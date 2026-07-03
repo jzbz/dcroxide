@@ -21,6 +21,15 @@
 //	msgtx_decode       → {"txid": ..., "witness_hash": ..., "full_hash": ...,
 //	                      "reencoded": "<hex>"}
 //	blockheader_decode → {"block_hash": ..., "reencoded": "<hex>"}
+//	ecdsa_parse_der    → {"result": "<hex 64-byte R||S>"} or
+//	                     {"error": ..., "kind": "ErrSig..."}
+//	ecdsa_sign         → data is 32-byte privkey || 32-byte hash;
+//	                     {"result": "<hex DER signature>"}
+//	ecdsa_verify       → data is 33-byte compressed pubkey || 32-byte hash ||
+//	                     DER signature; {"result": "true"|"false"}
+//	pubkey_parse       → {"result": "<hex uncompressed>",
+//	                      "compressed": "<hex compressed>"} or
+//	                     {"error": ..., "kind": "ErrPubKey..."}
 package main
 
 import (
@@ -28,11 +37,14 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/crypto/blake256"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	"github.com/decred/dcrd/wire"
 )
 
@@ -44,6 +56,8 @@ type request struct {
 type response struct {
 	Result      string `json:"result,omitempty"`
 	Error       string `json:"error,omitempty"`
+	Kind        string `json:"kind,omitempty"`
+	Compressed  string `json:"compressed,omitempty"`
 	TxID        string `json:"txid,omitempty"`
 	WitnessHash string `json:"witness_hash,omitempty"`
 	FullHash    string `json:"full_hash,omitempty"`
@@ -53,6 +67,22 @@ type response struct {
 
 func errResp(format string, args ...any) response {
 	return response{Error: fmt.Sprintf(format, args...)}
+}
+
+// errKindResp builds an error response carrying the dcrd error kind name
+// (e.g. "ErrSigTooShort") when the error wraps a known kind type.
+func errKindResp(err error) response {
+	resp := response{Error: err.Error()}
+	var sigErr ecdsa.Error
+	if errors.As(err, &sigErr) {
+		resp.Kind = sigErr.Err.Error()
+		return resp
+	}
+	var keyErr secp256k1.Error
+	if errors.As(err, &keyErr) {
+		resp.Kind = keyErr.Err.Error()
+	}
+	return resp
 }
 
 func handle(req request) response {
@@ -112,6 +142,54 @@ func handle(req request) response {
 		return response{
 			BlockHash: blockHash.String(),
 			Reencoded: hex.EncodeToString(reencoded),
+		}
+
+	case "ecdsa_parse_der":
+		sig, err := ecdsa.ParseDERSignature(data)
+		if err != nil {
+			return errKindResp(err)
+		}
+		r, s := sig.R(), sig.S()
+		var buf [64]byte
+		r.PutBytesUnchecked(buf[:32])
+		s.PutBytesUnchecked(buf[32:])
+		return response{Result: hex.EncodeToString(buf[:])}
+
+	case "ecdsa_sign":
+		if len(data) != 64 {
+			return errResp("ecdsa_sign: want 64 bytes (privkey || hash), got %d",
+				len(data))
+		}
+		privKey := secp256k1.PrivKeyFromBytes(data[:32])
+		sig := ecdsa.Sign(privKey, data[32:])
+		return response{Result: hex.EncodeToString(sig.Serialize())}
+
+	case "ecdsa_verify":
+		if len(data) < 33+32 {
+			return errResp("ecdsa_verify: want >= 65 bytes, got %d", len(data))
+		}
+		pubKey, err := secp256k1.ParsePubKey(data[:33])
+		if err != nil {
+			return errKindResp(err)
+		}
+		hash := data[33 : 33+32]
+		sig, err := ecdsa.ParseDERSignature(data[33+32:])
+		if err != nil {
+			return errKindResp(err)
+		}
+		if sig.Verify(hash, pubKey) {
+			return response{Result: "true"}
+		}
+		return response{Result: "false"}
+
+	case "pubkey_parse":
+		pubKey, err := secp256k1.ParsePubKey(data)
+		if err != nil {
+			return errKindResp(err)
+		}
+		return response{
+			Result:     hex.EncodeToString(pubKey.SerializeUncompressed()),
+			Compressed: hex.EncodeToString(pubKey.SerializeCompressed()),
 		}
 
 	default:
