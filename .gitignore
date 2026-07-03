@@ -1,0 +1,16 @@
+# Rust
+/target
+fuzz/target
+fuzz/artifacts
+fuzz/corpus
+fuzz/coverage
+Cargo.lock.orig
+
+# Go oracle build output (built into /target/oracle by the test harness)
+tools/oracle/dcrd-oracle
+tools/oracle/dcrd-oracle.exe
+
+# Editors
+*.swp
+.idea/
+.vscode/

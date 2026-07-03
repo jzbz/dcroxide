@@ -1,0 +1,23 @@
+[package]
+name = "dcroxide-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "ISC"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+dcroxide-crypto = { path = "../crates/dcroxide-crypto" }
+
+[[bin]]
+name = "blake256_incremental"
+path = "fuzz_targets/blake256_incremental.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
