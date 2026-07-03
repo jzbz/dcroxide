@@ -11,11 +11,34 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
+dcroxide-chainhash = { path = "../crates/dcroxide-chainhash" }
 dcroxide-crypto = { path = "../crates/dcroxide-crypto" }
+dcroxide-wire = { path = "../crates/dcroxide-wire" }
 
 [[bin]]
 name = "blake256_incremental"
 path = "fuzz_targets/blake256_incremental.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chainhash_from_str"
+path = "fuzz_targets/chainhash_from_str.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_msgtx_decode"
+path = "fuzz_targets/wire_msgtx_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_blockheader_decode"
+path = "fuzz_targets/wire_blockheader_decode.rs"
 test = false
 doc = false
 bench = false

@@ -70,7 +70,11 @@ jobs:
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked
-      - run: cargo fuzz run blake256_incremental -- -max_total_time=60
+      - name: Run every fuzz target briefly
+        run: |
+          for t in $(cargo fuzz list); do
+            cargo fuzz run "$t" -- -max_total_time=60
+          done
 
   nightly-fuzz:
     name: nightly fuzz (10m per target)
@@ -80,4 +84,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo install cargo-fuzz --locked
-      - run: cargo fuzz run blake256_incremental -- -max_total_time=600
+      - name: Run every fuzz target for 10 minutes
+        run: |
+          for t in $(cargo fuzz list); do
+            cargo fuzz run "$t" -- -max_total_time=600
+          done

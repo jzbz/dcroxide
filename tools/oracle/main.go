@@ -10,21 +10,30 @@
 // required by dcrd release-v2.1.5 — the project's parity target. Do not bump
 // them independently of a parity-target change.
 //
-// Protocol: one JSON object per line in, one per line out.
+// Protocol: one JSON object per line in, one per line out. Every command
+// takes a single "data" argument holding hex-encoded bytes; responses carry
+// {"error": "..."} on failure or command-specific fields on success:
 //
-//	→ {"cmd":"blake256","data":"<hex>"}
-//	← {"result":"<hex 32-byte digest>"}
-//	← {"error":"<message>"}   on any failure
+//	blake256           → {"result": "<hex 32-byte digest>"}
+//	newhashfromstr     → data is the hex of the string bytes;
+//	                     {"result": "<hex 32-byte hash, natural order>"}
+//	hash_string        → data is 32 hash bytes; {"result": "<display string>"}
+//	msgtx_decode       → {"txid": ..., "witness_hash": ..., "full_hash": ...,
+//	                      "reencoded": "<hex>"}
+//	blockheader_decode → {"block_hash": ..., "reencoded": "<hex>"}
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 
+	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/crypto/blake256"
+	"github.com/decred/dcrd/wire"
 )
 
 type request struct {
@@ -33,21 +42,80 @@ type request struct {
 }
 
 type response struct {
-	Result string `json:"result,omitempty"`
-	Error  string `json:"error,omitempty"`
+	Result      string `json:"result,omitempty"`
+	Error       string `json:"error,omitempty"`
+	TxID        string `json:"txid,omitempty"`
+	WitnessHash string `json:"witness_hash,omitempty"`
+	FullHash    string `json:"full_hash,omitempty"`
+	BlockHash   string `json:"block_hash,omitempty"`
+	Reencoded   string `json:"reencoded,omitempty"`
+}
+
+func errResp(format string, args ...any) response {
+	return response{Error: fmt.Sprintf(format, args...)}
 }
 
 func handle(req request) response {
+	data, err := hex.DecodeString(req.Data)
+	if err != nil {
+		return errResp("%s: bad hex argument: %v", req.Cmd, err)
+	}
+
 	switch req.Cmd {
 	case "blake256":
-		data, err := hex.DecodeString(req.Data)
-		if err != nil {
-			return response{Error: fmt.Sprintf("blake256: bad hex: %v", err)}
-		}
 		digest := blake256.Sum256(data)
 		return response{Result: hex.EncodeToString(digest[:])}
+
+	case "newhashfromstr":
+		hash, err := chainhash.NewHashFromStr(string(data))
+		if err != nil {
+			return errResp("%v", err)
+		}
+		return response{Result: hex.EncodeToString(hash[:])}
+
+	case "hash_string":
+		var hash chainhash.Hash
+		if err := hash.SetBytes(data); err != nil {
+			return errResp("%v", err)
+		}
+		return response{Result: hash.String()}
+
+	case "msgtx_decode":
+		var tx wire.MsgTx
+		if err := tx.FromBytes(data); err != nil {
+			return errResp("%v", err)
+		}
+		reencoded, err := tx.Bytes()
+		if err != nil {
+			return errResp("re-encode: %v", err)
+		}
+		txid := tx.TxHash()
+		witnessHash := tx.TxHashWitness()
+		fullHash := tx.TxHashFull()
+		return response{
+			TxID:        txid.String(),
+			WitnessHash: witnessHash.String(),
+			FullHash:    fullHash.String(),
+			Reencoded:   hex.EncodeToString(reencoded),
+		}
+
+	case "blockheader_decode":
+		var h wire.BlockHeader
+		if err := h.FromBytes(data); err != nil {
+			return errResp("%v", err)
+		}
+		reencoded, err := h.Bytes()
+		if err != nil {
+			return errResp("re-encode: %v", err)
+		}
+		blockHash := h.BlockHash()
+		return response{
+			BlockHash: blockHash.String(),
+			Reencoded: hex.EncodeToString(reencoded),
+		}
+
 	default:
-		return response{Error: "unknown cmd: " + req.Cmd}
+		return errResp("unknown cmd: %s", req.Cmd)
 	}
 }
 
@@ -60,13 +128,13 @@ func main() {
 
 	for in.Scan() {
 		line := in.Bytes()
-		if len(line) == 0 {
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		var req request
 		var resp response
 		if err := json.Unmarshal(line, &req); err != nil {
-			resp = response{Error: fmt.Sprintf("bad request: %v", err)}
+			resp = errResp("bad request: %v", err)
 		} else {
 			resp = handle(req)
 		}

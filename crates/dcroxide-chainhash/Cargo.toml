@@ -1,6 +1,6 @@
 [package]
-name = "dcroxide-crypto"
-description = "Decred cryptographic primitives: BLAKE-256 (vendored, KAT-pinned against dcrd)"
+name = "dcroxide-chainhash"
+description = "Decred chain hash type mirroring dcrd chaincfg/chainhash (BLAKE-256, byte-reversed display)"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+dcroxide-crypto = { path = "../dcroxide-crypto" }
 
 [dev-dependencies]
 dcroxide-testutil = { path = "../dcroxide-testutil" }

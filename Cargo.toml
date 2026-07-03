@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/dcroxide-crypto"]
+members = [
+    "crates/dcroxide-chainhash",
+    "crates/dcroxide-crypto",
+    "crates/dcroxide-testutil",
+    "crates/dcroxide-wire",
+]
 exclude = ["fuzz"]
 
 [workspace.package]

@@ -1,6 +1,7 @@
 [package]
-name = "dcroxide-crypto"
-description = "Decred cryptographic primitives: BLAKE-256 (vendored, KAT-pinned against dcrd)"
+name = "dcroxide-testutil"
+description = "Internal test utilities: dcrd oracle harness and deterministic PRNG (not for release)"
+publish = false
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -9,9 +10,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-
-[dev-dependencies]
-dcroxide-testutil = { path = "../dcroxide-testutil" }
+serde_json = "1"
 
 [lints]
 workspace = true

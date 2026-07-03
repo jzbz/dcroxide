@@ -16,10 +16,10 @@ Status legend:
 | `crypto/blake256` | `dcroxide-crypto` | vectors + diff | Vendored from dcr-rs `fd32c1a`; KATs regenerated via oracle; live differential test + incremental-hashing fuzz target |
 | `crypto/ripemd160` | `dcroxide-crypto` | — | RustCrypto re-export planned (Phase 1) |
 | `crypto/rand` | `dcroxide-crypto` | — | Phase 1 |
-| `chaincfg/chainhash` | `dcroxide-chainhash` | — | Phase 1 |
-| `dcrec` (ECDSA/Ed25519/Schnorr) | `dcroxide-dcrec` | — | Phase 1; decision D3 pending |
+| `chaincfg/chainhash` | `dcroxide-chainhash` | vectors + diff | `hash_test.go` vectors ported (incl. short-string zero-pad quirk); parse/display differential + fuzz target. Not ported: Go-specific plumbing (`SetBytes` pointer API, marshalers) |
+| `dcrec` (ECDSA/Ed25519/Schnorr) | `dcroxide-dcrec` | — | Phase 1; ADR-0006 drafted (D3) |
 | `math/uint256` | tbd | — | Phase 1 |
-| `wire` | `dcroxide-wire` | — | Phase 2 |
+| `wire` | `dcroxide-wire` | WIP: `MsgTx` + `BlockHeader` vectors + diff | varint (canonical enforcement), `MsgTx` all 3 ser types + tx hashes, 180-byte header + block hash; `multiTx`/`noTx`/TxHash vectors ported; structured/mutated differential + 2 fuzz targets + proptest round-trip laws. Pending: all other messages, framing, `PowHashV2` (BLAKE3, with standalone crate), error-kind text mapping ratchet |
 | `chaincfg` | `dcroxide-chaincfg` | — | Phase 3 |
 | `txscript` (+ `stdaddr`, `sign`) | `dcroxide-txscript` | — | Phase 4 |
 | `blockchain/stake` | `dcroxide-stake` | — | Phase 5 |

@@ -15,6 +15,11 @@ to validate, relay, or hold funds. Currently implemented:
 - `dcroxide-crypto` — BLAKE-256 (vendored from
   [dcr-rs](https://github.com/jzbz/dcr-rs), KAT-pinned, differential-tested
   against dcrd live)
+- `dcroxide-chainhash` — the 32-byte hash type with dcrd's byte-reversed
+  string encoding, including its short-string parsing quirk
+- `dcroxide-wire` (partial) — varints, `MsgTx` (all three serialization
+  types + transaction hashes), and the 180-byte `BlockHeader` + block hash;
+  every codec under differential test, fuzzing, and round-trip property tests
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
 
@@ -34,7 +39,8 @@ tests; without Go those tests skip).
 cargo test --workspace          # unit + KAT + differential tests
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo +nightly fuzz run blake256_incremental   # requires cargo-fuzz
+cargo +nightly fuzz list                       # requires cargo-fuzz
+cargo +nightly fuzz run wire_msgtx_decode
 ```
 
 Consensus-tagged crates enforce `#![forbid(unsafe_code)]` (workspace-wide

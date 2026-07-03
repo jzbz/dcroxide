@@ -30,6 +30,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "dcroxide-chainhash"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-crypto",
+]
+
+[[package]]
 name = "dcroxide-crypto"
 version = "0.1.0"
 
@@ -38,8 +45,18 @@ name = "dcroxide-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
+ "dcroxide-chainhash",
  "dcroxide-crypto",
+ "dcroxide-wire",
  "libfuzzer-sys",
+]
+
+[[package]]
+name = "dcroxide-wire"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-chainhash",
+ "dcroxide-crypto",
 ]
 
 [[package]]
