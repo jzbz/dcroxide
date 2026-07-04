@@ -1,0 +1,22 @@
+[package]
+name = "dcroxide-stake"
+description = "Decred stake transaction primitives mirroring dcrd's blockchain/stake: classification, rule checks, and the ticket lottery"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-txscript = { path = "../dcroxide-txscript" }
+dcroxide-uint256 = { path = "../dcroxide-uint256" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+
+[dev-dependencies]
+dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true

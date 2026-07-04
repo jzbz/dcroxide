@@ -178,6 +178,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-stake"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-chaincfg",
+ "dcroxide-chainhash",
+ "dcroxide-testutil",
+ "dcroxide-txscript",
+ "dcroxide-uint256",
+ "dcroxide-wire",
+]
+
+[[package]]
 name = "dcroxide-testutil"
 version = "0.1.0"
 dependencies = [

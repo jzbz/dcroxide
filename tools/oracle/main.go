@@ -82,6 +82,21 @@
 //	                     see the handler for the field layout
 //	tspend_sig         → data is key(32) || serialized tx;
 //	                     {"result": "<hex signature script>"}
+//	stake_analyze      → data is a serialized tx; {"result": "<hex of the
+//	                     canonical stake-analysis dump>"} covering
+//	                     DetermineTxType, the six Check* verdicts (error
+//	                     kind names), SStx commitment extraction, and
+//	                     SSGen vote extraction
+//	stake_lottery      → data is n_rand(2 BE) || pool_size(4 BE) ||
+//	                     winners(2 BE) || seed; {"result": "<hex dump>"} of
+//	                     the PRNG IV, draws, state hashes, and winner
+//	                     selection
+//	stake_calc_rewards → data is mode(1) || purchase(8 BE) || subsidy(8 BE)
+//	                     || n(1) || n*amount(8 BE) || prev header;
+//	                     {"result": "<hex of the amounts, one per line>"}
+//	stake_create_revocation → CreateRevocationFromTicket; see the handler
+//	                     for the field layout; {"result": "<hex tx>"} or
+//	                     {"error": ..., "kind": "Err..."}
 //	chaincfg_dump      → data is the network name bytes ("mainnet",
 //	                     "testnet3", "simnet", or "regnet");
 //	                     {"result": "<hex of the canonical params dump>"}
@@ -106,19 +121,21 @@ import (
 	"math/big"
 
 	"github.com/decred/base58"
+	stake "github.com/decred/dcrd/blockchain/stake/v5"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	chaincfg "github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec"
+	"github.com/decred/dcrd/dcrec/edwards/v2"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4/schnorr"
+	"github.com/decred/dcrd/dcrutil/v4"
+	"github.com/decred/dcrd/math/uint256"
 	"github.com/decred/dcrd/txscript/v4"
 	"github.com/decred/dcrd/txscript/v4/sign"
 	"github.com/decred/dcrd/txscript/v4/stdaddr"
 	"github.com/decred/dcrd/txscript/v4/stdscript"
-	"github.com/decred/dcrd/crypto/blake256"
-	"github.com/decred/dcrd/dcrec/edwards/v2"
-	"github.com/decred/dcrd/dcrec/secp256k1/v4"
-	"github.com/decred/dcrd/math/uint256"
-	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
-	"github.com/decred/dcrd/dcrec/secp256k1/v4/schnorr"
 	"github.com/decred/dcrd/wire"
 )
 
@@ -778,6 +795,169 @@ func handle(req request) response {
 		}
 		return response{Result: hex.EncodeToString(script)}
 
+	case "stake_analyze":
+		// data: treasury-agenda flag ignored (checks are format-only in
+		// the stake package) — serialized tx.
+		var tx wire.MsgTx
+		if err := tx.Deserialize(bytes.NewReader(data)); err != nil {
+			return errResp("stake_analyze: bad tx: %v", err)
+		}
+		var w strings.Builder
+		fmt.Fprintf(&w, "type=%v\n", int(stake.DetermineTxType(&tx)))
+		fmt.Fprintf(&w, "checksstx=%s\n", stakeErrKind(stake.CheckSStx(&tx)))
+		votes, ssgenErr := stake.CheckSSGenVotes(&tx)
+		fmt.Fprintf(&w, "checkssgen=%s\n", stakeErrKind(ssgenErr))
+		fmt.Fprintf(&w, "checkssrtx=%s\n", stakeErrKind(stake.CheckSSRtx(&tx)))
+		fmt.Fprintf(&w, "checktadd=%s\n", stakeErrKind(stake.CheckTAdd(&tx)))
+		_, _, tspendErr := stake.CheckTSpend(&tx)
+		fmt.Fprintf(&w, "checktspend=%s\n", stakeErrKind(tspendErr))
+		fmt.Fprintf(&w, "checktreasurybase=%s\n",
+			stakeErrKind(stake.CheckTreasuryBase(&tx)))
+		if stake.IsSStx(&tx) {
+			isP2SH, addrs, amts, changes, rules, limits :=
+				stake.TxSStxStakeOutputInfo(&tx)
+			for i := range isP2SH {
+				fmt.Fprintf(&w, "commit=%t %x %d %d %t %t %d %d\n",
+					isP2SH[i], addrs[i], amts[i], changes[i],
+					rules[i][0], rules[i][1], limits[i][0], limits[i][1])
+			}
+		}
+		if stake.IsSSGen(&tx) {
+			blockHash, height := stake.SSGenBlockVotedOn(&tx)
+			fmt.Fprintf(&w, "votedon=%s %d\n", blockHash, height)
+			fmt.Fprintf(&w, "votebits=%d\n", stake.SSGenVoteBits(&tx))
+			fmt.Fprintf(&w, "voteversion=%d\n", stake.SSGenVersion(&tx))
+			for _, v := range votes {
+				fmt.Fprintf(&w, "tv=%s %d\n", v.Hash, v.Vote)
+			}
+		}
+		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
+	case "stake_lottery":
+		// data: n_rand(2 BE) || pool_size(4 BE) || winners(2 BE) || seed
+		if len(data) < 8 {
+			return errResp("stake_lottery: truncated request")
+		}
+		nRand := int(binary.BigEndian.Uint16(data[0:2]))
+		poolSize := binary.BigEndian.Uint32(data[2:6])
+		winners := binary.BigEndian.Uint16(data[6:8])
+		seed := data[8:]
+		var w strings.Builder
+		fmt.Fprintf(&w, "iv=%s\n", stake.CalcHash256PRNGIV(seed))
+		prng := stake.NewHash256PRNG(seed)
+		for i := 0; i < nRand; i++ {
+			fmt.Fprintf(&w, "rand=%d\n", prng.Hash256Rand())
+		}
+		fmt.Fprintf(&w, "state=%s\n", prng.StateHash())
+		// Winner selection with a fresh PRNG using the same algorithm as
+		// dcrd's private findTicketIdxs, expressed via the public
+		// UniformRandom (the loop below matches it line for line).
+		prng2 := stake.NewHash256PRNG(seed)
+		if uint32(winners) <= poolSize {
+			picked := make([]int, 0, winners)
+			for len(picked) < int(winners) {
+				r := int(prng2.UniformRandom(poolSize))
+				dup := false
+				for _, e := range picked {
+					if e == r {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					picked = append(picked, r)
+				}
+			}
+			for _, idx := range picked {
+				fmt.Fprintf(&w, "winner=%d\n", idx)
+			}
+			fmt.Fprintf(&w, "winstate=%s\n", prng2.StateHash())
+		}
+		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
+	case "stake_calc_rewards":
+		// data: mode(1: 0=vote,1=revocation no-auto,2=revocation auto) ||
+		//       purchase(8 BE) || subsidy(8 BE) || n(1) || n*amount(8 BE) ||
+		//       prev header bytes
+		if len(data) < 18 {
+			return errResp("stake_calc_rewards: truncated request")
+		}
+		mode := data[0]
+		purchase := int64(binary.BigEndian.Uint64(data[1:9])) // nolint:gosec
+		subsidy := int64(binary.BigEndian.Uint64(data[9:17])) // nolint:gosec
+		n := int(data[17])
+		if len(data) < 18+n*8 {
+			return errResp("stake_calc_rewards: truncated amounts")
+		}
+		contribs := make([]int64, n)
+		for i := 0; i < n; i++ {
+			contribs[i] = int64(binary.BigEndian.Uint64(data[18+i*8 : 26+i*8])) // nolint:gosec
+		}
+		prevHeader := data[18+n*8:]
+		var amounts []int64
+		switch mode {
+		case 0:
+			amounts = stake.CalculateRewards(contribs, purchase, subsidy)
+		case 1:
+			amounts = stake.CalculateRevocationRewards(contribs, purchase,
+				prevHeader, false)
+		default:
+			amounts = stake.CalculateRevocationRewards(contribs, purchase,
+				prevHeader, true)
+		}
+		var w strings.Builder
+		for _, amt := range amounts {
+			fmt.Fprintf(&w, "%d\n", amt)
+		}
+		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
+	case "stake_create_revocation":
+		// data: net_len(1) || net || fee(8 BE) || version(2 BE) ||
+		//       auto(1) || ticket hash(32) || header_len(2 BE) || header ||
+		//       serialized ticket tx (for its outputs)
+		if len(data) < 1 {
+			return errResp("stake_create_revocation: empty request")
+		}
+		netLen := int(data[0])
+		if len(data) < 1+netLen+45 {
+			return errResp("stake_create_revocation: truncated request")
+		}
+		params, err := netParams(string(data[1 : 1+netLen]))
+		if err != nil {
+			return errResp("stake_create_revocation: %v", err)
+		}
+		rest := data[1+netLen:]
+		fee := int64(binary.BigEndian.Uint64(rest[0:8])) // nolint:gosec
+		version := binary.BigEndian.Uint16(rest[8:10])
+		auto := rest[10] != 0
+		var ticketHash chainhash.Hash
+		copy(ticketHash[:], rest[11:43])
+		headerLen := int(binary.BigEndian.Uint16(rest[43:45]))
+		if len(rest) < 45+headerLen {
+			return errResp("stake_create_revocation: truncated header")
+		}
+		prevHeader := rest[45 : 45+headerLen]
+		var ticketTx wire.MsgTx
+		if err := ticketTx.Deserialize(bytes.NewReader(rest[45+headerLen:])); err != nil {
+			return errResp("stake_create_revocation: bad ticket tx: %v", err)
+		}
+		minOuts := stake.ConvertToMinimalOutputs(&ticketTx)
+		revocation, err := stake.CreateRevocationFromTicket(&ticketHash,
+			minOuts, dcrutil.Amount(fee), version, params, prevHeader, auto)
+		if err != nil {
+			resp := response{Error: err.Error()}
+			var kindErr stake.ErrorKind
+			if errors.As(err, &kindErr) {
+				resp.Kind = kindErr.Error()
+			}
+			return resp
+		}
+		var buf bytes.Buffer
+		if err := revocation.Serialize(&buf); err != nil {
+			return errResp("stake_create_revocation: serialize: %v", err)
+		}
+		return response{Result: hex.EncodeToString(buf.Bytes())}
+
 	case "chaincfg_dump":
 		params, err := netParams(string(data))
 		if err != nil {
@@ -792,6 +972,19 @@ func handle(req request) response {
 	default:
 		return errResp("unknown cmd: %s", req.Cmd)
 	}
+}
+
+// stakeErrKind renders "ok" or the stake ErrorKind name for a check
+// result; errors without a stake kind render their message.
+func stakeErrKind(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	var kindErr stake.ErrorKind
+	if errors.As(err, &kindErr) {
+		return kindErr.Error()
+	}
+	return err.Error()
 }
 
 // netParams maps a network name to its chaincfg parameters.
