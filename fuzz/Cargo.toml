@@ -14,6 +14,7 @@ arbitrary = { version = "1", features = ["derive"] }
 dcroxide-chainhash = { path = "../crates/dcroxide-chainhash" }
 dcroxide-crypto = { path = "../crates/dcroxide-crypto" }
 dcroxide-dcrec = { path = "../crates/dcroxide-dcrec" }
+dcroxide-txscript = { path = "../crates/dcroxide-txscript" }
 dcroxide-uint256 = { path = "../crates/dcroxide-uint256" }
 dcroxide-wire = { path = "../crates/dcroxide-wire" }
 
@@ -88,3 +89,10 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "txscript_engine"
+path = "fuzz_targets/txscript_engine.rs"
+test = false
+doc = false
+bench = false

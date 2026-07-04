@@ -34,6 +34,23 @@ pub const NULL_BLOCK_HEIGHT: u32 = 0;
 /// The null input-witness block index.
 pub const NULL_BLOCK_INDEX: u32 = 0xffff_ffff;
 
+/// Flag on an input sequence number disabling its interpretation as a
+/// relative locktime (dcrd `SequenceLockTimeDisabled`).
+pub const SEQUENCE_LOCK_TIME_DISABLED: u32 = 1 << 31;
+
+/// Flag on an input sequence number giving the relative locktime units of
+/// 512 seconds (dcrd `SequenceLockTimeIsSeconds`).
+pub const SEQUENCE_LOCK_TIME_IS_SECONDS: u32 = 1 << 22;
+
+/// Mask extracting the relative locktime from an input sequence number
+/// (dcrd `SequenceLockTimeMask`).
+pub const SEQUENCE_LOCK_TIME_MASK: u32 = 0x0000_ffff;
+
+/// The right-shift converting seconds to a seconds-based relative lock
+/// (dcrd `SequenceLockTimeGranularity`); enforced locks are multiples of
+/// 512 seconds.
+pub const SEQUENCE_LOCK_TIME_GRANULARITY: u32 = 9;
+
 /// The default public key script version.
 pub const DEFAULT_PK_SCRIPT_VERSION: u16 = 0;
 

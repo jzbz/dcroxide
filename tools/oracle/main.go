@@ -54,6 +54,15 @@
 //	                      "compressed": "<command>"} or
 //	                     {"error": ..., "kind": "Err..." when a wire
 //	                      MessageError}
+//	script_exec        → data is flags(4 BE) || script_version(2 BE) ||
+//	                     tx_idx(4 BE) || pkscript_len(4 BE) || pkscript ||
+//	                     serialized tx; {"result": "ok"} or
+//	                     {"error": ..., "kind": "Err..." when a txscript
+//	                      ErrorKind}
+//	calc_sighash       → data is hash_type(1) || idx(4 BE) ||
+//	                     script_len(4 BE) || script || serialized tx;
+//	                     {"result": "<hex 32-byte sighash>"} or
+//	                     {"error": ..., "kind": ...}
 //	chaincfg_dump      → data is the network name bytes ("mainnet",
 //	                     "testnet3", "simnet", or "regnet");
 //	                     {"result": "<hex of the canonical params dump>"}
@@ -79,6 +88,7 @@ import (
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	chaincfg "github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/txscript/v4"
 	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec/edwards/v2"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -141,6 +151,11 @@ func errKindResp(err error) response {
 	var wireErr *wire.MessageError
 	if errors.As(err, &wireErr) {
 		resp.Kind = wireErr.ErrorCode.String()
+		return resp
+	}
+	var scriptErrKind txscript.ErrorKind
+	if errors.As(err, &scriptErrKind) {
+		resp.Kind = scriptErrKind.Error()
 	}
 	return resp
 }
@@ -438,6 +453,57 @@ func handle(req request) response {
 			Result:     hex.EncodeToString(buf.Bytes()),
 			Compressed: msg.Command(),
 		}
+
+	case "script_exec":
+		// data: flags(4 BE) || script_version(2 BE) || tx_idx(4 BE) ||
+		//       pkscript_len(4 BE) || pkscript || serialized tx
+		if len(data) < 14 {
+			return errResp("script_exec: want >= 14 bytes, got %d", len(data))
+		}
+		flags := txscript.ScriptFlags(binary.BigEndian.Uint32(data[0:4]))
+		scriptVersion := binary.BigEndian.Uint16(data[4:6])
+		txIdx := int(binary.BigEndian.Uint32(data[6:10]))
+		pkLen := int(binary.BigEndian.Uint32(data[10:14]))
+		if len(data) < 14+pkLen {
+			return errResp("script_exec: truncated pkscript")
+		}
+		pkScript := data[14 : 14+pkLen]
+		var tx wire.MsgTx
+		if err := tx.Deserialize(bytes.NewReader(data[14+pkLen:])); err != nil {
+			return errResp("script_exec: bad tx: %v", err)
+		}
+		vm, err := txscript.NewEngine(pkScript, &tx, txIdx, flags,
+			scriptVersion, nil)
+		if err == nil {
+			err = vm.Execute()
+		}
+		if err != nil {
+			return errKindResp(err)
+		}
+		return response{Result: "ok"}
+
+	case "calc_sighash":
+		// data: hash_type(1) || idx(4 BE) || script_len(4 BE) || script ||
+		//       serialized tx
+		if len(data) < 9 {
+			return errResp("calc_sighash: want >= 9 bytes, got %d", len(data))
+		}
+		hashType := txscript.SigHashType(data[0])
+		idx := int(binary.BigEndian.Uint32(data[1:5]))
+		scriptLen := int(binary.BigEndian.Uint32(data[5:9]))
+		if len(data) < 9+scriptLen {
+			return errResp("calc_sighash: truncated script")
+		}
+		script := data[9 : 9+scriptLen]
+		var tx wire.MsgTx
+		if err := tx.Deserialize(bytes.NewReader(data[9+scriptLen:])); err != nil {
+			return errResp("calc_sighash: bad tx: %v", err)
+		}
+		hash, err := txscript.CalcSignatureHash(script, hashType, &tx, idx, nil)
+		if err != nil {
+			return errKindResp(err)
+		}
+		return response{Result: hex.EncodeToString(hash)}
 
 	case "chaincfg_dump":
 		var params *chaincfg.Params

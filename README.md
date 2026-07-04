@@ -9,13 +9,13 @@ Parity target: **dcrd `release-v2.1.5`** — wire protocol 12, JSON-RPC API
 [PARITY.md](PARITY.md) for per-package status. The full plan lives in
 [dcroxide-project-brief.md](dcroxide-project-brief.md).
 
-**Status: pre-alpha — through Phase 3 (rig, primitives, wire, chaincfg).**
-Nothing here is ready to validate, relay, or hold funds. Currently
-implemented:
+**Status: pre-alpha — through Phase 4 (rig, primitives, wire, chaincfg, the
+script engine).** Nothing here is ready to validate, relay, or hold funds.
+Currently implemented:
 
 - `dcroxide-crypto` — BLAKE-256 (vendored from
   [dcr-rs](https://github.com/jzbz/dcr-rs), KAT-pinned, differential-tested
-  against dcrd live)
+  against dcrd live) and RIPEMD-160 (RustCrypto-backed, KAT-pinned)
 - `dcroxide-chainhash` — the 32-byte hash type with dcrd's byte-reversed
   string encoding, including its short-string parsing quirk
 - `dcroxide-wire` — message framing with dcrd's exact validation order and
@@ -39,6 +39,13 @@ implemented:
   block-one premine ledgers; the complete parameter set is dumped
   field-by-field and compared byte-for-byte against dcrd's `chaincfg`
   through the oracle
+- `dcroxide-txscript` — the version-0 Decred script engine ported from
+  dcrd's `txscript`: tokenizer, `ScriptNum`, the full 256-opcode set
+  (including the stake and treasury opcodes), the execution engine with all
+  flag combinations and P2SH handling, strict-encoding checks, signature
+  hashing, and signature checking across all three suites; dcrd's entire
+  `script_tests.json`/`tx_valid`/`tx_invalid`/`sighash.json` corpora run
+  green, backed by a live differential script fuzzer against dcrd
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
 
