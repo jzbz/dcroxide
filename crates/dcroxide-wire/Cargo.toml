@@ -15,6 +15,7 @@ dcroxide-crypto = { path = "../dcroxide-crypto" }
 [dev-dependencies]
 dcroxide-testutil = { path = "../dcroxide-testutil" }
 proptest = "1"
+serde_json = "1"
 
 [lints]
 workspace = true

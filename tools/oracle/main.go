@@ -49,11 +49,17 @@
 //	uint256_op         → data is op(1) || a(32 BE) || b(32 BE) || aux(8 BE);
 //	                     {"result": "<hex 32-byte BE>"} for value ops or the
 //	                     plain string for bitlen/cmp/text ops (see handler)
+//	wire_msg           → data is pver(4 BE) || magic(4 BE) || framed message;
+//	                     {"result": "<hex re-encoded frame>",
+//	                      "compressed": "<command>"} or
+//	                     {"error": ..., "kind": "Err..." when a wire
+//	                      MessageError}
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -120,6 +126,11 @@ func errKindResp(err error) response {
 	var schnorrErr schnorr.Error
 	if errors.As(err, &schnorrErr) {
 		resp.Kind = schnorrErr.Err.Error()
+		return resp
+	}
+	var wireErr *wire.MessageError
+	if errors.As(err, &wireErr) {
+		resp.Kind = wireErr.ErrorCode.String()
 	}
 	return resp
 }
@@ -397,6 +408,25 @@ func handle(req request) response {
 			return hexResult(a.DivUint64(aux))
 		default:
 			return errResp("uint256_op: unknown op %d", op)
+		}
+
+	case "wire_msg":
+		if len(data) < 8 {
+			return errResp("wire_msg: want >= 8 bytes, got %d", len(data))
+		}
+		pver := binary.BigEndian.Uint32(data[0:4])
+		net := wire.CurrencyNet(binary.BigEndian.Uint32(data[4:8]))
+		msg, _, err := wire.ReadMessage(bytes.NewReader(data[8:]), pver, net)
+		if err != nil {
+			return errKindResp(err)
+		}
+		var buf bytes.Buffer
+		if err := wire.WriteMessage(&buf, msg, pver, net); err != nil {
+			return errKindResp(err)
+		}
+		return response{
+			Result:     hex.EncodeToString(buf.Bytes()),
+			Compressed: msg.Command(),
 		}
 
 	default:

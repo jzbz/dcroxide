@@ -17,9 +17,12 @@ to validate, relay, or hold funds. Currently implemented:
   against dcrd live)
 - `dcroxide-chainhash` — the 32-byte hash type with dcrd's byte-reversed
   string encoding, including its short-string parsing quirk
-- `dcroxide-wire` (partial) — varints, `MsgTx` (all three serialization
-  types + transaction hashes), and the 180-byte `BlockHeader` + block hash;
-  every codec under differential test, fuzzing, and round-trip property tests
+- `dcroxide-wire` — message framing with dcrd's exact validation order and
+  error identities, plus every non-mix P2P message at protocol version 11
+  (the eight StakeShuffle mixing messages are next); `MsgTx`, blocks,
+  headers, filters, and state messages all under differential test,
+  fuzzing, and round-trip property tests — including the first `QUIRKS.md`
+  entry (write-only `reject`)
 - `dcroxide-uint256` — fixed-precision 256-bit arithmetic (difficulty/work
   math) ported operation-for-operation from dcrd's `math/uint256`,
   differentially tested against it across every operation

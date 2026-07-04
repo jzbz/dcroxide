@@ -3,13 +3,14 @@
 
 use core::fmt;
 
-/// An error from decoding wire data.
+/// An error from encoding or decoding wire data.
 ///
 /// Variants correspond 1:1 to the dcrd `wire` error codes reachable from the
-/// codecs implemented so far (per-variant notes name the dcrd code). Message
-/// texts approximate dcrd's; exact-text parity is only chased where it leaks
-/// into observable behavior (tracked in `PARITY.md`).
+/// implemented codecs ([`Self::kind_name`] gives the dcrd name for
+/// differential comparison). Message texts approximate dcrd's; exact-text
+/// parity is only chased where it leaks into observable behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)] // Limit-variant `count`/`max`-style fields are self-describing.
 pub enum WireError {
     /// Ran out of bytes mid-value. dcrd surfaces Go's `io.EOF` /
     /// `io.ErrUnexpectedEOF` here; both collapse to this variant.
@@ -22,6 +23,14 @@ pub enum WireError {
         /// The smallest value that would justify the encoding used.
         min: u64,
     },
+    /// A variable-length string exceeded its size limit
+    /// (`ErrVarStringTooLong`).
+    VarStringTooLong {
+        /// The declared length.
+        count: u64,
+        /// The maximum allowed.
+        max: u64,
+    },
     /// A variable-length byte array exceeded its size limit
     /// (`ErrVarBytesTooLong`).
     VarBytesTooLong {
@@ -30,14 +39,54 @@ pub enum WireError {
         /// The maximum allowed.
         max: u64,
     },
-    /// A transaction input or output count exceeded what could fit in a
-    /// message (`ErrTooManyTxs`).
-    TooManyTxs {
-        /// The declared count.
-        count: u64,
+    /// A command string exceeded the 12-byte header field
+    /// (`ErrCmdTooLong`).
+    CmdTooLong,
+    /// A message payload exceeded the global or per-type maximum
+    /// (`ErrPayloadTooLarge`).
+    PayloadTooLarge {
+        /// The payload length.
+        len: u64,
         /// The maximum allowed.
         max: u64,
     },
+    /// A message header carried the magic of a different network
+    /// (`ErrWrongNetwork`).
+    WrongNetwork(u32),
+    /// A message header command was not strict ASCII (`ErrMalformedCmd`).
+    MalformedCmd,
+    /// A message header command is not recognized (`ErrUnknownCmd`).
+    UnknownCmd,
+    /// The payload checksum did not match the header (`ErrPayloadChecksum`).
+    PayloadChecksum,
+    /// A message payload had unconsumed trailing bytes (`ErrTrailingBytes`).
+    TrailingBytes,
+    /// An address list exceeded its maximum (`ErrTooManyAddrs`).
+    TooManyAddrs { count: u64, max: u64 },
+    /// A transaction count exceeded what could fit (`ErrTooManyTxs`).
+    TooManyTxs { count: u64, max: u64 },
+    /// The message is not valid for the negotiated protocol version
+    /// (`ErrMsgInvalidForPVer`).
+    MsgInvalidForPVer,
+    /// A committed filter exceeded the maximum size (`ErrFilterTooLarge`).
+    FilterTooLarge { size: u64, max: u64 },
+    /// Too many header-commitment proof hashes (`ErrTooManyProofs`).
+    TooManyProofs { count: u64, max: u64 },
+    /// Too many filter types (`ErrTooManyFilterTypes`).
+    TooManyFilterTypes { count: u64, max: u64 },
+    /// Too many block locator hashes (`ErrTooManyLocators`).
+    TooManyLocators { count: u64, max: u64 },
+    /// Too many inventory vectors (`ErrTooManyVectors`).
+    TooManyVectors { count: u64, max: u64 },
+    /// Too many block headers or header-hashes (`ErrTooManyHeaders`).
+    TooManyHeaders { count: u64, max: u64 },
+    /// A headers-message header claimed to contain transactions
+    /// (`ErrHeaderContainsTxs`).
+    HeaderContainsTxs { count: u64 },
+    /// Too many vote hashes (`ErrTooManyVotes`).
+    TooManyVotes { count: u64, max: u64 },
+    /// Too many block hashes (`ErrTooManyBlocks`).
+    TooManyBlocks { count: u64, max: u64 },
     /// A full transaction's witness input count did not match its prefix
     /// input count (`ErrMismatchedWitnessCount`).
     MismatchedWitnessCount {
@@ -48,6 +97,71 @@ pub enum WireError {
     },
     /// The transaction serialization type is unknown (`ErrUnknownTxType`).
     UnknownTxType(u16),
+    /// The version message structure was invalid (`ErrInvalidMsg`).
+    InvalidMsg,
+    /// The user agent exceeded its maximum length (`ErrUserAgentTooLong`).
+    UserAgentTooLong { len: u64, max: u64 },
+    /// Too many committed filter headers (`ErrTooManyFilterHeaders`).
+    TooManyFilterHeaders { count: u64, max: u64 },
+    /// A strict-ASCII string contained other bytes
+    /// (`ErrMalformedStrictString`).
+    MalformedStrictString,
+    /// Too many initial state types (`ErrTooManyInitStateTypes`).
+    TooManyInitStateTypes { count: u64, max: u64 },
+    /// An initial state type string was too long
+    /// (`ErrInitStateTypeTooLong`).
+    InitStateTypeTooLong { len: u64, max: u64 },
+    /// Too many treasury spend hashes (`ErrTooManyTSpends`).
+    TooManyTSpends { count: u64, max: u64 },
+    /// Too many batched committed filters (`ErrTooManyCFilters`).
+    TooManyCFilters { count: u64, max: u64 },
+    /// A timestamp exceeded the maximum representable value
+    /// (`ErrInvalidTimestamp`).
+    InvalidTimestamp,
+}
+
+impl WireError {
+    /// The dcrd `wire.ErrorCode` name, used for differential comparison.
+    /// [`WireError::UnexpectedEof`] has no dcrd kind (it maps to Go io
+    /// errors) and returns an empty string.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            WireError::UnexpectedEof => "",
+            WireError::NonCanonicalVarInt { .. } => "ErrNonCanonicalVarInt",
+            WireError::VarStringTooLong { .. } => "ErrVarStringTooLong",
+            WireError::VarBytesTooLong { .. } => "ErrVarBytesTooLong",
+            WireError::CmdTooLong => "ErrCmdTooLong",
+            WireError::PayloadTooLarge { .. } => "ErrPayloadTooLarge",
+            WireError::WrongNetwork(_) => "ErrWrongNetwork",
+            WireError::MalformedCmd => "ErrMalformedCmd",
+            WireError::UnknownCmd => "ErrUnknownCmd",
+            WireError::PayloadChecksum => "ErrPayloadChecksum",
+            WireError::TrailingBytes => "ErrTrailingBytes",
+            WireError::TooManyAddrs { .. } => "ErrTooManyAddrs",
+            WireError::TooManyTxs { .. } => "ErrTooManyTxs",
+            WireError::MsgInvalidForPVer => "ErrMsgInvalidForPVer",
+            WireError::FilterTooLarge { .. } => "ErrFilterTooLarge",
+            WireError::TooManyProofs { .. } => "ErrTooManyProofs",
+            WireError::TooManyFilterTypes { .. } => "ErrTooManyFilterTypes",
+            WireError::TooManyLocators { .. } => "ErrTooManyLocators",
+            WireError::TooManyVectors { .. } => "ErrTooManyVectors",
+            WireError::TooManyHeaders { .. } => "ErrTooManyHeaders",
+            WireError::HeaderContainsTxs { .. } => "ErrHeaderContainsTxs",
+            WireError::TooManyVotes { .. } => "ErrTooManyVotes",
+            WireError::TooManyBlocks { .. } => "ErrTooManyBlocks",
+            WireError::MismatchedWitnessCount { .. } => "ErrMismatchedWitnessCount",
+            WireError::UnknownTxType(_) => "ErrUnknownTxType",
+            WireError::InvalidMsg => "ErrInvalidMsg",
+            WireError::UserAgentTooLong { .. } => "ErrUserAgentTooLong",
+            WireError::TooManyFilterHeaders { .. } => "ErrTooManyFilterHeaders",
+            WireError::MalformedStrictString => "ErrMalformedStrictString",
+            WireError::TooManyInitStateTypes { .. } => "ErrTooManyInitStateTypes",
+            WireError::InitStateTypeTooLong { .. } => "ErrInitStateTypeTooLong",
+            WireError::TooManyTSpends { .. } => "ErrTooManyTSpends",
+            WireError::TooManyCFilters { .. } => "ErrTooManyCFilters",
+            WireError::InvalidTimestamp => "ErrInvalidTimestamp",
+        }
+    }
 }
 
 impl fmt::Display for WireError {
@@ -58,14 +172,9 @@ impl fmt::Display for WireError {
                 f,
                 "non-canonical varint {value:x} - must encode a value greater than {min:x}"
             ),
-            WireError::VarBytesTooLong { count, max } => write!(
-                f,
-                "byte array is larger than the max allowed size [count {count}, max {max}]"
-            ),
-            WireError::TooManyTxs { count, max } => write!(
-                f,
-                "too many transactions to fit into max message size [count {count}, max {max}]"
-            ),
+            WireError::WrongNetwork(magic) => {
+                write!(f, "message from other network [{magic:#x}]")
+            }
             WireError::MismatchedWitnessCount { witness, prefix } => write!(
                 f,
                 "non equal witness and prefix txin quantities (witness {witness}, prefix {prefix})"
@@ -73,6 +182,7 @@ impl fmt::Display for WireError {
             WireError::UnknownTxType(t) => {
                 write!(f, "unsupported transaction type {t}")
             }
+            other => f.write_str(other.kind_name()),
         }
     }
 }

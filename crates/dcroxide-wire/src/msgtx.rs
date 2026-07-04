@@ -58,6 +58,10 @@ pub const MAX_TX_IN_PER_MESSAGE: u64 = MAX_MESSAGE_PAYLOAD / MIN_TX_IN_PAYLOAD +
 /// `minTxOutPayload` (used only to derive the output-count DoS limit).
 const MIN_TX_OUT_PAYLOAD: u64 = 9;
 
+/// Minimum serialized size of any full transaction, per dcrd's
+/// `minTxPayload` (used to derive the per-tree transaction count limit).
+pub(crate) const MIN_TX_PAYLOAD: u64 = 4 + 1 + 1 + 1 + 4 + 4;
+
 /// The maximum number of transaction outputs that could possibly fit into a
 /// max-size message (dcrd `maxTxOutPerMessage`).
 pub const MAX_TX_OUT_PER_MESSAGE: u64 = MAX_MESSAGE_PAYLOAD / MIN_TX_OUT_PAYLOAD + 1;

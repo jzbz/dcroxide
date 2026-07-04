@@ -90,6 +90,38 @@ pub(crate) fn write_var_bytes(w: &mut Vec<u8>, bytes: &[u8]) {
     w.extend_from_slice(bytes);
 }
 
+/// Read a variable-length string's raw bytes, limited to the maximum
+/// message payload (dcrd `ReadVarString`; the bytes are returned so callers
+/// can apply dcrd's strict-ASCII validation before conversion).
+pub(crate) fn read_var_string_bytes(r: &mut Cursor<'_>) -> Result<Vec<u8>, WireError> {
+    let count = read_var_int(r)?;
+    if count > crate::MAX_MESSAGE_PAYLOAD {
+        return Err(WireError::VarStringTooLong {
+            count,
+            max: crate::MAX_MESSAGE_PAYLOAD,
+        });
+    }
+    Ok(r.take(count as usize)?.to_vec())
+}
+
+/// Read a strict-ASCII variable-length string limited to `max_allowed`
+/// (dcrd `ReadAsciiVarString`).
+pub(crate) fn read_ascii_var_string(
+    r: &mut Cursor<'_>,
+    max_allowed: u64,
+) -> Result<alloc::string::String, WireError> {
+    let count = read_var_int(r)?;
+    let max = max_allowed.min(crate::MAX_MESSAGE_PAYLOAD);
+    if count > max {
+        return Err(WireError::VarStringTooLong { count, max });
+    }
+    let bytes = r.take(count as usize)?;
+    if !crate::protocol::is_strict_ascii(bytes) {
+        return Err(WireError::MalformedStrictString);
+    }
+    Ok(alloc::string::String::from_utf8(bytes.to_vec()).expect("strict ASCII is UTF-8"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

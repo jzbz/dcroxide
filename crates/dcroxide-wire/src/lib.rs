@@ -31,17 +31,51 @@ extern crate alloc;
 mod blockheader;
 mod cursor;
 mod error;
+mod invvect;
+mod message;
+mod msg_cf;
+mod msg_control;
+mod msg_data;
 mod msgtx;
+mod netaddress;
+mod protocol;
 mod varint;
 
 pub use blockheader::{BlockHeader, MAX_BLOCK_HEADER_PAYLOAD};
 pub use cursor::Cursor;
 pub use error::WireError;
+pub use invvect::{InvType, InvVect, MAX_INV_PER_MSG};
+pub use message::{COMMAND_SIZE, MESSAGE_HEADER_SIZE, Message, read_message, write_message};
+pub use msg_cf::{
+    FilterType, MAX_CFHEADERS_PER_MSG, MAX_CFILTER_DATA_SIZE, MAX_CFILTERS_V2_PER_BATCH,
+    MAX_FILTER_TYPES_PER_MSG, MAX_HEADER_PROOF_HASHES, MsgCFHeaders, MsgCFTypes, MsgCFilter,
+    MsgCFilterV2, MsgCFiltersV2, MsgGetCFHeaders, MsgGetCFilter, MsgGetCFilterV2, MsgGetCFsV2,
+};
+pub use msg_control::{
+    MAX_ADDR_PER_MSG, MAX_USER_AGENT_LEN, MsgAddr, MsgFeeFilter, MsgPing, MsgPong, MsgReject,
+    MsgVersion, RejectCode,
+};
+pub use msg_data::{
+    BlockLocator, INIT_STATE_HEAD_BLOCK_VOTES, INIT_STATE_HEAD_BLOCKS, INIT_STATE_TSPENDS,
+    MAX_BLOCK_HEADERS_PER_MSG, MAX_BLOCK_LOCATORS_PER_MSG, MAX_BLOCK_PAYLOAD, MAX_BLOCK_PAYLOAD_V3,
+    MAX_INIT_STATE_TYPE_LEN, MAX_INIT_STATE_TYPES, MAX_IS_BLOCKS_AT_HEAD_PER_MSG,
+    MAX_IS_TSPENDS_AT_HEAD_PER_MSG, MAX_IS_VOTES_AT_HEAD_PER_MSG, MAX_MS_BLOCKS_AT_HEAD_PER_MSG,
+    MAX_MS_VOTES_AT_HEAD_PER_MSG, MsgBlock, MsgGetBlocks, MsgGetData, MsgGetHeaders,
+    MsgGetInitState, MsgHeaders, MsgInitState, MsgInv, MsgMiningState, MsgNotFound,
+    max_tx_per_tx_tree,
+};
 pub use msgtx::{
     DEFAULT_PK_SCRIPT_VERSION, MAX_PREV_OUT_INDEX, MAX_TX_IN_PER_MESSAGE, MAX_TX_IN_SEQUENCE_NUM,
     MAX_TX_OUT_PER_MESSAGE, MsgTx, NO_EXPIRY_VALUE, NULL_BLOCK_HEIGHT, NULL_BLOCK_INDEX,
     NULL_VALUE_IN, OutPoint, TX_TREE_REGULAR, TX_TREE_STAKE, TX_TREE_UNKNOWN, TX_VERSION, TxIn,
     TxOut, TxSerializeType,
+};
+pub use netaddress::{MAX_NET_ADDRESS_PAYLOAD, NetAddress};
+pub use protocol::{
+    BATCHED_CFILTERS_V2_VERSION, CFILTER_V2_VERSION, CurrencyNet, FEE_FILTER_VERSION,
+    INIT_STATE_VERSION, INITIAL_PROTOCOL_VERSION, MAX_BLOCK_SIZE_VERSION, MIX_VERSION,
+    NODE_BLOOM_VERSION, NODE_CF_VERSION, PROTOCOL_VERSION, REMOVE_REJECT_VERSION,
+    SEND_HEADERS_VERSION, ServiceFlag,
 };
 pub use varint::{read_var_int, var_int_serialize_size, write_var_int};
 
