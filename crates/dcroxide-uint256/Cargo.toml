@@ -1,0 +1,18 @@
+[package]
+name = "dcroxide-uint256"
+description = "Fixed-precision unsigned 256-bit arithmetic mirroring dcrd's math/uint256"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+proptest = "1"
+
+[lints]
+workspace = true

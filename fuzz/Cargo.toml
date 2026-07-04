@@ -14,6 +14,7 @@ arbitrary = { version = "1", features = ["derive"] }
 dcroxide-chainhash = { path = "../crates/dcroxide-chainhash" }
 dcroxide-crypto = { path = "../crates/dcroxide-crypto" }
 dcroxide-dcrec = { path = "../crates/dcroxide-dcrec" }
+dcroxide-uint256 = { path = "../crates/dcroxide-uint256" }
 dcroxide-wire = { path = "../crates/dcroxide-wire" }
 
 [[bin]]
@@ -54,6 +55,13 @@ bench = false
 [[bin]]
 name = "dcrec_pubkey_parse"
 path = "fuzz_targets/dcrec_pubkey_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uint256_ops"
+path = "fuzz_targets/uint256_ops.rs"
 test = false
 doc = false
 bench = false

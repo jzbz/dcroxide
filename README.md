@@ -20,6 +20,9 @@ to validate, relay, or hold funds. Currently implemented:
 - `dcroxide-wire` (partial) — varints, `MsgTx` (all three serialization
   types + transaction hashes), and the 180-byte `BlockHeader` + block hash;
   every codec under differential test, fuzzing, and round-trip property tests
+- `dcroxide-uint256` — fixed-precision 256-bit arithmetic (difficulty/work
+  math) ported operation-for-operation from dcrd's `math/uint256`,
+  differentially tested against it across every operation
 - `dcroxide-dcrec` — all three Decred signature types with dcrd's exact
   acceptance rules and error identities: ECDSA-secp256k1 (type 0, over
   libsecp256k1), Ed25519 (type 1, over curve25519-dalek with dcrd's

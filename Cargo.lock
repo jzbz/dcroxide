@@ -165,6 +165,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-uint256"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-testutil",
+ "proptest",
+]
+
+[[package]]
 name = "dcroxide-wire"
 version = "0.1.0"
 dependencies = [

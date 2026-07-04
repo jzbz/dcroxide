@@ -46,6 +46,9 @@
 //	ed25519_verify     → data is 32-byte pubkey || 64-byte raw sig || message;
 //	                     R/S are taken raw (no ParseSignature) to expose the
 //	                     verify-layer semantics; {"result": "true"|"false"}
+//	uint256_op         → data is op(1) || a(32 BE) || b(32 BE) || aux(8 BE);
+//	                     {"result": "<hex 32-byte BE>"} for value ops or the
+//	                     plain string for bitlen/cmp/text ops (see handler)
 package main
 
 import (
@@ -63,6 +66,7 @@ import (
 	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec/edwards/v2"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	"github.com/decred/dcrd/math/uint256"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/schnorr"
 	"github.com/decred/dcrd/wire"
@@ -320,6 +324,80 @@ func handle(req request) response {
 			return response{Result: "true"}
 		}
 		return response{Result: "false"}
+
+	case "uint256_op":
+		if len(data) != 1+32+32+8 {
+			return errResp("uint256_op: want 73 bytes, got %d", len(data))
+		}
+		op := data[0]
+		var aBytes, bBytes [32]byte
+		copy(aBytes[:], data[1:33])
+		copy(bBytes[:], data[33:65])
+		a := new(uint256.Uint256).SetBytes(&aBytes)
+		b := new(uint256.Uint256).SetBytes(&bBytes)
+		var aux uint64
+		for _, by := range data[65:73] {
+			aux = aux<<8 | uint64(by)
+		}
+
+		hexResult := func(n *uint256.Uint256) response {
+			nb := n.Bytes()
+			return response{Result: hex.EncodeToString(nb[:])}
+		}
+		switch op {
+		case 0:
+			return hexResult(a.Add(b))
+		case 1:
+			return hexResult(a.Sub(b))
+		case 2:
+			return hexResult(a.Mul(b))
+		case 3:
+			if b.IsZero() {
+				return errResp("uint256_op: division by zero")
+			}
+			return hexResult(a.Div(b))
+		case 4:
+			return hexResult(a.Square())
+		case 5:
+			return hexResult(a.Negate())
+		case 6:
+			return hexResult(a.Not())
+		case 7:
+			return hexResult(a.And(b))
+		case 8:
+			return hexResult(a.Or(b))
+		case 9:
+			return hexResult(a.Xor(b))
+		case 10:
+			return hexResult(a.Lsh(uint32(aux)))
+		case 11:
+			return hexResult(a.Rsh(uint32(aux)))
+		case 12:
+			return response{Result: fmt.Sprintf("%d", a.BitLen())}
+		case 13:
+			return response{Result: fmt.Sprintf("%d", a.Cmp(b))}
+		case 14:
+			return response{Result: a.Text(uint256.OutputBaseBinary)}
+		case 15:
+			return response{Result: a.Text(uint256.OutputBaseOctal)}
+		case 16:
+			return response{Result: a.Text(uint256.OutputBaseDecimal)}
+		case 17:
+			return response{Result: a.Text(uint256.OutputBaseHex)}
+		case 18:
+			return hexResult(a.AddUint64(aux))
+		case 19:
+			return hexResult(a.SubUint64(aux))
+		case 20:
+			return hexResult(a.MulUint64(aux))
+		case 21:
+			if aux == 0 {
+				return errResp("uint256_op: division by zero")
+			}
+			return hexResult(a.DivUint64(aux))
+		default:
+			return errResp("uint256_op: unknown op %d", op)
+		}
 
 	default:
 		return errResp("unknown cmd: %s", req.Cmd)

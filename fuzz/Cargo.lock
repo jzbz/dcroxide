@@ -144,9 +144,14 @@ dependencies = [
  "dcroxide-chainhash",
  "dcroxide-crypto",
  "dcroxide-dcrec",
+ "dcroxide-uint256",
  "dcroxide-wire",
  "libfuzzer-sys",
 ]
+
+[[package]]
+name = "dcroxide-uint256"
+version = "0.1.0"
 
 [[package]]
 name = "dcroxide-wire"
