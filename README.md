@@ -9,8 +9,9 @@ Parity target: **dcrd `release-v2.1.5`** — wire protocol 12, JSON-RPC API
 [PARITY.md](PARITY.md) for per-package status. The full plan lives in
 [dcroxide-project-brief.md](dcroxide-project-brief.md).
 
-**Status: pre-alpha — Phase 0/1 (rig + primitives).** Nothing here is ready
-to validate, relay, or hold funds. Currently implemented:
+**Status: pre-alpha — through Phase 3 (rig, primitives, wire, chaincfg).**
+Nothing here is ready to validate, relay, or hold funds. Currently
+implemented:
 
 - `dcroxide-crypto` — BLAKE-256 (vendored from
   [dcr-rs](https://github.com/jzbz/dcr-rs), KAT-pinned, differential-tested
@@ -32,6 +33,12 @@ to validate, relay, or hold funds. Currently implemented:
   2017-agl verify semantics), and EC-Schnorr-DCRv0 (type 2, over k256 with
   dcrd's RFC6979 nonce variant); every signing path differentially verified
   byte-for-byte against dcrd
+- `dcroxide-chaincfg` — all four networks' consensus parameters
+  (mainnet/testnet3/simnet/regnet): genesis blocks reproducing dcrd's exact
+  hashes and quirks, the full consensus-agenda deployment history, and the
+  block-one premine ledgers; the complete parameter set is dumped
+  field-by-field and compared byte-for-byte against dcrd's `chaincfg`
+  through the oracle
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
 

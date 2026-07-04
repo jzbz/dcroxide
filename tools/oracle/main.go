@@ -54,6 +54,11 @@
 //	                      "compressed": "<command>"} or
 //	                     {"error": ..., "kind": "Err..." when a wire
 //	                      MessageError}
+//	chaincfg_dump      → data is the network name bytes ("mainnet",
+//	                     "testnet3", "simnet", or "regnet");
+//	                     {"result": "<hex of the canonical params dump>"}
+//	                     (line format defined by dumpParams below, mirrored
+//	                     byte-for-byte by dcroxide's Params::dump)
 package main
 
 import (
@@ -65,10 +70,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 
 	"math/big"
 
 	"github.com/decred/dcrd/chaincfg/chainhash"
+	chaincfg "github.com/decred/dcrd/chaincfg/v3"
 	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec/edwards/v2"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -429,9 +439,168 @@ func handle(req request) response {
 			Compressed: msg.Command(),
 		}
 
+	case "chaincfg_dump":
+		var params *chaincfg.Params
+		switch string(data) {
+		case "mainnet":
+			params = chaincfg.MainNetParams()
+		case "testnet3":
+			params = chaincfg.TestNet3Params()
+		case "simnet":
+			params = chaincfg.SimNetParams()
+		case "regnet":
+			params = chaincfg.RegNetParams()
+		default:
+			return errResp("chaincfg_dump: unknown network %q", string(data))
+		}
+		dump, err := dumpParams(params)
+		if err != nil {
+			return errResp("chaincfg_dump: %v", err)
+		}
+		return response{Result: hex.EncodeToString([]byte(dump))}
+
 	default:
 		return errResp("unknown cmd: %s", req.Cmd)
 	}
+}
+
+// dumpParams renders every network parameter as canonical line-oriented
+// text. The format must stay byte-identical to dcroxide's Params::dump —
+// that equality across all four networks is the chaincfg parity test.
+func dumpParams(p *chaincfg.Params) (string, error) {
+	var w strings.Builder
+	fmt.Fprintf(&w, "name=%s\n", p.Name)
+	fmt.Fprintf(&w, "net=0x%08x\n", uint32(p.Net))
+	fmt.Fprintf(&w, "defaultport=%s\n", p.DefaultPort)
+	for _, seed := range p.DNSSeeds {
+		fmt.Fprintf(&w, "dnsseed=%s %t\n", seed.Host, seed.HasFiltering)
+	}
+	for _, seeder := range p.Seeders() {
+		fmt.Fprintf(&w, "seeder=%s\n", seeder)
+	}
+	fmt.Fprintf(&w, "genesishash=%s\n", p.GenesisHash.String())
+	blockBytes, err := p.GenesisBlock.Bytes()
+	if err != nil {
+		return "", fmt.Errorf("serialize genesis block: %w", err)
+	}
+	fmt.Fprintf(&w, "genesisblock=%s\n", hex.EncodeToString(blockBytes))
+	fmt.Fprintf(&w, "powlimit=%064x\n", p.PowLimit)
+	fmt.Fprintf(&w, "powlimitbits=0x%08x\n", p.PowLimitBits)
+	fmt.Fprintf(&w, "reducemindifficulty=%t\n", p.ReduceMinDifficulty)
+	fmt.Fprintf(&w, "mindiffreductiontime=%d\n", int64(p.MinDiffReductionTime/time.Second))
+	fmt.Fprintf(&w, "generatesupported=%t\n", p.GenerateSupported)
+	sizes := make([]string, 0, len(p.MaximumBlockSizes))
+	for _, s := range p.MaximumBlockSizes {
+		sizes = append(sizes, strconv.Itoa(s))
+	}
+	fmt.Fprintf(&w, "maximumblocksizes=%s\n", strings.Join(sizes, ","))
+	fmt.Fprintf(&w, "maxtxsize=%d\n", p.MaxTxSize)
+	fmt.Fprintf(&w, "targettimeperblock=%d\n", int64(p.TargetTimePerBlock/time.Second))
+	fmt.Fprintf(&w, "workdiffalpha=%d\n", p.WorkDiffAlpha)
+	fmt.Fprintf(&w, "workdiffwindowsize=%d\n", p.WorkDiffWindowSize)
+	fmt.Fprintf(&w, "workdiffwindows=%d\n", p.WorkDiffWindows)
+	fmt.Fprintf(&w, "targettimespan=%d\n", int64(p.TargetTimespan/time.Second))
+	fmt.Fprintf(&w, "retargetadjustmentfactor=%d\n", p.RetargetAdjustmentFactor)
+	fmt.Fprintf(&w, "workdiffv2blake3startbits=0x%08x\n", p.WorkDiffV2Blake3StartBits)
+	fmt.Fprintf(&w, "workdiffv2halflifesecs=%d\n", p.WorkDiffV2HalfLifeSecs)
+	fmt.Fprintf(&w, "basesubsidy=%d\n", p.BaseSubsidy)
+	fmt.Fprintf(&w, "mulsubsidy=%d\n", p.MulSubsidy)
+	fmt.Fprintf(&w, "divsubsidy=%d\n", p.DivSubsidy)
+	fmt.Fprintf(&w, "subsidyreductioninterval=%d\n", p.SubsidyReductionInterval)
+	fmt.Fprintf(&w, "workrewardproportion=%d\n", p.WorkRewardProportion)
+	fmt.Fprintf(&w, "workrewardproportionv2=%d\n", p.WorkRewardProportionV2)
+	fmt.Fprintf(&w, "stakerewardproportion=%d\n", p.StakeRewardProportion)
+	fmt.Fprintf(&w, "stakerewardproportionv2=%d\n", p.StakeRewardProportionV2)
+	fmt.Fprintf(&w, "blocktaxproportion=%d\n", p.BlockTaxProportion)
+	fmt.Fprintf(&w, "assumevalid=%s\n", p.AssumeValid.String())
+	if p.MinKnownChainWork != nil {
+		fmt.Fprintf(&w, "minknownchainwork=%064x\n", p.MinKnownChainWork)
+	} else {
+		fmt.Fprintf(&w, "minknownchainwork=nil\n")
+	}
+	fmt.Fprintf(&w, "rulechangeactivationquorum=%d\n", p.RuleChangeActivationQuorum)
+	fmt.Fprintf(&w, "rulechangeactivationmultiplier=%d\n", p.RuleChangeActivationMultiplier)
+	fmt.Fprintf(&w, "rulechangeactivationdivisor=%d\n", p.RuleChangeActivationDivisor)
+	fmt.Fprintf(&w, "rulechangeactivationinterval=%d\n", p.RuleChangeActivationInterval)
+	versions := make([]uint32, 0, len(p.Deployments))
+	for version := range p.Deployments {
+		versions = append(versions, version)
+	}
+	sort.Slice(versions, func(i, j int) bool { return versions[i] < versions[j] })
+	for _, version := range versions {
+		for _, dep := range p.Deployments[version] {
+			fmt.Fprintf(&w,
+				"deployment version=%d id=%s mask=0x%04x forced=%s start=%d expire=%d desc=%s\n",
+				version, dep.Vote.Id, dep.Vote.Mask, dep.ForcedChoiceID,
+				dep.StartTime, dep.ExpireTime, dep.Vote.Description)
+			for _, c := range dep.Vote.Choices {
+				fmt.Fprintf(&w, "choice id=%s bits=0x%04x abstain=%t no=%t desc=%s\n",
+					c.Id, c.Bits, c.IsAbstain, c.IsNo, c.Description)
+			}
+		}
+	}
+	fmt.Fprintf(&w, "blockenforcenumrequired=%d\n", p.BlockEnforceNumRequired)
+	fmt.Fprintf(&w, "blockrejectnumrequired=%d\n", p.BlockRejectNumRequired)
+	fmt.Fprintf(&w, "blockupgradenumtocheck=%d\n", p.BlockUpgradeNumToCheck)
+	fmt.Fprintf(&w, "acceptnonstdtxs=%t\n", p.AcceptNonStdTxs)
+	fmt.Fprintf(&w, "networkaddressprefix=%s\n", p.NetworkAddressPrefix)
+	fmt.Fprintf(&w, "pubkeyaddrid=%s\n", hex.EncodeToString(p.PubKeyAddrID[:]))
+	fmt.Fprintf(&w, "pubkeyhashaddrid=%s\n", hex.EncodeToString(p.PubKeyHashAddrID[:]))
+	fmt.Fprintf(&w, "pkhedwardsaddrid=%s\n", hex.EncodeToString(p.PKHEdwardsAddrID[:]))
+	fmt.Fprintf(&w, "pkhschnorraddrid=%s\n", hex.EncodeToString(p.PKHSchnorrAddrID[:]))
+	fmt.Fprintf(&w, "scripthashaddrid=%s\n", hex.EncodeToString(p.ScriptHashAddrID[:]))
+	fmt.Fprintf(&w, "privatekeyid=%s\n", hex.EncodeToString(p.PrivateKeyID[:]))
+	fmt.Fprintf(&w, "hdprivatekeyid=%s\n", hex.EncodeToString(p.HDPrivateKeyID[:]))
+	fmt.Fprintf(&w, "hdpublickeyid=%s\n", hex.EncodeToString(p.HDPublicKeyID[:]))
+	fmt.Fprintf(&w, "slip0044cointype=%d\n", p.SLIP0044CoinType)
+	fmt.Fprintf(&w, "legacycointype=%d\n", p.LegacyCoinType)
+	fmt.Fprintf(&w, "minimumstakediff=%d\n", p.MinimumStakeDiff)
+	fmt.Fprintf(&w, "ticketpoolsize=%d\n", p.TicketPoolSize)
+	fmt.Fprintf(&w, "ticketsperblock=%d\n", p.TicketsPerBlock)
+	fmt.Fprintf(&w, "ticketmaturity=%d\n", p.TicketMaturity)
+	fmt.Fprintf(&w, "ticketexpiry=%d\n", p.TicketExpiry)
+	fmt.Fprintf(&w, "coinbasematurity=%d\n", p.CoinbaseMaturity)
+	fmt.Fprintf(&w, "sstxchangematurity=%d\n", p.SStxChangeMaturity)
+	fmt.Fprintf(&w, "ticketpoolsizeweight=%d\n", p.TicketPoolSizeWeight)
+	fmt.Fprintf(&w, "stakediffalpha=%d\n", p.StakeDiffAlpha)
+	fmt.Fprintf(&w, "stakediffwindowsize=%d\n", p.StakeDiffWindowSize)
+	fmt.Fprintf(&w, "stakediffwindows=%d\n", p.StakeDiffWindows)
+	fmt.Fprintf(&w, "stakeversioninterval=%d\n", p.StakeVersionInterval)
+	fmt.Fprintf(&w, "maxfreshstakeperblock=%d\n", p.MaxFreshStakePerBlock)
+	fmt.Fprintf(&w, "stakeenabledheight=%d\n", p.StakeEnabledHeight)
+	fmt.Fprintf(&w, "stakevalidationheight=%d\n", p.StakeValidationHeight)
+	fmt.Fprintf(&w, "stakebasesigscript=%s\n", hex.EncodeToString(p.StakeBaseSigScript))
+	fmt.Fprintf(&w, "stakemajoritymultiplier=%d\n", p.StakeMajorityMultiplier)
+	fmt.Fprintf(&w, "stakemajoritydivisor=%d\n", p.StakeMajorityDivisor)
+	fmt.Fprintf(&w, "organizationpkscript=%s\n", hex.EncodeToString(p.OrganizationPkScript))
+	fmt.Fprintf(&w, "organizationpkscriptversion=%d\n", p.OrganizationPkScriptVersion)
+	var ledgerBuf bytes.Buffer
+	for _, payout := range p.BlockOneLedger {
+		var tmp [8]byte
+		binary.LittleEndian.PutUint16(tmp[0:2], payout.ScriptVersion)
+		ledgerBuf.Write(tmp[0:2])
+		binary.LittleEndian.PutUint32(tmp[0:4], uint32(len(payout.Script)))
+		ledgerBuf.Write(tmp[0:4])
+		ledgerBuf.Write(payout.Script)
+		binary.LittleEndian.PutUint64(tmp[0:8], uint64(payout.Amount))
+		ledgerBuf.Write(tmp[0:8])
+	}
+	ledgerHash := blake256.Sum256(ledgerBuf.Bytes())
+	fmt.Fprintf(&w, "blockoneledger count=%d hash=%s\n",
+		len(p.BlockOneLedger), hex.EncodeToString(ledgerHash[:]))
+	for _, key := range p.PiKeys {
+		fmt.Fprintf(&w, "pikey=%s\n", hex.EncodeToString(key))
+	}
+	fmt.Fprintf(&w, "treasuryvoteinterval=%d\n", p.TreasuryVoteInterval)
+	fmt.Fprintf(&w, "treasuryvoteintervalmultiplier=%d\n", p.TreasuryVoteIntervalMultiplier)
+	fmt.Fprintf(&w, "treasuryvotequorummultiplier=%d\n", p.TreasuryVoteQuorumMultiplier)
+	fmt.Fprintf(&w, "treasuryvotequorumdivisor=%d\n", p.TreasuryVoteQuorumDivisor)
+	fmt.Fprintf(&w, "treasuryvoterequiredmultiplier=%d\n", p.TreasuryVoteRequiredMultiplier)
+	fmt.Fprintf(&w, "treasuryvoterequireddivisor=%d\n", p.TreasuryVoteRequiredDivisor)
+	fmt.Fprintf(&w, "treasuryexpenditurewindow=%d\n", p.TreasuryExpenditureWindow)
+	fmt.Fprintf(&w, "treasuryexpenditurepolicy=%d\n", p.TreasuryExpenditurePolicy)
+	fmt.Fprintf(&w, "treasuryexpenditurebootstrap=%d\n", p.TreasuryExpenditureBootstrap)
+	return w.String(), nil
 }
 
 func main() {

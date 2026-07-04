@@ -1,0 +1,21 @@
+[package]
+name = "dcroxide-chaincfg"
+description = "Decred network parameters mirroring dcrd's chaincfg: genesis blocks, consensus agendas, and per-network constants"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-crypto = { path = "../dcroxide-crypto" }
+dcroxide-uint256 = { path = "../dcroxide-uint256" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true
