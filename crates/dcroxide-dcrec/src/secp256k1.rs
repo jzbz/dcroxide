@@ -5,9 +5,11 @@
 use core::fmt;
 
 pub mod ecdsa;
+pub mod nonce;
+pub mod schnorr;
 
 /// The secp256k1 field prime P as 32 big-endian bytes.
-const FIELD_PRIME: [u8; 32] = [
+pub const FIELD_PRIME_BYTES: [u8; 32] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff, 0xfc, 0x2f,
 ];
@@ -152,10 +154,10 @@ impl PublicKey {
                 // would wrap around the field prime).
                 let x: &[u8; 32] = serialized[1..33].try_into().expect("32 bytes");
                 let y: &[u8; 32] = serialized[33..65].try_into().expect("32 bytes");
-                if *x >= FIELD_PRIME {
+                if *x >= FIELD_PRIME_BYTES {
                     return Err(Error::PubKeyXTooBig);
                 }
-                if *y >= FIELD_PRIME {
+                if *y >= FIELD_PRIME_BYTES {
                     return Err(Error::PubKeyYTooBig);
                 }
 
@@ -182,7 +184,7 @@ impl PublicKey {
                     return Err(Error::PubKeyInvalidFormat);
                 }
                 let x: &[u8; 32] = serialized[1..33].try_into().expect("32 bytes");
-                if *x >= FIELD_PRIME {
+                if *x >= FIELD_PRIME_BYTES {
                     return Err(Error::PubKeyXTooBig);
                 }
 
@@ -210,6 +212,15 @@ impl PublicKey {
 
     pub(crate) fn inner(&self) -> &libsecp256k1::PublicKey {
         &self.inner
+    }
+
+    /// The key as a k256 projective point (for the Schnorr-DCRv0 math,
+    /// which needs raw group operations per ADR-0006).
+    pub(crate) fn as_k256_point(&self) -> k256::ProjectivePoint {
+        let compressed = self.inner.serialize();
+        k256::PublicKey::from_sec1_bytes(&compressed)
+            .expect("PublicKey is always a valid curve point")
+            .to_projective()
     }
 }
 

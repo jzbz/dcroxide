@@ -22,8 +22,9 @@ to validate, relay, or hold funds. Currently implemented:
   every codec under differential test, fuzzing, and round-trip property tests
 - `dcroxide-dcrec` (partial) — ECDSA-secp256k1 (signature type 0) with
   dcrd's exact DER and public key acceptance rules and error identities over
-  libsecp256k1; RFC6979 signing differentially verified byte-for-byte
-  against dcrd
+  libsecp256k1, and EC-Schnorr-DCRv0 (signature type 2) on k256 with dcrd's
+  RFC6979 nonce variant ported exactly; both signing paths differentially
+  verified byte-for-byte against dcrd
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
 

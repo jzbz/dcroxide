@@ -30,6 +30,13 @@
 //	pubkey_parse       → {"result": "<hex uncompressed>",
 //	                      "compressed": "<hex compressed>"} or
 //	                     {"error": ..., "kind": "ErrPubKey..."}
+//	schnorr_parse      → {"result": "<hex 64-byte r||s>"} or
+//	                     {"error": ..., "kind": "ErrSig..."}
+//	schnorr_sign       → data is 32-byte privkey || 32-byte hash;
+//	                     {"result": "<hex 64-byte signature>"}
+//	schnorr_verify     → data is 33-byte compressed pubkey || 32-byte hash ||
+//	                     64-byte signature; {"result": "true"|"false"}
+//	schnorr_pubkey_parse → {"result": "<hex compressed>"} or {"error": ...}
 package main
 
 import (
@@ -45,6 +52,7 @@ import (
 	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
+	"github.com/decred/dcrd/dcrec/secp256k1/v4/schnorr"
 	"github.com/decred/dcrd/wire"
 )
 
@@ -81,6 +89,11 @@ func errKindResp(err error) response {
 	var keyErr secp256k1.Error
 	if errors.As(err, &keyErr) {
 		resp.Kind = keyErr.Err.Error()
+		return resp
+	}
+	var schnorrErr schnorr.Error
+	if errors.As(err, &schnorrErr) {
+		resp.Kind = schnorrErr.Err.Error()
 	}
 	return resp
 }
@@ -191,6 +204,49 @@ func handle(req request) response {
 			Result:     hex.EncodeToString(pubKey.SerializeUncompressed()),
 			Compressed: hex.EncodeToString(pubKey.SerializeCompressed()),
 		}
+
+	case "schnorr_parse":
+		sig, err := schnorr.ParseSignature(data)
+		if err != nil {
+			return errKindResp(err)
+		}
+		return response{Result: hex.EncodeToString(sig.Serialize())}
+
+	case "schnorr_sign":
+		if len(data) != 64 {
+			return errResp("schnorr_sign: want 64 bytes (privkey || hash), got %d",
+				len(data))
+		}
+		privKey := secp256k1.PrivKeyFromBytes(data[:32])
+		sig, err := schnorr.Sign(privKey, data[32:])
+		if err != nil {
+			return errKindResp(err)
+		}
+		return response{Result: hex.EncodeToString(sig.Serialize())}
+
+	case "schnorr_verify":
+		if len(data) != 33+32+64 {
+			return errResp("schnorr_verify: want 129 bytes, got %d", len(data))
+		}
+		pubKey, err := secp256k1.ParsePubKey(data[:33])
+		if err != nil {
+			return errKindResp(err)
+		}
+		sig, err := schnorr.ParseSignature(data[33+32:])
+		if err != nil {
+			return errKindResp(err)
+		}
+		if sig.Verify(data[33:33+32], pubKey) {
+			return response{Result: "true"}
+		}
+		return response{Result: "false"}
+
+	case "schnorr_pubkey_parse":
+		pubKey, err := schnorr.ParsePubKey(data)
+		if err != nil {
+			return errKindResp(err)
+		}
+		return response{Result: hex.EncodeToString(pubKey.SerializeCompressed())}
 
 	default:
 		return errResp("unknown cmd: %s", req.Cmd)

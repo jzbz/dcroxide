@@ -112,19 +112,26 @@ fn repo_root() -> &'static Path {
 }
 
 /// Build the oracle into `target/oracle/` and return the binary path.
+///
+/// Multiple test binaries run concurrently and all build the oracle, so the
+/// build goes to a process-unique path first and is then atomically renamed
+/// into place — spawning processes always see a complete binary (Go's build
+/// cache makes the duplicate builds cheap).
 fn build_oracle() -> PathBuf {
     let root = repo_root();
     let out_dir = root.join("target").join("oracle");
     std::fs::create_dir_all(&out_dir).expect("create target/oracle");
-    let bin = out_dir.join(if cfg!(windows) {
-        "dcrd-oracle.exe"
-    } else {
-        "dcrd-oracle"
-    });
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    let bin = out_dir.join(format!("dcrd-oracle{suffix}"));
+    // Unique per process *and* per calling thread: tests within one binary
+    // run concurrently and share a pid.
+    static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = out_dir.join(format!("dcrd-oracle-{}-{seq}{suffix}", std::process::id()));
 
     let output = Command::new("go")
         .args(["build", "-o"])
-        .arg(&bin)
+        .arg(&tmp)
         .arg(".")
         .current_dir(root.join("tools").join("oracle"))
         .output()
@@ -134,6 +141,7 @@ fn build_oracle() -> PathBuf {
         "go build failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    std::fs::rename(&tmp, &bin).expect("move oracle binary into place");
     bin
 }
 

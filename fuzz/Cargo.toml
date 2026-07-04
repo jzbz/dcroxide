@@ -38,6 +38,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "dcrec_schnorr"
+path = "fuzz_targets/dcrec_schnorr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "dcrec_pubkey_parse"
 path = "fuzz_targets/dcrec_pubkey_parse.rs"
 test = false
