@@ -130,6 +130,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-base58"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-crypto",
+ "dcroxide-testutil",
+]
+
+[[package]]
 name = "dcroxide-chaincfg"
 version = "0.1.0"
 dependencies = [
@@ -180,6 +188,8 @@ dependencies = [
 name = "dcroxide-txscript"
 version = "0.1.0"
 dependencies = [
+ "dcroxide-base58",
+ "dcroxide-chaincfg",
  "dcroxide-chainhash",
  "dcroxide-crypto",
  "dcroxide-dcrec",

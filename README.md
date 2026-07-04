@@ -45,7 +45,12 @@ Currently implemented:
   flag combinations and P2SH handling, strict-encoding checks, signature
   hashing, and signature checking across all three suites; dcrd's entire
   `script_tests.json`/`tx_valid`/`tx_invalid`/`sighash.json` corpora run
-  green, backed by a live differential script fuzzer against dcrd
+  green, backed by a live differential script fuzzer against dcrd. The
+  `stdaddr` and `stdscript` modules add all seven version-0 address kinds
+  and standard-script classification, differentially matched against dcrd
+  across every network
+- `dcroxide-base58` — modified base58 and Decred base58check from
+  decred/base58, vector- and differentially-tested
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
 

@@ -15,7 +15,8 @@
 //! - dcrd's `optimizeSigVerification` prefix-hash cache is permanently
 //!   disabled dead code at the parity tag and is likewise not reproduced.
 //!
-//! The `stdaddr`/`stdscript`/`sign` subpackages are a separate crate phase.
+//! The `stdaddr` and `stdscript` subpackages live in the modules of the
+//! same names; `sign` is a later piece.
 
 #![cfg_attr(not(test), no_std)]
 // The engine's arithmetic mirrors dcrd's Go semantics; every operation that
@@ -36,6 +37,8 @@ mod script;
 mod scriptnum;
 mod sighash;
 mod stack;
+pub mod stdaddr;
+pub mod stdscript;
 mod tokenizer;
 
 pub use builder::{NotCanonicalError, ScriptBuilder, canonical_data_size};

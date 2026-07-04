@@ -1,0 +1,18 @@
+[package]
+name = "dcroxide-base58"
+description = "Modified base58 and Decred base58check (2-byte version, double BLAKE-256 checksum) mirroring decred/base58"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-crypto = { path = "../dcroxide-crypto" }
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true

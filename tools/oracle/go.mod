@@ -4,6 +4,7 @@ go 1.24.0
 
 // Pinned to the versions required by dcrd release-v2.1.5 (the parity target).
 require (
+	github.com/decred/base58 v1.0.6
 	github.com/decred/dcrd/chaincfg/chainhash v1.0.5
 	github.com/decred/dcrd/chaincfg/v3 v3.3.0
 	github.com/decred/dcrd/crypto/blake256 v1.1.0

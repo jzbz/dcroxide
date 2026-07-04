@@ -63,6 +63,19 @@
 //	                     script_len(4 BE) || script || serialized tx;
 //	                     {"result": "<hex 32-byte sighash>"} or
 //	                     {"error": ..., "kind": ...}
+//	base58_encode      → {"result": "<encoded string>"} (omitted if empty)
+//	base58_decode      → data is the string bytes; {"result": "<hex>"}
+//	                     (omitted if empty; invalid input decodes empty)
+//	base58_check_encode → data is version(2) || payload; {"result": "<str>"}
+//	base58_check_decode → data is the string bytes;
+//	                     {"result": "<hex version||payload>"} or
+//	                     {"error": ..., "kind": "checksum"|"invalid format"}
+//	stdaddr_decode     → data is net_len(1) || net name || amount(8 BE) ||
+//	                     votefee(8 BE) || revokefee(8 BE) || address bytes;
+//	                     {"result": "<hex of canonical address dump>"} or
+//	                     {"error": ..., "kind": "Err..."}
+//	stdscript_analyze  → data is net_len(1) || net name || version(2 BE) ||
+//	                     script; {"result": "<hex of canonical analysis>"}
 //	chaincfg_dump      → data is the network name bytes ("mainnet",
 //	                     "testnet3", "simnet", or "regnet");
 //	                     {"result": "<hex of the canonical params dump>"}
@@ -86,9 +99,12 @@ import (
 
 	"math/big"
 
+	"github.com/decred/base58"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	chaincfg "github.com/decred/dcrd/chaincfg/v3"
 	"github.com/decred/dcrd/txscript/v4"
+	"github.com/decred/dcrd/txscript/v4/stdaddr"
+	"github.com/decred/dcrd/txscript/v4/stdscript"
 	"github.com/decred/dcrd/crypto/blake256"
 	"github.com/decred/dcrd/dcrec/edwards/v2"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -505,19 +521,98 @@ func handle(req request) response {
 		}
 		return response{Result: hex.EncodeToString(hash)}
 
+	case "base58_encode":
+		return response{Result: base58.Encode(data)}
+
+	case "base58_decode":
+		return response{Result: hex.EncodeToString(base58.Decode(string(data)))}
+
+	case "base58_check_encode":
+		if len(data) < 2 {
+			return errResp("base58_check_encode: want >= 2 bytes")
+		}
+		var version [2]byte
+		copy(version[:], data[0:2])
+		return response{Result: base58.CheckEncode(data[2:], version)}
+
+	case "base58_check_decode":
+		payload, version, err := base58.CheckDecode(string(data))
+		if err != nil {
+			resp := response{Error: err.Error()}
+			if errors.Is(err, base58.ErrChecksum) {
+				resp.Kind = "checksum"
+			} else {
+				resp.Kind = "invalid format"
+			}
+			return resp
+		}
+		return response{Result: hex.EncodeToString(append(version[:], payload...))}
+
+	case "stdaddr_decode":
+		// data: net_len(1) || net name || amount(8 BE) || votefee(8 BE) ||
+		//       revokefee(8 BE) || address string bytes
+		if len(data) < 1 {
+			return errResp("stdaddr_decode: empty request")
+		}
+		netLen := int(data[0])
+		if len(data) < 1+netLen+24 {
+			return errResp("stdaddr_decode: truncated request")
+		}
+		params, err := netParams(string(data[1 : 1+netLen]))
+		if err != nil {
+			return errResp("stdaddr_decode: %v", err)
+		}
+		rest := data[1+netLen:]
+		amount := int64(binary.BigEndian.Uint64(rest[0:8]))   // nolint:gosec
+		voteFee := int64(binary.BigEndian.Uint64(rest[8:16])) // nolint:gosec
+		revokeFee := int64(binary.BigEndian.Uint64(rest[16:24]))
+		addrStr := string(rest[24:])
+		addr, err := stdaddr.DecodeAddress(addrStr, params)
+		if err != nil {
+			var kindErr stdaddr.ErrorKind
+			resp := response{Error: err.Error()}
+			if errors.As(err, &kindErr) {
+				resp.Kind = kindErr.Error()
+			}
+			return resp
+		}
+		return response{Result: hex.EncodeToString([]byte(dumpStdAddr(addr,
+			amount, voteFee, revokeFee)))}
+
+	case "stdscript_analyze":
+		// data: net_len(1) || net name || version(2 BE) || script
+		if len(data) < 1 {
+			return errResp("stdscript_analyze: empty request")
+		}
+		netLen := int(data[0])
+		if len(data) < 1+netLen+2 {
+			return errResp("stdscript_analyze: truncated request")
+		}
+		params, err := netParams(string(data[1 : 1+netLen]))
+		if err != nil {
+			return errResp("stdscript_analyze: %v", err)
+		}
+		version := binary.BigEndian.Uint16(data[1+netLen : 3+netLen])
+		script := data[3+netLen:]
+		var w strings.Builder
+		scriptType, addrs := stdscript.ExtractAddrs(version, script, params)
+		fmt.Fprintf(&w, "type=%s\n", scriptType)
+		fmt.Fprintf(&w, "determined=%s\n", stdscript.DetermineScriptType(version, script))
+		fmt.Fprintf(&w, "reqsigs=%d\n", stdscript.DetermineRequiredSigs(version, script))
+		for _, addr := range addrs {
+			fmt.Fprintf(&w, "addr=%T %s\n", addr, addr.String())
+		}
+		if pushes := stdscript.ExtractAtomicSwapDataPushesV0(script); version == 0 && pushes != nil {
+			fmt.Fprintf(&w, "atomicswap=%x %x %x %d %d\n", pushes.RecipientHash160,
+				pushes.RefundHash160, pushes.SecretHash, pushes.SecretSize,
+				pushes.LockTime)
+		}
+		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
 	case "chaincfg_dump":
-		var params *chaincfg.Params
-		switch string(data) {
-		case "mainnet":
-			params = chaincfg.MainNetParams()
-		case "testnet3":
-			params = chaincfg.TestNet3Params()
-		case "simnet":
-			params = chaincfg.SimNetParams()
-		case "regnet":
-			params = chaincfg.RegNetParams()
-		default:
-			return errResp("chaincfg_dump: unknown network %q", string(data))
+		params, err := netParams(string(data))
+		if err != nil {
+			return errResp("chaincfg_dump: %v", err)
 		}
 		dump, err := dumpParams(params)
 		if err != nil {
@@ -528,6 +623,56 @@ func handle(req request) response {
 	default:
 		return errResp("unknown cmd: %s", req.Cmd)
 	}
+}
+
+// netParams maps a network name to its chaincfg parameters.
+func netParams(name string) (*chaincfg.Params, error) {
+	switch name {
+	case "mainnet":
+		return chaincfg.MainNetParams(), nil
+	case "testnet3":
+		return chaincfg.TestNet3Params(), nil
+	case "simnet":
+		return chaincfg.SimNetParams(), nil
+	case "regnet":
+		return chaincfg.RegNetParams(), nil
+	}
+	return nil, fmt.Errorf("unknown network %q", name)
+}
+
+// dumpStdAddr renders every observable surface of a decoded address as
+// canonical line-oriented text. The format must stay byte-identical to the
+// dump built by dcroxide's stdaddr differential test.
+func dumpStdAddr(addr stdaddr.Address, amount, voteFee, revokeFee int64) string {
+	var w strings.Builder
+	fmt.Fprintf(&w, "type=%T\n", addr)
+	fmt.Fprintf(&w, "string=%s\n", addr.String())
+	ver, script := addr.PaymentScript()
+	fmt.Fprintf(&w, "payment=%d:%x\n", ver, script)
+	if spk, ok := addr.(stdaddr.SerializedPubKeyer); ok {
+		fmt.Fprintf(&w, "serializedpubkey=%x\n", spk.SerializedPubKey())
+	}
+	if pkher, ok := addr.(stdaddr.AddressPubKeyHasher); ok {
+		fmt.Fprintf(&w, "pkh=%s\n", pkher.AddressPubKeyHash().String())
+	}
+	if h160er, ok := addr.(stdaddr.Hash160er); ok {
+		fmt.Fprintf(&w, "hash160=%x\n", *h160er.Hash160())
+	}
+	if sa, ok := addr.(stdaddr.StakeAddress); ok {
+		ver, script := sa.VotingRightsScript()
+		fmt.Fprintf(&w, "votingrights=%d:%x\n", ver, script)
+		ver, script = sa.RewardCommitmentScript(amount, voteFee, revokeFee)
+		fmt.Fprintf(&w, "rewardcommitment=%d:%x\n", ver, script)
+		ver, script = sa.StakeChangeScript()
+		fmt.Fprintf(&w, "stakechange=%d:%x\n", ver, script)
+		ver, script = sa.PayVoteCommitmentScript()
+		fmt.Fprintf(&w, "payvote=%d:%x\n", ver, script)
+		ver, script = sa.PayRevokeCommitmentScript()
+		fmt.Fprintf(&w, "payrevoke=%d:%x\n", ver, script)
+		ver, script = sa.PayFromTreasuryScript()
+		fmt.Fprintf(&w, "payfromtreasury=%d:%x\n", ver, script)
+	}
+	return w.String()
 }
 
 // dumpParams renders every network parameter as canonical line-oriented
