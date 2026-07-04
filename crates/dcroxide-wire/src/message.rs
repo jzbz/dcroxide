@@ -3,11 +3,6 @@
 //! payload length, BLAKE-256 checksum) and the dispatch across all message
 //! types (dcrd `message.go`).
 //!
-//! The eight mixing message commands (`mixpairreq` …) are recognized by
-//! dcrd but not yet implemented here; until the mixing piece lands, frames
-//! carrying them decode as [`WireError::UnknownCmd`] (tracked in
-//! PARITY.md).
-//!
 //! Quirk QK-0001: `reject` is *write-only* in dcrd at the pinned tag — its
 //! `makeEmptyMessage` has no case for it, so received reject frames fail
 //! with `ErrUnknownCmd` at every protocol version even though the encoder
@@ -24,6 +19,7 @@ use crate::error::WireError;
 use crate::msg_cf::*;
 use crate::msg_control::*;
 use crate::msg_data::*;
+use crate::msg_mix::*;
 use crate::msgtx::MsgTx;
 use crate::protocol::{CurrencyNet, SEND_HEADERS_VERSION, is_strict_ascii};
 
@@ -69,6 +65,15 @@ pub enum Message {
     InitState(MsgInitState),
     GetCFsV2(MsgGetCFsV2),
     CFiltersV2(MsgCFiltersV2),
+    MixPairReq(MsgMixPairReq),
+    // Boxed: the post-quantum public key array makes this variant ~1.4 KiB.
+    MixKeyExchange(alloc::boxed::Box<MsgMixKeyExchange>),
+    MixCiphertexts(MsgMixCiphertexts),
+    MixSlotReserve(MsgMixSlotReserve),
+    MixFactoredPoly(MsgMixFactoredPoly),
+    MixDCNet(MsgMixDCNet),
+    MixConfirm(MsgMixConfirm),
+    MixSecrets(MsgMixSecrets),
 }
 
 impl Message {
@@ -107,6 +112,14 @@ impl Message {
             Message::InitState(_) => "initstate",
             Message::GetCFsV2(_) => "getcfsv2",
             Message::CFiltersV2(_) => "cfiltersv2",
+            Message::MixPairReq(_) => "mixpairreq",
+            Message::MixKeyExchange(_) => "mixkeyxchg",
+            Message::MixCiphertexts(_) => "mixcphrtxt",
+            Message::MixSlotReserve(_) => "mixslotres",
+            Message::MixFactoredPoly(_) => "mixfactpoly",
+            Message::MixDCNet(_) => "mixdcnet",
+            Message::MixConfirm(_) => "mixconfirm",
+            Message::MixSecrets(_) => "mixsecrets",
         }
     }
 
@@ -162,6 +175,14 @@ impl Message {
             Message::InitState(m) => m.encode(&mut w, pver)?,
             Message::GetCFsV2(m) => m.encode(&mut w, pver)?,
             Message::CFiltersV2(m) => m.encode(&mut w, pver)?,
+            Message::MixPairReq(m) => m.encode(&mut w, pver)?,
+            Message::MixKeyExchange(m) => m.encode(&mut w, pver)?,
+            Message::MixCiphertexts(m) => m.encode(&mut w, pver)?,
+            Message::MixSlotReserve(m) => m.encode(&mut w, pver)?,
+            Message::MixFactoredPoly(m) => m.encode(&mut w, pver)?,
+            Message::MixDCNet(m) => m.encode(&mut w, pver)?,
+            Message::MixConfirm(m) => m.encode(&mut w, pver)?,
+            Message::MixSecrets(m) => m.encode(&mut w, pver)?,
         }
         Ok(w)
     }
@@ -193,6 +214,14 @@ fn max_payload_for_command(command: &str, pver: u32) -> Option<u32> {
         "initstate" => MsgInitState::max_payload_length(pver),
         "getcfsv2" => dcroxide_chainhash::HASH_SIZE as u32 * 2,
         "cfiltersv2" => MsgCFiltersV2::max_payload_length(pver),
+        "mixpairreq" => MsgMixPairReq::max_payload_length(pver),
+        "mixkeyxchg" => MsgMixKeyExchange::max_payload_length(pver),
+        "mixcphrtxt" => MsgMixCiphertexts::max_payload_length(pver),
+        "mixslotres" => MsgMixSlotReserve::max_payload_length(pver),
+        "mixfactpoly" => MsgMixFactoredPoly::max_payload_length(pver),
+        "mixdcnet" => MsgMixDCNet::max_payload_length(pver),
+        "mixconfirm" => MsgMixConfirm::max_payload_length(pver),
+        "mixsecrets" => MsgMixSecrets::max_payload_length(pver),
         _ => return None,
     })
 }
@@ -252,6 +281,15 @@ fn decode_payload(
         "initstate" => MsgInitState::decode(r, pver).map(Message::InitState),
         "getcfsv2" => MsgGetCFsV2::decode(r, pver).map(Message::GetCFsV2),
         "cfiltersv2" => MsgCFiltersV2::decode(r, pver).map(Message::CFiltersV2),
+        "mixpairreq" => MsgMixPairReq::decode(r, pver).map(Message::MixPairReq),
+        "mixkeyxchg" => MsgMixKeyExchange::decode(r, pver)
+            .map(|m| Message::MixKeyExchange(alloc::boxed::Box::new(m))),
+        "mixcphrtxt" => MsgMixCiphertexts::decode(r, pver).map(Message::MixCiphertexts),
+        "mixslotres" => MsgMixSlotReserve::decode(r, pver).map(Message::MixSlotReserve),
+        "mixfactpoly" => MsgMixFactoredPoly::decode(r, pver).map(Message::MixFactoredPoly),
+        "mixdcnet" => MsgMixDCNet::decode(r, pver).map(Message::MixDCNet),
+        "mixconfirm" => MsgMixConfirm::decode(r, pver).map(Message::MixConfirm),
+        "mixsecrets" => MsgMixSecrets::decode(r, pver).map(Message::MixSecrets),
         _ => return None,
     })
 }

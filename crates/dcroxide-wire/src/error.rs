@@ -113,6 +113,14 @@ pub enum WireError {
     InitStateTypeTooLong { len: u64, max: u64 },
     /// Too many treasury spend hashes (`ErrTooManyTSpends`).
     TooManyTSpends { count: u64, max: u64 },
+    /// A mixing script class exceeded its maximum length
+    /// (`ErrMixPairReqScriptClassTooLong`).
+    MixPairReqScriptClassTooLong { len: u64, max: u64 },
+    /// Too many UTXOs in a mix pair request (`ErrTooManyMixPairReqUTXOs`).
+    TooManyMixPairReqUTXOs { count: u64, max: u64 },
+    /// Too many referenced previous mixing messages
+    /// (`ErrTooManyPrevMixMsgs`).
+    TooManyPrevMixMsgs { count: u64, max: u64 },
     /// Too many batched committed filters (`ErrTooManyCFilters`).
     TooManyCFilters { count: u64, max: u64 },
     /// A timestamp exceeded the maximum representable value
@@ -158,6 +166,9 @@ impl WireError {
             WireError::TooManyInitStateTypes { .. } => "ErrTooManyInitStateTypes",
             WireError::InitStateTypeTooLong { .. } => "ErrInitStateTypeTooLong",
             WireError::TooManyTSpends { .. } => "ErrTooManyTSpends",
+            WireError::MixPairReqScriptClassTooLong { .. } => "ErrMixPairReqScriptClassTooLong",
+            WireError::TooManyMixPairReqUTXOs { .. } => "ErrTooManyMixPairReqUTXOs",
+            WireError::TooManyPrevMixMsgs { .. } => "ErrTooManyPrevMixMsgs",
             WireError::TooManyCFilters { .. } => "ErrTooManyCFilters",
             WireError::InvalidTimestamp => "ErrInvalidTimestamp",
         }

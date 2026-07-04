@@ -11,10 +11,12 @@
 use dcroxide_chainhash::Hash;
 use dcroxide_testutil::{Oracle, SplitMix64, hex, oracle_or_skip, unhex};
 use dcroxide_wire::{
-    BlockHeader, BlockLocator, CurrencyNet, InvType, InvVect, Message, MsgAddr, MsgBlock,
-    MsgCFHeaders, MsgCFTypes, MsgCFilter, MsgCFilterV2, MsgCFiltersV2, MsgFeeFilter, MsgGetBlocks,
-    MsgGetCFHeaders, MsgGetCFilter, MsgGetCFilterV2, MsgGetCFsV2, MsgGetData, MsgGetHeaders,
-    MsgGetInitState, MsgHeaders, MsgInitState, MsgInv, MsgMiningState, MsgNotFound, MsgPing,
+    BlockHeader, BlockLocator, CurrencyNet, InvType, InvVect, MIX_MSG_SIZE, Message,
+    MixPairReqUTXO, MixVect, MsgAddr, MsgBlock, MsgCFHeaders, MsgCFTypes, MsgCFilter, MsgCFilterV2,
+    MsgCFiltersV2, MsgFeeFilter, MsgGetBlocks, MsgGetCFHeaders, MsgGetCFilter, MsgGetCFilterV2,
+    MsgGetCFsV2, MsgGetData, MsgGetHeaders, MsgGetInitState, MsgHeaders, MsgInitState, MsgInv,
+    MsgMiningState, MsgMixCiphertexts, MsgMixConfirm, MsgMixDCNet, MsgMixFactoredPoly,
+    MsgMixKeyExchange, MsgMixPairReq, MsgMixSecrets, MsgMixSlotReserve, MsgNotFound, MsgPing,
     MsgPong, MsgReject, MsgTx, MsgVersion, NetAddress, OutPoint, PROTOCOL_VERSION,
     REMOVE_REJECT_VERSION, ServiceFlag, TxIn, TxOut, TxSerializeType, read_message, write_message,
 };
@@ -131,11 +133,172 @@ fn random_ascii(rng: &mut SplitMix64, max_len: u64) -> String {
         .collect()
 }
 
+fn rand_bytes_arr<const N: usize>(rng: &mut SplitMix64) -> [u8; N] {
+    let mut a = [0u8; N];
+    rng.fill(&mut a);
+    a
+}
+
+fn rand_field_val(rng: &mut SplitMix64) -> Vec<u8> {
+    // Field values are at most 32 bytes.
+    rng.bytes(32)
+}
+
+fn rand_mix_vect(rng: &mut SplitMix64, len: u64) -> MixVect {
+    (0..len)
+        .map(|_| {
+            let mut m = [0u8; MIX_MSG_SIZE];
+            rng.fill(&mut m);
+            m
+        })
+        .collect()
+}
+
+/// One random instance of each mixing message (all valid at MIX_VERSION,
+/// which PROTOCOL_VERSION exceeds).
+fn mix_messages(rng: &mut SplitMix64) -> Vec<(Message, u32)> {
+    let pver = PROTOCOL_VERSION;
+    let mcount = 1 + rng.below(3);
+    let kpcount = 1 + rng.below(3);
+    vec![
+        (
+            Message::MixPairReq(MsgMixPairReq {
+                signature: rand_bytes_arr(rng),
+                identity: rand_bytes_arr(rng),
+                expiry: rng.next_u64() as u32,
+                mix_amount: (rng.next_u64() >> 1) as i64,
+                script_class: random_ascii(rng, 30),
+                tx_version: rng.next_u64() as u16,
+                lock_time: rng.next_u64() as u32,
+                message_count: rng.next_u64() as u32,
+                input_value: (rng.next_u64() >> 1) as i64,
+                utxos: (0..rng.below(3))
+                    .map(|_| MixPairReqUTXO {
+                        out_point: OutPoint {
+                            hash: random_hash(rng),
+                            index: rng.next_u64() as u32,
+                            tree: rng.next_u64() as i8,
+                        },
+                        script: rng.bytes(40),
+                        pub_key: rng.bytes(33),
+                        signature: rng.bytes(64),
+                        opcode: rng.next_u64() as u8,
+                    })
+                    .collect(),
+                change: if rng.below(2) == 0 {
+                    None
+                } else {
+                    Some(TxOut {
+                        value: rng.next_u64() as i64,
+                        version: rng.next_u64() as u16,
+                        pk_script: rng.bytes(40),
+                    })
+                },
+                flags: rng.next_u64() as u8,
+                pairing_flags: rng.next_u64() as u8,
+            }),
+            pver,
+        ),
+        (
+            Message::MixKeyExchange(Box::new(MsgMixKeyExchange {
+                signature: rand_bytes_arr(rng),
+                identity: rand_bytes_arr(rng),
+                session_id: rand_bytes_arr(rng),
+                epoch: rng.next_u64(),
+                run: rng.next_u64() as u32,
+                pos: rng.next_u64() as u32,
+                ecdh: rand_bytes_arr(rng),
+                pqpk: rand_bytes_arr(rng),
+                commitment: rand_bytes_arr(rng),
+                seen_prs: random_hashes(rng, 4),
+            })),
+            pver,
+        ),
+        (
+            {
+                let n = rng.below(4);
+                Message::MixCiphertexts(MsgMixCiphertexts {
+                    signature: rand_bytes_arr(rng),
+                    identity: rand_bytes_arr(rng),
+                    session_id: rand_bytes_arr(rng),
+                    run: rng.next_u64() as u32,
+                    // The two lists share one on-wire count.
+                    ciphertexts: (0..n).map(|_| rand_bytes_arr(rng)).collect(),
+                    seen_key_exchanges: (0..n).map(|_| random_hash(rng)).collect(),
+                })
+            },
+            pver,
+        ),
+        (
+            Message::MixSlotReserve(MsgMixSlotReserve {
+                signature: rand_bytes_arr(rng),
+                identity: rand_bytes_arr(rng),
+                session_id: rand_bytes_arr(rng),
+                run: rng.next_u64() as u32,
+                dc_mix: (0..mcount)
+                    .map(|_| (0..kpcount).map(|_| rand_field_val(rng)).collect())
+                    .collect(),
+                seen_ciphertexts: random_hashes(rng, 4),
+            }),
+            pver,
+        ),
+        (
+            Message::MixFactoredPoly(MsgMixFactoredPoly {
+                signature: rand_bytes_arr(rng),
+                identity: rand_bytes_arr(rng),
+                session_id: rand_bytes_arr(rng),
+                run: rng.next_u64() as u32,
+                roots: (0..rng.below(5)).map(|_| rand_field_val(rng)).collect(),
+                seen_slot_reserves: random_hashes(rng, 4),
+            }),
+            pver,
+        ),
+        (
+            Message::MixDCNet(MsgMixDCNet {
+                signature: rand_bytes_arr(rng),
+                identity: rand_bytes_arr(rng),
+                session_id: rand_bytes_arr(rng),
+                run: rng.next_u64() as u32,
+                dc_net: (0..mcount).map(|_| rand_mix_vect(rng, kpcount)).collect(),
+                seen_slot_reserves: random_hashes(rng, 4),
+            }),
+            pver,
+        ),
+        (
+            Message::MixConfirm(MsgMixConfirm {
+                signature: rand_bytes_arr(rng),
+                identity: rand_bytes_arr(rng),
+                session_id: rand_bytes_arr(rng),
+                run: rng.next_u64() as u32,
+                mix: random_tx(rng),
+                seen_dc_nets: random_hashes(rng, 4),
+            }),
+            pver,
+        ),
+        (
+            Message::MixSecrets(MsgMixSecrets {
+                signature: rand_bytes_arr(rng),
+                identity: rand_bytes_arr(rng),
+                session_id: rand_bytes_arr(rng),
+                run: rng.next_u64() as u32,
+                seed: rand_bytes_arr(rng),
+                slot_reserve_msgs: (0..rng.below(4)).map(|_| rand_field_val(rng)).collect(),
+                dc_net_msgs: {
+                    let n = rng.below(4);
+                    rand_mix_vect(rng, n)
+                },
+                seen_secrets: random_hashes(rng, 4),
+            }),
+            pver,
+        ),
+    ]
+}
+
 /// Build one random instance of each message type valid at
 /// [`PROTOCOL_VERSION`], plus a reject at a pre-removal version.
 fn structured_messages(rng: &mut SplitMix64) -> Vec<(Message, u32)> {
     let pver = PROTOCOL_VERSION;
-    let msgs = vec![
+    let mut msgs = vec![
         (
             Message::Version(MsgVersion {
                 protocol_version: rng.next_u64() as i32,
@@ -308,6 +471,7 @@ fn structured_messages(rng: &mut SplitMix64) -> Vec<(Message, u32)> {
         ),
     ];
 
+    msgs.extend(mix_messages(rng));
     msgs
 }
 

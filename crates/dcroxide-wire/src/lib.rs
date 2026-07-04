@@ -36,6 +36,7 @@ mod message;
 mod msg_cf;
 mod msg_control;
 mod msg_data;
+mod msg_mix;
 mod msgtx;
 mod netaddress;
 mod protocol;
@@ -63,6 +64,13 @@ pub use msg_data::{
     MAX_MS_VOTES_AT_HEAD_PER_MSG, MsgBlock, MsgGetBlocks, MsgGetData, MsgGetHeaders,
     MsgGetInitState, MsgHeaders, MsgInitState, MsgInv, MsgMiningState, MsgNotFound,
     max_tx_per_tx_tree,
+};
+pub use msg_mix::{
+    MAX_MIX_FIELD_VAL_LEN, MAX_MIX_MCOUNT, MAX_MIX_PAIR_REQ_SCRIPT_CLASS_LEN,
+    MAX_MIX_PAIR_REQ_UTXO_PUB_KEY_LEN, MAX_MIX_PAIR_REQ_UTXO_SCRIPT_LEN,
+    MAX_MIX_PAIR_REQ_UTXO_SIGNATURE_LEN, MAX_MIX_PAIR_REQ_UTXOS, MAX_MIX_PEERS, MIX_MSG_SIZE,
+    MixPairReqUTXO, MixVect, MsgMixCiphertexts, MsgMixConfirm, MsgMixDCNet, MsgMixFactoredPoly,
+    MsgMixKeyExchange, MsgMixPairReq, MsgMixSecrets, MsgMixSlotReserve,
 };
 pub use msgtx::{
     DEFAULT_PK_SCRIPT_VERSION, MAX_PREV_OUT_INDEX, MAX_TX_IN_PER_MESSAGE, MAX_TX_IN_SEQUENCE_NUM,
