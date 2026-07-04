@@ -38,6 +38,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "dcrec_ed25519"
+path = "fuzz_targets/dcrec_ed25519.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "dcrec_schnorr"
 path = "fuzz_targets/dcrec_schnorr.rs"
 test = false

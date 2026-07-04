@@ -20,11 +20,12 @@ to validate, relay, or hold funds. Currently implemented:
 - `dcroxide-wire` (partial) — varints, `MsgTx` (all three serialization
   types + transaction hashes), and the 180-byte `BlockHeader` + block hash;
   every codec under differential test, fuzzing, and round-trip property tests
-- `dcroxide-dcrec` (partial) — ECDSA-secp256k1 (signature type 0) with
-  dcrd's exact DER and public key acceptance rules and error identities over
-  libsecp256k1, and EC-Schnorr-DCRv0 (signature type 2) on k256 with dcrd's
-  RFC6979 nonce variant ported exactly; both signing paths differentially
-  verified byte-for-byte against dcrd
+- `dcroxide-dcrec` — all three Decred signature types with dcrd's exact
+  acceptance rules and error identities: ECDSA-secp256k1 (type 0, over
+  libsecp256k1), Ed25519 (type 1, over curve25519-dalek with dcrd's
+  2017-agl verify semantics), and EC-Schnorr-DCRv0 (type 2, over k256 with
+  dcrd's RFC6979 nonce variant); every signing path differentially verified
+  byte-for-byte against dcrd
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
 

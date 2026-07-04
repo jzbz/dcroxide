@@ -22,9 +22,10 @@ risk R4.
 - **EC-Schnorr-DCRv0 (type 2):** implemented on **`k256`** (pure Rust)
   scalar/point arithmetic, ported from dcrd `dcrec/secp256k1/schnorr` with
   all vectors.
-- **Ed25519 (type 1):** `ed25519-dalek` wrapped behind a compatibility shim
-  that reproduces dcrd `dcrec/edwards` acceptance exactly (expect shims after
-  differential fuzzing; budget for it).
+- **Ed25519 (type 1):** `curve25519-dalek` primitives with dcrd
+  `dcrec/edwards` acceptance implemented explicitly in our layer (chosen
+  over wrapping `ed25519-dalek`'s packaged verifier, whose semantics differ
+  from the 2017-agl code dcrd delegates to — e.g. the S range check).
 - All three verify paths differential-fuzzed against the oracle to high
   volume before the chain engine consumes them (Phase 1 exit criterion).
 

@@ -2,9 +2,9 @@
 //! Decred signature types, mirroring dcrd's `dcrec` packages at the pinned
 //! parity tag (`release-v2.1.5`; module `dcrec/secp256k1/v4` v4.4.0).
 //!
-//! Decred scripts use three signature types; this crate currently implements
-//! **type 0 (ECDSA-secp256k1)** and **type 2 (EC-Schnorr-DCRv0)**. Ed25519
-//! (type 1) lands later in Phase 1.
+//! Decred scripts use three signature types; this crate implements all
+//! three: **type 0 (ECDSA-secp256k1)**, **type 1 (Ed25519)**, and **type 2
+//! (EC-Schnorr-DCRv0)**.
 //!
 //! Per ADR-0006, elliptic-curve arithmetic comes from the audited
 //! libsecp256k1 C library (via the `secp256k1` bindings crate); everything
@@ -16,4 +16,5 @@
 //! std (embedded consumers should use dcr-rs, where this crate's vendored
 //! primitives originate).
 
+pub mod edwards;
 pub mod secp256k1;

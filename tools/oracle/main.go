@@ -37,6 +37,15 @@
 //	schnorr_verify     → data is 33-byte compressed pubkey || 32-byte hash ||
 //	                     64-byte signature; {"result": "true"|"false"}
 //	schnorr_pubkey_parse → {"result": "<hex compressed>"} or {"error": ...}
+//	ed25519_pubkey_parse → {"result": "<hex canonical 32 bytes>"} or
+//	                       {"error": ...}
+//	ed25519_parse      → {"result": "<hex 64-byte R||S>"} or {"error": ...}
+//	ed25519_sign       → data is 32-byte seed || message;
+//	                     {"result": "<hex 64-byte sig>",
+//	                      "compressed": "<hex pubkey>"}
+//	ed25519_verify     → data is 32-byte pubkey || 64-byte raw sig || message;
+//	                     R/S are taken raw (no ParseSignature) to expose the
+//	                     verify-layer semantics; {"result": "true"|"false"}
 package main
 
 import (
@@ -48,8 +57,11 @@ import (
 	"fmt"
 	"os"
 
+	"math/big"
+
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/crypto/blake256"
+	"github.com/decred/dcrd/dcrec/edwards/v2"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/schnorr"
@@ -75,6 +87,16 @@ type response struct {
 
 func errResp(format string, args ...any) response {
 	return response{Error: fmt.Sprintf(format, args...)}
+}
+
+// littleEndianToBigInt interprets 32 little-endian bytes as a big integer,
+// like the edwards package's unexported encodedBytesToBigInt.
+func littleEndianToBigInt(le []byte) *big.Int {
+	be := make([]byte, len(le))
+	for i, b := range le {
+		be[len(le)-1-i] = b
+	}
+	return new(big.Int).SetBytes(be)
 }
 
 // errKindResp builds an error response carrying the dcrd error kind name
@@ -247,6 +269,57 @@ func handle(req request) response {
 			return errKindResp(err)
 		}
 		return response{Result: hex.EncodeToString(pubKey.SerializeCompressed())}
+
+	case "ed25519_pubkey_parse":
+		pubKey, err := edwards.ParsePubKey(data)
+		if err != nil {
+			return errResp("%v", err)
+		}
+		return response{Result: hex.EncodeToString(pubKey.Serialize())}
+
+	case "ed25519_parse":
+		sig, err := edwards.ParseSignature(data)
+		if err != nil {
+			return errResp("%v", err)
+		}
+		return response{Result: hex.EncodeToString(sig.Serialize())}
+
+	case "ed25519_sign":
+		if len(data) < 32 {
+			return errResp("ed25519_sign: want >= 32 bytes (seed || msg), got %d",
+				len(data))
+		}
+		privKey, pubKey := edwards.PrivKeyFromSecret(data[:32])
+		if privKey == nil {
+			return errResp("ed25519_sign: bad secret")
+		}
+		r, s, err := edwards.Sign(privKey, data[32:])
+		if err != nil {
+			return errResp("%v", err)
+		}
+		sig := edwards.NewSignature(r, s)
+		return response{
+			Result:     hex.EncodeToString(sig.Serialize()),
+			Compressed: hex.EncodeToString(pubKey.Serialize()),
+		}
+
+	case "ed25519_verify":
+		if len(data) < 32+64 {
+			return errResp("ed25519_verify: want >= 96 bytes, got %d", len(data))
+		}
+		pubKey, err := edwards.ParsePubKey(data[:32])
+		if err != nil {
+			return errResp("%v", err)
+		}
+		// R and S are taken from the raw bytes without ParseSignature,
+		// exposing the verify-layer (agl) semantics for differential
+		// testing; consensus always parses first.
+		r := littleEndianToBigInt(data[32 : 32+32])
+		s := littleEndianToBigInt(data[64 : 64+32])
+		if edwards.Verify(pubKey, data[96:], r, s) {
+			return response{Result: "true"}
+		}
+		return response{Result: "false"}
 
 	default:
 		return errResp("unknown cmd: %s", req.Cmd)

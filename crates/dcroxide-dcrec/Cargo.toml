@@ -18,6 +18,9 @@ k256 = { version = "0.13", default-features = false, features = ["arithmetic", "
 # RFC6979 nonce generation (dcrd's exact variant, ported in this crate).
 hmac = "0.12"
 sha2 = "0.10"
+# Ed25519 group/scalar primitives; dcrd's exact (2017-agl) acceptance
+# behavior is implemented in our edwards module on top of these.
+curve25519-dalek = "4"
 # BLAKE-256 for the EC-Schnorr-DCRv0 challenge.
 dcroxide-crypto = { path = "../dcroxide-crypto" }
 
