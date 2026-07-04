@@ -268,8 +268,23 @@ impl SecretKey {
 /// byte-compatible with dcrd's seed-based `edwards.Sign` path (verified
 /// differentially).
 pub fn sign(secret: &SecretKey, message: &[u8]) -> Signature {
-    let (a, prefix) = secret.expand();
     let pub_bytes = secret.public_key().compressed;
+    sign_with_pub_key_bytes(secret, &pub_bytes, message)
+}
+
+/// Sign with an explicitly provided public key encoding used as `A` in the
+/// commitment hash, reproducing the 2017-`agl` `ed25519.Sign` over a
+/// 64-byte `seed || pubkey` private key — the path dcrd's
+/// `edwards.PrivKeyFromBytes` + `Sign` takes, where the embedded public
+/// key (canonically re-serialized) participates rather than one derived
+/// from the seed. With a matching public key this is identical to
+/// [`sign`].
+pub fn sign_with_pub_key_bytes(
+    secret: &SecretKey,
+    pub_bytes: &[u8; 32],
+    message: &[u8],
+) -> Signature {
+    let (a, prefix) = secret.expand();
 
     // r = SHA-512(prefix || m) mod L; R = r·B.
     let mut h = Sha512::new();

@@ -15,12 +15,13 @@ require (
 	github.com/decred/dcrd/wire v1.7.5
 )
 
+require github.com/decred/dcrd/dcrec v1.0.1
+
 require (
 	github.com/agl/ed25519 v0.0.0-20170116200512-5312a6153412 // indirect
 	github.com/dchest/siphash v1.2.3 // indirect
 	github.com/decred/dcrd/crypto/rand v1.0.1 // indirect
 	github.com/decred/dcrd/crypto/ripemd160 v1.0.2 // indirect
-	github.com/decred/dcrd/dcrec v1.0.1 // indirect
 	github.com/decred/slog v1.2.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
 	golang.org/x/crypto v0.33.0 // indirect

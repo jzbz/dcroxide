@@ -220,6 +220,14 @@ impl ScriptBuilder {
             None => Ok(self.script),
         }
     }
+
+    /// The currently built script regardless of any error, containing
+    /// everything appended before the first failure. This matches the dcrd
+    /// call sites that discard the error from `Script()` (e.g. the signing
+    /// merge paths).
+    pub fn unchecked_script(self) -> Vec<u8> {
+        self.script
+    }
 }
 
 /// The number of bytes the canonical encoding of the data will take (dcrd

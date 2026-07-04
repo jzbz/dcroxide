@@ -9,8 +9,9 @@ Parity target: **dcrd `release-v2.1.5`** — wire protocol 12, JSON-RPC API
 [PARITY.md](PARITY.md) for per-package status. The full plan lives in
 [dcroxide-project-brief.md](dcroxide-project-brief.md).
 
-**Status: pre-alpha — through Phase 4 (rig, primitives, wire, chaincfg, the
-script engine).** Nothing here is ready to validate, relay, or hold funds.
+**Status: pre-alpha — Phase 4 complete (rig, primitives, wire, chaincfg,
+and the full script engine including addresses, classification, and
+signing).** Nothing here is ready to validate, relay, or hold funds.
 Currently implemented:
 
 - `dcroxide-crypto` — BLAKE-256 (vendored from
@@ -46,9 +47,11 @@ Currently implemented:
   hashing, and signature checking across all three suites; dcrd's entire
   `script_tests.json`/`tx_valid`/`tx_invalid`/`sighash.json` corpora run
   green, backed by a live differential script fuzzer against dcrd. The
-  `stdaddr` and `stdscript` modules add all seven version-0 address kinds
-  and standard-script classification, differentially matched against dcrd
-  across every network
+  `stdaddr`, `stdscript`, and `sign` modules add all seven version-0
+  address kinds, standard-script classification, and transaction signing
+  across every suite and script shape (P2PK/P2PKH, multisig, P2SH, stake
+  and treasury outputs), all differentially matched against dcrd across
+  every network
 - `dcroxide-base58` — modified base58 and Decred base58check from
   decred/base58, vector- and differentially-tested
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the

@@ -76,6 +76,12 @@
 //	                     {"error": ..., "kind": "Err..."}
 //	stdscript_analyze  → data is net_len(1) || net name || version(2 BE) ||
 //	                     script; {"result": "<hex of canonical analysis>"}
+//	raw_txin_sig       → raw input signature across the three suites;
+//	                     see the handler for the field layout
+//	sign_tx_output     → full SignTxOutput with explicit key/script DBs;
+//	                     see the handler for the field layout
+//	tspend_sig         → data is key(32) || serialized tx;
+//	                     {"result": "<hex signature script>"}
 //	chaincfg_dump      → data is the network name bytes ("mainnet",
 //	                     "testnet3", "simnet", or "regnet");
 //	                     {"result": "<hex of the canonical params dump>"}
@@ -102,7 +108,9 @@ import (
 	"github.com/decred/base58"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	chaincfg "github.com/decred/dcrd/chaincfg/v3"
+	"github.com/decred/dcrd/dcrec"
 	"github.com/decred/dcrd/txscript/v4"
+	"github.com/decred/dcrd/txscript/v4/sign"
 	"github.com/decred/dcrd/txscript/v4/stdaddr"
 	"github.com/decred/dcrd/txscript/v4/stdscript"
 	"github.com/decred/dcrd/crypto/blake256"
@@ -608,6 +616,167 @@ func handle(req request) response {
 				pushes.LockTime)
 		}
 		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
+	case "raw_txin_sig":
+		// data: sig_type(1) || hash_type(1) || idx(4 BE) || key_len(1) ||
+		//       key || sub_len(4 BE) || subscript || serialized tx
+		if len(data) < 7 {
+			return errResp("raw_txin_sig: truncated request")
+		}
+		sigType := dcrec.SignatureType(data[0])
+		hashType := txscript.SigHashType(data[1])
+		idx := int(binary.BigEndian.Uint32(data[2:6]))
+		keyLen := int(data[6])
+		if len(data) < 7+keyLen+4 {
+			return errResp("raw_txin_sig: truncated key")
+		}
+		key := data[7 : 7+keyLen]
+		rest := data[7+keyLen:]
+		subLen := int(binary.BigEndian.Uint32(rest[0:4]))
+		if len(rest) < 4+subLen {
+			return errResp("raw_txin_sig: truncated subscript")
+		}
+		subScript := rest[4 : 4+subLen]
+		var tx wire.MsgTx
+		if err := tx.Deserialize(bytes.NewReader(rest[4+subLen:])); err != nil {
+			return errResp("raw_txin_sig: bad tx: %v", err)
+		}
+		sig, err := sign.RawTxInSignature(&tx, idx, subScript, hashType, key,
+			sigType)
+		if err != nil {
+			return response{Error: err.Error()}
+		}
+		return response{Result: hex.EncodeToString(sig)}
+
+	case "sign_tx_output":
+		// data: net_len(1) || net || hash_type(1) || treasury(1) ||
+		//       idx(4 BE) || pk_len(4 BE) || pkscript || prev_len(4 BE) ||
+		//       prevscript || nkeys(1) || per key: addr_len(1) || addr ||
+		//       sigtype(1) || compressed(1) || key(32) || nscripts(1) ||
+		//       per script: addr_len(1) || addr || slen(2 BE) || script ||
+		//       serialized tx
+		if len(data) < 1 {
+			return errResp("sign_tx_output: empty request")
+		}
+		netLen := int(data[0])
+		if len(data) < 1+netLen+10 {
+			return errResp("sign_tx_output: truncated request")
+		}
+		params, err := netParams(string(data[1 : 1+netLen]))
+		if err != nil {
+			return errResp("sign_tx_output: %v", err)
+		}
+		rest := data[1+netLen:]
+		hashType := txscript.SigHashType(rest[0])
+		isTreasuryEnabled := rest[1] != 0
+		idx := int(binary.BigEndian.Uint32(rest[2:6]))
+		pkLen := int(binary.BigEndian.Uint32(rest[6:10]))
+		rest = rest[10:]
+		if len(rest) < pkLen+4 {
+			return errResp("sign_tx_output: truncated pkscript")
+		}
+		pkScript := rest[:pkLen]
+		prevLen := int(binary.BigEndian.Uint32(rest[pkLen : pkLen+4]))
+		rest = rest[pkLen+4:]
+		if len(rest) < prevLen+1 {
+			return errResp("sign_tx_output: truncated prevscript")
+		}
+		prevScript := rest[:prevLen]
+		rest = rest[prevLen:]
+
+		type keyEntry struct {
+			key        []byte
+			sigType    dcrec.SignatureType
+			compressed bool
+		}
+		keys := make(map[string]keyEntry)
+		nKeys := int(rest[0])
+		rest = rest[1:]
+		for i := 0; i < nKeys; i++ {
+			if len(rest) < 1 {
+				return errResp("sign_tx_output: truncated key entry")
+			}
+			addrLen := int(rest[0])
+			if len(rest) < 1+addrLen+3 {
+				return errResp("sign_tx_output: truncated key entry")
+			}
+			addr := string(rest[1 : 1+addrLen])
+			sigType := dcrec.SignatureType(rest[1+addrLen])
+			compressed := rest[2+addrLen] != 0
+			keyLen := int(rest[3+addrLen])
+			if len(rest) < 4+addrLen+keyLen {
+				return errResp("sign_tx_output: truncated key")
+			}
+			key := rest[4+addrLen : 4+addrLen+keyLen]
+			keys[addr] = keyEntry{key: key, sigType: sigType, compressed: compressed}
+			rest = rest[4+addrLen+keyLen:]
+		}
+
+		scripts := make(map[string][]byte)
+		if len(rest) < 1 {
+			return errResp("sign_tx_output: truncated script db")
+		}
+		nScripts := int(rest[0])
+		rest = rest[1:]
+		for i := 0; i < nScripts; i++ {
+			if len(rest) < 1 {
+				return errResp("sign_tx_output: truncated script entry")
+			}
+			addrLen := int(rest[0])
+			if len(rest) < 1+addrLen+2 {
+				return errResp("sign_tx_output: truncated script entry")
+			}
+			addr := string(rest[1 : 1+addrLen])
+			sLen := int(binary.BigEndian.Uint16(rest[1+addrLen : 3+addrLen]))
+			if len(rest) < 3+addrLen+sLen {
+				return errResp("sign_tx_output: truncated script entry")
+			}
+			scripts[addr] = rest[3+addrLen : 3+addrLen+sLen]
+			rest = rest[3+addrLen+sLen:]
+		}
+
+		var tx wire.MsgTx
+		if err := tx.Deserialize(bytes.NewReader(rest)); err != nil {
+			return errResp("sign_tx_output: bad tx: %v", err)
+		}
+
+		kdb := sign.KeyClosure(func(addr stdaddr.Address) ([]byte,
+			dcrec.SignatureType, bool, error) {
+			entry, ok := keys[addr.String()]
+			if !ok {
+				return nil, 0, false, fmt.Errorf("no key for %s", addr)
+			}
+			return entry.key, entry.sigType, entry.compressed, nil
+		})
+		sdb := sign.ScriptClosure(func(addr stdaddr.Address) ([]byte, error) {
+			script, ok := scripts[addr.String()]
+			if !ok {
+				return nil, fmt.Errorf("no script for %s", addr)
+			}
+			return script, nil
+		})
+
+		sigScript, err := sign.SignTxOutput(params, &tx, idx, pkScript,
+			hashType, kdb, sdb, prevScript, isTreasuryEnabled)
+		if err != nil {
+			return response{Error: err.Error()}
+		}
+		return response{Result: hex.EncodeToString(sigScript)}
+
+	case "tspend_sig":
+		// data: key(32) || serialized tx
+		if len(data) < 32 {
+			return errResp("tspend_sig: truncated request")
+		}
+		var tx wire.MsgTx
+		if err := tx.Deserialize(bytes.NewReader(data[32:])); err != nil {
+			return errResp("tspend_sig: bad tx: %v", err)
+		}
+		script, err := sign.TSpendSignatureScript(&tx, data[0:32])
+		if err != nil {
+			return response{Error: err.Error()}
+		}
+		return response{Result: hex.EncodeToString(script)}
 
 	case "chaincfg_dump":
 		params, err := netParams(string(data))

@@ -36,6 +36,7 @@ mod opcodes;
 mod script;
 mod scriptnum;
 mod sighash;
+pub mod sign;
 mod stack;
 pub mod stdaddr;
 pub mod stdscript;
