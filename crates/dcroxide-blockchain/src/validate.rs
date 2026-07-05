@@ -3689,3 +3689,236 @@ pub fn check_block_context(
 
     Ok(())
 }
+
+/// The script flags to use when executing transaction scripts to
+/// enforce consensus rules for the block AFTER the given node (dcrd
+/// `consensusScriptVerifyFlags`).
+pub fn consensus_script_verify_flags(
+    view: &impl FullChainView,
+    prev_height: Option<i64>,
+    params: &Params,
+) -> Result<dcroxide_txscript::ScriptFlags, RuleError> {
+    let unknown = |_| {
+        rule_error(
+            RuleErrorKind::UnknownDeploymentID,
+            "deployment not defined on this network",
+        )
+    };
+    let mut script_flags = dcroxide_txscript::ScriptFlags(
+        dcroxide_txscript::ScriptFlags::VERIFY_CLEAN_STACK.0
+            | dcroxide_txscript::ScriptFlags::VERIFY_CHECK_LOCK_TIME_VERIFY.0,
+    );
+
+    // Enable enforcement of OP_CSV and OP_SHA256 when the LN features
+    // agenda is active.
+    if crate::agendas::is_ln_features_agenda_active(view, prev_height, params).map_err(unknown)? {
+        script_flags.0 |= dcroxide_txscript::ScriptFlags::VERIFY_CHECK_SEQUENCE_VERIFY.0;
+        script_flags.0 |= dcroxide_txscript::ScriptFlags::VERIFY_SHA256.0;
+    }
+
+    // Enable the treasury opcodes when the treasury agenda is active.
+    if crate::agendas::is_treasury_agenda_active(view, prev_height, params).map_err(unknown)? {
+        script_flags.0 |= dcroxide_txscript::ScriptFlags::VERIFY_TREASURY.0;
+    }
+    Ok(script_flags)
+}
+
+/// Check the transaction inputs for a transaction list against a
+/// predetermined utxo view and connect each one to the view,
+/// accumulating and validating the fees and subsidies (dcrd
+/// `checkTransactionsAndConnect`).  The treasury and automatic
+/// revocation agenda states are supplied by the caller, which dcrd
+/// derives from the parent node.
+#[allow(clippy::too_many_arguments)]
+pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
+    subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
+    input_fees: i64,
+    node_height: i64,
+    node_voters: u16,
+    prev_header: &dcroxide_wire::BlockHeader,
+    txs: &[MsgTx],
+    view: &mut crate::utxoview::UtxoView,
+    mut stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
+    stake_tree: bool,
+    is_treasury_enabled: bool,
+    is_auto_revocations_enabled: bool,
+    subsidy_split_variant: dcroxide_standalone::SubsidySplitVariant,
+    params: &Params,
+) -> Result<(), RuleError> {
+    // Perform several checks on the inputs for each transaction,
+    // accumulating the total fees, and connect each transaction to
+    // the view as it validates.
+    let mut in_flight_regular_tx: alloc::collections::BTreeMap<[u8; 32], u32> =
+        alloc::collections::BTreeMap::new();
+    let mut total_fees: i64 = input_fees; // Stake tx tree carry forward
+    let mut cumulative_sig_ops: i64 = 0;
+    for (idx, tx) in txs.iter().enumerate() {
+        cumulative_sig_ops = check_num_sig_ops(
+            tx,
+            |op| view.lookup_entry(op).cloned(),
+            idx,
+            stake_tree,
+            cumulative_sig_ops,
+            is_treasury_enabled,
+        )?;
+
+        const CHECK_FRAUD_PROOF: bool = true;
+        let tx_fee = check_transaction_inputs(
+            subsidy_cache,
+            tx,
+            node_height,
+            |op| view.lookup_entry(op).cloned(),
+            CHECK_FRAUD_PROOF,
+            params,
+            prev_header,
+            is_treasury_enabled,
+            is_auto_revocations_enabled,
+            subsidy_split_variant,
+        )?;
+
+        // Sum the total fees and ensure no overflow.
+        let last_total_fees = total_fees;
+        total_fees = total_fees.wrapping_add(tx_fee);
+        if total_fees < last_total_fees {
+            return Err(rule_error(
+                RuleErrorKind::BadFees,
+                "total fees for block overflows accumulator",
+            ));
+        }
+
+        // Connect the transaction to the view so the remaining
+        // transactions can spend its outputs.
+        if !stake_tree {
+            view.connect_regular_transaction(
+                tx,
+                node_height,
+                idx as u32,
+                &mut in_flight_regular_tx,
+                stxos.as_deref_mut(),
+                is_treasury_enabled,
+            )?;
+        } else {
+            view.connect_stake_transaction(
+                tx,
+                node_height,
+                idx as u32,
+                stxos.as_deref_mut(),
+                is_treasury_enabled,
+            )?;
+        }
+    }
+
+    if !stake_tree {
+        // Apply the penalty for the regular tree fees based on the
+        // number of votes once stake validation begins.
+        if node_height >= params.stake_validation_height {
+            total_fees *= i64::from(node_voters);
+            total_fees /= i64::from(params.tickets_per_block);
+        }
+
+        // The coinbase must not pay more than the expected subsidy
+        // plus the fees, and its input must commit to the subsidy.
+        let mut total_atom_out_regular: i64 = 0;
+        for tx_out in &txs[0].tx_out {
+            total_atom_out_regular = total_atom_out_regular.wrapping_add(tx_out.value);
+        }
+        let exp_atom_out = if node_height == 1 {
+            subsidy_cache.calc_block_subsidy(node_height)
+        } else {
+            let subsidy_work =
+                subsidy_cache.calc_work_subsidy_v3(node_height, node_voters, subsidy_split_variant);
+            let subsidy_treasury =
+                subsidy_cache.calc_treasury_subsidy(node_height, node_voters, is_treasury_enabled);
+            if is_treasury_enabled {
+                subsidy_work + total_fees
+            } else {
+                subsidy_work + subsidy_treasury + total_fees
+            }
+        };
+        let coinbase_in = &txs[0].tx_in[0];
+        let subsidy_without_fees = exp_atom_out - total_fees;
+        if coinbase_in.value_in != subsidy_without_fees && node_height > 0 {
+            return Err(rule_error(
+                RuleErrorKind::BadCoinbaseAmountIn,
+                format!(
+                    "bad coinbase subsidy in input; got {}, expected \
+                     {subsidy_without_fees}",
+                    coinbase_in.value_in
+                ),
+            ));
+        }
+        if total_atom_out_regular > exp_atom_out {
+            return Err(rule_error(
+                RuleErrorKind::BadCoinbaseValue,
+                format!(
+                    "coinbase transaction pays {total_atom_out_regular} which is more \
+                     than expected value of {exp_atom_out}"
+                ),
+            ));
+        }
+    } else {
+        // The treasurybase input must commit to the treasury subsidy.
+        if node_height > 1 && is_treasury_enabled {
+            if txs.is_empty() {
+                return Err(rule_error(
+                    RuleErrorKind::NoStakeTx,
+                    format!("empty tx tree stake, expected treasurybase at height {node_height}"),
+                ));
+            }
+            let subsidy_tax =
+                subsidy_cache.calc_treasury_subsidy(node_height, node_voters, is_treasury_enabled);
+            let treasurybase_in = &txs[0].tx_in[0];
+            if treasurybase_in.value_in != subsidy_tax {
+                return Err(rule_error(
+                    RuleErrorKind::BadTreasurybaseAmountIn,
+                    format!(
+                        "bad treasurybase subsidy in input; got {}, expected {subsidy_tax}",
+                        treasurybase_in.value_in
+                    ),
+                ));
+            }
+        }
+
+        // An empty stake tree is only allowed before stake validation
+        // begins.
+        if txs.is_empty() && node_height < params.stake_validation_height {
+            return Ok(());
+        }
+        if txs.is_empty() && node_height >= params.stake_validation_height {
+            return Err(rule_error(
+                RuleErrorKind::NoStakeTx,
+                "empty tx tree stake in block after stake validation height",
+            ));
+        }
+
+        // The votes must not pay out more than the vote subsidies
+        // allow.
+        check_stake_base_amounts(
+            subsidy_cache,
+            node_height,
+            txs,
+            |op| view.lookup_entry(op).cloned(),
+            subsidy_split_variant,
+        )?;
+        let total_atom_out_stake =
+            get_stake_base_amounts(txs, |op| view.lookup_entry(op).cloned())?;
+        let exp_atom_out = if node_height >= params.stake_validation_height {
+            let vote_subsidy =
+                subsidy_cache.calc_stake_vote_subsidy_v3(node_height - 1, subsidy_split_variant);
+            vote_subsidy * i64::from(node_voters)
+        } else {
+            total_fees
+        };
+        if total_atom_out_stake > exp_atom_out {
+            return Err(rule_error(
+                RuleErrorKind::BadStakebaseValue,
+                format!(
+                    "stakebase transactions for block pays {total_atom_out_stake} which \
+                     is more than expected value of {exp_atom_out}"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
