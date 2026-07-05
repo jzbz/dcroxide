@@ -24,13 +24,16 @@ pub mod chainio;
 pub mod compress;
 pub mod difficulty;
 mod error;
+mod ruleerror;
 pub mod stakever;
 pub mod thresholdstate;
 mod utxoentry;
 mod utxoio;
+pub mod validate;
 
 pub use compress::CURRENT_COMPRESSION_VERSION;
 pub use error::Error;
+pub use ruleerror::{RuleError, RuleErrorKind};
 pub use utxoentry::{UtxoEntry, encode_utxo_flags, is_ticket_submission_output};
 pub use utxoio::{
     UTXO_PREFIX_DB_INFO, UTXO_PREFIX_UTXO_SET, UTXO_PREFIX_UTXO_STATE, UtxoSetState,
