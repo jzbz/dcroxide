@@ -1,0 +1,295 @@
+// SPDX-License-Identifier: ISC
+//! The agenda voting threshold state machine (dcrd
+//! internal/blockchain `thresholdstate.go`).
+//!
+//! The chain walk is abstracted behind [`VoteChainView`]; the stake
+//! version and median time prerequisites come from [`crate::stakever`].
+//! dcrd memoizes interval-boundary states in a per-deployment cache
+//! keyed by block hash; on a single-branch view the boundary heights
+//! are unique, so this port recomputes from the deployment start each
+//! call, which is result-identical.
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+use dcroxide_chaincfg::{Choice, ConsensusDeployment, Params};
+
+use crate::stakever::{
+    VersionChainView, VersionNode, calc_past_median_time, calc_stake_version, calc_want_height,
+    is_majority_version,
+};
+
+/// The threshold states an agenda moves through (dcrd
+/// `ThresholdState`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ThresholdState {
+    /// The first state each deployment starts in.
+    Defined,
+    /// The voting window has begun.
+    Started,
+    /// The vote reached its activation threshold.
+    LockedIn,
+    /// The deployment is active.
+    Active,
+    /// The deployment expired or was voted down.
+    Failed,
+}
+
+impl ThresholdState {
+    /// dcrd's name for this state.
+    pub fn go_name(self) -> &'static str {
+        match self {
+            ThresholdState::Defined => "ThresholdDefined",
+            ThresholdState::Started => "ThresholdStarted",
+            ThresholdState::LockedIn => "ThresholdLockedIn",
+            ThresholdState::Active => "ThresholdActive",
+            ThresholdState::Failed => "ThresholdFailed",
+        }
+    }
+}
+
+/// A threshold state along with the winning choice, when one exists
+/// (dcrd `ThresholdStateTuple`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThresholdStateTuple {
+    /// The current state.
+    pub state: ThresholdState,
+    /// The choice that locked in or failed the agenda, when decided.
+    pub choice: Option<Choice>,
+}
+
+fn tuple(state: ThresholdState, choice: Option<Choice>) -> ThresholdStateTuple {
+    ThresholdStateTuple { state, choice }
+}
+
+/// A node carrying the full vote data the state machine tallies.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VoteNode {
+    /// The version-independent node data.
+    pub node: VersionNode,
+    /// The (vote version, vote bits) pairs carried by the block votes;
+    /// must be consistent with `node.vote_versions`.
+    pub votes: Vec<(u32, u16)>,
+}
+
+/// A height-indexed view of the branch providing full vote data.
+pub trait VoteChainView {
+    /// The node at the given height along this branch.
+    fn vote_node(&self, height: i64) -> Option<VoteNode>;
+}
+
+/// Adapter exposing a [`VoteChainView`] as the [`VersionChainView`] the
+/// stake version calculations expect.
+struct AsVersionView<'a, V: VoteChainView>(&'a V);
+
+impl<V: VoteChainView> VersionChainView for AsVersionView<'_, V> {
+    fn node(&self, height: i64) -> Option<VersionNode> {
+        self.0.vote_node(height).map(|n| n.node)
+    }
+}
+
+/// The highest deployment version defined by the network (dcrd
+/// `currentDeploymentVersion`); zero when there are none.
+pub fn current_deployment_version(params: &Params) -> u32 {
+    params
+        .deployments
+        .iter()
+        .map(|(version, _)| *version)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The lowest deployment version greater than the given one (dcrd
+/// `nextDeploymentVersion`); zero when there is none.
+pub fn next_deployment_version(params: &Params, version: u32) -> u32 {
+    params
+        .deployments
+        .iter()
+        .map(|(v, _)| *v)
+        .filter(|v| *v > version)
+        .min()
+        .unwrap_or(0)
+}
+
+/// The next threshold state for the deployment at the block AFTER the
+/// given previous node (dcrd `nextThresholdState`).
+pub fn next_threshold_state(
+    view: &impl VoteChainView,
+    prev_height: Option<i64>,
+    deployment_version: u32,
+    deployment: &ConsensusDeployment,
+    params: &Params,
+) -> ThresholdStateTuple {
+    // The threshold state for the window that contains the genesis
+    // block is defined by definition.
+    let rule_change_interval = i64::from(params.rule_change_activation_interval);
+    let confirmation_window = rule_change_interval;
+    let svh = params.stake_validation_height;
+    let Some(prev_height) = prev_height else {
+        return tuple(ThresholdState::Defined, None);
+    };
+    if prev_height + 1 < svh + confirmation_window {
+        return tuple(ThresholdState::Defined, None);
+    }
+
+    // Get the ancestor that is the last block of the previous
+    // confirmation window.
+    let want_height = calc_want_height(svh, rule_change_interval, prev_height + 1);
+    let version_view = AsVersionView(view);
+
+    // Collect the confirmation-window boundary nodes back to the point
+    // the deployment's begin time is no longer met (dcrd walks until a
+    // cache hit; recomputing from the start is result-identical).
+    let begin_time = deployment.start_time;
+    let mut needed_heights = Vec::new();
+    let mut walk_height = Some(want_height);
+    while let Some(h) = walk_height {
+        if view.vote_node(h).is_none() {
+            break;
+        }
+        let median_time = calc_past_median_time(&version_view, h);
+        if (median_time as u64) < begin_time {
+            break;
+        }
+        needed_heights.push(h);
+        let next = h - confirmation_window;
+        walk_height = if next >= 0 { Some(next) } else { None };
+    }
+
+    // The starting state is defined (dcrd seeds its cache with Defined
+    // at the node whose median time is before the begin time).
+    let mut state = tuple(ThresholdState::Defined, None);
+
+    // Replay the state transitions forward through the collected
+    // boundary nodes.
+    let end_time = deployment.expire_time;
+    for &h in needed_heights.iter().rev() {
+        match state.state {
+            ThresholdState::Defined => {
+                // Ensure we are at the minimal require height (Go's
+                // `break` here exits the switch arm, not the loop, so
+                // the walk continues with the state left defined).
+                if h < svh {
+                    continue;
+                }
+
+                // The deployment expired.
+                let median_time = calc_past_median_time(&version_view, h) as u64;
+                if median_time >= end_time {
+                    state.state = ThresholdState::Failed;
+                } else if calc_stake_version(&version_view, h, params) < deployment_version {
+                    // Make sure we are on the correct stake version.
+                } else if !is_majority_version(
+                    &version_view,
+                    deployment_version as i32,
+                    Some(h),
+                    params.block_reject_num_required,
+                    params,
+                ) {
+                    // The dependency not being met means the state stays
+                    // defined.
+                } else if median_time >= begin_time {
+                    // The begin time has been reached: start voting.
+                    state.state = ThresholdState::Started;
+                }
+            }
+            ThresholdState::Started => {
+                // The deployment expired.
+                let median_time = calc_past_median_time(&version_view, h) as u64;
+                if median_time >= end_time {
+                    state.state = ThresholdState::Failed;
+                } else {
+                    // Tally the votes over the confirmation window.
+                    let vote = &deployment.vote;
+                    let choice_idx_shift = vote.mask.trailing_zeros();
+                    let mut total_non_abstain_votes: u32 = 0;
+                    let mut choice_counts = vec![0u32; vote.choices.len()];
+                    let mut count_height = h;
+                    for _ in 0..confirmation_window {
+                        let Some(count_node) = view.vote_node(count_height) else {
+                            break;
+                        };
+                        for (version, bits) in &count_node.votes {
+                            if *version != deployment_version {
+                                continue;
+                            }
+                            let choice_idx = usize::from((bits & vote.mask) >> choice_idx_shift);
+                            if choice_idx > vote.choices.len() - 1 {
+                                continue;
+                            }
+                            choice_counts[choice_idx] += 1;
+                            if !vote.choices[choice_idx].is_abstain {
+                                total_non_abstain_votes += 1;
+                            }
+                        }
+                        if count_height == 0 {
+                            break;
+                        }
+                        count_height -= 1;
+                    }
+
+                    if total_non_abstain_votes >= params.rule_change_activation_quorum {
+                        let threshold = total_non_abstain_votes
+                            * params.rule_change_activation_multiplier
+                            / params.rule_change_activation_divisor;
+                        for (choice_idx, choice) in vote.choices.iter().enumerate() {
+                            if choice.is_abstain || choice_counts[choice_idx] < threshold {
+                                continue;
+                            }
+                            if choice.is_no {
+                                state.state = ThresholdState::Failed;
+                            } else {
+                                state.state = ThresholdState::LockedIn;
+                            }
+                            state.choice = Some(choice.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+            ThresholdState::LockedIn => {
+                // The new rule becomes active when its previous state
+                // was locked in.
+                state.state = ThresholdState::Active;
+            }
+            // Nothing to do for the terminal states.
+            ThresholdState::Active | ThresholdState::Failed => {}
+        }
+    }
+
+    state
+}
+
+/// The threshold state for the deployment for the block AFTER the given
+/// node, honoring test networks' forced choices (dcrd
+/// `deploymentState`).
+pub fn deployment_state(
+    view: &impl VoteChainView,
+    prev_height: Option<i64>,
+    deployment_version: u32,
+    deployment: &ConsensusDeployment,
+    params: &Params,
+) -> ThresholdStateTuple {
+    // Networks may force an outcome for an agenda (used on test
+    // networks for already-decided agendas); dcrd resolves this into a
+    // forced state at chain construction.
+    if !deployment.forced_choice_id.is_empty() {
+        let choice = deployment
+            .vote
+            .choices
+            .iter()
+            .find(|c| c.id == deployment.forced_choice_id)
+            .cloned();
+        let state = match &choice {
+            Some(c) if c.is_no => ThresholdState::Failed,
+            Some(_) => ThresholdState::Active,
+            // A forced choice id that does not exist is a chaincfg data
+            // error; dcrd validates this at startup and the ported
+            // chaincfg sanity tests do the same.
+            None => unreachable!("forced choice id must exist in the vote choices"),
+        };
+        return tuple(state, choice);
+    }
+
+    next_threshold_state(view, prev_height, deployment_version, deployment, params)
+}

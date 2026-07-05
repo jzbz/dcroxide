@@ -23,6 +23,7 @@ pub mod compress;
 pub mod difficulty;
 mod error;
 pub mod stakever;
+pub mod thresholdstate;
 mod utxoentry;
 mod utxoio;
 
