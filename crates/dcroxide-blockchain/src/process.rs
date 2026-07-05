@@ -1129,6 +1129,7 @@ impl Chain {
                     parent_id,
                     &block,
                     &parent_stake_node,
+                    false,
                     params,
                 );
                 if let Err(err) = context_result {
@@ -1242,6 +1243,189 @@ impl Chain {
         reorg_errs
     }
 
+    /// Accept the data for the block, updating the block index state
+    /// for the full data now being available, and return the
+    /// descendant blocks now eligible for validation (dcrd
+    /// `maybeAcceptBlockData`; the stake node pruner and the block
+    /// database write are respectively a memory optimization and the
+    /// in-memory block map here).
+    pub fn maybe_accept_block_data(
+        &mut self,
+        node: NodeId,
+        block: &MsgBlock,
+        fast_add: bool,
+        params: &Params,
+    ) -> Result<Vec<NodeId>, RuleError> {
+        let _ = params;
+        if self.index.node_status(&self.store, node).have_data() {
+            return Ok(Vec::new());
+        }
+
+        // Populate the prunable ticket and vote information.
+        let info = dcroxide_stake::find_spent_tickets_in_block(block);
+        let votes = info.votes.iter().map(|v| (v.version, v.bits)).collect();
+        self.store
+            .populate_ticket_info(node, info.voted_tickets, info.revoked_tickets, votes);
+
+        // The block data must pass the position-dependent checks.
+        let prev_height = self
+            .store
+            .node(node)
+            .parent
+            .map(|p| self.store.node(p).height);
+        if let Err(err) = crate::validate::check_block_data_positional(block, prev_height, fast_add)
+        {
+            self.index
+                .mark_block_failed_validation(&mut self.store, node);
+            return Err(err);
+        }
+
+        // Store the block and update the index state for the data now
+        // being available, which may make descendants fully linked.
+        self.blocks
+            .insert(block.header.block_hash().0, block.clone());
+        self.index
+            .set_status_flags(&mut self.store, node, BlockStatus::DATA_STORED);
+        let tip = self.best_chain.tip().expect("best chain tip");
+        Ok(self.index.accept_block_data(&mut self.store, node, tip))
+    }
+
+    /// Tentatively accept fully linked blocks by running the
+    /// contextual checks over each, marking any failures, and return
+    /// those accepted along with the error for the first failure
+    /// (dcrd `maybeAcceptBlocks`; the recent block and context check
+    /// caches and the new-tip notification are not reproduced).
+    pub fn maybe_accept_blocks(
+        &mut self,
+        nodes: Vec<NodeId>,
+        fast_add: bool,
+        params: &Params,
+    ) -> (Vec<NodeId>, Option<RuleError>) {
+        for (i, &node) in nodes.iter().enumerate() {
+            let block = self.block_by_node(node).clone();
+            let parent_id = self.store.node(node).parent.expect("linked block parent");
+            let parent_stake_node = match self.fetch_stake_node(parent_id, params) {
+                Ok(sn) => sn,
+                Err(err) => return (nodes[..i].to_vec(), Some(stake_rule_error(err))),
+            };
+            if let Err(err) = check_block_context_for(
+                &self.store,
+                parent_id,
+                &block,
+                &parent_stake_node,
+                fast_add,
+                params,
+            ) {
+                self.index
+                    .mark_block_failed_validation(&mut self.store, node);
+                return (nodes[..i].to_vec(), Some(err));
+            }
+        }
+        (nodes, None)
+    }
+
+    /// The main workhorse for inserting new blocks into the chain,
+    /// including duplicate rejection, all validation rules, best
+    /// chain selection, and reorganization (dcrd `ProcessBlock`; the
+    /// block index flush and the acceptance notifications are not
+    /// reproduced).  Returns the length of the fork the block
+    /// extended alongside any errors; the fork length is zero when
+    /// the block extended or became the best chain tip.
+    pub fn process_block(
+        &mut self,
+        block: &MsgBlock,
+        adjusted_time_unix: i64,
+        params: &Params,
+    ) -> (i64, Vec<RuleError>) {
+        // The block must not already exist in the main chain or side
+        // chains.
+        let hash = block.header.block_hash();
+        if self.index.have_block(&self.store, &hash) {
+            return (
+                0,
+                alloc::vec![rule_error(
+                    RuleErrorKind::DuplicateBlock,
+                    format!("already have block {hash}"),
+                )],
+            );
+        }
+
+        // Reject blocks that are already known to be invalid.
+        let existing = self.index.lookup_node(&hash);
+        if let Some(node) = existing {
+            if let Err(err) = self.check_known_invalid_block(node) {
+                return (0, alloc::vec![err]);
+            }
+        }
+
+        // Perform preliminary sanity checks on the block and its
+        // transactions.
+        if let Err(err) =
+            crate::validate::check_block_sanity(block, adjusted_time_unix, false, params)
+        {
+            if let Some(node) = existing {
+                self.index
+                    .mark_block_failed_validation(&mut self.store, node);
+            }
+            return (0, alloc::vec![err]);
+        }
+
+        // Potentially accept the header to the block index when it
+        // does not already exist; the header sanity checks were just
+        // performed as part of the full block sanity checks.
+        let node = match existing {
+            Some(node) => node,
+            None => {
+                match self.maybe_accept_block_header(
+                    &block.header,
+                    false,
+                    adjusted_time_unix,
+                    params,
+                ) {
+                    Ok(node) => node,
+                    Err(err) => return (0, alloc::vec![err]),
+                }
+            }
+        };
+
+        // Skip the more expensive validation checks when the block is
+        // an ancestor of the assumed valid block or a bulk import.
+        let mut fast_add = false;
+        if self.bulk_import_mode || self.is_assume_valid_ancestor(node) {
+            self.index
+                .set_status_flags(&mut self.store, node, BlockStatus::VALIDATED);
+            fast_add = true;
+        }
+
+        // Accept the block data and determine the blocks now eligible
+        // for full validation.  dcrd flushes the block index to the
+        // database here; index persistence arrives with the wiring.
+        let linked = match self.maybe_accept_block_data(node, block, fast_add, params) {
+            Ok(linked) => linked,
+            Err(err) => return (0, alloc::vec![err]),
+        };
+
+        // Tentatively accept the linked blocks, then find the best
+        // chain candidate and attempt to reorganize to it regardless
+        // of any acceptance failure, exactly like dcrd.
+        let mut final_errs = Vec::new();
+        let (_accepted, accept_err) = self.maybe_accept_blocks(linked, fast_add, params);
+        if let Some(err) = accept_err {
+            final_errs.push(err);
+        }
+
+        let target = self.index.find_best_chain_candidate(&self.store);
+        final_errs.extend(self.reorganize_chain(target, adjusted_time_unix, params));
+
+        let mut fork_len = 0;
+        if final_errs.is_empty() {
+            if let Some(fork) = self.best_chain.find_fork(&self.store, node) {
+                fork_len = self.store.node(node).height - self.store.node(fork).height;
+            }
+        }
+        (fork_len, final_errs)
+    }
+
     /// Whether the node's timestamp is more than 24 hours old
     /// relative to the adjusted time (dcrd `isOldTimestamp`).
     fn is_old_timestamp(&self, node: NodeId, adjusted_time_unix: i64) -> bool {
@@ -1305,6 +1489,7 @@ fn check_block_context_for(
     parent_id: NodeId,
     block: &MsgBlock,
     parent_stake_node: &StakeNode,
+    fast_add: bool,
     params: &Params,
 ) -> Result<(), RuleError> {
     let parent_view = NodeBranchView {
@@ -1316,7 +1501,7 @@ fn check_block_context_for(
         &parent_view,
         block,
         prev_height,
-        false,
+        fast_add,
         false,
         parent_stake_node.pool_size() as u32,
         parent_stake_node.final_state(),
