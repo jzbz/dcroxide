@@ -707,6 +707,19 @@ impl BlockIndex {
         }
     }
 
+    /// The chain tips at the given height: the first tip followed by
+    /// any others (the shape dcrd `TipGeneration` reads).
+    pub fn tips_at_height(&self, height: i64) -> alloc::vec::Vec<NodeId> {
+        let mut out = alloc::vec::Vec::new();
+        if let Some(entry) = self.chain_tips.get(&height) {
+            if let Some(tip) = entry.tip {
+                out.push(tip);
+                out.extend(entry.other_tips.iter().copied());
+            }
+        }
+        out
+    }
+
     /// Drain the set of nodes with unflushed changes (used by the
     /// block index flush).
     pub fn take_modified(&mut self) -> alloc::vec::Vec<NodeId> {

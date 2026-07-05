@@ -2270,6 +2270,336 @@ impl Chain {
         self.reorganize_chain(Some(new_best_node), adjusted_time_unix, params)
     }
 
+    /// Fully validate that connecting the block template to the
+    /// current tip of the main chain or its parent does not violate
+    /// any consensus rules aside from proof of work (dcrd
+    /// `CheckConnectBlockTemplate`).
+    pub fn check_connect_block_template(
+        &mut self,
+        block: &MsgBlock,
+        adjusted_time_unix: i64,
+        params: &Params,
+    ) -> Result<(), RuleError> {
+        // The template must build off the current tip or its parent.
+        let tip = self.best_chain.tip().expect("best chain tip");
+        let tip_hash = self.store.node(tip).hash;
+        let tip_parent = self.store.node(tip).parent;
+        let parent_hash = block.header.prev_block;
+        let prev_node = if parent_hash == tip_hash {
+            Some(tip)
+        } else {
+            tip_parent.filter(|tp| parent_hash == self.store.node(*tp).hash)
+        };
+        let Some(prev_node) = prev_node else {
+            return Err(rule_error(
+                RuleErrorKind::InvalidTemplateParent,
+                format!(
+                    "previous block must be the current chain tip {tip_hash} or its parent, \
+                     but got {parent_hash}"
+                ),
+            ));
+        };
+        let prev_height = self.store.node(prev_node).height;
+
+        // Context-free sanity checks, skipping the proof of work.
+        crate::validate::check_block_sanity(block, adjusted_time_unix, true, params)?;
+
+        // The positional checks over the parent branch.
+        {
+            let view = NodeBranchView {
+                store: &self.store,
+                tip: prev_node,
+            };
+            crate::validate::check_block_positional(
+                &view,
+                block,
+                Some(prev_height),
+                false,
+                params,
+            )?;
+        }
+
+        // The contextual checks, again skipping the proof of work.
+        let prev_stake_node = self
+            .fetch_stake_node(prev_node, params)
+            .map_err(stake_rule_error)?;
+        {
+            let view = NodeBranchView {
+                store: &self.store,
+                tip: prev_node,
+            };
+            crate::validate::check_block_context(
+                &view,
+                block,
+                Some(prev_height),
+                false,
+                true,
+                prev_stake_node.pool_size() as u32,
+                prev_stake_node.final_state(),
+                Some(&prev_stake_node),
+                params,
+            )?;
+        }
+
+        // A template is never in the block index, so the assumed
+        // valid ancestry check inside dcrd's connect always reports
+        // false and scripts run unless bulk importing.
+        let run_scripts = !self.bulk_import_mode;
+        let is_treasury_enabled = {
+            let view = NodeBranchView {
+                store: &self.store,
+                tip: prev_node,
+            };
+            crate::agendas::is_treasury_agenda_active(&view, Some(prev_height), params)
+                .map_err(|_| unknown_deployment_error())?
+        };
+
+        let mut view = UtxoView::new();
+        view.set_best_hash(tip_hash);
+        let template_info = (
+            prev_height + 1,
+            block.header.block_hash(),
+            block.header.voters,
+            block.header.vote_bits,
+        );
+        let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(ChainSubsidyParams(params));
+
+        if prev_node == tip {
+            // Use the chain state as is when extending the main chain.
+            let parent = self.block_by_node(tip).clone();
+            let parent_stxos = self.fetch_spend_journal(&parent, is_treasury_enabled);
+            let branch_view = NodeBranchView {
+                store: &self.store,
+                tip: prev_node,
+            };
+            return crate::validate::check_connect_block(
+                &branch_view,
+                &mut subsidy_cache,
+                template_info.0,
+                template_info.1,
+                template_info.2,
+                template_info.3,
+                block,
+                &parent,
+                &parent_stxos,
+                &mut view,
+                &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
+                None,
+                run_scripts,
+                params,
+            )
+            .map(|_| ());
+        }
+
+        // The template builds on the parent of the current tip: undo
+        // the tip block to reach the template's point of view.
+        let tip_block = self.block_by_node(tip).clone();
+        let parent = self.block_by_node(prev_node).clone();
+        let stxos = self.fetch_spend_journal(&tip_block, is_treasury_enabled);
+        view.disconnect_block(
+            &tip_block,
+            &parent,
+            &stxos,
+            &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
+            is_treasury_enabled,
+        )?;
+        let parent_stxos = self.fetch_spend_journal(&parent, is_treasury_enabled);
+        let branch_view = NodeBranchView {
+            store: &self.store,
+            tip: prev_node,
+        };
+        crate::validate::check_connect_block(
+            &branch_view,
+            &mut subsidy_cache,
+            template_info.0,
+            template_info.1,
+            template_info.2,
+            template_info.3,
+            block,
+            &parent,
+            &parent_stxos,
+            &mut view,
+            &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
+            None,
+            run_scripts,
+            params,
+        )
+        .map(|_| ())
+    }
+
+    /// Ensure extending the provided block with one containing the
+    /// specified number of ticket purchases cannot make the chain
+    /// unrecoverable through ticket exhaustion (dcrd
+    /// `checkTicketExhaustion`).
+    pub fn check_ticket_exhaustion(
+        &self,
+        prev_node: NodeId,
+        ticket_purchases: u8,
+        params: &Params,
+    ) -> Result<(), RuleError> {
+        // Nothing to do when the chain is not far enough along for
+        // exhaustion to be an issue.
+        let prev = self.store.node(prev_node);
+        let next_height = prev.height + 1;
+        let ticket_maturity = i64::from(params.ticket_maturity);
+        if next_height + ticket_maturity + 1 < params.stake_validation_height {
+            return Ok(());
+        }
+
+        // The final live pool size after the maturity period.
+        let mut final_pool_size = i64::from(prev.pool_size);
+        {
+            let view = NodeBranchView {
+                store: &self.store,
+                tip: prev_node,
+            };
+            final_pool_size += crate::difficulty::sum_purchased_tickets(
+                &view,
+                Some(prev.height),
+                ticket_maturity + 1,
+            );
+        }
+        final_pool_size += i64::from(ticket_purchases);
+        let mut voting_blocks_in_maturity_period = ticket_maturity + 2;
+        if prev.height < params.stake_validation_height {
+            voting_blocks_in_maturity_period -= params.stake_validation_height - prev.height;
+        }
+        let votes_per_block = i64::from(params.tickets_per_block);
+        final_pool_size -= voting_blocks_in_maturity_period * votes_per_block;
+
+        if final_pool_size < votes_per_block {
+            let purchases_needed = votes_per_block - final_pool_size;
+            return Err(rule_error(
+                RuleErrorKind::TicketExhaustion,
+                format!(
+                    "extending block {} (height {}) with a block that contains fewer than \
+                     {purchases_needed} ticket purchase(s) would result in an unrecoverable \
+                     chain due to ticket exhaustion",
+                    prev.hash, prev.height
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The hash-keyed wrapper for the ticket exhaustion check (dcrd
+    /// `CheckTicketExhaustion`).
+    pub fn check_ticket_exhaustion_by_hash(
+        &self,
+        hash: &Hash,
+        ticket_purchases: u8,
+        params: &Params,
+    ) -> Result<(), RuleError> {
+        let node = self.index.lookup_node(hash).ok_or_else(|| {
+            rule_error(
+                RuleErrorKind::UnknownBlock,
+                format!("block {hash} is not known"),
+            )
+        })?;
+        self.check_ticket_exhaustion(node, ticket_purchases, params)
+    }
+
+    /// Whether the block with the given hash is in the main chain
+    /// (dcrd `MainChainHasBlock`).
+    pub fn main_chain_has_block(&self, hash: &Hash) -> bool {
+        self.index
+            .lookup_node(hash)
+            .is_some_and(|n| self.best_chain.contains(&self.store, n))
+    }
+
+    /// The height of the main chain block with the given hash (dcrd
+    /// `BlockHeightByHash`).
+    pub fn block_height_by_hash(&self, hash: &Hash) -> Option<i64> {
+        self.index
+            .lookup_node(hash)
+            .filter(|n| self.best_chain.contains(&self.store, *n))
+            .map(|n| self.store.node(n).height)
+    }
+
+    /// The hash of the main chain block at the given height (dcrd
+    /// `BlockHashByHeight`).
+    pub fn block_hash_by_height(&self, height: i64) -> Option<Hash> {
+        self.best_chain
+            .node_by_height(height)
+            .map(|n| self.store.node(n).hash)
+    }
+
+    /// The header of the block with the given hash regardless of
+    /// chain (dcrd `HeaderByHash`).
+    pub fn header_by_hash(&self, hash: &Hash) -> Option<BlockHeader> {
+        self.index.lookup_node(hash).map(|n| self.store.header(n))
+    }
+
+    /// The header of the main chain block at the given height (dcrd
+    /// `HeaderByHeight`).
+    pub fn header_by_height(&self, height: i64) -> Option<BlockHeader> {
+        self.best_chain
+            .node_by_height(height)
+            .map(|n| self.store.header(n))
+    }
+
+    /// The block with the given hash when its data is available (dcrd
+    /// `BlockByHash`).
+    pub fn block_by_hash(&self, hash: &Hash) -> Option<MsgBlock> {
+        self.index
+            .lookup_node(hash)
+            .filter(|n| self.index.node_status(&self.store, *n).have_data())
+            .and_then(|n| self.blocks.get(&self.store.node(n).hash.0).cloned())
+    }
+
+    /// The main chain block at the given height (dcrd
+    /// `BlockByHeight`).
+    pub fn block_by_height(&self, height: i64) -> Option<MsgBlock> {
+        self.best_chain
+            .node_by_height(height)
+            .and_then(|n| self.blocks.get(&self.store.node(n).hash.0).cloned())
+    }
+
+    /// The past median time of the block with the given hash (dcrd
+    /// `MedianTimeByHash`).
+    pub fn median_time_by_hash(&self, hash: &Hash) -> Option<i64> {
+        self.index
+            .lookup_node(hash)
+            .map(|n| self.store.calc_past_median_time(n))
+    }
+
+    /// The cumulative work of the block with the given hash (dcrd
+    /// `ChainWork`).
+    pub fn chain_work(&self, hash: &Hash) -> Option<Uint256> {
+        self.index
+            .lookup_node(hash)
+            .map(|n| self.store.node(n).work_sum)
+    }
+
+    /// The entire generation of blocks at the current tip height
+    /// (dcrd `TipGeneration`).
+    pub fn tip_generation(&self) -> Vec<Hash> {
+        let Some(tip) = self.best_chain.tip() else {
+            return Vec::new();
+        };
+        let height = self.store.node(tip).height;
+        self.index
+            .tips_at_height(height)
+            .into_iter()
+            .map(|n| self.store.node(n).hash)
+            .collect()
+    }
+
+    /// The main chain block hashes in the given inclusive height
+    /// range (dcrd `HeightRange` semantics over the best chain).
+    pub fn height_range(&self, start_height: i64, end_height: i64) -> Vec<Hash> {
+        let mut out = Vec::new();
+        let mut h = start_height;
+        while h < end_height {
+            match self.best_chain.node_by_height(h) {
+                Some(n) => out.push(self.store.node(n).hash),
+                None => break,
+            }
+            h += 1;
+        }
+        out
+    }
+
     /// Whether the node's timestamp is more than 24 hours old
     /// relative to the adjusted time (dcrd `isOldTimestamp`).
     fn is_old_timestamp(&self, node: NodeId, adjusted_time_unix: i64) -> bool {
