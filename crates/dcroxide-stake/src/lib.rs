@@ -37,6 +37,7 @@ use dcroxide_wire::{MsgBlock, MsgTx, OutPoint, TxIn, TxOut, TxSerializeType};
 pub mod error;
 pub mod lottery;
 pub mod ticketdb;
+pub mod ticketnode;
 pub mod tickettreap;
 pub mod treasury;
 
