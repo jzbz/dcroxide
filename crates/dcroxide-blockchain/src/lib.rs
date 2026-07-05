@@ -25,6 +25,7 @@ pub mod compress;
 pub mod difficulty;
 mod error;
 mod ruleerror;
+pub mod sequencelock;
 pub mod stakever;
 pub mod thresholdstate;
 mod utxoentry;
