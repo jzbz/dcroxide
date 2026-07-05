@@ -145,6 +145,8 @@ fn contextual_vectors() {
                         Some(tip_height),
                         fast_add,
                         no_pow,
+                        0,
+                        [0u8; 6],
                         &params
                     )),
                     f[4],

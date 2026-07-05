@@ -1200,15 +1200,18 @@ pub fn check_proof_of_work_context(
 /// `checkBlockHeaderContext`).  A `None` previous height means the
 /// genesis block, which is valid by definition.
 ///
-/// dcrd additionally verifies the header's pool size and ticket
-/// lottery final state commitments against the parent's stake node;
-/// those checks require the ticket database and are deferred with it.
+/// The header's pool size and ticket lottery final state commitments
+/// are checked against the parent's stake node state, which the
+/// caller supplies (dcrd fetches it via `fetchStakeNode`).
+#[allow(clippy::too_many_arguments)]
 pub fn check_block_header_context(
     view: &impl FullChainView,
     header: &dcroxide_wire::BlockHeader,
     prev_height: Option<i64>,
     fast_add: bool,
     no_pow_check: bool,
+    parent_pool_size: u32,
+    parent_final_state: [u8; 6],
     params: &Params,
 ) -> Result<(), RuleError> {
     // The genesis block is valid by definition.
@@ -1292,9 +1295,128 @@ pub fn check_block_header_context(
             }
         }
 
-        // dcrd verifies the header's pool size and ticket lottery
-        // final state commitments against the parent's stake node
-        // here; both require the ticket database and arrive with it.
+        // Ensure the header commits to the correct pool size based on
+        // its position within the chain.
+        if header.pool_size != parent_pool_size {
+            return Err(rule_error(
+                RuleErrorKind::PoolSize,
+                format!(
+                    "block header commitment to pool size {} does not match expected \
+                     size {parent_pool_size}",
+                    header.pool_size
+                ),
+            ));
+        }
+
+        // Ensure the header commits to the correct final state of the
+        // ticket lottery.
+        if header.final_state != parent_final_state {
+            return Err(rule_error(
+                RuleErrorKind::InvalidFinalState,
+                format!(
+                    "block header commitment to final state of the ticket lottery \
+                     {:x?} does not match expected value {parent_final_state:x?}",
+                    header.final_state
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Perform validation of all votes and revocations in the block
+/// against the lottery results (dcrd `checkTicketRedeemers`): votes
+/// MUST spend winning tickets, revocations MUST spend missed or
+/// expired tickets, and under the automatic revocations agenda every
+/// newly missed or expired ticket MUST be revoked in the block.
+/// `exists_missed_ticket` stands in for the stake node query.
+pub fn check_ticket_redeemers(
+    vote_ticket_hashes: &[Hash],
+    revocation_ticket_hashes: &[Hash],
+    winners: &[Hash],
+    expiring_next_block: &[Hash],
+    exists_missed_ticket: impl Fn(&Hash) -> bool,
+    is_auto_revocations_enabled: bool,
+) -> Result<(), RuleError> {
+    // Determine which of the winning tickets have votes in the block.
+    let mut winning_hashes: alloc::collections::BTreeMap<[u8; 32], bool> =
+        alloc::collections::BTreeMap::new();
+    for ticket_hash in winners {
+        winning_hashes.insert(ticket_hash.0, false);
+    }
+    for vote_ticket_hash in vote_ticket_hashes {
+        match winning_hashes.get_mut(&vote_ticket_hash.0) {
+            None => {
+                return Err(rule_error(
+                    RuleErrorKind::TicketUnavailable,
+                    format!("block contains vote for ineligible ticket {vote_ticket_hash}"),
+                ));
+            }
+            Some(has_vote) => *has_vote = true,
+        }
+    }
+
+    // The winning tickets without votes become missed as of this
+    // block.
+    let missed_ticket_hashes: alloc::collections::BTreeSet<[u8; 32]> = winning_hashes
+        .iter()
+        .filter(|&(_, &has_vote)| !has_vote)
+        .map(|(hash, _)| *hash)
+        .collect();
+    let expiring_ticket_hashes: alloc::collections::BTreeSet<[u8; 32]> =
+        expiring_next_block.iter().map(|h| h.0).collect();
+
+    // Each revocation must spend a ticket that is missed or, under the
+    // automatic revocations agenda, becoming missed or expired as of
+    // this block.
+    let mut revoked_ticket_hashes: alloc::collections::BTreeSet<[u8; 32]> =
+        alloc::collections::BTreeSet::new();
+    for revocation_ticket_hash in revocation_ticket_hashes {
+        let missed_in_block = missed_ticket_hashes.contains(&revocation_ticket_hash.0);
+        let expiring_in_block = expiring_ticket_hashes.contains(&revocation_ticket_hash.0);
+        let missed_or_expired_in_block = missed_in_block || expiring_in_block;
+        let eligible = (is_auto_revocations_enabled && missed_or_expired_in_block)
+            || exists_missed_ticket(revocation_ticket_hash);
+        if !eligible {
+            return Err(rule_error(
+                RuleErrorKind::InvalidSSRtx,
+                format!(
+                    "block contains revocation of ineligible ticket \
+                     {revocation_ticket_hash}"
+                ),
+            ));
+        }
+        revoked_ticket_hashes.insert(revocation_ticket_hash.0);
+    }
+
+    // Under the automatic revocations agenda the block must revoke
+    // every ticket becoming missed or expired as of this block.
+    if is_auto_revocations_enabled {
+        for ticket_hash in &missed_ticket_hashes {
+            if !revoked_ticket_hashes.contains(ticket_hash) {
+                return Err(rule_error(
+                    RuleErrorKind::NoMissedTicketRevocation,
+                    format!(
+                        "block does not contain a revocation for ticket that is \
+                         becoming missed as of this block: {}",
+                        Hash(*ticket_hash)
+                    ),
+                ));
+            }
+        }
+        for ticket_hash in &expiring_ticket_hashes {
+            if !revoked_ticket_hashes.contains(ticket_hash) {
+                return Err(rule_error(
+                    RuleErrorKind::NoExpiredTicketRevocation,
+                    format!(
+                        "block does not contain a revocation for ticket that is \
+                         becoming expired as of this block: {}",
+                        Hash(*ticket_hash)
+                    ),
+                ));
+            }
+        }
     }
 
     Ok(())
