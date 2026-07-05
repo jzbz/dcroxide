@@ -1146,3 +1146,416 @@ pub fn check_block_positional(
     check_block_header_positional(view, &block.header, prev_height, fast_add, params)?;
     check_block_data_positional(block, prev_height, fast_add)
 }
+
+/// The maximum number of bytes allowed in the pushed data output of
+/// the coinbase output that is used to ensure the coinbase has a
+/// unique hash (dcrd `maxUniqueCoinbaseNullDataSize`).
+pub const MAX_UNIQUE_COINBASE_NULL_DATA_SIZE: usize = 256;
+
+/// Ensure the proof of work hash is less than the target difficulty
+/// indicated by the header difficulty bits, choosing the hash
+/// algorithm by the state of the DCP0011 BLAKE3 agenda (dcrd
+/// `checkProofOfWorkContext`).  The target range is already handled by
+/// the sanity checks.  `no_pow_check` corresponds to dcrd's
+/// `BFNoPoWCheck` flag.
+pub fn check_proof_of_work_context(
+    view: &impl FullChainView,
+    header: &dcroxide_wire::BlockHeader,
+    prev_height: i64,
+    no_pow_check: bool,
+    params: &Params,
+) -> Result<(), RuleError> {
+    // Nothing to do when the flag to avoid proof of work checks is
+    // set.
+    if no_pow_check {
+        return Ok(());
+    }
+
+    // Choose the proof of work mining algorithm based on the result of
+    // the vote for the blake3 proof of work agenda.
+    let is_blake3_active =
+        crate::agendas::is_blake3_pow_agenda_active(view, Some(prev_height), params).map_err(
+            |_| {
+                rule_error(
+                    RuleErrorKind::UnknownDeploymentID,
+                    "blake3 pow deployment not defined on this network",
+                )
+            },
+        )?;
+    let pow_hash = if is_blake3_active {
+        header.pow_hash_v2()
+    } else {
+        header.pow_hash_v1()
+    };
+    dcroxide_standalone::check_proof_of_work_hash(&pow_hash, header.bits)
+        .map_err(standalone_to_chain_rule_error)
+}
+
+/// Perform the validation checks on the block header which depend on
+/// having the full block data for all of its ancestors available,
+/// which includes checks that depend on tallying votes (dcrd
+/// `checkBlockHeaderContext`).  A `None` previous height means the
+/// genesis block, which is valid by definition.
+///
+/// dcrd additionally verifies the header's pool size and ticket
+/// lottery final state commitments against the parent's stake node;
+/// those checks require the ticket database and are deferred with it.
+pub fn check_block_header_context(
+    view: &impl FullChainView,
+    header: &dcroxide_wire::BlockHeader,
+    prev_height: Option<i64>,
+    fast_add: bool,
+    no_pow_check: bool,
+    params: &Params,
+) -> Result<(), RuleError> {
+    // The genesis block is valid by definition.
+    let Some(prev_height) = prev_height else {
+        return Ok(());
+    };
+
+    // Ensure the proof of work hash is less than the target value
+    // described by the bits using the correct hash algorithm; the bits
+    // have already been validated to be in range by the sanity checks.
+    check_proof_of_work_context(view, header, prev_height, no_pow_check, params)?;
+
+    if !fast_add {
+        let prev_node = crate::difficulty::ChainView::node(view, prev_height).expect("prev node");
+
+        // Ensure the difficulty specified in the block header matches
+        // the calculated difficulty based on the previous block and
+        // difficulty retarget rules.
+        let exp_diff = crate::agendas::calc_next_required_difficulty(
+            view,
+            &prev_node,
+            i64::from(header.timestamp),
+            params,
+        )
+        .map_err(|_| {
+            rule_error(
+                RuleErrorKind::UnknownDeploymentID,
+                "blake3 pow deployment not defined on this network",
+            )
+        })?;
+        if header.bits != exp_diff {
+            return Err(rule_error(
+                RuleErrorKind::UnexpectedDifficulty,
+                format!(
+                    "block difficulty of {} is not the expected value of {exp_diff}",
+                    header.bits
+                ),
+            ));
+        }
+
+        // Ensure the stake difficulty specified in the block header
+        // matches the calculated difficulty based on the previous
+        // block and difficulty retarget rules.
+        let exp_sdiff =
+            crate::agendas::calc_next_required_stake_difficulty(view, Some(&prev_node), params);
+        if header.sbits != exp_sdiff {
+            return Err(rule_error(
+                RuleErrorKind::UnexpectedDifficulty,
+                format!(
+                    "block stake difficulty of {} is not the expected value of {exp_sdiff}",
+                    header.sbits
+                ),
+            ));
+        }
+
+        // Enforce the stake version in the header once a majority of
+        // the network has upgraded to version 3 blocks.
+        if header.version >= 3
+            && crate::stakever::is_majority_version(
+                &crate::sequencelock::AsVersionView(view),
+                3,
+                Some(prev_height),
+                params.block_enforce_num_required,
+                params,
+            )
+        {
+            let expected_stake_ver = crate::stakever::calc_stake_version(
+                &crate::sequencelock::AsVersionView(view),
+                prev_height,
+                params,
+            );
+            if header.stake_version != expected_stake_ver {
+                return Err(rule_error(
+                    RuleErrorKind::BadStakeVersion,
+                    format!(
+                        "block stake version of {} is not the expected version of \
+                         {expected_stake_ver}",
+                        header.stake_version
+                    ),
+                ));
+            }
+        }
+
+        // dcrd verifies the header's pool size and ticket lottery
+        // final state commitments against the parent's stake node
+        // here; both require the ticket database and arrive with it.
+    }
+
+    Ok(())
+}
+
+/// Ensure that for all blocks height > 1 the coinbase contains the
+/// height encoding to make coinbase hash collisions impossible (dcrd
+/// `checkCoinbaseUniqueHeight`).
+pub fn check_coinbase_unique_height(
+    block_height: i64,
+    block: &MsgBlock,
+    treasury_enabled: bool,
+) -> Result<(), RuleError> {
+    // Block 0 and 1 are special and don't need the coinbase height
+    // checks.
+    if block_height < 2 {
+        return Ok(());
+    }
+
+    // Prior to activation of the treasury agenda, output 0 is the
+    // project subsidy and output 1 encodes the height.  Once the
+    // agenda is active, the project subsidy is moved to the
+    // treasurybase in the stake tree and thus output 0 then encodes
+    // the height.
+    let null_data_out_idx = if treasury_enabled { 0 } else { 1 };
+
+    // There must be at least enough outputs to contain the one that
+    // encodes the height.
+    let coinbase_tx = &block.transactions[0];
+    if coinbase_tx.tx_out.len() < null_data_out_idx + 1 {
+        return Err(rule_error(
+            RuleErrorKind::FirstTxNotCoinbase,
+            format!(
+                "block is missing required coinbase outputs (num outputs: {}, min \
+                 required: {})",
+                coinbase_tx.tx_out.len(),
+                null_data_out_idx + 1
+            ),
+        ));
+    }
+
+    // Only version 0 scripts are currently valid.
+    const SCRIPT_VERSION: u16 = 0;
+    let null_data_out = &coinbase_tx.tx_out[null_data_out_idx];
+    if null_data_out.version != SCRIPT_VERSION {
+        return Err(rule_error(
+            RuleErrorKind::FirstTxNotCoinbase,
+            format!(
+                "coinbase output {null_data_out_idx} script version {} is not the \
+                 required version {SCRIPT_VERSION}",
+                null_data_out.version
+            ),
+        ));
+    }
+
+    // The nulldata in the coinbase must be a single OP_RETURN followed
+    // by a data push up to the maximum unique coinbase null data size,
+    // and the first 4 bytes of that data must be the little-endian
+    // encoded height of the block.  This intentionally avoids the
+    // standardness script type determination functions because this
+    // enforces consensus rules.
+    let mut null_data: &[u8] = &[];
+    let pk_script = &null_data_out.pk_script;
+    if pk_script.len() > 1 && pk_script[0] == dcroxide_txscript::OP_RETURN {
+        let mut tokenizer =
+            dcroxide_txscript::ScriptTokenizer::new(SCRIPT_VERSION, &pk_script[1..]);
+        if tokenizer.next()
+            && tokenizer.done()
+            && tokenizer.opcode() <= dcroxide_txscript::OP_PUSHDATA4
+        {
+            null_data = tokenizer.data();
+        }
+    }
+    if null_data.len() > MAX_UNIQUE_COINBASE_NULL_DATA_SIZE {
+        return Err(rule_error(
+            RuleErrorKind::FirstTxNotCoinbase,
+            format!(
+                "coinbase output {null_data_out_idx} pushes {} bytes which is more \
+                 than allowed value of {MAX_UNIQUE_COINBASE_NULL_DATA_SIZE}",
+                null_data.len()
+            ),
+        ));
+    }
+    if null_data.len() < 4 {
+        return Err(rule_error(
+            RuleErrorKind::FirstTxNotCoinbase,
+            format!(
+                "coinbase output {null_data_out_idx} pushes {} bytes which is too \
+                 short to encode height",
+                null_data.len()
+            ),
+        ));
+    }
+
+    // Check the height and ensure it is correct.
+    let cb_height = u32::from_le_bytes([null_data[0], null_data[1], null_data[2], null_data[3]]);
+    if cb_height != block_height as u32 {
+        return Err(rule_error(
+            RuleErrorKind::CoinbaseHeight,
+            format!(
+                "coinbase output {null_data_out_idx} encodes height {cb_height} instead \
+                 of expected height {}",
+                block_height as u32
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Ensure that for all blocks height > 1 the treasurybase contains the
+/// height encoding to make treasurybase hash collisions impossible
+/// (dcrd `checkTreasurybaseUniqueHeight`).  The caller must have
+/// already verified the block has at least one stake transaction, as
+/// in dcrd (which returns an assertion error there).
+pub fn check_treasurybase_unique_height(
+    block_height: i64,
+    block: &MsgBlock,
+) -> Result<(), RuleError> {
+    // Block 0 and 1 are special and don't need the treasurybase height
+    // checks.
+    if block_height < 2 {
+        return Ok(());
+    }
+
+    assert!(
+        !block.stransactions.is_empty(),
+        "checkTreasurybaseUniqueHeight must be called with a block that has already \
+         been verified to have at least one stake transaction"
+    );
+
+    // Treasurybase output 0 is the subsidy and output 1 encodes the
+    // height.
+    const NULL_DATA_OUT_IDX: usize = 1;
+    let trsybase_tx = &block.stransactions[0];
+    if trsybase_tx.tx_out.len() < NULL_DATA_OUT_IDX + 1 {
+        return Err(rule_error(
+            RuleErrorKind::FirstTxNotTreasurybase,
+            format!(
+                "block is missing required OP_RETURN output (num outputs: {}, min \
+                 required: {})",
+                trsybase_tx.tx_out.len(),
+                NULL_DATA_OUT_IDX + 1
+            ),
+        ));
+    }
+
+    // Only version 0 scripts are currently valid.
+    const SCRIPT_VERSION: u16 = 0;
+    let null_data_out = &trsybase_tx.tx_out[NULL_DATA_OUT_IDX];
+    if null_data_out.version != SCRIPT_VERSION {
+        return Err(rule_error(
+            RuleErrorKind::FirstTxNotTreasurybase,
+            format!(
+                "treasurybase output {NULL_DATA_OUT_IDX} script version {} is not the \
+                 required version {SCRIPT_VERSION}",
+                null_data_out.version
+            ),
+        ));
+    }
+
+    // The nulldata in the treasurybase must be a single OP_RETURN
+    // followed by a data push of 12 bytes which encodes the height of
+    // the block followed by random data.
+    let mut null_data: &[u8] = &[];
+    let pk_script = &null_data_out.pk_script;
+    if pk_script.len() == 14
+        && pk_script[0] == dcroxide_txscript::OP_RETURN
+        && pk_script[1] == dcroxide_txscript::OP_DATA_12
+    {
+        // The encoded height.
+        null_data = &pk_script[2..6];
+    }
+    if null_data.len() != 4 {
+        return Err(rule_error(
+            RuleErrorKind::TreasurybaseTxNotOpReturn,
+            format!("treasurybase output {NULL_DATA_OUT_IDX} is invalid"),
+        ));
+    }
+
+    // Check the height and ensure it is correct.
+    let encoded_height =
+        u32::from_le_bytes([null_data[0], null_data[1], null_data[2], null_data[3]]);
+    if encoded_height != block_height as u32 {
+        return Err(rule_error(
+            RuleErrorKind::TreasurybaseHeight,
+            format!(
+                "treasurybase output {NULL_DATA_OUT_IDX} encodes height {encoded_height} \
+                 instead of expected height {}",
+                block_height as u32
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validate the merkle root commitments in the block header against
+/// the calculated values, honoring the DCP0005 header commitments
+/// agenda for the combined-vs-dual tree behavior (dcrd
+/// `checkMerkleRoots`).
+pub fn check_merkle_roots(
+    view: &impl FullChainView,
+    block: &MsgBlock,
+    prev_height: i64,
+    params: &Params,
+) -> Result<(), RuleError> {
+    let header = &block.header;
+
+    let hdr_commitments_active =
+        crate::agendas::is_header_commitments_agenda_active(view, Some(prev_height), params)
+            .map_err(|_| {
+                rule_error(
+                    RuleErrorKind::UnknownDeploymentID,
+                    "header commitments deployment not defined on this network",
+                )
+            })?;
+    if hdr_commitments_active {
+        // Build the two merkle trees and use their calculated merkle
+        // roots as leaves to another merkle tree and ensure the final
+        // calculated merkle root matches the entry in the block
+        // header.
+        let want_merkle_root = dcroxide_standalone::calc_combined_tx_tree_merkle_root(
+            &block.transactions,
+            &block.stransactions,
+        );
+        if header.merkle_root != want_merkle_root {
+            return Err(rule_error(
+                RuleErrorKind::BadMerkleRoot,
+                format!(
+                    "block merkle root is invalid - block header indicates {}, but \
+                     calculated value is {want_merkle_root}",
+                    header.merkle_root
+                ),
+            ));
+        }
+        return Ok(());
+    }
+
+    // Fall back to the old behavior: check the regular and stake tree
+    // merkle roots independently.
+    let want_merkle_root = dcroxide_standalone::calc_tx_tree_merkle_root(&block.transactions);
+    if header.merkle_root != want_merkle_root {
+        return Err(rule_error(
+            RuleErrorKind::BadMerkleRoot,
+            format!(
+                "block merkle root is invalid - block header indicates {}, but \
+                 calculated value is {want_merkle_root}",
+                header.merkle_root
+            ),
+        ));
+    }
+
+    let want_stake_root = dcroxide_standalone::calc_tx_tree_merkle_root(&block.stransactions);
+    if header.stake_root != want_stake_root {
+        return Err(rule_error(
+            RuleErrorKind::BadMerkleRoot,
+            format!(
+                "block stake merkle root is invalid - block header indicates {}, but \
+                 calculated value is {want_stake_root}",
+                header.stake_root
+            ),
+        ));
+    }
+
+    Ok(())
+}

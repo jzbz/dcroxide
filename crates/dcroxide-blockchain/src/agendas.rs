@@ -65,6 +65,27 @@ pub fn is_agenda_active(
     Ok(state.state == ThresholdState::Active)
 }
 
+/// Whether the DCP0011 BLAKE3 proof of work agenda is active for the
+/// block AFTER the given node (dcrd `isBlake3PowAgendaActive`).
+pub fn is_blake3_pow_agenda_active(
+    view: &impl VoteChainView,
+    prev_height: Option<i64>,
+    params: &Params,
+) -> Result<bool, UnknownDeployment> {
+    is_agenda_active(view, prev_height, VOTE_ID_BLAKE3_POW, params)
+}
+
+/// Whether the DCP0005 header commitments agenda is active for the
+/// block AFTER the given node (dcrd
+/// `isHeaderCommitmentsAgendaActive`).
+pub fn is_header_commitments_agenda_active(
+    view: &impl VoteChainView,
+    prev_height: Option<i64>,
+    params: &Params,
+) -> Result<bool, UnknownDeployment> {
+    is_agenda_active(view, prev_height, VOTE_ID_HEADER_COMMITMENTS, params)
+}
+
 /// The network does not define the requested deployment (dcrd
 /// `ErrUnknownDeploymentID`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
