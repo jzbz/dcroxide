@@ -85,7 +85,7 @@ Currently implemented:
   UTXO serialization layer (VLQs, the domain-specific script and amount
   compression, UTXO entries, outpoint keys, and the set state) and the
   legacy work/stake difficulty algorithms, the stake-version voting
-  machinery, and the agenda threshold state machine, pinned by dcrd's own test vectors and by synthetic-chain
+  machinery, the agenda threshold state machine, and the agenda-driven algorithm selectors, pinned by dcrd's own test vectors and by synthetic-chain
   scenarios generated inside dcrd's internal package
 - `dcroxide-gcs` — Golomb-coded set filters (versions 1 and 2) and the
   DCP0005 version 2 block committed filters for light clients, matched
