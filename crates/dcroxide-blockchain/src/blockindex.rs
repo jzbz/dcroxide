@@ -658,7 +658,22 @@ impl BlockIndex {
         self.cached_tips_start = height;
     }
 
-    fn maybe_update_best_invalid(&mut self, store: &NodeStore, invalid_node: NodeId) {
+    /// Clear the tracked best invalid block so it can be
+    /// repopulated (used by block reconsideration).
+    pub(crate) fn reset_best_invalid(&mut self) {
+        self.best_invalid = None;
+    }
+
+    /// Add a node to its parent's unlinked children when not already
+    /// present (used by block reconsideration).
+    pub(crate) fn add_unlinked_child(&mut self, parent: NodeId, child: NodeId) {
+        let children = self.unlinked_children_of.entry(parent).or_default();
+        if !children.contains(&child) {
+            children.push(child);
+        }
+    }
+
+    pub(crate) fn maybe_update_best_invalid(&mut self, store: &NodeStore, invalid_node: NodeId) {
         let better = match self.best_invalid {
             Some(best) => store.better_candidate(invalid_node, best),
             None => true,
@@ -668,7 +683,7 @@ impl BlockIndex {
         }
     }
 
-    fn maybe_update_best_header_for_tip(&mut self, store: &NodeStore, tip: NodeId) {
+    pub(crate) fn maybe_update_best_header_for_tip(&mut self, store: &NodeStore, tip: NodeId) {
         let mut n = Some(tip);
         while let Some(cur) = n {
             let better = match self.best_header {

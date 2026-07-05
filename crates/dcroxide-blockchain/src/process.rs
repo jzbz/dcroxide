@@ -1426,6 +1426,286 @@ impl Chain {
         (fork_len, final_errs)
     }
 
+    /// Manually invalidate the block as if it had violated a
+    /// consensus rule, mark its descendants as having an invalid
+    /// ancestor, and reorganize to the best remaining valid chain
+    /// (dcrd `InvalidateBlock`; the context check cache and block
+    /// index flushes are not reproduced).
+    pub fn invalidate_block(
+        &mut self,
+        hash: &Hash,
+        adjusted_time_unix: i64,
+        params: &Params,
+    ) -> Vec<RuleError> {
+        let Some(node) = self.index.lookup_node(hash) else {
+            return alloc::vec![rule_error(
+                RuleErrorKind::UnknownBlock,
+                format!("block {hash} is not known"),
+            )];
+        };
+
+        // Disallow invalidation of the genesis block.
+        if self.store.node(node).height == 0 {
+            return alloc::vec![rule_error(
+                RuleErrorKind::InvalidateGenesisBlock,
+                "invalidating the genesis block is not allowed",
+            )];
+        }
+
+        // Nothing to do when the block already failed validation;
+        // a block that is merely on an invalid branch is still
+        // manually marked.
+        if self
+            .index
+            .node_status(&self.store, node)
+            .known_validate_failed()
+        {
+            return Vec::new();
+        }
+
+        // Simply mark the block when it is not part of the current
+        // best chain.
+        if !self.best_chain.contains(&self.store, node) {
+            self.index
+                .mark_block_failed_validation(&mut self.store, node);
+            return Vec::new();
+        }
+
+        // Reorganize back to the parent and mark the block and its
+        // descendants.
+        let parent = self.store.node(node).parent.expect("non-genesis parent");
+        let errs = self.reorganize_chain(Some(parent), adjusted_time_unix, params);
+        if !errs.is_empty() {
+            return errs;
+        }
+        self.index
+            .mark_block_failed_validation(&mut self.store, node);
+
+        // Reset whether the chain believes it is current since the
+        // best chain was just invalidated.
+        let new_tip = self.best_chain.tip().expect("best chain tip");
+        self.is_current_latch = false;
+        self.maybe_update_is_current(new_tip, adjusted_time_unix);
+
+        // Repopulate the best chain candidates by scouring the block
+        // tree, since the new tip was likely removed from them.
+        self.index.add_best_chain_candidate(new_tip);
+        let mut tips: Vec<NodeId> = Vec::new();
+        let _ = self.index.for_each_chain_tip(|tip| -> Result<(), ()> {
+            tips.push(tip);
+            Ok(())
+        });
+        let new_tip_work = self.store.node(new_tip).work_sum;
+        for tip in tips {
+            // Chain tips with less work than the new tip are not
+            // candidates, nor are any of their ancestors.
+            if self.store.node(tip).work_sum < new_tip_work {
+                continue;
+            }
+
+            // Find the first ancestor of the tip that is not known to
+            // be invalid and can be validated.
+            let mut n = Some(tip);
+            while let Some(id) = n {
+                if !self.store.node(id).status.known_invalid()
+                    && self.index.can_validate(&self.store, id)
+                {
+                    break;
+                }
+                n = self.store.node(id).parent;
+            }
+            if let Some(id) = n {
+                if id != new_tip && self.store.node(id).work_sum >= new_tip_work {
+                    self.index.add_best_chain_candidate(id);
+                }
+            }
+        }
+
+        // Reorganize to the best remaining candidate.
+        let target = self.index.find_best_chain_candidate(&self.store);
+        self.reorganize_chain(target, adjusted_time_unix, params)
+    }
+
+    /// Remove the known invalid status from the block and its
+    /// ancestors, clear the invalid ancestor status from descendants
+    /// not otherwise invalid, and reorganize to the best resulting
+    /// chain (dcrd `ReconsiderBlock`).
+    pub fn reconsider_block(
+        &mut self,
+        hash: &Hash,
+        adjusted_time_unix: i64,
+        params: &Params,
+    ) -> Vec<RuleError> {
+        let Some(node) = self.index.lookup_node(hash) else {
+            return alloc::vec![rule_error(
+                RuleErrorKind::UnknownBlock,
+                format!("block {hash} is not known"),
+            )];
+        };
+
+        // Remove invalidity flags from the block and its ancestors
+        // while tracking the earliest block marked as having failed
+        // validation, adding any that become eligible as best chain
+        // candidates and restoring unlinked children entries.
+        let cur_best_tip = self.best_chain.tip().expect("best chain tip");
+        let cur_best_work = self.store.node(cur_best_tip).work_sum;
+        let mut vf_node = node;
+        let mut n = Some(node);
+        while let Some(id) = n {
+            if self.store.node(id).height == 0 {
+                break;
+            }
+            let status = self.store.node(id).status;
+            if status.known_invalid() {
+                if status.known_validate_failed() {
+                    vf_node = id;
+                }
+                self.index.unset_status_flags(
+                    &mut self.store,
+                    id,
+                    BlockStatus(BlockStatus::VALIDATE_FAILED.0 | BlockStatus::INVALID_ANCESTOR.0),
+                );
+            }
+
+            if self.index.can_validate(&self.store, id)
+                && self.store.node(id).work_sum >= cur_best_work
+            {
+                self.index.add_best_chain_candidate(id);
+            }
+
+            let nd = self.store.node(id);
+            if !nd.is_fully_linked && nd.status.have_data() {
+                if let Some(parent) = nd.parent {
+                    self.index.add_unlinked_child(parent, id);
+                }
+            }
+            n = self.store.node(id).parent;
+        }
+
+        // Remove the invalid ancestor flag from descendants of the
+        // earliest failed block that are neither themselves marked as
+        // failed nor descendants of another such block.
+        let mut tips: Vec<NodeId> = Vec::new();
+        let _ = self.index.for_each_chain_tip_after_height(
+            &self.store,
+            vf_node,
+            |tip| -> Result<(), ()> {
+                tips.push(tip);
+                Ok(())
+            },
+        );
+        for tip in tips {
+            if !self.store.is_ancestor_of(vf_node, tip) {
+                continue;
+            }
+
+            // Find the final descendant not known to descend from
+            // another block that failed validation.
+            let mut final_ok = tip;
+            let mut m = tip;
+            while m != vf_node {
+                if self.store.node(m).status.known_validate_failed() {
+                    final_ok = self.store.node(m).parent.expect("descendant parent");
+                }
+                m = self.store.node(m).parent.expect("descendant parent");
+            }
+
+            let mut m = final_ok;
+            while m != vf_node {
+                self.index.unset_status_flags(
+                    &mut self.store,
+                    m,
+                    BlockStatus(BlockStatus::INVALID_ANCESTOR.0),
+                );
+                if self.index.can_validate(&self.store, m)
+                    && self.store.node(m).work_sum >= cur_best_work
+                {
+                    self.index.add_best_chain_candidate(m);
+                }
+                let nd = self.store.node(m);
+                if !nd.is_fully_linked && nd.status.have_data() {
+                    if let Some(parent) = nd.parent {
+                        self.index.add_unlinked_child(parent, m);
+                    }
+                }
+                m = self.store.node(m).parent.expect("descendant parent");
+            }
+        }
+
+        // Update the best known invalid block and the best header
+        // over all tips.
+        self.index.reset_best_invalid();
+        let mut all_tips: Vec<NodeId> = Vec::new();
+        let _ = self.index.for_each_chain_tip(|tip| -> Result<(), ()> {
+            all_tips.push(tip);
+            Ok(())
+        });
+        for tip in all_tips {
+            if self.store.node(tip).status.known_invalid() {
+                self.index.maybe_update_best_invalid(&self.store, tip);
+            }
+            self.index
+                .maybe_update_best_header_for_tip(&self.store, tip);
+        }
+
+        // Reset the current latch and reorganize to the best
+        // candidate, then force pruning of the cached chain tips.
+        self.is_current_latch = false;
+        let target = self.index.find_best_chain_candidate(&self.store);
+        let errs = self.reorganize_chain(target, adjusted_time_unix, params);
+        let best = self.best_chain.tip().expect("best chain tip");
+        self.index.prune_cached_tips(&self.store, best);
+        errs
+    }
+
+    /// Force a reorganization to a sibling of the current best chain
+    /// tip (dcrd `forceHeadReorganization`).
+    pub fn force_head_reorganization(
+        &mut self,
+        former_best: Hash,
+        new_best: Hash,
+        adjusted_time_unix: i64,
+        params: &Params,
+    ) -> Vec<RuleError> {
+        if former_best == new_best {
+            return alloc::vec![rule_error(
+                RuleErrorKind::ForceReorgSameBlock,
+                "tried to force reorg to the same block",
+            )];
+        }
+        let former_best_node = self.best_chain.tip().expect("best chain tip");
+        if self.store.node(former_best_node).hash != former_best {
+            return alloc::vec![rule_error(
+                RuleErrorKind::ForceReorgWrongChain,
+                "tried to force reorg on wrong chain",
+            )];
+        }
+        let new_best_node = self.index.lookup_node(&new_best);
+        let valid_sibling = new_best_node
+            .is_some_and(|n| self.store.node(n).parent == self.store.node(former_best_node).parent);
+        if !valid_sibling {
+            return alloc::vec![rule_error(
+                RuleErrorKind::ForceReorgMissingChild,
+                "missing child of common parent for forced reorg",
+            )];
+        }
+        let new_best_node = new_best_node.expect("checked above");
+        let status = self.index.node_status(&self.store, new_best_node);
+        if status.known_invalid() {
+            return alloc::vec![rule_error(
+                RuleErrorKind::KnownInvalidBlock,
+                "block is known to be invalid",
+            )];
+        }
+        if !status.have_data() {
+            return alloc::vec![rule_error(
+                RuleErrorKind::NoBlockData,
+                "block data is not available",
+            )];
+        }
+        self.reorganize_chain(Some(new_best_node), adjusted_time_unix, params)
+    }
+
     /// Whether the node's timestamp is more than 24 hours old
     /// relative to the adjusted time (dcrd `isOldTimestamp`).
     fn is_old_timestamp(&self, node: NodeId, adjusted_time_unix: i64) -> bool {
