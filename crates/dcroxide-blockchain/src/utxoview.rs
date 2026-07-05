@@ -148,6 +148,36 @@ impl UtxoView {
         self.entries.remove(&key(outpoint));
     }
 
+    /// Drain the view's committed changes with dcrd `UtxoCache.Commit`
+    /// semantics: modified entries leave the view and are returned as
+    /// upserts — spent ones as spent tombstones exactly like dcrd's
+    /// cache retains them until its next flush, which is what allows
+    /// later disconnects to restore the original entry fields —
+    /// entries spent by a later transaction in the same block leave
+    /// the view with no backing set effect, and unmodified entries
+    /// stay in the view untouched.
+    pub fn commit(&mut self) -> Vec<(OutPointKey, UtxoEntry)> {
+        let mut updates = Vec::new();
+        let keys: Vec<OutPointKey> = self.entries.keys().copied().collect();
+        for key in keys {
+            let entry = &self.entries[&key];
+            if !entry.is_modified() {
+                continue;
+            }
+            if entry.is_spent_by_zero_conf() {
+                assert!(
+                    entry.is_spent(),
+                    "zero confirmation spend not also marked spent"
+                );
+                self.entries.remove(&key);
+                continue;
+            }
+            let entry = self.entries.remove(&key).expect("present");
+            updates.push((key, entry));
+        }
+        updates
+    }
+
     /// Insert an entry directly; the resolver-driven analogue of
     /// dcrd's cache fetch populating the view.
     pub fn insert_entry(&mut self, outpoint: &OutPoint, entry: UtxoEntry) {

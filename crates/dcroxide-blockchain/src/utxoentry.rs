@@ -14,7 +14,7 @@ pub(crate) const UTXO_STATE_SPENT: u8 = 1 << 1;
 /// In-memory state bit: spent by a transaction in the same block.
 pub(crate) const UTXO_STATE_SPENT_BY_ZERO_CONF: u8 = 1 << 2;
 /// In-memory state bit: the entry is fresh (not yet in the backend).
-const UTXO_STATE_FRESH: u8 = 1 << 3;
+pub(crate) const UTXO_STATE_FRESH: u8 = 1 << 3;
 
 /// Packed flag bit: the output is from a coinbase (dcrd
 /// `utxoFlagCoinBase`).
