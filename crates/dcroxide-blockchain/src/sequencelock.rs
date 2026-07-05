@@ -43,7 +43,7 @@ pub struct SequenceLock {
 
 /// Adapter exposing a [`VoteChainView`] as the [`VersionChainView`]
 /// the past-median-time calculation expects.
-struct AsVersionView<'a, V: VoteChainView>(&'a V);
+pub(crate) struct AsVersionView<'a, V: VoteChainView>(pub(crate) &'a V);
 
 impl<V: VoteChainView> VersionChainView for AsVersionView<'_, V> {
     fn node(&self, height: i64) -> Option<VersionNode> {

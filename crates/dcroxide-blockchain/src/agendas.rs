@@ -142,7 +142,11 @@ fn blake3_work_diff_anchor(
 
 /// Calculate the required BLAKE3 difficulty for the block AFTER the
 /// given node (dcrd `calcNextBlake3Diff`).
-fn calc_next_blake3_diff(view: &impl FullChainView, prev_node: &DiffNode, params: &Params) -> u32 {
+pub(crate) fn calc_next_blake3_diff(
+    view: &impl FullChainView,
+    prev_node: &DiffNode,
+    params: &Params,
+) -> u32 {
     // When the agenda is always active, the anchor is the first block
     // of the chain.
     if is_blake3_pow_agenda_forced_active(params) {

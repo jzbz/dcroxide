@@ -48,9 +48,9 @@ pub trait ChainView {
 }
 
 /// The magic value of test network version 3 (wire `TestNet3`).
-const TESTNET3_NET: u32 = 0x48e7a065;
+pub(crate) const TESTNET3_NET: u32 = 0xb194aa75;
 
-fn is_testnet3(params: &Params) -> bool {
+pub(crate) fn is_testnet3(params: &Params) -> bool {
     params.net.0 == TESTNET3_NET
 }
 

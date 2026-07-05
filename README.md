@@ -85,7 +85,7 @@ Currently implemented:
   UTXO serialization layer (VLQs, the domain-specific script and amount
   compression, UTXO entries, outpoint keys, and the set state) and the
   legacy work/stake difficulty algorithms, the stake-version voting
-  machinery, the agenda threshold state machine, the agenda-driven algorithm selectors, the chain persistence formats, the context-free transaction validation and block sanity layers, and the DCP0003 sequence lock calculation, pinned by dcrd's own test vectors and by synthetic-chain
+  machinery, the agenda threshold state machine, the agenda-driven algorithm selectors, the chain persistence formats, the context-free transaction validation and block sanity layers, the DCP0003 sequence lock calculation, and the positional (header-chain) validation layer, pinned by dcrd's own test vectors and by synthetic-chain
   scenarios generated inside dcrd's internal package
 - `dcroxide-gcs` — Golomb-coded set filters (versions 1 and 2) and the
   DCP0005 version 2 block committed filters for light clients, matched
