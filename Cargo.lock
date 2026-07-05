@@ -194,6 +194,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-blockchain"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-chainhash",
+ "dcroxide-dcrec",
+ "dcroxide-stake",
+ "dcroxide-testutil",
+ "dcroxide-wire",
+]
+
+[[package]]
 name = "dcroxide-chaincfg"
 version = "0.1.0"
 dependencies = [

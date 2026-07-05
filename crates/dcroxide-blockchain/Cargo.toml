@@ -1,0 +1,21 @@
+[package]
+name = "dcroxide-blockchain"
+description = "Decred chain engine components mirroring dcrd's internal/blockchain; currently the UTXO serialization layer (VLQ, compressed amounts/scripts, entry and set-state formats)"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-dcrec = { path = "../dcroxide-dcrec" }
+dcroxide-stake = { path = "../dcroxide-stake" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true

@@ -81,6 +81,10 @@ Currently implemented:
   import/export in dcrd's `addblock` bootstrap format; pinned by the
   ported ffldb interface-test battery and a crash-consistency rig
   (fresh-sync stance: no in-place dcrd datadir reuse)
+- `dcroxide-blockchain` — the beginnings of the chain engine: dcrd's
+  UTXO serialization layer (VLQs, the domain-specific script and amount
+  compression, UTXO entries, outpoint keys, and the set state), pinned
+  by dcrd's own test vectors extracted from its internal package
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
 

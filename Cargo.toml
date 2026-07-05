@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/dcroxide-base58",
+    "crates/dcroxide-blockchain",
     "crates/dcroxide-chaincfg",
     "crates/dcroxide-chainhash",
     "crates/dcroxide-crypto",
