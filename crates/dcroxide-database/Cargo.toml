@@ -1,0 +1,23 @@
+[package]
+name = "dcroxide-database"
+description = "Block and metadata storage mirroring dcrd's database interface semantics: bucketed transactional metadata plus flat-file block storage, backed by redb per ADR-0004"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+crc = "3"
+redb = "2"
+
+[dev-dependencies]
+crc = "3"
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+tempfile = "3"
+
+[lints]
+workspace = true

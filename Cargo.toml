@@ -5,6 +5,7 @@ members = [
     "crates/dcroxide-chaincfg",
     "crates/dcroxide-chainhash",
     "crates/dcroxide-crypto",
+    "crates/dcroxide-database",
     "crates/dcroxide-dcrec",
     "crates/dcroxide-stake",
     "crates/dcroxide-standalone",

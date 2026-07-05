@@ -1,7 +1,7 @@
 # ADR-0004 — D1: Storage backend & datadir-compatibility stance
 
-- **Status:** Proposed (draft for decision D1)
-- **Date:** 2026-07-03
+- **Status:** Accepted (decision D1 ratified by the project owner)
+- **Date:** 2026-07-03 (proposed), 2026-07-05 (accepted)
 
 ## Context
 
@@ -10,7 +10,7 @@ plus a dedicated UTXO backend and index databases. Compatibility surface C6
 (reading an existing dcrd datadir in place) is declared a stretch goal by the
 project brief; fresh sync plus a bulk importer is the accepted default.
 
-## Decision (proposed)
+## Decision
 
 - Implement dcrd's `database` interface semantics (buckets, transactional
   model) as a Rust trait; back it with **`redb`** (pure Rust, no C build
@@ -29,5 +29,7 @@ project brief; fresh sync plus a bulk importer is the accepted default.
   tiers and keeps `cargo-vet`/audit scope smaller.
 - Crash-consistency test rig (kill -9 during writes) is required regardless
   of backend (Phase 7 exit criterion).
-- Final ratification blocked on: a Phase 7 write-load prototype (headers +
-  UTXO batches at sync rates) measured against rocksdb on the same hardware.
+- A Phase 7/8 write-load validation (headers + UTXO batches at sync rates)
+  remains a gate before M2: if redb cannot sustain sync-time write load,
+  the interface abstraction makes swapping in rocksdb a contained change
+  and this ADR gets superseded rather than silently amended.

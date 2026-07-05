@@ -9,11 +9,13 @@ Parity target: **dcrd `release-v2.1.5`** — wire protocol 12, JSON-RPC API
 [PARITY.md](PARITY.md) for per-package status. The full plan lives in
 [dcroxide-project-brief.md](dcroxide-project-brief.md).
 
-**Status: pre-alpha — Phases 4 and 6 complete plus the stake transaction
-primitives from Phase 5 (rig, primitives, wire, chaincfg, the full script
-engine including addresses, classification, and signing, stake
-transaction rules, and the standalone consensus functions).** Nothing
-here is ready to validate, relay, or hold funds. Currently implemented:
+**Status: pre-alpha — Phases 4 and 6 complete, plus the stake
+transaction primitives from Phase 5 and the storage layer opening
+Phase 7 (rig, primitives, wire, chaincfg, the full script engine
+including addresses, classification, and signing, stake transaction
+rules, the standalone consensus functions, and the block/metadata
+database).** Nothing here is ready to validate, relay, or hold funds.
+Currently implemented:
 
 - `dcroxide-crypto` — BLAKE-256 (vendored from
   [dcr-rs](https://github.com/jzbz/dcr-rs), KAT-pinned, differential-tested
@@ -72,6 +74,12 @@ here is ready to validate, relay, or hold funds. Currently implemented:
   total-supply figures), treasury spend window math, and context-free
   transaction sanity checks — all additionally differentially matched
   against dcrd
+- `dcroxide-database` — block and metadata storage with dcrd's
+  `database` interface semantics (buckets, transactions, block storage
+  APIs, all error kinds), backed by redb per ADR-0004 with dcrd's exact
+  ffldb key layout and flat-file block record format; pinned by the
+  ported ffldb interface-test battery and a crash-consistency rig
+  (fresh-sync stance: no in-place dcrd datadir reuse)
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
 
