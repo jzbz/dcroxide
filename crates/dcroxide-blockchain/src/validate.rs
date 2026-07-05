@@ -2710,3 +2710,363 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
 
     Ok(total_atom_in - total_atom_out)
 }
+
+/// The maximum number of signature operations per block (dcrd
+/// `MaxSigOpsPerBlock`).
+pub const MAX_SIG_OPS_PER_BLOCK: i64 = 1_000_000 / 200;
+
+/// The number of signature operations for all input and output scripts
+/// in the provided transaction, using the quicker but imprecise
+/// counting mechanism from txscript (dcrd `CountSigOps`).
+pub fn count_sig_ops(
+    tx: &MsgTx,
+    is_coin_base_tx: bool,
+    is_ssgen: bool,
+    is_treasury_enabled: bool,
+) -> i64 {
+    let mut total_sig_ops: i64 = 0;
+
+    if is_treasury_enabled && dcroxide_standalone::is_treasury_base(tx) {
+        return total_sig_ops;
+    }
+
+    if !is_coin_base_tx {
+        // Accumulate the signature operations in all inputs, skipping
+        // the stakebase.
+        for (i, tx_in) in tx.tx_in.iter().enumerate() {
+            if is_ssgen && i == 0 {
+                continue;
+            }
+            total_sig_ops = total_sig_ops.wrapping_add(dcroxide_txscript::get_sig_op_count(
+                &tx_in.signature_script,
+                is_treasury_enabled,
+            ) as i64);
+        }
+    }
+
+    // Accumulate the signature operations in all outputs.
+    for tx_out in &tx.tx_out {
+        total_sig_ops = total_sig_ops.wrapping_add(dcroxide_txscript::get_sig_op_count(
+            &tx_out.pk_script,
+            is_treasury_enabled,
+        ) as i64);
+    }
+
+    total_sig_ops
+}
+
+/// The number of signature operations for all input transactions of
+/// the pay-to-script-hash type, using the precise counting mechanism
+/// from the script engine (dcrd `CountP2SHSigOps`).
+pub fn count_p2sh_sig_ops(
+    tx: &MsgTx,
+    is_coin_base_tx: bool,
+    is_stake_base_tx: bool,
+    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    is_treasury_enabled: bool,
+) -> Result<i64, RuleError> {
+    // Coinbase transactions have no interesting inputs, stakebase
+    // (SSGen) transactions have no P2SH inputs, and treasury spends
+    // and treasurybases likewise have none once recognized under the
+    // active treasury agenda.
+    if is_coin_base_tx || is_stake_base_tx {
+        return Ok(0);
+    }
+    if is_treasury_enabled
+        && (dcroxide_stake::is_tspend(tx) || dcroxide_standalone::is_treasury_base(tx))
+    {
+        return Ok(0);
+    }
+
+    // Accumulate the signature operations in all inputs.
+    let mut total_sig_ops: i64 = 0;
+    for (tx_in_index, tx_in) in tx.tx_in.iter().enumerate() {
+        // Ensure the referenced input transaction is available.
+        let tx_in_outpoint = &tx_in.previous_out_point;
+        let utxo_entry = match lookup_entry(tx_in_outpoint) {
+            Some(e) if !e.is_spent() => e,
+            _ => {
+                return Err(rule_error(
+                    RuleErrorKind::MissingTxOut,
+                    format!(
+                        "output {tx_in_outpoint:?} referenced from transaction \
+                         {}:{tx_in_index} either does not exist or has already been \
+                         spent",
+                        tx.tx_hash()
+                    ),
+                ));
+            }
+        };
+
+        // Only pay-to-script-hash types are of interest.
+        let pk_script = utxo_entry.pk_script();
+        if !dcroxide_txscript::is_pay_to_script_hash(pk_script) {
+            continue;
+        }
+
+        // Count the precise number of signature operations in the
+        // referenced public key script.
+        let num_sig_ops = dcroxide_txscript::get_precise_sig_op_count(
+            &tx_in.signature_script,
+            pk_script,
+            is_treasury_enabled,
+        ) as i64;
+
+        // We could potentially overflow the accumulator so check for
+        // overflow.
+        let last_sig_ops = total_sig_ops;
+        total_sig_ops = total_sig_ops.wrapping_add(num_sig_ops);
+        if total_sig_ops < last_sig_ops {
+            return Err(rule_error(
+                RuleErrorKind::TooManySigOps,
+                format!(
+                    "the public key script from output {tx_in_outpoint:?} contains too \
+                     many signature operations - overflow"
+                ),
+            ));
+        }
+    }
+
+    Ok(total_sig_ops)
+}
+
+/// Check the number of P2SH signature operations to make sure they
+/// don't overflow the limits, accumulating into the passed cumulative
+/// count (dcrd `checkNumSigOps`).
+pub fn check_num_sig_ops(
+    tx: &MsgTx,
+    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    index: usize,
+    stake_tree: bool,
+    cumulative_sig_ops: i64,
+    is_treasury_enabled: bool,
+) -> Result<i64, RuleError> {
+    let is_ssgen = dcroxide_stake::is_ssgen(tx);
+    let is_coinbase_tx = index == 0 && !stake_tree;
+    let num_sig_ops = count_sig_ops(tx, is_coinbase_tx, is_ssgen, is_treasury_enabled);
+    let num_p2sh_sig_ops = count_p2sh_sig_ops(
+        tx,
+        is_coinbase_tx,
+        is_ssgen,
+        lookup_entry,
+        is_treasury_enabled,
+    )?;
+
+    // Check for overflow or going over the limits on every iteration.
+    let start_cum_sig_ops = cumulative_sig_ops;
+    let cumulative_sig_ops = cumulative_sig_ops
+        .wrapping_add(num_sig_ops)
+        .wrapping_add(num_p2sh_sig_ops);
+    if cumulative_sig_ops < start_cum_sig_ops || cumulative_sig_ops > MAX_SIG_OPS_PER_BLOCK {
+        return Err(rule_error(
+            RuleErrorKind::TooManySigOps,
+            format!(
+                "block contains too many signature operations - got \
+                 {cumulative_sig_ops}, max {MAX_SIG_OPS_PER_BLOCK}"
+            ),
+        ));
+    }
+
+    Ok(cumulative_sig_ops)
+}
+
+/// Ensure no vote in the given transactions spends more subsidy than
+/// allowed for the height being voted on (dcrd
+/// `checkStakeBaseAmounts`).
+pub fn check_stake_base_amounts<SP: dcroxide_standalone::SubsidyParams>(
+    subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
+    height: i64,
+    txs: &[MsgTx],
+    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    subsidy_split_variant: dcroxide_standalone::SubsidySplitVariant,
+) -> Result<(), RuleError> {
+    for tx in txs {
+        if !dcroxide_stake::is_ssgen(tx) {
+            continue;
+        }
+
+        // Ensure the ticket input is available.
+        let tx_in_outpoint = &tx.tx_in[1].previous_out_point;
+        let Some(utxo_entry) = lookup_entry(tx_in_outpoint) else {
+            return Err(rule_error(
+                RuleErrorKind::TicketUnavailable,
+                format!(
+                    "couldn't find input tx {} for stakebase amounts check",
+                    tx_in_outpoint.hash
+                ),
+            ));
+        };
+        let origin_tx_atom = utxo_entry.amount();
+
+        // Sum up the outputs.
+        let mut total_outputs: i64 = 0;
+        for out in &tx.tx_out {
+            total_outputs = total_outputs.wrapping_add(out.value);
+        }
+        let difference = total_outputs.wrapping_sub(origin_tx_atom);
+
+        // Subsidy aligns with the height being voted on, not with the
+        // height of the current block.
+        let calc_subsidy =
+            subsidy_cache.calc_stake_vote_subsidy_v3(height - 1, subsidy_split_variant);
+        if difference > calc_subsidy {
+            return Err(rule_error(
+                RuleErrorKind::SSGenSubsidy,
+                format!(
+                    "ssgen tx {} spent more than allowed (spent {difference}, allowed \
+                     {calc_subsidy})",
+                    tx.tx_hash()
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// The total amount given as subsidy from the collective stakebase
+/// transactions (votes) within a block (dcrd `getStakeBaseAmounts`).
+pub fn get_stake_base_amounts(
+    txs: &[MsgTx],
+    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+) -> Result<i64, RuleError> {
+    let mut total_inputs: i64 = 0;
+    let mut total_outputs: i64 = 0;
+    for tx in txs {
+        if !dcroxide_stake::is_ssgen(tx) {
+            continue;
+        }
+
+        // Ensure the ticket input is available.
+        let tx_in_outpoint = &tx.tx_in[1].previous_out_point;
+        let Some(utxo_entry) = lookup_entry(tx_in_outpoint) else {
+            return Err(rule_error(
+                RuleErrorKind::TicketUnavailable,
+                format!(
+                    "couldn't find input tx {} for stakebase amounts get",
+                    tx_in_outpoint.hash
+                ),
+            ));
+        };
+        total_inputs = total_inputs.wrapping_add(utxo_entry.amount());
+        for out in &tx.tx_out {
+            total_outputs = total_outputs.wrapping_add(out.value);
+        }
+    }
+
+    Ok(total_outputs.wrapping_sub(total_inputs))
+}
+
+/// The amount of fees in the stake tx tree of a block given the
+/// transactions and a utxo lookup (dcrd `getStakeTreeFees`).
+pub fn get_stake_tree_fees<SP: dcroxide_standalone::SubsidyParams>(
+    subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
+    height: i64,
+    txs: &[MsgTx],
+    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    is_treasury_enabled: bool,
+    subsidy_split_variant: dcroxide_standalone::SubsidySplitVariant,
+) -> Result<i64, RuleError> {
+    let mut total_inputs: i64 = 0;
+    let mut total_outputs: i64 = 0;
+    for tx in txs {
+        let is_ssgen = dcroxide_stake::is_ssgen(tx);
+        let is_treasury_base = is_treasury_enabled && dcroxide_standalone::is_treasury_base(tx);
+        let is_treasury_spend = is_treasury_enabled && dcroxide_stake::is_tspend(tx);
+
+        for (i, tx_in) in tx.tx_in.iter().enumerate() {
+            // Ignore stakebases, treasury spends, and treasurybases
+            // since they have no inputs.
+            if is_ssgen && i == 0 {
+                continue;
+            }
+            if is_treasury_base || is_treasury_spend {
+                continue;
+            }
+
+            let tx_in_outpoint = &tx_in.previous_out_point;
+            let Some(utxo_entry) = lookup_entry(tx_in_outpoint) else {
+                return Err(rule_error(
+                    RuleErrorKind::TicketUnavailable,
+                    format!(
+                        "couldn't find input tx {} for stake tree fee calculation",
+                        tx_in_outpoint.hash
+                    ),
+                ));
+            };
+            total_inputs = total_inputs.wrapping_add(utxo_entry.amount());
+        }
+
+        for out in &tx.tx_out {
+            total_outputs = total_outputs.wrapping_add(out.value);
+        }
+
+        // For votes, subtract the subsidy (aligned with the height
+        // being voted on) to determine actual fees.
+        if is_ssgen {
+            total_outputs = total_outputs.wrapping_sub(
+                subsidy_cache.calc_stake_vote_subsidy_v3(height - 1, subsidy_split_variant),
+            );
+        }
+        if is_treasury_spend {
+            total_outputs = total_outputs.wrapping_sub(tx.tx_in[0].value_in);
+        }
+        if is_treasury_base {
+            total_outputs = total_outputs.wrapping_sub(tx.tx_in[0].value_in);
+        }
+    }
+
+    if total_inputs < total_outputs {
+        return Err(rule_error(
+            RuleErrorKind::StakeFees,
+            "negative cumulative fees found in stake tx tree",
+        ));
+    }
+
+    Ok(total_inputs - total_outputs)
+}
+
+/// Whether duplicate transaction hash checking is performed; disabled
+/// in dcrd since the unique coinbase heights already prevent
+/// collisions in practice (dcrd `checkForDuplicateHashes`).
+const CHECK_FOR_DUPLICATE_HASHES: bool = false;
+
+/// Prevent duplicate transaction hashes from overwriting unspent
+/// outputs (dcrd `checkDupTxs`); a no-op at this dcrd version per
+/// [`CHECK_FOR_DUPLICATE_HASHES`].
+pub fn check_dup_txs(
+    txs: &[MsgTx],
+    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    tree: i8,
+) -> Result<(), RuleError> {
+    if !CHECK_FOR_DUPLICATE_HASHES {
+        return Ok(());
+    }
+
+    // Duplicate transaction outputs are only allowed if the previous
+    // transaction output is spent.
+    for tx in txs {
+        let mut outpoint = OutPoint {
+            hash: tx.tx_hash(),
+            index: 0,
+            tree,
+        };
+        for tx_out_idx in 0..tx.tx_out.len() {
+            outpoint.index = tx_out_idx as u32;
+            if let Some(entry) = lookup_entry(&outpoint) {
+                if !entry.is_spent() {
+                    return Err(rule_error(
+                        RuleErrorKind::OverwriteTx,
+                        format!(
+                            "tried to overwrite transaction output {outpoint:?} at block \
+                             height {} that is not spent",
+                            entry.block_height()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
