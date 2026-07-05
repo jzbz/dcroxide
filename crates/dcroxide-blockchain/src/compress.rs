@@ -109,7 +109,7 @@ const OP_CHECKSIG: u8 = 0xac;
 
 /// The pubkey hash when the script is a standard P2PKH (dcrd
 /// `extractPubKeyHash`).
-fn extract_pub_key_hash(script: &[u8]) -> Option<&[u8]> {
+pub(crate) fn extract_pub_key_hash(script: &[u8]) -> Option<&[u8]> {
     if script.len() == 25
         && script[0] == OP_DUP
         && script[1] == OP_HASH160
@@ -124,7 +124,7 @@ fn extract_pub_key_hash(script: &[u8]) -> Option<&[u8]> {
 
 /// The script hash when the script is a standard P2SH (dcrd
 /// `extractScriptHash`).
-fn extract_script_hash(script: &[u8]) -> Option<&[u8]> {
+pub(crate) fn extract_script_hash(script: &[u8]) -> Option<&[u8]> {
     if script.len() == 23
         && script[0] == OP_HASH160
         && script[1] == OP_DATA_20

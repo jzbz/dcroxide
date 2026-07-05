@@ -6,6 +6,9 @@
 //! sanity check spanning both hash versions.
 
 use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
@@ -1558,4 +1561,783 @@ pub fn check_merkle_roots(
     }
 
     Ok(())
+}
+
+/// The offsets of the commitment hash, amount, and fee limits inside a
+/// ticket commitment output script (dcrd `commitHashStartIdx` ...).
+const COMMIT_HASH_START_IDX: usize = 2;
+const COMMIT_HASH_END_IDX: usize = COMMIT_HASH_START_IDX + 20;
+const COMMIT_AMOUNT_START_IDX: usize = COMMIT_HASH_END_IDX;
+const COMMIT_AMOUNT_END_IDX: usize = COMMIT_AMOUNT_START_IDX + 8;
+const COMMIT_FEE_LIMIT_START_IDX: usize = COMMIT_AMOUNT_END_IDX;
+const COMMIT_FEE_LIMIT_END_IDX: usize = COMMIT_FEE_LIMIT_START_IDX + 2;
+
+/// The bit in the encoded commitment amount that specifies a P2SH
+/// commitment (dcrd `commitP2SHFlag`).
+const COMMIT_P2SH_FLAG: u64 = 1 << 63;
+
+/// The output index of a ticket's stake submission (dcrd
+/// `submissionOutputIdx`).
+const SUBMISSION_OUTPUT_IDX: u32 = 0;
+
+/// Extract a pubkey hash from the passed public key script if it is a
+/// standard pay-to-pubkey-hash script tagged with the provided stake
+/// opcode (dcrd `extractStakePubKeyHash`).
+pub fn extract_stake_pub_key_hash(script: &[u8], stake_opcode: u8) -> Option<&[u8]> {
+    if script.len() == 26
+        && script[0] == stake_opcode
+        && script[1] == dcroxide_txscript::OP_DUP
+        && script[2] == dcroxide_txscript::OP_HASH160
+        && script[3] == dcroxide_txscript::OP_DATA_20
+        && script[24] == dcroxide_txscript::OP_EQUALVERIFY
+        && script[25] == dcroxide_txscript::OP_CHECKSIG
+    {
+        return Some(&script[4..24]);
+    }
+    None
+}
+
+/// Whether the script is a standard pay-to-pubkey-hash script tagged
+/// with the provided stake opcode (dcrd `isStakePubKeyHash`).
+pub fn is_stake_pub_key_hash(script: &[u8], stake_opcode: u8) -> bool {
+    extract_stake_pub_key_hash(script, stake_opcode).is_some()
+}
+
+/// Extract a script hash from the passed public key script if it is a
+/// standard pay-to-script-hash script tagged with the provided stake
+/// opcode (dcrd `extractStakeScriptHash`).
+pub fn extract_stake_script_hash(script: &[u8], stake_opcode: u8) -> Option<&[u8]> {
+    if script.len() == 24
+        && script[0] == stake_opcode
+        && script[1] == dcroxide_txscript::OP_HASH160
+        && script[2] == dcroxide_txscript::OP_DATA_20
+        && script[23] == dcroxide_txscript::OP_EQUAL
+    {
+        return Some(&script[3..23]);
+    }
+    None
+}
+
+/// Whether the script is a standard pay-to-script-hash script tagged
+/// with the provided stake opcode (dcrd `isStakeScriptHash`).
+pub fn is_stake_script_hash(script: &[u8], stake_opcode: u8) -> bool {
+    extract_stake_script_hash(script, stake_opcode).is_some()
+}
+
+/// Whether the script is one of the allowed forms for a ticket input
+/// (dcrd `isAllowedTicketInputScriptForm`).
+pub fn is_allowed_ticket_input_script_form(script: &[u8]) -> bool {
+    crate::compress::extract_pub_key_hash(script).is_some()
+        || crate::compress::extract_script_hash(script).is_some()
+        || is_stake_pub_key_hash(script, dcroxide_txscript::OP_SSGEN)
+        || is_stake_script_hash(script, dcroxide_txscript::OP_SSGEN)
+        || is_stake_pub_key_hash(script, dcroxide_txscript::OP_SSRTX)
+        || is_stake_script_hash(script, dcroxide_txscript::OP_SSRTX)
+        || is_stake_pub_key_hash(script, dcroxide_txscript::OP_SSTXCHANGE)
+        || is_stake_script_hash(script, dcroxide_txscript::OP_SSTXCHANGE)
+}
+
+/// Extract and decode the amount from a ticket output commitment
+/// script (dcrd `extractTicketCommitAmount`).  The caller MUST have
+/// already determined the script is a commitment output script.
+pub fn extract_ticket_commit_amount(script: &[u8]) -> i64 {
+    // The MSB of the encoded amount specifies if the output is P2SH,
+    // so it must be cleared to get the decoded amount.
+    let mut amt_bytes = [0u8; 8];
+    amt_bytes.copy_from_slice(&script[COMMIT_AMOUNT_START_IDX..COMMIT_AMOUNT_END_IDX]);
+    let amt_encoded = u64::from_le_bytes(amt_bytes);
+    (amt_encoded & !COMMIT_P2SH_FLAG) as i64
+}
+
+/// Perform a series of checks on the inputs to a ticket purchase
+/// transaction (dcrd `checkTicketPurchaseInputs`).  The caller MUST
+/// have already determined the transaction is a ticket purchase.
+/// `lookup_entry` stands in for dcrd's `UtxoViewpoint.LookupEntry`.
+pub fn check_ticket_purchase_inputs(
+    tx: &MsgTx,
+    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+) -> Result<(), RuleError> {
+    // Assert there are two outputs for each input to the ticket as
+    // well as the additional voting rights output.
+    assert!(
+        tx.tx_in.len() * 2 + 1 == tx.tx_out.len(),
+        "attempt to check ticket purchase inputs on tx which does not appear to be \
+         a ticket purchase"
+    );
+
+    for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate() {
+        let entry = lookup_entry(&tx_in.previous_out_point);
+        let entry = match entry {
+            Some(e) if !e.is_spent() => e,
+            _ => {
+                return Err(rule_error(
+                    RuleErrorKind::MissingTxOut,
+                    format!(
+                        "output {:?} referenced from transaction {}:{tx_in_idx} either \
+                         does not exist or has already been spent",
+                        tx_in.previous_out_point,
+                        tx.tx_hash()
+                    ),
+                ));
+            }
+        };
+
+        // Ensure the output being spent is one of the allowed script
+        // forms: pay-to-pubkey-hash and pay-to-script-hash either in
+        // the standard form or their stake-tagged variant.
+        let pk_script_ver = entry.script_version();
+        if pk_script_ver != 0 {
+            return Err(rule_error(
+                RuleErrorKind::TicketInputScript,
+                format!(
+                    "output script version {pk_script_ver} referenced by ticket \
+                     {}:{tx_in_idx} is not supported",
+                    tx.tx_hash()
+                ),
+            ));
+        }
+        let pk_script = entry.pk_script();
+        if !is_allowed_ticket_input_script_form(pk_script) {
+            return Err(rule_error(
+                RuleErrorKind::TicketInputScript,
+                format!(
+                    "output referenced from ticket {}:{tx_in_idx} is not \
+                     pay-to-pubkey-hash or pay-to-script-hash",
+                    tx.tx_hash()
+                ),
+            ));
+        }
+
+        // Extract the amount from the commitment output associated
+        // with the input and ensure it matches the expected amount
+        // calculated from the actual input amount and change.
+        let commitment_out_idx = tx_in_idx * 2 + 1;
+        let commitment_script = &tx.tx_out[commitment_out_idx].pk_script;
+        let commitment_amount = extract_ticket_commit_amount(commitment_script);
+        let input_amount = entry.amount();
+        let change = tx.tx_out[commitment_out_idx + 1].value;
+        let adjusted_amount = commitment_amount.wrapping_add(change);
+        if adjusted_amount != input_amount {
+            return Err(rule_error(
+                RuleErrorKind::TicketCommitment,
+                format!(
+                    "ticket output {commitment_out_idx} pays a different amount than \
+                     the associated input {tx_in_idx} (input: {input_amount}, \
+                     commitment: {commitment_amount}, change: {change})"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether the script is a stake submission (an `OP_SSTX`-tagged
+/// pay-to-pubkey-hash or pay-to-script-hash script; dcrd
+/// `isStakeSubmission`).
+pub fn is_stake_submission(script: &[u8]) -> bool {
+    is_stake_pub_key_hash(script, dcroxide_txscript::OP_SSTX)
+        || is_stake_script_hash(script, dcroxide_txscript::OP_SSTX)
+}
+
+/// Extract the commitment hash from a ticket output commitment script
+/// (dcrd `extractTicketCommitHash`).  The caller MUST have already
+/// determined the script is a commitment output script.
+pub fn extract_ticket_commit_hash(script: &[u8]) -> &[u8] {
+    &script[COMMIT_HASH_START_IDX..COMMIT_HASH_END_IDX]
+}
+
+/// Whether the ticket output commitment script commits to a
+/// pay-to-script-hash output (dcrd `isTicketCommitP2SH`).  The caller
+/// MUST have already determined the script is a commitment output
+/// script.
+pub fn is_ticket_commit_p2sh(script: &[u8]) -> bool {
+    // The MSB of the little-endian encoded amount is in its final
+    // byte.
+    script[COMMIT_AMOUNT_END_IDX - 1] & 0x80 != 0
+}
+
+/// Calculate the required amounts to return from a ticket for the
+/// given original contribution amounts, the ticket purchase price, and
+/// the vote subsidy, distributing any revocation remainder via the
+/// Hash256PRNG when the automatic revocations agenda is active (dcrd
+/// `calcTicketReturnAmounts`).  The vote subsidy must be 0 for
+/// revocations.
+pub fn calc_ticket_return_amounts(
+    ticket_outs: &[dcroxide_stake::MinimalOutput],
+    ticket_purchase_amount: i64,
+    vote_subsidy: i64,
+    prev_header_bytes: &[u8],
+    is_vote: bool,
+    is_auto_revocations_enabled: bool,
+) -> Vec<i64> {
+    // Calculate the overall contribution sum, needed to scale the
+    // output amounts to the same proportions as the original
+    // contributions.  The calculations require more than 64 bits, so
+    // arbitrary-precision integers mirror dcrd's use of big.Int.
+    let mut contribution_sum: i64 = 0;
+    let mut i = 1;
+    while i < ticket_outs.len() {
+        contribution_sum =
+            contribution_sum.wrapping_add(extract_ticket_commit_amount(&ticket_outs[i].pk_script));
+        i += 2;
+    }
+    let contribution_sum_big = BigInt::from(contribution_sum);
+
+    let num_return_amounts = (ticket_outs.len() - 1) / 2;
+    let mut return_amounts = vec![0i64; num_return_amounts];
+
+    // 64.32 fixed point:
+    // return = (total output amount * contribution << 32) / total
+    // contributions >> 32.
+    let total_output_amt = ticket_purchase_amount.wrapping_add(vote_subsidy);
+    let total_output_amt_big = BigInt::from(total_output_amt);
+    let mut total_return_amount: i64 = 0;
+    for (i, amount) in return_amounts.iter_mut().enumerate() {
+        let ticket_out = &ticket_outs[i * 2 + 1];
+        let mut return_amt_big = BigInt::from(extract_ticket_commit_amount(&ticket_out.pk_script));
+        return_amt_big *= &total_output_amt_big;
+        return_amt_big <<= 32u32;
+        return_amt_big /= &contribution_sum_big;
+        return_amt_big >>= 32u32;
+        *amount = crate::difficulty::lossy_i64(&return_amt_big);
+        total_return_amount = total_return_amount.wrapping_add(*amount);
+    }
+
+    // For votes, any remainder left over becomes part of the
+    // transaction fee.
+    if is_vote {
+        return return_amounts;
+    }
+
+    // For revocations under the automatic ticket revocations agenda,
+    // select a uniformly pseudorandom output index to receive each
+    // remaining atom.
+    if is_auto_revocations_enabled && total_return_amount < total_output_amt {
+        let remainder = total_output_amt - total_return_amount;
+        let mut prng = dcroxide_stake::Hash256Prng::new(prev_header_bytes);
+        for _ in 0..remainder {
+            let return_index = prng.uniform_random(num_return_amounts as u32);
+            return_amounts[return_index as usize] += 1;
+        }
+    }
+
+    return_amounts
+}
+
+/// Extract the encoded fee limits from a ticket output commitment
+/// script (dcrd `extractTicketCommitFeeLimits`).  The caller MUST have
+/// already determined the script is a commitment output script.
+pub fn extract_ticket_commit_fee_limits(script: &[u8]) -> u16 {
+    let mut bytes = [0u8; 2];
+    bytes.copy_from_slice(&script[COMMIT_FEE_LIMIT_START_IDX..COMMIT_FEE_LIMIT_END_IDX]);
+    u16::from_le_bytes(bytes)
+}
+
+/// Ensure the provided unspent transaction output is a supported
+/// ticket submission output (dcrd `checkTicketSubmissionInput`).  The
+/// returned error is not a rule error; the caller converts it.
+pub fn check_ticket_submission_input(ticket_utxo: &crate::UtxoEntry) -> Result<(), String> {
+    let submission_script_ver = ticket_utxo.script_version();
+    if submission_script_ver != 0 {
+        return Err(format!(
+            "script version {submission_script_ver} is not supported"
+        ));
+    }
+    let submission_script = ticket_utxo.pk_script();
+    if !is_stake_submission(submission_script) {
+        let _ = submission_script;
+        return Err("not a supported stake submission script".into());
+    }
+
+    // Ensure the referenced output is from a ticket, which also proves
+    // the form of the transaction and its outputs are as expected.
+    if ticket_utxo.transaction_type() != dcroxide_stake::TxType::SStx as u8 {
+        return Err("not a submission script".into());
+    }
+
+    Ok(())
+}
+
+/// Ensure the outputs of the provided vote or revocation adhere to the
+/// commitments in the provided ticket outputs (dcrd
+/// `checkTicketRedeemerCommitments`).  The vote subsidy MUST be zero
+/// for revocations.
+#[allow(clippy::too_many_arguments)]
+pub fn check_ticket_redeemer_commitments(
+    ticket_outs: &[dcroxide_stake::MinimalOutput],
+    tx: &MsgTx,
+    is_vote: bool,
+    vote_subsidy: i64,
+    prev_header: &dcroxide_wire::BlockHeader,
+    is_treasury_enabled: bool,
+    is_auto_revocations_enabled: bool,
+) -> Result<(), RuleError> {
+    // The outputs that satisfy the commitments of the ticket start at
+    // offset 2 for votes and 0 for revocations, the payments must be
+    // tagged with the appropriate stake opcode, and the fee limits in
+    // the original ticket commitment differ for votes and revocations.
+    let (start_idx, req_stake_opcode, has_fee_limit_flag, fee_limit_mask, fee_limit_shift) =
+        if is_vote {
+            (
+                2usize,
+                dcroxide_txscript::OP_SSGEN,
+                dcroxide_stake::SSTX_VOTE_FRACTION_FLAG,
+                dcroxide_stake::SSTX_VOTE_RETURN_FRACTION_MASK,
+                0u16,
+            )
+        } else {
+            (
+                0usize,
+                dcroxide_txscript::OP_SSRTX,
+                dcroxide_stake::SSTX_REV_FRACTION_FLAG,
+                dcroxide_stake::SSTX_REV_RETURN_FRACTION_MASK,
+                dcroxide_stake::SSTX_REV_RETURN_FRACTION_SHIFT,
+            )
+        };
+    let ticket_paid_amt = ticket_outs[SUBMISSION_OUTPUT_IDX as usize].value;
+
+    // Serialize the previous header for the PRNG seed; unlike dcrd,
+    // serialization here cannot fail, making ErrSerializeHeader
+    // unreachable.
+    let prev_header_bytes = prev_header.serialize();
+
+    // Calculate the expected output amounts.
+    let expected_out_amts = calc_ticket_return_amounts(
+        ticket_outs,
+        ticket_paid_amt,
+        vote_subsidy,
+        &prev_header_bytes,
+        is_vote,
+        is_auto_revocations_enabled,
+    );
+
+    // When the treasury agenda is active and the vote carries treasury
+    // votes, the final output is excluded from the commitment checks.
+    let mut extra = 0usize;
+    if is_treasury_enabled {
+        let has_tv = dcroxide_stake::check_ssgen_votes(tx)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        if has_tv {
+            extra = 1;
+        }
+    }
+
+    for tx_out_idx in start_idx..tx.tx_out.len() - extra {
+        // Ensure the output is paying to the address and type
+        // specified by the original commitment in the ticket and is a
+        // version 0 script.
+        let tx_out = &tx.tx_out[tx_out_idx];
+        if tx_out.version != 0 {
+            return Err(rule_error(
+                RuleErrorKind::BadPayeeScriptVersion,
+                format!(
+                    "output {}:{tx_out_idx} script version {} is not supported",
+                    tx.tx_hash(),
+                    tx_out.version
+                ),
+            ));
+        }
+
+        let commitment_out_idx = (tx_out_idx - start_idx) * 2 + 1;
+        let commitment_script = &ticket_outs[commitment_out_idx].pk_script;
+        let payment_hash = if is_ticket_commit_p2sh(commitment_script) {
+            extract_stake_script_hash(&tx_out.pk_script, req_stake_opcode).ok_or_else(|| {
+                rule_error(
+                    RuleErrorKind::BadPayeeScriptType,
+                    format!(
+                        "output {}:{tx_out_idx} payment script type is not \
+                         pay-to-script-hash as required by ticket output commitment \
+                         {commitment_out_idx}",
+                        tx.tx_hash()
+                    ),
+                )
+            })?
+        } else {
+            extract_stake_pub_key_hash(&tx_out.pk_script, req_stake_opcode).ok_or_else(|| {
+                rule_error(
+                    RuleErrorKind::BadPayeeScriptType,
+                    format!(
+                        "output {}:{tx_out_idx} payment script type is not \
+                         pay-to-pubkey-hash as required by ticket output commitment \
+                         {commitment_out_idx}",
+                        tx.tx_hash()
+                    ),
+                )
+            })?
+        };
+        let commitment_hash = extract_ticket_commit_hash(commitment_script);
+        if payment_hash != commitment_hash {
+            return Err(rule_error(
+                RuleErrorKind::MismatchedPayeeHash,
+                format!(
+                    "output {}:{tx_out_idx} does not pay to the hash specified by \
+                     ticket output commitment {commitment_out_idx}",
+                    tx.tx_hash()
+                ),
+            ));
+        }
+
+        // Determine the fee limit that is imposed.  If the transaction
+        // is a revocation, the version is at least 2, and the
+        // automatic ticket revocation agenda is active, then the fee
+        // MUST be zero; otherwise the encoded fee limit from the
+        // ticket commitment applies.
+        let mut fee_limits_encoded: u16 = 0;
+        let mut has_fee_limit = false;
+        if is_vote
+            || !is_auto_revocations_enabled
+            || tx.version < dcroxide_stake::TX_VERSION_AUTO_REVOCATIONS
+        {
+            fee_limits_encoded = extract_ticket_commit_fee_limits(commitment_script);
+            has_fee_limit = fee_limits_encoded & has_fee_limit_flag != 0;
+        }
+
+        // Ensure the amount paid adheres to the commitment while
+        // taking into account any fee limits that might be imposed.
+        let expected_out_amt = expected_out_amts[tx_out_idx - start_idx];
+        if !has_fee_limit {
+            // The output amount must exactly match the calculated
+            // amount when not encumbered with a fee limit.
+            if tx_out.value != expected_out_amt {
+                return Err(rule_error(
+                    RuleErrorKind::BadPayeeValue,
+                    format!(
+                        "output {}:{tx_out_idx} does not pay the expected amount per \
+                         ticket output commitment {commitment_out_idx} (expected \
+                         {expected_out_amt}, output pays {})",
+                        tx.tx_hash(),
+                        tx_out.value
+                    ),
+                ));
+            }
+        } else {
+            // Since the fee limit is a log2 value and amounts are
+            // 64-bit, anything of 63 or more means the entire amount
+            // may be spent as a fee.
+            let mut amt_limit_low: i64 = 0;
+            let fee_limit_log2 = (fee_limits_encoded & fee_limit_mask) >> fee_limit_shift;
+            if fee_limit_log2 < 63 {
+                let fee_limit = 1i64 << u64::from(fee_limit_log2);
+                if fee_limit < expected_out_amt {
+                    amt_limit_low = expected_out_amt - fee_limit;
+                }
+            }
+
+            // The output must not be less than the minimum amount.
+            if tx_out.value < amt_limit_low {
+                return Err(rule_error(
+                    RuleErrorKind::BadPayeeValue,
+                    format!(
+                        "output {}:{tx_out_idx} pays less than the expected amount per \
+                         ticket output commitment {commitment_out_idx} (lowest allowed \
+                         {amt_limit_low}, output pays {})",
+                        tx.tx_hash(),
+                        tx_out.value
+                    ),
+                ));
+            }
+
+            // The output must not be more than the expected amount.
+            if tx_out.value > expected_out_amt {
+                return Err(rule_error(
+                    RuleErrorKind::BadPayeeValue,
+                    format!(
+                        "output {}:{tx_out_idx} pays more than the expected amount per \
+                         ticket output commitment {commitment_out_idx} (expected \
+                         {expected_out_amt}, output pays {})",
+                        tx.tx_hash(),
+                        tx_out.value
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Adapter exposing the chain parameters as the subsidy parameters
+/// the standalone subsidy cache expects (dcrd wires this up through
+/// its `chaincfg.Params` methods directly).
+pub struct ChainSubsidyParams<'a>(pub &'a Params);
+
+impl dcroxide_standalone::SubsidyParams for ChainSubsidyParams<'_> {
+    fn block_one_subsidy(&self) -> i64 {
+        self.0.block_one_subsidy()
+    }
+    fn base_subsidy_value(&self) -> i64 {
+        self.0.base_subsidy
+    }
+    fn subsidy_reduction_multiplier(&self) -> i64 {
+        self.0.mul_subsidy
+    }
+    fn subsidy_reduction_divisor(&self) -> i64 {
+        self.0.div_subsidy
+    }
+    fn subsidy_reduction_interval_blocks(&self) -> i64 {
+        self.0.subsidy_reduction_interval
+    }
+    fn work_subsidy_proportion(&self) -> u16 {
+        self.0.work_reward_proportion
+    }
+    fn stake_subsidy_proportion(&self) -> u16 {
+        self.0.stake_reward_proportion
+    }
+    fn treasury_subsidy_proportion(&self) -> u16 {
+        self.0.block_tax_proportion
+    }
+    fn stake_validation_begin_height(&self) -> i64 {
+        self.0.stake_validation_height
+    }
+    fn votes_per_block(&self) -> u16 {
+        self.0.tickets_per_block
+    }
+}
+
+/// Perform a series of checks on the inputs to a vote transaction
+/// (dcrd `checkVoteInputs`).  The caller MUST have already determined
+/// the transaction is a vote.
+#[allow(clippy::too_many_arguments)]
+pub fn check_vote_inputs<SP: dcroxide_standalone::SubsidyParams>(
+    subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
+    tx: &MsgTx,
+    tx_height: i64,
+    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    params: &Params,
+    prev_header: &dcroxide_wire::BlockHeader,
+    is_treasury_enabled: bool,
+    is_auto_revocations_enabled: bool,
+    subsidy_split_variant: dcroxide_standalone::SubsidySplitVariant,
+) -> Result<(), RuleError> {
+    let ticket_maturity = i64::from(params.ticket_maturity);
+    let vote_hash = tx.tx_hash();
+
+    // Calculate the theoretical stake vote subsidy by extracting the
+    // vote height.  dcrd notes this really should use the height of
+    // the block containing the vote, but it is now consensus.
+    let (_, height_voting_on) = dcroxide_stake::ssgen_block_voted_on(tx);
+    let vote_subsidy = subsidy_cache
+        .calc_stake_vote_subsidy_v3(i64::from(height_voting_on), subsidy_split_variant);
+
+    // The input amount specified by the stakebase must commit to the
+    // subsidy generated by the vote.
+    let stakebase = &tx.tx_in[0];
+    if stakebase.value_in != vote_subsidy {
+        return Err(rule_error(
+            RuleErrorKind::BadStakebaseAmountIn,
+            format!(
+                "vote subsidy input value of {} is not {vote_subsidy}",
+                stakebase.value_in
+            ),
+        ));
+    }
+
+    // The second input to a vote must be the first output of the
+    // ticket the vote is associated with.
+    const TICKET_IN_IDX: usize = 1;
+    let ticket_in = &tx.tx_in[TICKET_IN_IDX];
+    if ticket_in.previous_out_point.index != SUBMISSION_OUTPUT_IDX {
+        return Err(rule_error(
+            RuleErrorKind::InvalidVoteInput,
+            format!(
+                "vote {vote_hash}:{TICKET_IN_IDX} references output {} instead of the \
+                 first output",
+                ticket_in.previous_out_point.index
+            ),
+        ));
+    }
+
+    // Ensure the referenced ticket is available.
+    let ticket_utxo = match lookup_entry(&ticket_in.previous_out_point) {
+        Some(e) if !e.is_spent() => e,
+        _ => {
+            return Err(rule_error(
+                RuleErrorKind::MissingTxOut,
+                format!(
+                    "ticket output {:?} referenced by vote {vote_hash}:{TICKET_IN_IDX} \
+                     either does not exist or has already been spent",
+                    ticket_in.previous_out_point
+                ),
+            ));
+        }
+    };
+
+    // Ensure the referenced output is a supported ticket submission
+    // output, which also proves the form of the housing transaction.
+    if let Err(e) = check_ticket_submission_input(&ticket_utxo) {
+        return Err(rule_error(
+            RuleErrorKind::InvalidVoteInput,
+            format!(
+                "output {:?} referenced by vote {vote_hash}:{TICKET_IN_IDX} consensus \
+                 violation: {e}",
+                ticket_in.previous_out_point
+            ),
+        ));
+    }
+
+    // A ticket stake submission can only be spent in the block AFTER
+    // the entire ticket maturity has passed, hence the +1.
+    let origin_height = ticket_utxo.block_height();
+    let blocks_since_prev = tx_height - origin_height;
+    if blocks_since_prev < ticket_maturity + 1 {
+        return Err(rule_error(
+            RuleErrorKind::ImmatureTicketSpend,
+            format!(
+                "tried to spend ticket output from height {origin_height} at height \
+                 {tx_height} before required ticket maturity of {ticket_maturity}+1 \
+                 blocks"
+            ),
+        ));
+    }
+
+    let ticket_outs_data = ticket_utxo
+        .ticket_minimal_outputs_data()
+        .expect("missing extra stake data for ticket -- probable database corruption");
+    let (ticket_outs, _) = crate::chainio::deserialize_to_minimal_outputs(ticket_outs_data);
+
+    // Ensure the number of payment outputs matches the number of
+    // commitments made by the associated ticket: the vote outputs are
+    // an OP_RETURN block reference, an OP_RETURN with the vote bits,
+    // and one output per ticket commitment (plus an optional treasury
+    // vote output).
+    let mut extra = 0usize;
+    if is_treasury_enabled {
+        let has_tv = dcroxide_stake::check_ssgen_votes(tx)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        if has_tv {
+            extra = 1;
+        }
+    }
+    let num_vote_payments = tx.tx_out.len() - 2 - extra;
+    if num_vote_payments * 2 != ticket_outs.len() - 1 {
+        return Err(rule_error(
+            RuleErrorKind::BadNumPayees,
+            format!(
+                "vote {vote_hash} makes {num_vote_payments} payments when the input \
+                 ticket has {} commitments",
+                ticket_outs.len() - 1
+            ),
+        ));
+    }
+
+    // Ensure the outputs adhere to the ticket commitments.
+    check_ticket_redeemer_commitments(
+        &ticket_outs,
+        tx,
+        true,
+        vote_subsidy,
+        prev_header,
+        is_treasury_enabled,
+        is_auto_revocations_enabled,
+    )
+}
+
+/// Perform a series of checks on the inputs to a revocation
+/// transaction (dcrd `checkRevocationInputs`).  The caller MUST have
+/// already determined the transaction is a revocation.
+pub fn check_revocation_inputs(
+    tx: &MsgTx,
+    tx_height: i64,
+    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    params: &Params,
+    prev_header: &dcroxide_wire::BlockHeader,
+    is_treasury_enabled: bool,
+    is_auto_revocations_enabled: bool,
+) -> Result<(), RuleError> {
+    let ticket_maturity = i64::from(params.ticket_maturity);
+    let revoke_hash = tx.tx_hash();
+
+    // The first input to a revocation must be the first output of the
+    // ticket the revocation is associated with.
+    const TICKET_IN_IDX: usize = 0;
+    let ticket_in = &tx.tx_in[TICKET_IN_IDX];
+    if ticket_in.previous_out_point.index != SUBMISSION_OUTPUT_IDX {
+        return Err(rule_error(
+            RuleErrorKind::InvalidRevokeInput,
+            format!(
+                "revocation {revoke_hash}:{TICKET_IN_IDX} references output {} instead \
+                 of the first output",
+                ticket_in.previous_out_point.index
+            ),
+        ));
+    }
+
+    // Ensure the referenced ticket is available.
+    let ticket_utxo = match lookup_entry(&ticket_in.previous_out_point) {
+        Some(e) if !e.is_spent() => e,
+        _ => {
+            return Err(rule_error(
+                RuleErrorKind::MissingTxOut,
+                format!(
+                    "ticket output {:?} referenced from revocation \
+                     {revoke_hash}:{TICKET_IN_IDX} either does not exist or has \
+                     already been spent",
+                    ticket_in.previous_out_point
+                ),
+            ));
+        }
+    };
+
+    // Ensure the referenced output is a supported ticket submission
+    // output, which also proves the form of the housing transaction.
+    if let Err(e) = check_ticket_submission_input(&ticket_utxo) {
+        return Err(rule_error(
+            RuleErrorKind::InvalidRevokeInput,
+            format!(
+                "output {:?} referenced by revocation {revoke_hash}:{TICKET_IN_IDX} \
+                 consensus violation: {e}",
+                ticket_in.previous_out_point
+            ),
+        ));
+    }
+
+    // A ticket can only be revoked a block after it could have voted
+    // (+2), or in the same block it is missed or expired under the
+    // automatic ticket revocations agenda (+1).
+    let origin_height = ticket_utxo.block_height();
+    let blocks_since_prev = tx_height - origin_height;
+    let revocation_additional_maturity: i64 = if is_auto_revocations_enabled { 1 } else { 2 };
+    if blocks_since_prev < ticket_maturity + revocation_additional_maturity {
+        return Err(rule_error(
+            RuleErrorKind::ImmatureTicketSpend,
+            format!(
+                "tried to spend ticket output from height {origin_height} at height \
+                 {tx_height} before required ticket maturity of \
+                 {ticket_maturity}+{revocation_additional_maturity} blocks"
+            ),
+        ));
+    }
+
+    let ticket_outs_data = ticket_utxo
+        .ticket_minimal_outputs_data()
+        .expect("missing extra stake data for ticket -- probable database corruption");
+    let (ticket_outs, _) = crate::chainio::deserialize_to_minimal_outputs(ticket_outs_data);
+
+    // The revocation outputs must consist of one output per ticket
+    // commitment.
+    let num_revocation_payments = tx.tx_out.len();
+    if num_revocation_payments * 2 != ticket_outs.len() - 1 {
+        return Err(rule_error(
+            RuleErrorKind::BadNumPayees,
+            format!(
+                "revocation {revoke_hash} makes {num_revocation_payments} payments \
+                 when the input ticket has {} commitments",
+                ticket_outs.len() - 1
+            ),
+        ));
+    }
+
+    // Zero vote subsidy since revocations do not produce any subsidy.
+    check_ticket_redeemer_commitments(
+        &ticket_outs,
+        tx,
+        false,
+        0,
+        prev_header,
+        is_treasury_enabled,
+        is_auto_revocations_enabled,
+    )
 }

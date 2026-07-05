@@ -66,7 +66,7 @@ fn min_testnet_target(params: &Params) -> Option<BigInt> {
 
 /// Go's lossy `big.Int.Int64`: the low 64 bits of the magnitude with
 /// the sign applied.
-fn lossy_i64(n: &BigInt) -> i64 {
+pub(crate) fn lossy_i64(n: &BigInt) -> i64 {
     let low = n.iter_u64_digits().next().unwrap_or(0) as i64;
     if n.sign() == Sign::Minus {
         low.wrapping_neg()
