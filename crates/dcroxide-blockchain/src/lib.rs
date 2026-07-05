@@ -20,6 +20,7 @@
 extern crate alloc;
 
 pub mod agendas;
+pub mod chainio;
 pub mod compress;
 pub mod difficulty;
 mod error;

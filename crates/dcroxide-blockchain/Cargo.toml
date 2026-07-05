@@ -14,6 +14,7 @@ dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-dcrec = { path = "../dcroxide-dcrec" }
 dcroxide-stake = { path = "../dcroxide-stake" }
 dcroxide-standalone = { path = "../dcroxide-standalone" }
+dcroxide-uint256 = { path = "../dcroxide-uint256" }
 dcroxide-wire = { path = "../dcroxide-wire" }
 num-bigint = { version = "0.4", default-features = false }
 

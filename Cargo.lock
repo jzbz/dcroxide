@@ -203,6 +203,7 @@ dependencies = [
  "dcroxide-stake",
  "dcroxide-standalone",
  "dcroxide-testutil",
+ "dcroxide-uint256",
  "dcroxide-wire",
  "num-bigint",
 ]
