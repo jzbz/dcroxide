@@ -3922,3 +3922,580 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
 
     Ok(())
 }
+
+/// Ensure the coinbase pays the pre-treasury-agenda organization
+/// address the correct tax (dcrd `coinbasePaysTreasuryAddress`).
+pub fn coinbase_pays_treasury_address<SP: dcroxide_standalone::SubsidyParams>(
+    subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
+    tx: &MsgTx,
+    height: i64,
+    voters: u16,
+    params: &Params,
+) -> Result<(), RuleError> {
+    // Treasury subsidies only apply from block 2 onwards.
+    if height <= 1 {
+        return Ok(());
+    }
+    if tx.tx_out.is_empty() {
+        return Err(rule_error(
+            RuleErrorKind::NoTxOutputs,
+            "invalid coinbase (no outputs)",
+        ));
+    }
+    let treasury_output = &tx.tx_out[0];
+    if treasury_output.version != params.organization_pk_script_version {
+        return Err(rule_error(
+            RuleErrorKind::NoTreasury,
+            format!(
+                "treasury output version {} is instead of {}",
+                treasury_output.version, params.organization_pk_script_version
+            ),
+        ));
+    }
+    if treasury_output.pk_script != params.organization_pk_script {
+        return Err(rule_error(
+            RuleErrorKind::NoTreasury,
+            "treasury output script does not pay the organization address",
+        ));
+    }
+    let org_subsidy = subsidy_cache.calc_treasury_subsidy(height, voters, false);
+    if org_subsidy != treasury_output.value {
+        return Err(rule_error(
+            RuleErrorKind::NoTreasury,
+            format!(
+                "treasury output amount is {} instead of {org_subsidy}",
+                treasury_output.value
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Ensure the treasurybase pays the correct subsidy into the treasury
+/// account (dcrd `checkTreasuryBase`).
+pub fn check_treasury_base<SP: dcroxide_standalone::SubsidyParams>(
+    subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
+    tx: &MsgTx,
+    height: i64,
+    voters: u16,
+    _params: &Params,
+) -> Result<(), RuleError> {
+    if height <= 1 {
+        return Ok(());
+    }
+    const REQUIRED_OUTPUTS: usize = 2;
+    if tx.tx_out.len() != REQUIRED_OUTPUTS {
+        return Err(rule_error(
+            RuleErrorKind::InvalidTreasurybaseTxOutputs,
+            format!(
+                "treasurybase has {} outputs instead of {REQUIRED_OUTPUTS}",
+                tx.tx_out.len()
+            ),
+        ));
+    }
+    let treasury_output = &tx.tx_out[0];
+    if treasury_output.version != 0 {
+        return Err(rule_error(
+            RuleErrorKind::InvalidTreasurybaseVersion,
+            format!(
+                "treasury output script version is {} instead of 0",
+                treasury_output.version
+            ),
+        ));
+    }
+    if treasury_output.pk_script.len() != 1
+        || treasury_output.pk_script[0] != dcroxide_txscript::OP_TADD
+    {
+        return Err(rule_error(
+            RuleErrorKind::InvalidTreasurybaseScript,
+            "treasury output script is not a lone OP_TADD",
+        ));
+    }
+    let org_subsidy = subsidy_cache.calc_treasury_subsidy(height, voters, true);
+    if org_subsidy != treasury_output.value {
+        return Err(rule_error(
+            RuleErrorKind::TreasurybaseOutValue,
+            format!(
+                "treasury output amount is {} instead of {org_subsidy}",
+                treasury_output.value
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Ensure the block 1 coinbase pays the initial token distribution
+/// per the block one ledger (dcrd `blockOneCoinbasePaysTokens`).
+pub fn block_one_coinbase_pays_tokens(tx: &MsgTx, params: &Params) -> Result<(), RuleError> {
+    if params.block_one_ledger.is_empty() {
+        return Ok(());
+    }
+    if tx.lock_time != 0 {
+        return Err(rule_error(
+            RuleErrorKind::BlockOneTx,
+            "block 1 coinbase has invalid locktime",
+        ));
+    }
+    if tx.expiry != dcroxide_wire::NO_EXPIRY_VALUE {
+        return Err(rule_error(
+            RuleErrorKind::BlockOneTx,
+            "block 1 coinbase has invalid expiry",
+        ));
+    }
+    if tx.tx_in[0].sequence != u32::MAX {
+        return Err(rule_error(
+            RuleErrorKind::BlockOneInputs,
+            "block 1 coinbase not finalized",
+        ));
+    }
+    if tx.tx_out.is_empty() {
+        return Err(rule_error(
+            RuleErrorKind::BlockOneOutputs,
+            "coinbase outputs empty in block 1",
+        ));
+    }
+    let ledger = &params.block_one_ledger;
+    if ledger.len() != tx.tx_out.len() {
+        return Err(rule_error(
+            RuleErrorKind::BlockOneOutputs,
+            format!(
+                "wrong number of outputs in block 1 coinbase; got {}, expected {}",
+                tx.tx_out.len(),
+                ledger.len()
+            ),
+        ));
+    }
+    for (i, tx_out) in tx.tx_out.iter().enumerate() {
+        let ledger_entry = &ledger[i];
+        if tx_out.version != ledger_entry.script_version {
+            return Err(rule_error(
+                RuleErrorKind::BlockOneOutputs,
+                format!("block one output {i} script version is wrong"),
+            ));
+        }
+        if tx_out.pk_script != ledger_entry.script {
+            return Err(rule_error(
+                RuleErrorKind::BlockOneOutputs,
+                format!("block one output {i} script is wrong"),
+            ));
+        }
+        if tx_out.value != ledger_entry.amount {
+            return Err(rule_error(
+                RuleErrorKind::BlockOneOutputs,
+                format!("block one output {i} amount is wrong"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The total subsidy added by the block: the parent's coinbase input
+/// when approved, plus the treasurybase and stakebase inputs (dcrd
+/// `calculateAddedSubsidy`).
+pub fn calculate_added_subsidy(block: &MsgBlock, parent: &MsgBlock) -> i64 {
+    let mut subsidy: i64 = 0;
+    if header_approves_parent(&block.header) {
+        subsidy += parent.transactions[0].tx_in[0].value_in;
+    }
+    for (tx_idx, stx) in block.stransactions.iter().enumerate() {
+        if (tx_idx == 0 && dcroxide_standalone::is_treasury_base(stx))
+            || dcroxide_stake::is_ssgen(stx)
+        {
+            subsidy += stx.tx_in[0].value_in;
+        }
+    }
+    subsidy
+}
+
+/// The version 1 block commitment root: the hash of the sole filter
+/// commitment (dcrd `CalcCommitmentRootV1`).
+pub fn calc_commitment_root_v1(filter_hash: Hash) -> Hash {
+    filter_hash
+}
+
+/// The stateless treasury spend checks for blocks on a treasury vote
+/// interval: the expiry window and the OP_RETURN value-in encoding
+/// (the portable half of dcrd `tspendChecks`; the duplicate-spend
+/// lookup and the vote tallies over the voting window require prior
+/// block data and arrive with the chain engine).
+pub fn tspend_checks_stateless(
+    prev_height: i64,
+    block: &MsgBlock,
+    params: &Params,
+) -> Result<(), RuleError> {
+    let block_height = prev_height + 1;
+    let tvi = params.treasury_vote_interval;
+    if !dcroxide_standalone::is_treasury_vote_interval(block_height as u64, tvi) {
+        return Ok(());
+    }
+    for stx in &block.stransactions {
+        if !dcroxide_stake::is_tspend(stx) {
+            continue;
+        }
+        let exp = stx.expiry;
+        if !dcroxide_standalone::inside_tspend_window(
+            block_height,
+            exp,
+            tvi,
+            params.treasury_vote_interval_multiplier,
+        ) {
+            return Err(rule_error(
+                RuleErrorKind::InvalidTSpendWindow,
+                format!(
+                    "block at height {block_height} contains treasury spend transaction \
+                     {} with expiry {exp} that is outside of the valid window",
+                    stx.tx_hash()
+                ),
+            ));
+        }
+
+        // A valid treasury spend stores the entire spent amount in the
+        // first input, which must match the little-endian amount in
+        // the OP_RETURN.
+        let value_in = stx.tx_in[0].value_in;
+        let mut le = [0u8; 8];
+        le.copy_from_slice(&stx.tx_out[0].pk_script[2..10]);
+        let value_in_op_ret = i64::from_le_bytes(le);
+        if value_in != value_in_op_ret {
+            return Err(rule_error(
+                RuleErrorKind::InvalidTSpendValueIn,
+                format!(
+                    "block contains TSpend transaction ({}) that did not encode ValueIn \
+                     correctly got {value_in_op_ret} wanted {value_in}",
+                    stx.tx_hash()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate every script in one of the block's transaction trees
+/// against the utxo view (dcrd `checkBlockScripts`, executed
+/// sequentially; dcrd's signature cache is a result-invariant
+/// memoization and is not reproduced).
+pub fn check_block_scripts(
+    block: &MsgBlock,
+    view: &crate::utxoview::UtxoView,
+    tx_tree_regular: bool,
+    script_flags: dcroxide_txscript::ScriptFlags,
+    is_auto_revocations_enabled: bool,
+) -> Result<(), RuleError> {
+    let txs = if tx_tree_regular {
+        &block.transactions
+    } else {
+        &block.stransactions
+    };
+    for tx in txs {
+        // Skip version 2+ revocations under the automatic revocations
+        // agenda since consensus already enforces their outputs.
+        if is_auto_revocations_enabled
+            && !tx_tree_regular
+            && tx.version >= dcroxide_stake::TX_VERSION_AUTO_REVOCATIONS
+            && dcroxide_stake::is_ssrtx(tx)
+        {
+            continue;
+        }
+        for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate() {
+            // Skip coinbase-style inputs.
+            if tx_in.previous_out_point.index == u32::MAX {
+                continue;
+            }
+            let Some(entry) = view.lookup_entry(&tx_in.previous_out_point) else {
+                return Err(rule_error(
+                    RuleErrorKind::MissingTxOut,
+                    format!(
+                        "unable to find unspent output {:?} referenced from transaction \
+                         {}:{tx_in_idx}",
+                        tx_in.previous_out_point,
+                        tx.tx_hash()
+                    ),
+                ));
+            };
+            let pk_script = entry.pk_script().to_vec();
+            let version = entry.script_version();
+            let mut engine =
+                dcroxide_txscript::Engine::new(&pk_script, tx, tx_in_idx, script_flags, version)
+                    .map_err(|e| {
+                        rule_error(
+                            RuleErrorKind::ScriptValidation,
+                            format!("failed to create script engine: {e:?}"),
+                        )
+                    })?;
+            engine.execute().map_err(|e| {
+                rule_error(
+                    RuleErrorKind::ScriptValidation,
+                    format!(
+                        "failed to validate input {}:{tx_in_idx}: {e:?}",
+                        tx.tx_hash()
+                    ),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Perform the final battery of checks needed to connect the block to
+/// the main chain, connecting the view and producing the spend
+/// journal and header commitment filter (dcrd `checkConnectBlock`).
+///
+/// The caller supplies the disapproved-parent spend journal (dcrd
+/// fetches it from the database), whether scripts should run (dcrd
+/// derives this from bulk import mode and the assumed-valid ancestor),
+/// and the parent's past median time when the LN features agenda is
+/// active.  The treasury spend duplicate and vote tally checks from
+/// dcrd's `tspendChecks` require prior block data and arrive with the
+/// chain engine.
+#[allow(clippy::too_many_arguments)]
+pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
+    view_chain: &impl FullChainView,
+    subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
+    node_height: i64,
+    node_hash: Hash,
+    node_voters: u16,
+    node_vote_bits: u16,
+    block: &MsgBlock,
+    parent: &MsgBlock,
+    parent_stxos: &[crate::chainio::SpentTxOut],
+    view: &mut crate::utxoview::UtxoView,
+    resolver: &impl crate::utxoview::UtxoResolver,
+    mut stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
+    run_scripts: bool,
+    params: &Params,
+) -> Result<Hash, RuleError> {
+    let prev_height = node_height - 1;
+    // The view must be from the point of view of the parent.
+    assert_eq!(
+        view.best_hash(),
+        block.header.prev_block,
+        "inconsistent view when checking block connection"
+    );
+
+    let unknown = |_| {
+        rule_error(
+            RuleErrorKind::UnknownDeploymentID,
+            "deployment not defined on this network",
+        )
+    };
+    let is_treasury_enabled =
+        crate::agendas::is_treasury_agenda_active(view_chain, Some(prev_height), params)
+            .map_err(unknown)?;
+
+    // The treasury subsidy goes to the treasurybase under the agenda
+    // and to the organization address before it.
+    if is_treasury_enabled {
+        check_treasury_base(
+            subsidy_cache,
+            &block.stransactions[0],
+            node_height,
+            node_voters,
+            params,
+        )?;
+        tspend_checks_stateless(prev_height, block, params)?;
+    } else {
+        coinbase_pays_treasury_address(
+            subsidy_cache,
+            &block.transactions[0],
+            node_height,
+            node_voters,
+            params,
+        )?;
+    }
+
+    let script_flags = if run_scripts {
+        consensus_script_verify_flags(view_chain, Some(prev_height), params)?
+    } else {
+        dcroxide_txscript::ScriptFlags(0)
+    };
+
+    let is_auto_revocations_enabled = crate::agendas::is_agenda_active(
+        view_chain,
+        Some(prev_height),
+        crate::agendas::VOTE_ID_AUTO_REVOCATIONS,
+        params,
+    )
+    .map_err(unknown)?;
+
+    // Undo the parent's regular transactions when this block
+    // disapproves them.
+    if node_height > 1 && !vote_bits_approve_parent(node_vote_bits) {
+        view.disconnect_disapproved_block(parent, parent_stxos, resolver, is_treasury_enabled)?;
+    }
+
+    // Duplicate transaction checking is a no-op at this version.
+    check_dup_txs(&block.stransactions, |op| view.lookup_entry(op).cloned(), 1)?;
+
+    // Load all of the utxos referenced by the block that are not
+    // already in the view.
+    view.fetch_input_utxos(block, resolver, is_treasury_enabled);
+
+    // Determine the subsidy split.
+    let split = crate::agendas::is_agenda_active(
+        view_chain,
+        Some(prev_height),
+        crate::agendas::VOTE_ID_CHANGE_SUBSIDY_SPLIT,
+        params,
+    )
+    .map_err(unknown)?;
+    let split_r2 = crate::agendas::is_agenda_active(
+        view_chain,
+        Some(prev_height),
+        crate::agendas::VOTE_ID_CHANGE_SUBSIDY_SPLIT_R2,
+        params,
+    )
+    .map_err(unknown)?;
+    let subsidy_split_variant = if split_r2 {
+        dcroxide_standalone::SubsidySplitVariant::Dcp0012
+    } else if split {
+        dcroxide_standalone::SubsidySplitVariant::Dcp0010
+    } else {
+        dcroxide_standalone::SubsidySplitVariant::Original
+    };
+
+    // Connect the stake tree with full checks.
+    let prev_header = &parent.header;
+    check_transactions_and_connect(
+        subsidy_cache,
+        0,
+        node_height,
+        node_voters,
+        prev_header,
+        &block.stransactions,
+        view,
+        stxos.as_deref_mut(),
+        true,
+        is_treasury_enabled,
+        is_auto_revocations_enabled,
+        subsidy_split_variant,
+        params,
+    )?;
+    let stake_tree_fees = get_stake_tree_fees(
+        subsidy_cache,
+        node_height,
+        &block.stransactions,
+        |op| view.lookup_entry(op).cloned(),
+        is_treasury_enabled,
+        subsidy_split_variant,
+    )?;
+
+    // Enforce sequence locks once the LN features agenda is active.
+    let ln_features_active =
+        crate::agendas::is_ln_features_agenda_active(view_chain, Some(prev_height), params)
+            .map_err(unknown)?;
+    let mut prev_median_time = 0i64;
+    if ln_features_active {
+        prev_median_time = crate::stakever::calc_past_median_time(
+            &crate::sequencelock::AsVersionView(view_chain),
+            prev_height,
+        );
+        for stx in &block.stransactions {
+            let lock = crate::sequencelock::calc_sequence_lock(
+                view_chain,
+                node_height,
+                stx,
+                |op| Some(view.lookup_entry(op)?.block_height()),
+                true,
+                params,
+            )?;
+            if !sequence_lock_active(&lock, node_height, prev_median_time) {
+                return Err(rule_error(
+                    RuleErrorKind::UnfinalizedTx,
+                    "block contains stake transaction whose input sequence locks are \
+                     not met",
+                ));
+            }
+        }
+    }
+
+    if run_scripts {
+        check_block_scripts(
+            block,
+            view,
+            false,
+            script_flags,
+            is_auto_revocations_enabled,
+        )?;
+    }
+
+    check_dup_txs(&block.transactions, |op| view.lookup_entry(op).cloned(), 0)?;
+
+    // Connect the regular tree with full checks, carrying the stake
+    // tree fees forward.
+    check_transactions_and_connect(
+        subsidy_cache,
+        stake_tree_fees,
+        node_height,
+        node_voters,
+        prev_header,
+        &block.transactions,
+        view,
+        stxos,
+        false,
+        is_treasury_enabled,
+        is_auto_revocations_enabled,
+        subsidy_split_variant,
+        params,
+    )?;
+
+    if ln_features_active {
+        for tx in &block.transactions[1..] {
+            let lock = crate::sequencelock::calc_sequence_lock(
+                view_chain,
+                node_height,
+                tx,
+                |op| Some(view.lookup_entry(op)?.block_height()),
+                true,
+                params,
+            )?;
+            if !sequence_lock_active(&lock, node_height, prev_median_time) {
+                return Err(rule_error(
+                    RuleErrorKind::UnfinalizedTx,
+                    "block contains transaction whose input sequence locks are not met",
+                ));
+            }
+        }
+    }
+
+    // Build the version 2 committed filter and validate the header
+    // commitment to it once the agenda is active.
+    struct ViewScripts<'a>(&'a crate::utxoview::UtxoView);
+    impl dcroxide_gcs::blockcf2::PrevScripter for ViewScripts<'_> {
+        fn prev_script(&self, out: &dcroxide_wire::OutPoint) -> Option<(u16, &[u8])> {
+            let entry = self.0.lookup_entry(out)?;
+            Some((entry.script_version(), entry.pk_script()))
+        }
+    }
+    let filter = dcroxide_gcs::blockcf2::regular(block, &ViewScripts(view))
+        .map_err(|e| rule_error(RuleErrorKind::MissingTxOut, format!("{e:?}")))?;
+    let filter_hash = filter.hash();
+
+    let hdr_commitments_active =
+        crate::agendas::is_header_commitments_agenda_active(view_chain, Some(prev_height), params)
+            .map_err(unknown)?;
+    if hdr_commitments_active {
+        let want_commitment_root = calc_commitment_root_v1(filter_hash);
+        if block.header.stake_root != want_commitment_root {
+            return Err(rule_error(
+                RuleErrorKind::BadCommitmentRoot,
+                format!(
+                    "block commitment root is invalid - block header indicates {}, but \
+                     calculated value is {want_commitment_root}",
+                    block.header.stake_root
+                ),
+            ));
+        }
+    }
+
+    if run_scripts {
+        check_block_scripts(block, view, true, script_flags, is_auto_revocations_enabled)?;
+    }
+
+    // The block one coinbase pays the initial token distribution.
+    if node_height == 1 {
+        block_one_coinbase_pays_tokens(&block.transactions[0], params)?;
+    }
+
+    view.set_best_hash(node_hash);
+    Ok(filter_hash)
+}

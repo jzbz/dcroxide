@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-gcs = { path = "../dcroxide-gcs" }
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-dcrec = { path = "../dcroxide-dcrec" }
 dcroxide-stake = { path = "../dcroxide-stake" }

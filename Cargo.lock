@@ -200,6 +200,7 @@ dependencies = [
  "dcroxide-chaincfg",
  "dcroxide-chainhash",
  "dcroxide-dcrec",
+ "dcroxide-gcs",
  "dcroxide-stake",
  "dcroxide-standalone",
  "dcroxide-testutil",
