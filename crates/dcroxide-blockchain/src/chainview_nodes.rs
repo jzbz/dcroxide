@@ -209,3 +209,54 @@ impl NodeChainView {
         locator
     }
 }
+
+/// A height-indexed view over the branch of the block tree ending at
+/// a given tip node, bridging the arena-based block index to the
+/// `ChainView`/`VoteChainView` abstractions the validation functions
+/// walk.  dcrd's equivalents walk `blockNode` parent pointers
+/// directly; here the deterministic skip list serves each height
+/// lookup.
+pub struct NodeBranchView<'a> {
+    /// The node store holding the branch.
+    pub store: &'a crate::blockindex::NodeStore,
+    /// The branch tip.
+    pub tip: crate::blockindex::NodeId,
+}
+
+impl crate::difficulty::ChainView for NodeBranchView<'_> {
+    fn node(&self, height: i64) -> Option<crate::difficulty::DiffNode> {
+        if height < 0 || height > self.store.node(self.tip).height {
+            return None;
+        }
+        let id = self.store.ancestor(self.tip, height)?;
+        let n = self.store.node(id);
+        Some(crate::difficulty::DiffNode {
+            height: n.height,
+            timestamp: n.timestamp,
+            bits: n.bits,
+            sbits: n.sbits,
+            pool_size: n.pool_size,
+            fresh_stake: n.fresh_stake,
+        })
+    }
+}
+
+impl crate::thresholdstate::VoteChainView for NodeBranchView<'_> {
+    fn vote_node(&self, height: i64) -> Option<crate::thresholdstate::VoteNode> {
+        if height < 0 || height > self.store.node(self.tip).height {
+            return None;
+        }
+        let id = self.store.ancestor(self.tip, height)?;
+        let n = self.store.node(id);
+        Some(crate::thresholdstate::VoteNode {
+            node: crate::stakever::VersionNode {
+                height: n.height,
+                timestamp: n.timestamp,
+                block_version: n.block_version,
+                stake_version: n.stake_version,
+                vote_versions: n.votes.iter().map(|v| v.0).collect(),
+            },
+            votes: n.votes.clone(),
+        })
+    }
+}

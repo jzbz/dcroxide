@@ -150,6 +150,7 @@ fn positional_vectors() {
                         &header,
                         Some(tip_height),
                         fast_add,
+                        None,
                         &params
                     )),
                     f[3],

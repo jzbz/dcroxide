@@ -981,19 +981,31 @@ pub fn check_difficulty_positional(
     Ok(())
 }
 
+/// The caller-computed facts needed for the old fork rejection
+/// checkpoint check inside the positional header validation: dcrd
+/// reads them from its block index, which the chain processing layer
+/// supplies here.  `None` mirrors a nil checkpoint (the check is
+/// skipped).
+pub struct ForkRejection {
+    /// The height of the fork rejection checkpoint node.
+    pub checkpoint_height: i64,
+    /// Whether the previous node is an ancestor of the checkpoint.
+    pub prev_is_checkpoint_ancestor: bool,
+    /// Whether the header's block hash is already in the block index.
+    pub block_in_index: bool,
+}
+
 /// Perform the validation checks on the block header which depend on
 /// its position within the block chain and having the headers of all
 /// ancestors available (dcrd `checkBlockHeaderPositional`).  A `None`
 /// previous height means the genesis block, which is valid by
 /// definition.  `fast_add` corresponds to dcrd's `BFFastAdd` flag.
-///
-/// dcrd's fork rejection checkpoint check is deferred until the block
-/// index arrives with the chain engine.
 pub fn check_block_header_positional(
     view: &impl FullChainView,
     header: &dcroxide_wire::BlockHeader,
     prev_height: Option<i64>,
     fast_add: bool,
+    fork_rejection: Option<&ForkRejection>,
     params: &Params,
 ) -> Result<(), RuleError> {
     // The genesis block is valid by definition.
@@ -1067,9 +1079,23 @@ pub fn check_block_header_positional(
         ));
     }
 
-    // dcrd prevents blocks that fork the main chain before its fork
-    // rejection checkpoint here; that check requires the block index
-    // and arrives with the chain engine.
+    // Prevent blocks that fork the main chain prior to the old fork
+    // rejection checkpoint.  dcrd reads the checkpoint node and block
+    // index directly; the caller supplies the same facts here.
+    if let Some(fr) = fork_rejection {
+        if block_height < fr.checkpoint_height
+            && (!fr.prev_is_checkpoint_ancestor || !fr.block_in_index)
+        {
+            return Err(rule_error(
+                RuleErrorKind::ForkTooOld,
+                format!(
+                    "block at height {block_height} forks the main chain before the \
+                     fork rejection checkpoint at height {}",
+                    fr.checkpoint_height
+                ),
+            ));
+        }
+    }
 
     // Reject version 3 test network chains that are not specifically
     // the chain used to activate maximum difficulty semantics.
@@ -1164,7 +1190,7 @@ pub fn check_block_positional(
         return Ok(());
     }
 
-    check_block_header_positional(view, &block.header, prev_height, fast_add, params)?;
+    check_block_header_positional(view, &block.header, prev_height, fast_add, None, params)?;
     check_block_data_positional(block, prev_height, fast_add)
 }
 
