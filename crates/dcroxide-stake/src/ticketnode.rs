@@ -249,6 +249,66 @@ impl Node {
         false
     }
 
+    /// The stake node parameters.
+    pub fn params(&self) -> &StakeNodeParams {
+        &self.params
+    }
+
+    /// The missed ticket treap (used by the ticket database layer).
+    pub(crate) fn missed_treap(&self) -> &Immutable {
+        &self.missed_tickets
+    }
+
+    /// The revoked ticket treap (used by the ticket database layer).
+    pub(crate) fn revoked_treap(&self) -> &Immutable {
+        &self.revoked_tickets
+    }
+
+    /// Reconstruct a node from database state, recomputing the final
+    /// lottery state from the tip header exactly like dcrd
+    /// `LoadBestNode` does.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_database_state(
+        height: u32,
+        params: StakeNodeParams,
+        live_tickets: Immutable,
+        missed_tickets: Immutable,
+        revoked_tickets: Immutable,
+        database_undo_update: Vec<crate::ticketdb::UndoTicketData>,
+        database_block_tickets: Vec<Hash>,
+        state_next_winners: &[Hash],
+        header_bytes: &[u8],
+    ) -> Result<Node, RuleError> {
+        let mut node = Node {
+            height,
+            live_tickets,
+            missed_tickets,
+            revoked_tickets,
+            database_undo_update,
+            database_block_tickets,
+            next_winners: Vec::new(),
+            final_state: [0u8; 6],
+            params,
+        };
+        if i64::from(height) >= params.stake_validation_begin_height - 1 {
+            node.next_winners = state_next_winners.to_vec();
+
+            // Calculate the final state from the block header.
+            let mut state_buffer =
+                Vec::with_capacity((usize::from(params.votes_per_block) + 1) * 32);
+            for ticket_hash in &node.next_winners {
+                state_buffer.extend_from_slice(&ticket_hash.0);
+            }
+            let mut prng = Hash256Prng::new(header_bytes);
+            find_ticket_idxs(node.live_tickets.len(), params.votes_per_block, &mut prng)?;
+            let last_hash = prng.state_hash();
+            state_buffer.extend_from_slice(&last_hash.0);
+            node.final_state
+                .copy_from_slice(&hash_b(&state_buffer)[0..6]);
+        }
+        Ok(node)
+    }
+
     /// The tickets eligible to vote on the next block (dcrd
     /// `Winners`).
     pub fn winners(&self) -> &[Hash] {

@@ -10,11 +10,13 @@ repository.workspace = true
 
 [dependencies]
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-database = { path = "../dcroxide-database" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-uint256 = { path = "../dcroxide-uint256" }
 dcroxide-wire = { path = "../dcroxide-wire" }
 
 [dev-dependencies]
+tempfile = "3"
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-testutil = { path = "../dcroxide-testutil" }
 

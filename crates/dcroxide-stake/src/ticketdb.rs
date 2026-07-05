@@ -94,7 +94,7 @@ pub struct TicketDbError {
     pub description: String,
 }
 
-fn ticket_db_error(kind: TicketDbErrorKind, description: &str) -> TicketDbError {
+pub(crate) fn ticket_db_error(kind: TicketDbErrorKind, description: &str) -> TicketDbError {
     TicketDbError {
         kind,
         description: String::from(description),
