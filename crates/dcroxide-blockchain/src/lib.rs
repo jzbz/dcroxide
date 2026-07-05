@@ -32,6 +32,7 @@ pub mod stakever;
 pub mod thresholdstate;
 mod utxoentry;
 mod utxoio;
+pub mod utxoview;
 pub mod validate;
 
 pub use compress::CURRENT_COMPRESSION_VERSION;

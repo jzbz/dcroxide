@@ -8,11 +8,11 @@ use dcroxide_stake::TxType;
 
 /// In-memory state bit: the entry was modified since load (dcrd
 /// `utxoStateModified`).
-const UTXO_STATE_MODIFIED: u8 = 1 << 0;
+pub(crate) const UTXO_STATE_MODIFIED: u8 = 1 << 0;
 /// In-memory state bit: the output has been spent.
-const UTXO_STATE_SPENT: u8 = 1 << 1;
+pub(crate) const UTXO_STATE_SPENT: u8 = 1 << 1;
 /// In-memory state bit: spent by a transaction in the same block.
-const UTXO_STATE_SPENT_BY_ZERO_CONF: u8 = 1 << 2;
+pub(crate) const UTXO_STATE_SPENT_BY_ZERO_CONF: u8 = 1 << 2;
 /// In-memory state bit: the entry is fresh (not yet in the backend).
 const UTXO_STATE_FRESH: u8 = 1 << 3;
 
@@ -64,6 +64,28 @@ pub struct UtxoEntry {
 }
 
 impl UtxoEntry {
+    /// The raw in-memory state byte (test and persistence aid).
+    pub fn state_bits(&self) -> u8 {
+        self.state
+    }
+
+    /// Overwrite the raw in-memory state byte (test and persistence
+    /// aid).
+    pub fn set_state_bits(&mut self, state: u8) {
+        self.state = state;
+    }
+
+    /// The raw packed flags byte (test and persistence aid).
+    pub fn packed_flags_bits(&self) -> u8 {
+        self.packed_flags
+    }
+
+    /// Overwrite the raw packed flags byte (test and persistence
+    /// aid).
+    pub fn set_packed_flags_bits(&mut self, flags: u8) {
+        self.packed_flags = flags;
+    }
+
     /// Construct an entry for the given output data.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
