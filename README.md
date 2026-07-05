@@ -9,11 +9,11 @@ Parity target: **dcrd `release-v2.1.5`** — wire protocol 12, JSON-RPC API
 [PARITY.md](PARITY.md) for per-package status. The full plan lives in
 [dcroxide-project-brief.md](dcroxide-project-brief.md).
 
-**Status: pre-alpha — Phase 4 complete plus the stake transaction
+**Status: pre-alpha — Phases 4 and 6 complete plus the stake transaction
 primitives from Phase 5 (rig, primitives, wire, chaincfg, the full script
-engine including addresses, classification, and signing, and stake
-transaction rules).** Nothing here is ready to validate, relay, or hold
-funds. Currently implemented:
+engine including addresses, classification, and signing, stake
+transaction rules, and the standalone consensus functions).** Nothing
+here is ready to validate, relay, or hold funds. Currently implemented:
 
 - `dcroxide-crypto` — BLAKE-256 (vendored from
   [dcr-rs](https://github.com/jzbz/dcr-rs), KAT-pinned, differential-tested
@@ -63,6 +63,15 @@ funds. Currently implemented:
   construction; dcrd's own test vectors replay oracle-free and the whole
   surface is differentially matched against dcrd (the ticket-database
   state machinery follows in the blockchain phase)
+- `dcroxide-standalone` — dcrd's `blockchain/standalone` consensus
+  functions: merkle roots and inclusion proofs, compact-difficulty
+  conversions and proof-of-work checks (including the BLAKE3 `PowHashV2`
+  from DCP0011, added to `dcroxide-wire`), the ASERT difficulty
+  algorithm replaying dcrd's reference vectors, the full subsidy
+  schedule across all three split regimes (validated by dcrd's exact
+  total-supply figures), treasury spend window math, and context-free
+  transaction sanity checks — all additionally differentially matched
+  against dcrd
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
 

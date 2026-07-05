@@ -97,6 +97,31 @@
 //	stake_create_revocation → CreateRevocationFromTicket; see the handler
 //	                     for the field layout; {"result": "<hex tx>"} or
 //	                     {"error": ..., "kind": "Err..."}
+//	standalone_merkle  → data is leaf_index(4 BE) || n(4 BE) || n*32-byte
+//	                     leaves; {"result": "<hex dump>"} of the merkle
+//	                     root, inclusion proof, and verification result
+//	standalone_tx_merkle → data is n_regular(2 BE) || length-prefixed
+//	                     serialized txs; {"result": "<hex dump>"} of the
+//	                     regular, stake, and DCP0005 combined roots
+//	standalone_pow     → data is bits(4 BE) || pow_limit(32 BE) ||
+//	                     pow hash(32); {"result": "<hex dump>"} of the
+//	                     compact conversions, work, and check verdicts
+//	standalone_asert   → data is start_bits(4 BE) || pow_limit(32 BE) ||
+//	                     target_secs(8) || time_delta(8) ||
+//	                     height_delta(8) || half_life(8), all BE;
+//	                     {"result": "<8-hex-digit diff bits>"}
+//	standalone_subsidy → data is net_len(1) || net || height(8 BE) ||
+//	                     voters(2 BE) || variant(1);
+//	                     {"result": "<hex dump>"} of every subsidy calc
+//	standalone_treasury → data is height(8 BE) || expiry(4 BE) ||
+//	                     tvi(8 BE) || mul(8 BE); {"result": "<hex dump>"}
+//	                     of the TVI/expiry/window/inside calculations
+//	standalone_tx      → data is max_tx_size(8 BE) || serialized tx;
+//	                     {"result": "<hex dump>"} of coinbase/treasury
+//	                     base identification and the sanity verdict
+//	blockheader_powhash → data is a serialized block header;
+//	                     {"result": "<hex dump>"} of the v1 (BLAKE-256)
+//	                     and v2 (BLAKE3, DCP0011) proof of work hashes
 //	chaincfg_dump      → data is the network name bytes ("mainnet",
 //	                     "testnet3", "simnet", or "regnet");
 //	                     {"result": "<hex of the canonical params dump>"}
@@ -122,6 +147,7 @@ import (
 
 	"github.com/decred/base58"
 	stake "github.com/decred/dcrd/blockchain/stake/v5"
+	standalone "github.com/decred/dcrd/blockchain/standalone/v2"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	chaincfg "github.com/decred/dcrd/chaincfg/v3"
 	"github.com/decred/dcrd/crypto/blake256"
@@ -958,6 +984,206 @@ func handle(req request) response {
 		}
 		return response{Result: hex.EncodeToString(buf.Bytes())}
 
+	case "standalone_merkle":
+		// data: leaf_index(4 BE) || n_leaves(4 BE) || n*32-byte leaves.
+		// Dumps the merkle root, the inclusion proof for leaf_index, and
+		// the proof verification result against the computed root.
+		if len(data) < 8 {
+			return errResp("standalone_merkle: truncated request")
+		}
+		leafIndex := binary.BigEndian.Uint32(data[0:4])
+		nLeaves := int(binary.BigEndian.Uint32(data[4:8]))
+		if len(data) != 8+nLeaves*32 {
+			return errResp("standalone_merkle: bad leaf payload")
+		}
+		leaves := make([]chainhash.Hash, nLeaves)
+		for i := 0; i < nLeaves; i++ {
+			copy(leaves[i][:], data[8+i*32:40+i*32])
+		}
+		var w strings.Builder
+		root := standalone.CalcMerkleRoot(leaves)
+		fmt.Fprintf(&w, "root=%s\n", root)
+		proof := standalone.GenerateInclusionProof(leaves, leafIndex)
+		for _, h := range proof {
+			fmt.Fprintf(&w, "proof=%s\n", h)
+		}
+		if int(leafIndex) < nLeaves {
+			verified := standalone.VerifyInclusionProof(&root,
+				&leaves[leafIndex], leafIndex, proof)
+			fmt.Fprintf(&w, "verified=%t\n", verified)
+		}
+		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
+	case "standalone_tx_merkle":
+		// data: n_regular(2 BE) || regular txs || stake txs, each tx
+		// length-prefixed with 4 BE bytes.  Dumps the individual tx tree
+		// roots and the DCP0005 combined root.
+		if len(data) < 2 {
+			return errResp("standalone_tx_merkle: truncated request")
+		}
+		nRegular := int(binary.BigEndian.Uint16(data[0:2]))
+		rest := data[2:]
+		var allTxns []*wire.MsgTx
+		for len(rest) > 0 {
+			if len(rest) < 4 {
+				return errResp("standalone_tx_merkle: truncated tx length")
+			}
+			txLen := int(binary.BigEndian.Uint32(rest[0:4]))
+			if len(rest) < 4+txLen {
+				return errResp("standalone_tx_merkle: truncated tx")
+			}
+			var tx wire.MsgTx
+			if err := tx.Deserialize(bytes.NewReader(rest[4 : 4+txLen])); err != nil {
+				return errResp("standalone_tx_merkle: bad tx: %v", err)
+			}
+			allTxns = append(allTxns, &tx)
+			rest = rest[4+txLen:]
+		}
+		if nRegular > len(allTxns) {
+			return errResp("standalone_tx_merkle: bad regular count")
+		}
+		regular, stake := allTxns[:nRegular], allTxns[nRegular:]
+		var w strings.Builder
+		fmt.Fprintf(&w, "regular=%s\n", standalone.CalcTxTreeMerkleRoot(regular))
+		fmt.Fprintf(&w, "stake=%s\n", standalone.CalcTxTreeMerkleRoot(stake))
+		fmt.Fprintf(&w, "combined=%s\n",
+			standalone.CalcCombinedTxTreeMerkleRoot(regular, stake))
+		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
+	case "standalone_pow":
+		// data: bits(4 BE) || pow_limit(32 BE) || pow hash(32).  Dumps
+		// the compact conversion round trip, work, and the three check
+		// functions' verdicts.
+		if len(data) != 68 {
+			return errResp("standalone_pow: bad request length")
+		}
+		bits := binary.BigEndian.Uint32(data[0:4])
+		powLimit := new(big.Int).SetBytes(data[4:36])
+		var powHash chainhash.Hash
+		copy(powHash[:], data[36:68])
+		var w strings.Builder
+		target := standalone.CompactToBig(bits)
+		fmt.Fprintf(&w, "target=%s\n", target)
+		fmt.Fprintf(&w, "compact=%08x\n", standalone.BigToCompact(target))
+		fmt.Fprintf(&w, "work=%s\n", standalone.CalcWork(bits))
+		fmt.Fprintf(&w, "hashtobig=%s\n", standalone.HashToBig(&powHash))
+		fmt.Fprintf(&w, "range=%s\n",
+			standaloneErrKind(standalone.CheckProofOfWorkRange(bits, powLimit)))
+		fmt.Fprintf(&w, "hash=%s\n",
+			standaloneErrKind(standalone.CheckProofOfWorkHash(&powHash, bits)))
+		fmt.Fprintf(&w, "pow=%s\n",
+			standaloneErrKind(standalone.CheckProofOfWork(&powHash, bits, powLimit)))
+		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
+	case "standalone_asert":
+		// data: start_bits(4 BE) || pow_limit(32 BE) ||
+		//       target_secs(8 BE) || time_delta(8 BE) ||
+		//       height_delta(8 BE) || half_life(8 BE)
+		if len(data) != 68 {
+			return errResp("standalone_asert: bad request length")
+		}
+		startBits := binary.BigEndian.Uint32(data[0:4])
+		powLimit := new(big.Int).SetBytes(data[4:36])
+		targetSecs := int64(binary.BigEndian.Uint64(data[36:44]))  // nolint:gosec
+		timeDelta := int64(binary.BigEndian.Uint64(data[44:52]))   // nolint:gosec
+		heightDelta := int64(binary.BigEndian.Uint64(data[52:60])) // nolint:gosec
+		halfLife := int64(binary.BigEndian.Uint64(data[60:68]))    // nolint:gosec
+		diff := standalone.CalcASERTDiff(startBits, powLimit, targetSecs,
+			timeDelta, heightDelta, halfLife)
+		return response{Result: fmt.Sprintf("%08x", diff)}
+
+	case "standalone_subsidy":
+		// data: net_len(1) || net || height(8 BE) || voters(2 BE) ||
+		//       variant(1: 0=orig,1=dcp0010,2=dcp0012).  Dumps every
+		//       subsidy calculation variant for the height.
+		if len(data) < 1 {
+			return errResp("standalone_subsidy: empty request")
+		}
+		netLen := int(data[0])
+		if len(data) != 1+netLen+11 {
+			return errResp("standalone_subsidy: bad request length")
+		}
+		params, err := netParams(string(data[1 : 1+netLen]))
+		if err != nil {
+			return errResp("standalone_subsidy: %v", err)
+		}
+		rest := data[1+netLen:]
+		height := int64(binary.BigEndian.Uint64(rest[0:8])) // nolint:gosec
+		voters := binary.BigEndian.Uint16(rest[8:10])
+		var variant standalone.SubsidySplitVariant
+		switch rest[10] {
+		case 1:
+			variant = standalone.SSVDCP0010
+		case 2:
+			variant = standalone.SSVDCP0012
+		default:
+			variant = standalone.SSVOriginal
+		}
+		cache := standalone.NewSubsidyCache(params)
+		var w strings.Builder
+		fmt.Fprintf(&w, "full=%d\n", cache.CalcBlockSubsidy(height))
+		fmt.Fprintf(&w, "work=%d\n", cache.CalcWorkSubsidy(height, voters))
+		fmt.Fprintf(&w, "workv2f=%d\n", cache.CalcWorkSubsidyV2(height, voters, false))
+		fmt.Fprintf(&w, "workv2t=%d\n", cache.CalcWorkSubsidyV2(height, voters, true))
+		fmt.Fprintf(&w, "workv3=%d\n", cache.CalcWorkSubsidyV3(height, voters, variant))
+		fmt.Fprintf(&w, "vote=%d\n", cache.CalcStakeVoteSubsidy(height))
+		fmt.Fprintf(&w, "votev2f=%d\n", cache.CalcStakeVoteSubsidyV2(height, false))
+		fmt.Fprintf(&w, "votev2t=%d\n", cache.CalcStakeVoteSubsidyV2(height, true))
+		fmt.Fprintf(&w, "votev3=%d\n", cache.CalcStakeVoteSubsidyV3(height, variant))
+		fmt.Fprintf(&w, "treasuryf=%d\n", cache.CalcTreasurySubsidy(height, voters, false))
+		fmt.Fprintf(&w, "treasuryt=%d\n", cache.CalcTreasurySubsidy(height, voters, true))
+		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
+	case "standalone_treasury":
+		// data: height(8 BE) || expiry(4 BE) || tvi(8 BE) || mul(8 BE)
+		if len(data) != 28 {
+			return errResp("standalone_treasury: bad request length")
+		}
+		height := int64(binary.BigEndian.Uint64(data[0:8])) // nolint:gosec
+		expiry := binary.BigEndian.Uint32(data[8:12])
+		tvi := binary.BigEndian.Uint64(data[12:20])
+		mul := binary.BigEndian.Uint64(data[20:28])
+		var w strings.Builder
+		fmt.Fprintf(&w, "istvi=%t\n",
+			standalone.IsTreasuryVoteInterval(uint64(height), tvi)) // nolint:gosec
+		fmt.Fprintf(&w, "expiry=%d\n", standalone.CalcTSpendExpiry(height, tvi, mul))
+		start, end, err := standalone.CalcTSpendWindow(expiry, tvi, mul)
+		fmt.Fprintf(&w, "window=%s %d %d\n", standaloneErrKind(err), start, end)
+		fmt.Fprintf(&w, "inside=%t\n",
+			standalone.InsideTSpendWindow(height, expiry, tvi, mul))
+		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
+	case "standalone_tx":
+		// data: max_tx_size(8 BE) || serialized tx.  Dumps coinbase and
+		// treasury base identification plus the sanity check verdict.
+		if len(data) < 8 {
+			return errResp("standalone_tx: truncated request")
+		}
+		maxTxSize := binary.BigEndian.Uint64(data[0:8])
+		var tx wire.MsgTx
+		if err := tx.Deserialize(bytes.NewReader(data[8:])); err != nil {
+			return errResp("standalone_tx: bad tx: %v", err)
+		}
+		var w strings.Builder
+		fmt.Fprintf(&w, "coinbasepre=%t\n", standalone.IsCoinBaseTx(&tx, false))
+		fmt.Fprintf(&w, "coinbasepost=%t\n", standalone.IsCoinBaseTx(&tx, true))
+		fmt.Fprintf(&w, "treasurybase=%t\n", standalone.IsTreasuryBase(&tx))
+		fmt.Fprintf(&w, "sanity=%s\n",
+			standaloneErrKind(standalone.CheckTransactionSanity(&tx, maxTxSize)))
+		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
+	case "blockheader_powhash":
+		// data: a serialized 180-byte block header; dumps the v1
+		// (BLAKE-256) and v2 (BLAKE3, DCP0011) proof of work hashes.
+		var header wire.BlockHeader
+		if err := header.Deserialize(bytes.NewReader(data)); err != nil {
+			return errResp("blockheader_powhash: bad header: %v", err)
+		}
+		var w strings.Builder
+		fmt.Fprintf(&w, "v1=%s\n", header.PowHashV1())
+		fmt.Fprintf(&w, "v2=%s\n", header.PowHashV2())
+		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
 	case "chaincfg_dump":
 		params, err := netParams(string(data))
 		if err != nil {
@@ -972,6 +1198,19 @@ func handle(req request) response {
 	default:
 		return errResp("unknown cmd: %s", req.Cmd)
 	}
+}
+
+// standaloneErrKind renders "ok" or the standalone ErrorKind name for a
+// check result; errors without a standalone kind render their message.
+func standaloneErrKind(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	var kindErr standalone.ErrorKind
+	if errors.As(err, &kindErr) {
+		return kindErr.Error()
+	}
+	return err.Error()
 }
 
 // stakeErrKind renders "ok" or the stake ErrorKind name for a check

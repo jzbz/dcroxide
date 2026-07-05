@@ -125,9 +125,14 @@ impl BlockHeader {
 
     /// The version 1 proof-of-work hash: identical to [`Self::block_hash`]
     /// (dcrd `PowHashV1`; applies to all blocks before DCP0011 activation).
-    /// The BLAKE3 `PowHashV2` lands with the standalone consensus crate.
     pub fn pow_hash_v1(&self) -> Hash {
         self.block_hash()
+    }
+
+    /// The version 2 proof-of-work hash defined in DCP0011: BLAKE3 over the
+    /// serialized header (dcrd `PowHashV2`).
+    pub fn pow_hash_v2(&self) -> Hash {
+        Hash(*blake3::hash(&self.serialize()).as_bytes())
     }
 }
 

@@ -214,16 +214,15 @@ pub(crate) fn opcode_nop(
     _data: &[u8],
     vm: &mut Engine,
 ) -> Result<(), ScriptError> {
-    match op.value {
-        OP_NOP1 | OP_NOP4..=OP_NOP10 | OP_UNKNOWN196..=OP_UNKNOWN248 => {
-            if vm.has_flag(ScriptFlags::DISCOURAGE_UPGRADABLE_NOPS) {
-                return Err(script_error(
-                    ErrorKind::DiscourageUpgradableNOPs,
-                    format!("{} reserved for upgrades", op.name),
-                ));
-            }
-        }
-        _ => {}
+    if matches!(
+        op.value,
+        OP_NOP1 | OP_NOP4..=OP_NOP10 | OP_UNKNOWN196..=OP_UNKNOWN248
+    ) && vm.has_flag(ScriptFlags::DISCOURAGE_UPGRADABLE_NOPS)
+    {
+        return Err(script_error(
+            ErrorKind::DiscourageUpgradableNOPs,
+            format!("{} reserved for upgrades", op.name),
+        ));
     }
     Ok(())
 }

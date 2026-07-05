@@ -1,0 +1,22 @@
+[package]
+name = "dcroxide-standalone"
+description = "Standalone Decred consensus functions mirroring dcrd's blockchain/standalone: merkle roots, inclusion proofs, proof of work, ASERT difficulty, subsidies, and treasury spend math"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+num-bigint = { version = "0.4", default-features = false }
+
+[dev-dependencies]
+dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+serde_json = "1"
+
+[lints]
+workspace = true

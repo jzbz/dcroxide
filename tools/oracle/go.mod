@@ -6,6 +6,7 @@ go 1.24.0
 require (
 	github.com/decred/base58 v1.0.6
 	github.com/decred/dcrd/blockchain/stake/v5 v5.0.2
+	github.com/decred/dcrd/blockchain/standalone/v2 v2.2.2
 	github.com/decred/dcrd/chaincfg/chainhash v1.0.5
 	github.com/decred/dcrd/chaincfg/v3 v3.3.0
 	github.com/decred/dcrd/crypto/blake256 v1.1.0

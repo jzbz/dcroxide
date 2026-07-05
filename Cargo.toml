@@ -7,6 +7,7 @@ members = [
     "crates/dcroxide-crypto",
     "crates/dcroxide-dcrec",
     "crates/dcroxide-stake",
+    "crates/dcroxide-standalone",
     "crates/dcroxide-testutil",
     "crates/dcroxide-txscript",
     "crates/dcroxide-uint256",

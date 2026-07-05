@@ -75,10 +75,10 @@ proptest! {
         if let Some(p) = x.checked_mul(y) {
             prop_assert_eq!(prod, from_u128(p));
         }
-        if y != 0 {
+        if let Some(q) = x.checked_div(y) {
             let mut quo = a;
             quo.div(&b);
-            prop_assert_eq!(quo, from_u128(x / y));
+            prop_assert_eq!(quo, from_u128(q));
         }
         prop_assert_eq!(a.cmp(&b), x.cmp(&y));
         prop_assert_eq!(u32::from(a.bit_len()), 128 - x.leading_zeros());
