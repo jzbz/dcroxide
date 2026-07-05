@@ -86,6 +86,33 @@ pub fn is_header_commitments_agenda_active(
     is_agenda_active(view, prev_height, VOTE_ID_HEADER_COMMITMENTS, params)
 }
 
+/// Whether the LN features agenda is active for the block AFTER the
+/// given node (dcrd `isLNFeaturesAgendaActive`).
+pub fn is_ln_features_agenda_active(
+    view: &impl VoteChainView,
+    prev_height: Option<i64>,
+    params: &Params,
+) -> Result<bool, UnknownDeployment> {
+    is_agenda_active(view, prev_height, VOTE_ID_LN_FEATURES, params)
+}
+
+/// The maximum allowed block size for the block AFTER the given node,
+/// honoring the max block size vote where the network defines it
+/// (dcrd `maxBlockSize`).
+pub fn max_block_size(view: &impl VoteChainView, prev_height: Option<i64>, params: &Params) -> i64 {
+    // Networks without the deployment always use the first size.
+    const VOTE_ID_MAX_BLOCK_SIZE: &str = "maxblocksize";
+    let Some((version, deployment)) = find_deployment(params, VOTE_ID_MAX_BLOCK_SIZE) else {
+        return params.maximum_block_sizes[0] as i64;
+    };
+    let state =
+        crate::thresholdstate::deployment_state(view, prev_height, version, deployment, params);
+    if state.state == ThresholdState::Active {
+        return params.maximum_block_sizes[1] as i64;
+    }
+    params.maximum_block_sizes[0] as i64
+}
+
 /// The network does not define the requested deployment (dcrd
 /// `ErrUnknownDeploymentID`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

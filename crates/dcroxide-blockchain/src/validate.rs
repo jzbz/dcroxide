@@ -40,6 +40,12 @@ impl AgendaFlags {
     /// The automatic ticket revocations agenda is active (dcrd
     /// `AFAutoRevocationsEnabled`).
     pub const AUTO_REVOCATIONS_ENABLED: AgendaFlags = AgendaFlags(1 << 2);
+    /// The DCP0010 modified subsidy split agenda is active (dcrd
+    /// `AFSubsidySplitEnabled`).
+    pub const SUBSIDY_SPLIT_ENABLED: AgendaFlags = AgendaFlags(1 << 3);
+    /// The DCP0012 modified subsidy split agenda is active (dcrd
+    /// `AFSubsidySplitR2Enabled`).
+    pub const SUBSIDY_SPLIT_R2_ENABLED: AgendaFlags = AgendaFlags(1 << 4);
 
     fn has(self, flag: AgendaFlags) -> bool {
         self.0 & flag.0 != 0
@@ -61,6 +67,18 @@ impl AgendaFlags {
     /// `IsAutoRevocationsEnabled`).
     pub fn is_auto_revocations_enabled(self) -> bool {
         self.has(AgendaFlags::AUTO_REVOCATIONS_ENABLED)
+    }
+
+    /// Whether the DCP0010 subsidy split flag is set (dcrd
+    /// `IsSubsidySplitEnabled`).
+    pub fn is_subsidy_split_enabled(self) -> bool {
+        self.has(AgendaFlags::SUBSIDY_SPLIT_ENABLED)
+    }
+
+    /// Whether the DCP0012 subsidy split flag is set (dcrd
+    /// `IsSubsidySplitR2Enabled`).
+    pub fn is_subsidy_split_r2_enabled(self) -> bool {
+        self.has(AgendaFlags::SUBSIDY_SPLIT_R2_ENABLED)
     }
 
     /// Combine flag sets.
@@ -3185,6 +3203,485 @@ pub fn check_dup_txs(
                             entry.block_height()
                         ),
                     ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The maximum number of revocations per block (dcrd
+/// `maxRevocationsPerBlock`).
+const MAX_REVOCATIONS_PER_BLOCK: i64 = 255;
+
+/// The maximum number of treasury add transactions per block (dcrd
+/// `MaxTAddsPerBlock`).
+pub const MAX_TADDS_PER_BLOCK: i64 = 20;
+
+/// Determine the agenda flags to use when checking transactions for
+/// the block AFTER the given node (dcrd `determineCheckTxFlags`).
+pub fn determine_check_tx_flags(
+    view: &impl FullChainView,
+    prev_height: Option<i64>,
+    params: &Params,
+) -> Result<AgendaFlags, RuleError> {
+    let unknown = |_| {
+        rule_error(
+            RuleErrorKind::UnknownDeploymentID,
+            "deployment not defined on this network",
+        )
+    };
+    let treasury =
+        crate::agendas::is_treasury_agenda_active(view, prev_height, params).map_err(unknown)?;
+    let explicit = crate::agendas::is_agenda_active(
+        view,
+        prev_height,
+        crate::agendas::VOTE_ID_EXPLICIT_VERSION_UPGRADES,
+        params,
+    )
+    .map_err(unknown)?;
+    let auto_rev = crate::agendas::is_agenda_active(
+        view,
+        prev_height,
+        crate::agendas::VOTE_ID_AUTO_REVOCATIONS,
+        params,
+    )
+    .map_err(unknown)?;
+    let split = crate::agendas::is_agenda_active(
+        view,
+        prev_height,
+        crate::agendas::VOTE_ID_CHANGE_SUBSIDY_SPLIT,
+        params,
+    )
+    .map_err(unknown)?;
+    let split_r2 = crate::agendas::is_agenda_active(
+        view,
+        prev_height,
+        crate::agendas::VOTE_ID_CHANGE_SUBSIDY_SPLIT_R2,
+        params,
+    )
+    .map_err(unknown)?;
+
+    let mut flags = AgendaFlags::default();
+    if treasury {
+        flags = flags.with(AgendaFlags::TREASURY_ENABLED);
+    }
+    if explicit {
+        flags = flags.with(AgendaFlags::EXPLICIT_VER_UPGRADES);
+    }
+    if auto_rev {
+        flags = flags.with(AgendaFlags::AUTO_REVOCATIONS_ENABLED);
+    }
+    if split {
+        flags = flags.with(AgendaFlags::SUBSIDY_SPLIT_ENABLED);
+    }
+    if split_r2 {
+        flags = flags.with(AgendaFlags::SUBSIDY_SPLIT_R2_ENABLED);
+    }
+    Ok(flags)
+}
+
+/// Perform the validation checks on the block which depend on having
+/// the full block data for all of its ancestors available (dcrd
+/// `checkBlockContext`).  The parent stake node is required once the
+/// stake validation height is reached unless `fast_add` is set; dcrd's
+/// recent-context-checks cache is a pure optimization and is not
+/// reproduced.
+#[allow(clippy::too_many_arguments)]
+pub fn check_block_context(
+    view: &impl FullChainView,
+    block: &MsgBlock,
+    prev_height: Option<i64>,
+    fast_add: bool,
+    no_pow_check: bool,
+    parent_pool_size: u32,
+    parent_final_state: [u8; 6],
+    parent_stake_node: Option<&dcroxide_stake::ticketnode::Node>,
+    params: &Params,
+) -> Result<(), RuleError> {
+    // The genesis block is valid by definition.
+    let Some(prev_height) = prev_height else {
+        return Ok(());
+    };
+
+    let header = &block.header;
+
+    // Perform all block header related validation checks that depend
+    // on having the full block data for all of its ancestors.
+    check_block_header_context(
+        view,
+        header,
+        Some(prev_height),
+        fast_add,
+        no_pow_check,
+        parent_pool_size,
+        parent_final_state,
+        params,
+    )?;
+
+    let check_tx_flags = determine_check_tx_flags(view, Some(prev_height), params)?;
+    let is_treasury_enabled = check_tx_flags.is_treasury_enabled();
+    let is_auto_revocations_enabled = check_tx_flags.is_auto_revocations_enabled();
+
+    // The first transaction in a block must be a coinbase.
+    if !dcroxide_standalone::is_coin_base_tx(&block.transactions[0], is_treasury_enabled) {
+        return Err(rule_error(
+            RuleErrorKind::FirstTxNotCoinbase,
+            "first transaction in block is not a coinbase",
+        ));
+    }
+
+    // The coinbase (and the treasurybase under the treasury agenda)
+    // must commit to the block height.
+    let block_height = prev_height + 1;
+    check_coinbase_unique_height(block_height, block, is_treasury_enabled)?;
+    if is_treasury_enabled {
+        if block.stransactions.is_empty()
+            || !dcroxide_standalone::is_treasury_base(&block.stransactions[0])
+        {
+            return Err(rule_error(
+                RuleErrorKind::FirstTxNotTreasurybase,
+                "first transaction in stake tree is not a treasurybase",
+            ));
+        }
+        check_treasurybase_unique_height(block_height, block)?;
+    }
+
+    // Contextual per-transaction checks over the regular tree, plus
+    // the second-coinbase and misplaced-stake-transaction rules.
+    for (tx_idx, tx) in block.transactions.iter().enumerate() {
+        check_transaction_context(tx, params, check_tx_flags)?;
+        if tx_idx > 0 && dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled) {
+            return Err(rule_error(
+                RuleErrorKind::MultipleCoinbases,
+                format!("block contains second coinbase at index {tx_idx}"),
+            ));
+        }
+        if dcroxide_stake::determine_tx_type(tx) != dcroxide_stake::TxType::Regular {
+            return Err(rule_error(
+                RuleErrorKind::StakeTxInRegularTree,
+                format!(
+                    "block contains a stake transaction in the regular transaction \
+                     tree at index {tx_idx}"
+                ),
+            ));
+        }
+    }
+
+    // Contextual per-transaction checks over the stake tree plus the
+    // second-treasurybase rule.
+    for (tx_idx, stx) in block.stransactions.iter().enumerate() {
+        check_transaction_context(stx, params, check_tx_flags)?;
+        if tx_idx > 0 && is_treasury_enabled && dcroxide_standalone::is_treasury_base(stx) {
+            return Err(rule_error(
+                RuleErrorKind::MultipleTreasurybases,
+                format!("block contains second treasurybase at index {tx_idx}"),
+            ));
+        }
+    }
+
+    // Tally the stake transactions by type, enforcing the vote target
+    // block and collecting yes votes and treasury spends.
+    let stake_validation_height = params.stake_validation_height as u32;
+    let mut total_tickets: i64 = 0;
+    let mut total_votes: i64 = 0;
+    let mut total_revocations: i64 = 0;
+    let mut total_treasury_add: i64 = 0;
+    let mut total_treasury_spend: i64 = 0;
+    let mut total_treasurybase: i64 = 0;
+    let mut total_yes_votes: i64 = 0;
+    let mut treasury_spend_txns: Vec<&MsgTx> = Vec::new();
+    for (tx_idx, stx) in block.stransactions.iter().enumerate() {
+        let tx_type = dcroxide_stake::determine_tx_type(stx);
+        if tx_type == dcroxide_stake::TxType::Regular {
+            return Err(rule_error(
+                RuleErrorKind::RegTxInStakeTree,
+                format!(
+                    "block contains regular transaction in stake transaction tree at \
+                     index {tx_idx}"
+                ),
+            ));
+        }
+        match tx_type {
+            dcroxide_stake::TxType::SStx => total_tickets += 1,
+            dcroxide_stake::TxType::SSGen => {
+                total_votes += 1;
+                if header.height >= stake_validation_height {
+                    let (voted_hash, voted_height) = dcroxide_stake::ssgen_block_voted_on(stx);
+                    if voted_hash != header.prev_block || voted_height != header.height - 1 {
+                        return Err(rule_error(
+                            RuleErrorKind::VotesOnWrongBlock,
+                            format!(
+                                "vote {} at index {tx_idx} is for parent block \
+                                 {voted_hash} (height {voted_height}) versus expected \
+                                 parent block {} (height {})",
+                                stx.tx_hash(),
+                                header.prev_block,
+                                header.height - 1
+                            ),
+                        ));
+                    }
+                    if vote_bits_approve_parent(dcroxide_stake::ssgen_vote_bits(stx)) {
+                        total_yes_votes += 1;
+                    }
+                }
+            }
+            dcroxide_stake::TxType::SSRtx => total_revocations += 1,
+            _ => {}
+        }
+        if is_treasury_enabled {
+            match tx_type {
+                dcroxide_stake::TxType::TAdd => total_treasury_add += 1,
+                dcroxide_stake::TxType::TSpend => {
+                    total_treasury_spend += 1;
+                    treasury_spend_txns.push(stx);
+                }
+                dcroxide_stake::TxType::TreasuryBase => total_treasurybase += 1,
+                _ => {}
+            }
+        }
+    }
+
+    // The number of treasury adds is bounded.
+    if total_treasury_add > MAX_TADDS_PER_BLOCK {
+        return Err(rule_error(
+            RuleErrorKind::TooManyTAdds,
+            format!(
+                "block contains {total_treasury_add} treasury adds which exceeds the \
+                 maximum allowed amount of {MAX_TADDS_PER_BLOCK}"
+            ),
+        ));
+    }
+
+    // Every stake transaction must be accounted for by the tallies.
+    let num_stake_tx = block.stransactions.len() as i64;
+    let expected_num_stake_tx = total_tickets
+        + total_votes
+        + total_revocations
+        + total_treasury_add
+        + total_treasury_spend
+        + total_treasurybase;
+    if num_stake_tx != expected_num_stake_tx {
+        return Err(rule_error(
+            RuleErrorKind::NonstandardStakeTx,
+            format!(
+                "block contains an unexpected number of stake transactions (contains \
+                 {num_stake_tx}, expected {expected_num_stake_tx})"
+            ),
+        ));
+    }
+
+    // The header vote commitment must match, and once stake validation
+    // begins the header approval bit must agree with the vote tally.
+    if i64::from(header.voters) != total_votes {
+        return Err(rule_error(
+            RuleErrorKind::VotesMismatch,
+            format!(
+                "block header commitment to {} votes does not match {total_votes} \
+                 contained in the block",
+                header.voters
+            ),
+        ));
+    }
+    if header.height >= stake_validation_height {
+        let total_no_votes = total_votes - total_yes_votes;
+        let header_approves = header_approves_parent(header);
+        let votes_approve = total_yes_votes > total_no_votes;
+        if header_approves != votes_approve {
+            return Err(rule_error(
+                RuleErrorKind::IncongruentVotebit,
+                format!(
+                    "block header commitment to previous block approval does not match \
+                     votes (header claims: {header_approves}, votes: {votes_approve})"
+                ),
+            ));
+        }
+    }
+
+    // Only tickets, treasury adds, and treasurybases are allowed
+    // before stake validation begins.
+    if header.height < stake_validation_height {
+        let num_expected = total_tickets + total_treasury_add + total_treasurybase;
+        if num_stake_tx != num_expected {
+            return Err(rule_error(
+                RuleErrorKind::InvalidEarlyStakeTx,
+                format!(
+                    "block contains disallowed stake transactions before stake \
+                     validation height {stake_validation_height} (total: \
+                     {num_stake_tx}, expected {num_expected})"
+                ),
+            ));
+        }
+    }
+
+    // The number of revocations is bounded and must match the header
+    // commitment.
+    if total_revocations > MAX_REVOCATIONS_PER_BLOCK {
+        return Err(rule_error(
+            RuleErrorKind::TooManyRevocations,
+            format!(
+                "block contains {total_revocations} revocations which exceeds the \
+                 maximum allowed amount of {MAX_REVOCATIONS_PER_BLOCK}"
+            ),
+        ));
+    }
+    if i64::from(header.revocations) != total_revocations {
+        return Err(rule_error(
+            RuleErrorKind::RevocationsMismatch,
+            format!(
+                "block header commitment to {} revocations does not match \
+                 {total_revocations} contained in the block",
+                header.revocations
+            ),
+        ));
+    }
+
+    // The block must not contain too many signature operations by the
+    // quick counting method, checked cumulatively to avoid overflow.
+    let mut total_sig_ops: i64 = 0;
+    for tx in block.transactions.iter().chain(&block.stransactions) {
+        let last_sig_ops = total_sig_ops;
+        let is_coin_base = dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled);
+        let is_ssgen = dcroxide_stake::is_ssgen(tx);
+        total_sig_ops = total_sig_ops.wrapping_add(count_sig_ops(
+            tx,
+            is_coin_base,
+            is_ssgen,
+            is_treasury_enabled,
+        ));
+        if total_sig_ops < last_sig_ops || total_sig_ops > MAX_SIG_OPS_PER_BLOCK {
+            return Err(rule_error(
+                RuleErrorKind::TooManySigOps,
+                format!(
+                    "block contains too many signature operations - got \
+                     {total_sig_ops}, max {MAX_SIG_OPS_PER_BLOCK}"
+                ),
+            ));
+        }
+    }
+
+    if !fast_add {
+        // The header's claimed size must not exceed the agenda-driven
+        // maximum block size.
+        let max_block_size = crate::agendas::max_block_size(view, Some(prev_height), params);
+        let serialized_size = i64::from(header.size);
+        if serialized_size > max_block_size {
+            return Err(rule_error(
+                RuleErrorKind::BlockTooBig,
+                format!(
+                    "serialized block is too big - got {serialized_size}, max \
+                     {max_block_size}"
+                ),
+            ));
+        }
+
+        // The merkle root commitments must be valid.
+        check_merkle_roots(view, block, prev_height, params)?;
+
+        // All transactions must be finalized, relative to the past
+        // median time once the LN features agenda is active.
+        let mut block_time = i64::from(header.timestamp);
+        let ln_features_active =
+            crate::agendas::is_ln_features_agenda_active(view, Some(prev_height), params).map_err(
+                |_| {
+                    rule_error(
+                        RuleErrorKind::UnknownDeploymentID,
+                        "ln features deployment not defined on this network",
+                    )
+                },
+            )?;
+        if ln_features_active {
+            block_time = crate::stakever::calc_past_median_time(
+                &crate::sequencelock::AsVersionView(view),
+                prev_height,
+            );
+        }
+        for tx in &block.transactions {
+            if !is_finalized_transaction(tx, block_height, block_time) {
+                return Err(rule_error(
+                    RuleErrorKind::UnfinalizedTx,
+                    format!(
+                        "block contains unfinalized regular transaction {}",
+                        tx.tx_hash()
+                    ),
+                ));
+            }
+        }
+        for stx in &block.stransactions {
+            if !is_finalized_transaction(stx, block_height, block_time) {
+                return Err(rule_error(
+                    RuleErrorKind::UnfinalizedTx,
+                    format!(
+                        "block contains unfinalized stake transaction {}",
+                        stx.tx_hash()
+                    ),
+                ));
+            }
+        }
+
+        // Once stake validation begins, votes and revocations must
+        // redeem tickets per the parent's lottery.
+        if header.height >= stake_validation_height {
+            let parent_stake_node = parent_stake_node
+                .expect("parent stake node required at or above stake validation height");
+            let mut vote_ticket_hashes: Vec<Hash> = Vec::new();
+            let mut revocation_ticket_hashes: Vec<Hash> = Vec::new();
+            for stx in &block.stransactions {
+                if dcroxide_stake::is_ssgen(stx) {
+                    vote_ticket_hashes.push(stx.tx_in[1].previous_out_point.hash);
+                    continue;
+                }
+                if dcroxide_stake::is_ssrtx(stx) {
+                    revocation_ticket_hashes.push(stx.tx_in[0].previous_out_point.hash);
+                }
+            }
+            check_ticket_redeemers(
+                &vote_ticket_hashes,
+                &revocation_ticket_hashes,
+                parent_stake_node.winners(),
+                &parent_stake_node.expiring_next_block(),
+                |h| parent_stake_node.exists_missed_ticket(h),
+                is_auto_revocations_enabled,
+            )?;
+        }
+
+        // Treasury spends may only appear on treasury vote intervals
+        // and must allow a full voting window.
+        if is_treasury_enabled && block_height > 1 {
+            let tvi = params.treasury_vote_interval;
+            let is_tvi = dcroxide_standalone::is_treasury_vote_interval(block_height as u64, tvi);
+            if !is_tvi && !treasury_spend_txns.is_empty() {
+                let tx = treasury_spend_txns[0];
+                let cur_height = block_height as u64;
+                let next_tvi = cur_height + (tvi - (cur_height % tvi));
+                return Err(rule_error(
+                    RuleErrorKind::NotTVI,
+                    format!(
+                        "block contains treasury spend {} while not on a treasury vote \
+                         interval (block height: {block_height}, next TVI: {next_tvi})",
+                        tx.tx_hash()
+                    ),
+                ));
+            }
+            if is_tvi {
+                let min_required_expiry = 2
+                    + u64::from(stake_validation_height)
+                    + tvi * params.treasury_vote_interval_multiplier;
+                for tx in &treasury_spend_txns {
+                    if u64::from(tx.expiry) < min_required_expiry {
+                        return Err(rule_error(
+                            RuleErrorKind::InvalidTVoteWindow,
+                            format!(
+                                "block contains treasury spend transaction {} before a \
+                                 full voting window is possible (height: \
+                                 {block_height}, expiry: {}, min required expiry: \
+                                 {min_required_expiry})",
+                                tx.tx_hash(),
+                                tx.expiry
+                            ),
+                        ));
+                    }
                 }
             }
         }
