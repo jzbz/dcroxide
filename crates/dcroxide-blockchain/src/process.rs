@@ -8,16 +8,22 @@
 //! (`ProcessBlock` and the reorganization machinery it drives)
 //! arrives with the chain engine.
 
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_wire::BlockHeader;
 
+use dcroxide_stake::ticketdb::UndoTicketData;
+use dcroxide_stake::ticketnode::{Node as StakeNode, StakeNodeParams};
+use dcroxide_wire::MsgBlock;
+
 use crate::RuleError;
 use crate::blockindex::{BlockIndex, BlockStatus, NodeId, NodeStore};
-use crate::chainview_nodes::NodeBranchView;
+use crate::chainview_nodes::{NodeBranchView, NodeChainView};
 use crate::ruleerror::RuleErrorKind;
 use crate::validate::{ForkRejection, check_block_header_positional, check_block_header_sanity};
 
@@ -52,6 +58,31 @@ pub struct Chain {
     /// The expected number of blocks in two weeks, cached from the
     /// target block time.
     pub expected_blocks_in_two_weeks: i64,
+
+    /// The view of the current best chain.
+    pub best_chain: NodeChainView,
+    /// Full block data by block hash: the in-memory stand-in for
+    /// dcrd's database block storage and recent block cache until the
+    /// persistence wiring lands.
+    pub blocks: BTreeMap<[u8; 32], MsgBlock>,
+    /// Per-height ticket undo data for main chain blocks: the
+    /// in-memory stand-in for dcrd's ticket database undo rows
+    /// (written by `WriteConnectedBestNode`).
+    pub stake_undo: BTreeMap<i64, Vec<UndoTicketData>>,
+    /// Per-height maturing ticket hashes for main chain blocks: the
+    /// in-memory stand-in for dcrd's ticket database new tickets
+    /// rows.
+    pub stake_new_tickets: BTreeMap<i64, Vec<dcroxide_chainhash::Hash>>,
+}
+
+/// The stake node parameters for a network.
+pub fn stake_node_params(params: &Params) -> StakeNodeParams {
+    StakeNodeParams {
+        votes_per_block: params.tickets_per_block,
+        stake_validation_begin_height: params.stake_validation_height,
+        stake_enable_height: params.stake_enabled_height,
+        ticket_expiry_blocks: params.ticket_expiry,
+    }
 }
 
 impl Chain {
@@ -72,7 +103,15 @@ impl Chain {
         store.node_mut(genesis).status =
             BlockStatus(BlockStatus::DATA_STORED.0 | BlockStatus::VALIDATED.0);
         store.node_mut(genesis).is_fully_linked = true;
+        store.node_mut(genesis).stake_node = Some(StakeNode::genesis(stake_node_params(params)));
         index.add_node(&store, genesis);
+        let best_chain = NodeChainView::new(&store, Some(genesis));
+
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            params.genesis_block.header.block_hash().0,
+            params.genesis_block.clone(),
+        );
 
         Chain {
             store,
@@ -82,7 +121,213 @@ impl Chain {
             reject_forks_checkpoint: None,
             allow_old_forks,
             expected_blocks_in_two_weeks,
+            best_chain,
+            blocks,
+            stake_undo: BTreeMap::new(),
+            stake_new_tickets: BTreeMap::new(),
         }
+    }
+
+    /// The full block data for a node.  The data must have been
+    /// stored previously; callers only request blocks whose data
+    /// availability is tracked by the block index (dcrd
+    /// `fetchBlockByNode` over its database and recent block cache).
+    pub fn block_by_node(&self, node: NodeId) -> &MsgBlock {
+        self.blocks
+            .get(&self.store.node(node).hash.0)
+            .expect("block data for node is stored")
+    }
+
+    /// Load the list of newly maturing tickets for a node by looking
+    /// back to the block containing the tickets to mature (dcrd
+    /// `maybeFetchNewTickets`).  `None` means never looked up while
+    /// an empty list means no tickets mature at this node.
+    pub fn maybe_fetch_new_tickets(&mut self, node: NodeId, params: &Params) {
+        if self.store.node(node).new_tickets.is_some() {
+            return;
+        }
+
+        // No tickets in the live ticket pool are possible before
+        // stake enabled height.
+        if self.store.node(node).height < params.stake_enabled_height {
+            self.store.node_mut(node).new_tickets = Some(Vec::new());
+            return;
+        }
+
+        let mature_node = self
+            .store
+            .relative_ancestor(node, i64::from(params.ticket_maturity))
+            .expect("ancestor at the ticket maturity distance");
+        let mature_block = self.block_by_node(mature_node);
+        let tickets: Vec<dcroxide_chainhash::Hash> = mature_block
+            .stransactions
+            .iter()
+            .filter(|stx| dcroxide_stake::is_sstx(stx))
+            .map(|stx| stx.tx_hash())
+            .collect();
+        self.store.node_mut(node).new_tickets = Some(tickets);
+    }
+
+    /// Load and populate the prunable ticket information in the node
+    /// if needed (dcrd `maybeFetchTicketInfo`).
+    pub fn maybe_fetch_ticket_info(&mut self, node: NodeId, params: &Params) {
+        self.maybe_fetch_new_tickets(node, params);
+
+        if !self.store.node(node).ticket_info_populated {
+            let block = self
+                .blocks
+                .get(&self.store.node(node).hash.0)
+                .expect("block data for node is stored");
+            let info = dcroxide_stake::find_spent_tickets_in_block(block);
+            let votes = info.votes.iter().map(|v| (v.version, v.bits)).collect();
+            self.store
+                .populate_ticket_info(node, info.voted_tickets, info.revoked_tickets, votes);
+        }
+    }
+
+    /// Record the in-memory ticket database rows for a main chain
+    /// node whose stake node is loaded: the undo data and maturing
+    /// tickets by height (the row content of dcrd
+    /// `stake.WriteConnectedBestNode`; the database-backed rows
+    /// arrive with the persistence wiring).
+    pub fn write_stake_db_rows(&mut self, node: NodeId) {
+        let n = self.store.node(node);
+        let stake_node = n.stake_node.as_ref().expect("stake node loaded");
+        self.stake_undo
+            .insert(n.height, stake_node.undo_data().to_vec());
+        self.stake_new_tickets
+            .insert(n.height, stake_node.new_tickets().to_vec());
+    }
+
+    /// The stake node for the requested node, creating it if needed:
+    /// a cached node is returned directly, a node whose parent stake
+    /// node is loaded is connected forward, and anything else is
+    /// reached by disconnecting from the current best chain tip back
+    /// to the fork point (regenerating pruned nodes from the ticket
+    /// undo rows) and replaying any side chain blocks up to the
+    /// requested node (dcrd `fetchStakeNode`).
+    pub fn fetch_stake_node(
+        &mut self,
+        node: NodeId,
+        params: &Params,
+    ) -> Result<StakeNode, dcroxide_stake::RuleError> {
+        // Return the cached immutable stake node when it is already
+        // loaded.
+        if let Some(stake_node) = &self.store.node(node).stake_node {
+            return Ok(stake_node.clone());
+        }
+
+        // Create the requested stake node from the parent stake node
+        // when it is already loaded as an optimization.
+        if let Some(parent) = self.store.node(node).parent {
+            if self.store.node(parent).stake_node.is_some() {
+                self.maybe_fetch_ticket_info(node, params);
+                let n = self.store.node(node);
+                let voted = n.tickets_voted.clone();
+                let revoked = n.tickets_revoked.clone();
+                let new_tickets = n.new_tickets.clone().expect("new tickets loaded");
+                let iv = self.store.lottery_iv(node);
+                let parent_stake_node =
+                    self.store.node(parent).stake_node.as_ref().expect("loaded");
+                let stake_node = parent_stake_node.connect(iv, &voted, &revoked, &new_tickets)?;
+                self.store.node_mut(node).stake_node = Some(stake_node.clone());
+                return Ok(stake_node);
+            }
+        }
+
+        // Undo the effects from the current tip back to, and
+        // including, the fork point, regenerating and populating any
+        // stake nodes along the way that are not already loaded.
+        let tip = self.best_chain.tip().expect("best chain tip");
+        let fork = self.best_chain.find_fork(&self.store, node);
+        let mut cur = Some(tip);
+        while let Some(n) = cur {
+            if Some(n) == fork {
+                break;
+            }
+            let prev = self.store.node(n).parent;
+            let Some(prev_id) = prev else {
+                break;
+            };
+            if self.store.node(prev_id).stake_node.is_none() {
+                // Generate the previous stake node by starting with
+                // the child stake node and undoing the modifications
+                // caused by the stake details in the previous block,
+                // restoring the previous node's own bookkeeping from
+                // the ticket database rows like dcrd does.
+                let prev_height = self.store.node(prev_id).height;
+                let utds = self
+                    .stake_undo
+                    .get(&prev_height)
+                    .expect("ticket undo row for main chain height")
+                    .clone();
+                let tickets = self
+                    .stake_new_tickets
+                    .get(&prev_height)
+                    .expect("ticket row for main chain height")
+                    .clone();
+                let prev_iv = self.store.lottery_iv(prev_id);
+                let stake_node = self
+                    .store
+                    .node(n)
+                    .stake_node
+                    .as_ref()
+                    .expect("stake node along the walk is loaded")
+                    .disconnect(prev_iv, &utds, &tickets)?;
+                self.store.node_mut(prev_id).stake_node = Some(stake_node);
+            }
+            cur = prev;
+        }
+
+        // Nothing more to do if the requested node is the fork point
+        // itself.
+        if fork == Some(node) {
+            return Ok(self
+                .store
+                .node(node)
+                .stake_node
+                .clone()
+                .expect("fork stake node loaded"));
+        }
+
+        // The requested node is on a side chain, so replay the
+        // effects of the blocks up to the requested node.
+        let mut attach_nodes = Vec::new();
+        let mut n = Some(node);
+        while let Some(id) = n {
+            if Some(id) == fork {
+                break;
+            }
+            attach_nodes.push(id);
+            n = self.store.node(id).parent;
+        }
+        for &id in attach_nodes.iter().rev() {
+            if self.store.node(id).stake_node.is_some() {
+                continue;
+            }
+            self.maybe_fetch_ticket_info(id, params);
+            let nd = self.store.node(id);
+            let voted = nd.tickets_voted.clone();
+            let revoked = nd.tickets_revoked.clone();
+            let new_tickets = nd.new_tickets.clone().expect("new tickets loaded");
+            let parent = nd.parent.expect("side chain node has a parent");
+            let iv = self.store.lottery_iv(id);
+            let parent_stake_node = self
+                .store
+                .node(parent)
+                .stake_node
+                .as_ref()
+                .expect("parent stake node loaded along the attach path");
+            let stake_node = parent_stake_node.connect(iv, &voted, &revoked, &new_tickets)?;
+            self.store.node_mut(id).stake_node = Some(stake_node);
+        }
+
+        Ok(self
+            .store
+            .node(node)
+            .stake_node
+            .clone()
+            .expect("requested stake node loaded"))
     }
 
     /// The error for a block already known to be invalid, either

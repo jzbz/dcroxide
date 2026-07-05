@@ -113,6 +113,17 @@ pub fn fetch_winners(idxs: &[usize], t: &Immutable) -> Result<Vec<Key>, RuleErro
     Ok(winners)
 }
 
+impl core::fmt::Debug for Node {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Node")
+            .field("height", &self.height)
+            .field("live", &self.live_tickets.len())
+            .field("missed", &self.missed_tickets.len())
+            .field("revoked", &self.revoked_tickets.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Node {
     /// The genesis stake node (dcrd `genesisNode`).
     pub fn genesis(params: StakeNodeParams) -> Node {

@@ -84,8 +84,7 @@ pub struct NodeId(usize);
 
 /// A block within the block tree (dcrd `blockNode`), holding the
 /// header fields needed for chain selection and header
-/// reconstruction.  The ticket-database-backed `stakeNode` and the
-/// `newTickets` cache arrive with the ticket database.
+/// reconstruction.
 #[derive(Clone, Debug)]
 pub struct BlockNode {
     /// The parent node, if any.
@@ -150,6 +149,20 @@ pub struct BlockNode {
     /// The order block data was received, to prevent gaining chain
     /// selection priority by submitting headers first.
     pub received_order_id: u32,
+
+    /// The immutable ticket pool state as of this block, when loaded
+    /// (dcrd `stakeNode`; pruned nodes drop it and it is regenerated
+    /// on demand).
+    pub stake_node: Option<dcroxide_stake::ticketnode::Node>,
+    /// The tickets maturing in this block, when loaded (dcrd
+    /// `newTickets`; `None` means never looked up while an empty list
+    /// means no tickets mature here).
+    pub new_tickets: Option<Vec<Hash>>,
+    /// Whether the prunable vote and revocation info has been
+    /// populated.  dcrd tracks this through the nil-ness of the
+    /// ticket info slices; a flag is equivalent since they are always
+    /// populated together and repopulation is idempotent.
+    pub ticket_info_populated: bool,
 }
 
 /// Clear the lowest set bit in the passed value (dcrd
@@ -247,6 +260,9 @@ impl NodeStore {
             tickets_revoked: Vec::new(),
             votes: Vec::new(),
             received_order_id: 0,
+            stake_node: None,
+            new_tickets: None,
+            ticket_info_populated: false,
         };
         if let Some(parent_id) = parent {
             node.parent = Some(parent_id);
@@ -308,6 +324,7 @@ impl NodeStore {
         node.tickets_voted = voted;
         node.tickets_revoked = revoked;
         node.votes = votes;
+        node.ticket_info_populated = true;
     }
 
     /// The ancestor node at the provided height, following the chain
