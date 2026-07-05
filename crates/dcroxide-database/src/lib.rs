@@ -32,6 +32,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 mod blockfile;
+pub mod bootstrap;
 mod error;
 mod transaction;
 
@@ -40,6 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use blockfile::{BlockStore, deserialize_write_row, serialize_write_row};
+pub use bootstrap::ImportStats;
 pub use error::{Error, ErrorKind};
 use transaction::{
     BLOCK_IDX_BUCKET_ID, BLOCK_IDX_BUCKET_NAME, BUCKET_INDEX_PREFIX, CUR_BUCKET_ID_KEY, KvTxSeed,

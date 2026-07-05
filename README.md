@@ -77,7 +77,8 @@ Currently implemented:
 - `dcroxide-database` — block and metadata storage with dcrd's
   `database` interface semantics (buckets, transactions, block storage
   APIs, all error kinds), backed by redb per ADR-0004 with dcrd's exact
-  ffldb key layout and flat-file block record format; pinned by the
+  ffldb key layout and flat-file block record format, plus bulk block
+  import/export in dcrd's `addblock` bootstrap format; pinned by the
   ported ffldb interface-test battery and a crash-consistency rig
   (fresh-sync stance: no in-place dcrd datadir reuse)
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
