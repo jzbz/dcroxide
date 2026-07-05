@@ -83,8 +83,10 @@ Currently implemented:
   (fresh-sync stance: no in-place dcrd datadir reuse)
 - `dcroxide-blockchain` — the beginnings of the chain engine: dcrd's
   UTXO serialization layer (VLQs, the domain-specific script and amount
-  compression, UTXO entries, outpoint keys, and the set state), pinned
-  by dcrd's own test vectors extracted from its internal package
+  compression, UTXO entries, outpoint keys, and the set state) and the
+  legacy work/stake difficulty algorithms, pinned by dcrd's own test
+  vectors and by synthetic-chain scenarios generated inside dcrd's
+  internal package
 - `dcroxide-gcs` — Golomb-coded set filters (versions 1 and 2) and the
   DCP0005 version 2 block committed filters for light clients, matched
   differentially against dcrd over random filters and structured blocks

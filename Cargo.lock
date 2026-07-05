@@ -197,11 +197,14 @@ dependencies = [
 name = "dcroxide-blockchain"
 version = "0.1.0"
 dependencies = [
+ "dcroxide-chaincfg",
  "dcroxide-chainhash",
  "dcroxide-dcrec",
  "dcroxide-stake",
+ "dcroxide-standalone",
  "dcroxide-testutil",
  "dcroxide-wire",
+ "num-bigint",
 ]
 
 [[package]]
