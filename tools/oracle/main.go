@@ -97,6 +97,12 @@
 //	stake_create_revocation → CreateRevocationFromTicket; see the handler
 //	                     for the field layout; {"result": "<hex tx>"} or
 //	                     {"error": ..., "kind": "Err..."}
+//	gcs_filter         → build a v1/v2 GCS filter from entries and check
+//	                     match verdicts; see the handler for the layout;
+//	                     {"result": "<hex dump>"} or {"error", "kind"}
+//	gcs_blockcf2       → build the DCP0005 v2 block filter for a block
+//	                     given its previous scripts; see the handler for
+//	                     the layout; {"result": "<hex dump>"}
 //	standalone_merkle  → data is leaf_index(4 BE) || n(4 BE) || n*32-byte
 //	                     leaves; {"result": "<hex dump>"} of the merkle
 //	                     root, inclusion proof, and verification result
@@ -157,6 +163,8 @@ import (
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/schnorr"
 	"github.com/decred/dcrd/dcrutil/v4"
+	"github.com/decred/dcrd/gcs/v4"
+	"github.com/decred/dcrd/gcs/v4/blockcf2"
 	"github.com/decred/dcrd/math/uint256"
 	"github.com/decred/dcrd/txscript/v4"
 	"github.com/decred/dcrd/txscript/v4/sign"
@@ -984,6 +992,149 @@ func handle(req request) response {
 		}
 		return response{Result: hex.EncodeToString(buf.Bytes())}
 
+	case "gcs_filter":
+		// data: version(1) || b(1) || m(8 BE) || key(16) ||
+		//       n_entries(4 BE) || n * (len(2 BE) || entry) ||
+		//       n_match(4 BE) || n * (len(2 BE) || entry)
+		// Dumps the serialized filter, N, hash, per-entry Match
+		// verdicts, and the MatchAny verdict.
+		if len(data) < 30 {
+			return errResp("gcs_filter: truncated request")
+		}
+		version := data[0]
+		bParam := data[1]
+		m := binary.BigEndian.Uint64(data[2:10])
+		var key [gcs.KeySize]byte
+		copy(key[:], data[10:26])
+		rest := data[26:]
+		readEntries := func() ([][]byte, bool) {
+			if len(rest) < 4 {
+				return nil, false
+			}
+			n := int(binary.BigEndian.Uint32(rest[0:4]))
+			rest = rest[4:]
+			entries := make([][]byte, 0, n)
+			for i := 0; i < n; i++ {
+				if len(rest) < 2 {
+					return nil, false
+				}
+				entryLen := int(binary.BigEndian.Uint16(rest[0:2]))
+				rest = rest[2:]
+				if len(rest) < entryLen {
+					return nil, false
+				}
+				entries = append(entries, rest[:entryLen])
+				rest = rest[entryLen:]
+			}
+			return entries, true
+		}
+		entries, ok := readEntries()
+		if !ok {
+			return errResp("gcs_filter: truncated entries")
+		}
+		matchEntries, ok := readEntries()
+		if !ok {
+			return errResp("gcs_filter: truncated match entries")
+		}
+
+		var filterBytes []byte
+		var filterN uint32
+		var filterHash chainhash.Hash
+		matchFn := func([]byte) bool { return false }
+		matchAnyFn := func([][]byte) bool { return false }
+		switch version {
+		case 1:
+			f, err := gcs.NewFilterV1(bParam, key, entries)
+			if err != nil {
+				resp := response{Error: err.Error()}
+				var kindErr gcs.ErrorKind
+				if errors.As(err, &kindErr) {
+					resp.Kind = kindErr.Error()
+				}
+				return resp
+			}
+			filterBytes, filterN, filterHash = f.Bytes(), f.N(), f.Hash()
+			matchFn = func(d []byte) bool { return f.Match(key, d) }
+			matchAnyFn = func(d [][]byte) bool { return f.MatchAny(key, d) }
+		case 2:
+			f, err := gcs.NewFilterV2(bParam, m, key, entries)
+			if err != nil {
+				resp := response{Error: err.Error()}
+				var kindErr gcs.ErrorKind
+				if errors.As(err, &kindErr) {
+					resp.Kind = kindErr.Error()
+				}
+				return resp
+			}
+			filterBytes, filterN, filterHash = f.Bytes(), f.N(), f.Hash()
+			matchFn = func(d []byte) bool { return f.Match(key, d) }
+			matchAnyFn = func(d [][]byte) bool { return f.MatchAny(key, d) }
+		default:
+			return errResp("gcs_filter: bad version %d", version)
+		}
+
+		var w strings.Builder
+		fmt.Fprintf(&w, "bytes=%x\n", filterBytes)
+		fmt.Fprintf(&w, "n=%d\n", filterN)
+		fmt.Fprintf(&w, "hash=%s\n", filterHash)
+		for _, entry := range matchEntries {
+			fmt.Fprintf(&w, "match=%t\n", matchFn(entry))
+		}
+		fmt.Fprintf(&w, "matchany=%t\n", matchAnyFn(matchEntries))
+		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
+	case "gcs_blockcf2":
+		// data: n_prev(2 BE) || n * (hash(32) || index(4 BE) || tree(1)
+		//       || script_ver(2 BE) || script_len(2 BE) || script) ||
+		//       serialized block.  Dumps the filter key, bytes, N, and
+		//       hash, or the error.
+		if len(data) < 2 {
+			return errResp("gcs_blockcf2: truncated request")
+		}
+		nPrev := int(binary.BigEndian.Uint16(data[0:2]))
+		rest := data[2:]
+		type prevScript struct {
+			version uint16
+			script  []byte
+		}
+		prevs := make(map[wire.OutPoint]prevScript, nPrev)
+		for i := 0; i < nPrev; i++ {
+			if len(rest) < 41 {
+				return errResp("gcs_blockcf2: truncated prev script")
+			}
+			var op wire.OutPoint
+			copy(op.Hash[:], rest[0:32])
+			op.Index = binary.BigEndian.Uint32(rest[32:36])
+			op.Tree = int8(rest[36])
+			ver := binary.BigEndian.Uint16(rest[37:39])
+			scriptLen := int(binary.BigEndian.Uint16(rest[39:41]))
+			rest = rest[41:]
+			if len(rest) < scriptLen {
+				return errResp("gcs_blockcf2: truncated prev script data")
+			}
+			prevs[op] = prevScript{version: ver, script: rest[:scriptLen]}
+			rest = rest[scriptLen:]
+		}
+		var block wire.MsgBlock
+		if err := block.Deserialize(bytes.NewReader(rest)); err != nil {
+			return errResp("gcs_blockcf2: bad block: %v", err)
+		}
+
+		f, err := blockcf2.Regular(&block, prevScripterFunc(func(op *wire.OutPoint) (uint16, []byte, bool) {
+			ps, ok := prevs[*op]
+			return ps.version, ps.script, ok
+		}))
+		if err != nil {
+			return response{Error: err.Error(), Kind: "PrevScriptError"}
+		}
+		filterKey := blockcf2.Key(&block.Header.MerkleRoot)
+		var w strings.Builder
+		fmt.Fprintf(&w, "key=%x\n", filterKey[:])
+		fmt.Fprintf(&w, "bytes=%x\n", f.Bytes())
+		fmt.Fprintf(&w, "n=%d\n", f.N())
+		fmt.Fprintf(&w, "hash=%s\n", f.Hash())
+		return response{Result: hex.EncodeToString([]byte(w.String()))}
+
 	case "standalone_merkle":
 		// data: leaf_index(4 BE) || n_leaves(4 BE) || n*32-byte leaves.
 		// Dumps the merkle root, the inclusion proof for leaf_index, and
@@ -1198,6 +1349,14 @@ func handle(req request) response {
 	default:
 		return errResp("unknown cmd: %s", req.Cmd)
 	}
+}
+
+// prevScripterFunc adapts a function to the blockcf2.PrevScripter
+// interface.
+type prevScripterFunc func(*wire.OutPoint) (uint16, []byte, bool)
+
+func (f prevScripterFunc) PrevScript(op *wire.OutPoint) (uint16, []byte, bool) {
+	return f(op)
 }
 
 // standaloneErrKind renders "ok" or the standalone ErrorKind name for a

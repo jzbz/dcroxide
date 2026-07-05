@@ -85,6 +85,10 @@ Currently implemented:
   UTXO serialization layer (VLQs, the domain-specific script and amount
   compression, UTXO entries, outpoint keys, and the set state), pinned
   by dcrd's own test vectors extracted from its internal package
+- `dcroxide-gcs` — Golomb-coded set filters (versions 1 and 2) and the
+  DCP0005 version 2 block committed filters for light clients, matched
+  differentially against dcrd over random filters and structured blocks
+  with real stake transactions
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
 

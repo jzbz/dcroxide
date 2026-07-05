@@ -1,0 +1,23 @@
+[package]
+name = "dcroxide-gcs"
+description = "Golomb-coded set filters mirroring dcrd's gcs package, including the DCP0005 version 2 block committed filters"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-stake = { path = "../dcroxide-stake" }
+dcroxide-txscript = { path = "../dcroxide-txscript" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+siphasher = { version = "1", default-features = false }
+
+[dev-dependencies]
+dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true
