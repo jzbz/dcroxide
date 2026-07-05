@@ -409,3 +409,232 @@ pub fn check_proof_of_work_sanity(
     }
     result.map_err(standalone_to_chain_rule_error)
 }
+
+/// The maximum number of seconds a block time is allowed to be ahead
+/// of the current time (dcrd `MaxTimeOffsetSeconds`).
+pub const MAX_TIME_OFFSET_SECONDS: i64 = 2 * 60 * 60;
+
+/// The expected vote bits before stake validation height (dcrd
+/// `earlyVoteBitsValue`).
+const EARLY_VOTE_BITS_VALUE: u16 = 0x0001;
+
+/// The expected final state before stake validation height (dcrd
+/// `earlyFinalState`).
+const EARLY_FINAL_STATE: [u8; 6] = [0; 6];
+
+/// Perform context-free sanity checks on a block header (dcrd
+/// `checkBlockHeaderSanity`).  The adjusted time replaces dcrd's
+/// `MedianTimeSource`; the sub-second timestamp precision check is
+/// omitted because the wire timestamp is whole seconds by type.
+pub fn check_block_header_sanity(
+    header: &dcroxide_wire::BlockHeader,
+    adjusted_time_unix: i64,
+    skip_pow_check: bool,
+    params: &Params,
+) -> Result<(), RuleError> {
+    let stake_validation_height = params.stake_validation_height as u32;
+    let stake_enabled_height = params.stake_enabled_height as u32;
+    assert!(
+        stake_enabled_height <= stake_validation_height,
+        "checkBlockHeaderSanity called with stake enabled height after stake \
+         validation height"
+    );
+
+    // Ensure the proof of work bits in the block header is in min/max
+    // range and the block hash is less than the target value described
+    // by the bits.
+    let pow_limit = BigInt::from_bytes_be(
+        dcroxide_standalone::Sign::Plus,
+        &params.pow_limit.to_be_bytes(),
+    );
+    check_proof_of_work_sanity(header, &pow_limit, skip_pow_check)?;
+
+    // Ensure the block time is not too far in the future.
+    let max_timestamp = adjusted_time_unix + MAX_TIME_OFFSET_SECONDS;
+    if i64::from(header.timestamp) > max_timestamp {
+        return Err(rule_error(
+            RuleErrorKind::TimeTooNew,
+            format!(
+                "block timestamp of {} is too far in the future",
+                header.timestamp
+            ),
+        ));
+    }
+
+    // Check that the node is submitting the expected header commitments
+    // for the stake data before stake validation height.
+    if header.height < stake_validation_height {
+        if header.voters > 0 {
+            return Err(rule_error(
+                RuleErrorKind::InvalidEarlyStakeTx,
+                format!(
+                    "block at height {} commits to {} votes before stake validation \
+                     height {stake_validation_height}",
+                    header.height, header.voters
+                ),
+            ));
+        }
+        if header.revocations > 0 {
+            return Err(rule_error(
+                RuleErrorKind::InvalidEarlyStakeTx,
+                format!(
+                    "block at height {} commits to {} revocations before stake \
+                     validation height {stake_validation_height}",
+                    header.height, header.revocations
+                ),
+            ));
+        }
+        if header.vote_bits != EARLY_VOTE_BITS_VALUE {
+            return Err(rule_error(
+                RuleErrorKind::InvalidEarlyVoteBits,
+                format!(
+                    "block at height {} commits to invalid vote bits before stake \
+                     validation height {stake_validation_height} (expected {:x}, got {:x})",
+                    header.height, EARLY_VOTE_BITS_VALUE, header.vote_bits
+                ),
+            ));
+        }
+        if header.final_state != EARLY_FINAL_STATE {
+            return Err(rule_error(
+                RuleErrorKind::InvalidEarlyFinalState,
+                format!(
+                    "block at height {} commits to invalid final state before stake \
+                     validation height {stake_validation_height}",
+                    header.height
+                ),
+            ));
+        }
+    }
+
+    // A block must not contain fewer votes than the minimum required
+    // to reach majority once stake validation height has been reached.
+    if header.height >= stake_validation_height {
+        let majority = (params.tickets_per_block / 2) + 1;
+        if header.voters < majority {
+            return Err(rule_error(
+                RuleErrorKind::NotEnoughVotes,
+                format!(
+                    "block does not commit to enough votes (min: {majority}, got {})",
+                    header.voters
+                ),
+            ));
+        }
+    }
+
+    // The block header must not claim to contain more votes than the
+    // maximum allowed.
+    if header.voters > params.tickets_per_block {
+        return Err(rule_error(
+            RuleErrorKind::TooManyVotes,
+            format!(
+                "block commits to too many votes (max: {}, got {})",
+                params.tickets_per_block, header.voters
+            ),
+        ));
+    }
+
+    // A block must not contain more ticket purchases than the maximum
+    // allowed.
+    if header.fresh_stake > params.max_fresh_stake_per_block {
+        return Err(rule_error(
+            RuleErrorKind::TooManySStxs,
+            format!(
+                "block commits to too many ticket purchases (max: {}, got {})",
+                params.max_fresh_stake_per_block, header.fresh_stake
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Perform context-free sanity checks on a block and all of its
+/// transactions (dcrd `checkBlockSanity`/`CheckBlockSanity`).
+pub fn check_block_sanity(
+    block: &MsgBlock,
+    adjusted_time_unix: i64,
+    skip_pow_check: bool,
+    params: &Params,
+) -> Result<(), RuleError> {
+    let header = &block.header;
+    check_block_header_sanity(header, adjusted_time_unix, skip_pow_check, params)?;
+
+    // All ticket purchases via the stake tree must meet both the
+    // stake difficulty committed by the header and the network
+    // minimum.
+    check_proof_of_stake(block, params.minimum_stake_diff)?;
+
+    // A block must have at least one regular transaction.
+    if block.transactions.is_empty() {
+        return Err(rule_error(
+            RuleErrorKind::NoTransactions,
+            "block does not contain any transactions",
+        ));
+    }
+
+    // A block must not exceed the maximum allowed block payload when
+    // serialized, and the header commitment to its size must match.
+    let serialized_size = block.serialize().len();
+    if serialized_size > dcroxide_wire::MAX_BLOCK_PAYLOAD as usize {
+        return Err(rule_error(
+            RuleErrorKind::BlockTooBig,
+            format!(
+                "serialized block is too big - got {serialized_size}, max {}",
+                dcroxide_wire::MAX_BLOCK_PAYLOAD
+            ),
+        ));
+    }
+    if header.size != serialized_size as u32 {
+        return Err(rule_error(
+            RuleErrorKind::WrongBlockSize,
+            format!(
+                "serialized block is not size indicated in header - got {}, \
+                 expected {serialized_size}",
+                header.size
+            ),
+        ));
+    }
+
+    // Perform preliminary sanity checks on each transaction.
+    let max_tx_size = params.max_tx_size as u64;
+    for tx in &block.transactions {
+        dcroxide_standalone::check_transaction_sanity(tx, max_tx_size)
+            .map_err(standalone_to_chain_rule_error)?;
+    }
+    let mut total_tickets: i64 = 0;
+    for stx in &block.stransactions {
+        dcroxide_standalone::check_transaction_sanity(stx, max_tx_size)
+            .map_err(standalone_to_chain_rule_error)?;
+        if dcroxide_stake::is_sstx(stx) {
+            total_tickets += 1;
+        }
+    }
+
+    // The number of tickets in the block must match the header
+    // commitment.
+    if i64::from(header.fresh_stake) != total_tickets {
+        return Err(rule_error(
+            RuleErrorKind::FreshStakeMismatch,
+            format!(
+                "block header commitment to {} ticket purchases does not match \
+                 {total_tickets} contained in the block",
+                header.fresh_stake
+            ),
+        ));
+    }
+
+    // Check for duplicate transactions.
+    let mut existing_tx_hashes: alloc::collections::BTreeSet<[u8; 32]> =
+        alloc::collections::BTreeSet::new();
+    for tx in block.transactions.iter().chain(&block.stransactions) {
+        let hash = tx.tx_hash();
+        if !existing_tx_hashes.insert(hash.0) {
+            return Err(rule_error(
+                RuleErrorKind::DuplicateTx,
+                format!("block contains duplicate transaction {hash}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
