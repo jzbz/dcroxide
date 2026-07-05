@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-database = { path = "../dcroxide-database" }
 dcroxide-gcs = { path = "../dcroxide-gcs" }
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-dcrec = { path = "../dcroxide-dcrec" }
@@ -21,6 +22,7 @@ dcroxide-wire = { path = "../dcroxide-wire" }
 num-bigint = { version = "0.4", default-features = false }
 
 [dev-dependencies]
+tempfile = "3"
 dcroxide-testutil = { path = "../dcroxide-testutil" }
 
 [lints]

@@ -424,6 +424,8 @@ pub struct BlockIndex {
 
     best_header: Option<NodeId>,
     best_invalid: Option<NodeId>,
+    /// Nodes with unflushed changes (dcrd `modified`).
+    modified: alloc::collections::BTreeSet<NodeId>,
     best_chain_candidates: BTreeSet<NodeId>,
     unlinked_children_of: BTreeMap<NodeId, Vec<NodeId>>,
     next_received_order_id: u32,
@@ -449,6 +451,7 @@ impl BlockIndex {
             total_tips: 0,
             best_header: None,
             best_invalid: None,
+            modified: alloc::collections::BTreeSet::new(),
             best_chain_candidates: BTreeSet::new(),
             unlinked_children_of: BTreeMap::new(),
             next_received_order_id: 1,
@@ -467,6 +470,7 @@ impl BlockIndex {
     /// Add the provided node to the index (dcrd `addNode`/`AddNode`).
     /// Duplicate entries are not checked.
     pub fn add_node(&mut self, store: &NodeStore, node: NodeId) {
+        self.modified.insert(node);
         let (hash, height, parent, invalid) = {
             let n = store.node(node);
             (n.hash, n.height, n.parent, n.status.known_invalid())
@@ -625,11 +629,13 @@ impl BlockIndex {
 
     /// Set the provided status flags (dcrd `SetStatusFlags`).
     pub fn set_status_flags(&mut self, store: &mut NodeStore, node: NodeId, flags: BlockStatus) {
+        self.modified.insert(node);
         store.node_mut(node).status.0 |= flags.0;
     }
 
     /// Unset the provided status flags (dcrd `UnsetStatusFlags`).
     pub fn unset_status_flags(&mut self, store: &mut NodeStore, node: NodeId, flags: BlockStatus) {
+        self.modified.insert(node);
         store.node_mut(node).status.0 &= !flags.0;
     }
 
@@ -699,6 +705,14 @@ impl BlockIndex {
             }
             n = store.node(cur).parent;
         }
+    }
+
+    /// Drain the set of nodes with unflushed changes (used by the
+    /// block index flush).
+    pub fn take_modified(&mut self) -> alloc::vec::Vec<NodeId> {
+        let modified: alloc::vec::Vec<NodeId> = self.modified.iter().copied().collect();
+        self.modified.clear();
+        modified
     }
 
     /// The header with the most cumulative work not known to be

@@ -111,6 +111,8 @@ pub struct Chain {
     pub is_current_latch: bool,
     /// The minimum known cumulative chain work from the parameters.
     pub min_known_work: Option<Uint256>,
+    /// The backing database when the chain is persistent.
+    pub db: Option<dcroxide_database::Database>,
 }
 
 /// Information about the current best chain block and related state
@@ -230,7 +232,478 @@ impl Chain {
             bulk_import_mode: false,
             is_current_latch: false,
             min_known_work: params.min_known_chain_work,
+            db: None,
         }
+    }
+
+    /// Open a persistent chain over the database, creating the
+    /// initial chain state when the database is fresh and loading the
+    /// block index, best chain state, stake node, and chain data
+    /// otherwise (dcrd `createChainState`/`initChainState`; the
+    /// legacy version migration and `upgradeDB` paths are not
+    /// applicable to dcroxide's fresh-sync databases).
+    pub fn open(
+        db: dcroxide_database::Database,
+        params: &Params,
+        config_assume_valid: Hash,
+        config_allow_old_forks: bool,
+        created_unix: u64,
+    ) -> Result<Chain, crate::chaindb::ChainDbError> {
+        use crate::chaindb;
+
+        let mut chain = Chain::new(params, config_assume_valid, config_allow_old_forks);
+
+        // Determine the state of the database.
+        let mut db_info: Option<chaindb::DatabaseInfo> = None;
+        db.view(|tx| {
+            db_info = chaindb::db_fetch_database_info(tx).ok().flatten();
+            Ok(())
+        })?;
+
+        if let Some(info) = &db_info {
+            if info.version > chaindb::CURRENT_DATABASE_VERSION {
+                return Err(chaindb::ChainDbError::Corrupt(format!(
+                    "the database is no longer compatible ({} > {})",
+                    info.version,
+                    chaindb::CURRENT_DATABASE_VERSION
+                )));
+            }
+        }
+
+        if db_info.is_none() {
+            // Create the initial chain state (dcrd `createChainState`).
+            let genesis_block = params.genesis_block.clone();
+            let genesis_hash = genesis_block.header.block_hash();
+            let genesis = chain.best_chain.tip().expect("genesis node");
+            let stake_params = stake_node_params(params);
+            db.update(|tx| {
+                let meta = tx.metadata();
+                meta.create_bucket(chaindb::BCDB_INFO_BUCKET_NAME)?;
+                chaindb::db_put_database_info(
+                    tx,
+                    &chaindb::DatabaseInfo {
+                        version: chaindb::CURRENT_DATABASE_VERSION,
+                        comp_ver: crate::CURRENT_COMPRESSION_VERSION,
+                        bidx_ver: chaindb::CURRENT_BLOCK_INDEX_VERSION,
+                        created_unix,
+                        stxo_ver: chaindb::CURRENT_SPEND_JOURNAL_VERSION,
+                    },
+                )
+                .map_err(chain_db_to_db_error)?;
+                meta.create_bucket(chaindb::BLOCK_INDEX_BUCKET_NAME)?;
+                meta.create_bucket(chaindb::SPEND_JOURNAL_BUCKET_NAME)?;
+
+                // The genesis block index row and best chain state.
+                let entry = crate::chainio::BlockIndexEntry {
+                    header: genesis_block.header,
+                    status: chain.store.node(genesis).status.0,
+                    vote_info: Vec::new(),
+                };
+                chaindb::db_put_block_index_entry(tx, &genesis_hash, 0, &entry)
+                    .map_err(chain_db_to_db_error)?;
+                chaindb::db_put_best_state(
+                    tx,
+                    genesis_hash,
+                    0,
+                    chain.state_snapshot.total_txns,
+                    0,
+                    chain.store.node(genesis).work_sum,
+                )
+                .map_err(chain_db_to_db_error)?;
+
+                // The stake database and the genesis block itself.
+                dcroxide_stake::stakedb::init_database_state(
+                    tx,
+                    stake_params,
+                    &genesis_hash,
+                    created_unix as u32,
+                )
+                .map_err(|e| db_driver_error(format!("stake db: {e:?}")))?;
+                tx.store_block(&genesis_block)?;
+
+                // The remaining buckets and the empty genesis filter.
+                meta.create_bucket(chaindb::GCS_FILTER_BUCKET_NAME)?;
+                struct NoScripts;
+                impl dcroxide_gcs::blockcf2::PrevScripter for NoScripts {
+                    fn prev_script(&self, _out: &OutPoint) -> Option<(u16, &[u8])> {
+                        None
+                    }
+                }
+                let genesis_filter = dcroxide_gcs::blockcf2::regular(&genesis_block, &NoScripts)
+                    .map_err(|e| db_driver_error(format!("genesis filter: {e:?}")))?;
+                chaindb::db_put_gcs_filter(tx, &genesis_hash, &genesis_filter)
+                    .map_err(chain_db_to_db_error)?;
+                meta.create_bucket(chaindb::TREASURY_BUCKET_NAME)?;
+                meta.create_bucket(chaindb::TREASURY_TSPEND_BUCKET_NAME)?;
+                meta.create_bucket(chaindb::HEADER_CMTS_BUCKET_NAME)?;
+                meta.create_bucket(chaindb::UTXO_SET_BUCKET_NAME)?;
+
+                // The deployment version row.
+                chaindb::db_put_deployment_ver(
+                    tx,
+                    crate::thresholdstate::current_deployment_version(params),
+                )
+                .map_err(chain_db_to_db_error)?;
+                Ok(())
+            })?;
+            chain.filters.insert(genesis_hash.0, {
+                struct NoScripts;
+                impl dcroxide_gcs::blockcf2::PrevScripter for NoScripts {
+                    fn prev_script(&self, _out: &OutPoint) -> Option<(u16, &[u8])> {
+                        None
+                    }
+                }
+                dcroxide_gcs::blockcf2::regular(&params.genesis_block, &NoScripts)
+                    .expect("genesis filter")
+            });
+            chain.db = Some(db);
+            return Ok(chain);
+        }
+
+        // Load the chain state (dcrd `initChainState`).
+        let mut load_err: Option<chaindb::ChainDbError> = None;
+        db.view(|tx| {
+            if let Err(err) = chain.load_chain_state(tx, params) {
+                load_err = Some(err);
+            }
+            Ok(())
+        })?;
+        if let Some(err) = load_err {
+            return Err(err);
+        }
+        chain.db = Some(db);
+        Ok(chain)
+    }
+
+    /// Load the block index, best chain state, stake node, and chain
+    /// data from the database transaction (the body of dcrd
+    /// `initChainState` after initialization is known to have
+    /// happened).
+    fn load_chain_state(
+        &mut self,
+        tx: &dcroxide_database::Transaction,
+        params: &Params,
+    ) -> Result<(), crate::chaindb::ChainDbError> {
+        use crate::chaindb;
+
+        let state = chaindb::db_fetch_best_state(tx)?;
+
+        // Determine the earliest start time of newly detected
+        // deployment versions and update the stored version.
+        let cur_version = crate::thresholdstate::current_deployment_version(params);
+        let prev_version = chaindb::db_fetch_deployment_ver(tx);
+        let mut new_rules_start_time: u64 = 0;
+        if cur_version != 0 && cur_version > prev_version {
+            let next_version = crate::thresholdstate::next_deployment_version(params, prev_version);
+            if let Some((_, deployments)) =
+                params.deployments.iter().find(|(v, _)| *v == next_version)
+            {
+                if let Some(first) = deployments.first() {
+                    new_rules_start_time = first.start_time;
+                }
+            }
+        }
+
+        // Load the block index in height order.
+        let entries = chaindb::db_load_block_index(tx)?;
+        let genesis_hash = params.genesis_block.header.block_hash();
+        for (i, entry) in entries.iter().enumerate() {
+            let block_hash = entry.header.block_hash();
+            if i == 0 {
+                // The first entry is the genesis block, which the
+                // constructor already created; update its status.
+                if block_hash != genesis_hash {
+                    return Err(chaindb::ChainDbError::Corrupt(
+                        "expected first block index entry to be the genesis block".into(),
+                    ));
+                }
+                continue;
+            }
+            let parent = self
+                .index
+                .lookup_node(&entry.header.prev_block)
+                .ok_or_else(|| {
+                    chaindb::ChainDbError::Corrupt(format!(
+                        "could not find parent for block {block_hash}"
+                    ))
+                })?;
+            let node = self.store.new_node(&entry.header, Some(parent));
+            {
+                let n = self.store.node_mut(node);
+                n.status = crate::blockindex::BlockStatus(entry.status);
+                n.votes = entry.vote_info.clone();
+                n.ticket_info_populated = crate::blockindex::BlockStatus(entry.status).have_data();
+            }
+
+            // Unmark blocks that failed validation before newly
+            // detected consensus rules took effect.
+            if new_rules_start_time != 0 {
+                let status = self.store.node(node).status;
+                if status.known_validate_failed() || status.known_invalid_ancestor() {
+                    let median_time = self.store.calc_past_median_time(node);
+                    if median_time >= 0 && median_time as u64 >= new_rules_start_time {
+                        let n = self.store.node_mut(node);
+                        n.status = crate::blockindex::BlockStatus(
+                            n.status.0
+                                & !(crate::blockindex::BlockStatus::VALIDATE_FAILED.0
+                                    | crate::blockindex::BlockStatus::INVALID_ANCESTOR.0),
+                        );
+                    }
+                }
+            }
+
+            let parent_can_validate = self.index.can_validate(&self.store, parent);
+            self.store.node_mut(node).is_fully_linked = parent_can_validate;
+            self.index.add_node_from_db(&self.store, node);
+        }
+        if cur_version != 0 && cur_version != prev_version {
+            // dcrd updates the stored version here; deferred to the
+            // caller's update transaction via flush.
+        }
+
+        // Set the best chain to the stored state.
+        let tip = self.index.lookup_node(&state.hash).ok_or_else(|| {
+            crate::chaindb::ChainDbError::Corrupt(format!(
+                "cannot find chain tip {} in block index",
+                state.hash
+            ))
+        })?;
+        self.best_chain.set_tip(&self.store, Some(tip));
+        self.index.prune_cached_tips(&self.store, tip);
+        self.index.add_best_chain_candidate(tip);
+
+        // Load the stake node for the tip.
+        let tip_header = self.store.header(tip);
+        let stake_node = dcroxide_stake::stakedb::load_best_node(
+            tx,
+            state.height,
+            &state.hash,
+            &tip_header.serialize(),
+            stake_node_params(params),
+        )
+        .map_err(|e| crate::chaindb::ChainDbError::Corrupt(format!("stake node: {e:?}")))?;
+        {
+            let n = self.store.node_mut(tip);
+            n.new_tickets = Some(stake_node.new_tickets().to_vec());
+            n.stake_node = Some(stake_node.clone());
+        }
+
+        // Load the blocks for every node with data, the spend
+        // journals, filters, commitments, ticket rows, and the UTXO
+        // set into the in-memory maps (the disk-backed lazy access is
+        // an optimization that arrives later).
+        let node_ids: Vec<NodeId> = {
+            let mut ids = Vec::new();
+            let _ = self.index.for_each_chain_tip(|t| -> Result<(), ()> {
+                let mut n = Some(t);
+                while let Some(id) = n {
+                    ids.push(id);
+                    n = self.store.node(id).parent;
+                }
+                Ok(())
+            });
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+        for id in node_ids {
+            let n = self.store.node(id);
+            if !n.status.have_data() {
+                continue;
+            }
+            let hash = n.hash;
+            let raw = tx.fetch_block(&hash)?;
+            let (block, _) = dcroxide_wire::MsgBlock::from_bytes(&raw).map_err(|e| {
+                crate::chaindb::ChainDbError::Corrupt(format!("bad stored block: {e:?}"))
+            })?;
+            self.blocks.insert(hash.0, block);
+
+            let meta = tx.metadata();
+            if let Some(bucket) = meta.bucket(crate::chaindb::SPEND_JOURNAL_BUCKET_NAME) {
+                if let Some(journal) = bucket.get(&hash.0) {
+                    self.spend_journal.insert(hash.0, journal);
+                }
+            }
+            if let Some(filter) = crate::chaindb::db_fetch_gcs_filter(tx, &hash)? {
+                self.filters.insert(hash.0, filter);
+            }
+            let commitments = crate::chaindb::db_fetch_header_commitments(tx, &hash)?;
+            if !commitments.is_empty() {
+                self.header_commitments.insert(hash.0, commitments);
+            }
+        }
+
+        // The per-height ticket database rows.
+        let meta = tx.metadata();
+        if let Some(bucket) =
+            meta.bucket(dcroxide_stake::ticketdb::STAKE_BLOCK_UNDO_DATA_BUCKET_NAME)
+        {
+            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            bucket.for_each(|k, v| {
+                rows.push((k.to_vec(), v.to_vec()));
+                Ok(())
+            })?;
+            for (k, v) in rows {
+                if k.len() == 4 {
+                    let height = i64::from(u32::from_le_bytes([k[0], k[1], k[2], k[3]]));
+                    let utds =
+                        dcroxide_stake::ticketdb::deserialize_block_undo_data(&v).map_err(|e| {
+                            crate::chaindb::ChainDbError::Corrupt(format!("undo: {e:?}"))
+                        })?;
+                    self.stake_undo.insert(height, utds);
+                }
+            }
+        }
+        if let Some(bucket) = meta.bucket(dcroxide_stake::ticketdb::TICKETS_IN_BLOCK_BUCKET_NAME) {
+            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            bucket.for_each(|k, v| {
+                rows.push((k.to_vec(), v.to_vec()));
+                Ok(())
+            })?;
+            for (k, v) in rows {
+                if k.len() == 4 {
+                    let height = i64::from(u32::from_le_bytes([k[0], k[1], k[2], k[3]]));
+                    let ths =
+                        dcroxide_stake::ticketdb::deserialize_ticket_hashes(&v).map_err(|e| {
+                            crate::chaindb::ChainDbError::Corrupt(format!("tickets: {e:?}"))
+                        })?;
+                    self.stake_new_tickets.insert(height, ths);
+                }
+            }
+        }
+
+        // The UTXO set.
+        for (outpoint, entry) in crate::chaindb::db_load_utxo_set(tx)? {
+            self.utxo_backend
+                .insert((outpoint.hash.0, outpoint.index, outpoint.tree), entry);
+        }
+
+        // Rebuild the best state snapshot.
+        let tip_block = self
+            .blocks
+            .get(&state.hash.0)
+            .ok_or_else(|| crate::chaindb::ChainDbError::Corrupt("missing tip block".into()))?
+            .clone();
+        let stake_node = self
+            .store
+            .node(tip)
+            .stake_node
+            .clone()
+            .expect("tip stake node loaded");
+        let next_stake_diff = {
+            let view = NodeBranchView {
+                store: &self.store,
+                tip,
+            };
+            let node_diff = crate::difficulty::ChainView::node(&view, self.store.node(tip).height);
+            crate::agendas::calc_next_required_stake_difficulty(&view, node_diff.as_ref(), params)
+        };
+        self.maybe_set_fork_rejection_checkpoint(params);
+        if self.assume_valid != Hash::ZERO {
+            self.assume_valid_node = self.index.lookup_node(&self.assume_valid);
+        }
+        let tip_node = self.store.node(tip);
+        self.state_snapshot = BestState {
+            hash: tip_node.hash,
+            prev_hash: tip_node
+                .parent
+                .map(|p| self.store.node(p).hash)
+                .unwrap_or(Hash::ZERO),
+            height: tip_node.height,
+            bits: tip_node.bits,
+            next_pool_size: stake_node.pool_size() as u32,
+            next_stake_diff,
+            block_size: tip_block.serialize().len() as u64,
+            num_txns: tip_block.transactions.len() as u64,
+            total_txns: state.total_txns,
+            median_time: self.store.calc_past_median_time(tip),
+            total_subsidy: state.total_subsidy,
+            next_expiring_tickets: stake_node.expiring_next_block(),
+            next_winning_tickets: stake_node.winners().to_vec(),
+            missed_tickets: stake_node.missed_tickets(),
+            next_final_state: stake_node.final_state(),
+        };
+        Ok(())
+    }
+
+    /// Flush the durable chain state: the modified block index rows,
+    /// the UTXO cache, its set state, and the best chain state (the
+    /// clean-shutdown flush dcrd performs).
+    pub fn flush(&mut self, params: &Params) -> Result<(), crate::chaindb::ChainDbError> {
+        if self.db.is_none() {
+            return Ok(());
+        }
+        self.flush_block_index(params)?;
+        self.flush_utxo_cache();
+        let tip = self.best_chain.tip().expect("best chain tip");
+        let (tip_hash, tip_height, work_sum) = {
+            let n = self.store.node(tip);
+            (n.hash, n.height, n.work_sum)
+        };
+        let snapshot = self.state_snapshot.clone();
+        let db = self.db.as_ref().expect("checked above");
+        db.update(|tx| {
+            crate::chaindb::db_put_utxo_set_state(
+                tx,
+                &crate::utxoio::UtxoSetState {
+                    last_flush_height: tip_height as u32,
+                    last_flush_hash: tip_hash,
+                },
+            )
+            .map_err(chain_db_to_db_error)?;
+            crate::chaindb::db_put_best_state(
+                tx,
+                snapshot.hash,
+                snapshot.height as u32,
+                snapshot.total_txns,
+                snapshot.total_subsidy,
+                work_sum,
+            )
+            .map_err(chain_db_to_db_error)?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Write the modified block index entries to the database,
+    /// populating pruned ticket info first (dcrd `flushBlockIndex`).
+    fn flush_block_index(&mut self, params: &Params) -> Result<(), crate::chaindb::ChainDbError> {
+        if self.db.is_none() {
+            return Ok(());
+        }
+        let modified = self.index.take_modified();
+        // Populate prunable ticket info for nodes with data available.
+        for &id in &modified {
+            let n = self.store.node(id);
+            if n.status.have_data()
+                && !n.ticket_info_populated
+                && self.blocks.contains_key(&n.hash.0)
+            {
+                self.maybe_fetch_ticket_info(id, params);
+            }
+        }
+        let mut rows = Vec::with_capacity(modified.len());
+        for id in modified {
+            let n = self.store.node(id);
+            rows.push((
+                n.hash,
+                n.height as u32,
+                crate::chainio::BlockIndexEntry {
+                    header: self.store.header(id),
+                    status: n.status.0,
+                    vote_info: n.votes.clone(),
+                },
+            ));
+        }
+        let db = self.db.as_ref().expect("checked above");
+        db.update(|tx| {
+            for (hash, height, entry) in &rows {
+                crate::chaindb::db_put_block_index_entry(tx, hash, *height, entry)
+                    .map_err(chain_db_to_db_error)?;
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// Apply the view's committed changes to the UTXO cache with dcrd
@@ -314,17 +787,35 @@ impl Chain {
     /// the cache empties.
     fn flush_utxo_cache(&mut self) {
         let cache = core::mem::take(&mut self.utxo_cache);
+        let mut db_updates: Vec<(OutPoint, Option<UtxoEntry>)> = Vec::new();
         for (key, entry) in cache {
+            let outpoint = OutPoint {
+                hash: Hash(key.0),
+                index: key.1,
+                tree: key.2,
+            };
             match entry {
                 None => {}
                 Some(entry) if entry.is_spent() => {
                     self.utxo_backend.remove(&key);
+                    db_updates.push((outpoint, None));
                 }
                 Some(mut entry) => {
                     entry.set_state_bits(0);
+                    db_updates.push((outpoint, Some(entry.clone())));
                     self.utxo_backend.insert(key, entry);
                 }
             }
+        }
+        if let Some(db) = &self.db {
+            db.update(|tx| {
+                for (outpoint, entry) in &db_updates {
+                    crate::chaindb::db_put_utxo(tx, outpoint, entry.as_ref())
+                        .map_err(chain_db_to_db_error)?;
+                }
+                Ok(())
+            })
+            .expect("utxo flush");
         }
     }
 
@@ -877,11 +1368,39 @@ impl Chain {
         // database rows, the filter, and the commitment leaves.
         let serialized_journal =
             crate::chainio::serialize_spend_journal_entry(&stxos).unwrap_or_default();
-        self.spend_journal.insert(node_hash.0, serialized_journal);
+        self.spend_journal
+            .insert(node_hash.0, serialized_journal.clone());
         self.write_stake_db_rows(node);
-        self.filters.insert(node_hash.0, filter);
+        self.filters.insert(node_hash.0, filter.clone());
         self.header_commitments
-            .insert(node_hash.0, hdr_commitment_leaves);
+            .insert(node_hash.0, hdr_commitment_leaves.clone());
+        if self.db.is_some() {
+            self.flush_block_index(params).map_err(persist_rule_error)?;
+            let work_sum = self.store.node(node).work_sum;
+            let (total_txns, total_subsidy) = (state.total_txns, state.total_subsidy);
+            let db = self.db.as_ref().expect("checked above");
+            db.update(|tx| {
+                crate::chaindb::db_put_best_state(
+                    tx,
+                    node_hash,
+                    node_height as u32,
+                    total_txns,
+                    total_subsidy,
+                    work_sum,
+                )
+                .map_err(chain_db_to_db_error)?;
+                crate::chaindb::db_put_spend_journal_entry(tx, &node_hash, &serialized_journal)
+                    .map_err(chain_db_to_db_error)?;
+                dcroxide_stake::stakedb::write_connected_best_node(tx, &stake_node, &node_hash)
+                    .map_err(|e| db_driver_error(format!("stake db: {e:?}")))?;
+                crate::chaindb::db_put_gcs_filter(tx, &node_hash, &filter)
+                    .map_err(chain_db_to_db_error)?;
+                crate::chaindb::db_put_header_commitments(tx, &node_hash, &hdr_commitment_leaves)
+                    .map_err(chain_db_to_db_error)?;
+                Ok(())
+            })
+            .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
+        }
 
         // Commit all entries in the view to the UTXO set.
         self.commit_view(view);
@@ -961,6 +1480,45 @@ impl Chain {
         let node_height = self.store.node(node).height;
         self.stake_undo.retain(|h, _| *h < node_height);
         self.stake_new_tickets.retain(|h, _| *h < node_height);
+        if self.db.is_some() {
+            self.flush_block_index(params).map_err(persist_rule_error)?;
+            let node_hash = self.store.node(node).hash;
+            let node_work = self.store.node(node).work_sum;
+            let parent_hash = self.store.node(parent_id).hash;
+            let child_undo = self
+                .store
+                .node(node)
+                .stake_node
+                .as_ref()
+                .expect("child stake node loaded")
+                .undo_data()
+                .to_vec();
+            let (total_txns, total_subsidy) = (state.total_txns, state.total_subsidy);
+            let parent_height = self.store.node(parent_id).height;
+            let db = self.db.as_ref().expect("checked above");
+            db.update(|tx| {
+                crate::chaindb::db_put_best_state(
+                    tx,
+                    parent_hash,
+                    parent_height as u32,
+                    total_txns,
+                    total_subsidy,
+                    node_work,
+                )
+                .map_err(chain_db_to_db_error)?;
+                dcroxide_stake::stakedb::write_disconnected_best_node(
+                    tx,
+                    &parent_stake_node,
+                    &parent_hash,
+                    &child_undo,
+                )
+                .map_err(|e| db_driver_error(format!("stake db: {e:?}")))?;
+                crate::chaindb::db_remove_spend_journal_entry(tx, &node_hash)
+                    .map_err(chain_db_to_db_error)?;
+                Ok(())
+            })
+            .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
+        }
 
         // Commit all entries in the view to the UTXO set.  dcrd then
         // forces a cache flush on every disconnect, which drops the
@@ -1284,6 +1842,12 @@ impl Chain {
         // being available, which may make descendants fully linked.
         self.blocks
             .insert(block.header.block_hash().0, block.clone());
+        if let Some(db) = &self.db {
+            let stored = db.update(|tx| tx.store_block(block));
+            if let Err(err) = stored {
+                return Err(persist_rule_error(crate::chaindb::ChainDbError::Db(err)));
+            }
+        }
         self.index
             .set_status_flags(&mut self.store, node, BlockStatus::DATA_STORED);
         let tip = self.best_chain.tip().expect("best chain tip");
@@ -1742,6 +2306,34 @@ impl Chain {
     /// Whether the chain believes it is current (dcrd `isCurrent`).
     pub fn is_current(&self, cur_best: NodeId, adjusted_time_unix: i64) -> bool {
         self.is_current_latch && !self.is_old_timestamp(cur_best, adjusted_time_unix)
+    }
+}
+
+/// Convert a persistence failure into a rule error so it flows
+/// through the existing error paths (dcrd surfaces these as plain
+/// errors).
+fn persist_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
+    RuleError {
+        kind: RuleErrorKind::UnknownBlock,
+        description: format!("chain database failure: {err:?}"),
+    }
+}
+
+/// Wrap a message as a driver-specific database error for use inside
+/// database transaction closures.
+fn db_driver_error(description: String) -> dcroxide_database::Error {
+    dcroxide_database::Error {
+        kind: dcroxide_database::ErrorKind::DriverSpecific,
+        description,
+    }
+}
+
+/// Convert a chain database error into a database error for use
+/// inside database transaction closures.
+fn chain_db_to_db_error(err: crate::chaindb::ChainDbError) -> dcroxide_database::Error {
+    match err {
+        crate::chaindb::ChainDbError::Db(err) => err,
+        other => db_driver_error(format!("{other:?}")),
     }
 }
 

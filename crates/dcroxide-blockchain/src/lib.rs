@@ -21,6 +21,7 @@ extern crate alloc;
 
 pub mod agendas;
 pub mod blockindex;
+pub mod chaindb;
 pub mod chainio;
 pub mod chainview_nodes;
 pub mod compress;

@@ -199,6 +199,7 @@ version = "0.1.0"
 dependencies = [
  "dcroxide-chaincfg",
  "dcroxide-chainhash",
+ "dcroxide-database",
  "dcroxide-dcrec",
  "dcroxide-gcs",
  "dcroxide-stake",
@@ -208,6 +209,7 @@ dependencies = [
  "dcroxide-uint256",
  "dcroxide-wire",
  "num-bigint",
+ "tempfile",
 ]
 
 [[package]]
