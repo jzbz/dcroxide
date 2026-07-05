@@ -22,6 +22,7 @@ extern crate alloc;
 pub mod compress;
 pub mod difficulty;
 mod error;
+pub mod stakever;
 mod utxoentry;
 mod utxoio;
 

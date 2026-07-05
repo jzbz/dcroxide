@@ -84,9 +84,9 @@ Currently implemented:
 - `dcroxide-blockchain` — the beginnings of the chain engine: dcrd's
   UTXO serialization layer (VLQs, the domain-specific script and amount
   compression, UTXO entries, outpoint keys, and the set state) and the
-  legacy work/stake difficulty algorithms, pinned by dcrd's own test
-  vectors and by synthetic-chain scenarios generated inside dcrd's
-  internal package
+  legacy work/stake difficulty algorithms and stake-version voting
+  machinery, pinned by dcrd's own test vectors and by synthetic-chain
+  scenarios generated inside dcrd's internal package
 - `dcroxide-gcs` — Golomb-coded set filters (versions 1 and 2) and the
   DCP0005 version 2 block committed filters for light clients, matched
   differentially against dcrd over random filters and structured blocks
