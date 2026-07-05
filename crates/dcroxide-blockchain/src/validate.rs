@@ -2341,3 +2341,372 @@ pub fn check_revocation_inputs(
         is_auto_revocations_enabled,
     )
 }
+
+/// Verify that the provided schnorr signature and public key were the
+/// ones that signed the provided treasury spend transaction (dcrd
+/// `verifyTSpendSignature`).  The returned error is not a rule error;
+/// the caller converts it.
+pub fn verify_tspend_signature(tx: &MsgTx, signature: &[u8], pub_key: &[u8]) -> Result<(), String> {
+    // Calculate the signature hash exactly as dcrd does: an empty
+    // script, SigHashAll, and input zero.
+    let sig_hash =
+        dcroxide_txscript::calc_signature_hash_checked(&[], dcroxide_txscript::SIG_HASH_ALL, tx, 0)
+            .map_err(|e| format!("CalcSignatureHash: {e:?}"))?;
+
+    // Lift the signature and public PI key from bytes.
+    let sig = dcroxide_dcrec::secp256k1::schnorr::parse_signature(signature)
+        .map_err(|e| format!("ParseSignature: {e:?}"))?;
+    let pk = dcroxide_dcrec::secp256k1::schnorr::parse_pub_key(pub_key)
+        .map_err(|e| format!("ParsePubKey: {e:?}"))?;
+
+    // Verify the transaction was properly signed.
+    if !sig.verify(&sig_hash, &pk) {
+        return Err("Verify failed".into());
+    }
+
+    Ok(())
+}
+
+/// Perform a series of checks on the inputs to a transaction to ensure
+/// they are valid, returning the transaction fee (dcrd
+/// `CheckTransactionInputs`).  The transaction MUST have already been
+/// sanity checked.  `lookup_entry` stands in for dcrd's
+/// `UtxoViewpoint.LookupEntry`.
+#[allow(clippy::too_many_arguments)]
+pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
+    subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
+    tx: &MsgTx,
+    tx_height: i64,
+    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    check_fraud_proof: bool,
+    params: &Params,
+    prev_header: &dcroxide_wire::BlockHeader,
+    is_treasury_enabled: bool,
+    is_auto_revocations_enabled: bool,
+    subsidy_split_variant: dcroxide_standalone::SubsidySplitVariant,
+) -> Result<i64, RuleError> {
+    // Coinbase and treasurybase transactions have no inputs.
+    if dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled) {
+        return Ok(0);
+    }
+    if is_treasury_enabled && dcroxide_standalone::is_treasury_base(tx) {
+        return Ok(0);
+    }
+
+    // Perform the additional ticket purchase, vote, and revocation
+    // input checks, tracking the vote/revocation status since some
+    // inputs are skipped or treated specially later.
+    let is_ticket = dcroxide_stake::is_sstx(tx);
+    if is_ticket {
+        check_ticket_purchase_inputs(tx, &lookup_entry)?;
+    }
+    let is_vote = dcroxide_stake::is_ssgen(tx);
+    if is_vote {
+        check_vote_inputs(
+            subsidy_cache,
+            tx,
+            tx_height,
+            &lookup_entry,
+            params,
+            prev_header,
+            is_treasury_enabled,
+            is_auto_revocations_enabled,
+            subsidy_split_variant,
+        )?;
+    }
+    let is_revocation = dcroxide_stake::is_ssrtx(tx);
+    if is_revocation {
+        check_revocation_inputs(
+            tx,
+            tx_height,
+            &lookup_entry,
+            params,
+            prev_header,
+            is_treasury_enabled,
+            is_auto_revocations_enabled,
+        )?;
+    }
+
+    // The required maturity for revocation and vote outputs depends on
+    // whether or not the treasury agenda is active.
+    let req_stake_out_maturity = if is_treasury_enabled {
+        i64::from(params.coinbase_maturity)
+    } else {
+        i64::from(params.sstx_change_maturity)
+    };
+
+    // Perform additional checks on treasury spend transactions such as
+    // ensuring they have a valid signature from a sanctioned key.
+    let mut is_tspend = false;
+    if is_treasury_enabled {
+        if let Ok((signature, pub_key)) = dcroxide_stake::check_tspend(tx) {
+            is_tspend = true;
+
+            // The public key used to sign the treasury spend must be
+            // one of the sanctioned pi keys.
+            if !params.pi_key_exists(&pub_key) {
+                return Err(rule_error(
+                    RuleErrorKind::UnknownPiKey,
+                    format!("unknown treasury spend pi key: {pub_key:x?}"),
+                ));
+            }
+
+            // Verify that the signature is valid and corresponds to
+            // the provided public key.
+            if let Err(e) = verify_tspend_signature(tx, &signature, &pub_key) {
+                return Err(rule_error(
+                    RuleErrorKind::InvalidPiSignature,
+                    format!("failed to verify treasury spend signature: {e}"),
+                ));
+            }
+        }
+    }
+
+    // General transaction testing (and a few stake exceptions).
+    let tx_hash = tx.tx_hash();
+    let coinbase_maturity = i64::from(params.coinbase_maturity);
+    let mut total_atom_in: i64 = 0;
+    for (idx, tx_in) in tx.tx_in.iter().enumerate() {
+        // Inputs won't exist for the stakebase, so add the reward
+        // amount instead.
+        if is_vote && idx == 0 {
+            let (_, height_voting_on) = dcroxide_stake::ssgen_block_voted_on(tx);
+            let stake_vote_subsidy = subsidy_cache
+                .calc_stake_vote_subsidy_v3(i64::from(height_voting_on), subsidy_split_variant);
+            total_atom_in += stake_vote_subsidy;
+            continue;
+        }
+
+        // idx can only be 0 in this case but check it anyway.
+        if is_tspend && idx == 0 {
+            total_atom_in += tx_in.value_in;
+            continue;
+        }
+
+        let tx_in_outpoint = &tx_in.previous_out_point;
+        let utxo_entry = match lookup_entry(tx_in_outpoint) {
+            Some(e) if !e.is_spent() => e,
+            _ => {
+                return Err(rule_error(
+                    RuleErrorKind::MissingTxOut,
+                    format!(
+                        "output {tx_in_outpoint:?} referenced from transaction \
+                         {tx_hash}:{idx} either does not exist or has already been spent"
+                    ),
+                ));
+            }
+        };
+
+        // Using zero value outputs as inputs is banned.
+        if utxo_entry.amount() == 0 {
+            return Err(rule_error(
+                RuleErrorKind::ZeroValueOutputSpend,
+                format!("tried to spend zero value output from input {tx_in_outpoint:?}"),
+            ));
+        }
+
+        // Check fraud proof witness data.
+        if check_fraud_proof {
+            if tx_in.value_in != utxo_entry.amount() {
+                return Err(rule_error(
+                    RuleErrorKind::FraudAmountIn,
+                    format!(
+                        "bad fraud check value in (expected {}, given {}) for txIn {idx}",
+                        utxo_entry.amount(),
+                        tx_in.value_in
+                    ),
+                ));
+            }
+            if i64::from(tx_in.block_height) != utxo_entry.block_height() {
+                return Err(rule_error(
+                    RuleErrorKind::FraudBlockHeight,
+                    format!(
+                        "bad fraud check block height (expected {}, given {}) for txIn \
+                         {idx}",
+                        utxo_entry.block_height(),
+                        tx_in.block_height
+                    ),
+                ));
+            }
+            if tx_in.block_index != utxo_entry.block_index() {
+                return Err(rule_error(
+                    RuleErrorKind::FraudBlockIndex,
+                    format!(
+                        "bad fraud check block index (expected {}, given {}) for txIn \
+                         {idx}",
+                        utxo_entry.block_index(),
+                        tx_in.block_index
+                    ),
+                ));
+            }
+        }
+
+        // Ensure the transaction is not spending coins which have not
+        // yet reached the required coinbase maturity.
+        if utxo_entry.is_coin_base() {
+            let origin_height = utxo_entry.block_height();
+            let blocks_since_prev = tx_height - origin_height;
+            if blocks_since_prev < coinbase_maturity {
+                return Err(rule_error(
+                    RuleErrorKind::ImmatureSpend,
+                    format!(
+                        "tried to spend coinbase transaction from height {origin_height} \
+                         at height {tx_height} before required maturity of \
+                         {coinbase_maturity} blocks"
+                    ),
+                ));
+            }
+        }
+
+        // Transactions that included an expiry may likewise only be
+        // spent after coinbase maturity many blocks.
+        if utxo_entry.has_expiry() {
+            let origin_height = utxo_entry.block_height();
+            let blocks_since_prev = tx_height - origin_height;
+            if blocks_since_prev < coinbase_maturity {
+                return Err(rule_error(
+                    RuleErrorKind::ExpiryTxSpentEarly,
+                    format!(
+                        "tried to spend transaction including an expiry from height \
+                         {origin_height} at height {tx_height} before required maturity \
+                         of {coinbase_maturity} blocks"
+                    ),
+                ));
+            }
+        }
+
+        // OP_TGEN tagged outputs can only be spent after coinbase
+        // maturity many blocks.
+        let script_ver = utxo_entry.script_version();
+        let pk_script = utxo_entry.pk_script();
+        if is_treasury_enabled && dcroxide_stake::is_treasury_gen_script(script_ver, pk_script) {
+            let origin_height = utxo_entry.block_height();
+            let blocks_since_prev = tx_height - origin_height;
+            if blocks_since_prev < coinbase_maturity {
+                return Err(rule_error(
+                    RuleErrorKind::ImmatureSpend,
+                    format!(
+                        "tried to spend OP_TGEN output from height {origin_height} at \
+                         height {tx_height} before required maturity of \
+                         {coinbase_maturity} blocks"
+                    ),
+                ));
+            }
+        }
+
+        // Only votes and revocations may spend OP_SSTX tagged outputs.
+        if !(is_vote || is_revocation)
+            && dcroxide_stake::is_ticket_purchase_script(script_ver, pk_script)
+        {
+            return Err(rule_error(
+                RuleErrorKind::TxSStxOutSpend,
+                format!(
+                    "tried to spend OP_SSTX output {tx_in_outpoint:?} from a transaction \
+                     that is not a vote or revocation"
+                ),
+            ));
+        }
+
+        // Treasury adds are never spendable.
+        if is_treasury_enabled
+            && script_ver == 0
+            && pk_script.len() == 1
+            && pk_script[0] == dcroxide_txscript::OP_TADD
+        {
+            return Err(rule_error(
+                RuleErrorKind::BadTxInput,
+                format!("tried to spend treasury add output {tx_in_outpoint:?}"),
+            ));
+        }
+
+        // OP_SSGEN and OP_SSRTX tagged outputs can only be spent after
+        // the required stake output maturity.
+        if dcroxide_stake::is_revocation_script(script_ver, pk_script)
+            || dcroxide_stake::is_vote_script(script_ver, pk_script)
+        {
+            let origin_height = utxo_entry.block_height();
+            let blocks_since_prev = tx_height - origin_height;
+            if blocks_since_prev < req_stake_out_maturity {
+                return Err(rule_error(
+                    RuleErrorKind::ImmatureSpend,
+                    format!(
+                        "tried to spend OP_SSGEN or OP_SSRTX output {tx_in_outpoint:?} \
+                         from height {origin_height} at height {tx_height} before \
+                         required maturity of {coinbase_maturity} blocks"
+                    ),
+                ));
+            }
+        }
+
+        // Ticket change outputs may only be spent after ticket change
+        // maturity many blocks.
+        if dcroxide_stake::is_stake_change_script(script_ver, pk_script) {
+            let origin_height = utxo_entry.block_height();
+            let blocks_since_prev = tx_height - origin_height;
+            if blocks_since_prev < i64::from(params.sstx_change_maturity) {
+                return Err(rule_error(
+                    RuleErrorKind::ImmatureSpend,
+                    format!(
+                        "tried to spend ticket change output {tx_in_outpoint:?} from \
+                         height {origin_height} at height {tx_height} before required \
+                         maturity of {} blocks",
+                        params.sstx_change_maturity
+                    ),
+                ));
+            }
+        }
+
+        // Ensure the transaction amounts are in range: not negative
+        // and no more than the max allowed per transaction, both for
+        // each input and for the running total (with overflow checks).
+        let origin_tx_atom = utxo_entry.amount();
+        if origin_tx_atom < 0 {
+            return Err(rule_error(
+                RuleErrorKind::BadTxOutValue,
+                format!("transaction output has negative value of {origin_tx_atom}"),
+            ));
+        }
+        if origin_tx_atom > dcroxide_stake::MAX_AMOUNT {
+            return Err(rule_error(
+                RuleErrorKind::BadTxOutValue,
+                format!(
+                    "transaction output value of {origin_tx_atom} is higher than max \
+                     allowed value of {}",
+                    dcroxide_stake::MAX_AMOUNT
+                ),
+            ));
+        }
+        let last_atom_in = total_atom_in;
+        total_atom_in = total_atom_in.wrapping_add(origin_tx_atom);
+        if total_atom_in < last_atom_in || total_atom_in > dcroxide_stake::MAX_AMOUNT {
+            return Err(rule_error(
+                RuleErrorKind::BadTxOutValue,
+                format!(
+                    "total value of all transaction inputs is {total_atom_in} which is \
+                     higher than max allowed value of {}",
+                    dcroxide_stake::MAX_AMOUNT
+                ),
+            ));
+        }
+    }
+
+    // Calculate the total output amount; overflow and range problems
+    // would already have been caught by the sanity checks.
+    let mut total_atom_out: i64 = 0;
+    for tx_out in &tx.tx_out {
+        total_atom_out = total_atom_out.wrapping_add(tx_out.value);
+    }
+
+    // Ensure the transaction does not spend more than its inputs.
+    if total_atom_in < total_atom_out {
+        return Err(rule_error(
+            RuleErrorKind::SpendTooHigh,
+            format!(
+                "total value of all transaction inputs for transaction {tx_hash} is \
+                 {total_atom_in} which is less than the amount spent of {total_atom_out}"
+            ),
+        ));
+    }
+
+    Ok(total_atom_in - total_atom_out)
+}
