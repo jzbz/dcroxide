@@ -159,6 +159,13 @@ Currently implemented:
   pinned by the complete generated help text for every method and
   fully marshalled transaction results for every transaction shape
   from sessions generated inside dcrd's own package
+- `dcroxide-netsync` — the network chain synchronization manager
+  from dcrd's `internal/netsync`: the sync manager as a synchronous
+  decision core returning message/disconnect/timer actions, with
+  header-first sync, block download scheduling, announcement
+  tracking, and the rejected/recently-confirmed filters, pinned by a
+  scripted 87-step session against a real dcrd sync manager, chain,
+  peers, and pools, replayed over the real Rust chain engine
 - `dcroxide-peer` — the peer-to-peer protocol decision core from
   dcrd's `peer` package: version negotiation with self-connection
   detection and dcrd's exact acceptance rules, local version

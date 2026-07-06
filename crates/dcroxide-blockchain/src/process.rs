@@ -2635,6 +2635,92 @@ impl Chain {
             .map(|n| self.store.node(n).work_sum)
     }
 
+    /// The hashes for the next blocks after the current best chain
+    /// tip that are needed to make progress towards the current best
+    /// known header, skipping any blocks that already have their data
+    /// available, up to the given maximum (dcrd `PutNextNeededBlocks`
+    /// with the provided slice length as the maximum).
+    pub fn put_next_needed_blocks(&self, max_results: usize) -> Vec<Hash> {
+        // Nothing to do when no results are requested.
+        let mut out = Vec::with_capacity(max_results);
+        if max_results == 0 {
+            return out;
+        }
+
+        // Populate the results by making use of a sliding window.  Note
+        // that the needed block hashes are populated in forwards order
+        // while it is necessary to walk the block index backwards to
+        // determine them.  Further, an unknown number of blocks may
+        // already have their data and need to be skipped, so it's not
+        // possible to determine the precise height after the fork point
+        // to start iterating from.  Using a sliding window efficiently
+        // handles these conditions without needing additional
+        // allocations.
+        //
+        // The strategy is to initially determine the common ancestor
+        // between the current best chain tip and the current best known
+        // header as the starting fork point and move the fork point
+        // forward by the window size after populating the output with
+        // all relevant nodes in the window until either there are no
+        // more results or the desired number of results have been
+        // populated.
+        const WINDOW_SIZE: i64 = 32;
+        let mut window = [Hash([0u8; 32]); WINDOW_SIZE as usize];
+        let Some(best_header) = self.index.best_header() else {
+            return out;
+        };
+        let mut fork = self.best_chain.find_fork(&self.store, best_header);
+        while out.len() < max_results && fork.is_some() && fork != Some(best_header) {
+            let fork_node = fork.expect("fork checked above");
+
+            // Determine the final descendant block on the branch that
+            // leads to the best known header in this window by clamping
+            // the number of descendants to consider to the window size.
+            let mut end_node = best_header;
+            let fork_height = self.store.node(fork_node).height;
+            let num_blocks_to_consider = self.store.node(end_node).height - fork_height;
+            if num_blocks_to_consider > WINDOW_SIZE {
+                end_node = self
+                    .store
+                    .ancestor(end_node, fork_height + WINDOW_SIZE)
+                    .expect("ancestor within branch");
+            }
+
+            // Populate the blocks in this window from back to front by
+            // walking backwards from the final block to consider in the
+            // window to the first one excluding any blocks that already
+            // have their data available.
+            let mut window_idx = WINDOW_SIZE as usize;
+            let mut node = Some(end_node);
+            while let Some(n) = node {
+                if n == fork_node {
+                    break;
+                }
+                if !self.index.node_status(&self.store, n).have_data() {
+                    window_idx -= 1;
+                    window[window_idx] = self.store.node(n).hash;
+                }
+                node = self.store.node(n).parent;
+            }
+
+            // Populate the outputs with as many from the back of the
+            // window as possible (since the window might not have been
+            // fully populated due to skipped blocks).
+            for hash in &window[window_idx..] {
+                if out.len() >= max_results {
+                    break;
+                }
+                out.push(*hash);
+            }
+
+            // Move the fork point forward to the final block of the
+            // window.
+            fork = Some(end_node);
+        }
+
+        out
+    }
+
     /// The entire generation of blocks at the current tip height
     /// (dcrd `TipGeneration`).
     pub fn tip_generation(&self) -> Vec<Hash> {

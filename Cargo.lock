@@ -417,6 +417,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-netsync"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-blockchain",
+ "dcroxide-chaincfg",
+ "dcroxide-chainhash",
+ "dcroxide-containers",
+ "dcroxide-peer",
+ "dcroxide-testutil",
+ "dcroxide-uint256",
+ "dcroxide-wire",
+]
+
+[[package]]
 name = "dcroxide-peer"
 version = "0.1.0"
 dependencies = [

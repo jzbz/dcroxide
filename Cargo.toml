@@ -19,6 +19,7 @@ members = [
     "crates/dcroxide-mempool",
     "crates/dcroxide-mining",
     "crates/dcroxide-mixing",
+    "crates/dcroxide-netsync",
     "crates/dcroxide-peer",
     "crates/dcroxide-rpc",
     "crates/dcroxide-rpctypes",

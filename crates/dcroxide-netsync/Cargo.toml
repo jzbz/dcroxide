@@ -1,0 +1,24 @@
+[package]
+name = "dcroxide-netsync"
+description = "The network chain synchronization manager mirroring dcrd's internal/netsync package"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-containers = { path = "../dcroxide-containers" }
+dcroxide-peer = { path = "../dcroxide-peer" }
+dcroxide-uint256 = { path = "../dcroxide-uint256" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+
+[dev-dependencies]
+dcroxide-blockchain = { path = "../dcroxide-blockchain" }
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true
