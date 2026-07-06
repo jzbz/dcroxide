@@ -1840,7 +1840,7 @@ fn peer_exists<C: RpcChain>(server: &mut Server<C>, addr: &str, node_id: i32) ->
         .conn_mgr
         .connected_peers()
         .iter()
-        .any(|(id, peer_addr)| *id == node_id || peer_addr == addr)
+        .any(|p| p.id == node_id || p.addr == addr)
 }
 
 /// handlenode (dcrd `handleNode`): no data unless an error.
@@ -2440,4 +2440,256 @@ pub fn handle_get_cfilter_v2<C: RpcChain>(
         GoValue::Uint(u64::from(proof.proof_index)),
         GoValue::Null,
     ]))
+}
+
+/// handlegetpeerinfo (dcrd `handleGetPeerInfo`); the result is a
+/// slice of `GetPeerInfoResult` values sorted by peer id.
+pub fn handle_get_peer_info<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let peers = server.cfg.conn_mgr.connected_peers();
+    let sync_peer_id = server.cfg.sync_mgr.sync_peer_id();
+    let mut infos: Vec<(i32, GoValue)> = Vec::with_capacity(peers.len());
+    for p in &peers {
+        let addr_local = p.local_addr.clone().unwrap_or_default();
+        let mut ping_wait = GoValue::Float64(0.0);
+        if p.last_ping_nonce != 0 {
+            let wait = server.cfg.clock.since_nanos(p.last_ping_time_unix_nanos) as f64;
+            // We actually want microseconds.
+            ping_wait = GoValue::Float64(wait / 1000.0);
+        }
+        infos.push((
+            p.id,
+            GoValue::Struct(vec![
+                GoValue::Int(i64::from(p.id)),
+                GoValue::String(p.addr.clone()),
+                GoValue::String(addr_local),
+                GoValue::String(format!("{:08}", p.services)),
+                GoValue::Bool(!p.tx_relay_disabled),
+                GoValue::Int(p.last_send_unix),
+                GoValue::Int(p.last_recv_unix),
+                GoValue::Uint(p.bytes_sent),
+                GoValue::Uint(p.bytes_recv),
+                GoValue::Int(p.conn_time_unix),
+                GoValue::Int(p.time_offset),
+                GoValue::Float64(p.last_ping_micros as f64),
+                ping_wait,
+                GoValue::Uint(u64::from(p.version)),
+                GoValue::String(p.user_agent.clone()),
+                GoValue::Bool(p.inbound),
+                GoValue::Int(p.starting_height),
+                GoValue::Int(p.last_block),
+                GoValue::Int(i64::from(p.ban_score as i32)),
+                GoValue::Bool(p.id == sync_peer_id),
+            ]),
+        ));
+    }
+    infos.sort_by_key(|(id, _)| *id);
+    Ok(GoValue::Array(infos.into_iter().map(|(_, v)| v).collect()))
+}
+
+/// handlegetaddednodeinfo (dcrd `handleGetAddedNodeInfo`); the
+/// result is either the address list or a slice of
+/// `GetAddedNodeInfoResult` values when the dns flag is set.
+pub fn handle_get_added_node_info<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let dns = match &c[0] {
+        GoValue::Bool(b) => *b,
+        other => panic!("expected bool field, got {other:?}"),
+    };
+    let node = match &c[1] {
+        GoValue::Null => None,
+        GoValue::String(s) => Some(s.clone()),
+        other => panic!("expected optional string field, got {other:?}"),
+    };
+
+    // Retrieve a list of persistent (added) peers and filter the list
+    // per the specified address (if any).  dcrd reslices under a range
+    // over the original list, so the last match wins.
+    let mut peers = server.cfg.conn_mgr.persistent_peers();
+    if let Some(node) = &node {
+        let mut found = None;
+        for (i, peer) in peers.iter().enumerate() {
+            if peer.addr == *node {
+                found = Some(i);
+            }
+        }
+        let Some(i) = found else {
+            return Err(rpc_internal_err("node not found"));
+        };
+        peers = vec![peers[i].clone()];
+    }
+
+    // Without the dns flag, the result is just a slice of the
+    // addresses as strings.
+    if !dns {
+        return Ok(GoValue::Array(
+            peers
+                .iter()
+                .map(|peer| GoValue::String(peer.addr.clone()))
+                .collect(),
+        ));
+    }
+
+    // With the dns flag, the result is an array of JSON objects which
+    // include the result of DNS lookups for each peer.
+    let mut results = Vec::with_capacity(peers.len());
+    for peer in &peers {
+        // Split the address into host and port portions so we can do
+        // a DNS lookup against the host.  When no port is specified in
+        // the address, just use the address as the host.
+        let host = match crate::helpers::split_host_port(&peer.addr) {
+            Ok((host, _)) => host,
+            Err(()) => peer.addr.clone(),
+        };
+
+        // Do a DNS lookup for the address.  If the lookup fails, just
+        // use the host.
+        let ip_list = match server.cfg.conn_mgr.lookup(&host) {
+            Ok(ips) => ips,
+            Err(_) => vec![host.clone()],
+        };
+
+        // Add the addresses and connection info to the result.
+        let addrs: Vec<GoValue> = ip_list
+            .iter()
+            .map(|ip| {
+                let mut connected = "false";
+                if *ip == host && peer.connected {
+                    connected = crate::helpers::direction_string(peer.inbound);
+                }
+                GoValue::Struct(vec![
+                    GoValue::String(ip.clone()),
+                    GoValue::String(connected.to_string()),
+                ])
+            })
+            .collect();
+        results.push(GoValue::Struct(vec![
+            GoValue::String(peer.addr.clone()),
+            GoValue::Bool(peer.connected),
+            GoValue::Array(addrs),
+        ]));
+    }
+    Ok(GoValue::Array(results))
+}
+
+/// The exists-address index sync gauntlet shared by the two exists
+/// handlers (mirrors the tx index handling).
+fn exists_addr_index_synced<C: RpcChain>(server: &mut Server<C>) -> Result<(), RPCError> {
+    let addresser = server.cfg.exists_addresser.as_mut().expect("checked");
+    let (t_height, t_hash) = addresser.tip().map_err(|e| rpc_internal_err(&e))?;
+    let index_name = addresser.name();
+
+    // Return an out-of-sync error if the index is lagging a maximum
+    // reorg depth (6) blocks or more from the chain tip.
+    if server.cfg.chain.best_snapshot().height > t_height + 5 {
+        return Err(rpc_internal_err(&format!("{index_name}: index not synced")));
+    }
+
+    if server.cfg.chain.best_snapshot().hash != t_hash {
+        let addresser = server.cfg.exists_addresser.as_mut().expect("checked");
+        if !addresser.wait_for_sync() {
+            return Err(rpc_internal_err(&format!("{index_name}: index not synced")));
+        }
+    }
+    Ok(())
+}
+
+/// handleexistsaddress (dcrd `handleExistsAddress`).
+pub fn handle_exists_address<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    if server.cfg.exists_addresser.is_none() {
+        return Err(rpc_internal_err("exists address index disabled"));
+    }
+
+    let c = fields(cmd);
+    let address = s(&c[0]);
+
+    // Decode the provided address.  This also ensures the network
+    // encoded with the address matches the network the server is
+    // currently on.
+    let addr = stdaddr::decode_address(address, &server.cfg.chain_params)
+        .map_err(|e| rpc_address_key_error(&format!("Could not decode address: {e}")))?;
+
+    // Ensure the exists address index is synced.
+    exists_addr_index_synced(server)?;
+
+    let addresser = server.cfg.exists_addresser.as_mut().expect("checked");
+    let exists = addresser
+        .exists_address(&addr)
+        .map_err(|e| rpc_invalid_error(&format!("Could not query address: {e}")))?;
+
+    Ok(GoValue::Bool(exists))
+}
+
+/// handleexistsaddresses (dcrd `handleExistsAddresses`): the
+/// existence bits as a compacted hex string.
+pub fn handle_exists_addresses<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    if server.cfg.exists_addresser.is_none() {
+        return Err(rpc_internal_err("exists address index disabled"));
+    }
+
+    let c = fields(cmd);
+    let address_strs: Vec<String> = array(&c[0]).iter().map(|v| s(v).to_string()).collect();
+    let mut addresses = Vec::with_capacity(address_strs.len());
+    for address in &address_strs {
+        let addr = stdaddr::decode_address(address, &server.cfg.chain_params)
+            .map_err(|e| rpc_address_key_error(&format!("Could not decode address: {e}")))?;
+        addresses.push(addr);
+    }
+
+    // Ensure the exists address index is synced.
+    exists_addr_index_synced(server)?;
+
+    let addresser = server.cfg.exists_addresser.as_mut().expect("checked");
+    let exists = addresser
+        .exists_addresses(&addresses)
+        .map_err(|e| rpc_invalid_error(&format!("Could not query address: {e}")))?;
+
+    Ok(GoValue::String(hex_str(&bitset_bytes(&exists))))
+}
+
+/// handleticketsforaddress (dcrd `handleTicketsForAddress`); the
+/// result is a `TicketsForAddressResult` value.
+pub fn handle_tickets_for_address<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let address = s(&c[0]);
+
+    // Decode the provided address.  This also ensures the network
+    // encoded with the address matches the network the server is
+    // currently on.
+    let addr = stdaddr::decode_address(address, &server.cfg.chain_params)
+        .map_err(|e| rpc_invalid_error(&format!("Invalid address: {e}")))?;
+
+    // Only stake addresses participate in the staking system.
+    if addr.voting_rights_script().is_none() {
+        return Err(rpc_invalid_error(
+            "Address is not valid for use in the staking system",
+        ));
+    }
+
+    let tickets = server
+        .cfg
+        .chain
+        .tickets_with_address(&addr)
+        .map_err(|e| rpc_internal_err(&e))?;
+
+    Ok(GoValue::Struct(vec![GoValue::Array(
+        tickets
+            .iter()
+            .map(|t| GoValue::String(t.to_string()))
+            .collect(),
+    )]))
 }

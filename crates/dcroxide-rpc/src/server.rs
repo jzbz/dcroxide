@@ -228,6 +228,14 @@ pub trait RpcChain {
     fn fetch_utxo_stats(&mut self) -> Result<RpcUtxoStats, String> {
         unimplemented!("fetch_utxo_stats")
     }
+    /// The live tickets paying to the given stake address (dcrd
+    /// `TicketsWithAddress`).
+    fn tickets_with_address(
+        &mut self,
+        _addr: &dcroxide_txscript::stdaddr::Address,
+    ) -> Result<Vec<Hash>, String> {
+        unimplemented!("tickets_with_address")
+    }
     /// The header of the main chain block at the given height (dcrd
     /// `HeaderByHeight`; the error text only feeds the wrapped
     /// internal error).
@@ -410,6 +418,9 @@ pub struct Config<C> {
     pub db: Box<dyn RpcDb>,
     /// The version 2 filter source (dcrd `FiltererV2`).
     pub filterer_v2: Box<dyn RpcFiltererV2>,
+    /// The optional exists-address index (dcrd `ExistsAddresser`, nil
+    /// when disabled).
+    pub exists_addresser: Option<Box<dyn RpcExistsAddresser>>,
 }
 
 /// The sync manager operations the ported handlers perform (the used
@@ -419,6 +430,11 @@ pub trait RpcSyncManager {
     /// `SyncHeight`).
     fn sync_height(&mut self) -> i64 {
         unimplemented!("sync_height")
+    }
+    /// The id of the current sync peer, zero when none (dcrd
+    /// `SyncPeerID`).
+    fn sync_peer_id(&mut self) -> i32 {
+        unimplemented!("sync_peer_id")
     }
 }
 
@@ -463,10 +479,20 @@ pub trait RpcConnManager {
     fn disconnect_by_addr(&mut self, _addr: &str) -> Result<(), String> {
         unimplemented!("disconnect_by_addr")
     }
-    /// The ids and addresses of the currently connected peers (the
-    /// subset of dcrd `ConnectedPeers` the ported handlers read).
-    fn connected_peers(&mut self) -> Vec<(i32, String)> {
+    /// The currently connected peers (the subset of dcrd
+    /// `ConnectedPeers` the ported handlers read).
+    fn connected_peers(&mut self) -> Vec<RpcPeerInfo> {
         unimplemented!("connected_peers")
+    }
+    /// The persistent (added) peers (the subset of dcrd
+    /// `PersistentPeers` the ported handlers read).
+    fn persistent_peers(&mut self) -> Vec<RpcAddedNode> {
+        unimplemented!("persistent_peers")
+    }
+    /// DNS-resolve the host to its addresses rendered as strings
+    /// (dcrd `Lookup`).
+    fn lookup(&mut self, _host: &str) -> Result<Vec<String>, String> {
+        unimplemented!("lookup")
     }
     /// Broadcast the message to all connected peers (dcrd
     /// `BroadcastMessage`).
@@ -476,6 +502,102 @@ pub trait RpcConnManager {
 }
 
 impl RpcConnManager for () {}
+
+/// A connected peer as the ported handlers read it (the used subset
+/// of dcrd `rpcserver.Peer` plus its `peer.StatsSnap`).
+#[derive(Debug, Clone)]
+pub struct RpcPeerInfo {
+    /// The unique peer id.
+    pub id: i32,
+    /// The peer address.
+    pub addr: String,
+    /// The local address of the connection, when known.
+    pub local_addr: Option<String>,
+    /// The services the peer advertised.
+    pub services: u64,
+    /// Whether the peer has disabled transaction relay.
+    pub tx_relay_disabled: bool,
+    /// The last send time as unix seconds.
+    pub last_send_unix: i64,
+    /// The last receive time as unix seconds.
+    pub last_recv_unix: i64,
+    /// The total bytes sent.
+    pub bytes_sent: u64,
+    /// The total bytes received.
+    pub bytes_recv: u64,
+    /// The connection time as unix seconds.
+    pub conn_time_unix: i64,
+    /// The peer's time offset.
+    pub time_offset: i64,
+    /// The negotiated protocol version.
+    pub version: u32,
+    /// The peer's user agent.
+    pub user_agent: String,
+    /// Whether the peer is inbound.
+    pub inbound: bool,
+    /// The height the peer advertised at connect time.
+    pub starting_height: i64,
+    /// The latest block height the peer is known to have.
+    pub last_block: i64,
+    /// The peer's current ban score.
+    pub ban_score: u32,
+    /// The nonce of the outstanding ping, zero when none.
+    pub last_ping_nonce: u64,
+    /// When the outstanding ping was sent, as unix nanoseconds.
+    pub last_ping_time_unix_nanos: i64,
+    /// The last measured round trip in microseconds.
+    pub last_ping_micros: i64,
+    /// Whether the peer is currently connected.
+    pub connected: bool,
+}
+
+/// A persistent (added) peer as the ported handlers read it.
+#[derive(Debug, Clone)]
+pub struct RpcAddedNode {
+    /// The peer address.
+    pub addr: String,
+    /// Whether the peer is currently connected.
+    pub connected: bool,
+    /// Whether the peer is inbound.
+    pub inbound: bool,
+}
+
+/// The exists-address index operations the ported handlers perform
+/// (the used subset of dcrd's `rpcserver.ExistsAddresser`
+/// interface).
+pub trait RpcExistsAddresser {
+    /// The human-readable index name (dcrd `Name`).
+    fn name(&mut self) -> String {
+        unimplemented!("name")
+    }
+    /// The current index tip (dcrd `Tip`).
+    fn tip(&mut self) -> Result<(i64, Hash), String> {
+        unimplemented!("tip")
+    }
+    /// Wait for the index to signal synchronization, returning whether
+    /// the signal fired before dcrd's three-second timeout.
+    fn wait_for_sync(&mut self) -> bool {
+        unimplemented!("wait_for_sync")
+    }
+    /// Whether the address has ever been seen on chain (dcrd
+    /// `ExistsAddress`).
+    fn exists_address(
+        &mut self,
+        _addr: &dcroxide_txscript::stdaddr::Address,
+    ) -> Result<bool, String> {
+        unimplemented!("exists_address")
+    }
+    /// Whether each of the addresses has ever been seen on chain
+    /// (dcrd `ExistsAddresses`).
+    fn exists_addresses(
+        &mut self,
+        _addrs: &[dcroxide_txscript::stdaddr::Address],
+    ) -> Result<Vec<bool>, String> {
+        unimplemented!("exists_addresses")
+    }
+}
+
+impl RpcExistsAddresser for () {}
 
 /// A mempool transaction descriptor (the used subset of dcrd
 /// `mempool.TxDesc`).
@@ -539,6 +661,11 @@ pub trait RpcClock {
     /// the handler's millisecond conversion).
     fn now_unix_millis(&mut self) -> i64 {
         unimplemented!("now_unix_millis")
+    }
+    /// The nanoseconds elapsed since the given unix-nanosecond time
+    /// (dcrd `Clock.Since`).
+    fn since_nanos(&mut self, _t_unix_nanos: i64) -> i64 {
+        unimplemented!("since_nanos")
     }
 }
 

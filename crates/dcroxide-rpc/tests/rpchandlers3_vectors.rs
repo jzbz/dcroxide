@@ -517,6 +517,7 @@ fn stake_query_handler_slice_matches_dcrd() {
             tx_indexer: None,
             db: Box::new(()),
             filterer_v2: Box::new(()),
+            exists_addresser: None,
         });
 
         match dispatch(&mut server, method_name, &cmd) {

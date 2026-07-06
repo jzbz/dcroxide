@@ -17,8 +17,8 @@ use dcroxide_dcrjson::{GoType, GoValue, RPCError, Registry, gojson, parse_params
 use dcroxide_rpc::handlers;
 use dcroxide_rpc::helpers::NoInterfaces;
 use dcroxide_rpc::server::{
-    Config, RpcBestState, RpcChain, RpcClock, RpcConnManager, RpcMempoolTx, RpcSubsidyParams,
-    RpcTxMempooler, RpcVerboseMempoolTx, Server,
+    Config, RpcBestState, RpcChain, RpcClock, RpcConnManager, RpcMempoolTx, RpcPeerInfo,
+    RpcSubsidyParams, RpcTxMempooler, RpcVerboseMempoolTx, Server,
 };
 use dcroxide_rpctypes::chainsvrresults as results;
 use dcroxide_rpctypes::{method, register_all};
@@ -153,8 +153,33 @@ impl RpcConnManager for MockConnMgr {
     fn disconnect_by_addr(&mut self, _addr: &str) -> Result<(), String> {
         self.disconnect_by_addr.clone()
     }
-    fn connected_peers(&mut self) -> Vec<(i32, String)> {
-        self.peers.clone()
+    fn connected_peers(&mut self) -> Vec<RpcPeerInfo> {
+        self.peers
+            .iter()
+            .map(|(id, addr)| RpcPeerInfo {
+                id: *id,
+                addr: addr.clone(),
+                local_addr: None,
+                services: 0,
+                tx_relay_disabled: false,
+                last_send_unix: 0,
+                last_recv_unix: 0,
+                bytes_sent: 0,
+                bytes_recv: 0,
+                conn_time_unix: 0,
+                time_offset: 0,
+                version: 0,
+                user_agent: String::new(),
+                inbound: false,
+                starting_height: 0,
+                last_block: 0,
+                ban_score: 0,
+                last_ping_nonce: 0,
+                last_ping_time_unix_nanos: 0,
+                last_ping_micros: 0,
+                connected: true,
+            })
+            .collect()
     }
     fn broadcast_message(&mut self, _msg: &dcroxide_wire::Message) {}
 }
@@ -375,6 +400,7 @@ fn mempool_conn_handler_slice_matches_dcrd() {
             tx_indexer: None,
             db: Box::new(()),
             filterer_v2: Box::new(()),
+            exists_addresser: None,
         });
 
         match dispatch(&mut server, method_name, &cmd) {

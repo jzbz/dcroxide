@@ -157,10 +157,10 @@ Currently implemented:
   RPC error constructors, address/hash/difficulty helpers, getwork
   serialization, and the vin/vout/raw-transaction result builders),
   plus the first command handler slices (the stateless, chain-query,
-  stake-query, mempool/connection, and tx/utxo lookup commands) over
-  a Server scaffold with the chain, mempool, connection manager,
-  transaction index, database, filterer, and clock behind trait
-  seams, pinned by the complete generated help text,
+  stake-query, mempool/connection, tx/utxo lookup, and peer/address
+  commands) over a Server scaffold with the chain, mempool,
+  connection manager, indexes, database, filterer, and clock behind
+  trait seams, pinned by the complete generated help text,
   fully marshalled transaction results, and per-handler
   request/response cases from sessions generated inside dcrd's own
   package
