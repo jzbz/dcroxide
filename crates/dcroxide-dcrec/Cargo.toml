@@ -11,7 +11,7 @@ repository.workspace = true
 [dependencies]
 # The audited libsecp256k1 C library; dcrd's exact parsing/acceptance rules
 # are enforced by our own layer in front of it (ADR-0006).
-libsecp256k1 = { package = "secp256k1", version = "0.29", features = ["global-context"] }
+libsecp256k1 = { package = "secp256k1", version = "0.29", features = ["global-context", "recovery"] }
 # Pure-Rust scalar/point arithmetic for EC-Schnorr-DCRv0, which needs raw
 # group operations no packaged signing API exposes (ADR-0006).
 k256 = { version = "0.13", default-features = false, features = ["arithmetic", "precomputed-tables", "std"] }

@@ -214,6 +214,10 @@ impl PublicKey {
         &self.inner
     }
 
+    pub(crate) fn from_inner(inner: libsecp256k1::PublicKey) -> PublicKey {
+        PublicKey { inner }
+    }
+
     /// The key as a k256 projective point (for the Schnorr-DCRv0 math,
     /// which needs raw group operations per ADR-0006).
     pub(crate) fn as_k256_point(&self) -> k256::ProjectivePoint {

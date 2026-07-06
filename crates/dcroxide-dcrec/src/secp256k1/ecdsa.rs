@@ -312,6 +312,58 @@ fn scalar_from_der_int(bytes: &[u8], too_big: Error) -> Result<[u8; 32], Error> 
     Ok(out)
 }
 
+/// The size of a compact recoverable signature: one header byte
+/// carrying the recovery code plus R and S (dcrd `compactSigSize`).
+pub const COMPACT_SIG_SIZE: usize = 65;
+
+/// The value the compact signature header byte carries on top of the
+/// recovery code (dcrd `compactSigMagicOffset`).
+pub const COMPACT_SIG_MAGIC_OFFSET: u8 = 27;
+
+/// The header flag marking the public key as compressed (dcrd
+/// `compactSigCompPubKey`).
+pub const COMPACT_SIG_COMP_PUB_KEY: u8 = 4;
+
+/// Recover the public key from a compact recoverable signature over
+/// the 32-byte hash, returning it along with whether the signature
+/// commits to its compressed serialization (dcrd
+/// `ecdsa.RecoverCompact`; the individual dcrd error variants are
+/// collapsed since every caller in scope treats any failure as an
+/// invalid signature).
+// The unit error mirrors the collapse; the subtraction is guarded by
+// the range check above it.
+#[allow(clippy::result_unit_err, clippy::arithmetic_side_effects)]
+pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, bool), ()> {
+    // The signature must be the correct length.
+    if signature.len() != COMPACT_SIG_SIZE {
+        return Err(());
+    }
+
+    // The compact signature recovery code is the value 27 + the public
+    // key recovery code, with the compressed flag on top.
+    let sig_recovery_code = signature[0];
+    if !(COMPACT_SIG_MAGIC_OFFSET..COMPACT_SIG_MAGIC_OFFSET + COMPACT_SIG_COMP_PUB_KEY * 2)
+        .contains(&sig_recovery_code)
+    {
+        return Err(());
+    }
+    let sig_recovery_code = sig_recovery_code - COMPACT_SIG_MAGIC_OFFSET;
+    let was_compressed = sig_recovery_code & COMPACT_SIG_COMP_PUB_KEY != 0;
+    let pub_key_recovery_code = sig_recovery_code & 3;
+
+    // R and S must be in the half-open range [1, N) like dcrd, which the
+    // library enforces during parsing and recovery.
+    let recovery_id = libsecp256k1::ecdsa::RecoveryId::from_i32(i32::from(pub_key_recovery_code))
+        .map_err(|_| ())?;
+    let sig = libsecp256k1::ecdsa::RecoverableSignature::from_compact(&signature[1..], recovery_id)
+        .map_err(|_| ())?;
+    let msg = libsecp256k1::Message::from_digest(*hash);
+    let inner = libsecp256k1::SECP256K1
+        .recover_ecdsa(&msg, &sig)
+        .map_err(|_| ())?;
+    Ok((PublicKey::from_inner(inner), was_compressed))
+}
+
 /// Produce a deterministic (RFC6979) low-S signature for the 32-byte hash,
 /// matching dcrd `ecdsa.Sign` byte-for-byte (verified differentially).
 pub fn sign(priv_key: &PrivateKey, hash: &[u8; 32]) -> Signature {

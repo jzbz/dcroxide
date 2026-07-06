@@ -10,10 +10,12 @@
 //! requested, so whichever variant is generated first is returned
 //! for both.
 
+pub mod handlers;
 pub mod help;
 pub mod helpdescs;
 pub mod helpers;
 pub mod rpcerrors;
+pub mod server;
 pub mod txresults;
 
 pub use help::{HelpCacher, RPC_HANDLER_METHODS, WS_HANDLER_METHODS, rpc_result_types};

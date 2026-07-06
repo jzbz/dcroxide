@@ -446,6 +446,7 @@ version = "0.1.0"
 dependencies = [
  "dcroxide-chaincfg",
  "dcroxide-chainhash",
+ "dcroxide-dcrec",
  "dcroxide-dcrjson",
  "dcroxide-rpctypes",
  "dcroxide-stake",
