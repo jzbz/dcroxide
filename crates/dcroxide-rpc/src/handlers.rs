@@ -490,7 +490,7 @@ pub fn handle_decode_raw_transaction<C: RpcChain>(
 
     // Determine if the treasury rules are active as of the current
     // best tip.
-    let (prev_blk_hash, _) = server.cfg.chain.best_snapshot();
+    let prev_blk_hash = server.cfg.chain.best_snapshot().hash;
     let is_treasury_enabled = server.is_treasury_agenda_active(&prev_blk_hash)?;
 
     // Create and return the result.
@@ -607,9 +607,9 @@ pub fn handle_get_block_subsidy<C: RpcChain>(
     // Determine which agendas are active as of the provided height
     // when that height exists in the main chain or as of the current
     // best tip otherwise.
-    let (best_hash, best_height) = server.cfg.chain.best_snapshot();
-    let mut prev_blk_hash = best_hash;
-    if height <= best_height {
+    let best = server.cfg.chain.best_snapshot();
+    let mut prev_blk_hash = best.hash;
+    if height <= best.height {
         let header = server
             .cfg
             .chain
@@ -837,4 +837,475 @@ pub fn handle_verify_message<C: RpcChain>(
 fn write_var_string(w: &mut Vec<u8>, s: &str) {
     dcroxide_wire::write_var_int(w, s.len() as u64);
     w.extend_from_slice(s.as_bytes());
+}
+
+/// handlegetbestblock (dcrd `handleGetBestBlock`); the result is a
+/// `GetBestBlockResult` value.
+pub fn handle_get_best_block<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let best = server.cfg.chain.best_snapshot();
+    Ok(GoValue::Struct(vec![
+        GoValue::String(best.hash.to_string()),
+        GoValue::Int(best.height),
+    ]))
+}
+
+/// handlegetbestblockhash (dcrd `handleGetBestBlockHash`).
+pub fn handle_get_best_block_hash<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let best = server.cfg.chain.best_snapshot();
+    Ok(GoValue::String(best.hash.to_string()))
+}
+
+/// handlegetblockcount (dcrd `handleGetBlockCount`).
+pub fn handle_get_block_count<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    Ok(GoValue::Int(server.cfg.chain.best_snapshot().height))
+}
+
+/// handlegetcoinsupply (dcrd `handleGetCoinSupply`).
+pub fn handle_get_coin_supply<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    Ok(GoValue::Int(server.cfg.chain.best_snapshot().total_subsidy))
+}
+
+/// handlegetdifficulty (dcrd `handleGetDifficulty`).
+pub fn handle_get_difficulty<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let best = server.cfg.chain.best_snapshot();
+    Ok(GoValue::Float64(crate::helpers::get_difficulty_ratio(
+        best.bits,
+        server.cfg.chain_params.pow_limit_bits,
+    )))
+}
+
+/// handlegetblockhash (dcrd `handleGetBlockHash`).
+pub fn handle_get_block_hash<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let index = int(&c[0]);
+    let hash = server.cfg.chain.block_hash_by_height(index).map_err(|_| {
+        RPCError::new(
+            codes::OUT_OF_RANGE,
+            &format!("Block number out of range: {index}"),
+        )
+    })?;
+    Ok(GoValue::String(hash.to_string()))
+}
+
+/// handlegetchaintips (dcrd `handleGetChainTips`); the result is a
+/// slice of `GetChainTipsResult` values.
+pub fn handle_get_chain_tips<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let tips = server.cfg.chain.chain_tips();
+    Ok(GoValue::Array(
+        tips.into_iter()
+            .map(|tip| {
+                GoValue::Struct(vec![
+                    GoValue::Int(tip.height),
+                    GoValue::String(tip.hash.to_string()),
+                    GoValue::Int(tip.branch_len),
+                    GoValue::String(tip.status),
+                ])
+            })
+            .collect(),
+    ))
+}
+
+/// handlegetheaders (dcrd `handleGetHeaders`); the result is a
+/// `GetHeadersResult` value.
+pub fn handle_get_headers<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let locator_strs: Vec<String> = array(&c[0]).iter().map(|v| s(v).to_string()).collect();
+    let hash_stop_str = s(&c[1]);
+
+    let block_locators = crate::helpers::decode_hashes(&locator_strs)?;
+    let mut hash_stop = Hash([0u8; 32]);
+    if !hash_stop_str.is_empty() {
+        hash_stop = hash_stop_str
+            .parse()
+            .map_err(|e| rpc_invalid_error(&format!("Failed to decode hashstop: {e}")))?;
+    }
+
+    let headers = server.cfg.chain.locate_headers(&block_locators, &hash_stop);
+
+    // Return the serialized block headers as hex-encoded strings.
+    let hex_block_headers: Vec<GoValue> = headers
+        .iter()
+        .map(|h| GoValue::String(hex_str(&h.serialize())))
+        .collect();
+    Ok(GoValue::Struct(vec![GoValue::Array(hex_block_headers)]))
+}
+
+/// The shared verbose header/block fields: pow hash selection by the
+/// blake3 agenda, next hash, and confirmations.
+struct VerboseBlockCommon {
+    pow_hash: Hash,
+    next_hash_string: String,
+    confirmations: i64,
+}
+
+fn verbose_block_common<C: RpcChain>(
+    server: &mut Server<C>,
+    hash: &Hash,
+    header: &dcroxide_wire::BlockHeader,
+) -> Result<VerboseBlockCommon, RPCError> {
+    let best = server.cfg.chain.best_snapshot();
+
+    // Get next block hash unless there are none.
+    let mut next_hash_string = String::new();
+    let mut confirmations: i64 = -1;
+    let height = i64::from(header.height);
+    if server.cfg.chain.main_chain_has_block(hash) {
+        if height < best.height {
+            let next_hash = server
+                .cfg
+                .chain
+                .block_hash_by_height(height + 1)
+                .map_err(|e| rpc_internal_err(&e))?;
+            next_hash_string = next_hash.to_string();
+        }
+        confirmations = 1 + best.height - height;
+    }
+
+    let is_blake3_pow_active = server.is_blake3_pow_agenda_active(&header.prev_block)?;
+    let pow_hash = if is_blake3_pow_active {
+        header.pow_hash_v2()
+    } else {
+        header.block_hash()
+    };
+
+    Ok(VerboseBlockCommon {
+        pow_hash,
+        next_hash_string,
+        confirmations,
+    })
+}
+
+/// handlegetblockheader (dcrd `handleGetBlockHeader`); the verbose
+/// result is a `GetBlockHeaderVerboseResult` value and the
+/// non-verbose result is the serialized header hex string.
+pub fn handle_get_block_header<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let hash_str = s(&c[0]);
+    let verbose = opt_bool(&c[1]);
+
+    // Fetch the header from chain.
+    let hash: Hash = hash_str
+        .parse()
+        .map_err(|_| rpc_decode_hex_error(hash_str))?;
+    let header = server.cfg.chain.header_by_hash(&hash).map_err(|_| {
+        RPCError::new(
+            codes::BLOCK_NOT_FOUND,
+            &format!("Block not found: {hash_str}"),
+        )
+    })?;
+
+    // When the verbose flag isn't set, simply return the serialized
+    // block header as a hex-encoded string.
+    if let Some(false) = verbose {
+        return Ok(GoValue::String(hex_str(&header.serialize())));
+    }
+
+    // The verbose flag is set, so generate the JSON object and return
+    // it.
+    let chain_work = server
+        .cfg
+        .chain
+        .chain_work(&hash)
+        .map_err(|e| rpc_internal_err(&e))?;
+
+    let common = verbose_block_common(server, &hash, &header)?;
+
+    let median_time = server
+        .cfg
+        .chain
+        .median_time_by_hash(&hash)
+        .map_err(|e| rpc_internal_err(&e))?;
+
+    Ok(GoValue::Struct(vec![
+        GoValue::String(hash_str.to_string()),
+        GoValue::String(common.pow_hash.to_string()),
+        GoValue::Int(common.confirmations),
+        GoValue::Int(i64::from(header.version)),
+        GoValue::String(header.merkle_root.to_string()),
+        GoValue::String(header.stake_root.to_string()),
+        GoValue::Uint(u64::from(header.vote_bits)),
+        GoValue::String(hex_str(&header.final_state)),
+        GoValue::Uint(u64::from(header.voters)),
+        GoValue::Uint(u64::from(header.fresh_stake)),
+        GoValue::Uint(u64::from(header.revocations)),
+        GoValue::Uint(u64::from(header.pool_size)),
+        GoValue::String(format!("{:x}", header.bits)),
+        GoValue::Float64(txresults::to_coin(header.sbits)),
+        GoValue::Uint(u64::from(header.height)),
+        GoValue::Uint(u64::from(header.size)),
+        GoValue::Int(i64::from(header.timestamp)),
+        GoValue::Int(median_time),
+        GoValue::Uint(u64::from(header.nonce)),
+        GoValue::String(hex_str(&header.extra_data)),
+        GoValue::Uint(u64::from(header.stake_version)),
+        GoValue::Float64(crate::helpers::get_difficulty_ratio(
+            header.bits,
+            server.cfg.chain_params.pow_limit_bits,
+        )),
+        GoValue::String(format!("{chain_work:064x}")),
+        GoValue::String(header.prev_block.to_string()),
+        GoValue::String(common.next_hash_string),
+    ]))
+}
+
+/// handlegetblock (dcrd `handleGetBlock`); the verbose result is a
+/// `GetBlockVerboseResult` value and the non-verbose result is the
+/// serialized block hex string.
+pub fn handle_get_block<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let hash_str = s(&c[0]);
+    let verbose = opt_bool(&c[1]);
+    let verbose_tx = opt_bool(&c[2]);
+
+    // Load the raw block bytes from the database.  Note the parsed
+    // hash renders into the not-found message, unlike getblockheader.
+    let hash: Hash = hash_str
+        .parse()
+        .map_err(|_| rpc_decode_hex_error(hash_str))?;
+    let block =
+        server.cfg.chain.block_by_hash(&hash).map_err(|_| {
+            RPCError::new(codes::BLOCK_NOT_FOUND, &format!("Block not found: {hash}"))
+        })?;
+
+    // When the verbose flag isn't set, simply return the
+    // network-serialized block as a hex-encoded string.
+    if let Some(false) = verbose {
+        return Ok(GoValue::String(hex_str(&block.serialize())));
+    }
+
+    let chain_work = server
+        .cfg
+        .chain
+        .chain_work(&hash)
+        .map_err(|e| rpc_internal_err(&e))?;
+
+    let header = block.header;
+    let common = verbose_block_common(server, &hash, &header)?;
+
+    let sbits_float = header.sbits as f64 / 1e8;
+
+    let median_time = server
+        .cfg
+        .chain
+        .median_time_by_hash(&hash)
+        .map_err(|e| rpc_internal_err(&e))?;
+
+    // Determine if the treasury rules are active for the block.
+    let is_treasury_enabled = server.is_treasury_agenda_active(&header.prev_block)?;
+
+    let (tx, raw_tx, stx, raw_stx);
+    if !matches!(verbose_tx, Some(true)) {
+        tx = GoValue::Array(
+            block
+                .transactions
+                .iter()
+                .map(|t| GoValue::String(t.tx_hash().to_string()))
+                .collect(),
+        );
+        stx = GoValue::Array(
+            block
+                .stransactions
+                .iter()
+                .map(|t| GoValue::String(t.tx_hash().to_string()))
+                .collect(),
+        );
+        raw_tx = GoValue::Null;
+        raw_stx = GoValue::Null;
+    } else {
+        let block_hash_str = block.header.block_hash().to_string();
+        let build = |txns: &[MsgTx]| -> Result<GoValue, RPCError> {
+            let mut raw = Vec::with_capacity(txns.len());
+            for (i, t) in txns.iter().enumerate() {
+                raw.push(txresults::create_tx_raw_result(
+                    &server.cfg.chain_params,
+                    t,
+                    &t.tx_hash().to_string(),
+                    i as u32,
+                    Some(&header),
+                    &block_hash_str,
+                    i64::from(header.height),
+                    common.confirmations,
+                    is_treasury_enabled,
+                    server.cfg.max_protocol_version,
+                    server.cfg.chain_params.net,
+                )?);
+            }
+            Ok(GoValue::Array(raw))
+        };
+        raw_tx = build(&block.transactions)?;
+        raw_stx = build(&block.stransactions)?;
+        tx = GoValue::Null;
+        stx = GoValue::Null;
+    }
+
+    Ok(GoValue::Struct(vec![
+        GoValue::String(hash_str.to_string()),
+        GoValue::String(common.pow_hash.to_string()),
+        GoValue::Int(common.confirmations),
+        GoValue::Int(i64::from(header.size as i32)),
+        GoValue::Int(i64::from(header.height)),
+        GoValue::Int(i64::from(header.version)),
+        GoValue::String(header.merkle_root.to_string()),
+        GoValue::String(header.stake_root.to_string()),
+        tx,
+        raw_tx,
+        stx,
+        raw_stx,
+        GoValue::Int(i64::from(header.timestamp)),
+        GoValue::Int(median_time),
+        GoValue::Uint(u64::from(header.nonce)),
+        GoValue::Uint(u64::from(header.vote_bits)),
+        GoValue::String(hex_str(&header.final_state)),
+        GoValue::Uint(u64::from(header.voters)),
+        GoValue::Uint(u64::from(header.fresh_stake)),
+        GoValue::Uint(u64::from(header.revocations)),
+        GoValue::Uint(u64::from(header.pool_size)),
+        GoValue::String(format!("{:x}", header.bits)),
+        GoValue::Float64(sbits_float),
+        GoValue::String(hex_str(&header.extra_data)),
+        GoValue::Uint(u64::from(header.stake_version)),
+        GoValue::Float64(crate::helpers::get_difficulty_ratio(
+            header.bits,
+            server.cfg.chain_params.pow_limit_bits,
+        )),
+        GoValue::String(format!("{chain_work:064x}")),
+        GoValue::String(header.prev_block.to_string()),
+        GoValue::String(common.next_hash_string),
+    ]))
+}
+
+/// handlegetblockchaininfo (dcrd `handleGetBlockchainInfo`); the
+/// result is a `GetBlockChainInfoResult` value.
+pub fn handle_get_blockchain_info<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let best = server.cfg.chain.best_snapshot();
+    let (_, best_header_height) = server.cfg.chain.best_header();
+
+    // Fetch the current chain work using the best block hash.
+    let chain_work = server
+        .cfg
+        .chain
+        .chain_work(&best.hash)
+        .map_err(|e| rpc_internal_err(&e))?;
+
+    // Estimate the verification progress of the node.
+    let mut verify_progress = 0.0f64;
+    if best_header_height > 0 {
+        let progress = best.height as f64 / best_header_height as f64;
+        verify_progress = progress.min(1.0);
+    }
+
+    // Fetch the maximum allowed block size for all blocks other than
+    // the genesis block.
+    let zero_hash = Hash([0u8; 32]);
+    let params = server.cfg.chain_params.clone();
+    let mut max_block_size = params.maximum_block_sizes[0] as i64;
+    if best.prev_hash != zero_hash {
+        max_block_size = server
+            .cfg
+            .chain
+            .max_block_size(&best.prev_hash)
+            .map_err(|e| rpc_internal_err(&e))?;
+    }
+
+    // Fetch the agendas of the consensus deployments as well as their
+    // threshold states and state activation heights.  The map is
+    // filled per agenda id; the encoder emits it bytewise sorted,
+    // matching Go.
+    let mut d_info: Vec<(String, GoValue)> = Vec::new();
+    for (_, deployments) in &params.deployments {
+        for agenda in deployments {
+            let mut status = crate::helpers::threshold::State::Defined;
+            let mut since = 0i64;
+
+            // If the best block is the genesis block, continue without
+            // attempting to query the threshold state or state changed
+            // height.
+            if best.prev_hash != zero_hash {
+                status = server
+                    .cfg
+                    .chain
+                    .next_threshold_state(&best.prev_hash, agenda.vote.id)
+                    .map_err(|e| rpc_internal_err(&e))?;
+
+                since = server
+                    .cfg
+                    .chain
+                    .state_last_changed_height(&best.hash, agenda.vote.id)
+                    .map_err(|e| rpc_internal_err(&e))?;
+            }
+
+            d_info.push((
+                agenda.vote.id.to_string(),
+                GoValue::Struct(vec![
+                    GoValue::String(status.status_string().to_string()),
+                    GoValue::Int(since),
+                    GoValue::Uint(agenda.start_time),
+                    GoValue::Uint(agenda.expire_time),
+                ]),
+            ));
+        }
+    }
+
+    Ok(GoValue::Struct(vec![
+        GoValue::String(params.name.to_string()),
+        GoValue::Int(best.height),
+        GoValue::Int(best_header_height),
+        GoValue::Int(server.cfg.sync_mgr.sync_height()),
+        GoValue::String(best.hash.to_string()),
+        GoValue::Uint(u64::from(best.bits)),
+        GoValue::Float64(crate::helpers::get_difficulty_ratio(
+            best.bits,
+            params.pow_limit_bits,
+        )),
+        GoValue::Float64(verify_progress),
+        GoValue::String(format!("{chain_work:064x}")),
+        GoValue::Bool(!server.cfg.chain.is_current()),
+        GoValue::Int(max_block_size),
+        GoValue::Map(d_info),
+    ]))
+}
+
+fn opt_bool(v: &GoValue) -> Option<bool> {
+    match v {
+        GoValue::Null => None,
+        GoValue::Bool(b) => Some(*b),
+        other => panic!("expected optional bool field, got {other:?}"),
+    }
+}
+
+fn hex_str(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

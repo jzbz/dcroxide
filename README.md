@@ -156,9 +156,10 @@ Currently implemented:
   help/usage provider) and the handlers' pure transform layer (the
   RPC error constructors, address/hash/difficulty helpers, getwork
   serialization, and the vin/vout/raw-transaction result builders),
-  plus the first command handler slice over a Server scaffold with
-  the chain behind a trait seam, pinned by the complete generated
-  help text, fully marshalled transaction results, and per-handler
+  plus the first command handler slices (the stateless commands and
+  the chain-query commands) over a Server scaffold with the chain
+  behind a trait seam, pinned by the complete generated help text,
+  fully marshalled transaction results, and per-handler
   request/response cases from sessions generated inside dcrd's own
   package
 - `dcroxide-netsync` — the network chain synchronization manager

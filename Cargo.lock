@@ -453,6 +453,7 @@ dependencies = [
  "dcroxide-standalone",
  "dcroxide-testutil",
  "dcroxide-txscript",
+ "dcroxide-uint256",
  "dcroxide-wire",
  "num-bigint",
 ]

@@ -9,7 +9,8 @@ use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_dcrjson::RPCError;
 use dcroxide_standalone::SubsidyCache;
-use dcroxide_wire::BlockHeader;
+use dcroxide_uint256::Uint256;
+use dcroxide_wire::{BlockHeader, MsgBlock};
 
 use crate::rpcerrors::rpc_internal_err;
 
@@ -54,9 +55,55 @@ impl dcroxide_standalone::SubsidyParams for RpcSubsidyParams {
 /// of dcrd's `rpcserver.Chain` interface; it grows with each handler
 /// slice).
 pub trait RpcChain {
-    /// The current best chain snapshot hash and height (dcrd
-    /// `BestSnapshot`).
-    fn best_snapshot(&mut self) -> (Hash, i64);
+    /// The current best chain snapshot (dcrd `BestSnapshot`).
+    fn best_snapshot(&mut self) -> RpcBestState;
+    /// The hash and height of the current best known header (dcrd
+    /// `BestHeader`).
+    fn best_header(&mut self) -> (Hash, i64);
+    /// The block with the given hash (dcrd `BlockByHash`).
+    fn block_by_hash(&mut self, hash: &Hash) -> Result<MsgBlock, String>;
+    /// The hash of the main chain block at the given height (dcrd
+    /// `BlockHashByHeight`).
+    fn block_hash_by_height(&mut self, height: i64) -> Result<Hash, String>;
+    /// The current chain tips (dcrd `ChainTips`).
+    fn chain_tips(&mut self) -> Vec<RpcChainTip>;
+    /// The cumulative work of the block with the given hash (dcrd
+    /// `ChainWork`).
+    fn chain_work(&mut self, hash: &Hash) -> Result<Uint256, String>;
+    /// The header of the block with the given hash (dcrd
+    /// `HeaderByHash`).
+    fn header_by_hash(&mut self, hash: &Hash) -> Result<BlockHeader, String>;
+    /// Whether the chain believes it is current (dcrd `IsCurrent`).
+    fn is_current(&mut self) -> bool;
+    /// The headers after the first known block in the provided
+    /// locators up to the stop hash (dcrd `LocateHeaders`).
+    fn locate_headers(&mut self, locators: &[Hash], hash_stop: &Hash) -> Vec<BlockHeader>;
+    /// Whether the block is in the main chain (dcrd
+    /// `MainChainHasBlock`).
+    fn main_chain_has_block(&mut self, hash: &Hash) -> bool;
+    /// The maximum allowed block size as of the given block (dcrd
+    /// `MaxBlockSize`).
+    fn max_block_size(&mut self, prev_blk_hash: &Hash) -> Result<i64, String>;
+    /// The past median time of the block with the given hash, as unix
+    /// seconds (dcrd `MedianTimeByHash`).
+    fn median_time_by_hash(&mut self, hash: &Hash) -> Result<i64, String>;
+    /// The next threshold state of the given agenda as of the given
+    /// block (dcrd `NextThresholdState`).
+    fn next_threshold_state(
+        &mut self,
+        prev_blk_hash: &Hash,
+        deployment_id: &str,
+    ) -> Result<crate::helpers::threshold::State, String>;
+    /// The height the agenda's state last changed (dcrd
+    /// `StateLastChangedHeight`).
+    fn state_last_changed_height(
+        &mut self,
+        hash: &Hash,
+        deployment_id: &str,
+    ) -> Result<i64, String>;
+    /// Whether the blake3 proof of work agenda is active (dcrd
+    /// `IsBlake3PowAgendaActive`).
+    fn is_blake3_pow_agenda_active(&mut self, prev_blk_hash: &Hash) -> Result<bool, String>;
     /// The header of the main chain block at the given height (dcrd
     /// `HeaderByHeight`; the error text only feeds the wrapped
     /// internal error).
@@ -86,6 +133,45 @@ pub struct Config<C> {
     /// The maximum protocol version the server supports (drives
     /// message serialization).
     pub max_protocol_version: u32,
+    /// The sync manager (dcrd `SyncMgr`).
+    pub sync_mgr: Box<dyn RpcSyncManager>,
+}
+
+/// The sync manager operations the ported handlers perform (the used
+/// subset of dcrd's `rpcserver.SyncManager` interface).
+pub trait RpcSyncManager {
+    /// The latest known block height being synced to (dcrd
+    /// `SyncHeight`).
+    fn sync_height(&mut self) -> i64;
+}
+
+/// The best chain snapshot fields the ported handlers consume (a
+/// growing subset of dcrd's `blockchain.BestState`).
+#[derive(Debug, Clone)]
+pub struct RpcBestState {
+    /// The hash of the best block.
+    pub hash: Hash,
+    /// The previous block hash.
+    pub prev_hash: Hash,
+    /// The height of the best block.
+    pub height: i64,
+    /// The difficulty bits of the best block.
+    pub bits: u32,
+    /// The total subsidy issued by the chain.
+    pub total_subsidy: i64,
+}
+
+/// A chain tip description (dcrd `blockchain.ChainTipInfo`).
+#[derive(Debug, Clone)]
+pub struct RpcChainTip {
+    /// The height of the tip.
+    pub height: i64,
+    /// The hash of the tip block.
+    pub hash: Hash,
+    /// The length of the branch off the main chain.
+    pub branch_len: i64,
+    /// The tip status string.
+    pub status: String,
 }
 
 /// The RPC server core (dcrd `Server`): the handler host.
@@ -123,6 +209,17 @@ impl<C: RpcChain> Server<C> {
         self.cfg
             .chain
             .is_subsidy_split_agenda_active(prev_blk_hash)
+            .map_err(|e| rpc_internal_err(&e))
+    }
+
+    /// dcrd `Server.isBlake3PowAgendaActive`.
+    pub(crate) fn is_blake3_pow_agenda_active(
+        &mut self,
+        prev_blk_hash: &Hash,
+    ) -> Result<bool, RPCError> {
+        self.cfg
+            .chain
+            .is_blake3_pow_agenda_active(prev_blk_hash)
             .map_err(|e| rpc_internal_err(&e))
     }
 

@@ -16,13 +16,24 @@ use dcroxide_chaincfg::mainnet_params;
 use dcroxide_chainhash::Hash;
 use dcroxide_dcrjson::{GoType, GoValue, RPCError, Registry, gojson, parse_params};
 use dcroxide_rpc::handlers;
-use dcroxide_rpc::server::{Config, RpcChain, RpcSubsidyParams, Server};
+use dcroxide_rpc::server::{
+    Config, RpcBestState, RpcChain, RpcChainTip, RpcSubsidyParams, RpcSyncManager, Server,
+};
 use dcroxide_rpctypes::chainsvrresults as results;
 use dcroxide_rpctypes::{method, register_all};
 use dcroxide_standalone::SubsidyCache;
 use dcroxide_wire::{BlockHeader, PROTOCOL_VERSION};
 
 const VECTORS: &str = include_str!("data/rpchandlers_vectors.txt");
+
+/// The sync manager is unused by the stateless slice.
+struct StubSyncManager;
+
+impl RpcSyncManager for StubSyncManager {
+    fn sync_height(&mut self) -> i64 {
+        unreachable!("not used by the stateless slice")
+    }
+}
 
 fn unhex(s: &str) -> Vec<u8> {
     (0..s.len())
@@ -106,8 +117,61 @@ struct MockChain {
 }
 
 impl RpcChain for MockChain {
-    fn best_snapshot(&mut self) -> (Hash, i64) {
-        (self.best_hash, self.best_height)
+    fn best_snapshot(&mut self) -> RpcBestState {
+        RpcBestState {
+            hash: self.best_hash,
+            prev_hash: Hash([0u8; 32]),
+            height: self.best_height,
+            bits: 0,
+            total_subsidy: 0,
+        }
+    }
+
+    fn best_header(&mut self) -> (Hash, i64) {
+        unreachable!("not used by the stateless slice")
+    }
+    fn block_by_hash(&mut self, _hash: &Hash) -> Result<dcroxide_wire::MsgBlock, String> {
+        unreachable!("not used by the stateless slice")
+    }
+    fn block_hash_by_height(&mut self, _height: i64) -> Result<Hash, String> {
+        unreachable!("not used by the stateless slice")
+    }
+    fn chain_tips(&mut self) -> Vec<RpcChainTip> {
+        unreachable!("not used by the stateless slice")
+    }
+    fn chain_work(&mut self, _hash: &Hash) -> Result<dcroxide_uint256::Uint256, String> {
+        unreachable!("not used by the stateless slice")
+    }
+    fn is_current(&mut self) -> bool {
+        unreachable!("not used by the stateless slice")
+    }
+    fn locate_headers(&mut self, _locators: &[Hash], _stop: &Hash) -> Vec<BlockHeader> {
+        unreachable!("not used by the stateless slice")
+    }
+    fn main_chain_has_block(&mut self, _hash: &Hash) -> bool {
+        unreachable!("not used by the stateless slice")
+    }
+    fn max_block_size(&mut self, _prev: &Hash) -> Result<i64, String> {
+        unreachable!("not used by the stateless slice")
+    }
+    fn median_time_by_hash(&mut self, _hash: &Hash) -> Result<i64, String> {
+        unreachable!("not used by the stateless slice")
+    }
+    fn next_threshold_state(
+        &mut self,
+        _prev: &Hash,
+        _id: &str,
+    ) -> Result<dcroxide_rpc::helpers::threshold::State, String> {
+        unreachable!("not used by the stateless slice")
+    }
+    fn state_last_changed_height(&mut self, _hash: &Hash, _id: &str) -> Result<i64, String> {
+        unreachable!("not used by the stateless slice")
+    }
+    fn is_blake3_pow_agenda_active(&mut self, _prev: &Hash) -> Result<bool, String> {
+        unreachable!("not used by the stateless slice")
+    }
+    fn header_by_hash(&mut self, _hash: &Hash) -> Result<BlockHeader, String> {
+        unreachable!("not used by the stateless slice")
     }
 
     fn header_by_height(&mut self, _height: i64) -> Result<BlockHeader, String> {
@@ -182,8 +246,54 @@ struct FailingOrMock {
 }
 
 impl RpcChain for FailingOrMock {
-    fn best_snapshot(&mut self) -> (Hash, i64) {
+    fn best_snapshot(&mut self) -> RpcBestState {
         self.inner.best_snapshot()
+    }
+    fn best_header(&mut self) -> (Hash, i64) {
+        self.inner.best_header()
+    }
+    fn block_by_hash(&mut self, hash: &Hash) -> Result<dcroxide_wire::MsgBlock, String> {
+        self.inner.block_by_hash(hash)
+    }
+    fn block_hash_by_height(&mut self, height: i64) -> Result<Hash, String> {
+        self.inner.block_hash_by_height(height)
+    }
+    fn chain_tips(&mut self) -> Vec<RpcChainTip> {
+        self.inner.chain_tips()
+    }
+    fn chain_work(&mut self, hash: &Hash) -> Result<dcroxide_uint256::Uint256, String> {
+        self.inner.chain_work(hash)
+    }
+    fn is_current(&mut self) -> bool {
+        self.inner.is_current()
+    }
+    fn locate_headers(&mut self, locators: &[Hash], stop: &Hash) -> Vec<BlockHeader> {
+        self.inner.locate_headers(locators, stop)
+    }
+    fn main_chain_has_block(&mut self, hash: &Hash) -> bool {
+        self.inner.main_chain_has_block(hash)
+    }
+    fn max_block_size(&mut self, prev: &Hash) -> Result<i64, String> {
+        self.inner.max_block_size(prev)
+    }
+    fn median_time_by_hash(&mut self, hash: &Hash) -> Result<i64, String> {
+        self.inner.median_time_by_hash(hash)
+    }
+    fn next_threshold_state(
+        &mut self,
+        prev: &Hash,
+        id: &str,
+    ) -> Result<dcroxide_rpc::helpers::threshold::State, String> {
+        self.inner.next_threshold_state(prev, id)
+    }
+    fn state_last_changed_height(&mut self, hash: &Hash, id: &str) -> Result<i64, String> {
+        self.inner.state_last_changed_height(hash, id)
+    }
+    fn is_blake3_pow_agenda_active(&mut self, prev: &Hash) -> Result<bool, String> {
+        self.inner.is_blake3_pow_agenda_active(prev)
+    }
+    fn header_by_hash(&mut self, hash: &Hash) -> Result<BlockHeader, String> {
+        self.inner.header_by_hash(hash)
     }
     fn header_by_height(&mut self, height: i64) -> Result<BlockHeader, String> {
         self.inner.header_by_height(height)
@@ -255,6 +365,7 @@ fn handler_slice_matches_dcrd() {
             subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
+            sync_mgr: Box::new(StubSyncManager),
         });
 
         match dispatch(&mut server, method_name, &cmd) {
