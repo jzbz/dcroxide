@@ -8,6 +8,7 @@ members = [
     "crates/dcroxide-crypto",
     "crates/dcroxide-database",
     "crates/dcroxide-dcrec",
+    "crates/dcroxide-fees",
     "crates/dcroxide-gcs",
     "crates/dcroxide-mempool",
     "crates/dcroxide-stake",

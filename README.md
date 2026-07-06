@@ -99,6 +99,10 @@ Currently implemented:
   batch acceptance, pruning, and the vote, revocation, and treasury
   spend acceptance paths — pinned by dcrd's own policy verdicts and
   scripted pool sessions generated with dcrd's own test harness
+- `dcroxide-fees` — the smart fee estimator from dcrd's
+  `internal/fees`: decaying confirmation tracking over exponential
+  fee rate buckets and the median fee estimation, replaying dcrd's
+  floating point accounting bit for bit
 - `dcroxide-gcs` — Golomb-coded set filters (versions 1 and 2) and the
   DCP0005 version 2 block committed filters for light clients, matched
   differentially against dcrd over random filters and structured blocks

@@ -265,6 +265,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-fees"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-chainhash",
+ "dcroxide-stake",
+ "dcroxide-testutil",
+]
+
+[[package]]
 name = "dcroxide-gcs"
 version = "0.1.0"
 dependencies = [

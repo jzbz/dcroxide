@@ -1,0 +1,19 @@
+[package]
+name = "dcroxide-fees"
+description = "Smart fee estimation mirroring dcrd's internal/fees package"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-stake = { path = "../dcroxide-stake" }
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true
