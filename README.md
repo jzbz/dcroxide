@@ -106,7 +106,9 @@ Currently implemented:
 - `dcroxide-mining` — the beginnings of block template mining support
   from dcrd's `internal/mining`: the transaction dependency graph and
   mining view with ancestor statistics tracking, the priority queue
-  with Go's exact heap semantics, and the priority calculation, now
+  with Go's exact heap semantics, the priority calculation, and the
+  block template building blocks (coinbase and treasurybase
+  construction, parent vote sorting, and the template roots), now
   wired into the mempool's mining hooks
 - `dcroxide-gcs` — Golomb-coded set filters (versions 1 and 2) and the
   DCP0005 version 2 block committed filters for light clients, matched
