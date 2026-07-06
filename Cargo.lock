@@ -396,6 +396,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-rpc"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-dcrjson",
+ "dcroxide-rpctypes",
+ "dcroxide-testutil",
+]
+
+[[package]]
 name = "dcroxide-rpctypes"
 version = "0.1.0"
 dependencies = [

@@ -81,3 +81,19 @@ Entry format:
 - **Pinned by:** `addrmgr_vectors` (the `viability future`/`stale`
   rows show crafted extreme timestamps loading as not-bad because the
   load re-stamps them)
+
+## QK-0005 — the RPC help cacher's usage string ignores the websocket flag
+
+- **Where:** dcrd `internal/rpcserver` `helpCacher.RPCUsage` /
+  dcroxide-rpc `help.rs` `HelpCacher::rpc_usage`
+- **What:** the cacher stores one usage string and returns it for any
+  later call without checking whether it was generated with or
+  without the websocket commands. The HTTP `help` handler requests
+  the non-websocket form and the websocket `help` handler requests
+  the websocket form, so whichever transport asks first fixes the
+  usage text both transports serve for the life of the process.
+- **Why reproduced:** the `help` RPC output with no arguments must
+  match dcrd's under the same request ordering.
+- **Pinned by:** `rpchelp_vectors` (the `usage poisoned` row shows a
+  websocket-flag request returning the previously cached
+  non-websocket text, which differs from the true websocket form)

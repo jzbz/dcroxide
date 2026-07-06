@@ -150,6 +150,12 @@ Currently implemented:
   marshaling, pinned by usage text, zero-value marshals of every
   type, and curated populated round trips generated inside dcrd's
   own package
+- `dcroxide-rpc` — RPC server components from dcrd's
+  `internal/rpcserver`, starting with the help subsystem: the
+  English help description map, the per-method result types, and
+  the caching help/usage provider, pinned by the complete generated
+  help text for every method byte for byte from a session generated
+  inside dcrd's own package
 - `dcroxide-mixing` — the StakeShuffle mixing support from dcrd's
   `mixing` package: message identity hashes and Schnorr signatures,
   session ID derivation and validation, the DC-net finite field and

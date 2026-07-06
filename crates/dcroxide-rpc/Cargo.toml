@@ -1,0 +1,19 @@
+[package]
+name = "dcroxide-rpc"
+description = "RPC server components mirroring dcrd's internal/rpcserver, starting with the help subsystem"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-dcrjson = { path = "../dcroxide-dcrjson" }
+dcroxide-rpctypes = { path = "../dcroxide-rpctypes" }
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true
