@@ -156,6 +156,14 @@ Currently implemented:
   the caching help/usage provider, pinned by the complete generated
   help text for every method byte for byte from a session generated
   inside dcrd's own package
+- `dcroxide-peer` — the peer-to-peer protocol decision core from
+  dcrd's `peer` package: version negotiation with self-connection
+  detection and dcrd's exact acceptance rules, local version
+  construction including proxy address hiding, the push builders
+  with duplicate filters, ping/pong state, known-inventory
+  tracking, and the stall deadline table, pinned by negotiations
+  against dcrd's own package over real piped connections byte for
+  byte
 - `dcroxide-certgen` — self-signed TLS certificate generation from
   dcrd's `certgen` over an exact DER writer for Go's certificate
   shape: Ed25519 pairs pin byte for byte and ECDSA pairs pin their

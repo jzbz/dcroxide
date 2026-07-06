@@ -139,3 +139,21 @@ Entry format:
 - **Pinned by:** `certgen_vectors` (the `ed non-ascii-host` row pins
   the exact error text while the `ec idna` row pins the converted
   names in the certificate bytes)
+
+## QK-0008 — an invalid configured user agent is silently discarded
+
+- **Where:** dcrd `peer` `localVersionMsg` / dcroxide-peer `peer.rs`
+  `local_version_msg`
+- **What:** the local version message is built by appending the
+  configured user agent name, version, and comments to the wire
+  module's default agent, but dcrd ignores the error returned by
+  `AddUserAgent`. When the assembled agent is invalid — over 256
+  bytes or containing non-printable characters — the version message
+  silently advertises only the default `/dcrwire:1.0.0/` instead of
+  failing or truncating.
+- **Why reproduced:** the advertised user agent is observable by
+  every remote peer and must match dcrd's under identical
+  configuration.
+- **Pinned by:** `peer_vectors` (the `neg in-ua-overlong` row pins a
+  version message carrying only the default agent for a
+  configuration with a 300-byte comment)

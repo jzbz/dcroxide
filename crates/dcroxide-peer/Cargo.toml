@@ -1,0 +1,20 @@
+[package]
+name = "dcroxide-peer"
+description = "The peer-to-peer protocol decision core mirroring dcrd's peer package"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-containers = { path = "../dcroxide-containers" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true

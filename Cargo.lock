@@ -417,6 +417,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-peer"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-chainhash",
+ "dcroxide-containers",
+ "dcroxide-testutil",
+ "dcroxide-wire",
+]
+
+[[package]]
 name = "dcroxide-rpc"
 version = "0.1.0"
 dependencies = [

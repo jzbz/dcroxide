@@ -50,7 +50,7 @@ impl fmt::Display for InvType {
 
 /// An inventory vector advertising or requesting data (dcrd `InvVect`).
 /// Unknown type values decode without error, exactly like dcrd.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InvVect {
     /// The type of data.
     pub inv_type: InvType,
