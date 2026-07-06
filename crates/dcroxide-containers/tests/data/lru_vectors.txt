@@ -1,0 +1,180 @@
+clock 1000000000000
+mapnew 3 0 1000000000000
+state 0 - - 4059000000000000
+put a 1
+ev 0
+state 1 a 1 4059000000000000
+put b 2
+ev 0
+state 2 a,b 1,2 4059000000000000
+put c 3
+ev 0
+state 3 a,b,c 1,2,3 4059000000000000
+put d 4
+ev 1
+state 3 b,c,d 2,3,4 4059000000000000
+get a
+got - false
+state 3 b,c,d 2,3,4 0000000000000000
+get b
+got 2 true
+state 3 c,d,b 3,4,2 4049000000000000
+put e 5
+ev 1
+state 3 d,b,e 4,2,5 4049000000000000
+peek d
+got 4 true
+exists e
+is true
+put b 22
+ev 0
+state 3 d,e,b 4,5,22 4049000000000000
+get d
+got 4 true
+state 3 e,b,d 5,22,4 4050aaaaaaaaaaaa
+get e
+got 5 true
+state 3 b,d,e 22,4,5 4052c00000000000
+delete d
+state 2 b,e 22,5 4052c00000000000
+delete missing
+state 2 b,e 22,5 4052c00000000000
+clear
+state 0 - - 4059000000000000
+get b
+got - false
+state 0 - - 0000000000000000
+mapnew 0 0 1000000000000
+state 0 - - 4059000000000000
+put a 1
+ev 0
+state 0 - - 4059000000000000
+get a
+got - false
+state 0 - - 0000000000000000
+clock 2000000000000
+mapnew 5 10000000000 2000000000000
+state 0 - - 4059000000000000
+put a 1
+ev 0
+state 1 a 1 4059000000000000
+put b 2
+ev 0
+state 2 a,b 1,2 4059000000000000
+clock 2005000000000
+put c 3
+ev 0
+state 3 a,b,c 1,2,3 4059000000000000
+putttl nx keep 0
+ev 0
+state 4 a,b,c,nx 1,2,3,keep 4059000000000000
+clock 2011000000000
+exists a
+is false
+get a
+got - false
+state 4 c,nx 3,keep 0000000000000000
+peek b
+got - false
+put d 4
+ev 0
+state 5 c,nx,d 3,keep,4 0000000000000000
+get c
+got 3 true
+state 5 nx,d,c keep,4,3 4049000000000000
+evictnow
+ev 2
+state 3 nx,d,c keep,4,3 4049000000000000
+clock 2031000000000
+put e 5
+ev 0
+state 4 nx,e keep,5 4049000000000000
+get nx
+got keep true
+state 4 e,nx 5,keep 4050aaaaaaaaaaaa
+putttl e 55 100000000000
+ev 0
+state 4 nx,e keep,55 4050aaaaaaaaaaaa
+clock 2045000000000
+exists e
+is true
+clear
+state 0 - - 4059000000000000
+clock 3000000000000
+mapnew 4 0 3000000000000
+state 0 - - 4059000000000000
+put p 1
+ev 0
+state 1 p 1 4059000000000000
+putttl q 2 5000000000
+ev 0
+state 2 p,q 1,2 4059000000000000
+clock 3006000000000
+exists q
+is false
+exists p
+is true
+evictnow
+ev 1
+state 1 p 1 4059000000000000
+put r 3
+ev 0
+state 2 p,r 1,3 4059000000000000
+clock 4000000000000
+setnew 3 0 4000000000000
+state 0 - - 4059000000000000
+sput x
+ev 0
+state 1 x - 4059000000000000
+sput y
+ev 0
+state 2 x,y - 4059000000000000
+sput z
+ev 0
+state 3 x,y,z - 4059000000000000
+sput w
+ev 1
+state 3 y,z,w - 4059000000000000
+scontains x
+is false
+state 3 y,z,w - 0000000000000000
+scontains y
+is true
+state 3 z,w,y - 4049000000000000
+sput v
+ev 1
+state 3 w,y,v - 4049000000000000
+sexists v
+is true
+sdelete w
+state 2 y,v - 4049000000000000
+clear
+state 0 - - 4059000000000000
+clock 5000000000000
+setnew 3 8000000000 5000000000000
+state 0 - - 4059000000000000
+sput x
+ev 0
+state 1 x - 4059000000000000
+clock 5004000000000
+sput y
+ev 0
+state 2 x,y - 4059000000000000
+clock 5009000000000
+sexists x
+is false
+scontains x
+is false
+state 2 y - 0000000000000000
+evictnow
+ev 1
+state 1 y - 0000000000000000
+sputttl z 0
+ev 0
+state 2 y,z - 0000000000000000
+clock 5100000000000
+sexists z
+is true
+sexists y
+is false
+done

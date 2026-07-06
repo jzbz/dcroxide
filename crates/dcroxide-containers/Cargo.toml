@@ -1,0 +1,18 @@
+[package]
+name = "dcroxide-containers"
+description = "Container data structures mirroring dcrd's container packages: the age-partitioned bloom filter and the LRU map and set"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+siphasher = { version = "1", default-features = false }
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true

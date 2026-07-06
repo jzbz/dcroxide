@@ -232,6 +232,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-containers"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-testutil",
+ "siphasher",
+]
+
+[[package]]
 name = "dcroxide-crypto"
 version = "0.1.0"
 dependencies = [

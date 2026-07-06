@@ -122,6 +122,12 @@ Currently implemented:
   catch-up, recovery, and incremental drops, replayed against a real
   redb-backed database from a session scripted inside dcrd's own
   package
+- `dcroxide-containers` — the container data structures from dcrd's
+  `container` packages: the age-partitioned bloom filter used for
+  P2P relay deduplication and the generic LRU map and set with
+  optional time-based expiration, replayed bit for bit from sessions
+  scripted inside dcrd's own packages with injected hash keys and a
+  mock clock
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
 
