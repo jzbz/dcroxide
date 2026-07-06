@@ -9,6 +9,7 @@ members = [
     "crates/dcroxide-database",
     "crates/dcroxide-dcrec",
     "crates/dcroxide-gcs",
+    "crates/dcroxide-mempool",
     "crates/dcroxide-stake",
     "crates/dcroxide-standalone",
     "crates/dcroxide-testutil",

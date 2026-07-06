@@ -91,6 +91,11 @@ Currently implemented:
   fully signed blocks and invalid variants replayed through the real
   `ProcessBlock` with scripts on, matching every acceptance, rejection
   kind, and expected tip
+- `dcroxide-mempool` — the beginnings of the transaction memory pool
+  from dcrd's `internal/mempool`: the mempool error kinds and the
+  relay policy layer (minimum relay fees, dust outputs, and the
+  transaction, output script, and input standardness checks), pinned
+  by dcrd's own policy verdicts generated inside its internal package
 - `dcroxide-gcs` — Golomb-coded set filters (versions 1 and 2) and the
   DCP0005 version 2 block committed filters for light clients, matched
   differentially against dcrd over random filters and structured blocks

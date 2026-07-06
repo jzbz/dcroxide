@@ -278,6 +278,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-mempool"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-blockchain",
+ "dcroxide-stake",
+ "dcroxide-testutil",
+ "dcroxide-txscript",
+ "dcroxide-wire",
+]
+
+[[package]]
 name = "dcroxide-stake"
 version = "0.1.0"
 dependencies = [

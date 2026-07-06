@@ -1,0 +1,21 @@
+[package]
+name = "dcroxide-mempool"
+description = "Transaction memory pool mirroring dcrd's internal/mempool package, starting with the relay policy layer"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-blockchain = { path = "../dcroxide-blockchain" }
+dcroxide-stake = { path = "../dcroxide-stake" }
+dcroxide-txscript = { path = "../dcroxide-txscript" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true
