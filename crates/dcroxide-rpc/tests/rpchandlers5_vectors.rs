@@ -415,6 +415,9 @@ fn tx_utxo_handler_slice_matches_dcrd() {
             db: Box::new(db),
             filterer_v2: Box::new(filterer),
             exists_addresser: None,
+            log_manager: Box::new(()),
+            fee_estimator: Box::new(()),
+            block_templater: None,
         });
 
         match dispatch(&mut server, method_name, &cmd) {

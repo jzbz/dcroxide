@@ -369,6 +369,9 @@ fn peer_address_handler_slice_matches_dcrd() {
             db: Box::new(()),
             filterer_v2: Box::new(()),
             exists_addresser,
+            log_manager: Box::new(()),
+            fee_estimator: Box::new(()),
+            block_templater: None,
         });
 
         match dispatch(&mut server, method_name, &cmd) {

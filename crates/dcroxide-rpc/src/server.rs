@@ -236,6 +236,16 @@ pub trait RpcChain {
     ) -> Result<Vec<Hash>, String> {
         unimplemented!("tickets_with_address")
     }
+    /// Manually invalidate the block as though it violated a
+    /// consensus rule (dcrd `InvalidateBlock`).
+    fn invalidate_block(&mut self, _hash: &Hash) -> Result<(), InvalidateBlockFailure> {
+        unimplemented!("invalidate_block")
+    }
+    /// Manually reconsider a previously invalidated block (dcrd
+    /// `ReconsiderBlock`).
+    fn reconsider_block(&mut self, _hash: &Hash) -> Result<(), ReconsiderBlockFailure> {
+        unimplemented!("reconsider_block")
+    }
     /// The header of the main chain block at the given height (dcrd
     /// `HeaderByHeight`; the error text only feeds the wrapped
     /// internal error).
@@ -421,6 +431,13 @@ pub struct Config<C> {
     /// The optional exists-address index (dcrd `ExistsAddresser`, nil
     /// when disabled).
     pub exists_addresser: Option<Box<dyn RpcExistsAddresser>>,
+    /// The log manager (dcrd `LogManager`).
+    pub log_manager: Box<dyn RpcLogManager>,
+    /// The smart fee estimator (dcrd `FeeEstimator`).
+    pub fee_estimator: Box<dyn RpcFeeEstimator>,
+    /// The optional background block templater (dcrd
+    /// `BlockTemplater`, nil when mining is not configured).
+    pub block_templater: Option<Box<dyn RpcBlockTemplater>>,
 }
 
 /// The sync manager operations the ported handlers perform (the used
@@ -436,7 +453,109 @@ pub trait RpcSyncManager {
     fn sync_peer_id(&mut self) -> i32 {
         unimplemented!("sync_peer_id")
     }
+    /// Relay/validate the transaction through the mempool, returning
+    /// the hashes of all newly accepted transactions (dcrd
+    /// `ProcessTransaction`).
+    fn process_transaction(
+        &mut self,
+        _tx: &MsgTx,
+        _allow_orphan: bool,
+        _allow_high_fees: bool,
+        _tag: u64,
+    ) -> Result<Vec<Hash>, SendTxFailure> {
+        unimplemented!("process_transaction")
+    }
+    /// Whether the transaction was confirmed in a recent block (dcrd
+    /// `RecentlyConfirmedTxn`).
+    fn recently_confirmed_txn(&mut self, _hash: &Hash) -> bool {
+        unimplemented!("recently_confirmed_txn")
+    }
+    /// Submit the block to the network after processing it locally
+    /// (dcrd `SubmitBlock`).
+    fn submit_block(&mut self, _block: &MsgBlock) -> Result<(), String> {
+        unimplemented!("submit_block")
+    }
 }
+
+/// A transaction relay failure with the classification the handler
+/// needs (dcrd `mempool.RuleError` plus the duplicate kinds).
+#[derive(Debug, Clone)]
+pub struct SendTxFailure {
+    /// Whether the failure is a mempool rule error.
+    pub is_rule_error: bool,
+    /// Whether the failure is dcrd `mempool.ErrDuplicate` or
+    /// `mempool.ErrAlreadyExists`.
+    pub is_duplicate: bool,
+    /// The error text.
+    pub message: String,
+}
+
+/// An invalidate-block failure with the classification the handler
+/// needs.
+#[derive(Debug, Clone)]
+pub struct InvalidateBlockFailure {
+    /// Whether the failure is dcrd `blockchain.ErrUnknownBlock`.
+    pub is_unknown_block: bool,
+    /// Whether the failure is dcrd
+    /// `blockchain.ErrInvalidateGenesisBlock`.
+    pub is_invalidate_genesis: bool,
+    /// The error text.
+    pub message: String,
+}
+
+/// A reconsider-block failure with the classification the handler
+/// needs.
+#[derive(Debug, Clone)]
+pub struct ReconsiderBlockFailure {
+    /// Whether the failure is dcrd `blockchain.ErrUnknownBlock`.
+    pub is_unknown_block: bool,
+    /// Whether every wrapped failure is a chain rule error (dcrd's
+    /// `allRuleErrs` walk over the possible multi-error).
+    pub all_rule_errs: bool,
+    /// The error text.
+    pub message: String,
+}
+
+/// The log manager operations the ported handlers perform (the used
+/// subset of dcrd's `rpcserver.LogManager` interface).
+pub trait RpcLogManager {
+    /// The supported logging subsystems (dcrd `SupportedSubsystems`).
+    fn supported_subsystems(&mut self) -> Vec<String> {
+        unimplemented!("supported_subsystems")
+    }
+    /// Parse and apply a debug level specification (dcrd
+    /// `ParseAndSetDebugLevels`).
+    fn parse_and_set_debug_levels(&mut self, _level_spec: &str) -> Result<(), String> {
+        unimplemented!("parse_and_set_debug_levels")
+    }
+}
+
+impl RpcLogManager for () {}
+
+/// The fee estimator operations the ported handlers perform (the
+/// used subset of dcrd's `rpcserver.FeeEstimator` interface).
+pub trait RpcFeeEstimator {
+    /// The estimated fee rate in atoms per kB for confirmation within
+    /// the given target (dcrd `EstimateFee`).
+    fn estimate_fee(&mut self, _target_confirmations: i32) -> Result<i64, String> {
+        unimplemented!("estimate_fee")
+    }
+}
+
+impl RpcFeeEstimator for () {}
+
+/// The background block templater operations the ported handlers
+/// perform (the used subset of dcrd's `rpcserver.BlockTemplater`
+/// interface).
+pub trait RpcBlockTemplater {
+    /// Ask the templater to generate a new template immediately (dcrd
+    /// `ForceRegen`).
+    fn force_regen(&mut self) {
+        unimplemented!("force_regen")
+    }
+}
+
+impl RpcBlockTemplater for () {}
 
 /// The no-op stand-in for server dependencies a caller does not
 /// exercise.
@@ -498,6 +617,16 @@ pub trait RpcConnManager {
     /// `BroadcastMessage`).
     fn broadcast_message(&mut self, _msg: &dcroxide_wire::Message) {
         unimplemented!("broadcast_message")
+    }
+    /// Relay inventory vectors for newly accepted transactions (dcrd
+    /// `RelayTransactions`).
+    fn relay_transactions(&mut self, _tx_hashes: &[Hash]) {
+        unimplemented!("relay_transactions")
+    }
+    /// Track a transaction for rebroadcast until it confirms (dcrd
+    /// `AddRebroadcastInventory`).
+    fn add_rebroadcast_inventory(&mut self, _tx_hash: &Hash, _tx: &MsgTx) {
+        unimplemented!("add_rebroadcast_inventory")
     }
 }
 

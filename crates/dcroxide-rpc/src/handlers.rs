@@ -16,7 +16,7 @@ use dcroxide_chainhash::Hash;
 use dcroxide_dcrjson::{GoValue, RPCError, codes, err_rpc_parse, gojson};
 use dcroxide_stake::MAX_AMOUNT;
 use dcroxide_txscript::stdaddr;
-use dcroxide_wire::{Message, MsgTx, OutPoint, TxIn, TxOut};
+use dcroxide_wire::{Message, MsgBlock, MsgTx, OutPoint, TxIn, TxOut};
 
 use crate::rpcerrors::{
     rpc_address_key_error, rpc_decode_hex_error, rpc_deserialization_error, rpc_internal_err,
@@ -2692,4 +2692,287 @@ pub fn handle_tickets_for_address<C: RpcChain>(
             .map(|t| GoValue::String(t.to_string()))
             .collect(),
     )]))
+}
+
+/// Go `hex.DecodeString` with its exact error text for the handlers
+/// that surface it (`encoding/hex: invalid byte: %#U`).
+fn go_decode_hex_msg(s: &str) -> Result<Vec<u8>, String> {
+    if s.len() % 2 != 0 {
+        return Err("encoding/hex: odd length hex string".to_string());
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for pair in bytes.chunks(2) {
+        for &b in pair {
+            if !(b as char).is_ascii_hexdigit() {
+                return Err(format!(
+                    "encoding/hex: invalid byte: U+{:04X} {:?}",
+                    b, b as char
+                ));
+            }
+        }
+        let hi = (pair[0] as char).to_digit(16).expect("checked");
+        let lo = (pair[1] as char).to_digit(16).expect("checked");
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
+}
+
+/// handlesendrawtransaction (dcrd `handleSendRawTransaction`): the
+/// accepted transaction hash string.
+pub fn handle_send_raw_transaction<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let hex_tx = s(&c[0]);
+    let allow_high_fees = opt_bool(&c[1]).unwrap_or(false);
+
+    // Deserialize and send off to tx relay.
+    let padded;
+    let hex_str = if hex_tx.len() % 2 != 0 {
+        padded = format!("0{hex_tx}");
+        &padded
+    } else {
+        hex_tx
+    };
+    let serialized_tx = go_decode_hex(hex_str).map_err(|_| rpc_decode_hex_error(hex_str))?;
+    let (msgtx, _) = MsgTx::from_bytes(&serialized_tx).map_err(|e| {
+        let text = match e {
+            dcroxide_wire::WireError::UnexpectedEof => "unexpected EOF".to_string(),
+            other => other.to_string(),
+        };
+        rpc_deserialization_error(&format!("Could not decode Tx: {text}"))
+    })?;
+
+    // Use 0 for the tag to represent the local node.
+    let tx_hash = msgtx.tx_hash();
+    let accepted_txs =
+        match server
+            .cfg
+            .sync_mgr
+            .process_transaction(&msgtx, false, allow_high_fees, 0)
+        {
+            Ok(accepted) => accepted,
+            Err(failure) => {
+                if failure.is_rule_error {
+                    let msg = format!("rejected transaction {tx_hash}: {}", failure.message);
+
+                    // Use the duplicate tx error code when the transaction
+                    // is known to already be submitted to the mempool, as
+                    // well as whenever there is a high certainty that the
+                    // transaction has been confirmed in a recent block.
+                    if failure.is_duplicate || server.cfg.sync_mgr.recently_confirmed_txn(&tx_hash)
+                    {
+                        return Err(crate::rpcerrors::rpc_duplicate_tx_error(&msg));
+                    }
+
+                    // Return a generic rule error.
+                    return Err(crate::rpcerrors::rpc_rule_error(&msg));
+                }
+
+                return Err(rpc_deserialization_error(&format!(
+                    "rejected: failed to process transaction {tx_hash}: {}",
+                    failure.message
+                )));
+            }
+        };
+
+    // Generate and relay inventory vectors for all newly accepted
+    // transactions.  dcrd also notifies its websocket clients here;
+    // that hook arrives with the websocket layer.
+    server.cfg.conn_mgr.relay_transactions(&accepted_txs);
+
+    // Keep track of the request transaction so it can be rebroadcast
+    // if it doesn't make its way into a block.  Votes are only valid
+    // for a specific block and are time sensitive, so they are not
+    // added to the rebroadcast logic.
+    let tx_type = dcroxide_stake::determine_tx_type(&msgtx);
+    if tx_type != dcroxide_stake::TxType::SSGen {
+        server
+            .cfg
+            .conn_mgr
+            .add_rebroadcast_inventory(&tx_hash, &msgtx);
+    }
+
+    Ok(GoValue::String(tx_hash.to_string()))
+}
+
+/// handlesubmitblock (dcrd `handleSubmitBlock`): null on acceptance
+/// or a rejection string.
+pub fn handle_submit_block<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let hex_block = s(&c[0]);
+
+    // Deserialize the submitted block.  Note dcrd surfaces the raw
+    // hex/deserialization error text through an internal error here.
+    let padded;
+    let hex_str = if hex_block.len() % 2 != 0 {
+        padded = format!("0{hex_block}");
+        &padded
+    } else {
+        hex_block
+    };
+    let serialized_block = go_decode_hex_msg(hex_str).map_err(|e| rpc_internal_err(&e))?;
+    let block = match MsgBlock::from_bytes(&serialized_block) {
+        Ok((block, _)) => block,
+        Err(e) => {
+            let text = match e {
+                dcroxide_wire::WireError::UnexpectedEof => "unexpected EOF".to_string(),
+                other => other.to_string(),
+            };
+            return Err(rpc_internal_err(&text));
+        }
+    };
+
+    if let Err(err) = server.cfg.sync_mgr.submit_block(&block) {
+        return Ok(GoValue::String(format!("rejected: {err}")));
+    }
+
+    Ok(GoValue::Null)
+}
+
+/// handleinvalidateblock (dcrd `handleInvalidateBlock`): no data
+/// unless an error.
+pub fn handle_invalidate_block<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let block_hash_str = s(&c[0]);
+    let hash: Hash = block_hash_str
+        .parse()
+        .map_err(|_| rpc_decode_hex_error(block_hash_str))?;
+
+    server
+        .cfg
+        .chain
+        .invalidate_block(&hash)
+        .map_err(|failure| {
+            if failure.is_unknown_block {
+                return RPCError::new(codes::BLOCK_NOT_FOUND, &format!("Block not found: {hash}"));
+            }
+            if failure.is_invalidate_genesis {
+                return rpc_invalid_error(&failure.message);
+            }
+            rpc_internal_err(&failure.message)
+        })?;
+
+    Ok(GoValue::Null)
+}
+
+/// handlereconsiderblock (dcrd `handleReconsiderBlock`): no data
+/// unless an error.
+pub fn handle_reconsider_block<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let block_hash_str = s(&c[0]);
+    let hash: Hash = block_hash_str
+        .parse()
+        .map_err(|_| rpc_decode_hex_error(block_hash_str))?;
+
+    server
+        .cfg
+        .chain
+        .reconsider_block(&hash)
+        .map_err(|failure| {
+            if failure.is_unknown_block {
+                return RPCError::new(codes::BLOCK_NOT_FOUND, &format!("Block not found: {hash}"));
+            }
+
+            // Use a separate error code for failed validation.
+            if failure.all_rule_errs {
+                return RPCError::new(
+                    codes::RECONSIDER_FAILURE,
+                    &format!(
+                        "Reconsidering block {hash} led to one or more validation \
+                     failures: {}",
+                        failure.message
+                    ),
+                );
+            }
+
+            // Fall back to an internal error.
+            rpc_internal_err(&failure.message)
+        })?;
+
+    Ok(GoValue::Null)
+}
+
+/// handleregentemplate (dcrd `handleRegenTemplate`): no data unless
+/// an error.
+pub fn handle_regen_template<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let Some(bt) = server.cfg.block_templater.as_mut() else {
+        return Err(rpc_internal_err("node is not configured for mining"));
+    };
+    bt.force_regen();
+    Ok(GoValue::Null)
+}
+
+/// handledebuglevel (dcrd `handleDebugLevel`).
+pub fn handle_debug_level<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let level_spec = s(&c[0]);
+
+    // Special show command to list supported subsystems.
+    if level_spec == "show" {
+        let subsystems = server.cfg.log_manager.supported_subsystems();
+        return Ok(GoValue::String(format!(
+            "Supported subsystems [{}]",
+            subsystems.join(" ")
+        )));
+    }
+
+    server
+        .cfg
+        .log_manager
+        .parse_and_set_debug_levels(level_spec)
+        .map_err(|e| rpc_invalid_error(&format!("Invalid debug level {level_spec}: {e}")))?;
+
+    Ok(GoValue::String("Done.".to_string()))
+}
+
+/// handleestimatesmartfee (dcrd `handleEstimateSmartFee`); the
+/// result is an `EstimateSmartFeeResult` value.
+pub fn handle_estimate_smart_fee<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let confirmations = int(&c[0]);
+    let mode = match &c[1] {
+        GoValue::Null => "conservative",
+        GoValue::String(s) => s.as_str(),
+        other => panic!("expected optional string field, got {other:?}"),
+    };
+
+    if mode != "conservative" {
+        return Err(rpc_invalid_error(
+            "Only the default and conservative modes are supported for smart \
+             fee estimation at the moment",
+        ));
+    }
+
+    let fee = server
+        .cfg
+        .fee_estimator
+        .estimate_fee(confirmations as i32)
+        .map_err(|e| rpc_internal_err(&e))?;
+
+    Ok(GoValue::Struct(vec![
+        GoValue::Float64(txresults::to_coin(fee)),
+        GoValue::Null,
+        GoValue::Int(confirmations),
+    ]))
 }
