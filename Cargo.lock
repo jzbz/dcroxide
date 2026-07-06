@@ -307,6 +307,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-dcrjson"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-chainhash",
+ "dcroxide-testutil",
+]
+
+[[package]]
 name = "dcroxide-fees"
 version = "0.1.0"
 dependencies = [

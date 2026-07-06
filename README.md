@@ -135,6 +135,14 @@ Currently implemented:
   tracking, and dcrd-compatible `peers.json` persistence, pinned by
   grids and state transitions scripted inside dcrd's own package
   with the randomized paths covered under an injected RNG
+- `dcroxide-dcrjson` — the JSON-RPC command infrastructure from
+  dcrd's `dcrjson/v4` module: Go's reflection-driven registry,
+  marshalling, parameter parsing, usage, and help generation made
+  explicit over type descriptors, with Go `encoding/json` semantics
+  (HTML escaping, float formatting, sorted map keys, exact decode
+  error messages) and a `text/tabwriter` port reimplemented so every
+  byte of JSON, error text, and help output matches, pinned by a
+  scripted session generated inside dcrd's own package
 - `dcroxide-mixing` — the StakeShuffle mixing support from dcrd's
   `mixing` package: message identity hashes and Schnorr signatures,
   session ID derivation and validation, the DC-net finite field and

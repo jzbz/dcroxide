@@ -1,0 +1,18 @@
+[package]
+name = "dcroxide-dcrjson"
+description = "JSON-RPC 1.0 command infrastructure mirroring dcrd's dcrjson/v4 module"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true
