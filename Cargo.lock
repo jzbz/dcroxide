@@ -366,9 +366,11 @@ dependencies = [
  "chacha20",
  "dcroxide-chaincfg",
  "dcroxide-chainhash",
+ "dcroxide-containers",
  "dcroxide-crypto",
  "dcroxide-dcrec",
  "dcroxide-testutil",
+ "dcroxide-txscript",
  "dcroxide-wire",
 ]
 

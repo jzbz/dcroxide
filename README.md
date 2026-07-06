@@ -128,12 +128,14 @@ Currently implemented:
   optional time-based expiration, replayed bit for bit from sessions
   scripted inside dcrd's own packages with injected hash keys and a
   mock clock
-- `dcroxide-mixing` — the StakeShuffle mixing primitives from dcrd's
+- `dcroxide-mixing` — the StakeShuffle mixing support from dcrd's
   `mixing` package: message identity hashes and Schnorr signatures,
   session ID derivation and validation, the DC-net finite field and
-  vector math, the per-run ChaCha20 PRNG, and UTXO ownership proofs,
-  replayed bit for bit from a session scripted inside dcrd's own
-  package including a full honest 4-peer mix run
+  vector math, the per-run ChaCha20 PRNG, UTXO ownership proofs, and
+  the mixpool itself with its acceptance rules, orphan handling,
+  expiry, and misbehavior observer, replayed bit for bit from
+  sessions scripted inside dcrd's own packages including a full
+  honest 4-peer mix run and two observer strike rounds
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
 

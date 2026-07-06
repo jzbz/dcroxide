@@ -17,7 +17,8 @@ use crate::error::WireError;
 use crate::msgtx::{MsgTx, OutPoint, TxOut};
 use crate::protocol::{MIX_VERSION, is_strict_ascii};
 use crate::varint::{
-    read_ascii_var_string, read_var_bytes, read_var_int, write_var_bytes, write_var_int,
+    read_ascii_var_string, read_var_bytes, read_var_int, var_int_serialize_size, write_var_bytes,
+    write_var_int,
 };
 
 /// The size in bytes of a padded or unpadded DC-net message (dcrd
@@ -288,6 +289,32 @@ impl MsgMixPairReq {
 
     pub(crate) fn max_payload_length(pver: u32) -> u32 {
         if pver < MIX_VERSION { 0 } else { 8_476_848 }
+    }
+
+    /// A description of the type of transaction being mixed:
+    /// the mix amount, script class, transaction version, lock time,
+    /// and pairing flags (dcrd `Pairing`).  Only pair requests with
+    /// identical pairing descriptions may be mixed together.
+    pub fn pairing(&self) -> Vec<u8> {
+        let mut w = Vec::with_capacity(
+            8usize
+                .saturating_add(var_int_serialize_size(self.script_class.len() as u64))
+                .saturating_add(self.script_class.len())
+                .saturating_add(7),
+        );
+        w.extend_from_slice(&(self.mix_amount as u64).to_le_bytes());
+        write_var_int(&mut w, self.script_class.len() as u64);
+        w.extend_from_slice(self.script_class.as_bytes());
+        w.extend_from_slice(&self.tx_version.to_le_bytes());
+        w.extend_from_slice(&self.lock_time.to_le_bytes());
+        w.push(self.pairing_flags);
+        w
+    }
+
+    /// The block height at which the message expires (dcrd
+    /// `Expires`).
+    pub fn expires(&self) -> u32 {
+        self.expiry
     }
 }
 

@@ -11,9 +11,11 @@ repository.workspace = true
 [dependencies]
 chacha20 = { version = "0.9", default-features = false }
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-containers = { path = "../dcroxide-containers" }
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-crypto = { path = "../dcroxide-crypto" }
 dcroxide-dcrec = { path = "../dcroxide-dcrec" }
+dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-wire = { path = "../dcroxide-wire" }
 
 [dev-dependencies]

@@ -14,6 +14,7 @@ use core::fmt;
 
 mod dcnet;
 mod field;
+mod mixpool;
 mod prng;
 mod sid;
 mod signatures;
@@ -25,6 +26,10 @@ pub use dcnet::{
     xor_vectors,
 };
 pub use field::{F, FieldInt, in_field_be_bytes};
+pub use mixpool::{
+    MAX_ORPHANS, MAX_POST_EVICTION_ORPHANS, MixBlockChain, MixUtxoEntry, MixUtxoFetcher, MsgType,
+    Pool, PoolError, PoolMessage, Received, RuleKind,
+};
 pub use prng::{ChaCha20Prng, SEED_SIZE};
 pub use sid::{sort_prs_for_session, validate_session};
 pub use signatures::{MixMessage, sign_message, verify_signature, verify_signed_message};
