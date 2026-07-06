@@ -128,6 +128,13 @@ Currently implemented:
   optional time-based expiration, replayed bit for bit from sessions
   scripted inside dcrd's own packages with injected hash keys and a
   mock clock
+- `dcroxide-addrmgr` — the peer address manager from dcrd's
+  `addrmgr`: address keys and network groups with dcrd's exact
+  formatting, RFC-range routability and reachability, the new/tried
+  bucket machinery over BLAKE-256 derivations with viability
+  tracking, and dcrd-compatible `peers.json` persistence, pinned by
+  grids and state transitions scripted inside dcrd's own package
+  with the randomized paths covered under an injected RNG
 - `dcroxide-mixing` — the StakeShuffle mixing support from dcrd's
   `mixing` package: message identity hashes and Schnorr signatures,
   session ID derivation and validation, the DC-net finite field and

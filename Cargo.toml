@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/dcroxide-addrmgr",
     "crates/dcroxide-base58",
     "crates/dcroxide-blockchain",
     "crates/dcroxide-chaincfg",

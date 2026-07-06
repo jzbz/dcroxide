@@ -64,3 +64,20 @@ Entry format:
 - **Pinned by:** `mixpool_vectors` (the `receive … twocaps` row, kept
   as the final operation against that pool because generating the
   vectors from dcrd trips the deadlock for any later write)
+
+## QK-0004 — addrmgr never restores serialized address timestamps
+
+- **Where:** dcrd `addrmgr` `deserializePeers` / dcroxide-addrmgr
+  `manager.rs` `deserialize_peers`
+- **What:** `savePeers` writes each known address's `TimeStamp`, but
+  `deserializePeers` builds the loaded address through the string
+  parser, which stamps it with the load time, and never applies the
+  serialized value. Every address in a loaded `peers.json` therefore
+  appears freshly seen, which resets the staleness clock used by
+  `isBad`. Go's zero `time.Time` for the attempt/success fields does
+  round trip exactly through its `Unix()` encoding.
+- **Why reproduced:** address viability and expiry decisions after a
+  restart must match dcrd's on identical `peers.json` contents.
+- **Pinned by:** `addrmgr_vectors` (the `viability future`/`stale`
+  rows show crafted extreme timestamps loading as not-bad because the
+  load re-stamps them)

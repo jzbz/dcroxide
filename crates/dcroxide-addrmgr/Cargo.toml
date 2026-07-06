@@ -1,0 +1,23 @@
+[package]
+name = "dcroxide-addrmgr"
+description = "Concurrency safe address manager for caching potential peers, mirroring dcrd's addrmgr package"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chacha20 = { version = "0.9", default-features = false }
+dcroxide-crypto = { path = "../dcroxide-crypto" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+tempfile = "3"
+
+[lints]
+workspace = true
