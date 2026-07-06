@@ -344,6 +344,8 @@ fn tx_utxo_handler_slice_matches_dcrd() {
                         block_height: parts[2].parse().unwrap(),
                         is_coinbase: parts[3] == "true",
                         is_spent: parts[4] == "true",
+                        tx_type: dcroxide_stake::TxType::Regular,
+                        ticket_minimal_outputs: None,
                     }))
                 }
             },
@@ -418,6 +420,11 @@ fn tx_utxo_handler_slice_matches_dcrd() {
             log_manager: Box::new(()),
             fee_estimator: Box::new(()),
             block_templater: None,
+            sanity_checker: Box::new(()),
+            time_source: Box::new(()),
+            proxy: String::new(),
+            test_net: false,
+            runtime_version: String::new(),
         });
 
         match dispatch(&mut server, method_name, &cmd) {

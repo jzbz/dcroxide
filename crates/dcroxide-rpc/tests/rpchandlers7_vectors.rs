@@ -370,6 +370,11 @@ fn submission_handler_slice_matches_dcrd() {
                 },
             }),
             block_templater,
+            sanity_checker: Box::new(()),
+            time_source: Box::new(()),
+            proxy: String::new(),
+            test_net: false,
+            runtime_version: String::new(),
         });
 
         match dispatch(&mut server, method_name, &cmd) {

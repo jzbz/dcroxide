@@ -2976,3 +2976,676 @@ pub fn handle_estimate_smart_fee<C: RpcChain>(
         GoValue::Int(confirmations),
     ]))
 }
+
+fn opt_float(v: &GoValue) -> Option<f64> {
+    match v {
+        GoValue::Null => None,
+        GoValue::Float64(f) => Some(*f),
+        other => panic!("expected optional float field, got {other:?}"),
+    }
+}
+
+/// Go `dcrutil.Amount.String()`: the coin value rendered with
+/// `strconv.FormatFloat(f, 'f', -1, 64)` plus the " DCR" unit.
+fn amount_string(atoms: i64) -> String {
+    format!("{} DCR", gojson::format_float_f(txresults::to_coin(atoms)))
+}
+
+/// The minimum amount, zero when empty (dcrd rpcserver `min`).
+fn amounts_min(s: &[i64]) -> i64 {
+    s.iter().copied().min().unwrap_or(0)
+}
+
+/// The maximum amount, seeded with zero (dcrd rpcserver `max`).
+fn amounts_max(s: &[i64]) -> i64 {
+    s.iter().copied().fold(0, i64::max)
+}
+
+/// The mean amount via integer division, zero when empty (dcrd
+/// rpcserver `mean`).
+fn amounts_mean(s: &[i64]) -> i64 {
+    if s.is_empty() {
+        return 0;
+    }
+    let sum: i64 = s.iter().sum();
+    sum / s.len() as i64
+}
+
+/// The median amount: the middle element after sorting, or the
+/// integer mean of the two middle elements (dcrd rpcserver `median`).
+fn amounts_median(s: &[i64]) -> i64 {
+    if s.is_empty() {
+        return 0;
+    }
+    let mut sorted = s.to_vec();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    if sorted.len() % 2 != 0 {
+        sorted[middle]
+    } else {
+        (sorted[middle] + sorted[middle - 1]) / 2
+    }
+}
+
+/// The standard deviation over coin-denominated floats with Go's
+/// amount rounding, zero for fewer than two samples (dcrd rpcserver
+/// `stdDev`).
+fn amounts_std_dev(s: &[i64]) -> i64 {
+    let mean_coin = txresults::to_coin(amounts_mean(s));
+    let mut total = 0f64;
+    for amt in s {
+        let d = txresults::to_coin(*amt) - mean_coin;
+        total += d * d;
+    }
+    if s.len() as i64 - 1 == 0 {
+        return 0;
+    }
+    let v = total / (s.len() as i64 - 1) as f64;
+    // NewAmount cannot fail here; it would return zero anyway.
+    new_amount(v.sqrt()).unwrap_or(0)
+}
+
+/// The fee per kilobyte of a transaction with its fraud proofs set
+/// (dcrd `calcFeePerKb`).
+fn calc_fee_per_kb(tx: &MsgTx) -> i64 {
+    let mut value_in: i64 = 0;
+    for tx_in in &tx.tx_in {
+        value_in += tx_in.value_in;
+    }
+    let mut out: i64 = 0;
+    for tx_out in &tx.tx_out {
+        out += tx_out.value;
+    }
+    ((value_in - out) * 1000) / tx.serialize_size() as i64
+}
+
+/// The distilled fee statistics every fee info result carries.
+struct FeeStats {
+    number: u32,
+    min: f64,
+    max: f64,
+    mean: f64,
+    median: f64,
+    std_dev: f64,
+}
+
+impl FeeStats {
+    /// The statistics over the given per-kilobyte fees.
+    fn over(fees: &[i64], number: u32) -> FeeStats {
+        FeeStats {
+            number,
+            min: txresults::to_coin(amounts_min(fees)),
+            max: txresults::to_coin(amounts_max(fees)),
+            mean: txresults::to_coin(amounts_mean(fees)),
+            median: txresults::to_coin(amounts_median(fees)),
+            std_dev: txresults::to_coin(amounts_std_dev(fees)),
+        }
+    }
+
+    /// The `Number, Min, Max, Mean, Median, StdDev` field values every
+    /// fee info struct ends with.
+    fn tail_fields(&self) -> Vec<GoValue> {
+        vec![
+            GoValue::Uint(u64::from(self.number)),
+            GoValue::Float64(self.min),
+            GoValue::Float64(self.max),
+            GoValue::Float64(self.mean),
+            GoValue::Float64(self.median),
+            GoValue::Float64(self.std_dev),
+        ]
+    }
+}
+
+/// The fee information for the given tx type in the mempool (dcrd
+/// `feeInfoForMempool`).
+fn fee_info_for_mempool<C: RpcChain>(
+    server: &mut Server<C>,
+    tx_type: dcroxide_stake::TxType,
+) -> FeeStats {
+    let tx_descs = server.cfg.tx_mempooler.tx_descs();
+    let mut ticket_fees = Vec::with_capacity(tx_descs.len());
+    for tx_desc in &tx_descs {
+        if tx_desc.tx_type == tx_type {
+            let fee_per_kb = tx_desc.fee * 1000 / tx_desc.tx.serialize_size() as i64;
+            ticket_fees.push(fee_per_kb);
+        }
+    }
+    FeeStats::over(&ticket_fees, ticket_fees.len() as u32)
+}
+
+/// The fees of the transactions of the given type in the block, sized
+/// by the corresponding header count (dcrd `ticketFeeInfoForBlock`'s
+/// per-block fee collection).
+fn block_type_fees(bl: &MsgBlock, tx_type: dcroxide_stake::TxType) -> Vec<i64> {
+    let tx_num = match tx_type {
+        dcroxide_stake::TxType::Regular => bl.transactions.len() - 1,
+        dcroxide_stake::TxType::SStx => usize::from(bl.header.fresh_stake),
+        dcroxide_stake::TxType::SSGen => usize::from(bl.header.voters),
+        dcroxide_stake::TxType::SSRtx => usize::from(bl.header.revocations),
+        _ => 0,
+    };
+
+    let mut tx_fees = vec![0i64; tx_num];
+    let mut itr = 0;
+    if tx_type == dcroxide_stake::TxType::Regular {
+        for (i, tx) in bl.transactions.iter().enumerate() {
+            // Skip the coin base.
+            if i == 0 {
+                continue;
+            }
+            tx_fees[itr] = calc_fee_per_kb(tx);
+            itr += 1;
+        }
+    } else {
+        for stx in &bl.stransactions {
+            if dcroxide_stake::determine_tx_type(stx) == tx_type {
+                tx_fees[itr] = calc_fee_per_kb(stx);
+                itr += 1;
+            }
+        }
+    }
+    tx_fees
+}
+
+/// The fee information for the given tx type in the block at the
+/// given height (dcrd `ticketFeeInfoForBlock`); the raw chain error
+/// feeds the caller's internal error.
+fn ticket_fee_info_for_block<C: RpcChain>(
+    server: &mut Server<C>,
+    height: i64,
+    tx_type: dcroxide_stake::TxType,
+) -> Result<FeeStats, String> {
+    let bl = server.cfg.chain.block_by_height(height)?;
+    let tx_fees = block_type_fees(&bl, tx_type);
+    Ok(FeeStats::over(&tx_fees, tx_fees.len() as u32))
+}
+
+/// The fee information for the given tx type over the height range
+/// `[start, end)` (dcrd `ticketFeeInfoForRange`).
+fn ticket_fee_info_for_range<C: RpcChain>(
+    server: &mut Server<C>,
+    start: i64,
+    end: i64,
+    tx_type: dcroxide_stake::TxType,
+) -> Result<FeeStats, String> {
+    let hashes = server.cfg.chain.height_range(start, end)?;
+
+    let mut tx_fees = Vec::new();
+    for hash in &hashes {
+        let bl = server.cfg.chain.block_by_hash(hash)?;
+        if tx_type == dcroxide_stake::TxType::Regular {
+            for (i, tx) in bl.transactions.iter().enumerate() {
+                // Skip the coin base.
+                if i == 0 {
+                    continue;
+                }
+                tx_fees.push(calc_fee_per_kb(tx));
+            }
+        } else {
+            for stx in &bl.stransactions {
+                if dcroxide_stake::determine_tx_type(stx) == tx_type {
+                    tx_fees.push(calc_fee_per_kb(stx));
+                }
+            }
+        }
+    }
+    Ok(FeeStats::over(&tx_fees, tx_fees.len() as u32))
+}
+
+/// handleticketfeeinfo (dcrd `handleTicketFeeInfo`); the result is a
+/// `TicketFeeInfoResult` value.
+pub fn handle_ticket_fee_info<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let blocks = opt_uint(&c[0]).unwrap_or(0) as u32;
+    let windows = opt_uint(&c[1]).unwrap_or(0) as u32;
+
+    let best_height = server.cfg.chain.best_snapshot().height;
+
+    // Memory pool first.
+    let fee_info_mempool = fee_info_for_mempool(server, dcroxide_stake::TxType::SStx);
+
+    // Blocks requested, descending from the chain tip.
+    let mut fee_info_blocks = GoValue::Null;
+    if blocks > 0 {
+        let start = best_height;
+        let end = best_height - i64::from(blocks);
+        let mut items = Vec::new();
+        let mut i = start;
+        while i > end {
+            let stats = ticket_fee_info_for_block(server, i, dcroxide_stake::TxType::SStx)
+                .map_err(|e| rpc_internal_err(&e))?;
+            let mut item = vec![GoValue::Uint(i as u32 as u64)];
+            item.extend(stats.tail_fields());
+            items.push(GoValue::Struct(item));
+            i -= 1;
+        }
+        fee_info_blocks = GoValue::Array(items);
+    }
+
+    let mut fee_info_windows = GoValue::Null;
+    if windows > 0 {
+        // The first window is special because it may not be finished.
+        let win_len = server.cfg.chain_params.stake_diff_window_size;
+        let last_change = (best_height / win_len) * win_len;
+
+        let mut items = Vec::new();
+        let push_window = |server: &mut Server<C>,
+                           items: &mut Vec<GoValue>,
+                           start: i64,
+                           end: i64|
+         -> Result<(), RPCError> {
+            let stats = ticket_fee_info_for_range(server, start, end, dcroxide_stake::TxType::SStx)
+                .map_err(|e| rpc_internal_err(&e))?;
+            let mut item = vec![
+                GoValue::Uint(start as u32 as u64),
+                GoValue::Uint(end as u32 as u64),
+            ];
+            item.extend(stats.tail_fields());
+            items.push(GoValue::Struct(item));
+            Ok(())
+        };
+        push_window(server, &mut items, last_change, best_height + 1)?;
+
+        // Move backwards through window lengths from the last
+        // adjustment.
+        if windows > 1 {
+            let mut end = -1i64;
+            if last_change - i64::from(windows) * win_len > end {
+                end = last_change - i64::from(windows) * win_len;
+            }
+            let mut i = last_change;
+            while i > end + win_len {
+                push_window(server, &mut items, i - win_len, i)?;
+                i -= win_len;
+            }
+        }
+        fee_info_windows = GoValue::Array(items);
+    }
+
+    let mut mempool_item = Vec::new();
+    mempool_item.extend(fee_info_mempool.tail_fields());
+    Ok(GoValue::Struct(vec![
+        GoValue::Struct(mempool_item),
+        fee_info_blocks,
+        fee_info_windows,
+    ]))
+}
+
+/// handleticketvwap (dcrd `handleTicketVWAP`); the result is the
+/// volume weighted average ticket price as a float.
+pub fn handle_ticket_vwap<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+
+    // The default VWAP is for the past WorkDiffWindows *
+    // WorkDiffWindowSize many blocks.
+    let best_height = server.cfg.chain.best_snapshot().height;
+    let start = match opt_uint(&c[0]) {
+        None => {
+            let params = &server.cfg.chain_params;
+            let to_eval = params.work_diff_windows * params.work_diff_window_size;
+            let start_i64 = best_height - to_eval;
+            // Use 1 as the first block if there aren't enough blocks.
+            if start_i64 <= 0 { 1 } else { start_i64 as u32 }
+        }
+        Some(start) => start as u32,
+    };
+
+    let end = match opt_uint(&c[1]) {
+        None => best_height as u32,
+        Some(end) => end as u32,
+    };
+    if start > end {
+        return Err(rpc_invalid_error(&format!(
+            "Start height {start} is beyond end height {end}"
+        )));
+    }
+    if i64::from(end) > best_height {
+        return Err(rpc_invalid_error(&format!(
+            "End height {end} is beyond blockchain tip height {best_height}"
+        )));
+    }
+
+    // Calculate the volume weighted average price of a ticket for the
+    // given range.
+    let mut ticket_num: i64 = 0;
+    let mut total_value: i64 = 0;
+    for i in start..=end {
+        let block_header = server
+            .cfg
+            .chain
+            .header_by_height(i64::from(i))
+            .map_err(|e| rpc_internal_err(&e))?;
+
+        ticket_num += i64::from(block_header.fresh_stake);
+        total_value += block_header.sbits * i64::from(block_header.fresh_stake);
+    }
+    let mut vwap = 0i64;
+    if ticket_num > 0 {
+        vwap = total_value / ticket_num;
+    }
+
+    Ok(GoValue::Float64(txresults::to_coin(vwap)))
+}
+
+/// handletxfeeinfo (dcrd `handleTxFeeInfo`); the result is a
+/// `TxFeeInfoResult` value.
+pub fn handle_tx_fee_info<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let blocks = opt_uint(&c[0]).unwrap_or(0) as u32;
+
+    let best_height = server.cfg.chain.best_snapshot().height;
+
+    // Memory pool first.
+    let fee_info_mempool = fee_info_for_mempool(server, dcroxide_stake::TxType::Regular);
+
+    // Blocks requested, descending from the chain tip.
+    let mut fee_info_blocks = GoValue::Null;
+    if blocks > 0 {
+        let start = best_height;
+        let end = best_height - i64::from(blocks);
+        let mut items = Vec::new();
+        let mut i = start;
+        while i > end {
+            let stats = ticket_fee_info_for_block(server, i, dcroxide_stake::TxType::Regular)
+                .map_err(|e| rpc_internal_err(&e))?;
+            let mut item = vec![GoValue::Uint(i as u32 as u64)];
+            item.extend(stats.tail_fields());
+            items.push(GoValue::Struct(item));
+            i -= 1;
+        }
+        fee_info_blocks = GoValue::Array(items);
+    }
+
+    // Get the fee info for the range requested, unless none is given.
+    // The default range is for the past WorkDiffWindowSize many
+    // blocks.
+    let start = match opt_uint(&c[1]) {
+        None => {
+            let to_eval = server.cfg.chain_params.work_diff_window_size;
+            let start_i64 = best_height - to_eval;
+            // Use 1 as the first block if there aren't enough blocks.
+            if start_i64 <= 0 { 1 } else { start_i64 as u32 }
+        }
+        Some(start) => start as u32,
+    };
+
+    let end = match opt_uint(&c[2]) {
+        None => best_height as u32,
+        Some(end) => end as u32,
+    };
+    if start > end {
+        return Err(rpc_invalid_error(&format!(
+            "Start height {start} is beyond end height {end}"
+        )));
+    }
+    if i64::from(end) > best_height {
+        return Err(rpc_invalid_error(&format!(
+            "End height {end} is beyond blockchain tip height {best_height}"
+        )));
+    }
+
+    let stats = ticket_fee_info_for_range(
+        server,
+        i64::from(start),
+        i64::from(end.wrapping_add(1)),
+        dcroxide_stake::TxType::Regular,
+    )
+    .map_err(|e| rpc_internal_err(&e))?;
+
+    let mut mempool_item = Vec::new();
+    mempool_item.extend(fee_info_mempool.tail_fields());
+    Ok(GoValue::Struct(vec![
+        GoValue::Struct(mempool_item),
+        fee_info_blocks,
+        GoValue::Struct(stats.tail_fields()),
+    ]))
+}
+
+/// The chain verification loop (dcrd `verifyChain`); the error only
+/// feeds the boolean result.
+fn verify_chain<C: RpcChain>(server: &mut Server<C>, level: i64, depth: i64) -> Result<(), ()> {
+    let best = server.cfg.chain.best_snapshot();
+    let mut finish_height = best.height - depth;
+    if finish_height < 0 {
+        finish_height = 0;
+    }
+
+    let mut height = best.height;
+    while height > finish_height {
+        // Level 0 just looks up the block.
+        let block = server.cfg.chain.block_by_height(height).map_err(|_| ())?;
+
+        // Level 1 does basic chain sanity checks.
+        if level > 0 {
+            server
+                .cfg
+                .sanity_checker
+                .check_block_sanity(&block)
+                .map_err(|_| ())?;
+        }
+        height -= 1;
+    }
+    Ok(())
+}
+
+/// handleverifychain (dcrd `handleVerifyChain`); the result is a
+/// boolean.
+pub fn handle_verify_chain<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let check_level = opt_int(&c[0]).unwrap_or(0);
+    let check_depth = opt_int(&c[1]).unwrap_or(0);
+
+    let ok = verify_chain(server, check_level, check_depth).is_ok();
+    Ok(GoValue::Bool(ok))
+}
+
+/// handlegetinfo (dcrd `handleGetInfo`); the result is an
+/// `InfoChainResult` value.
+pub fn handle_get_info<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let best = server.cfg.chain.best_snapshot();
+
+    // Go `time.Duration.Seconds()` truncated to an int64.
+    let offset_nanos = server.cfg.time_source.offset_nanos();
+    let offset_secs =
+        (offset_nanos / 1_000_000_000) as f64 + (offset_nanos % 1_000_000_000) as f64 / 1e9;
+
+    Ok(GoValue::Struct(vec![
+        GoValue::Int(i64::from(
+            (1_000_000 * crate::version::MAJOR
+                + 10_000 * crate::version::MINOR
+                + 100 * crate::version::PATCH) as i32,
+        )),
+        GoValue::Int(i64::from(server.cfg.max_protocol_version as i32)),
+        GoValue::Int(best.height),
+        GoValue::Int(offset_secs as i64),
+        GoValue::Int(i64::from(server.cfg.conn_mgr.connected_count())),
+        GoValue::String(server.cfg.proxy.clone()),
+        GoValue::Float64(crate::helpers::get_difficulty_ratio(
+            best.bits,
+            server.cfg.chain_params.pow_limit_bits,
+        )),
+        GoValue::Bool(server.cfg.test_net),
+        GoValue::Float64(txresults::to_coin(server.cfg.min_relay_tx_fee)),
+        GoValue::String(String::new()),
+        GoValue::Bool(server.cfg.tx_indexer.is_some()),
+    ]))
+}
+
+/// The JSON-RPC API semantic version (dcrd `jsonrpcSemver*`).
+const JSONRPC_SEMVER_MAJOR: u32 = 8;
+const JSONRPC_SEMVER_MINOR: u32 = 3;
+const JSONRPC_SEMVER_PATCH: u32 = 0;
+const JSONRPC_SEMVER_STRING: &str = "8.3.0";
+
+/// handleversion (dcrd `handleVersion`); the result is a map of
+/// `VersionResult` values keyed by component.
+pub fn handle_version<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let runtime_ver = server.cfg.runtime_version.replace('.', "-");
+    let mut build_meta = crate::version::normalize_string(&runtime_ver);
+    let build = crate::version::normalize_string(crate::version::BUILD_METADATA);
+    if !build.is_empty() {
+        build_meta = format!("{build}.{build_meta}");
+    }
+    Ok(GoValue::Map(vec![
+        (
+            "dcrdjsonrpcapi".to_string(),
+            GoValue::Struct(vec![
+                GoValue::String(JSONRPC_SEMVER_STRING.to_string()),
+                GoValue::Uint(u64::from(JSONRPC_SEMVER_MAJOR)),
+                GoValue::Uint(u64::from(JSONRPC_SEMVER_MINOR)),
+                GoValue::Uint(u64::from(JSONRPC_SEMVER_PATCH)),
+                GoValue::String(String::new()),
+                GoValue::String(String::new()),
+            ]),
+        ),
+        (
+            "dcrd".to_string(),
+            GoValue::Struct(vec![
+                GoValue::String(crate::version::VERSION.to_string()),
+                GoValue::Uint(u64::from(crate::version::MAJOR)),
+                GoValue::Uint(u64::from(crate::version::MINOR)),
+                GoValue::Uint(u64::from(crate::version::PATCH)),
+                GoValue::String(crate::version::normalize_string(
+                    crate::version::PRE_RELEASE,
+                )),
+                GoValue::String(build_meta),
+            ]),
+        ),
+    ]))
+}
+
+/// handlecreaterawssrtx (dcrd `handleCreateRawSSRtx`); the result is
+/// the serialized revocation transaction hex string.
+pub fn handle_create_raw_ssrtx<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let inputs = array(&c[0]);
+
+    // Only a single SStx should be given.
+    if inputs.len() != 1 {
+        return Err(rpc_invalid_error("SSRtx invalid number of inputs"));
+    }
+
+    // The input must be in the stake tree.
+    let input = fields(&inputs[0]);
+    let (amount, txid, vout, tree) = (
+        float(&input[0]),
+        s(&input[1]),
+        uint(&input[2]) as u32,
+        int(&input[3]) as i8,
+    );
+    if tree != 1 {
+        return Err(rpc_invalid_error("Input tree is not TxTreeStake type"));
+    }
+
+    // The input must be a ticket submission output.
+    const TICKET_SUBMISSION_OUTPUT: u32 = 0;
+    if vout != TICKET_SUBMISSION_OUTPUT {
+        return Err(rpc_invalid_error(
+            "Input is not a ticket submission output (output index 0)",
+        ));
+    }
+
+    // Convert the provided transaction hash hex to a hash.
+    let tx_hash: Hash = txid.parse().map_err(|_| rpc_decode_hex_error(txid))?;
+
+    // Try to fetch the ticket from the block database.
+    let ticket_utxo = match server.cfg.chain.fetch_utxo_entry(&tx_hash, vout, tree) {
+        Ok(Some(entry)) => entry,
+        Ok(None) | Err(_) => {
+            return Err(crate::rpcerrors::rpc_no_tx_info_error(&tx_hash));
+        }
+    };
+    if ticket_utxo.tx_type != dcroxide_stake::TxType::SStx {
+        return Err(rpc_deserialization_error(&format!(
+            "Invalid Tx type: {}",
+            ticket_utxo.tx_type as i32
+        )));
+    }
+
+    // The sstx pubkeyhashes and amounts as found in the transaction
+    // outputs.
+    let Some(minimal_outputs) = ticket_utxo.ticket_minimal_outputs else {
+        return Err(rpc_internal_err("missing ticket minimal outputs"));
+    };
+
+    // The input amount must be the ticket submission amount.
+    let ticket_submission_amount = minimal_outputs[TICKET_SUBMISSION_OUTPUT as usize].value;
+    let input_amount = new_amount(amount).map_err(|e| rpc_invalid_error(&e))?;
+    if input_amount != ticket_submission_amount {
+        return Err(rpc_invalid_error(&format!(
+            "Input amount {} is not equal to ticket submission amount {}",
+            amount_string(input_amount),
+            amount_string(ticket_submission_amount)
+        )));
+    }
+
+    // Decode the fee as coins.
+    let mut fee_amt = 0i64;
+    if let Some(fee) = opt_float(&c[1]) {
+        fee_amt =
+            new_amount(fee).map_err(|e| rpc_invalid_error(&format!("Invalid fee amount: {e}")))?;
+    }
+
+    // Determine if the automatic ticket revocations agenda is active.
+    let prev_blk_hash = server.cfg.chain.best_snapshot().hash;
+    let is_auto_revocations_enabled = server.is_auto_revocations_agenda_active(&prev_blk_hash)?;
+
+    // If the automatic ticket revocations agenda is active, validate
+    // that the fee amount is zero and set the transaction version to 2.
+    let mut revocation_tx_version = 1u16;
+    if is_auto_revocations_enabled {
+        if fee_amt != 0 {
+            return Err(rpc_invalid_error(
+                "Fee amount must be 0 when the automatic ticket revocations agenda is active",
+            ));
+        }
+        revocation_tx_version = dcroxide_stake::TX_VERSION_AUTO_REVOCATIONS;
+    }
+
+    // Get the previous header bytes.
+    let prev_header = server
+        .cfg
+        .chain
+        .header_by_hash(&prev_blk_hash)
+        .map_err(|_| crate::rpcerrors::rpc_block_not_found_error(&prev_blk_hash))?;
+    let prev_header_bytes = prev_header.serialize();
+
+    let mtx = dcroxide_stake::create_revocation_from_ticket(
+        &tx_hash,
+        &minimal_outputs,
+        fee_amt,
+        revocation_tx_version,
+        &server.cfg.chain_params,
+        &prev_header_bytes,
+        is_auto_revocations_enabled,
+    )
+    .map_err(|e| rpc_invalid_error(&format!("Invalid SSRtx: {e}")))?;
+
+    // Check to make sure our SSRtx was created correctly.
+    dcroxide_stake::check_ssrtx(&mtx).map_err(|e| rpc_internal_err(&e.to_string()))?;
+
+    // Return the serialized and hex-encoded transaction.
+    let mtx_hex = txresults::message_to_hex(&Message::Tx(mtx), server.cfg.max_protocol_version)?;
+    Ok(GoValue::String(mtx_hex))
+}

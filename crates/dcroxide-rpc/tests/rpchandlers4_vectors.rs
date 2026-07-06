@@ -291,6 +291,7 @@ fn mempool_conn_handler_slice_matches_dcrd() {
                 descs.push(RpcMempoolTx {
                     tx,
                     tx_type: tx_type_from_name(f[2]),
+                    fee: f[5].parse().unwrap(),
                 });
                 desc_extras.push((
                     f[3].parse().unwrap(),
@@ -404,6 +405,11 @@ fn mempool_conn_handler_slice_matches_dcrd() {
             log_manager: Box::new(()),
             fee_estimator: Box::new(()),
             block_templater: None,
+            sanity_checker: Box::new(()),
+            time_source: Box::new(()),
+            proxy: String::new(),
+            test_net: false,
+            runtime_version: String::new(),
         });
 
         match dispatch(&mut server, method_name, &cmd) {

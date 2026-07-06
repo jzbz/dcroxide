@@ -134,6 +134,13 @@ pub fn format_float_json32(v: f32) -> String {
     format_float_json_parts(neg, digits, dp, use_e)
 }
 
+/// Format a `float64` exactly as Go's `strconv.FormatFloat(v, 'f',
+/// -1, 64)` does (shortest round-trip digits, never exponent form).
+pub fn format_float_f(v: f64) -> String {
+    let (neg, digits, dp) = shortest_digits(format!("{v:e}"));
+    fmt_f(neg, &digits, dp)
+}
+
 /// Format a `float64` like Go's `fmt` verb `%v` (shortest `%g`).
 pub fn format_float_g(v: f64) -> String {
     let (neg, digits, dp) = shortest_digits(format!("{v:e}"));

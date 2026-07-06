@@ -521,6 +521,11 @@ fn stake_query_handler_slice_matches_dcrd() {
             log_manager: Box::new(()),
             fee_estimator: Box::new(()),
             block_templater: None,
+            sanity_checker: Box::new(()),
+            time_source: Box::new(()),
+            proxy: String::new(),
+            test_net: false,
+            runtime_version: String::new(),
         });
 
         match dispatch(&mut server, method_name, &cmd) {

@@ -68,10 +68,20 @@ pub trait RpcChain {
     fn block_by_hash(&mut self, _hash: &Hash) -> Result<MsgBlock, String> {
         unimplemented!("block_by_hash")
     }
+    /// The main chain block at the given height (dcrd
+    /// `BlockByHeight`).
+    fn block_by_height(&mut self, _height: i64) -> Result<MsgBlock, String> {
+        unimplemented!("block_by_height")
+    }
     /// The hash of the main chain block at the given height (dcrd
     /// `BlockHashByHeight`).
     fn block_hash_by_height(&mut self, _height: i64) -> Result<Hash, String> {
         unimplemented!("block_hash_by_height")
+    }
+    /// The hashes of the main chain blocks in the height range
+    /// `[start, end)` (dcrd `HeightRange`).
+    fn height_range(&mut self, _start: i64, _end: i64) -> Result<Vec<Hash>, String> {
+        unimplemented!("height_range")
     }
     /// The height of the main chain block with the given hash (dcrd
     /// `BlockHeightByHash`).
@@ -267,6 +277,12 @@ pub trait RpcChain {
     fn is_subsidy_split_r2_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
         unimplemented!("is_subsidy_split_r2_agenda_active")
     }
+    /// Whether the automatic ticket revocations agenda is active as of
+    /// the block AFTER the given block (dcrd
+    /// `IsAutoRevocationsAgendaActive`).
+    fn is_auto_revocations_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+        unimplemented!("is_auto_revocations_agenda_active")
+    }
 }
 
 /// A transaction index entry (the used subset of dcrd
@@ -376,6 +392,12 @@ pub struct RpcUtxoEntry {
     pub is_coinbase: bool,
     /// Whether the output is spent by a main chain transaction.
     pub is_spent: bool,
+    /// The stake type of the transaction containing the output (dcrd
+    /// `UtxoEntry.TransactionType`).
+    pub tx_type: dcroxide_stake::TxType,
+    /// The minimal outputs of the containing ticket purchase, `None`
+    /// when unavailable (dcrd `UtxoEntry.TicketMinimalOutputs`).
+    pub ticket_minimal_outputs: Option<Vec<dcroxide_stake::MinimalOutput>>,
 }
 
 /// Unspent transaction output set statistics (the used subset of
@@ -438,7 +460,42 @@ pub struct Config<C> {
     /// The optional background block templater (dcrd
     /// `BlockTemplater`, nil when mining is not configured).
     pub block_templater: Option<Box<dyn RpcBlockTemplater>>,
+    /// The block sanity checker (dcrd `SanityChecker`).
+    pub sanity_checker: Box<dyn RpcSanityChecker>,
+    /// The median time source (dcrd `TimeSource`).
+    pub time_source: Box<dyn RpcTimeSource>,
+    /// The configured proxy address, empty when none (dcrd `Proxy`).
+    pub proxy: String,
+    /// Whether the server runs on a test network (dcrd `TestNet`).
+    pub test_net: bool,
+    /// The language runtime version string reported by the version
+    /// command (dcrd embeds Go's `runtime.Version()`).
+    pub runtime_version: String,
 }
+
+/// The block sanity checker the verifychain handler consults (the
+/// used subset of dcrd's `rpcserver.SanityChecker` interface).
+pub trait RpcSanityChecker {
+    /// Perform the basic chain sanity checks on the block (dcrd
+    /// `CheckBlockSanity`).
+    fn check_block_sanity(&mut self, _block: &MsgBlock) -> Result<(), String> {
+        unimplemented!("check_block_sanity")
+    }
+}
+
+impl RpcSanityChecker for () {}
+
+/// The median time source the ported handlers read (the used subset
+/// of dcrd's `blockchain.MedianTimeSource` interface).
+pub trait RpcTimeSource {
+    /// The offset between the local clock and the network-adjusted
+    /// time, in nanoseconds (dcrd `Offset`).
+    fn offset_nanos(&mut self) -> i64 {
+        unimplemented!("offset_nanos")
+    }
+}
+
+impl RpcTimeSource for () {}
 
 /// The sync manager operations the ported handlers perform (the used
 /// subset of dcrd's `rpcserver.SyncManager` interface).
@@ -736,6 +793,8 @@ pub struct RpcMempoolTx {
     pub tx: MsgTx,
     /// The stake type of the transaction.
     pub tx_type: dcroxide_stake::TxType,
+    /// The fee the transaction pays in atoms (dcrd `TxDesc.Fee`).
+    pub fee: i64,
 }
 
 /// A verbose mempool transaction descriptor (the used subset of dcrd
@@ -951,6 +1010,17 @@ impl<C: RpcChain> Server<C> {
         self.cfg
             .chain
             .is_subsidy_split_r2_agenda_active(prev_blk_hash)
+            .map_err(|e| rpc_internal_err(&e))
+    }
+
+    /// dcrd `Server.isAutoRevocationsAgendaActive`.
+    pub(crate) fn is_auto_revocations_agenda_active(
+        &mut self,
+        prev_blk_hash: &Hash,
+    ) -> Result<bool, RPCError> {
+        self.cfg
+            .chain
+            .is_auto_revocations_agenda_active(prev_blk_hash)
             .map_err(|e| rpc_internal_err(&e))
     }
 }
