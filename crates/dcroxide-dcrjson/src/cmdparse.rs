@@ -208,6 +208,7 @@ pub fn parse_params(
                 JsonError::Type {
                     value,
                     type_display,
+                    ..
                 } => {
                     let str = format!(
                         "parameter #{} '{field_name}' must be type {type_display} (got {value})",

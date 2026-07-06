@@ -266,6 +266,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-connmgr"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-dcrjson",
+ "dcroxide-testutil",
+ "dcroxide-wire",
+]
+
+[[package]]
 name = "dcroxide-containers"
 version = "0.1.0"
 dependencies = [

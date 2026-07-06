@@ -1,0 +1,19 @@
+[package]
+name = "dcroxide-connmgr"
+description = "Connection management mirroring dcrd's connmgr package: dynamic ban scores, the connection manager, HTTPS seeding, and Tor DNS resolution"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-dcrjson = { path = "../dcroxide-dcrjson" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true

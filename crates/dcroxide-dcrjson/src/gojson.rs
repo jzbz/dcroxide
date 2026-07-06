@@ -638,6 +638,10 @@ pub enum JsonError {
         value: String,
         /// Display form of the Go type that could not accept it.
         type_display: String,
+        /// The struct field context Go records while decoding into a
+        /// named struct, e.g. `node.host`: the innermost named struct
+        /// type and the dotted field path.
+        field: Option<String>,
     },
 }
 
@@ -649,9 +653,16 @@ impl JsonError {
             JsonError::Type {
                 value,
                 type_display,
-            } => {
-                format!("json: cannot unmarshal {value} into Go value of type {type_display}")
-            }
+                field,
+            } => match field {
+                Some(field) => format!(
+                    "json: cannot unmarshal {value} into Go struct field {field} \
+                     of type {type_display}"
+                ),
+                None => {
+                    format!("json: cannot unmarshal {value} into Go value of type {type_display}")
+                }
+            },
         }
     }
 }
@@ -1121,6 +1132,7 @@ fn type_error(value: &str, typ: &GoType) -> JsonError {
     JsonError::Type {
         value: value.to_string(),
         type_display: typ.display(),
+        field: None,
     }
 }
 
@@ -1363,7 +1375,8 @@ fn decode_object(typ: &GoType, r: &mut Reader<'_>, out: &mut GoValue) -> Result<
                     // in declaration order (Go `encoding/json`).
                     let idx = field_index(fields, &key);
                     match idx {
-                        Some(i) => decode_value(&fields[i].typ, r, &mut values[i])?,
+                        Some(i) => decode_value(&fields[i].typ, r, &mut values[i])
+                            .map_err(|e| add_field_context(e, typ, &effective_name(&fields[i])))?,
                         None => r.skip_value(),
                     }
                     r.skip_ws();
@@ -1386,6 +1399,54 @@ fn decode_object(typ: &GoType, r: &mut Reader<'_>, out: &mut GoValue) -> Result<
 }
 
 /// The index of the struct field a JSON object key maps to.
+/// The effective JSON name of a struct field for error context.
+fn effective_name(f: &crate::gotype::StructField) -> String {
+    match &f.json_tag {
+        Some(tag) => {
+            let name = tag.split(',').next().unwrap_or("");
+            if name.is_empty() || tag == "-" {
+                f.name.clone()
+            } else {
+                name.to_string()
+            }
+        }
+        None => f.name.clone(),
+    }
+}
+
+/// Attach Go's struct-field error context to a type error raised while
+/// decoding a named struct's field: the innermost struct type name
+/// with the dotted field path (Go `UnmarshalTypeError.Struct`/`Field`).
+fn add_field_context(err: JsonError, struct_type: &GoType, field_name: &str) -> JsonError {
+    match err {
+        JsonError::Type {
+            value,
+            type_display,
+            field,
+        } => {
+            let struct_name = struct_type.name();
+            let field = match field {
+                // An inner struct already recorded its context; Go
+                // keeps the innermost struct name and prepends the
+                // outer field to the path.
+                Some(existing) => match existing.split_once('.') {
+                    Some((inner_struct, path)) => {
+                        format!("{inner_struct}.{field_name}.{path}")
+                    }
+                    None => existing,
+                },
+                None => format!("{struct_name}.{field_name}"),
+            };
+            JsonError::Type {
+                value,
+                type_display,
+                field: Some(field),
+            }
+        }
+        other => other,
+    }
+}
+
 fn field_index(fields: &[crate::gotype::StructField], key: &str) -> Option<usize> {
     let effective = |f: &crate::gotype::StructField| -> Option<String> {
         if f.unexported {

@@ -97,3 +97,26 @@ Entry format:
 - **Pinned by:** `rpchelp_vectors` (the `usage poisoned` row shows a
   websocket-flag request returning the previously cached
   non-websocket text, which differs from the true websocket form)
+
+## QK-0006 — dcrd's ban score decay is platform-dependent
+
+- **Where:** dcrd `connmgr` `decayFactor` (via Go `math.Exp`) /
+  dcroxide-connmgr `banscore.rs` and `goexp.rs`
+- **What:** Go dispatches `math.Exp` to assembly on several
+  architectures (amd64, arm64, loong64, s390x), and the assembly
+  results differ from the portable Go implementation by one ulp on
+  276 of the 1801 decay ages the ban score can ever use. The decayed
+  component is truncated to a `uint32` after multiplication, so a
+  one-ulp difference can change the integer score near boundaries —
+  dcrd on amd64 and dcrd built for a portable target can disagree
+  with each other. There is therefore no single bit-exact truth; the
+  port follows the portable Go source, which is the specification at
+  the tag.
+- **Why reproduced:** ban thresholds decide peer disconnects and
+  bans; the port must have a defined, defensible behavior even
+  though dcrd's own is platform-dependent.
+- **Pinned by:** `connmgr_vectors` (the `decay` rows pin the whole
+  1801-value domain against the portable algorithm bit for bit, and
+  the `banscore` rows replay dcrd's own methods on ages where the
+  platform assembly agrees with the portable code, verified at dump
+  time)

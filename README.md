@@ -156,6 +156,13 @@ Currently implemented:
   the caching help/usage provider, pinned by the complete generated
   help text for every method byte for byte from a session generated
   inside dcrd's own package
+- `dcroxide-connmgr` — connection management from dcrd's `connmgr`:
+  the dynamic ban score over a bit-exact port of Go's portable
+  `math.Exp`, the connection manager as a synchronous state machine
+  with injectable dialers and event-driven retries, Tor SOCKS DNS
+  resolution, and HTTPS seeding, pinned by the full decay domain,
+  scripted proxy exchanges, and parse batteries generated inside
+  dcrd's own package
 - `dcroxide-mixing` — the StakeShuffle mixing support from dcrd's
   `mixing` package: message identity hashes and Schnorr signatures,
   session ID derivation and validation, the DC-net finite field and
