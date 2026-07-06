@@ -1,0 +1,18 @@
+[package]
+name = "dcroxide-rpctypes"
+description = "Chain server JSON-RPC command, result, and notification definitions mirroring dcrd's rpc/jsonrpc/types/v4 module"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-dcrjson = { path = "../dcroxide-dcrjson" }
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true

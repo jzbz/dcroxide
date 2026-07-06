@@ -143,6 +143,13 @@ Currently implemented:
   error messages) and a `text/tabwriter` port reimplemented so every
   byte of JSON, error text, and help output matches, pinned by a
   scripted session generated inside dcrd's own package
+- `dcroxide-rpctypes` — the chain server command, result, and
+  notification definitions from dcrd's `rpc/jsonrpc/types` module:
+  all 105 registered methods and every struct type as descriptors
+  over the dcrjson base, including the custom five-shape Vin
+  marshaling, pinned by usage text, zero-value marshals of every
+  type, and curated populated round trips generated inside dcrd's
+  own package
 - `dcroxide-mixing` — the StakeShuffle mixing support from dcrd's
   `mixing` package: message identity hashes and Schnorr signatures,
   session ID derivation and validation, the DC-net finite field and

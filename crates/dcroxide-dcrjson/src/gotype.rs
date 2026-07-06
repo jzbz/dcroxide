@@ -423,6 +423,9 @@ pub enum GoValue {
     Map(Vec<(String, GoValue)>),
     /// The field values of a struct, parallel to the type's fields.
     Struct(Vec<GoValue>),
+    /// Pre-marshalled JSON embedded verbatim, standing in for a Go
+    /// type with a custom `json.Marshaler` implementation.
+    Raw(String),
 }
 
 impl GoValue {
@@ -483,6 +486,7 @@ impl GoValue {
                     .collect();
                 format!("map[{}]", body.join(" "))
             }
+            GoValue::Raw(raw) => raw.clone(),
         }
     }
 }

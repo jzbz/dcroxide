@@ -431,6 +431,12 @@ pub fn encode(typ: &GoType, val: &GoValue) -> String {
 }
 
 fn encode_into(typ: &GoType, val: &GoValue, out: &mut String) {
+    // A raw value stands in for a custom json.Marshaler and is
+    // embedded verbatim regardless of the declared type.
+    if let GoValue::Raw(raw) = val {
+        out.push_str(raw);
+        return;
+    }
     let rt = resolve(typ);
     match rt {
         GoType::Ptr(elem) => match val {
