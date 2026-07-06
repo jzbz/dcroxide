@@ -73,6 +73,11 @@ pub trait RpcChain {
     fn block_hash_by_height(&mut self, _height: i64) -> Result<Hash, String> {
         unimplemented!("block_hash_by_height")
     }
+    /// The height of the main chain block with the given hash (dcrd
+    /// `BlockHeightByHash`).
+    fn block_height_by_hash(&mut self, _hash: &Hash) -> Result<i64, String> {
+        unimplemented!("block_height_by_hash")
+    }
     /// The current chain tips (dcrd `ChainTips`).
     fn chain_tips(&mut self) -> Vec<RpcChainTip> {
         unimplemented!("chain_tips")
@@ -208,6 +213,21 @@ pub trait RpcChain {
     fn live_tickets(&mut self) -> Result<Vec<Hash>, String> {
         unimplemented!("live_tickets")
     }
+    /// The unspent output entry for the outpoint, `None` when it does
+    /// not exist (dcrd `FetchUtxoEntry`).
+    fn fetch_utxo_entry(
+        &mut self,
+        _tx_hash: &Hash,
+        _index: u32,
+        _tree: i8,
+    ) -> Result<Option<RpcUtxoEntry>, String> {
+        unimplemented!("fetch_utxo_entry")
+    }
+    /// Statistics on the unspent transaction output set (dcrd
+    /// `FetchUtxoStats`).
+    fn fetch_utxo_stats(&mut self) -> Result<RpcUtxoStats, String> {
+        unimplemented!("fetch_utxo_stats")
+    }
     /// The header of the main chain block at the given height (dcrd
     /// `HeaderByHeight`; the error text only feeds the wrapped
     /// internal error).
@@ -229,6 +249,131 @@ pub trait RpcChain {
     fn is_subsidy_split_r2_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
         unimplemented!("is_subsidy_split_r2_agenda_active")
     }
+}
+
+/// A transaction index entry (the used subset of dcrd
+/// `indexers.TxIndexEntry`).
+#[derive(Debug, Clone)]
+pub struct RpcTxIndexEntry {
+    /// The hash of the block containing the transaction.
+    pub block_hash: Hash,
+    /// The byte offset of the transaction within the serialized block.
+    pub offset: u32,
+    /// The length of the serialized transaction.
+    pub len: u32,
+    /// The offset of the transaction within the block's regular tree.
+    pub block_index: u32,
+}
+
+/// The transaction index operations the ported handlers perform (the
+/// used subset of dcrd's `rpcserver.TxIndexer` interface).
+pub trait RpcTxIndexer {
+    /// The human-readable index name (dcrd `Name`).
+    fn name(&mut self) -> String {
+        unimplemented!("name")
+    }
+    /// The current index tip (dcrd `Tip`).
+    fn tip(&mut self) -> Result<(i64, Hash), String> {
+        unimplemented!("tip")
+    }
+    /// The index entry for the transaction (dcrd `Entry`; `None` for
+    /// an unindexed transaction).
+    fn entry(&mut self, _tx_hash: &Hash) -> Result<Option<RpcTxIndexEntry>, String> {
+        unimplemented!("entry")
+    }
+    /// Wait for the index to signal synchronization, returning whether
+    /// the signal fired before dcrd's three-second timeout (dcrd
+    /// selects `WaitForSync` against `syncWait`).
+    fn wait_for_sync(&mut self) -> bool {
+        unimplemented!("wait_for_sync")
+    }
+}
+
+impl RpcTxIndexer for () {}
+
+/// The database operations the ported handlers perform (the used
+/// subset of dcrd's `database.DB` config field).
+pub trait RpcDb {
+    /// Fetch the raw bytes of a block region (dcrd
+    /// `Tx.FetchBlockRegion` under `DB.View`).
+    fn fetch_block_region(
+        &mut self,
+        _block_hash: &Hash,
+        _offset: u32,
+        _len: u32,
+    ) -> Result<Vec<u8>, String> {
+        unimplemented!("fetch_block_region")
+    }
+}
+
+impl RpcDb for () {}
+
+/// A version 2 filter with its header commitment proof (the used
+/// subset of dcrd `gcs.FilterV2` + `blockchain.HeaderProof`).
+#[derive(Debug, Clone)]
+pub struct RpcFilterProof {
+    /// The serialized filter bytes.
+    pub filter_bytes: Vec<u8>,
+    /// The leaf index of the filter in the header commitment.
+    pub proof_index: u32,
+    /// The inclusion proof hashes.
+    pub proof_hashes: Vec<Hash>,
+}
+
+/// A filter lookup failure with the classification the handler needs
+/// (dcrd `blockchain.ErrNoFilter`).
+#[derive(Debug, Clone)]
+pub struct FilterFailure {
+    /// Whether the failure is dcrd `blockchain.ErrNoFilter`.
+    pub is_no_filter: bool,
+    /// The error text.
+    pub message: String,
+}
+
+/// The version 2 filter source (the used subset of dcrd's
+/// `rpcserver.FiltererV2` interface).
+pub trait RpcFiltererV2 {
+    /// The filter and its commitment proof for the given block (dcrd
+    /// `FilterByBlockHash`).
+    fn filter_by_block_hash(&mut self, _hash: &Hash) -> Result<RpcFilterProof, FilterFailure> {
+        unimplemented!("filter_by_block_hash")
+    }
+}
+
+impl RpcFiltererV2 for () {}
+
+/// An unspent transaction output entry (the used subset of dcrd
+/// `blockchain.UtxoEntry`).
+#[derive(Debug, Clone)]
+pub struct RpcUtxoEntry {
+    /// The output amount in atoms.
+    pub amount: i64,
+    /// The output script version.
+    pub script_version: u16,
+    /// The output script.
+    pub pk_script: Vec<u8>,
+    /// The height of the block containing the output.
+    pub block_height: i64,
+    /// Whether the containing transaction is a coinbase.
+    pub is_coinbase: bool,
+    /// Whether the output is spent by a main chain transaction.
+    pub is_spent: bool,
+}
+
+/// Unspent transaction output set statistics (the used subset of
+/// dcrd `blockchain.UtxoStats`).
+#[derive(Debug, Clone)]
+pub struct RpcUtxoStats {
+    /// The number of unspent outputs.
+    pub utxos: i64,
+    /// The number of transactions with unspent outputs.
+    pub transactions: i64,
+    /// The serialized size of the set.
+    pub size: i64,
+    /// The total amount in atoms.
+    pub total: i64,
+    /// The hash of the serialized set.
+    pub serialized_hash: Hash,
 }
 
 /// The configuration fields the ported handlers consume (the used
@@ -258,6 +403,13 @@ pub struct Config<C> {
     pub interfaces: Box<dyn crate::helpers::InterfaceLookup>,
     /// The random nonce source (dcrd uses the global math/rand).
     pub rand_u64: Box<dyn FnMut() -> u64>,
+    /// The optional transaction index (dcrd `TxIndexer`, nil when
+    /// disabled).
+    pub tx_indexer: Option<Box<dyn RpcTxIndexer>>,
+    /// The block database (dcrd `DB`).
+    pub db: Box<dyn RpcDb>,
+    /// The version 2 filter source (dcrd `FiltererV2`).
+    pub filterer_v2: Box<dyn RpcFiltererV2>,
 }
 
 /// The sync manager operations the ported handlers perform (the used
@@ -369,6 +521,12 @@ pub trait RpcTxMempooler {
     /// `HaveTransactions`).
     fn have_transactions(&mut self, _hashes: &[Hash]) -> Vec<bool> {
         unimplemented!("have_transactions")
+    }
+    /// The pool transaction with the given hash along with the tree
+    /// it lives in (dcrd `FetchTransaction`; the error text is
+    /// discarded by the handlers).
+    fn fetch_transaction(&mut self, _tx_hash: &Hash) -> Result<(MsgTx, i8), String> {
+        unimplemented!("fetch_transaction")
     }
 }
 

@@ -2108,3 +2108,336 @@ pub fn handle_exists_mempool_txs<C: RpcChain>(
 
     Ok(GoValue::String(hex_str(&bitset_bytes(&exists))))
 }
+
+/// handlegetrawtransaction (dcrd `handleGetRawTransaction`); the
+/// verbose result is a `TxRawResult` value and the non-verbose
+/// result is the serialized transaction hex string.
+pub fn handle_get_raw_transaction<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let txid = s(&c[0]);
+    let verbose = opt_int(&c[1]).is_some_and(|v| v != 0);
+
+    // Convert the provided transaction hash hex to a Hash.
+    let tx_hash: Hash = txid.parse().map_err(|_| rpc_decode_hex_error(txid))?;
+
+    // Try to fetch the transaction from the memory pool and if that
+    // fails, try the block database.
+    let mtx: MsgTx;
+    let mut blk_hash: Option<Hash> = None;
+    let mut blk_height: i64 = 0;
+    let mut blk_index: u32 = 0;
+    match server.cfg.tx_mempooler.fetch_transaction(&tx_hash) {
+        Err(_) => {
+            let Some(tx_index) = server.cfg.tx_indexer.as_mut() else {
+                return Err(rpc_internal_err(
+                    "the transaction index must be enabled to query the \
+                     blockchain (specify --txindex)",
+                ));
+            };
+
+            // Ensure the tx index is synced.
+            let (t_height, t_hash) = tx_index.tip().map_err(|e| rpc_internal_err(&e))?;
+
+            // Return an out-of-sync error if the index is lagging a
+            // maximum reorg depth (6) blocks or more from the chain
+            // tip.
+            let index_name = tx_index.name();
+            if server.cfg.chain.best_snapshot().height > t_height + 5 {
+                return Err(rpc_internal_err(&format!("{index_name}: index not synced")));
+            }
+
+            // Wait for the index to catch up to the current best tip,
+            // failing after dcrd's three second timeout.
+            if server.cfg.chain.best_snapshot().hash != t_hash {
+                let tx_index = server.cfg.tx_indexer.as_mut().expect("checked above");
+                if !tx_index.wait_for_sync() {
+                    return Err(rpc_internal_err(&format!("{index_name}: index not synced")));
+                }
+            }
+
+            // Look up the location of the transaction.
+            let tx_index = server.cfg.tx_indexer.as_mut().expect("checked above");
+            let idx_entry = tx_index.entry(&tx_hash).map_err(|e| rpc_internal_err(&e))?;
+            let Some(idx_entry) = idx_entry else {
+                return Err(crate::rpcerrors::rpc_no_tx_info_error(&tx_hash));
+            };
+
+            // Load the raw transaction bytes from the database.
+            let tx_bytes = server
+                .cfg
+                .db
+                .fetch_block_region(&idx_entry.block_hash, idx_entry.offset, idx_entry.len)
+                .map_err(|_| crate::rpcerrors::rpc_no_tx_info_error(&tx_hash))?;
+
+            // When the verbose flag isn't set, simply return the
+            // serialized transaction as a hex-encoded string.  This is
+            // done here to avoid deserializing it only to reserialize
+            // it again later.
+            if !verbose {
+                return Ok(GoValue::String(hex_str(&tx_bytes)));
+            }
+
+            // Grab the block details.
+            blk_hash = Some(idx_entry.block_hash);
+            blk_height = server
+                .cfg
+                .chain
+                .block_height_by_hash(&idx_entry.block_hash)
+                .map_err(|e| rpc_internal_err(&e))?;
+            blk_index = idx_entry.block_index;
+
+            // Deserialize the transaction.
+            let (msg_tx, _) =
+                MsgTx::from_bytes(&tx_bytes).map_err(|e| rpc_internal_err(&format!("{e:?}")))?;
+            mtx = msg_tx;
+        }
+        Ok((tx, _tree)) => {
+            // When the verbose flag isn't set, simply return the
+            // network-serialized transaction as a hex-encoded string.
+            if !verbose {
+                let mtx_hex =
+                    txresults::message_to_hex(&Message::Tx(tx), server.cfg.max_protocol_version)?;
+                return Ok(GoValue::String(mtx_hex));
+            }
+
+            mtx = tx;
+        }
+    }
+
+    // The verbose flag is set, so generate the JSON object and return
+    // it.
+    let mut blk_header = None;
+    let prev_blk_hash;
+    let mut blk_hash_str = String::new();
+    let mut confirmations: i64 = 0;
+    if let Some(blk_hash) = blk_hash {
+        // Fetch the header from chain.
+        let header = server
+            .cfg
+            .chain
+            .header_by_hash(&blk_hash)
+            .map_err(|e| rpc_internal_err(&e))?;
+
+        prev_blk_hash = header.prev_block;
+        blk_header = Some(header);
+        blk_hash_str = blk_hash.to_string();
+        confirmations = 1 + server.cfg.chain.best_snapshot().height - blk_height;
+    } else {
+        // The transaction was obtained from the mempool when there is
+        // no block hash set, so the previous block hash is the current
+        // best chain tip in that case.
+        prev_blk_hash = server.cfg.chain.best_snapshot().hash;
+    }
+
+    // Determine if the treasury rules are active as of either the
+    // block that contains the transaction or the current best tip when
+    // it is in the mempool.
+    let is_treasury_enabled = server.is_treasury_agenda_active(&prev_blk_hash)?;
+
+    txresults::create_tx_raw_result(
+        &server.cfg.chain_params,
+        &mtx,
+        &tx_hash.to_string(),
+        blk_index,
+        blk_header.as_ref(),
+        &blk_hash_str,
+        blk_height,
+        confirmations,
+        is_treasury_enabled,
+        server.cfg.max_protocol_version,
+        server.cfg.chain_params.net,
+    )
+}
+
+/// handlegettxout (dcrd `handleGetTxOut`); the result is a
+/// `GetTxOutResult` value, or null when the output does not exist or
+/// is spent.
+pub fn handle_get_tx_out<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let txid = s(&c[0]);
+    let vout = uint(&c[1]) as u32;
+    let tree = int(&c[2]) as i8;
+    let include_mempool = opt_bool(&c[3]).unwrap_or(true);
+
+    // Convert the provided transaction hash hex to a Hash.
+    let tx_hash: Hash = txid.parse().map_err(|_| rpc_decode_hex_error(txid))?;
+
+    if !(tree == 0 || tree == 1) {
+        return Err(rpc_invalid_error("Tx tree must be regular or stake"));
+    }
+
+    let best = server.cfg.chain.best_snapshot();
+
+    // If requested and the tx is available in the mempool try to fetch
+    // it from there, otherwise attempt to fetch from the block
+    // database.
+    let mut tx_from_mempool: Option<MsgTx> = None;
+    if include_mempool
+        && let Ok((tx, tx_tree)) = server.cfg.tx_mempooler.fetch_transaction(&tx_hash)
+    {
+        // Skip the mempool hit if the tx tree does not match the tree
+        // param that was passed; it is technically possible (though
+        // extremely unlikely) that the tx exists elsewhere.
+        if tx_tree == tree {
+            tx_from_mempool = Some(tx);
+        }
+    }
+
+    let (best_block_hash, confirmations, value, script_version, pk_script, is_coinbase);
+    if let Some(mtx) = &tx_from_mempool {
+        if vout > (mtx.tx_out.len() as u32).wrapping_sub(1) {
+            return Err(RPCError::new(
+                codes::INVALID_TX_VOUT,
+                "Output index number (vout) does not exist for transaction.",
+            ));
+        }
+
+        // dcrd also guards against a nil *wire.TxOut in the slice
+        // here; outputs cannot be nil in this representation.
+        let tx_out = &mtx.tx_out[vout as usize];
+
+        // The transaction output in question is from the mempool, so
+        // determine if the treasury rules are active from the point of
+        // view of the current best tip.
+        let is_treasury_enabled = server.is_treasury_agenda_active(&best.prev_hash)?;
+
+        best_block_hash = best.hash.to_string();
+        confirmations = 0i64;
+        value = tx_out.value;
+        script_version = tx_out.version;
+        pk_script = tx_out.pk_script.clone();
+        is_coinbase = dcroxide_standalone::is_coin_base_tx(mtx, is_treasury_enabled);
+    } else {
+        let entry = server
+            .cfg
+            .chain
+            .fetch_utxo_entry(&tx_hash, vout, tree)
+            .map_err(|e| rpc_internal_err(&e))?;
+
+        // To match the behavior of the reference client, return nil
+        // (JSON null) if the transaction output could not be found
+        // (never existed or was pruned) or is spent by another
+        // transaction already in the main chain.  Mined transactions
+        // that are spent by a mempool transaction are not affected by
+        // this.
+        let Some(entry) = entry else {
+            return Ok(GoValue::Null);
+        };
+        if entry.is_spent {
+            return Ok(GoValue::Null);
+        }
+
+        best_block_hash = best.hash.to_string();
+        confirmations = 1 + best.height - entry.block_height;
+        value = entry.amount;
+        script_version = entry.script_version;
+        pk_script = entry.pk_script;
+        is_coinbase = entry.is_coinbase;
+    }
+
+    // Disassemble script into single line printable format.  The
+    // disassembled string will contain [error] inline if the script
+    // doesn't fully parse, so ignore the error here.
+    let (disbuf, _) = dcroxide_txscript::disasm_string(&pk_script);
+
+    // Attempt to extract known addresses associated with the script.
+    let params = server.cfg.chain_params.clone();
+    let (script_type, addrs) =
+        dcroxide_txscript::stdscript::extract_addrs(script_version, &pk_script, &params);
+    let addresses: Vec<GoValue> = addrs
+        .iter()
+        .map(|addr| GoValue::String(addr.to_string()))
+        .collect();
+
+    // Determine the number of required signatures for known standard
+    // types.
+    let req_sigs =
+        dcroxide_txscript::stdscript::determine_required_sigs(script_version, &pk_script);
+
+    Ok(GoValue::Struct(vec![
+        GoValue::String(best_block_hash),
+        GoValue::Int(confirmations),
+        GoValue::Float64(txresults::to_coin(value)),
+        GoValue::Struct(vec![
+            GoValue::String(disbuf),
+            GoValue::String(hex_str(&pk_script)),
+            GoValue::Int(i64::from(req_sigs as i32)),
+            GoValue::String(script_type.to_string()),
+            GoValue::Array(addresses),
+            GoValue::Null,
+            GoValue::Uint(u64::from(script_version)),
+        ]),
+        GoValue::Bool(is_coinbase),
+    ]))
+}
+
+/// handlegettxoutsetinfo (dcrd `handleGetTxOutSetInfo`); the result
+/// is a `GetTxOutSetInfoResult` value.  Note dcrd returns the bare
+/// stats error which its dispatch layer wraps; the wrapped internal
+/// error stands in until the dispatch layer is ported.
+pub fn handle_get_tx_out_set_info<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let best = server.cfg.chain.best_snapshot();
+    let stats = server
+        .cfg
+        .chain
+        .fetch_utxo_stats()
+        .map_err(|e| rpc_internal_err(&e))?;
+
+    Ok(GoValue::Struct(vec![
+        GoValue::Int(best.height),
+        GoValue::String(best.hash.to_string()),
+        GoValue::Int(stats.transactions),
+        GoValue::Int(stats.utxos),
+        GoValue::String(stats.serialized_hash.to_string()),
+        GoValue::Int(stats.size),
+        GoValue::Int(stats.total),
+    ]))
+}
+
+/// handlegetcfilterv2 (dcrd `handleGetCFilterV2`); the result is a
+/// `GetCFilterV2Result` value.
+pub fn handle_get_cfilter_v2<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let block_hash_str = s(&c[0]);
+    let hash: Hash = block_hash_str
+        .parse()
+        .map_err(|_| rpc_decode_hex_error(block_hash_str))?;
+
+    let proof = server
+        .cfg
+        .filterer_v2
+        .filter_by_block_hash(&hash)
+        .map_err(|failure| {
+            if failure.is_no_filter {
+                return RPCError::new(codes::BLOCK_NOT_FOUND, &format!("Block not found: {hash}"));
+            }
+            rpc_internal_err(&failure.message)
+        })?;
+
+    // dcrd allocates a zero-length proof hash slice and assigns into
+    // it by index, which panics for any non-empty proof; the header
+    // commitment has a single leaf so proofs are always empty in
+    // practice, and the panic is mirrored deliberately.
+    if !proof.proof_hashes.is_empty() {
+        panic!("getcfilterv2: non-empty proof hashes are unreachable in dcrd");
+    }
+
+    Ok(GoValue::Struct(vec![
+        GoValue::String(block_hash_str.to_string()),
+        GoValue::String(hex_str(&proof.filter_bytes)),
+        GoValue::Uint(u64::from(proof.proof_index)),
+        GoValue::Null,
+    ]))
+}

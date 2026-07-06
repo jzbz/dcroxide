@@ -372,6 +372,9 @@ fn handler_slice_matches_dcrd() {
             clock: Box::new(()),
             interfaces: Box::new(dcroxide_rpc::helpers::NoInterfaces),
             rand_u64: Box::new(|| 0),
+            tx_indexer: None,
+            db: Box::new(()),
+            filterer_v2: Box::new(()),
         });
 
         match dispatch(&mut server, method_name, &cmd) {
