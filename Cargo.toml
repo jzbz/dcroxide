@@ -4,6 +4,7 @@ members = [
     "crates/dcroxide-addrmgr",
     "crates/dcroxide-base58",
     "crates/dcroxide-blockchain",
+    "crates/dcroxide-certgen",
     "crates/dcroxide-chaincfg",
     "crates/dcroxide-chainhash",
     "crates/dcroxide-connmgr",

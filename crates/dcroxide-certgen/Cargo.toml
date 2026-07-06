@@ -1,0 +1,22 @@
+[package]
+name = "dcroxide-certgen"
+description = "TLS certificate generation mirroring dcrd's certgen package byte for byte"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-dcrec = { path = "../dcroxide-dcrec" }
+idna = "1"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "sha256", "std"] }
+p521 = { version = "0.13", default-features = false, features = ["ecdsa", "sha512", "getrandom", "std"] }
+sha1 = "0.10"
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true

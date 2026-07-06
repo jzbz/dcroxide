@@ -156,6 +156,11 @@ Currently implemented:
   the caching help/usage provider, pinned by the complete generated
   help text for every method byte for byte from a session generated
   inside dcrd's own package
+- `dcroxide-certgen` — self-signed TLS certificate generation from
+  dcrd's `certgen` over an exact DER writer for Go's certificate
+  shape: Ed25519 pairs pin byte for byte and ECDSA pairs pin their
+  to-be-signed bytes and keys, from a scripted session mirroring
+  dcrd's template construction
 - `dcroxide-connmgr` — connection management from dcrd's `connmgr`:
   the dynamic ban score over a bit-exact port of Go's portable
   `math.Exp`, the connection manager as a synchronous state machine

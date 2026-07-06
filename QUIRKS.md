@@ -120,3 +120,22 @@ Entry format:
   the `banscore` rows replay dcrd's own methods on ages where the
   platform assembly agrees with the portable code, verified at dump
   time)
+
+## QK-0007 — the Ed25519 certificate generator fails on non-ASCII hostnames
+
+- **Where:** dcrd `certgen` `NewEd25519TLSCertPair` / dcroxide-certgen
+  `certgen.rs` `new_ed25519_tls_cert_pair`
+- **What:** the ECDSA generator converts a non-ASCII machine hostname
+  (and non-ASCII extra hosts) to ASCII with IDNA before placing them
+  in the certificate, but the Ed25519 generator was written without
+  that handling, so the raw hostname flows into the subject
+  alternative name and Go's certificate marshaling rejects it: on a
+  machine with a non-ASCII hostname the Ed25519 generator always
+  fails with `failed to create certificate: x509: "…" cannot be
+  encoded as an IA5String`.
+- **Why reproduced:** the generators must succeed and fail on
+  identical inputs so a dcroxide daemon behaves like dcrd on the same
+  machine.
+- **Pinned by:** `certgen_vectors` (the `ed non-ascii-host` row pins
+  the exact error text while the `ec idna` row pins the converted
+  names in the certificate bytes)
