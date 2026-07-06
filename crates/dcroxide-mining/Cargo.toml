@@ -1,6 +1,6 @@
 [package]
-name = "dcroxide-mempool"
-description = "Transaction memory pool mirroring dcrd's internal/mempool package, starting with the relay policy layer"
+name = "dcroxide-mining"
+description = "Block template mining support mirroring dcrd's internal/mining package, starting with the mining view and priority layers"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -9,13 +9,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-dcroxide-blockchain = { path = "../dcroxide-blockchain" }
-dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
-dcroxide-mining = { path = "../dcroxide-mining" }
-dcroxide-standalone = { path = "../dcroxide-standalone" }
 dcroxide-stake = { path = "../dcroxide-stake" }
-dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-wire = { path = "../dcroxide-wire" }
 
 [dev-dependencies]

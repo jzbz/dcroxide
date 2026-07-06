@@ -35,6 +35,8 @@ use crate::error::{
 };
 use crate::policy::calc_min_required_tx_relay_fee;
 use crate::{check_inputs_standard, check_transaction_standard};
+use dcroxide_mining::TxMiningView;
+pub use dcroxide_mining::{TxDesc, UNMINED_HEIGHT, VoteDesc};
 
 /// The factor that fees per kB are disallowed above the minimum
 /// transaction fee (dcrd `maxRelayFeeMultiplier`).
@@ -64,10 +66,6 @@ const ORPHAN_EXPIRE_SCAN_INTERVAL_SECS: i64 = 5 * 60;
 /// The maximum number of concurrent treasury spends allowed in the
 /// mempool (dcrd `MempoolMaxConcurrentTSpends`).
 pub const MEMPOOL_MAX_CONCURRENT_TSPENDS: usize = 7;
-
-/// The unmined height sentinel used for mempool outputs merged into
-/// utxo views (dcrd `mining.UnminedHeight`).
-pub const UNMINED_HEIGHT: i64 = 0x7fffffff;
 
 /// The null block index sentinel (wire `NullBlockIndex`).
 const NULL_BLOCK_INDEX: u32 = 0xffffffff;
@@ -161,43 +159,9 @@ pub struct Policy {
     /// The number of blocks from the next block height for which votes
     /// are accepted when old votes are disallowed (dcrd `MaxVoteAge`).
     pub max_vote_age: u16,
-}
-
-/// A descriptor for a transaction in the pool along with metadata
-/// (dcrd `TxDesc` embedding `mining.TxDesc`; the mining view arrives
-/// with the mining phase).
-#[derive(Clone, Debug)]
-pub struct TxDesc {
-    /// The transaction.
-    pub tx: MsgTx,
-    /// The transaction hash.
-    pub tx_hash: Hash,
-    /// The transaction tree derived from the type.
-    pub tree: i8,
-    /// The transaction type.
-    pub tx_type: TxType,
-    /// When the transaction was added to the pool, as unix seconds.
-    pub added_unix: i64,
-    /// The best block height when the transaction entered the pool.
-    pub height: i64,
-    /// The transaction fee in atoms.
-    pub fee: i64,
-    /// The total signature operations.
-    pub total_sig_ops: i64,
-    /// The serialized size in bytes.
-    pub tx_size: i64,
-}
-
-/// Vote metadata for a block (dcrd `mining.VoteDesc`, housed here
-/// until the mining phase).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct VoteDesc {
-    /// The vote transaction hash.
-    pub vote_hash: Hash,
-    /// The spent ticket hash.
-    pub ticket_hash: Hash,
-    /// Whether the vote approves the previous block's regular tree.
-    pub approves_parent: bool,
+    /// Whether the mining view tracks transaction relationships in
+    /// the mempool (dcrd `EnableAncestorTracking`).
+    pub enable_ancestor_tracking: bool,
 }
 
 /// An orphan transaction with its eviction metadata (dcrd
@@ -242,6 +206,7 @@ pub struct TxPool<'p, C: PoolChain> {
     staged: BTreeMap<[u8; 32], Rc<TxDesc>>,
     staged_outpoints: BTreeMap<OutKey, Rc<TxDesc>>,
     transient: BTreeMap<[u8; 32], MsgTx>,
+    mining_view: TxMiningView,
     votes: BTreeMap<[u8; 32], Vec<VoteDesc>>,
     tspends: BTreeSet<[u8; 32]>,
     next_expire_scan_unix: i64,
@@ -252,6 +217,7 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
     /// transactions until they are mined into a block (dcrd `New`).
     pub fn new(chain: C, policy: Policy, params: &'p Params) -> TxPool<'p, C> {
         let next_expire_scan_unix = chain.now_unix() + ORPHAN_EXPIRE_SCAN_INTERVAL_SECS;
+        let mining_view = TxMiningView::new(policy.enable_ancestor_tracking);
         TxPool {
             chain,
             policy,
@@ -265,6 +231,7 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
             staged: BTreeMap::new(),
             staged_outpoints: BTreeMap::new(),
             transient: BTreeMap::new(),
+            mining_view,
             votes: BTreeMap::new(),
             tspends: BTreeSet::new(),
             next_expire_scan_unix,
@@ -611,6 +578,13 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
                 self.outpoints.remove(&out_key(&tx_in.previous_out_point));
             }
 
+            // Stop tracking this transaction in the mining view.  If
+            // redeeming transactions are going to be removed from the
+            // graph, then do not update their stats.
+            let update_descendant_stats = !remove_redeemers;
+            self.mining_view
+                .remove_transaction(tx_hash, update_descendant_stats);
+
             self.last_updated_unix = self.chain.now_unix();
 
             // Stop tracking if it's a tspend.
@@ -641,8 +615,21 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
     /// address index, and fee estimation hooks are not reproduced).
     fn add_transaction(&mut self, tx_desc: Rc<TxDesc>) {
         // Add the transaction to the pool and mark the referenced
-        // outpoints as spent by the pool.
+        // outpoints as spent by the pool.  The mining view is updated
+        // between the two, matching dcrd's call order, so the
+        // redeemer scan sees only previously tracked outpoints.
         self.pool.insert(tx_desc.tx_hash.0, tx_desc.clone());
+        let pool = &self.pool;
+        let outpoints = &self.outpoints;
+        self.mining_view
+            .add_transaction(&tx_desc, &|hash| pool.get(&hash.0).cloned(), &|tx, f| {
+                let tree = dcroxide_wire::TX_TREE_REGULAR;
+                for i in 0..tx.tx.tx_out.len() as u32 {
+                    if let Some(redeemer) = outpoints.get(&(tx.tx_hash.0, i, tree)) {
+                        f(redeemer.clone());
+                    }
+                }
+            });
         for tx_in in &tx_desc.tx.tx_in {
             self.outpoints
                 .insert(out_key(&tx_in.previous_out_point), tx_desc.clone());
@@ -1719,6 +1706,20 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
     /// The hashes of all transactions in the stage pool.
     pub fn staged_hashes(&self) -> Vec<Hash> {
         self.staged.keys().map(|k| Hash(*k)).collect()
+    }
+
+    /// Mining descriptors for all transactions in the pool (dcrd
+    /// `miningDescs`).
+    pub fn mining_descs(&self) -> Vec<Rc<TxDesc>> {
+        self.pool.values().cloned().collect()
+    }
+
+    /// A snapshot of the pool's transactions and their relationships
+    /// (dcrd `MiningView`, part of the mining `TxSource` contract).
+    pub fn mining_view(&self) -> TxMiningView {
+        let pool = &self.pool;
+        self.mining_view
+            .clone_view(self.mining_descs(), &|hash| pool.get(&hash.0).cloned())
     }
 
     /// The last time a transaction was added to or removed from the

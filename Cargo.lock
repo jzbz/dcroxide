@@ -293,10 +293,21 @@ dependencies = [
  "dcroxide-blockchain",
  "dcroxide-chaincfg",
  "dcroxide-chainhash",
+ "dcroxide-mining",
  "dcroxide-stake",
  "dcroxide-standalone",
  "dcroxide-testutil",
  "dcroxide-txscript",
+ "dcroxide-wire",
+]
+
+[[package]]
+name = "dcroxide-mining"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-chainhash",
+ "dcroxide-stake",
+ "dcroxide-testutil",
  "dcroxide-wire",
 ]
 

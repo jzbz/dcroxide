@@ -240,6 +240,7 @@ pub fn harness_policy(coinbase_maturity: u16) -> Policy {
         min_relay_tx_fee: 1000,
         allow_old_votes: false,
         max_vote_age: coinbase_maturity,
+        enable_ancestor_tracking: true,
     }
 }
 

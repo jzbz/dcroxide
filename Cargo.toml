@@ -11,6 +11,7 @@ members = [
     "crates/dcroxide-fees",
     "crates/dcroxide-gcs",
     "crates/dcroxide-mempool",
+    "crates/dcroxide-mining",
     "crates/dcroxide-stake",
     "crates/dcroxide-standalone",
     "crates/dcroxide-testutil",
