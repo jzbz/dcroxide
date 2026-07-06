@@ -113,6 +113,14 @@ pub struct Chain {
     pub min_known_work: Option<Uint256>,
     /// The backing database when the chain is persistent.
     pub db: Option<dcroxide_database::Database>,
+    /// The treasury state rows by block hash: the in-memory mirror of
+    /// dcrd's treasury bucket.
+    pub treasury_state: BTreeMap<[u8; 32], crate::treasurydb::TreasuryState>,
+    /// The blocks each treasury spend was mined in: the in-memory
+    /// mirror of dcrd's tspend bucket.
+    pub tspend_blocks: BTreeMap<[u8; 32], Vec<Hash>>,
+    /// The floor for treasury expenditure limits per DCP0013.
+    pub treasury_spend_limit_floor: i64,
 }
 
 /// Information about the current best chain block and related state
@@ -233,6 +241,10 @@ impl Chain {
             is_current_latch: false,
             min_known_work: params.min_known_chain_work,
             db: None,
+            treasury_state: BTreeMap::new(),
+            tspend_blocks: BTreeMap::new(),
+            treasury_spend_limit_floor: (params.base_subsidy / 10)
+                * (params.treasury_vote_interval * params.treasury_vote_interval_multiplier) as i64,
         }
     }
 
@@ -568,6 +580,40 @@ impl Chain {
                             crate::chaindb::ChainDbError::Corrupt(format!("tickets: {e:?}"))
                         })?;
                     self.stake_new_tickets.insert(height, ths);
+                }
+            }
+        }
+
+        // The treasury account and spend rows.
+        if let Some(bucket) = meta.bucket(crate::chaindb::TREASURY_BUCKET_NAME) {
+            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            bucket.for_each(|k, v| {
+                rows.push((k.to_vec(), v.to_vec()));
+                Ok(())
+            })?;
+            for (k, v) in rows {
+                if k.len() == 32 {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&k);
+                    let ts = crate::treasurydb::deserialize_treasury_state(&v)
+                        .map_err(crate::chaindb::ChainDbError::Corrupt)?;
+                    self.treasury_state.insert(hash, ts);
+                }
+            }
+        }
+        if let Some(bucket) = meta.bucket(crate::chaindb::TREASURY_TSPEND_BUCKET_NAME) {
+            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            bucket.for_each(|k, v| {
+                rows.push((k.to_vec(), v.to_vec()));
+                Ok(())
+            })?;
+            for (k, v) in rows {
+                if k.len() == 32 {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&k);
+                    let blocks = crate::treasurydb::deserialize_tspend(&v)
+                        .map_err(crate::chaindb::ChainDbError::Corrupt)?;
+                    self.tspend_blocks.insert(hash, blocks);
                 }
             }
         }
@@ -1400,6 +1446,20 @@ impl Chain {
                 Ok(())
             })
             .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
+        }
+
+        // The treasury account and spend records when the agenda is
+        // active.
+        let is_treasury_enabled = {
+            let parent_view = NodeBranchView {
+                store: &self.store,
+                tip: parent_id,
+            };
+            crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)
+                .map_err(|_| unknown_deployment_error())?
+        };
+        if is_treasury_enabled {
+            self.put_treasury_records(node, block, params)?;
         }
 
         // Commit all entries in the view to the UTXO set.
@@ -2598,6 +2658,475 @@ impl Chain {
             h += 1;
         }
         out
+    }
+
+    /// The treasury balance as of the block after the given node:
+    /// the node's stored balance plus the maturing values from the
+    /// coinbase-maturity ancestor (dcrd `calculateTreasuryBalance`).
+    pub fn calculate_treasury_balance(&self, prev_node: NodeId, params: &Params) -> i64 {
+        let relative_maturity = i64::from(params.coinbase_maturity) - 1;
+        let Some(want_node) = self.store.relative_ancestor(prev_node, relative_maturity) else {
+            return 0;
+        };
+        let Some(ts) = self.treasury_state.get(&self.store.node(prev_node).hash.0) else {
+            return 0;
+        };
+        let Some(wts) = self.treasury_state.get(&self.store.node(want_node).hash.0) else {
+            return 0;
+        };
+        let mut net_value = 0i64;
+        for v in &wts.values {
+            net_value += v.amount;
+        }
+        ts.balance + net_value
+    }
+
+    /// Record the treasury state and spend rows for a connected block
+    /// (dcrd's method forms of `dbPutTreasuryBalance` and
+    /// `dbPutTSpend`), writing through to the database when
+    /// persistent.
+    pub fn put_treasury_records(
+        &mut self,
+        node: NodeId,
+        block: &MsgBlock,
+        params: &Params,
+    ) -> Result<(), RuleError> {
+        let parent = self.store.node(node).parent.expect("connected parent");
+        let balance = self.calculate_treasury_balance(parent, params);
+        let ts = crate::treasurydb::treasury_state_for_block(block, balance);
+        let block_hash = self.store.node(node).hash;
+        self.treasury_state.insert(block_hash.0, ts.clone());
+
+        let mut tspend_updates: Vec<(Hash, Vec<Hash>)> = Vec::new();
+        for stx in &block.stransactions {
+            if !dcroxide_stake::is_tspend(stx) {
+                continue;
+            }
+            let tx_hash = stx.tx_hash();
+            let blocks = self.tspend_blocks.entry(tx_hash.0).or_default();
+            blocks.push(block_hash);
+            tspend_updates.push((tx_hash, blocks.clone()));
+        }
+
+        if let Some(db) = &self.db {
+            db.update(|tx| {
+                crate::treasurydb::db_put_treasury_balance(tx, &block_hash, &ts)
+                    .map_err(chain_db_to_db_error)?;
+                for (tx_hash, blocks) in &tspend_updates {
+                    crate::treasurydb::db_put_tspend(tx, tx_hash, blocks)
+                        .map_err(chain_db_to_db_error)?;
+                }
+                Ok(())
+            })
+            .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
+        }
+        Ok(())
+    }
+
+    /// The blocks a treasury spend was mined in (dcrd `FetchTSpend`).
+    pub fn fetch_tspend(&self, tspend: &Hash) -> Vec<Hash> {
+        self.tspend_blocks
+            .get(&tspend.0)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Verify the treasury spend has not been mined in a block on the
+    /// chain of the previous node (dcrd `checkTSpendExists`).
+    pub fn check_tspend_exists(&self, prev_node: NodeId, tspend: &Hash) -> Result<(), String> {
+        let Some(blocks) = self.tspend_blocks.get(&tspend.0) else {
+            return Ok(());
+        };
+        for block_hash in blocks {
+            let Some(node) = self.index.lookup_node(block_hash) else {
+                continue;
+            };
+            if !self.store.is_ancestor_of(node, prev_node) {
+                continue;
+            }
+            return Err(format!(
+                "treasury spend has already been mined on this chain {tspend}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Tally the treasury votes for a treasury spend up to the given
+    /// node (dcrd `tSpendCountVotes`).  Returns the window start and
+    /// end alongside the yes and no counts.
+    pub fn tspend_count_votes(
+        &self,
+        prev_node: NodeId,
+        tspend: &MsgTx,
+        params: &Params,
+    ) -> Result<(u32, u32, u32, u32), String> {
+        let expiry = tspend.expiry;
+        let (start, end) = dcroxide_standalone::calc_tspend_window(
+            expiry,
+            params.treasury_vote_interval,
+            params.treasury_vote_interval_multiplier,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+
+        let next_height = self.store.node(prev_node).height + 1;
+        if !dcroxide_standalone::inside_tspend_window(
+            next_height,
+            expiry,
+            params.treasury_vote_interval,
+            params.treasury_vote_interval_multiplier,
+        ) {
+            return Err(format!(
+                "tspend outside of window: nextHeight {next_height} start {start} expiry {expiry}"
+            ));
+        }
+
+        let tspend_hash = tspend.tx_hash();
+        let mut yes = 0u32;
+        let mut no = 0u32;
+        let mut node = Some(prev_node);
+        while let Some(id) = node {
+            if self.store.node(id).height < i64::from(start) {
+                break;
+            }
+            let block = self.block_by_node(id);
+            for stx in &block.stransactions {
+                let Ok(votes) = dcroxide_stake::check_ssgen_votes(stx) else {
+                    // Not a vote.
+                    continue;
+                };
+                for vote in &votes {
+                    if vote.hash != tspend_hash {
+                        continue;
+                    }
+                    match vote.vote {
+                        dcroxide_stake::TREASURY_VOTE_YES => yes += 1,
+                        dcroxide_stake::TREASURY_VOTE_NO => no += 1,
+                        _ => {}
+                    }
+                }
+            }
+            node = self.store.node(id).parent;
+        }
+        Ok((start, end, yes, no))
+    }
+
+    /// Verify the treasury spend has enough votes to be included in a
+    /// block after the given node (dcrd `checkTSpendHasVotes`).
+    pub fn check_tspend_has_votes(
+        &self,
+        prev_node: NodeId,
+        tspend: &MsgTx,
+        params: &Params,
+    ) -> Result<(), String> {
+        let (start, end, yes, no) = self.tspend_count_votes(prev_node, tspend, params)?;
+
+        // Passing criteria are the quorum and required percentages.
+        let max_votes = u64::from(params.tickets_per_block) * u64::from(end - start);
+        let quorum = max_votes * params.treasury_vote_quorum_multiplier
+            / params.treasury_vote_quorum_divisor;
+        let num_votes_cast = u64::from(yes + no);
+        if num_votes_cast < quorum {
+            return Err(format!(
+                "quorum not met: yes {yes} no {no}  quorum {quorum} max {max_votes}"
+            ));
+        }
+
+        // Treat the maximum remaining votes as possible no votes,
+        // enabling early passage only when yes cannot drop below the
+        // threshold.
+        let cur_block_height = (self.store.node(prev_node).height + 1) as u32;
+        let remaining_blocks = end - cur_block_height;
+        let max_remaining_votes = u64::from(remaining_blocks) * u64::from(params.tickets_per_block);
+        let required_votes = (num_votes_cast + max_remaining_votes)
+            * params.treasury_vote_required_multiplier
+            / params.treasury_vote_required_divisor;
+        if u64::from(yes) < required_votes {
+            return Err(format!(
+                "not enough yes votes: yes {yes} no {no} quorum {quorum} max {max_votes} \
+                 required {required_votes} maxRemainingVotes {max_remaining_votes}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Sum the debits and credits over the given number of blocks
+    /// ending at the node (dcrd `sumPastTreasuryChanges`).  Returns
+    /// the spent and added totals along with the node before the
+    /// window.
+    fn sum_past_treasury_changes(
+        &self,
+        pre_tvi_node: NodeId,
+        nb_blocks: u64,
+    ) -> (i64, i64, Option<NodeId>) {
+        let mut node = Some(pre_tvi_node);
+        let mut spent = 0i64;
+        let mut added = 0i64;
+        let mut i = 0u64;
+        while let Some(id) = node {
+            if i >= nb_blocks {
+                break;
+            }
+            let Some(ts) = self.treasury_state.get(&self.store.node(id).hash.0) else {
+                // The end of available treasury records.
+                node = None;
+                break;
+            };
+            for v in &ts.values {
+                if v.typ.is_debit() {
+                    spent += -v.amount;
+                } else {
+                    added += v.amount;
+                }
+            }
+            node = self.store.node(id).parent;
+            i += 1;
+        }
+        (spent, added, node)
+    }
+
+    /// The maximum treasury expenditure per the original DCP0006
+    /// policy (dcrd `maxTreasuryExpenditureDCP0006`).
+    fn max_treasury_expenditure_dcp0006(&self, pre_tvi_node: NodeId, params: &Params) -> i64 {
+        let policy_window = params.treasury_vote_interval
+            * params.treasury_vote_interval_multiplier
+            * params.treasury_expenditure_window;
+
+        let (spent_recent_window, _, mut node) =
+            self.sum_past_treasury_changes(pre_tvi_node, policy_window);
+
+        let mut spent_prior_windows = 0i64;
+        let mut nb_non_empty_windows = 0i64;
+        let mut i = 0u64;
+        while i < params.treasury_expenditure_policy {
+            let Some(id) = node else {
+                break;
+            };
+            let (spent, _, next) = self.sum_past_treasury_changes(id, policy_window);
+            if spent > 0 {
+                spent_prior_windows += spent;
+                nb_non_empty_windows += 1;
+            }
+            node = next;
+            i += 1;
+        }
+
+        let avg_spent_prior_windows = if nb_non_empty_windows > 0 {
+            spent_prior_windows / nb_non_empty_windows
+        } else {
+            params.treasury_expenditure_bootstrap as i64
+        };
+        let avg_plus_allowance = avg_spent_prior_windows + avg_spent_prior_windows / 2;
+        if avg_plus_allowance > spent_recent_window {
+            avg_plus_allowance - spent_recent_window
+        } else {
+            0
+        }
+    }
+
+    /// The maximum treasury expenditure per the DCP0007 reverted
+    /// policy (dcrd `maxTreasuryExpenditureDCP0007`).
+    fn max_treasury_expenditure_dcp0007(&self, pre_tvi_node: NodeId, params: &Params) -> i64 {
+        let policy_window = params.treasury_vote_interval
+            * params.treasury_vote_interval_multiplier
+            * params.treasury_expenditure_window;
+        let (spent_recent, added_recent, _) =
+            self.sum_past_treasury_changes(pre_tvi_node, policy_window);
+        let added_plus_allowance = added_recent + added_recent / 2;
+        if added_plus_allowance > spent_recent {
+            added_plus_allowance - spent_recent
+        } else {
+            0
+        }
+    }
+
+    /// The maximum treasury expenditure per the DCP0013 policy (dcrd
+    /// `maxTreasuryExpenditureDCP0013`).
+    fn max_treasury_expenditure_dcp0013(&self, pre_tvi_node: NodeId, params: &Params) -> i64 {
+        let policy_window = params.treasury_vote_interval
+            * params.treasury_vote_interval_multiplier
+            * params.treasury_expenditure_window;
+        let (spent_recent, _, _) = self.sum_past_treasury_changes(pre_tvi_node, policy_window);
+        let treasury_balance = self.calculate_treasury_balance(pre_tvi_node, params);
+
+        let mut max_spendable = (treasury_balance + spent_recent) * 4 / 100;
+        if max_spendable < self.treasury_spend_limit_floor {
+            max_spendable = self.treasury_spend_limit_floor;
+        }
+        let mut allowed_to_spend = 0i64;
+        if max_spendable > spent_recent {
+            allowed_to_spend = max_spendable - spent_recent;
+        }
+        if allowed_to_spend > treasury_balance {
+            allowed_to_spend = treasury_balance;
+        }
+        allowed_to_spend
+    }
+
+    /// The maximum treasury expenditure at the block after the node,
+    /// selected by the active policy agenda (dcrd
+    /// `maxTreasuryExpenditure`).
+    pub fn max_treasury_expenditure(
+        &self,
+        pre_tvi_node: NodeId,
+        params: &Params,
+    ) -> Result<i64, RuleError> {
+        let prev_height = Some(self.store.node(pre_tvi_node).height);
+        let view = NodeBranchView {
+            store: &self.store,
+            tip: pre_tvi_node,
+        };
+        let dcp0013_active = crate::agendas::is_agenda_active(
+            &view,
+            prev_height,
+            dcroxide_chaincfg::VOTE_ID_MAX_TREASURY_SPEND,
+            params,
+        )
+        .map_err(|_| unknown_deployment_error())?;
+        if dcp0013_active {
+            return Ok(self.max_treasury_expenditure_dcp0013(pre_tvi_node, params));
+        }
+        let revert_active = crate::agendas::is_agenda_active(
+            &view,
+            prev_height,
+            crate::agendas::VOTE_ID_REVERT_TREASURY_POLICY,
+            params,
+        )
+        .map_err(|_| unknown_deployment_error())?;
+        if revert_active {
+            return Ok(self.max_treasury_expenditure_dcp0007(pre_tvi_node, params));
+        }
+        Ok(self.max_treasury_expenditure_dcp0006(pre_tvi_node, params))
+    }
+
+    /// Verify the total treasury spend amount is within the allowed
+    /// expenditure for a block extending the node (dcrd
+    /// `checkTSpendsExpenditure`).
+    pub fn check_tspends_expenditure(
+        &self,
+        pre_tvi_node: NodeId,
+        total_tspend_amount: i64,
+        params: &Params,
+    ) -> Result<(), String> {
+        if total_tspend_amount == 0 {
+            return Ok(());
+        }
+        if total_tspend_amount < 0 {
+            return Err(format!(
+                "invalid precondition: totalTSpendAmount must not be negative (got \
+                 {total_tspend_amount})"
+            ));
+        }
+        let treasury_balance = self.calculate_treasury_balance(pre_tvi_node, params);
+        if treasury_balance - total_tspend_amount < 0 {
+            return Err(format!(
+                "treasury balance may not become negative: balance {treasury_balance} spend \
+                 {total_tspend_amount}"
+            ));
+        }
+        let allowed_to_spend = self
+            .max_treasury_expenditure(pre_tvi_node, params)
+            .map_err(|e| format!("{e:?}"))?;
+        if total_tspend_amount > allowed_to_spend {
+            return Err(format!(
+                "treasury spend greater than allowed {total_tspend_amount} > {allowed_to_spend}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The complete treasury spend checks for a block on a treasury
+    /// vote interval, incl. the duplicate-mine, vote tally, and
+    /// expenditure rules the stateless subset defers (dcrd
+    /// `tspendChecks`).
+    pub fn tspend_checks(
+        &self,
+        prev_node: NodeId,
+        block: &MsgBlock,
+        params: &Params,
+    ) -> Result<(), RuleError> {
+        let block_height = self.store.node(prev_node).height + 1;
+        let tvi = params.treasury_vote_interval;
+        if !dcroxide_standalone::is_treasury_vote_interval(block_height as u64, tvi) {
+            return Ok(());
+        }
+
+        let mut total_tspend_amount = 0i64;
+        for stx in &block.stransactions {
+            if !dcroxide_stake::is_tspend(stx) {
+                continue;
+            }
+
+            // The expiry window.
+            let exp = stx.expiry;
+            if !dcroxide_standalone::inside_tspend_window(
+                block_height,
+                exp,
+                tvi,
+                params.treasury_vote_interval_multiplier,
+            ) {
+                return Err(rule_error(
+                    RuleErrorKind::InvalidTSpendWindow,
+                    format!(
+                        "block at height {block_height} contains treasury spend transaction \
+                         {} with expiry {exp} that is outside of the valid window",
+                        stx.tx_hash()
+                    ),
+                ));
+            }
+
+            // The value-in commitment in the OP_RETURN.
+            let value_in = stx.tx_in[0].value_in;
+            total_tspend_amount += value_in;
+            let mut le = [0u8; 8];
+            le.copy_from_slice(&stx.tx_out[0].pk_script[2..10]);
+            let value_in_op_ret = i64::from_le_bytes(le);
+            if value_in != value_in_op_ret {
+                return Err(rule_error(
+                    RuleErrorKind::InvalidTSpendValueIn,
+                    format!(
+                        "block contains TSpend transaction ({}) that did not encode ValueIn \
+                         correctly got {value_in_op_ret} wanted {value_in}",
+                        stx.tx_hash()
+                    ),
+                ));
+            }
+
+            // The duplicate-mine check.
+            if let Err(err) = self.check_tspend_exists(prev_node, &stx.tx_hash()) {
+                return Err(rule_error(
+                    RuleErrorKind::TSpendExists,
+                    format!(
+                        "block contains a TSpend transaction ({}) that has been mined in \
+                         another block: {err}",
+                        stx.tx_hash()
+                    ),
+                ));
+            }
+
+            // The vote tally.
+            if let Err(err) = self.check_tspend_has_votes(prev_node, stx, params) {
+                return Err(rule_error(
+                    RuleErrorKind::NotEnoughTSpendVotes,
+                    format!(
+                        "block contains a TSpend transaction ({}) that does not have enough \
+                         votes: {err}",
+                        stx.tx_hash()
+                    ),
+                ));
+            }
+        }
+
+        // The aggregate expenditure bound.
+        if total_tspend_amount > 0 {
+            if let Err(err) = self.check_tspends_expenditure(prev_node, total_tspend_amount, params)
+            {
+                return Err(rule_error(
+                    RuleErrorKind::InvalidExpenditure,
+                    format!("block contains a TSpend that has an invalid expenditure: {err}"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Whether the node's timestamp is more than 24 hours old

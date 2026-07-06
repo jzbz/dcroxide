@@ -32,6 +32,7 @@ mod ruleerror;
 pub mod sequencelock;
 pub mod stakever;
 pub mod thresholdstate;
+pub mod treasurydb;
 mod utxoentry;
 mod utxoio;
 pub mod utxoview;
