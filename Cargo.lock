@@ -430,9 +430,16 @@ dependencies = [
 name = "dcroxide-rpc"
 version = "0.1.0"
 dependencies = [
+ "dcroxide-chaincfg",
+ "dcroxide-chainhash",
  "dcroxide-dcrjson",
  "dcroxide-rpctypes",
+ "dcroxide-stake",
+ "dcroxide-standalone",
  "dcroxide-testutil",
+ "dcroxide-txscript",
+ "dcroxide-wire",
+ "num-bigint",
 ]
 
 [[package]]

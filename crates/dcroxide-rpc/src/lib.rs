@@ -12,6 +12,9 @@
 
 pub mod help;
 pub mod helpdescs;
+pub mod helpers;
+pub mod rpcerrors;
+pub mod txresults;
 
 pub use help::{HelpCacher, RPC_HANDLER_METHODS, WS_HANDLER_METHODS, rpc_result_types};
 pub use helpdescs::HELP_DESCS_EN_US;

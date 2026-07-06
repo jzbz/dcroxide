@@ -9,8 +9,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-dcrjson = { path = "../dcroxide-dcrjson" }
 dcroxide-rpctypes = { path = "../dcroxide-rpctypes" }
+dcroxide-stake = { path = "../dcroxide-stake" }
+dcroxide-standalone = { path = "../dcroxide-standalone" }
+dcroxide-txscript = { path = "../dcroxide-txscript" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+num-bigint = { version = "0.4", default-features = false }
 
 [dev-dependencies]
 dcroxide-testutil = { path = "../dcroxide-testutil" }
