@@ -1,0 +1,24 @@
+[package]
+name = "dcroxide-indexers"
+description = "Optional block chain indexes mirroring dcrd's internal/blockchain/indexers: the transaction index and the exists address index"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-database = { path = "../dcroxide-database" }
+dcroxide-stake = { path = "../dcroxide-stake" }
+dcroxide-txscript = { path = "../dcroxide-txscript" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+tempfile = "3"
+
+[lints]
+workspace = true

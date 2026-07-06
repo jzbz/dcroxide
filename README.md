@@ -115,6 +115,13 @@ Currently implemented:
   DCP0005 version 2 block committed filters for light clients, matched
   differentially against dcrd over random filters and structured blocks
   with real stake transactions
+- `dcroxide-indexers` — the optional block chain indexes from dcrd's
+  `internal/blockchain/indexers`: the transaction index with its
+  block-ID compaction, the exists address index with the unconfirmed
+  overlay, and the subscriber machinery with dependent relay,
+  catch-up, recovery, and incremental drops, replayed against a real
+  redb-backed database from a session scripted inside dcrd's own
+  package
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
 

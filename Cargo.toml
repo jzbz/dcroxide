@@ -10,6 +10,7 @@ members = [
     "crates/dcroxide-dcrec",
     "crates/dcroxide-fees",
     "crates/dcroxide-gcs",
+    "crates/dcroxide-indexers",
     "crates/dcroxide-mempool",
     "crates/dcroxide-mining",
     "crates/dcroxide-stake",

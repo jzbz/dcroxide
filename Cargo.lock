@@ -287,6 +287,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-indexers"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-chaincfg",
+ "dcroxide-chainhash",
+ "dcroxide-database",
+ "dcroxide-stake",
+ "dcroxide-testutil",
+ "dcroxide-txscript",
+ "dcroxide-wire",
+ "tempfile",
+]
+
+[[package]]
 name = "dcroxide-mempool"
 version = "0.1.0"
 dependencies = [
