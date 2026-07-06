@@ -3,9 +3,9 @@
 //! `msgmixpairreq.go` … `msgmixsecrets.go`, `mixvect.go`), all gated at
 //! [`MIX_VERSION`].
 //!
-//! Only the wire codecs live here; the mixpool identity hashes and
-//! signed-data digests (`WriteHash`/`WriteSignedData`) land with the
-//! mixing crate in Phase 12 (tracked in PARITY.md).
+//! Besides the wire codecs, the mixpool identity hashes and
+//! signed-data preimages (dcrd `WriteHash`/`WriteSignedData`) live
+//! here as `mix_hash`/`signed_data` on each message.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -850,3 +850,49 @@ impl MsgMixSecrets {
         if pver < MIX_VERSION { 0 } else { 70_831 }
     }
 }
+
+/// Generate the mixing identity hash and signed-data preimage methods
+/// (dcrd `WriteHash`/`Hash` and `WriteSignedData`) for a mix message.
+///
+/// The identity hash is the BLAKE-256 digest of the full message
+/// serialization at [`MIX_VERSION`], and the signed data is the
+/// command string with "-sig" appended as a var string followed by
+/// the serialization without the leading signature.  dcrd feeds a
+/// hasher and silently drops encoding errors, hashing whatever
+/// partial preimage was written; such messages cannot arrive through
+/// decoding, and this port surfaces the error instead.
+macro_rules! mix_message_hashes {
+    ($msg:ty, $cmd:expr) => {
+        impl $msg {
+            /// The mixing message identity hash (dcrd
+            /// `WriteHash`/`Hash`).
+            pub fn mix_hash(&self) -> Result<Hash, WireError> {
+                let mut buf = Vec::new();
+                self.encode(&mut buf, MIX_VERSION)?;
+                Ok(Hash(dcroxide_crypto::blake256::sum256(&buf)))
+            }
+
+            /// The preimage of the data committed to by the message
+            /// signature (dcrd `WriteSignedData`).
+            pub fn signed_data(&self) -> Result<Vec<u8>, WireError> {
+                let mut msg_buf = Vec::new();
+                self.encode(&mut msg_buf, MIX_VERSION)?;
+                let cmd = concat!($cmd, "-sig");
+                let mut buf = Vec::with_capacity(1 + cmd.len() + msg_buf.len() - 64);
+                write_var_int(&mut buf, cmd.len() as u64);
+                buf.extend_from_slice(cmd.as_bytes());
+                buf.extend_from_slice(&msg_buf[64..]);
+                Ok(buf)
+            }
+        }
+    };
+}
+
+mix_message_hashes!(MsgMixPairReq, "mixpairreq");
+mix_message_hashes!(MsgMixKeyExchange, "mixkeyxchg");
+mix_message_hashes!(MsgMixCiphertexts, "mixcphrtxt");
+mix_message_hashes!(MsgMixSlotReserve, "mixslotres");
+mix_message_hashes!(MsgMixFactoredPoly, "mixfactpoly");
+mix_message_hashes!(MsgMixDCNet, "mixdcnet");
+mix_message_hashes!(MsgMixConfirm, "mixconfirm");
+mix_message_hashes!(MsgMixSecrets, "mixsecrets");

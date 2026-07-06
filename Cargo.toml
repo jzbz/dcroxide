@@ -14,6 +14,7 @@ members = [
     "crates/dcroxide-indexers",
     "crates/dcroxide-mempool",
     "crates/dcroxide-mining",
+    "crates/dcroxide-mixing",
     "crates/dcroxide-stake",
     "crates/dcroxide-standalone",
     "crates/dcroxide-testutil",

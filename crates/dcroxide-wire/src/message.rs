@@ -226,6 +226,22 @@ fn max_payload_for_command(command: &str, pver: u32) -> Option<u32> {
     })
 }
 
+/// Decode a standalone payload for a known command at the given
+/// protocol version, requiring the payload to be fully consumed; for
+/// callers holding unframed message bytes such as the mixing tests.
+pub fn decode_message_payload(
+    command: &str,
+    payload: &[u8],
+    pver: u32,
+) -> Result<Message, WireError> {
+    let mut r = Cursor::new(payload);
+    let msg = decode_payload(command, &mut r, pver).ok_or(WireError::InvalidMsg)??;
+    if r.remaining() != 0 {
+        return Err(WireError::InvalidMsg);
+    }
+    Ok(msg)
+}
+
 /// Decode a payload for a known command (mirrors `makeEmptyMessage` +
 /// `BtcDecode` dispatch), or `None` for unknown commands.
 fn decode_payload(

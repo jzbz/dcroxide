@@ -1,0 +1,23 @@
+[package]
+name = "dcroxide-mixing"
+description = "StakeShuffle mixing primitives mirroring dcrd's mixing package: message identities and signatures, session IDs, the DC-net math, the run PRNG, and UTXO ownership proofs"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chacha20 = { version = "0.9", default-features = false }
+dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-crypto = { path = "../dcroxide-crypto" }
+dcroxide-dcrec = { path = "../dcroxide-dcrec" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+
+[dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
+
+[lints]
+workspace = true
