@@ -96,8 +96,9 @@ Currently implemented:
   (minimum relay fees, dust outputs, and the transaction, output
   script, and input standardness checks), and the `TxPool` itself with
   the full acceptance gauntlet, orphan processing, ticket staging,
-  batch acceptance, and pruning — pinned by dcrd's own policy verdicts
-  and a scripted pool session generated with dcrd's own test harness
+  batch acceptance, pruning, and the vote, revocation, and treasury
+  spend acceptance paths — pinned by dcrd's own policy verdicts and
+  scripted pool sessions generated with dcrd's own test harness
 - `dcroxide-gcs` — Golomb-coded set filters (versions 1 and 2) and the
   DCP0005 version 2 block committed filters for light clients, matched
   differentially against dcrd over random filters and structured blocks
