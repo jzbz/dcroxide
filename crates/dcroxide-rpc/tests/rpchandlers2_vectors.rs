@@ -427,6 +427,7 @@ fn chain_query_handler_slice_matches_dcrd() {
                 prev_hash: mock[18].parse().unwrap(),
                 height: mock[19].parse().unwrap(),
                 bits: mock[20].parse().unwrap(),
+                next_stake_diff: 0,
                 total_subsidy: mock[21].parse().unwrap(),
             },
             best_header: (mock[12].parse().unwrap(), mock[13].parse().unwrap()),

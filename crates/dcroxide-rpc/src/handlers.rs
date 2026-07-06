@@ -1309,3 +1309,486 @@ fn opt_bool(v: &GoValue) -> Option<bool> {
 fn hex_str(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// A compacted set of bit flags from a slice of bools (Go
+/// `bitset.NewBytes` + `Set`, LSB first within each byte).
+fn bitset_bytes(flags: &[bool]) -> Vec<u8> {
+    let mut set = vec![0u8; (flags.len() + 7) >> 3];
+    for (i, flag) in flags.iter().enumerate() {
+        if *flag {
+            set[i >> 3] |= 1 << (i & 7);
+        }
+    }
+    set
+}
+
+/// handleestimatestakediff (dcrd `handleEstimateStakeDiff`); the
+/// result is an `EstimateStakeDiffResult` value.
+pub fn handle_estimate_stake_diff<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let tickets = opt_uint(&c[0]);
+
+    // Minimum and maximum possible stake difficulty.
+    let best = server.cfg.chain.best_snapshot();
+    let min = server
+        .cfg
+        .chain
+        .estimate_next_stake_difficulty(&best.hash, 0, false)
+        .map_err(|e| rpc_internal_err(&e))?;
+    let max = server
+        .cfg
+        .chain
+        .estimate_next_stake_difficulty(&best.hash, 0, true)
+        .map_err(|e| rpc_internal_err(&e))?;
+
+    // The expected stake difficulty.  Average the number of fresh
+    // stake since the last retarget to get the number of tickets per
+    // block, then use that to estimate the next stake difficulty.
+    let params = server.cfg.chain_params.clone();
+    let best_height = best.height;
+    let last_adjustment =
+        (best_height / params.stake_diff_window_size) * params.stake_diff_window_size;
+    let next_adjustment =
+        ((best_height / params.stake_diff_window_size) + 1) * params.stake_diff_window_size;
+    let mut total_tickets: i64 = 0;
+    for i in last_adjustment..=best_height {
+        let bh = server
+            .cfg
+            .chain
+            .header_by_height(i)
+            .map_err(|e| rpc_internal_err(&e))?;
+        total_tickets += i64::from(bh.fresh_stake);
+    }
+    let blocks_since = (best_height - last_adjustment + 1) as f64;
+    let remaining = (next_adjustment - best_height - 1) as f64;
+    let average_per_block = total_tickets as f64 / blocks_since;
+    let expected_tickets = (average_per_block * remaining).floor() as i64;
+    let expected = server
+        .cfg
+        .chain
+        .estimate_next_stake_difficulty(&best.hash, expected_tickets, false)
+        .map_err(|e| rpc_internal_err(&e))?;
+
+    // User-specified stake difficulty, if they asked for one.
+    let mut user = GoValue::Null;
+    if let Some(tickets) = tickets {
+        let user_est = server
+            .cfg
+            .chain
+            .estimate_next_stake_difficulty(&best.hash, tickets as i64, false)
+            .map_err(|e| rpc_internal_err(&e))?;
+        user = GoValue::Float64(txresults::to_coin(user_est));
+    }
+
+    Ok(GoValue::Struct(vec![
+        GoValue::Float64(txresults::to_coin(min)),
+        GoValue::Float64(txresults::to_coin(max)),
+        GoValue::Float64(txresults::to_coin(expected)),
+        user,
+    ]))
+}
+
+/// handleexistsliveticket (dcrd `handleExistsLiveTicket`).
+pub fn handle_exists_live_ticket<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let tx_hash_str = s(&c[0]);
+    let hash: Hash = tx_hash_str
+        .parse()
+        .map_err(|_| rpc_decode_hex_error(tx_hash_str))?;
+    Ok(GoValue::Bool(server.cfg.chain.check_live_ticket(&hash)))
+}
+
+/// handleexistslivetickets (dcrd `handleExistsLiveTickets`): the
+/// existence bits as a compacted hex string.
+pub fn handle_exists_live_tickets<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let hash_strs: Vec<String> = array(&c[0]).iter().map(|v| s(v).to_string()).collect();
+    let hashes = crate::helpers::decode_hashes(&hash_strs)?;
+
+    let exists = server.cfg.chain.check_live_tickets(&hashes);
+    if exists.len() != hashes.len() {
+        return Err(rpc_invalid_error(&format!(
+            "Invalid live ticket count got {}, want {}",
+            exists.len(),
+            hashes.len()
+        )));
+    }
+
+    Ok(GoValue::String(hex_str(&bitset_bytes(&exists))))
+}
+
+/// handlegetstakedifficulty (dcrd `handleGetStakeDifficulty`); the
+/// result is a `GetStakeDifficultyResult` value.
+pub fn handle_get_stake_difficulty<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let best = server.cfg.chain.best_snapshot();
+    let header = server
+        .cfg
+        .chain
+        .header_by_height(best.height)
+        .map_err(|e| {
+            RPCError::new(
+                codes::DIFFICULTY,
+                &format!("Error getting stake difficulty: {e}"),
+            )
+        })?;
+    Ok(GoValue::Struct(vec![
+        GoValue::Float64(txresults::to_coin(header.sbits)),
+        GoValue::Float64(txresults::to_coin(best.next_stake_diff)),
+    ]))
+}
+
+/// The stake version version:count maps as sorted `VersionCount`
+/// values (dcrd `convertVersionMap` over the handler's maps).
+fn version_counts(m: &std::collections::HashMap<i64, i64>) -> GoValue {
+    GoValue::Array(
+        crate::helpers::convert_version_map(m)
+            .into_iter()
+            .map(|(v, c)| {
+                GoValue::Struct(vec![
+                    GoValue::Uint(u64::from(v)),
+                    GoValue::Uint(u64::from(c)),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// handlegetstakeversioninfo (dcrd `handleGetStakeVersionInfo`); the
+/// result is a `GetStakeVersionInfoResult` value.
+pub fn handle_get_stake_version_info<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let count_arg = opt_int(&c[0]);
+
+    let snapshot = server.cfg.chain.best_snapshot();
+    let interval = server.cfg.chain_params.stake_version_interval;
+
+    let mut count: i32 = 1;
+    if let Some(requested) = count_arg {
+        count = requested as i32;
+        if count <= 0 {
+            return Err(rpc_invalid_error("Count must be > 0"));
+        }
+
+        // Limit the count to the total possible available intervals.
+        let total_intervals = (snapshot.height + interval - 1) / interval;
+        if i64::from(count) > total_intervals {
+            count = total_intervals as i32;
+        }
+    }
+
+    // Assemble the result.
+    let mut intervals = Vec::with_capacity(count as usize);
+    let mut start_height = snapshot.height;
+    let mut end_height = server.cfg.chain.calc_want_height(interval, snapshot.height) + 1;
+    let mut hash = snapshot.hash;
+    let mut adjust: i32 = 1; // Off by one on the initial iteration.
+    for _ in 0..count {
+        let num_blocks = (start_height - end_height) as i32;
+        if num_blocks <= 0 {
+            // Just return what we got.
+            break;
+        }
+        let sv = server
+            .cfg
+            .chain
+            .get_stake_versions(&hash, num_blocks + adjust)
+            .map_err(|e| rpc_internal_err(&e))?;
+
+        let mut pos_versions = std::collections::HashMap::new();
+        let mut vote_versions = std::collections::HashMap::new();
+        for v in &sv {
+            *pos_versions.entry(i64::from(v.stake_version)).or_insert(0) += 1;
+            for vote in &v.votes {
+                *vote_versions.entry(i64::from(vote.0)).or_insert(0) += 1;
+            }
+        }
+        intervals.push(GoValue::Struct(vec![
+            GoValue::Int(end_height),
+            GoValue::Int(start_height),
+            version_counts(&pos_versions),
+            version_counts(&vote_versions),
+        ]));
+
+        // Adjust interval.
+        end_height -= interval;
+        start_height = end_height + interval;
+        adjust = 0;
+
+        // Get prior block hash.
+        hash = server
+            .cfg
+            .chain
+            .block_hash_by_height(start_height - 1)
+            .map_err(|e| rpc_internal_err(&e))?;
+    }
+
+    Ok(GoValue::Struct(vec![
+        GoValue::Int(snapshot.height),
+        GoValue::String(snapshot.hash.to_string()),
+        GoValue::Array(intervals),
+    ]))
+}
+
+/// handlegetstakeversions (dcrd `handleGetStakeVersions`); the result
+/// is a `GetStakeVersionsResult` value.
+pub fn handle_get_stake_versions<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let hash_str = s(&c[0]);
+    let count = int(&c[1]);
+
+    let hash: Hash = hash_str
+        .parse()
+        .map_err(|_| rpc_decode_hex_error(hash_str))?;
+    if count <= 0 {
+        return Err(rpc_invalid_error("Invalid parameter, count must be > 0"));
+    }
+
+    let sv = server
+        .cfg
+        .chain
+        .get_stake_versions(&hash, count as i32)
+        .map_err(|e| rpc_internal_err(&e))?;
+
+    let stake_versions: Vec<GoValue> = sv
+        .iter()
+        .map(|v| {
+            GoValue::Struct(vec![
+                GoValue::String(v.hash.to_string()),
+                GoValue::Int(v.height),
+                GoValue::Int(i64::from(v.block_version)),
+                GoValue::Uint(u64::from(v.stake_version)),
+                GoValue::Array(
+                    v.votes
+                        .iter()
+                        .map(|&(version, bits)| {
+                            GoValue::Struct(vec![
+                                GoValue::Uint(u64::from(version)),
+                                GoValue::Uint(u64::from(bits)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ])
+        })
+        .collect();
+
+    Ok(GoValue::Struct(vec![GoValue::Array(stake_versions)]))
+}
+
+/// handlegetvoteinfo (dcrd `handleGetVoteInfo`); the result is a
+/// `GetVoteInfoResult` value.
+pub fn handle_get_vote_info<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let version = uint(&c[0]) as u32;
+
+    // Shorter versions of some parameters for convenience.
+    let params = server.cfg.chain_params.clone();
+    let interval = i64::from(params.rule_change_activation_interval);
+    let quorum = params.rule_change_activation_quorum;
+    let snapshot = server.cfg.chain.best_snapshot();
+
+    let agendas = server
+        .cfg
+        .chain
+        .get_vote_info(&snapshot.hash, version)
+        .map_err(|failure| {
+            if failure.is_unknown_deployment_version {
+                return rpc_invalid_error(&format!("{version}: unrecognized vote version"));
+            }
+            rpc_internal_err(&failure.message)
+        })?;
+
+    let start_height = server.cfg.chain.calc_want_height(interval, snapshot.height) + 1;
+    let end_height = server.cfg.chain.calc_want_height(interval, snapshot.height) + interval;
+
+    // We don't fail, we try to return the totals for this version.
+    let total_votes = server
+        .cfg
+        .chain
+        .count_vote_version(version)
+        .map_err(|e| rpc_internal_err(&e))?;
+
+    let mut result_agendas = Vec::with_capacity(agendas.len());
+    for agenda in &agendas {
+        // Obtain status of agenda.
+        let state = server
+            .cfg
+            .chain
+            .next_threshold_state(&snapshot.hash, agenda.vote.id)
+            .map_err(|e| rpc_internal_err(&e))?;
+
+        let mut quorum_progress = 0.0f64;
+        let mut choice_counts: Vec<u32> = vec![0; agenda.vote.choices.len()];
+        let mut choice_progress: Vec<f64> = vec![0.0; agenda.vote.choices.len()];
+        if state == crate::helpers::threshold::State::Started {
+            let counts = server
+                .cfg
+                .chain
+                .get_vote_counts(version, agenda.vote.id)
+                .map_err(|e| rpc_internal_err(&e))?;
+
+            // Calculate quorum.
+            let mut qmin = quorum;
+            let total_non_abstain = counts.total - counts.total_abstain;
+            if total_non_abstain < quorum {
+                qmin = total_non_abstain;
+            }
+            quorum_progress = f64::from(qmin) / f64::from(quorum);
+
+            // Calculate choice progress.
+            for k in 0..choice_counts.len() {
+                choice_counts[k] = counts.vote_choices[k];
+                choice_progress[k] = f64::from(counts.vote_choices[k]) / f64::from(counts.total);
+            }
+        }
+
+        let choices: Vec<GoValue> = agenda
+            .vote
+            .choices
+            .iter()
+            .enumerate()
+            .map(|(k, choice)| {
+                GoValue::Struct(vec![
+                    GoValue::String(choice.id.to_string()),
+                    GoValue::String(choice.description.to_string()),
+                    GoValue::Uint(u64::from(choice.bits)),
+                    GoValue::Bool(choice.is_abstain),
+                    GoValue::Bool(choice.is_no),
+                    GoValue::Uint(u64::from(choice_counts[k])),
+                    GoValue::Float64(choice_progress[k]),
+                ])
+            })
+            .collect();
+
+        result_agendas.push(GoValue::Struct(vec![
+            GoValue::String(agenda.vote.id.to_string()),
+            GoValue::String(agenda.vote.description.to_string()),
+            GoValue::Uint(u64::from(agenda.vote.mask)),
+            GoValue::Uint(agenda.start_time),
+            GoValue::Uint(agenda.expire_time),
+            GoValue::String(state.status_string().to_string()),
+            GoValue::Float64(quorum_progress),
+            GoValue::Array(choices),
+        ]));
+    }
+
+    Ok(GoValue::Struct(vec![
+        GoValue::Int(snapshot.height),
+        GoValue::Int(start_height),
+        GoValue::Int(end_height),
+        GoValue::String(snapshot.hash.to_string()),
+        GoValue::Uint(u64::from(version)),
+        GoValue::Uint(u64::from(quorum)),
+        GoValue::Uint(u64::from(total_votes)),
+        GoValue::Array(result_agendas),
+    ]))
+}
+
+/// handlegetticketpoolvalue (dcrd `handleGetTicketPoolValue`).
+pub fn handle_get_ticket_pool_value<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let amt = server
+        .cfg
+        .chain
+        .ticket_pool_value()
+        .map_err(|e| rpc_internal_err(&e))?;
+    Ok(GoValue::Float64(txresults::to_coin(amt)))
+}
+
+/// handlegettreasurybalance (dcrd `handleGetTreasuryBalance`); the
+/// result is a `GetTreasuryBalanceResult` value.
+pub fn handle_get_treasury_balance<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let hash_arg = match &c[0] {
+        GoValue::Null => None,
+        GoValue::String(s) => Some(s.as_str()),
+        other => panic!("expected optional string field, got {other:?}"),
+    };
+    let verbose = opt_bool(&c[1]);
+
+    // Either parse the provided hash or use the current best tip hash
+    // when none is provided.
+    let hash = match hash_arg {
+        None | Some("") => server.cfg.chain.best_snapshot().hash,
+        Some(hash_str) => hash_str
+            .parse()
+            .map_err(|_| rpc_decode_hex_error(hash_str))?,
+    };
+
+    let balance_info = server
+        .cfg
+        .chain
+        .treasury_balance(&hash)
+        .map_err(|failure| {
+            if failure.is_unknown_block {
+                return RPCError::new(codes::BLOCK_NOT_FOUND, &format!("Block not found: {hash}"));
+            }
+            if failure.is_no_treasury_balance {
+                return RPCError::new(
+                    codes::NO_TREASURY,
+                    &format!("Treasury inactive for block {hash}"),
+                );
+            }
+            rpc_internal_err(&failure.message)
+        })?;
+
+    let updates = if matches!(verbose, Some(true)) {
+        GoValue::Array(
+            balance_info
+                .updates
+                .iter()
+                .map(|&u| GoValue::Int(u))
+                .collect(),
+        )
+    } else {
+        GoValue::Null
+    };
+    Ok(GoValue::Struct(vec![
+        GoValue::String(hash.to_string()),
+        GoValue::Int(balance_info.block_height),
+        GoValue::Uint(balance_info.balance),
+        updates,
+    ]))
+}
+
+/// handlelivetickets (dcrd `handleLiveTickets`); the result is a
+/// `LiveTicketsResult` value.
+pub fn handle_live_tickets<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let lt = server
+        .cfg
+        .chain
+        .live_tickets()
+        .map_err(|e| rpc_internal_err(&e))?;
+    Ok(GoValue::Struct(vec![GoValue::Array(
+        lt.iter().map(|h| GoValue::String(h.to_string())).collect(),
+    )]))
+}

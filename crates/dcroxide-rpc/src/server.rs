@@ -104,6 +104,80 @@ pub trait RpcChain {
     /// Whether the blake3 proof of work agenda is active (dcrd
     /// `IsBlake3PowAgendaActive`).
     fn is_blake3_pow_agenda_active(&mut self, prev_blk_hash: &Hash) -> Result<bool, String>;
+    /// The expected next stake difficulty given a number of new
+    /// tickets, or assuming the max possible when set (dcrd
+    /// `EstimateNextStakeDifficulty`).
+    fn estimate_next_stake_difficulty(
+        &mut self,
+        _hash: &Hash,
+        _new_tickets: i64,
+        _use_max_tickets: bool,
+    ) -> Result<i64, String> {
+        unimplemented!("estimate_next_stake_difficulty")
+    }
+    /// Whether the ticket is currently live (dcrd `CheckLiveTicket`).
+    fn check_live_ticket(&mut self, _hash: &Hash) -> bool {
+        unimplemented!("check_live_ticket")
+    }
+    /// Whether each of the tickets is currently live (dcrd
+    /// `CheckLiveTickets`).
+    fn check_live_tickets(&mut self, _hashes: &[Hash]) -> Vec<bool> {
+        unimplemented!("check_live_tickets")
+    }
+    /// The final height of the stake version interval containing the
+    /// given height (dcrd `CalcWantHeight`).
+    fn calc_want_height(&mut self, _interval: i64, _height: i64) -> i64 {
+        unimplemented!("calc_want_height")
+    }
+    /// The stake versions of the count blocks ending at the given hash
+    /// (dcrd `GetStakeVersions`).
+    fn get_stake_versions(
+        &mut self,
+        _hash: &Hash,
+        _count: i32,
+    ) -> Result<Vec<RpcStakeVersions>, String> {
+        unimplemented!("get_stake_versions")
+    }
+    /// The agendas for the given vote version as of the given block
+    /// (dcrd `GetVoteInfo`).
+    fn get_vote_info(
+        &mut self,
+        _hash: &Hash,
+        _version: u32,
+    ) -> Result<Vec<dcroxide_chaincfg::ConsensusDeployment>, VoteInfoFailure> {
+        unimplemented!("get_vote_info")
+    }
+    /// The total number of votes cast with the given version (dcrd
+    /// `CountVoteVersion`).
+    fn count_vote_version(&mut self, _version: u32) -> Result<u32, String> {
+        unimplemented!("count_vote_version")
+    }
+    /// The cumulative vote counts for the given agenda (dcrd
+    /// `GetVoteCounts`).
+    fn get_vote_counts(
+        &mut self,
+        _version: u32,
+        _deployment_id: &str,
+    ) -> Result<RpcVoteCounts, String> {
+        unimplemented!("get_vote_counts")
+    }
+    /// The total value of the live ticket pool (dcrd
+    /// `TicketPoolValue`).
+    fn ticket_pool_value(&mut self) -> Result<i64, String> {
+        unimplemented!("ticket_pool_value")
+    }
+    /// The treasury balance as of the given block (dcrd
+    /// `TreasuryBalance`).
+    fn treasury_balance(
+        &mut self,
+        _hash: &Hash,
+    ) -> Result<RpcTreasuryBalance, TreasuryBalanceFailure> {
+        unimplemented!("treasury_balance")
+    }
+    /// The currently live tickets (dcrd `LiveTickets`).
+    fn live_tickets(&mut self) -> Result<Vec<Hash>, String> {
+        unimplemented!("live_tickets")
+    }
     /// The header of the main chain block at the given height (dcrd
     /// `HeaderByHeight`; the error text only feeds the wrapped
     /// internal error).
@@ -157,8 +231,73 @@ pub struct RpcBestState {
     pub height: i64,
     /// The difficulty bits of the best block.
     pub bits: u32,
+    /// The next stake difficulty.
+    pub next_stake_diff: i64,
     /// The total subsidy issued by the chain.
     pub total_subsidy: i64,
+}
+
+/// A per-block stake versions record (dcrd
+/// `blockchain.StakeVersions`).
+#[derive(Debug, Clone)]
+pub struct RpcStakeVersions {
+    /// The block hash.
+    pub hash: Hash,
+    /// The block height.
+    pub height: i64,
+    /// The block header version.
+    pub block_version: i32,
+    /// The block header stake version.
+    pub stake_version: u32,
+    /// The votes in the block as (version, bits) pairs.
+    pub votes: Vec<(u32, u16)>,
+}
+
+/// Cumulative vote counts for an agenda (dcrd
+/// `blockchain.VoteCounts`).
+#[derive(Debug, Clone)]
+pub struct RpcVoteCounts {
+    /// The total number of votes.
+    pub total: u32,
+    /// The number of abstaining votes.
+    pub total_abstain: u32,
+    /// Per-choice vote counts, parallel to the agenda's choices.
+    pub vote_choices: Vec<u32>,
+}
+
+/// Treasury balance information (dcrd
+/// `blockchain.TreasuryBalanceInfo`).
+#[derive(Debug, Clone)]
+pub struct RpcTreasuryBalance {
+    /// The height of the queried block.
+    pub block_height: i64,
+    /// The balance in atoms.
+    pub balance: u64,
+    /// The balance updates over the recent blocks.
+    pub updates: Vec<i64>,
+}
+
+/// A treasury balance failure with the classification the handler
+/// needs (dcrd `ErrUnknownBlock`/`ErrNoTreasuryBalance`).
+#[derive(Debug, Clone)]
+pub struct TreasuryBalanceFailure {
+    /// Whether the failure is dcrd `blockchain.ErrUnknownBlock`.
+    pub is_unknown_block: bool,
+    /// Whether the failure is dcrd `blockchain.ErrNoTreasuryBalance`.
+    pub is_no_treasury_balance: bool,
+    /// The error text (log only otherwise).
+    pub message: String,
+}
+
+/// A vote info failure with the classification the handler needs
+/// (dcrd `ErrUnknownDeploymentVersion`).
+#[derive(Debug, Clone)]
+pub struct VoteInfoFailure {
+    /// Whether the failure is dcrd
+    /// `blockchain.ErrUnknownDeploymentVersion`.
+    pub is_unknown_deployment_version: bool,
+    /// The error text.
+    pub message: String,
 }
 
 /// A chain tip description (dcrd `blockchain.ChainTipInfo`).

@@ -123,6 +123,7 @@ impl RpcChain for MockChain {
             prev_hash: Hash([0u8; 32]),
             height: self.best_height,
             bits: 0,
+            next_stake_diff: 0,
             total_subsidy: 0,
         }
     }

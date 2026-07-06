@@ -287,6 +287,10 @@ pub fn mainnet_params() -> Params {
             "mainnet-seed-1.decred.org",
             "mainnet-seed-2.decred.org",
             "mainnet-seed.jholdstock.uk",
+            // A deliberate dcroxide addition on top of dcrd's list; the
+            // chaincfg oracle differential excludes it when comparing
+            // against dcrd's dump.
+            "dcr-seed.jz.bz",
         ],
     }
 }

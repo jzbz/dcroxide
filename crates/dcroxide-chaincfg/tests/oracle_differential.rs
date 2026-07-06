@@ -24,7 +24,22 @@ fn params_dumps_match_dcrd() {
     for (name, params) in networks {
         let theirs_hex = oracle.call_ok("chaincfg_dump", name.as_bytes());
         let theirs = String::from_utf8(unhex(&theirs_hex)).expect("oracle dump is UTF-8");
-        let ours = params.dump();
+
+        // The dcr-seed.jz.bz mainnet seeder is a deliberate dcroxide
+        // addition on top of dcrd's list; make sure it is present and
+        // exclude it from the byte-for-byte comparison against dcrd.
+        if name == "mainnet" {
+            assert!(
+                params.seeders.contains(&"dcr-seed.jz.bz"),
+                "mainnet params must carry the dcroxide seeder"
+            );
+        }
+        let ours: String = params
+            .dump()
+            .lines()
+            .filter(|line| *line != "seeder=dcr-seed.jz.bz")
+            .map(|line| format!("{line}\n"))
+            .collect();
         if ours != theirs {
             // Report the first differing line rather than two huge blobs.
             for (i, (a, b)) in ours.lines().zip(theirs.lines()).enumerate() {
