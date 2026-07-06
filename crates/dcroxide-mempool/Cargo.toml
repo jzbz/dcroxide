@@ -10,6 +10,9 @@ repository.workspace = true
 
 [dependencies]
 dcroxide-blockchain = { path = "../dcroxide-blockchain" }
+dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-standalone = { path = "../dcroxide-standalone" }
 dcroxide-stake = { path = "../dcroxide-stake" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-wire = { path = "../dcroxide-wire" }

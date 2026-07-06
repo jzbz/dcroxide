@@ -163,3 +163,31 @@ pub(crate) fn wrap_tx_rule_error(kind: ErrorKind, desc: String, err: &RuleError)
 
     tx_rule_error(kind, desc)
 }
+
+/// An error from a pool operation: either a rule violation or a
+/// non-rule failure from the chain backend (dcrd returns these as
+/// plain errors alongside its `RuleError`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PoolError {
+    /// A rule violation.
+    Rule(RuleError),
+    /// A non-rule failure.
+    Other(String),
+}
+
+impl PoolError {
+    /// dcrd's name for the error: the rule error kind name, or
+    /// "plain" for non-rule failures.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            PoolError::Rule(err) => err.kind_name(),
+            PoolError::Other(_) => "plain",
+        }
+    }
+}
+
+impl From<RuleError> for PoolError {
+    fn from(err: RuleError) -> PoolError {
+        PoolError::Rule(err)
+    }
+}

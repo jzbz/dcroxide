@@ -15,10 +15,15 @@ extern crate alloc;
 
 mod error;
 mod policy;
+mod pool;
 
-pub use error::{ErrorKind, RuleError, RuleErrorSource, chain_rule_error};
+pub use error::{ErrorKind, PoolError, RuleError, RuleErrorSource, chain_rule_error};
 pub use policy::{
     BASE_STANDARD_VERIFY_FLAGS, DEFAULT_MIN_RELAY_TX_FEE, MAX_STANDARD_TX_SIZE,
     calc_min_required_tx_relay_fee, check_inputs_standard, check_pk_script_standard,
     check_transaction_standard, is_dust,
+};
+pub use pool::{
+    MEMPOOL_MAX_CONCURRENT_TSPENDS, Policy, PoolChain, Tag, TxDesc, TxPool, UNMINED_HEIGHT,
+    VoteDesc,
 };

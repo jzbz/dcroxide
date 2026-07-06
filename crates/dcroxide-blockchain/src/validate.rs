@@ -4525,3 +4525,78 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     view.set_best_hash(node_hash);
     Ok(filter_hash)
 }
+
+/// Validate the scripts for all of a transaction's inputs against the
+/// referenced output scripts (dcrd `ValidateTransactionScripts`; the
+/// parallel validator and signature cache are result-invariant
+/// concurrency machinery and are not reproduced).  Entries that are
+/// missing or spent yield `ErrMissingTxOut` per the `PrevScripter`
+/// contract over a utxo viewpoint.
+pub fn validate_transaction_scripts(
+    tx: &MsgTx,
+    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    script_flags: dcroxide_txscript::ScriptFlags,
+    is_auto_revocations_enabled: bool,
+) -> Result<(), RuleError> {
+    // Skip revocations if the automatic ticket revocations agenda is
+    // active and the transaction version is greater than or equal to
+    // 2.  This is allowed since consensus rules enforce that
+    // revocations MUST pay to the addresses specified by the original
+    // commitments in the ticket.
+    if is_auto_revocations_enabled
+        && tx.version >= dcroxide_stake::TX_VERSION_AUTO_REVOCATIONS
+        && dcroxide_stake::is_ssrtx(tx)
+    {
+        return Ok(());
+    }
+
+    for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate() {
+        // Skip coinbases.
+        if tx_in.previous_out_point.index == u32::MAX {
+            continue;
+        }
+
+        // Ensure the referenced input utxo is available.
+        let prev_out = &tx_in.previous_out_point;
+        let entry = lookup_entry(prev_out).filter(|e| !e.is_spent());
+        let Some(entry) = entry else {
+            return Err(rule_error(
+                RuleErrorKind::MissingTxOut,
+                format!(
+                    "unable to find unspent output {prev_out:?} referenced from \
+                     transaction {}:{tx_in_idx}",
+                    tx.tx_hash()
+                ),
+            ));
+        };
+
+        // Create a new script engine for the script pair and execute
+        // it.
+        let pk_script = entry.pk_script().to_vec();
+        let script_version = entry.script_version();
+        let mut engine =
+            dcroxide_txscript::Engine::new(&pk_script, tx, tx_in_idx, script_flags, script_version)
+                .map_err(|e| {
+                    rule_error(
+                        RuleErrorKind::ScriptMalformed,
+                        format!(
+                            "failed to parse input {}:{tx_in_idx} which references output \
+                     {prev_out:?} - {e:?}",
+                            tx.tx_hash()
+                        ),
+                    )
+                })?;
+        engine.execute().map_err(|e| {
+            rule_error(
+                RuleErrorKind::ScriptValidation,
+                format!(
+                    "failed to validate input {}:{tx_in_idx} which references \
+                     output {prev_out:?} - {e:?}",
+                    tx.tx_hash()
+                ),
+            )
+        })?;
+    }
+
+    Ok(())
+}

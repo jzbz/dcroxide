@@ -282,7 +282,10 @@ name = "dcroxide-mempool"
 version = "0.1.0"
 dependencies = [
  "dcroxide-blockchain",
+ "dcroxide-chaincfg",
+ "dcroxide-chainhash",
  "dcroxide-stake",
+ "dcroxide-standalone",
  "dcroxide-testutil",
  "dcroxide-txscript",
  "dcroxide-wire",
