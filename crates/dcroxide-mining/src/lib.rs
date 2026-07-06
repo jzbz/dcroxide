@@ -15,6 +15,7 @@
 
 extern crate alloc;
 
+mod generator;
 mod graph;
 mod policy;
 mod pq;
@@ -22,6 +23,10 @@ mod template;
 mod types;
 mod view;
 
+pub use generator::{
+    BlkTmplGenerator, ExtraNonces, MiningPolicy, TemplateBest, TemplateChain, TemplateTxSource,
+    ViewPrevScripter, merge_utxo_view, spend_transaction,
+};
 pub use graph::{ForEachRedeemer, TxDescFind};
 pub use policy::{calc_input_value_age, calc_priority};
 pub use pq::{

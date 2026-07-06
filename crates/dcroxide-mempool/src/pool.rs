@@ -1753,3 +1753,29 @@ fn hex_string(bytes: &[u8]) -> String {
     }
     out
 }
+
+impl<C: PoolChain> dcroxide_mining::TemplateTxSource for TxPool<'_, C> {
+    fn mining_view(&self) -> dcroxide_mining::TxMiningView {
+        TxPool::mining_view(self)
+    }
+
+    fn have_transaction(&self, hash: &Hash) -> bool {
+        TxPool::have_transaction(self, hash)
+    }
+
+    fn have_all_transactions(&self, hashes: &[Hash]) -> bool {
+        TxPool::have_all_transactions(self, hashes)
+    }
+
+    fn vote_hashes_for_block(&self, hash: &Hash) -> Vec<Hash> {
+        TxPool::vote_hashes_for_block(self, hash)
+    }
+
+    fn votes_for_blocks(&self, hashes: &[Hash]) -> Vec<Vec<VoteDesc>> {
+        TxPool::votes_for_blocks(self, hashes)
+    }
+
+    fn is_reg_tx_tree_known_disapproved(&self, hash: &Hash) -> bool {
+        TxPool::is_reg_tx_tree_known_disapproved(self, hash)
+    }
+}

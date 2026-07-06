@@ -143,6 +143,13 @@ impl UtxoView {
         self.entries.get(&key(outpoint))
     }
 
+    /// A mutable reference to the entry for the outpoint, if any
+    /// (the mutable side of dcrd's `LookupEntry`, used by the mining
+    /// code to mark template inputs spent).
+    pub fn lookup_entry_mut(&mut self, outpoint: &OutPoint) -> Option<&mut UtxoEntry> {
+        self.entries.get_mut(&key(outpoint))
+    }
+
     /// Remove the entry for the outpoint (dcrd `RemoveEntry`).
     pub fn remove_entry(&mut self, outpoint: &OutPoint) {
         self.entries.remove(&key(outpoint));

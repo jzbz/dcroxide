@@ -103,13 +103,14 @@ Currently implemented:
   `internal/fees`: decaying confirmation tracking over exponential
   fee rate buckets and the median fee estimation, replaying dcrd's
   floating point accounting bit for bit
-- `dcroxide-mining` — the beginnings of block template mining support
-  from dcrd's `internal/mining`: the transaction dependency graph and
-  mining view with ancestor statistics tracking, the priority queue
-  with Go's exact heap semantics, the priority calculation, and the
-  block template building blocks (coinbase and treasurybase
-  construction, parent vote sorting, and the template roots), now
-  wired into the mempool's mining hooks
+- `dcroxide-mining` — block template mining support from dcrd's
+  `internal/mining`: the transaction dependency graph and mining view
+  with ancestor statistics tracking, the priority queue with Go's
+  exact heap semantics, the priority calculation, the block template
+  building blocks (coinbase and treasurybase construction, parent
+  vote sorting, and the template roots), and the full
+  `NewBlockTemplate` assembly replayed byte for byte against dcrd's
+  own harness, wired into the mempool's mining hooks
 - `dcroxide-gcs` — Golomb-coded set filters (versions 1 and 2) and the
   DCP0005 version 2 block committed filters for light clients, matched
   differentially against dcrd over random filters and structured blocks
