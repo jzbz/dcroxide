@@ -13,7 +13,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use dcroxide_chaincfg::Params;
+use dcroxide_chaincfg::{ConsensusDeployment, Params};
 use dcroxide_chainhash::Hash;
 use dcroxide_wire::BlockHeader;
 
@@ -28,6 +28,10 @@ use crate::blockindex::{BlockIndex, BlockStatus, NodeId, NodeStore};
 use crate::chainio::SpentTxOut;
 use crate::chainview_nodes::{NodeBranchView, NodeChainView};
 use crate::ruleerror::RuleErrorKind;
+use crate::stakever::calc_want_height;
+use crate::thresholdstate::{
+    ThresholdStateTuple, VoteCounts, deployment_state, state_last_changed,
+};
 use crate::utxoentry::UtxoEntry;
 use crate::utxoview::{OutPointKey, UtxoView, count_spent_outputs};
 use crate::validate::{
@@ -2660,6 +2664,427 @@ impl Chain {
         out
     }
 
+    /// Look up a block node that the chain can validate, the shared
+    /// entry check of dcrd's hash-keyed query surface
+    /// (`unknownBlockError` on failure).
+    fn lookup_validatable(&self, hash: &Hash) -> Result<NodeId, RuleError> {
+        self.index
+            .lookup_node(hash)
+            .filter(|n| self.index.can_validate(&self.store, *n))
+            .ok_or_else(|| {
+                rule_error(
+                    RuleErrorKind::UnknownBlock,
+                    format!("block {hash} is not known"),
+                )
+            })
+    }
+
+    /// Cooked stake version information for up to `count` blocks
+    /// walking backwards from the given block (dcrd
+    /// `GetStakeVersions`).  dcrd reports the unknown block through
+    /// its context error and the negative count through a plain
+    /// error; both surface here as message strings.
+    pub fn get_stake_versions(
+        &self,
+        hash: &Hash,
+        count: i32,
+    ) -> Result<Vec<StakeVersions>, String> {
+        let start_node = self.lookup_validatable(hash).map_err(|e| e.description)?;
+
+        // Nothing to do if no count requested.
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if count < 0 {
+            return Err(format!("count must not be less than zero - got {count}"));
+        }
+
+        // Limit the requested count to the max possible for the
+        // requested block.
+        let mut count = i64::from(count);
+        let start_height = self.store.node(start_node).height;
+        if count > start_height + 1 {
+            count = start_height + 1;
+        }
+
+        let mut result = Vec::with_capacity(count as usize);
+        let mut prev_node = Some(start_node);
+        let mut i = 0i64;
+        while let Some(id) = prev_node {
+            if i >= count {
+                break;
+            }
+            let node = self.store.node(id);
+            result.push(StakeVersions {
+                hash: node.hash,
+                height: node.height,
+                block_version: node.block_version,
+                stake_version: node.stake_version,
+                votes: node.votes.clone(),
+            });
+            prev_node = node.parent;
+            i += 1;
+        }
+        Ok(result)
+    }
+
+    /// The rule change threshold state of the given deployment for the
+    /// block AFTER the given block hash (dcrd `NextThresholdState`).
+    pub fn next_threshold_state(
+        &self,
+        hash: &Hash,
+        deployment_id: &str,
+        params: &Params,
+    ) -> Result<ThresholdStateTuple, RuleError> {
+        let node = self.lookup_validatable(hash)?;
+        let (version, deployment) = crate::agendas::find_deployment(params, deployment_id)
+            .ok_or_else(|| {
+                rule_error(
+                    RuleErrorKind::UnknownDeploymentID,
+                    format!("deployment ID {deployment_id} does not exist"),
+                )
+            })?;
+        let view = NodeBranchView {
+            store: &self.store,
+            tip: node,
+        };
+        let height = self.store.node(node).height;
+        Ok(deployment_state(
+            &view,
+            Some(height),
+            version,
+            deployment,
+            params,
+        ))
+    }
+
+    /// The height at which the given deployment last changed state as
+    /// of the given block hash (dcrd `StateLastChangedHeight`); zero
+    /// when the state has never changed.
+    pub fn state_last_changed_height(
+        &self,
+        hash: &Hash,
+        deployment_id: &str,
+        params: &Params,
+    ) -> Result<i64, RuleError> {
+        let node = self.lookup_validatable(hash)?;
+
+        // Determine the deployment details for the provided deployment
+        // id.
+        let (version, deployment) = crate::agendas::find_deployment(params, deployment_id)
+            .ok_or_else(|| {
+                rule_error(
+                    RuleErrorKind::UnknownDeploymentID,
+                    format!("deployment ID {deployment_id} does not exist"),
+                )
+            })?;
+        if !deployment.forced_choice_id.is_empty() {
+            // The state change height is 1 since the genesis block
+            // never experiences changes regardless of consensus rule
+            // changes.
+            return Ok(1);
+        }
+
+        // Find the height at which the current state changed.
+        let view = NodeBranchView {
+            store: &self.store,
+            tip: node,
+        };
+        let height = self.store.node(node).height;
+        Ok(state_last_changed(&view, height, version, deployment, params).unwrap_or(0))
+    }
+
+    /// The vote counts for the deployment over the current rule change
+    /// activation interval as of the best chain tip (the walk inside
+    /// dcrd `getVoteCounts`).
+    fn get_vote_counts_internal(
+        &self,
+        node: NodeId,
+        version: u32,
+        deployment: &ConsensusDeployment,
+        params: &Params,
+    ) -> VoteCounts {
+        // Don't try to count votes before the stake validation height
+        // since there could not possibly have been any.
+        let svh = params.stake_validation_height;
+        let mut result = VoteCounts {
+            total: 0,
+            total_abstain: 0,
+            vote_choices: alloc::vec![0u32; deployment.vote.choices.len()],
+        };
+        let node_height = self.store.node(node).height;
+        if node_height < svh {
+            return result;
+        }
+
+        // Calculate the final height of the prior interval.
+        let rcai = i64::from(params.rule_change_activation_interval);
+        let height = calc_want_height(svh, rcai, node_height);
+
+        let mut count_node = node;
+        while self.store.node(count_node).height > height {
+            for vote in &self.store.node(count_node).votes {
+                // Wrong versions do not count.
+                if vote.0 != version {
+                    continue;
+                }
+
+                // Increase total votes.
+                result.total += 1;
+
+                match deployment.vote.vote_index(vote.1) {
+                    None => {
+                        // Invalid votes are treated as abstain.
+                        result.total_abstain += 1;
+                    }
+                    Some(index) => {
+                        if deployment.vote.choices[index].is_abstain {
+                            result.total_abstain += 1;
+                        }
+                        result.vote_choices[index] += 1;
+                    }
+                }
+            }
+            count_node = self
+                .store
+                .node(count_node)
+                .parent
+                .expect("above the interval boundary implies a parent");
+        }
+        result
+    }
+
+    /// The vote counts for the specified version and deployment
+    /// identifier for the current rule change activation interval
+    /// (dcrd `GetVoteCounts`).
+    pub fn get_vote_counts(
+        &self,
+        version: u32,
+        deployment_id: &str,
+        params: &Params,
+    ) -> Result<VoteCounts, RuleError> {
+        if let Some((_, deployments)) = params.deployments.iter().find(|(v, _)| *v == version) {
+            for deployment in deployments {
+                if deployment.vote.id == deployment_id {
+                    let tip = self.best_chain.tip().expect("best chain tip");
+                    return Ok(self.get_vote_counts_internal(tip, version, deployment, params));
+                }
+            }
+        }
+        Err(rule_error(
+            RuleErrorKind::UnknownDeploymentID,
+            format!("deployment ID {deployment_id} does not exist"),
+        ))
+    }
+
+    /// The total number of version votes for the current rule change
+    /// activation interval as of the best chain tip (dcrd
+    /// `CountVoteVersion`).
+    pub fn count_vote_version(&self, version: u32, params: &Params) -> u32 {
+        let count_tip = self.best_chain.tip().expect("best chain tip");
+
+        // Don't try to count votes before the stake validation height
+        // since there could not possibly have been any.
+        let svh = params.stake_validation_height;
+        let tip_height = self.store.node(count_tip).height;
+        if tip_height < svh {
+            return 0;
+        }
+
+        // Calculate the final height of the prior interval.
+        let rcai = i64::from(params.rule_change_activation_interval);
+        let height = calc_want_height(svh, rcai, tip_height);
+
+        let mut total: u32 = 0;
+        let mut count_node = count_tip;
+        while self.store.node(count_node).height > height {
+            for vote in &self.store.node(count_node).votes {
+                // Wrong versions do not count.
+                if vote.0 != version {
+                    continue;
+                }
+
+                // Increase total votes.
+                total += 1;
+            }
+            count_node = self
+                .store
+                .node(count_node)
+                .parent
+                .expect("above the interval boundary implies a parent");
+        }
+        total
+    }
+
+    /// Information on the consensus deployment agendas and their
+    /// respective states at the provided hash for the provided
+    /// deployment version (dcrd `GetVoteInfo`).
+    pub fn get_vote_info(
+        &self,
+        hash: &Hash,
+        version: u32,
+        params: &Params,
+    ) -> Result<VoteInfo, RuleError> {
+        let deployments = params
+            .deployments
+            .iter()
+            .find(|(v, _)| *v == version)
+            .map(|(_, d)| d)
+            .ok_or_else(|| {
+                rule_error(
+                    RuleErrorKind::UnknownDeploymentVersion,
+                    format!("stake version {version} does not exist"),
+                )
+            })?;
+
+        let mut vote_info = VoteInfo {
+            agendas: Vec::with_capacity(deployments.len()),
+            agenda_status: Vec::with_capacity(deployments.len()),
+        };
+        for deployment in deployments {
+            vote_info.agendas.push(deployment.clone());
+            let status = self.next_threshold_state(hash, deployment.vote.id, params)?;
+            vote_info.agenda_status.push(status);
+        }
+        Ok(vote_info)
+    }
+
+    /// Locate the block after the first known block in the locator
+    /// along with the number of subsequent blocks needed, respecting
+    /// the stop hash and max entries (dcrd `locateInventory`).
+    fn locate_inventory(
+        &self,
+        locator: &[Hash],
+        hash_stop: &Hash,
+        max_entries: u32,
+    ) -> (Option<NodeId>, u32) {
+        // There are no block locators so a specific block is being
+        // requested as identified by the stop hash.
+        let stop_node = self.index.lookup_node(hash_stop);
+        if locator.is_empty() {
+            let Some(stop) = stop_node else {
+                // No blocks with the stop hash were found so there is
+                // nothing to do.
+                return (None, 0);
+            };
+            return (Some(stop), 1);
+        }
+
+        // Find the most recent locator block hash in the main chain.
+        // In the case none of the hashes in the locator are in the
+        // main chain, fall back to the genesis block.
+        let mut start_node = self.best_chain.genesis();
+        for hash in locator {
+            if let Some(node) = self.index.lookup_node(hash) {
+                if self.best_chain.contains(&self.store, node) {
+                    start_node = Some(node);
+                    break;
+                }
+            }
+        }
+
+        // Start at the block after the most recently known block.
+        // When there is no next block it means the most recently known
+        // block is the tip of the best chain, so there is nothing more
+        // to do.
+        let Some(start_node) = start_node.and_then(|n| self.best_chain.next(&self.store, n)) else {
+            return (None, 0);
+        };
+
+        // Calculate how many entries are needed.
+        let tip = self.best_chain.tip().expect("best chain tip");
+        let start_height = self.store.node(start_node).height;
+        let mut total = (self.store.node(tip).height - start_height + 1) as u32;
+        if let Some(stop) = stop_node {
+            if self.best_chain.contains(&self.store, stop)
+                && self.store.node(stop).height >= start_height
+            {
+                total = (self.store.node(stop).height - start_height + 1) as u32;
+            }
+        }
+        if total > max_entries {
+            total = max_entries;
+        }
+
+        (Some(start_node), total)
+    }
+
+    /// The hashes of the blocks after the first known block in the
+    /// locator until the provided stop hash is reached, or up to the
+    /// provided max number of block hashes (dcrd `LocateBlocks`).
+    ///
+    /// When no locators are provided the stop hash is treated as a
+    /// request for that block itself; when none of the locators are
+    /// known, hashes starting after the genesis block are returned.
+    pub fn locate_blocks(&self, locator: &[Hash], hash_stop: &Hash, max_hashes: u32) -> Vec<Hash> {
+        // Find the node after the first known block in the locator and
+        // the total number of nodes after it needed while respecting
+        // the stop hash and max entries.
+        let (mut node, total) = self.locate_inventory(locator, hash_stop, max_hashes);
+
+        // Populate and return the found hashes.
+        let mut hashes = Vec::with_capacity(total as usize);
+        for _ in 0..total {
+            let id = node.expect("the total is bounded by the chain view");
+            hashes.push(self.store.node(id).hash);
+            node = self.best_chain.next(&self.store, id);
+        }
+        hashes
+    }
+
+    /// The headers of the blocks after the first known block in the
+    /// locator until the provided stop hash is reached, or up to
+    /// wire's max headers per message (dcrd `LocateHeaders`).
+    pub fn locate_headers(&self, locator: &[Hash], hash_stop: &Hash) -> Vec<BlockHeader> {
+        let max_headers = dcroxide_wire::MAX_BLOCK_HEADERS_PER_MSG as u32;
+        let (mut node, total) = self.locate_inventory(locator, hash_stop, max_headers);
+
+        // Populate and return the found headers.
+        let mut headers = Vec::with_capacity(total as usize);
+        for _ in 0..total {
+            let id = node.expect("the total is bounded by the chain view");
+            headers.push(self.store.header(id));
+            node = self.best_chain.next(&self.store, id);
+        }
+        headers
+    }
+
+    /// A block locator for the passed block hash, or for the latest
+    /// known tip of the best chain when the hash is not known (dcrd
+    /// `BlockLocatorFromHash`).
+    pub fn block_locator_from_hash(&self, hash: &Hash) -> Vec<Hash> {
+        let node = self.index.lookup_node(hash);
+        self.best_chain.block_locator(&self.store, node)
+    }
+
+    /// Estimate the next stake difficulty by pretending the given
+    /// number of tickets will be purchased in the remainder of the
+    /// interval, or the maximum possible number when the flag is set
+    /// (dcrd `EstimateNextStakeDifficulty`).  dcrd reports the unknown
+    /// block through its context error and the excessive ticket counts
+    /// through plain errors; both surface here as message strings.
+    pub fn estimate_next_stake_difficulty(
+        &self,
+        hash: &Hash,
+        new_tickets: i64,
+        use_max_tickets: bool,
+        params: &Params,
+    ) -> Result<i64, String> {
+        let node = self.lookup_validatable(hash).map_err(|e| e.description)?;
+        let view = NodeBranchView {
+            store: &self.store,
+            tip: node,
+        };
+        let cur_node = crate::difficulty::ChainView::node(&view, self.store.node(node).height);
+        crate::agendas::estimate_next_stake_difficulty(
+            &view,
+            cur_node.as_ref(),
+            new_tickets,
+            use_max_tickets,
+            params,
+        )
+    }
+
     /// The treasury balance as of the block after the given node:
     /// the node's stored balance plus the maturing values from the
     /// coinbase-maturity ancestor (dcrd `calculateTreasuryBalance`).
@@ -3239,4 +3664,31 @@ fn check_block_context_for(
         Some(parent_stake_node),
         params,
     )
+}
+
+/// Cooked per-block stake version information walking backwards from a
+/// block (dcrd `StakeVersions`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StakeVersions {
+    /// The block hash.
+    pub hash: Hash,
+    /// The block height.
+    pub height: i64,
+    /// The block header version.
+    pub block_version: i32,
+    /// The block header stake version.
+    pub stake_version: u32,
+    /// The votes in the block as (version, bits) pairs.
+    pub votes: Vec<(u32, u16)>,
+}
+
+/// Information on consensus deployment agendas and their respective
+/// states for a deployment version (dcrd `VoteInfo`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoteInfo {
+    /// The agendas for the version.
+    pub agendas: Vec<ConsensusDeployment>,
+    /// The threshold state of each agenda, index-aligned with
+    /// [`Self::agendas`].
+    pub agenda_status: Vec<ThresholdStateTuple>,
 }

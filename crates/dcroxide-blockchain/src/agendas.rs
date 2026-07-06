@@ -6,9 +6,12 @@
 
 use dcroxide_chaincfg::{ConsensusDeployment, Params};
 
+use alloc::string::String;
+
 use crate::difficulty::{
     ChainView, DiffNode, calc_next_blake3_diff_from_anchor, calc_next_blake256_diff,
     calc_next_required_stake_difficulty_v1, calc_next_required_stake_difficulty_v2,
+    estimate_next_stake_difficulty_v1, estimate_next_stake_difficulty_v2,
 };
 use crate::stakever::calc_want_height;
 use crate::thresholdstate::{ThresholdState, VoteChainView, deployment_state};
@@ -254,4 +257,53 @@ pub fn calc_next_required_stake_difficulty(
         return calc_next_required_stake_difficulty_v2(view, cur_node, params);
     }
     calc_next_required_stake_difficulty_v1(view, cur_node, params)
+}
+
+/// Estimate the next stake difficulty by pretending the given number
+/// of tickets will be purchased in the remainder of the interval, or
+/// the maximum possible number when the flag is set, selecting the
+/// algorithm based on the DCP0001 agenda state (dcrd
+/// `estimateNextStakeDifficulty`).
+pub fn estimate_next_stake_difficulty(
+    view: &impl FullChainView,
+    cur_node: Option<&DiffNode>,
+    new_tickets: i64,
+    use_max_tickets: bool,
+    params: &Params,
+) -> Result<i64, String> {
+    // Determine the correct deployment details for the new stake
+    // difficulty algorithm consensus vote or treat it as active when
+    // voting is not enabled for the current network.
+    let Some((version, deployment)) = find_deployment(params, VOTE_ID_SDIFF_ALGORITHM) else {
+        return Ok(calc_next_required_stake_difficulty_v2(
+            view, cur_node, params,
+        ));
+    };
+
+    // Use the new stake difficulty algorithm if the stake vote for the
+    // new algorithm agenda is active.
+    //
+    // NOTE: The choice field of the returned threshold state is not
+    // examined here because there is only one possible choice that can
+    // be active for the agenda, which is yes, so there is no need to
+    // check it.
+    let state = deployment_state(
+        view,
+        cur_node.map(|n| n.height),
+        version,
+        deployment,
+        params,
+    );
+    if state.state == ThresholdState::Active {
+        return estimate_next_stake_difficulty_v2(
+            view,
+            cur_node,
+            new_tickets,
+            use_max_tickets,
+            params,
+        );
+    }
+
+    // Use the old stake difficulty algorithm in any other case.
+    estimate_next_stake_difficulty_v1(view, cur_node, new_tickets, use_max_tickets, params)
 }

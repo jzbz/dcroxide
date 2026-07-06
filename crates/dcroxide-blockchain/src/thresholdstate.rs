@@ -293,3 +293,76 @@ pub fn deployment_state(
 
     next_threshold_state(view, prev_height, deployment_version, deployment, params)
 }
+
+/// Compacted vote counts for a deployment over the current rule change
+/// activation interval (dcrd `VoteCounts`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VoteCounts {
+    /// The total number of votes with the deployment's version.
+    pub total: u32,
+    /// The number of votes that abstained, including invalid choices.
+    pub total_abstain: u32,
+    /// Per-choice vote counts in the deployment's choice order.
+    pub vote_choices: Vec<u32>,
+}
+
+/// The height at which the deployment last changed state as of the
+/// node at the given height, or `None` when the state has never
+/// changed (dcrd `stateLastChanged`).
+pub fn state_last_changed(
+    view: &impl VoteChainView,
+    node_height: i64,
+    deployment_version: u32,
+    deployment: &ConsensusDeployment,
+    params: &Params,
+) -> Option<i64> {
+    // No state changes are possible if the chain is not yet past stake
+    // validation height and had a full interval to change.
+    let confirmation_interval = i64::from(params.rule_change_activation_interval);
+    let svh = params.stake_validation_height;
+    if node_height < svh + confirmation_interval {
+        return None;
+    }
+
+    // Determine the current state.  Notice that nextThresholdState
+    // always calculates the state for the block after the provided
+    // one, so use the parent to get the state for the requested block.
+    let cur_state = next_threshold_state(
+        view,
+        Some(node_height - 1),
+        deployment_version,
+        deployment,
+        params,
+    );
+
+    // Determine the first block of the current confirmation interval
+    // in order to determine the block at which the state possibly
+    // changed.  Since the state can only change at an interval
+    // boundary, loop backwards one interval at a time to determine
+    // when (and if) the state changed.
+    let final_node_height = calc_want_height(svh, confirmation_interval, node_height);
+    let mut walk_height = final_node_height + 1;
+    let mut prior_state_change_height = walk_height;
+    while walk_height >= 1 {
+        // As previously mentioned, nextThresholdState always
+        // calculates the state for the block after the provided one,
+        // so use the parent to get the state of the block itself.
+        let state = next_threshold_state(
+            view,
+            Some(walk_height - 1),
+            deployment_version,
+            deployment,
+            params,
+        );
+        if state.state != cur_state.state {
+            return Some(prior_state_change_height);
+        }
+
+        // Get the ancestor that is the first block of the previous
+        // confirmation interval.
+        prior_state_change_height = walk_height;
+        walk_height -= confirmation_interval;
+    }
+
+    None
+}

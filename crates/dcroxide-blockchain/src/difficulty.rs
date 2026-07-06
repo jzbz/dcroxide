@@ -12,7 +12,10 @@
 //! threshold-state machinery in the chain engine; the RPC-only
 //! `EstimateNextStakeDifficulty` variants are deferred with it.
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec;
+use alloc::vec::Vec;
 
 use dcroxide_chaincfg::Params;
 use dcroxide_standalone::{BigInt, Sign, big_to_compact, calc_asert_diff, compact_to_big};
@@ -691,4 +694,441 @@ pub fn calc_next_required_stake_difficulty_v2(
         prev_pool_size_all,
         cur_pool_size_all,
     )
+}
+
+/// A chain view that overlays fabricated nodes on top of a base view
+/// (the fake blockchain dcrd's original stake difficulty estimator
+/// builds on the current tip).
+struct OverlayView<'a, V: ChainView> {
+    inner: &'a V,
+    base_height: i64,
+    overlay: &'a [DiffNode],
+}
+
+impl<V: ChainView> ChainView for OverlayView<'_, V> {
+    fn node(&self, height: i64) -> Option<DiffNode> {
+        if height > self.base_height {
+            let idx = usize::try_from(height - self.base_height - 1).ok()?;
+            return self.overlay.get(idx).copied();
+        }
+        self.inner.node(height)
+    }
+}
+
+/// Estimate the next stake difficulty using the original algorithm by
+/// pretending the given number of tickets will be purchased in the
+/// remainder of the interval, or the maximum possible number when the
+/// flag is set (dcrd `estimateNextStakeDifficultyV1`).
+pub fn estimate_next_stake_difficulty_v1(
+    view: &impl ChainView,
+    cur_node: Option<&DiffNode>,
+    tickets_in_window: i64,
+    use_max_tickets: bool,
+    params: &Params,
+) -> Result<i64, String> {
+    let alpha = params.stake_diff_alpha;
+    let stake_diff_start_height = i64::from(params.coinbase_maturity) + 1;
+    let max_retarget = params.retarget_adjustment_factor;
+    let ticket_pool_weight = i64::from(params.ticket_pool_size_weight);
+
+    // Number of nodes to traverse while calculating difficulty.
+    let nodes_to_traverse = params.stake_diff_window_size * params.stake_diff_windows;
+
+    // Genesis block. Block at height 1 has these parameters.
+    let Some(cur_node) = cur_node else {
+        return Ok(params.minimum_stake_diff);
+    };
+    if cur_node.height < stake_diff_start_height {
+        return Ok(params.minimum_stake_diff);
+    }
+
+    // Create a fake blockchain on top of the current best node with
+    // the number of freshly purchased tickets as indicated by the
+    // user.
+    let old_diff = cur_node.sbits;
+    let mut tickets_in_window = tickets_in_window;
+    let mut fakes: Vec<DiffNode> = Vec::new();
+    if (cur_node.height + 1) % params.stake_diff_window_size != 0 {
+        let next_adj_height =
+            (cur_node.height / params.stake_diff_window_size + 1) * params.stake_diff_window_size;
+        let max_tickets =
+            (next_adj_height - cur_node.height) * i64::from(params.max_fresh_stake_per_block);
+
+        // If the user has indicated that the automatically calculated
+        // maximum amount of tickets should be used, plug that in here.
+        if use_max_tickets {
+            tickets_in_window = max_tickets;
+        }
+
+        // Double check to make sure there isn't too much.
+        if tickets_in_window > max_tickets {
+            return Err(format!(
+                "too much fresh stake to be used in evaluation requested; \
+                 max {max_tickets}, got {tickets_in_window}"
+            ));
+        }
+
+        // Insert all the tickets into bogus nodes that will be used to
+        // calculate the next difficulty below.
+        let mut tickets_to_insert = tickets_in_window;
+        for height in (cur_node.height + 1)..next_adj_height {
+            // Insert the fake fresh stake into each block, decrementing
+            // the amount we need to use each time until we hit 0.
+            let fresh_stake = if i64::from(params.max_fresh_stake_per_block) > tickets_to_insert {
+                let fresh = tickets_to_insert as u8;
+                tickets_to_insert = 0;
+                fresh
+            } else {
+                tickets_to_insert -= i64::from(params.max_fresh_stake_per_block);
+                params.max_fresh_stake_per_block
+            };
+
+            // Use a constant pool size for the estimate, since this has
+            // much less fluctuation than the fresh stake.
+            fakes.push(DiffNode {
+                height,
+                timestamp: 0,
+                bits: 0,
+                sbits: 0,
+                pool_size: cur_node.pool_size,
+                fresh_stake,
+            });
+        }
+    }
+    let top_node = fakes.last().copied().unwrap_or(*cur_node);
+    let est_view = OverlayView {
+        inner: view,
+        base_height: cur_node.height,
+        overlay: &fakes,
+    };
+
+    // The target size of the ticketPool in live tickets.
+    let target_for_ticket_pool =
+        i64::from(params.tickets_per_block) * i64::from(params.ticket_pool_size);
+
+    // Initialize bigInt slice for the percentage changes for each
+    // window period above or below the target.
+    let mut window_changes = vec![BigInt::from(0); params.stake_diff_windows as usize];
+
+    // Regress through all of the previous blocks and store the percent
+    // changes per window period.
+    let mut old_node = top_node;
+    let mut window_period: i64 = 0;
+    let mut weights: u64 = 0;
+    let mut i: i64 = 0;
+    loop {
+        // Store and reset after reaching the end of every window
+        // period.
+        if (i + 1) % params.stake_diff_window_size == 0 {
+            let mut pool_size_skew = (i64::from(old_node.pool_size) - target_for_ticket_pool)
+                * ticket_pool_weight
+                + target_for_ticket_pool;
+
+            // Watch for divide by zero.
+            if pool_size_skew <= 0 {
+                pool_size_skew = 1;
+            }
+
+            let mut cur_pool_size_temp = BigInt::from(pool_size_skew);
+            cur_pool_size_temp <<= 32u32; // Add padding
+            let target_temp = BigInt::from(target_for_ticket_pool);
+
+            let mut window_adjusted = cur_pool_size_temp / target_temp;
+
+            // Weight it exponentially.
+            window_adjusted <<= ((params.stake_diff_windows - window_period) * alpha) as u32;
+
+            // Sum up all the different weights incrementally.
+            weights += 1u64 << (((params.stake_diff_windows - window_period) * alpha) as u32);
+
+            // Store it in the slice.
+            window_changes[window_period as usize] = window_adjusted;
+            window_period += 1;
+        }
+
+        if (i + 1) == nodes_to_traverse {
+            break; // Exit for loop when we hit the end.
+        }
+
+        // Get the previous node while staying at the genesis block as
+        // needed.
+        if old_node.height > 0 {
+            if let Some(parent) = est_view.node(old_node.height - 1) {
+                old_node = parent;
+            }
+        }
+        i += 1;
+    }
+
+    // Sum up the weighted window periods.
+    let mut weighted_sum = BigInt::from(0);
+    for change in &window_changes {
+        weighted_sum += change;
+    }
+
+    // Divide by the sum of all weights, multiply by the old stake
+    // difficulty, and shed the padding.
+    let weights_big = BigInt::from(weights as i64);
+    let weighted_sum_div = weighted_sum / weights_big;
+    let mut next_diff_big = weighted_sum_div * BigInt::from(old_diff);
+    next_diff_big >>= 32u32;
+    let next_diff_ticket_pool = lossy_i64(&next_diff_big);
+
+    // Check to see if we're over the limits for the maximum allowable
+    // retarget.
+    if old_diff == 0 {
+        // This should never really happen, but in case it does...
+        return Ok(next_diff_ticket_pool);
+    }
+    let next_diff_ticket_pool = clamp_v1_retarget(old_diff, next_diff_ticket_pool, max_retarget);
+
+    // The target number of new SStx per block for any given window
+    // period.
+    let target_for_window = params.stake_diff_window_size * i64::from(params.tickets_per_block);
+
+    // Regress through all of the previous blocks and store the percent
+    // changes per window period of fresh stake.
+    let mut old_node = top_node;
+    let mut window_fresh_stake: i64 = 0;
+    let mut window_period: i64 = 0;
+    let mut weights: u64 = 0;
+    let mut i: i64 = 0;
+    loop {
+        // Add the fresh stake into the store for this window period.
+        window_fresh_stake += i64::from(old_node.fresh_stake);
+
+        // Store and reset after reaching the end of every window
+        // period.
+        if (i + 1) % params.stake_diff_window_size == 0 {
+            // Watch for divide by zero.
+            if window_fresh_stake <= 0 {
+                window_fresh_stake = 1;
+            }
+
+            let mut fresh_temp = BigInt::from(window_fresh_stake);
+            fresh_temp <<= 32u32; // Add padding
+            let target_temp = BigInt::from(target_for_window);
+
+            let mut window_adjusted = fresh_temp / target_temp;
+
+            // Weight it exponentially.
+            window_adjusted <<= ((params.stake_diff_windows - window_period) * alpha) as u32;
+
+            // Sum up all the different weights incrementally.
+            weights += 1u64 << (((params.stake_diff_windows - window_period) * alpha) as u32);
+
+            // Store it in the slice.
+            window_changes[window_period as usize] = window_adjusted;
+            window_fresh_stake = 0;
+            window_period += 1;
+        }
+
+        if (i + 1) == nodes_to_traverse {
+            break; // Exit for loop when we hit the end.
+        }
+
+        // Get the previous node while staying at the genesis block as
+        // needed.
+        if old_node.height > 0 {
+            if let Some(parent) = est_view.node(old_node.height - 1) {
+                old_node = parent;
+            }
+        }
+        i += 1;
+    }
+
+    // Sum up the weighted window periods.
+    let mut weighted_sum = BigInt::from(0);
+    for change in &window_changes {
+        weighted_sum += change;
+    }
+
+    // Divide by the sum of all weights, multiply by the old stake
+    // difficulty, and shed the padding.
+    let weights_big = BigInt::from(weights as i64);
+    let weighted_sum_div = weighted_sum / weights_big;
+    let mut next_diff_big = weighted_sum_div * BigInt::from(old_diff);
+    next_diff_big >>= 32u32;
+    let next_diff_fresh_stake = lossy_i64(&next_diff_big);
+
+    // Check to see if we're over the limits for the maximum allowable
+    // retarget.
+    let next_diff_fresh_stake = clamp_v1_retarget(old_diff, next_diff_fresh_stake, max_retarget);
+
+    // Average the two differences using scaled multiplication.
+    let next_diff = merge_difficulty(old_diff, next_diff_ticket_pool, next_diff_fresh_stake);
+
+    // Check to see if we're over the limits for the maximum allowable
+    // retarget.
+    let next_diff = clamp_v1_retarget(old_diff, next_diff, max_retarget);
+
+    // If the next diff is below the network minimum, set the required
+    // stake difficulty to the minimum.
+    if next_diff < params.minimum_stake_diff {
+        return Ok(params.minimum_stake_diff);
+    }
+    Ok(next_diff)
+}
+
+/// Estimate the next stake difficulty using the DCP0001 algorithm by
+/// pretending the given number of tickets will be purchased in the
+/// remainder of the interval, or the maximum possible number when the
+/// flag is set (dcrd `estimateNextStakeDifficultyV2`).
+pub fn estimate_next_stake_difficulty_v2(
+    view: &impl ChainView,
+    cur_node: Option<&DiffNode>,
+    new_tickets: i64,
+    use_max_tickets: bool,
+    params: &Params,
+) -> Result<i64, String> {
+    // Calculate the next retarget interval height.
+    let cur_height = cur_node.map_or(0, |n| n.height);
+    let ticket_maturity = i64::from(params.ticket_maturity);
+    let interval_size = params.stake_diff_window_size;
+    let blocks_until_retarget = interval_size - cur_height % interval_size;
+    let next_retarget_height = cur_height + blocks_until_retarget;
+
+    // Calculate the maximum possible number of tickets that could be
+    // sold in the remainder of the interval and potentially override
+    // the number of new tickets to include in the estimate per the
+    // user-specified flag.
+    let max_tickets_per_block = i64::from(params.max_fresh_stake_per_block);
+    let max_remaining_tickets = (blocks_until_retarget - 1) * max_tickets_per_block;
+    let mut new_tickets = new_tickets;
+    if use_max_tickets {
+        new_tickets = max_remaining_tickets;
+    }
+
+    // Ensure the specified number of tickets is not too high.
+    if new_tickets > max_remaining_tickets {
+        return Err(format!(
+            "unable to create an estimated stake difficulty with {new_tickets} \
+             tickets since it is more than the maximum remaining of \
+             {max_remaining_tickets}"
+        ));
+    }
+
+    // Stake difficulty before any tickets could possibly be purchased
+    // is the minimum value.
+    let stake_diff_start_height = i64::from(params.coinbase_maturity) + 1;
+    if next_retarget_height < stake_diff_start_height {
+        return Ok(params.minimum_stake_diff);
+    }
+    let cur_node = cur_node.expect("past the stake difficulty start height implies a node");
+
+    // Get the pool size and number of tickets that were immature at
+    // the previous retarget interval.
+    //
+    // NOTE: Since the stake difficulty must be calculated based on
+    // existing blocks, it is always calculated for the block after a
+    // given block, so the information for the previous retarget
+    // interval must be retrieved relative to the block just before it
+    // to coincide with how it was originally calculated.
+    let mut prev_pool_size: i64 = 0;
+    let prev_retarget_height = next_retarget_height - interval_size - 1;
+    let prev_retarget_node = view.node(prev_retarget_height);
+    if let Some(node) = &prev_retarget_node {
+        prev_pool_size = i64::from(node.pool_size);
+    }
+    let prev_immature_tickets =
+        sum_purchased_tickets(view, prev_retarget_node.map(|n| n.height), ticket_maturity);
+
+    // Return the existing ticket price for the first few intervals to
+    // avoid division by zero and encourage initial pool population.
+    let cur_diff = cur_node.sbits;
+    let prev_pool_size_all = prev_pool_size + prev_immature_tickets;
+    if prev_pool_size_all == 0 {
+        return Ok(cur_diff);
+    }
+
+    // Calculate the number of tickets that will still be immature at
+    // the next retarget based on the known (non-estimated) data.
+    //
+    // Note that when the interval size is larger than the ticket
+    // maturity, the current height might be before the maturity floor
+    // (the point after which the remaining tickets will remain
+    // immature).  There are therefore no possible remaining immature
+    // tickets from the blocks that are not being estimated in that
+    // case.
+    let mut remaining_immature_tickets: i64 = 0;
+    let next_maturity_floor = next_retarget_height - ticket_maturity - 1;
+    if cur_height > next_maturity_floor {
+        remaining_immature_tickets = sum_purchased_tickets(
+            view,
+            Some(cur_node.height),
+            cur_height - next_maturity_floor,
+        );
+    }
+
+    // Add the number of tickets that will still be immature at the
+    // next retarget based on the estimated data.
+    let max_immature_tickets = ticket_maturity * max_tickets_per_block;
+    if new_tickets > max_immature_tickets {
+        remaining_immature_tickets += max_immature_tickets;
+    } else {
+        remaining_immature_tickets += new_tickets;
+    }
+
+    // Calculate the number of tickets that will mature in the
+    // remainder of the interval based on the known (non-estimated)
+    // data.
+    //
+    // NOTE: The pool size in the block headers does not include the
+    // tickets maturing at the height in which they mature since they
+    // are not eligible for selection until the next block, so exclude
+    // them by starting one block before the next maturity floor.
+    let mut final_maturing_height = next_maturity_floor - 1;
+    if final_maturing_height > cur_height {
+        final_maturing_height = cur_height;
+    }
+    let final_maturing_node = view.node(final_maturing_height);
+    let first_maturing_height = cur_height - ticket_maturity;
+    let mut maturing_tickets = sum_purchased_tickets(
+        view,
+        final_maturing_node.map(|n| n.height),
+        final_maturing_height - first_maturing_height + 1,
+    );
+
+    // Add the number of tickets that will mature based on the
+    // estimated data.
+    //
+    // Note that when the ticket maturity is greater than or equal to
+    // the interval size, the current height will always be after the
+    // maturity floor.  There are therefore no possible maturing
+    // estimated tickets in that case.
+    if cur_height < next_maturity_floor {
+        let maturing_estimate_nodes = next_maturity_floor - cur_height - 1;
+        let mut maturing_estimated_tickets = max_tickets_per_block * maturing_estimate_nodes;
+        if maturing_estimated_tickets > new_tickets {
+            maturing_estimated_tickets = new_tickets;
+        }
+        maturing_tickets += maturing_estimated_tickets;
+    }
+
+    // Calculate the number of votes that will occur during the
+    // remainder of the interval.
+    let stake_validation_height = params.stake_validation_height;
+    let mut pending_votes: i64 = 0;
+    if next_retarget_height > stake_validation_height {
+        let mut voting_blocks = blocks_until_retarget - 1;
+        if cur_height < stake_validation_height {
+            voting_blocks = next_retarget_height - stake_validation_height;
+        }
+        let votes_per_block = i64::from(params.tickets_per_block);
+        pending_votes = voting_blocks * votes_per_block;
+    }
+
+    // Calculate what the pool size would be as of the next interval.
+    let cur_pool_size = i64::from(cur_node.pool_size);
+    let estimated_pool_size = cur_pool_size + maturing_tickets - pending_votes;
+    let estimated_pool_size_all = estimated_pool_size + remaining_immature_tickets;
+
+    // Calculate and return the final estimated difficulty.
+    Ok(calc_next_stake_diff_v2(
+        params,
+        next_retarget_height,
+        cur_diff,
+        prev_pool_size_all,
+        estimated_pool_size_all,
+    ))
 }
