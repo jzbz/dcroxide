@@ -10,7 +10,7 @@ use dcroxide_chainhash::Hash;
 use dcroxide_dcrjson::RPCError;
 use dcroxide_standalone::SubsidyCache;
 use dcroxide_uint256::Uint256;
-use dcroxide_wire::{BlockHeader, MsgBlock};
+use dcroxide_wire::{BlockHeader, MsgBlock, MsgTx};
 
 use crate::rpcerrors::rpc_internal_err;
 
@@ -56,54 +56,84 @@ impl dcroxide_standalone::SubsidyParams for RpcSubsidyParams {
 /// slice).
 pub trait RpcChain {
     /// The current best chain snapshot (dcrd `BestSnapshot`).
-    fn best_snapshot(&mut self) -> RpcBestState;
+    fn best_snapshot(&mut self) -> RpcBestState {
+        unimplemented!("best_snapshot")
+    }
     /// The hash and height of the current best known header (dcrd
     /// `BestHeader`).
-    fn best_header(&mut self) -> (Hash, i64);
+    fn best_header(&mut self) -> (Hash, i64) {
+        unimplemented!("best_header")
+    }
     /// The block with the given hash (dcrd `BlockByHash`).
-    fn block_by_hash(&mut self, hash: &Hash) -> Result<MsgBlock, String>;
+    fn block_by_hash(&mut self, _hash: &Hash) -> Result<MsgBlock, String> {
+        unimplemented!("block_by_hash")
+    }
     /// The hash of the main chain block at the given height (dcrd
     /// `BlockHashByHeight`).
-    fn block_hash_by_height(&mut self, height: i64) -> Result<Hash, String>;
+    fn block_hash_by_height(&mut self, _height: i64) -> Result<Hash, String> {
+        unimplemented!("block_hash_by_height")
+    }
     /// The current chain tips (dcrd `ChainTips`).
-    fn chain_tips(&mut self) -> Vec<RpcChainTip>;
+    fn chain_tips(&mut self) -> Vec<RpcChainTip> {
+        unimplemented!("chain_tips")
+    }
     /// The cumulative work of the block with the given hash (dcrd
     /// `ChainWork`).
-    fn chain_work(&mut self, hash: &Hash) -> Result<Uint256, String>;
+    fn chain_work(&mut self, _hash: &Hash) -> Result<Uint256, String> {
+        unimplemented!("chain_work")
+    }
     /// The header of the block with the given hash (dcrd
     /// `HeaderByHash`).
-    fn header_by_hash(&mut self, hash: &Hash) -> Result<BlockHeader, String>;
+    fn header_by_hash(&mut self, _hash: &Hash) -> Result<BlockHeader, String> {
+        unimplemented!("header_by_hash")
+    }
     /// Whether the chain believes it is current (dcrd `IsCurrent`).
-    fn is_current(&mut self) -> bool;
+    fn is_current(&mut self) -> bool {
+        unimplemented!("is_current")
+    }
     /// The headers after the first known block in the provided
     /// locators up to the stop hash (dcrd `LocateHeaders`).
-    fn locate_headers(&mut self, locators: &[Hash], hash_stop: &Hash) -> Vec<BlockHeader>;
+    fn locate_headers(&mut self, _locators: &[Hash], _hash_stop: &Hash) -> Vec<BlockHeader> {
+        unimplemented!("locate_headers")
+    }
     /// Whether the block is in the main chain (dcrd
     /// `MainChainHasBlock`).
-    fn main_chain_has_block(&mut self, hash: &Hash) -> bool;
+    fn main_chain_has_block(&mut self, _hash: &Hash) -> bool {
+        unimplemented!("main_chain_has_block")
+    }
     /// The maximum allowed block size as of the given block (dcrd
     /// `MaxBlockSize`).
-    fn max_block_size(&mut self, prev_blk_hash: &Hash) -> Result<i64, String>;
+    fn max_block_size(&mut self, _prev_blk_hash: &Hash) -> Result<i64, String> {
+        unimplemented!("max_block_size")
+    }
     /// The past median time of the block with the given hash, as unix
     /// seconds (dcrd `MedianTimeByHash`).
-    fn median_time_by_hash(&mut self, hash: &Hash) -> Result<i64, String>;
+    fn median_time_by_hash(&mut self, _hash: &Hash) -> Result<i64, String> {
+        unimplemented!("median_time_by_hash")
+    }
     /// The next threshold state of the given agenda as of the given
     /// block (dcrd `NextThresholdState`).
     fn next_threshold_state(
         &mut self,
-        prev_blk_hash: &Hash,
-        deployment_id: &str,
-    ) -> Result<crate::helpers::threshold::State, String>;
+        _prev_blk_hash: &Hash,
+        _deployment_id: &str,
+    ) -> Result<crate::helpers::threshold::State, String> {
+        unimplemented!("next_threshold_state")
+    }
     /// The height the agenda's state last changed (dcrd
     /// `StateLastChangedHeight`).
     fn state_last_changed_height(
         &mut self,
-        hash: &Hash,
-        deployment_id: &str,
-    ) -> Result<i64, String>;
+        _hash: &Hash,
+        _deployment_id: &str,
+    ) -> Result<i64, String> {
+        unimplemented!("state_last_changed_height")
+    }
     /// Whether the blake3 proof of work agenda is active (dcrd
     /// `IsBlake3PowAgendaActive`).
-    fn is_blake3_pow_agenda_active(&mut self, prev_blk_hash: &Hash) -> Result<bool, String>;
+    fn is_blake3_pow_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+        unimplemented!("is_blake3_pow_agenda_active")
+    }
     /// The expected next stake difficulty given a number of new
     /// tickets, or assuming the max possible when set (dcrd
     /// `EstimateNextStakeDifficulty`).
@@ -181,16 +211,24 @@ pub trait RpcChain {
     /// The header of the main chain block at the given height (dcrd
     /// `HeaderByHeight`; the error text only feeds the wrapped
     /// internal error).
-    fn header_by_height(&mut self, height: i64) -> Result<BlockHeader, String>;
+    fn header_by_height(&mut self, _height: i64) -> Result<BlockHeader, String> {
+        unimplemented!("header_by_height")
+    }
     /// Whether the treasury agenda is active as of the block AFTER the
     /// given block (dcrd `IsTreasuryAgendaActive`).
-    fn is_treasury_agenda_active(&mut self, prev_blk_hash: &Hash) -> Result<bool, String>;
+    fn is_treasury_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+        unimplemented!("is_treasury_agenda_active")
+    }
     /// Whether the DCP0010 subsidy split agenda is active (dcrd
     /// `IsSubsidySplitAgendaActive`).
-    fn is_subsidy_split_agenda_active(&mut self, prev_blk_hash: &Hash) -> Result<bool, String>;
+    fn is_subsidy_split_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+        unimplemented!("is_subsidy_split_agenda_active")
+    }
     /// Whether the DCP0012 subsidy split agenda is active (dcrd
     /// `IsSubsidySplitR2AgendaActive`).
-    fn is_subsidy_split_r2_agenda_active(&mut self, prev_blk_hash: &Hash) -> Result<bool, String>;
+    fn is_subsidy_split_r2_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+        unimplemented!("is_subsidy_split_r2_agenda_active")
+    }
 }
 
 /// The configuration fields the ported handlers consume (the used
@@ -209,6 +247,17 @@ pub struct Config<C> {
     pub max_protocol_version: u32,
     /// The sync manager (dcrd `SyncMgr`).
     pub sync_mgr: Box<dyn RpcSyncManager>,
+    /// The connection manager (dcrd `ConnMgr`).
+    pub conn_mgr: Box<dyn RpcConnManager>,
+    /// The mempool (dcrd `TxMempooler`).
+    pub tx_mempooler: Box<dyn RpcTxMempooler>,
+    /// The clock (dcrd `Clock`).
+    pub clock: Box<dyn RpcClock>,
+    /// The local network interface lookup used by address
+    /// normalization (dcrd resolves interface names live).
+    pub interfaces: Box<dyn crate::helpers::InterfaceLookup>,
+    /// The random nonce source (dcrd uses the global math/rand).
+    pub rand_u64: Box<dyn FnMut() -> u64>,
 }
 
 /// The sync manager operations the ported handlers perform (the used
@@ -216,8 +265,126 @@ pub struct Config<C> {
 pub trait RpcSyncManager {
     /// The latest known block height being synced to (dcrd
     /// `SyncHeight`).
-    fn sync_height(&mut self) -> i64;
+    fn sync_height(&mut self) -> i64 {
+        unimplemented!("sync_height")
+    }
 }
+
+/// The no-op stand-in for server dependencies a caller does not
+/// exercise.
+impl RpcSyncManager for () {}
+
+/// The connection manager operations the ported handlers perform
+/// (the used subset of dcrd's `rpcserver.ConnManager` interface).
+pub trait RpcConnManager {
+    /// The number of currently connected peers (dcrd
+    /// `ConnectedCount`).
+    fn connected_count(&mut self) -> i32 {
+        unimplemented!("connected_count")
+    }
+    /// The total bytes received and sent across all peers (dcrd
+    /// `NetTotals`).
+    fn net_totals(&mut self) -> (u64, u64) {
+        unimplemented!("net_totals")
+    }
+    /// Add the address as a persistent or one-try peer (dcrd
+    /// `Connect`).
+    fn connect(&mut self, _addr: &str, _permanent: bool) -> Result<(), String> {
+        unimplemented!("connect")
+    }
+    /// Remove the persistent peer with the given id (dcrd
+    /// `RemoveByID`).
+    fn remove_by_id(&mut self, _id: i32) -> Result<(), String> {
+        unimplemented!("remove_by_id")
+    }
+    /// Remove the persistent peer with the given address (dcrd
+    /// `RemoveByAddr`).
+    fn remove_by_addr(&mut self, _addr: &str) -> Result<(), String> {
+        unimplemented!("remove_by_addr")
+    }
+    /// Disconnect the peer with the given id (dcrd `DisconnectByID`).
+    fn disconnect_by_id(&mut self, _id: i32) -> Result<(), String> {
+        unimplemented!("disconnect_by_id")
+    }
+    /// Disconnect the peer with the given address (dcrd
+    /// `DisconnectByAddr`).
+    fn disconnect_by_addr(&mut self, _addr: &str) -> Result<(), String> {
+        unimplemented!("disconnect_by_addr")
+    }
+    /// The ids and addresses of the currently connected peers (the
+    /// subset of dcrd `ConnectedPeers` the ported handlers read).
+    fn connected_peers(&mut self) -> Vec<(i32, String)> {
+        unimplemented!("connected_peers")
+    }
+    /// Broadcast the message to all connected peers (dcrd
+    /// `BroadcastMessage`).
+    fn broadcast_message(&mut self, _msg: &dcroxide_wire::Message) {
+        unimplemented!("broadcast_message")
+    }
+}
+
+impl RpcConnManager for () {}
+
+/// A mempool transaction descriptor (the used subset of dcrd
+/// `mempool.TxDesc`).
+#[derive(Debug, Clone)]
+pub struct RpcMempoolTx {
+    /// The transaction.
+    pub tx: MsgTx,
+    /// The stake type of the transaction.
+    pub tx_type: dcroxide_stake::TxType,
+}
+
+/// A verbose mempool transaction descriptor (the used subset of dcrd
+/// `mempool.VerboseTxDesc`).
+#[derive(Debug, Clone)]
+pub struct RpcVerboseMempoolTx {
+    /// The transaction.
+    pub tx: MsgTx,
+    /// The stake type of the transaction.
+    pub tx_type: dcroxide_stake::TxType,
+    /// When the transaction was added to the pool, as unix seconds.
+    pub added_unix: i64,
+    /// The block height when the transaction was added.
+    pub height: i64,
+    /// The total fee in atoms.
+    pub fee: i64,
+    /// The hashes of unconfirmed pool transactions this one redeems.
+    pub depends: Vec<Hash>,
+}
+
+/// The mempool operations the ported handlers perform (the used
+/// subset of dcrd's `rpcserver.TxMempooler` interface).
+pub trait RpcTxMempooler {
+    /// The descriptors for all pool transactions (dcrd `TxDescs`).
+    fn tx_descs(&mut self) -> Vec<RpcMempoolTx> {
+        unimplemented!("tx_descs")
+    }
+    /// The verbose descriptors for all pool transactions (dcrd
+    /// `VerboseTxDescs`).
+    fn verbose_tx_descs(&mut self) -> Vec<RpcVerboseMempoolTx> {
+        unimplemented!("verbose_tx_descs")
+    }
+    /// Whether each of the transactions is in the pool (dcrd
+    /// `HaveTransactions`).
+    fn have_transactions(&mut self, _hashes: &[Hash]) -> Vec<bool> {
+        unimplemented!("have_transactions")
+    }
+}
+
+impl RpcTxMempooler for () {}
+
+/// The clock the ported handlers read (the used subset of dcrd's
+/// `rpcserver.Clock` interface).
+pub trait RpcClock {
+    /// The current time as unix milliseconds (dcrd `Clock.Now` through
+    /// the handler's millisecond conversion).
+    fn now_unix_millis(&mut self) -> i64 {
+        unimplemented!("now_unix_millis")
+    }
+}
+
+impl RpcClock for () {}
 
 /// The best chain snapshot fields the ported handlers consume (a
 /// growing subset of dcrd's `blockchain.BestState`).

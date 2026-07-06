@@ -60,7 +60,7 @@ impl InterfaceLookup for NoInterfaces {
 /// Return a host:port form of the address with the default port added
 /// when one is missing, substituting the address of a local interface
 /// when the host names one (dcrd `normalizeAddress`).
-pub fn normalize_address<L: InterfaceLookup>(
+pub fn normalize_address<L: InterfaceLookup + ?Sized>(
     lookup: &mut L,
     addr: &str,
     default_port: &str,
@@ -101,7 +101,7 @@ fn join_host_port(host: &str, port: &str) -> String {
 
 /// Go `net.SplitHostPort` success cases (errors keep the original
 /// address exactly as `normalizeAddress` does).
-fn split_host_port(hostport: &str) -> Result<(String, String), ()> {
+pub(crate) fn split_host_port(hostport: &str) -> Result<(String, String), ()> {
     if let Some(stripped) = hostport.strip_prefix('[') {
         let end = stripped.find(']').ok_or(())?;
         let rest = &stripped[end + 1..];

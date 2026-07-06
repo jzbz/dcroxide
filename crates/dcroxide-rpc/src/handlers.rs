@@ -1792,3 +1792,319 @@ pub fn handle_live_tickets<C: RpcChain>(
         lt.iter().map(|h| GoValue::String(h.to_string())).collect(),
     )]))
 }
+
+/// Go `strconv.ParseUint(s, 10, 32)` acceptance: non-empty ASCII
+/// digits without a sign, within 32 bits.
+fn go_parse_uint32(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u64>().ok().and_then(|v| u32::try_from(v).ok())
+}
+
+/// Go `net.ParseIP` acceptance for the target forms the node handler
+/// distinguishes (plain IPv4/IPv6 literals).
+fn go_parse_ip_ok(s: &str) -> bool {
+    s.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// handleaddnode (dcrd `handleAddNode`): no data unless an error.
+pub fn handle_add_node<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let (addr_arg, sub_cmd) = (s(&c[0]), s(&c[1]));
+
+    let default_port = server.cfg.chain_params.default_port;
+    let addr =
+        crate::helpers::normalize_address(&mut *server.cfg.interfaces, addr_arg, default_port);
+    let result = match sub_cmd {
+        "add" => server.cfg.conn_mgr.connect(&addr, true),
+        "remove" => server.cfg.conn_mgr.remove_by_addr(&addr),
+        "onetry" => server.cfg.conn_mgr.connect(&addr, false),
+        _ => return Err(rpc_invalid_error("Invalid subcommand for addnode")),
+    };
+
+    result.map_err(|e| rpc_invalid_error(&format!("{sub_cmd}: {e}")))?;
+
+    // No data returned unless an error.
+    Ok(GoValue::Null)
+}
+
+/// Whether a peer with the given address or id is currently connected
+/// (dcrd `peerExists`).
+fn peer_exists<C: RpcChain>(server: &mut Server<C>, addr: &str, node_id: i32) -> bool {
+    server
+        .cfg
+        .conn_mgr
+        .connected_peers()
+        .iter()
+        .any(|(id, peer_addr)| *id == node_id || peer_addr == addr)
+}
+
+/// handlenode (dcrd `handleNode`): no data unless an error.
+pub fn handle_node<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let (sub_cmd, target) = (s(&c[0]).to_string(), s(&c[1]).to_string());
+    let connect_sub_cmd = match &c[2] {
+        GoValue::Null => None,
+        GoValue::String(s) => Some(s.clone()),
+        other => panic!("expected optional string field, got {other:?}"),
+    };
+
+    let default_port = server.cfg.chain_params.default_port;
+    let mut addr = String::new();
+    let mut node_id: u32 = 0;
+    let result = match sub_cmd.as_str() {
+        "disconnect" => {
+            // If we have a valid uint disconnect by node id.  Otherwise,
+            // attempt to disconnect by address, returning an error if a
+            // valid IP address is not supplied.
+            if let Some(id) = go_parse_uint32(&target) {
+                node_id = id;
+                server.cfg.conn_mgr.disconnect_by_id(id as i32)
+            } else if crate::helpers::split_host_port(&target).is_ok() || go_parse_ip_ok(&target) {
+                addr = crate::helpers::normalize_address(
+                    &mut *server.cfg.interfaces,
+                    &target,
+                    default_port,
+                );
+                server.cfg.conn_mgr.disconnect_by_addr(&addr)
+            } else {
+                return Err(rpc_invalid_error(&format!(
+                    "{sub_cmd}: Invalid address or node ID"
+                )));
+            }
+        }
+        "remove" => {
+            if let Some(id) = go_parse_uint32(&target) {
+                node_id = id;
+                server.cfg.conn_mgr.remove_by_id(id as i32)
+            } else if crate::helpers::split_host_port(&target).is_ok() || go_parse_ip_ok(&target) {
+                addr = crate::helpers::normalize_address(
+                    &mut *server.cfg.interfaces,
+                    &target,
+                    default_port,
+                );
+                server.cfg.conn_mgr.remove_by_addr(&addr)
+            } else {
+                return Err(rpc_invalid_error(&format!(
+                    "{sub_cmd}: invalid address or node ID"
+                )));
+            }
+        }
+        "connect" => {
+            addr = crate::helpers::normalize_address(
+                &mut *server.cfg.interfaces,
+                &target,
+                default_port,
+            );
+
+            // Default to temporary connections.
+            let sub = connect_sub_cmd.as_deref().unwrap_or("temp");
+            match sub {
+                "perm" | "temp" => server.cfg.conn_mgr.connect(&addr, sub == "perm"),
+                _ => {
+                    return Err(rpc_invalid_error(&format!(
+                        "{sub}: invalid subcommand for node connect"
+                    )));
+                }
+            }
+        }
+        _ => {
+            return Err(rpc_invalid_error(&format!(
+                "{sub_cmd}: invalid subcommand for node"
+            )));
+        }
+    };
+
+    if let Err(err) = result {
+        // The permanence hints only apply when the peer is known.
+        if peer_exists(server, &addr, node_id as i32) {
+            match sub_cmd.as_str() {
+                "disconnect" => {
+                    return Err(crate::rpcerrors::rpc_misc_error(
+                        "can't disconnect a permanent peer, use remove",
+                    ));
+                }
+                "remove" => {
+                    return Err(crate::rpcerrors::rpc_misc_error(
+                        "can't remove a temporary peer, use disconnect",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        return Err(rpc_invalid_error(&format!("{sub_cmd}: {err}")));
+    }
+
+    // No data returned unless an error.
+    Ok(GoValue::Null)
+}
+
+/// handlegetconnectioncount (dcrd `handleGetConnectionCount`).
+pub fn handle_get_connection_count<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    Ok(GoValue::Int(i64::from(
+        server.cfg.conn_mgr.connected_count(),
+    )))
+}
+
+/// handlegetnettotals (dcrd `handleGetNetTotals`); the result is a
+/// `GetNetTotalsResult` value.
+pub fn handle_get_net_totals<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let (total_bytes_recv, total_bytes_sent) = server.cfg.conn_mgr.net_totals();
+    Ok(GoValue::Struct(vec![
+        GoValue::Uint(total_bytes_recv),
+        GoValue::Uint(total_bytes_sent),
+        GoValue::Int(server.cfg.clock.now_unix_millis()),
+    ]))
+}
+
+/// handleping (dcrd `handlePing`): asks the server to ping all peers.
+pub fn handle_ping<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let nonce = (server.cfg.rand_u64)();
+    server
+        .cfg
+        .conn_mgr
+        .broadcast_message(&Message::Ping(dcroxide_wire::MsgPing { nonce }));
+    Ok(GoValue::Null)
+}
+
+/// handlegetmempoolinfo (dcrd `handleGetMempoolInfo`); the result is
+/// a `GetMempoolInfoResult` value.
+pub fn handle_get_mempool_info<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let mempool_txns = server.cfg.tx_mempooler.tx_descs();
+
+    let mut num_bytes: i64 = 0;
+    for tx_d in &mempool_txns {
+        num_bytes += tx_d.tx.serialize_size() as i64;
+    }
+
+    Ok(GoValue::Struct(vec![
+        GoValue::Int(mempool_txns.len() as i64),
+        GoValue::Int(num_bytes),
+    ]))
+}
+
+/// handlegetrawmempool (dcrd `handleGetRawMempool`); the verbose
+/// result is a map of `GetRawMempoolVerboseResult` values keyed by
+/// transaction hash and the plain result is the hash list.
+pub fn handle_get_raw_mempool<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let verbose = opt_bool(&c[0]);
+    let tx_type_arg = match &c[1] {
+        GoValue::Null => None,
+        GoValue::String(s) => Some(s.as_str()),
+        other => panic!("expected optional string field, got {other:?}"),
+    };
+
+    // Choose the type to filter the results by based on the provided
+    // param.  A filter type of None means no filtering.
+    use dcroxide_stake::TxType;
+    let mut filter_type: Option<TxType> = None;
+    if let Some(tx_type) = tx_type_arg {
+        match tx_type {
+            "regular" => filter_type = Some(TxType::Regular),
+            "tickets" => filter_type = Some(TxType::SStx),
+            "votes" => filter_type = Some(TxType::SSGen),
+            "revocations" => filter_type = Some(TxType::SSRtx),
+            "tspend" => filter_type = Some(TxType::TSpend),
+            "tadd" => filter_type = Some(TxType::TAdd),
+            "all" => {}
+            other => {
+                return Err(rpc_invalid_error(&format!(
+                    "Invalid transaction type: {other} -- supported types: \
+                     [regular tickets votes revocations tspend tadd all]"
+                )));
+            }
+        }
+    }
+
+    // Return verbose results if requested.
+    if matches!(verbose, Some(true)) {
+        let descs = server.cfg.tx_mempooler.verbose_tx_descs();
+        let mut result: Vec<(String, GoValue)> = Vec::with_capacity(descs.len());
+        for desc in &descs {
+            if let Some(filter) = filter_type
+                && desc.tx_type != filter
+            {
+                continue;
+            }
+
+            let depends: Vec<GoValue> = desc
+                .depends
+                .iter()
+                .map(|h| GoValue::String(h.to_string()))
+                .collect();
+            result.push((
+                desc.tx.tx_hash().to_string(),
+                GoValue::Struct(vec![
+                    GoValue::Int(desc.tx.serialize_size() as i64),
+                    GoValue::Float64(txresults::to_coin(desc.fee)),
+                    GoValue::Int(desc.added_unix),
+                    GoValue::Int(desc.height),
+                    GoValue::Float64(0.0),
+                    GoValue::Float64(0.0),
+                    GoValue::Array(depends),
+                ]),
+            ));
+        }
+
+        return Ok(GoValue::Map(result));
+    }
+
+    // The response is simply an array of the transaction hashes if the
+    // verbose flag is not set.
+    let descs = server.cfg.tx_mempooler.tx_descs();
+    let mut hash_strings = Vec::with_capacity(descs.len());
+    for desc in &descs {
+        if let Some(filter) = filter_type
+            && desc.tx_type != filter
+        {
+            continue;
+        }
+        hash_strings.push(GoValue::String(desc.tx.tx_hash().to_string()));
+    }
+    Ok(GoValue::Array(hash_strings))
+}
+
+/// handleexistsmempooltxs (dcrd `handleExistsMempoolTxs`): the
+/// existence bits as a compacted hex string.
+pub fn handle_exists_mempool_txs<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let hash_strs: Vec<String> = array(&c[0]).iter().map(|v| s(v).to_string()).collect();
+    let hashes = crate::helpers::decode_hash_pointers(&hash_strs)?;
+
+    let exists = server.cfg.tx_mempooler.have_transactions(&hashes);
+    if exists.len() != hashes.len() {
+        return Err(rpc_internal_err(&format!(
+            "got {}, want {}",
+            exists.len(),
+            hashes.len()
+        )));
+    }
+
+    Ok(GoValue::String(hex_str(&bitset_bytes(&exists))))
+}

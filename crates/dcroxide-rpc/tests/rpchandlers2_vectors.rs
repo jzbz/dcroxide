@@ -468,6 +468,11 @@ fn chain_query_handler_slice_matches_dcrd() {
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(MockSyncManager(mock[14].parse().unwrap())),
+            conn_mgr: Box::new(()),
+            tx_mempooler: Box::new(()),
+            clock: Box::new(()),
+            interfaces: Box::new(dcroxide_rpc::helpers::NoInterfaces),
+            rand_u64: Box::new(|| 0),
         });
 
         match dispatch(&mut server, method_name, &cmd) {
