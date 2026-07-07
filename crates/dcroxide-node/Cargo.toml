@@ -1,0 +1,21 @@
+[package]
+name = "dcroxide-node"
+description = "Daemon assembly mirroring dcrd's package main, starting with the configuration pipeline"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-mempool = { path = "../dcroxide-mempool" }
+dcroxide-rpc = { path = "../dcroxide-rpc" }
+dcroxide-txscript = { path = "../dcroxide-txscript" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

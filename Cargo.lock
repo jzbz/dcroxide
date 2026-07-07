@@ -431,6 +431,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-node"
+version = "0.1.0"
+dependencies = [
+ "dcroxide-chaincfg",
+ "dcroxide-mempool",
+ "dcroxide-rpc",
+ "dcroxide-txscript",
+ "tempfile",
+]
+
+[[package]]
 name = "dcroxide-peer"
 version = "0.1.0"
 dependencies = [
