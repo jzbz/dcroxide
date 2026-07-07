@@ -1871,3 +1871,123 @@ pub fn serve_get_data(
         pending_decrements,
     }
 }
+
+/// The maximum number of head block hashes per init state message
+/// (dcrd `wire.MaxISBlocksAtHeadPerMsg`).
+pub const MAX_IS_BLOCKS_AT_HEAD: usize = 8;
+
+/// The maximum number of vote hashes per init state message (dcrd
+/// `wire.MaxISVotesAtHeadPerMsg`).
+pub const MAX_IS_VOTES_AT_HEAD: usize = 40;
+
+/// The maximum number of treasury spend hashes per init state message
+/// (dcrd `wire.MaxISTSpendsAtHeadPerMsg`).
+pub const MAX_IS_TSPENDS_AT_HEAD: usize = 7;
+
+/// What the init state handler decided to send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnGetInitStateOutcome {
+    /// The init state was already sent on this connection; the
+    /// request is ignored.
+    AlreadySent,
+    /// An empty init state message, sent when the chain has not yet
+    /// reached stake validation so there is nothing interesting to
+    /// advertise.
+    Blank,
+    /// The filled init state response with the requested hashes.
+    Filled {
+        /// Head block hashes (at most eight).
+        block_hashes: Vec<dcroxide_chainhash::Hash>,
+        /// Vote hashes for the head blocks.
+        vote_hashes: Vec<dcroxide_chainhash::Hash>,
+        /// Mempool treasury spend hashes.
+        tspend_hashes: Vec<dcroxide_chainhash::Hash>,
+    },
+    /// The filled message exceeded a wire limit, so dcrd logs the
+    /// error and sends nothing.
+    BuildError,
+}
+
+/// The requested-type flags parsed from a getinitstate message.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InitStateWants {
+    /// Whether head block hashes were requested.
+    pub blocks: bool,
+    /// Whether head block vote hashes were requested.
+    pub votes: bool,
+    /// Whether mempool treasury spend hashes were requested.
+    pub tspends: bool,
+}
+
+/// Assemble the init state response: ignore duplicate requests on a
+/// connection, send an empty message before stake validation, and
+/// otherwise fill the requested head blocks (capped), their votes,
+/// and the mempool treasury spends, clearing the head blocks when
+/// only votes were requested and reporting the over-limit build
+/// failure dcrd swallows (dcrd `serverPeer.OnGetInitState`).  The
+/// eligible blocks come from the ported `SortParentsByVotes`, the
+/// votes from the mempool's `VoteHashesForBlock`, and the treasury
+/// spends from `TSpendHashes` — all seams supplied by the caller.
+pub fn on_get_init_state(
+    init_state_sent: bool,
+    best_height: i64,
+    stake_validation_height: i64,
+    wants: InitStateWants,
+    eligible_blocks: &[dcroxide_chainhash::Hash],
+    votes_for: impl Fn(&dcroxide_chainhash::Hash) -> Vec<dcroxide_chainhash::Hash>,
+    tspends: &[dcroxide_chainhash::Hash],
+) -> OnGetInitStateOutcome {
+    if init_state_sent {
+        return OnGetInitStateOutcome::AlreadySent;
+    }
+
+    // Send an empty init state message early in the chain.
+    if best_height < stake_validation_height - 1 {
+        return OnGetInitStateOutcome::Blank;
+    }
+
+    // Fetch head block hashes if either they or their votes are
+    // wanted, capping the list.
+    let mut block_hashes = Vec::new();
+    if wants.blocks || wants.votes {
+        block_hashes = eligible_blocks.to_vec();
+        if block_hashes.len() > MAX_IS_BLOCKS_AT_HEAD {
+            block_hashes.truncate(MAX_IS_BLOCKS_AT_HEAD);
+        }
+    }
+
+    // Construct the votes for the head blocks.
+    let mut vote_hashes = Vec::new();
+    if wants.votes {
+        for bh in &block_hashes {
+            vote_hashes.extend(votes_for(bh));
+        }
+    }
+
+    // Construct the treasury spends.
+    let tspend_hashes = if wants.tspends {
+        tspends.to_vec()
+    } else {
+        Vec::new()
+    };
+
+    // Clear the head blocks when they were not themselves requested.
+    if !wants.blocks {
+        block_hashes.clear();
+    }
+
+    // dcrd builds the message with per-list limits and logs and drops
+    // the response when any is exceeded.
+    if block_hashes.len() > MAX_IS_BLOCKS_AT_HEAD
+        || vote_hashes.len() > MAX_IS_VOTES_AT_HEAD
+        || tspend_hashes.len() > MAX_IS_TSPENDS_AT_HEAD
+    {
+        return OnGetInitStateOutcome::BuildError;
+    }
+
+    OnGetInitStateOutcome::Filled {
+        block_hashes,
+        vote_hashes,
+        tspend_hashes,
+    }
+}
