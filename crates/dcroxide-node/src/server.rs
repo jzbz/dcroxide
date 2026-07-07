@@ -782,3 +782,160 @@ pub fn on_not_found(
     }
     OnNotFoundOutcome::Forward
 }
+
+/// The default number of mix-capable outbound peers to maintain
+/// (dcrd `defaultWantMixCapableOutbound`).
+const DEFAULT_WANT_MIX_CAPABLE_OUTBOUND: u32 = 3;
+
+/// The early rejections of a version message (dcrd
+/// `serverPeer.OnVersion` returns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionRejection {
+    /// The protocol version predates the required minimum.
+    OldProtocol,
+    /// An outbound peer does not provide the required services.
+    MissingServices,
+}
+
+/// The peer and configuration facts the version handler consumes.
+pub struct OnVersionFacts {
+    /// Whether the peer is inbound.
+    pub inbound: bool,
+    /// Whether the simulation or regression test network is active.
+    pub sim_or_reg_net: bool,
+    /// Whether listening is disabled.
+    pub disable_listen: bool,
+    /// Whether the sync manager believes the chain is current.
+    pub sync_is_current: bool,
+    /// The current outbound peer count (dcrd walks the peer state).
+    pub num_outbound: u32,
+    /// The mix-capable outbound peer count.
+    pub num_mix_capable_outbound: u32,
+    /// The configured outbound connection target.
+    pub target_outbound: u32,
+    /// The peer's network address (dcrd `sp.NA()`).
+    pub remote_na: dcroxide_wire::NetAddress,
+}
+
+/// The observable outcome of handling a version message (dcrd
+/// `serverPeer.OnVersion`); the caller stores the peer address,
+/// adds the time sample, and runs the add-peer admission.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OnVersionOutcome {
+    /// Whether the advertised services were forwarded to the
+    /// address manager.
+    pub set_services: bool,
+    /// An early rejection; the peer disconnects and nothing below
+    /// applies.
+    pub rejected: Option<VersionRejection>,
+    /// The peer was disconnected to maintain mix-capable outbound
+    /// peers; dcrd deliberately continues processing afterwards.
+    pub mix_disconnect: bool,
+    /// The local address advertisement pushed to the peer, if any.
+    pub pushed_local: Option<PushAddrOutcome>,
+    /// Whether a getaddr request was queued for more addresses.
+    pub requested_more_addrs: bool,
+    /// Whether the peer's address was marked good.
+    pub marked_good: bool,
+    /// Whether the peer disabled transaction relay.
+    pub disable_relay_tx: bool,
+}
+
+/// Handle a version message (dcrd `serverPeer.OnVersion`).
+#[allow(clippy::too_many_arguments)] // Mirrors dcrd's surface.
+pub fn on_version<E: dcroxide_peer::PeerEnv>(
+    state: &mut ServerPeerAddrState,
+    peer: &mut dcroxide_peer::Peer,
+    env: &mut E,
+    addr_mgr: &mut AddrManager,
+    facts: &OnVersionFacts,
+    msg_protocol_version: i32,
+    msg_services: ServiceFlag,
+    msg_disable_relay_tx: bool,
+) -> OnVersionOutcome {
+    let mut outcome = OnVersionOutcome {
+        set_services: false,
+        rejected: None,
+        mix_disconnect: false,
+        pushed_local: None,
+        requested_more_addrs: false,
+        marked_good: false,
+        disable_relay_tx: false,
+    };
+
+    // Update the address manager with the advertised services for
+    // outbound connections; skipped for inbound connections and on
+    // the simulation and regression test networks.  This happens
+    // before rejecting peers that are too old.
+    let remote_addr = wire_to_addrmgr_net_address(&facts.remote_na);
+    if !facts.sim_or_reg_net && !facts.inbound {
+        // A lookup failure is logged and ignored.
+        let _ = addr_mgr.set_services(&remote_addr, msg_services);
+        outcome.set_services = true;
+    }
+
+    // Reject peers that have a protocol version that is too old.
+    if msg_protocol_version < dcroxide_wire::REMOVE_REJECT_VERSION as i32 {
+        outcome.rejected = Some(VersionRejection::OldProtocol);
+        return outcome;
+    }
+
+    // Maintain a minimum desired number of outbound peers capable
+    // of supporting p2p mixing.  Note that dcrd disconnects here
+    // without returning, so processing deliberately continues.
+    if !facts.inbound && msg_protocol_version < dcroxide_wire::MIX_VERSION as i32 {
+        let mut want_mix_capable = DEFAULT_WANT_MIX_CAPABLE_OUTBOUND;
+        if facts.target_outbound < want_mix_capable {
+            want_mix_capable = facts.target_outbound;
+        }
+        let has_min = facts.num_mix_capable_outbound >= want_mix_capable;
+        let needs_more = !has_min && facts.num_outbound + want_mix_capable >= facts.target_outbound;
+        if needs_more {
+            outcome.mix_disconnect = true;
+        }
+    }
+
+    // Reject outbound peers that are not full nodes.
+    let want_services = ServiceFlag::NODE_NETWORK;
+    if !facts.inbound && !has_services(msg_services, want_services) {
+        outcome.rejected = Some(VersionRejection::MissingServices);
+        return outcome;
+    }
+
+    // Update the address manager and request known addresses from
+    // the remote peer for outbound connections; skipped on the
+    // simulation and regression test networks.
+    if !facts.sim_or_reg_net && !facts.inbound {
+        // Advertise the local address when the server accepts
+        // incoming connections and it believes itself to be close
+        // to the best known tip.
+        if !facts.disable_listen && facts.sync_is_current {
+            let filter = natf_supported(msg_protocol_version as u32);
+            let lna = addr_mgr.get_best_local_address(&remote_addr, filter);
+            if lna.is_routable() {
+                outcome.pushed_local = Some(push_addr_msg(state, peer, env, &[lna]));
+            }
+        }
+
+        // Request known addresses if the server address manager
+        // needs more.
+        if addr_mgr.need_more_addresses() {
+            outcome.requested_more_addrs = true;
+        }
+
+        // Mark the address as a known good address; a failure is
+        // logged and ignored.
+        outcome.marked_good = addr_mgr.good(&remote_addr).is_ok();
+    }
+
+    // The caller stores the advertised address and time sample and
+    // chooses whether or not to relay transactions.
+    outcome.disable_relay_tx = msg_disable_relay_tx;
+    outcome
+}
+
+/// Handle a verack message (dcrd `serverPeer.OnVerAck`): request
+/// all block announcements via full headers.
+pub fn on_ver_ack() -> dcroxide_wire::Message {
+    dcroxide_wire::Message::SendHeaders
+}
