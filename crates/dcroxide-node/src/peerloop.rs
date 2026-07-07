@@ -19,6 +19,8 @@
 //! caller on the underlying stream (`TcpStream::set_read_timeout`); a
 //! read timeout ends the loop exactly like dcrd's idle disconnect.
 
+use std::sync::mpsc;
+
 use dcroxide_peer::{MsgTransport, Peer, PeerEnv};
 use dcroxide_wire::Message;
 
@@ -38,7 +40,7 @@ pub enum IncomingAction {
     },
 }
 
-/// Why the input loop stopped.
+/// Why an input or output loop stopped.
 #[derive(Debug)]
 pub enum DisconnectReason {
     /// A protocol violation with dcrd's reason string.
@@ -46,8 +48,11 @@ pub enum DisconnectReason {
     /// Reading the next message failed (a closed connection or an idle
     /// read timeout).
     ReadError(String),
-    /// Writing a protocol reply failed.
+    /// Writing a message failed.
     WriteError(String),
+    /// The outbound queue was closed, so the output loop finished (a
+    /// locally initiated shutdown).
+    LocalShutdown,
 }
 
 /// Give an incoming message its protocol-level handling, updating the
@@ -129,6 +134,49 @@ where
             }
         }
     }
+}
+
+/// A handle for originating messages to a peer (dcrd `QueueMessage`).
+///
+/// The server, the input pump's replies, and the ping timer send
+/// through clones of this handle; a single output loop drains the
+/// receiver and does the actual writing, so all writes to the
+/// connection are serialized on one thread.  dcrd's separate inventory
+/// trickle queue (`QueueInventory`) and the send semaphore are
+/// refinements that arrive later; this is the plain message queue.
+#[derive(Clone)]
+pub struct OutboundQueue {
+    sender: mpsc::Sender<Message>,
+}
+
+impl OutboundQueue {
+    /// Create an outbound queue and the receiver its output loop drains.
+    pub fn channel() -> (OutboundQueue, mpsc::Receiver<Message>) {
+        let (sender, receiver) = mpsc::channel();
+        (OutboundQueue { sender }, receiver)
+    }
+
+    /// Queue a message to be sent to the peer.  Fails only once the
+    /// output loop has stopped and dropped the receiver.
+    pub fn queue_message(&self, msg: Message) -> Result<(), String> {
+        self.sender
+            .send(msg)
+            .map_err(|_| "peer output queue is closed".to_string())
+    }
+}
+
+/// Write queued messages to the peer until the outbound queue is closed
+/// or a write fails (dcrd's `outHandler` draining the send queue).
+pub fn run_peer_output<T: MsgTransport>(
+    transport: &mut T,
+    outbound: mpsc::Receiver<Message>,
+) -> DisconnectReason {
+    while let Ok(msg) = outbound.recv() {
+        if let Err(e) = transport.write_message(&msg) {
+            return DisconnectReason::WriteError(e);
+        }
+    }
+    DisconnectReason::LocalShutdown
 }
 
 #[cfg(test)]

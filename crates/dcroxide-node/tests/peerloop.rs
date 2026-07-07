@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: ISC
-//! Integration check for the per-peer input pump: after the version
-//! handshake, the inbound peer sends its verack and runs the input loop,
-//! marking the remote's verack, answering a ping with a pong, and
-//! forwarding every message, over a real loopback TCP connection.
+//! Integration checks for the per-peer input pump and output handler:
+//! after the version handshake the inbound peer sends its verack and
+//! runs the input loop, marking the remote's verack, answering a ping
+//! with a pong, and forwarding every message; and the output handler
+//! drains an outbound queue to the connection in order, all over real
+//! loopback TCP connections.
 
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
 use dcroxide_node::peerconn::{NodePeerEnv, net_address_from_socket};
-use dcroxide_node::peerloop::{run_peer_input, send_verack};
+use dcroxide_node::peerloop::{OutboundQueue, run_peer_input, run_peer_output, send_verack};
 use dcroxide_node::transport::WireTransport;
 use dcroxide_peer::{Config, MAX_PROTOCOL_VERSION, MsgTransport, Peer, PeerEnv, PeerGlobals};
-use dcroxide_wire::{CurrencyNet, Message, MsgPing, ServiceFlag};
+use dcroxide_wire::{CurrencyNet, Message, MsgPing, MsgPong, ServiceFlag};
 
 const NET: CurrencyNet = CurrencyNet::TEST_NET3;
 
@@ -106,4 +108,56 @@ fn inbound_peer_completes_verack_and_answers_a_ping() {
     );
     // The loop ended because the client closed the connection.
     assert!(reason.contains("ReadError"), "disconnect reason: {reason}");
+}
+
+#[test]
+fn output_handler_writes_queued_messages_in_order_then_shuts_down() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let client = TcpStream::connect(addr).expect("dial the listener");
+    let (server, _remote) = listener.accept().expect("accept connection");
+    server
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+
+    // Queue a couple of messages, then drop the queue so the writer
+    // finishes once they are drained.
+    let (queue, outbound) = OutboundQueue::channel();
+    queue.queue_message(Message::VerAck).expect("queue verack");
+    queue
+        .queue_message(Message::Ping(MsgPing { nonce: 0x51 }))
+        .expect("queue ping");
+    drop(queue);
+
+    let writer = thread::spawn(move || {
+        let mut transport = WireTransport::new(client, MAX_PROTOCOL_VERSION, NET);
+        run_peer_output(&mut transport, outbound)
+    });
+
+    // The reader sees the queued messages arrive in the order they were
+    // queued.
+    let mut reader = WireTransport::new(server, MAX_PROTOCOL_VERSION, NET);
+    assert_eq!(reader.read_message().expect("read verack"), Message::VerAck);
+    assert_eq!(
+        reader.read_message().expect("read ping"),
+        Message::Ping(MsgPing { nonce: 0x51 })
+    );
+
+    // The writer stopped because the queue was closed, not from an error.
+    let reason = format!("{:?}", writer.join().expect("writer thread"));
+    assert!(
+        reason.contains("LocalShutdown"),
+        "disconnect reason: {reason}"
+    );
+}
+
+#[test]
+fn queue_message_fails_once_the_output_loop_has_stopped() {
+    let (queue, outbound) = OutboundQueue::channel();
+    // Dropping the receiver ends any output loop and closes the queue.
+    drop(outbound);
+    let err = queue
+        .queue_message(Message::Pong(MsgPong { nonce: 1 }))
+        .expect_err("queueing to a closed queue fails");
+    assert!(err.contains("closed"), "error: {err}");
 }
