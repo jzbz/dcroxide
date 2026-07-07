@@ -19,6 +19,7 @@ pub mod logsubsys;
 pub mod params;
 pub mod runtime;
 pub mod server;
+pub mod transport;
 pub mod version;
 
 pub use config::{
