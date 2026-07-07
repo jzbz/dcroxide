@@ -19,7 +19,9 @@ dcroxide-standalone = { path = "../dcroxide-standalone" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-uint256 = { path = "../dcroxide-uint256" }
 dcroxide-wire = { path = "../dcroxide-wire" }
+hmac = "0.12"
 num-bigint = { version = "0.4", default-features = false }
+sha2 = "0.10"
 
 [dev-dependencies]
 dcroxide-testutil = { path = "../dcroxide-testutil" }

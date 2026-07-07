@@ -455,7 +455,9 @@ dependencies = [
  "dcroxide-txscript",
  "dcroxide-uint256",
  "dcroxide-wire",
+ "hmac",
  "num-bigint",
+ "sha2",
 ]
 
 [[package]]

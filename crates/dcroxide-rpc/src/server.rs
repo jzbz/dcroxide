@@ -517,6 +517,14 @@ pub struct Config<C> {
     /// Whether mining is allowed without being connected and synced
     /// (dcrd `AllowUnsyncedMining`).
     pub allow_unsynced_mining: bool,
+    /// The admin RPC username (dcrd `RPCUser`).
+    pub rpc_user: String,
+    /// The admin RPC password (dcrd `RPCPass`).
+    pub rpc_pass: String,
+    /// The limited RPC username (dcrd `RPCLimitUser`).
+    pub rpc_limit_user: String,
+    /// The limited RPC password (dcrd `RPCLimitPass`).
+    pub rpc_limit_pass: String,
 }
 
 /// A per-network reachability description (dcrd carries
@@ -1202,6 +1210,14 @@ pub struct Server<C> {
     pub registry: dcroxide_dcrjson::Registry,
     /// The help text cacher (dcrd `helpCacher`).
     pub(crate) help_cacher: crate::help::HelpCacher,
+    /// The random key for the auth HMAC (dcrd draws it from
+    /// crypto/rand at construction).
+    pub(crate) hmac_key: [u8; 32],
+    /// The HMAC of the admin Basic auth string (dcrd `authsha`).
+    pub(crate) authsha: [u8; 32],
+    /// The HMAC of the limited-user Basic auth string (dcrd
+    /// `limitauthsha`).
+    pub(crate) limitauthsha: [u8; 32],
 }
 
 /// The getwork request/submission state (dcrd `workState`).
@@ -1222,14 +1238,40 @@ impl<C: RpcChain> Server<C> {
     /// A new server over the given configuration (the used subset of
     /// dcrd `New`).
     pub fn new(cfg: Config<C>) -> Server<C> {
+        let mut cfg = cfg;
         let mut registry = dcroxide_dcrjson::Registry::new();
         dcroxide_rpctypes::register_all(&mut registry);
-        Server {
+
+        // The auth HMAC key (dcrd reads it from crypto/rand); the
+        // stored MACs only ever compare against MACs under the same
+        // key, so the configured randomness source decides.
+        let mut hmac_key = [0u8; 32];
+        for chunk in hmac_key.chunks_mut(8) {
+            chunk.copy_from_slice(&(cfg.rand_u64)().to_le_bytes());
+        }
+        let mut server = Server {
             cfg,
             work_state: WorkState::default(),
             registry,
             help_cacher: crate::help::HelpCacher::new(),
+            hmac_key,
+            authsha: [0u8; 32],
+            limitauthsha: [0u8; 32],
+        };
+        if !server.cfg.rpc_user.is_empty() && !server.cfg.rpc_pass.is_empty() {
+            let login = format!("{}:{}", server.cfg.rpc_user, server.cfg.rpc_pass);
+            let auth = format!("Basic {}", crate::http::base64_std_encode(login.as_bytes()));
+            server.authsha = crate::http::auth_mac(&server.hmac_key, auth.as_bytes());
         }
+        if !server.cfg.rpc_limit_user.is_empty() && !server.cfg.rpc_limit_pass.is_empty() {
+            let login = format!(
+                "{}:{}",
+                server.cfg.rpc_limit_user, server.cfg.rpc_limit_pass
+            );
+            let auth = format!("Basic {}", crate::http::base64_std_encode(login.as_bytes()));
+            server.limitauthsha = crate::http::auth_mac(&server.hmac_key, auth.as_bytes());
+        }
+        server
     }
 
     /// Whether the treasury agenda is active as of the block AFTER the

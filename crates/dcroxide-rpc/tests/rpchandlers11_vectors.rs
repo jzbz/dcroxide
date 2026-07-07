@@ -354,6 +354,10 @@ fn getwork_handler_matches_dcrd() {
             services: 0,
             request_shutdown: Box::new(|| {}),
             allow_unsynced_mining: scen[5] == "true",
+            rpc_user: String::new(),
+            rpc_pass: String::new(),
+            rpc_limit_user: String::new(),
+            rpc_limit_pass: String::new(),
         });
 
         // Run the scenario's steps against the shared server.

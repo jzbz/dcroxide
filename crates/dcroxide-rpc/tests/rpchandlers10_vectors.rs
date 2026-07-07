@@ -321,6 +321,10 @@ fn treasury_spend_votes_handler_matches_dcrd() {
             services: 0,
             request_shutdown: Box::new(|| {}),
             allow_unsynced_mining: false,
+            rpc_user: String::new(),
+            rpc_pass: String::new(),
+            rpc_limit_user: String::new(),
+            rpc_limit_pass: String::new(),
         });
 
         match handlers::handle_get_treasury_spend_votes(&mut server, &cmd) {

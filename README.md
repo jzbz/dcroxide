@@ -161,7 +161,9 @@ Currently implemented:
   submission/control, fee-info/node-info, mining/network/mix, and
   treasury-vote, getwork, and help commands — all 77 dcrd
   handlers) plus the request dispatch core (parse, route, reply
-  marshalling, and the limited-user gate) over a Server scaffold
+  marshalling, and the limited-user gate), Basic auth over HMAC'd
+  credentials, and the single/batched request body processing over
+  a Server scaffold
   with the chain, mempool, sync and
   connection managers, indexes, database, filterer, log manager, fee
   estimator, sanity checker, time source, CPU miner, mix pooler,

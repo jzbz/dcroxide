@@ -437,6 +437,10 @@ fn tx_utxo_handler_slice_matches_dcrd() {
             services: 0,
             request_shutdown: Box::new(|| {}),
             allow_unsynced_mining: false,
+            rpc_user: String::new(),
+            rpc_pass: String::new(),
+            rpc_limit_user: String::new(),
+            rpc_limit_pass: String::new(),
         });
 
         match dispatch(&mut server, method_name, &cmd) {
