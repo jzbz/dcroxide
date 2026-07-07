@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: ISC
-//! The P2P server's address bookkeeping (the first slice of dcrd's
+//! The P2P server's decision core (the ported slices of dcrd's
 //! `server.go`): the bounded network address submission cache fed by
 //! outbound peers, the best-suggestion local address resolution, the
-//! host-to-network-address conversion, and the wire/address-manager
-//! conversion and service helpers.  The server struct itself, the
-//! peer handlers, and the relay machinery arrive with later slices.
+//! host-to-network-address conversion, the wire/address-manager
+//! conversion and service helpers, the serverPeer address relay,
+//! ban, and abuse-control handlers, the version handshake, the peer
+//! state maps and admission, and the relay and broadcast decisions.
+//! The chain-backed handlers, the mining and mix handlers, the
+//! rebroadcast prune, and the server lifecycle arrive with later
+//! slices.
 
 // Bounded cache and majority arithmetic mirroring Go.
 #![allow(clippy::arithmetic_side_effects)]
@@ -1398,4 +1402,161 @@ pub fn is_whitelisted(whitelists: &[crate::config::IpNet], addr: &str) -> bool {
     };
 
     whitelists.iter().any(|ipnet| ipnet.contains(&ip))
+}
+
+/// The negotiated peer facts the relay handler consumes (dcrd reads
+/// them off the live `serverPeer`).
+pub struct RelayPeerFacts {
+    /// Whether the peer is connected (dcrd `sp.Connected()`).
+    pub connected: bool,
+    /// The services the peer advertised (dcrd `sp.Services()`).
+    pub services: ServiceFlag,
+    /// Whether the peer prefers headers over inventory for block
+    /// announcements (dcrd `sp.WantsHeaders()`).
+    pub wants_headers: bool,
+    /// Whether the peer disabled transaction relaying (dcrd
+    /// `sp.disableRelayTx`).
+    pub disable_relay_tx: bool,
+    /// The negotiated protocol version (dcrd `sp.ProtocolVersion()`).
+    pub protocol_version: u32,
+}
+
+/// The relay message facts the handler consumes (dcrd `relayMsg`).
+pub struct RelayInvFacts {
+    /// The inventory type.
+    pub inv_type: dcroxide_wire::InvType,
+    /// The inventory hash.
+    pub inv_hash: dcroxide_chainhash::Hash,
+    /// The services required to receive the announcement.
+    pub req_services: ServiceFlag,
+    /// Whether to relay immediately rather than with the next batch.
+    pub immediate: bool,
+    /// Whether the message data is a usable block header (dcrd's type
+    /// assertion of `msg.data.(wire.BlockHeader)`).
+    pub data_is_block_header: bool,
+    /// Whether the message data is a usable transaction (dcrd's type
+    /// assertion of `msg.data.(*dcrutil.Tx)`).
+    pub data_is_tx: bool,
+}
+
+/// What the relay handler decided to do with the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayPeerAction {
+    /// Nothing is relayed to the peer.
+    Ignore,
+    /// A headers message carrying the announced block header is
+    /// queued.
+    QueueHeaders,
+    /// The inventory is queued to be relayed immediately.
+    QueueInventoryImmediate,
+    /// The inventory is queued to be relayed with the next batch.
+    QueueInventory,
+}
+
+/// The outcome of the relay handler: the queue action plus the
+/// transaction hash to record in the recently advertised cache when
+/// a transaction was relayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayPeerOutcome {
+    /// The queue action.
+    pub action: RelayPeerAction,
+    /// The transaction hash to record as recently advertised, set
+    /// only when a transaction relay reached the cache update.
+    pub advertised_tx: Option<dcroxide_chainhash::Hash>,
+}
+
+/// Relay an inventory announcement to a specific peer, applying the
+/// service filter, the block-announcement de-duplication, the
+/// headers preference, and the transaction and mix relay gates
+/// (dcrd `server.handleRelayPeerInvMsg`).  The peer's last announced
+/// block is updated in place.
+pub fn handle_relay_peer_inv(
+    announced_block: &mut Option<dcroxide_chainhash::Hash>,
+    facts: &RelayPeerFacts,
+    msg: &RelayInvFacts,
+) -> RelayPeerOutcome {
+    let ignore = RelayPeerOutcome {
+        action: RelayPeerAction::Ignore,
+        advertised_tx: None,
+    };
+
+    if !facts.connected {
+        return ignore;
+    }
+
+    // Ignore peers that do not have the required service flags.
+    if !has_services(facts.services, msg.req_services) {
+        return ignore;
+    }
+
+    // Filter duplicate block announcements.
+    let is_block_announcement = msg.inv_type == dcroxide_wire::InvType::BLOCK;
+    if is_block_announcement {
+        if *announced_block == Some(msg.inv_hash) {
+            *announced_block = None;
+            return ignore;
+        }
+        *announced_block = Some(msg.inv_hash);
+    }
+
+    // Generate and send a headers message instead of an inventory
+    // message for block announcements when the peer prefers headers.
+    if is_block_announcement && facts.wants_headers {
+        if !msg.data_is_block_header {
+            // dcrd warns and drops the announcement.
+            return ignore;
+        }
+        return RelayPeerOutcome {
+            action: RelayPeerAction::QueueHeaders,
+            advertised_tx: None,
+        };
+    }
+
+    let mut advertised_tx = None;
+    if msg.inv_type == dcroxide_wire::InvType::TX {
+        // Don't relay the transaction to the peer when it has
+        // transaction relaying disabled.
+        if facts.disable_relay_tx {
+            return ignore;
+        }
+        if !msg.data_is_tx {
+            // dcrd warns and drops the announcement.
+            return ignore;
+        }
+        // Track advertised transactions so they can be served even
+        // after leaving the mempool.
+        advertised_tx = Some(msg.inv_hash);
+    }
+
+    if msg.inv_type == dcroxide_wire::InvType::MIX {
+        // Don't relay the mixing message to the peer when it has
+        // transaction relaying disabled.
+        if facts.disable_relay_tx {
+            return ignore;
+        }
+        // Don't relay mix message inventory when unsupported by the
+        // negotiated protocol version.
+        if facts.protocol_version < dcroxide_wire::MIX_VERSION {
+            return ignore;
+        }
+    }
+
+    // Either queue the inventory to be relayed immediately or with
+    // the next batch depending on the immediate flag.
+    let action = if msg.immediate {
+        RelayPeerAction::QueueInventoryImmediate
+    } else {
+        RelayPeerAction::QueueInventory
+    };
+    RelayPeerOutcome {
+        action,
+        advertised_tx,
+    }
+}
+
+/// Whether the broadcast message should be queued to a given peer:
+/// the peer must be connected and not in the exclusion set (dcrd's
+/// per-peer body of `server.handleBroadcastMsg`).
+pub fn should_broadcast_to_peer(connected: bool, is_excluded: bool) -> bool {
+    connected && !is_excluded
 }

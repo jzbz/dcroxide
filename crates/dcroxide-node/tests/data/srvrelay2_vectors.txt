@@ -1,0 +1,15 @@
+rp|notconnected|true|false
+rp|missingservices|false|false
+rp|blockdedup|false|true
+rp|blockinv|true|true
+rp|blockheaders|true|true
+rp|blockheadersbaddata|false|false
+rp|txrelay|true|true
+rp|txdisabled|false|false
+rp|txbaddata|false|false
+rp|mixrelay|true
+rp|mixdisabled|false
+rp|mixunsupported|false|9
+rp|immediate|true
+bc|delivered|true
+bc|excluded|false
