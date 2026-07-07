@@ -1294,6 +1294,10 @@ pub const ERR_HELP_REQUESTED: &str = "help requested";
 /// the command line requested the version (dcrd prints it and
 /// exits).
 pub const ERR_VERSION_REQUESTED: &str = "version requested";
+/// The distinguished error [`load_config_from_argv`] returns when
+/// `--debuglevel=show` was requested (dcrd prints the supported
+/// subsystems and exits).
+pub const ERR_SHOW_SUBSYSTEMS: &str = "show subsystems requested";
 
 /// Initialize and parse the config from already-split option
 /// assignments (dcrd `loadConfig` past the go-flags syntax layer);
@@ -1617,8 +1621,13 @@ fn load_config_impl(
         cfg.log_size_kib = logsize;
     }
 
-    // The special "show" debug level command is handled by the
-    // front-end (dcrd prints the subsystems and exits).
+    // The special "show" debug level command lists the supported
+    // subsystems and exits; it is surfaced as a distinguished result
+    // for the front-end to print and exit, mirroring dcrd's direct
+    // `os.Exit(0)` right before the debug level parse.
+    if cfg.debug_level == "show" {
+        return Err(ERR_SHOW_SUBSYSTEMS.to_string());
+    }
 
     // Parse, validate, and set debug log level(s).
     let mut levels = LogLevels::new();
