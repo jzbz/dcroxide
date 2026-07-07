@@ -3176,6 +3176,41 @@ impl Chain {
         self.best_chain.block_locator(&self.store, node)
     }
 
+    /// The best chain state snapshot (dcrd `BlockChain.BestSnapshot`).
+    pub fn best_snapshot(&self) -> &BestState {
+        &self.state_snapshot
+    }
+
+    /// The stake node at the tip of the best chain, if loaded.
+    fn tip_stake_node(&self) -> Option<&StakeNode> {
+        let tip = self.best_chain.tip()?;
+        self.store.node(tip).stake_node.as_ref()
+    }
+
+    /// Whether the ticket exists in the live ticket treap of the best
+    /// node (dcrd `BlockChain.CheckLiveTicket`).
+    pub fn check_live_ticket(&self, hash: &Hash) -> bool {
+        self.tip_stake_node()
+            .is_some_and(|sn| sn.exists_live_ticket(hash))
+    }
+
+    /// Whether each ticket exists in the live ticket treap of the best
+    /// node (dcrd `BlockChain.CheckLiveTickets`).
+    pub fn check_live_tickets(&self, hashes: &[Hash]) -> Vec<bool> {
+        match self.tip_stake_node() {
+            Some(sn) => hashes.iter().map(|h| sn.exists_live_ticket(h)).collect(),
+            None => alloc::vec![false; hashes.len()],
+        }
+    }
+
+    /// All currently live tickets from the best node's stake state
+    /// (dcrd `BlockChain.LiveTickets`).
+    pub fn live_tickets(&self) -> Vec<Hash> {
+        self.tip_stake_node()
+            .map(StakeNode::live_tickets)
+            .unwrap_or_default()
+    }
+
     /// The version 2 GCS filter for the given block hash along with a
     /// header commitment inclusion proof, regardless of whether the
     /// block is part of the main chain (dcrd
