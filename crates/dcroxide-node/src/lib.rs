@@ -18,6 +18,7 @@ pub mod logo;
 pub mod logsubsys;
 pub mod params;
 pub mod peerconn;
+pub mod peerloop;
 pub mod runtime;
 pub mod server;
 pub mod transport;
