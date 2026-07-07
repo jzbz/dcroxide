@@ -3211,6 +3211,36 @@ impl Chain {
             .unwrap_or_default()
     }
 
+    /// The next tickets eligible for voting, the number of tickets in
+    /// the ticket pool, and the final state of the lottery PRNG for
+    /// the given block, including side chain blocks (dcrd
+    /// `BlockChain.LotteryDataForBlock`).  Returns empty data below
+    /// stake enabled height and the unknown-block error when the
+    /// block is not in the index.
+    pub fn lottery_data_for_block(
+        &mut self,
+        hash: &Hash,
+        params: &Params,
+    ) -> Result<(Vec<Hash>, usize, [u8; 6]), RuleError> {
+        let Some(node) = self.index.lookup_node(hash) else {
+            return Err(rule_error(
+                RuleErrorKind::UnknownBlock,
+                format!("block {hash} is not known"),
+            ));
+        };
+        if self.store.node(node).height < params.stake_enabled_height {
+            return Ok((Vec::new(), 0, [0u8; 6]));
+        }
+        let stake_node = self
+            .fetch_stake_node(node, params)
+            .map_err(|e| rule_error(RuleErrorKind::UnknownBlock, e.description))?;
+        Ok((
+            stake_node.winners().to_vec(),
+            stake_node.pool_size(),
+            stake_node.final_state(),
+        ))
+    }
+
     /// The version 2 GCS filter for the given block hash along with a
     /// header commitment inclusion proof, regardless of whether the
     /// block is part of the main chain (dcrd
