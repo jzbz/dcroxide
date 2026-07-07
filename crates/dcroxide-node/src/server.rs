@@ -1692,3 +1692,85 @@ pub fn on_inv_classify(inv_types: &[dcroxide_wire::InvType], blocks_only: bool) 
 
     OnInvOutcome::Forward
 }
+
+/// The maximum number of block inventory vectors per message (dcrd
+/// `wire.MaxBlocksPerMsg`).
+pub const MAX_BLOCKS_PER_MSG: usize = 500;
+
+/// The response the getblocks handler builds from the located block
+/// hashes (dcrd `serverPeer.OnGetBlocks` after `LocateBlocks`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetBlocksResponse {
+    /// The block inventory vectors to send; an empty list means no
+    /// message is sent.
+    pub inv: Vec<dcroxide_wire::InvVect>,
+    /// The continue hash to store when the inventory message is full,
+    /// so the next getblocks can be triggered by the corresponding
+    /// block request.
+    pub continue_hash: Option<dcroxide_chainhash::Hash>,
+}
+
+/// Build the getblocks inventory response from the located block
+/// hashes: skip inventory the peer is already known to have, and set
+/// the continue hash when the response fills an entire message (dcrd
+/// `serverPeer.OnGetBlocks`).  The `LocateBlocks` walk itself is the
+/// ported chain query, pinned separately.
+pub fn build_get_blocks_response(
+    located: &[dcroxide_chainhash::Hash],
+    known: impl Fn(&dcroxide_wire::InvVect) -> bool,
+) -> GetBlocksResponse {
+    let mut inv = Vec::new();
+    for hash in located {
+        let iv = dcroxide_wire::InvVect {
+            inv_type: dcroxide_wire::InvType::BLOCK,
+            hash: *hash,
+        };
+        // Skip inventory the peer is already known to have.  dcrd
+        // notes a TODO to increase the ban score here.
+        if known(&iv) {
+            continue;
+        }
+        inv.push(iv);
+    }
+
+    // Set the continue hash when the response fills an entire message
+    // so the peer requesting the final block triggers the next batch.
+    let mut continue_hash = None;
+    if !inv.is_empty() && inv.len() == MAX_BLOCKS_PER_MSG {
+        continue_hash = Some(inv[inv.len() - 1].hash);
+    }
+
+    GetBlocksResponse { inv, continue_hash }
+}
+
+/// The response the getheaders handler builds (dcrd
+/// `serverPeer.OnGetHeaders`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GetHeadersResponse {
+    /// An empty headers message signalling that the local best known
+    /// tip has too little work for the located headers to be
+    /// interesting, sent without appearing unresponsive.
+    Empty,
+    /// The located headers (possibly empty when the locator is
+    /// already at the tip).
+    Headers(Vec<dcroxide_wire::BlockHeader>),
+}
+
+/// Decide the getheaders response: send an empty headers message when
+/// the local best known tip's cumulative work is below the minimum
+/// known work already achieved on the network, otherwise send the
+/// located headers (dcrd `serverPeer.OnGetHeaders`).  The tip work is
+/// compared against the minimum known work by the ported uint256
+/// ordering; a chain work lookup error skips the empty-response gate.
+/// The `LocateHeaders` walk is the ported chain query, pinned
+/// separately.
+pub fn build_get_headers_response(
+    chain_work_errored: bool,
+    tip_work_below_min: bool,
+    located: Vec<dcroxide_wire::BlockHeader>,
+) -> GetHeadersResponse {
+    if !chain_work_errored && tip_work_below_min {
+        return GetHeadersResponse::Empty;
+    }
+    GetHeadersResponse::Headers(located)
+}
