@@ -3211,6 +3211,24 @@ impl Chain {
             .unwrap_or_default()
     }
 
+    /// The value of all the locked funds in the ticket pool, summing
+    /// the amount of every live ticket's stake submission output (dcrd
+    /// `BlockChain.TicketPoolValue`).  Returns `None` when a live
+    /// ticket's utxo is unexpectedly missing, matching dcrd's error.
+    pub fn ticket_pool_value(&self) -> Option<i64> {
+        let mut amt: i64 = 0;
+        for hash in self.live_tickets() {
+            let op = OutPoint {
+                hash,
+                index: 0,
+                tree: dcroxide_wire::TX_TREE_STAKE,
+            };
+            let utxo = self.fetch_utxo_entry(&op)?;
+            amt += utxo.amount();
+        }
+        Some(amt)
+    }
+
     /// The next tickets eligible for voting, the number of tickets in
     /// the ticket pool, and the final state of the lottery PRNG for
     /// the given block, including side chain blocks (dcrd
