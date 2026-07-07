@@ -20,6 +20,7 @@ pub mod rpcerrors;
 pub mod server;
 pub mod txresults;
 pub mod version;
+pub mod websocket;
 
 pub use help::{HelpCacher, RPC_HANDLER_METHODS, WS_HANDLER_METHODS, rpc_result_types};
 pub use helpdescs::HELP_DESCS_EN_US;

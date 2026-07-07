@@ -162,8 +162,9 @@ Currently implemented:
   treasury-vote, getwork, and help commands — all 77 dcrd
   handlers) plus the request dispatch core (parse, route, reply
   marshalling, and the limited-user gate), Basic auth over HMAC'd
-  credentials, and the single/batched request body processing over
-  a Server scaffold
+  credentials, the single/batched request body processing, and the
+  websocket client core (transaction filters, rescans, and the
+  websocket command handlers) over a Server scaffold
   with the chain, mempool, sync and
   connection managers, indexes, database, filterer, log manager, fee
   estimator, sanity checker, time source, CPU miner, mix pooler,

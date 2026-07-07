@@ -288,6 +288,17 @@ pub trait RpcChain {
     fn fetch_tspend(&mut self, _tspend: &Hash) -> Result<Vec<Hash>, String> {
         unimplemented!("fetch_tspend")
     }
+    /// The entire generation of blocks stemming from the parent of
+    /// the current tip (dcrd `TipGeneration`).
+    fn tip_generation(&mut self) -> Vec<Hash> {
+        unimplemented!("tip_generation")
+    }
+    /// The winning tickets of the block with the given hash (dcrd
+    /// `LotteryDataForBlock`; only the tickets are consumed and the
+    /// failure is log-only).
+    fn lottery_data_for_block(&mut self, _hash: &Hash) -> Result<Vec<Hash>, String> {
+        unimplemented!("lottery_data_for_block")
+    }
     /// The (yes, no) vote tally for the treasury spend counted up to
     /// the given block (dcrd `TSpendCountVotes`).
     fn tspend_count_votes(
@@ -1218,6 +1229,9 @@ pub struct Server<C> {
     /// The HMAC of the limited-user Basic auth string (dcrd
     /// `limitauthsha`).
     pub(crate) limitauthsha: [u8; 32],
+    /// The websocket notification manager (dcrd builds `ntfnMgr` in
+    /// `New`; the daemon replaces the default with the real fan-out).
+    pub ntfn_mgr: Box<dyn crate::websocket::RpcNtfnManager>,
 }
 
 /// The getwork request/submission state (dcrd `workState`).
@@ -1257,6 +1271,7 @@ impl<C: RpcChain> Server<C> {
             hmac_key,
             authsha: [0u8; 32],
             limitauthsha: [0u8; 32],
+            ntfn_mgr: Box::new(()),
         };
         if !server.cfg.rpc_user.is_empty() && !server.cfg.rpc_pass.is_empty() {
             let login = format!("{}:{}", server.cfg.rpc_user, server.cfg.rpc_pass);
