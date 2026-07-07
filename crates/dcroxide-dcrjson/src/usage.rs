@@ -15,11 +15,11 @@ fn sub_struct_usage(struct_type: &GoType) -> String {
     for rtf in fields {
         // When the field has a jsonrpcusage struct tag specified, use
         // that instead of automatically generating it.
-        if let Some(tag) = &rtf.usage_tag {
-            if !tag.is_empty() {
-                field_usages.push(tag.clone());
-                continue;
-            }
+        if let Some(tag) = &rtf.usage_tag
+            && !tag.is_empty()
+        {
+            field_usages.push(tag.clone());
+            continue;
         }
 
         // Create the name/value entry for the field while considering
@@ -73,10 +73,10 @@ fn sub_array_usage(array_type: &GoType, field_name: &str) -> String {
 fn field_usage(field: &crate::gotype::StructField, default_val: Option<&GoValue>) -> String {
     // When the field has a jsonrpcusage struct tag specified, use that
     // instead of automatically generating it.
-    if let Some(tag) = &field.usage_tag {
-        if !tag.is_empty() {
-            return tag.clone();
-        }
+    if let Some(tag) = &field.usage_tag
+        && !tag.is_empty()
+    {
+        return tag.clone();
     }
 
     // Indirect the pointer if needed.

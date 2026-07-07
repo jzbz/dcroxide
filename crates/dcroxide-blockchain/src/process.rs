@@ -309,14 +309,14 @@ impl Chain {
             Ok(())
         })?;
 
-        if let Some(info) = &db_info {
-            if info.version > chaindb::CURRENT_DATABASE_VERSION {
-                return Err(chaindb::ChainDbError::Corrupt(format!(
-                    "the database is no longer compatible ({} > {})",
-                    info.version,
-                    chaindb::CURRENT_DATABASE_VERSION
-                )));
-            }
+        if let Some(info) = &db_info
+            && info.version > chaindb::CURRENT_DATABASE_VERSION
+        {
+            return Err(chaindb::ChainDbError::Corrupt(format!(
+                "the database is no longer compatible ({} > {})",
+                info.version,
+                chaindb::CURRENT_DATABASE_VERSION
+            )));
         }
 
         if db_info.is_none() {
@@ -446,10 +446,9 @@ impl Chain {
             let next_version = crate::thresholdstate::next_deployment_version(params, prev_version);
             if let Some((_, deployments)) =
                 params.deployments.iter().find(|(v, _)| *v == next_version)
+                && let Some(first) = deployments.first()
             {
-                if let Some(first) = deployments.first() {
-                    new_rules_start_time = first.start_time;
-                }
+                new_rules_start_time = first.start_time;
             }
         }
 
@@ -568,10 +567,10 @@ impl Chain {
             self.blocks.insert(hash.0, block);
 
             let meta = tx.metadata();
-            if let Some(bucket) = meta.bucket(crate::chaindb::SPEND_JOURNAL_BUCKET_NAME) {
-                if let Some(journal) = bucket.get(&hash.0) {
-                    self.spend_journal.insert(hash.0, journal);
-                }
+            if let Some(bucket) = meta.bucket(crate::chaindb::SPEND_JOURNAL_BUCKET_NAME)
+                && let Some(journal) = bucket.get(&hash.0)
+            {
+                self.spend_journal.insert(hash.0, journal);
             }
             if let Some(filter) = crate::chaindb::db_fetch_gcs_filter(tx, &hash)? {
                 self.filters.insert(hash.0, filter);
@@ -1045,20 +1044,19 @@ impl Chain {
 
         // Create the requested stake node from the parent stake node
         // when it is already loaded as an optimization.
-        if let Some(parent) = self.store.node(node).parent {
-            if self.store.node(parent).stake_node.is_some() {
-                self.maybe_fetch_ticket_info(node, params);
-                let n = self.store.node(node);
-                let voted = n.tickets_voted.clone();
-                let revoked = n.tickets_revoked.clone();
-                let new_tickets = n.new_tickets.clone().expect("new tickets loaded");
-                let iv = self.store.lottery_iv(node);
-                let parent_stake_node =
-                    self.store.node(parent).stake_node.as_ref().expect("loaded");
-                let stake_node = parent_stake_node.connect(iv, &voted, &revoked, &new_tickets)?;
-                self.store.node_mut(node).stake_node = Some(stake_node.clone());
-                return Ok(stake_node);
-            }
+        if let Some(parent) = self.store.node(node).parent
+            && self.store.node(parent).stake_node.is_some()
+        {
+            self.maybe_fetch_ticket_info(node, params);
+            let n = self.store.node(node);
+            let voted = n.tickets_voted.clone();
+            let revoked = n.tickets_revoked.clone();
+            let new_tickets = n.new_tickets.clone().expect("new tickets loaded");
+            let iv = self.store.lottery_iv(node);
+            let parent_stake_node = self.store.node(parent).stake_node.as_ref().expect("loaded");
+            let stake_node = parent_stake_node.connect(iv, &voted, &revoked, &new_tickets)?;
+            self.store.node_mut(node).stake_node = Some(stake_node.clone());
+            return Ok(stake_node);
         }
 
         // Undo the effects from the current tip back to, and
@@ -2013,10 +2011,10 @@ impl Chain {
 
         // Reject blocks that are already known to be invalid.
         let existing = self.index.lookup_node(&hash);
-        if let Some(node) = existing {
-            if let Err(err) = self.check_known_invalid_block(node) {
-                return (0, alloc::vec![err]);
-            }
+        if let Some(node) = existing
+            && let Err(err) = self.check_known_invalid_block(node)
+        {
+            return (0, alloc::vec![err]);
         }
 
         // Perform preliminary sanity checks on the block and its
@@ -2079,10 +2077,10 @@ impl Chain {
         final_errs.extend(self.reorganize_chain(target, adjusted_time_unix, params));
 
         let mut fork_len = 0;
-        if final_errs.is_empty() {
-            if let Some(fork) = self.best_chain.find_fork(&self.store, node) {
-                fork_len = self.store.node(node).height - self.store.node(fork).height;
-            }
+        if final_errs.is_empty()
+            && let Some(fork) = self.best_chain.find_fork(&self.store, node)
+        {
+            fork_len = self.store.node(node).height - self.store.node(fork).height;
         }
         (fork_len, final_errs)
     }
@@ -2175,10 +2173,11 @@ impl Chain {
                 }
                 n = self.store.node(id).parent;
             }
-            if let Some(id) = n {
-                if id != new_tip && self.store.node(id).work_sum >= new_tip_work {
-                    self.index.add_best_chain_candidate(id);
-                }
+            if let Some(id) = n
+                && id != new_tip
+                && self.store.node(id).work_sum >= new_tip_work
+            {
+                self.index.add_best_chain_candidate(id);
             }
         }
 
@@ -2235,10 +2234,11 @@ impl Chain {
             }
 
             let nd = self.store.node(id);
-            if !nd.is_fully_linked && nd.status.have_data() {
-                if let Some(parent) = nd.parent {
-                    self.index.add_unlinked_child(parent, id);
-                }
+            if !nd.is_fully_linked
+                && nd.status.have_data()
+                && let Some(parent) = nd.parent
+            {
+                self.index.add_unlinked_child(parent, id);
             }
             n = self.store.node(id).parent;
         }
@@ -2284,10 +2284,11 @@ impl Chain {
                     self.index.add_best_chain_candidate(m);
                 }
                 let nd = self.store.node(m);
-                if !nd.is_fully_linked && nd.status.have_data() {
-                    if let Some(parent) = nd.parent {
-                        self.index.add_unlinked_child(parent, m);
-                    }
+                if !nd.is_fully_linked
+                    && nd.status.have_data()
+                    && let Some(parent) = nd.parent
+                {
+                    self.index.add_unlinked_child(parent, m);
                 }
                 m = self.store.node(m).parent.expect("descendant parent");
             }
@@ -3094,11 +3095,11 @@ impl Chain {
         // main chain, fall back to the genesis block.
         let mut start_node = self.best_chain.genesis();
         for hash in locator {
-            if let Some(node) = self.index.lookup_node(hash) {
-                if self.best_chain.contains(&self.store, node) {
-                    start_node = Some(node);
-                    break;
-                }
+            if let Some(node) = self.index.lookup_node(hash)
+                && self.best_chain.contains(&self.store, node)
+            {
+                start_node = Some(node);
+                break;
             }
         }
 
@@ -3114,12 +3115,11 @@ impl Chain {
         let tip = self.best_chain.tip().expect("best chain tip");
         let start_height = self.store.node(start_node).height;
         let mut total = (self.store.node(tip).height - start_height + 1) as u32;
-        if let Some(stop) = stop_node {
-            if self.best_chain.contains(&self.store, stop)
-                && self.store.node(stop).height >= start_height
-            {
-                total = (self.store.node(stop).height - start_height + 1) as u32;
-            }
+        if let Some(stop) = stop_node
+            && self.best_chain.contains(&self.store, stop)
+            && self.store.node(stop).height >= start_height
+        {
+            total = (self.store.node(stop).height - start_height + 1) as u32;
         }
         if total > max_entries {
             total = max_entries;
@@ -3868,14 +3868,13 @@ impl Chain {
         }
 
         // The aggregate expenditure bound.
-        if total_tspend_amount > 0 {
-            if let Err(err) = self.check_tspends_expenditure(prev_node, total_tspend_amount, params)
-            {
-                return Err(rule_error(
-                    RuleErrorKind::InvalidExpenditure,
-                    format!("block contains a TSpend that has an invalid expenditure: {err}"),
-                ));
-            }
+        if total_tspend_amount > 0
+            && let Err(err) = self.check_tspends_expenditure(prev_node, total_tspend_amount, params)
+        {
+            return Err(rule_error(
+                RuleErrorKind::InvalidExpenditure,
+                format!("block contains a TSpend that has an invalid expenditure: {err}"),
+            ));
         }
         Ok(())
     }
@@ -3893,10 +3892,10 @@ impl Chain {
         if !self.is_current_latch {
             // Not current with less cumulative work than the minimum
             // known work for the network.
-            if let Some(min_work) = &self.min_known_work {
-                if self.store.node(cur_best).work_sum < *min_work {
-                    return;
-                }
+            if let Some(min_work) = &self.min_known_work
+                && self.store.node(cur_best).work_sum < *min_work
+            {
+                return;
             }
 
             // Not current when not synced to the best header.

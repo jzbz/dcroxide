@@ -239,17 +239,17 @@ fn analyze_ours(version: u16, script: &[u8], params: &Params) -> String {
     for addr in &addrs {
         w.push_str(&format!("addr={} {}\n", addr.go_type_name(), addr.encode()));
     }
-    if version == 0 {
-        if let Some(pushes) = stdscript::extract_atomic_swap_data_pushes_v0(script) {
-            w.push_str(&format!(
-                "atomicswap={} {} {} {} {}\n",
-                hex(&pushes.recipient_hash160),
-                hex(&pushes.refund_hash160),
-                hex(&pushes.secret_hash),
-                pushes.secret_size,
-                pushes.lock_time
-            ));
-        }
+    if version == 0
+        && let Some(pushes) = stdscript::extract_atomic_swap_data_pushes_v0(script)
+    {
+        w.push_str(&format!(
+            "atomicswap={} {} {} {} {}\n",
+            hex(&pushes.recipient_hash160),
+            hex(&pushes.refund_hash160),
+            hex(&pushes.secret_hash),
+            pushes.secret_size,
+            pushes.lock_time
+        ));
     }
     w
 }

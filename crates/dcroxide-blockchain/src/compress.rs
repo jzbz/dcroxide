@@ -350,7 +350,7 @@ pub fn compress_tx_out_amount(mut amount: u64) -> u64 {
     // Find the largest power of 10 (max of 9) that evenly divides the
     // value.
     let mut exponent: u64 = 0;
-    while amount % 10 == 0 && exponent < 9 {
+    while amount.is_multiple_of(10) && exponent < 9 {
         amount /= 10;
         exponent += 1;
     }

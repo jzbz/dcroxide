@@ -268,14 +268,14 @@ impl ExistsAddrIndex {
                     continue;
                 }
 
-                if is_sstx && script_type == stdscript::ScriptType::NullData {
-                    if let Ok(addr) =
+                if is_sstx
+                    && script_type == stdscript::ScriptType::NullData
+                    && let Ok(addr) =
                         dcroxide_stake::addr_from_sstx_pk_scr_commitment(&tx_out.pk_script, params)
-                    {
-                        addrs.push(addr);
-                    }
-                    // Unsupported address types are ignored.
+                {
+                    addrs.push(addr);
                 }
+                // Unsupported address types are ignored.
 
                 for addr in &addrs {
                     // Ignore unsupported address types.
@@ -377,14 +377,14 @@ impl ExistsAddrIndex {
                     continue;
                 }
 
-                if is_sstx && script_type == stdscript::ScriptType::NullData {
-                    if let Ok(addr) =
+                if is_sstx
+                    && script_type == stdscript::ScriptType::NullData
+                    && let Ok(addr) =
                         dcroxide_stake::addr_from_sstx_pk_scr_commitment(&tx_out.pk_script, params)
-                    {
-                        addrs.push(addr);
-                    }
-                    // Unsupported address types are ignored.
+                {
+                    addrs.push(addr);
                 }
+                // Unsupported address types are ignored.
 
                 for addr in &addrs {
                     // Ignore unsupported address types.

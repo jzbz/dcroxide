@@ -514,15 +514,15 @@ impl BlockIndex {
             n.parent,
             n.status.known_invalid(),
         );
-        if !fully_linked && have_data {
-            if let Some(parent_id) = parent {
-                if !store.node(parent_id).status.known_invalid() {
-                    self.unlinked_children_of
-                        .entry(parent_id)
-                        .or_default()
-                        .push(node);
-                }
-            }
+        if !fully_linked
+            && have_data
+            && let Some(parent_id) = parent
+            && !store.node(parent_id).status.known_invalid()
+        {
+            self.unlinked_children_of
+                .entry(parent_id)
+                .or_default()
+                .push(node);
         }
         if invalid {
             self.maybe_update_best_invalid(store, node);
@@ -711,11 +711,11 @@ impl BlockIndex {
     /// any others (the shape dcrd `TipGeneration` reads).
     pub fn tips_at_height(&self, height: i64) -> alloc::vec::Vec<NodeId> {
         let mut out = alloc::vec::Vec::new();
-        if let Some(entry) = self.chain_tips.get(&height) {
-            if let Some(tip) = entry.tip {
-                out.push(tip);
-                out.extend(entry.other_tips.iter().copied());
-            }
+        if let Some(entry) = self.chain_tips.get(&height)
+            && let Some(tip) = entry.tip
+        {
+            out.push(tip);
+            out.extend(entry.other_tips.iter().copied());
         }
         out
     }

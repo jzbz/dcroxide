@@ -23,7 +23,7 @@ pub fn calc_tspend_expiry(next_block_height: i64, tvi: u64, multiplier: u64) -> 
 /// Whether the passed height is on a treasury vote interval and is not 0
 /// (dcrd `IsTreasuryVoteInterval`).
 pub fn is_treasury_vote_interval(height: u64, tvi: u64) -> bool {
-    height % tvi == 0 && height != 0
+    height.is_multiple_of(tvi) && height != 0
 }
 
 /// Calculate the start and end of a treasury voting window from the

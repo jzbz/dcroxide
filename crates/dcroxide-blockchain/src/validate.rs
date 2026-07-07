@@ -1082,19 +1082,18 @@ pub fn check_block_header_positional(
     // Prevent blocks that fork the main chain prior to the old fork
     // rejection checkpoint.  dcrd reads the checkpoint node and block
     // index directly; the caller supplies the same facts here.
-    if let Some(fr) = fork_rejection {
-        if block_height < fr.checkpoint_height
-            && (!fr.prev_is_checkpoint_ancestor || !fr.block_in_index)
-        {
-            return Err(rule_error(
-                RuleErrorKind::ForkTooOld,
-                format!(
-                    "block at height {block_height} forks the main chain before the \
+    if let Some(fr) = fork_rejection
+        && block_height < fr.checkpoint_height
+        && (!fr.prev_is_checkpoint_ancestor || !fr.block_in_index)
+    {
+        return Err(rule_error(
+            RuleErrorKind::ForkTooOld,
+            format!(
+                "block at height {block_height} forks the main chain before the \
                      fork rejection checkpoint at height {}",
-                    fr.checkpoint_height
-                ),
-            ));
-        }
+                fr.checkpoint_height
+            ),
+        ));
     }
 
     // Reject version 3 test network chains that are not specifically
@@ -2604,27 +2603,25 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
     // Perform additional checks on treasury spend transactions such as
     // ensuring they have a valid signature from a sanctioned key.
     let mut is_tspend = false;
-    if is_treasury_enabled {
-        if let Ok((signature, pub_key)) = dcroxide_stake::check_tspend(tx) {
-            is_tspend = true;
+    if is_treasury_enabled && let Ok((signature, pub_key)) = dcroxide_stake::check_tspend(tx) {
+        is_tspend = true;
 
-            // The public key used to sign the treasury spend must be
-            // one of the sanctioned pi keys.
-            if !params.pi_key_exists(&pub_key) {
-                return Err(rule_error(
-                    RuleErrorKind::UnknownPiKey,
-                    format!("unknown treasury spend pi key: {pub_key:x?}"),
-                ));
-            }
+        // The public key used to sign the treasury spend must be
+        // one of the sanctioned pi keys.
+        if !params.pi_key_exists(&pub_key) {
+            return Err(rule_error(
+                RuleErrorKind::UnknownPiKey,
+                format!("unknown treasury spend pi key: {pub_key:x?}"),
+            ));
+        }
 
-            // Verify that the signature is valid and corresponds to
-            // the provided public key.
-            if let Err(e) = verify_tspend_signature(tx, &signature, &pub_key) {
-                return Err(rule_error(
-                    RuleErrorKind::InvalidPiSignature,
-                    format!("failed to verify treasury spend signature: {e}"),
-                ));
-            }
+        // Verify that the signature is valid and corresponds to
+        // the provided public key.
+        if let Err(e) = verify_tspend_signature(tx, &signature, &pub_key) {
+            return Err(rule_error(
+                RuleErrorKind::InvalidPiSignature,
+                format!("failed to verify treasury spend signature: {e}"),
+            ));
         }
     }
 
@@ -3219,17 +3216,17 @@ pub fn check_dup_txs(
         };
         for tx_out_idx in 0..tx.tx_out.len() {
             outpoint.index = tx_out_idx as u32;
-            if let Some(entry) = lookup_entry(&outpoint) {
-                if !entry.is_spent() {
-                    return Err(rule_error(
-                        RuleErrorKind::OverwriteTx,
-                        format!(
-                            "tried to overwrite transaction output {outpoint:?} at block \
+            if let Some(entry) = lookup_entry(&outpoint)
+                && !entry.is_spent()
+            {
+                return Err(rule_error(
+                    RuleErrorKind::OverwriteTx,
+                    format!(
+                        "tried to overwrite transaction output {outpoint:?} at block \
                              height {} that is not spent",
-                            entry.block_height()
-                        ),
-                    ));
-                }
+                        entry.block_height()
+                    ),
+                ));
             }
         }
     }

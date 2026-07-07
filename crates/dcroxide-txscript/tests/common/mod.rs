@@ -122,19 +122,18 @@ fn handle_token(
     tok: &str,
 ) -> Result<ScriptBuilder, String> {
     // Multiple repeated tokens: <tokens>{n}.
-    if tok.starts_with('<') {
-        if let Some((head, count)) = split_repetition(tok) {
-            if let Some(inner) = head.strip_prefix('<').and_then(|h| h.strip_suffix('>')) {
-                let inner_tokens = tokenize(inner);
-                let mut builder = builder;
-                for _ in 0..count {
-                    for t in &inner_tokens {
-                        builder = handle_token(ops, builder, t)?;
-                    }
-                }
-                return Ok(builder);
+    if tok.starts_with('<')
+        && let Some((head, count)) = split_repetition(tok)
+        && let Some(inner) = head.strip_prefix('<').and_then(|h| h.strip_suffix('>'))
+    {
+        let inner_tokens = tokenize(inner);
+        let mut builder = builder;
+        for _ in 0..count {
+            for t in &inner_tokens {
+                builder = handle_token(ops, builder, t)?;
             }
         }
+        return Ok(builder);
     }
 
     // Plain number.
@@ -161,11 +160,13 @@ fn handle_token(
     }
 
     // Repeated quoted data: 'x'{n}.
-    if let Some((head, count)) = split_repetition(tok) {
-        if head.len() >= 2 && head.starts_with('\'') && head.ends_with('\'') {
-            let data = head[1..head.len() - 1].repeat(count);
-            return Ok(builder.add_data_unchecked(data.as_bytes()));
-        }
+    if let Some((head, count)) = split_repetition(tok)
+        && head.len() >= 2
+        && head.starts_with('\'')
+        && head.ends_with('\'')
+    {
+        let data = head[1..head.len() - 1].repeat(count);
+        return Ok(builder.add_data_unchecked(data.as_bytes()));
     }
 
     // Named opcode.

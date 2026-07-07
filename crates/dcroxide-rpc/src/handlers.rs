@@ -441,7 +441,7 @@ pub fn handle_create_raw_sstx<C: RpcChain>(
 /// `hex.DecodeString` succeeds only on full byte pairs of hex
 /// digits).
 fn go_decode_hex(s: &str) -> Result<Vec<u8>, ()> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(());
     }
     let bytes = s.as_bytes();
@@ -466,7 +466,7 @@ pub fn handle_decode_raw_transaction<C: RpcChain>(
 
     // Deserialize the transaction.
     let padded;
-    let hex_str = if hex_str.len() % 2 != 0 {
+    let hex_str = if !hex_str.len().is_multiple_of(2) {
         padded = format!("0{hex_str}");
         &padded
     } else {
@@ -525,7 +525,7 @@ pub fn handle_decode_script<C: RpcChain>(
 
     // Convert the hex script to bytes.
     let padded;
-    let hex_str = if hex_str.len() % 2 != 0 {
+    let hex_str = if !hex_str.len().is_multiple_of(2) {
         padded = format!("0{hex_str}");
         &padded
     } else {
@@ -2697,7 +2697,7 @@ pub fn handle_tickets_for_address<C: RpcChain>(
 /// Go `hex.DecodeString` with its exact error text for the handlers
 /// that surface it (`encoding/hex: invalid byte: %#U`).
 fn go_decode_hex_msg(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("encoding/hex: odd length hex string".to_string());
     }
     let bytes = s.as_bytes();
@@ -2730,7 +2730,7 @@ pub fn handle_send_raw_transaction<C: RpcChain>(
 
     // Deserialize and send off to tx relay.
     let padded;
-    let hex_str = if hex_tx.len() % 2 != 0 {
+    let hex_str = if !hex_tx.len().is_multiple_of(2) {
         padded = format!("0{hex_tx}");
         &padded
     } else {
@@ -2810,7 +2810,7 @@ pub fn handle_submit_block<C: RpcChain>(
     // Deserialize the submitted block.  Note dcrd surfaces the raw
     // hex/deserialization error text through an internal error here.
     let padded;
-    let hex_str = if hex_block.len() % 2 != 0 {
+    let hex_str = if !hex_block.len().is_multiple_of(2) {
         padded = format!("0{hex_block}");
         &padded
     } else {
@@ -3020,7 +3020,7 @@ fn amounts_median(s: &[i64]) -> i64 {
     let mut sorted = s.to_vec();
     sorted.sort_unstable();
     let middle = sorted.len() / 2;
-    if sorted.len() % 2 != 0 {
+    if !sorted.len().is_multiple_of(2) {
         sorted[middle]
     } else {
         (sorted[middle] + sorted[middle - 1]) / 2
@@ -4579,7 +4579,7 @@ fn handle_get_work_submission<C: RpcChain>(
 
     // Decode the provided hex data while padding the front with a 0
     // for odd-length strings.
-    let padded_hex = if hex_data.len() % 2 != 0 {
+    let padded_hex = if !hex_data.len().is_multiple_of(2) {
         format!("0{hex_data}")
     } else {
         hex_data.to_string()

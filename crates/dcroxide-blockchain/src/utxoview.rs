@@ -413,10 +413,10 @@ impl UtxoView {
             }
             entry.spend();
             // Mark spends of outputs created earlier in this block.
-            if let Some(&in_flight_idx) = in_flight_tx.get(&prev_out.hash.0) {
-                if block_index > in_flight_idx {
-                    entry.state |= UTXO_STATE_SPENT_BY_ZERO_CONF;
-                }
+            if let Some(&in_flight_idx) = in_flight_tx.get(&prev_out.hash.0)
+                && block_index > in_flight_idx
+            {
+                entry.state |= UTXO_STATE_SPENT_BY_ZERO_CONF;
             }
         }
         self.add_tx_outs(tx, block_height, block_index, is_treasury_enabled);
@@ -528,10 +528,10 @@ impl UtxoView {
                 }
                 let entry = self.entries.get_mut(&k).expect("just inserted");
                 entry.spend();
-                if let Some(&in_flight_idx) = spends_in_flight.get(&k) {
-                    if tx_idx < in_flight_idx {
-                        entry.state |= UTXO_STATE_SPENT_BY_ZERO_CONF;
-                    }
+                if let Some(&in_flight_idx) = spends_in_flight.get(&k)
+                    && tx_idx < in_flight_idx
+                {
+                    entry.state |= UTXO_STATE_SPENT_BY_ZERO_CONF;
                 }
             }
 

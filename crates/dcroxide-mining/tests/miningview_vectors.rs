@@ -293,14 +293,12 @@ fn miningview_vectors() {
             // Nothing.
         }
         // Take the snapshot right before "add f" appears next.
-        if snapshot.is_none() {
-            if let Some(next) = lines.peek() {
-                if *next == "add f" {
-                    let pool = &src.pool;
-                    snapshot =
-                        Some(view.clone_view(Vec::new(), &|hash| pool.get(&hash.0).cloned()));
-                }
-            }
+        if snapshot.is_none()
+            && let Some(next) = lines.peek()
+            && *next == "add f"
+        {
+            let pool = &src.pool;
+            snapshot = Some(view.clone_view(Vec::new(), &|hash| pool.get(&hash.0).cloned()));
         }
     }
     assert_eq!(counts, [18, 225, 1, 1, 1, 1, 5], "row counts");

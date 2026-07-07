@@ -125,10 +125,10 @@ where
         match classify_incoming(peer, &msg, env) {
             IncomingAction::Disconnect(reason) => return DisconnectReason::Protocol(reason),
             IncomingAction::Process { reply } => {
-                if let Some(reply) = reply {
-                    if let Err(e) = transport.write_message(&reply) {
-                        return DisconnectReason::WriteError(e);
-                    }
+                if let Some(reply) = reply
+                    && let Err(e) = transport.write_message(&reply)
+                {
+                    return DisconnectReason::WriteError(e);
                 }
                 on_message(peer, &msg);
             }

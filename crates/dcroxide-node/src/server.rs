@@ -1359,12 +1359,14 @@ pub fn done_peer(
     // peer has acknowledged our version and has sent us its version
     // as well; skipped on the simulation and regression test
     // networks.
-    if !facts.sim_or_reg_net && facts.ver_ack_received && facts.version_known {
-        if let Some(na) = &facts.na {
-            let remote_addr = wire_to_addrmgr_net_address(na);
-            // A failure is logged and ignored.
-            outcome.marked_connected = addr_mgr.connected(&remote_addr).is_ok();
-        }
+    if !facts.sim_or_reg_net
+        && facts.ver_ack_received
+        && facts.version_known
+        && let Some(na) = &facts.na
+    {
+        let remote_addr = wire_to_addrmgr_net_address(na);
+        // A failure is logged and ignored.
+        outcome.marked_connected = addr_mgr.connected(&remote_addr).is_ok();
     }
 
     outcome

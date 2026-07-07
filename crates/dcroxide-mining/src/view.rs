@@ -303,10 +303,11 @@ impl TxMiningView {
             base_descendants_added += 1;
             true
         });
-        if base_tx_has_stats && base_descendants_added > 0 {
-            if let Some(stats) = self.ancestor_stats.get_mut(&base_tx_hash.0) {
-                stats.num_descendants += base_descendants_added;
-            }
+        if base_tx_has_stats
+            && base_descendants_added > 0
+            && let Some(stats) = self.ancestor_stats.get_mut(&base_tx_hash.0)
+        {
+            stats.num_descendants += base_descendants_added;
         }
     }
 
@@ -394,10 +395,11 @@ impl TxMiningView {
     /// Stop tracking the transaction, optionally updating descendant
     /// statistics (dcrd `RemoveTransaction`).
     pub fn remove_transaction(&mut self, tx_hash: &Hash, update_descendant_stats: bool) {
-        if self.track_ancestor_stats && update_descendant_stats {
-            if let Some(tx_desc) = self.tx_graph.find(tx_hash) {
-                self.update_stats_descendants_removed(&tx_desc);
-            }
+        if self.track_ancestor_stats
+            && update_descendant_stats
+            && let Some(tx_desc) = self.tx_graph.find(tx_hash)
+        {
+            self.update_stats_descendants_removed(&tx_desc);
         }
 
         self.tx_graph.remove(tx_hash);

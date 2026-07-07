@@ -1480,10 +1480,10 @@ fn field_index(fields: &[crate::gotype::StructField], key: &str) -> Option<usize
         }
     }
     for (i, f) in fields.iter().enumerate() {
-        if let Some(name) = effective(f) {
-            if name.eq_ignore_ascii_case(key) {
-                return Some(i);
-            }
+        if let Some(name) = effective(f)
+            && name.eq_ignore_ascii_case(key)
+        {
+            return Some(i);
         }
     }
     None
@@ -1503,7 +1503,7 @@ fn base64_decode_std(s: &str) -> Option<Vec<u8>> {
         }
     }
     let b = s.as_bytes();
-    if b.len() % 4 != 0 {
+    if !b.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(b.len() / 4 * 3);

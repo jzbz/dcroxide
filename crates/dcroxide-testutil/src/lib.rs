@@ -24,7 +24,7 @@ pub fn hex(b: &[u8]) -> String {
 
 /// Decode a lowercase/uppercase hex string; panics on invalid input (tests).
 pub fn unhex(s: &str) -> Vec<u8> {
-    assert!(s.len() % 2 == 0, "unhex: odd-length string");
+    assert!(s.len().is_multiple_of(2), "unhex: odd-length string");
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("unhex: invalid hex"))

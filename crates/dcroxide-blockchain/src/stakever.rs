@@ -277,12 +277,11 @@ pub fn calc_stake_version(view: &impl VersionChainView, prev_height: i64, params
         return 0;
     }
 
-    if is_stake_majority_version(view, version, node_height, params) {
-        if let Some(prior_version) = calc_prior_stake_version(view, node_height, params) {
-            if prior_version > version {
-                version = prior_version;
-            }
-        }
+    if is_stake_majority_version(view, version, node_height, params)
+        && let Some(prior_version) = calc_prior_stake_version(view, node_height, params)
+        && prior_version > version
+    {
+        version = prior_version;
     }
     version
 }

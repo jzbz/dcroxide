@@ -1111,11 +1111,11 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                         if prioritized_txns.contains(&child_tx_hash.0) {
                             continue;
                         }
-                        if !mining_view.has_parents(&child_tx_hash) {
-                            if let Some(child_prio_item) = prio_item_map.get(&child_tx_hash.0) {
-                                priority_queue.push(child_prio_item.clone());
-                                prioritized_txns.insert(child_tx_hash.0);
-                            }
+                        if !mining_view.has_parents(&child_tx_hash)
+                            && let Some(child_prio_item) = prio_item_map.get(&child_tx_hash.0)
+                        {
+                            priority_queue.push(child_prio_item.clone());
+                            prioritized_txns.insert(child_tx_hash.0);
                         }
                     }
                 }

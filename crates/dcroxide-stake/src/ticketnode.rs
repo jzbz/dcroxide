@@ -236,15 +236,15 @@ impl Node {
     /// Whether the ticket is missed and expired (dcrd
     /// `ExistsExpiredTicket`).
     pub fn exists_expired_ticket(&self, ticket: &Hash) -> bool {
-        if let Some(v) = self.missed_tickets.value(&ticket.0) {
-            if v.expired {
-                return true;
-            }
+        if let Some(v) = self.missed_tickets.value(&ticket.0)
+            && v.expired
+        {
+            return true;
         }
-        if let Some(v) = self.revoked_tickets.value(&ticket.0) {
-            if v.expired {
-                return true;
-            }
+        if let Some(v) = self.revoked_tickets.value(&ticket.0)
+            && v.expired
+        {
+            return true;
         }
         false
     }

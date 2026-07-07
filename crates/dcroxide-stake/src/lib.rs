@@ -806,7 +806,7 @@ pub fn get_ssgen_treasury_votes(pk_script: &[u8]) -> Result<Vec<TreasuryVoteTupl
     // Expect N hashes with their vote bits.
     const SIZE: usize = 32 + 1;
     let votes_bytes = &pk_script[start + 2..];
-    if votes_bytes.len() < SIZE || votes_bytes.len() % SIZE != 0 {
+    if votes_bytes.len() < SIZE || !votes_bytes.len().is_multiple_of(SIZE) {
         return Err(stake_rule_error(
             ErrorKind::SSGenInvalidTVLength,
             "SSGen 'T','V' invalid length",
@@ -1147,7 +1147,7 @@ pub fn determine_tx_type(tx: &MsgTx) -> TxType {
 /// Whether the output index is a ticket commitment output (dcrd
 /// `IsStakeCommitmentTxOut`); only safe post-[`is_sstx`].
 pub fn is_stake_commitment_tx_out(index: usize) -> bool {
-    index % 2 != 0
+    !index.is_multiple_of(2)
 }
 
 /// Information about tickets spent in a block from its stake tree only,

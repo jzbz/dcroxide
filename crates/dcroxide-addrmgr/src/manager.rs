@@ -181,10 +181,10 @@ impl KnownAddress {
     /// the last week.
     pub fn is_bad(&self, now: i64) -> bool {
         // Wait a minute after the last check.
-        if let Some(lastattempt) = self.lastattempt {
-            if lastattempt > now - MINUTE_NANOS {
-                return false;
-            }
+        if let Some(lastattempt) = self.lastattempt
+            && lastattempt > now - MINUTE_NANOS
+        {
+            return false;
         }
 
         // From the future?

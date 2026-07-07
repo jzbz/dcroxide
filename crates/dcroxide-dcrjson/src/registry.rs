@@ -240,29 +240,29 @@ impl Registry {
             // Ensure the default value can be unmarshalled into the
             // type and that defaults are only specified for optional
             // fields.
-            if let Some(tag) = &rtf.default_tag {
-                if !tag.is_empty() {
-                    if !is_optional {
-                        let str = format!(
-                            "required fields must not have a default specified \
+            if let Some(tag) = &rtf.default_tag
+                && !tag.is_empty()
+            {
+                if !is_optional {
+                    let str = format!(
+                        "required fields must not have a default specified \
                              (field name {})",
+                        gojson::go_quote(&rtf.name),
+                    );
+                    return Err(make_error(ErrorKind::NonOptionalDefault, str));
+                }
+
+                match gojson::decode(rtf.typ.elem(), tag) {
+                    Ok(val) => {
+                        defaults.insert(i, val);
+                    }
+                    Err(_) => {
+                        let str = format!(
+                            "default value of {} is the wrong type (field name {})",
+                            gojson::go_quote(tag),
                             gojson::go_quote(&rtf.name),
                         );
-                        return Err(make_error(ErrorKind::NonOptionalDefault, str));
-                    }
-
-                    match gojson::decode(rtf.typ.elem(), tag) {
-                        Ok(val) => {
-                            defaults.insert(i, val);
-                        }
-                        Err(_) => {
-                            let str = format!(
-                                "default value of {} is the wrong type (field name {})",
-                                gojson::go_quote(tag),
-                                gojson::go_quote(&rtf.name),
-                            );
-                            return Err(make_error(ErrorKind::MismatchedDefault, str));
-                        }
+                        return Err(make_error(ErrorKind::MismatchedDefault, str));
                     }
                 }
             }

@@ -306,7 +306,7 @@ pub fn deserialize_block_undo_data(b: &[u8]) -> Result<Vec<UndoTicketData>, Tick
             "short read when deserializing block undo data",
         ));
     }
-    if b.len() % UNDO_TICKET_DATA_SIZE != 0 {
+    if !b.len().is_multiple_of(UNDO_TICKET_DATA_SIZE) {
         return Err(ticket_db_error(
             TicketDbErrorKind::UndoDataCorrupt,
             "corrupt data found when deserializing block undo data",
@@ -357,7 +357,7 @@ pub fn deserialize_ticket_hashes(b: &[u8]) -> Result<Vec<Hash>, TicketDbError> {
             "short read when deserializing ticket hashes",
         ));
     }
-    if b.len() % 32 != 0 {
+    if !b.len().is_multiple_of(32) {
         return Err(ticket_db_error(
             TicketDbErrorKind::TicketHashesCorrupt,
             "corrupt data found when deserializing ticket hashes",

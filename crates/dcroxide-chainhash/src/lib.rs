@@ -152,7 +152,7 @@ impl FromStr for Hash {
         let mut out = HASH_SIZE - padded_len / 2;
 
         let mut iter = src.iter().copied();
-        if src.len() % 2 != 0 {
+        if !src.len().is_multiple_of(2) {
             // Odd length: dcrd prepends '0', so the first digit is a full
             // byte's low nibble. Go's hex.Decode checks the high nibble ('0',
             // always valid) before the low one, so error order is preserved.

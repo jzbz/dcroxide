@@ -552,10 +552,11 @@ impl Peer {
         let begin_hash = locator.first().copied();
 
         // Filter duplicate getblocks requests.
-        if let (Some((prev_begin, prev_stop)), Some(begin)) = (&self.prev_get_blocks, begin_hash) {
-            if *stop_hash == *prev_stop && begin == *prev_begin {
-                return None;
-            }
+        if let (Some((prev_begin, prev_stop)), Some(begin)) = (&self.prev_get_blocks, begin_hash)
+            && *stop_hash == *prev_stop
+            && begin == *prev_begin
+        {
+            return None;
         }
 
         let msg = Message::GetBlocks(MsgGetBlocks(dcroxide_wire::BlockLocator {
@@ -579,10 +580,11 @@ impl Peer {
         let begin_hash = locator.first().copied();
 
         // Filter duplicate getheaders requests.
-        if let (Some((prev_begin, prev_stop)), Some(begin)) = (&self.prev_get_hdrs, begin_hash) {
-            if *stop_hash == *prev_stop && begin == *prev_begin {
-                return None;
-            }
+        if let (Some((prev_begin, prev_stop)), Some(begin)) = (&self.prev_get_hdrs, begin_hash)
+            && *stop_hash == *prev_stop
+            && begin == *prev_begin
+        {
+            return None;
         }
 
         // dcrd's NewMsgGetHeaders leaves the protocol version zero.

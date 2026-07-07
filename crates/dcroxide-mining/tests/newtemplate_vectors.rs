@@ -496,10 +496,10 @@ fn newtemplate_vectors() {
                     {
                         nonces.coinbase = nonce_from(&out.pk_script);
                     }
-                    if let Some(tb) = want_block.stransactions.first() {
-                        if dcroxide_stake::is_treasury_base(tb) {
-                            nonces.treasury = nonce_from(&tb.tx_out[1].pk_script);
-                        }
+                    if let Some(tb) = want_block.stransactions.first()
+                        && dcroxide_stake::is_treasury_base(tb)
+                    {
+                        nonces.treasury = nonce_from(&tb.tx_out[1].pk_script);
                     }
                     if use_addr && pay_addr.is_none() {
                         // The last coinbase output pays the harness

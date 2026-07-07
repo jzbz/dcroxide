@@ -624,11 +624,9 @@ impl<B: MixBlockChain> Pool<B> {
             .iter()
             .filter(|(_, o)| {
                 let mut expire = now - o.accepted >= ORPHAN_EXPIRY_NANOS;
-                if !expire {
-                    if let PoolMessage::KE(ke) = &o.message {
-                        let epoch_nanos = (ke.epoch as i64).wrapping_mul(1_000_000_000);
-                        expire = now - epoch_nanos >= ORPHAN_EXPIRY_NANOS;
-                    }
+                if !expire && let PoolMessage::KE(ke) = &o.message {
+                    let epoch_nanos = (ke.epoch as i64).wrapping_mul(1_000_000_000);
+                    expire = now - epoch_nanos >= ORPHAN_EXPIRY_NANOS;
                 }
                 expire
             })
@@ -713,11 +711,11 @@ impl<B: MixBlockChain> Pool<B> {
         if tx_hash.is_some() || success {
             if tx_hash.is_none() {
                 for h in &ses.hashes {
-                    if let Some(e) = self.pool.get(h) {
-                        if let PoolMessage::CM(cm) = &e.msg {
-                            tx_hash = Some(cm.mix.tx_hash());
-                            break;
-                        }
+                    if let Some(e) = self.pool.get(h)
+                        && let PoolMessage::CM(cm) = &e.msg
+                    {
+                        tx_hash = Some(cm.mix.tx_hash());
+                        break;
                     }
                 }
             }
@@ -942,11 +940,11 @@ impl<B: MixBlockChain> Pool<B> {
     /// Add the passed message to the orphan pool when it is not
     /// already present (dcrd `addOrphan`).
     fn add_orphan(&mut self, msg: &PoolMessage, hash: &[u8; 32], id: &IdPubKey, src: u64) {
-        if let Some(by_id) = self.orphans_by_id.get(id) {
-            if by_id.contains_key(hash) {
-                // Already an orphan.
-                return;
-            }
+        if let Some(by_id) = self.orphans_by_id.get(id)
+            && by_id.contains_key(hash)
+        {
+            // Already an orphan.
+            return;
         }
 
         self.limit_num_orphans();
@@ -1552,21 +1550,22 @@ impl<B: MixBlockChain> Pool<B> {
     fn active_in_epoch(&self, epoch: u64) -> ActivePeers {
         let mut epoch_kes: Vec<&MsgMixKeyExchange> = Vec::new();
         for e in self.pool.values() {
-            if let PoolMessage::KE(ke) = &e.msg {
-                if ke.epoch == epoch {
-                    epoch_kes.push(ke);
-                }
+            if let PoolMessage::KE(ke) = &e.msg
+                && ke.epoch == epoch
+            {
+                epoch_kes.push(ke);
             }
         }
         let mut kes: Vec<&MsgMixKeyExchange> = Vec::new();
         'next_ke: for ke in epoch_kes {
             if let Some(hashes) = self.messages_by_identity.get(&ke.identity) {
                 for msg_hash in hashes {
-                    if let Some(e) = self.pool.get(&msg_hash.0) {
-                        if e.msgtype == MsgType::CT && e.sid == ke.session_id {
-                            kes.push(ke);
-                            continue 'next_ke;
-                        }
+                    if let Some(e) = self.pool.get(&msg_hash.0)
+                        && e.msgtype == MsgType::CT
+                        && e.sid == ke.session_id
+                    {
+                        kes.push(ke);
+                        continue 'next_ke;
                     }
                 }
             }
@@ -1593,12 +1592,11 @@ impl<B: MixBlockChain> Pool<B> {
         'pr_loop: for pr in prs {
             if let Some(hashes) = self.messages_by_identity.get(&pr.identity) {
                 for msg_hash in hashes {
-                    if let Some(e) = self.pool.get(&msg_hash.0) {
-                        if let PoolMessage::KE(ke) = &e.msg {
-                            if ke.epoch == epoch {
-                                continue 'pr_loop;
-                            }
-                        }
+                    if let Some(e) = self.pool.get(&msg_hash.0)
+                        && let PoolMessage::KE(ke) = &e.msg
+                        && ke.epoch == epoch
+                    {
+                        continue 'pr_loop;
                     }
                 }
             }
@@ -1753,10 +1751,10 @@ impl<B: MixBlockChain> Pool<B> {
             };
             let pairing = pr.pairing();
             if !completed_pairings.contains(&pairing) {
-                if let Some(timed_out_ids) = timed_out.get(&pairing) {
-                    if timed_out_ids.contains(&id) {
-                        continue;
-                    }
+                if let Some(timed_out_ids) = timed_out.get(&pairing)
+                    && timed_out_ids.contains(&id)
+                {
+                    continue;
                 }
                 active.remove(&id);
             }
@@ -1765,10 +1763,10 @@ impl<B: MixBlockChain> Pool<B> {
         // Remove identities that were in abandoned sessions exceeding
         // the mix limits, unless they also timed out.
         for (id, pairing) in &size_limited {
-            if let Some(timed_out_ids) = timed_out.get(pairing) {
-                if timed_out_ids.contains(id) {
-                    continue;
-                }
+            if let Some(timed_out_ids) = timed_out.get(pairing)
+                && timed_out_ids.contains(id)
+            {
+                continue;
             }
             active.remove(id);
         }
@@ -1793,10 +1791,10 @@ impl<B: MixBlockChain> Pool<B> {
         for (pr, _) in misbehaving.values() {
             let mut ss: Vec<StrikeSetRef> = Vec::new();
             for utxo in &pr.utxos {
-                if let Some(s) = self.strikes.get(&op_key(&utxo.out_point)) {
-                    if !ss.iter().any(|other| Rc::ptr_eq(other, s)) {
-                        ss.push(s.clone());
-                    }
+                if let Some(s) = self.strikes.get(&op_key(&utxo.out_point))
+                    && !ss.iter().any(|other| Rc::ptr_eq(other, s))
+                {
+                    ss.push(s.clone());
                 }
             }
             let merged: StrikeSetRef = match ss.first() {

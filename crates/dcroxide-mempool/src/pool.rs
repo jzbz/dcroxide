@@ -597,15 +597,15 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
     pub fn remove_double_spends(&mut self, tx: &MsgTx, tx_hash: &Hash) {
         for tx_in in &tx.tx_in {
             let key = out_key(&tx_in.previous_out_point);
-            if let Some(redeemer) = self.outpoints.get(&key).cloned() {
-                if redeemer.tx_hash != *tx_hash {
-                    self.remove_transaction(&redeemer.tx.clone(), &redeemer.tx_hash.clone(), true);
-                }
+            if let Some(redeemer) = self.outpoints.get(&key).cloned()
+                && redeemer.tx_hash != *tx_hash
+            {
+                self.remove_transaction(&redeemer.tx.clone(), &redeemer.tx_hash.clone(), true);
             }
-            if let Some(redeemer) = self.staged_outpoints.get(&key).cloned() {
-                if redeemer.tx_hash != *tx_hash {
-                    self.remove_staged_transaction(&redeemer);
-                }
+            if let Some(redeemer) = self.staged_outpoints.get(&key).cloned()
+                && redeemer.tx_hash != *tx_hash
+            {
+                self.remove_staged_transaction(&redeemer);
             }
         }
     }
@@ -991,17 +991,17 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
         // Don't allow non-standard transactions if the mempool config
         // forbids their acceptance and relaying.
         let median_time = self.chain.past_median_time();
-        if !self.policy.accept_non_std {
-            if let Err(err) = check_transaction_standard(
+        if !self.policy.accept_non_std
+            && let Err(err) = check_transaction_standard(
                 &tx,
                 tx_type,
                 next_block_height,
                 median_time,
                 self.policy.min_relay_tx_fee,
-            ) {
-                let str = format!("transaction {tx_hash} is not standard: {}", err.description);
-                return Err(wrap_tx_rule_error(ErrorKind::NonStandard, str, &err).into());
-            }
+            )
+        {
+            let str = format!("transaction {tx_hash} is not standard: {}", err.description);
+            return Err(wrap_tx_rule_error(ErrorKind::NonStandard, str, &err).into());
         }
 
         // If the transaction is a ticket, ensure that it meets the
@@ -1195,8 +1195,8 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
 
         // Don't allow transactions with non-standard inputs if the
         // mempool config forbids their acceptance and relaying.
-        if !self.policy.accept_non_std {
-            if let Err(err) = check_inputs_standard(
+        if !self.policy.accept_non_std
+            && let Err(err) = check_inputs_standard(
                 &tx,
                 tx_type,
                 |op| {
@@ -1205,13 +1205,13 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
                         .map(|e| (e.script_version(), e.pk_script().to_vec()))
                 },
                 is_treasury_enabled,
-            ) {
-                let str = format!(
-                    "transaction {tx_hash} has a non-standard input: {}",
-                    err.description
-                );
-                return Err(wrap_tx_rule_error(ErrorKind::NonStandard, str, &err).into());
-            }
+            )
+        {
+            let str = format!(
+                "transaction {tx_hash} has a non-standard input: {}",
+                err.description
+            );
+            return Err(wrap_tx_rule_error(ErrorKind::NonStandard, str, &err).into());
         }
 
         // Don't allow transactions with an excessive number of

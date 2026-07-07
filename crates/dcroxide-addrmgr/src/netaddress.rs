@@ -127,15 +127,16 @@ pub(crate) fn derive_net_address_type(addr_bytes: &[u8]) -> Result<NetAddressTyp
 /// Convert the provided address bytes into a standard structure based
 /// on the type (dcrd `canonicalizeIP`).
 pub(crate) fn canonicalize_ip(addr_type: NetAddressType, addr_bytes: &[u8]) -> Vec<u8> {
-    if addr_bytes.len() == 16 && addr_type == NetAddressType::IPv4 {
-        if let Some(ip4) = to4(addr_bytes) {
-            return ip4.to_vec();
-        }
+    if addr_bytes.len() == 16
+        && addr_type == NetAddressType::IPv4
+        && let Some(ip4) = to4(addr_bytes)
+    {
+        return ip4.to_vec();
     }
-    if addr_type == NetAddressType::IPv6 {
-        if let Some(ip16) = crate::network::to16(addr_bytes) {
-            return ip16.to_vec();
-        }
+    if addr_type == NetAddressType::IPv6
+        && let Some(ip16) = crate::network::to16(addr_bytes)
+    {
+        return ip16.to_vec();
     }
     addr_bytes.to_vec()
 }

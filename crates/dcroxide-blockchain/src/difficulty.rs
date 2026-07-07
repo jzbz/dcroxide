@@ -205,10 +205,10 @@ pub fn calc_next_blake256_diff(
 
         // Get the previous node while staying at the genesis block as
         // needed.
-        if old_node.height > 0 {
-            if let Some(parent) = view.node(old_node.height - 1) {
-                old_node = parent;
-            }
+        if old_node.height > 0
+            && let Some(parent) = view.node(old_node.height - 1)
+        {
+            old_node = parent;
         }
         i += 1;
     }
@@ -249,12 +249,11 @@ pub fn calc_next_blake256_diff(
 
     // Impose the maximum testnet difficulty after the activation
     // height.
-    if let Some(min_target) = min_testnet_target(params) {
-        if next_diff_big < min_target
-            && (!is_testnet3(params) || next_height >= TESTNET3_MAX_DIFF_ACTIVATION_HEIGHT)
-        {
-            next_diff_big = min_target;
-        }
+    if let Some(min_target) = min_testnet_target(params)
+        && next_diff_big < min_target
+        && (!is_testnet3(params) || next_height >= TESTNET3_MAX_DIFF_ACTIVATION_HEIGHT)
+    {
+        next_diff_big = min_target;
     }
 
     // Convert the difficulty to the compact representation and return
@@ -416,10 +415,10 @@ pub fn calc_next_required_stake_difficulty_v1(
 
         // Get the previous node while staying at the genesis block as
         // needed.
-        if old_node.height > 0 {
-            if let Some(parent) = view.node(old_node.height - 1) {
-                old_node = parent;
-            }
+        if old_node.height > 0
+            && let Some(parent) = view.node(old_node.height - 1)
+        {
+            old_node = parent;
         }
         i += 1;
     }
@@ -493,10 +492,10 @@ pub fn calc_next_required_stake_difficulty_v1(
 
         // Get the previous node while staying at the genesis block as
         // needed.
-        if old_node.height > 0 {
-            if let Some(parent) = view.node(old_node.height - 1) {
-                old_node = parent;
-            }
+        if old_node.height > 0
+            && let Some(parent) = view.node(old_node.height - 1)
+        {
+            old_node = parent;
         }
         i += 1;
     }
@@ -852,10 +851,10 @@ pub fn estimate_next_stake_difficulty_v1(
 
         // Get the previous node while staying at the genesis block as
         // needed.
-        if old_node.height > 0 {
-            if let Some(parent) = est_view.node(old_node.height - 1) {
-                old_node = parent;
-            }
+        if old_node.height > 0
+            && let Some(parent) = est_view.node(old_node.height - 1)
+        {
+            old_node = parent;
         }
         i += 1;
     }
@@ -929,10 +928,10 @@ pub fn estimate_next_stake_difficulty_v1(
 
         // Get the previous node while staying at the genesis block as
         // needed.
-        if old_node.height > 0 {
-            if let Some(parent) = est_view.node(old_node.height - 1) {
-                old_node = parent;
-            }
+        if old_node.height > 0
+            && let Some(parent) = est_view.node(old_node.height - 1)
+        {
+            old_node = parent;
         }
         i += 1;
     }
