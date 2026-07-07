@@ -619,3 +619,166 @@ pub fn on_addr(
     addr_mgr.add_addresses(&addr_list, &remote_addr);
     OnAddrOutcome::Processed
 }
+
+/// Pick between singular and plural forms (dcrd `pickNoun`).
+pub fn pick_noun<'a>(n: u64, singular: &'a str, plural: &'a str) -> &'a str {
+    if n == 1 { singular } else { plural }
+}
+
+/// The observable outcome of a mempool request (dcrd
+/// `serverPeer.OnMemPool`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnMemPoolOutcome {
+    /// The flood ban score crossed the threshold; the caller bans
+    /// and stops.
+    Banned,
+    /// The inventory vectors to queue for the pool's transactions.
+    Inventory(Vec<dcroxide_wire::InvVect>),
+}
+
+/// Handle a mempool request (dcrd `serverPeer.OnMemPool`): a
+/// decaying ban score increase prevents flooding, and the pool's
+/// transaction hashes become queued inventory.
+pub fn on_mem_pool(
+    state: &mut ServerPeerAddrState,
+    tx_hashes: &[dcroxide_chainhash::Hash],
+    disable_banning: bool,
+    ban_threshold: u32,
+    now_unix: i64,
+) -> OnMemPoolOutcome {
+    // The score decays each minute to half of its value.
+    if add_ban_score(state, 0, 33, disable_banning, ban_threshold, now_unix) {
+        return OnMemPoolOutcome::Banned;
+    }
+
+    let invs = tx_hashes
+        .iter()
+        .map(|hash| dcroxide_wire::InvVect {
+            inv_type: dcroxide_wire::InvType::TX,
+            hash: *hash,
+        })
+        .collect();
+    OnMemPoolOutcome::Inventory(invs)
+}
+
+/// The observable outcome of enforcing the node cf service flag
+/// (dcrd `serverPeer.enforceNodeCFFlag`); every branch disconnects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CfFlagOutcome {
+    /// The ban score was applied (crossing recorded) and the peer
+    /// disconnects.
+    BanAndDisconnect {
+        /// Whether the score crossed the ban threshold.
+        banned: bool,
+    },
+    /// The peer disconnects without a score change.
+    DisconnectOnly,
+}
+
+/// Enforce the node cf service flag for the unsupported version 1
+/// committed filter requests (dcrd `serverPeer.enforceNodeCFFlag`,
+/// reached from `OnGetCFilter`, `OnGetCFHeaders`, and
+/// `OnGetCFTypes`).
+pub fn enforce_node_cf_flag(
+    state: &mut ServerPeerAddrState,
+    protocol_version: u32,
+    disable_banning: bool,
+    ban_threshold: u32,
+    now_unix: i64,
+) -> CfFlagOutcome {
+    // Ban the peer if the protocol version is high enough that the
+    // peer is knowingly violating the protocol and banning is
+    // enabled.
+    if protocol_version >= dcroxide_wire::NODE_CF_VERSION && !disable_banning {
+        let banned = add_ban_score(state, 100, 0, disable_banning, ban_threshold, now_unix);
+        return CfFlagOutcome::BanAndDisconnect { banned };
+    }
+
+    // Disconnect the peer regardless of protocol version or banning
+    // state.
+    CfFlagOutcome::DisconnectOnly
+}
+
+/// The observable outcome of a notfound message (dcrd
+/// `serverPeer.OnNotFound`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnNotFoundOutcome {
+    /// The peer is no longer connected; nothing happens.
+    Ignored,
+    /// An invalid inventory type disconnects the peer.
+    DisconnectInvalidType,
+    /// A ban score crossing with dcrd's reason string; the caller
+    /// bans and stops.
+    Banned(String),
+    /// The message forwards to the network sync manager.
+    Forward,
+}
+
+/// Handle a notfound message (dcrd `serverPeer.OnNotFound`).
+pub fn on_not_found(
+    state: &mut ServerPeerAddrState,
+    connected: bool,
+    inv_list: &[dcroxide_wire::InvVect],
+    disable_banning: bool,
+    ban_threshold: u32,
+    now_unix: i64,
+) -> OnNotFoundOutcome {
+    if !connected {
+        return OnNotFoundOutcome::Ignored;
+    }
+
+    let mut num_blocks: u32 = 0;
+    let mut num_txns: u32 = 0;
+    let mut num_mix_msgs: u32 = 0;
+    for inv in inv_list {
+        match inv.inv_type {
+            dcroxide_wire::InvType::BLOCK => num_blocks += 1,
+            dcroxide_wire::InvType::TX => num_txns += 1,
+            dcroxide_wire::InvType::MIX => num_mix_msgs += 1,
+            _ => return OnNotFoundOutcome::DisconnectInvalidType,
+        }
+    }
+    if num_blocks > 0 {
+        let block_str = pick_noun(u64::from(num_blocks), "block", "blocks");
+        let reason = format!("{num_blocks} {block_str} not found");
+        if add_ban_score(
+            state,
+            20 * num_blocks,
+            0,
+            disable_banning,
+            ban_threshold,
+            now_unix,
+        ) {
+            return OnNotFoundOutcome::Banned(reason);
+        }
+    }
+    if num_txns > 0 {
+        let tx_str = pick_noun(u64::from(num_txns), "transaction", "transactions");
+        let reason = format!("{num_txns} {tx_str} not found");
+        if add_ban_score(
+            state,
+            0,
+            10 * num_txns,
+            disable_banning,
+            ban_threshold,
+            now_unix,
+        ) {
+            return OnNotFoundOutcome::Banned(reason);
+        }
+    }
+    if num_mix_msgs > 0 {
+        let mix_str = pick_noun(u64::from(num_mix_msgs), "mix message", "mix messages");
+        let reason = format!("{num_mix_msgs} {mix_str} not found");
+        if add_ban_score(
+            state,
+            0,
+            10 * num_mix_msgs,
+            disable_banning,
+            ban_threshold,
+            now_unix,
+        ) {
+            return OnNotFoundOutcome::Banned(reason);
+        }
+    }
+    OnNotFoundOutcome::Forward
+}

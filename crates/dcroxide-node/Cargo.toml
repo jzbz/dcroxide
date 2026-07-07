@@ -13,6 +13,7 @@ dcroxide-addrmgr = { path = "../dcroxide-addrmgr" }
 dcroxide-connmgr = { path = "../dcroxide-connmgr" }
 dcroxide-containers = { path = "../dcroxide-containers" }
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-mempool = { path = "../dcroxide-mempool" }
 dcroxide-peer = { path = "../dcroxide-peer" }
 dcroxide-rpc = { path = "../dcroxide-rpc" }

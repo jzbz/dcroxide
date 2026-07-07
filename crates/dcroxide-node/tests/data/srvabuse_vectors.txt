@@ -1,0 +1,10 @@
+mp|1|false||true
+mp|2|false||true
+mp|3|false||true
+mp|4|false|10.0.0.2|false
+cf|getcfilter banning||false
+cf|getcftypes nobanning||false
+nf|invalidtype||false
+nf|blocksban|10.0.0.2|false
+nf|txflood|10.0.0.2|false
+nf|mixflood|10.0.0.2|false
