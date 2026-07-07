@@ -45,6 +45,21 @@ fn rule_error(kind: RuleErrorKind, description: impl Into<String>) -> RuleError 
     }
 }
 
+/// The proof index for the filter header commitment (dcrd
+/// `HeaderCmtFilterIndex`).
+pub const HEADER_CMT_FILTER_INDEX: u32 = 0;
+
+/// A merkle tree inclusion proof and associated proof index for a
+/// header commitment, letting clients prove the commitment root
+/// commits to specific data at the given index (dcrd `HeaderProof`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderProof {
+    /// The leaf index the proof is for.
+    pub proof_index: u32,
+    /// The sibling hashes forming the inclusion proof.
+    pub proof_hashes: Vec<Hash>,
+}
+
 /// The growing chain state: the block tree arena and index together
 /// with the header-processing configuration (the subset of dcrd's
 /// `BlockChain` struct the headers-first path reads).  dcrd's
@@ -223,6 +238,24 @@ impl Chain {
             next_final_state: [0u8; 6],
         };
 
+        // The genesis block's committed filter, mirroring dcrd's
+        // createChainState which stores it so it can be served like
+        // any other block's (the open path stores it too).
+        let mut filters = BTreeMap::new();
+        {
+            struct NoScripts;
+            impl dcroxide_gcs::blockcf2::PrevScripter for NoScripts {
+                fn prev_script(&self, _out: &OutPoint) -> Option<(u16, &[u8])> {
+                    None
+                }
+            }
+            if let Ok(genesis_filter) =
+                dcroxide_gcs::blockcf2::regular(&params.genesis_block, &NoScripts)
+            {
+                filters.insert(params.genesis_block.header.block_hash().0, genesis_filter);
+            }
+        }
+
         Chain {
             store,
             index,
@@ -238,7 +271,7 @@ impl Chain {
             utxo_backend: BTreeMap::new(),
             utxo_cache: BTreeMap::new(),
             spend_journal: BTreeMap::new(),
-            filters: BTreeMap::new(),
+            filters,
             header_commitments: BTreeMap::new(),
             state_snapshot,
             bulk_import_mode: false,
@@ -3141,6 +3174,130 @@ impl Chain {
     pub fn block_locator_from_hash(&self, hash: &Hash) -> Vec<Hash> {
         let node = self.index.lookup_node(hash);
         self.best_chain.block_locator(&self.store, node)
+    }
+
+    /// The version 2 GCS filter for the given block hash along with a
+    /// header commitment inclusion proof, regardless of whether the
+    /// block is part of the main chain (dcrd
+    /// `BlockChain.FilterByBlockHash`).  A missing filter surfaces as
+    /// the no-filter error kind; the filter and commitment leaves are
+    /// served from the in-memory caches the engine keeps in step with
+    /// the database.
+    pub fn filter_by_block_hash(&self, hash: &Hash) -> Result<(FilterV2, HeaderProof), RuleError> {
+        // Avoid a lookup when there is no way the filter data for the
+        // requested block is available.
+        let have_data = self
+            .index
+            .lookup_node(hash)
+            .is_some_and(|node| self.index.node_status(&self.store, node).have_data());
+        if !have_data {
+            return Err(rule_error(
+                RuleErrorKind::NoFilter,
+                format!("no filter available for block {hash}"),
+            ));
+        }
+
+        let Some(filter) = self.filters.get(&hash.0) else {
+            return Err(rule_error(
+                RuleErrorKind::NoFilter,
+                format!("no filter available for block {hash}"),
+            ));
+        };
+        let leaves = self
+            .header_commitments
+            .get(&hash.0)
+            .cloned()
+            .unwrap_or_default();
+
+        // Generate the header commitment inclusion proof for the
+        // filter.
+        let proof = dcroxide_standalone::generate_inclusion_proof(&leaves, HEADER_CMT_FILTER_INDEX);
+        Ok((
+            filter.clone(),
+            HeaderProof {
+                proof_index: HEADER_CMT_FILTER_INDEX,
+                proof_hashes: proof,
+            },
+        ))
+    }
+
+    /// All committed filters between the start and end hashes
+    /// (inclusive) prepared as a batched cfilters response (dcrd
+    /// `BlockChain.LocateCFiltersV2`).  Both blocks must exist and the
+    /// start must be an ancestor of the end; the batch is bounded by
+    /// the wire maximum.
+    pub fn locate_cfilters_v2(
+        &self,
+        start_hash: &Hash,
+        end_hash: &Hash,
+    ) -> Result<dcroxide_wire::MsgCFiltersV2, RuleError> {
+        let start_node = self.index.lookup_node(start_hash).ok_or_else(|| {
+            rule_error(
+                RuleErrorKind::UnknownBlock,
+                format!("block {start_hash} is not known"),
+            )
+        })?;
+        let end_node = self.index.lookup_node(end_hash).ok_or_else(|| {
+            rule_error(
+                RuleErrorKind::UnknownBlock,
+                format!("block {end_hash} is not known"),
+            )
+        })?;
+        if !self.store.is_ancestor_of(start_node, end_node) {
+            return Err(rule_error(
+                RuleErrorKind::NotAnAncestor,
+                format!("start block {start_hash} is not an ancestor of end block {end_hash}"),
+            ));
+        }
+
+        let nb = self.store.node(end_node).height - self.store.node(start_node).height + 1;
+        if nb > dcroxide_wire::MAX_CFILTERS_V2_PER_BATCH as i64 {
+            return Err(rule_error(
+                RuleErrorKind::RequestTooLarge,
+                format!(
+                    "number of requested cfilters {nb} greater than max allowed {}",
+                    dcroxide_wire::MAX_CFILTERS_V2_PER_BATCH
+                ),
+            ));
+        }
+        let nb = nb as usize;
+
+        // Fetch the block hashes for the range by walking parents back
+        // from the end node.
+        let mut hashes = alloc::vec![Hash([0u8; 32]); nb];
+        let mut node = Some(end_node);
+        for slot in hashes.iter_mut().rev() {
+            let id = node.expect("the range is bounded by the ancestor check");
+            *slot = self.store.node(id).hash;
+            node = self.store.node(id).parent;
+        }
+
+        // Build the per-block filter responses with their inclusion
+        // proofs.
+        let mut cfilters = Vec::with_capacity(nb);
+        for hash in &hashes {
+            let Some(filter) = self.filters.get(&hash.0) else {
+                return Err(rule_error(
+                    RuleErrorKind::NoFilter,
+                    format!("no filter available for block {hash}"),
+                ));
+            };
+            let leaves = self
+                .header_commitments
+                .get(&hash.0)
+                .cloned()
+                .unwrap_or_default();
+            let proof =
+                dcroxide_standalone::generate_inclusion_proof(&leaves, HEADER_CMT_FILTER_INDEX);
+            cfilters.push(dcroxide_wire::MsgCFilterV2 {
+                block_hash: *hash,
+                data: filter.bytes().to_vec(),
+                proof_index: HEADER_CMT_FILTER_INDEX,
+                proof_hashes: proof,
+            });
+        }
+
+        Ok(dcroxide_wire::MsgCFiltersV2 { cfilters })
     }
 
     /// Estimate the next stake difficulty by pretending the given
