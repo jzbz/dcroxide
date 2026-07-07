@@ -14,6 +14,7 @@ pub mod config;
 pub mod flags;
 mod gostd;
 pub mod ipc;
+pub mod logo;
 pub mod logsubsys;
 pub mod params;
 pub mod server;
