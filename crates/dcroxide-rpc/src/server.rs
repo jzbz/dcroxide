@@ -1197,6 +1197,11 @@ pub struct Server<C> {
     /// serializes concurrent invocations has no synchronous
     /// counterpart here).
     pub(crate) work_state: WorkState,
+    /// The command registry (dcrd registers commands globally in the
+    /// dcrjson package).
+    pub registry: dcroxide_dcrjson::Registry,
+    /// The help text cacher (dcrd `helpCacher`).
+    pub(crate) help_cacher: crate::help::HelpCacher,
 }
 
 /// The getwork request/submission state (dcrd `workState`).
@@ -1217,9 +1222,13 @@ impl<C: RpcChain> Server<C> {
     /// A new server over the given configuration (the used subset of
     /// dcrd `New`).
     pub fn new(cfg: Config<C>) -> Server<C> {
+        let mut registry = dcroxide_dcrjson::Registry::new();
+        dcroxide_rpctypes::register_all(&mut registry);
         Server {
             cfg,
             work_state: WorkState::default(),
+            registry,
+            help_cacher: crate::help::HelpCacher::new(),
         }
     }
 

@@ -4713,3 +4713,44 @@ pub fn handle_get_work<C: RpcChain>(
     // No data was provided, so the caller is requesting work.
     handle_get_work_request(server)
 }
+
+/// handlehelp (dcrd `handleHelp`); the result is the usage overview
+/// or the method help string.
+pub fn handle_help<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let command = match &c[0] {
+        GoValue::Null => "",
+        GoValue::String(s) => s.as_str(),
+        other => panic!("expected optional string field, got {other:?}"),
+    };
+
+    // Provide a usage overview of all commands when no specific
+    // command was specified.
+    if command.is_empty() {
+        // The context "Failed to generate RPC usage" is log-only.
+        let usage = server
+            .help_cacher
+            .rpc_usage(&server.registry, false)
+            .map_err(|e| rpc_internal_err(&e))?;
+        return Ok(GoValue::String(usage));
+    }
+
+    // Check that the command asked for is supported and implemented.
+    // Only search the main list of handlers since help should not be
+    // provided for commands that are unimplemented or related to
+    // wallet functionality.
+    if !crate::help::RPC_HANDLER_METHODS.contains(&command) {
+        return Err(rpc_invalid_error(&format!("Unknown method: {command}")));
+    }
+
+    // Get the help for the command; the context "Failed to generate
+    // help" is log-only.
+    let help = server
+        .help_cacher
+        .rpc_method_help(&server.registry, command)
+        .map_err(|e| rpc_internal_err(&e))?;
+    Ok(GoValue::String(help))
+}

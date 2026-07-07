@@ -159,8 +159,10 @@ Currently implemented:
   plus the command handler slices (the stateless, chain-query,
   stake-query, mempool/connection, tx/utxo lookup, peer/address,
   submission/control, fee-info/node-info, mining/network/mix, and
-  treasury-vote, and getwork commands — every dcrd handler except
-  help) over a Server scaffold with the chain, mempool, sync and
+  treasury-vote, getwork, and help commands — all 77 dcrd
+  handlers) plus the request dispatch core (parse, route, reply
+  marshalling, and the limited-user gate) over a Server scaffold
+  with the chain, mempool, sync and
   connection managers, indexes, database, filterer, log manager, fee
   estimator, sanity checker, time source, CPU miner, mix pooler,
   profiler and address managers, block templater, and clock behind

@@ -10,6 +10,7 @@
 //! requested, so whichever variant is generated first is returned
 //! for both.
 
+pub mod dispatch;
 pub mod handlers;
 pub mod help;
 pub mod helpdescs;
