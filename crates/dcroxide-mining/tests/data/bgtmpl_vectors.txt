@@ -1,0 +1,39 @@
+bgscen|1|bg: below svh connect|false|true
+bgstep|1|0|connect below svh|false|false|-|false|-|false|false|35f4313ab55ee091d1952d415fa1094ce189ff9dcd33b7b05dc4bdc148931e15|100|1|false|dump: no template generation|-
+bgstep|1|1|stale connect ignored|false|false|-|false|-|false|false|35f4313ab55ee091d1952d415fa1094ce189ff9dcd33b7b05dc4bdc148931e15|100|1|false|dump: no template generation|-
+bgscen|2|bg: max votes connect|false|true
+bgstep|2|0|connect max votes|false|false|-|false|-|false|false|19da5cc8e56714674a39d30dc4e2205549d8e23f406344ad75c6b85e83d393a6|5000|1|false|dump: no template generation|-
+bgscen|3|bg: min votes connect|false|true
+bgstep|3|0|connect min votes|false|false|-|true|-|false|false|00274c44cd09363a1218057f0eeda7be7ae6a492503982d4db7a8f53ba0bb93a|5000|0|false|-|-
+bgstep|3|1|vote below max with timeout|false|false|-|true|-|false|false|00274c44cd09363a1218057f0eeda7be7ae6a492503982d4db7a8f53ba0bb93a|5000|0|false|-|-
+bgstep|3|2|vote reaches max with timeout|false|false|-|false|-|false|false|00274c44cd09363a1218057f0eeda7be7ae6a492503982d4db7a8f53ba0bb93a|5000|1|false|dump: no template generation|-
+bgstep|3|3|vote after timeout|false|false|-|false|-|false|false|00274c44cd09363a1218057f0eeda7be7ae6a492503982d4db7a8f53ba0bb93a|5000|2|false|dump: no template generation|-
+bgscen|4|bg: awaiting min votes|false|true
+bgstep|4|0|connect few votes|false|false|e49d661834827e398240a10713bf233d741d2f9e9f729cd4e59d4565db8e50ea|false|-|true|false|0000000000000000000000000000000000000000000000000000000000000000|0|0|false|-|-
+bgstep|4|1|vote below min|false|false|e49d661834827e398240a10713bf233d741d2f9e9f729cd4e59d4565db8e50ea|false|-|true|false|0000000000000000000000000000000000000000000000000000000000000000|0|0|false|-|-
+bgstep|4|2|vote reaches min|false|false|-|true|-|false|false|e49d661834827e398240a10713bf233d741d2f9e9f729cd4e59d4565db8e50ea|5000|0|false|-|-
+bgstep|4|3|vote reaches max|false|false|-|false|-|false|false|e49d661834827e398240a10713bf233d741d2f9e9f729cd4e59d4565db8e50ea|5000|1|false|dump: no template generation|-
+bgscen|5|bg: side chain reorg by vote|false|true
+bgstep|5|0|connect no votes|false|false|9ef9cd3165050e069cf04454bde1e2ea4c0a50e7f84d7e95317285178bddb9a8|false|-|true|false|0000000000000000000000000000000000000000000000000000000000000000|0|0|false|-|-
+bgstep|5|1|sibling during timeout|false|false|9ef9cd3165050e069cf04454bde1e2ea4c0a50e7f84d7e95317285178bddb9a8|false|-|true|false|0000000000000000000000000000000000000000000000000000000000000000|0|0|false|-|-
+bgstep|5|2|tracking timeout|false|false|9ef9cd3165050e069cf04454bde1e2ea4c0a50e7f84d7e95317285178bddb9a8|false|702eec49b7e4d72cdd69edb72ed9c537b3ad04ab0730068e4674c94bdb9c0dc2|false|false|0000000000000000000000000000000000000000000000000000000000000050|4999|1|false|dump: no template generation|-
+bgstep|5|3|sibling vote reorg|false|false|9ef9cd3165050e069cf04454bde1e2ea4c0a50e7f84d7e95317285178bddb9a8|false|-|false|false|0000000000000000000000000000000000000000000000000000000000000050|4999|1|false|dump: no template generation|OK:9ef9cd3165050e069cf04454bde1e2ea4c0a50e7f84d7e95317285178bddb9a8>702eec49b7e4d72cdd69edb72ed9c537b3ad04ab0730068e4674c94bdb9c0dc2
+bgscen|6|bg: tracking timeout reorg|false|true
+bgstep|6|0|connect no votes|false|false|bc69c297d00d9743d60a27f67d8fd83188c5545bacb732073130b108f49a8d46|false|-|true|false|0000000000000000000000000000000000000000000000000000000000000000|0|0|false|-|-
+bgstep|6|1|timeout reorg fallback|false|false|bc69c297d00d9743d60a27f67d8fd83188c5545bacb732073130b108f49a8d46|false|0bdcdc5ccb9c9b940b6d5cec50458872679df55214a94604ef4bb15d18e4b156|false|false|0000000000000000000000000000000000000000000000000000000000000060|4999|1|false|dump: no template generation|FAIL:bc69c297d00d9743d60a27f67d8fd83188c5545bacb732073130b108f49a8d46>702ced6386e500900893c0c45875f446d38243d309f5f2559399f7a3b5ff1992
+bgscen|7|bg: reorg bracket|false|true
+bgstep|7|0|connect|false|false|-|false|-|false|false|9be77f8b3cd698da26396903de105b35de38520e1d73d54bff2bf64e111ff5c3|100|1|false|dump: no template generation|-
+bgstep|7|1|reorg started|true|false|-|false|-|false|false|0000000000000000000000000000000000000000000000000000000000000000|0|2|false|-|-
+bgstep|7|2|connect during reorg|true|false|-|false|-|false|false|0000000000000000000000000000000000000000000000000000000000000000|0|2|false|-|-
+bgstep|7|3|reorg done|false|false|-|false|-|false|false|9be77f8b3cd698da26396903de105b35de38520e1d73d54bff2bf64e111ff5c3|100|3|false|dump: no template generation|-
+bgscen|8|bg: unsynced gating|false|false
+bgstep|8|0|connect while unsynced|false|false|-|false|-|false|false|0000000000000000000000000000000000000000000000000000000000000000|0|0|false|-|-
+bgscen|9|bg: template updates|false|true
+bgstep|9|0|template update ok|false|true|-|false|-|false|false|0000000000000000000000000000000000000000000000000000000000000090|5000|0|false|-|-
+bgstep|9|1|template update err|false|true|-|false|-|false|true|0000000000000000000000000000000000000000000000000000000000000090|5000|0|false|-|-
+bgscen|10|bg: force regen|false|true
+bgstep|10|0|force regen|false|false|-|false|-|false|false|0000000000000000000000000000000000000000000000000000000000000000|0|1|false|dump: no template generation|-
+bgstep|10|1|force regen ignored|false|false|-|true|-|false|false|0000000000000000000000000000000000000000000000000000000000000000|0|1|false|dump: no template generation|-
+bgscen|11|bg: disconnect|false|true
+bgstep|11|0|disconnect|false|false|-|false|-|false|false|00000000000000000000000000000000000000000000000000000000000000a0|4999|1|false|dump: no template generation|-
+bgstep|11|1|stale disconnect ignored|false|false|-|false|-|false|false|00000000000000000000000000000000000000000000000000000000000000a0|4999|1|false|dump: no template generation|-

@@ -108,9 +108,11 @@ Currently implemented:
   with ancestor statistics tracking, the priority queue with Go's
   exact heap semantics, the priority calculation, the block template
   building blocks (coinbase and treasurybase construction, parent
-  vote sorting, and the template roots), and the full
-  `NewBlockTemplate` assembly replayed byte for byte against dcrd's
-  own harness, wired into the mempool's mining hooks
+  vote sorting, and the template roots), the full `NewBlockTemplate`
+  assembly replayed byte for byte against dcrd's own harness, wired
+  into the mempool's mining hooks, and the background template
+  generator's regeneration state machine replayed against dcrd's own
+  event handlers
 - `dcroxide-gcs` — Golomb-coded set filters (versions 1 and 2) and the
   DCP0005 version 2 block committed filters for light clients, matched
   differentially against dcrd over random filters and structured blocks

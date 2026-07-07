@@ -4,8 +4,8 @@
 //! descriptor types, the dependency graph and mining view with
 //! ancestor statistics tracking, the transaction priority queue with
 //! Go's exact heap semantics, and the priority calculation.  The
-//! block template generation (`NewBlockTemplate`) and the background
-//! template generator arrive with the following pieces.
+//! block template generation (`NewBlockTemplate`), and the background
+//! template generator's regeneration state machine.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
@@ -15,6 +15,7 @@
 
 extern crate alloc;
 
+pub mod bg_generator;
 mod generator;
 mod graph;
 mod policy;
