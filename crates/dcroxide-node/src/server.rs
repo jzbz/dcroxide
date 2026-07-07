@@ -1774,3 +1774,100 @@ pub fn build_get_headers_response(
     }
     GetHeadersResponse::Headers(located)
 }
+
+/// The outcome of resolving a single getdata inventory item against
+/// the advertised-transaction cache, mempool, chain, or mix pool
+/// (the fetch seams dcrd's `handleServeGetData` consults).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GetDataResolution {
+    /// The requested item was fetched; its data message is queued.
+    Found,
+    /// The requested item could not be found; it is accumulated into
+    /// the consolidated notfound response.
+    NotFound,
+    /// The inventory type is unknown; the item is skipped entirely
+    /// (dcrd neither serves it, records it as not found, nor
+    /// decrements the pending counter).
+    UnknownType,
+}
+
+/// A single action the getdata server takes, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeGetDataAction {
+    /// Queue the resolved data message for the given inventory item.
+    QueueData(dcroxide_wire::InvVect),
+    /// Queue a single-item inventory of the current best tip to
+    /// trigger the peer to request the next getblocks batch, sent
+    /// after the block that was the advertised continuation.
+    QueueContinueInv(dcroxide_chainhash::Hash),
+    /// Queue the consolidated notfound message at the end of the
+    /// batch.
+    QueueNotFound(Vec<dcroxide_wire::InvVect>),
+}
+
+/// What the getdata server decided over a batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeGetDataOutcome {
+    /// The actions in the exact order they are queued to the peer.
+    pub actions: Vec<ServeGetDataAction>,
+    /// Whether the stored continuation hash was cleared (after
+    /// serving the block it referenced).
+    pub cleared_continue_hash: bool,
+    /// The number of pending data item requests to decrement (dcrd
+    /// decrements for served and not-found items, but not for unknown
+    /// types).
+    pub pending_decrements: u32,
+}
+
+/// Serve a batch of getdata inventory items: queue each resolved data
+/// message in request order, accumulate the misses into a single
+/// notfound message sent last, and — when a served block was the
+/// advertised continuation — queue a best-tip inventory afterward and
+/// clear the continuation (dcrd `serverPeer.handleServeGetData`).
+/// dcrd's send semaphore and pipelining are concurrency machinery and
+/// are not reproduced; the item fetches are the caller's seams.
+pub fn serve_get_data(
+    items: &[(dcroxide_wire::InvVect, GetDataResolution)],
+    continue_hash: Option<dcroxide_chainhash::Hash>,
+    best_hash: dcroxide_chainhash::Hash,
+) -> ServeGetDataOutcome {
+    let mut actions = Vec::new();
+    let mut not_found = Vec::new();
+    let mut cleared_continue_hash = false;
+    let mut pending_decrements = 0;
+
+    for (iv, resolution) in items {
+        match resolution {
+            GetDataResolution::UnknownType => {
+                // Unknown inventory types are skipped without a
+                // notfound entry or a pending decrement.
+                continue;
+            }
+            GetDataResolution::NotFound => {
+                not_found.push(*iv);
+                pending_decrements += 1;
+            }
+            GetDataResolution::Found => {
+                actions.push(ServeGetDataAction::QueueData(*iv));
+                pending_decrements += 1;
+
+                // When the served block was the advertised
+                // continuation, trigger the next getblocks batch.
+                if iv.inv_type == dcroxide_wire::InvType::BLOCK && continue_hash == Some(iv.hash) {
+                    actions.push(ServeGetDataAction::QueueContinueInv(best_hash));
+                    cleared_continue_hash = true;
+                }
+            }
+        }
+    }
+
+    if !not_found.is_empty() {
+        actions.push(ServeGetDataAction::QueueNotFound(not_found));
+    }
+
+    ServeGetDataOutcome {
+        actions,
+        cleared_continue_hash,
+        pending_decrements,
+    }
+}
