@@ -32,8 +32,8 @@ impl NetAddress {
     }
 
     /// A string representation of the IP field without the port (dcrd
-    /// `ipString`).
-    pub(crate) fn ip_string(&self) -> String {
+    /// `ipString`, rendered like Go's `net.IP.String`).
+    pub fn ip_string(&self) -> String {
         match self.addr_type {
             NetAddressType::IPv4 | NetAddressType::IPv6 => ip_to_string(&self.ip),
             NetAddressType::Unknown => {

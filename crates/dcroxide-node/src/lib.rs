@@ -16,6 +16,7 @@ mod gostd;
 pub mod ipc;
 pub mod logsubsys;
 pub mod params;
+pub mod server;
 pub mod version;
 
 pub use config::{
@@ -31,3 +32,9 @@ pub use gostd::{go_duration_string, parse_go_duration};
 pub use ipc::{LifetimeAction, LifetimeEventId, PipeMessage};
 pub use logsubsys::{LogLevel, LogLevels, parse_and_set_debug_levels, supported_subsystems};
 pub use params::{ActiveNet, NodeParams};
+pub use server::{
+    DEFAULT_TARGET_OUTBOUND, MAX_CACHED_NA_SUBMISSIONS, NaSubmission, NaSubmissionCache,
+    addrmgr_to_wire_net_address, has_services, host_to_net_address, is_supported_net_addr_type_v1,
+    natf_supported, resolve_local_address, wire_to_addrmgr_net_address,
+    wire_to_addrmgr_net_addresses,
+};

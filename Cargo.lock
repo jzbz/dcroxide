@@ -434,10 +434,12 @@ dependencies = [
 name = "dcroxide-node"
 version = "0.1.0"
 dependencies = [
+ "dcroxide-addrmgr",
  "dcroxide-chaincfg",
  "dcroxide-mempool",
  "dcroxide-rpc",
  "dcroxide-txscript",
+ "dcroxide-wire",
  "tempfile",
 ]
 

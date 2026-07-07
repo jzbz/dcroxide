@@ -1,0 +1,24 @@
+scache|initial|1.2.3.4;1;4;1;200,2001:4860:4860::8888;2;5;1;300,8.8.8.8;1;4;1;100
+scache|incremented|1.2.3.4;1;4;1;200,2001:4860:4860::8888;2;5;1;300,8.8.8.8;1;4;4;150
+sexists|8.8.8.8|true
+sexists|9.9.9.9|false
+sexists||false
+sincerr|9.9.9.9|submission key not found: 9.9.9.9
+scache|readded|1.2.3.4;1;4;1;200,2001:4860:4860::8888;2;5;1;300,8.8.8.8;1;4;1;400
+scache|evicted|2001:4860:4860::8888;2;5;1;300,5.6.7.8;1;4;1;500,8.8.8.8;1;4;1;400,9.10.11.12;1;4;1;600
+sbest|1|5.6.7.8;7
+sbest|2|2001:4860:4860::8888;1
+shost|8.8.8.8|ok|8.8.8.8:19108|1
+shost|2001:4860:4860::8888|ok|[2001:4860:4860::8888]:19108|2
+shost|::ffff:1.2.3.4|ok|1.2.3.4:19108|1
+shost|resolves.example|ok|93.184.216.34:19108|1
+shost|empty.example|err|no addresses found for empty.example
+shost|fails.example|err|lookup failed for fails.example
+srla|1|below majority|
+srla|2|exact listener match|8.8.8.8;9108
+srla|3|generic listener|8.8.8.8;9108
+srla|4|external v4 endpoint|8.8.4.4;9108
+srla|5|external v6 endpoint|2001:4860:4860::8888;9108
+srla|6|reach mismatch|
+srla|7|low maxpeers majority|8.8.8.8;9108
+srla|8|zoned v6 listener|2001:4860:4860::8888;9108

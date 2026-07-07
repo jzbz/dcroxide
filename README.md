@@ -191,8 +191,9 @@ Currently implemented:
   dcrd's exact error strings, replayed field for field against
   dcrd's own loadConfig, plus the network parameter groupings, the
   embedded sample config, the logging subsystem registry, the pipe
-  IPC lifecycle protocol framed byte for byte, and the version
-  machinery with dcrd's semver parsing
+  IPC lifecycle protocol framed byte for byte, the version machinery
+  with dcrd's semver parsing, and the P2P server's address
+  bookkeeping (the submission cache and local address resolution)
 - `dcroxide-peer` — the peer-to-peer protocol decision core from
   dcrd's `peer` package: version negotiation with self-connection
   detection and dcrd's exact acceptance rules, local version
