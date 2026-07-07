@@ -236,7 +236,7 @@ Currently implemented:
 
 ## Development
 
-Rust ≥ 1.85 (MSRV) and a Go toolchain (for the oracle-backed differential
+Rust ≥ 1.88 (MSRV) and a Go toolchain (for the oracle-backed differential
 tests; without Go those tests skip).
 
 ```sh

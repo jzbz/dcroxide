@@ -37,7 +37,7 @@ exclude = ["fuzz"]
 version = "0.1.0"
 authors = ["The dcroxide developers"]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "ISC"
 repository = "https://github.com/jzbz/dcroxide"
 

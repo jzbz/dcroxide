@@ -20,4 +20,4 @@ ADR instead of editing). Use [template.md](template.md).
 - **D5** — Upstream tracking cadence once dcrd 2.2 lands
 - **D6** — dcr-rs relationship (upstream vs. fork) — partially covered by ADR-0002
 - **D7** — MSRV, platform tiers, release signing/reproducibility (MSRV
-  currently 1.85 via workspace `rust-version`; formal ADR pending)
+  currently 1.88 via workspace `rust-version`; formal ADR pending)
