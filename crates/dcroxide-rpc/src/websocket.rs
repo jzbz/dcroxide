@@ -7,6 +7,9 @@
 //! fan-out) has no synchronous counterpart; the notification manager
 //! sits behind a seam.
 
+// Amount accumulation and pool pruning arithmetic mirror Go.
+#![allow(clippy::arithmetic_side_effects)]
+
 use std::collections::HashSet;
 
 use dcroxide_chainhash::Hash;
@@ -698,4 +701,552 @@ pub fn ws_service_request<C: RpcChain>(
         err.as_ref(),
     )
     .ok()
+}
+
+/// A template update reason (dcrd `mining.TemplateUpdateReason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateUpdateReason {
+    /// A new parent block (dcrd `TURNewParent`).
+    NewParent,
+    /// New votes arrived (dcrd `TURNewVotes`).
+    NewVotes,
+    /// New transactions arrived (dcrd `TURNewTxns`).
+    NewTxns,
+}
+
+/// Convert a template update reason to the work notification string
+/// (dcrd `updateReasonToWorkNtfnString`).
+fn update_reason_to_work_ntfn_string(reason: TemplateUpdateReason) -> &'static str {
+    match reason {
+        TemplateUpdateReason::NewParent => "newparent",
+        TemplateUpdateReason::NewVotes => "newvotes",
+        TemplateUpdateReason::NewTxns => "newtxns",
+    }
+}
+
+/// Marshal a notification exactly like dcrd's
+/// `dcrjson.MarshalCmd("1.0", nil, &ntfn)`.
+fn marshal_ntfn<C: RpcChain>(
+    server: &Server<C>,
+    ntfn_type: dcroxide_dcrjson::GoType,
+    fields: Vec<GoValue>,
+) -> Option<String> {
+    let instance = dcroxide_dcrjson::CmdInstance {
+        cmd_type: ntfn_type.ptr(),
+        nil: false,
+        fields,
+    };
+    dcroxide_dcrjson::marshal_cmd(&server.registry, "1.0", &RpcId::Null, &instance).ok()
+}
+
+/// The clients whose filters consider the transaction relevant,
+/// updating their filters to watch discovered outputs; the result is
+/// parallel to the client list (dcrd `subscribedClients`, which also
+/// covers the ticket commitment address path).
+pub fn subscribed_clients<C: RpcChain>(
+    server: &mut Server<C>,
+    tx: &MsgTx,
+    tree: i8,
+    clients: &mut [&mut WsClient],
+) -> Vec<bool> {
+    let params = server.cfg.chain_params.clone();
+    let mut subscribed = vec![false; clients.len()];
+
+    let mut is_ticket = false; // lazily set
+    for (ci, client) in clients.iter_mut().enumerate() {
+        let Some(f) = client.filter_data.as_mut() else {
+            continue;
+        };
+
+        for input in &tx.tx_in {
+            if f.exists_unspent_out_point(&input.previous_out_point) {
+                subscribed[ci] = true;
+            }
+        }
+
+        for (i, output) in tx.tx_out.iter().enumerate() {
+            let mut watch_output = true;
+            let (script_type, mut addrs) =
+                stdscript::extract_addrs(output.version, &output.pk_script, &params);
+            if script_type == stdscript::ScriptType::NonStandard {
+                // Clients are not able to subscribe to nonstandard or
+                // non-address outputs.
+                continue;
+            }
+            if script_type == stdscript::ScriptType::NullData
+                && i & 1 == 1
+                && (is_ticket || dcroxide_stake::is_sstx(tx))
+            {
+                is_ticket = true;
+                // OP_RETURN ticket commitments may contain relevant
+                // P2PKH or P2SH HASH160s.  These outputs cannot be
+                // spent and do not need to be watched.
+                match dcroxide_stake::addr_from_sstx_pk_scr_commitment(&output.pk_script, &params) {
+                    Ok(addr) => {
+                        addrs = vec![addr];
+                        watch_output = false;
+                    }
+                    Err(_) => continue, // log-only in dcrd
+                }
+            }
+            for a in &addrs {
+                if f.exists_address(a) {
+                    subscribed[ci] = true;
+                    if watch_output {
+                        let op = OutPoint {
+                            hash: tx.tx_hash(),
+                            index: i as u32,
+                            tree,
+                        };
+                        f.add_unspent_out_point(&op);
+                    }
+                }
+            }
+        }
+    }
+
+    subscribed
+}
+
+/// Notify block-update clients about a connected block; the result
+/// pairs each notified client's session id with the marshalled
+/// notification (dcrd `notifyBlockConnected`).
+pub fn notify_block_connected<C: RpcChain>(
+    server: &mut Server<C>,
+    clients: &mut [&mut WsClient],
+    block: &MsgBlock,
+) -> Vec<(u64, String)> {
+    if clients.is_empty() {
+        return Vec::new();
+    }
+
+    // The common portion of the notification.
+    let header_hex: String = block
+        .header
+        .serialize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    // Search for relevant transactions for each client.
+    let mut subscribed_txs: Vec<Vec<String>> = vec![Vec::new(); clients.len()];
+    for tx in &block.stransactions {
+        let flags = subscribed_clients(server, tx, 1, clients);
+        for (ci, hit) in flags.iter().enumerate() {
+            if *hit {
+                subscribed_txs[ci].push(tx_hex_string(tx));
+            }
+        }
+    }
+    for tx in &block.transactions {
+        let flags = subscribed_clients(server, tx, 0, clients);
+        for (ci, hit) in flags.iter().enumerate() {
+            if *hit {
+                subscribed_txs[ci].push(tx_hex_string(tx));
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(clients.len());
+    for (ci, client) in clients.iter().enumerate() {
+        let txs = if subscribed_txs[ci].is_empty() {
+            GoValue::Null
+        } else {
+            GoValue::Array(
+                subscribed_txs[ci]
+                    .iter()
+                    .map(|s| GoValue::String(s.clone()))
+                    .collect(),
+            )
+        };
+        if let Some(marshalled) = marshal_ntfn(
+            server,
+            dcroxide_rpctypes::chainsvrwsntfns::block_connected_ntfn(),
+            vec![GoValue::String(header_hex.clone()), txs],
+        ) {
+            out.push((client.session_id, marshalled));
+        }
+    }
+    out
+}
+
+/// Notify block-update clients about a disconnected block (dcrd
+/// `notifyBlockDisconnected`).
+pub fn notify_block_disconnected<C: RpcChain>(
+    server: &mut Server<C>,
+    clients: &[&mut WsClient],
+    block: &MsgBlock,
+) -> Vec<(u64, String)> {
+    if clients.is_empty() {
+        return Vec::new();
+    }
+
+    let header_hex: String = block
+        .header
+        .serialize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let Some(marshalled) = marshal_ntfn(
+        server,
+        dcroxide_rpctypes::chainsvrwsntfns::block_disconnected_ntfn(),
+        vec![GoValue::String(header_hex)],
+    ) else {
+        return Vec::new();
+    };
+    clients
+        .iter()
+        .map(|c| (c.session_id, marshalled.clone()))
+        .collect()
+}
+
+/// Notify work-update clients about a new block template, adding the
+/// template to the pool and pruning it when the parent changed (dcrd
+/// `notifyWork`).
+pub fn notify_work<C: RpcChain>(
+    server: &mut Server<C>,
+    clients: &[&mut WsClient],
+    template_block: &MsgBlock,
+    reason: TemplateUpdateReason,
+) -> Vec<(u64, String)> {
+    if clients.is_empty() {
+        return Vec::new();
+    }
+
+    // Serialize the data that represents work to be solved; the
+    // agenda failure is log-only.
+    let header = template_block.header;
+    let Ok(is_blake3_pow_active) = server
+        .cfg
+        .chain
+        .is_blake3_pow_agenda_active(&header.prev_block)
+    else {
+        return Vec::new();
+    };
+    let data = crate::handlers::serialize_get_work_data(&header, is_blake3_pow_active);
+
+    // The byte-swapped legacy target.
+    let target =
+        crate::helpers::big_to_le_uint256(&dcroxide_standalone::compact_to_big(header.bits));
+
+    let Some(marshalled) = marshal_ntfn(
+        server,
+        dcroxide_rpctypes::chainsvrwsntfns::work_ntfn(),
+        vec![
+            GoValue::String(data.iter().map(|b| format!("{b:02x}")).collect()),
+            GoValue::String(target.iter().map(|b| format!("{b:02x}")).collect()),
+            GoValue::String(update_reason_to_work_ntfn_string(reason).to_string()),
+        ],
+    ) else {
+        return Vec::new();
+    };
+
+    // Prune old templates when the best block changed and add the
+    // template to the pool.
+    let template_key = crate::handlers::get_work_template_key(&header);
+    if reason == TemplateUpdateReason::NewParent {
+        let best_height = server.cfg.chain.best_snapshot().height;
+        let prune_height = best_height - 3;
+        server
+            .work_state
+            .template_pool
+            .retain(|_, block| i64::from(block.header.height) >= prune_height);
+    }
+    server
+        .work_state
+        .template_pool
+        .insert(template_key, template_block.clone());
+
+    clients
+        .iter()
+        .map(|c| (c.session_id, marshalled.clone()))
+        .collect()
+}
+
+/// Notify tspend clients about a new mempool treasury spend (dcrd
+/// `notifyTSpend`).
+pub fn notify_tspend<C: RpcChain>(
+    server: &mut Server<C>,
+    clients: &[&mut WsClient],
+    tspend: &MsgTx,
+) -> Vec<(u64, String)> {
+    if clients.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(marshalled) = marshal_ntfn(
+        server,
+        dcroxide_rpctypes::chainsvrwsntfns::tspend_ntfn(),
+        vec![GoValue::String(tx_hex_string(tspend))],
+    ) else {
+        return Vec::new();
+    };
+    clients
+        .iter()
+        .map(|c| (c.session_id, marshalled.clone()))
+        .collect()
+}
+
+/// Notify block-update clients about a chain reorganization (dcrd
+/// `notifyReorganization`).
+pub fn notify_reorganization<C: RpcChain>(
+    server: &mut Server<C>,
+    clients: &[&mut WsClient],
+    old_hash: &Hash,
+    old_height: i64,
+    new_hash: &Hash,
+    new_height: i64,
+) -> Vec<(u64, String)> {
+    if clients.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(marshalled) = marshal_ntfn(
+        server,
+        dcroxide_rpctypes::chainsvrwsntfns::reorganization_ntfn(),
+        vec![
+            GoValue::String(old_hash.to_string()),
+            GoValue::Int(i64::from(old_height as i32)),
+            GoValue::String(new_hash.to_string()),
+            GoValue::Int(i64::from(new_height as i32)),
+        ],
+    ) else {
+        return Vec::new();
+    };
+    clients
+        .iter()
+        .map(|c| (c.session_id, marshalled.clone()))
+        .collect()
+}
+
+/// Notify winning-ticket clients (dcrd `notifyWinningTickets`; the
+/// tickets ride in a map keyed by their decimal index).
+pub fn notify_winning_tickets_ntfn<C: RpcChain>(
+    server: &mut Server<C>,
+    clients: &[&mut WsClient],
+    block_hash: &Hash,
+    block_height: i64,
+    tickets: &[Hash],
+) -> Vec<(u64, String)> {
+    let ticket_map: Vec<(String, GoValue)> = tickets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (i.to_string(), GoValue::String(t.to_string())))
+        .collect();
+
+    let Some(marshalled) = marshal_ntfn(
+        server,
+        dcroxide_rpctypes::chainsvrwsntfns::winning_tickets_ntfn(),
+        vec![
+            GoValue::String(block_hash.to_string()),
+            GoValue::Int(i64::from(block_height as i32)),
+            GoValue::Map(ticket_map),
+        ],
+    ) else {
+        return Vec::new();
+    };
+    clients
+        .iter()
+        .map(|c| (c.session_id, marshalled.clone()))
+        .collect()
+}
+
+/// Notify maturing-ticket clients (dcrd `notifyNewTickets`).
+pub fn notify_new_tickets<C: RpcChain>(
+    server: &mut Server<C>,
+    clients: &[&mut WsClient],
+    hash: &Hash,
+    height: i64,
+    stake_difficulty: i64,
+    tickets_new: &[Hash],
+) -> Vec<(u64, String)> {
+    let tickets: Vec<GoValue> = tickets_new
+        .iter()
+        .map(|h| GoValue::String(h.to_string()))
+        .collect();
+
+    let Some(marshalled) = marshal_ntfn(
+        server,
+        dcroxide_rpctypes::chainsvrwsntfns::new_tickets_ntfn(),
+        vec![
+            GoValue::String(hash.to_string()),
+            GoValue::Int(i64::from(height as i32)),
+            GoValue::Int(stake_difficulty),
+            GoValue::Array(tickets),
+        ],
+    ) else {
+        return Vec::new();
+    };
+    clients
+        .iter()
+        .map(|c| (c.session_id, marshalled.clone()))
+        .collect()
+}
+
+/// Notify mempool-transaction clients about a new transaction, with
+/// the verbose variant for clients that requested it (dcrd
+/// `notifyForNewTx`).
+pub fn notify_for_new_tx<C: RpcChain>(
+    server: &mut Server<C>,
+    clients: &[&mut WsClient],
+    tx: &MsgTx,
+) -> Vec<(u64, String)> {
+    let tx_hash_str = tx.tx_hash().to_string();
+
+    let mut amount: i64 = 0;
+    for tx_out in &tx.tx_out {
+        amount += tx_out.value;
+    }
+
+    let Some(marshalled) = marshal_ntfn(
+        server,
+        dcroxide_rpctypes::chainsvrwsntfns::tx_accepted_ntfn(),
+        vec![
+            GoValue::String(tx_hash_str.clone()),
+            GoValue::Float64(txresults::to_coin(amount)),
+        ],
+    ) else {
+        return Vec::new();
+    };
+
+    // Determine if the treasury rules are active as of the current
+    // best tip; the failure is log-only.
+    let prev_blk_hash = server.cfg.chain.best_snapshot().hash;
+    let Ok(is_treasury_enabled) = server.cfg.chain.is_treasury_agenda_active(&prev_blk_hash) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::with_capacity(clients.len());
+    let mut marshalled_verbose: Option<String> = None;
+    for client in clients {
+        if client.verbose_tx_updates {
+            if let Some(verbose) = &marshalled_verbose {
+                out.push((client.session_id, verbose.clone()));
+                continue;
+            }
+
+            let Ok(raw_tx) = txresults::create_tx_raw_result(
+                &server.cfg.chain_params,
+                tx,
+                &tx_hash_str,
+                0xffffffff, // wire.NullBlockIndex
+                None,
+                "",
+                0,
+                0,
+                is_treasury_enabled,
+                server.cfg.max_protocol_version,
+                server.cfg.chain_params.net,
+            ) else {
+                // dcrd returns silently, skipping remaining clients.
+                return out;
+            };
+
+            let Some(verbose) = marshal_ntfn(
+                server,
+                dcroxide_rpctypes::chainsvrwsntfns::tx_accepted_verbose_ntfn(),
+                vec![raw_tx],
+            ) else {
+                return out;
+            };
+            out.push((client.session_id, verbose.clone()));
+            marshalled_verbose = Some(verbose);
+        } else {
+            out.push((client.session_id, marshalled.clone()));
+        }
+    }
+    out
+}
+
+/// Notify clients whose filters find the transaction relevant,
+/// watching discovered outputs (dcrd `notifyRelevantTxAccepted`).
+pub fn notify_relevant_tx_accepted<C: RpcChain>(
+    server: &mut Server<C>,
+    clients: &mut [&mut WsClient],
+    tx: &MsgTx,
+    tree: i8,
+) -> Vec<(u64, String)> {
+    let params = server.cfg.chain_params.clone();
+    let mut notify = vec![false; clients.len()];
+
+    for (ci, client) in clients.iter_mut().enumerate() {
+        let Some(f) = client.filter_data.as_mut() else {
+            continue;
+        };
+
+        for input in &tx.tx_in {
+            if f.exists_unspent_out_point(&input.previous_out_point) {
+                notify[ci] = true;
+            }
+        }
+
+        for (i, output) in tx.tx_out.iter().enumerate() {
+            let (script_type, addrs) =
+                stdscript::extract_addrs(output.version, &output.pk_script, &params);
+            if script_type == stdscript::ScriptType::NonStandard {
+                continue;
+            }
+            for a in &addrs {
+                if f.exists_address(a) {
+                    notify[ci] = true;
+
+                    let op = OutPoint {
+                        hash: tx.tx_hash(),
+                        index: i as u32,
+                        tree,
+                    };
+                    f.add_unspent_out_point(&op);
+                }
+            }
+        }
+    }
+
+    if !notify.iter().any(|n| *n) {
+        return Vec::new();
+    }
+    let Some(marshalled) = marshal_ntfn(
+        server,
+        dcroxide_rpctypes::chainsvrwsntfns::relevant_tx_accepted_ntfn(),
+        vec![GoValue::String(tx_hex_string(tx))],
+    ) else {
+        return Vec::new();
+    };
+    clients
+        .iter()
+        .zip(notify.iter())
+        .filter(|(_, hit)| **hit)
+        .map(|(c, _)| (c.session_id, marshalled.clone()))
+        .collect()
+}
+
+/// Notify mix-message clients about an accepted mixing message (dcrd
+/// `notifyMixMessage`).
+pub fn notify_mix_message<C: RpcChain>(
+    server: &mut Server<C>,
+    clients: &[&mut WsClient],
+    msg: &Message,
+) -> Vec<(u64, String)> {
+    if clients.is_empty() {
+        return Vec::new();
+    }
+
+    // The encode failure is log-only and unreachable for accepted
+    // messages.
+    let Ok(payload_hex) = txresults::message_to_hex(msg, dcroxide_wire::MIX_VERSION) else {
+        return Vec::new();
+    };
+    let Some(marshalled) = marshal_ntfn(
+        server,
+        dcroxide_rpctypes::chainsvrwsntfns::mix_message_ntfn(),
+        vec![
+            GoValue::String(msg.command().to_string()),
+            GoValue::String(payload_hex),
+        ],
+    ) else {
+        return Vec::new();
+    };
+    clients
+        .iter()
+        .map(|c| (c.session_id, marshalled.clone()))
+        .collect()
 }

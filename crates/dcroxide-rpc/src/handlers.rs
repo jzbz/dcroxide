@@ -4388,7 +4388,7 @@ fn blake256_pad() -> Vec<u8> {
 
 /// The key for the template pool: the merkle root and stake root pair
 /// (dcrd `getWorkTemplateKey`).
-fn get_work_template_key(header: &dcroxide_wire::BlockHeader) -> [u8; 64] {
+pub(crate) fn get_work_template_key(header: &dcroxide_wire::BlockHeader) -> [u8; 64] {
     let mut key = [0u8; 64];
     key[..32].copy_from_slice(&header.merkle_root.0);
     key[32..].copy_from_slice(&header.stake_root.0);
@@ -4399,7 +4399,7 @@ fn get_work_template_key(header: &dcroxide_wire::BlockHeader) -> [u8; 64] {
 /// the internal padding for the active hash function (dcrd
 /// `serializeGetWorkData`; the serialization error path is
 /// unreachable here).
-fn serialize_get_work_data(
+pub(crate) fn serialize_get_work_data(
     header: &dcroxide_wire::BlockHeader,
     is_blake3_pow_active: bool,
 ) -> Vec<u8> {

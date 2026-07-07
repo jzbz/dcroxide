@@ -164,7 +164,8 @@ Currently implemented:
   marshalling, and the limited-user gate), Basic auth over HMAC'd
   credentials, the single/batched request body processing, and the
   websocket client core (transaction filters, rescans, and the
-  websocket command handlers) over a Server scaffold
+  websocket command handlers), and the websocket notification
+  builders over a Server scaffold
   with the chain, mempool, sync and
   connection managers, indexes, database, filterer, log manager, fee
   estimator, sanity checker, time source, CPU miner, mix pooler,
