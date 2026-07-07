@@ -156,12 +156,13 @@ Currently implemented:
   help/usage provider) and the handlers' pure transform layer (the
   RPC error constructors, address/hash/difficulty helpers, getwork
   serialization, and the vin/vout/raw-transaction result builders),
-  plus the first command handler slices (the stateless, chain-query,
+  plus the command handler slices (the stateless, chain-query,
   stake-query, mempool/connection, tx/utxo lookup, peer/address,
-  submission/control, and fee-info/node-info commands) over a Server
-  scaffold with the chain, mempool, sync and connection managers,
-  indexes, database, filterer, log manager, fee estimator, sanity
-  checker, time source, and clock behind trait seams, pinned by the complete generated help text,
+  submission/control, fee-info/node-info, and mining/network/mix
+  commands) over a Server scaffold with the chain, mempool, sync and
+  connection managers, indexes, database, filterer, log manager, fee
+  estimator, sanity checker, time source, CPU miner, mix pooler,
+  profiler and address managers, and clock behind trait seams, pinned by the complete generated help text,
   fully marshalled transaction results, and per-handler
   request/response cases from sessions generated inside dcrd's own
   package

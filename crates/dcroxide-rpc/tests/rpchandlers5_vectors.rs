@@ -359,6 +359,8 @@ fn tx_utxo_handler_slice_matches_dcrd() {
                 bits: 0,
                 next_stake_diff: 0,
                 total_subsidy: 0,
+                block_size: 0,
+                num_txns: 0,
             },
             block_height_by_hash: rest[1].parse().unwrap(),
             header: header_fixture,
@@ -425,6 +427,15 @@ fn tx_utxo_handler_slice_matches_dcrd() {
             proxy: String::new(),
             test_net: false,
             runtime_version: String::new(),
+            cpu_miner: Box::new(()),
+            mix_pooler: Box::new(()),
+            profiler_mgr: Box::new(()),
+            addr_manager: Box::new(()),
+            mining_addrs: Vec::new(),
+            user_agent_version: String::new(),
+            net_info: Vec::new(),
+            services: 0,
+            request_shutdown: Box::new(|| {}),
         });
 
         match dispatch(&mut server, method_name, &cmd) {

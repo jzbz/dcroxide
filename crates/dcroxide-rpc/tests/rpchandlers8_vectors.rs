@@ -125,6 +125,8 @@ impl RpcChain for MockChain8 {
             bits: self.header.bits,
             next_stake_diff: 14428162590,
             total_subsidy: 1122503888072909,
+            block_size: 0,
+            num_txns: 0,
         }
     }
     fn block_by_height(&mut self, _height: i64) -> Result<MsgBlock, String> {
@@ -402,6 +404,15 @@ fn fee_and_node_info_handler_slice_matches_dcrd() {
             proxy: mock[12].to_string(),
             test_net: mock[13] == "true",
             runtime_version: mock[15].to_string(),
+            cpu_miner: Box::new(()),
+            mix_pooler: Box::new(()),
+            profiler_mgr: Box::new(()),
+            addr_manager: Box::new(()),
+            mining_addrs: Vec::new(),
+            user_agent_version: String::new(),
+            net_info: Vec::new(),
+            services: 0,
+            request_shutdown: Box::new(|| {}),
         });
 
         match dispatch(&mut server, method_name, &cmd) {

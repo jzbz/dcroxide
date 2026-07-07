@@ -10,7 +10,7 @@ use dcroxide_chainhash::Hash;
 use dcroxide_dcrjson::RPCError;
 use dcroxide_standalone::SubsidyCache;
 use dcroxide_uint256::Uint256;
-use dcroxide_wire::{BlockHeader, MsgBlock, MsgTx};
+use dcroxide_wire::{BlockHeader, Message, MsgBlock, MsgMixPairReq, MsgTx};
 
 use crate::rpcerrors::rpc_internal_err;
 
@@ -471,7 +471,133 @@ pub struct Config<C> {
     /// The language runtime version string reported by the version
     /// command (dcrd embeds Go's `runtime.Version()`).
     pub runtime_version: String,
+    /// The CPU miner (dcrd `CPUMiner`).
+    pub cpu_miner: Box<dyn RpcCpuMiner>,
+    /// The mixing message pool (dcrd `MixPooler`).
+    pub mix_pooler: Box<dyn RpcMixPooler>,
+    /// The profile server manager (dcrd `ProfilerMgr`).
+    pub profiler_mgr: Box<dyn RpcProfilerManager>,
+    /// The address manager (dcrd `AddrManager`).
+    pub addr_manager: Box<dyn RpcAddrManager>,
+    /// The configured mining payment addresses (dcrd `MiningAddrs`).
+    pub mining_addrs: Vec<dcroxide_txscript::stdaddr::Address>,
+    /// The user agent version string (dcrd `UserAgentVersion`).
+    pub user_agent_version: String,
+    /// The per-network reachability descriptions (dcrd `NetInfo`).
+    pub net_info: Vec<RpcNetworkInfo>,
+    /// The services the server advertises (dcrd `Services`).
+    pub services: u64,
+    /// Request a graceful server shutdown (dcrd's non-blocking send
+    /// on the server's `requestProcessShutdown` channel).
+    pub request_shutdown: Box<dyn FnMut()>,
 }
+
+/// A per-network reachability description (dcrd carries
+/// `types.NetworksResult` values directly in its config).
+#[derive(Debug, Clone)]
+pub struct RpcNetworkInfo {
+    /// The network name.
+    pub name: String,
+    /// Whether the network is limited.
+    pub limited: bool,
+    /// Whether the network is reachable.
+    pub reachable: bool,
+    /// The proxy used for the network, empty when none.
+    pub proxy: String,
+    /// Whether proxy credentials are randomized.
+    pub proxy_randomize_credentials: bool,
+}
+
+/// A CPU mining failure with the classification the generate handler
+/// needs.
+#[derive(Debug, Clone)]
+pub struct GenerateFailure {
+    /// Whether the request context was canceled (dcrd `ctx.Err()`).
+    pub is_ctx_err: bool,
+    /// Whether the failure is dcrd
+    /// `cpuminer.ErrCancelDiscreteMining`.
+    pub is_cancel_discrete: bool,
+    /// The error text.
+    pub message: String,
+}
+
+/// The CPU miner operations the ported handlers perform (the used
+/// subset of dcrd's `rpcserver.CPUMiner` interface).
+pub trait RpcCpuMiner {
+    /// Mine the requested number of blocks onto the main chain (dcrd
+    /// `GenerateNBlocks`).
+    fn generate_n_blocks(&mut self, _n: u32) -> Result<Vec<Hash>, GenerateFailure> {
+        unimplemented!("generate_n_blocks")
+    }
+    /// Whether the miner is currently running (dcrd `IsMining`).
+    fn is_mining(&mut self) -> bool {
+        unimplemented!("is_mining")
+    }
+    /// The current hashes per second, zero when not mining (dcrd
+    /// `HashesPerSecond`).
+    fn hashes_per_second(&mut self) -> f64 {
+        unimplemented!("hashes_per_second")
+    }
+    /// The number of mining worker goroutines (dcrd `NumWorkers`).
+    fn num_workers(&mut self) -> i32 {
+        unimplemented!("num_workers")
+    }
+    /// Set the number of mining workers, negative meaning the default
+    /// (dcrd `SetNumWorkers`).
+    fn set_num_workers(&mut self, _workers: i32) {
+        unimplemented!("set_num_workers")
+    }
+}
+
+impl RpcCpuMiner for () {}
+
+/// The mixing pool operations the ported handlers perform (dcrd's
+/// `rpcserver.MixPooler` interface).
+pub trait RpcMixPooler {
+    /// All current mixing pair request messages (dcrd `MixPRs`).
+    fn mix_prs(&mut self) -> Vec<MsgMixPairReq> {
+        unimplemented!("mix_prs")
+    }
+    /// The mixing message with the given hash (dcrd `Message`; the
+    /// error only drives the not-found result).
+    fn message(&mut self, _query: &Hash) -> Result<Message, String> {
+        unimplemented!("message")
+    }
+}
+
+impl RpcMixPooler for () {}
+
+/// The profile server operations the ported handlers perform (dcrd's
+/// `rpcserver.ProfilerManager` interface).
+pub trait RpcProfilerManager {
+    /// Start the profile server on the given address (dcrd `Start`).
+    fn start(&mut self, _listen_addr: &str, _allow_non_loopback: bool) -> Result<(), String> {
+        unimplemented!("start")
+    }
+    /// Stop the profile server (dcrd `Stop`).
+    fn stop(&mut self) -> Result<(), String> {
+        unimplemented!("stop")
+    }
+    /// The listener addresses the profile server is bound to, empty
+    /// when not running (dcrd `Listeners`).
+    fn listeners(&mut self) -> Vec<String> {
+        unimplemented!("listeners")
+    }
+}
+
+impl RpcProfilerManager for () {}
+
+/// The address manager operations the ported handlers perform (the
+/// used subset of dcrd's `rpcserver.AddrManager` interface).
+pub trait RpcAddrManager {
+    /// The local addresses as (address, port) pairs (dcrd
+    /// `LocalAddresses`).
+    fn local_addresses(&mut self) -> Vec<(String, u16)> {
+        unimplemented!("local_addresses")
+    }
+}
+
+impl RpcAddrManager for () {}
 
 /// The block sanity checker the verifychain handler consults (the
 /// used subset of dcrd's `rpcserver.SanityChecker` interface).
@@ -531,6 +657,11 @@ pub trait RpcSyncManager {
     /// (dcrd `SubmitBlock`).
     fn submit_block(&mut self, _block: &MsgBlock) -> Result<(), String> {
         unimplemented!("submit_block")
+    }
+    /// Submit the mixing message to the mixpool, with the local node
+    /// as the source (dcrd `AcceptMixMessage`).
+    fn accept_mix_message(&mut self, _msg: &Message) -> Result<(), String> {
+        unimplemented!("accept_mix_message")
     }
 }
 
@@ -685,6 +816,10 @@ pub trait RpcConnManager {
     fn add_rebroadcast_inventory(&mut self, _tx_hash: &Hash, _tx: &MsgTx) {
         unimplemented!("add_rebroadcast_inventory")
     }
+    /// Relay the mixing messages to peers (dcrd `RelayMixMessages`).
+    fn relay_mix_messages(&mut self, _msgs: &[Message]) {
+        unimplemented!("relay_mix_messages")
+    }
 }
 
 impl RpcConnManager for () {}
@@ -822,6 +957,10 @@ pub trait RpcTxMempooler {
     fn tx_descs(&mut self) -> Vec<RpcMempoolTx> {
         unimplemented!("tx_descs")
     }
+    /// The number of transactions in the pool (dcrd `Count`).
+    fn count(&mut self) -> i64 {
+        unimplemented!("count")
+    }
     /// The verbose descriptors for all pool transactions (dcrd
     /// `VerboseTxDescs`).
     fn verbose_tx_descs(&mut self) -> Vec<RpcVerboseMempoolTx> {
@@ -875,6 +1014,10 @@ pub struct RpcBestState {
     pub next_stake_diff: i64,
     /// The total subsidy issued by the chain.
     pub total_subsidy: i64,
+    /// The size of the best block in bytes.
+    pub block_size: u64,
+    /// The number of transactions in the best block.
+    pub num_txns: u64,
 }
 
 /// A per-block stake versions record (dcrd

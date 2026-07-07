@@ -242,6 +242,19 @@ pub fn decode_message_payload(
     Ok(msg)
 }
 
+/// Decode a standalone payload for a known command at the given
+/// protocol version without requiring the payload to be fully
+/// consumed; for callers mirroring dcrd handlers that stream from a
+/// lazy reader and never read past the end of the message.
+pub fn decode_message_payload_prefix(
+    command: &str,
+    payload: &[u8],
+    pver: u32,
+) -> Result<Message, WireError> {
+    let mut r = Cursor::new(payload);
+    decode_payload(command, &mut r, pver).ok_or(WireError::InvalidMsg)?
+}
+
 /// Decode a payload for a known command (mirrors `makeEmptyMessage` +
 /// `BtcDecode` dispatch), or `None` for unknown commands.
 fn decode_payload(

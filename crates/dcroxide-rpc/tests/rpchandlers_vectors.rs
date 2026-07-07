@@ -125,6 +125,8 @@ impl RpcChain for MockChain {
             bits: 0,
             next_stake_diff: 0,
             total_subsidy: 0,
+            block_size: 0,
+            num_txns: 0,
         }
     }
 
@@ -384,6 +386,15 @@ fn handler_slice_matches_dcrd() {
             proxy: String::new(),
             test_net: false,
             runtime_version: String::new(),
+            cpu_miner: Box::new(()),
+            mix_pooler: Box::new(()),
+            profiler_mgr: Box::new(()),
+            addr_manager: Box::new(()),
+            mining_addrs: Vec::new(),
+            user_agent_version: String::new(),
+            net_info: Vec::new(),
+            services: 0,
+            request_shutdown: Box::new(|| {}),
         });
 
         match dispatch(&mut server, method_name, &cmd) {

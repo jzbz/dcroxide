@@ -47,7 +47,8 @@ pub use cursor::Cursor;
 pub use error::WireError;
 pub use invvect::{InvType, InvVect, MAX_INV_PER_MSG};
 pub use message::{
-    COMMAND_SIZE, MESSAGE_HEADER_SIZE, Message, decode_message_payload, read_message, write_message,
+    COMMAND_SIZE, MESSAGE_HEADER_SIZE, Message, decode_message_payload,
+    decode_message_payload_prefix, read_message, write_message,
 };
 pub use msg_cf::{
     FilterType, MAX_CFHEADERS_PER_MSG, MAX_CFILTER_DATA_SIZE, MAX_CFILTERS_V2_PER_BATCH,

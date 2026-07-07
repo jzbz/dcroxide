@@ -429,6 +429,8 @@ fn chain_query_handler_slice_matches_dcrd() {
                 bits: mock[20].parse().unwrap(),
                 next_stake_diff: 0,
                 total_subsidy: mock[21].parse().unwrap(),
+                block_size: 0,
+                num_txns: 0,
             },
             best_header: (mock[12].parse().unwrap(), mock[13].parse().unwrap()),
             main_chain_has_block: mock[2] == "true",
@@ -485,6 +487,15 @@ fn chain_query_handler_slice_matches_dcrd() {
             proxy: String::new(),
             test_net: false,
             runtime_version: String::new(),
+            cpu_miner: Box::new(()),
+            mix_pooler: Box::new(()),
+            profiler_mgr: Box::new(()),
+            addr_manager: Box::new(()),
+            mining_addrs: Vec::new(),
+            user_agent_version: String::new(),
+            net_info: Vec::new(),
+            services: 0,
+            request_shutdown: Box::new(|| {}),
         });
 
         match dispatch(&mut server, method_name, &cmd) {

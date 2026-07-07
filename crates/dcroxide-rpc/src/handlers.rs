@@ -3649,3 +3649,504 @@ pub fn handle_create_raw_ssrtx<C: RpcChain>(
     let mtx_hex = txresults::message_to_hex(&Message::Tx(mtx), server.cfg.max_protocol_version)?;
     Ok(GoValue::String(mtx_hex))
 }
+
+/// handlegenerate (dcrd `handleGenerate`); the result is the list of
+/// generated block hash strings.
+pub fn handle_generate<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    // Respond with an error if there are no addresses to pay the
+    // created blocks to.
+    if server.cfg.mining_addrs.is_empty() {
+        return Err(rpc_internal_err(
+            "no payment addresses specified via --miningaddr",
+        ));
+    }
+
+    // Respond with an error if there's virtually 0 chance of
+    // CPU-mining a block.
+    let params = &server.cfg.chain_params;
+    if !params.generate_supported {
+        return Err(RPCError::new(
+            codes::DIFFICULTY,
+            &format!(
+                "No support for `generate` on the current network, {}, as it's \
+                 unlikely to be possible to mine a block with the CPU.",
+                params.net
+            ),
+        ));
+    }
+
+    let c = fields(cmd);
+    let num_blocks = uint(&c[0]) as u32;
+
+    // Extend the main chain by the requested number of blocks.
+    let block_hashes = match server.cfg.cpu_miner.generate_n_blocks(num_blocks) {
+        Ok(hashes) => hashes,
+        Err(failure) if failure.is_ctx_err => {
+            return Err(crate::rpcerrors::rpc_connection_closed_error());
+        }
+        Err(failure) if failure.is_cancel_discrete => {
+            return Err(crate::rpcerrors::rpc_cancel_error(&format!(
+                "Failed to generate the requested number of blocks: {}",
+                failure.message
+            )));
+        }
+        Err(failure) => return Err(rpc_internal_err(&failure.message)),
+    };
+    if block_hashes.is_empty() {
+        return Ok(GoValue::Null);
+    }
+    Ok(GoValue::Array(
+        block_hashes
+            .iter()
+            .map(|hash| GoValue::String(hash.to_string()))
+            .collect(),
+    ))
+}
+
+/// handlegetgenerate (dcrd `handleGetGenerate`); the result is a
+/// boolean.
+pub fn handle_get_generate<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    Ok(GoValue::Bool(server.cfg.cpu_miner.is_mining()))
+}
+
+/// handlegethashespersec (dcrd `handleGetHashesPerSec`); the result
+/// is the truncated integer rate.
+pub fn handle_get_hashes_per_sec<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    Ok(GoValue::Int(server.cfg.cpu_miner.hashes_per_second() as i64))
+}
+
+/// handlesetgenerate (dcrd `handleSetGenerate`); the result is null.
+pub fn handle_set_generate<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let mut generate = match &c[0] {
+        GoValue::Bool(b) => *b,
+        other => panic!("expected bool field, got {other:?}"),
+    };
+    let gen_proc_limit = opt_int(&c[1]).unwrap_or(-1);
+
+    // Disable generation regardless of the provided generate flag if
+    // the maximum number of threads is 0.
+    if gen_proc_limit == 0 {
+        generate = false;
+    }
+
+    if !generate {
+        // Stop CPU mining by setting the number of workers to zero.
+        server.cfg.cpu_miner.set_num_workers(0);
+    } else {
+        // Respond with an error if there are no addresses to pay the
+        // created blocks to.
+        if server.cfg.mining_addrs.is_empty() {
+            return Err(rpc_internal_err(
+                "no payment addresses specified via --miningaddr",
+            ));
+        }
+
+        server.cfg.cpu_miner.set_num_workers(gen_proc_limit as i32);
+    }
+    Ok(GoValue::Null)
+}
+
+/// handlegetnetworkhashps (dcrd `handleGetNetworkHashPS`); the result
+/// is an `int64` rate.
+pub fn handle_get_network_hash_ps<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+
+    // When the passed height is too high or zero, just return 0 now
+    // since we can't reasonably calculate the number of network hashes
+    // per second from invalid values.  When it's negative, use the
+    // current best block height.
+    let best = server.cfg.chain.best_snapshot();
+    let mut end_height = opt_int(&c[1]).unwrap_or(-1);
+    if end_height > best.height || end_height == 0 {
+        return Ok(GoValue::Int(0));
+    }
+    if end_height < 0 {
+        end_height = best.height;
+    }
+
+    // Calculate the starting block height based on the passed number
+    // of blocks.  When the passed value is negative, use the default.
+    // Also, make sure the starting height is not before the beginning
+    // of the chain.
+    let mut num_blocks = 120i64;
+    if let Some(blocks) = opt_int(&c[0])
+        && blocks >= 0
+    {
+        num_blocks = blocks;
+    }
+    let mut start_height = end_height - num_blocks;
+    if start_height < 0 {
+        start_height = 0;
+    }
+
+    // Find the min and max block timestamps as well as calculate the
+    // total amount of work that happened between the start and end
+    // blocks.
+    let mut min_timestamp = 0u32;
+    let mut max_timestamp = 0u32;
+    let mut total_work = num_bigint::BigInt::from(0);
+    let mut cur_height = start_height;
+    while cur_height <= end_height {
+        let hash = server
+            .cfg
+            .chain
+            .block_hash_by_height(cur_height)
+            .map_err(|e| rpc_internal_err(&e))?;
+        let header = server
+            .cfg
+            .chain
+            .header_by_hash(&hash)
+            .map_err(|e| rpc_internal_err(&e))?;
+
+        if cur_height == start_height {
+            min_timestamp = header.timestamp;
+            max_timestamp = min_timestamp;
+        } else {
+            total_work += dcroxide_standalone::calc_work(header.bits);
+
+            if min_timestamp > header.timestamp {
+                min_timestamp = header.timestamp;
+            }
+            if max_timestamp < header.timestamp {
+                max_timestamp = header.timestamp;
+            }
+        }
+        cur_height += 1;
+    }
+
+    // Calculate the difference in seconds between the min and max
+    // block timestamps and avoid division by zero in the case where
+    // there is no time difference.
+    let time_diff = i64::from(max_timestamp) - i64::from(min_timestamp);
+    if time_diff == 0 {
+        return Ok(GoValue::Int(0));
+    }
+
+    // Go `big.Int.Int64` keeps the low 64 bits of the magnitude (the
+    // quotient is never negative here).
+    let hashes_per_sec = total_work / num_bigint::BigInt::from(time_diff);
+    let low = hashes_per_sec.iter_u64_digits().next().unwrap_or(0);
+    Ok(GoValue::Int(low as i64))
+}
+
+/// handlegetmininginfo (dcrd `handleGetMiningInfo`); the result is a
+/// `GetMiningInfoResult` value.
+pub fn handle_get_mining_info<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    // Create a default getnetworkhashps command to use defaults and
+    // make use of the existing getnetworkhashps handler.
+    let gnhps_cmd = GoValue::Struct(vec![GoValue::Null, GoValue::Null]);
+    let network_hashes_per_sec = match handle_get_network_hash_ps(server, &gnhps_cmd)? {
+        GoValue::Int(n) => n,
+        other => panic!("expected int result, got {other:?}"),
+    };
+
+    let best = server.cfg.chain.best_snapshot();
+    Ok(GoValue::Struct(vec![
+        GoValue::Int(best.height),
+        GoValue::Uint(best.block_size),
+        GoValue::Uint(best.num_txns),
+        GoValue::Float64(crate::helpers::get_difficulty_ratio(
+            best.bits,
+            server.cfg.chain_params.pow_limit_bits,
+        )),
+        GoValue::Int(best.next_stake_diff),
+        GoValue::String(String::new()),
+        GoValue::Bool(server.cfg.cpu_miner.is_mining()),
+        GoValue::Int(i64::from(server.cfg.cpu_miner.num_workers())),
+        GoValue::Int(server.cfg.cpu_miner.hashes_per_second() as i64),
+        GoValue::Int(network_hashes_per_sec),
+        GoValue::Uint(server.cfg.tx_mempooler.count() as u64),
+        GoValue::Bool(server.cfg.test_net),
+    ]))
+}
+
+/// handlegetnetworkinfo (dcrd `handleGetNetworkInfo`); the result is
+/// a `GetNetworkInfoResult` value.
+pub fn handle_get_network_info<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let local_addrs: Vec<GoValue> = server
+        .cfg
+        .addr_manager
+        .local_addresses()
+        .into_iter()
+        .map(|(address, port)| {
+            GoValue::Struct(vec![
+                GoValue::String(address),
+                GoValue::Uint(u64::from(port)),
+                GoValue::Int(0),
+            ])
+        })
+        .collect();
+
+    // Go `time.Duration.Seconds()` truncated to an int64.
+    let offset_nanos = server.cfg.time_source.offset_nanos();
+    let offset_secs =
+        (offset_nanos / 1_000_000_000) as f64 + (offset_nanos % 1_000_000_000) as f64 / 1e9;
+
+    let networks = server
+        .cfg
+        .net_info
+        .iter()
+        .map(|net| {
+            GoValue::Struct(vec![
+                GoValue::String(net.name.clone()),
+                GoValue::Bool(net.limited),
+                GoValue::Bool(net.reachable),
+                GoValue::String(net.proxy.clone()),
+                GoValue::Bool(net.proxy_randomize_credentials),
+            ])
+        })
+        .collect();
+
+    Ok(GoValue::Struct(vec![
+        GoValue::Int(i64::from(
+            (1_000_000 * crate::version::MAJOR
+                + 10_000 * crate::version::MINOR
+                + 100 * crate::version::PATCH) as i32,
+        )),
+        GoValue::String(server.cfg.user_agent_version.clone()),
+        GoValue::Int(i64::from(server.cfg.max_protocol_version as i32)),
+        GoValue::Int(offset_secs as i64),
+        GoValue::Int(i64::from(server.cfg.conn_mgr.connected_count())),
+        GoValue::Array(networks),
+        GoValue::Float64(txresults::to_coin(server.cfg.min_relay_tx_fee)),
+        GoValue::Array(local_addrs),
+        GoValue::String(format!("{:016x}", server.cfg.services)),
+    ]))
+}
+
+/// handlegetmixmessage (dcrd `handleGetMixMessage`); the result is a
+/// `GetMixMessageResult` value.
+pub fn handle_get_mix_message<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let hash_str = s(&c[0]);
+    let msg_hash: Hash = hash_str
+        .parse()
+        .map_err(|_| rpc_decode_hex_error(hash_str))?;
+
+    let msg = server
+        .cfg
+        .mix_pooler
+        .message(&msg_hash)
+        .map_err(|_| crate::rpcerrors::rpc_mix_message_not_found_error(&msg_hash))?;
+
+    // dcrd returns the bare encode error and lets the dispatch layer
+    // wrap it; encoding a pool-held message cannot fail, so the
+    // messageToHex internal error stands in.
+    let message_hex = txresults::message_to_hex(&msg, dcroxide_wire::MIX_VERSION)?;
+
+    Ok(GoValue::Struct(vec![
+        GoValue::String(msg.command().to_string()),
+        GoValue::String(message_hex),
+    ]))
+}
+
+/// handlegetmixpairrequests (dcrd `handleGetMixPairRequests`); the
+/// result is the list of serialized pair request hex strings.
+pub fn handle_get_mix_pair_requests<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let prs = server.cfg.mix_pooler.mix_prs();
+
+    let mut res = Vec::with_capacity(prs.len());
+    for pr in prs {
+        let msg = Message::MixPairReq(pr);
+        let message_hex = txresults::message_to_hex(&msg, dcroxide_wire::MIX_VERSION)?;
+        res.push(GoValue::String(message_hex));
+    }
+
+    Ok(GoValue::Array(res))
+}
+
+/// Decode a hex string like Go's streaming `hex.Decoder`: the valid
+/// prefix decodes, and the first problem is remembered with Go's
+/// error text, surfacing only if a reader ever needs bytes past the
+/// prefix.
+fn lazy_hex_decode(s: &str) -> (Vec<u8>, Option<String>) {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let pair = [bytes[i], bytes[i + 1]];
+        for &b in &pair {
+            if !(b as char).is_ascii_hexdigit() {
+                return (
+                    out,
+                    Some(format!(
+                        "encoding/hex: invalid byte: U+{:04X} {:?}",
+                        b, b as char
+                    )),
+                );
+            }
+        }
+        let hi = (pair[0] as char).to_digit(16).expect("checked");
+        let lo = (pair[1] as char).to_digit(16).expect("checked");
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    if i < bytes.len() {
+        // A lone trailing character: an invalid one surfaces as the
+        // invalid-byte error, a valid one as an unexpected EOF.
+        let b = bytes[i];
+        if !(b as char).is_ascii_hexdigit() {
+            return (
+                out,
+                Some(format!(
+                    "encoding/hex: invalid byte: U+{:04X} {:?}",
+                    b, b as char
+                )),
+            );
+        }
+        return (out, Some("unexpected EOF".to_string()));
+    }
+    (out, None)
+}
+
+/// handlesendrawmixmessage (dcrd `handleSendRawMixMessage`); the
+/// result is null.
+pub fn handle_send_raw_mix_message<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let command = s(&c[0]);
+    let message_hex = s(&c[1]);
+
+    // Only the mixing message wire commands are recognized.
+    match command {
+        "mixpairreq" | "mixkeyxchg" | "mixcphrtxt" | "mixslotres" | "mixdcnet" | "mixconfirm"
+        | "mixfactpoly" | "mixsecrets" => {}
+        other => {
+            return Err(rpc_invalid_error(&format!(
+                "Unrecognized mixing message wire command string {}",
+                gojson::go_quote(other)
+            )));
+        }
+    }
+
+    // Deserialize the message.  dcrd streams through a lazy hex
+    // decoder, so hex problems past the end of the message are never
+    // observed and a short message surfaces the reader's error.
+    let (payload, hex_err) = lazy_hex_decode(message_hex);
+    let msg =
+        dcroxide_wire::decode_message_payload_prefix(command, &payload, dcroxide_wire::MIX_VERSION)
+            .map_err(|e| {
+                let text = match e {
+                    dcroxide_wire::WireError::UnexpectedEof => match &hex_err {
+                        Some(err) => err.clone(),
+                        None => "unexpected EOF".to_string(),
+                    },
+                    other => other.to_string(),
+                };
+                rpc_deserialization_error(&format!("Could not decode mix message: {text}"))
+            })?;
+
+    // dcrd pre-calculates the message hash here; the ported mixing
+    // types compute it on demand.
+
+    // Use the local node as the source.
+    if let Err(err) = server.cfg.sync_mgr.accept_mix_message(&msg) {
+        return Err(crate::rpcerrors::rpc_misc_error(&format!(
+            "Rejected mix message: {err}"
+        )));
+    }
+
+    server.cfg.conn_mgr.relay_mix_messages(&[msg]);
+
+    // The websocket notification hook (`NotifyMixMessage`) arrives
+    // with the websocket layer.
+
+    Ok(GoValue::Null)
+}
+
+/// handlestartprofiler (dcrd `handleStartProfiler`); the result is a
+/// `StartProfilerResult` value.
+pub fn handle_start_profiler<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let addr = s(&c[0]);
+    let allow_non_loopback = opt_bool(&c[1]).unwrap_or(false);
+
+    if !server.cfg.profiler_mgr.listeners().is_empty() {
+        return Err(RPCError::new(
+            codes::PROFILER_STATE,
+            "profile server is already running",
+        ));
+    }
+
+    if let Err(err) = server.cfg.profiler_mgr.start(addr, allow_non_loopback) {
+        return Err(rpc_invalid_error(&format!(
+            "unable to start profile server: {err}"
+        )));
+    }
+
+    // Ensure there are active listeners for generating the result.
+    let listeners = server.cfg.profiler_mgr.listeners();
+    if listeners.is_empty() {
+        return Err(rpc_internal_err(
+            "profile server started without active listeners",
+        ));
+    }
+
+    Ok(GoValue::Struct(vec![GoValue::Array(
+        listeners.into_iter().map(GoValue::String).collect(),
+    )]))
+}
+
+/// handlestopprofiler (dcrd `handleStopProfiler`); the result is a
+/// status string.
+pub fn handle_stop_profiler<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    if server.cfg.profiler_mgr.listeners().is_empty() {
+        return Err(RPCError::new(
+            codes::PROFILER_STATE,
+            "profile server is not started",
+        ));
+    }
+
+    server
+        .cfg
+        .profiler_mgr
+        .stop()
+        .map_err(|e| rpc_internal_err(&e))?;
+
+    Ok(GoValue::String("profile server stopped".to_string()))
+}
+
+/// handlestop (dcrd `handleStop`); the result is a status string.
+pub fn handle_stop<C: RpcChain>(
+    server: &mut Server<C>,
+    _cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    (server.cfg.request_shutdown)();
+    Ok(GoValue::String("dcrd stopping.".to_string()))
+}
