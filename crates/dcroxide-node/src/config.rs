@@ -26,9 +26,11 @@ use std::fs;
 use dcroxide_rpc::server::RpcNetworkInfo;
 use dcroxide_txscript::stdaddr::{self, Address};
 
+use crate::flags::OptKind;
 use crate::gostd::{
     expand_env, filepath_abs, filepath_clean, filepath_join, go_atoi_ok, go_duration_string,
-    go_parse_bool, go_quote, join_host_port, parse_go_duration, split_host_port,
+    go_parse_bool_err, go_parse_float, go_parse_int, go_parse_uint, go_quote, join_host_port,
+    parse_go_duration, split_host_port,
 };
 use crate::logsubsys::{LogLevels, parse_and_set_debug_levels};
 use crate::params::NodeParams;
@@ -640,196 +642,182 @@ impl Config {
 /// (the final command line after the config file) wholly replaces
 /// earlier values.
 #[derive(Default)]
-struct ParsePass(std::collections::BTreeSet<&'static str>);
+pub(crate) struct ParsePass(pub(crate) std::collections::BTreeSet<&'static str>);
 
-/// Apply a single already-split option assignment to the config,
-/// mirroring go-flags value conversion for the option types dcrd
-/// uses.
+/// Convert and store one option value like go-flags' `convert`:
+/// the value has already been split from the surrounding syntax,
+/// the empty string on a bool is the bare-flag form, and
+/// conversion failures return Go's raw strconv/time error texts
+/// for the callers to wrap with command line or INI context.
+pub(crate) fn store_option(
+    cfg: &mut Config,
+    pass: &mut ParsePass,
+    long: &'static str,
+    kind: OptKind,
+    val: &str,
+) -> Result<(), String> {
+    let as_bool = || -> Result<bool, String> {
+        if val.is_empty() {
+            Ok(true)
+        } else {
+            go_parse_bool_err(val)
+        }
+    };
+    let as_int = || go_parse_int(val, 64);
+    let as_uint = || go_parse_uint(val, 64);
+    let as_u32 = || go_parse_uint(val, 32).map(|v| v as u32);
+    let as_f64 = || go_parse_float(val);
+    let as_dur = || parse_go_duration(val);
+    let _ = kind;
+
+    match long {
+        "version" => cfg.show_version = as_bool()?,
+        "appdata" => cfg.home_dir = val.to_string(),
+        "configfile" => cfg.config_file = val.to_string(),
+        "datadir" => cfg.data_dir = val.to_string(),
+        "logdir" => cfg.log_dir = val.to_string(),
+        "logsize" => cfg.log_size = val.to_string(),
+        "nofilelogging" => cfg.no_file_logging = as_bool()?,
+        "dbtype" => cfg.db_type = val.to_string(),
+        "profile" => cfg.profile = val.to_string(),
+        "cpuprofile" => cfg.cpu_profile = val.to_string(),
+        "memprofile" => cfg.mem_profile = val.to_string(),
+        "testnet" => cfg.test_net = as_bool()?,
+        "simnet" => cfg.sim_net = as_bool()?,
+        "regnet" => cfg.reg_net = as_bool()?,
+        "debuglevel" => cfg.debug_level = val.to_string(),
+        "sigcachemaxsize" => cfg.sig_cache_max_size = as_uint()?,
+        "utxocachemaxsize" => cfg.utxo_cache_max_size = as_uint()?,
+        "norpc" => cfg.disable_rpc = as_bool()?,
+        "rpclisten" => {
+            if pass.0.insert("rpclisten") {
+                cfg.rpc_listeners.clear();
+            }
+            cfg.rpc_listeners.push(val.to_string());
+        }
+        "rpcuser" => cfg.rpc_user = val.to_string(),
+        "rpcpass" => cfg.rpc_pass = val.to_string(),
+        "authtype" => cfg.rpc_auth_type = val.to_string(),
+        "clientcafile" => cfg.rpc_client_cas = val.to_string(),
+        "rpclimituser" => cfg.rpc_limit_user = val.to_string(),
+        "rpclimitpass" => cfg.rpc_limit_pass = val.to_string(),
+        "rpccert" => cfg.rpc_cert = val.to_string(),
+        "rpckey" => cfg.rpc_key = val.to_string(),
+        "tlscurve" => cfg.tls_curve = val.to_string(),
+        "altdnsnames" => {
+            if pass.0.insert("altdnsnames") {
+                cfg.alt_dns_names.clear();
+            }
+            cfg.alt_dns_names.push(val.to_string());
+        }
+        "notls" => cfg.disable_tls = as_bool()?,
+        "rpcmaxclients" => cfg.rpc_max_clients = as_int()?,
+        "rpcmaxwebsockets" => cfg.rpc_max_websockets = as_int()?,
+        "rpcmaxconcurrentreqs" => cfg.rpc_max_concurrent_reqs = as_int()?,
+        "proxy" => cfg.proxy = val.to_string(),
+        "proxyuser" => cfg.proxy_user = val.to_string(),
+        "proxypass" => cfg.proxy_pass = val.to_string(),
+        "onion" => cfg.onion_proxy = val.to_string(),
+        "onionuser" => cfg.onion_proxy_user = val.to_string(),
+        "onionpass" => cfg.onion_proxy_pass = val.to_string(),
+        "noonion" => cfg.no_onion = as_bool()?,
+        "torisolation" => cfg.tor_isolation = as_bool()?,
+        "addpeer" => {
+            if pass.0.insert("addpeer") {
+                cfg.add_peers.clear();
+            }
+            cfg.add_peers.push(val.to_string());
+        }
+        "connect" => {
+            if pass.0.insert("connect") {
+                cfg.connect_peers.clear();
+            }
+            cfg.connect_peers.push(val.to_string());
+        }
+        "nolisten" => cfg.disable_listen = as_bool()?,
+        "listen" => {
+            if pass.0.insert("listen") {
+                cfg.listeners.clear();
+            }
+            cfg.listeners.push(val.to_string());
+        }
+        "maxsameip" => cfg.max_same_ip = as_int()?,
+        "maxpeers" => cfg.max_peers = as_int()?,
+        "dialtimeout" => cfg.dial_timeout_nanos = as_dur()?,
+        "peeridletimeout" => cfg.peer_idle_timeout_nanos = as_dur()?,
+        "noseeders" => cfg.disable_seeders = as_bool()?,
+        "nodnsseed" => cfg.disable_dns_seed = as_bool()?,
+        "externalip" => {
+            if pass.0.insert("externalip") {
+                cfg.external_ips.clear();
+            }
+            cfg.external_ips.push(val.to_string());
+        }
+        "nodiscoverip" => cfg.no_discover_ip = as_bool()?,
+        "upnp" => cfg.upnp = as_bool()?,
+        "nobanning" => cfg.disable_banning = as_bool()?,
+        "banduration" => cfg.ban_duration_nanos = as_dur()?,
+        "banthreshold" => cfg.ban_threshold = as_u32()?,
+        "whitelist" => {
+            if pass.0.insert("whitelist") {
+                cfg.whitelists_raw.clear();
+            }
+            cfg.whitelists_raw.push(val.to_string());
+        }
+        "allowoldforks" => cfg.allow_old_forks = as_bool()?,
+        "dumpblockchain" => cfg.dump_blockchain = val.to_string(),
+        "assumevalid" => cfg.assume_valid = val.to_string(),
+        "minrelaytxfee" => cfg.min_relay_tx_fee = as_f64()?,
+        "limitfreerelay" => cfg.free_tx_relay_limit = as_f64()?,
+        "norelaypriority" => cfg.no_relay_priority = as_bool()?,
+        "maxorphantx" => cfg.max_orphan_txs = as_int()?,
+        "blocksonly" => cfg.blocks_only = as_bool()?,
+        "acceptnonstd" => cfg.accept_non_std = as_bool()?,
+        "rejectnonstd" => cfg.reject_non_std = as_bool()?,
+        "allowoldvotes" => cfg.allow_old_votes = as_bool()?,
+        "generate" => cfg.generate = as_bool()?,
+        "miningaddr" => {
+            if pass.0.insert("miningaddr") {
+                cfg.mining_addrs_raw.clear();
+            }
+            cfg.mining_addrs_raw.push(val.to_string());
+        }
+        "blockminsize" => cfg.block_min_size = as_u32()?,
+        "blockmaxsize" => cfg.block_max_size = as_u32()?,
+        "blockprioritysize" => cfg.block_priority_size = as_u32()?,
+        "miningtimeoffset" => cfg.mining_time_offset = as_int()?,
+        "nonaggressive" => cfg.non_aggressive = as_bool()?,
+        "nominingstatesync" => cfg.no_mining_state_sync = as_bool()?,
+        "allowunsyncedmining" => cfg.allow_unsynced_mining = as_bool()?,
+        "txindex" => cfg.tx_index = as_bool()?,
+        "droptxindex" => cfg.drop_tx_index = as_bool()?,
+        "noexistsaddrindex" => cfg.no_exists_addr_index = as_bool()?,
+        "dropexistsaddrindex" => cfg.drop_exists_addr_index = as_bool()?,
+        "piperx" => cfg.pipe_rx = as_uint()?,
+        "pipetx" => cfg.pipe_tx = as_uint()?,
+        "lifetimeevents" => cfg.lifetime_events = as_bool()?,
+        "boundaddrevents" => cfg.bound_addr_events = as_bool()?,
+        other => return Err(format!("unknown flag `{other}'")),
+    }
+    Ok(())
+}
+
+/// Apply a single already-split option assignment (the
+/// pre-tokenized entry point; the argv front-end lives in
+/// [`crate::flags`]).
 fn apply_option(
     cfg: &mut Config,
     pass: &mut ParsePass,
     name: &str,
     value: Option<&str>,
 ) -> Result<(), String> {
-    fn as_bool(name: &str, value: Option<&str>) -> Result<bool, String> {
-        match value {
-            None => Ok(true),
-            Some(v) => {
-                go_parse_bool(v).map_err(|()| format!("invalid boolean value `{v}' for {name}"))
-            }
-        }
+    let Some(spec) = crate::flags::find_long(name) else {
+        return Err(format!("unknown flag `{name}'"));
+    };
+    if value.is_none() && spec.kind != OptKind::Bool {
+        return Err(format!("expected argument for flag `--{name}'"));
     }
-    fn req<'v>(name: &str, value: Option<&'v str>) -> Result<&'v str, String> {
-        value.ok_or_else(|| format!("expected argument for flag `--{name}'"))
-    }
-    fn num<T: std::str::FromStr>(name: &str, value: Option<&str>) -> Result<T, String> {
-        let v = req(name, value)?;
-        v.parse::<T>()
-            .map_err(|_| format!("invalid argument for flag `--{name}': {v}"))
-    }
-    fn dur(name: &str, value: Option<&str>) -> Result<i64, String> {
-        parse_go_duration(req(name, value)?)
-            .map_err(|e| format!("invalid argument for flag `--{name}': {e}"))
-    }
-
-    match name {
-        "version" => cfg.show_version = as_bool(name, value)?,
-        "appdata" => cfg.home_dir = req(name, value)?.to_string(),
-        "configfile" => cfg.config_file = req(name, value)?.to_string(),
-        "datadir" => cfg.data_dir = req(name, value)?.to_string(),
-        "logdir" => cfg.log_dir = req(name, value)?.to_string(),
-        "logsize" => cfg.log_size = req(name, value)?.to_string(),
-        "nofilelogging" => cfg.no_file_logging = as_bool(name, value)?,
-        "dbtype" => cfg.db_type = req(name, value)?.to_string(),
-        "profile" => cfg.profile = req(name, value)?.to_string(),
-        "cpuprofile" => cfg.cpu_profile = req(name, value)?.to_string(),
-        "memprofile" => cfg.mem_profile = req(name, value)?.to_string(),
-        "testnet" => cfg.test_net = as_bool(name, value)?,
-        "simnet" => cfg.sim_net = as_bool(name, value)?,
-        "regnet" => cfg.reg_net = as_bool(name, value)?,
-        "debuglevel" => cfg.debug_level = req(name, value)?.to_string(),
-        "sigcachemaxsize" => cfg.sig_cache_max_size = num(name, value)?,
-        "utxocachemaxsize" => cfg.utxo_cache_max_size = num(name, value)?,
-        "norpc" => cfg.disable_rpc = as_bool(name, value)?,
-        "rpclisten" => {
-            if pass.0.insert("rpclisten") {
-                cfg.rpc_listeners.clear();
-            }
-            cfg.rpc_listeners.push(req(name, value)?.to_string());
-        }
-        "rpcuser" => cfg.rpc_user = req(name, value)?.to_string(),
-        "rpcpass" => cfg.rpc_pass = req(name, value)?.to_string(),
-        "authtype" => cfg.rpc_auth_type = req(name, value)?.to_string(),
-        "clientcafile" => cfg.rpc_client_cas = req(name, value)?.to_string(),
-        "rpclimituser" => cfg.rpc_limit_user = req(name, value)?.to_string(),
-        "rpclimitpass" => cfg.rpc_limit_pass = req(name, value)?.to_string(),
-        "rpccert" => cfg.rpc_cert = req(name, value)?.to_string(),
-        "rpckey" => cfg.rpc_key = req(name, value)?.to_string(),
-        "tlscurve" => cfg.tls_curve = req(name, value)?.to_string(),
-        "altdnsnames" => {
-            if pass.0.insert("altdnsnames") {
-                cfg.alt_dns_names.clear();
-            }
-            cfg.alt_dns_names.push(req(name, value)?.to_string());
-        }
-        "notls" => cfg.disable_tls = as_bool(name, value)?,
-        "rpcmaxclients" => cfg.rpc_max_clients = num(name, value)?,
-        "rpcmaxwebsockets" => cfg.rpc_max_websockets = num(name, value)?,
-        "rpcmaxconcurrentreqs" => cfg.rpc_max_concurrent_reqs = num(name, value)?,
-        "proxy" => cfg.proxy = req(name, value)?.to_string(),
-        "proxyuser" => cfg.proxy_user = req(name, value)?.to_string(),
-        "proxypass" => cfg.proxy_pass = req(name, value)?.to_string(),
-        "onion" => cfg.onion_proxy = req(name, value)?.to_string(),
-        "onionuser" => cfg.onion_proxy_user = req(name, value)?.to_string(),
-        "onionpass" => cfg.onion_proxy_pass = req(name, value)?.to_string(),
-        "noonion" => cfg.no_onion = as_bool(name, value)?,
-        "torisolation" => cfg.tor_isolation = as_bool(name, value)?,
-        "addpeer" => {
-            if pass.0.insert("addpeer") {
-                cfg.add_peers.clear();
-            }
-            cfg.add_peers.push(req(name, value)?.to_string());
-        }
-        "connect" => {
-            if pass.0.insert("connect") {
-                cfg.connect_peers.clear();
-            }
-            cfg.connect_peers.push(req(name, value)?.to_string());
-        }
-        "nolisten" => cfg.disable_listen = as_bool(name, value)?,
-        "listen" => {
-            if pass.0.insert("listen") {
-                cfg.listeners.clear();
-            }
-            cfg.listeners.push(req(name, value)?.to_string());
-        }
-        "maxsameip" => cfg.max_same_ip = num(name, value)?,
-        "maxpeers" => cfg.max_peers = num(name, value)?,
-        "dialtimeout" => cfg.dial_timeout_nanos = dur(name, value)?,
-        "peeridletimeout" => cfg.peer_idle_timeout_nanos = dur(name, value)?,
-        "noseeders" => cfg.disable_seeders = as_bool(name, value)?,
-        "nodnsseed" => cfg.disable_dns_seed = as_bool(name, value)?,
-        "externalip" => {
-            if pass.0.insert("externalip") {
-                cfg.external_ips.clear();
-            }
-            cfg.external_ips.push(req(name, value)?.to_string());
-        }
-        "nodiscoverip" => cfg.no_discover_ip = as_bool(name, value)?,
-        "upnp" => cfg.upnp = as_bool(name, value)?,
-        "nobanning" => cfg.disable_banning = as_bool(name, value)?,
-        "banduration" => cfg.ban_duration_nanos = dur(name, value)?,
-        "banthreshold" => cfg.ban_threshold = num(name, value)?,
-        "whitelist" => {
-            if pass.0.insert("whitelist") {
-                cfg.whitelists_raw.clear();
-            }
-            cfg.whitelists_raw.push(req(name, value)?.to_string());
-        }
-        "allowoldforks" => cfg.allow_old_forks = as_bool(name, value)?,
-        "dumpblockchain" => cfg.dump_blockchain = req(name, value)?.to_string(),
-        "assumevalid" => cfg.assume_valid = req(name, value)?.to_string(),
-        "minrelaytxfee" => cfg.min_relay_tx_fee = num(name, value)?,
-        "limitfreerelay" => cfg.free_tx_relay_limit = num(name, value)?,
-        "norelaypriority" => cfg.no_relay_priority = as_bool(name, value)?,
-        "maxorphantx" => cfg.max_orphan_txs = num(name, value)?,
-        "blocksonly" => cfg.blocks_only = as_bool(name, value)?,
-        "acceptnonstd" => cfg.accept_non_std = as_bool(name, value)?,
-        "rejectnonstd" => cfg.reject_non_std = as_bool(name, value)?,
-        "allowoldvotes" => cfg.allow_old_votes = as_bool(name, value)?,
-        "generate" => cfg.generate = as_bool(name, value)?,
-        "miningaddr" => {
-            if pass.0.insert("miningaddr") {
-                cfg.mining_addrs_raw.clear();
-            }
-            cfg.mining_addrs_raw.push(req(name, value)?.to_string());
-        }
-        "blockminsize" => cfg.block_min_size = num(name, value)?,
-        "blockmaxsize" => cfg.block_max_size = num(name, value)?,
-        "blockprioritysize" => cfg.block_priority_size = num(name, value)?,
-        "miningtimeoffset" => cfg.mining_time_offset = num(name, value)?,
-        "nonaggressive" => cfg.non_aggressive = as_bool(name, value)?,
-        "nominingstatesync" => cfg.no_mining_state_sync = as_bool(name, value)?,
-        "allowunsyncedmining" => cfg.allow_unsynced_mining = as_bool(name, value)?,
-        "txindex" => cfg.tx_index = as_bool(name, value)?,
-        "droptxindex" => cfg.drop_tx_index = as_bool(name, value)?,
-        "noexistsaddrindex" => cfg.no_exists_addr_index = as_bool(name, value)?,
-        "dropexistsaddrindex" => cfg.drop_exists_addr_index = as_bool(name, value)?,
-        "piperx" => cfg.pipe_rx = num(name, value)?,
-        "pipetx" => cfg.pipe_tx = num(name, value)?,
-        "lifetimeevents" => cfg.lifetime_events = as_bool(name, value)?,
-        "boundaddrevents" => cfg.bound_addr_events = as_bool(name, value)?,
-        other => return Err(format!("unknown flag `{other}'")),
-    }
-    Ok(())
-}
-
-/// Parse config file content into assignments: `key=value` lines
-/// with `;`/`#` comments and `[section]` headers ignored.  The full
-/// go-flags INI grammar arrives with the front-end piece.
-fn parse_config_file(content: &str) -> Vec<Assignment> {
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty()
-            || line.starts_with(';')
-            || line.starts_with('#')
-            || line.starts_with('[')
-        {
-            continue;
-        }
-        match line.split_once('=') {
-            Some((key, value)) => out.push(Assignment {
-                name: key.trim().to_string(),
-                value: Some(value.trim().to_string()),
-            }),
-            None => out.push(Assignment {
-                name: line.to_string(),
-                value: None,
-            }),
-        }
-    }
-    out
+    store_option(cfg, pass, spec.long, spec.kind, value.unwrap_or(""))
 }
 
 /// Expand environment variables and a leading `~` in the path,
@@ -1245,12 +1233,81 @@ fn file_exists(name: &str) -> bool {
     std::path::Path::new(name).exists()
 }
 
+/// The command line input for [`load_config`]: pre-tokenized
+/// assignments (as the frozen pipeline vectors use) or the raw
+/// argument vector parsed with full go-flags syntax.
+enum CliSource<'a> {
+    /// Already-split option assignments plus positional arguments.
+    Assignments {
+        /// The option assignments.
+        opts: &'a [Assignment],
+        /// The positional arguments.
+        positional: &'a [String],
+    },
+    /// The raw arguments (without the program name).
+    Argv(&'a [String]),
+}
+
+/// The distinguished error [`load_config_from_argv`] returns when
+/// the command line requested the help output (dcrd prints usage
+/// and exits).
+pub const ERR_HELP_REQUESTED: &str = "help requested";
+/// The distinguished error [`load_config_from_argv`] returns when
+/// the command line requested the version (dcrd prints it and
+/// exits).
+pub const ERR_VERSION_REQUESTED: &str = "version requested";
+
 /// Initialize and parse the config from already-split option
 /// assignments (dcrd `loadConfig` past the go-flags syntax layer);
 /// returns the config and the remaining positional arguments.
 pub fn load_config(
     cli: &[Assignment],
     positional: &[String],
+    env: &ConfigEnv<'_>,
+) -> Result<(Config, Vec<String>), String> {
+    load_config_impl(
+        &CliSource::Assignments {
+            opts: cli,
+            positional,
+        },
+        env,
+    )
+}
+
+/// Initialize and parse the config from the raw command line
+/// arguments (without the program name), replicating go-flags'
+/// syntax exactly (dcrd `loadConfig`); returns the config and the
+/// remaining positional arguments.
+pub fn load_config_from_argv(
+    args: &[String],
+    env: &ConfigEnv<'_>,
+) -> Result<(Config, Vec<String>), String> {
+    // The built-in help option exits before anything else.
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        return Err(ERR_HELP_REQUESTED.to_string());
+    }
+    load_config_impl(&CliSource::Argv(args), env)
+}
+
+/// Apply a pre-pass over assignments (continuing past errors) and
+/// then the environment defaults, mirroring what a go-flags parse
+/// leaves behind.
+fn assignments_pre_pass(cfg: &mut Config, opts: &[Assignment], env: &ConfigEnv<'_>) {
+    let mut pass = ParsePass::default();
+    let mut set_names: Vec<&'static str> = Vec::new();
+    for a in opts {
+        if apply_option(cfg, &mut pass, &a.name, a.value.as_deref()).is_ok()
+            && let Some(spec) = crate::flags::find_long(&a.name)
+            && !set_names.contains(&spec.long)
+        {
+            set_names.push(spec.long);
+        }
+    }
+    crate::flags::apply_env_defaults(cfg, &set_names, &env.getenv);
+}
+
+fn load_config_impl(
+    cli: &CliSource<'_>,
     env: &ConfigEnv<'_>,
 ) -> Result<(Config, Vec<String>), String> {
     let func_name = "loadConfig";
@@ -1268,19 +1325,39 @@ pub fn load_config(
     let mut cfg = Config::defaults(&default_home);
 
     // The help pre-parse applies the command line into cfg (with
-    // unknown options ignored and errors discarded).
-    let mut pass = ParsePass::default();
-    for a in cli {
-        let _ = apply_option(&mut cfg, &mut pass, &a.name, a.value.as_deref());
+    // unknown options ignored and any other error aborting that
+    // parse silently); environment defaults apply when the parse
+    // succeeds.
+    match cli {
+        CliSource::Assignments { opts, .. } => assignments_pre_pass(&mut cfg, opts, env),
+        CliSource::Argv(args) => {
+            let (state, err) =
+                crate::flags::scan_args(&mut cfg, args, crate::flags::ScanMode::IgnoreUnknown);
+            if err.is_none() {
+                crate::flags::apply_env_defaults(&mut cfg, &state.set_names, &env.getenv);
+            }
+        }
     }
 
     // Pre-parse the command line to check for an alternative config
     // file; preCfg starts as a copy of cfg and takes the command
-    // line again.
+    // line again (with any error aborting silently).
     let mut pre_cfg = cfg.clone();
-    let mut pass = ParsePass::default();
-    for a in cli {
-        let _ = apply_option(&mut pre_cfg, &mut pass, &a.name, a.value.as_deref());
+    match cli {
+        CliSource::Assignments { opts, .. } => assignments_pre_pass(&mut pre_cfg, opts, env),
+        CliSource::Argv(args) => {
+            let (state, err) =
+                crate::flags::scan_args(&mut pre_cfg, args, crate::flags::ScanMode::Plain);
+            if err.is_none() {
+                crate::flags::apply_env_defaults(&mut pre_cfg, &state.set_names, &env.getenv);
+            }
+        }
+    }
+
+    // Show the version and exit if the version flag was specified
+    // (the caller handles the output).
+    if pre_cfg.show_version {
+        return Err(ERR_VERSION_REQUESTED.to_string());
     }
 
     // Update the home directory for dcrd if specified.  Since the
@@ -1338,16 +1415,28 @@ pub fn load_config(
         );
     }
 
-    // Load additional config from file.
+    // Load additional config from file.  The final parser is shared
+    // between the config file and the last command line pass, so
+    // options either sets suppress the environment defaults.
+    let mut parser_set_names: Vec<&'static str> = Vec::new();
     let mut config_file_error: Option<String> = None;
     if !(cfg.sim_net || cfg.reg_net) || pre_cfg.config_file != default_config_file {
         match fs::read_to_string(&pre_cfg.config_file) {
             Ok(content) => {
+                let assignments = crate::flags::parse_ini(&content, &pre_cfg.config_file)
+                    .map_err(|e| format!("Error parsing config file: {e}"))?;
                 let mut pass = ParsePass::default();
-                for a in parse_config_file(&content) {
-                    let applied = apply_option(&mut cfg, &mut pass, &a.name, a.value.as_deref());
-                    if let Err(e) = applied {
-                        return Err(format!("Error parsing config file: {e}"));
+                for a in assignments {
+                    if let Err(e) =
+                        crate::flags::set_option(&mut cfg, &mut pass, a.spec, a.value.as_deref())
+                    {
+                        return Err(format!(
+                            "Error parsing config file: {}:{}: {e}",
+                            pre_cfg.config_file, a.line
+                        ));
+                    }
+                    if !parser_set_names.contains(&a.spec.long) {
+                        parser_set_names.push(a.spec.long);
                     }
                 }
             }
@@ -1366,12 +1455,33 @@ pub fn load_config(
     }
 
     // Parse command line options again to ensure they take
-    // precedence.
-    let mut pass = ParsePass::default();
-    for a in cli {
-        apply_option(&mut cfg, &mut pass, &a.name, a.value.as_deref())?;
-    }
-    let remaining_args: Vec<String> = positional.to_vec();
+    // precedence, then apply the environment defaults for options
+    // neither the config file nor the command line set.
+    let remaining_args: Vec<String> = match cli {
+        CliSource::Assignments { opts, positional } => {
+            let mut pass = ParsePass::default();
+            for a in *opts {
+                apply_option(&mut cfg, &mut pass, &a.name, a.value.as_deref())?;
+                if let Some(spec) = crate::flags::find_long(&a.name)
+                    && !parser_set_names.contains(&spec.long)
+                {
+                    parser_set_names.push(spec.long);
+                }
+            }
+            crate::flags::apply_env_defaults(&mut cfg, &parser_set_names, &env.getenv);
+            positional.to_vec()
+        }
+        CliSource::Argv(args) => {
+            let (state, err) =
+                crate::flags::scan_args(&mut cfg, args, crate::flags::ScanMode::PassDoubleDash);
+            if let Some(err) = err {
+                return Err(err.message());
+            }
+            parser_set_names.extend(state.set_names.iter().copied());
+            crate::flags::apply_env_defaults(&mut cfg, &parser_set_names, &env.getenv);
+            state.retargs
+        }
+    };
 
     // Create the home directory if it doesn't already exist.
     if let Err(e) = fs::create_dir_all(&cfg.home_dir) {

@@ -470,6 +470,233 @@ pub(crate) fn go_parse_bool(s: &str) -> Result<bool, ()> {
     }
 }
 
+/// The Go `strconv.NumError` text for a failed conversion.
+fn num_error(func: &str, num: &str, err: &str) -> String {
+    format!("strconv.{func}: parsing {}: {err}", go_quote(num))
+}
+
+/// Parse a boolean like Go's `strconv.ParseBool`, with the
+/// `NumError` text on failure.
+pub(crate) fn go_parse_bool_err(s: &str) -> Result<bool, String> {
+    go_parse_bool(s).map_err(|()| num_error("ParseBool", s, "invalid syntax"))
+}
+
+/// Split the sign and base prefix like Go's `strconv.ParseInt` with
+/// base 0, returning (negative, digits, base) or a syntax error.
+/// Underscores are validated and stripped (base 0 allows them
+/// between digits and after the base prefix).
+fn split_int_prefix(s: &str, allow_sign: bool) -> Result<(bool, String, u32), ()> {
+    let mut rest = s;
+    let mut neg = false;
+    if allow_sign
+        && let Some(first) = rest.bytes().next()
+        && (first == b'+' || first == b'-')
+    {
+        neg = first == b'-';
+        rest = &rest[1..];
+    }
+    // Base detection (Go base 0 semantics).
+    let bytes = rest.as_bytes();
+    let (base, digits): (u32, &str) = if bytes.len() >= 2 && bytes[0] == b'0' {
+        match bytes[1] {
+            b'b' | b'B' => (2, &rest[2..]),
+            b'o' | b'O' => (8, &rest[2..]),
+            b'x' | b'X' => (16, &rest[2..]),
+            _ => (8, &rest[1..]),
+        }
+    } else {
+        (10, rest)
+    };
+    if digits.is_empty() && !(base == 8 && rest == "0") {
+        // A bare base prefix (or empty digits) is a syntax error;
+        // plain "0" is fine.
+        if rest == "0" {
+            return Ok((neg, "0".to_string(), 10));
+        }
+        return Err(());
+    }
+    if rest == "0" {
+        return Ok((neg, "0".to_string(), 10));
+    }
+    // Underscore validation like Go's underscoreOK: underscores may
+    // appear only between digits or between the prefix and a digit,
+    // and never leading/trailing/doubled.
+    let db = digits.as_bytes();
+    let mut cleaned = String::with_capacity(digits.len());
+    let is_digit = |c: u8| -> bool {
+        match base {
+            2 => matches!(c, b'0'..=b'1'),
+            8 => matches!(c, b'0'..=b'7'),
+            16 => c.is_ascii_hexdigit(),
+            _ => c.is_ascii_digit(),
+        }
+    };
+    let prefixed = base != 10 || (bytes.len() >= 2 && bytes[0] == b'0');
+    for (i, c) in db.iter().enumerate() {
+        if *c == b'_' {
+            // Underscores are only permitted in base-prefixed or
+            // plain decimal runs sandwiched by digits (or the
+            // prefix on the left).
+            let left_ok = if i == 0 {
+                prefixed
+            } else {
+                is_digit(db[i - 1])
+            };
+            let right_ok = i + 1 < db.len() && is_digit(db[i + 1]);
+            if !left_ok || !right_ok {
+                return Err(());
+            }
+            continue;
+        }
+        if !is_digit(*c) {
+            return Err(());
+        }
+        cleaned.push(*c as char);
+    }
+    if cleaned.is_empty() {
+        return Err(());
+    }
+    Ok((neg, cleaned, base))
+}
+
+/// Parse a signed integer like Go's `strconv.ParseInt(s, 0, bits)`,
+/// with the `NumError` texts.
+pub(crate) fn go_parse_int(s: &str, bits: u32) -> Result<i64, String> {
+    let syntax = || num_error("ParseInt", s, "invalid syntax");
+    let range = || num_error("ParseInt", s, "value out of range");
+    if s.is_empty() {
+        return Err(syntax());
+    }
+    let (neg, digits, base) = split_int_prefix(s, true).map_err(|()| syntax())?;
+    let mag = u64::from_str_radix(&digits, base).map_err(|_| range())?;
+    let max = if bits == 64 {
+        1u64 << 63
+    } else {
+        1u64 << (bits - 1)
+    };
+    if neg {
+        if mag > max {
+            return Err(range());
+        }
+        Ok((mag as i64).wrapping_neg())
+    } else {
+        if mag >= max {
+            return Err(range());
+        }
+        Ok(mag as i64)
+    }
+}
+
+/// Parse an unsigned integer like Go's `strconv.ParseUint(s, 0,
+/// bits)`, with the `NumError` texts.
+pub(crate) fn go_parse_uint(s: &str, bits: u32) -> Result<u64, String> {
+    let syntax = || num_error("ParseUint", s, "invalid syntax");
+    let range = || num_error("ParseUint", s, "value out of range");
+    if s.is_empty() {
+        return Err(syntax());
+    }
+    let (_, digits, base) = split_int_prefix(s, false).map_err(|()| syntax())?;
+    let mag = u64::from_str_radix(&digits, base).map_err(|_| range())?;
+    if bits < 64 && mag >= (1u64 << bits) {
+        return Err(range());
+    }
+    Ok(mag)
+}
+
+/// Parse a float like Go's `strconv.ParseFloat(s, 64)`, with the
+/// `NumError` text (Rust's parser matches Go's acceptance for the
+/// decimal, exponent, and inf/nan forms the options carry).
+pub(crate) fn go_parse_float(s: &str) -> Result<f64, String> {
+    s.parse::<f64>()
+        .map_err(|_| num_error("ParseFloat", s, "invalid syntax"))
+}
+
+/// Unquote a Go double-quoted string like `strconv.Unquote` for the
+/// escape forms configuration values can carry; the error is Go's
+/// `ErrSyntax` text.
+pub(crate) fn go_unquote(s: &str) -> Result<String, String> {
+    let syntax = || "invalid syntax".to_string();
+    let b = s.as_bytes();
+    if b.len() < 2 || b[0] != b'"' || b[b.len() - 1] != b'"' {
+        return Err(syntax());
+    }
+    let inner = &s[1..s.len() - 1];
+    if inner.contains('\n') {
+        return Err(syntax());
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            // An unescaped quote means the quoted string ended
+            // before the end of the input.
+            return Err(syntax());
+        }
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(esc) = chars.next() else {
+            return Err(syntax());
+        };
+        match esc {
+            'a' => out.push('\u{7}'),
+            'b' => out.push('\u{8}'),
+            'f' => out.push('\u{c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'v' => out.push('\u{b}'),
+            '\\' => out.push('\\'),
+            '\'' => return Err(syntax()), // \' only valid in char literals
+            '"' => out.push('"'),
+            'x' => {
+                let h: String = chars.by_ref().take(2).collect();
+                if h.len() != 2 {
+                    return Err(syntax());
+                }
+                let v = u8::from_str_radix(&h, 16).map_err(|_| syntax())?;
+                if v > 0x7f {
+                    // Non-UTF-8 byte escapes are not representable
+                    // in a Rust string; the config values never
+                    // carry them.
+                    return Err(syntax());
+                }
+                out.push(v as char);
+            }
+            'u' => {
+                let h: String = chars.by_ref().take(4).collect();
+                if h.len() != 4 {
+                    return Err(syntax());
+                }
+                let v = u32::from_str_radix(&h, 16).map_err(|_| syntax())?;
+                out.push(char::from_u32(v).ok_or_else(syntax)?);
+            }
+            '0'..='7' => {
+                let mut v = esc as u32 - '0' as u32;
+                for _ in 0..2 {
+                    let Some(d) = chars.next() else {
+                        return Err(syntax());
+                    };
+                    if !('0'..='7').contains(&d) {
+                        return Err(syntax());
+                    }
+                    v = v * 8 + (d as u32 - '0' as u32);
+                }
+                if v > 255 {
+                    return Err(syntax());
+                }
+                if v > 0x7f {
+                    return Err(syntax());
+                }
+                out.push(char::from_u32(v).ok_or_else(syntax)?);
+            }
+            _ => return Err(syntax()),
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

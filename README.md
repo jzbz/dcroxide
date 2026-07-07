@@ -184,13 +184,13 @@ Currently implemented:
   scripted 87-step session against a real dcrd sync manager, chain,
   peers, and pools, replayed over the real Rust chain engine
 - `dcroxide-node` — daemon assembly from dcrd's package main,
-  starting with the configuration pipeline: every option with dcrd's
-  defaults, config file and command line precedence including
-  go-flags' slice replacement semantics, and the full validation and
-  derivation gauntlet with dcrd's exact error strings, replayed
-  field for field against dcrd's own loadConfig, plus the network
-  parameter groupings, the embedded sample config, and the logging
-  subsystem registry
+  starting with the configuration layer: every option with dcrd's
+  defaults, the go-flags command line and INI syntax with its exact
+  parse error texts and precedence semantics, environment variable
+  defaults, and the full validation and derivation gauntlet with
+  dcrd's exact error strings, replayed field for field against
+  dcrd's own loadConfig, plus the network parameter groupings, the
+  embedded sample config, and the logging subsystem registry
 - `dcroxide-peer` — the peer-to-peer protocol decision core from
   dcrd's `peer` package: version negotiation with self-connection
   detection and dcrd's exact acceptance rules, local version

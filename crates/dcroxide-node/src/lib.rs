@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod flags;
 mod gostd;
 pub mod logsubsys;
 pub mod params;
@@ -19,10 +20,11 @@ pub use config::{
     AUTH_TYPE_BASIC, AUTH_TYPE_CLIENT_CERT, Assignment, Config, ConfigEnv, DialSelection,
     IfaceAddrs, IpNet, LookupSelection, NORMALIZE_INTERFACE_ADDRS, NORMALIZE_INTERFACE_FIRST_ADDR,
     OnionSelection, TlsCurve, app_data_dir, clean_and_expand_path, create_default_config_file,
-    load_config, normalize_addresses, parse_listeners, parse_network_interfaces,
-    port_to_local_host_addr, remove_duplicate_addresses, sample_dcrd_conf, tls_curve,
-    validate_profile_addr,
+    load_config, load_config_from_argv, normalize_addresses, parse_listeners,
+    parse_network_interfaces, port_to_local_host_addr, remove_duplicate_addresses,
+    sample_dcrd_conf, tls_curve, validate_profile_addr,
 };
+pub use flags::{OPTIONS, OptKind, OptSpec};
 pub use gostd::{go_duration_string, parse_go_duration};
 pub use logsubsys::{LogLevel, LogLevels, parse_and_set_debug_levels, supported_subsystems};
 pub use params::{ActiveNet, NodeParams};
