@@ -180,6 +180,44 @@ impl fmt::Display for IpNet {
     }
 }
 
+impl IpNet {
+    /// Whether the network includes the IP (Go `net.IPNet.Contains`).
+    /// The candidate must already be in Go's `To4`-normalized form (4
+    /// bytes for IPv4 and IPv4-mapped addresses, 16 otherwise), as
+    /// [`parse_ip_go`] produces.
+    pub fn contains(&self, ip: &[u8]) -> bool {
+        // Go's networkNumberAndMask: a 16-byte network address that
+        // is IPv4-mapped is compared in its 4-byte form against the
+        // last 4 mask bytes.
+        let (nn, mask_bit_offset): (&[u8], u32) = if self.ip.len() == 16
+            && self.ip[..10] == [0u8; 10]
+            && self.ip[10] == 0xff
+            && self.ip[11] == 0xff
+        {
+            (&self.ip[12..], 96)
+        } else {
+            (&self.ip[..], 0)
+        };
+        if ip.len() != nn.len() {
+            return false;
+        }
+        for (i, (&n, &c)) in nn.iter().zip(ip.iter()).enumerate() {
+            let bit = mask_bit_offset + (i as u32) * 8;
+            let m: u8 = if self.ones >= bit + 8 {
+                0xff
+            } else if self.ones <= bit {
+                0
+            } else {
+                0xffu8 << (8 - (self.ones - bit))
+            };
+            if n & m != c & m {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Format IP bytes like Go's `net.IP.String`: dotted for IPv4 (and
 /// IPv4-mapped IPv6), RFC 5952 for IPv6.
 fn go_ip_string(ip: &[u8]) -> String {
@@ -239,7 +277,7 @@ fn go_ip_string(ip: &[u8]) -> String {
 
 /// Parse an IP like Go's `net.ParseIP`, normalized to 4 bytes for
 /// IPv4 (including the IPv4-mapped IPv6 form, matching Go's `To4`).
-fn parse_ip_go(host: &str) -> Option<Vec<u8>> {
+pub(crate) fn parse_ip_go(host: &str) -> Option<Vec<u8>> {
     match host.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => Some(v4.octets().to_vec()),
         Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {

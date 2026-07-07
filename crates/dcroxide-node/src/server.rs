@@ -939,3 +939,463 @@ pub fn on_version<E: dcroxide_peer::PeerEnv>(
 pub fn on_ver_ack() -> dcroxide_wire::Message {
     dcroxide_wire::Message::SendHeaders
 }
+
+/// Whether the 16-byte wire IP is an IPv4-mapped address (Go
+/// `na.IP.To4() != nil`).
+fn wire_ip_is_v4(ip: &[u8; 16]) -> bool {
+    ip[..10] == [0u8; 10] && ip[10] == 0xff && ip[11] == 0xff
+}
+
+/// Whether the 16-byte wire IP is a loopback address (Go
+/// `net.IP.IsLoopback`).
+fn wire_ip_is_loopback(ip: &[u8; 16]) -> bool {
+    if wire_ip_is_v4(ip) {
+        return ip[12] == 127;
+    }
+    *ip == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+}
+
+/// A tracked peer in the server peer state maps; the fields are the
+/// ones the admission and removal decisions read (dcrd's maps hold
+/// the live `*serverPeer`).
+#[derive(Debug, Clone)]
+pub struct PeerStateEntry {
+    /// The peer's network address (dcrd `sp.NA()`).
+    pub na: dcroxide_wire::NetAddress,
+    /// Whether the peer is inbound.
+    pub inbound: bool,
+    /// Whether the peer is a persistent outbound peer.
+    pub persistent: bool,
+}
+
+/// The state of inbound, persistent, and outbound peers as well as
+/// banned peers and outbound groups (dcrd `peerState`).  dcrd guards
+/// the maps with a mutex; the port is single-threaded.
+pub struct PeerState {
+    /// The inbound peers by peer ID.
+    pub inbound_peers: BTreeMap<i32, PeerStateEntry>,
+    /// The non-persistent outbound peers by peer ID.
+    pub outbound_peers: BTreeMap<i32, PeerStateEntry>,
+    /// The persistent outbound peers by peer ID.
+    pub persistent_peers: BTreeMap<i32, PeerStateEntry>,
+    /// The banned hosts and the Unix nanosecond times the bans lift.
+    pub banned: BTreeMap<String, i64>,
+    /// The outbound peer counts by address group key.
+    pub outbound_groups: BTreeMap<String, i64>,
+    /// The network address submission cache.
+    pub sub_cache: NaSubmissionCache,
+}
+
+impl Default for PeerState {
+    fn default() -> PeerState {
+        PeerState::new()
+    }
+}
+
+impl PeerState {
+    /// An empty peer state (dcrd `makePeerState`).
+    pub fn new() -> PeerState {
+        PeerState {
+            inbound_peers: BTreeMap::new(),
+            outbound_peers: BTreeMap::new(),
+            persistent_peers: BTreeMap::new(),
+            banned: BTreeMap::new(),
+            outbound_groups: BTreeMap::new(),
+            sub_cache: NaSubmissionCache::new(MAX_CACHED_NA_SUBMISSIONS),
+        }
+    }
+
+    /// The count of all known peers (dcrd `count`).
+    pub fn count(&self) -> i64 {
+        (self.inbound_peers.len() + self.outbound_peers.len() + self.persistent_peers.len()) as i64
+    }
+
+    /// The number of connections with the given wire IP (dcrd
+    /// `connectionsWithIP`).
+    pub fn connections_with_ip(&self, ip: &[u8; 16]) -> i64 {
+        let mut total = 0;
+        for entry in self
+            .inbound_peers
+            .values()
+            .chain(self.outbound_peers.values())
+            .chain(self.persistent_peers.values())
+        {
+            if entry.na.ip == *ip {
+                total += 1;
+            }
+        }
+        total
+    }
+}
+
+/// Why the admission handler rejected a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddPeerReject {
+    /// The server is shutting down.
+    Shutdown,
+    /// The peer address could not be split into host and port.
+    BadAddress,
+    /// The peer's host is banned.
+    Banned,
+    /// The single-IP connection limit was reached.
+    TooManySameIp,
+    /// The maximum peer count was reached.
+    MaxPeers,
+}
+
+/// The peer and configuration facts the admission handler consumes.
+pub struct AddPeerFacts {
+    /// Whether the server is shutting down.
+    pub shutdown: bool,
+    /// The peer ID (dcrd `sp.ID()`).
+    pub id: i32,
+    /// The peer's address string (dcrd `sp.Addr()`).
+    pub addr: String,
+    /// Whether the peer is inbound.
+    pub inbound: bool,
+    /// Whether the peer is a persistent outbound peer.
+    pub persistent: bool,
+    /// Whether the peer is whitelisted.
+    pub is_whitelisted: bool,
+    /// The peer's network address (dcrd `sp.NA()`).
+    pub na: dcroxide_wire::NetAddress,
+    /// The remote peer's view of the local address from its version
+    /// message, when one was stored (dcrd `sp.peerNa`).
+    pub peer_na: Option<dcroxide_wire::NetAddress>,
+    /// The single-IP connection limit (dcrd `cfg.MaxSameIP`).
+    pub max_same_ip: i64,
+    /// The maximum peer count (dcrd `cfg.MaxPeers`).
+    pub max_peers: i64,
+    /// Whether a proxy or onion proxy is configured.
+    pub has_proxy: bool,
+    /// Whether automatic network address discovery is disabled.
+    pub no_discover_ip: bool,
+    /// Whether external IPs are explicitly configured.
+    pub has_external_ips: bool,
+    /// Whether listening is disabled or no listeners exist.
+    pub listen_disabled: bool,
+    /// Whether Universal Plug and Play is enabled.
+    pub upnp: bool,
+    /// Whether the active network is the simulation or regression
+    /// test network.
+    pub sim_or_reg_net: bool,
+    /// The services the server supports.
+    pub services: ServiceFlag,
+    /// The configured listeners (dcrd `cfg.Listeners`).
+    pub listeners: Vec<String>,
+}
+
+/// What the admission handler decided and did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AddPeerOutcome {
+    /// The rejection when the peer was refused and disconnected;
+    /// dcrd returns false from `handleAddPeer`.
+    pub rejected: Option<AddPeerReject>,
+    /// An expired ban entry for the host was removed.
+    pub unbanned: bool,
+    /// An inbound peer corroborated an existing address submission.
+    pub corroborated: bool,
+    /// An outbound peer's suggestion was added as a new submission.
+    pub sub_added: bool,
+    /// An outbound peer's suggestion incremented an existing
+    /// submission.
+    pub sub_incremented: bool,
+    /// The local address resolution ran after the submission.
+    pub resolved_local: bool,
+}
+
+/// Deal with adding new peers: categorize the peer, enforce the ban
+/// list and the connection limits, track it in the peer state maps,
+/// and feed the local external address discovery (dcrd
+/// `server.handleAddPeer`).  A rejection in the outcome means dcrd
+/// disconnected the peer and returned false.
+pub fn handle_add_peer(
+    state: &mut PeerState,
+    addr_mgr: &mut AddrManager,
+    facts: &AddPeerFacts,
+    resolver: &ResolveIpFn<'_>,
+    now_nanos: i64,
+) -> AddPeerOutcome {
+    let mut outcome = AddPeerOutcome::default();
+
+    // Ignore new peers when shutting down.
+    if facts.shutdown {
+        outcome.rejected = Some(AddPeerReject::Shutdown);
+        return outcome;
+    }
+
+    // Disconnect banned peers.
+    let Ok((host, _)) = split_host_port(&facts.addr) else {
+        outcome.rejected = Some(AddPeerReject::BadAddress);
+        return outcome;
+    };
+    if let Some(&ban_end) = state.banned.get(&host) {
+        if now_nanos < ban_end {
+            outcome.rejected = Some(AddPeerReject::Banned);
+            return outcome;
+        }
+        state.banned.remove(&host);
+        outcome.unbanned = true;
+    }
+
+    // Limit the max number of connections from a single IP, allowing
+    // whitelisted inbound peers and localhost connections regardless.
+    let is_inbound_whitelisted = facts.is_whitelisted && facts.inbound;
+    let peer_ip = facts.na.ip;
+    if facts.max_same_ip > 0
+        && !is_inbound_whitelisted
+        && !wire_ip_is_loopback(&peer_ip)
+        && state.connections_with_ip(&peer_ip) + 1 > facts.max_same_ip
+    {
+        outcome.rejected = Some(AddPeerReject::TooManySameIp);
+        return outcome;
+    }
+
+    // Limit the max number of total peers, allowing whitelisted
+    // inbound peers regardless.
+    if state.count() + 1 > facts.max_peers && !is_inbound_whitelisted {
+        outcome.rejected = Some(AddPeerReject::MaxPeers);
+        return outcome;
+    }
+
+    let entry = PeerStateEntry {
+        na: facts.na,
+        inbound: facts.inbound,
+        persistent: facts.persistent,
+    };
+    let now_unix = now_nanos / 1_000_000_000;
+
+    // Add the new peer.
+    if facts.inbound {
+        state.inbound_peers.insert(facts.id, entry);
+
+        if let Some(peer_na) = &facts.peer_na {
+            let id = wire_to_addrmgr_net_address(peer_na).ip_string();
+
+            // Inbound peers can only corroborate existing address
+            // submissions; an increment failure is logged and
+            // returns early.
+            if state.sub_cache.exists(&id) {
+                if state.sub_cache.increment_score(&id, now_unix).is_err() {
+                    return outcome;
+                }
+                outcome.corroborated = true;
+            }
+        }
+
+        return outcome;
+    }
+
+    // The peer is an outbound peer at this point.
+    let remote_addr = wire_to_addrmgr_net_address(&facts.na);
+    *state
+        .outbound_groups
+        .entry(remote_addr.group_key())
+        .or_insert(0) += 1;
+    if facts.persistent {
+        state.persistent_peers.insert(facts.id, entry);
+    } else {
+        state.outbound_peers.insert(facts.id, entry);
+    }
+
+    // Fetch the suggested public IP from the outbound peer unless a
+    // prevailing condition disables automatic network address
+    // discovery: a proxy, explicit disablement, explicit external
+    // IPs, disabled listening, UPnP, or the simulation networks.
+    if facts.has_proxy
+        || facts.no_discover_ip
+        || facts.has_external_ips
+        || facts.listen_disabled
+        || facts.upnp
+        || facts.sim_or_reg_net
+    {
+        return outcome;
+    }
+
+    if let Some(peer_na) = &facts.peer_na {
+        let net = if wire_ip_is_v4(&peer_na.ip) {
+            NetAddressType::IPv4
+        } else {
+            NetAddressType::IPv6
+        };
+
+        let local_addr = wire_to_addrmgr_net_address(peer_na);
+        let (good, reach) = addr_mgr.is_external_addr_candidate(&local_addr, &remote_addr);
+        if !good {
+            return outcome;
+        }
+
+        let id = local_addr.ip_string();
+        if state.sub_cache.exists(&id) {
+            // Increment the submission score if it already exists;
+            // a failure is logged and returns early.
+            if state.sub_cache.increment_score(&id, now_unix).is_err() {
+                return outcome;
+            }
+            outcome.sub_incremented = true;
+        } else {
+            // Create a cache entry for a new submission; a failure
+            // is logged and returns early.
+            let sub = NaSubmission {
+                na: local_addr,
+                net_type: net,
+                reach,
+                score: 0,
+                last_accessed: 0,
+            };
+            if state.sub_cache.add(sub, now_unix).is_err() {
+                return outcome;
+            }
+            outcome.sub_added = true;
+        }
+
+        // Pick the local address for the provided network based on
+        // submission scores.
+        resolve_local_address(
+            &state.sub_cache,
+            net,
+            addr_mgr,
+            facts.services,
+            &facts.listeners,
+            facts.max_peers,
+            resolver,
+            now_unix,
+        );
+        outcome.resolved_local = true;
+    }
+
+    outcome
+}
+
+/// The peer and configuration facts the removal handler consumes.
+pub struct DonePeerFacts {
+    /// The peer ID (dcrd `sp.ID()`).
+    pub id: i32,
+    /// Whether the peer is inbound.
+    pub inbound: bool,
+    /// Whether the peer is a persistent outbound peer.
+    pub persistent: bool,
+    /// Whether the version handshake stored the peer's version.
+    pub version_known: bool,
+    /// Whether the peer acknowledged the local version.
+    pub ver_ack_received: bool,
+    /// The peer's network address; dcrd's is always set once the
+    /// handshake completed.
+    pub na: Option<dcroxide_wire::NetAddress>,
+    /// Whether a connection manager request is attached to the peer.
+    pub has_conn_req: bool,
+    /// Whether the simulation or regression test network is active
+    /// (dcrd `cfg.SimNet || cfg.RegNet`).
+    pub sim_or_reg_net: bool,
+}
+
+/// What the removal handler decided and did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DonePeerOutcome {
+    /// The peer was removed from its tracking map.
+    pub removed: bool,
+    /// The peer's outbound group count was decremented.
+    pub group_decremented: bool,
+    /// The connection manager was told to disconnect the request.
+    pub conn_mgr_disconnect: bool,
+    /// The address manager recorded the connection time.
+    pub marked_connected: bool,
+}
+
+/// Remove a disconnected peer from the server: update the tracking
+/// maps and outbound groups, release the connection manager request,
+/// and record the last seen time for negotiated untracked peers
+/// (dcrd `server.DonePeer`).
+pub fn done_peer(
+    state: &mut PeerState,
+    addr_mgr: &mut AddrManager,
+    facts: &DonePeerFacts,
+) -> DonePeerOutcome {
+    let mut outcome = DonePeerOutcome::default();
+
+    let tracked = if facts.persistent {
+        state.persistent_peers.contains_key(&facts.id)
+    } else if facts.inbound {
+        state.inbound_peers.contains_key(&facts.id)
+    } else {
+        state.outbound_peers.contains_key(&facts.id)
+    };
+    if tracked {
+        if !facts.inbound && facts.version_known {
+            // dcrd reads the address unconditionally; it is always
+            // set for peers that completed the handshake.
+            if let Some(na) = &facts.na {
+                let remote_addr = wire_to_addrmgr_net_address(na);
+                *state
+                    .outbound_groups
+                    .entry(remote_addr.group_key())
+                    .or_insert(0) -= 1;
+                outcome.group_decremented = true;
+            }
+        }
+        if !facts.inbound && facts.has_conn_req {
+            outcome.conn_mgr_disconnect = true;
+        }
+        if facts.persistent {
+            state.persistent_peers.remove(&facts.id);
+        } else if facts.inbound {
+            state.inbound_peers.remove(&facts.id);
+        } else {
+            state.outbound_peers.remove(&facts.id);
+        }
+        outcome.removed = true;
+        return outcome;
+    }
+
+    if facts.has_conn_req {
+        outcome.conn_mgr_disconnect = true;
+    }
+
+    // Update the address manager with the last seen time when the
+    // peer has acknowledged our version and has sent us its version
+    // as well; skipped on the simulation and regression test
+    // networks.
+    if !facts.sim_or_reg_net && facts.ver_ack_received && facts.version_known {
+        if let Some(na) = &facts.na {
+            let remote_addr = wire_to_addrmgr_net_address(na);
+            // A failure is logged and ignored.
+            outcome.marked_connected = addr_mgr.connected(&remote_addr).is_ok();
+        }
+    }
+
+    outcome
+}
+
+/// Disconnect and remove the first peer in the list the comparison
+/// selects, returning it for the caller's when-found handling (dcrd
+/// `disconnectPeer` with its `whenFound` callback).  dcrd iterates
+/// the map in Go's random order; iteration here is in key order.
+pub fn disconnect_peer(
+    peer_list: &mut BTreeMap<i32, PeerStateEntry>,
+    compare: impl Fn(i32, &PeerStateEntry) -> bool,
+) -> Option<(i32, PeerStateEntry)> {
+    let id = peer_list
+        .iter()
+        .find(|(id, entry)| compare(**id, entry))
+        .map(|(id, _)| *id)?;
+    let entry = peer_list.remove(&id)?;
+    Some((id, entry))
+}
+
+/// Whether the peer address is within a whitelisted network (dcrd
+/// `isWhitelisted`); unsplittable addresses and unparseable hosts
+/// are logged and not whitelisted.
+pub fn is_whitelisted(whitelists: &[crate::config::IpNet], addr: &str) -> bool {
+    if whitelists.is_empty() {
+        return false;
+    }
+
+    let Ok((host, _)) = split_host_port(addr) else {
+        return false;
+    };
+    let Some(ip) = crate::config::parse_ip_go(&host) else {
+        return false;
+    };
+
+    whitelists.iter().any(|ipnet| ipnet.contains(&ip))
+}
