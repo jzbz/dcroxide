@@ -190,7 +190,9 @@ Currently implemented:
   defaults, and the full validation and derivation gauntlet with
   dcrd's exact error strings, replayed field for field against
   dcrd's own loadConfig, plus the network parameter groupings, the
-  embedded sample config, and the logging subsystem registry
+  embedded sample config, the logging subsystem registry, the pipe
+  IPC lifecycle protocol framed byte for byte, and the version
+  machinery with dcrd's semver parsing
 - `dcroxide-peer` — the peer-to-peer protocol decision core from
   dcrd's `peer` package: version negotiation with self-connection
   detection and dcrd's exact acceptance rules, local version

@@ -13,8 +13,10 @@
 pub mod config;
 pub mod flags;
 mod gostd;
+pub mod ipc;
 pub mod logsubsys;
 pub mod params;
+pub mod version;
 
 pub use config::{
     AUTH_TYPE_BASIC, AUTH_TYPE_CLIENT_CERT, Assignment, Config, ConfigEnv, DialSelection,
@@ -26,5 +28,6 @@ pub use config::{
 };
 pub use flags::{OPTIONS, OptKind, OptSpec};
 pub use gostd::{go_duration_string, parse_go_duration};
+pub use ipc::{LifetimeAction, LifetimeEventId, PipeMessage};
 pub use logsubsys::{LogLevel, LogLevels, parse_and_set_debug_levels, supported_subsystems};
 pub use params::{ActiveNet, NodeParams};

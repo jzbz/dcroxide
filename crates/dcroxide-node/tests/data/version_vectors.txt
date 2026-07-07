@@ -1,0 +1,93 @@
+vver|2.1.5+release.local|2|1|5||release.local
+vsem|0.0.4|ok|0|0|4||
+vsem|1.2.3|ok|1|2|3||
+vsem|10.20.30|ok|10|20|30||
+vsem|1.1.2-prerelease+meta|ok|1|1|2|prerelease|meta
+vsem|1.1.2+meta|ok|1|1|2||meta
+vsem|1.1.2+meta-valid|ok|1|1|2||meta-valid
+vsem|1.0.0-alpha|ok|1|0|0|alpha|
+vsem|1.0.0-beta|ok|1|0|0|beta|
+vsem|1.0.0-alpha.beta|ok|1|0|0|alpha.beta|
+vsem|1.0.0-alpha.beta.1|ok|1|0|0|alpha.beta.1|
+vsem|1.0.0-alpha.1|ok|1|0|0|alpha.1|
+vsem|1.0.0-alpha0.valid|ok|1|0|0|alpha0.valid|
+vsem|1.0.0-alpha.0valid|ok|1|0|0|alpha.0valid|
+vsem|1.0.0-alpha-a.b-c-somethinglong+build.1-aef.1-its-okay|ok|1|0|0|alpha-a.b-c-somethinglong|build.1-aef.1-its-okay
+vsem|1.0.0-rc.1+build.1|ok|1|0|0|rc.1|build.1
+vsem|2.0.0-rc.1+build.123|ok|2|0|0|rc.1|build.123
+vsem|1.2.3-beta|ok|1|2|3|beta|
+vsem|10.2.3-DEV-SNAPSHOT|ok|10|2|3|DEV-SNAPSHOT|
+vsem|1.2.3-SNAPSHOT-123|ok|1|2|3|SNAPSHOT-123|
+vsem|1.0.0|ok|1|0|0||
+vsem|2.0.0|ok|2|0|0||
+vsem|1.1.7|ok|1|1|7||
+vsem|2.0.0+build.1848|ok|2|0|0||build.1848
+vsem|2.0.1-alpha.1227|ok|2|0|1|alpha.1227|
+vsem|1.0.0-alpha+beta|ok|1|0|0|alpha|beta
+vsem|1.2.3----RC-SNAPSHOT.12.9.1--.12+788|ok|1|2|3|---RC-SNAPSHOT.12.9.1--.12|788
+vsem|1.2.3----R-S.12.9.1--.12+meta|ok|1|2|3|---R-S.12.9.1--.12|meta
+vsem|1.2.3----RC-SNAPSHOT.12.9.1--.12|ok|1|2|3|---RC-SNAPSHOT.12.9.1--.12|
+vsem|1.0.0+0.build.1-rc.10000aaa-kk-0.1|ok|1|0|0||0.build.1-rc.10000aaa-kk-0.1
+vsem|1.0.0-0A.is.legal|ok|1|0|0|0A.is.legal|
+vsem|1|err|malformed version string "1": does not conform to semver specification
+vsem|1.2|err|malformed version string "1.2": does not conform to semver specification
+vsem|1.2.3-0123|err|malformed version string "1.2.3-0123": does not conform to semver specification
+vsem|1.2.3-0123.0123|err|malformed version string "1.2.3-0123.0123": does not conform to semver specification
+vsem|1.1.2+.123|err|malformed version string "1.1.2+.123": does not conform to semver specification
+vsem|+invalid|err|malformed version string "+invalid": does not conform to semver specification
+vsem|-invalid|err|malformed version string "-invalid": does not conform to semver specification
+vsem|-invalid+invalid|err|malformed version string "-invalid+invalid": does not conform to semver specification
+vsem|-invalid.01|err|malformed version string "-invalid.01": does not conform to semver specification
+vsem|alpha|err|malformed version string "alpha": does not conform to semver specification
+vsem|alpha.beta|err|malformed version string "alpha.beta": does not conform to semver specification
+vsem|alpha.beta.1|err|malformed version string "alpha.beta.1": does not conform to semver specification
+vsem|alpha.1|err|malformed version string "alpha.1": does not conform to semver specification
+vsem|alpha+beta|err|malformed version string "alpha+beta": does not conform to semver specification
+vsem|alpha_beta|err|malformed version string "alpha_beta": does not conform to semver specification
+vsem|alpha.|err|malformed version string "alpha.": does not conform to semver specification
+vsem|alpha..|err|malformed version string "alpha..": does not conform to semver specification
+vsem|beta|err|malformed version string "beta": does not conform to semver specification
+vsem|1.0.0-alpha_beta|err|malformed version string "1.0.0-alpha_beta": does not conform to semver specification
+vsem|-alpha.|err|malformed version string "-alpha.": does not conform to semver specification
+vsem|1.0.0-alpha..|err|malformed version string "1.0.0-alpha..": does not conform to semver specification
+vsem|1.0.0-alpha..1|err|malformed version string "1.0.0-alpha..1": does not conform to semver specification
+vsem|1.0.0-alpha...1|err|malformed version string "1.0.0-alpha...1": does not conform to semver specification
+vsem|1.0.0-alpha....1|err|malformed version string "1.0.0-alpha....1": does not conform to semver specification
+vsem|1.0.0-alpha.....1|err|malformed version string "1.0.0-alpha.....1": does not conform to semver specification
+vsem|1.0.0-alpha......1|err|malformed version string "1.0.0-alpha......1": does not conform to semver specification
+vsem|1.0.0-alpha.......1|err|malformed version string "1.0.0-alpha.......1": does not conform to semver specification
+vsem|01.1.1|err|malformed version string "01.1.1": does not conform to semver specification
+vsem|1.01.1|err|malformed version string "1.01.1": does not conform to semver specification
+vsem|1.1.01|err|malformed version string "1.1.01": does not conform to semver specification
+vsem|1.2.3.DEV|err|malformed version string "1.2.3.DEV": does not conform to semver specification
+vsem|1.2-SNAPSHOT|err|malformed version string "1.2-SNAPSHOT": does not conform to semver specification
+vsem|1.2.31.2.3----RC-SNAPSHOT.12.09.1--..12+788|err|malformed version string "1.2.31.2.3----RC-SNAPSHOT.12.09.1--..12+788": does not conform to semver specification
+vsem|1.2-RC-SNAPSHOT|err|malformed version string "1.2-RC-SNAPSHOT": does not conform to semver specification
+vsem|-1.0.3-gamma+b7718|err|malformed version string "-1.0.3-gamma+b7718": does not conform to semver specification
+vsem|+justmeta|err|malformed version string "+justmeta": does not conform to semver specification
+vsem|9.8.7+meta+meta|err|malformed version string "9.8.7+meta+meta": does not conform to semver specification
+vsem|9.8.7-whatever+meta+meta|err|malformed version string "9.8.7-whatever+meta+meta": does not conform to semver specification
+vsem|99999999999999999999999.999999999999999999.99999999999999999|err|malformed semver major: strconv.ParseUint: parsing "99999999999999999999999": value out of range
+vsem|999999999.999999999.999999999----RC-SNAPSHOT.12.09.1---------------------------..12|err|malformed version string "999999999.999999999.999999999----RC-SNAPSHOT.12.09.1---------------------------..12": does not conform to semver specification
+vsem|4294967296.0.0|err|malformed semver major: strconv.ParseUint: parsing "4294967296": value out of range
+vsem|0.4294967296.0|err|malformed semver minor: strconv.ParseUint: parsing "4294967296": value out of range
+vsem|0.0.4294967296|err|malformed semver patch: strconv.ParseUint: parsing "4294967296": value out of range
+vsem|4294967295.4294967295.4294967295|ok|4294967295|4294967295|4294967295||
+vsem|1.2.3-|err|malformed version string "1.2.3-": does not conform to semver specification
+vsem|1.2.3+|err|malformed version string "1.2.3+": does not conform to semver specification
+vsem|1.2.3-+b|err|malformed version string "1.2.3-+b": does not conform to semver specification
+vsem|1.2.3-a.|err|malformed version string "1.2.3-a.": does not conform to semver specification
+vsem|1.2.3+b.|err|malformed version string "1.2.3+b.": does not conform to semver specification
+vsem|1.2.3-a+|err|malformed version string "1.2.3-a+": does not conform to semver specification
+vsem||err|malformed version string "": does not conform to semver specification
+vsem|1.2.3-ż|err|malformed version string "1.2.3-ż": does not conform to semver specification
+vsem|2.1.5+release.local|ok|2|1|5||release.local
+vnorm||
+vnorm|already-valid.123|already-valid.123
+vnorm|under_score|underscore
+vnorm|space here|spacehere
+vnorm|tab	char|tabchar
+vnorm|plus+meta|plusmeta
+vnorm|żółć|
+vnorm|UPPER.lower-09|UPPER.lower-09
+vnorm|a/b\c|abc
