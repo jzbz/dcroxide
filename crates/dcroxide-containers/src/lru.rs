@@ -8,19 +8,21 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// The minimum interval between expiration scans, in nanoseconds
 /// (dcrd `expireScanInterval`, 30 seconds).
 const EXPIRE_SCAN_INTERVAL: i64 = 30_000_000_000;
 
 /// A clock returning the current time as Unix nanoseconds (dcrd's
-/// `nowFn`, injectable so tests can control expiration).
-pub type Clock = Rc<dyn Fn() -> i64>;
+/// `nowFn`, injectable so tests can control expiration).  It is
+/// `Send + Sync` so the LRU caches inside a peer can move between the
+/// daemon's per-peer threads.
+pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 /// The system clock.
 fn system_clock() -> Clock {
-    Rc::new(|| {
+    Arc::new(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)

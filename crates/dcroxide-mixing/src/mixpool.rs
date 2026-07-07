@@ -426,7 +426,9 @@ impl<B: MixBlockChain> Pool<B> {
         Pool::new_with_clock(
             blockchain,
             utxo_fetcher,
-            Rc::new(|| {
+            // The LRU clock must be Send + Sync, unlike the mixpool's
+            // single-threaded internal Rc structures.
+            std::sync::Arc::new(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as i64)

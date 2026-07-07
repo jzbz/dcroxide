@@ -253,7 +253,7 @@ fn mixpool_vectors() {
                 let fetcher = Rc::new(DumpFetcher::default());
                 let clock: dcroxide_containers::lru::Clock = {
                     let nanos = now_unix.wrapping_mul(1_000_000_000);
-                    Rc::new(move || nanos)
+                    std::sync::Arc::new(move || nanos)
                 };
                 let pool = Pool::new_with_clock(
                     chain,

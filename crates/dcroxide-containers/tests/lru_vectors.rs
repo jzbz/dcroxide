@@ -12,10 +12,10 @@
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
 
-use core::cell::Cell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
-use dcroxide_containers::lru::{Map, Set};
+use dcroxide_containers::lru::{Clock, Map, Set};
 
 enum Container {
     Map(Map<String, String>),
@@ -68,10 +68,10 @@ fn lru_vectors() {
     let data = include_str!("data/lru_vectors.txt");
     let mut lines = data.lines().peekable();
 
-    let clock = Rc::new(Cell::new(0i64));
-    let now_fn: Rc<dyn Fn() -> i64> = {
-        let clock = clock.clone();
-        Rc::new(move || clock.get())
+    let clock = Arc::new(AtomicI64::new(0));
+    let now_fn: Clock = {
+        let clock = Arc::clone(&clock);
+        Arc::new(move || clock.load(Ordering::Relaxed))
     };
 
     let mut container: Option<Container> = None;
@@ -94,7 +94,7 @@ fn lru_vectors() {
     while let Some(line) = lines.next() {
         let f: Vec<&str> = line.split(' ').collect();
         match f[0] {
-            "clock" => clock.set(f[1].parse().expect("clock")),
+            "clock" => clock.store(f[1].parse().expect("clock"), Ordering::Relaxed),
             "mapnew" => {
                 let limit: u32 = f[1].parse().expect("limit");
                 let ttl: i64 = f[2].parse().expect("ttl");
@@ -255,4 +255,14 @@ fn lru_vectors() {
         }
     }
     assert_eq!(counts, [6, 17, 9, 5, 3, 8], "row counts");
+}
+
+/// The LRU containers must be `Send` when their contents are, so a peer
+/// holding them can move between the daemon's per-peer threads.  This is
+/// a compile-time guarantee; the body only needs to type-check.
+#[test]
+fn lru_containers_are_send_when_contents_are() {
+    fn assert_send<T: Send>() {}
+    assert_send::<Map<u64, ()>>();
+    assert_send::<Set<u64>>();
 }
