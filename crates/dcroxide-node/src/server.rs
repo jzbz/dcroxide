@@ -1560,3 +1560,135 @@ pub fn handle_relay_peer_inv(
 pub fn should_broadcast_to_peer(connected: bool, is_excluded: bool) -> bool {
     connected && !is_excluded
 }
+
+/// The maximum number of inventory vectors per message (dcrd
+/// `wire.MaxInvPerMsg`).
+pub const MAX_INV_PER_MSG: u32 = 50000;
+
+/// The maximum number of concurrent pending getdata request batches
+/// before a peer is disconnected (dcrd `maxConcurrentGetDataReqs`).
+pub const MAX_CONCURRENT_GETDATA_REQS: usize = 1000;
+
+/// The maximum number of pending individual getdata item requests
+/// before a peer is disconnected (dcrd `maxPendingGetDataItemReqs`,
+/// two full inventory messages).
+pub const MAX_PENDING_GETDATA_ITEM_REQS: u32 = 2 * MAX_INV_PER_MSG;
+
+/// What the getdata handler decided to do with the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnGetDataOutcome {
+    /// The empty request is banned with dcrd's reason.
+    BanEmpty,
+    /// The decaying request ban score crossed the threshold, so dcrd
+    /// bans with the "ban score exceeds threshold" reason.
+    BanScore,
+    /// Too many concurrent pending request batches; the peer is
+    /// disconnected.
+    DisconnectConcurrent,
+    /// Too many pending individual item requests; the peer is
+    /// disconnected.
+    DisconnectPendingItems,
+    /// The request is queued to be served asynchronously; the field
+    /// is the new pending item count.
+    Enqueue {
+        /// The pending individual item request count after the
+        /// enqueue.
+        new_pending_items: u32,
+    },
+}
+
+/// Apply the getdata intake gates: ban empty requests, apply the
+/// decaying ban score that penalizes oversized inventory queries,
+/// enforce the concurrent-request and pending-item limits, and
+/// otherwise queue the request to be served (dcrd
+/// `serverPeer.OnGetData` up to the point the serve queue takes
+/// over).  The serving itself is chain-backed and lands with a later
+/// slice.
+#[allow(clippy::too_many_arguments)] // Mirrors dcrd's fact surface.
+pub fn on_get_data(
+    state: &mut ServerPeerAddrState,
+    inv_len: u32,
+    pending_getdata_reqs: usize,
+    pending_item_reqs: u32,
+    disable_banning: bool,
+    ban_threshold: u32,
+    now_unix: i64,
+) -> OnGetDataOutcome {
+    // Ban peers sending empty getdata requests.
+    if inv_len == 0 {
+        return OnGetDataOutcome::BanEmpty;
+    }
+
+    // A decaying ban score increase is applied to prevent exhausting
+    // resources with unusually large inventory queries.  Requesting
+    // more than the maximum inventory vector length within a short
+    // period of time yields a score above the default ban threshold,
+    // while sustained bursts of small requests are not penalized.
+    let num_new_reqs = inv_len;
+    if add_ban_score(
+        state,
+        0,
+        num_new_reqs * 99 / MAX_INV_PER_MSG,
+        disable_banning,
+        ban_threshold,
+        now_unix,
+    ) {
+        return OnGetDataOutcome::BanScore;
+    }
+
+    // Prevent too many outstanding request batches while still
+    // allowing multiple simultaneous getdata requests to be served
+    // asynchronously.
+    if pending_getdata_reqs + 1 > MAX_CONCURRENT_GETDATA_REQS {
+        return OnGetDataOutcome::DisconnectConcurrent;
+    }
+
+    // Prevent too many outstanding individual item requests.
+    if pending_item_reqs + num_new_reqs > MAX_PENDING_GETDATA_ITEM_REQS {
+        return OnGetDataOutcome::DisconnectPendingItems;
+    }
+
+    // Queue the data requests to be served asynchronously.
+    OnGetDataOutcome::Enqueue {
+        new_pending_items: pending_item_reqs + num_new_reqs,
+    }
+}
+
+/// What the inventory handler decided to do with the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnInvOutcome {
+    /// The empty announcement is banned with dcrd's reason.
+    BanEmpty,
+    /// A blocks-only peer announced the given noun (transactions or
+    /// mix messages) and is disconnected.
+    DisconnectAnnouncement(&'static str),
+    /// The announcement is forwarded to the sync manager (ported
+    /// netsync machinery).
+    Forward,
+}
+
+/// Classify an inventory announcement: ban empty announcements, and
+/// in blocks-only mode disconnect peers that announce transactions
+/// or mix messages, otherwise forward to the sync manager (dcrd
+/// `serverPeer.OnInv`).  The forward is ported netsync machinery.
+pub fn on_inv_classify(inv_types: &[dcroxide_wire::InvType], blocks_only: bool) -> OnInvOutcome {
+    // Ban peers sending empty inventory announcements.
+    if inv_types.is_empty() {
+        return OnInvOutcome::BanEmpty;
+    }
+
+    if !blocks_only {
+        return OnInvOutcome::Forward;
+    }
+
+    for inv_type in inv_types {
+        if *inv_type == dcroxide_wire::InvType::TX {
+            return OnInvOutcome::DisconnectAnnouncement("transactions");
+        }
+        if *inv_type == dcroxide_wire::InvType::MIX {
+            return OnInvOutcome::DisconnectAnnouncement("mix messages");
+        }
+    }
+
+    OnInvOutcome::Forward
+}

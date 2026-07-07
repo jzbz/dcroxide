@@ -1,0 +1,9 @@
+gd|empty|10.0.0.2|false|0
+gd|smallenqueue||true|5
+gd|scorewarn||true|50000
+gd|scoreban|10.0.0.2|false
+gd|concurrent||false
+gd|pendingitems||false
+iv|empty|10.0.0.2|false
+iv|blocksonlytx||false
+iv|blocksonlymix||false
