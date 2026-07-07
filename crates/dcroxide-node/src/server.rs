@@ -326,3 +326,296 @@ pub fn is_supported_net_addr_type_v1(addr_type: NetAddressType) -> bool {
 pub fn natf_supported(_pver: u32) -> fn(NetAddressType) -> bool {
     is_supported_net_addr_type_v1
 }
+
+/// The maximum number of known addresses to track per peer (dcrd
+/// `maxKnownAddrsPerPeer`).
+pub const MAX_KNOWN_ADDRS_PER_PEER: u32 = 10000;
+
+/// The false positive rate for the known-address filter (dcrd
+/// `knownAddrsFPRate`).
+pub const KNOWN_ADDRS_FP_RATE: f64 = 0.001;
+
+/// The per-peer address relay and banning state (the corresponding
+/// `serverPeer` fields).
+pub struct ServerPeerAddrState {
+    /// The addresses already sent to or received from the peer
+    /// (dcrd `knownAddresses`).
+    pub known_addresses: dcroxide_containers::apbf::Filter,
+    /// Whether the peer already requested addresses (dcrd
+    /// `addrsSent`).
+    pub addrs_sent: bool,
+    /// The dynamic ban score (dcrd `banScore`).
+    pub ban_score: dcroxide_connmgr::DynamicBanScore,
+    /// Whether the peer is exempt from banning (dcrd
+    /// `isWhitelisted`).
+    pub is_whitelisted: bool,
+}
+
+impl ServerPeerAddrState {
+    /// A fresh state as `newServerPeer` builds it.
+    pub fn new(is_whitelisted: bool) -> ServerPeerAddrState {
+        ServerPeerAddrState {
+            known_addresses: dcroxide_containers::apbf::new_filter(
+                MAX_KNOWN_ADDRS_PER_PEER,
+                KNOWN_ADDRS_FP_RATE,
+            ),
+            addrs_sent: false,
+            ban_score: dcroxide_connmgr::DynamicBanScore::default(),
+            is_whitelisted,
+        }
+    }
+
+    /// Track an address as known to the peer (dcrd
+    /// `addKnownAddress`).
+    pub fn add_known_address(&mut self, na: &NetAddress) {
+        self.known_addresses.add(na.key().as_bytes());
+    }
+
+    /// Track a collection of addresses as known to the peer (dcrd
+    /// `addKnownAddresses`).
+    pub fn add_known_addresses(&mut self, addresses: &[NetAddress]) {
+        for na in addresses {
+            self.add_known_address(na);
+        }
+    }
+
+    /// Whether the address is already known to the peer (dcrd
+    /// `addressKnown`).
+    pub fn address_known(&self, na: &NetAddress) -> bool {
+        self.known_addresses.contains(na.key().as_bytes())
+    }
+}
+
+/// The observable outcome of the server-level addr push (dcrd
+/// `serverPeer.pushAddrMsg`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushAddrOutcome {
+    /// The addr message to queue to the peer.
+    Queued(Box<dcroxide_wire::Message>),
+    /// The filtered list was empty; nothing is pushed.  dcrd carries
+    /// an error-and-disconnect branch here, but the peer push never
+    /// errors at the parity tag, so it is dead code.
+    Nothing,
+}
+
+/// Push the provided addresses to the peer, filtering the ones it
+/// already knows and tracking the ones actually sent (dcrd
+/// `serverPeer.pushAddrMsg`).
+pub fn push_addr_msg<E: dcroxide_peer::PeerEnv>(
+    state: &mut ServerPeerAddrState,
+    peer: &mut dcroxide_peer::Peer,
+    env: &mut E,
+    addresses: &[NetAddress],
+) -> PushAddrOutcome {
+    // Filter addresses already known to the peer.
+    let addrs: Vec<dcroxide_wire::NetAddress> = addresses
+        .iter()
+        .filter(|addr| !state.address_known(addr))
+        .map(addrmgr_to_wire_net_address)
+        .collect();
+    match peer.push_addr_msg(env, &addrs) {
+        Some((msg, known)) => {
+            let known_net_addrs = wire_to_addrmgr_net_addresses(&known);
+            state.add_known_addresses(&known_net_addrs);
+            PushAddrOutcome::Queued(Box::new(msg))
+        }
+        None => PushAddrOutcome::Nothing,
+    }
+}
+
+/// Increase the peer's ban score, returning whether the peer is now
+/// banned (dcrd `serverPeer.addBanScore`); dcrd's warning logs are
+/// daemon output.  The caller performs the ban itself via
+/// [`ban_peer`] exactly as dcrd's `BanPeer` does.
+#[allow(clippy::too_many_arguments)] // Mirrors dcrd's config surface.
+pub fn add_ban_score(
+    state: &mut ServerPeerAddrState,
+    persistent: u32,
+    transient: u32,
+    disable_banning: bool,
+    ban_threshold: u32,
+    now_unix: i64,
+) -> bool {
+    // No warning is logged and no score is calculated if banning is
+    // disabled.
+    if disable_banning {
+        return false;
+    }
+    if state.is_whitelisted {
+        return false;
+    }
+
+    let warn_threshold = ban_threshold >> 1;
+    if transient == 0 && persistent == 0 {
+        // The score is not being increased, but dcrd still logs a
+        // warning when the score is above the warn threshold.
+        let _ = state.ban_score.int_at(now_unix) > warn_threshold;
+        return false;
+    }
+    let score = state.ban_score.increase_at(persistent, transient, now_unix);
+    if score > warn_threshold && score > ban_threshold {
+        return true;
+    }
+    false
+}
+
+/// The observable outcome of banning a peer (dcrd
+/// `server.BanPeer`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BanPeerOutcome {
+    /// Banning is disabled or the peer is whitelisted; nothing
+    /// happens.
+    Ignored,
+    /// The address could not be split; the peer is disconnected
+    /// without a ban entry.
+    DisconnectOnly,
+    /// The host was banned until the given time and the peer is
+    /// disconnected.
+    Banned {
+        /// The banned host.
+        host: String,
+        /// The Unix nanosecond time the ban lifts.
+        until_nanos: i64,
+    },
+}
+
+/// Ban the peer at the given address (dcrd `server.BanPeer`); the
+/// caller owns the banned-host map until the peer state slice
+/// lands.
+pub fn ban_peer(
+    banned: &mut std::collections::BTreeMap<String, i64>,
+    addr: &str,
+    is_whitelisted: bool,
+    disable_banning: bool,
+    ban_duration_nanos: i64,
+    now_nanos: i64,
+) -> BanPeerOutcome {
+    // No warning is logged when banning is disabled.
+    if disable_banning {
+        return BanPeerOutcome::Ignored;
+    }
+    if is_whitelisted {
+        return BanPeerOutcome::Ignored;
+    }
+
+    let Ok((host, _)) = split_host_port(addr) else {
+        return BanPeerOutcome::DisconnectOnly;
+    };
+
+    let until_nanos = now_nanos + ban_duration_nanos;
+    banned.insert(host.clone(), until_nanos);
+    BanPeerOutcome::Banned { host, until_nanos }
+}
+
+/// The peer facts the getaddr handler consumes.
+pub struct GetAddrFacts {
+    /// Whether the simulation or regression test network is active.
+    pub sim_or_reg_net: bool,
+    /// Whether the peer is inbound.
+    pub inbound: bool,
+}
+
+/// Handle a getaddr message (dcrd `serverPeer.OnGetAddr`): the
+/// address cache is the caller's `AddressCache` result over the
+/// version-appropriate type filter, and the returned outcome is the
+/// push to perform, if any.
+pub fn on_get_addr<E: dcroxide_peer::PeerEnv>(
+    state: &mut ServerPeerAddrState,
+    peer: &mut dcroxide_peer::Peer,
+    env: &mut E,
+    facts: &GetAddrFacts,
+    addr_cache: &[NetAddress],
+) -> Option<PushAddrOutcome> {
+    // Don't return any addresses when running on the simulation and
+    // regression test networks.
+    if facts.sim_or_reg_net {
+        return None;
+    }
+
+    // Do not accept getaddr requests from outbound peers.  This
+    // reduces fingerprinting attacks.
+    if !facts.inbound {
+        return None;
+    }
+
+    // Only respond with addresses once per connection.
+    if state.addrs_sent {
+        return None;
+    }
+    state.addrs_sent = true;
+
+    // Push the addresses.
+    Some(push_addr_msg(state, peer, env, addr_cache))
+}
+
+/// The peer facts the addr handler consumes.
+pub struct OnAddrFacts {
+    /// Whether the simulation or regression test network is active.
+    pub sim_or_reg_net: bool,
+    /// Whether the peer remains connected (dcrd samples this per
+    /// address to stop early on concurrent disconnects; the
+    /// synchronous port samples it once).
+    pub connected: bool,
+    /// The peer's network address (dcrd `sp.NA()`).
+    pub peer_na: dcroxide_wire::NetAddress,
+}
+
+/// The observable outcome of handling an addr message (dcrd
+/// `serverPeer.OnAddr`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnAddrOutcome {
+    /// The message was ignored.
+    Ignored,
+    /// The peer sent an empty address list and the caller bans it
+    /// with dcrd's reason string.
+    BanEmptyList,
+    /// The addresses were tracked and forwarded to the address
+    /// manager.
+    Processed,
+}
+
+/// Handle an addr message (dcrd `serverPeer.OnAddr`); the clock is
+/// injected as Unix nanoseconds.
+pub fn on_addr(
+    state: &mut ServerPeerAddrState,
+    addr_mgr: &mut AddrManager,
+    facts: &OnAddrFacts,
+    addr_list: &[dcroxide_wire::NetAddress],
+    now_nanos: i64,
+) -> OnAddrOutcome {
+    // Ignore addresses when running on the simulation and regression
+    // test networks.
+    if facts.sim_or_reg_net {
+        return OnAddrOutcome::Ignored;
+    }
+
+    // A message that has no addresses is invalid; dcrd bans the
+    // sender with the reason "sent an empty address list".
+    if addr_list.is_empty() {
+        return OnAddrOutcome::BanEmptyList;
+    }
+
+    let mut addr_list = wire_to_addrmgr_net_addresses(addr_list);
+    for na in &mut addr_list {
+        // Don't add more addresses when disconnecting.
+        if !facts.connected {
+            return OnAddrOutcome::Processed;
+        }
+
+        // Set the timestamp to 5 days ago if it's more than 24 hours
+        // in the future so this address is one of the first to be
+        // removed when space is needed.
+        if na.timestamp > now_nanos + 10 * 60 * 1_000_000_000 {
+            na.timestamp = now_nanos - 24 * 5 * 3600 * 1_000_000_000;
+        }
+
+        // Add address to known addresses for this peer.
+        state.add_known_address(na);
+    }
+
+    // Add addresses to the server address manager, which handles
+    // duplicate prevention, limits, and last seen updates.
+    let remote_addr = wire_to_addrmgr_net_address(&facts.peer_na);
+    addr_mgr.add_addresses(&addr_list, &remote_addr);
+    OnAddrOutcome::Processed
+}

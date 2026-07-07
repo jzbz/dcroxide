@@ -1,0 +1,15 @@
+ga|simnet|false|false
+ga|outbound|false|false
+ga|emptycache|false|true|true
+ga|populated|true|true|3|true|52.91.10.5:9108,52.91.3.5:9108,52.91.5.5:9108
+ga|secondrequest|false|true
+oa|tracked|true|true|true|false|
+oa|simnet|false|
+oa|emptylist|10.0.0.2
+bs|disabled|false|
+bs|whitelisted|false|
+bs|zeroscores|false|
+bs|warnonly|false|
+bs|banned|true|10.0.0.2
+bp|whitelisted|
+bp|banned|10.0.0.2

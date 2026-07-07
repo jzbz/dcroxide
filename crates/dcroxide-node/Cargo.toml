@@ -10,8 +10,11 @@ repository.workspace = true
 
 [dependencies]
 dcroxide-addrmgr = { path = "../dcroxide-addrmgr" }
+dcroxide-connmgr = { path = "../dcroxide-connmgr" }
+dcroxide-containers = { path = "../dcroxide-containers" }
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-mempool = { path = "../dcroxide-mempool" }
+dcroxide-peer = { path = "../dcroxide-peer" }
 dcroxide-rpc = { path = "../dcroxide-rpc" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-wire = { path = "../dcroxide-wire" }

@@ -193,7 +193,9 @@ Currently implemented:
   embedded sample config, the logging subsystem registry, the pipe
   IPC lifecycle protocol framed byte for byte, the version machinery
   with dcrd's semver parsing, and the P2P server's address
-  bookkeeping (the submission cache and local address resolution)
+  bookkeeping and relay (the submission cache, local address
+  resolution, the getaddr/addr handlers, and the ban machinery,
+  replayed against dcrd's real handlers over piped peers)
 - `dcroxide-peer` — the peer-to-peer protocol decision core from
   dcrd's `peer` package: version negotiation with self-connection
   detection and dcrd's exact acceptance rules, local version

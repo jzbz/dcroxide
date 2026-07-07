@@ -436,7 +436,10 @@ version = "0.1.0"
 dependencies = [
  "dcroxide-addrmgr",
  "dcroxide-chaincfg",
+ "dcroxide-connmgr",
+ "dcroxide-containers",
  "dcroxide-mempool",
+ "dcroxide-peer",
  "dcroxide-rpc",
  "dcroxide-txscript",
  "dcroxide-wire",
