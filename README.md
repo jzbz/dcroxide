@@ -158,8 +158,9 @@ Currently implemented:
   serialization, and the vin/vout/raw-transaction result builders),
   plus the command handler slices (the stateless, chain-query,
   stake-query, mempool/connection, tx/utxo lookup, peer/address,
-  submission/control, fee-info/node-info, and mining/network/mix
-  commands) over a Server scaffold with the chain, mempool, sync and
+  submission/control, fee-info/node-info, mining/network/mix, and
+  treasury-vote commands — every dcrd handler except getwork and
+  help) over a Server scaffold with the chain, mempool, sync and
   connection managers, indexes, database, filterer, log manager, fee
   estimator, sanity checker, time source, CPU miner, mix pooler,
   profiler and address managers, and clock behind trait seams, pinned by the complete generated help text,

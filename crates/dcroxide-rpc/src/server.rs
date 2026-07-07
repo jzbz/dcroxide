@@ -283,6 +283,30 @@ pub trait RpcChain {
     fn is_auto_revocations_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
         unimplemented!("is_auto_revocations_agenda_active")
     }
+    /// The hashes of the blocks a treasury spend was mined in (dcrd
+    /// `FetchTSpend`; the error only drives the not-found result).
+    fn fetch_tspend(&mut self, _tspend: &Hash) -> Result<Vec<Hash>, String> {
+        unimplemented!("fetch_tspend")
+    }
+    /// The (yes, no) vote tally for the treasury spend counted up to
+    /// the given block (dcrd `TSpendCountVotes`).
+    fn tspend_count_votes(
+        &mut self,
+        _check_block: &Hash,
+        _tspend: &MsgTx,
+    ) -> Result<(i64, i64), TSpendCountVotesFailure> {
+        unimplemented!("tspend_count_votes")
+    }
+}
+
+/// A treasury spend vote count failure with the classification the
+/// handler needs.
+#[derive(Debug, Clone)]
+pub struct TSpendCountVotesFailure {
+    /// Whether the failure is dcrd `blockchain.ErrUnknownBlock`.
+    pub is_unknown_block: bool,
+    /// The error text.
+    pub message: String,
 }
 
 /// A transaction index entry (the used subset of dcrd
@@ -960,6 +984,11 @@ pub trait RpcTxMempooler {
     /// The number of transactions in the pool (dcrd `Count`).
     fn count(&mut self) -> i64 {
         unimplemented!("count")
+    }
+    /// The hashes of the treasury spends currently in the pool (dcrd
+    /// `TSpendHashes`).
+    fn tspend_hashes(&mut self) -> Vec<Hash> {
+        unimplemented!("tspend_hashes")
     }
     /// The verbose descriptors for all pool transactions (dcrd
     /// `VerboseTxDescs`).

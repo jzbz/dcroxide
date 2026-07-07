@@ -4150,3 +4150,209 @@ pub fn handle_stop<C: RpcChain>(
     (server.cfg.request_shutdown)();
     Ok(GoValue::String("dcrd stopping.".to_string()))
 }
+
+/// handlegettreasuryspendvotes (dcrd `handleGetTreasurySpendVotes`);
+/// the result is a `GetTreasurySpendVotesResult` value.
+pub fn handle_get_treasury_spend_votes<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    let c = fields(cmd);
+    let tvi = server.cfg.chain_params.treasury_vote_interval;
+    let mul = server.cfg.chain_params.treasury_vote_interval_multiplier;
+
+    // Either parse the provided hash or use the current best tip hash
+    // when none is provided.
+    let block_param = match &c[0] {
+        GoValue::Null => None,
+        GoValue::String(s) => Some(s.as_str()),
+        other => panic!("expected optional string field, got {other:?}"),
+    };
+    let (block, block_height, checking_main_chain) = match block_param {
+        None | Some("") => {
+            let best = server.cfg.chain.best_snapshot();
+            (best.hash, best.height, true)
+        }
+        Some(hash_str) => {
+            let block: Hash = hash_str
+                .parse()
+                .map_err(|_| rpc_decode_hex_error(hash_str))?;
+
+            // Using HeaderByHash allows querying both the mainchain
+            // and any sidechains.
+            let hdr = server
+                .cfg
+                .chain
+                .header_by_hash(&block)
+                .map_err(|_| crate::rpcerrors::rpc_block_not_found_error(&block))?;
+
+            let checking = server.cfg.chain.main_chain_has_block(&block);
+            (block, i64::from(hdr.height), checking)
+        }
+    };
+
+    // When tallying votes on mainchain and for mined tspends, only
+    // count votes up to when the tspend was mined.
+    let mut end_blocks: Vec<(Hash, Hash)> = Vec::new();
+
+    // Determine whether to use the specified tspends or all the ones
+    // in the mempool.
+    let client_tspends: Option<Vec<&str>> = match &c[1] {
+        GoValue::Null => None,
+        v => Some(array(v).iter().map(s).collect()),
+    };
+    let mut tspends: Vec<MsgTx> = Vec::new();
+    match client_tspends {
+        Some(list) if !list.is_empty() => {
+            // Client-specified tspends may be in the mempool, mined,
+            // or completely unknown.
+            for tspend_str in list {
+                let hash: Hash = tspend_str
+                    .parse()
+                    .map_err(|_| rpc_decode_hex_error(tspend_str))?;
+
+                // Check if this tspend is in the mempool.
+                if let Ok((tx, _tree)) = server.cfg.tx_mempooler.fetch_transaction(&hash) {
+                    // Sanity check this is actually a tspend.
+                    if !dcroxide_stake::is_tspend(&tx) {
+                        return Err(rpc_invalid_error(&format!(
+                            "mempool tx {hash} is not a tspend"
+                        )));
+                    }
+                    tspends.push(tx);
+                    continue;
+                }
+
+                // Not in the mempool.  Check if it is mined.
+                let blocks = match server.cfg.chain.fetch_tspend(&hash) {
+                    Ok(blocks) if !blocks.is_empty() => blocks,
+                    _ => {
+                        // TSpend does not exist mined or in mempool.
+                        return Err(crate::rpcerrors::rpc_no_tx_info_error(&hash));
+                    }
+                };
+
+                // TSpend exists mined in at least one block.  Fetch
+                // the first one and extract the tspend.
+                let full_block = server
+                    .cfg
+                    .chain
+                    .block_by_hash(&blocks[0])
+                    .map_err(|e| rpc_internal_err(&e))?;
+
+                // TSpends live in the stake tree.  dcrd dereferences a
+                // nil error when the block does not contain the
+                // tspend, so the missing case is unreachable.
+                let tx = full_block
+                    .stransactions
+                    .iter()
+                    .find(|tx| tx.tx_hash() == hash)
+                    .unwrap_or_else(|| {
+                        panic!("block did not contain treasury spend tx in stake tree")
+                    });
+                tspends.push(tx.clone());
+
+                // Figure out which (if any) of the blocks the tspend
+                // is found in are in the main chain so votes count
+                // only up to that block.
+                if !checking_main_chain {
+                    continue;
+                }
+                for block_hash in &blocks {
+                    if !server.cfg.chain.main_chain_has_block(block_hash) {
+                        continue;
+                    }
+
+                    // Fetch the header to discover this block's
+                    // height.
+                    let hdr = server
+                        .cfg
+                        .chain
+                        .header_by_hash(block_hash)
+                        .map_err(|e| rpc_internal_err(&e))?;
+
+                    // Count votes only up to the block before the
+                    // tspend was mined.
+                    if block_height >= i64::from(hdr.height) {
+                        end_blocks.push((hash, hdr.prev_block));
+                    }
+
+                    break;
+                }
+            }
+        }
+        _ => {
+            // Fetch vote counts for all mempool tspends.
+            for hash in server.cfg.tx_mempooler.tspend_hashes() {
+                let (tx, _tree) = server
+                    .cfg
+                    .tx_mempooler
+                    .fetch_transaction(&hash)
+                    .map_err(|e| rpc_internal_err(&e))?;
+                tspends.push(tx);
+            }
+        }
+    }
+
+    // Fetch the vote counts from the blockchain.
+    let mut votes = Vec::with_capacity(tspends.len());
+    for tx in &tspends {
+        let tx_hash = tx.tx_hash();
+
+        // Early check to ensure this tx has a valid expiry.
+        let expiry = tx.expiry;
+        if !dcroxide_standalone::is_treasury_vote_interval(u64::from(expiry.wrapping_sub(2)), tvi) {
+            return Err(rpc_internal_err(&format!(
+                "treasury spend {tx_hash} has incorrect expiry {expiry}"
+            )));
+        }
+
+        // Only count votes for tspends that are inside their voting
+        // window; otherwise just return the vote start and end
+        // heights.
+        let mut yes = 0i64;
+        let mut no = 0i64;
+        let inside_window =
+            dcroxide_standalone::inside_tspend_window(block_height, expiry, tvi, mul);
+        let mined_block = end_blocks
+            .iter()
+            .find(|(hash, _)| *hash == tx_hash)
+            .map(|(_, end)| *end);
+        if inside_window || mined_block.is_some() {
+            // Use the originally requested stop block or the custom
+            // one for mainchain mined tspends.
+            let check_block = mined_block.unwrap_or(block);
+
+            match server.cfg.chain.tspend_count_votes(&check_block, tx) {
+                Ok((y, n)) => {
+                    yes = y;
+                    no = n;
+                }
+                Err(failure) if failure.is_unknown_block => {
+                    return Err(crate::rpcerrors::rpc_block_not_found_error(&block));
+                }
+                Err(failure) => return Err(rpc_internal_err(&failure.message)),
+            }
+        }
+
+        // The error can be ignored because the expiry was verified to
+        // be in a TVI earlier.
+        let (start, end) =
+            dcroxide_standalone::calc_tspend_window(expiry, tvi, mul).unwrap_or((0, 0));
+
+        votes.push(GoValue::Struct(vec![
+            GoValue::String(tx_hash.to_string()),
+            GoValue::Int(i64::from(expiry)),
+            GoValue::Int(i64::from(start)),
+            GoValue::Int(i64::from(end)),
+            GoValue::Int(yes),
+            GoValue::Int(no),
+        ]));
+    }
+
+    Ok(GoValue::Struct(vec![
+        GoValue::String(block.to_string()),
+        GoValue::Int(block_height),
+        GoValue::Array(votes),
+    ]))
+}
