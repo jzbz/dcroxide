@@ -320,6 +320,7 @@ fn treasury_spend_votes_handler_matches_dcrd() {
             net_info: Vec::new(),
             services: 0,
             request_shutdown: Box::new(|| {}),
+            allow_unsynced_mining: false,
         });
 
         match handlers::handle_get_treasury_spend_votes(&mut server, &cmd) {

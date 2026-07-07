@@ -514,6 +514,9 @@ pub struct Config<C> {
     /// Request a graceful server shutdown (dcrd's non-blocking send
     /// on the server's `requestProcessShutdown` channel).
     pub request_shutdown: Box<dyn FnMut()>,
+    /// Whether mining is allowed without being connected and synced
+    /// (dcrd `AllowUnsyncedMining`).
+    pub allow_unsynced_mining: bool,
 }
 
 /// A per-network reachability description (dcrd carries
@@ -679,7 +682,7 @@ pub trait RpcSyncManager {
     }
     /// Submit the block to the network after processing it locally
     /// (dcrd `SubmitBlock`).
-    fn submit_block(&mut self, _block: &MsgBlock) -> Result<(), String> {
+    fn submit_block(&mut self, _block: &MsgBlock) -> Result<(), SubmitBlockFailure> {
         unimplemented!("submit_block")
     }
     /// Submit the mixing message to the mixpool, with the local node
@@ -698,6 +701,16 @@ pub struct SendTxFailure {
     /// Whether the failure is dcrd `mempool.ErrDuplicate` or
     /// `mempool.ErrAlreadyExists`.
     pub is_duplicate: bool,
+    /// The error text.
+    pub message: String,
+}
+
+/// A block submission failure with the classification the getwork
+/// handler needs (dcrd `blockchain.RuleError` detection).
+#[derive(Debug, Clone)]
+pub struct SubmitBlockFailure {
+    /// Whether the failure is a blockchain rule error.
+    pub is_rule_error: bool,
     /// The error text.
     pub message: String,
 }
@@ -765,9 +778,59 @@ pub trait RpcBlockTemplater {
     fn force_regen(&mut self) {
         unimplemented!("force_regen")
     }
+    /// The current template block, `Ok(None)` during a chain
+    /// reorganization (dcrd `CurrentTemplate`; the handlers only read
+    /// the template's block).
+    fn current_template(&mut self) -> Result<Option<MsgBlock>, String> {
+        unimplemented!("current_template")
+    }
+    /// Subscribe to block template updates (dcrd `Subscribe`; the
+    /// subscription immediately delivers the current template).
+    fn subscribe(&mut self) -> Box<dyn RpcTemplateSubscription> {
+        unimplemented!("subscribe")
+    }
+    /// Update the timestamp in the passed header to the current time
+    /// while taking the consensus rules into account (dcrd
+    /// `UpdateBlockTime`).
+    fn update_block_time(&mut self, _header: &mut BlockHeader) {
+        unimplemented!("update_block_time")
+    }
 }
 
 impl RpcBlockTemplater for () {}
+
+/// The outcome of waiting on a template subscription.
+#[derive(Debug, Clone)]
+pub enum TemplateRecv {
+    /// A template notification arrived; only its block is consumed
+    /// (boxed to keep the variant sizes balanced).
+    Template(Box<MsgBlock>),
+    /// The bounded wait timed out (dcrd's 5.5 second known-template
+    /// timeout).
+    Timeout,
+    /// The request context was canceled.
+    Canceled,
+}
+
+/// A block template subscription (dcrd `TemplateSubber`).
+pub trait RpcTemplateSubscription {
+    /// Wait for the next template notification (dcrd `<-C()` against
+    /// the request context).
+    fn recv(&mut self) -> TemplateRecv {
+        unimplemented!("recv")
+    }
+    /// Wait for the next template notification with dcrd's known-
+    /// template timeout.
+    fn recv_with_timeout(&mut self) -> TemplateRecv {
+        unimplemented!("recv_with_timeout")
+    }
+    /// Stop the subscription (dcrd `Stop`).
+    fn stop(&mut self) {
+        unimplemented!("stop")
+    }
+}
+
+impl RpcTemplateSubscription for () {}
 
 /// The no-op stand-in for server dependencies a caller does not
 /// exercise.
@@ -1130,13 +1193,34 @@ pub struct Server<C> {
     /// The configuration, treated as immutable after creation like
     /// dcrd's.
     pub cfg: Config<C>,
+    /// The getwork state (dcrd `workState`; the semaphore that
+    /// serializes concurrent invocations has no synchronous
+    /// counterpart here).
+    pub(crate) work_state: WorkState,
+}
+
+/// The getwork request/submission state (dcrd `workState`).
+#[derive(Default)]
+pub(crate) struct WorkState {
+    /// The previous best known chain tip (dcrd `prevBestHash`).
+    pub(crate) prev_best_hash: Option<Hash>,
+    /// Whether the next request should block until a new template
+    /// arrives (dcrd `waitForUpdatedTemplate`).
+    pub(crate) wait_for_updated_template: bool,
+    /// The templates returned to clients, keyed by the merkle and
+    /// stake root pair so full blocks can be reconstructed from
+    /// submissions (dcrd `templatePool`).
+    pub(crate) template_pool: std::collections::HashMap<[u8; 64], MsgBlock>,
 }
 
 impl<C: RpcChain> Server<C> {
     /// A new server over the given configuration (the used subset of
     /// dcrd `New`).
     pub fn new(cfg: Config<C>) -> Server<C> {
-        Server { cfg }
+        Server {
+            cfg,
+            work_state: WorkState::default(),
+        }
     }
 
     /// Whether the treasury agenda is active as of the block AFTER the

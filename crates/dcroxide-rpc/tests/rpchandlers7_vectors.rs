@@ -21,7 +21,7 @@ use dcroxide_rpc::helpers::NoInterfaces;
 use dcroxide_rpc::server::{
     Config, InvalidateBlockFailure, ReconsiderBlockFailure, RpcBlockTemplater, RpcChain,
     RpcConnManager, RpcFeeEstimator, RpcLogManager, RpcSubsidyParams, RpcSyncManager,
-    SendTxFailure, Server,
+    SendTxFailure, Server, SubmitBlockFailure,
 };
 use dcroxide_rpctypes::chainsvrresults as results;
 use dcroxide_rpctypes::{method, register_all};
@@ -104,7 +104,7 @@ fn split_json_array(data: &str) -> Vec<String> {
 struct MockSyncMgr7 {
     process: Result<Vec<Hash>, SendTxFailure>,
     recently_confirmed: bool,
-    submit: Result<(), String>,
+    submit: Result<(), SubmitBlockFailure>,
 }
 
 impl RpcSyncManager for MockSyncMgr7 {
@@ -120,7 +120,7 @@ impl RpcSyncManager for MockSyncMgr7 {
     fn recently_confirmed_txn(&mut self, _hash: &Hash) -> bool {
         self.recently_confirmed
     }
-    fn submit_block(&mut self, _block: &MsgBlock) -> Result<(), String> {
+    fn submit_block(&mut self, _block: &MsgBlock) -> Result<(), SubmitBlockFailure> {
         self.submit.clone()
     }
 }
@@ -335,7 +335,10 @@ fn submission_handler_slice_matches_dcrd() {
             process,
             recently_confirmed: mock[3] == "true",
             submit: match mock[4].strip_prefix("ERR:") {
-                Some(err) => Err(err.to_string()),
+                Some(err) => Err(SubmitBlockFailure {
+                    is_rule_error: false,
+                    message: err.to_string(),
+                }),
                 None => Ok(()),
             },
         };
@@ -384,6 +387,7 @@ fn submission_handler_slice_matches_dcrd() {
             net_info: Vec::new(),
             services: 0,
             request_shutdown: Box::new(|| {}),
+            allow_unsynced_mining: false,
         });
 
         match dispatch(&mut server, method_name, &cmd) {

@@ -2828,8 +2828,8 @@ pub fn handle_submit_block<C: RpcChain>(
         }
     };
 
-    if let Err(err) = server.cfg.sync_mgr.submit_block(&block) {
-        return Ok(GoValue::String(format!("rejected: {err}")));
+    if let Err(failure) = server.cfg.sync_mgr.submit_block(&block) {
+        return Ok(GoValue::String(format!("rejected: {}", failure.message)));
     }
 
     Ok(GoValue::Null)
@@ -4355,4 +4355,361 @@ pub fn handle_get_treasury_spend_votes<C: RpcChain>(
         GoValue::Int(block_height),
         GoValue::Array(votes),
     ]))
+}
+
+/// The length of the getwork data field when providing work for
+/// blake256 (dcrd `getworkDataLenBlake256`): the serialized header
+/// plus the internal blake256 padding.
+const GETWORK_DATA_LEN_BLAKE256: usize =
+    (1 + ((dcroxide_wire::MAX_BLOCK_HEADER_PAYLOAD * 8 + 65) / (64 * 8))) * 64;
+
+/// The length of the getwork data field when providing work for
+/// blake3 (dcrd `getworkDataLenBlake3`): the serialized header padded
+/// to a multiple of the blake3 block size.
+#[allow(clippy::manual_div_ceil)] // Mirrors dcrd's constant expression.
+const GETWORK_DATA_LEN_BLAKE3: usize = ((dcroxide_wire::MAX_BLOCK_HEADER_PAYLOAD + 63) / 64) * 64;
+
+/// The number of blocks below the current best height to begin
+/// pruning old block work from the template pool (dcrd
+/// `getworkExpirationDiff`).
+const GETWORK_EXPIRATION_DIFF: i64 = 3;
+
+/// The extra blake256 internal padding for the getwork data (dcrd
+/// `blake256Pad`, computed in its init routine).
+fn blake256_pad() -> Vec<u8> {
+    let mut pad = vec![0u8; GETWORK_DATA_LEN_BLAKE256 - dcroxide_wire::MAX_BLOCK_HEADER_PAYLOAD];
+    pad[0] = 0x80;
+    let n = pad.len();
+    pad[n - 9] |= 0x01;
+    pad[n - 8..]
+        .copy_from_slice(&((dcroxide_wire::MAX_BLOCK_HEADER_PAYLOAD as u64) * 8).to_be_bytes());
+    pad
+}
+
+/// The key for the template pool: the merkle root and stake root pair
+/// (dcrd `getWorkTemplateKey`).
+fn get_work_template_key(header: &dcroxide_wire::BlockHeader) -> [u8; 64] {
+    let mut key = [0u8; 64];
+    key[..32].copy_from_slice(&header.merkle_root.0);
+    key[32..].copy_from_slice(&header.stake_root.0);
+    key
+}
+
+/// Serialized data representing work to be solved: the header plus
+/// the internal padding for the active hash function (dcrd
+/// `serializeGetWorkData`; the serialization error path is
+/// unreachable here).
+fn serialize_get_work_data(
+    header: &dcroxide_wire::BlockHeader,
+    is_blake3_pow_active: bool,
+) -> Vec<u8> {
+    let (getwork_data_len, pad) = if is_blake3_pow_active {
+        (
+            GETWORK_DATA_LEN_BLAKE3,
+            vec![0u8; GETWORK_DATA_LEN_BLAKE3 - dcroxide_wire::MAX_BLOCK_HEADER_PAYLOAD],
+        )
+    } else {
+        (GETWORK_DATA_LEN_BLAKE256, blake256_pad())
+    };
+
+    let mut data = Vec::with_capacity(getwork_data_len);
+    data.extend_from_slice(&header.serialize());
+    data.extend_from_slice(&pad);
+    data
+}
+
+/// Generate and return work to the caller (dcrd
+/// `handleGetWorkRequest`).
+fn handle_get_work_request<C: RpcChain>(server: &mut Server<C>) -> Result<GoValue, RPCError> {
+    // Return an error immediately in the case of a failed background
+    // template.  dcrd dereferences a nil templater; the mining address
+    // gate makes that unreachable in practice.
+    let bt = server
+        .cfg
+        .block_templater
+        .as_mut()
+        .expect("getwork requires a block templater");
+    if let Err(err) = bt.current_template() {
+        return Err(crate::rpcerrors::rpc_misc_error(&format!(
+            "no work is available: {err}"
+        )));
+    }
+
+    // Prune old templates when the current best chain tip changes.
+    let best = server.cfg.chain.best_snapshot();
+    let state = &mut server.work_state;
+    let tip_changed = state.prev_best_hash != Some(best.hash);
+    if tip_changed {
+        let prune_height = best.height - GETWORK_EXPIRATION_DIFF;
+        state
+            .template_pool
+            .retain(|_, block| i64::from(block.header.height) >= prune_height);
+        state.prev_best_hash = Some(best.hash);
+        state.wait_for_updated_template = true;
+    }
+    let wait_for_new_template = state.wait_for_updated_template;
+
+    // Wait for updated templates when the current best chain tip
+    // changed.  Since the subscription immediately sends the current
+    // template, the template might not have been updated yet; in that
+    // case wait for the updated template with an eventual timeout.
+    let mut template: Option<MsgBlock> = None;
+    if wait_for_new_template {
+        let bt = server.cfg.block_templater.as_mut().expect("checked above");
+        let mut sub = bt.subscribe();
+        match sub.recv() {
+            crate::server::TemplateRecv::Template(block) => template = Some(*block),
+            crate::server::TemplateRecv::Canceled => {
+                sub.stop();
+                return Err(crate::rpcerrors::rpc_connection_closed_error());
+            }
+            crate::server::TemplateRecv::Timeout => {
+                panic!("unbounded template wait cannot time out")
+            }
+        }
+        let template_key = get_work_template_key(&template.as_ref().expect("just received").header);
+        let template_known = server.work_state.template_pool.contains_key(&template_key);
+        if template_known {
+            match sub.recv_with_timeout() {
+                crate::server::TemplateRecv::Template(block) => template = Some(*block),
+                crate::server::TemplateRecv::Timeout => template = None,
+                crate::server::TemplateRecv::Canceled => {
+                    sub.stop();
+                    return Err(crate::rpcerrors::rpc_connection_closed_error());
+                }
+            }
+        }
+        sub.stop();
+    }
+
+    // Grab the current template from the background generator when it
+    // was not already obtained above.
+    if template.is_none() {
+        let bt = server.cfg.block_templater.as_mut().expect("checked above");
+        match bt.current_template() {
+            Err(err) => {
+                // The context "Unable to retrieve work due to invalid
+                // template" is log-only.
+                return Err(rpc_internal_err(&err));
+            }
+            Ok(None) => {
+                return Err(crate::rpcerrors::rpc_misc_error(
+                    "no work is available during a chain reorganization",
+                ));
+            }
+            Ok(Some(block)) => template = Some(block),
+        }
+    }
+    let template = template.expect("resolved above");
+
+    // Allow future invocations to immediately return the existing
+    // background template.
+    if wait_for_new_template {
+        server.work_state.wait_for_updated_template = false;
+    }
+
+    // Update the time of the block template to the current time while
+    // accounting for the median time of the past several blocks per
+    // the chain consensus rules.  The header is copied to avoid
+    // mutating the shared block template.
+    let mut header_copy = template.header;
+    server
+        .cfg
+        .block_templater
+        .as_mut()
+        .expect("checked above")
+        .update_block_time(&mut header_copy);
+
+    // Serialize the data that represents work to be solved.
+    let is_blake3_pow_active = server.is_blake3_pow_agenda_active(&header_copy.prev_block)?;
+    let data = serialize_get_work_data(&header_copy, is_blake3_pow_active);
+
+    // Add the template to the template pool.  Since the key is a
+    // combination of the merkle and stake root fields, this will not
+    // add duplicate entries for templates with modified timestamps
+    // and/or difficulty bits.
+    let template_key = get_work_template_key(&header_copy);
+    server
+        .work_state
+        .template_pool
+        .insert(template_key, template);
+
+    // The target is in big endian, but it is treated as a uint256 and
+    // byte swapped to little endian in the final result as a holdover
+    // from legacy code now required for compatibility.
+    let target =
+        crate::helpers::big_to_le_uint256(&dcroxide_standalone::compact_to_big(header_copy.bits));
+    Ok(GoValue::Struct(vec![
+        GoValue::String(data.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        GoValue::String(
+            target
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        ),
+    ]))
+}
+
+/// Check and submit solved work to the network (dcrd
+/// `handleGetWorkSubmission`).
+fn handle_get_work_submission<C: RpcChain>(
+    server: &mut Server<C>,
+    hex_data: &str,
+) -> Result<GoValue, RPCError> {
+    // Ensure the provided data is sane.  Both data lengths coincide at
+    // the pinned tag, so the single-length error message applies.
+    let min_data_len = GETWORK_DATA_LEN_BLAKE256.min(GETWORK_DATA_LEN_BLAKE3);
+    let max_data_len = GETWORK_DATA_LEN_BLAKE256.max(GETWORK_DATA_LEN_BLAKE3);
+    let padded_hex_data_len = hex_data.len() + hex_data.len() % 2;
+    if padded_hex_data_len < min_data_len * 2 || padded_hex_data_len > max_data_len * 2 {
+        if min_data_len == max_data_len {
+            return Err(rpc_invalid_error(&format!(
+                "Argument must be a hexadecimal string with length {} (not {})",
+                min_data_len * 2,
+                hex_data.len()
+            )));
+        }
+        return Err(rpc_invalid_error(&format!(
+            "Argument must be a hexadecimal string with a length between {} and {} (not {})",
+            min_data_len * 2,
+            max_data_len * 2,
+            hex_data.len()
+        )));
+    }
+
+    // Decode the provided hex data while padding the front with a 0
+    // for odd-length strings.
+    let padded_hex = if hex_data.len() % 2 != 0 {
+        format!("0{hex_data}")
+    } else {
+        hex_data.to_string()
+    };
+    let data = go_decode_hex(&padded_hex).map_err(|_| rpc_decode_hex_error(&padded_hex))?;
+
+    // Deserialize the block header from the data; the data length
+    // gate makes a short read unreachable.
+    let (submitted_header, _) =
+        dcroxide_wire::BlockHeader::from_bytes(&data[..dcroxide_wire::MAX_BLOCK_HEADER_PAYLOAD])
+            .map_err(|e| rpc_invalid_error(&format!("Invalid block header: {e:?}")))?;
+
+    // Reject orphan blocks.
+    let prev_blk_hash = submitted_header.prev_block;
+    if server.cfg.chain.header_by_hash(&prev_blk_hash).is_err() {
+        return Ok(GoValue::Bool(false));
+    }
+
+    // Choose the proof of work mining algorithm based on the result of
+    // the vote for the blake3 proof of work agenda.
+    let is_blake3_pow_active = server.is_blake3_pow_agenda_active(&prev_blk_hash)?;
+    let pow_hash = if is_blake3_pow_active {
+        submitted_header.pow_hash_v2()
+    } else {
+        submitted_header.pow_hash_v1()
+    };
+
+    // Ensure the submitted proof of work hash is less than the target
+    // difficulty.  Every error the check returns is a rule error, so
+    // dcrd's internal-error branch for other kinds is unreachable.
+    let pow_limit = num_bigint::BigInt::from_bytes_be(
+        num_bigint::Sign::Plus,
+        &server.cfg.chain_params.pow_limit.to_be_bytes(),
+    );
+    if dcroxide_standalone::check_proof_of_work(&pow_hash, submitted_header.bits, &pow_limit)
+        .is_err()
+    {
+        return Ok(GoValue::Bool(false));
+    }
+
+    // Look up the full block for the provided data based on the merkle
+    // and stake roots.
+    let template_key = get_work_template_key(&submitted_header);
+    let Some(template_block) = server.work_state.template_pool.get(&template_key) else {
+        return Ok(GoValue::Bool(false));
+    };
+
+    // Reconstruct the block using the submitted header and the stored
+    // block info.
+    let mut msg_block = template_block.clone();
+    msg_block.header = submitted_header;
+
+    // Process this block using the same rules as blocks coming from
+    // other nodes, relaying it to the network like normal.
+    if let Err(failure) = server.cfg.sync_mgr.submit_block(&msg_block) {
+        // Anything other than a rule violation is an unexpected
+        // error; the context is log-only.
+        if !failure.is_rule_error {
+            return Err(rpc_internal_err(&failure.message));
+        }
+        return Ok(GoValue::Bool(false));
+    }
+
+    // The block was accepted.
+    Ok(GoValue::Bool(true))
+}
+
+/// handlegetwork (dcrd `handleGetWork`); the result is a
+/// `GetWorkResult` value for requests and a boolean for submissions.
+pub fn handle_get_work<C: RpcChain>(
+    server: &mut Server<C>,
+    cmd: &GoValue,
+) -> Result<GoValue, RPCError> {
+    if server.cfg.cpu_miner.is_mining() {
+        return Err(crate::rpcerrors::rpc_misc_error(
+            "getwork polling is disallowed while CPU mining is enabled. Please disable CPU \
+             mining and try again.",
+        ));
+    }
+
+    // Respond with an error if there are no addresses to pay the
+    // created blocks to.
+    if server.cfg.mining_addrs.is_empty() {
+        return Err(rpc_internal_err(
+            "no payment addresses specified via --miningaddr",
+        ));
+    }
+
+    // Return an error if there are no peers connected since there is
+    // no way to relay a found block or receive transactions to work on
+    // unless unsynchronized mining has specifically been allowed.
+    if !server.cfg.allow_unsynced_mining && server.cfg.conn_mgr.connected_count() == 0 {
+        return Err(RPCError::new(
+            codes::CLIENT_NOT_CONNECTED,
+            "Decred is not connected",
+        ));
+    }
+
+    // No point in generating or accepting work before the chain is
+    // synced unless unsynchronized mining has specifically been
+    // allowed.
+    let (_, best_header_height) = server.cfg.chain.best_header();
+    let best_height = server.cfg.chain.best_snapshot().height;
+    let initial_chain_state = best_header_height == 0 && best_height == 0;
+    if !server.cfg.allow_unsynced_mining && !initial_chain_state && !server.cfg.chain.is_current() {
+        return Err(RPCError::new(
+            codes::CLIENT_IN_INITIAL_DOWNLOAD,
+            "Decred is downloading blocks...",
+        ));
+    }
+
+    // dcrd serializes concurrent invocations through a single-item
+    // semaphore with early cancellation; invocations here are already
+    // sequential.
+
+    // When the caller provides data, it is a submission of a
+    // supposedly solved block that needs to be checked and submitted
+    // to the network if valid.
+    let c = fields(cmd);
+    let data = match &c[0] {
+        GoValue::Null => None,
+        GoValue::String(s) => Some(s.clone()),
+        other => panic!("expected optional string field, got {other:?}"),
+    };
+    if let Some(data) = data
+        && !data.is_empty()
+    {
+        return handle_get_work_submission(server, &data);
+    }
+
+    // No data was provided, so the caller is requesting work.
+    handle_get_work_request(server)
 }

@@ -539,6 +539,7 @@ fn mining_network_mix_handler_slice_matches_dcrd() {
             ],
             services: mock[19].parse().unwrap(),
             request_shutdown: Box::new(|| {}),
+            allow_unsynced_mining: false,
         });
 
         match dispatch(&mut server, method_name, &cmd) {

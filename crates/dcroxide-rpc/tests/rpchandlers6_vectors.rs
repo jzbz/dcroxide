@@ -388,6 +388,7 @@ fn peer_address_handler_slice_matches_dcrd() {
             net_info: Vec::new(),
             services: 0,
             request_shutdown: Box::new(|| {}),
+            allow_unsynced_mining: false,
         });
 
         match dispatch(&mut server, method_name, &cmd) {
