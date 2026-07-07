@@ -4,10 +4,12 @@
 //! real operating system, parse the command line through the ported
 //! configuration pipeline, handle the help, version, and
 //! debug-level-show exits with dcrd's exit codes, print the startup
-//! banner, and idle on a shutdown-signal listener until interrupted.
+//! banner, open the block database and initialize the chain state,
+//! create the address manager, announce the network configuration,
+//! and idle on a shutdown-signal listener until interrupted.
 //!
-//! The block database load, the UTXO database, and the peer-to-peer
-//! server (`newServer`/`svr.Run`) arrive with later pieces; this
+//! The UTXO database, the connection manager, and the peer-to-peer
+//! serving (`newServer`/`svr.Run`) arrive with later pieces; this
 //! stops after the startup announcements.  The rotating file-logging
 //! backend is likewise not yet wired, so startup output goes to
 //! standard streams.
@@ -17,6 +19,7 @@ use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dcroxide_addrmgr::{AddrManager, NetAddressType};
 use dcroxide_blockchain::process::Chain;
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{Database, ErrorKind, Options};
@@ -122,9 +125,34 @@ fn run(cfg: Config) -> ExitCode {
         best.height, best.hash
     ));
 
+    // Create the address manager and load any persisted peers (dcrd
+    // `newServer`'s `addrmgr.New(cfg.DataDir)`).
+    let mut addr_manager = AddrManager::new(Path::new(&cfg.data_dir));
+    addr_manager.load_peers();
+    let known_addrs = addr_manager.address_cache(|_: NetAddressType| true).len();
+    log_info(&format!(
+        "Address manager loaded {known_addrs} known address(es)"
+    ));
+
+    if cfg.disable_listen {
+        log_info("Listening for peer-to-peer connections is disabled");
+    } else {
+        log_info(&format!(
+            "Peer-to-peer listeners: {}",
+            if cfg.listeners.is_empty() {
+                "(none configured)".to_string()
+            } else {
+                cfg.listeners.join(", ")
+            }
+        ));
+    }
+    if cfg.disable_seeders {
+        log_info("Peer discovery through seeders is disabled");
+    }
+
     log_info(
-        "The UTXO database and peer-to-peer server are not yet wired; \
-         idling until a shutdown signal is received.",
+        "The UTXO database, connection manager, and peer serving are not yet \
+         wired; idling until a shutdown signal is received.",
     );
 
     // Idle until an interrupt (SIGINT) or termination (SIGTERM) signal
