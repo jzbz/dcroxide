@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: ISC
-//! Integration checks for the per-peer input pump and output handler:
-//! after the version handshake the inbound peer sends its verack and
-//! runs the input loop, marking the remote's verack, answering a ping
-//! with a pong, and forwarding every message; and the output handler
-//! drains an outbound queue to the connection in order, all over real
-//! loopback TCP connections.
+//! Integration checks for the per-peer message loops.  After the version
+//! handshake the inbound peer queues its verack and runs the input loop
+//! over a shared peer, answering a ping with a pong through the output
+//! queue; the output handler drains the queue to the connection in
+//! order; and the ping timer queues and records keepalive pings — all
+//! over real loopback TCP connections.
 
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use dcroxide_node::peerconn::{NodePeerEnv, net_address_from_socket};
-use dcroxide_node::peerloop::{OutboundQueue, run_peer_input, run_peer_output, send_verack};
+use dcroxide_node::peerloop::{
+    OutboundQueue, run_peer_input, run_peer_output, run_ping_timer, send_verack,
+};
 use dcroxide_node::transport::WireTransport;
 use dcroxide_peer::{Config, MAX_PROTOCOL_VERSION, MsgTransport, Peer, PeerEnv, PeerGlobals};
 use dcroxide_wire::{CurrencyNet, Message, MsgPing, MsgPong, ServiceFlag};
@@ -30,34 +33,53 @@ fn config(user_agent_name: &str) -> Config {
 }
 
 #[test]
-fn inbound_peer_completes_verack_and_answers_a_ping() {
+fn inbound_peer_answers_verack_and_ping_through_the_output_queue() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
     let server_addr = listener.local_addr().expect("listener addr");
     let ping_nonce = 0xfeed_face_dead_beef_u64;
 
-    // Server side: negotiate, send verack, then run the input loop until
-    // the client closes the connection.
+    // Server side: negotiate, split the socket into read and write
+    // halves, queue the verack, run the output loop on its own thread,
+    // and run the input loop over the shared peer.
     let server = thread::spawn(move || {
         let (stream, remote_addr) = listener.accept().expect("accept connection");
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("set read timeout");
-        let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
+        let write_stream = stream.try_clone().expect("clone stream");
+        let mut read_transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
+        let mut write_transport = WireTransport::new(write_stream, MAX_PROTOCOL_VERSION, NET);
         let mut env = NodePeerEnv::new();
         let mut globals = PeerGlobals::new();
         let mut peer = Peer::new_inbound(config("dcroxide-in"));
         let na = net_address_from_socket(remote_addr, ServiceFlag(0)).expect("net address");
         peer.associate(&remote_addr.to_string(), na, env.now_nanos());
-        peer.negotiate_inbound_protocol(&mut transport, &mut env, &mut globals)
+        peer.negotiate_inbound_protocol(&mut read_transport, &mut env, &mut globals)
             .expect("inbound negotiation");
 
-        send_verack(&mut transport).expect("send verack");
+        let peer = Mutex::new(peer);
+        let (queue, outbound) = OutboundQueue::channel();
+        send_verack(&queue).expect("queue verack");
+
+        let output = thread::spawn(move || run_peer_output(&mut write_transport, outbound));
 
         let mut forwarded: Vec<Message> = Vec::new();
-        let reason = run_peer_input(&mut peer, &mut transport, &mut env, |_peer, msg| {
-            forwarded.push(msg.clone());
-        });
-        (peer.verack_received(), forwarded, format!("{reason:?}"))
+        let reason = run_peer_input(
+            &peer,
+            &mut read_transport,
+            &mut env,
+            &queue,
+            |_peer, msg| {
+                forwarded.push(msg.clone());
+            },
+        );
+
+        // End the output loop by closing the queue, then join it.
+        drop(queue);
+        let _ = output.join();
+
+        let verack_received = peer.lock().expect("peer mutex").verack_received();
+        (verack_received, forwarded, format!("{reason:?}"))
     });
 
     // Client side: negotiate, send verack and a ping, then read the
@@ -74,13 +96,15 @@ fn inbound_peer_completes_verack_and_answers_a_ping() {
     peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
         .expect("outbound negotiation");
 
-    send_verack(&mut transport).expect("send verack");
+    transport
+        .write_message(&Message::VerAck)
+        .expect("send verack");
     transport
         .write_message(&Message::Ping(MsgPing { nonce: ping_nonce }))
         .expect("send ping");
 
-    // The server replies with its verack (on start) and a pong (in
-    // answer to the ping).
+    // The server replies with its verack (queued on start) and a pong
+    // (queued in answer to the ping), both written by the output loop.
     assert_eq!(
         transport.read_message().expect("read verack"),
         Message::VerAck
@@ -160,4 +184,38 @@ fn queue_message_fails_once_the_output_loop_has_stopped() {
         .queue_message(Message::Pong(MsgPong { nonce: 1 }))
         .expect_err("queueing to a closed queue fails");
     assert!(err.contains("closed"), "error: {err}");
+}
+
+#[test]
+fn ping_timer_queues_and_records_pings_until_shutdown() {
+    let peer = Mutex::new(Peer::new_inbound(config("dcroxide")));
+    let (queue, outbound) = OutboundQueue::channel();
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+
+    let timer = thread::spawn(move || {
+        let mut env = NodePeerEnv::new();
+        run_ping_timer(
+            &peer,
+            &mut env,
+            &queue,
+            Duration::from_millis(20),
+            &shutdown_rx,
+        );
+        peer.lock().expect("peer mutex").last_ping_nonce()
+    });
+
+    // The first tick queues a ping.
+    let queued = outbound
+        .recv_timeout(Duration::from_secs(2))
+        .expect("a ping should be queued");
+    match queued {
+        Message::Ping(_) => {}
+        other => panic!("expected a ping, got {other:?}"),
+    }
+
+    // Stopping the timer lets it return the last recorded ping nonce,
+    // set whenever a ping is queued so the answering pong can be matched.
+    shutdown_tx.send(()).expect("signal shutdown");
+    let last_recorded = timer.join().expect("timer thread");
+    assert_ne!(last_recorded, 0, "a ping nonce should have been recorded");
 }

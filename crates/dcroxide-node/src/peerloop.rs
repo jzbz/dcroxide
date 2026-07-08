@@ -1,28 +1,33 @@
 // SPDX-License-Identifier: ISC
-//! The per-peer input message pump — dcrd `peer.go`'s `inHandler`.
+//! The per-peer message loops — dcrd `peer.go`'s `inHandler`,
+//! `outHandler`, and `pingHandler`.
 //!
-//! Once the version handshake completes the daemon sends its verack and
-//! reads messages in a loop, giving the protocol-level messages their
-//! fixed handling (a duplicate version or verack disconnects, a ping is
-//! answered with a pong, a pong updates the ping statistics, and a
-//! sendheaders records the peer's preference) and forwarding every
-//! message to the server's handlers.  The dispatch itself is a decision
-//! core over the ported [`Peer`] handlers; [`run_peer_input`] is the
-//! thin loop that reads, writes the reply, and forwards.
+//! Once the version handshake completes the daemon reads messages in a
+//! loop, giving the protocol-level messages their fixed handling (a
+//! duplicate version or verack disconnects, a ping is answered with a
+//! pong, a pong updates the ping statistics, and a sendheaders records
+//! the peer's preference) and forwarding every message to the server's
+//! handlers.  The dispatch itself is a decision core over the ported
+//! [`Peer`] handlers ([`classify_incoming`]); [`run_peer_input`] is the
+//! read loop, [`run_peer_output`] the write loop draining the
+//! [`OutboundQueue`], and [`run_ping_timer`] the periodic keepalive.
 //!
-//! dcrd runs the read and write halves as separate goroutines joined by
-//! an outbound queue so the server can push messages while the reader
-//! blocks; this slice writes the immediate protocol replies (verack,
-//! pong) inline.  The outbound queue that lets the server originate
-//! messages, the ping timer, and the stall detector arrive with the
-//! output-handler piece.  The idle read deadline is applied by the
-//! caller on the underlying stream (`TcpStream::set_read_timeout`); a
-//! read timeout ends the loop exactly like dcrd's idle disconnect.
+//! dcrd runs these as separate goroutines sharing the peer under its
+//! mutexes, so the peer is passed as a `&Mutex<Peer>` and every write to
+//! the connection — including the input loop's protocol replies and the
+//! keepalive pings — goes through the outbound queue, keeping all writes
+//! on the single output loop.  The blocking read is taken without the
+//! peer lock held so the ping timer and the server make progress.  The
+//! stall detector and the inventory trickle queue arrive later.  The
+//! idle read deadline is applied by the caller on the underlying stream
+//! (`TcpStream::set_read_timeout`); a read timeout ends the loop exactly
+//! like dcrd's idle disconnect.
 
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
+use std::time::Duration;
 
 use dcroxide_peer::{MsgTransport, Peer, PeerEnv};
-use dcroxide_wire::Message;
+use dcroxide_wire::{Message, MsgPing};
 
 /// The protocol-level handling an incoming message calls for, before it
 /// is forwarded to the server handlers.
@@ -95,20 +100,21 @@ pub fn classify_incoming<E: PeerEnv>(
     }
 }
 
-/// Send the verack that follows a successful negotiation (dcrd
+/// Queue the verack that follows a successful negotiation (dcrd
 /// `start`'s `QueueMessage(NewMsgVerAck())`).
-pub fn send_verack<T: MsgTransport>(transport: &mut T) -> Result<(), String> {
-    transport.write_message(&Message::VerAck)
+pub fn send_verack(outbound: &OutboundQueue) -> Result<(), String> {
+    outbound.queue_message(Message::VerAck)
 }
 
 /// Read and dispatch messages until the peer disconnects.  Each message
-/// is given its protocol-level handling (writing any immediate reply)
-/// and then forwarded to `on_message` for the server handlers, mirroring
-/// dcrd's `inHandler`.
+/// is given its protocol-level handling (queueing any immediate reply on
+/// the outbound queue) and then forwarded to `on_message` for the server
+/// handlers, mirroring dcrd's `inHandler`.
 pub fn run_peer_input<T, E, F>(
-    peer: &mut Peer,
+    peer: &Mutex<Peer>,
     transport: &mut T,
     env: &mut E,
+    outbound: &OutboundQueue,
     mut on_message: F,
 ) -> DisconnectReason
 where
@@ -117,20 +123,26 @@ where
     F: FnMut(&mut Peer, &Message),
 {
     loop {
+        // Read without the peer lock held so the ping timer and the
+        // server keep making progress while this thread blocks.
         let msg = match transport.read_message() {
             Ok(msg) => msg,
             Err(e) => return DisconnectReason::ReadError(e),
         };
 
-        match classify_incoming(peer, &msg, env) {
+        let mut peer = peer.lock().expect("peer mutex poisoned");
+        match classify_incoming(&mut peer, &msg, env) {
             IncomingAction::Disconnect(reason) => return DisconnectReason::Protocol(reason),
             IncomingAction::Process { reply } => {
+                // Immediate replies go through the outbound queue so all
+                // writes stay serialized on the output loop; a closed
+                // queue means the output loop already stopped.
                 if let Some(reply) = reply
-                    && let Err(e) = transport.write_message(&reply)
+                    && outbound.queue_message(*reply).is_err()
                 {
-                    return DisconnectReason::WriteError(e);
+                    return DisconnectReason::LocalShutdown;
                 }
-                on_message(peer, &msg);
+                on_message(&mut peer, &msg);
             }
         }
     }
@@ -177,6 +189,36 @@ pub fn run_peer_output<T: MsgTransport>(
         }
     }
     DisconnectReason::LocalShutdown
+}
+
+/// Send a ping to the peer every `interval` until shutdown is signalled
+/// or the outbound queue closes (dcrd's `pingHandler`).  Each ping gets
+/// a fresh nonce recorded on the peer so the answering pong can be timed.
+pub fn run_ping_timer<E: PeerEnv>(
+    peer: &Mutex<Peer>,
+    env: &mut E,
+    outbound: &OutboundQueue,
+    interval: Duration,
+    shutdown: &mpsc::Receiver<()>,
+) {
+    loop {
+        // Wait a full interval unless shutdown arrives first.
+        match shutdown.recv_timeout(interval) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let ping = MsgPing {
+                    nonce: env.rand_u64(),
+                };
+                peer.lock()
+                    .expect("peer mutex poisoned")
+                    .record_sent_ping(env, &ping);
+                if outbound.queue_message(Message::Ping(ping)).is_err() {
+                    return;
+                }
+            }
+            // Shutdown signalled, or the signalling half was dropped.
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
 }
 
 #[cfg(test)]
