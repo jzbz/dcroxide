@@ -71,8 +71,12 @@ impl Default for PeerGlobals {
     }
 }
 
-type HostToNetAddressFn = Box<dyn FnMut(&str, u16, ServiceFlag) -> Result<NetAddress, String>>;
-type NewestBlockFn = Box<dyn FnMut() -> Result<(Hash, i64), String>>;
+// The callbacks are `Send` so a peer holding them can move between the
+// daemon's per-peer threads (the peer itself is guarded by a mutex, so
+// `Sync` is not required).
+type HostToNetAddressFn =
+    Box<dyn FnMut(&str, u16, ServiceFlag) -> Result<NetAddress, String> + Send>;
+type NewestBlockFn = Box<dyn FnMut() -> Result<(Hash, i64), String> + Send>;
 
 /// The peer configuration (dcrd `Config`).  The message listener
 /// callbacks are daemon-phase; the equivalents here are the values

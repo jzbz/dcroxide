@@ -493,3 +493,12 @@ fn v4(octets: &[u8; 4]) -> [u8; 16] {
     ip[12..16].copy_from_slice(octets);
     ip
 }
+
+/// A `Peer` must be `Send` so the daemon can move it between the
+/// per-peer input, output, and ping threads (guarded by a mutex).  This
+/// is a compile-time guarantee; the body only needs to type-check.
+#[test]
+fn peer_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<Peer>();
+}
