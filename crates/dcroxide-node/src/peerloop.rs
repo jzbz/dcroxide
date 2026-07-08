@@ -23,11 +23,16 @@
 //! (`TcpStream::set_read_timeout`); a read timeout ends the loop exactly
 //! like dcrd's idle disconnect.
 
-use std::sync::{Mutex, mpsc};
+use std::net::TcpStream;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 use std::time::Duration;
 
-use dcroxide_peer::{MsgTransport, Peer, PeerEnv};
-use dcroxide_wire::{Message, MsgPing};
+use dcroxide_peer::{MsgTransport, Peer, PeerEnv, PeerGlobals};
+use dcroxide_wire::{CurrencyNet, Message, MsgPing};
+
+use crate::peerconn::NodePeerEnv;
+use crate::transport::WireTransport;
 
 /// The protocol-level handling an incoming message calls for, before it
 /// is forwarded to the server handlers.
@@ -48,6 +53,8 @@ pub enum IncomingAction {
 /// Why an input or output loop stopped.
 #[derive(Debug)]
 pub enum DisconnectReason {
+    /// The version handshake failed with dcrd's negotiation error.
+    Negotiate(String),
     /// A protocol violation with dcrd's reason string.
     Protocol(&'static str),
     /// Reading the next message failed (a closed connection or an idle
@@ -219,6 +226,92 @@ pub fn run_ping_timer<E: PeerEnv>(
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+/// Run a peer connection from the negotiated handshake through the
+/// steady-state message loops until it disconnects (dcrd `peer.go`'s
+/// `start` plus the per-peer goroutine set, as OS threads).
+///
+/// The socket is split into read and write halves; the version handshake
+/// runs (inbound or outbound per the peer) before the loops start; then
+/// the output loop and the ping timer run on their own threads while the
+/// input loop runs on this thread.  When the input loop ends the ping
+/// timer is signalled and the outbound queue is closed so the other
+/// threads finish, and both are joined before returning the reason the
+/// connection stopped.  `idle_timeout` bounds each read so a silent peer
+/// eventually disconnects (dcrd's idle timer); `ping_interval` should be
+/// shorter so a live peer answers before that fires.
+pub fn run_peer_connection<F>(
+    stream: TcpStream,
+    mut peer: Peer,
+    pver: u32,
+    net: CurrencyNet,
+    idle_timeout: Duration,
+    ping_interval: Duration,
+    on_message: F,
+) -> DisconnectReason
+where
+    F: FnMut(&mut Peer, &Message),
+{
+    // A read deadline so a peer that stops answering is disconnected
+    // rather than blocking the input loop forever.
+    if let Err(e) = stream.set_read_timeout(Some(idle_timeout)) {
+        return DisconnectReason::ReadError(e.to_string());
+    }
+    let write_stream = match stream.try_clone() {
+        Ok(write_stream) => write_stream,
+        Err(e) => return DisconnectReason::WriteError(e.to_string()),
+    };
+    let mut read_transport = WireTransport::new(stream, pver, net);
+    let mut write_transport = WireTransport::new(write_stream, pver, net);
+
+    // Negotiate the version exchange before starting the loops.  The
+    // read transport is full duplex, so it also writes the local version.
+    let mut env = NodePeerEnv::new();
+    let mut globals = PeerGlobals::new();
+    let negotiated = if peer.inbound() {
+        peer.negotiate_inbound_protocol(&mut read_transport, &mut env, &mut globals)
+    } else {
+        peer.negotiate_outbound_protocol(&mut read_transport, &mut env, &mut globals)
+    };
+    if let Err(e) = negotiated {
+        return DisconnectReason::Negotiate(e.message);
+    }
+
+    // Share the peer across the loops and queue the verack that follows
+    // negotiation.
+    let peer = Arc::new(Mutex::new(peer));
+    let (outbound, receiver) = OutboundQueue::channel();
+    if send_verack(&outbound).is_err() {
+        return DisconnectReason::LocalShutdown;
+    }
+
+    let output = thread::spawn(move || run_peer_output(&mut write_transport, receiver));
+
+    let (ping_shutdown, ping_shutdown_rx) = mpsc::channel();
+    let ping_peer = Arc::clone(&peer);
+    let ping_outbound = outbound.clone();
+    let ping = thread::spawn(move || {
+        let mut ping_env = NodePeerEnv::new();
+        run_ping_timer(
+            &ping_peer,
+            &mut ping_env,
+            &ping_outbound,
+            ping_interval,
+            &ping_shutdown_rx,
+        );
+    });
+
+    // Drive the input loop on this thread until the peer disconnects.
+    let reason = run_peer_input(&peer, &mut read_transport, &mut env, &outbound, on_message);
+
+    // Tear down: stop the ping timer and close the outbound queue so the
+    // output loop finishes, then join both threads.
+    let _ = ping_shutdown.send(());
+    drop(outbound);
+    let _ = ping.join();
+    let _ = output.join();
+    reason
 }
 
 #[cfg(test)]

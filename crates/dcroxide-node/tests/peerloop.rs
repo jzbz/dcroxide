@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use dcroxide_node::peerconn::{NodePeerEnv, net_address_from_socket};
 use dcroxide_node::peerloop::{
-    OutboundQueue, run_peer_input, run_peer_output, run_ping_timer, send_verack,
+    OutboundQueue, run_peer_connection, run_peer_input, run_peer_output, run_ping_timer,
+    send_verack,
 };
 use dcroxide_node::transport::WireTransport;
 use dcroxide_peer::{Config, MAX_PROTOCOL_VERSION, MsgTransport, Peer, PeerEnv, PeerGlobals};
@@ -218,4 +219,79 @@ fn ping_timer_queues_and_records_pings_until_shutdown() {
     shutdown_tx.send(()).expect("signal shutdown");
     let last_recorded = timer.join().expect("timer thread");
     assert_ne!(last_recorded, 0, "a ping nonce should have been recorded");
+}
+
+#[test]
+fn run_peer_connection_negotiates_and_serves_until_the_remote_closes() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
+    let server_addr = listener.local_addr().expect("listener addr");
+    let ping_nonce = 0x0bad_c0de_0bad_c0de_u64;
+
+    // Server side: accept, associate the inbound peer, and run the whole
+    // connection (handshake + loops) until the client closes.  The ping
+    // interval and idle timeout are long so neither fires during the test.
+    let server = thread::spawn(move || {
+        let (stream, remote_addr) = listener.accept().expect("accept connection");
+        let mut peer = Peer::new_inbound(config("dcroxide-in"));
+        let na = net_address_from_socket(remote_addr, ServiceFlag(0)).expect("net address");
+        peer.associate(&remote_addr.to_string(), na, 0);
+
+        let forwarded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Message>::new()));
+        let sink = std::sync::Arc::clone(&forwarded);
+        let reason = run_peer_connection(
+            stream,
+            peer,
+            MAX_PROTOCOL_VERSION,
+            NET,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            move |_peer, msg| sink.lock().expect("sink").push(msg.clone()),
+        );
+        let forwarded = forwarded.lock().expect("forwarded").clone();
+        (forwarded, format!("{reason:?}"))
+    });
+
+    // Client side: negotiate, send verack + ping, read the server's
+    // verack and the pong, then close.
+    let stream = TcpStream::connect(server_addr).expect("dial the listener");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
+    let mut env = NodePeerEnv::new();
+    let mut globals = PeerGlobals::new();
+    let mut peer = Peer::new_outbound(config("dcroxide-out"), &server_addr.to_string())
+        .expect("outbound peer");
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+        .expect("outbound negotiation");
+
+    transport
+        .write_message(&Message::VerAck)
+        .expect("send verack");
+    transport
+        .write_message(&Message::Ping(MsgPing { nonce: ping_nonce }))
+        .expect("send ping");
+
+    assert_eq!(
+        transport.read_message().expect("read verack"),
+        Message::VerAck
+    );
+    match transport.read_message().expect("read pong") {
+        Message::Pong(pong) => assert_eq!(pong.nonce, ping_nonce),
+        other => panic!("expected pong, got {other:?}"),
+    }
+
+    // Closing the connection ends the server's whole connection runtime.
+    drop(transport);
+
+    let (forwarded, reason) = server.join().expect("server thread");
+    assert_eq!(
+        forwarded,
+        vec![
+            Message::VerAck,
+            Message::Ping(MsgPing { nonce: ping_nonce })
+        ],
+        "the connection forwards every message in order",
+    );
+    assert!(reason.contains("ReadError"), "disconnect reason: {reason}");
 }
