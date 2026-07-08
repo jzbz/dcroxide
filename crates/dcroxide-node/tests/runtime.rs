@@ -85,7 +85,7 @@ fn binds_multiple_listeners_and_shuts_down() {
 #[test]
 fn serves_an_inbound_peer_through_the_handler() {
     use dcroxide_node::peerconn::NodePeerEnv;
-    use dcroxide_node::runtime::{PeerTemplate, inbound_peer_handler};
+    use dcroxide_node::runtime::{ConnectedPeers, PeerTemplate, inbound_peer_handler};
     use dcroxide_node::transport::WireTransport;
     use dcroxide_peer::{Config, MAX_PROTOCOL_VERSION, MsgTransport, Peer, PeerGlobals};
     use dcroxide_wire::{CurrencyNet, Message, MsgPing, ServiceFlag};
@@ -105,7 +105,7 @@ fn serves_an_inbound_peer_through_the_handler() {
 
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template),
+        inbound_peer_handler(template, ConnectedPeers::new()),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();
@@ -156,4 +156,81 @@ fn serves_an_inbound_peer_through_the_handler() {
 
     drop(transport);
     runtime.shutdown();
+}
+
+/// A served peer is tracked in the connected-peers registry while it is
+/// active, and disconnecting all peers unblocks it so it deregisters.
+#[test]
+fn disconnecting_all_peers_tears_down_a_served_connection() {
+    use dcroxide_node::peerconn::NodePeerEnv;
+    use dcroxide_node::runtime::{ConnectedPeers, PeerTemplate, inbound_peer_handler};
+    use dcroxide_node::transport::WireTransport;
+    use dcroxide_peer::{Config, MAX_PROTOCOL_VERSION, Peer, PeerGlobals};
+    use dcroxide_wire::{CurrencyNet, ServiceFlag};
+
+    const NET: CurrencyNet = CurrencyNet::TEST_NET3;
+
+    let template = PeerTemplate {
+        net: NET,
+        protocol_version: 0,
+        services: ServiceFlag(1),
+        user_agent_name: "dcroxide".to_string(),
+        user_agent_version: "0.1.0".to_string(),
+        idle_timeout: Duration::from_secs(3600),
+        ping_interval: Duration::from_secs(3600),
+    };
+
+    let connected = ConnectedPeers::new();
+    let runtime = ListenerRuntime::start(
+        &[("tcp4", ":0".to_string())],
+        inbound_peer_handler(template, connected.clone()),
+    )
+    .expect("start serving runtime");
+    let port = runtime.bound_addrs()[0].port();
+
+    // Connect and negotiate so the peer is registered as live.
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
+    let mut env = NodePeerEnv::new();
+    let mut globals = PeerGlobals::new();
+    let config = Config {
+        net: NET,
+        protocol_version: 0,
+        ..Config::default()
+    };
+    let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound peer");
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+        .expect("negotiate");
+
+    // The peer should register shortly after the handshake.
+    assert!(
+        wait_until(Duration::from_secs(5), || connected.len() == 1),
+        "the served peer should be registered as live"
+    );
+
+    // Disconnecting all peers unblocks the served connection so it winds
+    // down and deregisters itself.
+    connected.disconnect_all();
+    assert!(
+        wait_until(Duration::from_secs(5), || connected.is_empty()),
+        "the served peer should deregister after being disconnected"
+    );
+
+    drop(transport);
+    runtime.shutdown();
+}
+
+/// Poll `cond` until it holds or the timeout elapses.
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    cond()
 }

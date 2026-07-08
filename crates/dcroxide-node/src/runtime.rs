@@ -11,10 +11,11 @@
 //! and the RPC server arrive with later pieces and plug into this same
 //! shutdown coordination.
 
+use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -33,6 +34,69 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// thread and must not block for long, so it hands the connection off to
 /// a dedicated peer thread.
 pub type InboundHandler = Arc<dyn Fn(TcpStream, SocketAddr) + Send + Sync>;
+
+/// A registry of the live peer connections so they can be disconnected
+/// on shutdown (the connected-peer half of dcrd's `peerState`, tracking
+/// just the socket needed to interrupt a peer blocked on a read).
+#[derive(Clone, Default)]
+pub struct ConnectedPeers {
+    inner: Arc<Mutex<ConnectedPeersInner>>,
+}
+
+#[derive(Default)]
+struct ConnectedPeersInner {
+    next_id: u64,
+    peers: HashMap<u64, TcpStream>,
+}
+
+impl ConnectedPeers {
+    /// An empty registry.
+    pub fn new() -> ConnectedPeers {
+        ConnectedPeers::default()
+    }
+
+    /// Register a live connection, returning the handle used to remove it.
+    fn register(&self, stream: TcpStream) -> u64 {
+        let mut inner = self.inner.lock().expect("connected peers mutex poisoned");
+        let id = inner.next_id;
+        inner.next_id = inner.next_id.wrapping_add(1);
+        inner.peers.insert(id, stream);
+        id
+    }
+
+    /// Remove a connection that has finished.
+    fn deregister(&self, id: u64) {
+        self.inner
+            .lock()
+            .expect("connected peers mutex poisoned")
+            .peers
+            .remove(&id);
+    }
+
+    /// The number of live connections.
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("connected peers mutex poisoned")
+            .peers
+            .len()
+    }
+
+    /// Whether there are no live connections.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Disconnect every live connection by shutting down its socket,
+    /// which unblocks each peer's read loop so it winds down (dcrd's
+    /// server shutdown disconnecting all peers).
+    pub fn disconnect_all(&self) {
+        let inner = self.inner.lock().expect("connected peers mutex poisoned");
+        for stream in inner.peers.values() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+}
 
 /// The parameters a fresh inbound peer is built from (the daemon's slice
 /// of dcrd's `peer.Config`).  Plain data so it can be cloned per
@@ -78,15 +142,22 @@ impl PeerTemplate {
 /// through the full connection runtime.  The server-handler dispatch is
 /// a no-op for now; the peer-state bookkeeping and message forwarding
 /// arrive with the peer-handler piece.
-pub fn inbound_peer_handler(template: PeerTemplate) -> InboundHandler {
+pub fn inbound_peer_handler(template: PeerTemplate, connected: ConnectedPeers) -> InboundHandler {
     Arc::new(move |stream: TcpStream, addr: SocketAddr| {
         let template = template.clone();
-        thread::spawn(move || serve_inbound_peer(stream, addr, &template));
+        let connected = connected.clone();
+        thread::spawn(move || serve_inbound_peer(stream, addr, &template, &connected));
     })
 }
 
-/// Build, associate, and run a single inbound peer to completion.
-fn serve_inbound_peer(stream: TcpStream, addr: SocketAddr, template: &PeerTemplate) {
+/// Build, associate, and run a single inbound peer to completion,
+/// keeping it in the connected-peers registry while it is served.
+fn serve_inbound_peer(
+    stream: TcpStream,
+    addr: SocketAddr,
+    template: &PeerTemplate,
+    connected: &ConnectedPeers,
+) {
     let mut peer = Peer::new_inbound(template.config());
     let na = match net_address_from_socket(addr, template.services) {
         Ok(na) => na,
@@ -95,6 +166,11 @@ fn serve_inbound_peer(stream: TcpStream, addr: SocketAddr, template: &PeerTempla
         Err(_) => return,
     };
     peer.associate(&addr.to_string(), na, NodePeerEnv::new().now_nanos());
+
+    // Register a socket handle so a shutdown can interrupt this peer's
+    // blocking read; a failed clone just leaves it unregistered.
+    let handle = stream.try_clone().ok().map(|h| connected.register(h));
+
     let _ = run_peer_connection(
         stream,
         peer,
@@ -106,6 +182,10 @@ fn serve_inbound_peer(stream: TcpStream, addr: SocketAddr, template: &PeerTempla
         // a later piece; keepalive and the handshake are handled inside.
         |_peer, _msg| {},
     );
+
+    if let Some(id) = handle {
+        connected.deregister(id);
+    }
 }
 
 /// Resolve a listener spec's bind address, expanding the wildcard host

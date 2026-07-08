@@ -24,7 +24,7 @@ use dcroxide_addrmgr::{AddrManager, NetAddressType};
 use dcroxide_blockchain::process::Chain;
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{Database, ErrorKind, Options};
-use dcroxide_node::runtime::{ListenerRuntime, PeerTemplate, inbound_peer_handler};
+use dcroxide_node::runtime::{ConnectedPeers, ListenerRuntime, PeerTemplate, inbound_peer_handler};
 use dcroxide_node::{
     Config, ConfigEnv, ERR_HELP_REQUESTED, ERR_SHOW_SUBSYSTEMS, ERR_VERSION_REQUESTED,
     app_data_dir, load_config_from_argv, logo, parse_listeners, supported_subsystems, version,
@@ -145,7 +145,7 @@ fn run(cfg: Config) -> ExitCode {
         None
     } else {
         match start_listeners(&cfg) {
-            Ok(runtime) => {
+            Ok((runtime, connected)) => {
                 let addrs: Vec<String> = runtime
                     .bound_addrs()
                     .iter()
@@ -159,7 +159,7 @@ fn run(cfg: Config) -> ExitCode {
                         addrs.join(", ")
                     }
                 ));
-                Some(runtime)
+                Some((runtime, connected))
             }
             Err(e) => {
                 log_info(&format!("Unable to start peer-to-peer listeners: {e}"));
@@ -188,11 +188,11 @@ fn run(cfg: Config) -> ExitCode {
     }
     let _ = rx.recv();
 
-    // Stop accepting new connections (existing peer threads wind down as
-    // their connections close; tracked peer teardown arrives with the
-    // peer-handler piece).
-    if let Some(listeners) = listeners {
-        listeners.shutdown();
+    // Disconnect the live peers and stop accepting new connections
+    // (dcrd's server shutdown disconnecting all peers).
+    if let Some((runtime, connected)) = listeners {
+        connected.disconnect_all();
+        runtime.shutdown();
     }
 
     log_info("Shutdown complete");
@@ -201,7 +201,8 @@ fn run(cfg: Config) -> ExitCode {
 
 /// Bind the configured peer-to-peer listeners and start serving inbound
 /// peers (dcrd `newServer`'s listener setup plus `inboundPeerConnected`).
-fn start_listeners(cfg: &Config) -> Result<ListenerRuntime, String> {
+/// Returns the listener runtime and the registry of the peers it serves.
+fn start_listeners(cfg: &Config) -> Result<(ListenerRuntime, ConnectedPeers), String> {
     let params = &cfg.params.params;
     let template = PeerTemplate {
         net: params.net,
@@ -214,8 +215,11 @@ fn start_listeners(cfg: &Config) -> Result<ListenerRuntime, String> {
         idle_timeout: Duration::from_nanos(DEFAULT_IDLE_TIMEOUT as u64),
         ping_interval: Duration::from_nanos(PING_INTERVAL as u64),
     };
+    let connected = ConnectedPeers::new();
     let specs = parse_listeners(&cfg.listeners)?;
-    ListenerRuntime::start(&specs, inbound_peer_handler(template)).map_err(|e| e.to_string())
+    let runtime = ListenerRuntime::start(&specs, inbound_peer_handler(template, connected.clone()))
+        .map_err(|e| e.to_string())?;
+    Ok((runtime, connected))
 }
 
 /// Open (or create) the block database and initialize the chain state
