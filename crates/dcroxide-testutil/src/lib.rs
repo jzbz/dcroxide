@@ -141,7 +141,18 @@ fn build_oracle() -> PathBuf {
         "go build failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    std::fs::rename(&tmp, &bin).expect("move oracle binary into place");
+    // Atomically move the freshly built binary into place.  On Windows a
+    // destination that another test process is currently executing cannot
+    // be replaced (rename fails with a sharing violation); since every
+    // build of the same source is equivalent, fall back to the binary
+    // already there and discard our own copy.
+    match std::fs::rename(&tmp, &bin) {
+        Ok(()) => {}
+        Err(_) if bin.exists() => {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        Err(e) => panic!("move oracle binary into place: {e}"),
+    }
     bin
 }
 

@@ -264,7 +264,17 @@ impl ListenerRuntime {
 fn accept_loop(listener: &TcpListener, shutdown: &AtomicBool, handler: &InboundHandler) {
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, addr)) => handler(stream, addr),
+            // The listener is non-blocking so this loop can poll for
+            // shutdown; on BSD/macOS the accepted socket inherits that
+            // flag, so restore blocking mode before handing it off (Linux
+            // accepts already come blocking).  A socket that cannot be put
+            // back into blocking mode would break the per-peer read loop,
+            // so it is dropped rather than served.
+            Ok((stream, addr)) => {
+                if stream.set_nonblocking(false).is_ok() {
+                    handler(stream, addr);
+                }
+            }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(ACCEPT_POLL_INTERVAL);
             }
