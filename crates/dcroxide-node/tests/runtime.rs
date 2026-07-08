@@ -78,3 +78,82 @@ fn binds_multiple_listeners_and_shuts_down() {
     runtime.shutdown();
     assert_eq!(count.load(Ordering::SeqCst), 2, "both connections accepted");
 }
+
+/// Start a listener runtime whose handler serves inbound peers, then
+/// connect as a peer, negotiate, exchange verack, and confirm a ping is
+/// answered with a pong — the full accept-to-serve path.
+#[test]
+fn serves_an_inbound_peer_through_the_handler() {
+    use dcroxide_node::peerconn::NodePeerEnv;
+    use dcroxide_node::runtime::{PeerTemplate, inbound_peer_handler};
+    use dcroxide_node::transport::WireTransport;
+    use dcroxide_peer::{Config, MAX_PROTOCOL_VERSION, MsgTransport, Peer, PeerGlobals};
+    use dcroxide_wire::{CurrencyNet, Message, MsgPing, ServiceFlag};
+
+    const NET: CurrencyNet = CurrencyNet::TEST_NET3;
+
+    let template = PeerTemplate {
+        net: NET,
+        protocol_version: 0,
+        services: ServiceFlag(1),
+        user_agent_name: "dcroxide".to_string(),
+        user_agent_version: "0.1.0".to_string(),
+        // Long enough that neither fires during the test.
+        idle_timeout: Duration::from_secs(3600),
+        ping_interval: Duration::from_secs(3600),
+    };
+
+    let runtime = ListenerRuntime::start(
+        &[("tcp4", ":0".to_string())],
+        inbound_peer_handler(template),
+    )
+    .expect("start serving runtime");
+    let port = runtime.bound_addrs()[0].port();
+
+    // Connect as an outbound peer and complete the handshake.
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
+    let mut env = NodePeerEnv::new();
+    let mut globals = PeerGlobals::new();
+    let client_config = Config {
+        net: NET,
+        services: ServiceFlag(1),
+        user_agent_name: "dcroxide-client".to_string(),
+        user_agent_version: "0.1.0".to_string(),
+        protocol_version: 0,
+        ..Config::default()
+    };
+    let mut peer =
+        Peer::new_outbound(client_config, &format!("127.0.0.1:{port}")).expect("outbound peer");
+    let remote = peer
+        .negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+        .expect("negotiate with the server");
+    assert!(
+        remote.user_agent.contains("dcroxide"),
+        "server user agent: {}",
+        remote.user_agent
+    );
+
+    // Exchange verack and confirm the server answers a ping with a pong.
+    transport
+        .write_message(&Message::VerAck)
+        .expect("send verack");
+    let ping_nonce = 0x1234_5678_9abc_def0_u64;
+    transport
+        .write_message(&Message::Ping(MsgPing { nonce: ping_nonce }))
+        .expect("send ping");
+    assert_eq!(
+        transport.read_message().expect("read verack"),
+        Message::VerAck
+    );
+    match transport.read_message().expect("read pong") {
+        Message::Pong(pong) => assert_eq!(pong.nonce, ping_nonce),
+        other => panic!("expected pong, got {other:?}"),
+    }
+
+    drop(transport);
+    runtime.shutdown();
+}

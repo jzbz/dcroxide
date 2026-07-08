@@ -15,8 +15,14 @@ use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use dcroxide_peer::{Config, Peer, PeerEnv};
+use dcroxide_wire::{CurrencyNet, ServiceFlag};
+
+use crate::peerconn::{NodePeerEnv, net_address_from_socket};
+use crate::peerloop::run_peer_connection;
 
 /// The interval the accept loops wait between polling for shutdown when
 /// no connection is pending.
@@ -24,9 +30,83 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// A handler invoked for each accepted inbound connection (dcrd
 /// `server.inboundPeerConnected`).  It runs on the listener's accept
-/// thread and must not block for long; later pieces hand the connection
-/// off to a dedicated peer thread.
+/// thread and must not block for long, so it hands the connection off to
+/// a dedicated peer thread.
 pub type InboundHandler = Arc<dyn Fn(TcpStream, SocketAddr) + Send + Sync>;
+
+/// The parameters a fresh inbound peer is built from (the daemon's slice
+/// of dcrd's `peer.Config`).  Plain data so it can be cloned per
+/// connection; the peer's boxed callbacks are left unset here.
+#[derive(Clone)]
+pub struct PeerTemplate {
+    /// The network to frame messages for.
+    pub net: CurrencyNet,
+    /// The maximum protocol version to negotiate (0 means the package
+    /// maximum).
+    pub protocol_version: u32,
+    /// The services to advertise.
+    pub services: ServiceFlag,
+    /// The user agent name to advertise.
+    pub user_agent_name: String,
+    /// The user agent version to advertise.
+    pub user_agent_version: String,
+    /// How long a peer may be silent before it is disconnected.
+    pub idle_timeout: Duration,
+    /// How often to ping an otherwise-quiet peer.
+    pub ping_interval: Duration,
+}
+
+impl PeerTemplate {
+    /// Build a fresh peer configuration for a new connection.
+    fn config(&self) -> Config {
+        Config {
+            net: self.net,
+            services: self.services,
+            user_agent_name: self.user_agent_name.clone(),
+            user_agent_version: self.user_agent_version.clone(),
+            protocol_version: self.protocol_version,
+            idle_timeout_nanos: self.idle_timeout.as_nanos() as i64,
+            ..Config::default()
+        }
+    }
+}
+
+/// Build the inbound handler that serves each accepted connection as a
+/// negotiated peer (dcrd `server.inboundPeerConnected`).  Each
+/// connection is handled on its own thread: a fresh inbound peer is
+/// built from `template`, associated with the remote address, and run
+/// through the full connection runtime.  The server-handler dispatch is
+/// a no-op for now; the peer-state bookkeeping and message forwarding
+/// arrive with the peer-handler piece.
+pub fn inbound_peer_handler(template: PeerTemplate) -> InboundHandler {
+    Arc::new(move |stream: TcpStream, addr: SocketAddr| {
+        let template = template.clone();
+        thread::spawn(move || serve_inbound_peer(stream, addr, &template));
+    })
+}
+
+/// Build, associate, and run a single inbound peer to completion.
+fn serve_inbound_peer(stream: TcpStream, addr: SocketAddr, template: &PeerTemplate) {
+    let mut peer = Peer::new_inbound(template.config());
+    let na = match net_address_from_socket(addr, template.services) {
+        Ok(na) => na,
+        // An address the manager cannot represent is dropped, matching
+        // dcrd refusing to serve an unroutable peer.
+        Err(_) => return,
+    };
+    peer.associate(&addr.to_string(), na, NodePeerEnv::new().now_nanos());
+    let _ = run_peer_connection(
+        stream,
+        peer,
+        template.protocol_version,
+        template.net,
+        template.idle_timeout,
+        template.ping_interval,
+        // Server-handler dispatch (relay, inv, getdata, ...) is wired in
+        // a later piece; keepalive and the handshake are handled inside.
+        |_peer, _msg| {},
+    );
+}
 
 /// Resolve a listener spec's bind address, expanding the wildcard host
 /// to the family-appropriate any-address (dcrd relies on Go's
