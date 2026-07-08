@@ -5,28 +5,32 @@
 //! configuration pipeline, handle the help, version, and
 //! debug-level-show exits with dcrd's exit codes, print the startup
 //! banner, open the block database and initialize the chain state,
-//! create the address manager, announce the network configuration,
-//! and idle on a shutdown-signal listener until interrupted.
+//! create the address manager, bind the peer-to-peer listeners and
+//! serve inbound peers, and idle on a shutdown-signal listener until
+//! interrupted, then stop accepting connections.
 //!
-//! The UTXO database, the connection manager, and the peer-to-peer
-//! serving (`newServer`/`svr.Run`) arrive with later pieces; this
-//! stops after the startup announcements.  The rotating file-logging
-//! backend is likewise not yet wired, so startup output goes to
-//! standard streams.
+//! The UTXO database, the connection manager (outbound dialing and
+//! seeding), the sync manager, the RPC server, and the server-handler
+//! dispatch that a served peer's messages are forwarded to arrive with
+//! later pieces.  The rotating file-logging backend is likewise not yet
+//! wired, so startup output goes to standard streams.
 
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dcroxide_addrmgr::{AddrManager, NetAddressType};
 use dcroxide_blockchain::process::Chain;
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{Database, ErrorKind, Options};
+use dcroxide_node::runtime::{ListenerRuntime, PeerTemplate, inbound_peer_handler};
 use dcroxide_node::{
     Config, ConfigEnv, ERR_HELP_REQUESTED, ERR_SHOW_SUBSYSTEMS, ERR_VERSION_REQUESTED,
-    app_data_dir, load_config_from_argv, logo, supported_subsystems, version,
+    app_data_dir, load_config_from_argv, logo, parse_listeners, supported_subsystems, version,
 };
+use dcroxide_peer::{DEFAULT_IDLE_TIMEOUT, PING_INTERVAL};
+use dcroxide_wire::ServiceFlag;
 
 const APP_NAME: &str = "dcroxide";
 
@@ -134,25 +138,43 @@ fn run(cfg: Config) -> ExitCode {
         "Address manager loaded {known_addrs} known address(es)"
     ));
 
-    if cfg.disable_listen {
+    // Bind the peer-to-peer listeners and start serving inbound peers
+    // unless listening is disabled (dcrd's server listeners).
+    let listeners = if cfg.disable_listen {
         log_info("Listening for peer-to-peer connections is disabled");
+        None
     } else {
-        log_info(&format!(
-            "Peer-to-peer listeners: {}",
-            if cfg.listeners.is_empty() {
-                "(none configured)".to_string()
-            } else {
-                cfg.listeners.join(", ")
+        match start_listeners(&cfg) {
+            Ok(runtime) => {
+                let addrs: Vec<String> = runtime
+                    .bound_addrs()
+                    .iter()
+                    .map(|addr| addr.to_string())
+                    .collect();
+                log_info(&format!(
+                    "Serving peer-to-peer connections on {}",
+                    if addrs.is_empty() {
+                        "(no listeners bound)".to_string()
+                    } else {
+                        addrs.join(", ")
+                    }
+                ));
+                Some(runtime)
             }
-        ));
-    }
+            Err(e) => {
+                log_info(&format!("Unable to start peer-to-peer listeners: {e}"));
+                return ExitCode::FAILURE;
+            }
+        }
+    };
     if cfg.disable_seeders {
         log_info("Peer discovery through seeders is disabled");
     }
 
     log_info(
-        "The UTXO database, connection manager, and peer serving are not yet \
-         wired; idling until a shutdown signal is received.",
+        "The UTXO database, connection manager, sync manager, and RPC server \
+         are not yet wired; serving inbound peers until a shutdown signal is \
+         received.",
     );
 
     // Idle until an interrupt (SIGINT) or termination (SIGTERM) signal
@@ -166,8 +188,34 @@ fn run(cfg: Config) -> ExitCode {
     }
     let _ = rx.recv();
 
+    // Stop accepting new connections (existing peer threads wind down as
+    // their connections close; tracked peer teardown arrives with the
+    // peer-handler piece).
+    if let Some(listeners) = listeners {
+        listeners.shutdown();
+    }
+
     log_info("Shutdown complete");
     ExitCode::SUCCESS
+}
+
+/// Bind the configured peer-to-peer listeners and start serving inbound
+/// peers (dcrd `newServer`'s listener setup plus `inboundPeerConnected`).
+fn start_listeners(cfg: &Config) -> Result<ListenerRuntime, String> {
+    let params = &cfg.params.params;
+    let template = PeerTemplate {
+        net: params.net,
+        // 0 selects the package's maximum protocol version.
+        protocol_version: 0,
+        // dcrd's `defaultServices`.
+        services: ServiceFlag::NODE_NETWORK,
+        user_agent_name: APP_NAME.to_string(),
+        user_agent_version: version::version_string().to_string(),
+        idle_timeout: Duration::from_nanos(DEFAULT_IDLE_TIMEOUT as u64),
+        ping_interval: Duration::from_nanos(PING_INTERVAL as u64),
+    };
+    let specs = parse_listeners(&cfg.listeners)?;
+    ListenerRuntime::start(&specs, inbound_peer_handler(template)).map_err(|e| e.to_string())
 }
 
 /// Open (or create) the block database and initialize the chain state

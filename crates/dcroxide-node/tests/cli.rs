@@ -65,6 +65,8 @@ fn startup_opens_block_database_and_loads_genesis() {
     // temporary directory and the run touches nothing else.
     let home = std::env::temp_dir().join(format!("dcroxide-cli-{}", std::process::id()));
     let mut child = Command::new(env!("CARGO_BIN_EXE_dcroxide"))
+        // Do not bind a real listen port; this test is about the database.
+        .arg("--nolisten")
         .env("HOME", &home)
         .env_remove("DCRD_APPDATA")
         .stdout(Stdio::piped())
@@ -107,5 +109,53 @@ fn startup_opens_block_database_and_loads_genesis() {
     assert!(
         loaded.contains("best block height 0"),
         "startup line: {loaded}"
+    );
+}
+
+#[test]
+fn startup_serves_peer_connections_on_a_listener() {
+    // Bind an ephemeral loopback port so the test neither uses a fixed
+    // port nor touches the network.
+    let home = std::env::temp_dir().join(format!("dcroxide-cli-listen-{}", std::process::id()));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dcroxide"))
+        .arg("--listen=127.0.0.1:0")
+        .env("HOME", &home)
+        .env_remove("DCRD_APPDATA")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn dcroxide binary");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut serving = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(line) if line.contains("Serving peer-to-peer connections on 127.0.0.1:") => {
+                serving = Some(line);
+                break;
+            }
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&home);
+
+    assert!(
+        serving.is_some(),
+        "binary should announce it is serving peers on the bound listener"
     );
 }
