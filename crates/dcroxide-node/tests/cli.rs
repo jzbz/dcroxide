@@ -6,19 +6,36 @@
 //! before idling on a shutdown signal.
 
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// A unique application data directory under the system temp directory,
+/// so a spawned daemon neither reads nor writes the real user
+/// configuration and concurrent tests never share a data directory (and
+/// its exclusively locked block database).  This is passed as --appdata
+/// rather than via $HOME because on Windows the data directory is
+/// resolved from the OS-native location (%LOCALAPPDATA%), where $HOME is
+/// ignored, so an $HOME override would not isolate the run at all.  The
+/// process id alone is not unique enough — tests in one binary share it
+/// — so a per-call sequence number is mixed in.
+fn isolated_appdata(tag: &str) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("dcroxide-cli-{tag}-{}-{seq}", std::process::id()))
+}
+
 fn run(args: &[&str]) -> (String, String, i32) {
+    let appdata = isolated_appdata("run");
     let out = Command::new(env!("CARGO_BIN_EXE_dcroxide"))
+        .arg(format!("--appdata={}", appdata.display()))
         .args(args)
-        // Use an isolated home so the run neither reads nor writes the
-        // real user configuration.
-        .env("HOME", std::env::temp_dir())
         .env_remove("DCRD_APPDATA")
         .output()
         .expect("run dcroxide binary");
+    let _ = std::fs::remove_dir_all(&appdata);
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -43,8 +60,8 @@ fn help_exits_zero() {
 
 #[test]
 fn debuglevel_show_lists_subsystems() {
-    let (stdout, _, code) = run(&["--debuglevel=show"]);
-    assert_eq!(code, 0);
+    let (stdout, stderr, code) = run(&["--debuglevel=show"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.contains("Supported subsystems"), "stdout: {stdout}");
     // A couple of the known subsystem identifiers.
     assert!(stdout.contains("DCRD"), "stdout: {stdout}");
@@ -63,11 +80,11 @@ fn unknown_flag_exits_one_with_error() {
 fn startup_opens_block_database_and_loads_genesis() {
     // Use an isolated home so a fresh block database is created under a
     // temporary directory and the run touches nothing else.
-    let home = std::env::temp_dir().join(format!("dcroxide-cli-{}", std::process::id()));
+    let home = isolated_appdata("db");
     let mut child = Command::new(env!("CARGO_BIN_EXE_dcroxide"))
         // Do not bind a real listen port; this test is about the database.
         .arg("--nolisten")
-        .env("HOME", &home)
+        .arg(format!("--appdata={}", home.display()))
         .env_remove("DCRD_APPDATA")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -116,10 +133,10 @@ fn startup_opens_block_database_and_loads_genesis() {
 fn startup_serves_peer_connections_on_a_listener() {
     // Bind an ephemeral loopback port so the test neither uses a fixed
     // port nor touches the network.
-    let home = std::env::temp_dir().join(format!("dcroxide-cli-listen-{}", std::process::id()));
+    let home = isolated_appdata("listen");
     let mut child = Command::new(env!("CARGO_BIN_EXE_dcroxide"))
         .arg("--listen=127.0.0.1:0")
-        .env("HOME", &home)
+        .arg(format!("--appdata={}", home.display()))
         .env_remove("DCRD_APPDATA")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
