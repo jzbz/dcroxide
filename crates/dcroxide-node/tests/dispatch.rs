@@ -31,6 +31,7 @@ fn serve_genesis_chain() -> (
     ConnectedPeers,
     WireTransport<TcpStream>,
     Hash,
+    Arc<Mutex<dcroxide_addrmgr::AddrManager>>,
 ) {
     let params = dcroxide_chaincfg::testnet3_params();
     let genesis_hash = params.genesis_hash;
@@ -40,12 +41,15 @@ fn serve_genesis_chain() -> (
     let db = Database::create(&opts).expect("create database");
     let chain = Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain");
 
+    let addr_manager = Arc::new(Mutex::new(dcroxide_addrmgr::AddrManager::new(dir.path())));
     let server = Arc::new(ServerContext {
         chain: Arc::new(Mutex::new(chain)),
         min_known_work: params.min_known_chain_work,
         disable_banning: false,
         ban_threshold: 100,
         whitelists: Vec::new(),
+        addr_manager: Arc::clone(&addr_manager),
+        sim_or_reg_net: false,
     });
 
     let template = PeerTemplate {
@@ -89,7 +93,14 @@ fn serve_genesis_chain() -> (
         Message::VerAck
     );
 
-    (dir, runtime, connected, transport, genesis_hash)
+    (
+        dir,
+        runtime,
+        connected,
+        transport,
+        genesis_hash,
+        addr_manager,
+    )
 }
 
 /// A block locator anchored at the given hash.
@@ -108,7 +119,7 @@ fn locator(hash: Hash) -> BlockLocator {
 /// from the chain while misses accumulate into notfound.
 #[test]
 fn serves_chain_backed_requests() {
-    let (_dir, runtime, _connected, mut transport, genesis_hash) = serve_genesis_chain();
+    let (_dir, runtime, _connected, mut transport, genesis_hash, _addrmgr) = serve_genesis_chain();
 
     // getheaders -> an empty headers message via the low-work gate.
     transport
@@ -172,7 +183,7 @@ fn serves_chain_backed_requests() {
 /// the connection (dcrd bans and disconnects).
 #[test]
 fn an_empty_getdata_disconnects_the_peer() {
-    let (_dir, runtime, connected, mut transport, _genesis_hash) = serve_genesis_chain();
+    let (_dir, runtime, connected, mut transport, _genesis_hash, _addrmgr) = serve_genesis_chain();
 
     transport
         .write_message(&Message::GetData(MsgGetData { inv_list: vec![] }))
@@ -192,4 +203,88 @@ fn an_empty_getdata_disconnects_the_peer() {
     assert!(connected.is_empty(), "the served peer should deregister");
 
     runtime.shutdown();
+}
+
+/// The addr exchange: a getaddr from an inbound peer is answered with
+/// a subset of the address cache, an advertised addr list lands in the
+/// address manager, and an empty addr list drops the connection.
+#[test]
+fn exchanges_addresses_with_a_served_peer() {
+    let (_dir, runtime, _connected, mut transport, _genesis_hash, addr_manager) =
+        serve_genesis_chain();
+
+    // Seed the manager with routable addresses so the cache subset is
+    // non-empty (the 23% cache cap rounds small pools down).
+    let now_nanos = dcroxide_peer::PeerEnv::now_nanos(&mut NodePeerEnv::new());
+    {
+        let mut mgr = addr_manager.lock().expect("addrmgr");
+        let source = wire_na([8, 8, 4, 4], 9108, now_nanos);
+        for i in 1..=20u8 {
+            let na =
+                dcroxide_node::wire_to_addrmgr_net_address(&wire_na([8, 8, 8, i], 9108, now_nanos));
+            mgr.add_addresses(
+                std::slice::from_ref(&na),
+                &dcroxide_node::wire_to_addrmgr_net_address(&source),
+            );
+            // The cache only serves addresses that have succeeded.
+            mgr.good(&na).expect("mark good");
+        }
+    }
+
+    transport
+        .write_message(&Message::GetAddr)
+        .expect("send getaddr");
+    match transport.read_message().expect("read addr") {
+        Message::Addr(addr) => assert!(
+            !addr.addr_list.is_empty(),
+            "the cache subset should contain seeded addresses"
+        ),
+        other => panic!("expected addr, got {other:?}"),
+    }
+
+    // An advertised address is forwarded into the manager.
+    let advertised =
+        dcroxide_node::wire_to_addrmgr_net_address(&wire_na([8, 8, 6, 6], 9108, now_nanos));
+    transport
+        .write_message(&Message::Addr(dcroxide_wire::MsgAddr {
+            addr_list: vec![wire_na([8, 8, 6, 6], 9108, now_nanos)],
+        }))
+        .expect("send addr");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut known = false;
+    while !known && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        known = addr_manager
+            .lock()
+            .expect("addrmgr")
+            .known_address(&advertised.key())
+            .is_some();
+    }
+    assert!(known, "the advertised address should be added");
+
+    // An empty addr list is a bannable offense; the server disconnects.
+    transport
+        .write_message(&Message::Addr(dcroxide_wire::MsgAddr { addr_list: vec![] }))
+        .expect("send empty addr");
+    assert!(
+        transport.read_message().is_err(),
+        "the connection should be dropped"
+    );
+
+    runtime.shutdown();
+}
+
+/// An IPv4 wire net address with the given timestamp.
+fn wire_na(ip: [u8; 4], port: u16, now_nanos: i64) -> dcroxide_wire::NetAddress {
+    let mut ip16 = [0u8; 16];
+    ip16[10] = 0xff;
+    ip16[11] = 0xff;
+    ip16[12..16].copy_from_slice(&ip);
+    dcroxide_wire::NetAddress {
+        timestamp: (now_nanos / 1_000_000_000) as u32,
+        services: ServiceFlag(1),
+        ip: ip16,
+        port,
+    }
 }

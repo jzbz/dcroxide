@@ -25,16 +25,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dcroxide_addrmgr::AddrManager;
 use dcroxide_blockchain::process::Chain;
 use dcroxide_chainhash::Hash;
-use dcroxide_peer::Peer;
+use dcroxide_peer::{Peer, PeerEnv};
 use dcroxide_uint256::Uint256;
 use dcroxide_wire::{InvType, InvVect, Message, MsgHeaders, MsgInv, MsgNotFound};
 
+use crate::peerconn::NodePeerEnv;
 use crate::peerloop::{OutboundQueue, ServeSignal};
 use crate::server::{
-    GetDataResolution, GetHeadersResponse, MAX_BLOCKS_PER_MSG, OnGetDataOutcome,
-    ServeGetDataAction, ServerPeerAddrState, build_get_blocks_response, build_get_headers_response,
+    GetAddrFacts, GetDataResolution, GetHeadersResponse, MAX_BLOCKS_PER_MSG, OnAddrFacts,
+    OnAddrOutcome, OnGetDataOutcome, PushAddrOutcome, ServeGetDataAction, ServerPeerAddrState,
+    build_get_blocks_response, build_get_headers_response, natf_supported, on_addr, on_get_addr,
     on_get_data, serve_get_data,
 };
 
@@ -55,6 +58,11 @@ pub struct ServerContext {
     /// The parsed whitelisted networks (`--whitelist`); peers matching
     /// one are exempt from banning.
     pub whitelists: Vec<crate::config::IpNet>,
+    /// The address manager the addr exchange consults and feeds.
+    pub addr_manager: Arc<Mutex<AddrManager>>,
+    /// Whether the simulation or regression test network is active;
+    /// both suppress the address exchange entirely.
+    pub sim_or_reg_net: bool,
 }
 
 /// The per-connection server state and message dispatch (the message
@@ -68,6 +76,8 @@ pub struct ServerPeerHandler {
     /// response; serving that block triggers a best-tip inventory to
     /// prompt the next batch (dcrd `serverPeer.continueHash`).
     continue_hash: Option<Hash>,
+    /// The clock-and-randomness environment for the handlers.
+    env: NodePeerEnv,
 }
 
 impl ServerPeerHandler {
@@ -77,6 +87,7 @@ impl ServerPeerHandler {
             ctx,
             addr_state: ServerPeerAddrState::new(is_whitelisted),
             continue_hash: None,
+            env: NodePeerEnv::new(),
         }
     }
 
@@ -99,9 +110,14 @@ impl ServerPeerHandler {
                 ServeSignal::Continue
             }
             Message::GetData(get_data) => self.on_get_data(&get_data.inv_list, outbound),
-            // The remaining server handlers (addr exchange, inventory
-            // relay, sync-manager intake, init state, cfilters) arrive
-            // with later pieces.
+            Message::GetAddr => {
+                self.on_get_addr(peer, outbound);
+                ServeSignal::Continue
+            }
+            Message::Addr(addr) => self.on_addr(peer, &addr.addr_list),
+            // The remaining server handlers (inventory relay,
+            // sync-manager intake, init state, cfilters) arrive with
+            // later pieces.
             _ => ServeSignal::Continue,
         }
     }
@@ -258,6 +274,60 @@ impl ServerPeerHandler {
             self.continue_hash = None;
         }
         ServeSignal::Continue
+    }
+}
+
+impl ServerPeerHandler {
+    /// Answer a getaddr request with a randomized subset of the address
+    /// cache, once per connection and only for inbound peers (dcrd
+    /// `serverPeer.OnGetAddr` over `pushAddrMsg`).
+    fn on_get_addr(&mut self, peer: &mut Peer, outbound: &OutboundQueue) {
+        let facts = GetAddrFacts {
+            sim_or_reg_net: self.ctx.sim_or_reg_net,
+            inbound: peer.inbound(),
+        };
+        let addr_cache = {
+            let mut mgr = self
+                .ctx
+                .addr_manager
+                .lock()
+                .expect("addrmgr mutex poisoned");
+            mgr.address_cache(natf_supported(peer.protocol_version()))
+        };
+        if let Some(PushAddrOutcome::Queued(msg)) = on_get_addr(
+            &mut self.addr_state,
+            peer,
+            &mut self.env,
+            &facts,
+            &addr_cache,
+        ) {
+            let _ = outbound.queue_message(*msg);
+        }
+    }
+
+    /// Track and forward advertised addresses to the address manager,
+    /// banning a peer that sends an empty list (dcrd
+    /// `serverPeer.OnAddr`).
+    fn on_addr(&mut self, peer: &mut Peer, addr_list: &[dcroxide_wire::NetAddress]) -> ServeSignal {
+        let facts = OnAddrFacts {
+            sim_or_reg_net: self.ctx.sim_or_reg_net,
+            // The synchronous handler runs on the connection's own
+            // input thread, so the peer is connected by construction.
+            connected: true,
+            peer_na: *peer.na(),
+        };
+        let now_nanos = self.env.now_nanos();
+        let mut mgr = self
+            .ctx
+            .addr_manager
+            .lock()
+            .expect("addrmgr mutex poisoned");
+        match on_addr(&mut self.addr_state, &mut mgr, &facts, addr_list, now_nanos) {
+            // The ban outcome drops the connection; the ban-list
+            // bookkeeping arrives with the peer-state wiring.
+            OnAddrOutcome::BanEmptyList => ServeSignal::Disconnect("sent an empty address list"),
+            OnAddrOutcome::Ignored | OnAddrOutcome::Processed => ServeSignal::Continue,
+        }
     }
 }
 

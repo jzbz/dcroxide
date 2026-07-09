@@ -141,6 +141,8 @@ fn run(cfg: Config) -> ExitCode {
     log_info(&format!(
         "Address manager loaded {known_addrs} known address(es)"
     ));
+    // Share the manager with the served peers' addr exchange.
+    let addr_manager = Arc::new(Mutex::new(addr_manager));
 
     // Bind the peer-to-peer listeners and start serving inbound peers
     // unless listening is disabled (dcrd's server listeners).
@@ -148,7 +150,7 @@ fn run(cfg: Config) -> ExitCode {
         log_info("Listening for peer-to-peer connections is disabled");
         None
     } else {
-        match start_listeners(&cfg, Arc::clone(&chain)) {
+        match start_listeners(&cfg, Arc::clone(&chain), Arc::clone(&addr_manager)) {
             Ok((runtime, connected)) => {
                 let addrs: Vec<String> = runtime
                     .bound_addrs()
@@ -209,6 +211,7 @@ fn run(cfg: Config) -> ExitCode {
 fn start_listeners(
     cfg: &Config,
     chain: Arc<Mutex<Chain>>,
+    addr_manager: Arc<Mutex<AddrManager>>,
 ) -> Result<(ListenerRuntime, ConnectedPeers), String> {
     let params = &cfg.params.params;
     let template = PeerTemplate {
@@ -230,6 +233,8 @@ fn start_listeners(
         disable_banning: cfg.disable_banning,
         ban_threshold: cfg.ban_threshold,
         whitelists: cfg.whitelists.clone(),
+        addr_manager,
+        sim_or_reg_net: cfg.sim_net || cfg.reg_net,
     });
     let connected = ConnectedPeers::new();
     let specs = parse_listeners(&cfg.listeners)?;
