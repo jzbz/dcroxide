@@ -50,6 +50,7 @@ fn serve_genesis_chain() -> (
         whitelists: Vec::new(),
         addr_manager: Arc::clone(&addr_manager),
         sim_or_reg_net: false,
+        stake_validation_height: params.stake_validation_height,
     });
 
     let template = PeerTemplate {
@@ -287,4 +288,76 @@ fn wire_na(ip: [u8; 4], port: u16, now_nanos: i64) -> dcroxide_wire::NetAddress 
         ip: ip16,
         port,
     }
+}
+
+/// The committed-filter and init-state handlers: getcfilterv2 serves
+/// the genesis block's version 2 filter with its inclusion proof,
+/// getcfsv2 serves the one-block batch, and getinitstate answers the
+/// pre-stake-validation chain with the empty message exactly once per
+/// connection.
+#[test]
+fn serves_cfilters_and_init_state() {
+    let (_dir, runtime, _connected, mut transport, genesis_hash, _addrmgr) = serve_genesis_chain();
+
+    // getcfilterv2 for the genesis block.
+    transport
+        .write_message(&Message::GetCFilterV2(dcroxide_wire::MsgGetCFilterV2 {
+            block_hash: genesis_hash,
+        }))
+        .expect("send getcfilterv2");
+    match transport.read_message().expect("read cfilterv2") {
+        Message::CFilterV2(cf) => assert_eq!(cf.block_hash, genesis_hash),
+        other => panic!("expected cfilterv2, got {other:?}"),
+    }
+
+    // getcfsv2 over the single-block genesis range.
+    transport
+        .write_message(&Message::GetCFsV2(dcroxide_wire::MsgGetCFsV2 {
+            start_hash: genesis_hash,
+            end_hash: genesis_hash,
+        }))
+        .expect("send getcfsv2");
+    match transport.read_message().expect("read cfiltersv2") {
+        Message::CFiltersV2(cfs) => {
+            assert_eq!(cfs.cfilters.len(), 1);
+            assert_eq!(cfs.cfilters[0].block_hash, genesis_hash);
+        }
+        other => panic!("expected cfiltersv2, got {other:?}"),
+    }
+
+    // getinitstate before stake validation answers with the empty
+    // message; a repeat on the same connection is ignored, so the
+    // following ping is answered next.
+    transport
+        .write_message(&Message::GetInitState(dcroxide_wire::MsgGetInitState {
+            types: vec![
+                dcroxide_wire::INIT_STATE_HEAD_BLOCKS.to_string(),
+                dcroxide_wire::INIT_STATE_HEAD_BLOCK_VOTES.to_string(),
+                dcroxide_wire::INIT_STATE_TSPENDS.to_string(),
+            ],
+        }))
+        .expect("send getinitstate");
+    match transport.read_message().expect("read initstate") {
+        Message::InitState(init) => {
+            assert!(init.block_hashes.is_empty());
+            assert!(init.vote_hashes.is_empty());
+            assert!(init.tspend_hashes.is_empty());
+        }
+        other => panic!("expected initstate, got {other:?}"),
+    }
+    transport
+        .write_message(&Message::GetInitState(dcroxide_wire::MsgGetInitState {
+            types: vec![dcroxide_wire::INIT_STATE_HEAD_BLOCKS.to_string()],
+        }))
+        .expect("send second getinitstate");
+    transport
+        .write_message(&Message::Ping(dcroxide_wire::MsgPing { nonce: 7 }))
+        .expect("send ping");
+    match transport.read_message().expect("read pong") {
+        Message::Pong(pong) => assert_eq!(pong.nonce, 7, "the repeat getinitstate is ignored"),
+        other => panic!("expected pong, got {other:?}"),
+    }
+
+    drop(transport);
+    runtime.shutdown();
 }

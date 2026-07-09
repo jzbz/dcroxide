@@ -30,15 +30,18 @@ use dcroxide_blockchain::process::Chain;
 use dcroxide_chainhash::Hash;
 use dcroxide_peer::{Peer, PeerEnv};
 use dcroxide_uint256::Uint256;
-use dcroxide_wire::{InvType, InvVect, Message, MsgHeaders, MsgInv, MsgNotFound};
+use dcroxide_wire::{
+    INIT_STATE_HEAD_BLOCK_VOTES, INIT_STATE_HEAD_BLOCKS, INIT_STATE_TSPENDS, InvType, InvVect,
+    Message, MsgCFilterV2, MsgHeaders, MsgInitState, MsgInv, MsgNotFound,
+};
 
 use crate::peerconn::NodePeerEnv;
 use crate::peerloop::{OutboundQueue, ServeSignal};
 use crate::server::{
-    GetAddrFacts, GetDataResolution, GetHeadersResponse, MAX_BLOCKS_PER_MSG, OnAddrFacts,
-    OnAddrOutcome, OnGetDataOutcome, PushAddrOutcome, ServeGetDataAction, ServerPeerAddrState,
-    build_get_blocks_response, build_get_headers_response, natf_supported, on_addr, on_get_addr,
-    on_get_data, serve_get_data,
+    GetAddrFacts, GetDataResolution, GetHeadersResponse, InitStateWants, MAX_BLOCKS_PER_MSG,
+    OnAddrFacts, OnAddrOutcome, OnGetDataOutcome, OnGetInitStateOutcome, PushAddrOutcome,
+    ServeGetDataAction, ServerPeerAddrState, build_get_blocks_response, build_get_headers_response,
+    natf_supported, on_addr, on_get_addr, on_get_data, on_get_init_state, serve_get_data,
 };
 
 /// The daemon-wide state the server handlers consult, shared across
@@ -60,6 +63,9 @@ pub struct ServerContext {
     pub whitelists: Vec<crate::config::IpNet>,
     /// The address manager the addr exchange consults and feeds.
     pub addr_manager: Arc<Mutex<AddrManager>>,
+    /// The network's stake validation height; a best tip below it
+    /// answers getinitstate with an empty message.
+    pub stake_validation_height: i64,
     /// Whether the simulation or regression test network is active;
     /// both suppress the address exchange entirely.
     pub sim_or_reg_net: bool,
@@ -78,6 +84,9 @@ pub struct ServerPeerHandler {
     continue_hash: Option<Hash>,
     /// The clock-and-randomness environment for the handlers.
     env: NodePeerEnv,
+    /// Whether the init state was already sent on this connection
+    /// (dcrd `serverPeer.initStateSent`).
+    init_state_sent: bool,
 }
 
 impl ServerPeerHandler {
@@ -88,6 +97,7 @@ impl ServerPeerHandler {
             addr_state: ServerPeerAddrState::new(is_whitelisted),
             continue_hash: None,
             env: NodePeerEnv::new(),
+            init_state_sent: false,
         }
     }
 
@@ -115,9 +125,20 @@ impl ServerPeerHandler {
                 ServeSignal::Continue
             }
             Message::Addr(addr) => self.on_addr(peer, &addr.addr_list),
-            // The remaining server handlers (inventory relay,
-            // sync-manager intake, init state, cfilters) arrive with
-            // later pieces.
+            Message::GetCFilterV2(get_cf) => {
+                self.on_get_cfilter_v2(get_cf.block_hash, outbound);
+                ServeSignal::Continue
+            }
+            Message::GetCFsV2(get_cfs) => {
+                self.on_get_cfilters_v2(get_cfs.start_hash, get_cfs.end_hash, outbound);
+                ServeSignal::Continue
+            }
+            Message::GetInitState(get_init) => {
+                self.on_get_init_state(&get_init.types, outbound);
+                ServeSignal::Continue
+            }
+            // The remaining server handlers (inventory relay and the
+            // sync-manager intake) arrive with later pieces.
             _ => ServeSignal::Continue,
         }
     }
@@ -328,6 +349,90 @@ impl ServerPeerHandler {
             OnAddrOutcome::BanEmptyList => ServeSignal::Disconnect("sent an empty address list"),
             OnAddrOutcome::Ignored | OnAddrOutcome::Processed => ServeSignal::Continue,
         }
+    }
+}
+
+impl ServerPeerHandler {
+    /// Serve a version 2 committed filter with its inclusion proof,
+    /// silently ignoring requests for unknown blocks or missing
+    /// filters (dcrd `serverPeer.OnGetCFilterV2`).
+    fn on_get_cfilter_v2(&self, block_hash: Hash, outbound: &OutboundQueue) {
+        let fetched = {
+            let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
+            chain.filter_by_block_hash(&block_hash)
+        };
+        let Ok((filter, proof)) = fetched else {
+            return;
+        };
+        let _ = outbound.queue_message(Message::CFilterV2(MsgCFilterV2 {
+            block_hash,
+            data: filter.bytes().to_vec(),
+            proof_index: proof.proof_index,
+            proof_hashes: proof.proof_hashes,
+        }));
+    }
+
+    /// Serve the batched committed filters for an ancestry range,
+    /// silently ignoring invalid ranges (dcrd
+    /// `serverPeer.OnGetCFiltersV2`).
+    fn on_get_cfilters_v2(&self, start_hash: Hash, end_hash: Hash, outbound: &OutboundQueue) {
+        let located = {
+            let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
+            chain.locate_cfilters_v2(&start_hash, &end_hash)
+        };
+        let Ok(filters) = located else {
+            return;
+        };
+        let _ = outbound.queue_message(Message::CFiltersV2(filters));
+    }
+
+    /// Answer a getinitstate request once per connection (dcrd
+    /// `serverPeer.OnGetInitState`).  Before stake validation the
+    /// response is the empty message; past it, the eligible head
+    /// blocks, their votes, and the treasury spends come from the
+    /// mempool and tip generation, which are not yet wired, so the
+    /// filled response is empty until then (the daemon cannot sync
+    /// past stake validation before the sync manager lands).
+    fn on_get_init_state(&mut self, types: &[String], outbound: &OutboundQueue) {
+        let wants = InitStateWants {
+            blocks: types.iter().any(|t| t == INIT_STATE_HEAD_BLOCKS),
+            votes: types.iter().any(|t| t == INIT_STATE_HEAD_BLOCK_VOTES),
+            tspends: types.iter().any(|t| t == INIT_STATE_TSPENDS),
+        };
+        let best_height = {
+            let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
+            chain.best_snapshot().height
+        };
+        let outcome = on_get_init_state(
+            self.init_state_sent,
+            best_height,
+            self.ctx.stake_validation_height,
+            wants,
+            &[],
+            |_| Vec::new(),
+            &[],
+        );
+        if matches!(outcome, OnGetInitStateOutcome::AlreadySent) {
+            return;
+        }
+        // dcrd marks the state sent right after the gate, before any
+        // reply is built, so even a dropped over-limit response counts.
+        self.init_state_sent = true;
+        let msg = match outcome {
+            OnGetInitStateOutcome::AlreadySent => unreachable!("handled above"),
+            OnGetInitStateOutcome::Blank => MsgInitState::default(),
+            OnGetInitStateOutcome::Filled {
+                block_hashes,
+                vote_hashes,
+                tspend_hashes,
+            } => MsgInitState {
+                block_hashes,
+                vote_hashes,
+                tspend_hashes,
+            },
+            OnGetInitStateOutcome::BuildError => return,
+        };
+        let _ = outbound.queue_message(Message::InitState(msg));
     }
 }
 
