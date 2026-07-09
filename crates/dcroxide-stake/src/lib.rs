@@ -827,7 +827,7 @@ pub fn get_ssgen_treasury_votes(pk_script: &[u8]) -> Result<Vec<TreasuryVoteTupl
         if !is_treasury_vote(vote) {
             return Err(stake_rule_error(
                 ErrorKind::SSGenInvalidTreasuryVote,
-                format!("SSGen invalid treasury vote bits {vote:#02x}"),
+                format!("SSGen invalid treasury vote bits {vote:#x}"),
             ));
         }
 
