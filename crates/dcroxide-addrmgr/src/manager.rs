@@ -12,10 +12,9 @@
 // Bounded bookkeeping arithmetic mirrors Go.
 #![allow(clippy::arithmetic_side_effects)]
 
-use core::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use dcroxide_wire::ServiceFlag;
 use serde::{Deserialize, Serialize};
@@ -67,8 +66,10 @@ const DAY_NANOS: i64 = 24 * 60 * MINUTE_NANOS;
 /// writes for never-set attempt/success times.
 const GO_ZERO_TIME_UNIX: i64 = -62_135_596_800;
 
-/// A clock returning the current time as Unix nanoseconds.
-pub type Clock = Rc<dyn Fn() -> i64>;
+/// A clock returning the current time as Unix nanoseconds.  It is
+/// `Send + Sync` so the address manager can be shared across the
+/// daemon's threads.
+pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 /// A source of randomness for the address manager (dcrd uses
 /// `crypto/rand`); injectable so tests are deterministic.
@@ -141,7 +142,7 @@ pub struct KnownAddress {
 }
 
 /// A shared handle to a known address.
-pub type KnownAddressRef = Rc<RefCell<KnownAddress>>;
+pub type KnownAddressRef = Arc<Mutex<KnownAddress>>;
 
 impl KnownAddress {
     /// The underlying network address (dcrd `NetAddress`).
@@ -319,7 +320,7 @@ pub struct AddrManager {
     tried_bucket_size: usize,
 
     now_fn: Clock,
-    rng: Rc<RefCell<dyn AddrRng>>,
+    rng: Arc<Mutex<dyn AddrRng + Send>>,
 }
 
 /// A pseudorandom new bucket index for the provided addresses (dcrd
@@ -414,13 +415,13 @@ impl AddrManager {
     pub fn new(data_dir: &std::path::Path) -> AddrManager {
         AddrManager::new_with_hooks(
             data_dir,
-            Rc::new(|| {
+            Arc::new(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or_default()
             }),
-            Rc::new(RefCell::new(SystemRng::default())),
+            Arc::new(Mutex::new(SystemRng::default())),
         )
     }
 
@@ -430,7 +431,7 @@ impl AddrManager {
     pub fn new_with_hooks(
         data_dir: &std::path::Path,
         now_fn: Clock,
-        rng: Rc<RefCell<dyn AddrRng>>,
+        rng: Arc<Mutex<dyn AddrRng + Send>>,
     ) -> AddrManager {
         let mut am = AddrManager {
             peers_file: data_dir.join(PEERS_FILENAME),
@@ -454,7 +455,10 @@ impl AddrManager {
     /// fresh empty bucket storage (dcrd `reset`).
     fn reset(&mut self) {
         self.addr_index = HashMap::new();
-        self.rng.borrow_mut().read(&mut self.key);
+        self.rng
+            .lock()
+            .expect("addrmgr lock poisoned")
+            .read(&mut self.key);
         self.addr_new = (0..NEW_BUCKET_COUNT).map(|_| HashMap::new()).collect();
         self.addr_tried = (0..TRIED_BUCKET_COUNT).map(|_| Vec::new()).collect();
         self.n_new = 0;
@@ -504,7 +508,7 @@ impl AddrManager {
         let ka = match existing {
             Some(ka) => {
                 {
-                    let mut ka_mut = ka.borrow_mut();
+                    let mut ka_mut = ka.lock().expect("addrmgr lock poisoned");
                     // Update the last seen time and services.  The
                     // stored network addresses are treated as
                     // immutable in dcrd and replaced wholesale.
@@ -530,14 +534,20 @@ impl AddrManager {
                     // The more entries we have, the less likely we are
                     // to add more; likelihood is 2N.
                     let factor = (2 * ka_mut.refs) as usize;
-                    if self.rng.borrow_mut().int_n(factor) != 0 {
+                    if self
+                        .rng
+                        .lock()
+                        .expect("addrmgr lock poisoned")
+                        .int_n(factor)
+                        != 0
+                    {
                         return;
                     }
                 }
                 ka
             }
             None => {
-                let ka = Rc::new(RefCell::new(KnownAddress {
+                let ka = Arc::new(Mutex::new(KnownAddress {
                     na: net_addr.clone(),
                     src_addr: src_addr.clone(),
                     attempts: 0,
@@ -567,7 +577,7 @@ impl AddrManager {
         }
 
         // Add to the new bucket.
-        ka.borrow_mut().refs += 1;
+        ka.lock().expect("addrmgr lock poisoned").refs += 1;
         self.addr_new[bucket].insert(addr_key, ka);
         self.addr_changed = true;
     }
@@ -583,11 +593,11 @@ impl AddrManager {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         for (k, v) in entries {
-            if v.borrow().is_bad(now) {
+            if v.lock().expect("addrmgr lock poisoned").is_bad(now) {
                 self.addr_new[bucket].remove(&k);
                 self.addr_changed = true;
                 let refs = {
-                    let mut v_mut = v.borrow_mut();
+                    let mut v_mut = v.lock().expect("addrmgr lock poisoned");
                     v_mut.refs -= 1;
                     v_mut.refs
                 };
@@ -600,7 +610,9 @@ impl AddrManager {
             oldest = match oldest {
                 None => Some((k, v)),
                 Some((ok, ov)) => {
-                    if v.borrow().na.timestamp <= ov.borrow().na.timestamp {
+                    if v.lock().expect("addrmgr lock poisoned").na.timestamp
+                        <= ov.lock().expect("addrmgr lock poisoned").na.timestamp
+                    {
                         Some((k, v))
                     } else {
                         Some((ok, ov))
@@ -613,7 +625,7 @@ impl AddrManager {
             self.addr_new[bucket].remove(&key);
             self.addr_changed = true;
             let refs = {
-                let mut oldest_mut = oldest.borrow_mut();
+                let mut oldest_mut = oldest.lock().expect("addrmgr lock poisoned");
                 oldest_mut.refs -= 1;
                 oldest_mut.refs
             };
@@ -630,7 +642,7 @@ impl AddrManager {
         let mut idx = 0;
         let mut oldest_ts = 0i64;
         for (i, ka) in self.addr_tried[bucket].iter().enumerate() {
-            let ts = ka.borrow().na.timestamp;
+            let ts = ka.lock().expect("addrmgr lock poisoned").na.timestamp;
             if i == 0 || oldest_ts > ts {
                 oldest_ts = ts;
                 idx = i;
@@ -667,7 +679,7 @@ impl AddrManager {
         let now = (self.now_fn)();
         let mut all_addr: Vec<NetAddress> = Vec::with_capacity(self.addr_index.len());
         for ka in self.addr_index.values() {
-            let ka = ka.borrow();
+            let ka = ka.lock().expect("addrmgr lock poisoned");
             // Skip address types that don't match the filter, low
             // quality addresses, and addresses that never succeeded.
             if !filter(ka.na.addr_type) || ka.is_bad(now) || ka.lastsuccess.is_none() {
@@ -686,7 +698,7 @@ impl AddrManager {
         }
 
         // Fisher-Yates shuffle.
-        let mut rng = self.rng.borrow_mut();
+        let mut rng = self.rng.lock().expect("addrmgr lock poisoned");
         for i in (1..all_addr.len()).rev() {
             let j = rng.int_n(i + 1);
             all_addr.swap(i, j);
@@ -707,7 +719,7 @@ impl AddrManager {
         let now = (self.now_fn)();
         let large = 1usize << 30;
         let mut factor = 1.0f64;
-        let mut rng = self.rng.borrow_mut();
+        let mut rng = self.rng.lock().expect("addrmgr lock poisoned");
         if self.n_tried > 0 && (self.n_new == 0 || rng.int_n(2) == 0) {
             // Tried entry.
             loop {
@@ -720,7 +732,9 @@ impl AddrManager {
                 let ka = &self.addr_tried[bucket][rand_entry];
 
                 let randval = rng.int_n(large);
-                if (randval as f64) < factor * ka.borrow().chance(now) * large as f64 {
+                if (randval as f64)
+                    < factor * ka.lock().expect("addrmgr lock poisoned").chance(now) * large as f64
+                {
                     return Some(ka.clone());
                 }
                 factor *= 1.2;
@@ -742,7 +756,9 @@ impl AddrManager {
                     .expect("nth entry")
                     .clone();
                 let randval = rng.int_n(large);
-                if (randval as f64) < factor * ka.borrow().chance(now) * large as f64 {
+                if (randval as f64)
+                    < factor * ka.lock().expect("addrmgr lock poisoned").chance(now) * large as f64
+                {
                     return Some(ka);
                 }
                 factor *= 1.2;
@@ -770,7 +786,7 @@ impl AddrManager {
             )
         })?;
 
-        let mut ka = ka.borrow_mut();
+        let mut ka = ka.lock().expect("addrmgr lock poisoned");
         ka.attempts += 1;
         ka.lastattempt = Some((self.now_fn)());
         Ok(())
@@ -789,7 +805,7 @@ impl AddrManager {
         // Update the time as long as it has been 20 minutes since
         // last time.
         let now = (self.now_fn)();
-        let mut ka = ka.borrow_mut();
+        let mut ka = ka.lock().expect("addrmgr lock poisoned");
         if now > ka.na.timestamp + 20 * MINUTE_NANOS {
             let mut na_copy = ka.na.clone();
             na_copy.timestamp = now;
@@ -810,7 +826,7 @@ impl AddrManager {
 
         let now = (self.now_fn)();
         {
-            let mut ka_mut = ka.borrow_mut();
+            let mut ka_mut = ka.lock().expect("addrmgr lock poisoned");
             // The timestamp is not updated here to avoid leaking
             // information about currently connected peers.
             ka_mut.lastsuccess = Some(now);
@@ -825,12 +841,12 @@ impl AddrManager {
 
         // Remove from all new buckets, remembering the first bucket
         // it was found in.
-        let addr_key = ka.borrow().na.key();
+        let addr_key = ka.lock().expect("addrmgr lock poisoned").na.key();
         let mut addr_new_available_index: Option<usize> = None;
         for i in 0..self.addr_new.len() {
             if self.addr_new[i].remove(&addr_key).is_some() {
                 self.addr_changed = true;
-                ka.borrow_mut().refs -= 1;
+                ka.lock().expect("addrmgr lock poisoned").refs -= 1;
                 if addr_new_available_index.is_none() {
                     addr_new_available_index = Some(i);
                 }
@@ -845,12 +861,12 @@ impl AddrManager {
             ));
         };
 
-        let bucket = get_tried_bucket(&self.key, &ka.borrow().na);
+        let bucket = get_tried_bucket(&self.key, &ka.lock().expect("addrmgr lock poisoned").na);
 
         // If this tried bucket has capacity, add the address and flag
         // it as tried.
         if self.addr_tried[bucket].len() < self.tried_bucket_size {
-            ka.borrow_mut().tried = true;
+            ka.lock().expect("addrmgr lock poisoned").tried = true;
             self.addr_tried[bucket].push(ka);
             self.addr_changed = true;
             self.n_tried += 1;
@@ -864,7 +880,7 @@ impl AddrManager {
 
         // First new bucket it would have been put in.
         let mut new_bucket = {
-            let rmka_ref = rmka.borrow();
+            let rmka_ref = rmka.lock().expect("addrmgr lock poisoned");
             get_new_bucket(&self.key, &rmka_ref.na, &rmka_ref.src_addr)
         };
 
@@ -875,11 +891,11 @@ impl AddrManager {
         }
 
         // Replace the oldest tried address in the bucket with ka.
-        ka.borrow_mut().tried = true;
+        ka.lock().expect("addrmgr lock poisoned").tried = true;
         self.addr_tried[bucket][oldest_tried_index] = ka;
 
         {
-            let mut rmka_mut = rmka.borrow_mut();
+            let mut rmka_mut = rmka.lock().expect("addrmgr lock poisoned");
             rmka_mut.tried = false;
             rmka_mut.refs += 1;
         }
@@ -888,7 +904,7 @@ impl AddrManager {
         // decremented above and an address is moving back to new.
         self.n_new += 1;
 
-        let rmkey = rmka.borrow().na.key();
+        let rmkey = rmka.lock().expect("addrmgr lock poisoned").na.key();
         self.addr_new[new_bucket].insert(rmkey, rmka);
         Ok(())
     }
@@ -906,7 +922,7 @@ impl AddrManager {
             )
         })?;
 
-        let mut ka = ka.borrow_mut();
+        let mut ka = ka.lock().expect("addrmgr lock poisoned");
         if ka.na.services != services {
             let mut na_copy = ka.na.clone();
             na_copy.services = services;
@@ -1078,7 +1094,7 @@ impl AddrManager {
             tried_buckets: Vec::with_capacity(TRIED_BUCKET_COUNT),
         };
         for (k, v) in &self.addr_index {
-            let v = v.borrow();
+            let v = v.lock().expect("addrmgr lock poisoned");
             sam.addresses.push(SerializedKnownAddress {
                 addr: k.clone(),
                 src: v.src_addr.key(),
@@ -1092,8 +1108,12 @@ impl AddrManager {
             sam.new_buckets.push(bucket.keys().cloned().collect());
         }
         for bucket in &self.addr_tried {
-            sam.tried_buckets
-                .push(bucket.iter().map(|ka| ka.borrow().na.key()).collect());
+            sam.tried_buckets.push(
+                bucket
+                    .iter()
+                    .map(|ka| ka.lock().expect("addrmgr lock poisoned").na.key())
+                    .collect(),
+            );
         }
 
         // Write a temporary peers file and then move it into place.
@@ -1157,7 +1177,7 @@ impl AddrManager {
                     Some(secs * NANOS_PER_SEC)
                 }
             };
-            let ka = Rc::new(RefCell::new(KnownAddress {
+            let ka = Arc::new(Mutex::new(KnownAddress {
                 na: net_addr,
                 src_addr,
                 attempts: v.attempts,
@@ -1166,7 +1186,7 @@ impl AddrManager {
                 tried: false,
                 refs: 0,
             }));
-            let key = ka.borrow().na.key();
+            let key = ka.lock().expect("addrmgr lock poisoned").na.key();
             self.addr_index.insert(key, ka);
         }
 
@@ -1178,7 +1198,7 @@ impl AddrManager {
                     ));
                 };
                 let refs = {
-                    let mut ka_mut = ka.borrow_mut();
+                    let mut ka_mut = ka.lock().expect("addrmgr lock poisoned");
                     let prev = ka_mut.refs;
                     ka_mut.refs += 1;
                     prev
@@ -1201,7 +1221,7 @@ impl AddrManager {
                         "tried buckets contains {val} but none in address list"
                     ));
                 };
-                ka.borrow_mut().tried = true;
+                ka.lock().expect("addrmgr lock poisoned").tried = true;
                 self.n_tried += 1;
                 self.addr_tried[i].push(ka);
             }
@@ -1209,7 +1229,7 @@ impl AddrManager {
 
         // Sanity checking.
         for (k, v) in &self.addr_index {
-            let v = v.borrow();
+            let v = v.lock().expect("addrmgr lock poisoned");
             if v.refs == 0 && !v.tried {
                 return Err(format!(
                     "address {k} after serialisation with no references"
@@ -1238,7 +1258,7 @@ impl AddrManager {
     ) {
         let mut addrs = Vec::new();
         for (k, v) in &self.addr_index {
-            let v = v.borrow();
+            let v = v.lock().expect("addrmgr lock poisoned");
             let mut new_buckets: Vec<usize> = self
                 .addr_new
                 .iter()
@@ -1254,7 +1274,7 @@ impl AddrManager {
                 .find(|(_, bucket)| {
                     bucket
                         .iter()
-                        .any(|ka| Rc::ptr_eq(ka, self.addr_index.get(k).expect("indexed")))
+                        .any(|ka| Arc::ptr_eq(ka, self.addr_index.get(k).expect("indexed")))
                 })
                 .map(|(i, _)| i);
             addrs.push((

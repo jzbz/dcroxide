@@ -14,8 +14,8 @@
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
 
-use core::cell::RefCell;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use dcroxide_addrmgr::{
     AddrManager, AddrRng, AddressPriority, NetAddress, NetAddressType, encode_host,
@@ -95,13 +95,13 @@ fn addrmgr_vectors() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let mut now_unix = 0i64;
-    let clock_cell = Rc::new(core::cell::Cell::new(0i64));
+    let clock_cell = Arc::new(AtomicI64::new(0));
     let clock: dcroxide_addrmgr::Clock = {
         let cell = clock_cell.clone();
-        Rc::new(move || cell.get())
+        Arc::new(move || cell.load(Ordering::Relaxed))
     };
     let mut am =
-        AddrManager::new_with_hooks(dir.path(), clock.clone(), Rc::new(RefCell::new(StubRng)));
+        AddrManager::new_with_hooks(dir.path(), clock.clone(), Arc::new(Mutex::new(StubRng)));
     let mut counts = [0usize; 7];
 
     macro_rules! check_state {
@@ -148,11 +148,11 @@ fn addrmgr_vectors() {
             }
             "scenario" => {
                 now_unix = f[3].parse().expect("now");
-                clock_cell.set(now_unix * NANOS_PER_SEC);
+                clock_cell.store(now_unix * NANOS_PER_SEC, Ordering::Relaxed);
                 am = AddrManager::new_with_hooks(
                     dir.path(),
                     clock.clone(),
-                    Rc::new(RefCell::new(StubRng)),
+                    Arc::new(Mutex::new(StubRng)),
                 );
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&unhex(f[1]));
@@ -225,7 +225,7 @@ fn addrmgr_vectors() {
                 let mut reloaded = AddrManager::new_with_hooks(
                     dir.path(),
                     clock.clone(),
-                    Rc::new(RefCell::new(StubRng)),
+                    Arc::new(Mutex::new(StubRng)),
                 );
                 reloaded
                     .deserialize_peers(&contents)
@@ -240,7 +240,7 @@ fn addrmgr_vectors() {
                 let mut round = AddrManager::new_with_hooks(
                     dir.path(),
                     clock.clone(),
-                    Rc::new(RefCell::new(StubRng)),
+                    Arc::new(Mutex::new(StubRng)),
                 );
                 round.deserialize_peers(&saved).expect("round trip");
                 assert_eq!(
@@ -266,7 +266,7 @@ fn addrmgr_vectors() {
                 let mut amc = AddrManager::new_with_hooks(
                     dir.path(),
                     clock.clone(),
-                    Rc::new(RefCell::new(StubRng)),
+                    Arc::new(Mutex::new(StubRng)),
                 );
                 amc.set_key(key);
                 let na = dump_na("1.2.3.4", 9108, now_unix);
@@ -291,8 +291,8 @@ fn addrmgr_vectors() {
                 amc.deserialize_peers(&blob.to_string())
                     .expect("crafted state");
                 let ka = amc.known_address("1.2.3.4:9108").expect("crafted address");
-                let ka = ka.borrow();
-                let now = clock_cell.get();
+                let ka = ka.lock().expect("addr lock poisoned");
+                let now = clock_cell.load(Ordering::Relaxed);
                 assert_eq!(ka.chance(now).to_bits(), want_chance, "{name}: chance bits");
                 assert_eq!(ka.is_bad(now), want_bad, "{name}: isBad");
                 counts[6] += 1;
@@ -303,7 +303,7 @@ fn addrmgr_vectors() {
                 let mut amc = AddrManager::new_with_hooks(
                     dir.path(),
                     clock.clone(),
-                    Rc::new(RefCell::new(StubRng)),
+                    Arc::new(Mutex::new(StubRng)),
                 );
                 assert_eq!(
                     amc.deserialize_peers(&contents).is_err(),
@@ -314,11 +314,11 @@ fn addrmgr_vectors() {
             }
             "localscenario" => {
                 now_unix = f[1].parse().expect("now");
-                clock_cell.set(now_unix * NANOS_PER_SEC);
+                clock_cell.store(now_unix * NANOS_PER_SEC, Ordering::Relaxed);
                 am = AddrManager::new_with_hooks(
                     dir.path(),
                     clock.clone(),
-                    Rc::new(RefCell::new(StubRng)),
+                    Arc::new(Mutex::new(StubRng)),
                 );
             }
             "localadd" => {
@@ -399,8 +399,8 @@ impl AddrRng for SeqRng {
 #[test]
 fn randomized_paths() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let clock: dcroxide_addrmgr::Clock = Rc::new(|| 1_700_000_000 * NANOS_PER_SEC);
-    let rng = Rc::new(RefCell::new(SeqRng {
+    let clock: dcroxide_addrmgr::Clock = Arc::new(|| 1_700_000_000 * NANOS_PER_SEC);
+    let rng = Arc::new(Mutex::new(SeqRng {
         values: Vec::new(),
         pos: 0,
     }));
@@ -414,16 +414,16 @@ fn randomized_paths() {
     // Re-adding the same address consults the 2N likelihood; a
     // nonzero draw skips the additional bucket placement.
     let src2 = dump_na("64.1.2.3", 9108, 1_700_000_000);
-    rng.borrow_mut().values = vec![1];
-    rng.borrow_mut().pos = 0;
+    rng.lock().expect("addr lock poisoned").values = vec![1];
+    rng.lock().expect("addr lock poisoned").pos = 0;
     am.add_addresses(std::slice::from_ref(&na), &src2);
     let (addrs, _, _, _) = am.state_snapshot();
     assert_eq!(addrs[0].4, 1, "nonzero draw keeps a single reference");
 
     // A zero draw adds the address to the second source group's
     // bucket.
-    rng.borrow_mut().values = vec![0];
-    rng.borrow_mut().pos = 0;
+    rng.lock().expect("addr lock poisoned").values = vec![0];
+    rng.lock().expect("addr lock poisoned").pos = 0;
     am.add_addresses(std::slice::from_ref(&na), &src2);
     let (addrs, _, _, _) = am.state_snapshot();
     assert_eq!(addrs[0].4, 2, "zero draw adds a second reference");
@@ -433,8 +433,23 @@ fn randomized_paths() {
     // chance 0.01, so script a low accept draw after locating the
     // populated bucket.
     let bucket = am.new_bucket_index(&na, &src);
-    rng.borrow_mut().values = vec![bucket, 0, 0];
-    rng.borrow_mut().pos = 0;
+    rng.lock().expect("addr lock poisoned").values = vec![bucket, 0, 0];
+    rng.lock().expect("addr lock poisoned").pos = 0;
     let picked = am.get_address().expect("selected address");
-    assert_eq!(picked.borrow().net_address().key(), "1.2.3.4:9108");
+    assert_eq!(
+        picked
+            .lock()
+            .expect("addr lock poisoned")
+            .net_address()
+            .key(),
+        "1.2.3.4:9108"
+    );
+}
+
+/// The address manager must be `Send` so the daemon can hold it in its
+/// shared server state across the peer threads.  Compile-time only.
+#[test]
+fn addr_manager_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<AddrManager>();
 }
