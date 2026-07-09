@@ -681,6 +681,22 @@ struct Scanner<'a> {
 
 const UNEXPECTED_END: &str = "unexpected end of JSON input";
 
+/// The maximum number of nested arrays or objects Go's scanner accepts
+/// before failing (`encoding/json` `maxNestingDepth`).  The 10001st open
+/// bracket errors, matching `checkValid`, so a deeply nested document is
+/// rejected instead of overflowing the stack.
+const MAX_NESTING_DEPTH: usize = 10000;
+
+/// An open container on the validator's explicit walk stack.  The
+/// scanner tracks nesting iteratively — like Go's `scanner` parseState —
+/// so a deeply nested document is caught by the depth guard instead of
+/// exhausting the native stack.
+#[derive(Clone, Copy)]
+enum Container {
+    Array,
+    Object,
+}
+
 impl<'a> Scanner<'a> {
     fn new(data: &'a [u8]) -> Scanner<'a> {
         Scanner { data, pos: 0 }
@@ -704,23 +720,145 @@ impl<'a> Scanner<'a> {
 
     /// Validate one JSON value starting at the current position,
     /// producing Go scanner messages on malformed input.
+    ///
+    /// Container nesting is walked with an explicit stack rather than by
+    /// recursing into `check_array`/`check_object`, so a deeply nested
+    /// document is rejected by the depth guard (Go's `maxNestingDepth`)
+    /// instead of exhausting the native stack — Go's scanner tracks the
+    /// same nesting in an explicit `parseState` slice.
     fn check_value(&mut self) -> Result<(), JsonError> {
+        let mut stack: Vec<Container> = Vec::new();
+
+        'read_value: loop {
+            self.skip_ws();
+            let Some(c) = self.peek() else {
+                return Err(Self::syntax(UNEXPECTED_END.to_string()));
+            };
+            match c {
+                b'[' => {
+                    self.pos += 1;
+                    self.enter(stack.len(), b'[')?;
+                    self.skip_ws();
+                    if self.peek() == Some(b']') {
+                        self.pos += 1; // an empty array is a complete value
+                    } else {
+                        stack.push(Container::Array);
+                        continue 'read_value; // read the first element
+                    }
+                }
+                b'{' => {
+                    self.pos += 1;
+                    self.enter(stack.len(), b'{')?;
+                    self.skip_ws();
+                    if self.peek() == Some(b'}') {
+                        self.pos += 1; // an empty object is a complete value
+                    } else {
+                        self.check_object_key()?;
+                        stack.push(Container::Object);
+                        continue 'read_value; // read the member value
+                    }
+                }
+                b'"' => self.check_string()?,
+                b't' => self.check_literal("true")?,
+                b'f' => self.check_literal("false")?,
+                b'n' => self.check_literal("null")?,
+                b'-' | b'0'..=b'9' => self.check_number()?,
+                c => {
+                    return Err(Self::syntax(format!(
+                        "invalid character {} looking for beginning of value",
+                        quote_char(c)
+                    )));
+                }
+            }
+
+            // A complete value has just been scanned.  Ascend through the
+            // open containers, consuming element/member separators, until
+            // another value is due or the top-level value is finished.
+            loop {
+                let Some(container) = stack.last().copied() else {
+                    return Ok(());
+                };
+                self.skip_ws();
+                match container {
+                    Container::Array => match self.peek() {
+                        Some(b',') => {
+                            self.pos += 1;
+                            continue 'read_value;
+                        }
+                        Some(b']') => {
+                            self.pos += 1;
+                            stack.pop();
+                        }
+                        Some(c) => {
+                            return Err(Self::syntax(format!(
+                                "invalid character {} after array element",
+                                quote_char(c)
+                            )));
+                        }
+                        None => return Err(Self::syntax(UNEXPECTED_END.to_string())),
+                    },
+                    Container::Object => match self.peek() {
+                        Some(b',') => {
+                            self.pos += 1;
+                            self.check_object_key()?;
+                            continue 'read_value;
+                        }
+                        Some(b'}') => {
+                            self.pos += 1;
+                            stack.pop();
+                        }
+                        Some(c) => {
+                            return Err(Self::syntax(format!(
+                                "invalid character {} after object key:value pair",
+                                quote_char(c)
+                            )));
+                        }
+                        None => return Err(Self::syntax(UNEXPECTED_END.to_string())),
+                    },
+                }
+            }
+        }
+    }
+
+    /// Fail with Go's scanner message once the number of open containers
+    /// would exceed `MAX_NESTING_DEPTH`.  `open_containers` is the count
+    /// already on the stack, so the new `[` or `{` is the (n+1)th level.
+    fn enter(&self, open_containers: usize, open: u8) -> Result<(), JsonError> {
+        if open_containers >= MAX_NESTING_DEPTH {
+            return Err(Self::syntax(format!(
+                "invalid character {} exceeded max depth",
+                quote_char(open)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Scan an object key string and its trailing colon at the current
+    /// position, producing the Go scanner messages for a missing key or
+    /// colon.
+    fn check_object_key(&mut self) -> Result<(), JsonError> {
         self.skip_ws();
-        let Some(c) = self.peek() else {
-            return Err(Self::syntax(UNEXPECTED_END.to_string()));
-        };
-        match c {
-            b'{' => self.check_object(),
-            b'[' => self.check_array(),
-            b'"' => self.check_string(),
-            b't' => self.check_literal("true"),
-            b'f' => self.check_literal("false"),
-            b'n' => self.check_literal("null"),
-            b'-' | b'0'..=b'9' => self.check_number(),
-            c => Err(Self::syntax(format!(
-                "invalid character {} looking for beginning of value",
+        match self.peek() {
+            Some(b'"') => self.check_string()?,
+            Some(c) => {
+                return Err(Self::syntax(format!(
+                    "invalid character {} looking for beginning of object key string",
+                    quote_char(c)
+                )));
+            }
+            None => return Err(Self::syntax(UNEXPECTED_END.to_string())),
+        }
+        self.skip_ws();
+        match self.peek() {
+            Some(b':') => {
+                self.pos += 1;
+                Ok(())
+            }
+            Some(c) => Err(Self::syntax(format!(
+                "invalid character {} after object key",
                 quote_char(c)
             ))),
+            None => Err(Self::syntax(UNEXPECTED_END.to_string())),
         }
     }
 
@@ -853,88 +991,6 @@ impl<'a> Scanner<'a> {
             }
         }
         Ok(())
-    }
-
-    fn check_array(&mut self) -> Result<(), JsonError> {
-        self.pos += 1; // '['
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(());
-        }
-        loop {
-            self.check_value()?;
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(());
-                }
-                Some(c) => {
-                    return Err(Self::syntax(format!(
-                        "invalid character {} after array element",
-                        quote_char(c)
-                    )));
-                }
-                None => return Err(Self::syntax(UNEXPECTED_END.to_string())),
-            }
-        }
-    }
-
-    fn check_object(&mut self) -> Result<(), JsonError> {
-        self.pos += 1; // '{'
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(());
-        }
-        loop {
-            self.skip_ws();
-            match self.peek() {
-                Some(b'"') => self.check_string()?,
-                Some(c) => {
-                    return Err(Self::syntax(format!(
-                        "invalid character {} looking for beginning of object key string",
-                        quote_char(c)
-                    )));
-                }
-                None => return Err(Self::syntax(UNEXPECTED_END.to_string())),
-            }
-            self.skip_ws();
-            match self.peek() {
-                Some(b':') => {
-                    self.pos += 1;
-                }
-                Some(c) => {
-                    return Err(Self::syntax(format!(
-                        "invalid character {} after object key",
-                        quote_char(c)
-                    )));
-                }
-                None => return Err(Self::syntax(UNEXPECTED_END.to_string())),
-            }
-            self.check_value()?;
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(());
-                }
-                Some(c) => {
-                    return Err(Self::syntax(format!(
-                        "invalid character {} after object key:value pair",
-                        quote_char(c)
-                    )));
-                }
-                None => return Err(Self::syntax(UNEXPECTED_END.to_string())),
-            }
-        }
     }
 }
 
@@ -1077,47 +1133,75 @@ impl<'a> Reader<'a> {
     }
 
     /// Skip one complete value (used when the target ignores it).
+    ///
+    /// Nesting is walked with an explicit stack rather than by recursing,
+    /// so skipping a deeply nested but ignored value does not exhaust the
+    /// native stack.  The input is already validated, so its depth is
+    /// bounded by `MAX_NESTING_DEPTH`.
     fn skip_value(&mut self) {
-        match self.next_token() {
-            Token::ArrayStart => {
-                self.skip_ws();
-                if self.peek() == Some(b']') {
-                    self.pos += 1;
-                    return;
-                }
-                loop {
-                    self.skip_value();
+        let mut stack: Vec<Container> = Vec::new();
+
+        'read_value: loop {
+            match self.next_token() {
+                Token::ArrayStart => {
                     self.skip_ws();
-                    if self.peek() == Some(b',') {
-                        self.pos += 1;
+                    if self.peek() == Some(b']') {
+                        self.pos += 1; // an empty array is a complete value
                     } else {
+                        stack.push(Container::Array);
+                        continue 'read_value; // skip the first element
+                    }
+                }
+                Token::ObjectStart => {
+                    self.skip_ws();
+                    if self.peek() == Some(b'}') {
+                        self.pos += 1; // an empty object is a complete value
+                    } else {
+                        self.skip_object_key();
+                        stack.push(Container::Object);
+                        continue 'read_value; // skip the member value
+                    }
+                }
+                _ => {} // a scalar was consumed by next_token
+            }
+
+            // The value is complete.  Ascend through the open containers,
+            // consuming separators, until another value is due or the
+            // top-level value is finished.
+            loop {
+                let Some(container) = stack.last().copied() else {
+                    return;
+                };
+                self.skip_ws();
+                match container {
+                    Container::Array => {
+                        if self.peek() == Some(b',') {
+                            self.pos += 1;
+                            continue 'read_value;
+                        }
                         self.pos += 1; // ']'
-                        return;
+                        stack.pop();
                     }
-                }
-            }
-            Token::ObjectStart => {
-                self.skip_ws();
-                if self.peek() == Some(b'}') {
-                    self.pos += 1;
-                    return;
-                }
-                loop {
-                    self.next_token(); // key
-                    self.skip_ws();
-                    self.pos += 1; // ':'
-                    self.skip_value();
-                    self.skip_ws();
-                    if self.peek() == Some(b',') {
-                        self.pos += 1;
-                    } else {
+                    Container::Object => {
+                        if self.peek() == Some(b',') {
+                            self.pos += 1;
+                            self.skip_object_key();
+                            continue 'read_value;
+                        }
                         self.pos += 1; // '}'
-                        return;
+                        stack.pop();
                     }
                 }
             }
-            _ => {}
         }
+    }
+
+    /// Skip an object key string and its trailing colon (input known
+    /// valid).
+    fn skip_object_key(&mut self) {
+        self.next_token(); // key
+        self.skip_ws();
+        self.pos += 1; // ':'
     }
 }
 

@@ -120,13 +120,11 @@ pub(crate) fn split_host_port(hostport: &str) -> Result<(String, String), String
         let host = &stripped[..end];
         let rest = &stripped[end.saturating_add(1)..];
         let Some(port) = rest.strip_prefix(':') else {
-            if rest.is_empty() {
-                return Err(missing_port());
-            }
-            return Err(format!(
-                "address {hostport}: unexpected '{}' after address",
-                &rest[..1]
-            ));
+            // Go's net.SplitHostPort reports a missing port whether the
+            // ']' ends the string or is followed by a non-colon byte; it
+            // never indexes the trailing character, so a multibyte one
+            // must not be byte-sliced.
+            return Err(missing_port());
         };
         if port.contains(':') {
             return Err(too_many_colons());
@@ -145,4 +143,31 @@ pub(crate) fn split_host_port(hostport: &str) -> Result<(String, String), String
         return Err(format!("address {hostport}: unexpected '[' in address"));
     }
     Ok((host.to_string(), port.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `split_host_port` matches Go's `net.SplitHostPort`, reporting a
+    /// missing port (never panicking) when a bracketed host is followed
+    /// by a trailing character — including a multibyte one.
+    #[test]
+    fn split_host_port_matches_go() {
+        assert_eq!(
+            split_host_port("[::1]:80").unwrap(),
+            ("::1".to_string(), "80".to_string())
+        );
+        for missing in ["[::1]", "[::1]x", "[::1]\u{20ac}"] {
+            assert_eq!(
+                split_host_port(missing).unwrap_err(),
+                format!("address {missing}: missing port in address"),
+                "{missing}"
+            );
+        }
+        assert_eq!(
+            split_host_port("[::1]::80").unwrap_err(),
+            "address [::1]::80: too many colons in address"
+        );
+    }
 }
