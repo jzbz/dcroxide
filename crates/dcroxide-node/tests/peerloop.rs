@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use dcroxide_node::peerconn::{NodePeerEnv, net_address_from_socket};
 use dcroxide_node::peerloop::{
-    OutboundQueue, run_peer_connection, run_peer_input, run_peer_output, run_ping_timer,
-    send_verack,
+    OutboundQueue, ServeSignal, run_peer_connection, run_peer_input, run_peer_output,
+    run_ping_timer, send_verack,
 };
 use dcroxide_node::transport::WireTransport;
 use dcroxide_peer::{Config, MAX_PROTOCOL_VERSION, MsgTransport, Peer, PeerEnv, PeerGlobals};
@@ -70,8 +70,9 @@ fn inbound_peer_answers_verack_and_ping_through_the_output_queue() {
             &mut read_transport,
             &mut env,
             &queue,
-            |_peer, msg| {
+            |_peer, msg, _outbound| {
                 forwarded.push(msg.clone());
+                ServeSignal::Continue
             },
         );
 
@@ -245,7 +246,10 @@ fn run_peer_connection_negotiates_and_serves_until_the_remote_closes() {
             NET,
             Duration::from_secs(3600),
             Duration::from_secs(3600),
-            move |_peer, msg| sink.lock().expect("sink").push(msg.clone()),
+            move |_peer, msg, _outbound| {
+                sink.lock().expect("sink").push(msg.clone());
+                ServeSignal::Continue
+            },
         );
         let forwarded = forwarded.lock().expect("forwarded").clone();
         (forwarded, format!("{reason:?}"))
@@ -319,7 +323,10 @@ fn run_peer_connection_frames_at_the_negotiated_version_not_the_sentinel() {
             NET,
             Duration::from_secs(3600),
             Duration::from_secs(3600),
-            move |_peer, msg| sink.lock().expect("sink").push(msg.clone()),
+            move |_peer, msg, _outbound| {
+                sink.lock().expect("sink").push(msg.clone());
+                ServeSignal::Continue
+            },
         );
         forwarded.lock().expect("forwarded").clone()
     });

@@ -17,13 +17,14 @@
 
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dcroxide_addrmgr::{AddrManager, NetAddressType};
 use dcroxide_blockchain::process::Chain;
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{Database, ErrorKind, Options};
+use dcroxide_node::dispatch::ServerContext;
 use dcroxide_node::runtime::{ConnectedPeers, ListenerRuntime, PeerTemplate, inbound_peer_handler};
 use dcroxide_node::{
     Config, ConfigEnv, ERR_HELP_REQUESTED, ERR_SHOW_SUBSYSTEMS, ERR_VERSION_REQUESTED,
@@ -128,6 +129,9 @@ fn run(cfg: Config) -> ExitCode {
         "Block database loaded with best block height {} hash {}",
         best.height, best.hash
     ));
+    // Share the chain with the served peers' message handlers (dcrd's
+    // server holding the chain the serverPeer callbacks consult).
+    let chain = Arc::new(Mutex::new(chain));
 
     // Create the address manager and load any persisted peers (dcrd
     // `newServer`'s `addrmgr.New(cfg.DataDir)`).
@@ -144,7 +148,7 @@ fn run(cfg: Config) -> ExitCode {
         log_info("Listening for peer-to-peer connections is disabled");
         None
     } else {
-        match start_listeners(&cfg) {
+        match start_listeners(&cfg, Arc::clone(&chain)) {
             Ok((runtime, connected)) => {
                 let addrs: Vec<String> = runtime
                     .bound_addrs()
@@ -202,7 +206,10 @@ fn run(cfg: Config) -> ExitCode {
 /// Bind the configured peer-to-peer listeners and start serving inbound
 /// peers (dcrd `newServer`'s listener setup plus `inboundPeerConnected`).
 /// Returns the listener runtime and the registry of the peers it serves.
-fn start_listeners(cfg: &Config) -> Result<(ListenerRuntime, ConnectedPeers), String> {
+fn start_listeners(
+    cfg: &Config,
+    chain: Arc<Mutex<Chain>>,
+) -> Result<(ListenerRuntime, ConnectedPeers), String> {
     let params = &cfg.params.params;
     let template = PeerTemplate {
         net: params.net,
@@ -215,10 +222,22 @@ fn start_listeners(cfg: &Config) -> Result<(ListenerRuntime, ConnectedPeers), St
         idle_timeout: Duration::from_nanos(DEFAULT_IDLE_TIMEOUT as u64),
         ping_interval: Duration::from_nanos(PING_INTERVAL as u64),
     };
+    // The daemon-wide state the served peers' message handlers consult
+    // (dcrd `newServer` deriving `minKnownWork` from the params).
+    let server = Arc::new(ServerContext {
+        chain,
+        min_known_work: params.min_known_chain_work,
+        disable_banning: cfg.disable_banning,
+        ban_threshold: cfg.ban_threshold,
+        whitelists: cfg.whitelists.clone(),
+    });
     let connected = ConnectedPeers::new();
     let specs = parse_listeners(&cfg.listeners)?;
-    let runtime = ListenerRuntime::start(&specs, inbound_peer_handler(template, connected.clone()))
-        .map_err(|e| e.to_string())?;
+    let runtime = ListenerRuntime::start(
+        &specs,
+        inbound_peer_handler(template, connected.clone(), Some(server)),
+    )
+    .map_err(|e| e.to_string())?;
     Ok((runtime, connected))
 }
 

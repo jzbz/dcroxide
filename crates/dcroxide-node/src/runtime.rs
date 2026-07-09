@@ -22,8 +22,10 @@ use std::time::Duration;
 use dcroxide_peer::{Config, Peer, PeerEnv};
 use dcroxide_wire::{CurrencyNet, ServiceFlag};
 
+use crate::dispatch::{ServerContext, ServerPeerHandler};
 use crate::peerconn::{NodePeerEnv, net_address_from_socket};
-use crate::peerloop::run_peer_connection;
+use crate::peerloop::{ServeSignal, run_peer_connection};
+use crate::server::is_whitelisted;
 
 /// The interval the accept loops wait between polling for shutdown when
 /// no connection is pending.
@@ -154,14 +156,20 @@ impl PeerTemplate {
 /// negotiated peer (dcrd `server.inboundPeerConnected`).  Each
 /// connection is handled on its own thread: a fresh inbound peer is
 /// built from `template`, associated with the remote address, and run
-/// through the full connection runtime.  The server-handler dispatch is
-/// a no-op for now; the peer-state bookkeeping and message forwarding
-/// arrive with the peer-handler piece.
-pub fn inbound_peer_handler(template: PeerTemplate, connected: ConnectedPeers) -> InboundHandler {
+/// through the full connection runtime.  With a [`ServerContext`] the
+/// chain-backed server handlers answer the peer's requests; without one
+/// (tests exercising just the protocol plumbing) the dispatch is a
+/// no-op.
+pub fn inbound_peer_handler(
+    template: PeerTemplate,
+    connected: ConnectedPeers,
+    server: Option<Arc<ServerContext>>,
+) -> InboundHandler {
     Arc::new(move |stream: TcpStream, addr: SocketAddr| {
         let template = template.clone();
         let connected = connected.clone();
-        thread::spawn(move || serve_inbound_peer(stream, addr, &template, &connected));
+        let server = server.clone();
+        thread::spawn(move || serve_inbound_peer(stream, addr, &template, &connected, server));
     })
 }
 
@@ -172,6 +180,7 @@ fn serve_inbound_peer(
     addr: SocketAddr,
     template: &PeerTemplate,
     connected: &ConnectedPeers,
+    server: Option<Arc<ServerContext>>,
 ) {
     let mut peer = Peer::new_inbound(template.config());
     let na = match net_address_from_socket(addr, template.services) {
@@ -190,6 +199,13 @@ fn serve_inbound_peer(
         id: connected.register(h),
     });
 
+    // The per-peer server state and dispatch (dcrd `newServerPeer` and
+    // the message listeners it registers).
+    let mut handler = server.map(|ctx| {
+        let whitelisted = is_whitelisted(&ctx.whitelists, &addr.to_string());
+        ServerPeerHandler::new(ctx, whitelisted)
+    });
+
     let _ = run_peer_connection(
         stream,
         peer,
@@ -197,9 +213,10 @@ fn serve_inbound_peer(
         template.net,
         template.idle_timeout,
         template.ping_interval,
-        // Server-handler dispatch (relay, inv, getdata, ...) is wired in
-        // a later piece; keepalive and the handshake are handled inside.
-        |_peer, _msg| {},
+        move |peer, msg, outbound| match handler.as_mut() {
+            Some(handler) => handler.handle_message(peer, msg, outbound),
+            None => ServeSignal::Continue,
+        },
     );
 }
 

@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod dispatch;
 pub mod flags;
 mod gostd;
 pub mod ipc;

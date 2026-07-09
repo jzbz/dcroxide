@@ -12,7 +12,7 @@
 //! Go's garbage-collected pointers, and the size accounting fixes the
 //! pointer width at dcrd's 64-bit values.
 
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// A key in the treap: a ticket hash (dcrd `tickettreap.Key`).
@@ -59,11 +59,11 @@ struct TreapNode {
     value: Value,
     priority: u32,
     size: u32,
-    left: Option<Rc<TreapNode>>,
-    right: Option<Rc<TreapNode>>,
+    left: Option<Arc<TreapNode>>,
+    right: Option<Arc<TreapNode>>,
 }
 
-fn subtree_size(node: &Option<Rc<TreapNode>>) -> u32 {
+fn subtree_size(node: &Option<Arc<TreapNode>>) -> u32 {
     node.as_ref().map_or(0, |n| n.size)
 }
 
@@ -71,7 +71,7 @@ fn subtree_size(node: &Option<Rc<TreapNode>>) -> u32 {
 /// the ticket height as the priority (dcrd `tickettreap.Immutable`).
 #[derive(Default, Clone)]
 pub struct Immutable {
-    root: Option<Rc<TreapNode>>,
+    root: Option<Arc<TreapNode>>,
     count: usize,
     total_size: u64,
 }
@@ -158,7 +158,7 @@ impl Immutable {
     /// spines (sorted keys and heights) cannot exhaust the stack.
     pub fn put(&self, key: Key, value: Value) -> Immutable {
         // Descend to the insertion point recording the path.
-        let mut path: Vec<(Rc<TreapNode>, bool)> = Vec::new();
+        let mut path: Vec<(Arc<TreapNode>, bool)> = Vec::new();
         let mut node = self.root.clone();
         let mut found = false;
         while let Some(n) = node {
@@ -185,7 +185,7 @@ impl Immutable {
             // Replace the value in the located node and rebuild the
             // path with sizes unchanged.
             let (target, _) = path.pop().expect("found node on path");
-            let mut acc = Rc::new(TreapNode {
+            let mut acc = Arc::new(TreapNode {
                 key: target.key,
                 value,
                 priority: target.priority,
@@ -199,7 +199,7 @@ impl Immutable {
                 } else {
                     (parent.left.clone(), Some(acc))
                 };
-                acc = Rc::new(TreapNode {
+                acc = Arc::new(TreapNode {
                     key: parent.key,
                     value: parent.value,
                     priority: parent.priority,
@@ -218,7 +218,7 @@ impl Immutable {
         // Attach the new node and bubble it up while it has a strictly
         // smaller priority than its parent, exactly like dcrd; the
         // first non-rotation ends the cascade.
-        let mut acc = Rc::new(TreapNode {
+        let mut acc = Arc::new(TreapNode {
             key,
             value,
             priority: value.height,
@@ -232,7 +232,7 @@ impl Immutable {
                 if went_left {
                     // Rotate right: the parent adopts acc's right
                     // subtree as its new left child.
-                    let new_parent = Rc::new(TreapNode {
+                    let new_parent = Arc::new(TreapNode {
                         key: parent.key,
                         value: parent.value,
                         priority: parent.priority,
@@ -240,7 +240,7 @@ impl Immutable {
                         left: acc.right.clone(),
                         right: parent.right.clone(),
                     });
-                    acc = Rc::new(TreapNode {
+                    acc = Arc::new(TreapNode {
                         key: acc.key,
                         value: acc.value,
                         priority: acc.priority,
@@ -250,7 +250,7 @@ impl Immutable {
                     });
                 } else {
                     // Rotate left.
-                    let new_parent = Rc::new(TreapNode {
+                    let new_parent = Arc::new(TreapNode {
                         key: parent.key,
                         value: parent.value,
                         priority: parent.priority,
@@ -258,7 +258,7 @@ impl Immutable {
                         left: parent.left.clone(),
                         right: acc.left.clone(),
                     });
-                    acc = Rc::new(TreapNode {
+                    acc = Arc::new(TreapNode {
                         key: acc.key,
                         value: acc.value,
                         priority: acc.priority,
@@ -274,7 +274,7 @@ impl Immutable {
                 } else {
                     (parent.left.clone(), Some(acc))
                 };
-                acc = Rc::new(TreapNode {
+                acc = Arc::new(TreapNode {
                     key: parent.key,
                     value: parent.value,
                     priority: parent.priority,
@@ -297,9 +297,9 @@ impl Immutable {
     /// priority ties exactly as in dcrd, implemented iteratively.
     pub fn delete(&self, key: &Key) -> Immutable {
         // Descend to the node being deleted, recording the path.
-        let mut path: Vec<(Rc<TreapNode>, bool)> = Vec::new();
+        let mut path: Vec<(Arc<TreapNode>, bool)> = Vec::new();
         let mut node = self.root.clone();
-        let mut del_node: Option<Rc<TreapNode>> = None;
+        let mut del_node: Option<Arc<TreapNode>> = None;
         while let Some(n) = node {
             match key.cmp(&n.key) {
                 core::cmp::Ordering::Less => {
@@ -325,7 +325,7 @@ impl Immutable {
         // Cascade the smaller-priority child of the deleted node up,
         // collecting the winners, then fold them back together from
         // the bottom.
-        let mut winners: Vec<(Rc<TreapNode>, bool)> = Vec::new();
+        let mut winners: Vec<(Arc<TreapNode>, bool)> = Vec::new();
         let mut left = del_node.left.clone();
         let mut right = del_node.right.clone();
         loop {
@@ -352,11 +352,11 @@ impl Immutable {
                 }
             }
         }
-        let mut acc: Option<Rc<TreapNode>> = None;
+        let mut acc: Option<Arc<TreapNode>> = None;
         while let Some((w, took_left)) = winners.pop() {
             let acc_size = acc.as_ref().map_or(0, |n| n.size);
             acc = Some(if took_left {
-                Rc::new(TreapNode {
+                Arc::new(TreapNode {
                     key: w.key,
                     value: w.value,
                     priority: w.priority,
@@ -365,7 +365,7 @@ impl Immutable {
                     right: acc,
                 })
             } else {
-                Rc::new(TreapNode {
+                Arc::new(TreapNode {
                     key: w.key,
                     value: w.value,
                     priority: w.priority,
@@ -383,7 +383,7 @@ impl Immutable {
             } else {
                 (parent.left.clone(), acc)
             };
-            acc = Some(Rc::new(TreapNode {
+            acc = Some(Arc::new(TreapNode {
                 key: parent.key,
                 value: parent.value,
                 priority: parent.priority,

@@ -113,10 +113,21 @@ pub fn send_verack(outbound: &OutboundQueue) -> Result<(), String> {
     outbound.queue_message(Message::VerAck)
 }
 
+/// What the server's message handler decided about the connection
+/// (dcrd's handlers either return or call `Disconnect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeSignal {
+    /// Keep serving the peer.
+    Continue,
+    /// Drop the connection with dcrd's reason.
+    Disconnect(&'static str),
+}
+
 /// Read and dispatch messages until the peer disconnects.  Each message
 /// is given its protocol-level handling (queueing any immediate reply on
 /// the outbound queue) and then forwarded to `on_message` for the server
-/// handlers, mirroring dcrd's `inHandler`.
+/// handlers, which queue their responses through the outbound queue and
+/// may request a disconnect, mirroring dcrd's `inHandler`.
 pub fn run_peer_input<T, E, F>(
     peer: &Mutex<Peer>,
     transport: &mut T,
@@ -127,7 +138,7 @@ pub fn run_peer_input<T, E, F>(
 where
     T: MsgTransport,
     E: PeerEnv,
-    F: FnMut(&mut Peer, &Message),
+    F: FnMut(&mut Peer, &Message, &OutboundQueue) -> ServeSignal,
 {
     loop {
         // Read without the peer lock held so the ping timer and the
@@ -149,7 +160,9 @@ where
                 {
                     return DisconnectReason::LocalShutdown;
                 }
-                on_message(&mut peer, &msg);
+                if let ServeSignal::Disconnect(reason) = on_message(&mut peer, &msg, outbound) {
+                    return DisconnectReason::Protocol(reason);
+                }
             }
         }
     }
@@ -251,7 +264,7 @@ pub fn run_peer_connection<F>(
     on_message: F,
 ) -> DisconnectReason
 where
-    F: FnMut(&mut Peer, &Message),
+    F: FnMut(&mut Peer, &Message, &OutboundQueue) -> ServeSignal,
 {
     // A read deadline so a peer that stops answering is disconnected
     // rather than blocking the input loop forever.
