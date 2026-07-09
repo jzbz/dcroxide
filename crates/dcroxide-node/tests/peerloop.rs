@@ -18,7 +18,7 @@ use dcroxide_node::peerloop::{
 };
 use dcroxide_node::transport::WireTransport;
 use dcroxide_peer::{Config, MAX_PROTOCOL_VERSION, MsgTransport, Peer, PeerEnv, PeerGlobals};
-use dcroxide_wire::{CurrencyNet, Message, MsgPing, MsgPong, ServiceFlag};
+use dcroxide_wire::{CurrencyNet, Message, MsgFeeFilter, MsgPing, MsgPong, ServiceFlag};
 
 const NET: CurrencyNet = CurrencyNet::TEST_NET3;
 
@@ -294,4 +294,66 @@ fn run_peer_connection_negotiates_and_serves_until_the_remote_closes() {
         "the connection forwards every message in order",
     );
     assert!(reason.contains("ReadError"), "disconnect reason: {reason}");
+}
+
+#[test]
+fn run_peer_connection_frames_at_the_negotiated_version_not_the_sentinel() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
+    let server_addr = listener.local_addr().expect("listener addr");
+
+    // Server runs the connection with pver 0 — the binary's "package
+    // maximum" sentinel. The transport must reframe at the negotiated
+    // version after the handshake, not literally 0.
+    let server = thread::spawn(move || {
+        let (stream, remote_addr) = listener.accept().expect("accept connection");
+        let mut peer = Peer::new_inbound(config("dcroxide-in"));
+        let na = net_address_from_socket(remote_addr, ServiceFlag(0)).expect("net address");
+        peer.associate(&remote_addr.to_string(), na, 0);
+
+        let forwarded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Message>::new()));
+        let sink = std::sync::Arc::clone(&forwarded);
+        let _ = run_peer_connection(
+            stream,
+            peer,
+            0,
+            NET,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            move |_peer, msg| sink.lock().expect("sink").push(msg.clone()),
+        );
+        forwarded.lock().expect("forwarded").clone()
+    });
+
+    let stream = TcpStream::connect(server_addr).expect("dial the listener");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
+    let mut env = NodePeerEnv::new();
+    let mut globals = PeerGlobals::new();
+    let mut peer = Peer::new_outbound(config("dcroxide-out"), &server_addr.to_string())
+        .expect("outbound peer");
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+        .expect("outbound negotiation");
+
+    // feefilter is version-gated (FEE_FILTER_VERSION = 5); it decodes only
+    // if the server frames at the negotiated version (11), not pver 0
+    // where the codec returns MsgInvalidForPVer and the peer is dropped.
+    let feefilter = Message::FeeFilter(MsgFeeFilter { min_fee: 12345 });
+    transport
+        .write_message(&Message::VerAck)
+        .expect("send verack");
+    transport.write_message(&feefilter).expect("send feefilter");
+    assert_eq!(
+        transport.read_message().expect("read verack"),
+        Message::VerAck
+    );
+    drop(transport);
+
+    let forwarded = server.join().expect("server thread");
+    assert!(
+        forwarded.contains(&feefilter),
+        "the version-gated feefilter should be forwarded (decoded at the \
+         negotiated version), got {forwarded:?}"
+    );
 }

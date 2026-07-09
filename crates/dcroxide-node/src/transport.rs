@@ -49,6 +49,14 @@ impl<S> WireTransport<S> {
         }
     }
 
+    /// Set the protocol version future messages are framed at.  The
+    /// handshake runs at the local maximum; the daemon lowers this to the
+    /// negotiated version once it is known, matching dcrd's per-message
+    /// use of the peer's current protocol version.
+    pub fn set_protocol_version(&mut self, pver: u32) {
+        self.pver = pver;
+    }
+
     /// The total wire bytes read from the stream so far (header and
     /// payload).  The peer loop snapshots this around a read to feed
     /// dcrd's per-message receive accounting.

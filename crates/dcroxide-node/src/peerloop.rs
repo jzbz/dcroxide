@@ -23,12 +23,12 @@
 //! (`TcpStream::set_read_timeout`); a read timeout ends the loop exactly
 //! like dcrd's idle disconnect.
 
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use dcroxide_peer::{MsgTransport, Peer, PeerEnv, PeerGlobals};
+use dcroxide_peer::{MAX_PROTOCOL_VERSION, MsgTransport, Peer, PeerEnv, PeerGlobals};
 use dcroxide_wire::{CurrencyNet, Message, MsgPing};
 
 use crate::peerconn::NodePeerEnv;
@@ -262,8 +262,16 @@ where
         Ok(write_stream) => write_stream,
         Err(e) => return DisconnectReason::WriteError(e.to_string()),
     };
-    let mut read_transport = WireTransport::new(stream, pver, net);
-    let mut write_transport = WireTransport::new(write_stream, pver, net);
+    // The handshake is framed at the local maximum protocol version (0
+    // is dcrd's "package maximum" sentinel); the transport is lowered to
+    // the negotiated version below.
+    let handshake_pver = if pver == 0 {
+        MAX_PROTOCOL_VERSION
+    } else {
+        pver
+    };
+    let mut read_transport = WireTransport::new(stream, handshake_pver, net);
+    let mut write_transport = WireTransport::new(write_stream, handshake_pver, net);
 
     // Negotiate the version exchange before starting the loops.  The
     // read transport is full duplex, so it also writes the local version.
@@ -278,6 +286,12 @@ where
         return DisconnectReason::Negotiate(e.message);
     }
 
+    // Frame the rest of the session at the negotiated version (dcrd
+    // re-reads the peer's protocol version on every message).
+    let negotiated_pver = peer.protocol_version();
+    read_transport.set_protocol_version(negotiated_pver);
+    write_transport.set_protocol_version(negotiated_pver);
+
     // Share the peer across the loops and queue the verack that follows
     // negotiation.
     let peer = Arc::new(Mutex::new(peer));
@@ -286,7 +300,14 @@ where
         return DisconnectReason::LocalShutdown;
     }
 
-    let output = thread::spawn(move || run_peer_output(&mut write_transport, receiver));
+    let output = thread::spawn(move || {
+        let reason = run_peer_output(&mut write_transport, receiver);
+        // Shut the socket down when the output loop ends (a write error
+        // or a closed queue) so the input loop's blocking read unblocks
+        // and the connection tears down instead of lingering.
+        let _ = write_transport.get_mut().shutdown(Shutdown::Both);
+        reason
+    });
 
     let (ping_shutdown, ping_shutdown_rx) = mpsc::channel();
     let ping_peer = Arc::clone(&peer);
@@ -305,8 +326,11 @@ where
     // Drive the input loop on this thread until the peer disconnects.
     let reason = run_peer_input(&peer, &mut read_transport, &mut env, &outbound, on_message);
 
-    // Tear down: stop the ping timer and close the outbound queue so the
-    // output loop finishes, then join both threads.
+    // Tear down: shut the socket down so the output loop's blocking write
+    // unblocks (a peer that stopped reading would otherwise wedge it),
+    // stop the ping timer, and close the outbound queue, then join both
+    // threads.
+    let _ = read_transport.get_mut().shutdown(Shutdown::Both);
     let _ = ping_shutdown.send(());
     drop(outbound);
     let _ = ping.join();
