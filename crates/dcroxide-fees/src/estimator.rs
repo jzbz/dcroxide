@@ -103,6 +103,11 @@ pub enum EstimateFeeError {
     /// Not enough transactions have been seen for an estimate (dcrd
     /// `ErrNotEnoughTxsForEstimate`).
     NotEnoughTxsForEstimate,
+    /// The median scan fell through every best bucket (dcrd returns an
+    /// ad-hoc `errors.New("this isn't supposed to be reached")` rather
+    /// than panicking, so float rounding on the half-count can never
+    /// crash the caller).
+    MedianScanFellThrough,
 }
 
 /// The fee estimator (dcrd `Estimator`; the leveldb handle and lock
@@ -350,7 +355,7 @@ impl Estimator {
             }
         }
 
-        unreachable!("this isn't supposed to be reached");
+        Err(EstimateFeeError::MedianScanFellThrough)
     }
 
     /// The suggested fee in atoms for a transaction to be confirmed

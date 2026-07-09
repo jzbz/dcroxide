@@ -54,6 +54,7 @@ fn err_name(err: &EstimateFeeError) -> &'static str {
         EstimateFeeError::TargetConfTooLarge { .. } => "toolarge",
         EstimateFeeError::NoSuccessPctBucketFound => "nopct",
         EstimateFeeError::NotEnoughTxsForEstimate => "notenough",
+        EstimateFeeError::MedianScanFellThrough => "fellthrough",
     }
 }
 

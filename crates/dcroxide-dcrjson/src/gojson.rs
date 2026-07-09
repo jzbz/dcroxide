@@ -1575,6 +1575,13 @@ fn field_index(fields: &[crate::gotype::StructField], key: &str) -> Option<usize
 
 /// Decode standard base64 (with padding), as Go's `encoding/json`
 /// does for `[]byte` targets.
+///
+/// Faithful to `base64.StdEncoding.Decode`: newlines (`\r`, `\n`) are
+/// ignored anywhere in the input, a padded quantum must carry at least
+/// two data characters (`====` and `A===` are corrupt), and padding
+/// terminates the input — nothing but newlines may follow it.  Go
+/// returns the partial output alongside the error, but `encoding/json`
+/// discards it, so any error decodes to `None` here.
 fn base64_decode_std(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         match c {
@@ -1586,32 +1593,46 @@ fn base64_decode_std(s: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     }
-    let b = s.as_bytes();
-    if !b.len().is_multiple_of(4) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(b.len() / 4 * 3);
-    for chunk in b.chunks(4) {
-        let pad = chunk.iter().filter(|&&c| c == b'=').count();
-        let mut n: u32 = 0;
-        for (i, &c) in chunk.iter().enumerate() {
-            let v = if c == b'=' {
-                if i < 4 - pad {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut it = s.bytes().filter(|&c| c != b'\r' && c != b'\n');
+    loop {
+        // Assemble one 4-character quantum.  '=' is corrupt in the
+        // first two positions (`val` rejects it), so a padded quantum
+        // always has at least two data characters.
+        let Some(c0) = it.next() else {
+            return Some(out);
+        };
+        let n = (val(c0)? << 6) | val(it.next()?)?;
+        match it.next()? {
+            b'=' => {
+                // "==" completes the quantum and must end the input.
+                if it.next()? != b'=' || it.next().is_some() {
                     return None;
                 }
-                0
-            } else {
-                val(c)?
-            };
-            n = (n << 6) | v;
-        }
-        out.push((n >> 16) as u8);
-        if pad < 2 {
-            out.push((n >> 8) as u8);
-        }
-        if pad < 1 {
-            out.push(n as u8);
+                out.push((n >> 4) as u8);
+                return Some(out);
+            }
+            c2 => {
+                let n = (n << 6) | val(c2)?;
+                match it.next()? {
+                    b'=' => {
+                        // "=" completes the quantum and must end the
+                        // input.
+                        if it.next().is_some() {
+                            return None;
+                        }
+                        out.push((n >> 10) as u8);
+                        out.push((n >> 2) as u8);
+                        return Some(out);
+                    }
+                    c3 => {
+                        let n = (n << 6) | val(c3)?;
+                        out.push((n >> 16) as u8);
+                        out.push((n >> 8) as u8);
+                        out.push(n as u8);
+                    }
+                }
+            }
         }
     }
-    Some(out)
 }
