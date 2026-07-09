@@ -318,10 +318,40 @@ pub(crate) fn filepath_join(elems: &[&str]) -> String {
     String::new()
 }
 
+/// Whether `path` is already absolute.  A leading `/` counts on every
+/// platform — this module cleans and joins with `/`, and the pinned
+/// dcrd differential vectors are `/`-rooted — so keeping that check
+/// platform-independent preserves parity.  On Windows a drive-rooted
+/// path (`C:\` or `C:/`) or a UNC path (`\\host`) is absolute too, so
+/// the daemon's real application data directory (e.g. `%LOCALAPPDATA%\
+/// Dcroxide`) is not mistaken for a relative path and prefixed with the
+/// working directory.
+fn is_absolute_path(path: &str) -> bool {
+    if path.starts_with('/') {
+        return true;
+    }
+    if cfg!(windows) {
+        let b = path.as_bytes();
+        // Drive-rooted: `X:\` or `X:/`.
+        if b.len() >= 3
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && (b[2] == b'\\' || b[2] == b'/')
+        {
+            return true;
+        }
+        // UNC: `\\host\share` (a `//`-rooted path is already caught above).
+        if b.len() >= 2 && b[0] == b'\\' && b[1] == b'\\' {
+            return true;
+        }
+    }
+    false
+}
+
 /// Make a path absolute like Go's `path/filepath.Abs` (which also
 /// cleans the result).
 pub(crate) fn filepath_abs(path: &str) -> String {
-    if path.starts_with('/') {
+    if is_absolute_path(path) {
         return filepath_clean(path);
     }
     let cwd = std::env::current_dir()

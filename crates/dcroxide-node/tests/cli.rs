@@ -76,42 +76,52 @@ fn unknown_flag_exits_one_with_error() {
     assert!(stderr.contains("Use dcroxide -h"), "stderr: {stderr}");
 }
 
-#[test]
-fn startup_opens_block_database_and_loads_genesis() {
-    // Use an isolated home so a fresh block database is created under a
-    // temporary directory and the run touches nothing else.
-    let home = isolated_appdata("db");
+/// Spawn the daemon with `args` (plus an isolated app data directory),
+/// then wait up to 20s for a stdout or stderr line satisfying `wanted`,
+/// returning that line.  On timeout the panic message includes every
+/// line the daemon printed, so a startup failure on a CI platform that
+/// cannot be reproduced locally is still diagnosable rather than a bare
+/// "line never appeared".
+fn wait_for_daemon_line(tag: &str, args: &[&str], wanted: impl Fn(&str) -> bool) -> String {
+    let home = isolated_appdata(tag);
     let mut child = Command::new(env!("CARGO_BIN_EXE_dcroxide"))
-        // Do not bind a real listen port; this test is about the database.
-        .arg("--nolisten")
+        .args(args)
         .arg(format!("--appdata={}", home.display()))
         .env_remove("DCRD_APPDATA")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn dcroxide binary");
 
-    // Read startup lines on a background thread so the test can bound
-    // how long it waits for the database-loaded announcement.
-    let stdout = child.stdout.take().expect("piped stdout");
+    // Drain stdout and stderr on their own threads onto one channel, so
+    // startup progress and any error diagnostics are captured together
+    // and the wait can be time-bounded.
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
+    for stream in [
+        Box::new(child.stdout.take().expect("piped stdout")) as Box<dyn std::io::Read + Send>,
+        Box::new(child.stderr.take().expect("piped stderr")),
+    ] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
             }
-        }
-    });
+        });
+    }
+    drop(tx);
 
-    let mut loaded = None;
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while std::time::Instant::now() < deadline {
+    let mut seen = Vec::new();
+    let mut found = None;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(20) {
         match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(line) if line.contains("Block database loaded") => {
-                loaded = Some(line);
+            Ok(line) if wanted(&line) => {
+                found = Some(line);
                 break;
             }
-            Ok(_) => {}
+            Ok(line) => seen.push(line),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -121,7 +131,20 @@ fn startup_opens_block_database_and_loads_genesis() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&home);
 
-    let loaded = loaded.expect("binary announced the block database was loaded");
+    found.unwrap_or_else(|| {
+        panic!(
+            "daemon did not print the expected startup line within 20s; captured output:\n{}",
+            seen.join("\n")
+        )
+    })
+}
+
+#[test]
+fn startup_opens_block_database_and_loads_genesis() {
+    // --nolisten because this test is about the database, not the network.
+    let loaded = wait_for_daemon_line("db", &["--nolisten"], |line| {
+        line.contains("Block database loaded")
+    });
     // A fresh database starts at the genesis block (height 0).
     assert!(
         loaded.contains("best block height 0"),
@@ -132,47 +155,9 @@ fn startup_opens_block_database_and_loads_genesis() {
 #[test]
 fn startup_serves_peer_connections_on_a_listener() {
     // Bind an ephemeral loopback port so the test neither uses a fixed
-    // port nor touches the network.
-    let home = isolated_appdata("listen");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dcroxide"))
-        .arg("--listen=127.0.0.1:0")
-        .arg(format!("--appdata={}", home.display()))
-        .env_remove("DCRD_APPDATA")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn dcroxide binary");
-
-    let stdout = child.stdout.take().expect("piped stdout");
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
+    // port nor touches the network.  The helper panics with the captured
+    // daemon output if the announcement never arrives.
+    wait_for_daemon_line("listen", &["--listen=127.0.0.1:0"], |line| {
+        line.contains("Serving peer-to-peer connections on 127.0.0.1:")
     });
-
-    let mut serving = None;
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while std::time::Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(line) if line.contains("Serving peer-to-peer connections on 127.0.0.1:") => {
-                serving = Some(line);
-                break;
-            }
-            Ok(_) => {}
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = std::fs::remove_dir_all(&home);
-
-    assert!(
-        serving.is_some(),
-        "binary should announce it is serving peers on the bound listener"
-    );
 }
