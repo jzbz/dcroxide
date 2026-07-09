@@ -39,9 +39,10 @@ use crate::peerconn::NodePeerEnv;
 use crate::peerloop::{OutboundQueue, ServeSignal};
 use crate::server::{
     GetAddrFacts, GetDataResolution, GetHeadersResponse, InitStateWants, MAX_BLOCKS_PER_MSG,
-    OnAddrFacts, OnAddrOutcome, OnGetDataOutcome, OnGetInitStateOutcome, PushAddrOutcome,
-    ServeGetDataAction, ServerPeerAddrState, build_get_blocks_response, build_get_headers_response,
-    natf_supported, on_addr, on_get_addr, on_get_data, on_get_init_state, serve_get_data,
+    OnAddrFacts, OnAddrOutcome, OnGetDataOutcome, OnGetInitStateOutcome, OnInvOutcome,
+    PushAddrOutcome, ServeGetDataAction, ServerPeerAddrState, build_get_blocks_response,
+    build_get_headers_response, natf_supported, on_addr, on_get_addr, on_get_data,
+    on_get_init_state, on_inv_classify, serve_get_data,
 };
 
 /// The daemon-wide state the server handlers consult, shared across
@@ -66,6 +67,9 @@ pub struct ServerContext {
     /// The network's stake validation height; a best tip below it
     /// answers getinitstate with an empty message.
     pub stake_validation_height: i64,
+    /// Whether transaction and mix relay is disabled (`--blocksonly`);
+    /// peers announcing either are disconnected.
+    pub blocks_only: bool,
     /// Whether the simulation or regression test network is active;
     /// both suppress the address exchange entirely.
     pub sim_or_reg_net: bool,
@@ -137,8 +141,10 @@ impl ServerPeerHandler {
                 self.on_get_init_state(&get_init.types, outbound);
                 ServeSignal::Continue
             }
-            // The remaining server handlers (inventory relay and the
-            // sync-manager intake) arrive with later pieces.
+            Message::Inv(inv) => self.on_inv(&inv.inv_list),
+            // The sync-manager intake (headers, blocks, transactions,
+            // and the forwarded announcements) arrives with the netsync
+            // driver pieces.
             _ => ServeSignal::Continue,
         }
     }
@@ -353,6 +359,27 @@ impl ServerPeerHandler {
 }
 
 impl ServerPeerHandler {
+    /// Gate an inventory announcement: ban empty announcements, and in
+    /// blocks-only mode disconnect peers announcing transactions or
+    /// mix messages (dcrd `serverPeer.OnInv`).  Announcements that
+    /// pass forward to the sync manager, whose driver arrives with the
+    /// netsync pieces.
+    fn on_inv(&self, inv_list: &[InvVect]) -> ServeSignal {
+        let inv_types: Vec<InvType> = inv_list.iter().map(|iv| iv.inv_type).collect();
+        match on_inv_classify(&inv_types, self.ctx.blocks_only) {
+            // The ban outcome drops the connection; the ban-list
+            // bookkeeping arrives with the peer-state wiring.
+            OnInvOutcome::BanEmpty => ServeSignal::Disconnect("sent empty inventory announcement"),
+            OnInvOutcome::DisconnectAnnouncement("transactions") => {
+                ServeSignal::Disconnect("announcing transactions in blocks-only mode")
+            }
+            OnInvOutcome::DisconnectAnnouncement(_) => {
+                ServeSignal::Disconnect("announcing mix messages in blocks-only mode")
+            }
+            OnInvOutcome::Forward => ServeSignal::Continue,
+        }
+    }
+
     /// Serve a version 2 committed filter with its inclusion proof,
     /// silently ignoring requests for unknown blocks or missing
     /// filters (dcrd `serverPeer.OnGetCFilterV2`).

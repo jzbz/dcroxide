@@ -236,6 +236,7 @@ fn start_listeners(
         addr_manager,
         sim_or_reg_net: cfg.sim_net || cfg.reg_net,
         stake_validation_height: params.stake_validation_height,
+        blocks_only: cfg.blocks_only,
     });
     let connected = ConnectedPeers::new();
     let specs = parse_listeners(&cfg.listeners)?;

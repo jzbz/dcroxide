@@ -51,6 +51,7 @@ fn serve_genesis_chain() -> (
         addr_manager: Arc::clone(&addr_manager),
         sim_or_reg_net: false,
         stake_validation_height: params.stake_validation_height,
+        blocks_only: false,
     });
 
     let template = PeerTemplate {
@@ -359,5 +360,43 @@ fn serves_cfilters_and_init_state() {
     }
 
     drop(transport);
+    runtime.shutdown();
+}
+
+/// The inventory intake gates: a block announcement passes through
+/// (the sync-manager forward is a later piece, so the connection just
+/// stays up), and an empty announcement drops the connection.
+#[test]
+fn gates_inventory_announcements() {
+    let (_dir, runtime, _connected, mut transport, genesis_hash, _addrmgr) = serve_genesis_chain();
+
+    // A block announcement passes the gate; the connection stays
+    // healthy, verified by a following ping.
+    transport
+        .write_message(&Message::Inv(dcroxide_wire::MsgInv {
+            inv_list: vec![InvVect {
+                inv_type: InvType::BLOCK,
+                hash: genesis_hash,
+            }],
+        }))
+        .expect("send inv");
+    transport
+        .write_message(&Message::Ping(dcroxide_wire::MsgPing { nonce: 9 }))
+        .expect("send ping");
+    match transport.read_message().expect("read pong") {
+        Message::Pong(pong) => assert_eq!(pong.nonce, 9),
+        other => panic!("expected pong, got {other:?}"),
+    }
+
+    // An empty announcement is a bannable offense; the server
+    // disconnects.
+    transport
+        .write_message(&Message::Inv(dcroxide_wire::MsgInv { inv_list: vec![] }))
+        .expect("send empty inv");
+    assert!(
+        transport.read_message().is_err(),
+        "the connection should be dropped"
+    );
+
     runtime.shutdown();
 }
