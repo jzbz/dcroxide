@@ -1,0 +1,7 @@
+# Force LF line endings in the working tree on every platform.  Several
+# tests embed checked-in assets (the sample dcrd.conf, the differential
+# vectors) with include_str!/include_bytes! and compare them byte for
+# byte against dcrd-generated fixtures, so a CRLF checkout on Windows
+# would corrupt those comparisons.  Git still auto-detects binary files
+# and leaves them untouched.
+* text=auto eol=lf
