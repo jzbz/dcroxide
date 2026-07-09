@@ -132,10 +132,22 @@ fn block_store_fetch_round_trip() {
             assert_eq!(data.as_slice(), &serialized[i][4..24]);
         }
 
-        // Committed out-of-bounds region.
-        let bad = BlockRegion {
+        // A committed region may reach into the record's trailing
+        // overhead bytes: dcrd bounds the check by the full record
+        // length (raw block + 12 bytes of network/length/checksum
+        // overhead), so the first byte past the raw block serves the
+        // checksum rather than erroring.
+        let into_overhead = BlockRegion {
             hash: hashes[0],
             offset: serialized[0].len() as u32,
+            len: 1,
+        };
+        assert_eq!(tx.fetch_block_region(&into_overhead)?.len(), 1);
+
+        // Past the full record the region is invalid.
+        let bad = BlockRegion {
+            hash: hashes[0],
+            offset: serialized[0].len() as u32 + 12,
             len: 1,
         };
         assert_eq!(

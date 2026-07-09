@@ -24,7 +24,7 @@ use std::sync::Arc;
 use dcroxide_chainhash::Hash;
 use redb::ReadableTable;
 
-use crate::blockfile::{BLOCK_LOC_SIZE, BLOCK_RECORD_OVERHEAD, BlockLocation, serialize_write_row};
+use crate::blockfile::{BLOCK_LOC_SIZE, BlockLocation, serialize_write_row};
 use crate::error::{Error, ErrorKind, db_error};
 use crate::{DbInner, METADATA_TABLE};
 
@@ -420,8 +420,11 @@ impl Transaction {
                     return Err(db_error(
                         ErrorKind::BlockRegionInvalid,
                         format!(
-                            "block {} region is invalid: offset {}, length {}",
-                            region.hash, region.offset, region.len
+                            "block {} region offset {}, length {} exceeds block length of {}",
+                            region.hash,
+                            region.offset,
+                            region.len,
+                            bytes.len()
                         ),
                     ));
                 }
@@ -431,18 +434,20 @@ impl Transaction {
         let row = self.fetch_block_row(&region.hash)?;
         let loc = BlockLocation::deserialize(&row[..BLOCK_LOC_SIZE]);
 
-        // Ensure the region is within the bounds of the block.
-        let block_len = loc.block_len - BLOCK_RECORD_OVERHEAD;
+        // Ensure the region is within the bounds of the block.  dcrd
+        // checks against the full record length (which includes the
+        // network, length, and checksum overhead), not the raw block
+        // length, so a region reaching into the trailing overhead bytes
+        // is accepted and served from the file.
         let end = region.offset.checked_add(region.len);
         match end {
-            Some(end) if end <= block_len => {}
+            Some(end) if end <= loc.block_len => {}
             _ => {
                 return Err(db_error(
                     ErrorKind::BlockRegionInvalid,
                     format!(
-                        "block {} region exceeds the block length of {block_len}: offset {}, \
-                         length {}",
-                        region.hash, region.offset, region.len
+                        "block {} region offset {}, length {} exceeds block length of {}",
+                        region.hash, region.offset, region.len, loc.block_len
                     ),
                 ));
             }

@@ -42,8 +42,11 @@ pub fn calc_tspend_window(expiry: u32, tvi: u64, multiplier: u64) -> Result<(u32
         return Err(rule_error(ErrorKind::InvalidTSpendExpiry, str));
     }
 
-    // Ensure the provided expiry is two more than a TVI.
-    if !is_treasury_vote_interval(u64::from(expiry - 2), tvi) {
+    // Ensure the provided expiry is two more than a TVI.  The wrapping
+    // subtraction matches Go's uint32 arithmetic: a hostile TVI and
+    // multiplier can wrap the minimum-expiry guard above, letting an
+    // expiry below two through to here.
+    if !is_treasury_vote_interval(u64::from(expiry.wrapping_sub(2)), tvi) {
         let str = format!(
             "expiry {expiry} must be two more than a multiple of the treasury vote \
              interval {tvi}"
@@ -55,7 +58,7 @@ pub fn calc_tspend_window(expiry: u32, tvi: u64, multiplier: u64) -> Result<(u32
         expiry
             .wrapping_sub(tvi.wrapping_mul(multiplier) as u32)
             .wrapping_sub(2),
-        expiry - 2,
+        expiry.wrapping_sub(2),
     ))
 }
 

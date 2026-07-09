@@ -102,6 +102,28 @@ fn calc_tspend_window_vectors() {
             5186 - 288 * 7 - 2,
             5186 - 2,
         ),
+        // The two hostile-parameter cases below are pinned against real
+        // standalone.CalcTSpendWindow runs: the wrapping guards must
+        // reproduce Go's uint arithmetic instead of panicking on the
+        // expiry - 2 underflow.
+        (
+            "hostile mul wraps the min-expiry guard and the window wraps",
+            0,
+            2,
+            (1 << 63) - 1,
+            None,
+            0,
+            4294967294,
+        ),
+        (
+            "hostile tvi errors on the wrapped TVI check",
+            0,
+            u64::MAX,
+            2,
+            Some(ErrorKind::InvalidTSpendExpiry),
+            0,
+            0,
+        ),
     ];
 
     for (name, expiry, tvi, tvimul, want_err, want_start, want_end) in tests {

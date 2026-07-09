@@ -462,8 +462,13 @@ pub fn deserialize_header_commitments(serialized: &[u8]) -> Result<Vec<Hash>, Er
             "unexpected end of data after num commitments",
         ));
     }
-    let total = num_commitments as usize * HASH_SIZE;
-    if serialized[offset..].len() < total {
+    // dcrd sizes the check with a wrapping int64 conversion and
+    // multiply, so a corrupt count large enough to wrap skips the
+    // length check and crashes at the allocation below exactly like
+    // Go's makeslice; a moderately corrupt count reports the same
+    // (possibly negative) needed size.
+    let total = (num_commitments as i64).wrapping_mul(HASH_SIZE as i64);
+    if (serialized[offset..].len() as i64) < total {
         return Err(deserialize_error(format!(
             "unexpected end of data after number of commitments (got {}, need {total})",
             serialized[offset..].len()

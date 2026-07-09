@@ -182,7 +182,13 @@ pub fn compressed_script_size(_script_version: u16, pk_script: &[u8]) -> usize {
 
 /// The number of bytes the compressed script starting at the front of
 /// the serialized data occupies (dcrd `decodeCompressedScriptSize`).
-pub fn decode_compressed_script_size(serialized: &[u8]) -> usize {
+///
+/// Returns an `i64` mirroring dcrd's `int`: a corrupt size discriminant
+/// below `NUM_SPECIAL_SCRIPTS` wraps around to a negative size exactly
+/// like Go's unsigned subtraction followed by the `int` conversion, and
+/// the decode caller rejects it with dcrd's "negative script size"
+/// error.
+pub fn decode_compressed_script_size(serialized: &[u8]) -> i64 {
     let (script_size, bytes_read) = deserialize_vlq(serialized);
     if bytes_read == 0 {
         return 0;
@@ -194,7 +200,9 @@ pub fn decode_compressed_script_size(serialized: &[u8]) -> usize {
         | CST_PAY_TO_PUB_KEY_COMP_ODD
         | CST_PAY_TO_PUB_KEY_UNCOMP_EVEN
         | CST_PAY_TO_PUB_KEY_UNCOMP_ODD => 33,
-        _ => (script_size - NUM_SPECIAL_SCRIPTS) as usize + bytes_read,
+        _ => script_size
+            .wrapping_sub(NUM_SPECIAL_SCRIPTS)
+            .wrapping_add(bytes_read as u64) as i64,
     }
 }
 
@@ -482,6 +490,11 @@ pub fn decode_compressed_tx_out(
     // Decode the compressed script size and ensure there are enough
     // bytes left in the slice for it.
     let script_size = decode_compressed_script_size(&serialized[offset..]);
+    // Note: script_size == 0 is OK (an empty compressed script is valid)
+    if script_size < 0 {
+        return Err(deserialize_error("negative script size"));
+    }
+    let script_size = script_size as usize;
     if serialized[offset..].len() < script_size {
         return Err(deserialize_error(alloc::format!(
             "unexpected end of data after script size (got {}, need {})",

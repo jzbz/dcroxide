@@ -176,7 +176,9 @@ impl Filter {
             version,
             n: num_entries as u32,
             b,
-            modulus_nm: num_entries * m,
+            // The modulus wraps on overflow exactly like Go's uint64
+            // multiply.
+            modulus_nm: num_entries.wrapping_mul(m),
             filter_n_data: Vec::new(),
             data_offset: 0,
         };
@@ -460,7 +462,9 @@ impl FilterV2 {
                 version: 2,
                 n: n as u32,
                 b,
-                modulus_nm: n * m,
+                // A hostile serialized entry count can overflow the
+                // modulus; it wraps exactly like Go's uint64 multiply.
+                modulus_nm: n.wrapping_mul(m),
                 filter_n_data: d.to_vec(),
                 data_offset,
             },
@@ -510,12 +514,19 @@ pub fn make_header_for_filter(filter: &FilterV1, prev_header: &Hash) -> Hash {
 
 /// The maximum serialized size of a version 2 filter with the given
 /// parameters and entry count (dcrd `MaxFilterV2Size`).
+///
+/// The arithmetic reproduces Go's uint64 semantics exactly: with no
+/// entries the largest difference wraps around to `u64::MAX`, a shift
+/// count of 64 or more yields zero, and the final byte rounding wraps
+/// rather than saturating.
 pub fn max_filter_v2_size(b: u8, m: u64, n: u32) -> u64 {
     let n = u64::from(n);
-    let b = u64::from(b);
-    let largest_diff = n * m - 1;
-    let max_quo_bits = largest_diff >> b;
+    let b = u32::from(b);
+    let largest_diff = n.wrapping_mul(m).wrapping_sub(1);
+    let max_quo_bits = largest_diff.checked_shr(b).unwrap_or(0);
     let n_ser_size = var_int_serialize_size(n) as u64;
-    let max_bits = n + n * b + max_quo_bits;
-    max_bits.div_ceil(8) + n_ser_size
+    let max_bits = n
+        .wrapping_add(n.wrapping_mul(u64::from(b)))
+        .wrapping_add(max_quo_bits);
+    max_bits.wrapping_add(7) / 8 + n_ser_size
 }

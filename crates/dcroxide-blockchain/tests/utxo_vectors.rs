@@ -86,7 +86,7 @@ fn compress_vectors() {
                 assert_eq!(buf, compressed, "{line}: compress");
                 assert_eq!(
                     compress::decode_compressed_script_size(&compressed),
-                    compressed.len(),
+                    compressed.len() as i64,
                     "{line}: decoded size"
                 );
                 assert_eq!(
@@ -229,6 +229,22 @@ fn utxoio_vectors() {
 }
 
 /// Randomized round trips over the whole serialization surface.
+/// A corrupt compressed script size below the special-script count
+/// wraps negative exactly like dcrd's unsigned subtraction and `int`
+/// conversion, and the txout decoder rejects it with dcrd's "negative
+/// script size" error instead of panicking.
+#[test]
+fn corrupt_script_size_discriminants_wrap_negative() {
+    // VLQ 10 is above the special encodings (0-5) but below the
+    // NUM_SPECIAL_SCRIPTS bias of 64: 10 - 64 + 1 byte read = -53.
+    assert_eq!(compress::decode_compressed_script_size(&[10]), -53);
+
+    // Script version 0 followed by the corrupt size discriminant.
+    let err = compress::decode_compressed_tx_out(&[0x00, 10], false)
+        .expect_err("a negative script size must be rejected");
+    assert_eq!(err.to_string(), "deserialize error: negative script size");
+}
+
 #[test]
 fn round_trip_properties() {
     let mut rng = SplitMix64::from_entropy("utxo-round-trips");
@@ -261,7 +277,7 @@ fn round_trip_properties() {
         let size = compress::compressed_script_size(0, &script);
         let mut buf = vec![0u8; size];
         compress::put_compressed_script(&mut buf, 0, &script);
-        assert_eq!(compress::decode_compressed_script_size(&buf), size);
+        assert_eq!(compress::decode_compressed_script_size(&buf), size as i64);
         assert_eq!(compress::decompress_script(&buf), script);
 
         // Outpoint keys.
