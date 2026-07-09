@@ -55,9 +55,19 @@ impl ConnectedPeers {
         ConnectedPeers::default()
     }
 
+    /// Lock the registry, recovering from a poisoned mutex: every
+    /// critical section here is a single map operation that cannot leave
+    /// the registry in a broken state, and the registry must stay usable
+    /// for shutdown's `disconnect_all` even after a peer thread panics.
+    fn locked(&self) -> std::sync::MutexGuard<'_, ConnectedPeersInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Register a live connection, returning the handle used to remove it.
     fn register(&self, stream: TcpStream) -> u64 {
-        let mut inner = self.inner.lock().expect("connected peers mutex poisoned");
+        let mut inner = self.locked();
         let id = inner.next_id;
         inner.next_id = inner.next_id.wrapping_add(1);
         inner.peers.insert(id, stream);
@@ -66,20 +76,12 @@ impl ConnectedPeers {
 
     /// Remove a connection that has finished.
     fn deregister(&self, id: u64) {
-        self.inner
-            .lock()
-            .expect("connected peers mutex poisoned")
-            .peers
-            .remove(&id);
+        self.locked().peers.remove(&id);
     }
 
     /// The number of live connections.
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("connected peers mutex poisoned")
-            .peers
-            .len()
+        self.locked().peers.len()
     }
 
     /// Whether there are no live connections.
@@ -91,10 +93,23 @@ impl ConnectedPeers {
     /// which unblocks each peer's read loop so it winds down (dcrd's
     /// server shutdown disconnecting all peers).
     pub fn disconnect_all(&self) {
-        let inner = self.inner.lock().expect("connected peers mutex poisoned");
+        let inner = self.locked();
         for stream in inner.peers.values() {
             let _ = stream.shutdown(Shutdown::Both);
         }
+    }
+}
+
+/// Removes a connection from the registry when dropped, so a peer
+/// deregisters even when its serving thread unwinds from a panic.
+struct DeregisterGuard<'a> {
+    connected: &'a ConnectedPeers,
+    id: u64,
+}
+
+impl Drop for DeregisterGuard<'_> {
+    fn drop(&mut self) {
+        self.connected.deregister(self.id);
     }
 }
 
@@ -168,8 +183,12 @@ fn serve_inbound_peer(
     peer.associate(&addr.to_string(), na, NodePeerEnv::new().now_nanos());
 
     // Register a socket handle so a shutdown can interrupt this peer's
-    // blocking read; a failed clone just leaves it unregistered.
-    let handle = stream.try_clone().ok().map(|h| connected.register(h));
+    // blocking read; a failed clone just leaves it unregistered.  The
+    // guard deregisters on every exit path, panics included.
+    let _guard = stream.try_clone().ok().map(|h| DeregisterGuard {
+        connected,
+        id: connected.register(h),
+    });
 
     let _ = run_peer_connection(
         stream,
@@ -182,10 +201,6 @@ fn serve_inbound_peer(
         // a later piece; keepalive and the handshake are handled inside.
         |_peer, _msg| {},
     );
-
-    if let Some(id) = handle {
-        connected.deregister(id);
-    }
 }
 
 /// Resolve a listener spec's bind address, expanding the wildcard host
@@ -297,12 +312,15 @@ fn accept_loop(listener: &TcpListener, shutdown: &AtomicBool, handler: &InboundH
                     handler(stream, addr);
                 }
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+            // WouldBlock means no connection is pending; anything else
+            // is a transient accept error (a peer resetting between the
+            // SYN queue and accept, descriptor pressure) that must not
+            // kill the listener — dcrd logs and keeps accepting.  Either
+            // way wait a poll interval, which also keeps a persistent
+            // error from spinning hot.
+            Err(_) => {
                 std::thread::sleep(ACCEPT_POLL_INTERVAL);
             }
-            // A hard listener error ends the accept loop; the runtime's
-            // other listeners and the shutdown path are unaffected.
-            Err(_) => return,
         }
     }
 }
@@ -317,5 +335,54 @@ mod tests {
         assert_eq!(bind_address("tcp6", ":9108"), "[::]:9108");
         assert_eq!(bind_address("tcp4", "127.0.0.1:9108"), "127.0.0.1:9108");
         assert_eq!(bind_address("tcp6", "[::1]:9108"), "[::1]:9108");
+    }
+
+    /// The registry stays usable after a thread panics while holding its
+    /// lock, so a crashed peer thread cannot break shutdown's
+    /// `disconnect_all`.
+    #[test]
+    fn connected_peers_survive_a_poisoned_lock() {
+        let connected = ConnectedPeers::new();
+
+        // Poison the mutex by panicking while holding it.
+        let poisoner = connected.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.inner.lock().expect("first lock");
+            panic!("poison the registry mutex");
+        })
+        .join();
+        assert!(connected.inner.lock().is_err(), "mutex should be poisoned");
+
+        // Every registry operation still works.
+        assert!(connected.is_empty());
+        assert_eq!(connected.len(), 0);
+        connected.disconnect_all();
+        connected.deregister(0);
+    }
+
+    /// A guard deregisters its connection even when the serving thread
+    /// unwinds from a panic.
+    #[test]
+    fn deregister_guard_runs_on_unwind() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let stream = TcpStream::connect(addr).expect("connect");
+
+        let connected = ConnectedPeers::new();
+        let registered = connected.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = DeregisterGuard {
+                connected: &registered,
+                id: registered.register(stream),
+            };
+            assert_eq!(registered.len(), 1);
+            panic!("unwind through the guard");
+        })
+        .join();
+
+        assert!(
+            connected.is_empty(),
+            "the guard should deregister on unwind"
+        );
     }
 }
