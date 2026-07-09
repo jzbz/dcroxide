@@ -199,6 +199,28 @@ fn bind_address(net: &str, addr: &str) -> String {
     }
 }
 
+/// Bind a listener spec.  A `tcp6` listener is bound IPv6-only, exactly
+/// like Go's `net.Listen("tcp6", ...)` sets `IPV6_V6ONLY`: without it, a
+/// dual-stack host (Linux `bindv6only=0`) refuses the `[::]` wildcard
+/// with "address in use" once the `0.0.0.0` wildcard for the same port —
+/// the other half of the default listener pair — is already bound.
+fn bind_listener(net: &str, addr: &str) -> io::Result<TcpListener> {
+    let bind_addr = bind_address(net, addr);
+    if net == "tcp6" {
+        // The address is an IP:port by the time it reaches here (the
+        // config pipeline normalizes listeners); fall back to the
+        // resolving std bind for anything else.
+        if let Ok(sock_addr) = bind_addr.parse::<SocketAddr>() {
+            let socket = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)?;
+            socket.set_only_v6(true)?;
+            socket.bind(&sock_addr.into())?;
+            socket.listen(128)?;
+            return Ok(socket.into());
+        }
+    }
+    TcpListener::bind(bind_addr)
+}
+
 /// Binds the parsed peer-to-peer listeners and accepts inbound
 /// connections until shutdown.
 pub struct ListenerRuntime {
@@ -222,7 +244,7 @@ impl ListenerRuntime {
         let mut bound = Vec::with_capacity(specs.len());
 
         for (net, addr) in specs {
-            let listener = TcpListener::bind(bind_address(net, addr))?;
+            let listener = bind_listener(net, addr)?;
             // Non-blocking accept so the loop can observe shutdown
             // promptly without a separate wakeup connection.
             listener.set_nonblocking(true)?;

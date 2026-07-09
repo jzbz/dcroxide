@@ -27,6 +27,7 @@ dcroxide-peer = { path = "../dcroxide-peer" }
 dcroxide-rpc = { path = "../dcroxide-rpc" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-wire = { path = "../dcroxide-wire" }
+socket2 = "0.6.4"
 
 [dev-dependencies]
 tempfile = "3"

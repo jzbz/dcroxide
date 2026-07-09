@@ -6,9 +6,8 @@
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use dcroxide_node::runtime::ListenerRuntime;
@@ -233,4 +232,34 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(20));
     }
     cond()
+}
+
+/// The default listener config expands to a tcp4 and a tcp6 wildcard on
+/// the same port; the tcp6 bind must be IPv6-only (as Go's
+/// net.Listen("tcp6", ...) sets IPV6_V6ONLY) or a dual-stack host
+/// refuses the second bind with "address in use".
+#[test]
+fn binds_the_default_dual_wildcard_listener_pair() {
+    // Bind the tcp4 wildcard first on an ephemeral port, then the tcp6
+    // wildcard on the very same port — the daemon's default ":9108"
+    // shape.  The first runtime holds its port for the whole test, so
+    // there is no reuse race.
+    let (tx, _rx) = mpsc::channel::<SocketAddr>();
+    let handler: Arc<dyn Fn(TcpStream, SocketAddr) + Send + Sync> = {
+        let tx = Mutex::new(tx);
+        Arc::new(move |_stream, peer| {
+            let _ = tx.lock().expect("tx").send(peer);
+        })
+    };
+
+    let v4 = ListenerRuntime::start(&[("tcp4", ":0".to_string())], Arc::clone(&handler))
+        .expect("bind the tcp4 wildcard");
+    let port = v4.bound_addrs()[0].port();
+
+    let v6 = ListenerRuntime::start(&[("tcp6", format!(":{port}"))], handler)
+        .expect("the tcp6 wildcard must bind beside the tcp4 wildcard on the same port");
+    assert_eq!(v6.bound_addrs()[0].port(), port);
+
+    v6.shutdown();
+    v4.shutdown();
 }
