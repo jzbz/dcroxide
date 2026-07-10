@@ -328,7 +328,7 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
     // Unsynced mining allowed so the drain's is-current gate stays
     // open over the genesis-only fixture chain.
     let handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
-        ntfn.clone(),
+        Some(ntfn.clone()),
         params.clone(),
         true,
         dcroxide_node::txmempool::new_shared_tx_pool(

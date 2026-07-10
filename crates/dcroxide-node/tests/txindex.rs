@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: ISC
-//! End-to-end checks for the daemon's transaction index: a regnet
-//! chain built from dcrd's own full-block battery backs a live
-//! `TxIndex` that catches up at startup, follows a block connected
-//! through the chain handler's drain, and serves `getrawtransaction`
-//! over the RPC listener — the non-verbose hex, the verbose block
-//! fields, the no-information error, and getinfo's txindex flag.
+//! End-to-end checks for the daemon's indexes: a regnet chain built
+//! from dcrd's own full-block battery backs a live `TxIndex` and
+//! `ExistsAddrIndex` sharing one subscriber — both catch up at
+//! startup, follow a block connected through the chain handler's
+//! drain, and serve `getrawtransaction`, `existsaddress`, and
+//! `existsaddresses` over the RPC listener with dcrd's exact result
+//! shapes and errors.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -18,7 +19,9 @@ use dcroxide_chainhash::Hash;
 use dcroxide_database::{Database, Options};
 use dcroxide_indexers::Interrupt;
 use dcroxide_netsync::manager::SyncChain;
-use dcroxide_node::indexes::{NodeRpcDb, NodeRpcTxIndexer, NodeTxIndex, start_tx_index};
+use dcroxide_node::indexes::{
+    NodeIndexes, NodeRpcDb, NodeRpcExistsAddresser, NodeRpcTxIndexer, start_indexes,
+};
 use dcroxide_node::rpcrun::{
     NodeRpcChain, NodeRpcConnManager, NodeRpcSyncManager, start_rpc_listener,
 };
@@ -77,7 +80,7 @@ fn serve_txindex_rpc(
     dcroxide_node::rpcrun::RpcListener,
     u16,
     Arc<Mutex<Chain>>,
-    NodeTxIndex,
+    NodeIndexes,
     dcroxide_node::sync::NodeSyncChain,
     i64,
     Vec<MsgBlock>,
@@ -101,15 +104,18 @@ fn serve_txindex_rpc(
         assert!(errs.is_empty(), "history block must accept: {errs:?}");
     }
 
-    // Create the index and catch it up (the daemon's startup path).
+    // Create both indexes and catch them up over one shared
+    // subscriber (the daemon's startup path).
     let interrupt: Interrupt = Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let tx_index = start_tx_index(
+    let indexes = start_indexes(
         interrupt,
         Arc::new(db.clone()),
         Arc::clone(&chain),
         params.clone(),
+        true,
+        true,
     )
-    .expect("start tx index");
+    .expect("start indexes");
 
     // The chain handler wiring the daemon installs: the callback
     // queues block events and the sync chain drains them into the
@@ -124,14 +130,14 @@ fn serve_txindex_rpc(
         false,
     );
     let mut handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
-        dcroxide_node::websocket::NodeNtfnMgr::new(),
+        Some(dcroxide_node::websocket::NodeNtfnMgr::new()),
         params.clone(),
         false,
         Arc::clone(&tx_pool),
         dcroxide_node::dispatch::SyncPeers::new(),
         dcroxide_node::dispatch::new_recently_advertised(),
     );
-    handler.set_index_subscriber(Arc::clone(&tx_index.subscriber));
+    handler.set_index_subscriber(Arc::clone(&indexes.subscriber));
     {
         let callback_handler = handler.clone();
         chain
@@ -170,12 +176,20 @@ fn serve_txindex_rpc(
         interfaces: Box::new(NoInterfaces),
         rand_u64: Box::new(|| 7),
         tx_indexer: Some(Box::new(NodeRpcTxIndexer::new(
-            Arc::clone(&tx_index.index),
-            Arc::clone(&tx_index.queryer),
+            Arc::clone(indexes.tx_index.as_ref().expect("tx index enabled")),
+            Arc::clone(&indexes.queryer),
         ))),
         db: Box::new(NodeRpcDb::new(db)),
         filterer_v2: Box::new(()),
-        exists_addresser: None,
+        exists_addresser: Some(Box::new(NodeRpcExistsAddresser::new(
+            Arc::clone(
+                indexes
+                    .exists_addr_index
+                    .as_ref()
+                    .expect("exists index enabled"),
+            ),
+            Arc::clone(&indexes.queryer),
+        ))),
         log_manager: Box::new(()),
         fee_estimator: Box::new(()),
         block_templater: None,
@@ -208,9 +222,7 @@ fn serve_txindex_rpc(
     )
     .expect("start rpc listener");
     let port = listener.bound_addrs()[0].port();
-    (
-        dir, listener, port, chain, tx_index, sync_chain, now, blocks,
-    )
+    (dir, listener, port, chain, indexes, sync_chain, now, blocks)
 }
 
 /// Send one authenticated raw HTTP POST and return the response body.
@@ -236,16 +248,24 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[test]
 fn serves_getrawtransaction_over_the_live_txindex() {
-    let (_dir, listener, port, _chain, tx_index, mut sync_chain, _now, blocks) =
+    let (_dir, listener, port, _chain, indexes, mut sync_chain, _now, blocks) =
         serve_txindex_rpc(2);
 
-    // The startup catch-up indexed the processed history.
+    // The startup catch-up indexed the processed history for both
+    // indexes over the one shared subscriber.
     {
         use dcroxide_indexers::{ChainQueryer, Indexer};
-        let (best_height, best_hash) = tx_index.queryer.best();
+        let (best_height, best_hash) = indexes.queryer.best();
         assert_eq!(best_height, 2);
-        let idx = tx_index.index.lock().expect("tx index");
+        let idx = indexes.tx_index.as_ref().expect("tx index enabled");
+        let idx = idx.lock().expect("tx index");
         assert_eq!(idx.tip().expect("index tip"), (2, best_hash));
+        let exists = indexes
+            .exists_addr_index
+            .as_ref()
+            .expect("exists index enabled");
+        let exists = exists.lock().expect("exists index");
+        assert_eq!(exists.tip().expect("index tip"), (2, best_hash));
     }
 
     // Connect the next battery block through the live path: the chain
@@ -331,4 +351,149 @@ fn serves_getrawtransaction_over_the_live_txindex() {
     );
 
     listener.shutdown();
+}
+
+#[test]
+fn serves_existsaddress_over_the_live_index() {
+    let (_dir, listener, port, _chain, _indexes, mut sync_chain, _now, blocks) =
+        serve_txindex_rpc(2);
+
+    // Connect the next battery block through the live path so the
+    // exists index records its coinbase addresses through the drain.
+    let live = &blocks[2];
+    sync_chain.process_block(live).expect("live block accepts");
+
+    // The dev-subsidy and pay-to-OP_TRUE script-hash addresses from
+    // the live block's coinbase, and a premine pay-to-pubkey-hash
+    // payout the startup catch-up indexed.
+    let dev = "RcQR65gasxuzf7mUeBXeAux6Z37joPuUwUN";
+    let op_true = "RcdEQX5ee4HPsRTrNxyTApHPVgEgDcyMSEv";
+    let premine = "RsKrWb7Vny1jnzL1sDLgKTAteh9RZcRr5g6";
+    for addr in [dev, op_true, premine] {
+        let response = post(
+            port,
+            &format!(r#"{{"jsonrpc":"1.0","method":"existsaddress","params":["{addr}"],"id":1}}"#),
+        );
+        assert!(
+            response.contains(r#""result":true"#),
+            "{addr} must exist: {response}"
+        );
+    }
+
+    // A valid address the chain has never seen answers false.
+    let params = dcroxide_chaincfg::regnet_params();
+    let unused = dcroxide_txscript::stdaddr::new_address_pub_key_hash_ecdsa_secp256k1_v0(
+        &[0x77u8; 20],
+        &params,
+    )
+    .expect("unused address")
+    .encode();
+    let response = post(
+        port,
+        &format!(r#"{{"jsonrpc":"1.0","method":"existsaddress","params":["{unused}"],"id":2}}"#),
+    );
+    assert!(
+        response.contains(r#""result":false"#),
+        "unused address: {response}"
+    );
+
+    // The batch form packs the answers into dcrd's LSB-first bitset
+    // hex: [true, false, true, true] -> 0b00001101 -> "0d".
+    let response = post(
+        port,
+        &format!(
+            r#"{{"jsonrpc":"1.0","method":"existsaddresses","params":[["{dev}","{unused}","{op_true}","{premine}"]],"id":3}}"#
+        ),
+    );
+    assert!(
+        response.contains(r#""result":"0d""#),
+        "batch bitset: {response}"
+    );
+
+    // A malformed address answers dcrd's decode error.
+    let response = post(
+        port,
+        r#"{"jsonrpc":"1.0","method":"existsaddress","params":["notanaddress"],"id":4}"#,
+    );
+    assert!(
+        response.contains(r#""code":-5"#) && response.contains("Could not decode address"),
+        "bad address: {response}"
+    );
+
+    listener.shutdown();
+}
+
+/// The chain handler drives the index and mempool maintenance without
+/// a websocket manager (the daemon under --norpc; dcrd maintains the
+/// indexes regardless of whether the RPC server runs).
+#[test]
+fn indexes_follow_blocks_without_the_rpc_stack() {
+    let params = dcroxide_chaincfg::regnet_params();
+    let (now, blocks) = accepted_prefix(2);
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let opts = Options::new(dir.path().join("blocks"), params.net.0);
+    let db = Database::create(&opts).expect("create database");
+    let chain = Arc::new(Mutex::new(
+        Chain::open(db.clone(), &params, params.assume_valid, false, 0).expect("open chain"),
+    ));
+    for block in &blocks[..1] {
+        let (_, errs) = chain
+            .lock()
+            .expect("chain")
+            .process_block(block, now, &params);
+        assert!(errs.is_empty(), "history block must accept: {errs:?}");
+    }
+    let interrupt: Interrupt = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let indexes = start_indexes(
+        interrupt,
+        Arc::new(db),
+        Arc::clone(&chain),
+        params.clone(),
+        true,
+        true,
+    )
+    .expect("start indexes");
+
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
+    let mut handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
+        None,
+        params.clone(),
+        false,
+        tx_pool,
+        dcroxide_node::dispatch::SyncPeers::new(),
+        dcroxide_node::dispatch::new_recently_advertised(),
+    );
+    handler.set_index_subscriber(Arc::clone(&indexes.subscriber));
+    {
+        let callback_handler = handler.clone();
+        chain
+            .lock()
+            .expect("chain")
+            .set_notification_callback(Box::new(move |n| callback_handler.handle(n)));
+    }
+    let mut sync_chain =
+        dcroxide_node::sync::NodeSyncChain::new(Arc::clone(&chain), params.clone());
+    sync_chain.set_chain_ntfn_handler(handler);
+
+    sync_chain.process_block(&blocks[1]).expect("live block");
+
+    use dcroxide_indexers::Indexer;
+    let live_hash = blocks[1].header.block_hash();
+    for index in [
+        Arc::clone(indexes.tx_index.as_ref().expect("tx index")) as Arc<Mutex<dyn Indexer>>,
+        Arc::clone(indexes.exists_addr_index.as_ref().expect("exists index"))
+            as Arc<Mutex<dyn Indexer>>,
+    ] {
+        let index = index.lock().expect("index");
+        assert_eq!(index.tip().expect("tip"), (2, live_hash));
+    }
 }

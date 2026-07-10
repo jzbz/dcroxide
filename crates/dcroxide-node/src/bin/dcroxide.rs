@@ -194,20 +194,28 @@ fn run(cfg: Config) -> ExitCode {
     // server holding the chain the serverPeer callbacks consult).
     let chain = Arc::new(Mutex::new(chain));
 
-    // Create the transaction index and catch it up to the main chain
-    // when enabled (dcrd `newServer`'s index block; the exists
-    // address index arrives with a later piece).
-    let tx_index = if cfg.tx_index {
-        log_info("Transaction index is enabled");
-        match dcroxide_node::indexes::start_tx_index(
+    // Create the enabled indexes and catch them up to the main chain
+    // (dcrd `newServer`'s index block: the transaction index under
+    // --txindex, the exists address index unless disabled, one
+    // catch-up over the shared subscriber).
+    let indexes = if cfg.tx_index || !cfg.no_exists_addr_index {
+        if cfg.tx_index {
+            log_info("Transaction index is enabled");
+        }
+        if !cfg.no_exists_addr_index {
+            log_info("Exists address index is enabled");
+        }
+        match dcroxide_node::indexes::start_indexes(
             Arc::clone(&interrupt),
             Arc::new(db.clone()),
             Arc::clone(&chain),
             cfg.params.params.clone(),
+            cfg.tx_index,
+            !cfg.no_exists_addr_index,
         ) {
-            Ok(tx_index) => Some(tx_index),
+            Ok(indexes) => Some(indexes),
             Err(e) => {
-                log_info(&format!("Unable to start the transaction index: {e}"));
+                log_info(&format!("Unable to start the indexes: {e}"));
                 return ExitCode::FAILURE;
             }
         }
@@ -239,6 +247,20 @@ fn run(cfg: Config) -> ExitCode {
         cfg.allow_old_votes,
         !cfg.mining_addrs.is_empty(),
     );
+    // The pool records every added unconfirmed transaction's
+    // addresses in the exists address index when it is enabled
+    // (dcrd's mempool config carrying `ExistsAddrIndex`).
+    if let Some(exists) = indexes
+        .as_ref()
+        .and_then(|indexes| indexes.exists_addr_index.as_ref())
+    {
+        tx_pool
+            .lock()
+            .expect("tx pool mutex poisoned")
+            .set_exists_addr_index(Box::new(
+                dcroxide_node::indexes::NodeUnconfirmedAddrIndexer::new(Arc::clone(exists)),
+            ));
+    }
     // The websocket notification manager exists whenever the RPC
     // server will run, so the peer handlers can announce accepted
     // transactions (dcrd's nil rpcServer checks).
@@ -255,13 +277,47 @@ fn run(cfg: Config) -> ExitCode {
         ntfn.clone(),
     );
 
+    // Feed the chain's events into the daemon handler as blocks
+    // connect, disconnect, and reorganize (dcrd installing
+    // handleBlockchainNotification as its blockchain notification
+    // callback inside `newServer`, before any peer activity): the
+    // mempool maintenance and index notifications run whether or not
+    // the RPC server does — only the websocket sends need the
+    // manager — and the sync adapter drains the handler's deferred
+    // work after each processing call.
+    let mut handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
+        ntfn.clone(),
+        cfg.params.params.clone(),
+        cfg.allow_unsynced_mining,
+        Arc::clone(&tx_pool),
+        server.sync_peers.clone(),
+        Arc::clone(&server.recently_advertised),
+    );
+    // The drained block events also feed the subscribed indexes
+    // (dcrd's handler notifying `s.indexSubscriber`).
+    if let Some(indexes) = &indexes {
+        handler.set_index_subscriber(Arc::clone(&indexes.subscriber));
+    }
+    {
+        let callback_handler = handler.clone();
+        chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .set_notification_callback(Box::new(move |n| callback_handler.handle(n)));
+    }
+    server
+        .sync_manager
+        .lock()
+        .expect("sync manager mutex poisoned")
+        .chain_mut()
+        .set_chain_ntfn_handler(handler);
+
     // Serve the JSON-RPC endpoint (dcrd's RPC server): TLS over the
     // generated certificate pair by default, plain HTTP under the
     // localhost-validated --notls.  This runs before the peer-to-peer
-    // listeners come up so the chain notification callback is
-    // installed before any peer can connect a block (dcrd registers
-    // its notification handler at chain construction inside
-    // `newServer`, ahead of all peer activity).
+    // listeners come up, like dcrd's rpc server existing before
+    // `server.Run` starts any peer activity (the chain notification
+    // callback installs even earlier, above, with the handler).
     let rpc_listener = if cfg.disable_rpc {
         log_info("RPC service is disabled");
         None
@@ -283,14 +339,32 @@ fn run(cfg: Config) -> ExitCode {
                 }
             }
         };
-        // The transaction-index seam over the live index (dcrd
-        // assigning `s.txIndex` to the rpcserver config).
-        let tx_indexer = tx_index.as_ref().map(|tx_index| {
-            Box::new(dcroxide_node::indexes::NodeRpcTxIndexer::new(
-                Arc::clone(&tx_index.index),
-                Arc::clone(&tx_index.queryer),
-            )) as Box<dyn dcroxide_rpc::server::RpcTxIndexer + Send>
-        });
+        // The index seams over the live indexes (dcrd assigning
+        // `s.txIndex` and `s.existsAddrIndex` to the rpcserver
+        // config).
+        let tx_indexer = indexes
+            .as_ref()
+            .and_then(|indexes| indexes.tx_index.as_ref().map(|index| (index, indexes)))
+            .map(|(index, indexes)| {
+                Box::new(dcroxide_node::indexes::NodeRpcTxIndexer::new(
+                    Arc::clone(index),
+                    Arc::clone(&indexes.queryer),
+                )) as Box<dyn dcroxide_rpc::server::RpcTxIndexer + Send>
+            });
+        let exists_addresser = indexes
+            .as_ref()
+            .and_then(|indexes| {
+                indexes
+                    .exists_addr_index
+                    .as_ref()
+                    .map(|index| (index, indexes))
+            })
+            .map(|(index, indexes)| {
+                Box::new(dcroxide_node::indexes::NodeRpcExistsAddresser::new(
+                    Arc::clone(index),
+                    Arc::clone(&indexes.queryer),
+                )) as Box<dyn dcroxide_rpc::server::RpcExistsAddresser + Send>
+            });
         let mut rpc_srv = dcroxide_rpc::server::Server::new(rpc_config(
             &cfg,
             Arc::clone(&chain),
@@ -301,6 +375,7 @@ fn run(cfg: Config) -> ExitCode {
             server.sync_peers.clone(),
             Arc::clone(&server.recently_advertised),
             tx_indexer,
+            exists_addresser,
             db.clone(),
         ));
         // Install the websocket notification manager (dcrd's
@@ -312,39 +387,6 @@ fn run(cfg: Config) -> ExitCode {
         rpc_srv.ntfn_mgr = Box::new(ntfn.clone());
         let rpc_server = Arc::new(Mutex::new(rpc_srv));
         let ntfn_thread = ntfn.start(Arc::clone(&rpc_server));
-
-        // Feed the manager from the chain's events: the chain calls
-        // the daemon handler as blocks connect, disconnect, and
-        // reorganize (dcrd installing handleBlockchainNotification as
-        // its blockchain notification callback), and the sync adapter
-        // drains the handler's deferred winning-tickets lookups after
-        // each processing call.
-        let mut handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
-            ntfn.clone(),
-            cfg.params.params.clone(),
-            cfg.allow_unsynced_mining,
-            Arc::clone(&tx_pool),
-            server.sync_peers.clone(),
-            Arc::clone(&server.recently_advertised),
-        );
-        // The drained block events also feed the subscribed indexes
-        // (dcrd's handler notifying `s.indexSubscriber`).
-        if let Some(tx_index) = &tx_index {
-            handler.set_index_subscriber(Arc::clone(&tx_index.subscriber));
-        }
-        {
-            let callback_handler = handler.clone();
-            chain
-                .lock()
-                .expect("chain mutex poisoned")
-                .set_notification_callback(Box::new(move |n| callback_handler.handle(n)));
-        }
-        server
-            .sync_manager
-            .lock()
-            .expect("sync manager mutex poisoned")
-            .chain_mut()
-            .set_chain_ntfn_handler(handler);
         match dcroxide_node::rpcrun::start_rpc_listener(
             &cfg.rpc_listeners,
             rpc_server,
@@ -632,6 +674,7 @@ fn rpc_config(
         Mutex<dcroxide_containers::lru::Map<dcroxide_chainhash::Hash, dcroxide_wire::MsgTx>>,
     >,
     tx_indexer: Option<Box<dyn dcroxide_rpc::server::RpcTxIndexer + Send>>,
+    exists_addresser: Option<Box<dyn dcroxide_rpc::server::RpcExistsAddresser + Send>>,
     db: Database,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
@@ -665,7 +708,7 @@ fn rpc_config(
         tx_indexer,
         db: Box::new(dcroxide_node::indexes::NodeRpcDb::new(db)),
         filterer_v2: Box::new(()),
-        exists_addresser: None,
+        exists_addresser,
         log_manager: Box::new(()),
         fee_estimator: Box::new(()),
         block_templater: None,

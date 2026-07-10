@@ -182,3 +182,50 @@ fn txpool_vectors() {
     }
     assert_eq!(counts, [29, 1, 2, 1, 1, 40, 1, 1], "row counts");
 }
+
+/// The exists-address hook fires for every transaction added to the
+/// pool (dcrd `addTransaction` calling `AddUnconfirmedTx` when the
+/// index is enabled): replaying the battery's first acceptance with a
+/// recording index installed sees exactly the accepted transactions.
+#[test]
+fn the_exists_addr_hook_records_added_transactions() {
+    use std::sync::{Arc, Mutex};
+
+    struct Recorder(Arc<Mutex<Vec<dcroxide_chainhash::Hash>>>);
+    impl dcroxide_mempool::UnconfirmedAddrIndexer for Recorder {
+        fn add_unconfirmed_tx(&mut self, tx: &MsgTx) {
+            self.0.lock().expect("recorder").push(tx.tx_hash());
+        }
+    }
+
+    let params = mainnet_params();
+    let data = include_str!("data/txpool_vectors.txt");
+    let mut lines = data.lines();
+    let init: Vec<&str> = lines.next().expect("init row").split(' ').collect();
+    let chain = chain_from_init(&init);
+    let policy = harness_policy(params.coinbase_maturity);
+    let mut pool = TxPool::new(chain, policy, &params);
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    pool.set_exists_addr_index(Box::new(Recorder(Arc::clone(&recorded))));
+
+    // The battery's first operation accepts a transaction spending
+    // the harness coinbase.
+    let f: Vec<&str> = lines.next().expect("first op").split(' ').collect();
+    assert_eq!(f[0], "pt", "battery starts with a process-transaction row");
+    assert_eq!(f[5], "ok", "battery's first row accepts");
+    let tx = parse_tx(f[1]);
+    let accepted = pool
+        .process_transaction(
+            &tx,
+            f[2] == "true",
+            f[3] == "true",
+            f[4].parse().expect("tag"),
+        )
+        .expect("scripted acceptance");
+    assert!(!accepted.is_empty());
+    let recorded = recorded.lock().expect("recorder");
+    assert_eq!(
+        accepted, *recorded,
+        "every accepted transaction must reach the index hook"
+    );
+}

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: ISC
 //! The daemon's optional index wiring (dcrd `newServer`'s index
 //! block): the chain queryer the indexes consult, the startup path
-//! that creates the transaction index and catches it up to the main
-//! chain, and the RPC-facing seams `getrawtransaction` consumes.
+//! that creates the enabled indexes and catches them up to the main
+//! chain over one shared subscriber, the mempool's unconfirmed hook,
+//! and the RPC-facing seams `getrawtransaction`, `existsaddress`,
+//! and `existsaddresses` consume.
 //!
 //! dcrd delivers index notifications through a buffered channel into
 //! the subscriber's handler goroutine; the daemon delivers them
@@ -18,8 +20,11 @@ use dcroxide_blockchain::process::Chain;
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{BlockRegion, Database};
-use dcroxide_indexers::{ChainQueryer, IdxError, IndexSubscriber, Indexer, Interrupt, TxIndex};
-use dcroxide_rpc::server::{RpcDb, RpcTxIndexEntry, RpcTxIndexer};
+use dcroxide_indexers::{
+    ChainQueryer, ExistsAddrIndex, IdxError, IndexSubscriber, Indexer, Interrupt, TxIndex,
+};
+use dcroxide_rpc::server::{RpcDb, RpcExistsAddresser, RpcTxIndexEntry, RpcTxIndexer};
+use dcroxide_txscript::stdaddr::Address;
 use dcroxide_wire::{BlockHeader, MsgBlock};
 
 /// How long the RPC seam waits for the index to reach the chain tip
@@ -97,42 +102,97 @@ impl ChainQueryer for NodeChainQueryer {
     }
 }
 
-/// The daemon's live transaction index: the shared index state with
-/// the subscriber that maintains it (dcrd's `server` holding
-/// `txIndex` and `indexSubscriber`).
-pub struct NodeTxIndex {
-    /// The shared transaction index.
-    pub index: Arc<Mutex<TxIndex>>,
-    /// The subscriber feeding it; the chain handler's drain notifies
-    /// through this handle.
+/// The daemon's live indexes: the enabled index handles with the
+/// subscriber that maintains them (dcrd's `server` holding `txIndex`,
+/// `existsAddrIndex`, and `indexSubscriber`).
+pub struct NodeIndexes {
+    /// The shared transaction index, when enabled.
+    pub tx_index: Option<Arc<Mutex<TxIndex>>>,
+    /// The shared exists address index, when enabled.
+    pub exists_addr_index: Option<Arc<Mutex<ExistsAddrIndex>>>,
+    /// The subscriber feeding the indexes; the chain handler's drain
+    /// notifies through this handle.
     pub subscriber: Arc<Mutex<IndexSubscriber>>,
-    /// The queryer both consult.
+    /// The queryer every index consults.
     pub queryer: Arc<NodeChainQueryer>,
 }
 
-/// Create the transaction index and catch it up to the main chain
-/// (dcrd `newServer`'s `indexers.NewTxIndex` + `CatchUp` when
-/// `cfg.TxIndex` is set).  Creation recovers a tip that is no longer
-/// on the main chain by rolling the index back first.
-pub fn start_tx_index(
+/// Create the enabled indexes and catch them up to the main chain
+/// (dcrd `newServer`'s index block: `indexers.NewTxIndex` when
+/// `cfg.TxIndex` is set, `indexers.NewExistsAddrIndex` when the
+/// exists address index is not disabled, then one `CatchUp` over the
+/// shared subscriber).  Creation recovers a tip that is no longer on
+/// the main chain by rolling the index back first.
+pub fn start_indexes(
     interrupt: Interrupt,
     db: Arc<Database>,
     chain: Arc<Mutex<Chain>>,
     params: Params,
-) -> Result<NodeTxIndex, IdxError> {
+    tx_index: bool,
+    exists_addr_index: bool,
+) -> Result<NodeIndexes, IdxError> {
     let queryer = Arc::new(NodeChainQueryer::new(chain, params));
     let mut subscriber = IndexSubscriber::new(interrupt);
-    let index = TxIndex::new(
-        &mut subscriber,
-        db,
-        Arc::clone(&queryer) as Arc<dyn ChainQueryer>,
-    )?;
+    let tx_index = if tx_index {
+        Some(TxIndex::new(
+            &mut subscriber,
+            Arc::clone(&db),
+            Arc::clone(&queryer) as Arc<dyn ChainQueryer>,
+        )?)
+    } else {
+        None
+    };
+    let exists_addr_index = if exists_addr_index {
+        Some(ExistsAddrIndex::new(
+            &mut subscriber,
+            db,
+            Arc::clone(&queryer) as Arc<dyn ChainQueryer>,
+        )?)
+    } else {
+        None
+    };
     subscriber.catch_up(&*queryer)?;
-    Ok(NodeTxIndex {
-        index,
+    Ok(NodeIndexes {
+        tx_index,
+        exists_addr_index,
         subscriber: Arc::new(Mutex::new(subscriber)),
         queryer,
     })
+}
+
+/// Whether the index tip matches the chain tip (dcrd
+/// `maybeNotifySubscribers`' condition).  The locks are taken one at
+/// a time so the RPC thread never nests them.
+fn index_synced<I: Indexer>(
+    index: &Arc<Mutex<I>>,
+    queryer: &NodeChainQueryer,
+) -> Result<bool, String> {
+    let (tip_height, tip_hash) = index
+        .lock()
+        .expect("index mutex poisoned")
+        .tip()
+        .map_err(|e| e.to_string())?;
+    let (best_height, best_hash) = queryer.best();
+    Ok(tip_height == best_height && tip_hash == best_hash)
+}
+
+/// The sync wait with an injectable deadline for the tests; dcrd
+/// races the subscriber's sync signal against `syncWait`.
+fn wait_for_index_sync<I: Indexer>(
+    index: &Arc<Mutex<I>>,
+    queryer: &NodeChainQueryer,
+    deadline: Duration,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        if index_synced(index, queryer).unwrap_or(false) {
+            return true;
+        }
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        std::thread::sleep(SYNC_POLL.min(deadline));
+    }
 }
 
 /// The RPC transaction-index seam over the live index (dcrd assigns
@@ -147,35 +207,6 @@ impl NodeRpcTxIndexer {
     /// A seam over the daemon's live transaction index.
     pub fn new(index: Arc<Mutex<TxIndex>>, queryer: Arc<NodeChainQueryer>) -> NodeRpcTxIndexer {
         NodeRpcTxIndexer { index, queryer }
-    }
-
-    /// Whether the index tip matches the chain tip (dcrd
-    /// `maybeNotifySubscribers`' condition).  The locks are taken one
-    /// at a time so the RPC thread never nests them.
-    fn synced(&self) -> Result<bool, String> {
-        let (tip_height, tip_hash) = self
-            .index
-            .lock()
-            .expect("tx index mutex poisoned")
-            .tip()
-            .map_err(|e| e.to_string())?;
-        let (best_height, best_hash) = self.queryer.best();
-        Ok(tip_height == best_height && tip_hash == best_hash)
-    }
-
-    /// The sync wait with an injectable deadline for the tests; dcrd
-    /// races the subscriber's sync signal against `syncWait`.
-    fn wait_for_sync_until(&self, deadline: Duration) -> bool {
-        let start = Instant::now();
-        loop {
-            if self.synced().unwrap_or(false) {
-                return true;
-            }
-            if start.elapsed() >= deadline {
-                return false;
-            }
-            std::thread::sleep(SYNC_POLL.min(deadline));
-        }
     }
 }
 
@@ -212,7 +243,87 @@ impl RpcTxIndexer for NodeRpcTxIndexer {
     }
 
     fn wait_for_sync(&mut self) -> bool {
-        self.wait_for_sync_until(SYNC_WAIT)
+        wait_for_index_sync(&self.index, &self.queryer, SYNC_WAIT)
+    }
+}
+
+/// The RPC exists-address index seam over the live index (dcrd
+/// assigns the concrete `*indexers.ExistsAddrIndex` to the rpcserver
+/// config's `ExistsAddresser` interface directly).
+pub struct NodeRpcExistsAddresser {
+    index: Arc<Mutex<ExistsAddrIndex>>,
+    queryer: Arc<NodeChainQueryer>,
+}
+
+impl NodeRpcExistsAddresser {
+    /// A seam over the daemon's live exists address index.
+    pub fn new(
+        index: Arc<Mutex<ExistsAddrIndex>>,
+        queryer: Arc<NodeChainQueryer>,
+    ) -> NodeRpcExistsAddresser {
+        NodeRpcExistsAddresser { index, queryer }
+    }
+}
+
+impl RpcExistsAddresser for NodeRpcExistsAddresser {
+    fn name(&mut self) -> String {
+        self.index
+            .lock()
+            .expect("exists addr index mutex poisoned")
+            .name()
+            .to_string()
+    }
+
+    fn tip(&mut self) -> Result<(i64, Hash), String> {
+        self.index
+            .lock()
+            .expect("exists addr index mutex poisoned")
+            .tip()
+            .map_err(|e| e.to_string())
+    }
+
+    fn wait_for_sync(&mut self) -> bool {
+        wait_for_index_sync(&self.index, &self.queryer, SYNC_WAIT)
+    }
+
+    fn exists_address(&mut self, addr: &Address) -> Result<bool, String> {
+        self.index
+            .lock()
+            .expect("exists addr index mutex poisoned")
+            .exists_address(addr)
+            .map_err(|e| e.to_string())
+    }
+
+    fn exists_addresses(&mut self, addrs: &[Address]) -> Result<Vec<bool>, String> {
+        self.index
+            .lock()
+            .expect("exists addr index mutex poisoned")
+            .exists_addresses(addrs)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The mempool's unconfirmed-transaction hook over the live exists
+/// address index (dcrd's mempool config carrying the concrete
+/// `*indexers.ExistsAddrIndex`; `AddUnconfirmedTx` records the
+/// transaction's addresses in the memory-only overlay).
+pub struct NodeUnconfirmedAddrIndexer {
+    index: Arc<Mutex<ExistsAddrIndex>>,
+}
+
+impl NodeUnconfirmedAddrIndexer {
+    /// A hook over the daemon's live exists address index.
+    pub fn new(index: Arc<Mutex<ExistsAddrIndex>>) -> NodeUnconfirmedAddrIndexer {
+        NodeUnconfirmedAddrIndexer { index }
+    }
+}
+
+impl dcroxide_mempool::UnconfirmedAddrIndexer for NodeUnconfirmedAddrIndexer {
+    fn add_unconfirmed_tx(&mut self, tx: &dcroxide_wire::MsgTx) {
+        self.index
+            .lock()
+            .expect("exists addr index mutex poisoned")
+            .add_unconfirmed_tx(tx);
     }
 }
 
@@ -333,14 +444,26 @@ mod tests {
         let genesis_hash = params.genesis_hash;
         let (_dir, db, chain) = open_genesis_chain(&params);
         let interrupt: Interrupt = Arc::new(core::sync::atomic::AtomicBool::new(false));
-        let tx_index =
-            start_tx_index(interrupt, Arc::new(db), chain, params).expect("start tx index");
+        let indexes =
+            start_indexes(interrupt, Arc::new(db), chain, params, true, true).expect("start");
+        let tx_index = indexes.tx_index.as_ref().expect("tx index enabled");
 
-        let mut seam =
-            NodeRpcTxIndexer::new(Arc::clone(&tx_index.index), Arc::clone(&tx_index.queryer));
+        let mut seam = NodeRpcTxIndexer::new(Arc::clone(tx_index), Arc::clone(&indexes.queryer));
         assert_eq!(seam.name(), "transaction index");
         assert_eq!(seam.tip(), Ok((0, genesis_hash)));
         assert!(matches!(seam.entry(&Hash([7u8; 32])), Ok(None)));
+        assert!(seam.wait_for_sync());
+
+        // The exists address index shares the subscriber and answers
+        // over the same synced tip.
+        let exists = indexes
+            .exists_addr_index
+            .as_ref()
+            .expect("exists index enabled");
+        let mut seam =
+            NodeRpcExistsAddresser::new(Arc::clone(exists), Arc::clone(&indexes.queryer));
+        assert_eq!(seam.name(), "exists address index");
+        assert_eq!(seam.tip(), Ok((0, genesis_hash)));
         assert!(seam.wait_for_sync());
     }
 
@@ -352,16 +475,21 @@ mod tests {
         let simnet = dcroxide_chaincfg::simnet_params();
         let (_dir1, db1, chain1) = open_genesis_chain(&simnet);
         let interrupt: Interrupt = Arc::new(core::sync::atomic::AtomicBool::new(false));
-        let tx_index =
-            start_tx_index(interrupt, Arc::new(db1), chain1, simnet).expect("start tx index");
+        let indexes =
+            start_indexes(interrupt, Arc::new(db1), chain1, simnet, true, false).expect("start");
+        let tx_index = indexes.tx_index.as_ref().expect("tx index enabled");
+        assert!(indexes.exists_addr_index.is_none());
 
         // A queryer over a different chain makes the tips disagree
         // permanently for the duration of the wait.
         let testnet = dcroxide_chaincfg::testnet3_params();
         let (_dir2, _db2, chain2) = open_genesis_chain(&testnet);
         let other = Arc::new(NodeChainQueryer::new(chain2, testnet));
-        let seam = NodeRpcTxIndexer::new(Arc::clone(&tx_index.index), other);
-        assert!(!seam.wait_for_sync_until(Duration::from_millis(200)));
+        assert!(!wait_for_index_sync(
+            tx_index,
+            &other,
+            Duration::from_millis(200)
+        ));
     }
 
     /// The daemon shares these seams across the RPC, sync, and signal
@@ -373,6 +501,8 @@ mod tests {
         assert_send_sync::<NodeChainQueryer>();
         assert_send::<NodeRpcTxIndexer>();
         assert_send::<NodeRpcDb>();
-        assert_send::<NodeTxIndex>();
+        assert_send::<NodeIndexes>();
+        assert_send::<NodeRpcExistsAddresser>();
+        assert_send::<NodeUnconfirmedAddrIndexer>();
     }
 }

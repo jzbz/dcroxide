@@ -4,11 +4,12 @@
 //! `mempool.go`: the main, orphan, and stage pools with their
 //! outpoint indexes, vote and treasury spend tracking, the full
 //! acceptance gauntlet (`maybeAcceptTransaction`), orphan processing,
-//! and the pruning surface.  The mining view bookkeeping, exists
-//! address index, fee estimator hooks, and notification callbacks are
-//! integration plumbing that arrives with the mining and RPC phases;
-//! dcrd's locks are unnecessary under Rust ownership.
+//! and the pruning surface.  The fee estimator hooks and notification
+//! callbacks are integration plumbing that arrives with later phases
+//! (the mining view and the exists-address hook are wired); dcrd's
+//! locks are unnecessary under Rust ownership.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
@@ -74,9 +75,10 @@ const NULL_BLOCK_INDEX: u32 = 0xffffffff;
 pub type Tag = u64;
 
 /// The chain state and callbacks the pool needs, standing in for the
-/// closures of dcrd's mempool `Config` (the exists address index, fee
-/// estimator, and notification callbacks are integration plumbing and
-/// are not part of this interface).
+/// closures of dcrd's mempool `Config` (the fee estimator and
+/// notification callbacks are integration plumbing and are not part
+/// of this interface; the exists address index attaches through
+/// [`UnconfirmedAddrIndexer`]).
 pub trait PoolChain {
     /// The stake difficulty for the block after the current best block
     /// (dcrd `Config.NextStakeDifficulty`).
@@ -226,6 +228,15 @@ impl dcroxide_standalone::SubsidyParams for PoolSubsidyParams {
     }
 }
 
+/// The optional exists-address index hook (dcrd mempool `Config`'s
+/// `ExistsAddrIndex` field): the pool records every added unconfirmed
+/// transaction's addresses when the index is enabled.
+pub trait UnconfirmedAddrIndexer: Send {
+    /// Record the unconfirmed transaction's addresses (dcrd
+    /// `AddUnconfirmedTx`).
+    fn add_unconfirmed_tx(&mut self, tx: &MsgTx);
+}
+
 /// The transaction memory pool (dcrd `TxPool`).
 pub struct TxPool<C: PoolChain> {
     /// The chain backend.
@@ -247,6 +258,7 @@ pub struct TxPool<C: PoolChain> {
     votes: BTreeMap<[u8; 32], Vec<VoteDesc>>,
     tspends: BTreeSet<[u8; 32]>,
     next_expire_scan_unix: i64,
+    exists_addr_index: Option<Box<dyn UnconfirmedAddrIndexer>>,
 }
 
 impl<C: PoolChain> TxPool<C> {
@@ -272,7 +284,15 @@ impl<C: PoolChain> TxPool<C> {
             votes: BTreeMap::new(),
             tspends: BTreeSet::new(),
             next_expire_scan_unix,
+            exists_addr_index: None,
         }
+    }
+
+    /// Install the optional exists-address index the pool notifies of
+    /// added unconfirmed transactions (dcrd's mempool config carrying
+    /// `ExistsAddrIndex`).
+    pub fn set_exists_addr_index(&mut self, index: Box<dyn UnconfirmedAddrIndexer>) {
+        self.exists_addr_index = Some(index);
     }
 
     /// Insert a vote into the map of block votes (dcrd `insertVote`).
@@ -648,8 +668,8 @@ impl<C: PoolChain> TxPool<C> {
     }
 
     /// Add the passed transaction to the memory pool without
-    /// validation (dcrd `addTransaction`; the mining view, exists
-    /// address index, and fee estimation hooks are not reproduced).
+    /// validation (dcrd `addTransaction`; the fee estimation hook is
+    /// not reproduced yet).
     fn add_transaction(&mut self, tx_desc: Arc<TxDesc>) {
         // Add the transaction to the pool and mark the referenced
         // outpoints as spent by the pool.  The mining view is updated
@@ -672,6 +692,13 @@ impl<C: PoolChain> TxPool<C> {
                 .insert(out_key(&tx_in.previous_out_point), tx_desc.clone());
         }
         self.last_updated_unix = self.chain.now_unix();
+
+        // Add unconfirmed exists address index entries associated
+        // with the transaction if enabled (dcrd's hook right after
+        // the last-updated bump).
+        if let Some(index) = &mut self.exists_addr_index {
+            index.add_unconfirmed_tx(&tx_desc.tx);
+        }
     }
 
     /// Whether the transaction attempts to spend coins already spent

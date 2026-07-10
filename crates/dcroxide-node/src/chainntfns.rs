@@ -43,7 +43,10 @@ const MAX_REORG_DEPTH_NOTIFY: i64 = 6;
 /// handler consults).  Clones share the same state.
 #[derive(Clone)]
 pub struct ChainNtfnHandler {
-    ntfn: NodeNtfnMgr,
+    /// The websocket notification manager, present when the RPC
+    /// server runs (dcrd's nil `rpcServer` checks around the ws
+    /// sends; the index and mempool maintenance run either way).
+    ntfn: Option<NodeNtfnMgr>,
     params: Params,
     allow_unsynced_mining: bool,
     /// The blocks whose winning tickets were already announced (dcrd
@@ -89,7 +92,7 @@ impl ChainNtfnHandler {
     /// A handler forwarding into the given notification manager and
     /// driving the pool's block maintenance through the relay sinks.
     pub fn new(
-        ntfn: NodeNtfnMgr,
+        ntfn: Option<NodeNtfnMgr>,
         params: Params,
         allow_unsynced_mining: bool,
         tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
@@ -129,7 +132,9 @@ impl ChainNtfnHandler {
             Notification::NewTipBlockChecked(_) => {}
             Notification::BlockAccepted(data) => self.handle_block_accepted(data),
             Notification::BlockConnected(data) => {
-                self.ntfn.notify_block_connected(data.block.clone());
+                if let Some(ntfn) = &self.ntfn {
+                    ntfn.notify_block_connected(data.block.clone());
+                }
                 self.pending_block_events
                     .lock()
                     .expect("pending block events")
@@ -140,7 +145,9 @@ impl ChainNtfnHandler {
                     });
             }
             Notification::BlockDisconnected(data) => {
-                self.ntfn.notify_block_disconnected(data.block.clone());
+                if let Some(ntfn) = &self.ntfn {
+                    ntfn.notify_block_disconnected(data.block.clone());
+                }
                 self.pending_block_events
                     .lock()
                     .expect("pending block events")
@@ -154,27 +161,37 @@ impl ChainNtfnHandler {
             // which is not wired yet.
             Notification::ChainReorgStarted | Notification::ChainReorgDone => {}
             Notification::Reorganization(data) => {
-                self.ntfn.notify_reorganization(
-                    data.old_hash,
-                    data.old_height,
-                    data.new_hash,
-                    data.new_height,
-                );
+                if let Some(ntfn) = &self.ntfn {
+                    ntfn.notify_reorganization(
+                        data.old_hash,
+                        data.old_height,
+                        data.new_hash,
+                        data.new_height,
+                    );
+                }
             }
             Notification::NewTickets(data) => {
-                self.ntfn.notify_new_tickets(
-                    data.hash,
-                    data.height,
-                    data.stake_difficulty,
-                    data.tickets_new.clone(),
-                );
+                if let Some(ntfn) = &self.ntfn {
+                    ntfn.notify_new_tickets(
+                        data.hash,
+                        data.height,
+                        data.stake_difficulty,
+                        data.tickets_new.clone(),
+                    );
+                }
             }
         }
     }
 
     /// Queue the winning-tickets lookup for an accepted block that
-    /// passes dcrd's announcement gate.
+    /// passes dcrd's announcement gate.  dcrd's first condition on
+    /// the whole case is the RPC server running (`s.rpcServer !=
+    /// nil`), so without one there is no lottery work and no
+    /// broadcast-set growth.
     fn handle_block_accepted(&self, data: &BlockAcceptedNtfnsData<'_>) {
+        if self.ntfn.is_none() {
+            return;
+        }
         if !should_notify_winning_tickets(
             &self.params,
             &data.block.header,
@@ -240,8 +257,15 @@ impl ChainNtfnHandler {
             else {
                 continue;
             };
-            let mut mgr = self.ntfn.clone();
-            RpcNtfnManager::notify_winning_tickets(&mut mgr, &block_hash, block_height, &winners);
+            if let Some(ntfn) = &self.ntfn {
+                let mut mgr = ntfn.clone();
+                RpcNtfnManager::notify_winning_tickets(
+                    &mut mgr,
+                    &block_hash,
+                    block_height,
+                    &winners,
+                );
+            }
             self.lottery_data_broadcast
                 .lock()
                 .expect("lottery broadcast set")
@@ -434,7 +458,9 @@ impl ChainNtfnHandler {
                 });
             pairs.push((tx, tree));
         }
-        self.ntfn.notify_new_transactions(pairs);
+        if let Some(ntfn) = &self.ntfn {
+            ntfn.notify_new_transactions(pairs);
+        }
     }
 }
 
