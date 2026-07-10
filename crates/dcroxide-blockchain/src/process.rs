@@ -27,6 +27,10 @@ use crate::RuleError;
 use crate::blockindex::{BlockIndex, BlockStatus, NodeId, NodeStore};
 use crate::chainio::SpentTxOut;
 use crate::chainview_nodes::{NodeBranchView, NodeChainView};
+use crate::notifications::{
+    BlockAcceptedNtfnsData, BlockConnectedNtfnsData, BlockDisconnectedNtfnsData, Notification,
+    NotificationCallback, ReorganizationNtfnsData, TicketNotificationsData,
+};
 use crate::ruleerror::RuleErrorKind;
 use crate::stakever::calc_want_height;
 use crate::thresholdstate::{
@@ -160,6 +164,9 @@ pub struct Chain {
     pub tspend_blocks: BTreeMap<[u8; 32], Vec<Hash>>,
     /// The floor for treasury expenditure limits per DCP0013.
     pub treasury_spend_limit_floor: i64,
+    /// The chain event callback (dcrd `BlockChain.notifications`);
+    /// invoked synchronously from the processing paths when installed.
+    notifications: Option<crate::notifications::NotificationCallback>,
 }
 
 /// Information about the current best chain block and related state
@@ -302,7 +309,41 @@ impl Chain {
             tspend_blocks: BTreeMap::new(),
             treasury_spend_limit_floor: (params.base_subsidy / 10)
                 * (params.treasury_vote_interval * params.treasury_vote_interval_multiplier) as i64,
+            notifications: None,
         }
+    }
+
+    /// Install the chain event callback (dcrd `Config.Notifications`).
+    /// The callback runs synchronously on the processing thread and
+    /// must not call back into the chain.  Installing it after the
+    /// chain opens also mirrors dcrd, whose init-time reorganizations
+    /// run with notifications suppressed.
+    pub fn set_notification_callback(&mut self, callback: NotificationCallback) {
+        self.notifications = Some(callback);
+    }
+
+    /// Invoke the notification callback when one is installed (dcrd
+    /// `sendNotification`).
+    fn send_ntfn(
+        notifications: &mut Option<NotificationCallback>,
+        notification: &Notification<'_>,
+    ) {
+        if let Some(callback) = notifications {
+            callback(notification);
+        }
+    }
+
+    /// Whether the node is an ancestor of (or is) the target (dcrd
+    /// `blockNode.IsAncestorOf`).
+    fn is_ancestor_of(&self, node: NodeId, target: NodeId) -> bool {
+        let node_height = self.store.node(node).height;
+        let target_height = self.store.node(target).height;
+        if target_height < node_height {
+            return false;
+        }
+        self.store
+            .relative_ancestor(target, target_height - node_height)
+            == Some(node)
     }
 
     /// Open a persistent chain over the database, creating the
@@ -1459,13 +1500,13 @@ impl Chain {
             .parent
             .expect("connected block has a parent");
         let prev_height = Some(self.store.node(parent_id).height);
-        {
+        let check_tx_flags = {
             let parent_view = NodeBranchView {
                 store: &self.store,
                 tip: parent_id,
             };
-            crate::validate::determine_check_tx_flags(&parent_view, prev_height, params)?;
-        }
+            crate::validate::determine_check_tx_flags(&parent_view, prev_height, params)?
+        };
 
         // Sanity check the correct number of stxos are provided.
         assert_eq!(
@@ -1534,6 +1575,7 @@ impl Chain {
             missed_tickets: stake_node.missed_tickets(),
             next_final_state: stake_node.final_state(),
         };
+        let tickets_new = stake_node.new_tickets().to_vec();
 
         // The database writes: the spend journal record, the ticket
         // database rows, the filter, and the commitment leaves.
@@ -1593,6 +1635,29 @@ impl Chain {
         // This node is now the end of the best chain.
         self.best_chain.set_tip(&self.store, Some(node));
         self.state_snapshot = state;
+
+        // The connected and new-tickets events (dcrd sends the former
+        // with the chain lock released and the latter with it held;
+        // the synchronous callback here must only queue either way).
+        Self::send_ntfn(
+            &mut self.notifications,
+            &Notification::BlockConnected(BlockConnectedNtfnsData {
+                block,
+                parent_block: parent,
+                check_tx_flags,
+            }),
+        );
+        if node_height >= params.stake_enabled_height {
+            Self::send_ntfn(
+                &mut self.notifications,
+                &Notification::NewTickets(TicketNotificationsData {
+                    hash: node_hash,
+                    height: node_height,
+                    stake_difficulty: next_stake_diff,
+                    tickets_new,
+                }),
+            );
+        }
         Ok(())
     }
 
@@ -1624,7 +1689,8 @@ impl Chain {
             store: &self.store,
             tip: parent_id,
         };
-        crate::validate::determine_check_tx_flags(&parent_view, prev_height, params)?;
+        let check_tx_flags =
+            crate::validate::determine_check_tx_flags(&parent_view, prev_height, params)?;
 
         self.fetch_stake_node(node, params)
             .map_err(stake_rule_error)?;
@@ -1722,6 +1788,18 @@ impl Chain {
         // This node's parent is now the end of the best chain.
         self.best_chain.set_tip(&self.store, Some(parent_id));
         self.state_snapshot = state;
+
+        // The disconnected event with the flags that were active for
+        // the DISCONNECTED block (dcrd sends it with the chain lock
+        // released; the synchronous callback here must only queue).
+        Self::send_ntfn(
+            &mut self.notifications,
+            &Notification::BlockDisconnected(BlockDisconnectedNtfnsData {
+                block,
+                parent_block: parent,
+                check_tx_flags,
+            }),
+        );
         Ok(())
     }
 
@@ -1960,10 +2038,24 @@ impl Chain {
             return reorg_errs;
         }
 
+        let orig_tip = tip;
+        let mut sent_reorging_ntfn = false;
         while let Some(t) = target {
-            if self.best_chain.tip() == Some(t) {
+            let cur_tip = self.best_chain.tip();
+            if cur_tip == Some(t) {
                 break;
             }
+
+            // Notify a reorganization to a competing branch is under
+            // way; a plain tip extension sends nothing (dcrd sends
+            // this at most once with the chain lock held).
+            if !sent_reorging_ntfn
+                && cur_tip.is_some_and(|tip_node| !self.is_ancestor_of(tip_node, t))
+            {
+                Self::send_ntfn(&mut self.notifications, &Notification::ChainReorgStarted);
+                sent_reorging_ntfn = true;
+            }
+
             if let Err(err) = self.reorganize_chain_internal(t, params) {
                 reorg_errs.push(err);
 
@@ -1982,6 +2074,35 @@ impl Chain {
         // based on the actual new tip.
         if let Some(new_tip) = self.best_chain.tip() {
             self.maybe_update_is_current(new_tip, adjusted_time_unix);
+        }
+
+        // The reorganization outcome when the tip actually moved,
+        // then the completion event dcrd defers, which fires even
+        // when every attempt failed.
+        if sent_reorging_ntfn {
+            let new_tip = self.best_chain.tip();
+            if new_tip != orig_tip
+                && let (Some(orig), Some(new)) = (orig_tip, new_tip)
+            {
+                let (old_hash, old_height) = {
+                    let n = self.store.node(orig);
+                    (n.hash, n.height)
+                };
+                let (new_hash, new_height) = {
+                    let n = self.store.node(new);
+                    (n.hash, n.height)
+                };
+                Self::send_ntfn(
+                    &mut self.notifications,
+                    &Notification::Reorganization(ReorganizationNtfnsData {
+                        old_hash,
+                        old_height,
+                        new_hash,
+                        new_height,
+                    }),
+                );
+            }
+            Self::send_ntfn(&mut self.notifications, &Notification::ChainReorgDone);
         }
         reorg_errs
     }
@@ -2043,13 +2164,18 @@ impl Chain {
     /// contextual checks over each, marking any failures, and return
     /// those accepted along with the error for the first failure
     /// (dcrd `maybeAcceptBlocks`; the recent block and context check
-    /// caches and the new-tip notification are not reproduced).
+    /// caches are not reproduced).  A checked block that directly
+    /// extends the current tip while the chain is current sends the
+    /// early new-tip event.
     pub fn maybe_accept_blocks(
         &mut self,
         nodes: Vec<NodeId>,
         fast_add: bool,
+        adjusted_time_unix: i64,
         params: &Params,
     ) -> (Vec<NodeId>, Option<RuleError>) {
+        let cur_tip = self.best_chain.tip();
+        let is_current = cur_tip.is_some_and(|t| self.is_current(t, adjusted_time_unix));
         for (i, &node) in nodes.iter().enumerate() {
             let block = self.block_by_node(node).clone();
             let parent_id = self.store.node(node).parent.expect("linked block parent");
@@ -2068,6 +2194,17 @@ impl Chain {
                 self.index
                     .mark_block_failed_validation(&mut self.store, node);
                 return (nodes[..i].to_vec(), Some(err));
+            }
+
+            // The block checked out and intends to directly extend
+            // the tip as of processing entry: dcrd's early new-tip
+            // event, sent with the chain lock held so the daemon can
+            // relay before the expensive connect.
+            if is_current && self.store.node(node).parent == cur_tip {
+                Self::send_ntfn(
+                    &mut self.notifications,
+                    &Notification::NewTipBlockChecked(&block),
+                );
             }
         }
         (nodes, None)
@@ -2158,13 +2295,46 @@ impl Chain {
         // chain candidate and attempt to reorganize to it regardless
         // of any acceptance failure, exactly like dcrd.
         let mut final_errs = Vec::new();
-        let (_accepted, accept_err) = self.maybe_accept_blocks(linked, fast_add, params);
+        let (accepted, accept_err) =
+            self.maybe_accept_blocks(linked, fast_add, adjusted_time_unix, params);
         if let Some(err) = accept_err {
             final_errs.push(err);
         }
 
         let target = self.index.find_best_chain_candidate(&self.store);
         final_errs.extend(self.reorganize_chain(target, adjusted_time_unix, params));
+
+        // The acceptance events, sent after any reorganization so the
+        // data is relative to the final best chain, skipping nodes
+        // already known invalid; the processed block is the data for
+        // every accepted node, exactly like dcrd.
+        let best_height = self
+            .best_chain
+            .tip()
+            .map(|t| self.store.node(t).height)
+            .unwrap_or(0);
+        for &accepted_node in &accepted {
+            if self
+                .index
+                .node_status(&self.store, accepted_node)
+                .known_invalid()
+            {
+                continue;
+            }
+            let mut accepted_fork_len = 0;
+            if let Some(fork) = self.best_chain.find_fork(&self.store, accepted_node) {
+                accepted_fork_len =
+                    self.store.node(accepted_node).height - self.store.node(fork).height;
+            }
+            Self::send_ntfn(
+                &mut self.notifications,
+                &Notification::BlockAccepted(BlockAcceptedNtfnsData {
+                    best_height,
+                    fork_len: accepted_fork_len,
+                    block,
+                }),
+            );
+        }
 
         let mut fork_len = 0;
         if final_errs.is_empty()

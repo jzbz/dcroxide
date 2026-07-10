@@ -27,6 +27,7 @@ pub mod chainview_nodes;
 pub mod compress;
 pub mod difficulty;
 mod error;
+pub mod notifications;
 pub mod process;
 mod ruleerror;
 pub mod sequencelock;
