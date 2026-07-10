@@ -183,26 +183,33 @@ fn run(cfg: Config) -> ExitCode {
         }
     };
 
-    // Open outbound connections: the permanent `--connect` peers drive
-    // the connection manager (dcrd's connmgr).  The address-manager
-    // automatic dialing plugs into the same driver with a later piece.
-    let connector = if cfg.connect_peers.is_empty() {
-        None
+    // Open outbound connections through the connection manager: the
+    // permanent `--connect` peers when configured, otherwise automatic
+    // dialing from the address manager (dcrd sets `newAddressFunc` only
+    // when no `--connect` peers are given).
+    let get_new_address = if cfg.connect_peers.is_empty() {
+        Some(dcroxide_node::outbound::new_address_source(
+            Arc::clone(&addr_manager),
+            server.outbound_groups.clone(),
+            cfg.params.params.default_port.to_string(),
+        ))
     } else {
         log_info(&format!(
             "Connecting to {} permanent peer(s)",
             cfg.connect_peers.len()
         ));
-        Some(start_outbound(OutboundConfig {
-            template: template.clone(),
-            connected: connected.clone(),
-            server: Some(Arc::clone(&server)),
-            target_outbound: DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u32,
-            retry_duration: Duration::from_nanos(DEFAULT_RETRY_DURATION as u64),
-            dial_timeout: Duration::from_nanos(cfg.dial_timeout_nanos as u64),
-            permanent: cfg.connect_peers.clone(),
-        }))
+        None
     };
+    let connector = start_outbound(OutboundConfig {
+        template: template.clone(),
+        connected: connected.clone(),
+        server: Some(Arc::clone(&server)),
+        target_outbound: DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u32,
+        retry_duration: Duration::from_nanos(DEFAULT_RETRY_DURATION as u64),
+        dial_timeout: Duration::from_nanos(cfg.dial_timeout_nanos as u64),
+        permanent: cfg.connect_peers.clone(),
+        get_new_address,
+    });
     if cfg.disable_seeders {
         log_info("Peer discovery through seeders is disabled");
     }
@@ -226,9 +233,7 @@ fn run(cfg: Config) -> ExitCode {
 
     // Stop dialing, stop the watchdog, disconnect the live peers, and
     // stop accepting new connections (dcrd's server shutdown).
-    if let Some(connector) = connector {
-        connector.shutdown();
-    }
+    connector.shutdown();
     stall_timer.shutdown();
     connected.disconnect_all();
     if let Some(runtime) = runtime {
@@ -289,6 +294,8 @@ fn build_server(
         sync_manager,
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
+        outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
+        disable_listen: cfg.disable_listen,
     });
     // Arm the header-sync stall watchdog around the manager (dcrd's
     // stallHandler timer).

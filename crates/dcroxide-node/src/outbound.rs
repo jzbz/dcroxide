@@ -14,21 +14,25 @@
 //! `serverPeer` serves both directions), registering it with the sync
 //! manager so the daemon syncs from the peers it dials.
 //!
-//! This slice drives the permanent connections requested with
-//! `--connect`; the address-manager-backed automatic dialing (dcrd's
-//! `newAddressFunc` with its group and recent-attempt filtering) plugs
-//! into the same driver through the manager's address source with a
-//! later piece.
+//! The driver opens the permanent connections requested with
+//! `--connect` and fills the remaining outbound slots from the address
+//! source; [`new_address_source`] is dcrd's `newAddressFunc` over the
+//! shared address manager, with its outbound-group spreading,
+//! recent-attempt, and default-port filtering.
 
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use dcroxide_addrmgr::AddrManager;
 use dcroxide_connmgr::{Config, Conn, ConnManager, Event, ReqAddr};
 
-use crate::dispatch::ServerContext;
+use crate::dispatch::{OutboundGroups, ServerContext};
 use crate::runtime::{ConnectedPeers, PeerTemplate, serve_outbound_peer};
+
+/// The address source the automatic dialer draws from.
+pub type AddressSource = Box<dyn FnMut() -> Result<ReqAddr, String> + Send>;
 
 /// A dialed connection handle owned by the connection manager.  It
 /// carries the established stream so the `Connected` event can hand it
@@ -65,6 +69,67 @@ pub struct OutboundConfig {
     /// The addresses to keep permanent connections to (dcrd's
     /// `--connect`).
     pub permanent: Vec<String>,
+    /// The source of new addresses to dial automatically, maintaining
+    /// `target_outbound` connections (dcrd's `NewConnReq` address
+    /// source); absent when only permanent connections are wanted.
+    pub get_new_address: Option<AddressSource>,
+}
+
+/// Build dcrd's `newAddressFunc` over the shared address manager: draw
+/// candidates, skipping addresses in a group the daemon already has an
+/// outbound connection to, recently attempted addresses for the first
+/// thirty tries, and non-default ports for the first fifty.
+pub fn new_address_source(
+    addr_manager: Arc<Mutex<AddrManager>>,
+    groups: OutboundGroups,
+    default_port: String,
+) -> AddressSource {
+    Box::new(move || {
+        for tries in 0..100 {
+            let candidate = addr_manager
+                .lock()
+                .expect("addrmgr mutex poisoned")
+                .get_address();
+            let Some(candidate) = candidate else {
+                break;
+            };
+            let candidate = candidate.lock().expect("known address poisoned");
+            let net_addr = candidate.net_address();
+
+            // Just check that we don't already have an address in the
+            // same group so that we are not connecting to the same
+            // network segment at the expense of others.
+            if groups.count(&net_addr.group_key()) != 0 {
+                continue;
+            }
+
+            // Skip recently attempted nodes until we have tried 30
+            // times.
+            if tries < 30
+                && let Some(last_attempt) = candidate.last_attempt()
+                && now_nanos().saturating_sub(last_attempt) < 10 * 60 * 1_000_000_000
+            {
+                continue;
+            }
+
+            // Allow non-default ports after 50 failed tries.
+            if net_addr.port.to_string() != default_port && tries < 50 {
+                continue;
+            }
+
+            return Ok(ReqAddr::tcp(&net_addr.key()));
+        }
+        Err("no valid connect address".to_string())
+    })
+}
+
+/// The current unix time in nanoseconds for the recent-attempt check
+/// (dcrd's `time.Since(lastAttempt)`).
+fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 /// The state the connection events need to serve a dialed peer.
@@ -165,6 +230,10 @@ fn run_event_loop(
         target_outbound: cfg.target_outbound,
         retry_duration_nanos: cfg.retry_duration.as_nanos() as i64,
         dial: Some(Box::new(move |req: &ReqAddr| dial(req, dial_timeout))),
+        get_new_address: cfg
+            .get_new_address
+            // Re-box to drop the Send bound the driver thread needed.
+            .map(|source| source as Box<dyn FnMut() -> Result<ReqAddr, String>>),
         timeout_nanos: cfg.dial_timeout.as_nanos() as i64,
         ..Config::default()
     });
@@ -173,12 +242,14 @@ fn run_event_loop(
     };
 
     // Open the permanent connections (dcrd `Connect` with permanent set
-    // for each `--connect` address).
+    // for each `--connect` address), then let the manager fill the
+    // remaining outbound slots from the address source (dcrd `Start`).
     let mut events = Vec::new();
     for addr in &cfg.permanent {
         let (_id, dial_events) = manager.connect(ReqAddr::tcp(addr), true);
         events.extend(dial_events);
     }
+    events.extend(manager.start());
     handle_events(&mut manager, events, &serve, &commands);
 
     while let Ok(command) = receiver.recv() {

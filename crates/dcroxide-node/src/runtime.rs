@@ -217,7 +217,27 @@ pub(crate) fn serve_outbound_peer(
         }
         Err(_) => return,
     };
+
+    // Track the outbound group for the connection's lifetime so the
+    // automatic dialer spreads across network segments (dcrd
+    // `handleAddPeer`/`handleDonePeer` updating `outboundGroups`).
+    let group = server
+        .as_ref()
+        .map(|ctx| (ctx.outbound_groups.clone(), group_key_for(&na)));
+    if let Some((groups, key)) = &group {
+        groups.increment(key);
+    }
+
     serve_connection(stream, peer, addr, template, connected, server);
+
+    if let Some((groups, key)) = &group {
+        groups.decrement(key);
+    }
+}
+
+/// The address-manager group key for a wire net address.
+fn group_key_for(na: &dcroxide_wire::NetAddress) -> String {
+    crate::server::wire_to_addrmgr_net_address(na).group_key()
 }
 
 /// Register a connected peer, run it through the connection runtime

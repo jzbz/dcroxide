@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 
 use dcroxide_blockchain::process::Chain;
 use dcroxide_database::{Database, Options};
+use dcroxide_node::dispatch::OutboundGroups;
 use dcroxide_node::dispatch::ServerContext;
-use dcroxide_node::outbound::{OutboundConfig, start_outbound};
+use dcroxide_node::outbound::{OutboundConfig, new_address_source, start_outbound};
 use dcroxide_node::runtime::{ConnectedPeers, ListenerRuntime, PeerTemplate, inbound_peer_handler};
 use dcroxide_wire::{CurrencyNet, ServiceFlag};
 
@@ -44,6 +45,8 @@ fn genesis_server(dir: &std::path::Path, name: &str) -> (Arc<ServerContext>, Con
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
+        outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
+        disable_listen: false,
     });
     (server, connected)
 }
@@ -92,6 +95,7 @@ fn dials_and_serves_a_permanent_connection() {
         retry_duration: Duration::from_millis(200),
         dial_timeout: Duration::from_secs(5),
         permanent: vec![format!("127.0.0.1:{port}")],
+        get_new_address: None,
     });
 
     // Both sides register the live peer once the handshake completes.
@@ -131,6 +135,7 @@ fn retries_an_unreachable_permanent_connection() {
         retry_duration: Duration::from_millis(100),
         dial_timeout: Duration::from_millis(500),
         permanent: vec![format!("127.0.0.1:{port}")],
+        get_new_address: None,
     });
 
     // Nothing ever connects, and the driver stays healthy across a few
@@ -155,4 +160,56 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(20));
     }
     cond()
+}
+
+/// The automatic-dial address source draws candidates from the address
+/// manager, skipping a group the daemon already has an outbound
+/// connection to (dcrd `newAddressFunc`).
+#[test]
+fn address_source_spreads_across_outbound_groups() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let addr_manager = Arc::new(Mutex::new(dcroxide_addrmgr::AddrManager::new(dir.path())));
+
+    // Seed the manager with routable, succeeded addresses in a single
+    // /16 group on the testnet default port.
+    let source_na = wire_na([8, 8, 4, 4], 19108);
+    {
+        let mut mgr = addr_manager.lock().expect("addrmgr");
+        for i in 1..=20u8 {
+            let na = wire_na([8, 8, 8, i], 19108);
+            mgr.add_addresses(std::slice::from_ref(&na), &source_na);
+            mgr.good(&na).expect("mark good");
+        }
+    }
+
+    let groups = OutboundGroups::new();
+    let mut source = new_address_source(Arc::clone(&addr_manager), groups.clone(), "19108".into());
+
+    // A candidate is available while the group is unoccupied.
+    let picked = source().expect("an address is available");
+    assert!(picked.addr.starts_with("8.8.8."), "picked {}", picked.addr);
+
+    // Once an outbound connection occupies the group, every candidate
+    // is skipped and the source reports none available.
+    let group_key = wire_na([8, 8, 8, 8], 19108).group_key();
+    groups.increment(&group_key);
+    assert!(
+        source().is_err(),
+        "the only group is already occupied by an outbound connection"
+    );
+}
+
+/// A routable IPv4 addr-manager net address for the seeding above.
+fn wire_na(ip: [u8; 4], port: u16) -> dcroxide_addrmgr::NetAddress {
+    let mut ip16 = vec![0u8; 16];
+    ip16[10] = 0xff;
+    ip16[11] = 0xff;
+    ip16[12..16].copy_from_slice(&ip);
+    dcroxide_addrmgr::NetAddress {
+        timestamp: 1,
+        services: dcroxide_wire::ServiceFlag(1),
+        ip: ip16,
+        port,
+        addr_type: dcroxide_addrmgr::NetAddressType::IPv4,
+    }
 }
