@@ -470,7 +470,7 @@ fn rpc_config(
         conn_mgr: Box::new(dcroxide_node::rpcrun::NodeRpcConnManager::new(
             connected, net_totals,
         )),
-        tx_mempooler: Box::new(()),
+        tx_mempooler: Box::new(dcroxide_node::rpcrun::EmptyTxMempooler),
         clock: Box::new(dcroxide_node::rpcrun::SystemClock),
         interfaces: Box::new(dcroxide_rpc::helpers::NoInterfaces),
         rand_u64: Box::new(|| {

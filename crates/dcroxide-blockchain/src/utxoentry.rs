@@ -189,4 +189,13 @@ impl UtxoEntry {
     pub fn ticket_minimal_outputs_data(&self) -> Option<&[u8]> {
         self.ticket_min_outs.as_deref()
     }
+
+    /// The decoded minimal outputs of the ticket purchase when this
+    /// entry is a ticket submission output; `None` for every other
+    /// output type (dcrd `TicketMinimalOutputs`).
+    pub fn ticket_minimal_outputs(&self) -> Option<Vec<dcroxide_stake::MinimalOutput>> {
+        self.ticket_min_outs
+            .as_ref()
+            .map(|data| crate::chainio::deserialize_to_minimal_outputs(data).0)
+    }
 }

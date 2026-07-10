@@ -8,7 +8,7 @@
 //! (`ProcessBlock` and the reorganization machinery it drives)
 //! arrives with the chain engine.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -37,6 +37,26 @@ use crate::utxoview::{OutPointKey, UtxoView, count_spent_outputs};
 use crate::validate::{
     ChainSubsidyParams, ForkRejection, check_block_header_positional, check_block_header_sanity,
 };
+
+/// Statistics on the current UTXO set (dcrd `UtxoStats`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UtxoStats {
+    /// The number of unspent outputs.
+    pub utxos: i64,
+    /// The number of distinct transactions with unspent outputs.
+    pub transactions: i64,
+    /// The serialized size of all entries.
+    pub size: i64,
+    /// The total amount of all unspent outputs in atoms.
+    pub total: i64,
+    /// The merkle root of the BLAKE-256 hashes of the serialized
+    /// entries, taken in serialized-key order.
+    pub serialized_hash: Hash,
+}
+
+/// A stats fold row: the serialized outpoint key the fold orders by,
+/// the serialized entry, its amount, and its transaction hash.
+type UtxoStatsRow = (Vec<u8>, Vec<u8>, i64, [u8; 32]);
 
 fn rule_error(kind: RuleErrorKind, description: impl Into<String>) -> RuleError {
     RuleError {
@@ -907,6 +927,76 @@ impl Chain {
     /// preserves original entry fields across disconnects).
     pub fn fetch_utxo_entry(&self, op: &OutPoint) -> Option<UtxoEntry> {
         Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op)
+    }
+
+    /// Statistics on the current UTXO set (dcrd
+    /// `BlockChain.FetchUtxoStats`).  The cache is flushed first, and
+    /// the utxo set state is written for the current tip, exactly as
+    /// dcrd's forced cache flush does before its backend computes the
+    /// stats over the full set.
+    pub fn fetch_utxo_stats(&mut self) -> Result<UtxoStats, crate::chaindb::ChainDbError> {
+        self.flush_utxo_cache();
+        if let Some(db) = &self.db {
+            let tip = self.best_chain.tip().expect("best chain tip");
+            let (tip_hash, tip_height) = {
+                let n = self.store.node(tip);
+                (n.hash, n.height)
+            };
+            db.update(|tx| {
+                crate::chaindb::db_put_utxo_set_state(
+                    tx,
+                    &crate::utxoio::UtxoSetState {
+                        last_flush_height: tip_height as u32,
+                        last_flush_hash: tip_hash,
+                    },
+                )
+                .map_err(chain_db_to_db_error)?;
+                Ok(())
+            })?;
+        }
+
+        // dcrd's backend iterates the set by serialized key bytes;
+        // the VLQ-coded output index makes that order diverge from
+        // numeric order across VLQ length boundaries, so sort by the
+        // serialized keys rather than trusting the in-memory map's
+        // tuple order.
+        let mut rows: Vec<UtxoStatsRow> = Vec::with_capacity(self.utxo_backend.len());
+        for (key, entry) in &self.utxo_backend {
+            let outpoint = OutPoint {
+                hash: Hash(key.0),
+                index: key.1,
+                tree: key.2,
+            };
+            let serialized = crate::utxoio::serialize_utxo_entry(entry)
+                .expect("the utxo backend never holds spent entries");
+            rows.push((
+                crate::utxoio::outpoint_key(&outpoint),
+                serialized,
+                entry.amount(),
+                key.0,
+            ));
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut stats = UtxoStats {
+            utxos: 0,
+            transactions: 0,
+            size: 0,
+            total: 0,
+            serialized_hash: Hash::ZERO,
+        };
+        let mut transactions: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut leaves: Vec<Hash> = Vec::with_capacity(rows.len());
+        for (_, serialized, amount, tx_hash) in rows {
+            stats.utxos += 1;
+            stats.size += serialized.len() as i64;
+            transactions.insert(tx_hash);
+            leaves.push(dcroxide_chainhash::hash_h(&serialized));
+            stats.total += amount;
+        }
+        stats.serialized_hash = dcroxide_standalone::calc_merkle_root_in_place(&mut leaves);
+        stats.transactions = transactions.len() as i64;
+        Ok(stats)
     }
 
     fn cache_fetch(
@@ -2889,6 +2979,72 @@ impl Chain {
         };
         let height = self.store.node(node).height;
         Ok(crate::agendas::max_block_size(&view, Some(height), params))
+    }
+
+    /// Whether the DCP0006 treasury agenda is active for the block
+    /// AFTER the given block (dcrd
+    /// `BlockChain.IsTreasuryAgendaActive`).
+    pub fn is_treasury_agenda_active(
+        &self,
+        prev_hash: &Hash,
+        params: &Params,
+    ) -> Result<bool, RuleError> {
+        // Agendas are never active for the genesis block (dcrd
+        // `isAgendaActiveByHash`'s zero-hash special case).
+        if *prev_hash == Hash::ZERO {
+            return Ok(false);
+        }
+        let node = self.lookup_validatable(prev_hash)?;
+        let view = NodeBranchView {
+            store: &self.store,
+            tip: node,
+        };
+        let height = self.store.node(node).height;
+        crate::agendas::is_treasury_agenda_active(&view, Some(height), params).map_err(|_| {
+            rule_error(
+                RuleErrorKind::UnknownDeploymentID,
+                format!(
+                    "deployment ID {} does not exist",
+                    crate::agendas::VOTE_ID_TREASURY
+                ),
+            )
+        })
+    }
+
+    /// Whether the DCP0009 automatic ticket revocations agenda is
+    /// active for the block AFTER the given block (dcrd
+    /// `BlockChain.IsAutoRevocationsAgendaActive`).
+    pub fn is_auto_revocations_agenda_active(
+        &self,
+        prev_hash: &Hash,
+        params: &Params,
+    ) -> Result<bool, RuleError> {
+        // Agendas are never active for the genesis block (dcrd
+        // `isAgendaActiveByHash`'s zero-hash special case).
+        if *prev_hash == Hash::ZERO {
+            return Ok(false);
+        }
+        let node = self.lookup_validatable(prev_hash)?;
+        let view = NodeBranchView {
+            store: &self.store,
+            tip: node,
+        };
+        let height = self.store.node(node).height;
+        crate::agendas::is_agenda_active(
+            &view,
+            Some(height),
+            crate::agendas::VOTE_ID_AUTO_REVOCATIONS,
+            params,
+        )
+        .map_err(|_| {
+            rule_error(
+                RuleErrorKind::UnknownDeploymentID,
+                format!(
+                    "deployment ID {} does not exist",
+                    crate::agendas::VOTE_ID_AUTO_REVOCATIONS
+                ),
+            )
+        })
     }
 
     /// The height at which the given deployment last changed state as

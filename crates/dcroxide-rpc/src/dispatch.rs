@@ -417,9 +417,11 @@ pub fn standard_cmd_result<C: RpcChain>(
             h::handle_get_treasury_spend_votes(server, cmd)?,
             results::get_treasury_spend_votes_result(),
         ),
+        // dcrd returns a *GetTxOutResult: a missing or spent output
+        // answers JSON null through the nil pointer.
         "gettxout" => (
             h::handle_get_tx_out(server, cmd)?,
-            results::get_tx_out_result(),
+            results::get_tx_out_result().ptr(),
         ),
         "gettxoutsetinfo" => (
             h::handle_get_tx_out_set_info(server, cmd)?,

@@ -20,12 +20,14 @@ use dcroxide_rpc::server::{Config, RpcSubsidyParams, Server};
 use dcroxide_standalone::SubsidyCache;
 use dcroxide_wire::PROTOCOL_VERSION;
 
-/// Start an RPC listener over a fresh genesis testnet chain.
+/// Start an RPC listener over a fresh genesis testnet chain, also
+/// handing back the shared chain so tests can seed its state.
 fn serve_rpc() -> (
     tempfile::TempDir,
     dcroxide_node::rpcrun::RpcListener,
     u16,
     dcroxide_chainhash::Hash,
+    Arc<Mutex<Chain>>,
 ) {
     let params = dcroxide_chaincfg::testnet3_params();
     let genesis_hash = params.genesis_hash;
@@ -36,6 +38,7 @@ fn serve_rpc() -> (
     let chain = Arc::new(Mutex::new(
         Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
     ));
+    let shared_chain = Arc::clone(&chain);
     let connected = ConnectedPeers::new();
     let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
         Arc::clone(&chain),
@@ -56,7 +59,7 @@ fn serve_rpc() -> (
             connected,
             Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         )),
-        tx_mempooler: Box::new(()),
+        tx_mempooler: Box::new(dcroxide_node::rpcrun::EmptyTxMempooler),
         clock: Box::new(dcroxide_node::rpcrun::SystemClock),
         interfaces: Box::new(NoInterfaces),
         rand_u64: Box::new(|| 7),
@@ -95,7 +98,7 @@ fn serve_rpc() -> (
     )
     .expect("start rpc listener");
     let port = listener.bound_addrs()[0].port();
-    (dir, listener, port, genesis_hash)
+    (dir, listener, port, genesis_hash, shared_chain)
 }
 
 /// Send one raw HTTP POST and return the full response text.
@@ -121,7 +124,7 @@ fn post(port: u16, auth: Option<&str>, body: &str) -> String {
 
 #[test]
 fn answers_chain_queries_over_http() {
-    let (_dir, listener, port, genesis_hash) = serve_rpc();
+    let (_dir, listener, port, genesis_hash, _chain) = serve_rpc();
 
     // getbestblockhash answers the genesis hash.
     let response = post(
@@ -244,7 +247,7 @@ fn answers_chain_queries_over_http() {
 
 #[test]
 fn rejects_bad_credentials_with_dcrds_401() {
-    let (_dir, listener, port, _genesis_hash) = serve_rpc();
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
 
     let response = post(
         port,
@@ -263,6 +266,77 @@ fn rejects_bad_credentials_with_dcrds_401() {
         r#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":2}"#,
     );
     assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+
+    listener.shutdown();
+}
+
+/// The UTXO seams: gettxout resolves a seeded entry through the chain
+/// adapter (falling through the empty mempool with dcrd's default
+/// includemempool), misses answer JSON null, and gettxoutsetinfo
+/// reports the seeded set's statistics.
+#[test]
+fn answers_utxo_queries_over_http() {
+    let (_dir, listener, port, genesis_hash, chain) = serve_rpc();
+
+    // Seed one unspent regular output at a known outpoint the way a
+    // connected block would leave it in the flushed set.
+    let tx_hash = dcroxide_chainhash::Hash([0xab; 32]);
+    let entry = dcroxide_blockchain::UtxoEntry::new(
+        123456789,
+        vec![0x51], // OP_TRUE
+        0,
+        0,
+        0,
+        false,
+        false,
+        dcroxide_stake::TxType::Regular,
+        None,
+    );
+    chain
+        .lock()
+        .expect("chain mutex")
+        .utxo_backend
+        .insert((tx_hash.0, 0, 0), entry);
+
+    // gettxout with dcrd's default includemempool probes the empty
+    // mempool, misses, and resolves the entry from the UTXO set.
+    let response = post(
+        port,
+        Some("user:pass"),
+        &format!(r#"{{"jsonrpc":"1.0","method":"gettxout","params":["{tx_hash}",0,0],"id":1}}"#),
+    );
+    assert!(response.contains("\"value\":1.23456789"), "{response}");
+    assert!(response.contains("\"confirmations\":1"), "{response}");
+    assert!(response.contains("\"coinbase\":false"), "{response}");
+    assert!(
+        response.contains(&format!("\"bestblock\":\"{genesis_hash}\"")),
+        "{response}"
+    );
+
+    // An unknown outpoint answers JSON null with no error.
+    let unknown = dcroxide_chainhash::Hash([0xcd; 32]);
+    let response = post(
+        port,
+        Some("user:pass"),
+        &format!(r#"{{"jsonrpc":"1.0","method":"gettxout","params":["{unknown}",0,0],"id":2}}"#),
+    );
+    assert!(response.contains("\"result\":null"), "{response}");
+    assert!(response.contains("\"error\":null"), "{response}");
+
+    // gettxoutsetinfo reports the seeded set over the stats seam.
+    let response = post(
+        port,
+        Some("user:pass"),
+        r#"{"jsonrpc":"1.0","method":"gettxoutsetinfo","params":[],"id":3}"#,
+    );
+    assert!(response.contains("\"height\":0"), "{response}");
+    assert!(
+        response.contains(&format!("\"bestblock\":\"{genesis_hash}\"")),
+        "{response}"
+    );
+    assert!(response.contains("\"transactions\":1"), "{response}");
+    assert!(response.contains("\"txouts\":1"), "{response}");
+    assert!(response.contains("\"totalamount\":123456789"), "{response}");
 
     listener.shutdown();
 }

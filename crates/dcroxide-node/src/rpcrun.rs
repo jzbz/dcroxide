@@ -21,7 +21,8 @@
 //! is a self-signed CA served directly as the end-entity certificate:
 //! Go clients accept that shape, but webpki-based clients must pin
 //! `rpc.cert` exactly as Decred tooling does.  `--notls` on localhost serves plain
-//! HTTP.  The websocket upgrade arrives with a later piece.
+//! HTTP.  A `GET /ws` upgrade request branches to the websocket
+//! serving loop instead of the POST body path.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -242,6 +243,91 @@ impl RpcChain for NodeRpcChain {
             .expect("chain mutex poisoned")
             .state_last_changed_height(hash, deployment_id, &self.params)
             .map_err(|e| e.description)
+    }
+
+    fn fetch_utxo_entry(
+        &mut self,
+        tx_hash: &Hash,
+        index: u32,
+        tree: i8,
+    ) -> Result<Option<dcroxide_rpc::server::RpcUtxoEntry>, String> {
+        use dcroxide_stake::TxType;
+        let outpoint = dcroxide_wire::OutPoint {
+            hash: *tx_hash,
+            index,
+            tree,
+        };
+        let entry = self
+            .chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .fetch_utxo_entry(&outpoint);
+        Ok(entry.map(|entry| dcroxide_rpc::server::RpcUtxoEntry {
+            amount: entry.amount(),
+            script_version: entry.script_version(),
+            pk_script: entry.pk_script().to_vec(),
+            block_height: entry.block_height(),
+            is_coinbase: entry.is_coin_base(),
+            is_spent: entry.is_spent(),
+            // The entry stores the raw type bits; only real transaction
+            // types are ever written, so out-of-range bits (which Go's
+            // unchecked cast would pass through) cannot occur.
+            tx_type: match entry.transaction_type() {
+                1 => TxType::SStx,
+                2 => TxType::SSGen,
+                3 => TxType::SSRtx,
+                4 => TxType::TAdd,
+                5 => TxType::TSpend,
+                6 => TxType::TreasuryBase,
+                _ => TxType::Regular,
+            },
+            ticket_minimal_outputs: entry.ticket_minimal_outputs(),
+        }))
+    }
+
+    fn fetch_utxo_stats(&mut self) -> Result<dcroxide_rpc::server::RpcUtxoStats, String> {
+        let stats = self
+            .chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .fetch_utxo_stats()
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(dcroxide_rpc::server::RpcUtxoStats {
+            utxos: stats.utxos,
+            transactions: stats.transactions,
+            size: stats.size,
+            total: stats.total,
+            serialized_hash: stats.serialized_hash,
+        })
+    }
+
+    fn is_treasury_agenda_active(&mut self, prev_blk_hash: &Hash) -> Result<bool, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .is_treasury_agenda_active(prev_blk_hash, &self.params)
+            .map_err(|e| e.description)
+    }
+
+    fn is_auto_revocations_agenda_active(&mut self, prev_blk_hash: &Hash) -> Result<bool, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .is_auto_revocations_agenda_active(prev_blk_hash, &self.params)
+            .map_err(|e| e.description)
+    }
+}
+
+/// The mempool seam for a daemon that has no mempool yet: every
+/// transaction lookup misses with the error dcrd's mempool answers for
+/// an unknown transaction, which lets gettxout's mempool probe fall
+/// through to the UTXO set.  The remaining mempool operations stay
+/// unwired until the mempool arrives.
+pub struct EmptyTxMempooler;
+
+impl dcroxide_rpc::server::RpcTxMempooler for EmptyTxMempooler {
+    fn fetch_transaction(&mut self, _tx_hash: &Hash) -> Result<(dcroxide_wire::MsgTx, i8), String> {
+        Err("transaction is not in the pool".to_string())
     }
 }
 
