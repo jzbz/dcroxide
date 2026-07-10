@@ -24,8 +24,9 @@
 use std::collections::HashMap;
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dcroxide_addrmgr::AddrManager;
 use dcroxide_blockchain::process::Chain;
@@ -100,6 +101,9 @@ type SyncPeerHandles = (OutboundQueue, Option<TcpStream>);
 #[derive(Clone, Default)]
 pub struct SyncPeers {
     inner: Arc<Mutex<HashMap<i32, SyncPeerHandles>>>,
+    /// The command channel of the header-sync stall timer, once it is
+    /// started ([`start_stall_timer`] wires it back here).
+    stall: Arc<Mutex<Option<mpsc::Sender<StallCommand>>>>,
 }
 
 impl SyncPeers {
@@ -122,6 +126,14 @@ impl SyncPeers {
             .remove(&id);
     }
 
+    /// Forward a timer command to the stall timer when one is running
+    /// (a closed or absent timer means shutdown is in progress).
+    fn send_stall(&self, command: StallCommand) {
+        if let Some(sender) = self.stall.lock().expect("stall sender poisoned").as_ref() {
+            let _ = sender.send(command);
+        }
+    }
+
     /// Execute the sync manager's actions: queue messages on the
     /// targeted peers' outbound queues and interrupt disconnected
     /// peers' reads by shutting their sockets down.  The stall-timer
@@ -140,11 +152,102 @@ impl SyncPeers {
                         let _ = socket.shutdown(Shutdown::Both);
                     }
                 }
-                // The header sync stall timer arrives with the next
-                // piece.
-                Action::ResetHeaderSyncStallTimeout | Action::StopHeaderSyncStallTimeout => {}
+                Action::ResetHeaderSyncStallTimeout => self.send_stall(StallCommand::Reset),
+                Action::StopHeaderSyncStallTimeout => self.send_stall(StallCommand::Stop),
             }
         }
+    }
+}
+
+/// A command for the header-sync stall timer.
+enum StallCommand {
+    /// (Re)arm the timer (dcrd `headerSyncState.ResetStallTimeout`).
+    Reset,
+    /// Disarm the timer (dcrd `headerSyncState.StopStallTimeout`).
+    Stop,
+}
+
+/// The running header-sync stall timer; dropping it (or calling
+/// [`StallTimer::shutdown`]) stops the thread.
+pub struct StallTimer {
+    sender: mpsc::Sender<StallCommand>,
+    /// The registry's sender slot, cleared on shutdown so every sender
+    /// is gone and the thread's receive fails promptly.
+    stall: Arc<Mutex<Option<mpsc::Sender<StallCommand>>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl StallTimer {
+    /// Stop the timer thread and wait for it to finish.
+    pub fn shutdown(mut self) {
+        self.stop_thread();
+    }
+
+    fn stop_thread(&mut self) {
+        // Dropping every sender — the registry's clone and this
+        // handle's own — makes the thread's receive fail, ending its
+        // loop even while parked.
+        *self.stall.lock().expect("stall sender poisoned") = None;
+        let (closed, _) = mpsc::channel();
+        self.sender = closed;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for StallTimer {
+    fn drop(&mut self) {
+        self.stop_thread();
+    }
+}
+
+/// Start the header-sync stall timer: a thread that, once armed by the
+/// manager's reset action, fires the manager's stall handler after
+/// `timeout` unless rearmed or stopped first, executing the disconnect
+/// it decides (dcrd arms the same timeout around its `stallHandler`).
+/// The timeout is injected so tests can shorten it; the daemon passes
+/// [`dcroxide_netsync::manager::HEADER_SYNC_STALL_TIMEOUT_SECS`].
+pub fn start_stall_timer(
+    manager: Arc<Mutex<NodeSyncManager>>,
+    peers: SyncPeers,
+    timeout: Duration,
+) -> StallTimer {
+    let (sender, receiver) = mpsc::channel();
+    let peers_stall = Arc::clone(&peers.stall);
+    *peers_stall.lock().expect("stall sender poisoned") = Some(sender.clone());
+    let thread = thread::spawn(move || {
+        // Parked until a command arrives; armed while a deadline is set.
+        let mut deadline: Option<Instant> = None;
+        loop {
+            let wait = match deadline {
+                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+                None => Duration::from_secs(3600),
+            };
+            match receiver.recv_timeout(wait) {
+                Ok(StallCommand::Reset) => deadline = Instant::now().checked_add(timeout),
+                Ok(StallCommand::Stop) => deadline = None,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Fire only when actually armed; a parked wait that
+                    // elapses just loops.
+                    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        deadline = None;
+                        let actions = {
+                            let mut manager = manager.lock().expect("sync manager poisoned");
+                            manager.on_header_sync_stall_timeout()
+                        };
+                        peers.execute(actions);
+                    }
+                }
+                // All senders dropped: the daemon is shutting down.
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    });
+    StallTimer {
+        sender,
+        stall: Arc::clone(&peers_stall),
+        thread: Some(thread),
     }
 }
 

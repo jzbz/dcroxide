@@ -152,7 +152,7 @@ fn run(cfg: Config) -> ExitCode {
         None
     } else {
         match start_listeners(&cfg, Arc::clone(&chain), Arc::clone(&addr_manager)) {
-            Ok((runtime, connected)) => {
+            Ok((runtime, connected, stall_timer)) => {
                 let addrs: Vec<String> = runtime
                     .bound_addrs()
                     .iter()
@@ -166,7 +166,7 @@ fn run(cfg: Config) -> ExitCode {
                         addrs.join(", ")
                     }
                 ));
-                Some((runtime, connected))
+                Some((runtime, connected, stall_timer))
             }
             Err(e) => {
                 log_info(&format!("Unable to start peer-to-peer listeners: {e}"));
@@ -197,7 +197,8 @@ fn run(cfg: Config) -> ExitCode {
 
     // Disconnect the live peers and stop accepting new connections
     // (dcrd's server shutdown disconnecting all peers).
-    if let Some((runtime, connected)) = listeners {
+    if let Some((runtime, connected, stall_timer)) = listeners {
+        stall_timer.shutdown();
         connected.disconnect_all();
         runtime.shutdown();
     }
@@ -213,7 +214,14 @@ fn start_listeners(
     cfg: &Config,
     chain: Arc<Mutex<Chain>>,
     addr_manager: Arc<Mutex<AddrManager>>,
-) -> Result<(ListenerRuntime, ConnectedPeers), String> {
+) -> Result<
+    (
+        ListenerRuntime,
+        ConnectedPeers,
+        dcroxide_node::dispatch::StallTimer,
+    ),
+    String,
+> {
     let params = &cfg.params.params;
     let template = PeerTemplate {
         net: params.net,
@@ -252,6 +260,13 @@ fn start_listeners(
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
     });
+    // Arm the header-sync stall watchdog around the manager (dcrd's
+    // stallHandler timer).
+    let stall_timer = dcroxide_node::dispatch::start_stall_timer(
+        Arc::clone(&server.sync_manager),
+        server.sync_peers.clone(),
+        Duration::from_secs(dcroxide_netsync::manager::HEADER_SYNC_STALL_TIMEOUT_SECS),
+    );
     let connected = ConnectedPeers::new();
     let specs = parse_listeners(&cfg.listeners)?;
     let runtime = ListenerRuntime::start(
@@ -259,7 +274,7 @@ fn start_listeners(
         inbound_peer_handler(template, connected.clone(), Some(server)),
     )
     .map_err(|e| e.to_string())?;
-    Ok((runtime, connected))
+    Ok((runtime, connected, stall_timer))
 }
 
 /// Open (or create) the block database and initialize the chain state

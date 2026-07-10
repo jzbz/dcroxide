@@ -505,3 +505,101 @@ fn initiates_header_sync_with_a_data_serving_peer() {
     drop(transport);
     runtime.shutdown();
 }
+
+/// The header-sync stall watchdog: a data-serving peer is chosen as
+/// the sync peer and sent getheaders, never answers, and is
+/// disconnected when the stall timeout fires (dcrd\'s stallHandler
+/// timer case).
+#[test]
+fn disconnects_a_stalled_header_sync_peer() {
+    let params = dcroxide_chaincfg::testnet3_params();
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let opts = Options::new(dir.path().join("blocks"), params.net.0);
+    let db = Database::create(&opts).expect("create database");
+    let chain = Arc::new(Mutex::new(
+        Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
+    ));
+    let sync_peers = dcroxide_node::dispatch::SyncPeers::new();
+    let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
+        Arc::clone(&chain),
+        &params,
+        false,
+        8,
+        1000,
+    )));
+    // A short stall timeout so the test observes the watchdog firing.
+    let stall_timer = dcroxide_node::dispatch::start_stall_timer(
+        Arc::clone(&sync_manager),
+        sync_peers.clone(),
+        Duration::from_millis(300),
+    );
+    let server = Arc::new(ServerContext {
+        chain: Arc::clone(&chain),
+        min_known_work: params.min_known_chain_work,
+        disable_banning: false,
+        ban_threshold: 100,
+        whitelists: Vec::new(),
+        addr_manager: Arc::new(Mutex::new(dcroxide_addrmgr::AddrManager::new(dir.path()))),
+        sim_or_reg_net: false,
+        stake_validation_height: params.stake_validation_height,
+        blocks_only: false,
+        sync_manager,
+        sync_peers,
+        next_peer_id: std::sync::atomic::AtomicI32::new(1),
+    });
+    let template = PeerTemplate {
+        net: NET,
+        protocol_version: 0,
+        services: ServiceFlag(1),
+        user_agent_name: "dcroxide".to_string(),
+        user_agent_version: "0.1.0".to_string(),
+        idle_timeout: Duration::from_secs(3600),
+        ping_interval: Duration::from_secs(3600),
+    };
+    let connected = ConnectedPeers::new();
+    let runtime = ListenerRuntime::start(
+        &[("tcp4", ":0".to_string())],
+        inbound_peer_handler(template, connected.clone(), Some(server)),
+    )
+    .expect("start serving runtime");
+    let port = runtime.bound_addrs()[0].port();
+
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
+    let mut env = NodePeerEnv::new();
+    let mut globals = PeerGlobals::new();
+    let config = Config {
+        net: NET,
+        protocol_version: 0,
+        services: ServiceFlag::NODE_NETWORK,
+        ..Config::default()
+    };
+    let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+        .expect("negotiate");
+    transport
+        .write_message(&Message::VerAck)
+        .expect("send verack");
+
+    // The daemon initiates the header sync, then this peer stalls: it
+    // never answers the getheaders, so the watchdog disconnects it and
+    // the reads run out with a closed connection.
+    let mut disconnected = false;
+    for _ in 0..8 {
+        match transport.read_message() {
+            Ok(_) => continue,
+            Err(_) => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+    assert!(disconnected, "the stalled sync peer should be disconnected");
+
+    stall_timer.shutdown();
+    runtime.shutdown();
+}
