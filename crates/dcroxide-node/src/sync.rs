@@ -142,9 +142,12 @@ impl SyncChain for NodeSyncChain {
             self.locked()
                 .process_block(block, adjusted_time_unix(), &self.params);
 
-        // Run the deferred winning-tickets lookups the callback
-        // queued, now that the chain mutex is free.
+        // Run the deferred mempool maintenance and winning-tickets
+        // lookups the callback queued, now that the chain mutex is
+        // free (dcrd handles both inline with its chain lock
+        // released).
         if let Some(handler) = &self.ntfn_handler {
+            handler.drain_pending_block_events();
             handler.drain_pending_winning_tickets(&self.chain, adjusted_time_unix());
         }
 

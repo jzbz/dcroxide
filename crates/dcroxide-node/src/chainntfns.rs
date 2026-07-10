@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use dcroxide_blockchain::notifications::{BlockAcceptedNtfnsData, Notification};
 use dcroxide_blockchain::process::Chain;
+use dcroxide_blockchain::validate::{AgendaFlags, header_approves_parent};
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_rpc::websocket::RpcNtfnManager;
@@ -50,17 +51,57 @@ pub struct ChainNtfnHandler {
     lottery_data_broadcast: Arc<Mutex<HashSet<Hash>>>,
     /// Gate-passing accepted blocks awaiting their lottery lookup.
     pending_winning_tickets: Arc<Mutex<Vec<(Hash, i64)>>>,
+    /// Connected and disconnected blocks awaiting their mempool
+    /// maintenance.
+    pending_block_events: Arc<Mutex<Vec<PendingBlockEvent>>>,
+    /// The shared transaction pool the maintenance drives.
+    tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
+    /// The relay registry for the orphan-acceptance announce cascade.
+    sync_peers: crate::dispatch::SyncPeers,
+    /// The recently-advertised cache the cascade feeds.
+    recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
+}
+
+/// A block event awaiting its mempool maintenance (dcrd's handler
+/// runs it inline with the chain lock released; the daemon's callback
+/// runs under the chain mutex and the pool reaches back into the
+/// chain, so the work defers to the post-processing drain).
+enum PendingBlockEvent {
+    /// A block connected to the main chain.
+    Connected {
+        block: dcroxide_wire::MsgBlock,
+        parent: dcroxide_wire::MsgBlock,
+        check_tx_flags: AgendaFlags,
+    },
+    /// A block disconnected from the main chain.
+    Disconnected {
+        block: dcroxide_wire::MsgBlock,
+        parent: dcroxide_wire::MsgBlock,
+        check_tx_flags: AgendaFlags,
+    },
 }
 
 impl ChainNtfnHandler {
-    /// A handler forwarding into the given notification manager.
-    pub fn new(ntfn: NodeNtfnMgr, params: Params, allow_unsynced_mining: bool) -> ChainNtfnHandler {
+    /// A handler forwarding into the given notification manager and
+    /// driving the pool's block maintenance through the relay sinks.
+    pub fn new(
+        ntfn: NodeNtfnMgr,
+        params: Params,
+        allow_unsynced_mining: bool,
+        tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
+        sync_peers: crate::dispatch::SyncPeers,
+        recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
+    ) -> ChainNtfnHandler {
         ChainNtfnHandler {
             ntfn,
             params,
             allow_unsynced_mining,
             lottery_data_broadcast: Arc::default(),
             pending_winning_tickets: Arc::default(),
+            pending_block_events: Arc::default(),
+            tx_pool,
+            sync_peers,
+            recently_advertised,
         }
     }
 
@@ -74,9 +115,25 @@ impl ChainNtfnHandler {
             Notification::BlockAccepted(data) => self.handle_block_accepted(data),
             Notification::BlockConnected(data) => {
                 self.ntfn.notify_block_connected(data.block.clone());
+                self.pending_block_events
+                    .lock()
+                    .expect("pending block events")
+                    .push(PendingBlockEvent::Connected {
+                        block: data.block.clone(),
+                        parent: data.parent_block.clone(),
+                        check_tx_flags: data.check_tx_flags,
+                    });
             }
             Notification::BlockDisconnected(data) => {
                 self.ntfn.notify_block_disconnected(data.block.clone());
+                self.pending_block_events
+                    .lock()
+                    .expect("pending block events")
+                    .push(PendingBlockEvent::Disconnected {
+                        block: data.block.clone(),
+                        parent: data.parent_block.clone(),
+                        check_tx_flags: data.check_tx_flags,
+                    });
             }
             // These only feed dcrd's background template generator,
             // which is not wired yet.
@@ -175,6 +232,155 @@ impl ChainNtfnHandler {
                 .expect("lottery broadcast set")
                 .insert(block_hash);
         }
+    }
+}
+
+impl ChainNtfnHandler {
+    /// Run the queued mempool maintenance for the connected and
+    /// disconnected blocks, in order, now that the chain mutex is
+    /// free (dcrd `handleBlockchainNotification`'s NTBlockConnected
+    /// and NTBlockDisconnected mempool halves; the fee-estimator feed
+    /// and the rebroadcast bookkeeping arrive with later pieces).
+    pub fn drain_pending_block_events(&self) {
+        let pending: Vec<PendingBlockEvent> = core::mem::take(
+            &mut *self
+                .pending_block_events
+                .lock()
+                .expect("pending block events"),
+        );
+        for event in pending {
+            match event {
+                PendingBlockEvent::Connected {
+                    block,
+                    parent,
+                    check_tx_flags,
+                } => self.handle_connected_block(&block, &parent, check_tx_flags),
+                PendingBlockEvent::Disconnected {
+                    block,
+                    parent,
+                    check_tx_flags,
+                } => self.handle_disconnected_block(&block, &parent, check_tx_flags),
+            }
+        }
+    }
+
+    /// Per-transaction maintenance over a connected block's
+    /// transactions (dcrd `handleConnectedBlockTxns`): drop each from
+    /// the pool without touching its now-valid redeemers, unstage
+    /// dependents, evict double spends and matching orphans, and
+    /// process newly acceptable orphans with the announce cascade.
+    fn handle_connected_block(
+        &self,
+        block: &dcroxide_wire::MsgBlock,
+        parent: &dcroxide_wire::MsgBlock,
+        check_tx_flags: AgendaFlags,
+    ) {
+        let is_treasury_enabled = check_tx_flags.is_treasury_enabled();
+        let regular = block.transactions.get(1..).unwrap_or(&[]);
+        let stake = if is_treasury_enabled {
+            block.stransactions.get(1..).unwrap_or(&[])
+        } else {
+            &block.stransactions[..]
+        };
+        for tx in regular.iter().chain(stake) {
+            let tx_hash = tx.tx_hash();
+            let accepted = {
+                let mut pool = self.tx_pool.lock().expect("tx pool mutex poisoned");
+                pool.remove_transaction(tx, &tx_hash, false);
+                pool.maybe_accept_dependents(tx, &tx_hash, is_treasury_enabled);
+                pool.remove_double_spends(tx, &tx_hash);
+                pool.remove_orphan_pub(&tx_hash);
+                pool.process_orphans(tx, check_tx_flags)
+            };
+            self.announce_transactions(&accepted);
+        }
+
+        // A block that disapproves its parent returns the parent's
+        // regular transactions to contention.
+        if !header_approves_parent(&block.header) {
+            let resurrect = parent.transactions.get(1..).unwrap_or(&[]);
+            let _errs = self
+                .tx_pool
+                .lock()
+                .expect("tx pool mutex poisoned")
+                .maybe_accept_transactions(resurrect);
+        }
+    }
+
+    /// The disconnected-block maintenance (dcrd's NTBlockDisconnected
+    /// case): drop the parent's transactions when the disconnected
+    /// block disapproved them, then re-admit the disconnected block's
+    /// own transactions.
+    fn handle_disconnected_block(
+        &self,
+        block: &dcroxide_wire::MsgBlock,
+        parent: &dcroxide_wire::MsgBlock,
+        check_tx_flags: AgendaFlags,
+    ) {
+        let is_treasury_enabled = check_tx_flags.is_treasury_enabled();
+        if !header_approves_parent(&block.header) {
+            for tx in parent.transactions.get(1..).unwrap_or(&[]) {
+                let tx_hash = tx.tx_hash();
+                let mut pool = self.tx_pool.lock().expect("tx pool mutex poisoned");
+                pool.remove_transaction(tx, &tx_hash, false);
+                pool.maybe_accept_dependents(tx, &tx_hash, is_treasury_enabled);
+                pool.remove_double_spends(tx, &tx_hash);
+                pool.remove_orphan_pub(&tx_hash);
+                // dcrd discards the orphan acceptances on disconnect.
+                let _ = pool.process_orphans(tx, check_tx_flags);
+            }
+        }
+
+        let mut readmit: Vec<dcroxide_wire::MsgTx> =
+            block.transactions.get(1..).unwrap_or(&[]).to_vec();
+        readmit.extend_from_slice(if is_treasury_enabled {
+            block.stransactions.get(1..).unwrap_or(&[])
+        } else {
+            &block.stransactions[..]
+        });
+        let _errs = self
+            .tx_pool
+            .lock()
+            .expect("tx pool mutex poisoned")
+            .maybe_accept_transactions(&readmit);
+    }
+
+    /// The announce cascade for transactions the maintenance accepted
+    /// (dcrd `AnnounceNewTransactions`): websocket notifications, the
+    /// recently-advertised cache, and the peer inventory relay.
+    fn announce_transactions(&self, accepted: &[Hash]) {
+        if accepted.is_empty() {
+            return;
+        }
+        let mut pairs = Vec::new();
+        for hash in accepted {
+            let fetched = {
+                let pool = self.tx_pool.lock().expect("tx pool mutex poisoned");
+                pool.fetch_transaction(hash)
+            };
+            let Some(tx) = fetched else { continue };
+            let tree = if dcroxide_stake::determine_tx_type(&tx) == dcroxide_stake::TxType::Regular
+            {
+                dcroxide_wire::TX_TREE_REGULAR
+            } else {
+                dcroxide_wire::TX_TREE_STAKE
+            };
+            self.recently_advertised
+                .lock()
+                .expect("recently advertised poisoned")
+                .put(*hash, tx.clone());
+            self.sync_peers
+                .relay_inventory(&crate::server::RelayInvFacts {
+                    inv_type: dcroxide_wire::InvType::TX,
+                    inv_hash: *hash,
+                    req_services: dcroxide_wire::ServiceFlag(0),
+                    immediate: false,
+                    data_is_block_header: false,
+                    data_is_tx: true,
+                });
+            pairs.push((tx, tree));
+        }
+        self.ntfn.notify_new_transactions(pairs);
     }
 }
 

@@ -321,6 +321,9 @@ fn run(cfg: Config) -> ExitCode {
             ntfn.clone(),
             cfg.params.params.clone(),
             cfg.allow_unsynced_mining,
+            Arc::clone(&tx_pool),
+            server.sync_peers.clone(),
+            Arc::clone(&server.recently_advertised),
         );
         {
             let callback_handler = handler.clone();

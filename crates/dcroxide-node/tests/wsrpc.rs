@@ -327,8 +327,22 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
     let params = dcroxide_chaincfg::testnet3_params();
     // Unsynced mining allowed so the drain's is-current gate stays
     // open over the genesis-only fixture chain.
-    let handler =
-        dcroxide_node::chainntfns::ChainNtfnHandler::new(ntfn.clone(), params.clone(), true);
+    let handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
+        ntfn.clone(),
+        params.clone(),
+        true,
+        dcroxide_node::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            false,
+            100,
+            10000,
+            false,
+            false,
+        ),
+        dcroxide_node::dispatch::SyncPeers::new(),
+        dcroxide_node::dispatch::new_recently_advertised(),
+    );
 
     // Subscribe to block and new-ticket notifications.
     let mut ws = handshake(port);
@@ -382,6 +396,9 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
         fork_len: 0,
         block: &accepted,
     }));
+    // The connected block queued its mempool maintenance; draining it
+    // over the empty pool is a no-op that must not disturb anything.
+    handler.drain_pending_block_events();
     handler.drain_pending_winning_tickets(&chain, 2_000_000_000);
     ws.set_read_timeout(Some(std::time::Duration::from_millis(300)))
         .expect("set timeout");
