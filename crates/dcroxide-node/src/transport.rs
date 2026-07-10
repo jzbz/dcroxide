@@ -27,6 +27,24 @@ use dcroxide_wire::{
 /// message header (after the 4-byte network magic and 12-byte command).
 const PAYLOAD_LEN_OFFSET: usize = 16;
 
+/// Server-wide wire byte totals (dcrd's `bytesReceived`/`bytesSent`
+/// atomic pair on the server, fed by every peer's reads and writes and
+/// served by the getnettotals RPC).
+#[derive(Default)]
+pub struct NetByteTotals {
+    /// Total wire bytes received from all peers.
+    pub bytes_received: std::sync::atomic::AtomicU64,
+    /// Total wire bytes sent to all peers.
+    pub bytes_sent: std::sync::atomic::AtomicU64,
+}
+
+impl NetByteTotals {
+    /// A zeroed totals pair.
+    pub fn new() -> NetByteTotals {
+        NetByteTotals::default()
+    }
+}
+
 /// Frames [`Message`]s over a byte stream using dcrd's wire encoding.
 pub struct WireTransport<S> {
     stream: S,
@@ -34,6 +52,10 @@ pub struct WireTransport<S> {
     net: CurrencyNet,
     bytes_read: u64,
     bytes_written: u64,
+    /// The server-wide totals this transport contributes to, when the
+    /// daemon's accounting is wired (dcrd's `OnRead`/`OnWrite`
+    /// listeners adding into the server's atomic counters).
+    net_totals: Option<std::sync::Arc<NetByteTotals>>,
 }
 
 impl<S> WireTransport<S> {
@@ -46,7 +68,14 @@ impl<S> WireTransport<S> {
             net,
             bytes_read: 0,
             bytes_written: 0,
+            net_totals: None,
         }
+    }
+
+    /// Contribute this transport's reads and writes to the server-wide
+    /// byte totals.
+    pub fn set_net_totals(&mut self, totals: std::sync::Arc<NetByteTotals>) {
+        self.net_totals = Some(totals);
     }
 
     /// Set the protocol version future messages are framed at.  The
@@ -115,6 +144,11 @@ impl<S: Read + Write> MsgTransport for WireTransport<S> {
         let (msg, consumed) =
             wire_read_message(&buf, self.pver, self.net).map_err(|e| e.to_string())?;
         self.bytes_read = self.bytes_read.saturating_add(consumed as u64);
+        if let Some(totals) = &self.net_totals {
+            totals
+                .bytes_received
+                .fetch_add(consumed as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(msg)
     }
 
@@ -123,6 +157,11 @@ impl<S: Read + Write> MsgTransport for WireTransport<S> {
         self.stream.write_all(&bytes).map_err(|e| e.to_string())?;
         self.stream.flush().map_err(|e| e.to_string())?;
         self.bytes_written = self.bytes_written.saturating_add(bytes.len() as u64);
+        if let Some(totals) = &self.net_totals {
+            totals
+                .bytes_sent
+                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(())
     }
 }

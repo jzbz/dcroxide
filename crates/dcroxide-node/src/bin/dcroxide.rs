@@ -272,6 +272,7 @@ fn run(cfg: Config) -> ExitCode {
             Arc::clone(&chain),
             connected.clone(),
             Arc::clone(&server.sync_manager),
+            Arc::clone(&server.net_totals),
         ))));
         match dcroxide_node::rpcrun::start_rpc_listener(&cfg.rpc_listeners, rpc_server, transport) {
             Ok(listener) => {
@@ -372,6 +373,7 @@ fn build_server(
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
         outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
+        net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: cfg.disable_listen,
     });
     // Arm the header-sync stall watchdog around the manager (dcrd's
@@ -449,10 +451,11 @@ fn rpc_config(
     chain: Arc<Mutex<Chain>>,
     connected: ConnectedPeers,
     sync_manager: Arc<Mutex<dcroxide_node::sync::NodeSyncManager>>,
+    net_totals: Arc<dcroxide_node::transport::NetByteTotals>,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
     dcroxide_rpc::server::Config {
-        chain: dcroxide_node::rpcrun::NodeRpcChain::new(chain),
+        chain: dcroxide_node::rpcrun::NodeRpcChain::new(chain, params.clone()),
         chain_params: params.clone(),
         subsidy_cache: dcroxide_standalone::SubsidyCache::new(
             dcroxide_rpc::server::RpcSubsidyParams(params),
@@ -460,9 +463,11 @@ fn rpc_config(
         min_relay_tx_fee: cfg.min_relay_tx_fee_atoms,
         max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
         sync_mgr: Box::new(dcroxide_node::rpcrun::NodeRpcSyncManager::new(sync_manager)),
-        conn_mgr: Box::new(dcroxide_node::rpcrun::NodeRpcConnManager::new(connected)),
+        conn_mgr: Box::new(dcroxide_node::rpcrun::NodeRpcConnManager::new(
+            connected, net_totals,
+        )),
         tx_mempooler: Box::new(()),
-        clock: Box::new(()),
+        clock: Box::new(dcroxide_node::rpcrun::SystemClock),
         interfaces: Box::new(dcroxide_rpc::helpers::NoInterfaces),
         rand_u64: Box::new(|| {
             let mut buf = [0u8; 8];
@@ -477,7 +482,7 @@ fn rpc_config(
         fee_estimator: Box::new(()),
         block_templater: None,
         sanity_checker: Box::new(()),
-        time_source: Box::new(()),
+        time_source: Box::new(dcroxide_node::rpcrun::SystemTimeSource),
         proxy: cfg.proxy.clone(),
         test_net: cfg.test_net,
         runtime_version: String::new(),

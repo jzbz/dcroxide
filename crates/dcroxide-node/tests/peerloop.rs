@@ -246,6 +246,7 @@ fn run_peer_connection_negotiates_and_serves_until_the_remote_closes() {
             NET,
             Duration::from_secs(3600),
             Duration::from_secs(3600),
+            None,
             move |_peer: &mut Peer, msg: &Message, _outbound: &OutboundQueue| {
                 sink.lock().expect("sink").push(msg.clone());
                 ServeSignal::Continue
@@ -323,6 +324,7 @@ fn run_peer_connection_frames_at_the_negotiated_version_not_the_sentinel() {
             NET,
             Duration::from_secs(3600),
             Duration::from_secs(3600),
+            None,
             move |_peer: &mut Peer, msg: &Message, _outbound: &OutboundQueue| {
                 sink.lock().expect("sink").push(msg.clone());
                 ServeSignal::Continue

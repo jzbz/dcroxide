@@ -46,15 +46,18 @@ fn serve_rpc() -> (
     )));
 
     let server = Arc::new(Mutex::new(Server::new(Config {
-        chain: NodeRpcChain::new(chain),
+        chain: NodeRpcChain::new(chain, params.clone()),
         chain_params: params.clone(),
         subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager)),
-        conn_mgr: Box::new(NodeRpcConnManager::new(connected)),
+        conn_mgr: Box::new(NodeRpcConnManager::new(
+            connected,
+            Arc::new(dcroxide_node::transport::NetByteTotals::new()),
+        )),
         tx_mempooler: Box::new(()),
-        clock: Box::new(()),
+        clock: Box::new(dcroxide_node::rpcrun::SystemClock),
         interfaces: Box::new(NoInterfaces),
         rand_u64: Box::new(|| 7),
         tx_indexer: None,
@@ -65,7 +68,7 @@ fn serve_rpc() -> (
         fee_estimator: Box::new(()),
         block_templater: None,
         sanity_checker: Box::new(()),
-        time_source: Box::new(()),
+        time_source: Box::new(dcroxide_node::rpcrun::SystemTimeSource),
         proxy: String::new(),
         test_net: true,
         runtime_version: String::new(),
@@ -180,12 +183,51 @@ fn answers_chain_queries_over_http() {
     );
     assert!(response.contains("\"result\":0"), "{response}");
 
-    // A handler whose daemon seam is not wired yet (net totals) answers
-    // an internal error instead of killing the server...
+    // getinfo answers the full node-info result (the zero-offset time
+    // source matches a sample-less dcrd).
     let response = post(
         port,
         Some("user:pass"),
-        r#"{"jsonrpc":"1.0","method":"getnettotals","params":[],"id":3}"#,
+        r#"{"jsonrpc":"1.0","method":"getinfo","params":[],"id":9}"#,
+    );
+    assert!(response.contains("\"blocks\":0"), "{response}");
+    assert!(response.contains("\"timeoffset\":0"), "{response}");
+    assert!(response.contains("\"testnet\":true"), "{response}");
+    assert!(response.contains("\"txindex\":false"), "{response}");
+
+    // getblockchaininfo answers with the genesis chain state and the
+    // agenda statuses through the threshold-state conversion.
+    let response = post(
+        port,
+        Some("user:pass"),
+        r#"{"jsonrpc":"1.0","method":"getblockchaininfo","params":[],"id":10}"#,
+    );
+    assert!(response.contains("\"chain\":\"testnet3\""), "{response}");
+    assert!(response.contains("\"blocks\":0"), "{response}");
+    assert!(
+        response.contains("\"initialblockdownload\":true"),
+        "{response}"
+    );
+    assert!(response.contains("\"deployments\":{"), "{response}");
+    assert!(response.contains("\"status\":\"defined\""), "{response}");
+
+    // getnettotals answers through the byte-totals pair and the system
+    // clock (no peers have exchanged bytes in this fixture).
+    let response = post(
+        port,
+        Some("user:pass"),
+        r#"{"jsonrpc":"1.0","method":"getnettotals","params":[],"id":11}"#,
+    );
+    assert!(response.contains("\"totalbytesrecv\":0"), "{response}");
+    assert!(response.contains("\"totalbytessent\":0"), "{response}");
+    assert!(response.contains("\"timemillis\":"), "{response}");
+
+    // A handler whose daemon seam is not wired yet (the mempool)
+    // answers an internal error instead of killing the server...
+    let response = post(
+        port,
+        Some("user:pass"),
+        r#"{"jsonrpc":"1.0","method":"getrawmempool","params":[],"id":3}"#,
     );
     assert!(response.contains("-32603"), "{response}");
 
@@ -258,7 +300,7 @@ fn serves_tls_with_a_generated_certificate() {
         Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
     ));
     let server = Arc::new(Mutex::new(Server::new(Config {
-        chain: NodeRpcChain::new(chain),
+        chain: NodeRpcChain::new(chain, params.clone()),
         chain_params: params.clone(),
         subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
         min_relay_tx_fee: 10000,
@@ -266,7 +308,7 @@ fn serves_tls_with_a_generated_certificate() {
         sync_mgr: Box::new(()),
         conn_mgr: Box::new(()),
         tx_mempooler: Box::new(()),
-        clock: Box::new(()),
+        clock: Box::new(dcroxide_node::rpcrun::SystemClock),
         interfaces: Box::new(NoInterfaces),
         rand_u64: Box::new(|| 7),
         tx_indexer: None,
@@ -277,7 +319,7 @@ fn serves_tls_with_a_generated_certificate() {
         fee_estimator: Box::new(()),
         block_templater: None,
         sanity_checker: Box::new(()),
-        time_source: Box::new(()),
+        time_source: Box::new(dcroxide_node::rpcrun::SystemTimeSource),
         proxy: String::new(),
         test_net: true,
         runtime_version: String::new(),

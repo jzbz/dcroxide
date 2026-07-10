@@ -2878,6 +2878,19 @@ impl Chain {
         ))
     }
 
+    /// The maximum allowed block size for the block after the given
+    /// one, honoring the max-block-size vote where the network defines
+    /// it (dcrd `BlockChain.MaxBlockSize`).
+    pub fn max_block_size(&self, hash: &Hash, params: &Params) -> Result<i64, RuleError> {
+        let node = self.lookup_validatable(hash)?;
+        let view = NodeBranchView {
+            store: &self.store,
+            tip: node,
+        };
+        let height = self.store.node(node).height;
+        Ok(crate::agendas::max_block_size(&view, Some(height), params))
+    }
+
     /// The height at which the given deployment last changed state as
     /// of the given block hash (dcrd `StateLastChangedHeight`); zero
     /// when the state has never changed.

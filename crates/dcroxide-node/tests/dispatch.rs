@@ -64,6 +64,7 @@ fn serve_genesis_chain() -> (
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
         outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
+        net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
     });
 
@@ -449,6 +450,7 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
         outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
+        net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
     });
     let template = PeerTemplate {
@@ -552,6 +554,7 @@ fn disconnects_a_stalled_header_sync_peer() {
         sync_peers,
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
         outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
+        net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
     });
     let template = PeerTemplate {

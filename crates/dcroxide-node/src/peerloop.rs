@@ -287,6 +287,7 @@ pub fn run_ping_timer<E: PeerEnv>(
 /// connection stopped.  `idle_timeout` bounds each read so a silent peer
 /// eventually disconnects (dcrd's idle timer); `ping_interval` should be
 /// shorter so a live peer answers before that fires.
+#[allow(clippy::too_many_arguments)] // Mirrors dcrd's connection surface.
 pub fn run_peer_connection<H>(
     stream: TcpStream,
     mut peer: Peer,
@@ -294,6 +295,7 @@ pub fn run_peer_connection<H>(
     net: CurrencyNet,
     idle_timeout: Duration,
     ping_interval: Duration,
+    net_totals: Option<Arc<crate::transport::NetByteTotals>>,
     mut hooks: H,
 ) -> DisconnectReason
 where
@@ -318,6 +320,12 @@ where
     };
     let mut read_transport = WireTransport::new(stream, handshake_pver, net);
     let mut write_transport = WireTransport::new(write_stream, handshake_pver, net);
+    // Both halves contribute to the server-wide byte totals from the
+    // handshake onward, exactly like dcrd's read/write listeners.
+    if let Some(totals) = net_totals {
+        read_transport.set_net_totals(Arc::clone(&totals));
+        write_transport.set_net_totals(totals);
+    }
 
     // Negotiate the version exchange before starting the loops.  The
     // read transport is full duplex, so it also writes the local version.

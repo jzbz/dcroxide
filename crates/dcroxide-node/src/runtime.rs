@@ -263,6 +263,9 @@ fn serve_connection(
     // The per-peer server state and dispatch (dcrd `newServerPeer` and
     // the message listeners it registers).  The socket handle lets the
     // sync manager's disconnect actions interrupt this peer's read.
+    let server_net_totals = server
+        .as_ref()
+        .map(|ctx| std::sync::Arc::clone(&ctx.net_totals));
     let hooks = match server {
         Some(ctx) => {
             let whitelisted = is_whitelisted(&ctx.whitelists, &addr.to_string());
@@ -275,6 +278,10 @@ fn serve_connection(
         None => InboundHooks::NoOp,
     };
 
+    let net_totals = match &hooks {
+        InboundHooks::Server(_) => server_net_totals,
+        InboundHooks::NoOp => None,
+    };
     let _ = run_peer_connection(
         stream,
         peer,
@@ -282,6 +289,7 @@ fn serve_connection(
         template.net,
         template.idle_timeout,
         template.ping_interval,
+        net_totals,
         hooks,
     );
 }

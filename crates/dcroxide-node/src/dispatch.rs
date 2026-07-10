@@ -94,6 +94,10 @@ pub struct ServerContext {
     /// Whether the daemon accepts incoming connections (`--nolisten`);
     /// gates the local-address advertisement to outbound peers.
     pub disable_listen: bool,
+    /// The server-wide wire byte totals every peer transport feeds
+    /// (dcrd's `bytesReceived`/`bytesSent` pair; getnettotals serves
+    /// them).
+    pub net_totals: Arc<crate::transport::NetByteTotals>,
 }
 
 /// The per-group count of outbound connections (dcrd

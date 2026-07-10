@@ -52,12 +52,13 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// are wired).
 pub struct NodeRpcChain {
     chain: Arc<Mutex<Chain>>,
+    params: dcroxide_chaincfg::Params,
 }
 
 impl NodeRpcChain {
     /// Adapt the shared chain for the RPC handlers.
-    pub fn new(chain: Arc<Mutex<Chain>>) -> NodeRpcChain {
-        NodeRpcChain { chain }
+    pub fn new(chain: Arc<Mutex<Chain>>, params: dcroxide_chaincfg::Params) -> NodeRpcChain {
+        NodeRpcChain { chain, params }
     }
 }
 
@@ -198,6 +199,84 @@ impl RpcChain for NodeRpcChain {
             .ticket_pool_value()
             .ok_or_else(|| "unable to compute the ticket pool value".to_string())
     }
+
+    fn max_block_size(&mut self, prev_blk_hash: &Hash) -> Result<i64, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .max_block_size(prev_blk_hash, &self.params)
+            .map_err(|e| e.description)
+    }
+
+    fn next_threshold_state(
+        &mut self,
+        prev_blk_hash: &Hash,
+        deployment_id: &str,
+    ) -> Result<dcroxide_rpc::helpers::threshold::State, String> {
+        use dcroxide_blockchain::thresholdstate::ThresholdState;
+        use dcroxide_rpc::helpers::threshold::State;
+        let tuple = self
+            .chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .next_threshold_state(prev_blk_hash, deployment_id, &self.params)
+            .map_err(|e| e.description)?;
+        // The winning choice is dropped: dcrd's handler consults only
+        // the state for the agenda status string.
+        Ok(match tuple.state {
+            ThresholdState::Defined => State::Defined,
+            ThresholdState::Started => State::Started,
+            ThresholdState::LockedIn => State::LockedIn,
+            ThresholdState::Active => State::Active,
+            ThresholdState::Failed => State::Failed,
+        })
+    }
+
+    fn state_last_changed_height(
+        &mut self,
+        hash: &Hash,
+        deployment_id: &str,
+    ) -> Result<i64, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .state_last_changed_height(hash, deployment_id, &self.params)
+            .map_err(|e| e.description)
+    }
+}
+
+/// The system clock for the RPC handlers (dcrd `rpcClock` over bare
+/// `time.Now`/`time.Since`).
+pub struct SystemClock;
+
+impl dcroxide_rpc::server::RpcClock for SystemClock {
+    fn now_unix_millis(&mut self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    fn since_nanos(&mut self, t_unix_nanos: i64) -> i64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        now.saturating_sub(t_unix_nanos)
+    }
+}
+
+/// The median-adjusted time source for the RPC handlers.  dcrd feeds
+/// its median time source samples from each peer's version message;
+/// the daemon collects no samples yet, and a sample-less dcrd source
+/// reports a zero offset, so the zero here is dcrd-exact until the
+/// median-time port lands.
+pub struct SystemTimeSource;
+
+impl dcroxide_rpc::server::RpcTimeSource for SystemTimeSource {
+    fn offset_nanos(&mut self) -> i64 {
+        0
+    }
 }
 
 /// The connection-manager adapter answering the RPC handlers' peer
@@ -205,18 +284,38 @@ impl RpcChain for NodeRpcChain {
 /// the `RpcConnManager` seam).
 pub struct NodeRpcConnManager {
     connected: crate::runtime::ConnectedPeers,
+    net_totals: Arc<crate::transport::NetByteTotals>,
 }
 
 impl NodeRpcConnManager {
-    /// Adapt the connected-peer registry for the RPC handlers.
-    pub fn new(connected: crate::runtime::ConnectedPeers) -> NodeRpcConnManager {
-        NodeRpcConnManager { connected }
+    /// Adapt the connected-peer registry and byte totals for the RPC
+    /// handlers.
+    pub fn new(
+        connected: crate::runtime::ConnectedPeers,
+        net_totals: Arc<crate::transport::NetByteTotals>,
+    ) -> NodeRpcConnManager {
+        NodeRpcConnManager {
+            connected,
+            net_totals,
+        }
     }
 }
 
 impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
     fn connected_count(&mut self) -> i32 {
         self.connected.len() as i32
+    }
+
+    fn net_totals(&mut self) -> (u64, u64) {
+        // Received first, sent second (dcrd `NetTotals`).
+        (
+            self.net_totals
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.net_totals
+                .bytes_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 }
 
