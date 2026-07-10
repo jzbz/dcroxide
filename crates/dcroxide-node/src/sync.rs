@@ -47,12 +47,25 @@ const RECENTLY_CONFIRMED_TXNS_FP_RATE: f64 = 0.000001;
 pub struct NodeSyncChain {
     chain: Arc<Mutex<Chain>>,
     params: Params,
+    ntfn_handler: Option<crate::chainntfns::ChainNtfnHandler>,
 }
 
 impl NodeSyncChain {
     /// Adapt the shared chain for the sync manager.
     pub fn new(chain: Arc<Mutex<Chain>>, params: Params) -> NodeSyncChain {
-        NodeSyncChain { chain, params }
+        NodeSyncChain {
+            chain,
+            params,
+            ntfn_handler: None,
+        }
+    }
+
+    /// Install the chain event handler whose deferred winning-tickets
+    /// lookups drain after each processing call (dcrd runs the lookup
+    /// in its handler with the chain lock released; the daemon's
+    /// callback runs under the chain mutex, so the lookup waits here).
+    pub fn set_chain_ntfn_handler(&mut self, handler: crate::chainntfns::ChainNtfnHandler) {
+        self.ntfn_handler = Some(handler);
     }
 
     fn locked(&self) -> std::sync::MutexGuard<'_, Chain> {
@@ -127,6 +140,13 @@ impl SyncChain for NodeSyncChain {
         let (fork_len, errs) =
             self.locked()
                 .process_block(block, adjusted_time_unix(), &self.params);
+
+        // Run the deferred winning-tickets lookups the callback
+        // queued, now that the chain mutex is free.
+        if let Some(handler) = &self.ntfn_handler {
+            handler.drain_pending_winning_tickets(&self.chain, adjusted_time_unix());
+        }
+
         match errs.into_iter().next() {
             None => Ok(fork_len),
             Some(err) => Err(ProcessBlockFailure {

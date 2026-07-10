@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod chainntfns;
 pub mod config;
 pub mod dispatch;
 pub mod flags;

@@ -281,6 +281,31 @@ fn run(cfg: Config) -> ExitCode {
         rpc_srv.ntfn_mgr = Box::new(ntfn.clone());
         let rpc_server = Arc::new(Mutex::new(rpc_srv));
         let ntfn_thread = ntfn.start(Arc::clone(&rpc_server));
+
+        // Feed the manager from the chain's events: the chain calls
+        // the daemon handler as blocks connect, disconnect, and
+        // reorganize (dcrd installing handleBlockchainNotification as
+        // its blockchain notification callback), and the sync adapter
+        // drains the handler's deferred winning-tickets lookups after
+        // each processing call.
+        let handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
+            ntfn.clone(),
+            cfg.params.params.clone(),
+            cfg.allow_unsynced_mining,
+        );
+        {
+            let callback_handler = handler.clone();
+            chain
+                .lock()
+                .expect("chain mutex poisoned")
+                .set_notification_callback(Box::new(move |n| callback_handler.handle(n)));
+        }
+        server
+            .sync_manager
+            .lock()
+            .expect("sync manager mutex poisoned")
+            .chain_mut()
+            .set_chain_ntfn_handler(handler);
         match dcroxide_node::rpcrun::start_rpc_listener(
             &cfg.rpc_listeners,
             rpc_server,
