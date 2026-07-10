@@ -210,9 +210,32 @@ fn run(cfg: Config) -> ExitCode {
         permanent: cfg.connect_peers.clone(),
         get_new_address,
     });
-    if cfg.disable_seeders {
+    // Query the network seeders to bootstrap the address manager (dcrd
+    // `Run` launching `querySeeders` when seeding is enabled).
+    let seeder_boot = if cfg.disable_seeders {
         log_info("Peer discovery through seeders is disabled");
-    }
+        None
+    } else {
+        let seeders: Vec<String> = cfg
+            .params
+            .params
+            .seeders
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if seeders.is_empty() {
+            None
+        } else {
+            log_info(&format!("Querying {} network seeder(s)", seeders.len()));
+            Some(dcroxide_node::seeding::start_seeding(
+                seeders,
+                Arc::clone(&addr_manager),
+                // dcrd's defaultRequiredServices.
+                ServiceFlag::NODE_NETWORK.0,
+                dcroxide_node::seeding::UreqTransport::new,
+            ))
+        }
+    };
 
     log_info(
         "The UTXO database, the address-manager automatic dialing, and the RPC \
@@ -231,8 +254,12 @@ fn run(cfg: Config) -> ExitCode {
     }
     let _ = rx.recv();
 
-    // Stop dialing, stop the watchdog, disconnect the live peers, and
-    // stop accepting new connections (dcrd's server shutdown).
+    // Stop seeding and dialing, stop the watchdog, disconnect the live
+    // peers, and stop accepting new connections (dcrd's server
+    // shutdown).
+    if let Some(seeder_boot) = seeder_boot {
+        seeder_boot.shutdown();
+    }
     connector.shutdown();
     stall_timer.shutdown();
     connected.disconnect_all();
