@@ -243,21 +243,35 @@ fn run(cfg: Config) -> ExitCode {
          received.",
     );
 
-    // Serve the JSON-RPC endpoint (dcrd's RPC server).  This slice
-    // serves the plain-HTTP --notls configuration; the TLS listener
-    // arrives with a later piece.
+    // Serve the JSON-RPC endpoint (dcrd's RPC server): TLS over the
+    // generated certificate pair by default, plain HTTP under the
+    // localhost-validated --notls.
     let rpc_listener = if cfg.disable_rpc {
         log_info("RPC service is disabled");
         None
-    } else if !cfg.disable_tls {
-        log_info("The RPC TLS listener is not yet wired; use --notls on localhost");
-        None
     } else {
+        let transport = if cfg.disable_tls {
+            dcroxide_node::rpcrun::RpcTransport::Plain
+        } else {
+            let config = dcroxide_node::rpcrun::load_or_generate_cert_pair(
+                Path::new(&cfg.rpc_cert),
+                Path::new(&cfg.rpc_key),
+                &cfg.external_ips,
+            )
+            .and_then(|(cert, key)| dcroxide_node::rpcrun::tls_server_config(&cert, &key));
+            match config {
+                Ok(config) => dcroxide_node::rpcrun::RpcTransport::Tls(config),
+                Err(e) => {
+                    log_info(&format!("Unable to set up RPC TLS: {e}"));
+                    return ExitCode::FAILURE;
+                }
+            }
+        };
         let rpc_server = Arc::new(Mutex::new(dcroxide_rpc::server::Server::new(rpc_config(
             &cfg,
             Arc::clone(&chain),
         ))));
-        match dcroxide_node::rpcrun::start_rpc_listener(&cfg.rpc_listeners, rpc_server) {
+        match dcroxide_node::rpcrun::start_rpc_listener(&cfg.rpc_listeners, rpc_server, transport) {
             Ok(listener) => {
                 let addrs: Vec<String> = listener
                     .bound_addrs()

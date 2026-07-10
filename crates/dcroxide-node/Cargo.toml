@@ -17,6 +17,7 @@ ctrlc = { version = "3", features = ["termination"] }
 getrandom = "0.3"
 dcroxide-addrmgr = { path = "../dcroxide-addrmgr" }
 dcroxide-blockchain = { path = "../dcroxide-blockchain" }
+dcroxide-certgen = { path = "../dcroxide-certgen" }
 dcroxide-uint256 = { path = "../dcroxide-uint256" }
 dcroxide-database = { path = "../dcroxide-database" }
 dcroxide-connmgr = { path = "../dcroxide-connmgr" }
@@ -30,6 +31,8 @@ dcroxide-peer = { path = "../dcroxide-peer" }
 dcroxide-rpc = { path = "../dcroxide-rpc" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-wire = { path = "../dcroxide-wire" }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
 ureq = "3"
 socket2 = "0.6.4"
 
