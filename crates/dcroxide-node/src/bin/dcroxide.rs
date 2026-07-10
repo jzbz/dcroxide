@@ -274,11 +274,19 @@ fn run(cfg: Config) -> ExitCode {
             Arc::clone(&server.sync_manager),
             Arc::clone(&server.net_totals),
         ));
-        // Install the websocket subscription recorder (dcrd's
-        // wsNotificationManager) so the subscription commands answer.
-        rpc_srv.ntfn_mgr = Box::new(dcroxide_node::websocket::NodeNtfnMgr::new());
+        // Install the websocket notification manager (dcrd's
+        // wsNotificationManager) and start its delivery thread over
+        // the server.
+        let ntfn = dcroxide_node::websocket::NodeNtfnMgr::new();
+        rpc_srv.ntfn_mgr = Box::new(ntfn.clone());
         let rpc_server = Arc::new(Mutex::new(rpc_srv));
-        match dcroxide_node::rpcrun::start_rpc_listener(&cfg.rpc_listeners, rpc_server, transport) {
+        let ntfn_thread = ntfn.start(Arc::clone(&rpc_server));
+        match dcroxide_node::rpcrun::start_rpc_listener(
+            &cfg.rpc_listeners,
+            rpc_server,
+            transport,
+            ntfn.clone(),
+        ) {
             Ok(listener) => {
                 let addrs: Vec<String> = listener
                     .bound_addrs()
@@ -286,7 +294,7 @@ fn run(cfg: Config) -> ExitCode {
                     .map(|addr| addr.to_string())
                     .collect();
                 log_info(&format!("RPC server listening on {}", addrs.join(", ")));
-                Some(listener)
+                Some((listener, ntfn, ntfn_thread))
             }
             Err(e) => {
                 log_info(&format!("Unable to start RPC server: {e}"));
@@ -309,8 +317,12 @@ fn run(cfg: Config) -> ExitCode {
     // Stop seeding and dialing, stop the watchdog, disconnect the live
     // peers, and stop accepting new connections (dcrd's server
     // shutdown).
-    if let Some(rpc_listener) = rpc_listener {
+    if let Some((rpc_listener, ntfn, ntfn_thread)) = rpc_listener {
         rpc_listener.shutdown();
+        ntfn.shutdown();
+        if let Some(thread) = ntfn_thread {
+            let _ = thread.join();
+        }
     }
     if let Some(seeder_boot) = seeder_boot {
         seeder_boot.shutdown();

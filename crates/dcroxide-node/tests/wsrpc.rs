@@ -21,8 +21,14 @@ use dcroxide_standalone::SubsidyCache;
 use dcroxide_wire::PROTOCOL_VERSION;
 
 /// Start a plain-HTTP RPC listener (which also serves `/ws`) over a
-/// genesis testnet chain with the credentials user:pass.
-fn serve_ws() -> (tempfile::TempDir, RpcListener, u16) {
+/// genesis testnet chain with the credentials user:pass, handing back
+/// the notification manager so tests can queue events.
+fn serve_ws() -> (
+    tempfile::TempDir,
+    RpcListener,
+    u16,
+    dcroxide_node::websocket::NodeNtfnMgr,
+) {
     let params = dcroxide_chaincfg::testnet3_params();
     let dir = tempfile::tempdir().expect("temp dir");
     let opts = Options::new(dir.path().join("blocks"), params.net.0);
@@ -80,16 +86,20 @@ fn serve_ws() -> (tempfile::TempDir, RpcListener, u16) {
         rpc_limit_user: String::new(),
         rpc_limit_pass: String::new(),
     });
-    server.ntfn_mgr = Box::new(dcroxide_node::websocket::NodeNtfnMgr::new());
+    let ntfn = dcroxide_node::websocket::NodeNtfnMgr::new();
+    server.ntfn_mgr = Box::new(ntfn.clone());
+    let server = Arc::new(Mutex::new(server));
+    ntfn.start(Arc::clone(&server)).expect("delivery thread");
 
     let listener = start_rpc_listener(
         &["127.0.0.1:0".to_string()],
-        Arc::new(Mutex::new(server)),
+        server,
         RpcTransport::Plain,
+        ntfn.clone(),
     )
     .expect("start rpc listener");
     let port = listener.bound_addrs()[0].port();
-    (dir, listener, port)
+    (dir, listener, port, ntfn)
 }
 
 /// Complete the RFC 6455 handshake over a fresh connection, returning
@@ -144,8 +154,20 @@ fn read_server_frame(stream: &mut TcpStream) -> String {
     let mut header = [0u8; 2];
     stream.read_exact(&mut header).expect("read frame header");
     assert_eq!(header[0] & 0x0F, 0x1, "server sends text frames");
-    let len = (header[1] & 0x7F) as usize;
-    // Server frames are never masked, and test replies are small.
+    // Server frames are never masked.
+    let len = match header[1] & 0x7F {
+        126 => {
+            let mut ext = [0u8; 2];
+            stream.read_exact(&mut ext).expect("read extended length");
+            u16::from_be_bytes(ext) as usize
+        }
+        127 => {
+            let mut ext = [0u8; 8];
+            stream.read_exact(&mut ext).expect("read extended length");
+            u64::from_be_bytes(ext) as usize
+        }
+        n => n as usize,
+    };
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload).expect("read frame payload");
     String::from_utf8(payload).expect("utf8 payload")
@@ -153,7 +175,7 @@ fn read_server_frame(stream: &mut TcpStream) -> String {
 
 #[test]
 fn authenticates_and_queries_over_websocket() {
-    let (_dir, listener, port) = serve_ws();
+    let (_dir, listener, port, _ntfn) = serve_ws();
     let mut ws = handshake(port);
 
     // A query before authenticating drops the connection... but first
@@ -187,9 +209,96 @@ fn authenticates_and_queries_over_websocket() {
     listener.shutdown();
 }
 
+/// Delivery: a queued block-connected event reaches the subscribed
+/// client as a JSON-RPC notification, skips the unsubscribed one, and
+/// the connection keeps answering requests afterwards; a disconnected
+/// subscriber is cleaned up without disturbing later events.
+#[test]
+fn notifications_reach_only_subscribers() {
+    let (_dir, listener, port, ntfn) = serve_ws();
+    let genesis = dcroxide_chaincfg::testnet3_params().genesis_block;
+
+    // Client A authenticates and subscribes to block notifications.
+    let mut a = handshake(port);
+    write_client_frame(
+        &mut a,
+        br#"{"jsonrpc":"1.0","method":"authenticate","params":["user","pass"],"id":1}"#,
+    );
+    read_server_frame(&mut a);
+    write_client_frame(
+        &mut a,
+        br#"{"jsonrpc":"1.0","method":"notifyblocks","params":[],"id":2}"#,
+    );
+    read_server_frame(&mut a);
+
+    // Client B authenticates but subscribes to nothing.
+    let mut b = handshake(port);
+    write_client_frame(
+        &mut b,
+        br#"{"jsonrpc":"1.0","method":"authenticate","params":["user","pass"],"id":1}"#,
+    );
+    read_server_frame(&mut b);
+
+    // A connected block fans out to A as a null-id notification...
+    ntfn.notify_block_connected(genesis.clone());
+    a.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .expect("set timeout");
+    let notification = read_server_frame(&mut a);
+    assert!(
+        notification.contains("\"method\":\"blockconnected\""),
+        "{notification}"
+    );
+    assert!(notification.contains("\"id\":null"), "{notification}");
+    // The params carry the serialized header hex.
+    let header_hex: String =
+        genesis
+            .header
+            .serialize()
+            .iter()
+            .fold(String::new(), |mut acc, byte| {
+                acc.push_str(&format!("{byte:02x}"));
+                acc
+            });
+    assert!(notification.contains(&header_hex), "{notification}");
+
+    // ...and not to B, whose read times out with no frame.
+    b.set_read_timeout(Some(std::time::Duration::from_millis(400)))
+        .expect("set timeout");
+    let mut probe = [0u8; 1];
+    assert!(
+        b.read(&mut probe).is_err(),
+        "the unsubscribed client must receive nothing"
+    );
+
+    // A still answers requests after the notification (the serving
+    // loop interleaves notification writes with request handling).
+    write_client_frame(
+        &mut a,
+        br#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":3}"#,
+    );
+    let reply = read_server_frame(&mut a);
+    assert!(reply.contains("\"result\":0"), "{reply}");
+
+    // Dropping the subscriber cleans it up; later events go nowhere
+    // and the survivor keeps answering.
+    drop(a);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    ntfn.notify_block_connected(genesis);
+    b.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .expect("set timeout");
+    write_client_frame(
+        &mut b,
+        br#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":2}"#,
+    );
+    let reply = read_server_frame(&mut b);
+    assert!(reply.contains("\"result\":0"), "{reply}");
+
+    listener.shutdown();
+}
+
 #[test]
 fn a_command_before_authenticate_drops_the_connection() {
-    let (_dir, listener, port) = serve_ws();
+    let (_dir, listener, port, _ntfn) = serve_ws();
     let mut ws = handshake(port);
 
     // An unauthenticated client that skips authenticate is disconnected
@@ -209,7 +318,7 @@ fn a_command_before_authenticate_drops_the_connection() {
 
 #[test]
 fn a_bad_upgrade_request_is_refused() {
-    let (_dir, listener, port) = serve_ws();
+    let (_dir, listener, port, _ntfn) = serve_ws();
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     // Missing Sec-WebSocket-Version.
     let request = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n";

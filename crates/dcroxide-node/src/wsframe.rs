@@ -43,6 +43,30 @@ pub enum WsIn {
     Text(Vec<u8>),
     /// The client sent a close frame or the connection ended.
     Close,
+    /// No frame arrived within the stream's read timeout.  The serving
+    /// loop uses this to interleave notification writes with reads on
+    /// one thread — the poll-loop translation of dcrd's separate in
+    /// and out handler goroutines.
+    Idle,
+}
+
+/// One attempt to read a frame.
+enum FrameRead {
+    /// A decoded frame.
+    Frame(Frame),
+    /// The connection ended cleanly at a frame boundary.
+    Eof,
+    /// The read timed out before any frame byte arrived.
+    Idle,
+}
+
+/// Whether an I/O error is a read-timeout expiry (`WouldBlock` on
+/// Unix sockets, `TimedOut` on Windows).
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 /// A WebSocket connection over a byte stream, after the handshake.
@@ -69,9 +93,19 @@ impl<S: Read + Write> WsConn<S> {
 
         loop {
             let frame = match self.read_frame()? {
-                Some(frame) => frame,
+                FrameRead::Frame(frame) => frame,
                 // A clean EOF between messages is a normal disconnect.
-                None => return Ok(WsIn::Close),
+                FrameRead::Eof => return Ok(WsIn::Close),
+                FrameRead::Idle => {
+                    // Idleness between a message's fragments keeps
+                    // waiting for the rest; between messages it
+                    // surfaces so the caller can write pending
+                    // notifications.
+                    if in_message {
+                        continue;
+                    }
+                    return Ok(WsIn::Idle);
+                }
             };
 
             match frame.opcode {
@@ -131,22 +165,32 @@ impl<S: Read + Write> WsConn<S> {
         self.write_frame(0x1, payload)
     }
 
-    /// A decoded frame header and its unmasked payload.
-    fn read_frame(&mut self) -> Result<Option<Frame>, String> {
-        let mut header = [0u8; 2];
-        match self.stream.read_exact(&mut header) {
-            Ok(()) => {}
-            // A clean EOF right at a frame boundary is a disconnect.
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e.to_string()),
-        }
+    /// A decoded frame header and its unmasked payload.  Only the
+    /// first header byte may report idleness: once a frame has begun,
+    /// the remaining reads absorb timeouts so a frame split across
+    /// segments is never lost.
+    fn read_frame(&mut self) -> Result<FrameRead, String> {
+        let first = loop {
+            let mut byte = [0u8; 1];
+            match self.stream.read(&mut byte) {
+                // A clean EOF right at a frame boundary is a disconnect.
+                Ok(0) => return Ok(FrameRead::Eof),
+                Ok(_) => break byte[0],
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if is_timeout(&e) => return Ok(FrameRead::Idle),
+                Err(e) => return Err(e.to_string()),
+            }
+        };
+        let mut second = [0u8; 1];
+        self.read_full(&mut second)?;
+        let header = [first, second[0]];
 
         let fin = header[0] & 0x80 != 0;
         // The reserved bits must be zero (no extensions are negotiated).
         if header[0] & 0x70 != 0 {
             return self
                 .fail(close_code::PROTOCOL_ERROR, "reserved bits set")
-                .map(|_| None);
+                .map(|_| FrameRead::Eof);
         }
         let opcode = header[0] & 0x0F;
         let masked = header[1] & 0x80 != 0;
@@ -157,22 +201,18 @@ impl<S: Read + Write> WsConn<S> {
         if is_control && (!fin || len_code > 125) {
             return self
                 .fail(close_code::PROTOCOL_ERROR, "invalid control frame")
-                .map(|_| None);
+                .map(|_| FrameRead::Eof);
         }
 
         let payload_len = match len_code {
             126 => {
                 let mut ext = [0u8; 2];
-                self.stream
-                    .read_exact(&mut ext)
-                    .map_err(|e| e.to_string())?;
+                self.read_full(&mut ext)?;
                 u16::from_be_bytes(ext) as usize
             }
             127 => {
                 let mut ext = [0u8; 8];
-                self.stream
-                    .read_exact(&mut ext)
-                    .map_err(|e| e.to_string())?;
+                self.read_full(&mut ext)?;
                 u64::from_be_bytes(ext) as usize
             }
             other => other,
@@ -182,26 +222,41 @@ impl<S: Read + Write> WsConn<S> {
         if !masked {
             return self
                 .fail(close_code::PROTOCOL_ERROR, "client frame not masked")
-                .map(|_| None);
+                .map(|_| FrameRead::Eof);
         }
         let mut mask = [0u8; 4];
-        self.stream
-            .read_exact(&mut mask)
-            .map_err(|e| e.to_string())?;
+        self.read_full(&mut mask)?;
 
         let mut payload = vec![0u8; payload_len];
-        self.stream
-            .read_exact(&mut payload)
-            .map_err(|e| e.to_string())?;
+        self.read_full(&mut payload)?;
         for (i, byte) in payload.iter_mut().enumerate() {
             *byte ^= mask[i & 3];
         }
 
-        Ok(Some(Frame {
+        Ok(FrameRead::Frame(Frame {
             fin,
             opcode,
             payload,
         }))
+    }
+
+    /// Fill the buffer completely, retrying across read timeouts and
+    /// interrupts; an EOF mid-fill is an error since it can only occur
+    /// inside a frame.
+    fn read_full(&mut self, mut buf: &mut [u8]) -> Result<(), String> {
+        while !buf.is_empty() {
+            match self.stream.read(buf) {
+                Ok(0) => return Err("connection ended mid-frame".to_string()),
+                Ok(n) => {
+                    let rest = core::mem::take(&mut buf);
+                    buf = &mut rest[n..];
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if is_timeout(&e) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Ok(())
     }
 
     /// Write a data frame with the given opcode and unmasked payload.
@@ -249,6 +304,7 @@ struct Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     #[test]
     fn accept_key_matches_the_rfc_example() {
@@ -257,5 +313,100 @@ mod tests {
             accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         );
+    }
+
+    /// A stream whose reads follow a script: a byte chunk delivers
+    /// data, `Timeout` simulates a read-timeout expiry, and an
+    /// exhausted script reads EOF.
+    struct Scripted {
+        reads: VecDeque<ScriptedRead>,
+    }
+    enum ScriptedRead {
+        Data(Vec<u8>),
+        Timeout,
+    }
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.reads.pop_front() {
+                Some(ScriptedRead::Data(chunk)) => {
+                    let n = chunk.len().min(buf.len());
+                    buf[..n].copy_from_slice(&chunk[..n]);
+                    if n < chunk.len() {
+                        self.reads
+                            .push_front(ScriptedRead::Data(chunk[n..].to_vec()));
+                    }
+                    Ok(n)
+                }
+                Some(ScriptedRead::Timeout) => Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "timed out",
+                )),
+                None => Ok(0),
+            }
+        }
+    }
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A masked text frame carrying the payload.
+    fn masked_text_frame(payload: &[u8]) -> Vec<u8> {
+        let mask = [0x11u8, 0x22, 0x33, 0x44];
+        let mut frame = vec![0x81, 0x80 | payload.len() as u8];
+        frame.extend_from_slice(&mask);
+        for (i, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[i & 3]);
+        }
+        frame
+    }
+
+    #[test]
+    fn a_timeout_between_frames_reads_idle() {
+        let mut conn = WsConn::new(Scripted {
+            reads: VecDeque::from([
+                ScriptedRead::Timeout,
+                ScriptedRead::Data(masked_text_frame(b"hi")),
+            ]),
+        });
+        assert!(matches!(conn.read_message(1 << 12), Ok(WsIn::Idle)));
+        match conn.read_message(1 << 12) {
+            Ok(WsIn::Text(payload)) => assert_eq!(payload, b"hi"),
+            _ => panic!("expected the text message after the idle read"),
+        }
+    }
+
+    #[test]
+    fn a_timeout_mid_frame_keeps_reading() {
+        // The frame arrives split across segments with timeouts in
+        // between; no byte may be lost.
+        let frame = masked_text_frame(b"split");
+        let (a, rest) = frame.split_at(1);
+        let (b, c) = rest.split_at(3);
+        let mut conn = WsConn::new(Scripted {
+            reads: VecDeque::from([
+                ScriptedRead::Data(a.to_vec()),
+                ScriptedRead::Timeout,
+                ScriptedRead::Data(b.to_vec()),
+                ScriptedRead::Timeout,
+                ScriptedRead::Data(c.to_vec()),
+            ]),
+        });
+        match conn.read_message(1 << 12) {
+            Ok(WsIn::Text(payload)) => assert_eq!(payload, b"split"),
+            _ => panic!("expected the split frame to reassemble"),
+        }
+    }
+
+    #[test]
+    fn an_exhausted_stream_reads_close() {
+        let mut conn = WsConn::new(Scripted {
+            reads: VecDeque::new(),
+        });
+        assert!(matches!(conn.read_message(1 << 12), Ok(WsIn::Close)));
     }
 }

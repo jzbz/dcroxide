@@ -25,7 +25,7 @@
 //! serving loop instead of the POST body path.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +46,10 @@ const RPC_READ_LIMIT_AUTHENTICATED: usize = 1 << 23;
 
 /// The interval the accept loop waits between polling for shutdown.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The websocket serving loop's read timeout: how often an idle
+/// connection wakes to write queued notifications.
+const WS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The chain adapter answering the RPC handlers' queries over the
 /// shared chain (a growing slice of the `RpcChain` seam; handlers
@@ -597,6 +601,7 @@ pub fn start_rpc_listener(
     listeners: &[String],
     server: Arc<Mutex<Server<NodeRpcChain>>>,
     transport: RpcTransport,
+    ntfn: crate::websocket::NodeNtfnMgr,
 ) -> std::io::Result<RpcListener> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::with_capacity(listeners.len());
@@ -610,8 +615,9 @@ pub fn start_rpc_listener(
         let shutdown = Arc::clone(&shutdown);
         let server = Arc::clone(&server);
         let transport = transport.clone();
+        let ntfn = ntfn.clone();
         threads.push(thread::spawn(move || {
-            accept_loop(&listener, &shutdown, &server, &transport);
+            accept_loop(&listener, &shutdown, &server, &transport, &ntfn);
         }));
     }
 
@@ -629,6 +635,7 @@ fn accept_loop(
     shutdown: &AtomicBool,
     server: &Arc<Mutex<Server<NodeRpcChain>>>,
     transport: &RpcTransport,
+    ntfn: &crate::websocket::NodeNtfnMgr,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -637,10 +644,16 @@ fn accept_loop(
                     continue;
                 }
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                // A handle onto the raw socket so the websocket path
+                // can shorten the read timeout to its poll interval.
+                let raw = stream.try_clone().ok();
                 let server = Arc::clone(server);
+                let ntfn = ntfn.clone();
                 match transport {
                     RpcTransport::Plain => {
-                        thread::spawn(move || serve_rpc_connection(stream, &server));
+                        thread::spawn(move || {
+                            serve_rpc_connection(stream, &server, &ntfn, raw.as_ref());
+                        });
                     }
                     RpcTransport::Tls(config) => {
                         let config = Arc::clone(config);
@@ -649,7 +662,7 @@ fn accept_loop(
                                 return;
                             };
                             let tls = rustls::StreamOwned::new(session, stream);
-                            serve_rpc_connection(tls, &server);
+                            serve_rpc_connection(tls, &server, &ntfn, raw.as_ref());
                         });
                     }
                 }
@@ -750,8 +763,15 @@ fn is_websocket_upgrade(head: &HttpHead) -> bool {
 
 /// Serve a single RPC connection: parse the request head, then either
 /// serve the websocket upgrade at `/ws` or process one JSON-RPC POST
-/// (dcrd's HTTP handler routing between `/` and `/ws`).
-fn serve_rpc_connection<S: Read + Write>(mut stream: S, server: &Arc<Mutex<Server<NodeRpcChain>>>) {
+/// (dcrd's HTTP handler routing between `/` and `/ws`).  `raw_sock`
+/// hands the websocket path the underlying socket so it can shorten
+/// the read timeout to its notification poll interval.
+fn serve_rpc_connection<S: Read + Write>(
+    mut stream: S,
+    server: &Arc<Mutex<Server<NodeRpcChain>>>,
+    ntfn: &crate::websocket::NodeNtfnMgr,
+    raw_sock: Option<&TcpStream>,
+) {
     let head = match read_http_head(&mut stream) {
         Ok(head) => head,
         Err(reason) => {
@@ -777,7 +797,14 @@ fn serve_rpc_connection<S: Read + Write>(mut stream: S, server: &Arc<Mutex<Serve
                 return;
             }
         };
-        crate::websocket::serve_websocket(stream, &head, authed, is_admin, server);
+        // Drop to the notification poll interval: an idle read wakes
+        // the serving loop to write queued notifications, and dcrd
+        // websocket connections have no read deadline, so the 30
+        // second connection timeout must not apply here.
+        if let Some(sock) = raw_sock {
+            let _ = sock.set_read_timeout(Some(WS_POLL_INTERVAL));
+        }
+        crate::websocket::serve_websocket(stream, &head, authed, is_admin, server, ntfn);
         return;
     }
 

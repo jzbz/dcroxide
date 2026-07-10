@@ -95,6 +95,7 @@ fn serve_rpc() -> (
         &["127.0.0.1:0".to_string()],
         server,
         dcroxide_node::rpcrun::RpcTransport::Plain,
+        dcroxide_node::websocket::NodeNtfnMgr::new(),
     )
     .expect("start rpc listener");
     let port = listener.bound_addrs()[0].port();
@@ -416,6 +417,7 @@ fn serves_tls_with_a_generated_certificate() {
         &["127.0.0.1:0".to_string()],
         server,
         dcroxide_node::rpcrun::RpcTransport::Tls(tls),
+        dcroxide_node::websocket::NodeNtfnMgr::new(),
     )
     .expect("start tls listener");
     let port = listener.bound_addrs()[0].port();
