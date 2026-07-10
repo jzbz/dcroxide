@@ -15,6 +15,7 @@ pub mod config;
 pub mod dispatch;
 pub mod flags;
 mod gostd;
+pub mod indexes;
 pub mod ipc;
 pub mod logo;
 pub mod logsubsys;

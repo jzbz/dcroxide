@@ -93,6 +93,10 @@ impl Options {
 }
 
 /// A handle to an open block/metadata database (dcrd `database.DB`).
+/// Cloning shares the underlying database exactly as copies of dcrd's
+/// `database.DB` interface value do: the daemon hands the same open
+/// database to the chain and the indexes.
+#[derive(Clone)]
 pub struct Database {
     inner: Arc<DbInner>,
 }

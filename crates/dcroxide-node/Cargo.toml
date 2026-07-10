@@ -25,6 +25,7 @@ dcroxide-containers = { path = "../dcroxide-containers" }
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-dcrjson = { path = "../dcroxide-dcrjson" }
+dcroxide-indexers = { path = "../dcroxide-indexers" }
 dcroxide-mempool = { path = "../dcroxide-mempool" }
 dcroxide-netsync = { path = "../dcroxide-netsync" }
 dcroxide-stake = { path = "../dcroxide-stake" }
@@ -40,6 +41,7 @@ ureq = "3"
 socket2 = "0.6.4"
 
 [dev-dependencies]
+dcroxide-testutil = { path = "../dcroxide-testutil" }
 tempfile = "3"
 
 [lints]

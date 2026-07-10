@@ -60,6 +60,10 @@ pub struct ChainNtfnHandler {
     sync_peers: crate::dispatch::SyncPeers,
     /// The recently-advertised cache the cascade feeds.
     recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
+    /// The index subscriber the drained block events feed (dcrd's
+    /// `s.indexSubscriber.Notify` at the end of each connect and
+    /// disconnect case; `None` when no index is enabled).
+    index_subscriber: Option<Arc<Mutex<dcroxide_indexers::IndexSubscriber>>>,
 }
 
 /// A block event awaiting its mempool maintenance (dcrd's handler
@@ -102,7 +106,18 @@ impl ChainNtfnHandler {
             tx_pool,
             sync_peers,
             recently_advertised,
+            index_subscriber: None,
         }
+    }
+
+    /// Feed the drained block events into the given index subscriber
+    /// (dcrd's server holding its `indexSubscriber`).  Must be set
+    /// before the handler is cloned into the chain callback.
+    pub fn set_index_subscriber(
+        &mut self,
+        subscriber: Arc<Mutex<dcroxide_indexers::IndexSubscriber>>,
+    ) {
+        self.index_subscriber = Some(subscriber);
     }
 
     /// The chain callback body (dcrd `handleBlockchainNotification`);
@@ -249,17 +264,56 @@ impl ChainNtfnHandler {
                 .expect("pending block events"),
         );
         for event in pending {
-            match event {
+            let (ntfn_type, block, parent, check_tx_flags) = match event {
                 PendingBlockEvent::Connected {
                     block,
                     parent,
                     check_tx_flags,
-                } => self.handle_connected_block(&block, &parent, check_tx_flags),
+                } => {
+                    self.handle_connected_block(&block, &parent, check_tx_flags);
+                    (
+                        dcroxide_indexers::CONNECT_NTFN,
+                        block,
+                        parent,
+                        check_tx_flags,
+                    )
+                }
                 PendingBlockEvent::Disconnected {
                     block,
                     parent,
                     check_tx_flags,
-                } => self.handle_disconnected_block(&block, &parent, check_tx_flags),
+                } => {
+                    self.handle_disconnected_block(&block, &parent, check_tx_flags);
+                    (
+                        dcroxide_indexers::DISCONNECT_NTFN,
+                        block,
+                        parent,
+                        check_tx_flags,
+                    )
+                }
+            };
+            // Notify the subscribed indexes at the end of each case
+            // (dcrd's `s.indexSubscriber.Notify`).  A failed update
+            // marks the subscriber cancelled and later notifications
+            // skip it, like dcrd's handler goroutine logging the
+            // error and cancelling its context so the quit channel
+            // absorbs further sends.
+            if let Some(subscriber) = &self.index_subscriber {
+                let mut subscriber = subscriber.lock().expect("index subscriber mutex poisoned");
+                if !subscriber.cancelled() {
+                    let ntfn = dcroxide_indexers::IndexNtfn {
+                        ntfn_type,
+                        block: Arc::new(block),
+                        parent: Arc::new(parent),
+                        is_treasury_enabled: check_tx_flags.is_treasury_enabled(),
+                    };
+                    if let Err(e) = subscriber.notify(&ntfn) {
+                        // The only operator-visible diagnostic for a
+                        // halted index (dcrd logs the error right
+                        // before cancelling).
+                        eprintln!("index update failed, index maintenance halted: {e}");
+                    }
+                }
             }
         }
     }

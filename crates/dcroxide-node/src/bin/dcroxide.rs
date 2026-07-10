@@ -118,10 +118,67 @@ fn run(cfg: Config) -> ExitCode {
         log_info("File logging disabled");
     }
 
+    // The shared interrupt flag standing in for dcrd's daemon context
+    // cancellation, armed before the block database work so an
+    // interrupt (SIGINT) or termination (SIGTERM) signal aborts the
+    // long-running index drops and catch-up too (dcrd installs its
+    // shutdown listener at the top of `dcrdMain`, before
+    // `loadBlockDB`).  The channel carries the same signal to the
+    // idle wait at the end of startup.
+    let interrupt: dcroxide_indexers::Interrupt =
+        Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    {
+        let signal_interrupt = Arc::clone(&interrupt);
+        if let Err(e) = ctrlc::set_handler(move || {
+            signal_interrupt.store(true, core::sync::atomic::Ordering::SeqCst);
+            let _ = shutdown_tx.send(());
+        }) {
+            log_info(&format!("unable to install signal handler: {e}"));
+            return ExitCode::FAILURE;
+        }
+    }
+
     // Load the block database and initialize the chain state, creating
     // the genesis state when the database is fresh.
     log_info("Loading block database from disk...");
-    let chain = match open_chain(&cfg) {
+    let db = match open_block_db(&cfg) {
+        Ok(db) => db,
+        Err(e) => {
+            log_info(&format!("Unable to load block database: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Always drop the legacy address index, drop any other indexes
+    // and exit if requested, then drop the legacy v1 committed filter
+    // index (dcrd `dcrdMain` between `loadBlockDB` and `newServer`;
+    // the order matters because dropping the tx index also drops the
+    // address index since it relied on it).
+    if let Err(e) = dcroxide_indexers::drop_addr_index(&interrupt, &db) {
+        log_info(&format!("{e}"));
+        return ExitCode::FAILURE;
+    }
+    if cfg.drop_tx_index {
+        if let Err(e) = dcroxide_indexers::drop_tx_index(&interrupt, &db) {
+            log_info(&format!("{e}"));
+            return ExitCode::FAILURE;
+        }
+        return ExitCode::SUCCESS;
+    }
+    if cfg.drop_exists_addr_index {
+        if let Err(e) = dcroxide_indexers::drop_exists_addr_index(&interrupt, &db) {
+            log_info(&format!("{e}"));
+            return ExitCode::FAILURE;
+        }
+        return ExitCode::SUCCESS;
+    }
+    if let Err(e) = dcroxide_indexers::drop_cf_index(&db) {
+        log_info(&format!("{e}"));
+        return ExitCode::FAILURE;
+    }
+
+    let chain = match open_chain(&cfg, db.clone()) {
         Ok(chain) => chain,
         Err(e) => {
             log_info(&format!("Unable to load block database: {e}"));
@@ -136,6 +193,27 @@ fn run(cfg: Config) -> ExitCode {
     // Share the chain with the served peers' message handlers (dcrd's
     // server holding the chain the serverPeer callbacks consult).
     let chain = Arc::new(Mutex::new(chain));
+
+    // Create the transaction index and catch it up to the main chain
+    // when enabled (dcrd `newServer`'s index block; the exists
+    // address index arrives with a later piece).
+    let tx_index = if cfg.tx_index {
+        log_info("Transaction index is enabled");
+        match dcroxide_node::indexes::start_tx_index(
+            Arc::clone(&interrupt),
+            Arc::new(db.clone()),
+            Arc::clone(&chain),
+            cfg.params.params.clone(),
+        ) {
+            Ok(tx_index) => Some(tx_index),
+            Err(e) => {
+                log_info(&format!("Unable to start the transaction index: {e}"));
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
 
     // Create the address manager and load any persisted peers (dcrd
     // `newServer`'s `addrmgr.New(cfg.DataDir)`).
@@ -176,6 +254,118 @@ fn run(cfg: Config) -> ExitCode {
         Arc::clone(&tx_pool),
         ntfn.clone(),
     );
+
+    // Serve the JSON-RPC endpoint (dcrd's RPC server): TLS over the
+    // generated certificate pair by default, plain HTTP under the
+    // localhost-validated --notls.  This runs before the peer-to-peer
+    // listeners come up so the chain notification callback is
+    // installed before any peer can connect a block (dcrd registers
+    // its notification handler at chain construction inside
+    // `newServer`, ahead of all peer activity).
+    let rpc_listener = if cfg.disable_rpc {
+        log_info("RPC service is disabled");
+        None
+    } else {
+        let transport = if cfg.disable_tls {
+            dcroxide_node::rpcrun::RpcTransport::Plain
+        } else {
+            let config = dcroxide_node::rpcrun::load_or_generate_cert_pair(
+                Path::new(&cfg.rpc_cert),
+                Path::new(&cfg.rpc_key),
+                &cfg.external_ips,
+            )
+            .and_then(|(cert, key)| dcroxide_node::rpcrun::tls_server_config(&cert, &key));
+            match config {
+                Ok(config) => dcroxide_node::rpcrun::RpcTransport::Tls(config),
+                Err(e) => {
+                    log_info(&format!("Unable to set up RPC TLS: {e}"));
+                    return ExitCode::FAILURE;
+                }
+            }
+        };
+        // The transaction-index seam over the live index (dcrd
+        // assigning `s.txIndex` to the rpcserver config).
+        let tx_indexer = tx_index.as_ref().map(|tx_index| {
+            Box::new(dcroxide_node::indexes::NodeRpcTxIndexer::new(
+                Arc::clone(&tx_index.index),
+                Arc::clone(&tx_index.queryer),
+            )) as Box<dyn dcroxide_rpc::server::RpcTxIndexer + Send>
+        });
+        let mut rpc_srv = dcroxide_rpc::server::Server::new(rpc_config(
+            &cfg,
+            Arc::clone(&chain),
+            connected.clone(),
+            Arc::clone(&server.sync_manager),
+            Arc::clone(&server.net_totals),
+            Arc::clone(&tx_pool),
+            server.sync_peers.clone(),
+            Arc::clone(&server.recently_advertised),
+            tx_indexer,
+            db.clone(),
+        ));
+        // Install the websocket notification manager (dcrd's
+        // wsNotificationManager) and start its delivery thread over
+        // the server.
+        let ntfn = ntfn
+            .clone()
+            .expect("the manager exists when RPC is enabled");
+        rpc_srv.ntfn_mgr = Box::new(ntfn.clone());
+        let rpc_server = Arc::new(Mutex::new(rpc_srv));
+        let ntfn_thread = ntfn.start(Arc::clone(&rpc_server));
+
+        // Feed the manager from the chain's events: the chain calls
+        // the daemon handler as blocks connect, disconnect, and
+        // reorganize (dcrd installing handleBlockchainNotification as
+        // its blockchain notification callback), and the sync adapter
+        // drains the handler's deferred winning-tickets lookups after
+        // each processing call.
+        let mut handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
+            ntfn.clone(),
+            cfg.params.params.clone(),
+            cfg.allow_unsynced_mining,
+            Arc::clone(&tx_pool),
+            server.sync_peers.clone(),
+            Arc::clone(&server.recently_advertised),
+        );
+        // The drained block events also feed the subscribed indexes
+        // (dcrd's handler notifying `s.indexSubscriber`).
+        if let Some(tx_index) = &tx_index {
+            handler.set_index_subscriber(Arc::clone(&tx_index.subscriber));
+        }
+        {
+            let callback_handler = handler.clone();
+            chain
+                .lock()
+                .expect("chain mutex poisoned")
+                .set_notification_callback(Box::new(move |n| callback_handler.handle(n)));
+        }
+        server
+            .sync_manager
+            .lock()
+            .expect("sync manager mutex poisoned")
+            .chain_mut()
+            .set_chain_ntfn_handler(handler);
+        match dcroxide_node::rpcrun::start_rpc_listener(
+            &cfg.rpc_listeners,
+            rpc_server,
+            transport,
+            ntfn.clone(),
+        ) {
+            Ok(listener) => {
+                let addrs: Vec<String> = listener
+                    .bound_addrs()
+                    .iter()
+                    .map(|addr| addr.to_string())
+                    .collect();
+                log_info(&format!("RPC server listening on {}", addrs.join(", ")));
+                Some((listener, ntfn, ntfn_thread))
+            }
+            Err(e) => {
+                log_info(&format!("Unable to start RPC server: {e}"));
+                return ExitCode::FAILURE;
+            }
+        }
+    };
 
     // Bind the peer-to-peer listeners and start serving inbound peers
     // unless listening is disabled (dcrd's server listeners).
@@ -261,115 +451,12 @@ fn run(cfg: Config) -> ExitCode {
         }
     };
 
-    log_info(
-        "The UTXO database, the address-manager automatic dialing, and the RPC \
-         server are not yet wired; serving peers until a shutdown signal is \
-         received.",
-    );
+    log_info("Serving peers until a shutdown signal is received.");
 
-    // Serve the JSON-RPC endpoint (dcrd's RPC server): TLS over the
-    // generated certificate pair by default, plain HTTP under the
-    // localhost-validated --notls.
-    let rpc_listener = if cfg.disable_rpc {
-        log_info("RPC service is disabled");
-        None
-    } else {
-        let transport = if cfg.disable_tls {
-            dcroxide_node::rpcrun::RpcTransport::Plain
-        } else {
-            let config = dcroxide_node::rpcrun::load_or_generate_cert_pair(
-                Path::new(&cfg.rpc_cert),
-                Path::new(&cfg.rpc_key),
-                &cfg.external_ips,
-            )
-            .and_then(|(cert, key)| dcroxide_node::rpcrun::tls_server_config(&cert, &key));
-            match config {
-                Ok(config) => dcroxide_node::rpcrun::RpcTransport::Tls(config),
-                Err(e) => {
-                    log_info(&format!("Unable to set up RPC TLS: {e}"));
-                    return ExitCode::FAILURE;
-                }
-            }
-        };
-        let mut rpc_srv = dcroxide_rpc::server::Server::new(rpc_config(
-            &cfg,
-            Arc::clone(&chain),
-            connected.clone(),
-            Arc::clone(&server.sync_manager),
-            Arc::clone(&server.net_totals),
-            Arc::clone(&tx_pool),
-            server.sync_peers.clone(),
-            Arc::clone(&server.recently_advertised),
-        ));
-        // Install the websocket notification manager (dcrd's
-        // wsNotificationManager) and start its delivery thread over
-        // the server.
-        let ntfn = ntfn
-            .clone()
-            .expect("the manager exists when RPC is enabled");
-        rpc_srv.ntfn_mgr = Box::new(ntfn.clone());
-        let rpc_server = Arc::new(Mutex::new(rpc_srv));
-        let ntfn_thread = ntfn.start(Arc::clone(&rpc_server));
-
-        // Feed the manager from the chain's events: the chain calls
-        // the daemon handler as blocks connect, disconnect, and
-        // reorganize (dcrd installing handleBlockchainNotification as
-        // its blockchain notification callback), and the sync adapter
-        // drains the handler's deferred winning-tickets lookups after
-        // each processing call.
-        let handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
-            ntfn.clone(),
-            cfg.params.params.clone(),
-            cfg.allow_unsynced_mining,
-            Arc::clone(&tx_pool),
-            server.sync_peers.clone(),
-            Arc::clone(&server.recently_advertised),
-        );
-        {
-            let callback_handler = handler.clone();
-            chain
-                .lock()
-                .expect("chain mutex poisoned")
-                .set_notification_callback(Box::new(move |n| callback_handler.handle(n)));
-        }
-        server
-            .sync_manager
-            .lock()
-            .expect("sync manager mutex poisoned")
-            .chain_mut()
-            .set_chain_ntfn_handler(handler);
-        match dcroxide_node::rpcrun::start_rpc_listener(
-            &cfg.rpc_listeners,
-            rpc_server,
-            transport,
-            ntfn.clone(),
-        ) {
-            Ok(listener) => {
-                let addrs: Vec<String> = listener
-                    .bound_addrs()
-                    .iter()
-                    .map(|addr| addr.to_string())
-                    .collect();
-                log_info(&format!("RPC server listening on {}", addrs.join(", ")));
-                Some((listener, ntfn, ntfn_thread))
-            }
-            Err(e) => {
-                log_info(&format!("Unable to start RPC server: {e}"));
-                return ExitCode::FAILURE;
-            }
-        }
-    };
-
-    // Idle until an interrupt (SIGINT) or termination (SIGTERM) signal
-    // arrives, mirroring dcrd's shutdown listener.
-    let (tx, rx) = mpsc::channel();
-    if let Err(e) = ctrlc::set_handler(move || {
-        let _ = tx.send(());
-    }) {
-        log_info(&format!("unable to install signal handler: {e}"));
-        return ExitCode::FAILURE;
-    }
-    let _ = rx.recv();
+    // Idle until the signal handler armed at startup reports an
+    // interrupt (SIGINT) or termination (SIGTERM) signal, mirroring
+    // dcrd's shutdown listener.
+    let _ = shutdown_rx.recv();
 
     // Stop seeding and dialing, stop the watchdog, disconnect the live
     // peers, and stop accepting new connections (dcrd's server
@@ -481,27 +568,33 @@ fn start_listeners(
     .map_err(|e| e.to_string())
 }
 
-/// Open (or create) the block database and initialize the chain state
-/// (dcrd `dcrdMain`'s `loadBlockDB` plus the chain construction inside
-/// `newServer`).  The block database lives at
-/// `<datadir>/blocks_<dbtype>`; a fresh database creates the genesis
-/// chain state.
-fn open_chain(cfg: &Config) -> Result<Chain, String> {
+/// Open (or create) the block database (dcrd `dcrdMain`'s
+/// `loadBlockDB`).  The block database lives at
+/// `<datadir>/blocks_<dbtype>`; the same handle backs the chain and
+/// the enabled indexes.
+fn open_block_db(cfg: &Config) -> Result<Database, String> {
     let params = &cfg.params.params;
     let db_path = Path::new(&cfg.data_dir).join(format!("blocks_{}", cfg.db_type));
     let opts = Options::new(&db_path, params.net.0);
 
     // Open the existing database, creating it when it does not yet
     // exist (dcrd's `database.Open` then `database.Create` fallback).
-    let db = match Database::open(&opts) {
-        Ok(db) => db,
+    match Database::open(&opts) {
+        Ok(db) => Ok(db),
         Err(e) if e.kind == ErrorKind::DbDoesNotExist => {
             std::fs::create_dir_all(&db_path)
                 .map_err(|e| format!("unable to create database directory: {e}"))?;
-            Database::create(&opts).map_err(|e| format!("unable to create database: {e}"))?
+            Database::create(&opts).map_err(|e| format!("unable to create database: {e}"))
         }
-        Err(e) => return Err(format!("unable to open database: {e}")),
-    };
+        Err(e) => Err(format!("unable to open database: {e}")),
+    }
+}
+
+/// Initialize the chain state over the open block database (the chain
+/// construction inside dcrd's `newServer`); a fresh database creates
+/// the genesis chain state.
+fn open_chain(cfg: &Config, db: Database) -> Result<Chain, String> {
+    let params = &cfg.params.params;
 
     // The assume-valid hash defaults to the network's hard-coded value
     // and is overridden by the command line when provided.
@@ -538,6 +631,8 @@ fn rpc_config(
     recently_advertised: Arc<
         Mutex<dcroxide_containers::lru::Map<dcroxide_chainhash::Hash, dcroxide_wire::MsgTx>>,
     >,
+    tx_indexer: Option<Box<dyn dcroxide_rpc::server::RpcTxIndexer + Send>>,
+    db: Database,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
     dcroxide_rpc::server::Config {
@@ -567,8 +662,8 @@ fn rpc_config(
             getrandom::fill(&mut buf).expect("system random source");
             u64::from_le_bytes(buf)
         }),
-        tx_indexer: None,
-        db: Box::new(()),
+        tx_indexer,
+        db: Box::new(dcroxide_node::indexes::NodeRpcDb::new(db)),
         filterer_v2: Box::new(()),
         exists_addresser: None,
         log_manager: Box::new(()),
