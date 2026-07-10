@@ -61,6 +61,8 @@ fn serve_genesis_chain() -> (
             8,
             1000,
         ))),
+        sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
+        next_peer_id: std::sync::atomic::AtomicI32::new(1),
     });
 
     let template = PeerTemplate {
@@ -407,5 +409,99 @@ fn gates_inventory_announcements() {
         "the connection should be dropped"
     );
 
+    runtime.shutdown();
+}
+
+/// The sync-manager driver milestone: a data-serving peer connecting to
+/// a stale chain is picked as the header-sync peer, and the daemon
+/// initiates the sync by sending getheaders right after the handshake
+/// (dcrd `OnPeerConnected` starting the initial header sync).
+#[test]
+fn initiates_header_sync_with_a_data_serving_peer() {
+    let params = dcroxide_chaincfg::testnet3_params();
+    let genesis_hash = params.genesis_hash;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let opts = Options::new(dir.path().join("blocks"), params.net.0);
+    let db = Database::create(&opts).expect("create database");
+    let chain = Arc::new(Mutex::new(
+        Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
+    ));
+    let server = Arc::new(ServerContext {
+        chain: Arc::clone(&chain),
+        min_known_work: params.min_known_chain_work,
+        disable_banning: false,
+        ban_threshold: 100,
+        whitelists: Vec::new(),
+        addr_manager: Arc::new(Mutex::new(dcroxide_addrmgr::AddrManager::new(dir.path()))),
+        sim_or_reg_net: false,
+        stake_validation_height: params.stake_validation_height,
+        blocks_only: false,
+        sync_manager: Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
+            Arc::clone(&chain),
+            &params,
+            false,
+            8,
+            1000,
+        ))),
+        sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
+        next_peer_id: std::sync::atomic::AtomicI32::new(1),
+    });
+    let template = PeerTemplate {
+        net: NET,
+        protocol_version: 0,
+        services: ServiceFlag(1),
+        user_agent_name: "dcroxide".to_string(),
+        user_agent_version: "0.1.0".to_string(),
+        idle_timeout: Duration::from_secs(3600),
+        ping_interval: Duration::from_secs(3600),
+    };
+    let connected = ConnectedPeers::new();
+    let runtime = ListenerRuntime::start(
+        &[("tcp4", ":0".to_string())],
+        inbound_peer_handler(template, connected.clone(), Some(server)),
+    )
+    .expect("start serving runtime");
+    let port = runtime.bound_addrs()[0].port();
+
+    // Connect advertising NODE_NETWORK so the daemon selects this peer
+    // for its initial header sync.
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
+    let mut env = NodePeerEnv::new();
+    let mut globals = PeerGlobals::new();
+    let config = Config {
+        net: NET,
+        protocol_version: 0,
+        services: ServiceFlag::NODE_NETWORK,
+        ..Config::default()
+    };
+    let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+        .expect("negotiate");
+    transport
+        .write_message(&Message::VerAck)
+        .expect("send verack");
+
+    // The daemon initiates the header sync: among the first messages
+    // after the handshake is a getheaders anchored at the genesis tip.
+    let mut saw_getheaders = false;
+    for _ in 0..4 {
+        match transport.read_message() {
+            Ok(Message::GetHeaders(get)) => {
+                assert_eq!(get.0.block_locator_hashes.first(), Some(&genesis_hash));
+                saw_getheaders = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(e) => panic!("expected getheaders, got read error {e}"),
+        }
+    }
+    assert!(saw_getheaders, "the daemon should initiate the header sync");
+
+    drop(transport);
     runtime.shutdown();
 }

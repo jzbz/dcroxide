@@ -22,9 +22,11 @@ use std::time::Duration;
 use dcroxide_peer::{Config, Peer, PeerEnv};
 use dcroxide_wire::{CurrencyNet, ServiceFlag};
 
+use dcroxide_wire::Message;
+
 use crate::dispatch::{ServerContext, ServerPeerHandler};
 use crate::peerconn::{NodePeerEnv, net_address_from_socket};
-use crate::peerloop::{ServeSignal, run_peer_connection};
+use crate::peerloop::{OutboundQueue, ServeHooks, ServeSignal, run_peer_connection};
 use crate::server::is_whitelisted;
 
 /// The interval the accept loops wait between polling for shutdown when
@@ -200,11 +202,19 @@ fn serve_inbound_peer(
     });
 
     // The per-peer server state and dispatch (dcrd `newServerPeer` and
-    // the message listeners it registers).
-    let mut handler = server.map(|ctx| {
-        let whitelisted = is_whitelisted(&ctx.whitelists, &addr.to_string());
-        ServerPeerHandler::new(ctx, whitelisted)
-    });
+    // the message listeners it registers).  The socket handle lets the
+    // sync manager's disconnect actions interrupt this peer's read.
+    let hooks = match server {
+        Some(ctx) => {
+            let whitelisted = is_whitelisted(&ctx.whitelists, &addr.to_string());
+            InboundHooks::Server(ServerPeerHandler::new(
+                ctx,
+                whitelisted,
+                stream.try_clone().ok(),
+            ))
+        }
+        None => InboundHooks::NoOp,
+    };
 
     let _ = run_peer_connection(
         stream,
@@ -213,11 +223,42 @@ fn serve_inbound_peer(
         template.net,
         template.idle_timeout,
         template.ping_interval,
-        move |peer, msg, outbound| match handler.as_mut() {
-            Some(handler) => handler.handle_message(peer, msg, outbound),
-            None => ServeSignal::Continue,
-        },
+        hooks,
     );
+}
+
+/// The lifecycle hooks a served inbound connection runs: the full
+/// server dispatch when a [`ServerContext`] is available, or plain
+/// protocol serving for tests exercising just the plumbing.
+enum InboundHooks {
+    Server(ServerPeerHandler),
+    NoOp,
+}
+
+impl ServeHooks for InboundHooks {
+    fn on_connected(&mut self, peer: &mut Peer, outbound: &OutboundQueue) {
+        if let InboundHooks::Server(handler) = self {
+            handler.on_connected(peer, outbound);
+        }
+    }
+
+    fn on_message(
+        &mut self,
+        peer: &mut Peer,
+        msg: &Message,
+        outbound: &OutboundQueue,
+    ) -> ServeSignal {
+        match self {
+            InboundHooks::Server(handler) => handler.handle_message(peer, msg, outbound),
+            InboundHooks::NoOp => ServeSignal::Continue,
+        }
+    }
+
+    fn on_disconnected(&mut self, peer: &mut Peer) {
+        if let InboundHooks::Server(handler) = self {
+            handler.on_disconnected(peer);
+        }
+    }
 }
 
 /// Resolve a listener spec's bind address, expanding the wildcard host

@@ -22,12 +22,15 @@
 //! subsystems simply have nothing to do.
 
 use std::collections::HashMap;
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dcroxide_addrmgr::AddrManager;
 use dcroxide_blockchain::process::Chain;
 use dcroxide_chainhash::Hash;
+use dcroxide_netsync::manager::Action;
 use dcroxide_peer::{Peer, PeerEnv};
 use dcroxide_uint256::Uint256;
 use dcroxide_wire::{
@@ -74,10 +77,75 @@ pub struct ServerContext {
     /// Whether the simulation or regression test network is active;
     /// both suppress the address exchange entirely.
     pub sim_or_reg_net: bool,
-    /// The sync manager tracking the header and block download state
-    /// (not yet driven; the peer registration and action executor
-    /// arrive with the following pieces).
+    /// The sync manager tracking the header and block download state.
     pub sync_manager: Arc<Mutex<NodeSyncManager>>,
+    /// The live peers' outbound queues and socket handles, keyed by
+    /// the sync-manager peer id, so the manager's actions can reach
+    /// any peer (dcrd resolves the same through its peer references).
+    pub sync_peers: SyncPeers,
+    /// The next sync-manager peer id (dcrd's peer package draws ids
+    /// from a package-global atomic counter).
+    pub next_peer_id: AtomicI32,
+}
+
+/// The registry resolving sync-manager peer ids to the handles the
+/// manager's actions need: the outbound queue for sends and the socket
+/// for disconnects.
+/// A registered peer's handles: the outbound queue for sends and the
+/// socket for disconnects.
+type SyncPeerHandles = (OutboundQueue, Option<TcpStream>);
+
+/// The registry resolving sync-manager peer ids to their handles so
+/// the manager's actions can reach any live peer.
+#[derive(Clone, Default)]
+pub struct SyncPeers {
+    inner: Arc<Mutex<HashMap<i32, SyncPeerHandles>>>,
+}
+
+impl SyncPeers {
+    /// An empty registry.
+    pub fn new() -> SyncPeers {
+        SyncPeers::default()
+    }
+
+    fn register(&self, id: i32, outbound: OutboundQueue, socket: Option<TcpStream>) {
+        self.inner
+            .lock()
+            .expect("sync peers mutex poisoned")
+            .insert(id, (outbound, socket));
+    }
+
+    fn deregister(&self, id: i32) {
+        self.inner
+            .lock()
+            .expect("sync peers mutex poisoned")
+            .remove(&id);
+    }
+
+    /// Execute the sync manager's actions: queue messages on the
+    /// targeted peers' outbound queues and interrupt disconnected
+    /// peers' reads by shutting their sockets down.  The stall-timer
+    /// actions are handled by the header-sync timer piece.
+    fn execute(&self, actions: Vec<Action>) {
+        let registry = self.inner.lock().expect("sync peers mutex poisoned");
+        for action in actions {
+            match action {
+                Action::QueueMessage { peer, message } => {
+                    if let Some((outbound, _)) = registry.get(&peer) {
+                        let _ = outbound.queue_message(message);
+                    }
+                }
+                Action::Disconnect { peer } => {
+                    if let Some((_, Some(socket))) = registry.get(&peer) {
+                        let _ = socket.shutdown(Shutdown::Both);
+                    }
+                }
+                // The header sync stall timer arrives with the next
+                // piece.
+                Action::ResetHeaderSyncStallTimeout | Action::StopHeaderSyncStallTimeout => {}
+            }
+        }
+    }
 }
 
 /// The per-connection server state and message dispatch (the message
@@ -96,18 +164,80 @@ pub struct ServerPeerHandler {
     /// Whether the init state was already sent on this connection
     /// (dcrd `serverPeer.initStateSent`).
     init_state_sent: bool,
+    /// The sync-manager peer id once registered (dcrd `sp.syncMgrPeer`).
+    sync_peer_id: Option<i32>,
+    /// A socket handle handed to the registry so disconnect actions
+    /// can interrupt this peer's read.
+    socket: Option<TcpStream>,
 }
 
 impl ServerPeerHandler {
     /// Fresh per-peer server state (dcrd `newServerPeer`).
-    pub fn new(ctx: Arc<ServerContext>, is_whitelisted: bool) -> ServerPeerHandler {
+    pub fn new(
+        ctx: Arc<ServerContext>,
+        is_whitelisted: bool,
+        socket: Option<TcpStream>,
+    ) -> ServerPeerHandler {
         ServerPeerHandler {
             ctx,
             addr_state: ServerPeerAddrState::new(is_whitelisted),
             continue_hash: None,
             env: NodePeerEnv::new(),
             init_state_sent: false,
+            sync_peer_id: None,
+            socket,
         }
+    }
+
+    /// Register the handshaken peer with the sync manager and execute
+    /// the actions it decides — for a data-serving peer on a stale
+    /// chain this is where the header sync begins (dcrd `AddPeer`
+    /// signalling `OnPeerConnected`).
+    pub fn on_connected(&mut self, peer: &mut Peer, outbound: &OutboundQueue) {
+        let id = self.ctx.next_peer_id.fetch_add(1, Ordering::SeqCst);
+        self.sync_peer_id = Some(id);
+        self.ctx
+            .sync_peers
+            .register(id, outbound.clone(), self.socket.take());
+        let actions = {
+            let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
+            manager.on_peer_connected(dcroxide_netsync::manager::Peer::new(
+                id,
+                peer.inbound(),
+                peer.services(),
+                peer.protocol_version(),
+                peer.last_block(),
+            ))
+        };
+        self.ctx.sync_peers.execute(actions);
+    }
+
+    /// Deregister the departing peer from the sync manager, executing
+    /// the re-request and sync-peer handoff actions it decides (dcrd
+    /// `DonePeer` signalling `OnPeerDisconnected`).
+    pub fn on_disconnected(&mut self, _peer: &mut Peer) {
+        let Some(id) = self.sync_peer_id.take() else {
+            return;
+        };
+        let actions = {
+            let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
+            manager.on_peer_disconnected(id)
+        };
+        self.ctx.sync_peers.deregister(id);
+        self.ctx.sync_peers.execute(actions);
+    }
+
+    /// Run a sync-manager intake for this registered peer and execute
+    /// the actions it decides.
+    fn drive_sync(&mut self, intake: impl FnOnce(&mut NodeSyncManager, i32) -> Vec<Action>) {
+        let Some(id) = self.sync_peer_id else {
+            return;
+        };
+        let actions = {
+            let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
+            intake(&mut manager, id)
+        };
+        self.ctx.sync_peers.execute(actions);
     }
 
     /// Dispatch one incoming message to its server handler, queueing
@@ -146,10 +276,25 @@ impl ServerPeerHandler {
                 self.on_get_init_state(&get_init.types, outbound);
                 ServeSignal::Continue
             }
-            Message::Inv(inv) => self.on_inv(&inv.inv_list),
-            // The sync-manager intake (headers, blocks, transactions,
-            // and the forwarded announcements) arrives with the netsync
-            // driver pieces.
+            Message::Inv(inv) => self.on_inv(inv),
+            Message::Headers(headers) => {
+                self.drive_sync(|manager, id| manager.on_headers(id, headers));
+                ServeSignal::Continue
+            }
+            Message::Block(block) => {
+                self.drive_sync(|manager, id| manager.on_block(id, block));
+                ServeSignal::Continue
+            }
+            Message::Tx(tx) => {
+                // The accepted-transaction relay arrives with the
+                // mempool wiring; the null pool rejects everything.
+                self.drive_sync(|manager, id| {
+                    manager.on_tx(id, tx);
+                    Vec::new()
+                });
+                ServeSignal::Continue
+            }
+            // The mix-message intake arrives with the mixpool wiring.
             _ => ServeSignal::Continue,
         }
     }
@@ -369,8 +514,8 @@ impl ServerPeerHandler {
     /// mix messages (dcrd `serverPeer.OnInv`).  Announcements that
     /// pass forward to the sync manager, whose driver arrives with the
     /// netsync pieces.
-    fn on_inv(&self, inv_list: &[InvVect]) -> ServeSignal {
-        let inv_types: Vec<InvType> = inv_list.iter().map(|iv| iv.inv_type).collect();
+    fn on_inv(&mut self, inv: &MsgInv) -> ServeSignal {
+        let inv_types: Vec<InvType> = inv.inv_list.iter().map(|iv| iv.inv_type).collect();
         match on_inv_classify(&inv_types, self.ctx.blocks_only) {
             // The ban outcome drops the connection; the ban-list
             // bookkeeping arrives with the peer-state wiring.
@@ -381,7 +526,10 @@ impl ServerPeerHandler {
             OnInvOutcome::DisconnectAnnouncement(_) => {
                 ServeSignal::Disconnect("announcing mix messages in blocks-only mode")
             }
-            OnInvOutcome::Forward => ServeSignal::Continue,
+            OnInvOutcome::Forward => {
+                self.drive_sync(|manager, id| manager.on_inv(id, inv));
+                ServeSignal::Continue
+            }
         }
     }
 

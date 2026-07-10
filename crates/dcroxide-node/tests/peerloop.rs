@@ -70,7 +70,7 @@ fn inbound_peer_answers_verack_and_ping_through_the_output_queue() {
             &mut read_transport,
             &mut env,
             &queue,
-            |_peer, msg, _outbound| {
+            &mut |_peer: &mut Peer, msg: &Message, _outbound: &OutboundQueue| {
                 forwarded.push(msg.clone());
                 ServeSignal::Continue
             },
@@ -246,7 +246,7 @@ fn run_peer_connection_negotiates_and_serves_until_the_remote_closes() {
             NET,
             Duration::from_secs(3600),
             Duration::from_secs(3600),
-            move |_peer, msg, _outbound| {
+            move |_peer: &mut Peer, msg: &Message, _outbound: &OutboundQueue| {
                 sink.lock().expect("sink").push(msg.clone());
                 ServeSignal::Continue
             },
@@ -323,7 +323,7 @@ fn run_peer_connection_frames_at_the_negotiated_version_not_the_sentinel() {
             NET,
             Duration::from_secs(3600),
             Duration::from_secs(3600),
-            move |_peer, msg, _outbound| {
+            move |_peer: &mut Peer, msg: &Message, _outbound: &OutboundQueue| {
                 sink.lock().expect("sink").push(msg.clone());
                 ServeSignal::Continue
             },

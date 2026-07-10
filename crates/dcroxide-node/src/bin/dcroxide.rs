@@ -249,6 +249,8 @@ fn start_listeners(
         stake_validation_height: params.stake_validation_height,
         blocks_only: cfg.blocks_only,
         sync_manager,
+        sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
+        next_peer_id: std::sync::atomic::AtomicI32::new(1),
     });
     let connected = ConnectedPeers::new();
     let specs = parse_listeners(&cfg.listeners)?;

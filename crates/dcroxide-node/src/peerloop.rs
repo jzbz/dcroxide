@@ -123,22 +123,54 @@ pub enum ServeSignal {
     Disconnect(&'static str),
 }
 
+/// The server-side connection lifecycle a served peer runs through:
+/// dcrd's `AddPeer` after the handshake, the message listeners while
+/// the connection lives, and `DonePeer` on the way out.  A plain
+/// message closure satisfies this with no-op lifecycle hooks.
+pub trait ServeHooks {
+    /// The connection completed its handshake (dcrd `AddPeer`).
+    fn on_connected(&mut self, _peer: &mut Peer, _outbound: &OutboundQueue) {}
+    /// A message arrived for the server handlers.
+    fn on_message(
+        &mut self,
+        peer: &mut Peer,
+        msg: &Message,
+        outbound: &OutboundQueue,
+    ) -> ServeSignal;
+    /// The connection is winding down (dcrd `DonePeer`).
+    fn on_disconnected(&mut self, _peer: &mut Peer) {}
+}
+
+impl<F> ServeHooks for F
+where
+    F: FnMut(&mut Peer, &Message, &OutboundQueue) -> ServeSignal,
+{
+    fn on_message(
+        &mut self,
+        peer: &mut Peer,
+        msg: &Message,
+        outbound: &OutboundQueue,
+    ) -> ServeSignal {
+        self(peer, msg, outbound)
+    }
+}
+
 /// Read and dispatch messages until the peer disconnects.  Each message
 /// is given its protocol-level handling (queueing any immediate reply on
-/// the outbound queue) and then forwarded to `on_message` for the server
-/// handlers, which queue their responses through the outbound queue and
-/// may request a disconnect, mirroring dcrd's `inHandler`.
-pub fn run_peer_input<T, E, F>(
+/// the outbound queue) and then forwarded to the hooks' message handler,
+/// which queues its responses through the outbound queue and may request
+/// a disconnect, mirroring dcrd's `inHandler`.
+pub fn run_peer_input<T, E, H>(
     peer: &Mutex<Peer>,
     transport: &mut T,
     env: &mut E,
     outbound: &OutboundQueue,
-    mut on_message: F,
+    hooks: &mut H,
 ) -> DisconnectReason
 where
     T: MsgTransport,
     E: PeerEnv,
-    F: FnMut(&mut Peer, &Message, &OutboundQueue) -> ServeSignal,
+    H: ServeHooks,
 {
     loop {
         // Read without the peer lock held so the ping timer and the
@@ -160,7 +192,8 @@ where
                 {
                     return DisconnectReason::LocalShutdown;
                 }
-                if let ServeSignal::Disconnect(reason) = on_message(&mut peer, &msg, outbound) {
+                if let ServeSignal::Disconnect(reason) = hooks.on_message(&mut peer, &msg, outbound)
+                {
                     return DisconnectReason::Protocol(reason);
                 }
             }
@@ -254,17 +287,17 @@ pub fn run_ping_timer<E: PeerEnv>(
 /// connection stopped.  `idle_timeout` bounds each read so a silent peer
 /// eventually disconnects (dcrd's idle timer); `ping_interval` should be
 /// shorter so a live peer answers before that fires.
-pub fn run_peer_connection<F>(
+pub fn run_peer_connection<H>(
     stream: TcpStream,
     mut peer: Peer,
     pver: u32,
     net: CurrencyNet,
     idle_timeout: Duration,
     ping_interval: Duration,
-    on_message: F,
+    mut hooks: H,
 ) -> DisconnectReason
 where
-    F: FnMut(&mut Peer, &Message, &OutboundQueue) -> ServeSignal,
+    H: ServeHooks,
 {
     // A read deadline so a peer that stops answering is disconnected
     // rather than blocking the input loop forever.
@@ -313,6 +346,10 @@ where
         return DisconnectReason::LocalShutdown;
     }
 
+    // The handshake is complete: hand the peer to the server's
+    // lifecycle hook (dcrd `AddPeer` signalling the sync manager).
+    hooks.on_connected(&mut peer.lock().expect("peer mutex poisoned"), &outbound);
+
     let output = thread::spawn(move || {
         let reason = run_peer_output(&mut write_transport, receiver);
         // Shut the socket down when the output loop ends (a write error
@@ -337,7 +374,10 @@ where
     });
 
     // Drive the input loop on this thread until the peer disconnects.
-    let reason = run_peer_input(&peer, &mut read_transport, &mut env, &outbound, on_message);
+    let reason = run_peer_input(&peer, &mut read_transport, &mut env, &outbound, &mut hooks);
+
+    // The connection is winding down (dcrd `DonePeer`).
+    hooks.on_disconnected(&mut peer.lock().expect("peer mutex poisoned"));
 
     // Tear down: shut the socket down so the output loop's blocking write
     // unblocks (a peer that stopped reading would otherwise wedge it),
