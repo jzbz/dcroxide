@@ -105,6 +105,28 @@ pub struct ServerContext {
     /// acceptance; absent when the RPC server is disabled (dcrd's nil
     /// rpcServer checks).
     pub ntfn: Option<crate::websocket::NodeNtfnMgr>,
+    /// Recently advertised transactions, kept servable briefly after
+    /// leaving the pool (dcrd `recentlyAdvertisedTxns`).
+    pub recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
+}
+
+/// The maximum number of recently advertised transactions to track
+/// (dcrd `maxRecentlyAdvertisedTxns`).
+pub const MAX_RECENTLY_ADVERTISED_TXNS: u32 = 4500;
+
+/// How long advertised transactions stay servable, in nanoseconds
+/// (dcrd `recentlyAdvertisedTxnsTTL`).
+pub const RECENTLY_ADVERTISED_TXNS_TTL_NANOS: i64 = 45 * 1_000_000_000;
+
+/// A fresh recently-advertised transaction cache.
+pub fn new_recently_advertised()
+-> Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>> {
+    Arc::new(Mutex::new(
+        dcroxide_containers::lru::Map::new_with_default_ttl(
+            MAX_RECENTLY_ADVERTISED_TXNS,
+            RECENTLY_ADVERTISED_TXNS_TTL_NANOS,
+        ),
+    ))
 }
 
 /// The per-group count of outbound connections (dcrd
@@ -155,9 +177,38 @@ impl OutboundGroups {
 /// The registry resolving sync-manager peer ids to the handles the
 /// manager's actions need: the outbound queue for sends and the socket
 /// for disconnects.
-/// A registered peer's handles: the outbound queue for sends and the
-/// socket for disconnects.
-type SyncPeerHandles = (OutboundQueue, Option<TcpStream>);
+/// A registered peer's handles: the outbound queue for sends, the
+/// socket for disconnects, and the relay state the inventory fan-out
+/// consults.
+struct SyncPeerHandles {
+    outbound: OutboundQueue,
+    socket: Option<TcpStream>,
+    relay: Arc<Mutex<RelayPeerState>>,
+}
+
+/// The per-peer relay state (dcrd's `serverPeer` fields the relay
+/// reads): the handshake facts, the last announced block, and the
+/// known-inventory set that both dedups our announcements and
+/// prevents echoing inventory the peer itself announced.
+pub struct RelayPeerState {
+    facts: crate::server::RelayPeerFacts,
+    announced_block: Option<Hash>,
+    known_inventory: dcroxide_containers::lru::Set<InvVect>,
+}
+
+impl RelayPeerState {
+    /// The relay state for a freshly handshaken peer.
+    fn new(facts: crate::server::RelayPeerFacts) -> RelayPeerState {
+        RelayPeerState {
+            facts,
+            announced_block: None,
+            known_inventory: dcroxide_containers::lru::Set::new_with_default_ttl(
+                dcroxide_peer::MAX_KNOWN_INVENTORY,
+                dcroxide_peer::MAX_KNOWN_INVENTORY_TTL,
+            ),
+        }
+    }
+}
 
 /// The registry resolving sync-manager peer ids to their handles so
 /// the manager's actions can reach any live peer.
@@ -175,11 +226,78 @@ impl SyncPeers {
         SyncPeers::default()
     }
 
-    fn register(&self, id: i32, outbound: OutboundQueue, socket: Option<TcpStream>) {
+    fn register(
+        &self,
+        id: i32,
+        outbound: OutboundQueue,
+        socket: Option<TcpStream>,
+        relay: Arc<Mutex<RelayPeerState>>,
+    ) {
         self.inner
             .lock()
             .expect("sync peers mutex poisoned")
-            .insert(id, (outbound, socket));
+            .insert(
+                id,
+                SyncPeerHandles {
+                    outbound,
+                    socket,
+                    relay,
+                },
+            );
+    }
+
+    /// Mark inventory as known to the peer so the relay never echoes
+    /// it back (dcrd `AddKnownInventory` on intake).
+    pub(crate) fn mark_known_inventory(&self, id: i32, inv: InvVect) {
+        let registry = self.inner.lock().expect("sync peers mutex poisoned");
+        if let Some(handles) = registry.get(&id) {
+            handles
+                .relay
+                .lock()
+                .expect("relay state poisoned")
+                .known_inventory
+                .put(inv);
+        }
+    }
+
+    /// Relay inventory to every registered peer that should receive it
+    /// (dcrd `RelayInventory` driving `handleRelayPeerInvMsg`); the
+    /// known-inventory set dedups repeated announcements.  dcrd's
+    /// trickle queue batches non-immediate inventory over a short
+    /// random window; the plain per-peer queue sends each announcement
+    /// as its own message.
+    pub fn relay_inventory(&self, msg: &crate::server::RelayInvFacts) {
+        let registry = self.inner.lock().expect("sync peers mutex poisoned");
+        for handles in registry.values() {
+            let mut relay = handles.relay.lock().expect("relay state poisoned");
+            let RelayPeerState {
+                facts,
+                announced_block,
+                known_inventory,
+            } = &mut *relay;
+            let outcome = crate::server::handle_relay_peer_inv(announced_block, facts, msg);
+            match outcome.action {
+                crate::server::RelayPeerAction::Ignore => {}
+                // The headers form of a block announcement needs the
+                // header data; block relay arrives with the block
+                // announcement piece.
+                crate::server::RelayPeerAction::QueueHeaders => {}
+                crate::server::RelayPeerAction::QueueInventory
+                | crate::server::RelayPeerAction::QueueInventoryImmediate => {
+                    let inv = InvVect {
+                        inv_type: msg.inv_type,
+                        hash: msg.inv_hash,
+                    };
+                    if known_inventory.contains(&inv) {
+                        continue;
+                    }
+                    known_inventory.put(inv);
+                    let _ = handles.outbound.queue_message(Message::Inv(MsgInv {
+                        inv_list: vec![inv],
+                    }));
+                }
+            }
+        }
     }
 
     fn deregister(&self, id: i32) {
@@ -206,12 +324,16 @@ impl SyncPeers {
         for action in actions {
             match action {
                 Action::QueueMessage { peer, message } => {
-                    if let Some((outbound, _)) = registry.get(&peer) {
-                        let _ = outbound.queue_message(message);
+                    if let Some(handles) = registry.get(&peer) {
+                        let _ = handles.outbound.queue_message(message);
                     }
                 }
                 Action::Disconnect { peer } => {
-                    if let Some((_, Some(socket))) = registry.get(&peer) {
+                    if let Some(SyncPeerHandles {
+                        socket: Some(socket),
+                        ..
+                    }) = registry.get(&peer)
+                    {
                         let _ = socket.shutdown(Shutdown::Both);
                     }
                 }
@@ -359,7 +481,12 @@ impl ServerPeerHandler {
     /// the actions it decides — for a data-serving peer on a stale
     /// chain this is where the header sync begins (dcrd `AddPeer`
     /// signalling `OnPeerConnected`).
-    pub fn on_connected(&mut self, peer: &mut Peer, outbound: &OutboundQueue) {
+    pub fn on_connected(
+        &mut self,
+        peer: &mut Peer,
+        outbound: &OutboundQueue,
+        remote_disable_relay_tx: bool,
+    ) {
         // Update the address manager and request known addresses for
         // outbound connections, skipped on the simulation and
         // regression test networks (dcrd `OnVersion`'s outbound
@@ -407,9 +534,21 @@ impl ServerPeerHandler {
 
         let id = self.ctx.next_peer_id.fetch_add(1, Ordering::SeqCst);
         self.sync_peer_id = Some(id);
+        // The relay facts snapshot the handshake (dcrd reads them off
+        // the live serverPeer; the headers preference is refreshed if
+        // the peer later sends sendheaders).
+        let relay = Arc::new(Mutex::new(RelayPeerState::new(
+            crate::server::RelayPeerFacts {
+                connected: true,
+                services: peer.services(),
+                wants_headers: peer.wants_headers(),
+                disable_relay_tx: remote_disable_relay_tx,
+                protocol_version: peer.protocol_version(),
+            },
+        )));
         self.ctx
             .sync_peers
-            .register(id, outbound.clone(), self.socket.take());
+            .register(id, outbound.clone(), self.socket.take(), relay);
         let actions = {
             let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
             manager.on_peer_connected(dcroxide_netsync::manager::Peer::new(
@@ -487,7 +626,16 @@ impl ServerPeerHandler {
                 self.on_get_init_state(&get_init.types, outbound);
                 ServeSignal::Continue
             }
-            Message::Inv(inv) => self.on_inv(inv),
+            Message::Inv(inv) => {
+                // Inventory the peer announces is known to it, so the
+                // relay never echoes it back (dcrd `AddKnownInventory`).
+                if let Some(id) = self.sync_peer_id {
+                    for iv in &inv.inv_list {
+                        self.ctx.sync_peers.mark_known_inventory(id, *iv);
+                    }
+                }
+                self.on_inv(inv)
+            }
             Message::Headers(headers) => {
                 self.drive_sync(|manager, id| manager.on_headers(id, headers));
                 ServeSignal::Continue
@@ -526,6 +674,40 @@ impl ServerPeerHandler {
                             .collect()
                     };
                     ntfn.notify_new_transactions(pairs);
+                }
+                // The inventory half of dcrd's AnnounceNewTransactions:
+                // the source peer already knows the transaction, and
+                // every accepted transaction joins the
+                // recently-advertised cache before fanning out.
+                for hash in &accepted {
+                    let inv = InvVect {
+                        inv_type: InvType::TX,
+                        hash: *hash,
+                    };
+                    if let Some(id) = self.sync_peer_id {
+                        self.ctx.sync_peers.mark_known_inventory(id, inv);
+                    }
+                    let fetched = {
+                        let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
+                        pool.fetch_transaction(hash)
+                    };
+                    if let Some(tx) = fetched {
+                        self.ctx
+                            .recently_advertised
+                            .lock()
+                            .expect("recently advertised poisoned")
+                            .put(*hash, tx);
+                    }
+                    self.ctx
+                        .sync_peers
+                        .relay_inventory(&crate::server::RelayInvFacts {
+                            inv_type: InvType::TX,
+                            inv_hash: *hash,
+                            req_services: dcroxide_wire::ServiceFlag(0),
+                            immediate: false,
+                            data_is_block_header: false,
+                            data_is_tx: true,
+                        });
                 }
                 ServeSignal::Continue
             }
@@ -688,8 +870,21 @@ impl ServerPeerHandler {
                         // handleServeGetData; the recently-advertised
                         // cache arrives with the relay fan-out).
                         InvType::TX => {
-                            let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
-                            match pool.fetch_transaction(&iv.hash) {
+                            // The recently-advertised cache serves
+                            // first so announcements stay servable
+                            // briefly after leaving the pool (dcrd's
+                            // handleServeGetData order).
+                            let advertised = self
+                                .ctx
+                                .recently_advertised
+                                .lock()
+                                .expect("recently advertised poisoned")
+                                .get(&iv.hash);
+                            let fetched = advertised.or_else(|| {
+                                let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
+                                pool.fetch_transaction(&iv.hash)
+                            });
+                            match fetched {
                                 Some(tx) => {
                                     txs.insert(iv.hash, tx);
                                     GetDataResolution::Found
@@ -915,4 +1110,78 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn relay_facts(disable_relay_tx: bool) -> crate::server::RelayPeerFacts {
+        crate::server::RelayPeerFacts {
+            connected: true,
+            services: dcroxide_wire::ServiceFlag(0),
+            wants_headers: false,
+            disable_relay_tx,
+            protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+        }
+    }
+
+    fn tx_inv(byte: u8) -> InvVect {
+        InvVect {
+            inv_type: InvType::TX,
+            hash: Hash([byte; 32]),
+        }
+    }
+
+    fn tx_relay_msg(inv: &InvVect) -> crate::server::RelayInvFacts {
+        crate::server::RelayInvFacts {
+            inv_type: inv.inv_type,
+            inv_hash: inv.hash,
+            req_services: dcroxide_wire::ServiceFlag(0),
+            immediate: false,
+            data_is_block_header: false,
+            data_is_tx: true,
+        }
+    }
+
+    /// The fan-out relays a transaction announcement to relay-enabled
+    /// peers only, dedups repeats through the known-inventory set, and
+    /// never echoes inventory a peer already knows.
+    #[test]
+    fn relays_tx_inventory_with_dedup_and_relay_preference() {
+        let peers = SyncPeers::new();
+        let (queue_a, rx_a) = crate::peerloop::OutboundQueue::channel();
+        let (queue_b, rx_b) = crate::peerloop::OutboundQueue::channel();
+        peers.register(
+            1,
+            queue_a,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+        );
+        peers.register(
+            2,
+            queue_b,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(true)))),
+        );
+
+        // Relay reaches the relay-enabled peer only.
+        let inv = tx_inv(0x01);
+        peers.relay_inventory(&tx_relay_msg(&inv));
+        match rx_a.try_recv().expect("peer 1 receives the inv") {
+            Message::Inv(msg) => assert_eq!(msg.inv_list, vec![inv]),
+            other => panic!("expected inv, got {other:?}"),
+        }
+        assert!(rx_b.try_recv().is_err(), "relay-disabled peer gets nothing");
+
+        // Repeats dedup through the known-inventory set.
+        peers.relay_inventory(&tx_relay_msg(&inv));
+        assert!(rx_a.try_recv().is_err(), "repeat announcements dedup");
+
+        // Inventory the peer announced itself is never echoed back.
+        let echoed = tx_inv(0x02);
+        peers.mark_known_inventory(1, echoed);
+        peers.relay_inventory(&tx_relay_msg(&echoed));
+        assert!(rx_a.try_recv().is_err(), "announced inventory not echoed");
+    }
 }

@@ -129,7 +129,13 @@ pub enum ServeSignal {
 /// message closure satisfies this with no-op lifecycle hooks.
 pub trait ServeHooks {
     /// The connection completed its handshake (dcrd `AddPeer`).
-    fn on_connected(&mut self, _peer: &mut Peer, _outbound: &OutboundQueue) {}
+    fn on_connected(
+        &mut self,
+        _peer: &mut Peer,
+        _outbound: &OutboundQueue,
+        _remote_disable_relay_tx: bool,
+    ) {
+    }
     /// A message arrived for the server handlers.
     fn on_message(
         &mut self,
@@ -336,9 +342,10 @@ where
     } else {
         peer.negotiate_outbound_protocol(&mut read_transport, &mut env, &mut globals)
     };
-    if let Err(e) = negotiated {
-        return DisconnectReason::Negotiate(e.message);
-    }
+    let remote_version = match negotiated {
+        Ok(remote) => remote,
+        Err(e) => return DisconnectReason::Negotiate(e.message),
+    };
 
     // Frame the rest of the session at the negotiated version (dcrd
     // re-reads the peer's protocol version on every message).
@@ -356,7 +363,11 @@ where
 
     // The handshake is complete: hand the peer to the server's
     // lifecycle hook (dcrd `AddPeer` signalling the sync manager).
-    hooks.on_connected(&mut peer.lock().expect("peer mutex poisoned"), &outbound);
+    hooks.on_connected(
+        &mut peer.lock().expect("peer mutex poisoned"),
+        &outbound,
+        remote_version.disable_relay_tx,
+    );
 
     let output = thread::spawn(move || {
         let reason = run_peer_output(&mut write_transport, receiver);

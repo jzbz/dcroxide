@@ -60,6 +60,7 @@ fn genesis_server(dir: &std::path::Path, name: &str) -> (Arc<ServerContext>, Con
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
         ntfn: None,
+        recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
     });
     (server, connected)
 }

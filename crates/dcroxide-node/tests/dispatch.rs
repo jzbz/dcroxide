@@ -78,6 +78,7 @@ fn serve_genesis_chain() -> (
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
         ntfn: None,
+        recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
     });
 
     let template = PeerTemplate {
@@ -476,6 +477,7 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
         ntfn: None,
+        recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
     });
     let template = PeerTemplate {
         net: NET,
@@ -592,6 +594,7 @@ fn disconnects_a_stalled_header_sync_peer() {
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
         ntfn: None,
+        recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
     });
     let template = PeerTemplate {
         net: NET,

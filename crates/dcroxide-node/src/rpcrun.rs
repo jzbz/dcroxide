@@ -375,6 +375,15 @@ impl dcroxide_rpc::server::RpcTimeSource for SystemTimeSource {
 pub struct NodeRpcConnManager {
     connected: crate::runtime::ConnectedPeers,
     net_totals: Arc<crate::transport::NetByteTotals>,
+    relay: Option<RpcRelaySinks>,
+}
+
+/// The relay handles the RPC connection manager drives when a
+/// submitted transaction should announce to the network.
+struct RpcRelaySinks {
+    sync_peers: crate::dispatch::SyncPeers,
+    recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
+    tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
 }
 
 impl NodeRpcConnManager {
@@ -387,13 +396,61 @@ impl NodeRpcConnManager {
         NodeRpcConnManager {
             connected,
             net_totals,
+            relay: None,
         }
+    }
+
+    /// Attach the relay handles so submitted transactions announce to
+    /// the network (dcrd rpcConnManager's `RelayTransactions`).
+    pub fn with_relay(
+        mut self,
+        sync_peers: crate::dispatch::SyncPeers,
+        recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
+        tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
+    ) -> NodeRpcConnManager {
+        self.relay = Some(RpcRelaySinks {
+            sync_peers,
+            recently_advertised,
+            tx_pool,
+        });
+        self
     }
 }
 
 impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
     fn connected_count(&mut self) -> i32 {
         self.connected.len() as i32
+    }
+
+    /// Announce submitted transactions to the network (dcrd
+    /// `relayTransactions` from the RPC adaptor).
+    fn relay_transactions(&mut self, tx_hashes: &[Hash]) {
+        let Some(relay) = &self.relay else {
+            return;
+        };
+        for hash in tx_hashes {
+            let fetched = {
+                let pool = relay.tx_pool.lock().expect("tx pool mutex poisoned");
+                pool.fetch_transaction(hash)
+            };
+            if let Some(tx) = fetched {
+                relay
+                    .recently_advertised
+                    .lock()
+                    .expect("recently advertised poisoned")
+                    .put(*hash, tx);
+            }
+            relay
+                .sync_peers
+                .relay_inventory(&crate::server::RelayInvFacts {
+                    inv_type: dcroxide_wire::InvType::TX,
+                    inv_hash: *hash,
+                    req_services: dcroxide_wire::ServiceFlag(0),
+                    immediate: false,
+                    data_is_block_header: false,
+                    data_is_tx: true,
+                });
+        }
     }
 
     fn net_totals(&mut self) -> (u64, u64) {

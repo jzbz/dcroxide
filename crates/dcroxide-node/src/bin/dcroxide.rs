@@ -298,6 +298,8 @@ fn run(cfg: Config) -> ExitCode {
             Arc::clone(&server.sync_manager),
             Arc::clone(&server.net_totals),
             Arc::clone(&tx_pool),
+            server.sync_peers.clone(),
+            Arc::clone(&server.recently_advertised),
         ));
         // Install the websocket notification manager (dcrd's
         // wsNotificationManager) and start its delivery thread over
@@ -448,6 +450,7 @@ fn build_server(
         disable_listen: cfg.disable_listen,
         tx_pool,
         ntfn,
+        recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
     });
     // Arm the header-sync stall watchdog around the manager (dcrd's
     // stallHandler timer).
@@ -519,6 +522,8 @@ fn open_chain(cfg: &Config) -> Result<Chain, String> {
 /// Build the RPC server configuration over the shared chain with the
 /// daemon's not-yet-wired subsystem seams as no-ops (dcrd `newRPCServer`;
 /// each seam fills in as its subsystem lands).
+// Mirrors dcrd's rpcserver config assembly, which takes the same set.
+#[allow(clippy::too_many_arguments)]
 fn rpc_config(
     cfg: &Config,
     chain: Arc<Mutex<Chain>>,
@@ -526,6 +531,10 @@ fn rpc_config(
     sync_manager: Arc<Mutex<dcroxide_node::sync::NodeSyncManager>>,
     net_totals: Arc<dcroxide_node::transport::NetByteTotals>,
     tx_pool: Arc<Mutex<dcroxide_node::txmempool::NodeTxPool>>,
+    sync_peers: dcroxide_node::dispatch::SyncPeers,
+    recently_advertised: Arc<
+        Mutex<dcroxide_containers::lru::Map<dcroxide_chainhash::Hash, dcroxide_wire::MsgTx>>,
+    >,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
     dcroxide_rpc::server::Config {
@@ -540,9 +549,13 @@ fn rpc_config(
             sync_manager,
             Arc::clone(&tx_pool),
         )),
-        conn_mgr: Box::new(dcroxide_node::rpcrun::NodeRpcConnManager::new(
-            connected, net_totals,
-        )),
+        conn_mgr: Box::new(
+            dcroxide_node::rpcrun::NodeRpcConnManager::new(connected, net_totals).with_relay(
+                sync_peers,
+                recently_advertised,
+                Arc::clone(&tx_pool),
+            ),
+        ),
         tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(tx_pool)),
         clock: Box::new(dcroxide_node::rpcrun::SystemClock),
         interfaces: Box::new(dcroxide_rpc::helpers::NoInterfaces),

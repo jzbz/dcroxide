@@ -303,9 +303,14 @@ enum InboundHooks {
 }
 
 impl ServeHooks for InboundHooks {
-    fn on_connected(&mut self, peer: &mut Peer, outbound: &OutboundQueue) {
+    fn on_connected(
+        &mut self,
+        peer: &mut Peer,
+        outbound: &OutboundQueue,
+        remote_disable_relay_tx: bool,
+    ) {
         if let InboundHooks::Server(handler) = self {
-            handler.on_connected(peer, outbound);
+            handler.on_connected(peer, outbound, remote_disable_relay_tx);
         }
     }
 
