@@ -4,8 +4,7 @@
 //! its version and drop-marker keys, index creation and upgrade, and
 //! the incremental drop paths shared by every index.
 
-use core::cell::Cell;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::{HASH_SIZE, Hash};
@@ -26,30 +25,31 @@ pub(crate) const INTERRUPT_MSG: &str = "interrupt requested";
 /// A shared interrupt flag standing in for dcrd's context
 /// cancellation: the daemon sets it to request an early shutdown of
 /// long-running index operations.
-pub type Interrupt = Rc<Cell<bool>>;
+pub type Interrupt = Arc<core::sync::atomic::AtomicBool>;
 
 /// Whether an interrupt has been requested (dcrd
 /// `interruptRequested`).
 pub(crate) fn interrupt_requested(interrupt: &Interrupt) -> bool {
-    interrupt.get()
+    interrupt.load(core::sync::atomic::Ordering::SeqCst)
 }
 
 /// A handle returned by [`Indexer::wait_for_sync`]: it flips to true
 /// when the index signals its subscribers that it is synced (the
 /// synchronous stand-in for dcrd's closed channel).
-pub type SyncWaiter = Rc<Cell<bool>>;
+pub type SyncWaiter = Arc<core::sync::atomic::AtomicBool>;
 
 /// Signal and clear the provided sync subscribers (dcrd
 /// `notifySyncSubscribers`).
 pub(crate) fn notify_sync_subscribers(subscribers: &mut Vec<SyncWaiter>) {
     for sub in subscribers.drain(..) {
-        sub.set(true);
+        sub.store(true, core::sync::atomic::Ordering::SeqCst);
     }
 }
 
 /// Access to the chain details required by indexes (dcrd
-/// `ChainQueryer`).
-pub trait ChainQueryer {
+/// `ChainQueryer`).  The daemon shares one queryer across the index
+/// threads, so implementations must be thread-safe.
+pub trait ChainQueryer: Send + Sync {
     /// Whether the block with the given hash is in the main chain.
     fn main_chain_has_block(&self, hash: &Hash) -> bool;
 
@@ -69,7 +69,7 @@ pub trait ChainQueryer {
     fn block_height_by_hash(&self, hash: &Hash) -> Result<i64, String>;
 
     /// The block of the provided hash.
-    fn block_by_hash(&self, hash: &Hash) -> Result<Rc<MsgBlock>, String>;
+    fn block_by_hash(&self, hash: &Hash) -> Result<Arc<MsgBlock>, String>;
 
     /// Whether the treasury agenda is active at the provided block.
     fn is_treasury_agenda_active(&self, hash: &Hash) -> Result<bool, String>;
@@ -79,8 +79,10 @@ pub trait ChainQueryer {
 /// the index constructors together with
 /// [`IndexSubscriber::subscribe`](crate::IndexSubscriber::subscribe),
 /// and the `DropIndex` method of dcrd's `IndexDropper` is part of
-/// this trait since both concrete indexes implement it.
-pub trait Indexer {
+/// this trait since both concrete indexes implement it.  The daemon
+/// drives the indexes from its own threads, so implementations must
+/// be sendable.
+pub trait Indexer: Send {
     /// The key of the index as a byte slice.
     fn key(&self) -> &'static [u8];
 
@@ -91,10 +93,10 @@ pub trait Indexer {
     fn version(&self) -> u32;
 
     /// The database of the index.
-    fn db(&self) -> Rc<Database>;
+    fn db(&self) -> Arc<Database>;
 
     /// The chain queryer.
-    fn queryer(&self) -> Rc<dyn ChainQueryer>;
+    fn queryer(&self) -> Arc<dyn ChainQueryer>;
 
     /// The current index tip.
     fn tip(&self) -> Result<(i64, Hash), IdxError>;

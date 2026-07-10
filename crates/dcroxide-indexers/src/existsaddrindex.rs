@@ -5,7 +5,7 @@
 //! removed, plus a memory-only overlay for unconfirmed transactions.
 
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{Bucket, Database, Transaction};
@@ -90,8 +90,8 @@ pub fn addr_to_key(addr: &Address) -> Result<[u8; ADDR_KEY_SIZE], IdxError> {
 
 /// The "ever seen" address index (dcrd `ExistsAddrIndex`).
 pub struct ExistsAddrIndex {
-    db: Rc<Database>,
-    chain: Rc<dyn ChainQueryer>,
+    db: Arc<Database>,
+    chain: Arc<dyn ChainQueryer>,
 
     // The memory-only index of addresses seen in unconfirmed
     // transactions (dcrd `mpExistsAddr`).
@@ -106,9 +106,9 @@ impl ExistsAddrIndex {
     /// `ExistsAddrIndex.Init`).
     pub fn new(
         subscriber: &mut IndexSubscriber,
-        db: Rc<Database>,
-        chain: Rc<dyn ChainQueryer>,
-    ) -> Result<Rc<core::cell::RefCell<ExistsAddrIndex>>, IdxError> {
+        db: Arc<Database>,
+        chain: Arc<dyn ChainQueryer>,
+    ) -> Result<Arc<std::sync::Mutex<ExistsAddrIndex>>, IdxError> {
         ExistsAddrIndex::new_with_prereq(subscriber, db, chain, NO_PREREQS)
     }
 
@@ -117,11 +117,11 @@ impl ExistsAddrIndex {
     /// relay hierarchy is exercised through this hook.
     pub fn new_with_prereq(
         subscriber: &mut IndexSubscriber,
-        db: Rc<Database>,
-        chain: Rc<dyn ChainQueryer>,
+        db: Arc<Database>,
+        chain: Arc<dyn ChainQueryer>,
         prereq: &str,
-    ) -> Result<Rc<core::cell::RefCell<ExistsAddrIndex>>, IdxError> {
-        let idx = Rc::new(core::cell::RefCell::new(ExistsAddrIndex {
+    ) -> Result<Arc<std::sync::Mutex<ExistsAddrIndex>>, IdxError> {
+        let idx = Arc::new(std::sync::Mutex::new(ExistsAddrIndex {
             db,
             chain,
             mp_exists_addr: HashSet::new(),
@@ -146,11 +146,11 @@ impl ExistsAddrIndex {
         }
         {
             let genesis_hash = {
-                let borrowed = idx.borrow();
+                let borrowed = idx.lock().expect("indexer lock poisoned");
                 let params = borrowed.chain.chain_params();
                 params.genesis_hash
             };
-            let borrowed = idx.borrow();
+            let borrowed = idx.lock().expect("indexer lock poisoned");
             // Finish any drops that were previously interrupted.
             crate::common::finish_drop(&interrupt, &*borrowed)?;
             // Create the initial state for the index as needed.
@@ -414,11 +414,11 @@ impl Indexer for ExistsAddrIndex {
         EXISTS_ADDR_INDEX_VERSION
     }
 
-    fn db(&self) -> Rc<Database> {
+    fn db(&self) -> Arc<Database> {
         self.db.clone()
     }
 
-    fn queryer(&self) -> Rc<dyn ChainQueryer> {
+    fn queryer(&self) -> Arc<dyn ChainQueryer> {
         self.chain.clone()
     }
 
@@ -461,7 +461,7 @@ impl Indexer for ExistsAddrIndex {
     }
 
     fn wait_for_sync(&mut self) -> SyncWaiter {
-        let waiter: SyncWaiter = Rc::new(core::cell::Cell::new(false));
+        let waiter: SyncWaiter = Arc::new(core::sync::atomic::AtomicBool::new(false));
         self.subscribers.push(waiter.clone());
         waiter
     }

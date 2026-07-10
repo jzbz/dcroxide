@@ -4,7 +4,7 @@
 //! block ID compaction layer mapping each indexed block to a
 //! sequential 4-byte ID.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dcroxide_chainhash::{HASH_SIZE, Hash};
 use dcroxide_database::{BlockRegion, Database, Transaction};
@@ -293,8 +293,8 @@ fn bucket_missing(name: &[u8]) -> IdxError {
 /// The transaction by hash index (dcrd `TxIndex`).
 pub struct TxIndex {
     cur_block_id: u32,
-    db: Rc<Database>,
-    chain: Rc<dyn ChainQueryer>,
+    db: Arc<Database>,
+    chain: Arc<dyn ChainQueryer>,
     subscribers: Vec<SyncWaiter>,
 }
 
@@ -304,10 +304,10 @@ impl TxIndex {
     /// `NewTxIndex` + `TxIndex.Init`).
     pub fn new(
         subscriber: &mut IndexSubscriber,
-        db: Rc<Database>,
-        chain: Rc<dyn ChainQueryer>,
-    ) -> Result<Rc<core::cell::RefCell<TxIndex>>, IdxError> {
-        let idx = Rc::new(core::cell::RefCell::new(TxIndex {
+        db: Arc<Database>,
+        chain: Arc<dyn ChainQueryer>,
+    ) -> Result<Arc<std::sync::Mutex<TxIndex>>, IdxError> {
+        let idx = Arc::new(std::sync::Mutex::new(TxIndex {
             cur_block_id: 0,
             db,
             chain,
@@ -327,11 +327,11 @@ impl TxIndex {
         }
         {
             let genesis_hash = {
-                let borrowed = idx.borrow();
+                let borrowed = idx.lock().expect("indexer lock poisoned");
                 let params = borrowed.chain.chain_params();
                 params.genesis_hash
             };
-            let borrowed = idx.borrow();
+            let borrowed = idx.lock().expect("indexer lock poisoned");
             // Finish any drops that were previously interrupted.
             finish_drop(&interrupt, &*borrowed)?;
             // Create the initial state for the index as needed.
@@ -347,7 +347,7 @@ impl TxIndex {
         // Find the latest known block id for the internal block id
         // index and initialize it.
         let cur_block_id = {
-            let borrowed = idx.borrow();
+            let borrowed = idx.lock().expect("indexer lock poisoned");
             let db_tx = borrowed.db.begin(false)?;
             // Scan forward in large gaps to find a block id that
             // doesn't exist yet to serve as an upper bound for the
@@ -387,7 +387,7 @@ impl TxIndex {
             db_tx.rollback()?;
             found
         };
-        idx.borrow_mut().cur_block_id = cur_block_id;
+        idx.lock().expect("indexer lock poisoned").cur_block_id = cur_block_id;
 
         Ok(idx)
     }
@@ -464,11 +464,11 @@ impl Indexer for TxIndex {
         TX_INDEX_VERSION
     }
 
-    fn db(&self) -> Rc<Database> {
+    fn db(&self) -> Arc<Database> {
         self.db.clone()
     }
 
-    fn queryer(&self) -> Rc<dyn ChainQueryer> {
+    fn queryer(&self) -> Arc<dyn ChainQueryer> {
         self.chain.clone()
     }
 
@@ -514,7 +514,7 @@ impl Indexer for TxIndex {
     }
 
     fn wait_for_sync(&mut self) -> SyncWaiter {
-        let waiter: SyncWaiter = Rc::new(core::cell::Cell::new(false));
+        let waiter: SyncWaiter = Arc::new(core::sync::atomic::AtomicBool::new(false));
         self.subscribers.push(waiter.clone());
         waiter
     }

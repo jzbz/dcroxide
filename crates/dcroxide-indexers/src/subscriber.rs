@@ -8,9 +8,9 @@
 //! ticker; this port delivers synchronously with identical state
 //! transitions, leaving the concurrency to the daemon phase.
 
-use core::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use dcroxide_wire::MsgBlock;
 
@@ -44,9 +44,9 @@ pub struct IndexNtfn {
     /// The notification type.
     pub ntfn_type: IndexNtfnType,
     /// The block the notification is for.
-    pub block: Rc<MsgBlock>,
+    pub block: Arc<MsgBlock>,
     /// The parent of the block.
-    pub parent: Rc<MsgBlock>,
+    pub parent: Arc<MsgBlock>,
     /// Whether the treasury agenda is active at the block.
     pub is_treasury_enabled: bool,
 }
@@ -58,7 +58,7 @@ pub(crate) fn block_height(block: &MsgBlock) -> i64 {
 }
 
 /// A shared, mutably borrowable indexer handle.
-pub type IndexerHandle = Rc<RefCell<dyn Indexer>>;
+pub type IndexerHandle = Arc<Mutex<dyn Indexer>>;
 
 /// A subscription chain: the first entry is the prerequisite-free
 /// index, each following entry is the dependent of the one before
@@ -195,12 +195,16 @@ impl IndexSubscriber {
         ntfn: &IndexNtfn,
     ) -> Result<(), IdxError> {
         let (name, idx) = &chain[0];
-        let (tip, _) = idx.borrow().tip().map_err(|err| {
-            indexer_error(
-                ErrorKind::FetchTip,
-                format!("{name}: unable to fetch index tip: {err}"),
-            )
-        })?;
+        let (tip, _) = idx
+            .lock()
+            .expect("indexer lock poisoned")
+            .tip()
+            .map_err(|err| {
+                indexer_error(
+                    ErrorKind::FetchTip,
+                    format!("{name}: unable to fetch index tip: {err}"),
+                )
+            })?;
 
         let expected_height = match ntfn.ntfn_type {
             CONNECT_NTFN => tip.saturating_add(1),
@@ -231,9 +235,13 @@ impl IndexSubscriber {
                 ),
             ));
         } else {
-            let db = idx.borrow().db();
+            let db = idx.lock().expect("indexer lock poisoned").db();
             let db_tx = db.begin(true)?;
-            match idx.borrow_mut().process_notification(&db_tx, ntfn) {
+            match idx
+                .lock()
+                .expect("indexer lock poisoned")
+                .process_notification(&db_tx, ntfn)
+            {
                 Ok(()) => db_tx.commit()?,
                 Err(err) => {
                     let _ = db_tx.rollback();
@@ -243,7 +251,10 @@ impl IndexSubscriber {
 
             self.notify_dependent(chain, ntfn)?;
 
-            maybe_notify_subscribers(&self.interrupt, &mut *idx.borrow_mut())?;
+            maybe_notify_subscribers(
+                &self.interrupt,
+                &mut *idx.lock().expect("indexer lock poisoned"),
+            )?;
         }
 
         Ok(())
@@ -302,7 +313,7 @@ impl IndexSubscriber {
         let mut lowest_height = best_height;
         for entry in self.subscriptions.values() {
             let (name, idx) = &entry.chain[0];
-            let (tip_height, tip_hash) = idx.borrow().tip()?;
+            let (tip_height, tip_hash) = idx.lock().expect("indexer lock poisoned").tip()?;
 
             // Ensure the index tip is on the main chain.
             if !queryer.main_chain_has_block(&tip_hash) {
@@ -321,7 +332,10 @@ impl IndexSubscriber {
             if entry.chain.len() > 1 {
                 let first_dependent = &entry.chain[1].1;
                 for _ in 1..entry.chain.len() {
-                    let (tip_height, _) = first_dependent.borrow().tip()?;
+                    let (tip_height, _) = first_dependent
+                        .lock()
+                        .expect("indexer lock poisoned")
+                        .tip()?;
                     if tip_height < lowest_height {
                         lowest_height = tip_height;
                     }
@@ -343,7 +357,7 @@ impl IndexSubscriber {
             return Ok(());
         }
 
-        let mut cached_parent: Option<Rc<MsgBlock>> = None;
+        let mut cached_parent: Option<Arc<MsgBlock>> = None;
         let mut height = lowest_height.saturating_add(1);
         while height <= best_height {
             if interrupt_requested(&self.interrupt) {
@@ -420,21 +434,21 @@ impl IndexSubscriber {
         let idx = chain[0].1.clone();
 
         // Fetch the current tip for the index.
-        let (mut height, mut hash) = idx.borrow().tip()?;
+        let (mut height, mut hash) = idx.lock().expect("indexer lock poisoned").tip()?;
 
         // Nothing to do if the index does not have any entries yet.
         if height == 0 {
             return Ok(());
         }
 
-        let queryer = idx.borrow().queryer();
+        let queryer = idx.lock().expect("indexer lock poisoned").queryer();
 
         // Nothing to do if the index tip is on the main chain.
         if queryer.main_chain_has_block(&hash) {
             return Ok(());
         }
 
-        let mut cached_block: Option<Rc<MsgBlock>> = None;
+        let mut cached_block: Option<Arc<MsgBlock>> = None;
         while !queryer.main_chain_has_block(&hash) {
             if interrupt_requested(&self.interrupt) {
                 return Err(indexer_error(ErrorKind::InterruptRequested, INTERRUPT_MSG));

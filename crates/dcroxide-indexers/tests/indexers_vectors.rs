@@ -13,9 +13,8 @@
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
 
-use core::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use dcroxide_chaincfg::{Params, simnet_params};
 use dcroxide_chainhash::Hash;
@@ -37,20 +36,20 @@ fn leaked_params() -> &'static Params {
 struct TestChainState {
     best_height: i64,
     best_hash: Option<Hash>,
-    keyed_by_height: HashMap<i64, Rc<MsgBlock>>,
-    keyed_by_hash: HashMap<[u8; 32], Rc<MsgBlock>>,
-    orphans: HashMap<[u8; 32], Rc<MsgBlock>>,
+    keyed_by_height: HashMap<i64, Arc<MsgBlock>>,
+    keyed_by_hash: HashMap<[u8; 32], Arc<MsgBlock>>,
+    orphans: HashMap<[u8; 32], Arc<MsgBlock>>,
 }
 
 struct TestChain {
-    state: RefCell<TestChainState>,
+    state: Mutex<TestChainState>,
     params: &'static Params,
 }
 
 impl TestChain {
     fn new(params: &'static Params) -> TestChain {
         let chain = TestChain {
-            state: RefCell::new(TestChainState {
+            state: Mutex::new(TestChainState {
                 best_height: 0,
                 best_hash: None,
                 keyed_by_height: HashMap::new(),
@@ -59,12 +58,12 @@ impl TestChain {
             }),
             params,
         };
-        chain.add_block(Rc::new(params.genesis_block.clone()));
+        chain.add_block(Arc::new(params.genesis_block.clone()));
         chain
     }
 
-    fn add_block(&self, block: Rc<MsgBlock>) {
-        let mut state = self.state.borrow_mut();
+    fn add_block(&self, block: Arc<MsgBlock>) {
+        let mut state = self.state.lock().expect("indexer lock poisoned");
         if let Some(best) = &state.best_hash {
             assert_eq!(
                 block.header.prev_block,
@@ -81,8 +80,8 @@ impl TestChain {
         state.best_hash = Some(hash);
     }
 
-    fn remove_block(&self, block: &Rc<MsgBlock>) {
-        let mut state = self.state.borrow_mut();
+    fn remove_block(&self, block: &Arc<MsgBlock>) {
+        let mut state = self.state.lock().expect("indexer lock poisoned");
         let hash = block.header.block_hash();
         assert_eq!(
             state.best_hash,
@@ -100,7 +99,11 @@ impl TestChain {
 
 impl ChainQueryer for TestChain {
     fn main_chain_has_block(&self, hash: &Hash) -> bool {
-        self.state.borrow().keyed_by_hash.contains_key(&hash.0)
+        self.state
+            .lock()
+            .expect("indexer lock poisoned")
+            .keyed_by_hash
+            .contains_key(&hash.0)
     }
 
     fn chain_params(&self) -> &Params {
@@ -108,12 +111,12 @@ impl ChainQueryer for TestChain {
     }
 
     fn best(&self) -> (i64, Hash) {
-        let state = self.state.borrow();
+        let state = self.state.lock().expect("indexer lock poisoned");
         (state.best_height, state.best_hash.expect("best hash"))
     }
 
     fn block_header_by_hash(&self, hash: &Hash) -> Result<BlockHeader, String> {
-        let state = self.state.borrow();
+        let state = self.state.lock().expect("indexer lock poisoned");
         state
             .keyed_by_hash
             .get(&hash.0)
@@ -124,7 +127,8 @@ impl ChainQueryer for TestChain {
 
     fn block_hash_by_height(&self, height: i64) -> Result<Hash, String> {
         self.state
-            .borrow()
+            .lock()
+            .expect("indexer lock poisoned")
             .keyed_by_height
             .get(&height)
             .map(|b| b.header.block_hash())
@@ -135,8 +139,8 @@ impl ChainQueryer for TestChain {
         self.block_by_hash(hash).map(|b| i64::from(b.header.height))
     }
 
-    fn block_by_hash(&self, hash: &Hash) -> Result<Rc<MsgBlock>, String> {
-        let state = self.state.borrow();
+    fn block_by_hash(&self, hash: &Hash) -> Result<Arc<MsgBlock>, String> {
+        let state = self.state.lock().expect("indexer lock poisoned");
         state
             .keyed_by_hash
             .get(&hash.0)
@@ -153,23 +157,23 @@ impl ChainQueryer for TestChain {
 /// The per-scenario replay state.
 struct Scenario {
     _dir: tempfile::TempDir,
-    db: Rc<Database>,
-    chain: Rc<TestChain>,
+    db: Arc<Database>,
+    chain: Arc<TestChain>,
     subber: IndexSubscriber,
-    tx_idx: Option<Rc<RefCell<TxIndex>>>,
-    ex_idx: Option<Rc<RefCell<ExistsAddrIndex>>>,
+    tx_idx: Option<Arc<Mutex<TxIndex>>>,
+    ex_idx: Option<Arc<Mutex<ExistsAddrIndex>>>,
 }
 
 impl Scenario {
     fn new(params: &'static Params) -> Scenario {
         let dir = tempfile::tempdir().expect("tempdir");
         let opts = Options::new(dir.path().join("db"), params.net.0);
-        let db = Rc::new(Database::create(&opts).expect("db"));
+        let db = Arc::new(Database::create(&opts).expect("db"));
         Scenario {
             _dir: dir,
             db,
-            chain: Rc::new(TestChain::new(params)),
-            subber: IndexSubscriber::new(Rc::new(Cell::new(false))),
+            chain: Arc::new(TestChain::new(params)),
+            subber: IndexSubscriber::new(Arc::new(core::sync::atomic::AtomicBool::new(false))),
             tx_idx: None,
             ex_idx: None,
         }
@@ -181,8 +185,14 @@ impl Scenario {
         let mut lines = Vec::new();
         for (short, key) in [("tx", TX_INDEX_KEY), ("exists", EXISTS_ADDR_INDEX_KEY)] {
             let tip = match short {
-                "tx" => self.tx_idx.as_ref().map(|idx| idx.borrow().tip()),
-                _ => self.ex_idx.as_ref().map(|idx| idx.borrow().tip()),
+                "tx" => self
+                    .tx_idx
+                    .as_ref()
+                    .map(|idx| idx.lock().expect("indexer lock poisoned").tip()),
+                _ => self
+                    .ex_idx
+                    .as_ref()
+                    .map(|idx| idx.lock().expect("indexer lock poisoned").tip()),
             };
             // The dump reads the tip straight from the database so an
             // index object need not exist; mirror through a throwaway
@@ -260,9 +270,9 @@ fn raw_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn parse_block(hex: &str) -> Rc<MsgBlock> {
+fn parse_block(hex: &str) -> Arc<MsgBlock> {
     let (block, _) = MsgBlock::from_bytes(&unhex(hex)).expect("block");
-    Rc::new(block)
+    Arc::new(block)
 }
 
 #[test]
@@ -272,7 +282,7 @@ fn indexers_vectors() {
     let mut lines = data.lines().peekable();
 
     let mut scenario: Option<Scenario> = None;
-    let mut blocks: HashMap<String, Rc<MsgBlock>> = HashMap::new();
+    let mut blocks: HashMap<String, Arc<MsgBlock>> = HashMap::new();
     let mut addrs: HashMap<String, Address> = HashMap::new();
     let mut counts = [0usize; 6];
 
@@ -291,7 +301,7 @@ fn indexers_vectors() {
             assert_eq!(got, want, "state mismatch after {context}");
         };
 
-    let ntfn_for = |blocks: &HashMap<String, Rc<MsgBlock>>,
+    let ntfn_for = |blocks: &HashMap<String, Arc<MsgBlock>>,
                     name: &str,
                     parent: &str,
                     ntfn_type: IndexNtfnType|
@@ -332,7 +342,7 @@ fn indexers_vectors() {
                 let idx = TxIndex::new(
                     &mut sc.subber,
                     sc.db.clone(),
-                    sc.chain.clone() as Rc<dyn ChainQueryer>,
+                    sc.chain.clone() as Arc<dyn ChainQueryer>,
                 )
                 .expect("new tx index");
                 sc.tx_idx = Some(idx);
@@ -343,7 +353,7 @@ fn indexers_vectors() {
                 let idx = ExistsAddrIndex::new(
                     &mut sc.subber,
                     sc.db.clone(),
-                    sc.chain.clone() as Rc<dyn ChainQueryer>,
+                    sc.chain.clone() as Arc<dyn ChainQueryer>,
                 )
                 .expect("new exists index");
                 sc.ex_idx = Some(idx);
@@ -354,7 +364,7 @@ fn indexers_vectors() {
                 let idx = ExistsAddrIndex::new_with_prereq(
                     &mut sc.subber,
                     sc.db.clone(),
-                    sc.chain.clone() as Rc<dyn ChainQueryer>,
+                    sc.chain.clone() as Arc<dyn ChainQueryer>,
                     TX_INDEX_NAME,
                 )
                 .expect("new dependent exists index");
@@ -416,14 +426,20 @@ fn indexers_vectors() {
                 let sc = scenario.as_ref().expect("scenario");
                 let interrupt = sc.subber.interrupt();
                 let idx = sc.tx_idx.as_ref().expect("tx index");
-                idx.borrow().drop_index(&interrupt, &sc.db).expect("drop");
+                idx.lock()
+                    .expect("indexer lock poisoned")
+                    .drop_index(&interrupt, &sc.db)
+                    .expect("drop");
                 compare_state(&mut lines, sc, line);
             }
             "dropexists" => {
                 let sc = scenario.as_ref().expect("scenario");
                 let interrupt = sc.subber.interrupt();
                 let idx = sc.ex_idx.as_ref().expect("exists index");
-                idx.borrow().drop_index(&interrupt, &sc.db).expect("drop");
+                idx.lock()
+                    .expect("indexer lock poisoned")
+                    .drop_index(&interrupt, &sc.db)
+                    .expect("drop");
                 compare_state(&mut lines, sc, line);
             }
             "entry" | "entryhash" => {
@@ -443,7 +459,8 @@ fn indexers_vectors() {
                     .tx_idx
                     .as_ref()
                     .expect("tx index")
-                    .borrow()
+                    .lock()
+                    .expect("indexer lock poisoned")
                     .entry(&hash)
                     .expect("entry query");
                 let got = match entry {
@@ -470,7 +487,8 @@ fn indexers_vectors() {
                 sc.ex_idx
                     .as_ref()
                     .expect("exists index")
-                    .borrow_mut()
+                    .lock()
+                    .expect("indexer lock poisoned")
                     .add_unconfirmed_tx(&tx);
                 counts[3] += 1;
             }
@@ -481,7 +499,8 @@ fn indexers_vectors() {
                     .ex_idx
                     .as_ref()
                     .expect("exists index")
-                    .borrow()
+                    .lock()
+                    .expect("indexer lock poisoned")
                     .exists_address(&addrs[f[1]])
                     .expect("exists query");
                 assert_eq!(got, want, "{line}");
@@ -496,7 +515,8 @@ fn indexers_vectors() {
                     .ex_idx
                     .as_ref()
                     .expect("exists index")
-                    .borrow()
+                    .lock()
+                    .expect("indexer lock poisoned")
                     .exists_addresses(&query)
                     .expect("exists multi query");
                 assert_eq!(got, want, "{line}");
@@ -517,14 +537,14 @@ fn sync_waiters_and_legacy_drops() {
     let params = leaked_params();
     let dir = tempfile::tempdir().expect("tempdir");
     let opts = Options::new(dir.path().join("db"), params.net.0);
-    let db = Rc::new(Database::create(&opts).expect("db"));
-    let chain = Rc::new(TestChain::new(params));
-    let mut subber = IndexSubscriber::new(Rc::new(Cell::new(false)));
+    let db = Arc::new(Database::create(&opts).expect("db"));
+    let chain = Arc::new(TestChain::new(params));
+    let mut subber = IndexSubscriber::new(Arc::new(core::sync::atomic::AtomicBool::new(false)));
 
     let idx = TxIndex::new(
         &mut subber,
         db.clone(),
-        chain.clone() as Rc<dyn ChainQueryer>,
+        chain.clone() as Arc<dyn ChainQueryer>,
     )
     .expect("tx index");
 
@@ -537,9 +557,12 @@ fn sync_waiters_and_legacy_drops() {
         .expect("bk1 hex");
     let block = parse_block(block_hex);
     chain.add_block(block.clone());
-    let waiter = idx.borrow_mut().wait_for_sync();
-    assert!(!waiter.get(), "waiter must start unsignalled");
-    let genesis = Rc::new(params.genesis_block.clone());
+    let waiter = idx.lock().expect("indexer lock poisoned").wait_for_sync();
+    assert!(
+        !waiter.load(core::sync::atomic::Ordering::SeqCst),
+        "waiter must start unsignalled"
+    );
+    let genesis = Arc::new(params.genesis_block.clone());
     let ntfn = IndexNtfn {
         ntfn_type: CONNECT_NTFN,
         block,
@@ -547,7 +570,10 @@ fn sync_waiters_and_legacy_drops() {
         is_treasury_enabled: false,
     };
     subber.notify(&ntfn).expect("notify");
-    assert!(waiter.get(), "waiter must fire at the chain tip");
+    assert!(
+        waiter.load(core::sync::atomic::Ordering::SeqCst),
+        "waiter must fire at the chain tip"
+    );
 
     // The legacy drop helpers are no-ops without the tips entry and
     // remove the bucket, tip, version, and drop marker with it.
@@ -582,4 +608,23 @@ fn sync_waiters_and_legacy_drops() {
         assert!(tips.get(legacy).is_none(), "legacy tip must be gone");
     }
     db_tx.rollback().expect("rollback");
+}
+
+/// The daemon drives the indexes from its own threads, so the index
+/// state and the shared handles it hands out must cross thread
+/// boundaries.  This pins the conversion off `Rc`/`RefCell`/`Cell` at
+/// compile time.
+#[test]
+fn indexer_state_is_send() {
+    fn assert_send<T: Send>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send::<TxIndex>();
+    assert_send::<ExistsAddrIndex>();
+    assert_send::<IndexSubscriber>();
+    assert_send_sync::<Arc<Mutex<TxIndex>>>();
+    assert_send_sync::<Arc<Mutex<ExistsAddrIndex>>>();
+    assert_send_sync::<Arc<dyn ChainQueryer>>();
+    assert_send_sync::<Arc<Mutex<dyn Indexer>>>();
+    assert_send_sync::<dcroxide_indexers::Interrupt>();
+    assert_send_sync::<dcroxide_indexers::SyncWaiter>();
 }
