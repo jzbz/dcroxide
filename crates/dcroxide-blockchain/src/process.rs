@@ -3217,6 +3217,74 @@ impl Chain {
         })
     }
 
+    /// Whether the given agenda is active for the block AFTER the
+    /// given block (the shared body of the by-hash agenda queries,
+    /// dcrd `isAgendaActiveByHash`).
+    fn is_agenda_active_by_hash(
+        &self,
+        prev_hash: &Hash,
+        vote_id: &'static str,
+        params: &Params,
+    ) -> Result<bool, RuleError> {
+        // Agendas are never active for the genesis block.
+        if *prev_hash == Hash::ZERO {
+            return Ok(false);
+        }
+        let node = self.lookup_validatable(prev_hash)?;
+        let view = NodeBranchView {
+            store: &self.store,
+            tip: node,
+        };
+        let height = self.store.node(node).height;
+        crate::agendas::is_agenda_active(&view, Some(height), vote_id, params).map_err(|_| {
+            rule_error(
+                RuleErrorKind::UnknownDeploymentID,
+                format!("deployment ID {vote_id} does not exist"),
+            )
+        })
+    }
+
+    /// Whether the DCP0010 modified subsidy split agenda is active for
+    /// the block AFTER the given block (dcrd
+    /// `BlockChain.IsSubsidySplitAgendaActive`).
+    pub fn is_subsidy_split_agenda_active(
+        &self,
+        prev_hash: &Hash,
+        params: &Params,
+    ) -> Result<bool, RuleError> {
+        self.is_agenda_active_by_hash(
+            prev_hash,
+            crate::agendas::VOTE_ID_CHANGE_SUBSIDY_SPLIT,
+            params,
+        )
+    }
+
+    /// Whether the DCP0012 modified subsidy split round 2 agenda is
+    /// active for the block AFTER the given block (dcrd
+    /// `BlockChain.IsSubsidySplitR2AgendaActive`).
+    pub fn is_subsidy_split_r2_agenda_active(
+        &self,
+        prev_hash: &Hash,
+        params: &Params,
+    ) -> Result<bool, RuleError> {
+        self.is_agenda_active_by_hash(
+            prev_hash,
+            crate::agendas::VOTE_ID_CHANGE_SUBSIDY_SPLIT_R2,
+            params,
+        )
+    }
+
+    /// Whether the DCP0002/DCP0003 LN features agenda is active for
+    /// the block AFTER the given block (dcrd
+    /// `BlockChain.IsLNFeaturesAgendaActive`).
+    pub fn is_ln_features_agenda_active(
+        &self,
+        prev_hash: &Hash,
+        params: &Params,
+    ) -> Result<bool, RuleError> {
+        self.is_agenda_active_by_hash(prev_hash, crate::agendas::VOTE_ID_LN_FEATURES, params)
+    }
+
     /// The height at which the given deployment last changed state as
     /// of the given block hash (dcrd `StateLastChangedHeight`); zero
     /// when the state has never changed.

@@ -60,6 +60,15 @@ fn serve_genesis_chain() -> (
             false,
             8,
             1000,
+            dcroxide_node::txmempool::new_shared_tx_pool(
+                Arc::clone(&chain),
+                &params,
+                false,
+                100,
+                10000,
+                false,
+                false,
+            ),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
@@ -446,6 +455,15 @@ fn initiates_header_sync_with_a_data_serving_peer() {
             false,
             8,
             1000,
+            dcroxide_node::txmempool::new_shared_tx_pool(
+                Arc::clone(&chain),
+                &params,
+                false,
+                100,
+                10000,
+                false,
+                false,
+            ),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
@@ -533,6 +551,15 @@ fn disconnects_a_stalled_header_sync_peer() {
         false,
         8,
         1000,
+        dcroxide_node::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            false,
+            100,
+            10000,
+            false,
+            false,
+        ),
     )));
     // A short stall timeout so the test observes the watchdog firing.
     let stall_timer = dcroxide_node::dispatch::start_stall_timer(

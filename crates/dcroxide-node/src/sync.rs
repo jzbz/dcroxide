@@ -30,7 +30,8 @@ use dcroxide_wire::{BlockHeader, MsgBlock, MsgTx};
 
 /// The daemon's concrete sync manager over the shared chain and the
 /// not-yet-wired pools.
-pub type NodeSyncManager = SyncManager<NodeSyncChain, NullTxPool, NullMixPool>;
+pub type NodeSyncManager =
+    SyncManager<NodeSyncChain, crate::txmempool::NodeSyncTxPool, NullMixPool>;
 
 /// The maximum number of recently confirmed transactions to track
 /// (dcrd `maxRecentlyConfirmedTxns`: about one hour of main network
@@ -215,10 +216,11 @@ pub fn new_sync_manager(
     no_mining_state_sync: bool,
     max_outbound_peers: u64,
     max_orphan_txs: usize,
+    tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
 ) -> NodeSyncManager {
     SyncManager::new(Config {
         chain: NodeSyncChain::new(chain, params.clone()),
-        tx_mem_pool: NullTxPool,
+        tx_mem_pool: crate::txmempool::NodeSyncTxPool::new(tx_pool),
         mix_pool: NullMixPool,
         min_known_chain_work: params.min_known_chain_work,
         net: params.net,

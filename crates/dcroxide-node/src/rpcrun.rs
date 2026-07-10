@@ -414,12 +414,21 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
 /// `RpcSyncManager` seam).
 pub struct NodeRpcSyncManager {
     sync_manager: Arc<Mutex<crate::sync::NodeSyncManager>>,
+    tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
 }
 
 impl NodeRpcSyncManager {
-    /// Adapt the sync manager for the RPC handlers.
-    pub fn new(sync_manager: Arc<Mutex<crate::sync::NodeSyncManager>>) -> NodeRpcSyncManager {
-        NodeRpcSyncManager { sync_manager }
+    /// Adapt the sync manager and the transaction pool for the RPC
+    /// handlers (dcrd's rpcSyncMgr holds both the sync manager and
+    /// the pool).
+    pub fn new(
+        sync_manager: Arc<Mutex<crate::sync::NodeSyncManager>>,
+        tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
+    ) -> NodeRpcSyncManager {
+        NodeRpcSyncManager {
+            sync_manager,
+            tx_pool,
+        }
     }
 }
 
@@ -436,6 +445,39 @@ impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
             .lock()
             .expect("sync manager poisoned")
             .sync_peer_id()
+    }
+
+    /// Submit a transaction to the pool (dcrd rpcSyncMgr's
+    /// `ProcessTransaction`, which reaches the pool directly).
+    fn process_transaction(
+        &mut self,
+        tx: &dcroxide_wire::MsgTx,
+        allow_orphan: bool,
+        allow_high_fees: bool,
+        tag: u64,
+    ) -> Result<Vec<Hash>, dcroxide_rpc::server::SendTxFailure> {
+        self.tx_pool
+            .lock()
+            .expect("tx pool mutex poisoned")
+            .process_transaction(tx, allow_orphan, allow_high_fees, tag)
+            .map_err(|err| dcroxide_rpc::server::SendTxFailure {
+                is_rule_error: matches!(err, dcroxide_mempool::PoolError::Rule(_)),
+                is_duplicate: crate::txmempool::is_duplicate_pool_error(&err),
+                message: match &err {
+                    dcroxide_mempool::PoolError::Rule(rule) => rule.description.clone(),
+                    dcroxide_mempool::PoolError::Other(text) => text.clone(),
+                },
+            })
+    }
+
+    /// Whether the transaction confirmed in a recent block (dcrd
+    /// `RecentlyConfirmedTxn` over the netsync APBF filter).
+    fn recently_confirmed_txn(&mut self, hash: &Hash) -> bool {
+        self.sync_manager
+            .lock()
+            .expect("sync manager poisoned")
+            .recently_confirmed_txns_mut()
+            .contains(&hash.0)
     }
 }
 

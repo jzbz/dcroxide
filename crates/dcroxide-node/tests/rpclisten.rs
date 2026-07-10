@@ -40,12 +40,22 @@ fn serve_rpc() -> (
     ));
     let shared_chain = Arc::clone(&chain);
     let connected = ConnectedPeers::new();
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
     let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
         Arc::clone(&chain),
         &params,
         false,
         8,
         1000,
+        Arc::clone(&tx_pool),
     )));
 
     let server = Arc::new(Mutex::new(Server::new(Config {
@@ -54,12 +64,14 @@ fn serve_rpc() -> (
         subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
-        sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager)),
+        sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool))),
         conn_mgr: Box::new(NodeRpcConnManager::new(
             connected,
             Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         )),
-        tx_mempooler: Box::new(dcroxide_node::rpcrun::EmptyTxMempooler),
+        tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(
+            Arc::clone(&tx_pool),
+        )),
         clock: Box::new(dcroxide_node::rpcrun::SystemClock),
         interfaces: Box::new(NoInterfaces),
         rand_u64: Box::new(|| 7),
@@ -226,12 +238,70 @@ fn answers_chain_queries_over_http() {
     assert!(response.contains("\"totalbytessent\":0"), "{response}");
     assert!(response.contains("\"timemillis\":"), "{response}");
 
-    // A handler whose daemon seam is not wired yet (the mempool)
-    // answers an internal error instead of killing the server...
+    // The mempool now answers over the wired pool: empty for a fresh
+    // chain.
     let response = post(
         port,
         Some("user:pass"),
-        r#"{"jsonrpc":"1.0","method":"getrawmempool","params":[],"id":3}"#,
+        r#"{"jsonrpc":"1.0","method":"getrawmempool","params":[],"id":12}"#,
+    );
+    assert!(response.contains("\"result\":[]"), "{response}");
+
+    // A garbage sendrawtransaction draws dcrd's deserialization error.
+    let response = post(
+        port,
+        Some("user:pass"),
+        r#"{"jsonrpc":"1.0","method":"sendrawtransaction","params":["zz"],"id":13}"#,
+    );
+    assert!(response.contains("-22"), "{response}");
+
+    // A well-formed transaction spending unknown outputs is refused as
+    // an orphan (rule error), since submission disallows orphans.
+    let orphan_tx = {
+        use dcroxide_wire::{MsgTx, OutPoint, TxIn, TxOut};
+        let tx = MsgTx {
+            tx_in: vec![TxIn {
+                previous_out_point: OutPoint {
+                    hash: dcroxide_chainhash::Hash([0x77; 32]),
+                    index: 0,
+                    tree: 0,
+                },
+                sequence: u32::MAX,
+                value_in: 0,
+                block_height: 0,
+                block_index: 0,
+                signature_script: vec![0x51],
+            }],
+            tx_out: vec![TxOut {
+                value: 1,
+                version: 0,
+                pk_script: vec![0x51],
+            }],
+            ..MsgTx::default()
+        };
+        tx.serialize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let response = post(
+        port,
+        Some("user:pass"),
+        &format!(
+            r#"{{"jsonrpc":"1.0","method":"sendrawtransaction","params":["{orphan_tx}"],"id":14}}"#
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(!response.contains("-32603"), "{response}");
+    assert!(response.contains("\"error\":{"), "{response}");
+
+    // A handler whose daemon seam is not wired yet (the fee
+    // estimator) answers an internal error instead of killing the
+    // server...
+    let response = post(
+        port,
+        Some("user:pass"),
+        r#"{"jsonrpc":"1.0","method":"estimatesmartfee","params":[10],"id":3}"#,
     );
     assert!(response.contains("-32603"), "{response}");
 

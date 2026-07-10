@@ -150,8 +150,23 @@ fn run(cfg: Config) -> ExitCode {
 
     // Build the daemon-wide server state shared by every peer, inbound
     // or outbound (dcrd's single `server`).
-    let (server, connected, template, stall_timer) =
-        build_server(&cfg, Arc::clone(&chain), Arc::clone(&addr_manager));
+    // The shared transaction memory pool over the chain (dcrd
+    // `newServer` building the pool before the rest of the server).
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &cfg.params.params,
+        cfg.accept_non_std,
+        cfg.max_orphan_txs,
+        cfg.min_relay_tx_fee_atoms,
+        cfg.allow_old_votes,
+        !cfg.mining_addrs.is_empty(),
+    );
+    let (server, connected, template, stall_timer) = build_server(
+        &cfg,
+        Arc::clone(&chain),
+        Arc::clone(&addr_manager),
+        Arc::clone(&tx_pool),
+    );
 
     // Bind the peer-to-peer listeners and start serving inbound peers
     // unless listening is disabled (dcrd's server listeners).
@@ -273,6 +288,7 @@ fn run(cfg: Config) -> ExitCode {
             connected.clone(),
             Arc::clone(&server.sync_manager),
             Arc::clone(&server.net_totals),
+            Arc::clone(&tx_pool),
         ));
         // Install the websocket notification manager (dcrd's
         // wsNotificationManager) and start its delivery thread over
@@ -370,6 +386,7 @@ fn build_server(
     cfg: &Config,
     chain: Arc<Mutex<Chain>>,
     addr_manager: Arc<Mutex<AddrManager>>,
+    tx_pool: Arc<Mutex<dcroxide_node::txmempool::NodeTxPool>>,
 ) -> (
     Arc<ServerContext>,
     ConnectedPeers,
@@ -397,6 +414,7 @@ fn build_server(
         // dcrd's targetOutbound: the default capped by --maxpeers.
         DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u64,
         cfg.max_orphan_txs as usize,
+        tx_pool,
     )));
     // The daemon-wide state the served peers' message handlers consult
     // (dcrd `newServer` deriving `minKnownWork` from the params).
@@ -493,6 +511,7 @@ fn rpc_config(
     connected: ConnectedPeers,
     sync_manager: Arc<Mutex<dcroxide_node::sync::NodeSyncManager>>,
     net_totals: Arc<dcroxide_node::transport::NetByteTotals>,
+    tx_pool: Arc<Mutex<dcroxide_node::txmempool::NodeTxPool>>,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
     dcroxide_rpc::server::Config {
@@ -503,11 +522,14 @@ fn rpc_config(
         ),
         min_relay_tx_fee: cfg.min_relay_tx_fee_atoms,
         max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
-        sync_mgr: Box::new(dcroxide_node::rpcrun::NodeRpcSyncManager::new(sync_manager)),
+        sync_mgr: Box::new(dcroxide_node::rpcrun::NodeRpcSyncManager::new(
+            sync_manager,
+            Arc::clone(&tx_pool),
+        )),
         conn_mgr: Box::new(dcroxide_node::rpcrun::NodeRpcConnManager::new(
             connected, net_totals,
         )),
-        tx_mempooler: Box::new(dcroxide_node::rpcrun::EmptyTxMempooler),
+        tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(tx_pool)),
         clock: Box::new(dcroxide_node::rpcrun::SystemClock),
         interfaces: Box::new(dcroxide_rpc::helpers::NoInterfaces),
         rand_u64: Box::new(|| {

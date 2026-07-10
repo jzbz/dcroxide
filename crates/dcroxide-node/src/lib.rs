@@ -28,6 +28,7 @@ pub mod seeding;
 pub mod server;
 pub mod sync;
 pub mod transport;
+pub mod txmempool;
 pub mod version;
 pub mod websocket;
 pub mod wsframe;

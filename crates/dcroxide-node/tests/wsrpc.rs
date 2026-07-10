@@ -39,12 +39,22 @@ fn serve_ws() -> (
     ));
     let shared_chain = Arc::clone(&chain);
     let connected = ConnectedPeers::new();
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
     let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
         Arc::clone(&chain),
         &params,
         false,
         8,
         1000,
+        Arc::clone(&tx_pool),
     )));
     let mut server = Server::new(Config {
         chain: NodeRpcChain::new(chain, params.clone()),
@@ -52,12 +62,14 @@ fn serve_ws() -> (
         subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
-        sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager)),
+        sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool))),
         conn_mgr: Box::new(NodeRpcConnManager::new(
             connected,
             Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         )),
-        tx_mempooler: Box::new(()),
+        tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(
+            Arc::clone(&tx_pool),
+        )),
         clock: Box::new(dcroxide_node::rpcrun::SystemClock),
         interfaces: Box::new(NoInterfaces),
         rand_u64: Box::new(|| 7),
