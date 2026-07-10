@@ -98,6 +98,13 @@ pub struct ServerContext {
     /// (dcrd's `bytesReceived`/`bytesSent` pair; getnettotals serves
     /// them).
     pub net_totals: Arc<crate::transport::NetByteTotals>,
+    /// The shared transaction memory pool the getdata and mempool
+    /// handlers serve from.
+    pub tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
+    /// The websocket notification manager fed on transaction
+    /// acceptance; absent when the RPC server is disabled (dcrd's nil
+    /// rpcServer checks).
+    pub ntfn: Option<crate::websocket::NodeNtfnMgr>,
 }
 
 /// The per-group count of outbound connections (dcrd
@@ -490,13 +497,70 @@ impl ServerPeerHandler {
                 ServeSignal::Continue
             }
             Message::Tx(tx) => {
-                // The accepted-transaction relay arrives with the
-                // mempool wiring; the null pool rejects everything.
+                let mut accepted = Vec::new();
                 self.drive_sync(|manager, id| {
-                    manager.on_tx(id, tx);
+                    accepted = manager.on_tx(id, tx);
                     Vec::new()
                 });
+                // dcrd's AnnounceNewTransactions: the websocket
+                // notification half; the peer inventory relay arrives
+                // with the relay fan-out piece.
+                if !accepted.is_empty()
+                    && let Some(ntfn) = &self.ctx.ntfn
+                {
+                    let pairs: Vec<(dcroxide_wire::MsgTx, i8)> = {
+                        let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
+                        accepted
+                            .iter()
+                            .filter_map(|hash| {
+                                let tx = pool.fetch_transaction(hash)?;
+                                let tree = if dcroxide_stake::determine_tx_type(&tx)
+                                    == dcroxide_stake::TxType::Regular
+                                {
+                                    dcroxide_wire::TX_TREE_REGULAR
+                                } else {
+                                    dcroxide_wire::TX_TREE_STAKE
+                                };
+                                Some((tx, tree))
+                            })
+                            .collect()
+                    };
+                    ntfn.notify_new_transactions(pairs);
+                }
                 ServeSignal::Continue
+            }
+            Message::MemPool => {
+                // Serve the pool's inventory (dcrd `OnMemPool`); the
+                // flood guard applies its decaying ban score.
+                let tx_hashes = {
+                    let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
+                    pool.tx_hashes()
+                };
+                match crate::server::on_mem_pool(
+                    &mut self.addr_state,
+                    &tx_hashes,
+                    self.ctx.disable_banning,
+                    self.ctx.ban_threshold,
+                    now_unix(),
+                ) {
+                    crate::server::OnMemPoolOutcome::Banned => {
+                        ServeSignal::Disconnect("ban score exceeds threshold")
+                    }
+                    crate::server::OnMemPoolOutcome::Inventory(invs) => {
+                        // dcrd trickles through its inventory queue,
+                        // which splits at the wire limit; the plain
+                        // queue chunks the same way.
+                        for chunk in invs.chunks(dcroxide_wire::MAX_INV_PER_MSG as usize) {
+                            if chunk.is_empty() {
+                                continue;
+                            }
+                            let _ = outbound.queue_message(Message::Inv(MsgInv {
+                                inv_list: chunk.to_vec(),
+                            }));
+                        }
+                        ServeSignal::Continue
+                    }
+                }
             }
             // The mix-message intake arrives with the mixpool wiring.
             _ => ServeSignal::Continue,
@@ -601,6 +665,7 @@ impl ServerPeerHandler {
         // Resolve each item against the chain, keeping the fetched
         // blocks so the serve actions can queue them in request order.
         let mut blocks = HashMap::new();
+        let mut txs: HashMap<dcroxide_chainhash::Hash, dcroxide_wire::MsgTx> = HashMap::new();
         let (items, best_hash) = {
             let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
             let items: Vec<(InvVect, GetDataResolution)> = inv_list
@@ -617,7 +682,25 @@ impl ServerPeerHandler {
                         // Transactions and mix messages resolve against
                         // pools that are not yet wired, so they miss
                         // exactly like an empty mempool's fetch.
-                        InvType::TX | InvType::MIX => GetDataResolution::NotFound,
+                        // Transactions serve from the mempool only:
+                        // confirmed transactions are deliberately not
+                        // servable over the network (dcrd's
+                        // handleServeGetData; the recently-advertised
+                        // cache arrives with the relay fan-out).
+                        InvType::TX => {
+                            let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
+                            match pool.fetch_transaction(&iv.hash) {
+                                Some(tx) => {
+                                    txs.insert(iv.hash, tx);
+                                    GetDataResolution::Found
+                                }
+                                None => GetDataResolution::NotFound,
+                            }
+                        }
+                        // Mix messages resolve against a pool that is
+                        // not yet wired, so they miss exactly like an
+                        // empty mixpool's fetch.
+                        InvType::MIX => GetDataResolution::NotFound,
                         _ => GetDataResolution::UnknownType,
                     };
                     (*iv, resolution)
@@ -629,10 +712,15 @@ impl ServerPeerHandler {
         let outcome = serve_get_data(&items, self.continue_hash, best_hash);
         for action in outcome.actions {
             let queued = match action {
-                ServeGetDataAction::QueueData(iv) => match blocks.remove(&iv.hash) {
-                    Some(block) => outbound.queue_message(Message::Block(block)),
-                    None => Ok(()),
-                },
+                ServeGetDataAction::QueueData(iv) => {
+                    if let Some(block) = blocks.remove(&iv.hash) {
+                        outbound.queue_message(Message::Block(block))
+                    } else if let Some(tx) = txs.remove(&iv.hash) {
+                        outbound.queue_message(Message::Tx(tx))
+                    } else {
+                        Ok(())
+                    }
+                }
                 ServeGetDataAction::QueueContinueInv(best) => {
                     outbound.queue_message(Message::Inv(MsgInv {
                         inv_list: vec![InvVect {

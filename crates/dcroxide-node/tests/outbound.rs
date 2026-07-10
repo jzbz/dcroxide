@@ -26,6 +26,15 @@ fn genesis_server(dir: &std::path::Path, name: &str) -> (Arc<ServerContext>, Con
         Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
     ));
     let connected = ConnectedPeers::new();
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
     let server = Arc::new(ServerContext {
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
@@ -42,21 +51,15 @@ fn genesis_server(dir: &std::path::Path, name: &str) -> (Arc<ServerContext>, Con
             false,
             8,
             1000,
-            dcroxide_node::txmempool::new_shared_tx_pool(
-                Arc::clone(&chain),
-                &params,
-                false,
-                100,
-                10000,
-                false,
-                false,
-            ),
+            Arc::clone(&tx_pool),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
         outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
+        tx_pool: Arc::clone(&tx_pool),
+        ntfn: None,
     });
     (server, connected)
 }

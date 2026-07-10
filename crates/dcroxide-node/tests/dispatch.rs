@@ -44,6 +44,15 @@ fn serve_genesis_chain() -> (
     ));
 
     let addr_manager = Arc::new(Mutex::new(dcroxide_addrmgr::AddrManager::new(dir.path())));
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
     let server = Arc::new(ServerContext {
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
@@ -60,21 +69,15 @@ fn serve_genesis_chain() -> (
             false,
             8,
             1000,
-            dcroxide_node::txmempool::new_shared_tx_pool(
-                Arc::clone(&chain),
-                &params,
-                false,
-                100,
-                10000,
-                false,
-                false,
-            ),
+            Arc::clone(&tx_pool),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
         outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
+        tx_pool: Arc::clone(&tx_pool),
+        ntfn: None,
     });
 
     let template = PeerTemplate {
@@ -439,6 +442,15 @@ fn initiates_header_sync_with_a_data_serving_peer() {
     let chain = Arc::new(Mutex::new(
         Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
     ));
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
     let server = Arc::new(ServerContext {
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
@@ -455,21 +467,15 @@ fn initiates_header_sync_with_a_data_serving_peer() {
             false,
             8,
             1000,
-            dcroxide_node::txmempool::new_shared_tx_pool(
-                Arc::clone(&chain),
-                &params,
-                false,
-                100,
-                10000,
-                false,
-                false,
-            ),
+            Arc::clone(&tx_pool),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
         outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
+        tx_pool: Arc::clone(&tx_pool),
+        ntfn: None,
     });
     let template = PeerTemplate {
         net: NET,
@@ -545,21 +551,22 @@ fn disconnects_a_stalled_header_sync_peer() {
         Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
     ));
     let sync_peers = dcroxide_node::dispatch::SyncPeers::new();
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
     let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
         Arc::clone(&chain),
         &params,
         false,
         8,
         1000,
-        dcroxide_node::txmempool::new_shared_tx_pool(
-            Arc::clone(&chain),
-            &params,
-            false,
-            100,
-            10000,
-            false,
-            false,
-        ),
+        Arc::clone(&tx_pool),
     )));
     // A short stall timeout so the test observes the watchdog firing.
     let stall_timer = dcroxide_node::dispatch::start_stall_timer(
@@ -583,6 +590,8 @@ fn disconnects_a_stalled_header_sync_peer() {
         outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
+        tx_pool: Arc::clone(&tx_pool),
+        ntfn: None,
     });
     let template = PeerTemplate {
         net: NET,
@@ -637,5 +646,51 @@ fn disconnects_a_stalled_header_sync_peer() {
     assert!(disconnected, "the stalled sync peer should be disconnected");
 
     stall_timer.shutdown();
+    runtime.shutdown();
+}
+
+/// The mempool serving arms: a mempool request over an empty pool
+/// queues no inventory (dcrd sends nothing when there is nothing to
+/// announce), a getdata for an unknown transaction answers notfound
+/// from the empty pool, and the connection keeps serving afterwards.
+#[test]
+fn serves_mempool_requests_over_the_empty_pool() {
+    let (_dir, runtime, _connected, mut transport, _genesis_hash, _addrmgr) = serve_genesis_chain();
+
+    // A mempool request over an empty pool queues nothing; prove the
+    // arm ran and the connection survived with a ping round trip.
+    transport
+        .write_message(&Message::MemPool)
+        .expect("send mempool");
+    transport
+        .write_message(&Message::Ping(dcroxide_wire::MsgPing { nonce: 41 }))
+        .expect("send ping");
+    match transport.read_message().expect("read pong") {
+        Message::Pong(pong) => assert_eq!(pong.nonce, 41),
+        other => panic!("expected pong, got {other:?}"),
+    }
+
+    // A getdata for an unknown transaction resolves against the pool
+    // and answers notfound.
+    let unknown_tx = InvVect {
+        inv_type: InvType::TX,
+        hash: dcroxide_chainhash::Hash([0x42; 32]),
+    };
+    transport
+        .write_message(&Message::GetData(MsgGetData {
+            inv_list: vec![unknown_tx],
+        }))
+        .expect("send getdata");
+    match transport.read_message().expect("read notfound") {
+        Message::NotFound(notfound) => {
+            assert_eq!(notfound.inv_list.len(), 1);
+            assert_eq!(
+                notfound.inv_list[0].hash,
+                dcroxide_chainhash::Hash([0x42; 32])
+            );
+        }
+        other => panic!("expected notfound, got {other:?}"),
+    }
+
     runtime.shutdown();
 }

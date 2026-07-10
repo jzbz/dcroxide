@@ -161,11 +161,20 @@ fn run(cfg: Config) -> ExitCode {
         cfg.allow_old_votes,
         !cfg.mining_addrs.is_empty(),
     );
+    // The websocket notification manager exists whenever the RPC
+    // server will run, so the peer handlers can announce accepted
+    // transactions (dcrd's nil rpcServer checks).
+    let ntfn = if cfg.disable_rpc {
+        None
+    } else {
+        Some(dcroxide_node::websocket::NodeNtfnMgr::new())
+    };
     let (server, connected, template, stall_timer) = build_server(
         &cfg,
         Arc::clone(&chain),
         Arc::clone(&addr_manager),
         Arc::clone(&tx_pool),
+        ntfn.clone(),
     );
 
     // Bind the peer-to-peer listeners and start serving inbound peers
@@ -293,7 +302,9 @@ fn run(cfg: Config) -> ExitCode {
         // Install the websocket notification manager (dcrd's
         // wsNotificationManager) and start its delivery thread over
         // the server.
-        let ntfn = dcroxide_node::websocket::NodeNtfnMgr::new();
+        let ntfn = ntfn
+            .clone()
+            .expect("the manager exists when RPC is enabled");
         rpc_srv.ntfn_mgr = Box::new(ntfn.clone());
         let rpc_server = Arc::new(Mutex::new(rpc_srv));
         let ntfn_thread = ntfn.start(Arc::clone(&rpc_server));
@@ -387,6 +398,7 @@ fn build_server(
     chain: Arc<Mutex<Chain>>,
     addr_manager: Arc<Mutex<AddrManager>>,
     tx_pool: Arc<Mutex<dcroxide_node::txmempool::NodeTxPool>>,
+    ntfn: Option<dcroxide_node::websocket::NodeNtfnMgr>,
 ) -> (
     Arc<ServerContext>,
     ConnectedPeers,
@@ -414,7 +426,7 @@ fn build_server(
         // dcrd's targetOutbound: the default capped by --maxpeers.
         DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u64,
         cfg.max_orphan_txs as usize,
-        tx_pool,
+        Arc::clone(&tx_pool),
     )));
     // The daemon-wide state the served peers' message handlers consult
     // (dcrd `newServer` deriving `minKnownWork` from the params).
@@ -434,6 +446,8 @@ fn build_server(
         outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: cfg.disable_listen,
+        tx_pool,
+        ntfn,
     });
     // Arm the header-sync stall watchdog around the manager (dcrd's
     // stallHandler timer).
