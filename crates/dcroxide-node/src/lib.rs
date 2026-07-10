@@ -17,6 +17,7 @@ mod gostd;
 pub mod ipc;
 pub mod logo;
 pub mod logsubsys;
+pub mod outbound;
 pub mod params;
 pub mod peerconn;
 pub mod peerloop;

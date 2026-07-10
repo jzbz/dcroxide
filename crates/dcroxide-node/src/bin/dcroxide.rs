@@ -9,11 +9,12 @@
 //! serve inbound peers, and idle on a shutdown-signal listener until
 //! interrupted, then stop accepting connections.
 //!
-//! The UTXO database, the connection manager (outbound dialing and
-//! seeding), the sync manager, the RPC server, and the server-handler
-//! dispatch that a served peer's messages are forwarded to arrive with
-//! later pieces.  The rotating file-logging backend is likewise not yet
-//! wired, so startup output goes to standard streams.
+//! Served peers, inbound and dialed, run through the sync-manager
+//! dispatch, and the connection manager keeps the permanent `--connect`
+//! peers up.  The UTXO database, the address-manager automatic dialing
+//! and seeding, and the RPC server arrive with later pieces.  The
+//! rotating file-logging backend is likewise not yet wired, so startup
+//! output goes to standard streams.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -23,8 +24,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dcroxide_addrmgr::{AddrManager, NetAddressType};
 use dcroxide_blockchain::process::Chain;
 use dcroxide_chainhash::Hash;
+use dcroxide_connmgr::DEFAULT_RETRY_DURATION;
 use dcroxide_database::{Database, ErrorKind, Options};
 use dcroxide_node::dispatch::ServerContext;
+use dcroxide_node::outbound::{OutboundConfig, start_outbound};
 use dcroxide_node::runtime::{ConnectedPeers, ListenerRuntime, PeerTemplate, inbound_peer_handler};
 use dcroxide_node::{
     Config, ConfigEnv, DEFAULT_TARGET_OUTBOUND, ERR_HELP_REQUESTED, ERR_SHOW_SUBSYSTEMS,
@@ -145,14 +148,19 @@ fn run(cfg: Config) -> ExitCode {
     // Share the manager with the served peers' addr exchange.
     let addr_manager = Arc::new(Mutex::new(addr_manager));
 
+    // Build the daemon-wide server state shared by every peer, inbound
+    // or outbound (dcrd's single `server`).
+    let (server, connected, template, stall_timer) =
+        build_server(&cfg, Arc::clone(&chain), Arc::clone(&addr_manager));
+
     // Bind the peer-to-peer listeners and start serving inbound peers
     // unless listening is disabled (dcrd's server listeners).
-    let listeners = if cfg.disable_listen {
+    let runtime = if cfg.disable_listen {
         log_info("Listening for peer-to-peer connections is disabled");
         None
     } else {
-        match start_listeners(&cfg, Arc::clone(&chain), Arc::clone(&addr_manager)) {
-            Ok((runtime, connected, stall_timer)) => {
+        match start_listeners(&cfg, &template, connected.clone(), Arc::clone(&server)) {
+            Ok(runtime) => {
                 let addrs: Vec<String> = runtime
                     .bound_addrs()
                     .iter()
@@ -166,7 +174,7 @@ fn run(cfg: Config) -> ExitCode {
                         addrs.join(", ")
                     }
                 ));
-                Some((runtime, connected, stall_timer))
+                Some(runtime)
             }
             Err(e) => {
                 log_info(&format!("Unable to start peer-to-peer listeners: {e}"));
@@ -174,13 +182,34 @@ fn run(cfg: Config) -> ExitCode {
             }
         }
     };
+
+    // Open outbound connections: the permanent `--connect` peers drive
+    // the connection manager (dcrd's connmgr).  The address-manager
+    // automatic dialing plugs into the same driver with a later piece.
+    let connector = if cfg.connect_peers.is_empty() {
+        None
+    } else {
+        log_info(&format!(
+            "Connecting to {} permanent peer(s)",
+            cfg.connect_peers.len()
+        ));
+        Some(start_outbound(OutboundConfig {
+            template: template.clone(),
+            connected: connected.clone(),
+            server: Some(Arc::clone(&server)),
+            target_outbound: DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u32,
+            retry_duration: Duration::from_nanos(DEFAULT_RETRY_DURATION as u64),
+            dial_timeout: Duration::from_nanos(cfg.dial_timeout_nanos as u64),
+            permanent: cfg.connect_peers.clone(),
+        }))
+    };
     if cfg.disable_seeders {
         log_info("Peer discovery through seeders is disabled");
     }
 
     log_info(
-        "The UTXO database, connection manager, sync manager, and RPC server \
-         are not yet wired; serving inbound peers until a shutdown signal is \
+        "The UTXO database, the address-manager automatic dialing, and the RPC \
+         server are not yet wired; serving peers until a shutdown signal is \
          received.",
     );
 
@@ -195,11 +224,14 @@ fn run(cfg: Config) -> ExitCode {
     }
     let _ = rx.recv();
 
-    // Disconnect the live peers and stop accepting new connections
-    // (dcrd's server shutdown disconnecting all peers).
-    if let Some((runtime, connected, stall_timer)) = listeners {
-        stall_timer.shutdown();
-        connected.disconnect_all();
+    // Stop dialing, stop the watchdog, disconnect the live peers, and
+    // stop accepting new connections (dcrd's server shutdown).
+    if let Some(connector) = connector {
+        connector.shutdown();
+    }
+    stall_timer.shutdown();
+    connected.disconnect_all();
+    if let Some(runtime) = runtime {
         runtime.shutdown();
     }
 
@@ -207,21 +239,19 @@ fn run(cfg: Config) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Bind the configured peer-to-peer listeners and start serving inbound
-/// peers (dcrd `newServer`'s listener setup plus `inboundPeerConnected`).
-/// Returns the listener runtime and the registry of the peers it serves.
-fn start_listeners(
+/// Build the daemon-wide server state: the shared context the peer
+/// handlers consult, the connected-peer registry, the peer template,
+/// and the armed header-sync watchdog (dcrd `newServer`).
+fn build_server(
     cfg: &Config,
     chain: Arc<Mutex<Chain>>,
     addr_manager: Arc<Mutex<AddrManager>>,
-) -> Result<
-    (
-        ListenerRuntime,
-        ConnectedPeers,
-        dcroxide_node::dispatch::StallTimer,
-    ),
-    String,
-> {
+) -> (
+    Arc<ServerContext>,
+    ConnectedPeers,
+    PeerTemplate,
+    dcroxide_node::dispatch::StallTimer,
+) {
     let params = &cfg.params.params;
     let template = PeerTemplate {
         net: params.net,
@@ -234,8 +264,6 @@ fn start_listeners(
         idle_timeout: Duration::from_nanos(DEFAULT_IDLE_TIMEOUT as u64),
         ping_interval: Duration::from_nanos(PING_INTERVAL as u64),
     };
-    // The daemon-wide state the served peers' message handlers consult
-    // (dcrd `newServer` deriving `minKnownWork` from the params).
     // The sync manager shares the chain with the message handlers
     // (dcrd `newServer` building its `netsync.Config`).
     let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
@@ -246,6 +274,8 @@ fn start_listeners(
         DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u64,
         cfg.max_orphan_txs as usize,
     )));
+    // The daemon-wide state the served peers' message handlers consult
+    // (dcrd `newServer` deriving `minKnownWork` from the params).
     let server = Arc::new(ServerContext {
         chain,
         min_known_work: params.min_known_chain_work,
@@ -267,14 +297,23 @@ fn start_listeners(
         server.sync_peers.clone(),
         Duration::from_secs(dcroxide_netsync::manager::HEADER_SYNC_STALL_TIMEOUT_SECS),
     );
-    let connected = ConnectedPeers::new();
+    (server, ConnectedPeers::new(), template, stall_timer)
+}
+
+/// Bind the configured peer-to-peer listeners and start serving inbound
+/// peers (dcrd `newServer`'s listener setup plus `inboundPeerConnected`).
+fn start_listeners(
+    cfg: &Config,
+    template: &PeerTemplate,
+    connected: ConnectedPeers,
+    server: Arc<ServerContext>,
+) -> Result<ListenerRuntime, String> {
     let specs = parse_listeners(&cfg.listeners)?;
-    let runtime = ListenerRuntime::start(
+    ListenerRuntime::start(
         &specs,
-        inbound_peer_handler(template, connected.clone(), Some(server)),
+        inbound_peer_handler(template.clone(), connected, Some(server)),
     )
-    .map_err(|e| e.to_string())?;
-    Ok((runtime, connected, stall_timer))
+    .map_err(|e| e.to_string())
 }
 
 /// Open (or create) the block database and initialize the chain state

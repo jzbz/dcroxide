@@ -184,15 +184,54 @@ fn serve_inbound_peer(
     connected: &ConnectedPeers,
     server: Option<Arc<ServerContext>>,
 ) {
-    let mut peer = Peer::new_inbound(template.config());
     let na = match net_address_from_socket(addr, template.services) {
         Ok(na) => na,
         // An address the manager cannot represent is dropped, matching
         // dcrd refusing to serve an unroutable peer.
         Err(_) => return,
     };
+    let mut peer = Peer::new_inbound(template.config());
     peer.associate(&addr.to_string(), na, NodePeerEnv::new().now_nanos());
+    serve_connection(stream, peer, addr, template, connected, server);
+}
 
+/// Build, associate, and run a single outbound peer to completion,
+/// keeping it in the connected-peers registry while it is served (the
+/// serving half of dcrd `outboundPeerConnected`).  Called by the
+/// connection manager driver once a dial has established the socket.
+pub(crate) fn serve_outbound_peer(
+    stream: TcpStream,
+    addr: SocketAddr,
+    template: &PeerTemplate,
+    connected: &ConnectedPeers,
+    server: Option<Arc<ServerContext>>,
+) {
+    let na = match net_address_from_socket(addr, template.services) {
+        Ok(na) => na,
+        Err(_) => return,
+    };
+    let peer = match Peer::new_outbound(template.config(), &addr.to_string()) {
+        Ok(mut peer) => {
+            peer.associate(&addr.to_string(), na, NodePeerEnv::new().now_nanos());
+            peer
+        }
+        Err(_) => return,
+    };
+    serve_connection(stream, peer, addr, template, connected, server);
+}
+
+/// Register a connected peer, run it through the connection runtime
+/// with the server dispatch, and deregister it on exit — shared by the
+/// inbound and outbound serve paths (dcrd's `serverPeer` runs the same
+/// for both directions).
+fn serve_connection(
+    stream: TcpStream,
+    peer: Peer,
+    addr: SocketAddr,
+    template: &PeerTemplate,
+    connected: &ConnectedPeers,
+    server: Option<Arc<ServerContext>>,
+) {
     // Register a socket handle so a shutdown can interrupt this peer's
     // blocking read; a failed clone just leaves it unregistered.  The
     // guard deregisters on every exit path, panics included.
