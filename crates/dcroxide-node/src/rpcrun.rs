@@ -644,15 +644,12 @@ fn accept_loop(
                     continue;
                 }
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-                // A handle onto the raw socket so the websocket path
-                // can shorten the read timeout to its poll interval.
-                let raw = stream.try_clone().ok();
                 let server = Arc::clone(server);
                 let ntfn = ntfn.clone();
                 match transport {
                     RpcTransport::Plain => {
                         thread::spawn(move || {
-                            serve_rpc_connection(stream, &server, &ntfn, raw.as_ref());
+                            serve_rpc_connection(stream, &server, &ntfn);
                         });
                     }
                     RpcTransport::Tls(config) => {
@@ -662,13 +659,36 @@ fn accept_loop(
                                 return;
                             };
                             let tls = rustls::StreamOwned::new(session, stream);
-                            serve_rpc_connection(tls, &server, &ntfn, raw.as_ref());
+                            serve_rpc_connection(tls, &server, &ntfn);
                         });
                     }
                 }
             }
             Err(_) => thread::sleep(ACCEPT_POLL_INTERVAL),
         }
+    }
+}
+
+/// Access to the read timeout of the socket underneath a served
+/// connection, through any TLS wrapping.  The websocket path shortens
+/// the timeout to its notification poll interval, and it must land on
+/// the handle the reads actually go through: setting it on a
+/// `try_clone` of the socket does not reach the original handle on
+/// Windows.
+pub trait SocketTimeout {
+    /// Set the read timeout on the underlying socket.
+    fn set_socket_read_timeout(&self, timeout: Option<Duration>);
+}
+
+impl SocketTimeout for TcpStream {
+    fn set_socket_read_timeout(&self, timeout: Option<Duration>) {
+        let _ = self.set_read_timeout(timeout);
+    }
+}
+
+impl SocketTimeout for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+    fn set_socket_read_timeout(&self, timeout: Option<Duration>) {
+        let _ = self.sock.set_read_timeout(timeout);
     }
 }
 
@@ -763,14 +783,11 @@ fn is_websocket_upgrade(head: &HttpHead) -> bool {
 
 /// Serve a single RPC connection: parse the request head, then either
 /// serve the websocket upgrade at `/ws` or process one JSON-RPC POST
-/// (dcrd's HTTP handler routing between `/` and `/ws`).  `raw_sock`
-/// hands the websocket path the underlying socket so it can shorten
-/// the read timeout to its notification poll interval.
-fn serve_rpc_connection<S: Read + Write>(
+/// (dcrd's HTTP handler routing between `/` and `/ws`).
+fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     mut stream: S,
     server: &Arc<Mutex<Server<NodeRpcChain>>>,
     ntfn: &crate::websocket::NodeNtfnMgr,
-    raw_sock: Option<&TcpStream>,
 ) {
     let head = match read_http_head(&mut stream) {
         Ok(head) => head,
@@ -801,9 +818,7 @@ fn serve_rpc_connection<S: Read + Write>(
         // the serving loop to write queued notifications, and dcrd
         // websocket connections have no read deadline, so the 30
         // second connection timeout must not apply here.
-        if let Some(sock) = raw_sock {
-            let _ = sock.set_read_timeout(Some(WS_POLL_INTERVAL));
-        }
+        stream.set_socket_read_timeout(Some(WS_POLL_INTERVAL));
         crate::websocket::serve_websocket(stream, &head, authed, is_admin, server, ntfn);
         return;
     }
