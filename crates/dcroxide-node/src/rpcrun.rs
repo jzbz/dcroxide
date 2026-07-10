@@ -483,16 +483,16 @@ pub fn tls_server_config(
     cert_pem: &[u8],
     key_pem: &[u8],
 ) -> Result<Arc<rustls::ServerConfig>, String> {
+    use rustls::pki_types::pem::PemObject;
     // Pin the process-level crypto provider: both bundled providers
     // are compiled in through the dependency tree, and rustls requires
     // an explicit choice when more than one is present.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..])
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<_, _>>()
         .map_err(|e| format!("unable to parse the RPC certificate: {e}"))?;
-    let key = rustls_pemfile::private_key(&mut &key_pem[..])
-        .map_err(|e| format!("unable to parse the RPC key: {e}"))?
-        .ok_or("no private key found in the RPC key file")?;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem)
+        .map_err(|e| format!("unable to parse the RPC key: {e}"))?;
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)

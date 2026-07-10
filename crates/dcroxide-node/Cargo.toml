@@ -35,7 +35,7 @@ dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-wire = { path = "../dcroxide-wire" }
 rustls = { version = "0.23", features = ["ring"] }
 sha1 = { version = "0.10.6", default-features = false }
-rustls-pemfile = "2"
+rustls-pki-types = "1"
 ureq = "3"
 socket2 = "0.6.4"
 

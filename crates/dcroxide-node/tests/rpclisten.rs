@@ -476,7 +476,8 @@ fn serves_tls_with_a_generated_certificate() {
                 .supported_schemes()
         }
     }
-    let pinned_der = rustls_pemfile::certs(&mut &cert_pem[..])
+    use rustls::pki_types::pem::PemObject;
+    let pinned_der = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_pem)
         .next()
         .expect("one cert")
         .expect("parse cert")
