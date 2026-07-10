@@ -23,7 +23,7 @@
 //! `rpc.cert` exactly as Decred tooling does.  `--notls` on localhost serves plain
 //! HTTP.  The websocket upgrade arrives with a later piece.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
@@ -573,68 +573,142 @@ fn accept_loop(
     }
 }
 
-/// A parsed HTTP request: the Authorization header value and the body.
-struct HttpRequest {
+/// The parsed head of an HTTP/1.1 request: the request line pieces and
+/// the headers the RPC and websocket endpoints consult.
+pub struct HttpHead {
+    method: String,
+    path: String,
     authorization: Option<String>,
-    body: String,
+    content_length: usize,
+    upgrade: Option<String>,
+    connection: Option<String>,
+    pub(crate) sec_websocket_key: Option<String>,
+    pub(crate) sec_websocket_version: Option<String>,
 }
 
-/// Read one HTTP/1.1 request from the stream (the minimal surface the
-/// JSON-RPC endpoint needs: `POST /` with a `Content-Length` body,
-/// capped at dcrd's authenticated read limit).
-fn read_request<S: Read>(stream: S) -> Result<HttpRequest, &'static str> {
-    let mut reader = BufReader::new(stream);
+/// The largest request head accepted, bounding an abusive client.
+const MAX_HEAD_SIZE: usize = 1 << 13;
 
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .map_err(|_| "read failure")?;
-    if !request_line.starts_with("POST ") {
-        return Err("method not allowed");
-    }
-
-    let mut authorization = None;
-    let mut content_length = 0usize;
+/// Read one HTTP/1.1 request head byte by byte up to the blank-line
+/// terminator, leaving the stream positioned exactly at the body (or
+/// at the first websocket frame), so the websocket path never
+/// over-reads into frame data.
+fn read_http_head<S: Read>(stream: &mut S) -> Result<HttpHead, &'static str> {
+    let mut raw = Vec::new();
+    let mut byte = [0u8; 1];
     loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).map_err(|_| "read failure")?;
-        let line = line.trim_end();
+        stream.read_exact(&mut byte).map_err(|_| "read failure")?;
+        raw.push(byte[0]);
+        if raw.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if raw.len() > MAX_HEAD_SIZE {
+            return Err("request head too large");
+        }
+    }
+    let text = core::str::from_utf8(&raw).map_err(|_| "invalid head")?;
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split(' ');
+    let method = parts.next().unwrap_or("").to_string();
+    let path = parts.next().unwrap_or("").to_string();
+
+    let mut head = HttpHead {
+        method,
+        path,
+        authorization: None,
+        content_length: 0,
+        upgrade: None,
+        connection: None,
+        sec_websocket_key: None,
+        sec_websocket_version: None,
+    };
+    for line in lines {
         if line.is_empty() {
             break;
         }
         if let Some((name, value)) = line.split_once(':') {
             let value = value.trim();
             if name.eq_ignore_ascii_case("authorization") {
-                authorization = Some(value.to_string());
+                head.authorization = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse().map_err(|_| "bad content length")?;
+                head.content_length = value.parse().map_err(|_| "bad content length")?;
+            } else if name.eq_ignore_ascii_case("upgrade") {
+                head.upgrade = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("connection") {
+                head.connection = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("sec-websocket-key") {
+                head.sec_websocket_key = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("sec-websocket-version") {
+                head.sec_websocket_version = Some(value.to_string());
             }
         }
     }
-    if content_length > RPC_READ_LIMIT_AUTHENTICATED {
-        return Err("request too large");
-    }
-
-    let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body).map_err(|_| "read failure")?;
-    let body = String::from_utf8(body).map_err(|_| "invalid body")?;
-    Ok(HttpRequest {
-        authorization,
-        body,
-    })
+    Ok(head)
 }
 
-/// Serve a single RPC connection: authenticate, process the body
-/// through the ported pipeline, and answer (dcrd `jsonRPCRead` behind
-/// the HTTP handler).
+/// Whether the request head is a websocket upgrade for the `/ws`
+/// endpoint (dcrd serves websockets only at the dedicated path).
+fn is_websocket_upgrade(head: &HttpHead) -> bool {
+    let has_token = |header: &Option<String>, token: &str| {
+        header
+            .as_deref()
+            .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
+            .unwrap_or(false)
+    };
+    head.path == "/ws"
+        && head.method.eq_ignore_ascii_case("GET")
+        && has_token(&head.connection, "upgrade")
+        && has_token(&head.upgrade, "websocket")
+}
+
+/// Serve a single RPC connection: parse the request head, then either
+/// serve the websocket upgrade at `/ws` or process one JSON-RPC POST
+/// (dcrd's HTTP handler routing between `/` and `/ws`).
 fn serve_rpc_connection<S: Read + Write>(mut stream: S, server: &Arc<Mutex<Server<NodeRpcChain>>>) {
-    let request = match read_request(&mut stream) {
-        Ok(request) => request,
+    let head = match read_http_head(&mut stream) {
+        Ok(head) => head,
         Err(reason) => {
             let _ = write_response(&mut stream, "400 Bad Request", reason.as_bytes());
             return;
         }
     };
+
+    // The websocket upgrade allows an unauthenticated connection that
+    // must authenticate in-band (dcrd `checkAuth` with `require =
+    // false`); serve it before touching a body.
+    if is_websocket_upgrade(&head) {
+        let auth = {
+            let server = server
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            server.check_auth(head.authorization.as_deref(), false)
+        };
+        let (authed, is_admin) = match auth {
+            Ok(auth) => auth,
+            Err(_) => {
+                let _ = write_unauthorized(&mut stream);
+                return;
+            }
+        };
+        crate::websocket::serve_websocket(stream, &head, authed, is_admin, server);
+        return;
+    }
+
+    if !head.method.eq_ignore_ascii_case("POST") {
+        let _ = write_response(&mut stream, "405 Method Not Allowed", b"method not allowed");
+        return;
+    }
+    if head.content_length > RPC_READ_LIMIT_AUTHENTICATED {
+        let _ = write_response(&mut stream, "400 Bad Request", b"request too large");
+        return;
+    }
+    // Read the body before authenticating so an error response closes
+    // the connection cleanly (an unread body would reset the socket).
+    let mut body = vec![0u8; head.content_length];
+    if stream.read_exact(&mut body).is_err() {
+        return;
+    }
 
     // Authenticate (dcrd `checkAuth` with authentication required),
     // answering an auth failure with dcrd's 401 and realm.
@@ -642,14 +716,19 @@ fn serve_rpc_connection<S: Read + Write>(mut stream: S, server: &Arc<Mutex<Serve
         let server = server
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        server.check_auth(request.authorization.as_deref(), true)
+        server.check_auth(head.authorization.as_deref(), true)
     };
-    let (_, is_admin) = match auth {
-        Ok(auth) => auth,
+    let is_admin = match auth {
+        Ok((_, is_admin)) => is_admin,
         Err(_) => {
             let _ = write_unauthorized(&mut stream);
             return;
         }
+    };
+
+    let Ok(body) = String::from_utf8(body) else {
+        let _ = write_response(&mut stream, "400 Bad Request", b"invalid body");
+        return;
     };
 
     // Process the request body, holding the server for the duration
@@ -660,7 +739,7 @@ fn serve_rpc_connection<S: Read + Write>(mut stream: S, server: &Arc<Mutex<Serve
         let mut server = server
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        dcroxide_rpc::http::process_body(&mut server, &request.body, is_admin)
+        dcroxide_rpc::http::process_body(&mut server, &body, is_admin)
     }))
     .unwrap_or_else(|_| {
         br#"{"jsonrpc":"1.0","result":null,"error":{"code":-32603,"message":"internal error: the handler's daemon seam is not yet wired"},"id":null}"#

@@ -267,13 +267,17 @@ fn run(cfg: Config) -> ExitCode {
                 }
             }
         };
-        let rpc_server = Arc::new(Mutex::new(dcroxide_rpc::server::Server::new(rpc_config(
+        let mut rpc_srv = dcroxide_rpc::server::Server::new(rpc_config(
             &cfg,
             Arc::clone(&chain),
             connected.clone(),
             Arc::clone(&server.sync_manager),
             Arc::clone(&server.net_totals),
-        ))));
+        ));
+        // Install the websocket subscription recorder (dcrd's
+        // wsNotificationManager) so the subscription commands answer.
+        rpc_srv.ntfn_mgr = Box::new(dcroxide_node::websocket::NodeNtfnMgr::new());
+        let rpc_server = Arc::new(Mutex::new(rpc_srv));
         match dcroxide_node::rpcrun::start_rpc_listener(&cfg.rpc_listeners, rpc_server, transport) {
             Ok(listener) => {
                 let addrs: Vec<String> = listener

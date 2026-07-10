@@ -24,6 +24,7 @@ dcroxide-connmgr = { path = "../dcroxide-connmgr" }
 dcroxide-containers = { path = "../dcroxide-containers" }
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-dcrjson = { path = "../dcroxide-dcrjson" }
 dcroxide-mempool = { path = "../dcroxide-mempool" }
 dcroxide-netsync = { path = "../dcroxide-netsync" }
 dcroxide-standalone = { path = "../dcroxide-standalone" }
@@ -32,6 +33,7 @@ dcroxide-rpc = { path = "../dcroxide-rpc" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-wire = { path = "../dcroxide-wire" }
 rustls = { version = "0.23", features = ["ring"] }
+sha1 = { version = "0.10.6", default-features = false }
 rustls-pemfile = "2"
 ureq = "3"
 socket2 = "0.6.4"

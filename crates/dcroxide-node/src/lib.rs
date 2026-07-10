@@ -28,6 +28,8 @@ pub mod server;
 pub mod sync;
 pub mod transport;
 pub mod version;
+pub mod websocket;
+pub mod wsframe;
 
 pub use config::{
     AUTH_TYPE_BASIC, AUTH_TYPE_CLIENT_CERT, Assignment, Config, ConfigEnv, DialSelection,
