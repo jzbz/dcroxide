@@ -270,6 +270,8 @@ fn run(cfg: Config) -> ExitCode {
         let rpc_server = Arc::new(Mutex::new(dcroxide_rpc::server::Server::new(rpc_config(
             &cfg,
             Arc::clone(&chain),
+            connected.clone(),
+            Arc::clone(&server.sync_manager),
         ))));
         match dcroxide_node::rpcrun::start_rpc_listener(&cfg.rpc_listeners, rpc_server, transport) {
             Ok(listener) => {
@@ -445,6 +447,8 @@ fn open_chain(cfg: &Config) -> Result<Chain, String> {
 fn rpc_config(
     cfg: &Config,
     chain: Arc<Mutex<Chain>>,
+    connected: ConnectedPeers,
+    sync_manager: Arc<Mutex<dcroxide_node::sync::NodeSyncManager>>,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
     dcroxide_rpc::server::Config {
@@ -455,8 +459,8 @@ fn rpc_config(
         ),
         min_relay_tx_fee: cfg.min_relay_tx_fee_atoms,
         max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
-        sync_mgr: Box::new(()),
-        conn_mgr: Box::new(()),
+        sync_mgr: Box::new(dcroxide_node::rpcrun::NodeRpcSyncManager::new(sync_manager)),
+        conn_mgr: Box::new(dcroxide_node::rpcrun::NodeRpcConnManager::new(connected)),
         tx_mempooler: Box::new(()),
         clock: Box::new(()),
         interfaces: Box::new(dcroxide_rpc::helpers::NoInterfaces),

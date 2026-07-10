@@ -11,7 +11,10 @@ use std::sync::{Arc, Mutex};
 
 use dcroxide_blockchain::process::Chain;
 use dcroxide_database::{Database, Options};
-use dcroxide_node::rpcrun::{NodeRpcChain, start_rpc_listener};
+use dcroxide_node::rpcrun::{
+    NodeRpcChain, NodeRpcConnManager, NodeRpcSyncManager, start_rpc_listener,
+};
+use dcroxide_node::runtime::ConnectedPeers;
 use dcroxide_rpc::helpers::NoInterfaces;
 use dcroxide_rpc::server::{Config, RpcSubsidyParams, Server};
 use dcroxide_standalone::SubsidyCache;
@@ -33,6 +36,14 @@ fn serve_rpc() -> (
     let chain = Arc::new(Mutex::new(
         Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
     ));
+    let connected = ConnectedPeers::new();
+    let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
+        Arc::clone(&chain),
+        &params,
+        false,
+        8,
+        1000,
+    )));
 
     let server = Arc::new(Mutex::new(Server::new(Config {
         chain: NodeRpcChain::new(chain),
@@ -40,8 +51,8 @@ fn serve_rpc() -> (
         subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
-        sync_mgr: Box::new(()),
-        conn_mgr: Box::new(()),
+        sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager)),
+        conn_mgr: Box::new(NodeRpcConnManager::new(connected)),
         tx_mempooler: Box::new(()),
         clock: Box::new(()),
         interfaces: Box::new(NoInterfaces),
@@ -129,17 +140,54 @@ fn answers_chain_queries_over_http() {
     );
     assert!(response.contains("\"result\":0"), "{response}");
 
-    // A handler whose daemon seam is not wired yet answers an internal
-    // error instead of killing the server...
+    // getblockhash 0 answers the genesis hash through the chain adapter.
     let response = post(
         port,
         Some("user:pass"),
-        r#"{"jsonrpc":"1.0","method":"getconnectioncount","params":[],"id":3}"#,
+        r#"{"jsonrpc":"1.0","method":"getblockhash","params":[0],"id":5}"#,
     );
     assert!(
-        response.contains("-32603") || response.contains("error"),
+        response.contains(&format!("\"result\":\"{genesis_hash}\"")),
         "{response}"
     );
+
+    // getblock (non-verbose) returns the serialized genesis block hex.
+    let response = post(
+        port,
+        Some("user:pass"),
+        &format!(
+            r#"{{"jsonrpc":"1.0","method":"getblock","params":["{genesis_hash}",false],"id":6}}"#
+        ),
+    );
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("\"result\":\""), "{response}");
+
+    // getbestblock returns the genesis hash and height zero.
+    let response = post(
+        port,
+        Some("user:pass"),
+        r#"{"jsonrpc":"1.0","method":"getbestblock","params":[],"id":7}"#,
+    );
+    assert!(response.contains(&genesis_hash.to_string()), "{response}");
+    assert!(response.contains("\"height\":0"), "{response}");
+
+    // getconnectioncount answers zero through the connection-manager
+    // adapter over the empty registry.
+    let response = post(
+        port,
+        Some("user:pass"),
+        r#"{"jsonrpc":"1.0","method":"getconnectioncount","params":[],"id":8}"#,
+    );
+    assert!(response.contains("\"result\":0"), "{response}");
+
+    // A handler whose daemon seam is not wired yet (net totals) answers
+    // an internal error instead of killing the server...
+    let response = post(
+        port,
+        Some("user:pass"),
+        r#"{"jsonrpc":"1.0","method":"getnettotals","params":[],"id":3}"#,
+    );
+    assert!(response.contains("-32603"), "{response}");
 
     // ...and the server still answers afterwards.
     let response = post(

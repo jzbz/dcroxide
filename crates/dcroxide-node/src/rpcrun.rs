@@ -36,6 +36,8 @@ use dcroxide_blockchain::process::Chain;
 use dcroxide_certgen::{CertEnv, Curve, new_tls_cert_pair};
 use dcroxide_chainhash::Hash;
 use dcroxide_rpc::server::{RpcBestState, RpcChain, Server};
+use dcroxide_uint256::Uint256;
+use dcroxide_wire::{BlockHeader, MsgBlock};
 
 /// The maximum number of bytes allowed for a request read from an
 /// authenticated peer (dcrd `rpcReadLimitAuthenticated`).
@@ -81,6 +83,180 @@ impl RpcChain for NodeRpcChain {
             .expect("chain mutex poisoned")
             .best_header()
     }
+
+    fn block_by_hash(&mut self, hash: &Hash) -> Result<MsgBlock, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .block_by_hash(hash)
+            .ok_or_else(|| format!("block {hash} not found"))
+    }
+
+    fn block_by_height(&mut self, height: i64) -> Result<MsgBlock, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .block_by_height(height)
+            .ok_or_else(|| format!("no block at height {height}"))
+    }
+
+    fn block_hash_by_height(&mut self, height: i64) -> Result<Hash, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .block_hash_by_height(height)
+            .ok_or_else(|| format!("no block at height {height}"))
+    }
+
+    fn height_range(&mut self, start: i64, end: i64) -> Result<Vec<Hash>, String> {
+        Ok(self
+            .chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .height_range(start, end))
+    }
+
+    fn block_height_by_hash(&mut self, hash: &Hash) -> Result<i64, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .block_height_by_hash(hash)
+            .ok_or_else(|| format!("block {hash} not found"))
+    }
+
+    fn chain_work(&mut self, hash: &Hash) -> Result<Uint256, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .chain_work(hash)
+            .ok_or_else(|| format!("no chain work for block {hash}"))
+    }
+
+    fn header_by_hash(&mut self, hash: &Hash) -> Result<BlockHeader, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .header_by_hash(hash)
+            .ok_or_else(|| format!("block {hash} not found"))
+    }
+
+    fn is_current(&mut self) -> bool {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .is_current_at(adjusted_time_unix())
+    }
+
+    fn locate_headers(&mut self, locators: &[Hash], hash_stop: &Hash) -> Vec<BlockHeader> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .locate_headers(locators, hash_stop)
+    }
+
+    fn main_chain_has_block(&mut self, hash: &Hash) -> bool {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .main_chain_has_block(hash)
+    }
+
+    fn median_time_by_hash(&mut self, hash: &Hash) -> Result<i64, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .median_time_by_hash(hash)
+            .ok_or_else(|| format!("block {hash} not found"))
+    }
+
+    fn check_live_ticket(&mut self, hash: &Hash) -> bool {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .check_live_ticket(hash)
+    }
+
+    fn check_live_tickets(&mut self, hashes: &[Hash]) -> Vec<bool> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .check_live_tickets(hashes)
+    }
+
+    fn live_tickets(&mut self) -> Result<Vec<Hash>, String> {
+        Ok(self
+            .chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .live_tickets())
+    }
+
+    fn ticket_pool_value(&mut self) -> Result<i64, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .ticket_pool_value()
+            .ok_or_else(|| "unable to compute the ticket pool value".to_string())
+    }
+}
+
+/// The connection-manager adapter answering the RPC handlers' peer
+/// queries over the daemon's live-peer registry (a growing slice of
+/// the `RpcConnManager` seam).
+pub struct NodeRpcConnManager {
+    connected: crate::runtime::ConnectedPeers,
+}
+
+impl NodeRpcConnManager {
+    /// Adapt the connected-peer registry for the RPC handlers.
+    pub fn new(connected: crate::runtime::ConnectedPeers) -> NodeRpcConnManager {
+        NodeRpcConnManager { connected }
+    }
+}
+
+impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
+    fn connected_count(&mut self) -> i32 {
+        self.connected.len() as i32
+    }
+}
+
+/// The sync-manager adapter answering the RPC handlers' sync-state
+/// queries over the shared sync manager (a growing slice of the
+/// `RpcSyncManager` seam).
+pub struct NodeRpcSyncManager {
+    sync_manager: Arc<Mutex<crate::sync::NodeSyncManager>>,
+}
+
+impl NodeRpcSyncManager {
+    /// Adapt the sync manager for the RPC handlers.
+    pub fn new(sync_manager: Arc<Mutex<crate::sync::NodeSyncManager>>) -> NodeRpcSyncManager {
+        NodeRpcSyncManager { sync_manager }
+    }
+}
+
+impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
+    fn sync_height(&mut self) -> i64 {
+        self.sync_manager
+            .lock()
+            .expect("sync manager poisoned")
+            .sync_height()
+    }
+
+    fn sync_peer_id(&mut self) -> i32 {
+        self.sync_manager
+            .lock()
+            .expect("sync manager poisoned")
+            .sync_peer_id()
+    }
+}
+
+/// The current unix time for the chain's is-current resolution (dcrd's
+/// median-adjusted time source; the daemon has no samples yet).
+fn adjusted_time_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// The running RPC listener; [`RpcListener::shutdown`] stops the accept
