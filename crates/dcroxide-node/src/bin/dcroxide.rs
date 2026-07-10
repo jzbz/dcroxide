@@ -243,6 +243,37 @@ fn run(cfg: Config) -> ExitCode {
          received.",
     );
 
+    // Serve the JSON-RPC endpoint (dcrd's RPC server).  This slice
+    // serves the plain-HTTP --notls configuration; the TLS listener
+    // arrives with a later piece.
+    let rpc_listener = if cfg.disable_rpc {
+        log_info("RPC service is disabled");
+        None
+    } else if !cfg.disable_tls {
+        log_info("The RPC TLS listener is not yet wired; use --notls on localhost");
+        None
+    } else {
+        let rpc_server = Arc::new(Mutex::new(dcroxide_rpc::server::Server::new(rpc_config(
+            &cfg,
+            Arc::clone(&chain),
+        ))));
+        match dcroxide_node::rpcrun::start_rpc_listener(&cfg.rpc_listeners, rpc_server) {
+            Ok(listener) => {
+                let addrs: Vec<String> = listener
+                    .bound_addrs()
+                    .iter()
+                    .map(|addr| addr.to_string())
+                    .collect();
+                log_info(&format!("RPC server listening on {}", addrs.join(", ")));
+                Some(listener)
+            }
+            Err(e) => {
+                log_info(&format!("Unable to start RPC server: {e}"));
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
     // Idle until an interrupt (SIGINT) or termination (SIGTERM) signal
     // arrives, mirroring dcrd's shutdown listener.
     let (tx, rx) = mpsc::channel();
@@ -257,6 +288,9 @@ fn run(cfg: Config) -> ExitCode {
     // Stop seeding and dialing, stop the watchdog, disconnect the live
     // peers, and stop accepting new connections (dcrd's server
     // shutdown).
+    if let Some(rpc_listener) = rpc_listener {
+        rpc_listener.shutdown();
+    }
     if let Some(seeder_boot) = seeder_boot {
         seeder_boot.shutdown();
     }
@@ -389,6 +423,61 @@ fn open_chain(cfg: &Config) -> Result<Chain, String> {
 
     Chain::open(db, params, assume_valid, cfg.allow_old_forks, created_unix)
         .map_err(|e| format!("unable to initialize chain: {e:?}"))
+}
+
+/// Build the RPC server configuration over the shared chain with the
+/// daemon's not-yet-wired subsystem seams as no-ops (dcrd `newRPCServer`;
+/// each seam fills in as its subsystem lands).
+fn rpc_config(
+    cfg: &Config,
+    chain: Arc<Mutex<Chain>>,
+) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
+    let params = cfg.params.params.clone();
+    dcroxide_rpc::server::Config {
+        chain: dcroxide_node::rpcrun::NodeRpcChain::new(chain),
+        chain_params: params.clone(),
+        subsidy_cache: dcroxide_standalone::SubsidyCache::new(
+            dcroxide_rpc::server::RpcSubsidyParams(params),
+        ),
+        min_relay_tx_fee: cfg.min_relay_tx_fee_atoms,
+        max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+        sync_mgr: Box::new(()),
+        conn_mgr: Box::new(()),
+        tx_mempooler: Box::new(()),
+        clock: Box::new(()),
+        interfaces: Box::new(dcroxide_rpc::helpers::NoInterfaces),
+        rand_u64: Box::new(|| {
+            let mut buf = [0u8; 8];
+            getrandom::fill(&mut buf).expect("system random source");
+            u64::from_le_bytes(buf)
+        }),
+        tx_indexer: None,
+        db: Box::new(()),
+        filterer_v2: Box::new(()),
+        exists_addresser: None,
+        log_manager: Box::new(()),
+        fee_estimator: Box::new(()),
+        block_templater: None,
+        sanity_checker: Box::new(()),
+        time_source: Box::new(()),
+        proxy: cfg.proxy.clone(),
+        test_net: cfg.test_net,
+        runtime_version: String::new(),
+        cpu_miner: Box::new(()),
+        mix_pooler: Box::new(()),
+        profiler_mgr: Box::new(()),
+        addr_manager: Box::new(()),
+        mining_addrs: Vec::new(),
+        user_agent_version: version::version_string().to_string(),
+        net_info: Vec::new(),
+        services: ServiceFlag::NODE_NETWORK.0,
+        request_shutdown: Box::new(|| {}),
+        allow_unsynced_mining: cfg.allow_unsynced_mining,
+        rpc_user: cfg.rpc_user.clone(),
+        rpc_pass: cfg.rpc_pass.clone(),
+        rpc_limit_user: cfg.rpc_limit_user.clone(),
+        rpc_limit_pass: cfg.rpc_limit_pass.clone(),
+    }
 }
 
 /// A minimal startup log line until the rotating logging subsystem is

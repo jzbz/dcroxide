@@ -25,6 +25,7 @@ dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-mempool = { path = "../dcroxide-mempool" }
 dcroxide-netsync = { path = "../dcroxide-netsync" }
+dcroxide-standalone = { path = "../dcroxide-standalone" }
 dcroxide-peer = { path = "../dcroxide-peer" }
 dcroxide-rpc = { path = "../dcroxide-rpc" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }

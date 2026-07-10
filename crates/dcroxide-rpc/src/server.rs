@@ -466,39 +466,39 @@ pub struct Config<C> {
     /// message serialization).
     pub max_protocol_version: u32,
     /// The sync manager (dcrd `SyncMgr`).
-    pub sync_mgr: Box<dyn RpcSyncManager>,
+    pub sync_mgr: Box<dyn RpcSyncManager + Send>,
     /// The connection manager (dcrd `ConnMgr`).
-    pub conn_mgr: Box<dyn RpcConnManager>,
+    pub conn_mgr: Box<dyn RpcConnManager + Send>,
     /// The mempool (dcrd `TxMempooler`).
-    pub tx_mempooler: Box<dyn RpcTxMempooler>,
+    pub tx_mempooler: Box<dyn RpcTxMempooler + Send>,
     /// The clock (dcrd `Clock`).
-    pub clock: Box<dyn RpcClock>,
+    pub clock: Box<dyn RpcClock + Send>,
     /// The local network interface lookup used by address
     /// normalization (dcrd resolves interface names live).
-    pub interfaces: Box<dyn crate::helpers::InterfaceLookup>,
+    pub interfaces: Box<dyn crate::helpers::InterfaceLookup + Send>,
     /// The random nonce source (dcrd uses the global math/rand).
-    pub rand_u64: Box<dyn FnMut() -> u64>,
+    pub rand_u64: Box<dyn FnMut() -> u64 + Send>,
     /// The optional transaction index (dcrd `TxIndexer`, nil when
     /// disabled).
-    pub tx_indexer: Option<Box<dyn RpcTxIndexer>>,
+    pub tx_indexer: Option<Box<dyn RpcTxIndexer + Send>>,
     /// The block database (dcrd `DB`).
-    pub db: Box<dyn RpcDb>,
+    pub db: Box<dyn RpcDb + Send>,
     /// The version 2 filter source (dcrd `FiltererV2`).
-    pub filterer_v2: Box<dyn RpcFiltererV2>,
+    pub filterer_v2: Box<dyn RpcFiltererV2 + Send>,
     /// The optional exists-address index (dcrd `ExistsAddresser`, nil
     /// when disabled).
-    pub exists_addresser: Option<Box<dyn RpcExistsAddresser>>,
+    pub exists_addresser: Option<Box<dyn RpcExistsAddresser + Send>>,
     /// The log manager (dcrd `LogManager`).
-    pub log_manager: Box<dyn RpcLogManager>,
+    pub log_manager: Box<dyn RpcLogManager + Send>,
     /// The smart fee estimator (dcrd `FeeEstimator`).
-    pub fee_estimator: Box<dyn RpcFeeEstimator>,
+    pub fee_estimator: Box<dyn RpcFeeEstimator + Send>,
     /// The optional background block templater (dcrd
     /// `BlockTemplater`, nil when mining is not configured).
-    pub block_templater: Option<Box<dyn RpcBlockTemplater>>,
+    pub block_templater: Option<Box<dyn RpcBlockTemplater + Send>>,
     /// The block sanity checker (dcrd `SanityChecker`).
-    pub sanity_checker: Box<dyn RpcSanityChecker>,
+    pub sanity_checker: Box<dyn RpcSanityChecker + Send>,
     /// The median time source (dcrd `TimeSource`).
-    pub time_source: Box<dyn RpcTimeSource>,
+    pub time_source: Box<dyn RpcTimeSource + Send>,
     /// The configured proxy address, empty when none (dcrd `Proxy`).
     pub proxy: String,
     /// Whether the server runs on a test network (dcrd `TestNet`).
@@ -507,13 +507,13 @@ pub struct Config<C> {
     /// command (dcrd embeds Go's `runtime.Version()`).
     pub runtime_version: String,
     /// The CPU miner (dcrd `CPUMiner`).
-    pub cpu_miner: Box<dyn RpcCpuMiner>,
+    pub cpu_miner: Box<dyn RpcCpuMiner + Send>,
     /// The mixing message pool (dcrd `MixPooler`).
-    pub mix_pooler: Box<dyn RpcMixPooler>,
+    pub mix_pooler: Box<dyn RpcMixPooler + Send>,
     /// The profile server manager (dcrd `ProfilerMgr`).
-    pub profiler_mgr: Box<dyn RpcProfilerManager>,
+    pub profiler_mgr: Box<dyn RpcProfilerManager + Send>,
     /// The address manager (dcrd `AddrManager`).
-    pub addr_manager: Box<dyn RpcAddrManager>,
+    pub addr_manager: Box<dyn RpcAddrManager + Send>,
     /// The configured mining payment addresses (dcrd `MiningAddrs`).
     pub mining_addrs: Vec<dcroxide_txscript::stdaddr::Address>,
     /// The user agent version string (dcrd `UserAgentVersion`).
@@ -524,7 +524,7 @@ pub struct Config<C> {
     pub services: u64,
     /// Request a graceful server shutdown (dcrd's non-blocking send
     /// on the server's `requestProcessShutdown` channel).
-    pub request_shutdown: Box<dyn FnMut()>,
+    pub request_shutdown: Box<dyn FnMut() + Send>,
     /// Whether mining is allowed without being connected and synced
     /// (dcrd `AllowUnsyncedMining`).
     pub allow_unsynced_mining: bool,
@@ -805,7 +805,7 @@ pub trait RpcBlockTemplater {
     }
     /// Subscribe to block template updates (dcrd `Subscribe`; the
     /// subscription immediately delivers the current template).
-    fn subscribe(&mut self) -> Box<dyn RpcTemplateSubscription> {
+    fn subscribe(&mut self) -> Box<dyn RpcTemplateSubscription + Send> {
         unimplemented!("subscribe")
     }
     /// Update the timestamp in the passed header to the current time
@@ -1231,7 +1231,7 @@ pub struct Server<C> {
     pub(crate) limitauthsha: [u8; 32],
     /// The websocket notification manager (dcrd builds `ntfnMgr` in
     /// `New`; the daemon replaces the default with the real fan-out).
-    pub ntfn_mgr: Box<dyn crate::websocket::RpcNtfnManager>,
+    pub ntfn_mgr: Box<dyn crate::websocket::RpcNtfnManager + Send>,
 }
 
 /// The getwork request/submission state (dcrd `workState`).

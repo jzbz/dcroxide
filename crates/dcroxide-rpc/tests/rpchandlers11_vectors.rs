@@ -162,7 +162,7 @@ impl RpcBlockTemplater for MockTemplater11 {
     fn current_template(&mut self) -> Result<Option<MsgBlock>, String> {
         self.curr.clone()
     }
-    fn subscribe(&mut self) -> Box<dyn RpcTemplateSubscription> {
+    fn subscribe(&mut self) -> Box<dyn RpcTemplateSubscription + Send> {
         Box::new(MockSub11 {
             queue: self.ntfns.clone().into(),
         })

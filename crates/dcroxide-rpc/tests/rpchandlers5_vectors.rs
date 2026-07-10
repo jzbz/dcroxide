@@ -296,38 +296,39 @@ fn tx_utxo_handler_slice_matches_dcrd() {
 
         // The indexer part of the row is either the single "NONE"
         // field or five inline fields.
-        let (tx_indexer, rest): (Option<Box<dyn RpcTxIndexer>>, &[&str]) = if mock[3] == "NONE" {
-            (None, &mock[4..])
-        } else {
-            let tip = match mock[3].strip_prefix("ERR:") {
-                Some(err) => Err(err.to_string()),
-                None => Ok((mock[4].parse().unwrap(), mock[5].parse().unwrap())),
-            };
-            let entry = match mock[7] {
-                "NIL" => Ok(None),
-                other => match other.strip_prefix("ERR:") {
+        let (tx_indexer, rest): (Option<Box<dyn RpcTxIndexer + Send>>, &[&str]) =
+            if mock[3] == "NONE" {
+                (None, &mock[4..])
+            } else {
+                let tip = match mock[3].strip_prefix("ERR:") {
                     Some(err) => Err(err.to_string()),
-                    None => {
-                        let ok = other.strip_prefix("OK:").unwrap();
-                        let parts: Vec<&str> = ok.split(',').collect();
-                        Ok(Some(RpcTxIndexEntry {
-                            block_hash: parts[0].parse().unwrap(),
-                            offset: parts[1].parse().unwrap(),
-                            len: parts[2].parse().unwrap(),
-                            block_index: parts[3].parse().unwrap(),
-                        }))
-                    }
-                },
+                    None => Ok((mock[4].parse().unwrap(), mock[5].parse().unwrap())),
+                };
+                let entry = match mock[7] {
+                    "NIL" => Ok(None),
+                    other => match other.strip_prefix("ERR:") {
+                        Some(err) => Err(err.to_string()),
+                        None => {
+                            let ok = other.strip_prefix("OK:").unwrap();
+                            let parts: Vec<&str> = ok.split(',').collect();
+                            Ok(Some(RpcTxIndexEntry {
+                                block_hash: parts[0].parse().unwrap(),
+                                offset: parts[1].parse().unwrap(),
+                                len: parts[2].parse().unwrap(),
+                                block_index: parts[3].parse().unwrap(),
+                            }))
+                        }
+                    },
+                };
+                (
+                    Some(Box::new(MockTxIndexer {
+                        tip,
+                        signal_on_wait: mock[6] == "true",
+                        entry,
+                    })),
+                    &mock[8..],
+                )
             };
-            (
-                Some(Box::new(MockTxIndexer {
-                    tip,
-                    signal_on_wait: mock[6] == "true",
-                    entry,
-                })),
-                &mock[8..],
-            )
-        };
         // rest: [bestheight, blockHeightByHash, db, utxo, filt,
         // besthash, treasury]
         let utxo = match rest[3] {

@@ -290,7 +290,7 @@ fn peer_address_handler_slice_matches_dcrd() {
 
         // The exists-addresser part of the row is either the single
         // "NONE" field or seven inline fields.
-        let (exists_addresser, rest): (Option<Box<dyn RpcExistsAddresser>>, &[&str]) =
+        let (exists_addresser, rest): (Option<Box<dyn RpcExistsAddresser + Send>>, &[&str]) =
             if mock[4] == "NONE" {
                 (None, &mock[5..])
             } else {

@@ -499,6 +499,7 @@ dependencies = [
  "dcroxide-netsync",
  "dcroxide-peer",
  "dcroxide-rpc",
+ "dcroxide-standalone",
  "dcroxide-txscript",
  "dcroxide-uint256",
  "dcroxide-wire",

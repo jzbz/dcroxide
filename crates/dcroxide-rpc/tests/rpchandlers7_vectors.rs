@@ -342,7 +342,7 @@ fn submission_handler_slice_matches_dcrd() {
                 None => Ok(()),
             },
         };
-        let block_templater: Option<Box<dyn RpcBlockTemplater>> = if mock[9] == "true" {
+        let block_templater: Option<Box<dyn RpcBlockTemplater + Send>> = if mock[9] == "true" {
             None
         } else {
             Some(Box::new(MockTemplater))
