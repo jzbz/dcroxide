@@ -469,6 +469,7 @@ dependencies = [
  "dcroxide-containers",
  "dcroxide-database",
  "dcroxide-mempool",
+ "dcroxide-netsync",
  "dcroxide-peer",
  "dcroxide-rpc",
  "dcroxide-txscript",

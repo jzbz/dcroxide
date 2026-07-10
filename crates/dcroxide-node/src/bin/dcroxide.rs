@@ -27,8 +27,9 @@ use dcroxide_database::{Database, ErrorKind, Options};
 use dcroxide_node::dispatch::ServerContext;
 use dcroxide_node::runtime::{ConnectedPeers, ListenerRuntime, PeerTemplate, inbound_peer_handler};
 use dcroxide_node::{
-    Config, ConfigEnv, ERR_HELP_REQUESTED, ERR_SHOW_SUBSYSTEMS, ERR_VERSION_REQUESTED,
-    app_data_dir, load_config_from_argv, logo, parse_listeners, supported_subsystems, version,
+    Config, ConfigEnv, DEFAULT_TARGET_OUTBOUND, ERR_HELP_REQUESTED, ERR_SHOW_SUBSYSTEMS,
+    ERR_VERSION_REQUESTED, app_data_dir, load_config_from_argv, logo, parse_listeners,
+    supported_subsystems, version,
 };
 use dcroxide_peer::{DEFAULT_IDLE_TIMEOUT, PING_INTERVAL};
 use dcroxide_wire::ServiceFlag;
@@ -227,6 +228,16 @@ fn start_listeners(
     };
     // The daemon-wide state the served peers' message handlers consult
     // (dcrd `newServer` deriving `minKnownWork` from the params).
+    // The sync manager shares the chain with the message handlers
+    // (dcrd `newServer` building its `netsync.Config`).
+    let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
+        Arc::clone(&chain),
+        params,
+        cfg.no_mining_state_sync,
+        // dcrd's targetOutbound: the default capped by --maxpeers.
+        DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u64,
+        cfg.max_orphan_txs as usize,
+    )));
     let server = Arc::new(ServerContext {
         chain,
         min_known_work: params.min_known_chain_work,
@@ -237,6 +248,7 @@ fn start_listeners(
         sim_or_reg_net: cfg.sim_net || cfg.reg_net,
         stake_validation_height: params.stake_validation_height,
         blocks_only: cfg.blocks_only,
+        sync_manager,
     });
     let connected = ConnectedPeers::new();
     let specs = parse_listeners(&cfg.listeners)?;

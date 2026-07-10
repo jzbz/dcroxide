@@ -3916,6 +3916,43 @@ impl Chain {
     pub fn is_current(&self, cur_best: NodeId, adjusted_time_unix: i64) -> bool {
         self.is_current_latch && !self.is_old_timestamp(cur_best, adjusted_time_unix)
     }
+
+    /// Whether the chain believes it is current, resolved at the best
+    /// chain tip (dcrd's exported `IsCurrent`; the adjusted time is
+    /// injected rather than read from a time source).
+    pub fn is_current_at(&self, adjusted_time_unix: i64) -> bool {
+        let tip = self.best_chain.tip().expect("best chain tip");
+        self.is_current(tip, adjusted_time_unix)
+    }
+
+    /// Potentially update whether the chain believes it is current,
+    /// resolved at the best chain tip (dcrd's exported
+    /// `MaybeUpdateIsCurrent`).
+    pub fn maybe_update_is_current_at(&mut self, adjusted_time_unix: i64) {
+        let tip = self.best_chain.tip().expect("best chain tip");
+        self.maybe_update_is_current(tip, adjusted_time_unix);
+    }
+
+    /// The hash and height of the current best known header, which may
+    /// be ahead of the best block during a sync (dcrd `BestHeader`).
+    pub fn best_header(&self) -> (Hash, i64) {
+        let id = self
+            .index
+            .best_header()
+            .expect("the genesis header always exists");
+        let node = self.store.node(id);
+        (node.hash, node.height)
+    }
+
+    /// Whether the header is known to the chain (dcrd `HaveHeader`).
+    pub fn have_header(&self, hash: &Hash) -> bool {
+        self.index.lookup_node(hash).is_some()
+    }
+
+    /// Whether the block data is available (dcrd `HaveBlock`).
+    pub fn have_block(&self, hash: &Hash) -> bool {
+        self.index.have_block(&self.store, hash)
+    }
 }
 
 /// Convert a persistence failure into a rule error so it flows

@@ -39,11 +39,13 @@ fn serve_genesis_chain() -> (
     let dir = tempfile::tempdir().expect("temp dir");
     let opts = Options::new(dir.path().join("blocks"), params.net.0);
     let db = Database::create(&opts).expect("create database");
-    let chain = Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain");
+    let chain = Arc::new(Mutex::new(
+        Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
+    ));
 
     let addr_manager = Arc::new(Mutex::new(dcroxide_addrmgr::AddrManager::new(dir.path())));
     let server = Arc::new(ServerContext {
-        chain: Arc::new(Mutex::new(chain)),
+        chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
         disable_banning: false,
         ban_threshold: 100,
@@ -52,6 +54,13 @@ fn serve_genesis_chain() -> (
         sim_or_reg_net: false,
         stake_validation_height: params.stake_validation_height,
         blocks_only: false,
+        sync_manager: Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
+            Arc::clone(&chain),
+            &params,
+            false,
+            8,
+            1000,
+        ))),
     });
 
     let template = PeerTemplate {

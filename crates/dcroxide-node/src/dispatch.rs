@@ -44,6 +44,7 @@ use crate::server::{
     build_get_headers_response, natf_supported, on_addr, on_get_addr, on_get_data,
     on_get_init_state, on_inv_classify, serve_get_data,
 };
+use crate::sync::NodeSyncManager;
 
 /// The daemon-wide state the server handlers consult, shared across
 /// every served peer (the relevant slice of dcrd's `server`).
@@ -73,6 +74,10 @@ pub struct ServerContext {
     /// Whether the simulation or regression test network is active;
     /// both suppress the address exchange entirely.
     pub sim_or_reg_net: bool,
+    /// The sync manager tracking the header and block download state
+    /// (not yet driven; the peer registration and action executor
+    /// arrive with the following pieces).
+    pub sync_manager: Arc<Mutex<NodeSyncManager>>,
 }
 
 /// The per-connection server state and message dispatch (the message

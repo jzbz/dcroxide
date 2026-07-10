@@ -22,6 +22,7 @@ pub mod peerconn;
 pub mod peerloop;
 pub mod runtime;
 pub mod server;
+pub mod sync;
 pub mod transport;
 pub mod version;
 
