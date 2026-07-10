@@ -14,7 +14,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dcroxide_chainhash::Hash;
 use dcroxide_mining::{
@@ -39,12 +39,12 @@ fn tx_type(v: &str) -> TxType {
 /// and the mempool's wiring.
 #[derive(Default)]
 struct ThinSource {
-    pool: HashMap<[u8; 32], Rc<TxDesc>>,
-    outpoints: HashMap<([u8; 32], u32, i8), Rc<TxDesc>>,
+    pool: HashMap<[u8; 32], Arc<TxDesc>>,
+    outpoints: HashMap<([u8; 32], u32, i8), Arc<TxDesc>>,
 }
 
 impl ThinSource {
-    fn add(&mut self, view: &mut TxMiningView, desc: Rc<TxDesc>) {
+    fn add(&mut self, view: &mut TxMiningView, desc: Arc<TxDesc>) {
         self.pool.insert(desc.tx_hash.0, desc.clone());
         let pool = &self.pool;
         let outpoints = &self.outpoints;
@@ -78,7 +78,7 @@ impl ThinSource {
 fn miningview_vectors() {
     let data = include_str!("data/miningview_vectors.txt");
 
-    let mut names: HashMap<String, Rc<TxDesc>> = HashMap::new();
+    let mut names: HashMap<String, Arc<TxDesc>> = HashMap::new();
     let mut hash_names: HashMap<[u8; 32], String> = HashMap::new();
     let mut src = ThinSource::default();
     let mut view = TxMiningView::new(true);
@@ -105,7 +105,7 @@ fn miningview_vectors() {
                 let (tx, _) = MsgTx::from_bytes(&unhex(f[2])).expect("tx");
                 let tx_hash = tx.tx_hash();
                 let tx_size = tx.serialize_size() as i64;
-                let desc = Rc::new(TxDesc {
+                let desc = Arc::new(TxDesc {
                     tx,
                     tx_hash,
                     tree: TX_TREE_REGULAR,
@@ -227,7 +227,7 @@ fn miningview_vectors() {
             "pqpush" => {
                 // pqpush <idx> <type> <autorev> <fee> <priobits> <feekbbits>
                 let idx: i64 = f[1].parse().expect("idx");
-                let dummy = Rc::new(TxDesc {
+                let dummy = Arc::new(TxDesc {
                     tx: MsgTx::from_bytes(&unhex("010000000000000000000000000000"))
                         .map(|(tx, _)| tx)
                         .unwrap_or_else(|_| panic!("dummy tx")),

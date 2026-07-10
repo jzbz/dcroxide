@@ -7,7 +7,7 @@
 //! ownership, with identical behavior.
 
 use alloc::collections::BTreeMap;
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use dcroxide_chainhash::Hash;
@@ -17,22 +17,22 @@ use crate::types::TxDesc;
 /// The redeemer enumeration callback: invokes the closure for every
 /// in-source transaction spending an output of the given one (dcrd's
 /// stored `forEachRedeemer` closure, passed per call here).
-pub type ForEachRedeemer<'a> = &'a dyn Fn(&TxDesc, &mut dyn FnMut(Rc<TxDesc>));
+pub type ForEachRedeemer<'a> = &'a dyn Fn(&TxDesc, &mut dyn FnMut(Arc<TxDesc>));
 
 /// The transaction locator callback (dcrd `TxDescFind`).
-pub type TxDescFind<'a> = &'a dyn Fn(&Hash) -> Option<Rc<TxDesc>>;
+pub type TxDescFind<'a> = &'a dyn Fn(&Hash) -> Option<Arc<TxDesc>>;
 
 /// The dependency graph (dcrd `txDescGraph`).
 #[derive(Default)]
 pub(crate) struct TxDescGraph {
-    pub(crate) children_of: BTreeMap<[u8; 32], BTreeMap<[u8; 32], Rc<TxDesc>>>,
-    pub(crate) parents_of: BTreeMap<[u8; 32], BTreeMap<[u8; 32], Rc<TxDesc>>>,
+    pub(crate) children_of: BTreeMap<[u8; 32], BTreeMap<[u8; 32], Arc<TxDesc>>>,
+    pub(crate) parents_of: BTreeMap<[u8; 32], BTreeMap<[u8; 32], Arc<TxDesc>>>,
 }
 
 impl TxDescGraph {
     /// Add a child transaction as a dependent of `tx` (dcrd
     /// `addChild`).
-    fn add_child(&mut self, tx: &TxDesc, child: Rc<TxDesc>) {
+    fn add_child(&mut self, tx: &TxDesc, child: Arc<TxDesc>) {
         self.children_of
             .entry(tx.tx_hash.0)
             .or_default()
@@ -41,7 +41,7 @@ impl TxDescGraph {
 
     /// Add a parent transaction as a dependency of `tx` (dcrd
     /// `addParent`).
-    fn add_parent(&mut self, tx: &TxDesc, parent: Rc<TxDesc>) {
+    fn add_parent(&mut self, tx: &TxDesc, parent: Arc<TxDesc>) {
         self.parents_of
             .entry(tx.tx_hash.0)
             .or_default()
@@ -51,7 +51,7 @@ impl TxDescGraph {
     /// The descriptor stored in the graph for the hash, if any (dcrd
     /// `find`): every transaction in the graph has at least one edge,
     /// so scanning as a child or parent suffices.
-    pub(crate) fn find(&self, tx_hash: &Hash) -> Option<Rc<TxDesc>> {
+    pub(crate) fn find(&self, tx_hash: &Hash) -> Option<Arc<TxDesc>> {
         if let Some(parents) = self.parents_of.get(&tx_hash.0) {
             for parent_hash in parents.keys() {
                 if let Some(desc) = self
@@ -83,9 +83,9 @@ impl TxDescGraph {
         &self,
         tx_hash: &Hash,
         seen: &mut BTreeMap<[u8; 32], ()>,
-        f: &mut dyn FnMut(&Rc<TxDesc>),
+        f: &mut dyn FnMut(&Arc<TxDesc>),
     ) {
-        let parents: Vec<(Hash, Rc<TxDesc>)> = self
+        let parents: Vec<(Hash, Arc<TxDesc>)> = self
             .parents_of
             .get(&tx_hash.0)
             .map(|m| m.iter().map(|(k, v)| (Hash(*k), v.clone())).collect())
@@ -107,10 +107,10 @@ impl TxDescGraph {
     pub(crate) fn for_each_ancestor_pre_order(
         &self,
         tx_hash: &Hash,
-        seen: &mut BTreeMap<[u8; 32], Rc<TxDesc>>,
-        f: &mut dyn FnMut(&Rc<TxDesc>) -> bool,
+        seen: &mut BTreeMap<[u8; 32], Arc<TxDesc>>,
+        f: &mut dyn FnMut(&Arc<TxDesc>) -> bool,
     ) {
-        let parents: Vec<(Hash, Rc<TxDesc>)> = self
+        let parents: Vec<(Hash, Arc<TxDesc>)> = self
             .parents_of
             .get(&tx_hash.0)
             .map(|m| m.iter().map(|(k, v)| (Hash(*k), v.clone())).collect())
@@ -136,9 +136,9 @@ impl TxDescGraph {
         &self,
         tx_hash: &Hash,
         seen: &mut BTreeMap<[u8; 32], ()>,
-        f: &mut dyn FnMut(&Rc<TxDesc>),
+        f: &mut dyn FnMut(&Arc<TxDesc>),
     ) {
-        let children: Vec<(Hash, Rc<TxDesc>)> = self
+        let children: Vec<(Hash, Arc<TxDesc>)> = self
             .children_of
             .get(&tx_hash.0)
             .map(|m| m.iter().map(|(k, v)| (Hash(*k), v.clone())).collect())
@@ -160,9 +160,9 @@ impl TxDescGraph {
         &self,
         tx_hash: &Hash,
         seen: &mut BTreeMap<[u8; 32], ()>,
-        f: &mut dyn FnMut(&Rc<TxDesc>) -> bool,
+        f: &mut dyn FnMut(&Arc<TxDesc>) -> bool,
     ) {
-        let children: Vec<(Hash, Rc<TxDesc>)> = self
+        let children: Vec<(Hash, Arc<TxDesc>)> = self
             .children_of
             .get(&tx_hash.0)
             .map(|m| m.iter().map(|(k, v)| (Hash(*k), v.clone())).collect())
@@ -182,14 +182,14 @@ impl TxDescGraph {
     /// with its in-source relatives (dcrd `insert`).
     pub(crate) fn insert(
         &mut self,
-        tx_desc: &Rc<TxDesc>,
+        tx_desc: &Arc<TxDesc>,
         find_tx: TxDescFind<'_>,
         for_each_redeemer: ForEachRedeemer<'_>,
     ) {
         let mut seen: BTreeMap<[u8; 32], ()> = BTreeMap::new();
 
         // Fetch transactions that spend this one.
-        let mut children: Vec<Rc<TxDesc>> = Vec::new();
+        let mut children: Vec<Arc<TxDesc>> = Vec::new();
         for_each_redeemer(tx_desc, &mut |child| children.push(child));
         for child in children {
             self.add_child(tx_desc, child.clone());
@@ -268,7 +268,7 @@ impl TxDescGraph {
             let Some(tx_desc) = fetch_tx(&Hash(tx_hash)) else {
                 continue;
             };
-            let children: Vec<Rc<TxDesc>> = graph
+            let children: Vec<Arc<TxDesc>> = graph
                 .children_of
                 .get(&tx_hash)
                 .map(|m| m.values().cloned().collect())

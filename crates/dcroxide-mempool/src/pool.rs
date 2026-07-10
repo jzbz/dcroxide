@@ -11,17 +11,16 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
-use alloc::rc::Rc;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use dcroxide_blockchain::sequencelock::SequenceLock;
 use dcroxide_blockchain::utxoview::UtxoView;
 use dcroxide_blockchain::validate::{
-    AgendaFlags, ChainSubsidyParams, check_transaction, check_transaction_inputs,
-    count_p2sh_sig_ops, count_sig_ops, is_expired_tx, sequence_lock_active,
-    validate_transaction_scripts, verify_tspend_signature,
+    AgendaFlags, check_transaction, check_transaction_inputs, count_p2sh_sig_ops, count_sig_ops,
+    is_expired_tx, sequence_lock_active, validate_transaction_scripts, verify_tspend_signature,
 };
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
@@ -167,7 +166,7 @@ pub struct Policy {
 /// An orphan transaction with its eviction metadata (dcrd
 /// `orphanTx`).
 struct OrphanTx {
-    tx: Rc<MsgTx>,
+    tx: Arc<MsgTx>,
     tx_hash: Hash,
     tag: Tag,
     expiration_unix: i64,
@@ -189,22 +188,60 @@ fn tree_for_type(tx_type: TxType) -> i8 {
     }
 }
 
+/// An owned subsidy parameter source over the chain parameters (the
+/// borrowing `ChainSubsidyParams` shape, owned so the pool can move
+/// across threads).
+pub struct PoolSubsidyParams(pub Params);
+
+impl dcroxide_standalone::SubsidyParams for PoolSubsidyParams {
+    fn block_one_subsidy(&self) -> i64 {
+        self.0.block_one_subsidy()
+    }
+    fn base_subsidy_value(&self) -> i64 {
+        self.0.base_subsidy
+    }
+    fn subsidy_reduction_multiplier(&self) -> i64 {
+        self.0.mul_subsidy
+    }
+    fn subsidy_reduction_divisor(&self) -> i64 {
+        self.0.div_subsidy
+    }
+    fn subsidy_reduction_interval_blocks(&self) -> i64 {
+        self.0.subsidy_reduction_interval
+    }
+    fn work_subsidy_proportion(&self) -> u16 {
+        self.0.work_reward_proportion
+    }
+    fn stake_subsidy_proportion(&self) -> u16 {
+        self.0.stake_reward_proportion
+    }
+    fn treasury_subsidy_proportion(&self) -> u16 {
+        self.0.block_tax_proportion
+    }
+    fn stake_validation_begin_height(&self) -> i64 {
+        self.0.stake_validation_height
+    }
+    fn votes_per_block(&self) -> u16 {
+        self.0.tickets_per_block
+    }
+}
+
 /// The transaction memory pool (dcrd `TxPool`).
-pub struct TxPool<'p, C: PoolChain> {
+pub struct TxPool<C: PoolChain> {
     /// The chain backend.
     pub chain: C,
     /// The pool policy.
     pub policy: Policy,
-    params: &'p Params,
-    subsidy_cache: SubsidyCache<ChainSubsidyParams<'p>>,
+    params: Params,
+    subsidy_cache: SubsidyCache<PoolSubsidyParams>,
     last_updated_unix: i64,
 
-    pool: BTreeMap<[u8; 32], Rc<TxDesc>>,
-    orphans: BTreeMap<[u8; 32], Rc<OrphanTx>>,
-    orphans_by_prev: BTreeMap<OutKey, BTreeMap<[u8; 32], Rc<MsgTx>>>,
-    outpoints: BTreeMap<OutKey, Rc<TxDesc>>,
-    staged: BTreeMap<[u8; 32], Rc<TxDesc>>,
-    staged_outpoints: BTreeMap<OutKey, Rc<TxDesc>>,
+    pool: BTreeMap<[u8; 32], Arc<TxDesc>>,
+    orphans: BTreeMap<[u8; 32], Arc<OrphanTx>>,
+    orphans_by_prev: BTreeMap<OutKey, BTreeMap<[u8; 32], Arc<MsgTx>>>,
+    outpoints: BTreeMap<OutKey, Arc<TxDesc>>,
+    staged: BTreeMap<[u8; 32], Arc<TxDesc>>,
+    staged_outpoints: BTreeMap<OutKey, Arc<TxDesc>>,
     transient: BTreeMap<[u8; 32], MsgTx>,
     mining_view: TxMiningView,
     votes: BTreeMap<[u8; 32], Vec<VoteDesc>>,
@@ -212,17 +249,17 @@ pub struct TxPool<'p, C: PoolChain> {
     next_expire_scan_unix: i64,
 }
 
-impl<'p, C: PoolChain> TxPool<'p, C> {
+impl<C: PoolChain> TxPool<C> {
     /// A new memory pool for validating and storing standalone
     /// transactions until they are mined into a block (dcrd `New`).
-    pub fn new(chain: C, policy: Policy, params: &'p Params) -> TxPool<'p, C> {
+    pub fn new(chain: C, policy: Policy, params: &Params) -> TxPool<C> {
         let next_expire_scan_unix = chain.now_unix() + ORPHAN_EXPIRE_SCAN_INTERVAL_SECS;
         let mining_view = TxMiningView::new(policy.enable_ancestor_tracking);
         TxPool {
             chain,
             policy,
-            params,
-            subsidy_cache: SubsidyCache::new(ChainSubsidyParams(params)),
+            params: params.clone(),
+            subsidy_cache: SubsidyCache::new(PoolSubsidyParams(params.clone())),
             last_updated_unix: 0,
             pool: BTreeMap::new(),
             orphans: BTreeMap::new(),
@@ -407,10 +444,10 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
         // exhaustion.
         self.limit_num_orphans();
 
-        let tx = Rc::new(tx.clone());
+        let tx = Arc::new(tx.clone());
         self.orphans.insert(
             tx_hash.0,
-            Rc::new(OrphanTx {
+            Arc::new(OrphanTx {
                 tx: tx.clone(),
                 tx_hash: *tx_hash,
                 tag,
@@ -481,7 +518,7 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
 
     /// Add the provided transaction to the stage pool (dcrd
     /// `stageTransaction`).
-    fn stage_transaction(&mut self, tx_desc: Rc<TxDesc>) {
+    fn stage_transaction(&mut self, tx_desc: Arc<TxDesc>) {
         self.staged.insert(tx_desc.tx_hash.0, tx_desc.clone());
         for tx_in in &tx_desc.tx.tx_in {
             self.staged_outpoints
@@ -511,10 +548,10 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
     /// of the given regular transaction (the shared body of dcrd's
     /// `forEachRedeemer` helpers, collected to satisfy borrows).
     fn collect_redeemers(
-        outpoints: &BTreeMap<OutKey, Rc<TxDesc>>,
+        outpoints: &BTreeMap<OutKey, Arc<TxDesc>>,
         tx: &MsgTx,
         tx_hash: &Hash,
-    ) -> Vec<Rc<TxDesc>> {
+    ) -> Vec<Arc<TxDesc>> {
         let tree = dcroxide_wire::TX_TREE_REGULAR;
         let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
         let mut result = Vec::new();
@@ -613,7 +650,7 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
     /// Add the passed transaction to the memory pool without
     /// validation (dcrd `addTransaction`; the mining view, exists
     /// address index, and fee estimation hooks are not reproduced).
-    fn add_transaction(&mut self, tx_desc: Rc<TxDesc>) {
+    fn add_transaction(&mut self, tx_desc: Arc<TxDesc>) {
         // Add the transaction to the pool and mark the referenced
         // outpoints as spent by the pool.  The mining view is updated
         // between the two, matching dcrd's call order, so the
@@ -807,7 +844,7 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
     /// `maybeUnstageTransaction`).
     fn maybe_unstage_transaction(
         &mut self,
-        tx_desc: Rc<TxDesc>,
+        tx_desc: Arc<TxDesc>,
         is_treasury_enabled: bool,
     ) -> Result<(), PoolError> {
         if tx_desc.tx_type == TxType::SStx && !self.has_mempool_input(&tx_desc.tx) {
@@ -910,7 +947,7 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
 
         // Perform preliminary validation checks on the transaction
         // using the invariant rules from the chain.
-        check_transaction(&tx, self.params, check_tx_flags)
+        check_transaction(&tx, &self.params, check_tx_flags)
             .map_err(|e| PoolError::Rule(chain_rule_error(e)))?;
 
         // Determine active agendas based on flags.
@@ -1185,7 +1222,7 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
             next_block_height,
             |op| utxo_view.lookup_entry(op).cloned(),
             true,
-            self.params,
+            &self.params,
             &best_header,
             is_treasury_enabled,
             is_auto_revocations_enabled,
@@ -1297,7 +1334,7 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
             self.check_tspend_policy(&tx, &tx_hash, next_block_height)?;
         }
 
-        let tx_desc = Rc::new(TxDesc {
+        let tx_desc = Arc::new(TxDesc {
             tx: tx.clone(),
             tx_hash,
             tree,
@@ -1479,7 +1516,7 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
                 // Look up all orphans that redeem the output that is
                 // now available.
                 let key = (process_hash.0, tx_out_idx, tree);
-                let orphans: Vec<(Hash, Rc<MsgTx>)> = self
+                let orphans: Vec<(Hash, Arc<MsgTx>)> = self
                     .orphans_by_prev
                     .get(&key)
                     .map(|m| m.iter().map(|(k, v)| (Hash(*k), v.clone())).collect())
@@ -1604,7 +1641,7 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
         height: i64,
         is_auto_revocations_enabled: bool,
     ) {
-        let pool_descs: Vec<Rc<TxDesc>> = self.pool.values().cloned().collect();
+        let pool_descs: Vec<Arc<TxDesc>> = self.pool.values().cloned().collect();
         for tx_desc in pool_descs {
             let tx_type = tx_desc.tx_type;
             if tx_type == TxType::SStx && tx_desc.height + HEIGHT_DIFF_TO_PRUNE_TICKET < height {
@@ -1629,7 +1666,7 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
                 continue;
             }
         }
-        let staged_descs: Vec<Rc<TxDesc>> = self.staged.values().cloned().collect();
+        let staged_descs: Vec<Arc<TxDesc>> = self.staged.values().cloned().collect();
         for tx_desc in staged_descs {
             let tx_type = tx_desc.tx_type;
             if tx_type == TxType::SStx && tx_desc.tx.tx_out[0].value < required_stake_difficulty {
@@ -1666,14 +1703,14 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
     pub fn prune_expired_tx(&mut self, height: i64) {
         let next_block_height = height + 1;
 
-        let pool_descs: Vec<Rc<TxDesc>> = self.pool.values().cloned().collect();
+        let pool_descs: Vec<Arc<TxDesc>> = self.pool.values().cloned().collect();
         for tx_desc in pool_descs {
             if is_expired_tx(&tx_desc.tx, next_block_height) {
                 self.remove_transaction(&tx_desc.tx.clone(), &tx_desc.tx_hash.clone(), true);
             }
         }
 
-        let staged_descs: Vec<Rc<TxDesc>> = self.staged.values().cloned().collect();
+        let staged_descs: Vec<Arc<TxDesc>> = self.staged.values().cloned().collect();
         for tx_desc in staged_descs {
             if is_expired_tx(&tx_desc.tx, next_block_height) {
                 self.remove_staged_transaction(&tx_desc);
@@ -1694,7 +1731,7 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
 
     /// Descriptors for all transactions in the main pool (dcrd
     /// `TxDescs`).
-    pub fn tx_descs(&self) -> Vec<Rc<TxDesc>> {
+    pub fn tx_descs(&self) -> Vec<Arc<TxDesc>> {
         self.pool.values().cloned().collect()
     }
 
@@ -1710,7 +1747,7 @@ impl<'p, C: PoolChain> TxPool<'p, C> {
 
     /// Mining descriptors for all transactions in the pool (dcrd
     /// `miningDescs`).
-    pub fn mining_descs(&self) -> Vec<Rc<TxDesc>> {
+    pub fn mining_descs(&self) -> Vec<Arc<TxDesc>> {
         self.pool.values().cloned().collect()
     }
 
@@ -1754,7 +1791,7 @@ fn hex_string(bytes: &[u8]) -> String {
     out
 }
 
-impl<C: PoolChain> dcroxide_mining::TemplateTxSource for TxPool<'_, C> {
+impl<C: PoolChain> dcroxide_mining::TemplateTxSource for TxPool<C> {
     fn mining_view(&self) -> dcroxide_mining::TxMiningView {
         TxPool::mining_view(self)
     }
@@ -1777,5 +1814,74 @@ impl<C: PoolChain> dcroxide_mining::TemplateTxSource for TxPool<'_, C> {
 
     fn is_reg_tx_tree_known_disapproved(&self, hash: &Hash) -> bool {
         TxPool::is_reg_tx_tree_known_disapproved(self, hash)
+    }
+}
+
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+
+    /// The daemon shares the pool behind a mutex across its peer and
+    /// RPC threads, which requires `Send`.
+    #[test]
+    fn the_pool_is_send() {
+        struct NeverChain;
+        impl PoolChain for NeverChain {
+            fn next_stake_difficulty(&self) -> Result<i64, String> {
+                unimplemented!()
+            }
+            fn fetch_utxo_view(
+                &self,
+                _tx: &MsgTx,
+                _tx_hash: &Hash,
+                _tree: i8,
+                _tree_valid: bool,
+            ) -> Result<UtxoView, String> {
+                unimplemented!()
+            }
+            fn best_hash(&self) -> Hash {
+                unimplemented!()
+            }
+            fn best_height(&self) -> i64 {
+                unimplemented!()
+            }
+            fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
+                unimplemented!()
+            }
+            fn past_median_time(&self) -> i64 {
+                unimplemented!()
+            }
+            fn calc_sequence_lock(
+                &self,
+                _tx: &MsgTx,
+                _tx_hash: &Hash,
+                _view: &UtxoView,
+            ) -> Result<SequenceLock, PoolError> {
+                unimplemented!()
+            }
+            fn is_treasury_agenda_active(&self) -> Result<bool, String> {
+                unimplemented!()
+            }
+            fn is_auto_revocations_agenda_active(&self) -> Result<bool, String> {
+                unimplemented!()
+            }
+            fn is_subsidy_split_agenda_active(&self) -> Result<bool, String> {
+                unimplemented!()
+            }
+            fn is_subsidy_split_r2_agenda_active(&self) -> Result<bool, String> {
+                unimplemented!()
+            }
+            fn tspend_mined_on_ancestor(&self, _tspend: &Hash) -> Result<(), String> {
+                unimplemented!()
+            }
+            fn standard_verify_flags(&self) -> Result<ScriptFlags, String> {
+                unimplemented!()
+            }
+            fn now_unix(&self) -> i64 {
+                unimplemented!()
+            }
+        }
+        fn assert_send<T: Send>() {}
+        assert_send::<TxPool<NeverChain>>();
     }
 }

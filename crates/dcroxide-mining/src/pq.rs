@@ -5,7 +5,7 @@
 //! operations so pop order matches dcrd exactly, including among
 //! equal elements.
 
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use dcroxide_stake::TxType;
@@ -17,7 +17,7 @@ use crate::types::TxDesc;
 #[derive(Clone, Debug)]
 pub struct TxPrioItem {
     /// The transaction descriptor.
-    pub tx_desc: Rc<TxDesc>,
+    pub tx_desc: Arc<TxDesc>,
     /// The transaction type.
     pub tx_type: TxType,
     /// Whether the transaction is an automatic revocation.

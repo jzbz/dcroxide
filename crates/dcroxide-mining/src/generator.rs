@@ -14,8 +14,8 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
-use alloc::rc::Rc;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use dcroxide_blockchain::UtxoEntry;
@@ -531,7 +531,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         block_utxos: &mut UtxoView,
         prev_header_bytes: &[u8],
         is_treasury_enabled: bool,
-    ) -> Result<Rc<TxDesc>, String> {
+    ) -> Result<Arc<TxDesc>, String> {
         // Fetch the utxo for the ticket submission to be revoked.
         let ticket_submission = OutPoint {
             hash: *ticket_hash,
@@ -580,7 +580,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             self.chain
                 .count_sig_ops(&revocation_tx, false, false, is_treasury_enabled);
         let tx_size = revocation_tx.serialize_size() as i64;
-        Ok(Rc::new(TxDesc {
+        Ok(Arc::new(TxDesc {
             tx: revocation_tx,
             tx_hash,
             tree: dcroxide_wire::TX_TREE_STAKE,
@@ -743,10 +743,10 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         }
 
         let mut mining_view = self.tx_source.mining_view();
-        let source_txns: Vec<Rc<TxDesc>> = mining_view.tx_descs().to_vec();
+        let source_txns: Vec<Arc<TxDesc>> = mining_view.tx_descs().to_vec();
         let mut priority_queue = TxPriorityQueue::new(source_txns.len(), tx_pq_by_stake_and_fee);
         let mut prioritized_txns: BTreeSet<[u8; 32]> = BTreeSet::new();
-        let mut block_txns: Vec<Rc<TxDesc>> = Vec::with_capacity(source_txns.len());
+        let mut block_txns: Vec<Arc<TxDesc>> = Vec::with_capacity(source_txns.len());
         let mut block_utxos = UtxoView::new();
         let mut tx_fees: Vec<i64> = Vec::with_capacity(source_txns.len());
         let mut tx_fees_map: BTreeMap<[u8; 32], i64> = BTreeMap::new();

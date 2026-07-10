@@ -5,7 +5,7 @@
 //! cached ancestor statistics bounded by the tracking limit.
 
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use dcroxide_chainhash::Hash;
@@ -36,7 +36,7 @@ fn remove_ancestor_from(stats: &mut TxAncestorStats, tx_desc: &TxDesc) {
 pub struct TxMiningView {
     rejected: BTreeSet<[u8; 32]>,
     tx_graph: TxDescGraph,
-    tx_descs: Vec<Rc<TxDesc>>,
+    tx_descs: Vec<Arc<TxDesc>>,
     track_ancestor_stats: bool,
     ancestor_stats: BTreeMap<[u8; 32], TxAncestorStats>,
 }
@@ -56,12 +56,12 @@ impl TxMiningView {
 
     /// All transactions the given hash depends on along with a
     /// refresh of its cached bundle statistics (dcrd `ancestors`).
-    pub fn ancestors(&mut self, tx_hash: &Hash) -> Vec<Rc<TxDesc>> {
+    pub fn ancestors(&mut self, tx_hash: &Hash) -> Vec<Arc<TxDesc>> {
         if !self.track_ancestor_stats {
             return Vec::new();
         }
 
-        let mut ancestors: Vec<Rc<TxDesc>> = Vec::with_capacity(ANCESTOR_TRACKING_LIMIT);
+        let mut ancestors: Vec<Arc<TxDesc>> = Vec::with_capacity(ANCESTOR_TRACKING_LIMIT);
         // Preserve the up-to-date descendant count when statistics
         // were already tracked.
         let mut base_tx_stats: Option<TxAncestorStats> =
@@ -106,7 +106,7 @@ impl TxMiningView {
 
     /// The transactions that directly spend from the hash (dcrd
     /// `children`).
-    pub fn children(&self, tx_hash: &Hash) -> Vec<Rc<TxDesc>> {
+    pub fn children(&self, tx_hash: &Hash) -> Vec<Arc<TxDesc>> {
         self.tx_graph
             .children_of
             .get(&tx_hash.0)
@@ -116,7 +116,7 @@ impl TxMiningView {
 
     /// A deep copy of the view and underlying graph over the given
     /// descriptor snapshot (dcrd `Clone`).
-    pub fn clone_view(&self, tx_descs: Vec<Rc<TxDesc>>, fetch_tx: TxDescFind<'_>) -> TxMiningView {
+    pub fn clone_view(&self, tx_descs: Vec<Arc<TxDesc>>, fetch_tx: TxDescFind<'_>) -> TxMiningView {
         TxMiningView {
             rejected: BTreeSet::new(),
             tx_graph: self.tx_graph.clone_graph(fetch_tx),
@@ -155,7 +155,7 @@ impl TxMiningView {
 
     /// The transactions the hash directly spends from (dcrd
     /// `parents`).
-    pub fn parents(&self, tx_hash: &Hash) -> Vec<Rc<TxDesc>> {
+    pub fn parents(&self, tx_hash: &Hash) -> Vec<Arc<TxDesc>> {
         self.tx_graph
             .parents_of
             .get(&tx_hash.0)
@@ -169,7 +169,7 @@ impl TxMiningView {
     fn maybe_update_ancestor_stats(&mut self, tx_desc: &TxDesc, ignore_tx_hash: &Hash) -> bool {
         let base_tx_hash = tx_desc.tx_hash;
         let mut can_track_ancestors = true;
-        let mut seen_ancestors: BTreeMap<[u8; 32], Rc<TxDesc>> = BTreeMap::new();
+        let mut seen_ancestors: BTreeMap<[u8; 32], Arc<TxDesc>> = BTreeMap::new();
         // The walk inserts into the seen map exactly when the callback
         // returns true, so a parallel counter mirrors dcrd's
         // len(seenAncestors) reads inside the callback.
@@ -313,7 +313,7 @@ impl TxMiningView {
 
     /// Remove the transaction's stats from all dependents (dcrd
     /// `updateStatsDescendantsRemoved`).
-    fn update_stats_descendants_removed(&mut self, base_tx_desc: &Rc<TxDesc>) {
+    fn update_stats_descendants_removed(&mut self, base_tx_desc: &Arc<TxDesc>) {
         let base_tx_hash = base_tx_desc.tx_hash;
         if !self.ancestor_stats.contains_key(&base_tx_hash.0) {
             // If the transaction does not have ancestor tracking
@@ -323,7 +323,7 @@ impl TxMiningView {
 
         let mut num_untracked_descendants = 0usize;
         let mut seen: BTreeMap<[u8; 32], ()> = BTreeMap::new();
-        let mut retrack: Vec<Rc<TxDesc>> = Vec::new();
+        let mut retrack: Vec<Arc<TxDesc>> = Vec::new();
         {
             let graph = &self.tx_graph;
             let ancestor_stats = &mut self.ancestor_stats;
@@ -363,7 +363,7 @@ impl TxMiningView {
 
         // Update all ancestors to account for the removal of a
         // descendant.
-        let mut seen_ancestors: BTreeMap<[u8; 32], Rc<TxDesc>> = BTreeMap::new();
+        let mut seen_ancestors: BTreeMap<[u8; 32], Arc<TxDesc>> = BTreeMap::new();
         let graph = &self.tx_graph;
         let ancestor_stats = &mut self.ancestor_stats;
         graph.for_each_ancestor_pre_order(&base_tx_hash, &mut seen_ancestors, &mut |ancestor| {
@@ -378,7 +378,7 @@ impl TxMiningView {
     /// children through the provided lookups (dcrd `AddTransaction`).
     pub fn add_transaction(
         &mut self,
-        tx_desc: &Rc<TxDesc>,
+        tx_desc: &Arc<TxDesc>,
         find_tx: TxDescFind<'_>,
         for_each_redeemer: ForEachRedeemer<'_>,
     ) {
@@ -427,7 +427,7 @@ impl TxMiningView {
 
     /// All transactions available in the view snapshot (dcrd
     /// `TxDescs`).
-    pub fn tx_descs(&self) -> &[Rc<TxDesc>] {
+    pub fn tx_descs(&self) -> &[Arc<TxDesc>] {
         &self.tx_descs
     }
 }

@@ -15,7 +15,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dcroxide_blockchain::UtxoEntry;
 use dcroxide_blockchain::utxoview::UtxoView;
@@ -237,8 +237,8 @@ impl TemplateChain for FakeChain {
 /// generator consumes.
 #[derive(Default)]
 struct ThinSource {
-    pool: HashMap<[u8; 32], Rc<TxDesc>>,
-    outpoints: HashMap<([u8; 32], u32, i8), Rc<TxDesc>>,
+    pool: HashMap<[u8; 32], Arc<TxDesc>>,
+    outpoints: HashMap<([u8; 32], u32, i8), Arc<TxDesc>>,
     view: Option<TxMiningView>,
     votes: HashMap<[u8; 32], Vec<VoteDesc>>,
 }
@@ -251,7 +251,7 @@ impl ThinSource {
         }
     }
 
-    fn add(&mut self, desc: Rc<TxDesc>) {
+    fn add(&mut self, desc: Arc<TxDesc>) {
         self.pool.insert(desc.tx_hash.0, desc.clone());
         let pool = &self.pool;
         let outpoints = &self.outpoints;
@@ -446,7 +446,7 @@ fn newtemplate_vectors() {
                     TX_TREE_STAKE
                 };
                 let tx_size = tx.serialize_size() as i64;
-                g.tx_source.add(Rc::new(TxDesc {
+                g.tx_source.add(Arc::new(TxDesc {
                     tx,
                     tx_hash,
                     tree,
