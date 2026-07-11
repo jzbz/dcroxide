@@ -384,6 +384,7 @@ struct RpcRelaySinks {
     sync_peers: crate::dispatch::SyncPeers,
     recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
     tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
+    rebroadcast: crate::rebroadcast::RebroadcastSink,
 }
 
 impl NodeRpcConnManager {
@@ -407,11 +408,13 @@ impl NodeRpcConnManager {
         sync_peers: crate::dispatch::SyncPeers,
         recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
         tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
+        rebroadcast: crate::rebroadcast::RebroadcastSink,
     ) -> NodeRpcConnManager {
         self.relay = Some(RpcRelaySinks {
             sync_peers,
             recently_advertised,
             tx_pool,
+            rebroadcast,
         });
         self
     }
@@ -451,6 +454,16 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
                     data_is_tx: true,
                 });
         }
+    }
+
+    fn add_rebroadcast_inventory(&mut self, tx_hash: &Hash, tx: &dcroxide_wire::MsgTx) {
+        // Track user-submitted transactions for periodic rebroadcast
+        // until they make it into a block (dcrd rpcConnManager
+        // forwarding to the server's `AddRebroadcastInventory`).
+        let Some(relay) = &self.relay else {
+            return;
+        };
+        relay.rebroadcast.add_rebroadcast_inventory(tx_hash, tx);
     }
 
     fn net_totals(&mut self) -> (u64, u64) {
@@ -530,11 +543,15 @@ impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
     /// Whether the transaction confirmed in a recent block (dcrd
     /// `RecentlyConfirmedTxn` over the netsync APBF filter).
     fn recently_confirmed_txn(&mut self, hash: &Hash) -> bool {
-        self.sync_manager
+        // Take the shared filter handle so the check does not hold
+        // the sync manager across the read.
+        let filter = self
+            .sync_manager
             .lock()
             .expect("sync manager poisoned")
-            .recently_confirmed_txns_mut()
-            .contains(&hash.0)
+            .recently_confirmed_txns();
+        let filter = filter.lock().expect("recently confirmed filter poisoned");
+        filter.contains(&hash.0)
     }
 }
 

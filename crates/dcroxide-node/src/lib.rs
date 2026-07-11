@@ -23,6 +23,7 @@ pub mod outbound;
 pub mod params;
 pub mod peerconn;
 pub mod peerloop;
+pub mod rebroadcast;
 pub mod rpcrun;
 pub mod runtime;
 pub mod seeding;

@@ -285,7 +285,9 @@ fn config(
         no_mining_state_sync: false,
         max_outbound_peers: 8,
         max_orphan_txs: 100,
-        recently_confirmed_txns: apbf::new_filter(62500, 0.0000001),
+        recently_confirmed_txns: std::sync::Arc::new(std::sync::Mutex::new(apbf::new_filter(
+            62500, 0.0000001,
+        ))),
     }
 }
 
@@ -353,7 +355,10 @@ fn netsync_scenario_matches_dcrd() {
     cfg.tx_mem_pool.orphan_hash = orphan_hash;
     cfg.tx_mem_pool.bad_hash = bad_hash;
     cfg.mix_pool.reject.insert(mix_hash);
-    cfg.recently_confirmed_txns.add(&hashes["confirmed"].0);
+    cfg.recently_confirmed_txns
+        .lock()
+        .expect("filter")
+        .add(&hashes["confirmed"].0);
     let mut m = SyncManager::new(cfg);
 
     // Second pass: drive the scenario and compare every message and
@@ -711,7 +716,9 @@ fn header_sync_progress_guess_matches_dcrd() {
         no_mining_state_sync: false,
         max_outbound_peers: 8,
         max_orphan_txs: 100,
-        recently_confirmed_txns: apbf::new_filter(62500, 0.0000001),
+        recently_confirmed_txns: std::sync::Arc::new(std::sync::Mutex::new(apbf::new_filter(
+            62500, 0.0000001,
+        ))),
     };
     let m = SyncManager::new(cfg);
 

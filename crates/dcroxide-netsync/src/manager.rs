@@ -421,8 +421,11 @@ pub struct Config<C, T, M> {
     /// (dcrd `MaxOrphanTxs`).
     pub max_orphan_txs: usize,
     /// A size limited set tracking the most recently confirmed
-    /// transactions (dcrd `RecentlyConfirmedTxns`).
-    pub recently_confirmed_txns: apbf::Filter,
+    /// transactions (dcrd `RecentlyConfirmedTxns`).  Shared with the
+    /// daemon exactly as dcrd shares the server's filter with the
+    /// netsync config: the chain handler records confirmations while
+    /// the manager consults it.
+    pub recently_confirmed_txns: std::sync::Arc<std::sync::Mutex<apbf::Filter>>,
 }
 
 /// The concurrency-free core of dcrd's `SyncManager`.
@@ -505,8 +508,8 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
 
     /// The recently confirmed transactions filter (shared with the
     /// daemon, which records confirmations).
-    pub fn recently_confirmed_txns_mut(&mut self) -> &mut apbf::Filter {
-        &mut self.cfg.recently_confirmed_txns
+    pub fn recently_confirmed_txns(&self) -> std::sync::Arc<std::sync::Mutex<apbf::Filter>> {
+        std::sync::Arc::clone(&self.cfg.recently_confirmed_txns)
     }
 
     /// The hashes and requesting peers of the in-flight requests, for
@@ -1640,7 +1643,13 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         }
 
         // No need for transactions that were recently confirmed.
-        if self.cfg.recently_confirmed_txns.contains(&hash.0) {
+        if self
+            .cfg
+            .recently_confirmed_txns
+            .lock()
+            .expect("recently confirmed filter poisoned")
+            .contains(&hash.0)
+        {
             return false;
         }
 

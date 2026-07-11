@@ -67,6 +67,15 @@ pub struct ChainNtfnHandler {
     /// `s.indexSubscriber.Notify` at the end of each connect and
     /// disconnect case; `None` when no index is enabled).
     index_subscriber: Option<Arc<Mutex<dcroxide_indexers::IndexSubscriber>>>,
+    /// The recently-confirmed filter every confirmed transaction
+    /// feeds (dcrd `TransactionConfirmed` adding to
+    /// `recentlyConfirmedTxns`), shared with the netsync manager.
+    recently_confirmed: Option<Arc<Mutex<dcroxide_containers::apbf::Filter>>>,
+    /// The rebroadcast feeder for confirmation removals and the
+    /// block-change prunes; `Some` only when the RPC server runs
+    /// (dcrd gates both on `s.rpcServer != nil` since only RPC
+    /// submissions are ever tracked).
+    rebroadcast: Option<crate::rebroadcast::RebroadcastSink>,
 }
 
 /// A block event awaiting its mempool maintenance (dcrd's handler
@@ -110,7 +119,28 @@ impl ChainNtfnHandler {
             sync_peers,
             recently_advertised,
             index_subscriber: None,
+            recently_confirmed: None,
+            rebroadcast: None,
         }
+    }
+
+    /// Record confirmed transactions in the given shared filter (dcrd
+    /// `TransactionConfirmed`'s `recentlyConfirmedTxns.Add`).  Must be
+    /// set before the handler is cloned into the chain callback.
+    pub fn set_recently_confirmed(
+        &mut self,
+        filter: Arc<Mutex<dcroxide_containers::apbf::Filter>>,
+    ) {
+        self.recently_confirmed = Some(filter);
+    }
+
+    /// Feed confirmation removals and block-change prunes into the
+    /// rebroadcast thread (dcrd's `RemoveRebroadcastInventory` and
+    /// `PruneRebroadcastInventory`, both gated on the RPC server
+    /// running).  Must be set before the handler is cloned into the
+    /// chain callback.
+    pub fn set_rebroadcast(&mut self, sink: crate::rebroadcast::RebroadcastSink) {
+        self.rebroadcast = Some(sink);
     }
 
     /// Feed the drained block events into the given index subscriber
@@ -278,8 +308,9 @@ impl ChainNtfnHandler {
     /// Run the queued mempool maintenance for the connected and
     /// disconnected blocks, in order, now that the chain mutex is
     /// free (dcrd `handleBlockchainNotification`'s NTBlockConnected
-    /// and NTBlockDisconnected mempool halves; the fee-estimator feed
-    /// and the rebroadcast bookkeeping arrive with later pieces).
+    /// and NTBlockDisconnected mempool halves with the confirmed-
+    /// transaction bookkeeping and the rebroadcast prunes; the
+    /// fee-estimator feed arrives with a later piece).
     pub fn drain_pending_block_events(&self) {
         let pending: Vec<PendingBlockEvent> = core::mem::take(
             &mut *self
@@ -316,6 +347,14 @@ impl ChainNtfnHandler {
                     )
                 }
             };
+            // Filter and update the rebroadcast inventory (dcrd's
+            // `s.PruneRebroadcastInventory()` in both the connect and
+            // disconnect cases when the RPC server runs; the prune is
+            // a queued command processed by the rebroadcast thread,
+            // exactly like dcrd's channel send).
+            if let Some(rebroadcast) = &self.rebroadcast {
+                rebroadcast.prune_rebroadcast_inventory();
+            }
             // Notify the subscribed indexes at the end of each case
             // (dcrd's `s.indexSubscriber.Notify`).  A failed update
             // marks the subscriber cancelled and later notifications
@@ -371,6 +410,21 @@ impl ChainNtfnHandler {
                 pool.process_orphans(tx, check_tx_flags)
             };
             self.announce_transactions(&accepted);
+
+            // Now that this block is in the blockchain, mark the
+            // transaction as no longer needing rebroadcasting and
+            // keep track of it for use when avoiding requests for
+            // recently confirmed transactions (dcrd
+            // `TransactionConfirmed`).
+            if let Some(filter) = &self.recently_confirmed {
+                filter
+                    .lock()
+                    .expect("recently confirmed filter poisoned")
+                    .add(&tx_hash.0);
+            }
+            if let Some(rebroadcast) = &self.rebroadcast {
+                rebroadcast.remove_rebroadcast_inventory(&tx_hash);
+            }
         }
 
         // A block that disapproves its parent returns the parent's

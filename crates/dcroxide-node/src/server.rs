@@ -6,9 +6,9 @@
 //! conversion and service helpers, the serverPeer address relay,
 //! ban, and abuse-control handlers, the version handshake, the peer
 //! state maps and admission, and the relay and broadcast decisions.
-//! The chain-backed handlers, the mining and mix handlers, the
-//! rebroadcast prune, and the server lifecycle arrive with later
-//! slices.
+//! The chain-backed handlers, the mining and mix handlers, and the
+//! server lifecycle arrive with later slices (the rebroadcast
+//! machinery lives in the `rebroadcast` module).
 
 // Bounded cache and majority arithmetic mirroring Go.
 #![allow(clippy::arithmetic_side_effects)]

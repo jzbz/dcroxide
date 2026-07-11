@@ -231,9 +231,9 @@ pub fn new_sync_manager(
         no_mining_state_sync,
         max_outbound_peers,
         max_orphan_txs,
-        recently_confirmed_txns: dcroxide_containers::apbf::new_filter(
+        recently_confirmed_txns: Arc::new(Mutex::new(dcroxide_containers::apbf::new_filter(
             MAX_RECENTLY_CONFIRMED_TXNS,
             RECENTLY_CONFIRMED_TXNS_FP_RATE,
-        ),
+        ))),
     })
 }

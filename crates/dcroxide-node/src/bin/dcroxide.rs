@@ -277,6 +277,20 @@ fn run(cfg: Config) -> ExitCode {
         ntfn.clone(),
     );
 
+    // Track user-submitted transactions and periodically rebroadcast
+    // them until they make it into a block (dcrd `server.Run`
+    // launching `rebroadcastHandler` only when the RPC server runs —
+    // only RPC submissions are ever tracked).
+    let rebroadcaster = if cfg.disable_rpc {
+        None
+    } else {
+        Some(dcroxide_node::rebroadcast::start_rebroadcaster(
+            Arc::clone(&chain),
+            server.sync_peers.clone(),
+            Arc::clone(&server.recently_advertised),
+        ))
+    };
+
     // Feed the chain's events into the daemon handler as blocks
     // connect, disconnect, and reorganize (dcrd installing
     // handleBlockchainNotification as its blockchain notification
@@ -297,6 +311,20 @@ fn run(cfg: Config) -> ExitCode {
     // (dcrd's handler notifying `s.indexSubscriber`).
     if let Some(indexes) = &indexes {
         handler.set_index_subscriber(Arc::clone(&indexes.subscriber));
+    }
+    // Confirmed transactions feed the recently-confirmed filter the
+    // sync manager consults, and — when the RPC server runs — remove
+    // their rebroadcast entries and trigger the block-change prunes
+    // (dcrd `TransactionConfirmed` and the `rpcServer != nil` gates).
+    handler.set_recently_confirmed(
+        server
+            .sync_manager
+            .lock()
+            .expect("sync manager mutex poisoned")
+            .recently_confirmed_txns(),
+    );
+    if let Some(rebroadcaster) = &rebroadcaster {
+        handler.set_rebroadcast(rebroadcaster.sink());
     }
     {
         let callback_handler = handler.clone();
@@ -374,6 +402,10 @@ fn run(cfg: Config) -> ExitCode {
             Arc::clone(&tx_pool),
             server.sync_peers.clone(),
             Arc::clone(&server.recently_advertised),
+            rebroadcaster
+                .as_ref()
+                .expect("the rebroadcaster exists when RPC is enabled")
+                .sink(),
             tx_indexer,
             exists_addresser,
             db.clone(),
@@ -515,6 +547,9 @@ fn run(cfg: Config) -> ExitCode {
     }
     connector.shutdown();
     stall_timer.shutdown();
+    if let Some(rebroadcaster) = rebroadcaster {
+        rebroadcaster.shutdown();
+    }
     connected.disconnect_all();
     if let Some(runtime) = runtime {
         runtime.shutdown();
@@ -673,6 +708,7 @@ fn rpc_config(
     recently_advertised: Arc<
         Mutex<dcroxide_containers::lru::Map<dcroxide_chainhash::Hash, dcroxide_wire::MsgTx>>,
     >,
+    rebroadcast: dcroxide_node::rebroadcast::RebroadcastSink,
     tx_indexer: Option<Box<dyn dcroxide_rpc::server::RpcTxIndexer + Send>>,
     exists_addresser: Option<Box<dyn dcroxide_rpc::server::RpcExistsAddresser + Send>>,
     db: Database,
@@ -695,6 +731,7 @@ fn rpc_config(
                 sync_peers,
                 recently_advertised,
                 Arc::clone(&tx_pool),
+                rebroadcast,
             ),
         ),
         tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(tx_pool)),
