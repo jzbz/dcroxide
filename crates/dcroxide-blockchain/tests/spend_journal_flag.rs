@@ -132,7 +132,12 @@ fn parent_journal_decode_depends_on_the_treasury_flag() {
         552_447,
         vec![
             coinbase(0),
-            spend_tx(2, reg_stxo.amount, reg_stxo.block_height, reg_stxo.block_index),
+            spend_tx(
+                2,
+                reg_stxo.amount,
+                reg_stxo.block_height,
+                reg_stxo.block_index,
+            ),
         ],
         vec![spend_tx(
             0,
@@ -203,7 +208,11 @@ fn connect_block_fetches_parent_journal_only_on_disapprove() {
             false,
         )
         .expect("connect approving child");
-        assert_eq!(calls.get(), 0, "approve path must not decode the parent journal");
+        assert_eq!(
+            calls.get(),
+            0,
+            "approve path must not decode the parent journal"
+        );
     }
 
     // Disapproving child: the provider runs exactly once.
@@ -225,6 +234,10 @@ fn connect_block_fetches_parent_journal_only_on_disapprove() {
             false,
         )
         .expect("connect disapproving child");
-        assert_eq!(calls.get(), 1, "disapprove path must decode the parent journal once");
+        assert_eq!(
+            calls.get(),
+            1,
+            "disapprove path must decode the parent journal once"
+        );
     }
 }
