@@ -33,10 +33,15 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use dcroxide_addrmgr::AddrManager;
+use dcroxide_blockchain::RuleErrorKind;
 use dcroxide_blockchain::process::Chain;
 use dcroxide_certgen::{CertEnv, Curve, new_tls_cert_pair};
 use dcroxide_chainhash::Hash;
-use dcroxide_rpc::server::{RpcBestState, RpcChain, Server};
+use dcroxide_rpc::server::{
+    FilterFailure, RpcAddrManager, RpcBestState, RpcChain, RpcFilterProof, RpcFiltererV2,
+    RpcSanityChecker, Server,
+};
 use dcroxide_uint256::Uint256;
 use dcroxide_wire::{BlockHeader, MsgBlock};
 
@@ -374,6 +379,101 @@ pub struct SystemTimeSource;
 impl dcroxide_rpc::server::RpcTimeSource for SystemTimeSource {
     fn offset_nanos(&mut self) -> i64 {
         0
+    }
+}
+
+/// The version 2 committed-filter source answering `getcfilterv2` over
+/// the live chain (dcrd's `rpcFiltererV2` wrapping
+/// `BlockChain.FilterByBlockHash`).
+pub struct NodeRpcFiltererV2 {
+    chain: Arc<Mutex<Chain>>,
+}
+
+impl NodeRpcFiltererV2 {
+    /// Adapt the shared chain as the RPC filter source.
+    pub fn new(chain: Arc<Mutex<Chain>>) -> NodeRpcFiltererV2 {
+        NodeRpcFiltererV2 { chain }
+    }
+}
+
+impl RpcFiltererV2 for NodeRpcFiltererV2 {
+    fn filter_by_block_hash(&mut self, hash: &Hash) -> Result<RpcFilterProof, FilterFailure> {
+        let fetched = {
+            let chain = self.chain.lock().expect("chain mutex poisoned");
+            chain.filter_by_block_hash(hash)
+        };
+        match fetched {
+            Ok((filter, proof)) => Ok(RpcFilterProof {
+                filter_bytes: filter.bytes().to_vec(),
+                proof_index: proof.proof_index,
+                proof_hashes: proof.proof_hashes,
+            }),
+            // A missing filter is dcrd's `blockchain.ErrNoFilter`, which
+            // the handler turns into the "Block not found" RPC error; any
+            // other failure surfaces as an internal error.
+            Err(err) => Err(FilterFailure {
+                is_no_filter: err.kind == RuleErrorKind::NoFilter,
+                message: err.to_string(),
+            }),
+        }
+    }
+}
+
+/// The block sanity checker answering `verifychain` over the ported
+/// context-free checks (dcrd's `rpcSanityChecker.CheckBlockSanity`,
+/// which calls the package-level `blockchain.CheckBlockSanity(block,
+/// timeSource, chainParams)` — no chain lock, since the checks are
+/// context free and dcrd's median time source guards itself).  The port
+/// passes the daemon's wall clock as the adjusted time, matching how the
+/// sync manager's own `process_block` path calls `check_block_sanity`
+/// (no network time samples are collected yet, so the two are
+/// identical).
+pub struct NodeRpcSanityChecker {
+    params: dcroxide_chaincfg::Params,
+}
+
+impl NodeRpcSanityChecker {
+    /// Adapt the network parameters as the RPC sanity checker.
+    pub fn new(params: dcroxide_chaincfg::Params) -> NodeRpcSanityChecker {
+        NodeRpcSanityChecker { params }
+    }
+}
+
+impl RpcSanityChecker for NodeRpcSanityChecker {
+    fn check_block_sanity(&mut self, block: &MsgBlock) -> Result<(), String> {
+        dcroxide_blockchain::validate::check_block_sanity(
+            block,
+            crate::txmempool::now_unix(),
+            false,
+            &self.params,
+        )
+        .map_err(|err| err.to_string())
+    }
+}
+
+/// The address-manager adapter answering `getnetworkinfo`'s local
+/// address summary over the daemon's live address manager (dcrd's
+/// `addrManager.LocalAddresses`).
+pub struct NodeRpcAddrManager {
+    addr_manager: Arc<Mutex<AddrManager>>,
+}
+
+impl NodeRpcAddrManager {
+    /// Adapt the shared address manager for the RPC handlers.
+    pub fn new(addr_manager: Arc<Mutex<AddrManager>>) -> NodeRpcAddrManager {
+        NodeRpcAddrManager { addr_manager }
+    }
+}
+
+impl RpcAddrManager for NodeRpcAddrManager {
+    fn local_addresses(&mut self) -> Vec<(String, u16)> {
+        self.addr_manager
+            .lock()
+            .expect("addr manager mutex poisoned")
+            .local_addresses()
+            .into_iter()
+            .map(|local| (local.address, local.port))
+            .collect()
     }
 }
 

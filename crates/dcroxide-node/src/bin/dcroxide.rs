@@ -131,9 +131,15 @@ fn run(cfg: Config) -> ExitCode {
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     {
         let signal_interrupt = Arc::clone(&interrupt);
+        // Clone the sender for the signal handler so the original stays
+        // owned by `run` and can be handed to the RPC server's
+        // `request_shutdown` seam, letting the `stop` command trigger the
+        // same graceful shutdown as SIGINT (dcrd's `requestProcessShutdown`
+        // channel, which its signal handler also sends on).
+        let signal_shutdown = shutdown_tx.clone();
         if let Err(e) = ctrlc::set_handler(move || {
             signal_interrupt.store(true, core::sync::atomic::Ordering::SeqCst);
-            let _ = shutdown_tx.send(());
+            let _ = signal_shutdown.send(());
         }) {
             log_info(&format!("unable to install signal handler: {e}"));
             return ExitCode::FAILURE;
@@ -528,6 +534,18 @@ fn run(cfg: Config) -> ExitCode {
             Some(miner) => Box::new(miner),
             None => Box::new(dcroxide_node::rpcrun::IdleCpuMiner),
         };
+        // The `stop` RPC requests the same graceful shutdown as an
+        // interrupt: set the shared interrupt flag and send on the
+        // shutdown channel the idle wait blocks on (dcrd's non-blocking
+        // send on the server's `requestProcessShutdown` channel).
+        let request_shutdown: Box<dyn FnMut() + Send> = {
+            let interrupt = Arc::clone(&interrupt);
+            let shutdown_tx = shutdown_tx.clone();
+            Box::new(move || {
+                interrupt.store(true, core::sync::atomic::Ordering::SeqCst);
+                let _ = shutdown_tx.send(());
+            })
+        };
         let mut rpc_srv = dcroxide_rpc::server::Server::new(rpc_config(
             &cfg,
             Arc::clone(&chain),
@@ -547,6 +565,8 @@ fn run(cfg: Config) -> ExitCode {
             block_templater,
             Arc::clone(&fee_estimator),
             cpu_miner,
+            Arc::clone(&addr_manager),
+            request_shutdown,
         ));
         // Install the websocket notification manager (dcrd's
         // wsNotificationManager) and start its delivery thread over
@@ -869,8 +889,15 @@ fn rpc_config(
     block_templater: Option<Box<dyn dcroxide_rpc::server::RpcBlockTemplater + Send>>,
     fee_estimator: dcroxide_node::fees::SharedFeeEstimator,
     cpu_miner: Box<dyn dcroxide_rpc::server::RpcCpuMiner + Send>,
+    addr_manager: Arc<Mutex<AddrManager>>,
+    request_shutdown: Box<dyn FnMut() + Send>,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
+    // The version 2 filter source shares the live chain (cloned before it
+    // is moved into the chain adapter below); the sanity checker keeps the
+    // parameters (cloned before they are moved into the subsidy cache).
+    let filterer_v2 = dcroxide_node::rpcrun::NodeRpcFiltererV2::new(Arc::clone(&chain));
+    let sanity_checker = dcroxide_node::rpcrun::NodeRpcSanityChecker::new(params.clone());
     dcroxide_rpc::server::Config {
         chain: dcroxide_node::rpcrun::NodeRpcChain::new(chain, params.clone()),
         chain_params: params.clone(),
@@ -901,12 +928,12 @@ fn rpc_config(
         }),
         tx_indexer,
         db: Box::new(dcroxide_node::indexes::NodeRpcDb::new(db)),
-        filterer_v2: Box::new(()),
+        filterer_v2: Box::new(filterer_v2),
         exists_addresser,
         log_manager: Box::new(()),
         fee_estimator: Box::new(dcroxide_node::fees::NodeRpcFeeEstimator::new(fee_estimator)),
         block_templater,
-        sanity_checker: Box::new(()),
+        sanity_checker: Box::new(sanity_checker),
         time_source: Box::new(dcroxide_node::rpcrun::SystemTimeSource),
         proxy: cfg.proxy.clone(),
         test_net: cfg.test_net,
@@ -918,12 +945,19 @@ fn rpc_config(
         cpu_miner,
         mix_pooler: Box::new(()),
         profiler_mgr: Box::new(()),
-        addr_manager: Box::new(()),
+        addr_manager: Box::new(dcroxide_node::rpcrun::NodeRpcAddrManager::new(addr_manager)),
         mining_addrs: cfg.mining_addrs.clone(),
         user_agent_version: version::version_string().to_string(),
-        net_info: Vec::new(),
+        // The three per-network reachability descriptions the config's
+        // `parse_network_interfaces` already derived from the listeners
+        // and proxy settings (dcrd's `cfg.generateNetworkInfo()`).
+        net_info: vec![
+            cfg.ipv4_net_info.clone(),
+            cfg.ipv6_net_info.clone(),
+            cfg.onion_net_info.clone(),
+        ],
         services: ServiceFlag::NODE_NETWORK.0,
-        request_shutdown: Box::new(|| {}),
+        request_shutdown,
         allow_unsynced_mining: cfg.allow_unsynced_mining,
         rpc_user: cfg.rpc_user.clone(),
         rpc_pass: cfg.rpc_pass.clone(),
