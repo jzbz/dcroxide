@@ -147,7 +147,9 @@ impl SyncChain for NodeSyncChain {
         // free (dcrd handles both inline with its chain lock
         // released).
         if let Some(handler) = &self.ntfn_handler {
+            handler.drain_pending_checked_announcements();
             handler.drain_pending_block_events();
+            handler.drain_pending_accepted_announcements(&self.chain, adjusted_time_unix());
             handler.drain_pending_winning_tickets(&self.chain, adjusted_time_unix());
         }
 

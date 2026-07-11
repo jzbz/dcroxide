@@ -198,7 +198,7 @@ pub struct RelayPeerState {
 
 impl RelayPeerState {
     /// The relay state for a freshly handshaken peer.
-    fn new(facts: crate::server::RelayPeerFacts) -> RelayPeerState {
+    pub(crate) fn new(facts: crate::server::RelayPeerFacts) -> RelayPeerState {
         RelayPeerState {
             facts,
             announced_block: None,
@@ -226,7 +226,7 @@ impl SyncPeers {
         SyncPeers::default()
     }
 
-    fn register(
+    pub(crate) fn register(
         &self,
         id: i32,
         outbound: OutboundQueue,
@@ -244,6 +244,17 @@ impl SyncPeers {
                     relay,
                 },
             );
+    }
+
+    /// Flip the peer's preference for header announcements (dcrd's
+    /// `sendHeadersPreferred`, consulted as `WantsHeaders` by the
+    /// relay).
+    pub(crate) fn set_wants_headers(&self, id: i32) {
+        let registry = self.inner.lock().expect("sync peers mutex poisoned");
+        if let Some(handles) = registry.get(&id) {
+            let mut relay = handles.relay.lock().expect("relay state poisoned");
+            relay.facts.wants_headers = true;
+        }
     }
 
     /// Mark inventory as known to the peer so the relay never echoes
@@ -267,6 +278,35 @@ impl SyncPeers {
     /// random window; the plain per-peer queue sends each announcement
     /// as its own message.
     pub fn relay_inventory(&self, msg: &crate::server::RelayInvFacts) {
+        self.relay_to_peers(msg, None);
+    }
+
+    /// Announce a block to every registered peer with the required
+    /// services (dcrd `RelayBlockAnnouncement` driving
+    /// `handleRelayPeerInvMsg` with the header as the message data):
+    /// peers that asked for headers get the header itself, the rest
+    /// get the immediate inventory.
+    pub fn relay_block_announcement(
+        &self,
+        header: &dcroxide_wire::BlockHeader,
+        req_services: dcroxide_wire::ServiceFlag,
+    ) {
+        let msg = crate::server::RelayInvFacts {
+            inv_type: InvType::BLOCK,
+            inv_hash: header.block_hash(),
+            req_services,
+            immediate: true,
+            data_is_block_header: true,
+            data_is_tx: false,
+        };
+        self.relay_to_peers(&msg, Some(header));
+    }
+
+    fn relay_to_peers(
+        &self,
+        msg: &crate::server::RelayInvFacts,
+        header: Option<&dcroxide_wire::BlockHeader>,
+    ) {
         let registry = self.inner.lock().expect("sync peers mutex poisoned");
         for handles in registry.values() {
             let mut relay = handles.relay.lock().expect("relay state poisoned");
@@ -278,10 +318,19 @@ impl SyncPeers {
             let outcome = crate::server::handle_relay_peer_inv(announced_block, facts, msg);
             match outcome.action {
                 crate::server::RelayPeerAction::Ignore => {}
-                // The headers form of a block announcement needs the
-                // header data; block relay arrives with the block
-                // announcement piece.
-                crate::server::RelayPeerAction::QueueHeaders => {}
+                crate::server::RelayPeerAction::QueueHeaders => {
+                    // The decision core only asks for headers when the
+                    // announcement carries the header data (dcrd sends
+                    // the headers message directly, bypassing the
+                    // inventory queue and its known-inventory set).
+                    if let Some(header) = header {
+                        let _ = handles.outbound.queue_message(Message::Headers(
+                            dcroxide_wire::MsgHeaders {
+                                headers: vec![*header],
+                            },
+                        ));
+                    }
+                }
                 crate::server::RelayPeerAction::QueueInventory
                 | crate::server::RelayPeerAction::QueueInventoryImmediate => {
                     let inv = InvVect {
@@ -641,6 +690,19 @@ impl ServerPeerHandler {
                 ServeSignal::Continue
             }
             Message::Block(block) => {
+                // The block the peer delivered is known to it, so the
+                // announcement fan-out never echoes the inventory back
+                // (dcrd `OnBlock`'s `AddKnownInventory` before the
+                // sync-manager hand-off).
+                if let Some(id) = self.sync_peer_id {
+                    self.ctx.sync_peers.mark_known_inventory(
+                        id,
+                        InvVect {
+                            inv_type: dcroxide_wire::InvType::BLOCK,
+                            hash: block.header.block_hash(),
+                        },
+                    );
+                }
                 self.drive_sync(|manager, id| manager.on_block(id, block));
                 ServeSignal::Continue
             }
@@ -743,6 +805,15 @@ impl ServerPeerHandler {
                         ServeSignal::Continue
                     }
                 }
+            }
+            Message::SendHeaders => {
+                // The peer prefers header announcements over invs from
+                // now on (dcrd's peer marking `sendHeadersPreferred`
+                // on the sendheaders message).
+                if let Some(id) = self.sync_peer_id {
+                    self.ctx.sync_peers.set_wants_headers(id);
+                }
+                ServeSignal::Continue
             }
             // The mix-message intake arrives with the mixpool wiring.
             _ => ServeSignal::Continue,
@@ -1183,5 +1254,114 @@ mod tests {
         peers.mark_known_inventory(1, echoed);
         peers.relay_inventory(&tx_relay_msg(&echoed));
         assert!(rx_a.try_recv().is_err(), "announced inventory not echoed");
+    }
+
+    fn full_node_facts() -> crate::server::RelayPeerFacts {
+        crate::server::RelayPeerFacts {
+            connected: true,
+            services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+            wants_headers: false,
+            disable_relay_tx: false,
+            protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+        }
+    }
+
+    fn announce_header() -> dcroxide_wire::BlockHeader {
+        dcroxide_wire::BlockHeader {
+            version: 1,
+            prev_block: Hash([0x11; 32]),
+            merkle_root: Hash::ZERO,
+            stake_root: Hash::ZERO,
+            vote_bits: 0,
+            final_state: [0u8; 6],
+            voters: 0,
+            fresh_stake: 0,
+            revocations: 0,
+            pool_size: 0,
+            bits: 0,
+            sbits: 0,
+            height: 5,
+            size: 0,
+            timestamp: 0,
+            nonce: 0,
+            extra_data: [0u8; 32],
+            stake_version: 0,
+        }
+    }
+
+    /// Block announcements honor the required services, the headers
+    /// preference, the per-peer announced-block toggle across the
+    /// checked and accepted passes, and the known-inventory dedup
+    /// (dcrd's `handleRelayPeerInvMsg` block branch).
+    #[test]
+    fn announces_blocks_with_headers_preference_and_dedup() {
+        let peers = SyncPeers::new();
+        let (queue_inv, rx_inv) = crate::peerloop::OutboundQueue::channel();
+        let (queue_hdr, rx_hdr) = crate::peerloop::OutboundQueue::channel();
+        let (queue_lite, rx_lite) = crate::peerloop::OutboundQueue::channel();
+        peers.register(
+            1,
+            queue_inv,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(full_node_facts()))),
+        );
+        peers.register(
+            2,
+            queue_hdr,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(full_node_facts()))),
+        );
+        peers.register(
+            3,
+            queue_lite,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+        );
+        peers.set_wants_headers(2);
+
+        let header = announce_header();
+        let block_hash = header.block_hash();
+        let inv = InvVect {
+            inv_type: dcroxide_wire::InvType::BLOCK,
+            hash: block_hash,
+        };
+
+        // The checked pass reaches full nodes only: the inv peer gets
+        // the immediate inventory, the headers peer the header itself.
+        peers.relay_block_announcement(&header, dcroxide_wire::ServiceFlag::NODE_NETWORK);
+        match rx_inv.try_recv().expect("full node receives the inv") {
+            Message::Inv(msg) => assert_eq!(msg.inv_list, vec![inv]),
+            other => panic!("expected inv, got {other:?}"),
+        }
+        match rx_hdr.try_recv().expect("headers peer receives headers") {
+            Message::Headers(msg) => assert_eq!(msg.headers, vec![header]),
+            other => panic!("expected headers, got {other:?}"),
+        }
+        assert!(
+            rx_lite.try_recv().is_err(),
+            "peer without the required services skipped"
+        );
+
+        // The accepted pass reaches everyone; the already-announced
+        // peers dedup through the announced-block toggle.
+        peers.relay_block_announcement(&header, dcroxide_wire::ServiceFlag(0));
+        assert!(rx_inv.try_recv().is_err(), "announced toggle suppresses");
+        assert!(rx_hdr.try_recv().is_err(), "announced toggle suppresses");
+        match rx_lite.try_recv().expect("light peer now receives the inv") {
+            Message::Inv(msg) => assert_eq!(msg.inv_list, vec![inv]),
+            other => panic!("expected inv, got {other:?}"),
+        }
+
+        // A third announcement of the same block toggles the marker
+        // back on: the inv peers dedup through known inventory while
+        // the headers path, which never records inventory, sends the
+        // headers again (dcrd's toggle semantics kept bug for bug).
+        peers.relay_block_announcement(&header, dcroxide_wire::ServiceFlag(0));
+        assert!(rx_inv.try_recv().is_err(), "known inventory dedups");
+        match rx_hdr.try_recv().expect("headers peer receives again") {
+            Message::Headers(msg) => assert_eq!(msg.headers, vec![header]),
+            other => panic!("expected headers, got {other:?}"),
+        }
+        assert!(rx_lite.try_recv().is_err(), "announced toggle suppresses");
     }
 }

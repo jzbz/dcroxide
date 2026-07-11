@@ -697,3 +697,193 @@ fn serves_mempool_requests_over_the_empty_pool() {
 
     runtime.shutdown();
 }
+
+/// A regnet daemon over dcrd's full-block battery announces connected
+/// blocks to its served peers: as an inventory by default, and as the
+/// header itself once the peer sends sendheaders (dcrd's
+/// `RelayBlockAnnouncement` from the accepted case, with unsynced
+/// mining allowed since the battery chain's timestamps are stale).
+#[test]
+fn announces_connected_blocks_to_served_peers() {
+    let params = dcroxide_chaincfg::regnet_params();
+    let net = params.net;
+
+    // The linear accepted main-chain prefix of the battery.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../dcroxide-blockchain/tests/data/fullblock_vectors.txt"
+    );
+    let data = std::fs::read_to_string(path).expect("fullblock vectors");
+    let mut tip = params.genesis_hash;
+    let mut blocks = Vec::new();
+    for line in data.lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        // accept <name> <mainchain> <orphan> <blockhex>
+        if f[0] != "accept" {
+            continue;
+        }
+        let (block, _) =
+            dcroxide_wire::MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4])).expect("block");
+        if f[2] != "true" || block.header.prev_block != tip {
+            continue;
+        }
+        tip = block.header.block_hash();
+        blocks.push(block);
+        if blocks.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(blocks.len(), 2, "battery must provide two blocks");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let opts = Options::new(dir.path().join("blocks"), net.0);
+    let db = Database::create(&opts).expect("create database");
+    let chain = Arc::new(Mutex::new(
+        Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
+    ));
+    let addr_manager = Arc::new(Mutex::new(dcroxide_addrmgr::AddrManager::new(dir.path())));
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
+    let sync_peers = dcroxide_node::dispatch::SyncPeers::new();
+    let server = Arc::new(ServerContext {
+        chain: Arc::clone(&chain),
+        min_known_work: params.min_known_chain_work,
+        disable_banning: false,
+        ban_threshold: 100,
+        whitelists: Vec::new(),
+        addr_manager,
+        sim_or_reg_net: true,
+        stake_validation_height: params.stake_validation_height,
+        blocks_only: false,
+        sync_manager: Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
+            Arc::clone(&chain),
+            &params,
+            false,
+            8,
+            1000,
+            Arc::clone(&tx_pool),
+        ))),
+        sync_peers: sync_peers.clone(),
+        next_peer_id: std::sync::atomic::AtomicI32::new(1),
+        outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
+        net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
+        disable_listen: false,
+        tx_pool: Arc::clone(&tx_pool),
+        ntfn: None,
+        recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
+    });
+
+    // The daemon's chain handler wiring: the callback queues the
+    // announcements and the sync chain drains them into the fan-out
+    // (unsynced mining allowed so the stale battery chain announces).
+    let handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
+        None,
+        params.clone(),
+        true,
+        Arc::clone(&tx_pool),
+        sync_peers.clone(),
+        dcroxide_node::dispatch::new_recently_advertised(),
+    );
+    {
+        let callback_handler = handler.clone();
+        chain
+            .lock()
+            .expect("chain")
+            .set_notification_callback(Box::new(move |n| callback_handler.handle(n)));
+    }
+    let mut sync_chain =
+        dcroxide_node::sync::NodeSyncChain::new(Arc::clone(&chain), params.clone());
+    sync_chain.set_chain_ntfn_handler(handler);
+
+    let template = PeerTemplate {
+        net,
+        protocol_version: 0,
+        services: ServiceFlag(1),
+        user_agent_name: "dcroxide".to_string(),
+        user_agent_version: "0.1.0".to_string(),
+        idle_timeout: Duration::from_secs(3600),
+        ping_interval: Duration::from_secs(3600),
+    };
+    let connected = ConnectedPeers::new();
+    let runtime = ListenerRuntime::start(
+        &[("tcp4", ":0".to_string())],
+        inbound_peer_handler(template, connected.clone(), Some(server)),
+    )
+    .expect("start serving runtime");
+    let port = runtime.bound_addrs()[0].port();
+
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, net);
+    let mut env = NodePeerEnv::new();
+    let mut globals = PeerGlobals::new();
+    let config = Config {
+        net,
+        protocol_version: 0,
+        ..Config::default()
+    };
+    let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+        .expect("negotiate");
+    transport
+        .write_message(&Message::VerAck)
+        .expect("send verack");
+    assert_eq!(
+        transport.read_message().expect("read verack"),
+        Message::VerAck
+    );
+
+    // A ping round trip guarantees the served peer is registered with
+    // the relay before the first block connects.
+    transport
+        .write_message(&Message::Ping(dcroxide_wire::MsgPing { nonce: 7 }))
+        .expect("send ping");
+    assert_eq!(
+        transport.read_message().expect("read pong"),
+        Message::Pong(dcroxide_wire::MsgPong { nonce: 7 })
+    );
+
+    // The first connected block announces as an inventory.
+    let fork_len = dcroxide_netsync::manager::SyncChain::process_block(&mut sync_chain, &blocks[0])
+        .expect("first block accepts");
+    assert_eq!(fork_len, 0);
+    match transport.read_message().expect("read announcement") {
+        Message::Inv(msg) => assert_eq!(
+            msg.inv_list,
+            vec![dcroxide_wire::InvVect {
+                inv_type: dcroxide_wire::InvType::BLOCK,
+                hash: blocks[0].header.block_hash(),
+            }]
+        ),
+        other => panic!("expected block inv, got {other:?}"),
+    }
+
+    // After sendheaders the next block announces as the header itself.
+    transport
+        .write_message(&Message::SendHeaders)
+        .expect("send sendheaders");
+    transport
+        .write_message(&Message::Ping(dcroxide_wire::MsgPing { nonce: 8 }))
+        .expect("send ping");
+    assert_eq!(
+        transport.read_message().expect("read pong"),
+        Message::Pong(dcroxide_wire::MsgPong { nonce: 8 })
+    );
+    dcroxide_netsync::manager::SyncChain::process_block(&mut sync_chain, &blocks[1])
+        .expect("second block accepts");
+    match transport.read_message().expect("read headers announcement") {
+        Message::Headers(msg) => assert_eq!(msg.headers, vec![blocks[1].header]),
+        other => panic!("expected headers, got {other:?}"),
+    }
+
+    runtime.shutdown();
+}

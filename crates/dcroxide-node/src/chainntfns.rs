@@ -14,11 +14,10 @@
 //! which is exactly the lock situation dcrd's handler runs under.
 //!
 //! The reorg-started and reorg-done events only feed dcrd's
-//! background template generator, and the early new-tip event only
-//! feeds its block relay; neither is wired yet, so both are ignored
-//! here.  The mix-observer refusal gate is likewise skipped until the
-//! mixpool arrives — without a pool there are no misbehaving mix
-//! inputs to refuse.
+//! background template generator, which is not wired yet, so both are
+//! ignored here.  The mix-observer refusal gate is likewise skipped
+//! until the mixpool arrives — without a pool there are no
+//! misbehaving mix inputs to refuse.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -54,6 +53,14 @@ pub struct ChainNtfnHandler {
     lottery_data_broadcast: Arc<Mutex<HashSet<Hash>>>,
     /// Gate-passing accepted blocks awaiting their lottery lookup.
     pending_winning_tickets: Arc<Mutex<Vec<(Hash, i64)>>>,
+    /// Early checked-block announcements awaiting their relay fan-out
+    /// (dcrd's `RelayBlockAnnouncement` send from the
+    /// NTNewTipBlockChecked case; the callback runs under the chain
+    /// mutex, so they queue for the post-processing drain).
+    pending_checked_announcements: Arc<Mutex<Vec<BlockHeader>>>,
+    /// Accepted-block announcements awaiting their gated relay
+    /// fan-out (the send at the end of dcrd's NTBlockAccepted case).
+    pending_accepted_announcements: Arc<Mutex<Vec<BlockHeader>>>,
     /// Connected and disconnected blocks awaiting their mempool
     /// maintenance.
     pending_block_events: Arc<Mutex<Vec<PendingBlockEvent>>>,
@@ -114,6 +121,8 @@ impl ChainNtfnHandler {
             allow_unsynced_mining,
             lottery_data_broadcast: Arc::default(),
             pending_winning_tickets: Arc::default(),
+            pending_checked_announcements: Arc::default(),
+            pending_accepted_announcements: Arc::default(),
             pending_block_events: Arc::default(),
             tx_pool,
             sync_peers,
@@ -157,9 +166,17 @@ impl ChainNtfnHandler {
     /// runs inside the chain's critical section and only queues.
     pub fn handle(&self, notification: &Notification<'_>) {
         match notification {
-            // The early new-tip event only feeds dcrd's block relay,
-            // which is not wired yet.
-            Notification::NewTipBlockChecked(_) => {}
+            // A block extending the current tip passed the sanity
+            // and contextual checks: relay it immediately to full
+            // nodes (dcrd's NTNewTipBlockChecked case calling
+            // `RelayBlockAnnouncement(block, SFNodeNetwork)`; the
+            // chain already gated the emission on being current).
+            Notification::NewTipBlockChecked(block) => {
+                self.pending_checked_announcements
+                    .lock()
+                    .expect("pending checked announcements")
+                    .push(block.header);
+            }
             Notification::BlockAccepted(data) => self.handle_block_accepted(data),
             Notification::BlockConnected(data) => {
                 if let Some(ntfn) = &self.ntfn {
@@ -213,36 +230,95 @@ impl ChainNtfnHandler {
         }
     }
 
-    /// Queue the winning-tickets lookup for an accepted block that
-    /// passes dcrd's announcement gate.  dcrd's first condition on
-    /// the whole case is the RPC server running (`s.rpcServer !=
-    /// nil`), so without one there is no lottery work and no
-    /// broadcast-set growth.
+    /// Queue the winning-tickets lookup and the block announcement
+    /// for an accepted block (dcrd's NTBlockAccepted case).  The
+    /// lottery work requires the RPC server (`s.rpcServer != nil` is
+    /// part of dcrd's winning-tickets conditions), so without one
+    /// there is no lookup and no broadcast-set growth; the relay to
+    /// the peers that were not already notified via the checked
+    /// announcement happens regardless.
     fn handle_block_accepted(&self, data: &BlockAcceptedNtfnsData<'_>) {
-        if self.ntfn.is_none() {
-            return;
-        }
-        if !should_notify_winning_tickets(
-            &self.params,
-            &data.block.header,
-            data.best_height,
-            data.fork_len,
-        ) {
-            return;
-        }
-        let block_hash = data.block.header.block_hash();
-        if self
-            .lottery_data_broadcast
-            .lock()
-            .expect("lottery broadcast set")
-            .contains(&block_hash)
+        if self.ntfn.is_some()
+            && should_notify_winning_tickets(
+                &self.params,
+                &data.block.header,
+                data.best_height,
+                data.fork_len,
+            )
         {
+            let block_hash = data.block.header.block_hash();
+            let already = self
+                .lottery_data_broadcast
+                .lock()
+                .expect("lottery broadcast set")
+                .contains(&block_hash);
+            if !already {
+                self.pending_winning_tickets
+                    .lock()
+                    .expect("pending winning tickets")
+                    .push((block_hash, i64::from(data.block.header.height)));
+            }
+        }
+
+        self.pending_accepted_announcements
+            .lock()
+            .expect("pending accepted announcements")
+            .push(data.block.header);
+    }
+
+    /// Fan the early checked-block announcements out to the full-node
+    /// peers now that the chain mutex is free (dcrd's
+    /// `RelayBlockAnnouncement(block, SFNodeNetwork)` from the
+    /// NTNewTipBlockChecked case; the chain gated the emission on
+    /// being current, so no further gate applies).  Runs before the
+    /// block-event drain so the wire order matches dcrd's single
+    /// relay queue.
+    pub fn drain_pending_checked_announcements(&self) {
+        let pending: Vec<BlockHeader> = core::mem::take(
+            &mut *self
+                .pending_checked_announcements
+                .lock()
+                .expect("pending checked announcements"),
+        );
+        for header in pending {
+            self.sync_peers
+                .relay_block_announcement(&header, dcroxide_wire::ServiceFlag::NODE_NETWORK);
+        }
+    }
+
+    /// Fan the accepted-block announcements out to every peer that
+    /// was not already notified via the checked announcement (the
+    /// send at the end of dcrd's NTBlockAccepted case).  dcrd's sync
+    /// gate applies: not relayed unless the chain is current or
+    /// unsynced mining is allowed.  Runs after the block-event drain
+    /// so the connect maintenance's transaction announcements keep
+    /// dcrd's wire order.
+    pub fn drain_pending_accepted_announcements(
+        &self,
+        chain: &Arc<Mutex<Chain>>,
+        adjusted_time_unix: i64,
+    ) {
+        let pending: Vec<BlockHeader> = core::mem::take(
+            &mut *self
+                .pending_accepted_announcements
+                .lock()
+                .expect("pending accepted announcements"),
+        );
+        if pending.is_empty() {
             return;
         }
-        self.pending_winning_tickets
-            .lock()
-            .expect("pending winning tickets")
-            .push((block_hash, i64::from(data.block.header.height)));
+        let is_current = self.allow_unsynced_mining
+            || chain
+                .lock()
+                .expect("chain mutex poisoned")
+                .is_current_at(adjusted_time_unix);
+        if !is_current {
+            return;
+        }
+        for header in pending {
+            self.sync_peers
+                .relay_block_announcement(&header, dcroxide_wire::ServiceFlag(0));
+        }
     }
 
     /// Run the queued lottery lookups now that the chain mutex is
@@ -607,5 +683,88 @@ mod tests {
             1_035_288,
             0
         ));
+    }
+
+    /// The announcement drain applies dcrd's sync gate: an accepted
+    /// block over a stale chain is not announced unless unsynced
+    /// mining is allowed, while the early checked announcement was
+    /// already gated at emission and always relays.
+    #[test]
+    fn the_announcement_drain_applies_dcrds_sync_gate() {
+        let params = dcroxide_chaincfg::testnet3_params();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opts = dcroxide_database::Options::new(dir.path().join("blocks"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create database");
+        let chain = Arc::new(Mutex::new(
+            dcroxide_blockchain::process::Chain::open(db, &params, params.assume_valid, false, 0)
+                .expect("open chain"),
+        ));
+        let tx_pool = crate::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            false,
+            100,
+            10000,
+            false,
+            false,
+        );
+        let genesis = chain
+            .lock()
+            .expect("chain")
+            .block_by_hash(&params.genesis_hash)
+            .expect("genesis block");
+        let now = 2_000_000_000i64; // far past the stale genesis tip
+
+        let drive = |allow_unsynced: bool| -> Vec<dcroxide_wire::Message> {
+            let peers = crate::dispatch::SyncPeers::new();
+            let (queue, rx) = crate::peerloop::OutboundQueue::channel();
+            peers.register(
+                1,
+                queue,
+                None,
+                Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
+                    crate::server::RelayPeerFacts {
+                        connected: true,
+                        services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+                        wants_headers: false,
+                        disable_relay_tx: false,
+                        protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+                    },
+                ))),
+            );
+            let handler = ChainNtfnHandler::new(
+                None,
+                params.clone(),
+                allow_unsynced,
+                Arc::clone(&tx_pool),
+                peers,
+                crate::dispatch::new_recently_advertised(),
+            );
+            handler.handle(&Notification::NewTipBlockChecked(&genesis));
+            handler.handle(&Notification::BlockAccepted(BlockAcceptedNtfnsData {
+                best_height: 0,
+                fork_len: 0,
+                block: &genesis,
+            }));
+            handler.drain_pending_checked_announcements();
+            handler.drain_pending_accepted_announcements(&chain, now);
+            let mut got = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                got.push(msg);
+            }
+            got
+        };
+
+        // Not current and unsynced mining not allowed: only the
+        // emission-gated checked announcement relays.
+        let gated = drive(false);
+        assert_eq!(gated.len(), 1, "checked announcement only: {gated:?}");
+
+        // Unsynced mining allowed: the accepted announcement relays
+        // too, deduped per peer by the announced-block toggle — the
+        // checked pass announced the same hash, so the accepted pass
+        // clears the marker and both passes produce one message.
+        let allowed = drive(true);
+        assert_eq!(allowed.len(), 1, "toggle dedups the second pass");
     }
 }
