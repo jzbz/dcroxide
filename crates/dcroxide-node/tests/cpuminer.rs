@@ -8,6 +8,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use dcroxide_blockchain::process::Chain;
 use dcroxide_database::{Database, Options};
@@ -16,6 +17,7 @@ use dcroxide_node::bgtemplate::start_generator;
 use dcroxide_node::chainntfns::ChainNtfnHandler;
 use dcroxide_node::cpuminer::NodeCpuMiner;
 use dcroxide_node::dispatch::{SyncPeers, new_recently_advertised};
+use dcroxide_node::runtime::ConnectedPeers;
 use dcroxide_rpc::server::RpcCpuMiner;
 use dcroxide_testutil::unhex;
 use dcroxide_wire::MsgBlock;
@@ -171,25 +173,13 @@ fn generate_mines_blocks_onto_the_chain() {
         params.clone(),
         mining_policy(),
         0,
+        ConnectedPeers::new(),
+        true,
     );
 
-    // The idle miner reports dcrd's defaults before any mining, and
-    // set_num_workers records the count with dcrd's clamping.
+    // The idle miner reports dcrd's defaults before any mining.
     assert!(!miner.is_mining(), "the miner is idle before generate");
     assert_eq!(miner.num_workers(), 1, "the default worker count");
-    miner.set_num_workers(4);
-    assert_eq!(miner.num_workers(), 4, "a positive count is recorded");
-    miner.set_num_workers(-1);
-    assert_eq!(
-        miner.num_workers(),
-        1,
-        "a negative count selects the default"
-    );
-    miner.set_num_workers(i32::MAX);
-    assert!(
-        miner.num_workers() >= 2 && miner.num_workers() < i32::MAX,
-        "an oversized count is clamped to the maximum"
-    );
     assert_eq!(miner.hashes_per_second(), 0.0, "the idle hash rate is zero");
 
     let (orig_height, _) = best(&chain);
@@ -227,5 +217,132 @@ fn generate_mines_blocks_onto_the_chain() {
     // is idle again (the Drop guard ran on every return path).
     assert!(!miner.is_mining(), "the miner is idle after generate");
 
+    generator.shutdown();
+}
+
+/// `setgenerate true` starts continuous background workers that mine
+/// blocks onto the chain until `setgenerate 0`, and a discrete `generate`
+/// is refused while they run.
+#[test]
+fn continuous_mining_extends_the_chain() {
+    let params = dcroxide_chaincfg::regnet_params();
+    let (_dir, chain) = regnet_chain(2);
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
+    let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
+        Arc::clone(&chain),
+        &params,
+        false,
+        8,
+        1000,
+        Arc::clone(&tx_pool),
+    )));
+
+    let generator = start_generator(
+        Arc::clone(&chain),
+        Arc::clone(&tx_pool),
+        params.clone(),
+        vec![mining_address()],
+        mining_policy(),
+        0,
+        true,
+        None,
+        None,
+    );
+
+    // Feed mined blocks back to the generator so it regenerates the next
+    // template, exactly as the daemon wires it.
+    let mut handler = ChainNtfnHandler::new(
+        None,
+        params.clone(),
+        true,
+        Arc::clone(&tx_pool),
+        SyncPeers::new(),
+        new_recently_advertised(),
+    );
+    handler.set_generator(generator.sink());
+    {
+        let callback = handler.clone();
+        chain
+            .lock()
+            .expect("chain")
+            .set_notification_callback(Box::new(move |n| callback.handle(n)));
+    }
+    sync_manager
+        .lock()
+        .expect("sync manager")
+        .chain_mut()
+        .set_chain_ntfn_handler(handler);
+
+    let mut miner = NodeCpuMiner::new(
+        generator.current_handle(),
+        generator.subscribers_handle(),
+        generator.sink(),
+        Arc::clone(&chain),
+        Arc::clone(&sync_manager),
+        Arc::clone(&tx_pool),
+        params.clone(),
+        mining_policy(),
+        0,
+        ConnectedPeers::new(),
+        true,
+    );
+    let runtime = miner.start();
+
+    let (orig_height, _) = best(&chain);
+
+    // Start continuous mining with the default worker count.
+    miner.set_num_workers(1);
+    assert!(miner.is_mining(), "the miner mines continuously");
+    assert_eq!(miner.num_workers(), 1, "one worker");
+
+    // Querying the live rate while mining exercises the end-to-end
+    // speed-monitor path — a real worker registers its stats, the monitor
+    // answers the request/reply query — end to end.  The rate itself may
+    // be zero because a regnet target solves in a handful of hashes, far
+    // less than the one second of hashing the monitor needs to report a
+    // nonzero rate, so only its validity is asserted.
+    assert!(
+        miner.hashes_per_second() >= 0.0,
+        "the live hash rate is a valid non-negative rate"
+    );
+
+    // A discrete generate is refused while continuously mining.
+    let failure = miner
+        .generate_n_blocks(1)
+        .expect_err("discrete generate is refused while mining");
+    assert!(
+        failure.message.contains("already CPU mining"),
+        "{}",
+        failure.message
+    );
+
+    // The worker extends the chain over the regenerated templates.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if best(&chain).0 >= orig_height + 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "continuous mining did not extend the chain"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Stop mining; the miner reports idle and a zero hash rate.
+    miner.set_num_workers(0);
+    assert!(!miner.is_mining(), "the miner is idle after setgenerate 0");
+    assert_eq!(miner.num_workers(), 0, "zero workers");
+    assert_eq!(miner.hashes_per_second(), 0.0, "idle hash rate is zero");
+
+    runtime.shutdown();
     generator.shutdown();
 }

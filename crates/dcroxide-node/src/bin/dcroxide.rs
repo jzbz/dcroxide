@@ -35,6 +35,7 @@ use dcroxide_node::{
     supported_subsystems, version,
 };
 use dcroxide_peer::{DEFAULT_IDLE_TIMEOUT, PING_INTERVAL};
+use dcroxide_rpc::server::RpcCpuMiner;
 use dcroxide_wire::ServiceFlag;
 
 const APP_NAME: &str = "dcroxide";
@@ -416,10 +417,38 @@ fn run(cfg: Config) -> ExitCode {
         .chain_mut()
         .set_chain_ntfn_handler(handler);
 
-    // The CPU miner's shutdown flag, flipped before the RPC listener
-    // stops so an in-flight `generate` exits promptly (dcrd cancels the
-    // miner's context on shutdown); `None` when no miner runs.
-    let mut cpu_miner_quit: Option<Arc<core::sync::atomic::AtomicBool>> = None;
+    // The CPU miner (dcrd `s.cpuMiner`), built and started whenever a
+    // block template generator runs — i.e. mining addresses are
+    // configured — so it can mine under `--norpc` too, exactly as dcrd
+    // runs `go s.cpuMiner.Run(ctx)` unconditionally in `newServer`.  The
+    // background threads start idle; `--generate` kicks off continuous
+    // mining with the default worker count (dcrd's `if cfg.Generate {
+    // SetNumWorkers(-1) }`).  The RPC-facing `NodeCpuMiner` moves into
+    // the RPC server config below; the `MinerRuntime` stays here to be
+    // shut down at the end.
+    let mut cpu_miner: Option<dcroxide_node::cpuminer::NodeCpuMiner> = None;
+    let mut miner_runtime: Option<dcroxide_node::cpuminer::MinerRuntime> = None;
+    if let Some(generator) = &generator {
+        let mut miner = dcroxide_node::cpuminer::NodeCpuMiner::new(
+            generator.current_handle(),
+            generator.subscribers_handle(),
+            generator.sink(),
+            Arc::clone(&chain),
+            Arc::clone(&server.sync_manager),
+            Arc::clone(&tx_pool),
+            cfg.params.params.clone(),
+            mining_policy.clone(),
+            cfg.mining_time_offset,
+            connected.clone(),
+            cfg.sim_net || cfg.reg_net,
+        );
+        let runtime = miner.start();
+        if cfg.generate {
+            miner.set_num_workers(-1);
+        }
+        cpu_miner = Some(miner);
+        miner_runtime = Some(runtime);
+    }
 
     // Serve the JSON-RPC endpoint (dcrd's RPC server): TLS over the
     // generated certificate pair by default, plain HTTP under the
@@ -490,27 +519,13 @@ fn run(cfg: Config) -> ExitCode {
                 cfg.mining_time_offset,
             )) as Box<dyn dcroxide_rpc::server::RpcBlockTemplater + Send>
         });
-        // The CPU miner over the running generator's templates and the
-        // block-submit seam (dcrd `s.cpuMiner`); the idle stand-in when
-        // no mining addresses are configured, so `generate` answers
-        // dcrd's "no payment addresses" error.
-        let cpu_miner: Box<dyn dcroxide_rpc::server::RpcCpuMiner + Send> = match generator.as_ref()
-        {
-            Some(generator) => {
-                let miner = dcroxide_node::cpuminer::NodeCpuMiner::new(
-                    generator.current_handle(),
-                    generator.subscribers_handle(),
-                    generator.sink(),
-                    Arc::clone(&chain),
-                    Arc::clone(&server.sync_manager),
-                    Arc::clone(&tx_pool),
-                    cfg.params.params.clone(),
-                    mining_policy.clone(),
-                    cfg.mining_time_offset,
-                );
-                cpu_miner_quit = Some(miner.quit_handle());
-                Box::new(miner)
-            }
+        // Hand the already-built CPU miner to the RPC server so
+        // `generate`/`setgenerate`/`getmininginfo` reach it (dcrd
+        // assigning `s.cpuMiner`); the idle stand-in when no mining
+        // addresses are configured, so `generate` answers dcrd's "no
+        // payment addresses" error.
+        let cpu_miner: Box<dyn dcroxide_rpc::server::RpcCpuMiner + Send> = match cpu_miner.take() {
+            Some(miner) => Box::new(miner),
             None => Box::new(dcroxide_node::rpcrun::IdleCpuMiner),
         };
         let mut rpc_srv = dcroxide_rpc::server::Server::new(rpc_config(
@@ -658,10 +673,11 @@ fn run(cfg: Config) -> ExitCode {
     // Stop seeding and dialing, stop the watchdog, disconnect the live
     // peers, and stop accepting new connections (dcrd's server
     // shutdown).
-    // Signal any in-flight `generate` to stop so it releases the RPC
-    // server before the listener is torn down.
-    if let Some(cpu_miner_quit) = &cpu_miner_quit {
-        cpu_miner_quit.store(true, core::sync::atomic::Ordering::Release);
+    // Signal the miner to stop hashing so any in-flight solve or
+    // `generate` winds down promptly and releases the RPC server before
+    // the listener is torn down.
+    if let Some(runtime) = &miner_runtime {
+        runtime.signal_quit();
     }
     if let Some((rpc_listener, ntfn, ntfn_thread)) = rpc_listener {
         rpc_listener.shutdown();
@@ -677,6 +693,13 @@ fn run(cfg: Config) -> ExitCode {
     stall_timer.shutdown();
     if let Some(rebroadcaster) = rebroadcaster {
         rebroadcaster.shutdown();
+    }
+    // Stop the miner's background threads before the generator so its
+    // workers deregister their template subscriptions first, and while
+    // the chain, sync manager, and database are still live for any
+    // in-flight block submission to complete.
+    if let Some(runtime) = miner_runtime {
+        runtime.shutdown();
     }
     if let Some(generator) = generator {
         generator.shutdown();
