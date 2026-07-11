@@ -306,11 +306,12 @@ impl ServeHooks for InboundHooks {
     fn on_connected(
         &mut self,
         peer: &mut Peer,
+        peer_handle: &Arc<Mutex<Peer>>,
         outbound: &OutboundQueue,
         remote_disable_relay_tx: bool,
     ) {
         if let InboundHooks::Server(handler) = self {
-            handler.on_connected(peer, outbound, remote_disable_relay_tx);
+            handler.on_connected(peer, peer_handle, outbound, remote_disable_relay_tx);
         }
     }
 

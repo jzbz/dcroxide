@@ -800,6 +800,10 @@ mod tests {
                         protocol_version: dcroxide_wire::PROTOCOL_VERSION,
                     },
                 ))),
+                Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
+                    dcroxide_peer::Config::default(),
+                ))),
+                None,
             );
             let handler = ChainNtfnHandler::new(
                 None,

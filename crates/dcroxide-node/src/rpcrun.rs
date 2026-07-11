@@ -483,13 +483,17 @@ impl RpcAddrManager for NodeRpcAddrManager {
 pub struct NodeRpcConnManager {
     connected: crate::runtime::ConnectedPeers,
     net_totals: Arc<crate::transport::NetByteTotals>,
+    /// The sync-manager peer registry, backing `getpeerinfo` (and the
+    /// relay fan-out).  Held at the top level, not inside the relay
+    /// option, so peer info is available even when the relay handles are
+    /// not attached.
+    sync_peers: crate::dispatch::SyncPeers,
     relay: Option<RpcRelaySinks>,
 }
 
 /// The relay handles the RPC connection manager drives when a
 /// submitted transaction should announce to the network.
 struct RpcRelaySinks {
-    sync_peers: crate::dispatch::SyncPeers,
     recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
     tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
     rebroadcast: crate::rebroadcast::RebroadcastSink,
@@ -505,12 +509,25 @@ impl NodeRpcConnManager {
         NodeRpcConnManager {
             connected,
             net_totals,
+            sync_peers: crate::dispatch::SyncPeers::default(),
             relay: None,
         }
     }
 
-    /// Attach the relay handles so submitted transactions announce to
-    /// the network (dcrd rpcConnManager's `RelayTransactions`).
+    /// Attach only the sync-manager peer registry that backs
+    /// `getpeerinfo`, without the transaction-relay handles.  The daemon
+    /// always installs both together through
+    /// [`with_relay`](Self::with_relay), so this exists solely to build
+    /// the peer-info seam in isolation for tests.
+    #[cfg(test)]
+    fn with_peer_registry(mut self, sync_peers: crate::dispatch::SyncPeers) -> NodeRpcConnManager {
+        self.sync_peers = sync_peers;
+        self
+    }
+
+    /// Attach the sync-manager peer registry (backing `getpeerinfo`) and
+    /// the relay handles so submitted transactions announce to the
+    /// network (dcrd rpcConnManager's `RelayTransactions`).
     pub fn with_relay(
         mut self,
         sync_peers: crate::dispatch::SyncPeers,
@@ -518,8 +535,8 @@ impl NodeRpcConnManager {
         tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
         rebroadcast: crate::rebroadcast::RebroadcastSink,
     ) -> NodeRpcConnManager {
+        self.sync_peers = sync_peers;
         self.relay = Some(RpcRelaySinks {
-            sync_peers,
             recently_advertised,
             tx_pool,
             rebroadcast,
@@ -531,6 +548,13 @@ impl NodeRpcConnManager {
 impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
     fn connected_count(&mut self) -> i32 {
         self.connected.len() as i32
+    }
+
+    /// Snapshot the live peers for `getpeerinfo` (dcrd
+    /// `rpcConnManager.ConnectedPeers`); the handler sorts by id and
+    /// flags the sync peer itself.
+    fn connected_peers(&mut self) -> Vec<dcroxide_rpc::server::RpcPeerInfo> {
+        self.sync_peers.connected_peer_infos()
     }
 
     /// Announce submitted transactions to the network (dcrd
@@ -551,8 +575,7 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
                     .expect("recently advertised poisoned")
                     .put(*hash, tx);
             }
-            relay
-                .sync_peers
+            self.sync_peers
                 .relay_inventory(&crate::server::RelayInvFacts {
                     inv_type: dcroxide_wire::InvType::TX,
                     inv_hash: *hash,
@@ -1192,4 +1215,58 @@ fn write_unauthorized<S: Write>(stream: &mut S) -> std::io::Result<()> {
     stream.write_all(header.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dcroxide_rpc::server::RpcConnManager;
+
+    /// The connection-manager adapter answers `getpeerinfo` from the
+    /// peer registry attached through the builder — proving both the
+    /// `sync_peers` wiring and the `connected_peers` delegation.
+    #[test]
+    fn connected_peers_reads_the_attached_peer_registry() {
+        let sync_peers = crate::dispatch::SyncPeers::new();
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        let peer = Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
+            dcroxide_peer::Config::default(),
+        )));
+        sync_peers.register(
+            5,
+            queue,
+            None,
+            Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
+                crate::server::RelayPeerFacts {
+                    connected: true,
+                    services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+                    wants_headers: false,
+                    disable_relay_tx: false,
+                    protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+                },
+            ))),
+            peer,
+            Some("10.0.0.1:9108".to_string()),
+        );
+
+        let mut manager = NodeRpcConnManager::new(
+            crate::runtime::ConnectedPeers::new(),
+            Arc::new(crate::transport::NetByteTotals::new()),
+        )
+        .with_peer_registry(sync_peers);
+
+        let infos = manager.connected_peers();
+        assert_eq!(infos.len(), 1, "the registered peer is reported");
+        assert_eq!(infos[0].id, 5, "the id is the registry key");
+        assert_eq!(infos[0].local_addr.as_deref(), Some("10.0.0.1:9108"));
+        assert!(!infos[0].tx_relay_disabled, "relay enabled per the facts");
+
+        // An empty (default) registry reports no peers rather than
+        // panicking, so getpeerinfo is safe before any peer connects.
+        let mut idle = NodeRpcConnManager::new(
+            crate::runtime::ConnectedPeers::new(),
+            Arc::new(crate::transport::NetByteTotals::new()),
+        );
+        assert!(idle.connected_peers().is_empty());
+    }
 }

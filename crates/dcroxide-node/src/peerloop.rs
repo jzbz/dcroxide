@@ -128,10 +128,15 @@ pub enum ServeSignal {
 /// the connection lives, and `DonePeer` on the way out.  A plain
 /// message closure satisfies this with no-op lifecycle hooks.
 pub trait ServeHooks {
-    /// The connection completed its handshake (dcrd `AddPeer`).
+    /// The connection completed its handshake (dcrd `AddPeer`).  The
+    /// shared `peer_handle` is the same `Arc<Mutex<Peer>>` both loops
+    /// run behind, handed over so the server can register it for live
+    /// stat snapshots (`getpeerinfo`) without ever locking it here — the
+    /// caller already holds the guard across this call.
     fn on_connected(
         &mut self,
         _peer: &mut Peer,
+        _peer_handle: &std::sync::Arc<std::sync::Mutex<Peer>>,
         _outbound: &OutboundQueue,
         _remote_disable_relay_tx: bool,
     ) {
@@ -365,6 +370,7 @@ where
     // lifecycle hook (dcrd `AddPeer` signalling the sync manager).
     hooks.on_connected(
         &mut peer.lock().expect("peer mutex poisoned"),
+        &peer,
         &outbound,
         remote_version.disable_relay_tx,
     );

@@ -178,12 +178,15 @@ impl OutboundGroups {
 /// manager's actions need: the outbound queue for sends and the socket
 /// for disconnects.
 /// A registered peer's handles: the outbound queue for sends, the
-/// socket for disconnects, and the relay state the inventory fan-out
-/// consults.
+/// socket for disconnects, the relay state the inventory fan-out
+/// consults, the shared peer for live stat snapshots (`getpeerinfo`),
+/// and the local connection address.
 struct SyncPeerHandles {
     outbound: OutboundQueue,
     socket: Option<TcpStream>,
     relay: Arc<Mutex<RelayPeerState>>,
+    peer: Arc<Mutex<Peer>>,
+    local_addr: Option<String>,
 }
 
 /// The per-peer relay state (dcrd's `serverPeer` fields the relay
@@ -197,6 +200,13 @@ pub struct RelayPeerState {
 }
 
 impl RelayPeerState {
+    /// Whether the peer disabled transaction relay in its version
+    /// message (dcrd's `serverPeer.disableRelayTx`, reported inverted as
+    /// `relaytxes` by `getpeerinfo`).
+    pub(crate) fn tx_relay_disabled(&self) -> bool {
+        self.facts.disable_relay_tx
+    }
+
     /// The relay state for a freshly handshaken peer.
     pub(crate) fn new(facts: crate::server::RelayPeerFacts) -> RelayPeerState {
         RelayPeerState {
@@ -226,12 +236,15 @@ impl SyncPeers {
         SyncPeers::default()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register(
         &self,
         id: i32,
         outbound: OutboundQueue,
         socket: Option<TcpStream>,
         relay: Arc<Mutex<RelayPeerState>>,
+        peer: Arc<Mutex<Peer>>,
+        local_addr: Option<String>,
     ) {
         self.inner
             .lock()
@@ -242,8 +255,100 @@ impl SyncPeers {
                     outbound,
                     socket,
                     relay,
+                    peer,
+                    local_addr,
                 },
             );
+    }
+
+    /// Snapshot every registered peer as an RPC peer-info record (dcrd's
+    /// `rpcConnManager.ConnectedPeers` over the server's `peerState`).
+    /// The registry lock is released before any peer or relay lock is
+    /// taken — the entries are cloned out under the map lock, then each
+    /// `Peer` and `RelayPeerState` is locked one at a time — so this
+    /// never nests the map lock inside a peer lock and cannot invert the
+    /// input thread's `Peer -> map -> relay` lock order; each per-peer
+    /// lock is held only for the lock-free stat snapshot.
+    pub(crate) fn connected_peer_infos(&self) -> Vec<dcroxide_rpc::server::RpcPeerInfo> {
+        #[allow(clippy::type_complexity)]
+        let entries: Vec<(
+            i32,
+            Arc<Mutex<Peer>>,
+            Arc<Mutex<RelayPeerState>>,
+            Option<String>,
+        )> = {
+            let registry = self.inner.lock().expect("sync peers mutex poisoned");
+            registry
+                .iter()
+                .map(|(id, handles)| {
+                    (
+                        *id,
+                        Arc::clone(&handles.peer),
+                        Arc::clone(&handles.relay),
+                        handles.local_addr.clone(),
+                    )
+                })
+                .collect()
+        };
+
+        entries
+            .into_iter()
+            .filter_map(|(id, peer, relay, local_addr)| {
+                // Skip a peer whose mutex is poisoned — its input thread
+                // panicked, so it is effectively dead — rather than
+                // propagating the poison and making every `getpeerinfo`
+                // call panic (caught as an internal error) forever.
+                let peer = peer.lock().ok()?;
+                let snap = peer.stats_snapshot();
+                // dcrd's `getpeerinfo` reports the version the peer
+                // advertised, not the negotiated (capped) one.
+                let advertised_version = peer.advertised_proto_ver();
+                drop(peer);
+                let tx_relay_disabled = relay
+                    .lock()
+                    .map(|relay| relay.tx_relay_disabled())
+                    .unwrap_or(false);
+                Some(dcroxide_rpc::server::RpcPeerInfo {
+                    // The id is the registry key (the sync manager's peer
+                    // id, the space `sync_peer_id` returns), not the
+                    // snapshot's id which the peer never assigns.
+                    id,
+                    addr: snap.addr,
+                    local_addr,
+                    services: snap.services.0,
+                    tx_relay_disabled,
+                    // The peer tracks these as unix nanoseconds; the RPC
+                    // result reports unix seconds.  They (and the byte
+                    // counters) read zero until per-peer send/receive
+                    // accounting is wired through the transport — a
+                    // documented divergence from dcrd, which updates the
+                    // peer's counters on every read and write.
+                    last_send_unix: snap.last_send_nanos / 1_000_000_000,
+                    last_recv_unix: snap.last_recv_nanos / 1_000_000_000,
+                    bytes_sent: snap.bytes_sent,
+                    bytes_recv: snap.bytes_recv,
+                    conn_time_unix: snap.connected_nanos / 1_000_000_000,
+                    time_offset: snap.time_offset,
+                    version: advertised_version,
+                    // `StatsSnap.version` is the user-agent string (dcrd's
+                    // `subver`).
+                    user_agent: snap.version,
+                    inbound: snap.inbound,
+                    starting_height: snap.starting_height,
+                    last_block: snap.last_block,
+                    // The live decaying ban score is not shared to the RPC
+                    // seam yet; a well-behaved peer scores zero (a
+                    // documented divergence from dcrd's `banScore.Int()`).
+                    ban_score: 0,
+                    last_ping_nonce: snap.last_ping_nonce,
+                    // The handler feeds this straight to `clock.since_nanos`,
+                    // so it stays in nanoseconds.
+                    last_ping_time_unix_nanos: snap.last_ping_time_nanos,
+                    last_ping_micros: snap.last_ping_micros,
+                    connected: true,
+                })
+            })
+            .collect()
     }
 
     /// Flip the peer's preference for header announcements (dcrd's
@@ -533,6 +638,7 @@ impl ServerPeerHandler {
     pub fn on_connected(
         &mut self,
         peer: &mut Peer,
+        peer_handle: &Arc<Mutex<Peer>>,
         outbound: &OutboundQueue,
         remote_disable_relay_tx: bool,
     ) {
@@ -595,9 +701,24 @@ impl ServerPeerHandler {
                 protocol_version: peer.protocol_version(),
             },
         )));
-        self.ctx
-            .sync_peers
-            .register(id, outbound.clone(), self.socket.take(), relay);
+        // Capture the local connection address before the socket is
+        // taken (getpeerinfo's `addrlocal`), and register the shared peer
+        // for live stat snapshots.  `peer_handle` is only cloned here,
+        // never locked: the caller already holds the peer guard across
+        // this call, so locking the same mutex would self-deadlock.
+        let local_addr = self
+            .socket
+            .as_ref()
+            .and_then(|socket| socket.local_addr().ok())
+            .map(|addr| addr.to_string());
+        self.ctx.sync_peers.register(
+            id,
+            outbound.clone(),
+            self.socket.take(),
+            relay,
+            Arc::clone(peer_handle),
+            local_addr,
+        );
         let actions = {
             let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
             manager.on_peer_connected(dcroxide_netsync::manager::Peer::new(
@@ -1197,6 +1318,14 @@ mod tests {
         }
     }
 
+    /// A shared inbound peer with no I/O, standing in for a live
+    /// connection's `Arc<Mutex<Peer>>` in the registry.
+    fn test_peer_handle() -> Arc<Mutex<Peer>> {
+        Arc::new(Mutex::new(Peer::new_inbound(
+            dcroxide_peer::Config::default(),
+        )))
+    }
+
     fn tx_inv(byte: u8) -> InvVect {
         InvVect {
             inv_type: InvType::TX,
@@ -1228,12 +1357,16 @@ mod tests {
             queue_a,
             None,
             Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+            test_peer_handle(),
+            None,
         );
         peers.register(
             2,
             queue_b,
             None,
             Arc::new(Mutex::new(RelayPeerState::new(relay_facts(true)))),
+            test_peer_handle(),
+            None,
         );
 
         // Relay reaches the relay-enabled peer only.
@@ -1254,6 +1387,84 @@ mod tests {
         peers.mark_known_inventory(1, echoed);
         peers.relay_inventory(&tx_relay_msg(&echoed));
         assert!(rx_a.try_recv().is_err(), "announced inventory not echoed");
+    }
+
+    /// `connected_peer_infos` snapshots each registered peer for
+    /// `getpeerinfo`: the id is the registry key (not the snapshot's
+    /// always-zero id), the nanosecond stat times fold to unix seconds,
+    /// the byte counters pass through, the local address is carried, and
+    /// tx-relay-disabled is read from the relay facts.
+    #[test]
+    fn connected_peer_infos_snapshots_registered_peers() {
+        let peers = SyncPeers::new();
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+
+        let handle = test_peer_handle();
+        {
+            let mut peer = handle.lock().expect("peer");
+            peer.record_send(1000, 5_000_000_000);
+            peer.record_recv(2000, 9_000_000_000);
+        }
+
+        // Register under a non-1 id to prove the id comes from the key,
+        // not the snapshot (whose id the peer never assigns).
+        peers.register(
+            42,
+            queue,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(true)))),
+            handle,
+            Some("127.0.0.1:9108".to_string()),
+        );
+
+        let infos = peers.connected_peer_infos();
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
+        assert_eq!(info.id, 42, "id is the registry key, not the snapshot's 0");
+        assert_eq!(info.local_addr.as_deref(), Some("127.0.0.1:9108"));
+        assert!(info.tx_relay_disabled, "read from the relay facts");
+        assert_eq!(info.bytes_sent, 1000);
+        assert_eq!(info.bytes_recv, 2000);
+        assert_eq!(info.last_send_unix, 5, "5e9 nanoseconds folds to 5 seconds");
+        assert_eq!(info.last_recv_unix, 9);
+        assert!(info.inbound, "a new_inbound peer");
+        assert!(info.connected);
+        assert_eq!(info.ban_score, 0, "documented v1 divergence");
+        // `version` is the numeric advertised protocol version (0 here,
+        // never negotiated), and `user_agent` is the version string — the
+        // two are not swapped.  A fresh peer's negotiated protocol version
+        // defaults nonzero, so a zero here proves the advertised field is
+        // the source.
+        assert_eq!(info.version, 0, "the advertised protocol version");
+        assert_eq!(info.user_agent, "", "the user-agent string");
+    }
+
+    /// A deregistered peer vanishes from `getpeerinfo`: the disconnect
+    /// path removes the whole registry entry, dropping its `Arc<Peer>` so
+    /// it is neither reported nor kept alive.
+    #[test]
+    fn deregister_removes_the_peer_from_connected_peer_infos() {
+        let peers = SyncPeers::new();
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        peers.register(
+            9,
+            queue,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+            test_peer_handle(),
+            None,
+        );
+        assert_eq!(
+            peers.connected_peer_infos().len(),
+            1,
+            "the peer is reported"
+        );
+
+        peers.deregister(9);
+        assert!(
+            peers.connected_peer_infos().is_empty(),
+            "a departed peer vanishes from getpeerinfo"
+        );
     }
 
     fn full_node_facts() -> crate::server::RelayPeerFacts {
@@ -1304,18 +1515,24 @@ mod tests {
             queue_inv,
             None,
             Arc::new(Mutex::new(RelayPeerState::new(full_node_facts()))),
+            test_peer_handle(),
+            None,
         );
         peers.register(
             2,
             queue_hdr,
             None,
             Arc::new(Mutex::new(RelayPeerState::new(full_node_facts()))),
+            test_peer_handle(),
+            None,
         );
         peers.register(
             3,
             queue_lite,
             None,
             Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+            test_peer_handle(),
+            None,
         );
         peers.set_wants_headers(2);
 
