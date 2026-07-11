@@ -853,7 +853,11 @@ fn rpc_config(
         proxy: cfg.proxy.clone(),
         test_net: cfg.test_net,
         runtime_version: String::new(),
-        cpu_miner: Box::new(()),
+        // The generating CPU miner arrives with a later piece; the idle
+        // stand-in reports not-mining so the getwork handler's mining
+        // gate allows work polling and submission (dcrd's miner is off
+        // by default).
+        cpu_miner: Box::new(dcroxide_node::rpcrun::IdleCpuMiner),
         mix_pooler: Box::new(()),
         profiler_mgr: Box::new(()),
         addr_manager: Box::new(()),

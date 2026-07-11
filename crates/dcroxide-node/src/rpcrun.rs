@@ -561,6 +561,66 @@ impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
         let filter = filter.lock().expect("recently confirmed filter poisoned");
         filter.contains(&hash.0)
     }
+
+    /// Process a locally-submitted block (from `submitblock` or the
+    /// getwork solution branch) through the same path as blocks
+    /// received from peers, relaying it and pruning the mempool on
+    /// acceptance (dcrd rpcSyncMgr's `SubmitBlock`, which calls
+    /// `syncManager.ProcessBlock`; the relay and prune run inside the
+    /// manager's block processing exactly as for a network block).
+    fn submit_block(
+        &mut self,
+        block: &MsgBlock,
+    ) -> Result<(), dcroxide_rpc::server::SubmitBlockFailure> {
+        self.sync_manager
+            .lock()
+            .expect("sync manager poisoned")
+            .process_block(block)
+            .map_err(|err| dcroxide_rpc::server::SubmitBlockFailure {
+                // Every block-processing failure here classifies as a
+                // rule error: the ported `Chain::process_block` only
+                // ever surfaces `RuleError`s (database and assertion
+                // faults panic per the project's decision-core
+                // convention), and dcrd's `ErrDuplicateBlock` is itself
+                // a `blockchain.RuleError`, so dcrd's non-rule
+                // internal-error branch (the getwork-submission split)
+                // is unreachable and `submitblock` never wrongly reports
+                // an internal error where dcrd would `rejected: ...`.
+                // The message is the first rule error's text, matching
+                // dcrd for the common single-error rejection; the rare
+                // block that both fails acceptance and whose ensuing
+                // reorganization also errors would render dcrd's nested
+                // `MultiError` text — a divergence deferred with the
+                // blockchain layer's error surface.
+                is_rule_error: true,
+                message: err.message,
+            })
+    }
+}
+
+/// A CPU miner that never runs, so the getwork handler's mining gate
+/// allows work polling and `getmininginfo`/`gethashespersec` answer the
+/// idle values dcrd reports when the miner is off (dcrd's CPU miner is
+/// off by default; the generating miner behind `generate`/`setgenerate`
+/// arrives with a later piece).
+pub struct IdleCpuMiner;
+
+impl dcroxide_rpc::server::RpcCpuMiner for IdleCpuMiner {
+    fn is_mining(&mut self) -> bool {
+        false
+    }
+
+    /// Zero while the miner is off (dcrd `cpuminer.HashesPerSecond`
+    /// returns 0 when not normal-mining).
+    fn hashes_per_second(&mut self) -> f64 {
+        0.0
+    }
+
+    /// dcrd's `cpuminer.NumWorkers` returns the configured worker count
+    /// even while idle, which defaults to `defaultNumWorkers` (1).
+    fn num_workers(&mut self) -> i32 {
+        1
+    }
 }
 
 /// The current unix time for the chain's is-current resolution (dcrd's

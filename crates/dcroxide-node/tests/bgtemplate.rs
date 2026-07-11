@@ -21,13 +21,11 @@ use dcroxide_database::{Database, Options};
 use dcroxide_mining::MiningPolicy;
 use dcroxide_node::bgtemplate::{NodeRpcBlockTemplater, start_generator};
 use dcroxide_node::rpcrun::{
-    NodeRpcChain, NodeRpcConnManager, NodeRpcSyncManager, start_rpc_listener,
+    IdleCpuMiner, NodeRpcChain, NodeRpcConnManager, NodeRpcSyncManager, start_rpc_listener,
 };
 use dcroxide_node::runtime::ConnectedPeers;
 use dcroxide_rpc::helpers::NoInterfaces;
-use dcroxide_rpc::server::{
-    Config, RpcBlockTemplater, RpcCpuMiner, RpcSubsidyParams, Server, TemplateRecv,
-};
+use dcroxide_rpc::server::{Config, RpcBlockTemplater, RpcSubsidyParams, Server, TemplateRecv};
 use dcroxide_standalone::SubsidyCache;
 use dcroxide_testutil::unhex;
 use dcroxide_wire::{MsgBlock, PROTOCOL_VERSION};
@@ -85,15 +83,6 @@ fn regnet_chain(history: usize) -> (tempfile::TempDir, Arc<Mutex<Chain>>) {
         assert!(errs.is_empty(), "history block must accept: {errs:?}");
     }
     (dir, chain)
-}
-
-/// A CPU miner that is never running, so getwork polling is allowed
-/// (dcrd's default off CPU miner).
-struct IdleCpuMiner;
-impl RpcCpuMiner for IdleCpuMiner {
-    fn is_mining(&mut self) -> bool {
-        false
-    }
 }
 
 /// A regnet premine pay-to-pubkey-hash payout used as the mining
