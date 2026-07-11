@@ -35,12 +35,110 @@ const DEFAULT_MAXIMUM_VOTE_AGE: u16 = 1440;
 /// The daemon's concrete pool over the live chain.
 pub type NodeTxPool = TxPool<NodePoolChain>;
 
-/// The current unix time (dcrd's direct `time.Now()` calls).
-fn now_unix() -> i64 {
+/// The current unix time (dcrd's direct `time.Now()` calls; also the
+/// wall clock standing in for dcrd's median-adjusted time source
+/// until network time samples are collected).
+pub(crate) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// The unspent view for the transaction's inputs and its own outputs
+/// from the tip's point of view (dcrd `BlockChain.FetchUtxoView`,
+/// which dcrd wires into both its mempool and mining configs; the
+/// pool trait's `tree_valid` and the template trait's
+/// `include_regular_txns` are the same flag).  When the flag is
+/// unset, the tip's regular tree is disconnected from the view first.
+/// Spent entries stay in the view like the cache hands them out; the
+/// consumers' checks filter them.
+pub(crate) fn chain_fetch_utxo_view(
+    chain: &Chain,
+    params: &Params,
+    tx: &MsgTx,
+    tx_hash: &Hash,
+    tree: i8,
+    include_regular_txns: bool,
+) -> Result<UtxoView, String> {
+    let best = chain.best_snapshot().clone();
+    let mut view = UtxoView::new();
+    view.set_best_hash(best.hash);
+    if best.height == 0 {
+        return Ok(view);
+    }
+
+    if !include_regular_txns {
+        // Disconnect the disapproved regular tree of the tip block
+        // (dcrd `disconnectDisapprovedBlock`; the memoized
+        // disapproved-view cache is an optimization dcrd layers on
+        // top and is not reproduced).
+        let is_treasury_enabled = chain
+            .is_treasury_agenda_active(&best.hash, params)
+            .map_err(|e| e.description)?;
+        let tip_block = chain
+            .block_by_hash(&best.hash)
+            .ok_or_else(|| format!("no block data for tip {}", best.hash))?;
+        let stxos = chain.fetch_spend_journal(&tip_block, is_treasury_enabled);
+        view.disconnect_disapproved_block(
+            &tip_block,
+            &stxos,
+            &|op: &OutPoint| chain.fetch_utxo_entry(op),
+            is_treasury_enabled,
+        )
+        .map_err(|e| e.description)?;
+    }
+
+    // The transaction's own outputs (for duplicate detection), then
+    // its inputs; outpoints the chain does not know stay absent from
+    // the view.
+    for tx_out_idx in 0..tx.tx_out.len() {
+        let op = OutPoint {
+            hash: *tx_hash,
+            index: tx_out_idx as u32,
+            tree,
+        };
+        if view.lookup_entry(&op).is_none()
+            && let Some(entry) = chain.fetch_utxo_entry(&op)
+        {
+            view.insert_entry(&op, entry);
+        }
+    }
+    for tx_in in &tx.tx_in {
+        let op = tx_in.previous_out_point;
+        if view.lookup_entry(&op).is_none()
+            && let Some(entry) = chain.fetch_utxo_entry(&op)
+        {
+            view.insert_entry(&op, entry);
+        }
+    }
+    Ok(view)
+}
+
+/// The script verification flags for the next block (dcrd
+/// `standardScriptVerifyFlags`, shared by the mempool and mining
+/// configs): the base policy flags plus SHA256 under the LN features
+/// agenda and the treasury opcodes under the treasury agenda, both
+/// evaluated at the current tip.
+pub(crate) fn chain_standard_verify_flags(
+    chain: &Chain,
+    params: &Params,
+) -> Result<ScriptFlags, String> {
+    let tip_hash = chain.best_snapshot().hash;
+    let mut flags = dcroxide_mempool::BASE_STANDARD_VERIFY_FLAGS;
+    if chain
+        .is_ln_features_agenda_active(&tip_hash, params)
+        .map_err(|e| e.description)?
+    {
+        flags = ScriptFlags(flags.0 | ScriptFlags::VERIFY_SHA256.0);
+    }
+    if chain
+        .is_treasury_agenda_active(&tip_hash, params)
+        .map_err(|e| e.description)?
+    {
+        flags = ScriptFlags(flags.0 | ScriptFlags::VERIFY_TREASURY.0);
+    }
+    Ok(flags)
 }
 
 /// The chain backend for the pool over the shared chain (dcrd's
@@ -67,11 +165,9 @@ impl PoolChain for NodePoolChain {
     }
 
     /// The unspent view for the transaction's inputs and its own
-    /// outputs from the tip's point of view (dcrd
-    /// `BlockChain.FetchUtxoView`).  When the pool's votes disapprove
-    /// the tip's regular tree, that tree is disconnected from the view
-    /// first.  Spent entries stay in the view like the cache hands
-    /// them out; the pool's checks filter them.
+    /// outputs from the tip's point of view
+    /// ([`chain_fetch_utxo_view`]; the pool's votes disapproving the
+    /// tip's regular tree is the unset flag).
     fn fetch_utxo_view(
         &self,
         tx: &MsgTx,
@@ -79,59 +175,7 @@ impl PoolChain for NodePoolChain {
         tree: i8,
         tree_valid: bool,
     ) -> Result<UtxoView, String> {
-        let chain = self.locked();
-        let best = chain.best_snapshot().clone();
-        let mut view = UtxoView::new();
-        view.set_best_hash(best.hash);
-        if best.height == 0 {
-            return Ok(view);
-        }
-
-        if !tree_valid {
-            // Disconnect the disapproved regular tree of the tip
-            // block (dcrd `disconnectDisapprovedBlock`; the memoized
-            // disapproved-view cache is an optimization dcrd layers on
-            // top and is not reproduced).
-            let is_treasury_enabled = chain
-                .is_treasury_agenda_active(&best.hash, &self.params)
-                .map_err(|e| e.description)?;
-            let tip_block = chain
-                .block_by_hash(&best.hash)
-                .ok_or_else(|| format!("no block data for tip {}", best.hash))?;
-            let stxos = chain.fetch_spend_journal(&tip_block, is_treasury_enabled);
-            view.disconnect_disapproved_block(
-                &tip_block,
-                &stxos,
-                &|op: &OutPoint| chain.fetch_utxo_entry(op),
-                is_treasury_enabled,
-            )
-            .map_err(|e| e.description)?;
-        }
-
-        // The transaction's own outputs (for duplicate detection),
-        // then its inputs; outpoints the chain does not know stay
-        // absent from the view.
-        for tx_out_idx in 0..tx.tx_out.len() {
-            let op = OutPoint {
-                hash: *tx_hash,
-                index: tx_out_idx as u32,
-                tree,
-            };
-            if view.lookup_entry(&op).is_none()
-                && let Some(entry) = chain.fetch_utxo_entry(&op)
-            {
-                view.insert_entry(&op, entry);
-            }
-        }
-        for tx_in in &tx.tx_in {
-            let op = tx_in.previous_out_point;
-            if view.lookup_entry(&op).is_none()
-                && let Some(entry) = chain.fetch_utxo_entry(&op)
-            {
-                view.insert_entry(&op, entry);
-            }
-        }
-        Ok(view)
+        chain_fetch_utxo_view(&self.locked(), &self.params, tx, tx_hash, tree, tree_valid)
     }
 
     fn best_hash(&self) -> Hash {
@@ -222,27 +266,10 @@ impl PoolChain for NodePoolChain {
         chain.check_tspend_exists(tip, tspend)
     }
 
-    /// The script verification flags for standardness (dcrd
-    /// `standardScriptVerifyFlags`): the base policy flags plus SHA256
-    /// under the LN features agenda and the treasury opcodes under the
-    /// treasury agenda, both evaluated at the current tip.
+    /// The script verification flags for standardness
+    /// ([`chain_standard_verify_flags`]).
     fn standard_verify_flags(&self) -> Result<ScriptFlags, String> {
-        let chain = self.locked();
-        let tip_hash = chain.best_snapshot().hash;
-        let mut flags = dcroxide_mempool::BASE_STANDARD_VERIFY_FLAGS;
-        if chain
-            .is_ln_features_agenda_active(&tip_hash, &self.params)
-            .map_err(|e| e.description)?
-        {
-            flags = ScriptFlags(flags.0 | ScriptFlags::VERIFY_SHA256.0);
-        }
-        if chain
-            .is_treasury_agenda_active(&tip_hash, &self.params)
-            .map_err(|e| e.description)?
-        {
-            flags = ScriptFlags(flags.0 | ScriptFlags::VERIFY_TREASURY.0);
-        }
-        Ok(flags)
+        chain_standard_verify_flags(&self.locked(), &self.params)
     }
 
     fn now_unix(&self) -> i64 {

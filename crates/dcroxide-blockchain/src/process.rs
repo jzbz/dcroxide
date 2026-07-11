@@ -2785,6 +2785,88 @@ impl Chain {
         .map(|_| ())
     }
 
+    /// Load utxo details from the point of view of just having
+    /// connected the given block, which must be a block template that
+    /// connects to the parent of the current tip of the main chain
+    /// (dcrd `FetchUtxoViewParentTemplate`).  dcrd's rule errors
+    /// (`ErrInvalidTemplateParent`) surface here as their message
+    /// strings, matching the mining seam that consumes them.
+    pub fn fetch_utxo_view_parent_template(
+        &self,
+        block: &MsgBlock,
+        params: &Params,
+    ) -> Result<UtxoView, String> {
+        // The block template must build off the parent of the current
+        // tip of the main chain.
+        let tip = self.best_chain.tip().expect("best chain tip");
+        let tip_hash = self.store.node(tip).hash;
+        let Some(tip_parent) = self.store.node(tip).parent else {
+            return Err(format!(
+                "unable to fetch utxos for non-existent parent of the current tip {tip_hash}"
+            ));
+        };
+        let tip_parent_hash = self.store.node(tip_parent).hash;
+        let parent_hash = block.header.prev_block;
+        if parent_hash != tip_parent_hash {
+            return Err(format!(
+                "previous block must be the parent of the current chain tip {tip_parent_hash}, \
+                 but got {parent_hash}"
+            ));
+        }
+
+        // Since the block template is building on the parent of the
+        // current tip, undo the transactions and spend information
+        // for the tip block to reach the point of view of the block
+        // template.
+        let mut view = UtxoView::new();
+        view.set_best_hash(tip_hash);
+        let tip_block = self.block_by_node(tip).clone();
+        let parent = self.block_by_node(tip_parent).clone();
+
+        // Determine if the treasury agenda is active.
+        let is_treasury_enabled = self
+            .is_treasury_agenda_active(&tip_parent_hash, params)
+            .map_err(|e| e.description)?;
+
+        // Load all of the spent txos for the tip block from the spend
+        // journal, then update the view to unspend all of them and
+        // remove the utxos created by the tip block.  Also, if the
+        // block votes against its parent, reconnect all of the
+        // regular transactions.
+        let stxos = self.fetch_spend_journal(&tip_block, is_treasury_enabled);
+        view.disconnect_block(
+            &tip_block,
+            &parent,
+            &stxos,
+            &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
+            is_treasury_enabled,
+        )
+        .map_err(|e| e.description)?;
+
+        // The view is now from the point of view of the parent of the
+        // current tip block.  However, calculating the commitment
+        // root requires the view to include outputs created in the
+        // candidate block, so update the view to mark all utxos
+        // referenced by the block as spent and add all transactions
+        // being created by the block to it.  In the case the block
+        // votes against the parent, also disconnect all of the
+        // regular transactions in the parent block (dcrd passes nil
+        // stxos to collect here; the parent journal feeds the
+        // disapproval handling this port hoists to the caller).
+        let parent_stxos = self.fetch_spend_journal(&parent, is_treasury_enabled);
+        view.connect_block(
+            block,
+            &parent,
+            &parent_stxos,
+            &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
+            None,
+            is_treasury_enabled,
+        )
+        .map_err(|e| e.description)?;
+
+        Ok(view)
+    }
+
     /// Ensure extending the provided block with one containing the
     /// specified number of ticket purchases cannot make the chain
     /// unrecoverable through ticket exhaustion (dcrd
@@ -3108,6 +3190,48 @@ impl Chain {
         Ok(result)
     }
 
+    /// The expected stake version for the block AFTER the given block
+    /// hash (dcrd `CalcStakeVersionByHash`): the last prior valid
+    /// majority stake version, walking back one interval at a time.
+    pub fn calc_stake_version_by_hash(&self, hash: &Hash, params: &Params) -> Result<u32, String> {
+        let node = self.lookup_validatable(hash).map_err(|e| e.description)?;
+        let view = NodeBranchView {
+            store: &self.store,
+            tip: node,
+        };
+        let height = self.store.node(node).height;
+        Ok(crate::stakever::calc_stake_version(
+            &crate::sequencelock::AsVersionView(&view),
+            height,
+            params,
+        ))
+    }
+
+    /// The required proof of work difficulty for the block AFTER the
+    /// given block hash, based on the active difficulty retarget
+    /// rules (dcrd `CalcNextRequiredDifficulty`).
+    pub fn calc_next_required_difficulty_by_hash(
+        &self,
+        hash: &Hash,
+        new_block_time_unix: i64,
+        params: &Params,
+    ) -> Result<u32, String> {
+        let node = self.lookup_validatable(hash).map_err(|e| e.description)?;
+        let view = NodeBranchView {
+            store: &self.store,
+            tip: node,
+        };
+        let prev_node = crate::difficulty::ChainView::node(&view, self.store.node(node).height)
+            .expect("node at its own height");
+        crate::agendas::calc_next_required_difficulty(
+            &view,
+            &prev_node,
+            new_block_time_unix,
+            params,
+        )
+        .map_err(|_| String::from("deployment ID blake3pow does not exist"))
+    }
+
     /// The rule change threshold state of the given deployment for the
     /// block AFTER the given block hash (dcrd `NextThresholdState`).
     pub fn next_threshold_state(
@@ -3283,6 +3407,21 @@ impl Chain {
         params: &Params,
     ) -> Result<bool, RuleError> {
         self.is_agenda_active_by_hash(prev_hash, crate::agendas::VOTE_ID_LN_FEATURES, params)
+    }
+
+    /// Whether the DCP0005 header commitments agenda is active for
+    /// the block AFTER the given block (dcrd
+    /// `BlockChain.IsHeaderCommitmentsAgendaActive`).
+    pub fn is_header_commitments_agenda_active(
+        &self,
+        prev_hash: &Hash,
+        params: &Params,
+    ) -> Result<bool, RuleError> {
+        self.is_agenda_active_by_hash(
+            prev_hash,
+            crate::agendas::VOTE_ID_HEADER_COMMITMENTS,
+            params,
+        )
     }
 
     /// The height at which the given deployment last changed state as

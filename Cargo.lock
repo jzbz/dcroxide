@@ -533,6 +533,7 @@ dependencies = [
  "dcroxide-dcrjson",
  "dcroxide-indexers",
  "dcroxide-mempool",
+ "dcroxide-mining",
  "dcroxide-netsync",
  "dcroxide-peer",
  "dcroxide-rpc",
