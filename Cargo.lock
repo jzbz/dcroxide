@@ -531,6 +531,7 @@ dependencies = [
  "dcroxide-containers",
  "dcroxide-database",
  "dcroxide-dcrjson",
+ "dcroxide-fees",
  "dcroxide-indexers",
  "dcroxide-mempool",
  "dcroxide-mining",

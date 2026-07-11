@@ -247,6 +247,19 @@ fn run(cfg: Config) -> ExitCode {
         cfg.allow_old_votes,
         !cfg.mining_addrs.is_empty(),
     );
+    // The shared fee estimator dcrd always builds in `newServer` and
+    // hands to both the mempool (fed as transactions enter and leave)
+    // and the RPC server (read by estimatesmartfee).  It starts
+    // disabled until the first accepted block and empty each run — the
+    // on-disk statistics store is deferred in the port.
+    let fee_estimator = dcroxide_node::fees::new_shared_estimator(cfg.min_relay_tx_fee_atoms)
+        .expect("build the fee estimator");
+    tx_pool
+        .lock()
+        .expect("tx pool mutex poisoned")
+        .set_fee_estimator(Box::new(dcroxide_node::fees::NodeFeeEstimatorSink::new(
+            Arc::clone(&fee_estimator),
+        )));
     // The pool records every added unconfirmed transaction's
     // addresses in the exists address index when it is enabled
     // (dcrd's mempool config carrying `ExistsAddrIndex`).
@@ -334,6 +347,10 @@ fn run(cfg: Config) -> ExitCode {
     if let Some(rebroadcaster) = &rebroadcaster {
         handler.set_rebroadcast(rebroadcaster.sink());
     }
+    // Every connected block feeds the fee estimator, and the first
+    // accepted block enables it (dcrd's `s.feeEstimator` driven from
+    // the chain notifications, run whether or not the RPC server does).
+    handler.set_fee_estimator(Arc::clone(&fee_estimator));
 
     // Run the background block template generator when mining addresses
     // are configured (dcrd only constructs `s.bg` and serves getwork
@@ -485,6 +502,7 @@ fn run(cfg: Config) -> ExitCode {
             exists_addresser,
             db.clone(),
             block_templater,
+            Arc::clone(&fee_estimator),
         ));
         // Install the websocket notification manager (dcrd's
         // wsNotificationManager) and start its delivery thread over
@@ -792,6 +810,7 @@ fn rpc_config(
     exists_addresser: Option<Box<dyn dcroxide_rpc::server::RpcExistsAddresser + Send>>,
     db: Database,
     block_templater: Option<Box<dyn dcroxide_rpc::server::RpcBlockTemplater + Send>>,
+    fee_estimator: dcroxide_node::fees::SharedFeeEstimator,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
     dcroxide_rpc::server::Config {
@@ -827,7 +846,7 @@ fn rpc_config(
         filterer_v2: Box::new(()),
         exists_addresser,
         log_manager: Box::new(()),
-        fee_estimator: Box::new(()),
+        fee_estimator: Box::new(dcroxide_node::fees::NodeRpcFeeEstimator::new(fee_estimator)),
         block_templater,
         sanity_checker: Box::new(()),
         time_source: Box::new(dcroxide_node::rpcrun::SystemTimeSource),

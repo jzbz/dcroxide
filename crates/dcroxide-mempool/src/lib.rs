@@ -24,6 +24,6 @@ pub use policy::{
     check_transaction_standard, is_dust,
 };
 pub use pool::{
-    MEMPOOL_MAX_CONCURRENT_TSPENDS, Policy, PoolChain, PoolSubsidyParams, Tag, TxDesc, TxPool,
-    UNMINED_HEIGHT, UnconfirmedAddrIndexer, VoteDesc, VoteReceiver,
+    FeeEstimatorSink, MEMPOOL_MAX_CONCURRENT_TSPENDS, Policy, PoolChain, PoolSubsidyParams, Tag,
+    TxDesc, TxPool, UNMINED_HEIGHT, UnconfirmedAddrIndexer, VoteDesc, VoteReceiver,
 };

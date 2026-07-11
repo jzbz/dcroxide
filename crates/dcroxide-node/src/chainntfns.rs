@@ -88,6 +88,11 @@ pub struct ChainNtfnHandler {
     /// mining addresses are configured (dcrd's chain events driving
     /// `s.bg`, present whenever the generator runs).
     generator: Option<crate::bgtemplate::GeneratorSink>,
+    /// The shared fee estimator, fed the connected block's transactions
+    /// and enabled at the first accepted block (dcrd's `s.feeEstimator`
+    /// driven from the NTBlockConnected and NTBlockAccepted cases).
+    /// Always `Some` on the daemon; `None` in tests that skip it.
+    fee_estimator: Option<crate::fees::SharedFeeEstimator>,
 }
 
 /// A block event awaiting its mempool maintenance (dcrd's handler
@@ -136,6 +141,7 @@ impl ChainNtfnHandler {
             recently_confirmed: None,
             rebroadcast: None,
             generator: None,
+            fee_estimator: None,
         }
     }
 
@@ -164,6 +170,14 @@ impl ChainNtfnHandler {
     /// the chain callback.
     pub fn set_generator(&mut self, sink: crate::bgtemplate::GeneratorSink) {
         self.generator = Some(sink);
+    }
+
+    /// Feed connected blocks into the shared fee estimator and enable
+    /// it at the first accepted block (dcrd's `s.feeEstimator` driven
+    /// from the chain notifications).  Must be set before the handler
+    /// is cloned into the chain callback.
+    pub fn set_fee_estimator(&mut self, estimator: crate::fees::SharedFeeEstimator) {
+        self.fee_estimator = Some(estimator);
     }
 
     /// Feed the drained block events into the given index subscriber
@@ -350,9 +364,20 @@ impl ChainNtfnHandler {
         if !is_current {
             return;
         }
+        // dcrd enables the fee estimator at the height of the first
+        // accepted block here — the last statement of the same
+        // is-current-gated NTBlockAccepted case, right after
+        // `RelayBlockAnnouncement` — so fee estimation only begins once
+        // the initial sync has completed and never records mempool
+        // transactions at a mid-sync height (dcrd's `if !s.feeEstimator
+        // .IsEnabled() { s.feeEstimator.Enable(block.Height()) }`).
+        let enable_height = pending.first().map(|header| i64::from(header.height));
         for header in pending {
             self.sync_peers
                 .relay_block_announcement(&header, dcroxide_wire::ServiceFlag(0));
+        }
+        if let (Some(estimator), Some(height)) = (&self.fee_estimator, enable_height) {
+            crate::fees::enable_at_height(estimator, height);
         }
     }
 
@@ -503,6 +528,15 @@ impl ChainNtfnHandler {
         parent: &dcroxide_wire::MsgBlock,
         check_tx_flags: AgendaFlags,
     ) {
+        // Feed the connected block into the fee estimator before the
+        // mempool removal.  dcrd runs `ProcessBlock` first because the
+        // mempool removals below alert the estimator, and if they ran
+        // first the estimator would see these transactions leave the
+        // pool without ever having been mined.
+        if let Some(estimator) = &self.fee_estimator {
+            crate::fees::process_connected_block(estimator, block);
+        }
+
         let is_treasury_enabled = check_tx_flags.is_treasury_enabled();
         let regular = block.transactions.get(1..).unwrap_or(&[]);
         let stake = if is_treasury_enabled {
@@ -801,5 +835,67 @@ mod tests {
         // clears the marker and both passes produce one message.
         let allowed = drive(true);
         assert_eq!(allowed.len(), 1, "toggle dedups the second pass");
+    }
+
+    /// The fee estimator's enable rides the same sync gate: dcrd only
+    /// runs `Enable(block.Height())` inside the is-current-gated
+    /// NTBlockAccepted case, so an accepted block over a stale chain
+    /// leaves the estimator disabled unless unsynced mining is allowed.
+    #[test]
+    fn the_fee_estimator_enable_honors_the_sync_gate() {
+        let params = dcroxide_chaincfg::testnet3_params();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opts = dcroxide_database::Options::new(dir.path().join("blocks"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create database");
+        let chain = Arc::new(Mutex::new(
+            dcroxide_blockchain::process::Chain::open(db, &params, params.assume_valid, false, 0)
+                .expect("open chain"),
+        ));
+        let tx_pool = crate::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            false,
+            100,
+            10000,
+            false,
+            false,
+        );
+        let genesis = chain
+            .lock()
+            .expect("chain")
+            .block_by_hash(&params.genesis_hash)
+            .expect("genesis block");
+        let now = 2_000_000_000i64; // far past the stale genesis tip
+
+        let enabled_after_drain = |allow_unsynced: bool| -> bool {
+            let estimator = crate::fees::new_shared_estimator(10000).expect("estimator");
+            let mut handler = ChainNtfnHandler::new(
+                None,
+                params.clone(),
+                allow_unsynced,
+                Arc::clone(&tx_pool),
+                crate::dispatch::SyncPeers::new(),
+                crate::dispatch::new_recently_advertised(),
+            );
+            handler.set_fee_estimator(Arc::clone(&estimator));
+            handler.handle(&Notification::BlockAccepted(BlockAcceptedNtfnsData {
+                best_height: 0,
+                fork_len: 0,
+                block: &genesis,
+            }));
+            handler.drain_pending_accepted_announcements(&chain, now);
+            estimator.lock().expect("estimator").is_enabled()
+        };
+
+        // Stale chain, no unsynced mining: dcrd's gate skips the enable.
+        assert!(
+            !enabled_after_drain(false),
+            "a stale chain leaves the estimator disabled"
+        );
+        // Unsynced mining forces the gate open: the enable fires.
+        assert!(
+            enabled_after_drain(true),
+            "unsynced mining enables the estimator at the accepted height"
+        );
     }
 }

@@ -14,6 +14,7 @@ pub mod bgtemplate;
 pub mod chainntfns;
 pub mod config;
 pub mod dispatch;
+pub mod fees;
 pub mod flags;
 mod gostd;
 pub mod indexes;

@@ -4,10 +4,10 @@
 //! `mempool.go`: the main, orphan, and stage pools with their
 //! outpoint indexes, vote and treasury spend tracking, the full
 //! acceptance gauntlet (`maybeAcceptTransaction`), orphan processing,
-//! and the pruning surface.  The fee estimator hooks and notification
-//! callbacks are integration plumbing that arrives with later phases
-//! (the mining view and the exists-address hook are wired); dcrd's
-//! locks are unnecessary under Rust ownership.
+//! and the pruning surface.  The mining view, the exists-address hook,
+//! the vote receiver, and the fee estimator hook are wired as optional
+//! sinks the daemon installs; dcrd's locks are unnecessary under Rust
+//! ownership.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -228,6 +228,19 @@ impl dcroxide_standalone::SubsidyParams for PoolSubsidyParams {
     }
 }
 
+/// The optional fee-estimator hook (dcrd mempool `Config`'s
+/// `AddTxToFeeEstimation`/`RemoveTxFromFeeEstimation` closures): the
+/// pool notifies the estimator as transactions enter and leave the
+/// mempool.
+pub trait FeeEstimatorSink: Send {
+    /// Record a transaction added to the mempool (dcrd
+    /// `AddMemPoolTransaction`).
+    fn add_mem_pool_transaction(&mut self, tx_hash: &Hash, fee: i64, size: i64, tx_type: TxType);
+    /// Record a transaction removed from the mempool (dcrd
+    /// `RemoveMemPoolTransaction`).
+    fn remove_mem_pool_transaction(&mut self, tx_hash: &Hash);
+}
+
 /// The optional exists-address index hook (dcrd mempool `Config`'s
 /// `ExistsAddrIndex` field): the pool records every added unconfirmed
 /// transaction's addresses when the index is enabled.
@@ -270,6 +283,7 @@ pub struct TxPool<C: PoolChain> {
     next_expire_scan_unix: i64,
     exists_addr_index: Option<Box<dyn UnconfirmedAddrIndexer>>,
     vote_receiver: Option<Box<dyn VoteReceiver>>,
+    fee_estimator: Option<Box<dyn FeeEstimatorSink>>,
 }
 
 impl<C: PoolChain> TxPool<C> {
@@ -297,6 +311,7 @@ impl<C: PoolChain> TxPool<C> {
             next_expire_scan_unix,
             exists_addr_index: None,
             vote_receiver: None,
+            fee_estimator: None,
         }
     }
 
@@ -312,6 +327,13 @@ impl<C: PoolChain> TxPool<C> {
     /// `OnVoteReceived`).
     pub fn set_vote_receiver(&mut self, receiver: Box<dyn VoteReceiver>) {
         self.vote_receiver = Some(receiver);
+    }
+
+    /// Install the optional fee estimator the pool notifies as
+    /// transactions enter and leave (dcrd's mempool config carrying
+    /// the fee-estimation closures).
+    pub fn set_fee_estimator(&mut self, estimator: Box<dyn FeeEstimatorSink>) {
+        self.fee_estimator = Some(estimator);
     }
 
     /// Insert a vote into the map of block votes (dcrd `insertVote`).
@@ -665,6 +687,12 @@ impl<C: PoolChain> TxPool<C> {
 
             // Stop tracking if it's a tspend.
             self.tspends.remove(&tx_hash.0);
+
+            // Inform the fee estimator the transaction has left the
+            // mempool (dcrd's `RemoveTxFromFeeEstimation`).
+            if let Some(estimator) = &mut self.fee_estimator {
+                estimator.remove_mem_pool_transaction(tx_hash);
+            }
         }
     }
 
@@ -687,8 +715,7 @@ impl<C: PoolChain> TxPool<C> {
     }
 
     /// Add the passed transaction to the memory pool without
-    /// validation (dcrd `addTransaction`; the fee estimation hook is
-    /// not reproduced yet).
+    /// validation (dcrd `addTransaction`).
     fn add_transaction(&mut self, tx_desc: Arc<TxDesc>) {
         // Add the transaction to the pool and mark the referenced
         // outpoints as spent by the pool.  The mining view is updated
@@ -717,6 +744,17 @@ impl<C: PoolChain> TxPool<C> {
         // the last-updated bump).
         if let Some(index) = &mut self.exists_addr_index {
             index.add_unconfirmed_tx(&tx_desc.tx);
+        }
+
+        // Inform the fee estimator that a new transaction has been
+        // added to the mempool (dcrd's `AddTxToFeeEstimation`).
+        if let Some(estimator) = &mut self.fee_estimator {
+            estimator.add_mem_pool_transaction(
+                &tx_desc.tx_hash,
+                tx_desc.fee,
+                tx_desc.tx_size,
+                tx_desc.tx_type,
+            );
         }
     }
 

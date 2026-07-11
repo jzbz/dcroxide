@@ -110,6 +110,40 @@ pub enum EstimateFeeError {
     MedianScanFellThrough,
 }
 
+impl core::fmt::Display for EstimateFeeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            // dcrd `estimateMedianFee`'s `targetConfs <= 0` error.
+            EstimateFeeError::NonPositiveTarget => {
+                f.write_str("target confirmation range cannot be <= 0")
+            }
+            // dcrd `ErrTargetConfTooLarge.Error`.
+            EstimateFeeError::TargetConfTooLarge {
+                max_confirms,
+                req_confirms,
+            } => write!(
+                f,
+                "target confirmation requested ({req_confirms}) higher than \
+                 maximum confirmation range tracked by estimator ({max_confirms})"
+            ),
+            // dcrd `ErrNoSuccessPctBucketFound`.
+            EstimateFeeError::NoSuccessPctBucketFound => {
+                f.write_str("no bucket with the minimum required success percentage found")
+            }
+            // dcrd `ErrNotEnoughTxsForEstimate`.
+            EstimateFeeError::NotEnoughTxsForEstimate => {
+                f.write_str("not enough transactions seen for estimation")
+            }
+            // dcrd's ad-hoc `errors.New` in the unreachable median branch.
+            EstimateFeeError::MedianScanFellThrough => {
+                f.write_str("this isn't supposed to be reached")
+            }
+        }
+    }
+}
+
+impl core::error::Error for EstimateFeeError {}
+
 /// The fee estimator (dcrd `Estimator`; the leveldb handle and lock
 /// are plumbing).
 pub struct Estimator {

@@ -57,6 +57,10 @@ fn serve_rpc() -> (
         1000,
         Arc::clone(&tx_pool),
     )));
+    // A real (but empty and never-enabled) fee estimator, exactly as
+    // the daemon wires it: estimatesmartfee reads it and, with no
+    // transactions ever seen, answers dcrd's estimation error.
+    let fee_estimator = dcroxide_node::fees::new_shared_estimator(10000).expect("fee estimator");
 
     let server = Arc::new(Mutex::new(Server::new(Config {
         chain: NodeRpcChain::new(chain, params.clone()),
@@ -80,7 +84,7 @@ fn serve_rpc() -> (
         filterer_v2: Box::new(()),
         exists_addresser: None,
         log_manager: Box::new(()),
-        fee_estimator: Box::new(()),
+        fee_estimator: Box::new(dcroxide_node::fees::NodeRpcFeeEstimator::new(fee_estimator)),
         block_templater: None,
         sanity_checker: Box::new(()),
         time_source: Box::new(dcroxide_node::rpcrun::SystemTimeSource),
@@ -295,15 +299,28 @@ fn answers_chain_queries_over_http() {
     assert!(!response.contains("-32603"), "{response}");
     assert!(response.contains("\"error\":{"), "{response}");
 
-    // A handler whose daemon seam is not wired yet (the fee
-    // estimator) answers an internal error instead of killing the
-    // server...
+    // estimatesmartfee reads the wired fee estimator; with no
+    // transactions ever seen it answers dcrd's estimation error as an
+    // internal error (-32603) rather than killing the server.
     let response = post(
         port,
         Some("user:pass"),
         r#"{"jsonrpc":"1.0","method":"estimatesmartfee","params":[10],"id":3}"#,
     );
     assert!(response.contains("-32603"), "{response}");
+    assert!(
+        response.contains("not enough transactions seen for estimation"),
+        "{response}"
+    );
+
+    // An unsupported estimation mode is rejected before the estimator
+    // is even consulted (dcrd's rpc_invalid_error, -8).
+    let response = post(
+        port,
+        Some("user:pass"),
+        r#"{"jsonrpc":"1.0","method":"estimatesmartfee","params":[10,"economical"],"id":31}"#,
+    );
+    assert!(response.contains("-8"), "{response}");
 
     // ...and the server still answers afterwards.
     let response = post(
