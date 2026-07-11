@@ -284,6 +284,13 @@ fn handle_events(
                     .conn_req(id)
                     .and_then(|req| req.addr.as_ref())
                     .and_then(|addr| addr.addr.parse::<SocketAddr>().ok());
+                // Whether this is a persistent (added-node) connection, so
+                // the served peer is registered as one (dcrd's
+                // `serverPeer.persistent`).
+                let permanent = manager
+                    .conn_req(id)
+                    .map(|req| req.permanent)
+                    .unwrap_or(false);
                 if let (Some(stream), Some(addr)) = (stream, addr) {
                     let serve = Arc::clone(serve);
                     let commands = commands.clone();
@@ -294,6 +301,7 @@ fn handle_events(
                             &serve.template,
                             &serve.connected,
                             serve.server.clone(),
+                            permanent,
                         );
                         let _ = commands.send(Command::PeerDone(id));
                     });

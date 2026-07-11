@@ -557,6 +557,47 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
         self.sync_peers.connected_peer_infos()
     }
 
+    /// The persistent peers for `getaddednodeinfo` (dcrd
+    /// `rpcConnManager.PersistentPeers`).
+    fn persistent_peers(&mut self) -> Vec<dcroxide_rpc::server::RpcAddedNode> {
+        self.sync_peers.persistent_peers()
+    }
+
+    /// Disconnect the non-permanent peer with the given id (dcrd
+    /// `rpcConnManager.DisconnectByID`); a permanent or absent peer is
+    /// "peer not found", which the `node` handler turns into its "use
+    /// remove" hint.
+    fn disconnect_by_id(&mut self, id: i32) -> Result<(), String> {
+        if self.sync_peers.disconnect_by_id(id) {
+            Ok(())
+        } else {
+            Err("peer not found".to_string())
+        }
+    }
+
+    /// Disconnect the non-permanent peers at the given address (dcrd
+    /// `rpcConnManager.DisconnectByAddr`).
+    fn disconnect_by_addr(&mut self, addr: &str) -> Result<(), String> {
+        if self.sync_peers.disconnect_by_addr(addr) {
+            Ok(())
+        } else {
+            Err("peer not found".to_string())
+        }
+    }
+
+    /// Resolve a host to its addresses for `getaddednodeinfo` with DNS
+    /// details (dcrd `rpcConnManager.Lookup` over the config's lookup
+    /// function; the system resolver here — a `.onion`/proxied host
+    /// resolves through it rather than dcrd's SOCKS lookup, a documented
+    /// divergence until the Tor path is wired).
+    fn lookup(&mut self, host: &str) -> Result<Vec<String>, String> {
+        use std::net::ToSocketAddrs;
+        (host, 0u16)
+            .to_socket_addrs()
+            .map(|addrs| addrs.map(|addr| addr.ip().to_string()).collect())
+            .map_err(|e| e.to_string())
+    }
+
     /// Announce submitted transactions to the network (dcrd
     /// `relayTransactions` from the RPC adaptor).
     fn relay_transactions(&mut self, tx_hashes: &[Hash]) {
@@ -1247,6 +1288,7 @@ mod tests {
             ))),
             peer,
             Some("10.0.0.1:9108".to_string()),
+            false,
         );
 
         let mut manager = NodeRpcConnManager::new(
@@ -1268,5 +1310,72 @@ mod tests {
             Arc::new(crate::transport::NetByteTotals::new()),
         );
         assert!(idle.connected_peers().is_empty());
+    }
+
+    /// The connection manager answers the read/disconnect peer-control
+    /// seams from the registry: `getaddednodeinfo` sees the permanent
+    /// peer, `node disconnect` on it is "peer not found" (which the
+    /// handler upgrades to the "use remove" hint), and `lookup` resolves
+    /// a host.
+    #[test]
+    fn peer_control_read_and_disconnect_seams() {
+        use dcroxide_rpc::server::RpcConnManager;
+        use std::net::{TcpListener, TcpStream};
+
+        let sync_peers = crate::dispatch::SyncPeers::new();
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        let peer = Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
+            dcroxide_peer::Config::default(),
+        )));
+        // A permanent (added-node) peer over a real loopback connection so
+        // it carries a remote address for getaddednodeinfo.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let _client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        sync_peers.register(
+            3,
+            queue,
+            Some(server),
+            Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
+                crate::server::RelayPeerFacts {
+                    connected: true,
+                    services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+                    wants_headers: false,
+                    disable_relay_tx: false,
+                    protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+                },
+            ))),
+            peer,
+            None,
+            true,
+        );
+
+        let mut manager = NodeRpcConnManager::new(
+            crate::runtime::ConnectedPeers::new(),
+            Arc::new(crate::transport::NetByteTotals::new()),
+        )
+        .with_peer_registry(sync_peers);
+
+        // getaddednodeinfo sees the permanent peer as connected/outbound.
+        let persistent = manager.persistent_peers();
+        assert_eq!(persistent.len(), 1);
+        assert!(persistent[0].connected && !persistent[0].inbound);
+
+        // node disconnect on a permanent (or unknown) peer is "peer not
+        // found", which the handler turns into the "use remove" hint.
+        assert_eq!(
+            manager.disconnect_by_id(3),
+            Err("peer not found".to_string())
+        );
+        assert_eq!(
+            manager.disconnect_by_id(99),
+            Err("peer not found".to_string())
+        );
+
+        // lookup resolves a loopback literal to itself.
+        assert_eq!(
+            manager.lookup("127.0.0.1").expect("lookup 127.0.0.1"),
+            vec!["127.0.0.1".to_string()]
+        );
     }
 }

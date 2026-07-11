@@ -192,7 +192,8 @@ fn serve_inbound_peer(
     };
     let mut peer = Peer::new_inbound(template.config());
     peer.associate(&addr.to_string(), na, NodePeerEnv::new().now_nanos());
-    serve_connection(stream, peer, addr, template, connected, server);
+    // An inbound peer is never a persistent (added) node.
+    serve_connection(stream, peer, addr, template, connected, server, false);
 }
 
 /// Build, associate, and run a single outbound peer to completion,
@@ -205,6 +206,7 @@ pub(crate) fn serve_outbound_peer(
     template: &PeerTemplate,
     connected: &ConnectedPeers,
     server: Option<Arc<ServerContext>>,
+    permanent: bool,
 ) {
     let na = match net_address_from_socket(addr, template.services) {
         Ok(na) => na,
@@ -228,7 +230,7 @@ pub(crate) fn serve_outbound_peer(
         groups.increment(key);
     }
 
-    serve_connection(stream, peer, addr, template, connected, server);
+    serve_connection(stream, peer, addr, template, connected, server, permanent);
 
     if let Some((groups, key)) = &group {
         groups.decrement(key);
@@ -244,6 +246,7 @@ fn group_key_for(na: &dcroxide_wire::NetAddress) -> String {
 /// with the server dispatch, and deregister it on exit — shared by the
 /// inbound and outbound serve paths (dcrd's `serverPeer` runs the same
 /// for both directions).
+#[allow(clippy::too_many_arguments)]
 fn serve_connection(
     stream: TcpStream,
     peer: Peer,
@@ -251,6 +254,7 @@ fn serve_connection(
     template: &PeerTemplate,
     connected: &ConnectedPeers,
     server: Option<Arc<ServerContext>>,
+    permanent: bool,
 ) {
     // Register a socket handle so a shutdown can interrupt this peer's
     // blocking read; a failed clone just leaves it unregistered.  The
@@ -273,6 +277,7 @@ fn serve_connection(
                 ctx,
                 whitelisted,
                 stream.try_clone().ok(),
+                permanent,
             ))
         }
         None => InboundHooks::NoOp,

@@ -804,6 +804,7 @@ mod tests {
                     dcroxide_peer::Config::default(),
                 ))),
                 None,
+                false,
             );
             let handler = ChainNtfnHandler::new(
                 None,
