@@ -3300,6 +3300,17 @@ impl Chain {
         })
     }
 
+    /// Whether the DCP0011 blake3 proof of work agenda is active for
+    /// the block AFTER the given block (dcrd
+    /// `BlockChain.IsBlake3PowAgendaActive`).
+    pub fn is_blake3_pow_agenda_active(
+        &self,
+        prev_hash: &Hash,
+        params: &Params,
+    ) -> Result<bool, RuleError> {
+        self.is_agenda_active_by_hash(prev_hash, crate::agendas::VOTE_ID_BLAKE3_POW, params)
+    }
+
     /// Whether the DCP0009 automatic ticket revocations agenda is
     /// active for the block AFTER the given block (dcrd
     /// `BlockChain.IsAutoRevocationsAgendaActive`).

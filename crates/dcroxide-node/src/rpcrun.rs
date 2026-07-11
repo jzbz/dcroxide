@@ -320,6 +320,14 @@ impl RpcChain for NodeRpcChain {
             .is_auto_revocations_agenda_active(prev_blk_hash, &self.params)
             .map_err(|e| e.description)
     }
+
+    fn is_blake3_pow_agenda_active(&mut self, prev_blk_hash: &Hash) -> Result<bool, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .is_blake3_pow_agenda_active(prev_blk_hash, &self.params)
+            .map_err(|e| e.description)
+    }
 }
 
 /// The mempool seam for a daemon that has no mempool yet: every

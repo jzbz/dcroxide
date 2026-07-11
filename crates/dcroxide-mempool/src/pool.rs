@@ -237,6 +237,16 @@ pub trait UnconfirmedAddrIndexer: Send {
     fn add_unconfirmed_tx(&mut self, tx: &MsgTx);
 }
 
+/// The optional vote-received hook (dcrd mempool `Config`'s
+/// `OnVoteReceived` callback, wired to the background template
+/// generator's `VoteReceived`): the pool forwards every accepted vote
+/// so the generator can react to it as votes propagate.
+pub trait VoteReceiver: Send {
+    /// A vote (SSGen) was accepted into the pool (dcrd's
+    /// `OnVoteReceived` firing `s.bg.VoteReceived`).
+    fn vote_received(&mut self, vote: &MsgTx);
+}
+
 /// The transaction memory pool (dcrd `TxPool`).
 pub struct TxPool<C: PoolChain> {
     /// The chain backend.
@@ -259,6 +269,7 @@ pub struct TxPool<C: PoolChain> {
     tspends: BTreeSet<[u8; 32]>,
     next_expire_scan_unix: i64,
     exists_addr_index: Option<Box<dyn UnconfirmedAddrIndexer>>,
+    vote_receiver: Option<Box<dyn VoteReceiver>>,
 }
 
 impl<C: PoolChain> TxPool<C> {
@@ -285,6 +296,7 @@ impl<C: PoolChain> TxPool<C> {
             tspends: BTreeSet::new(),
             next_expire_scan_unix,
             exists_addr_index: None,
+            vote_receiver: None,
         }
     }
 
@@ -293,6 +305,13 @@ impl<C: PoolChain> TxPool<C> {
     /// `ExistsAddrIndex`).
     pub fn set_exists_addr_index(&mut self, index: Box<dyn UnconfirmedAddrIndexer>) {
         self.exists_addr_index = Some(index);
+    }
+
+    /// Install the optional vote-received hook the pool notifies of
+    /// every accepted vote (dcrd's mempool config carrying
+    /// `OnVoteReceived`).
+    pub fn set_vote_receiver(&mut self, receiver: Box<dyn VoteReceiver>) {
+        self.vote_receiver = Some(receiver);
     }
 
     /// Insert a vote into the map of block votes (dcrd `insertVote`).
@@ -1398,6 +1417,13 @@ impl<C: PoolChain> TxPool<C> {
         // Keep track of votes separately.
         if is_vote {
             self.insert_vote(&tx, &tx_hash);
+
+            // Notify the background template generator of the accepted
+            // vote so it can react as votes propagate (dcrd's
+            // `OnVoteReceived` firing `s.bg.VoteReceived`).
+            if let Some(receiver) = &mut self.vote_receiver {
+                receiver.vote_received(&tx);
+            }
         }
 
         // Keep track of tspends separately.

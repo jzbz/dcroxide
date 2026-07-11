@@ -291,6 +291,14 @@ fn run(cfg: Config) -> ExitCode {
         ))
     };
 
+    // The mining policy the background template generator and the
+    // getwork seam share (dcrd's mining `Policy`).
+    let mining_policy = dcroxide_mining::MiningPolicy {
+        block_max_size: cfg.block_max_size,
+        tx_min_free_fee: cfg.min_relay_tx_fee_atoms,
+        aggressive_mining: !cfg.non_aggressive,
+    };
+
     // Feed the chain's events into the daemon handler as blocks
     // connect, disconnect, and reorganize (dcrd installing
     // handleBlockchainNotification as its blockchain notification
@@ -325,6 +333,57 @@ fn run(cfg: Config) -> ExitCode {
     );
     if let Some(rebroadcaster) = &rebroadcaster {
         handler.set_rebroadcast(rebroadcaster.sink());
+    }
+
+    // Run the background block template generator when mining addresses
+    // are configured (dcrd only constructs `s.bg` and serves getwork
+    // with `--miningaddr` set): a dedicated thread drives the
+    // regeneration state machine over the live chain and mempool,
+    // feeding the getwork RPC and the websocket work notifications.  It
+    // starts after the chain handler exists so its drain hook can run
+    // the handler's deferred maintenance for reorgs the generator
+    // itself initiates (which the sync adapter's post-process drain
+    // never covers).
+    let generator = if cfg.mining_addrs.is_empty() {
+        None
+    } else {
+        let drain_handler = handler.clone();
+        let drain_chain = Arc::clone(&chain);
+        let drain_hook: Box<dyn Fn() + Send> = Box::new(move || {
+            let now = now_unix();
+            drain_handler.drain_pending_checked_announcements();
+            drain_handler.drain_pending_block_events();
+            drain_handler.drain_pending_accepted_announcements(&drain_chain, now);
+            drain_handler.drain_pending_winning_tickets(&drain_chain, now);
+        });
+        Some(dcroxide_node::bgtemplate::start_generator(
+            Arc::clone(&chain),
+            Arc::clone(&tx_pool),
+            cfg.params.params.clone(),
+            cfg.mining_addrs.clone(),
+            mining_policy.clone(),
+            cfg.mining_time_offset,
+            cfg.allow_unsynced_mining,
+            ntfn.clone(),
+            Some(drain_hook),
+        ))
+    };
+
+    // Forward accepted votes from the pool into the generator (dcrd's
+    // mempool `OnVoteReceived` firing `s.bg.VoteReceived`).
+    if let Some(generator) = &generator {
+        tx_pool
+            .lock()
+            .expect("tx pool mutex poisoned")
+            .set_vote_receiver(Box::new(dcroxide_node::bgtemplate::NodeVoteReceiver::new(
+                generator.sink(),
+            )));
+    }
+
+    // The chain's block and reorganization events feed the background
+    // template generator (dcrd's chain notifications driving `s.bg`).
+    if let Some(generator) = &generator {
+        handler.set_generator(generator.sink());
     }
     {
         let callback_handler = handler.clone();
@@ -393,6 +452,22 @@ fn run(cfg: Config) -> ExitCode {
                     Arc::clone(&indexes.queryer),
                 )) as Box<dyn dcroxide_rpc::server::RpcExistsAddresser + Send>
             });
+        // The getwork seam over the running generator (dcrd assigning
+        // `s.bg` to the rpcserver config's `BlockTemplater`); `None`
+        // when no mining addresses are configured, so getwork errors
+        // with dcrd's "no payment addresses" message.
+        let block_templater = generator.as_ref().map(|generator| {
+            Box::new(dcroxide_node::bgtemplate::NodeRpcBlockTemplater::new(
+                generator.current_handle(),
+                generator.subscribers_handle(),
+                generator.sink(),
+                Arc::clone(&chain),
+                Arc::clone(&tx_pool),
+                cfg.params.params.clone(),
+                mining_policy.clone(),
+                cfg.mining_time_offset,
+            )) as Box<dyn dcroxide_rpc::server::RpcBlockTemplater + Send>
+        });
         let mut rpc_srv = dcroxide_rpc::server::Server::new(rpc_config(
             &cfg,
             Arc::clone(&chain),
@@ -409,6 +484,7 @@ fn run(cfg: Config) -> ExitCode {
             tx_indexer,
             exists_addresser,
             db.clone(),
+            block_templater,
         ));
         // Install the websocket notification manager (dcrd's
         // wsNotificationManager) and start its delivery thread over
@@ -549,6 +625,9 @@ fn run(cfg: Config) -> ExitCode {
     stall_timer.shutdown();
     if let Some(rebroadcaster) = rebroadcaster {
         rebroadcaster.shutdown();
+    }
+    if let Some(generator) = generator {
+        generator.shutdown();
     }
     connected.disconnect_all();
     if let Some(runtime) = runtime {
@@ -712,6 +791,7 @@ fn rpc_config(
     tx_indexer: Option<Box<dyn dcroxide_rpc::server::RpcTxIndexer + Send>>,
     exists_addresser: Option<Box<dyn dcroxide_rpc::server::RpcExistsAddresser + Send>>,
     db: Database,
+    block_templater: Option<Box<dyn dcroxide_rpc::server::RpcBlockTemplater + Send>>,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
     dcroxide_rpc::server::Config {
@@ -748,7 +828,7 @@ fn rpc_config(
         exists_addresser,
         log_manager: Box::new(()),
         fee_estimator: Box::new(()),
-        block_templater: None,
+        block_templater,
         sanity_checker: Box::new(()),
         time_source: Box::new(dcroxide_node::rpcrun::SystemTimeSource),
         proxy: cfg.proxy.clone(),
@@ -758,7 +838,7 @@ fn rpc_config(
         mix_pooler: Box::new(()),
         profiler_mgr: Box::new(()),
         addr_manager: Box::new(()),
-        mining_addrs: Vec::new(),
+        mining_addrs: cfg.mining_addrs.clone(),
         user_agent_version: version::version_string().to_string(),
         net_info: Vec::new(),
         services: ServiceFlag::NODE_NETWORK.0,
@@ -769,6 +849,16 @@ fn rpc_config(
         rpc_limit_user: cfg.rpc_limit_user.clone(),
         rpc_limit_pass: cfg.rpc_limit_pass.clone(),
     }
+}
+
+/// The current time as unix seconds (matching the sync adapter's
+/// `adjusted_time_unix`), for driving the chain handler's deferred
+/// maintenance from the generator's drain hook.
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// A minimal startup log line until the rotating logging subsystem is

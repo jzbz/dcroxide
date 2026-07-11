@@ -712,15 +712,21 @@ pub enum TemplateUpdateReason {
     NewVotes,
     /// New transactions arrived (dcrd `TURNewTxns`).
     NewTxns,
+    /// The template was regenerated for an unclassified reason, such
+    /// as a forced regeneration (dcrd's internal `turUnknown`, which
+    /// still notifies work clients).
+    Unknown,
 }
 
 /// Convert a template update reason to the work notification string
-/// (dcrd `updateReasonToWorkNtfnString`).
+/// (dcrd `updateReasonToWorkNtfnString`; every reason outside the
+/// three classified ones maps to "unknown").
 fn update_reason_to_work_ntfn_string(reason: TemplateUpdateReason) -> &'static str {
     match reason {
         TemplateUpdateReason::NewParent => "newparent",
         TemplateUpdateReason::NewVotes => "newvotes",
         TemplateUpdateReason::NewTxns => "newtxns",
+        TemplateUpdateReason::Unknown => "unknown",
     }
 }
 

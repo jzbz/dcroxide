@@ -13,11 +13,12 @@
 //! them right after the processing call returns with the mutex free,
 //! which is exactly the lock situation dcrd's handler runs under.
 //!
-//! The reorg-started and reorg-done events only feed dcrd's
-//! background template generator, which is not wired yet, so both are
-//! ignored here.  The mix-observer refusal gate is likewise skipped
-//! until the mixpool arrives — without a pool there are no
-//! misbehaving mix inputs to refuse.
+//! The reorg-started and reorg-done events feed dcrd's background
+//! template generator (present when mining addresses are configured),
+//! halting and resuming template generation around the reorg; the
+//! block accepted, connected, and disconnected events feed it too.
+//! The mix-observer refusal gate is skipped until the mixpool arrives
+//! — without a pool there are no misbehaving mix inputs to refuse.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -83,6 +84,10 @@ pub struct ChainNtfnHandler {
     /// (dcrd gates both on `s.rpcServer != nil` since only RPC
     /// submissions are ever tracked).
     rebroadcast: Option<crate::rebroadcast::RebroadcastSink>,
+    /// The background template generator feeder; `Some` only when
+    /// mining addresses are configured (dcrd's chain events driving
+    /// `s.bg`, present whenever the generator runs).
+    generator: Option<crate::bgtemplate::GeneratorSink>,
 }
 
 /// A block event awaiting its mempool maintenance (dcrd's handler
@@ -130,6 +135,7 @@ impl ChainNtfnHandler {
             index_subscriber: None,
             recently_confirmed: None,
             rebroadcast: None,
+            generator: None,
         }
     }
 
@@ -150,6 +156,14 @@ impl ChainNtfnHandler {
     /// chain callback.
     pub fn set_rebroadcast(&mut self, sink: crate::rebroadcast::RebroadcastSink) {
         self.rebroadcast = Some(sink);
+    }
+
+    /// Feed the chain's block and reorganization events into the
+    /// background template generator (dcrd's chain notifications
+    /// driving `s.bg`).  Must be set before the handler is cloned into
+    /// the chain callback.
+    pub fn set_generator(&mut self, sink: crate::bgtemplate::GeneratorSink) {
+        self.generator = Some(sink);
     }
 
     /// Feed the drained block events into the given index subscriber
@@ -177,10 +191,18 @@ impl ChainNtfnHandler {
                     .expect("pending checked announcements")
                     .push(block.header);
             }
-            Notification::BlockAccepted(data) => self.handle_block_accepted(data),
+            Notification::BlockAccepted(data) => {
+                if let Some(generator) = &self.generator {
+                    generator.block_accepted(data.block.clone());
+                }
+                self.handle_block_accepted(data);
+            }
             Notification::BlockConnected(data) => {
                 if let Some(ntfn) = &self.ntfn {
                     ntfn.notify_block_connected(data.block.clone());
+                }
+                if let Some(generator) = &self.generator {
+                    generator.block_connected(data.block.clone());
                 }
                 self.pending_block_events
                     .lock()
@@ -195,6 +217,9 @@ impl ChainNtfnHandler {
                 if let Some(ntfn) = &self.ntfn {
                     ntfn.notify_block_disconnected(data.block.clone());
                 }
+                if let Some(generator) = &self.generator {
+                    generator.block_disconnected(data.block.clone());
+                }
                 self.pending_block_events
                     .lock()
                     .expect("pending block events")
@@ -204,9 +229,19 @@ impl ChainNtfnHandler {
                         check_tx_flags: data.check_tx_flags,
                     });
             }
-            // These only feed dcrd's background template generator,
-            // which is not wired yet.
-            Notification::ChainReorgStarted | Notification::ChainReorgDone => {}
+            // The reorganization events only feed dcrd's background
+            // template generator, halting and resuming template
+            // generation around the reorg.
+            Notification::ChainReorgStarted => {
+                if let Some(generator) = &self.generator {
+                    generator.chain_reorg_started();
+                }
+            }
+            Notification::ChainReorgDone => {
+                if let Some(generator) = &self.generator {
+                    generator.chain_reorg_done();
+                }
+            }
             Notification::Reorganization(data) => {
                 if let Some(ntfn) = &self.ntfn {
                     ntfn.notify_reorganization(
