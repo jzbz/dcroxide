@@ -678,17 +678,32 @@ impl UtxoView {
     /// Update the view to represent connecting the passed block,
     /// undoing the parent's regular transactions first when the block
     /// disapproves it (dcrd `connectBlock`).
+    ///
+    /// The parent's spend journal is only needed to undo a disapproved
+    /// parent, so it is supplied lazily and decoded solely on that
+    /// path — matching dcrd, which fetches it inside `connectBlock`
+    /// only when the block disapproves its parent rather than eagerly
+    /// at every caller.  This avoids decoding the parent journal with
+    /// the wrong treasury flag on the common approve path (the child's
+    /// flag differs from the parent's exactly at the treasury agenda
+    /// activation boundary).
     pub fn connect_block(
         &mut self,
         block: &MsgBlock,
         parent: &MsgBlock,
-        parent_stxos: &[SpentTxOut],
+        parent_stxos: impl FnOnce() -> Vec<SpentTxOut>,
         resolver: &impl UtxoResolver,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
         if !crate::validate::header_approves_parent(&block.header) {
-            self.disconnect_disapproved_block(parent, parent_stxos, resolver, is_treasury_enabled)?;
+            let parent_stxos = parent_stxos();
+            self.disconnect_disapproved_block(
+                parent,
+                &parent_stxos,
+                resolver,
+                is_treasury_enabled,
+            )?;
         }
         self.fetch_input_utxos(block, resolver, is_treasury_enabled);
         self.connect_stake_transactions(block, stxos.as_deref_mut(), is_treasury_enabled)?;

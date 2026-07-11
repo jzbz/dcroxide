@@ -4263,13 +4263,19 @@ pub fn check_block_scripts(
 /// the main chain, connecting the view and producing the spend
 /// journal and header commitment filter (dcrd `checkConnectBlock`).
 ///
-/// The caller supplies the disapproved-parent spend journal (dcrd
-/// fetches it from the database), whether scripts should run (dcrd
-/// derives this from bulk import mode and the assumed-valid ancestor),
-/// and the parent's past median time when the LN features agenda is
-/// active.  The treasury spend duplicate and vote tally checks from
-/// dcrd's `tspendChecks` require prior block data and arrive with the
-/// chain engine.
+/// The caller supplies the disapproved-parent spend journal lazily
+/// (dcrd fetches it from the database only when it disapproves its
+/// parent), whether scripts should run (dcrd derives this from bulk
+/// import mode and the assumed-valid ancestor), and the parent's past
+/// median time when the LN features agenda is active.  The treasury
+/// spend duplicate and vote tally checks from dcrd's `tspendChecks`
+/// require prior block data and arrive with the chain engine.
+///
+/// `parent_stxos` is only invoked when the block disapproves its
+/// parent, so callers must not pay to decode it on the approve path —
+/// and decoding it there with this block's treasury flag would be
+/// wrong at the treasury activation boundary, where the parent's flag
+/// differs from the child's.
 #[allow(clippy::too_many_arguments)]
 pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     view_chain: &impl FullChainView,
@@ -4280,7 +4286,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     node_vote_bits: u16,
     block: &MsgBlock,
     parent: &MsgBlock,
-    parent_stxos: &[crate::chainio::SpentTxOut],
+    parent_stxos: impl FnOnce() -> Vec<crate::chainio::SpentTxOut>,
     view: &mut crate::utxoview::UtxoView,
     resolver: &impl crate::utxoview::UtxoResolver,
     mut stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
@@ -4341,9 +4347,11 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     .map_err(unknown)?;
 
     // Undo the parent's regular transactions when this block
-    // disapproves them.
+    // disapproves them.  The parent spend journal is only decoded here,
+    // on the disapprove path, exactly like dcrd.
     if node_height > 1 && !vote_bits_approve_parent(node_vote_bits) {
-        view.disconnect_disapproved_block(parent, parent_stxos, resolver, is_treasury_enabled)?;
+        let parent_stxos = parent_stxos();
+        view.disconnect_disapproved_block(parent, &parent_stxos, resolver, is_treasury_enabled)?;
     }
 
     // Duplicate transaction checking is a no-op at this version.

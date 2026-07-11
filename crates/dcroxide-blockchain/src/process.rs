@@ -1928,11 +1928,10 @@ impl Chain {
             let mut stxos: Vec<SpentTxOut> = Vec::with_capacity(count_spent_outputs(&block));
             let filter;
             if self.index.node_status(&self.store, node).has_validated() {
-                let parent_stxos = self.fetch_spend_journal(&parent, is_treasury_enabled);
                 view.connect_block(
                     &block,
                     &parent,
-                    &parent_stxos,
+                    || self.fetch_spend_journal(&parent, is_treasury_enabled),
                     &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
                     Some(&mut stxos),
                     is_treasury_enabled,
@@ -1960,7 +1959,6 @@ impl Chain {
                 }
 
                 let run_scripts = !self.bulk_import_mode && !self.is_assume_valid_ancestor(node);
-                let parent_stxos = self.fetch_spend_journal(&parent, is_treasury_enabled);
                 let mut subsidy_cache =
                     dcroxide_standalone::SubsidyCache::new(ChainSubsidyParams(params));
                 let node_info = {
@@ -1981,7 +1979,7 @@ impl Chain {
                         node_info.3,
                         &block,
                         &parent,
-                        &parent_stxos,
+                        || self.fetch_spend_journal(&parent, is_treasury_enabled),
                         &mut view,
                         &|op: &OutPoint| {
                             Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op)
@@ -2725,7 +2723,6 @@ impl Chain {
         if prev_node == tip {
             // Use the chain state as is when extending the main chain.
             let parent = self.block_by_node(tip).clone();
-            let parent_stxos = self.fetch_spend_journal(&parent, is_treasury_enabled);
             let branch_view = NodeBranchView {
                 store: &self.store,
                 tip: prev_node,
@@ -2739,7 +2736,7 @@ impl Chain {
                 template_info.3,
                 block,
                 &parent,
-                &parent_stxos,
+                || self.fetch_spend_journal(&parent, is_treasury_enabled),
                 &mut view,
                 &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
                 None,
@@ -2761,7 +2758,6 @@ impl Chain {
             &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
             is_treasury_enabled,
         )?;
-        let parent_stxos = self.fetch_spend_journal(&parent, is_treasury_enabled);
         let branch_view = NodeBranchView {
             store: &self.store,
             tip: prev_node,
@@ -2775,7 +2771,7 @@ impl Chain {
             template_info.3,
             block,
             &parent,
-            &parent_stxos,
+            || self.fetch_spend_journal(&parent, is_treasury_enabled),
             &mut view,
             &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
             None,
@@ -2851,13 +2847,12 @@ impl Chain {
         // being created by the block to it.  In the case the block
         // votes against the parent, also disconnect all of the
         // regular transactions in the parent block (dcrd passes nil
-        // stxos to collect here; the parent journal feeds the
-        // disapproval handling this port hoists to the caller).
-        let parent_stxos = self.fetch_spend_journal(&parent, is_treasury_enabled);
+        // stxos to collect here; the parent journal is decoded lazily,
+        // only on that disapproval path, as dcrd does).
         view.connect_block(
             block,
             &parent,
-            &parent_stxos,
+            || self.fetch_spend_journal(&parent, is_treasury_enabled),
             &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
             None,
             is_treasury_enabled,
