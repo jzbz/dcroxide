@@ -4,7 +4,7 @@
 //! This file's variant list is machine-generated from dcrd's ErrorKind
 //! constants at the pinned tag; regenerate rather than hand-edit.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use core::fmt;
 
 /// The kind of a consensus rule violation; each variant's
@@ -367,5 +367,110 @@ pub(crate) fn rule_error(kind: RuleErrorKind, description: impl Into<String>) ->
     RuleError {
         kind,
         description: description.into(),
+    }
+}
+
+/// Render a slice of block-processing errors exactly as dcrd's
+/// `blockchain.MultiError.Error` renders the combined `finalErr` that
+/// `ProcessBlock` returns (dcrd internal/blockchain `error.go`).
+///
+/// A lone error renders unadorned (its bare description), matching the
+/// common single-error rejection.  Two or more render as a
+/// `multiple errors (N):` block that lists the first five errors, each
+/// on its own ` - <description>` line, followed by a ` - ... M more
+/// error(s)` line when more than five are present.
+///
+/// dcrd's `ProcessBlock` flattens the reorganization `MultiError` into
+/// the acceptance error rather than nesting it — its final-error switch
+/// uses `errors.As` to combine them into a single flat `MultiError`
+/// rather than wrapping one inside the other.  The flat error slice the
+/// ported [`process_block`](crate::process::Chain::process_block)
+/// returns (the acceptance error followed by the reorganization errors)
+/// therefore renders byte-for-byte identically to dcrd's `finalErr`.
+pub fn render_multi_error(errs: &[RuleError]) -> String {
+    // dcrd `MultiError.Error` returns a lone error's text unadorned.
+    if errs.len() == 1 {
+        return errs[0].description.clone();
+    }
+
+    const MAX_ERRS: usize = 5;
+    let mut out = String::new();
+    out.push_str("multiple errors (");
+    out.push_str(&errs.len().to_string());
+    out.push_str("):\n");
+    for err in errs.iter().take(MAX_ERRS) {
+        out.push_str(" - ");
+        out.push_str(&err.description);
+        out.push('\n');
+    }
+    if errs.len() > MAX_ERRS {
+        out.push_str(" - ... ");
+        out.push_str(&(errs.len() - MAX_ERRS).to_string());
+        out.push_str(" more error(s)\n");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn err(description: &str) -> RuleError {
+        rule_error(RuleErrorKind::UnexpectedDifficulty, description)
+    }
+
+    // Ground-truth strings below are captured from dcrd
+    // release-v2.1.5's `blockchain.MultiError.Error`.
+
+    #[test]
+    fn single_error_is_unadorned() {
+        assert_eq!(
+            render_multi_error(&[err("already have block abc")]),
+            "already have block abc"
+        );
+    }
+
+    #[test]
+    fn two_errors_render_as_multi() {
+        // The acceptance error followed by a single reorganization
+        // error, the smallest multi-error rejection.
+        assert_eq!(
+            render_multi_error(&[err("accept failed: bad"), err("reorg failed: worse")]),
+            "multiple errors (2):\n - accept failed: bad\n - reorg failed: worse\n"
+        );
+    }
+
+    #[test]
+    fn three_errors_list_every_line() {
+        assert_eq!(
+            render_multi_error(&[err("accept-err"), err("reorg-err-1"), err("reorg-err-2")]),
+            "multiple errors (3):\n - accept-err\n - reorg-err-1\n - reorg-err-2\n"
+        );
+    }
+
+    #[test]
+    fn five_errors_have_no_tail() {
+        assert_eq!(
+            render_multi_error(&[err("e1"), err("e2"), err("e3"), err("e4"), err("e5")]),
+            "multiple errors (5):\n - e1\n - e2\n - e3\n - e4\n - e5\n"
+        );
+    }
+
+    #[test]
+    fn more_than_five_errors_are_capped_with_tail() {
+        let errs = vec![
+            err("e1"),
+            err("e2"),
+            err("e3"),
+            err("e4"),
+            err("e5"),
+            err("e6"),
+            err("e7"),
+        ];
+        assert_eq!(
+            render_multi_error(&errs),
+            "multiple errors (7):\n - e1\n - e2\n - e3\n - e4\n - e5\n - ... 2 more error(s)\n"
+        );
     }
 }

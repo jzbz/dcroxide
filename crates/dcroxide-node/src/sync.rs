@@ -18,8 +18,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dcroxide_blockchain::RuleErrorKind;
 use dcroxide_blockchain::process::Chain;
+use dcroxide_blockchain::{RuleError, RuleErrorKind, render_multi_error};
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_netsync::manager::{
@@ -153,13 +153,30 @@ impl SyncChain for NodeSyncChain {
             handler.drain_pending_winning_tickets(&self.chain, adjusted_time_unix());
         }
 
-        match errs.into_iter().next() {
-            None => Ok(fork_len),
-            Some(err) => Err(ProcessBlockFailure {
-                is_duplicate_block: err.kind == RuleErrorKind::DuplicateBlock,
-                message: err.description,
-            }),
-        }
+        combine_process_block_result(fork_len, errs)
+    }
+}
+
+/// Fold the chain's block-processing outcome into the manager's result,
+/// rendering every error exactly as dcrd's `blockchain.ProcessBlock`
+/// renders its combined `finalErr` (via [`render_multi_error`]).
+///
+/// dcrd surfaces a `blockchain.ErrDuplicateBlock` rejection only as a
+/// lone early return, so the duplicate-block classification the manager
+/// needs comes from the first error; the message renders the whole flat
+/// error slice so the rare block that both fails acceptance and whose
+/// ensuing reorganization also errors reports dcrd's `multiple errors
+/// (N):` text rather than only the first error's.
+fn combine_process_block_result(
+    fork_len: i64,
+    errs: Vec<RuleError>,
+) -> Result<i64, ProcessBlockFailure> {
+    match errs.first() {
+        None => Ok(fork_len),
+        Some(first) => Err(ProcessBlockFailure {
+            is_duplicate_block: first.kind == RuleErrorKind::DuplicateBlock,
+            message: render_multi_error(&errs),
+        }),
     }
 }
 
@@ -238,4 +255,63 @@ pub fn new_sync_manager(
             RECENTLY_CONFIRMED_TXNS_FP_RATE,
         ))),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule_err(kind: RuleErrorKind, description: &str) -> RuleError {
+        RuleError {
+            kind,
+            description: description.to_string(),
+        }
+    }
+
+    #[test]
+    fn no_errors_yields_the_fork_length() {
+        assert_eq!(combine_process_block_result(3, Vec::new()).unwrap(), 3);
+    }
+
+    #[test]
+    fn a_single_error_reports_its_bare_description() {
+        // The common single-error rejection: a lone duplicate-block
+        // error classifies the failure and renders unadorned, exactly
+        // as dcrd's `submitblock` reports it after `rejected: `.
+        let failure = combine_process_block_result(
+            0,
+            vec![rule_err(
+                RuleErrorKind::DuplicateBlock,
+                "already have block abc",
+            )],
+        )
+        .unwrap_err();
+        assert!(failure.is_duplicate_block);
+        assert_eq!(failure.message, "already have block abc");
+    }
+
+    #[test]
+    fn multiple_errors_render_dcrd_multi_error_text() {
+        // The rare block that both fails contextual acceptance and
+        // whose ensuing reorganization also errors: dcrd combines the
+        // acceptance error (element 0) with the reorganization errors
+        // into one flat `MultiError`, so `submitblock` reports the
+        // whole `multiple errors (N):` block rather than only the
+        // first error's text.  The classification still comes from the
+        // first error, which is never a duplicate-block rejection.
+        let failure = combine_process_block_result(
+            0,
+            vec![
+                rule_err(RuleErrorKind::UnexpectedDifficulty, "accept-err"),
+                rule_err(RuleErrorKind::BadMerkleRoot, "reorg-err-1"),
+                rule_err(RuleErrorKind::BadMerkleRoot, "reorg-err-2"),
+            ],
+        )
+        .unwrap_err();
+        assert!(!failure.is_duplicate_block);
+        assert_eq!(
+            failure.message,
+            "multiple errors (3):\n - accept-err\n - reorg-err-1\n - reorg-err-2\n"
+        );
+    }
 }

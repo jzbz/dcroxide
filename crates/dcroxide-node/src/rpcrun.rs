@@ -586,12 +586,16 @@ impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
                 // internal-error branch (the getwork-submission split)
                 // is unreachable and `submitblock` never wrongly reports
                 // an internal error where dcrd would `rejected: ...`.
-                // The message is the first rule error's text, matching
-                // dcrd for the common single-error rejection; the rare
-                // block that both fails acceptance and whose ensuing
-                // reorganization also errors would render dcrd's nested
-                // `MultiError` text — a divergence deferred with the
-                // blockchain layer's error surface.
+                // The message renders every block-processing error
+                // exactly as dcrd's `blockchain.MultiError.Error`
+                // combines them: a lone error unadorned (the common
+                // single-error rejection) and two or more as dcrd's
+                // `multiple errors (N):` block.  dcrd's `ProcessBlock`
+                // flattens the reorganization multi error into the
+                // acceptance error rather than nesting it, so the flat
+                // error slice `NodeSyncChain::process_block` returns
+                // renders byte-for-byte identically for the rare block
+                // that both fails acceptance and then errors reorganizing.
                 is_rule_error: true,
                 message: err.message,
             })
