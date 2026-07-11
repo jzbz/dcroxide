@@ -13,6 +13,7 @@
 pub mod bgtemplate;
 pub mod chainntfns;
 pub mod config;
+pub mod cpuminer;
 pub mod dispatch;
 pub mod fees;
 pub mod flags;

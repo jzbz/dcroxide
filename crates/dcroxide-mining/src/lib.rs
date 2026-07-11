@@ -16,6 +16,7 @@
 extern crate alloc;
 
 pub mod bg_generator;
+pub mod cpuminer;
 mod generator;
 mod graph;
 mod policy;

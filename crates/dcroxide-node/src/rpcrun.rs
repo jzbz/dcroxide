@@ -625,6 +625,12 @@ impl dcroxide_rpc::server::RpcCpuMiner for IdleCpuMiner {
     fn num_workers(&mut self) -> i32 {
         1
     }
+
+    /// A no-op: with no mining addresses there is no miner to configure,
+    /// but `setgenerate` still reaches this on its disable path (dcrd's
+    /// handler unconditionally calls `SetNumWorkers(0)` before the
+    /// address check), so it must answer rather than panic.
+    fn set_num_workers(&mut self, _workers: i32) {}
 }
 
 /// The current unix time for the chain's is-current resolution (dcrd's

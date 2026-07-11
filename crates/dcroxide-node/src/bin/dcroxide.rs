@@ -416,6 +416,11 @@ fn run(cfg: Config) -> ExitCode {
         .chain_mut()
         .set_chain_ntfn_handler(handler);
 
+    // The CPU miner's shutdown flag, flipped before the RPC listener
+    // stops so an in-flight `generate` exits promptly (dcrd cancels the
+    // miner's context on shutdown); `None` when no miner runs.
+    let mut cpu_miner_quit: Option<Arc<core::sync::atomic::AtomicBool>> = None;
+
     // Serve the JSON-RPC endpoint (dcrd's RPC server): TLS over the
     // generated certificate pair by default, plain HTTP under the
     // localhost-validated --notls.  This runs before the peer-to-peer
@@ -485,6 +490,29 @@ fn run(cfg: Config) -> ExitCode {
                 cfg.mining_time_offset,
             )) as Box<dyn dcroxide_rpc::server::RpcBlockTemplater + Send>
         });
+        // The CPU miner over the running generator's templates and the
+        // block-submit seam (dcrd `s.cpuMiner`); the idle stand-in when
+        // no mining addresses are configured, so `generate` answers
+        // dcrd's "no payment addresses" error.
+        let cpu_miner: Box<dyn dcroxide_rpc::server::RpcCpuMiner + Send> = match generator.as_ref()
+        {
+            Some(generator) => {
+                let miner = dcroxide_node::cpuminer::NodeCpuMiner::new(
+                    generator.current_handle(),
+                    generator.subscribers_handle(),
+                    generator.sink(),
+                    Arc::clone(&chain),
+                    Arc::clone(&server.sync_manager),
+                    Arc::clone(&tx_pool),
+                    cfg.params.params.clone(),
+                    mining_policy.clone(),
+                    cfg.mining_time_offset,
+                );
+                cpu_miner_quit = Some(miner.quit_handle());
+                Box::new(miner)
+            }
+            None => Box::new(dcroxide_node::rpcrun::IdleCpuMiner),
+        };
         let mut rpc_srv = dcroxide_rpc::server::Server::new(rpc_config(
             &cfg,
             Arc::clone(&chain),
@@ -503,6 +531,7 @@ fn run(cfg: Config) -> ExitCode {
             db.clone(),
             block_templater,
             Arc::clone(&fee_estimator),
+            cpu_miner,
         ));
         // Install the websocket notification manager (dcrd's
         // wsNotificationManager) and start its delivery thread over
@@ -629,6 +658,11 @@ fn run(cfg: Config) -> ExitCode {
     // Stop seeding and dialing, stop the watchdog, disconnect the live
     // peers, and stop accepting new connections (dcrd's server
     // shutdown).
+    // Signal any in-flight `generate` to stop so it releases the RPC
+    // server before the listener is torn down.
+    if let Some(cpu_miner_quit) = &cpu_miner_quit {
+        cpu_miner_quit.store(true, core::sync::atomic::Ordering::Release);
+    }
     if let Some((rpc_listener, ntfn, ntfn_thread)) = rpc_listener {
         rpc_listener.shutdown();
         ntfn.shutdown();
@@ -811,6 +845,7 @@ fn rpc_config(
     db: Database,
     block_templater: Option<Box<dyn dcroxide_rpc::server::RpcBlockTemplater + Send>>,
     fee_estimator: dcroxide_node::fees::SharedFeeEstimator,
+    cpu_miner: Box<dyn dcroxide_rpc::server::RpcCpuMiner + Send>,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
     dcroxide_rpc::server::Config {
@@ -857,7 +892,7 @@ fn rpc_config(
         // stand-in reports not-mining so the getwork handler's mining
         // gate allows work polling and submission (dcrd's miner is off
         // by default).
-        cpu_miner: Box::new(dcroxide_node::rpcrun::IdleCpuMiner),
+        cpu_miner,
         mix_pooler: Box::new(()),
         profiler_mgr: Box::new(()),
         addr_manager: Box::new(()),
