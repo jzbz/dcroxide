@@ -559,6 +559,8 @@ fn run(cfg: Config) -> ExitCode {
                 .as_ref()
                 .expect("the rebroadcaster exists when RPC is enabled")
                 .sink(),
+            ntfn.clone()
+                .expect("the manager exists when RPC is enabled"),
             tx_indexer,
             exists_addresser,
             db.clone(),
@@ -903,6 +905,7 @@ fn rpc_config(
         Mutex<dcroxide_containers::lru::Map<dcroxide_chainhash::Hash, dcroxide_wire::MsgTx>>,
     >,
     rebroadcast: dcroxide_node::rebroadcast::RebroadcastSink,
+    ntfn: dcroxide_node::websocket::NodeNtfnMgr,
     tx_indexer: Option<Box<dyn dcroxide_rpc::server::RpcTxIndexer + Send>>,
     exists_addresser: Option<Box<dyn dcroxide_rpc::server::RpcExistsAddresser + Send>>,
     db: Database,
@@ -936,6 +939,7 @@ fn rpc_config(
                 recently_advertised,
                 Arc::clone(&tx_pool),
                 rebroadcast,
+                ntfn.clone(),
             ),
         ),
         tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(tx_pool)),

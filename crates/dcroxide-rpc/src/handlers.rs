@@ -2779,8 +2779,10 @@ pub fn handle_send_raw_transaction<C: RpcChain>(
         };
 
     // Generate and relay inventory vectors for all newly accepted
-    // transactions.  dcrd also notifies its websocket clients here;
-    // that hook arrives with the websocket layer.
+    // transactions and notify subscribed websocket clients (dcrd
+    // `handleSendRawTransaction` calls both `RelayTransactions` and
+    // `NotifyNewTransactions`; the node conn-manager seam performs the
+    // websocket notification alongside the peer relay).
     server.cfg.conn_mgr.relay_transactions(&accepted_txs);
 
     // Keep track of the request transaction so it can be rebroadcast

@@ -852,6 +852,20 @@ impl ServerPeerHandler {
         };
         self.ctx.sync_peers.deregister(id);
         self.ctx.sync_peers.execute(actions);
+
+        // Evict every orphan the departing peer contributed, freeing its
+        // slots in the shared orphan pool immediately rather than leaving
+        // them to age out (dcrd `serverPeer.Run` calling
+        // `txMemPool.RemoveOrphansByTag(mempool.Tag(sp.ID()))` after
+        // `DonePeer`).  The tag matches the one netsync tx intake records
+        // (`peer_id as u64`); reaching here means the peer was registered,
+        // which mirrors dcrd's `VersionKnown` gate on the same call.
+        let _num_evicted = self
+            .ctx
+            .tx_pool
+            .lock()
+            .expect("tx pool mutex poisoned")
+            .remove_orphans_by_tag(id as u64);
     }
 
     /// Run a sync-manager intake for this registered peer and execute

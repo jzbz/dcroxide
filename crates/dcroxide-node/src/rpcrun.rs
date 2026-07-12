@@ -497,6 +497,11 @@ struct RpcRelaySinks {
     recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
     tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
     rebroadcast: crate::rebroadcast::RebroadcastSink,
+    /// The websocket notification manager, so a submitted transaction
+    /// reaches subscribed clients as well as peers (dcrd
+    /// `handleSendRawTransaction` calling `NotifyNewTransactions`
+    /// alongside `RelayTransactions`).
+    ntfn: crate::websocket::NodeNtfnMgr,
 }
 
 impl NodeRpcConnManager {
@@ -534,12 +539,14 @@ impl NodeRpcConnManager {
         recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
         tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
         rebroadcast: crate::rebroadcast::RebroadcastSink,
+        ntfn: crate::websocket::NodeNtfnMgr,
     ) -> NodeRpcConnManager {
         self.sync_peers = sync_peers;
         self.relay = Some(RpcRelaySinks {
             recently_advertised,
             tx_pool,
             rebroadcast,
+            ntfn,
         });
         self
     }
@@ -604,17 +611,25 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
         let Some(relay) = &self.relay else {
             return;
         };
+        let mut notify_pairs: Vec<(dcroxide_wire::MsgTx, i8)> = Vec::new();
         for hash in tx_hashes {
             let fetched = {
                 let pool = relay.tx_pool.lock().expect("tx pool mutex poisoned");
                 pool.fetch_transaction(hash)
             };
             if let Some(tx) = fetched {
+                let tree =
+                    if dcroxide_stake::determine_tx_type(&tx) == dcroxide_stake::TxType::Regular {
+                        dcroxide_wire::TX_TREE_REGULAR
+                    } else {
+                        dcroxide_wire::TX_TREE_STAKE
+                    };
                 relay
                     .recently_advertised
                     .lock()
                     .expect("recently advertised poisoned")
-                    .put(*hash, tx);
+                    .put(*hash, tx.clone());
+                notify_pairs.push((tx, tree));
             }
             self.sync_peers
                 .relay_inventory(&crate::server::RelayInvFacts {
@@ -625,6 +640,14 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
                     data_is_block_header: false,
                     data_is_tx: true,
                 });
+        }
+        // Notify subscribed websocket clients of the accepted transactions,
+        // mirroring dcrd's `handleSendRawTransaction` calling
+        // `NotifyNewTransactions(acceptedTxs)` right after
+        // `RelayTransactions`.  This seam's sole caller is that handler, so
+        // bundling the notify here is observably equivalent.
+        if !notify_pairs.is_empty() {
+            relay.ntfn.notify_new_transactions(notify_pairs);
         }
     }
 

@@ -777,7 +777,7 @@ impl Chain {
             return Ok(());
         }
         self.flush_block_index(params)?;
-        self.flush_utxo_cache();
+        self.flush_utxo_cache()?;
         let tip = self.best_chain.tip().expect("best chain tip");
         let (tip_hash, tip_height, work_sum) = {
             let n = self.store.node(tip);
@@ -928,7 +928,7 @@ impl Chain {
     /// when forced): spent tombstones delete their backend rows,
     /// unspent entries are written with the cache state cleared, and
     /// the cache empties.
-    fn flush_utxo_cache(&mut self) {
+    fn flush_utxo_cache(&mut self) -> Result<(), crate::chaindb::ChainDbError> {
         let cache = core::mem::take(&mut self.utxo_cache);
         let mut db_updates: Vec<(OutPoint, Option<UtxoEntry>)> = Vec::new();
         for (key, entry) in cache {
@@ -958,8 +958,9 @@ impl Chain {
                 }
                 Ok(())
             })
-            .expect("utxo flush");
+            .map_err(crate::chaindb::ChainDbError::Db)?;
         }
+        Ok(())
     }
 
     /// Fetch an entry through the cache and backend (dcrd
@@ -976,7 +977,7 @@ impl Chain {
     /// dcrd's forced cache flush does before its backend computes the
     /// stats over the full set.
     pub fn fetch_utxo_stats(&mut self) -> Result<UtxoStats, crate::chaindb::ChainDbError> {
-        self.flush_utxo_cache();
+        self.flush_utxo_cache()?;
         if let Some(db) = &self.db {
             let tip = self.best_chain.tip().expect("best chain tip");
             let (tip_hash, tip_height) = {
@@ -1778,7 +1779,7 @@ impl Chain {
         // rather than the retained originals, and reproducing that
         // timing matters for field-level parity.
         self.commit_view(view);
-        self.flush_utxo_cache();
+        self.flush_utxo_cache().map_err(persist_rule_error)?;
 
         // Remove the block's spend journal record after the flush like
         // dcrd, since the journal is its cache recovery source.
