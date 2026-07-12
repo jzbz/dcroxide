@@ -28,7 +28,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use dcroxide_peer::{MAX_PROTOCOL_VERSION, MsgTransport, Peer, PeerEnv, PeerGlobals};
+use dcroxide_peer::{
+    MAX_PROTOCOL_VERSION, MsgTransport, NEGOTIATE_TIMEOUT, Peer, PeerEnv, PeerGlobals,
+};
 use dcroxide_wire::{CurrencyNet, Message, MsgPing};
 
 use crate::peerconn::NodePeerEnv;
@@ -312,9 +314,13 @@ pub fn run_peer_connection<H>(
 where
     H: ServeHooks,
 {
-    // A read deadline so a peer that stops answering is disconnected
-    // rather than blocking the input loop forever.
-    if let Err(e) = stream.set_read_timeout(Some(idle_timeout)) {
+    // Bound the version handshake by dcrd's 30-second negotiate deadline
+    // (peer `NEGOTIATE_TIMEOUT`), shorter than the idle timeout, so a peer
+    // that connects and then stalls the handshake is dropped promptly
+    // instead of holding a serving thread for the full idle window; the
+    // idle timeout takes over once the session begins.
+    let negotiate_timeout = Duration::from_nanos(NEGOTIATE_TIMEOUT.max(0) as u64);
+    if let Err(e) = stream.set_read_timeout(Some(negotiate_timeout)) {
         return DisconnectReason::ReadError(e.to_string());
     }
     let write_stream = match stream.try_clone() {
@@ -357,6 +363,16 @@ where
     let negotiated_pver = peer.protocol_version();
     read_transport.set_protocol_version(negotiated_pver);
     write_transport.set_protocol_version(negotiated_pver);
+
+    // The handshake completed within the negotiate deadline; the longer
+    // idle timeout governs the session from here (dcrd clearing the
+    // negotiate deadline once the version exchange succeeds).
+    if let Err(e) = read_transport
+        .get_ref()
+        .set_read_timeout(Some(idle_timeout))
+    {
+        return DisconnectReason::ReadError(e.to_string());
+    }
 
     // Share the peer across the loops and queue the verack that follows
     // negotiation.
