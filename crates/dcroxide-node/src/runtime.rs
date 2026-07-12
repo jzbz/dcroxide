@@ -117,6 +117,22 @@ impl Drop for DeregisterGuard<'_> {
     }
 }
 
+/// Decrements the outbound-group counter when dropped, so the count is
+/// released on every exit path — panic unwinds included — and a leaked
+/// count can never permanently exclude an address group from the
+/// automatic dialer (mirroring [`DeregisterGuard`]; dcrd's
+/// `handleDonePeer` always updates `outboundGroups`).
+struct OutboundGroupGuard {
+    groups: crate::dispatch::OutboundGroups,
+    key: String,
+}
+
+impl Drop for OutboundGroupGuard {
+    fn drop(&mut self) {
+        self.groups.decrement(&self.key);
+    }
+}
+
 /// The parameters a fresh inbound peer is built from (the daemon's slice
 /// of dcrd's `peer.Config`).  Plain data so it can be cloned per
 /// connection; the peer's boxed callbacks are left unset here.
@@ -233,19 +249,19 @@ pub(crate) fn serve_outbound_peer(
 
     // Track the outbound group for the connection's lifetime so the
     // automatic dialer spreads across network segments (dcrd
-    // `handleAddPeer`/`handleDonePeer` updating `outboundGroups`).
-    let group = server
-        .as_ref()
-        .map(|ctx| (ctx.outbound_groups.clone(), group_key_for(&na)));
-    if let Some((groups, key)) = &group {
-        groups.increment(key);
-    }
+    // `handleAddPeer`/`handleDonePeer` updating `outboundGroups`).  The
+    // guard releases the count on drop, so a panic in serve_connection
+    // cannot leak it.
+    let _group_guard = server.as_ref().map(|ctx| {
+        let key = group_key_for(&na);
+        ctx.outbound_groups.increment(&key);
+        OutboundGroupGuard {
+            groups: ctx.outbound_groups.clone(),
+            key,
+        }
+    });
 
     serve_connection(stream, peer, addr, template, connected, server, permanent);
-
-    if let Some((groups, key)) = &group {
-        groups.decrement(key);
-    }
 }
 
 /// The address-manager group key for a wire net address.

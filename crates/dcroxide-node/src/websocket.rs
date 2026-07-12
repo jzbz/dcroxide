@@ -630,16 +630,15 @@ pub fn serve_websocket<S: Read + Write>(
             // ends the connection.
             Ok(WsIn::Close) | Err(_) => break,
         };
-        let Ok(body) = String::from_utf8(message) else {
-            // Non-UTF-8 payloads cannot be JSON; dcrd's JSON parse is
-            // the backstop, so treat it as a parse failure.
-            if !authenticated {
-                break;
-            }
-            continue;
+        // A non-UTF-8 (e.g. binary) frame cannot be JSON; dcrd feeds the
+        // raw bytes to json.Unmarshal, so an authenticated client gets a
+        // parse-error reply and an unauthenticated one is disconnected,
+        // rather than the frame being dropped silently.
+        let outcome = match String::from_utf8(message) {
+            Ok(body) => handle_ws_request(server, &state, &body),
+            Err(_) => parse_error_outcome(authenticated, "invalid UTF-8"),
         };
-
-        match handle_ws_request(server, &state, &body) {
+        match outcome {
             WsOutcome::Reply(reply) => {
                 if conn.write_text(reply.as_bytes()).is_err() {
                     break;
@@ -672,6 +671,26 @@ enum WsOutcome {
     Disconnect,
 }
 
+/// The outcome for a request that could not be parsed: dcrd disconnects
+/// an unauthenticated client on any parse failure and hands an
+/// authenticated one an RPC parse error (dcrd `inHandler`).  Shared by
+/// the JSON parse path and the non-UTF-8 frame path.
+fn parse_error_outcome(authenticated: bool, err_text: &str) -> WsOutcome {
+    if !authenticated {
+        return WsOutcome::Disconnect;
+    }
+    let json_err = RPCError::new(
+        err_rpc_parse().code,
+        &format!("Failed to parse request: {err_text}"),
+    );
+    reply_or_skip(create_marshalled_reply(
+        "1.0",
+        &RpcId::Null,
+        None,
+        Some(&json_err),
+    ))
+}
+
 /// Give one websocket request its dcrd `inHandler` handling: the
 /// authenticate state machine, the limited-user gate, the
 /// notification-id skip, and dispatch through the ported service
@@ -684,23 +703,7 @@ fn handle_ws_request(
     let (authenticated, is_admin) = client_flags(state);
     let req = match unmarshal_request(body) {
         Ok(req) => req,
-        Err(err_text) => {
-            // dcrd disconnects an unauthenticated client on any parse
-            // failure; an authenticated one gets the parse error.
-            if !authenticated {
-                return WsOutcome::Disconnect;
-            }
-            let json_err = RPCError::new(
-                err_rpc_parse().code,
-                &format!("Failed to parse request: {err_text}"),
-            );
-            return reply_or_skip(create_marshalled_reply(
-                "1.0",
-                &RpcId::Null,
-                None,
-                Some(&json_err),
-            ));
-        }
+        Err(err_text) => return parse_error_outcome(authenticated, &err_text),
     };
     let param_refs: Vec<&str> = req.params.iter().map(|s| s.as_str()).collect();
 

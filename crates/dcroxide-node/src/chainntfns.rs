@@ -527,7 +527,12 @@ impl ChainNtfnHandler {
                         // The only operator-visible diagnostic for a
                         // halted index (dcrd logs the error right
                         // before cancelling).
-                        eprintln!("index update failed, index maintenance halted: {e}");
+                        // Emit on stdout with dcrd's level + subsystem tag
+                        // (INDX, ERROR) so an operator capturing the daemon's
+                        // stdout sees why the index halted, matching the
+                        // `log_info` placeholder convention (dcrd logs this via
+                        // `indxLog.Error`).
+                        println!("[ERR] INDX: index update failed, index maintenance halted: {e}");
                     }
                 }
             }
