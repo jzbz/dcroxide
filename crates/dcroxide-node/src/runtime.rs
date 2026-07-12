@@ -166,8 +166,19 @@ pub fn inbound_peer_handler(
     template: PeerTemplate,
     connected: ConnectedPeers,
     server: Option<Arc<ServerContext>>,
+    max_peers: usize,
 ) -> InboundHandler {
     Arc::new(move |stream: TcpStream, addr: SocketAddr| {
+        // Refuse the connection once the total (inbound and outbound)
+        // connection count has reached the limit, so an attacker opening
+        // sockets cannot spawn unbounded serving threads (dcrd's
+        // `handleAddPeer` rejecting a peer over `cfg.MaxPeers`).  A limit
+        // of zero means unlimited, matching dcrd.  The dropped stream is
+        // closed on return.
+        if max_peers != 0 && connected.len() >= max_peers {
+            let _ = stream.shutdown(Shutdown::Both);
+            return;
+        }
         let template = template.clone();
         let connected = connected.clone();
         let server = server.clone();
@@ -520,5 +531,54 @@ mod tests {
             connected.is_empty(),
             "the guard should deregister on unwind"
         );
+    }
+
+    /// An inbound connection accepted while the registry is already at the
+    /// peer limit is refused: its socket is shut down without a serving
+    /// thread, so the client reads end-of-file.
+    #[test]
+    fn inbound_admission_rejects_over_the_peer_limit() {
+        use std::io::Read;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let bound = listener.local_addr().expect("addr");
+
+        // Fill the registry to a limit of one.
+        let connected = ConnectedPeers::new();
+        let _held_client = TcpStream::connect(bound).expect("connect held");
+        let (held_server, _) = listener.accept().expect("accept held");
+        connected.register(held_server);
+        assert_eq!(connected.len(), 1);
+
+        let template = PeerTemplate {
+            net: CurrencyNet::TEST_NET3,
+            protocol_version: 0,
+            services: ServiceFlag(1),
+            user_agent_name: "dcroxide".to_string(),
+            user_agent_version: "0.1.0".to_string(),
+            idle_timeout: Duration::from_secs(3600),
+            ping_interval: Duration::from_secs(3600),
+        };
+        let handler = inbound_peer_handler(template, connected.clone(), None, 1);
+
+        // The next connection is over the limit and must be refused.
+        let mut over_client = TcpStream::connect(bound).expect("connect over");
+        let (over_server, over_addr) = listener.accept().expect("accept over");
+        handler(over_server, over_addr);
+
+        // The refused connection's socket was shut down, so the client
+        // reads end-of-file rather than a version handshake.
+        over_client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            over_client.read(&mut buf).expect("read"),
+            0,
+            "an over-limit inbound peer is refused"
+        );
+
+        // The under-limit connection is untouched by admission control.
+        assert_eq!(connected.len(), 1);
     }
 }

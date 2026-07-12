@@ -829,7 +829,12 @@ fn start_listeners(
     let specs = parse_listeners(&cfg.listeners)?;
     ListenerRuntime::start(
         &specs,
-        inbound_peer_handler(template.clone(), connected, Some(server)),
+        inbound_peer_handler(
+            template.clone(),
+            connected,
+            Some(server),
+            cfg.max_peers.max(0) as usize,
+        ),
     )
     .map_err(|e| e.to_string())
 }

@@ -104,7 +104,7 @@ fn serves_an_inbound_peer_through_the_handler() {
 
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, ConnectedPeers::new(), None),
+        inbound_peer_handler(template, ConnectedPeers::new(), None, 0),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();
@@ -182,7 +182,7 @@ fn disconnecting_all_peers_tears_down_a_served_connection() {
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, connected.clone(), None),
+        inbound_peer_handler(template, connected.clone(), None, 0),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();

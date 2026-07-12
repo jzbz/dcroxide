@@ -93,7 +93,7 @@ fn serve_genesis_chain() -> (
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, connected.clone(), Some(server)),
+        inbound_peer_handler(template, connected.clone(), Some(server), 0),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();
@@ -491,7 +491,7 @@ fn initiates_header_sync_with_a_data_serving_peer() {
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, connected.clone(), Some(server)),
+        inbound_peer_handler(template, connected.clone(), Some(server), 0),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();
@@ -608,7 +608,7 @@ fn disconnects_a_stalled_header_sync_peer() {
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, connected.clone(), Some(server)),
+        inbound_peer_handler(template, connected.clone(), Some(server), 0),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();
@@ -814,7 +814,7 @@ fn announces_connected_blocks_to_served_peers() {
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, connected.clone(), Some(server)),
+        inbound_peer_handler(template, connected.clone(), Some(server), 0),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();

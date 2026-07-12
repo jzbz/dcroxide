@@ -94,6 +94,7 @@ fn dials_and_serves_a_permanent_connection() {
             template("listener"),
             listen_connected.clone(),
             Some(listen_server),
+            0,
         ),
     )
     .expect("start listener");
