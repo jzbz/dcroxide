@@ -58,7 +58,15 @@ pub struct NodeNtfnMgr {
     clients: Arc<Mutex<HashMap<u64, ClientHandle>>>,
     events: mpsc::Sender<NtfnEvent>,
     receiver: Arc<Mutex<Option<mpsc::Receiver<NtfnEvent>>>>,
+    /// The maximum number of concurrent websocket clients (dcrd's
+    /// `RPCMaxWebsockets`).  A value of zero rejects every client, as
+    /// dcrd's `NumClients()+1 > 0` does.
+    max_websockets: usize,
 }
+
+/// The default concurrent websocket client cap (dcrd's
+/// `defaultMaxRPCWebsockets`).
+const DEFAULT_MAX_WEBSOCKETS: usize = 25;
 
 /// The per-notification-kind subscriber sets, keyed by session id.
 #[derive(Default)]
@@ -124,15 +132,22 @@ enum NtfnEvent {
 }
 
 impl NodeNtfnMgr {
-    /// An empty notification manager whose delivery thread has not
-    /// started yet.
+    /// An empty notification manager (with dcrd's default websocket cap)
+    /// whose delivery thread has not started yet.
     pub fn new() -> NodeNtfnMgr {
+        NodeNtfnMgr::with_max_websockets(DEFAULT_MAX_WEBSOCKETS)
+    }
+
+    /// An empty notification manager with an explicit concurrent
+    /// websocket client cap (the daemon threads `RPCMaxWebsockets` here).
+    pub fn with_max_websockets(max_websockets: usize) -> NodeNtfnMgr {
         let (events, receiver) = mpsc::channel();
         NodeNtfnMgr {
             inner: Arc::default(),
             clients: Arc::default(),
             events,
             receiver: Arc::new(Mutex::new(Some(receiver))),
+            max_websockets,
         }
     }
 
@@ -231,17 +246,24 @@ impl NodeNtfnMgr {
         }
     }
 
-    /// Register a connected client (dcrd `AddClient`).
+    /// Register a connected client, returning `false` without inserting
+    /// when the concurrent websocket cap is reached (dcrd rejecting when
+    /// `NumClients()+1 > RPCMaxWebsockets`).  The check and insert happen
+    /// under the same lock, so concurrent connection threads cannot race
+    /// past the cap.  `len() >= max` is `len()+1 > max` without the
+    /// overflow-prone increment.
     fn add_client(
         &self,
         session_id: u64,
         state: Arc<Mutex<WsClient>>,
         outbound: Arc<Mutex<VecDeque<String>>>,
-    ) {
-        self.clients
-            .lock()
-            .expect("ws clients")
-            .insert(session_id, ClientHandle { state, outbound });
+    ) -> bool {
+        let mut clients = self.clients.lock().expect("ws clients");
+        if clients.len() >= self.max_websockets {
+            return false;
+        }
+        clients.insert(session_id, ClientHandle { state, outbound });
+        true
     }
 
     /// Drop a disconnected client: the registry entry and every
@@ -563,7 +585,14 @@ pub fn serve_websocket<S: Read + Write>(
         wsc
     }));
     let outbound: Arc<Mutex<VecDeque<String>>> = Arc::default();
-    ntfn.add_client(session_id, Arc::clone(&state), Arc::clone(&outbound));
+    // Register the client, or refuse it when the websocket cap is
+    // reached: dropping `stream` closes the connection with no close
+    // frame, exactly as dcrd's `conn.Close()` does.  Returning here
+    // before the serve loop keeps `remove_client` from running for a
+    // client that was never admitted.
+    if !ntfn.add_client(session_id, Arc::clone(&state), Arc::clone(&outbound)) {
+        return;
+    }
     let mut conn = WsConn::new(stream);
 
     loop {
@@ -860,5 +889,31 @@ mod tests {
         // entry stays, kept bug-for-bug.
         assert!(subs.mix_messages.contains(&7));
         assert!(mgr.clients.lock().expect("clients").is_empty());
+    }
+
+    /// The concurrent-websocket cap admits up to the limit and refuses
+    /// the next client (dcrd rejecting when `NumClients()+1 >
+    /// RPCMaxWebsockets`), and a cap of zero refuses every client.
+    #[test]
+    fn add_client_enforces_the_websocket_cap() {
+        let mgr = NodeNtfnMgr::with_max_websockets(2);
+        assert!(mgr.add_client(1, Arc::new(Mutex::new(WsClient::new(1))), Arc::default()));
+        assert!(mgr.add_client(2, Arc::new(Mutex::new(WsClient::new(2))), Arc::default()));
+        assert!(
+            !mgr.add_client(3, Arc::new(Mutex::new(WsClient::new(3))), Arc::default()),
+            "the third client is over the cap of two"
+        );
+        assert_eq!(mgr.clients.lock().expect("clients").len(), 2);
+
+        // A freed slot admits a replacement.
+        mgr.remove_client(1);
+        assert!(mgr.add_client(4, Arc::new(Mutex::new(WsClient::new(4))), Arc::default()));
+
+        // A zero cap refuses every client.
+        let none = NodeNtfnMgr::with_max_websockets(0);
+        assert!(
+            !none.add_client(1, Arc::new(Mutex::new(WsClient::new(1))), Arc::default()),
+            "a zero cap refuses every client"
+        );
     }
 }

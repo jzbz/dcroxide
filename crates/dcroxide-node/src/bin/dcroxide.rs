@@ -287,7 +287,9 @@ fn run(cfg: Config) -> ExitCode {
     let ntfn = if cfg.disable_rpc {
         None
     } else {
-        Some(dcroxide_node::websocket::NodeNtfnMgr::new())
+        Some(dcroxide_node::websocket::NodeNtfnMgr::with_max_websockets(
+            cfg.rpc_max_websockets.max(0) as usize,
+        ))
     };
     let (server, connected, template, stall_timer) = build_server(
         &cfg,

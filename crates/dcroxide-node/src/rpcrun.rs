@@ -1195,6 +1195,12 @@ pub struct HttpHead {
     connection: Option<String>,
     pub(crate) sec_websocket_key: Option<String>,
     pub(crate) sec_websocket_version: Option<String>,
+    /// The `Origin` request header, consulted by the websocket
+    /// same-origin guard (dcrd's `CheckOrigin`).
+    origin: Option<String>,
+    /// The `Host` request header, the request host the `Origin` is
+    /// compared against.
+    host: Option<String>,
 }
 
 /// The largest request head accepted, bounding an abusive client.
@@ -1238,6 +1244,8 @@ fn read_http_head<S: Read + SocketTimeout>(
         connection: None,
         sec_websocket_key: None,
         sec_websocket_version: None,
+        origin: None,
+        host: None,
     };
     for line in lines {
         if line.is_empty() {
@@ -1257,6 +1265,10 @@ fn read_http_head<S: Read + SocketTimeout>(
                 head.sec_websocket_key = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("sec-websocket-version") {
                 head.sec_websocket_version = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("origin") {
+                head.origin = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("host") {
+                head.host = Some(value.to_string());
             }
         }
     }
@@ -1276,6 +1288,50 @@ fn is_websocket_upgrade(head: &HttpHead) -> bool {
         && head.method.eq_ignore_ascii_case("GET")
         && has_token(&head.connection, "upgrade")
         && has_token(&head.upgrade, "websocket")
+}
+
+/// Whether a websocket upgrade's `Origin` header is allowed, mirroring
+/// dcrd's `CheckOrigin` (rpcserver.go): a missing or empty `Origin` is
+/// allowed (non-browser clients such as dcrctl send none), a `null`
+/// origin or a `file://` scheme is allowed (sandboxed/local pages), and
+/// any other origin must match the request `Host` after stripping the
+/// port and folding ASCII case; a malformed origin is rejected.  This
+/// blocks a cross-origin web page (or a DNS-rebinding attack against a
+/// `--notls` localhost RPC) from opening a websocket.
+fn check_origin(head: &HttpHead) -> bool {
+    let Some(origin) = head.origin.as_deref() else {
+        return true;
+    };
+    if origin.is_empty() || origin == "null" {
+        return true;
+    }
+    let Some((scheme, authority_and_path)) = origin.split_once("://") else {
+        return false;
+    };
+    if scheme.eq_ignore_ascii_case("file") {
+        return true;
+    }
+    // The authority is everything up to the first path/query/fragment
+    // delimiter; drop any `userinfo@` before the host, as `url.Parse` does.
+    let authority = authority_and_path
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    let origin_host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let Some(request_host_port) = head.host.as_deref() else {
+        return false;
+    };
+    strip_port(origin_host_port).eq_ignore_ascii_case(&strip_port(request_host_port))
+}
+
+/// The host portion of a `host[:port]`, stripping the port when present
+/// and falling back to the whole value when it does not parse as a
+/// host-port pair (dcrd's `if host, _, err := net.SplitHostPort(...);
+/// err == nil` fallback).
+fn strip_port(host_port: &str) -> String {
+    crate::gostd::split_host_port(host_port)
+        .map(|(host, _)| host)
+        .unwrap_or_else(|_| host_port.to_string())
 }
 
 /// Serve a single RPC connection: parse the request head, then either
@@ -1318,6 +1374,16 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
                 return;
             }
         };
+        // Reject a cross-origin upgrade (dcrd's `CheckOrigin`), after the
+        // auth 401 so the ordering matches dcrd's auth-then-origin.
+        if !check_origin(&head) {
+            let _ = write_response(
+                &mut stream,
+                "403 Forbidden",
+                b"websocket: request origin not allowed",
+            );
+            return;
+        }
         // Drop to the notification poll interval: an idle read wakes
         // the serving loop to write queued notifications, and dcrd
         // websocket connections have no read deadline, so the 30
@@ -1440,6 +1506,61 @@ fn write_unauthorized<S: Write>(stream: &mut S) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use dcroxide_rpc::server::RpcConnManager;
+
+    /// A minimal request head carrying only an `Origin` and `Host`, for
+    /// exercising the websocket same-origin guard.
+    fn origin_head(origin: Option<&str>, host: Option<&str>) -> HttpHead {
+        HttpHead {
+            method: "GET".to_string(),
+            path: "/ws".to_string(),
+            authorization: None,
+            content_length: 0,
+            upgrade: None,
+            connection: None,
+            sec_websocket_key: None,
+            sec_websocket_version: None,
+            origin: origin.map(str::to_string),
+            host: host.map(str::to_string),
+        }
+    }
+
+    /// The websocket origin guard mirrors dcrd's `CheckOrigin`: no
+    /// `Origin` (non-browser clients) and `null`/`file://` origins are
+    /// allowed, a same-host origin is allowed regardless of port, and a
+    /// cross-host origin is rejected.
+    #[test]
+    fn check_origin_matches_dcrd() {
+        // No Origin header at all -> allowed (dcrctl and friends).
+        assert!(check_origin(&origin_head(None, Some("localhost:9109"))));
+        // Sandboxed / local-file origins -> allowed.
+        assert!(check_origin(&origin_head(Some("null"), Some("localhost"))));
+        assert!(check_origin(&origin_head(
+            Some("file:///tmp/x.html"),
+            Some("h")
+        )));
+        // Same host, differing ports -> allowed (port is stripped).
+        assert!(check_origin(&origin_head(
+            Some("https://localhost:8443"),
+            Some("localhost:9109"),
+        )));
+        // Case-insensitive host match -> allowed.
+        assert!(check_origin(&origin_head(
+            Some("https://Example.COM"),
+            Some("example.com"),
+        )));
+        // Cross-origin -> rejected.
+        assert!(!check_origin(&origin_head(
+            Some("https://evil.example.net"),
+            Some("localhost:9109"),
+        )));
+        // Malformed origin -> rejected.
+        assert!(!check_origin(&origin_head(
+            Some("not-a-url"),
+            Some("localhost")
+        )));
+        // An origin with no request Host to compare against -> rejected.
+        assert!(!check_origin(&origin_head(Some("https://localhost"), None)));
+    }
 
     /// The connection-manager adapter answers `getpeerinfo` from the
     /// peer registry attached through the builder — proving both the
