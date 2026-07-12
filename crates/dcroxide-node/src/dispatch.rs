@@ -1447,29 +1447,53 @@ impl ServerPeerHandler {
 
     /// Answer a getinitstate request once per connection (dcrd
     /// `serverPeer.OnGetInitState`).  Before stake validation the
-    /// response is the empty message; past it, the eligible head
-    /// blocks, their votes, and the treasury spends come from the
-    /// mempool and tip generation, which are not yet wired, so the
-    /// filled response is empty until then (the daemon cannot sync
-    /// past stake validation before the sync manager lands).
+    /// response is the empty message; past it, the eligible head blocks
+    /// (the tip generation), their mempool votes, and the mempool
+    /// treasury spends, matching dcrd's filled response.
     fn on_get_init_state(&mut self, types: &[String], outbound: &OutboundQueue) {
         let wants = InitStateWants {
             blocks: types.iter().any(|t| t == INIT_STATE_HEAD_BLOCKS),
             votes: types.iter().any(|t| t == INIT_STATE_HEAD_BLOCK_VOTES),
             tspends: types.iter().any(|t| t == INIT_STATE_TSPENDS),
         };
-        let best_height = {
+        // The eligible head blocks are the tip generation the votes
+        // attach to; they key both the block list and the vote lookup, so
+        // fetch them when either is requested.  The chain lock is released
+        // before the mempool lookups below, so there is no lock-order
+        // cycle with tx intake's pool->chain order.
+        let (best_height, eligible_blocks) = {
             let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
-            chain.best_snapshot().height
+            let height = chain.best_snapshot().height;
+            let blocks = if wants.blocks || wants.votes {
+                chain.tip_generation()
+            } else {
+                Vec::new()
+            };
+            (height, blocks)
+        };
+        let tspends = if wants.tspends {
+            self.ctx
+                .tx_pool
+                .lock()
+                .expect("tx pool mutex poisoned")
+                .tspend_hashes()
+        } else {
+            Vec::new()
         };
         let outcome = on_get_init_state(
             self.init_state_sent,
             best_height,
             self.ctx.stake_validation_height,
             wants,
-            &[],
-            |_| Vec::new(),
-            &[],
+            &eligible_blocks,
+            |block_hash| {
+                self.ctx
+                    .tx_pool
+                    .lock()
+                    .expect("tx pool mutex poisoned")
+                    .vote_hashes_for_block(block_hash)
+            },
+            &tspends,
         );
         if matches!(outcome, OnGetInitStateOutcome::AlreadySent) {
             return;

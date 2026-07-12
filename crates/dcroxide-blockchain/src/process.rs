@@ -334,16 +334,10 @@ impl Chain {
     }
 
     /// Whether the node is an ancestor of (or is) the target (dcrd
-    /// `blockNode.IsAncestorOf`).
+    /// `blockNode.IsAncestorOf`), delegating to the block index's own
+    /// ancestor walk so the reorg gate and the store never drift.
     fn is_ancestor_of(&self, node: NodeId, target: NodeId) -> bool {
-        let node_height = self.store.node(node).height;
-        let target_height = self.store.node(target).height;
-        if target_height < node_height {
-            return false;
-        }
-        self.store
-            .relative_ancestor(target, target_height - node_height)
-            == Some(node)
+        self.store.is_ancestor_of(node, target)
     }
 
     /// Open a persistent chain over the database, creating the
