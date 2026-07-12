@@ -29,6 +29,20 @@ fn serve_rpc() -> (
     dcroxide_chainhash::Hash,
     Arc<Mutex<Chain>>,
 ) {
+    // A cap comfortably above any test's connection concurrency, so the
+    // standard-client limit never trips for the functional tests.
+    serve_rpc_capped(128)
+}
+
+fn serve_rpc_capped(
+    max_clients: usize,
+) -> (
+    tempfile::TempDir,
+    dcroxide_node::rpcrun::RpcListener,
+    u16,
+    dcroxide_chainhash::Hash,
+    Arc<Mutex<Chain>>,
+) {
     let params = dcroxide_chaincfg::testnet3_params();
     let genesis_hash = params.genesis_hash;
 
@@ -112,6 +126,7 @@ fn serve_rpc() -> (
         server,
         dcroxide_node::rpcrun::RpcTransport::Plain,
         dcroxide_node::websocket::NodeNtfnMgr::new(),
+        max_clients,
     )
     .expect("start rpc listener");
     let port = listener.bound_addrs()[0].port();
@@ -358,6 +373,55 @@ fn rejects_bad_credentials_with_dcrds_401() {
     listener.shutdown();
 }
 
+#[test]
+fn unauthenticated_post_is_rejected_before_reading_the_body() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+
+    // An unauthenticated POST declares a multi-megabyte body but sends
+    // none, then half-closes its write side.  The server must
+    // authenticate before allocating or reading the body (dcrd's
+    // checkAuth-before-jsonRPCRead order), so it still answers 401
+    // instead of blocking on a body that never arrives.  Before the fix
+    // the body was read first, and this connection got no response.
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let request = "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 4000000\r\nConnection: close\r\n\r\n";
+    stream.write_all(request.as_bytes()).expect("write");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("half close");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    assert!(
+        response.starts_with("HTTP/1.1 401"),
+        "an unauthenticated request must be rejected without its body: {response:?}"
+    );
+
+    listener.shutdown();
+}
+
+#[test]
+fn a_zero_client_cap_sheds_every_standard_request_with_503() {
+    // dcrd's RPCMaxClients == 0 makes numClients+1 > 0 always true, so
+    // every standard RPC connection is shed with 503.  The cap is checked
+    // before authentication, so even a valid request is refused.
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc_capped(0);
+
+    let response = post(
+        port,
+        Some("user:pass"),
+        r#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}"#,
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 503"),
+        "a zero client cap must shed every request: {response}"
+    );
+
+    listener.shutdown();
+}
+
 /// The UTXO seams: gettxout resolves a seeded entry through the chain
 /// adapter (falling through the empty mempool with dcrd's default
 /// includemempool), misses answer JSON null, and gettxoutsetinfo
@@ -505,6 +569,7 @@ fn serves_tls_with_a_generated_certificate() {
         server,
         dcroxide_node::rpcrun::RpcTransport::Tls(tls),
         dcroxide_node::websocket::NodeNtfnMgr::new(),
+        128,
     )
     .expect("start tls listener");
     let port = listener.bound_addrs()[0].port();

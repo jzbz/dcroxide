@@ -259,6 +259,7 @@ fn serves_getwork_over_the_live_generator() {
         server,
         dcroxide_node::rpcrun::RpcTransport::Plain,
         dcroxide_node::websocket::NodeNtfnMgr::new(),
+        128,
     )
     .expect("start rpc listener");
     let port = listener.bound_addrs()[0].port();

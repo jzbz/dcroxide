@@ -28,10 +28,10 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dcroxide_addrmgr::AddrManager;
 use dcroxide_blockchain::RuleErrorKind;
@@ -51,6 +51,21 @@ const RPC_READ_LIMIT_AUTHENTICATED: usize = 1 << 23;
 
 /// The interval the accept loop waits between polling for shutdown.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The absolute deadline covering a connection's initial handshake — the
+/// request head plus, for an authenticated POST, its body (dcrd's
+/// `http.Server.ReadTimeout = rpcAuthTimeoutSeconds`, 10 seconds).  It is
+/// re-armed as the remaining budget before every plaintext `stream.read`,
+/// so a byte-dribbling slowloris on the `--notls` path is bounded to the
+/// deadline rather than resetting a per-read timeout indefinitely.
+///
+/// Two gaps remain, both tracked as follow-ups: over TLS a single
+/// `rustls` read loops many internal `sock.read` syscalls under one
+/// re-armed `SO_RCVTIMEO`, so the absolute bound does not reach the TLS
+/// record loop (std exposes no absolute read deadline; a per-connection
+/// watchdog is the fix), and there is no write-side deadline, so a
+/// zero-window reader can stall a response write.
+const RPC_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The websocket serving loop's read timeout: how often an idle
 /// connection wakes to write queued notifications.
@@ -983,8 +998,13 @@ pub fn start_rpc_listener(
     server: Arc<Mutex<Server<NodeRpcChain>>>,
     transport: RpcTransport,
     ntfn: crate::websocket::NodeNtfnMgr,
+    max_clients: usize,
 ) -> std::io::Result<RpcListener> {
     let shutdown = Arc::new(AtomicBool::new(false));
+    // The concurrent standard-client count, shared across every listener
+    // thread so the cap bounds the whole RPC server (dcrd's single
+    // `numClients` atomic).
+    let num_clients = Arc::new(AtomicI32::new(0));
     let mut threads = Vec::with_capacity(listeners.len());
     let mut bound = Vec::with_capacity(listeners.len());
 
@@ -997,8 +1017,17 @@ pub fn start_rpc_listener(
         let server = Arc::clone(&server);
         let transport = transport.clone();
         let ntfn = ntfn.clone();
+        let num_clients = Arc::clone(&num_clients);
         threads.push(thread::spawn(move || {
-            accept_loop(&listener, &shutdown, &server, &transport, &ntfn);
+            accept_loop(
+                &listener,
+                &shutdown,
+                &server,
+                &transport,
+                &ntfn,
+                max_clients,
+                &num_clients,
+            );
         }));
     }
 
@@ -1017,6 +1046,8 @@ fn accept_loop(
     server: &Arc<Mutex<Server<NodeRpcChain>>>,
     transport: &RpcTransport,
     ntfn: &crate::websocket::NodeNtfnMgr,
+    max_clients: usize,
+    num_clients: &Arc<AtomicI32>,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -1024,13 +1055,16 @@ fn accept_loop(
                 if stream.set_nonblocking(false).is_err() {
                     continue;
                 }
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                // The connection's whole handshake is bounded by
+                // `serve_rpc_connection`'s per-read absolute deadline
+                // rather than a resetting per-read socket timeout.
                 let server = Arc::clone(server);
                 let ntfn = ntfn.clone();
+                let num_clients = Arc::clone(num_clients);
                 match transport {
                     RpcTransport::Plain => {
                         thread::spawn(move || {
-                            serve_rpc_connection(stream, &server, &ntfn);
+                            serve_rpc_connection(stream, &server, &ntfn, max_clients, &num_clients);
                         });
                     }
                     RpcTransport::Tls(config) => {
@@ -1040,7 +1074,7 @@ fn accept_loop(
                                 return;
                             };
                             let tls = rustls::StreamOwned::new(session, stream);
-                            serve_rpc_connection(tls, &server, &ntfn);
+                            serve_rpc_connection(tls, &server, &ntfn, max_clients, &num_clients);
                         });
                     }
                 }
@@ -1073,6 +1107,83 @@ impl SocketTimeout for rustls::StreamOwned<rustls::ServerConnection, TcpStream> 
     }
 }
 
+/// Counts a standard (non-websocket) RPC client for its lifetime,
+/// decrementing on drop so the count is released on every return path
+/// (dcrd's `incrementClients`/`decrementClients` around the `/`
+/// handler).
+struct RpcClientGuard<'a> {
+    counter: &'a AtomicI32,
+}
+
+impl<'a> RpcClientGuard<'a> {
+    fn new(counter: &'a AtomicI32) -> RpcClientGuard<'a> {
+        counter.fetch_add(1, Ordering::SeqCst);
+        RpcClientGuard { counter }
+    }
+}
+
+impl Drop for RpcClientGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Fill `buf` from the stream under an absolute deadline, re-arming the
+/// per-read socket timeout to the remaining budget before each read so
+/// the total read time is capped no matter how the peer paces its bytes.
+/// Returns false on timeout, EOF, or error.
+fn read_exact_by_deadline<S: Read + SocketTimeout>(
+    stream: &mut S,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> bool {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        stream.set_socket_read_timeout(Some(remaining));
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => return false,
+            Ok(n) => filled = filled.saturating_add(n),
+            // A signal interrupting the read is retried within the same
+            // deadline (as the std `read_exact` this replaced did); a
+            // timeout surfaces as `WouldBlock`/`TimedOut` and correctly
+            // ends the read.
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Read and discard up to `remaining` declared body bytes under the
+/// deadline, in bounded scratch chunks.  An error response (401/503/400)
+/// that closes the socket while inbound body bytes are still unread
+/// triggers a TCP reset that can truncate the response the client is
+/// reading; draining first lets a well-behaved client's small body clear
+/// so the close is clean.  A body larger than the deadline allows drains
+/// only partially and then closes, mirroring dcrd's bounded post-handler
+/// drain.
+fn drain_body<S: Read + SocketTimeout>(stream: &mut S, mut remaining: usize, deadline: Instant) {
+    let mut scratch = [0u8; 4096];
+    while remaining > 0 {
+        let want = remaining.min(scratch.len());
+        let budget = deadline.saturating_duration_since(Instant::now());
+        if budget.is_zero() {
+            return;
+        }
+        stream.set_socket_read_timeout(Some(budget));
+        match stream.read(&mut scratch[..want]) {
+            Ok(0) => return,
+            Ok(n) => remaining = remaining.saturating_sub(n),
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        }
+    }
+}
+
 /// The parsed head of an HTTP/1.1 request: the request line pieces and
 /// the headers the RPC and websocket endpoints consult.
 pub struct HttpHead {
@@ -1093,11 +1204,16 @@ const MAX_HEAD_SIZE: usize = 1 << 13;
 /// terminator, leaving the stream positioned exactly at the body (or
 /// at the first websocket frame), so the websocket path never
 /// over-reads into frame data.
-fn read_http_head<S: Read>(stream: &mut S) -> Result<HttpHead, &'static str> {
+fn read_http_head<S: Read + SocketTimeout>(
+    stream: &mut S,
+    deadline: Instant,
+) -> Result<HttpHead, &'static str> {
     let mut raw = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        stream.read_exact(&mut byte).map_err(|_| "read failure")?;
+        if !read_exact_by_deadline(stream, &mut byte, deadline) {
+            return Err("read failure");
+        }
         raw.push(byte[0]);
         if raw.ends_with(b"\r\n\r\n") {
             break;
@@ -1169,8 +1285,15 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     mut stream: S,
     server: &Arc<Mutex<Server<NodeRpcChain>>>,
     ntfn: &crate::websocket::NodeNtfnMgr,
+    max_clients: usize,
+    num_clients: &Arc<AtomicI32>,
 ) {
-    let head = match read_http_head(&mut stream) {
+    // The absolute deadline for the whole handshake (dcrd's HTTP
+    // `ReadTimeout`), applied per read so a byte-dribbling client cannot
+    // hold the connection open past it.
+    let now = Instant::now();
+    let deadline = now.checked_add(RPC_AUTH_TIMEOUT).unwrap_or(now);
+    let head = match read_http_head(&mut stream, deadline) {
         Ok(head) => head,
         Err(reason) => {
             let _ = write_response(&mut stream, "400 Bad Request", reason.as_bytes());
@@ -1208,19 +1331,30 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
         let _ = write_response(&mut stream, "405 Method Not Allowed", b"method not allowed");
         return;
     }
-    if head.content_length > RPC_READ_LIMIT_AUTHENTICATED {
-        let _ = write_response(&mut stream, "400 Bad Request", b"request too large");
+    // Shed load once the concurrent standard-client count has reached the
+    // cap, before any authentication work (dcrd's `limitConnections`
+    // answering 503 when `numClients+1 > RPCMaxClients`).  A cap of zero —
+    // including a negative config clamped to zero — rejects every standard
+    // client, exactly as dcrd's `numClients+1 > 0` does.  `load() >= max`
+    // is `load()+1 > max` without the overflow-prone increment.
+    if num_clients.load(Ordering::SeqCst) as usize >= max_clients {
+        // Drain the declared body before closing so the 503 reaches the
+        // client cleanly rather than resetting the socket over unread
+        // bytes.  dcrd's 503 body is text/plain via http.Error;
+        // write_response uses the JSON content type, a cosmetic divergence.
+        drain_body(&mut stream, head.content_length, deadline);
+        let _ = write_response(
+            &mut stream,
+            "503 Service Unavailable",
+            b"503 Too busy.  Try again later.\n",
+        );
         return;
     }
-    // Read the body before authenticating so an error response closes
-    // the connection cleanly (an unread body would reset the socket).
-    let mut body = vec![0u8; head.content_length];
-    if stream.read_exact(&mut body).is_err() {
-        return;
-    }
+    let _client_guard = RpcClientGuard::new(num_clients);
 
-    // Authenticate (dcrd `checkAuth` with authentication required),
-    // answering an auth failure with dcrd's 401 and realm.
+    // Authenticate before allocating the body (dcrd runs `checkAuth`
+    // before `jsonRPCRead`), so an unauthenticated client never drives a
+    // full-body allocation from its declared Content-Length.
     let auth = {
         let server = server
             .lock()
@@ -1230,10 +1364,31 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     let is_admin = match auth {
         Ok((_, is_admin)) => is_admin,
         Err(_) => {
+            // Release the client slot before draining so an
+            // unauthenticated client cannot occupy a cap slot for the
+            // drain's duration, then drain the small body so the 401
+            // closes cleanly.
+            drop(_client_guard);
+            drain_body(&mut stream, head.content_length, deadline);
             let _ = write_unauthorized(&mut stream);
             return;
         }
     };
+
+    // The read limit applies only after authentication (dcrd caps the body
+    // inside the authenticated `jsonRPCRead`), so an unauthenticated
+    // oversized request is answered 401 above, not 400.
+    if head.content_length > RPC_READ_LIMIT_AUTHENTICATED {
+        drain_body(&mut stream, head.content_length, deadline);
+        let _ = write_response(&mut stream, "400 Bad Request", b"request too large");
+        return;
+    }
+
+    // Read the authenticated body under the same absolute deadline.
+    let mut body = vec![0u8; head.content_length];
+    if !read_exact_by_deadline(&mut stream, &mut body, deadline) {
+        return;
+    }
 
     let Ok(body) = String::from_utf8(body) else {
         let _ = write_response(&mut stream, "400 Bad Request", b"invalid body");

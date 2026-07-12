@@ -249,6 +249,7 @@ fn control_and_chain_query_seams_over_http() {
         server,
         dcroxide_node::rpcrun::RpcTransport::Plain,
         dcroxide_node::websocket::NodeNtfnMgr::new(),
+        128,
     )
     .expect("start rpc listener");
     let port = listener.bound_addrs()[0].port();

@@ -219,6 +219,7 @@ fn serve_txindex_rpc(
         server,
         dcroxide_node::rpcrun::RpcTransport::Plain,
         dcroxide_node::websocket::NodeNtfnMgr::new(),
+        128,
     )
     .expect("start rpc listener");
     let port = listener.bound_addrs()[0].port();

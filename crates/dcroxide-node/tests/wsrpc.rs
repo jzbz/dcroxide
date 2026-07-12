@@ -110,6 +110,7 @@ fn serve_ws() -> (
         server,
         RpcTransport::Plain,
         ntfn.clone(),
+        128,
     )
     .expect("start rpc listener");
     let port = listener.bound_addrs()[0].port();

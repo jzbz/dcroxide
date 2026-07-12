@@ -584,6 +584,7 @@ fn run(cfg: Config) -> ExitCode {
             rpc_server,
             transport,
             ntfn.clone(),
+            cfg.rpc_max_clients.max(0) as usize,
         ) {
             Ok(listener) => {
                 let addrs: Vec<String> = listener
