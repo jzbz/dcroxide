@@ -87,8 +87,8 @@ pub struct HeaderProof {
 /// The growing chain state: the block tree arena and index together
 /// with the header-processing configuration (the subset of dcrd's
 /// `BlockChain` struct the headers-first path reads).  dcrd's
-/// database flushes, locks, and notification plumbing are not
-/// reproduced; index persistence arrives with the engine wiring.
+/// database flushes and locks are not reproduced; index persistence
+/// arrives with the engine wiring.
 pub struct Chain {
     /// The block tree arena.
     pub store: NodeStore,
@@ -1474,8 +1474,8 @@ impl Chain {
     /// best chain tip, and replace the best state snapshot (dcrd
     /// `connectBlock`; the treasury balance and treasury spend rows
     /// arrive with the treasury database, and the block index flush,
-    /// cache flush tuning, notifications, and the stake node memory
-    /// prune optimization are not reproduced).
+    /// cache flush tuning, and the stake node memory prune
+    /// optimization are not reproduced).
     #[allow(clippy::too_many_arguments)]
     pub fn connect_block(
         &mut self,
@@ -1832,8 +1832,8 @@ impl Chain {
     /// undo failed reorgs: disconnect blocks back to the fork point
     /// and connect the blocks of the new branch, fully validating any
     /// that have not been validated before (dcrd
-    /// `reorganizeChainInternal`; the shutdown interrupt checks and
-    /// notifications are not reproduced).
+    /// `reorganizeChainInternal`; the shutdown interrupt checks are
+    /// not reproduced).
     pub fn reorganize_chain_internal(
         &mut self,
         target: NodeId,
@@ -2021,9 +2021,9 @@ impl Chain {
     /// Reorganize the chain to the given target with handling for
     /// failed reorgs: when the target is or becomes invalid, fall
     /// back to the best valid chain candidate (dcrd
-    /// `reorganizeChain`; notifications and the current-latch cache
-    /// flush are not reproduced).  All accumulated reorg errors are
-    /// returned (dcrd wraps multiple in a `MultiError`).
+    /// `reorganizeChain`; the current-latch cache flush is not
+    /// reproduced).  All accumulated reorg errors are returned (dcrd
+    /// wraps multiple in a `MultiError`).
     pub fn reorganize_chain(
         &mut self,
         target: Option<NodeId>,
@@ -2212,8 +2212,8 @@ impl Chain {
     /// The main workhorse for inserting new blocks into the chain,
     /// including duplicate rejection, all validation rules, best
     /// chain selection, and reorganization (dcrd `ProcessBlock`; the
-    /// block index flush and the acceptance notifications are not
-    /// reproduced).  Returns the length of the fork the block
+    /// block index flush is not reproduced).  Returns the length of
+    /// the fork the block
     /// extended alongside any errors; the fork length is zero when
     /// the block extended or became the best chain tip.
     pub fn process_block(

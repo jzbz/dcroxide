@@ -11,10 +11,12 @@
 //!
 //! Served peers, inbound and dialed, run through the sync-manager
 //! dispatch, and the connection manager keeps the permanent `--connect`
-//! peers up.  The UTXO database, the address-manager automatic dialing
-//! and seeding, and the RPC server arrive with later pieces.  The
-//! rotating file-logging backend is likewise not yet wired, so startup
-//! output goes to standard streams.
+//! peers up while also dialing discovered peers from the address manager
+//! (off simnet/regnet), which the HTTPS seeder bootstrap primes; the
+//! chain carries a live UTXO cache flushed to the block database on
+//! shutdown; and the JSON-RPC/websocket server binds unless `--norpc`.
+//! The logging subsystem is still a fixed-prefix stdout stub
+//! (`log_info`), of which the absent rotating file backend is one facet.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -102,9 +104,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// Announce startup and idle until a shutdown signal.  This is the
-/// portion of `dcrdMain` after a successful configuration load and
-/// before the block database and server are brought up.
+/// Bring the daemon up and idle until a shutdown signal.  This is the
+/// portion of `dcrdMain` after a successful configuration load: it opens
+/// the block database and chain, creates the address manager, binds the
+/// peer listeners, starts outbound dialing, seeding, and the RPC server,
+/// then idles on the shutdown listener before tearing everything down.
 fn run(cfg: Config) -> ExitCode {
     print!("{}", logo::startup_banner(version::version_string()));
     println!();
