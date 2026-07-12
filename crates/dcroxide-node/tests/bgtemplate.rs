@@ -423,3 +423,83 @@ fn the_drain_hook_runs_after_each_processed_event() {
 
     generator.shutdown();
 }
+
+#[test]
+fn a_reorg_clears_and_then_recovers_getwork() {
+    // Drive the generator's no-rebuild publish path: a reorg-started
+    // event clears the current template without queuing a build, so the
+    // getwork mirror must follow (reporting no work) rather than keep
+    // serving the stale pre-reorg template, and a reorg-done event then
+    // rebuilds on the tip so getwork recovers.  A real
+    // force_head_reorganization that leaves the new tip awaiting votes —
+    // the window in which a mispublished mirror would serve an
+    // orphan-parent template — needs a competing side chain at stake
+    // validation height, out of reach of this regnet prefix (the
+    // state-machine clear itself is covered by dcroxide-mining's
+    // differential tests, and the publish primitive by the
+    // `publish_tracks_a_cleared_template` unit test); here the reorg
+    // events exercise the wiring end-to-end.
+    let params = dcroxide_chaincfg::regnet_params();
+    let (_dir, chain) = regnet_chain(2);
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
+
+    let policy = mining_policy();
+    let generator = start_generator(
+        Arc::clone(&chain),
+        Arc::clone(&tx_pool),
+        params.clone(),
+        vec![mining_address()],
+        policy.clone(),
+        0,
+        true,
+        None,
+        None,
+    );
+
+    let mut templater = NodeRpcBlockTemplater::new(
+        generator.current_handle(),
+        generator.subscribers_handle(),
+        generator.sink(),
+        Arc::clone(&chain),
+        Arc::clone(&tx_pool),
+        params.clone(),
+        policy.clone(),
+        0,
+    );
+    let first = wait_for_template(&mut templater);
+    assert_eq!(first.header.height, 3, "startup template height");
+
+    // A reorg starts: the generator clears the template and reports no
+    // work (dcrd's `CurrentTemplate` blocks on the stale-template wait
+    // group; the port returns `Ok(None)`).
+    generator.sink().chain_reorg_started();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match templater.current_template() {
+            Ok(None) => break,
+            Ok(Some(_)) => {}
+            Err(err) => panic!("a reorg must not error the template: {err}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a reorg must clear the getwork work signal"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // A reorg finishes: the generator rebuilds on the tip and getwork
+    // recovers a fresh template.
+    generator.sink().chain_reorg_done();
+    let recovered = wait_for_template(&mut templater);
+    assert_eq!(recovered.header.height, 3, "recovered post-reorg template");
+
+    generator.shutdown();
+}

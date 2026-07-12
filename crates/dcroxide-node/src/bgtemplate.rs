@@ -361,6 +361,35 @@ struct BuildCtx {
     ntfn: Option<NodeNtfnMgr>,
 }
 
+/// Publish the generator's current template state to the getwork mirror
+/// (`ctx.current`).  dcrd reads the template directly under `templateMtx`,
+/// so there is no separate publish step that can be skipped; the port
+/// keeps a snapshot the RPC thread reads instead, so it must be resynced
+/// after every state-machine step — including the ones that change the
+/// template without queuing a rebuild, such as a reorg-started event
+/// clearing it or a reorg-done event awaiting votes.  Leaving the mirror
+/// stale would let getwork serve a template built on an orphaned
+/// pre-reorg parent.
+///
+/// The block is deep-copied *before* the lock is taken so the getwork
+/// read path (which locks the same mirror) never contends behind a
+/// whole-block clone.  dcrd swaps a `*BlockTemplate` pointer under
+/// `templateMtx`; the port copies, so the copy is kept out of the
+/// critical section and only three moves happen under the lock.
+fn publish_current_template(
+    current: &Arc<Mutex<SharedTemplate>>,
+    g: &BgGenerator,
+    state: &BgTemplateState,
+) {
+    let block = g.template.as_ref().map(|t| t.block.clone());
+    let err = g.template_err.clone();
+    let reorganizing = state.is_reorganizing;
+    let mut current = current.lock().expect("shared template poisoned");
+    current.block = block;
+    current.err = err;
+    current.reorganizing = reorganizing;
+}
+
 /// Run the last queued generation request, mirroring dcrd's
 /// `genTemplateAsync` goroutine: dcrd cancels any in-flight generation
 /// so only the final request matters.  Builds the template, feeds the
@@ -375,6 +404,13 @@ fn drain_and_build(
 ) {
     let requests = core::mem::take(&mut g.gen_requests);
     let Some(request) = requests.into_iter().last() else {
+        // No queued generation, but the preceding event may still have
+        // changed the current template (a reorg-started event clears it;
+        // a reorg-done event awaiting votes rebuilds the base without
+        // queuing a build), so resync the getwork mirror to whatever the
+        // generator now holds rather than leaving a stale pre-reorg
+        // template exposed once the reorganizing flag clears.
+        publish_current_template(&ctx.current, g, state);
         return;
     };
 
@@ -442,12 +478,7 @@ fn drain_and_build(
     reconcile_timers(deadlines, state, false);
 
     // Publish the current template for the getwork RPC.
-    {
-        let mut current = ctx.current.lock().expect("shared template poisoned");
-        current.block = g.template.as_ref().map(|t| t.block.clone());
-        current.err = g.template_err.clone();
-        current.reorganizing = state.is_reorganizing;
-    }
+    publish_current_template(&ctx.current, g, state);
 
     // Fan the notification out to the subscribers and the websocket
     // work sink (dcrd's send on `notifySubscribers`).
@@ -496,13 +527,10 @@ fn process_event(
     // a fresh countdown (dcrd's `time.After` in `handleBlockConnected`).
     let rearmed_fixed = matches!(event, OwnedRegenEvent::BlockConnected(_));
     reconcile_timers(deadlines, state, rearmed_fixed);
-    // The reorg-started and reorg-done events flip the reorganizing
-    // flag; surface it so the getwork RPC reports no work during a
-    // reorg even before the next build publishes the template.
-    ctx.current
-        .lock()
-        .expect("shared template poisoned")
-        .reorganizing = state.is_reorganizing;
+    // `drain_and_build` republishes the full current-template state
+    // (block, error, and the reorganizing flag) on every path, including
+    // the no-build path a reorg event takes, so the getwork mirror always
+    // reflects the state machine after this event.
     drain_and_build(ctx, g, state, deadlines);
 }
 
@@ -715,15 +743,8 @@ pub fn start_generator(
             let best = tip_chain.best_snapshot();
             match tip_chain.block_by_hash(&best.hash) {
                 Err(err) => {
-                    g.set_current_template(
-                        None,
-                        BgTemplateUpdateReason::Unknown,
-                        Some(err.clone()),
-                    );
-                    let mut current = ctx.current.lock().expect("shared template poisoned");
-                    current.block = None;
-                    current.err = Some(err);
-                    current.reorganizing = false;
+                    g.set_current_template(None, BgTemplateUpdateReason::Unknown, Some(err));
+                    publish_current_template(&ctx.current, &g, &state);
                 }
                 Ok(tip_block) => {
                     process_event(
@@ -964,6 +985,79 @@ mod tests {
         assert_eq!(
             map_reason(BgTemplateUpdateReason::Unknown),
             TemplateUpdateReason::Unknown
+        );
+    }
+
+    /// A cheap block template built from the regnet genesis block for
+    /// exercising the getwork mirror publish without a live chain.
+    fn genesis_template(height: i64) -> dcroxide_mining::BlockTemplate {
+        dcroxide_mining::BlockTemplate {
+            block: dcroxide_chaincfg::regnet_params().genesis_block,
+            fees: Vec::new(),
+            sig_op_counts: Vec::new(),
+            height,
+            valid_pay_address: false,
+        }
+    }
+
+    /// The publish primitive faithfully mirrors the generator's current
+    /// template — populating it from a built template, clearing the block
+    /// when the template is cleared (as a reorg-started event does), and
+    /// carrying the reorganizing flag.  This guards the helper itself; the
+    /// call-site wiring that publishes on the no-rebuild path (a reorg
+    /// clearing the template without queuing a build) is covered by the
+    /// integration test `a_reorg_clears_and_then_recovers_getwork`.
+    #[test]
+    fn publish_tracks_a_cleared_template() {
+        let mut g = BgGenerator::new(5, 16, true);
+        let mut state = BgTemplateState::new();
+        let current = Arc::new(Mutex::new(SharedTemplate::default()));
+
+        // A generated template populates the mirror.
+        g.set_current_template(
+            Some(genesis_template(1)),
+            BgTemplateUpdateReason::NewParent,
+            None,
+        );
+        publish_current_template(&current, &g, &state);
+        assert!(
+            current.lock().expect("mirror").block.is_some(),
+            "a generated template populates the getwork mirror"
+        );
+
+        // A reorg-started clear drops the template and raises the flag;
+        // the mirror must follow rather than retaining the stale block.
+        g.set_current_template(None, BgTemplateUpdateReason::Unknown, None);
+        state.is_reorganizing = true;
+        publish_current_template(&current, &g, &state);
+        {
+            let snap = current.lock().expect("mirror");
+            assert!(
+                snap.block.is_none(),
+                "a cleared template clears the mirror block"
+            );
+            assert!(
+                snap.reorganizing,
+                "the reorganizing flag reaches the mirror"
+            );
+        }
+
+        // A post-reorg rebuild repopulates the mirror and lowers the flag.
+        g.set_current_template(
+            Some(genesis_template(2)),
+            BgTemplateUpdateReason::NewParent,
+            None,
+        );
+        state.is_reorganizing = false;
+        publish_current_template(&current, &g, &state);
+        let snap = current.lock().expect("mirror");
+        assert!(
+            snap.block.is_some(),
+            "a rebuilt template repopulates the mirror"
+        );
+        assert!(
+            !snap.reorganizing,
+            "the reorganizing flag clears with the reorg"
         );
     }
 
