@@ -446,7 +446,15 @@ impl<C: Conn> ConnManager<C> {
         self.conns.retain(|c| *c != id);
         let permanent = {
             let req = self.reqs.get_mut(&id).expect("known conn");
-            if let Some(conn) = req.conn.as_mut() {
+            // Close AND drop the connection handle so its socket file
+            // descriptors are released immediately.  Go's `net.Conn.Close`
+            // does both, but the port's `Conn::close` only shuts the
+            // socket; keeping the handle would leak an fd per disconnect
+            // (a non-persistent peer's request is replaced by a fresh
+            // one on redial and never reused, so its handle is never
+            // dropped) and exhaust the process's descriptors under peer
+            // churn.
+            if let Some(mut conn) = req.conn.take() {
                 conn.close();
             }
             req.permanent

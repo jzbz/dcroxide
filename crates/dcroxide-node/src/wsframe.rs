@@ -92,7 +92,7 @@ impl<S: Read + Write> WsConn<S> {
         let mut in_message = false;
 
         loop {
-            let frame = match self.read_frame()? {
+            let frame = match self.read_frame(read_limit)? {
                 FrameRead::Frame(frame) => frame,
                 // A clean EOF between messages is a normal disconnect.
                 FrameRead::Eof => return Ok(WsIn::Close),
@@ -169,7 +169,7 @@ impl<S: Read + Write> WsConn<S> {
     /// first header byte may report idleness: once a frame has begun,
     /// the remaining reads absorb timeouts so a frame split across
     /// segments is never lost.
-    fn read_frame(&mut self) -> Result<FrameRead, String> {
+    fn read_frame(&mut self, read_limit: usize) -> Result<FrameRead, String> {
         let first = loop {
             let mut byte = [0u8; 1];
             match self.stream.read(&mut byte) {
@@ -217,6 +217,17 @@ impl<S: Read + Write> WsConn<S> {
             }
             other => other,
         };
+
+        // Reject a frame whose declared length exceeds the read limit
+        // before allocating its payload buffer, so a hostile length field
+        // (up to 2^63 with the 127 length code) cannot drive an
+        // out-of-memory abort ahead of the reassembled-message limit
+        // check (gorilla/dcrd reject by the declared length too).
+        if payload_len > read_limit {
+            return self
+                .fail(close_code::TOO_BIG, "frame exceeds the read limit")
+                .map(|_| FrameRead::Eof);
+        }
 
         // Every client frame must be masked (RFC 6455 section 5.1).
         if !masked {
@@ -363,6 +374,25 @@ mod tests {
             frame.push(byte ^ mask[i & 3]);
         }
         frame
+    }
+
+    #[test]
+    fn an_oversized_frame_is_rejected_before_allocating() {
+        // A masked text frame whose 127 length code declares a payload
+        // far larger than the read limit.  read_frame must reject it by
+        // the declared length rather than allocating the buffer (which
+        // would abort the process), so the read returns gracefully.
+        let mut frame = vec![0x81u8, 0x80 | 127];
+        frame.extend_from_slice(&u64::MAX.to_be_bytes());
+        frame.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        let mut conn = WsConn::new(Scripted {
+            reads: VecDeque::from([ScriptedRead::Data(frame)]),
+        });
+        let graceful = matches!(conn.read_message(1 << 12), Ok(WsIn::Close) | Err(_));
+        assert!(
+            graceful,
+            "oversized frame must be rejected gracefully, not allocated"
+        );
     }
 
     #[test]
