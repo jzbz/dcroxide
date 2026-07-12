@@ -393,6 +393,43 @@ impl SyncPeers {
         }
     }
 
+    /// Whether the peer already knows this inventory (dcrd
+    /// `IsKnownInventory`), so a getblocks response can omit it.  An
+    /// unregistered peer knows nothing.
+    pub(crate) fn is_known_inventory(&self, id: i32, inv: &InvVect) -> bool {
+        let registry = self.inner.lock().expect("sync peers mutex poisoned");
+        registry.get(&id).is_some_and(|handles| {
+            handles
+                .relay
+                .lock()
+                .expect("relay state poisoned")
+                .known_inventory
+                .contains(inv)
+        })
+    }
+
+    /// Drop the inventory the peer already knows and mark the survivors
+    /// known, returning what remains to send (dcrd `QueueInventory`'s
+    /// contains-check plus its mark-on-send).  An unregistered peer keeps
+    /// the whole list.
+    pub(crate) fn filter_and_mark_known(&self, id: i32, invs: Vec<InvVect>) -> Vec<InvVect> {
+        let registry = self.inner.lock().expect("sync peers mutex poisoned");
+        let Some(handles) = registry.get(&id) else {
+            return invs;
+        };
+        let mut relay = handles.relay.lock().expect("relay state poisoned");
+        invs.into_iter()
+            .filter(|inv| {
+                if relay.known_inventory.contains(inv) {
+                    false
+                } else {
+                    relay.known_inventory.put(*inv);
+                    true
+                }
+            })
+            .collect()
+    }
+
     /// Relay inventory to every registered peer that should receive it
     /// (dcrd `RelayInventory` driving `handleRelayPeerInvMsg`); the
     /// known-inventory set dedups repeated announcements.  dcrd's
@@ -896,7 +933,7 @@ impl ServerPeerHandler {
                 ServeSignal::Continue
             }
             Message::GetBlocks(get_blocks) => {
-                self.on_get_blocks(peer, &get_blocks.0, outbound);
+                self.on_get_blocks(&get_blocks.0, outbound);
                 ServeSignal::Continue
             }
             Message::GetData(get_data) => self.on_get_data(&get_data.inv_list, outbound),
@@ -949,6 +986,26 @@ impl ServerPeerHandler {
                 ServeSignal::Continue
             }
             Message::Tx(tx) => {
+                // Blocks-only mode ignores an unsolicited transaction push
+                // entirely (dcrd `OnTx`'s bare return under
+                // `cfg.BlocksOnly`): no pooling, notification, or relay.
+                if self.ctx.blocks_only {
+                    return ServeSignal::Continue;
+                }
+                // The delivered transaction is known to the source peer, so
+                // the relay fan-out never echoes it back — marked up front
+                // with the delivered hash regardless of the acceptance
+                // outcome (dcrd `OnTx`'s `AddKnownInventory` before the
+                // sync-manager hand-off), mirroring the Block arm above.
+                if let Some(id) = self.sync_peer_id {
+                    self.ctx.sync_peers.mark_known_inventory(
+                        id,
+                        InvVect {
+                            inv_type: InvType::TX,
+                            hash: tx.tx_hash(),
+                        },
+                    );
+                }
                 let mut accepted = Vec::new();
                 self.drive_sync(|manager, id| {
                     accepted = manager.on_tx(id, tx);
@@ -980,17 +1037,13 @@ impl ServerPeerHandler {
                     ntfn.notify_new_transactions(pairs);
                 }
                 // The inventory half of dcrd's AnnounceNewTransactions:
-                // the source peer already knows the transaction, and
-                // every accepted transaction joins the
-                // recently-advertised cache before fanning out.
+                // every accepted transaction (the delivered one plus any
+                // orphan it releases) joins the recently-advertised cache
+                // and fans out.  Only the delivered transaction is marked
+                // known to the source peer (done up front above); a
+                // released orphan is not, so it still relays to the peer
+                // that supplied its parent — matching dcrd.
                 for hash in &accepted {
-                    let inv = InvVect {
-                        inv_type: InvType::TX,
-                        hash: *hash,
-                    };
-                    if let Some(id) = self.sync_peer_id {
-                        self.ctx.sync_peers.mark_known_inventory(id, inv);
-                    }
                     let fetched = {
                         let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
                         pool.fetch_transaction(hash)
@@ -1033,6 +1086,15 @@ impl ServerPeerHandler {
                         ServeSignal::Disconnect("ban score exceeds threshold")
                     }
                     crate::server::OnMemPoolOutcome::Inventory(invs) => {
+                        // Drop inventory the peer already knows and mark the
+                        // survivors, matching dcrd `OnMemPool` queuing each
+                        // tx through `QueueInventory` (which both filters
+                        // against and updates the peer's known-inventory
+                        // set) rather than sending the raw pool contents.
+                        let invs = match self.sync_peer_id {
+                            Some(id) => self.ctx.sync_peers.filter_and_mark_known(id, invs),
+                            None => invs,
+                        };
                         // dcrd trickles through its inventory queue,
                         // which splits at the wire limit; the plain
                         // queue chunks the same way.
@@ -1056,6 +1118,25 @@ impl ServerPeerHandler {
                     self.ctx.sync_peers.set_wants_headers(id);
                 }
                 ServeSignal::Continue
+            }
+            Message::GetCFilter(_) | Message::GetCFHeaders(_) | Message::GetCFTypes => {
+                // The daemon advertises no committed-filter service, so a
+                // v1 committed-filter request is a deliberate protocol
+                // violation: disconnect and, when the peer negotiated
+                // NodeCFVersion and banning is enabled, add dcrd's +100 ban
+                // score (dcrd `enforceNodeCFFlag`).
+                match crate::server::enforce_node_cf_flag(
+                    &mut self.addr_state,
+                    peer.protocol_version(),
+                    self.ctx.disable_banning,
+                    self.ctx.ban_threshold,
+                    now_unix(),
+                ) {
+                    crate::server::CfFlagOutcome::BanAndDisconnect { .. }
+                    | crate::server::CfFlagOutcome::DisconnectOnly => {
+                        ServeSignal::Disconnect("sent an unsupported committed filter request")
+                    }
+                }
             }
             // The mix-message intake arrives with the mixpool wiring.
             _ => ServeSignal::Continue,
@@ -1088,12 +1169,7 @@ impl ServerPeerHandler {
     /// Answer a getblocks request with the located block inventory,
     /// recording the continuation hash when the response fills an
     /// entire message (dcrd `serverPeer.OnGetBlocks`).
-    fn on_get_blocks(
-        &mut self,
-        peer: &mut Peer,
-        locator: &dcroxide_wire::BlockLocator,
-        outbound: &OutboundQueue,
-    ) {
+    fn on_get_blocks(&mut self, locator: &dcroxide_wire::BlockLocator, outbound: &OutboundQueue) {
         let located = {
             let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
             chain.locate_blocks(
@@ -1102,12 +1178,15 @@ impl ServerPeerHandler {
                 MAX_BLOCKS_PER_MSG as u32,
             )
         };
-        // The known-inventory check touches the peer's LRU, so route the
-        // shared reference through a cell for the decision core's `Fn`
-        // seam.
-        let peer = std::cell::RefCell::new(peer);
-        let response =
-            build_get_blocks_response(&located, |iv| peer.borrow_mut().is_known_inventory(iv));
+        // Filter located blocks against the peer's known-inventory set
+        // (dcrd `OnGetBlocks`'s `IsKnownInventory` check), the same
+        // per-peer set intake and relay fan-out populate.  The chain lock
+        // is released above before this per-item registry lookup, so there
+        // is no lock-order cycle.
+        let response = build_get_blocks_response(&located, |iv| {
+            self.sync_peer_id
+                .is_some_and(|id| self.ctx.sync_peers.is_known_inventory(id, iv))
+        });
         if let Some(continue_hash) = response.continue_hash {
             self.continue_hash = Some(continue_hash);
         }
