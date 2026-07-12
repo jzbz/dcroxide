@@ -65,6 +65,12 @@ pub struct ChainNtfnHandler {
     /// Connected and disconnected blocks awaiting their mempool
     /// maintenance.
     pending_block_events: Arc<Mutex<Vec<PendingBlockEvent>>>,
+    /// Serializes the block-event drain: both the netsync post-process
+    /// path and the generator's drain hook drain the queue, and without
+    /// this one could take a prefix of an in-flight reorg batch while the
+    /// other takes the suffix, processing the maintenance and index
+    /// notifications out of order.
+    block_drain_lock: Arc<Mutex<()>>,
     /// The shared transaction pool the maintenance drives.
     tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
     /// The relay registry for the orphan-acceptance announce cascade.
@@ -134,6 +140,7 @@ impl ChainNtfnHandler {
             pending_checked_announcements: Arc::default(),
             pending_accepted_announcements: Arc::default(),
             pending_block_events: Arc::default(),
+            block_drain_lock: Arc::default(),
             tx_pool,
             sync_peers,
             recently_advertised,
@@ -448,6 +455,16 @@ impl ChainNtfnHandler {
     /// transaction bookkeeping and the rebroadcast prunes; the
     /// fee-estimator feed arrives with a later piece).
     pub fn drain_pending_block_events(&self) {
+        // Serialize the drainers for the whole drain so each contiguous
+        // FIFO prefix of the (possibly still-emitting) block-event queue
+        // is processed to completion, in order, by one thread at a time —
+        // the netsync post-process drain and the generator's drain hook
+        // otherwise split a reorg batch and process it out of order,
+        // permanently cancelling the index subscriber.
+        let _drain = self
+            .block_drain_lock
+            .lock()
+            .expect("block drain lock poisoned");
         let pending: Vec<PendingBlockEvent> = core::mem::take(
             &mut *self
                 .pending_block_events

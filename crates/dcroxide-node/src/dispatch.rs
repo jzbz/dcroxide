@@ -1143,65 +1143,65 @@ impl ServerPeerHandler {
             OnGetDataOutcome::Enqueue { .. } => {}
         }
 
-        // Resolve each item against the chain, keeping the fetched
-        // blocks so the serve actions can queue them in request order.
+        // Resolve each item, keeping the fetched blocks and transactions
+        // so the serve actions can queue them in request order.  Block
+        // items resolve under the chain lock, which is released BEFORE the
+        // mempool is touched: the transaction-intake path locks the tx
+        // pool and then the chain, so nesting the tx-pool fetch inside the
+        // chain lock here would form a lock-order cycle and deadlock the
+        // node.
         let mut blocks = HashMap::new();
         let mut txs: HashMap<dcroxide_chainhash::Hash, dcroxide_wire::MsgTx> = HashMap::new();
-        let (items, best_hash) = {
+        let best_hash = {
             let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
-            let items: Vec<(InvVect, GetDataResolution)> = inv_list
-                .iter()
-                .map(|iv| {
-                    let resolution = match iv.inv_type {
-                        InvType::BLOCK => match chain.block_by_hash(&iv.hash) {
-                            Some(block) => {
-                                blocks.insert(iv.hash, block);
-                                GetDataResolution::Found
-                            }
-                            None => GetDataResolution::NotFound,
-                        },
-                        // Transactions and mix messages resolve against
-                        // pools that are not yet wired, so they miss
-                        // exactly like an empty mempool's fetch.
-                        // Transactions serve from the mempool only:
-                        // confirmed transactions are deliberately not
-                        // servable over the network (dcrd's
-                        // handleServeGetData; the recently-advertised
-                        // cache arrives with the relay fan-out).
-                        InvType::TX => {
-                            // The recently-advertised cache serves
-                            // first so announcements stay servable
-                            // briefly after leaving the pool (dcrd's
-                            // handleServeGetData order).
-                            let advertised = self
-                                .ctx
-                                .recently_advertised
-                                .lock()
-                                .expect("recently advertised poisoned")
-                                .get(&iv.hash);
-                            let fetched = advertised.or_else(|| {
-                                let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
-                                pool.fetch_transaction(&iv.hash)
-                            });
-                            match fetched {
-                                Some(tx) => {
-                                    txs.insert(iv.hash, tx);
-                                    GetDataResolution::Found
-                                }
-                                None => GetDataResolution::NotFound,
-                            }
-                        }
-                        // Mix messages resolve against a pool that is
-                        // not yet wired, so they miss exactly like an
-                        // empty mixpool's fetch.
-                        InvType::MIX => GetDataResolution::NotFound,
-                        _ => GetDataResolution::UnknownType,
-                    };
-                    (*iv, resolution)
-                })
-                .collect();
-            (items, chain.best_snapshot().hash)
+            for iv in inv_list.iter() {
+                if iv.inv_type == InvType::BLOCK
+                    && let Some(block) = chain.block_by_hash(&iv.hash)
+                {
+                    blocks.insert(iv.hash, block);
+                }
+            }
+            chain.best_snapshot().hash
         };
+
+        // Resolve transaction items against the mempool without holding
+        // the chain lock.  Transactions serve from the recently-advertised
+        // cache first, then the pool, so announcements stay servable
+        // briefly after leaving it (dcrd's handleServeGetData order);
+        // confirmed transactions are deliberately not servable.
+        for iv in inv_list.iter() {
+            if iv.inv_type == InvType::TX {
+                let advertised = self
+                    .ctx
+                    .recently_advertised
+                    .lock()
+                    .expect("recently advertised poisoned")
+                    .get(&iv.hash);
+                let fetched = advertised.or_else(|| {
+                    let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
+                    pool.fetch_transaction(&iv.hash)
+                });
+                if let Some(tx) = fetched {
+                    txs.insert(iv.hash, tx);
+                }
+            }
+        }
+
+        // Classify each item in request order from the resolved sets.
+        // Mix messages resolve against a pool that is not yet wired, so
+        // they miss exactly like an empty mixpool's fetch.
+        let items: Vec<(InvVect, GetDataResolution)> = inv_list
+            .iter()
+            .map(|iv| {
+                let resolution = match iv.inv_type {
+                    InvType::BLOCK if blocks.contains_key(&iv.hash) => GetDataResolution::Found,
+                    InvType::TX if txs.contains_key(&iv.hash) => GetDataResolution::Found,
+                    InvType::BLOCK | InvType::TX | InvType::MIX => GetDataResolution::NotFound,
+                    _ => GetDataResolution::UnknownType,
+                };
+                (*iv, resolution)
+            })
+            .collect();
 
         let outcome = serve_get_data(&items, self.continue_hash, best_hash);
         for action in outcome.actions {
