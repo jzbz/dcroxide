@@ -1830,7 +1830,7 @@ pub struct ServeGetDataOutcome {
 /// are not reproduced; the item fetches are the caller's seams.
 pub fn serve_get_data(
     items: &[(dcroxide_wire::InvVect, GetDataResolution)],
-    continue_hash: Option<dcroxide_chainhash::Hash>,
+    mut continue_hash: Option<dcroxide_chainhash::Hash>,
     best_hash: dcroxide_chainhash::Hash,
 ) -> ServeGetDataOutcome {
     let mut actions = Vec::new();
@@ -1854,10 +1854,15 @@ pub fn serve_get_data(
                 pending_decrements += 1;
 
                 // When the served block was the advertised
-                // continuation, trigger the next getblocks batch.
+                // continuation, trigger the next getblocks batch — and
+                // clear the continuation so a getdata that lists the same
+                // block twice emits exactly one continue inv (dcrd
+                // `handleServeGetData` reloading `continueHash` each
+                // iteration and `Store(nil)` after the first match).
                 if iv.inv_type == dcroxide_wire::InvType::BLOCK && continue_hash == Some(iv.hash) {
                     actions.push(ServeGetDataAction::QueueContinueInv(best_hash));
                     cleared_continue_hash = true;
+                    continue_hash = None;
                 }
             }
         }

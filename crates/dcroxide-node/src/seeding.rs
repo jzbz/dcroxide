@@ -15,7 +15,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dcroxide_addrmgr::AddrManager;
-use dcroxide_connmgr::{HttpsSeederFilters, SeedEnv, SeederTransport, seed_addrs};
+use std::io::Read;
+
+use dcroxide_connmgr::{HttpsSeederFilters, MAX_RESP_SIZE, SeedEnv, SeederTransport, seed_addrs};
 
 /// The TLS-capable seeder transport over `ureq` (dcrd's `dcrdDial`
 /// behind Go's `http.Client`; the proxy configuration plugs in with the
@@ -52,9 +54,17 @@ impl SeederTransport for UreqTransport {
             .call()
             .map_err(|e| format!("seeder request failed: {e}"))?;
         let status = u32::from(response.status().as_u16());
-        let body = response
+        // Read at most the connmgr's response cap off the wire from an
+        // untrusted seeder (dcrd's `io.LimitReader(resp.Body,
+        // maxNodes*maxAddrLen)`), rather than ureq's 10 MiB default; a
+        // larger body is truncated to the cap, not rejected.  `seed_addrs`
+        // truncates to the same cap again as a safety net.
+        let mut body = Vec::new();
+        response
             .body_mut()
-            .read_to_vec()
+            .as_reader()
+            .take(MAX_RESP_SIZE as u64)
+            .read_to_end(&mut body)
             .map_err(|e| format!("seeder response read failed: {e}"))?;
         Ok((status, body))
     }

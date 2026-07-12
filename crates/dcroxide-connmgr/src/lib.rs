@@ -19,8 +19,8 @@ pub use connmanager::{
     Event, MAX_FAILED_ATTEMPTS, MAX_RETRY_DURATION, ReqAddr,
 };
 pub use seed::{
-    DURATION_3_DAYS, DURATION_4_DAYS, HttpsSeederFilters, SeedEnv, SeederTransport, seed_addrs,
-    seeder_url,
+    DURATION_3_DAYS, DURATION_4_DAYS, HttpsSeederFilters, MAX_RESP_SIZE, SeedEnv, SeederTransport,
+    seed_addrs, seeder_url,
 };
 pub use tor::{TorTransport, tor_lookup_ip};
 

@@ -14,7 +14,9 @@ pub const DURATION_3_DAYS: i64 = 24 * 60 * 60 * 3 * 1_000_000_000;
 pub const DURATION_4_DAYS: i64 = 24 * 60 * 60 * 4 * 1_000_000_000;
 
 const MAX_NODES: usize = 16;
-const MAX_RESP_SIZE: usize = MAX_NODES * 256;
+/// The maximum bytes read from an untrusted seeder response (dcrd's
+/// `io.LimitReader(resp.Body, maxNodes*maxAddrLen)`).
+pub const MAX_RESP_SIZE: usize = MAX_NODES * 256;
 
 /// Filter parameters for a request to an HTTPS seeder (dcrd
 /// `HttpsSeederFilters`).
