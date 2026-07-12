@@ -636,9 +636,12 @@ fn run(cfg: Config) -> ExitCode {
 
     // Open outbound connections through the connection manager: the
     // permanent `--connect` peers when configured, otherwise automatic
-    // dialing from the address manager (dcrd sets `newAddressFunc` only
-    // when no `--connect` peers are given).
-    let get_new_address = if cfg.connect_peers.is_empty() {
+    // dialing from the address manager.  dcrd installs `newAddressFunc`
+    // only when there are no `--connect` peers AND the network is neither
+    // simnet nor regnet — those networks stay in connect-only mode and
+    // never dial discovered peers (dcrd server.go: `!cfg.SimNet &&
+    // !cfg.RegNet && len(cfg.ConnectPeers) == 0`).
+    let get_new_address = if !cfg.sim_net && !cfg.reg_net && cfg.connect_peers.is_empty() {
         Some(dcroxide_node::outbound::new_address_source(
             Arc::clone(&addr_manager),
             server.outbound_groups.clone(),
@@ -660,6 +663,13 @@ fn run(cfg: Config) -> ExitCode {
         dial_timeout: Duration::from_nanos(cfg.dial_timeout_nanos as u64),
         permanent: cfg.connect_peers.clone(),
         get_new_address,
+        // Record dial attempts against the address manager off simnet and
+        // regnet, matching where dcrd installs attemptDcrdDial.
+        addr_manager: if !cfg.sim_net && !cfg.reg_net {
+            Some(Arc::clone(&addr_manager))
+        } else {
+            None
+        },
     });
     // Query the network seeders to bootstrap the address manager (dcrd
     // `Run` launching `querySeeders` when seeding is enabled).
@@ -732,6 +742,19 @@ fn run(cfg: Config) -> ExitCode {
     connected.disconnect_all();
     if let Some(runtime) = runtime {
         runtime.shutdown();
+    }
+
+    // Persist the address book so a restart redials its learned peers
+    // instead of re-bootstrapping from the seeders every time (dcrd's
+    // final `savePeers` when the address handler stops).  save_peers is a
+    // no-op when nothing changed and writes atomically.  A periodic dump
+    // ticker for crash resilience remains a follow-up.
+    if let Err(e) = addr_manager
+        .lock()
+        .expect("addr manager mutex poisoned")
+        .save_peers()
+    {
+        log_info(&format!("Unable to save peers: {e}"));
     }
 
     // Flush the chain's in-memory UTXO cache and modified block index to

@@ -20,7 +20,7 @@
 //! shared address manager, with its outbound-group spreading,
 //! recent-attempt, and default-port filtering.
 
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -73,6 +73,11 @@ pub struct OutboundConfig {
     /// `target_outbound` connections (dcrd's `NewConnReq` address
     /// source); absent when only permanent connections are wanted.
     pub get_new_address: Option<AddressSource>,
+    /// The address manager, so each dial records an attempt against it
+    /// (dcrd `attemptDcrdDial`'s `Attempt`).  `Some` only off simnet and
+    /// regnet, matching where dcrd installs that dial hook; `None`
+    /// otherwise leaves the dial path free of address bookkeeping.
+    pub addr_manager: Option<Arc<Mutex<AddrManager>>>,
 }
 
 /// Build dcrd's `newAddressFunc` over the shared address manager: draw
@@ -196,11 +201,38 @@ pub fn start_outbound(cfg: OutboundConfig) -> OutboundConnector {
 
 /// Dial the address for a connection request, wrapping the established
 /// stream in the manager's connection handle (dcrd's `Dial`).
-fn dial(req: &ReqAddr, timeout: Duration) -> Result<DialedConn, String> {
+fn dial(
+    req: &ReqAddr,
+    timeout: Duration,
+    addr_manager: Option<&Arc<Mutex<AddrManager>>>,
+) -> Result<DialedConn, String> {
     let socket: SocketAddr = req
         .addr
         .parse()
         .map_err(|e| format!("invalid dial address {}: {e}", req.addr))?;
+    // Record the dial attempt so the address manager's recently-attempted
+    // gate and chance() penalty apply, and the same dead address is not
+    // redialed in a tight loop (dcrd `attemptDcrdDial` marking `Attempt`
+    // before the dial).  A not-found address — a permanent `--connect`
+    // peer the manager never learned — is ignored, as dcrd does; the
+    // address's services and timestamp do not affect the lookup, which
+    // keys on the canonicalized host and port.
+    if let Some(addr_manager) = addr_manager {
+        let ip_bytes = match socket.ip() {
+            IpAddr::V4(v4) => v4.octets().to_vec(),
+            IpAddr::V6(v6) => v6.octets().to_vec(),
+        };
+        let na = dcroxide_addrmgr::new_net_address_from_ip_port(
+            &ip_bytes,
+            socket.port(),
+            dcroxide_wire::ServiceFlag(0),
+            0,
+        );
+        let _ = addr_manager
+            .lock()
+            .expect("addr manager mutex poisoned")
+            .attempt(&na);
+    }
     let stream =
         TcpStream::connect_timeout(&socket, timeout).map_err(|e| format!("dial failed: {e}"))?;
     let shutdown = stream
@@ -225,11 +257,14 @@ fn run_event_loop(
         server: cfg.server,
     });
     let dial_timeout = cfg.dial_timeout;
+    let dial_addr_manager = cfg.addr_manager.clone();
 
     let manager = ConnManager::new(Config {
         target_outbound: cfg.target_outbound,
         retry_duration_nanos: cfg.retry_duration.as_nanos() as i64,
-        dial: Some(Box::new(move |req: &ReqAddr| dial(req, dial_timeout))),
+        dial: Some(Box::new(move |req: &ReqAddr| {
+            dial(req, dial_timeout, dial_addr_manager.as_ref())
+        })),
         get_new_address: cfg
             .get_new_address
             // Re-box to drop the Send bound the driver thread needed.

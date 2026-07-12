@@ -111,6 +111,7 @@ fn dials_and_serves_a_permanent_connection() {
         dial_timeout: Duration::from_secs(5),
         permanent: vec![format!("127.0.0.1:{port}")],
         get_new_address: None,
+        addr_manager: None,
     });
 
     // Both sides register the live peer once the handshake completes.
@@ -151,6 +152,7 @@ fn retries_an_unreachable_permanent_connection() {
         dial_timeout: Duration::from_millis(500),
         permanent: vec![format!("127.0.0.1:{port}")],
         get_new_address: None,
+        addr_manager: None,
     });
 
     // Nothing ever connects, and the driver stays healthy across a few
