@@ -729,6 +729,21 @@ fn run(cfg: Config) -> ExitCode {
         runtime.shutdown();
     }
 
+    // Flush the chain's in-memory UTXO cache and modified block index to
+    // the database now that no thread can process another block (dcrd's
+    // clean-shutdown flush).  Every connect persists the best state but
+    // holds the UTXO changes in the cache, so without this a restart
+    // loads a best state ahead of the persisted UTXO set and wedges the
+    // node on the next block.
+    log_info("Flushing the block database to disk...");
+    if let Err(e) = chain
+        .lock()
+        .expect("chain mutex poisoned")
+        .flush(&cfg.params.params)
+    {
+        log_info(&format!("Unable to flush the block database: {e:?}"));
+    }
+
     log_info("Shutdown complete");
     ExitCode::SUCCESS
 }
