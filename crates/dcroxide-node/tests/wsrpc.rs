@@ -319,7 +319,8 @@ fn notifications_reach_only_subscribers() {
 #[test]
 fn the_chain_event_handler_feeds_websocket_subscribers() {
     use dcroxide_blockchain::notifications::{
-        BlockAcceptedNtfnsData, BlockConnectedNtfnsData, Notification, TicketNotificationsData,
+        BlockAcceptedNtfnsData, BlockConnectedNtfnsData, BlockDisconnectedNtfnsData, Notification,
+        TicketNotificationsData,
     };
     use dcroxide_blockchain::validate::AgendaFlags;
     use dcroxide_chainhash::Hash;
@@ -366,15 +367,37 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
         .expect("set timeout");
 
     // A connected-block event flows through the handler to the
-    // subscriber.
+    // subscriber.  The block-connected notification is deferred to the
+    // block-event drain (dcrd emits it only after the connected block's
+    // mempool maintenance, so txaccepted precedes blockconnected), so
+    // the callback only queues and the drain delivers the frame.
     let genesis = params.genesis_block.clone();
     handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData {
         block: &genesis,
         parent_block: &genesis,
         check_tx_flags: AgendaFlags::default(),
     }));
+    handler.drain_pending_block_events();
     let frame = read_server_frame(&mut ws);
     assert!(frame.contains("\"method\":\"blockconnected\""), "{frame}");
+
+    // A disconnected-block event takes the same deferred path: dcrd emits
+    // blockdisconnected at the end of its NTBlockDisconnected case (after
+    // the mempool maintenance, index notify, and rebroadcast prune), so
+    // the callback only queues and the drain delivers the frame.
+    handler.handle(&Notification::BlockDisconnected(
+        BlockDisconnectedNtfnsData {
+            block: &genesis,
+            parent_block: &genesis,
+            check_tx_flags: AgendaFlags::default(),
+        },
+    ));
+    handler.drain_pending_block_events();
+    let frame = read_server_frame(&mut ws);
+    assert!(
+        frame.contains("\"method\":\"blockdisconnected\""),
+        "{frame}"
+    );
 
     // A new-tickets event follows the same path.
     handler.handle(&Notification::NewTickets(TicketNotificationsData {
@@ -397,8 +420,9 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
         fork_len: 0,
         block: &accepted,
     }));
-    // The connected block queued its mempool maintenance; draining it
-    // over the empty pool is a no-op that must not disturb anything.
+    // The block-event queue was already drained above, so this drain is
+    // a no-op; the winning-tickets drain runs the accepted block's
+    // failed lottery lookup, which must not notify.
     handler.drain_pending_block_events();
     handler.drain_pending_winning_tickets(&chain, 2_000_000_000);
     ws.set_read_timeout(Some(std::time::Duration::from_millis(300)))

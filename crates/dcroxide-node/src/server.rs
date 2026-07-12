@@ -1456,14 +1456,14 @@ pub enum RelayPeerAction {
 }
 
 /// The outcome of the relay handler: the queue action plus the
-/// transaction hash to record in the recently advertised cache when
-/// a transaction was relayed.
+/// transaction hash the peer qualified to be advertised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayPeerOutcome {
     /// The queue action.
     pub action: RelayPeerAction,
-    /// The transaction hash to record as recently advertised, set
-    /// only when a transaction relay reached the cache update.
+    /// The transaction hash the caller records as recently advertised,
+    /// set only for a transaction inventory that cleared this peer's
+    /// relay gate (dcrd's per-peer `recentlyAdvertisedTxns.Put`).
     pub advertised_tx: Option<dcroxide_chainhash::Hash>,
 }
 

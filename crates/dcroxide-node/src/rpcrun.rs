@@ -632,21 +632,8 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
                 let pool = relay.tx_pool.lock().expect("tx pool mutex poisoned");
                 pool.fetch_transaction(hash)
             };
-            if let Some(tx) = fetched {
-                let tree =
-                    if dcroxide_stake::determine_tx_type(&tx) == dcroxide_stake::TxType::Regular {
-                        dcroxide_wire::TX_TREE_REGULAR
-                    } else {
-                        dcroxide_wire::TX_TREE_STAKE
-                    };
-                relay
-                    .recently_advertised
-                    .lock()
-                    .expect("recently advertised poisoned")
-                    .put(*hash, tx.clone());
-                notify_pairs.push((tx, tree));
-            }
-            self.sync_peers
+            let advertised = self
+                .sync_peers
                 .relay_inventory(&crate::server::RelayInvFacts {
                     inv_type: dcroxide_wire::InvType::TX,
                     inv_hash: *hash,
@@ -655,6 +642,24 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
                     data_is_block_header: false,
                     data_is_tx: true,
                 });
+            if let Some(tx) = fetched {
+                let tree =
+                    if dcroxide_stake::determine_tx_type(&tx) == dcroxide_stake::TxType::Regular {
+                        dcroxide_wire::TX_TREE_REGULAR
+                    } else {
+                        dcroxide_wire::TX_TREE_STAKE
+                    };
+                // Cache as recently advertised only when a peer qualified
+                // for the relay, matching dcrd's per-peer cache update.
+                if advertised {
+                    relay
+                        .recently_advertised
+                        .lock()
+                        .expect("recently advertised poisoned")
+                        .put(*hash, tx.clone());
+                }
+                notify_pairs.push((tx, tree));
+            }
         }
         // Notify subscribed websocket clients of the accepted transactions,
         // mirroring dcrd's `handleSendRawTransaction` calling

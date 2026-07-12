@@ -504,3 +504,91 @@ fn a_reorg_clears_and_then_recovers_getwork() {
 
     generator.shutdown();
 }
+
+#[test]
+fn the_pre_current_wait_loop_forwards_reorg_events() {
+    // The pre-current startup wait loop must still forward
+    // ReorgStarted/ReorgDone to the state machine (P3-12): dcrd's regen
+    // handler has no separate pre-current wait and tracks the reorg state
+    // for every event, so a reorg that begins and ends before the chain
+    // is current keeps the stale-template guard balanced and the
+    // reorg-done tip inject rebuilds the template.  If the wait loop
+    // dropped the reorg events (the bug), ReorgStarted would be lost, so
+    // ReorgDone never runs `handle_block_connected` and the generator
+    // stays wedged with no template.
+    let params = dcroxide_chaincfg::regnet_params();
+    // The regnet battery blocks carry old timestamps, so a chain built
+    // from them is never current under is_current_at; with unsynced
+    // mining disallowed the generator sits in the pre-current wait loop.
+    let (_dir, chain) = regnet_chain(2);
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
+
+    let policy = mining_policy();
+    let generator = start_generator(
+        Arc::clone(&chain),
+        Arc::clone(&tx_pool),
+        params.clone(),
+        vec![mining_address()],
+        policy.clone(),
+        0,
+        // allow_unsynced_mining disabled: stay in the pre-current wait
+        // loop over the not-yet-current battery chain.
+        false,
+        None,
+        None,
+    );
+
+    let mut templater = NodeRpcBlockTemplater::new(
+        generator.current_handle(),
+        generator.subscribers_handle(),
+        generator.sink(),
+        Arc::clone(&chain),
+        Arc::clone(&tx_pool),
+        params.clone(),
+        policy.clone(),
+        0,
+    );
+
+    // No startup template while the chain is not current.
+    assert!(
+        matches!(templater.current_template(), Ok(None)),
+        "an unsynced chain must not produce a startup template"
+    );
+
+    // A reorg begins and ends before the chain is current.  The wait
+    // loop forwards both events, so reorg-done runs the tip inject
+    // (dcrd's rtReorgDone runs handleBlockConnected before the IsCurrent
+    // gate) and the generator publishes a template even while syncing.
+    generator.sink().chain_reorg_started();
+    generator.sink().chain_reorg_done();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match templater.current_template() {
+            Ok(Some(block)) => {
+                assert_eq!(
+                    block.header.height, 3,
+                    "reorg-done rebuilds the tip template pre-current"
+                );
+                break;
+            }
+            Ok(None) => {}
+            Err(err) => panic!("pre-current reorg handling must not error: {err}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pre-current wait loop must forward reorg-done and rebuild"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    generator.shutdown();
+}

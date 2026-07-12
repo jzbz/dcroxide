@@ -380,11 +380,7 @@ fn run(cfg: Config) -> ExitCode {
         let drain_handler = handler.clone();
         let drain_chain = Arc::clone(&chain);
         let drain_hook: Box<dyn Fn() + Send> = Box::new(move || {
-            let now = now_unix();
-            drain_handler.drain_pending_checked_announcements();
-            drain_handler.drain_pending_block_events();
-            drain_handler.drain_pending_accepted_announcements(&drain_chain, now);
-            drain_handler.drain_pending_winning_tickets(&drain_chain, now);
+            drain_handler.drain_pending(&drain_chain, now_unix());
         });
         Some(dcroxide_node::bgtemplate::start_generator(
             Arc::clone(&chain),

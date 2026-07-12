@@ -436,8 +436,15 @@ impl SyncPeers {
     /// trickle queue batches non-immediate inventory over a short
     /// random window; the plain per-peer queue sends each announcement
     /// as its own message.
-    pub fn relay_inventory(&self, msg: &crate::server::RelayInvFacts) {
-        self.relay_to_peers(msg, None);
+    /// Returns whether at least one peer was eligible to receive the
+    /// advertisement — i.e. a connected peer with the required services
+    /// and, for a transaction, relaying enabled.  A transaction relay's
+    /// caller records the transaction in the recently-advertised cache
+    /// exactly when this is true, matching dcrd's per-peer
+    /// `recentlyAdvertisedTxns.Put` inside `handleRelayPeerInvMsg`
+    /// (which never fires when no peer qualifies).
+    pub fn relay_inventory(&self, msg: &crate::server::RelayInvFacts) -> bool {
+        self.relay_to_peers(msg, None)
     }
 
     /// Announce a block to every registered peer with the required
@@ -465,7 +472,8 @@ impl SyncPeers {
         &self,
         msg: &crate::server::RelayInvFacts,
         header: Option<&dcroxide_wire::BlockHeader>,
-    ) {
+    ) -> bool {
+        let mut advertised = false;
         let registry = self.inner.lock().expect("sync peers mutex poisoned");
         for handles in registry.values() {
             let mut relay = handles.relay.lock().expect("relay state poisoned");
@@ -475,6 +483,12 @@ impl SyncPeers {
                 known_inventory,
             } = &mut *relay;
             let outcome = crate::server::handle_relay_peer_inv(announced_block, facts, msg);
+            // dcrd records the transaction as recently advertised for
+            // every peer that clears the relay gate, before the
+            // known-inventory dedup below; track that any peer qualified.
+            if outcome.advertised_tx.is_some() {
+                advertised = true;
+            }
             match outcome.action {
                 crate::server::RelayPeerAction::Ignore => {}
                 crate::server::RelayPeerAction::QueueHeaders => {
@@ -506,6 +520,7 @@ impl SyncPeers {
                 }
             }
         }
+        advertised
     }
 
     fn deregister(&self, id: i32) {
@@ -1048,23 +1063,27 @@ impl ServerPeerHandler {
                         let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
                         pool.fetch_transaction(hash)
                     };
-                    if let Some(tx) = fetched {
+                    let advertised =
+                        self.ctx
+                            .sync_peers
+                            .relay_inventory(&crate::server::RelayInvFacts {
+                                inv_type: InvType::TX,
+                                inv_hash: *hash,
+                                req_services: dcroxide_wire::ServiceFlag(0),
+                                immediate: false,
+                                data_is_block_header: false,
+                                data_is_tx: true,
+                            });
+                    // Only cache the transaction as recently advertised
+                    // when a peer actually qualified for the relay, as
+                    // dcrd's per-peer `recentlyAdvertisedTxns.Put` does.
+                    if advertised && let Some(tx) = fetched {
                         self.ctx
                             .recently_advertised
                             .lock()
                             .expect("recently advertised poisoned")
                             .put(*hash, tx);
                     }
-                    self.ctx
-                        .sync_peers
-                        .relay_inventory(&crate::server::RelayInvFacts {
-                            inv_type: InvType::TX,
-                            inv_hash: *hash,
-                            req_services: dcroxide_wire::ServiceFlag(0),
-                            immediate: false,
-                            data_is_block_header: false,
-                            data_is_tx: true,
-                        });
                 }
                 ServeSignal::Continue
             }
@@ -1595,24 +1614,65 @@ mod tests {
             false,
         );
 
-        // Relay reaches the relay-enabled peer only.
+        // Relay reaches the relay-enabled peer only, and reports the
+        // transaction as advertised because that peer cleared the gate.
         let inv = tx_inv(0x01);
-        peers.relay_inventory(&tx_relay_msg(&inv));
+        assert!(
+            peers.relay_inventory(&tx_relay_msg(&inv)),
+            "a relay-enabled peer marks the tx advertised"
+        );
         match rx_a.try_recv().expect("peer 1 receives the inv") {
             Message::Inv(msg) => assert_eq!(msg.inv_list, vec![inv]),
             other => panic!("expected inv, got {other:?}"),
         }
         assert!(rx_b.try_recv().is_err(), "relay-disabled peer gets nothing");
 
-        // Repeats dedup through the known-inventory set.
-        peers.relay_inventory(&tx_relay_msg(&inv));
+        // Repeats dedup through the known-inventory set but still count
+        // as advertised — dcrd's per-peer Put fires before the dedup.
+        assert!(
+            peers.relay_inventory(&tx_relay_msg(&inv)),
+            "the tx is still advertised even when the queue dedups it"
+        );
         assert!(rx_a.try_recv().is_err(), "repeat announcements dedup");
 
-        // Inventory the peer announced itself is never echoed back.
+        // Inventory the peer announced itself is never echoed back, yet
+        // the peer still cleared the relay gate so it is advertised.
         let echoed = tx_inv(0x02);
         peers.mark_known_inventory(1, echoed);
-        peers.relay_inventory(&tx_relay_msg(&echoed));
+        assert!(
+            peers.relay_inventory(&tx_relay_msg(&echoed)),
+            "a known inventory still counts as advertised"
+        );
         assert!(rx_a.try_recv().is_err(), "announced inventory not echoed");
+    }
+
+    /// A transaction relay reports "not advertised" when no peer clears
+    /// the relay gate, so the caller skips the recently-advertised cache
+    /// exactly as dcrd's per-peer `recentlyAdvertisedTxns.Put` never
+    /// fires (an empty registry, or every peer with relaying disabled).
+    #[test]
+    fn tx_relay_not_advertised_without_an_eligible_peer() {
+        let peers = SyncPeers::new();
+        let inv = tx_inv(0x03);
+        assert!(
+            !peers.relay_inventory(&tx_relay_msg(&inv)),
+            "no peers means the tx is not advertised"
+        );
+
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        peers.register(
+            1,
+            queue,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(true)))),
+            test_peer_handle(),
+            None,
+            false,
+        );
+        assert!(
+            !peers.relay_inventory(&tx_relay_msg(&inv)),
+            "a relay-disabled peer does not advertise the tx"
+        );
     }
 
     /// `connected_peer_infos` snapshots each registered peer for

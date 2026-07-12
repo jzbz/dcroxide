@@ -126,11 +126,7 @@ impl PendingInvs {
         recently_advertised: &Arc<Mutex<dcroxide_containers::lru::Map<Hash, MsgTx>>>,
     ) {
         for (iv, tx) in &self.invs {
-            recently_advertised
-                .lock()
-                .expect("recently advertised poisoned")
-                .put(iv.hash, tx.clone());
-            sync_peers.relay_inventory(&RelayInvFacts {
+            let advertised = sync_peers.relay_inventory(&RelayInvFacts {
                 inv_type: iv.inv_type,
                 inv_hash: iv.hash,
                 req_services: ServiceFlag(0),
@@ -138,6 +134,14 @@ impl PendingInvs {
                 data_is_block_header: false,
                 data_is_tx: true,
             });
+            // Refresh the recently-advertised cache only when a peer
+            // qualified, matching dcrd's per-peer cache update.
+            if advertised {
+                recently_advertised
+                    .lock()
+                    .expect("recently advertised poisoned")
+                    .put(iv.hash, tx.clone());
+            }
         }
     }
 }
@@ -450,12 +454,43 @@ mod tests {
         );
     }
 
+    /// Register a single relay-enabled peer so a rebroadcast fire
+    /// actually advertises the inventory (dcrd only records a
+    /// recently-advertised transaction when a peer clears the relay
+    /// gate, so the cache stays empty with no eligible peer).
+    fn register_relay_peer(peers: &SyncPeers) {
+        // The relay marks the transaction advertised before it queues
+        // the inventory, so the dropped receiver (a failed queue send)
+        // does not affect the recently-advertised bookkeeping under test.
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        let facts = crate::server::RelayPeerFacts {
+            connected: true,
+            services: ServiceFlag(0),
+            wants_headers: false,
+            disable_relay_tx: false,
+            protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+        };
+        let peer = Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
+            dcroxide_peer::Config::default(),
+        )));
+        peers.register(
+            1,
+            queue,
+            None,
+            Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(facts))),
+            peer,
+            None,
+            false,
+        );
+    }
+
     /// A timer fire re-relays every pending entry: the transactions
     /// land back in the recently-advertised cache serving getdata.
     #[test]
     fn fire_reannounces_the_pending_inventory() {
         let cache = crate::dispatch::new_recently_advertised();
         let peers = SyncPeers::new();
+        register_relay_peer(&peers);
         let mut pending = PendingInvs::default();
         let tx = regular_tx(3);
         pending.add(iv(&tx), tx.clone());
@@ -463,6 +498,24 @@ mod tests {
         assert!(
             cache.lock().expect("cache").get(&tx.tx_hash()).is_some(),
             "fired transaction must serve from the cache"
+        );
+    }
+
+    /// A fire with no eligible peer leaves the recently-advertised cache
+    /// empty: dcrd's per-peer `recentlyAdvertisedTxns.Put` runs inside
+    /// the relay loop, so with no peer to iterate it never records the
+    /// transaction (P3-2).
+    #[test]
+    fn fire_without_a_peer_does_not_cache() {
+        let cache = crate::dispatch::new_recently_advertised();
+        let peers = SyncPeers::new();
+        let mut pending = PendingInvs::default();
+        let tx = regular_tx(5);
+        pending.add(iv(&tx), tx.clone());
+        pending.fire(&peers, &cache);
+        assert!(
+            cache.lock().expect("cache").get(&tx.tx_hash()).is_none(),
+            "no eligible peer means the tx is never advertised or cached"
         );
     }
 
@@ -487,9 +540,11 @@ mod tests {
             Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
         ));
         let cache = crate::dispatch::new_recently_advertised();
+        let peers = SyncPeers::new();
+        register_relay_peer(&peers);
         let rebroadcaster = start_with_delays(
             chain,
-            SyncPeers::new(),
+            peers,
             Arc::clone(&cache),
             Duration::from_millis(30),
             Duration::from_millis(30),

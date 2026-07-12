@@ -65,12 +65,14 @@ pub struct ChainNtfnHandler {
     /// Connected and disconnected blocks awaiting their mempool
     /// maintenance.
     pending_block_events: Arc<Mutex<Vec<PendingBlockEvent>>>,
-    /// Serializes the block-event drain: both the netsync post-process
-    /// path and the generator's drain hook drain the queue, and without
+    /// Serializes the whole deferred-notification drain: both the
+    /// netsync post-process path and the generator's drain hook run the
+    /// full [`ChainNtfnHandler::drain_pending`] sequence, and without
     /// this one could take a prefix of an in-flight reorg batch while the
-    /// other takes the suffix, processing the maintenance and index
-    /// notifications out of order.
-    block_drain_lock: Arc<Mutex<()>>,
+    /// other takes the suffix, processing the maintenance, announcements,
+    /// and index notifications out of the strict order dcrd's single
+    /// notification goroutine emits them in.
+    drain_lock: Arc<Mutex<()>>,
     /// The shared transaction pool the maintenance drives.
     tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
     /// The relay registry for the orphan-acceptance announce cascade.
@@ -140,7 +142,7 @@ impl ChainNtfnHandler {
             pending_checked_announcements: Arc::default(),
             pending_accepted_announcements: Arc::default(),
             pending_block_events: Arc::default(),
-            block_drain_lock: Arc::default(),
+            drain_lock: Arc::default(),
             tx_pool,
             sync_peers,
             recently_advertised,
@@ -219,9 +221,23 @@ impl ChainNtfnHandler {
                 self.handle_block_accepted(data);
             }
             Notification::BlockConnected(data) => {
-                if let Some(ntfn) = &self.ntfn {
-                    ntfn.notify_block_connected(data.block.clone());
-                }
+                // The block-connected websocket notification is deferred
+                // to the block-event drain: dcrd emits it only after the
+                // connected block's mempool maintenance has announced any
+                // newly acceptable transactions, so a websocket client
+                // sees txaccepted before blockconnected.
+                //
+                // The generator feed stays here at callback time, where it
+                // is correctly interleaved with the callback-time reorg
+                // events (a reorg disconnects then connects blocks between
+                // ChainReorgStarted and ChainReorgDone); moving it to the
+                // drain would let ChainReorgDone reach the generator before
+                // the reorg's own block events.  dcrd emits
+                // NotifyBlockConnected just before feeding the generator, so
+                // the port's generator-derived work notification can race
+                // ahead of the deferred blockconnected frame — an accepted
+                // cross-notification divergence a fully faithful fix would
+                // resolve only by deferring the reorg events too.
                 if let Some(generator) = &self.generator {
                     generator.block_connected(data.block.clone());
                 }
@@ -235,9 +251,9 @@ impl ChainNtfnHandler {
                     });
             }
             Notification::BlockDisconnected(data) => {
-                if let Some(ntfn) = &self.ntfn {
-                    ntfn.notify_block_disconnected(data.block.clone());
-                }
+                // The block-disconnected websocket notification is also
+                // deferred to the drain, matching dcrd's emission after
+                // the disconnect mempool maintenance and index notify.
                 if let Some(generator) = &self.generator {
                     generator.block_disconnected(data.block.clone());
                 }
@@ -448,23 +464,39 @@ impl ChainNtfnHandler {
 }
 
 impl ChainNtfnHandler {
+    /// Run the whole deferred-notification drain as one serialized unit:
+    /// the early checked-block announcements, the connected/disconnected
+    /// mempool maintenance, the accepted-block announcements, then the
+    /// queued winning-ticket lookups.  This fixed order preserves the
+    /// per-observer orderings that dcrd's single notification goroutine
+    /// produces — the peer relay order (a checked announcement before an
+    /// accepted one) and, within the block-event drain, txaccepted before
+    /// blockconnected — while the cross-sink orderings (a winning-tickets
+    /// websocket notification versus an accepted-block peer relay, which
+    /// dcrd emits in the opposite order inside its single NTBlockAccepted
+    /// case) are not observable by any one client.  The whole sequence
+    /// holds the drain lock so the two drivers — the netsync post-process
+    /// path and the background generator's drain hook — can never
+    /// interleave two runs and split a reorg batch, which would process
+    /// the maintenance, announcements, and index notifications out of
+    /// order (and could permanently cancel the index subscriber).
+    pub fn drain_pending(&self, chain: &Arc<Mutex<Chain>>, adjusted_time_unix: i64) {
+        let _drain = self.drain_lock.lock().expect("drain lock poisoned");
+        self.drain_pending_checked_announcements();
+        self.drain_pending_block_events();
+        self.drain_pending_accepted_announcements(chain, adjusted_time_unix);
+        self.drain_pending_winning_tickets(chain, adjusted_time_unix);
+    }
+
     /// Run the queued mempool maintenance for the connected and
     /// disconnected blocks, in order, now that the chain mutex is
     /// free (dcrd `handleBlockchainNotification`'s NTBlockConnected
     /// and NTBlockDisconnected mempool halves with the confirmed-
     /// transaction bookkeeping and the rebroadcast prunes; the
-    /// fee-estimator feed arrives with a later piece).
+    /// fee-estimator feed arrives with a later piece).  Serialized by
+    /// [`ChainNtfnHandler::drain_pending`], which every production
+    /// caller runs the whole drain through.
     pub fn drain_pending_block_events(&self) {
-        // Serialize the drainers for the whole drain so each contiguous
-        // FIFO prefix of the (possibly still-emitting) block-event queue
-        // is processed to completion, in order, by one thread at a time —
-        // the netsync post-process drain and the generator's drain hook
-        // otherwise split a reorg batch and process it out of order,
-        // permanently cancelling the index subscriber.
-        let _drain = self
-            .block_drain_lock
-            .lock()
-            .expect("block drain lock poisoned");
         let pending: Vec<PendingBlockEvent> = core::mem::take(
             &mut *self
                 .pending_block_events
@@ -472,70 +504,91 @@ impl ChainNtfnHandler {
                 .expect("pending block events"),
         );
         for event in pending {
-            let (ntfn_type, block, parent, check_tx_flags) = match event {
+            match event {
+                // dcrd NTBlockConnected: the connected block's mempool
+                // maintenance (which announces any newly acceptable
+                // transactions) runs first, then the rebroadcast prune,
+                // then the block-connected notification, then the index
+                // notify — so a websocket client sees txaccepted before
+                // blockconnected.
                 PendingBlockEvent::Connected {
                     block,
                     parent,
                     check_tx_flags,
                 } => {
                     self.handle_connected_block(&block, &parent, check_tx_flags);
-                    (
+                    if let Some(rebroadcast) = &self.rebroadcast {
+                        rebroadcast.prune_rebroadcast_inventory();
+                    }
+                    if let Some(ntfn) = &self.ntfn {
+                        ntfn.notify_block_connected(block.clone());
+                    }
+                    self.notify_index_subscriber(
                         dcroxide_indexers::CONNECT_NTFN,
                         block,
                         parent,
                         check_tx_flags,
-                    )
+                    );
                 }
+                // dcrd NTBlockDisconnected: the disconnect mempool
+                // maintenance, then the index notify, then the
+                // rebroadcast prune and the block-disconnected
+                // notification.
                 PendingBlockEvent::Disconnected {
                     block,
                     parent,
                     check_tx_flags,
                 } => {
                     self.handle_disconnected_block(&block, &parent, check_tx_flags);
-                    (
+                    self.notify_index_subscriber(
                         dcroxide_indexers::DISCONNECT_NTFN,
-                        block,
+                        block.clone(),
                         parent,
                         check_tx_flags,
-                    )
-                }
-            };
-            // Filter and update the rebroadcast inventory (dcrd's
-            // `s.PruneRebroadcastInventory()` in both the connect and
-            // disconnect cases when the RPC server runs; the prune is
-            // a queued command processed by the rebroadcast thread,
-            // exactly like dcrd's channel send).
-            if let Some(rebroadcast) = &self.rebroadcast {
-                rebroadcast.prune_rebroadcast_inventory();
-            }
-            // Notify the subscribed indexes at the end of each case
-            // (dcrd's `s.indexSubscriber.Notify`).  A failed update
-            // marks the subscriber cancelled and later notifications
-            // skip it, like dcrd's handler goroutine logging the
-            // error and cancelling its context so the quit channel
-            // absorbs further sends.
-            if let Some(subscriber) = &self.index_subscriber {
-                let mut subscriber = subscriber.lock().expect("index subscriber mutex poisoned");
-                if !subscriber.cancelled() {
-                    let ntfn = dcroxide_indexers::IndexNtfn {
-                        ntfn_type,
-                        block: Arc::new(block),
-                        parent: Arc::new(parent),
-                        is_treasury_enabled: check_tx_flags.is_treasury_enabled(),
-                    };
-                    if let Err(e) = subscriber.notify(&ntfn) {
-                        // The only operator-visible diagnostic for a
-                        // halted index (dcrd logs the error right
-                        // before cancelling).
-                        // Emit on stdout with dcrd's level + subsystem tag
-                        // (INDX, ERROR) so an operator capturing the daemon's
-                        // stdout sees why the index halted, matching the
-                        // `log_info` placeholder convention (dcrd logs this via
-                        // `indxLog.Error`).
-                        println!("[ERR] INDX: index update failed, index maintenance halted: {e}");
+                    );
+                    if let Some(rebroadcast) = &self.rebroadcast {
+                        rebroadcast.prune_rebroadcast_inventory();
+                    }
+                    if let Some(ntfn) = &self.ntfn {
+                        ntfn.notify_block_disconnected(block);
                     }
                 }
             }
+        }
+    }
+
+    /// Notify the subscribed indexes for a drained block event (dcrd's
+    /// `s.indexSubscriber.Notify`).  A failed update marks the
+    /// subscriber cancelled and later notifications skip it, like dcrd's
+    /// handler goroutine logging the error and cancelling its context so
+    /// the quit channel absorbs further sends.
+    fn notify_index_subscriber(
+        &self,
+        ntfn_type: dcroxide_indexers::IndexNtfnType,
+        block: dcroxide_wire::MsgBlock,
+        parent: dcroxide_wire::MsgBlock,
+        check_tx_flags: AgendaFlags,
+    ) {
+        let Some(subscriber) = &self.index_subscriber else {
+            return;
+        };
+        let mut subscriber = subscriber.lock().expect("index subscriber mutex poisoned");
+        if subscriber.cancelled() {
+            return;
+        }
+        let ntfn = dcroxide_indexers::IndexNtfn {
+            ntfn_type,
+            block: Arc::new(block),
+            parent: Arc::new(parent),
+            is_treasury_enabled: check_tx_flags.is_treasury_enabled(),
+        };
+        if let Err(e) = subscriber.notify(&ntfn) {
+            // The only operator-visible diagnostic for a halted index
+            // (dcrd logs the error right before cancelling).  Emit on
+            // stdout with dcrd's level + subsystem tag (INDX, ERROR) so
+            // an operator capturing the daemon's stdout sees why the
+            // index halted (dcrd logs this via `indxLog.Error`).
+            println!("[ERR] INDX: index update failed, index maintenance halted: {e}");
         }
     }
 
@@ -664,11 +717,8 @@ impl ChainNtfnHandler {
             } else {
                 dcroxide_wire::TX_TREE_STAKE
             };
-            self.recently_advertised
-                .lock()
-                .expect("recently advertised poisoned")
-                .put(*hash, tx.clone());
-            self.sync_peers
+            let advertised = self
+                .sync_peers
                 .relay_inventory(&crate::server::RelayInvFacts {
                     inv_type: dcroxide_wire::InvType::TX,
                     inv_hash: *hash,
@@ -677,6 +727,14 @@ impl ChainNtfnHandler {
                     data_is_block_header: false,
                     data_is_tx: true,
                 });
+            // Record it as recently advertised only when a peer
+            // qualified, matching dcrd's per-peer cache update.
+            if advertised {
+                self.recently_advertised
+                    .lock()
+                    .expect("recently advertised poisoned")
+                    .put(*hash, tx.clone());
+            }
             pairs.push((tx, tree));
         }
         if let Some(ntfn) = &self.ntfn {
@@ -862,6 +920,93 @@ mod tests {
         // clears the marker and both passes produce one message.
         let allowed = drive(true);
         assert_eq!(allowed.len(), 1, "toggle dedups the second pass");
+    }
+
+    /// The combined `drain_pending` entry point drives the whole
+    /// deferred sequence under one lock: two distinct queued
+    /// announcements (a checked one for a fresh hash and an accepted one
+    /// for another) both relay from a single call, so neither sub-drain
+    /// is skipped (P3-1).
+    #[test]
+    fn drain_pending_drives_the_whole_sequence() {
+        let params = dcroxide_chaincfg::testnet3_params();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opts = dcroxide_database::Options::new(dir.path().join("blocks"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create database");
+        let chain = Arc::new(Mutex::new(
+            dcroxide_blockchain::process::Chain::open(db, &params, params.assume_valid, false, 0)
+                .expect("open chain"),
+        ));
+        let tx_pool = crate::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            false,
+            100,
+            10000,
+            false,
+            false,
+        );
+        let genesis = chain
+            .lock()
+            .expect("chain")
+            .block_by_hash(&params.genesis_hash)
+            .expect("genesis block");
+        // A second header with a different hash so the checked and
+        // accepted announcements are not deduped into one message.
+        let mut other = genesis.clone();
+        other.header.version = 0x5eed;
+        let now = 2_000_000_000i64;
+
+        let peers = crate::dispatch::SyncPeers::new();
+        let (queue, rx) = crate::peerloop::OutboundQueue::channel();
+        peers.register(
+            1,
+            queue,
+            None,
+            Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
+                crate::server::RelayPeerFacts {
+                    connected: true,
+                    services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+                    wants_headers: false,
+                    disable_relay_tx: false,
+                    protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+                },
+            ))),
+            Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
+                dcroxide_peer::Config::default(),
+            ))),
+            None,
+            false,
+        );
+        // Unsynced mining allowed so the accepted announcement clears the
+        // is-current gate over the stale genesis tip.
+        let handler = ChainNtfnHandler::new(
+            None,
+            params.clone(),
+            true,
+            Arc::clone(&tx_pool),
+            peers,
+            crate::dispatch::new_recently_advertised(),
+        );
+        handler.handle(&Notification::NewTipBlockChecked(&genesis));
+        handler.handle(&Notification::BlockAccepted(BlockAcceptedNtfnsData {
+            best_height: 0,
+            fork_len: 0,
+            block: &other,
+        }));
+
+        // A single combined drain runs both the checked and accepted
+        // sub-drains: two distinct announced hashes relay two messages.
+        handler.drain_pending(&chain, now);
+        let mut got = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            got.push(msg);
+        }
+        assert_eq!(
+            got.len(),
+            2,
+            "drain_pending relays both the checked and accepted announcements: {got:?}"
+        );
     }
 
     /// The fee estimator's enable rides the same sync gate: dcrd only

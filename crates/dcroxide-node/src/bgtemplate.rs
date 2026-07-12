@@ -729,8 +729,27 @@ pub fn start_generator(
                 }
                 match receiver.recv_timeout(Duration::from_secs(1)) {
                     Ok(GenCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    // Events before the chain is current are dropped;
-                    // the tip inject below reflects the current state.
+                    // Reorg events must still reach the state machine so
+                    // the reorganizing flag and the stale-template guard
+                    // stay balanced across the sync-completion boundary.
+                    // dcrd's regen handler has no separate pre-current
+                    // wait: `handleRegenEvent` tracks the reorg state for
+                    // every event (its `rtReorgStarted`/`rtReorgDone`
+                    // arms run before the `IsCurrent` gate).  A reorg that
+                    // starts before the chain is current and finishes
+                    // after would otherwise drive the stale-template
+                    // counter negative and build a template mid-reorg.
+                    Ok(GenCommand::Event(event))
+                        if matches!(
+                            event.as_ref(),
+                            OwnedRegenEvent::ReorgStarted | OwnedRegenEvent::ReorgDone
+                        ) =>
+                    {
+                        process_event(&ctx, &mut g, &mut state, &mut deadlines, event.as_ref());
+                    }
+                    // Other events before the chain is current are
+                    // dropped; the tip inject below reflects the current
+                    // state.
                     Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
             }
