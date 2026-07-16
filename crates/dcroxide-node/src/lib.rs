@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod addblock;
 pub mod bgtemplate;
 pub mod chainntfns;
 pub mod config;

@@ -601,12 +601,22 @@ pub const ENV_DEFAULTS: [(&str, &str, Option<&str>); 2] = [
 
 /// Find an option by its long name.
 pub fn find_long(name: &str) -> Option<&'static OptSpec> {
-    OPTIONS.iter().find(|o| o.long == name)
+    find_long_in(&OPTIONS, name)
+}
+
+/// Find an option by its long name in the given registry.
+fn find_long_in(registry: &'static [OptSpec], name: &str) -> Option<&'static OptSpec> {
+    registry.iter().find(|o| o.long == name)
 }
 
 /// Find an option by its short name.
 fn find_short(name: char) -> Option<&'static OptSpec> {
-    OPTIONS.iter().find(|o| o.short == Some(name))
+    find_short_in(&OPTIONS, name)
+}
+
+/// Find an option by its short name in the given registry.
+fn find_short_in(registry: &'static [OptSpec], name: char) -> Option<&'static OptSpec> {
+    registry.iter().find(|o| o.short == Some(name))
 }
 
 /// Find an option the way go-flags' INI parser matches names:
@@ -709,12 +719,17 @@ fn valid_separate_value(spec: &OptSpec, arg: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The value sink a scan applies options through: the daemon stores
+/// into its `Config` via `set_option`, and each tool binary stores
+/// into its own config struct (go-flags reflecting into whatever
+/// struct the parser was built over).
+type StoreFn<'s> = dyn FnMut(&'static OptSpec, Option<&str>) -> Result<(), String> + 's;
+
 /// Apply a value to an option like go-flags `parseOption`: bare
 /// bools reject arguments, values unquote when they look quoted,
 /// and conversion failures wrap as marshal errors.
 fn parse_option(
-    cfg: &mut Config,
-    pass: &mut ParsePass,
+    store: &mut StoreFn<'_>,
     state: &mut ScanState<'_>,
     spec: &'static OptSpec,
     canarg: bool,
@@ -728,7 +743,7 @@ fn parse_option(
             )));
         }
         state.record_set(spec);
-        set_option(cfg, pass, spec, None).map_err(|e| ScanError::Other(marshal_error(spec, &e)))?;
+        store(spec, None).map_err(|e| ScanError::Other(marshal_error(spec, &e)))?;
         return Ok(());
     }
 
@@ -761,7 +776,7 @@ fn parse_option(
     };
 
     state.record_set(spec);
-    set_option(cfg, pass, spec, Some(&arg)).map_err(|e| ScanError::Other(marshal_error(spec, &e)))
+    store(spec, Some(&arg)).map_err(|e| ScanError::Other(marshal_error(spec, &e)))
 }
 
 /// Wrap a conversion error like go-flags `marshalError`.
@@ -812,6 +827,25 @@ pub(crate) fn scan_args<'a>(
     mode: ScanMode,
 ) -> (ScanState<'a>, Option<ScanError>) {
     let mut pass = ParsePass::default();
+    scan_args_in(
+        &OPTIONS,
+        &mut |spec, value| set_option(cfg, &mut pass, spec, value),
+        args,
+        mode,
+    )
+}
+
+/// Scan and apply a command line like go-flags `ParseArgs` over any
+/// option registry and value sink — the shared scanner behind the
+/// daemon and the tool binaries (each of dcrd's commands builds its
+/// own go-flags parser over its own config struct, all with the same
+/// scanning semantics).
+pub(crate) fn scan_args_in<'a>(
+    registry: &'static [OptSpec],
+    store: &mut StoreFn<'_>,
+    args: &'a [String],
+    mode: ScanMode,
+) -> (ScanState<'a>, Option<ScanError>) {
     let mut state = ScanState {
         args,
         pos: 0,
@@ -844,8 +878,8 @@ pub(crate) fn scan_args<'a>(
                 Some((name, value)) => (name, Some(value.to_string())),
                 None => (rest, None),
             };
-            match find_long(name) {
-                Some(spec) => parse_option(cfg, &mut pass, &mut state, spec, true, argument),
+            match find_long_in(registry, name) {
+                Some(spec) => parse_option(store, &mut state, spec, true, argument),
                 None => Err(ScanError::UnknownFlag(name.to_string())),
             }
         } else {
@@ -858,7 +892,7 @@ pub(crate) fn scan_args<'a>(
                 }
                 _ => (rest.to_string(), None),
             };
-            parse_shorts(cfg, &mut pass, &mut state, &names, argument)
+            parse_shorts(registry, store, &mut state, &names, argument)
         };
 
         if let Err(err) = result {
@@ -879,8 +913,8 @@ pub(crate) fn scan_args<'a>(
 /// Parse a short option cluster like go-flags `parseShort` with
 /// `splitShortConcatArg`.
 fn parse_shorts(
-    cfg: &mut Config,
-    pass: &mut ParsePass,
+    registry: &'static [OptSpec],
+    store: &mut StoreFn<'_>,
     state: &mut ScanState<'_>,
     names: &str,
     mut argument: Option<String>,
@@ -894,7 +928,7 @@ fn parse_shorts(
         if let Some(first) = chars.next() {
             let rest: String = chars.collect();
             if !rest.is_empty()
-                && let Some(spec) = find_short(first)
+                && let Some(spec) = find_short_in(registry, first)
                 && spec.kind != OptKind::Bool
             {
                 argument = Some(rest);
@@ -905,13 +939,13 @@ fn parse_shorts(
 
     let total = names.chars().count();
     for (i, c) in names.chars().enumerate() {
-        let Some(spec) = find_short(c) else {
+        let Some(spec) = find_short_in(registry, c) else {
             return Err(ScanError::UnknownFlag(c.to_string()));
         };
         // Only the last short option may consume a separate
         // argument.
         let canarg = i + 1 == total;
-        parse_option(cfg, pass, state, spec, canarg, argument.take())?;
+        parse_option(store, state, spec, canarg, argument.take())?;
     }
     Ok(())
 }
