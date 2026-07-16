@@ -508,6 +508,9 @@ pub struct NodeRpcConnManager {
     /// manual connect/remove RPCs (dcrd's `rpcConnManager` reaching
     /// `cm.server.connManager`); absent only in tests without a driver.
     outbound: Option<crate::outbound::OutboundControl>,
+    /// The dial/lookup routing (dcrd's `dcrdLookup` behind
+    /// `rpcConnManager.Lookup`); direct unless configured otherwise.
+    dialer: crate::socks::NodeDialer,
 }
 
 /// The relay handles the RPC connection manager drives when a
@@ -536,7 +539,15 @@ impl NodeRpcConnManager {
             sync_peers: crate::dispatch::SyncPeers::default(),
             relay: None,
             outbound: None,
+            dialer: crate::socks::NodeDialer::direct(),
         }
+    }
+
+    /// Attach the configured dial/lookup routing so `getaddednodeinfo`'s
+    /// DNS detail resolves the way dcrd's `dcrdLookup` does.
+    pub fn with_dialer(mut self, dialer: crate::socks::NodeDialer) -> NodeRpcConnManager {
+        self.dialer = dialer;
+        self
     }
 
     /// Attach the outbound connection driver's control handle so the
@@ -693,11 +704,14 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
     /// resolves through it rather than dcrd's SOCKS lookup, a documented
     /// divergence until the Tor path is wired).
     fn lookup(&mut self, host: &str) -> Result<Vec<String>, String> {
-        use std::net::ToSocketAddrs;
-        (host, 0u16)
-            .to_socket_addrs()
-            .map(|addrs| addrs.map(|addr| addr.ip().to_string()).collect())
-            .map_err(|e| e.to_string())
+        // dcrd `rpcConnManager.Lookup` runs the configured `dcrdLookup`,
+        // so a proxied daemon resolves through Tor and a `.onion` host
+        // takes the onion route (one minute bounds the resolution like
+        // the seeder's transport timeout; Go's resolver context here is
+        // unbounded).
+        self.dialer
+            .lookup(host, std::time::Duration::from_secs(60))
+            .map(|ips| ips.iter().map(|ip| ip.to_string()).collect())
     }
 
     /// Announce submitted transactions to the network (dcrd
@@ -1826,6 +1840,7 @@ mod tests {
                 // by the post-remove stability check below.
                 retry_duration: std::time::Duration::from_millis(50),
                 dial_timeout: std::time::Duration::from_secs(5),
+                dialer: crate::socks::NodeDialer::direct(),
                 permanent: Vec::new(),
                 get_new_address: None,
                 addr_manager: None,
@@ -1962,6 +1977,7 @@ mod tests {
                 // mid-test, leaving the failed request pending.
                 retry_duration: std::time::Duration::from_secs(60),
                 dial_timeout: std::time::Duration::from_secs(5),
+                dialer: crate::socks::NodeDialer::direct(),
                 permanent: Vec::new(),
                 get_new_address: None,
                 addr_manager: None,

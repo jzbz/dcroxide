@@ -685,6 +685,9 @@ fn run(cfg: Config) -> ExitCode {
             max_peers: cfg.max_peers.max(0) as usize,
             retry_duration: Duration::from_nanos(DEFAULT_RETRY_DURATION as u64),
             dial_timeout: Duration::from_nanos(cfg.dial_timeout_nanos as u64),
+            // The configured dial routing: direct, or SOCKS5 with the
+            // onion rules (dcrd's dcrdDial closures).
+            dialer: dcroxide_node::socks::NodeDialer::from_config(&cfg),
             permanent,
             get_new_address,
             // Record dial attempts against the address manager off simnet and
@@ -1001,7 +1004,10 @@ fn rpc_config(
                     rebroadcast,
                     ntfn.clone(),
                 )
-                .with_outbound(outbound_control),
+                .with_outbound(outbound_control)
+                // The configured lookup routing, so getaddednodeinfo's
+                // DNS detail resolves like dcrd's dcrdLookup.
+                .with_dialer(dcroxide_node::socks::NodeDialer::from_config(cfg)),
         ),
         tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(tx_pool)),
         clock: Box::new(dcroxide_node::rpcrun::SystemClock),

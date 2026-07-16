@@ -81,6 +81,9 @@ pub struct OutboundConfig {
     /// `target_outbound` connections (dcrd's `NewConnReq` address
     /// source); absent when only permanent connections are wanted.
     pub get_new_address: Option<AddressSource>,
+    /// The dial routing (direct, SOCKS5 proxy, and the onion rules;
+    /// dcrd's `dcrdDial` over the configured closures).
+    pub dialer: crate::socks::NodeDialer,
     /// The address manager, so each dial records an attempt against it
     /// (dcrd `attemptDcrdDial`'s `Attempt`).  `Some` only off simnet and
     /// regnet, matching where dcrd installs that dial hook; `None`
@@ -154,6 +157,7 @@ struct ServeState {
     /// How long each dial may take (dcrd `Timeout` wrapping the dial
     /// context).
     dial_timeout: Duration,
+    dialer: crate::socks::NodeDialer,
     /// The address manager each dial records an attempt against (dcrd
     /// `attemptDcrdDial`); `None` on simnet and regnet.
     addr_manager: Option<Arc<Mutex<AddrManager>>>,
@@ -371,20 +375,21 @@ pub fn addr_string_to_socket_addr(addr: &str) -> Result<SocketAddr, String> {
 fn dial(
     req: &ReqAddr,
     timeout: Duration,
+    dialer: &crate::socks::NodeDialer,
     addr_manager: Option<&Arc<Mutex<AddrManager>>>,
 ) -> Result<DialedConn, String> {
-    let socket: SocketAddr = req
-        .addr
-        .parse()
-        .map_err(|e| format!("invalid dial address {}: {e}", req.addr))?;
     // Record the dial attempt so the address manager's recently-attempted
     // gate and chance() penalty apply, and the same dead address is not
     // redialed in a tight loop (dcrd `attemptDcrdDial` marking `Attempt`
-    // before the dial).  A not-found address — a permanent `--connect`
-    // peer the manager never learned — is ignored, as dcrd does; the
-    // address's services and timestamp do not affect the lookup, which
-    // keys on the canonicalized host and port.
-    if let Some(addr_manager) = addr_manager {
+    // before the dial).  dcrd's `attemptDcrdDial` also `AddAddresses`es
+    // the target first so a `--connect`/addnode address the manager
+    // never learned becomes markable — that `AddAddresses` step is the
+    // documented deferral, so here a not-found address simply has its
+    // `attempt` return discarded; the address's services and timestamp
+    // do not affect the lookup, which keys on the canonicalized host
+    // and port.  A hostname address (a proxied dial resolves it
+    // remotely) has no manager entry to mark at all.
+    if let (Some(addr_manager), Ok(socket)) = (addr_manager, req.addr.parse::<SocketAddr>()) {
         let ip_bytes = match socket.ip() {
             IpAddr::V4(v4) => v4.octets().to_vec(),
             IpAddr::V6(v6) => v6.octets().to_vec(),
@@ -400,8 +405,9 @@ fn dial(
             .expect("addr manager mutex poisoned")
             .attempt(&na);
     }
-    let stream =
-        TcpStream::connect_timeout(&socket, timeout).map_err(|e| format!("dial failed: {e}"))?;
+    let stream = dialer
+        .dial(&req.addr, timeout)
+        .map_err(|e| format!("dial failed: {e}"))?;
     let shutdown = stream
         .try_clone()
         .map_err(|e| format!("dial clone failed: {e}"))?;
@@ -423,6 +429,7 @@ fn run_event_loop(
         connected: cfg.connected,
         server: cfg.server,
         dial_timeout: cfg.dial_timeout,
+        dialer: cfg.dialer.clone(),
         addr_manager: cfg.addr_manager.clone(),
     });
     let max_peers = cfg.max_peers;
@@ -569,7 +576,12 @@ fn handle_events(
                 let serve = Arc::clone(serve);
                 let commands = commands.clone();
                 thread::spawn(move || {
-                    let outcome = dial(&addr, serve.dial_timeout, serve.addr_manager.as_ref());
+                    let outcome = dial(
+                        &addr,
+                        serve.dial_timeout,
+                        &serve.dialer,
+                        serve.addr_manager.as_ref(),
+                    );
                     let _ = commands.send(Command::DialDone(id, outcome));
                 });
             }
