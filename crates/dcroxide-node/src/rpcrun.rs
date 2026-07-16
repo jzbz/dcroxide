@@ -1909,11 +1909,20 @@ mod tests {
             None,
         );
 
-        // node remove: the persistent peer disconnects and the request
-        // is removed, so the permanent connection is never redialed —
-        // the count settles at one (the temporary peer) and stays there
-        // across several would-be retry windows.
+        // node remove: the request is removed so the permanent
+        // connection is never redialed — the count settles at one (the
+        // temporary peer) and stays there across several would-be retry
+        // windows.  The dialed peer sits mid-handshake (the listener
+        // never accepts), and Windows does not abort another thread's
+        // in-flight blocking read when the local socket is shut down,
+        // so the teardown is completed from the remote side instead:
+        // accepting the backlog connection and dropping it delivers a
+        // wire-level close every platform observes, while the listener
+        // stays bound so a leaked redial of the removed request would
+        // still reconnect and trip the stability check below.
         manager.remove_by_addr(&reg_remote).expect("remove");
+        let (conn_a, _) = listener_a.accept().expect("accept the dialed conn");
+        drop(conn_a);
         assert!(
             wait_until(std::time::Duration::from_secs(5), || connected.len() == 1),
             "the removed peer must disconnect"
