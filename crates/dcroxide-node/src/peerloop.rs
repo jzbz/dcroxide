@@ -185,6 +185,11 @@ where
     E: PeerEnv,
     H: ServeHooks,
 {
+    // Snapshot the transport's cumulative read counter so each message
+    // contributes its delta to the peer's receive accounting (dcrd's
+    // `readMessage` adding its byte count to `bytesReceived`); the
+    // handshake's bytes were folded in by the connection assembly.
+    let mut read_total = transport.total_bytes_read();
     loop {
         // Read without the peer lock held so the ping timer and the
         // server keep making progress while this thread blocks.
@@ -192,8 +197,16 @@ where
             Ok(msg) => msg,
             Err(e) => return DisconnectReason::ReadError(e),
         };
+        let read_delta = transport.total_bytes_read().wrapping_sub(read_total);
+        read_total = transport.total_bytes_read();
 
         let mut peer = peer.lock().expect("peer mutex poisoned");
+        // Per-message receive accounting (dcrd stamping `lastRecv` in
+        // `inHandler` after each read); transports without byte
+        // tracking report zero deltas and skip it.
+        if read_delta > 0 {
+            peer.record_recv(read_delta, env.now_nanos());
+        }
         match classify_incoming(&mut peer, &msg, env) {
             IncomingAction::Disconnect(reason) => return DisconnectReason::Protocol(reason),
             IncomingAction::Process { reply } => {
@@ -244,14 +257,30 @@ impl OutboundQueue {
 }
 
 /// Write queued messages to the peer until the outbound queue is closed
-/// or a write fails (dcrd's `outHandler` draining the send queue).
-pub fn run_peer_output<T: MsgTransport>(
+/// or a write fails (dcrd's `outHandler` draining the send queue).  Each
+/// completed write contributes its byte delta and timestamp to the
+/// peer's send accounting (dcrd's `writeMessage` bookkeeping).
+pub fn run_peer_output<T, E>(
+    peer: &Mutex<Peer>,
     transport: &mut T,
+    env: &mut E,
     outbound: mpsc::Receiver<Message>,
-) -> DisconnectReason {
+) -> DisconnectReason
+where
+    T: MsgTransport,
+    E: PeerEnv,
+{
+    let mut write_total = transport.total_bytes_written();
     while let Ok(msg) = outbound.recv() {
         if let Err(e) = transport.write_message(&msg) {
             return DisconnectReason::WriteError(e);
+        }
+        let write_delta = transport.total_bytes_written().wrapping_sub(write_total);
+        write_total = transport.total_bytes_written();
+        if write_delta > 0 {
+            peer.lock()
+                .expect("peer mutex poisoned")
+                .record_send(write_delta, env.now_nanos());
         }
     }
     DisconnectReason::LocalShutdown
@@ -374,6 +403,20 @@ where
         return DisconnectReason::ReadError(e.to_string());
     }
 
+    // Fold the handshake's traffic into the peer's counters: dcrd's
+    // negotiation reads and writes go through the same counted
+    // `readMessage`/`writeMessage` bookkeeping as the session, and the
+    // version exchange ran on the (full-duplex) read transport.
+    let handshake_now = env.now_nanos();
+    let handshake_read = read_transport.bytes_read();
+    if handshake_read > 0 {
+        peer.record_recv(handshake_read, handshake_now);
+    }
+    let handshake_written = read_transport.bytes_written();
+    if handshake_written > 0 {
+        peer.record_send(handshake_written, handshake_now);
+    }
+
     // Share the peer across the loops and queue the verack that follows
     // negotiation.
     let peer = Arc::new(Mutex::new(peer));
@@ -391,8 +434,15 @@ where
         remote_version.disable_relay_tx,
     );
 
+    let output_peer = Arc::clone(&peer);
     let output = thread::spawn(move || {
-        let reason = run_peer_output(&mut write_transport, receiver);
+        let mut output_env = NodePeerEnv::new();
+        let reason = run_peer_output(
+            &output_peer,
+            &mut write_transport,
+            &mut output_env,
+            receiver,
+        );
         // Shut the socket down when the output loop ends (a write error
         // or a closed queue) so the input loop's blocking read unblocks
         // and the connection tears down instead of lingering.

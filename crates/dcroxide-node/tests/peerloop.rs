@@ -58,11 +58,20 @@ fn inbound_peer_answers_verack_and_ping_through_the_output_queue() {
         peer.negotiate_inbound_protocol(&mut read_transport, &mut env, &mut globals)
             .expect("inbound negotiation");
 
-        let peer = Mutex::new(peer);
+        let peer = std::sync::Arc::new(Mutex::new(peer));
         let (queue, outbound) = OutboundQueue::channel();
         send_verack(&queue).expect("queue verack");
 
-        let output = thread::spawn(move || run_peer_output(&mut write_transport, outbound));
+        let output_peer = std::sync::Arc::clone(&peer);
+        let output = thread::spawn(move || {
+            let mut output_env = NodePeerEnv::new();
+            run_peer_output(
+                &output_peer,
+                &mut write_transport,
+                &mut output_env,
+                outbound,
+            )
+        });
 
         let mut forwarded: Vec<Message> = Vec::new();
         let reason = run_peer_input(
@@ -80,8 +89,11 @@ fn inbound_peer_answers_verack_and_ping_through_the_output_queue() {
         drop(queue);
         let _ = output.join();
 
-        let verack_received = peer.lock().expect("peer mutex").verack_received();
-        (verack_received, forwarded, format!("{reason:?}"))
+        let guard = peer.lock().expect("peer mutex");
+        let verack_received = guard.verack_received();
+        let snap = guard.stats_snapshot();
+        drop(guard);
+        (verack_received, forwarded, format!("{reason:?}"), snap)
     });
 
     // Client side: negotiate, send verack and a ping, then read the
@@ -119,7 +131,7 @@ fn inbound_peer_answers_verack_and_ping_through_the_output_queue() {
     // Closing the connection ends the server's input loop.
     drop(transport);
 
-    let (verack_received, forwarded, reason) = server.join().expect("server thread");
+    let (verack_received, forwarded, reason, snap) = server.join().expect("server thread");
     assert!(
         verack_received,
         "server should have marked the remote verack"
@@ -134,6 +146,15 @@ fn inbound_peer_answers_verack_and_ping_through_the_output_queue() {
     );
     // The loop ended because the client closed the connection.
     assert!(reason.contains("ReadError"), "disconnect reason: {reason}");
+    // The loops fed the peer's per-message byte accounting: the input
+    // pump counted the client's verack and ping, the output loop the
+    // server's verack and pong, and both stamped the activity times
+    // (dcrd's read/write bookkeeping behind lastsend/lastrecv and the
+    // byte counters in getpeerinfo).
+    assert!(snap.bytes_recv > 0, "received bytes are counted");
+    assert!(snap.bytes_sent > 0, "sent bytes are counted");
+    assert!(snap.last_recv_nanos > 0, "the receive time is stamped");
+    assert!(snap.last_send_nanos > 0, "the send time is stamped");
 }
 
 #[test]
@@ -155,9 +176,12 @@ fn output_handler_writes_queued_messages_in_order_then_shuts_down() {
         .expect("queue ping");
     drop(queue);
 
+    let writer_peer = std::sync::Arc::new(Mutex::new(Peer::new_inbound(config("dcroxide-out"))));
+    let snap_peer = std::sync::Arc::clone(&writer_peer);
     let writer = thread::spawn(move || {
         let mut transport = WireTransport::new(client, MAX_PROTOCOL_VERSION, NET);
-        run_peer_output(&mut transport, outbound)
+        let mut env = NodePeerEnv::new();
+        run_peer_output(&writer_peer, &mut transport, &mut env, outbound)
     });
 
     // The reader sees the queued messages arrive in the order they were
@@ -175,6 +199,10 @@ fn output_handler_writes_queued_messages_in_order_then_shuts_down() {
         reason.contains("LocalShutdown"),
         "disconnect reason: {reason}"
     );
+    // Both writes fed the peer's send accounting.
+    let snap = snap_peer.lock().expect("peer mutex").stats_snapshot();
+    assert!(snap.bytes_sent > 0, "sent bytes are counted");
+    assert!(snap.last_send_nanos > 0, "the send time is stamped");
 }
 
 #[test]

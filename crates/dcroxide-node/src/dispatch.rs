@@ -348,11 +348,9 @@ impl SyncPeers {
                     services: snap.services.0,
                     tx_relay_disabled,
                     // The peer tracks these as unix nanoseconds; the RPC
-                    // result reports unix seconds.  They (and the byte
-                    // counters) read zero until per-peer send/receive
-                    // accounting is wired through the transport — a
-                    // documented divergence from dcrd, which updates the
-                    // peer's counters on every read and write.
+                    // result reports unix seconds.  The serving loops feed
+                    // them (and the byte counters) per message, like dcrd
+                    // updating the peer's counters on every read and write.
                     last_send_unix: snap.last_send_nanos / 1_000_000_000,
                     last_recv_unix: snap.last_recv_nanos / 1_000_000_000,
                     bytes_sent: snap.bytes_sent,

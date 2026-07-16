@@ -164,6 +164,14 @@ impl<S: Read + Write> MsgTransport for WireTransport<S> {
         }
         Ok(())
     }
+
+    fn total_bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    fn total_bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
 }
 
 #[cfg(test)]

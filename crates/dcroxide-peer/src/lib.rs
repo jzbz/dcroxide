@@ -79,4 +79,17 @@ pub trait MsgTransport {
     fn read_message(&mut self) -> Result<Message, String>;
     /// Write a message to the remote peer.
     fn write_message(&mut self, msg: &Message) -> Result<(), String>;
+    /// The cumulative bytes read off the underlying connection, so the
+    /// serving loops can attribute per-message deltas to the peer's
+    /// receive counters (dcrd's `readMessage` returning the byte count
+    /// it adds to `bytesReceived`).  Transports that do not track it
+    /// report zero and the accounting is skipped.
+    fn total_bytes_read(&self) -> u64 {
+        0
+    }
+    /// The cumulative bytes written to the underlying connection (the
+    /// send-side counterpart, dcrd's `writeMessage` count).
+    fn total_bytes_written(&self) -> u64 {
+        0
+    }
 }
