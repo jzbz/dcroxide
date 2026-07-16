@@ -55,6 +55,7 @@ fn serve_ws() -> (
         8,
         1000,
         Arc::clone(&tx_pool),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     )));
     let mut server = Server::new(Config {
         chain: NodeRpcChain::new(chain, params.clone()),

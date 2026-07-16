@@ -70,6 +70,7 @@ fn serve_rpc_capped(
         8,
         1000,
         Arc::clone(&tx_pool),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     )));
     // A real (but empty and never-enabled) fee estimator, exactly as
     // the daemon wires it: estimatesmartfee reads it and, with no

@@ -125,6 +125,7 @@ fn the_submit_seam_accepts_a_block_and_rejects_a_duplicate() {
         8,
         1000,
         Arc::clone(&tx_pool),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     )));
     let mut rpc_sync = NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool));
 
@@ -175,6 +176,7 @@ fn a_submitted_block_drains_the_chain_handler() {
         8,
         1000,
         Arc::clone(&tx_pool),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     )));
 
     // Install the chain handler both as the chain's notification
@@ -248,6 +250,7 @@ fn submitblock_over_http_accepts_then_rejects_duplicate() {
         8,
         1000,
         Arc::clone(&tx_pool),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     )));
     let server = Arc::new(Mutex::new(Server::new(Config {
         chain: NodeRpcChain::new(Arc::clone(&chain), params.clone()),

@@ -134,6 +134,7 @@ fn control_and_chain_query_seams_over_http() {
         8,
         1000,
         Arc::clone(&tx_pool),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     )));
 
     // An address manager holding one routable local address, so the

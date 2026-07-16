@@ -55,6 +55,7 @@ fn genesis_server(dir: &std::path::Path, name: &str) -> (Arc<ServerContext>, Con
             8,
             1000,
             Arc::clone(&tx_pool),
+            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
@@ -64,6 +65,8 @@ fn genesis_server(dir: &std::path::Path, name: &str) -> (Arc<ServerContext>, Con
         tx_pool: Arc::clone(&tx_pool),
         ntfn: None,
         recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
+
+        mix_pool: dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     });
     (server, connected)
 }

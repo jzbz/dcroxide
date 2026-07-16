@@ -71,6 +71,7 @@ fn serve_genesis_chain() -> (
             8,
             1000,
             Arc::clone(&tx_pool),
+            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
@@ -80,6 +81,8 @@ fn serve_genesis_chain() -> (
         tx_pool: Arc::clone(&tx_pool),
         ntfn: None,
         recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
+
+        mix_pool: dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     });
 
     let template = PeerTemplate {
@@ -201,6 +204,34 @@ fn serves_chain_backed_requests() {
     match transport.read_message().expect("read notfound") {
         Message::NotFound(not_found) => {
             assert_eq!(not_found.inv_list, vec![unknown_block, unknown_tx]);
+        }
+        other => panic!("expected notfound, got {other:?}"),
+    }
+
+    drop(transport);
+    runtime.shutdown();
+}
+
+/// getdata for a mix message the pool does not hold misses into a
+/// notfound, exactly as dcrd resolves a getdata MIX inv against its
+/// empty `mixMsgPool` (the daemon shares one pool between this serve
+/// path and the netsync intake).
+#[test]
+fn serves_notfound_for_an_absent_mix_message() {
+    let (_dir, runtime, _connected, mut transport, _genesis_hash, _addrmgr) = serve_genesis_chain();
+
+    let unknown_mix = InvVect {
+        inv_type: InvType::MIX,
+        hash: Hash([0x77; 32]),
+    };
+    transport
+        .write_message(&Message::GetData(MsgGetData {
+            inv_list: vec![unknown_mix],
+        }))
+        .expect("send getdata for a mix message");
+    match transport.read_message().expect("read notfound") {
+        Message::NotFound(not_found) => {
+            assert_eq!(not_found.inv_list, vec![unknown_mix]);
         }
         other => panic!("expected notfound, got {other:?}"),
     }
@@ -508,6 +539,7 @@ fn initiates_header_sync_with_a_data_serving_peer() {
             8,
             1000,
             Arc::clone(&tx_pool),
+            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
@@ -517,6 +549,8 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         tx_pool: Arc::clone(&tx_pool),
         ntfn: None,
         recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
+
+        mix_pool: dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     });
     let template = PeerTemplate {
         net: NET,
@@ -608,6 +642,7 @@ fn disconnects_a_stalled_header_sync_peer() {
         8,
         1000,
         Arc::clone(&tx_pool),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     )));
     // A short stall timeout so the test observes the watchdog firing.
     let stall_timer = dcroxide_node::dispatch::start_stall_timer(
@@ -635,6 +670,8 @@ fn disconnects_a_stalled_header_sync_peer() {
         tx_pool: Arc::clone(&tx_pool),
         ntfn: None,
         recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
+
+        mix_pool: dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     });
     let template = PeerTemplate {
         net: NET,
@@ -810,6 +847,7 @@ fn announces_connected_blocks_to_served_peers() {
             8,
             1000,
             Arc::clone(&tx_pool),
+            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
         ))),
         sync_peers: sync_peers.clone(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
@@ -819,6 +857,8 @@ fn announces_connected_blocks_to_served_peers() {
         tx_pool: Arc::clone(&tx_pool),
         ntfn: None,
         recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
+
+        mix_pool: dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     });
 
     // The daemon's chain handler wiring: the callback queues the

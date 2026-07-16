@@ -16,9 +16,8 @@
 // explicit wrapping operations.
 #![allow(clippy::arithmetic_side_effects)]
 
-use core::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
@@ -372,7 +371,7 @@ impl Session {
     }
 }
 
-type StrikeSetRef = Rc<RefCell<StrikeSet>>;
+type StrikeSetRef = Arc<Mutex<StrikeSet>>;
 
 struct StrikeSet {
     set: HashSet<OutPointKey>,
@@ -394,8 +393,8 @@ pub struct Pool<B: MixBlockChain> {
     prs: HashMap<[u8; 32], MsgMixPairReq>,
     out_points: HashMap<OutPointKey, Hash>,
     pool: HashMap<[u8; 32], Entry>,
-    orphans: HashMap<[u8; 32], Rc<OrphanMsg>>,
-    orphans_by_id: HashMap<IdPubKey, HashMap<[u8; 32], Rc<OrphanMsg>>>,
+    orphans: HashMap<[u8; 32], Arc<OrphanMsg>>,
+    orphans_by_id: HashMap<IdPubKey, HashMap<[u8; 32], Arc<OrphanMsg>>>,
     messages_by_identity: HashMap<IdPubKey, Vec<Hash>>,
     latest_ke: HashMap<IdPubKey, MsgMixKeyExchange>,
     sessions: HashMap<[u8; 32], Session>,
@@ -408,7 +407,7 @@ pub struct Pool<B: MixBlockChain> {
     recent_mix_msgs: lru::Map<[u8; 32], PoolMessage>,
 
     blockchain: B,
-    utxo_fetcher: Option<Rc<dyn MixUtxoFetcher>>,
+    utxo_fetcher: Option<Arc<dyn MixUtxoFetcher + Send + Sync>>,
     fee_rate: i64,
 
     // Observer state (dcrd `Observer.strikes`).
@@ -422,7 +421,10 @@ impl<B: MixBlockChain> Pool<B> {
     /// required for distributed transaction mixing (dcrd `NewPool`).
     /// Pass a fetcher when UTXO validation capability is available
     /// (dcrd type-asserts this from the blockchain).
-    pub fn new(blockchain: B, utxo_fetcher: Option<Rc<dyn MixUtxoFetcher>>) -> Pool<B> {
+    pub fn new(
+        blockchain: B,
+        utxo_fetcher: Option<Arc<dyn MixUtxoFetcher + Send + Sync>>,
+    ) -> Pool<B> {
         Pool::new_with_clock(
             blockchain,
             utxo_fetcher,
@@ -442,7 +444,7 @@ impl<B: MixBlockChain> Pool<B> {
     #[doc(hidden)]
     pub fn new_with_clock(
         blockchain: B,
-        utxo_fetcher: Option<Rc<dyn MixUtxoFetcher>>,
+        utxo_fetcher: Option<Arc<dyn MixUtxoFetcher + Send + Sync>>,
         now_fn: lru::Clock,
     ) -> Pool<B> {
         // XXX (dcrd): mainnet epoch; add to chainparams.
@@ -951,7 +953,7 @@ impl<B: MixBlockChain> Pool<B> {
 
         self.limit_num_orphans();
 
-        let orphan = Rc::new(OrphanMsg {
+        let orphan = Arc::new(OrphanMsg {
             message: msg.clone(),
             src,
             accepted: (self.now_fn)(),
@@ -1794,7 +1796,7 @@ impl<B: MixBlockChain> Pool<B> {
             let mut ss: Vec<StrikeSetRef> = Vec::new();
             for utxo in &pr.utxos {
                 if let Some(s) = self.strikes.get(&op_key(&utxo.out_point))
-                    && !ss.iter().any(|other| Rc::ptr_eq(other, s))
+                    && !ss.iter().any(|other| Arc::ptr_eq(other, s))
                 {
                     ss.push(s.clone());
                 }
@@ -1802,8 +1804,8 @@ impl<B: MixBlockChain> Pool<B> {
             let merged: StrikeSetRef = match ss.first() {
                 Some(first) => {
                     for other in &ss[1..] {
-                        let other_set = other.borrow();
-                        let mut first_mut = first.borrow_mut();
+                        let other_set = other.lock().expect("strike set poisoned");
+                        let mut first_mut = first.lock().expect("strike set poisoned");
                         for op in &other_set.set {
                             first_mut.set.insert(*op);
                         }
@@ -1813,12 +1815,16 @@ impl<B: MixBlockChain> Pool<B> {
                     }
                     first.clone()
                 }
-                None => Rc::new(RefCell::new(StrikeSet {
+                None => Arc::new(Mutex::new(StrikeSet {
                     set: HashSet::new(),
                     strikes: Vec::new(),
                 })),
             };
-            merged.borrow_mut().strikes.push(epoch);
+            merged
+                .lock()
+                .expect("strike set poisoned")
+                .strikes
+                .push(epoch);
             for utxo in &pr.utxos {
                 self.strikes.insert(op_key(&utxo.out_point), merged.clone());
             }
@@ -1842,7 +1848,7 @@ impl<B: MixBlockChain> Pool<B> {
         // Remove strikes if none occurred in the past 24h.
         let cutoff = epoch.wrapping_sub(60 * 60 * 24);
         self.strikes.retain(|_, s| {
-            let s = s.borrow();
+            let s = s.lock().expect("strike set poisoned");
             s.strikes.last().copied().unwrap_or_default() > cutoff
         });
     }
@@ -1856,7 +1862,7 @@ impl<B: MixBlockChain> Pool<B> {
             let Some(s) = self.strikes.get(&op_key(&utxo.out_point)) else {
                 continue;
             };
-            let mut s = s.borrow_mut();
+            let mut s = s.lock().expect("strike set poisoned");
             for other in &pr.utxos {
                 s.set.insert(op_key(&other.out_point));
             }
@@ -1897,7 +1903,7 @@ impl<B: MixBlockChain> Pool<B> {
             let Some(s) = self.strikes.get(&op_key(&tx_in.previous_out_point)) else {
                 continue;
             };
-            if s.borrow().strikes.len() >= STRIKE_LIMIT {
+            if s.lock().expect("strike set poisoned").strikes.len() >= STRIKE_LIMIT {
                 return true;
             }
         }
@@ -1913,7 +1919,7 @@ impl<B: MixBlockChain> Pool<B> {
                 let Some(s) = self.strikes.get(&op_key(&utxo.out_point)) else {
                     continue;
                 };
-                if s.borrow().strikes.len() >= STRIKE_LIMIT {
+                if s.lock().expect("strike set poisoned").strikes.len() >= STRIKE_LIMIT {
                     continue 'prs;
                 }
             }
@@ -1934,7 +1940,7 @@ impl<B: MixBlockChain> Pool<B> {
                         index: *index,
                         tree: *tree,
                     },
-                    s.borrow().strikes.len(),
+                    s.lock().expect("strike set poisoned").strikes.len(),
                 )
             })
             .collect()

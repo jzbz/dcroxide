@@ -28,6 +28,7 @@ dcroxide-dcrjson = { path = "../dcroxide-dcrjson" }
 dcroxide-fees = { path = "../dcroxide-fees" }
 dcroxide-indexers = { path = "../dcroxide-indexers" }
 dcroxide-mempool = { path = "../dcroxide-mempool" }
+dcroxide-mixing = { path = "../dcroxide-mixing" }
 dcroxide-mining = { path = "../dcroxide-mining" }
 dcroxide-netsync = { path = "../dcroxide-netsync" }
 dcroxide-stake = { path = "../dcroxide-stake" }

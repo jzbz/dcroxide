@@ -28,10 +28,10 @@ use dcroxide_netsync::manager::{
 use dcroxide_uint256::Uint256;
 use dcroxide_wire::{BlockHeader, MsgBlock, MsgTx};
 
-/// The daemon's concrete sync manager over the shared chain and the
-/// not-yet-wired pools.
+/// The daemon's concrete sync manager over the shared chain, mempool,
+/// and mixing pool.
 pub type NodeSyncManager =
-    SyncManager<NodeSyncChain, crate::txmempool::NodeSyncTxPool, NullMixPool>;
+    SyncManager<NodeSyncChain, crate::txmempool::NodeSyncTxPool, crate::mixnode::NodeSyncMixPool>;
 
 /// The maximum number of recently confirmed transactions to track
 /// (dcrd `maxRecentlyConfirmedTxns`: about one hour of main network
@@ -209,6 +209,7 @@ pub struct NullMixPool;
 
 impl SyncMixPool for NullMixPool {
     type Msg = dcroxide_wire::Message;
+    type Err = String;
 
     fn mix_hash(&mut self, _msg: &Self::Msg) -> Hash {
         Hash([0u8; 32])
@@ -236,11 +237,12 @@ pub fn new_sync_manager(
     max_outbound_peers: u64,
     max_orphan_txs: usize,
     tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
+    mix_pool: Arc<Mutex<crate::mixnode::NodeMixPool>>,
 ) -> NodeSyncManager {
     SyncManager::new(Config {
         chain: NodeSyncChain::new(chain, params.clone()),
         tx_mem_pool: crate::txmempool::NodeSyncTxPool::new(tx_pool),
-        mix_pool: NullMixPool,
+        mix_pool: crate::mixnode::NodeSyncMixPool::new(mix_pool),
         min_known_chain_work: params.min_known_chain_work,
         net: params.net,
         target_time_per_block_secs: params.target_time_per_block_secs,

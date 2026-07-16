@@ -535,6 +535,7 @@ dependencies = [
  "dcroxide-indexers",
  "dcroxide-mempool",
  "dcroxide-mining",
+ "dcroxide-mixing",
  "dcroxide-netsync",
  "dcroxide-peer",
  "dcroxide-rpc",

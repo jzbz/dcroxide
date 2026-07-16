@@ -16,7 +16,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use dcroxide_chaincfg::{Params, simnet_params, testnet3_params};
 use dcroxide_chainhash::Hash;
@@ -113,12 +113,17 @@ type UtxoRow = (Vec<u8>, u16, i64, i64, bool);
 
 #[derive(Default)]
 struct DumpFetcher {
-    utxos: core::cell::RefCell<HashMap<([u8; 32], u32), UtxoRow>>,
+    utxos: std::sync::Mutex<HashMap<([u8; 32], u32), UtxoRow>>,
 }
 
 impl MixUtxoFetcher for DumpFetcher {
     fn fetch_utxo_entry(&self, op: &OutPoint) -> Result<Box<dyn MixUtxoEntry>, String> {
-        match self.utxos.borrow().get(&(op.hash.0, op.index)) {
+        match self
+            .utxos
+            .lock()
+            .expect("utxo map")
+            .get(&(op.hash.0, op.index))
+        {
             Some((script, ver, height, amount, spent)) => Ok(Box::new(DumpUtxo {
                 pk_script: script.clone(),
                 script_ver: *ver,
@@ -171,7 +176,7 @@ fn err_code(err: &PoolError) -> String {
 
 struct Scenario {
     pool: Pool<DumpChain>,
-    fetcher: Rc<DumpFetcher>,
+    fetcher: Arc<DumpFetcher>,
     msgs: HashMap<[u8; 32], PoolMessage>,
 }
 
@@ -250,7 +255,7 @@ fn mixpool_vectors() {
                 let height: i64 = f[4].parse().expect("height");
                 let now_unix: i64 = f[5].parse().expect("now");
                 let chain = DumpChain { params, height };
-                let fetcher = Rc::new(DumpFetcher::default());
+                let fetcher = Arc::new(DumpFetcher::default());
                 let clock: dcroxide_containers::lru::Clock = {
                     let nanos = now_unix.wrapping_mul(1_000_000_000);
                     std::sync::Arc::new(move || nanos)
@@ -258,7 +263,7 @@ fn mixpool_vectors() {
                 let pool = Pool::new_with_clock(
                     chain,
                     if has_fetcher {
-                        Some(fetcher.clone() as Rc<dyn MixUtxoFetcher>)
+                        Some(fetcher.clone() as Arc<dyn MixUtxoFetcher + Send + Sync>)
                     } else {
                         None
                     },
@@ -281,7 +286,8 @@ fn mixpool_vectors() {
                 let ver: u16 = f[7].parse().expect("ver");
                 sc.fetcher
                     .utxos
-                    .borrow_mut()
+                    .lock()
+                    .expect("utxo map")
                     .insert((hash.0, index), (script, ver, height, amount, spent));
             }
             "accept" => {

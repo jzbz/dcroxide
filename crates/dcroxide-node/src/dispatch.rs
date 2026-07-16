@@ -111,6 +111,9 @@ pub struct ServerContext {
     /// Recently advertised transactions, kept servable briefly after
     /// leaving the pool (dcrd `recentlyAdvertisedTxns`).
     pub recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
+    /// The mixing pool the getdata serve path reads, shared with the
+    /// sync manager that accepts mix messages (dcrd `server.mixMsgPool`).
+    pub mix_pool: Arc<Mutex<crate::mixnode::NodeMixPool>>,
 }
 
 /// The maximum number of recently advertised transactions to track
@@ -1063,6 +1066,16 @@ impl ServerPeerHandler {
                 });
                 ServeSignal::Continue
             }
+            // The eight mixing messages all submit to the mixpool (dcrd's
+            // OnMix* handlers each forwarding to `onMixMessage`).
+            Message::MixPairReq(_)
+            | Message::MixKeyExchange(_)
+            | Message::MixCiphertexts(_)
+            | Message::MixSlotReserve(_)
+            | Message::MixDCNet(_)
+            | Message::MixConfirm(_)
+            | Message::MixFactoredPoly(_)
+            | Message::MixSecrets(_) => self.on_mix_message(msg.clone(), peer.services()),
             Message::Inv(inv) => {
                 // Inventory the peer announces is known to it, so the
                 // relay never echoes it back (dcrd `AddKnownInventory`).
@@ -1393,15 +1406,34 @@ impl ServerPeerHandler {
             }
         }
 
+        // Resolve mix items against the mixing pool (dcrd's
+        // `s.mixMsgPool.RecentMessage`, which also consults the LRU of
+        // messages just removed from the pool so a peer that advertised a
+        // now-confirmed message is still served it); a message the pool
+        // has never seen misses into the consolidated notfound.
+        let mut mixes: HashMap<dcroxide_chainhash::Hash, dcroxide_wire::Message> = HashMap::new();
+        for iv in inv_list.iter() {
+            if iv.inv_type == InvType::MIX {
+                let fetched = self
+                    .ctx
+                    .mix_pool
+                    .lock()
+                    .expect("mix pool mutex poisoned")
+                    .recent_message(&iv.hash);
+                if let Some(msg) = fetched {
+                    mixes.insert(iv.hash, crate::mixnode::pool_to_wire_message(msg));
+                }
+            }
+        }
+
         // Classify each item in request order from the resolved sets.
-        // Mix messages resolve against a pool that is not yet wired, so
-        // they miss exactly like an empty mixpool's fetch.
         let items: Vec<(InvVect, GetDataResolution)> = inv_list
             .iter()
             .map(|iv| {
                 let resolution = match iv.inv_type {
                     InvType::BLOCK if blocks.contains_key(&iv.hash) => GetDataResolution::Found,
                     InvType::TX if txs.contains_key(&iv.hash) => GetDataResolution::Found,
+                    InvType::MIX if mixes.contains_key(&iv.hash) => GetDataResolution::Found,
                     InvType::BLOCK | InvType::TX | InvType::MIX => GetDataResolution::NotFound,
                     _ => GetDataResolution::UnknownType,
                 };
@@ -1417,6 +1449,8 @@ impl ServerPeerHandler {
                         outbound.queue_message(Message::Block(block))
                     } else if let Some(tx) = txs.remove(&iv.hash) {
                         outbound.queue_message(Message::Tx(tx))
+                    } else if let Some(mix) = mixes.remove(&iv.hash) {
+                        outbound.queue_message(mix)
                     } else {
                         Ok(())
                     }
@@ -1694,6 +1728,114 @@ impl ServerPeerHandler {
                 block_hashes,
                 vote_hashes,
             }));
+        }
+    }
+
+    /// Submit a received mixing message to the mixpool (dcrd's OnMix*
+    /// handlers over `onMixMessage`): announce every accepted message to
+    /// the peers, request the missing pair request when an orphan key
+    /// exchange references an unknown one, and disconnect a peer whose
+    /// message is a bannable protocol violation (dcrd `BanPeer`).
+    fn on_mix_message(
+        &mut self,
+        msg: Message,
+        services: dcroxide_wire::ServiceFlag,
+    ) -> ServeSignal {
+        // dcrd `onMixMessage` ignores mix traffic entirely under
+        // --blocksonly (server.go), before it touches the pool or the
+        // peer's known inventory.
+        if self.ctx.blocks_only {
+            return ServeSignal::Continue;
+        }
+        let Some(pool_msg) = crate::mixnode::wire_to_pool_message(msg) else {
+            return ServeSignal::Continue;
+        };
+        let Some(id) = self.sync_peer_id else {
+            return ServeSignal::Continue;
+        };
+
+        // Mark the message known to the sending peer before processing
+        // (dcrd `sp.AddKnownInventory`), so the accept-time relay below
+        // never echoes the inventory back to the peer that just sent it.
+        if let Ok(hash) = pool_msg.mix_hash() {
+            self.ctx.sync_peers.mark_known_inventory(
+                id,
+                InvVect {
+                    inv_type: InvType::MIX,
+                    hash,
+                },
+            );
+        }
+
+        // Accept under the sync-manager lock (its rejected-message
+        // bookkeeping wraps the pool's acceptance); the missing-PR
+        // request is issued while still holding it, exactly as dcrd's
+        // OnMixMsg runs both against the sync manager.
+        enum MixOutcome {
+            Accepted(Vec<dcroxide_mixing::PoolMessage>),
+            Ban,
+            Nothing,
+        }
+        let outcome = {
+            let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
+            match manager.on_mix_msg(id, &pool_msg) {
+                Ok(accepted) => MixOutcome::Accepted(accepted),
+                Err(dcroxide_mixing::PoolError::MissingOwnPR(missing)) => {
+                    // Request the referenced pair request from the peer
+                    // (dcrd `RequestMixMsgFromPeer`); a normal orphan.
+                    let actions = manager.request_mix_msg_from_peer(id, &missing);
+                    drop(manager);
+                    self.ctx.sync_peers.execute(actions);
+                    MixOutcome::Nothing
+                }
+                Err(err) => {
+                    if err.is_bannable(services) {
+                        MixOutcome::Ban
+                    } else {
+                        MixOutcome::Nothing
+                    }
+                }
+            }
+        };
+
+        match outcome {
+            MixOutcome::Accepted(accepted) => {
+                // Announce every accepted message to the peers (dcrd
+                // `AnnounceMixMessages` → `relayMixMessages`), so they can
+                // request it — the pool already holds it for the getdata
+                // serve path.  The accepted slice carries the delivered
+                // message plus any orphan its acceptance un-orphaned.
+                for msg in &accepted {
+                    if let Ok(hash) = msg.mix_hash() {
+                        self.ctx
+                            .sync_peers
+                            .relay_inventory(&crate::server::RelayInvFacts {
+                                inv_type: InvType::MIX,
+                                inv_hash: hash,
+                                req_services: dcroxide_wire::ServiceFlag(0),
+                                immediate: false,
+                                data_is_block_header: false,
+                                data_is_tx: false,
+                            });
+                    }
+                }
+                // The websocket half of `AnnounceMixMessages` (dcrd
+                // `s.rpcServer.NotifyMixMessages`): push every accepted
+                // message to the subscribed clients (a no-op under
+                // --norpc, exactly as dcrd's nil-rpcServer check).
+                if let Some(ntfn) = &self.ctx.ntfn {
+                    ntfn.notify_mix_messages(
+                        accepted
+                            .iter()
+                            .cloned()
+                            .map(crate::mixnode::pool_to_wire_message)
+                            .collect(),
+                    );
+                }
+                ServeSignal::Continue
+            }
+            MixOutcome::Ban => ServeSignal::Disconnect("sent malformed mix message"),
+            MixOutcome::Nothing => ServeSignal::Continue,
         }
     }
 }

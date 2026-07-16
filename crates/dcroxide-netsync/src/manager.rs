@@ -196,12 +196,17 @@ pub trait SyncTxPool {
 pub trait SyncMixPool {
     /// The mixing message type.
     type Msg;
+    /// The acceptance error type (dcrd's mixpool error values): the
+    /// server inspects the returned error for the missing-own-PR
+    /// request and the bannable check, so the pool's structured error
+    /// passes through [`SyncManager::on_mix_msg`] intact.
+    type Err;
     /// The mixing message hash (dcrd `mixing.Message.Hash`).
     fn mix_hash(&mut self, msg: &Self::Msg) -> Hash;
     /// Validate and potentially accept the message along with any
-    /// orphans it satisfies (dcrd `AcceptMessage`; the error text only
-    /// feeds logs and is returned to the caller).
-    fn accept_message(&mut self, msg: &Self::Msg, source: u64) -> Result<Vec<Self::Msg>, String>;
+    /// orphans it satisfies (dcrd `AcceptMessage`).
+    fn accept_message(&mut self, msg: &Self::Msg, source: u64)
+    -> Result<Vec<Self::Msg>, Self::Err>;
     /// Whether the message is currently or was recently in the pool
     /// (dcrd `RecentMessage` presence).
     fn recent_message(&mut self, hash: &Hash) -> bool;
@@ -983,9 +988,10 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     }
 
     /// Process a mixing message received from a remote peer, returning
-    /// the messages accepted to the mixpool or the acceptance error
-    /// (dcrd `OnMixMsg`).
-    pub fn on_mix_msg(&mut self, peer_id: i32, msg: &M::Msg) -> Result<Vec<M::Msg>, String> {
+    /// the messages accepted to the mixpool or the pool's structured
+    /// acceptance error (dcrd `OnMixMsg`), which the server inspects
+    /// for the missing-own-PR request and the bannable check.
+    pub fn on_mix_msg(&mut self, peer_id: i32, msg: &M::Msg) -> Result<Vec<M::Msg>, M::Err> {
         if self.shutdown {
             return Ok(Vec::new());
         }

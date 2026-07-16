@@ -156,6 +156,7 @@ fn serve_txindex_rpc(
         8,
         1000,
         Arc::clone(&tx_pool),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     )));
 
     let server = Arc::new(Mutex::new(Server::new(Config {

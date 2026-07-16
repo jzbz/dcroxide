@@ -829,6 +829,9 @@ fn build_server(
         idle_timeout: Duration::from_nanos(DEFAULT_IDLE_TIMEOUT as u64),
         ping_interval: Duration::from_nanos(PING_INTERVAL as u64),
     };
+    // The mixing pool the getdata serve path and the sync manager share
+    // (dcrd `newServer` building one `mixpool.Pool`).
+    let mix_pool = dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone());
     // The sync manager shares the chain with the message handlers
     // (dcrd `newServer` building its `netsync.Config`).
     let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
@@ -839,6 +842,7 @@ fn build_server(
         DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u64,
         cfg.max_orphan_txs as usize,
         Arc::clone(&tx_pool),
+        Arc::clone(&mix_pool),
     )));
     // The daemon-wide state the served peers' message handlers consult
     // (dcrd `newServer` deriving `minKnownWork` from the params).
@@ -862,6 +866,7 @@ fn build_server(
         tx_pool,
         ntfn,
         recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
+        mix_pool,
     });
     // Arm the header-sync stall watchdog around the manager (dcrd's
     // stallHandler timer).

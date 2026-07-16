@@ -183,6 +183,7 @@ struct ScriptedMixPool {
 
 impl SyncMixPool for ScriptedMixPool {
     type Msg = Hash;
+    type Err = String;
 
     fn mix_hash(&mut self, msg: &Hash) -> Hash {
         *msg

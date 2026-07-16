@@ -23,6 +23,7 @@ pub mod ipc;
 pub mod logo;
 pub mod logsubsys;
 pub mod mining;
+pub mod mixnode;
 pub mod outbound;
 pub mod params;
 pub mod peerconn;
