@@ -378,32 +378,10 @@ fn dial(
     dialer: &crate::socks::NodeDialer,
     addr_manager: Option<&Arc<Mutex<AddrManager>>>,
 ) -> Result<DialedConn, String> {
-    // Record the dial attempt so the address manager's recently-attempted
-    // gate and chance() penalty apply, and the same dead address is not
-    // redialed in a tight loop (dcrd `attemptDcrdDial` marking `Attempt`
-    // before the dial).  dcrd's `attemptDcrdDial` also `AddAddresses`es
-    // the target first so a `--connect`/addnode address the manager
-    // never learned becomes markable — that `AddAddresses` step is the
-    // documented deferral, so here a not-found address simply has its
-    // `attempt` return discarded; the address's services and timestamp
-    // do not affect the lookup, which keys on the canonicalized host
-    // and port.  A hostname address (a proxied dial resolves it
-    // remotely) has no manager entry to mark at all.
-    if let (Some(addr_manager), Ok(socket)) = (addr_manager, req.addr.parse::<SocketAddr>()) {
-        let ip_bytes = match socket.ip() {
-            IpAddr::V4(v4) => v4.octets().to_vec(),
-            IpAddr::V6(v6) => v6.octets().to_vec(),
-        };
-        let na = dcroxide_addrmgr::new_net_address_from_ip_port(
-            &ip_bytes,
-            socket.port(),
-            dcroxide_wire::ServiceFlag(0),
-            0,
-        );
-        let _ = addr_manager
-            .lock()
-            .expect("addr manager mutex poisoned")
-            .attempt(&na);
+    // The sim/reg-net gate lives upstream: the manager is `None` on
+    // those networks.
+    if let Some(addr_manager) = addr_manager {
+        mark_dial_attempt(addr_manager, dialer, &req.addr, timeout)?;
     }
     let stream = dialer
         .dial(&req.addr, timeout)
@@ -636,6 +614,42 @@ fn handle_events(
     }
 }
 
+/// dcrd `attemptDcrdDial`'s address bookkeeping: make sure the
+/// address exists in the address manager (`AddAddresses` with the
+/// address as its own source, so a `--connect`/addnode target the
+/// manager never learned joins it for gossip and persistence) and
+/// mark it attempted (the recently-attempted gate and `chance()`
+/// penalty), before the actual dial.  The host/port split, the port
+/// parse, and the net-address conversion failures fail the dial
+/// exactly as dcrd returns them; the `Attempt` error is only logged
+/// there and is discarded here.
+fn mark_dial_attempt(
+    addr_manager: &Arc<Mutex<AddrManager>>,
+    dialer: &crate::socks::NodeDialer,
+    addr: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let (host, port_str) = crate::gostd::split_host_port(addr)?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|e| format!("strconv.ParseUint: parsing \"{port_str}\": {e}"))?;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let na = crate::server::host_to_net_address(
+        &host,
+        port,
+        dcroxide_wire::ServiceFlag(0),
+        &|h| dialer.lookup(h, timeout),
+        now_unix,
+    )?;
+    let mut mgr = addr_manager.lock().expect("addr manager mutex poisoned");
+    mgr.add_addresses(core::slice::from_ref(&na), &na);
+    let _ = mgr.attempt(&na);
+    Ok(())
+}
+
 /// Fire the command back to the event loop after the delay (dcrd arms a
 /// `time.After` for the same schedule).  The timer is detached; once
 /// the loop stops and drops the receiver the send simply fails.
@@ -645,4 +659,46 @@ fn spawn_timer(delay_nanos: i64, commands: mpsc::Sender<Command>, command: Comma
         thread::sleep(delay);
         let _ = commands.send(command);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// dcrd `attemptDcrdDial`'s bookkeeping: a routable dial target the
+    /// manager never learned joins it (AddAddresses with itself as the
+    /// source) and is marked attempted before the dial.
+    #[test]
+    fn dial_bookkeeping_adds_and_attempts_the_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mgr = Arc::new(Mutex::new(AddrManager::new(dir.path())));
+        let dialer = crate::socks::NodeDialer::direct();
+
+        mark_dial_attempt(&mgr, &dialer, "8.8.8.8:9108", Duration::from_secs(1))
+            .expect("bookkeeping");
+
+        let locked = mgr.lock().expect("addrmgr");
+        let known = locked
+            .get_address()
+            .expect("the target must join the manager");
+        let known = known.lock().expect("known address");
+        assert_eq!(known.net_address().key(), "8.8.8.8:9108");
+        assert!(
+            known.last_attempt().is_some(),
+            "the dial must be marked attempted"
+        );
+    }
+
+    /// An unparseable dial address fails the dial like dcrd's
+    /// attemptDcrdDial returning the split error.
+    #[test]
+    fn dial_bookkeeping_rejects_malformed_addresses() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mgr = Arc::new(Mutex::new(AddrManager::new(dir.path())));
+        let dialer = crate::socks::NodeDialer::direct();
+        assert!(
+            mark_dial_attempt(&mgr, &dialer, "no-port", Duration::from_secs(1)).is_err(),
+            "a missing port must fail the dial"
+        );
+    }
 }

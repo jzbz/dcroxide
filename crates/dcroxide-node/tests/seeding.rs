@@ -101,3 +101,34 @@ fn failing_seeders_retry_until_shutdown() {
         "shutdown should interrupt the backoff"
     );
 }
+
+/// The periodic address-book dump: the ticker saves a changed manager
+/// to peers.json without waiting for shutdown, and the handle stops
+/// the loop cleanly.
+#[test]
+fn periodic_dump_writes_the_peers_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut mgr = dcroxide_addrmgr::AddrManager::new(dir.path());
+    // A routable address marks the book dirty so the dirty gate lets
+    // the save through.
+    let na = dcroxide_addrmgr::new_net_address_from_ip_port(
+        &[8, 8, 8, 8],
+        9108,
+        dcroxide_wire::ServiceFlag(0),
+        2_000_000_000,
+    );
+    mgr.add_addresses(core::slice::from_ref(&na), &na);
+    let mgr = std::sync::Arc::new(std::sync::Mutex::new(mgr));
+
+    let dump = dcroxide_node::seeding::start_address_dump(
+        std::sync::Arc::clone(&mgr),
+        std::time::Duration::from_millis(50),
+    );
+    let peers = dir.path().join("peers.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !peers.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(peers.exists(), "the ticker must dump the address book");
+    dump.shutdown();
+}

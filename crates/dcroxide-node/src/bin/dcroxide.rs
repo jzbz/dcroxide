@@ -244,6 +244,13 @@ fn run(cfg: Config) -> ExitCode {
     ));
     // Share the manager with the served peers' addr exchange.
     let addr_manager = Arc::new(Mutex::new(addr_manager));
+    // Dump the address book periodically for crash resilience (the
+    // ticker half of dcrd addrmgr's addressHandler; the final save
+    // still runs at shutdown).
+    let address_dump = dcroxide_node::seeding::start_address_dump(
+        Arc::clone(&addr_manager),
+        dcroxide_node::seeding::DUMP_ADDRESS_INTERVAL,
+    );
 
     // Build the daemon-wide server state shared by every peer, inbound
     // or outbound (dcrd's single `server`).
@@ -773,11 +780,12 @@ fn run(cfg: Config) -> ExitCode {
         runtime.shutdown();
     }
 
-    // Persist the address book so a restart redials its learned peers
-    // instead of re-bootstrapping from the seeders every time (dcrd's
-    // final `savePeers` when the address handler stops).  save_peers is a
-    // no-op when nothing changed and writes atomically.  A periodic dump
-    // ticker for crash resilience remains a follow-up.
+    // Stop the periodic dump ticker, then persist the address book so a
+    // restart redials its learned peers instead of re-bootstrapping from
+    // the seeders every time (dcrd's final `savePeers` when the address
+    // handler stops).  save_peers is a no-op when nothing changed and
+    // writes atomically.
+    address_dump.shutdown();
     if let Err(e) = addr_manager
         .lock()
         .expect("addr manager mutex poisoned")

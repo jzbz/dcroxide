@@ -215,3 +215,55 @@ fn add_seeded(
         .expect("addrmgr mutex poisoned")
         .add_addresses(&addresses, &src);
 }
+
+/// The interval between periodic address-book dumps (dcrd addrmgr
+/// `dumpAddressInterval`).
+pub const DUMP_ADDRESS_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// The running address-book dump ticker; dropping the stop sender
+/// through [`AddressDump::shutdown`] ends the loop.
+pub struct AddressDump {
+    stop: mpsc::Sender<()>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl AddressDump {
+    /// Stop the ticker and wait for it (the daemon's final `savePeers`
+    /// runs separately at shutdown, like dcrd's address handler saving
+    /// once more after its loop breaks).
+    pub fn shutdown(mut self) {
+        let _ = self.stop.send(());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Start the periodic address-book dump (the ticker half of dcrd
+/// addrmgr's `addressHandler`): every interval the shared manager
+/// saves its peers file — a no-op when nothing changed, exactly
+/// dcrd's `savePeers` dirty gate.
+pub fn start_address_dump(
+    addr_manager: Arc<Mutex<AddrManager>>,
+    interval: Duration,
+) -> AddressDump {
+    let (stop, stopped) = mpsc::channel::<()>();
+    let join = thread::spawn(move || {
+        // A stop signal or a dropped sender ends the loop; a timeout
+        // is the tick.
+        while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(interval) {
+            if let Err(e) = addr_manager
+                .lock()
+                .expect("addr manager mutex poisoned")
+                .save_peers()
+            {
+                // dcrd's savePeers logs and carries on.
+                println!("[ERR] AMGR: Unable to save peers: {e}");
+            }
+        }
+    });
+    AddressDump {
+        stop,
+        join: Some(join),
+    }
+}
