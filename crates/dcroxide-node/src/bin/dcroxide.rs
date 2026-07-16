@@ -724,13 +724,27 @@ fn run(cfg: Config) -> ExitCode {
             None
         } else {
             log_info(&format!("Querying {} network seeder(s)", seeders.len()));
-            Some(dcroxide_node::seeding::start_seeding(
-                seeders,
-                Arc::clone(&addr_manager),
-                // dcrd's defaultRequiredServices.
-                ServiceFlag::NODE_NETWORK.0,
-                dcroxide_node::seeding::UreqTransport::new,
-            ))
+            // dcrd routes its seeder HTTP transport through `dcrdDial`,
+            // so a proxied daemon queries the seeders over the SOCKS
+            // proxy rather than leaking the traffic; without a proxy the
+            // battle-tested ureq transport does the direct dial.
+            let services = ServiceFlag::NODE_NETWORK.0;
+            if cfg.dial == dcroxide_node::config::DialSelection::SocksProxy {
+                let dialer = dcroxide_node::socks::NodeDialer::from_config(&cfg);
+                Some(dcroxide_node::seeding::start_seeding(
+                    seeders,
+                    Arc::clone(&addr_manager),
+                    services,
+                    move || dcroxide_node::seeding::ProxySeederTransport::new(dialer.clone()),
+                ))
+            } else {
+                Some(dcroxide_node::seeding::start_seeding(
+                    seeders,
+                    Arc::clone(&addr_manager),
+                    services,
+                    dcroxide_node::seeding::UreqTransport::new,
+                ))
+            }
         }
     };
 

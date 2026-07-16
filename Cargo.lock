@@ -554,6 +554,7 @@ dependencies = [
  "socket2",
  "tempfile",
  "ureq",
+ "webpki-roots",
 ]
 
 [[package]]

@@ -12,10 +12,10 @@
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dcroxide_addrmgr::AddrManager;
-use std::io::Read;
+use std::io::{Read, Write};
 
 use dcroxide_connmgr::{HttpsSeederFilters, MAX_RESP_SIZE, SeedEnv, SeederTransport, seed_addrs};
 
@@ -70,6 +70,189 @@ impl SeederTransport for UreqTransport {
     }
 }
 
+/// A seeder transport that dials through the configured proxy routing
+/// (dcrd routes its seeder HTTP transport through `dcrdDial`, so a
+/// `--proxy` operator's seeder traffic rides the SOCKS proxy rather
+/// than leaking directly).  The connection is established through the
+/// [`NodeDialer`](crate::socks::NodeDialer) — SOCKS5 or direct — then
+/// wrapped in TLS validated against the public web PKI roots, and a
+/// minimal HTTP/1.1 GET reads the seeder's JSON response.
+///
+/// The client is deliberately small: it sends one `Connection: close`
+/// GET and reads the body to end of stream, capped at the connmgr's
+/// response limit and bounded by an absolute deadline (dcrd's
+/// one-minute request timeout).  It follows no redirects and decodes
+/// no chunked transfer encoding — the Decred seeders answer 200 with
+/// the JSON body directly — a documented simplification from Go's
+/// `http.Client`.
+pub struct ProxySeederTransport {
+    dialer: crate::socks::NodeDialer,
+    timeout: Duration,
+}
+
+impl ProxySeederTransport {
+    /// A transport over the given dial routing with dcrd's one-minute
+    /// per-seeder request deadline.
+    pub fn new(dialer: crate::socks::NodeDialer) -> ProxySeederTransport {
+        ProxySeederTransport {
+            dialer,
+            timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+/// A URL split into the parts the transport dials and requests.
+struct SeederUrl {
+    host: String,
+    port: u16,
+    path_and_query: String,
+    tls: bool,
+}
+
+fn parse_seeder_url(url: &str) -> Result<SeederUrl, String> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| format!("invalid seeder url: {url}"))?;
+    let tls = match scheme {
+        "https" => true,
+        "http" => false,
+        other => return Err(format!("unsupported seeder scheme: {other}")),
+    };
+    let (authority, path_and_query) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (
+            host.to_string(),
+            port.parse::<u16>()
+                .map_err(|e| format!("invalid seeder port {port}: {e}"))?,
+        ),
+        None => (authority.to_string(), if tls { 443 } else { 80 }),
+    };
+    if host.is_empty() {
+        return Err(format!("invalid seeder url: {url}"));
+    }
+    Ok(SeederUrl {
+        host,
+        port,
+        path_and_query: path_and_query.to_string(),
+        tls,
+    })
+}
+
+/// The shared TLS client configuration over the public web PKI roots
+/// (built once; rustls' config is meant to be reused).
+fn seeder_tls_config() -> Arc<rustls::ClientConfig> {
+    static CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("rustls default protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            Arc::new(config)
+        })
+        .clone()
+}
+
+/// Read the HTTP response off a stream: the status line's code and the
+/// body after the header block, capped at the connmgr's limit and
+/// bounded by an absolute deadline.
+fn read_http_response(mut read: impl Read, deadline: Instant) -> Result<(u32, Vec<u8>), String> {
+    // Cap the whole response (header + body) at the connmgr limit plus
+    // a small header allowance, so an untrusted seeder cannot force an
+    // unbounded read, and stop at the deadline so a slow-trickle seeder
+    // cannot pin the seeding round (a true absolute bound, not just a
+    // per-read idle timeout).
+    let cap = (MAX_RESP_SIZE as u64).saturating_add(8192) as usize;
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while raw.len() < cap {
+        if Instant::now() >= deadline {
+            return Err("seeder response timed out".to_string());
+        }
+        match read.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            // rustls surfaces an unclean TLS close (a peer that shuts
+            // the TCP connection without close_notify, common behind
+            // CDNs and load balancers) as UnexpectedEof; the
+            // Connection: close body framing treats it as end of stream
+            // and keeps the bytes already received, as Go's http.Client
+            // does.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(format!("seeder response read failed: {e}")),
+        }
+    }
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "seeder response missing header terminator".to_string())?;
+    let header = &raw[..split];
+    let body_start = split.saturating_add(4);
+    let status_line = header
+        .split(|b| *b == b'\r' || *b == b'\n')
+        .next()
+        .unwrap_or_default();
+    let status = std::str::from_utf8(status_line)
+        .ok()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u32>().ok())
+        .ok_or_else(|| "seeder response missing status code".to_string())?;
+    let mut body = raw[body_start..].to_vec();
+    body.truncate(MAX_RESP_SIZE);
+    Ok((status, body))
+}
+
+impl SeederTransport for ProxySeederTransport {
+    fn get(&mut self, url: &str) -> Result<(u32, Vec<u8>), String> {
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .unwrap_or_else(Instant::now);
+        let parsed = parse_seeder_url(url)?;
+        let stream = self
+            .dialer
+            .dial(&format!("{}:{}", parsed.host, parsed.port), self.timeout)?;
+        let _ = stream.set_read_timeout(Some(self.timeout));
+        let _ = stream.set_write_timeout(Some(self.timeout));
+
+        // The Host header carries the port unless it is the scheme
+        // default (Go's http.Client and RFC 7230 both do this).
+        let default_port = if parsed.tls { 443 } else { 80 };
+        let host_header = if parsed.port == default_port {
+            parsed.host.clone()
+        } else {
+            format!("{}:{}", parsed.host, parsed.port)
+        };
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: dcroxide\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            parsed.path_and_query
+        );
+
+        if parsed.tls {
+            let server_name = rustls::pki_types::ServerName::try_from(parsed.host.clone())
+                .map_err(|e| format!("invalid seeder host {}: {e}", parsed.host))?;
+            let conn = rustls::ClientConnection::new(seeder_tls_config(), server_name)
+                .map_err(|e| format!("seeder tls setup failed: {e}"))?;
+            let mut tls = rustls::StreamOwned::new(conn, stream);
+            tls.write_all(request.as_bytes())
+                .map_err(|e| format!("seeder request failed: {e}"))?;
+            read_http_response(tls, deadline)
+        } else {
+            let mut stream = stream;
+            stream
+                .write_all(request.as_bytes())
+                .map_err(|e| format!("seeder request failed: {e}"))?;
+            read_http_response(stream, deadline)
+        }
+    }
+}
 /// The system clock and randomness stamping discovered addresses (the
 /// seeder backdates each between three and seven days).
 pub struct SystemSeedEnv;
@@ -265,5 +448,56 @@ pub fn start_address_dump(
     AddressDump {
         stop,
         join: Some(join),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deadline far enough out that the parse tests never hit it.
+    fn far_deadline() -> Instant {
+        Instant::now()
+            .checked_add(Duration::from_secs(60))
+            .expect("deadline")
+    }
+
+    #[test]
+    fn seeder_url_splits_scheme_host_port_path() {
+        let u = parse_seeder_url("https://dnsseed.decred.org/api/addrs?services=1").expect("url");
+        assert!(u.tls);
+        assert_eq!(u.host, "dnsseed.decred.org");
+        assert_eq!(u.port, 443, "https defaults to 443");
+        assert_eq!(u.path_and_query, "/api/addrs?services=1");
+
+        let u = parse_seeder_url("http://seed.example:8080/x").expect("url");
+        assert!(!u.tls);
+        assert_eq!(u.host, "seed.example");
+        assert_eq!(u.port, 8080);
+
+        // No path defaults to "/", and http defaults to 80.
+        let u = parse_seeder_url("http://seed.example").expect("url");
+        assert_eq!(u.port, 80);
+        assert_eq!(u.path_and_query, "/");
+
+        assert!(parse_seeder_url("ftp://seed.example/").is_err());
+        assert!(parse_seeder_url("no-scheme").is_err());
+    }
+
+    #[test]
+    fn http_response_reads_status_and_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"a\":1}";
+        let (status, body) = read_http_response(&raw[..], far_deadline()).expect("parse");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"{\"a\":1}");
+
+        // A non-200 status is surfaced (the seeder logic inspects it).
+        let raw = b"HTTP/1.1 503 Service Unavailable\r\n\r\n";
+        let (status, body) = read_http_response(&raw[..], far_deadline()).expect("parse");
+        assert_eq!(status, 503);
+        assert!(body.is_empty());
+
+        // A response with no header terminator is an error, not a panic.
+        assert!(read_http_response(&b"garbage"[..], far_deadline()).is_err());
     }
 }
