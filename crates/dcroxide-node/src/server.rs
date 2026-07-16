@@ -2010,3 +2010,158 @@ pub fn on_get_init_state(
         tspend_hashes,
     }
 }
+
+/// The maximum block hashes a mining state message carries (dcrd wire
+/// `MaxMSBlocksAtHeadPerMsg`).
+const MAX_MS_BLOCKS_AT_HEAD: usize = dcroxide_wire::MAX_MS_BLOCKS_AT_HEAD_PER_MSG as usize;
+
+/// The outcome of the getminingstate handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnGetMiningStateOutcome {
+    /// The state was already sent on this connection; ignore the
+    /// request (dcrd's `getMiningStateSent` latch).
+    AlreadySent,
+    /// Send nothing: the chain is early (dcrd's blank
+    /// `pushMiningStateMsg` aborts on zero blocks), there are no
+    /// eligible blocks, or an eligible block has no vote metadata
+    /// (dcrd warns and returns).
+    Nothing,
+    /// Send the mining state.
+    Filled {
+        /// The best height (dcrd's `uint32(best.Height)`).
+        height: u32,
+        /// The eligible head block hashes, capped at the message
+        /// maximum.
+        block_hashes: Vec<dcroxide_chainhash::Hash>,
+        /// Their vote hashes — capped at `MaxMSBlocksAtHeadPerMsg`,
+        /// dcrd's `pushMiningStateMsg` comparing its vote index
+        /// against the BLOCK limit (kept bug for bug; the wire cap of
+        /// forty is never reached).
+        vote_hashes: Vec<dcroxide_chainhash::Hash>,
+    },
+}
+
+/// Assemble the mining state response, the legacy sibling of the init
+/// state exchange (dcrd `serverPeer.OnGetMiningState` +
+/// `pushMiningStateMsg`): ignore duplicate requests on a connection,
+/// send nothing early in the chain (the blank push aborts on zero
+/// blocks) or when no block is eligible, and otherwise fill the capped
+/// head blocks and their votes — bailing out entirely when any
+/// eligible block is missing vote metadata, exactly as dcrd returns
+/// without pushing.  The eligible blocks come from the ported
+/// `SortParentsByVotes` and the votes from the mempool's
+/// `VoteHashesForBlock`, both seams supplied by the caller.
+pub fn on_get_mining_state(
+    mining_state_sent: bool,
+    best_height: i64,
+    stake_validation_height: i64,
+    eligible_blocks: &[dcroxide_chainhash::Hash],
+    votes_for: impl Fn(&dcroxide_chainhash::Hash) -> Vec<dcroxide_chainhash::Hash>,
+) -> OnGetMiningStateOutcome {
+    if mining_state_sent {
+        return OnGetMiningStateOutcome::AlreadySent;
+    }
+
+    // Early in the chain dcrd pushes a blank state, and the push
+    // aborts on an empty block list — so nothing is sent.
+    if best_height < stake_validation_height - 1 {
+        return OnGetMiningStateOutcome::Nothing;
+    }
+
+    // Cap the eligible list to the message maximum; nothing is sent
+    // when no block is eligible.
+    let mut block_hashes = eligible_blocks.to_vec();
+    if block_hashes.is_empty() {
+        return OnGetMiningStateOutcome::Nothing;
+    }
+    if block_hashes.len() > MAX_MS_BLOCKS_AT_HEAD {
+        block_hashes.truncate(MAX_MS_BLOCKS_AT_HEAD);
+    }
+
+    // Construct the votes; an eligible block without vote metadata
+    // aborts the whole response (dcrd warns and returns).
+    let mut vote_hashes = Vec::new();
+    for bh in &block_hashes {
+        let vhs = votes_for(bh);
+        if vhs.is_empty() {
+            return OnGetMiningStateOutcome::Nothing;
+        }
+        vote_hashes.extend(vhs);
+    }
+    // dcrd's push truncates the votes against the BLOCK limit (kept
+    // bug for bug).
+    if vote_hashes.len() > MAX_MS_BLOCKS_AT_HEAD {
+        vote_hashes.truncate(MAX_MS_BLOCKS_AT_HEAD);
+    }
+
+    OnGetMiningStateOutcome::Filled {
+        height: best_height as u32,
+        block_hashes,
+        vote_hashes,
+    }
+}
+
+#[cfg(test)]
+mod mining_state_tests {
+    use super::*;
+    use dcroxide_chainhash::Hash;
+
+    fn h(byte: u8) -> Hash {
+        Hash([byte; 32])
+    }
+
+    /// The latch, the early-chain no-op, the empty-eligible no-op, the
+    /// missing-votes bail-out, and the block and vote caps (the vote
+    /// cap being dcrd's block-limit quirk).
+    #[test]
+    fn get_mining_state_outcomes_match_dcrd() {
+        let svh = 100i64;
+        let votes = |bh: &Hash| vec![Hash([bh.0[0]; 32]), Hash([bh.0[0] ^ 0xff; 32])];
+
+        // Duplicate requests are ignored.
+        assert_eq!(
+            on_get_mining_state(true, 200, svh, &[h(1)], votes),
+            OnGetMiningStateOutcome::AlreadySent
+        );
+        // Early chain: dcrd's blank push sends nothing.
+        assert_eq!(
+            on_get_mining_state(false, svh - 2, svh, &[h(1)], votes),
+            OnGetMiningStateOutcome::Nothing
+        );
+        // No eligible blocks: nothing.
+        assert_eq!(
+            on_get_mining_state(false, 200, svh, &[], votes),
+            OnGetMiningStateOutcome::Nothing
+        );
+        // An eligible block without vote metadata aborts the response.
+        assert_eq!(
+            on_get_mining_state(false, 200, svh, &[h(1), h(2)], |bh: &Hash| {
+                if bh.0[0] == 2 {
+                    Vec::new()
+                } else {
+                    vec![h(0xaa)]
+                }
+            }),
+            OnGetMiningStateOutcome::Nothing
+        );
+
+        // Blocks cap at eight, and the votes cap at the BLOCK limit
+        // (dcrd's pushMiningStateMsg quirk): nine eligible blocks with
+        // two votes each fill eight blocks and eight (not sixteen or
+        // forty) votes.
+        let blocks: Vec<Hash> = (1..=9).map(h).collect();
+        match on_get_mining_state(false, 200, svh, &blocks, votes) {
+            OnGetMiningStateOutcome::Filled {
+                height,
+                block_hashes,
+                vote_hashes,
+            } => {
+                assert_eq!(height, 200);
+                assert_eq!(block_hashes.len(), 8, "blocks cap at the message max");
+                assert_eq!(block_hashes[0], h(1), "order preserved");
+                assert_eq!(vote_hashes.len(), 8, "votes cap at the BLOCK limit");
+            }
+            other => panic!("expected filled, got {other:?}"),
+        }
+    }
+}

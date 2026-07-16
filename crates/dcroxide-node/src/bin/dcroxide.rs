@@ -845,6 +845,7 @@ fn build_server(
     let server = Arc::new(ServerContext {
         chain,
         min_known_work: params.min_known_chain_work,
+        params: params.clone(),
         disable_banning: cfg.disable_banning,
         ban_threshold: cfg.ban_threshold,
         whitelists: cfg.whitelists.clone(),

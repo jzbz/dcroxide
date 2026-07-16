@@ -43,10 +43,10 @@ use crate::peerconn::NodePeerEnv;
 use crate::peerloop::{OutboundQueue, ServeSignal};
 use crate::server::{
     GetAddrFacts, GetDataResolution, GetHeadersResponse, InitStateWants, MAX_BLOCKS_PER_MSG,
-    OnAddrFacts, OnAddrOutcome, OnGetDataOutcome, OnGetInitStateOutcome, OnInvOutcome,
-    PushAddrOutcome, ServeGetDataAction, ServerPeerAddrState, build_get_blocks_response,
-    build_get_headers_response, natf_supported, on_addr, on_get_addr, on_get_data,
-    on_get_init_state, on_inv_classify, serve_get_data,
+    OnAddrFacts, OnAddrOutcome, OnGetDataOutcome, OnGetInitStateOutcome, OnGetMiningStateOutcome,
+    OnInvOutcome, PushAddrOutcome, ServeGetDataAction, ServerPeerAddrState,
+    build_get_blocks_response, build_get_headers_response, natf_supported, on_addr, on_get_addr,
+    on_get_data, on_get_init_state, on_get_mining_state, on_inv_classify, serve_get_data,
 };
 use crate::sync::NodeSyncManager;
 
@@ -72,6 +72,9 @@ pub struct ServerContext {
     /// The network's stake validation height; a best tip below it
     /// answers getinitstate with an empty message.
     pub stake_validation_height: i64,
+    /// The network parameters (dcrd's `server.chainParams`); the
+    /// eligible-parent sorting consults the tickets per block.
+    pub params: dcroxide_chaincfg::Params,
     /// Whether transaction and mix relay is disabled (`--blocksonly`);
     /// peers announcing either are disconnected.
     pub blocks_only: bool,
@@ -816,6 +819,9 @@ pub struct ServerPeerHandler {
     /// Whether the init state was already sent on this connection
     /// (dcrd `serverPeer.initStateSent`).
     init_state_sent: bool,
+    /// Whether the legacy mining state was already sent on this
+    /// connection (dcrd `serverPeer.getMiningStateSent`).
+    mining_state_sent: bool,
     /// The sync-manager peer id once registered (dcrd `sp.syncMgrPeer`).
     sync_peer_id: Option<i32>,
     /// A socket handle handed to the registry so disconnect actions
@@ -852,6 +858,7 @@ impl ServerPeerHandler {
             continue_hash: None,
             env: NodePeerEnv::new(),
             init_state_sent: false,
+            mining_state_sent: false,
             sync_peer_id: None,
             socket,
             permanent,
@@ -1041,6 +1048,19 @@ impl ServerPeerHandler {
             }
             Message::GetInitState(get_init) => {
                 self.on_get_init_state(&get_init.types, outbound);
+                ServeSignal::Continue
+            }
+            Message::GetMiningState => {
+                self.on_get_mining_state(outbound);
+                ServeSignal::Continue
+            }
+            Message::MiningState(state) => {
+                // Request the advertised blocks and votes through the
+                // sync manager (dcrd `OnMiningState` calling
+                // `RequestFromPeer` with no treasury spends).
+                self.drive_sync(|manager, id| {
+                    manager.request_from_peer(id, &state.block_hashes, &state.vote_hashes, &[])
+                });
                 ServeSignal::Continue
             }
             Message::Inv(inv) => {
@@ -1549,20 +1569,18 @@ impl ServerPeerHandler {
             votes: types.iter().any(|t| t == INIT_STATE_HEAD_BLOCK_VOTES),
             tspends: types.iter().any(|t| t == INIT_STATE_TSPENDS),
         };
-        // The eligible head blocks are the tip generation the votes
-        // attach to; they key both the block list and the vote lookup, so
-        // fetch them when either is requested.  The chain lock is released
-        // before the mempool lookups below, so there is no lock-order
-        // cycle with tx intake's pool->chain order.
-        let (best_height, eligible_blocks) = {
+        // The eligible head blocks are the tip generation sorted and
+        // filtered by their mempool votes (dcrd's
+        // `mining.SortParentsByVotes`); they key both the block list and
+        // the vote lookup, so fetch them when either is requested.  The
+        // chain lock is released before the mempool lookups (the sort's
+        // vote metadata included), so there is no lock-order cycle with
+        // tx intake's pool->chain order.
+        let (best_height, eligible_blocks) = if wants.blocks || wants.votes {
+            self.eligible_tip_blocks()
+        } else {
             let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
-            let height = chain.best_snapshot().height;
-            let blocks = if wants.blocks || wants.votes {
-                chain.tip_generation()
-            } else {
-                Vec::new()
-            };
-            (height, blocks)
+            (chain.best_snapshot().height, Vec::new())
         };
         let tspends = if wants.tspends {
             self.ctx
@@ -1609,6 +1627,74 @@ impl ServerPeerHandler {
             OnGetInitStateOutcome::BuildError => return,
         };
         let _ = outbound.queue_message(Message::InitState(msg));
+    }
+
+    /// The best height and the tip generation sorted to the blocks
+    /// eligible to build on (dcrd `chain.TipGeneration()` fed through
+    /// `mining.SortParentsByVotes` over the mempool's vote metadata).
+    /// The chain lock is released before the mempool lookup so there is
+    /// no lock-order cycle with tx intake's pool->chain order.
+    fn eligible_tip_blocks(&self) -> (i64, Vec<Hash>) {
+        let (best_hash, best_height, children) = {
+            let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
+            let best = chain.best_snapshot();
+            (best.hash, best.height, chain.tip_generation())
+        };
+        let eligible = dcroxide_mining::sort_parents_by_votes(
+            |hashes| {
+                self.ctx
+                    .tx_pool
+                    .lock()
+                    .expect("tx pool mutex poisoned")
+                    .votes_for_blocks(hashes)
+            },
+            best_hash,
+            &children,
+            &self.ctx.params,
+        );
+        (best_height, eligible)
+    }
+
+    /// Serve a getminingstate request, the legacy sibling of the init
+    /// state exchange (dcrd `OnGetMiningState`): the eligible head
+    /// blocks and their votes, or nothing early in the chain, with no
+    /// eligible block, or when an eligible block is missing vote
+    /// metadata.
+    fn on_get_mining_state(&mut self, outbound: &OutboundQueue) {
+        let (best_height, eligible_blocks) = self.eligible_tip_blocks();
+        let outcome = on_get_mining_state(
+            self.mining_state_sent,
+            best_height,
+            self.ctx.stake_validation_height,
+            &eligible_blocks,
+            |block_hash| {
+                self.ctx
+                    .tx_pool
+                    .lock()
+                    .expect("tx pool mutex poisoned")
+                    .vote_hashes_for_block(block_hash)
+            },
+        );
+        if matches!(outcome, OnGetMiningStateOutcome::AlreadySent) {
+            return;
+        }
+        // dcrd marks the state sent right after the gate, before any
+        // response is assembled, so a dropped response counts too.
+        self.mining_state_sent = true;
+        if let OnGetMiningStateOutcome::Filled {
+            height,
+            block_hashes,
+            vote_hashes,
+        } = outcome
+        {
+            let _ = outbound.queue_message(Message::MiningState(dcroxide_wire::MsgMiningState {
+                // dcrd's NewMsgMiningState fixes the version at one.
+                version: 1,
+                height,
+                block_hashes,
+                vote_hashes,
+            }));
+        }
     }
 }
 

@@ -56,6 +56,7 @@ fn serve_genesis_chain() -> (
     let server = Arc::new(ServerContext {
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
+        params: params.clone(),
         disable_banning: false,
         ban_threshold: 100,
         whitelists: Vec::new(),
@@ -386,6 +387,43 @@ fn serves_cfilters_and_init_state() {
         other => panic!("expected pong, got {other:?}"),
     }
 
+    // getminingstate early in the chain sends nothing at all — dcrd's
+    // blank pushMiningStateMsg aborts on zero blocks (unlike the empty
+    // initstate above) — so the next reply is the pong.
+    transport
+        .write_message(&Message::GetMiningState)
+        .expect("send getminingstate");
+    transport
+        .write_message(&Message::Ping(dcroxide_wire::MsgPing { nonce: 8 }))
+        .expect("send ping");
+    match transport.read_message().expect("read pong") {
+        Message::Pong(pong) => assert_eq!(
+            pong.nonce, 8,
+            "an early-chain getminingstate produces no reply"
+        ),
+        other => panic!("expected pong, got {other:?}"),
+    }
+
+    // A miningstate advertisement requests the unknown blocks through
+    // the sync manager (dcrd `OnMiningState` -> `RequestFromPeer`).
+    let advertised = Hash([0x5a; 32]);
+    transport
+        .write_message(&Message::MiningState(dcroxide_wire::MsgMiningState {
+            version: 1,
+            height: 1,
+            block_hashes: vec![advertised],
+            vote_hashes: Vec::new(),
+        }))
+        .expect("send miningstate");
+    match transport.read_message().expect("read getdata") {
+        Message::GetData(getdata) => {
+            assert_eq!(getdata.inv_list.len(), 1);
+            assert_eq!(getdata.inv_list[0].hash, advertised);
+            assert_eq!(getdata.inv_list[0].inv_type, dcroxide_wire::InvType::BLOCK);
+        }
+        other => panic!("expected getdata for the advertised block, got {other:?}"),
+    }
+
     drop(transport);
     runtime.shutdown();
 }
@@ -455,6 +493,7 @@ fn initiates_header_sync_with_a_data_serving_peer() {
     let server = Arc::new(ServerContext {
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
+        params: params.clone(),
         disable_banning: false,
         ban_threshold: 100,
         whitelists: Vec::new(),
@@ -579,6 +618,7 @@ fn disconnects_a_stalled_header_sync_peer() {
     let server = Arc::new(ServerContext {
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
+        params: params.clone(),
         disable_banning: false,
         ban_threshold: 100,
         whitelists: Vec::new(),
@@ -755,6 +795,7 @@ fn announces_connected_blocks_to_served_peers() {
     let server = Arc::new(ServerContext {
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
+        params: params.clone(),
         disable_banning: false,
         ban_threshold: 100,
         whitelists: Vec::new(),

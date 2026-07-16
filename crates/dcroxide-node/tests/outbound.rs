@@ -40,6 +40,7 @@ fn genesis_server(dir: &std::path::Path, name: &str) -> (Arc<ServerContext>, Con
     let server = Arc::new(ServerContext {
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
+        params: params.clone(),
         disable_banning: false,
         ban_threshold: 100,
         whitelists: Vec::new(),
