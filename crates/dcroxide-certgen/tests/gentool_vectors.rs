@@ -5,8 +5,7 @@
 //! rules (validity clamp, elapsed error) hold.
 
 use dcroxide_certgen::gentool::{
-    GenEnv, ToolKeyPair, create_issued_cert, generate_authority, generate_key, load_ca_pair,
-    pem_private_key,
+    GenEnv, create_issued_cert, generate_authority, generate_key, load_ca_pair, pem_private_key,
 };
 
 /// A scripted clock and serial source.
@@ -140,20 +139,4 @@ fn elapsed_validity_is_refused() {
         err.starts_with("valid until date ") && err.ends_with(" already elapsed"),
         "unexpected error: {err}"
     );
-}
-
-/// The RSA key marshaling and loading round-trips (a small key keeps
-/// the debug-build generation fast; the tool itself generates 4096).
-#[test]
-fn rsa_pair_round_trips() {
-    let mut rng = rsa::rand_core::OsRng;
-    let key = ToolKeyPair::Rsa(Box::new(
-        rsa::RsaPrivateKey::new(&mut rng, 1024).expect("rsa keygen"),
-    ));
-    let ca = generate_authority(&mut env(), &key, &["localhost".to_string()], "org", 5, true)
-        .expect("rsa authority");
-    let key_pem = pem_private_key(&key.marshal_pkcs8().expect("marshal"));
-    let (loaded, loaded_key) = load_ca_pair(&ca.pem, &key_pem).expect("load rsa pair");
-    assert!(loaded.cert_sign);
-    assert_eq!(loaded_key.public_bytes(), key.public_bytes());
 }

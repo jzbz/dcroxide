@@ -90,7 +90,7 @@ Application Options:
   -L   append localhost, 127.0.0.1, and ::1 to hosts if not already specified
   -S   allow certificate to sign leaf certificates
   -o=  organization
-  -a=  key algorithm (one of: P-256, P-384, P-521, Ed25519, RSA4096)
+  -a=  key algorithm (one of: P-256, P-384, P-521, Ed25519)
   -y=  years certificate is valid for
   -f   overwrite existing certs/keys
 
@@ -216,10 +216,7 @@ fn main() {
 
     // The algorithm selection precedes every other check (dcrd's
     // keygen switch with its %q-quoted unknown-algorithm error).
-    if !matches!(
-        cfg.algo.as_str(),
-        "P-256" | "P-384" | "P-521" | "Ed25519" | "RSA4096"
-    ) {
+    if !matches!(cfg.algo.as_str(), "P-256" | "P-384" | "P-521" | "Ed25519") {
         eprintln!("unknown algorithm \"{}\"", cfg.algo);
         usage();
     }

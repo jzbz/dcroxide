@@ -9,13 +9,16 @@
 //! `tls.LoadX509KeyPair` performs (PEM decode, the key/certificate
 //! match check, and both PKCS#8 and SEC 1 private key forms).
 //!
-//! Documented divergences: the IDNA conversion is UTS-46 where Go's
-//! `idna.ToASCII` is the bare Punycode profile (case-preserving, no
-//! validation); the CA key loader accepts the forms the Decred tools
-//! emit rather than every ` PRIVATE KEY` suffix Go probes (a PKCS#1
-//! `RSA PRIVATE KEY` block is not recognized); the elapsed-validity
-//! error renders the date as whole-second UTC where Go renders the
-//! local zone with the monotonic-clock suffix; and OS error texts use
+//! Documented divergences: dcrd's `RSA4096` algorithm is not offered
+//! — the `rsa` crate carries the unfixed Marvin-attack advisory
+//! (RUSTSEC-2023-0071) and no dcrd daemon component uses RSA, so
+//! gencerts here supports P-256/P-384/P-521/Ed25519 only; the IDNA
+//! conversion is UTS-46 where Go's `idna.ToASCII` is the bare
+//! Punycode profile (case-preserving, no validation); the CA key
+//! loader accepts the forms the Decred tools emit rather than every
+//! ` PRIVATE KEY` suffix Go probes; the elapsed-validity error
+//! renders the date as whole-second UTC where Go renders the local
+//! zone with the monotonic-clock suffix; and OS error texts use
 //! Rust's rendering rather than Go's `*PathError` form.
 
 // The assembly mirrors Go's arithmetic over bounded buffers and
@@ -23,8 +26,6 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use p256::ecdsa::signature::Signer;
-use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey};
-use rsa::traits::PublicKeyParts;
 
 use crate::x509::SigAlg;
 use crate::{der, pem};
@@ -54,8 +55,6 @@ pub enum ToolKeyPair {
     P521(p521::ecdsa::SigningKey),
     /// Ed25519, held as its seed.
     Ed25519([u8; 32]),
-    /// RSA (the tool generates 4096-bit keys).
-    Rsa(Box<rsa::RsaPrivateKey>),
 }
 
 impl ToolKeyPair {
@@ -66,13 +65,11 @@ impl ToolKeyPair {
             ToolKeyPair::P384(_) => SigAlg::EcdsaP384,
             ToolKeyPair::P521(_) => SigAlg::EcdsaP521,
             ToolKeyPair::Ed25519(_) => SigAlg::Ed25519,
-            ToolKeyPair::Rsa(_) => SigAlg::RsaSha256,
         }
     }
 
     /// The SubjectPublicKeyInfo bit-string content: the uncompressed
-    /// point for EC keys, the raw public key for Ed25519, and the
-    /// PKCS#1 `RSAPublicKey` for RSA.
+    /// point for EC keys and the raw public key for Ed25519.
     pub fn public_bytes(&self) -> Vec<u8> {
         match self {
             ToolKeyPair::P256(key) => key
@@ -93,24 +90,11 @@ impl ToolKeyPair {
                 .public_key()
                 .serialize()
                 .to_vec(),
-            ToolKeyPair::Rsa(key) => {
-                // PKCS#1 RSAPublicKey ::= SEQUENCE { modulus, exponent }.
-                let n = key.n().to_bytes_be();
-                let e = key.e().to_bytes_be();
-                der::sequence(
-                    &[
-                        der::integer_from_unsigned(&n),
-                        der::integer_from_unsigned(&e),
-                    ]
-                    .concat(),
-                )
-            }
         }
     }
 
     /// Sign the to-be-signed bytes with Go's hash selection: SHA-256/
-    /// 384/512 by curve, pure Ed25519, and PKCS#1 v1.5 SHA-256 for
-    /// RSA.
+    /// 384/512 by curve and pure Ed25519.
     fn sign(&self, tbs: &[u8]) -> Result<Vec<u8>, String> {
         Ok(match self {
             ToolKeyPair::P256(key) => {
@@ -130,11 +114,6 @@ impl ToolKeyPair {
                 dcroxide_dcrec::edwards::sign(&secret, tbs)
                     .serialize()
                     .to_vec()
-            }
-            ToolKeyPair::Rsa(key) => {
-                let signing = rsa::pkcs1v15::SigningKey::<rsa::sha2::Sha256>::new((**key).clone());
-                let sig: rsa::pkcs1v15::Signature = signing.sign(tbs);
-                rsa::signature::SignatureEncoding::to_vec(&sig)
             }
         })
     }
@@ -193,19 +172,13 @@ impl ToolKeyPair {
                 ]
                 .concat(),
             ),
-            ToolKeyPair::Rsa(key) => key
-                .to_pkcs8_der()
-                .map_err(|e| format!("failed to marshal private key: {e}"))?
-                .as_bytes()
-                .to_vec(),
         })
     }
 }
 
 /// Generate a fresh key for the selected algorithm (`None` for an
 /// unknown one).  The EC scalars use rejection sampling over system
-/// randomness like Go's `ecdsa.GenerateKey`; the RSA generation is
-/// the rsa crate's over the system rng.
+/// randomness like Go's `ecdsa.GenerateKey`.
 pub fn generate_key(algo: &str) -> Option<ToolKeyPair> {
     let scalar = |len: usize| -> Vec<u8> {
         let mut bytes = vec![0u8; len];
@@ -232,11 +205,6 @@ pub fn generate_key(algo: &str) -> Option<ToolKeyPair> {
             let mut seed = [0u8; 32];
             getrandom::fill(&mut seed).expect("system randomness");
             Some(ToolKeyPair::Ed25519(seed))
-        }
-        "RSA4096" => {
-            let mut rng = rsa::rand_core::OsRng;
-            let key = rsa::RsaPrivateKey::new(&mut rng, 4096).expect("generate random RSA key");
-            Some(ToolKeyPair::Rsa(Box::new(key)))
         }
         _ => None,
     }
@@ -818,7 +786,6 @@ fn parse_private_key(block_type: &str, key_der: &[u8]) -> Result<ToolKeyPair, St
 
     let ec_oid = &der::oid(&[1, 2, 840, 10045, 2, 1])[2..];
     let ed_oid = &der::oid(&[1, 3, 101, 112])[2..];
-    let rsa_oid = &der::oid(&[1, 2, 840, 113549, 1, 1, 1])[2..];
     if alg_oid == ec_oid {
         let (params, _) = alg_r.expect(0x06).map_err(|_| parse_err())?;
         let curve = der::tlv(0x06, params);
@@ -833,9 +800,6 @@ fn parse_private_key(block_type: &str, key_der: &[u8]) -> Result<ToolKeyPair, St
         let (seed, _) = inner.expect(0x04)?;
         let seed: [u8; 32] = seed.try_into().map_err(|_| parse_err())?;
         Ok(ToolKeyPair::Ed25519(seed))
-    } else if alg_oid == rsa_oid {
-        let key = rsa::RsaPrivateKey::from_pkcs8_der(key_der).map_err(|_| parse_err())?;
-        Ok(ToolKeyPair::Rsa(Box::new(key)))
     } else {
         Err(parse_err())
     }
@@ -853,13 +817,6 @@ pub fn load_ca_pair(cert_pem: &[u8], key_pem: &[u8]) -> Result<(LoadedCa, ToolKe
 
     let ca = parse_certificate(&cert_der)?;
     let key = parse_private_key(&block_type, &key_der)?;
-    // Go's X509KeyPair distinguishes a key of the wrong algorithm
-    // family from a same-family mismatch.
-    let key_is_rsa = matches!(key, ToolKeyPair::Rsa(_));
-    let cert_is_rsa = ca.public_bytes.first() == Some(&0x30);
-    if key_is_rsa != cert_is_rsa {
-        return Err("tls: private key type does not match public key type".to_string());
-    }
     if key.public_bytes() != ca.public_bytes {
         return Err("tls: private key does not match public key".to_string());
     }

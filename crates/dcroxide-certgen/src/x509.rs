@@ -20,8 +20,6 @@ pub enum SigAlg {
     EcdsaP384,
     /// ECDSA with SHA-512 over P-521.
     EcdsaP521,
-    /// PKCS#1 v1.5 RSA with SHA-256 (the gencerts tool's `RSA4096`).
-    RsaSha256,
 }
 
 impl SigAlg {
@@ -32,14 +30,10 @@ impl SigAlg {
             SigAlg::EcdsaP256 => der::oid(&[1, 2, 840, 10045, 4, 3, 2]),
             SigAlg::EcdsaP384 => der::oid(&[1, 2, 840, 10045, 4, 3, 3]),
             SigAlg::EcdsaP521 => der::oid(&[1, 2, 840, 10045, 4, 3, 4]),
-            SigAlg::RsaSha256 => der::oid(&[1, 2, 840, 113549, 1, 1, 11]),
         };
         // Go omits the parameters for Ed25519 and ECDSA signature
-        // algorithms and emits an explicit NULL for RSA.
-        match self {
-            SigAlg::RsaSha256 => der::sequence(&[oid, der::null()].concat()),
-            _ => der::sequence(&oid),
-        }
+        // algorithms.
+        der::sequence(&oid)
     }
 
     /// The SubjectPublicKeyInfo AlgorithmIdentifier.
@@ -60,9 +54,6 @@ impl SigAlg {
                 let mut inner = der::oid(&[1, 2, 840, 10045, 2, 1]);
                 inner.extend_from_slice(&der::oid(&[1, 3, 132, 0, 35]));
                 der::sequence(&inner)
-            }
-            SigAlg::RsaSha256 => {
-                der::sequence(&[der::oid(&[1, 2, 840, 113549, 1, 1, 1]), der::null()].concat())
             }
         }
     }

@@ -61,10 +61,6 @@ pub fn integer_u64(v: u64) -> Vec<u8> {
 }
 
 /// A BOOLEAN.
-pub fn null() -> Vec<u8> {
-    vec![0x05, 0x00]
-}
-
 pub fn boolean(v: bool) -> Vec<u8> {
     tlv(0x01, &[if v { 0xff } else { 0x00 }])
 }
