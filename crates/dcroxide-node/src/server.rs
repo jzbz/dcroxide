@@ -348,8 +348,11 @@ pub struct ServerPeerAddrState {
     /// Whether the peer already requested addresses (dcrd
     /// `addrsSent`).
     pub addrs_sent: bool,
-    /// The dynamic ban score (dcrd `banScore`).
-    pub ban_score: dcroxide_connmgr::DynamicBanScore,
+    /// The dynamic ban score (dcrd `banScore`), shared so the peer
+    /// registry can report the live decaying value for `getpeerinfo`
+    /// exactly as dcrd's RPC adaptor reads `sp.banScore.Int()` off the
+    /// same object the abuse handlers bump.
+    pub ban_score: std::sync::Arc<std::sync::Mutex<dcroxide_connmgr::DynamicBanScore>>,
     /// Whether the peer is exempt from banning (dcrd
     /// `isWhitelisted`).
     pub is_whitelisted: bool,
@@ -364,7 +367,7 @@ impl ServerPeerAddrState {
                 KNOWN_ADDRS_FP_RATE,
             ),
             addrs_sent: false,
-            ban_score: dcroxide_connmgr::DynamicBanScore::default(),
+            ban_score: std::sync::Arc::default(),
             is_whitelisted,
         }
     }
@@ -453,10 +456,19 @@ pub fn add_ban_score(
     if transient == 0 && persistent == 0 {
         // The score is not being increased, but dcrd still logs a
         // warning when the score is above the warn threshold.
-        let _ = state.ban_score.int_at(now_unix) > warn_threshold;
+        let _ = state
+            .ban_score
+            .lock()
+            .expect("ban score poisoned")
+            .int_at(now_unix)
+            > warn_threshold;
         return false;
     }
-    let score = state.ban_score.increase_at(persistent, transient, now_unix);
+    let score = state
+        .ban_score
+        .lock()
+        .expect("ban score poisoned")
+        .increase_at(persistent, transient, now_unix);
     if score > warn_threshold && score > ban_threshold {
         return true;
     }

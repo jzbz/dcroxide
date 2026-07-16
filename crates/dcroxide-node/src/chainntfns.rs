@@ -887,6 +887,7 @@ mod tests {
                 false,
                 None,
                 None,
+                None,
             );
             let handler = ChainNtfnHandler::new(
                 None,
@@ -979,6 +980,7 @@ mod tests {
             ))),
             None,
             false,
+            None,
             None,
             None,
         );

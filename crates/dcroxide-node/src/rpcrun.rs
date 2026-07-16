@@ -1675,6 +1675,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
 
         let mut manager = NodeRpcConnManager::new(
@@ -1737,6 +1738,7 @@ mod tests {
             true,
             None,
             Some(remote),
+            None,
         );
 
         let mut manager = NodeRpcConnManager::new(
@@ -1904,6 +1906,7 @@ mod tests {
             true,
             Some(1),
             Some(reg_remote.clone()),
+            None,
         );
 
         // node remove: the persistent peer disconnects and the request

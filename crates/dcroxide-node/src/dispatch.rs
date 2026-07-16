@@ -198,6 +198,10 @@ struct SyncPeerHandles {
     /// `serverPeer.connReq`), so `node remove` can stop a persistent
     /// peer's redial; `None` for inbound peers.
     conn_req_id: Option<u64>,
+    /// The peer's dynamic ban score, shared with the abuse-control
+    /// handlers so `getpeerinfo` reports the live decaying value (dcrd
+    /// reading `sp.banScore.Int()` off the serverPeer).
+    ban_score: Option<Arc<Mutex<dcroxide_connmgr::DynamicBanScore>>>,
 }
 
 /// The per-peer relay state (dcrd's `serverPeer` fields the relay
@@ -263,6 +267,7 @@ impl SyncPeers {
         // stored socket handle, so the address-keyed control RPCs match
         // even for a peer whose socket clone failed.
         remote_addr: Option<String>,
+        ban_score: Option<Arc<Mutex<dcroxide_connmgr::DynamicBanScore>>>,
     ) {
         self.inner
             .lock()
@@ -278,6 +283,7 @@ impl SyncPeers {
                     remote_addr,
                     permanent,
                     conn_req_id,
+                    ban_score,
                 },
             );
     }
@@ -297,6 +303,7 @@ impl SyncPeers {
             Arc<Mutex<Peer>>,
             Arc<Mutex<RelayPeerState>>,
             Option<String>,
+            Option<Arc<Mutex<dcroxide_connmgr::DynamicBanScore>>>,
         )> = {
             let registry = self.inner.lock().expect("sync peers mutex poisoned");
             registry
@@ -307,14 +314,16 @@ impl SyncPeers {
                         Arc::clone(&handles.peer),
                         Arc::clone(&handles.relay),
                         handles.local_addr.clone(),
+                        handles.ban_score.clone(),
                     )
                 })
                 .collect()
         };
 
+        let now = now_unix();
         entries
             .into_iter()
-            .filter_map(|(id, peer, relay, local_addr)| {
+            .filter_map(|(id, peer, relay, local_addr, ban_score)| {
                 // Skip a peer whose mutex is poisoned — its input thread
                 // panicked, so it is effectively dead — rather than
                 // propagating the poison and making every `getpeerinfo`
@@ -357,10 +366,13 @@ impl SyncPeers {
                     inbound: snap.inbound,
                     starting_height: snap.starting_height,
                     last_block: snap.last_block,
-                    // The live decaying ban score is not shared to the RPC
-                    // seam yet; a well-behaved peer scores zero (a
-                    // documented divergence from dcrd's `banScore.Int()`).
-                    ban_score: 0,
+                    // The live decaying score off the shared abuse-control
+                    // state (dcrd's `sp.banScore.Int()`), poison-tolerant
+                    // like the other per-peer locks; a peer registered
+                    // without one (tests) scores zero.
+                    ban_score: ban_score
+                        .and_then(|score| score.lock().ok().map(|score| score.int_at(now)))
+                        .unwrap_or(0),
                     last_ping_nonce: snap.last_ping_nonce,
                     // The handler feeds this straight to `clock.since_nanos`,
                     // so it stays in nanoseconds.
@@ -940,6 +952,7 @@ impl ServerPeerHandler {
             self.permanent,
             self.conn_req_id,
             Some(self.remote_addr.clone()),
+            Some(Arc::clone(&self.addr_state.ban_score)),
         );
         let actions = {
             let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
@@ -1668,6 +1681,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         peers.register(
             2,
@@ -1677,6 +1691,7 @@ mod tests {
             test_peer_handle(),
             None,
             false,
+            None,
             None,
             None,
         );
@@ -1737,6 +1752,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         assert!(
             !peers.relay_inventory(&tx_relay_msg(&inv)),
@@ -1761,6 +1777,15 @@ mod tests {
             peer.record_recv(2000, 9_000_000_000);
         }
 
+        // The shared abuse-control score the input thread would bump; a
+        // persistent bump never decays, so the assertion below is
+        // time-independent.
+        let ban_score = Arc::new(Mutex::new(dcroxide_connmgr::DynamicBanScore::default()));
+        ban_score
+            .lock()
+            .expect("ban score")
+            .increase_at(50, 0, now_unix());
+
         // Register under a non-1 id to prove the id comes from the key,
         // not the snapshot (whose id the peer never assigns).
         peers.register(
@@ -1773,6 +1798,7 @@ mod tests {
             false,
             None,
             None,
+            Some(Arc::clone(&ban_score)),
         );
 
         let infos = peers.connected_peer_infos();
@@ -1787,7 +1813,10 @@ mod tests {
         assert_eq!(info.last_recv_unix, 9);
         assert!(info.inbound, "a new_inbound peer");
         assert!(info.connected);
-        assert_eq!(info.ban_score, 0, "documented v1 divergence");
+        assert_eq!(
+            info.ban_score, 50,
+            "the live score off the shared abuse-control state"
+        );
         // `version` is the numeric advertised protocol version (0 here,
         // never negotiated), and `user_agent` is the version string — the
         // two are not swapped.  A fresh peer's negotiated protocol version
@@ -1812,6 +1841,7 @@ mod tests {
             test_peer_handle(),
             None,
             false,
+            None,
             None,
             None,
         );
@@ -1861,6 +1891,7 @@ mod tests {
                 permanent,
                 None,
                 Some(remote.clone()),
+                None,
             );
             // A read timeout so a broken shutdown fails the EOF check
             // instead of hanging the test forever.
@@ -1888,6 +1919,7 @@ mod tests {
             test_peer_handle(),
             None,
             false,
+            None,
             None,
             None,
         );
@@ -1988,6 +2020,7 @@ mod tests {
                 permanent,
                 conn_req_id,
                 Some(remote.clone()),
+                None,
             );
             client
                 .set_read_timeout(Some(Duration::from_secs(5)))
@@ -2015,6 +2048,7 @@ mod tests {
             // The remote address is known from the dial even when the
             // socket clone failed, so the by-addr control still matches.
             Some("203.0.113.7:9108".to_string()),
+            None,
         );
 
         // Temporary and unknown peers are not removable.
@@ -2114,6 +2148,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         peers.register(
             2,
@@ -2125,6 +2160,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         peers.register(
             3,
@@ -2134,6 +2170,7 @@ mod tests {
             test_peer_handle(),
             None,
             false,
+            None,
             None,
             None,
         );
