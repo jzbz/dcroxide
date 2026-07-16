@@ -481,6 +481,8 @@ mod tests {
             peer,
             None,
             false,
+            None,
+            None,
         );
     }
 

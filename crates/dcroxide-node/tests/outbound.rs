@@ -11,7 +11,9 @@ use dcroxide_blockchain::process::Chain;
 use dcroxide_database::{Database, Options};
 use dcroxide_node::dispatch::OutboundGroups;
 use dcroxide_node::dispatch::ServerContext;
-use dcroxide_node::outbound::{OutboundConfig, new_address_source, start_outbound};
+use dcroxide_node::outbound::{
+    OutboundConfig, new_address_source, outbound_channel, start_outbound,
+};
 use dcroxide_node::runtime::{ConnectedPeers, ListenerRuntime, PeerTemplate, inbound_peer_handler};
 use dcroxide_wire::{CurrencyNet, ServiceFlag};
 
@@ -102,17 +104,21 @@ fn dials_and_serves_a_permanent_connection() {
 
     // The dialing daemon opens a permanent connection to it.
     let (dial_server, dial_connected) = genesis_server(dir.path(), "dial");
-    let connector = start_outbound(OutboundConfig {
-        template: template("dialer"),
-        connected: dial_connected.clone(),
-        server: Some(dial_server),
-        target_outbound: 8,
-        retry_duration: Duration::from_millis(200),
-        dial_timeout: Duration::from_secs(5),
-        permanent: vec![format!("127.0.0.1:{port}")],
-        get_new_address: None,
-        addr_manager: None,
-    });
+    let connector = start_outbound(
+        OutboundConfig {
+            template: template("dialer"),
+            connected: dial_connected.clone(),
+            server: Some(dial_server),
+            target_outbound: 8,
+            max_peers: 125,
+            retry_duration: Duration::from_millis(200),
+            dial_timeout: Duration::from_secs(5),
+            permanent: vec![format!("127.0.0.1:{port}")],
+            get_new_address: None,
+            addr_manager: None,
+        },
+        outbound_channel(),
+    );
 
     // Both sides register the live peer once the handshake completes.
     assert!(
@@ -143,17 +149,21 @@ fn retries_an_unreachable_permanent_connection() {
     let port = dead.local_addr().expect("addr").port();
     drop(dead);
 
-    let connector = start_outbound(OutboundConfig {
-        template: template("dialer"),
-        connected: dial_connected.clone(),
-        server: Some(dial_server),
-        target_outbound: 8,
-        retry_duration: Duration::from_millis(100),
-        dial_timeout: Duration::from_millis(500),
-        permanent: vec![format!("127.0.0.1:{port}")],
-        get_new_address: None,
-        addr_manager: None,
-    });
+    let connector = start_outbound(
+        OutboundConfig {
+            template: template("dialer"),
+            connected: dial_connected.clone(),
+            server: Some(dial_server),
+            target_outbound: 8,
+            max_peers: 125,
+            retry_duration: Duration::from_millis(100),
+            dial_timeout: Duration::from_millis(500),
+            permanent: vec![format!("127.0.0.1:{port}")],
+            get_new_address: None,
+            addr_manager: None,
+        },
+        outbound_channel(),
+    );
 
     // Nothing ever connects, and the driver stays healthy across a few
     // retry cycles.
@@ -165,6 +175,103 @@ fn retries_an_unreachable_permanent_connection() {
     );
 
     connector.shutdown();
+}
+
+/// `node remove` on a served permanent peer tears the whole chain down
+/// end to end: the handshake registered the peer with its live
+/// connection-request id, so the remove disconnects it AND stops the
+/// connection manager's redial — despite the permanence and a short
+/// retry interval (dcrd's `removeNode` nilling `connReq` before
+/// `connManager.Remove`).
+#[test]
+fn removing_a_permanent_peer_stops_its_redial() {
+    use dcroxide_rpc::server::RpcConnManager;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    // The listening daemon.
+    let (listen_server, listen_connected) = genesis_server(dir.path(), "listen");
+    let runtime = ListenerRuntime::start(
+        &[("tcp4", ":0".to_string())],
+        inbound_peer_handler(
+            template("listener"),
+            listen_connected.clone(),
+            Some(listen_server),
+            0,
+        ),
+    )
+    .expect("start listener");
+    let port = runtime.bound_addrs()[0].port();
+
+    // The dialing daemon keeps a permanent connection with a retry
+    // interval short enough that a leaked redial would be observed.
+    let (dial_server, dial_connected) = genesis_server(dir.path(), "dial");
+    let channel = dcroxide_node::outbound::outbound_channel();
+    let control = channel.control();
+    let connector = start_outbound(
+        OutboundConfig {
+            template: template("dialer"),
+            connected: dial_connected.clone(),
+            server: Some(Arc::clone(&dial_server)),
+            target_outbound: 8,
+            max_peers: 125,
+            retry_duration: Duration::from_millis(100),
+            dial_timeout: Duration::from_secs(5),
+            permanent: vec![format!("127.0.0.1:{port}")],
+            get_new_address: None,
+            addr_manager: None,
+        },
+        channel,
+    );
+
+    // The handshake completes and the peer registers as persistent.
+    let rebroadcaster = dcroxide_node::rebroadcast::start_rebroadcaster(
+        Arc::clone(&dial_server.chain),
+        dial_server.sync_peers.clone(),
+        Arc::clone(&dial_server.recently_advertised),
+    );
+    let mut manager = dcroxide_node::rpcrun::NodeRpcConnManager::new(
+        dial_connected.clone(),
+        Arc::new(dcroxide_node::transport::NetByteTotals::new()),
+    )
+    .with_relay(
+        dial_server.sync_peers.clone(),
+        Arc::clone(&dial_server.recently_advertised),
+        Arc::clone(&dial_server.tx_pool),
+        rebroadcaster.sink(),
+        dcroxide_node::websocket::NodeNtfnMgr::new(),
+    )
+    .with_outbound(control);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            manager.persistent_peers().len() == 1
+        }),
+        "the permanent peer must register through the handshake"
+    );
+    let peer_addr = manager.persistent_peers()[0].addr.clone();
+
+    // Remove it: the peer disconnects, and the request's redial is
+    // stopped — both registries settle at zero and stay there across
+    // several would-be retry windows.
+    manager.remove_by_addr(&peer_addr).expect("remove");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            dial_connected.is_empty() && manager.persistent_peers().is_empty()
+        }),
+        "the removed peer must disconnect"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        dial_connected.len(),
+        0,
+        "a removed permanent peer is never redialed"
+    );
+
+    connector.shutdown();
+    rebroadcaster.shutdown();
+    dial_connected.disconnect_all();
+    listen_connected.disconnect_all();
+    runtime.shutdown();
 }
 
 /// Poll `cond` until it holds or the timeout elapses.

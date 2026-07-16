@@ -194,6 +194,10 @@ struct SyncPeerHandles {
     /// — dcrd's `persistentPeers` set, listed by `getaddednodeinfo` and
     /// exempt from `node disconnect`.
     permanent: bool,
+    /// The outbound connection manager's request id (dcrd's
+    /// `serverPeer.connReq`), so `node remove` can stop a persistent
+    /// peer's redial; `None` for inbound peers.
+    conn_req_id: Option<u64>,
 }
 
 /// The per-peer relay state (dcrd's `serverPeer` fields the relay
@@ -253,14 +257,13 @@ impl SyncPeers {
         peer: Arc<Mutex<Peer>>,
         local_addr: Option<String>,
         permanent: bool,
+        conn_req_id: Option<u64>,
+        // The remote address, supplied by the caller from the accept or
+        // dial (dcrd's `Peer.Addr()`) rather than derived from the
+        // stored socket handle, so the address-keyed control RPCs match
+        // even for a peer whose socket clone failed.
+        remote_addr: Option<String>,
     ) {
-        // The remote address is captured here (symmetric to the caller's
-        // local address) before the socket is stored, so the
-        // address-keyed control RPCs need no peer lock.
-        let remote_addr = socket
-            .as_ref()
-            .and_then(|socket| socket.peer_addr().ok())
-            .map(|addr| addr.to_string());
         self.inner
             .lock()
             .expect("sync peers mutex poisoned")
@@ -274,6 +277,7 @@ impl SyncPeers {
                     local_addr,
                     remote_addr,
                     permanent,
+                    conn_req_id,
                 },
             );
     }
@@ -613,6 +617,50 @@ impl SyncPeers {
         !ids.is_empty()
     }
 
+    /// Remove the first persistent peer matching the predicate: shut
+    /// its socket and delete the entry, returning its
+    /// connection-request id so the caller can stop the redial (the
+    /// shared body of dcrd's `removeNode`, whose `disconnectPeer`
+    /// helper takes the same compare function and stops after the
+    /// first match).  Only permanent peers match — a temporary or
+    /// absent peer is `None` ("peer not found"), so the handler emits
+    /// dcrd's "use disconnect" hint for a connected temporary peer.
+    /// Unlike `node disconnect`, a peer without a socket handle is
+    /// still removable (dcrd's `removeNode` has no such precondition):
+    /// the entry deletion and redial stop matter even when the
+    /// connection itself can only wind down on its own.  The
+    /// outbound-group count releases when the serving thread unwinds
+    /// (its drop guard), like dcrd's `whenFound` decrement.
+    fn remove_persistent_where(
+        &self,
+        matches: impl Fn(i32, &SyncPeerHandles) -> bool,
+    ) -> Option<Option<u64>> {
+        let mut registry = self.inner.lock().expect("sync peers mutex poisoned");
+        let id = registry
+            .iter()
+            .find(|(id, handles)| handles.permanent && matches(**id, handles))
+            .map(|(id, _)| *id)?;
+        let handles = registry.remove(&id).expect("found above");
+        if let Some(socket) = &handles.socket {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+        Some(handles.conn_req_id)
+    }
+
+    /// Remove the persistent peer with the given id (dcrd's
+    /// `RemoveByID` compare function over `removeNode`).
+    pub(crate) fn remove_persistent_by_id(&self, id: i32) -> Option<Option<u64>> {
+        self.remove_persistent_where(|peer_id, _| peer_id == id)
+    }
+
+    /// Remove the first persistent peer whose remote address matches
+    /// (dcrd's `RemoveByAddr` compare function).  `None` when no
+    /// persistent peer matches — the caller then falls back to
+    /// cancelling a pending connection, like dcrd's `RemoveByAddr`.
+    pub(crate) fn remove_persistent_by_addr(&self, addr: &str) -> Option<Option<u64>> {
+        self.remove_persistent_where(|_, handles| handles.remote_addr.as_deref() == Some(addr))
+    }
+
     /// Forward a timer command to the stall timer when one is running
     /// (a closed or absent timer means shutdown is in progress).
     fn send_stall(&self, command: StallCommand) {
@@ -767,6 +815,15 @@ pub struct ServerPeerHandler {
     /// `serverPeer.persistent`); recorded in the registry so
     /// `getaddednodeinfo` lists it and `node disconnect` skips it.
     permanent: bool,
+    /// The connection manager's request id for an outbound peer (dcrd's
+    /// `serverPeer.connReq`); recorded in the registry so `node remove`
+    /// can stop the request's redial.
+    conn_req_id: Option<u64>,
+    /// The connection's remote address, known from the accept or dial
+    /// independently of the registry's socket handle (dcrd's
+    /// `Peer.Addr()`, stored at peer creation), so the address-keyed
+    /// control RPCs match even when the socket clone failed.
+    remote_addr: String,
 }
 
 impl ServerPeerHandler {
@@ -776,6 +833,8 @@ impl ServerPeerHandler {
         is_whitelisted: bool,
         socket: Option<TcpStream>,
         permanent: bool,
+        conn_req_id: Option<u64>,
+        remote_addr: String,
     ) -> ServerPeerHandler {
         ServerPeerHandler {
             ctx,
@@ -786,6 +845,8 @@ impl ServerPeerHandler {
             sync_peer_id: None,
             socket,
             permanent,
+            conn_req_id,
+            remote_addr,
         }
     }
 
@@ -877,6 +938,8 @@ impl ServerPeerHandler {
             Arc::clone(peer_handle),
             local_addr,
             self.permanent,
+            self.conn_req_id,
+            Some(self.remote_addr.clone()),
         );
         let actions = {
             let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
@@ -1603,6 +1666,8 @@ mod tests {
             test_peer_handle(),
             None,
             false,
+            None,
+            None,
         );
         peers.register(
             2,
@@ -1612,6 +1677,8 @@ mod tests {
             test_peer_handle(),
             None,
             false,
+            None,
+            None,
         );
 
         // Relay reaches the relay-enabled peer only, and reports the
@@ -1668,6 +1735,8 @@ mod tests {
             test_peer_handle(),
             None,
             false,
+            None,
+            None,
         );
         assert!(
             !peers.relay_inventory(&tx_relay_msg(&inv)),
@@ -1702,6 +1771,8 @@ mod tests {
             handle,
             Some("127.0.0.1:9108".to_string()),
             false,
+            None,
+            None,
         );
 
         let infos = peers.connected_peer_infos();
@@ -1741,6 +1812,8 @@ mod tests {
             test_peer_handle(),
             None,
             false,
+            None,
+            None,
         );
         assert_eq!(
             peers.connected_peer_infos().len(),
@@ -1786,6 +1859,8 @@ mod tests {
                 test_peer_handle(),
                 None,
                 permanent,
+                None,
+                Some(remote.clone()),
             );
             // A read timeout so a broken shutdown fails the EOF check
             // instead of hanging the test forever.
@@ -1813,6 +1888,8 @@ mod tests {
             test_peer_handle(),
             None,
             false,
+            None,
+            None,
         );
 
         // getaddednodeinfo lists only the permanent peer, as a connected
@@ -1874,6 +1951,116 @@ mod tests {
         );
     }
 
+    /// `node remove` scans the persistent peers only (dcrd's
+    /// `removeNode`): a permanent peer is removed — socket shut, entry
+    /// deleted, connection-request id handed back for the connmgr
+    /// remove — while temporary and unknown peers are "not found".  A
+    /// permanent peer without a socket handle is still removable, by id
+    /// or by its registered address (dcrd's `removeNode` has no socket
+    /// precondition).
+    #[test]
+    fn remove_persistent_seams() {
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+
+        // Register `id` over a fresh loopback connection with the given
+        // permanence and connection-request id.
+        fn register_conn(
+            peers: &SyncPeers,
+            listener: &TcpListener,
+            id: i32,
+            permanent: bool,
+            conn_req_id: Option<u64>,
+        ) -> (TcpStream, String) {
+            let bound = listener.local_addr().expect("addr");
+            let client = TcpStream::connect(bound).expect("connect");
+            let (server, _) = listener.accept().expect("accept");
+            let remote = server.peer_addr().expect("peer addr").to_string();
+            let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+            peers.register(
+                id,
+                queue,
+                Some(server),
+                Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+                test_peer_handle(),
+                None,
+                permanent,
+                conn_req_id,
+                Some(remote.clone()),
+            );
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            (client, remote)
+        }
+
+        let peers = SyncPeers::new();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+
+        let (mut perm_client, _) = register_conn(&peers, &listener, 1, true, Some(7));
+        let (_temp_client, temp_remote) = register_conn(&peers, &listener, 2, false, None);
+        let (_addr_client, addr_remote) = register_conn(&peers, &listener, 3, true, Some(9));
+        // A permanent peer whose socket clone failed (no socket handle).
+        let (q4, _r4) = crate::peerloop::OutboundQueue::channel();
+        peers.register(
+            4,
+            q4,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+            test_peer_handle(),
+            None,
+            true,
+            Some(11),
+            // The remote address is known from the dial even when the
+            // socket clone failed, so the by-addr control still matches.
+            Some("203.0.113.7:9108".to_string()),
+        );
+
+        // Temporary and unknown peers are not removable.
+        assert_eq!(peers.remove_persistent_by_id(2), None, "temporary");
+        assert_eq!(peers.remove_persistent_by_id(99), None, "unknown");
+        assert_eq!(
+            peers.remove_persistent_by_addr(&temp_remote),
+            None,
+            "a temporary peer's address never matches"
+        );
+        // A permanent peer without a socket handle is still removable —
+        // dcrd's removeNode has no socket precondition, and the entry
+        // deletion plus redial stop matter even when the connection can
+        // only wind down on its own.  Its registered dial address keys
+        // the by-addr form despite the missing socket.
+        assert_eq!(
+            peers.remove_persistent_by_addr("203.0.113.7:9108"),
+            Some(Some(11)),
+            "socketless by addr"
+        );
+        assert_eq!(
+            peers.remove_persistent_by_id(4),
+            None,
+            "the socketless peer was already removed by address"
+        );
+
+        // Removing the permanent peer by id shuts its socket, deletes
+        // the entry synchronously, and returns its request id.
+        assert_eq!(peers.remove_persistent_by_id(1), Some(Some(7)));
+        assert_eq!(
+            peers.remove_persistent_by_id(1),
+            None,
+            "the removed peer was deleted synchronously"
+        );
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            perm_client.read(&mut buf).expect("read the shut socket"),
+            0,
+            "the removed peer's socket is shut"
+        );
+
+        // The by-address form matches the other permanent peer.
+        assert_eq!(peers.remove_persistent_by_addr(&addr_remote), Some(Some(9)));
+        assert_eq!(peers.remove_persistent_by_addr(&addr_remote), None);
+    }
+
     fn full_node_facts() -> crate::server::RelayPeerFacts {
         crate::server::RelayPeerFacts {
             connected: true,
@@ -1925,6 +2112,8 @@ mod tests {
             test_peer_handle(),
             None,
             false,
+            None,
+            None,
         );
         peers.register(
             2,
@@ -1934,6 +2123,8 @@ mod tests {
             test_peer_handle(),
             None,
             false,
+            None,
+            None,
         );
         peers.register(
             3,
@@ -1943,6 +2134,8 @@ mod tests {
             test_peer_handle(),
             None,
             false,
+            None,
+            None,
         );
         peers.set_wants_headers(2);
 

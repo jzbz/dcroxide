@@ -504,6 +504,10 @@ pub struct NodeRpcConnManager {
     /// not attached.
     sync_peers: crate::dispatch::SyncPeers,
     relay: Option<RpcRelaySinks>,
+    /// The outbound connection driver's control handle, backing the
+    /// manual connect/remove RPCs (dcrd's `rpcConnManager` reaching
+    /// `cm.server.connManager`); absent only in tests without a driver.
+    outbound: Option<crate::outbound::OutboundControl>,
 }
 
 /// The relay handles the RPC connection manager drives when a
@@ -531,6 +535,29 @@ impl NodeRpcConnManager {
             net_totals,
             sync_peers: crate::dispatch::SyncPeers::default(),
             relay: None,
+            outbound: None,
+        }
+    }
+
+    /// Attach the outbound connection driver's control handle so the
+    /// manual peer-control RPCs (`addnode`, `node connect`/`remove`) can
+    /// dial and remove connection requests.
+    pub fn with_outbound(
+        mut self,
+        outbound: crate::outbound::OutboundControl,
+    ) -> NodeRpcConnManager {
+        self.outbound = Some(outbound);
+        self
+    }
+
+    /// Stop a removed persistent peer's redial by removing its
+    /// connection request (dcrd's `removeNode` nilling the peer's
+    /// `connReq` and calling `connManager.Remove`) — the shared tail of
+    /// both remove seams.  A peer registered without a request id (or
+    /// without a driver attached) has no redial to stop.
+    fn stop_redial(&self, conn_req_id: Option<u64>) {
+        if let (Some(outbound), Some(req_id)) = (&self.outbound, conn_req_id) {
+            outbound.remove(req_id);
         }
     }
 
@@ -604,6 +631,59 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
             Ok(())
         } else {
             Err("peer not found".to_string())
+        }
+    }
+
+    /// Add the address as a new persistent or one-try outbound peer
+    /// (dcrd `rpcConnManager.Connect`): the driver's event loop runs the
+    /// duplicate, resolution, and max-peers checks and dials after
+    /// replying.
+    fn connect(&mut self, addr: &str, permanent: bool) -> Result<(), String> {
+        let outbound = self
+            .outbound
+            .as_ref()
+            .ok_or_else(|| crate::outbound::STOPPED.to_string())?;
+        outbound.connect(addr, permanent)
+    }
+
+    /// Remove the persistent peer with the given id (dcrd
+    /// `rpcConnManager.RemoveByID` over `removeNode`): the peer is
+    /// disconnected and its connection request removed so it is not
+    /// redialed.  A temporary or unknown peer is "peer not found", which
+    /// the `node` handler turns into its "use disconnect" hint when the
+    /// peer is connected.
+    fn remove_by_id(&mut self, id: i32) -> Result<(), String> {
+        match self.sync_peers.remove_persistent_by_id(id) {
+            Some(conn_req_id) => {
+                self.stop_redial(conn_req_id);
+                Ok(())
+            }
+            None => Err("peer not found".to_string()),
+        }
+    }
+
+    /// Remove the persistent peer with the given address (dcrd
+    /// `rpcConnManager.RemoveByAddr`): when no connected persistent peer
+    /// matches, fall back to cancelling a pending connection request for
+    /// the resolved address — an added peer that is still dialing or
+    /// awaiting a retry.
+    fn remove_by_addr(&mut self, addr: &str) -> Result<(), String> {
+        match self.sync_peers.remove_persistent_by_addr(addr) {
+            Some(conn_req_id) => {
+                self.stop_redial(conn_req_id);
+                Ok(())
+            }
+            None => {
+                let outbound = self
+                    .outbound
+                    .as_ref()
+                    .ok_or_else(|| crate::outbound::STOPPED.to_string())?;
+                // dcrd resolves through `addrStringToNetAddr` before
+                // `CancelPending`, surfacing resolution errors; pending
+                // requests store the resolved dial address.
+                let resolved = crate::outbound::addr_string_to_socket_addr(addr)?;
+                outbound.cancel_pending(&resolved.to_string())
+            }
         }
     }
 
@@ -1593,6 +1673,8 @@ mod tests {
             peer,
             Some("10.0.0.1:9108".to_string()),
             false,
+            None,
+            None,
         );
 
         let mut manager = NodeRpcConnManager::new(
@@ -1636,6 +1718,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let _client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
         let (server, _) = listener.accept().expect("accept");
+        let remote = server.peer_addr().expect("peer addr").to_string();
         sync_peers.register(
             3,
             queue,
@@ -1652,6 +1735,8 @@ mod tests {
             peer,
             None,
             true,
+            None,
+            Some(remote),
         );
 
         let mut manager = NodeRpcConnManager::new(
@@ -1681,5 +1766,219 @@ mod tests {
             manager.lookup("127.0.0.1").expect("lookup 127.0.0.1"),
             vec!["127.0.0.1".to_string()]
         );
+    }
+
+    /// The peer template the outbound-control tests dial with: long
+    /// timeouts so nothing fires mid-test.
+    fn control_template() -> crate::runtime::PeerTemplate {
+        crate::runtime::PeerTemplate {
+            net: dcroxide_wire::CurrencyNet::TEST_NET3,
+            protocol_version: 0,
+            services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+            user_agent_name: "control-test".to_string(),
+            user_agent_version: "0.1.0".to_string(),
+            idle_timeout: std::time::Duration::from_secs(3600),
+            ping_interval: std::time::Duration::from_secs(3600),
+        }
+    }
+
+    /// Poll `cond` until it holds or the timeout elapses.
+    fn wait_until(timeout: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    /// The manual peer-control seams drive a live outbound driver
+    /// (dcrd `rpcConnManager.Connect`/`RemoveByAddr`/`RemoveByID`):
+    /// `addnode add` dials and refuses duplicates in dcrd's check
+    /// order, and removing the persistent peer disconnects it without
+    /// a redial despite its permanence.
+    #[test]
+    fn connect_and_remove_control_the_outbound_driver() {
+        use std::net::{TcpListener, TcpStream};
+
+        // Two live listeners the driver can dial (their kernel backlog
+        // completes the TCP handshake without an accept loop).
+        let listener_a = TcpListener::bind("127.0.0.1:0").expect("bind a");
+        let addr_a = listener_a.local_addr().expect("addr a").to_string();
+        let listener_b = TcpListener::bind("127.0.0.1:0").expect("bind b");
+        let addr_b = listener_b.local_addr().expect("addr b").to_string();
+
+        let channel = crate::outbound::outbound_channel();
+        let control = channel.control();
+        let connected = crate::runtime::ConnectedPeers::new();
+        let connector = crate::outbound::start_outbound(
+            crate::outbound::OutboundConfig {
+                template: control_template(),
+                connected: connected.clone(),
+                server: None,
+                target_outbound: 8,
+                max_peers: 2,
+                // Short enough that a leaked redial would be observed
+                // by the post-remove stability check below.
+                retry_duration: std::time::Duration::from_millis(50),
+                dial_timeout: std::time::Duration::from_secs(5),
+                permanent: Vec::new(),
+                get_new_address: None,
+                addr_manager: None,
+            },
+            channel,
+        );
+
+        let sync_peers = crate::dispatch::SyncPeers::new();
+        let mut manager = NodeRpcConnManager::new(
+            connected.clone(),
+            Arc::new(crate::transport::NetByteTotals::new()),
+        )
+        .with_peer_registry(sync_peers.clone())
+        .with_outbound(control);
+
+        // addnode add: the dial succeeds and the served peer registers.
+        manager.connect(&addr_a, true).expect("connect permanent");
+        assert!(
+            wait_until(std::time::Duration::from_secs(5), || connected.len() == 1),
+            "the dialed peer must be served"
+        );
+
+        // A duplicate of a permanent request is refused up front.
+        assert_eq!(
+            manager.connect(&addr_a, true),
+            Err("peer exists as a permanent peer".to_string())
+        );
+        // An unparseable address surfaces the resolution error.
+        assert!(
+            manager
+                .connect("127.0.0.1", false)
+                .expect_err("no port must fail")
+                .contains("missing port"),
+        );
+
+        // node connect (temp) to the second listener fills the table.
+        manager.connect(&addr_b, false).expect("connect temp");
+        assert!(
+            wait_until(std::time::Duration::from_secs(5), || connected.len() == 2),
+            "the second dialed peer must be served"
+        );
+        // A duplicate of an established temporary request is refused...
+        assert_eq!(
+            manager.connect(&addr_b, false),
+            Err("peer already connected".to_string())
+        );
+        // ...and a fresh address is refused once the peer table is full.
+        assert_eq!(
+            manager.connect("127.0.0.1:1", false),
+            Err("max peers reached".to_string())
+        );
+
+        // Register the permanent peer as its handshake would, carrying
+        // the driver's first request id (a fresh manager assigns 1).
+        let reg_listener = TcpListener::bind("127.0.0.1:0").expect("bind reg");
+        let _client =
+            TcpStream::connect(reg_listener.local_addr().expect("addr")).expect("connect");
+        let (reg_socket, _) = reg_listener.accept().expect("accept");
+        let reg_remote = reg_socket.peer_addr().expect("peer addr").to_string();
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        sync_peers.register(
+            1,
+            queue,
+            Some(reg_socket),
+            Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
+                crate::server::RelayPeerFacts {
+                    connected: true,
+                    services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+                    wants_headers: false,
+                    disable_relay_tx: false,
+                    protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+                },
+            ))),
+            Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
+                dcroxide_peer::Config::default(),
+            ))),
+            None,
+            true,
+            Some(1),
+            Some(reg_remote.clone()),
+        );
+
+        // node remove: the persistent peer disconnects and the request
+        // is removed, so the permanent connection is never redialed —
+        // the count settles at one (the temporary peer) and stays there
+        // across several would-be retry windows.
+        manager.remove_by_addr(&reg_remote).expect("remove");
+        assert!(
+            wait_until(std::time::Duration::from_secs(5), || connected.len() == 1),
+            "the removed peer must disconnect"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(connected.len(), 1, "a removed peer is not redialed");
+
+        // Removing an unknown or temporary peer is "peer not found".
+        assert_eq!(manager.remove_by_id(99), Err("peer not found".to_string()));
+
+        connector.shutdown();
+        connected.disconnect_all();
+    }
+
+    /// `node remove` on an added peer that never connected falls back
+    /// to cancelling its pending connection request (dcrd
+    /// `RemoveByAddr` calling `CancelPending` after `removeNode` misses),
+    /// and a second remove reports nothing pending.
+    #[test]
+    fn remove_by_addr_cancels_a_pending_connection() {
+        // A port that refuses connections: bind, take the address, drop.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let dead_addr = dead.local_addr().expect("addr").to_string();
+        drop(dead);
+
+        let channel = crate::outbound::outbound_channel();
+        let control = channel.control();
+        let connected = crate::runtime::ConnectedPeers::new();
+        let connector = crate::outbound::start_outbound(
+            crate::outbound::OutboundConfig {
+                template: control_template(),
+                connected: connected.clone(),
+                server: None,
+                target_outbound: 8,
+                max_peers: 8,
+                // Long enough that the scheduled retry never fires
+                // mid-test, leaving the failed request pending.
+                retry_duration: std::time::Duration::from_secs(60),
+                dial_timeout: std::time::Duration::from_secs(5),
+                permanent: Vec::new(),
+                get_new_address: None,
+                addr_manager: None,
+            },
+            channel,
+        );
+
+        let mut manager =
+            NodeRpcConnManager::new(connected, Arc::new(crate::transport::NetByteTotals::new()))
+                .with_outbound(control);
+
+        // The add succeeds (the checks pass); the dial then fails and
+        // the permanent request waits for its retry.
+        manager.connect(&dead_addr, true).expect("connect");
+        // Re-adding the same peer is refused while its request lives on.
+        assert_eq!(
+            manager.connect(&dead_addr, true),
+            Err("peer exists as a permanent peer".to_string())
+        );
+
+        // No connected persistent peer matches, so the remove falls back
+        // to cancelling the pending request; a second remove finds
+        // nothing.
+        manager.remove_by_addr(&dead_addr).expect("cancel pending");
+        assert_eq!(
+            manager.remove_by_addr(&dead_addr),
+            Err(format!("no pending connection to {dead_addr}"))
+        );
+
+        connector.shutdown();
     }
 }

@@ -61,6 +61,10 @@ pub struct OutboundConfig {
     /// `TargetOutbound`); only the address-source dialing honours it,
     /// so it is unused until that source lands.
     pub target_outbound: u32,
+    /// The maximum number of peers, bounding RPC-requested connects
+    /// (dcrd `rpcConnManager.Connect`'s `cfg.MaxPeers` check against
+    /// the peer count).
+    pub max_peers: usize,
     /// How long to wait before retrying a failed permanent connection
     /// (dcrd `RetryDuration`).
     pub retry_duration: Duration,
@@ -153,8 +157,116 @@ enum Command {
     RetryFire(u64),
     /// A scheduled new-connection timer fired.
     NewConnFire,
+    /// An RPC-requested outbound connection (dcrd
+    /// `rpcConnManager.Connect`): the loop runs the duplicate and
+    /// max-peers checks over its state, replies with their result, and
+    /// only then dials — so the RPC never waits on its own dial (dcrd's
+    /// `go connManager.Connect`), though like every command it can
+    /// queue behind an in-flight dial (the PARITY-documented
+    /// synchronous-dial divergence).  The address is resolved by the
+    /// sender on the RPC thread — where dcrd's `addrStringToNetAddr`
+    /// runs — so a slow resolver never stalls the dial scheduling; the
+    /// pre-computed result is unwrapped after the duplicate check to
+    /// keep dcrd's error precedence.
+    RpcConnect {
+        addr: String,
+        resolved: Result<SocketAddr, String>,
+        permanent: bool,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    /// Remove the identified connection request so a persistent peer is
+    /// not redialed (dcrd `connManager.Remove` from the RPC adaptor's
+    /// `removeNode`).
+    RpcRemove(u64),
+    /// Cancel the pending connection to the address (dcrd
+    /// `connManager.CancelPending` — `addnode remove`/`node remove` for
+    /// a persistent peer that is mid-dial or awaiting a retry).
+    RpcCancelPending {
+        addr: String,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
     /// Stop the driver.
     Stop,
+}
+
+/// The RPC control handle into the driver's event loop — the seams
+/// dcrd's `rpcConnManager` reaches through `cm.server.connManager`.
+/// Clones share the same driver.
+#[derive(Clone)]
+pub struct OutboundControl {
+    commands: mpsc::Sender<Command>,
+}
+
+/// The failure every control call reports once the driver has stopped
+/// and the command channel is closed — or was never attached (dcrd's
+/// connmgr methods report "connection manager stopped" after quit).
+pub(crate) const STOPPED: &str = "connection manager stopped";
+
+impl OutboundControl {
+    /// Add the address as a new outbound peer, persistent or one-try
+    /// (dcrd `rpcConnManager.Connect`): duplicate requests, unresolvable
+    /// addresses, and a full peer table are errors; the dial itself
+    /// happens after this returns.
+    pub fn connect(&self, addr: &str, permanent: bool) -> Result<(), String> {
+        let (reply, result) = mpsc::channel();
+        self.commands
+            .send(Command::RpcConnect {
+                addr: addr.to_string(),
+                // Resolve here on the caller's thread (dcrd's
+                // `addrStringToNetAddr` on the RPC goroutine); the loop
+                // reports the outcome in dcrd's check order.
+                resolved: addr_string_to_socket_addr(addr),
+                permanent,
+                reply,
+            })
+            .map_err(|_| STOPPED.to_string())?;
+        result.recv().map_err(|_| STOPPED.to_string())?
+    }
+
+    /// Remove the connection request so its peer is not redialed (dcrd
+    /// `connManager.Remove`); the peer's socket teardown is the
+    /// caller's, exactly like dcrd's `removeNode` disconnecting the
+    /// peer after the remove.
+    pub fn remove(&self, conn_req_id: u64) {
+        let _ = self.commands.send(Command::RpcRemove(conn_req_id));
+    }
+
+    /// Cancel the pending connection to the address (dcrd
+    /// `connManager.CancelPending`).
+    pub fn cancel_pending(&self, addr: &str) -> Result<(), String> {
+        let (reply, result) = mpsc::channel();
+        self.commands
+            .send(Command::RpcCancelPending {
+                addr: addr.to_string(),
+                reply,
+            })
+            .map_err(|_| STOPPED.to_string())?;
+        result.recv().map_err(|_| STOPPED.to_string())?
+    }
+}
+
+/// The pre-created command channel a driver runs on, so the control
+/// handle can be wired into consumers (the RPC connection manager)
+/// before the driver itself starts.
+pub struct OutboundChannel {
+    control: OutboundControl,
+    receiver: mpsc::Receiver<Command>,
+}
+
+impl OutboundChannel {
+    /// A control handle for this channel's driver.
+    pub fn control(&self) -> OutboundControl {
+        self.control.clone()
+    }
+}
+
+/// Create the command channel for a driver.
+pub fn outbound_channel() -> OutboundChannel {
+    let (commands, receiver) = mpsc::channel();
+    OutboundChannel {
+        control: OutboundControl { commands },
+        receiver,
+    }
 }
 
 /// The running outbound connection driver.  Dropping it (or calling
@@ -186,17 +298,58 @@ impl Drop for OutboundConnector {
     }
 }
 
-/// Start the outbound connection driver, dialing the configured
-/// permanent connections and keeping them up with the manager's retry
-/// backoff.
-pub fn start_outbound(cfg: OutboundConfig) -> OutboundConnector {
-    let (commands, receiver) = mpsc::channel();
+/// Start the outbound connection driver on the given channel, dialing
+/// the configured permanent connections and keeping them up with the
+/// manager's retry backoff.
+pub fn start_outbound(cfg: OutboundConfig, channel: OutboundChannel) -> OutboundConnector {
+    let commands = channel.control.commands;
+    let receiver = channel.receiver;
     let loop_commands = commands.clone();
     let thread = thread::spawn(move || run_event_loop(cfg, loop_commands, receiver));
     OutboundConnector {
         commands,
         thread: Some(thread),
     }
+}
+
+/// Resolve an address string to a socket address (dcrd
+/// `addrStringToNetAddr`, in its order): the host and port split with
+/// Go's `net.SplitHostPort` semantics, the host resolves first — an IP
+/// literal directly, a `.onion` host refused while Tor is unwired, any
+/// other host through the system resolver taking the first answer —
+/// and the port parses last, so a bad host surfaces its lookup error
+/// before a bad port like dcrd.  The one divergence: the port must fit
+/// sixteen bits here (a socket address cannot hold more), where dcrd
+/// carries any integer and only fails the eventual dial.  The daemon
+/// resolves its `--connect` peers through this at startup — where
+/// dcrd's `newServer` does, failing the start on an unresolvable
+/// address — so the manager's stored request addresses are always the
+/// resolved form the duplicate and cancel checks compare against.
+pub fn addr_string_to_socket_addr(addr: &str) -> Result<SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    let (host, port) = crate::gostd::split_host_port(addr)?;
+    let ip = if let Ok(ip) = host.parse::<IpAddr>() {
+        ip
+    } else if host.ends_with(".onion") {
+        // Tor addresses cannot be resolved to an IP; the Tor dial path
+        // is not wired, matching dcrd's answer when onion support is
+        // disabled.
+        return Err("tor has been disabled".to_string());
+    } else {
+        // The resolver only accepts host:port pairs; the port is not
+        // yet validated, so resolve with a placeholder and keep the
+        // first answer's IP (dcrd's `dcrdLookup(host)` taking ips[0]).
+        (host.as_str(), 0u16)
+            .to_socket_addrs()
+            .map_err(|e| e.to_string())?
+            .next()
+            .ok_or_else(|| format!("no addresses found for {host}"))?
+            .ip()
+    };
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("invalid port {port} in address {addr}"))?;
+    Ok(SocketAddr::new(ip, port))
 }
 
 /// Dial the address for a connection request, wrapping the established
@@ -258,6 +411,7 @@ fn run_event_loop(
     });
     let dial_timeout = cfg.dial_timeout;
     let dial_addr_manager = cfg.addr_manager.clone();
+    let max_peers = cfg.max_peers;
 
     let manager = ConnManager::new(Config {
         target_outbound: cfg.target_outbound,
@@ -293,9 +447,90 @@ fn run_event_loop(
             Command::PeerDone(id) => manager.disconnect(id),
             Command::RetryFire(id) => manager.retry_connect(id),
             Command::NewConnFire => manager.new_conn_req_now(),
+            Command::RpcConnect {
+                addr,
+                resolved,
+                permanent,
+                reply,
+            } => {
+                match rpc_connect_checks(&manager, &serve, max_peers, &addr, resolved) {
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                        continue;
+                    }
+                    Ok(resolved) => {
+                        // Reply before the dial so the RPC caller never
+                        // waits on it (dcrd's `go connManager.Connect`
+                        // after the synchronous checks).
+                        let _ = reply.send(Ok(()));
+                        let (_id, events) = manager.connect(resolved, permanent);
+                        events
+                    }
+                }
+            }
+            Command::RpcRemove(id) => manager.remove(id),
+            Command::RpcCancelPending { addr, reply } => {
+                let _ = reply.send(manager.cancel_pending(&addr));
+                continue;
+            }
         };
         handle_events(&mut manager, events, &serve, &commands);
     }
+}
+
+/// The synchronous half of dcrd `rpcConnManager.Connect`, in its check
+/// order: refuse a duplicate request, surface the (pre-computed)
+/// resolution outcome, and refuse to exceed the peer limit.  Returns
+/// the resolved dial address.
+fn rpc_connect_checks(
+    manager: &ConnManager<DialedConn>,
+    serve: &ServeState,
+    max_peers: usize,
+    addr: &str,
+    resolved: Result<SocketAddr, String>,
+) -> Result<ReqAddr, String> {
+    // Prevent duplicate connections to the same peer.  The comparison
+    // is against the request's stored dial string — the resolved
+    // address for RPC-added peers — matching dcrd comparing
+    // `c.Addr.String()` against the normalized input (so a hostname
+    // spelled differently from its stored resolution passes, exactly
+    // like dcrd).
+    manager.for_each_conn_req(|req| {
+        let Some(req_addr) = &req.addr else {
+            return Ok(());
+        };
+        if req_addr.addr == addr {
+            if req.permanent {
+                return Err("peer exists as a permanent peer".to_string());
+            }
+            match req.state {
+                dcroxide_connmgr::ConnState::Pending => {
+                    return Err("peer pending connection".to_string());
+                }
+                dcroxide_connmgr::ConnState::Established => {
+                    return Err("peer already connected".to_string());
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })?;
+
+    // The resolution ran on the RPC thread; its error surfaces after
+    // the duplicate check, in dcrd's order.
+    let resolved = resolved?;
+
+    // Limit max number of total peers (dcrd checks the peer-state count
+    // against `cfg.MaxPeers`).  The connected-peers registry tracks
+    // served connections in both directions from raw-socket serve time,
+    // slightly earlier than dcrd's post-handshake `peerState` — the
+    // same population the inbound admission cap counts, so the two
+    // limits stay coherent within the daemon.
+    if serve.connected.len() >= max_peers {
+        return Err("max peers reached".to_string());
+    }
+
+    Ok(ReqAddr::tcp(&resolved.to_string()))
 }
 
 /// Act on the manager's events: serve established connections, and turn
@@ -337,6 +572,10 @@ fn handle_events(
                             &serve.connected,
                             serve.server.clone(),
                             permanent,
+                            // The connection-request id rides with the
+                            // served peer so `node remove` can stop its
+                            // redial (dcrd's `serverPeer.connReq`).
+                            Some(id),
                         );
                         let _ = commands.send(Command::PeerDone(id));
                     });

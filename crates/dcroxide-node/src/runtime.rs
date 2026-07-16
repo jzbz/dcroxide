@@ -219,14 +219,18 @@ fn serve_inbound_peer(
     };
     let mut peer = Peer::new_inbound(template.config());
     peer.associate(&addr.to_string(), na, NodePeerEnv::new().now_nanos());
-    // An inbound peer is never a persistent (added) node.
-    serve_connection(stream, peer, addr, template, connected, server, false);
+    // An inbound peer is never a persistent (added) node and has no
+    // connection request.
+    serve_connection(stream, peer, addr, template, connected, server, false, None);
 }
 
 /// Build, associate, and run a single outbound peer to completion,
 /// keeping it in the connected-peers registry while it is served (the
 /// serving half of dcrd `outboundPeerConnected`).  Called by the
-/// connection manager driver once a dial has established the socket.
+/// connection manager driver once a dial has established the socket;
+/// `conn_req_id` is the manager's request id, carried with the peer so
+/// the manual-control RPCs can remove the request (dcrd's
+/// `serverPeer.connReq`).
 pub(crate) fn serve_outbound_peer(
     stream: TcpStream,
     addr: SocketAddr,
@@ -234,6 +238,7 @@ pub(crate) fn serve_outbound_peer(
     connected: &ConnectedPeers,
     server: Option<Arc<ServerContext>>,
     permanent: bool,
+    conn_req_id: Option<u64>,
 ) {
     let na = match net_address_from_socket(addr, template.services) {
         Ok(na) => na,
@@ -261,7 +266,16 @@ pub(crate) fn serve_outbound_peer(
         }
     });
 
-    serve_connection(stream, peer, addr, template, connected, server, permanent);
+    serve_connection(
+        stream,
+        peer,
+        addr,
+        template,
+        connected,
+        server,
+        permanent,
+        conn_req_id,
+    );
 }
 
 /// The address-manager group key for a wire net address.
@@ -282,6 +296,7 @@ fn serve_connection(
     connected: &ConnectedPeers,
     server: Option<Arc<ServerContext>>,
     permanent: bool,
+    conn_req_id: Option<u64>,
 ) {
     // Register a socket handle so a shutdown can interrupt this peer's
     // blocking read; a failed clone just leaves it unregistered.  The
@@ -305,6 +320,8 @@ fn serve_connection(
                 whitelisted,
                 stream.try_clone().ok(),
                 permanent,
+                conn_req_id,
+                addr.to_string(),
             ))
         }
         None => InboundHooks::NoOp,

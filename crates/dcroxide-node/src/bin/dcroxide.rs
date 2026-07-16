@@ -458,6 +458,12 @@ fn run(cfg: Config) -> ExitCode {
         miner_runtime = Some(runtime);
     }
 
+    // The outbound driver's command channel is created ahead of the RPC
+    // server so its control handle can back the manual peer-control
+    // RPCs (`addnode`, `node connect`/`remove`); the driver itself
+    // starts below with the other peer activity.
+    let outbound_channel = dcroxide_node::outbound::outbound_channel();
+
     // Serve the JSON-RPC endpoint (dcrd's RPC server): TLS over the
     // generated certificate pair by default, plain HTTP under the
     // localhost-validated --notls.  This runs before the peer-to-peer
@@ -571,6 +577,7 @@ fn run(cfg: Config) -> ExitCode {
             cpu_miner,
             Arc::clone(&addr_manager),
             request_shutdown,
+            outbound_channel.control(),
         ));
         // Install the websocket notification manager (dcrd's
         // wsNotificationManager) and start its delivery thread over
@@ -654,23 +661,42 @@ fn run(cfg: Config) -> ExitCode {
         ));
         None
     };
-    let connector = start_outbound(OutboundConfig {
-        template: template.clone(),
-        connected: connected.clone(),
-        server: Some(Arc::clone(&server)),
-        target_outbound: DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u32,
-        retry_duration: Duration::from_nanos(DEFAULT_RETRY_DURATION as u64),
-        dial_timeout: Duration::from_nanos(cfg.dial_timeout_nanos as u64),
-        permanent: cfg.connect_peers.clone(),
-        get_new_address,
-        // Record dial attempts against the address manager off simnet and
-        // regnet, matching where dcrd installs attemptDcrdDial.
-        addr_manager: if !cfg.sim_net && !cfg.reg_net {
-            Some(Arc::clone(&addr_manager))
-        } else {
-            None
+    // Resolve the permanent peers up front (dcrd `newServer` running
+    // each through `addrStringToNetAddr`, failing the start on an
+    // unresolvable address), so the manager's stored request addresses
+    // are the resolved form the duplicate-connect and cancel-pending
+    // checks compare against.
+    let mut permanent = Vec::with_capacity(cfg.connect_peers.len());
+    for addr in &cfg.connect_peers {
+        match dcroxide_node::outbound::addr_string_to_socket_addr(addr) {
+            Ok(resolved) => permanent.push(resolved.to_string()),
+            Err(e) => {
+                log_info(&format!("Unable to resolve connect peer {addr}: {e}"));
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let connector = start_outbound(
+        OutboundConfig {
+            template: template.clone(),
+            connected: connected.clone(),
+            server: Some(Arc::clone(&server)),
+            target_outbound: DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u32,
+            max_peers: cfg.max_peers.max(0) as usize,
+            retry_duration: Duration::from_nanos(DEFAULT_RETRY_DURATION as u64),
+            dial_timeout: Duration::from_nanos(cfg.dial_timeout_nanos as u64),
+            permanent,
+            get_new_address,
+            // Record dial attempts against the address manager off simnet and
+            // regnet, matching where dcrd installs attemptDcrdDial.
+            addr_manager: if !cfg.sim_net && !cfg.reg_net {
+                Some(Arc::clone(&addr_manager))
+            } else {
+                None
+            },
         },
-    });
+        outbound_channel,
+    );
     // Query the network seeders to bootstrap the address manager (dcrd
     // `Run` launching `querySeeders` when seeding is enabled).
     let seeder_boot = if cfg.disable_seeders {
@@ -940,6 +966,7 @@ fn rpc_config(
     cpu_miner: Box<dyn dcroxide_rpc::server::RpcCpuMiner + Send>,
     addr_manager: Arc<Mutex<AddrManager>>,
     request_shutdown: Box<dyn FnMut() + Send>,
+    outbound_control: dcroxide_node::outbound::OutboundControl,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
     // The version 2 filter source shares the live chain (cloned before it
@@ -960,13 +987,15 @@ fn rpc_config(
             Arc::clone(&tx_pool),
         )),
         conn_mgr: Box::new(
-            dcroxide_node::rpcrun::NodeRpcConnManager::new(connected, net_totals).with_relay(
-                sync_peers,
-                recently_advertised,
-                Arc::clone(&tx_pool),
-                rebroadcast,
-                ntfn.clone(),
-            ),
+            dcroxide_node::rpcrun::NodeRpcConnManager::new(connected, net_totals)
+                .with_relay(
+                    sync_peers,
+                    recently_advertised,
+                    Arc::clone(&tx_pool),
+                    rebroadcast,
+                    ntfn.clone(),
+                )
+                .with_outbound(outbound_control),
         ),
         tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(tx_pool)),
         clock: Box::new(dcroxide_node::rpcrun::SystemClock),

@@ -885,6 +885,8 @@ mod tests {
                 ))),
                 None,
                 false,
+                None,
+                None,
             );
             let handler = ChainNtfnHandler::new(
                 None,
@@ -977,6 +979,8 @@ mod tests {
             ))),
             None,
             false,
+            None,
+            None,
         );
         // Unsynced mining allowed so the accepted announcement clears the
         // is-current gate over the stale genesis tip.
