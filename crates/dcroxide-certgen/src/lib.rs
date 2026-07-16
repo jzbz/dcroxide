@@ -16,6 +16,7 @@
 
 mod certgen;
 mod der;
+pub mod gentool;
 mod pem;
 mod x509;
 

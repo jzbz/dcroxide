@@ -589,7 +589,7 @@ fn split_int_prefix(s: &str, allow_sign: bool) -> Result<(bool, String, u32), ()
 
 /// Parse a signed integer like Go's `strconv.ParseInt(s, 0, bits)`,
 /// with the `NumError` texts.
-pub(crate) fn go_parse_int(s: &str, bits: u32) -> Result<i64, String> {
+pub fn go_parse_int(s: &str, bits: u32) -> Result<i64, String> {
     let syntax = || num_error("ParseInt", s, "invalid syntax");
     let range = || num_error("ParseInt", s, "value out of range");
     if s.is_empty() {

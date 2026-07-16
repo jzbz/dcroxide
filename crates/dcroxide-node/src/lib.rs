@@ -51,7 +51,7 @@ pub use config::{
     validate_profile_addr,
 };
 pub use flags::{OPTIONS, OptKind, OptSpec};
-pub use gostd::{go_duration_string, parse_go_duration};
+pub use gostd::{go_duration_string, go_parse_int, parse_go_duration};
 pub use ipc::{LifetimeAction, LifetimeEventId, PipeMessage};
 pub use logsubsys::{LogLevel, LogLevels, parse_and_set_debug_levels, supported_subsystems};
 pub use params::{ActiveNet, NodeParams};

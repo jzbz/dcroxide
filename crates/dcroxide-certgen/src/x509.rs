@@ -16,25 +16,34 @@ pub enum SigAlg {
     Ed25519,
     /// ECDSA with SHA-256 over P-256.
     EcdsaP256,
+    /// ECDSA with SHA-384 over P-384 (the gencerts tool's `P-384`).
+    EcdsaP384,
     /// ECDSA with SHA-512 over P-521.
     EcdsaP521,
+    /// PKCS#1 v1.5 RSA with SHA-256 (the gencerts tool's `RSA4096`).
+    RsaSha256,
 }
 
 impl SigAlg {
     /// The AlgorithmIdentifier for the signature.
-    fn signature_algorithm(&self) -> Vec<u8> {
+    pub(crate) fn signature_algorithm(&self) -> Vec<u8> {
         let oid = match self {
             SigAlg::Ed25519 => der::oid(&[1, 3, 101, 112]),
             SigAlg::EcdsaP256 => der::oid(&[1, 2, 840, 10045, 4, 3, 2]),
+            SigAlg::EcdsaP384 => der::oid(&[1, 2, 840, 10045, 4, 3, 3]),
             SigAlg::EcdsaP521 => der::oid(&[1, 2, 840, 10045, 4, 3, 4]),
+            SigAlg::RsaSha256 => der::oid(&[1, 2, 840, 113549, 1, 1, 11]),
         };
-        // Go omits the parameters for both Ed25519 and ECDSA
-        // signature algorithms.
-        der::sequence(&oid)
+        // Go omits the parameters for Ed25519 and ECDSA signature
+        // algorithms and emits an explicit NULL for RSA.
+        match self {
+            SigAlg::RsaSha256 => der::sequence(&[oid, der::null()].concat()),
+            _ => der::sequence(&oid),
+        }
     }
 
     /// The SubjectPublicKeyInfo AlgorithmIdentifier.
-    fn spki_algorithm(&self) -> Vec<u8> {
+    pub(crate) fn spki_algorithm(&self) -> Vec<u8> {
         match self {
             SigAlg::Ed25519 => der::sequence(&der::oid(&[1, 3, 101, 112])),
             SigAlg::EcdsaP256 => {
@@ -42,10 +51,18 @@ impl SigAlg {
                 inner.extend_from_slice(&der::oid(&[1, 2, 840, 10045, 3, 1, 7]));
                 der::sequence(&inner)
             }
+            SigAlg::EcdsaP384 => {
+                let mut inner = der::oid(&[1, 2, 840, 10045, 2, 1]);
+                inner.extend_from_slice(&der::oid(&[1, 3, 132, 0, 34]));
+                der::sequence(&inner)
+            }
             SigAlg::EcdsaP521 => {
                 let mut inner = der::oid(&[1, 2, 840, 10045, 2, 1]);
                 inner.extend_from_slice(&der::oid(&[1, 3, 132, 0, 35]));
                 der::sequence(&inner)
+            }
+            SigAlg::RsaSha256 => {
+                der::sequence(&[der::oid(&[1, 2, 840, 113549, 1, 1, 1]), der::null()].concat())
             }
         }
     }

@@ -604,9 +604,12 @@ pub fn find_long(name: &str) -> Option<&'static OptSpec> {
     find_long_in(&OPTIONS, name)
 }
 
-/// Find an option by its long name in the given registry.
+/// Find an option by its long name in the given registry
+/// (short-only options carry an empty long name and never match).
 fn find_long_in(registry: &'static [OptSpec], name: &str) -> Option<&'static OptSpec> {
-    registry.iter().find(|o| o.long == name)
+    registry
+        .iter()
+        .find(|o| !o.long.is_empty() && o.long == name)
 }
 
 /// Find an option by its short name.
@@ -640,6 +643,7 @@ fn find_ini_name(name: &str) -> Option<&'static OptSpec> {
 /// messages: `-u, --rpcuser` or `--maxpeers`.
 fn opt_display(spec: &OptSpec) -> String {
     match spec.short {
+        Some(short) if spec.long.is_empty() => format!("-{short}"),
         Some(short) => format!("-{short}, --{}", spec.long),
         None => format!("--{}", spec.long),
     }
@@ -660,7 +664,7 @@ pub(crate) fn set_option(
 
 /// A parse error from the scanner with go-flags' exact texts; the
 /// unknown-flag case is distinguished for `IgnoreUnknown`.
-pub(crate) enum ScanError {
+pub enum ScanError {
     /// An unknown option name.
     UnknownFlag(String),
     /// Any other parse failure.
@@ -668,7 +672,8 @@ pub(crate) enum ScanError {
 }
 
 impl ScanError {
-    pub(crate) fn message(self) -> String {
+    /// The go-flags error text for this failure.
+    pub fn message(self) -> String {
         match self {
             ScanError::UnknownFlag(name) => format!("unknown flag `{name}'"),
             ScanError::Other(msg) => msg,
@@ -678,7 +683,7 @@ impl ScanError {
 
 /// The parser mode differences `loadConfig`'s three parses exhibit.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScanMode {
+pub enum ScanMode {
     /// The help pre-parse: unknown options are ignored, `--` is not
     /// special, and errors abort silently.
     IgnoreUnknown,
@@ -789,7 +794,7 @@ fn marshal_error(spec: &OptSpec, err: &str) -> String {
 }
 
 /// The scanner state over the argument list.
-pub(crate) struct ScanState<'a> {
+pub struct ScanState<'a> {
     args: &'a [String],
     pos: usize,
     mode: ScanMode,
@@ -840,7 +845,7 @@ pub(crate) fn scan_args<'a>(
 /// daemon and the tool binaries (each of dcrd's commands builds its
 /// own go-flags parser over its own config struct, all with the same
 /// scanning semantics).
-pub(crate) fn scan_args_in<'a>(
+pub fn scan_args_in<'a>(
     registry: &'static [OptSpec],
     store: &mut StoreFn<'_>,
     args: &'a [String],

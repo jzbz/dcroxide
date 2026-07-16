@@ -171,3 +171,140 @@ fn promptsecret_flag_exits() {
         "stderr: {stderr}"
     );
 }
+
+fn run_gencerts(args: &[&str]) -> (String, String, i32) {
+    let out = Command::new(env!("CARGO_BIN_EXE_gencerts"))
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run gencerts binary");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// gencerts' exits: help exits 0, a wrong argument count prints the
+/// help to stderr and exits 2, an unknown algorithm exits 2 with its
+/// quoted name, and pairing -C without -K is a fatal exit 1.
+#[test]
+fn gencerts_cli_exits() {
+    let (stdout, _, code) = run_gencerts(&["--help"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("Usage:"), "stdout: {stdout}");
+
+    let (_, stderr, code) = run_gencerts(&["only-one-arg"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("Usage:"), "stderr: {stderr}");
+
+    let (_, stderr, code) = run_gencerts(&["-a", "DSA", "cert.pem", "key.pem"]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.contains("unknown algorithm \"DSA\""),
+        "stderr: {stderr}"
+    );
+
+    let (_, stderr, code) = run_gencerts(&["-C", "ca.pem", "cert.pem", "key.pem"]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("-C and -K must be used together"),
+        "stderr: {stderr}"
+    );
+}
+
+/// The full flow over the built binary: generate a signing authority
+/// with -L, issue a localhost leaf from it, refuse to overwrite
+/// without -f, and prove the chain works by completing a rustls
+/// handshake with the CA as the trust root.
+#[test]
+fn gencerts_authority_issues_a_working_tls_chain() {
+    use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+
+    // The tests pick the ring provider explicitly (the daemon installs
+    // it at startup).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = scratch("gencerts");
+    let ca_cert = dir.join("ca.pem").to_string_lossy().into_owned();
+    let ca_key = dir.join("ca.key").to_string_lossy().into_owned();
+    let leaf_cert = dir.join("leaf.pem").to_string_lossy().into_owned();
+    let leaf_key = dir.join("leaf.key").to_string_lossy().into_owned();
+
+    // The authority (with -S so it can issue).
+    let (_, stderr, code) = run_gencerts(&["-S", "-L", "-o", "test-ca", &ca_cert, &ca_key]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    // Overwrite refusal without -f, with dcrd's quoted text.
+    let (_, stderr, code) = run_gencerts(&["-S", "-L", &ca_cert, &ca_key]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains(&format!("certificate file \"{ca_cert}\" already exists")),
+        "stderr: {stderr}"
+    );
+
+    // The issued localhost leaf.
+    let (_, stderr, code) = run_gencerts(&[
+        "-C",
+        &ca_cert,
+        "-K",
+        &ca_key,
+        "-L",
+        "-o",
+        "test-leaf",
+        &leaf_cert,
+        &leaf_key,
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    // A rustls handshake: server presents the leaf, the client trusts
+    // only the CA and requires the localhost name.
+    use rustls::pki_types::pem::PemObject;
+    let load_certs = |path: &str| -> Vec<rustls::pki_types::CertificateDer<'static>> {
+        let pem = std::fs::read(path).expect("read pem");
+        rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse certs")
+    };
+    let leaf_chain = load_certs(&leaf_cert);
+    let key_pem = std::fs::read(&leaf_key).expect("read key");
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem).expect("parse key");
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in load_certs(&ca_cert) {
+        roots.add(cert).expect("trust the generated CA");
+    }
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(leaf_chain, key)
+        .expect("server config over the issued pair");
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let conn = rustls::ServerConnection::new(Arc::new(server_config)).expect("server conn");
+        let mut tls = rustls::StreamOwned::new(conn, stream);
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).expect("read over tls");
+        tls.write_all(b"pong").expect("write over tls");
+        buf
+    });
+
+    let stream = std::net::TcpStream::connect(addr).expect("connect");
+    let name = rustls::pki_types::ServerName::try_from("localhost").expect("name");
+    let conn = rustls::ClientConnection::new(Arc::new(client_config), name).expect("client conn");
+    let mut tls = rustls::StreamOwned::new(conn, stream);
+    tls.write_all(b"ping").expect("write over tls");
+    let mut reply = [0u8; 4];
+    tls.read_exact(&mut reply).expect("read over tls");
+    assert_eq!(&reply, b"pong", "the chain must satisfy the handshake");
+    assert_eq!(&server.join().expect("server thread"), b"ping");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

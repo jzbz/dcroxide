@@ -20,6 +20,10 @@ path = "src/bin/addblock.rs"
 name = "promptsecret"
 path = "src/bin/promptsecret.rs"
 
+[[bin]]
+name = "gencerts"
+path = "src/bin/gencerts.rs"
+
 [dependencies]
 ctrlc = { version = "3", features = ["termination"] }
 getrandom = "0.3"

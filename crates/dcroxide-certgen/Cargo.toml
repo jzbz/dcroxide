@@ -10,9 +10,12 @@ repository.workspace = true
 
 [dependencies]
 dcroxide-dcrec = { path = "../dcroxide-dcrec" }
+getrandom = "0.3"
 idna = "1"
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "sha256", "std"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "sha384", "std"] }
 p521 = { version = "0.13", default-features = false, features = ["ecdsa", "sha512", "getrandom", "std"] }
+rsa = { version = "0.9", features = ["sha2"] }
 sha1 = "0.10"
 
 [dev-dependencies]
