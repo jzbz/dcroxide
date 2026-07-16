@@ -376,3 +376,73 @@ fn for_each_conn_req() {
         .expect_err("propagates");
     assert_eq!(err, "stop");
 }
+
+// Deferred dials (dcrd's actual structure: `Connect` dials on its own
+// goroutine and the connHandler only processes the outcomes): the
+// manager emits Dial events instead of calling a dial closure, and the
+// driver reports each result through `dial_outcome`.
+#[test]
+fn deferred_dials_split_request_and_outcome() {
+    // No dial closure is required in deferred mode.
+    let cfg = Config::<MockConn> {
+        deferred_dials: true,
+        ..Config::default()
+    };
+    let mut cm = ConnManager::new(cfg).unwrap();
+
+    // A connect registers the request pending and asks for a dial.
+    let (id, events) = cm.connect(ReqAddr::tcp("127.0.0.1:18555"), true);
+    assert_eq!(events, vec![Event::Dial { id }]);
+    assert_eq!(cm.conn_req(id).unwrap().state, ConnState::Pending);
+
+    // A successful outcome establishes the connection (dcrd
+    // `handleConnected`).
+    let events = cm.dial_outcome(id, Ok(MockConn::default()));
+    assert_eq!(events, vec![Event::Connected { id }]);
+    assert_eq!(cm.conn_req(id).unwrap().state, ConnState::Established);
+    assert_eq!(cm.conn_count(), 1);
+
+    // A failed permanent dial schedules a retry (dcrd `handleFailed`),
+    // and the retry firing asks for another dial.
+    let (id2, events) = cm.connect(ReqAddr::tcp("127.0.0.1:18556"), true);
+    assert_eq!(events, vec![Event::Dial { id: id2 }]);
+    let events = cm.dial_outcome(id2, Err("connection refused".to_string()));
+    assert_eq!(
+        events,
+        vec![Event::ScheduleRetry {
+            id: id2,
+            delay_nanos: DEFAULT_RETRY_DURATION,
+        }]
+    );
+    let events = cm.retry_connect(id2);
+    assert_eq!(events, vec![Event::Dial { id: id2 }]);
+}
+
+// A request canceled while its deferred dial is in flight closes the
+// late connection and ignores it (dcrd `handleConnected`'s pending
+// check), and a late failure is likewise ignored.
+#[test]
+fn deferred_dial_outcome_after_cancel_is_ignored() {
+    let cfg = Config::<MockConn> {
+        deferred_dials: true,
+        ..Config::default()
+    };
+    let mut cm = ConnManager::new(cfg).unwrap();
+    let (id, events) = cm.connect(ReqAddr::tcp("127.0.0.1:18555"), true);
+    assert_eq!(events, vec![Event::Dial { id }]);
+    cm.cancel_pending("127.0.0.1:18555").unwrap();
+    assert_eq!(cm.conn_req(id).unwrap().state, ConnState::Canceled);
+
+    let conn = MockConn::default();
+    let state = Rc::clone(&conn.0);
+    assert!(
+        cm.dial_outcome(id, Ok(conn)).is_empty(),
+        "a late success for a canceled request is ignored"
+    );
+    assert_eq!(state.borrow().closed, 1, "the late connection is closed");
+    assert_eq!(cm.conn_count(), 0);
+    assert!(
+        cm.dial_outcome(id, Err("refused".to_string())).is_empty(),
+        "a late failure for a canceled request is ignored"
+    );
+}

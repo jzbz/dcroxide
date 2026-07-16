@@ -6,13 +6,17 @@
 //! The connection manager itself is synchronous: it returns [`Event`]s
 //! describing dials to make, retries to schedule, and connections that
 //! came up or went down.  This driver runs it on a dedicated thread,
-//! turning the scheduling events into timer threads and the connection
-//! events into served outbound peers, and feeding the results back in.
-//! A dialed socket rides inside the manager's connection handle so the
-//! `Connected` event can hand it to [`serve_outbound_peer`], which runs
-//! it through the same server dispatch as an inbound peer (dcrd's
-//! `serverPeer` serves both directions), registering it with the sync
-//! manager so the daemon syncs from the peers it dials.
+//! turning the dial events into per-request dialer threads (dcrd's
+//! `Connect` goroutines, reporting back through the manager's
+//! `dial_outcome`), the scheduling events into timer threads, and the
+//! connection events into served outbound peers, feeding every result
+//! back in — so the event loop, and the RPC control commands riding it,
+//! never block on a dial.  A dialed socket rides inside the manager's
+//! connection handle so the `Connected` event can hand it to
+//! [`serve_outbound_peer`], which runs it through the same server
+//! dispatch as an inbound peer (dcrd's `serverPeer` serves both
+//! directions), registering it with the sync manager so the daemon
+//! syncs from the peers it dials.
 //!
 //! The driver opens the permanent connections requested with
 //! `--connect` and fills the remaining outbound slots from the address
@@ -141,11 +145,18 @@ fn now_nanos() -> i64 {
         .unwrap_or(0)
 }
 
-/// The state the connection events need to serve a dialed peer.
+/// The state the connection events need to serve a dialed peer and to
+/// run the deferred dials off the event thread.
 struct ServeState {
     template: PeerTemplate,
     connected: ConnectedPeers,
     server: Option<Arc<ServerContext>>,
+    /// How long each dial may take (dcrd `Timeout` wrapping the dial
+    /// context).
+    dial_timeout: Duration,
+    /// The address manager each dial records an attempt against (dcrd
+    /// `attemptDcrdDial`); `None` on simnet and regnet.
+    addr_manager: Option<Arc<Mutex<AddrManager>>>,
 }
 
 /// A command the driver's event loop processes.
@@ -157,17 +168,20 @@ enum Command {
     RetryFire(u64),
     /// A scheduled new-connection timer fired.
     NewConnFire,
+    /// A deferred dial finished on its dialer thread (dcrd's `Connect`
+    /// goroutine messaging `handleConnected`/`handleFailed`); the
+    /// manager processes the outcome without ever having blocked on
+    /// the dial.
+    DialDone(u64, Result<DialedConn, String>),
     /// An RPC-requested outbound connection (dcrd
     /// `rpcConnManager.Connect`): the loop runs the duplicate and
     /// max-peers checks over its state, replies with their result, and
-    /// only then dials — so the RPC never waits on its own dial (dcrd's
-    /// `go connManager.Connect`), though like every command it can
-    /// queue behind an in-flight dial (the PARITY-documented
-    /// synchronous-dial divergence).  The address is resolved by the
-    /// sender on the RPC thread — where dcrd's `addrStringToNetAddr`
-    /// runs — so a slow resolver never stalls the dial scheduling; the
-    /// pre-computed result is unwrapped after the duplicate check to
-    /// keep dcrd's error precedence.
+    /// hands the dial to a dialer thread — so the RPC never waits on a
+    /// dial (dcrd's `go connManager.Connect`).  The address is resolved
+    /// by the sender on the RPC thread — where dcrd's
+    /// `addrStringToNetAddr` runs — so a slow resolver never stalls the
+    /// dial scheduling; the pre-computed result is unwrapped after the
+    /// duplicate check to keep dcrd's error precedence.
     RpcConnect {
         addr: String,
         resolved: Result<SocketAddr, String>,
@@ -408,17 +422,19 @@ fn run_event_loop(
         template: cfg.template,
         connected: cfg.connected,
         server: cfg.server,
+        dial_timeout: cfg.dial_timeout,
+        addr_manager: cfg.addr_manager.clone(),
     });
-    let dial_timeout = cfg.dial_timeout;
-    let dial_addr_manager = cfg.addr_manager.clone();
     let max_peers = cfg.max_peers;
 
     let manager = ConnManager::new(Config {
         target_outbound: cfg.target_outbound,
         retry_duration_nanos: cfg.retry_duration.as_nanos() as i64,
-        dial: Some(Box::new(move |req: &ReqAddr| {
-            dial(req, dial_timeout, dial_addr_manager.as_ref())
-        })),
+        // Dials are deferred to per-request dialer threads (dcrd's
+        // `Connect` goroutines), so the event loop never blocks on one
+        // and the scheduling — and the RPC control commands — stay
+        // responsive while dials are in flight.
+        deferred_dials: true,
         get_new_address: cfg
             .get_new_address
             // Re-box to drop the Send bound the driver thread needed.
@@ -447,6 +463,7 @@ fn run_event_loop(
             Command::PeerDone(id) => manager.disconnect(id),
             Command::RetryFire(id) => manager.retry_connect(id),
             Command::NewConnFire => manager.new_conn_req_now(),
+            Command::DialDone(id, outcome) => manager.dial_outcome(id, outcome),
             Command::RpcConnect {
                 addr,
                 resolved,
@@ -543,6 +560,19 @@ fn handle_events(
 ) {
     for event in events {
         match event {
+            // A deferred dial: run it on its own thread (dcrd's
+            // `Connect` goroutine) and report the outcome back as a
+            // command, so the event loop never blocks on a dial.
+            Event::Dial { id } => {
+                let addr = manager.conn_req(id).and_then(|req| req.addr.clone());
+                let Some(addr) = addr else { continue };
+                let serve = Arc::clone(serve);
+                let commands = commands.clone();
+                thread::spawn(move || {
+                    let outcome = dial(&addr, serve.dial_timeout, serve.addr_manager.as_ref());
+                    let _ = commands.send(Command::DialDone(id, outcome));
+                });
+            }
             Event::Connected { id } => {
                 // Take the dialed stream out of the request and serve it
                 // on its own thread, reporting back when it ends.

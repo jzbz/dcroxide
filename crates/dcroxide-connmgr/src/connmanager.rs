@@ -100,6 +100,16 @@ impl<C> ConnReq<C> {
 /// invocations and timer arms that dcrd performs with goroutines.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
+    /// Dial the identified request's address and report the result
+    /// through [`ConnManager::dial_outcome`] (only under
+    /// [`Config::deferred_dials`]).  dcrd's `Connect` performs this
+    /// dial on its own goroutine before messaging the `connHandler`,
+    /// so the driver should dial off its event thread.  The address is
+    /// available through [`ConnManager::conn_req`].
+    Dial {
+        /// The connection request id.
+        id: u64,
+    },
     /// A new outbound connection was established; dcrd fires the
     /// `OnConnection` callback.  The connection handle is available
     /// through [`ConnManager::conn_req`].
@@ -163,6 +173,15 @@ pub struct Config<C> {
     /// up, in nanoseconds; applied by the caller-provided dialer
     /// (dcrd wraps the dial context).
     pub timeout_nanos: i64,
+    /// Defer dials to the driver instead of calling a dial closure
+    /// inline: each dial request surfaces as [`Event::Dial`] and the
+    /// driver reports back through [`ConnManager::dial_outcome`].  This
+    /// is dcrd's actual structure — `Connect` dials on its own
+    /// goroutine and the `connHandler` only processes the
+    /// `handleConnected`/`handleFailed` outcomes — so the manager's
+    /// state machine never blocks on a dial.  When set, `dial` and
+    /// `dial_addr` are unused and may be `None`.
+    pub deferred_dials: bool,
 }
 
 impl<C> Default for Config<C> {
@@ -174,6 +193,7 @@ impl<C> Default for Config<C> {
             dial: None,
             dial_addr: None,
             timeout_nanos: 0,
+            deferred_dials: false,
         }
     }
 }
@@ -193,7 +213,10 @@ impl<C: Conn> ConnManager<C> {
     /// `New`), applying the retry duration and target outbound
     /// defaults.
     pub fn new(mut cfg: Config<C>) -> Result<ConnManager<C>, ConnmgrError> {
-        if cfg.dial.is_none() && cfg.dial_addr.is_none() {
+        // A deferred-dial manager never calls a dial closure, so none is
+        // required (the driver dials on [`Event::Dial`] and reports back
+        // through `dial_outcome`).
+        if !cfg.deferred_dials && cfg.dial.is_none() && cfg.dial_addr.is_none() {
             return Err(make_error(ErrorKind::DialNil, "dial cannot be nil"));
         }
         if cfg.dial.is_some() && cfg.dial_addr.is_some() {
@@ -330,12 +353,19 @@ impl<C: Conn> ConnManager<C> {
 
     /// Dial a registered request and process the outcome (the dial
     /// plus `handleConnected`/`handleFailed` halves of dcrd's
-    /// `Connect`).
+    /// `Connect`).  Under deferred dials the request surfaces as an
+    /// [`Event::Dial`] instead, and the driver reports the outcome
+    /// through [`ConnManager::dial_outcome`] — dcrd's `Connect`
+    /// goroutine dialing and then messaging the `connHandler`.
     fn dial_registered(&mut self, id: u64, events: &mut Vec<Event>) {
         let addr = match self.reqs.get(&id).and_then(|r| r.addr.clone()) {
             Some(addr) => addr,
             None => return,
         };
+        if self.cfg.deferred_dials {
+            events.push(Event::Dial { id });
+            return;
+        }
         let dial = self
             .cfg
             .dial
@@ -346,6 +376,21 @@ impl<C: Conn> ConnManager<C> {
             Ok(conn) => self.handle_connected(id, conn, events),
             Err(err) => self.handle_failed(id, &err, events),
         }
+    }
+
+    /// Report the outcome of a deferred dial (dcrd's `Connect`
+    /// goroutine messaging `handleConnected` on success or
+    /// `handleFailed` on error).  A request canceled or removed while
+    /// the dial was in flight closes a successful connection and
+    /// ignores a failure, exactly like dcrd's handlers checking the
+    /// pending set.
+    pub fn dial_outcome(&mut self, id: u64, outcome: Result<C, String>) -> Vec<Event> {
+        let mut events = Vec::new();
+        match outcome {
+            Ok(conn) => self.handle_connected(id, conn, &mut events),
+            Err(err) => self.handle_failed(id, &err, &mut events),
+        }
+        events
     }
 
     /// dcrd `handleConnected`.
