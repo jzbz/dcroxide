@@ -28,6 +28,22 @@ use dcroxide_testutil::unhex;
 use dcroxide_wire::{MsgBlock, OutPoint};
 use tempfile::TempDir;
 
+/// Read the persisted utxo set state marker straight off the database.
+fn read_set_state(chain: &Chain) -> dcroxide_blockchain::UtxoSetState {
+    let mut state = None;
+    chain
+        .db
+        .as_ref()
+        .expect("db")
+        .view(|tx| {
+            state = dcroxide_blockchain::chaindb::db_fetch_utxo_set_state(tx)
+                .expect("read utxo set state");
+            Ok(())
+        })
+        .expect("view");
+    state.expect("a utxo set state marker")
+}
+
 fn parse_hash(s: &str) -> Hash {
     let bytes = unhex(s);
     let mut h = [0u8; 32];
@@ -228,6 +244,26 @@ fn persistence_vectors() {
     }
     assert_eq!(counts, [12, 19, 4], "row counts");
 
+    // Every reorg's disconnects flushed the cache with the new tip of
+    // each step recorded ATOMICALLY alongside the entry writes (dcrd's
+    // backend `PutUtxos`), so the persisted marker has moved off its
+    // initial value and sits on the main chain (the fork point of the
+    // last reorganization; connects do not flush).
+    let mid_state = read_set_state(&chain);
+    assert_ne!(
+        mid_state.last_flush_hash, params.genesis_hash,
+        "the disconnect flushes must have recorded a utxo set state"
+    );
+    let marker = chain
+        .index
+        .lookup_node(&mid_state.last_flush_hash)
+        .expect("the marker block is known");
+    let tip = chain.best_chain.tip().expect("tip");
+    assert!(
+        marker == tip || chain.store.is_ancestor_of(marker, tip),
+        "the flush marker must sit on the main chain"
+    );
+
     // Snapshot the pre-restart observables.
     let statuses_of = |chain: &Chain| -> Vec<String> {
         known_blocks
@@ -261,6 +297,18 @@ fn persistence_vectors() {
     // Flush, restart, and verify the final section against the
     // reopened chain along with the deeper observables.
     chain.flush(&params).expect("flush");
+    // The shutdown flush lands the utxo set state and the best state
+    // in the same transaction as the entries: both markers now agree
+    // on the tip.
+    let flushed_state = read_set_state(&chain);
+    assert_eq!(
+        flushed_state.last_flush_hash, pre_tip,
+        "flushed marker hash"
+    );
+    assert_eq!(
+        flushed_state.last_flush_height, chain.state_snapshot.height as u32,
+        "flushed marker height"
+    );
     chain = reopen(chain, &opts, &params, &known_blocks);
     for row in &section {
         let rf: Vec<&str> = row.split(' ').collect();
