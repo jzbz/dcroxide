@@ -356,6 +356,9 @@ struct BuildCtx {
     mining_addrs: Vec<Address>,
     mining_time_offset: i64,
     allow_unsynced_mining: bool,
+    /// The netsync is-current gate (dcrd wires `IsCurrent:
+    /// s.syncManager.IsCurrent` into the generator's config).
+    sync_gate: crate::sync::SyncGate,
     current: Arc<Mutex<SharedTemplate>>,
     subscribers: Arc<Mutex<SubscriberRegistry>>,
     ntfn: Option<NodeNtfnMgr>,
@@ -454,12 +457,7 @@ fn drain_and_build(
     );
     let built = g.template.clone();
     let now = now_unix();
-    let is_current = ctx.allow_unsynced_mining
-        || ctx
-            .chain
-            .lock()
-            .expect("chain mutex poisoned")
-            .is_current_at(now);
+    let is_current = ctx.allow_unsynced_mining || ctx.sync_gate.is_current(&ctx.chain, now);
     {
         let mut chain = NodeTemplateChain::new(Arc::clone(&ctx.chain), ctx.params.clone());
         let tx_source = NodeTemplateTxSource::new(Arc::clone(&ctx.pool));
@@ -504,12 +502,7 @@ fn process_event(
     event: &OwnedRegenEvent,
 ) {
     let now = now_unix();
-    let is_current = ctx.allow_unsynced_mining
-        || ctx
-            .chain
-            .lock()
-            .expect("chain mutex poisoned")
-            .is_current_at(now);
+    let is_current = ctx.allow_unsynced_mining || ctx.sync_gate.is_current(&ctx.chain, now);
     {
         let mut chain = NodeTemplateChain::new(Arc::clone(&ctx.chain), ctx.params.clone());
         let tx_source = NodeTemplateTxSource::new(Arc::clone(&ctx.pool));
@@ -543,12 +536,7 @@ fn process_force_regen(
     deadlines: &mut TimerDeadlines,
 ) {
     let now = now_unix();
-    let is_current = ctx.allow_unsynced_mining
-        || ctx
-            .chain
-            .lock()
-            .expect("chain mutex poisoned")
-            .is_current_at(now);
+    let is_current = ctx.allow_unsynced_mining || ctx.sync_gate.is_current(&ctx.chain, now);
     {
         let mut chain = NodeTemplateChain::new(Arc::clone(&ctx.chain), ctx.params.clone());
         let tx_source = NodeTemplateTxSource::new(Arc::clone(&ctx.pool));
@@ -683,6 +671,7 @@ pub fn start_generator(
     policy: MiningPolicy,
     mining_time_offset: i64,
     allow_unsynced_mining: bool,
+    sync_gate: crate::sync::SyncGate,
     ntfn: Option<NodeNtfnMgr>,
     drain_hook: Option<Box<dyn Fn() + Send>>,
 ) -> Generator {
@@ -708,6 +697,7 @@ pub fn start_generator(
             mining_addrs,
             mining_time_offset,
             allow_unsynced_mining,
+            sync_gate,
             current: thread_current,
             subscribers: thread_subscribers,
             ntfn,
@@ -719,12 +709,7 @@ pub fn start_generator(
         if !allow_unsynced_mining {
             loop {
                 let now = now_unix();
-                if ctx
-                    .chain
-                    .lock()
-                    .expect("chain mutex poisoned")
-                    .is_current_at(now)
-                {
+                if ctx.sync_gate.is_current(&ctx.chain, now) {
                     break;
                 }
                 match receiver.recv_timeout(Duration::from_secs(1)) {

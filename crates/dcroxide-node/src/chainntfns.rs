@@ -43,6 +43,10 @@ const MAX_REORG_DEPTH_NOTIFY: i64 = 6;
 /// handler consults).  Clones share the same state.
 #[derive(Clone)]
 pub struct ChainNtfnHandler {
+    /// The netsync is-current gate the relay and estimator-enable
+    /// paths consult (dcrd gates the NTBlockAccepted case on
+    /// `s.syncManager.IsCurrent()`).
+    sync_gate: crate::sync::SyncGate,
     /// The websocket notification manager, present when the RPC
     /// server runs (dcrd's nil `rpcServer` checks around the ws
     /// sends; the index and mempool maintenance run either way).
@@ -129,6 +133,7 @@ impl ChainNtfnHandler {
         ntfn: Option<NodeNtfnMgr>,
         params: Params,
         allow_unsynced_mining: bool,
+        sync_gate: crate::sync::SyncGate,
         tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
         sync_peers: crate::dispatch::SyncPeers,
         recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
@@ -137,6 +142,7 @@ impl ChainNtfnHandler {
             ntfn,
             params,
             allow_unsynced_mining,
+            sync_gate,
             lottery_data_broadcast: Arc::default(),
             pending_winning_tickets: Arc::default(),
             pending_checked_announcements: Arc::default(),
@@ -379,11 +385,11 @@ impl ChainNtfnHandler {
         if pending.is_empty() {
             return;
         }
-        let is_current = self.allow_unsynced_mining
-            || chain
-                .lock()
-                .expect("chain mutex poisoned")
-                .is_current_at(adjusted_time_unix);
+        // dcrd's gate is the sync manager's IsCurrent, which requires
+        // the best height to have reached the sync height on top of
+        // the chain believing itself current.
+        let is_current =
+            self.allow_unsynced_mining || self.sync_gate.is_current(chain, adjusted_time_unix);
         if !is_current {
             return;
         }
@@ -426,7 +432,11 @@ impl ChainNtfnHandler {
         }
 
         let mut chain = chain.lock().expect("chain mutex poisoned");
-        if !self.allow_unsynced_mining && !chain.is_current_at(adjusted_time_unix) {
+        if !self.allow_unsynced_mining
+            && !self
+                .sync_gate
+                .is_current_locked(&mut chain, adjusted_time_unix)
+        {
             return;
         }
         for (block_hash, block_height) in pending {
@@ -893,6 +903,7 @@ mod tests {
                 None,
                 params.clone(),
                 allow_unsynced,
+                crate::sync::SyncGate::always_current(),
                 Arc::clone(&tx_pool),
                 peers,
                 crate::dispatch::new_recently_advertised(),
@@ -990,6 +1001,7 @@ mod tests {
             None,
             params.clone(),
             true,
+            crate::sync::SyncGate::always_current(),
             Arc::clone(&tx_pool),
             peers,
             crate::dispatch::new_recently_advertised(),
@@ -1051,6 +1063,7 @@ mod tests {
                 None,
                 params.clone(),
                 allow_unsynced,
+                crate::sync::SyncGate::unsynced(),
                 Arc::clone(&tx_pool),
                 crate::dispatch::SyncPeers::new(),
                 crate::dispatch::new_recently_advertised(),

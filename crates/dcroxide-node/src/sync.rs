@@ -228,6 +228,76 @@ impl SyncMixPool for NullMixPool {
     fn expire_messages_in_background(&mut self, _height: u32) {}
 }
 
+/// The daemon-side view of dcrd `SyncManager.IsCurrent`, over the
+/// manager's shared is-current flag and sync height (dcrd's
+/// `isCurrent` is an `atomic.Bool` readable from any goroutine): the
+/// accepted-block relay, fee-estimator enable, and background-generator
+/// gates evaluate it without taking the manager lock, which the gates
+/// cannot do because the manager itself takes the chain lock.
+#[derive(Clone)]
+pub struct SyncGate {
+    current: Arc<std::sync::atomic::AtomicBool>,
+    sync_height: Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl SyncGate {
+    /// A gate over the manager's shared state handles.
+    pub fn from_manager(manager: &NodeSyncManager) -> SyncGate {
+        let (current, sync_height) = manager.current_state_handles();
+        SyncGate {
+            current,
+            sync_height,
+        }
+    }
+
+    /// A gate that always reports current, for tests and tools that
+    /// have no sync manager.
+    pub fn always_current() -> SyncGate {
+        SyncGate {
+            current: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            sync_height: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        }
+    }
+
+    /// A gate that has not latched and has no sync peer, so it opens
+    /// exactly when the chain itself reports current — the manager's
+    /// own state on a fresh chain before any peer connects.
+    pub fn unsynced() -> SyncGate {
+        SyncGate {
+            current: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sync_height: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        }
+    }
+
+    /// dcrd `SyncManager.IsCurrent` over an already-locked chain:
+    /// `maybeUpdateIsCurrent` — nothing to do when the flag is already
+    /// set; otherwise the chain is considered synced once it believes
+    /// it is current and the best height reaches the sync height —
+    /// then the flag read.
+    pub fn is_current_locked(&self, chain: &mut Chain, now_unix: i64) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.current.load(Ordering::SeqCst) {
+            return true;
+        }
+        let best_height = chain.best_snapshot().height;
+        if best_height >= self.sync_height.load(Ordering::SeqCst) && chain.is_current_at(now_unix) {
+            self.current.store(true, Ordering::SeqCst);
+            return true;
+        }
+        false
+    }
+
+    /// [`SyncGate::is_current_locked`] taking the chain lock itself.
+    pub fn is_current(&self, chain: &Arc<Mutex<Chain>>, now_unix: i64) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.current.load(Ordering::SeqCst) {
+            return true;
+        }
+        let mut chain = chain.lock().expect("chain mutex poisoned");
+        self.is_current_locked(&mut chain, now_unix)
+    }
+}
+
 /// Construct the daemon's sync manager over the shared chain (dcrd
 /// `newServer` building its `netsync.Config`).
 pub fn new_sync_manager(

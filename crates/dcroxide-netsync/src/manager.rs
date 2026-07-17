@@ -5,6 +5,8 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use dcroxide_chainhash::Hash;
 use dcroxide_containers::{apbf, lru};
@@ -459,8 +461,8 @@ pub struct SyncManager<C, T, M: SyncMixPool> {
     headers_synced: bool,
     is_initial_chain_sync_done: bool,
 
-    sync_height: i64,
-    is_current: bool,
+    sync_height: Arc<AtomicI64>,
+    is_current: Arc<AtomicBool>,
 
     next_blocks_header: Hash,
     next_needed_blocks: VecDeque<Hash>,
@@ -472,8 +474,8 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// A new sync manager (dcrd `New`).
     pub fn new(mut cfg: Config<C, T, M>) -> SyncManager<C, T, M> {
         let min_known_work = cfg.min_known_chain_work;
-        let sync_height = cfg.chain.best_snapshot().height;
-        let is_current = cfg.chain.is_current();
+        let sync_height = Arc::new(AtomicI64::new(cfg.chain.best_snapshot().height));
+        let is_current = Arc::new(AtomicBool::new(cfg.chain.is_current()));
         SyncManager {
             cfg,
             min_known_work,
@@ -547,7 +549,15 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// The latest known block height being synced to (dcrd
     /// `SyncHeight`).
     pub fn sync_height(&self) -> i64 {
-        self.sync_height
+        self.sync_height.load(Ordering::SeqCst)
+    }
+
+    /// Shared handles to the is-current flag and the sync height, so
+    /// the daemon can evaluate dcrd `SyncManager.IsCurrent` without
+    /// taking the manager lock (dcrd's `isCurrent` is an `atomic.Bool`
+    /// readable from any goroutine for the same reason).
+    pub fn current_state_handles(&self) -> (Arc<AtomicBool>, Arc<AtomicI64>) {
+        (Arc::clone(&self.is_current), Arc::clone(&self.sync_height))
     }
 
     /// Whether the initial header sync process is complete (dcrd
@@ -564,8 +574,8 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// Atomically raise the sync height to the provided value (dcrd
     /// `maybeUpdateSyncHeight`).
     fn maybe_update_sync_height(&mut self, new_height: i64) {
-        if new_height > self.sync_height {
-            self.sync_height = new_height;
+        if new_height > self.sync_height() {
+            self.sync_height.store(new_height, Ordering::SeqCst);
         }
     }
 
@@ -705,7 +715,8 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         }
 
         if best_peer.is_none() {
-            self.is_current = self.cfg.chain.is_current();
+            self.is_current
+                .store(self.cfg.chain.is_current(), Ordering::SeqCst);
 
             // A sync peer already being assigned prior to calling
             // implies it was disconnected or otherwise is no longer a
@@ -742,7 +753,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // to.
         let best_height = self.cfg.chain.best_snapshot().height;
         if best_height + 2 < sync_height {
-            self.is_current = false;
+            self.is_current.store(false, Ordering::SeqCst);
         }
 
         // Request headers starting from the parent of the best known
@@ -1027,7 +1038,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// is considered synced (dcrd `maybeUpdateIsCurrent`).
     fn maybe_update_is_current(&mut self) {
         // Nothing to do when already considered synced.
-        if self.is_current {
+        if self.is_current.load(Ordering::SeqCst) {
             return;
         }
 
@@ -1035,8 +1046,8 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // believes it is current and the sync height is reached or
         // exceeded.
         let best_height = self.cfg.chain.best_snapshot().height;
-        if best_height >= self.sync_height && self.cfg.chain.is_current() {
-            self.is_current = true;
+        if best_height >= self.sync_height() && self.cfg.chain.is_current() {
+            self.is_current.store(true, Ordering::SeqCst);
         }
     }
 
@@ -1168,7 +1179,8 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                 let is_block_for_best_header = cur_best_header_hash == block_hash;
                 if is_block_for_best_header {
                     let (_, new_best_header_height) = self.cfg.chain.best_header();
-                    self.sync_height = new_best_header_height;
+                    self.sync_height
+                        .store(new_best_header_height, Ordering::SeqCst);
 
                     self.maybe_update_is_current();
 
@@ -1274,7 +1286,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
 
         // Fall back to using the sync height reported by the remote
         // peer otherwise.
-        let sync_height = self.sync_height;
+        let sync_height = self.sync_height();
         if sync_height == 0 {
             return 0.0;
         }
@@ -1458,7 +1470,8 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                 // peer.
                 if !headers_synced && is_sync_peer {
                     let (_, new_best_header_height) = self.cfg.chain.best_header();
-                    self.sync_height = new_best_header_height;
+                    self.sync_height
+                        .store(new_best_header_height, Ordering::SeqCst);
                 }
 
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
@@ -1544,7 +1557,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // the sync height.
         if !headers_synced
             && is_sync_peer
-            && final_header.height as i64 + SYNC_HEIGHT_FETCH_OFFSET > self.sync_height
+            && final_header.height as i64 + SYNC_HEIGHT_FETCH_OFFSET > self.sync_height()
         {
             {
                 headers_synced = true;
@@ -1964,7 +1977,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// peers (dcrd `IsCurrent`).
     pub fn is_current(&mut self) -> bool {
         self.maybe_update_is_current();
-        self.is_current
+        self.is_current.load(Ordering::SeqCst)
     }
 }
 

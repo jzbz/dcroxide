@@ -868,6 +868,7 @@ fn announces_connected_blocks_to_served_peers() {
         None,
         params.clone(),
         true,
+        dcroxide_node::sync::SyncGate::always_current(),
         Arc::clone(&tx_pool),
         sync_peers.clone(),
         dcroxide_node::dispatch::new_recently_advertised(),
@@ -967,4 +968,56 @@ fn announces_connected_blocks_to_served_peers() {
     }
 
     runtime.shutdown();
+}
+
+/// The netsync is-current gate over a real manager: a stale genesis
+/// chain keeps it closed, and the manager's latch (once the sync
+/// completes) keeps it open even against a stale tip timestamp — the
+/// behavior distinguishing dcrd's `syncManager.IsCurrent` from the
+/// chain's own view, which flips back on wall-clock staleness.
+#[test]
+fn sync_gate_latches_over_the_manager_state() {
+    let params = dcroxide_chaincfg::testnet3_params();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let opts = Options::new(dir.path().join("blocks"), params.net.0);
+    let db = Database::create(&opts).expect("create database");
+    let chain = Arc::new(Mutex::new(
+        Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
+    ));
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
+    let manager = dcroxide_node::sync::new_sync_manager(
+        Arc::clone(&chain),
+        &params,
+        false,
+        8,
+        1000,
+        tx_pool,
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+    );
+    let gate = dcroxide_node::sync::SyncGate::from_manager(&manager);
+
+    // Far past the genesis timestamp: not current, gate closed.
+    let stale_now = 2_000_000_000i64;
+    assert!(
+        !gate.is_current(&chain, stale_now),
+        "a stale unsynced chain keeps the gate closed"
+    );
+
+    // The manager latching current (the sync having completed) holds
+    // the gate open through the shared flag even though the chain's
+    // own view is stale.
+    let (current, _sync_height) = manager.current_state_handles();
+    current.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        gate.is_current(&chain, stale_now),
+        "the manager latch keeps the gate open over a stale tip"
+    );
 }

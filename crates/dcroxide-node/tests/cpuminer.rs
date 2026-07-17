@@ -134,6 +134,7 @@ fn generate_mines_blocks_onto_the_chain() {
         mining_policy(),
         0,
         true,
+        dcroxide_node::sync::SyncGate::always_current(),
         None,
         None,
     );
@@ -146,6 +147,7 @@ fn generate_mines_blocks_onto_the_chain() {
         None,
         params.clone(),
         true,
+        dcroxide_node::sync::SyncGate::always_current(),
         Arc::clone(&tx_pool),
         SyncPeers::new(),
         new_recently_advertised(),
@@ -255,6 +257,7 @@ fn continuous_mining_extends_the_chain() {
         mining_policy(),
         0,
         true,
+        dcroxide_node::sync::SyncGate::always_current(),
         None,
         None,
     );
@@ -265,6 +268,7 @@ fn continuous_mining_extends_the_chain() {
         None,
         params.clone(),
         true,
+        dcroxide_node::sync::SyncGate::always_current(),
         Arc::clone(&tx_pool),
         SyncPeers::new(),
         new_recently_advertised(),

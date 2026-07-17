@@ -334,6 +334,7 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
         Some(ntfn.clone()),
         params.clone(),
         true,
+        dcroxide_node::sync::SyncGate::always_current(),
         dcroxide_node::txmempool::new_shared_tx_pool(
             Arc::clone(&chain),
             &params,

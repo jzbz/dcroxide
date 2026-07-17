@@ -91,6 +91,7 @@ fn confirmed_transactions_feed_the_shared_filter() {
         None,
         params.clone(),
         false,
+        dcroxide_node::sync::SyncGate::always_current(),
         tx_pool,
         dcroxide_node::dispatch::SyncPeers::new(),
         dcroxide_node::dispatch::new_recently_advertised(),

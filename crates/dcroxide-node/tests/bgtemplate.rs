@@ -172,6 +172,7 @@ fn serves_getwork_over_the_live_generator() {
         policy.clone(),
         0,
         true,
+        dcroxide_node::sync::SyncGate::always_current(),
         None,
         None,
     );
@@ -314,6 +315,7 @@ fn regentemplate_forces_a_new_template() {
         policy.clone(),
         0,
         true,
+        dcroxide_node::sync::SyncGate::always_current(),
         None,
         None,
     );
@@ -389,6 +391,7 @@ fn the_drain_hook_runs_after_each_processed_event() {
         policy.clone(),
         0,
         true,
+        dcroxide_node::sync::SyncGate::always_current(),
         None,
         Some(Box::new(move || {
             hook_drains.fetch_add(1, Ordering::SeqCst);
@@ -462,6 +465,7 @@ fn a_reorg_clears_and_then_recovers_getwork() {
         policy.clone(),
         0,
         true,
+        dcroxide_node::sync::SyncGate::always_current(),
         None,
         None,
     );
@@ -543,6 +547,7 @@ fn the_pre_current_wait_loop_forwards_reorg_events() {
         // allow_unsynced_mining disabled: stay in the pre-current wait
         // loop over the not-yet-current battery chain.
         false,
+        dcroxide_node::sync::SyncGate::always_current(),
         None,
         None,
     );

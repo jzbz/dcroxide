@@ -340,10 +340,20 @@ fn run(cfg: Config) -> ExitCode {
     // the RPC server does — only the websocket sends need the
     // manager — and the sync adapter drains the handler's deferred
     // work after each processing call.
+    // The netsync is-current gate the relay, estimator-enable, and
+    // generator paths consult (dcrd wiring `s.syncManager.IsCurrent`
+    // into those sites rather than the chain's own view).
+    let sync_gate = dcroxide_node::sync::SyncGate::from_manager(
+        &server
+            .sync_manager
+            .lock()
+            .expect("sync manager mutex poisoned"),
+    );
     let mut handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
         ntfn.clone(),
         cfg.params.params.clone(),
         cfg.allow_unsynced_mining,
+        sync_gate.clone(),
         Arc::clone(&tx_pool),
         server.sync_peers.clone(),
         Arc::clone(&server.recently_advertised),
@@ -397,6 +407,7 @@ fn run(cfg: Config) -> ExitCode {
             mining_policy.clone(),
             cfg.mining_time_offset,
             cfg.allow_unsynced_mining,
+            sync_gate.clone(),
             ntfn.clone(),
             Some(drain_hook),
         ))
