@@ -46,6 +46,15 @@ pub fn version_string() -> &'static str {
     VERSION
 }
 
+/// The strictly numeric `major.minor.patch` version advertised in the
+/// peer-to-peer user agent and the RPC server's version reporting
+/// (dcrd server.go's `userAgentVersion`, which deliberately excludes
+/// the pre-release and build metadata portions).
+pub fn user_agent_version() -> String {
+    let c = version_components();
+    format!("{}.{}.{}", c.major, c.minor, c.patch)
+}
+
 /// Whether an identifier is numeric with no leading zeros (the
 /// `0|[1-9]\d*` alternates of dcrd's `semverRE`).
 fn numeric_identifier(id: &str) -> bool {

@@ -954,7 +954,7 @@ fn build_server(
         // dcrd's `defaultServices`.
         services: ServiceFlag::NODE_NETWORK,
         user_agent_name: APP_NAME.to_string(),
-        user_agent_version: version::version_string().to_string(),
+        user_agent_version: version::user_agent_version(),
         idle_timeout: Duration::from_nanos(DEFAULT_IDLE_TIMEOUT as u64),
         ping_interval: Duration::from_nanos(PING_INTERVAL as u64),
     };
@@ -1171,7 +1171,7 @@ fn rpc_config(
         profiler_mgr: Box::new(()),
         addr_manager: Box::new(dcroxide_node::rpcrun::NodeRpcAddrManager::new(addr_manager)),
         mining_addrs: cfg.mining_addrs.clone(),
-        user_agent_version: version::version_string().to_string(),
+        user_agent_version: version::user_agent_version(),
         // The three per-network reachability descriptions the config's
         // `parse_network_interfaces` already derived from the listeners
         // and proxy settings (dcrd's `cfg.generateNetworkInfo()`).
