@@ -551,6 +551,7 @@ pub fn serve_websocket<S: Read + Write>(
     is_admin: bool,
     server: &Arc<Mutex<Server<NodeRpcChain>>>,
     ntfn: &NodeNtfnMgr,
+    shutdown: &std::sync::atomic::AtomicBool,
 ) {
     // Validate the remaining upgrade requirements (gorilla's checks
     // after the method and header tokens): version 13 and a 16-byte
@@ -596,6 +597,12 @@ pub fn serve_websocket<S: Read + Write>(
     let mut conn = WsConn::new(stream);
 
     loop {
+        // A server shutdown ends the connection like dcrd's
+        // `close(s.quit)` unblocking every websocket loop; the poll
+        // read below wakes this check within its interval.
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         // Drain queued notifications before waiting for the next
         // request (the poll-loop translation of dcrd's out handler).
         let mut write_failed = false;

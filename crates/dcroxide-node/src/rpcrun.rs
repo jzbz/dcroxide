@@ -25,7 +25,7 @@
 //! serving loop instead of the POST body path.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -944,11 +944,12 @@ fn adjusted_time_unix() -> i64 {
 }
 
 /// The running RPC listener; [`RpcListener::shutdown`] stops the accept
-/// threads.
+/// threads and drains the per-connection handler threads.
 pub struct RpcListener {
     shutdown: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     bound: Vec<SocketAddr>,
+    handlers: HandlerGroup,
 }
 
 impl RpcListener {
@@ -957,12 +958,156 @@ impl RpcListener {
         &self.bound
     }
 
-    /// Signal the accept threads to stop and join them.
+    /// Signal the accept threads to stop, join them, then drain the
+    /// per-connection handler threads.  dcrd's `Run` waits only for its
+    /// accept goroutines and stops websocket clients by cancelling the
+    /// request context, whose per-client watcher calls `Disconnect` —
+    /// closing the connection out from under any blocked read; in-flight
+    /// standard handlers are left detached.  The port mirrors that with
+    /// a grace period first: websocket serving loops observe the
+    /// shutdown flag within a poll interval and standard connections
+    /// finish their one deadline-bounded request, so the drain normally
+    /// completes without cutting anyone off.  A connection still alive
+    /// after the grace — a mid-frame websocket stall, a zero-window
+    /// reader pinning a response write — gets its socket shut down
+    /// (dcrd's `Disconnect`), unblocking its handler; the final wait is
+    /// bounded too, so shutdown never hangs on a wedged thread (which
+    /// is then abandoned exactly as dcrd abandons detached handlers).
     pub fn shutdown(self) {
         self.shutdown.store(true, Ordering::SeqCst);
         for thread in self.threads {
             let _ = thread.join();
         }
+        if !self.handlers.wait_timeout(HANDLER_DRAIN_GRACE) {
+            self.handlers.force_disconnect();
+            let _ = self.handlers.wait_timeout(HANDLER_FORCE_WAIT);
+        }
+    }
+}
+
+/// How long a shutdown lets the in-flight handlers finish on their own
+/// before force-closing their sockets.
+const HANDLER_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// How long a shutdown waits after force-closing the sockets before
+/// abandoning any still-wedged handler thread.
+const HANDLER_FORCE_WAIT: Duration = Duration::from_secs(5);
+
+/// The live per-connection handler threads, drained at shutdown, and a
+/// second handle to each connection's socket so a shutdown can close a
+/// wedged connection out from under its blocked handler (dcrd's
+/// context watcher calling `wsClient.Disconnect`).  Entering must
+/// happen on the accept thread before the handler thread spawns, so a
+/// shutdown that begins between the spawn and the handler's first
+/// instruction still sees the connection.
+#[derive(Clone, Default)]
+struct HandlerGroup {
+    live: Arc<HandlerState>,
+}
+
+/// The shared drain state behind a [`HandlerGroup`].
+#[derive(Default)]
+struct HandlerState {
+    conns: Mutex<std::collections::HashMap<u64, TcpStream>>,
+    next_id: Mutex<u64>,
+    count: Mutex<usize>,
+    done: std::sync::Condvar,
+}
+
+impl HandlerGroup {
+    /// Count a handler in, registering a second socket handle for the
+    /// force-close path; the returned guard counts it back out when the
+    /// handler thread finishes, panicking or not.
+    fn enter(&self, sock: Option<TcpStream>) -> HandlerGuard {
+        let id = {
+            let mut next = self
+                .live
+                .next_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *next = next.wrapping_add(1);
+            *next
+        };
+        if let Some(sock) = sock {
+            self.live
+                .conns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id, sock);
+        }
+        let mut count = self
+            .live
+            .count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *count = count.saturating_add(1);
+        HandlerGuard {
+            live: Arc::clone(&self.live),
+            id,
+        }
+    }
+
+    /// Block until every entered handler has finished or the timeout
+    /// passes; whether the drain completed.
+    fn wait_timeout(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut count = self
+            .live
+            .count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *count > 0 {
+            let remaining = deadline
+                .map(|d| d.saturating_duration_since(Instant::now()))
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                return false;
+            }
+            let (guard, _) = self
+                .live
+                .done
+                .wait_timeout(count, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            count = guard;
+        }
+        true
+    }
+
+    /// Shut down every still-registered connection socket, erroring out
+    /// the blocked reads and writes so their handlers finish (dcrd's
+    /// `Disconnect` closing the conn at context cancellation).
+    fn force_disconnect(&self) {
+        let conns = self
+            .live
+            .conns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for sock in conns.values() {
+            let _ = sock.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// The in-flight mark a handler thread holds for its lifetime.
+struct HandlerGuard {
+    live: Arc<HandlerState>,
+    id: u64,
+}
+
+impl Drop for HandlerGuard {
+    fn drop(&mut self) {
+        self.live
+            .conns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
+        let mut count = self
+            .live
+            .count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *count = count.saturating_sub(1);
+        self.live.done.notify_all();
     }
 }
 
@@ -1104,6 +1249,7 @@ pub fn start_rpc_listener(
     // thread so the cap bounds the whole RPC server (dcrd's single
     // `numClients` atomic).
     let num_clients = Arc::new(AtomicI32::new(0));
+    let handlers = HandlerGroup::default();
     let mut threads = Vec::with_capacity(listeners.len());
     let mut bound = Vec::with_capacity(listeners.len());
 
@@ -1117,6 +1263,7 @@ pub fn start_rpc_listener(
         let transport = transport.clone();
         let ntfn = ntfn.clone();
         let num_clients = Arc::clone(&num_clients);
+        let handlers = handlers.clone();
         threads.push(thread::spawn(move || {
             accept_loop(
                 &listener,
@@ -1126,6 +1273,7 @@ pub fn start_rpc_listener(
                 &ntfn,
                 max_clients,
                 &num_clients,
+                &handlers,
             );
         }));
     }
@@ -1134,19 +1282,22 @@ pub fn start_rpc_listener(
         shutdown,
         threads,
         bound,
+        handlers,
     })
 }
 
 /// Accept RPC connections until shutdown, serving each on its own
 /// thread.
+#[allow(clippy::too_many_arguments)]
 fn accept_loop(
     listener: &TcpListener,
-    shutdown: &AtomicBool,
+    shutdown: &Arc<AtomicBool>,
     server: &Arc<Mutex<Server<NodeRpcChain>>>,
     transport: &RpcTransport,
     ntfn: &crate::websocket::NodeNtfnMgr,
     max_clients: usize,
     num_clients: &Arc<AtomicI32>,
+    handlers: &HandlerGroup,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -1160,20 +1311,44 @@ fn accept_loop(
                 let server = Arc::clone(server);
                 let ntfn = ntfn.clone();
                 let num_clients = Arc::clone(num_clients);
+                let stop = Arc::clone(shutdown);
+                // Enter the wait group here on the accept thread, so a
+                // shutdown beginning right after the spawn still waits
+                // for this connection; the second socket handle is the
+                // force-close path.  `shutdown(2)` acts on the shared
+                // underlying socket, unlike the per-handle timeout
+                // options `SocketTimeout` warns about.
+                let guard = handlers.enter(stream.try_clone().ok());
                 match transport {
                     RpcTransport::Plain => {
                         thread::spawn(move || {
-                            serve_rpc_connection(stream, &server, &ntfn, max_clients, &num_clients);
+                            let _guard = guard;
+                            serve_rpc_connection(
+                                stream,
+                                &server,
+                                &ntfn,
+                                max_clients,
+                                &num_clients,
+                                &stop,
+                            );
                         });
                     }
                     RpcTransport::Tls(config) => {
                         let config = Arc::clone(config);
                         thread::spawn(move || {
+                            let _guard = guard;
                             let Ok(session) = rustls::ServerConnection::new(config) else {
                                 return;
                             };
                             let tls = rustls::StreamOwned::new(session, stream);
-                            serve_rpc_connection(tls, &server, &ntfn, max_clients, &num_clients);
+                            serve_rpc_connection(
+                                tls,
+                                &server,
+                                &ntfn,
+                                max_clients,
+                                &num_clients,
+                                &stop,
+                            );
                         });
                     }
                 }
@@ -1283,6 +1458,170 @@ fn drain_body<S: Read + SocketTimeout>(stream: &mut S, mut remaining: usize, dea
     }
 }
 
+/// How much of an unread chunked body an error path drains before
+/// closing, bounding a client that keeps sending (Go's
+/// `maxPostHandlerReadBytes` discard cap serves the same clean-close
+/// purpose).
+const CHUNKED_DRAIN_LIMIT: usize = 1 << 18;
+
+/// The longest accepted chunk-size line, extensions included (Go's
+/// `maxLineLength` in `internal/chunked`).
+const MAX_CHUNK_LINE: usize = 4096;
+
+/// A decoded chunked request body, or why it could not be read.
+enum ChunkedBody {
+    /// The whole body, decoded.
+    Body(Vec<u8>),
+    /// The decoded body exceeded the limit.
+    TooLarge,
+    /// The chunk framing was malformed.
+    Malformed,
+    /// The stream failed or the deadline passed.
+    Io,
+}
+
+/// Read one line under the deadline: terminated by LF with any
+/// trailing whitespace (the optional CR included) trimmed, exactly
+/// Go's `readChunkLine`, which tolerates bare-LF size and trailer
+/// lines while the after-data terminator stays strict CRLF.
+fn read_chunk_line<S: Read + SocketTimeout>(
+    stream: &mut S,
+    deadline: Instant,
+) -> Result<Vec<u8>, ChunkedBody> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if !read_exact_by_deadline(stream, &mut byte, deadline) {
+            return Err(ChunkedBody::Io);
+        }
+        if byte[0] == b'\n' {
+            while line.last().is_some_and(|b: &u8| b.is_ascii_whitespace()) {
+                line.pop();
+            }
+            return Ok(line);
+        }
+        line.push(byte[0]);
+        if line.len() > MAX_CHUNK_LINE {
+            return Err(ChunkedBody::Malformed);
+        }
+    }
+}
+
+/// Decode a chunked transfer-encoded request body under the deadline
+/// (RFC 7230 section 4.1, the request-side subset of Go's
+/// `internal/chunked` reader the `net/http` server decodes with):
+/// hex-size lines with optional extensions, each chunk's data and its
+/// trailing CRLF, the zero-size last chunk, then any trailer lines up
+/// to the final blank line, which are discarded.  `collect` gathers the
+/// data up to `limit`; a drain passes `false` and the limit bounds the
+/// discarded bytes instead.
+fn read_chunked_body<S: Read + SocketTimeout>(
+    stream: &mut S,
+    deadline: Instant,
+    limit: usize,
+    collect: bool,
+) -> ChunkedBody {
+    let mut body = Vec::new();
+    let mut total = 0usize;
+    loop {
+        let line = match read_chunk_line(stream, deadline) {
+            Ok(line) => line,
+            Err(err) => return err,
+        };
+        // The size is hex up to an optional extension delimiter (Go
+        // also stops at the first semicolon and ignores extensions).
+        let size_hex = line.split(|b| *b == b';').next().unwrap_or_default();
+        let size_hex = core::str::from_utf8(size_hex).unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_hex, 16) else {
+            return ChunkedBody::Malformed;
+        };
+        if size == 0 {
+            // Trailer section: lines until the blank one, discarded
+            // (Go parses them into Request.Trailer; the RPC server
+            // never consults them).
+            loop {
+                match read_chunk_line(stream, deadline) {
+                    Ok(line) if line.is_empty() => {
+                        return if collect {
+                            ChunkedBody::Body(body)
+                        } else {
+                            ChunkedBody::Body(Vec::new())
+                        };
+                    }
+                    Ok(_) => continue,
+                    Err(err) => return err,
+                }
+            }
+        }
+        total = total.saturating_add(size);
+        if total > limit {
+            return ChunkedBody::TooLarge;
+        }
+        if collect {
+            let start = body.len();
+            body.resize(start.saturating_add(size), 0);
+            if !read_exact_by_deadline(stream, &mut body[start..], deadline) {
+                return ChunkedBody::Io;
+            }
+        } else {
+            let mut scratch = [0u8; 4096];
+            let mut remaining = size;
+            while remaining > 0 {
+                let want = remaining.min(scratch.len());
+                if !read_exact_by_deadline(stream, &mut scratch[..want], deadline) {
+                    return ChunkedBody::Io;
+                }
+                remaining = remaining.saturating_sub(want);
+            }
+        }
+        // Each chunk's data ends with its own CRLF.
+        let mut crlf = [0u8; 2];
+        if !read_exact_by_deadline(stream, &mut crlf, deadline) {
+            return ChunkedBody::Io;
+        }
+        if &crlf != b"\r\n" {
+            return ChunkedBody::Malformed;
+        }
+    }
+}
+
+/// Whether the request declares a chunked body, and whether its
+/// transfer encoding is one the server can read at all.  Go's server
+/// accepts exactly `chunked` and answers anything else with 501
+/// Unsupported Transfer-Encoding; per RFC 7230 a chunked message's
+/// Content-Length is ignored.
+enum BodyFraming {
+    /// No Transfer-Encoding: the Content-Length declares the body.
+    Length,
+    /// `Transfer-Encoding: chunked`.
+    Chunked,
+    /// An encoding the server does not implement.
+    Unsupported,
+}
+
+fn body_framing(head: &HttpHead) -> BodyFraming {
+    match head.transfer_encoding.as_deref() {
+        None => BodyFraming::Length,
+        Some(value) if value.trim().eq_ignore_ascii_case("chunked") => BodyFraming::Chunked,
+        Some(_) => BodyFraming::Unsupported,
+    }
+}
+
+/// Drain whatever body the request declared before an error response,
+/// so the close is clean (see `drain_body`).
+fn drain_declared_body<S: Read + SocketTimeout>(
+    stream: &mut S,
+    head: &HttpHead,
+    deadline: Instant,
+) {
+    match body_framing(head) {
+        BodyFraming::Chunked => {
+            let _ = read_chunked_body(stream, deadline, CHUNKED_DRAIN_LIMIT, false);
+        }
+        _ => drain_body(stream, head.content_length, deadline),
+    }
+}
+
 /// The parsed head of an HTTP/1.1 request: the request line pieces and
 /// the headers the RPC and websocket endpoints consult.
 pub struct HttpHead {
@@ -1290,6 +1629,7 @@ pub struct HttpHead {
     path: String,
     authorization: Option<String>,
     content_length: usize,
+    transfer_encoding: Option<String>,
     upgrade: Option<String>,
     connection: Option<String>,
     pub(crate) sec_websocket_key: Option<String>,
@@ -1339,6 +1679,7 @@ fn read_http_head<S: Read + SocketTimeout>(
         path,
         authorization: None,
         content_length: 0,
+        transfer_encoding: None,
         upgrade: None,
         connection: None,
         sec_websocket_key: None,
@@ -1356,6 +1697,8 @@ fn read_http_head<S: Read + SocketTimeout>(
                 head.authorization = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("content-length") {
                 head.content_length = value.parse().map_err(|_| "bad content length")?;
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                head.transfer_encoding = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("upgrade") {
                 head.upgrade = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("connection") {
@@ -1442,6 +1785,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     ntfn: &crate::websocket::NodeNtfnMgr,
     max_clients: usize,
     num_clients: &Arc<AtomicI32>,
+    shutdown: &AtomicBool,
 ) {
     // The absolute deadline for the whole handshake (dcrd's HTTP
     // `ReadTimeout`), applied per read so a byte-dribbling client cannot
@@ -1455,6 +1799,18 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
             return;
         }
     };
+
+    // A transfer encoding the server cannot read fails the request
+    // before any routing (Go's `net/http` answers 501 Unsupported
+    // Transfer-Encoding while reading the request).
+    if matches!(body_framing(&head), BodyFraming::Unsupported) {
+        let _ = write_response(
+            &mut stream,
+            "501 Not Implemented",
+            b"Unsupported transfer encoding",
+        );
+        return;
+    }
 
     // The websocket upgrade allows an unauthenticated connection that
     // must authenticate in-band (dcrd `checkAuth` with `require =
@@ -1488,7 +1844,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
         // websocket connections have no read deadline, so the 30
         // second connection timeout must not apply here.
         stream.set_socket_read_timeout(Some(WS_POLL_INTERVAL));
-        crate::websocket::serve_websocket(stream, &head, authed, is_admin, server, ntfn);
+        crate::websocket::serve_websocket(stream, &head, authed, is_admin, server, ntfn, shutdown);
         return;
     }
 
@@ -1507,7 +1863,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
         // client cleanly rather than resetting the socket over unread
         // bytes.  dcrd's 503 body is text/plain via http.Error;
         // write_response uses the JSON content type, a cosmetic divergence.
-        drain_body(&mut stream, head.content_length, deadline);
+        drain_declared_body(&mut stream, &head, deadline);
         let _ = write_response(
             &mut stream,
             "503 Service Unavailable",
@@ -1534,7 +1890,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
             // drain's duration, then drain the small body so the 401
             // closes cleanly.
             drop(_client_guard);
-            drain_body(&mut stream, head.content_length, deadline);
+            drain_declared_body(&mut stream, &head, deadline);
             let _ = write_unauthorized(&mut stream);
             return;
         }
@@ -1543,17 +1899,41 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     // The read limit applies only after authentication (dcrd caps the body
     // inside the authenticated `jsonRPCRead`), so an unauthenticated
     // oversized request is answered 401 above, not 400.
-    if head.content_length > RPC_READ_LIMIT_AUTHENTICATED {
-        drain_body(&mut stream, head.content_length, deadline);
-        let _ = write_response(&mut stream, "400 Bad Request", b"request too large");
-        return;
-    }
-
-    // Read the authenticated body under the same absolute deadline.
-    let mut body = vec![0u8; head.content_length];
-    if !read_exact_by_deadline(&mut stream, &mut body, deadline) {
-        return;
-    }
+    let body = match body_framing(&head) {
+        BodyFraming::Length => {
+            if head.content_length > RPC_READ_LIMIT_AUTHENTICATED {
+                drain_body(&mut stream, head.content_length, deadline);
+                let _ = write_response(&mut stream, "400 Bad Request", b"request too large");
+                return;
+            }
+            // Read the authenticated body under the same absolute
+            // deadline.
+            let mut body = vec![0u8; head.content_length];
+            if !read_exact_by_deadline(&mut stream, &mut body, deadline) {
+                return;
+            }
+            body
+        }
+        // A chunked body is decoded under the same limit and deadline
+        // (Go's server decodes chunked transparently; per RFC 7230 the
+        // Content-Length of a chunked message is ignored).
+        BodyFraming::Chunked => {
+            match read_chunked_body(&mut stream, deadline, RPC_READ_LIMIT_AUTHENTICATED, true) {
+                ChunkedBody::Body(body) => body,
+                ChunkedBody::TooLarge => {
+                    let _ = write_response(&mut stream, "400 Bad Request", b"request too large");
+                    return;
+                }
+                ChunkedBody::Malformed => {
+                    let _ = write_response(&mut stream, "400 Bad Request", b"invalid chunked body");
+                    return;
+                }
+                ChunkedBody::Io => return,
+            }
+        }
+        // Rejected with 501 above.
+        BodyFraming::Unsupported => return,
+    };
 
     let Ok(body) = String::from_utf8(body) else {
         let _ = write_response(&mut stream, "400 Bad Request", b"invalid body");
@@ -1614,6 +1994,7 @@ mod tests {
             path: "/ws".to_string(),
             authorization: None,
             content_length: 0,
+            transfer_encoding: None,
             upgrade: None,
             connection: None,
             sec_websocket_key: None,

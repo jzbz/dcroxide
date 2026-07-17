@@ -663,3 +663,154 @@ fn serves_tls_with_a_generated_certificate() {
 
     listener.shutdown();
 }
+
+/// A chunked-transfer POST decodes to the same request the
+/// Content-Length path serves (Go's net/http decodes chunked
+/// transparently; the RPC pipeline sees only the body).
+#[test]
+fn answers_a_chunked_transfer_request() {
+    let (_dir, listener, port, genesis_hash, _chain) = serve_rpc();
+
+    let body = r#"{"jsonrpc":"1.0","method":"getbestblockhash","params":[],"id":1}"#;
+    let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
+    // Split the body across two chunks with an extension on the first
+    // size line and a trailer header, all of which the decoder must
+    // accept and discard.
+    let (first, second) = body.split_at(10);
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x};ext=1\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\nX-Trailer: ignored\r\n\r\n",
+        first.len(),
+        second.len(),
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.write_all(request.as_bytes()).expect("write");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read");
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(
+        response.contains(&format!("\"result\":\"{genesis_hash}\"")),
+        "{response}"
+    );
+
+    // Bare-LF size and trailer lines are tolerated exactly as Go's
+    // readChunkLine tolerates them (the after-data CRLF stays strict).
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\n{body}\r\n0\n\n",
+        body.len(),
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.write_all(request.as_bytes()).expect("write");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read");
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+    listener.shutdown();
+}
+
+/// A transfer encoding the server cannot read is answered 501 before
+/// any routing (Go's server answers Unsupported Transfer-Encoding),
+/// and malformed chunk framing is a 400.
+#[test]
+fn rejects_bad_transfer_encodings() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+    let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
+
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\n"
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.write_all(request.as_bytes()).expect("write");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read");
+    assert!(response.starts_with("HTTP/1.1 501"), "{response}");
+
+    // A size line that is not hex fails the chunk framing.
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nzz\r\n"
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.write_all(request.as_bytes()).expect("write");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read");
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(response.contains("invalid chunked body"), "{response}");
+
+    listener.shutdown();
+}
+
+/// Shutdown waits for the per-connection handler threads (dcrd
+/// `rpcServer.Stop`'s wait group): with a live websocket client
+/// connected, `shutdown()` must both wait for it and terminate,
+/// because the serving loop observes the shutdown flag within a poll
+/// interval.
+#[test]
+fn shutdown_drains_a_live_websocket_handler() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+
+    // Open a websocket and complete the upgrade so the serving loop is
+    // live, then leave the connection idle.
+    let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let request = format!(
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).expect("write");
+    let mut head = [0u8; 12];
+    stream.read_exact(&mut head).expect("read upgrade status");
+    assert_eq!(&head, b"HTTP/1.1 101", "upgrade must be accepted");
+
+    // Shutdown must return: it waits for the ws handler, and the
+    // handler exits once it observes the flag.  Run it on a helper
+    // thread so a regression (a hang) fails the join below rather than
+    // wedging the test forever.
+    let done = std::thread::spawn(move || {
+        listener.shutdown();
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        done.is_finished(),
+        "shutdown must drain the websocket handler within the deadline"
+    );
+    done.join().expect("shutdown thread");
+}
+
+/// A websocket client that stalls mid-frame (one frame-header byte,
+/// then silence) wedges its read past the poll interval; shutdown must
+/// still return, because the drain force-closes the socket after the
+/// grace period (dcrd's context watcher calling `Disconnect`).
+#[test]
+fn shutdown_force_closes_a_mid_frame_websocket_stall() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+
+    let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let request = format!(
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).expect("write");
+    let mut head = [0u8; 12];
+    stream.read_exact(&mut head).expect("read upgrade status");
+    assert_eq!(&head, b"HTTP/1.1 101", "upgrade must be accepted");
+    // The first byte of a text frame header, then nothing: the serving
+    // loop is now blocked inside the frame read, past the idle poll.
+    stream.write_all(&[0x81]).expect("write partial frame");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let done = std::thread::spawn(move || {
+        listener.shutdown();
+    });
+    // The grace period is one second; the force-close must unblock the
+    // handler well before this deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !done.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        done.is_finished(),
+        "shutdown must force-close a wedged websocket handler"
+    );
+    done.join().expect("shutdown thread");
+}
