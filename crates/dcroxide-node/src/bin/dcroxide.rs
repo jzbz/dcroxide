@@ -1071,8 +1071,12 @@ fn open_chain(cfg: &Config, db: Database) -> Result<Chain, String> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    Chain::open(db, params, assume_valid, cfg.allow_old_forks, created_unix)
-        .map_err(|e| format!("unable to initialize chain: {e:?}"))
+    let mut chain = Chain::open(db, params, assume_valid, cfg.allow_old_forks, created_unix)
+        .map_err(|e| format!("unable to initialize chain: {e:?}"))?;
+    // dcrd's --utxocachemaxsize (megabytes) bounds the pending UTXO
+    // cache before a connect flushes it.
+    chain.set_utxo_cache_max_bytes(cfg.utxo_cache_max_size.saturating_mul(1024 * 1024));
+    Ok(chain)
 }
 
 /// Build the RPC server configuration over the shared chain with the

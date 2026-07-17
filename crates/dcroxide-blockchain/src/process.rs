@@ -84,6 +84,15 @@ pub struct HeaderProof {
     pub proof_hashes: Vec<Hash>,
 }
 
+/// The default maximum pending-UTXO-cache size (dcrd's
+/// `defaultUtxoCacheMaxSize` of 150 MiB, in bytes).
+const DEFAULT_UTXO_CACHE_MAX_BYTES: u64 = 150 * 1024 * 1024;
+
+/// The estimated in-memory cost of one cached UTXO entry — the map
+/// overhead, outpoint key, pointer, and a typical entry — used to
+/// approximate dcrd's byte-exact cache size accounting.
+const APPROX_UTXO_CACHE_ENTRY_BYTES: u64 = 200;
+
 /// The growing chain state: the block tree arena and index together
 /// with the header-processing configuration (the subset of dcrd's
 /// `BlockChain` struct the headers-first path reads).  dcrd's
@@ -150,6 +159,16 @@ pub struct Chain {
     /// Whether several validation checks are skipped for bulk imports
     /// (dcrd `bulkImportMode`).
     pub bulk_import_mode: bool,
+    /// The unix time the in-memory state was last pruned (dcrd
+    /// `chainPruner.lastPruneTime`).
+    last_prune_unix: i64,
+    /// The pruning interval in seconds — the target block time (dcrd
+    /// `chainPruner.pruningInterval`).
+    prune_interval_secs: i64,
+    /// The maximum size in bytes the pending UTXO cache may reach
+    /// before a connect flushes it to the backend (dcrd's
+    /// `utxoCache.maxSize` from `--utxocachemaxsize`).
+    utxo_cache_max_bytes: u64,
     /// Whether the chain has latched to believing it is current.
     pub is_current_latch: bool,
     /// The minimum known cumulative chain work from the parameters.
@@ -302,6 +321,9 @@ impl Chain {
             header_commitments: BTreeMap::new(),
             state_snapshot,
             bulk_import_mode: false,
+            last_prune_unix: 0,
+            prune_interval_secs: params.target_time_per_block_secs,
+            utxo_cache_max_bytes: DEFAULT_UTXO_CACHE_MAX_BYTES,
             is_current_latch: false,
             min_known_work: params.min_known_chain_work,
             db: None,
@@ -591,15 +613,22 @@ impl Chain {
             n.stake_node = Some(stake_node.clone());
         }
 
-        // Load the blocks for every node with data, the spend
-        // journals, filters, commitments, ticket rows, and the UTXO
-        // set into the in-memory maps (the disk-backed lazy access is
-        // an optimization that arrives later).
+        // Warm the recent-window mirrors (blocks, spend journals,
+        // filters, commitments) only within `MIN_MEMORY_STAKE_NODES`
+        // of the tip; everything older is served from the database on
+        // demand through the fallbacks, so a restart at a large tip
+        // does not load the whole chain into memory.  The UTXO set and
+        // treasury account are loaded in full below since dcrd keeps
+        // those resident.
+        let keep_below = i64::from(state.height).saturating_sub(Self::MIN_MEMORY_STAKE_NODES);
         let node_ids: Vec<NodeId> = {
             let mut ids = Vec::new();
             let _ = self.index.for_each_chain_tip(|t| -> Result<(), ()> {
                 let mut n = Some(t);
                 while let Some(id) = n {
+                    if self.store.node(id).height < keep_below {
+                        break;
+                    }
                     ids.push(id);
                     n = self.store.node(id).parent;
                 }
@@ -636,44 +665,11 @@ impl Chain {
             }
         }
 
-        // The per-height ticket database rows.
+        // The per-height ticket database rows are read from the
+        // database on demand (through `ticket_rows_by_height`) during
+        // the stake-node regeneration walk, so they are not warmed
+        // into memory here.
         let meta = tx.metadata();
-        if let Some(bucket) =
-            meta.bucket(dcroxide_stake::ticketdb::STAKE_BLOCK_UNDO_DATA_BUCKET_NAME)
-        {
-            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            bucket.for_each(|k, v| {
-                rows.push((k.to_vec(), v.to_vec()));
-                Ok(())
-            })?;
-            for (k, v) in rows {
-                if k.len() == 4 {
-                    let height = i64::from(u32::from_le_bytes([k[0], k[1], k[2], k[3]]));
-                    let utds =
-                        dcroxide_stake::ticketdb::deserialize_block_undo_data(&v).map_err(|e| {
-                            crate::chaindb::ChainDbError::Corrupt(format!("undo: {e:?}"))
-                        })?;
-                    self.stake_undo.insert(height, utds);
-                }
-            }
-        }
-        if let Some(bucket) = meta.bucket(dcroxide_stake::ticketdb::TICKETS_IN_BLOCK_BUCKET_NAME) {
-            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            bucket.for_each(|k, v| {
-                rows.push((k.to_vec(), v.to_vec()));
-                Ok(())
-            })?;
-            for (k, v) in rows {
-                if k.len() == 4 {
-                    let height = i64::from(u32::from_le_bytes([k[0], k[1], k[2], k[3]]));
-                    let ths =
-                        dcroxide_stake::ticketdb::deserialize_ticket_hashes(&v).map_err(|e| {
-                            crate::chaindb::ChainDbError::Corrupt(format!("tickets: {e:?}"))
-                        })?;
-                    self.stake_new_tickets.insert(height, ths);
-                }
-            }
-        }
 
         // The treasury account and spend rows.
         if let Some(bucket) = meta.bucket(crate::chaindb::TREASURY_BUCKET_NAME) {
@@ -844,10 +840,7 @@ impl Chain {
         // Populate prunable ticket info for nodes with data available.
         for &id in &modified {
             let n = self.store.node(id);
-            if n.status.have_data()
-                && !n.ticket_info_populated
-                && self.blocks.contains_key(&n.hash.0)
-            {
+            if n.status.have_data() && !n.ticket_info_populated {
                 self.maybe_fetch_ticket_info(id, params);
             }
         }
@@ -1089,9 +1082,7 @@ impl Chain {
         is_treasury_enabled: bool,
     ) -> Vec<SpentTxOut> {
         let serialized = self
-            .spend_journal
-            .get(&block.header.block_hash().0)
-            .cloned()
+            .spend_journal_row(&block.header.block_hash())
             .unwrap_or_default();
 
         let mut block_txns: Vec<MsgTx> = Vec::new();
@@ -1116,9 +1107,8 @@ impl Chain {
     /// stored previously; callers only request blocks whose data
     /// availability is tracked by the block index (dcrd
     /// `fetchBlockByNode` over its database and recent block cache).
-    pub fn block_by_node(&self, node: NodeId) -> &MsgBlock {
-        self.blocks
-            .get(&self.store.node(node).hash.0)
+    pub fn block_by_node(&self, node: NodeId) -> MsgBlock {
+        self.block_data(node)
             .expect("block data for node is stored")
     }
 
@@ -1239,16 +1229,9 @@ impl Chain {
                 // restoring the previous node's own bookkeeping from
                 // the ticket database rows like dcrd does.
                 let prev_height = self.store.node(prev_id).height;
-                let utds = self
-                    .stake_undo
-                    .get(&prev_height)
-                    .expect("ticket undo row for main chain height")
-                    .clone();
-                let tickets = self
-                    .stake_new_tickets
-                    .get(&prev_height)
-                    .expect("ticket row for main chain height")
-                    .clone();
+                let (utds, tickets) = self
+                    .ticket_rows_by_height(prev_height)
+                    .expect("ticket rows for main chain height");
                 let prev_iv = self.store.lottery_iv(prev_id);
                 let stake_node = self
                     .store
@@ -1657,8 +1640,16 @@ impl Chain {
             self.put_treasury_records(node, block, params)?;
         }
 
-        // Commit all entries in the view to the UTXO set.
+        // Commit all entries in the view to the UTXO set, then flush
+        // the pending cache to the backend once it reaches its size
+        // limit so a sustained sync stays memory-bounded (dcrd
+        // `MaybeFlush` after each connect; the clean-shutdown flush
+        // still records the tail).
         self.commit_view(view);
+        if self.db.is_some() && self.utxo_cache_over_limit() {
+            self.flush_utxo_cache(node_hash, node_height as u32)
+                .map_err(persist_rule_error)?;
+        }
 
         // This node is now the end of the best chain.
         self.best_chain.set_tip(&self.store, Some(node));
@@ -1897,7 +1888,7 @@ impl Chain {
             }
             let block = match next_block_to_detach.take() {
                 Some(b) => b,
-                None => self.block_by_node(n).clone(),
+                None => self.block_by_node(n),
             };
             assert_eq!(
                 self.store.node(n).hash,
@@ -1905,7 +1896,7 @@ impl Chain {
                 "detach block node hash does not match the block"
             );
             let parent_id = self.store.node(n).parent.expect("detached block parent");
-            let parent = self.block_by_node(parent_id).clone();
+            let parent = self.block_by_node(parent_id);
             next_block_to_detach = Some(parent.clone());
 
             let parent_view = NodeBranchView {
@@ -1947,9 +1938,9 @@ impl Chain {
         attach_nodes.reverse();
 
         for node in attach_nodes {
-            let block = self.block_by_node(node).clone();
+            let block = self.block_by_node(node);
             let parent_id = self.store.node(node).parent.expect("attach parent");
-            let parent = self.block_by_node(parent_id).clone();
+            let parent = self.block_by_node(parent_id);
             assert_eq!(
                 self.store.node(parent_id).hash,
                 parent.header.block_hash(),
@@ -2219,7 +2210,7 @@ impl Chain {
         let cur_tip = self.best_chain.tip();
         let is_current = cur_tip.is_some_and(|t| self.is_current(t, adjusted_time_unix));
         for (i, &node) in nodes.iter().enumerate() {
-            let block = self.block_by_node(node).clone();
+            let block = self.block_by_node(node);
             let parent_id = self.store.node(node).parent.expect("linked block parent");
             let parent_stake_node = match self.fetch_stake_node(parent_id, params) {
                 Ok(sn) => sn,
@@ -2384,6 +2375,12 @@ impl Chain {
         {
             fork_len = self.store.node(node).height - self.store.node(fork).height;
         }
+
+        // Prune old in-memory state on the pruning interval so a
+        // sustained sync stays memory-bounded (dcrd
+        // `chainPruner.pruneChainIfNeeded` from `connectBestChain`).
+        self.prune_if_needed(adjusted_time_unix);
+
         (fork_len, final_errs)
     }
 
@@ -2766,7 +2763,7 @@ impl Chain {
 
         if prev_node == tip {
             // Use the chain state as is when extending the main chain.
-            let parent = self.block_by_node(tip).clone();
+            let parent = self.block_by_node(tip);
             let branch_view = NodeBranchView {
                 store: &self.store,
                 tip: prev_node,
@@ -2792,8 +2789,8 @@ impl Chain {
 
         // The template builds on the parent of the current tip: undo
         // the tip block to reach the template's point of view.
-        let tip_block = self.block_by_node(tip).clone();
-        let parent = self.block_by_node(prev_node).clone();
+        let tip_block = self.block_by_node(tip);
+        let parent = self.block_by_node(prev_node);
         let stxos = self.fetch_spend_journal(&tip_block, is_treasury_enabled);
         view.disconnect_block(
             &tip_block,
@@ -2860,7 +2857,7 @@ impl Chain {
         // template.
         let mut view = UtxoView::new();
         view.set_best_hash(tip_hash);
-        let tip_block = self.block_by_node(tip).clone();
+        let tip_block = self.block_by_node(tip);
         let parent = self.block_by_node(tip_parent).clone();
 
         // Determine if the treasury agenda is active.
@@ -3017,13 +3014,223 @@ impl Chain {
             .map(|n| self.store.header(n))
     }
 
+    /// Fetch a stored block from the database — the fallback once the
+    /// recent in-memory window has been pruned (dcrd serves every
+    /// block from its database).
+    fn db_fetch_stored_block(&self, hash: &Hash) -> Option<MsgBlock> {
+        let db = self.db.as_ref()?;
+        let mut found: Option<MsgBlock> = None;
+        let _ = db.view(|tx| {
+            if let Ok(raw) = tx.fetch_block(hash)
+                && let Ok((block, _)) = dcroxide_wire::MsgBlock::from_bytes(&raw)
+            {
+                found = Some(block);
+            }
+            Ok(())
+        });
+        found
+    }
+
+    /// The block data for a node from the recent in-memory window or
+    /// the database (dcrd `fetchBlockByNode`).
+    fn block_data(&self, node: NodeId) -> Option<MsgBlock> {
+        let hash = self.store.node(node).hash;
+        if let Some(block) = self.blocks.get(&hash.0) {
+            return Some(block.clone());
+        }
+        self.db_fetch_stored_block(&hash)
+    }
+
+    /// A block's serialized spend journal row from the recent window
+    /// or the database.
+    fn spend_journal_row(&self, hash: &Hash) -> Option<Vec<u8>> {
+        if let Some(row) = self.spend_journal.get(&hash.0) {
+            return Some(row.clone());
+        }
+        let db = self.db.as_ref()?;
+        let mut found = None;
+        let _ = db.view(|tx| {
+            let meta = tx.metadata();
+            if let Some(bucket) = meta.bucket(crate::chaindb::SPEND_JOURNAL_BUCKET_NAME) {
+                found = bucket.get(&hash.0);
+            }
+            Ok(())
+        });
+        found
+    }
+
+    /// A block's version 2 GCS filter from the recent window or the
+    /// database.
+    fn gcs_filter(&self, hash: &Hash) -> Option<FilterV2> {
+        if let Some(filter) = self.filters.get(&hash.0) {
+            return Some(filter.clone());
+        }
+        let db = self.db.as_ref()?;
+        let mut found = None;
+        let _ = db.view(|tx| {
+            found = crate::chaindb::db_fetch_gcs_filter(tx, hash).unwrap_or(None);
+            Ok(())
+        });
+        found
+    }
+
+    /// A block's header commitment leaves from the recent window or
+    /// the database.
+    fn commitments_by_block_hash(&self, hash: &Hash) -> Vec<Hash> {
+        if let Some(leaves) = self.header_commitments.get(&hash.0) {
+            return leaves.clone();
+        }
+        let Some(db) = self.db.as_ref() else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        let _ = db.view(|tx| {
+            found = crate::chaindb::db_fetch_header_commitments(tx, hash).unwrap_or_default();
+            Ok(())
+        });
+        found
+    }
+
+    /// A height's ticket database rows (undo data and new tickets)
+    /// from the recent window or the database.
+    fn ticket_rows_by_height(&self, height: i64) -> Option<(Vec<UndoTicketData>, Vec<Hash>)> {
+        if let (Some(utds), Some(ths)) = (
+            self.stake_undo.get(&height),
+            self.stake_new_tickets.get(&height),
+        ) {
+            return Some((utds.clone(), ths.clone()));
+        }
+        let db = self.db.as_ref()?;
+        let key = (height as u32).to_le_bytes();
+        let mut found = None;
+        let _ = db.view(|tx| {
+            let meta = tx.metadata();
+            let undo = meta
+                .bucket(dcroxide_stake::ticketdb::STAKE_BLOCK_UNDO_DATA_BUCKET_NAME)
+                .and_then(|b| b.get(&key));
+            let tickets = meta
+                .bucket(dcroxide_stake::ticketdb::TICKETS_IN_BLOCK_BUCKET_NAME)
+                .and_then(|b| b.get(&key));
+            if let (Some(undo), Some(tickets)) = (undo, tickets)
+                && let Ok(utds) = dcroxide_stake::ticketdb::deserialize_block_undo_data(&undo)
+                && let Ok(ths) = dcroxide_stake::ticketdb::deserialize_ticket_hashes(&tickets)
+            {
+                found = Some((utds, ths));
+            }
+            Ok(())
+        });
+        found
+    }
+
+    /// The number of blocks whose stake nodes and recent-window data
+    /// stay in memory below the best tip (dcrd `minMemoryStakeNodes`).
+    pub const MIN_MEMORY_STAKE_NODES: i64 = 288;
+
+    /// Set the maximum pending-UTXO-cache size before a connect flushes
+    /// it (dcrd's `--utxocachemaxsize`, in bytes).
+    pub fn set_utxo_cache_max_bytes(&mut self, bytes: u64) {
+        self.utxo_cache_max_bytes = bytes;
+    }
+
+    /// Whether the pending UTXO cache has reached its size limit and a
+    /// connect should flush it (dcrd `utxoCache.shouldFlush`'s size
+    /// check).  The size is estimated from the entry count and a fixed
+    /// per-entry cost rather than tracked byte-exactly, a documented
+    /// simplification of dcrd's incremental `totalEntrySize`.
+    fn utxo_cache_over_limit(&self) -> bool {
+        (self.utxo_cache.len() as u64).saturating_mul(APPROX_UTXO_CACHE_ENTRY_BYTES)
+            >= self.utxo_cache_max_bytes
+    }
+
+    /// Prune old in-memory state on the pruning interval — the target
+    /// block time (dcrd's `chainPruner.pruneChainIfNeeded` called from
+    /// `ProcessBlock`).  A chain without a database never prunes: the
+    /// memory is its only store.
+    pub fn prune_if_needed(&mut self, now_unix: i64) {
+        if self.db.is_none() {
+            return;
+        }
+        // The first observation seeds the interval clock without
+        // pruning (dcrd's `chainPruner.lastPruneTime = time.Now()`), so
+        // the first prune fires one interval later, not immediately.
+        if self.last_prune_unix == 0 {
+            self.last_prune_unix = now_unix;
+            return;
+        }
+        if now_unix.saturating_sub(self.last_prune_unix) < self.prune_interval_secs {
+            return;
+        }
+        self.last_prune_unix = now_unix;
+        self.prune_chain_memory(Self::MIN_MEMORY_STAKE_NODES);
+    }
+
+    /// dcrd `pruneStakeNodes`, extended for the port's recent-window
+    /// mirrors: clear the stake-related fields on block nodes deeper
+    /// than the keep depth below the tip, and evict those blocks'
+    /// bodies, spend journal rows, filters, commitment leaves, and
+    /// per-height ticket rows from memory — every one of them is
+    /// persisted per connect and read back through the database
+    /// fallbacks.  The walk stops at the first already-pruned node
+    /// exactly like dcrd's `stakeNode == nil` bound.
+    pub fn prune_chain_memory(&mut self, keep_depth: i64) {
+        let Some(tip) = self.best_chain.tip() else {
+            return;
+        };
+        let mut prune_to = tip;
+        for _ in 0..keep_depth.saturating_sub(1) {
+            match self.store.node(prune_to).parent {
+                Some(parent) => prune_to = parent,
+                None => return,
+            }
+        }
+        let Some(first) = self.store.node(prune_to).parent else {
+            return;
+        };
+
+        let mut prune_nodes = Vec::new();
+        let mut walk = Some(first);
+        while let Some(id) = walk {
+            let node = self.store.node(id);
+            if node.stake_node.is_none() && !self.blocks.contains_key(&node.hash.0) {
+                break;
+            }
+            prune_nodes.push(id);
+            walk = node.parent;
+        }
+
+        // Oldest to newest, like dcrd.
+        for id in prune_nodes.into_iter().rev() {
+            let (hash, height) = {
+                let node = self.store.node(id);
+                (node.hash, node.height)
+            };
+            {
+                let node = self.store.node_mut(id);
+                node.stake_node = None;
+                node.new_tickets = None;
+                node.tickets_voted = Vec::new();
+                node.tickets_revoked = Vec::new();
+            }
+            // The genesis block stays resident: chains are created
+            // around it and it has no journal or ticket rows.
+            if height > 0 {
+                self.blocks.remove(&hash.0);
+            }
+            self.spend_journal.remove(&hash.0);
+            self.filters.remove(&hash.0);
+            self.header_commitments.remove(&hash.0);
+            self.stake_undo.remove(&height);
+            self.stake_new_tickets.remove(&height);
+        }
+    }
+
     /// The block with the given hash when its data is available (dcrd
     /// `BlockByHash`).
     pub fn block_by_hash(&self, hash: &Hash) -> Option<MsgBlock> {
         self.index
             .lookup_node(hash)
             .filter(|n| self.index.node_status(&self.store, *n).have_data())
-            .and_then(|n| self.blocks.get(&self.store.node(n).hash.0).cloned())
+            .and_then(|n| self.block_data(n))
     }
 
     /// The main chain block at the given height (dcrd
@@ -3031,7 +3238,7 @@ impl Chain {
     pub fn block_by_height(&self, height: i64) -> Option<MsgBlock> {
         self.best_chain
             .node_by_height(height)
-            .and_then(|n| self.blocks.get(&self.store.node(n).hash.0).cloned())
+            .and_then(|n| self.block_data(n))
     }
 
     /// The past median time of the block with the given hash (dcrd
@@ -3876,23 +4083,19 @@ impl Chain {
             ));
         }
 
-        let Some(filter) = self.filters.get(&hash.0) else {
+        let Some(filter) = self.gcs_filter(hash) else {
             return Err(rule_error(
                 RuleErrorKind::NoFilter,
                 format!("no filter available for block {hash}"),
             ));
         };
-        let leaves = self
-            .header_commitments
-            .get(&hash.0)
-            .cloned()
-            .unwrap_or_default();
+        let leaves = self.commitments_by_block_hash(hash);
 
         // Generate the header commitment inclusion proof for the
         // filter.
         let proof = dcroxide_standalone::generate_inclusion_proof(&leaves, HEADER_CMT_FILTER_INDEX);
         Ok((
-            filter.clone(),
+            filter,
             HeaderProof {
                 proof_index: HEADER_CMT_FILTER_INDEX,
                 proof_hashes: proof,
@@ -3955,17 +4158,16 @@ impl Chain {
         // proofs.
         let mut cfilters = Vec::with_capacity(nb);
         for hash in &hashes {
-            let Some(filter) = self.filters.get(&hash.0) else {
+            // The recent window or the database, so a pruned range is
+            // still served (dcrd reads every filter from its cfilter
+            // database).
+            let Some(filter) = self.gcs_filter(hash) else {
                 return Err(rule_error(
                     RuleErrorKind::NoFilter,
                     format!("no filter available for block {hash}"),
                 ));
             };
-            let leaves = self
-                .header_commitments
-                .get(&hash.0)
-                .cloned()
-                .unwrap_or_default();
+            let leaves = self.commitments_by_block_hash(hash);
             let proof =
                 dcroxide_standalone::generate_inclusion_proof(&leaves, HEADER_CMT_FILTER_INDEX);
             cfilters.push(dcroxide_wire::MsgCFilterV2 {
