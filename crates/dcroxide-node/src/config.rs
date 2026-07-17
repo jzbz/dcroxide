@@ -329,6 +329,11 @@ pub struct Config {
     // General application behavior.
     /// Display version information and exit.
     pub show_version: bool,
+    /// The Windows service command (`-s/--service`
+    /// {install,remove,start,stop}); the option group is registered
+    /// only on Windows exactly like dcrd's `newConfigParser`, so the
+    /// flag is an unknown-option error everywhere else.
+    pub service_command: String,
     /// Path to application home directory.
     pub home_dir: String,
     /// Path to configuration file.
@@ -572,6 +577,7 @@ impl Config {
     pub fn defaults(default_home_dir: &str) -> Config {
         Config {
             show_version: false,
+            service_command: String::new(),
             home_dir: default_home_dir.to_string(),
             config_file: filepath_join(&[default_home_dir, DEFAULT_CONFIG_FILENAME]),
             data_dir: filepath_join(&[default_home_dir, DEFAULT_DATA_DIRNAME]),
@@ -710,6 +716,7 @@ pub(crate) fn store_option(
 
     match long {
         "version" => cfg.show_version = as_bool()?,
+        "service" => cfg.service_command = val.to_string(),
         "appdata" => cfg.home_dir = val.to_string(),
         "configfile" => cfg.config_file = val.to_string(),
         "datadir" => cfg.data_dir = val.to_string(),

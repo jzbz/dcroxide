@@ -1,0 +1,21 @@
+[package]
+name = "dcroxide-winsvc"
+version = "0.1.0"
+edition = "2024"
+license = "ISC"
+description = "dcrd's Windows service wrapper (service_windows.go) over the windows-service crate"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
+# The workspace lints are inherited except that this crate cannot
+# forbid unsafe code: the windows-service crate's service-entry macro
+# expands an FFI shim containing an unsafe block into the consuming
+# crate.  No unsafe is written here directly.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+
+[lints.clippy]
+all = "warn"
+arithmetic_side_effects = "warn"

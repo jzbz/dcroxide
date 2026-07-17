@@ -59,6 +59,11 @@ fn flags_front_end_matches_dcrd() {
     assert_eq!(scenarios.len(), 52, "unexpected scenario count");
 
     for (n, sc) in &scenarios {
+        // dcrd registers the service options group only on Windows,
+        // so this posix-truth rejection scenario does not apply there.
+        if cfg!(windows) && sc.name == "service flag not on posix" {
+            continue;
+        }
         let home_dir = tempfile::tempdir().unwrap();
         let home = home_dir.path().to_string_lossy().into_owned();
 
@@ -102,5 +107,34 @@ fn flags_front_end_matches_dcrd() {
                 assert_eq!(&got, expected, "scenario {n}: {}", sc.name);
             }
         }
+    }
+}
+
+/// The `-s/--service` option parses in both forms on Windows, where
+/// dcrd registers the service options group (the posix rejection is
+/// pinned by the vector scenarios).
+#[cfg(windows)]
+#[test]
+fn the_service_command_option_parses() {
+    for args in [
+        vec!["-s".to_string(), "install".to_string()],
+        vec!["--service=stop".to_string()],
+    ] {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path().to_string_lossy().into_owned();
+        let mut full_args = vec![format!("--appdata={home}")];
+        full_args.extend(args.clone());
+        let env = ConfigEnv {
+            default_home_dir: "/dcroxide-nonexistent-default".to_string(),
+            lookup_localhost: Box::new(|| Ok(vec!["::1".to_string(), "127.0.0.1".to_string()])),
+            interface_by_name: Box::new(|_| None),
+            getenv: Box::new(|_| None),
+            user_home: Box::new(|_| None),
+            rand_bytes: Box::new(|b: &mut [u8]| b.fill(0x42)),
+        };
+        let (cfg, _) = load_config_from_argv(&full_args, &env)
+            .unwrap_or_else(|e| panic!("args {args:?}: {e}"));
+        let expected = if args[0] == "-s" { "install" } else { "stop" };
+        assert_eq!(cfg.service_command, expected, "args {args:?}");
     }
 }

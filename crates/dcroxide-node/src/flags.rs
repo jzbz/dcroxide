@@ -601,8 +601,25 @@ pub const ENV_DEFAULTS: [(&str, &str, Option<&str>); 2] = [
 
 /// Find an option by its long name.
 pub fn find_long(name: &str) -> Option<&'static OptSpec> {
-    find_long_in(&OPTIONS, name)
+    find_long_in(&OPTIONS, name).or_else(|| {
+        if cfg!(windows) {
+            find_long_in(&SERVICE_OPTIONS, name)
+        } else {
+            None
+        }
+    })
 }
+
+/// The Windows service options group (dcrd `serviceOptions`): dcrd's
+/// `newConfigParser` adds it to the parser only on Windows, so the
+/// `-s/--service` flag is an unknown-option error everywhere else —
+/// pinned by the flags vectors.
+pub const SERVICE_OPTIONS: [OptSpec; 1] = [OptSpec {
+    long: "service",
+    short: Some('s'),
+    field: "ServiceCommand",
+    kind: OptKind::Str,
+}];
 
 /// Find an option by its long name in the given registry
 /// (short-only options carry an empty long name and never match).
@@ -612,9 +629,16 @@ fn find_long_in(registry: &'static [OptSpec], name: &str) -> Option<&'static Opt
         .find(|o| !o.long.is_empty() && o.long == name)
 }
 
-/// Find an option by its short name.
+/// Find an option by its short name (the Windows-only service group
+/// included only there, like [`find_long`]).
 fn find_short(name: char) -> Option<&'static OptSpec> {
-    find_short_in(&OPTIONS, name)
+    find_short_in(&OPTIONS, name).or_else(|| {
+        if cfg!(windows) {
+            find_short_in(&SERVICE_OPTIONS, name)
+        } else {
+            None
+        }
+    })
 }
 
 /// Find an option by its short name in the given registry.

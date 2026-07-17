@@ -42,7 +42,50 @@ use dcroxide_wire::ServiceFlag;
 
 const APP_NAME: &str = "dcroxide";
 
+/// The graceful-shutdown trigger the Windows service control handler
+/// fires (dcrd's package-level `shutdownRequestChannel`): `run` stores
+/// its interrupt flag and shutdown sender here once they exist, and a
+/// stop arriving before then is latched for `run` to honor on arming.
+static SERVICE_SHUTDOWN: std::sync::OnceLock<(dcroxide_indexers::Interrupt, mpsc::Sender<()>)> =
+    std::sync::OnceLock::new();
+static SERVICE_STOP_EARLY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Request the same graceful shutdown as an interrupt signal, from the
+/// service control handler's thread.
+#[cfg_attr(not(windows), allow(dead_code))] // Only the SCM path calls it.
+fn request_service_shutdown() {
+    SERVICE_STOP_EARLY.store(true, core::sync::atomic::Ordering::SeqCst);
+    if let Some((interrupt, shutdown)) = SERVICE_SHUTDOWN.get() {
+        interrupt.store(true, core::sync::atomic::Ordering::SeqCst);
+        let _ = shutdown.send(());
+    }
+}
+
 fn main() -> ExitCode {
+    // Run under the service control manager when invoked as a Windows
+    // service (dcrd `main` calling `winServiceMain` first); interactive
+    // operation falls through.
+    #[cfg(windows)]
+    {
+        match dcroxide_winsvc::service_main(
+            Box::new(|| {
+                let _ = real_main();
+            }),
+            Box::new(request_service_shutdown),
+        ) {
+            Ok(true) => return ExitCode::SUCCESS,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    real_main()
+}
+
+fn real_main() -> ExitCode {
     // dcrd derives the application data directory with Go's GOOS; map
     // Rust's target OS onto the same names (notably macos -> darwin).
     let goos = match std::env::consts::OS {
@@ -79,7 +122,20 @@ fn main() -> ExitCode {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match load_config_from_argv(&args, &env) {
-        Ok((cfg, _remaining_args)) => run(cfg),
+        Ok((cfg, _remaining_args)) => {
+            // Perform a requested service command and exit (dcrd's
+            // loadConfig hook; the flag parses everywhere but acts
+            // only on Windows, where dcrd prints any error and exits
+            // zero either way).
+            #[cfg(windows)]
+            if !cfg.service_command.is_empty() {
+                if let Err(e) = dcroxide_winsvc::run_service_command(&cfg.service_command) {
+                    eprintln!("{e}");
+                }
+                return ExitCode::SUCCESS;
+            }
+            run(cfg)
+        }
         Err(msg) => match msg.as_str() {
             ERR_HELP_REQUESTED => {
                 // The full go-flags help text is not yet generated.
@@ -133,6 +189,13 @@ fn run(cfg: Config) -> ExitCode {
     let interrupt: dcroxide_indexers::Interrupt =
         Arc::new(core::sync::atomic::AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    // Publish the handles for the Windows service control handler and
+    // honor a stop that arrived before they existed.
+    let _ = SERVICE_SHUTDOWN.set((Arc::clone(&interrupt), shutdown_tx.clone()));
+    if SERVICE_STOP_EARLY.load(core::sync::atomic::Ordering::SeqCst) {
+        interrupt.store(true, core::sync::atomic::Ordering::SeqCst);
+        let _ = shutdown_tx.send(());
+    }
     {
         let signal_interrupt = Arc::clone(&interrupt);
         // Clone the sender for the signal handler so the original stays
