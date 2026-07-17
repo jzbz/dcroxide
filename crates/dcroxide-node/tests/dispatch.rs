@@ -869,6 +869,7 @@ fn announces_connected_blocks_to_served_peers() {
         params.clone(),
         true,
         dcroxide_node::sync::SyncGate::always_current(),
+        None,
         Arc::clone(&tx_pool),
         sync_peers.clone(),
         dcroxide_node::dispatch::new_recently_advertised(),

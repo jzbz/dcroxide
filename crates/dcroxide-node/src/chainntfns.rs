@@ -47,6 +47,11 @@ pub struct ChainNtfnHandler {
     /// paths consult (dcrd gates the NTBlockAccepted case on
     /// `s.syncManager.IsCurrent()`).
     sync_gate: crate::sync::SyncGate,
+    /// The shared mixpool whose misbehavior observer the
+    /// winning-tickets path consults (dcrd's
+    /// `s.mixObserver.MisbehavingBlock` refusal); absent in tests that
+    /// carry no pool.
+    mix_pool: Option<Arc<Mutex<crate::mixnode::NodeMixPool>>>,
     /// The websocket notification manager, present when the RPC
     /// server runs (dcrd's nil `rpcServer` checks around the ws
     /// sends; the index and mempool maintenance run either way).
@@ -129,11 +134,13 @@ enum PendingBlockEvent {
 impl ChainNtfnHandler {
     /// A handler forwarding into the given notification manager and
     /// driving the pool's block maintenance through the relay sinks.
+    #[allow(clippy::too_many_arguments)] // Mirrors dcrd's notification surface.
     pub fn new(
         ntfn: Option<NodeNtfnMgr>,
         params: Params,
         allow_unsynced_mining: bool,
         sync_gate: crate::sync::SyncGate,
+        mix_pool: Option<Arc<Mutex<crate::mixnode::NodeMixPool>>>,
         tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
         sync_peers: crate::dispatch::SyncPeers,
         recently_advertised: Arc<Mutex<dcroxide_containers::lru::Map<Hash, dcroxide_wire::MsgTx>>>,
@@ -143,6 +150,7 @@ impl ChainNtfnHandler {
             params,
             allow_unsynced_mining,
             sync_gate,
+            mix_pool,
             lottery_data_broadcast: Arc::default(),
             pending_winning_tickets: Arc::default(),
             pending_checked_announcements: Arc::default(),
@@ -440,6 +448,19 @@ impl ChainNtfnHandler {
             return;
         }
         for (block_hash, block_height) in pending {
+            // Refuse to notify winning tickets for a block spending
+            // misbehaving mix inputs (dcrd's `MisbehavingBlock` break
+            // in the same gated case), so clients are not prompted to
+            // vote on it.
+            if let Some(mix_pool) = &self.mix_pool
+                && let Some(block) = chain.block_by_hash(&block_hash)
+                && mix_pool
+                    .lock()
+                    .expect("mix pool mutex poisoned")
+                    .misbehaving_block(&block)
+            {
+                continue;
+            }
             {
                 let broadcast = self
                     .lottery_data_broadcast
@@ -904,6 +925,7 @@ mod tests {
                 params.clone(),
                 allow_unsynced,
                 crate::sync::SyncGate::always_current(),
+                None,
                 Arc::clone(&tx_pool),
                 peers,
                 crate::dispatch::new_recently_advertised(),
@@ -1002,6 +1024,7 @@ mod tests {
             params.clone(),
             true,
             crate::sync::SyncGate::always_current(),
+            None,
             Arc::clone(&tx_pool),
             peers,
             crate::dispatch::new_recently_advertised(),
@@ -1064,6 +1087,7 @@ mod tests {
                 params.clone(),
                 allow_unsynced,
                 crate::sync::SyncGate::unsynced(),
+                None,
                 Arc::clone(&tx_pool),
                 crate::dispatch::SyncPeers::new(),
                 crate::dispatch::new_recently_advertised(),

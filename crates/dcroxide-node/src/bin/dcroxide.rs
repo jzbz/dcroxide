@@ -374,6 +374,7 @@ fn run(cfg: Config) -> ExitCode {
         cfg.params.params.clone(),
         cfg.allow_unsynced_mining,
         sync_gate.clone(),
+        Some(Arc::clone(&server.mix_pool)),
         Arc::clone(&tx_pool),
         server.sync_peers.clone(),
         Arc::clone(&server.recently_advertised),
@@ -779,6 +780,11 @@ fn run(cfg: Config) -> ExitCode {
         }
     };
 
+    // Watch for mix session misbehavior at every epoch boundary (dcrd
+    // `Server.Run` running `s.mixObserver.Run`).
+    let mix_observer =
+        dcroxide_node::mixnode::start_mix_epoch_observer(Arc::clone(&server.mix_pool));
+
     pipe_notifier.notify_startup_complete();
     log_info("Serving peers until a shutdown signal is received.");
 
@@ -807,6 +813,7 @@ fn run(cfg: Config) -> ExitCode {
     if let Some(seeder_boot) = seeder_boot {
         seeder_boot.shutdown();
     }
+    mix_observer.shutdown();
     connector.shutdown();
     stall_timer.shutdown();
     if let Some(rebroadcaster) = rebroadcaster {

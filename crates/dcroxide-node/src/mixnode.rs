@@ -190,6 +190,100 @@ pub fn pool_to_wire_message(msg: PoolMessage) -> Message {
     }
 }
 
+/// The running mix epoch observer; [`MixObserver::shutdown`] stops
+/// the ticker.
+pub struct MixObserver {
+    stop: std::sync::mpsc::Sender<()>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl MixObserver {
+    /// Stop the ticker and wait for it.
+    pub fn shutdown(mut self) {
+        let _ = self.stop.send(());
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Wake at every epoch boundary (UTC unix time truncated to the epoch,
+/// plus one epoch — dcrd `Observer.waitForEpoch`) and hand the
+/// previous finished epoch to the callback, skipping the first
+/// boundary because no full epoch has finished yet (dcrd
+/// `Observer.Run`'s `prevEpoch == 0` skip).  The callback's error
+/// stops the loop, exactly as dcrd's `Run` returns it.
+fn run_epoch_ticker(
+    epoch: std::time::Duration,
+    stopped: &std::sync::mpsc::Receiver<()>,
+    mut on_prev_epoch: impl FnMut(u64) -> Result<(), String>,
+) {
+    let epoch_secs = epoch.as_secs().max(1);
+    let mut prev_epoch = 0u64;
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        // epoch_secs is clamped to at least one above.
+        let now_sub = now.as_secs().checked_rem(epoch_secs).unwrap_or(0);
+        let until_boundary = std::time::Duration::from_secs(epoch_secs.saturating_sub(now_sub))
+            .saturating_sub(std::time::Duration::from_nanos(u64::from(
+                now.subsec_nanos(),
+            )));
+        let boundary = now
+            .as_secs()
+            .saturating_sub(now_sub)
+            .saturating_add(epoch_secs);
+        match stopped.recv_timeout(until_boundary) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            // A stop signal or a dropped sender ends the loop.
+            _ => return,
+        }
+        if prev_epoch == 0 {
+            prev_epoch = boundary;
+            continue;
+        }
+        if on_prev_epoch(prev_epoch).is_err() {
+            return;
+        }
+        prev_epoch = boundary;
+    }
+}
+
+/// Drive the mixpool's misbehavior observer on the epoch ticker (dcrd
+/// `Server.Run` running `s.mixObserver.Run(ctx)`): after each epoch
+/// completes, the previous epoch's sessions are checked for timeout
+/// misbehavior, feeding the strike set behind
+/// [`Pool::misbehaving_block`] and [`Pool::misbehaving_tx`].  A check
+/// error stops the observer, exactly as dcrd's `Run` returns it.
+pub fn start_mix_epoch_observer(pool: Arc<Mutex<NodeMixPool>>) -> MixObserver {
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let epoch_secs = pool
+        .lock()
+        .expect("mix pool mutex poisoned")
+        .epoch_secs()
+        .max(1) as u64;
+    let join = std::thread::spawn(move || {
+        run_epoch_ticker(
+            std::time::Duration::from_secs(epoch_secs),
+            &stopped,
+            |prev_epoch| {
+                pool.lock()
+                    .expect("mix pool mutex poisoned")
+                    .check_prev_epoch(prev_epoch)
+                    .map_err(|e| {
+                        println!("[ERR] MXPL: mix observer check failed: {e:?}");
+                        format!("{e:?}")
+                    })
+            },
+        );
+    });
+    MixObserver {
+        stop,
+        join: Some(join),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +396,41 @@ mod tests {
 
     /// A non-mix message is not mistaken for one (the intake gate returns
     /// `None` so the dispatcher falls through to the normal handlers).
+    /// The epoch ticker skips the first boundary (no finished epoch
+    /// yet), then hands each completed epoch's boundary time to the
+    /// callback in order, and the stop signal ends it (dcrd
+    /// `Observer.Run`'s prevEpoch skip over `waitForEpoch`).
+    #[test]
+    fn epoch_ticker_reports_previous_epochs() {
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let fired: Arc<Mutex<Vec<u64>>> = Arc::default();
+        let thread_fired = Arc::clone(&fired);
+        let ticker = std::thread::spawn(move || {
+            run_epoch_ticker(std::time::Duration::from_secs(1), &stopped, |prev| {
+                thread_fired.lock().expect("fired").push(prev);
+                Ok(())
+            });
+        });
+        // Three boundaries: the first is skipped, so at least one and
+        // possibly two callbacks land.
+        std::thread::sleep(std::time::Duration::from_millis(3200));
+        stop.send(()).expect("stop");
+        ticker.join().expect("ticker thread");
+
+        let fired = fired.lock().expect("fired");
+        assert!(!fired.is_empty(), "a completed epoch must be reported");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        for window in fired.windows(2) {
+            assert!(window[0] < window[1], "epochs must be increasing");
+        }
+        for prev in fired.iter() {
+            assert!(*prev <= now, "a reported epoch lies in the past");
+        }
+    }
+
     #[test]
     fn non_mix_message_is_not_converted() {
         assert!(wire_to_pool_message(Message::MemPool).is_none());

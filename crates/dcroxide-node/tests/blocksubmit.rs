@@ -189,6 +189,7 @@ fn a_submitted_block_drains_the_chain_handler() {
         params.clone(),
         true,
         dcroxide_node::sync::SyncGate::always_current(),
+        None,
         Arc::clone(&tx_pool),
         SyncPeers::new(),
         new_recently_advertised(),

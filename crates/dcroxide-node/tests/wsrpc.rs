@@ -335,6 +335,12 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
         params.clone(),
         true,
         dcroxide_node::sync::SyncGate::always_current(),
+        // A real (empty) mixpool exercises the misbehaving-block gate's
+        // clean path: nothing is struck, so the notifications proceed.
+        Some(dcroxide_node::mixnode::shared_mix_pool(
+            Arc::clone(&chain),
+            params.clone(),
+        )),
         dcroxide_node::txmempool::new_shared_tx_pool(
             Arc::clone(&chain),
             &params,
