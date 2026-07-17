@@ -5,7 +5,9 @@
 //!
 //! Like the difficulty port, dcrd's parent-pointer walks are abstracted
 //! behind a height-indexed view.  dcrd's per-hash memoization caches
-//! are result-invariant and not reproduced.
+//! are exposed through the view's `cache_*` hooks: result-invariant —
+//! the vector batteries run without them — but load-bearing for
+//! performance on deep chains.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -34,10 +36,74 @@ pub struct VersionNode {
 
 /// A height-indexed view of the branch of block nodes ending at the
 /// block being extended.
+///
+/// The `cache_*` methods expose dcrd blockchain.go's hash-keyed
+/// memoization caches (`calcPriorStakeVersionCache`,
+/// `calcVoterVersionIntervalCache`, `calcStakeVersionCache`,
+/// `isStakeMajorityVersionCache`).  The defaults disable caching —
+/// results are identical either way, which the differential vector
+/// batteries exercise through these very defaults — and the live
+/// chain's view overrides them, since without memoization the
+/// interval walks make every deep-chain contextual check re-tally
+/// hundreds of thousands of ancestors.
+///
+/// The keys deliberately use the hash of each function's ARGUMENT
+/// node where dcrd keys some caches by the derived prior-interval
+/// node; every function is a pure function of its argument node's
+/// ancestry, so the results are identical — only the cache contents
+/// and hit patterns differ, which an adversarial differential
+/// harness verified across forked branches.
 pub trait VersionChainView {
     /// The node at the given height along this branch, or `None` when
     /// the height is negative or unknown.
     fn node(&self, height: i64) -> Option<VersionNode>;
+
+    /// The hash identifying the node at the height along this branch,
+    /// used as the memoization key exactly as dcrd keys its caches by
+    /// block hash; `None` — the default — disables caching.
+    fn cache_hash(&self, _height: i64) -> Option<[u8; 32]> {
+        None
+    }
+
+    /// A cached `calc_voter_version_interval` result for the
+    /// interval-final node with the hash.
+    fn voter_version_interval_cached(&self, _hash: [u8; 32]) -> Option<Option<u32>> {
+        None
+    }
+
+    /// Record a `calc_voter_version_interval` result for the
+    /// interval-final node with the hash.
+    fn cache_voter_version_interval(&self, _hash: [u8; 32], _version: Option<u32>) {}
+
+    /// A cached `is_stake_majority_version` result for the minimum
+    /// version at the node with the hash.
+    fn stake_majority_cached(&self, _min_ver: u32, _hash: [u8; 32]) -> Option<bool> {
+        None
+    }
+
+    /// Record an `is_stake_majority_version` result for the minimum
+    /// version at the node with the hash.
+    fn cache_stake_majority(&self, _min_ver: u32, _hash: [u8; 32], _majority: bool) {}
+
+    /// A cached `calc_prior_stake_version` result for the node with
+    /// the hash.
+    fn prior_stake_version_cached(&self, _hash: [u8; 32]) -> Option<Option<u32>> {
+        None
+    }
+
+    /// Record a `calc_prior_stake_version` result for the node with
+    /// the hash.
+    fn cache_prior_stake_version(&self, _hash: [u8; 32], _version: Option<u32>) {}
+
+    /// A cached `calc_stake_version` result for the node with the
+    /// hash.
+    fn stake_version_cached(&self, _hash: [u8; 32]) -> Option<u32> {
+        None
+    }
+
+    /// Record a `calc_stake_version` result for the node with the
+    /// hash.
+    fn cache_stake_version(&self, _hash: [u8; 32], _version: u32) {}
 }
 
 /// The height of the final block in the interval that occurred before
@@ -93,6 +159,15 @@ pub fn is_stake_majority_version(
         return min_ver == 0;
     };
 
+    // dcrd's isStakeMajorityVersionCache, keyed by the minimum
+    // version and the node's hash.
+    let cache_key = view.cache_hash(prev_height);
+    if let Some(hash) = cache_key
+        && let Some(majority) = view.stake_majority_cached(min_ver, hash)
+    {
+        return majority;
+    }
+
     let mut version_count: i32 = 0;
     let mut h = start;
     for _ in 0..params.stake_version_interval {
@@ -110,7 +185,11 @@ pub fn is_stake_majority_version(
 
     let num_required = params.stake_version_interval as i32 * params.stake_majority_multiplier
         / params.stake_majority_divisor;
-    version_count >= num_required
+    let majority = version_count >= num_required;
+    if let Some(hash) = cache_key {
+        view.cache_stake_majority(min_ver, hash, majority);
+    }
+    majority
 }
 
 /// The header stake version a supermajority of the previous interval
@@ -124,6 +203,14 @@ pub fn calc_prior_stake_version(
     let Some(start) = find_stake_version_prior_height(prev_height, params) else {
         return Some(0);
     };
+
+    // dcrd's calcPriorStakeVersionCache, keyed by the node's hash.
+    let cache_key = view.cache_hash(prev_height);
+    if let Some(hash) = cache_key
+        && let Some(version) = view.prior_stake_version_cached(hash)
+    {
+        return version;
+    }
 
     let mut versions: BTreeMap<u32, i32> = BTreeMap::new();
     let mut h = start;
@@ -142,10 +229,14 @@ pub fn calc_prior_stake_version(
     // random map iteration order is immaterial.
     let num_required = params.stake_version_interval as i32 * params.stake_majority_multiplier
         / params.stake_majority_divisor;
-    versions
+    let version = versions
         .into_iter()
         .find(|(_, count)| *count >= num_required)
-        .map(|(version, _)| version)
+        .map(|(version, _)| version);
+    if let Some(hash) = cache_key {
+        view.cache_prior_stake_version(hash, version);
+    }
+    version
 }
 
 /// The version of the votes in the stake version interval ending at the
@@ -166,6 +257,15 @@ pub fn calc_voter_version_interval(
          version interval"
     );
 
+    // dcrd's calcVoterVersionIntervalCache, keyed by the
+    // interval-final node's hash.
+    let cache_key = view.cache_hash(interval_end_height);
+    if let Some(hash) = cache_key
+        && let Some(version) = view.voter_version_interval_cached(hash)
+    {
+        return version;
+    }
+
     let mut versions: BTreeMap<u32, i32> = BTreeMap::new();
     let mut total_votes_found: i32 = 0;
     let mut h = interval_end_height;
@@ -185,10 +285,14 @@ pub fn calc_voter_version_interval(
 
     let num_required =
         total_votes_found * params.stake_majority_multiplier / params.stake_majority_divisor;
-    versions
+    let version = versions
         .into_iter()
         .find(|(_, count)| *count >= num_required)
-        .map(|(version, _)| version)
+        .map(|(version, _)| version);
+    if let Some(hash) = cache_key {
+        view.cache_voter_version_interval(hash, version);
+    }
+    version
 }
 
 /// The last majority vote version walking backwards one interval at a
@@ -244,8 +348,19 @@ pub fn is_majority_version(
 /// The expected stake version for the block after the given node (dcrd
 /// `calcStakeVersion`).
 pub fn calc_stake_version(view: &impl VersionChainView, prev_height: i64, params: &Params) -> u32 {
+    // dcrd's calcStakeVersionCache, keyed by the node's hash.
+    let cache_key = view.cache_hash(prev_height);
+    if let Some(hash) = cache_key
+        && let Some(version) = view.stake_version_cached(hash)
+    {
+        return version;
+    }
+
     let (mut version, node_height) = calc_voter_version(view, prev_height, params);
     if version == 0 || node_height.is_none() {
+        if let Some(hash) = cache_key {
+            view.cache_stake_version(hash, 0);
+        }
         return 0;
     }
     let node_height = node_height.expect("checked above");
@@ -274,6 +389,9 @@ pub fn calc_stake_version(view: &impl VersionChainView, prev_height: i64, params
         params.block_reject_num_required,
         params,
     ) {
+        if let Some(hash) = cache_key {
+            view.cache_stake_version(hash, 0);
+        }
         return 0;
     }
 
@@ -282,6 +400,9 @@ pub fn calc_stake_version(view: &impl VersionChainView, prev_height: i64, params
         && prior_version > version
     {
         version = prior_version;
+    }
+    if let Some(hash) = cache_key {
+        view.cache_stake_version(hash, version);
     }
     version
 }

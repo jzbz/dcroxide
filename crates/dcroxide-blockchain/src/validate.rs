@@ -1314,18 +1314,17 @@ pub fn check_block_header_context(
         // the network has upgraded to version 3 blocks.
         if header.version >= 3
             && crate::stakever::is_majority_version(
-                &crate::sequencelock::AsVersionView(view),
+                view,
                 3,
                 Some(prev_height),
                 params.block_enforce_num_required,
                 params,
             )
         {
-            let expected_stake_ver = crate::stakever::calc_stake_version(
-                &crate::sequencelock::AsVersionView(view),
-                prev_height,
-                params,
-            );
+            // The view is passed directly — not through the adapter —
+            // so the stake version caches engage on this per-block
+            // path (dcrd's primary calcStakeVersionCache consumer).
+            let expected_stake_ver = crate::stakever::calc_stake_version(view, prev_height, params);
             if header.stake_version != expected_stake_ver {
                 return Err(rule_error(
                     RuleErrorKind::BadStakeVersion,

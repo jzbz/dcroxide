@@ -241,6 +241,77 @@ impl crate::difficulty::ChainView for NodeBranchView<'_> {
     }
 }
 
+impl crate::stakever::VersionChainView for NodeBranchView<'_> {
+    fn node(&self, height: i64) -> Option<crate::stakever::VersionNode> {
+        use crate::thresholdstate::VoteChainView;
+        self.vote_node(height).map(|n| n.node)
+    }
+
+    fn cache_hash(&self, height: i64) -> Option<[u8; 32]> {
+        if height < 0 || height > self.store.node(self.tip).height {
+            return None;
+        }
+        let id = self.store.ancestor(self.tip, height)?;
+        Some(self.store.node(id).hash.0)
+    }
+
+    fn voter_version_interval_cached(&self, hash: [u8; 32]) -> Option<Option<u32>> {
+        self.store
+            .voter_version_interval_cache
+            .borrow()
+            .get(&hash)
+            .copied()
+    }
+
+    fn cache_voter_version_interval(&self, hash: [u8; 32], version: Option<u32>) {
+        self.store
+            .voter_version_interval_cache
+            .borrow_mut()
+            .insert(hash, version);
+    }
+
+    fn stake_majority_cached(&self, min_ver: u32, hash: [u8; 32]) -> Option<bool> {
+        self.store
+            .stake_majority_cache
+            .borrow()
+            .get(&(min_ver, hash))
+            .copied()
+    }
+
+    fn cache_stake_majority(&self, min_ver: u32, hash: [u8; 32], majority: bool) {
+        self.store
+            .stake_majority_cache
+            .borrow_mut()
+            .insert((min_ver, hash), majority);
+    }
+
+    fn prior_stake_version_cached(&self, hash: [u8; 32]) -> Option<Option<u32>> {
+        self.store
+            .prior_stake_version_cache
+            .borrow()
+            .get(&hash)
+            .copied()
+    }
+
+    fn cache_prior_stake_version(&self, hash: [u8; 32], version: Option<u32>) {
+        self.store
+            .prior_stake_version_cache
+            .borrow_mut()
+            .insert(hash, version);
+    }
+
+    fn stake_version_cached(&self, hash: [u8; 32]) -> Option<u32> {
+        self.store.stake_version_cache.borrow().get(&hash).copied()
+    }
+
+    fn cache_stake_version(&self, hash: [u8; 32], version: u32) {
+        self.store
+            .stake_version_cache
+            .borrow_mut()
+            .insert(hash, version);
+    }
+}
+
 impl crate::thresholdstate::VoteChainView for NodeBranchView<'_> {
     fn vote_node(&self, height: i64) -> Option<crate::thresholdstate::VoteNode> {
         if height < 0 || height > self.store.node(self.tip).height {
@@ -258,5 +329,39 @@ impl crate::thresholdstate::VoteChainView for NodeBranchView<'_> {
             },
             votes: n.votes.clone(),
         })
+    }
+
+    fn threshold_state_cached(
+        &self,
+        deployment_version: u32,
+        vote_id: &str,
+        hash: [u8; 32],
+    ) -> Option<crate::thresholdstate::ThresholdStateTuple> {
+        self.store
+            .threshold_state_cache
+            .borrow()
+            .get(&(
+                deployment_version,
+                alloc::string::String::from(vote_id),
+                hash,
+            ))
+            .cloned()
+    }
+
+    fn cache_threshold_state(
+        &self,
+        deployment_version: u32,
+        vote_id: &str,
+        hash: [u8; 32],
+        state: crate::thresholdstate::ThresholdStateTuple,
+    ) {
+        self.store.threshold_state_cache.borrow_mut().insert(
+            (
+                deployment_version,
+                alloc::string::String::from(vote_id),
+                hash,
+            ),
+            state,
+        );
     }
 }

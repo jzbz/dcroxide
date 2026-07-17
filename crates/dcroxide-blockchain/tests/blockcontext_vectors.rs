@@ -38,6 +38,15 @@ impl ChainView for VecChain {
     }
 }
 
+// The vote view is also a version view (the supertrait the cached
+// stake version calculations require); the cache hooks stay at their
+// disabled defaults so the vectors replay the uncached path.
+impl dcroxide_blockchain::stakever::VersionChainView for VecChain {
+    fn node(&self, height: i64) -> Option<dcroxide_blockchain::stakever::VersionNode> {
+        self.vote_node(height).map(|n| n.node)
+    }
+}
+
 impl VoteChainView for VecChain {
     fn vote_node(&self, height: i64) -> Option<VoteNode> {
         if height < 0 {

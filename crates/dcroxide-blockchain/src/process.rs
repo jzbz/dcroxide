@@ -4036,11 +4036,10 @@ impl Chain {
             tip: node,
         };
         let height = self.store.node(node).height;
-        Ok(crate::stakever::calc_stake_version(
-            &crate::sequencelock::AsVersionView(&view),
-            height,
-            params,
-        ))
+        // The view is passed directly so the stake version caches
+        // engage (dcrd `CalcStakeVersionByHash` reads the same
+        // caches).
+        Ok(crate::stakever::calc_stake_version(&view, height, params))
     }
 
     /// The required proof of work difficulty for the block AFTER the

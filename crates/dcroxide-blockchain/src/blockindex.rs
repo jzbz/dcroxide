@@ -205,11 +205,45 @@ pub fn compare_hashes_as_uint256_le(a: &Hash, b: &Hash) -> i32 {
     0
 }
 
+/// The threshold-state cache rows: the deployment version, its vote
+/// id, and the interval-boundary block hash mapping to the computed
+/// state.
+type ThresholdStateCacheMap = alloc::collections::BTreeMap<
+    (u32, alloc::string::String, [u8; 32]),
+    crate::thresholdstate::ThresholdStateTuple,
+>;
+
 /// The arena owning every block node, providing the node-level
 /// operations dcrd implements as `blockNode` methods.
+///
+/// The store also owns the hash-keyed memoization caches dcrd keeps
+/// on its `BlockChain` (the per-deployment `thresholdStateCache` and
+/// the four stake-version caches from blockchain.go).  They live here
+/// so the branch views can consult them without widening any
+/// signatures; entries are keyed by block hash, so they are correct
+/// across every branch and never need invalidating.  Interior
+/// mutability lets the read-only views record results.
 #[derive(Default)]
 pub struct NodeStore {
     nodes: Vec<BlockNode>,
+    /// dcrd's per-deployment `thresholdStateCache`, keyed by the
+    /// deployment version, its vote id, and the interval-boundary
+    /// block hash.
+    pub(crate) threshold_state_cache: core::cell::RefCell<ThresholdStateCacheMap>,
+    /// dcrd's `calcVoterVersionIntervalCache`, keyed by the
+    /// interval-final block hash.
+    pub(crate) voter_version_interval_cache:
+        core::cell::RefCell<alloc::collections::BTreeMap<[u8; 32], Option<u32>>>,
+    /// dcrd's `isStakeMajorityVersionCache`, keyed by the minimum
+    /// version and the block hash.
+    pub(crate) stake_majority_cache:
+        core::cell::RefCell<alloc::collections::BTreeMap<(u32, [u8; 32]), bool>>,
+    /// dcrd's `calcPriorStakeVersionCache`, keyed by the block hash.
+    pub(crate) prior_stake_version_cache:
+        core::cell::RefCell<alloc::collections::BTreeMap<[u8; 32], Option<u32>>>,
+    /// dcrd's `calcStakeVersionCache`, keyed by the block hash.
+    pub(crate) stake_version_cache:
+        core::cell::RefCell<alloc::collections::BTreeMap<[u8; 32], u32>>,
 }
 
 impl NodeStore {
