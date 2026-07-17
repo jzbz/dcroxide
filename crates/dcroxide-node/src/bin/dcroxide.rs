@@ -150,8 +150,27 @@ fn run(cfg: Config) -> ExitCode {
         }
     }
 
+    // The pipe IPC lifecycle (dcrd `dcrdMain`'s lifetimeNotifier and
+    // service control pipes): the writer serves --pipetx, the watcher
+    // treats the parent closing --piperx as a shutdown request, and
+    // the lifetime events fire only under --lifetimeevents.
+    let pipe_notifier =
+        dcroxide_node::pipeserve::new_pipe_notifier(cfg.pipe_tx, cfg.lifetime_events);
+    if cfg.pipe_rx != 0 {
+        let rx_interrupt = Arc::clone(&interrupt);
+        let rx_shutdown = shutdown_tx.clone();
+        dcroxide_node::pipeserve::start_pipe_rx(
+            cfg.pipe_rx,
+            Box::new(move || {
+                rx_interrupt.store(true, core::sync::atomic::Ordering::SeqCst);
+                let _ = rx_shutdown.send(());
+            }),
+        );
+    }
+
     // Load the block database and initialize the chain state, creating
     // the genesis state when the database is fresh.
+    pipe_notifier.notify_startup_event(dcroxide_node::ipc::LifetimeAction::DbOpen);
     log_info("Loading block database from disk...");
     let db = match open_block_db(&cfg) {
         Ok(db) => db,
@@ -302,6 +321,7 @@ fn run(cfg: Config) -> ExitCode {
             cfg.rpc_max_websockets.max(0) as usize,
         ))
     };
+    pipe_notifier.notify_startup_event(dcroxide_node::ipc::LifetimeAction::P2pServer);
     let (server, connected, template, stall_timer) = build_server(
         &cfg,
         Arc::clone(&chain),
@@ -759,12 +779,14 @@ fn run(cfg: Config) -> ExitCode {
         }
     };
 
+    pipe_notifier.notify_startup_complete();
     log_info("Serving peers until a shutdown signal is received.");
 
     // Idle until the signal handler armed at startup reports an
     // interrupt (SIGINT) or termination (SIGTERM) signal, mirroring
     // dcrd's shutdown listener.
     let _ = shutdown_rx.recv();
+    pipe_notifier.notify_shutdown_event(dcroxide_node::ipc::LifetimeAction::P2pServer);
 
     // Stop seeding and dialing, stop the watchdog, disconnect the live
     // peers, and stop accepting new connections (dcrd's server
@@ -825,6 +847,7 @@ fn run(cfg: Config) -> ExitCode {
     // holds the UTXO changes in the cache, so without this a restart
     // loads a best state ahead of the persisted UTXO set and wedges the
     // node on the next block.
+    pipe_notifier.notify_shutdown_event(dcroxide_node::ipc::LifetimeAction::DbOpen);
     log_info("Flushing the block database to disk...");
     if let Err(e) = chain
         .lock()
