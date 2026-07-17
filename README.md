@@ -9,13 +9,19 @@ Parity target: **dcrd `release-v2.1.5`** — wire protocol 12, JSON-RPC API
 [PARITY.md](PARITY.md) for per-package status. The full plan lives in
 [dcroxide-project-brief.md](dcroxide-project-brief.md).
 
-**Status: pre-alpha — Phases 4 and 6 complete, plus the stake
-transaction primitives from Phase 5 and the storage layer opening
-Phase 7 (rig, primitives, wire, chaincfg, the full script engine
-including addresses, classification, and signing, stake transaction
-rules, the standalone consensus functions, and the block/metadata
-database).** Nothing here is ready to validate, relay, or hold funds.
-Currently implemented:
+**Status: pre-alpha — the dcrd surface is ported end to end.** Every
+dcrd package has a Rust counterpart and the threaded daemon assembles
+them all: config, chain engine with full consensus validation, mempool,
+mining and CPU miner, P2P server with sync, relay, and mixing, the
+JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
+and the Windows service wrapper. The deliberate non-ports are small
+and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
+the Windows event log, and the wallet-side mixclient). The test suite
+runs 550+ tests across 214 suites, most differential against dcrd
+itself or replaying sessions generated inside dcrd's own packages.
+**It has not yet been soaked against the live network, and nothing
+here is ready to validate, relay, or hold funds.** Currently
+implemented:
 
 - `dcroxide-crypto` — BLAKE-256 (vendored from
   [dcr-rs](https://github.com/jzbz/dcr-rs), KAT-pinned, differential-tested
@@ -183,19 +189,23 @@ Currently implemented:
   tracking, and the rejected/recently-confirmed filters, pinned by a
   scripted 87-step session against a real dcrd sync manager, chain,
   peers, and pools, replayed over the real Rust chain engine
-- `dcroxide-node` — daemon assembly from dcrd's package main,
-  starting with the configuration layer: every option with dcrd's
-  defaults, the go-flags command line and INI syntax with its exact
-  parse error texts and precedence semantics, environment variable
-  defaults, and the full validation and derivation gauntlet with
-  dcrd's exact error strings, replayed field for field against
-  dcrd's own loadConfig, plus the network parameter groupings, the
-  embedded sample config, the logging subsystem registry, the pipe
-  IPC lifecycle protocol framed byte for byte, the version machinery
-  with dcrd's semver parsing, and the P2P server's address
-  bookkeeping and relay (the submission cache, local address
-  resolution, the getaddr/addr handlers, and the ban machinery,
-  replayed against dcrd's real handlers over piped peers)
+- `dcroxide-node` — the daemon itself from dcrd's package main, as OS
+  threads over channels rather than goroutines: the full configuration
+  layer (every option with dcrd's defaults, the go-flags command line,
+  INI, and environment semantics with dcrd's exact error strings, and
+  the generated help text byte for byte), the server dispatch wiring
+  every ported handler over live TCP peers (handshake, sync, relay,
+  addr exchange, bans, mixing, and getdata serving with absolute
+  per-message read deadlines), the outbound connection driver with
+  addrmgr-backed dialing, the SOCKS5/Tor dial path with stream
+  isolation, the HTTPS seeder (proxy-routed when configured), the
+  JSON-RPC/websocket server over TLS with the shutdown drain and
+  request-read watchdog, the mempool/chain/index/fee-estimator
+  glue, the background template generator and CPU miner, the pipe
+  IPC lifecycle, and the tool binaries (gencerts, addblock,
+  promptsecret) — the P2P and RPC decision cores replayed against
+  dcrd's real handlers, the runtime pinned by end-to-end socket
+  tests
 - `dcroxide-peer` — the peer-to-peer protocol decision core from
   dcrd's `peer` package: version negotiation with self-connection
   detection and dcrd's exact acceptance rules, local version
@@ -224,8 +234,15 @@ Currently implemented:
   expiry, and misbehavior observer, replayed bit for bit from
   sessions scripted inside dcrd's own packages including a full
   honest 4-peer mix run and two observer strike rounds
+- `dcroxide-winsvc` — dcrd's Windows service wrapper over the
+  `windows-service` crate: SCM detection and the service body with
+  dcrd's status transitions, and the `--service`
+  install/remove/start/stop commands (the option registered only on
+  Windows, exactly like dcrd)
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   release-v2.1.5 module versions) as a test oracle over line-delimited JSON
+- `tools/helpgen` — the go-flags help-vector generator over dcrd's
+  verbatim config struct
 
 ## Layout
 
@@ -247,8 +264,10 @@ cargo +nightly fuzz list                       # requires cargo-fuzz
 cargo +nightly fuzz run wire_msgtx_decode
 ```
 
-Consensus-tagged crates enforce `#![forbid(unsafe_code)]` (workspace-wide
-lint) and `#![deny(missing_docs)]`.
+The workspace forbids `unsafe_code` and denies `missing_docs`
+everywhere (the one exception: `dcroxide-winsvc` denies rather than
+forbids unsafe because the service-entry macro expands an FFI shim,
+while writing none itself).
 
 ## License
 
