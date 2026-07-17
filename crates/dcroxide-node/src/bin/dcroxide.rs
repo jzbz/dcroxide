@@ -15,8 +15,9 @@
 //! (off simnet/regnet), which the HTTPS seeder bootstrap primes; the
 //! chain carries a live UTXO cache flushed to the block database on
 //! shutdown; and the JSON-RPC/websocket server binds unless `--norpc`.
-//! The logging subsystem is still a fixed-prefix stdout stub
-//! (`log_info`), of which the absent rotating file backend is one facet.
+//! Log lines render in slog's exact header format with their dcrd
+//! subsystem tags, gated by `--debuglevel`, to stdout only — the
+//! rotating file backend remains unwired.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -166,6 +167,9 @@ fn real_main() -> ExitCode {
 /// peer listeners, starts outbound dialing, seeding, and the RPC server,
 /// then idles on the shutdown listener before tearing everything down.
 fn run(cfg: Config) -> ExitCode {
+    // Install the per-subsystem log levels the configuration parsed
+    // (dcrd's loadConfig calling parseAndSetDebugLevels).
+    dcroxide_node::logging::set_levels(cfg.log_levels.clone());
     print!("{}", logo::startup_banner(version::version_string()));
     println!();
 
@@ -208,7 +212,7 @@ fn run(cfg: Config) -> ExitCode {
             signal_interrupt.store(true, core::sync::atomic::Ordering::SeqCst);
             let _ = signal_shutdown.send(());
         }) {
-            log_info(&format!("unable to install signal handler: {e}"));
+            log_error(&format!("unable to install signal handler: {e}"));
             return ExitCode::FAILURE;
         }
     }
@@ -238,7 +242,7 @@ fn run(cfg: Config) -> ExitCode {
     let db = match open_block_db(&cfg) {
         Ok(db) => db,
         Err(e) => {
-            log_info(&format!("Unable to load block database: {e}"));
+            log_error(&format!("Unable to load block database: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -274,7 +278,7 @@ fn run(cfg: Config) -> ExitCode {
     let chain = match open_chain(&cfg, db.clone()) {
         Ok(chain) => chain,
         Err(e) => {
-            log_info(&format!("Unable to load block database: {e}"));
+            log_error(&format!("Unable to load block database: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -293,10 +297,10 @@ fn run(cfg: Config) -> ExitCode {
     // catch-up over the shared subscriber).
     let indexes = if cfg.tx_index || !cfg.no_exists_addr_index {
         if cfg.tx_index {
-            log_info("Transaction index is enabled");
+            dcroxide_node::logging::info("INDX", "Transaction index is enabled");
         }
         if !cfg.no_exists_addr_index {
-            log_info("Exists address index is enabled");
+            dcroxide_node::logging::info("INDX", "Exists address index is enabled");
         }
         match dcroxide_node::indexes::start_indexes(
             Arc::clone(&interrupt),
@@ -308,7 +312,7 @@ fn run(cfg: Config) -> ExitCode {
         ) {
             Ok(indexes) => Some(indexes),
             Err(e) => {
-                log_info(&format!("Unable to start the indexes: {e}"));
+                log_error(&format!("Unable to start the indexes: {e}"));
                 return ExitCode::FAILURE;
             }
         }
@@ -321,9 +325,10 @@ fn run(cfg: Config) -> ExitCode {
     let mut addr_manager = AddrManager::new(Path::new(&cfg.data_dir));
     addr_manager.load_peers();
     let known_addrs = addr_manager.address_cache(|_: NetAddressType| true).len();
-    log_info(&format!(
-        "Address manager loaded {known_addrs} known address(es)"
-    ));
+    dcroxide_node::logging::info(
+        "AMGR",
+        &format!("Address manager loaded {known_addrs} known address(es)"),
+    );
     // Share the manager with the served peers' addr exchange.
     let addr_manager = Arc::new(Mutex::new(addr_manager));
     // Dump the address book periodically for crash resilience (the
@@ -573,7 +578,7 @@ fn run(cfg: Config) -> ExitCode {
     // `server.Run` starts any peer activity (the chain notification
     // callback installs even earlier, above, with the handler).
     let rpc_listener = if cfg.disable_rpc {
-        log_info("RPC service is disabled");
+        dcroxide_node::logging::info("RPCS", "RPC service is disabled");
         None
     } else {
         let transport = if cfg.disable_tls {
@@ -588,7 +593,7 @@ fn run(cfg: Config) -> ExitCode {
             match config {
                 Ok(config) => dcroxide_node::rpcrun::RpcTransport::Tls(config),
                 Err(e) => {
-                    log_info(&format!("Unable to set up RPC TLS: {e}"));
+                    log_error(&format!("Unable to set up RPC TLS: {e}"));
                     return ExitCode::FAILURE;
                 }
             }
@@ -703,11 +708,14 @@ fn run(cfg: Config) -> ExitCode {
                     .iter()
                     .map(|addr| addr.to_string())
                     .collect();
-                log_info(&format!("RPC server listening on {}", addrs.join(", ")));
+                dcroxide_node::logging::info(
+                    "RPCS",
+                    &format!("RPC server listening on {}", addrs.join(", ")),
+                );
                 Some((listener, ntfn, ntfn_thread))
             }
             Err(e) => {
-                log_info(&format!("Unable to start RPC server: {e}"));
+                log_error(&format!("Unable to start RPC server: {e}"));
                 return ExitCode::FAILURE;
             }
         }
@@ -716,7 +724,7 @@ fn run(cfg: Config) -> ExitCode {
     // Bind the peer-to-peer listeners and start serving inbound peers
     // unless listening is disabled (dcrd's server listeners).
     let runtime = if cfg.disable_listen {
-        log_info("Listening for peer-to-peer connections is disabled");
+        dcroxide_node::logging::info("SRVR", "Listening for peer-to-peer connections is disabled");
         None
     } else {
         match start_listeners(&cfg, &template, connected.clone(), Arc::clone(&server)) {
@@ -726,18 +734,21 @@ fn run(cfg: Config) -> ExitCode {
                     .iter()
                     .map(|addr| addr.to_string())
                     .collect();
-                log_info(&format!(
-                    "Serving peer-to-peer connections on {}",
-                    if addrs.is_empty() {
-                        "(no listeners bound)".to_string()
-                    } else {
-                        addrs.join(", ")
-                    }
-                ));
+                dcroxide_node::logging::info(
+                    "SRVR",
+                    &format!(
+                        "Serving peer-to-peer connections on {}",
+                        if addrs.is_empty() {
+                            "(no listeners bound)".to_string()
+                        } else {
+                            addrs.join(", ")
+                        }
+                    ),
+                );
                 Some(runtime)
             }
             Err(e) => {
-                log_info(&format!("Unable to start peer-to-peer listeners: {e}"));
+                log_error(&format!("Unable to start peer-to-peer listeners: {e}"));
                 return ExitCode::FAILURE;
             }
         }
@@ -757,10 +768,13 @@ fn run(cfg: Config) -> ExitCode {
             cfg.params.params.default_port.to_string(),
         ))
     } else {
-        log_info(&format!(
-            "Connecting to {} permanent peer(s)",
-            cfg.connect_peers.len()
-        ));
+        dcroxide_node::logging::info(
+            "SRVR",
+            &format!(
+                "Connecting to {} permanent peer(s)",
+                cfg.connect_peers.len()
+            ),
+        );
         None
     };
     // Resolve the permanent peers up front (dcrd `newServer` running
@@ -773,7 +787,10 @@ fn run(cfg: Config) -> ExitCode {
         match dcroxide_node::outbound::addr_string_to_socket_addr(addr) {
             Ok(resolved) => permanent.push(resolved.to_string()),
             Err(e) => {
-                log_info(&format!("Unable to resolve connect peer {addr}: {e}"));
+                dcroxide_node::logging::error(
+                    "SRVR",
+                    &format!("Unable to resolve connect peer {addr}: {e}"),
+                );
                 return ExitCode::FAILURE;
             }
         }
@@ -805,7 +822,7 @@ fn run(cfg: Config) -> ExitCode {
     // Query the network seeders to bootstrap the address manager (dcrd
     // `Run` launching `querySeeders` when seeding is enabled).
     let seeder_boot = if cfg.disable_seeders {
-        log_info("Peer discovery through seeders is disabled");
+        dcroxide_node::logging::info("SRVR", "Peer discovery through seeders is disabled");
         None
     } else {
         let seeders: Vec<String> = cfg
@@ -818,7 +835,10 @@ fn run(cfg: Config) -> ExitCode {
         if seeders.is_empty() {
             None
         } else {
-            log_info(&format!("Querying {} network seeder(s)", seeders.len()));
+            dcroxide_node::logging::info(
+                "SRVR",
+                &format!("Querying {} network seeder(s)", seeders.len()),
+            );
             // dcrd routes its seeder HTTP transport through `dcrdDial`,
             // so a proxied daemon queries the seeders over the SOCKS
             // proxy rather than leaking the traffic; without a proxy the
@@ -908,7 +928,7 @@ fn run(cfg: Config) -> ExitCode {
         .expect("addr manager mutex poisoned")
         .save_peers()
     {
-        log_info(&format!("Unable to save peers: {e}"));
+        dcroxide_node::logging::error("AMGR", &format!("Unable to save peers: {e}"));
     }
 
     // Flush the chain's in-memory UTXO cache and modified block index to
@@ -924,7 +944,7 @@ fn run(cfg: Config) -> ExitCode {
         .expect("chain mutex poisoned")
         .flush(&cfg.params.params)
     {
-        log_info(&format!("Unable to flush the block database: {e:?}"));
+        log_error(&format!("Unable to flush the block database: {e:?}"));
     }
 
     log_info("Shutdown complete");
@@ -1200,8 +1220,13 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// A minimal startup log line until the rotating logging subsystem is
-/// wired.
+/// A package-main log line (dcrd's `dcrdLog`); subsystem-specific
+/// lines call [`dcroxide_node::logging`] with their own tags.
 fn log_info(msg: &str) {
-    println!("[INF] DCRD: {msg}");
+    dcroxide_node::logging::info("DCRD", msg);
+}
+
+/// A package-main error line (dcrd `dcrdLog.Errorf`).
+fn log_error(msg: &str) {
+    dcroxide_node::logging::error("DCRD", msg);
 }

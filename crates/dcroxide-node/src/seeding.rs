@@ -470,7 +470,7 @@ pub fn start_address_dump(
                 .save_peers()
             {
                 // dcrd's savePeers logs and carries on.
-                println!("[ERR] AMGR: Unable to save peers: {e}");
+                crate::logging::error("AMGR", &format!("Unable to save peers: {e}"));
             }
         }
     });

@@ -21,6 +21,7 @@ pub mod flags;
 mod gostd;
 pub mod indexes;
 pub mod ipc;
+pub mod logging;
 pub mod logo;
 pub mod logsubsys;
 pub mod mining;

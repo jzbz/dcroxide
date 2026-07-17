@@ -126,7 +126,10 @@ pub fn new_pipe_notifier(pipe_tx: u64, lifetime_events: bool) -> PipeNotifier {
                 });
             }
             Err(e) => {
-                println!("[WRN] DCRD: Unable to open the pipetx descriptor {pipe_tx}: {e}");
+                crate::logging::warn(
+                    "DCRD",
+                    &format!("Unable to open the pipetx descriptor {pipe_tx}: {e}"),
+                );
             }
         }
     }
@@ -147,14 +150,14 @@ pub fn start_pipe_rx(pipe_rx: u64, request_shutdown: Box<dyn FnOnce() + Send>) {
         let mut pipe = match open_inherited_fd(pipe_rx, false) {
             Ok(pipe) => pipe,
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                println!("[WRN] DCRD: --piperx is not supported on this platform yet");
+                crate::logging::warn("DCRD", "--piperx is not supported on this platform yet");
                 return;
             }
             Err(e) => {
                 // dcrd's reads over a bad descriptor fail immediately
                 // and request the shutdown; a descriptor that cannot
                 // even be opened is the same broken contract.
-                println!("[ERR] DCRD: Failed to read from pipe: {e}");
+                crate::logging::error("DCRD", &format!("Failed to read from pipe: {e}"));
                 request_shutdown();
                 return;
             }
@@ -166,7 +169,7 @@ pub fn start_pipe_rx(pipe_rx: u64, request_shutdown: Box<dyn FnOnce() + Send>) {
                 Ok(_) => continue,
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    println!("[ERR] DCRD: Failed to read from pipe: {e}");
+                    crate::logging::error("DCRD", &format!("Failed to read from pipe: {e}"));
                     break;
                 }
             }

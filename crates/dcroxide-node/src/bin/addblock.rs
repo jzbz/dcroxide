@@ -22,11 +22,11 @@ use dcroxide_node::go_duration_string;
 /// dcrd's addblock logs through slog subsystem loggers on stdout; the
 /// port keeps the daemon's minimal level+tag line style.
 fn log_info(msg: &str) {
-    println!("[INF] MAIN: {msg}");
+    dcroxide_node::logging::info("MAIN", msg);
 }
 
 fn log_error(msg: &str) {
-    println!("[ERR] MAIN: {msg}");
+    dcroxide_node::logging::error("MAIN", msg);
 }
 
 /// Open the block database, creating it when it does not yet exist

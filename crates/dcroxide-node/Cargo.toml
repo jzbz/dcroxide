@@ -25,6 +25,7 @@ name = "gencerts"
 path = "src/bin/gencerts.rs"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ctrlc = { version = "3", features = ["termination"] }
 getrandom = "0.3"
 dcroxide-addrmgr = { path = "../dcroxide-addrmgr" }

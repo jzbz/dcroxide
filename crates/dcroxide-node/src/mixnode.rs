@@ -272,7 +272,7 @@ pub fn start_mix_epoch_observer(pool: Arc<Mutex<NodeMixPool>>) -> MixObserver {
                     .expect("mix pool mutex poisoned")
                     .check_prev_epoch(prev_epoch)
                     .map_err(|e| {
-                        println!("[ERR] MXPL: mix observer check failed: {e:?}");
+                        crate::logging::error("MIXP", &format!("mix observer check failed: {e:?}"));
                         format!("{e:?}")
                     })
             },

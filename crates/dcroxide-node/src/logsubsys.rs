@@ -14,8 +14,11 @@ pub const SUBSYSTEM_IDS: [&str; 19] = [
     "RPCS", "SCRP", "SRVR", "STKE", "SYNC", "TRSY", "TXMP",
 ];
 
-/// A logging level (decred/slog `Level`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A logging level (decred/slog `Level`).  The ordering follows the
+/// declaration: a message is emitted when its level is at or above
+/// the subsystem's configured level, and `Off` — above every real
+/// level — suppresses everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
     /// Trace.
     Trace,
@@ -46,6 +49,20 @@ impl LogLevel {
             "critical" | "crt" => Some(LogLevel::Critical),
             "off" => Some(LogLevel::Off),
             _ => None,
+        }
+    }
+
+    /// The three-letter tag slog renders inside the brackets of a log
+    /// line's header (slog `Level.String`).
+    pub fn three_letter(self) -> &'static str {
+        match self {
+            LogLevel::Trace => "TRC",
+            LogLevel::Debug => "DBG",
+            LogLevel::Info => "INF",
+            LogLevel::Warn => "WRN",
+            LogLevel::Error => "ERR",
+            LogLevel::Critical => "CRT",
+            LogLevel::Off => "OFF",
         }
     }
 }

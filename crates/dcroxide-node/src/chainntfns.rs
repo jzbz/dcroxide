@@ -619,7 +619,10 @@ impl ChainNtfnHandler {
             // stdout with dcrd's level + subsystem tag (INDX, ERROR) so
             // an operator capturing the daemon's stdout sees why the
             // index halted (dcrd logs this via `indxLog.Error`).
-            println!("[ERR] INDX: index update failed, index maintenance halted: {e}");
+            crate::logging::error(
+                "INDX",
+                &format!("index update failed, index maintenance halted: {e}"),
+            );
         }
     }
 
