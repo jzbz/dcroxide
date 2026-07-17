@@ -1761,7 +1761,6 @@ impl Chain {
         self.stake_new_tickets.retain(|h, _| *h < node_height);
         if self.db.is_some() {
             self.flush_block_index(params).map_err(persist_rule_error)?;
-            let node_hash = self.store.node(node).hash;
             let node_work = self.store.node(node).work_sum;
             let parent_hash = self.store.node(parent_id).hash;
             let child_undo = self
@@ -1792,8 +1791,6 @@ impl Chain {
                     &child_undo,
                 )
                 .map_err(|e| db_driver_error(format!("stake db: {e:?}")))?;
-                crate::chaindb::db_remove_spend_journal_entry(tx, &node_hash)
-                    .map_err(chain_db_to_db_error)?;
                 Ok(())
             })
             .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
@@ -1816,8 +1813,20 @@ impl Chain {
             .map_err(persist_rule_error)?;
 
         // Remove the block's spend journal record after the flush like
-        // dcrd, since the journal is its cache recovery source.
+        // dcrd, since the journal is the cache's recovery source: dcrd
+        // runs `dbRemoveSpendJournalEntry` in its own transaction
+        // intentionally AFTER the forced `MaybeFlush`, so a crash
+        // between the best-state write and the flush still finds the
+        // journal record it needs to recover.
         let node_hash = self.store.node(node).hash;
+        if let Some(db) = self.db.as_ref() {
+            db.update(|tx| {
+                crate::chaindb::db_remove_spend_journal_entry(tx, &node_hash)
+                    .map_err(chain_db_to_db_error)?;
+                Ok(())
+            })
+            .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
+        }
         self.spend_journal.remove(&node_hash.0);
 
         // This node's parent is now the end of the best chain.
