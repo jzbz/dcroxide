@@ -601,13 +601,7 @@ pub const ENV_DEFAULTS: [(&str, &str, Option<&str>); 2] = [
 
 /// Find an option by its long name.
 pub fn find_long(name: &str) -> Option<&'static OptSpec> {
-    find_long_in(&OPTIONS, name).or_else(|| {
-        if cfg!(windows) {
-            find_long_in(&SERVICE_OPTIONS, name)
-        } else {
-            None
-        }
-    })
+    find_long_in(&OPTIONS, name)
 }
 
 /// The Windows service options group (dcrd `serviceOptions`): dcrd's
@@ -624,26 +618,59 @@ pub const SERVICE_OPTIONS: [OptSpec; 1] = [OptSpec {
 /// Find an option by its long name in the given registry
 /// (short-only options carry an empty long name and never match).
 fn find_long_in(registry: &'static [OptSpec], name: &str) -> Option<&'static OptSpec> {
+    find_long_with(registry, name, has_service_group(registry))
+}
+
+/// Whether lookups over the registry also consult the Windows service
+/// options group: dcrd's `newConfigParser` adds that group to the
+/// daemon parser only on Windows, and the tool registries never carry
+/// it.
+fn has_service_group(registry: &'static [OptSpec]) -> bool {
+    // OPTIONS is a const, so identity is by content: the dcrd registry
+    // is the only 86-entry one and its first option is `version`.
+    cfg!(windows)
+        && registry.len() == OPTIONS.len()
+        && registry.first().is_some_and(|o| o.long == "version")
+}
+
+fn find_long_with(
+    registry: &'static [OptSpec],
+    name: &str,
+    service_group: bool,
+) -> Option<&'static OptSpec> {
     registry
         .iter()
+        .chain(if service_group {
+            SERVICE_OPTIONS.iter()
+        } else {
+            [].iter()
+        })
         .find(|o| !o.long.is_empty() && o.long == name)
 }
 
-/// Find an option by its short name (the Windows-only service group
-/// included only there, like [`find_long`]).
+/// Find an option by its short name.
 fn find_short(name: char) -> Option<&'static OptSpec> {
-    find_short_in(&OPTIONS, name).or_else(|| {
-        if cfg!(windows) {
-            find_short_in(&SERVICE_OPTIONS, name)
-        } else {
-            None
-        }
-    })
+    find_short_in(&OPTIONS, name)
 }
 
 /// Find an option by its short name in the given registry.
 fn find_short_in(registry: &'static [OptSpec], name: char) -> Option<&'static OptSpec> {
-    registry.iter().find(|o| o.short == Some(name))
+    find_short_with(registry, name, has_service_group(registry))
+}
+
+fn find_short_with(
+    registry: &'static [OptSpec],
+    name: char,
+    service_group: bool,
+) -> Option<&'static OptSpec> {
+    registry
+        .iter()
+        .chain(if service_group {
+            SERVICE_OPTIONS.iter()
+        } else {
+            [].iter()
+        })
+        .find(|o| o.short == Some(name))
 }
 
 /// Find an option the way go-flags' INI parser matches names:
@@ -1095,4 +1122,21 @@ pub(crate) fn parse_ini(content: &str, filename: &str) -> Result<Vec<IniAssignme
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The service group chains into lookups only when requested — the
+    /// Windows-only behavior, testable on every platform through the
+    /// forced flag (the posix rejection is pinned by the flags
+    /// vectors).
+    #[test]
+    fn service_group_chains_when_requested() {
+        assert!(find_long_with(&OPTIONS, "service", true).is_some());
+        assert!(find_long_with(&OPTIONS, "service", false).is_none());
+        assert!(find_short_with(&OPTIONS, 's', true).is_some());
+        assert!(find_short_with(&OPTIONS, 's', false).is_none());
+    }
 }
