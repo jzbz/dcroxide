@@ -140,6 +140,57 @@ fn replay_battery(chain: &mut Chain, params: &dcroxide_chaincfg::Params, clock_o
 }
 
 #[test]
+fn a_prestored_block_still_connects() {
+    // A crash can land between storing a block's bytes and flushing
+    // its index status row, leaving the database holding the block
+    // while the chain does not know the data is available.  The
+    // redelivered block must be accepted and connected — dcrd's
+    // `dbMaybeStoreBlock` skips the store when the block is already
+    // present — rather than rejected on the database's block-exists
+    // error, which would stall the chain on that height forever.
+    // Pre-storing every block's bytes replays the entire battery
+    // through that crash window.
+    let params = regnet_params();
+    let dir = TempDir::new().expect("tempdir");
+    let opts = Options::new(dir.path().join("chain"), params.net.0);
+    let db = Database::create(&opts).expect("create database");
+    let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("open chain");
+
+    let data = include_str!("data/fullblock_vectors.txt");
+    let mut now: i64 = 0;
+    for line in data.lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        match f[0] {
+            "now" => now = f[1].parse().expect("now"),
+            "accept" => {
+                let (block, _) = MsgBlock::from_bytes(&unhex(f[4])).expect("block");
+                chain
+                    .db
+                    .as_ref()
+                    .expect("db")
+                    .update(|tx| {
+                        if tx.has_block(&block.header.block_hash())? {
+                            return Ok(());
+                        }
+                        tx.store_block(&block)
+                    })
+                    .expect("pre-store the block bytes");
+                let (_, errs) = chain.process_block(&block, now, &params);
+                let is_orphan = errs.len() == 1 && errs[0].kind == RuleErrorKind::MissingParent;
+                assert!(errs.is_empty() || is_orphan, "accept {}: {errs:?}", f[1]);
+            }
+            _ => {}
+        }
+    }
+
+    let tip = chain.best_chain.tip().expect("tip");
+    assert!(
+        chain.store.node(tip).height > 10,
+        "the pre-stored battery still built the chain"
+    );
+}
+
+#[test]
 fn an_unflushed_utxo_set_catches_up_on_reopen() {
     let params = regnet_params();
 

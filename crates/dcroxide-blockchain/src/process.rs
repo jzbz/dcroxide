@@ -2732,10 +2732,21 @@ impl Chain {
 
         // Store the block and update the index state for the data now
         // being available, which may make descendants fully linked.
+        // The store is skipped when the database already has the
+        // block (dcrd `dbMaybeStoreBlock`): a crash between a prior
+        // store and the index status flush leaves the bytes present
+        // without the stored bit, and the redelivered block must heal
+        // that window rather than be rejected on the database's
+        // block-exists error.
         self.blocks
             .insert(block.header.block_hash().0, block.clone());
         if let Some(db) = &self.db {
-            let stored = db.update(|tx| tx.store_block(block));
+            let stored = db.update(|tx| {
+                if tx.has_block(&block.header.block_hash())? {
+                    return Ok(());
+                }
+                tx.store_block(block)
+            });
             if let Err(err) = stored {
                 return Err(persist_rule_error(crate::chaindb::ChainDbError::Db(err)));
             }
