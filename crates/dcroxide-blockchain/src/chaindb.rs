@@ -373,24 +373,29 @@ pub fn db_put_utxo(
     Ok(())
 }
 
-/// Load the full UTXO set rows as outpoints and entries.
-pub fn db_load_utxo_set(tx: &Transaction) -> Result<Vec<(OutPoint, UtxoEntry)>, ChainDbError> {
+/// Fetch one UTXO set row by outpoint (dcrd
+/// `levelDbUtxoBackend.dbFetchUtxoEntry`): a missing row returns
+/// `None`, an empty row is an entry for a spent output — which should
+/// never exist — and both it and an undecodable row are corruption.
+pub fn db_fetch_utxo_entry(
+    tx: &Transaction,
+    outpoint: &OutPoint,
+) -> Result<Option<UtxoEntry>, ChainDbError> {
     let meta = tx.metadata();
     let bucket = meta
         .bucket(UTXO_SET_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing utxo set bucket".into()))?;
-    let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    bucket.for_each(|k, v| {
-        rows.push((k.to_vec(), v.to_vec()));
-        Ok(())
-    })?;
-    let mut out = Vec::with_capacity(rows.len());
-    for (k, v) in rows {
-        let outpoint = decode_outpoint_key(&k)?;
-        let entry = deserialize_utxo_entry(&v, outpoint.index)?;
-        out.push((outpoint, entry));
+    let key = outpoint_key(outpoint);
+    let Some(serialized) = bucket.get(&key) else {
+        return Ok(None);
+    };
+    if serialized.is_empty() {
+        return Err(ChainDbError::Corrupt(format!(
+            "database contains entry for spent tx output {}:{}",
+            outpoint.hash, outpoint.index
+        )));
     }
-    Ok(out)
+    Ok(Some(deserialize_utxo_entry(&serialized, outpoint.index)?))
 }
 
 /// Store the UTXO set state row.
@@ -409,7 +414,7 @@ pub fn db_fetch_utxo_set_state(tx: &Transaction) -> Result<Option<UtxoSetState>,
 }
 
 /// Decode an outpoint row key produced by `outpoint_key`.
-fn decode_outpoint_key(key: &[u8]) -> Result<OutPoint, ChainDbError> {
+pub(crate) fn decode_outpoint_key(key: &[u8]) -> Result<OutPoint, ChainDbError> {
     // The key layout is the [3, 3] prefix, the hash, the VLQ tree,
     // and the VLQ index.
     if key.len() < 2 + 32 + 2 {

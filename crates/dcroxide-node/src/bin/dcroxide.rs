@@ -1073,8 +1073,11 @@ fn open_chain(cfg: &Config, db: Database) -> Result<Chain, String> {
 
     let mut chain = Chain::open(db, params, assume_valid, cfg.allow_old_forks, created_unix)
         .map_err(|e| format!("unable to initialize chain: {e:?}"))?;
-    // dcrd's --utxocachemaxsize (megabytes) bounds the pending UTXO
-    // cache before a connect flushes it.
+    // dcrd's --utxocachemaxsize (megabytes) bounds the UTXO cache
+    // before a flush evicts it down.  The open-time catch-up replay
+    // above ran at the default size; the configured value governs
+    // everything after (a documented divergence — dcrd sizes the
+    // cache before initializing it).
     chain.set_utxo_cache_max_bytes(cfg.utxo_cache_max_size.saturating_mul(1024 * 1024));
     Ok(chain)
 }

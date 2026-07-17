@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: ISC
 //! UTXO set statistics (dcrd `FetchStats`): the flushed set's counts,
 //! sizes, total amount, and serialized hash over a database-backed
-//! chain, including the flush of pending cache state the stats force
-//! and the serialized-key iteration order dcrd's backend walks.
+//! chain — the utxo set bucket on disk — including the flush of
+//! pending cache state the stats force and the serialized-key
+//! iteration order dcrd's backend walks.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -98,23 +99,52 @@ fn stats_over_an_empty_set_are_zero() {
 fn stats_flush_the_cache_and_fold_the_full_set() {
     let (_dir, mut chain) = open_chain();
 
-    // Two outputs of transaction A and one of B in the flushed set...
+    // Two outputs of transaction A and one of B in the flushed set —
+    // written straight to the utxo set bucket like a prior flush
+    // left them...
     let a = Hash([0x0a; 32]);
     let b = Hash([0x0b; 32]);
     let c = Hash([0x0c; 32]);
-    chain.utxo_backend.insert((a.0, 0, 0), regular_entry(1000));
-    chain.utxo_backend.insert((a.0, 1, 0), regular_entry(2500));
-    chain.utxo_backend.insert((b.0, 0, 0), regular_entry(5000));
+    let outpoint = |hash: Hash, index: u32| OutPoint {
+        hash,
+        index,
+        tree: 0,
+    };
+    chain
+        .db
+        .as_ref()
+        .expect("db")
+        .update(|tx| {
+            for (op, entry) in [
+                (outpoint(a, 0), regular_entry(1000)),
+                (outpoint(a, 1), regular_entry(2500)),
+                (outpoint(b, 0), regular_entry(5000)),
+            ] {
+                dcroxide_blockchain::chaindb::db_put_utxo(tx, &op, Some(&entry))
+                    .expect("write utxo row");
+            }
+            Ok(())
+        })
+        .expect("seed the flushed set");
 
-    // ...an unflushed entry of C pending in the cache, and a pending
-    // spend of B's output.  The stats force the flush first, so C
-    // joins the fold and B leaves it.
+    // ...an unflushed fresh entry of C pending in the cache, and a
+    // pending spend of B's output pulled in as a tombstone.  The
+    // stats force the flush first, so C joins the fold and B leaves
+    // it.
+    let mut c_entry = regular_entry(70);
+    c_entry.set_state_bits(
+        dcroxide_blockchain::UTXO_STATE_MODIFIED | dcroxide_blockchain::UTXO_STATE_FRESH,
+    );
     chain
         .utxo_cache
-        .insert((c.0, 0, 0), Some(regular_entry(70)));
+        .borrow_mut()
+        .insert((c.0, 0, 0), Some(c_entry));
     let mut spent = regular_entry(5000);
     spent.spend();
-    chain.utxo_cache.insert((b.0, 0, 0), Some(spent));
+    chain
+        .utxo_cache
+        .borrow_mut()
+        .insert((b.0, 0, 0), Some(spent));
 
     let stats = chain.fetch_utxo_stats().expect("stats");
     let expected = expected_stats(&[
@@ -148,7 +178,22 @@ fn stats_flush_the_cache_and_fold_the_full_set() {
     assert_eq!(stats.utxos, 3);
     assert_eq!(stats.transactions, 2);
     assert_eq!(stats.total, 3570);
-    assert!(chain.utxo_cache.is_empty(), "the stats flushed the cache");
+    // The flush kept the now-clean entry as read cache and evicted
+    // the spent tombstone (dcrd's flush eviction).
+    let cache = chain.utxo_cache.borrow();
+    assert_eq!(
+        cache.len(),
+        1,
+        "the flush kept the clean entry and evicted the spent one"
+    );
+    let retained = cache
+        .get(&(c.0, 0, 0))
+        .and_then(|e| e.clone())
+        .expect("the fresh entry stays cached");
+    assert!(
+        !retained.is_modified() && !retained.is_fresh(),
+        "the retained entry has its cache flags cleared"
+    );
 }
 
 #[test]
@@ -176,11 +221,17 @@ fn iteration_follows_serialized_key_order() {
 
     let (_dir, mut chain) = open_chain();
     chain
-        .utxo_backend
-        .insert((hash.0, low.index, 0), regular_entry(1));
-    chain
-        .utxo_backend
-        .insert((hash.0, high.index, 0), regular_entry(2));
+        .db
+        .as_ref()
+        .expect("db")
+        .update(|tx| {
+            dcroxide_blockchain::chaindb::db_put_utxo(tx, &low, Some(&regular_entry(1)))
+                .expect("write utxo row");
+            dcroxide_blockchain::chaindb::db_put_utxo(tx, &high, Some(&regular_entry(2)))
+                .expect("write utxo row");
+            Ok(())
+        })
+        .expect("seed the flushed set");
 
     // The serialized hash must fold the higher index FIRST, exactly
     // as dcrd's byte-ordered iteration does.

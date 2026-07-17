@@ -12,6 +12,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::{Cell, RefCell};
 
 use dcroxide_chaincfg::{ConsensusDeployment, Params};
 use dcroxide_chainhash::Hash;
@@ -84,14 +85,47 @@ pub struct HeaderProof {
     pub proof_hashes: Vec<Hash>,
 }
 
-/// The default maximum pending-UTXO-cache size (dcrd's
+/// The default maximum UTXO-cache size (dcrd's
 /// `defaultUtxoCacheMaxSize` of 150 MiB, in bytes).
 const DEFAULT_UTXO_CACHE_MAX_BYTES: u64 = 150 * 1024 * 1024;
 
-/// The estimated in-memory cost of one cached UTXO entry — the map
-/// overhead, outpoint key, pointer, and a typical entry — used to
-/// approximate dcrd's byte-exact cache size accounting.
-const APPROX_UTXO_CACHE_ENTRY_BYTES: u64 = 200;
+/// The size of an outpoint in dcrd's cache accounting (dcrd
+/// `outpointSize`, `unsafe.Sizeof(wire.OutPoint{})` on 64-bit).
+const UTXO_CACHE_OUTPOINT_SIZE: u64 = 56;
+
+/// The size of a pointer in dcrd's cache accounting (dcrd
+/// `pointerSize`).
+const UTXO_CACHE_POINTER_SIZE: u64 = 8;
+
+/// The per-entry map overhead in dcrd's cache accounting (dcrd
+/// `mapOverhead`).
+const UTXO_CACHE_MAP_OVERHEAD: u64 = 57;
+
+/// The base size of a utxo entry in dcrd's cache accounting (dcrd
+/// `baseEntrySize`).
+const UTXO_BASE_ENTRY_SIZE: u64 = 56;
+
+/// The fraction of the eviction depth to evict when the cache reaches
+/// its maximum size (dcrd `evictionPercentage`).
+const UTXO_CACHE_EVICTION_PERCENTAGE: f64 = 0.15;
+
+/// The seconds between periodic cache flushes during the initial
+/// chain sync (dcrd `periodicFlushInterval` of two minutes).
+const UTXO_PERIODIC_FLUSH_SECS: i64 = 120;
+
+/// The in-memory size of a utxo entry in dcrd's cache accounting
+/// (dcrd `UtxoEntry.size`): the base size plus the script and, for
+/// ticket submissions, the serialized minimal-outputs data.
+fn utxo_entry_size(entry: &UtxoEntry) -> u64 {
+    UTXO_BASE_ENTRY_SIZE
+        .saturating_add(entry.pk_script().len() as u64)
+        .saturating_add(
+            entry
+                .ticket_minimal_outputs_data()
+                .map(|d| d.len() as u64)
+                .unwrap_or(0),
+        )
+}
 
 /// The growing chain state: the block tree arena and index together
 /// with the header-processing configuration (the subset of dcrd's
@@ -133,16 +167,24 @@ pub struct Chain {
     /// rows.
     pub stake_new_tickets: BTreeMap<i64, Vec<dcroxide_chainhash::Hash>>,
 
-    /// The flushed UTXO set by outpoint: the in-memory stand-in for
-    /// dcrd's utxo backend until the persistence wiring lands.
+    /// The flushed UTXO set by outpoint for chains WITHOUT a backing
+    /// database: the in-memory utxo backend the pure differential-test
+    /// chains flush into.  Database-backed chains never touch it —
+    /// their backend is the utxo set bucket on disk, read through
+    /// [`Self::fetch_utxo_entry`] exactly as dcrd's cache reads its
+    /// leveldb backend.
     pub utxo_backend: BTreeMap<OutPointKey, UtxoEntry>,
-    /// The UTXO cache overlay with dcrd's exact semantics: fresh
-    /// entries have never been flushed, spent non-fresh entries are
-    /// retained as tombstones until the next flush, and an explicit
-    /// `None` marks an output known to be spent whose backing entry
-    /// was never flushed.  These distinctions are observable through
-    /// the entry fields that survive reorganizations.
-    pub utxo_cache: BTreeMap<OutPointKey, Option<UtxoEntry>>,
+    /// The UTXO cache with dcrd's exact `UtxoCache` semantics: a
+    /// read-through cache over the backend (misses are cached, missing
+    /// outputs negatively cached) and a write-back cache for the
+    /// connect/disconnect paths.  Fresh entries have never been
+    /// flushed, spent non-fresh entries are retained as tombstones
+    /// until the next flush, and an explicit `None` marks an output
+    /// known to be absent from the backend.  These distinctions are
+    /// observable through the entry fields that survive
+    /// reorganizations.  Interior mutability lets `&self` reads cache
+    /// their misses like dcrd's mutex-guarded cache does.
+    pub utxo_cache: RefCell<BTreeMap<OutPointKey, Option<UtxoEntry>>>,
     /// The transaction spend journal by block hash, in dcrd's
     /// serialized journal format: the in-memory stand-in for dcrd's
     /// spend journal bucket.  The serialization is deliberately round
@@ -165,10 +207,34 @@ pub struct Chain {
     /// The pruning interval in seconds — the target block time (dcrd
     /// `chainPruner.pruningInterval`).
     prune_interval_secs: i64,
-    /// The maximum size in bytes the pending UTXO cache may reach
-    /// before a connect flushes it to the backend (dcrd's
-    /// `utxoCache.maxSize` from `--utxocachemaxsize`).
+    /// The maximum size in bytes the UTXO cache may reach before a
+    /// flush and eviction are required (dcrd's `utxoCache.maxSize`
+    /// from `--utxocachemaxsize`).
     utxo_cache_max_bytes: u64,
+    /// The total size of all utxo entries in the cache in bytes (dcrd
+    /// `totalEntrySize`), updated as entries enter and leave.  A cell
+    /// because `&self` reads cache their misses.
+    utxo_total_entry_size: Cell<u64>,
+    /// The cache hit counter (dcrd `hits`).
+    utxo_cache_hits: Cell<u64>,
+    /// The cache miss counter (dcrd `misses`).
+    utxo_cache_misses: Cell<u64>,
+    /// The block hash of the last utxo cache flush (dcrd
+    /// `lastFlushHash`), compared against the backend's recorded utxo
+    /// set state on startup.
+    utxo_last_flush_hash: Hash,
+    /// The adjusted-clock unix time of the last utxo cache flush
+    /// (dcrd `lastFlushTime`, which uses the wall clock; the port
+    /// drives the periodic flush interval from the same adjusted
+    /// clock the pruner uses so the decision core stays
+    /// deterministic).
+    utxo_last_flush_unix: i64,
+    /// The block height of the last cache eviction (dcrd
+    /// `lastEvictionHeight`).
+    utxo_last_eviction_height: u32,
+    /// The adjusted unix time of the processing call in flight,
+    /// feeding the periodic flush check.
+    utxo_clock_unix: i64,
     /// Whether the chain has latched to believing it is current.
     pub is_current_latch: bool,
     /// The minimum known cumulative chain work from the parameters.
@@ -315,7 +381,7 @@ impl Chain {
             stake_undo: BTreeMap::new(),
             stake_new_tickets: BTreeMap::new(),
             utxo_backend: BTreeMap::new(),
-            utxo_cache: BTreeMap::new(),
+            utxo_cache: RefCell::new(BTreeMap::new()),
             spend_journal: BTreeMap::new(),
             filters,
             header_commitments: BTreeMap::new(),
@@ -324,6 +390,13 @@ impl Chain {
             last_prune_unix: 0,
             prune_interval_secs: params.target_time_per_block_secs,
             utxo_cache_max_bytes: DEFAULT_UTXO_CACHE_MAX_BYTES,
+            utxo_total_entry_size: Cell::new(0),
+            utxo_cache_hits: Cell::new(0),
+            utxo_cache_misses: Cell::new(0),
+            utxo_last_flush_hash: Hash::ZERO,
+            utxo_last_flush_unix: 0,
+            utxo_last_eviction_height: 0,
+            utxo_clock_unix: 0,
             is_current_latch: false,
             min_known_work: params.min_known_chain_work,
             db: None,
@@ -483,6 +556,9 @@ impl Chain {
                     .expect("genesis filter")
             });
             chain.db = Some(db);
+            // Record the fresh utxo set state at the genesis tip
+            // (dcrd initializes the utxo cache during `New`).
+            chain.initialize_utxo_state(params)?;
             return Ok(chain);
         }
 
@@ -498,6 +574,12 @@ impl Chain {
             return Err(err);
         }
         chain.db = Some(db);
+
+        // Catch the utxo set up to the tip of the best chain: the
+        // cache only flushes periodically, so an unclean shutdown
+        // leaves the on-disk set behind the chain (dcrd initializes
+        // the utxo cache during `New`).
+        chain.initialize_utxo_state(params)?;
         Ok(chain)
     }
 
@@ -705,11 +787,10 @@ impl Chain {
             }
         }
 
-        // The UTXO set.
-        for (outpoint, entry) in crate::chaindb::db_load_utxo_set(tx)? {
-            self.utxo_backend
-                .insert((outpoint.hash.0, outpoint.index, outpoint.tree), entry);
-        }
+        // The UTXO set stays on disk: entries are read through the
+        // cache on demand (dcrd's utxo backend), and
+        // `initialize_utxo_state` catches the set up to the tip after
+        // the chain state loads.
 
         // Rebuild the best state snapshot.
         let tip_block = self
@@ -767,12 +848,13 @@ impl Chain {
             return Ok(());
         }
         let rows = self.take_block_index_rows(params);
-        let db_updates = self.drain_utxo_cache();
         let tip = self.best_chain.tip().expect("best chain tip");
         let (tip_hash, tip_height, work_sum) = {
             let n = self.store.node(tip);
             (n.hash, n.height, n.work_sum)
         };
+        let eviction_height = self.utxo_calc_flush_eviction_height(tip_height as u32);
+        let db_updates = self.utxo_flush_collect();
         let snapshot = self.state_snapshot.clone();
         let db = self.db.as_ref().expect("checked above");
         // One transaction for the block index rows, the UTXO entries,
@@ -808,6 +890,7 @@ impl Chain {
             .map_err(chain_db_to_db_error)?;
             Ok(())
         })?;
+        self.utxo_flush_finish(eviction_height, tip_hash);
         Ok(())
     }
 
@@ -866,9 +949,9 @@ impl Chain {
     pub fn commit_view(&mut self, view: &mut UtxoView) {
         for (key, entry) in view.commit() {
             if entry.is_spent() {
-                Self::cache_spend_entry(&self.utxo_backend, &mut self.utxo_cache, key);
+                self.cache_spend_entry(key);
             } else {
-                Self::cache_add_entry(&mut self.utxo_cache, key, entry);
+                self.cache_add_entry(key, entry);
             }
         }
     }
@@ -876,24 +959,27 @@ impl Chain {
     /// Add or update an unspent entry in the cache (dcrd
     /// `UtxoCache.addEntry`): new-to-cache entries are marked fresh
     /// and updates preserve the existing freshness.
-    fn cache_add_entry(
-        cache: &mut BTreeMap<OutPointKey, Option<UtxoEntry>>,
-        key: OutPointKey,
-        mut entry: UtxoEntry,
-    ) {
+    fn cache_add_entry(&mut self, key: OutPointKey, mut entry: UtxoEntry) {
         entry.set_state_bits(entry.state_bits() | crate::utxoentry::UTXO_STATE_MODIFIED);
+        let cache = self.utxo_cache.get_mut();
+        let entry_size = utxo_entry_size(&entry);
+        let mut total = self.utxo_total_entry_size.get();
         match cache.get(&key) {
             Some(Some(existing)) => {
                 if existing.is_fresh() {
                     entry.set_state_bits(entry.state_bits() | crate::utxoentry::UTXO_STATE_FRESH);
                 }
+                total = total.saturating_sub(utxo_entry_size(existing));
             }
             // Both a missing entry and an explicit spent marker mean
-            // the backend has never seen this output.
+            // the backend has never seen this output (dcrd's map
+            // lookup returns nil for both).
             _ => {
                 entry.set_state_bits(entry.state_bits() | crate::utxoentry::UTXO_STATE_FRESH);
             }
         }
+        self.utxo_total_entry_size
+            .set(total.saturating_add(entry_size));
         cache.insert(key, Some(entry));
     }
 
@@ -902,44 +988,171 @@ impl Chain {
     /// the backend never knew about them, other cached entries become
     /// spent tombstones, and cache misses pull the backend entry in
     /// as a tombstone so the next flush removes it.
-    fn cache_spend_entry(
-        backend: &BTreeMap<OutPointKey, UtxoEntry>,
-        cache: &mut BTreeMap<OutPointKey, Option<UtxoEntry>>,
-        key: OutPointKey,
-    ) {
-        match cache.get_mut(&key) {
-            Some(None) => {}
+    fn cache_spend_entry(&mut self, key: OutPointKey) {
+        // What the cache probe decided; the mutating follow-ups run
+        // with the probe's borrow released.
+        enum SpendAction {
+            Done,
+            Tombstone(u64),
+            BackendLookup,
+        }
+        let action = match self.utxo_cache.get_mut().get_mut(&key) {
+            Some(None) => SpendAction::Done,
             Some(Some(entry)) => {
                 assert!(!entry.is_spent(), "attempt to double spend in view commit");
                 if entry.is_fresh() {
-                    cache.insert(key, None);
+                    SpendAction::Tombstone(utxo_entry_size(entry))
                 } else {
                     entry.set_state_bits(
                         entry.state_bits()
                             | crate::utxoentry::UTXO_STATE_SPENT
                             | crate::utxoentry::UTXO_STATE_MODIFIED,
                     );
+                    SpendAction::Done
                 }
             }
-            None => {
-                if let Some(backend_entry) = backend.get(&key) {
-                    let mut entry = backend_entry.clone();
+            None => SpendAction::BackendLookup,
+        };
+        match action {
+            SpendAction::Done => {}
+            // A fresh entry was never flushed: replace it with an
+            // explicit spent marker so later lookups still hit.
+            SpendAction::Tombstone(removed_size) => {
+                self.utxo_cache.get_mut().insert(key, None);
+                self.utxo_total_entry_size.set(
+                    self.utxo_total_entry_size
+                        .get()
+                        .saturating_sub(removed_size),
+                );
+            }
+            // The output has no cache entry at all: pull it from the
+            // backend so the next flush removes its row (a missing
+            // backend entry is not an error and is NOT negatively
+            // cached here — a double spend would be the only future
+            // lookup).
+            SpendAction::BackendLookup => {
+                self.utxo_cache_misses
+                    .set(self.utxo_cache_misses.get().wrapping_add(1));
+                if let Some(mut entry) = self.backend_fetch_entry(&key) {
+                    self.utxo_total_entry_size.set(
+                        self.utxo_total_entry_size
+                            .get()
+                            .saturating_add(utxo_entry_size(&entry)),
+                    );
                     entry.set_state_bits(
                         entry.state_bits()
                             | crate::utxoentry::UTXO_STATE_SPENT
                             | crate::utxoentry::UTXO_STATE_MODIFIED,
                     );
-                    cache.insert(key, Some(entry));
+                    self.utxo_cache.get_mut().insert(key, Some(entry));
                 }
             }
         }
     }
 
-    /// Flush the cache to the backend (dcrd `UtxoCache.MaybeFlush`
-    /// when forced): spent tombstones delete their backend rows,
-    /// unspent entries are written with the cache state cleared, and
-    /// the cache empties.  The entry writes and the utxo set state
-    /// land in ONE database transaction, exactly as dcrd's backend
+    /// Fetch an entry from the backend, bypassing the cache: the
+    /// utxo set bucket on disk for database-backed chains (dcrd
+    /// `levelDbUtxoBackend.FetchEntry`) and the in-memory map for the
+    /// pure-memory test chains.  Missing outputs return `None`;
+    /// entries for spent outputs, undecodable rows, and database read
+    /// failures all panic — the resolver seam has no error channel,
+    /// so the whole class dcrd surfaces as backend errors aborts
+    /// here (a documented divergence).
+    fn backend_fetch_entry(&self, key: &OutPointKey) -> Option<UtxoEntry> {
+        let Some(db) = &self.db else {
+            return self.utxo_backend.get(key).cloned();
+        };
+        let outpoint = OutPoint {
+            hash: Hash(key.0),
+            index: key.1,
+            tree: key.2,
+        };
+        let mut found: Option<UtxoEntry> = None;
+        db.view(|tx| {
+            found = crate::chaindb::db_fetch_utxo_entry(tx, &outpoint)
+                .expect("corrupt utxo backend entry");
+            Ok(())
+        })
+        .expect("utxo backend read");
+        found
+    }
+
+    /// The eviction height for a flush at the given best height —
+    /// the height the flush records, exactly the parameter dcrd's
+    /// `flush` receives: entries in blocks below it leave the cache
+    /// when the maximum size has been reached, and zero (no height
+    /// eviction) otherwise (the eviction half of dcrd
+    /// `UtxoCache.flush`).
+    fn utxo_calc_flush_eviction_height(&self, best_height: u32) -> u32 {
+        if self.utxo_cache_total_size() < self.utxo_cache_max_bytes {
+            return 0;
+        }
+        self.calc_eviction_height(best_height)
+    }
+
+    /// The eviction height from the best height and the last eviction
+    /// height (dcrd `UtxoCache.calcEvictionHeight`).
+    fn calc_eviction_height(&self, best_height: u32) -> u32 {
+        if best_height < self.utxo_last_eviction_height {
+            return best_height;
+        }
+        let last_eviction_depth = best_height - self.utxo_last_eviction_height;
+        let num_blocks_to_evict =
+            (f64::from(last_eviction_depth) * UTXO_CACHE_EVICTION_PERCENTAGE).ceil() as u32;
+        self.utxo_last_eviction_height
+            .saturating_add(num_blocks_to_evict)
+    }
+
+    /// The total size of the cache in dcrd's accounting: the map
+    /// overhead, outpoint, and pointer per entry plus the entry sizes
+    /// (dcrd `UtxoCache.totalSize`).
+    fn utxo_cache_total_size(&self) -> u64 {
+        let num_entries = self.utxo_cache.borrow().len() as u64;
+        UTXO_CACHE_MAP_OVERHEAD
+            .saturating_add(UTXO_CACHE_OUTPOINT_SIZE)
+            .saturating_add(UTXO_CACHE_POINTER_SIZE)
+            .saturating_mul(num_entries)
+            .saturating_add(self.utxo_total_entry_size.get())
+    }
+
+    /// Whether a non-forced flush is due (dcrd
+    /// `UtxoCache.shouldFlush`): not when already flushed through the
+    /// best hash, and otherwise when the maximum size or the periodic
+    /// flush interval has been reached.
+    fn utxo_should_flush(&self, best_hash: &Hash) -> bool {
+        if self.utxo_last_flush_hash == *best_hash {
+            return false;
+        }
+        if self.utxo_cache_total_size() >= self.utxo_cache_max_bytes {
+            return true;
+        }
+        self.utxo_clock_unix
+            .saturating_sub(self.utxo_last_flush_unix)
+            >= UTXO_PERIODIC_FLUSH_SECS
+    }
+
+    /// Conditionally flush the cache to the backend (dcrd
+    /// `UtxoCache.MaybeFlush`).
+    fn maybe_flush_utxo_cache(
+        &mut self,
+        best_hash: Hash,
+        best_height: u32,
+        force: bool,
+    ) -> Result<(), crate::chaindb::ChainDbError> {
+        if force || self.utxo_should_flush(&best_hash) {
+            self.flush_utxo_cache(best_hash, best_height)?;
+        }
+        Ok(())
+    }
+
+    /// Flush the cache to the backend (dcrd `UtxoCache.flush`): the
+    /// modified entries are written — spent tombstones delete their
+    /// backend rows, unspent entries land with the cache state
+    /// cleared — and the cache then evicts tombstones, spent entries,
+    /// and (once the maximum size has been reached) entries in blocks
+    /// below the eviction height, keeping the rest as clean read
+    /// cache.  The entry writes and the utxo set state land in ONE
+    /// database transaction, exactly as dcrd's backend
     /// `PutUtxos(utxos, state)` couples them, so a crash can never
     /// leave the flushed set and its recorded state out of step.
     fn flush_utxo_cache(
@@ -947,7 +1160,8 @@ impl Chain {
         last_flush_hash: Hash,
         last_flush_height: u32,
     ) -> Result<(), crate::chaindb::ChainDbError> {
-        let db_updates = self.drain_utxo_cache();
+        let eviction_height = self.utxo_calc_flush_eviction_height(last_flush_height);
+        let db_updates = self.utxo_flush_collect();
         if let Some(db) = &self.db {
             db.update(|tx| {
                 for (outpoint, entry) in &db_updates {
@@ -966,29 +1180,52 @@ impl Chain {
             })
             .map_err(crate::chaindb::ChainDbError::Db)?;
         }
+        self.utxo_flush_finish(eviction_height, last_flush_hash);
         Ok(())
     }
 
-    /// Drain the cache into the in-memory backend, collecting the
-    /// database updates (the entry half of dcrd's flush).
-    fn drain_utxo_cache(&mut self) -> Vec<(OutPoint, Option<UtxoEntry>)> {
-        let cache = core::mem::take(&mut self.utxo_cache);
+    /// Collect the modified cache entries as backend writes and apply
+    /// them to the in-memory backend when there is no database (the
+    /// write half of dcrd `UtxoCache.flush`; dcrd's `dbPutUtxoEntry`
+    /// skips unmodified entries the same way).
+    fn utxo_flush_collect(&mut self) -> Vec<(OutPoint, Option<UtxoEntry>)> {
+        let has_db = self.db.is_some();
         let mut db_updates: Vec<(OutPoint, Option<UtxoEntry>)> = Vec::new();
-        for (key, entry) in cache {
+        let mut memory_writes: Vec<(OutPointKey, Option<UtxoEntry>)> = Vec::new();
+        for (key, entry) in self.utxo_cache.get_mut().iter() {
+            let Some(entry) = entry else {
+                continue;
+            };
+            if !entry.is_modified() {
+                continue;
+            }
             let outpoint = OutPoint {
                 hash: Hash(key.0),
                 index: key.1,
                 tree: key.2,
             };
-            match entry {
-                None => {}
-                Some(entry) if entry.is_spent() => {
-                    self.utxo_backend.remove(&key);
+            if entry.is_spent() {
+                if has_db {
                     db_updates.push((outpoint, None));
+                } else {
+                    memory_writes.push((*key, None));
                 }
-                Some(mut entry) => {
-                    entry.set_state_bits(0);
-                    db_updates.push((outpoint, Some(entry.clone())));
+            } else {
+                let mut cleaned = entry.clone();
+                cleaned.set_state_bits(0);
+                if has_db {
+                    db_updates.push((outpoint, Some(cleaned)));
+                } else {
+                    memory_writes.push((*key, Some(cleaned)));
+                }
+            }
+        }
+        for (key, write) in memory_writes {
+            match write {
+                None => {
+                    self.utxo_backend.remove(&key);
+                }
+                Some(entry) => {
                     self.utxo_backend.insert(key, entry);
                 }
             }
@@ -996,12 +1233,271 @@ impl Chain {
         db_updates
     }
 
+    /// Evict and clean the cache after a successful backend write
+    /// (the post-write half of dcrd `UtxoCache.flush`): tombstones,
+    /// spent entries, and entries below the eviction height leave;
+    /// everything retained has its modified and fresh flags cleared.
+    fn utxo_flush_finish(&mut self, eviction_height: u32, last_flush_hash: Hash) {
+        let mut total = self.utxo_total_entry_size.get();
+        self.utxo_cache.get_mut().retain(|_, entry| {
+            let evict = match entry {
+                None => true,
+                Some(e) => e.is_spent() || e.block_height() < i64::from(eviction_height),
+            };
+            if evict {
+                if let Some(e) = entry {
+                    total = total.saturating_sub(utxo_entry_size(e));
+                }
+                return false;
+            }
+            if let Some(e) = entry {
+                e.set_state_bits(
+                    e.state_bits()
+                        & !(crate::utxoentry::UTXO_STATE_MODIFIED
+                            | crate::utxoentry::UTXO_STATE_FRESH),
+                );
+            }
+            true
+        });
+        self.utxo_total_entry_size.set(total);
+        self.utxo_last_flush_hash = last_flush_hash;
+        self.utxo_last_flush_unix = self.utxo_clock_unix;
+        if eviction_height != 0 {
+            self.utxo_last_eviction_height = eviction_height;
+        }
+    }
+
+    /// Catch the utxo set up to the tip of the best chain (dcrd
+    /// `UtxoCache.Initialize`, without the backend upgrade step that
+    /// does not apply to a fresh implementation): since the cache
+    /// only flushes periodically, an unclean shutdown leaves the
+    /// recorded utxo set state behind the best chain — or past it,
+    /// across an interrupted disconnect.  Blocks are disconnected
+    /// back to the fork point using their spend journals and replayed
+    /// forward through the cache until the set matches the tip.  On a
+    /// fresh backend the state is simply recorded at the tip.
+    pub fn initialize_utxo_state(
+        &mut self,
+        params: &Params,
+    ) -> Result<(), crate::chaindb::ChainDbError> {
+        if self.db.is_none() {
+            return Ok(());
+        }
+
+        // The recorded utxo set state.
+        let mut state: Option<crate::utxoio::UtxoSetState> = None;
+        let mut state_err: Option<crate::chaindb::ChainDbError> = None;
+        {
+            let db = self.db.as_ref().expect("checked above");
+            db.view(|tx| {
+                match crate::chaindb::db_fetch_utxo_set_state(tx) {
+                    Ok(s) => state = s,
+                    Err(e) => state_err = Some(e),
+                }
+                Ok(())
+            })
+            .map_err(crate::chaindb::ChainDbError::Db)?;
+        }
+        if let Some(e) = state_err {
+            return Err(e);
+        }
+
+        let tip = self.best_chain.tip().expect("best chain tip");
+        let (tip_hash, tip_height) = {
+            let n = self.store.node(tip);
+            (n.hash, n.height)
+        };
+
+        // A fresh backend: record the state at the tip (dcrd's
+        // `PutUtxos` over the empty cache).
+        let state = match state {
+            None => {
+                let recorded = crate::utxoio::UtxoSetState {
+                    last_flush_height: tip_height as u32,
+                    last_flush_hash: tip_hash,
+                };
+                let db = self.db.as_ref().expect("checked above");
+                db.update(|tx| {
+                    crate::chaindb::db_put_utxo_set_state(tx, &recorded)
+                        .map_err(chain_db_to_db_error)?;
+                    Ok(())
+                })
+                .map_err(crate::chaindb::ChainDbError::Db)?;
+                recorded
+            }
+            Some(s) => s,
+        };
+
+        // Start from the recorded state (dcrd seeds the last flush
+        // hash and eviction height from it).
+        self.utxo_last_flush_hash = state.last_flush_hash;
+        self.utxo_last_eviction_height = state.last_flush_height;
+
+        // Already caught up to the tip.
+        if state.last_flush_hash == tip_hash {
+            return Ok(());
+        }
+
+        // The last flushed block must exist in the index; anything
+        // else is backend corruption (dcrd panics identically).
+        let last_flushed = self
+            .index
+            .lookup_node(&state.last_flush_hash)
+            .unwrap_or_else(|| {
+                panic!(
+                    "last flushed block node hash {} (height {}) does not exist",
+                    state.last_flush_hash, state.last_flush_height
+                )
+            });
+        let fork = self.best_chain.find_fork(&self.store, last_flushed);
+
+        let mut view = UtxoView::new();
+        view.set_best_hash(tip_hash);
+
+        // Disconnect back to the point of the fork: unspend the spent
+        // txos from each block's journal and remove the utxos it
+        // created.  Blocks only need disconnecting when an unclean
+        // shutdown occurred between a block being disconnected and
+        // the cache being flushed; in the typical catch-up the fork
+        // IS the last flushed node and this loop is skipped.
+        let mut n = Some(last_flushed);
+        let mut next_block_to_detach: Option<MsgBlock> = None;
+        while let Some(id) = n {
+            if Some(id) == fork {
+                break;
+            }
+            let block = match next_block_to_detach.take() {
+                Some(b) => b,
+                None => self.block_by_node(id),
+            };
+            assert_eq!(
+                self.store.node(id).hash,
+                block.header.block_hash(),
+                "detach block node hash does not match the block"
+            );
+            let parent_id = self.store.node(id).parent.expect("detached block parent");
+            let parent = self.block_by_node(parent_id);
+            next_block_to_detach = Some(parent.clone());
+
+            let prev_height = Some(self.store.node(parent_id).height);
+            let is_treasury_enabled = {
+                let parent_view = NodeBranchView {
+                    store: &self.store,
+                    tip: parent_id,
+                };
+                crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)
+                    .map_err(|_| {
+                        crate::chaindb::ChainDbError::Corrupt("unknown deployment".into())
+                    })?
+            };
+            let stxos = self.fetch_spend_journal(&block, is_treasury_enabled);
+            view.disconnect_block(
+                &block,
+                &parent,
+                &stxos,
+                &|op: &OutPoint| self.fetch_utxo_entry(op),
+                is_treasury_enabled,
+            )
+            .map_err(|e| {
+                crate::chaindb::ChainDbError::Corrupt(format!("utxo catch-up disconnect: {e:?}"))
+            })?;
+            self.commit_view(&mut view);
+            let (parent_hash, parent_height) = {
+                let p = self.store.node(parent_id);
+                (p.hash, p.height as u32)
+            };
+            self.maybe_flush_utxo_cache(parent_hash, parent_height, false)?;
+            n = Some(parent_id);
+        }
+
+        // Replay the blocks after the fork point forward through the
+        // cache.
+        let mut attach_nodes = Vec::new();
+        let mut m = Some(tip);
+        while let Some(id) = m {
+            if Some(id) == fork {
+                break;
+            }
+            attach_nodes.push(id);
+            m = self.store.node(id).parent;
+        }
+        attach_nodes.reverse();
+        for id in attach_nodes {
+            let block = self.block_by_node(id);
+            let parent_id = self.store.node(id).parent.expect("attach parent");
+            let parent = self.block_by_node(parent_id);
+            assert_eq!(
+                self.store.node(parent_id).hash,
+                parent.header.block_hash(),
+                "attach block node parent hash does not match the parent block"
+            );
+            let prev_height = Some(self.store.node(parent_id).height);
+            let is_treasury_enabled = {
+                let parent_view = NodeBranchView {
+                    store: &self.store,
+                    tip: parent_id,
+                };
+                crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)
+                    .map_err(|_| {
+                        crate::chaindb::ChainDbError::Corrupt("unknown deployment".into())
+                    })?
+            };
+            view.connect_block(
+                &block,
+                &parent,
+                || self.fetch_spend_journal(&parent, is_treasury_enabled),
+                &|op: &OutPoint| self.fetch_utxo_entry(op),
+                None,
+                is_treasury_enabled,
+            )
+            .map_err(|e| {
+                crate::chaindb::ChainDbError::Corrupt(format!("utxo catch-up connect: {e:?}"))
+            })?;
+            self.commit_view(&mut view);
+            let (node_hash, node_height) = {
+                let nd = self.store.node(id);
+                (nd.hash, nd.height as u32)
+            };
+            self.maybe_flush_utxo_cache(node_hash, node_height, false)?;
+        }
+        // The unflushed tail stays in the cache for the normal flush
+        // triggers, exactly like dcrd's initialization.
+        Ok(())
+    }
+
     /// Fetch an entry through the cache and backend (dcrd
-    /// `UtxoCache.FetchEntry` semantics; spent tombstones are
-    /// returned like dcrd's cache hands them to views, which is what
-    /// preserves original entry fields across disconnects).
+    /// `UtxoCache.FetchEntry`): cache hits return a clone with the
+    /// modified and fresh flags cleared — spent tombstones are still
+    /// returned spent, which is what preserves original entry fields
+    /// across disconnects — and misses read the backend, caching the
+    /// entry (or its absence) for later lookups.
     pub fn fetch_utxo_entry(&self, op: &OutPoint) -> Option<UtxoEntry> {
-        Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op)
+        let key = (op.hash.0, op.index, op.tree);
+        if let Some(entry) = self.utxo_cache.borrow().get(&key) {
+            self.utxo_cache_hits
+                .set(self.utxo_cache_hits.get().wrapping_add(1));
+            let mut cloned = entry.clone()?;
+            cloned.set_state_bits(
+                cloned.state_bits()
+                    & !(crate::utxoentry::UTXO_STATE_MODIFIED | crate::utxoentry::UTXO_STATE_FRESH),
+            );
+            return Some(cloned);
+        }
+        self.utxo_cache_misses
+            .set(self.utxo_cache_misses.get().wrapping_add(1));
+        let fetched = self.backend_fetch_entry(&key);
+        if let Some(entry) = &fetched {
+            self.utxo_total_entry_size.set(
+                self.utxo_total_entry_size
+                    .get()
+                    .saturating_add(utxo_entry_size(entry)),
+            );
+        }
+        // Backend entries carry no state flags, and a missing output
+        // is negatively cached so other code can use the presence of
+        // an entry to avoid reloading it (dcrd caches the nil too).
+        self.utxo_cache.borrow_mut().insert(key, fetched.clone());
+        fetched
     }
 
     /// Statistics on the current UTXO set (dcrd
@@ -1017,28 +1513,77 @@ impl Chain {
         };
         self.flush_utxo_cache(tip_hash, tip_height as u32)?;
 
-        // dcrd's backend iterates the set by serialized key bytes;
-        // the VLQ-coded output index makes that order diverge from
-        // numeric order across VLQ length boundaries, so sort by the
-        // serialized keys rather than trusting the in-memory map's
-        // tuple order.
-        let mut rows: Vec<UtxoStatsRow> = Vec::with_capacity(self.utxo_backend.len());
-        for (key, entry) in &self.utxo_backend {
-            let outpoint = OutPoint {
-                hash: Hash(key.0),
-                index: key.1,
-                tree: key.2,
-            };
-            let serialized = crate::utxoio::serialize_utxo_entry(entry)
-                .expect("the utxo backend never holds spent entries");
-            rows.push((
-                crate::utxoio::outpoint_key(&outpoint),
-                serialized,
-                entry.amount(),
-                key.0,
-            ));
+        // The forced flush above means the backend holds the full
+        // set: the utxo bucket for database-backed chains — walked in
+        // serialized-key order exactly as dcrd's backend iterates —
+        // and the in-memory map otherwise.  The VLQ-coded output
+        // index makes serialized-key order diverge from numeric order
+        // across VLQ length boundaries, so the in-memory rows are
+        // sorted by their serialized keys rather than trusting the
+        // map's tuple order.
+        let mut rows: Vec<UtxoStatsRow> = Vec::new();
+        if let Some(db) = &self.db {
+            let mut corrupt: Option<String> = None;
+            db.view(|tx| {
+                let Some(bucket) = tx.metadata().bucket(crate::chaindb::UTXO_SET_BUCKET_NAME)
+                else {
+                    corrupt = Some("missing utxo set bucket".into());
+                    return Ok(());
+                };
+                bucket.for_each(|k, v| {
+                    if corrupt.is_some() {
+                        return Ok(());
+                    }
+                    match crate::chaindb::decode_outpoint_key(k) {
+                        Ok(outpoint) => {
+                            if v.is_empty() {
+                                corrupt = Some(format!(
+                                    "database contains entry for spent tx output {}:{}",
+                                    outpoint.hash, outpoint.index
+                                ));
+                                return Ok(());
+                            }
+                            match crate::utxoio::deserialize_utxo_entry(v, outpoint.index) {
+                                Ok(entry) => {
+                                    rows.push((
+                                        k.to_vec(),
+                                        v.to_vec(),
+                                        entry.amount(),
+                                        outpoint.hash.0,
+                                    ));
+                                }
+                                Err(e) => corrupt = Some(format!("corrupt utxo entry: {e:?}")),
+                            }
+                        }
+                        Err(e) => corrupt = Some(format!("corrupt outpoint key: {e:?}")),
+                    }
+                    Ok(())
+                })?;
+                Ok(())
+            })
+            .map_err(crate::chaindb::ChainDbError::Db)?;
+            if let Some(desc) = corrupt {
+                return Err(crate::chaindb::ChainDbError::Corrupt(desc));
+            }
+        } else {
+            rows.reserve(self.utxo_backend.len());
+            for (key, entry) in &self.utxo_backend {
+                let outpoint = OutPoint {
+                    hash: Hash(key.0),
+                    index: key.1,
+                    tree: key.2,
+                };
+                let serialized = crate::utxoio::serialize_utxo_entry(entry)
+                    .expect("the utxo backend never holds spent entries");
+                rows.push((
+                    crate::utxoio::outpoint_key(&outpoint),
+                    serialized,
+                    entry.amount(),
+                    key.0,
+                ));
+            }
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
         }
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut stats = UtxoStats {
             utxos: 0,
@@ -1059,18 +1604,6 @@ impl Chain {
         stats.serialized_hash = dcroxide_standalone::calc_merkle_root_in_place(&mut leaves);
         stats.transactions = transactions.len() as i64;
         Ok(stats)
-    }
-
-    fn cache_fetch(
-        backend: &BTreeMap<OutPointKey, UtxoEntry>,
-        cache: &BTreeMap<OutPointKey, Option<UtxoEntry>>,
-        op: &OutPoint,
-    ) -> Option<UtxoEntry> {
-        let key = (op.hash.0, op.index, op.tree);
-        match cache.get(&key) {
-            Some(entry) => entry.clone(),
-            None => backend.get(&key).cloned(),
-        }
     }
 
     /// The spent txouts for the block from the spend journal,
@@ -1640,16 +2173,17 @@ impl Chain {
             self.put_treasury_records(node, block, params)?;
         }
 
-        // Commit all entries in the view to the UTXO set, then flush
-        // the pending cache to the backend once it reaches its size
-        // limit so a sustained sync stays memory-bounded (dcrd
-        // `MaybeFlush` after each connect; the clean-shutdown flush
-        // still records the tail).
+        // Commit all entries in the view to the UTXO set, then
+        // conditionally flush the cache to the backend.  A flush is
+        // forced when the chain believes it is current since blocks
+        // connect infrequently at that point; during the initial sync
+        // the size limit and periodic interval gate it (dcrd
+        // `MaybeFlush(&node.hash, height, isCurrent, ...)` after each
+        // connect).
         self.commit_view(view);
-        if self.db.is_some() && self.utxo_cache_over_limit() {
-            self.flush_utxo_cache(node_hash, node_height as u32)
-                .map_err(persist_rule_error)?;
-        }
+        let is_chain_current = self.is_current(node, self.utxo_clock_unix);
+        self.maybe_flush_utxo_cache(node_hash, node_height as u32, is_chain_current)
+            .map_err(persist_rule_error)?;
 
         // This node is now the end of the best chain.
         self.best_chain.set_tip(&self.store, Some(node));
@@ -1915,7 +2449,7 @@ impl Chain {
                 &block,
                 &parent,
                 &stxos,
-                &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
+                &|op: &OutPoint| self.fetch_utxo_entry(op),
                 is_treasury_enabled,
             )?;
 
@@ -1967,7 +2501,7 @@ impl Chain {
                     &block,
                     &parent,
                     || self.fetch_spend_journal(&parent, is_treasury_enabled),
-                    &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
+                    &|op: &OutPoint| self.fetch_utxo_entry(op),
                     Some(&mut stxos),
                     is_treasury_enabled,
                 )?;
@@ -2016,9 +2550,7 @@ impl Chain {
                         &parent,
                         || self.fetch_spend_journal(&parent, is_treasury_enabled),
                         &mut view,
-                        &|op: &OutPoint| {
-                            Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op)
-                        },
+                        &|op: &OutPoint| self.fetch_utxo_entry(op),
                         Some(&mut stxos),
                         run_scripts,
                         params,
@@ -2055,9 +2587,8 @@ impl Chain {
     /// Reorganize the chain to the given target with handling for
     /// failed reorgs: when the target is or becomes invalid, fall
     /// back to the best valid chain candidate (dcrd
-    /// `reorganizeChain`; the current-latch cache flush is not
-    /// reproduced).  All accumulated reorg errors are returned (dcrd
-    /// wraps multiple in a `MultiError`).
+    /// `reorganizeChain`).  All accumulated reorg errors are returned
+    /// (dcrd wraps multiple in a `MultiError`).
     pub fn reorganize_chain(
         &mut self,
         target: Option<NodeId>,
@@ -2105,8 +2636,29 @@ impl Chain {
 
         // Potentially update whether the chain believes it is current
         // based on the actual new tip.
+        let mut latch_flush_failed = false;
         if let Some(new_tip) = self.best_chain.tip() {
+            let was_latched = self.is_current_latch;
             self.maybe_update_is_current(new_tip, adjusted_time_unix);
+
+            // If the chain just latched to current, force the UTXO
+            // cache to flush to the backend, which ensures the full
+            // set is on disk when the chain becomes current and
+            // allows fetching up-to-date utxo set stats (dcrd
+            // `reorganizeChain`).
+            if !was_latched && self.is_current_latch {
+                let (new_hash, new_height) = {
+                    let n = self.store.node(new_tip);
+                    (n.hash, n.height)
+                };
+                if let Err(e) = self.flush_utxo_cache(new_hash, new_height as u32) {
+                    // dcrd returns the flush error here, which skips
+                    // the reorganization-outcome notification below
+                    // (its deferred completion event still fires).
+                    reorg_errs.push(persist_rule_error(e));
+                    latch_flush_failed = true;
+                }
+            }
         }
 
         // The reorganization outcome when the tip actually moved,
@@ -2114,7 +2666,8 @@ impl Chain {
         // when every attempt failed.
         if sent_reorging_ntfn {
             let new_tip = self.best_chain.tip();
-            if new_tip != orig_tip
+            if !latch_flush_failed
+                && new_tip != orig_tip
                 && let (Some(orig), Some(new)) = (orig_tip, new_tip)
             {
                 let (old_hash, old_height) = {
@@ -2256,6 +2809,18 @@ impl Chain {
         adjusted_time_unix: i64,
         params: &Params,
     ) -> (i64, Vec<RuleError>) {
+        // The adjusted clock drives the periodic UTXO cache flush
+        // interval for the connects this call performs (dcrd's cache
+        // reads the wall clock; the port pins it to the same adjusted
+        // time the pruner uses so decisions stay deterministic).  The
+        // first observed clock also seeds the flush baseline so no
+        // periodic flush fires within the interval of startup, like
+        // dcrd's `lastFlushTime: time.Now()` at cache construction.
+        self.utxo_clock_unix = adjusted_time_unix;
+        if self.utxo_last_flush_unix == 0 {
+            self.utxo_last_flush_unix = adjusted_time_unix;
+        }
+
         // The block must not already exist in the main chain or side
         // chains.
         let hash = block.header.block_hash();
@@ -2395,6 +2960,14 @@ impl Chain {
         adjusted_time_unix: i64,
         params: &Params,
     ) -> Vec<RuleError> {
+        // The reorganization below flushes the utxo cache; keep the
+        // periodic-flush clock on the caller's adjusted time (and
+        // seed the flush baseline on first observation, like
+        // `process_block`).
+        self.utxo_clock_unix = adjusted_time_unix;
+        if self.utxo_last_flush_unix == 0 {
+            self.utxo_last_flush_unix = adjusted_time_unix;
+        }
         let Some(node) = self.index.lookup_node(hash) else {
             return alloc::vec![rule_error(
                 RuleErrorKind::UnknownBlock,
@@ -2495,6 +3068,14 @@ impl Chain {
         adjusted_time_unix: i64,
         params: &Params,
     ) -> Vec<RuleError> {
+        // The reorganization below flushes the utxo cache; keep the
+        // periodic-flush clock on the caller's adjusted time (and
+        // seed the flush baseline on first observation, like
+        // `process_block`).
+        self.utxo_clock_unix = adjusted_time_unix;
+        if self.utxo_last_flush_unix == 0 {
+            self.utxo_last_flush_unix = adjusted_time_unix;
+        }
         let Some(node) = self.index.lookup_node(hash) else {
             return alloc::vec![rule_error(
                 RuleErrorKind::UnknownBlock,
@@ -2628,6 +3209,14 @@ impl Chain {
         adjusted_time_unix: i64,
         params: &Params,
     ) -> Vec<RuleError> {
+        // The reorganization below flushes the utxo cache; keep the
+        // periodic-flush clock on the caller's adjusted time (and
+        // seed the flush baseline on first observation, like
+        // `process_block`).
+        self.utxo_clock_unix = adjusted_time_unix;
+        if self.utxo_last_flush_unix == 0 {
+            self.utxo_last_flush_unix = adjusted_time_unix;
+        }
         if former_best == new_best {
             return alloc::vec![rule_error(
                 RuleErrorKind::ForceReorgSameBlock,
@@ -2779,7 +3368,7 @@ impl Chain {
                 &parent,
                 || self.fetch_spend_journal(&parent, is_treasury_enabled),
                 &mut view,
-                &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
+                &|op: &OutPoint| self.fetch_utxo_entry(op),
                 None,
                 run_scripts,
                 params,
@@ -2796,7 +3385,7 @@ impl Chain {
             &tip_block,
             &parent,
             &stxos,
-            &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
+            &|op: &OutPoint| self.fetch_utxo_entry(op),
             is_treasury_enabled,
         )?;
         let branch_view = NodeBranchView {
@@ -2814,7 +3403,7 @@ impl Chain {
             &parent,
             || self.fetch_spend_journal(&parent, is_treasury_enabled),
             &mut view,
-            &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
+            &|op: &OutPoint| self.fetch_utxo_entry(op),
             None,
             run_scripts,
             params,
@@ -2875,7 +3464,7 @@ impl Chain {
             &tip_block,
             &parent,
             &stxos,
-            &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
+            &|op: &OutPoint| self.fetch_utxo_entry(op),
             is_treasury_enabled,
         )
         .map_err(|e| e.description)?;
@@ -2894,7 +3483,7 @@ impl Chain {
             block,
             &parent,
             || self.fetch_spend_journal(&parent, is_treasury_enabled),
-            &|op: &OutPoint| Self::cache_fetch(&self.utxo_backend, &self.utxo_cache, op),
+            &|op: &OutPoint| self.fetch_utxo_entry(op),
             None,
             is_treasury_enabled,
         )
@@ -3130,16 +3719,6 @@ impl Chain {
     /// it (dcrd's `--utxocachemaxsize`, in bytes).
     pub fn set_utxo_cache_max_bytes(&mut self, bytes: u64) {
         self.utxo_cache_max_bytes = bytes;
-    }
-
-    /// Whether the pending UTXO cache has reached its size limit and a
-    /// connect should flush it (dcrd `utxoCache.shouldFlush`'s size
-    /// check).  The size is estimated from the entry count and a fixed
-    /// per-entry cost rather than tracked byte-exactly, a documented
-    /// simplification of dcrd's incremental `totalEntrySize`.
-    fn utxo_cache_over_limit(&self) -> bool {
-        (self.utxo_cache.len() as u64).saturating_mul(APPROX_UTXO_CACHE_ENTRY_BYTES)
-            >= self.utxo_cache_max_bytes
     }
 
     /// Prune old in-memory state on the pruning interval — the target

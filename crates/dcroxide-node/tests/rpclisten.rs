@@ -448,8 +448,23 @@ fn answers_utxo_queries_over_http() {
     chain
         .lock()
         .expect("chain mutex")
-        .utxo_backend
-        .insert((tx_hash.0, 0, 0), entry);
+        .db
+        .as_ref()
+        .expect("db")
+        .update(|tx| {
+            dcroxide_blockchain::chaindb::db_put_utxo(
+                tx,
+                &dcroxide_wire::OutPoint {
+                    hash: tx_hash,
+                    index: 0,
+                    tree: 0,
+                },
+                Some(&entry),
+            )
+            .expect("write utxo row");
+            Ok(())
+        })
+        .expect("seed the flushed set");
 
     // gettxout with dcrd's default includemempool probes the empty
     // mempool, misses, and resolves the entry from the UTXO set.

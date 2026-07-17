@@ -42,7 +42,10 @@ pub mod validate;
 pub use compress::CURRENT_COMPRESSION_VERSION;
 pub use error::Error;
 pub use ruleerror::{RuleError, RuleErrorKind, render_multi_error};
-pub use utxoentry::{UtxoEntry, encode_utxo_flags, is_ticket_submission_output};
+pub use utxoentry::{
+    UTXO_STATE_FRESH, UTXO_STATE_MODIFIED, UTXO_STATE_SPENT, UtxoEntry, encode_utxo_flags,
+    is_ticket_submission_output,
+};
 pub use utxoio::{
     UTXO_PREFIX_DB_INFO, UTXO_PREFIX_UTXO_SET, UTXO_PREFIX_UTXO_STATE, UtxoSetState,
     decode_outpoint_key, deserialize_utxo_entry, deserialize_utxo_set_state, outpoint_key,
