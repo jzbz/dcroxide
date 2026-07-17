@@ -394,3 +394,41 @@ fn run_peer_connection_frames_at_the_negotiated_version_not_the_sentinel() {
          negotiated version), got {forwarded:?}"
     );
 }
+
+/// A byte-dribbling peer cannot stretch one message read past the
+/// absolute budget: dcrd's `SetReadDeadline(now + IdleTimeout)` covers
+/// the whole message, not each receive.
+#[test]
+fn a_dribbled_message_read_ends_at_the_budget() {
+    use std::io::Write;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let dribbler = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().expect("accept");
+        // One header byte per 100ms: with a per-receive timeout this
+        // 24-byte header would take 2.4s and never time out; the
+        // absolute budget must end it at ~300ms.
+        for byte in [0xf1u8, 0x86, 0x86, 0x69].iter().cycle().take(24) {
+            if conn.write_all(&[*byte]).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    let stream = std::net::TcpStream::connect(addr).expect("connect");
+    let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
+    transport.set_read_budget(Some(Duration::from_millis(300)));
+
+    let started = std::time::Instant::now();
+    let result = transport.read_message();
+    let elapsed = started.elapsed();
+    assert!(result.is_err(), "the dribbled read must fail");
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "the budget must bound the whole message read, took {elapsed:?}"
+    );
+    drop(transport);
+    let _ = dribbler.join();
+}

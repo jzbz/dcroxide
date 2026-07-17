@@ -10,12 +10,17 @@
 //! the ported wire codec, and tallies the wire bytes moved in each
 //! direction so the peer loop can feed dcrd's byte accounting.
 //!
-//! The idle read deadline dcrd sets before each read is applied by the
-//! peer loop on the underlying stream (for a TCP connection,
-//! `TcpStream::set_read_timeout`); the transport itself is deadline
-//! agnostic.
+//! The idle read deadline dcrd sets before each read
+//! (`SetReadDeadline(now + IdleTimeout)` in `readMessage`) is an
+//! absolute bound over the whole message; the transport reproduces it
+//! by arming the stream's read timeout with the remaining budget
+//! before every receive, so a byte-dribbling peer cannot extend one
+//! message read past the budget the peer loop configures.
 
 use std::io::{Read, Write};
+use std::time::{Duration, Instant};
+
+use crate::rpcrun::SocketTimeout;
 
 use dcroxide_peer::MsgTransport;
 use dcroxide_wire::{
@@ -52,6 +57,10 @@ pub struct WireTransport<S> {
     net: CurrencyNet,
     bytes_read: u64,
     bytes_written: u64,
+    /// The absolute budget covering each whole message read (dcrd's
+    /// per-`readMessage` `SetReadDeadline`); `None` leaves the
+    /// stream's own timeout, if any, to govern each receive.
+    read_budget: Option<Duration>,
     /// The server-wide totals this transport contributes to, when the
     /// daemon's accounting is wired (dcrd's `OnRead`/`OnWrite`
     /// listeners adding into the server's atomic counters).
@@ -68,6 +77,7 @@ impl<S> WireTransport<S> {
             net,
             bytes_read: 0,
             bytes_written: 0,
+            read_budget: None,
             net_totals: None,
         }
     }
@@ -112,17 +122,63 @@ impl<S> WireTransport<S> {
     pub fn into_inner(self) -> S {
         self.stream
     }
+
+    /// Set the absolute budget each whole message read must complete
+    /// within (dcrd's `SetReadDeadline(now + IdleTimeout)` before each
+    /// `readMessage`).
+    pub fn set_read_budget(&mut self, budget: Option<Duration>) {
+        self.read_budget = budget;
+    }
 }
 
-impl<S: Read + Write> MsgTransport for WireTransport<S> {
+/// Fill the buffer under an absolute deadline, re-arming the stream's
+/// read timeout with the remaining budget before every receive; with
+/// no deadline the reads run under the stream's own settings.
+fn read_exact_by_deadline<S: Read + SocketTimeout>(
+    stream: &mut S,
+    buf: &mut [u8],
+    deadline: Option<Instant>,
+) -> std::io::Result<()> {
+    let Some(deadline) = deadline else {
+        return stream.read_exact(buf);
+    };
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "read timed out",
+            ));
+        }
+        stream.set_socket_read_timeout(Some(remaining));
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            Ok(n) => filled = filled.saturating_add(n),
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
     fn read_message(&mut self) -> Result<Message, String> {
+        // One absolute deadline covers the whole message — header and
+        // payload (dcrd's single `SetReadDeadline` before
+        // `ReadMessageN`).
+        let now = Instant::now();
+        let deadline = self.read_budget.map(|b| now.checked_add(b).unwrap_or(now));
         // Read the fixed-size header first so the payload length is
         // known before any payload allocation (dcrd `readMessageHeader`
         // then the payload read).
         let mut buf = vec![0u8; MESSAGE_HEADER_SIZE];
-        self.stream
-            .read_exact(&mut buf)
-            .map_err(|e| e.to_string())?;
+        read_exact_by_deadline(&mut self.stream, &mut buf, deadline).map_err(|e| e.to_string())?;
 
         let payload_len = u32::from_le_bytes(
             buf[PAYLOAD_LEN_OFFSET..PAYLOAD_LEN_OFFSET + 4]
@@ -136,8 +192,7 @@ impl<S: Read + Write> MsgTransport for WireTransport<S> {
         // so a hostile peer cannot force a huge allocation.
         if payload_len as u64 <= MAX_MESSAGE_PAYLOAD {
             buf.resize(MESSAGE_HEADER_SIZE.saturating_add(payload_len), 0);
-            self.stream
-                .read_exact(&mut buf[MESSAGE_HEADER_SIZE..])
+            read_exact_by_deadline(&mut self.stream, &mut buf[MESSAGE_HEADER_SIZE..], deadline)
                 .map_err(|e| e.to_string())?;
         }
 

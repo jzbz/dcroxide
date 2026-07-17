@@ -1319,9 +1319,23 @@ fn accept_loop(
                 // underlying socket, unlike the per-handle timeout
                 // options `SocketTimeout` warns about.
                 let guard = handlers.enter(stream.try_clone().ok());
+                // The request-read watchdog: an absolute wall-clock
+                // bound over the handshake phase, closing the socket at
+                // the deadline (Go's ReadTimeout; the per-receive
+                // budget alone cannot bound the TLS record loop).
+                let now = Instant::now();
+                let watchdog = arm_handshake_watchdog(
+                    stream.try_clone().ok(),
+                    now.checked_add(RPC_AUTH_TIMEOUT).unwrap_or(now),
+                );
+                // A failed spawn under thread exhaustion drops the
+                // connection (the guard and the socket close with the
+                // closure) instead of panicking the accept loop, which
+                // must outlive any flood (Go's goroutine model cannot
+                // fail here).
                 match transport {
                     RpcTransport::Plain => {
-                        thread::spawn(move || {
+                        let _ = thread::Builder::new().spawn(move || {
                             let _guard = guard;
                             serve_rpc_connection(
                                 stream,
@@ -1330,12 +1344,13 @@ fn accept_loop(
                                 max_clients,
                                 &num_clients,
                                 &stop,
+                                watchdog,
                             );
                         });
                     }
                     RpcTransport::Tls(config) => {
                         let config = Arc::clone(config);
-                        thread::spawn(move || {
+                        let _ = thread::Builder::new().spawn(move || {
                             let _guard = guard;
                             let Ok(session) = rustls::ServerConnection::new(config) else {
                                 return;
@@ -1348,6 +1363,7 @@ fn accept_loop(
                                 max_clients,
                                 &num_clients,
                                 &stop,
+                                watchdog,
                             );
                         });
                     }
@@ -1355,6 +1371,66 @@ fn accept_loop(
             }
             Err(_) => thread::sleep(ACCEPT_POLL_INTERVAL),
         }
+    }
+}
+
+/// Bounds a connection's request-read phase with a wall-clock deadline
+/// enforced from outside the reading thread (Go's `http.Server`
+/// `ReadTimeout` is such an absolute bound at the `net.Conn` level,
+/// under TLS too): over TLS a single stream read loops socket receives
+/// internally, each under the re-armed remaining budget, so a
+/// record-dribbling client could stretch the phase past the deadline —
+/// the watchdog closes the socket at the deadline instead.  Dropping
+/// the handle disarms it, so every return path stands it down.
+struct HandshakeWatchdog {
+    state: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+/// Arm a watchdog that shuts the socket down at the deadline unless
+/// disarmed first.  With no socket handle (a failed `try_clone`) the
+/// watchdog is inert and the per-receive budget alone bounds the
+/// plaintext path.
+fn arm_handshake_watchdog(sock: Option<TcpStream>, deadline: Instant) -> HandshakeWatchdog {
+    let state = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    if let Some(sock) = sock {
+        let thread_state = Arc::clone(&state);
+        // A failed spawn (thread exhaustion under an accept flood)
+        // degrades to an inert watchdog rather than panicking the
+        // accept loop; the per-receive budget still bounds the
+        // plaintext path.
+        let _ = thread::Builder::new().spawn(move || {
+            let (done, bell) = &*thread_state;
+            let mut done = done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*done {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    let _ = sock.shutdown(Shutdown::Both);
+                    return;
+                }
+                let (guard, _) = bell
+                    .wait_timeout(done, remaining)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                done = guard;
+            }
+        });
+    }
+    HandshakeWatchdog { state }
+}
+
+impl HandshakeWatchdog {
+    /// Stand the watchdog down: the request-read phase completed
+    /// within the deadline.
+    fn disarm(&self) {
+        let (done, bell) = &*self.state;
+        let mut done = done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *done = true;
+        bell.notify_all();
+    }
+}
+
+impl Drop for HandshakeWatchdog {
+    fn drop(&mut self) {
+        self.disarm();
     }
 }
 
@@ -1373,6 +1449,12 @@ impl SocketTimeout for TcpStream {
     fn set_socket_read_timeout(&self, timeout: Option<Duration>) {
         let _ = self.set_read_timeout(timeout);
     }
+}
+
+/// In-memory streams have no socket timeout; tests frame messages over
+/// cursors and pipes.
+impl<T> SocketTimeout for std::io::Cursor<T> {
+    fn set_socket_read_timeout(&self, _timeout: Option<Duration>) {}
 }
 
 impl SocketTimeout for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
@@ -1779,6 +1861,7 @@ fn strip_port(host_port: &str) -> String {
 /// Serve a single RPC connection: parse the request head, then either
 /// serve the websocket upgrade at `/ws` or process one JSON-RPC POST
 /// (dcrd's HTTP handler routing between `/` and `/ws`).
+#[allow(clippy::too_many_arguments)]
 fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     mut stream: S,
     server: &Arc<Mutex<Server<NodeRpcChain>>>,
@@ -1786,6 +1869,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     max_clients: usize,
     num_clients: &Arc<AtomicI32>,
     shutdown: &AtomicBool,
+    watchdog: HandshakeWatchdog,
 ) {
     // The absolute deadline for the whole handshake (dcrd's HTTP
     // `ReadTimeout`), applied per read so a byte-dribbling client cannot
@@ -1843,6 +1927,10 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
         // the serving loop to write queued notifications, and dcrd
         // websocket connections have no read deadline, so the 30
         // second connection timeout must not apply here.
+        // The request read completed; a websocket connection lives past
+        // the handshake deadline by design (dcrd sets no read deadline
+        // on websocket conns).
+        watchdog.disarm();
         stream.set_socket_read_timeout(Some(WS_POLL_INTERVAL));
         crate::websocket::serve_websocket(stream, &head, authed, is_admin, server, ntfn, shutdown);
         return;
@@ -1934,6 +2022,10 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
         // Rejected with 501 above.
         BodyFraming::Unsupported => return,
     };
+    // The whole request is read (Go's ReadTimeout stops mattering
+    // here); processing and the response write run unbounded exactly
+    // as dcrd's http.Server without a WriteTimeout does.
+    watchdog.disarm();
 
     let Ok(body) = String::from_utf8(body) else {
         let _ = write_response(&mut stream, "400 Bad Request", b"invalid body");
@@ -2389,5 +2481,69 @@ mod tests {
         );
 
         connector.shutdown();
+    }
+
+    /// The handshake watchdog closes a dribbled connection at the
+    /// deadline, and disarming stands it down.
+    #[test]
+    fn handshake_watchdog_fires_and_disarms() {
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+
+        // Fired: a reader with no timeout of its own is unblocked when
+        // the watchdog shuts the socket down at the deadline.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server_sock, _) = listener.accept().expect("accept");
+        let now = Instant::now();
+        let watchdog = arm_handshake_watchdog(
+            server_sock.try_clone().ok(),
+            now.checked_add(Duration::from_millis(150))
+                .expect("deadline"),
+        );
+        // On Windows a local shutdown does not abort a blocked recv;
+        // the socket timeout is the cross-platform fallback bounding
+        // the test, while unix unblocks at the watchdog's deadline.
+        server_sock
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("read timeout");
+        let mut reader = server_sock;
+        let started = Instant::now();
+        let mut byte = [0u8; 1];
+        let outcome = reader.read(&mut byte);
+        assert!(
+            matches!(outcome, Ok(0) | Err(_)),
+            "the watchdog must end the blocked read"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "fired late: {:?}",
+            started.elapsed()
+        );
+        drop(watchdog);
+        drop(client);
+
+        // Disarmed: the socket outlives the deadline.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let (server_sock, _) = listener.accept().expect("accept");
+        let now = Instant::now();
+        let watchdog = arm_handshake_watchdog(
+            server_sock.try_clone().ok(),
+            now.checked_add(Duration::from_millis(100))
+                .expect("deadline"),
+        );
+        watchdog.disarm();
+        std::thread::sleep(Duration::from_millis(250));
+        use std::io::Write;
+        let mut server_sock = server_sock;
+        server_sock
+            .write_all(b"ok")
+            .expect("a disarmed socket stays open");
+        let mut buf = [0u8; 2];
+        client.read_exact(&mut buf).expect("read");
+        assert_eq!(&buf, b"ok");
     }
 }

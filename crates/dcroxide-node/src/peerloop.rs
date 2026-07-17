@@ -19,8 +19,9 @@
 //! on the single output loop.  The blocking read is taken without the
 //! peer lock held so the ping timer and the server make progress.  The
 //! stall detector and the inventory trickle queue arrive later.  The
-//! idle read deadline is applied by the caller on the underlying stream
-//! (`TcpStream::set_read_timeout`); a read timeout ends the loop exactly
+//! idle read deadline is applied through the transport's absolute
+//! per-message read budget (dcrd's
+//! `SetReadDeadline` before each read); a read timeout ends the loop exactly
 //! like dcrd's idle disconnect.
 
 use std::net::{Shutdown, TcpStream};
@@ -349,9 +350,6 @@ where
     // instead of holding a serving thread for the full idle window; the
     // idle timeout takes over once the session begins.
     let negotiate_timeout = Duration::from_nanos(NEGOTIATE_TIMEOUT.max(0) as u64);
-    if let Err(e) = stream.set_read_timeout(Some(negotiate_timeout)) {
-        return DisconnectReason::ReadError(e.to_string());
-    }
     let write_stream = match stream.try_clone() {
         Ok(write_stream) => write_stream,
         Err(e) => return DisconnectReason::WriteError(e.to_string()),
@@ -365,6 +363,13 @@ where
         pver
     };
     let mut read_transport = WireTransport::new(stream, handshake_pver, net);
+    // The negotiate deadline bounds the handshake message read
+    // absolutely, so a peer dribbling bytes cannot stretch the
+    // handshake past it; dcrd's negotiation reads also run under the
+    // per-message idle deadline inside its 30-second select, so a
+    // configured idle timeout below the negotiate window bounds the
+    // read tighter, exactly as dcrd's does.
+    read_transport.set_read_budget(Some(negotiate_timeout.min(idle_timeout)));
     let mut write_transport = WireTransport::new(write_stream, handshake_pver, net);
     // Both halves contribute to the server-wide byte totals from the
     // handshake onward, exactly like dcrd's read/write listeners.
@@ -394,14 +399,10 @@ where
     write_transport.set_protocol_version(negotiated_pver);
 
     // The handshake completed within the negotiate deadline; the longer
-    // idle timeout governs the session from here (dcrd clearing the
-    // negotiate deadline once the version exchange succeeds).
-    if let Err(e) = read_transport
-        .get_ref()
-        .set_read_timeout(Some(idle_timeout))
-    {
-        return DisconnectReason::ReadError(e.to_string());
-    }
+    // idle timeout governs each message read from here, again as an
+    // absolute per-message bound (dcrd's readMessage arming
+    // SetReadDeadline(now + IdleTimeout) before every read).
+    read_transport.set_read_budget(Some(idle_timeout));
 
     // Fold the handshake's traffic into the peer's counters: dcrd's
     // negotiation reads and writes go through the same counted
