@@ -256,3 +256,47 @@ fn proxy_transport_routes_through_the_socks_proxy() {
     let req = requests.recv().expect("request via proxy");
     assert!(req.starts_with("GET /addrs HTTP/1.1"), "req: {req}");
 }
+
+/// A transport wedged in a slow request must not hold up shutdown:
+/// the round is abandoned and its thread dies with the process (dcrd
+/// cancels the requests through the daemon context).
+#[test]
+fn shutdown_abandons_an_in_flight_seeder_round() {
+    struct BlockingTransport;
+    impl SeederTransport for BlockingTransport {
+        fn get(&mut self, _url: &str) -> Result<(u32, Vec<u8>), String> {
+            // Far longer than the test's shutdown deadline; the
+            // abandoned thread ends with the process.
+            std::thread::sleep(Duration::from_secs(60));
+            Err("never reached".to_string())
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mgr = Arc::new(Mutex::new(AddrManager::new(dir.path())));
+    let boot = start_seeding(
+        vec!["blocking.example".to_string()],
+        Arc::clone(&mgr),
+        0,
+        || BlockingTransport,
+    );
+    // Let the round start its request thread.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let started = Instant::now();
+    let done = std::thread::spawn(move || boot.shutdown());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        done.is_finished(),
+        "shutdown must abandon the in-flight round, not wait out its transport"
+    );
+    done.join().expect("shutdown thread");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown returned in {:?}",
+        started.elapsed()
+    );
+}

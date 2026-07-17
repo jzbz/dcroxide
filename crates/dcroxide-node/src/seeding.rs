@@ -282,7 +282,9 @@ pub struct SeederBoot {
 }
 
 impl SeederBoot {
-    /// Stop the bootstrap and wait for its round to finish.
+    /// Stop the bootstrap; an in-flight seeder round is abandoned
+    /// rather than waited out (its request threads end at the
+    /// transport timeout at most).
     pub fn shutdown(mut self) {
         self.stop_thread();
     }
@@ -324,28 +326,55 @@ where
         // every seeder fails and the manager still needs addresses.
         let mut backoff = Duration::from_secs(1);
         loop {
+            // Each seeder reports its result over a channel rather than
+            // being joined, so a shutdown does not wait out an in-flight
+            // request (dcrd cancels the requests through the daemon
+            // context; the port cannot abort its transports, so the
+            // round threads are abandoned instead — their requests run
+            // to the transport timeout at most and die with the
+            // process).
             let mut err_count = 0usize;
-            let mut rounds = Vec::new();
+            let (results, resulted) = mpsc::channel();
             for seeder in &seeders {
                 let seeder = seeder.clone();
                 let filters = filters.clone();
                 let factory = Arc::clone(&factory);
-                rounds.push(thread::spawn(move || {
+                let results = results.clone();
+                thread::spawn(move || {
                     let mut transport = factory();
                     let mut env = SystemSeedEnv;
-                    seed_addrs(&seeder, &mut transport, &mut env, &filters)
-                        .map(|addrs| (seeder, addrs))
-                }));
+                    let outcome = seed_addrs(&seeder, &mut transport, &mut env, &filters)
+                        .map(|addrs| (seeder, addrs));
+                    let _ = results.send(outcome);
+                });
             }
-            for round in rounds {
-                match round.join() {
+            drop(results);
+            let mut outstanding = seeders.len();
+            while outstanding > 0 {
+                // A stop request or a dropped stop sender abandons the
+                // round immediately.
+                if let Ok(()) | Err(mpsc::TryRecvError::Disconnected) = stopped.try_recv() {
+                    return;
+                }
+                match resulted.recv_timeout(Duration::from_millis(200)) {
                     Ok(Ok((seeder, addrs))) => {
+                        outstanding = outstanding.saturating_sub(1);
                         if addrs.is_empty() {
                             continue;
                         }
                         add_seeded(&addr_manager, &seeder, addrs);
                     }
-                    _ => err_count = err_count.saturating_add(1),
+                    Ok(Err(_)) => {
+                        outstanding = outstanding.saturating_sub(1);
+                        err_count = err_count.saturating_add(1);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    // Every round sender is gone: whatever did not
+                    // report counts as failed.
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        err_count = err_count.saturating_add(outstanding);
+                        break;
+                    }
                 }
             }
 
