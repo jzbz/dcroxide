@@ -187,7 +187,12 @@ pub struct MsgAddr {
 }
 
 impl MsgAddr {
-    pub(crate) fn decode(r: &mut Cursor<'_>) -> Result<MsgAddr, WireError> {
+    pub(crate) fn decode(r: &mut Cursor<'_>, pver: u32) -> Result<MsgAddr, WireError> {
+        // The legacy addr message is invalid once addrv2 exists (dcrd
+        // `MsgAddr.BtcDecode` at `AddrV2Version`).
+        if pver >= crate::protocol::ADDR_V2_VERSION {
+            return Err(WireError::MsgInvalidForPVer);
+        }
         let count = read_var_int(r)?;
         if count > MAX_ADDR_PER_MSG {
             return Err(WireError::TooManyAddrs {
@@ -202,7 +207,12 @@ impl MsgAddr {
         Ok(MsgAddr { addr_list })
     }
 
-    pub(crate) fn encode(&self, w: &mut Vec<u8>) -> Result<(), WireError> {
+    pub(crate) fn encode(&self, w: &mut Vec<u8>, pver: u32) -> Result<(), WireError> {
+        // The legacy addr message is invalid once addrv2 exists (dcrd
+        // `MsgAddr.BtcEncode` at `AddrV2Version`).
+        if pver >= crate::protocol::ADDR_V2_VERSION {
+            return Err(WireError::MsgInvalidForPVer);
+        }
         if self.addr_list.len() as u64 > MAX_ADDR_PER_MSG {
             return Err(WireError::TooManyAddrs {
                 count: self.addr_list.len() as u64,
@@ -216,9 +226,87 @@ impl MsgAddr {
         Ok(())
     }
 
-    pub(crate) fn max_payload_length(_pver: u32) -> u32 {
+    /// The maximum payload for the version (dcrd
+    /// `MsgAddr.MaxPayloadLength`).
+    pub fn max_payload_length(pver: u32) -> u32 {
+        // Zero once the message is invalid for the version (at
+        // `AddrV2Version`).
+        if pver >= crate::protocol::ADDR_V2_VERSION {
+            return 0;
+        }
         var_int_serialize_size(MAX_ADDR_PER_MSG) as u32
             + (MAX_ADDR_PER_MSG as u32 * MAX_NET_ADDRESS_PAYLOAD)
+    }
+}
+
+/// The maximum number of addresses in one `addrv2` message (dcrd
+/// `MaxAddrPerV2Msg`).
+pub const MAX_ADDR_PER_V2_MSG: u64 = 1000;
+
+/// The `addrv2` message (dcrd `MsgAddrV2`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MsgAddrV2 {
+    /// The advertised addresses (at least one, at most
+    /// [`MAX_ADDR_PER_V2_MSG`]).
+    pub addr_list: Vec<crate::netaddress::NetAddressV2>,
+}
+
+impl MsgAddrV2 {
+    /// Decode the payload (dcrd `MsgAddrV2.BtcDecode`).
+    pub fn decode(r: &mut Cursor<'_>, pver: u32) -> Result<MsgAddrV2, WireError> {
+        // Peers sending addrv2 must negotiate at least its version
+        // (dcrd `MsgAddrV2.BtcDecode`).
+        if pver < crate::protocol::ADDR_V2_VERSION {
+            return Err(WireError::MsgInvalidForPVer);
+        }
+        let count = read_var_int(r)?;
+        if count == 0 {
+            return Err(WireError::TooFewAddrs);
+        }
+        if count > MAX_ADDR_PER_V2_MSG {
+            return Err(WireError::TooManyAddrs {
+                count,
+                max: MAX_ADDR_PER_V2_MSG,
+            });
+        }
+        let mut addr_list = Vec::new();
+        for _ in 0..count {
+            addr_list.push(crate::netaddress::NetAddressV2::decode(r)?);
+        }
+        Ok(MsgAddrV2 { addr_list })
+    }
+
+    /// Append the payload encoding (dcrd `MsgAddrV2.BtcEncode`).
+    pub fn encode(&self, w: &mut Vec<u8>, pver: u32) -> Result<(), WireError> {
+        if pver < crate::protocol::ADDR_V2_VERSION {
+            return Err(WireError::MsgInvalidForPVer);
+        }
+        let count = self.addr_list.len() as u64;
+        if count == 0 {
+            return Err(WireError::TooFewAddrs);
+        }
+        if count > MAX_ADDR_PER_V2_MSG {
+            return Err(WireError::TooManyAddrs {
+                count,
+                max: MAX_ADDR_PER_V2_MSG,
+            });
+        }
+        write_var_int(w, count);
+        for na in &self.addr_list {
+            na.encode(w)?;
+        }
+        Ok(())
+    }
+
+    /// The maximum payload for the version (dcrd
+    /// `MsgAddrV2.MaxPayloadLength`).
+    pub fn max_payload_length(pver: u32) -> u32 {
+        // Zero before the message exists for the version.
+        if pver < crate::protocol::ADDR_V2_VERSION {
+            return 0;
+        }
+        var_int_serialize_size(MAX_ADDR_PER_V2_MSG) as u32
+            + (MAX_ADDR_PER_V2_MSG as u32 * crate::netaddress::MAX_NET_ADDRESS_PAYLOAD_V2)
     }
 }
 

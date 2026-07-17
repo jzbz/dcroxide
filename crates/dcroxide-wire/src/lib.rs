@@ -56,8 +56,8 @@ pub use msg_cf::{
     MsgCFilterV2, MsgCFiltersV2, MsgGetCFHeaders, MsgGetCFilter, MsgGetCFilterV2, MsgGetCFsV2,
 };
 pub use msg_control::{
-    MAX_ADDR_PER_MSG, MAX_USER_AGENT_LEN, MsgAddr, MsgFeeFilter, MsgPing, MsgPong, MsgReject,
-    MsgVersion, RejectCode,
+    MAX_ADDR_PER_MSG, MAX_ADDR_PER_V2_MSG, MAX_USER_AGENT_LEN, MsgAddr, MsgAddrV2, MsgFeeFilter,
+    MsgPing, MsgPong, MsgReject, MsgVersion, RejectCode,
 };
 pub use msg_data::{
     BlockLocator, INIT_STATE_HEAD_BLOCK_VOTES, INIT_STATE_HEAD_BLOCKS, INIT_STATE_TSPENDS,
@@ -82,7 +82,9 @@ pub use msgtx::{
     SEQUENCE_LOCK_TIME_IS_SECONDS, SEQUENCE_LOCK_TIME_MASK, TX_TREE_REGULAR, TX_TREE_STAKE,
     TX_TREE_UNKNOWN, TX_VERSION, TxIn, TxOut, TxSerializeType,
 };
-pub use netaddress::{MAX_NET_ADDRESS_PAYLOAD, NetAddress};
+pub use netaddress::{
+    MAX_NET_ADDRESS_PAYLOAD, MAX_NET_ADDRESS_PAYLOAD_V2, NetAddress, NetAddressType, NetAddressV2,
+};
 pub use protocol::{
     BATCHED_CFILTERS_V2_VERSION, CFILTER_V2_VERSION, CurrencyNet, FEE_FILTER_VERSION,
     INIT_STATE_VERSION, INITIAL_PROTOCOL_VERSION, MAX_BLOCK_SIZE_VERSION, MIX_VERSION,

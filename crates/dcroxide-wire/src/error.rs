@@ -63,6 +63,12 @@ pub enum WireError {
     TrailingBytes,
     /// An address list exceeded its maximum (`ErrTooManyAddrs`).
     TooManyAddrs { count: u64, max: u64 },
+    /// An address list had no entries where at least one is required
+    /// (`ErrTooFewAddrs`).
+    TooFewAddrs,
+    /// A version 2 network address carried an unknown address type
+    /// discriminator (`ErrUnknownNetAddrType`).
+    UnknownNetAddrType { addr_type: u8 },
     /// A transaction count exceeded what could fit (`ErrTooManyTxs`).
     TooManyTxs { count: u64, max: u64 },
     /// The message is not valid for the negotiated protocol version
@@ -160,6 +166,8 @@ impl WireError {
             WireError::MismatchedWitnessCount { .. } => "ErrMismatchedWitnessCount",
             WireError::UnknownTxType(_) => "ErrUnknownTxType",
             WireError::InvalidMsg => "ErrInvalidMsg",
+            WireError::TooFewAddrs => "ErrTooFewAddrs",
+            WireError::UnknownNetAddrType { .. } => "ErrUnknownNetAddrType",
             WireError::UserAgentTooLong { .. } => "ErrUserAgentTooLong",
             WireError::TooManyFilterHeaders { .. } => "ErrTooManyFilterHeaders",
             WireError::MalformedStrictString => "ErrMalformedStrictString",

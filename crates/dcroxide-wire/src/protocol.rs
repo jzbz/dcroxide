@@ -10,7 +10,14 @@ pub const INITIAL_PROTOCOL_VERSION: u32 = 1;
 
 /// The latest protocol version this crate implements (dcrd
 /// `ProtocolVersion` at the pinned release-v2.1.5 tag).
+/// NOTE: dcrd master (the 2.2 pre-release) negotiates protocol
+/// version 12; the port advertises 11 until the daemon's addrv2
+/// handlers land, at which point this becomes 12.
 pub const PROTOCOL_VERSION: u32 = 11;
+
+/// The protocol version which adds the `addrv2` message and retires
+/// the legacy `addr` message (dcrd `AddrV2Version`).
+pub const ADDR_V2_VERSION: u32 = 12;
 
 /// Version in which the SFNodeBloom service flag was introduced.
 pub const NODE_BLOOM_VERSION: u32 = 2;

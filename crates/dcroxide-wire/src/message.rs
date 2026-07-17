@@ -37,6 +37,8 @@ pub enum Message {
     VerAck,
     GetAddr,
     Addr(MsgAddr),
+    /// An `addrv2` message.
+    AddrV2(MsgAddrV2),
     GetBlocks(MsgGetBlocks),
     Inv(MsgInv),
     GetData(MsgGetData),
@@ -84,6 +86,7 @@ impl Message {
             Message::VerAck => "verack",
             Message::GetAddr => "getaddr",
             Message::Addr(_) => "addr",
+            Message::AddrV2(_) => "addrv2",
             Message::GetBlocks(_) => "getblocks",
             Message::Inv(_) => "inv",
             Message::GetData(_) => "getdata",
@@ -150,7 +153,8 @@ impl Message {
                     return Err(WireError::MsgInvalidForPVer);
                 }
             }
-            Message::Addr(m) => m.encode(&mut w)?,
+            Message::Addr(m) => m.encode(&mut w, pver)?,
+            Message::AddrV2(m) => m.encode(&mut w, pver)?,
             Message::GetBlocks(m) => m.encode(&mut w)?,
             Message::Inv(m) => encode_inv_message(&mut w, &m.inv_list)?,
             Message::GetData(m) => encode_inv_message(&mut w, &m.inv_list)?,
@@ -195,6 +199,7 @@ fn max_payload_for_command(command: &str, pver: u32) -> Option<u32> {
         "version" => MsgVersion::max_payload_length(pver),
         "verack" | "getaddr" | "mempool" | "getminings" | "sendheaders" | "getcftypes" => 0,
         "addr" => MsgAddr::max_payload_length(pver),
+        "addrv2" => MsgAddrV2::max_payload_length(pver),
         "getblocks" | "getheaders" => BlockLocator::max_payload_length(pver),
         "inv" | "getdata" | "notfound" => inv_message_max_payload(pver),
         "block" => MsgBlock::max_payload_length(pver),
@@ -282,7 +287,8 @@ fn decode_payload(
                 Ok(Message::GetCFTypes)
             }
         }
-        "addr" => MsgAddr::decode(r).map(Message::Addr),
+        "addr" => MsgAddr::decode(r, pver).map(Message::Addr),
+        "addrv2" => MsgAddrV2::decode(r, pver).map(Message::AddrV2),
         "getblocks" => MsgGetBlocks::decode(r).map(Message::GetBlocks),
         "getheaders" => MsgGetHeaders::decode(r).map(Message::GetHeaders),
         "inv" => decode_inv_message(r).map(|inv_list| Message::Inv(MsgInv { inv_list })),
