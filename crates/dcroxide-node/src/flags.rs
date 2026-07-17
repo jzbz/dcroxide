@@ -599,6 +599,447 @@ pub const ENV_DEFAULTS: [(&str, &str, Option<&str>); 2] = [
     ("altdnsnames", "DCRD_ALT_DNSNAMES", Some(",")),
 ];
 
+/// The help description and environment-variable annotation for each
+/// dcrd option, in registry order (the `description:`/`env:` struct
+/// tags go-flags renders; extracted verbatim from dcrd v1.10.7
+/// config.go by tools/helpgen).
+pub const HELP_DESCRIPTIONS: [(&str, &str, Option<&str>); 86] = [
+    ("version", "Display version information and exit", None),
+    (
+        "appdata",
+        "Path to application home directory",
+        Some("DCRD_APPDATA"),
+    ),
+    ("configfile", "Path to configuration file", None),
+    ("datadir", "Directory to store data", None),
+    ("logdir", "Directory to log output", None),
+    (
+        "logsize",
+        "Maximum size of log file before it is rotated",
+        None,
+    ),
+    ("nofilelogging", "Disable file logging", None),
+    (
+        "dbtype",
+        "Database backend to use for the block chain",
+        None,
+    ),
+    (
+        "profile",
+        "Enable HTTP profiling on given [addr:]port -- NOTE port must be between 1024 and 65536",
+        None,
+    ),
+    (
+        "cpuprofile",
+        "Write CPU profile to the specified file",
+        None,
+    ),
+    (
+        "memprofile",
+        "Write mem profile to the specified file",
+        None,
+    ),
+    ("testnet", "Use the test network", None),
+    ("simnet", "Use the simulation test network", None),
+    ("regnet", "Use the regression test network", None),
+    (
+        "debuglevel",
+        "Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems",
+        None,
+    ),
+    (
+        "sigcachemaxsize",
+        "The maximum number of entries in the signature verification cache",
+        None,
+    ),
+    (
+        "utxocachemaxsize",
+        "The maximum size in MiB of the utxo cache; (min: 25, max: 32768)",
+        None,
+    ),
+    (
+        "norpc",
+        "Disable built-in RPC server -- NOTE: The RPC server is disabled by default if no rpcuser/rpcpass or rpclimituser/rpclimitpass is specified",
+        None,
+    ),
+    (
+        "rpclisten",
+        "Add an interface/port to listen for RPC connections (default port: 9109, testnet: 19109)",
+        None,
+    ),
+    ("rpcuser", "Username for RPC connections", None),
+    ("rpcpass", "Password for RPC connections", None),
+    (
+        "authtype",
+        "Method for RPC client authentication (basic or clientcert)",
+        None,
+    ),
+    (
+        "clientcafile",
+        "File containing Certificate Authorities to verify TLS client certificates; requires authtype=clientcert",
+        None,
+    ),
+    ("rpclimituser", "Username for limited RPC connections", None),
+    ("rpclimitpass", "Password for limited RPC connections", None),
+    ("rpccert", "File containing the certificate file", None),
+    ("rpckey", "File containing the certificate key", None),
+    (
+        "tlscurve",
+        "Curve to use when generating TLS keypairs",
+        None,
+    ),
+    (
+        "altdnsnames",
+        "Specify additional DNS names to use when generating the RPC server certificate",
+        Some("DCRD_ALT_DNSNAMES"),
+    ),
+    (
+        "notls",
+        "Disable TLS for the RPC server -- NOTE: This is only allowed if the RPC server is bound to localhost",
+        None,
+    ),
+    (
+        "rpcmaxclients",
+        "Max number of RPC clients for standard connections",
+        None,
+    ),
+    (
+        "rpcmaxwebsockets",
+        "Max number of RPC websocket connections",
+        None,
+    ),
+    (
+        "rpcmaxconcurrentreqs",
+        "Max number of concurrent RPC requests that may be processed concurrently",
+        None,
+    ),
+    (
+        "proxy",
+        "Connect via SOCKS5 proxy (eg. 127.0.0.1:9050)",
+        None,
+    ),
+    ("proxyuser", "Username for proxy server", None),
+    ("proxypass", "Password for proxy server", None),
+    (
+        "onion",
+        "Connect to tor hidden services via SOCKS5 proxy (eg. 127.0.0.1:9050)",
+        None,
+    ),
+    ("onionuser", "Username for onion proxy server", None),
+    ("onionpass", "Password for onion proxy server", None),
+    ("noonion", "Disable connecting to tor hidden services", None),
+    (
+        "torisolation",
+        "Enable Tor stream isolation by randomizing user credentials for each connection",
+        None,
+    ),
+    ("addpeer", "Add a peer to connect with at startup", None),
+    (
+        "connect",
+        "Connect only to the specified peers at startup",
+        None,
+    ),
+    (
+        "nolisten",
+        "Disable listening for incoming connections -- NOTE: Listening is automatically disabled if the --connect or --proxy options are used without also specifying listen interfaces via --listen",
+        None,
+    ),
+    (
+        "listen",
+        "Add an interface/port to listen for connections (default all interfaces port: 9108, testnet: 19108)",
+        None,
+    ),
+    (
+        "maxsameip",
+        "Max number of connections with the same IP -- 0 to disable",
+        None,
+    ),
+    ("maxpeers", "Max number of inbound and outbound peers", None),
+    (
+        "dialtimeout",
+        "How long to wait for TCP connection completion.  Valid time units are {s, m, h}.  Minimum 1 second",
+        None,
+    ),
+    (
+        "peeridletimeout",
+        "The duration of inactivity before a peer is timed out.  Valid time units are {s,m,h}.  Minimum 15 seconds",
+        None,
+    ),
+    ("noseeders", "Disable seeding for peer discovery", None),
+    ("nodnsseed", "DEPRECATED: use --noseeders", None),
+    (
+        "externalip",
+        "Add a public-facing IP to the list of local external IPs that dcrd will advertise to other peers",
+        None,
+    ),
+    (
+        "nodiscoverip",
+        "Disable automatic network address discovery of local external IPs",
+        None,
+    ),
+    (
+        "upnp",
+        "Use UPnP to map our listening port outside of NAT",
+        None,
+    ),
+    ("nobanning", "Disable banning of misbehaving peers", None),
+    (
+        "banduration",
+        "How long to ban misbehaving peers.  Valid time units are {s, m, h}.  Minimum 1 second",
+        None,
+    ),
+    (
+        "banthreshold",
+        "Maximum allowed ban score before disconnecting and banning misbehaving peers",
+        None,
+    ),
+    (
+        "whitelist",
+        "Add an IP network or IP that will not be banned (eg. 192.168.1.0/24 or ::1)",
+        None,
+    ),
+    (
+        "allowoldforks",
+        "Process forks deep in history.  Don't do this unless you know what you're doing",
+        None,
+    ),
+    (
+        "dumpblockchain",
+        "Write blockchain as a flat file of blocks for use with addblock, to the specified filename",
+        None,
+    ),
+    (
+        "assumevalid",
+        "Hash of an assumed valid block.  Defaults to the hard-coded assumed valid block that is updated periodically with new releases.  Don't use a different hash unless you understand the implications.  Set to 0 to disable",
+        None,
+    ),
+    (
+        "minrelaytxfee",
+        "The minimum transaction fee in DCR/kB to be considered a non-zero fee",
+        None,
+    ),
+    (
+        "limitfreerelay",
+        "DEPRECATED: This behavior is no longer available and this option will be removed in a future version of the software",
+        None,
+    ),
+    (
+        "norelaypriority",
+        "DEPRECATED: This behavior is no longer available and this option will be removed in a future version of the software",
+        None,
+    ),
+    (
+        "maxorphantx",
+        "Max number of orphan transactions to keep in memory",
+        None,
+    ),
+    (
+        "blocksonly",
+        "Do not accept transactions from remote peers",
+        None,
+    ),
+    (
+        "acceptnonstd",
+        "Accept and relay non-standard transactions to the network regardless of the default settings for the active network",
+        None,
+    ),
+    (
+        "rejectnonstd",
+        "Reject non-standard transactions regardless of the default settings for the active network",
+        None,
+    ),
+    (
+        "allowoldvotes",
+        "Enable the addition of very old votes to the mempool",
+        None,
+    ),
+    ("generate", "Generate (mine) coins using the CPU", None),
+    (
+        "miningaddr",
+        "Add the specified payment address to the list of addresses to use for generated blocks.  At least one address is required if the generate option is set",
+        None,
+    ),
+    (
+        "blockminsize",
+        "DEPRECATED: This behavior is no longer available and this option will be removed in a future version of the software",
+        None,
+    ),
+    (
+        "blockmaxsize",
+        "Maximum block size in bytes to be used when creating a block",
+        None,
+    ),
+    (
+        "blockprioritysize",
+        "DEPRECATED: This behavior is no longer available and this option will be removed in a future version of the software",
+        None,
+    ),
+    (
+        "miningtimeoffset",
+        "Offset the mining timestamp of a block by this many seconds (positive values are in the past)",
+        None,
+    ),
+    (
+        "nonaggressive",
+        "Disable mining off of the parent block of the blockchain if there aren't enough voters",
+        None,
+    ),
+    (
+        "nominingstatesync",
+        "Disable synchronizing the mining state with other nodes",
+        None,
+    ),
+    (
+        "allowunsyncedmining",
+        "Allow block templates to be generated even when the chain is not considered synced on networks other than the main network.  This is automatically enabled when the simnet option is set.  Don't do this unless you know what you're doing",
+        None,
+    ),
+    (
+        "txindex",
+        "Maintain a full hash-based transaction index which makes all transactions available via the getrawtransaction RPC",
+        None,
+    ),
+    (
+        "droptxindex",
+        "Deletes the hash-based transaction index from the database on start up and then exits",
+        None,
+    ),
+    (
+        "noexistsaddrindex",
+        "Disable the exists address index, which tracks whether or not an address has even been used",
+        None,
+    ),
+    (
+        "dropexistsaddrindex",
+        "Deletes the exists address index from the database on start up and then exits",
+        None,
+    ),
+    (
+        "piperx",
+        "File descriptor of read end pipe to enable parent -> child process communication",
+        None,
+    ),
+    (
+        "pipetx",
+        "File descriptor of write end pipe to enable parent <- child process communication",
+        None,
+    ),
+    (
+        "lifetimeevents",
+        "Send lifetime notifications over the TX pipe",
+        None,
+    ),
+    (
+        "boundaddrevents",
+        "Send notifications with the locally bound addresses of the P2P and RPC subsystems over the TX pipe",
+        None,
+    ),
+];
+
+/// Render dcrd's `-h` help text (go-flags v1.6.1's `writeHelp` over
+/// the option registry, byte-for-byte): the usage line over the app
+/// name, the Application Options section with the option column
+/// padded two spaces past the longest entry, descriptions (with their
+/// `[$ENV]` annotations) wrapped at eighty columns onto
+/// continuation lines aligned to the description column, and the Help
+/// Options tail.  dcrd's dedicated help pre-parse never adds the
+/// Windows service group, so neither does this.
+pub fn render_help(app_name: &str) -> String {
+    // The alignment column counts "  " + the short slot + "--long"
+    // WITHOUT the value marker: go-flags appends the "=" after
+    // computing the alignment, so the marker eats into the padding
+    // (down to a single space) rather than widening the column.
+    let base = |spec: &OptSpec| -> String {
+        let short = match spec.short {
+            Some(c) => format!("-{c}, "),
+            None => "    ".to_string(),
+        };
+        format!("  {short}--{}", spec.long)
+    };
+    let prefix = |spec: &OptSpec| -> String {
+        let value = if matches!(spec.kind, OptKind::Bool) {
+            ""
+        } else {
+            "="
+        };
+        format!("{}{value}", base(spec))
+    };
+    let help_prefix = "  -h, --help".to_string();
+    let column = OPTIONS
+        .iter()
+        .map(|o| base(o).chars().count())
+        .chain(core::iter::once(help_prefix.chars().count()))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(2);
+
+    let mut out = String::new();
+    out.push_str("Usage:\n");
+    out.push_str(&format!("  {app_name} [OPTIONS]\n"));
+    out.push_str("\nApplication Options:\n");
+    for spec in OPTIONS.iter() {
+        let (_, desc, env) = HELP_DESCRIPTIONS
+            .iter()
+            .find(|(long, _, _)| *long == spec.long)
+            .copied()
+            .unwrap_or((spec.long, "", None));
+        let mut text = desc.to_string();
+        if let Some(env) = env {
+            text.push_str(&format!(" [${env}]"));
+        }
+        push_entry(&mut out, &prefix(spec), &text, column);
+    }
+    out.push_str("\nHelp Options:\n");
+    push_entry(&mut out, &help_prefix, "Show this help message", column);
+    // dcrd prints the help error through Println, appending a final
+    // blank line.
+    out.push('\n');
+    out
+}
+
+/// One help entry: the option column padded to the description start
+/// (a value marker may squeeze the padding down to one space), then
+/// the description through go-flags' `wrapText` — while the remaining
+/// text is LONGER than the width, split at the last space within the
+/// first width bytes (hyphenating when there is none), keeping an
+/// exactly-width remainder whole — with continuation lines aligned
+/// under the description column.  Descriptions are ASCII, matching
+/// go-flags' byte indexing.
+fn push_entry(out: &mut String, prefix: &str, description: &str, column: usize) {
+    let width = 80usize.saturating_sub(column);
+    out.push_str(prefix);
+    let pad = column.saturating_sub(prefix.chars().count()).max(1);
+    for _ in 0..pad {
+        out.push(' ');
+    }
+    let indent = " ".repeat(column);
+    let mut line = description.trim();
+    let mut first = true;
+    while line.len() > width {
+        let (segment, rest) = match line[..width].rfind(' ') {
+            Some(pos) => (line[..pos].trim_end().to_string(), line[pos..].trim_start()),
+            None => {
+                let cut = width.saturating_sub(1);
+                (format!("{}-", &line[..cut]), &line[cut..])
+            }
+        };
+        if !first {
+            out.push_str(&indent);
+        }
+        out.push_str(&segment);
+        out.push('\n');
+        first = false;
+        line = rest;
+    }
+    if !line.is_empty() {
+        if !first {
+            out.push_str(&indent);
+        }
+        out.push_str(line);
+    }
+    out.push('\n');
+}
+
 /// Find an option by its long name.
 pub fn find_long(name: &str) -> Option<&'static OptSpec> {
     find_long_in(&OPTIONS, name)

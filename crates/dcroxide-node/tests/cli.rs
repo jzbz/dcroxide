@@ -52,10 +52,20 @@ fn version_exits_zero_with_version() {
 }
 
 #[test]
-fn help_exits_zero() {
+fn help_exits_zero_with_the_full_help() {
     let (stdout, _, code) = run(&["-h"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("Usage: dcroxide"), "stdout: {stdout}");
+    // The full go-flags help, pinned byte-exact by the flags vectors;
+    // here just the shape end to end through the binary.
+    assert!(
+        stdout.starts_with("Usage:\n  dcroxide [OPTIONS]"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("-V, --version               Display version information and exit"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("Help Options:"), "stdout: {stdout}");
 }
 
 #[test]

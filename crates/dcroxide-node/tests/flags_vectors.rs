@@ -138,3 +138,12 @@ fn the_service_command_option_parses() {
         assert_eq!(cfg.service_command, expected, "args {args:?}");
     }
 }
+
+/// The rendered help matches go-flags' output for dcrd's option
+/// registry byte for byte (`tools/helpgen` regenerates the vector).
+#[test]
+fn help_text_matches_the_go_flags_vector() {
+    let expected = include_str!("data/help_vector.txt");
+    let rendered = dcroxide_node::flags::render_help("dcroxide");
+    assert_eq!(rendered, expected, "help text must match go-flags");
+}

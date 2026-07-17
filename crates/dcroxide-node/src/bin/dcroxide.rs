@@ -138,9 +138,9 @@ fn real_main() -> ExitCode {
         }
         Err(msg) => match msg.as_str() {
             ERR_HELP_REQUESTED => {
-                // The full go-flags help text is not yet generated.
-                println!("Usage: {APP_NAME} [OPTIONS]");
-                println!("(the full option help text is not yet generated)");
+                // dcrd's help pre-parse prints the go-flags help to
+                // stdout and exits zero.
+                print!("{}", dcroxide_node::flags::render_help(APP_NAME));
                 ExitCode::SUCCESS
             }
             ERR_VERSION_REQUESTED => {
