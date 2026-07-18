@@ -39,7 +39,7 @@ mod tests {
             // column, so the char count is the column count.
             assert!(line.chars().count() <= 80, "line too wide: {line}");
         }
-        assert!(banner.contains("2.1.5+release.local"));
+        assert!(banner.contains("2.2.0-pre"));
         assert_eq!(banner.lines().count(), 7);
     }
 }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: ISC
-//! The dcrd configuration pipeline (`config.go` at release-v2.1.5):
+//! The dcrd configuration pipeline (`config.go` at master
+//! `452c1a6c`, the dcrd 2.2 campaign parity target):
 //! defaults, config file and command line precedence, and the full
 //! validation and derivation gauntlet with dcrd's exact error
 //! strings.  The command line front-end replicating go-flags syntax
@@ -163,46 +164,48 @@ pub enum OnionSelection {
     Disabled,
 }
 
-/// An IP network entry from the whitelist (the used subset of Go's
-/// `net.IPNet`); the address bytes are 4 for IPv4 and 16 for IPv6.
+/// An IP network prefix from the whitelist (the used subset of Go's
+/// `net/netip.Prefix`); the address bytes are 4 for IPv4 and 16 for
+/// IPv6, with IPv4-mapped IPv6 addresses kept in their 16-byte form.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IpNet {
+pub struct IpPrefix {
     /// The network address bytes, already masked.
     pub ip: Vec<u8>,
     /// The prefix length.
     pub ones: u32,
 }
 
-impl fmt::Display for IpNet {
-    /// Format like Go's `net.IPNet.String` for canonical masks.
+impl fmt::Display for IpPrefix {
+    /// Format like Go's `netip.Prefix.String`, which prints
+    /// IPv4-mapped IPv6 addresses in their `::ffff:a.b.c.d` form
+    /// rather than unwrapping them.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", go_ip_string(&self.ip), self.ones)
-    }
-}
-
-impl IpNet {
-    /// Whether the network includes the IP (Go `net.IPNet.Contains`).
-    /// The candidate must already be in Go's `To4`-normalized form (4
-    /// bytes for IPv4 and IPv4-mapped addresses, 16 otherwise), as
-    /// [`parse_ip_go`] produces.
-    pub fn contains(&self, ip: &[u8]) -> bool {
-        // Go's networkNumberAndMask: a 16-byte network address that
-        // is IPv4-mapped is compared in its 4-byte form against the
-        // last 4 mask bytes.
-        let (nn, mask_bit_offset): (&[u8], u32) = if self.ip.len() == 16
+        if self.ip.len() == 16
             && self.ip[..10] == [0u8; 10]
             && self.ip[10] == 0xff
             && self.ip[11] == 0xff
         {
-            (&self.ip[12..], 96)
-        } else {
-            (&self.ip[..], 0)
-        };
-        if ip.len() != nn.len() {
+            return write!(
+                f,
+                "::ffff:{}.{}.{}.{}/{}",
+                self.ip[12], self.ip[13], self.ip[14], self.ip[15], self.ones
+            );
+        }
+        write!(f, "{}/{}", go_ip_string(&self.ip), self.ones)
+    }
+}
+
+impl IpPrefix {
+    /// Whether the prefix includes the IP (Go `netip.Prefix.Contains`):
+    /// the candidate must be the same address family — an IPv4-mapped
+    /// IPv6 prefix never matches a 4-byte candidate and vice versa —
+    /// and match the network bits.
+    pub fn contains(&self, ip: &[u8]) -> bool {
+        if ip.len() != self.ip.len() {
             return false;
         }
-        for (i, (&n, &c)) in nn.iter().zip(ip.iter()).enumerate() {
-            let bit = mask_bit_offset + (i as u32) * 8;
+        for (i, (&n, &c)) in self.ip.iter().zip(ip.iter()).enumerate() {
+            let bit = (i as u32) * 8;
             let m: u8 = if self.ones >= bit + 8 {
                 0xff
             } else if self.ones <= bit {
@@ -215,6 +218,23 @@ impl IpNet {
             }
         }
         true
+    }
+
+    /// The prefix with the host bits of the address zeroed (Go
+    /// `netip.Prefix.Masked`).
+    fn masked(mut self) -> Self {
+        for (i, byte) in self.ip.iter_mut().enumerate() {
+            let bit = (i as u32) * 8;
+            let mask_byte: u8 = if self.ones >= bit + 8 {
+                0xff
+            } else if self.ones <= bit {
+                0
+            } else {
+                0xffu8 << (8 - (self.ones - bit))
+            };
+            *byte &= mask_byte;
+        }
+        self
     }
 }
 
@@ -288,37 +308,52 @@ pub(crate) fn parse_ip_go(host: &str) -> Option<Vec<u8>> {
     }
 }
 
-/// Parse a CIDR like Go's `net.ParseCIDR`, returning the masked
-/// network; the address form (dotted vs colon) selects the mask
-/// width exactly as Go's parser does.
-fn parse_cidr_go(s: &str) -> Option<IpNet> {
-    let (addr, mask) = s.split_once('/')?;
-    let mut ip: Vec<u8> = if addr.contains(':') {
-        addr.parse::<std::net::Ipv6Addr>().ok()?.octets().to_vec()
-    } else {
-        addr.parse::<std::net::Ipv4Addr>().ok()?.octets().to_vec()
-    };
-    let bits = (ip.len() * 8) as u32;
-    if mask.is_empty() || mask.len() > 3 || !mask.bytes().all(|b| b.is_ascii_digit()) {
+/// Parse an address like Go's `netip.ParseAddr`, returning the raw
+/// address bytes without `To4` normalization: 4 bytes for dotted
+/// IPv4 and 16 for IPv6, with IPv4-mapped forms kept as 16 bytes.
+/// An IPv6 zone follows the first `%`, must be non-empty, and is
+/// dropped the way `netip.PrefixFrom` strips it.
+fn parse_addr_netip(s: &str) -> Option<Vec<u8>> {
+    if let Some((addr, zone)) = s.split_once('%') {
+        // Zones are only valid on IPv6 addresses.
+        if zone.is_empty() {
+            return None;
+        }
+        let v6 = addr.parse::<std::net::Ipv6Addr>().ok()?;
+        return Some(v6.octets().to_vec());
+    }
+    match s.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => Some(v4.octets().to_vec()),
+        Ok(std::net::IpAddr::V6(v6)) => Some(v6.octets().to_vec()),
+        Err(_) => None,
+    }
+}
+
+/// Parse a CIDR prefix like Go's `netip.ParsePrefix`: the address
+/// portion runs to the last `/`, may not carry an IPv6 zone, and the
+/// prefix length may not be empty, signed, longer than the address
+/// width, or written with a leading zero.  The host bits are kept;
+/// the caller masks.
+fn parse_prefix_netip(s: &str) -> Option<IpPrefix> {
+    let (addr, bits_str) = s.rsplit_once('/')?;
+    // ParseAddr accepts zones, which ParsePrefix then rejects; the
+    // zone split below only strips it, so refuse it here directly.
+    if addr.contains('%') {
         return None;
     }
-    let ones: u32 = mask.parse().ok()?;
-    if ones > bits {
+    let ip = parse_addr_netip(addr)?;
+    let max_bits = (ip.len() * 8) as u32;
+    if bits_str.is_empty() || !bits_str.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    // Mask the address to the network number.
-    for (i, byte) in ip.iter_mut().enumerate() {
-        let bit = (i as u32) * 8;
-        let mask_byte: u8 = if ones >= bit + 8 {
-            0xff
-        } else if ones <= bit {
-            0
-        } else {
-            0xffu8 << (8 - (ones - bit))
-        };
-        *byte &= mask_byte;
+    if bits_str.len() > 1 && !bits_str.starts_with(|c: char| ('1'..='9').contains(&c)) {
+        return None;
     }
-    Some(IpNet { ip, ones })
+    let ones: u32 = bits_str.parse().ok()?;
+    if ones > max_bits {
+        return None;
+    }
+    Some(IpPrefix { ip, ones })
 }
 
 /// The configuration options for dcrd (dcrd `config`), plus the
@@ -450,7 +485,8 @@ pub struct Config {
     pub external_ips: Vec<String>,
     /// Disable automatic network address discovery.
     pub no_discover_ip: bool,
-    /// Use UPnP to map the listening port.
+    /// The removed UPnP option, still accepted (dcrd marks it
+    /// REMOVED but keeps the flag until a future version).
     pub upnp: bool,
 
     // Banning options.
@@ -536,7 +572,7 @@ pub struct Config {
     /// The minimum relay fee in atoms.
     pub min_relay_tx_fee_atoms: i64,
     /// The parsed whitelist networks.
-    pub whitelists: Vec<IpNet>,
+    pub whitelists: Vec<IpPrefix>,
     /// The IPv4 network reachability description.
     pub ipv4_net_info: RpcNetworkInfo,
     /// The IPv6 network reachability description.
@@ -1694,19 +1730,20 @@ fn load_config_impl(
         cfg.whitelists = Vec::with_capacity(cfg.whitelists_raw.len());
         let whitelists_raw = cfg.whitelists_raw.clone();
         for addr in &whitelists_raw {
-            let ipnet = match parse_cidr_go(addr) {
-                Some(ipnet) => ipnet,
+            let prefix = match parse_prefix_netip(addr) {
+                Some(prefix) => prefix,
                 None => {
-                    let Some(ip) = parse_ip_go(addr) else {
+                    let Some(ip) = parse_addr_netip(addr) else {
                         return Err(format!(
-                            "{func_name}: the whitelist value of '{addr}' is invalid"
+                            "{func_name}: invalid whitelist value {}",
+                            go_quote(addr)
                         ));
                     };
                     let ones = (ip.len() * 8) as u32;
-                    IpNet { ip, ones }
+                    IpPrefix { ip, ones }
                 }
             };
-            cfg.whitelists.push(ipnet);
+            cfg.whitelists.push(prefix.masked());
         }
     }
 
@@ -2039,4 +2076,93 @@ fn load_config_impl(
     }
 
     Ok((cfg, remaining_args))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IpPrefix, parse_addr_netip, parse_prefix_netip};
+
+    /// The whitelist parse outcomes of dcrd master's `loadConfig`
+    /// netip pipeline (`ParsePrefix` → `ParseAddr`/`PrefixFrom` →
+    /// `Masked`), dumped from a Go probe replicating the block at
+    /// `452c1a6c` verbatim.
+    #[test]
+    fn whitelist_netip_parse_matches_go() {
+        let parse = |addr: &str| -> Option<IpPrefix> {
+            let prefix = match parse_prefix_netip(addr) {
+                Some(prefix) => prefix,
+                None => {
+                    let ip = parse_addr_netip(addr)?;
+                    let ones = (ip.len() * 8) as u32;
+                    IpPrefix { ip, ones }
+                }
+            };
+            Some(prefix.masked())
+        };
+        let ok_cases = [
+            ("192.168.1.5/24", "192.168.1.0/24"),
+            ("10.1.2.3", "10.1.2.3/32"),
+            ("2001:db8::/32", "2001:db8::/32"),
+            ("::1", "::1/128"),
+            ("10.7.7.7", "10.7.7.7/32"),
+            ("1.2.3.4/2", "0.0.0.0/2"),
+            ("::ffff:1.2.3.4", "::ffff:1.2.3.4/128"),
+            ("::ffff:1.2.3.0/120", "::ffff:1.2.3.0/120"),
+            // The zone is accepted on a bare address and stripped the
+            // way `netip.PrefixFrom` does; in the prefix form the
+            // zone swallows the slash, so it parses as a bare
+            // address too.
+            ("fe80::1%eth0", "fe80::1/128"),
+            ("fe80::1%eth0/64", "fe80::1/128"),
+            ("0.0.0.0/0", "0.0.0.0/0"),
+            ("::/0", "::/0"),
+            ("10.1.2.3/8", "10.0.0.0/8"),
+            ("0:0:0:0:0:ffff:102:304/96", "::ffff:0.0.0.0/96"),
+        ];
+        for (input, want) in ok_cases {
+            let got = parse(input).unwrap_or_else(|| panic!("{input} must parse"));
+            assert_eq!(got.to_string(), want, "{input}");
+        }
+        let err_cases = [
+            "bogus",
+            "1.2.3.4/33",
+            "1.2.3.4/032",
+            "1.2.3.04",
+            "260.1.2.3",
+            "",
+            " 1.2.3.4",
+            "1.2.3.4/",
+            "1.2.3.4/+1",
+            "2001:db8::1/129",
+        ];
+        for input in err_cases {
+            assert!(parse(input).is_none(), "{input:?} must be rejected");
+        }
+    }
+
+    /// `netip.Prefix.Contains` family semantics: an IPv4-mapped IPv6
+    /// prefix never matches a 4-byte candidate (dcrd 2.1.5's
+    /// `net.IPNet.Contains` unwrapped it; the netip form does not).
+    #[test]
+    fn whitelist_netip_contains_is_family_strict() {
+        let v4 = IpPrefix {
+            ip: vec![10, 0, 0, 0],
+            ones: 8,
+        };
+        assert!(v4.contains(&[10, 1, 2, 3]));
+        assert!(!v4.contains(&[11, 1, 2, 3]));
+        let mut mapped = vec![0u8; 16];
+        mapped[10] = 0xff;
+        mapped[11] = 0xff;
+        mapped[12] = 10;
+        let mapped_net = IpPrefix {
+            ip: mapped.clone(),
+            ones: 120,
+        };
+        // The 4-byte form of the same address no longer matches.
+        assert!(!mapped_net.contains(&[10, 0, 0, 1]));
+        // The 16-byte mapped form still does.
+        mapped[15] = 1;
+        assert!(mapped_net.contains(&mapped));
+    }
 }

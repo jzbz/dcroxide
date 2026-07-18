@@ -183,6 +183,14 @@ fn run(cfg: Config) -> ExitCode {
         log_info("File logging disabled");
     }
 
+    if cfg.upnp {
+        log_warn(
+            "The --upnp option is no longer supported.  Make sure to manually map the \
+             listening port on your router if you are behind NAT and wish to receive \
+             inbound connections",
+        );
+    }
+
     // The shared interrupt flag standing in for dcrd's daemon context
     // cancellation, armed before the block database work so an
     // interrupt (SIGINT) or termination (SIGTERM) signal aborts the
@@ -1288,6 +1296,11 @@ fn now_unix() -> i64 {
 /// lines call [`dcroxide_node::logging`] with their own tags.
 fn log_info(msg: &str) {
     dcroxide_node::logging::info("DCRD", msg);
+}
+
+/// A package-main warning line (dcrd `dcrdLog.Warnf`).
+fn log_warn(msg: &str) {
+    dcroxide_node::logging::warn("DCRD", msg);
 }
 
 /// A package-main error line (dcrd `dcrdLog.Errorf`).

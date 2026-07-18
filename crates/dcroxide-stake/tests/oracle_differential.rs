@@ -44,12 +44,10 @@ fn analyze_ours(tx: &MsgTx) -> String {
             Err(e) => e.kind.kind_name().to_string(),
         }
     ));
-    // dcrd 2.2 moved the treasurybase null-outpoint check ahead of
-    // the output checks, so the failure kind for multi-defect
-    // transactions no longer matches the v2.1.5 oracle; the check is
-    // excluded from the oracle comparison (the acceptance set is
-    // unchanged and still covered through the type classification)
-    // and the new precedence is pinned natively below.
+    w.push_str(&format!(
+        "checktreasurybase={}\n",
+        ok_or(stake::check_treasury_base(tx))
+    ));
     if stake::is_sstx(tx) {
         let info = stake::tx_sstx_stake_output_info(tx);
         for i in 0..info.is_p2sh.len() {
@@ -80,13 +78,7 @@ fn analyze_ours(tx: &MsgTx) -> String {
 
 fn analyze_theirs(oracle: &mut Oracle, tx: &MsgTx) -> String {
     let result = oracle.call_ok("stake_analyze", &tx.serialize());
-    let dump = String::from_utf8(unhex(&result)).expect("dump is UTF-8");
-    // Strip the treasurybase check row: its failure precedence
-    // changed in dcrd 2.2 (see analyze_ours).
-    dump.lines()
-        .filter(|line| !line.starts_with("checktreasurybase="))
-        .map(|line| format!("{line}\n"))
-        .collect()
+    String::from_utf8(unhex(&result)).expect("dump is UTF-8")
 }
 
 fn random_hash(rng: &mut SplitMix64) -> Hash {

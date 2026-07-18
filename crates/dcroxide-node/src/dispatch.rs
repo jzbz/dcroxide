@@ -66,7 +66,7 @@ pub struct ServerContext {
     pub ban_threshold: u32,
     /// The parsed whitelisted networks (`--whitelist`); peers matching
     /// one are exempt from banning.
-    pub whitelists: Vec<crate::config::IpNet>,
+    pub whitelists: Vec<crate::config::IpPrefix>,
     /// The banned hosts and the Unix nanosecond times the bans lift
     /// (dcrd `peerState.banned`), fed by the misbehavior handlers and
     /// consulted by the pre-handshake inbound admission.
@@ -691,6 +691,17 @@ impl SyncPeers {
                     }) = registry.get(&peer)
                     {
                         let _ = socket.shutdown(Shutdown::Both);
+                    }
+                }
+                Action::MarkKnownInventory { peer, invs } => {
+                    // The registry lock is already held; feed the
+                    // relay state directly (the daemon half of dcrd's
+                    // `peer.AddKnownInventory` in the headers loop).
+                    if let Some(handles) = registry.get(&peer) {
+                        let mut relay = handles.relay.lock().expect("relay state poisoned");
+                        for inv in invs {
+                            relay.known_inventory.put(inv);
+                        }
                     }
                 }
                 Action::ResetHeaderSyncStallTimeout => self.send_stall(StallCommand::Reset),

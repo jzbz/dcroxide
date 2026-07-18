@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! Decred P2P wire protocol types and codecs, mirroring dcrd's `wire`
-//! package (module version v1.7.5, as pinned by dcrd release-v2.1.5).
+//! package at master `452c1a6c` (the dcrd 2.2 campaign parity
+//! target; wire protocol 12).
 //!
 //! Currently implemented: variable-length integers, transactions ([`MsgTx`])
 //! with all three serialization types and their BLAKE-256 hashes, and the

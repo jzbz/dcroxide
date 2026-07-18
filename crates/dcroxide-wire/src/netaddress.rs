@@ -177,6 +177,12 @@ impl NetAddressV2 {
     /// exactly like dcrd, so an erroring encode leaves the same
     /// partial prefix behind.
     pub(crate) fn encode(&self, w: &mut Vec<u8>) -> Result<(), WireError> {
+        // dcrd's `writeElement` for `*uint64Time` rejects timestamps
+        // beyond the maximum Go time can represent before writing
+        // anything, matching the decode-side bound.
+        if self.timestamp > MAX_V2_TIMESTAMP {
+            return Err(WireError::InvalidTimestamp);
+        }
         w.extend_from_slice(&self.timestamp.to_le_bytes());
         w.extend_from_slice(&self.services.0.to_le_bytes());
         w.push(self.addr_type.0);
@@ -194,5 +200,33 @@ impl NetAddressV2 {
         w.extend_from_slice(&self.encoded_addr);
         w.extend_from_slice(&self.port.to_le_bytes());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The write side rejects overflowing timestamps before emitting
+    /// anything, exactly like dcrd's `writeElement` for `*uint64Time`
+    /// (the same bound the read side enforces).
+    #[test]
+    fn v2_encode_rejects_overflowing_timestamp() {
+        let na = NetAddressV2 {
+            timestamp: MAX_V2_TIMESTAMP + 1,
+            services: ServiceFlag(0),
+            addr_type: NetAddressType::IPV4,
+            encoded_addr: vec![1, 2, 3, 4],
+            port: 9108,
+        };
+        let mut w = Vec::new();
+        assert_eq!(na.encode(&mut w), Err(WireError::InvalidTimestamp));
+        assert!(w.is_empty(), "nothing written before the rejection");
+
+        let ok = NetAddressV2 {
+            timestamp: MAX_V2_TIMESTAMP,
+            ..na
+        };
+        assert!(ok.encode(&mut w).is_ok());
     }
 }

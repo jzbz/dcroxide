@@ -99,6 +99,16 @@ pub enum Action {
         /// The unique id of the peer to disconnect.
         peer: i32,
     },
+    /// Mark the inventory as known to the peer in the daemon's relay
+    /// registry (the daemon-side mirror of the manager's own
+    /// known-inventory cache; dcrd's single `peer.AddKnownInventory`
+    /// in the headers processing loop feeds both consumers at once).
+    MarkKnownInventory {
+        /// The unique id of the peer that announced the inventory.
+        peer: i32,
+        /// The inventory vectors now known to the peer.
+        invs: Vec<InvVect>,
+    },
     /// (Re)arm the header sync progress stall timer for
     /// [`HEADER_SYNC_STALL_TIMEOUT_SECS`] (dcrd
     /// `headerSyncState.ResetStallTimeout`).
@@ -506,6 +516,12 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// The peer with the given id, when tracked.
     pub fn peer(&self, id: i32) -> Option<&Peer> {
         self.peers.get(&id)
+    }
+
+    /// The registered peer with the given id, mutably (the
+    /// known-inventory cache updates recency on lookup).
+    pub fn peer_mut(&mut self, id: i32) -> Option<&mut Peer> {
+        self.peers.get_mut(&id)
     }
 
     /// The chain instance (for daemon queries).
@@ -1460,7 +1476,8 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         let (_, prev_best_header_height) = self.cfg.chain.best_header();
 
         // Process all of the received headers.
-        for header in headers {
+        let mut processed_invs: Vec<InvVect> = Vec::with_capacity(headers.len());
+        for (idx, header) in headers.iter().enumerate() {
             if self.cfg.chain.process_block_header(header).is_err() {
                 // Update the sync height when the sync peer fails to
                 // process any headers since that chain is invalid from
@@ -1474,13 +1491,37 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                         .store(new_best_header_height, Ordering::SeqCst);
                 }
 
+                // The successfully processed prefix was already added
+                // to the peer's known inventory before the failure.
+                if !processed_invs.is_empty() {
+                    actions.push(Action::MarkKnownInventory {
+                        peer: peer_id,
+                        invs: processed_invs,
+                    });
+                }
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.connected = false;
                 }
                 actions.push(Action::Disconnect { peer: peer_id });
                 return actions;
             }
+
+            // Add the block to the cache of known inventory for the
+            // peer.  This helps avoid sending blocks to the peer that
+            // it is already known to have.
+            let inv_vect = InvVect {
+                inv_type: InvType::BLOCK,
+                hash: header_hashes[idx],
+            };
+            if let Some(peer) = self.peers.get_mut(&peer_id) {
+                peer.add_known_inventory(inv_vect);
+            }
+            processed_invs.push(inv_vect);
         }
+        actions.push(Action::MarkKnownInventory {
+            peer: peer_id,
+            invs: processed_invs,
+        });
 
         // All of the headers were either accepted or already known
         // valid at this point.

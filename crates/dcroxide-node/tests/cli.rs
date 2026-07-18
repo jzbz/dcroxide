@@ -48,7 +48,7 @@ fn version_exits_zero_with_version() {
     let (stdout, _, code) = run(&["--version"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("dcroxide version"), "stdout: {stdout}");
-    assert!(stdout.contains("2.1.5+release.local"), "stdout: {stdout}");
+    assert!(stdout.contains("2.2.0-pre"), "stdout: {stdout}");
 }
 
 #[test]

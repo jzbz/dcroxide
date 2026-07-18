@@ -2,7 +2,7 @@
 //! Internal test utilities for dcroxide differential tests.
 //!
 //! Provides the harness for `tools/oracle` (the Go shim linking dcrd's own
-//! packages at the release-v2.1.5 module versions) plus a deterministic PRNG
+//! packages at the master `452c1a6c` module versions) plus a deterministic PRNG
 //! and hex helpers, so every crate's differential tests share one
 //! implementation.
 //!

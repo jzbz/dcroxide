@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! Decred chain-engine components ported from dcrd's
-//! `internal/blockchain` at release-v2.1.5.  This crate currently
+//! `internal/blockchain` at master `452c1a6c` (the dcrd 2.2 campaign
+//! parity target).  This crate currently
 //! contains the UTXO serialization layer — variable-length quantities,
 //! the domain-specific script and amount compression, UTXO entries and
 //! their storage format, outpoint keys, and the UTXO set state — and

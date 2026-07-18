@@ -1,4 +1,4 @@
-vver|2.1.5+release.local|2|1|5||release.local
+vver|2.2.0-pre|2|2|0|pre|
 vsem|0.0.4|ok|0|0|4||
 vsem|1.2.3|ok|1|2|3||
 vsem|10.20.30|ok|10|20|30||

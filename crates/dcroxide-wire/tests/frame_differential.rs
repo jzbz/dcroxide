@@ -12,22 +12,22 @@ use dcroxide_chainhash::Hash;
 use dcroxide_testutil::{Oracle, SplitMix64, hex, oracle_or_skip, unhex};
 use dcroxide_wire::{
     BlockHeader, BlockLocator, CurrencyNet, InvType, InvVect, MIX_MSG_SIZE, Message,
-    MixPairReqUTXO, MixVect, MsgAddr, MsgBlock, MsgCFHeaders, MsgCFTypes, MsgCFilter, MsgCFilterV2,
-    MsgCFiltersV2, MsgFeeFilter, MsgGetBlocks, MsgGetCFHeaders, MsgGetCFilter, MsgGetCFilterV2,
-    MsgGetCFsV2, MsgGetData, MsgGetHeaders, MsgGetInitState, MsgHeaders, MsgInitState, MsgInv,
-    MsgMiningState, MsgMixCiphertexts, MsgMixConfirm, MsgMixDCNet, MsgMixFactoredPoly,
-    MsgMixKeyExchange, MsgMixPairReq, MsgMixSecrets, MsgMixSlotReserve, MsgNotFound, MsgPing,
-    MsgPong, MsgReject, MsgTx, MsgVersion, NetAddress, OutPoint, PROTOCOL_VERSION,
-    REMOVE_REJECT_VERSION, ServiceFlag, TxIn, TxOut, TxSerializeType, read_message, write_message,
+    MixPairReqUTXO, MixVect, MsgAddr, MsgAddrV2, MsgBlock, MsgCFHeaders, MsgCFTypes, MsgCFilter,
+    MsgCFilterV2, MsgCFiltersV2, MsgFeeFilter, MsgGetBlocks, MsgGetCFHeaders, MsgGetCFilter,
+    MsgGetCFilterV2, MsgGetCFsV2, MsgGetData, MsgGetHeaders, MsgGetInitState, MsgHeaders,
+    MsgInitState, MsgInv, MsgMiningState, MsgMixCiphertexts, MsgMixConfirm, MsgMixDCNet,
+    MsgMixFactoredPoly, MsgMixKeyExchange, MsgMixPairReq, MsgMixSecrets, MsgMixSlotReserve,
+    MsgNotFound, MsgPing, MsgPong, MsgReject, MsgTx, MsgVersion, NetAddress, NetAddressType,
+    NetAddressV2, OutPoint, PROTOCOL_VERSION, REMOVE_REJECT_VERSION, ServiceFlag, TxIn, TxOut,
+    TxSerializeType, read_message, write_message,
 };
 
-/// The protocol version the differential drives: the oracle is the
-/// dcrd binary pinned at release-v2.1.5, whose maximum is 11, so the
-/// battery frames below the port's addrv2-era PROTOCOL_VERSION (the
-/// legacy `addr` in the battery no longer encodes at 12, exactly like
-/// dcrd master).  The 2.2 oracle re-pin lifts this back to
-/// PROTOCOL_VERSION.
-const ORACLE_PVER: u32 = PROTOCOL_VERSION - 1;
+/// The protocol version the differential drives: the oracle links
+/// dcrd master's wire module, so the battery frames at the port's
+/// addrv2-era PROTOCOL_VERSION; the legacy `addr` row alone pins one
+/// version below, the last one it still encodes at (exactly like
+/// dcrd master's own wire tests).
+const ORACLE_PVER: u32 = PROTOCOL_VERSION;
 
 fn random_hash(rng: &mut SplitMix64) -> Hash {
     let mut b = [0u8; 32];
@@ -114,6 +114,26 @@ fn random_inv(rng: &mut SplitMix64) -> Vec<InvVect> {
             hash: random_hash(rng),
         })
         .collect()
+}
+
+/// A random typed v2 address with the length its type fixes.
+fn random_netaddress_v2(rng: &mut SplitMix64) -> NetAddressV2 {
+    let (addr_type, len) = match rng.below(3) {
+        0 => (NetAddressType::IPV4, 4),
+        1 => (NetAddressType::IPV6, 16),
+        _ => (NetAddressType::TOR_V3, 32),
+    };
+    // The encoded length is fixed by the type (`bytes` draws a random
+    // length, so fill an exact-size buffer instead).
+    let mut encoded_addr = vec![0u8; len];
+    rng.fill(&mut encoded_addr);
+    NetAddressV2 {
+        timestamp: rng.next_u64() >> 16,
+        services: ServiceFlag(rng.next_u64()),
+        addr_type,
+        encoded_addr,
+        port: rng.next_u64() as u16,
+    }
 }
 
 fn random_locator(rng: &mut SplitMix64) -> BlockLocator {
@@ -335,6 +355,16 @@ fn structured_messages(rng: &mut SplitMix64) -> Vec<(Message, u32)> {
             Message::Addr(MsgAddr {
                 addr_list: (0..rng.below(4)).map(|_| random_netaddress(rng)).collect(),
             }),
+            // Legacy addr no longer encodes at the addrv2 version.
+            PROTOCOL_VERSION - 1,
+        ),
+        (
+            Message::AddrV2(MsgAddrV2 {
+                // At least one: an empty addrv2 refuses to encode.
+                addr_list: (0..1 + rng.below(3))
+                    .map(|_| random_netaddress_v2(rng))
+                    .collect(),
+            }),
             pver,
         ),
         (Message::GetBlocks(MsgGetBlocks(random_locator(rng))), pver),
@@ -512,7 +542,8 @@ fn frames_round_trip_against_dcrd_oracle() {
         ][rng.below(4) as usize];
 
         for (msg, pver) in structured_messages(&mut rng) {
-            let frame = write_message(&msg, pver, net).expect("structured messages encode cleanly");
+            let frame = write_message(&msg, pver, net)
+                .unwrap_or_else(|e| panic!("{} at pver {pver} fails encode: {e:?}", msg.command()));
 
             // Our decoder round-trips.
             let (decoded, consumed) = read_message(&frame, pver, net).expect("own frame decodes");

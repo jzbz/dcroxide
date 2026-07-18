@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: ISC
 //! The application version machinery (dcrd `internal/version`):
 //! semantic version parsing with dcrd's exact error texts, the
-//! normalization helper, and the pinned release version.  dcrd's
-//! `vcsCommitID` fallback reads the Go build info when the build
-//! metadata is empty; the release version carries explicit metadata,
-//! so that path never runs at the parity tag and is not ported.
+//! normalization helper, and the pinned release version.  With the
+//! empty build metadata of `2.2.0-pre`, dcrd's `vcsCommitID` init
+//! fallback embeds the Go build info's VCS revision when a binary is
+//! built from a git checkout; the port has no Go build info and
+//! deliberately models the module-build flavor (no commit suffix),
+//! which is also what the test oracle links.
 
 use std::sync::OnceLock;
 
@@ -15,8 +17,8 @@ use crate::gostd::go_quote;
 const SEMANTIC_ALPHABET: &str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-.";
 
 /// The application version per the semantic versioning 2.0.0 spec
-/// (dcrd `Version` at release-v2.1.5).
-pub const VERSION: &str = "2.1.5+release.local";
+/// (dcrd `Version` at master `452c1a6c`, the campaign parity target).
+pub const VERSION: &str = "2.2.0-pre";
 
 /// The parsed semantic version components.
 #[derive(Debug, Clone, PartialEq, Eq)]

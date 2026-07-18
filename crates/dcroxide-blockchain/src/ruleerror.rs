@@ -424,8 +424,8 @@ mod tests {
         rule_error(RuleErrorKind::UnexpectedDifficulty, description)
     }
 
-    // Ground-truth strings below are captured from dcrd
-    // release-v2.1.5's `blockchain.MultiError.Error`.
+    // Ground-truth strings below are captured from dcrd's
+    // `blockchain.MultiError.Error` (unchanged at master `452c1a6c`).
 
     #[test]
     fn single_error_is_unadorned() {

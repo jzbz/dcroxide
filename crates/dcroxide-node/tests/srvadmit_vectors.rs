@@ -14,7 +14,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use dcroxide_addrmgr::AddrManager;
-use dcroxide_node::config::IpNet;
+use dcroxide_node::config::IpPrefix;
 use dcroxide_node::server::{
     AddPeerFacts, AddPeerOutcome, DonePeerFacts, NaSubmission, PeerState, PeerStateEntry,
     disconnect_peer, handle_add_peer, is_whitelisted, wire_to_addrmgr_net_address,
@@ -65,7 +65,6 @@ fn base_facts(id: i32, remote: &str) -> AddPeerFacts {
         no_discover_ip: true,
         has_external_ips: false,
         listen_disabled: true,
-        upnp: false,
         sim_or_reg_net: false,
         services: ServiceFlag::NODE_NETWORK,
         listeners: Vec::new(),
@@ -332,11 +331,11 @@ fn server_peer_admission_matches_dcrd() {
 
     // --- isWhitelisted ---------------------------------------------------------------
     let whitelists = vec![
-        IpNet {
+        IpPrefix {
             ip: vec![10, 0, 0, 0],
             ones: 8,
         },
-        IpNet {
+        IpPrefix {
             ip: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
             ones: 128,
         },

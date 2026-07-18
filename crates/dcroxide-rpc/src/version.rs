@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! The application version constants and helpers (dcrd
-//! `internal/version` at release-v2.1.5, where the release branch
-//! pins `Version = "2.1.5+release.local"`).  Only the pieces the
+//! `internal/version` at master `452c1a6c`, where the development
+//! branch pins `Version = "2.2.0-pre"`).  Only the pieces the
 //! handlers read at runtime are ported; the semver parsing that
 //! dcrd's package `init` performs on the constant is frozen into the
 //! individual components here.
@@ -11,24 +11,24 @@
 const SEMANTIC_ALPHABET: &str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-.";
 
 /// The full semantic version string (dcrd `version.String()`).
-pub const VERSION: &str = "2.1.5+release.local";
+pub const VERSION: &str = "2.2.0-pre";
 
 /// The major semantic version component (dcrd `version.Major`).
 pub const MAJOR: u32 = 2;
 
 /// The minor semantic version component (dcrd `version.Minor`).
-pub const MINOR: u32 = 1;
+pub const MINOR: u32 = 2;
 
 /// The patch semantic version component (dcrd `version.Patch`).
-pub const PATCH: u32 = 5;
+pub const PATCH: u32 = 0;
 
 /// The pre-release portion of the version (dcrd
 /// `version.PreRelease`).
-pub const PRE_RELEASE: &str = "";
+pub const PRE_RELEASE: &str = "pre";
 
 /// The build metadata portion of the version (dcrd
 /// `version.BuildMetadata`).
-pub const BUILD_METADATA: &str = "release.local";
+pub const BUILD_METADATA: &str = "";
 
 /// Strip all characters that are not valid in semantic versioning
 /// pre-release and build metadata strings (dcrd

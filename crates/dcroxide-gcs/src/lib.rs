@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
-//! Golomb-coded set (GCS) filters, ported from dcrd's `gcs/v4 v4.1.1`
-//! (the version pinned by dcrd release-v2.1.5): the version 1 and
+//! Golomb-coded set (GCS) filters, ported from dcrd's `gcs/v4` at
+//! master `452c1a6c` (the dcrd 2.2 campaign parity target): the version 1 and
 //! version 2 filter formats, matching, serialization, and the DCP0005
 //! version 2 block committed filters in [`blockcf2`].
 //!

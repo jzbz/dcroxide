@@ -46,7 +46,7 @@ pub mod wsframe;
 
 pub use config::{
     AUTH_TYPE_BASIC, AUTH_TYPE_CLIENT_CERT, Assignment, Config, ConfigEnv, DialSelection,
-    ERR_HELP_REQUESTED, ERR_SHOW_SUBSYSTEMS, ERR_VERSION_REQUESTED, IfaceAddrs, IpNet,
+    ERR_HELP_REQUESTED, ERR_SHOW_SUBSYSTEMS, ERR_VERSION_REQUESTED, IfaceAddrs, IpPrefix,
     LookupSelection, NORMALIZE_INTERFACE_ADDRS, NORMALIZE_INTERFACE_FIRST_ADDR, OnionSelection,
     TlsCurve, app_data_dir, clean_and_expand_path, create_default_config_file, load_config,
     load_config_from_argv, normalize_addresses, parse_listeners, parse_network_interfaces,

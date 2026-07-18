@@ -3,8 +3,8 @@
 A from-scratch Rust implementation of the Decred full-node daemon, built as a
 drop-in replacement for [dcrd](https://github.com/decred/dcrd).
 
-Parity target: **dcrd `release-v2.1.5`** — wire protocol 12, JSON-RPC API
-8.3.0. dcrd's behavior at that tag is the specification; see
+Parity target: **dcrd master `452c1a6c`** (version 2.2.0-pre) — wire protocol
+12, JSON-RPC API 8.3.0. dcrd's behavior at that commit is the specification; see
 [QUIRKS.md](QUIRKS.md) for deliberate bug-for-bug reproductions and
 [PARITY.md](PARITY.md) for per-package status. The full plan lives in
 [dcroxide-project-brief.md](dcroxide-project-brief.md).
@@ -240,7 +240,7 @@ implemented:
   install/remove/start/stop commands (the option registered only on
   Windows, exactly like dcrd)
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
-  release-v2.1.5 module versions) as a test oracle over line-delimited JSON
+  master `452c1a6c` module versions) as a test oracle over line-delimited JSON
 - `tools/helpgen` — the go-flags help-vector generator over dcrd's
   verbatim config struct
 

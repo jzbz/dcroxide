@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! The transaction memory pool, ported from dcrd's `internal/mempool`
-//! package at release-v2.1.5: the mempool error kinds and the relay
+//! package at master `452c1a6c` (the dcrd 2.2 campaign parity
+//! target): the mempool error kinds and the relay
 //! policy layer (`policy.go`) — minimum relay fees, dust outputs, and
 //! the transaction, output script, and input standardness checks.
 //! The pool itself (`TxPool`) arrives with the following pieces.

@@ -7,7 +7,7 @@
 // generation and differential tests.
 //
 // Every dcrd module dependency in go.mod is pinned to the exact version
-// required by dcrd release-v2.1.5 — the project's parity target. Do not bump
+// required by dcrd master 452c1a6c — the project's parity target. Do not bump
 // them independently of a parity-target change.
 //
 // Protocol: one JSON object per line in, one per line out. Every command

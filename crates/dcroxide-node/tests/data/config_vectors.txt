@@ -170,7 +170,7 @@ cok|34|homedir=@HOME@configfile=@HOME@/dcrd.confdatadir=@HOME@/data/mainnetlo
 cscen|35|whitelist invalid
 carg|35|--appdata=@HOME@
 carg|35|--whitelist=bogus
-cerr|35|loadConfig: the whitelist value of 'bogus' is invalid
+cerr|35|loadConfig: invalid whitelist value "bogus"
 cscen|36|addpeer connect conflict
 carg|36|--appdata=@HOME@
 carg|36|--addpeer=10.1.1.1

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! Block template mining support, ported from dcrd's
-//! `internal/mining` package at release-v2.1.5: the transaction
+//! `internal/mining` package at master `452c1a6c` (the dcrd 2.2
+//! campaign parity target): the transaction
 //! descriptor types, the dependency graph and mining view with
 //! ancestor statistics tracking, the transaction priority queue with
 //! Go's exact heap semantics, and the priority calculation.  The

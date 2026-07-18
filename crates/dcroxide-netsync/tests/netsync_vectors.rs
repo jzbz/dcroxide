@@ -384,9 +384,12 @@ fn netsync_scenario_matches_dcrd() {
                         .or_default()
                         .push(format!("{command}|{hex}"));
                 }
-                // Disconnects are verified via the connected probes and
-                // the stall timer has no dcrd-observable counterpart.
+                // Disconnects are verified via the connected probes,
+                // the stall timer has no dcrd-observable counterpart,
+                // and the known-inventory marks are pinned natively
+                // (headers_mark_known_inventory_for_the_peer).
                 Action::Disconnect { .. }
+                | Action::MarkKnownInventory { .. }
                 | Action::ResetHeaderSyncStallTimeout
                 | Action::StopHeaderSyncStallTimeout => {}
             }
@@ -772,4 +775,189 @@ fn stall_timeout_disconnects_sync_peer() {
     let actions = m.on_header_sync_stall_timeout();
     assert_eq!(actions, vec![Action::Disconnect { peer: 7 }]);
     assert!(!m.peer(7).unwrap().connected());
+}
+
+/// A chain stub that accepts a scripted number of headers and then
+/// rejects, for pinning the known-inventory marks dcrd 2.2's headers
+/// processing loop emits (`peer.AddKnownInventory` per accepted
+/// header, master `452c1a6c` manager.go).
+struct ScriptedHeaderChain {
+    accept: usize,
+    processed: usize,
+}
+
+impl SyncChain for ScriptedHeaderChain {
+    fn best_header(&mut self) -> (Hash, i64) {
+        (Hash::ZERO, 0)
+    }
+    fn header_by_hash(&mut self, _hash: &Hash) -> Option<BlockHeader> {
+        None
+    }
+    fn block_locator_from_hash(&mut self, _hash: &Hash) -> Vec<Hash> {
+        vec![Hash::ZERO]
+    }
+    fn put_next_needed_blocks(&mut self, _max_results: usize) -> Vec<Hash> {
+        Vec::new()
+    }
+    fn best_snapshot(&mut self) -> BestSnapshot {
+        BestSnapshot {
+            hash: Hash::ZERO,
+            height: 0,
+            next_stake_diff: 0,
+        }
+    }
+    fn is_current(&mut self) -> bool {
+        false
+    }
+    fn maybe_update_is_current(&mut self) {}
+    fn chain_work(&mut self, _hash: &Hash) -> Option<dcroxide_uint256::Uint256> {
+        None
+    }
+    fn have_header(&mut self, hash: &Hash) -> bool {
+        *hash == Hash::ZERO
+    }
+    fn have_block(&mut self, _hash: &Hash) -> bool {
+        false
+    }
+    fn process_block_header(&mut self, _header: &BlockHeader) -> Result<(), String> {
+        if self.processed < self.accept {
+            self.processed += 1;
+            Ok(())
+        } else {
+            Err("scripted header rejection".to_string())
+        }
+    }
+    fn process_block(&mut self, _block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
+        Err(ProcessBlockFailure {
+            is_duplicate_block: false,
+            message: "unused".to_string(),
+        })
+    }
+}
+
+/// Headers linked by previous-hash and height starting above the
+/// stub's known zero hash.
+fn linked_headers(count: usize) -> Vec<BlockHeader> {
+    let mut headers = Vec::with_capacity(count);
+    let mut prev = Hash::ZERO;
+    for i in 0..count {
+        let (mut header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
+        header.prev_block = prev;
+        header.height = 1 + i as u32;
+        prev = header.block_hash();
+        headers.push(header);
+    }
+    headers
+}
+
+fn scripted_header_manager(
+    accept: usize,
+) -> SyncManager<ScriptedHeaderChain, ScriptedTxPool, ScriptedMixPool> {
+    let params = regnet_params();
+    let chain = ScriptedHeaderChain {
+        accept,
+        processed: 0,
+    };
+    let mut m = SyncManager::new(Config {
+        chain,
+        tx_mem_pool: ScriptedTxPool::default(),
+        mix_pool: ScriptedMixPool::default(),
+        min_known_chain_work: params.min_known_chain_work,
+        net: params.net,
+        target_time_per_block_secs: params.target_time_per_block_secs,
+        no_mining_state_sync: false,
+        max_outbound_peers: 8,
+        max_orphan_txs: 100,
+        recently_confirmed_txns: std::sync::Arc::new(std::sync::Mutex::new(apbf::new_filter(
+            62500, 0.0000001,
+        ))),
+    });
+    m.on_peer_connected(Peer::new(7, false, ServiceFlag(1), PROTOCOL_VERSION, 50));
+    assert_eq!(m.sync_peer_id(), 7);
+    m
+}
+
+/// Every successfully processed header is marked as known inventory
+/// for the announcing peer, in the manager's own cache and through
+/// the daemon-registry action (dcrd 2.2's `AddKnownInventory` in the
+/// headers loop).
+#[test]
+fn headers_mark_known_inventory_for_the_peer() {
+    let mut m = scripted_header_manager(usize::MAX);
+    let headers = linked_headers(3);
+    let want_invs: Vec<InvVect> = headers
+        .iter()
+        .map(|h| InvVect {
+            inv_type: InvType::BLOCK,
+            hash: h.block_hash(),
+        })
+        .collect();
+
+    let actions = m.on_headers(
+        7,
+        &MsgHeaders {
+            headers: headers.clone(),
+        },
+    );
+    let marks: Vec<&Action> = actions
+        .iter()
+        .filter(|a| matches!(a, Action::MarkKnownInventory { .. }))
+        .collect();
+    assert_eq!(
+        marks,
+        vec![&Action::MarkKnownInventory {
+            peer: 7,
+            invs: want_invs.clone(),
+        }],
+        "all accepted headers are marked at once"
+    );
+    // The manager's own per-peer cache got the same adds.
+    for inv in &want_invs {
+        assert!(m.peer_mut(7).unwrap().is_known_inventory(inv), "{inv:?}");
+    }
+}
+
+/// A header rejection marks only the accepted prefix, before the
+/// disconnect (dcrd adds each header as it is processed and bails on
+/// the failure).
+#[test]
+fn header_rejection_marks_only_the_accepted_prefix() {
+    let mut m = scripted_header_manager(2);
+    let headers = linked_headers(3);
+    let want_invs: Vec<InvVect> = headers[..2]
+        .iter()
+        .map(|h| InvVect {
+            inv_type: InvType::BLOCK,
+            hash: h.block_hash(),
+        })
+        .collect();
+
+    let actions = m.on_headers(
+        7,
+        &MsgHeaders {
+            headers: headers.clone(),
+        },
+    );
+    let mark_pos = actions
+        .iter()
+        .position(|a| matches!(a, Action::MarkKnownInventory { .. }))
+        .expect("prefix mark emitted");
+    assert_eq!(
+        actions[mark_pos],
+        Action::MarkKnownInventory {
+            peer: 7,
+            invs: want_invs,
+        }
+    );
+    let disconnect_pos = actions
+        .iter()
+        .position(|a| matches!(a, Action::Disconnect { peer: 7 }))
+        .expect("rejection disconnects");
+    assert!(mark_pos < disconnect_pos, "marks precede the disconnect");
+    // The rejected header is not marked anywhere.
+    let rejected = InvVect {
+        inv_type: InvType::BLOCK,
+        hash: headers[2].block_hash(),
+    };
+    assert!(!m.peer_mut(7).unwrap().is_known_inventory(&rejected));
 }

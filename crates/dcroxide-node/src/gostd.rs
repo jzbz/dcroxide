@@ -80,10 +80,41 @@ fn fmt_frac(mut v: u64, prec: usize) -> (String, u64) {
     (frac, v)
 }
 
-/// Quote a string like Go's `strconv.Quote` for the plain ASCII
-/// inputs the config errors carry.
+/// Quote a string like Go's `strconv.Quote`: the quote and backslash
+/// escapes, the named control escapes, and `\xHH` for the remaining
+/// ASCII control bytes.  Non-ASCII characters follow Go's handling
+/// for control characters (`\uHHHH`/`\UHHHHHHHH`); Go's full
+/// `unicode.IsPrint` tables additionally escape exotic space and
+/// format characters, which is approximated here with the control
+/// and whitespace classes (format characters like the soft hyphen
+/// stay raw — unreachable through the config and version error paths
+/// this feeds).
 pub(crate) fn go_quote(s: &str) -> String {
-    format!("\"{s}\"")
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{07}' => out.push_str("\\a"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0b}' => out.push_str("\\v"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c if c.is_ascii() || (!c.is_control() && !c.is_whitespace()) => out.push(c),
+            c if (c as u32) < 0x1_0000 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push_str(&format!("\\U{:08x}", c as u32)),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Parse a duration like Go's `time.ParseDuration`, returning
@@ -727,6 +758,29 @@ pub(crate) fn go_unquote(s: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::go_quote;
+
+    /// Go `strconv.Quote` outputs for the escape classes the config
+    /// error paths can carry.
+    #[test]
+    fn go_quote_matches_strconv_quote() {
+        let cases = [
+            ("plain", "\"plain\""),
+            ("a\"b", "\"a\\\"b\""),
+            ("C:\\foo", "\"C:\\\\foo\""),
+            ("tab\there", "\"tab\\there\""),
+            ("\u{01}", "\"\\x01\""),
+            ("\u{7f}", "\"\\x7f\""),
+            ("bell\u{07}", "\"bell\\a\""),
+            ("h\u{e9}llo", "\"h\u{e9}llo\""),
+            ("nb\u{a0}sp", "\"nb\\u00a0sp\""),
+            ("", "\"\""),
+        ];
+        for (input, want) in cases {
+            assert_eq!(go_quote(input), want, "{input:?}");
+        }
+    }
+
     use super::*;
 
     /// `split_host_port` matches Go's `net.SplitHostPort`, reporting a

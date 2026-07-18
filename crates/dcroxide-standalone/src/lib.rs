@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! Standalone Decred consensus functions, ported from dcrd's
-//! `blockchain/standalone/v2` package at `v2.2.2` (the version pinned
-//! by dcrd release-v2.1.5): merkle root calculations (regular, stake,
+//! `blockchain/standalone/v2` package at master `452c1a6c` (the dcrd
+//! 2.2 campaign parity target): merkle root calculations (regular, stake,
 //! and DCP0005 combined), merkle tree
 //! inclusion proofs, proof-of-work checks and compact-bits conversions,
 //! the DCP0011 ASERT difficulty algorithm, the full subsidy schedule

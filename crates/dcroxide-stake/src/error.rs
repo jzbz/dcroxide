@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: ISC
 // GENERATED from dcrd blockchain/stake error.go ErrorKind constants at
-// release-v2.1.5 (stake/v5 v5.0.2); names are the differential parity
+// master 452c1a6c (the dcrd 2.2 campaign parity target); names are the
+// differential parity
 // surface. Regenerate rather than editing by hand.
 //! Stake rule errors (dcrd stake `ErrorKind`/`RuleError`).
 

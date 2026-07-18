@@ -1278,8 +1278,6 @@ pub struct AddPeerFacts {
     pub has_external_ips: bool,
     /// Whether listening is disabled or no listeners exist.
     pub listen_disabled: bool,
-    /// Whether Universal Plug and Play is enabled.
-    pub upnp: bool,
     /// Whether the active network is the simulation or regression
     /// test network.
     pub sim_or_reg_net: bool,
@@ -1371,12 +1369,12 @@ pub fn handle_add_peer(
     // Fetch the suggested public IP from the outbound peer unless a
     // prevailing condition disables automatic network address
     // discovery: a proxy, explicit disablement, explicit external
-    // IPs, disabled listening, UPnP, or the simulation networks.
+    // IPs, disabled listening, or the simulation networks (dcrd 2.2
+    // dropped the removed UPnP option from this gate).
     if facts.has_proxy
         || facts.no_discover_ip
         || facts.has_external_ips
         || facts.listen_disabled
-        || facts.upnp
         || facts.sim_or_reg_net
     {
         return outcome;
@@ -1541,9 +1539,11 @@ pub fn disconnect_peer(
 }
 
 /// Whether the peer address is within a whitelisted network (dcrd
-/// `isWhitelisted`); unsplittable addresses and unparseable hosts
-/// are logged and not whitelisted.
-pub fn is_whitelisted(whitelists: &[crate::config::IpNet], addr: &str) -> bool {
+/// `connmgr.IsWhitelisted`); unsplittable addresses and unparseable
+/// hosts are not whitelisted.  The candidate is parsed through the
+/// `To4`-normalized form the address manager canonicalizes remote
+/// addresses into before dcrd hands them to the connection manager.
+pub fn is_whitelisted(whitelists: &[crate::config::IpPrefix], addr: &str) -> bool {
     if whitelists.is_empty() {
         return false;
     }

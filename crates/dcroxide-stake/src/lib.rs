@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! Decred stake transaction primitives, mirroring dcrd's
-//! `blockchain/stake` package (module v5.0.2, as pinned by dcrd
-//! release-v2.1.5): stake transaction classification and format rule
+//! `blockchain/stake` package at master `452c1a6c` (the dcrd 2.2
+//! campaign parity target): stake transaction classification and format rule
 //! checks (tickets, votes, revocations, and the treasury transactions),
 //! commitment/vote-bits/block-reference extraction, reward calculation,
 //! and the deterministic ticket lottery PRNG.

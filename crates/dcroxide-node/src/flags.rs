@@ -779,7 +779,7 @@ pub const HELP_DESCRIPTIONS: [(&str, &str, Option<&str>); 86] = [
     ),
     (
         "upnp",
-        "Use UPnP to map our listening port outside of NAT",
+        "REMOVED: This feature is no longer available and this flag will be removed in a future version",
         None,
     ),
     ("nobanning", "Disable banning of misbehaving peers", None),
