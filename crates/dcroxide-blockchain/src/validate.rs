@@ -171,8 +171,9 @@ pub fn check_transaction_context(
                 RuleErrorKind::BadStakebaseScrVal,
                 format!(
                     "stakebase transaction signature script was set to disallowed value \
-                     (got {:x?}, want {:x?})",
-                    tx.tx_in[0].signature_script, params.stake_base_sig_script
+                     (got {}, want {})",
+                    hex_string(&tx.tx_in[0].signature_script),
+                    hex_string(&params.stake_base_sig_script)
                 ),
             ));
         }
@@ -1379,8 +1380,9 @@ pub fn check_block_header_context(
                 RuleErrorKind::InvalidFinalState,
                 format!(
                     "block header commitment to final state of the ticket lottery \
-                     {:x?} does not match expected value {parent_final_state:x?}",
-                    header.final_state
+                     {} does not match expected value {}",
+                    hex_string(&header.final_state),
+                    hex_string(&parent_final_state)
                 ),
             ));
         }
