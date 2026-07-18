@@ -22,6 +22,7 @@ members = [
     "crates/dcroxide-netsync",
     "crates/dcroxide-node",
     "crates/dcroxide-peer",
+    "crates/dcroxide-ratelimit",
     "crates/dcroxide-rpc",
     "crates/dcroxide-rpctypes",
     "crates/dcroxide-stake",

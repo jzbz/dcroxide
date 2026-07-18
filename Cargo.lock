@@ -603,6 +603,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dcroxide-ratelimit"
+version = "0.1.0"
+
+[[package]]
 name = "dcroxide-rpc"
 version = "0.1.0"
 dependencies = [
