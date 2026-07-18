@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: ISC
-//! An implementation of dcrd's `connmgr` package: dynamic ban scores,
-//! the connection manager, HTTPS seeding, and Tor DNS resolution.
+//! An implementation of dcrd's `connmgr` package: dynamic ban scores
+//! and the connection manager.  dcrd 2.2 relocated the HTTPS seeding
+//! and Tor DNS resolution into `addrmgr`; they live in
+//! `dcroxide-addrmgr` accordingly.
 //!
 //! dcrd's goroutines, channels, and timers are daemon-phase
 //! concurrency; the ports are synchronous with identical state
@@ -10,19 +12,12 @@
 mod banscore;
 mod connmanager;
 pub mod goexp;
-mod seed;
-mod tor;
 
 pub use banscore::{DynamicBanScore, HALFLIFE, LIFETIME, decay_factor_bits};
 pub use connmanager::{
     Config, Conn, ConnManager, ConnReq, ConnState, DEFAULT_RETRY_DURATION, DEFAULT_TARGET_OUTBOUND,
     Event, MAX_FAILED_ATTEMPTS, MAX_RETRY_DURATION, ReqAddr,
 };
-pub use seed::{
-    DURATION_3_DAYS, DURATION_4_DAYS, HttpsSeederFilters, MAX_RESP_SIZE, SeedEnv, SeederTransport,
-    seed_addrs, seeder_url,
-};
-pub use tor::{TorTransport, tor_lookup_ip};
 
 /// A kind of connection manager error (dcrd `ErrorKind`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -31,31 +26,6 @@ pub enum ErrorKind {
     DialNil,
     /// Dial and DialAddr cannot both be specified.
     BothDialsFilled,
-    /// An invalid address was returned by the Tor DNS resolver.
-    TorInvalidAddressResponse,
-    /// The Tor proxy returned a response in an unexpected format.
-    TorInvalidProxyResponse,
-    /// The authentication method is not recognized.
-    TorUnrecognizedAuthMethod,
-    /// A general tor error.
-    TorGeneralError,
-    /// Tor connections are not allowed.
-    TorNotAllowed,
-    /// The tor network is unreachable.
-    TorNetUnreachable,
-    /// The tor host is unreachable.
-    TorHostUnreachable,
-    /// The tor connection was refused.
-    TorConnectionRefused,
-    /// The tor request TTL expired.
-    TorTTLExpired,
-    /// The tor command is not supported.
-    TorCmdNotSupported,
-    /// The tor address type is not supported.
-    TorAddrNotSupported,
-    /// A transport-level failure outside dcrd's kinds, carrying the
-    /// underlying I/O error text.
-    Transport,
 }
 
 impl ErrorKind {
@@ -65,18 +35,6 @@ impl ErrorKind {
         match self {
             ErrorKind::DialNil => "ErrDialNil",
             ErrorKind::BothDialsFilled => "ErrBothDialsFilled",
-            ErrorKind::TorInvalidAddressResponse => "ErrTorInvalidAddressResponse",
-            ErrorKind::TorInvalidProxyResponse => "ErrTorInvalidProxyResponse",
-            ErrorKind::TorUnrecognizedAuthMethod => "ErrTorUnrecognizedAuthMethod",
-            ErrorKind::TorGeneralError => "ErrTorGeneralError",
-            ErrorKind::TorNotAllowed => "ErrTorNotAllowed",
-            ErrorKind::TorNetUnreachable => "ErrTorNetUnreachable",
-            ErrorKind::TorHostUnreachable => "ErrTorHostUnreachable",
-            ErrorKind::TorConnectionRefused => "ErrTorConnectionRefused",
-            ErrorKind::TorTTLExpired => "ErrTorTTLExpired",
-            ErrorKind::TorCmdNotSupported => "ErrTorCmdNotSupported",
-            ErrorKind::TorAddrNotSupported => "ErrTorAddrNotSupported",
-            ErrorKind::Transport => "Transport",
         }
     }
 }

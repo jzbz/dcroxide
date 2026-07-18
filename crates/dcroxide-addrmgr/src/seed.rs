@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: ISC
-//! HTTPS seeding (dcrd connmgr `seed.go`).
+//! HTTPS seeding (dcrd addrmgr `seed.go`; relocated verbatim from
+//! connmgr in dcrd 2.2, which renames the reflected JSON node type to
+//! `addrmgr.node`).
 
 // Bounded scanning arithmetic mirrors Go.
 #![allow(clippy::arithmetic_side_effects)]
@@ -77,7 +79,7 @@ pub trait SeedEnv {
 /// The JSON object shape returned by the https seeders (dcrd `node`).
 fn node_type() -> GoType {
     GoType::Named(
-        "connmgr".to_string(),
+        "addrmgr".to_string(),
         "node".to_string(),
         Box::new(GoType::Struct(vec![
             StructField::new("Host", GoType::String).with_json_tag("host"),

@@ -7,8 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use dcroxide_addrmgr::{AddrManager, NetAddressType};
-use dcroxide_connmgr::SeederTransport;
+use dcroxide_addrmgr::{AddrManager, NetAddressType, SeederTransport};
 use dcroxide_node::seeding::start_seeding;
 
 /// A transport answering every request with the scripted body.

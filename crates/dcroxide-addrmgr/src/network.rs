@@ -16,6 +16,8 @@ pub enum NetAddressType {
     /// An IPv6 address.
     IPv6 = 2,
     // TorV2 = 3 is no longer supported.
+    /// A Tor v3 onion address (dcrd `TorV3Address`).
+    TorV3 = 4,
 }
 
 /// A function that returns whether a particular network address type
@@ -265,4 +267,91 @@ pub(crate) fn masked_string(ip: &[u8], bits: u32) -> String {
         }
     }
     ip_to_string(&masked)
+}
+
+/// The version byte carried by Tor v3 onion addresses (dcrd
+/// `torV3VersionByte`).
+pub(crate) const TOR_V3_VERSION_BYTE: u8 = 3;
+
+/// The checksum bytes for a 32-byte Tor v3 public key (dcrd
+/// `calcTorV3Checksum`): the first two bytes of
+/// `SHA3-256(".onion checksum" || pubkey || version)`.
+pub(crate) fn calc_tor_v3_checksum(public_key: &[u8; 32]) -> [u8; 2] {
+    use sha3::{Digest, Sha3_256};
+    let mut hasher = Sha3_256::new();
+    hasher.update(b".onion checksum");
+    hasher.update(public_key);
+    hasher.update([TOR_V3_VERSION_BYTE]);
+    let digest = hasher.finalize();
+    [digest[0], digest[1]]
+}
+
+/// Whether the bytes are a valid 35-byte Tor v3 address
+/// (public key, checksum, version), returning the public key when
+/// they are (dcrd `isTorV3`).
+pub(crate) fn is_tor_v3(address_bytes: &[u8]) -> Option<[u8; 32]> {
+    if address_bytes.len() != 35 {
+        return None;
+    }
+    if address_bytes[34] != TOR_V3_VERSION_BYTE {
+        return None;
+    }
+    let mut public_key = [0u8; 32];
+    public_key.copy_from_slice(&address_bytes[..32]);
+    let checksum = calc_tor_v3_checksum(&public_key);
+    if address_bytes[32..34] != checksum {
+        return None;
+    }
+    Some(public_key)
+}
+
+/// Lowercased RFC 4648 standard-alphabet base32 without padding
+/// stripping (Go's `base32.StdEncoding.EncodeToString` then
+/// `strings.ToLower`, as dcrd renders onion addresses).
+pub(crate) fn base32_lower(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut out = String::new();
+    for chunk in data.chunks(5) {
+        let mut buf = [0u8; 5];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        let bits = u64::from(buf[0]) << 32
+            | u64::from(buf[1]) << 24
+            | u64::from(buf[2]) << 16
+            | u64::from(buf[3]) << 8
+            | u64::from(buf[4]);
+        let out_chars = [2, 4, 5, 7, 8][chunk.len() - 1];
+        for i in 0..out_chars {
+            let idx = ((bits >> (35 - 5 * i)) & 0x1f) as usize;
+            out.push(ALPHABET[idx] as char);
+        }
+        // Go's StdEncoding pads to 8 characters per 5-byte group.
+        for _ in out_chars..8 {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Strict uppercase RFC 4648 standard-alphabet base32 decoding of a
+/// padding-free input whose length is a multiple of eight (Go's
+/// `base32.StdEncoding.DecodeString` as `EncodeHost` uses it on the
+/// 56-character onion host portion); `None` on any character outside
+/// the alphabet.
+pub(crate) fn base32_std_decode(input: &[u8]) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    if !input.len().is_multiple_of(8) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len() / 8 * 5);
+    for chunk in input.chunks(8) {
+        let mut bits = 0u64;
+        for &c in chunk {
+            let val = ALPHABET.iter().position(|&a| a == c)?;
+            bits = bits << 5 | val as u64;
+        }
+        for i in 0..5 {
+            out.push((bits >> (32 - 8 * i) & 0xff) as u8);
+        }
+    }
+    Some(out)
 }

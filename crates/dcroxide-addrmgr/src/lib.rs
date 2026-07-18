@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: ISC
 //! Concurrency safe address manager for caching potential peers on
-//! the Decred network, mirroring dcrd's `addrmgr` package at
-//! `release-v2.1.5`: network address types with dcrd's key and group
-//! key formatting, the RFC-range classification and reachability
-//! rules, known-address viability tracking, the new/tried bucket
-//! machinery over BLAKE-256 bucket derivation, local address
-//! bookkeeping, and the `peers.json` serialization.
+//! the Decred network, mirroring dcrd's `addrmgr` package at master
+//! `452c1a6c` (the 2.2 pre-release): network address types with
+//! dcrd's key and group key formatting including Tor v3 onion
+//! addresses, the RFC-range classification and reachability rules,
+//! known-address viability tracking, the new/tried bucket machinery
+//! over BLAKE-256 bucket derivation with per-bucket type statistics
+//! and filtered address selection, local address bookkeeping, the
+//! `peers.json` serialization, and the HTTPS seeder and Tor DNS
+//! resolution dcrd 2.2 relocated into this package.
 //!
 //! dcrd guards the manager with mutexes and persists peers from a
 //! ticker goroutine; this port is synchronous with identical state
@@ -17,6 +20,8 @@ use core::fmt;
 mod manager;
 mod netaddress;
 mod network;
+mod seed;
+mod tordns;
 
 pub use manager::{
     AddrManager, AddrRng, AddressPriority, Clock, KnownAddress, KnownAddressRef, LocalAddr,
@@ -26,6 +31,11 @@ pub use netaddress::{
     NetAddress, encode_host, new_net_address_from_ip_port, new_net_address_from_params,
 };
 pub use network::{NetAddressType, NetAddressTypeFilter, is_routable};
+pub use seed::{
+    DURATION_3_DAYS, DURATION_4_DAYS, HttpsSeederFilters, MAX_RESP_SIZE, SeedEnv, SeederTransport,
+    seed_addrs, seeder_url,
+};
+pub use tordns::{TorTransport, tor_lookup_ip};
 
 /// The kind of an address manager error; each variant's
 /// [`kind_name`](ErrorKind::kind_name) matches dcrd's `ErrorKind`
@@ -39,6 +49,32 @@ pub enum ErrorKind {
     /// A network address' derived type does not match the expected
     /// type.
     MismatchedAddressType,
+    /// An invalid address was returned by the Tor DNS resolver.
+    TorInvalidAddressResponse,
+    /// The Tor proxy returned a response in an unexpected format.
+    TorInvalidProxyResponse,
+    /// The authentication method is not recognized.
+    TorUnrecognizedAuthMethod,
+    /// A general tor error.
+    TorGeneralError,
+    /// Tor connections are not allowed.
+    TorNotAllowed,
+    /// The tor network is unreachable.
+    TorNetUnreachable,
+    /// The tor host is unreachable.
+    TorHostUnreachable,
+    /// The tor connection was refused.
+    TorConnectionRefused,
+    /// The tor request TTL expired.
+    TorTTLExpired,
+    /// The tor command is not supported.
+    TorCmdNotSupported,
+    /// The tor address type is not supported.
+    TorAddrNotSupported,
+    /// A transport-level failure outside dcrd's kinds, carrying the
+    /// underlying I/O error text; this is the port's seam for the
+    /// injectable transports, not a dcrd kind.
+    Transport,
 }
 
 impl ErrorKind {
@@ -48,6 +84,18 @@ impl ErrorKind {
             ErrorKind::AddressNotFound => "ErrAddressNotFound",
             ErrorKind::UnknownAddressType => "ErrUnknownAddressType",
             ErrorKind::MismatchedAddressType => "ErrMismatchedAddressType",
+            ErrorKind::TorInvalidAddressResponse => "ErrTorInvalidAddressResponse",
+            ErrorKind::TorInvalidProxyResponse => "ErrTorInvalidProxyResponse",
+            ErrorKind::TorUnrecognizedAuthMethod => "ErrTorUnrecognizedAuthMethod",
+            ErrorKind::TorGeneralError => "ErrTorGeneralError",
+            ErrorKind::TorNotAllowed => "ErrTorNotAllowed",
+            ErrorKind::TorNetUnreachable => "ErrTorNetUnreachable",
+            ErrorKind::TorHostUnreachable => "ErrTorHostUnreachable",
+            ErrorKind::TorConnectionRefused => "ErrTorConnectionRefused",
+            ErrorKind::TorTTLExpired => "ErrTorTTLExpired",
+            ErrorKind::TorCmdNotSupported => "ErrTorCmdNotSupported",
+            ErrorKind::TorAddrNotSupported => "ErrTorAddrNotSupported",
+            ErrorKind::Transport => "Transport",
         }
     }
 }

@@ -26,8 +26,12 @@ pub struct NetAddress {
 }
 
 impl NetAddress {
-    /// Whether the network address is routable (dcrd `IsRoutable`).
+    /// Whether the network address is routable (dcrd `IsRoutable`);
+    /// Tor v3 addresses always are.
     pub fn is_routable(&self) -> bool {
+        if self.addr_type == NetAddressType::TorV3 {
+            return true;
+        }
         is_routable(&self.ip)
     }
 
@@ -36,6 +40,19 @@ impl NetAddress {
     pub fn ip_string(&self) -> String {
         match self.addr_type {
             NetAddressType::IPv4 | NetAddressType::IPv6 => ip_to_string(&self.ip),
+            NetAddressType::TorV3 => {
+                // The onion form: lowercase base32 of the public key,
+                // its checksum, and the version byte (dcrd `ipString`).
+                let mut public_key = [0u8; 32];
+                let len = self.ip.len().min(32);
+                public_key[..len].copy_from_slice(&self.ip[..len]);
+                let checksum = crate::network::calc_tor_v3_checksum(&public_key);
+                let mut tor_address_bytes = [0u8; 35];
+                tor_address_bytes[..32].copy_from_slice(&public_key);
+                tor_address_bytes[32..34].copy_from_slice(&checksum);
+                tor_address_bytes[34] = crate::network::TOR_V3_VERSION_BYTE;
+                format!("{}.onion", crate::network::base32_lower(&tor_address_bytes))
+            }
             NetAddressType::Unknown => {
                 let hex: String = self.ip.iter().map(|b| format!("{b:02x}")).collect();
                 format!(
@@ -70,6 +87,10 @@ impl NetAddress {
     /// unroutable address.
     pub fn group_key(&self) -> String {
         let ip = &self.ip;
+        if self.addr_type == NetAddressType::TorV3 {
+            // Group is keyed off the first 4 bits of the public key.
+            return format!("torv3:{}", ip[0] & 0xf);
+        }
         if is_local(ip) {
             return "local".to_string();
         }
@@ -109,14 +130,22 @@ impl core::fmt::Display for NetAddress {
     }
 }
 
-/// Attempt to determine the network address type from raw bytes (dcrd
-/// `deriveNetAddressType`).
-pub(crate) fn derive_net_address_type(addr_bytes: &[u8]) -> Result<NetAddressType, AddrError> {
+/// Attempt to determine the network address type from raw bytes,
+/// with the claimed type as a hint for ambiguous lengths (dcrd
+/// `deriveNetAddressType` on master: a 32-byte address is Tor v3
+/// only when claimed as such).
+pub(crate) fn derive_net_address_type(
+    claimed_type: NetAddressType,
+    addr_bytes: &[u8],
+) -> Result<NetAddressType, AddrError> {
     if is_ipv4(addr_bytes) {
         return Ok(NetAddressType::IPv4);
     }
     if addr_bytes.len() == 16 {
         return Ok(NetAddressType::IPv6);
+    }
+    if addr_bytes.len() == 32 && claimed_type == NetAddressType::TorV3 {
+        return Ok(NetAddressType::TorV3);
     }
     Err(make_error(
         ErrorKind::UnknownAddressType,
@@ -144,7 +173,7 @@ pub(crate) fn canonicalize_ip(addr_type: NetAddressType, addr_bytes: &[u8]) -> V
 /// Return an error if the suggested address type does not match the
 /// provided address (dcrd `checkNetAddressType`).
 fn check_net_address_type(addr_type: NetAddressType, addr_bytes: &[u8]) -> Result<(), AddrError> {
-    let derived = derive_net_address_type(addr_bytes)?;
+    let derived = derive_net_address_type(addr_type, addr_bytes)?;
     if addr_type != derived {
         return Err(make_error(
             ErrorKind::MismatchedAddressType,
@@ -182,6 +211,19 @@ pub fn new_net_address_from_params(
 /// convert it to its unique encoding (dcrd `EncodeHost`).  A host
 /// that is not recognized returns the unknown type without error.
 pub fn encode_host(host: &str) -> (NetAddressType, Vec<u8>) {
+    // Check if this is a valid TorV3 address.  TorV3 addresses tend
+    // to be lowercase by convention, but the standard base32 decoding
+    // expects uppercase input, so convert for a successful decode
+    // (dcrd converts with `strings.ToUpper` for the same reason).
+    if host.len() == 62 && host.ends_with(".onion") {
+        let upper = host.as_bytes()[..56].to_ascii_uppercase();
+        if let Some(tor_address_bytes) = crate::network::base32_std_decode(&upper)
+            && let Some(pubkey) = crate::network::is_tor_v3(&tor_address_bytes)
+        {
+            return (NetAddressType::TorV3, pubkey.to_vec());
+        }
+    }
+
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return match ip {
             std::net::IpAddr::V4(v4) => (NetAddressType::IPv4, v4.octets().to_vec()),
@@ -210,7 +252,8 @@ pub fn new_net_address_from_ip_port(
     services: ServiceFlag,
     timestamp: i64,
 ) -> NetAddress {
-    let addr_type = derive_net_address_type(ip).unwrap_or(NetAddressType::Unknown);
+    let addr_type =
+        derive_net_address_type(NetAddressType::Unknown, ip).unwrap_or(NetAddressType::Unknown);
     let canonicalized = canonicalize_ip(addr_type, ip);
     NetAddress {
         addr_type,

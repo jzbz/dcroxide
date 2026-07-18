@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: ISC
-//! Tor DNS resolution via a SOCKS proxy (dcrd connmgr `tor.go`).
+//! Tor DNS resolution via a SOCKS proxy (dcrd addrmgr `tordns.go`;
+//! relocated from connmgr's `tor.go` in dcrd 2.2 with the error
+//! constructors switched to the addrmgr kinds).
 
-use crate::{ConnmgrError, ErrorKind, make_error};
+use crate::{AddrError, ErrorKind, make_error};
 
 const TOR_GENERAL_ERROR: u8 = 0x01;
 const TOR_NOT_ALLOWED: u8 = 0x02;
@@ -19,7 +21,7 @@ const TOR_ATYPE_IPV6: u8 = 4;
 const TOR_CMD_RESOLVE: u8 = 240;
 
 /// The error for a SOCKS status byte (dcrd `torStatusErrors`).
-fn tor_status_error(status: u8) -> Option<ConnmgrError> {
+fn tor_status_error(status: u8) -> Option<AddrError> {
     let (kind, desc) = match status {
         TOR_GENERAL_ERROR => (ErrorKind::TorGeneralError, "tor general error"),
         TOR_NOT_ALLOWED => (ErrorKind::TorNotAllowed, "tor not allowed"),
@@ -43,9 +45,9 @@ fn tor_status_error(status: u8) -> Option<ConnmgrError> {
 /// filled, mirroring Go's `net.Conn` semantics.
 pub trait TorTransport {
     /// Write the whole buffer.
-    fn write(&mut self, data: &[u8]) -> Result<(), ConnmgrError>;
+    fn write(&mut self, data: &[u8]) -> Result<(), AddrError>;
     /// Read up to `buf.len()` bytes.
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, ConnmgrError>;
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, AddrError>;
 }
 
 /// Resolve DNS for a host via the passed SOCKS proxy transport (dcrd
@@ -53,10 +55,7 @@ pub trait TorTransport {
 /// Go produces: a 16-byte IPv4-mapped address for the IPv4 answer
 /// type, and the raw reply bytes for the IPv6 answer type (whose
 /// length dcrd does not validate beyond a minimum).
-pub fn tor_lookup_ip<T: TorTransport>(
-    host: &str,
-    conn: &mut T,
-) -> Result<Vec<Vec<u8>>, ConnmgrError> {
+pub fn tor_lookup_ip<T: TorTransport>(host: &str, conn: &mut T) -> Result<Vec<Vec<u8>>, AddrError> {
     conn.write(&[0x05, 0x01, 0x00])?;
 
     let mut buf2 = [0u8; 2];

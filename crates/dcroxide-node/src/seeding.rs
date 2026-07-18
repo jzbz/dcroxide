@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dcroxide_addrmgr::AddrManager;
 use std::io::{Read, Write};
 
-use dcroxide_connmgr::{HttpsSeederFilters, MAX_RESP_SIZE, SeedEnv, SeederTransport, seed_addrs};
+use dcroxide_addrmgr::{HttpsSeederFilters, MAX_RESP_SIZE, SeedEnv, SeederTransport, seed_addrs};
 
 /// The TLS-capable seeder transport over `ureq` (dcrd's `dcrdDial`
 /// behind Go's `http.Client`; the proxy configuration plugs in with the

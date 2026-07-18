@@ -762,10 +762,21 @@ fn run(cfg: Config) -> ExitCode {
     // never dial discovered peers (dcrd server.go: `!cfg.SimNet &&
     // !cfg.RegNet && len(cfg.ConnectPeers) == 0`).
     let get_new_address = if !cfg.sim_net && !cfg.reg_net && cfg.connect_peers.is_empty() {
+        // The address types the automatic dialer may draw (dcrd
+        // server.go's `filter` over `GetAddress`): Tor addresses
+        // require .onion reachability through a configured proxy.
+        let onion_reachable =
+            !cfg.no_onion && (!cfg.proxy.is_empty() || !cfg.onion_proxy.is_empty());
+        let filter = move |addr_type: dcroxide_addrmgr::NetAddressType| match addr_type {
+            dcroxide_addrmgr::NetAddressType::IPv4 | dcroxide_addrmgr::NetAddressType::IPv6 => true,
+            dcroxide_addrmgr::NetAddressType::TorV3 => onion_reachable,
+            _ => false,
+        };
         Some(dcroxide_node::outbound::new_address_source(
             Arc::clone(&addr_manager),
             server.outbound_groups.clone(),
             cfg.params.params.default_port.to_string(),
+            filter,
         ))
     } else {
         dcroxide_node::logging::info(

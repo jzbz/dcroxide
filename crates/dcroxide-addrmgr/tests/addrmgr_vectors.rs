@@ -428,14 +428,14 @@ fn randomized_paths() {
     let (addrs, _, _, _) = am.state_snapshot();
     assert_eq!(addrs[0].4, 2, "zero draw adds a second reference");
 
-    // get_address walks random buckets until it finds an entry and
-    // accepts it against its chance; a never-attempted address has
-    // chance 0.01, so script a low accept draw after locating the
-    // populated bucket.
-    let bucket = am.new_bucket_index(&na, &src);
-    rng.lock().expect("addr lock poisoned").values = vec![bucket, 0, 0];
+    // get_address picks a random bucket from those whose stats match
+    // the filter, walks to the nth matching entry, and accepts it
+    // against its chance; a never-attempted address has chance 0.01,
+    // so script the first matching bucket, the first entry, and a low
+    // accept draw.
+    rng.lock().expect("addr lock poisoned").values = vec![0, 0, 0];
     rng.lock().expect("addr lock poisoned").pos = 0;
-    let picked = am.get_address().expect("selected address");
+    let picked = am.get_address(|_| true).expect("selected address");
     assert_eq!(
         picked
             .lock()

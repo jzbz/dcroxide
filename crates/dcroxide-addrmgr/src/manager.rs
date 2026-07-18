@@ -267,6 +267,8 @@ pub enum NetAddressReach {
     Ipv4 = 4,
     /// A connection state between two IPv6 addresses.
     Ipv6Strong = 5,
+    /// A connection state between two TorV3 addresses.
+    Private = 6,
 }
 
 /// The serializable state of a known address (dcrd
@@ -305,6 +307,82 @@ struct SerializedAddrManager {
     tried_buckets: Vec<Vec<String>>,
 }
 
+/// The wanted network address types for an address lookup (dcrd
+/// `addrTypeFilter`).
+#[derive(Clone, Copy)]
+struct AddrTypeFilter {
+    want_ipv4: bool,
+    want_ipv6: bool,
+    want_tor_v3: bool,
+}
+
+impl AddrTypeFilter {
+    /// Whether the address type matches the filter criteria (dcrd
+    /// `addrTypeFilter.matches`).
+    fn matches(&self, addr_type: NetAddressType) -> bool {
+        (self.want_ipv4 && addr_type == NetAddressType::IPv4)
+            || (self.want_ipv6 && addr_type == NetAddressType::IPv6)
+            || (self.want_tor_v3 && addr_type == NetAddressType::TorV3)
+    }
+}
+
+/// The number of addresses by type within a single bucket (dcrd
+/// `bucketStats`).  The counters wrap like Go's `uint16` arithmetic.
+#[derive(Clone, Copy, Default)]
+struct BucketStats {
+    num_ipv4: u16,
+    num_ipv6: u16,
+    num_tor_v3: u16,
+}
+
+impl BucketStats {
+    /// Increase the count for the given address type (dcrd
+    /// `bucketStats.increment`).
+    fn increment(&mut self, addr_type: NetAddressType) {
+        match addr_type {
+            NetAddressType::IPv4 => self.num_ipv4 = self.num_ipv4.wrapping_add(1),
+            NetAddressType::IPv6 => self.num_ipv6 = self.num_ipv6.wrapping_add(1),
+            NetAddressType::TorV3 => self.num_tor_v3 = self.num_tor_v3.wrapping_add(1),
+            NetAddressType::Unknown => {}
+        }
+    }
+
+    /// Decrease the count for the given address type (dcrd
+    /// `bucketStats.decrement`).
+    fn decrement(&mut self, addr_type: NetAddressType) {
+        match addr_type {
+            NetAddressType::IPv4 => self.num_ipv4 = self.num_ipv4.wrapping_sub(1),
+            NetAddressType::IPv6 => self.num_ipv6 = self.num_ipv6.wrapping_sub(1),
+            NetAddressType::TorV3 => self.num_tor_v3 = self.num_tor_v3.wrapping_sub(1),
+            NetAddressType::Unknown => {}
+        }
+    }
+
+    /// The sum of address counts matching the filter (dcrd
+    /// `bucketStats.total`).
+    fn total(&self, filter: AddrTypeFilter) -> usize {
+        let mut sum = 0usize;
+        if filter.want_ipv4 {
+            sum = sum.wrapping_add(usize::from(self.num_ipv4));
+        }
+        if filter.want_ipv6 {
+            sum = sum.wrapping_add(usize::from(self.num_ipv6));
+        }
+        if filter.want_tor_v3 {
+            sum = sum.wrapping_add(usize::from(self.num_tor_v3));
+        }
+        sum
+    }
+
+    /// Whether the bucket has any addresses matching the filter (dcrd
+    /// `bucketStats.matches`).
+    fn matches(&self, filter: AddrTypeFilter) -> bool {
+        (filter.want_ipv4 && self.num_ipv4 > 0)
+            || (filter.want_ipv6 && self.num_ipv6 > 0)
+            || (filter.want_tor_v3 && self.num_tor_v3 > 0)
+    }
+}
+
 /// A concurrency safe address manager for caching potential peers
 /// (dcrd `AddrManager`); this port is synchronous.
 pub struct AddrManager {
@@ -313,6 +391,12 @@ pub struct AddrManager {
     addr_index: HashMap<String, KnownAddressRef>,
     addr_new: Vec<HashMap<String, KnownAddressRef>>,
     addr_tried: Vec<Vec<KnownAddressRef>>,
+    /// Statistics about the addresses in each new bucket (dcrd
+    /// `addrNewStats`).
+    addr_new_stats: Vec<BucketStats>,
+    /// Statistics about the addresses in each tried bucket (dcrd
+    /// `addrTriedStats`).
+    addr_tried_stats: Vec<BucketStats>,
     addr_changed: bool,
     n_tried: usize,
     n_new: usize,
@@ -371,6 +455,15 @@ fn get_remote_reachability_from_local(
     if !remote_addr.is_routable() {
         return Unreachable;
     }
+    if remote_addr.addr_type == NetAddressType::TorV3 {
+        return if local_addr.addr_type == NetAddressType::TorV3 {
+            Private
+        } else if local_addr.is_routable() && local_addr.addr_type == NetAddressType::IPv4 {
+            Ipv4
+        } else {
+            Default
+        };
+    }
     if is_rfc4380(&remote_addr.ip) {
         return if !local_addr.is_routable() {
             Default
@@ -383,7 +476,11 @@ fn get_remote_reachability_from_local(
         };
     }
     if remote_addr.addr_type == NetAddressType::IPv4 {
-        return if local_addr.is_routable() && local_addr.addr_type == NetAddressType::IPv4 {
+        // dcrd's routable-IPv4-local and TorV3-local cases both reach
+        // the IPv4 remote.
+        return if (local_addr.is_routable() && local_addr.addr_type == NetAddressType::IPv4)
+            || local_addr.addr_type == NetAddressType::TorV3
+        {
             Ipv4
         } else {
             Unreachable
@@ -396,6 +493,8 @@ fn get_remote_reachability_from_local(
             Teredo
         } else if local_addr.addr_type == NetAddressType::IPv4 {
             Ipv4
+        } else if local_addr.addr_type == NetAddressType::TorV3 {
+            Ipv6Strong
         } else if is_rfc3964(&local_addr.ip)
             || is_rfc6052(&local_addr.ip)
             || is_rfc6145(&local_addr.ip)
@@ -439,6 +538,8 @@ impl AddrManager {
             addr_index: HashMap::new(),
             addr_new: Vec::new(),
             addr_tried: Vec::new(),
+            addr_new_stats: Vec::new(),
+            addr_tried_stats: Vec::new(),
             addr_changed: false,
             n_tried: 0,
             n_new: 0,
@@ -461,6 +562,8 @@ impl AddrManager {
             .read(&mut self.key);
         self.addr_new = (0..NEW_BUCKET_COUNT).map(|_| HashMap::new()).collect();
         self.addr_tried = (0..TRIED_BUCKET_COUNT).map(|_| Vec::new()).collect();
+        self.addr_new_stats = vec![BucketStats::default(); NEW_BUCKET_COUNT];
+        self.addr_tried_stats = vec![BucketStats::default(); TRIED_BUCKET_COUNT];
         self.n_new = 0;
         self.n_tried = 0;
         self.addr_changed = true;
@@ -579,6 +682,7 @@ impl AddrManager {
         // Add to the new bucket.
         ka.lock().expect("addrmgr lock poisoned").refs += 1;
         self.addr_new[bucket].insert(addr_key, ka);
+        self.addr_new_stats[bucket].increment(net_addr.addr_type);
         self.addr_changed = true;
     }
 
@@ -595,6 +699,8 @@ impl AddrManager {
         for (k, v) in entries {
             if v.lock().expect("addrmgr lock poisoned").is_bad(now) {
                 self.addr_new[bucket].remove(&k);
+                self.addr_new_stats[bucket]
+                    .decrement(v.lock().expect("addrmgr lock poisoned").na.addr_type);
                 self.addr_changed = true;
                 let refs = {
                     let mut v_mut = v.lock().expect("addrmgr lock poisoned");
@@ -623,6 +729,8 @@ impl AddrManager {
 
         if let Some((key, oldest)) = oldest {
             self.addr_new[bucket].remove(&key);
+            self.addr_new_stats[bucket]
+                .decrement(oldest.lock().expect("addrmgr lock poisoned").na.addr_type);
             self.addr_changed = true;
             let refs = {
                 let mut oldest_mut = oldest.lock().expect("addrmgr lock poisoned");
@@ -708,28 +816,76 @@ impl AddrManager {
         all_addr
     }
 
-    /// A single address that should be routable, picked at random
-    /// with preference to those not recently used (dcrd
-    /// `GetAddress`).
-    pub fn get_address(&self) -> Option<KnownAddressRef> {
+    /// A single address that should be routable and satisfies the
+    /// provided filter, picked at random with preference to those not
+    /// recently used (dcrd `GetAddress`).
+    pub fn get_address<F: Fn(NetAddressType) -> bool>(
+        &self,
+        filter_fn: F,
+    ) -> Option<KnownAddressRef> {
         if self.num_addresses() == 0 {
             return None;
         }
 
+        let filter = AddrTypeFilter {
+            want_ipv4: filter_fn(NetAddressType::IPv4),
+            want_ipv6: filter_fn(NetAddressType::IPv6),
+            want_tor_v3: filter_fn(NetAddressType::TorV3),
+        };
+
+        if !filter.want_ipv4 && !filter.want_ipv6 && !filter.want_tor_v3 {
+            return None;
+        }
+
+        // Collect indices of tried and new buckets that match the
+        // filter.
+        let tried_bucket_idxs: Vec<usize> = (0..self.addr_tried_stats.len())
+            .filter(|&i| self.addr_tried_stats[i].matches(filter))
+            .collect();
+        let new_bucket_idxs: Vec<usize> = (0..self.addr_new_stats.len())
+            .filter(|&i| self.addr_new_stats[i].matches(filter))
+            .collect();
+
+        let num_tried = tried_bucket_idxs.len();
+        let num_new = new_bucket_idxs.len();
+
+        // Return early if no buckets match the filter.
+        if num_tried == 0 && num_new == 0 {
+            return None;
+        }
+
+        // Use a 50% chance for choosing between tried and new table
+        // entries.
         let now = (self.now_fn)();
         let large = 1usize << 30;
         let mut factor = 1.0f64;
         let mut rng = self.rng.lock().expect("addrmgr lock poisoned");
-        if self.n_tried > 0 && (self.n_new == 0 || rng.int_n(2) == 0) {
+        if num_tried > 0 && (num_new == 0 || rng.int_n(2) == 0) {
             // Tried entry.
             loop {
-                let bucket = rng.int_n(self.addr_tried.len());
-                if self.addr_tried[bucket].is_empty() {
-                    continue;
-                }
+                // Pick a random bucket from buckets matching the
+                // filter.
+                let bucket_idx = tried_bucket_idxs[rng.int_n(num_tried)];
 
-                let rand_entry = rng.int_n(self.addr_tried[bucket].len());
-                let ka = &self.addr_tried[bucket][rand_entry];
+                // Calculate total number of tried addresses matching
+                // the filter, then pick a random entry.
+                let counts = self.addr_tried_stats[bucket_idx];
+                let total_matching = counts.total(filter);
+                let mut nth = rng.int_n(total_matching);
+
+                // Find the nth address matching the filter.
+                let mut picked: Option<&KnownAddressRef> = None;
+                for addr in &self.addr_tried[bucket_idx] {
+                    if !filter.matches(addr.lock().expect("addrmgr lock poisoned").na.addr_type) {
+                        continue;
+                    }
+                    if nth == 0 {
+                        picked = Some(addr);
+                        break;
+                    }
+                    nth -= 1;
+                }
+                let ka = picked.expect("bucket stats track bucket contents");
 
                 let randval = rng.int_n(large);
                 if (randval as f64)
@@ -740,26 +896,39 @@ impl AddrManager {
                 factor *= 1.2;
             }
         } else {
-            // New node.  Note that dcrd picks the nth entry in Go's
-            // random map iteration order; entries are selected by
-            // index over an unspecified order here as well.
+            // New node.  Note that dcrd walks entries in Go's random
+            // map iteration order; entries are walked in an
+            // unspecified order here as well.
             loop {
-                let bucket = rng.int_n(self.addr_new.len());
-                if self.addr_new[bucket].is_empty() {
-                    continue;
-                }
+                // Pick a random bucket from the buckets matching the
+                // filter.
+                let bucket_idx = new_bucket_idxs[rng.int_n(num_new)];
 
-                let nth = rng.int_n(self.addr_new[bucket].len());
-                let ka = self.addr_new[bucket]
-                    .values()
-                    .nth(nth)
-                    .expect("nth entry")
-                    .clone();
+                // Calculate total number of new addresses matching
+                // the filter, then pick a random entry.
+                let counts = self.addr_new_stats[bucket_idx];
+                let total_matching = counts.total(filter);
+                let mut nth = rng.int_n(total_matching);
+
+                // Find the nth address matching the filter.
+                let mut picked: Option<&KnownAddressRef> = None;
+                for addr in self.addr_new[bucket_idx].values() {
+                    if !filter.matches(addr.lock().expect("addrmgr lock poisoned").na.addr_type) {
+                        continue;
+                    }
+                    if nth == 0 {
+                        picked = Some(addr);
+                        break;
+                    }
+                    nth -= 1;
+                }
+                let ka = picked.expect("bucket stats track bucket contents");
+
                 let randval = rng.int_n(large);
                 if (randval as f64)
                     < factor * ka.lock().expect("addrmgr lock poisoned").chance(now) * large as f64
                 {
-                    return Some(ka);
+                    return Some(ka.clone());
                 }
                 factor *= 1.2;
             }
@@ -841,12 +1010,16 @@ impl AddrManager {
 
         // Remove from all new buckets, remembering the first bucket
         // it was found in.
-        let addr_key = ka.lock().expect("addrmgr lock poisoned").na.key();
+        let (addr_key, ka_type) = {
+            let ka_ref = ka.lock().expect("addrmgr lock poisoned");
+            (ka_ref.na.key(), ka_ref.na.addr_type)
+        };
         let mut addr_new_available_index: Option<usize> = None;
         for i in 0..self.addr_new.len() {
             if self.addr_new[i].remove(&addr_key).is_some() {
                 self.addr_changed = true;
                 ka.lock().expect("addrmgr lock poisoned").refs -= 1;
+                self.addr_new_stats[i].decrement(ka_type);
                 if addr_new_available_index.is_none() {
                     addr_new_available_index = Some(i);
                 }
@@ -868,6 +1041,7 @@ impl AddrManager {
         if self.addr_tried[bucket].len() < self.tried_bucket_size {
             ka.lock().expect("addrmgr lock poisoned").tried = true;
             self.addr_tried[bucket].push(ka);
+            self.addr_tried_stats[bucket].increment(ka_type);
             self.addr_changed = true;
             self.n_tried += 1;
             return Ok(());
@@ -893,6 +1067,9 @@ impl AddrManager {
         // Replace the oldest tried address in the bucket with ka.
         ka.lock().expect("addrmgr lock poisoned").tried = true;
         self.addr_tried[bucket][oldest_tried_index] = ka;
+        self.addr_tried_stats[bucket]
+            .decrement(rmka.lock().expect("addrmgr lock poisoned").na.addr_type);
+        self.addr_tried_stats[bucket].increment(ka_type);
 
         {
             let mut rmka_mut = rmka.lock().expect("addrmgr lock poisoned");
@@ -904,8 +1081,12 @@ impl AddrManager {
         // decremented above and an address is moving back to new.
         self.n_new += 1;
 
-        let rmkey = rmka.lock().expect("addrmgr lock poisoned").na.key();
+        let (rmkey, rmka_type) = {
+            let rmka_ref = rmka.lock().expect("addrmgr lock poisoned");
+            (rmka_ref.na.key(), rmka_ref.na.addr_type)
+        };
         self.addr_new[new_bucket].insert(rmkey, rmka);
+        self.addr_new_stats[new_bucket].increment(rmka_type);
         Ok(())
     }
 
@@ -1206,7 +1387,9 @@ impl AddrManager {
                 if refs == 0 {
                     self.n_new += 1;
                 }
+                let ka_type = ka.lock().expect("addrmgr lock poisoned").na.addr_type;
                 self.addr_new[i].insert(val.clone(), ka);
+                self.addr_new_stats[i].increment(ka_type);
             }
         }
         for (i, bucket) in sam
@@ -1221,9 +1404,14 @@ impl AddrManager {
                         "tried buckets contains {val} but none in address list"
                     ));
                 };
-                ka.lock().expect("addrmgr lock poisoned").tried = true;
+                let ka_type = {
+                    let mut ka_mut = ka.lock().expect("addrmgr lock poisoned");
+                    ka_mut.tried = true;
+                    ka_mut.na.addr_type
+                };
                 self.n_tried += 1;
                 self.addr_tried[i].push(ka);
+                self.addr_tried_stats[i].increment(ka_type);
             }
         }
 
@@ -1289,6 +1477,36 @@ impl AddrManager {
         }
         addrs.sort();
         (addrs, self.n_new, self.n_tried, self.key)
+    }
+
+    /// The new/tried totals plus every non-empty bucket's per-type
+    /// statistics as `(bucket, ipv4, ipv6, tor_v3)` rows for the new
+    /// then tried tables; exposed so tests replay dcrd's bookkeeping
+    /// dumps.
+    #[doc(hidden)]
+    #[allow(clippy::type_complexity)]
+    pub fn bucket_stats_snapshot(
+        &self,
+    ) -> (
+        usize,
+        usize,
+        Vec<(usize, u16, u16, u16)>,
+        Vec<(usize, u16, u16, u16)>,
+    ) {
+        let nonzero = |stats: &[BucketStats]| {
+            stats
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.num_ipv4 != 0 || s.num_ipv6 != 0 || s.num_tor_v3 != 0)
+                .map(|(i, s)| (i, s.num_ipv4, s.num_ipv6, s.num_tor_v3))
+                .collect()
+        };
+        (
+            self.n_new,
+            self.n_tried,
+            nonzero(&self.addr_new_stats),
+            nonzero(&self.addr_tried_stats),
+        )
     }
 }
 

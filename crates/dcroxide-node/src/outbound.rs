@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use dcroxide_addrmgr::AddrManager;
+use dcroxide_addrmgr::{AddrManager, NetAddressType};
 use dcroxide_connmgr::{Config, Conn, ConnManager, Event, ReqAddr};
 
 use crate::dispatch::{OutboundGroups, ServerContext};
@@ -99,13 +99,14 @@ pub fn new_address_source(
     addr_manager: Arc<Mutex<AddrManager>>,
     groups: OutboundGroups,
     default_port: String,
+    filter: impl Fn(NetAddressType) -> bool + Send + 'static,
 ) -> AddressSource {
     Box::new(move || {
         for tries in 0..100 {
             let candidate = addr_manager
                 .lock()
                 .expect("addrmgr mutex poisoned")
-                .get_address();
+                .get_address(&filter);
             let Some(candidate) = candidate else {
                 break;
             };
@@ -679,7 +680,7 @@ mod tests {
 
         let locked = mgr.lock().expect("addrmgr");
         let known = locked
-            .get_address()
+            .get_address(|_| true)
             .expect("the target must join the manager");
         let known = known.lock().expect("known address");
         assert_eq!(known.net_address().key(), "8.8.8.8:9108");

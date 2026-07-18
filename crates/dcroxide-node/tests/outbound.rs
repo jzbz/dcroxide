@@ -314,7 +314,12 @@ fn address_source_spreads_across_outbound_groups() {
     }
 
     let groups = OutboundGroups::new();
-    let mut source = new_address_source(Arc::clone(&addr_manager), groups.clone(), "19108".into());
+    let mut source = new_address_source(
+        Arc::clone(&addr_manager),
+        groups.clone(),
+        "19108".into(),
+        |_| true,
+    );
 
     // A candidate is available while the group is unoccupied.
     let picked = source().expect("an address is available");
