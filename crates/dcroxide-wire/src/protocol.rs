@@ -9,11 +9,10 @@ use core::fmt;
 pub const INITIAL_PROTOCOL_VERSION: u32 = 1;
 
 /// The latest protocol version this crate implements (dcrd
-/// `ProtocolVersion` at the pinned release-v2.1.5 tag).
-/// NOTE: dcrd master (the 2.2 pre-release) negotiates protocol
-/// version 12; the port advertises 11 until the daemon's addrv2
-/// handlers land, at which point this becomes 12.
-pub const PROTOCOL_VERSION: u32 = 11;
+/// `ProtocolVersion` at the dcrd master 2.2 pre-release parity
+/// target): the addrv2 version, negotiated since the strict-verack
+/// handshake and the daemon's addrv2 handlers landed.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The protocol version which adds the `addrv2` message and retires
 /// the legacy `addr` message (dcrd `AddrV2Version`).

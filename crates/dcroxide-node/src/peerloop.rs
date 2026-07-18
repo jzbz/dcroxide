@@ -110,12 +110,6 @@ pub fn classify_incoming<E: PeerEnv>(
     }
 }
 
-/// Queue the verack that follows a successful negotiation (dcrd
-/// `start`'s `QueueMessage(NewMsgVerAck())`).
-pub fn send_verack(outbound: &OutboundQueue) -> Result<(), String> {
-    outbound.queue_message(Message::VerAck)
-}
-
 /// What the server's message handler decided about the connection
 /// (dcrd's handlers either return or call `Disconnect`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +137,16 @@ pub trait ServeHooks {
         _outbound: &OutboundQueue,
         _remote_disable_relay_tx: bool,
     ) {
+    }
+    /// The remote's version message arrived during the handshake
+    /// (dcrd 2.2's `OnVersionCallback`); an error aborts the
+    /// handshake and disconnects the peer.
+    fn on_version(
+        &mut self,
+        _peer: &dcroxide_peer::Peer,
+        _msg: &dcroxide_wire::MsgVersion,
+    ) -> Result<(), String> {
+        Ok(())
     }
     /// A message arrived for the server handlers.
     fn on_message(
@@ -180,12 +184,34 @@ pub fn run_peer_input<T, E, H>(
     env: &mut E,
     outbound: &OutboundQueue,
     hooks: &mut H,
+    delayed: Vec<Message>,
 ) -> DisconnectReason
 where
     T: MsgTransport,
     E: PeerEnv,
     H: ServeHooks,
 {
+    // Replay any messages a legacy peer sent before its verack first
+    // (dcrd's `inHandler` draining `delayedHandshakeMsgs`); their
+    // bytes were folded into the handshake accounting already.
+    for msg in delayed {
+        let mut peer = peer.lock().expect("peer mutex poisoned");
+        match classify_incoming(&mut peer, &msg, env) {
+            IncomingAction::Disconnect(reason) => return DisconnectReason::Protocol(reason),
+            IncomingAction::Process { reply } => {
+                if let Some(reply) = reply
+                    && outbound.queue_message(*reply).is_err()
+                {
+                    return DisconnectReason::LocalShutdown;
+                }
+                if let ServeSignal::Disconnect(reason) = hooks.on_message(&mut peer, &msg, outbound)
+                {
+                    return DisconnectReason::Protocol(reason);
+                }
+            }
+        }
+    }
+
     // Snapshot the transport's cumulative read counter so each message
     // contributes its delta to the peer's receive accounting (dcrd's
     // `readMessage` adding its byte count to `bytesReceived`); the
@@ -378,19 +404,35 @@ where
         write_transport.set_net_totals(totals);
     }
 
-    // Negotiate the version exchange before starting the loops.  The
-    // read transport is full duplex, so it also writes the local version.
+    // Run the handshake (version and verack exchange) before starting
+    // the loops, firing the server's version listener from inside it
+    // exactly where dcrd 2.2's `onVersion` callback runs.  The read
+    // transport is full duplex, so it also writes the local messages.
     let mut env = NodePeerEnv::new();
     let mut globals = PeerGlobals::new();
-    let negotiated = if peer.inbound() {
-        peer.negotiate_inbound_protocol(&mut read_transport, &mut env, &mut globals)
-    } else {
-        peer.negotiate_outbound_protocol(&mut read_transport, &mut env, &mut globals)
+    let outcome = {
+        let mut on_version = |p: &Peer, msg: &dcroxide_wire::MsgVersion| hooks.on_version(p, msg);
+        let negotiated = if peer.inbound() {
+            peer.negotiate_inbound_protocol(
+                &mut read_transport,
+                &mut env,
+                &mut globals,
+                Some(&mut on_version),
+            )
+        } else {
+            peer.negotiate_outbound_protocol(
+                &mut read_transport,
+                &mut env,
+                &mut globals,
+                Some(&mut on_version),
+            )
+        };
+        match negotiated {
+            Ok(outcome) => outcome,
+            Err(e) => return DisconnectReason::Negotiate(e.message),
+        }
     };
-    let remote_version = match negotiated {
-        Ok(remote) => remote,
-        Err(e) => return DisconnectReason::Negotiate(e.message),
-    };
+    let remote_version = outcome.remote_version;
 
     // Frame the rest of the session at the negotiated version (dcrd
     // re-reads the peer's protocol version on every message).
@@ -418,11 +460,13 @@ where
         peer.record_send(handshake_written, handshake_now);
     }
 
-    // Share the peer across the loops and queue the verack that follows
-    // negotiation.
+    // Share the peer across the loops and request all block
+    // announcements via full headers instead of the inv message (dcrd
+    // `serverPeer.Run` queueing `NewMsgSendHeaders` after the
+    // handshake).
     let peer = Arc::new(Mutex::new(peer));
     let (outbound, receiver) = OutboundQueue::channel();
-    if send_verack(&outbound).is_err() {
+    if outbound.queue_message(Message::SendHeaders).is_err() {
         return DisconnectReason::LocalShutdown;
     }
 
@@ -466,7 +510,14 @@ where
     });
 
     // Drive the input loop on this thread until the peer disconnects.
-    let reason = run_peer_input(&peer, &mut read_transport, &mut env, &outbound, &mut hooks);
+    let reason = run_peer_input(
+        &peer,
+        &mut read_transport,
+        &mut env,
+        &outbound,
+        &mut hooks,
+        outcome.delayed,
+    );
 
     // The connection is winding down (dcrd `DonePeer`).
     hooks.on_disconnected(&mut peer.lock().expect("peer mutex poisoned"));

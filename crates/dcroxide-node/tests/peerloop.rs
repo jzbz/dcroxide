@@ -11,10 +11,10 @@ use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use dcroxide_node::peerconn::{NodePeerEnv, net_address_from_socket};
+use dcroxide_node::peerconn::{NodePeerEnv, net_address_v2_from_socket};
 use dcroxide_node::peerloop::{
     OutboundQueue, ServeSignal, run_peer_connection, run_peer_input, run_peer_output,
-    run_ping_timer, send_verack,
+    run_ping_timer,
 };
 use dcroxide_node::transport::WireTransport;
 use dcroxide_peer::{Config, MAX_PROTOCOL_VERSION, MsgTransport, Peer, PeerEnv, PeerGlobals};
@@ -53,14 +53,14 @@ fn inbound_peer_answers_verack_and_ping_through_the_output_queue() {
         let mut env = NodePeerEnv::new();
         let mut globals = PeerGlobals::new();
         let mut peer = Peer::new_inbound(config("dcroxide-in"));
-        let na = net_address_from_socket(remote_addr, ServiceFlag(0)).expect("net address");
+        let na = net_address_v2_from_socket(remote_addr, ServiceFlag(0)).expect("net address");
         peer.associate(&remote_addr.to_string(), na, env.now_nanos());
-        peer.negotiate_inbound_protocol(&mut read_transport, &mut env, &mut globals)
+        let outcome = peer
+            .negotiate_inbound_protocol(&mut read_transport, &mut env, &mut globals, None)
             .expect("inbound negotiation");
 
         let peer = std::sync::Arc::new(Mutex::new(peer));
         let (queue, outbound) = OutboundQueue::channel();
-        send_verack(&queue).expect("queue verack");
 
         let output_peer = std::sync::Arc::clone(&peer);
         let output = thread::spawn(move || {
@@ -83,6 +83,7 @@ fn inbound_peer_answers_verack_and_ping_through_the_output_queue() {
                 forwarded.push(msg.clone());
                 ServeSignal::Continue
             },
+            outcome.delayed,
         );
 
         // End the output loop by closing the queue, then join it.
@@ -107,22 +108,15 @@ fn inbound_peer_answers_verack_and_ping_through_the_output_queue() {
     let mut globals = PeerGlobals::new();
     let mut peer = Peer::new_outbound(config("dcroxide-out"), &server_addr.to_string())
         .expect("outbound peer");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
         .expect("outbound negotiation");
 
-    transport
-        .write_message(&Message::VerAck)
-        .expect("send verack");
+    // The handshake already exchanged the veracks; send a ping.
     transport
         .write_message(&Message::Ping(MsgPing { nonce: ping_nonce }))
         .expect("send ping");
 
-    // The server replies with its verack (queued on start) and a pong
-    // (queued in answer to the ping), both written by the output loop.
-    assert_eq!(
-        transport.read_message().expect("read verack"),
-        Message::VerAck
-    );
+    // The pong answering the ping is written by the output loop.
     match transport.read_message().expect("read pong") {
         Message::Pong(pong) => assert_eq!(pong.nonce, ping_nonce),
         other => panic!("expected pong, got {other:?}"),
@@ -138,11 +132,9 @@ fn inbound_peer_answers_verack_and_ping_through_the_output_queue() {
     );
     assert_eq!(
         forwarded,
-        vec![
-            Message::VerAck,
-            Message::Ping(MsgPing { nonce: ping_nonce })
-        ],
-        "the loop forwards every message in order",
+        vec![Message::Ping(MsgPing { nonce: ping_nonce })],
+        "the loop forwards every message in order; the verack was \
+         consumed by the handshake",
     );
     // The loop ended because the client closed the connection.
     assert!(reason.contains("ReadError"), "disconnect reason: {reason}");
@@ -262,7 +254,7 @@ fn run_peer_connection_negotiates_and_serves_until_the_remote_closes() {
     let server = thread::spawn(move || {
         let (stream, remote_addr) = listener.accept().expect("accept connection");
         let mut peer = Peer::new_inbound(config("dcroxide-in"));
-        let na = net_address_from_socket(remote_addr, ServiceFlag(0)).expect("net address");
+        let na = net_address_v2_from_socket(remote_addr, ServiceFlag(0)).expect("net address");
         peer.associate(&remote_addr.to_string(), na, 0);
 
         let forwarded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Message>::new()));
@@ -295,19 +287,18 @@ fn run_peer_connection_negotiates_and_serves_until_the_remote_closes() {
     let mut globals = PeerGlobals::new();
     let mut peer = Peer::new_outbound(config("dcroxide-out"), &server_addr.to_string())
         .expect("outbound peer");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
         .expect("outbound negotiation");
 
-    transport
-        .write_message(&Message::VerAck)
-        .expect("send verack");
     transport
         .write_message(&Message::Ping(MsgPing { nonce: ping_nonce }))
         .expect("send ping");
 
+    // The connection runtime requests header announcements right
+    // after the handshake, then the pong answers the ping.
     assert_eq!(
-        transport.read_message().expect("read verack"),
-        Message::VerAck
+        transport.read_message().expect("read sendheaders"),
+        Message::SendHeaders
     );
     match transport.read_message().expect("read pong") {
         Message::Pong(pong) => assert_eq!(pong.nonce, ping_nonce),
@@ -320,11 +311,9 @@ fn run_peer_connection_negotiates_and_serves_until_the_remote_closes() {
     let (forwarded, reason) = server.join().expect("server thread");
     assert_eq!(
         forwarded,
-        vec![
-            Message::VerAck,
-            Message::Ping(MsgPing { nonce: ping_nonce })
-        ],
-        "the connection forwards every message in order",
+        vec![Message::Ping(MsgPing { nonce: ping_nonce })],
+        "the connection forwards every message in order; the verack \
+         was consumed by the handshake",
     );
     assert!(reason.contains("ReadError"), "disconnect reason: {reason}");
 }
@@ -340,7 +329,7 @@ fn run_peer_connection_frames_at_the_negotiated_version_not_the_sentinel() {
     let server = thread::spawn(move || {
         let (stream, remote_addr) = listener.accept().expect("accept connection");
         let mut peer = Peer::new_inbound(config("dcroxide-in"));
-        let na = net_address_from_socket(remote_addr, ServiceFlag(0)).expect("net address");
+        let na = net_address_v2_from_socket(remote_addr, ServiceFlag(0)).expect("net address");
         peer.associate(&remote_addr.to_string(), na, 0);
 
         let forwarded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Message>::new()));
@@ -370,20 +359,17 @@ fn run_peer_connection_frames_at_the_negotiated_version_not_the_sentinel() {
     let mut globals = PeerGlobals::new();
     let mut peer = Peer::new_outbound(config("dcroxide-out"), &server_addr.to_string())
         .expect("outbound peer");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
         .expect("outbound negotiation");
 
     // feefilter is version-gated (FEE_FILTER_VERSION = 5); it decodes only
     // if the server frames at the negotiated version (11), not pver 0
     // where the codec returns MsgInvalidForPVer and the peer is dropped.
     let feefilter = Message::FeeFilter(MsgFeeFilter { min_fee: 12345 });
-    transport
-        .write_message(&Message::VerAck)
-        .expect("send verack");
     transport.write_message(&feefilter).expect("send feefilter");
     assert_eq!(
-        transport.read_message().expect("read verack"),
-        Message::VerAck
+        transport.read_message().expect("read sendheaders"),
+        Message::SendHeaders
     );
     drop(transport);
 

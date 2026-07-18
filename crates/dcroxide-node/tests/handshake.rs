@@ -9,7 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use dcroxide_node::peerconn::{NodePeerEnv, net_address_from_socket};
+use dcroxide_node::peerconn::{NodePeerEnv, net_address_v2_from_socket};
 use dcroxide_node::transport::WireTransport;
 use dcroxide_peer::{Config, MAX_PROTOCOL_VERSION, Peer, PeerEnv, PeerGlobals};
 use dcroxide_wire::{CurrencyNet, ServiceFlag};
@@ -47,12 +47,12 @@ fn negotiates_version_between_inbound_and_outbound_peers() {
         let mut peer = Peer::new_outbound(config("dcroxide-out"), &server_addr.to_string())
             .expect("build outbound peer");
         let remote = peer
-            .negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+            .negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
             .expect("outbound negotiation");
         (
             peer.protocol_version(),
             peer.user_agent().to_string(),
-            remote.user_agent,
+            remote.remote_version.user_agent,
         )
     });
 
@@ -66,10 +66,10 @@ fn negotiates_version_between_inbound_and_outbound_peers() {
     let mut env = NodePeerEnv::new();
     let mut globals = PeerGlobals::new();
     let mut peer = Peer::new_inbound(config("dcroxide-in"));
-    let na = net_address_from_socket(remote_addr, ServiceFlag(0)).expect("remote net address");
+    let na = net_address_v2_from_socket(remote_addr, ServiceFlag(0)).expect("remote net address");
     peer.associate(&remote_addr.to_string(), na, env.now_nanos());
     let remote = peer
-        .negotiate_inbound_protocol(&mut transport, &mut env, &mut globals)
+        .negotiate_inbound_protocol(&mut transport, &mut env, &mut globals, None)
         .expect("inbound negotiation");
 
     // The inbound peer learned the outbound peer's advertised details.
@@ -77,12 +77,12 @@ fn negotiates_version_between_inbound_and_outbound_peers() {
     assert_eq!(peer.protocol_version(), MAX_PROTOCOL_VERSION);
     assert_eq!(peer.services(), SERVICES);
     assert!(
-        remote.user_agent.contains("dcroxide-out"),
+        remote.remote_version.user_agent.contains("dcroxide-out"),
         "remote user agent: {}",
-        remote.user_agent
+        remote.remote_version.user_agent
     );
     // The peer records the remote's user agent as its own view of it.
-    assert_eq!(peer.user_agent(), remote.user_agent);
+    assert_eq!(peer.user_agent(), remote.remote_version.user_agent);
 
     let (out_pver, out_self_ua, out_remote_ua) = outbound.join().expect("outbound thread");
     assert_eq!(out_pver, MAX_PROTOCOL_VERSION);

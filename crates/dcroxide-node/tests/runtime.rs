@@ -127,26 +127,25 @@ fn serves_an_inbound_peer_through_the_handler() {
     };
     let mut peer =
         Peer::new_outbound(client_config, &format!("127.0.0.1:{port}")).expect("outbound peer");
-    let remote = peer
-        .negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+    let outcome = peer
+        .negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
         .expect("negotiate with the server");
+    let remote = outcome.remote_version;
     assert!(
         remote.user_agent.contains("dcroxide"),
         "server user agent: {}",
         remote.user_agent
     );
 
-    // Exchange verack and confirm the server answers a ping with a pong.
-    transport
-        .write_message(&Message::VerAck)
-        .expect("send verack");
+    // The handshake exchanged veracks; the served peer requests
+    // header announcements first, then answers a ping with a pong.
     let ping_nonce = 0x1234_5678_9abc_def0_u64;
     transport
         .write_message(&Message::Ping(MsgPing { nonce: ping_nonce }))
         .expect("send ping");
     assert_eq!(
-        transport.read_message().expect("read verack"),
-        Message::VerAck
+        transport.read_message().expect("read sendheaders"),
+        Message::SendHeaders
     );
     match transport.read_message().expect("read pong") {
         Message::Pong(pong) => assert_eq!(pong.nonce, ping_nonce),
@@ -201,7 +200,7 @@ fn disconnecting_all_peers_tears_down_a_served_connection() {
         ..Config::default()
     };
     let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound peer");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
         .expect("negotiate");
 
     // The peer should register shortly after the handshake.

@@ -63,6 +63,22 @@ impl PeerEnv for NodePeerEnv {
             addrs.swap(i, j);
         }
     }
+
+    fn shuffle_addrs_v2(&mut self, addrs: &mut [dcroxide_wire::NetAddressV2]) {
+        // Fisher-Yates over the system random source; the exact
+        // permutation is not observable across peers, only that it is a
+        // uniform reordering (dcrd `rand.ShuffleSlice`).
+        let len = addrs.len();
+        for i in (1..len).rev() {
+            // A uniform index in 0..=i; the modulo bias over a full
+            // 64-bit draw is negligible for address relay ordering.  The
+            // divisor is at least two here, so `checked_rem` never
+            // yields `None`.
+            let bound = (i as u64).saturating_add(1);
+            let j = self.rand_u64().checked_rem(bound).unwrap_or(0) as usize;
+            addrs.swap(i, j);
+        }
+    }
 }
 
 /// Convert an accepted socket address into the peer address form the
@@ -86,6 +102,21 @@ pub fn net_address_from_socket(
     services: ServiceFlag,
 ) -> Result<NetAddress, String> {
     new_net_address(&peer_addr_from_socket(addr), services)
+}
+
+/// Build the v2 network address for a connected socket (dcrd 2.2's
+/// `newNetAddress` returning a `wire.NetAddressV2`).
+pub fn net_address_v2_from_socket(
+    addr: SocketAddr,
+    services: ServiceFlag,
+) -> Result<dcroxide_wire::NetAddressV2, String> {
+    let legacy = new_net_address(&peer_addr_from_socket(addr), services)?;
+    Ok(dcroxide_wire::NetAddressV2::from_ip_port(
+        legacy.ip,
+        legacy.port,
+        services,
+        0,
+    ))
 }
 
 #[cfg(test)]

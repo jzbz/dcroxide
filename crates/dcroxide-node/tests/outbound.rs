@@ -38,6 +38,7 @@ fn genesis_server(dir: &std::path::Path, name: &str) -> (Arc<ServerContext>, Con
         false,
     );
     let server = Arc::new(ServerContext {
+        target_outbound: 8,
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
         params: params.clone(),

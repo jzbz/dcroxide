@@ -1,7 +1,0 @@
-sv|oldprotocol|false|0
-sv|missingservices|false|0
-sv|mixdisconnect|false|1
-sv|acceptoutbound|false|1|true|52.91.77.1:9108
-sv|acceptinbound|false|0|false
-sv|simnet|false|0
-sv|verack|true

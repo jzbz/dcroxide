@@ -1007,6 +1007,7 @@ fn build_server(
     // The daemon-wide state the served peers' message handlers consult
     // (dcrd `newServer` deriving `minKnownWork` from the params).
     let server = Arc::new(ServerContext {
+        target_outbound: dcroxide_node::DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u32,
         chain,
         min_known_work: params.min_known_chain_work,
         params: params.clone(),

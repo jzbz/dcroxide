@@ -81,6 +81,10 @@ pub struct ServerContext {
     /// Whether the simulation or regression test network is active;
     /// both suppress the address exchange entirely.
     pub sim_or_reg_net: bool,
+    /// The configured outbound connection target (dcrd
+    /// `server.targetOutbound`), consulted by the version handler's
+    /// mix-capable preference check.
+    pub target_outbound: u32,
     /// The sync manager tracking the header and block download state.
     pub sync_manager: Arc<Mutex<NodeSyncManager>>,
     /// The live peers' outbound queues and socket handles, keyed by
@@ -292,6 +296,30 @@ impl SyncPeers {
                     ban_score,
                 },
             );
+    }
+
+    /// Count the registered outbound peers and how many negotiated a
+    /// mix-capable protocol version (dcrd `forAllOutboundPeers` inside
+    /// `OnVersion`'s mix preference check).  The map lock is released
+    /// before any peer lock is taken, matching the snapshot methods.
+    pub(crate) fn outbound_mix_counts(&self) -> (u32, u32) {
+        let peers: Vec<Arc<Mutex<Peer>>> = {
+            let registry = self.inner.lock().expect("sync peers mutex poisoned");
+            registry.values().map(|h| Arc::clone(&h.peer)).collect()
+        };
+        let mut num_outbound = 0u32;
+        let mut num_mix_capable = 0u32;
+        for peer in peers {
+            let Ok(peer) = peer.lock() else { continue };
+            if peer.inbound() {
+                continue;
+            }
+            num_outbound = num_outbound.saturating_add(1);
+            if peer.protocol_version() >= dcroxide_wire::MIX_VERSION {
+                num_mix_capable = num_mix_capable.saturating_add(1);
+            }
+        }
+        (num_outbound, num_mix_capable)
     }
 
     /// Snapshot every registered peer as an RPC peer-info record (dcrd's
@@ -870,6 +898,47 @@ impl ServerPeerHandler {
         }
     }
 
+    /// The remote's version message arrived during the handshake
+    /// (dcrd `serverPeer.OnVersion`, fired from inside dcrd 2.2's
+    /// handshake); an error rejects the peer before the verack
+    /// exchange with dcrd's exact message.
+    pub fn on_version(
+        &mut self,
+        peer: &Peer,
+        msg: &dcroxide_wire::MsgVersion,
+    ) -> Result<(), String> {
+        let (num_outbound, num_mix_capable_outbound) = self.ctx.sync_peers.outbound_mix_counts();
+        let facts = crate::server::OnVersionFacts {
+            inbound: peer.inbound(),
+            sim_or_reg_net: self.ctx.sim_or_reg_net,
+            num_outbound,
+            num_mix_capable_outbound,
+            target_outbound: self.ctx.target_outbound,
+            remote_na: crate::server::wire_v2_to_addrmgr_net_address(peer.na())
+                .expect("the peer net address is well formed"),
+        };
+        let outcome = {
+            let mut mgr = self
+                .ctx
+                .addr_manager
+                .lock()
+                .expect("addrmgr mutex poisoned");
+            crate::server::on_version(
+                &mut mgr,
+                &facts,
+                msg.protocol_version,
+                msg.services,
+                msg.disable_relay_tx,
+            )
+        };
+        match outcome.rejected {
+            Some(rejection) => Err(crate::server::version_rejection_text(
+                &facts, msg, rejection,
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// Register the handshaken peer with the sync manager and execute
     /// the actions it decides — for a data-serving peer on a stale
     /// chain this is where the header sync begins (dcrd `AddPeer`
@@ -886,7 +955,8 @@ impl ServerPeerHandler {
         // regression test networks (dcrd `OnVersion`'s outbound
         // branch).
         if !self.ctx.sim_or_reg_net && !peer.inbound() {
-            let remote = crate::server::wire_to_addrmgr_net_address(peer.na());
+            let remote = crate::server::wire_v2_to_addrmgr_net_address(peer.na())
+                .expect("the peer net address is well formed");
             let mut mgr = self
                 .ctx
                 .addr_manager
@@ -903,6 +973,7 @@ impl ServerPeerHandler {
                 .expect("sync manager poisoned")
                 .is_current();
             if !self.ctx.disable_listen && is_current {
+                let peer_pver = peer.protocol_version();
                 let lna =
                     mgr.get_best_local_address(&remote, natf_supported(peer.protocol_version()));
                 if lna.is_routable()
@@ -910,6 +981,7 @@ impl ServerPeerHandler {
                         &mut self.addr_state,
                         peer,
                         &mut self.env,
+                        peer_pver,
                         &[lna],
                     )
                 {
@@ -1041,6 +1113,7 @@ impl ServerPeerHandler {
                 ServeSignal::Continue
             }
             Message::Addr(addr) => self.on_addr(peer, &addr.addr_list),
+            Message::AddrV2(addr) => self.on_addr_v2(peer, &addr.addr_list),
             Message::GetCFilterV2(get_cf) => {
                 self.on_get_cfilter_v2(get_cf.block_hash, outbound);
                 ServeSignal::Continue
@@ -1508,6 +1581,42 @@ impl ServerPeerHandler {
         }
     }
 
+    /// Track and forward v2 advertised addresses to the address
+    /// manager, banning a peer whose claimed address types do not
+    /// convert (dcrd `serverPeer.OnAddrV2`).
+    fn on_addr_v2(
+        &mut self,
+        peer: &mut Peer,
+        addr_list: &[dcroxide_wire::NetAddressV2],
+    ) -> ServeSignal {
+        let facts = OnAddrFacts {
+            sim_or_reg_net: self.ctx.sim_or_reg_net,
+            connected: true,
+            peer_na: crate::server::wire_v2_to_addrmgr_net_address(peer.na())
+                .expect("the peer net address is well formed"),
+        };
+        let now_nanos = self.env.now_nanos();
+        let mut mgr = self
+            .ctx
+            .addr_manager
+            .lock()
+            .expect("addrmgr mutex poisoned");
+        match crate::server::on_addr_v2(
+            &mut self.addr_state,
+            &mut mgr,
+            &facts,
+            addr_list,
+            now_nanos,
+        ) {
+            crate::server::OnAddrV2Outcome::BanInvalid => {
+                ServeSignal::Disconnect("sent invalid addrv2 message")
+            }
+            crate::server::OnAddrV2Outcome::Ignored | crate::server::OnAddrV2Outcome::Processed => {
+                ServeSignal::Continue
+            }
+        }
+    }
+
     /// Track and forward advertised addresses to the address manager,
     /// banning a peer that sends an empty list (dcrd
     /// `serverPeer.OnAddr`).
@@ -1517,7 +1626,8 @@ impl ServerPeerHandler {
             // The synchronous handler runs on the connection's own
             // input thread, so the peer is connected by construction.
             connected: true,
-            peer_na: *peer.na(),
+            peer_na: crate::server::wire_v2_to_addrmgr_net_address(peer.na())
+                .expect("the peer net address is well formed"),
         };
         let now_nanos = self.env.now_nanos();
         let mut mgr = self

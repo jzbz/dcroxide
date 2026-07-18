@@ -31,6 +31,7 @@ impl PeerEnv for FixedEnv {
         0x1234_5678_9abc_def0
     }
     fn shuffle_addrs(&mut self, _addrs: &mut [NetAddress]) {}
+    fn shuffle_addrs_v2(&mut self, _addrs: &mut [dcroxide_wire::NetAddressV2]) {}
 }
 
 fn wire_addr(ip: &str, port: u16, timestamp: u32) -> NetAddress {
@@ -52,7 +53,12 @@ fn wire_addr(ip: &str, port: u16, timestamp: u32) -> NetAddress {
 }
 
 fn new_peer() -> Peer {
-    Peer::new_inbound(dcroxide_peer::Config::default())
+    // The rows were dumped at protocol version 11; pinning the peer
+    // keeps the dispatcher on the legacy addr path they encode.
+    Peer::new_inbound(dcroxide_peer::Config {
+        protocol_version: 11,
+        ..dcroxide_peer::Config::default()
+    })
 }
 
 /// The banned map rendered like the dump's sorted host join.
@@ -207,7 +213,7 @@ fn server_address_relay_matches_dcrd() {
                     &OnAddrFacts {
                         sim_or_reg_net: false,
                         connected: true,
-                        peer_na,
+                        peer_na: wire_to_addrmgr_net_address(&peer_na),
                     },
                     &[sent_a, sent_b, future],
                     now_nanos,
@@ -234,7 +240,7 @@ fn server_address_relay_matches_dcrd() {
                     &OnAddrFacts {
                         sim_or_reg_net: true,
                         connected: true,
-                        peer_na,
+                        peer_na: wire_to_addrmgr_net_address(&peer_na),
                     },
                     &[sent_a],
                     now_nanos,
@@ -256,7 +262,7 @@ fn server_address_relay_matches_dcrd() {
                     &OnAddrFacts {
                         sim_or_reg_net: false,
                         connected: true,
-                        peer_na,
+                        peer_na: wire_to_addrmgr_net_address(&peer_na),
                     },
                     &[],
                     now_nanos,

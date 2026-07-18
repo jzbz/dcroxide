@@ -168,6 +168,10 @@ fn read_exact_by_deadline<S: Read + SocketTimeout>(
 }
 
 impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
+    fn set_protocol_version(&mut self, pver: u32) {
+        WireTransport::set_protocol_version(self, pver);
+    }
+
     fn read_message(&mut self) -> Result<Message, String> {
         // One absolute deadline covers the whole message — header and
         // payload (dcrd's single `SetReadDeadline` before

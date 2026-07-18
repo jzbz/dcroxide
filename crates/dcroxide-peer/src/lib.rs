@@ -25,8 +25,8 @@ pub use peer::{Config, NegotiateError, Peer, PeerEnv, PeerGlobals, StatsSnap};
 use dcroxide_wire::Message;
 
 /// The max protocol version the peer supports (dcrd
-/// `MaxProtocolVersion`).
-pub const MAX_PROTOCOL_VERSION: u32 = dcroxide_wire::BATCHED_CFILTERS_V2_VERSION;
+/// `MaxProtocolVersion`, the addrv2 version since dcrd 2.2).
+pub const MAX_PROTOCOL_VERSION: u32 = dcroxide_wire::ADDR_V2_VERSION;
 
 /// The maximum amount of inventory in a single inv message when
 /// trickling (dcrd `maxInvTrickleSize`).
@@ -79,6 +79,13 @@ pub trait MsgTransport {
     fn read_message(&mut self) -> Result<Message, String>;
     /// Write a message to the remote peer.
     fn write_message(&mut self, msg: &Message) -> Result<(), String>;
+    /// Adopt the negotiated protocol version for subsequent frames.
+    /// dcrd frames every read at the peer's live `ProtocolVersion`,
+    /// which the version exchange lowers before the verack phase — a
+    /// legacy peer's pre-verack messages must decode at the
+    /// negotiated version, not the local maximum.  Transports without
+    /// version-dependent framing ignore it.
+    fn set_protocol_version(&mut self, _pver: u32) {}
     /// The cumulative bytes read off the underlying connection, so the
     /// serving loops can attribute per-message deltas to the peer's
     /// receive counters (dcrd's `readMessage` returning the byte count

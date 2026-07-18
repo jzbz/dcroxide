@@ -54,6 +54,7 @@ fn serve_genesis_chain() -> (
         false,
     );
     let server = Arc::new(ServerContext {
+        target_outbound: 8,
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
         params: params.clone(),
@@ -116,14 +117,14 @@ fn serve_genesis_chain() -> (
         ..Config::default()
     };
     let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
         .expect("negotiate");
-    transport
-        .write_message(&Message::VerAck)
-        .expect("send verack");
+    // The handshake exchanged the veracks; the served peer then
+    // requests header announcements (dcrd `serverPeer.Run` queueing
+    // sendheaders right after the handshake).
     assert_eq!(
-        transport.read_message().expect("read verack"),
-        Message::VerAck
+        transport.read_message().expect("read sendheaders"),
+        Message::SendHeaders
     );
 
     (
@@ -295,22 +296,28 @@ fn exchanges_addresses_with_a_served_peer() {
     transport
         .write_message(&Message::GetAddr)
         .expect("send getaddr");
-    match transport.read_message().expect("read addr") {
-        Message::Addr(addr) => assert!(
+    match transport.read_message().expect("read addrv2") {
+        Message::AddrV2(addr) => assert!(
             !addr.addr_list.is_empty(),
             "the cache subset should contain seeded addresses"
         ),
-        other => panic!("expected addr, got {other:?}"),
+        other => panic!("expected addrv2, got {other:?}"),
     }
 
-    // An advertised address is forwarded into the manager.
+    // An advertised address is forwarded into the manager (the
+    // exchange rides addrv2 at the negotiated version).
     let advertised =
         dcroxide_node::wire_to_addrmgr_net_address(&wire_na([8, 8, 6, 6], 9108, now_nanos));
     transport
-        .write_message(&Message::Addr(dcroxide_wire::MsgAddr {
-            addr_list: vec![wire_na([8, 8, 6, 6], 9108, now_nanos)],
+        .write_message(&Message::AddrV2(dcroxide_wire::MsgAddrV2 {
+            addr_list: vec![dcroxide_wire::NetAddressV2::from_ip_port(
+                wire_na([8, 8, 6, 6], 9108, now_nanos).ip,
+                9108,
+                dcroxide_wire::ServiceFlag::NODE_NETWORK,
+                (now_nanos / 1_000_000_000) as u64,
+            )],
         }))
-        .expect("send addr");
+        .expect("send addrv2");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut known = false;
@@ -324,10 +331,26 @@ fn exchanges_addresses_with_a_served_peer() {
     }
     assert!(known, "the advertised address should be added");
 
-    // An empty addr list is a bannable offense; the server disconnects.
+    // An addrv2 whose claimed type does not match the canonical form
+    // of its bytes is a bannable offense; the server disconnects
+    // (dcrd's "sent invalid addrv2 message" ban — its example is
+    // exactly this IPv4-mapped address claiming the IPv6 type; the
+    // legacy empty-list ban applies only below the addrv2 version).
+    let mut mapped = [0u8; 16];
+    mapped[10] = 0xff;
+    mapped[11] = 0xff;
+    mapped[12..16].copy_from_slice(&[8, 8, 6, 7]);
     transport
-        .write_message(&Message::Addr(dcroxide_wire::MsgAddr { addr_list: vec![] }))
-        .expect("send empty addr");
+        .write_message(&Message::AddrV2(dcroxide_wire::MsgAddrV2 {
+            addr_list: vec![dcroxide_wire::NetAddressV2 {
+                timestamp: (now_nanos / 1_000_000_000) as u64,
+                services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+                addr_type: dcroxide_wire::NetAddressType::IPV6,
+                encoded_addr: mapped.to_vec(),
+                port: 9108,
+            }],
+        }))
+        .expect("send invalid addrv2");
     assert!(
         transport.read_message().is_err(),
         "the connection should be dropped"
@@ -522,6 +545,7 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         false,
     );
     let server = Arc::new(ServerContext {
+        target_outbound: 8,
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
         params: params.clone(),
@@ -585,11 +609,8 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         ..Config::default()
     };
     let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
         .expect("negotiate");
-    transport
-        .write_message(&Message::VerAck)
-        .expect("send verack");
 
     // The daemon initiates the header sync: among the first messages
     // after the handshake is a getheaders anchored at the genesis tip.
@@ -651,6 +672,7 @@ fn disconnects_a_stalled_header_sync_peer() {
         Duration::from_millis(300),
     );
     let server = Arc::new(ServerContext {
+        target_outbound: 8,
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
         params: params.clone(),
@@ -704,11 +726,8 @@ fn disconnects_a_stalled_header_sync_peer() {
         ..Config::default()
     };
     let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
         .expect("negotiate");
-    transport
-        .write_message(&Message::VerAck)
-        .expect("send verack");
 
     // The daemon initiates the header sync, then this peer stalls: it
     // never answers the getheaders, so the watchdog disconnects it and
@@ -830,6 +849,7 @@ fn announces_connected_blocks_to_served_peers() {
     );
     let sync_peers = dcroxide_node::dispatch::SyncPeers::new();
     let server = Arc::new(ServerContext {
+        target_outbound: 8,
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
         params: params.clone(),
@@ -915,14 +935,14 @@ fn announces_connected_blocks_to_served_peers() {
         ..Config::default()
     };
     let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
         .expect("negotiate");
-    transport
-        .write_message(&Message::VerAck)
-        .expect("send verack");
+    // The handshake exchanged the veracks; the served peer then
+    // requests header announcements (dcrd `serverPeer.Run` queueing
+    // sendheaders right after the handshake).
     assert_eq!(
-        transport.read_message().expect("read verack"),
-        Message::VerAck
+        transport.read_message().expect("read sendheaders"),
+        Message::SendHeaders
     );
 
     // A ping round trip guarantees the served peer is registered with

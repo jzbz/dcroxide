@@ -25,7 +25,7 @@ use dcroxide_wire::{CurrencyNet, ServiceFlag};
 use dcroxide_wire::Message;
 
 use crate::dispatch::{ServerContext, ServerPeerHandler};
-use crate::peerconn::{NodePeerEnv, net_address_from_socket};
+use crate::peerconn::{NodePeerEnv, net_address_v2_from_socket};
 use crate::peerloop::{OutboundQueue, ServeHooks, ServeSignal, run_peer_connection};
 use crate::server::is_whitelisted;
 
@@ -211,7 +211,7 @@ fn serve_inbound_peer(
     connected: &ConnectedPeers,
     server: Option<Arc<ServerContext>>,
 ) {
-    let na = match net_address_from_socket(addr, template.services) {
+    let na = match net_address_v2_from_socket(addr, template.services) {
         Ok(na) => na,
         // An address the manager cannot represent is dropped, matching
         // dcrd refusing to serve an unroutable peer.
@@ -240,10 +240,16 @@ pub(crate) fn serve_outbound_peer(
     permanent: bool,
     conn_req_id: Option<u64>,
 ) {
-    let na = match net_address_from_socket(addr, template.services) {
+    // The remote's services are unknown until its version message
+    // arrives, and the outbound version message is written first, so
+    // its addr_you carries zero services (dcrd's outbound
+    // `newNetAddress(remoteAddr, remoteServices)` with remoteServices
+    // still zero).
+    let na = match net_address_v2_from_socket(addr, dcroxide_wire::ServiceFlag(0)) {
         Ok(na) => na,
         Err(_) => return,
     };
+    let group_na = na.clone();
     let peer = match Peer::new_outbound(template.config(), &addr.to_string()) {
         Ok(mut peer) => {
             peer.associate(&addr.to_string(), na, NodePeerEnv::new().now_nanos());
@@ -258,7 +264,7 @@ pub(crate) fn serve_outbound_peer(
     // guard releases the count on drop, so a panic in serve_connection
     // cannot leak it.
     let _group_guard = server.as_ref().map(|ctx| {
-        let key = group_key_for(&na);
+        let key = group_key_for(&group_na);
         ctx.outbound_groups.increment(&key);
         OutboundGroupGuard {
             groups: ctx.outbound_groups.clone(),
@@ -278,9 +284,11 @@ pub(crate) fn serve_outbound_peer(
     );
 }
 
-/// The address-manager group key for a wire net address.
-fn group_key_for(na: &dcroxide_wire::NetAddress) -> String {
-    crate::server::wire_to_addrmgr_net_address(na).group_key()
+/// The address-manager group key for a wire v2 net address.
+fn group_key_for(na: &dcroxide_wire::NetAddressV2) -> String {
+    crate::server::wire_v2_to_addrmgr_net_address(na)
+        .expect("the peer net address is well formed")
+        .group_key()
 }
 
 /// Register a connected peer, run it through the connection runtime
@@ -352,6 +360,17 @@ enum InboundHooks {
 }
 
 impl ServeHooks for InboundHooks {
+    fn on_version(
+        &mut self,
+        peer: &dcroxide_peer::Peer,
+        msg: &dcroxide_wire::MsgVersion,
+    ) -> Result<(), String> {
+        match self {
+            InboundHooks::Server(handler) => handler.on_version(peer, msg),
+            InboundHooks::NoOp => Ok(()),
+        }
+    }
+
     fn on_connected(
         &mut self,
         peer: &mut Peer,

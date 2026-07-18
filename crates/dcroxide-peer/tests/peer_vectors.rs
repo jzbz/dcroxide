@@ -41,29 +41,28 @@ impl PeerEnv for FixedEnv {
     }
 
     fn shuffle_addrs(&mut self, _addrs: &mut [NetAddress]) {}
+    fn shuffle_addrs_v2(&mut self, _addrs: &mut [dcroxide_wire::NetAddressV2]) {}
 }
 
 /// A scripted transport feeding the dump's framed remote bytes and
-/// capturing everything written.
+/// capturing everything written.  Frames decode lazily at the live
+/// protocol version so the negotiated lowering applies to the
+/// pre-verack reads exactly as dcrd's per-read framing does — a
+/// legacy addr in the script only decodes once the version exchange
+/// lowered the transport below the addrv2 version.
 struct Scripted {
-    remote: Vec<Message>,
+    remote_frames: Vec<u8>,
+    pos: usize,
+    pver: u32,
     written: Vec<Message>,
 }
 
 impl Scripted {
     fn new(remote_frames: &[u8]) -> Scripted {
-        let mut remote = Vec::new();
-        let mut pos = 0usize;
-        while pos < remote_frames.len() {
-            let (msg, consumed) =
-                dcroxide_wire::read_message(&remote_frames[pos..], PROTOCOL_VERSION, NET)
-                    .expect("dump frame decodes");
-            remote.push(msg);
-            pos = pos.checked_add(consumed).expect("bounded");
-        }
-        remote.reverse();
         Scripted {
-            remote,
+            remote_frames: remote_frames.to_vec(),
+            pos: 0,
+            pver: PROTOCOL_VERSION,
             written: Vec::new(),
         }
     }
@@ -71,12 +70,23 @@ impl Scripted {
 
 impl MsgTransport for Scripted {
     fn read_message(&mut self) -> Result<Message, String> {
-        self.remote.pop().ok_or_else(|| "EOF".to_string())
+        if self.pos >= self.remote_frames.len() {
+            return Err("EOF".to_string());
+        }
+        let (msg, consumed) =
+            dcroxide_wire::read_message(&self.remote_frames[self.pos..], self.pver, NET)
+                .map_err(|e| e.kind_name().to_string())?;
+        self.pos = self.pos.checked_add(consumed).expect("bounded");
+        Ok(msg)
     }
 
     fn write_message(&mut self, msg: &Message) -> Result<(), String> {
         self.written.push(msg.clone());
         Ok(())
+    }
+
+    fn set_protocol_version(&mut self, pver: u32) {
+        self.pver = pver;
     }
 }
 
@@ -91,17 +101,12 @@ fn base_cfg() -> Config {
     }
 }
 
-fn na_10123() -> NetAddress {
+fn na_10123() -> dcroxide_wire::NetAddressV2 {
     let mut ip = [0u8; 16];
     ip[10] = 0xff;
     ip[11] = 0xff;
     ip[12..16].copy_from_slice(&[10, 1, 2, 3]);
-    NetAddress {
-        timestamp: 0,
-        services: ServiceFlag(0),
-        ip,
-        port: 19108,
-    }
+    dcroxide_wire::NetAddressV2::from_ip_port(ip, 19108, ServiceFlag(0), 0)
 }
 
 /// The peer and inbound flag for a negotiation row label, mirroring
@@ -112,15 +117,15 @@ fn peer_for(label: &str) -> (Peer, bool) {
         ip[10] = 0xff;
         ip[11] = 0xff;
         ip[12..16].copy_from_slice(&[127, 0, 0, 1]);
-        NetAddress {
-            timestamp: 0,
-            services: ServiceFlag(0),
-            ip,
-            port: 9050,
-        }
+        dcroxide_wire::NetAddressV2::from_ip_port(ip, 9050, ServiceFlag(0), 0)
     };
     match label {
-        "in-basic" | "in-nonversion" | "in-selfconn" | "in-too-old" | "in-lower-remote" => {
+        "in-basic"
+        | "in-nonversion"
+        | "in-selfconn"
+        | "in-too-old"
+        | "in-lower-remote"
+        | "in-legacy-preverack" => {
             let mut p = Peer::new_inbound(base_cfg());
             p.associate("10.1.2.3:19108", na_10123(), 0);
             (p, true)
@@ -191,6 +196,27 @@ fn make_outbound_like(p: Peer) -> Peer {
     p
 }
 
+/// The dumped push frames carry the locator protocol version dcrd's
+/// builders stamp from the wire constant (11 at the dump); refresh it
+/// to the current constant and re-frame so the rows keep pinning the
+/// dedup logic while the codec bytes stay pinned by the wire
+/// differentials.
+fn refresh_locator_frame(row_hex: &str) -> String {
+    let bytes = unhex(row_hex);
+    let (msg, _) =
+        dcroxide_wire::read_message(&bytes, PROTOCOL_VERSION - 1, NET).expect("row frame decodes");
+    let msg = match msg {
+        Message::GetBlocks(mut m) => {
+            m.0.protocol_version = PROTOCOL_VERSION;
+            Message::GetBlocks(m)
+        }
+        // dcrd's NewMsgGetHeaders leaves the locator version zero,
+        // so those frames are version-independent.
+        other => other,
+    };
+    hex(&dcroxide_wire::write_message(&msg, PROTOCOL_VERSION, NET).expect("re-frames"))
+}
+
 /// The state summary in the dump's format.
 fn state_string(p: &Peer) -> String {
     format!(
@@ -228,8 +254,15 @@ fn peer_vectors() {
     let mut env = FixedEnv;
     let mut counts: HashMap<&str, usize> = HashMap::new();
 
-    // Stateful sequences reused across rows.
-    let mut push_peer = Peer::new_inbound(base_cfg());
+    // Stateful sequences reused across rows.  The push rows were
+    // dumped from dcrd at protocol version 11 and the builders only
+    // parameterize the frame by the negotiated version, so the peer
+    // pins it (dcrd master also deleted the getblocks sender
+    // entirely; the port's follows with the netsync alignment).
+    let mut push_peer = Peer::new_inbound(Config {
+        protocol_version: 11,
+        ..base_cfg()
+    });
     let hash_a = Hash({
         let mut h = [0u8; 32];
         h[0] = 0x0a;
@@ -266,12 +299,30 @@ fn peer_vectors() {
                 let (mut peer, inbound) = peer_for(label);
                 let mut transport = Scripted::new(&unhex(parts[3]));
                 let result = if inbound {
-                    peer.negotiate_inbound_protocol(&mut transport, &mut env, &mut globals)
+                    peer.negotiate_inbound_protocol(&mut transport, &mut env, &mut globals, None)
                 } else {
-                    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals)
+                    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
                 };
                 match &result {
-                    Ok(_) => assert_eq!(parts[2], "ok", "{label}"),
+                    Ok(outcome) => {
+                        assert_eq!(parts[2], "ok", "{label}");
+                        // The legacy peer's pre-verack messages are
+                        // queued for the input handler (dcrd's
+                        // delayedHandshakeMsgs).
+                        if label == "in-legacy-preverack" {
+                            assert_eq!(outcome.delayed.len(), 2, "{label}: delayed");
+                            assert!(
+                                matches!(outcome.delayed[0], Message::Addr(_)),
+                                "{label}: first delayed"
+                            );
+                            assert!(
+                                matches!(outcome.delayed[1], Message::GetAddr),
+                                "{label}: second delayed"
+                            );
+                        } else {
+                            assert!(outcome.delayed.is_empty(), "{label}: no delayed");
+                        }
+                    }
                     Err(e) => {
                         assert_eq!(parts[2], "err", "{label}");
                         assert_eq!(e.message, utf8(parts[5]), "{label}");
@@ -311,7 +362,7 @@ fn peer_vectors() {
                         assert_eq!(parts[2], "sent", "{label}");
                         let framed = dcroxide_wire::write_message(&msg, PROTOCOL_VERSION, NET)
                             .expect("frames");
-                        assert_eq!(hex(&framed), parts[3], "{label}");
+                        assert_eq!(hex(&framed), refresh_locator_frame(parts[3]), "{label}");
                     }
                     None => assert_eq!(parts[2], "filtered", "{label}"),
                 }
@@ -344,7 +395,9 @@ fn peer_vectors() {
                         ];
                         let (msg, sent) = push_peer.push_addr_msg(&mut env, &addrs).expect("sends");
                         assert_eq!(sent.len().to_string(), parts[2], "{label}");
-                        let framed = dcroxide_wire::write_message(&msg, PROTOCOL_VERSION, NET)
+                        // A legacy addr only frames below the addrv2
+                        // version, exactly where dcrd still sends it.
+                        let framed = dcroxide_wire::write_message(&msg, PROTOCOL_VERSION - 1, NET)
                             .expect("frames");
                         assert_eq!(hex(&framed), parts[3], "{label}");
                     }
@@ -437,12 +490,12 @@ fn peer_vectors() {
                     "resolved" => {
                         let mut cfg = base_cfg();
                         cfg.host_to_net_address = Some(Box::new(|_, port, services| {
-                            Ok(NetAddress {
-                                timestamp: 0,
-                                services,
-                                ip: v4(&[9, 9, 9, 9]),
+                            Ok(dcroxide_wire::NetAddressV2::from_ip_port(
+                                v4(&[9, 9, 9, 9]),
                                 port,
-                            })
+                                services,
+                                0,
+                            ))
                         }));
                         cfg
                     }
@@ -458,7 +511,19 @@ fn peer_vectors() {
                 match Peer::new_outbound(cfg, addr) {
                     Ok(p) => {
                         assert_eq!(parts[2], "ok", "{line}");
-                        assert_eq!(hex(&p.na().ip), parts[3], "{line}");
+                        // The dump rows carry the v1 16-byte mapped ip;
+                        // rebuild it from the v2 encoded bytes.
+                        let mut mapped = [0u8; 16];
+                        match p.na().encoded_addr.len() {
+                            4 => {
+                                mapped[10] = 0xff;
+                                mapped[11] = 0xff;
+                                mapped[12..16].copy_from_slice(&p.na().encoded_addr);
+                            }
+                            16 => mapped.copy_from_slice(&p.na().encoded_addr),
+                            _ => {}
+                        }
+                        assert_eq!(hex(&mapped), parts[3], "{line}");
                         assert_eq!(p.na().port.to_string(), parts[4], "{line}");
                     }
                     Err(e) => {
@@ -472,7 +537,7 @@ fn peer_vectors() {
     }
 
     let expected: &[(&str, usize)] = &[
-        ("neg", 13),
+        ("neg", 14),
         ("push", 7),
         ("pushaddr", 2),
         ("ping", 1),

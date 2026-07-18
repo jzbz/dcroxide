@@ -5,7 +5,7 @@ use dcroxide_chainhash::Hash;
 use dcroxide_containers::lru;
 use dcroxide_wire::{
     CurrencyNet, InvVect, Message, MsgAddr, MsgGetBlocks, MsgGetHeaders, MsgPing, MsgPong,
-    MsgVersion, NetAddress, ServiceFlag,
+    MsgVersion, NetAddress, NetAddressV2, ServiceFlag,
 };
 
 use crate::{MAX_KNOWN_INVENTORY, MAX_KNOWN_INVENTORY_TTL, MAX_PROTOCOL_VERSION, MsgTransport};
@@ -30,6 +30,9 @@ pub trait PeerEnv {
     /// Shuffle addresses for an over-full addr message (dcrd
     /// `rand.ShuffleSlice`).
     fn shuffle_addrs(&mut self, addrs: &mut [NetAddress]);
+    /// Shuffle v2 addresses for an over-full addrv2 message (dcrd
+    /// `rand.ShuffleSlice`).
+    fn shuffle_addrs_v2(&mut self, addrs: &mut [NetAddressV2]);
 }
 
 /// State dcrd keeps in package globals, owned by the daemon and
@@ -75,7 +78,7 @@ impl Default for PeerGlobals {
 // daemon's per-peer threads (the peer itself is guarded by a mutex, so
 // `Sync` is not required).
 type HostToNetAddressFn =
-    Box<dyn FnMut(&str, u16, ServiceFlag) -> Result<NetAddress, String> + Send>;
+    Box<dyn FnMut(&str, u16, ServiceFlag) -> Result<NetAddressV2, String> + Send>;
 type NewestBlockFn = Box<dyn FnMut() -> Result<(Hash, i64), String> + Send>;
 
 /// The peer configuration (dcrd `Config`).  The message listener
@@ -177,17 +180,79 @@ pub struct StatsSnap {
 pub struct NegotiateError {
     /// The error text, matching dcrd's.
     pub message: String,
+    /// The typed kind for errors dcrd 2.2's `peer/error.go` names;
+    /// `None` for transport-level failures dcrd surfaces untyped.
+    pub kind: Option<NegotiateErrorKind>,
     /// The remote version message, when one was read.
     pub remote_version: Option<Box<MsgVersion>>,
+}
+
+/// The typed handshake error kinds (dcrd 2.2 `peer/error.go`); each
+/// [`kind_name`](NegotiateErrorKind::kind_name) matches dcrd's
+/// `ErrorKind` string exactly.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum NegotiateErrorKind {
+    /// The first message was not a version message.
+    NotVersionMessage,
+    /// The connection is to ourselves.
+    SelfConnection,
+    /// The peer's protocol version is too old.
+    ProtocolVerTooOld,
+    /// The message following the version message was not a verack.
+    NotVerAckMessage,
+    /// The handshake did not complete in time.  The daemon's
+    /// negotiate read budget currently surfaces this as a transport
+    /// read error; the kind is reserved for dcrd's typed
+    /// `errHandshakeTimeout` mapping.
+    HandshakeTimeout,
+}
+
+impl NegotiateErrorKind {
+    /// dcrd's name for this error kind.
+    pub fn kind_name(self) -> &'static str {
+        match self {
+            NegotiateErrorKind::NotVersionMessage => "ErrNotVersionMessage",
+            NegotiateErrorKind::SelfConnection => "ErrSelfConnection",
+            NegotiateErrorKind::ProtocolVerTooOld => "ErrProtocolVerTooOld",
+            NegotiateErrorKind::NotVerAckMessage => "ErrNotVerAckMessage",
+            NegotiateErrorKind::HandshakeTimeout => "ErrHandshakeTimeout",
+        }
+    }
 }
 
 impl NegotiateError {
     fn new(message: &str) -> NegotiateError {
         NegotiateError {
             message: message.to_string(),
+            kind: None,
             remote_version: None,
         }
     }
+
+    /// A typed error (dcrd `makeError`).
+    fn typed(kind: NegotiateErrorKind, message: &str) -> NegotiateError {
+        NegotiateError {
+            message: message.to_string(),
+            kind: Some(kind),
+            remote_version: None,
+        }
+    }
+}
+
+/// The version callback the handshake fires (dcrd
+/// `OnVersionCallback`); an error aborts the handshake.  The peer is
+/// passed alongside the message so the daemon can read the state the
+/// version read just negotiated, matching dcrd's `sp` receiver.
+pub type OnVersionFn<'p> = dyn FnMut(&Peer, &MsgVersion) -> Result<(), String> + 'p;
+
+/// A completed handshake (dcrd's post-`Handshake` state): the remote
+/// version and any messages a legacy peer sent before its verack,
+/// which the input handler must replay first.
+pub struct HandshakeOutcome {
+    /// The remote peer's version message.
+    pub remote_version: Box<MsgVersion>,
+    /// Messages read while waiting for a legacy verack.
+    pub delayed: Vec<Message>,
 }
 
 /// The synchronous peer core (dcrd `Peer` minus its handler
@@ -196,7 +261,7 @@ pub struct Peer {
     cfg: Config,
     inbound: bool,
     addr: String,
-    na: NetAddress,
+    na: NetAddressV2,
 
     id: i32,
     services: ServiceFlag,
@@ -262,19 +327,22 @@ impl Peer {
             cfg.idle_timeout_nanos = crate::DEFAULT_IDLE_TIMEOUT;
         }
 
-        let services = cfg.services;
         Peer {
             cfg,
             inbound,
             addr: String::new(),
-            na: NetAddress {
+            na: NetAddressV2 {
                 timestamp: 0,
                 services: ServiceFlag(0),
-                ip: [0u8; 16],
+                addr_type: dcroxide_wire::NetAddressType::UNKNOWN,
+                encoded_addr: Vec::new(),
                 port: 0,
             },
             id: 0,
-            services,
+            // The remote's services are unknown until its version
+            // message arrives (dcrd 2.2 `remoteServices`; pre-2.2
+            // seeded the local services here).
+            services: ServiceFlag(0),
             user_agent: String::new(),
             version_known: false,
             advertised_proto_ver: 0,
@@ -342,12 +410,7 @@ impl Peer {
                     std::net::IpAddr::V6(v6) => v6.octets(),
                 })
                 .unwrap_or([0u8; 16]);
-            p.na = NetAddress {
-                timestamp: 0,
-                services: ServiceFlag(0),
-                ip,
-                port,
-            };
+            p.na = NetAddressV2::from_ip_port(ip, port, ServiceFlag(0), 0);
         }
 
         Ok(p)
@@ -355,7 +418,7 @@ impl Peer {
 
     /// Set the peer's address and network address when a connection
     /// is associated (the sync half of dcrd `AssociateConnection`).
-    pub fn associate(&mut self, addr: &str, na: NetAddress, now_nanos: i64) {
+    pub fn associate(&mut self, addr: &str, na: NetAddressV2, now_nanos: i64) {
         self.addr = addr.to_string();
         self.na = na;
         self.time_connected_nanos = now_nanos;
@@ -374,7 +437,7 @@ impl Peer {
     }
 
     /// The peer network address (dcrd `NA`).
-    pub fn na(&self) -> &NetAddress {
+    pub fn na(&self) -> &NetAddressV2 {
         &self.na
     }
 
@@ -517,6 +580,36 @@ impl Peer {
 
     // -- Push builders --
 
+    /// Send an addrv2 message with the provided addresses, shuffling
+    /// and truncating past the per-message maximum and returning the
+    /// message plus the list actually sent (dcrd `PushAddrV2Msg`).
+    pub fn push_addr_v2_msg<E: PeerEnv>(
+        &mut self,
+        env: &mut E,
+        addresses: &[NetAddressV2],
+    ) -> Option<(Message, Vec<NetAddressV2>)> {
+        // Nothing to send.
+        if addresses.is_empty() {
+            return None;
+        }
+
+        let mut addr_list: Vec<NetAddressV2> = addresses.to_vec();
+
+        // Randomize the addresses sent if there are more than the
+        // maximum allowed.
+        if addr_list.len() > dcroxide_wire::MAX_ADDR_PER_V2_MSG as usize {
+            env.shuffle_addrs_v2(&mut addr_list);
+            addr_list.truncate(dcroxide_wire::MAX_ADDR_PER_V2_MSG as usize);
+        }
+
+        Some((
+            Message::AddrV2(dcroxide_wire::MsgAddrV2 {
+                addr_list: addr_list.clone(),
+            }),
+            addr_list,
+        ))
+    }
+
     /// Build an addr message for the provided addresses, limiting and
     /// randomizing them when there are too many (dcrd `PushAddrMsg`).
     /// Returns the message to queue and the addresses actually sent.
@@ -651,6 +744,7 @@ impl Peer {
         transport: &mut T,
         env: &mut E,
         globals: &mut PeerGlobals,
+        on_version: Option<&mut OnVersionFn<'_>>,
     ) -> Result<MsgVersion, NegotiateError> {
         // Read their version message.
         let remote_msg = transport
@@ -662,7 +756,8 @@ impl Peer {
         let msg = match remote_msg {
             Message::Version(msg) => msg,
             _ => {
-                return Err(NegotiateError::new(
+                return Err(NegotiateError::typed(
+                    NegotiateErrorKind::NotVersionMessage,
                     "a version message must precede all others",
                 ));
             }
@@ -670,13 +765,19 @@ impl Peer {
 
         // Detect self connections.
         if !globals.allow_self_conns && globals.sent_nonces.contains(&msg.nonce) {
-            return Err(NegotiateError::new("disconnecting peer connected to self"));
+            return Err(NegotiateError::typed(
+                NegotiateErrorKind::SelfConnection,
+                "disconnecting peer connected to self",
+            ));
         }
 
         // Negotiate the protocol version and set the services to what
-        // the remote peer advertised.
+        // the remote peer advertised.  Subsequent handshake reads
+        // frame at the negotiated version (dcrd's `readMessage` uses
+        // the live `ProtocolVersion` on every read).
         self.advertised_proto_ver = msg.protocol_version as u32;
         self.protocol_version = min_u32(self.protocol_version, self.advertised_proto_ver);
+        transport.set_protocol_version(self.protocol_version);
         self.version_known = true;
         self.services = msg.services;
         self.na.services = msg.services;
@@ -694,12 +795,22 @@ impl Peer {
         self.id = globals.next_id();
         self.user_agent = msg.user_agent.clone();
 
+        // Fire the daemon's version listener exactly where dcrd's
+        // onVersion callback runs: after the state updates, before
+        // the too-old rejection; an error aborts the handshake.
+        if let Some(on_version) = on_version
+            && let Err(e) = on_version(self, &msg)
+        {
+            return Err(NegotiateError::new(&e));
+        }
+
         // Disconnect clients that have a protocol version that is too
         // old.
         let req_protocol_version = dcroxide_wire::REMOVE_REJECT_VERSION as i32;
         if msg.protocol_version < req_protocol_version {
             return Err(NegotiateError {
                 message: format!("protocol version must be {req_protocol_version} or greater"),
+                kind: Some(NegotiateErrorKind::ProtocolVerTooOld),
                 remote_version: Some(Box::new(msg)),
             });
         }
@@ -720,7 +831,28 @@ impl Peer {
             block_num = num;
         }
 
-        let mut their_na = self.na;
+        // Convert the peer's v2 address to the legacy form the version
+        // message carries (dcrd building `theirNA` from the v2
+        // `EncodedAddr`): Go's `To16` yields the mapped form for a
+        // 4-byte address, the bytes unchanged for 16, and nil — all
+        // zero bytes on the wire — for any other length, notably a
+        // 32-byte Tor v3 key.
+        let mut their_ip = [0u8; 16];
+        match self.na.encoded_addr.len() {
+            4 => {
+                their_ip[10] = 0xff;
+                their_ip[11] = 0xff;
+                their_ip[12..16].copy_from_slice(&self.na.encoded_addr);
+            }
+            16 => their_ip.copy_from_slice(&self.na.encoded_addr),
+            _ => {}
+        }
+        let mut their_na = NetAddress {
+            timestamp: 0,
+            services: self.na.services,
+            ip: their_ip,
+            port: self.na.port,
+        };
 
         // If we are behind a proxy and the connection comes from the
         // proxy then we return an unroutable address as their address.
@@ -731,7 +863,7 @@ impl Peer {
                 // An invalid proxy means poorly configured; be on the
                 // safe side.
                 Err(_) => true,
-                Ok((proxy_address, _)) => ip_string(&self.na.ip) == proxy_address,
+                Ok((proxy_address, _)) => ip_string(&their_na.ip) == proxy_address,
             };
             if hide {
                 their_na = NetAddress {
@@ -816,32 +948,122 @@ impl Peer {
             .map_err(|e| NegotiateError::new(&e))
     }
 
-    /// Wait to receive a version message from the peer then send ours
-    /// (dcrd `negotiateInboundProtocol`).  Returns the remote version
-    /// message for the daemon's version listener.
+    /// Read the remote verack strictly (dcrd `readRemoteVerAckMsg`,
+    /// used at protocol versions with addrv2 support): any other
+    /// message disconnects.
+    fn read_remote_verack_msg<T: MsgTransport>(
+        &mut self,
+        transport: &mut T,
+    ) -> Result<(), NegotiateError> {
+        let remote_msg = transport
+            .read_message()
+            .map_err(|e| NegotiateError::new(&e))?;
+        match remote_msg {
+            Message::VerAck => {
+                self.verack_received = true;
+                Ok(())
+            }
+            _ => Err(NegotiateError::typed(
+                NegotiateErrorKind::NotVerAckMessage,
+                "the verack message must follow the version message and precede all others",
+            )),
+        }
+    }
+
+    /// Read the remote verack tolerantly (dcrd
+    /// `readRemoteVerAckMsgLegacy`, used below the addrv2 protocol
+    /// version): up to three non-verack messages are queued for the
+    /// input handler to replay after the handshake.
+    fn read_remote_verack_msg_legacy<T: MsgTransport>(
+        &mut self,
+        transport: &mut T,
+        delayed: &mut Vec<Message>,
+    ) -> Result<(), NegotiateError> {
+        const MAX_NON_VER_ACKS: usize = 3;
+        for _ in 0..MAX_NON_VER_ACKS {
+            let msg = transport
+                .read_message()
+                .map_err(|e| NegotiateError::new(&e))?;
+            match msg {
+                Message::VerAck => {
+                    self.verack_received = true;
+                    return Ok(());
+                }
+                other => delayed.push(other),
+            }
+        }
+        Err(NegotiateError::typed(
+            NegotiateErrorKind::NotVerAckMessage,
+            &format!(
+                "the verack message must follow the version message within {MAX_NON_VER_ACKS} messages"
+            ),
+        ))
+    }
+
+    /// Read the remote verack with the strictness the negotiated
+    /// protocol version selects (dcrd's `readRemoteVerAckMsgFn`
+    /// dispatch in the handshake).
+    fn read_remote_verack<T: MsgTransport>(
+        &mut self,
+        transport: &mut T,
+        delayed: &mut Vec<Message>,
+    ) -> Result<(), NegotiateError> {
+        if self.protocol_version() < dcroxide_wire::ADDR_V2_VERSION {
+            self.read_remote_verack_msg_legacy(transport, delayed)
+        } else {
+            self.read_remote_verack_msg(transport)
+        }
+    }
+
+    /// Wait to receive a version message from the peer, send ours,
+    /// then exchange veracks (dcrd `inboundHandshake`).  The version
+    /// callback runs inside the version read exactly where dcrd's
+    /// `onVersion` does — after the peer state updates, before the
+    /// too-old rejection — and its error aborts the handshake.
+    /// Returns the remote version plus any messages a legacy peer
+    /// sent before its verack for the input handler to replay.
     pub fn negotiate_inbound_protocol<T: MsgTransport, E: PeerEnv>(
         &mut self,
         transport: &mut T,
         env: &mut E,
         globals: &mut PeerGlobals,
-    ) -> Result<MsgVersion, NegotiateError> {
-        let remote = self.read_remote_version_msg(transport, env, globals)?;
+        on_version: Option<&mut OnVersionFn<'_>>,
+    ) -> Result<HandshakeOutcome, NegotiateError> {
+        let remote = self.read_remote_version_msg(transport, env, globals, on_version)?;
         self.write_local_version_msg(transport, env, globals)?;
+        transport
+            .write_message(&Message::VerAck)
+            .map_err(|e| NegotiateError::new(&e))?;
+        let mut delayed = Vec::new();
+        self.read_remote_verack(transport, &mut delayed)?;
         self.handshake_done = true;
-        Ok(remote)
+        Ok(HandshakeOutcome {
+            remote_version: Box::new(remote),
+            delayed,
+        })
     }
 
-    /// Send our version message then wait to receive one from the
-    /// peer (dcrd `negotiateOutboundProtocol`).
+    /// Send our version message, wait to receive one from the peer,
+    /// then exchange veracks (dcrd `outboundHandshake`); the verack
+    /// read precedes our verack write on the outbound side.
     pub fn negotiate_outbound_protocol<T: MsgTransport, E: PeerEnv>(
         &mut self,
         transport: &mut T,
         env: &mut E,
         globals: &mut PeerGlobals,
-    ) -> Result<MsgVersion, NegotiateError> {
+        on_version: Option<&mut OnVersionFn<'_>>,
+    ) -> Result<HandshakeOutcome, NegotiateError> {
         self.write_local_version_msg(transport, env, globals)?;
-        let remote = self.read_remote_version_msg(transport, env, globals)?;
+        let remote = self.read_remote_version_msg(transport, env, globals, on_version)?;
+        let mut delayed = Vec::new();
+        self.read_remote_verack(transport, &mut delayed)?;
+        transport
+            .write_message(&Message::VerAck)
+            .map_err(|e| NegotiateError::new(&e))?;
         self.handshake_done = true;
-        Ok(remote)
+        Ok(HandshakeOutcome {
+            remote_version: Box::new(remote),
+            delayed,
+        })
     }
 }

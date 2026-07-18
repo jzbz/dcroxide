@@ -21,6 +21,14 @@ use dcroxide_wire::{
     REMOVE_REJECT_VERSION, ServiceFlag, TxIn, TxOut, TxSerializeType, read_message, write_message,
 };
 
+/// The protocol version the differential drives: the oracle is the
+/// dcrd binary pinned at release-v2.1.5, whose maximum is 11, so the
+/// battery frames below the port's addrv2-era PROTOCOL_VERSION (the
+/// legacy `addr` in the battery no longer encodes at 12, exactly like
+/// dcrd master).  The 2.2 oracle re-pin lifts this back to
+/// PROTOCOL_VERSION.
+const ORACLE_PVER: u32 = PROTOCOL_VERSION - 1;
+
 fn random_hash(rng: &mut SplitMix64) -> Hash {
     let mut b = [0u8; 32];
     rng.fill(&mut b);
@@ -157,7 +165,7 @@ fn rand_mix_vect(rng: &mut SplitMix64, len: u64) -> MixVect {
 /// One random instance of each mixing message (all valid at MIX_VERSION,
 /// which PROTOCOL_VERSION exceeds).
 fn mix_messages(rng: &mut SplitMix64) -> Vec<(Message, u32)> {
-    let pver = PROTOCOL_VERSION;
+    let pver = ORACLE_PVER;
     let mcount = 1 + rng.below(3);
     let kpcount = 1 + rng.below(3);
     vec![
@@ -297,7 +305,7 @@ fn mix_messages(rng: &mut SplitMix64) -> Vec<(Message, u32)> {
 /// Build one random instance of each message type valid at
 /// [`PROTOCOL_VERSION`], plus a reject at a pre-removal version.
 fn structured_messages(rng: &mut SplitMix64) -> Vec<(Message, u32)> {
-    let pver = PROTOCOL_VERSION;
+    let pver = ORACLE_PVER;
     let mut msgs = vec![
         (
             Message::Version(MsgVersion {

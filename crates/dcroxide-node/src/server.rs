@@ -278,6 +278,49 @@ pub fn resolve_local_address(
     }
 }
 
+/// Convert a wire v2 network address type to an address manager type
+/// (dcrd `wireToAddrmgrNetAddressType`).
+pub fn wire_v2_to_addrmgr_net_address_type(
+    addr_type: dcroxide_wire::NetAddressType,
+) -> dcroxide_addrmgr::NetAddressType {
+    match addr_type {
+        dcroxide_wire::NetAddressType::IPV4 => dcroxide_addrmgr::NetAddressType::IPv4,
+        dcroxide_wire::NetAddressType::IPV6 => dcroxide_addrmgr::NetAddressType::IPv6,
+        dcroxide_wire::NetAddressType::TOR_V3 => dcroxide_addrmgr::NetAddressType::TorV3,
+        _ => dcroxide_addrmgr::NetAddressType::Unknown,
+    }
+}
+
+/// Convert an address manager network address type to a wire v2 type
+/// (dcrd `addrmgrToWireNetAddressType`).
+pub fn addrmgr_to_wire_v2_net_address_type(
+    addr_type: dcroxide_addrmgr::NetAddressType,
+) -> dcroxide_wire::NetAddressType {
+    match addr_type {
+        dcroxide_addrmgr::NetAddressType::IPv4 => dcroxide_wire::NetAddressType::IPV4,
+        dcroxide_addrmgr::NetAddressType::IPv6 => dcroxide_wire::NetAddressType::IPV6,
+        dcroxide_addrmgr::NetAddressType::TorV3 => dcroxide_wire::NetAddressType::TOR_V3,
+        _ => dcroxide_wire::NetAddressType::UNKNOWN,
+    }
+}
+
+/// Convert a wire v2 network address to an address manager net
+/// address (one element of dcrd `wireToAddrmgrNetAddressesV2`); fails
+/// when the encoded bytes do not fit the claimed type.
+pub fn wire_v2_to_addrmgr_net_address(
+    net_addr: &dcroxide_wire::NetAddressV2,
+) -> Result<NetAddress, String> {
+    let addr_type = wire_v2_to_addrmgr_net_address_type(net_addr.addr_type);
+    dcroxide_addrmgr::new_net_address_from_params(
+        addr_type,
+        &net_addr.encoded_addr,
+        net_addr.port,
+        (net_addr.timestamp as i64).saturating_mul(1_000_000_000),
+        net_addr.services,
+    )
+    .map_err(|e| e.description)
+}
+
 /// Convert a wire net address to an address manager net address
 /// (dcrd `wireToAddrmgrNetAddress`).
 pub fn wire_to_addrmgr_net_address(net_addr: &dcroxide_wire::NetAddress) -> NetAddress {
@@ -291,6 +334,30 @@ pub fn wire_to_addrmgr_net_address(net_addr: &dcroxide_wire::NetAddress) -> NetA
 /// `wireToAddrmgrNetAddresses`).
 pub fn wire_to_addrmgr_net_addresses(net_addrs: &[dcroxide_wire::NetAddress]) -> Vec<NetAddress> {
     net_addrs.iter().map(wire_to_addrmgr_net_address).collect()
+}
+
+/// Convert an address manager net address to a wire v2 net address
+/// (dcrd `addrmgrToWireNetAddressV2`).
+pub fn addrmgr_to_wire_net_address_v2(net_addr: &NetAddress) -> dcroxide_wire::NetAddressV2 {
+    dcroxide_wire::NetAddressV2::new(
+        addrmgr_to_wire_v2_net_address_type(net_addr.addr_type),
+        net_addr.ip.clone(),
+        net_addr.port,
+        net_addr.timestamp.div_euclid(1_000_000_000) as u64,
+        net_addr.services,
+    )
+}
+
+/// Convert a collection of wire v2 net addresses, failing when any
+/// address cannot form a valid manager address (dcrd
+/// `wireToAddrmgrNetAddressesV2`).
+pub fn wire_v2_to_addrmgr_net_addresses(
+    net_addrs: &[dcroxide_wire::NetAddressV2],
+) -> Result<Vec<NetAddress>, String> {
+    net_addrs
+        .iter()
+        .map(wire_v2_to_addrmgr_net_address)
+        .collect()
 }
 
 /// Convert an address manager net address to a wire net address
@@ -324,11 +391,22 @@ pub fn is_supported_net_addr_type_v1(addr_type: NetAddressType) -> bool {
     addr_type == NetAddressType::IPv4 || addr_type == NetAddressType::IPv6
 }
 
+/// Whether the address manager address type is supported by the v2
+/// address message (dcrd `isSupportedNetAddressTypeV2`).
+pub fn is_supported_net_address_type_v2(addr_type: NetAddressType) -> bool {
+    addr_type == NetAddressType::IPv4
+        || addr_type == NetAddressType::IPv6
+        || addr_type == NetAddressType::TorV3
+}
+
 /// The address type filter for the protocol version (dcrd
-/// `natfSupported`); every version at the parity tag uses the v1
-/// filter.
-pub fn natf_supported(_pver: u32) -> fn(NetAddressType) -> bool {
-    is_supported_net_addr_type_v1
+/// `natfSupported`): the v1 types below the addrv2 version and the
+/// v2 types from it on.
+pub fn natf_supported(pver: u32) -> fn(NetAddressType) -> bool {
+    if pver < dcroxide_wire::ADDR_V2_VERSION {
+        return is_supported_net_addr_type_v1;
+    }
+    is_supported_net_address_type_v2
 }
 
 /// The maximum number of known addresses to track per peer (dcrd
@@ -405,10 +483,10 @@ pub enum PushAddrOutcome {
     Nothing,
 }
 
-/// Push the provided addresses to the peer, filtering the ones it
-/// already knows and tracking the ones actually sent (dcrd
-/// `serverPeer.pushAddrMsg`).
-pub fn push_addr_msg<E: dcroxide_peer::PeerEnv>(
+/// Push the provided addresses to the peer as a legacy addr message,
+/// filtering the ones it already knows and tracking the ones actually
+/// sent (dcrd `serverPeer.pushAddrV1Msg`).
+pub fn push_addr_v1_msg<E: dcroxide_peer::PeerEnv>(
     state: &mut ServerPeerAddrState,
     peer: &mut dcroxide_peer::Peer,
     env: &mut E,
@@ -428,6 +506,50 @@ pub fn push_addr_msg<E: dcroxide_peer::PeerEnv>(
         }
         None => PushAddrOutcome::Nothing,
     }
+}
+
+/// Push the provided addresses to the peer as an addrv2 message,
+/// filtering the ones it already knows and tracking the ones actually
+/// sent (dcrd `serverPeer.pushAddrV2Msg`).
+pub fn push_addr_v2_msg<E: dcroxide_peer::PeerEnv>(
+    state: &mut ServerPeerAddrState,
+    peer: &mut dcroxide_peer::Peer,
+    env: &mut E,
+    addresses: &[NetAddress],
+) -> PushAddrOutcome {
+    // Filter addresses already known to the peer.
+    let addrs: Vec<dcroxide_wire::NetAddressV2> = addresses
+        .iter()
+        .filter(|addr| !state.address_known(addr))
+        .map(addrmgr_to_wire_net_address_v2)
+        .collect();
+    match peer.push_addr_v2_msg(env, &addrs) {
+        Some((msg, known)) => {
+            // A conversion failure only skips the known-address
+            // bookkeeping; the message is already queued (dcrd logs
+            // the error and returns after `PushAddrV2Msg` sent).
+            if let Ok(known_net_addrs) = wire_v2_to_addrmgr_net_addresses(&known) {
+                state.add_known_addresses(&known_net_addrs);
+            }
+            PushAddrOutcome::Queued(Box::new(msg))
+        }
+        None => PushAddrOutcome::Nothing,
+    }
+}
+
+/// Send the address message form the negotiated protocol version
+/// calls for (dcrd `serverPeer.pushAddrMsg`).
+pub fn push_addr_msg<E: dcroxide_peer::PeerEnv>(
+    state: &mut ServerPeerAddrState,
+    peer: &mut dcroxide_peer::Peer,
+    env: &mut E,
+    pver: u32,
+    addresses: &[NetAddress],
+) -> PushAddrOutcome {
+    if pver >= dcroxide_wire::ADDR_V2_VERSION {
+        return push_addr_v2_msg(state, peer, env, addresses);
+    }
+    push_addr_v1_msg(state, peer, env, addresses)
 }
 
 /// Increase the peer's ban score, returning whether the peer is now
@@ -561,7 +683,8 @@ pub fn on_get_addr<E: dcroxide_peer::PeerEnv>(
     state.addrs_sent = true;
 
     // Push the addresses.
-    Some(push_addr_msg(state, peer, env, addr_cache))
+    let pver = peer.protocol_version();
+    Some(push_addr_msg(state, peer, env, pver, addr_cache))
 }
 
 /// The peer facts the addr handler consumes.
@@ -573,7 +696,7 @@ pub struct OnAddrFacts {
     /// synchronous port samples it once).
     pub connected: bool,
     /// The peer's network address (dcrd `sp.NA()`).
-    pub peer_na: dcroxide_wire::NetAddress,
+    pub peer_na: NetAddress,
 }
 
 /// The observable outcome of handling an addr message (dcrd
@@ -631,8 +754,7 @@ pub fn on_addr(
 
     // Add addresses to the server address manager, which handles
     // duplicate prevention, limits, and last seen updates.
-    let remote_addr = wire_to_addrmgr_net_address(&facts.peer_na);
-    addr_mgr.add_addresses(&addr_list, &remote_addr);
+    addr_mgr.add_addresses(&addr_list, &facts.peer_na);
     OnAddrOutcome::Processed
 }
 
@@ -809,6 +931,9 @@ const DEFAULT_WANT_MIX_CAPABLE_OUTBOUND: u32 = 3;
 pub enum VersionRejection {
     /// The protocol version predates the required minimum.
     OldProtocol,
+    /// An outbound peer was rejected in favor of a mix-capable one
+    /// (dcrd 2.2; pre-2.2 this disconnected without rejecting).
+    MixCapableWanted,
     /// An outbound peer does not provide the required services.
     MissingServices,
 }
@@ -819,18 +944,14 @@ pub struct OnVersionFacts {
     pub inbound: bool,
     /// Whether the simulation or regression test network is active.
     pub sim_or_reg_net: bool,
-    /// Whether listening is disabled.
-    pub disable_listen: bool,
-    /// Whether the sync manager believes the chain is current.
-    pub sync_is_current: bool,
     /// The current outbound peer count (dcrd walks the peer state).
     pub num_outbound: u32,
     /// The mix-capable outbound peer count.
     pub num_mix_capable_outbound: u32,
     /// The configured outbound connection target.
     pub target_outbound: u32,
-    /// The peer's network address (dcrd `sp.NA()`).
-    pub remote_na: dcroxide_wire::NetAddress,
+    /// The peer's network address (dcrd `sp.remoteAddr`).
+    pub remote_na: NetAddress,
 }
 
 /// The observable outcome of handling a version message (dcrd
@@ -844,25 +965,15 @@ pub struct OnVersionOutcome {
     /// An early rejection; the peer disconnects and nothing below
     /// applies.
     pub rejected: Option<VersionRejection>,
-    /// The peer was disconnected to maintain mix-capable outbound
-    /// peers; dcrd deliberately continues processing afterwards.
-    pub mix_disconnect: bool,
-    /// The local address advertisement pushed to the peer, if any.
-    pub pushed_local: Option<PushAddrOutcome>,
-    /// Whether a getaddr request was queued for more addresses.
-    pub requested_more_addrs: bool,
-    /// Whether the peer's address was marked good.
-    pub marked_good: bool,
     /// Whether the peer disabled transaction relay.
     pub disable_relay_tx: bool,
 }
 
-/// Handle a version message (dcrd `serverPeer.OnVersion`).
-#[allow(clippy::too_many_arguments)] // Mirrors dcrd's surface.
-pub fn on_version<E: dcroxide_peer::PeerEnv>(
-    state: &mut ServerPeerAddrState,
-    peer: &mut dcroxide_peer::Peer,
-    env: &mut E,
+/// Handle a version message (dcrd `serverPeer.OnVersion`, the
+/// callback dcrd 2.2 fires from inside the handshake; the address
+/// advertisement that used to follow moved to the post-handshake
+/// add-peer admission).
+pub fn on_version(
     addr_mgr: &mut AddrManager,
     facts: &OnVersionFacts,
     msg_protocol_version: i32,
@@ -872,10 +983,6 @@ pub fn on_version<E: dcroxide_peer::PeerEnv>(
     let mut outcome = OnVersionOutcome {
         set_services: false,
         rejected: None,
-        mix_disconnect: false,
-        pushed_local: None,
-        requested_more_addrs: false,
-        marked_good: false,
         disable_relay_tx: false,
     };
 
@@ -883,10 +990,9 @@ pub fn on_version<E: dcroxide_peer::PeerEnv>(
     // outbound connections; skipped for inbound connections and on
     // the simulation and regression test networks.  This happens
     // before rejecting peers that are too old.
-    let remote_addr = wire_to_addrmgr_net_address(&facts.remote_na);
     if !facts.sim_or_reg_net && !facts.inbound {
         // A lookup failure is logged and ignored.
-        let _ = addr_mgr.set_services(&remote_addr, msg_services);
+        let _ = addr_mgr.set_services(&facts.remote_na, msg_services);
         outcome.set_services = true;
     }
 
@@ -897,8 +1003,8 @@ pub fn on_version<E: dcroxide_peer::PeerEnv>(
     }
 
     // Maintain a minimum desired number of outbound peers capable
-    // of supporting p2p mixing.  Note that dcrd disconnects here
-    // without returning, so processing deliberately continues.
+    // of supporting p2p mixing.  dcrd 2.2 rejects here (aborting the
+    // handshake); pre-2.2 it disconnected without returning.
     if !facts.inbound && msg_protocol_version < dcroxide_wire::MIX_VERSION as i32 {
         let mut want_mix_capable = DEFAULT_WANT_MIX_CAPABLE_OUTBOUND;
         if facts.target_outbound < want_mix_capable {
@@ -907,7 +1013,8 @@ pub fn on_version<E: dcroxide_peer::PeerEnv>(
         let has_min = facts.num_mix_capable_outbound >= want_mix_capable;
         let needs_more = !has_min && facts.num_outbound + want_mix_capable >= facts.target_outbound;
         if needs_more {
-            outcome.mix_disconnect = true;
+            outcome.rejected = Some(VersionRejection::MixCapableWanted);
+            return outcome;
         }
     }
 
@@ -918,36 +1025,112 @@ pub fn on_version<E: dcroxide_peer::PeerEnv>(
         return outcome;
     }
 
-    // Update the address manager and request known addresses from
-    // the remote peer for outbound connections; skipped on the
-    // simulation and regression test networks.
-    if !facts.sim_or_reg_net && !facts.inbound {
-        // Advertise the local address when the server accepts
-        // incoming connections and it believes itself to be close
-        // to the best known tip.
-        if !facts.disable_listen && facts.sync_is_current {
-            let filter = natf_supported(msg_protocol_version as u32);
-            let lna = addr_mgr.get_best_local_address(&remote_addr, filter);
-            if lna.is_routable() {
-                outcome.pushed_local = Some(push_addr_msg(state, peer, env, &[lna]));
-            }
-        }
-
-        // Request known addresses if the server address manager
-        // needs more.
-        if addr_mgr.need_more_addresses() {
-            outcome.requested_more_addrs = true;
-        }
-
-        // Mark the address as a known good address; a failure is
-        // logged and ignored.
-        outcome.marked_good = addr_mgr.good(&remote_addr).is_ok();
-    }
-
-    // The caller stores the advertised address and time sample and
-    // chooses whether or not to relay transactions.
+    // The address advertisement, getaddr request, and good marking
+    // moved to the post-handshake add-peer admission in dcrd 2.2
+    // (`handleAddPeer`); the caller stores the advertised address and
+    // time sample and chooses whether or not to relay transactions.
     outcome.disable_relay_tx = msg_disable_relay_tx;
     outcome
+}
+
+/// The observable outcome of handling an addrv2 message (dcrd
+/// `serverPeer.OnAddrV2`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnAddrV2Outcome {
+    /// The message was ignored (simulation or regression network).
+    Ignored,
+    /// An address failed conversion; the peer is banned (dcrd's
+    /// "sent invalid addrv2 message" ban).
+    BanInvalid,
+    /// The addresses were forwarded to the address manager.
+    Processed,
+}
+
+/// Handle an addrv2 message (dcrd `serverPeer.OnAddrV2`).  Unlike the
+/// legacy handler an empty list is NOT banned, and a conversion
+/// failure is.
+pub fn on_addr_v2(
+    state: &mut ServerPeerAddrState,
+    addr_mgr: &mut AddrManager,
+    facts: &OnAddrFacts,
+    addr_list: &[dcroxide_wire::NetAddressV2],
+    now_nanos: i64,
+) -> OnAddrV2Outcome {
+    // Ignore addresses when running on the simulation and regression
+    // test networks.
+    if facts.sim_or_reg_net {
+        return OnAddrV2Outcome::Ignored;
+    }
+
+    // Do not add more addresses if the peer is disconnecting.
+    if !facts.connected {
+        return OnAddrV2Outcome::Ignored;
+    }
+
+    // A claimed type that does not match the canonical form of the
+    // address bans the peer.
+    let Ok(mut addr_list) = wire_v2_to_addrmgr_net_addresses(addr_list) else {
+        return OnAddrV2Outcome::BanInvalid;
+    };
+
+    for na in &mut addr_list {
+        if !facts.connected {
+            return OnAddrV2Outcome::Processed;
+        }
+
+        // Set the timestamp to 5 days ago if it's more than 10
+        // minutes in the future so this address is one of the first
+        // to be removed when space is needed.
+        if na.timestamp > now_nanos + 10 * 60 * 1_000_000_000 {
+            na.timestamp = now_nanos - 5 * 24 * 60 * 60 * 1_000_000_000;
+        }
+
+        // Add address to known addresses for this peer.
+        state.add_known_addresses(core::slice::from_ref(na));
+    }
+
+    // Add addresses to the server address manager, which handles
+    // duplicate prevention, limits, and last seen updates.
+    addr_mgr.add_addresses(&addr_list, &facts.peer_na);
+    OnAddrV2Outcome::Processed
+}
+
+/// dcrd's exact error text for a version rejection (the `fmt.Errorf`
+/// strings `serverPeer.OnVersion` returns).
+pub fn version_rejection_text(
+    facts: &OnVersionFacts,
+    msg: &dcroxide_wire::MsgVersion,
+    rejection: VersionRejection,
+) -> String {
+    match rejection {
+        VersionRejection::OldProtocol => format!(
+            "rejecting protocol version {} prior to the required version {}",
+            msg.protocol_version,
+            dcroxide_wire::REMOVE_REJECT_VERSION,
+        ),
+        VersionRejection::MixCapableWanted => {
+            let mut want_mix_capable = DEFAULT_WANT_MIX_CAPABLE_OUTBOUND;
+            if facts.target_outbound < want_mix_capable {
+                want_mix_capable = facts.target_outbound;
+            }
+            format!(
+                "rejecting outbound peer with protocol version {} in favor of \
+                 a peer with minimum version {} (have: {}, target: {})",
+                msg.protocol_version,
+                dcroxide_wire::MIX_VERSION,
+                facts.num_mix_capable_outbound,
+                want_mix_capable,
+            )
+        }
+        VersionRejection::MissingServices => {
+            let want_services = ServiceFlag::NODE_NETWORK;
+            let missing = ServiceFlag(want_services.0 & !msg.services.0);
+            format!(
+                "rejecting peer with services {} due to not providing desired services {}",
+                msg.services, missing,
+            )
+        }
+    }
 }
 
 /// Handle a verack message (dcrd `serverPeer.OnVerAck`): request
