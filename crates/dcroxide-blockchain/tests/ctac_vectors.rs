@@ -28,9 +28,9 @@ fn parse_hash(s: &str) -> Hash {
     Hash(h)
 }
 
-fn kind_of(result: &Result<(), RuleError>) -> String {
+fn kind_of<T>(result: &Result<T, RuleError>) -> String {
     match result {
-        Ok(()) => "ok".to_string(),
+        Ok(_) => "ok".to_string(),
         Err(e) => e.kind.kind_name().to_string(),
     }
 }

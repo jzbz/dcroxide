@@ -20,7 +20,7 @@ use std::sync::Arc;
 use dcroxide_blockchain::UtxoEntry;
 use dcroxide_blockchain::utxoview::UtxoView;
 use dcroxide_blockchain::validate::{
-    ChainSubsidyParams, check_transaction_inputs, count_sig_ops, is_finalized_transaction,
+    ChainSubsidyParams, check_transaction_inputs, count_total_sig_ops, is_finalized_transaction,
     validate_transaction_scripts,
 };
 use dcroxide_chaincfg::mainnet_params;
@@ -145,8 +145,22 @@ impl TemplateChain for FakeChain {
     fn check_tspend_has_votes(&self, _h: &Hash, _tx: &MsgTx) -> Result<(), String> {
         Ok(())
     }
-    fn count_sig_ops(&self, tx: &MsgTx, is_cb: bool, is_ssgen: bool, treasury: bool) -> i64 {
-        count_sig_ops(tx, is_cb, is_ssgen, treasury)
+    fn count_total_sig_ops(
+        &self,
+        tx: &MsgTx,
+        is_cb: bool,
+        is_vote: bool,
+        view: &UtxoView,
+        treasury: bool,
+    ) -> Result<u32, String> {
+        count_total_sig_ops(
+            tx,
+            is_cb,
+            is_vote,
+            |op| view.lookup_entry(op).cloned(),
+            treasury,
+        )
+        .map_err(|e| e.description)
     }
     fn fetch_utxo_entry(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>, String> {
         Ok(self.utxos.lookup_entry(outpoint).cloned())

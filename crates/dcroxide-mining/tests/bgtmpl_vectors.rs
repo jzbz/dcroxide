@@ -138,7 +138,14 @@ impl TemplateChain for BgChain {
     fn check_tspend_has_votes(&self, _h: &Hash, _tx: &MsgTx) -> Result<(), String> {
         unreachable!("unused by the regen state machine")
     }
-    fn count_sig_ops(&self, _tx: &MsgTx, _cb: bool, _ssgen: bool, _treasury: bool) -> i64 {
+    fn count_total_sig_ops(
+        &self,
+        _tx: &MsgTx,
+        _cb: bool,
+        _vote: bool,
+        _view: &UtxoView,
+        _treasury: bool,
+    ) -> Result<u32, String> {
         unreachable!("unused by the regen state machine")
     }
     fn fetch_utxo_entry(&self, _op: &OutPoint) -> Result<Option<UtxoEntry>, String> {

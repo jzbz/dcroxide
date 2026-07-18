@@ -179,6 +179,7 @@ fn connectblock_vectors() {
                     &none_resolver,
                     Some(&mut stxos),
                     false,
+                    None,
                     &params,
                 );
                 assert_eq!(kind_of(&result), f[2], "{line}");
@@ -247,5 +248,9 @@ fn connectblock_vectors() {
             other => panic!("unknown row tag {other}"),
         }
     }
-    assert_eq!(counts, [9, 4, 6, 8, 4, 5], "row counts");
+    // The fourth tsc row (the 2.1.5 value-in encoding kind) retired
+    // with dcrd 2.2: the commitment check moved into
+    // checkTreasurySpendInputs, pinned by the txinputs vectors and
+    // the native treasury spend battery.
+    assert_eq!(counts, [9, 3, 6, 8, 4, 5], "row counts");
 }

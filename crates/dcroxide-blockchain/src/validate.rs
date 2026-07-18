@@ -16,6 +16,7 @@ use dcroxide_standalone::BigInt;
 use dcroxide_wire::{MsgBlock, MsgTx, OutPoint, TxIn};
 
 use crate::agendas::FullChainView;
+use crate::checkedmath::{AddSigned, AddUnsigned};
 use crate::ruleerror::{RuleError, RuleErrorKind, rule_error};
 
 /// The minimum length a coinbase (and stakebase) signature script may
@@ -25,6 +26,12 @@ pub const MIN_COINBASE_SCRIPT_LEN: usize = 2;
 /// The maximum length a coinbase (and stakebase) signature script may
 /// be (dcrd `MaxCoinbaseScriptLen`).
 pub const MAX_COINBASE_SCRIPT_LEN: usize = 100;
+
+/// The chain-backed treasury spend battery `check_connect_block`
+/// runs after connecting the stake tree (dcrd `tspendChecks`);
+/// chainless callers pass `None` to fall back to the stateless
+/// window subset.
+pub type FullTspendChecks<'a> = &'a dyn Fn(&MsgBlock) -> Result<(), RuleError>;
 
 /// Flags describing which agendas are treated as active during
 /// validation (dcrd `AgendaFlags`).
@@ -169,10 +176,11 @@ pub fn check_transaction_context(
                 ),
             ));
         }
+        // The referenced ticket in a vote must not be null.
         if is_null_outpoint(&tx.tx_in[1].previous_out_point) {
             return Err(rule_error(
                 RuleErrorKind::BadTxInput,
-                "vote ticket input refers to previous output that is null",
+                "vote ticket input refers to null previous output",
             ));
         }
     } else if is_revocation {
@@ -186,6 +194,15 @@ pub fn check_transaction_context(
                     tx.version,
                     dcroxide_stake::TX_VERSION_AUTO_REVOCATIONS
                 ),
+            ));
+        }
+
+        // The referenced ticket in a revocation must not be null (new
+        // in dcrd 2.2).
+        if is_null_outpoint(&tx.tx_in[0].previous_out_point) {
+            return Err(rule_error(
+                RuleErrorKind::BadTxInput,
+                "revocation ticket input refers to null previous output",
             ));
         }
     } else if is_coin_base {
@@ -348,13 +365,13 @@ fn standalone_to_chain_rule_error(err: dcroxide_standalone::RuleError) -> RuleEr
         SK::NoTxOutputs => RuleErrorKind::NoTxOutputs,
         SK::TxTooBig => RuleErrorKind::TxTooBig,
         SK::BadTxOutValue => RuleErrorKind::BadTxOutValue,
+        // New in dcrd 2.2: the fraud-proof input-value range check.
+        SK::FraudAmountIn => RuleErrorKind::FraudAmountIn,
         SK::DuplicateTxInputs => RuleErrorKind::DuplicateTxInputs,
-        // The standalone tspend expiry kind has no chain counterpart
-        // in this mapping; dcrd passes such errors through unchanged,
-        // which cannot occur via the sanity checks used here.
-        SK::InvalidTSpendExpiry => {
-            unreachable!("tspend expiry errors do not flow through sanity checks")
-        }
+        // New in dcrd 2.2: the treasury spend expiry maps to the
+        // chain's dedicated kind.  The remaining tspend expiry paths
+        // cannot occur via the sanity checks used here.
+        SK::InvalidTSpendExpiry => RuleErrorKind::InvalidTreasurySpendExpiry,
     };
     RuleError {
         kind,
@@ -373,36 +390,41 @@ pub fn check_transaction(tx: &MsgTx, params: &Params, flags: AgendaFlags) -> Res
 /// Ensure ticket purchases in the block commit at least the stake
 /// difficulty specified by the header and the network minimum (dcrd
 /// `CheckProofOfStake`).
-pub fn check_proof_of_stake(block: &MsgBlock, pos_limit: i64) -> Result<(), RuleError> {
-    for stake_tx in &block.stransactions {
-        if dcroxide_stake::is_sstx(stake_tx) {
-            let commit_value = stake_tx.tx_out[0].value;
+pub fn check_proof_of_stake(block: &MsgBlock, min_stake_diff: i64) -> Result<(), RuleError> {
+    let header = &block.header;
+    for stx in &block.stransactions {
+        if !dcroxide_stake::is_sstx(stx) {
+            continue;
+        }
 
-            // Check for underflow.
-            if commit_value < block.header.sbits {
-                return Err(rule_error(
-                    RuleErrorKind::NotEnoughStake,
-                    format!(
-                        "Stake tx {} has a commitment value less than the minimum stake \
-                         difficulty specified in the block ({})",
-                        stake_tx.tx_hash(),
-                        block.header.sbits
-                    ),
-                ));
-            }
+        // The ticket price must not be below the stake difficulty
+        // claimed by the block header.
+        let ticket_paid_amt = stx.tx_out[SUBMISSION_OUTPUT_IDX as usize].value;
+        if ticket_paid_amt < header.sbits {
+            return Err(rule_error(
+                RuleErrorKind::NotEnoughStake,
+                format!(
+                    "ticket {} pays less than the stake difficulty committed to by the \
+                     block header ({} < {})",
+                    stx.tx_hash(),
+                    ticket_paid_amt,
+                    header.sbits
+                ),
+            ));
+        }
 
-            // Check to make sure they meet the minimum given by the
-            // network.
-            if commit_value < pos_limit {
-                return Err(rule_error(
-                    RuleErrorKind::StakeBelowMinimum,
-                    format!(
-                        "Stake tx {} has a commitment value less than the minimum stake \
-                         difficulty for the network ({pos_limit})",
-                        stake_tx.tx_hash()
-                    ),
-                ));
-            }
+        // The ticket price must not be below the network minimum.
+        if ticket_paid_amt < min_stake_diff {
+            return Err(rule_error(
+                RuleErrorKind::StakeBelowMinimum,
+                format!(
+                    "ticket {} pays less than the network minimum stake difficulty of \
+                     ({} < {})",
+                    stx.tx_hash(),
+                    ticket_paid_amt,
+                    min_stake_diff
+                ),
+            ));
         }
     }
     Ok(())
@@ -2531,6 +2553,79 @@ pub fn verify_tspend_signature(tx: &MsgTx, signature: &[u8], pub_key: &[u8]) -> 
     Ok(())
 }
 
+/// The amount committed by a treasury spend's first output OP_RETURN
+/// script (dcrd `extractTreasurySpendCommitAmount`).  The caller MUST
+/// have already determined the script is a well-formed treasury spend
+/// commitment or this may panic.
+fn extract_treasury_spend_commit_amount(script: &[u8]) -> i64 {
+    // A treasury spend commitment output is an OP_RETURN script with a
+    // 32-byte data push consisting of an 8-byte little-endian amount
+    // and a 24-byte random value, so the encoded amount is at offset
+    // 2 (1 byte OP_RETURN + 1 byte data push length).
+    const START_IDX: usize = 2;
+    const END_IDX: usize = START_IDX + 8;
+    let mut le = [0u8; 8];
+    le.copy_from_slice(&script[START_IDX..END_IDX]);
+    i64::from_le_bytes(le)
+}
+
+/// A series of checks on the inputs to a treasury spend: the input
+/// values are sane and the spend amount commitment in the first
+/// output matches the input amount (dcrd `checkTreasurySpendInputs`,
+/// new in dcrd 2.2).  The caller MUST have already determined the
+/// transaction is a treasury spend or this may panic.
+pub fn check_treasury_spend_inputs(msg_tx: &MsgTx) -> Result<(), RuleError> {
+    // Assert there is at least one input and one output.
+    assert!(
+        !msg_tx.tx_in.is_empty() && !msg_tx.tx_out.is_empty(),
+        "attempt to check treasury spend inputs on tx {} which does not appear to be a \
+         treasury spend ({} inputs, {} outputs)",
+        msg_tx.tx_hash(),
+        msg_tx.tx_in.len(),
+        msg_tx.tx_out.len()
+    );
+
+    // Ensure all input amounts are sane.  This is only a fast check
+    // for obviously invalid values; the expenditure policy is enforced
+    // separately.
+    for tx_in in &msg_tx.tx_in {
+        let value_in = tx_in.value_in;
+        if value_in < 0 {
+            return Err(rule_error(
+                RuleErrorKind::BadTxInput,
+                format!("treasury spend has negative value of {value_in}"),
+            ));
+        }
+        if value_in > dcroxide_stake::MAX_AMOUNT {
+            return Err(rule_error(
+                RuleErrorKind::BadTxInput,
+                format!(
+                    "treasury spend value of {value_in} is higher than max allowed value \
+                     of {}",
+                    dcroxide_stake::MAX_AMOUNT
+                ),
+            ));
+        }
+    }
+
+    // A valid treasury spend must specify the entire amount the
+    // treasury is spending in the first input and commit to that
+    // amount in the script of the first output.
+    let value_in = msg_tx.tx_in[0].value_in;
+    let commitment_amt = extract_treasury_spend_commit_amount(&msg_tx.tx_out[0].pk_script);
+    if value_in != commitment_amt {
+        return Err(rule_error(
+            RuleErrorKind::InvalidTSpendValueIn,
+            format!(
+                "treasury spend input value {value_in} does not match spend amount \
+                 commitment {commitment_amt}"
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Perform a series of checks on the inputs to a transaction to ensure
 /// they are valid, returning the transaction fee (dcrd
 /// `CheckTransactionInputs`).  The transaction MUST have already been
@@ -2549,11 +2644,15 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
     is_auto_revocations_enabled: bool,
     subsidy_split_variant: dcroxide_standalone::SubsidySplitVariant,
 ) -> Result<i64, RuleError> {
-    // Coinbase and treasurybase transactions have no inputs.
-    if dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled) {
-        return Ok(0);
-    }
-    if is_treasury_enabled && dcroxide_standalone::is_treasury_base(tx) {
+    // This check MUST come before the coinbase check because a
+    // treasurybase will be identified as a coinbase as well.  dcrd 2.2
+    // lets the treasurybase flow through so its input value commitment
+    // is range checked and contributes to the input sum (its fee is
+    // zero for a valid treasurybase, as before).
+    let is_treasury_base = is_treasury_enabled && dcroxide_standalone::is_treasury_base(tx);
+
+    // Coinbase transactions have no inputs.
+    if !is_treasury_base && dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled) {
         return Ok(0);
     }
 
@@ -2601,9 +2700,9 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
 
     // Perform additional checks on treasury spend transactions such as
     // ensuring they have a valid signature from a sanctioned key.
-    let mut is_tspend = false;
+    let mut is_treasury_spend = false;
     if is_treasury_enabled && let Ok((signature, pub_key)) = dcroxide_stake::check_tspend(tx) {
-        is_tspend = true;
+        is_treasury_spend = true;
 
         // The public key used to sign the treasury spend must be
         // one of the sanctioned pi keys.
@@ -2624,24 +2723,51 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
         }
     }
 
+    // Perform additional checks on treasury spends such as verifying
+    // the input values are sane and the spend amount commitment in the
+    // first output matches the input amount (new in dcrd 2.2).
+    if is_treasury_spend {
+        check_treasury_spend_inputs(tx)?;
+    }
+
     // General transaction testing (and a few stake exceptions).
+    //
+    // Accumulate the total input amount while ensuring the accumulator
+    // does not overflow and the total does not exceed the max allowed
+    // per transaction (dcrd 2.2's sumTotalAtomIn closure).
     let tx_hash = tx.tx_hash();
     let coinbase_maturity = i64::from(params.coinbase_maturity);
     let mut total_atom_in: i64 = 0;
-    for (idx, tx_in) in tx.tx_in.iter().enumerate() {
-        // Inputs won't exist for the stakebase, so add the reward
-        // amount instead.
-        if is_vote && idx == 0 {
-            let (_, height_voting_on) = dcroxide_stake::ssgen_block_voted_on(tx);
-            let stake_vote_subsidy = subsidy_cache
-                .calc_stake_vote_subsidy_v3(i64::from(height_voting_on), subsidy_split_variant);
-            total_atom_in += stake_vote_subsidy;
-            continue;
+    let sum_total_atom_in = |total: &mut i64, amount: i64| -> Result<(), RuleError> {
+        let (sum, ok) = total.add_signed(amount);
+        *total = sum;
+        if !ok {
+            return Err(rule_error(
+                RuleErrorKind::BadTxOutValue,
+                "total value of all transaction inputs overflows accumulator",
+            ));
         }
-
-        // idx can only be 0 in this case but check it anyway.
-        if is_tspend && idx == 0 {
-            total_atom_in += tx_in.value_in;
+        if *total > dcroxide_stake::MAX_AMOUNT {
+            return Err(rule_error(
+                RuleErrorKind::BadTxOutValue,
+                format!(
+                    "total value of all transaction inputs is {total} which is higher \
+                     than max allowed value of {}",
+                    dcroxide_stake::MAX_AMOUNT
+                ),
+            ));
+        }
+        Ok(())
+    };
+    for (idx, tx_in) in tx.tx_in.iter().enumerate() {
+        // The stakebase of votes, treasurybases, and treasury spends
+        // do not have normal inputs, so handle them separately.  Their
+        // input value commitments all contribute to the total input
+        // sum and have been proven to commit to correct values in a
+        // valid range previously.  Treasurybases and treasury spends
+        // only have a single input, so their index can only be 0.
+        if idx == 0 && (is_vote || is_treasury_base || is_treasury_spend) {
+            sum_total_atom_in(&mut total_atom_in, tx_in.value_in)?;
             continue;
         }
 
@@ -2838,18 +2964,7 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
                 ),
             ));
         }
-        let last_atom_in = total_atom_in;
-        total_atom_in = total_atom_in.wrapping_add(origin_tx_atom);
-        if total_atom_in < last_atom_in || total_atom_in > dcroxide_stake::MAX_AMOUNT {
-            return Err(rule_error(
-                RuleErrorKind::BadTxOutValue,
-                format!(
-                    "total value of all transaction inputs is {total_atom_in} which is \
-                     higher than max allowed value of {}",
-                    dcroxide_stake::MAX_AMOUNT
-                ),
-            ));
-        }
+        sum_total_atom_in(&mut total_atom_in, origin_tx_atom)?;
     }
 
     // Calculate the total output amount; overflow and range problems
@@ -2879,70 +2994,105 @@ pub const MAX_SIG_OPS_PER_BLOCK: i64 = 1_000_000 / 200;
 
 /// The number of signature operations for all input and output scripts
 /// in the provided transaction, using the quicker but imprecise
-/// counting mechanism from txscript (dcrd `CountSigOps`).
+/// counting mechanism from the script engine (dcrd `countSigOps` at
+/// the 2.2 parity target; the accumulator is a fallible `u32`).
 pub fn count_sig_ops(
     tx: &MsgTx,
-    is_coin_base_tx: bool,
-    is_ssgen: bool,
+    is_coin_base: bool,
+    is_vote: bool,
     is_treasury_enabled: bool,
-) -> i64 {
-    let mut total_sig_ops: i64 = 0;
-
-    if is_treasury_enabled && dcroxide_standalone::is_treasury_base(tx) {
-        return total_sig_ops;
+) -> Result<u32, RuleError> {
+    // Treasurybases do not have any signature operations.
+    if is_treasury_enabled && dcroxide_stake::is_treasury_base(tx) {
+        return Ok(0);
     }
 
-    if !is_coin_base_tx {
-        // Accumulate the signature operations in all inputs, skipping
-        // the stakebase.
-        for (i, tx_in) in tx.tx_in.iter().enumerate() {
-            if is_ssgen && i == 0 {
-                continue;
-            }
-            total_sig_ops = total_sig_ops.wrapping_add(dcroxide_txscript::get_sig_op_count(
-                &tx_in.signature_script,
-                is_treasury_enabled,
-            ) as i64);
+    // Determine which transaction inputs to consider.  Coinbase
+    // transactions and the first input (aka stakebase) of a vote do
+    // not have normal input scripts to consider.
+    let (tx_in_start_idx, tx_ins): (usize, &[_]) = if is_coin_base {
+        (0, &[])
+    } else if is_vote && !tx.tx_in.is_empty() {
+        (1, &tx.tx_in[1..])
+    } else {
+        (0, &tx.tx_in[..])
+    };
+
+    // Accumulate the signature operations in all relevant inputs.
+    let mut total_sig_ops: u32 = 0;
+    for (tx_in_idx, tx_in) in tx_ins.iter().enumerate() {
+        let num_sig_ops =
+            dcroxide_txscript::get_sig_op_count(&tx_in.signature_script, is_treasury_enabled)
+                as u32;
+        let ok;
+        (total_sig_ops, ok) = total_sig_ops.add_unsigned(num_sig_ops);
+        if !ok {
+            return Err(rule_error(
+                RuleErrorKind::TooManySigOps,
+                format!(
+                    "input {}:{} signature script causes signature operation count to \
+                     overflow",
+                    tx.tx_hash(),
+                    tx_in_idx + tx_in_start_idx
+                ),
+            ));
         }
     }
 
     // Accumulate the signature operations in all outputs.
-    for tx_out in &tx.tx_out {
-        total_sig_ops = total_sig_ops.wrapping_add(dcroxide_txscript::get_sig_op_count(
-            &tx_out.pk_script,
-            is_treasury_enabled,
-        ) as i64);
+    for (tx_out_idx, tx_out) in tx.tx_out.iter().enumerate() {
+        let num_sig_ops =
+            dcroxide_txscript::get_sig_op_count(&tx_out.pk_script, is_treasury_enabled) as u32;
+        let ok;
+        (total_sig_ops, ok) = total_sig_ops.add_unsigned(num_sig_ops);
+        if !ok {
+            return Err(rule_error(
+                RuleErrorKind::TooManySigOps,
+                format!(
+                    "output {}:{tx_out_idx} public key script causes signature operation \
+                     count to overflow",
+                    tx.tx_hash()
+                ),
+            ));
+        }
     }
 
-    total_sig_ops
+    Ok(total_sig_ops)
 }
 
 /// The number of signature operations for all input transactions of
 /// the pay-to-script-hash type, using the precise counting mechanism
-/// from the script engine (dcrd `CountP2SHSigOps`).
+/// from the script engine (dcrd `countP2SHSigOps` at 2.2).
 pub fn count_p2sh_sig_ops(
     tx: &MsgTx,
-    is_coin_base_tx: bool,
-    is_stake_base_tx: bool,
+    is_coin_base: bool,
+    is_vote: bool,
     lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
     is_treasury_enabled: bool,
-) -> Result<i64, RuleError> {
-    // Coinbase transactions have no interesting inputs, stakebase
-    // (SSGen) transactions have no P2SH inputs, and treasury spends
-    // and treasurybases likewise have none once recognized under the
-    // active treasury agenda.
-    if is_coin_base_tx || is_stake_base_tx {
+) -> Result<u32, RuleError> {
+    // Coinbase transactions have no interesting inputs.
+    if is_coin_base {
         return Ok(0);
     }
+    // Treasury spends and treasurybases likewise have no P2SH inputs
+    // once recognized under the active treasury agenda.
     if is_treasury_enabled
-        && (dcroxide_stake::is_tspend(tx) || dcroxide_standalone::is_treasury_base(tx))
+        && (dcroxide_stake::is_tspend(tx) || dcroxide_stake::is_treasury_base(tx))
     {
         return Ok(0);
     }
 
-    // Accumulate the signature operations in all inputs.
-    let mut total_sig_ops: i64 = 0;
-    for (tx_in_index, tx_in) in tx.tx_in.iter().enumerate() {
+    // The first input (aka stakebase) of votes has no P2SH inputs.
+    let (tx_in_start_idx, tx_ins): (usize, &[_]) = if is_vote && !tx.tx_in.is_empty() {
+        (1, &tx.tx_in[1..])
+    } else {
+        (0, &tx.tx_in[..])
+    };
+
+    // Accumulate the signature operations from all pay-to-script-hash
+    // inputs.
+    let mut total_sig_ops: u32 = 0;
+    for (tx_in_index, tx_in) in tx_ins.iter().enumerate() {
         // Ensure the referenced input transaction is available.
         let tx_in_outpoint = &tx_in.previous_out_point;
         let utxo_entry = match lookup_entry(tx_in_outpoint) {
@@ -2951,16 +3101,16 @@ pub fn count_p2sh_sig_ops(
                 return Err(rule_error(
                     RuleErrorKind::MissingTxOut,
                     format!(
-                        "output {tx_in_outpoint:?} referenced from transaction \
-                         {}:{tx_in_index} either does not exist or has already been \
-                         spent",
-                        tx.tx_hash()
+                        "output {tx_in_outpoint:?} referenced from transaction {}:{} \
+                         either does not exist or has already been spent",
+                        tx.tx_hash(),
+                        tx_in_index + tx_in_start_idx
                     ),
                 ));
             }
         };
 
-        // Only pay-to-script-hash types are of interest.
+        // Skip inputs that aren't pay-to-script-hash.
         let pk_script = utxo_entry.pk_script();
         if !dcroxide_txscript::is_pay_to_script_hash(pk_script) {
             continue;
@@ -2972,18 +3122,15 @@ pub fn count_p2sh_sig_ops(
             &tx_in.signature_script,
             pk_script,
             is_treasury_enabled,
-        ) as i64;
-
-        // We could potentially overflow the accumulator so check for
-        // overflow.
-        let last_sig_ops = total_sig_ops;
-        total_sig_ops = total_sig_ops.wrapping_add(num_sig_ops);
-        if total_sig_ops < last_sig_ops {
+        ) as u32;
+        let ok;
+        (total_sig_ops, ok) = total_sig_ops.add_unsigned(num_sig_ops);
+        if !ok {
             return Err(rule_error(
                 RuleErrorKind::TooManySigOps,
                 format!(
-                    "the public key script from output {tx_in_outpoint:?} contains too \
-                     many signature operations - overflow"
+                    "output {tx_in_outpoint:?} public key script causes signature \
+                     operations count to overflow"
                 ),
             ));
         }
@@ -2992,44 +3139,34 @@ pub fn count_p2sh_sig_ops(
     Ok(total_sig_ops)
 }
 
-/// Check the number of P2SH signature operations to make sure they
-/// don't overflow the limits, accumulating into the passed cumulative
-/// count (dcrd `checkNumSigOps`).
-pub fn check_num_sig_ops(
+/// The total number of signature operations for the transaction —
+/// input and output scripts plus any redeemed pay-to-script-hash
+/// inputs (dcrd `CountTotalSigOps`, new in dcrd 2.2).
+pub fn count_total_sig_ops(
     tx: &MsgTx,
+    is_coin_base: bool,
+    is_vote: bool,
     lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
-    index: usize,
-    stake_tree: bool,
-    cumulative_sig_ops: i64,
     is_treasury_enabled: bool,
-) -> Result<i64, RuleError> {
-    let is_ssgen = dcroxide_stake::is_ssgen(tx);
-    let is_coinbase_tx = index == 0 && !stake_tree;
-    let num_sig_ops = count_sig_ops(tx, is_coinbase_tx, is_ssgen, is_treasury_enabled);
-    let num_p2sh_sig_ops = count_p2sh_sig_ops(
-        tx,
-        is_coinbase_tx,
-        is_ssgen,
-        lookup_entry,
-        is_treasury_enabled,
-    )?;
+) -> Result<u32, RuleError> {
+    // Count the number of regular signature operations.
+    let num_sig_ops = count_sig_ops(tx, is_coin_base, is_vote, is_treasury_enabled)?;
 
-    // Check for overflow or going over the limits on every iteration.
-    let start_cum_sig_ops = cumulative_sig_ops;
-    let cumulative_sig_ops = cumulative_sig_ops
-        .wrapping_add(num_sig_ops)
-        .wrapping_add(num_p2sh_sig_ops);
-    if cumulative_sig_ops < start_cum_sig_ops || cumulative_sig_ops > MAX_SIG_OPS_PER_BLOCK {
+    // Count the number of precise pay-to-script-hash signature
+    // operations.
+    let num_p2sh_sig_ops =
+        count_p2sh_sig_ops(tx, is_coin_base, is_vote, lookup_entry, is_treasury_enabled)?;
+
+    // Ensure the combined total does not overflow.
+    let (total_sig_ops, ok) = num_sig_ops.add_unsigned(num_p2sh_sig_ops);
+    if !ok {
         return Err(rule_error(
             RuleErrorKind::TooManySigOps,
-            format!(
-                "block contains too many signature operations - got \
-                 {cumulative_sig_ops}, max {MAX_SIG_OPS_PER_BLOCK}"
-            ),
+            format!("tx {} total signature operations overflow", tx.tx_hash()),
         ));
     }
 
-    Ok(cumulative_sig_ops)
+    Ok(total_sig_ops)
 }
 
 /// Ensure no vote in the given transactions spends more subsidy than
@@ -3117,75 +3254,6 @@ pub fn get_stake_base_amounts(
     }
 
     Ok(total_outputs.wrapping_sub(total_inputs))
-}
-
-/// The amount of fees in the stake tx tree of a block given the
-/// transactions and a utxo lookup (dcrd `getStakeTreeFees`).
-pub fn get_stake_tree_fees<SP: dcroxide_standalone::SubsidyParams>(
-    subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
-    height: i64,
-    txs: &[MsgTx],
-    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
-    is_treasury_enabled: bool,
-    subsidy_split_variant: dcroxide_standalone::SubsidySplitVariant,
-) -> Result<i64, RuleError> {
-    let mut total_inputs: i64 = 0;
-    let mut total_outputs: i64 = 0;
-    for tx in txs {
-        let is_ssgen = dcroxide_stake::is_ssgen(tx);
-        let is_treasury_base = is_treasury_enabled && dcroxide_standalone::is_treasury_base(tx);
-        let is_treasury_spend = is_treasury_enabled && dcroxide_stake::is_tspend(tx);
-
-        for (i, tx_in) in tx.tx_in.iter().enumerate() {
-            // Ignore stakebases, treasury spends, and treasurybases
-            // since they have no inputs.
-            if is_ssgen && i == 0 {
-                continue;
-            }
-            if is_treasury_base || is_treasury_spend {
-                continue;
-            }
-
-            let tx_in_outpoint = &tx_in.previous_out_point;
-            let Some(utxo_entry) = lookup_entry(tx_in_outpoint) else {
-                return Err(rule_error(
-                    RuleErrorKind::TicketUnavailable,
-                    format!(
-                        "couldn't find input tx {} for stake tree fee calculation",
-                        tx_in_outpoint.hash
-                    ),
-                ));
-            };
-            total_inputs = total_inputs.wrapping_add(utxo_entry.amount());
-        }
-
-        for out in &tx.tx_out {
-            total_outputs = total_outputs.wrapping_add(out.value);
-        }
-
-        // For votes, subtract the subsidy (aligned with the height
-        // being voted on) to determine actual fees.
-        if is_ssgen {
-            total_outputs = total_outputs.wrapping_sub(
-                subsidy_cache.calc_stake_vote_subsidy_v3(height - 1, subsidy_split_variant),
-            );
-        }
-        if is_treasury_spend {
-            total_outputs = total_outputs.wrapping_sub(tx.tx_in[0].value_in);
-        }
-        if is_treasury_base {
-            total_outputs = total_outputs.wrapping_sub(tx.tx_in[0].value_in);
-        }
-    }
-
-    if total_inputs < total_outputs {
-        return Err(rule_error(
-            RuleErrorKind::StakeFees,
-            "negative cumulative fees found in stake tx tree",
-        ));
-    }
-
-    Ok(total_inputs - total_outputs)
 }
 
 /// Whether duplicate transaction hash checking is performed; disabled
@@ -3559,20 +3627,25 @@ pub fn check_block_context(
         ));
     }
 
-    // The block must not contain too many signature operations by the
-    // quick counting method, checked cumulatively to avoid overflow.
-    let mut total_sig_ops: i64 = 0;
+    // The number of signature operations must not overflow the
+    // accumulator and be less than the maximum allowed per block.
+    let mut total_sig_ops: u32 = 0;
     for tx in block.transactions.iter().chain(&block.stransactions) {
-        let last_sig_ops = total_sig_ops;
         let is_coin_base = dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled);
         let is_ssgen = dcroxide_stake::is_ssgen(tx);
-        total_sig_ops = total_sig_ops.wrapping_add(count_sig_ops(
-            tx,
-            is_coin_base,
-            is_ssgen,
-            is_treasury_enabled,
-        ));
-        if total_sig_ops < last_sig_ops || total_sig_ops > MAX_SIG_OPS_PER_BLOCK {
+        let num_sig_ops = count_sig_ops(tx, is_coin_base, is_ssgen, is_treasury_enabled)?;
+        let ok;
+        (total_sig_ops, ok) = total_sig_ops.add_unsigned(num_sig_ops);
+        if !ok {
+            return Err(rule_error(
+                RuleErrorKind::TooManySigOps,
+                format!(
+                    "tx {} causes block signature operation count to overflow",
+                    tx.tx_hash()
+                ),
+            ));
+        }
+        if i64::from(total_sig_ops) > MAX_SIG_OPS_PER_BLOCK {
             return Err(rule_error(
                 RuleErrorKind::TooManySigOps,
                 format!(
@@ -3766,23 +3839,53 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
     is_auto_revocations_enabled: bool,
     subsidy_split_variant: dcroxide_standalone::SubsidySplitVariant,
     params: &Params,
-) -> Result<(), RuleError> {
+) -> Result<i64, RuleError> {
     // Perform several checks on the inputs for each transaction,
     // accumulating the total fees, and connect each transaction to
-    // the view as it validates.
+    // the view as it validates.  The total fees are returned so the
+    // caller can carry the stake tree fees into the regular tree
+    // (dcrd 2.2 folded getStakeTreeFees into this return).
     let mut in_flight_regular_tx: alloc::collections::BTreeMap<[u8; 32], u32> =
         alloc::collections::BTreeMap::new();
     let mut total_fees: i64 = input_fees; // Stake tx tree carry forward
-    let mut cumulative_sig_ops: i64 = 0;
+    let mut cumulative_sig_ops: u32 = 0;
     for (idx, tx) in txs.iter().enumerate() {
-        cumulative_sig_ops = check_num_sig_ops(
+        // Since the first (and only the first) transaction has already
+        // been verified to be a coinbase transaction, use (idx == 0)
+        // && !stake_tree as an optimization rather than a full
+        // coinbase check again.
+        let is_coin_base = idx == 0 && !stake_tree;
+        let is_vote = stake_tree && dcroxide_stake::is_ssgen(tx);
+
+        // The number of signature operations must not overflow the
+        // accumulator and be less than the maximum allowed per block.
+        let num_sig_ops = count_total_sig_ops(
             tx,
+            is_coin_base,
+            is_vote,
             |op| view.lookup_entry(op).cloned(),
-            idx,
-            stake_tree,
-            cumulative_sig_ops,
             is_treasury_enabled,
         )?;
+        let ok;
+        (cumulative_sig_ops, ok) = cumulative_sig_ops.add_unsigned(num_sig_ops);
+        if !ok {
+            return Err(rule_error(
+                RuleErrorKind::TooManySigOps,
+                format!(
+                    "tx {} causes block signature operation count to overflow",
+                    tx.tx_hash()
+                ),
+            ));
+        }
+        if i64::from(cumulative_sig_ops) > MAX_SIG_OPS_PER_BLOCK {
+            return Err(rule_error(
+                RuleErrorKind::TooManySigOps,
+                format!(
+                    "block contains too many signature operations - got \
+                     {cumulative_sig_ops}, max {MAX_SIG_OPS_PER_BLOCK}"
+                ),
+            ));
+        }
 
         const CHECK_FRAUD_PROOF: bool = true;
         let tx_fee = check_transaction_inputs(
@@ -3798,10 +3901,11 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
             subsidy_split_variant,
         )?;
 
-        // Sum the total fees and ensure no overflow.
-        let last_total_fees = total_fees;
-        total_fees = total_fees.wrapping_add(tx_fee);
-        if total_fees < last_total_fees {
+        // Sum the total fees and ensure they do not overflow the
+        // accumulator.
+        let ok;
+        (total_fees, ok) = total_fees.add_signed(tx_fee);
+        if !ok {
             return Err(rule_error(
                 RuleErrorKind::BadFees,
                 "total fees for block overflows accumulator",
@@ -3904,7 +4008,7 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
         // An empty stake tree is only allowed before stake validation
         // begins.
         if txs.is_empty() && node_height < params.stake_validation_height {
-            return Ok(());
+            return Ok(total_fees);
         }
         if txs.is_empty() && node_height >= params.stake_validation_height {
             return Err(rule_error(
@@ -3924,13 +4028,15 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
         )?;
         let total_atom_out_stake =
             get_stake_base_amounts(txs, |op| view.lookup_entry(op).cloned())?;
-        let exp_atom_out = if node_height >= params.stake_validation_height {
+        // dcrd 2.2 dropped the pre-stake-validation-height else arm
+        // that set the expected stakebase output to the accumulated
+        // fees; before that height the expected output is simply zero.
+        let mut exp_atom_out: i64 = 0;
+        if node_height >= params.stake_validation_height {
             let vote_subsidy =
                 subsidy_cache.calc_stake_vote_subsidy_v3(node_height - 1, subsidy_split_variant);
-            vote_subsidy * i64::from(node_voters)
-        } else {
-            total_fees
-        };
+            exp_atom_out = vote_subsidy * i64::from(node_voters);
+        }
         if total_atom_out_stake > exp_atom_out {
             return Err(rule_error(
                 RuleErrorKind::BadStakebaseValue,
@@ -3942,7 +4048,7 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
         }
     }
 
-    Ok(())
+    Ok(total_fees)
 }
 
 /// Ensure the coinbase pays the pre-treasury-agenda organization
@@ -4000,7 +4106,6 @@ pub fn check_treasury_base<SP: dcroxide_standalone::SubsidyParams>(
     tx: &MsgTx,
     height: i64,
     voters: u16,
-    _params: &Params,
 ) -> Result<(), RuleError> {
     if height <= 1 {
         return Ok(());
@@ -4028,9 +4133,17 @@ pub fn check_treasury_base<SP: dcroxide_standalone::SubsidyParams>(
     if treasury_output.pk_script.len() != 1
         || treasury_output.pk_script[0] != dcroxide_txscript::OP_TADD
     {
+        let script_hex: String = treasury_output
+            .pk_script
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         return Err(rule_error(
             RuleErrorKind::InvalidTreasurybaseScript,
-            "treasury output script is not a lone OP_TADD",
+            format!(
+                "treasury output script is {script_hex} instead of {:x}",
+                dcroxide_txscript::OP_TADD
+            ),
         ));
     }
     let org_subsidy = subsidy_cache.calc_treasury_subsidy(height, voters, true);
@@ -4135,11 +4248,12 @@ pub fn calc_commitment_root_v1(filter_hash: Hash) -> Hash {
     filter_hash
 }
 
-/// The stateless treasury spend checks for blocks on a treasury vote
-/// interval: the expiry window and the OP_RETURN value-in encoding
-/// (the portable half of dcrd `tspendChecks`; the duplicate-spend
-/// lookup and the vote tallies over the voting window require prior
-/// block data and arrive with the chain engine).
+/// The stateless treasury spend expiry-window check for blocks on a
+/// treasury vote interval — the chainless-test fallback for dcrd's
+/// `tspendChecks` when no engine battery is supplied to
+/// [`check_connect_block`] (the duplicate-spend lookup, vote tallies,
+/// and expenditure bound require prior block data; dcrd 2.2 moved the
+/// value-in commitment check into `checkTreasurySpendInputs`).
 pub fn tspend_checks_stateless(
     prev_height: i64,
     block: &MsgBlock,
@@ -4166,24 +4280,6 @@ pub fn tspend_checks_stateless(
                 format!(
                     "block at height {block_height} contains treasury spend transaction \
                      {} with expiry {exp} that is outside of the valid window",
-                    stx.tx_hash()
-                ),
-            ));
-        }
-
-        // A valid treasury spend stores the entire spent amount in the
-        // first input, which must match the little-endian amount in
-        // the OP_RETURN.
-        let value_in = stx.tx_in[0].value_in;
-        let mut le = [0u8; 8];
-        le.copy_from_slice(&stx.tx_out[0].pk_script[2..10]);
-        let value_in_op_ret = i64::from_le_bytes(le);
-        if value_in != value_in_op_ret {
-            return Err(rule_error(
-                RuleErrorKind::InvalidTSpendValueIn,
-                format!(
-                    "block contains TSpend transaction ({}) that did not encode ValueIn \
-                     correctly got {value_in_op_ret} wanted {value_in}",
                     stx.tx_hash()
                 ),
             ));
@@ -4267,8 +4363,10 @@ pub fn check_block_scripts(
 /// parent), whether scripts should run (dcrd derives this from bulk
 /// import mode and the assumed-valid ancestor), and the parent's past
 /// median time when the LN features agenda is active.  The treasury
-/// spend duplicate and vote tally checks from dcrd's `tspendChecks`
-/// require prior block data and arrive with the chain engine.
+/// spend checks from dcrd's `tspendChecks` require prior block data,
+/// so the chain engine supplies them through `full_tspend_checks`;
+/// chainless callers pass `None` to fall back to the stateless window
+/// subset.
 ///
 /// `parent_stxos` is only invoked when the block disapproves its
 /// parent, so callers must not pay to decode it on the approve path —
@@ -4290,6 +4388,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     resolver: &impl crate::utxoview::UtxoResolver,
     mut stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
     run_scripts: bool,
+    full_tspend_checks: Option<FullTspendChecks<'_>>,
     params: &Params,
 ) -> Result<Hash, RuleError> {
     let prev_height = node_height - 1;
@@ -4311,16 +4410,17 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
             .map_err(unknown)?;
 
     // The treasury subsidy goes to the treasurybase under the agenda
-    // and to the organization address before it.
+    // and to the organization address before it.  dcrd 2.2 moved the
+    // treasury spend checks to after the stake tree is connected (so
+    // the input checks in checkTreasurySpendInputs have already run),
+    // so only the treasurybase is verified here.
     if is_treasury_enabled {
         check_treasury_base(
             subsidy_cache,
             &block.stransactions[0],
             node_height,
             node_voters,
-            params,
         )?;
-        tspend_checks_stateless(prev_height, block, params)?;
     } else {
         coinbase_pays_treasury_address(
             subsidy_cache,
@@ -4383,9 +4483,11 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         dcroxide_standalone::SubsidySplitVariant::Original
     };
 
-    // Connect the stake tree with full checks.
+    // Connect the stake tree with full checks; the returned fees are
+    // carried forward into the regular tree (dcrd 2.2 folded
+    // getStakeTreeFees into this return).
     let prev_header = &parent.header;
-    check_transactions_and_connect(
+    let stake_tree_fees = check_transactions_and_connect(
         subsidy_cache,
         0,
         node_height,
@@ -4400,14 +4502,17 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         subsidy_split_variant,
         params,
     )?;
-    let stake_tree_fees = get_stake_tree_fees(
-        subsidy_cache,
-        node_height,
-        &block.stransactions,
-        |op| view.lookup_entry(op).cloned(),
-        is_treasury_enabled,
-        subsidy_split_variant,
-    )?;
+
+    // Verify treasury spends now that the stake tree — and thus the
+    // treasury spend input checks in checkTreasurySpendInputs — has
+    // been validated and the view is coherent (dcrd 2.2 moved this
+    // after the stake tree connect).
+    if is_treasury_enabled {
+        match full_tspend_checks {
+            Some(tspend_checks) => tspend_checks(block)?,
+            None => tspend_checks_stateless(prev_height, block, params)?,
+        }
+    }
 
     // Enforce sequence locks once the LN features agenda is active.
     let ln_features_active =
@@ -4452,7 +4557,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
 
     // Connect the regular tree with full checks, carrying the stake
     // tree fees forward.
-    check_transactions_and_connect(
+    let _ = check_transactions_and_connect(
         subsidy_cache,
         stake_tree_fees,
         node_height,

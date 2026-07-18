@@ -3,9 +3,10 @@
 //! generated inside dcrd's internal/blockchain package
 //! (`data/txinputs_vectors.txt`): regular spends across every utxo
 //! flavor (coinbase/expiry maturities, treasury-gen and stake-tagged
-//! scripts, fraud proofs, amount ranges), coinbase/treasurybase
-//! early-outs, treasury spends signed with the published simnet Pi
-//! test key, votes reaching the stakebase subsidy fee path, and
+//! scripts, fraud proofs, amount ranges), coinbase early-outs and the
+//! dcrd 2.2 treasurybase flow-through, treasury spends signed with
+//! the published simnet Pi test key (incl. the spend amount
+//! commitment check), votes summing their stakebase value-in, and
 //! direct `verifyTSpendSignature` rows.
 
 // Test-harness arithmetic over bounded lengths.

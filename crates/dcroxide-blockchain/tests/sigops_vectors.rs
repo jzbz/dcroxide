@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: ISC
 //! Replay of dcrd's signature operation counting and stakebase amount
 //! verdicts generated inside dcrd's internal/blockchain package
-//! (`data/sigops_vectors.txt`): `CountSigOps`/`CountP2SHSigOps` over
-//! P2SH redeem scripts bearing checksig operations, `checkNumSigOps`
-//! accumulation against the block limit, and
-//! `checkStakeBaseAmounts`/`getStakeBaseAmounts`/`getStakeTreeFees`
-//! over vote sets against a fabricated utxo view.
+//! (`data/sigops_vectors.txt`): `countSigOps`/`countP2SHSigOps`/
+//! `CountTotalSigOps` over P2SH redeem scripts bearing checksig
+//! operations and `checkStakeBaseAmounts`/`getStakeBaseAmounts` over
+//! vote sets against a fabricated utxo view.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -13,8 +12,8 @@
 use std::collections::BTreeMap;
 
 use dcroxide_blockchain::validate::{
-    ChainSubsidyParams, check_num_sig_ops, check_stake_base_amounts, count_p2sh_sig_ops,
-    count_sig_ops, get_stake_base_amounts, get_stake_tree_fees,
+    ChainSubsidyParams, check_stake_base_amounts, count_p2sh_sig_ops, count_sig_ops,
+    count_total_sig_ops, get_stake_base_amounts,
 };
 use dcroxide_blockchain::{RuleError, UtxoEntry};
 use dcroxide_chaincfg::simnet_params;
@@ -58,7 +57,7 @@ fn sigops_vectors() {
     let data = include_str!("data/sigops_vectors.txt");
 
     let mut utxos: BTreeMap<UtxoKey, UtxoEntry> = BTreeMap::new();
-    let mut counts = [0usize; 6];
+    let mut counts = [0usize; 5];
 
     for line in data.lines() {
         let f: Vec<&str> = line.split(' ').collect();
@@ -91,8 +90,11 @@ fn sigops_vectors() {
                 let treasury: bool = f[3].parse().expect("treasury");
                 let (tx, _) = MsgTx::from_bytes(&unhex(f[4])).expect("tx");
                 let want: i64 = f[5].parse().expect("count");
+                // dcrd 2.2 made the count a fallible u32; the values
+                // for valid inputs are unchanged (the vote/coinbase
+                // input skipping is behavior-equivalent).
                 assert_eq!(
-                    count_sig_ops(&tx, coinbase, ssgen, treasury),
+                    i64::from(count_sig_ops(&tx, coinbase, ssgen, treasury).expect(line)),
                     want,
                     "{line}"
                 );
@@ -113,28 +115,26 @@ fn sigops_vectors() {
                 assert_eq!(kind_of(&result), f[6], "{line}");
                 if f[5] != "-" {
                     let want: i64 = f[5].parse().expect("count");
-                    assert_eq!(result.expect(line), want, "{line}: count");
+                    assert_eq!(i64::from(result.expect(line)), want, "{line}: count");
                 }
                 counts[1] += 1;
             }
-            "cnso" => {
-                let index: usize = f[1].parse().expect("index");
-                let stake_tree: bool = f[2].parse().expect("staketree");
-                let cum: i64 = f[3].parse().expect("cum");
-                let treasury: bool = f[4].parse().expect("treasury");
-                let (tx, _) = MsgTx::from_bytes(&unhex(f[5])).expect("tx");
-                let result = check_num_sig_ops(
+            "ctso" => {
+                let coinbase: bool = f[1].parse().expect("coinbase");
+                let vote: bool = f[2].parse().expect("vote");
+                let treasury: bool = f[3].parse().expect("treasury");
+                let (tx, _) = MsgTx::from_bytes(&unhex(f[4])).expect("tx");
+                let result = count_total_sig_ops(
                     &tx,
+                    coinbase,
+                    vote,
                     |op| utxos.get(&utxo_key(op)).cloned(),
-                    index,
-                    stake_tree,
-                    cum,
                     treasury,
                 );
-                assert_eq!(kind_of(&result), f[7], "{line}");
-                if f[6] != "-" {
-                    let want: i64 = f[6].parse().expect("count");
-                    assert_eq!(result.expect(line), want, "{line}: count");
+                assert_eq!(kind_of(&result), f[6], "{line}");
+                if f[5] != "-" {
+                    let want: i64 = f[5].parse().expect("count");
+                    assert_eq!(i64::from(result.expect(line)), want, "{line}: count");
                 }
                 counts[2] += 1;
             }
@@ -162,28 +162,8 @@ fn sigops_vectors() {
                 }
                 counts[4] += 1;
             }
-            "gstf" => {
-                let height: i64 = f[1].parse().expect("height");
-                let treasury: bool = f[2].parse().expect("treasury");
-                let variant = parse_variant(f[3]);
-                let txs = parse_txs(f[4]);
-                let result = get_stake_tree_fees(
-                    &mut subsidy_cache,
-                    height,
-                    &txs,
-                    |op| utxos.get(&utxo_key(op)).cloned(),
-                    treasury,
-                    variant,
-                );
-                assert_eq!(kind_of(&result), f[6], "{line}");
-                if f[5] != "-" {
-                    let want: i64 = f[5].parse().expect("fee");
-                    assert_eq!(result.expect(line), want, "{line}: fee");
-                }
-                counts[5] += 1;
-            }
             other => panic!("unknown row tag {other}"),
         }
     }
-    assert_eq!(counts, [40, 40, 40, 25, 25, 25], "row counts");
+    assert_eq!(counts, [40, 40, 40, 25, 25], "row counts");
 }

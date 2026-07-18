@@ -159,15 +159,18 @@ pub trait TemplateChain {
     /// Whether the treasury spend has enough votes to be included in
     /// a block after the given one (dcrd `CheckTSpendHasVotes`).
     fn check_tspend_has_votes(&self, prev_hash: &Hash, tspend: &MsgTx) -> Result<(), String>;
-    /// The signature operation count for the transaction (dcrd
-    /// `CountSigOps`).
-    fn count_sig_ops(
+    /// The total signature operation count for the transaction over
+    /// the given utxo view — input and output scripts plus redeemed
+    /// pay-to-script-hash inputs (dcrd `CountTotalSigOps`, new in
+    /// dcrd 2.2).
+    fn count_total_sig_ops(
         &self,
         tx: &MsgTx,
-        is_coin_base_tx: bool,
-        is_ssgen: bool,
+        is_coin_base: bool,
+        is_vote: bool,
+        view: &UtxoView,
         is_treasury_enabled: bool,
-    ) -> i64;
+    ) -> Result<u32, String>;
     /// The unspent output for the outpoint from the main chain tip,
     /// if any (dcrd `FetchUtxoEntry`).
     fn fetch_utxo_entry(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>, String>;
@@ -576,9 +579,13 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         )
         .map_err(|e| format!("{e:?}"))?;
         let tx_hash = revocation_tx.tx_hash();
-        let total_sig_ops =
-            self.chain
-                .count_sig_ops(&revocation_tx, false, false, is_treasury_enabled);
+        let total_sig_ops = i64::from(self.chain.count_total_sig_ops(
+            &revocation_tx,
+            false,
+            false,
+            block_utxos,
+            is_treasury_enabled,
+        )?);
         let tx_size = revocation_tx.serialize_size() as i64;
         Ok(Arc::new(TxDesc {
             tx: revocation_tx,
@@ -1304,9 +1311,13 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             subsidy_split_variant,
         );
         let coinbase_hash = coinbase_tx.tx_hash();
-        let num_coinbase_sig_ops =
-            self.chain
-                .count_sig_ops(&coinbase_tx, true, false, is_treasury_enabled);
+        let num_coinbase_sig_ops = i64::from(self.chain.count_total_sig_ops(
+            &coinbase_tx,
+            true,
+            false,
+            &block_utxos,
+            is_treasury_enabled,
+        )?);
         block_size += coinbase_tx.serialize_size() as u32;
         // Only consumed by dcrd's final debug log.
         block_sig_ops += num_coinbase_sig_ops;
@@ -1316,10 +1327,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         if let Some(tb) = &treasury_base {
             let tb_hash = tb.tx_hash();
             tx_fees_map.insert(tb_hash.0, 0);
-            let n = self
-                .chain
-                .count_sig_ops(tb, true, false, is_treasury_enabled);
-            tx_sig_op_counts_map.insert(tb_hash.0, n);
+            tx_sig_op_counts_map.insert(tb_hash.0, 0);
         }
 
         // Assemble the regular tree.

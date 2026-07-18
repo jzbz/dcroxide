@@ -141,19 +141,22 @@ impl TemplateChain for NodeTemplateChain {
         chain.check_tspend_has_votes(prev_node, tspend, &self.params)
     }
 
-    fn count_sig_ops(
+    fn count_total_sig_ops(
         &self,
         tx: &MsgTx,
-        is_coin_base_tx: bool,
-        is_ssgen: bool,
+        is_coin_base: bool,
+        is_vote: bool,
+        view: &UtxoView,
         is_treasury_enabled: bool,
-    ) -> i64 {
-        dcroxide_blockchain::validate::count_sig_ops(
+    ) -> Result<u32, String> {
+        dcroxide_blockchain::validate::count_total_sig_ops(
             tx,
-            is_coin_base_tx,
-            is_ssgen,
+            is_coin_base,
+            is_vote,
+            |op| view.lookup_entry(op).cloned(),
             is_treasury_enabled,
         )
+        .map_err(|e| e.description)
     }
 
     fn fetch_utxo_entry(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>, String> {

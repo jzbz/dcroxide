@@ -24,6 +24,7 @@ pub mod blockindex;
 pub mod chaindb;
 pub mod chainio;
 pub mod chainview_nodes;
+mod checkedmath;
 pub mod compress;
 pub mod difficulty;
 mod error;

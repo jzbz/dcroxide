@@ -44,10 +44,12 @@ fn analyze_ours(tx: &MsgTx) -> String {
             Err(e) => e.kind.kind_name().to_string(),
         }
     ));
-    w.push_str(&format!(
-        "checktreasurybase={}\n",
-        ok_or(stake::check_treasury_base(tx))
-    ));
+    // dcrd 2.2 moved the treasurybase null-outpoint check ahead of
+    // the output checks, so the failure kind for multi-defect
+    // transactions no longer matches the v2.1.5 oracle; the check is
+    // excluded from the oracle comparison (the acceptance set is
+    // unchanged and still covered through the type classification)
+    // and the new precedence is pinned natively below.
     if stake::is_sstx(tx) {
         let info = stake::tx_sstx_stake_output_info(tx);
         for i in 0..info.is_p2sh.len() {
@@ -78,7 +80,13 @@ fn analyze_ours(tx: &MsgTx) -> String {
 
 fn analyze_theirs(oracle: &mut Oracle, tx: &MsgTx) -> String {
     let result = oracle.call_ok("stake_analyze", &tx.serialize());
-    String::from_utf8(unhex(&result)).expect("dump is UTF-8")
+    let dump = String::from_utf8(unhex(&result)).expect("dump is UTF-8");
+    // Strip the treasurybase check row: its failure precedence
+    // changed in dcrd 2.2 (see analyze_ours).
+    dump.lines()
+        .filter(|line| !line.starts_with("checktreasurybase="))
+        .map(|line| format!("{line}\n"))
+        .collect()
 }
 
 fn random_hash(rng: &mut SplitMix64) -> Hash {
@@ -593,4 +601,50 @@ fn create_revocation_differential() {
             ),
         }
     }
+}
+
+/// dcrd 2.2's treasurybase failure precedence: the null-outpoint
+/// check runs before the output checks, so a transaction that is
+/// defective in both ways fails with the outpoint kind (the v2.1.5
+/// oracle reported the output kind for the same transaction).
+#[test]
+fn treasurybase_null_outpoint_precedence() {
+    // Version-3 transaction: one input with a NON-null outpoint and
+    // an empty signature script, plus a valid OP_TADD first output
+    // and a WRONG-LENGTH second output.
+    let mut tx = MsgTx {
+        version: 3,
+        ..MsgTx::default()
+    };
+    tx.tx_in.push(TxIn {
+        previous_out_point: OutPoint {
+            hash: Hash([0x57; 32]),
+            index: 1,
+            tree: 0,
+        },
+        sequence: 0xffff_ffff,
+        value_in: 0,
+        block_height: 0,
+        block_index: 0xffff_ffff,
+        signature_script: Vec::new(),
+    });
+    tx.tx_out.push(out(1, vec![0xc1])); // OP_TADD
+    tx.tx_out.push(out(0, vec![0x6a; 24])); // wrong second output
+
+    let err = stake::check_treasury_base(&tx).expect_err("defective treasurybase");
+    assert_eq!(err.kind.kind_name(), "ErrTreasuryBaseInvalid");
+    assert!(
+        err.description.contains("is not a null outpoint"),
+        "unexpected message: {}",
+        err.description
+    );
+
+    // With the null outpoint fixed, the later output check fires.
+    tx.tx_in[0].previous_out_point = OutPoint {
+        hash: Hash([0; 32]),
+        index: u32::MAX,
+        tree: 0,
+    };
+    let err = stake::check_treasury_base(&tx).expect_err("bad second output");
+    assert_eq!(err.kind.kind_name(), "ErrTreasuryBaseInvalidOpcode1");
 }

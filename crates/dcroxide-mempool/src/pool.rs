@@ -20,8 +20,8 @@ use alloc::vec::Vec;
 use dcroxide_blockchain::sequencelock::SequenceLock;
 use dcroxide_blockchain::utxoview::UtxoView;
 use dcroxide_blockchain::validate::{
-    AgendaFlags, check_transaction, check_transaction_inputs, count_p2sh_sig_ops, count_sig_ops,
-    is_expired_tx, sequence_lock_active, validate_transaction_scripts, verify_tspend_signature,
+    AgendaFlags, check_transaction, check_transaction_inputs, count_total_sig_ops, is_expired_tx,
+    sequence_lock_active, validate_transaction_scripts, verify_tspend_signature,
 };
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
@@ -1338,18 +1338,19 @@ impl<C: PoolChain> TxPool<C> {
         // Don't allow transactions with an excessive number of
         // signature operations which would result in making it
         // impossible to mine.
-        let num_p2sh_sig_ops = count_p2sh_sig_ops(
+        // dcrd 2.2 consolidated the regular and P2SH counting into
+        // CountTotalSigOps.
+        let total_sig_ops = count_total_sig_ops(
             &tx,
             false,
-            tx_type == TxType::SSGen,
+            is_vote,
             |op| utxo_view.lookup_entry(op).cloned(),
             is_treasury_enabled,
         )
         .map_err(|e| PoolError::Rule(chain_rule_error(e)))?;
-
-        let num_sig_ops = count_sig_ops(&tx, false, is_vote, is_treasury_enabled);
-        let total_sig_ops = num_p2sh_sig_ops + num_sig_ops;
-        if total_sig_ops > self.policy.max_sig_ops_per_tx {
+        // dcrd compares against uint32(MaxSigOpsPerTx); mirror the
+        // truncating conversion exactly.
+        if total_sig_ops > self.policy.max_sig_ops_per_tx as u32 {
             let str = format!(
                 "transaction {tx_hash} has too many sigops: {total_sig_ops} > {}",
                 self.policy.max_sig_ops_per_tx
@@ -1426,7 +1427,7 @@ impl<C: PoolChain> TxPool<C> {
             added_unix: self.chain.now_unix(),
             height: best_height,
             fee: tx_fee,
-            total_sig_ops,
+            total_sig_ops: i64::from(total_sig_ops),
             tx_size: serialized_size,
         });
 

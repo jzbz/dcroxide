@@ -190,6 +190,24 @@ pub fn check_transaction_sanity(tx: &MsgTx, max_tx_size: u64) -> Result<(), Rule
         }
     }
 
+    // Input values in the fraud proof must either be in the valid
+    // range or the special sentinel value that signals it needs to be
+    // filled in later (new in dcrd 2.2).
+    for tx_in in &tx.tx_in {
+        let atoms = tx_in.value_in;
+        if atoms < 0 && atoms != dcroxide_wire::NULL_VALUE_IN {
+            let str = format!("transaction input value has negative value of {atoms}");
+            return Err(rule_error(ErrorKind::FraudAmountIn, str));
+        }
+        if atoms > MAX_ATOMS {
+            let str = format!(
+                "transaction input value {atoms} is higher than max allowed value \
+                 of {MAX_ATOMS}"
+            );
+            return Err(rule_error(ErrorKind::FraudAmountIn, str));
+        }
+    }
+
     // Check for duplicate transaction inputs.
     let mut existing_tx_out: BTreeSet<([u8; 32], u32, i8)> = BTreeSet::new();
     for tx_in in &tx.tx_in {

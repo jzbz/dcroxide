@@ -2553,6 +2553,7 @@ impl Chain {
                         &|op: &OutPoint| self.fetch_utxo_entry(op),
                         Some(&mut stxos),
                         run_scripts,
+                        Some(&|blk: &MsgBlock| self.tspend_checks(parent_id, blk, params)),
                         params,
                     )
                 };
@@ -3382,6 +3383,7 @@ impl Chain {
                 &|op: &OutPoint| self.fetch_utxo_entry(op),
                 None,
                 run_scripts,
+                Some(&|blk: &MsgBlock| self.tspend_checks(prev_node, blk, params)),
                 params,
             )
             .map(|_| ());
@@ -3417,6 +3419,7 @@ impl Chain {
             &|op: &OutPoint| self.fetch_utxo_entry(op),
             None,
             run_scripts,
+            Some(&|blk: &MsgBlock| self.tspend_checks(prev_node, blk, params)),
             params,
         )
         .map(|_| ())
@@ -4906,6 +4909,7 @@ impl Chain {
         )
         .map_err(|e| format!("{e:?}"))?;
 
+        let tspend_hash = tspend.tx_hash();
         let next_height = self.store.node(prev_node).height + 1;
         if !dcroxide_standalone::inside_tspend_window(
             next_height,
@@ -4914,13 +4918,17 @@ impl Chain {
             params.treasury_vote_interval_multiplier,
         ) {
             return Err(format!(
-                "tspend outside of window: nextHeight {next_height} start {start} expiry {expiry}"
+                "treasury spend {tspend_hash} at height {next_height} with expiry {expiry} is \
+                 outside of the valid window [{start}, {end}]"
             ));
         }
 
-        let tspend_hash = tspend.tx_hash();
-        let mut yes = 0u32;
-        let mut no = 0u32;
+        // Tally the total number of yes and no votes in the voting
+        // window.  dcrd 2.2 guards the tallies against overflow even
+        // though the voting window and per-block vote limits make it
+        // unreachable in practice.
+        let mut total_yes = 0u32;
+        let mut total_no = 0u32;
         let mut node = Some(prev_node);
         while let Some(id) = node {
             if self.store.node(id).height < i64::from(start) {
@@ -4929,7 +4937,7 @@ impl Chain {
             let block = self.block_by_node(id);
             for stx in &block.stransactions {
                 let Ok(votes) = dcroxide_stake::check_ssgen_votes(stx) else {
-                    // Not a vote.
+                    // Not a stake vote.
                     continue;
                 };
                 for vote in &votes {
@@ -4937,15 +4945,37 @@ impl Chain {
                         continue;
                     }
                     match vote.vote {
-                        dcroxide_stake::TREASURY_VOTE_YES => yes += 1,
-                        dcroxide_stake::TREASURY_VOTE_NO => no += 1,
+                        dcroxide_stake::TREASURY_VOTE_YES => {
+                            let (sum, ok) =
+                                crate::checkedmath::AddUnsigned::add_unsigned(total_yes, 1);
+                            total_yes = sum;
+                            if !ok {
+                                return Err(format!(
+                                    "yes vote for treasury spend {tspend_hash} at height {} \
+                                     causes yes count to overflow",
+                                    self.store.node(id).height
+                                ));
+                            }
+                        }
+                        dcroxide_stake::TREASURY_VOTE_NO => {
+                            let (sum, ok) =
+                                crate::checkedmath::AddUnsigned::add_unsigned(total_no, 1);
+                            total_no = sum;
+                            if !ok {
+                                return Err(format!(
+                                    "no vote for treasury spend {tspend_hash} at height {} \
+                                     causes no count to overflow",
+                                    self.store.node(id).height
+                                ));
+                            }
+                        }
                         _ => {}
                     }
                 }
             }
             node = self.store.node(id).parent;
         }
-        Ok((start, end, yes, no))
+        Ok((start, end, total_yes, total_no))
     }
 
     /// Verify the treasury spend has enough votes to be included in a
@@ -4959,10 +4989,13 @@ impl Chain {
         let (start, end, yes, no) = self.tspend_count_votes(prev_node, tspend, params)?;
 
         // Passing criteria are the quorum and required percentages.
-        let max_votes = u64::from(params.tickets_per_block) * u64::from(end - start);
+        // dcrd computes maxVotes in wrapping u32 before widening.
+        let max_votes = u64::from(u32::from(params.tickets_per_block).wrapping_mul(end - start));
         let quorum = max_votes * params.treasury_vote_quorum_multiplier
             / params.treasury_vote_quorum_divisor;
-        let num_votes_cast = u64::from(yes + no);
+        // Go adds the u32 tallies before widening; mirror the wrapping
+        // semantics exactly.
+        let num_votes_cast = u64::from(yes.wrapping_add(no));
         if num_votes_cast < quorum {
             return Err(format!(
                 "quorum not met: yes {yes} no {no}  quorum {quorum} max {max_votes}"
@@ -4974,7 +5007,8 @@ impl Chain {
         // threshold.
         let cur_block_height = (self.store.node(prev_node).height + 1) as u32;
         let remaining_blocks = end - cur_block_height;
-        let max_remaining_votes = u64::from(remaining_blocks) * u64::from(params.tickets_per_block);
+        let max_remaining_votes =
+            u64::from(remaining_blocks.wrapping_mul(u32::from(params.tickets_per_block)));
         let required_votes = (num_votes_cast + max_remaining_votes)
             * params.treasury_vote_required_multiplier
             / params.treasury_vote_required_divisor;
@@ -5212,20 +5246,20 @@ impl Chain {
                 ));
             }
 
-            // The value-in commitment in the OP_RETURN.
+            // A valid treasury spend always stores the entire amount
+            // the treasury is spending in the first input.  It has
+            // already been verified to match the commitment value by
+            // checkTreasurySpendInputs during the stake tree connect
+            // (dcrd 2.2 moved the value-in check there), so here it
+            // only accumulates the total while checking for overflow.
             let value_in = stx.tx_in[0].value_in;
-            total_tspend_amount += value_in;
-            let mut le = [0u8; 8];
-            le.copy_from_slice(&stx.tx_out[0].pk_script[2..10]);
-            let value_in_op_ret = i64::from_le_bytes(le);
-            if value_in != value_in_op_ret {
+            let (sum, ok) =
+                crate::checkedmath::AddSigned::add_signed(total_tspend_amount, value_in);
+            total_tspend_amount = sum;
+            if !ok {
                 return Err(rule_error(
-                    RuleErrorKind::InvalidTSpendValueIn,
-                    format!(
-                        "block contains TSpend transaction ({}) that did not encode ValueIn \
-                         correctly got {value_in_op_ret} wanted {value_in}",
-                        stx.tx_hash()
-                    ),
+                    RuleErrorKind::BadTxOutValue,
+                    "total value of all treasury spends overflows accumulator",
                 ));
             }
 

@@ -30,6 +30,10 @@ pub enum ErrorKind {
     /// An output value for a transaction is invalid in some way, such as
     /// being out of range.
     BadTxOutValue,
+    /// A fraud proof witness amount (aka the input value) for a
+    /// transaction is invalid in some way such as being out of range
+    /// (new in dcrd 2.2).
+    FraudAmountIn,
     /// A transaction references the same input more than once.
     DuplicateTxInputs,
 }
@@ -45,6 +49,7 @@ impl ErrorKind {
             ErrorKind::NoTxOutputs => "ErrNoTxOutputs",
             ErrorKind::TxTooBig => "ErrTxTooBig",
             ErrorKind::BadTxOutValue => "ErrBadTxOutValue",
+            ErrorKind::FraudAmountIn => "ErrFraudAmountIn",
             ErrorKind::DuplicateTxInputs => "ErrDuplicateTxInputs",
         }
     }
