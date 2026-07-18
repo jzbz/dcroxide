@@ -1859,7 +1859,7 @@ pub fn check_ticket_purchase_inputs(
                 return Err(rule_error(
                     RuleErrorKind::MissingTxOut,
                     format!(
-                        "output {:?} referenced from transaction {}:{tx_in_idx} either \
+                        "output {} referenced from transaction {}:{tx_in_idx} either \
                          does not exist or has already been spent",
                         tx_in.previous_out_point,
                         tx.tx_hash()
@@ -2342,7 +2342,7 @@ pub fn check_vote_inputs<SP: dcroxide_standalone::SubsidyParams>(
             return Err(rule_error(
                 RuleErrorKind::MissingTxOut,
                 format!(
-                    "ticket output {:?} referenced by vote {vote_hash}:{TICKET_IN_IDX} \
+                    "ticket output {} referenced by vote {vote_hash}:{TICKET_IN_IDX} \
                      either does not exist or has already been spent",
                     ticket_in.previous_out_point
                 ),
@@ -2356,7 +2356,7 @@ pub fn check_vote_inputs<SP: dcroxide_standalone::SubsidyParams>(
         return Err(rule_error(
             RuleErrorKind::InvalidVoteInput,
             format!(
-                "output {:?} referenced by vote {vote_hash}:{TICKET_IN_IDX} consensus \
+                "output {} referenced by vote {vote_hash}:{TICKET_IN_IDX} consensus \
                  violation: {e}",
                 ticket_in.previous_out_point
             ),
@@ -2458,7 +2458,7 @@ pub fn check_revocation_inputs(
             return Err(rule_error(
                 RuleErrorKind::MissingTxOut,
                 format!(
-                    "ticket output {:?} referenced from revocation \
+                    "ticket output {} referenced from revocation \
                      {revoke_hash}:{TICKET_IN_IDX} either does not exist or has \
                      already been spent",
                     ticket_in.previous_out_point
@@ -2473,7 +2473,7 @@ pub fn check_revocation_inputs(
         return Err(rule_error(
             RuleErrorKind::InvalidRevokeInput,
             format!(
-                "output {:?} referenced by revocation {revoke_hash}:{TICKET_IN_IDX} \
+                "output {} referenced by revocation {revoke_hash}:{TICKET_IN_IDX} \
                  consensus violation: {e}",
                 ticket_in.previous_out_point
             ),
@@ -2626,6 +2626,15 @@ pub fn check_treasury_spend_inputs(msg_tx: &MsgTx) -> Result<(), RuleError> {
     Ok(())
 }
 
+/// Render bytes as the concatenated lowercase hex of Go's `%x` verb.
+fn hex_string(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 /// Perform a series of checks on the inputs to a transaction to ensure
 /// they are valid, returning the transaction fee (dcrd
 /// `CheckTransactionInputs`).  The transaction MUST have already been
@@ -2709,7 +2718,7 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
         if !params.pi_key_exists(&pub_key) {
             return Err(rule_error(
                 RuleErrorKind::UnknownPiKey,
-                format!("unknown treasury spend pi key: {pub_key:x?}"),
+                format!("unknown treasury spend pi key: {}", hex_string(&pub_key)),
             ));
         }
 
@@ -2772,13 +2781,14 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
         }
 
         let tx_in_outpoint = &tx_in.previous_out_point;
+        let tx_in_hash = &tx_in_outpoint.hash;
         let utxo_entry = match lookup_entry(tx_in_outpoint) {
             Some(e) if !e.is_spent() => e,
             _ => {
                 return Err(rule_error(
                     RuleErrorKind::MissingTxOut,
                     format!(
-                        "output {tx_in_outpoint:?} referenced from transaction \
+                        "output {tx_in_outpoint} referenced from transaction \
                          {tx_hash}:{idx} either does not exist or has already been spent"
                     ),
                 ));
@@ -2789,7 +2799,7 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
         if utxo_entry.amount() == 0 {
             return Err(rule_error(
                 RuleErrorKind::ZeroValueOutputSpend,
-                format!("tried to spend zero value output from input {tx_in_outpoint:?}"),
+                format!("tried to spend zero value output from input {tx_in_outpoint}"),
             ));
         }
 
@@ -2838,9 +2848,9 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
                 return Err(rule_error(
                     RuleErrorKind::ImmatureSpend,
                     format!(
-                        "tried to spend coinbase transaction from height {origin_height} \
-                         at height {tx_height} before required maturity of \
-                         {coinbase_maturity} blocks"
+                        "tried to spend coinbase transaction {tx_in_hash} from height \
+                         {origin_height} at height {tx_height} before required maturity \
+                         of {coinbase_maturity} blocks"
                     ),
                 ));
             }
@@ -2855,9 +2865,9 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
                 return Err(rule_error(
                     RuleErrorKind::ExpiryTxSpentEarly,
                     format!(
-                        "tried to spend transaction including an expiry from height \
-                         {origin_height} at height {tx_height} before required maturity \
-                         of {coinbase_maturity} blocks"
+                        "tried to spend transaction {tx_in_hash} including an expiry \
+                         from height {origin_height} at height {tx_height} before \
+                         required maturity of {coinbase_maturity} blocks"
                     ),
                 ));
             }
@@ -2874,9 +2884,9 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
                 return Err(rule_error(
                     RuleErrorKind::ImmatureSpend,
                     format!(
-                        "tried to spend OP_TGEN output from height {origin_height} at \
-                         height {tx_height} before required maturity of \
-                         {coinbase_maturity} blocks"
+                        "tried to spend OP_TGEN output from tx {tx_in_hash} from height \
+                         {origin_height} at height {tx_height} before required maturity \
+                         of {coinbase_maturity} blocks"
                     ),
                 ));
             }
@@ -2889,7 +2899,7 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
             return Err(rule_error(
                 RuleErrorKind::TxSStxOutSpend,
                 format!(
-                    "tried to spend OP_SSTX output {tx_in_outpoint:?} from a transaction \
+                    "tried to spend OP_SSTX output {tx_in_outpoint} from a transaction \
                      that is not a vote or revocation"
                 ),
             ));
@@ -2903,7 +2913,7 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
         {
             return Err(rule_error(
                 RuleErrorKind::BadTxInput,
-                format!("tried to spend treasury add output {tx_in_outpoint:?}"),
+                format!("tried to spend treasury add output {tx_in_outpoint}"),
             ));
         }
 
@@ -2918,7 +2928,7 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
                 return Err(rule_error(
                     RuleErrorKind::ImmatureSpend,
                     format!(
-                        "tried to spend OP_SSGEN or OP_SSRTX output {tx_in_outpoint:?} \
+                        "tried to spend OP_SSGEN or OP_SSRTX output {tx_in_outpoint} \
                          from height {origin_height} at height {tx_height} before \
                          required maturity of {coinbase_maturity} blocks"
                     ),
@@ -2935,7 +2945,7 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
                 return Err(rule_error(
                     RuleErrorKind::ImmatureSpend,
                     format!(
-                        "tried to spend ticket change output {tx_in_outpoint:?} from \
+                        "tried to spend ticket change output {tx_in_outpoint} from \
                          height {origin_height} at height {tx_height} before required \
                          maturity of {} blocks",
                         params.sstx_change_maturity
@@ -3101,7 +3111,7 @@ pub fn count_p2sh_sig_ops(
                 return Err(rule_error(
                     RuleErrorKind::MissingTxOut,
                     format!(
-                        "output {tx_in_outpoint:?} referenced from transaction {}:{} \
+                        "output {tx_in_outpoint} referenced from transaction {}:{} \
                          either does not exist or has already been spent",
                         tx.tx_hash(),
                         tx_in_index + tx_in_start_idx
@@ -3129,7 +3139,7 @@ pub fn count_p2sh_sig_ops(
             return Err(rule_error(
                 RuleErrorKind::TooManySigOps,
                 format!(
-                    "output {tx_in_outpoint:?} public key script causes signature \
+                    "output {tx_in_outpoint} public key script causes signature \
                      operations count to overflow"
                 ),
             ));
@@ -3289,7 +3299,7 @@ pub fn check_dup_txs(
                 return Err(rule_error(
                     RuleErrorKind::OverwriteTx,
                     format!(
-                        "tried to overwrite transaction output {outpoint:?} at block \
+                        "tried to overwrite transaction output {outpoint} at block \
                              height {} that is not spent",
                         entry.block_height()
                     ),
@@ -3829,6 +3839,7 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
     subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
     input_fees: i64,
     node_height: i64,
+    node_hash: Hash,
     node_voters: u16,
     prev_header: &dcroxide_wire::BlockHeader,
     txs: &[MsgTx],
@@ -3977,8 +3988,9 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
             return Err(rule_error(
                 RuleErrorKind::BadCoinbaseValue,
                 format!(
-                    "coinbase transaction pays {total_atom_out_regular} which is more \
-                     than expected value of {exp_atom_out}"
+                    "coinbase transaction for block {node_hash} pays \
+                     {total_atom_out_regular} which is more than expected value of \
+                     {exp_atom_out}"
                 ),
             ));
         }
@@ -4051,6 +4063,87 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
     Ok(total_fees)
 }
 
+/// Whether `coins` lies exactly halfway between the decimal value
+/// rendered by `digits` (which carries `frac_len` fractional digits)
+/// and the adjacent same-length decimal one final-digit step toward
+/// zero (`Some(true)`) or away from zero (`Some(false)`), decided
+/// with exact integer arithmetic.  `None` when the value is not
+/// exactly halfway; any overflow implies inequality and also yields
+/// `None`.
+fn halfway_tie(coins: f64, digits: &[u8], frac_len: usize) -> Option<bool> {
+    // Decompose |coins| = mant * 2^exp exactly.
+    let bits = coins.abs().to_bits();
+    let biased = (bits >> 52) as i64;
+    let mask52 = (1u64 << 52) - 1;
+    let (mant, exp) = if biased == 0 {
+        (bits & mask52, -1074i64)
+    } else {
+        ((bits & mask52) | (1u64 << 52), biased - 1075)
+    };
+    if mant == 0 {
+        return None;
+    }
+
+    // The printed digits as an integer n, so |value| = n * 10^-frac_len.
+    let mut n: u128 = 0;
+    for &b in digits {
+        if b.is_ascii_digit() {
+            n = n.checked_mul(10)?.checked_add(u128::from(b - b'0'))?;
+        }
+    }
+
+    // Halfway iff mant * 2^exp * 10^(frac_len+1) == 10*n -+ 5.
+    let scale = frac_len as i64 + 1;
+    let mut lhs = u128::from(mant).checked_mul(5u128.checked_pow(u32::try_from(scale).ok()?)?)?;
+    let shift = exp + scale;
+    if shift >= 0 {
+        lhs = lhs.checked_mul(1u128.checked_shl(u32::try_from(shift).ok()?)?)?;
+    } else {
+        let down = u32::try_from(-shift).ok()?;
+        if down >= 128 || lhs & ((1u128 << down) - 1) != 0 {
+            return None;
+        }
+        lhs >>= down;
+    }
+    let ten_n = n.checked_mul(10)?;
+    if Some(lhs) == ten_n.checked_sub(5) {
+        return Some(true); // the printed digits round the tie away from zero
+    }
+    if Some(lhs) == ten_n.checked_add(5) {
+        return Some(false); // the printed digits round the tie toward zero
+    }
+    None
+}
+
+/// Format an atoms amount the way dcrd's `dcrutil.Amount` `String`
+/// method renders it: the float64 quotient atoms/1e8 printed with the
+/// fewest digits that parse back to the same float64 and the " DCR"
+/// units label appended.  Rust's float `Display` follows the same
+/// shortest-round-trip rule but resolves an exactly-halfway final
+/// digit away from zero where Go's strconv keeps the even candidate
+/// (reachable only beyond consensus-valid amounts), so that case is
+/// detected exactly and nudged to the even digit.
+fn amount_string(atoms: i64) -> String {
+    let coins = atoms as f64 / 1e8;
+    let mut digits = format!("{coins}").into_bytes();
+    if let Some(dot) = digits.iter().position(|&b| b == b'.') {
+        let frac_len = digits.len() - dot - 1;
+        let last_idx = digits.len() - 1;
+        // Both tie orientations print an odd final digit whenever the
+        // choice differs from Go's, so an even one needs no check.
+        if (digits[last_idx] - b'0') % 2 == 1 {
+            match halfway_tie(coins, &digits, frac_len) {
+                Some(true) => digits[last_idx] -= 1,
+                Some(false) => digits[last_idx] += 1,
+                None => {}
+            }
+        }
+    }
+    let mut s = String::from_utf8(digits).expect("ascii decimal digits");
+    s.push_str(" DCR");
+    s
+}
+
 /// Ensure the coinbase pays the pre-treasury-agenda organization
 /// address the correct tax (dcrd `coinbasePaysTreasuryAddress`).
 pub fn coinbase_pays_treasury_address<SP: dcroxide_standalone::SubsidyParams>(
@@ -4091,8 +4184,9 @@ pub fn coinbase_pays_treasury_address<SP: dcroxide_standalone::SubsidyParams>(
         return Err(rule_error(
             RuleErrorKind::NoTreasury,
             format!(
-                "treasury output amount is {} instead of {org_subsidy}",
-                treasury_output.value
+                "treasury output amount is {} instead of {}",
+                amount_string(treasury_output.value),
+                amount_string(org_subsidy)
             ),
         ));
     }
@@ -4151,8 +4245,9 @@ pub fn check_treasury_base<SP: dcroxide_standalone::SubsidyParams>(
         return Err(rule_error(
             RuleErrorKind::TreasurybaseOutValue,
             format!(
-                "treasury output amount is {} instead of {org_subsidy}",
-                treasury_output.value
+                "treasury output amount is {} instead of {}",
+                amount_string(treasury_output.value),
+                amount_string(org_subsidy)
             ),
         ));
     }
@@ -4323,7 +4418,7 @@ pub fn check_block_scripts(
                 return Err(rule_error(
                     RuleErrorKind::MissingTxOut,
                     format!(
-                        "unable to find unspent output {:?} referenced from transaction \
+                        "unable to find unspent output {} referenced from transaction \
                          {}:{tx_in_idx}",
                         tx_in.previous_out_point,
                         tx.tx_hash()
@@ -4491,6 +4586,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         subsidy_cache,
         0,
         node_height,
+        node_hash,
         node_voters,
         prev_header,
         &block.stransactions,
@@ -4561,6 +4657,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         subsidy_cache,
         stake_tree_fees,
         node_height,
+        node_hash,
         node_voters,
         prev_header,
         &block.transactions,
@@ -4672,7 +4769,7 @@ pub fn validate_transaction_scripts(
             return Err(rule_error(
                 RuleErrorKind::MissingTxOut,
                 format!(
-                    "unable to find unspent output {prev_out:?} referenced from \
+                    "unable to find unspent output {prev_out} referenced from \
                      transaction {}:{tx_in_idx}",
                     tx.tx_hash()
                 ),
@@ -4690,7 +4787,7 @@ pub fn validate_transaction_scripts(
                         RuleErrorKind::ScriptMalformed,
                         format!(
                             "failed to parse input {}:{tx_in_idx} which references output \
-                     {prev_out:?} - {e:?}",
+                     {prev_out} - {e:?}",
                             tx.tx_hash()
                         ),
                     )
@@ -4700,7 +4797,7 @@ pub fn validate_transaction_scripts(
                 RuleErrorKind::ScriptValidation,
                 format!(
                     "failed to validate input {}:{tx_in_idx} which references \
-                     output {prev_out:?} - {e:?}",
+                     output {prev_out} - {e:?}",
                     tx.tx_hash()
                 ),
             )

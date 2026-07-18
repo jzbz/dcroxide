@@ -4907,7 +4907,7 @@ impl Chain {
             params.treasury_vote_interval,
             params.treasury_vote_interval_multiplier,
         )
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| format!("{e}"))?;
 
         let tspend_hash = tspend.tx_hash();
         let next_height = self.store.node(prev_node).height + 1;
@@ -5197,7 +5197,7 @@ impl Chain {
         }
         let allowed_to_spend = self
             .max_treasury_expenditure(pre_tvi_node, params)
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|e| format!("{e}"))?;
         if total_tspend_amount > allowed_to_spend {
             return Err(format!(
                 "treasury spend greater than allowed {total_tspend_amount} > {allowed_to_spend}"

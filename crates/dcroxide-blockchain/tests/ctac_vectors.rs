@@ -98,6 +98,7 @@ fn ctac_vectors() {
                     &mut subsidy_cache,
                     input_fees,
                     height,
+                    Hash::default(),
                     voters,
                     &prev_header,
                     &txs,

@@ -3,6 +3,7 @@
 //! all three serialization types, and the BLAKE-256 transaction hashes.
 
 use alloc::vec::Vec;
+use core::fmt;
 
 use dcroxide_chainhash::{Hash, hash_h};
 
@@ -128,6 +129,14 @@ pub struct OutPoint {
     pub index: u32,
     /// The transaction tree the referenced output lives in.
     pub tree: i8,
+}
+
+impl fmt::Display for OutPoint {
+    /// The `hash:index` form of dcrd's `OutPoint.String` (the tree is
+    /// not part of the rendering).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.hash, self.index)
+    }
 }
 
 /// A Decred transaction input: prefix fields plus witness fields.
