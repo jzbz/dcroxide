@@ -67,6 +67,13 @@ pub struct ServerContext {
     /// The parsed whitelisted networks (`--whitelist`); peers matching
     /// one are exempt from banning.
     pub whitelists: Vec<crate::config::IpNet>,
+    /// The banned hosts and the Unix nanosecond times the bans lift
+    /// (dcrd `peerState.banned`), fed by the misbehavior handlers and
+    /// consulted by the pre-handshake inbound admission.
+    pub banned_hosts: Mutex<std::collections::BTreeMap<String, i64>>,
+    /// How long misbehaving peers stay banned, in nanoseconds
+    /// (`--banduration`).
+    pub ban_duration_nanos: i64,
     /// The address manager the addr exchange consults and feeds.
     pub addr_manager: Arc<Mutex<AddrManager>>,
     /// The network's stake validation height; a best tip below it
@@ -804,6 +811,10 @@ pub struct ServerPeerHandler {
     /// Whether the legacy mining state was already sent on this
     /// connection (dcrd `serverPeer.getMiningStateSent`).
     mining_state_sent: bool,
+    /// Whether an initial state message (initstate or the legacy
+    /// miningstate) was already received on this connection (dcrd
+    /// 2.2's `serverPeer.initStateReceived`; repeats ban).
+    init_state_received: bool,
     /// The sync-manager peer id once registered (dcrd `sp.syncMgrPeer`).
     sync_peer_id: Option<i32>,
     /// A socket handle handed to the registry so disconnect actions
@@ -841,11 +852,54 @@ impl ServerPeerHandler {
             env: NodePeerEnv::new(),
             init_state_sent: false,
             mining_state_sent: false,
+            init_state_received: false,
             sync_peer_id: None,
             socket,
             permanent,
             conn_req_id,
             remote_addr,
+        }
+    }
+
+    /// Record a ban for this peer's host in the shared banned map
+    /// (dcrd `server.BanPeer` reached from the misbehavior handlers;
+    /// the disconnect itself rides the returned serve signal, and
+    /// whitelisted peers and disabled banning are no-ops inside
+    /// [`crate::server::ban_peer`]).
+    fn ban_peer_now(&mut self) -> crate::server::BanPeerOutcome {
+        let mut banned = self
+            .ctx
+            .banned_hosts
+            .lock()
+            .expect("banned-hosts mutex poisoned");
+        crate::server::ban_peer(
+            &mut banned,
+            &self.remote_addr,
+            self.addr_state.is_whitelisted,
+            self.ctx.disable_banning,
+            self.ctx.ban_duration_nanos,
+            self.env.now_nanos(),
+        )
+    }
+
+    /// The peer sent bytes that failed wire decoding (dcrd `OnRead`
+    /// banning "sent malformed wire message: %s"): record the ban;
+    /// the reason is log-only and the read loop disconnects on its
+    /// own.  BanPeer's whitelist and disabled-banning no-ops live
+    /// inside [`crate::server::ban_peer`].
+    pub(crate) fn on_wire_violation(&mut self, _err: &str) {
+        let _ = self.ban_peer_now();
+    }
+
+    /// Route a direct ban whose disconnect happens only inside dcrd
+    /// `BanPeer`: a whitelisted peer or disabled banning keeps the
+    /// connection (dcrd's handlers just return), everything else
+    /// drops it with the given reason.
+    fn ban_peer_or_continue(&mut self, reason: std::borrow::Cow<'static, str>) -> ServeSignal {
+        match self.ban_peer_now() {
+            crate::server::BanPeerOutcome::Ignored => ServeSignal::Continue,
+            crate::server::BanPeerOutcome::Banned { .. }
+            | crate::server::BanPeerOutcome::DisconnectOnly => ServeSignal::Disconnect(reason),
         }
     }
 
@@ -1073,20 +1127,57 @@ impl ServerPeerHandler {
                 self.on_get_cfilters_v2(get_cfs.start_hash, get_cfs.end_hash, outbound);
                 ServeSignal::Continue
             }
-            Message::GetInitState(get_init) => {
-                self.on_get_init_state(&get_init.types, outbound);
-                ServeSignal::Continue
-            }
-            Message::GetMiningState => {
-                self.on_get_mining_state(outbound);
-                ServeSignal::Continue
-            }
+            Message::GetInitState(get_init) => self.on_get_init_state(&get_init.types, outbound),
+            Message::GetMiningState => self.on_get_mining_state(peer.protocol_version(), outbound),
             Message::MiningState(state) => {
+                // dcrd 2.2 bans peers sending the legacy state once the
+                // protocol version makes it a knowing violation, and
+                // peers repeating an initial state message.
+                let pver = peer.protocol_version();
+                if pver >= dcroxide_wire::INIT_STATE_VERSION {
+                    let _ = self.ban_peer_now();
+                    return ServeSignal::Disconnect(
+                        format!(
+                            "sent miningstate with protocol version {pver} >= {}",
+                            dcroxide_wire::INIT_STATE_VERSION
+                        )
+                        .into(),
+                    );
+                }
+                if self.init_state_received {
+                    let _ = self.ban_peer_now();
+                    return ServeSignal::Disconnect(
+                        "sent more than one initial state message (miningstate)".into(),
+                    );
+                }
+                self.init_state_received = true;
+
                 // Request the advertised blocks and votes through the
                 // sync manager (dcrd `OnMiningState` calling
                 // `RequestFromPeer` with no treasury spends).
                 self.drive_sync(|manager, id| {
                     manager.request_from_peer(id, &state.block_hashes, &state.vote_hashes, &[])
+                });
+                ServeSignal::Continue
+            }
+            Message::InitState(state) => {
+                // dcrd 2.2 bans peers repeating an initial state
+                // message; the first one forwards its hashes to the
+                // sync manager (dcrd `OnInitState`).
+                if self.init_state_received {
+                    let _ = self.ban_peer_now();
+                    return ServeSignal::Disconnect(
+                        "sent more than one initial state message (initstate)".into(),
+                    );
+                }
+                self.init_state_received = true;
+                self.drive_sync(|manager, id| {
+                    manager.request_from_peer(
+                        id,
+                        &state.block_hashes,
+                        &state.vote_hashes,
+                        &state.tspend_hashes,
+                    )
                 });
                 ServeSignal::Continue
             }
@@ -1233,7 +1324,8 @@ impl ServerPeerHandler {
                     now_unix(),
                 ) {
                     crate::server::OnMemPoolOutcome::Banned => {
-                        ServeSignal::Disconnect("ban score exceeds threshold")
+                        let _ = self.ban_peer_now();
+                        ServeSignal::Disconnect("ban score exceeds threshold".into())
                     }
                     crate::server::OnMemPoolOutcome::Inventory(invs) => {
                         // Drop inventory the peer already knows and mark the
@@ -1269,26 +1361,56 @@ impl ServerPeerHandler {
                 }
                 ServeSignal::Continue
             }
-            Message::GetCFilter(_) | Message::GetCFHeaders(_) | Message::GetCFTypes => {
+            msg @ (Message::GetCFilter(_) | Message::GetCFHeaders(_) | Message::GetCFTypes) => {
                 // The daemon advertises no committed-filter service, so a
                 // v1 committed-filter request is a deliberate protocol
-                // violation: disconnect and, when the peer negotiated
-                // NodeCFVersion and banning is enabled, add dcrd's +100 ban
-                // score (dcrd `enforceNodeCFFlag`).
+                // violation: dcrd 2.2 bans the peer directly when it
+                // negotiated NodeCFVersion and banning is enabled, and
+                // disconnects regardless (dcrd `enforceNodeCFFlag`).
                 match crate::server::enforce_node_cf_flag(
-                    &mut self.addr_state,
                     peer.protocol_version(),
+                    self.ctx.disable_banning,
+                    msg.command(),
+                ) {
+                    crate::server::CfFlagOutcome::BanAndDisconnect { reason } => {
+                        let _ = self.ban_peer_now();
+                        ServeSignal::Disconnect(reason.into())
+                    }
+                    crate::server::CfFlagOutcome::DisconnectOnly => ServeSignal::Disconnect(
+                        "sent an unsupported committed filter request".into(),
+                    ),
+                }
+            }
+            Message::NotFound(not_found) => {
+                // Score excessive notfound messages (dcrd
+                // `serverPeer.OnNotFound` applying the per-type ban
+                // scores) and forward the survivors to the sync
+                // manager.
+                match crate::server::on_not_found(
+                    &mut self.addr_state,
+                    true,
+                    &not_found.inv_list,
                     self.ctx.disable_banning,
                     self.ctx.ban_threshold,
                     now_unix(),
                 ) {
-                    crate::server::CfFlagOutcome::BanAndDisconnect { .. }
-                    | crate::server::CfFlagOutcome::DisconnectOnly => {
-                        ServeSignal::Disconnect("sent an unsupported committed filter request")
+                    crate::server::OnNotFoundOutcome::Banned(_) => {
+                        let _ = self.ban_peer_now();
+                        ServeSignal::Disconnect("ban score exceeds threshold".into())
+                    }
+                    crate::server::OnNotFoundOutcome::DisconnectInvalidType => {
+                        ServeSignal::Disconnect("sent an invalid notfound inventory type".into())
+                    }
+                    crate::server::OnNotFoundOutcome::Ignored => ServeSignal::Continue,
+                    crate::server::OnNotFoundOutcome::Forward => {
+                        self.drive_sync(|manager, id| {
+                            manager.on_not_found(id, not_found);
+                            Vec::new()
+                        });
+                        ServeSignal::Continue
                     }
                 }
             }
-            // The mix-message intake arrives with the mixpool wiring.
             _ => ServeSignal::Continue,
         }
     }
@@ -1368,20 +1490,21 @@ impl ServerPeerHandler {
             now_unix(),
         );
         match outcome {
-            // The ban outcomes drop the connection; the ban-list
-            // bookkeeping refusing reconnects arrives with the
-            // peer-state wiring.
+            // The ban outcomes record the host in the shared banned map
+            // and drop the connection.
             OnGetDataOutcome::BanEmpty => {
-                return ServeSignal::Disconnect("sent an empty getdata request");
+                // dcrd only disconnects inside BanPeer here.
+                return self.ban_peer_or_continue("sent an empty getdata request".into());
             }
             OnGetDataOutcome::BanScore => {
-                return ServeSignal::Disconnect("ban score exceeds threshold");
+                let _ = self.ban_peer_now();
+                return ServeSignal::Disconnect("ban score exceeds threshold".into());
             }
             OnGetDataOutcome::DisconnectConcurrent => {
-                return ServeSignal::Disconnect("too many concurrent getdata requests");
+                return ServeSignal::Disconnect("too many concurrent getdata requests".into());
             }
             OnGetDataOutcome::DisconnectPendingItems => {
-                return ServeSignal::Disconnect("too many pending getdata item requests");
+                return ServeSignal::Disconnect("too many pending getdata item requests".into());
             }
             OnGetDataOutcome::Enqueue { .. } => {}
         }
@@ -1560,7 +1683,9 @@ impl ServerPeerHandler {
             now_nanos,
         ) {
             crate::server::OnAddrV2Outcome::BanInvalid => {
-                ServeSignal::Disconnect("sent invalid addrv2 message")
+                // dcrd only disconnects inside BanPeer here.
+                drop(mgr);
+                self.ban_peer_or_continue("sent invalid addrv2 message".into())
             }
             crate::server::OnAddrV2Outcome::Ignored | crate::server::OnAddrV2Outcome::Processed => {
                 ServeSignal::Continue
@@ -1587,9 +1712,13 @@ impl ServerPeerHandler {
             .lock()
             .expect("addrmgr mutex poisoned");
         match on_addr(&mut self.addr_state, &mut mgr, &facts, addr_list, now_nanos) {
-            // The ban outcome drops the connection; the ban-list
-            // bookkeeping arrives with the peer-state wiring.
-            OnAddrOutcome::BanEmptyList => ServeSignal::Disconnect("sent an empty address list"),
+            // The ban outcome records the host in the shared banned map
+            // and drops the connection.
+            OnAddrOutcome::BanEmptyList => {
+                // dcrd only disconnects inside BanPeer here.
+                drop(mgr);
+                self.ban_peer_or_continue("sent an empty address list".into())
+            }
             OnAddrOutcome::Ignored | OnAddrOutcome::Processed => ServeSignal::Continue,
         }
     }
@@ -1604,14 +1733,17 @@ impl ServerPeerHandler {
     fn on_inv(&mut self, inv: &MsgInv) -> ServeSignal {
         let inv_types: Vec<InvType> = inv.inv_list.iter().map(|iv| iv.inv_type).collect();
         match on_inv_classify(&inv_types, self.ctx.blocks_only) {
-            // The ban outcome drops the connection; the ban-list
-            // bookkeeping arrives with the peer-state wiring.
-            OnInvOutcome::BanEmpty => ServeSignal::Disconnect("sent empty inventory announcement"),
+            // The ban outcome records the host in the shared banned map
+            // and drops the connection.
+            OnInvOutcome::BanEmpty => {
+                // dcrd only disconnects inside BanPeer here.
+                self.ban_peer_or_continue("sent empty inventory announcement".into())
+            }
             OnInvOutcome::DisconnectAnnouncement("transactions") => {
-                ServeSignal::Disconnect("announcing transactions in blocks-only mode")
+                ServeSignal::Disconnect("announcing transactions in blocks-only mode".into())
             }
             OnInvOutcome::DisconnectAnnouncement(_) => {
-                ServeSignal::Disconnect("announcing mix messages in blocks-only mode")
+                ServeSignal::Disconnect("announcing mix messages in blocks-only mode".into())
             }
             OnInvOutcome::Forward => {
                 self.drive_sync(|manager, id| manager.on_inv(id, inv));
@@ -1658,7 +1790,7 @@ impl ServerPeerHandler {
     /// response is the empty message; past it, the eligible head blocks
     /// (the tip generation), their mempool votes, and the mempool
     /// treasury spends, matching dcrd's filled response.
-    fn on_get_init_state(&mut self, types: &[String], outbound: &OutboundQueue) {
+    fn on_get_init_state(&mut self, types: &[String], outbound: &OutboundQueue) -> ServeSignal {
         let wants = InitStateWants {
             blocks: types.iter().any(|t| t == INIT_STATE_HEAD_BLOCKS),
             votes: types.iter().any(|t| t == INIT_STATE_HEAD_BLOCK_VOTES),
@@ -1701,14 +1833,17 @@ impl ServerPeerHandler {
             },
             &tspends,
         );
-        if matches!(outcome, OnGetInitStateOutcome::AlreadySent) {
-            return;
+        if let OnGetInitStateOutcome::Ban(reason) = outcome {
+            // dcrd 2.2 bans peers repeating the request and
+            // disconnects explicitly regardless of the ban outcome.
+            let _ = self.ban_peer_now();
+            return ServeSignal::Disconnect(reason.into());
         }
         // dcrd marks the state sent right after the gate, before any
         // reply is built, so even a dropped over-limit response counts.
         self.init_state_sent = true;
         let msg = match outcome {
-            OnGetInitStateOutcome::AlreadySent => unreachable!("handled above"),
+            OnGetInitStateOutcome::Ban(_) => unreachable!("handled above"),
             OnGetInitStateOutcome::Blank => MsgInitState::default(),
             OnGetInitStateOutcome::Filled {
                 block_hashes,
@@ -1719,9 +1854,10 @@ impl ServerPeerHandler {
                 vote_hashes,
                 tspend_hashes,
             },
-            OnGetInitStateOutcome::BuildError => return,
+            OnGetInitStateOutcome::BuildError => return ServeSignal::Continue,
         };
         let _ = outbound.queue_message(Message::InitState(msg));
+        ServeSignal::Continue
     }
 
     /// The best height and the tip generation sorted to the blocks
@@ -1755,9 +1891,14 @@ impl ServerPeerHandler {
     /// blocks and their votes, or nothing early in the chain, with no
     /// eligible block, or when an eligible block is missing vote
     /// metadata.
-    fn on_get_mining_state(&mut self, outbound: &OutboundQueue) {
+    fn on_get_mining_state(
+        &mut self,
+        protocol_version: u32,
+        outbound: &OutboundQueue,
+    ) -> ServeSignal {
         let (best_height, eligible_blocks) = self.eligible_tip_blocks();
         let outcome = on_get_mining_state(
+            protocol_version,
             self.mining_state_sent,
             best_height,
             self.ctx.stake_validation_height,
@@ -1770,8 +1911,11 @@ impl ServerPeerHandler {
                     .vote_hashes_for_block(block_hash)
             },
         );
-        if matches!(outcome, OnGetMiningStateOutcome::AlreadySent) {
-            return;
+        if let OnGetMiningStateOutcome::Ban(reason) = outcome {
+            // dcrd 2.2 bans protocol-version violations and repeats,
+            // disconnecting explicitly regardless of the ban outcome.
+            let _ = self.ban_peer_now();
+            return ServeSignal::Disconnect(reason.into());
         }
         // dcrd marks the state sent right after the gate, before any
         // response is assembled, so a dropped response counts too.
@@ -1790,6 +1934,7 @@ impl ServerPeerHandler {
                 vote_hashes,
             }));
         }
+        ServeSignal::Continue
     }
 
     /// Submit a received mixing message to the mixpool (dcrd's OnMix*
@@ -1895,7 +2040,11 @@ impl ServerPeerHandler {
                 }
                 ServeSignal::Continue
             }
-            MixOutcome::Ban => ServeSignal::Disconnect("sent malformed mix message"),
+            MixOutcome::Ban => {
+                // dcrd bans "sent malformed mix message: %s" and only
+                // disconnects inside BanPeer.
+                self.ban_peer_or_continue("sent malformed mix message".into())
+            }
             MixOutcome::Nothing => ServeSignal::Continue,
         }
     }

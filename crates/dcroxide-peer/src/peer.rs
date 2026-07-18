@@ -749,7 +749,7 @@ impl Peer {
         // Read their version message.
         let remote_msg = transport
             .read_message()
-            .map_err(|e| NegotiateError::new(&e))?;
+            .map_err(|e| NegotiateError::new(&e.message))?;
 
         // Disconnect clients if the first message is not a version
         // message.
@@ -957,7 +957,7 @@ impl Peer {
     ) -> Result<(), NegotiateError> {
         let remote_msg = transport
             .read_message()
-            .map_err(|e| NegotiateError::new(&e))?;
+            .map_err(|e| NegotiateError::new(&e.message))?;
         match remote_msg {
             Message::VerAck => {
                 self.verack_received = true;
@@ -983,7 +983,7 @@ impl Peer {
         for _ in 0..MAX_NON_VER_ACKS {
             let msg = transport
                 .read_message()
-                .map_err(|e| NegotiateError::new(&e))?;
+                .map_err(|e| NegotiateError::new(&e.message))?;
             match msg {
                 Message::VerAck => {
                     self.verack_received = true;

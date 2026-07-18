@@ -281,11 +281,14 @@ fn server_address_relay_matches_dcrd() {
                 assert_eq!(banned_hosts(&banned), fields[2]);
             }
             ("bs", name) => {
+                // dcrd 2.2 accumulates whitelisted peers' scores (the
+                // whitelisted row contributes 60), so the warn-only row
+                // adds 30 to sit between the warn and ban thresholds.
                 let (disable, whitelisted, persistent) = match name {
                     "disabled" => (true, false, 60),
                     "whitelisted" => (false, true, 60),
                     "zeroscores" => (false, false, 0),
-                    "warnonly" => (false, false, 60),
+                    "warnonly" => (false, false, 30),
                     "banned" => (false, false, 60),
                     other => panic!("unknown bs row {other}"),
                 };

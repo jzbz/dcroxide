@@ -74,30 +74,28 @@ fn server_abuse_control_matches_dcrd() {
             }
             ("cf", name) => {
                 let disable_banning = name.contains("nobanning");
-                let mut state = ServerPeerAddrState::new(false);
-                let banned: BTreeMap<String, i64> = BTreeMap::new();
-                let out = enforce_node_cf_flag(
-                    &mut state,
-                    PROTOCOL_VERSION,
-                    disable_banning,
-                    ban_threshold,
-                    now,
-                );
+                let out = enforce_node_cf_flag(PROTOCOL_VERSION, disable_banning, "getcfilter");
                 match out {
-                    CfFlagOutcome::BanAndDisconnect { banned: crossed } => {
+                    CfFlagOutcome::BanAndDisconnect { reason } => {
+                        // dcrd 2.2 bans directly with the command and
+                        // protocol version in the reason.
                         assert!(!disable_banning, "{name}");
-                        // A single violation scores exactly the
-                        // threshold and does not cross it.
-                        assert!(!crossed, "{name}: threshold not exceeded");
+                        assert_eq!(
+                            reason,
+                            format!(
+                                "sent getcfilter request with protocol version \
+                                 {PROTOCOL_VERSION} >= {}",
+                                dcroxide_wire::NODE_CF_VERSION
+                            ),
+                            "{name}"
+                        );
                     }
                     CfFlagOutcome::DisconnectOnly => {
-                        // dcrd's addBanScore no-ops with banning
-                        // disabled, so only the disconnect remains.
+                        // With banning disabled only the disconnect
+                        // remains.
                         assert!(disable_banning, "{name}");
                     }
                 }
-                assert_eq!(banned_hosts(&banned), fields[2], "{name}");
-                assert_eq!(fields[3], "false", "{name}: disconnected");
             }
             ("nf", name) => {
                 let inv_list = match name {

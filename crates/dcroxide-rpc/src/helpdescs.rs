@@ -57,7 +57,7 @@ pub static HELP_DESCS_EN_US: &[(&str, &str)] = &[
     ("debuglevel--condition1", "levelspec=show"),
     ("debuglevel--result0", "The string 'Done.'"),
     ("debuglevel--result1", "The list of subsystems"),
-    ("debuglevel--synopsis", "Dynamically changes the debug logging level.\nThe levelspec can either a debug level or of the form:\n<subsystem>=<level>,<subsystem2>=<level2>,...\nThe valid debug levels are trace, debug, info, warn, error, and critical.\nThe valid subsystems are AMGR, ADXR, BCDB, DCRD, CHAN, DISC, PEER, RPCS, SCRP, SRVR, SYNC, and TXMP.\nFinally the keyword 'show' will return a list of the available subsystems."),
+    ("debuglevel--synopsis", "Dynamically changes the debug logging level.\nThe levelspec can either a debug level or of the form:\n<subsystem>=<level>,<subsystem2>=<level2>,...\nThe valid debug levels are trace, debug, info, warn, error, and critical.\nThe valid subsystems are AMGR, BCDB, DCRD, CHAN, DISC, PEER, RPCS, SCRP, SRVR, SYNC, and TXMP.\nFinally the keyword 'show' will return a list of the available subsystems."),
     ("debuglevel-levelspec", "The debug level(s) to use or the keyword 'show'"),
     ("decoderawtransaction--synopsis", "Returns a JSON object representing the provided serialized, hex-encoded transaction."),
     ("decoderawtransaction-hextx", "Serialized, hex-encoded transaction"),

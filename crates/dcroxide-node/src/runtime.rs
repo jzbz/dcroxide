@@ -312,6 +312,22 @@ fn serve_inbound_peer(
     connected: &ConnectedPeers,
     server: Option<Arc<ServerContext>>,
 ) {
+    // Refuse connections from banned hosts before any handshake work,
+    // clearing expired bans as they are consulted (dcrd 2.2's
+    // pre-handshake ban check over `peerState.banned`, bare-IP key).
+    if let Some(server) = &server {
+        let host = addr.ip().to_string();
+        let mut banned = server
+            .banned_hosts
+            .lock()
+            .expect("banned-hosts mutex poisoned");
+        let outcome =
+            crate::server::handle_banned_conn(&mut banned, &host, NodePeerEnv::new().now_nanos());
+        if outcome.banned {
+            return;
+        }
+    }
+
     let na = match net_address_v2_from_socket(addr, template.services) {
         Ok(na) => na,
         // An address the manager cannot represent is dropped, matching
@@ -341,6 +357,23 @@ pub(crate) fn serve_outbound_peer(
     permanent: bool,
     conn_req_id: Option<u64>,
 ) {
+    // Refuse dialing out to banned hosts before any handshake work —
+    // dcrd's `outboundPeerConnected` runs the same pre-handshake ban
+    // check since the connection manager is unaware of banned
+    // addresses.
+    if let Some(server) = &server {
+        let host = addr.ip().to_string();
+        let mut banned = server
+            .banned_hosts
+            .lock()
+            .expect("banned-hosts mutex poisoned");
+        let outcome =
+            crate::server::handle_banned_conn(&mut banned, &host, NodePeerEnv::new().now_nanos());
+        if outcome.banned {
+            return;
+        }
+    }
+
     // The remote's services are unknown until its version message
     // arrives, and the outbound version message is written first, so
     // its addr_you carries zero services (dcrd's outbound
@@ -471,6 +504,12 @@ impl ServeHooks for InboundHooks {
         match self {
             InboundHooks::Server(handler) => handler.handle_message(peer, msg, outbound),
             InboundHooks::NoOp => ServeSignal::Continue,
+        }
+    }
+
+    fn on_wire_violation(&mut self, err: &str) {
+        if let InboundHooks::Server(handler) = self {
+            handler.on_wire_violation(err);
         }
     }
 

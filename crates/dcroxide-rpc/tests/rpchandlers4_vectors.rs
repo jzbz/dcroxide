@@ -444,5 +444,7 @@ fn mempool_conn_handler_slice_matches_dcrd() {
             }
         }
     }
-    assert_eq!(cases, 34, "unexpected case count");
+    // Case 35 is a native addition pinning dcrd 2.2's node-connect
+    // internal-error mapping (the dumped corpus predates it).
+    assert_eq!(cases, 35, "unexpected case count");
 }

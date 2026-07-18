@@ -42,6 +42,8 @@ fn genesis_server(dir: &std::path::Path, name: &str) -> (Arc<ServerContext>, Con
         disable_banning: false,
         ban_threshold: 100,
         whitelists: Vec::new(),
+        banned_hosts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        ban_duration_nanos: 24 * 60 * 60 * 1_000_000_000,
         addr_manager: Arc::new(Mutex::new(dcroxide_addrmgr::AddrManager::new(dir))),
         sim_or_reg_net: false,
         stake_validation_height: params.stake_validation_height,

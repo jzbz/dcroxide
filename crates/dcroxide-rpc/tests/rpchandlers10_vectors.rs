@@ -119,7 +119,7 @@ struct MockChain10 {
     main_chain: bool,
     fetch_tspend_mined: bool,
     block_by_hash: Result<(), String>,
-    votes: Result<(i64, i64), TSpendCountVotesFailure>,
+    votes: Result<(u32, u32), TSpendCountVotesFailure>,
 }
 
 impl RpcChain for MockChain10 {
@@ -161,7 +161,7 @@ impl RpcChain for MockChain10 {
         &mut self,
         _check_block: &Hash,
         _tspend: &MsgTx,
-    ) -> Result<(i64, i64), TSpendCountVotesFailure> {
+    ) -> Result<(u32, u32), TSpendCountVotesFailure> {
         self.votes.clone()
     }
 }

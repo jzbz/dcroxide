@@ -9,9 +9,9 @@ use std::fmt;
 
 /// The supported subsystem identifiers, pre-sorted as dcrd's
 /// `supportedSubsystems` sorts them for display.
-pub const SUBSYSTEM_IDS: [&str; 19] = [
-    "ADXR", "AMGR", "BCDB", "CHAN", "CMGR", "DCRD", "DISC", "FEES", "INDX", "MINR", "MIXP", "PEER",
-    "RPCS", "SCRP", "SRVR", "STKE", "SYNC", "TRSY", "TXMP",
+pub const SUBSYSTEM_IDS: [&str; 18] = [
+    "AMGR", "BCDB", "CHAN", "CMGR", "DCRD", "DISC", "FEES", "INDX", "MINR", "MIXP", "PEER", "RPCS",
+    "SCRP", "SRVR", "STKE", "SYNC", "TRSY", "TXMP",
 ];
 
 /// A logging level (decred/slog `Level`).  The ordering follows the

@@ -126,6 +126,29 @@ impl RpcChain for NodeRpcChain {
             .ok_or_else(|| format!("no block at height {height}"))
     }
 
+    fn tspend_count_votes(
+        &mut self,
+        check_block: &Hash,
+        tspend: &dcroxide_wire::MsgTx,
+    ) -> Result<(u32, u32), dcroxide_rpc::server::TSpendCountVotesFailure> {
+        let chain = self.chain.lock().expect("chain mutex poisoned");
+        let Some(node) = chain.index.lookup_node(check_block) else {
+            // dcrd `TSpendCountVotes` classifies an unknown check
+            // block as `ErrUnknownBlock`.
+            return Err(dcroxide_rpc::server::TSpendCountVotesFailure {
+                is_unknown_block: true,
+                message: format!("block {check_block} is not known"),
+            });
+        };
+        let (_, _, yes, no) = chain
+            .tspend_count_votes(node, tspend, &self.params)
+            .map_err(|message| dcroxide_rpc::server::TSpendCountVotesFailure {
+                is_unknown_block: false,
+                message,
+            })?;
+        Ok((yes, no))
+    }
+
     fn block_hash_by_height(&mut self, height: i64) -> Result<Hash, String> {
         self.chain
             .lock()

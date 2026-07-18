@@ -172,7 +172,7 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
         WireTransport::set_protocol_version(self, pver);
     }
 
-    fn read_message(&mut self) -> Result<Message, String> {
+    fn read_message(&mut self) -> Result<Message, dcroxide_peer::ReadError> {
         // One absolute deadline covers the whole message — header and
         // payload (dcrd's single `SetReadDeadline` before
         // `ReadMessageN`).
@@ -182,7 +182,8 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
         // known before any payload allocation (dcrd `readMessageHeader`
         // then the payload read).
         let mut buf = vec![0u8; MESSAGE_HEADER_SIZE];
-        read_exact_by_deadline(&mut self.stream, &mut buf, deadline).map_err(|e| e.to_string())?;
+        read_exact_by_deadline(&mut self.stream, &mut buf, deadline)
+            .map_err(|e| dcroxide_peer::ReadError::io(e.to_string()))?;
 
         let payload_len = u32::from_le_bytes(
             buf[PAYLOAD_LEN_OFFSET..PAYLOAD_LEN_OFFSET + 4]
@@ -197,11 +198,13 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
         if payload_len as u64 <= MAX_MESSAGE_PAYLOAD {
             buf.resize(MESSAGE_HEADER_SIZE.saturating_add(payload_len), 0);
             read_exact_by_deadline(&mut self.stream, &mut buf[MESSAGE_HEADER_SIZE..], deadline)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| dcroxide_peer::ReadError::io(e.to_string()))?;
         }
 
-        let (msg, consumed) =
-            wire_read_message(&buf, self.pver, self.net).map_err(|e| e.to_string())?;
+        // A codec failure is a wire-protocol violation (dcrd's
+        // `wire.ErrorCode`), which the daemon bans on.
+        let (msg, consumed) = wire_read_message(&buf, self.pver, self.net)
+            .map_err(|e| dcroxide_peer::ReadError::wire(e.to_string()))?;
         self.bytes_read = self.bytes_read.saturating_add(consumed as u64);
         if let Some(totals) = &self.net_totals {
             totals
@@ -299,6 +302,9 @@ mod tests {
         let err = transport
             .read_message()
             .expect_err("oversized payload rejected");
-        assert!(err.to_lowercase().contains("payload"), "error: {err}");
+        assert!(
+            err.message.to_lowercase().contains("payload"),
+            "error: {err}"
+        );
     }
 }

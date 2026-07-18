@@ -59,7 +59,7 @@ pub enum DisconnectReason {
     /// The version handshake failed with dcrd's negotiation error.
     Negotiate(String),
     /// A protocol violation with dcrd's reason string.
-    Protocol(&'static str),
+    Protocol(std::borrow::Cow<'static, str>),
     /// Reading the next message failed (a closed connection or an idle
     /// read timeout).
     ReadError(String),
@@ -112,12 +112,12 @@ pub fn classify_incoming<E: PeerEnv>(
 
 /// What the server's message handler decided about the connection
 /// (dcrd's handlers either return or call `Disconnect`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServeSignal {
     /// Keep serving the peer.
     Continue,
     /// Drop the connection with dcrd's reason.
-    Disconnect(&'static str),
+    Disconnect(std::borrow::Cow<'static, str>),
 }
 
 /// The server-side connection lifecycle a served peer runs through:
@@ -125,6 +125,12 @@ pub enum ServeSignal {
 /// the connection lives, and `DonePeer` on the way out.  A plain
 /// message closure satisfies this with no-op lifecycle hooks.
 pub trait ServeHooks {
+    /// The peer sent bytes that failed wire decoding (dcrd `OnRead`
+    /// observing a `wire.ErrorCode`): the server bans the host with
+    /// dcrd's "sent malformed wire message" reason.  The read loop
+    /// disconnects regardless, so implementations only record the
+    /// ban.
+    fn on_wire_violation(&mut self, _err: &str) {}
     /// The connection completed its handshake (dcrd `AddPeer`).  The
     /// shared `peer_handle` is the same `Arc<Mutex<Peer>>` both loops
     /// run behind, handed over so the server can register it for live
@@ -197,7 +203,7 @@ where
     for msg in delayed {
         let mut peer = peer.lock().expect("peer mutex poisoned");
         match classify_incoming(&mut peer, &msg, env) {
-            IncomingAction::Disconnect(reason) => return DisconnectReason::Protocol(reason),
+            IncomingAction::Disconnect(reason) => return DisconnectReason::Protocol(reason.into()),
             IncomingAction::Process { reply } => {
                 if let Some(reply) = reply
                     && outbound.queue_message(*reply).is_err()
@@ -222,7 +228,15 @@ where
         // server keep making progress while this thread blocks.
         let msg = match transport.read_message() {
             Ok(msg) => msg,
-            Err(e) => return DisconnectReason::ReadError(e),
+            Err(e) => {
+                // Ban peers sending messages that do not conform to
+                // the wire protocol (dcrd `OnRead` on a
+                // `wire.ErrorCode`); the read loop exits either way.
+                if e.wire_violation {
+                    hooks.on_wire_violation(&e.message);
+                }
+                return DisconnectReason::ReadError(e.message);
+            }
         };
         let read_delta = transport.total_bytes_read().wrapping_sub(read_total);
         read_total = transport.total_bytes_read();
@@ -235,7 +249,7 @@ where
             peer.record_recv(read_delta, env.now_nanos());
         }
         match classify_incoming(&mut peer, &msg, env) {
-            IncomingAction::Disconnect(reason) => return DisconnectReason::Protocol(reason),
+            IncomingAction::Disconnect(reason) => return DisconnectReason::Protocol(reason.into()),
             IncomingAction::Process { reply } => {
                 // Immediate replies go through the outbound queue so all
                 // writes stay serialized on the output loop; a closed

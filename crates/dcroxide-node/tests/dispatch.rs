@@ -25,14 +25,20 @@ const NET: CurrencyNet = CurrencyNet::TEST_NET3;
 /// Bring up a genesis-state testnet chain in a temporary database and
 /// serve it through the listener runtime, returning the runtime, the
 /// registry, and a negotiated client transport talking to it.
-fn serve_genesis_chain() -> (
+/// The serving rig a dispatch test drives: the backing directory, the
+/// runtime, the peer registry, the negotiated client transport, the
+/// genesis hash, the address manager, and the server context.
+type GenesisChainRig = (
     tempfile::TempDir,
     ListenerRuntime,
     ConnectedPeers,
     WireTransport<TcpStream>,
     Hash,
     Arc<Mutex<dcroxide_addrmgr::AddrManager>>,
-) {
+    Arc<ServerContext>,
+);
+
+fn serve_genesis_chain() -> GenesisChainRig {
     let params = dcroxide_chaincfg::testnet3_params();
     let genesis_hash = params.genesis_hash;
 
@@ -61,6 +67,8 @@ fn serve_genesis_chain() -> (
         disable_banning: false,
         ban_threshold: 100,
         whitelists: Vec::new(),
+        banned_hosts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        ban_duration_nanos: 24 * 60 * 60 * 1_000_000_000,
         addr_manager: Arc::clone(&addr_manager),
         sim_or_reg_net: false,
         stake_validation_height: params.stake_validation_height,
@@ -97,7 +105,7 @@ fn serve_genesis_chain() -> (
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, connected.clone(), Some(server), None),
+        inbound_peer_handler(template, connected.clone(), Some(Arc::clone(&server)), None),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();
@@ -133,6 +141,7 @@ fn serve_genesis_chain() -> (
         transport,
         genesis_hash,
         addr_manager,
+        server,
     )
 }
 
@@ -152,7 +161,8 @@ fn locator(hash: Hash) -> BlockLocator {
 /// from the chain while misses accumulate into notfound.
 #[test]
 fn serves_chain_backed_requests() {
-    let (_dir, runtime, _connected, mut transport, genesis_hash, _addrmgr) = serve_genesis_chain();
+    let (_dir, runtime, _connected, mut transport, genesis_hash, _addrmgr, _server) =
+        serve_genesis_chain();
 
     // getheaders -> an empty headers message via the low-work gate.
     transport
@@ -212,13 +222,101 @@ fn serves_chain_backed_requests() {
     runtime.shutdown();
 }
 
+/// A frame that fails wire decoding bans the host (dcrd `OnRead`
+/// observing a `wire.ErrorCode` and calling `BanPeer` with the
+/// malformed-wire reason) and the connection drops with the read
+/// loop; a reconnect from the banned host is refused pre-handshake.
+#[test]
+fn bans_malformed_wire_messages() {
+    let (_dir, runtime, _connected, _transport, _genesis_hash, _addrmgr, server) =
+        serve_genesis_chain();
+
+    // Dial and handshake a fresh connection, keeping a raw handle to
+    // the socket so garbage bytes can bypass the framing transport.
+    let port = runtime.bound_addrs()[0].port();
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut raw = stream.try_clone().expect("clone the socket");
+    let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
+    let mut env = NodePeerEnv::new();
+    let mut globals = PeerGlobals::new();
+    let config = Config {
+        net: NET,
+        protocol_version: 0,
+        ..Config::default()
+    };
+    let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+        .expect("negotiate");
+    assert_eq!(
+        transport.read_message().expect("read sendheaders"),
+        Message::SendHeaders
+    );
+
+    // A well-formed header bearing an unknown command is a wire
+    // violation: correct magic, twelve command bytes, zero payload.
+    let mut frame = Vec::with_capacity(24);
+    frame.extend_from_slice(&NET.0.to_le_bytes());
+    let mut cmd = [0u8; 12];
+    cmd[..5].copy_from_slice(b"bogus");
+    frame.extend_from_slice(&cmd);
+    frame.extend_from_slice(&0u32.to_le_bytes());
+    frame.extend_from_slice(&[0u8; 4]);
+    use std::io::Write as _;
+    raw.write_all(&frame).expect("send garbage frame");
+
+    // The server bans and the read loop drops the connection.
+    assert!(
+        transport.read_message().is_err(),
+        "the malformed frame should drop the connection"
+    );
+    {
+        let banned = server
+            .banned_hosts
+            .lock()
+            .expect("banned-hosts mutex poisoned");
+        assert!(
+            banned.contains_key("127.0.0.1"),
+            "the malformed frame bans the host: {banned:?}"
+        );
+    }
+
+    // A reconnect from the banned host is refused before any
+    // handshake work.
+    let retry_stream = TcpStream::connect(("127.0.0.1", port)).expect("reconnect");
+    retry_stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut retry = WireTransport::new(retry_stream, MAX_PROTOCOL_VERSION, NET);
+    let mut retry_peer = Peer::new_outbound(
+        Config {
+            net: NET,
+            protocol_version: 0,
+            ..Config::default()
+        },
+        &format!("127.0.0.1:{port}"),
+    )
+    .expect("outbound");
+    assert!(
+        retry_peer
+            .negotiate_outbound_protocol(&mut retry, &mut env, &mut globals, None)
+            .is_err(),
+        "a banned host's handshake should be refused"
+    );
+
+    runtime.shutdown();
+}
+
 /// getdata for a mix message the pool does not hold misses into a
 /// notfound, exactly as dcrd resolves a getdata MIX inv against its
 /// empty `mixMsgPool` (the daemon shares one pool between this serve
 /// path and the netsync intake).
 #[test]
 fn serves_notfound_for_an_absent_mix_message() {
-    let (_dir, runtime, _connected, mut transport, _genesis_hash, _addrmgr) = serve_genesis_chain();
+    let (_dir, runtime, _connected, mut transport, _genesis_hash, _addrmgr, _server) =
+        serve_genesis_chain();
 
     let unknown_mix = InvVect {
         inv_type: InvType::MIX,
@@ -244,7 +342,8 @@ fn serves_notfound_for_an_absent_mix_message() {
 /// the connection (dcrd bans and disconnects).
 #[test]
 fn an_empty_getdata_disconnects_the_peer() {
-    let (_dir, runtime, connected, mut transport, _genesis_hash, _addrmgr) = serve_genesis_chain();
+    let (_dir, runtime, connected, mut transport, _genesis_hash, _addrmgr, _server) =
+        serve_genesis_chain();
 
     transport
         .write_message(&Message::GetData(MsgGetData { inv_list: vec![] }))
@@ -271,7 +370,7 @@ fn an_empty_getdata_disconnects_the_peer() {
 /// address manager, and an empty addr list drops the connection.
 #[test]
 fn exchanges_addresses_with_a_served_peer() {
-    let (_dir, runtime, _connected, mut transport, _genesis_hash, addr_manager) =
+    let (_dir, runtime, _connected, mut transport, _genesis_hash, addr_manager, _server) =
         serve_genesis_chain();
 
     // Seed the manager with routable addresses so the cache subset is
@@ -379,7 +478,8 @@ fn wire_na(ip: [u8; 4], port: u16, now_nanos: i64) -> dcroxide_wire::NetAddress 
 /// connection.
 #[test]
 fn serves_cfilters_and_init_state() {
-    let (_dir, runtime, _connected, mut transport, genesis_hash, _addrmgr) = serve_genesis_chain();
+    let (_dir, runtime, _connected, mut transport, genesis_hash, _addrmgr, server) =
+        serve_genesis_chain();
 
     // getcfilterv2 for the genesis block.
     transport
@@ -408,8 +508,7 @@ fn serves_cfilters_and_init_state() {
     }
 
     // getinitstate before stake validation answers with the empty
-    // message; a repeat on the same connection is ignored, so the
-    // following ping is answered next.
+    // message.
     transport
         .write_message(&Message::GetInitState(dcroxide_wire::MsgGetInitState {
             types: vec![
@@ -427,55 +526,61 @@ fn serves_cfilters_and_init_state() {
         }
         other => panic!("expected initstate, got {other:?}"),
     }
-    transport
-        .write_message(&Message::GetInitState(dcroxide_wire::MsgGetInitState {
-            types: vec![dcroxide_wire::INIT_STATE_HEAD_BLOCKS.to_string()],
-        }))
-        .expect("send second getinitstate");
-    transport
-        .write_message(&Message::Ping(dcroxide_wire::MsgPing { nonce: 7 }))
-        .expect("send ping");
-    match transport.read_message().expect("read pong") {
-        Message::Pong(pong) => assert_eq!(pong.nonce, 7, "the repeat getinitstate is ignored"),
-        other => panic!("expected pong, got {other:?}"),
-    }
 
-    // getminingstate early in the chain sends nothing at all — dcrd's
-    // blank pushMiningStateMsg aborts on zero blocks (unlike the empty
-    // initstate above) — so the next reply is the pong.
-    transport
-        .write_message(&Message::GetMiningState)
-        .expect("send getminingstate");
-    transport
-        .write_message(&Message::Ping(dcroxide_wire::MsgPing { nonce: 8 }))
-        .expect("send ping");
-    match transport.read_message().expect("read pong") {
-        Message::Pong(pong) => assert_eq!(
-            pong.nonce, 8,
-            "an early-chain getminingstate produces no reply"
-        ),
-        other => panic!("expected pong, got {other:?}"),
-    }
-
-    // A miningstate advertisement requests the unknown blocks through
-    // the sync manager (dcrd `OnMiningState` -> `RequestFromPeer`).
-    let advertised = Hash([0x5a; 32]);
+    // dcrd 2.2 retires the legacy state exchange at the negotiated
+    // protocol version: a miningstate message (like a getminings
+    // request or a repeated getinitstate) is a knowing violation that
+    // bans the peer and drops the connection.  The sub-getinitstate
+    // exchange is unreachable through a compliant handshake — the
+    // minimum acceptable protocol version is RemoveRejectVersion —
+    // and stays pinned at the pure-handler level like dcrd's own
+    // dead branch.
     transport
         .write_message(&Message::MiningState(dcroxide_wire::MsgMiningState {
             version: 1,
             height: 1,
-            block_hashes: vec![advertised],
+            block_hashes: vec![Hash([0x5a; 32])],
             vote_hashes: Vec::new(),
         }))
         .expect("send miningstate");
-    match transport.read_message().expect("read getdata") {
-        Message::GetData(getdata) => {
-            assert_eq!(getdata.inv_list.len(), 1);
-            assert_eq!(getdata.inv_list[0].hash, advertised);
-            assert_eq!(getdata.inv_list[0].inv_type, dcroxide_wire::InvType::BLOCK);
-        }
-        other => panic!("expected getdata for the advertised block, got {other:?}"),
+    assert!(
+        transport.read_message().is_err(),
+        "the connection should be dropped"
+    );
+
+    // The ban landed in the shared banned map under the bare host.
+    {
+        let banned = server
+            .banned_hosts
+            .lock()
+            .expect("banned-hosts mutex poisoned");
+        assert!(
+            banned.contains_key("127.0.0.1"),
+            "the misbehaving host is banned: {banned:?}"
+        );
     }
+
+    // A reconnect from the banned host is refused before any
+    // handshake work (dcrd's pre-handshake ban check on admission).
+    let port = runtime.bound_addrs()[0].port();
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("reconnect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set read timeout");
+    let mut retry = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
+    let mut env = NodePeerEnv::new();
+    let mut globals = PeerGlobals::new();
+    let config = Config {
+        net: NET,
+        protocol_version: 0,
+        ..Config::default()
+    };
+    let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
+    assert!(
+        peer.negotiate_outbound_protocol(&mut retry, &mut env, &mut globals, None)
+            .is_err(),
+        "a banned host's handshake should be refused"
+    );
 
     drop(transport);
     runtime.shutdown();
@@ -486,7 +591,8 @@ fn serves_cfilters_and_init_state() {
 /// stays up), and an empty announcement drops the connection.
 #[test]
 fn gates_inventory_announcements() {
-    let (_dir, runtime, _connected, mut transport, genesis_hash, _addrmgr) = serve_genesis_chain();
+    let (_dir, runtime, _connected, mut transport, genesis_hash, _addrmgr, _server) =
+        serve_genesis_chain();
 
     // A block announcement passes the gate; the connection stays
     // healthy, verified by a following ping.
@@ -551,6 +657,8 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         disable_banning: false,
         ban_threshold: 100,
         whitelists: Vec::new(),
+        banned_hosts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        ban_duration_nanos: 24 * 60 * 60 * 1_000_000_000,
         addr_manager: Arc::new(Mutex::new(dcroxide_addrmgr::AddrManager::new(dir.path()))),
         sim_or_reg_net: false,
         stake_validation_height: params.stake_validation_height,
@@ -586,7 +694,7 @@ fn initiates_header_sync_with_a_data_serving_peer() {
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, connected.clone(), Some(server), None),
+        inbound_peer_handler(template, connected.clone(), Some(Arc::clone(&server)), None),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();
@@ -677,6 +785,8 @@ fn disconnects_a_stalled_header_sync_peer() {
         disable_banning: false,
         ban_threshold: 100,
         whitelists: Vec::new(),
+        banned_hosts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        ban_duration_nanos: 24 * 60 * 60 * 1_000_000_000,
         addr_manager: Arc::new(Mutex::new(dcroxide_addrmgr::AddrManager::new(dir.path()))),
         sim_or_reg_net: false,
         stake_validation_height: params.stake_validation_height,
@@ -704,7 +814,7 @@ fn disconnects_a_stalled_header_sync_peer() {
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, connected.clone(), Some(server), None),
+        inbound_peer_handler(template, connected.clone(), Some(Arc::clone(&server)), None),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();
@@ -751,7 +861,8 @@ fn disconnects_a_stalled_header_sync_peer() {
 /// from the empty pool, and the connection keeps serving afterwards.
 #[test]
 fn serves_mempool_requests_over_the_empty_pool() {
-    let (_dir, runtime, _connected, mut transport, _genesis_hash, _addrmgr) = serve_genesis_chain();
+    let (_dir, runtime, _connected, mut transport, _genesis_hash, _addrmgr, _server) =
+        serve_genesis_chain();
 
     // A mempool request over an empty pool queues nothing; prove the
     // arm ran and the connection survived with a ping round trip.
@@ -853,6 +964,8 @@ fn announces_connected_blocks_to_served_peers() {
         disable_banning: false,
         ban_threshold: 100,
         whitelists: Vec::new(),
+        banned_hosts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        ban_duration_nanos: 24 * 60 * 60 * 1_000_000_000,
         addr_manager,
         sim_or_reg_net: true,
         stake_validation_height: params.stake_validation_height,
@@ -913,7 +1026,7 @@ fn announces_connected_blocks_to_served_peers() {
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, connected.clone(), Some(server), None),
+        inbound_peer_handler(template, connected.clone(), Some(Arc::clone(&server)), None),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();

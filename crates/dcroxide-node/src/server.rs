@@ -570,28 +570,17 @@ pub fn add_ban_score(
     if disable_banning {
         return false;
     }
-    if state.is_whitelisted {
-        return false;
-    }
 
+    // dcrd 2.2 increments whitelisted peers' scores (visible through
+    // getpeerinfo) and only skips the ban itself; the zero-increase
+    // warning branch is gone.
     let warn_threshold = ban_threshold >> 1;
-    if transient == 0 && persistent == 0 {
-        // The score is not being increased, but dcrd still logs a
-        // warning when the score is above the warn threshold.
-        let _ = state
-            .ban_score
-            .lock()
-            .expect("ban score poisoned")
-            .int_at(now_unix)
-            > warn_threshold;
-        return false;
-    }
     let score = state
         .ban_score
         .lock()
         .expect("ban score poisoned")
         .increase_at(persistent, transient, now_unix);
-    if score > warn_threshold && score > ban_threshold {
+    if score > warn_threshold && score > ban_threshold && !state.is_whitelisted {
         return true;
     }
     false
@@ -803,13 +792,13 @@ pub fn on_mem_pool(
 /// (dcrd `serverPeer.enforceNodeCFFlag`); every branch disconnects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CfFlagOutcome {
-    /// The ban score was applied (crossing recorded) and the peer
-    /// disconnects.
+    /// The peer is banned directly with the carried reason (dcrd 2.2
+    /// replaced the ban-score increase) and disconnects.
     BanAndDisconnect {
-        /// Whether the score crossed the ban threshold.
-        banned: bool,
+        /// dcrd's ban reason.
+        reason: String,
     },
-    /// The peer disconnects without a score change.
+    /// The peer disconnects without a ban.
     DisconnectOnly,
 }
 
@@ -818,18 +807,21 @@ pub enum CfFlagOutcome {
 /// reached from `OnGetCFilter`, `OnGetCFHeaders`, and
 /// `OnGetCFTypes`).
 pub fn enforce_node_cf_flag(
-    state: &mut ServerPeerAddrState,
     protocol_version: u32,
     disable_banning: bool,
-    ban_threshold: u32,
-    now_unix: i64,
+    cmd: &str,
 ) -> CfFlagOutcome {
-    // Ban the peer if the protocol version is high enough that the
-    // peer is knowingly violating the protocol and banning is
-    // enabled.
+    // Ban the peer directly if the protocol version is high enough
+    // that the peer is knowingly violating the protocol and banning
+    // is enabled (dcrd 2.2 replaced the ban-score increase); the peer
+    // disconnects regardless.
     if protocol_version >= dcroxide_wire::NODE_CF_VERSION && !disable_banning {
-        let banned = add_ban_score(state, 100, 0, disable_banning, ban_threshold, now_unix);
-        return CfFlagOutcome::BanAndDisconnect { banned };
+        return CfFlagOutcome::BanAndDisconnect {
+            reason: format!(
+                "sent {cmd} request with protocol version {protocol_version} >= {}",
+                dcroxide_wire::NODE_CF_VERSION
+            ),
+        };
     }
 
     // Disconnect the peer regardless of protocol version or banning
@@ -2054,9 +2046,10 @@ pub const MAX_IS_TSPENDS_AT_HEAD: usize = 7;
 /// What the init state handler decided to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OnGetInitStateOutcome {
-    /// The init state was already sent on this connection; the
-    /// request is ignored.
-    AlreadySent,
+    /// A repeated request on the connection; dcrd 2.2 bans the peer
+    /// with the carried reason and disconnects (older versions
+    /// ignored it).
+    Ban(String),
     /// An empty init state message, sent when the chain has not yet
     /// reached stake validation so there is nothing interesting to
     /// advertise.
@@ -2105,7 +2098,7 @@ pub fn on_get_init_state(
     tspends: &[dcroxide_chainhash::Hash],
 ) -> OnGetInitStateOutcome {
     if init_state_sent {
-        return OnGetInitStateOutcome::AlreadySent;
+        return OnGetInitStateOutcome::Ban("sent more than one getinitstate".to_string());
     }
 
     // Send an empty init state message early in the chain.
@@ -2166,9 +2159,11 @@ const MAX_MS_BLOCKS_AT_HEAD: usize = dcroxide_wire::MAX_MS_BLOCKS_AT_HEAD_PER_MS
 /// The outcome of the getminingstate handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OnGetMiningStateOutcome {
-    /// The state was already sent on this connection; ignore the
-    /// request (dcrd's `getMiningStateSent` latch).
-    AlreadySent,
+    /// The peer is banned with the carried reason and disconnected:
+    /// dcrd 2.2 rejects requests from peers whose protocol version
+    /// makes the legacy message a knowing violation, and repeated
+    /// requests on a connection (older versions ignored repeats).
+    Ban(String),
     /// Send nothing: the chain is early (dcrd's blank
     /// `pushMiningStateMsg` aborts on zero blocks), there are no
     /// eligible blocks, or an eligible block has no vote metadata
@@ -2200,14 +2195,24 @@ pub enum OnGetMiningStateOutcome {
 /// `SortParentsByVotes` and the votes from the mempool's
 /// `VoteHashesForBlock`, both seams supplied by the caller.
 pub fn on_get_mining_state(
+    protocol_version: u32,
     mining_state_sent: bool,
     best_height: i64,
     stake_validation_height: i64,
     eligible_blocks: &[dcroxide_chainhash::Hash],
     votes_for: impl Fn(&dcroxide_chainhash::Hash) -> Vec<dcroxide_chainhash::Hash>,
 ) -> OnGetMiningStateOutcome {
+    // Ban peers requesting the initial state via the legacy message
+    // once the protocol version makes it a knowing violation, and
+    // peers repeating the request (both new in dcrd 2.2).
+    if protocol_version >= dcroxide_wire::INIT_STATE_VERSION {
+        return OnGetMiningStateOutcome::Ban(format!(
+            "sent getminings request with protocol version {protocol_version} >= {}",
+            dcroxide_wire::INIT_STATE_VERSION
+        ));
+    }
     if mining_state_sent {
-        return OnGetMiningStateOutcome::AlreadySent;
+        return OnGetMiningStateOutcome::Ban("sent more than one getminings".to_string());
     }
 
     // Early in the chain dcrd pushes a blank state, and the push
@@ -2266,24 +2271,41 @@ mod mining_state_tests {
         let svh = 100i64;
         let votes = |bh: &Hash| vec![Hash([bh.0[0]; 32]), Hash([bh.0[0] ^ 0xff; 32])];
 
-        // Duplicate requests are ignored.
+        // Peers whose protocol version covers getinitstate are banned
+        // for using the legacy message (dcrd 2.2).
         assert_eq!(
-            on_get_mining_state(true, 200, svh, &[h(1)], votes),
-            OnGetMiningStateOutcome::AlreadySent
+            on_get_mining_state(
+                dcroxide_wire::INIT_STATE_VERSION,
+                false,
+                200,
+                svh,
+                &[h(1)],
+                votes
+            ),
+            OnGetMiningStateOutcome::Ban(format!(
+                "sent getminings request with protocol version {} >= {}",
+                dcroxide_wire::INIT_STATE_VERSION,
+                dcroxide_wire::INIT_STATE_VERSION
+            ))
+        );
+        // Duplicate requests ban (dcrd 2.2; older versions ignored).
+        assert_eq!(
+            on_get_mining_state(7, true, 200, svh, &[h(1)], votes),
+            OnGetMiningStateOutcome::Ban("sent more than one getminings".to_string())
         );
         // Early chain: dcrd's blank push sends nothing.
         assert_eq!(
-            on_get_mining_state(false, svh - 2, svh, &[h(1)], votes),
+            on_get_mining_state(7, false, svh - 2, svh, &[h(1)], votes),
             OnGetMiningStateOutcome::Nothing
         );
         // No eligible blocks: nothing.
         assert_eq!(
-            on_get_mining_state(false, 200, svh, &[], votes),
+            on_get_mining_state(7, false, 200, svh, &[], votes),
             OnGetMiningStateOutcome::Nothing
         );
         // An eligible block without vote metadata aborts the response.
         assert_eq!(
-            on_get_mining_state(false, 200, svh, &[h(1), h(2)], |bh: &Hash| {
+            on_get_mining_state(7, false, 200, svh, &[h(1), h(2)], |bh: &Hash| {
                 if bh.0[0] == 2 {
                     Vec::new()
                 } else {
@@ -2298,7 +2320,7 @@ mod mining_state_tests {
         // two votes each fill eight blocks and eight (not sixteen or
         // forty) votes.
         let blocks: Vec<Hash> = (1..=9).map(h).collect();
-        match on_get_mining_state(false, 200, svh, &blocks, votes) {
+        match on_get_mining_state(7, false, 200, svh, &blocks, votes) {
             OnGetMiningStateOutcome::Filled {
                 height,
                 block_hashes,

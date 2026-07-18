@@ -70,13 +70,48 @@ pub const PING_INTERVAL: i64 = DEFAULT_IDLE_TIMEOUT - 13 * 1_000_000_000;
 /// The size of the sent version nonce cache (dcrd `sentNonces`).
 pub const SENT_NONCES_LIMIT: u32 = 50;
 
+/// A transport read failure, classified so the daemon can mirror
+/// dcrd's `OnRead` ban for wire-protocol violations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadError {
+    /// The error text (dcrd's error string).
+    pub message: String,
+    /// Whether the failure was a wire-protocol violation (dcrd's
+    /// `wire.ErrorCode`) rather than an IO or timeout failure.
+    pub wire_violation: bool,
+}
+
+impl ReadError {
+    /// An IO-classified read failure.
+    pub fn io(message: impl Into<String>) -> ReadError {
+        ReadError {
+            message: message.into(),
+            wire_violation: false,
+        }
+    }
+
+    /// A wire-protocol violation.
+    pub fn wire(message: impl Into<String>) -> ReadError {
+        ReadError {
+            message: message.into(),
+            wire_violation: true,
+        }
+    }
+}
+
+impl core::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// The message transport version negotiation runs over.  The daemon
 /// implements this with dcrd's wire framing over the connection
 /// (including the read deadline and byte accounting); tests script
 /// it.
 pub trait MsgTransport {
     /// Read the next message from the remote peer.
-    fn read_message(&mut self) -> Result<Message, String>;
+    fn read_message(&mut self) -> Result<Message, ReadError>;
     /// Write a message to the remote peer.
     fn write_message(&mut self, msg: &Message) -> Result<(), String>;
     /// Adopt the negotiated protocol version for subsequent frames.

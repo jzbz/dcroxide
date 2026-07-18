@@ -1069,6 +1069,8 @@ fn build_server(
         disable_banning: cfg.disable_banning,
         ban_threshold: cfg.ban_threshold,
         whitelists: cfg.whitelists.clone(),
+        banned_hosts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        ban_duration_nanos: cfg.ban_duration_nanos,
         addr_manager,
         sim_or_reg_net: cfg.sim_net || cfg.reg_net,
         stake_validation_height: params.stake_validation_height,

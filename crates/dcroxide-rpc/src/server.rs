@@ -300,12 +300,13 @@ pub trait RpcChain {
         unimplemented!("lottery_data_for_block")
     }
     /// The (yes, no) vote tally for the treasury spend counted up to
-    /// the given block (dcrd `TSpendCountVotes`).
+    /// the given block (dcrd `TSpendCountVotes`; u32 tallies per
+    /// dcrd 2.2).
     fn tspend_count_votes(
         &mut self,
         _check_block: &Hash,
         _tspend: &MsgTx,
-    ) -> Result<(i64, i64), TSpendCountVotesFailure> {
+    ) -> Result<(u32, u32), TSpendCountVotesFailure> {
         unimplemented!("tspend_count_votes")
     }
 }

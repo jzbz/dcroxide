@@ -1826,9 +1826,14 @@ pub fn handle_add_node<C: RpcChain>(
         _ => return Err(rpc_invalid_error("Invalid subcommand for addnode")),
     };
 
-    result.map_err(|e| rpc_invalid_error(&format!("{sub_cmd}: {e}")))?;
+    // dcrd 2.2 maps failures through the connection context: parent
+    // cancellation, dial cancellation, and dial timeouts get their
+    // own errors, and everything else becomes an internal error whose
+    // wire message is the raw error (the "failed operation on" prefix
+    // is log-only).  The port's dial is synchronous with no context,
+    // so only the internal-error branch is representable.
+    result.map_err(|e| rpc_internal_err(&e))?;
 
-    // No data returned unless an error.
     Ok(GoValue::Null)
 }
 
@@ -1876,7 +1881,7 @@ pub fn handle_node<C: RpcChain>(
                 server.cfg.conn_mgr.disconnect_by_addr(&addr)
             } else {
                 return Err(rpc_invalid_error(&format!(
-                    "{sub_cmd}: Invalid address or node ID"
+                    "{sub_cmd}: invalid address or node ID"
                 )));
             }
         }
@@ -1939,10 +1944,17 @@ pub fn handle_node<C: RpcChain>(
                 _ => {}
             }
         }
+        // dcrd 2.2 splits the fallthroughs: disconnect and remove
+        // stay invalid-parameter errors, while connect failures map
+        // through the connection context — only the internal-error
+        // branch (raw error text; the "failed operation on" prefix is
+        // log-only) is representable in the port's synchronous dial.
+        if sub_cmd == "connect" {
+            return Err(rpc_internal_err(&err));
+        }
         return Err(rpc_invalid_error(&format!("{sub_cmd}: {err}")));
     }
 
-    // No data returned unless an error.
     Ok(GoValue::Null)
 }
 
@@ -4312,8 +4324,8 @@ pub fn handle_get_treasury_spend_votes<C: RpcChain>(
         // Only count votes for tspends that are inside their voting
         // window; otherwise just return the vote start and end
         // heights.
-        let mut yes = 0i64;
-        let mut no = 0i64;
+        let mut yes = 0u32;
+        let mut no = 0u32;
         let inside_window =
             dcroxide_standalone::inside_tspend_window(block_height, expiry, tvi, mul);
         let mined_block = end_blocks
@@ -4347,8 +4359,8 @@ pub fn handle_get_treasury_spend_votes<C: RpcChain>(
             GoValue::Int(i64::from(expiry)),
             GoValue::Int(i64::from(start)),
             GoValue::Int(i64::from(end)),
-            GoValue::Int(yes),
-            GoValue::Int(no),
+            GoValue::Int(i64::from(yes)),
+            GoValue::Int(i64::from(no)),
         ]));
     }
 

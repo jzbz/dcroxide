@@ -69,13 +69,13 @@ impl Scripted {
 }
 
 impl MsgTransport for Scripted {
-    fn read_message(&mut self) -> Result<Message, String> {
+    fn read_message(&mut self) -> Result<Message, dcroxide_peer::ReadError> {
         if self.pos >= self.remote_frames.len() {
-            return Err("EOF".to_string());
+            return Err(dcroxide_peer::ReadError::io("EOF"));
         }
         let (msg, consumed) =
             dcroxide_wire::read_message(&self.remote_frames[self.pos..], self.pver, NET)
-                .map_err(|e| e.kind_name().to_string())?;
+                .map_err(|e| dcroxide_peer::ReadError::wire(e.kind_name()))?;
         self.pos = self.pos.checked_add(consumed).expect("bounded");
         Ok(msg)
     }

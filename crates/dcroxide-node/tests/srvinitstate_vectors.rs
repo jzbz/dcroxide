@@ -81,7 +81,7 @@ fn init_state_matches_dcrd() {
         );
 
         match out {
-            OnGetInitStateOutcome::AlreadySent | OnGetInitStateOutcome::BuildError => {
+            OnGetInitStateOutcome::Ban(_) | OnGetInitStateOutcome::BuildError => {
                 assert!(!pushed, "row {name}: expected no push");
             }
             OnGetInitStateOutcome::Blank => {
@@ -118,10 +118,11 @@ fn init_state_assembly() {
         tspends: true,
     };
 
-    // Already sent: ignored regardless of everything else.
+    // A repeated request bans regardless of everything else (dcrd
+    // 2.2; older versions ignored it).
     assert_eq!(
         on_get_init_state(true, past, svh, both, &[h(1)], |_| vec![h(9)], &[h(5)]),
-        OnGetInitStateOutcome::AlreadySent
+        OnGetInitStateOutcome::Ban("sent more than one getinitstate".to_string())
     );
 
     // Below stake validation: blank.
