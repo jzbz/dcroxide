@@ -404,8 +404,14 @@ dependencies = [
 name = "dcroxide-connmgr"
 version = "0.1.0"
 dependencies = [
+ "chacha20",
+ "dcroxide-addrmgr",
+ "dcroxide-containers",
  "dcroxide-dcrjson",
+ "dcroxide-ratelimit",
  "dcroxide-testutil",
+ "dcroxide-wire",
+ "siphasher",
 ]
 
 [[package]]

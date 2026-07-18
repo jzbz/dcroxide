@@ -9,11 +9,8 @@ use std::time::{Duration, Instant};
 
 use dcroxide_blockchain::process::Chain;
 use dcroxide_database::{Database, Options};
-use dcroxide_node::dispatch::OutboundGroups;
 use dcroxide_node::dispatch::ServerContext;
-use dcroxide_node::outbound::{
-    OutboundConfig, new_address_source, outbound_channel, start_outbound,
-};
+use dcroxide_node::outbound::{OutboundConfig, outbound_channel, start_outbound};
 use dcroxide_node::runtime::{ConnectedPeers, ListenerRuntime, PeerTemplate, inbound_peer_handler};
 use dcroxide_wire::{CurrencyNet, ServiceFlag};
 
@@ -60,7 +57,6 @@ fn genesis_server(dir: &std::path::Path, name: &str) -> (Arc<ServerContext>, Con
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
-        outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
@@ -101,7 +97,7 @@ fn dials_and_serves_a_permanent_connection() {
             template("listener"),
             listen_connected.clone(),
             Some(listen_server),
-            0,
+            None,
         ),
     )
     .expect("start listener");
@@ -109,17 +105,17 @@ fn dials_and_serves_a_permanent_connection() {
 
     // The dialing daemon opens a permanent connection to it.
     let (dial_server, dial_connected) = genesis_server(dir.path(), "dial");
+    let manager = test_manager(200000000);
+    let persistent = add_persistent(&manager, &format!("127.0.0.1:{port}"));
     let connector = start_outbound(
         OutboundConfig {
             template: template("dialer"),
             connected: dial_connected.clone(),
             server: Some(dial_server),
-            target_outbound: 8,
-            max_peers: 125,
-            retry_duration: Duration::from_millis(200),
+            manager: Arc::clone(&manager),
             dial_timeout: Duration::from_secs(5),
             dialer: dcroxide_node::socks::NodeDialer::direct(),
-            permanent: vec![format!("127.0.0.1:{port}")],
+            persistent,
             get_new_address: None,
             addr_manager: None,
         },
@@ -155,17 +151,17 @@ fn retries_an_unreachable_permanent_connection() {
     let port = dead.local_addr().expect("addr").port();
     drop(dead);
 
+    let manager = test_manager(100000000);
+    let persistent = add_persistent(&manager, &format!("127.0.0.1:{port}"));
     let connector = start_outbound(
         OutboundConfig {
             template: template("dialer"),
             connected: dial_connected.clone(),
             server: Some(dial_server),
-            target_outbound: 8,
-            max_peers: 125,
-            retry_duration: Duration::from_millis(100),
+            manager: Arc::clone(&manager),
             dial_timeout: Duration::from_millis(500),
             dialer: dcroxide_node::socks::NodeDialer::direct(),
-            permanent: vec![format!("127.0.0.1:{port}")],
+            persistent,
             get_new_address: None,
             addr_manager: None,
         },
@@ -204,7 +200,7 @@ fn removing_a_permanent_peer_stops_its_redial() {
             template("listener"),
             listen_connected.clone(),
             Some(listen_server),
-            0,
+            None,
         ),
     )
     .expect("start listener");
@@ -215,17 +211,17 @@ fn removing_a_permanent_peer_stops_its_redial() {
     let (dial_server, dial_connected) = genesis_server(dir.path(), "dial");
     let channel = dcroxide_node::outbound::outbound_channel();
     let control = channel.control();
+    let manager = test_manager(100000000);
+    let persistent = add_persistent(&manager, &format!("127.0.0.1:{port}"));
     let connector = start_outbound(
         OutboundConfig {
             template: template("dialer"),
             connected: dial_connected.clone(),
             server: Some(Arc::clone(&dial_server)),
-            target_outbound: 8,
-            max_peers: 125,
-            retry_duration: Duration::from_millis(100),
+            manager: Arc::clone(&manager),
             dial_timeout: Duration::from_secs(5),
             dialer: dcroxide_node::socks::NodeDialer::direct(),
-            permanent: vec![format!("127.0.0.1:{port}")],
+            persistent,
             get_new_address: None,
             addr_manager: None,
         },
@@ -282,6 +278,36 @@ fn removing_a_permanent_peer_stops_its_redial() {
     runtime.shutdown();
 }
 
+/// A fresh shared connection manager core with the given retry
+/// duration in nanoseconds.
+fn test_manager(retry_nanos: i64) -> dcroxide_node::outbound::SharedConnManager {
+    let mut csprng = dcroxide_connmgr::SystemCsprng::default();
+    Arc::new(Mutex::new(dcroxide_connmgr::ConnManager::new(
+        dcroxide_connmgr::ManagerConfig {
+            retry_duration_nanos: retry_nanos,
+            ..Default::default()
+        },
+        &mut csprng,
+    )))
+}
+
+/// Register the address as a persistent entry (the binary's startup
+/// AddPersistent) and return the driver's entry list.
+fn add_persistent(
+    manager: &dcroxide_node::outbound::SharedConnManager,
+    addr: &str,
+) -> Vec<(u64, dcroxide_addrmgr::NetAddress)> {
+    let resolved =
+        dcroxide_node::outbound::addr_string_to_socket_addr(addr).expect("resolve persistent");
+    let na = dcroxide_node::outbound::socket_addr_to_net_address(&resolved);
+    let id = manager
+        .lock()
+        .expect("connmgr mutex")
+        .add_persistent(&na)
+        .expect("add persistent");
+    vec![(id, na)]
+}
+
 /// Poll `cond` until it holds or the timeout elapses.
 fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
@@ -294,11 +320,12 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     cond()
 }
 
-/// The automatic-dial address source draws candidates from the address
-/// manager, skipping a group the daemon already has an outbound
-/// connection to (dcrd `newAddressFunc`).
+/// The connection manager's outbound selection draws candidates from
+/// the thin address source and skips a group the daemon already has
+/// an outbound connection to (dcrd 2.2: `pickOutboundAddr` over
+/// `newAddressFunc`).
 #[test]
-fn address_source_spreads_across_outbound_groups() {
+fn outbound_selection_spreads_across_groups() {
     let dir = tempfile::tempdir().expect("temp dir");
     let addr_manager = Arc::new(Mutex::new(dcroxide_addrmgr::AddrManager::new(dir.path())));
 
@@ -314,25 +341,48 @@ fn address_source_spreads_across_outbound_groups() {
         }
     }
 
-    let groups = OutboundGroups::new();
-    let mut source = new_address_source(
-        Arc::clone(&addr_manager),
-        groups.clone(),
-        "19108".into(),
-        |_| true,
+    // The thin source of dcrd 2.2's newAddressFunc: the candidate and
+    // its last attempt time.
+    let source_mgr = Arc::clone(&addr_manager);
+    let mut source = move || {
+        let candidate = source_mgr
+            .lock()
+            .expect("addrmgr")
+            .get_address(|_| true)
+            .ok_or_else(|| "no valid connect address".to_string())?;
+        let candidate = candidate.lock().expect("known address");
+        Ok((
+            candidate.net_address().clone(),
+            candidate.last_attempt().unwrap_or(0),
+        ))
+    };
+
+    let mut csprng = dcroxide_connmgr::SystemCsprng::default();
+    let mut manager = dcroxide_connmgr::ConnManager::new(
+        dcroxide_connmgr::ManagerConfig {
+            default_port: 19108,
+            ..Default::default()
+        },
+        &mut csprng,
+    );
+    let now_nanos = 1_700_000_000_000_000_000i64;
+
+    // A candidate is available while the group is unoccupied, and the
+    // pick registers the group.
+    let picked = manager
+        .pick_outbound_addr(&mut source, now_nanos)
+        .expect("an address is available");
+    assert!(
+        picked.key().starts_with("8.8.8."),
+        "picked {}",
+        picked.key()
     );
 
-    // A candidate is available while the group is unoccupied.
-    let picked = source().expect("an address is available");
-    assert!(picked.addr.starts_with("8.8.8."), "picked {}", picked.addr);
-
-    // Once an outbound connection occupies the group, every candidate
-    // is skipped and the source reports none available.
-    let group_key = wire_na([8, 8, 8, 8], 19108).group_key();
-    groups.increment(&group_key);
-    assert!(
-        source().is_err(),
-        "the only group is already occupied by an outbound connection"
+    // Once the pick occupies the group, every candidate is skipped and
+    // the selection reports no suitable address.
+    assert_eq!(
+        manager.pick_outbound_addr(&mut source, now_nanos),
+        Err(dcroxide_connmgr::NO_SUITABLE_ADDR_MSG.to_string())
     );
 }
 

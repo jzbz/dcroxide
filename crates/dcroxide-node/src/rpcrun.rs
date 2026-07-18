@@ -669,7 +669,18 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
                 self.stop_redial(conn_req_id);
                 Ok(())
             }
-            None => Err("peer not found".to_string()),
+            None => {
+                // dcrd 2.2's fallback: treat the ID as a connection
+                // manager ID and remove it when it is a persistent
+                // entry (an added peer that never connected).
+                if id >= 0
+                    && let Some(outbound) = self.outbound.as_ref()
+                    && outbound.remove_if_persistent(id as u64)
+                {
+                    return Ok(());
+                }
+                Err("peer not found".to_string())
+            }
         }
     }
 
@@ -689,11 +700,10 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
                     .outbound
                     .as_ref()
                     .ok_or_else(|| crate::outbound::STOPPED.to_string())?;
-                // dcrd resolves through `addrStringToNetAddr` before
-                // `CancelPending`, surfacing resolution errors; pending
-                // requests store the resolved dial address.
-                let resolved = crate::outbound::addr_string_to_socket_addr(addr)?;
-                outbound.cancel_pending(&resolved.to_string())
+                // dcrd 2.2's fallback: find the persistent entry for
+                // the address in the connection manager and remove it
+                // (an added peer still dialing or awaiting a retry).
+                outbound.remove_persistent_by_addr(addr)
             }
         }
     }
@@ -2258,6 +2268,29 @@ mod tests {
     }
 
     /// The peer template the outbound-control tests dial with: long
+    /// A fresh shared connection manager core for the driver tests,
+    /// with the given retry duration in nanoseconds.
+    fn test_conn_manager(retry_nanos: i64) -> crate::outbound::SharedConnManager {
+        test_conn_manager_with_cap(retry_nanos, 0)
+    }
+
+    /// As [`test_conn_manager`], with an explicit normal-connection
+    /// cap (0 selects dcrd's default 125).
+    fn test_conn_manager_with_cap(
+        retry_nanos: i64,
+        max_normal_conns: u32,
+    ) -> crate::outbound::SharedConnManager {
+        let mut csprng = dcroxide_connmgr::SystemCsprng::default();
+        Arc::new(std::sync::Mutex::new(dcroxide_connmgr::ConnManager::new(
+            dcroxide_connmgr::ManagerConfig {
+                retry_duration_nanos: retry_nanos,
+                max_normal_conns,
+                ..Default::default()
+            },
+            &mut csprng,
+        )))
+    }
+
     /// timeouts so nothing fires mid-test.
     fn control_template() -> crate::runtime::PeerTemplate {
         crate::runtime::PeerTemplate {
@@ -2298,6 +2331,8 @@ mod tests {
         let addr_a = listener_a.local_addr().expect("addr a").to_string();
         let listener_b = TcpListener::bind("127.0.0.1:0").expect("bind b");
         let addr_b = listener_b.local_addr().expect("addr b").to_string();
+        let listener_c = TcpListener::bind("127.0.0.1:0").expect("bind c");
+        let addr_c = listener_c.local_addr().expect("addr c").to_string();
 
         let channel = crate::outbound::outbound_channel();
         let control = channel.control();
@@ -2307,14 +2342,15 @@ mod tests {
                 template: control_template(),
                 connected: connected.clone(),
                 server: None,
-                target_outbound: 8,
-                max_peers: 2,
                 // Short enough that a leaked redial would be observed
                 // by the post-remove stability check below.
-                retry_duration: std::time::Duration::from_millis(50),
+                // Two normal-connection permits: the persistent peer
+                // is exempt (dcrd 2.2), so two temporary connections
+                // fill the table.
+                manager: test_conn_manager_with_cap(50_000_000, 2),
                 dial_timeout: std::time::Duration::from_secs(5),
                 dialer: crate::socks::NodeDialer::direct(),
-                permanent: Vec::new(),
+                persistent: Vec::new(),
                 get_new_address: None,
                 addr_manager: None,
             },
@@ -2336,10 +2372,14 @@ mod tests {
             "the dialed peer must be served"
         );
 
-        // A duplicate of a permanent request is refused up front.
+        // A duplicate of a permanent request is refused up front with
+        // the connection manager's raw error (dcrd 2.2 surfaces the
+        // typed gate errors through the RPC adapter).
         assert_eq!(
             manager.connect(&addr_a, true),
-            Err("peer exists as a permanent peer".to_string())
+            Err(format!(
+                "a persistent connection for {addr_a} already exists"
+            ))
         );
         // An unparseable address surfaces the resolution error.
         assert!(
@@ -2358,12 +2398,19 @@ mod tests {
         // A duplicate of an established temporary request is refused...
         assert_eq!(
             manager.connect(&addr_b, false),
-            Err("peer already connected".to_string())
+            Err(format!("a connection to {addr_b} is already established"))
         );
-        // ...and a fresh address is refused once the peer table is full.
+        // A third temporary connection uses the last permit...
+        manager.connect(&addr_c, false).expect("connect third");
+        assert!(
+            wait_until(std::time::Duration::from_secs(5), || connected.len() == 3),
+            "the third dialed peer must be served"
+        );
+        // ...and a fresh address is refused once the normal-connection
+        // permits are used (the persistent peer does not count).
         assert_eq!(
             manager.connect("127.0.0.1:1", false),
-            Err("max peers reached".to_string())
+            Err("a maximum of 2 connections is allowed".to_string())
         );
 
         // Register the permanent peer as its handshake would, carrying
@@ -2412,11 +2459,11 @@ mod tests {
         let (conn_a, _) = listener_a.accept().expect("accept the dialed conn");
         drop(conn_a);
         assert!(
-            wait_until(std::time::Duration::from_secs(5), || connected.len() == 1),
+            wait_until(std::time::Duration::from_secs(5), || connected.len() == 2),
             "the removed peer must disconnect"
         );
         std::thread::sleep(std::time::Duration::from_millis(300));
-        assert_eq!(connected.len(), 1, "a removed peer is not redialed");
+        assert_eq!(connected.len(), 2, "a removed peer is not redialed");
 
         // Removing an unknown or temporary peer is "peer not found".
         assert_eq!(manager.remove_by_id(99), Err("peer not found".to_string()));
@@ -2444,14 +2491,12 @@ mod tests {
                 template: control_template(),
                 connected: connected.clone(),
                 server: None,
-                target_outbound: 8,
-                max_peers: 8,
                 // Long enough that the scheduled retry never fires
                 // mid-test, leaving the failed request pending.
-                retry_duration: std::time::Duration::from_secs(60),
+                manager: test_conn_manager(60_000_000_000),
                 dial_timeout: std::time::Duration::from_secs(5),
                 dialer: crate::socks::NodeDialer::direct(),
-                permanent: Vec::new(),
+                persistent: Vec::new(),
                 get_new_address: None,
                 addr_manager: None,
             },
@@ -2464,20 +2509,31 @@ mod tests {
 
         // The add succeeds (the checks pass); the dial then fails and
         // the permanent request waits for its retry.
+        // A temporary connect to the dead port surfaces the dial
+        // error synchronously (dcrd's Connect blocks the RPC through
+        // the dial and returns its error).
+        let err = manager
+            .connect(&dead_addr, false)
+            .expect_err("temp dial to a dead port fails");
+        assert!(err.contains("dial failed"), "unexpected error: {err}");
+
         manager.connect(&dead_addr, true).expect("connect");
-        // Re-adding the same peer is refused while its request lives on.
+        // Re-adding the same peer is refused while its entry lives on,
+        // with the connection manager's raw error (dcrd 2.2).
         assert_eq!(
             manager.connect(&dead_addr, true),
-            Err("peer exists as a permanent peer".to_string())
+            Err(format!(
+                "a persistent connection for {dead_addr} already exists"
+            ))
         );
 
         // No connected persistent peer matches, so the remove falls back
-        // to cancelling the pending request; a second remove finds
-        // nothing.
-        manager.remove_by_addr(&dead_addr).expect("cancel pending");
+        // to the connection manager's persistent entry; a second remove
+        // finds nothing (dcrd 2.2's errPeerNotFound).
+        manager.remove_by_addr(&dead_addr).expect("remove entry");
         assert_eq!(
             manager.remove_by_addr(&dead_addr),
-            Err(format!("no pending connection to {dead_addr}"))
+            Err("peer not found".to_string())
         );
 
         connector.shutdown();

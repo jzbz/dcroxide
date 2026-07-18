@@ -9,10 +9,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+chacha20 = { version = "0.9", default-features = false }
+dcroxide-addrmgr = { path = "../dcroxide-addrmgr" }
+dcroxide-containers = { path = "../dcroxide-containers" }
 dcroxide-dcrjson = { path = "../dcroxide-dcrjson" }
+dcroxide-ratelimit = { path = "../dcroxide-ratelimit" }
+siphasher = { version = "1", default-features = false }
 
 [dev-dependencies]
 dcroxide-testutil = { path = "../dcroxide-testutil" }
+dcroxide-wire = { path = "../dcroxide-wire" }
 
 [lints]
 workspace = true

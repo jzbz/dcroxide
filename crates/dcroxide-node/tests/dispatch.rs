@@ -76,7 +76,6 @@ fn serve_genesis_chain() -> (
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
-        outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
@@ -98,7 +97,7 @@ fn serve_genesis_chain() -> (
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, connected.clone(), Some(server), 0),
+        inbound_peer_handler(template, connected.clone(), Some(server), None),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();
@@ -567,7 +566,6 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
-        outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
@@ -588,7 +586,7 @@ fn initiates_header_sync_with_a_data_serving_peer() {
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, connected.clone(), Some(server), 0),
+        inbound_peer_handler(template, connected.clone(), Some(server), None),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();
@@ -686,7 +684,6 @@ fn disconnects_a_stalled_header_sync_peer() {
         sync_manager,
         sync_peers,
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
-        outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
@@ -707,7 +704,7 @@ fn disconnects_a_stalled_header_sync_peer() {
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, connected.clone(), Some(server), 0),
+        inbound_peer_handler(template, connected.clone(), Some(server), None),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();
@@ -871,7 +868,6 @@ fn announces_connected_blocks_to_served_peers() {
         ))),
         sync_peers: sync_peers.clone(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
-        outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
@@ -917,7 +913,7 @@ fn announces_connected_blocks_to_served_peers() {
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
         &[("tcp4", ":0".to_string())],
-        inbound_peer_handler(template, connected.clone(), Some(server), 0),
+        inbound_peer_handler(template, connected.clone(), Some(server), None),
     )
     .expect("start serving runtime");
     let port = runtime.bound_addrs()[0].port();

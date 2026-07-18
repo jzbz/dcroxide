@@ -94,10 +94,6 @@ pub struct ServerContext {
     /// The next sync-manager peer id (dcrd's peer package draws ids
     /// from a package-global atomic counter).
     pub next_peer_id: AtomicI32,
-    /// The number of outbound peers connected per address group (dcrd
-    /// `peerState.outboundGroups`), consulted by the automatic dialer
-    /// so it spreads connections across network segments.
-    pub outbound_groups: OutboundGroups,
     /// Whether the daemon accepts incoming connections (`--nolisten`);
     /// gates the local-address advertisement to outbound peers.
     pub disable_listen: bool,
@@ -137,51 +133,6 @@ pub fn new_recently_advertised()
             RECENTLY_ADVERTISED_TXNS_TTL_NANOS,
         ),
     ))
-}
-
-/// The per-group count of outbound connections (dcrd
-/// `peerState.outboundGroups` behind the peer-state lock).
-#[derive(Clone, Default)]
-pub struct OutboundGroups {
-    inner: Arc<Mutex<HashMap<String, i64>>>,
-}
-
-impl OutboundGroups {
-    /// An empty tracker.
-    pub fn new() -> OutboundGroups {
-        OutboundGroups::default()
-    }
-
-    /// Record an outbound connection to the group (dcrd
-    /// `handleAddPeer`'s increment).
-    pub fn increment(&self, key: &str) {
-        let mut groups = self.inner.lock().expect("outbound groups poisoned");
-        let count = groups.entry(key.to_string()).or_insert(0);
-        *count = count.saturating_add(1);
-    }
-
-    /// Record an outbound disconnection from the group (dcrd
-    /// `handleDonePeer`'s decrement).
-    pub fn decrement(&self, key: &str) {
-        let mut groups = self.inner.lock().expect("outbound groups poisoned");
-        if let Some(count) = groups.get_mut(key) {
-            *count = count.saturating_sub(1);
-            if *count <= 0 {
-                groups.remove(key);
-            }
-        }
-    }
-
-    /// The number of outbound connections to the group (dcrd
-    /// `OutboundGroupCount`).
-    pub fn count(&self, key: &str) -> i64 {
-        *self
-            .inner
-            .lock()
-            .expect("outbound groups poisoned")
-            .get(key)
-            .unwrap_or(&0)
-    }
 }
 
 /// The registry resolving sync-manager peer ids to the handles the

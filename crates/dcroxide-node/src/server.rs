@@ -1145,15 +1145,6 @@ fn wire_ip_is_v4(ip: &[u8; 16]) -> bool {
     ip[..10] == [0u8; 10] && ip[10] == 0xff && ip[11] == 0xff
 }
 
-/// Whether the 16-byte wire IP is a loopback address (Go
-/// `net.IP.IsLoopback`).
-fn wire_ip_is_loopback(ip: &[u8; 16]) -> bool {
-    if wire_ip_is_v4(ip) {
-        return ip[12] == 127;
-    }
-    *ip == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
-}
-
 /// A tracked peer in the server peer state maps; the fields are the
 /// ones the admission and removal decisions read (dcrd's maps hold
 /// the live `*serverPeer`).
@@ -1179,8 +1170,6 @@ pub struct PeerState {
     pub persistent_peers: BTreeMap<i32, PeerStateEntry>,
     /// The banned hosts and the Unix nanosecond times the bans lift.
     pub banned: BTreeMap<String, i64>,
-    /// The outbound peer counts by address group key.
-    pub outbound_groups: BTreeMap<String, i64>,
     /// The network address submission cache.
     pub sub_cache: NaSubmissionCache,
 }
@@ -1199,7 +1188,6 @@ impl PeerState {
             outbound_peers: BTreeMap::new(),
             persistent_peers: BTreeMap::new(),
             banned: BTreeMap::new(),
-            outbound_groups: BTreeMap::new(),
             sub_cache: NaSubmissionCache::new(MAX_CACHED_NA_SUBMISSIONS),
         }
     }
@@ -1227,19 +1215,44 @@ impl PeerState {
     }
 }
 
-/// Why the admission handler rejected a peer.
+/// Why the admission handler rejected a peer.  dcrd 2.2 rejects
+/// banned connections before the handshake and enforces the
+/// connection limits in the connection manager, leaving shutdown as
+/// the only add-time rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddPeerReject {
     /// The server is shutting down.
     Shutdown,
-    /// The peer address could not be split into host and port.
-    BadAddress,
-    /// The peer's host is banned.
-    Banned,
-    /// The single-IP connection limit was reached.
-    TooManySameIp,
-    /// The maximum peer count was reached.
-    MaxPeers,
+}
+
+/// The outcome of the pre-handshake banned-host check.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BannedConnOutcome {
+    /// The host is banned and the connection must be closed.
+    pub banned: bool,
+    /// An expired ban was lifted (dcrd logs "no longer banned").
+    pub unbanned: bool,
+}
+
+/// Reject a connection from a banned host before the handshake (dcrd
+/// 2.2 `handleBannedConn`); an expired ban is lifted.  The host key
+/// is the bare IP rendering (dcrd `net.IP(remoteAddr.IP).String()`),
+/// not the host:port form.
+pub fn handle_banned_conn(
+    banned: &mut std::collections::BTreeMap<String, i64>,
+    host: &str,
+    now_nanos: i64,
+) -> BannedConnOutcome {
+    let mut outcome = BannedConnOutcome::default();
+    if let Some(&ban_end) = banned.get(host) {
+        if now_nanos < ban_end {
+            outcome.banned = true;
+            return outcome;
+        }
+        banned.remove(host);
+        outcome.unbanned = true;
+    }
+    outcome
 }
 
 /// The peer and configuration facts the admission handler consumes.
@@ -1323,40 +1336,10 @@ pub fn handle_add_peer(
         return outcome;
     }
 
-    // Disconnect banned peers.
-    let Ok((host, _)) = split_host_port(&facts.addr) else {
-        outcome.rejected = Some(AddPeerReject::BadAddress);
-        return outcome;
-    };
-    if let Some(&ban_end) = state.banned.get(&host) {
-        if now_nanos < ban_end {
-            outcome.rejected = Some(AddPeerReject::Banned);
-            return outcome;
-        }
-        state.banned.remove(&host);
-        outcome.unbanned = true;
-    }
-
-    // Limit the max number of connections from a single IP, allowing
-    // whitelisted inbound peers and localhost connections regardless.
-    let is_inbound_whitelisted = facts.is_whitelisted && facts.inbound;
-    let peer_ip = facts.na.ip;
-    if facts.max_same_ip > 0
-        && !is_inbound_whitelisted
-        && !wire_ip_is_loopback(&peer_ip)
-        && state.connections_with_ip(&peer_ip) + 1 > facts.max_same_ip
-    {
-        outcome.rejected = Some(AddPeerReject::TooManySameIp);
-        return outcome;
-    }
-
-    // Limit the max number of total peers, allowing whitelisted
-    // inbound peers regardless.
-    if state.count() + 1 > facts.max_peers && !is_inbound_whitelisted {
-        outcome.rejected = Some(AddPeerReject::MaxPeers);
-        return outcome;
-    }
-
+    // dcrd 2.2 rejects banned connections before the handshake
+    // ([`handle_banned_conn`]) and enforces the connection limits in
+    // the connection manager, so the only add-time gate left is the
+    // shutdown check above.
     let entry = PeerStateEntry {
         na: facts.na,
         inbound: facts.inbound,
@@ -1387,10 +1370,6 @@ pub fn handle_add_peer(
 
     // The peer is an outbound peer at this point.
     let remote_addr = wire_to_addrmgr_net_address(&facts.na);
-    *state
-        .outbound_groups
-        .entry(remote_addr.group_key())
-        .or_insert(0) += 1;
     if facts.persistent {
         state.persistent_peers.insert(facts.id, entry);
     } else {
@@ -1493,8 +1472,6 @@ pub struct DonePeerFacts {
 pub struct DonePeerOutcome {
     /// The peer was removed from its tracking map.
     pub removed: bool,
-    /// The peer's outbound group count was decremented.
-    pub group_decremented: bool,
     /// The connection manager was told to disconnect the request.
     pub conn_mgr_disconnect: bool,
     /// The address manager recorded the connection time.
@@ -1520,18 +1497,6 @@ pub fn done_peer(
         state.outbound_peers.contains_key(&facts.id)
     };
     if tracked {
-        if !facts.inbound && facts.version_known {
-            // dcrd reads the address unconditionally; it is always
-            // set for peers that completed the handshake.
-            if let Some(na) = &facts.na {
-                let remote_addr = wire_to_addrmgr_net_address(na);
-                *state
-                    .outbound_groups
-                    .entry(remote_addr.group_key())
-                    .or_insert(0) -= 1;
-                outcome.group_decremented = true;
-            }
-        }
         if !facts.inbound && facts.has_conn_req {
             outcome.conn_mgr_disconnect = true;
         }

@@ -721,13 +721,41 @@ fn run(cfg: Config) -> ExitCode {
         }
     };
 
+    // The connection manager decision core (dcrd 2.2's connmgr.New in
+    // newServer): the policy limits, the CIDR whitelist matcher, and
+    // the network default port for address selection.
+    let default_port: u16 = cfg.params.params.default_port.parse().unwrap_or(0);
+    let whitelists = cfg.whitelists.clone();
+    let conn_manager: dcroxide_node::outbound::SharedConnManager = {
+        let mut csprng = dcroxide_connmgr::SystemCsprng::default();
+        Arc::new(std::sync::Mutex::new(dcroxide_connmgr::ConnManager::new(
+            dcroxide_connmgr::ManagerConfig {
+                default_port,
+                max_normal_conns: cfg.max_peers.max(0) as u32,
+                max_conns_per_host: cfg.max_same_ip.max(0) as u32,
+                target_outbound: (DEFAULT_TARGET_OUTBOUND as u32).min(cfg.max_peers.max(0) as u32),
+                retry_duration_nanos: DEFAULT_RETRY_DURATION,
+                is_whitelisted: Box::new(move |addr| {
+                    whitelists.iter().any(|net| net.contains(&addr.ip))
+                }),
+            },
+            &mut csprng,
+        )))
+    };
+
     // Bind the peer-to-peer listeners and start serving inbound peers
     // unless listening is disabled (dcrd's server listeners).
     let runtime = if cfg.disable_listen {
         dcroxide_node::logging::info("SRVR", "Listening for peer-to-peer connections is disabled");
         None
     } else {
-        match start_listeners(&cfg, &template, connected.clone(), Arc::clone(&server)) {
+        match start_listeners(
+            &cfg,
+            &template,
+            connected.clone(),
+            Arc::clone(&server),
+            Arc::clone(&conn_manager),
+        ) {
             Ok(runtime) => {
                 let addrs: Vec<String> = runtime
                     .bound_addrs()
@@ -772,12 +800,24 @@ fn run(cfg: Config) -> ExitCode {
             dcroxide_addrmgr::NetAddressType::TorV3 => onion_reachable,
             _ => false,
         };
-        Some(dcroxide_node::outbound::new_address_source(
-            Arc::clone(&addr_manager),
-            server.outbound_groups.clone(),
-            cfg.params.params.default_port.to_string(),
-            filter,
-        ))
+        // dcrd 2.2's newAddressFunc: the manager candidate and its
+        // last attempt time; the group spreading, recency, and port
+        // preferences live in the connection manager's selection.
+        let source_mgr = Arc::clone(&addr_manager);
+        Some(Box::new(move || {
+            let candidate = source_mgr
+                .lock()
+                .expect("addrmgr mutex poisoned")
+                .get_address(filter);
+            let Some(candidate) = candidate else {
+                return Err("no valid connect address".to_string());
+            };
+            let candidate = candidate.lock().expect("known address poisoned");
+            Ok((
+                candidate.net_address().clone(),
+                candidate.last_attempt().unwrap_or(0),
+            ))
+        }) as dcroxide_node::outbound::AddressSource)
     } else {
         dcroxide_node::logging::info(
             "SRVR",
@@ -788,19 +828,32 @@ fn run(cfg: Config) -> ExitCode {
         );
         None
     };
-    // Resolve the permanent peers up front (dcrd `newServer` running
-    // each through `addrStringToNetAddr`, failing the start on an
-    // unresolvable address), so the manager's stored request addresses
-    // are the resolved form the duplicate-connect and cancel-pending
-    // checks compare against.
-    let mut permanent = Vec::with_capacity(cfg.connect_peers.len());
-    for addr in &cfg.connect_peers {
-        match dcroxide_node::outbound::addr_string_to_socket_addr(addr) {
-            Ok(resolved) => permanent.push(resolved.to_string()),
+    // Register the persistent peers (dcrd newServer: ConnectPeers,
+    // else AddPeers, each resolved through addrStringToNetAddr and
+    // added via AddPersistent — any failure fails the start).
+    let persistent_targets = if !cfg.connect_peers.is_empty() {
+        &cfg.connect_peers
+    } else {
+        &cfg.add_peers
+    };
+    let mut persistent = Vec::with_capacity(persistent_targets.len());
+    for addr in persistent_targets {
+        let added = dcroxide_node::outbound::addr_string_to_socket_addr(addr)
+            .map(|resolved| dcroxide_node::outbound::socket_addr_to_net_address(&resolved))
+            .and_then(|net_addr| {
+                let mut manager = conn_manager.lock().expect("connmgr mutex poisoned");
+                manager
+                    .persistent_capacity_check()
+                    .and_then(|()| manager.add_persistent(&net_addr))
+                    .map_err(|e| e.description)
+                    .map(|id| (id, net_addr))
+            });
+        match added {
+            Ok(entry) => persistent.push(entry),
             Err(e) => {
                 dcroxide_node::logging::error(
                     "SRVR",
-                    &format!("Unable to resolve connect peer {addr}: {e}"),
+                    &format!("Unable to add persistent peer {addr}: {e}"),
                 );
                 return ExitCode::FAILURE;
             }
@@ -811,14 +864,12 @@ fn run(cfg: Config) -> ExitCode {
             template: template.clone(),
             connected: connected.clone(),
             server: Some(Arc::clone(&server)),
-            target_outbound: DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u32,
-            max_peers: cfg.max_peers.max(0) as usize,
-            retry_duration: Duration::from_nanos(DEFAULT_RETRY_DURATION as u64),
+            manager: Arc::clone(&conn_manager),
             dial_timeout: Duration::from_nanos(cfg.dial_timeout_nanos as u64),
             // The configured dial routing: direct, or SOCKS5 with the
             // onion rules (dcrd's dcrdDial closures).
             dialer: dcroxide_node::socks::NodeDialer::from_config(&cfg),
-            permanent,
+            persistent,
             get_new_address,
             // Record dial attempts against the address manager off simnet and
             // regnet, matching where dcrd installs attemptDcrdDial.
@@ -908,6 +959,13 @@ fn run(cfg: Config) -> ExitCode {
         seeder_boot.shutdown();
     }
     mix_observer.shutdown();
+    // Stop the peer-to-peer listeners before the connection manager
+    // sweep (dcrd Run() closes its listeners first, then removes
+    // every connection), so no new inbound admissions race the
+    // teardown.
+    if let Some(runtime) = runtime {
+        runtime.shutdown();
+    }
     connector.shutdown();
     stall_timer.shutdown();
     if let Some(rebroadcaster) = rebroadcaster {
@@ -924,9 +982,6 @@ fn run(cfg: Config) -> ExitCode {
         generator.shutdown();
     }
     connected.disconnect_all();
-    if let Some(runtime) = runtime {
-        runtime.shutdown();
-    }
 
     // Stop the periodic dump ticker, then persist the address book so a
     // restart redials its learned peers instead of re-bootstrapping from
@@ -1021,7 +1076,6 @@ fn build_server(
         sync_manager,
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
-        outbound_groups: dcroxide_node::dispatch::OutboundGroups::new(),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: cfg.disable_listen,
         tx_pool,
@@ -1046,16 +1100,12 @@ fn start_listeners(
     template: &PeerTemplate,
     connected: ConnectedPeers,
     server: Arc<ServerContext>,
+    manager: dcroxide_node::outbound::SharedConnManager,
 ) -> Result<ListenerRuntime, String> {
     let specs = parse_listeners(&cfg.listeners)?;
     ListenerRuntime::start(
         &specs,
-        inbound_peer_handler(
-            template.clone(),
-            connected,
-            Some(server),
-            cfg.max_peers.max(0) as usize,
-        ),
+        inbound_peer_handler(template.clone(), connected, Some(server), Some(manager)),
     )
     .map_err(|e| e.to_string())
 }

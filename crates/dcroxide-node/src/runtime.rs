@@ -117,22 +117,6 @@ impl Drop for DeregisterGuard<'_> {
     }
 }
 
-/// Decrements the outbound-group counter when dropped, so the count is
-/// released on every exit path — panic unwinds included — and a leaked
-/// count can never permanently exclude an address group from the
-/// automatic dialer (mirroring [`DeregisterGuard`]; dcrd's
-/// `handleDonePeer` always updates `outboundGroups`).
-struct OutboundGroupGuard {
-    groups: crate::dispatch::OutboundGroups,
-    key: String,
-}
-
-impl Drop for OutboundGroupGuard {
-    fn drop(&mut self) {
-        self.groups.decrement(&self.key);
-    }
-}
-
 /// The parameters a fresh inbound peer is built from (the daemon's slice
 /// of dcrd's `peer.Config`).  Plain data so it can be cloned per
 /// connection; the peer's boxed callbacks are left unset here.
@@ -182,24 +166,141 @@ pub fn inbound_peer_handler(
     template: PeerTemplate,
     connected: ConnectedPeers,
     server: Option<Arc<ServerContext>>,
-    max_peers: usize,
+    manager: Option<crate::outbound::SharedConnManager>,
 ) -> InboundHandler {
+    // The accept-time randomness for the probabilistic flood drops
+    // (dcrd's manager-wide csprng).
+    let csprng = Arc::new(Mutex::new(dcroxide_connmgr::SystemCsprng::default()));
     Arc::new(move |stream: TcpStream, addr: SocketAddr| {
-        // Refuse the connection once the total (inbound and outbound)
-        // connection count has reached the limit, so an attacker opening
-        // sockets cannot spawn unbounded serving threads (dcrd's
-        // `handleAddPeer` rejecting a peer over `cfg.MaxPeers`).  A limit
-        // of zero means unlimited, matching dcrd.  The dropped stream is
-        // closed on return.
-        if max_peers != 0 && connected.len() >= max_peers {
-            let _ = stream.shutdown(Shutdown::Both);
-            return;
+        // dcrd 2.2's `listenHandler` admission, inline on the accept
+        // path so rejected connections shed before a serving thread
+        // exists: rate limiting and flood drops, duplicate rejection,
+        // the per-host permit, and the total-connections permit.
+        // Tests that exercise just the protocol plumbing pass no
+        // manager and skip admission.
+        let mut admitted = None;
+        if let Some(manager) = &manager {
+            let ip_bytes = match addr.ip() {
+                std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+                std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+            };
+            let remote_na = dcroxide_addrmgr::new_net_address_from_ip_port(
+                &ip_bytes,
+                addr.port(),
+                dcroxide_wire::ServiceFlag(0),
+                now_unix_nanos(),
+            );
+            let now_nanos = now_unix_nanos();
+            let now_unix = now_nanos / 1_000_000_000;
+            let mut rng = csprng.lock().expect("csprng mutex poisoned");
+            let mut mgr = manager.lock().expect("connmgr mutex poisoned");
+            match mgr.admit_inbound(&remote_na, now_unix, now_nanos, &mut *rng) {
+                dcroxide_connmgr::InboundDecision::Drop { reason } => {
+                    log_inbound_drop(&mut mgr, manager, &addr, &reason, now_nanos);
+                    drop(mgr);
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return;
+                }
+                dcroxide_connmgr::InboundDecision::DropSilent => {
+                    drop(mgr);
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return;
+                }
+                dcroxide_connmgr::InboundDecision::Admit {
+                    require_permit,
+                    host_permit_reserved,
+                } => {
+                    let record =
+                        mgr.register_inbound(&remote_na, require_permit, host_permit_reserved);
+                    admitted = Some((Arc::clone(manager), record.id));
+                }
+            }
         }
         let template = template.clone();
         let connected = connected.clone();
         let server = server.clone();
-        thread::spawn(move || serve_inbound_peer(stream, addr, &template, &connected, server));
+        thread::spawn(move || {
+            serve_inbound_peer(stream, addr, &template, &connected, server);
+            if let Some((manager, conn_id)) = admitted {
+                manager
+                    .lock()
+                    .expect("connmgr mutex poisoned")
+                    .conn_closed(conn_id);
+            }
+        });
     })
+}
+
+/// The wall clock in unix nanoseconds for the admission path.
+fn now_unix_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// Route a dropped inbound connection through the drop-log throttle
+/// (dcrd `inboundRateLimiter.LogDrops`), arming the suppression-reset
+/// timer when one starts.
+fn log_inbound_drop(
+    mgr: &mut dcroxide_connmgr::ConnManager,
+    manager: &crate::outbound::SharedConnManager,
+    addr: &SocketAddr,
+    reason: &str,
+    now_nanos: i64,
+) {
+    match mgr.inbound_limiter.log_drops(now_nanos) {
+        dcroxide_connmgr::LogDropsOutcome::Logged => {
+            crate::logging::debug("CMGR", &format!("Dropped connection from {addr}: {reason}"));
+        }
+        dcroxide_connmgr::LogDropsOutcome::SuppressionStarted { reset_after_nanos } => {
+            // dcrd renders the wait rounded to the nearest second.
+            let rounded = round_nanos_to_second(reset_after_nanos);
+            crate::logging::debug(
+                "CMGR",
+                &format!(
+                    "Dropped connection from {addr}: {reason} -- suppressing drop logs for {}",
+                    crate::gostd::go_duration_string(rounded)
+                ),
+            );
+            let manager = Arc::clone(manager);
+            thread::spawn(move || {
+                thread::sleep(std::time::Duration::from_nanos(
+                    reset_after_nanos.max(0) as u64
+                ));
+                let summary = manager
+                    .lock()
+                    .expect("connmgr mutex poisoned")
+                    .inbound_limiter
+                    .finish_suppression();
+                if let Some(dropped) = summary {
+                    let noun = if dropped == 1 {
+                        "connection"
+                    } else {
+                        "connections"
+                    };
+                    crate::logging::debug(
+                        "CMGR",
+                        &format!("Dropped {dropped} {noun} while suppressed"),
+                    );
+                }
+            });
+        }
+        dcroxide_connmgr::LogDropsOutcome::Suppressed => {}
+    }
+}
+
+/// Go's `Duration.Round(time.Second)`: round half away from zero to
+/// the nearest second, in nanoseconds.
+fn round_nanos_to_second(nanos: i64) -> i64 {
+    const SECOND: i64 = 1_000_000_000;
+    let rem = nanos % SECOND;
+    let base = nanos.saturating_sub(rem);
+    if rem.saturating_mul(2) >= SECOND {
+        base.saturating_add(SECOND)
+    } else {
+        base
+    }
 }
 
 /// Build, associate, and run a single inbound peer to completion,
@@ -249,7 +350,6 @@ pub(crate) fn serve_outbound_peer(
         Ok(na) => na,
         Err(_) => return,
     };
-    let group_na = na.clone();
     let peer = match Peer::new_outbound(template.config(), &addr.to_string()) {
         Ok(mut peer) => {
             peer.associate(&addr.to_string(), na, NodePeerEnv::new().now_nanos());
@@ -257,20 +357,6 @@ pub(crate) fn serve_outbound_peer(
         }
         Err(_) => return,
     };
-
-    // Track the outbound group for the connection's lifetime so the
-    // automatic dialer spreads across network segments (dcrd
-    // `handleAddPeer`/`handleDonePeer` updating `outboundGroups`).  The
-    // guard releases the count on drop, so a panic in serve_connection
-    // cannot leak it.
-    let _group_guard = server.as_ref().map(|ctx| {
-        let key = group_key_for(&group_na);
-        ctx.outbound_groups.increment(&key);
-        OutboundGroupGuard {
-            groups: ctx.outbound_groups.clone(),
-            key,
-        }
-    });
 
     serve_connection(
         stream,
@@ -282,13 +368,6 @@ pub(crate) fn serve_outbound_peer(
         permanent,
         conn_req_id,
     );
-}
-
-/// The address-manager group key for a wire v2 net address.
-fn group_key_for(na: &dcroxide_wire::NetAddressV2) -> String {
-    crate::server::wire_v2_to_addrmgr_net_address(na)
-        .expect("the peer net address is well formed")
-        .group_key()
 }
 
 /// Register a connected peer, run it through the connection runtime
@@ -611,7 +690,22 @@ mod tests {
             idle_timeout: Duration::from_secs(3600),
             ping_interval: Duration::from_secs(3600),
         };
-        let handler = inbound_peer_handler(template, connected.clone(), None, 1);
+        let mut csprng = dcroxide_connmgr::SystemCsprng::default();
+        let manager = Arc::new(Mutex::new(dcroxide_connmgr::ConnManager::new(
+            dcroxide_connmgr::ManagerConfig {
+                max_normal_conns: 1,
+                ..Default::default()
+            },
+            &mut csprng,
+        )));
+        // The single permit is held by a registered connection, so the
+        // accepted socket is shed by the admission (dcrd's
+        // listenHandler over the total-connections semaphore).
+        {
+            let mut mgr = manager.lock().expect("connmgr mutex");
+            assert!(mgr.total_normal_conns_sem.try_acquire());
+        }
+        let handler = inbound_peer_handler(template, connected.clone(), None, Some(manager));
 
         // The next connection is over the limit and must be refused.
         let mut over_client = TcpStream::connect(bound).expect("connect over");

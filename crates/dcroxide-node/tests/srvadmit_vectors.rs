@@ -16,8 +16,8 @@
 use dcroxide_addrmgr::AddrManager;
 use dcroxide_node::config::IpNet;
 use dcroxide_node::server::{
-    AddPeerFacts, AddPeerOutcome, AddPeerReject, DonePeerFacts, NaSubmission, PeerState,
-    PeerStateEntry, disconnect_peer, handle_add_peer, is_whitelisted, wire_to_addrmgr_net_address,
+    AddPeerFacts, AddPeerOutcome, DonePeerFacts, NaSubmission, PeerState, PeerStateEntry,
+    disconnect_peer, handle_add_peer, is_whitelisted, wire_to_addrmgr_net_address,
 };
 use dcroxide_wire::{NetAddress, ServiceFlag};
 
@@ -76,15 +76,6 @@ fn banned_hosts(state: &PeerState) -> String {
     state.banned.keys().cloned().collect::<Vec<_>>().join(",")
 }
 
-fn groups(state: &PeerState) -> String {
-    state
-        .outbound_groups
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join(";")
-}
-
 struct Rows<'a> {
     lines: std::str::Lines<'a>,
 }
@@ -111,16 +102,18 @@ fn server_peer_admission_matches_dcrd() {
          -> AddPeerOutcome { handle_add_peer(state, addr_mgr, facts, &no_dns, NOW_NANOS) };
     let amgr_dir = || tempfile::tempdir().unwrap();
 
-    // --- banned host gate ------------------------------------------------
+    // --- banned host gate (dcrd 2.2 handleBannedConn, before the
+    // handshake; the vector rows carry the v2.1.5 dump's banned-map
+    // transitions, which the relocated check preserves) -----------------
     let dir = amgr_dir();
     let mut amgr = AddrManager::new(dir.path());
     let mut state = PeerState::new();
     state
         .banned
         .insert("10.0.0.2".to_string(), NOW_NANOS + HOUR_NANOS);
-    let out = add(&mut state, &mut amgr, &base_facts(1, "10.0.0.2:34567"));
+    let out = dcroxide_node::server::handle_banned_conn(&mut state.banned, "10.0.0.2", NOW_NANOS);
     let fields = rows.next("bannedactive");
-    assert_eq!(out.rejected, Some(AddPeerReject::Banned));
+    assert!(out.banned, "an active ban rejects the connection");
     assert_eq!(fields[2], "false");
     assert_eq!(banned_hosts(&state), fields[3]);
     assert_eq!(state.inbound_peers.len().to_string(), fields[4]);
@@ -129,73 +122,17 @@ fn server_peer_admission_matches_dcrd() {
     state
         .banned
         .insert("10.0.0.2".to_string(), NOW_NANOS - HOUR_NANOS);
-    let out = add(&mut state, &mut amgr, &base_facts(1, "10.0.0.2:34567"));
+    let out = dcroxide_node::server::handle_banned_conn(&mut state.banned, "10.0.0.2", NOW_NANOS);
     let fields = rows.next("bannedexpired");
-    assert_eq!(out.rejected, None);
-    assert!(out.unbanned);
+    assert!(!out.banned);
+    assert!(out.unbanned, "an expired ban lifts");
     assert_eq!(fields[2], "true");
     assert_eq!(banned_hosts(&state), fields[3]);
+    // The 2.2 check runs before the handshake, so no peer is added;
+    // the admission that follows it inserts unconditionally.
+    let out = add(&mut state, &mut amgr, &base_facts(1, "10.0.0.2:34567"));
+    assert_eq!(out.rejected, None);
     assert_eq!(state.inbound_peers.len().to_string(), fields[4]);
-
-    // --- same IP limit -----------------------------------------------------
-    let mut state = PeerState::new();
-    let mut facts_a = base_facts(1, "10.0.0.2:34567");
-    facts_a.max_same_ip = 1;
-    let mut facts_b = base_facts(2, "10.0.0.2:41000");
-    facts_b.max_same_ip = 1;
-    let out_a = add(&mut state, &mut amgr, &facts_a);
-    let out_b = add(&mut state, &mut amgr, &facts_b);
-    let fields = rows.next("sameip");
-    assert_eq!(out_a.rejected.is_none().to_string(), fields[2]);
-    assert_eq!(out_b.rejected, Some(AddPeerReject::TooManySameIp));
-    assert_eq!(fields[3], "false");
-    assert_eq!(state.inbound_peers.len().to_string(), fields[4]);
-
-    // A whitelisted inbound peer bypasses the same IP limit.
-    let mut facts_c = base_facts(3, "10.0.0.2:41001");
-    facts_c.max_same_ip = 1;
-    facts_c.is_whitelisted = true;
-    let out_c = add(&mut state, &mut amgr, &facts_c);
-    let fields = rows.next("sameipwhitelisted");
-    assert_eq!(out_c.rejected.is_none().to_string(), fields[2]);
-    assert_eq!(state.inbound_peers.len().to_string(), fields[3]);
-
-    // Loopback connections bypass the same IP limit.
-    let mut state = PeerState::new();
-    let mut facts_l1 = base_facts(1, "127.0.0.1:34567");
-    facts_l1.max_same_ip = 1;
-    let mut facts_l2 = base_facts(2, "127.0.0.1:41000");
-    facts_l2.max_same_ip = 1;
-    let out_l1 = add(&mut state, &mut amgr, &facts_l1);
-    let out_l2 = add(&mut state, &mut amgr, &facts_l2);
-    let fields = rows.next("sameiploopback");
-    assert_eq!(out_l1.rejected.is_none().to_string(), fields[2]);
-    assert_eq!(out_l2.rejected.is_none().to_string(), fields[3]);
-    assert_eq!(state.inbound_peers.len().to_string(), fields[4]);
-
-    // --- max peers -----------------------------------------------------------
-    let mut state = PeerState::new();
-    let mut facts_1 = base_facts(1, "10.0.0.2:34567");
-    facts_1.max_peers = 1;
-    let mut facts_2 = base_facts(2, "10.0.0.3:34567");
-    facts_2.max_peers = 1;
-    let out_1 = add(&mut state, &mut amgr, &facts_1);
-    let out_2 = add(&mut state, &mut amgr, &facts_2);
-    let fields = rows.next("maxpeers");
-    assert_eq!(out_1.rejected.is_none().to_string(), fields[2]);
-    assert_eq!(out_2.rejected, Some(AddPeerReject::MaxPeers));
-    assert_eq!(fields[3], "false");
-    assert_eq!(state.inbound_peers.len().to_string(), fields[4]);
-
-    // A whitelisted inbound peer bypasses the max peers limit.
-    let mut state = PeerState::new();
-    let mut facts = base_facts(1, "10.0.0.2:34567");
-    facts.max_peers = 0;
-    facts.is_whitelisted = true;
-    let out = add(&mut state, &mut amgr, &facts);
-    let fields = rows.next("maxpeerswhitelisted");
-    assert_eq!(out.rejected.is_none().to_string(), fields[2]);
-    assert_eq!(state.inbound_peers.len().to_string(), fields[3]);
 
     // --- inbound submission corroboration ------------------------------------
     let mut state = PeerState::new();
@@ -240,7 +177,8 @@ fn server_peer_admission_matches_dcrd() {
     assert_eq!(out.rejected.is_none().to_string(), fields[2]);
     assert!(!out.resolved_local);
     assert_eq!(state.outbound_peers.len().to_string(), fields[3]);
-    assert_eq!(groups(&state), fields[4]);
+    // fields[4] carried the v2.1.5 peer-state group count; dcrd 2.2
+    // tracks outbound groups in the connection manager instead.
 
     // DonePeer removes the tracked outbound peer and decrements its
     // group.
@@ -260,10 +198,10 @@ fn server_peer_admission_matches_dcrd() {
     );
     let fields = rows.next("outbound");
     assert!(done.removed);
-    assert!(done.group_decremented);
     assert!(!done.conn_mgr_disconnect);
     assert_eq!(state.outbound_peers.len().to_string(), fields[2]);
-    assert_eq!(groups(&state), fields[3]);
+    // fields[3] carried the v2.1.5 group decrement, now in the
+    // connection manager.
 
     let mut state = PeerState::new();
     let mut facts = base_facts(1, "52.91.77.2:34567");
@@ -273,7 +211,8 @@ fn server_peer_admission_matches_dcrd() {
     let fields = rows.next("persistent");
     assert_eq!(out.rejected.is_none().to_string(), fields[2]);
     assert_eq!(state.persistent_peers.len().to_string(), fields[3]);
-    assert_eq!(groups(&state), fields[4]);
+    // fields[4]: the v2.1.5 group count, now in the connection
+    // manager.
 
     // --- outbound discovery submissions -----------------------------------------
     let discovery_facts = |id: i32, remote: &str| -> AddPeerFacts {

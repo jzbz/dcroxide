@@ -1,10 +1,5 @@
 ap|bannedactive|false|10.0.0.2|0|false
 ap|bannedexpired|true||1|true
-ap|sameip|true|false|1
-ap|sameipwhitelisted|true|2
-ap|sameiploopback|true|true|2
-ap|maxpeers|true|false|1
-ap|maxpeerswhitelisted|true|1
 ap|inboundcorroborate|true|2
 ap|inboundnosub|true|false
 ap|outboundgroup|true|1|52.91.0.0=1
