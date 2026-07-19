@@ -21,8 +21,8 @@ use dcroxide_chaincfg::{Params, mainnet_params, regnet_params};
 use dcroxide_chainhash::Hash;
 use dcroxide_containers::apbf;
 use dcroxide_netsync::{
-    Action, BestSnapshot, Config, Peer, ProcessBlockFailure, SyncChain, SyncManager, SyncMixPool,
-    SyncTxPool,
+    Action, BestSnapshot, Config, LogLevel, Peer, ProcessBlockFailure, SyncChain, SyncManager,
+    SyncMixPool, SyncTxPool,
 };
 use dcroxide_wire::{
     BlockHeader, InvType, InvVect, MsgBlock, MsgHeaders, MsgInv, MsgNotFound, MsgTx,
@@ -96,6 +96,9 @@ impl SyncChain for ChainAdapter {
         let tip = self.tip();
         self.chain.maybe_update_is_current(tip, self.now);
     }
+    fn adjusted_time_unix(&mut self) -> i64 {
+        self.now
+    }
 
     fn chain_work(&mut self, hash: &Hash) -> Option<dcroxide_uint256::Uint256> {
         self.chain.chain_work(hash)
@@ -131,6 +134,7 @@ impl SyncChain for ChainAdapter {
         }
         Err(ProcessBlockFailure {
             is_duplicate_block: errs[0].kind == RuleErrorKind::DuplicateBlock,
+            is_rule_error: true,
             message: errs[0].description.clone(),
         })
     }
@@ -231,6 +235,9 @@ impl SyncChain for StubChain {
         false
     }
     fn maybe_update_is_current(&mut self) {}
+    fn adjusted_time_unix(&mut self) -> i64 {
+        0
+    }
     fn chain_work(&mut self, _hash: &Hash) -> Option<dcroxide_uint256::Uint256> {
         None
     }
@@ -246,6 +253,7 @@ impl SyncChain for StubChain {
     fn process_block(&mut self, _block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
         Err(ProcessBlockFailure {
             is_duplicate_block: false,
+            is_rule_error: true,
             message: "stub".to_string(),
         })
     }
@@ -386,10 +394,16 @@ fn netsync_scenario_matches_dcrd() {
                 }
                 // Disconnects are verified via the connected probes,
                 // the stall timer has no dcrd-observable counterpart,
-                // and the known-inventory marks are pinned natively
-                // (headers_mark_known_inventory_for_the_peer).
+                // the known-inventory marks and the sync log lines are
+                // pinned natively (the dump captured no log output),
+                // and the progress accumulations feed the daemon-side
+                // throttle.
                 Action::Disconnect { .. }
                 | Action::MarkKnownInventory { .. }
+                | Action::Log { .. }
+                | Action::LogBlockProgress { .. }
+                | Action::LogHeaderProgress { .. }
+                | Action::ResetProgressLogTime
                 | Action::ResetHeaderSyncStallTimeout
                 | Action::StopHeaderSyncStallTimeout => {}
             }
@@ -433,6 +447,7 @@ fn netsync_scenario_matches_dcrd() {
                         let info = &peer_infos[label];
                         let peer = Peer::new(
                             info.id,
+                            format!("10.0.0.{}:9108", info.id),
                             info.inbound,
                             ServiceFlag(info.services),
                             info.pver,
@@ -764,7 +779,14 @@ fn stall_timeout_disconnects_sync_peer() {
 
     // With a sync candidate connected during the header sync, the
     // timeout disconnects it.
-    let actions = m.on_peer_connected(Peer::new(7, false, ServiceFlag(1), PROTOCOL_VERSION, 50));
+    let actions = m.on_peer_connected(Peer::new(
+        7,
+        "10.0.0.7:9108".to_string(),
+        false,
+        ServiceFlag(1),
+        PROTOCOL_VERSION,
+        50,
+    ));
     assert!(
         actions
             .iter()
@@ -781,23 +803,34 @@ fn stall_timeout_disconnects_sync_peer() {
 /// rejects, for pinning the known-inventory marks dcrd 2.2's headers
 /// processing loop emits (`peer.AddKnownInventory` per accepted
 /// header, master `452c1a6c` manager.go).
+#[derive(Default)]
 struct ScriptedHeaderChain {
     accept: usize,
     processed: usize,
+    /// The scripted best known header ((zero, 0) when unset).
+    best: (Hash, i64),
+    /// The next blocks to download (`put_next_needed_blocks`).
+    next_blocks: Vec<Hash>,
+    /// The scripted per-call block processing outcomes.
+    block_results: std::collections::VecDeque<Result<i64, ProcessBlockFailure>>,
+    /// The scripted `is_current` answer.
+    current: bool,
+    /// The scripted previous header (`header_by_hash`).
+    prev_header: Option<BlockHeader>,
 }
 
 impl SyncChain for ScriptedHeaderChain {
     fn best_header(&mut self) -> (Hash, i64) {
-        (Hash::ZERO, 0)
+        self.best
     }
     fn header_by_hash(&mut self, _hash: &Hash) -> Option<BlockHeader> {
-        None
+        self.prev_header
     }
     fn block_locator_from_hash(&mut self, _hash: &Hash) -> Vec<Hash> {
         vec![Hash::ZERO]
     }
     fn put_next_needed_blocks(&mut self, _max_results: usize) -> Vec<Hash> {
-        Vec::new()
+        self.next_blocks.clone()
     }
     fn best_snapshot(&mut self) -> BestSnapshot {
         BestSnapshot {
@@ -807,9 +840,12 @@ impl SyncChain for ScriptedHeaderChain {
         }
     }
     fn is_current(&mut self) -> bool {
-        false
+        self.current
     }
     fn maybe_update_is_current(&mut self) {}
+    fn adjusted_time_unix(&mut self) -> i64 {
+        0
+    }
     fn chain_work(&mut self, _hash: &Hash) -> Option<dcroxide_uint256::Uint256> {
         None
     }
@@ -828,10 +864,13 @@ impl SyncChain for ScriptedHeaderChain {
         }
     }
     fn process_block(&mut self, _block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
-        Err(ProcessBlockFailure {
-            is_duplicate_block: false,
-            message: "unused".to_string(),
-        })
+        self.block_results
+            .pop_front()
+            .unwrap_or(Err(ProcessBlockFailure {
+                is_duplicate_block: false,
+                is_rule_error: true,
+                message: "unused".to_string(),
+            }))
     }
 }
 
@@ -850,13 +889,17 @@ fn linked_headers(count: usize) -> Vec<BlockHeader> {
     headers
 }
 
-fn scripted_header_manager(
+fn scripted_manager_capture(
     accept: usize,
-) -> SyncManager<ScriptedHeaderChain, ScriptedTxPool, ScriptedMixPool> {
+    last_block: i64,
+) -> (
+    SyncManager<ScriptedHeaderChain, ScriptedTxPool, ScriptedMixPool>,
+    Vec<Action>,
+) {
     let params = regnet_params();
     let chain = ScriptedHeaderChain {
         accept,
-        processed: 0,
+        ..ScriptedHeaderChain::default()
     };
     let mut m = SyncManager::new(Config {
         chain,
@@ -872,9 +915,33 @@ fn scripted_header_manager(
             62500, 0.0000001,
         ))),
     });
-    m.on_peer_connected(Peer::new(7, false, ServiceFlag(1), PROTOCOL_VERSION, 50));
+    let actions = m.on_peer_connected(Peer::new(
+        7,
+        "10.0.0.7:9108".to_string(),
+        false,
+        ServiceFlag(1),
+        PROTOCOL_VERSION,
+        last_block,
+    ));
     assert_eq!(m.sync_peer_id(), 7);
-    m
+    (m, actions)
+}
+
+fn scripted_header_manager(
+    accept: usize,
+) -> SyncManager<ScriptedHeaderChain, ScriptedTxPool, ScriptedMixPool> {
+    scripted_manager_capture(accept, 50).0
+}
+
+/// The formatted sync log lines among the actions, in order.
+fn log_lines(actions: &[Action]) -> Vec<(LogLevel, String)> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            Action::Log { level, message } => Some((*level, message.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Every successfully processed header is marked as known inventory
@@ -960,4 +1027,263 @@ fn header_rejection_marks_only_the_accepted_prefix() {
         hash: headers[2].block_hash(),
     };
     assert!(!m.peer_mut(7).unwrap().is_known_inventory(&rejected));
+}
+
+/// The sync-start info line on peer connect and the no-candidates
+/// warning when the sync peer departs with none to replace it (dcrd
+/// `startInitialHeaderSync` / `updateSyncPeerState`).
+#[test]
+fn sync_lifecycle_log_lines() {
+    let (mut m, connect_actions) = scripted_manager_capture(usize::MAX, 50);
+    assert!(
+        log_lines(&connect_actions).contains(&(
+            LogLevel::Info,
+            "Syncing headers to block height 50 from peer 10.0.0.7:9108 (outbound)".to_string(),
+        )),
+        "{connect_actions:?}"
+    );
+
+    let actions = m.on_peer_disconnected(7);
+    assert!(
+        log_lines(&actions).contains(&(
+            LogLevel::Warn,
+            "No sync peer candidates available".to_string(),
+        )),
+        "{actions:?}"
+    );
+}
+
+/// The headers-synced transition emits the forced header progress
+/// accumulation, the completion lines, and the progress-time reset,
+/// in dcrd's order; a non-final message emits the unforced
+/// accumulation only.
+#[test]
+fn header_sync_transition_log_lines() {
+    // Final header 3 + offset 6 exceeds the sync height of 5.
+    let (mut m, _) = scripted_manager_capture(usize::MAX, 5);
+    let actions = m.on_headers(
+        7,
+        &MsgHeaders {
+            headers: linked_headers(3),
+        },
+    );
+    let progress_pos = actions
+        .iter()
+        .position(|a| {
+            matches!(
+                a,
+                Action::LogHeaderProgress {
+                    count: 3,
+                    force: true,
+                    ..
+                }
+            )
+        })
+        .expect("forced header progress");
+    let lines = log_lines(&actions);
+    let zero = Hash::ZERO;
+    let complete = format!("Initial headers sync complete (best header hash {zero}, height 0)");
+    assert!(
+        lines.contains(&(LogLevel::Info, complete.clone())),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&(
+            LogLevel::Info,
+            "Performing initial chain sync...".to_string()
+        )),
+        "{lines:?}"
+    );
+    let complete_pos = actions
+        .iter()
+        .position(|a| matches!(a, Action::Log { message, .. } if message == complete.as_str()))
+        .expect("completion line");
+    assert!(progress_pos < complete_pos, "progress precedes completion");
+    let reset_pos = actions
+        .iter()
+        .position(|a| matches!(a, Action::ResetProgressLogTime))
+        .expect("progress time reset");
+    assert!(complete_pos < reset_pos, "reset follows the lines");
+
+    // A message that does not finish the sync accumulates unforced.
+    let (mut m, _) = scripted_manager_capture(usize::MAX, 50);
+    let actions = m.on_headers(
+        7,
+        &MsgHeaders {
+            headers: linked_headers(3),
+        },
+    );
+    assert!(
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::LogHeaderProgress {
+                    count: 3,
+                    force: false,
+                    ..
+                }
+            )
+        }),
+        "{actions:?}"
+    );
+    assert!(log_lines(&actions).is_empty(), "no milestone lines yet");
+}
+
+/// The block-path lines: the progress accumulation while the initial
+/// chain sync runs, the chain-sync completion, the steady-state `New
+/// block` line with its interval, the rejected-block info line, and
+/// the unrequested-block warning (dcrd `OnBlock`).
+#[test]
+fn block_path_log_lines() {
+    let (mut m, _) = scripted_manager_capture(usize::MAX, 8);
+    let _ = m.on_headers(
+        7,
+        &MsgHeaders {
+            headers: linked_headers(3),
+        },
+    );
+
+    // Four scripted blocks with linked headers and known heights.
+    let mut headers = Vec::new();
+    let mut prev = Hash::ZERO;
+    for i in 0..4u32 {
+        let (mut header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
+        header.prev_block = prev;
+        header.height = 6 + i;
+        header.timestamp = 1000 + 100 * i;
+        prev = header.block_hash();
+        headers.push(header);
+    }
+    let blocks: Vec<MsgBlock> = headers
+        .iter()
+        .map(|h| MsgBlock {
+            header: *h,
+            transactions: Vec::new(),
+            stransactions: Vec::new(),
+        })
+        .collect();
+
+    // A best header distinct from the initial needed-blocks anchor so
+    // the fetch refreshes its list from the scripted chain.
+    m.chain_mut().best = (Hash([9u8; 32]), 0);
+    m.chain_mut().next_blocks = blocks.iter().map(|b| b.header.block_hash()).collect();
+    m.chain_mut().block_results = vec![
+        Ok(0),
+        Ok(0),
+        Ok(0),
+        Err(ProcessBlockFailure {
+            is_duplicate_block: false,
+            is_rule_error: true,
+            message: "the block violates a rule".to_string(),
+        }),
+    ]
+    .into();
+
+    // Hand the sync role to a fresh peer; the handoff requests the
+    // scripted blocks from it.
+    m.on_peer_connected(Peer::new(
+        8,
+        "10.0.0.8:9108".to_string(),
+        false,
+        ServiceFlag(1),
+        PROTOCOL_VERSION,
+        8,
+    ));
+    let _ = m.on_peer_disconnected(7);
+    assert_eq!(m.sync_peer_id(), 8);
+
+    // Initial chain sync in progress: the periodic accumulation.
+    let actions = m.on_block(8, &blocks[0]);
+    assert!(
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::LogBlockProgress {
+                    num_txs: 0,
+                    height: 6,
+                    force: false,
+                    ..
+                }
+            )
+        }),
+        "{actions:?}"
+    );
+
+    // The chain becoming current forces the line and completes the
+    // initial chain sync.
+    m.chain_mut().current = true;
+    let actions = m.on_block(8, &blocks[1]);
+    assert!(
+        actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::LogBlockProgress {
+                    height: 7,
+                    force: true,
+                    ..
+                }
+            )
+        }),
+        "{actions:?}"
+    );
+    let zero = Hash::ZERO;
+    assert!(
+        log_lines(&actions).contains(&(
+            LogLevel::Info,
+            format!("Initial chain sync complete (hash {zero}, height 0)"),
+        )),
+        "{actions:?}"
+    );
+
+    // Steady state: the individual `New block` line with the interval
+    // from the previous header.
+    let mut prev_header = headers[1];
+    prev_header.timestamp = headers[2].timestamp - 300;
+    m.chain_mut().prev_header = Some(prev_header);
+    let actions = m.on_block(8, &blocks[2]);
+    assert!(
+        log_lines(&actions).contains(&(
+            LogLevel::Info,
+            format!(
+                "New block {} (0 transactions, 0 tickets, 0 votes, 0 revocations, \
+                 height 8, interval 5m0s)",
+                blocks[2].header.block_hash()
+            ),
+        )),
+        "{actions:?}"
+    );
+
+    // A rejected block logs the rule failure.
+    let actions = m.on_block(8, &blocks[3]);
+    assert!(
+        log_lines(&actions).contains(&(
+            LogLevel::Info,
+            format!(
+                "Rejected block {} from 10.0.0.8:9108 (outbound): the block violates a rule",
+                blocks[3].header.block_hash()
+            ),
+        )),
+        "{actions:?}"
+    );
+
+    // An unrequested block warns and disconnects.
+    let (mut stray, _) = BlockHeader::from_bytes(&[7u8; 180]).expect("header");
+    stray.height = 99;
+    let stray_block = MsgBlock {
+        header: stray,
+        transactions: Vec::new(),
+        stransactions: Vec::new(),
+    };
+    let actions = m.on_block(8, &stray_block);
+    assert!(
+        log_lines(&actions).contains(&(
+            LogLevel::Warn,
+            format!(
+                "Got unrequested block {} from 10.0.0.8:9108 (outbound) -- disconnecting",
+                stray.block_hash()
+            ),
+        )),
+        "{actions:?}"
+    );
+    assert!(actions.contains(&Action::Disconnect { peer: 8 }));
 }

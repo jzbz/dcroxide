@@ -21,6 +21,6 @@
 pub mod manager;
 
 pub use manager::{
-    Action, BestSnapshot, Config, Peer, ProcessBlockFailure, SyncChain, SyncManager, SyncMixPool,
-    SyncTxPool,
+    Action, BestSnapshot, Config, LogLevel, Peer, ProcessBlockFailure, SyncChain, SyncManager,
+    SyncMixPool, SyncTxPool,
 };

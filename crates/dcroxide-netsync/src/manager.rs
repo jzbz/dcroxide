@@ -80,10 +80,23 @@ pub const NEXT_BLOCKS_BUF_SIZE: usize = 512;
 /// considered complete (dcrd `syncHeightFetchOffset`).
 const SYNC_HEIGHT_FETCH_OFFSET: i64 = 6;
 
+/// The log level a sync log line carries (the dcrd `slog` levels the
+/// netsync manager uses on its sync-status paths).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    /// dcrd `log.Infof`.
+    Info,
+    /// dcrd `log.Warnf`.
+    Warn,
+    /// dcrd `log.Errorf`.
+    Error,
+}
+
 /// An external effect decided by the manager: a message for the
-/// daemon to queue to a peer, a peer to disconnect, or a change to
-/// the header sync progress stall timer (dcrd queues messages and
-/// disconnects peers directly and owns a `time.Timer`).
+/// daemon to queue to a peer, a peer to disconnect, a sync log line
+/// or progress accumulation, or a change to the header sync progress
+/// stall timer (dcrd queues messages, disconnects peers, and logs
+/// directly, and owns a `time.Timer`).
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Message mirrors dcrd's queued values.
 pub enum Action {
@@ -99,6 +112,52 @@ pub enum Action {
         /// The unique id of the peer to disconnect.
         peer: i32,
     },
+    /// Emit a fully formatted sync log line under the daemon's SYNC
+    /// subsystem tag (the `log.Infof`/`Warnf`/`Errorf` calls of dcrd's
+    /// netsync manager; the pure manager cannot log directly).
+    Log {
+        /// The level dcrd logs the line at.
+        level: LogLevel,
+        /// The formatted line, byte-for-byte dcrd's.
+        message: String,
+    },
+    /// Accumulate a processed block into the periodic sync progress
+    /// logger (dcrd `progressLogger.LogProgress`); the daemon owns the
+    /// ten-second throttle and renders the line when it fires.
+    LogBlockProgress {
+        /// The number of regular transactions in the block (dcrd
+        /// `len(block.Transactions)`).
+        num_txs: u64,
+        /// The number of fresh tickets (`header.FreshStake`).
+        num_tickets: u64,
+        /// The number of votes (`header.Voters`).
+        num_votes: u64,
+        /// The number of revocations (`header.Revocations`).
+        num_revocations: u64,
+        /// The block height for the `height` portion of the line.
+        height: u32,
+        /// Bypass the ten-second throttle (dcrd's `forceLog`).
+        force: bool,
+        /// The chain verification progress percentage at this call
+        /// (dcrd evaluates `chain.VerifyProgress` when printing; the
+        /// value travels with the action instead).
+        verify_progress: f64,
+    },
+    /// Accumulate processed headers into the periodic sync progress
+    /// logger (dcrd `progressLogger.LogHeaderProgress`).
+    LogHeaderProgress {
+        /// The number of headers in the processed message.
+        count: u64,
+        /// Bypass the ten-second throttle (dcrd's `forceLog`).
+        force: bool,
+        /// The header sync progress percentage at this call (dcrd
+        /// evaluates `m.headerSyncProgress` when printing).
+        progress: f64,
+    },
+    /// Reset the progress logger's last-log time to now (dcrd
+    /// `progressLogger.SetLastLogTime(time.Now())` at the header sync
+    /// to chain sync transition).
+    ResetProgressLogTime,
     /// Mark the inventory as known to the peer in the daemon's relay
     /// registry (the daemon-side mirror of the manager's own
     /// known-inventory cache; dcrd's single `peer.AddKnownInventory`
@@ -137,6 +196,11 @@ pub struct BestSnapshot {
 pub struct ProcessBlockFailure {
     /// Whether the failure is dcrd `blockchain.ErrDuplicateBlock`.
     pub is_duplicate_block: bool,
+    /// Whether the failure is a `blockchain.RuleError` (a rejected
+    /// block) as opposed to an internal processing error; selects
+    /// between dcrd's `Rejected block` info line and its `Failed to
+    /// process block` error line.
+    pub is_rule_error: bool,
     /// The error text (log only).
     pub message: String,
 }
@@ -161,6 +225,11 @@ pub trait SyncChain {
     fn best_snapshot(&mut self) -> BestSnapshot;
     /// Whether the chain believes it is current (dcrd `IsCurrent`).
     fn is_current(&mut self) -> bool;
+    /// The current network time as a unix timestamp for the header
+    /// sync progress estimate (dcrd `cfg.TimeSource.AdjustedTime()`;
+    /// the daemon's time source stands in the system clock for the
+    /// median-adjusted time, like its is-current checks).
+    fn adjusted_time_unix(&mut self) -> i64;
     /// Potentially flip the chain's is-current latch (dcrd
     /// `MaybeUpdateIsCurrent`).
     fn maybe_update_is_current(&mut self);
@@ -229,6 +298,31 @@ pub trait SyncMixPool {
     fn expire_messages_in_background(&mut self, height: u32);
 }
 
+/// The singular or plural form of a noun depending on the count
+/// (dcrd netsync's `pickNoun`).
+fn pick_noun<'a>(n: u64, singular: &'a str, plural: &'a str) -> &'a str {
+    if n == 1 { singular } else { plural }
+}
+
+/// A whole-second duration rendered like Go's `time.Duration.String`
+/// (the `New block` interval is rounded to the second first, so only
+/// the hour/minute/second forms are reachable): `45s`, `5m0s`,
+/// `1h2m5s`, `0s`, with a leading `-` for negative intervals.
+fn go_interval_string(secs: i64) -> String {
+    let neg = secs < 0;
+    let s = secs.unsigned_abs();
+    let (hours, rem) = (s / 3600, s % 3600);
+    let (mins, secs) = (rem / 60, rem % 60);
+    let body = if hours > 0 {
+        format!("{hours}h{mins}m{secs}s")
+    } else if mins > 0 {
+        format!("{mins}m{secs}s")
+    } else {
+        format!("{secs}s")
+    };
+    if neg { format!("-{body}") } else { body }
+}
+
 /// A peer as the manager tracks it: the netsync-specific state from
 /// dcrd's `netsync.Peer` plus the facts and small state machines the
 /// manager reads from the embedded `peer.Peer` (id, direction,
@@ -237,6 +331,9 @@ pub trait SyncMixPool {
 /// these in step with its real peers.
 pub struct Peer {
     id: i32,
+    /// The peer's address string for log display (dcrd
+    /// `p.remoteAddr` via `Peer.String`).
+    addr: String,
     inbound: bool,
     protocol_version: u32,
     connected: bool,
@@ -258,6 +355,7 @@ impl Peer {
     /// A new peer wrapping the provided facts (dcrd `NewPeer`).
     pub fn new(
         id: i32,
+        addr: String,
         inbound: bool,
         services: ServiceFlag,
         protocol_version: u32,
@@ -266,6 +364,7 @@ impl Peer {
         let serves_data = services.0 & ServiceFlag::NODE_NETWORK.0 == ServiceFlag::NODE_NETWORK.0;
         Peer {
             id,
+            addr,
             inbound,
             protocol_version,
             connected: true,
@@ -288,6 +387,13 @@ impl Peer {
     /// The peer's unique id.
     pub fn id(&self) -> i32 {
         self.id
+    }
+
+    /// The peer rendered the way dcrd formats a `%v` of its peer
+    /// (`Peer.String`: the address and the connection direction).
+    pub fn display(&self) -> String {
+        let direction = if self.inbound { "inbound" } else { "outbound" };
+        format!("{} ({})", self.addr, direction)
     }
 
     /// Whether the manager still considers the peer connected (dcrd
@@ -701,7 +807,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// Update the sync peer to be the candidate with the highest known
     /// block height, and the is-current belief when there are no
     /// candidates (dcrd `updateSyncPeerState`).
-    fn update_sync_peer_state(&mut self) {
+    fn update_sync_peer_state(&mut self, actions: &mut Vec<Action>) {
         let (_, best_header_height) = self.cfg.chain.best_header();
 
         // Determine the best sync peer and number of outbound peers.
@@ -742,6 +848,10 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
             let had_sync_peer = self.sync_peer.is_some();
             let has_max_outbound = num_outbound >= self.cfg.max_outbound_peers;
             if self.warn_on_no_sync && (had_sync_peer || has_max_outbound) {
+                actions.push(Action::Log {
+                    level: LogLevel::Warn,
+                    message: "No sync peer candidates available".to_string(),
+                });
                 self.warn_on_no_sync = false;
             }
         } else {
@@ -757,12 +867,20 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// initial header sync process with it (dcrd
     /// `startInitialHeaderSync`).
     fn start_initial_header_sync(&mut self, actions: &mut Vec<Action>) {
-        self.update_sync_peer_state();
+        self.update_sync_peer_state(actions);
         let Some(sync_peer) = self.sync_peer else {
             return;
         };
 
         let sync_height = self.peers[&sync_peer].last_block;
+        actions.push(Action::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "Syncing headers to block height {} from peer {}",
+                sync_height,
+                self.peers[&sync_peer].display()
+            ),
+        });
 
         // The chain is not synced whenever the current best chain
         // height is not within a couple of blocks of the height to sync
@@ -787,7 +905,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// Find a peer to sync the chain from and start or continue the
     /// blockchain sync process with it (dcrd `startChainSync`).
     fn start_chain_sync(&mut self, actions: &mut Vec<Action>) {
-        self.update_sync_peer_state();
+        self.update_sync_peer_state(actions);
         let Some(sync_peer) = self.sync_peer else {
             return;
         };
@@ -805,6 +923,15 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
             return;
         }
         self.is_initial_chain_sync_done = true;
+
+        let best = self.cfg.chain.best_snapshot();
+        actions.push(Action::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "Initial chain sync complete (hash {}, height {})",
+                best.hash, best.height
+            ),
+        });
 
         // Request initial state from all peers that still need it now
         // that the initial chain sync is done.
@@ -1155,6 +1282,16 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         let block_hash = block.header.block_hash();
         let requested = self.requested_blocks.get(&block_hash) == Some(&peer_id);
         if !requested {
+            let peer_display = self
+                .peers
+                .get(&peer_id)
+                .map_or_else(|| peer_id.to_string(), Peer::display);
+            actions.push(Action::Log {
+                level: LogLevel::Warn,
+                message: format!(
+                    "Got unrequested block {block_hash} from {peer_display} -- disconnecting"
+                ),
+            });
             if let Some(peer) = self.peers.get_mut(&peer_id) {
                 peer.connected = false;
             }
@@ -1181,6 +1318,32 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                 // it through.
                 if failure.is_duplicate_block {
                     return actions;
+                }
+
+                // A rule error means the block was simply rejected as
+                // opposed to something actually going wrong.  Orphan
+                // blocks are never requested so there is no need to
+                // test for that rule error separately.
+                if failure.is_rule_error {
+                    let peer_display = self
+                        .peers
+                        .get(&peer_id)
+                        .map_or_else(|| peer_id.to_string(), Peer::display);
+                    actions.push(Action::Log {
+                        level: LogLevel::Info,
+                        message: format!(
+                            "Rejected block {block_hash} from {peer_display}: {}",
+                            failure.message
+                        ),
+                    });
+                } else {
+                    actions.push(Action::Log {
+                        level: LogLevel::Error,
+                        message: format!(
+                            "Failed to process block {block_hash}: {}",
+                            failure.message
+                        ),
+                    });
                 }
 
                 // Request headers from all peers that serve data to
@@ -1215,15 +1378,57 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
             }
         };
 
-        // dcrd logs information about the block here, via the periodic
+        // Log information about the block: through the periodic
         // progress logger before the initial chain sync is done and
-        // individually after; only the state transition is mirrored.
+        // individually after (dcrd `progressLogger.LogProgress` and
+        // the `New block` line).
         let header = &block.header;
         if !self.is_initial_chain_sync_done {
             let is_chain_current = self.cfg.chain.is_current();
+            let force = header.height as i64 >= self.sync_height() || is_chain_current;
+            let verify_progress = self.verify_progress();
+            actions.push(Action::LogBlockProgress {
+                num_txs: block.transactions.len() as u64,
+                num_tickets: u64::from(header.fresh_stake),
+                num_votes: u64::from(header.voters),
+                num_revocations: u64::from(header.revocations),
+                height: header.height,
+                force,
+                verify_progress,
+            });
             if is_chain_current {
                 self.on_initial_chain_sync_done(&mut actions);
             }
+        } else {
+            let interval = match self.cfg.chain.header_by_hash(&header.prev_block) {
+                Some(prev) => {
+                    let diff = header.timestamp as i64 - prev.timestamp as i64;
+                    format!(", interval {}", go_interval_string(diff))
+                }
+                None => String::new(),
+            };
+
+            let num_txs = block.transactions.len() as u64;
+            let num_tickets = u64::from(header.fresh_stake);
+            let num_votes = u64::from(header.voters);
+            let num_revokes = u64::from(header.revocations);
+            actions.push(Action::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "New block {} ({} {}, {} {}, {} {}, {} {}, height {}{})",
+                    block_hash,
+                    num_txs,
+                    pick_noun(num_txs, "transaction", "transactions"),
+                    num_tickets,
+                    pick_noun(num_tickets, "ticket", "tickets"),
+                    num_votes,
+                    pick_noun(num_votes, "vote", "votes"),
+                    num_revokes,
+                    pick_noun(num_revokes, "revocation", "revocations"),
+                    header.height,
+                    interval
+                ),
+            });
         }
 
         // Perform some additional processing when the block extended
@@ -1256,6 +1461,23 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         }
 
         actions
+    }
+
+    /// A guess of the progress of the chain verification process
+    /// (dcrd `blockchain.VerifyProgress`, evaluated through the chain
+    /// seam for the periodic block progress line).  dcrd defers the
+    /// evaluation to print time inside its progress logger; the pure
+    /// manager evaluates per emission and ships the value in the
+    /// action — the printed value is the same one dcrd would compute
+    /// for the printing call, at the cost of two extra chain reads on
+    /// a path that already makes several per block.
+    fn verify_progress(&mut self) -> f64 {
+        let (_, best_header_height) = self.cfg.chain.best_header();
+        if best_header_height == 0 {
+            return 0.0;
+        }
+        let tip_height = self.cfg.chain.best_snapshot().height;
+        (tip_height as f64 / best_header_height as f64).min(1.0) * 100.0
     }
 
     /// A guess of the header sync progress percentage based on the
@@ -1311,7 +1533,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
 
     /// The initial header sync completion transition (dcrd
     /// `onInitialHeaderSyncDone`).
-    fn on_initial_header_sync_done(&mut self, actions: &mut Vec<Action>) {
+    fn on_initial_header_sync_done(&mut self, hash: &Hash, height: i64, actions: &mut Vec<Action>) {
         actions.push(Action::StopHeaderSyncStallTimeout);
 
         // Prevent multiple invocations.
@@ -1319,6 +1541,18 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
             return;
         }
         self.headers_synced = true;
+
+        actions.push(Action::Log {
+            level: LogLevel::Info,
+            message: format!(
+                "Initial headers sync complete (best header hash {hash}, height {height})"
+            ),
+        });
+        actions.push(Action::Log {
+            level: LogLevel::Info,
+            message: "Performing initial chain sync...".to_string(),
+        });
+        actions.push(Action::ResetProgressLogTime);
 
         // Request headers starting from the parent of the best known
         // header for the local chain from any peers that potentially
@@ -1529,7 +1763,6 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // Reset the header sync progress stall timeout when the
         // headers are not already synced and progress was made.
         let (new_best_header_hash, new_best_header_height) = self.cfg.chain.best_header();
-        let _ = new_best_header_hash;
         if !headers_synced && is_sync_peer && new_best_header_height > prev_best_header_height {
             actions.push(Action::ResetHeaderSyncStallTimeout);
         }
@@ -1595,21 +1828,38 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
 
         // Consider the headers synced once the sync peer sends a
         // message with a final header that is within a few blocks of
-        // the sync height.
-        if !headers_synced
-            && is_sync_peer
-            && final_header.height as i64 + SYNC_HEIGHT_FETCH_OFFSET > self.sync_height()
-        {
-            {
+        // the sync height, logging the header progress along the way
+        // (dcrd `progressLogger.LogHeaderProgress` in both branches,
+        // forced once the headers are synced).
+        if !headers_synced && is_sync_peer {
+            if final_header.height as i64 + SYNC_HEIGHT_FETCH_OFFSET > self.sync_height() {
                 headers_synced = true;
 
-                // dcrd logs the header progress here.
-                self.on_initial_header_sync_done(&mut actions);
+                let now = self.cfg.chain.adjusted_time_unix();
+                let progress = self.header_sync_progress(now);
+                actions.push(Action::LogHeaderProgress {
+                    count: headers.len() as u64,
+                    force: headers_synced,
+                    progress,
+                });
+                self.on_initial_header_sync_done(
+                    &new_best_header_hash,
+                    new_best_header_height,
+                    &mut actions,
+                );
 
                 // Update the local var that tracks whether the chain
                 // believes it is current since it might have been
                 // updated now that the headers are synced.
                 is_chain_current = self.cfg.chain.is_current();
+            } else {
+                let now = self.cfg.chain.adjusted_time_unix();
+                let progress = self.header_sync_progress(now);
+                actions.push(Action::LogHeaderProgress {
+                    count: headers.len() as u64,
+                    force: headers_synced,
+                    progress,
+                });
             }
         }
 
@@ -2038,4 +2288,38 @@ fn limit_add(m: &mut HashMap<Hash, i32>, hash: Hash, peer: i32, limit: usize) {
         m.remove(&victim);
     }
     m.insert(hash, peer);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::go_interval_string;
+
+    /// Whole-second intervals render exactly like Go's
+    /// `time.Duration.String` (table generated from Go).
+    #[test]
+    fn interval_strings_match_go() {
+        let cases: [(i64, &str); 18] = [
+            (0, "0s"),
+            (1, "1s"),
+            (45, "45s"),
+            (59, "59s"),
+            (60, "1m0s"),
+            (61, "1m1s"),
+            (90, "1m30s"),
+            (300, "5m0s"),
+            (3599, "59m59s"),
+            (3600, "1h0m0s"),
+            (3601, "1h0m1s"),
+            (3725, "1h2m5s"),
+            (86400, "24h0m0s"),
+            (90061, "25h1m1s"),
+            (-1, "-1s"),
+            (-45, "-45s"),
+            (-150, "-2m30s"),
+            (-3725, "-1h2m5s"),
+        ];
+        for (secs, want) in cases {
+            assert_eq!(go_interval_string(secs), want, "{secs}");
+        }
+    }
 }

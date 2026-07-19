@@ -31,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dcroxide_addrmgr::AddrManager;
 use dcroxide_blockchain::process::Chain;
 use dcroxide_chainhash::Hash;
-use dcroxide_netsync::manager::Action;
+use dcroxide_netsync::manager::{Action, LogLevel as SyncLogLevel};
 use dcroxide_peer::{Peer, PeerEnv};
 use dcroxide_uint256::Uint256;
 use dcroxide_wire::{
@@ -211,6 +211,9 @@ pub struct SyncPeers {
     /// The command channel of the header-sync stall timer, once it is
     /// started ([`start_stall_timer`] wires it back here).
     stall: Arc<Mutex<Option<mpsc::Sender<StallCommand>>>>,
+    /// The periodic sync progress logger the manager's accumulation
+    /// actions feed (dcrd's `progressLogger` on the sync manager).
+    progress: Arc<Mutex<crate::progresslog::ProgressLogger>>,
 }
 
 impl SyncPeers {
@@ -693,6 +696,58 @@ impl SyncPeers {
                         let _ = socket.shutdown(Shutdown::Both);
                     }
                 }
+                Action::Log { level, message } => match level {
+                    SyncLogLevel::Info => crate::logging::info("SYNC", &message),
+                    SyncLogLevel::Warn => crate::logging::warn("SYNC", &message),
+                    SyncLogLevel::Error => crate::logging::error("SYNC", &message),
+                },
+                Action::LogBlockProgress {
+                    num_txs,
+                    num_tickets,
+                    num_votes,
+                    num_revocations,
+                    height,
+                    force,
+                    verify_progress,
+                } => {
+                    let line = self
+                        .progress
+                        .lock()
+                        .expect("progress logger poisoned")
+                        .log_block_progress_at(
+                            num_txs,
+                            num_tickets,
+                            num_votes,
+                            num_revocations,
+                            height,
+                            force,
+                            verify_progress,
+                            std::time::Instant::now(),
+                        );
+                    if let Some(line) = line {
+                        crate::logging::info("SYNC", &line);
+                    }
+                }
+                Action::LogHeaderProgress {
+                    count,
+                    force,
+                    progress,
+                } => {
+                    let line = self
+                        .progress
+                        .lock()
+                        .expect("progress logger poisoned")
+                        .log_header_progress_at(count, force, progress, std::time::Instant::now());
+                    if let Some(line) = line {
+                        crate::logging::info("SYNC", &line);
+                    }
+                }
+                Action::ResetProgressLogTime => {
+                    self.progress
+                        .lock()
+                        .expect("progress logger poisoned")
+                        .set_last_log_time(std::time::Instant::now());
+                }
                 Action::MarkKnownInventory { peer, invs } => {
                     // The registry lock is already held; feed the
                     // relay state directly (the daemon half of dcrd's
@@ -1054,6 +1109,7 @@ impl ServerPeerHandler {
             let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
             manager.on_peer_connected(dcroxide_netsync::manager::Peer::new(
                 id,
+                self.remote_addr.clone(),
                 peer.inbound(),
                 peer.services(),
                 peer.protocol_version(),

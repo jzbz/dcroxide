@@ -119,6 +119,10 @@ impl SyncChain for NodeSyncChain {
             .maybe_update_is_current_at(adjusted_time_unix());
     }
 
+    fn adjusted_time_unix(&mut self) -> i64 {
+        adjusted_time_unix()
+    }
+
     fn chain_work(&mut self, hash: &Hash) -> Option<Uint256> {
         self.locked().chain_work(hash)
     }
@@ -172,6 +176,10 @@ fn combine_process_block_result(
         None => Ok(fork_len),
         Some(first) => Err(ProcessBlockFailure {
             is_duplicate_block: first.kind == RuleErrorKind::DuplicateBlock,
+            // Every failure the chain surfaces here is a rule error
+            // (dcrd's non-rule process failures come from its database
+            // layer, which the port reports through panics instead).
+            is_rule_error: true,
             message: render_multi_error(&errs),
         }),
     }
