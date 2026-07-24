@@ -1489,7 +1489,7 @@ pub(crate) fn opcode_check_sig(
     let sub_script = remove_opcode_by_data(&sub_script, &full_sig_bytes);
 
     // Generate the signature hash based on the signature hash type.
-    let hash = match calc_signature_hash(&sub_script, hash_type, &vm.tx, vm.tx_idx) {
+    let hash = match calc_signature_hash(&sub_script, hash_type, vm.tx, vm.tx_idx) {
         Ok(hash) => hash,
         Err(_) => {
             vm.dstack.push_bool(false);
@@ -1665,7 +1665,7 @@ pub(crate) fn opcode_check_multi_sig(
         };
 
         // Generate the signature hash based on the signature hash type.
-        let hash = calc_signature_hash(&script, hash_type, &vm.tx, vm.tx_idx)?;
+        let hash = calc_signature_hash(&script, hash_type, vm.tx, vm.tx_idx)?;
 
         if parsed_sig.verify(&hash, &parsed_pub_key) {
             // PubKey verified, move on to the next signature.
@@ -1756,7 +1756,7 @@ pub(crate) fn opcode_check_sig_alt(
     let sub_script = remove_opcode_by_data(&sub_script, &full_sig_bytes);
 
     // Generate the signature hash based on the signature hash type.
-    let hash = match calc_signature_hash(&sub_script, hash_type, &vm.tx, vm.tx_idx) {
+    let hash = match calc_signature_hash(&sub_script, hash_type, vm.tx, vm.tx_idx) {
         Ok(hash) => hash,
         Err(_) => {
             vm.dstack.push_bool(false);

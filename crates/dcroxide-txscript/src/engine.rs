@@ -70,10 +70,14 @@ impl core::ops::BitOr for ScriptFlags {
 pub(crate) const NO_COND_DISABLE_DEPTH: i32 = -1;
 
 /// The virtual machine that executes scripts (dcrd `Engine`).
-pub struct Engine {
+pub struct Engine<'a> {
     // Set at creation and unchanged afterwards.
     pub(crate) flags: ScriptFlags,
-    pub(crate) tx: MsgTx,
+    /// The transaction under validation, borrowed for the engine's
+    /// lifetime (dcrd copies the Go struct, whose slices share their
+    /// backing arrays; an owned clone here deep-copied every script
+    /// of the transaction once per input).
+    pub(crate) tx: &'a MsgTx,
     pub(crate) tx_idx: usize,
     pub(crate) version: u16,
     pub(crate) is_p2sh: bool,
@@ -95,7 +99,7 @@ pub struct Engine {
     pub(crate) cond_disable_depth: i32,
 }
 
-impl Engine {
+impl<'a> Engine<'a> {
     /// Whether the engine has the passed flag set (dcrd `hasFlag`).
     pub(crate) fn has_flag(&self, flag: ScriptFlags) -> bool {
         self.flags.0 & flag.0 == flag.0
@@ -451,11 +455,11 @@ impl Engine {
     /// version-0 parse checks.
     pub fn new(
         script_pub_key: &[u8],
-        tx: &MsgTx,
+        tx: &'a MsgTx,
         tx_idx: usize,
         flags: ScriptFlags,
         script_version: u16,
-    ) -> Result<Engine, ScriptError> {
+    ) -> Result<Engine<'a>, ScriptError> {
         // The provided transaction input index must refer to a valid input.
         if tx_idx >= tx.tx_in.len() {
             return Err(script_error(
@@ -481,7 +485,7 @@ impl Engine {
 
         let mut vm = Engine {
             flags,
-            tx: tx.clone(),
+            tx,
             tx_idx,
             version: script_version,
             is_p2sh: false,
