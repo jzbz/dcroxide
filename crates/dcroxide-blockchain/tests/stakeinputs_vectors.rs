@@ -99,9 +99,7 @@ fn stakeinputs_vectors() {
             "tpi" => {
                 let (tx, _) = MsgTx::from_bytes(&unhex(f[1])).expect("tx");
                 assert_eq!(
-                    kind_of(check_ticket_purchase_inputs(&tx, |op| {
-                        utxos.get(&utxo_key(op)).cloned()
-                    })),
+                    kind_of(check_ticket_purchase_inputs(&tx, |op| utxos.get(&utxo_key(op)))),
                     f[2],
                     "{line}"
                 );
@@ -126,7 +124,7 @@ fn stakeinputs_vectors() {
                         &mut subsidy_cache,
                         &tx,
                         tx_height,
-                        |op| utxos.get(&utxo_key(op)).cloned(),
+                        |op| utxos.get(&utxo_key(op)),
                         &params,
                         &prev_header,
                         treasury,
@@ -150,7 +148,7 @@ fn stakeinputs_vectors() {
                     kind_of(check_revocation_inputs(
                         &tx,
                         tx_height,
-                        |op| utxos.get(&utxo_key(op)).cloned(),
+                        |op| utxos.get(&utxo_key(op)),
                         &params,
                         &prev_header,
                         treasury,

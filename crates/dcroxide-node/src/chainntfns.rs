@@ -641,30 +641,49 @@ impl ChainNtfnHandler {
         parent: &dcroxide_wire::MsgBlock,
         check_tx_flags: AgendaFlags,
     ) {
+        // Hash every transaction in the block exactly once up front:
+        // the fee-estimator feed and the per-transaction pool
+        // maintenance below both key on the hashes, and dcrd pays for
+        // them only once via the `dcrutil.Block` hash cache.
+        let regular_hashes: Vec<Hash> = block.transactions.iter().map(|tx| tx.tx_hash()).collect();
+        let stake_hashes: Vec<Hash> = block.stransactions.iter().map(|tx| tx.tx_hash()).collect();
+
         // Feed the connected block into the fee estimator before the
         // mempool removal.  dcrd runs `ProcessBlock` first because the
         // mempool removals below alert the estimator, and if they ran
         // first the estimator would see these transactions leave the
         // pool without ever having been mined.
         if let Some(estimator) = &self.fee_estimator {
-            crate::fees::process_connected_block(estimator, block);
+            crate::fees::process_connected_block(
+                estimator,
+                i64::from(block.header.height),
+                &regular_hashes,
+                &stake_hashes,
+            );
         }
 
         let is_treasury_enabled = check_tx_flags.is_treasury_enabled();
         let regular = block.transactions.get(1..).unwrap_or(&[]);
-        let stake = if is_treasury_enabled {
-            block.stransactions.get(1..).unwrap_or(&[])
+        let regular_tail_hashes = regular_hashes.get(1..).unwrap_or(&[]);
+        let (stake, stake_tail_hashes) = if is_treasury_enabled {
+            (
+                block.stransactions.get(1..).unwrap_or(&[]),
+                stake_hashes.get(1..).unwrap_or(&[]),
+            )
         } else {
-            &block.stransactions[..]
+            (&block.stransactions[..], &stake_hashes[..])
         };
-        for tx in regular.iter().chain(stake) {
-            let tx_hash = tx.tx_hash();
+        for (tx, tx_hash) in regular
+            .iter()
+            .zip(regular_tail_hashes)
+            .chain(stake.iter().zip(stake_tail_hashes))
+        {
             let accepted = {
                 let mut pool = self.tx_pool.lock().expect("tx pool mutex poisoned");
-                pool.remove_transaction(tx, &tx_hash, false);
-                pool.maybe_accept_dependents(tx, &tx_hash, is_treasury_enabled);
-                pool.remove_double_spends(tx, &tx_hash);
-                pool.remove_orphan_pub(&tx_hash);
+                pool.remove_transaction(tx, tx_hash, false);
+                pool.maybe_accept_dependents(tx, tx_hash, is_treasury_enabled);
+                pool.remove_double_spends(tx, tx_hash);
+                pool.remove_orphan_pub(tx_hash);
                 pool.process_orphans(tx, check_tx_flags)
             };
             self.announce_transactions(&accepted);
@@ -681,7 +700,7 @@ impl ChainNtfnHandler {
                     .add(&tx_hash.0);
             }
             if let Some(rebroadcast) = &self.rebroadcast {
-                rebroadcast.remove_rebroadcast_inventory(&tx_hash);
+                rebroadcast.remove_rebroadcast_inventory(tx_hash);
             }
         }
 

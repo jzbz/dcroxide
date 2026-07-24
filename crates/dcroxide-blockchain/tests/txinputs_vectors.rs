@@ -109,7 +109,7 @@ fn txinputs_vectors() {
                     &mut subsidy_cache,
                     &tx,
                     tx_height,
-                    |op| utxos.get(&utxo_key(op)).cloned(),
+                    |op| utxos.get(&utxo_key(op)),
                     fraud,
                     &params,
                     &prev_header,

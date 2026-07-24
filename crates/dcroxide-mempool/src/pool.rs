@@ -1312,7 +1312,7 @@ impl<C: PoolChain> TxPool<C> {
             &mut self.subsidy_cache,
             &tx,
             next_block_height,
-            |op| utxo_view.lookup_entry(op).cloned(),
+            |op| utxo_view.lookup_entry(op),
             true,
             &self.params,
             &best_header,
@@ -1331,7 +1331,7 @@ impl<C: PoolChain> TxPool<C> {
                 |op| {
                     utxo_view
                         .lookup_entry(op)
-                        .map(|e| (e.script_version(), e.pk_script().to_vec()))
+                        .map(|e| (e.script_version(), e.pk_script()))
                 },
                 is_treasury_enabled,
             )
@@ -1352,7 +1352,7 @@ impl<C: PoolChain> TxPool<C> {
             &tx,
             false,
             is_vote,
-            |op| utxo_view.lookup_entry(op).cloned(),
+            |op| utxo_view.lookup_entry(op),
             is_treasury_enabled,
         )
         .map_err(|e| PoolError::Rule(chain_rule_error(e)))?;
@@ -1419,7 +1419,7 @@ impl<C: PoolChain> TxPool<C> {
         let sig_cache = self.chain.sig_cache();
         validate_transaction_scripts(
             &tx,
-            |op| utxo_view.lookup_entry(op).cloned(),
+            |op| utxo_view.lookup_entry(op),
             flags,
             sig_cache.as_deref(),
             is_auto_revocations_enabled,

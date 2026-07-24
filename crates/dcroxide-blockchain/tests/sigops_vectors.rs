@@ -109,7 +109,7 @@ fn sigops_vectors() {
                     &tx,
                     coinbase,
                     stakebase,
-                    |op| utxos.get(&utxo_key(op)).cloned(),
+                    |op| utxos.get(&utxo_key(op)),
                     treasury,
                 );
                 assert_eq!(kind_of(&result), f[6], "{line}");
@@ -128,7 +128,7 @@ fn sigops_vectors() {
                     &tx,
                     coinbase,
                     vote,
-                    |op| utxos.get(&utxo_key(op)).cloned(),
+                    |op| utxos.get(&utxo_key(op)),
                     treasury,
                 );
                 assert_eq!(kind_of(&result), f[6], "{line}");
@@ -146,7 +146,7 @@ fn sigops_vectors() {
                     &mut subsidy_cache,
                     height,
                     &txs,
-                    |op| utxos.get(&utxo_key(op)).cloned(),
+                    |op| utxos.get(&utxo_key(op)),
                     variant,
                 );
                 assert_eq!(kind_of(&result), f[4], "{line}");
@@ -154,7 +154,7 @@ fn sigops_vectors() {
             }
             "gsba" => {
                 let txs = parse_txs(f[1]);
-                let result = get_stake_base_amounts(&txs, |op| utxos.get(&utxo_key(op)).cloned());
+                let result = get_stake_base_amounts(&txs, |op| utxos.get(&utxo_key(op)));
                 assert_eq!(kind_of(&result), f[3], "{line}");
                 if f[2] != "-" {
                     let want: i64 = f[2].parse().expect("amount");

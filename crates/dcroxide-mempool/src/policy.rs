@@ -5,7 +5,6 @@
 //! transaction, output script, and input standardness checks.
 
 use alloc::format;
-use alloc::vec::Vec;
 
 use dcroxide_stake::TxType;
 use dcroxide_txscript::stdscript::{
@@ -102,10 +101,10 @@ pub fn calc_min_required_tx_relay_fee(serialized_size: i64, min_relay_tx_fee: i6
 /// The entries for all inputs must exist in the view supplied by the
 /// lookup; existence has already been checked prior to calling this
 /// function, matching dcrd.
-pub fn check_inputs_standard(
+pub fn check_inputs_standard<'a>(
     tx: &MsgTx,
     tx_type: TxType,
-    lookup_entry: impl Fn(&OutPoint) -> Option<(u16, Vec<u8>)>,
+    lookup_entry: impl Fn(&OutPoint) -> Option<(u16, &'a [u8])>,
     is_treasury_enabled: bool,
 ) -> Result<(), RuleError> {
     // NOTE: The reference implementation also does a coinbase check
@@ -127,11 +126,11 @@ pub fn check_inputs_standard(
         // function.
         let (origin_script_ver, origin_script) =
             lookup_entry(&tx_in.previous_out_point).expect("input entry exists");
-        match determine_script_type(origin_script_ver, &origin_script) {
+        match determine_script_type(origin_script_ver, origin_script) {
             ScriptType::ScriptHash => {
                 let num_sig_ops = get_precise_sig_op_count(
                     &tx_in.signature_script,
-                    &origin_script,
+                    origin_script,
                     is_treasury_enabled,
                 );
                 if num_sig_ops > MAX_STANDARD_P2SH_SIG_OPS {

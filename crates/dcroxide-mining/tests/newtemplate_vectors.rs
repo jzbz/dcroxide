@@ -132,7 +132,7 @@ impl TemplateChain for FakeChain {
             &mut self.subsidy_cache.borrow_mut(),
             tx,
             tx_height,
-            |op| view.lookup_entry(op).cloned(),
+            |op| view.lookup_entry(op),
             check_fraud_proof,
             params,
             prev_header,
@@ -153,14 +153,8 @@ impl TemplateChain for FakeChain {
         view: &UtxoView,
         treasury: bool,
     ) -> Result<u32, String> {
-        count_total_sig_ops(
-            tx,
-            is_cb,
-            is_vote,
-            |op| view.lookup_entry(op).cloned(),
-            treasury,
-        )
-        .map_err(|e| e.description)
+        count_total_sig_ops(tx, is_cb, is_vote, |op| view.lookup_entry(op), treasury)
+            .map_err(|e| e.description)
     }
     fn fetch_utxo_entry(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>, String> {
         Ok(self.utxos.lookup_entry(outpoint).cloned())
@@ -236,14 +230,8 @@ impl TemplateChain for FakeChain {
         flags: ScriptFlags,
         auto_rev: bool,
     ) -> Result<(), String> {
-        validate_transaction_scripts(
-            tx,
-            |op| view.lookup_entry(op).cloned(),
-            flags,
-            None,
-            auto_rev,
-        )
-        .map_err(|e| format!("{e:?}"))
+        validate_transaction_scripts(tx, |op| view.lookup_entry(op), flags, None, auto_rev)
+            .map_err(|e| format!("{e:?}"))
     }
     fn standard_verify_flags(&self) -> Result<ScriptFlags, String> {
         Ok(self.script_flags)

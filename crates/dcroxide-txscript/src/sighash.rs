@@ -53,6 +53,70 @@ fn put_var_int(buf: &mut Vec<u8>, val: u64) {
     }
 }
 
+/// The number of bytes the varint encoding of `val` occupies (dcrd
+/// `varIntSerializeSize`).
+fn var_int_serialize_size(val: u64) -> usize {
+    if val < 0xfd {
+        1
+    } else if val <= u64::from(u16::MAX) {
+        3
+    } else if val <= u64::from(u32::MAX) {
+        5
+    } else {
+        9
+    }
+}
+
+/// The number of bytes the prefix hash portion of the signature hash
+/// occupies when serialized (dcrd `sigHashPrefixSerializeSize`).
+fn sig_hash_prefix_serialize_size(
+    hash_type: SigHashType,
+    tx_ins: &[dcroxide_wire::TxIn],
+    tx_outs: &[dcroxide_wire::TxOut],
+    sign_idx: usize,
+) -> usize {
+    // 1) 4 bytes version/serialization type
+    // 2) number of inputs varint
+    // 3) per input: 32-byte prevout hash, 4-byte index, 1-byte tree,
+    //    4-byte sequence
+    // 4) number of outputs varint
+    // 5) per output: 8-byte amount, 2-byte script version, pkscript
+    //    varint + bytes (nil script for non-signed SigHashSingle outputs)
+    // 6) 4 bytes lock time
+    // 7) 4 bytes expiry
+    let num_tx_ins = tx_ins.len();
+    let num_tx_outs = tx_outs.len();
+    let mut size = 4
+        + var_int_serialize_size(num_tx_ins as u64)
+        + num_tx_ins * (32 + 4 + 1 + 4)
+        + var_int_serialize_size(num_tx_outs as u64)
+        + num_tx_outs * (8 + 2)
+        + 4
+        + 4;
+    for (tx_out_idx, tx_out) in tx_outs.iter().enumerate() {
+        let mut pk_script: &[u8] = &tx_out.pk_script;
+        if hash_type.0 & SIG_HASH_MASK == SIG_HASH_SINGLE.0 && tx_out_idx != sign_idx {
+            pk_script = &[];
+        }
+        size += var_int_serialize_size(pk_script.len() as u64);
+        size += pk_script.len();
+    }
+    size
+}
+
+/// The number of bytes the witness hash portion of the signature hash
+/// occupies when serialized (dcrd `sigHashWitnessSerializeSize`).
+fn sig_hash_witness_serialize_size(num_tx_ins: usize, sign_script: &[u8]) -> usize {
+    // 1) 4 bytes version/serialization type
+    // 2) number of inputs varint
+    // 3) per input: the signing script for the input being signed and a
+    //    nil script (a single 0x00 varint byte) for the numTxIns-1 others.
+    4 + var_int_serialize_size(num_tx_ins as u64)
+        + num_tx_ins.saturating_sub(1)
+        + var_int_serialize_size(sign_script.len() as u64)
+        + sign_script.len()
+}
+
 /// Compute the signature hash for the specified input (dcrd
 /// `calcSignatureHash`). The prefix-hash caching optimization dcrd carries
 /// behind its permanently-disabled `optimizeSigVerification` flag is not
@@ -105,7 +169,8 @@ pub(crate) fn calc_signature_hash(
     //    SigHashSingle non-corresponding outputs commit to value -1 and a
     //    nil script
     // 4) lock time and expiry (LE u32 each).
-    let mut prefix_buf = Vec::new();
+    let prefix_size = sig_hash_prefix_serialize_size(hash_type, tx_ins, tx_outs, idx);
+    let mut prefix_buf = Vec::with_capacity(prefix_size);
     let version = u32::from(tx.version) | (SIG_HASH_SERIALIZE_PREFIX << 16);
     prefix_buf.extend_from_slice(&version.to_le_bytes());
 
@@ -148,7 +213,8 @@ pub(crate) fn calc_signature_hash(
     // 1) txversion|(SigHashSerializeWitness<<16) (LE u32)
     // 2) number of inputs (varint), then per input the signing script for
     //    the input being signed and a nil script for all others.
-    let mut witness_buf = Vec::new();
+    let witness_size = sig_hash_witness_serialize_size(tx_ins.len(), sign_script);
+    let mut witness_buf = Vec::with_capacity(witness_size);
     let version = u32::from(tx.version) | (SIG_HASH_SERIALIZE_WITNESS << 16);
     witness_buf.extend_from_slice(&version.to_le_bytes());
 

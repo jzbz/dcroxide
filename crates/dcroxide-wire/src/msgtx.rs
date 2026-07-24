@@ -279,7 +279,9 @@ impl MsgTx {
             });
         }
 
-        self.tx_in.clear();
+        // The count was just bounded above, so this pre-size is capped the
+        // same way dcrd's `make([]TxIn, count)` is.
+        self.tx_in = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let hash = Hash(r.take_array()?);
             let index = r.read_u32()?;
@@ -300,7 +302,8 @@ impl MsgTx {
             });
         }
 
-        self.tx_out.clear();
+        // Bounded above, mirroring dcrd's `make([]*TxOut, count)`.
+        self.tx_out = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let value = r.read_u64()? as i64;
             let version = r.read_u16()?;
@@ -340,8 +343,10 @@ impl MsgTx {
         }
 
         if !is_full {
-            self.tx_in.clear();
-            self.tx_out.clear();
+            // Bounded above, mirroring dcrd's `make([]*TxIn, count)` in the
+            // witness-only decode path (outputs stay empty, as in dcrd).
+            self.tx_in = Vec::with_capacity(count as usize);
+            self.tx_out = Vec::new();
         }
         for i in 0..count as usize {
             let value_in = r.read_u64()? as i64;
@@ -427,6 +432,13 @@ impl MsgTx {
     /// The serialized size in bytes for [`Self::ser_type`] (dcrd
     /// `SerializeSize`).
     pub fn serialize_size(&self) -> usize {
+        self.serialize_size_with_type(self.ser_type)
+    }
+
+    /// The serialized size in bytes for an explicit serialization type
+    /// (dcrd computes this by shallow-copying the transaction with the
+    /// desired `SerType` and calling `SerializeSize`).
+    fn serialize_size_with_type(&self, ser_type: TxSerializeType) -> usize {
         let prefix = || {
             12 + var_int_serialize_size(self.tx_in.len() as u64)
                 + var_int_serialize_size(self.tx_out.len() as u64)
@@ -445,7 +457,7 @@ impl MsgTx {
                     .map(TxIn::serialize_size_witness)
                     .sum::<usize>()
         };
-        match self.ser_type {
+        match ser_type {
             TxSerializeType::NoWitness => prefix(),
             TxSerializeType::OnlyWitness => 4 + witness(),
             TxSerializeType::Full => prefix() + witness(),
@@ -453,18 +465,21 @@ impl MsgTx {
     }
 
     /// The transaction hash: BLAKE-256 over the prefix (no-witness)
-    /// serialization (dcrd `TxHash`).
+    /// serialization (dcrd `TxHash`, which preallocates via
+    /// `SerializeSize` in `serialize`).
     pub fn tx_hash(&self) -> Hash {
-        let mut w = Vec::new();
-        self.encode_with_type(TxSerializeType::NoWitness, &mut w);
+        let ser_type = TxSerializeType::NoWitness;
+        let mut w = Vec::with_capacity(self.serialize_size_with_type(ser_type));
+        self.encode_with_type(ser_type, &mut w);
         hash_h(&w)
     }
 
     /// The witness hash: BLAKE-256 over the witness-only serialization
     /// (dcrd `TxHashWitness`).
     pub fn tx_hash_witness(&self) -> Hash {
-        let mut w = Vec::new();
-        self.encode_with_type(TxSerializeType::OnlyWitness, &mut w);
+        let ser_type = TxSerializeType::OnlyWitness;
+        let mut w = Vec::with_capacity(self.serialize_size_with_type(ser_type));
+        self.encode_with_type(ser_type, &mut w);
         hash_h(&w)
     }
 

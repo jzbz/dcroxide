@@ -37,19 +37,27 @@ pub fn new_shared_estimator(min_relay_tx_fee: i64) -> Result<Arc<Mutex<Estimator
     Ok(Arc::new(Mutex::new(Estimator::new(&cfg)?)))
 }
 
-/// Feed a connected block's transactions into the estimator (dcrd's
-/// `feeEstimator.ProcessBlock` in the NTBlockConnected case, run
-/// before the mempool removal so each transaction transitions from
-/// mempool to mined).  Every regular and stake transaction hash is
-/// passed — the coinbase and treasurybase were never in the mempool,
-/// so the estimator ignores them, matching dcrd.
-pub fn process_connected_block(estimator: &Arc<Mutex<Estimator>>, block: &dcroxide_wire::MsgBlock) {
-    let regular: Vec<Hash> = block.transactions.iter().map(|tx| tx.tx_hash()).collect();
-    let stake: Vec<Hash> = block.stransactions.iter().map(|tx| tx.tx_hash()).collect();
+/// Feed a connected block's transaction hashes into the estimator
+/// (dcrd's `feeEstimator.ProcessBlock` in the NTBlockConnected case,
+/// run before the mempool removal so each transaction transitions
+/// from mempool to mined).  Every regular and stake transaction hash
+/// is passed — the coinbase and treasurybase were never in the
+/// mempool, so the estimator ignores them, matching dcrd.  The caller
+/// hands over the hashes it already computed for the post-connect
+/// mempool maintenance (dcrd gets them cached on `dcrutil.Block`), so
+/// the block is never hashed a second time for this feed — and a
+/// disabled estimator costs nothing but the lock (`ProcessBlock`'s
+/// pre-enable early return).
+pub fn process_connected_block(
+    estimator: &Arc<Mutex<Estimator>>,
+    height: i64,
+    regular_tx_hashes: &[Hash],
+    stake_tx_hashes: &[Hash],
+) {
     estimator
         .lock()
         .expect("fee estimator mutex poisoned")
-        .process_block(i64::from(block.header.height), &regular, &stake);
+        .process_block(height, regular_tx_hashes, stake_tx_hashes);
 }
 
 /// Enable the estimator at the accepted block's height once the chain
@@ -258,7 +266,14 @@ mod tests {
             1.0,
             "tracked before the block"
         );
-        process_connected_block(&estimator, &block);
+        let regular_hashes: Vec<Hash> = block.transactions.iter().map(|t| t.tx_hash()).collect();
+        let stake_hashes: Vec<Hash> = block.stransactions.iter().map(|t| t.tx_hash()).collect();
+        process_connected_block(
+            &estimator,
+            i64::from(block.header.height),
+            &regular_hashes,
+            &stake_hashes,
+        );
 
         assert!(estimator.lock().expect("est").is_enabled());
         assert_eq!(

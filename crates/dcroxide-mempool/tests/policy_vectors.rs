@@ -111,7 +111,11 @@ fn policy_vectors() {
                 let kind = match check_inputs_standard(
                     &tx,
                     tx_type(f[2]),
-                    |op| entries.get(&(op.hash, op.index, op.tree)).cloned(),
+                    |op| {
+                        entries
+                            .get(&(op.hash, op.index, op.tree))
+                            .map(|(ver, script)| (*ver, script.as_slice()))
+                    },
                     treasury,
                 ) {
                     Ok(()) => "ok".to_string(),

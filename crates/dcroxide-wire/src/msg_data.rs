@@ -270,7 +270,9 @@ impl MsgBlock {
                 max: max_per_tree,
             });
         }
-        let mut transactions = Vec::new();
+        // The count was just bounded above, so this pre-size is capped the
+        // same way dcrd's `make([]*MsgTx, 0, txCount)` is.
+        let mut transactions = Vec::with_capacity(tx_count as usize);
         for _ in 0..tx_count {
             transactions.push(MsgTx::decode(r)?);
         }
@@ -282,7 +284,8 @@ impl MsgBlock {
                 max: max_per_tree,
             });
         }
-        let mut stransactions = Vec::new();
+        // Bounded above, mirroring dcrd's `make([]*MsgTx, 0, stakeTxCount)`.
+        let mut stransactions = Vec::with_capacity(stake_tx_count as usize);
         for _ in 0..stake_tx_count {
             stransactions.push(MsgTx::decode(r)?);
         }
@@ -314,11 +317,29 @@ impl MsgBlock {
         Ok((msg, r.position()))
     }
 
-    /// The serialization (dcrd `Bytes`).
+    /// The serialization (dcrd `Bytes`, which preallocates via
+    /// `SerializeSize`).
     pub fn serialize(&self) -> Vec<u8> {
-        let mut w = Vec::new();
+        let mut w = Vec::with_capacity(self.serialize_size());
         self.encode(&mut w);
         w
+    }
+
+    /// The serialized size in bytes (dcrd `MsgBlock.SerializeSize`).
+    pub fn serialize_size(&self) -> usize {
+        MAX_BLOCK_HEADER_PAYLOAD
+            + var_int_serialize_size(self.transactions.len() as u64)
+            + var_int_serialize_size(self.stransactions.len() as u64)
+            + self
+                .transactions
+                .iter()
+                .map(MsgTx::serialize_size)
+                .sum::<usize>()
+            + self
+                .stransactions
+                .iter()
+                .map(MsgTx::serialize_size)
+                .sum::<usize>()
     }
 
     /// The block hash (dcrd `BlockHash`).

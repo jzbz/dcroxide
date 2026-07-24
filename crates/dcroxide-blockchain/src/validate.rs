@@ -619,7 +619,7 @@ pub fn check_block_sanity(
 
     // A block must not exceed the maximum allowed block payload when
     // serialized, and the header commitment to its size must match.
-    let serialized_size = block.serialize().len();
+    let serialized_size = block.serialize_size();
     if serialized_size > dcroxide_wire::MAX_BLOCK_PAYLOAD as usize {
         return Err(rule_error(
             RuleErrorKind::BlockTooBig,
@@ -1841,9 +1841,9 @@ pub fn extract_ticket_commit_amount(script: &[u8]) -> i64 {
 /// transaction (dcrd `checkTicketPurchaseInputs`).  The caller MUST
 /// have already determined the transaction is a ticket purchase.
 /// `lookup_entry` stands in for dcrd's `UtxoViewpoint.LookupEntry`.
-pub fn check_ticket_purchase_inputs(
+pub fn check_ticket_purchase_inputs<'a>(
     tx: &MsgTx,
-    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    lookup_entry: impl Fn(&OutPoint) -> Option<&'a crate::UtxoEntry>,
 ) -> Result<(), RuleError> {
     // Assert there are two outputs for each input to the ticket as
     // well as the additional voting rights output.
@@ -2288,11 +2288,11 @@ impl dcroxide_standalone::SubsidyParams for ChainSubsidyParams<'_> {
 /// (dcrd `checkVoteInputs`).  The caller MUST have already determined
 /// the transaction is a vote.
 #[allow(clippy::too_many_arguments)]
-pub fn check_vote_inputs<SP: dcroxide_standalone::SubsidyParams>(
+pub fn check_vote_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
     subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
     tx: &MsgTx,
     tx_height: i64,
-    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    lookup_entry: impl Fn(&OutPoint) -> Option<&'a crate::UtxoEntry>,
     params: &Params,
     prev_header: &dcroxide_wire::BlockHeader,
     is_treasury_enabled: bool,
@@ -2355,7 +2355,7 @@ pub fn check_vote_inputs<SP: dcroxide_standalone::SubsidyParams>(
 
     // Ensure the referenced output is a supported ticket submission
     // output, which also proves the form of the housing transaction.
-    if let Err(e) = check_ticket_submission_input(&ticket_utxo) {
+    if let Err(e) = check_ticket_submission_input(ticket_utxo) {
         let vote_hash = tx.tx_hash();
         return Err(rule_error(
             RuleErrorKind::InvalidVoteInput,
@@ -2429,10 +2429,10 @@ pub fn check_vote_inputs<SP: dcroxide_standalone::SubsidyParams>(
 /// Perform a series of checks on the inputs to a revocation
 /// transaction (dcrd `checkRevocationInputs`).  The caller MUST have
 /// already determined the transaction is a revocation.
-pub fn check_revocation_inputs(
+pub fn check_revocation_inputs<'a>(
     tx: &MsgTx,
     tx_height: i64,
-    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    lookup_entry: impl Fn(&OutPoint) -> Option<&'a crate::UtxoEntry>,
     params: &Params,
     prev_header: &dcroxide_wire::BlockHeader,
     is_treasury_enabled: bool,
@@ -2475,7 +2475,7 @@ pub fn check_revocation_inputs(
 
     // Ensure the referenced output is a supported ticket submission
     // output, which also proves the form of the housing transaction.
-    if let Err(e) = check_ticket_submission_input(&ticket_utxo) {
+    if let Err(e) = check_ticket_submission_input(ticket_utxo) {
         let revoke_hash = tx.tx_hash();
         return Err(rule_error(
             RuleErrorKind::InvalidRevokeInput,
@@ -2649,11 +2649,11 @@ fn hex_string(bytes: &[u8]) -> String {
 /// sanity checked.  `lookup_entry` stands in for dcrd's
 /// `UtxoViewpoint.LookupEntry`.
 #[allow(clippy::too_many_arguments)]
-pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
+pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
     subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
     tx: &MsgTx,
     tx_height: i64,
-    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    lookup_entry: impl Fn(&OutPoint) -> Option<&'a crate::UtxoEntry>,
     check_fraud_proof: bool,
     params: &Params,
     prev_header: &dcroxide_wire::BlockHeader,
@@ -3082,11 +3082,11 @@ pub fn count_sig_ops(
 /// The number of signature operations for all input transactions of
 /// the pay-to-script-hash type, using the precise counting mechanism
 /// from the script engine (dcrd `countP2SHSigOps` at 2.2).
-pub fn count_p2sh_sig_ops(
+pub fn count_p2sh_sig_ops<'a>(
     tx: &MsgTx,
     is_coin_base: bool,
     is_vote: bool,
-    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    lookup_entry: impl Fn(&OutPoint) -> Option<&'a crate::UtxoEntry>,
     is_treasury_enabled: bool,
 ) -> Result<u32, RuleError> {
     // Coinbase transactions have no interesting inputs.
@@ -3161,11 +3161,11 @@ pub fn count_p2sh_sig_ops(
 /// The total number of signature operations for the transaction —
 /// input and output scripts plus any redeemed pay-to-script-hash
 /// inputs (dcrd `CountTotalSigOps`, new in dcrd 2.2).
-pub fn count_total_sig_ops(
+pub fn count_total_sig_ops<'a>(
     tx: &MsgTx,
     is_coin_base: bool,
     is_vote: bool,
-    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    lookup_entry: impl Fn(&OutPoint) -> Option<&'a crate::UtxoEntry>,
     is_treasury_enabled: bool,
 ) -> Result<u32, RuleError> {
     // Count the number of regular signature operations.
@@ -3191,11 +3191,11 @@ pub fn count_total_sig_ops(
 /// Ensure no vote in the given transactions spends more subsidy than
 /// allowed for the height being voted on (dcrd
 /// `checkStakeBaseAmounts`).
-pub fn check_stake_base_amounts<SP: dcroxide_standalone::SubsidyParams>(
+pub fn check_stake_base_amounts<'a, SP: dcroxide_standalone::SubsidyParams>(
     subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
     height: i64,
     txs: &[MsgTx],
-    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    lookup_entry: impl Fn(&OutPoint) -> Option<&'a crate::UtxoEntry>,
     subsidy_split_variant: dcroxide_standalone::SubsidySplitVariant,
 ) -> Result<(), RuleError> {
     for tx in txs {
@@ -3244,9 +3244,9 @@ pub fn check_stake_base_amounts<SP: dcroxide_standalone::SubsidyParams>(
 
 /// The total amount given as subsidy from the collective stakebase
 /// transactions (votes) within a block (dcrd `getStakeBaseAmounts`).
-pub fn get_stake_base_amounts(
+pub fn get_stake_base_amounts<'a>(
     txs: &[MsgTx],
-    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    lookup_entry: impl Fn(&OutPoint) -> Option<&'a crate::UtxoEntry>,
 ) -> Result<i64, RuleError> {
     let mut total_inputs: i64 = 0;
     let mut total_outputs: i64 = 0;
@@ -3283,9 +3283,9 @@ const CHECK_FOR_DUPLICATE_HASHES: bool = false;
 /// Prevent duplicate transaction hashes from overwriting unspent
 /// outputs (dcrd `checkDupTxs`); a no-op at this dcrd version per
 /// [`CHECK_FOR_DUPLICATE_HASHES`].
-pub fn check_dup_txs(
+pub fn check_dup_txs<'a>(
     txs: &[MsgTx],
-    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    lookup_entry: impl Fn(&OutPoint) -> Option<&'a crate::UtxoEntry>,
     tree: i8,
 ) -> Result<(), RuleError> {
     if !CHECK_FOR_DUPLICATE_HASHES {
@@ -3887,7 +3887,7 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
             tx,
             is_coin_base,
             is_vote,
-            |op| view.lookup_entry(op).cloned(),
+            |op| view.lookup_entry(op),
             is_treasury_enabled,
         )?;
         let ok;
@@ -3916,7 +3916,7 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
             subsidy_cache,
             tx,
             node_height,
-            |op| view.lookup_entry(op).cloned(),
+            |op| view.lookup_entry(op),
             CHECK_FRAUD_PROOF,
             params,
             prev_header,
@@ -4050,11 +4050,10 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
             subsidy_cache,
             node_height,
             txs,
-            |op| view.lookup_entry(op).cloned(),
+            |op| view.lookup_entry(op),
             subsidy_split_variant,
         )?;
-        let total_atom_out_stake =
-            get_stake_base_amounts(txs, |op| view.lookup_entry(op).cloned())?;
+        let total_atom_out_stake = get_stake_base_amounts(txs, |op| view.lookup_entry(op))?;
         // dcrd 2.2 dropped the pre-stake-validation-height else arm
         // that set the expected stakebase output to the accumulated
         // fees; before that height the expected output is simply zero.
@@ -4681,7 +4680,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     }
 
     // Duplicate transaction checking is a no-op at this version.
-    check_dup_txs(&block.stransactions, |op| view.lookup_entry(op).cloned(), 1)?;
+    check_dup_txs(&block.stransactions, |op| view.lookup_entry(op), 1)?;
 
     // Load all of the utxos referenced by the block that are not
     // already in the view.
@@ -4783,7 +4782,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         )?;
     }
 
-    check_dup_txs(&block.transactions, |op| view.lookup_entry(op).cloned(), 0)?;
+    check_dup_txs(&block.transactions, |op| view.lookup_entry(op), 0)?;
 
     // Connect the regular tree with full checks, carrying the stake
     // tree fees forward.
@@ -4881,9 +4880,9 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
 /// `sig_cache` exactly as dcrd wires its `sigCache`).  Entries that
 /// are missing or spent yield `ErrMissingTxOut` per the
 /// `PrevScripter` contract over a utxo viewpoint.
-pub fn validate_transaction_scripts(
+pub fn validate_transaction_scripts<'a>(
     tx: &MsgTx,
-    lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
+    lookup_entry: impl Fn(&OutPoint) -> Option<&'a crate::UtxoEntry>,
     script_flags: dcroxide_txscript::ScriptFlags,
     sig_cache: Option<&dcroxide_txscript::SigCache>,
     is_auto_revocations_enabled: bool,
@@ -4921,11 +4920,13 @@ pub fn validate_transaction_scripts(
         };
 
         // Create a new script engine for the script pair and execute
-        // it.
-        let pk_script = entry.pk_script().to_vec();
+        // it.  The referenced output script is borrowed straight from
+        // the looked-up entry — no copy (dcrd hands the engine the
+        // view entry's script slice).
+        let pk_script = entry.pk_script();
         let script_version = entry.script_version();
         let mut engine =
-            dcroxide_txscript::Engine::new(&pk_script, tx, tx_in_idx, script_flags, script_version)
+            dcroxide_txscript::Engine::new(pk_script, tx, tx_in_idx, script_flags, script_version)
                 .map_err(|e| {
                     rule_error(
                         RuleErrorKind::ScriptMalformed,

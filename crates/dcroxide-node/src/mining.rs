@@ -121,7 +121,7 @@ impl TemplateChain for NodeTemplateChain {
             &mut self.subsidy_cache,
             tx,
             tx_height,
-            |op| view.lookup_entry(op).cloned(),
+            |op| view.lookup_entry(op),
             check_fraud_proof,
             &self.params,
             prev_header,
@@ -153,7 +153,7 @@ impl TemplateChain for NodeTemplateChain {
             tx,
             is_coin_base,
             is_vote,
-            |op| view.lookup_entry(op).cloned(),
+            |op| view.lookup_entry(op),
             is_treasury_enabled,
         )
         .map_err(|e| e.description)
@@ -289,7 +289,7 @@ impl TemplateChain for NodeTemplateChain {
         let chain = self.locked();
         dcroxide_blockchain::validate::validate_transaction_scripts(
             tx,
-            |op| view.lookup_entry(op).cloned(),
+            |op| view.lookup_entry(op),
             flags,
             chain.sig_cache.as_deref(),
             is_auto_revocations_enabled,
