@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/dcroxide-addrmgr",
     "crates/dcroxide-base58",
+    "crates/dcroxide-bench",
     "crates/dcroxide-blockchain",
     "crates/dcroxide-certgen",
     "crates/dcroxide-chaincfg",
@@ -42,6 +43,13 @@ edition = "2024"
 rust-version = "1.88"
 license = "ISC"
 repository = "https://github.com/jzbz/dcroxide"
+
+# Release binaries trade compile time for runtime: single codegen unit
+# with thin LTO, and line tables kept for profiling (`perf`).
+[profile.release]
+codegen-units = 1
+lto = "thin"
+debug = "line-tables-only"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

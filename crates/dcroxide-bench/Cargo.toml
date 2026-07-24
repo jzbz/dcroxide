@@ -1,0 +1,19 @@
+[package]
+name = "dcroxide-bench"
+description = "Development-only benchmark harness: replay bootstrap-format block corpora through the live chain engine with timing (no dcrd counterpart)"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dcroxide-blockchain = { path = "../dcroxide-blockchain" }
+dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
+dcroxide-chainhash = { path = "../dcroxide-chainhash" }
+dcroxide-database = { path = "../dcroxide-database" }
+dcroxide-wire = { path = "../dcroxide-wire" }
+
+[lints]
+workspace = true
