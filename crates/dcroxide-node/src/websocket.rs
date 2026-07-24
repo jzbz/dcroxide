@@ -93,10 +93,12 @@ struct ClientHandle {
 /// A chain or mempool event awaiting fan-out (dcrd's
 /// `notification*` queue types).
 enum NtfnEvent {
-    /// A block connected to the main chain.
-    BlockConnected(Box<MsgBlock>),
-    /// A block disconnected from the main chain.
-    BlockDisconnected(Box<MsgBlock>),
+    /// A block connected to the main chain, shared with the rest of
+    /// the notification fan-out through the `Arc`.
+    BlockConnected(Arc<MsgBlock>),
+    /// A block disconnected from the main chain, shared with the rest
+    /// of the notification fan-out through the `Arc`.
+    BlockDisconnected(Arc<MsgBlock>),
     /// A new block template (dcrd `notificationWork`).
     Work(Box<MsgBlock>, TemplateUpdateReason),
     /// A treasury spend arrived in the mempool.
@@ -173,16 +175,14 @@ impl NodeNtfnMgr {
 
     /// Queue a block-connected event (dcrd
     /// `Server.NotifyBlockConnected`).
-    pub fn notify_block_connected(&self, block: MsgBlock) {
-        let _ = self.events.send(NtfnEvent::BlockConnected(Box::new(block)));
+    pub fn notify_block_connected(&self, block: Arc<MsgBlock>) {
+        let _ = self.events.send(NtfnEvent::BlockConnected(block));
     }
 
     /// Queue a block-disconnected event (dcrd
     /// `Server.NotifyBlockDisconnected`).
-    pub fn notify_block_disconnected(&self, block: MsgBlock) {
-        let _ = self
-            .events
-            .send(NtfnEvent::BlockDisconnected(Box::new(block)));
+    pub fn notify_block_disconnected(&self, block: Arc<MsgBlock>) {
+        let _ = self.events.send(NtfnEvent::BlockDisconnected(block));
     }
 
     /// Queue a new-template work event (dcrd's template subscription

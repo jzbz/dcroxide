@@ -115,18 +115,22 @@ pub struct ChainNtfnHandler {
 /// A block event awaiting its mempool maintenance (dcrd's handler
 /// runs it inline with the chain lock released; the daemon's callback
 /// runs under the chain mutex and the pool reaches back into the
-/// chain, so the work defers to the post-processing drain).
+/// chain, so the work defers to the post-processing drain).  The
+/// blocks are shared `Arc`s: the whole fan-out — generator feed,
+/// mempool maintenance, websocket notify, index notify — clones
+/// pointers to the one block the chain connected, like dcrd passing
+/// the same `*dcrutil.Block` to every observer.
 enum PendingBlockEvent {
     /// A block connected to the main chain.
     Connected {
-        block: dcroxide_wire::MsgBlock,
-        parent: dcroxide_wire::MsgBlock,
+        block: Arc<dcroxide_wire::MsgBlock>,
+        parent: Arc<dcroxide_wire::MsgBlock>,
         check_tx_flags: AgendaFlags,
     },
     /// A block disconnected from the main chain.
     Disconnected {
-        block: dcroxide_wire::MsgBlock,
-        parent: dcroxide_wire::MsgBlock,
+        block: Arc<dcroxide_wire::MsgBlock>,
+        parent: Arc<dcroxide_wire::MsgBlock>,
         check_tx_flags: AgendaFlags,
     },
 }
@@ -230,7 +234,7 @@ impl ChainNtfnHandler {
             }
             Notification::BlockAccepted(data) => {
                 if let Some(generator) = &self.generator {
-                    generator.block_accepted(data.block.clone());
+                    generator.block_accepted(Arc::new(data.block.clone()));
                 }
                 self.handle_block_accepted(data);
             }
@@ -253,14 +257,14 @@ impl ChainNtfnHandler {
                 // cross-notification divergence a fully faithful fix would
                 // resolve only by deferring the reorg events too.
                 if let Some(generator) = &self.generator {
-                    generator.block_connected(data.block.clone());
+                    generator.block_connected(Arc::clone(&data.block));
                 }
                 self.pending_block_events
                     .lock()
                     .expect("pending block events")
                     .push(PendingBlockEvent::Connected {
-                        block: data.block.clone(),
-                        parent: data.parent_block.clone(),
+                        block: Arc::clone(&data.block),
+                        parent: Arc::clone(&data.parent_block),
                         check_tx_flags: data.check_tx_flags,
                     });
             }
@@ -269,14 +273,14 @@ impl ChainNtfnHandler {
                 // deferred to the drain, matching dcrd's emission after
                 // the disconnect mempool maintenance and index notify.
                 if let Some(generator) = &self.generator {
-                    generator.block_disconnected(data.block.clone());
+                    generator.block_disconnected(Arc::clone(&data.block));
                 }
                 self.pending_block_events
                     .lock()
                     .expect("pending block events")
                     .push(PendingBlockEvent::Disconnected {
-                        block: data.block.clone(),
-                        parent: data.parent_block.clone(),
+                        block: Arc::clone(&data.block),
+                        parent: Arc::clone(&data.parent_block),
                         check_tx_flags: data.check_tx_flags,
                     });
             }
@@ -552,7 +556,7 @@ impl ChainNtfnHandler {
                         rebroadcast.prune_rebroadcast_inventory();
                     }
                     if let Some(ntfn) = &self.ntfn {
-                        ntfn.notify_block_connected(block.clone());
+                        ntfn.notify_block_connected(Arc::clone(&block));
                     }
                     self.notify_index_subscriber(
                         dcroxide_indexers::CONNECT_NTFN,
@@ -573,7 +577,7 @@ impl ChainNtfnHandler {
                     self.handle_disconnected_block(&block, &parent, check_tx_flags);
                     self.notify_index_subscriber(
                         dcroxide_indexers::DISCONNECT_NTFN,
-                        block.clone(),
+                        Arc::clone(&block),
                         parent,
                         check_tx_flags,
                     );
@@ -596,8 +600,8 @@ impl ChainNtfnHandler {
     fn notify_index_subscriber(
         &self,
         ntfn_type: dcroxide_indexers::IndexNtfnType,
-        block: dcroxide_wire::MsgBlock,
-        parent: dcroxide_wire::MsgBlock,
+        block: Arc<dcroxide_wire::MsgBlock>,
+        parent: Arc<dcroxide_wire::MsgBlock>,
         check_tx_flags: AgendaFlags,
     ) {
         let Some(subscriber) = &self.index_subscriber else {
@@ -609,8 +613,8 @@ impl ChainNtfnHandler {
         }
         let ntfn = dcroxide_indexers::IndexNtfn {
             ntfn_type,
-            block: Arc::new(block),
-            parent: Arc::new(parent),
+            block,
+            parent,
             is_treasury_enabled: check_tx_flags.is_treasury_enabled(),
         };
         if let Err(e) = subscriber.notify(&ntfn) {

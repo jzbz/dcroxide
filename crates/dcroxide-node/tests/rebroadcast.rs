@@ -117,8 +117,8 @@ fn confirmed_transactions_feed_the_shared_filter() {
         stransactions: Vec::new(),
     };
     handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData {
-        block: &block,
-        parent_block: &parent,
+        block: Arc::new(block),
+        parent_block: Arc::new(parent),
         check_tx_flags: AgendaFlags(0),
     }));
     handler.drain_pending_block_events();

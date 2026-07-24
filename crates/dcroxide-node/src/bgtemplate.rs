@@ -66,18 +66,20 @@ const MAX_TEMPLATE_TIMEOUT: Duration = Duration::from_millis(5500);
 /// An owned regen event carried over the command channel (the owned
 /// counterpart of [`BgRegenEvent`], which borrows its block and vote
 /// data); the thread borrows it back into a [`BgRegenEvent`] before
-/// running the state machine.
+/// running the state machine.  The blocks arrive as shared `Arc`s
+/// from the chain notification fan-out, so queueing an event never
+/// copies a block.
 enum OwnedRegenEvent {
     /// A chain reorganization started (dcrd `rtReorgStarted`).
     ReorgStarted,
     /// A chain reorganization finished (dcrd `rtReorgDone`).
     ReorgDone,
     /// A block was connected to the main chain.
-    BlockConnected(MsgBlock),
+    BlockConnected(Arc<MsgBlock>),
     /// A block was disconnected from the main chain.
-    BlockDisconnected(MsgBlock),
+    BlockDisconnected(Arc<MsgBlock>),
     /// A block was accepted to the block index.
-    BlockAccepted(MsgBlock),
+    BlockAccepted(Arc<MsgBlock>),
     /// A vote was received.
     Vote(MsgTx),
 }
@@ -106,7 +108,7 @@ pub struct GeneratorSink {
 
 impl GeneratorSink {
     /// A block was accepted to the block index (dcrd `BlockAccepted`).
-    pub fn block_accepted(&self, block: MsgBlock) {
+    pub fn block_accepted(&self, block: Arc<MsgBlock>) {
         let _ = self
             .sender
             .send(GenCommand::Event(Box::new(OwnedRegenEvent::BlockAccepted(
@@ -116,7 +118,7 @@ impl GeneratorSink {
 
     /// A block was connected to the main chain (dcrd
     /// `BlockConnected`).
-    pub fn block_connected(&self, block: MsgBlock) {
+    pub fn block_connected(&self, block: Arc<MsgBlock>) {
         let _ = self.sender.send(GenCommand::Event(Box::new(
             OwnedRegenEvent::BlockConnected(block),
         )));
@@ -124,7 +126,7 @@ impl GeneratorSink {
 
     /// A block was disconnected from the main chain (dcrd
     /// `BlockDisconnected`).
-    pub fn block_disconnected(&self, block: MsgBlock) {
+    pub fn block_disconnected(&self, block: Arc<MsgBlock>) {
         let _ = self.sender.send(GenCommand::Event(Box::new(
             OwnedRegenEvent::BlockDisconnected(block),
         )));
@@ -509,9 +511,11 @@ fn process_event(
         let borrowed = match event {
             OwnedRegenEvent::ReorgStarted => BgRegenEvent::ReorgStarted,
             OwnedRegenEvent::ReorgDone => BgRegenEvent::ReorgDone,
-            OwnedRegenEvent::BlockConnected(block) => BgRegenEvent::BlockConnected(block),
-            OwnedRegenEvent::BlockDisconnected(block) => BgRegenEvent::BlockDisconnected(block),
-            OwnedRegenEvent::BlockAccepted(block) => BgRegenEvent::BlockAccepted(block),
+            OwnedRegenEvent::BlockConnected(block) => BgRegenEvent::BlockConnected(block.as_ref()),
+            OwnedRegenEvent::BlockDisconnected(block) => {
+                BgRegenEvent::BlockDisconnected(block.as_ref())
+            }
+            OwnedRegenEvent::BlockAccepted(block) => BgRegenEvent::BlockAccepted(block.as_ref()),
             OwnedRegenEvent::Vote(vote) => BgRegenEvent::Vote(vote),
         };
         handle_regen_event(g, state, &mut chain, &tx_source, borrowed, is_current, now);
@@ -756,7 +760,7 @@ pub fn start_generator(
                         &mut g,
                         &mut state,
                         &mut deadlines,
-                        &OwnedRegenEvent::BlockConnected(tip_block),
+                        &OwnedRegenEvent::BlockConnected(Arc::new(tip_block)),
                     );
                 }
             }

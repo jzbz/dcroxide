@@ -112,6 +112,15 @@ pub fn entry_to_spent_tx_out(entry: &UtxoEntry) -> SpentTxOut {
     }
 }
 
+/// Compute the transaction hash of every transaction in the slice, in
+/// order.  The connect and disconnect paths compute these once per
+/// block tree and thread them through the helpers so no transaction
+/// is re-serialized and re-hashed per use (dcrd wraps transactions in
+/// `dcrutil.Tx`, which memoizes the hash).
+pub fn collect_tx_hashes(txs: &[MsgTx]) -> Vec<Hash> {
+    txs.iter().map(|tx| tx.tx_hash()).collect()
+}
+
 /// A view into the set of unspent transaction outputs from a specific
 /// point of view in the chain (dcrd `UtxoViewpoint`).
 #[derive(Default, Clone)]
@@ -228,9 +237,11 @@ impl UtxoView {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_tx_outs_internal(
         &mut self,
         tx: &MsgTx,
+        tx_hash: &Hash,
         start: u32,
         end: u32,
         block_height: i64,
@@ -242,7 +253,6 @@ impl UtxoView {
         let tx_type = dcroxide_stake::determine_tx_type(tx);
         let tree: i8 = if tx_type != TxType::Regular { 1 } else { 0 };
         let flags = encode_utxo_flags(is_coin_base, has_expiry, tx_type);
-        let tx_hash = tx.tx_hash();
         for tx_out_idx in start..end {
             // The treasury add change output is not spendable.
             if is_treasury_add_output(tx_type, tx_out_idx) {
@@ -260,7 +270,7 @@ impl UtxoView {
             };
             let tx_out = &tx.tx_out[tx_out_idx as usize];
             let outpoint = OutPoint {
-                hash: tx_hash,
+                hash: *tx_hash,
                 index: tx_out_idx,
                 tree,
             };
@@ -292,6 +302,7 @@ impl UtxoView {
         }
         self.add_tx_outs_internal(
             tx,
+            &tx.tx_hash(),
             tx_out_idx,
             tx_out_idx + 1,
             block_height,
@@ -309,8 +320,29 @@ impl UtxoView {
         block_index: u32,
         is_treasury_enabled: bool,
     ) {
+        self.add_tx_outs_with_hash(
+            tx,
+            &tx.tx_hash(),
+            block_height,
+            block_index,
+            is_treasury_enabled,
+        );
+    }
+
+    /// [`UtxoView::add_tx_outs`] with the transaction hash supplied
+    /// by the caller, for the block connect and disconnect paths that
+    /// compute each tree's hashes once per block.
+    pub fn add_tx_outs_with_hash(
+        &mut self,
+        tx: &MsgTx,
+        tx_hash: &Hash,
+        block_height: i64,
+        block_index: u32,
+        is_treasury_enabled: bool,
+    ) {
         self.add_tx_outs_internal(
             tx,
+            tx_hash,
             0,
             tx.tx_out.len() as u32,
             block_height,
@@ -327,10 +359,13 @@ impl UtxoView {
     }
 
     /// Connect a stake tree transaction, spending its inputs and
-    /// adding its outputs (dcrd `connectStakeTransaction`).
+    /// adding its outputs (dcrd `connectStakeTransaction`).  The
+    /// caller supplies the transaction's hash, computed once per
+    /// block.
     pub fn connect_stake_transaction(
         &mut self,
         tx: &MsgTx,
+        tx_hash: &Hash,
         block_height: i64,
         block_index: u32,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
@@ -342,7 +377,7 @@ impl UtxoView {
         }
         // Treasury spends source from the treasury account.
         if is_treasury_enabled && dcroxide_stake::is_tspend(tx) {
-            self.add_tx_outs(tx, block_height, block_index, is_treasury_enabled);
+            self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
             return Ok(());
         }
         let is_vote = dcroxide_stake::is_ssgen(tx);
@@ -360,22 +395,30 @@ impl UtxoView {
             }
             entry.spend();
         }
-        self.add_tx_outs(tx, block_height, block_index, is_treasury_enabled);
+        self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
         Ok(())
     }
 
     /// Connect every stake tree transaction of the block (dcrd
-    /// `connectStakeTransactions`).
+    /// `connectStakeTransactions`).  `stake_tx_hashes` carries the
+    /// hash of each stake transaction, computed once per block.
     pub fn connect_stake_transactions(
         &mut self,
         block: &MsgBlock,
+        stake_tx_hashes: &[Hash],
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
+        debug_assert_eq!(
+            block.stransactions.len(),
+            stake_tx_hashes.len(),
+            "one hash per stake transaction"
+        );
         let height = i64::from(block.header.height);
-        for (i, tx) in block.stransactions.iter().enumerate() {
+        for (i, (tx, tx_hash)) in block.stransactions.iter().zip(stake_tx_hashes).enumerate() {
             self.connect_stake_transaction(
                 tx,
+                tx_hash,
                 height,
                 i as u32,
                 stxos.as_deref_mut(),
@@ -387,11 +430,13 @@ impl UtxoView {
 
     /// Connect a regular tree transaction, tracking in-flight spends
     /// of outputs created earlier in the same block (dcrd
-    /// `connectRegularTransaction`).
+    /// `connectRegularTransaction`).  The caller supplies the
+    /// transaction's hash, computed once per block.
     #[allow(clippy::too_many_arguments)]
     pub fn connect_regular_transaction(
         &mut self,
         tx: &MsgTx,
+        tx_hash: &Hash,
         block_height: i64,
         block_index: u32,
         in_flight_tx: &mut BTreeMap<[u8; 32], u32>,
@@ -399,8 +444,8 @@ impl UtxoView {
         is_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
         if dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled) {
-            self.add_tx_outs(tx, block_height, block_index, is_treasury_enabled);
-            in_flight_tx.insert(tx.tx_hash().0, block_index);
+            self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
+            in_flight_tx.insert(tx_hash.0, block_index);
             return Ok(());
         }
         for tx_in in &tx.tx_in {
@@ -419,24 +464,32 @@ impl UtxoView {
                 entry.state |= UTXO_STATE_SPENT_BY_ZERO_CONF;
             }
         }
-        self.add_tx_outs(tx, block_height, block_index, is_treasury_enabled);
-        in_flight_tx.insert(tx.tx_hash().0, block_index);
+        self.add_tx_outs_with_hash(tx, tx_hash, block_height, block_index, is_treasury_enabled);
+        in_flight_tx.insert(tx_hash.0, block_index);
         Ok(())
     }
 
     /// Connect every regular tree transaction of the block (dcrd
-    /// `connectRegularTransactions`).
+    /// `connectRegularTransactions`).  `regular_tx_hashes` carries
+    /// the hash of each regular transaction, computed once per block.
     pub fn connect_regular_transactions(
         &mut self,
         block: &MsgBlock,
+        regular_tx_hashes: &[Hash],
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
+        debug_assert_eq!(
+            block.transactions.len(),
+            regular_tx_hashes.len(),
+            "one hash per regular transaction"
+        );
         let height = i64::from(block.header.height);
         let mut in_flight_tx: BTreeMap<[u8; 32], u32> = BTreeMap::new();
-        for (i, tx) in block.transactions.iter().enumerate() {
+        for (i, (tx, tx_hash)) in block.transactions.iter().zip(regular_tx_hashes).enumerate() {
             self.connect_regular_transaction(
                 tx,
+                tx_hash,
                 height,
                 i as u32,
                 &mut in_flight_tx,
@@ -450,11 +503,14 @@ impl UtxoView {
     /// Disconnect one of the block's transaction trees, restoring the
     /// spent outputs from the spend journal (dcrd
     /// `disconnectTransactions`).  The create-if-missing map shape
-    /// mirrors dcrd's.
+    /// mirrors dcrd's.  `tx_hashes` carries the hash of each
+    /// transaction in the tree being disconnected, computed once per
+    /// block.
     #[allow(clippy::map_entry)]
     pub fn disconnect_transactions(
         &mut self,
         block: &MsgBlock,
+        tx_hashes: &[Hash],
         stxos: &[SpentTxOut],
         stake_tree: bool,
         is_treasury_enabled: bool,
@@ -472,7 +528,7 @@ impl UtxoView {
         let mut spends_in_flight: BTreeMap<OutPointKey, usize> = BTreeMap::new();
         for tx_idx in (0..transactions.len()).rev() {
             let tx = &transactions[tx_idx];
-            let tx_hash = tx.tx_hash();
+            let tx_hash = tx_hashes[tx_idx];
             let tx_type = if stake_tree {
                 dcroxide_stake::determine_tx_type(tx)
             } else {
@@ -591,16 +647,19 @@ impl UtxoView {
     /// Load the utxos for the regular transactions' inputs into the
     /// view, adding outputs created earlier in the same block directly
     /// (dcrd `fetchRegularInputUtxos` over the resolver).
+    /// `regular_tx_hashes` carries the hash of each regular
+    /// transaction, computed once per block.
     pub fn fetch_regular_input_utxos(
         &mut self,
         block: &MsgBlock,
+        regular_tx_hashes: &[Hash],
         resolver: &impl UtxoResolver,
         is_treasury_enabled: bool,
     ) {
         let height = i64::from(block.header.height);
         let mut tx_in_flight: BTreeMap<[u8; 32], usize> = BTreeMap::new();
-        for (i, tx) in block.transactions.iter().enumerate() {
-            tx_in_flight.insert(tx.tx_hash().0, i);
+        for (i, tx_hash) in regular_tx_hashes.iter().enumerate() {
+            tx_in_flight.insert(tx_hash.0, i);
         }
         for (i, tx) in block.transactions.iter().enumerate().skip(1) {
             for tx_in in &tx.tx_in {
@@ -614,8 +673,9 @@ impl UtxoView {
                     // equivalent to i - 1 >= in_flight_index here.
                     if i > in_flight_index {
                         let origin_tx = &block.transactions[in_flight_index];
-                        self.add_tx_outs(
+                        self.add_tx_outs_with_hash(
                             origin_tx,
+                            &regular_tx_hashes[in_flight_index],
                             height,
                             in_flight_index as u32,
                             is_treasury_enabled,
@@ -630,13 +690,17 @@ impl UtxoView {
 
     /// Load the utxos for all of the block's inputs into the view
     /// (dcrd `fetchInputUtxos` over the resolver).
+    /// `regular_tx_hashes` carries the hash of each regular
+    /// transaction, computed once per block; the stake tree only
+    /// resolves inputs and needs no hashes.
     pub fn fetch_input_utxos(
         &mut self,
         block: &MsgBlock,
+        regular_tx_hashes: &[Hash],
         resolver: &impl UtxoResolver,
         is_treasury_enabled: bool,
     ) {
-        self.fetch_regular_input_utxos(block, resolver, is_treasury_enabled);
+        self.fetch_regular_input_utxos(block, regular_tx_hashes, resolver, is_treasury_enabled);
         for (tx_idx, stx) in block.stransactions.iter().enumerate() {
             let should_be_treasury_base = is_treasury_enabled && tx_idx == 0;
             if should_be_treasury_base && dcroxide_standalone::is_treasury_base(stx) {
@@ -666,13 +730,25 @@ impl UtxoView {
         resolver: &impl UtxoResolver,
         is_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
-        self.fetch_regular_input_utxos(parent, resolver, is_treasury_enabled);
+        let parent_regular_tx_hashes = collect_tx_hashes(&parent.transactions);
+        self.fetch_regular_input_utxos(
+            parent,
+            &parent_regular_tx_hashes,
+            resolver,
+            is_treasury_enabled,
+        );
         assert_eq!(
             parent_stxos.len(),
             count_spent_outputs(parent),
             "provided stxos do not match the outputs the parent spends"
         );
-        self.disconnect_transactions(parent, parent_stxos, false, is_treasury_enabled)
+        self.disconnect_transactions(
+            parent,
+            &parent_regular_tx_hashes,
+            parent_stxos,
+            false,
+            is_treasury_enabled,
+        )
     }
 
     /// Update the view to represent connecting the passed block,
@@ -705,9 +781,16 @@ impl UtxoView {
                 is_treasury_enabled,
             )?;
         }
-        self.fetch_input_utxos(block, resolver, is_treasury_enabled);
-        self.connect_stake_transactions(block, stxos.as_deref_mut(), is_treasury_enabled)?;
-        self.connect_regular_transactions(block, stxos, is_treasury_enabled)?;
+        let regular_tx_hashes = collect_tx_hashes(&block.transactions);
+        let stake_tx_hashes = collect_tx_hashes(&block.stransactions);
+        self.fetch_input_utxos(block, &regular_tx_hashes, resolver, is_treasury_enabled);
+        self.connect_stake_transactions(
+            block,
+            &stake_tx_hashes,
+            stxos.as_deref_mut(),
+            is_treasury_enabled,
+        )?;
+        self.connect_regular_transactions(block, &regular_tx_hashes, stxos, is_treasury_enabled)?;
         self.set_best_hash(block.header.block_hash());
         Ok(())
     }
@@ -728,12 +811,25 @@ impl UtxoView {
             count_spent_outputs(block),
             "provided stxos do not match the outputs the block spends"
         );
-        self.fetch_input_utxos(block, resolver, is_treasury_enabled);
-        self.disconnect_transactions(block, stxos, false, is_treasury_enabled)?;
-        self.disconnect_transactions(block, stxos, true, is_treasury_enabled)?;
+        let regular_tx_hashes = collect_tx_hashes(&block.transactions);
+        let stake_tx_hashes = collect_tx_hashes(&block.stransactions);
+        self.fetch_input_utxos(block, &regular_tx_hashes, resolver, is_treasury_enabled);
+        self.disconnect_transactions(block, &regular_tx_hashes, stxos, false, is_treasury_enabled)?;
+        self.disconnect_transactions(block, &stake_tx_hashes, stxos, true, is_treasury_enabled)?;
         if !crate::validate::header_approves_parent(&block.header) {
-            self.fetch_regular_input_utxos(parent, resolver, is_treasury_enabled);
-            self.connect_regular_transactions(parent, None, is_treasury_enabled)?;
+            let parent_regular_tx_hashes = collect_tx_hashes(&parent.transactions);
+            self.fetch_regular_input_utxos(
+                parent,
+                &parent_regular_tx_hashes,
+                resolver,
+                is_treasury_enabled,
+            );
+            self.connect_regular_transactions(
+                parent,
+                &parent_regular_tx_hashes,
+                None,
+                is_treasury_enabled,
+            )?;
         }
         self.set_best_hash(block.header.prev_block);
         Ok(())

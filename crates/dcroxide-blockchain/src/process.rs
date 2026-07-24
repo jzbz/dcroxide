@@ -11,6 +11,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
@@ -2040,8 +2041,8 @@ impl Chain {
     pub fn connect_block(
         &mut self,
         node: NodeId,
-        block: &MsgBlock,
-        parent: &MsgBlock,
+        block: &Arc<MsgBlock>,
+        parent: &Arc<MsgBlock>,
         view: &mut UtxoView,
         stxos: Vec<SpentTxOut>,
         filter: FilterV2,
@@ -2212,8 +2213,8 @@ impl Chain {
         Self::send_ntfn(
             &mut self.notifications,
             &Notification::BlockConnected(BlockConnectedNtfnsData {
-                block,
-                parent_block: parent,
+                block: Arc::clone(block),
+                parent_block: Arc::clone(parent),
                 check_tx_flags,
             }),
         );
@@ -2239,8 +2240,8 @@ impl Chain {
     pub fn disconnect_block(
         &mut self,
         node: NodeId,
-        block: &MsgBlock,
-        parent: &MsgBlock,
+        block: &Arc<MsgBlock>,
+        parent: &Arc<MsgBlock>,
         view: &mut UtxoView,
         params: &Params,
     ) -> Result<(), RuleError> {
@@ -2381,8 +2382,8 @@ impl Chain {
         Self::send_ntfn(
             &mut self.notifications,
             &Notification::BlockDisconnected(BlockDisconnectedNtfnsData {
-                block,
-                parent_block: parent,
+                block: Arc::clone(block),
+                parent_block: Arc::clone(parent),
                 check_tx_flags,
             }),
         );
@@ -2432,14 +2433,14 @@ impl Chain {
         if let Some(t) = tip {
             view.set_best_hash(self.store.node(t).hash);
         }
-        let mut next_block_to_detach: Option<MsgBlock> = None;
+        let mut next_block_to_detach: Option<Arc<MsgBlock>> = None;
         while let Some(n) = tip {
             if Some(n) == fork {
                 break;
             }
             let block = match next_block_to_detach.take() {
                 Some(b) => b,
-                None => self.block_by_node(n),
+                None => Arc::new(self.block_by_node(n)),
             };
             assert_eq!(
                 self.store.node(n).hash,
@@ -2447,8 +2448,8 @@ impl Chain {
                 "detach block node hash does not match the block"
             );
             let parent_id = self.store.node(n).parent.expect("detached block parent");
-            let parent = self.block_by_node(parent_id);
-            next_block_to_detach = Some(parent.clone());
+            let parent = Arc::new(self.block_by_node(parent_id));
+            next_block_to_detach = Some(Arc::clone(&parent));
 
             let parent_view = NodeBranchView {
                 store: &self.store,
@@ -2489,9 +2490,9 @@ impl Chain {
         attach_nodes.reverse();
 
         for node in attach_nodes {
-            let block = self.block_by_node(node);
+            let block = Arc::new(self.block_by_node(node));
             let parent_id = self.store.node(node).parent.expect("attach parent");
-            let parent = self.block_by_node(parent_id);
+            let parent = Arc::new(self.block_by_node(parent_id));
             assert_eq!(
                 self.store.node(parent_id).hash,
                 parent.header.block_hash(),

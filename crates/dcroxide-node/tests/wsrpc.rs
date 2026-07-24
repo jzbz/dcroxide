@@ -256,7 +256,7 @@ fn notifications_reach_only_subscribers() {
     read_server_frame(&mut b);
 
     // A connected block fans out to A as a null-id notification...
-    ntfn.notify_block_connected(genesis.clone());
+    ntfn.notify_block_connected(Arc::new(genesis.clone()));
     a.set_read_timeout(Some(std::time::Duration::from_secs(10)))
         .expect("set timeout");
     let notification = read_server_frame(&mut a);
@@ -299,7 +299,7 @@ fn notifications_reach_only_subscribers() {
     // and the survivor keeps answering.
     drop(a);
     std::thread::sleep(std::time::Duration::from_millis(300));
-    ntfn.notify_block_connected(genesis);
+    ntfn.notify_block_connected(Arc::new(genesis));
     b.set_read_timeout(Some(std::time::Duration::from_secs(10)))
         .expect("set timeout");
     write_client_frame(
@@ -379,10 +379,10 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
     // block-event drain (dcrd emits it only after the connected block's
     // mempool maintenance, so txaccepted precedes blockconnected), so
     // the callback only queues and the drain delivers the frame.
-    let genesis = params.genesis_block.clone();
+    let genesis = Arc::new(params.genesis_block.clone());
     handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData {
-        block: &genesis,
-        parent_block: &genesis,
+        block: Arc::clone(&genesis),
+        parent_block: Arc::clone(&genesis),
         check_tx_flags: AgendaFlags::default(),
     }));
     handler.drain_pending_block_events();
@@ -395,8 +395,8 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
     // the callback only queues and the drain delivers the frame.
     handler.handle(&Notification::BlockDisconnected(
         BlockDisconnectedNtfnsData {
-            block: &genesis,
-            parent_block: &genesis,
+            block: Arc::clone(&genesis),
+            parent_block: Arc::clone(&genesis),
             check_tx_flags: AgendaFlags::default(),
         },
     ));

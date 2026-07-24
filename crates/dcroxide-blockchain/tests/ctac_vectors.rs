@@ -94,6 +94,7 @@ fn ctac_vectors() {
 
                 let mut view = base_view.clone();
                 let mut stxos: Vec<SpentTxOut> = Vec::new();
+                let tx_hashes = dcroxide_blockchain::utxoview::collect_tx_hashes(&txs);
                 let result = check_transactions_and_connect(
                     &mut subsidy_cache,
                     input_fees,
@@ -102,6 +103,7 @@ fn ctac_vectors() {
                     voters,
                     &prev_header,
                     &txs,
+                    &tx_hashes,
                     &mut view,
                     Some(&mut stxos),
                     stake_tree,

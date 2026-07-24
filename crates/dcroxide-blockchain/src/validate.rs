@@ -2300,7 +2300,6 @@ pub fn check_vote_inputs<SP: dcroxide_standalone::SubsidyParams>(
     subsidy_split_variant: dcroxide_standalone::SubsidySplitVariant,
 ) -> Result<(), RuleError> {
     let ticket_maturity = i64::from(params.ticket_maturity);
-    let vote_hash = tx.tx_hash();
 
     // Calculate the theoretical stake vote subsidy by extracting the
     // vote height.  dcrd notes this really should use the height of
@@ -2327,6 +2326,7 @@ pub fn check_vote_inputs<SP: dcroxide_standalone::SubsidyParams>(
     const TICKET_IN_IDX: usize = 1;
     let ticket_in = &tx.tx_in[TICKET_IN_IDX];
     if ticket_in.previous_out_point.index != SUBMISSION_OUTPUT_IDX {
+        let vote_hash = tx.tx_hash();
         return Err(rule_error(
             RuleErrorKind::InvalidVoteInput,
             format!(
@@ -2341,6 +2341,7 @@ pub fn check_vote_inputs<SP: dcroxide_standalone::SubsidyParams>(
     let ticket_utxo = match lookup_entry(&ticket_in.previous_out_point) {
         Some(e) if !e.is_spent() => e,
         _ => {
+            let vote_hash = tx.tx_hash();
             return Err(rule_error(
                 RuleErrorKind::MissingTxOut,
                 format!(
@@ -2355,6 +2356,7 @@ pub fn check_vote_inputs<SP: dcroxide_standalone::SubsidyParams>(
     // Ensure the referenced output is a supported ticket submission
     // output, which also proves the form of the housing transaction.
     if let Err(e) = check_ticket_submission_input(&ticket_utxo) {
+        let vote_hash = tx.tx_hash();
         return Err(rule_error(
             RuleErrorKind::InvalidVoteInput,
             format!(
@@ -2401,6 +2403,7 @@ pub fn check_vote_inputs<SP: dcroxide_standalone::SubsidyParams>(
     }
     let num_vote_payments = tx.tx_out.len() - 2 - extra;
     if num_vote_payments * 2 != ticket_outs.len() - 1 {
+        let vote_hash = tx.tx_hash();
         return Err(rule_error(
             RuleErrorKind::BadNumPayees,
             format!(
@@ -2436,13 +2439,13 @@ pub fn check_revocation_inputs(
     is_auto_revocations_enabled: bool,
 ) -> Result<(), RuleError> {
     let ticket_maturity = i64::from(params.ticket_maturity);
-    let revoke_hash = tx.tx_hash();
 
     // The first input to a revocation must be the first output of the
     // ticket the revocation is associated with.
     const TICKET_IN_IDX: usize = 0;
     let ticket_in = &tx.tx_in[TICKET_IN_IDX];
     if ticket_in.previous_out_point.index != SUBMISSION_OUTPUT_IDX {
+        let revoke_hash = tx.tx_hash();
         return Err(rule_error(
             RuleErrorKind::InvalidRevokeInput,
             format!(
@@ -2457,6 +2460,7 @@ pub fn check_revocation_inputs(
     let ticket_utxo = match lookup_entry(&ticket_in.previous_out_point) {
         Some(e) if !e.is_spent() => e,
         _ => {
+            let revoke_hash = tx.tx_hash();
             return Err(rule_error(
                 RuleErrorKind::MissingTxOut,
                 format!(
@@ -2472,6 +2476,7 @@ pub fn check_revocation_inputs(
     // Ensure the referenced output is a supported ticket submission
     // output, which also proves the form of the housing transaction.
     if let Err(e) = check_ticket_submission_input(&ticket_utxo) {
+        let revoke_hash = tx.tx_hash();
         return Err(rule_error(
             RuleErrorKind::InvalidRevokeInput,
             format!(
@@ -2508,6 +2513,7 @@ pub fn check_revocation_inputs(
     // commitment.
     let num_revocation_payments = tx.tx_out.len();
     if num_revocation_payments * 2 != ticket_outs.len() - 1 {
+        let revoke_hash = tx.tx_hash();
         return Err(rule_error(
             RuleErrorKind::BadNumPayees,
             format!(
@@ -2746,7 +2752,6 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
     // Accumulate the total input amount while ensuring the accumulator
     // does not overflow and the total does not exceed the max allowed
     // per transaction (dcrd 2.2's sumTotalAtomIn closure).
-    let tx_hash = tx.tx_hash();
     let coinbase_maturity = i64::from(params.coinbase_maturity);
     let mut total_atom_in: i64 = 0;
     let sum_total_atom_in = |total: &mut i64, amount: i64| -> Result<(), RuleError> {
@@ -2787,6 +2792,7 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
         let utxo_entry = match lookup_entry(tx_in_outpoint) {
             Some(e) if !e.is_spent() => e,
             _ => {
+                let tx_hash = tx.tx_hash();
                 return Err(rule_error(
                     RuleErrorKind::MissingTxOut,
                     format!(
@@ -2988,6 +2994,7 @@ pub fn check_transaction_inputs<SP: dcroxide_standalone::SubsidyParams>(
 
     // Ensure the transaction does not spend more than its inputs.
     if total_atom_in < total_atom_out {
+        let tx_hash = tx.tx_hash();
         return Err(rule_error(
             RuleErrorKind::SpendTooHigh,
             format!(
@@ -3835,7 +3842,9 @@ pub fn consensus_script_verify_flags(
 /// accumulating and validating the fees and subsidies (dcrd
 /// `checkTransactionsAndConnect`).  The treasury and automatic
 /// revocation agenda states are supplied by the caller, which dcrd
-/// derives from the parent node.
+/// derives from the parent node.  `tx_hashes` carries the hash of
+/// each transaction in `txs`, computed once per block by the caller
+/// (dcrd's `dcrutil.Tx` wrapper memoizes the hashes instead).
 #[allow(clippy::too_many_arguments)]
 pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
     subsidy_cache: &mut dcroxide_standalone::SubsidyCache<SP>,
@@ -3845,6 +3854,7 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
     node_voters: u16,
     prev_header: &dcroxide_wire::BlockHeader,
     txs: &[MsgTx],
+    tx_hashes: &[Hash],
     view: &mut crate::utxoview::UtxoView,
     mut stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
     stake_tree: bool,
@@ -3858,11 +3868,12 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
     // the view as it validates.  The total fees are returned so the
     // caller can carry the stake tree fees into the regular tree
     // (dcrd 2.2 folded getStakeTreeFees into this return).
+    debug_assert_eq!(txs.len(), tx_hashes.len(), "one hash per transaction");
     let mut in_flight_regular_tx: alloc::collections::BTreeMap<[u8; 32], u32> =
         alloc::collections::BTreeMap::new();
     let mut total_fees: i64 = input_fees; // Stake tx tree carry forward
     let mut cumulative_sig_ops: u32 = 0;
-    for (idx, tx) in txs.iter().enumerate() {
+    for (idx, (tx, tx_hash)) in txs.iter().zip(tx_hashes).enumerate() {
         // Since the first (and only the first) transaction has already
         // been verified to be a coinbase transaction, use (idx == 0)
         // && !stake_tree as an optimization rather than a full
@@ -3930,6 +3941,7 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
         if !stake_tree {
             view.connect_regular_transaction(
                 tx,
+                tx_hash,
                 node_height,
                 idx as u32,
                 &mut in_flight_regular_tx,
@@ -3939,6 +3951,7 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
         } else {
             view.connect_stake_transaction(
                 tx,
+                tx_hash,
                 node_height,
                 idx as u32,
                 stxos.as_deref_mut(),
@@ -4596,6 +4609,12 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         "inconsistent view when checking block connection"
     );
 
+    // Compute each tree's transaction hashes once and thread them
+    // through the connect helpers below (dcrd's `dcrutil.Tx` wrapper
+    // memoizes the hash; `MsgTx::tx_hash` re-serializes per call).
+    let regular_tx_hashes = crate::utxoview::collect_tx_hashes(&block.transactions);
+    let stake_tx_hashes = crate::utxoview::collect_tx_hashes(&block.stransactions);
+
     let unknown = |_| {
         rule_error(
             RuleErrorKind::UnknownDeploymentID,
@@ -4655,7 +4674,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
 
     // Load all of the utxos referenced by the block that are not
     // already in the view.
-    view.fetch_input_utxos(block, resolver, is_treasury_enabled);
+    view.fetch_input_utxos(block, &regular_tx_hashes, resolver, is_treasury_enabled);
 
     // Determine the subsidy split.
     let split = crate::agendas::is_agenda_active(
@@ -4692,6 +4711,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         node_voters,
         prev_header,
         &block.stransactions,
+        &stake_tx_hashes,
         view,
         stxos.as_deref_mut(),
         true,
@@ -4763,6 +4783,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
         node_voters,
         prev_header,
         &block.transactions,
+        &regular_tx_hashes,
         view,
         stxos,
         false,

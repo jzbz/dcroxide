@@ -195,8 +195,15 @@ fn utxoview_vectors() {
             }
             "parent" => {
                 let (blk, _) = MsgBlock::from_bytes(&unhex(f[1])).expect("parent");
-                view.connect_regular_transactions(&blk, Some(&mut parent_stxos), TREASURY)
-                    .expect("connect parent");
+                let regular_hashes =
+                    dcroxide_blockchain::utxoview::collect_tx_hashes(&blk.transactions);
+                view.connect_regular_transactions(
+                    &blk,
+                    &regular_hashes,
+                    Some(&mut parent_stxos),
+                    TREASURY,
+                )
+                .expect("connect parent");
                 parent = Some(blk);
             }
             "pstxos" => check_stxos(&parent_stxos, &f, &mut lines, "pstxos"),
@@ -208,11 +215,20 @@ fn utxoview_vectors() {
                 // parent, so undo its regular transactions first.
                 view.disconnect_disapproved_block(parent, &parent_stxos, &none_resolver, TREASURY)
                     .expect("disapprove parent");
-                view.fetch_input_utxos(&blk, &none_resolver, TREASURY);
-                view.connect_stake_transactions(&blk, Some(&mut stxos), TREASURY)
+                let regular_hashes =
+                    dcroxide_blockchain::utxoview::collect_tx_hashes(&blk.transactions);
+                let stake_hashes =
+                    dcroxide_blockchain::utxoview::collect_tx_hashes(&blk.stransactions);
+                view.fetch_input_utxos(&blk, &regular_hashes, &none_resolver, TREASURY);
+                view.connect_stake_transactions(&blk, &stake_hashes, Some(&mut stxos), TREASURY)
                     .expect("connect stake");
-                view.connect_regular_transactions(&blk, Some(&mut stxos), TREASURY)
-                    .expect("connect regular");
+                view.connect_regular_transactions(
+                    &blk,
+                    &regular_hashes,
+                    Some(&mut stxos),
+                    TREASURY,
+                )
+                .expect("connect regular");
                 view.set_best_hash(blk.header.block_hash());
                 block = Some(blk);
             }

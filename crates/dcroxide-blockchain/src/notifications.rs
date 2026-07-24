@@ -12,6 +12,7 @@
 //! notification managers.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use dcroxide_chainhash::Hash;
@@ -34,24 +35,28 @@ pub struct BlockAcceptedNtfnsData<'a> {
 }
 
 /// A block connected to the main chain (dcrd
-/// `BlockConnectedNtfnsData`).
-pub struct BlockConnectedNtfnsData<'a> {
+/// `BlockConnectedNtfnsData`).  The blocks are shared as `Arc`s so
+/// the daemon's notification fan-out clones a pointer per consumer,
+/// like dcrd handing the same `*dcrutil.Block` to every observer.
+pub struct BlockConnectedNtfnsData {
     /// The connected block.
-    pub block: &'a MsgBlock,
+    pub block: Arc<MsgBlock>,
     /// The connected block's parent.
-    pub parent_block: &'a MsgBlock,
+    pub parent_block: Arc<MsgBlock>,
     /// The agendas active when checking the connected block's
     /// transactions.
     pub check_tx_flags: AgendaFlags,
 }
 
 /// A block disconnected from the main chain (dcrd
-/// `BlockDisconnectedNtfnsData`).
-pub struct BlockDisconnectedNtfnsData<'a> {
+/// `BlockDisconnectedNtfnsData`).  The blocks are shared as `Arc`s so
+/// the daemon's notification fan-out clones a pointer per consumer,
+/// like dcrd handing the same `*dcrutil.Block` to every observer.
+pub struct BlockDisconnectedNtfnsData {
     /// The disconnected block.
-    pub block: &'a MsgBlock,
+    pub block: Arc<MsgBlock>,
     /// The disconnected block's parent, now the tip again.
-    pub parent_block: &'a MsgBlock,
+    pub parent_block: Arc<MsgBlock>,
     /// The agendas that were active for the DISCONNECTED block.
     pub check_tx_flags: AgendaFlags,
 }
@@ -95,10 +100,10 @@ pub enum Notification<'a> {
     /// best chain.
     BlockAccepted(BlockAcceptedNtfnsData<'a>),
     /// A block connected to the main chain (dcrd `NTBlockConnected`).
-    BlockConnected(BlockConnectedNtfnsData<'a>),
+    BlockConnected(BlockConnectedNtfnsData),
     /// A block disconnected from the main chain (dcrd
     /// `NTBlockDisconnected`).
-    BlockDisconnected(BlockDisconnectedNtfnsData<'a>),
+    BlockDisconnected(BlockDisconnectedNtfnsData),
     /// A reorganization to a competing branch began (dcrd
     /// `NTChainReorgStarted`); never sent for a plain tip extension.
     ChainReorgStarted,
