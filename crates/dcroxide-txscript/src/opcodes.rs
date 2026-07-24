@@ -1513,7 +1513,13 @@ pub(crate) fn opcode_check_sig(
         }
     };
 
-    let valid = signature.verify(&hash, &pub_key);
+    let valid = vm.verify_sig_with_cache(
+        crate::SigCacheSuite::EcdsaSecp256k1,
+        &hash,
+        sig_bytes,
+        &pk_bytes,
+        || signature.verify(&hash, &pub_key),
+    );
     vm.dstack.push_bool(valid);
     Ok(())
 }
@@ -1667,7 +1673,14 @@ pub(crate) fn opcode_check_multi_sig(
         // Generate the signature hash based on the signature hash type.
         let hash = calc_signature_hash(&script, hash_type, vm.tx, vm.tx_idx)?;
 
-        if parsed_sig.verify(&hash, &parsed_pub_key) {
+        let valid = vm.verify_sig_with_cache(
+            crate::SigCacheSuite::EcdsaSecp256k1,
+            &hash,
+            signature,
+            &pub_key,
+            || parsed_sig.verify(&hash, &parsed_pub_key),
+        );
+        if valid {
             // PubKey verified, move on to the next signature.
             signature_idx += 1;
             num_signatures -= 1;
@@ -1780,7 +1793,13 @@ pub(crate) fn opcode_check_sig_alt(
                     return Ok(());
                 }
             };
-            let ok = sig.verify(&hash, &pub_key);
+            let ok = vm.verify_sig_with_cache(
+                crate::SigCacheSuite::Ed25519,
+                &hash,
+                sig_bytes,
+                &pk_bytes,
+                || sig.verify(&hash, &pub_key),
+            );
             vm.dstack.push_bool(ok);
             Ok(())
         }
@@ -1799,7 +1818,13 @@ pub(crate) fn opcode_check_sig_alt(
                     return Ok(());
                 }
             };
-            let ok = sig.verify(&hash, &pub_key);
+            let ok = vm.verify_sig_with_cache(
+                crate::SigCacheSuite::SchnorrSecp256k1,
+                &hash,
+                sig_bytes,
+                &pk_bytes,
+                || sig.verify(&hash, &pub_key),
+            );
             vm.dstack.push_bool(ok);
             Ok(())
         }

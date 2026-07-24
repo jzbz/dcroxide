@@ -180,6 +180,7 @@ fn connectblock_vectors() {
                     Some(&mut stxos),
                     false,
                     None,
+                    None,
                     &params,
                 );
                 assert_eq!(kind_of(&result), f[2], "{line}");
@@ -241,7 +242,7 @@ fn connectblock_vectors() {
                 let flags = ScriptFlags(f[2].parse().expect("flags"));
                 let autorev: bool = f[3].parse().expect("autorev");
                 let (block, _) = MsgBlock::from_bytes(&unhex(f[4])).expect("block");
-                let result = check_block_scripts(&block, &cbs_view, regular, flags, autorev);
+                let result = check_block_scripts(&block, &cbs_view, regular, flags, None, autorev);
                 assert_eq!(kind_of(&result), f[5], "{line}");
                 counts[5] += 1;
             }

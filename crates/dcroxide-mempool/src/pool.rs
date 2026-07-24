@@ -132,6 +132,14 @@ pub trait PoolChain {
     /// The current wall clock as unix seconds (dcrd's direct
     /// `time.Now()` calls, injected for determinism).
     fn now_unix(&self) -> i64;
+    /// The chain's shared signature verification cache, threaded into
+    /// the acceptance-path script validation so successful mempool
+    /// verifications are reused when the block connects (dcrd wires
+    /// `s.sigCache` into `mempool.Config.SigCache`).  Defaults to no
+    /// cache, which verifies every signature directly.
+    fn sig_cache(&self) -> Option<Arc<dcroxide_txscript::SigCache>> {
+        None
+    }
 }
 
 /// The mempool policy configuration (dcrd `Policy`; the standard
@@ -1401,15 +1409,19 @@ impl<C: PoolChain> TxPool<C> {
         }
 
         // Verify crypto signatures for each input and reject the
-        // transaction if any don't verify.
+        // transaction if any don't verify.  The chain's signature
+        // cache remembers the successful verifications so the block
+        // connect skips them (dcrd passes its `sigCache` here).
         let flags = self
             .chain
             .standard_verify_flags()
             .map_err(PoolError::Other)?;
+        let sig_cache = self.chain.sig_cache();
         validate_transaction_scripts(
             &tx,
             |op| utxo_view.lookup_entry(op).cloned(),
             flags,
+            sig_cache.as_deref(),
             is_auto_revocations_enabled,
         )
         .map_err(|e| PoolError::Rule(chain_rule_error(e)))?;

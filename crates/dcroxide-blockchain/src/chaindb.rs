@@ -398,6 +398,38 @@ pub fn db_fetch_utxo_entry(
     Ok(Some(deserialize_utxo_entry(&serialized, outpoint.index)?))
 }
 
+/// Fetch a batch of UTXO set rows by outpoint within one database
+/// transaction, one result per outpoint in order; per-row semantics
+/// are exactly [`db_fetch_utxo_entry`]'s and the bucket resolves once
+/// for the whole batch.  (dcrd's `UtxoCache.FetchEntries` loop issues
+/// per-outpoint leveldb gets, which need no per-read transaction; the
+/// redb-backed store amortizes its read transaction here instead.)
+pub fn db_fetch_utxo_entries(
+    tx: &Transaction,
+    outpoints: &[OutPoint],
+) -> Result<Vec<Option<UtxoEntry>>, ChainDbError> {
+    let meta = tx.metadata();
+    let bucket = meta
+        .bucket(UTXO_SET_BUCKET_NAME)
+        .ok_or_else(|| ChainDbError::Corrupt("missing utxo set bucket".into()))?;
+    let mut entries = Vec::with_capacity(outpoints.len());
+    for outpoint in outpoints {
+        let key = outpoint_key(outpoint);
+        let Some(serialized) = bucket.get(&key) else {
+            entries.push(None);
+            continue;
+        };
+        if serialized.is_empty() {
+            return Err(ChainDbError::Corrupt(format!(
+                "database contains entry for spent tx output {}:{}",
+                outpoint.hash, outpoint.index
+            )));
+        }
+        entries.push(Some(deserialize_utxo_entry(&serialized, outpoint.index)?));
+    }
+    Ok(entries)
+}
+
 /// Store the UTXO set state row.
 pub fn db_put_utxo_set_state(tx: &Transaction, state: &UtxoSetState) -> Result<(), ChainDbError> {
     Ok(tx

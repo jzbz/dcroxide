@@ -4411,6 +4411,7 @@ struct ValidateItem<'a> {
 fn validate_item(
     item: &ValidateItem<'_>,
     script_flags: dcroxide_txscript::ScriptFlags,
+    sig_cache: Option<&dcroxide_txscript::SigCache>,
 ) -> Result<(), RuleError> {
     let tx_in_idx = item.tx_in_idx;
     let mut engine = dcroxide_txscript::Engine::new(
@@ -4426,6 +4427,9 @@ fn validate_item(
             format!("failed to create script engine: {e:?}"),
         )
     })?;
+    if let Some(sig_cache) = sig_cache {
+        engine.set_sig_cache(sig_cache);
+    }
     engine.execute().map_err(|e| {
         rule_error(
             RuleErrorKind::ScriptValidation,
@@ -4450,6 +4454,7 @@ fn validate_item(
 fn validate_items(
     items: &[ValidateItem<'_>],
     script_flags: dcroxide_txscript::ScriptFlags,
+    sig_cache: Option<&dcroxide_txscript::SigCache>,
 ) -> Result<(), RuleError> {
     const MIN_PARALLEL_ITEMS: usize = 16;
     let cores = std::thread::available_parallelism()
@@ -4458,7 +4463,7 @@ fn validate_items(
     let workers = cores.saturating_mul(3).min(items.len());
     if items.len() < MIN_PARALLEL_ITEMS || workers <= 1 {
         for item in items {
-            validate_item(item, script_flags)?;
+            validate_item(item, script_flags, sig_cache)?;
         }
         return Ok(());
     }
@@ -4478,7 +4483,7 @@ fn validate_items(
                     let Some(item) = items.get(i) else {
                         return;
                     };
-                    if let Err(e) = validate_item(item, script_flags) {
+                    if let Err(e) = validate_item(item, script_flags, sig_cache) {
                         failed.store(true, Ordering::Relaxed);
                         let mut slot = failure.lock().expect("failure slot poisoned");
                         if slot.is_none() {
@@ -4503,22 +4508,25 @@ fn validate_items(
 fn validate_items(
     items: &[ValidateItem<'_>],
     script_flags: dcroxide_txscript::ScriptFlags,
+    sig_cache: Option<&dcroxide_txscript::SigCache>,
 ) -> Result<(), RuleError> {
     for item in items {
-        validate_item(item, script_flags)?;
+        validate_item(item, script_flags, sig_cache)?;
     }
     Ok(())
 }
 
 /// Validate every script in one of the block's transaction trees
 /// against the utxo view (dcrd `checkBlockScripts`: the items collect
-/// up front and validate across the worker pool; dcrd's signature
-/// cache is a result-invariant memoization and is not reproduced).
+/// up front and validate across the worker pool, each engine sharing
+/// the optional signature verification cache exactly as dcrd threads
+/// its `sigCache` into `NewEngine`).
 pub fn check_block_scripts(
     block: &MsgBlock,
     view: &crate::utxoview::UtxoView,
     tx_tree_regular: bool,
     script_flags: dcroxide_txscript::ScriptFlags,
+    sig_cache: Option<&dcroxide_txscript::SigCache>,
     is_auto_revocations_enabled: bool,
 ) -> Result<(), RuleError> {
     let txs = if tx_tree_regular {
@@ -4561,7 +4569,7 @@ pub fn check_block_scripts(
             });
         }
     }
-    validate_items(&items, script_flags)
+    validate_items(&items, script_flags, sig_cache)
 }
 
 /// Perform the final battery of checks needed to connect the block to
@@ -4571,8 +4579,10 @@ pub fn check_block_scripts(
 /// The caller supplies the disapproved-parent spend journal lazily
 /// (dcrd fetches it from the database only when it disapproves its
 /// parent), whether scripts should run (dcrd derives this from bulk
-/// import mode and the assumed-valid ancestor), and the parent's past
-/// median time when the LN features agenda is active.  The treasury
+/// import mode and the assumed-valid ancestor), the optional shared
+/// signature verification cache for the script checks (dcrd's
+/// `b.sigCache`), and the parent's past median time when the LN
+/// features agenda is active.  The treasury
 /// spend checks from dcrd's `tspendChecks` require prior block data,
 /// so the chain engine supplies them through `full_tspend_checks`;
 /// chainless callers pass `None` to fall back to the stateless window
@@ -4598,6 +4608,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     resolver: &impl crate::utxoview::UtxoResolver,
     mut stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
     run_scripts: bool,
+    sig_cache: Option<&dcroxide_txscript::SigCache>,
     full_tspend_checks: Option<FullTspendChecks<'_>>,
     params: &Params,
 ) -> Result<Hash, RuleError> {
@@ -4767,6 +4778,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
             view,
             false,
             script_flags,
+            sig_cache,
             is_auto_revocations_enabled,
         )?;
     }
@@ -4843,7 +4855,14 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     }
 
     if run_scripts {
-        check_block_scripts(block, view, true, script_flags, is_auto_revocations_enabled)?;
+        check_block_scripts(
+            block,
+            view,
+            true,
+            script_flags,
+            sig_cache,
+            is_auto_revocations_enabled,
+        )?;
     }
 
     // The block one coinbase pays the initial token distribution.
@@ -4856,15 +4875,17 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
 }
 
 /// Validate the scripts for all of a transaction's inputs against the
-/// referenced output scripts (dcrd `ValidateTransactionScripts`; the
-/// parallel validator and signature cache are result-invariant
-/// concurrency machinery and are not reproduced).  Entries that are
-/// missing or spent yield `ErrMissingTxOut` per the `PrevScripter`
-/// contract over a utxo viewpoint.
+/// referenced output scripts (dcrd `ValidateTransactionScripts`; its
+/// parallel validator is result-invariant concurrency machinery and
+/// is not reproduced, while the signature cache threads through
+/// `sig_cache` exactly as dcrd wires its `sigCache`).  Entries that
+/// are missing or spent yield `ErrMissingTxOut` per the
+/// `PrevScripter` contract over a utxo viewpoint.
 pub fn validate_transaction_scripts(
     tx: &MsgTx,
     lookup_entry: impl Fn(&OutPoint) -> Option<crate::UtxoEntry>,
     script_flags: dcroxide_txscript::ScriptFlags,
+    sig_cache: Option<&dcroxide_txscript::SigCache>,
     is_auto_revocations_enabled: bool,
 ) -> Result<(), RuleError> {
     // Skip revocations if the automatic ticket revocations agenda is
@@ -4915,6 +4936,9 @@ pub fn validate_transaction_scripts(
                         ),
                     )
                 })?;
+        if let Some(sig_cache) = sig_cache {
+            engine.set_sig_cache(sig_cache);
+        }
         engine.execute().map_err(|e| {
             rule_error(
                 RuleErrorKind::ScriptValidation,

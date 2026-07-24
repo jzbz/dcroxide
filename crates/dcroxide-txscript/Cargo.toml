@@ -8,6 +8,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Enables the signature verification cache (it needs std's HashMap
+# and RwLock; the crate is no_std without it and the cache compiles
+# as an inert stub — results are identical either way).
+std = []
+
 [dependencies]
 dcroxide-base58 = { path = "../dcroxide-base58" }
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }

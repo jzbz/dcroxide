@@ -1171,6 +1171,11 @@ fn open_chain(cfg: &Config, db: Database) -> Result<Chain, String> {
     // everything after (a documented divergence — dcrd sizes the
     // cache before initializing it).
     chain.set_utxo_cache_max_bytes(cfg.utxo_cache_max_size.saturating_mul(1024 * 1024));
+    // dcrd's --sigcachemaxsize bounds the signature verification
+    // cache by ENTRY COUNT (server.go passes it to
+    // `txscript.NewSigCache`).  The open-time catch-up replay above
+    // runs no scripts, so sizing after open is equivalent.
+    chain.set_sig_cache_max_entries(usize::try_from(cfg.sig_cache_max_size).unwrap_or(usize::MAX));
     Ok(chain)
 }
 

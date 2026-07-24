@@ -114,6 +114,11 @@ const UTXO_CACHE_EVICTION_PERCENTAGE: f64 = 0.15;
 /// chain sync (dcrd `periodicFlushInterval` of two minutes).
 const UTXO_PERIODIC_FLUSH_SECS: i64 = 120;
 
+/// The default maximum number of entries in the signature
+/// verification cache (dcrd config.go `defaultSigCacheMaxSize`; dcrd
+/// sizes the cache by entry count, not bytes).
+pub const DEFAULT_SIG_CACHE_MAX_ENTRIES: usize = 100000;
+
 /// The in-memory size of a utxo entry in dcrd's cache accounting
 /// (dcrd `UtxoEntry.size`): the base size plus the script and, for
 /// ticket submissions, the serialized minimal-outputs data.
@@ -126,6 +131,26 @@ fn utxo_entry_size(entry: &UtxoEntry) -> u64 {
                 .map(|d| d.len() as u64)
                 .unwrap_or(0),
         )
+}
+
+/// The chain's read-through resolver over its utxo cache and backend
+/// (dcrd's utxo viewpoints fetch through `UtxoCache`): single
+/// lookups go through [`Chain::fetch_utxo_entry`], and the view's
+/// per-block batches go through [`Chain::fetch_utxo_entries`] so all
+/// cache misses of a block read the backend in one database view
+/// transaction.
+struct ChainUtxoResolver<'a> {
+    chain: &'a Chain,
+}
+
+impl crate::utxoview::UtxoResolver for ChainUtxoResolver<'_> {
+    fn resolve(&self, outpoint: &OutPoint) -> Option<UtxoEntry> {
+        self.chain.fetch_utxo_entry(outpoint)
+    }
+
+    fn resolve_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<UtxoEntry>> {
+        self.chain.fetch_utxo_entries(outpoints)
+    }
 }
 
 /// The growing chain state: the block tree arena and index together
@@ -253,6 +278,13 @@ pub struct Chain {
     /// The chain event callback (dcrd `BlockChain.notifications`);
     /// invoked synchronously from the processing paths when installed.
     notifications: Option<crate::notifications::NotificationCallback>,
+    /// The shared signature verification cache threaded into every
+    /// script engine the connect and mempool paths create (dcrd wires
+    /// `s.sigCache` into `blockchain.Config.SigCache`).  Defaults to
+    /// a [`DEFAULT_SIG_CACHE_MAX_ENTRIES`]-entry cache; `None`
+    /// verifies every signature directly.  Shared behind an `Arc` so
+    /// the daemon's mempool seams reuse the same cache.
+    pub sig_cache: Option<Arc<dcroxide_txscript::SigCache>>,
 }
 
 /// Information about the current best chain block and related state
@@ -406,7 +438,19 @@ impl Chain {
             treasury_spend_limit_floor: (params.base_subsidy / 10)
                 * (params.treasury_vote_interval * params.treasury_vote_interval_multiplier) as i64,
             notifications: None,
+            sig_cache: Some(Arc::new(dcroxide_txscript::SigCache::new(
+                DEFAULT_SIG_CACHE_MAX_ENTRIES,
+            ))),
         }
+    }
+
+    /// Replace the signature verification cache with one holding at
+    /// most `max_entries` entries (the `--sigcachemaxsize` config
+    /// knob; dcrd sizes the cache by entry count and passes it to
+    /// `txscript.NewSigCache` at server creation).  Zero keeps a
+    /// cache that never stores anything, exactly like dcrd's.
+    pub fn set_sig_cache_max_entries(&mut self, max_entries: usize) {
+        self.sig_cache = Some(Arc::new(dcroxide_txscript::SigCache::new(max_entries)));
     }
 
     /// Install the chain event callback (dcrd `Config.Notifications`).
@@ -1413,7 +1457,7 @@ impl Chain {
                 &block,
                 &parent,
                 &stxos,
-                &|op: &OutPoint| self.fetch_utxo_entry(op),
+                &ChainUtxoResolver { chain: self },
                 is_treasury_enabled,
             )
             .map_err(|e| {
@@ -1464,7 +1508,7 @@ impl Chain {
                 &block,
                 &parent,
                 || self.fetch_spend_journal(&parent, is_treasury_enabled),
-                &|op: &OutPoint| self.fetch_utxo_entry(op),
+                &ChainUtxoResolver { chain: self },
                 None,
                 is_treasury_enabled,
             )
@@ -1516,6 +1560,107 @@ impl Chain {
         // an entry to avoid reloading it (dcrd caches the nil too).
         self.utxo_cache.borrow_mut().insert(key, fetched.clone());
         fetched
+    }
+
+    /// Fetch a batch of entries through the cache and backend, one
+    /// result per outpoint in order: per-outpoint semantics are
+    /// exactly [`Self::fetch_utxo_entry`]'s — hits are cloned with
+    /// the modified and fresh flags cleared, misses are cached
+    /// (missing outputs negatively) — but every cache miss of the
+    /// batch reads the backend within ONE database view transaction
+    /// instead of opening one per outpoint (dcrd's
+    /// `UtxoCache.FetchEntries` needs no such batching because its
+    /// leveldb reads are transactionless).
+    pub fn fetch_utxo_entries(&self, outpoints: &[OutPoint]) -> Vec<Option<UtxoEntry>> {
+        // Serve cache hits and collect the missing indexes (one
+        // borrow across the pass; the counters update in bulk after).
+        let mut results: Vec<Option<UtxoEntry>> = Vec::with_capacity(outpoints.len());
+        let mut missing: Vec<usize> = Vec::new();
+        {
+            let cache = self.utxo_cache.borrow();
+            for (i, op) in outpoints.iter().enumerate() {
+                let key = (op.hash.0, op.index, op.tree);
+                match cache.get(&key) {
+                    Some(entry) => {
+                        results.push(entry.clone().map(|mut cloned| {
+                            cloned.set_state_bits(
+                                cloned.state_bits()
+                                    & !(crate::utxoentry::UTXO_STATE_MODIFIED
+                                        | crate::utxoentry::UTXO_STATE_FRESH),
+                            );
+                            cloned
+                        }));
+                    }
+                    None => {
+                        missing.push(i);
+                        results.push(None);
+                    }
+                }
+            }
+        }
+        self.utxo_cache_misses.set(
+            self.utxo_cache_misses
+                .get()
+                .wrapping_add(missing.len() as u64),
+        );
+        self.utxo_cache_hits.set(
+            self.utxo_cache_hits
+                .get()
+                .wrapping_add((outpoints.len().wrapping_sub(missing.len())) as u64),
+        );
+        if missing.is_empty() {
+            return results;
+        }
+
+        // Read every miss from the backend in one view transaction
+        // (or the in-memory map for the pure-memory test chains),
+        // with [`Self::backend_fetch_entry`]'s exact panic semantics
+        // for corruption and read failures.
+        let miss_outpoints: Vec<OutPoint> = missing.iter().map(|&i| outpoints[i]).collect();
+        let fetched: Vec<Option<UtxoEntry>> = match &self.db {
+            Some(db) => {
+                let mut fetched = Vec::new();
+                db.view(|tx| {
+                    fetched = crate::chaindb::db_fetch_utxo_entries(tx, &miss_outpoints)
+                        .expect("corrupt utxo backend entry");
+                    Ok(())
+                })
+                .expect("utxo backend read");
+                fetched
+            }
+            None => miss_outpoints
+                .iter()
+                .map(|op| {
+                    self.utxo_backend
+                        .get(&(op.hash.0, op.index, op.tree))
+                        .cloned()
+                })
+                .collect(),
+        };
+
+        // Cache each fetched entry (or its absence) and fill in the
+        // result slots, exactly as the per-outpoint path does.  A
+        // duplicate outpoint within the batch caches (and accounts
+        // for) its entry only once — the key can only already be
+        // present from an earlier duplicate in this same loop, since
+        // the first pass saw it missing.
+        let mut cache = self.utxo_cache.borrow_mut();
+        for (&i, entry) in missing.iter().zip(fetched) {
+            let op = &outpoints[i];
+            let key = (op.hash.0, op.index, op.tree);
+            if let alloc::collections::btree_map::Entry::Vacant(slot) = cache.entry(key) {
+                if let Some(entry) = &entry {
+                    self.utxo_total_entry_size.set(
+                        self.utxo_total_entry_size
+                            .get()
+                            .saturating_add(utxo_entry_size(entry)),
+                    );
+                }
+                slot.insert(entry.clone());
+            }
+            results[i] = entry;
+        }
+        results
     }
 
     /// Statistics on the current UTXO set (dcrd
@@ -2467,7 +2612,7 @@ impl Chain {
                 &block,
                 &parent,
                 &stxos,
-                &|op: &OutPoint| self.fetch_utxo_entry(op),
+                &ChainUtxoResolver { chain: self },
                 is_treasury_enabled,
             )?;
 
@@ -2519,7 +2664,7 @@ impl Chain {
                     &block,
                     &parent,
                     || self.fetch_spend_journal(&parent, is_treasury_enabled),
-                    &|op: &OutPoint| self.fetch_utxo_entry(op),
+                    &ChainUtxoResolver { chain: self },
                     Some(&mut stxos),
                     is_treasury_enabled,
                 )?;
@@ -2568,9 +2713,10 @@ impl Chain {
                         &parent,
                         || self.fetch_spend_journal(&parent, is_treasury_enabled),
                         &mut view,
-                        &|op: &OutPoint| self.fetch_utxo_entry(op),
+                        &ChainUtxoResolver { chain: self },
                         Some(&mut stxos),
                         run_scripts,
+                        self.sig_cache.as_deref(),
                         Some(&|blk: &MsgBlock| self.tspend_checks(parent_id, blk, params)),
                         params,
                     )
@@ -3398,9 +3544,10 @@ impl Chain {
                 &parent,
                 || self.fetch_spend_journal(&parent, is_treasury_enabled),
                 &mut view,
-                &|op: &OutPoint| self.fetch_utxo_entry(op),
+                &ChainUtxoResolver { chain: self },
                 None,
                 run_scripts,
+                self.sig_cache.as_deref(),
                 Some(&|blk: &MsgBlock| self.tspend_checks(prev_node, blk, params)),
                 params,
             )
@@ -3416,7 +3563,7 @@ impl Chain {
             &tip_block,
             &parent,
             &stxos,
-            &|op: &OutPoint| self.fetch_utxo_entry(op),
+            &ChainUtxoResolver { chain: self },
             is_treasury_enabled,
         )?;
         let branch_view = NodeBranchView {
@@ -3434,9 +3581,10 @@ impl Chain {
             &parent,
             || self.fetch_spend_journal(&parent, is_treasury_enabled),
             &mut view,
-            &|op: &OutPoint| self.fetch_utxo_entry(op),
+            &ChainUtxoResolver { chain: self },
             None,
             run_scripts,
+            self.sig_cache.as_deref(),
             Some(&|blk: &MsgBlock| self.tspend_checks(prev_node, blk, params)),
             params,
         )
@@ -3496,7 +3644,7 @@ impl Chain {
             &tip_block,
             &parent,
             &stxos,
-            &|op: &OutPoint| self.fetch_utxo_entry(op),
+            &ChainUtxoResolver { chain: self },
             is_treasury_enabled,
         )
         .map_err(|e| e.description)?;
@@ -3515,7 +3663,7 @@ impl Chain {
             block,
             &parent,
             || self.fetch_spend_journal(&parent, is_treasury_enabled),
-            &|op: &OutPoint| self.fetch_utxo_entry(op),
+            &ChainUtxoResolver { chain: self },
             None,
             is_treasury_enabled,
         )

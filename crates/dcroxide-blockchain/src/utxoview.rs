@@ -36,6 +36,17 @@ fn key(op: &OutPoint) -> OutPointKey {
 pub trait UtxoResolver {
     /// The backing entry for the outpoint, if it exists.
     fn resolve(&self, outpoint: &OutPoint) -> Option<UtxoEntry>;
+
+    /// The backing entries for a batch of outpoints, one result per
+    /// outpoint in order.  The default resolves each outpoint
+    /// individually; database-backed resolvers override this to read
+    /// every miss of a block in a single database transaction
+    /// (mirroring dcrd's `UtxoCache.FetchEntries`, which serves the
+    /// whole filtered set in one call — its leveldb backend needs no
+    /// per-read transaction, the redb-backed store amortizes one).
+    fn resolve_batch(&self, outpoints: &[OutPoint]) -> Vec<Option<UtxoEntry>> {
+        outpoints.iter().map(|op| self.resolve(op)).collect()
+    }
 }
 
 impl<F: Fn(&OutPoint) -> Option<UtxoEntry>> UtxoResolver for F {
@@ -634,26 +645,51 @@ impl UtxoView {
         Ok(())
     }
 
-    fn resolve_missing(&mut self, resolver: &impl UtxoResolver, outpoint: &OutPoint) {
-        let k = key(outpoint);
-        if self.entries.contains_key(&k) {
+    /// Queue an outpoint whose entry is missing from the view for a
+    /// batched resolve (the `add` of dcrd's `ViewFilteredSet`:
+    /// outpoints already in the view are skipped).  Duplicates within
+    /// a block are not filtered here — they are rare (only invalid
+    /// blocks or the in-flight index corner produce them), and both
+    /// [`Self::resolve_queued`] and the chain's batch fetch handle
+    /// them exactly like the old sequential resolve did.
+    fn queue_missing(&self, needed: &mut Vec<OutPoint>, outpoint: &OutPoint) {
+        if self.entries.contains_key(&key(outpoint)) {
             return;
         }
-        if let Some(entry) = resolver.resolve(outpoint) {
-            self.entries.insert(k, entry);
+        needed.push(*outpoint);
+    }
+
+    /// Resolve the queued outpoints in one batch and add the entries
+    /// that exist to the view, skipping any outpoint another entry
+    /// filled in the meantime (the resolve half of dcrd's
+    /// `fetchUtxosMain` over `UtxoCache.FetchEntries`).
+    fn resolve_queued(&mut self, resolver: &impl UtxoResolver, needed: &[OutPoint]) {
+        if needed.is_empty() {
+            return;
+        }
+        let resolved = resolver.resolve_batch(needed);
+        debug_assert_eq!(needed.len(), resolved.len(), "resolver batch size mismatch");
+        for (outpoint, entry) in needed.iter().zip(resolved) {
+            let k = key(outpoint);
+            if self.entries.contains_key(&k) {
+                continue;
+            }
+            if let Some(entry) = entry {
+                self.entries.insert(k, entry);
+            }
         }
     }
 
-    /// Load the utxos for the regular transactions' inputs into the
-    /// view, adding outputs created earlier in the same block directly
-    /// (dcrd `fetchRegularInputUtxos` over the resolver).
-    /// `regular_tx_hashes` carries the hash of each regular
-    /// transaction, computed once per block.
-    pub fn fetch_regular_input_utxos(
+    /// Queue the missing utxos for the regular transactions' inputs,
+    /// adding outputs created earlier in the same block to the view
+    /// directly (the set-construction half of dcrd
+    /// `fetchRegularInputUtxos`).  `regular_tx_hashes` carries the
+    /// hash of each regular transaction, computed once per block.
+    fn queue_regular_input_utxos(
         &mut self,
         block: &MsgBlock,
         regular_tx_hashes: &[Hash],
-        resolver: &impl UtxoResolver,
+        needed: &mut Vec<OutPoint>,
         is_treasury_enabled: bool,
     ) {
         let height = i64::from(block.header.height);
@@ -683,24 +719,19 @@ impl UtxoView {
                         continue;
                     }
                 }
-                self.resolve_missing(resolver, &tx_in.previous_out_point);
+                self.queue_missing(needed, &tx_in.previous_out_point);
             }
         }
     }
 
-    /// Load the utxos for all of the block's inputs into the view
-    /// (dcrd `fetchInputUtxos` over the resolver).
-    /// `regular_tx_hashes` carries the hash of each regular
-    /// transaction, computed once per block; the stake tree only
-    /// resolves inputs and needs no hashes.
-    pub fn fetch_input_utxos(
-        &mut self,
+    /// Queue the missing utxos for the stake transactions' inputs
+    /// (the stake half of dcrd `fetchInputUtxos`'s set construction).
+    fn queue_stake_input_utxos(
+        &self,
         block: &MsgBlock,
-        regular_tx_hashes: &[Hash],
-        resolver: &impl UtxoResolver,
+        needed: &mut Vec<OutPoint>,
         is_treasury_enabled: bool,
     ) {
-        self.fetch_regular_input_utxos(block, regular_tx_hashes, resolver, is_treasury_enabled);
         for (tx_idx, stx) in block.stransactions.iter().enumerate() {
             let should_be_treasury_base = is_treasury_enabled && tx_idx == 0;
             if should_be_treasury_base && dcroxide_standalone::is_treasury_base(stx) {
@@ -714,9 +745,47 @@ impl UtxoView {
                 if is_vote && tx_in_idx == 0 {
                     continue;
                 }
-                self.resolve_missing(resolver, &tx_in.previous_out_point);
+                self.queue_missing(needed, &tx_in.previous_out_point);
             }
         }
+    }
+
+    /// Load the utxos for the regular transactions' inputs into the
+    /// view, adding outputs created earlier in the same block directly
+    /// (dcrd `fetchRegularInputUtxos` over the resolver: the missing
+    /// outpoints collect into one set and resolve in one batch).
+    /// `regular_tx_hashes` carries the hash of each regular
+    /// transaction, computed once per block.
+    pub fn fetch_regular_input_utxos(
+        &mut self,
+        block: &MsgBlock,
+        regular_tx_hashes: &[Hash],
+        resolver: &impl UtxoResolver,
+        is_treasury_enabled: bool,
+    ) {
+        let mut needed = Vec::new();
+        self.queue_regular_input_utxos(block, regular_tx_hashes, &mut needed, is_treasury_enabled);
+        self.resolve_queued(resolver, &needed);
+    }
+
+    /// Load the utxos for all of the block's inputs into the view
+    /// (dcrd `fetchInputUtxos` over the resolver: every missing
+    /// outpoint across both trees resolves in one batch, so a
+    /// database-backed resolver reads them all in one transaction).
+    /// `regular_tx_hashes` carries the hash of each regular
+    /// transaction, computed once per block; the stake tree only
+    /// resolves inputs and needs no hashes.
+    pub fn fetch_input_utxos(
+        &mut self,
+        block: &MsgBlock,
+        regular_tx_hashes: &[Hash],
+        resolver: &impl UtxoResolver,
+        is_treasury_enabled: bool,
+    ) {
+        let mut needed = Vec::new();
+        self.queue_regular_input_utxos(block, regular_tx_hashes, &mut needed, is_treasury_enabled);
+        self.queue_stake_input_utxos(block, &mut needed, is_treasury_enabled);
+        self.resolve_queued(resolver, &needed);
     }
 
     /// Disconnect the regular transactions of a disapproved parent

@@ -283,10 +283,15 @@ impl TemplateChain for NodeTemplateChain {
         flags: ScriptFlags,
         is_auto_revocations_enabled: bool,
     ) -> Result<(), String> {
+        // Thread the chain's signature cache through so template
+        // assembly reuses the mempool's successful verifications
+        // (dcrd wires `s.sigCache` into the template generator).
+        let chain = self.locked();
         dcroxide_blockchain::validate::validate_transaction_scripts(
             tx,
             |op| view.lookup_entry(op).cloned(),
             flags,
+            chain.sig_cache.as_deref(),
             is_auto_revocations_enabled,
         )
         .map_err(|e| e.description)

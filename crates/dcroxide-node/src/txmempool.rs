@@ -275,6 +275,13 @@ impl PoolChain for NodePoolChain {
     fn now_unix(&self) -> i64 {
         now_unix()
     }
+
+    /// The chain's shared signature verification cache, so block
+    /// connects reuse the mempool's successful verifications (dcrd
+    /// wires `s.sigCache` into `mempool.Config.SigCache`).
+    fn sig_cache(&self) -> Option<Arc<dcroxide_txscript::SigCache>> {
+        self.locked().sig_cache.clone()
+    }
 }
 
 /// dcrd's mempool policy values (server.go `newServer`'s

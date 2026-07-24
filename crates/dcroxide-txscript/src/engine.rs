@@ -81,6 +81,10 @@ pub struct Engine<'a> {
     pub(crate) tx_idx: usize,
     pub(crate) version: u16,
     pub(crate) is_p2sh: bool,
+    /// The shared signature verification cache, when the caller
+    /// attached one (dcrd `Engine.sigCache`); `None` verifies every
+    /// signature directly, byte-identical to the pre-cache engine.
+    pub(crate) sig_cache: Option<&'a crate::SigCache>,
 
     // Current execution state.
     pub(crate) scripts: Vec<Vec<u8>>,
@@ -116,6 +120,43 @@ impl<'a> Engine<'a> {
     /// current script, but the field is kept for structural fidelity.
     pub(crate) fn sub_script(&self) -> &[u8] {
         &self.scripts[self.script_idx][self.last_code_sep..]
+    }
+
+    /// Attach a shared signature verification cache consulted before —
+    /// and populated after — successful signature verifications (the
+    /// `sigCache` parameter of dcrd's `NewEngine`).  Cache hits and
+    /// fresh verifications are indistinguishable in every observable
+    /// result.
+    pub fn set_sig_cache(&mut self, sig_cache: &'a crate::SigCache) {
+        self.sig_cache = Some(sig_cache);
+    }
+
+    /// Verify a signature through the optional signature cache,
+    /// mirroring the cache consultation in dcrd's `opcodeCheckSig`
+    /// and `opcodeCheckMultiSig`: a cached successful verification of
+    /// the same (hash, signature, key) triple short-circuits the
+    /// curve math, a fresh successful verification is added to the
+    /// cache, and failures are never cached.  Without a cache the
+    /// verification closure runs directly.
+    pub(crate) fn verify_sig_with_cache(
+        &self,
+        suite: crate::SigCacheSuite,
+        sig_hash: &[u8; 32],
+        sig_bytes: &[u8],
+        pk_bytes: &[u8],
+        verify: impl FnOnce() -> bool,
+    ) -> bool {
+        let Some(sig_cache) = self.sig_cache else {
+            return verify();
+        };
+        if sig_cache.exists(sig_hash, suite, sig_bytes, pk_bytes) {
+            return true;
+        }
+        let valid = verify();
+        if valid {
+            sig_cache.add(sig_hash, suite, sig_bytes, pk_bytes);
+        }
+        valid
     }
 
     /// Execute an opcode taking into account disabled/illegal opcodes,
@@ -489,6 +530,7 @@ impl<'a> Engine<'a> {
             tx_idx,
             version: script_version,
             is_p2sh: false,
+            sig_cache: None,
             scripts: Vec::new(),
             script_idx: 0,
             opcode_idx: 0,

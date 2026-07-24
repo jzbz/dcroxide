@@ -10,15 +10,16 @@
 //!   [`ErrorKind::kind_name`] matches dcrd's `ErrorKind` string; the
 //!   differential tests compare verdicts *and* kinds against dcrd through
 //!   the oracle.
-//! - dcrd's `SigCache` is not reproduced: it is a concurrency optimization
-//!   that cannot change results; the engine here verifies directly.
+//! - dcrd's `SigCache` is ported (behind the `std` feature) as a
+//!   result-invariant memoization of successful verifications; the
+//!   no-cache path verifies directly, byte-identical to before.
 //! - dcrd's `optimizeSigVerification` prefix-hash cache is permanently
-//!   disabled dead code at the parity tag and is likewise not reproduced.
+//!   disabled dead code at the parity tag and is not reproduced.
 //!
 //! The `stdaddr` and `stdscript` subpackages live in the modules of the
 //! same names; `sign` is a later piece.
 
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
 // The engine's arithmetic mirrors dcrd's Go semantics; every operation that
 // can wrap does so deliberately via wrapping/checked forms, and index
 // arithmetic is bounds-checked by construction (Rust panics would surface
@@ -35,6 +36,7 @@ mod opcode_table;
 mod opcodes;
 mod script;
 mod scriptnum;
+mod sigcache;
 mod sighash;
 pub mod sign;
 mod stack;
@@ -61,6 +63,7 @@ pub use scriptnum::{
     CLTV_MAX_SCRIPT_NUM_LEN, CSV_MAX_SCRIPT_NUM_LEN, MATH_OP_CODE_MAX_SCRIPT_NUM_LEN, ScriptNum,
     make_script_num,
 };
+pub use sigcache::{SigCache, SigCacheSuite};
 pub use sighash::{
     SIG_HASH_ALL, SIG_HASH_ANY_ONE_CAN_PAY, SIG_HASH_NONE, SIG_HASH_SERIALIZE_PREFIX,
     SIG_HASH_SERIALIZE_WITNESS, SIG_HASH_SINGLE, SigHashType, calc_signature_hash_as_hash,

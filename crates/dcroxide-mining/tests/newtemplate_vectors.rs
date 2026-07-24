@@ -236,8 +236,14 @@ impl TemplateChain for FakeChain {
         flags: ScriptFlags,
         auto_rev: bool,
     ) -> Result<(), String> {
-        validate_transaction_scripts(tx, |op| view.lookup_entry(op).cloned(), flags, auto_rev)
-            .map_err(|e| format!("{e:?}"))
+        validate_transaction_scripts(
+            tx,
+            |op| view.lookup_entry(op).cloned(),
+            flags,
+            None,
+            auto_rev,
+        )
+        .map_err(|e| format!("{e:?}"))
     }
     fn standard_verify_flags(&self) -> Result<ScriptFlags, String> {
         Ok(self.script_flags)

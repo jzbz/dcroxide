@@ -9,9 +9,10 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Enables the threaded script-validation worker pool (the crate is
-# no_std without it; results are identical either way).
-std = []
+# Enables the threaded script-validation worker pool and the real
+# signature verification cache (the crate is no_std without it;
+# results are identical either way).
+std = ["dcroxide-txscript/std"]
 
 [dependencies]
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
