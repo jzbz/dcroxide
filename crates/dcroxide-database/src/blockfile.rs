@@ -227,7 +227,10 @@ impl BlockStore {
 
     /// Sync all files written to since the last sync.
     pub(crate) fn sync(&mut self) -> Result<(), Error> {
-        for num in std::mem::take(&mut self.dirty_files) {
+        // Entries leave the dirty list only after their fsync succeeds
+        // so a transient failure keeps the files-before-metadata
+        // invariant armed for the next attempt.
+        while let Some(&num) = self.dirty_files.first() {
             let via_write_handle = num == self.write_file_num && self.write_file.is_some();
             if via_write_handle {
                 let f = self.write_file.as_ref().expect("checked above");
@@ -239,6 +242,7 @@ impl BlockStore {
                 f.sync_all()
                     .map_err(|e| io_err(&e, "failed to sync file"))?;
             }
+            self.dirty_files.remove(0);
         }
         Ok(())
     }

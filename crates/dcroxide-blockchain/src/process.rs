@@ -891,6 +891,14 @@ impl Chain {
             Ok(())
         })?;
         self.utxo_flush_finish(eviction_height, tip_hash);
+        // Make everything durable: dcrd's UTXO cache flush makes the
+        // block database durable on every flush (`flushBlockDB` at
+        // the start of dcrd's `UtxoCache.flush`); with the single
+        // shared database here, one flush after the combined update
+        // covers both atomically.
+        if let Err(e) = self.db.as_ref().expect("checked above").flush() {
+            return Err(crate::chaindb::ChainDbError::Db(e));
+        }
         Ok(())
     }
 
@@ -1181,6 +1189,15 @@ impl Chain {
             .map_err(crate::chaindb::ChainDbError::Db)?;
         }
         self.utxo_flush_finish(eviction_height, last_flush_hash);
+        // Bound the crash-loss window to the UTXO flush cadence like
+        // dcrd, whose every UTXO cache flush makes the block database
+        // durable (`flushBlockDB`); the eviction that follows relies
+        // on these writes having reached disk.
+        if let Some(db) = self.db.as_ref()
+            && let Err(e) = db.flush()
+        {
+            return Err(crate::chaindb::ChainDbError::Db(e));
+        }
         Ok(())
     }
 

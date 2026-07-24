@@ -292,6 +292,13 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
         }
     }
 
+    // The clean-shutdown flush is part of the measured work: a real
+    // sync pays it too, and without it the work directory's tail
+    // rolls back on the next open.
+    chain
+        .flush(&params)
+        .map_err(|e| format!("flush failed: {e:?}"))?;
+
     let elapsed = start.elapsed().as_secs_f64();
     let best = chain.best_snapshot();
     println!("---");

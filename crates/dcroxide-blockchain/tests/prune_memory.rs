@@ -91,6 +91,9 @@ fn pruning_keeps_the_chain_queryable_from_the_database() {
 
     // A reopen rebuilds from the database with the pruned state intact
     // (the recent window is warmed, the rest lazy) and the same tip.
+    // The metadata write cache must reach disk first (the daemon's
+    // clean shutdown flushes it).
+    chain.db.as_ref().expect("db").flush().expect("db flush");
     drop(chain);
     let db = Database::open(&opts).expect("reopen database");
     let chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("reopen chain");
@@ -238,6 +241,11 @@ fn an_unflushed_utxo_set_catches_up_on_reopen() {
         recorded.last_flush_hash, tip_hash,
         "the crash run must leave the recorded utxo set state behind the tip"
     );
+    // Persist the per-block metadata (the write cache) while leaving
+    // the recorded utxo set state behind the tip: the flush below is
+    // the database's, not the chain's, so the catch-up replay is
+    // still exercised on reopen.
+    chain_b.db.as_ref().expect("db").flush().expect("db flush");
     drop(chain_b);
 
     // The reopen runs the catch-up replay: the utxo set converges to

@@ -36,6 +36,7 @@ fn create_open_semantics() {
 
     // Create succeeds, re-create fails.
     let db = Database::create(&opts).expect("create");
+    db.close().expect("close");
     drop(db);
     assert_eq!(
         Database::create(&opts).err().map(kind_of),

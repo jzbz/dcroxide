@@ -200,6 +200,7 @@ fn block_store_fetch_round_trip() {
     .expect("view");
 
     // Everything survives a reopen.
+    db.close().expect("close");
     drop(db);
     let db = Database::open(&opts).expect("reopen");
     db.view(|tx| {
@@ -269,6 +270,7 @@ fn corrupted_block_file_detected() {
     let block = make_block(&mut rng);
     let hash = block.header.block_hash();
     db.update(|tx| tx.store_block(&block)).expect("store");
+    db.close().expect("close");
     drop(db);
 
     // Flip a byte in the middle of the stored block data.

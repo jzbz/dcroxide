@@ -22,7 +22,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dcroxide_chainhash::Hash;
-use redb::ReadableTable;
 
 use crate::blockfile::{BLOCK_LOC_SIZE, BlockLocation, serialize_write_row};
 use crate::error::{Error, ErrorKind, db_error};
@@ -93,7 +92,10 @@ fn bucketized_key(bucket_id: [u8; 4], key: &[u8]) -> Vec<u8> {
 #[allow(clippy::large_enum_variant)]
 enum KvTx {
     Read(redb::ReadTransaction),
-    Write(redb::WriteTransaction),
+    /// A writable transaction: reads come from a redb read snapshot
+    /// (writes buffer in the pending maps and reach redb only when
+    /// the metadata cache flushes); the writer semaphore is held.
+    Write(redb::ReadTransaction),
 }
 
 /// The mutable state of a transaction, kept behind a `RefCell` so
@@ -108,6 +110,16 @@ struct TxState {
     /// `pendingBlockData`).
     pending_blocks: Vec<(Hash, Vec<u8>)>,
     pending_index: HashMap<[u8; 32], usize>,
+    /// Metadata puts buffered until commit (dcrd `pendingKeys`).
+    pending_keys: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Metadata deletions buffered until commit (dcrd
+    /// `pendingRemove`).
+    pending_removes: std::collections::BTreeSet<Vec<u8>>,
+    /// The metadata cache overlay as of transaction start (dcrd's
+    /// `dbCacheSnapshot`); an `Arc` clone, released at commit before
+    /// the cache applies this transaction so the overlay mutates in
+    /// place instead of copy-on-write cloning itself every commit.
+    cache_snap: Arc<crate::dbcache::CacheMap>,
 }
 
 /// A database transaction over the metadata buckets and block storage
@@ -121,7 +133,12 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub(crate) fn new(db: Arc<DbInner>, kv: KvTxSeed, managed: bool) -> Transaction {
+    pub(crate) fn new(
+        db: Arc<DbInner>,
+        kv: KvTxSeed,
+        cache_snap: Arc<crate::dbcache::CacheMap>,
+        managed: bool,
+    ) -> Transaction {
         let (kv, writable) = match kv {
             KvTxSeed::Read(t) => (KvTx::Read(t), false),
             KvTxSeed::Write(t) => (KvTx::Write(t), true),
@@ -132,6 +149,9 @@ impl Transaction {
                 kv: Some(kv),
                 pending_blocks: Vec::new(),
                 pending_index: HashMap::new(),
+                pending_keys: std::collections::BTreeMap::new(),
+                pending_removes: std::collections::BTreeSet::new(),
+                cache_snap,
             }),
             writable,
             managed,
@@ -162,12 +182,19 @@ impl Transaction {
 
     pub(crate) fn fetch_raw(&self, key: &[u8]) -> Option<Vec<u8>> {
         let state = self.state.borrow();
+        // The layered view (dcrd `fetchKey`): this transaction's
+        // pending changes, then the cache snapshot, then the store.
+        if state.pending_removes.contains(key) {
+            return None;
+        }
+        if let Some(v) = state.pending_keys.get(key) {
+            return Some(v.clone());
+        }
+        if let Some(entry) = state.cache_snap.get(key) {
+            return entry.clone();
+        }
         match state.kv.as_ref()? {
-            KvTx::Read(t) => {
-                let table = t.open_table(METADATA_TABLE).ok()?;
-                table.get(key).ok()?.map(|g| g.value().to_vec())
-            }
-            KvTx::Write(t) => {
+            KvTx::Read(t) | KvTx::Write(t) => {
                 let table = t.open_table(METADATA_TABLE).ok()?;
                 table.get(key).ok()?.map(|g| g.value().to_vec())
             }
@@ -179,35 +206,23 @@ impl Transaction {
     }
 
     pub(crate) fn put_raw(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
-        let state = self.state.borrow();
-        match state.kv.as_ref() {
-            Some(KvTx::Write(t)) => {
-                let mut table = t
-                    .open_table(METADATA_TABLE)
-                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
-                table
-                    .insert(key, value)
-                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
-                Ok(())
-            }
-            _ => Err(db_error(ErrorKind::TxNotWritable, "tx not writable")),
+        let mut state = self.state.borrow_mut();
+        if state.kv.is_none() || !self.writable {
+            return Err(db_error(ErrorKind::TxNotWritable, "tx not writable"));
         }
+        state.pending_removes.remove(key);
+        state.pending_keys.insert(key.to_vec(), value.to_vec());
+        Ok(())
     }
 
     pub(crate) fn delete_raw(&self, key: &[u8]) -> Result<(), Error> {
-        let state = self.state.borrow();
-        match state.kv.as_ref() {
-            Some(KvTx::Write(t)) => {
-                let mut table = t
-                    .open_table(METADATA_TABLE)
-                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
-                table
-                    .remove(key)
-                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
-                Ok(())
-            }
-            _ => Err(db_error(ErrorKind::TxNotWritable, "tx not writable")),
+        let mut state = self.state.borrow_mut();
+        if state.kv.is_none() || !self.writable {
+            return Err(db_error(ErrorKind::TxNotWritable, "tx not writable"));
         }
+        state.pending_keys.remove(key);
+        state.pending_removes.insert(key.to_vec());
+        Ok(())
     }
 
     /// All raw keys beginning with the prefix, in raw byte order.
@@ -253,7 +268,42 @@ impl Transaction {
                 range.ok().map(collect)
             }),
         };
-        result.unwrap_or_default()
+
+        // Merge the layered views over the stored keys: the cache
+        // snapshot's live entries add and its deletions mask, then
+        // this transaction's own pending sets do the same on top.
+        let mut merged: std::collections::BTreeSet<Vec<u8>> =
+            result.unwrap_or_default().into_iter().collect();
+        for (key, value) in state.cache_snap.range(prefix.to_vec()..) {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            match value {
+                Some(_) => {
+                    merged.insert(key.clone());
+                }
+                None => {
+                    merged.remove(key);
+                }
+            }
+        }
+        for key in state.pending_removes.range(prefix.to_vec()..) {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            merged.remove(key);
+        }
+        for key in state
+            .pending_keys
+            .range::<Vec<u8>, _>(prefix.to_vec()..)
+            .map(|(k, _)| k)
+        {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            merged.insert(key.clone());
+        }
+        merged.into_iter().collect()
     }
 
     /// Allocate the next bucket ID (dcrd `nextBucketID`).
@@ -472,16 +522,18 @@ impl Transaction {
 
     fn close(&self) {
         let mut state = self.state.borrow_mut();
-        if let Some(kv) = state.kv.take() {
-            match kv {
-                KvTx::Read(_) => {}
-                KvTx::Write(t) => {
-                    let _ = t.abort();
-                }
-            }
+        if state.kv.take().is_some() && self.writable {
+            // Release the writer semaphore (dcrd releases its write
+            // lock when a writable transaction ends).
+            let mut busy = self.db.writer_busy.lock().expect("writer flag poisoned");
+            *busy = false;
+            self.db.writer_cv.notify_one();
         }
         state.pending_blocks.clear();
         state.pending_index.clear();
+        state.pending_keys.clear();
+        state.pending_removes.clear();
+        state.cache_snap = Arc::new(std::collections::BTreeMap::new());
     }
 
     /// Commit all changes made to metadata and block storage (dcrd
@@ -527,7 +579,8 @@ impl Transaction {
                     let loc = store.write_block(bytes)?;
                     locations.push((*hash, loc, bytes));
                 }
-                store.sync()?;
+                // The metadata cache flush syncs the files; per-
+                // commit syncing is gone with it (dcrd ffldb).
 
                 // Stage the block index rows: location || header.
                 for (hash, loc, bytes) in &locations {
@@ -542,19 +595,11 @@ impl Transaction {
                 self.put_raw(&bucketized_key(METADATA_BUCKET_ID, WRITE_LOC_KEY), &row)?;
             }
 
-            // Commit the metadata transaction.
-            let kv = self.state.borrow_mut().kv.take();
-            match kv {
-                Some(KvTx::Write(t)) => t
-                    .commit()
-                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string())),
-                _ => unreachable!("writable transaction has a write tx"),
-            }
+            Ok(())
         })();
 
         if result.is_err() {
-            // Roll the flat files back to their pre-transaction state
-            // and abort the metadata transaction if it is still open.
+            // Roll the flat files back to their pre-transaction state.
             let _ = self
                 .db
                 .block_store
@@ -562,10 +607,52 @@ impl Transaction {
                 .expect("store lock")
                 .rollback_to(rollback_pos.0, rollback_pos.1);
             self.close();
-        } else {
-            self.state.borrow_mut().pending_index.clear();
+            return result;
         }
-        result
+
+        // dcrd's `commitTx` order: when the thresholds demand it,
+        // flush the accumulated window FIRST — a flush failure fails
+        // the commit with this transaction unapplied (the files roll
+        // back below) — and only then publish this transaction's
+        // changes to the cache.
+        let flush_result = {
+            let mut cache = self.db.cache.lock().expect("cache lock poisoned");
+            if cache.needs_flush() {
+                cache.flush(&self.db.kv, &self.db.block_store)
+            } else {
+                Ok(())
+            }
+        };
+        if let Err(e) = flush_result {
+            let _ = self
+                .db
+                .block_store
+                .lock()
+                .expect("store lock")
+                .rollback_to(rollback_pos.0, rollback_pos.1);
+            self.close();
+            return Err(e);
+        }
+
+        let (puts, removes) = {
+            let mut state = self.state.borrow_mut();
+            // Release this transaction's snapshot so the shared cache
+            // is unshared when it applies the changes below (the
+            // copy-on-write clone otherwise turns every commit into a
+            // full-map copy).
+            state.cache_snap = Arc::new(std::collections::BTreeMap::new());
+            (
+                std::mem::take(&mut state.pending_keys),
+                std::mem::take(&mut state.pending_removes),
+            )
+        };
+        self.db
+            .cache
+            .lock()
+            .expect("cache lock poisoned")
+            .commit_pending(puts, removes.into_iter());
+        self.close();
+        Ok(())
     }
 
     /// Undo all changes made to metadata and block storage (dcrd
@@ -598,7 +685,9 @@ impl Drop for Transaction {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum KvTxSeed {
     Read(redb::ReadTransaction),
-    Write(redb::WriteTransaction),
+    /// A writable transaction's read snapshot; the writer semaphore
+    /// is already held by the caller.
+    Write(redb::ReadTransaction),
 }
 
 // ----------------------------------------------------------------------
@@ -767,6 +856,7 @@ impl<'tx> Bucket<'tx> {
                 bucket_id: self.id,
                 keys: Vec::new(),
                 pos: CursorPos::Exhausted,
+                parked: None,
             };
         }
 
@@ -786,6 +876,7 @@ impl<'tx> Bucket<'tx> {
             bucket_id: self.id,
             keys,
             pos: CursorPos::Unpositioned,
+            parked: None,
         }
     }
 
@@ -861,9 +952,56 @@ pub struct Cursor<'tx> {
     bucket_id: [u8; 4],
     keys: Vec<Vec<u8>>,
     pos: CursorPos,
+    /// The key/value pair parked by `delete` until the next movement
+    /// (dcrd's cursor keeps returning the deleted pair from its
+    /// parked iterators until it is repositioned).
+    parked: Option<(Vec<u8>, Option<Vec<u8>>)>,
 }
 
 impl Cursor<'_> {
+    /// Whether the key at the index was deleted in this transaction
+    /// after the cursor materialized (dcrd's `skipPendingUpdates`
+    /// consults the live pending-remove set on every movement).
+    fn removed(&self, i: usize) -> bool {
+        self.keys.get(i).is_some_and(|k| {
+            self.tx
+                .state
+                .borrow()
+                .pending_removes
+                .contains(k.as_slice())
+        })
+    }
+
+    /// Move forward from a removed key to the next live one.
+    fn skip_forward(&mut self, mut i: usize) -> bool {
+        loop {
+            i += 1;
+            if i >= self.keys.len() {
+                self.pos = CursorPos::Exhausted;
+                return false;
+            }
+            if !self.removed(i) {
+                self.pos = CursorPos::At(i);
+                return true;
+            }
+        }
+    }
+
+    /// Move backward from a removed key to the previous live one.
+    fn skip_backward(&mut self, mut i: usize) -> bool {
+        loop {
+            if i == 0 {
+                self.pos = CursorPos::Exhausted;
+                return false;
+            }
+            i -= 1;
+            if !self.removed(i) {
+                self.pos = CursorPos::At(i);
+                return true;
+            }
+        }
+    }
+
     fn current_raw(&self) -> Option<&[u8]> {
         match self.pos {
             CursorPos::At(i) => self.keys.get(i).map(|k| k.as_slice()),
@@ -894,28 +1032,40 @@ impl Cursor<'_> {
             ));
         }
         let raw = raw.to_vec();
+        // Park the deleted pair: dcrd's cursor keeps returning it
+        // from its iterators until the cursor moves.
+        self.parked = Some((raw.clone(), self.tx.fetch_raw(&raw)));
         self.tx.delete_raw(&raw)
     }
 
     /// Position at the first entry; returns whether it exists (dcrd
     /// `First`).
     pub fn first(&mut self) -> bool {
+        self.parked = None;
         if self.tx.check_closed().is_err() || self.keys.is_empty() {
             self.pos = CursorPos::Exhausted;
             return false;
         }
         self.pos = CursorPos::At(0);
+        if self.removed(0) {
+            return self.skip_forward(0);
+        }
         true
     }
 
     /// Position at the last entry; returns whether it exists (dcrd
     /// `Last`).
     pub fn last(&mut self) -> bool {
+        self.parked = None;
         if self.tx.check_closed().is_err() || self.keys.is_empty() {
             self.pos = CursorPos::Exhausted;
             return false;
         }
-        self.pos = CursorPos::At(self.keys.len() - 1);
+        let last = self.keys.len() - 1;
+        self.pos = CursorPos::At(last);
+        if self.removed(last) {
+            return self.skip_backward(last);
+        }
         true
     }
 
@@ -927,9 +1077,13 @@ impl Cursor<'_> {
         if self.tx.check_closed().is_err() {
             return false;
         }
+        self.parked = None;
         match self.pos {
             CursorPos::At(i) if i + 1 < self.keys.len() => {
                 self.pos = CursorPos::At(i + 1);
+                if self.removed(i + 1) {
+                    return self.skip_forward(i + 1);
+                }
                 true
             }
             CursorPos::At(_) => {
@@ -946,9 +1100,13 @@ impl Cursor<'_> {
         if self.tx.check_closed().is_err() {
             return false;
         }
+        self.parked = None;
         match self.pos {
             CursorPos::At(i) if i > 0 => {
                 self.pos = CursorPos::At(i - 1);
+                if self.removed(i - 1) {
+                    return self.skip_backward(i - 1);
+                }
                 true
             }
             CursorPos::At(_) => {
@@ -965,12 +1123,16 @@ impl Cursor<'_> {
         if self.tx.check_closed().is_err() {
             return false;
         }
+        self.parked = None;
         let seek_key = bucketized_key(self.bucket_id, seek);
         let idx = self
             .keys
             .partition_point(|k| k.as_slice() < seek_key.as_slice());
         if idx < self.keys.len() {
             self.pos = CursorPos::At(idx);
+            if self.removed(idx) {
+                return self.skip_forward(idx);
+            }
             true
         } else {
             self.pos = CursorPos::Exhausted;
@@ -984,7 +1146,10 @@ impl Cursor<'_> {
         if self.tx.check_closed().is_err() {
             return None;
         }
-        let raw = self.current_raw()?;
+        let raw = match &self.parked {
+            Some((k, _)) => k.as_slice(),
+            None => self.current_raw()?,
+        };
         if raw.starts_with(BUCKET_INDEX_PREFIX) {
             return Some(raw[BUCKET_INDEX_PREFIX.len() + 4..].to_vec());
         }
@@ -996,6 +1161,12 @@ impl Cursor<'_> {
     pub fn value(&self) -> Option<Vec<u8>> {
         if self.tx.check_closed().is_err() {
             return None;
+        }
+        if let Some((k, v)) = &self.parked {
+            if k.starts_with(BUCKET_INDEX_PREFIX) {
+                return None;
+            }
+            return v.clone();
         }
         let raw = self.current_raw()?;
         if raw.starts_with(BUCKET_INDEX_PREFIX) {

@@ -155,6 +155,13 @@ fn real_main() -> Result<(), ()> {
         return Err(());
     }
 
+    // Make the import durable (dcrd's deferred `db.Close()` flushes
+    // the database write cache).
+    if let Err(e) = chain.lock().expect("chain mutex poisoned").flush(&params) {
+        log_error(&format!("Failed to flush the block database: {e:?}"));
+        return Err(());
+    }
+
     log_info(&format!(
         "Processed a total of {} blocks ({} imported, {} already known) in {}",
         stats.blocks_processed,

@@ -64,6 +64,7 @@ fn reconcile_truncates_orphaned_block_data() {
     let committed = make_block(&mut rng);
     let committed_hash = committed.header.block_hash();
     db.update(|tx| tx.store_block(&committed)).expect("store");
+    db.close().expect("close");
     drop(db);
 
     // Simulate the crash: append garbage "block" bytes directly to the
@@ -110,6 +111,7 @@ fn reconcile_detects_missing_block_data() {
 
     let block = make_block(&mut rng);
     db.update(|tx| tx.store_block(&block)).expect("store");
+    db.close().expect("close");
     drop(db);
 
     // Chop the tail off the block file.
@@ -147,6 +149,7 @@ fn reconcile_random_tear_soak() {
             db.update(|tx| tx.store_block(&block)).expect("store");
             committed.push(block);
         }
+        db.close().expect("close");
         drop(db);
 
         // Tear: append a random amount of garbage to the newest file.
@@ -189,4 +192,43 @@ fn reconcile_random_tear_soak() {
         })
         .expect("view");
     }
+}
+
+/// An unclean shutdown inside the write-cache window: the cached
+/// metadata never reached the store, so reopening rolls the block
+/// files back to the last durable flush and the database keeps
+/// working — a consistent chain that is merely shorter, exactly
+/// dcrd's contract (the daemon re-syncs the lost window).
+#[test]
+fn unclean_shutdown_loses_only_the_cached_window() {
+    let dir = TempDir::new().expect("tempdir");
+    let opts = Options::new(dir.path().join("db"), NET);
+    let mut rng = SplitMix64::from_entropy("db-crash-window");
+
+    // A durable base: one block, flushed to disk.
+    let db = Database::create(&opts).expect("create");
+    let base = make_block(&mut rng);
+    let base_hash = base.header.block_hash();
+    db.update(|tx| tx.store_block(&base)).expect("store base");
+    db.flush().expect("flush");
+
+    // A second block that stays in the cache window; the drop without
+    // close is the crash.
+    let lost = make_block(&mut rng);
+    let lost_hash = lost.header.block_hash();
+    db.update(|tx| tx.store_block(&lost)).expect("store lost");
+    drop(db);
+
+    let db = Database::open(&opts).expect("reopen");
+    db.view(|tx| {
+        assert_eq!(tx.fetch_block(&base_hash)?, base.serialize());
+        assert!(!tx.has_block(&lost_hash)?, "cached block must be gone");
+        Ok(())
+    })
+    .expect("view");
+
+    // The rolled-back store accepts new blocks from there.
+    let next = make_block(&mut rng);
+    db.update(|tx| tx.store_block(&next)).expect("store next");
+    db.close().expect("close");
 }

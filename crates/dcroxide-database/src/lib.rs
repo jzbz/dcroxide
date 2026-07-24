@@ -33,10 +33,12 @@
 
 mod blockfile;
 pub mod bootstrap;
+pub(crate) mod dbcache;
 mod error;
 mod transaction;
 
 use std::path::PathBuf;
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -61,10 +63,30 @@ const METADATA_FILE: &str = "metadata.redb";
 /// The database driver type identifier (dcrd `DB.Type`).
 pub const DB_TYPE: &str = "redb";
 
+/// Releases the writer semaphore on drop.
+struct WriterGuard<'a> {
+    db: &'a DbInner,
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        let mut busy = self.db.writer_busy.lock().expect("writer flag poisoned");
+        *busy = false;
+        self.db.writer_cv.notify_one();
+    }
+}
+
 pub(crate) struct DbInner {
     kv: redb::Database,
     pub(crate) block_store: Mutex<BlockStore>,
     closed: AtomicBool,
+    /// The metadata write cache (dcrd ffldb's `dbCache`).
+    pub(crate) cache: Mutex<crate::dbcache::DbCache>,
+    /// Serializes writable transactions for their whole lifetime
+    /// (dcrd's `writeLock`); redb no longer provides this because
+    /// writes only reach it at flush time.
+    pub(crate) writer_cv: Condvar,
+    pub(crate) writer_busy: Mutex<bool>,
 }
 
 /// Options controlling database creation and opening.
@@ -163,6 +185,9 @@ impl Database {
                 kv,
                 block_store: Mutex::new(block_store),
                 closed: AtomicBool::new(false),
+                cache: Mutex::new(crate::dbcache::DbCache::new()),
+                writer_cv: Condvar::new(),
+                writer_busy: Mutex::new(false),
             }),
         })
     }
@@ -229,6 +254,9 @@ impl Database {
                 kv,
                 block_store: Mutex::new(block_store),
                 closed: AtomicBool::new(false),
+                cache: Mutex::new(crate::dbcache::DbCache::new()),
+                writer_cv: Condvar::new(),
+                writer_busy: Mutex::new(false),
             }),
         })
     }
@@ -250,44 +278,96 @@ impl Database {
     /// starting a read-write transaction blocks until any current one
     /// finishes.  The transaction must be finalized with
     /// [`Transaction::commit`] or [`Transaction::rollback`].
+    /// Acquire everything a new transaction needs, in the safe order:
+    /// the writer semaphore (writable only, dcrd's `writeLock`), the
+    /// cache overlay snapshot, and only then the redb read snapshot.
+    /// A flush between the two snapshots is then seen twice (the
+    /// overlay wins with identical values) instead of not at all.
+    fn begin_seed(
+        &self,
+        writable: bool,
+    ) -> Result<(KvTxSeed, std::sync::Arc<crate::dbcache::CacheMap>), Error> {
+        let release = |inner: &DbInner| {
+            let mut busy = inner.writer_busy.lock().expect("writer flag poisoned");
+            *busy = false;
+            inner.writer_cv.notify_one();
+        };
+        if writable {
+            let mut busy = self.inner.writer_busy.lock().expect("writer flag poisoned");
+            while *busy {
+                busy = self
+                    .inner
+                    .writer_cv
+                    .wait(busy)
+                    .expect("writer flag poisoned");
+            }
+            *busy = true;
+            drop(busy);
+            // The database may have closed while this writer waited
+            // (dcrd re-checks `closed` after taking its write lock).
+            if self.inner.closed.load(Ordering::SeqCst) {
+                release(&self.inner);
+                return Err(db_error(ErrorKind::DbNotOpen, "database is not open"));
+            }
+        }
+        let cache_snap =
+            std::sync::Arc::clone(&self.inner.cache.lock().expect("cache lock poisoned").cached);
+        let kv = match self.inner.kv.begin_read() {
+            Ok(t) => t,
+            Err(e) => {
+                if writable {
+                    release(&self.inner);
+                }
+                return Err(db_error(ErrorKind::DriverSpecific, e.to_string()));
+            }
+        };
+        let seed = if writable {
+            KvTxSeed::Write(kv)
+        } else {
+            KvTxSeed::Read(kv)
+        };
+        Ok((seed, cache_snap))
+    }
+
+    /// Hold the writer semaphore for the guard's lifetime, waiting out
+    /// any committing transaction (dcrd holds its close/write locks in
+    /// `Flush` and `Close`).
+    fn exclusive_writer(&self) -> WriterGuard<'_> {
+        let mut busy = self.inner.writer_busy.lock().expect("writer flag poisoned");
+        while *busy {
+            busy = self
+                .inner
+                .writer_cv
+                .wait(busy)
+                .expect("writer flag poisoned");
+        }
+        *busy = true;
+        WriterGuard { db: &self.inner }
+    }
+
+    /// Start a transaction (dcrd `Begin`): multiple read-only
+    /// transactions may run concurrently; writable transactions
+    /// serialize on the writer semaphore.
     pub fn begin(&self, writable: bool) -> Result<Transaction, Error> {
         self.check_open()?;
-        let seed = if writable {
-            KvTxSeed::Write(
-                self.inner
-                    .kv
-                    .begin_write()
-                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?,
-            )
-        } else {
-            KvTxSeed::Read(
-                self.inner
-                    .kv
-                    .begin_read()
-                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?,
-            )
-        };
-        Ok(Transaction::new(Arc::clone(&self.inner), seed, false))
+        let (seed, cache_snap) = self.begin_seed(writable)?;
+        Ok(Transaction::new(
+            Arc::clone(&self.inner),
+            seed,
+            cache_snap,
+            false,
+        ))
     }
 
     fn begin_managed(&self, writable: bool) -> Result<Transaction, Error> {
         self.check_open()?;
-        let seed = if writable {
-            KvTxSeed::Write(
-                self.inner
-                    .kv
-                    .begin_write()
-                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?,
-            )
-        } else {
-            KvTxSeed::Read(
-                self.inner
-                    .kv
-                    .begin_read()
-                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?,
-            )
-        };
-        Ok(Transaction::new(Arc::clone(&self.inner), seed, true))
+        let (seed, cache_snap) = self.begin_seed(writable)?;
+        Ok(Transaction::new(
+            Arc::clone(&self.inner),
+            seed,
+            cache_snap,
+            true,
+        ))
     }
 
     /// Invoke the function in a managed read-only transaction (dcrd
@@ -320,14 +400,29 @@ impl Database {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Err(db_error(ErrorKind::DbNotOpen, "database is not open"));
         }
+        // Flush the metadata write cache so a clean shutdown persists
+        // everything (dcrd `Close` flushes the cache), waiting out any
+        // committing transaction first (dcrd's close/write locks).
+        let _writer = self.exclusive_writer();
+        self.inner
+            .cache
+            .lock()
+            .expect("cache lock poisoned")
+            .flush(&self.inner.kv, &self.inner.block_store)?;
         Ok(())
     }
 
-    /// Write all outstanding cached entries to disk (dcrd `Flush`).
-    /// Every commit in this driver is already durable, so this only
-    /// verifies the database is open.
+    /// Write all outstanding cached entries to disk (dcrd `Flush`):
+    /// sync the flat block files, then durably commit the metadata
+    /// write cache.
     pub fn flush(&self) -> Result<(), Error> {
         self.check_open()?;
+        let _writer = self.exclusive_writer();
+        self.inner
+            .cache
+            .lock()
+            .expect("cache lock poisoned")
+            .flush(&self.inner.kv, &self.inner.block_store)?;
         Ok(())
     }
 }
