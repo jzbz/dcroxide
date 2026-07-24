@@ -4385,10 +4385,122 @@ pub fn tspend_checks_stateless(
     Ok(())
 }
 
+/// One script to validate: an input of a transaction against the
+/// referenced output's script (dcrd `txValidateItem`).
+struct ValidateItem<'a> {
+    tx: &'a dcroxide_wire::MsgTx,
+    tx_in_idx: usize,
+    pk_script: &'a [u8],
+    script_version: u16,
+}
+
+/// Validate one item (the body of dcrd's `validateHandler` loop).
+fn validate_item(
+    item: &ValidateItem<'_>,
+    script_flags: dcroxide_txscript::ScriptFlags,
+) -> Result<(), RuleError> {
+    let tx_in_idx = item.tx_in_idx;
+    let mut engine = dcroxide_txscript::Engine::new(
+        item.pk_script,
+        item.tx,
+        tx_in_idx,
+        script_flags,
+        item.script_version,
+    )
+    .map_err(|e| {
+        rule_error(
+            RuleErrorKind::ScriptValidation,
+            format!("failed to create script engine: {e:?}"),
+        )
+    })?;
+    engine.execute().map_err(|e| {
+        rule_error(
+            RuleErrorKind::ScriptValidation,
+            format!(
+                "failed to validate input {}:{tx_in_idx}: {e:?}",
+                item.tx.tx_hash()
+            ),
+        )
+    })
+}
+
+/// Validate the items across a worker pool sized like dcrd's
+/// (`runtime.NumCPU()*3` capped at the item count), cancelling the
+/// remaining work on the first failure.  Small batches run inline —
+/// the thread spawn costs more than the scripts (a scheduling-only
+/// difference; dcrd's goroutines are cheap enough not to care).
+/// When several items are invalid, which failure surfaces depends on
+/// scheduling, exactly like dcrd's first-off-the-channel error.
+/// Threads need the standard library: without the `std` feature this
+/// crate is `no_std` and the serial fallback below runs instead.
+#[cfg(any(test, feature = "std"))]
+fn validate_items(
+    items: &[ValidateItem<'_>],
+    script_flags: dcroxide_txscript::ScriptFlags,
+) -> Result<(), RuleError> {
+    const MIN_PARALLEL_ITEMS: usize = 16;
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let workers = cores.saturating_mul(3).min(items.len());
+    if items.len() < MIN_PARALLEL_ITEMS || workers <= 1 {
+        for item in items {
+            validate_item(item, script_flags)?;
+        }
+        return Ok(());
+    }
+
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let failure: std::sync::Mutex<Option<RuleError>> = std::sync::Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    if failed.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else {
+                        return;
+                    };
+                    if let Err(e) = validate_item(item, script_flags) {
+                        failed.store(true, Ordering::Relaxed);
+                        let mut slot = failure.lock().expect("failure slot poisoned");
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    match failure.into_inner().expect("failure slot poisoned") {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// The `no_std` fallback: every item validates inline on the calling
+/// thread (the behavior before the worker pool, byte-identical
+/// results).
+#[cfg(not(any(test, feature = "std")))]
+fn validate_items(
+    items: &[ValidateItem<'_>],
+    script_flags: dcroxide_txscript::ScriptFlags,
+) -> Result<(), RuleError> {
+    for item in items {
+        validate_item(item, script_flags)?;
+    }
+    Ok(())
+}
+
 /// Validate every script in one of the block's transaction trees
-/// against the utxo view (dcrd `checkBlockScripts`, executed
-/// sequentially; dcrd's signature cache is a result-invariant
-/// memoization and is not reproduced).
+/// against the utxo view (dcrd `checkBlockScripts`: the items collect
+/// up front and validate across the worker pool; dcrd's signature
+/// cache is a result-invariant memoization and is not reproduced).
 pub fn check_block_scripts(
     block: &MsgBlock,
     view: &crate::utxoview::UtxoView,
@@ -4401,6 +4513,7 @@ pub fn check_block_scripts(
     } else {
         &block.stransactions
     };
+    let mut items = Vec::new();
     for tx in txs {
         // Skip version 2+ revocations under the automatic revocations
         // agenda since consensus already enforces their outputs.
@@ -4427,28 +4540,15 @@ pub fn check_block_scripts(
                     ),
                 ));
             };
-            let pk_script = entry.pk_script().to_vec();
-            let version = entry.script_version();
-            let mut engine =
-                dcroxide_txscript::Engine::new(&pk_script, tx, tx_in_idx, script_flags, version)
-                    .map_err(|e| {
-                        rule_error(
-                            RuleErrorKind::ScriptValidation,
-                            format!("failed to create script engine: {e:?}"),
-                        )
-                    })?;
-            engine.execute().map_err(|e| {
-                rule_error(
-                    RuleErrorKind::ScriptValidation,
-                    format!(
-                        "failed to validate input {}:{tx_in_idx}: {e:?}",
-                        tx.tx_hash()
-                    ),
-                )
-            })?;
+            items.push(ValidateItem {
+                tx,
+                tx_in_idx,
+                pk_script: entry.pk_script(),
+                script_version: entry.script_version(),
+            });
         }
     }
-    Ok(())
+    validate_items(&items, script_flags)
 }
 
 /// Perform the final battery of checks needed to connect the block to

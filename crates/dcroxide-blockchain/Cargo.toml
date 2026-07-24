@@ -8,6 +8,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Enables the threaded script-validation worker pool (the crate is
+# no_std without it; results are identical either way).
+std = []
+
 [dependencies]
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-database = { path = "../dcroxide-database" }

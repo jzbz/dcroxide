@@ -12,7 +12,7 @@
 //! extracted mechanically from the Go test sources, plus round-trip
 //! property tests.
 
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![forbid(unsafe_code)]
 // The consensus serialization formats ported here rely on Go's
 // fixed-width integer semantics over bounded inputs.
