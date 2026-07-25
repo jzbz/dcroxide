@@ -127,6 +127,46 @@ fn write_owner_only_hooked(
     file.flush()
 }
 
+/// Create `path` with an explicit mode and fill it with `contents`,
+/// truncating any existing file.
+///
+/// For the files that are meant to be readable — the RPC certificate is
+/// the only one — where dcrd still names a mode rather than letting the
+/// umask decide.  `std::fs::write` asks for 0666, so under a permissive
+/// umask it produces a group- and world-WRITABLE file where dcrd's
+/// `os.WriteFile(certFile, cert, 0644)` does not.  For the certificate
+/// that is an integrity question rather than a confidentiality one:
+/// anyone who can write it can swap the identity the node serves.
+///
+/// Like `open(2)`, the mode applies only when the file is created, and it
+/// is still masked by the umask; this narrows the request to dcrd's,
+/// it does not widen anything.  A pre-existing file keeps its own mode —
+/// see [`write_owner_only`] for the secret-bearing case, which does not
+/// leave that to chance.
+#[cfg(unix)]
+pub fn write_with_mode(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.flush()
+}
+
+/// Create `path` and fill it with `contents`.  Off Unix there is no mode
+/// to apply, so this is plain `std::fs::write` — what `os.WriteFile`
+/// reduces to on those platforms.
+#[cfg(not(unix))]
+pub fn write_with_mode(path: &Path, contents: &[u8], _mode: u32) -> std::io::Result<()> {
+    std::fs::write(path, contents)
+}
+
 /// Create `path` and any missing parents, with every directory this
 /// call creates reachable only by its owner (dcrd's
 /// `os.MkdirAll(dir, 0700)`).

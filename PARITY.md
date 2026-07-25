@@ -119,6 +119,41 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   already merged away, and those bytes stay allocated until the reader drops
   — uncounted, because they belong to a transaction's lifetime rather than
   the overlay's, which is where dcrd's accounting draws the same line.
+- **The RPC read is sliced for the same reason the peer read is.** dcrd's
+  handlers are goroutines, so closing a connection makes the handler's `Read`
+  return on any platform; the port's handlers are OS threads, and the
+  pre-authentication pool's eviction depends on a victim's handler noticing the
+  socket shut down under it and releasing its slot. A receive armed with the
+  whole remaining budget does not come back when another thread shuts the socket
+  down mid-flight under Winsock, so a victim slept out the ten-second
+  authentication timeout, its entry stayed counted, the pool pinned at its
+  ceiling, and every later arrival — an operator's `dcrctl` included — was
+  refused with no reply. The receives are now issued in one-second slices, which
+  is enough: only the receive already in flight survives the shutdown, and the
+  next one fails. The ceiling still caps the pool, deliberately — an evicted
+  entry holds its handler thread until that handler returns, so admitting past
+  the ceiling on the strength of an eviction would let the thread count climb
+  without bound, which is the exhaustion the budget exists to prevent. As on the
+  peer side, a slice elapsing is not a timeout: `WouldBlock`/`TimedOut`
+  continues, because otherwise any client that paused mid-request would be cut
+  off. Pinned by `a_client_that_pauses_mid_request_is_still_served`, verified to
+  fail when that arm is removed.
+- **A half-present RPC cert pair is not regenerated.** dcrd guards `genCertPair`
+  with `!keyFileExists && !certFileExists` (`server.go` 3846), so with one file
+  present it generates nothing and startup fails on the missing one. The port
+  regenerated whenever either file was missing, which silently destroyed a
+  private key an operator may have provisioned — on a path where nothing in the
+  request said "replace my key". It now matches dcrd: both-absent to generate,
+  otherwise an error naming the missing half with the surviving file untouched.
+  Relatedly, neither dcrd nor the port inspects the mode of a file it did not
+  create — dcrd contains no `Chmod`, `FileMode`, or `Mode()` call anywhere — so a
+  key left group-readable by an earlier install stays that way and is the
+  operator's to fix; tightening it would diverge for no gain against a threat
+  model in which a local user who can read the datadir can read the key
+  regardless. The certificate is written with an explicit 0644 (dcrd's mode)
+  rather than `std::fs::write`'s 0666, which under a permissive umask would
+  leave it group- and world-writable — an integrity question, since anyone able
+  to write it can swap the identity the node serves.
 - **Peer teardown polls a flag where dcrd closes the connection.** dcrd ends a
   peer by calling `Disconnect`, which closes the `net.Conn`; Go's runtime makes a
   goroutine blocked in `Read` return on every platform, so the connection's
