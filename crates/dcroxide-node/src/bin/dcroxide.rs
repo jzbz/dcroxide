@@ -178,6 +178,14 @@ fn run(cfg: Config) -> ExitCode {
         version::version_string(),
         std::env::consts::OS
     ));
+    // The zone every timestamp in this log is rendered in.  It is fixed
+    // for the life of the process (see `logging::local_offset`), so saying
+    // it once means a reader never has to infer it — and would have made
+    // the mixed-zone bug this replaced obvious on sight.
+    log_info(&format!(
+        "Log timestamps are UTC{}",
+        dcroxide_node::logging::local_offset_label()
+    ));
     log_info(&format!("Home dir: {}", cfg.home_dir));
     if cfg.no_file_logging {
         log_info("File logging disabled");

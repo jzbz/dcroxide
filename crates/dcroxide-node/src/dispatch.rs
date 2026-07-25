@@ -1605,6 +1605,21 @@ impl ServerPeerHandler {
             Some(self.remote_addr.clone()),
             Some(Arc::clone(&self.addr_state.ban_score)),
         );
+        // dcrd `handleAddPeerMsg`: `srvrLog.Infof("New valid peer %s
+        // (%s)", sp, sp.UserAgent())`, immediately before signalling the
+        // sync manager.  The port had no peer-lifecycle logging at all, so
+        // a twenty-hour mainnet run produced zero lines about which peers
+        // it was talking to — when a sync stalled there was no way to tell
+        // from the log whether peers had been lost or were merely quiet,
+        // and I misdiagnosed exactly that.
+        crate::logging::info(
+            "SRVR",
+            &format!(
+                "New valid peer {} ({})",
+                self.remote_addr,
+                peer.user_agent()
+            ),
+        );
         let actions = {
             let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
             manager.on_peer_connected(dcroxide_netsync::manager::Peer::new(
@@ -1623,6 +1638,11 @@ impl ServerPeerHandler {
     /// the re-request and sync-peer handoff actions it decides (dcrd
     /// `DonePeer` signalling `OnPeerDisconnected`).
     pub fn on_disconnected(&mut self, _peer: &mut Peer) {
+        // dcrd `handleDonePeerMsg`: `srvrLog.Debugf("Removed peer %s",
+        // sp)` — debug, not info, so a churning network does not flood
+        // the log at the default level.
+        crate::logging::debug("SRVR", &format!("Removed peer {}", self.remote_addr));
+
         // Stop the serve worker before anything else: the caller joins
         // the peer's output loop right after this returns and the
         // worker holds one of that queue's senders.
