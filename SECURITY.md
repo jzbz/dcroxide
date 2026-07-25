@@ -72,6 +72,19 @@ code:
   loud beats the previous behaviour, where a poisoned lock wedged the node
   while the RPC layer's `catch_unwind` kept it answering canned errors and
   looking healthy.
+- **A websocket client that stops reading grows node memory without
+  bound.** The notification queues are unbounded, exactly as dcrd's are,
+  so nothing is ever dropped and nothing is reordered — the whole cost of
+  a slow or stalled subscriber is paid in node memory. Since RPC access
+  requires credentials this is not reachable unauthenticated, and adding
+  a cap would diverge from dcrd while cutting off honest clients on slow
+  links, so it stays. Operators running many subscribers, or exposing the
+  websocket to clients they do not control, should bound the process
+  (a memory limit plus a supervisor) rather than expect the node to shed.
+  One port-specific amplifier: a single long request — a
+  multi-thousand-block `rescan` — holds the server lock for its duration
+  and stalls notification construction for every other client, where
+  dcrd's handlers hold no server-wide lock.
 - **No fuzzing or sanitizer coverage in CI** beyond the targeted
   `cargo-fuzz` corpora committed for the wire and script codecs.
 - **The dependency set has not been audited** (no `cargo audit` /

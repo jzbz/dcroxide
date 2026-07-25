@@ -119,6 +119,34 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   already merged away, and those bytes stay allocated until the reader drops
   — uncounted, because they belong to a transaction's lifetime rather than
   the overlay's, which is where dcrd's accounting draws the same line.
+- **The websocket notification pipeline is unbounded, as dcrd's is.** Two
+  accumulators sit between a chain event and a client's socket: the manager's
+  `std::sync::mpsc::channel()` (`websocket.rs` 146) and the per-client
+  `VecDeque<String>` (`websocket.rs` 90), plus four `Vec` staging queues in the
+  chain callback (`chainntfns.rs` 72-83), which only queues because it runs
+  inside the chain's critical section. dcrd is unbounded in the same two places
+  — the manager's `q []any` slice behind `queueHandler`'s select loop and each
+  client's `pendingNtfns [][]byte` behind `notificationQueueHandler` — with no
+  drop policy, no slow-client disconnect, and no write deadline on the data-frame
+  write. So a client that stops reading grows node memory in both
+  implementations; the cost of a slow reader is borne by the node, and no
+  notification is ever dropped or reordered. Capping it with drops or a
+  slowness disconnect was considered and rejected: it would diverge from dcrd
+  *and* punish an honest client on a slow link, which is the failure mode this
+  campaign kept finding. dcrd does know the pattern — its mining-template feed is
+  a bounded channel with an explicit drop policy — and deliberately does not
+  apply it here.
+
+  Where the port is **stronger** than dcrd: a stalled client cannot block writes
+  to other clients (each writes on its own thread holding no shared lock, and the
+  outbound mutex is released before the write), and cannot block the
+  chain-notification callback, so it cannot stall block processing — dcrd's
+  single fan-out goroutine head-of-line blocks every client behind one stalled
+  TCP peer. Where the port is **weaker**: the single
+  `Arc<Mutex<Server<NodeRpcChain>>>` is held for the whole of any one client's
+  request, so a multi-thousand-block `rescan` stalls notification *construction*
+  for every other client; dcrd's handlers hold no server-wide lock. That coupling
+  is the part still worth addressing, and it is tracked rather than papered over.
 - **The RPC read is sliced for the same reason the peer read is.** dcrd's
   handlers are goroutines, so closing a connection makes the handler's `Read`
   return on any platform; the port's handlers are OS threads, and the
