@@ -478,6 +478,7 @@ fn mining_network_mix_handler_slice_matches_dcrd() {
                 accept: err_or(mock[13]),
             }),
             conn_mgr: Box::new(MockConnMgr9),
+            client_cert_auth: false,
             tx_mempooler: Box::new(MockMempool9 {
                 count: mock[10].parse().unwrap(),
             }),

@@ -384,6 +384,7 @@ fn fee_and_node_info_handler_slice_matches_dcrd() {
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(()),
             conn_mgr: Box::new(MockConnMgr8),
+            client_cert_auth: false,
             tx_mempooler: Box::new(MockMempool8 { descs }),
             clock: Box::new(()),
             interfaces: Box::new(NoInterfaces),

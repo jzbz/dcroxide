@@ -172,6 +172,7 @@ fn serve_txindex_rpc(
             ConnectedPeers::new(),
             Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         )),
+        client_cert_auth: false,
         tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(
             Arc::clone(&tx_pool),
         )),

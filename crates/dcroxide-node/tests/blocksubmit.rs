@@ -265,6 +265,7 @@ fn submitblock_over_http_accepts_then_rejects_duplicate() {
             ConnectedPeers::new(),
             Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         )),
+        client_cert_auth: false,
         tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(
             Arc::clone(&tx_pool),
         )),

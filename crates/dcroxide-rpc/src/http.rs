@@ -92,10 +92,17 @@ impl<C: RpcChain> Server<C> {
         auth_header: Option<&str>,
         require: bool,
     ) -> Result<(bool, bool), String> {
-        // If no RPC credentials are set this always succeeds (TLS
-        // client certificates are being used for authentication).
+        // With no Basic credentials configured, authentication rests
+        // entirely on the TLS layer having required and verified a
+        // client certificate (dcrd's `--authtype=clientcert`).  If the
+        // transport does not enforce that, deny: an endpoint with no
+        // credentials and no client verification must never be served
+        // as an authenticated admin.
         if self.authsha == [0u8; 32] && self.limitauthsha == [0u8; 32] {
-            return Ok((true, true));
+            if self.cfg.client_cert_auth {
+                return Ok((true, true));
+            }
+            return Err("auth failure".to_string());
         }
 
         let Some(auth) = auth_header else {
@@ -115,6 +122,7 @@ impl<C: RpcChain> Server<C> {
 
 /// A JSON-RPC request unmarshalled from a raw body exactly like Go's
 /// `json.Unmarshal` into `dcrjson.Request`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct RawRequest {
     /// The JSON-RPC protocol version.
     pub jsonrpc: String,
@@ -342,7 +350,25 @@ pub fn unmarshal_request(body: &str) -> Result<RawRequest, String> {
                 Some(b't') | Some(b'f') => RpcId::Invalid("bool".to_string()),
                 Some(b'[') => RpcId::Invalid("[]interface {}".to_string()),
                 Some(b'{') => RpcId::Invalid("map[string]interface {}".to_string()),
-                _ => RpcId::Float(raw.trim().parse().unwrap_or(0.0)),
+                _ => {
+                    // Go's `convertNumber` runs the literal through
+                    // `strconv.ParseFloat`, which reports `ErrRange`
+                    // for a magnitude past float64 and makes the whole
+                    // unmarshal fail.  Rust's `f64::from_str` instead
+                    // returns `Ok(inf)`, so reject the non-finite
+                    // results here; an id of `1e999` must be a parse
+                    // error, never an infinite float that later
+                    // marshalling has no way to render.
+                    let literal = raw.trim();
+                    let value: f64 = literal.parse().unwrap_or(0.0);
+                    if !value.is_finite() {
+                        return Err(format!(
+                            "json: cannot unmarshal number {literal} into Go struct field \
+                             Request.id of type float64"
+                        ));
+                    }
+                    RpcId::Float(value)
+                }
             };
         }
     }
@@ -473,4 +499,76 @@ pub fn process_body<C: RpcChain>(server: &mut Server<C>, body: &str, is_admin: b
     // Core.
     msg.push(b'\n');
     msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Go's `convertNumber` runs an `interface{}` id through
+    /// `strconv.ParseFloat`, which reports `ErrRange` for a magnitude
+    /// past `float64` and fails the whole unmarshal.  Rust's
+    /// `f64::from_str` instead returns `Ok(inf)`, which used to become
+    /// an `RpcId::Float(inf)` that no formatter could render — a panic
+    /// reachable by any credential, limited included.  The id must be
+    /// rejected here with Go's exact text instead.
+    #[test]
+    fn an_out_of_range_id_is_a_parse_error_with_gos_text() {
+        for (body, literal) in [
+            (
+                r#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1e999}"#,
+                "1e999",
+            ),
+            (
+                r#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":-1e999}"#,
+                "-1e999",
+            ),
+            (r#"{"id":1e309}"#, "1e309"),
+            (
+                r#"{"id":  1.7976931348623159e308  }"#,
+                "1.7976931348623159e308",
+            ),
+        ] {
+            let err = unmarshal_request(body).expect_err("an infinite id must be rejected");
+            assert_eq!(
+                err,
+                format!(
+                    "json: cannot unmarshal number {literal} into Go struct field Request.id of \
+                     type float64"
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    /// Only the out-of-range ids are refused: everything Go accepts as
+    /// an id still parses to the same value, including underflow to
+    /// zero, which Go's `ParseFloat` reports no error for.
+    #[test]
+    fn in_range_ids_are_unchanged() {
+        let cases: [(&str, RpcId); 6] = [
+            (r#"{"id":1}"#, RpcId::Float(1.0)),
+            (r#"{"id":-2.5}"#, RpcId::Float(-2.5)),
+            (r#"{"id":1e308}"#, RpcId::Float(1e308)),
+            (r#"{"id":1e-999}"#, RpcId::Float(0.0)),
+            (r#"{"id":"abc"}"#, RpcId::Str("abc".to_string())),
+            (r#"{"id":null}"#, RpcId::Null),
+        ];
+        for (body, want) in cases {
+            let req = unmarshal_request(body).expect("a valid id");
+            assert_eq!(req.id, want, "{body}");
+        }
+    }
+
+    /// The first error in document order wins, as it does in Go, where
+    /// `saveError` keeps only the earliest.
+    #[test]
+    fn an_earlier_field_error_still_wins_over_the_id() {
+        let err = unmarshal_request(r#"{"method":5,"id":1e999}"#)
+            .expect_err("the method type error comes first");
+        assert_eq!(
+            err,
+            "json: cannot unmarshal number into Go struct field Request.method of type string"
+        );
+    }
 }

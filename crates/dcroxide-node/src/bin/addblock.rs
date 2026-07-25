@@ -42,7 +42,12 @@ fn load_block_db(cfg: &AddblockConfig, net: u32) -> Result<Database, String> {
     let db = match Database::open(&opts) {
         Ok(db) => db,
         Err(e) if e.kind == ErrorKind::DbDoesNotExist => {
-            std::fs::create_dir_all(&db_path)
+            // dcrd's addblock creates the data directory owner-only
+            // (`os.MkdirAll(cfg.DataDir, 0700)`, `cmd/addblock/addblock.go`
+            // 48), and ffldb then makes the database directory beneath
+            // it 0700 as well; `std::fs::create_dir_all` would leave
+            // both 0755 under the usual umask.
+            dcroxide_database::create_dir_all_owner_only(&db_path)
                 .map_err(|e| format!("unable to create database directory: {e}"))?;
             Database::create(&opts).map_err(|e| e.to_string())?
         }
@@ -176,5 +181,50 @@ fn real_main() -> Result<(), ()> {
 fn main() {
     if real_main().is_err() {
         std::process::exit(1);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// dcrd's addblock makes the data directory with
+    /// `os.MkdirAll(cfg.DataDir, 0700)` before `database.Create`, so
+    /// importing into a `--datadir` on a shared path does not leave a
+    /// tree every local user can walk.
+    #[test]
+    fn the_created_data_directory_is_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data").join("mainnet");
+        let cfg = AddblockConfig {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            db_type: "redb".to_string(),
+            test_net: false,
+            sim_net: false,
+            in_file: "bootstrap.dat".to_string(),
+            no_exists_addr_index: false,
+            tx_index: false,
+            progress: 10,
+        };
+
+        let db = load_block_db(&cfg, 0x0709_1101).unwrap();
+        db.close().unwrap();
+
+        let db_path = data_dir.join("blocks_redb");
+        assert_eq!(
+            mode_of(&db_path),
+            0o700,
+            "the block database directory must be owner-only"
+        );
+        assert_eq!(
+            mode_of(&data_dir),
+            0o700,
+            "the data directory addblock creates must be owner-only"
+        );
     }
 }

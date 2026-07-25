@@ -394,6 +394,7 @@ fn mempool_conn_handler_slice_matches_dcrd() {
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(()),
             conn_mgr: Box::new(conn_mgr),
+            client_cert_auth: false,
             tx_mempooler: Box::new(mempooler),
             clock: Box::new(MockClock(mock[5].parse().unwrap())),
             interfaces: Box::new(NoInterfaces),

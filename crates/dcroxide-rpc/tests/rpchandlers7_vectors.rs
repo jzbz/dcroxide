@@ -355,6 +355,7 @@ fn submission_handler_slice_matches_dcrd() {
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(sync_mgr),
             conn_mgr: Box::new(MockConnMgr7),
+            client_cert_auth: false,
             tx_mempooler: Box::new(()),
             clock: Box::new(()),
             interfaces: Box::new(NoInterfaces),

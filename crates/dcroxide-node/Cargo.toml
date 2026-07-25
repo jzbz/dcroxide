@@ -50,7 +50,17 @@ dcroxide-peer = { path = "../dcroxide-peer" }
 dcroxide-rpc = { path = "../dcroxide-rpc" }
 dcroxide-txscript = { path = "../dcroxide-txscript" }
 dcroxide-wire = { path = "../dcroxide-wire" }
-rustls = { version = "0.23", features = ["ring"] }
+# Only the ring provider is used (see rpcrun::tls_server_config).
+# Default features would also pull aws-lc-rs, compiling a 68 MB
+# C/assembly crypto library into a workspace that otherwise forbids
+# unsafe code, and leaving two providers registered so rustls cannot
+# pick one without an explicit install_default().
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
 sha1 = { version = "0.10.6", default-features = false }
 rustls-pki-types = "1"
 ureq = "3"

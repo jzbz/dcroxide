@@ -471,6 +471,7 @@ fn chain_query_handler_slice_matches_dcrd() {
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(MockSyncManager(mock[14].parse().unwrap())),
             conn_mgr: Box::new(()),
+            client_cert_auth: false,
             tx_mempooler: Box::new(()),
             clock: Box::new(()),
             interfaces: Box::new(dcroxide_rpc::helpers::NoInterfaces),

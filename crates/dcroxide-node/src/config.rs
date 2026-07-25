@@ -1262,9 +1262,11 @@ pub fn create_default_config_file(
     auth_type: &str,
     rand_bytes: &dyn Fn(&mut [u8]),
 ) -> Result<(), String> {
-    // Create the destination directory if it does not exist.
+    // Create the destination directory if it does not exist.  dcrd
+    // uses `os.MkdirAll(dir, 0700)` here because the file about to be
+    // written carries the generated RPC password.
     if let Some(parent) = std::path::Path::new(dest_path).parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        crate::secretfile::create_dir_all_owner_only(parent).map_err(|e| e.to_string())?;
     }
 
     let mut cfg = sample_dcrd_conf().to_string();
@@ -1292,7 +1294,13 @@ pub fn create_default_config_file(
         cfg = lines.join("\n");
     }
 
-    fs::write(dest_path, cfg).map_err(|e| e.to_string())
+    // dcrd creates the file with mode 0600 (`os.OpenFile` with
+    // `O_RDWR|O_CREATE|O_TRUNC`): under basic auth it holds the
+    // generated `rpcpass`, so it must never be readable by other local
+    // users, including for the instant a write-then-chmod would leave
+    // it exposed.
+    crate::secretfile::write_owner_only(std::path::Path::new(dest_path), cfg.as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 /// Convert a floating point DCR amount to atoms (dcrd
@@ -1568,8 +1576,12 @@ fn load_config_impl(
         }
     };
 
-    // Create the home directory if it doesn't already exist.
-    if let Err(e) = fs::create_dir_all(&cfg.home_dir) {
+    // Create the home directory if it doesn't already exist.  dcrd
+    // uses `os.MkdirAll(cfg.HomeDir, 0700)`: the tree holds the RPC
+    // key, the config file and the address manager state.
+    if let Err(e) =
+        crate::secretfile::create_dir_all_owner_only(std::path::Path::new(&cfg.home_dir))
+    {
         return Err(format!("{func_name}: failed to create home directory: {e}"));
     }
 
@@ -1804,6 +1816,17 @@ fn load_config_impl(
     {
         return Err(format!(
             "{func_name}: RPC usernames and passwords are not allowed with --authtype=clientcert"
+        ));
+    }
+
+    // Client certificate authentication is meaningless without the
+    // certificate authorities used to verify the client chain, and
+    // dcrd fails startup when the file is missing or holds no
+    // certificate.  Reject the empty path here so the endpoint can
+    // never come up unauthenticated.
+    if cfg.rpc_auth_type == AUTH_TYPE_CLIENT_CERT && cfg.rpc_client_cas.is_empty() {
+        return Err(format!(
+            "{func_name}: --authtype=clientcert requires --clientcafile"
         ));
     }
 

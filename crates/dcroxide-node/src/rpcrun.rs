@@ -33,6 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+pub use crate::socktimeout::SocketTimeout;
+
 use dcroxide_addrmgr::AddrManager;
 use dcroxide_blockchain::RuleErrorKind;
 use dcroxide_blockchain::process::Chain;
@@ -983,12 +985,30 @@ pub struct RpcListener {
     threads: Vec<JoinHandle<()>>,
     bound: Vec<SocketAddr>,
     handlers: HandlerGroup,
+    pre_auth: Arc<PreAuthGate>,
 }
 
 impl RpcListener {
     /// The addresses the listener is serving on.
     pub fn bound_addrs(&self) -> &[SocketAddr] {
         &self.bound
+    }
+
+    /// How many connections are in the pre-authentication phase right
+    /// now — accepted, but not yet authenticated (or upgraded to a
+    /// websocket) — counted across every listen address, since the
+    /// budget is one process-wide pool rather than one per accept loop.
+    /// Exposed for diagnostics and for the tests that pin the bound.
+    pub fn pre_auth_connections(&self) -> usize {
+        self.pre_auth.live()
+    }
+
+    /// The pre-authentication budget: the nominal number of such
+    /// connections, past which admitting a new one disconnects the
+    /// oldest, and the absolute ceiling past which a new connection is
+    /// refused outright.  See [`PreAuthGate`].
+    pub fn pre_auth_budget(&self) -> (usize, usize) {
+        (self.pre_auth.soft, self.pre_auth.hard)
     }
 
     /// Signal the accept threads to stop, join them, then drain the
@@ -1156,9 +1176,18 @@ pub enum RpcTransport {
 
 /// Build the rustls server configuration from the PEM certificate
 /// pair (dcrd loading `rpc.cert`/`rpc.key` into its `tls.Config`).
+///
+/// `client_cas_pem` carries the contents of `--clientcafile` and is
+/// supplied only under `--authtype=clientcert`, exactly like dcrd's
+/// `newTLSConfig`, which passes an empty path for every other auth
+/// type.  When present the listener demands and verifies a client
+/// certificate chaining to those roots, and a file holding no usable
+/// certificate is a hard startup error rather than a silently
+/// unauthenticated endpoint.
 pub fn tls_server_config(
     cert_pem: &[u8],
     key_pem: &[u8],
+    client_cas_pem: Option<&[u8]>,
 ) -> Result<Arc<rustls::ServerConfig>, String> {
     use rustls::pki_types::pem::PemObject;
     // Pin the process-level crypto provider: both bundled providers
@@ -1170,8 +1199,29 @@ pub fn tls_server_config(
         .map_err(|e| format!("unable to parse the RPC certificate: {e}"))?;
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem)
         .map_err(|e| format!("unable to parse the RPC key: {e}"))?;
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
+
+    let builder = match client_cas_pem {
+        Some(cas_pem) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in rustls::pki_types::CertificateDer::pem_slice_iter(cas_pem) {
+                let cert = cert.map_err(|e| {
+                    format!("unable to parse the RPC client certificate authorities: {e}")
+                })?;
+                roots.add(cert).map_err(|e| {
+                    format!("unable to add an RPC client certificate authority: {e}")
+                })?;
+            }
+            if roots.is_empty() {
+                return Err("no certificates found in the client CA file".to_string());
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| format!("unable to build the RPC client verifier: {e}"))?;
+            rustls::ServerConfig::builder().with_client_cert_verifier(verifier)
+        }
+        None => rustls::ServerConfig::builder().with_no_client_auth(),
+    };
+    let config = builder
         .with_single_cert(certs, key)
         .map_err(|e| format!("unable to build the RPC TLS configuration: {e}"))?;
     Ok(Arc::new(config))
@@ -1254,15 +1304,19 @@ pub fn load_or_generate_cert_pair(
     )?;
 
     if let Some(parent) = cert_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = crate::secretfile::create_dir_all_owner_only(parent);
     }
+    // The certificate is public (dcrd writes it 0644); the key is not,
+    // so it is created 0600 rather than written world-readable and
+    // chmod'ed afterwards.  A failure to place the key owner-only is
+    // fatal: continuing would serve RPC with a private key any local
+    // user could read.  dcrd removes the certificate when the key
+    // cannot be written so the next start regenerates a matching pair.
     std::fs::write(cert_path, &pair.cert)
         .map_err(|e| format!("unable to write the RPC certificate: {e}"))?;
-    std::fs::write(key_path, &pair.key).map_err(|e| format!("unable to write the RPC key: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600));
+    if let Err(e) = crate::secretfile::write_owner_only(key_path, &pair.key) {
+        let _ = std::fs::remove_file(cert_path);
+        return Err(format!("unable to write the RPC key: {e}"));
     }
     Ok((pair.cert, pair.key))
 }
@@ -1282,6 +1336,13 @@ pub fn start_rpc_listener(
     // thread so the cap bounds the whole RPC server (dcrd's single
     // `numClients` atomic).
     let num_clients = Arc::new(AtomicI32::new(0));
+    // The pre-authentication admission pool, shared across every
+    // listener thread for exactly the reason `num_clients` is: the
+    // default `rpclisten` expands to every localhost lookup result
+    // (typically 127.0.0.1 and ::1), and each extra `--rpclisten` adds
+    // another accept loop, so a per-loop pool would multiply the bound
+    // by the number of listen addresses.
+    let pre_auth = Arc::new(PreAuthGate::new(max_clients));
     let handlers = HandlerGroup::default();
     let mut threads = Vec::with_capacity(listeners.len());
     let mut bound = Vec::with_capacity(listeners.len());
@@ -1297,6 +1358,7 @@ pub fn start_rpc_listener(
         let ntfn = ntfn.clone();
         let num_clients = Arc::clone(&num_clients);
         let handlers = handlers.clone();
+        let pre_auth = Arc::clone(&pre_auth);
         threads.push(thread::spawn(move || {
             accept_loop(
                 &listener,
@@ -1307,6 +1369,7 @@ pub fn start_rpc_listener(
                 max_clients,
                 &num_clients,
                 &handlers,
+                &pre_auth,
             );
         }));
     }
@@ -1316,7 +1379,322 @@ pub fn start_rpc_listener(
         threads,
         bound,
         handlers,
+        pre_auth,
     })
+}
+
+/// The subsystem tag the RPC server logs under (dcrd's `RPCS`).
+const RPC_LOG_SUBSYSTEM: &str = "RPCS";
+
+/// How many OS threads one connection costs while it is still in the
+/// pre-authentication phase: the connection handler itself, plus the
+/// [`arm_handshake_watchdog`] thread that bounds its request read.  The
+/// watchdog stands down (and its thread exits) as soon as the request
+/// head is read, so past that point a connection costs one thread.
+const THREADS_PER_PRE_AUTH_CONNECTION: usize = 2;
+
+/// The absolute ceiling on OS threads the listener dedicates to
+/// connections that have not yet completed a request — process-wide,
+/// every `--rpclisten` address together, not per accept loop.
+const MAX_PRE_AUTH_THREADS: usize = 512;
+
+/// The pre-authentication connection budget for a configured client
+/// cap: the nominal number of such connections, and the absolute
+/// admission ceiling above it.
+///
+/// dcrd answers 503 from inside the handler, after the TLS handshake
+/// and the request read, because there the handler is a goroutine
+/// costing a few KiB.  Here it is an OS thread with a multi-megabyte
+/// stack, so accepting without a bound lets connections that never get
+/// past the handshake spawn a thread apiece — the 503 that was meant to
+/// shed them never runs.
+///
+/// The budget therefore covers only the pre-authentication phase.  It
+/// scales with the configured cap so a large `rpcmaxclients` gets
+/// proportional handshake room, with a floor that keeps the phase
+/// usable at dcrd's tiny defaults, and a roof set by the thread
+/// ceiling: `hard * THREADS_PER_PRE_AUTH_CONNECTION` never exceeds
+/// [`MAX_PRE_AUTH_THREADS`], which is what the bound actually spends.
+fn pre_auth_budget(max_clients: usize) -> (usize, usize) {
+    /// The smallest nominal budget: dcrd's default `rpcmaxclients` is
+    /// 10, and a handshake phase that short would shed on ordinary
+    /// bursts of legitimate clients.
+    const MIN_PRE_AUTH_CONNECTIONS: usize = 32;
+    // The reserve above the nominal budget absorbs evicted handlers
+    // that have not finished unwinding yet, so the nominal budget stays
+    // available to arriving connections during a flood.
+    const RESERVE_MULTIPLIER: usize = 2;
+    let hard_roof = MAX_PRE_AUTH_THREADS / THREADS_PER_PRE_AUTH_CONNECTION;
+    let soft = max_clients
+        .saturating_add(8)
+        .clamp(MIN_PRE_AUTH_CONNECTIONS, hard_roof / RESERVE_MULTIPLIER);
+    (soft, soft.saturating_mul(RESERVE_MULTIPLIER).min(hard_roof))
+}
+
+/// How long a shed reason waits before logging again, so an accept
+/// flood cannot become a log flood.
+const SHED_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A log line emitted at most once per [`SHED_LOG_INTERVAL`], carrying
+/// how many identical events were suppressed since the previous line.
+struct RateLimitedLog {
+    /// When a line was last emitted; `None` before the first one.
+    last: Option<Instant>,
+    /// Occurrences since that line which were not logged.
+    suppressed: u64,
+}
+
+impl RateLimitedLog {
+    /// A limiter that has never emitted, so the first event logs.
+    const fn new() -> RateLimitedLog {
+        RateLimitedLog {
+            last: None,
+            suppressed: 0,
+        }
+    }
+
+    /// Record one occurrence at `now`; `Some(n)` when a line is due,
+    /// where `n` is how many occurrences were suppressed since the
+    /// previous line (zero in the common unflooded case, which keeps
+    /// the message text dcrd-exact).
+    fn record(&mut self, interval: Duration, now: Instant) -> Option<u64> {
+        let due = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= interval);
+        if !due {
+            self.suppressed = self.suppressed.saturating_add(1);
+            return None;
+        }
+        self.last = Some(now);
+        let suppressed = self.suppressed;
+        self.suppressed = 0;
+        Some(suppressed)
+    }
+}
+
+/// The rate limiter for the standard-client cap's shed line (dcrd's
+/// `Max RPC clients exceeded`), which sits on an unauthenticated path
+/// and so must not be loggable at an attacker's rate.
+static MAX_CLIENTS_LOG: Mutex<RateLimitedLog> = Mutex::new(RateLimitedLog::new());
+
+/// The rate limiter for the pre-authentication eviction line.
+static PRE_AUTH_EVICT_LOG: Mutex<RateLimitedLog> = Mutex::new(RateLimitedLog::new());
+
+/// The rate limiter for the pre-authentication refusal line.
+static PRE_AUTH_REFUSE_LOG: Mutex<RateLimitedLog> = Mutex::new(RateLimitedLog::new());
+
+/// The line to log for one shed event, or `None` when the limiter is
+/// still inside its interval.  The suppressed count is appended only
+/// when events were actually dropped, so an unflooded server logs the
+/// message verbatim — which is what keeps dcrd's own shed text exact.
+fn shed_line(
+    limiter: &Mutex<RateLimitedLog>,
+    message: &str,
+    interval: Duration,
+    now: Instant,
+) -> Option<String> {
+    let suppressed = limiter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record(interval, now)?;
+    if suppressed == 0 {
+        Some(message.to_string())
+    } else {
+        Some(format!("{message} ({suppressed} more suppressed)"))
+    }
+}
+
+/// Emit a rate-limited shed line under the RPC subsystem tag.
+fn log_shed(limiter: &Mutex<RateLimitedLog>, message: &str) {
+    if let Some(line) = shed_line(limiter, message, SHED_LOG_INTERVAL, Instant::now()) {
+        crate::logging::info(RPC_LOG_SUBSYSTEM, &line);
+    }
+}
+
+/// One connection's registration in the pre-authentication pool.
+struct PreAuthEntry {
+    /// The identity used to release the entry when its handler ends.
+    ticket: u64,
+    /// A second handle to the connection's socket, taken when the entry
+    /// is evicted so its blocked read errors out; `None` once evicted
+    /// (an entry is never evicted twice) or when the clone failed.
+    sock: Option<TcpStream>,
+}
+
+/// The pre-authentication pool's contents, in arrival order.
+#[derive(Default)]
+struct PreAuthState {
+    /// Every registered connection, oldest first.  An evicted entry
+    /// stays here — and stays counted — until its handler unwinds, so
+    /// the count is a true count of live handler threads.
+    live: std::collections::VecDeque<PreAuthEntry>,
+    /// The next ticket to hand out.
+    next_ticket: u64,
+}
+
+/// Admission control for connections that have not yet completed a
+/// request: one process-wide, bounded pool, shared by every accept
+/// loop the way `num_clients` is.
+///
+/// The pool is deliberately *separate* from the capacity the
+/// configuration admits.  A connection releases its slot the moment it
+/// authenticates (or completes a websocket upgrade), after which it is
+/// governed by dcrd's own limits — `rpcmaxclients` through
+/// `num_clients`, `rpcmaxwebsockets` through the notification
+/// manager — so a handshake flood can never consume the capacity an
+/// operator's `dcrctl` or an established websocket subscriber runs in.
+/// One shared pool for both would turn a thread flood into a total
+/// availability outage: every legitimate connection dropped on the
+/// accept thread for the whole `RPC_AUTH_TIMEOUT` a stalled attacker
+/// holds its slot.
+///
+/// Within the pool, reaching the nominal budget disconnects the
+/// *oldest* pre-authentication connection to make room for the new
+/// one, rather than dropping the new one.  A pre-authentication flood
+/// is by construction the set of oldest such connections — a
+/// legitimate client's handshake lasts a round trip, an attacker's
+/// lasts until the read deadline — so an arriving legitimate client is
+/// admitted and the flood pays for it.  Only past the reserve above
+/// the nominal budget, which exists so evicted handlers still
+/// unwinding cannot crowd out arrivals, is a connection refused
+/// outright.  Both the eviction and the refusal are logged
+/// (rate-limited), because a silent drop is an operator blind spot.
+struct PreAuthGate {
+    /// The registered connections.
+    state: Mutex<PreAuthState>,
+    /// The nominal budget: at or above it, admitting evicts the oldest.
+    soft: usize,
+    /// The absolute admission ceiling.
+    hard: usize,
+}
+
+impl PreAuthGate {
+    /// The gate for a configured standard-client cap.
+    fn new(max_clients: usize) -> PreAuthGate {
+        let (soft, hard) = pre_auth_budget(max_clients);
+        PreAuthGate {
+            state: Mutex::new(PreAuthState::default()),
+            soft,
+            hard,
+        }
+    }
+
+    /// A gate with an explicit budget, so the eviction and refusal paths
+    /// can be exercised without opening a production-sized flood.
+    #[cfg(test)]
+    fn with_budget(soft: usize, hard: usize) -> PreAuthGate {
+        PreAuthGate {
+            state: Mutex::new(PreAuthState::default()),
+            soft,
+            hard,
+        }
+    }
+
+    /// How many connections are registered right now.
+    fn live(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .live
+            .len()
+    }
+
+    /// Register a connection, evicting the oldest registered
+    /// connection first when the nominal budget is reached; `None`
+    /// when even the reserve is exhausted, in which case the caller
+    /// must drop the connection.
+    fn admit(self: &Arc<Self>, sock: Option<TcpStream>, peer: &SocketAddr) -> Option<PreAuthSlot> {
+        /// What admitting this connection cost, logged once the pool
+        /// lock is released.
+        enum Shed {
+            /// Room to spare: nothing to report.
+            Nothing,
+            /// The oldest pre-authentication connection was closed.
+            Evicted,
+            /// Even the reserve was exhausted.
+            Refused,
+        }
+        let mut shed = Shed::Nothing;
+        let admitted = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.live.len() >= self.hard {
+                shed = Shed::Refused;
+                None
+            } else {
+                // At the nominal budget, disconnect the oldest
+                // connection that has not been evicted already.  Its
+                // handler observes the closed socket, returns, and
+                // releases its slot; the entry stays counted until it
+                // does, so the count never understates the live
+                // handler threads.
+                if state.live.len() >= self.soft
+                    && let Some(entry) = state.live.iter_mut().find(|entry| entry.sock.is_some())
+                    && let Some(victim) = entry.sock.take()
+                {
+                    let _ = victim.shutdown(Shutdown::Both);
+                    shed = Shed::Evicted;
+                }
+                state.next_ticket = state.next_ticket.wrapping_add(1);
+                let ticket = state.next_ticket;
+                // Registered under the lock, so no release can race
+                // ahead of the registration it belongs to.
+                state.live.push_back(PreAuthEntry { ticket, sock });
+                Some(PreAuthSlot {
+                    gate: Arc::clone(self),
+                    ticket,
+                })
+            }
+        };
+        match shed {
+            Shed::Nothing => {}
+            Shed::Evicted => log_shed(
+                &PRE_AUTH_EVICT_LOG,
+                &format!(
+                    "Max pre-authentication RPC connections reached [{}] - disconnecting the \
+                     oldest pre-authentication client to admit {peer}",
+                    self.soft
+                ),
+            ),
+            Shed::Refused => log_shed(
+                &PRE_AUTH_REFUSE_LOG,
+                &format!(
+                    "Max pre-authentication RPC connections exceeded [{}] - dropping client {peer}",
+                    self.hard
+                ),
+            ),
+        }
+        admitted
+    }
+
+    /// Release the entry for `ticket`; an already-evicted entry is
+    /// released just the same.
+    fn release(&self, ticket: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(at) = state.live.iter().position(|entry| entry.ticket == ticket) {
+            state.live.remove(at);
+        }
+    }
+}
+
+/// A connection's registration in the pre-authentication pool,
+/// released on drop so every return path — including an unwind and an
+/// eviction — gives the slot back.  Dropping it early is how a
+/// connection that has authenticated (or upgraded) leaves the pool.
+struct PreAuthSlot {
+    gate: Arc<PreAuthGate>,
+    ticket: u64,
+}
+
+impl Drop for PreAuthSlot {
+    fn drop(&mut self) {
+        self.gate.release(self.ticket);
+    }
 }
 
 /// Accept RPC connections until shutdown, serving each on its own
@@ -1331,13 +1709,23 @@ fn accept_loop(
     max_clients: usize,
     num_clients: &Arc<AtomicI32>,
     handlers: &HandlerGroup,
+    pre_auth: &Arc<PreAuthGate>,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
-            Ok((stream, _addr)) => {
+            Ok((stream, peer)) => {
                 if stream.set_nonblocking(false).is_err() {
                     continue;
                 }
+                // Register in the pre-authentication pool before
+                // anything is spawned.  At the nominal budget this
+                // disconnects the oldest pre-authentication connection
+                // to make room, so a stalled flood — not the arriving
+                // client — pays for the admission; only past the
+                // reserve is the connection dropped here.
+                let Some(slot) = pre_auth.admit(stream.try_clone().ok(), &peer) else {
+                    continue;
+                };
                 // The connection's whole handshake is bounded by
                 // `serve_rpc_connection`'s per-read absolute deadline
                 // rather than a resetting per-read socket timeout.
@@ -1378,6 +1766,8 @@ fn accept_loop(
                                 &num_clients,
                                 &stop,
                                 watchdog,
+                                peer,
+                                slot,
                             );
                         });
                     }
@@ -1385,6 +1775,8 @@ fn accept_loop(
                         let config = Arc::clone(config);
                         let _ = thread::Builder::new().spawn(move || {
                             let _guard = guard;
+                            // A session that cannot be built returns
+                            // here, dropping the slot with the rest.
                             let Ok(session) = rustls::ServerConnection::new(config) else {
                                 return;
                             };
@@ -1397,6 +1789,8 @@ fn accept_loop(
                                 &num_clients,
                                 &stop,
                                 watchdog,
+                                peer,
+                                slot,
                             );
                         });
                     }
@@ -1464,35 +1858,6 @@ impl HandshakeWatchdog {
 impl Drop for HandshakeWatchdog {
     fn drop(&mut self) {
         self.disarm();
-    }
-}
-
-/// Access to the read timeout of the socket underneath a served
-/// connection, through any TLS wrapping.  The websocket path shortens
-/// the timeout to its notification poll interval, and it must land on
-/// the handle the reads actually go through: setting it on a
-/// `try_clone` of the socket does not reach the original handle on
-/// Windows.
-pub trait SocketTimeout {
-    /// Set the read timeout on the underlying socket.
-    fn set_socket_read_timeout(&self, timeout: Option<Duration>);
-}
-
-impl SocketTimeout for TcpStream {
-    fn set_socket_read_timeout(&self, timeout: Option<Duration>) {
-        let _ = self.set_read_timeout(timeout);
-    }
-}
-
-/// In-memory streams have no socket timeout; tests frame messages over
-/// cursors and pipes.
-impl<T> SocketTimeout for std::io::Cursor<T> {
-    fn set_socket_read_timeout(&self, _timeout: Option<Duration>) {}
-}
-
-impl SocketTimeout for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
-    fn set_socket_read_timeout(&self, timeout: Option<Duration>) {
-        let _ = self.sock.set_read_timeout(timeout);
     }
 }
 
@@ -1903,6 +2268,8 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     num_clients: &Arc<AtomicI32>,
     shutdown: &AtomicBool,
     watchdog: HandshakeWatchdog,
+    peer: SocketAddr,
+    slot: PreAuthSlot,
 ) {
     // The absolute deadline for the whole handshake (dcrd's HTTP
     // `ReadTimeout`), applied per read so a byte-dribbling client cannot
@@ -1964,6 +2331,13 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
         // the handshake deadline by design (dcrd sets no read deadline
         // on websocket conns).
         watchdog.disarm();
+        // The handshake is over, so leave the pre-authentication pool:
+        // from here the websocket client cap governs this connection
+        // (`rpcmaxwebsockets`, enforced where the notification manager
+        // registers the client, a few instructions below).  Keeping the
+        // slot would let a handshake flood crowd out the subscribers the
+        // configuration admits.
+        drop(slot);
         stream.set_socket_read_timeout(Some(WS_POLL_INTERVAL));
         crate::websocket::serve_websocket(stream, &head, authed, is_admin, server, ntfn, shutdown);
         return;
@@ -1980,6 +2354,14 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     // client, exactly as dcrd's `numClients+1 > 0` does.  `load() >= max`
     // is `load()+1 > max` without the overflow-prone increment.
     if num_clients.load(Ordering::SeqCst) as usize >= max_clients {
+        // dcrd logs this shed unconditionally; the check sits ahead of
+        // authentication, so an unauthenticated flood could otherwise
+        // drive the log at its own rate — hence the rate limiter, which
+        // keeps the text verbatim when nothing was suppressed.
+        log_shed(
+            &MAX_CLIENTS_LOG,
+            &format!("Max RPC clients exceeded [{max_clients}] - disconnecting client {peer}"),
+        );
         // Drain the declared body before closing so the 503 reaches the
         // client cleanly rather than resetting the socket over unread
         // bytes.  dcrd's 503 body is text/plain via http.Error;
@@ -2016,6 +2398,12 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
             return;
         }
     };
+    // Authenticated: leave the pre-authentication pool.  This connection
+    // is now one of the `rpcmaxclients` the configuration admits,
+    // counted by `num_clients` above, and its body read runs under the
+    // authenticated read limit — so it must not keep occupying a
+    // handshake slot that arriving clients need.
+    drop(slot);
 
     // The read limit applies only after authentication (dcrd caps the body
     // inside the authenticated `jsonRPCRead`), so an unauthenticated
@@ -2624,5 +3012,205 @@ mod tests {
         let mut buf = [0u8; 2];
         client.read_exact(&mut buf).expect("read");
         assert_eq!(&buf, b"ok");
+    }
+
+    /// The pre-authentication budget is what its name says: a bound on
+    /// the OS threads the pre-authentication phase spends, which is two
+    /// per connection (the handler and its handshake watchdog), never a
+    /// bound on connections that quietly costs twice as much.  It also
+    /// scales with the configured cap and keeps a floor, so dcrd's tiny
+    /// defaults still get a usable handshake phase.
+    #[test]
+    fn the_pre_auth_budget_bounds_threads_not_just_connections() {
+        for cap in [0usize, 1, 10, 25, 100, 1000, usize::MAX] {
+            let (soft, hard) = pre_auth_budget(cap);
+            assert!(soft >= 32, "cap {cap}: the floor keeps the phase usable");
+            assert!(soft < hard, "cap {cap}: the reserve must be real");
+            assert!(
+                hard.saturating_mul(THREADS_PER_PRE_AUTH_CONNECTION) <= MAX_PRE_AUTH_THREADS,
+                "cap {cap}: {hard} connections at {THREADS_PER_PRE_AUTH_CONNECTION} threads \
+                 each exceeds the {MAX_PRE_AUTH_THREADS}-thread ceiling the constant promises"
+            );
+        }
+        // The budget grows with the cap up to the thread roof.
+        assert_eq!(pre_auth_budget(0), (32, 64), "dcrd's zero cap");
+        assert_eq!(pre_auth_budget(10), (32, 64), "the dcrd default cap");
+        assert_eq!(pre_auth_budget(100), (108, 216));
+        assert_eq!(
+            pre_auth_budget(usize::MAX),
+            (128, 256),
+            "an absurd cap saturates at the thread roof rather than overflowing"
+        );
+    }
+
+    /// Admitting past the nominal budget disconnects the *oldest*
+    /// pre-authentication connection rather than the arriving one: a
+    /// stalled flood is exactly the oldest set, so an arriving client
+    /// gets in and the flood pays for it.  The evicted entry stays
+    /// counted until its handler releases the slot, and past the reserve
+    /// admission genuinely fails.
+    #[test]
+    fn admission_disconnects_the_oldest_pre_auth_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let gate = Arc::new(PreAuthGate::with_budget(2, 3));
+
+        // A connected pair, with the server side registered in the gate.
+        let open = |gate: &Arc<PreAuthGate>| {
+            let client = TcpStream::connect(addr).expect("connect");
+            let (server, peer) = listener.accept().expect("accept");
+            let slot = gate.admit(server.try_clone().ok(), &peer);
+            (client, server, slot)
+        };
+
+        let (mut oldest, _oldest_server, oldest_slot) = open(&gate);
+        let (newer, newer_server, _newer_slot) = open(&gate);
+        assert_eq!(gate.live(), 2, "the nominal budget is full");
+
+        // The third admission is granted and evicts the oldest.
+        let (_third, _third_server, third_slot) = open(&gate);
+        assert!(
+            third_slot.is_some(),
+            "an arriving connection must be admitted, not dropped"
+        );
+        assert_eq!(
+            gate.live(),
+            3,
+            "the evicted entry stays counted until its handler releases it"
+        );
+
+        oldest
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut buf = [0u8; 1];
+        assert!(
+            matches!(oldest.read(&mut buf), Ok(0)),
+            "the oldest pre-authentication connection is the one disconnected"
+        );
+
+        // The connection after it was left alone: it still carries data.
+        let mut newer_server = newer_server;
+        newer_server
+            .write_all(b"x")
+            .expect("the newer socket is open");
+        let mut newer = newer;
+        newer
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        newer.read_exact(&mut buf).expect("read");
+        assert_eq!(&buf, b"x", "only the oldest connection is evicted");
+
+        // Past the reserve, admission fails outright rather than
+        // evicting a connection it has no room to replace.
+        let (_fourth, _fourth_server, fourth_slot) = open(&gate);
+        assert!(
+            fourth_slot.is_none(),
+            "the reserve is an absolute ceiling, not another eviction round"
+        );
+
+        // Releasing the evicted entry's slot frees its capacity.
+        drop(oldest_slot);
+        assert_eq!(gate.live(), 2, "a released slot leaves the pool");
+    }
+
+    /// A slot is released on every exit path, including an unwind, so a
+    /// panicking handler cannot permanently consume capacity.
+    #[test]
+    fn pre_auth_slots_are_released_even_on_unwind() {
+        let gate = Arc::new(PreAuthGate::with_budget(3, 3));
+        let peer: SocketAddr = "127.0.0.1:1234".parse().expect("addr");
+
+        let held: Vec<PreAuthSlot> = (0..3)
+            .map(|_| gate.admit(None, &peer).expect("within the budget"))
+            .collect();
+        assert_eq!(gate.live(), 3);
+        assert!(
+            gate.admit(None, &peer).is_none(),
+            "the ceiling must refuse rather than over-admit"
+        );
+        drop(held);
+        assert_eq!(gate.live(), 0, "drops release the slots");
+
+        // An unwind through a scope holding a slot still releases it.
+        let unwind_gate = Arc::clone(&gate);
+        let result = std::panic::catch_unwind(move || {
+            let _slot = unwind_gate.admit(None, &peer).expect("admit");
+            assert_eq!(unwind_gate.live(), 1);
+            panic!("handler blew up");
+        });
+        assert!(result.is_err(), "the panic must propagate");
+        assert_eq!(gate.live(), 0, "a panicking handler must not leak its slot");
+    }
+
+    /// The shed lines are rate limited, so an accept flood cannot become
+    /// a log flood, and the suppressed count is reported on the next
+    /// line — zero in the unflooded case, which keeps dcrd's message
+    /// text verbatim.
+    #[test]
+    fn shed_logging_is_rate_limited_with_a_suppressed_count() {
+        let interval = Duration::from_secs(10);
+        let start = Instant::now();
+        let mut limiter = RateLimitedLog::new();
+
+        assert_eq!(
+            limiter.record(interval, start),
+            Some(0),
+            "the first event logs with nothing suppressed"
+        );
+        for i in 1..100u32 {
+            let at = start
+                .checked_add(Duration::from_millis(u64::from(i)))
+                .expect("instant");
+            assert_eq!(
+                limiter.record(interval, at),
+                None,
+                "a flood inside the interval must not log"
+            );
+        }
+        let after = start.checked_add(interval).expect("instant");
+        assert_eq!(
+            limiter.record(interval, after),
+            Some(99),
+            "the next line reports how many were suppressed"
+        );
+        let later = after.checked_add(interval).expect("instant");
+        assert_eq!(
+            limiter.record(interval, later),
+            Some(0),
+            "the counter resets with each emitted line"
+        );
+    }
+
+    /// The shed line composed for the standard-client cap keeps dcrd's
+    /// text verbatim when nothing was suppressed, and carries the
+    /// suppressed count when a flood was throttled.
+    #[test]
+    fn a_throttled_shed_line_carries_its_suppressed_count() {
+        let interval = Duration::from_secs(10);
+        let start = Instant::now();
+        let limiter = Mutex::new(RateLimitedLog::new());
+        let message = "Max RPC clients exceeded [10] - disconnecting client 127.0.0.1:5000";
+
+        assert_eq!(
+            shed_line(&limiter, message, interval, start).as_deref(),
+            Some(message),
+            "the unflooded line is dcrd's text, unadorned"
+        );
+        for i in 1..5u32 {
+            let at = start
+                .checked_add(Duration::from_millis(u64::from(i)))
+                .expect("instant");
+            assert_eq!(
+                shed_line(&limiter, message, interval, at),
+                None,
+                "a flood inside the interval must not log"
+            );
+        }
+        let after = start.checked_add(interval).expect("instant");
+        assert_eq!(
+            shed_line(&limiter, message, interval, after).as_deref(),
+            Some(format!("{message} (4 more suppressed)").as_str()),
+            "the next line accounts for the events the flood cost"
+        );
     }
 }

@@ -68,6 +68,7 @@ fn serve_ws() -> (
             connected,
             Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         )),
+        client_cert_auth: false,
         tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(
             Arc::clone(&tx_pool),
         )),

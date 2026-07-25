@@ -211,6 +211,7 @@ fn control_and_chain_query_seams_over_http() {
             ConnectedPeers::new(),
             Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         )),
+        client_cert_auth: false,
         tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(
             Arc::clone(&tx_pool),
         )),

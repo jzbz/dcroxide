@@ -53,6 +53,17 @@ impl RpcChain for MockChain13 {
     }
 }
 
+/// The block-432,100 header fixture shared by the auth tests.
+fn fixture_header() -> BlockHeader {
+    include_str!("data/rpchandlers8_vectors.txt")
+        .lines()
+        .find_map(|line| {
+            let f: Vec<&str> = line.split('|').collect();
+            (f[0] == "blk").then(|| MsgBlock::from_bytes(&unhex(f[1])).unwrap().0.header)
+        })
+        .expect("block fixture")
+}
+
 fn new_server(
     header: BlockHeader,
     user: &str,
@@ -69,6 +80,7 @@ fn new_server(
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(()),
         conn_mgr: Box::new(()),
+        client_cert_auth: false,
         tx_mempooler: Box::new(()),
         clock: Box::new(()),
         interfaces: Box::new(NoInterfaces),
@@ -102,6 +114,39 @@ fn new_server(
     })
 }
 
+/// With no Basic credentials configured, the zero-MAC path must deny
+/// unless the TLS transport itself required and verified a client
+/// certificate.  dcrd only reaches that state under
+/// `--authtype=clientcert`, where its listener is built with
+/// `RequireAndVerifyClientCert`; a listener without client
+/// verification must never serve an unauthenticated request as admin.
+#[test]
+fn zero_credentials_deny_without_client_certificate_auth() {
+    // No credentials and no client-certificate enforcement: deny.
+    let header = fixture_header();
+    let server = new_server(header, "", "", "", "");
+    assert!(
+        server.check_auth(None, false).is_err(),
+        "an endpoint with neither credentials nor client-certificate \
+         verification must not authenticate anyone"
+    );
+    assert!(
+        server
+            .check_auth(Some("Basic Zm9vOmJhcg=="), false)
+            .is_err(),
+        "a bogus credential must not authenticate either"
+    );
+
+    // The same server with the transport enforcing client certificates
+    // authenticates as admin, matching dcrd's clientcert mode.
+    let mut server = new_server(header, "", "", "", "");
+    server.cfg.client_cert_auth = true;
+    assert_eq!(
+        server.check_auth(None, false).expect("client cert auth"),
+        (true, true)
+    );
+}
+
 #[test]
 fn auth_and_body_processing_matches_dcrd() {
     let header = include_str!("data/rpchandlers8_vectors.txt")
@@ -121,7 +166,19 @@ fn auth_and_body_processing_matches_dcrd() {
             "auth" => {
                 auth_cases += 1;
                 let name = f[2];
-                let server = new_server(header, f[3], f[4], f[5], f[6]);
+                let mut server = new_server(header, f[3], f[4], f[5], f[6]);
+                // dcrd only reaches the no-credentials state under
+                // `--authtype=clientcert` (basic auth without a
+                // user/password disables the RPC server outright), and
+                // there its listener requires and verifies a client
+                // certificate.  Model that configuration so the dumped
+                // verdict stays comparable; the fail-closed behaviour
+                // when the transport does NOT verify certificates is
+                // pinned by
+                // `zero_credentials_deny_without_client_certificate_auth`.
+                if f[3].is_empty() && f[4].is_empty() && f[5].is_empty() && f[6].is_empty() {
+                    server.cfg.client_cert_auth = true;
+                }
                 let header_text = utf8(f[7]);
                 let auth_header = (header_text != "-").then_some(header_text.as_str());
                 let require = f[8] == "true";

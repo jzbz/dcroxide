@@ -323,6 +323,7 @@ fn getwork_handler_matches_dcrd() {
             conn_mgr: Box::new(MockConnMgr11 {
                 count: scen[6].parse().unwrap(),
             }),
+            client_cert_auth: false,
             tx_mempooler: Box::new(()),
             clock: Box::new(()),
             interfaces: Box::new(NoInterfaces),

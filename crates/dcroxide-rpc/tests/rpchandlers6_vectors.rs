@@ -363,6 +363,7 @@ fn peer_address_handler_slice_matches_dcrd() {
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(MockSyncMgr6(mock[2].parse().unwrap())),
             conn_mgr: Box::new(conn_mgr),
+            client_cert_auth: false,
             tx_mempooler: Box::new(()),
             clock: Box::new(MockClock6(since_nanos)),
             interfaces: Box::new(NoInterfaces),

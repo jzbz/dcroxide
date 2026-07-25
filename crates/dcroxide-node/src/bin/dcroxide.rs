@@ -597,7 +597,26 @@ fn run(cfg: Config) -> ExitCode {
                 Path::new(&cfg.rpc_key),
                 &cfg.external_ips,
             )
-            .and_then(|(cert, key)| dcroxide_node::rpcrun::tls_server_config(&cert, &key));
+            .and_then(|(cert, key)| {
+                // Client certificate authentication demands the CA
+                // roots; dcrd reads the file in `newTLSConfig` and
+                // fails startup when it is missing or empty.
+                let client_cas =
+                    if cfg.rpc_auth_type == dcroxide_node::config::AUTH_TYPE_CLIENT_CERT {
+                        match std::fs::read(&cfg.rpc_client_cas) {
+                            Ok(pem) => Some(pem),
+                            Err(e) => {
+                                return Err(format!(
+                                    "unable to read the client CA file {}: {e}",
+                                    cfg.rpc_client_cas
+                                ));
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                dcroxide_node::rpcrun::tls_server_config(&cert, &key, client_cas.as_deref())
+            });
             match config {
                 Ok(config) => dcroxide_node::rpcrun::RpcTransport::Tls(config),
                 Err(e) => {
@@ -1134,7 +1153,12 @@ fn open_block_db(cfg: &Config) -> Result<Database, String> {
     match Database::open(&opts) {
         Ok(db) => Ok(db),
         Err(e) if e.kind == ErrorKind::DbDoesNotExist => {
-            std::fs::create_dir_all(&db_path)
+            // 0700, matching dcrd's `os.MkdirAll(cfg.DataDir, 0700)`
+            // in blockdb.go.  Creating it 0755 here would also make
+            // `Database::create`'s own owner-only mkdir a no-op, since
+            // that one deliberately leaves an existing directory's mode
+            // alone.
+            dcroxide_database::create_dir_all_owner_only(&db_path)
                 .map_err(|e| format!("unable to create database directory: {e}"))?;
             Database::create(&opts).map_err(|e| format!("unable to create database: {e}"))
         }
@@ -1239,6 +1263,7 @@ fn rpc_config(
                 // DNS detail resolves like dcrd's dcrdLookup.
                 .with_dialer(dcroxide_node::socks::NodeDialer::from_config(cfg)),
         ),
+        client_cert_auth: cfg.rpc_auth_type == dcroxide_node::config::AUTH_TYPE_CLIENT_CERT,
         tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(tx_pool)),
         clock: Box::new(dcroxide_node::rpcrun::SystemClock),
         interfaces: Box::new(dcroxide_rpc::helpers::NoInterfaces),

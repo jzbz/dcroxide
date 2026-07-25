@@ -270,6 +270,10 @@ impl NodeNtfnMgr {
     /// subscription EXCEPT mix messages — dcrd's unregister-client
     /// case skips the mix map (kept bug-for-bug; the stale entry is
     /// harmless because delivery only reaches registered clients).
+    ///
+    /// This runs from [`ClientRegistration`]'s `Drop`, so it is reached
+    /// on an unwind out of the serving loop as well as on a clean
+    /// disconnect — dcrd unregisters from a `defer`.
     fn remove_client(&self, session_id: u64) {
         {
             let mut subs = self.inner.lock().expect("subs");
@@ -281,6 +285,51 @@ impl NodeNtfnMgr {
             subs.mempool_txs.remove(&session_id);
         }
         self.clients.lock().expect("ws clients").remove(&session_id);
+    }
+
+    /// The number of currently registered websocket clients (dcrd
+    /// `wsNotificationManager.NumClients`).
+    pub fn num_clients(&self) -> usize {
+        self.clients.lock().expect("ws clients").len()
+    }
+}
+
+/// A client's registration with the notification manager, released when
+/// the guard is dropped.
+///
+/// dcrd unregisters each client from a `defer` in its per-client
+/// goroutine, so the registration goes away whether the client leaves
+/// cleanly or the goroutine dies.  A bare `remove_client` statement at
+/// the end of the serving loop does not match that: an unwind from
+/// anywhere inside the loop skips it and strands the session in the
+/// client registry and in every subscription set for the life of the
+/// process, with an outbound queue no thread will ever drain and a
+/// websocket slot no client can ever reclaim.  Owning the registration
+/// restores dcrd's `defer`.
+struct ClientRegistration<'a> {
+    ntfn: &'a NodeNtfnMgr,
+    session_id: u64,
+}
+
+impl<'a> ClientRegistration<'a> {
+    /// Register the client, or return `None` when the concurrent
+    /// websocket cap refuses it (dcrd rejecting when `NumClients()+1 >
+    /// RPCMaxWebsockets`).  A client that was never admitted gets no
+    /// guard, so nothing is unregistered on its behalf.
+    fn register(
+        ntfn: &'a NodeNtfnMgr,
+        session_id: u64,
+        state: Arc<Mutex<WsClient>>,
+        outbound: Arc<Mutex<VecDeque<String>>>,
+    ) -> Option<ClientRegistration<'a>> {
+        ntfn.add_client(session_id, state, outbound)
+            .then(|| ClientRegistration { ntfn, session_id })
+    }
+}
+
+impl Drop for ClientRegistration<'_> {
+    fn drop(&mut self) {
+        self.ntfn.remove_client(self.session_id);
     }
 }
 
@@ -590,10 +639,15 @@ pub fn serve_websocket<S: Read + Write>(
     // reached: dropping `stream` closes the connection with no close
     // frame, exactly as dcrd's `conn.Close()` does.  Returning here
     // before the serve loop keeps `remove_client` from running for a
-    // client that was never admitted.
-    if !ntfn.add_client(session_id, Arc::clone(&state), Arc::clone(&outbound)) {
+    // client that was never admitted.  The guard releases the
+    // registration on every exit from this function — a clean
+    // disconnect, an early `break`, or an unwind — the way dcrd's
+    // `defer` does.
+    let Some(_registration) =
+        ClientRegistration::register(ntfn, session_id, Arc::clone(&state), Arc::clone(&outbound))
+    else {
         return;
-    }
+    };
     let mut conn = WsConn::new(stream);
 
     loop {
@@ -655,8 +709,6 @@ pub fn serve_websocket<S: Read + Write>(
             WsOutcome::Disconnect => break,
         }
     }
-
-    ntfn.remove_client(session_id);
 }
 
 /// The client's (authenticated, is_admin) flags under a brief lock.
@@ -698,11 +750,51 @@ fn parse_error_outcome(authenticated: bool, err_text: &str) -> WsOutcome {
     ))
 }
 
-/// Give one websocket request its dcrd `inHandler` handling: the
-/// authenticate state machine, the limited-user gate, the
-/// notification-id skip, and dispatch through the ported service
-/// handler.
+/// The reply for a request whose handling panicked: dcrd's internal
+/// error, carrying a null id.
+///
+/// The id is deliberately not the request's own.  Whatever panicked
+/// might have been the marshalling of that id, in which case echoing it
+/// back would panic a second time — this time with no handler left to
+/// catch it.  A null id is the same answer the HTTP path's
+/// panic-recovery gives.
+fn panic_recovery_outcome() -> WsOutcome {
+    let json_err = RPCError::new(
+        err_rpc_internal().code,
+        "internal error: the handler's daemon seam is not yet wired",
+    );
+    reply_or_skip(create_marshalled_reply(
+        "1.0",
+        &RpcId::Null,
+        None,
+        Some(&json_err),
+    ))
+}
+
+/// Give one websocket request its dcrd `inHandler` handling, with the
+/// whole of it inside a single `catch_unwind`.
+///
+/// Nothing about handling one request may unwind past this point.  The
+/// serving loop above holds the client's notification registration, and
+/// an escaping panic would tear down the connection thread while the
+/// notification manager kept queueing onto a session that no longer has
+/// a reader — so every step, including marshalling the client's own id,
+/// runs under the guard, and the recovery answers with a null id.
 fn handle_ws_request(
+    server: &Arc<Mutex<Server<NodeRpcChain>>>,
+    state: &Arc<Mutex<WsClient>>,
+    body: &str,
+) -> WsOutcome {
+    catch_unwind(AssertUnwindSafe(|| {
+        handle_ws_request_inner(server, state, body)
+    }))
+    .unwrap_or_else(|_| panic_recovery_outcome())
+}
+
+/// The dcrd `inHandler` body: the authenticate state machine, the
+/// limited-user gate, the notification-id skip, and dispatch through
+/// the ported service handler.
+fn handle_ws_request_inner(
     server: &Arc<Mutex<Server<NodeRpcChain>>>,
     state: &Arc<Mutex<WsClient>>,
     body: &str,
@@ -773,18 +865,7 @@ fn handle_ws_request(
     match outcome {
         Ok(Some(reply)) => WsOutcome::Reply(reply),
         Ok(None) => WsOutcome::Skip,
-        Err(_) => {
-            let json_err = RPCError::new(
-                err_rpc_internal().code,
-                "internal error: the handler's daemon seam is not yet wired",
-            );
-            reply_or_skip(create_marshalled_reply(
-                &req.jsonrpc,
-                &req.id,
-                None,
-                Some(&json_err),
-            ))
-        }
+        Err(_) => panic_recovery_outcome(),
     }
 }
 
@@ -925,5 +1006,91 @@ mod tests {
             !none.add_client(1, Arc::new(Mutex::new(WsClient::new(1))), Arc::default()),
             "a zero cap refuses every client"
         );
+    }
+
+    /// A panic unwinding through the serving loop must still release
+    /// the client's registration.  dcrd unregisters from a `defer`; a
+    /// plain statement after the loop is skipped by an unwind, which
+    /// would strand the session in the registry and in every
+    /// subscription set for the life of the process and burn a
+    /// websocket slot no client could reclaim.
+    #[test]
+    fn an_unwind_past_the_serving_loop_releases_the_registration() {
+        // A cap of one makes a leaked slot immediately visible.
+        let mgr = NodeNtfnMgr::with_max_websockets(1);
+        let outbound: Arc<Mutex<VecDeque<String>>> = Arc::default();
+
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let _registration = ClientRegistration::register(
+                &mgr,
+                7,
+                Arc::new(Mutex::new(WsClient::new(7))),
+                Arc::clone(&outbound),
+            )
+            .expect("the first client fits the cap");
+            let mut subscriber = mgr.clone();
+            subscriber.register_block_updates(7);
+            subscriber.register_new_mempool_txs_updates(7);
+            assert_eq!(mgr.num_clients(), 1);
+            panic!("a request handler unwound out of the serving loop");
+        }));
+        assert!(unwound.is_err(), "the panic must have been caught here");
+
+        // The registry and the subscription sets are clear...
+        assert_eq!(
+            mgr.num_clients(),
+            0,
+            "the unwind stranded the client in the registry"
+        );
+        {
+            let subs = mgr.inner.lock().expect("subs");
+            assert!(subs.blocks.is_empty(), "a stranded block subscription");
+            assert!(
+                subs.mempool_txs.is_empty(),
+                "a stranded mempool subscription"
+            );
+        }
+
+        // ...and the slot is reusable.
+        let replacement = ClientRegistration::register(
+            &mgr,
+            8,
+            Arc::new(Mutex::new(WsClient::new(8))),
+            Arc::default(),
+        )
+        .expect("the freed slot admits a replacement");
+        assert_eq!(mgr.num_clients(), 1);
+
+        // A clean exit releases it just the same.
+        drop(replacement);
+        assert_eq!(mgr.num_clients(), 0);
+    }
+
+    /// A client refused by the cap gets no guard, so nothing is
+    /// unregistered on its behalf and the admitted client keeps its
+    /// registration.
+    #[test]
+    fn a_refused_client_does_not_unregister_the_admitted_one() {
+        let mgr = NodeNtfnMgr::with_max_websockets(1);
+        let admitted = ClientRegistration::register(
+            &mgr,
+            1,
+            Arc::new(Mutex::new(WsClient::new(1))),
+            Arc::default(),
+        )
+        .expect("the first client fits the cap");
+        assert!(
+            ClientRegistration::register(
+                &mgr,
+                2,
+                Arc::new(Mutex::new(WsClient::new(2))),
+                Arc::default(),
+            )
+            .is_none(),
+            "the second client is over the cap"
+        );
+        assert_eq!(mgr.num_clients(), 1, "the admitted client is untouched");
+        drop(admitted);
+        assert_eq!(mgr.num_clients(), 0);
     }
 }

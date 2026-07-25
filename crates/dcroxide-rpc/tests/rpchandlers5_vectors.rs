@@ -412,6 +412,7 @@ fn tx_utxo_handler_slice_matches_dcrd() {
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(()),
             conn_mgr: Box::new(()),
+            client_cert_auth: false,
             tx_mempooler: Box::new(mempooler),
             clock: Box::new(()),
             interfaces: Box::new(NoInterfaces),

@@ -43,6 +43,25 @@ fn serve_rpc_capped(
     dcroxide_chainhash::Hash,
     Arc<Mutex<Chain>>,
 ) {
+    let (dir, listener, ports, hash, chain) =
+        serve_rpc_capped_on(&["127.0.0.1:0".to_string()], max_clients);
+    let port = ports[0];
+    (dir, listener, port, hash, chain)
+}
+
+/// As [`serve_rpc_capped`], but over an explicit set of listen
+/// addresses, so the tests can exercise the several accept loops the
+/// default `rpclisten` expands to (typically 127.0.0.1 and ::1).
+fn serve_rpc_capped_on(
+    listen: &[String],
+    max_clients: usize,
+) -> (
+    tempfile::TempDir,
+    dcroxide_node::rpcrun::RpcListener,
+    Vec<u16>,
+    dcroxide_chainhash::Hash,
+    Arc<Mutex<Chain>>,
+) {
     let params = dcroxide_chaincfg::testnet3_params();
     let genesis_hash = params.genesis_hash;
 
@@ -88,6 +107,7 @@ fn serve_rpc_capped(
             connected,
             Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         )),
+        client_cert_auth: false,
         tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(
             Arc::clone(&tx_pool),
         )),
@@ -123,15 +143,19 @@ fn serve_rpc_capped(
     })));
 
     let listener = start_rpc_listener(
-        &["127.0.0.1:0".to_string()],
+        listen,
         server,
         dcroxide_node::rpcrun::RpcTransport::Plain,
         dcroxide_node::websocket::NodeNtfnMgr::new(),
         max_clients,
     )
     .expect("start rpc listener");
-    let port = listener.bound_addrs()[0].port();
-    (dir, listener, port, genesis_hash, shared_chain)
+    let ports = listener
+        .bound_addrs()
+        .iter()
+        .map(|addr| addr.port())
+        .collect();
+    (dir, listener, ports, genesis_hash, shared_chain)
 }
 
 /// Send one raw HTTP POST and return the full response text.
@@ -153,6 +177,35 @@ fn post(port: u16, auth: Option<&str>, body: &str) -> String {
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read");
     response
+}
+
+/// As [`post`], but tolerating a connection the server drops without a
+/// reply: a refused connection surfaces as a failed connect, a failed
+/// write, a clean end of stream, or a reset depending on timing, and all
+/// four mean the same thing — no HTTP response came back.
+fn try_post(port: u16, auth: Option<&str>, body: &str) -> String {
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+        return String::new();
+    };
+    let auth_header = auth
+        .map(|creds| {
+            format!(
+                "Authorization: Basic {}\r\n",
+                dcroxide_rpc::http::base64_std_encode(creds.as_bytes())
+            )
+        })
+        .unwrap_or_default();
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\n{auth_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return String::new();
+    }
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    String::from_utf8_lossy(&response).into_owned()
 }
 
 #[test]
@@ -532,8 +585,8 @@ fn serves_tls_with_a_generated_certificate() {
             .expect("reload cert pair");
     assert_eq!(cert_pem, cert_again);
 
-    let tls =
-        dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem).expect("build tls config");
+    let tls = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, None)
+        .expect("build tls config");
 
     // A chain-backed server exactly like the plain-HTTP fixture.
     let opts = Options::new(dir.path().join("blocks"), params.net.0);
@@ -549,6 +602,7 @@ fn serves_tls_with_a_generated_certificate() {
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(()),
         conn_mgr: Box::new(()),
+        client_cert_auth: false,
         tx_mempooler: Box::new(()),
         clock: Box::new(dcroxide_node::rpcrun::SystemClock),
         interfaces: Box::new(NoInterfaces),
@@ -828,4 +882,367 @@ fn shutdown_force_closes_a_mid_frame_websocket_stall() {
         "shutdown must force-close a wedged websocket handler"
     );
     done.join().expect("shutdown thread");
+}
+
+/// `--authtype=clientcert` must produce a listener that actually
+/// demands a verified client certificate: a CA file holding no usable
+/// certificate is a startup error, never a silently open endpoint
+/// (dcrd `newTLSConfig` returns "no certificates found in %q").
+#[test]
+fn client_cert_auth_requires_usable_certificate_authorities() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let cert_path = dir.path().join("rpc.cert");
+    let key_path = dir.path().join("rpc.key");
+    let (cert_pem, key_pem) =
+        dcroxide_node::rpcrun::load_or_generate_cert_pair(&cert_path, &key_path, &[])
+            .expect("generate cert pair");
+
+    // Empty and garbage CA material both fail closed.
+    for cas in [&b""[..], &b"not a certificate at all"[..]] {
+        let err = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, Some(cas))
+            .expect_err("a CA file without certificates must not build a listener");
+        assert!(
+            err.contains("no certificates found") || err.contains("client certificate"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // A real certificate as the CA root builds a verifying listener
+    // (rustls keeps the verifier private, so the observable assertion
+    // here is that the CA material is required and parsed; the
+    // fail-closed half of the control is pinned by
+    // `zero_credentials_deny_without_client_certificate_auth`).
+    dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, Some(&cert_pem))
+        .expect("build tls config with client CAs");
+    dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, None).expect("build tls config");
+}
+
+/// The autogenerated RPC private key must be owner-only from the
+/// moment it exists — dcrd writes it with `os.WriteFile(keyFile, key,
+/// 0600)`.  Writing it world-readable and chmod'ing afterwards leaves
+/// a window in which any local user can copy it, so the mode is
+/// asserted here; the certificate stays world-readable like dcrd's.
+#[cfg(unix)]
+#[test]
+fn generated_rpc_key_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cert_path = dir.path().join("rpc.cert");
+    let key_path = dir.path().join("rpc.key");
+
+    // Pre-create the key world-readable: a pair left behind by an
+    // older build must be tightened, not inherited.
+    std::fs::write(&key_path, b"stale").expect("seed stale key");
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
+        .expect("loosen stale key");
+
+    dcroxide_node::rpcrun::load_or_generate_cert_pair(&cert_path, &key_path, &[])
+        .expect("generate cert pair");
+
+    let mode = std::fs::metadata(&key_path)
+        .expect("key metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "the RPC private key must not be group/world readable"
+    );
+}
+
+/// When the private key cannot be placed, startup must fail rather
+/// than continue with a half-written pair.  The old code discarded the
+/// result of the permission call, so a key it could not protect was
+/// still handed to the listener.  dcrd also removes the certificate on
+/// this path so the next start regenerates a matching pair.
+#[cfg(unix)]
+#[test]
+fn an_unplaceable_rpc_key_fails_startup_and_removes_the_certificate() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cert_path = dir.path().join("rpc.cert");
+    let key_path = dir.path().join("rpc.key");
+
+    // A directory at the key path cannot be opened for writing.
+    std::fs::create_dir(&key_path).expect("occupy the key path");
+
+    let err = dcroxide_node::rpcrun::load_or_generate_cert_pair(&cert_path, &key_path, &[])
+        .expect_err("an unwritable key must not be ignored");
+    assert!(
+        err.contains("unable to write the RPC key"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !cert_path.exists(),
+        "the certificate must not outlive the key it was generated with"
+    );
+}
+
+/// Open `count` connections that say nothing at all, each parking a
+/// handler in the request read for the full authentication timeout, and
+/// hand the sockets back so the caller holds the flood open.
+fn stall_connections(port: u16, count: usize) -> Vec<TcpStream> {
+    let mut stalled = Vec::with_capacity(count);
+    for _ in 0..count {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(sock) => stalled.push(sock),
+            // The kernel refusing this early is itself a shed; nothing
+            // more can be opened, so the flood is as large as it gets.
+            Err(_) => break,
+        }
+    }
+    stalled
+}
+
+/// Block until the pre-authentication pool is actually saturated.
+///
+/// Opening the sockets is far cheaper than accepting them — each
+/// admission spawns two threads — so a test that dialled a flood and
+/// immediately probed the server would be racing the accept loop
+/// draining the listen backlog, and could observe an idle pool. Waiting
+/// on the invariant (rather than sleeping a guessed interval) makes the
+/// flood real before the assertion that depends on it.
+fn wait_for_pre_auth_saturation(listener: &dcroxide_node::rpcrun::RpcListener) {
+    let (soft, _hard) = listener.pre_auth_budget();
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(30))
+        .expect("deadline");
+    while listener.pre_auth_connections() < soft && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        listener.pre_auth_connections() >= soft,
+        "the flood must fill the nominal pre-authentication budget {soft} before the \
+         assertions that depend on it (live: {})",
+        listener.pre_auth_connections(),
+    );
+}
+
+/// A pre-authentication flood must not take the RPC server off the air.
+///
+/// dcrd sheds an over-limit client with 503 from inside the handler,
+/// which is safe there because the handler is a goroutine and the check
+/// runs per request. Here a handler is an OS thread with a
+/// multi-megabyte stack, so admission has to be bounded before the
+/// spawn — and a single bounded pool shared by unauthenticated and
+/// legitimate connections turns a thread flood into a total
+/// availability outage: an attacker opening the whole pool and sending
+/// nothing holds it for the ten-second authentication timeout, and every
+/// other connection (the operator's `dcrctl`, every websocket
+/// subscriber) is dropped on the accept thread with no reply.
+///
+/// The budget is therefore split — a connection leaves the
+/// pre-authentication pool the moment it authenticates — and within the
+/// pool admission disconnects the *oldest* pre-authentication
+/// connection rather than the arriving one. So with a flood many times
+/// the pool's size in progress, an authenticated request still gets its
+/// answer.
+#[test]
+fn an_authenticated_request_is_served_during_a_pre_auth_flood() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc_capped(10);
+    let (soft, hard) = listener.pre_auth_budget();
+
+    // A flood well past the whole budget, held open for the test.
+    let stalled = stall_connections(port, hard.saturating_mul(2));
+    assert!(
+        stalled.len() > hard,
+        "the flood must exceed the budget it is testing ({} opened, budget {soft}/{hard})",
+        stalled.len()
+    );
+    wait_for_pre_auth_saturation(&listener);
+
+    // The pool is bounded no matter how large the flood is.
+    assert!(
+        listener.pre_auth_connections() <= hard,
+        "a flood of {} connections must not exceed the pre-authentication ceiling {hard} \
+         (live: {})",
+        stalled.len(),
+        listener.pre_auth_connections(),
+    );
+
+    // ...and an authenticated client is still served.  Retries cover a
+    // loaded machine, inside a window far shorter than the ten-second
+    // authentication timeout a stalled connection would hold a shared
+    // slot for, so a regression cannot pass by simply waiting the flood
+    // out.
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(5))
+        .expect("deadline");
+    let mut attempts = 0usize;
+    let last = loop {
+        attempts += 1;
+        let last = try_post(
+            port,
+            Some("user:pass"),
+            r#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}"#,
+        );
+        if last.starts_with("HTTP/1.1 200 OK") {
+            break last;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an authenticated request must be answered during a pre-authentication flood \
+             ({attempts} attempts, last response: {last:?})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(last.contains("\"result\":0"), "{last}");
+
+    drop(stalled);
+    listener.shutdown();
+}
+
+/// Read the bytes of an HTTP response head, stopping at the blank line
+/// so the frames that follow an upgrade stay in the socket.
+fn read_head(stream: &mut TcpStream) -> String {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("read response head");
+        head.push(byte[0]);
+    }
+    String::from_utf8(head).expect("utf8 head")
+}
+
+/// Write a masked client text frame (every client frame must be masked).
+fn write_client_frame(stream: &mut TcpStream, payload: &[u8]) {
+    let mut frame = vec![0x81]; // FIN + text.
+    assert!(payload.len() < 126, "test payloads stay small");
+    frame.push(0x80 | payload.len() as u8); // MASK + length.
+    let mask = [0x12u8, 0x34, 0x56, 0x78];
+    frame.extend_from_slice(&mask);
+    for (i, byte) in payload.iter().enumerate() {
+        frame.push(byte ^ mask[i & 3]);
+    }
+    stream.write_all(&frame).expect("write frame");
+}
+
+/// Read one unmasked server text frame's payload.
+fn read_server_frame(stream: &mut TcpStream) -> String {
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).expect("read frame header");
+    let len = match header[1] & 0x7F {
+        126 => {
+            let mut ext = [0u8; 2];
+            stream.read_exact(&mut ext).expect("read extended length");
+            u16::from_be_bytes(ext) as usize
+        }
+        127 => {
+            let mut ext = [0u8; 8];
+            stream.read_exact(&mut ext).expect("read extended length");
+            u64::from_be_bytes(ext) as usize
+        }
+        n => n as usize,
+    };
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).expect("read frame payload");
+    String::from_utf8(payload).expect("utf8 payload")
+}
+
+/// An established websocket subscriber must survive a pre-authentication
+/// flood.
+///
+/// This is the half of the split budget that the eviction rule alone
+/// cannot provide: if a connection kept its pre-authentication slot for
+/// its whole session, a long-lived subscriber would be the *oldest*
+/// entry in the pool and therefore the first thing an arriving flood
+/// disconnects — the fix for the attacker would have broken the
+/// legitimate user outright. A connection therefore leaves the pool the
+/// moment it completes its handshake, after which dcrd's own
+/// `rpcmaxwebsockets` governs it.
+#[test]
+fn an_established_websocket_survives_a_pre_auth_flood() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc_capped(10);
+    let (_soft, hard) = listener.pre_auth_budget();
+
+    // Complete the upgrade, so this connection is an established client.
+    let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
+    let mut ws = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let request = format!(
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n"
+    );
+    ws.write_all(request.as_bytes()).expect("write");
+    let head = read_head(&mut ws);
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+    // It answers before the flood...
+    write_client_frame(
+        &mut ws,
+        br#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}"#,
+    );
+    ws.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .expect("read timeout");
+    let before = read_server_frame(&mut ws);
+    assert!(before.contains("\"result\":0"), "{before}");
+
+    // ...and after a flood that churns the whole pre-authentication pool
+    // many times over.
+    let stalled = stall_connections(port, hard.saturating_mul(2));
+    assert!(
+        stalled.len() > hard,
+        "the flood must exceed the pre-authentication ceiling {hard}"
+    );
+    wait_for_pre_auth_saturation(&listener);
+    write_client_frame(
+        &mut ws,
+        br#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":2}"#,
+    );
+    let after = read_server_frame(&mut ws);
+    assert!(
+        after.contains("\"result\":0"),
+        "an established websocket must stay serviceable through a pre-authentication \
+         flood: {after}"
+    );
+
+    drop(stalled);
+    listener.shutdown();
+}
+
+/// The pre-authentication budget is one process-wide pool, not one per
+/// accept loop: `num_clients` is deliberately shared across the accept
+/// loops for exactly this reason, and the default `rpclisten` expands to
+/// every localhost lookup result (typically 127.0.0.1 and ::1), so a
+/// per-loop pool would silently multiply the documented bound by the
+/// number of listen addresses.
+///
+/// Each listen address must register its connections in the shared pool,
+/// so flooding any one of them alone moves the listener-wide count.
+#[test]
+fn the_pre_auth_budget_is_shared_across_listen_addresses() {
+    let listen = vec!["127.0.0.1:0".to_string(), "127.0.0.1:0".to_string()];
+    for which in 0..listen.len() {
+        let (_dir, listener, ports, _genesis_hash, _chain) = serve_rpc_capped_on(&listen, 10);
+        assert_eq!(ports.len(), 2, "both addresses must bind");
+        let (soft, hard) = listener.pre_auth_budget();
+        assert_eq!(
+            listener.pre_auth_connections(),
+            0,
+            "a fresh listener has nothing in the pre-authentication pool"
+        );
+
+        // Flood exactly one of the two addresses.
+        let stalled = stall_connections(ports[which], soft.saturating_add(4));
+        // The count is polled: the accept loop registers connections as
+        // it drains the backlog, which is not instantaneous.
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(10))
+            .expect("deadline");
+        while listener.pre_auth_connections() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            listener.pre_auth_connections() > 0,
+            "the flood on listen address {which} must register in the process-wide \
+             pre-authentication pool, not in a pool private to its accept loop"
+        );
+        assert!(
+            listener.pre_auth_connections() <= hard,
+            "listen address {which} must share the ceiling {hard}, not have its own \
+             (live: {})",
+            listener.pre_auth_connections(),
+        );
+
+        drop(stalled);
+        listener.shutdown();
+    }
 }

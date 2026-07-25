@@ -292,6 +292,7 @@ fn treasury_spend_votes_handler_matches_dcrd() {
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(()),
             conn_mgr: Box::new(()),
+            client_cert_auth: false,
             tx_mempooler: Box::new(MockMempool10 {
                 tspend_hashes,
                 fetch,

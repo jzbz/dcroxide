@@ -37,7 +37,7 @@ pub(crate) mod dbcache;
 mod error;
 mod transaction;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -62,6 +62,40 @@ const METADATA_FILE: &str = "metadata.redb";
 
 /// The database driver type identifier (dcrd `DB.Type`).
 pub const DB_TYPE: &str = "redb";
+
+/// Create `path` and any missing parents, reachable only by the user
+/// running the node.
+///
+/// dcrd creates every database directory owner-only:
+/// `os.MkdirAll(dbPath, 0700)` in `database/ffldb/db.go` 2088,
+/// `os.MkdirAll(cfg.DataDir, 0700)` in `blockdb.go` 131 and
+/// `cmd/addblock/addblock.go` 48, and `os.MkdirAll(dataDir, 0700)` in
+/// `internal/blockchain/utxobackend.go` 357.  `std::fs::create_dir_all`
+/// takes no mode, so it would create `0777` masked by the umask —
+/// `0755` under the common `022`, which lets any local user walk and
+/// list a `--datadir` placed on a shared path.  The block and UTXO data
+/// are public, so this is traversal parity with dcrd rather than
+/// secrecy: nothing here is a credential.
+///
+/// Directories that already exist keep their current mode, exactly as
+/// `MkdirAll` does, so an operator who deliberately widened the data
+/// directory is not overridden and a read-only parent is not disturbed.
+/// This crate cannot depend on `dcroxide-node`, so this duplicates the
+/// daemon's `secretfile::create_dir_all_owner_only`.
+#[cfg(unix)]
+pub fn create_dir_all_owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder.create(path)
+}
+
+/// Create `path` and any missing parents.  Off Unix there is no mode to
+/// apply, so this is plain `create_dir_all`.
+#[cfg(not(unix))]
+pub fn create_dir_all_owner_only(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
 
 /// Releases the writer semaphore on drop.
 struct WriterGuard<'a> {
@@ -135,7 +169,9 @@ impl Database {
                 "database already exists at the provided path",
             ));
         }
-        std::fs::create_dir_all(&opts.path)
+        // dcrd's ffldb only creates the tree when the database does not
+        // exist (the guard above), and creates it 0700.
+        create_dir_all_owner_only(&opts.path)
             .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
 
         let kv = redb::Database::create(&meta_path)
@@ -424,5 +460,36 @@ impl Database {
             .expect("cache lock poisoned")
             .flush(&self.inner.kv, &self.inner.block_store)?;
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod dirmode_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// dcrd creates the block database tree with `os.MkdirAll(dbPath,
+    /// 0700)`, so a `--datadir` on a shared path is not traversable by
+    /// other local users.  Plain `create_dir_all` would leave 0755
+    /// under the usual 022 umask.
+    #[test]
+    fn a_created_database_directory_is_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Two missing levels, because dcrd makes the data directory and
+        // the database directory beneath it both 0700.
+        let path = tmp.path().join("data").join("blocks_redb");
+        let db = Database::create(&Options::new(&path, 0x0709_1101)).unwrap();
+        db.close().unwrap();
+
+        assert_eq!(
+            mode_of(path.parent().unwrap()),
+            0o700,
+            "every directory created for the database must be owner-only"
+        );
+        assert_eq!(mode_of(&path), 0o700, "the database directory must be 0700");
     }
 }

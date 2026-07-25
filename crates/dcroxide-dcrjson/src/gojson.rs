@@ -26,16 +26,41 @@ use crate::gotype::{GoType, GoValue, Kind, resolve};
 // Float formatting.
 // ---------------------------------------------------------------------
 
+/// Go `strconv.FormatFloat`'s text for a value with no digits — `NaN`
+/// and `±Inf` — or `None` when `v` is finite and does decompose into
+/// digits.  Every digit-based formatter below checks this first, so
+/// none of them can be handed a representation without an exponent.
+fn nonfinite_text(v: f64) -> Option<&'static str> {
+    if v.is_nan() {
+        Some("NaN")
+    } else if v.is_infinite() {
+        if v.is_sign_negative() {
+            Some("-Inf")
+        } else {
+            Some("+Inf")
+        }
+    } else {
+        None
+    }
+}
+
 /// Decompose a float's shortest-round-trip representation into its
 /// negative flag, decimal digits, and decimal point position (the
 /// number of digits before the decimal point; may be negative or
 /// exceed the digit count).
+///
+/// This is total: a representation carrying no exponent (Rust renders
+/// the non-finite floats as `inf`/`NaN`, which have no `e`) decomposes
+/// to a plain zero rather than panicking.  Callers guard those values
+/// with [`nonfinite_text`] and never observe the fallback.
 fn shortest_digits(repr: String) -> (bool, String, i32) {
     // `format!("{:e}")` yields `d.ddd...e<exp>` (shortest digits).
     let neg = repr.starts_with('-');
     let s = repr.trim_start_matches('-');
-    let (mantissa, exp) = s.split_once('e').expect("exponent");
-    let exp: i32 = exp.parse().expect("exp digits");
+    let Some((mantissa, exp)) = s.split_once('e') else {
+        return (neg, "0".to_string(), 1);
+    };
+    let exp: i32 = exp.parse().unwrap_or(0);
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
     // Strip trailing zeros; the mantissa of a shortest form has none,
     // except the plain "0".
@@ -119,15 +144,30 @@ fn format_float_json_parts(neg: bool, digits: String, dp: i32, use_e: bool) -> S
 }
 
 /// Format a `float64` exactly as Go's `encoding/json` does.
+///
+/// Go's encoder has no rendering for `NaN` and `±Inf`: it aborts the
+/// whole marshal with `json: unsupported value`.  This signature
+/// cannot fail and the decoder never produces a non-finite `float64`
+/// (`decode_number` rejects one), so such a value — only reachable from
+/// a hand-built [`GoValue`] — is emitted as the JSON `null` literal,
+/// which keeps the document parseable instead of panicking or writing
+/// a bare `+Inf` that no JSON reader accepts.
 pub fn format_float_json(v: f64) -> String {
+    if !v.is_finite() {
+        return "null".to_string();
+    }
     let abs = v.abs();
     let use_e = abs != 0.0 && (abs < 1e-6 || abs >= 1e21);
     let (neg, digits, dp) = shortest_digits(format!("{v:e}"));
     format_float_json_parts(neg, digits, dp, use_e)
 }
 
-/// Format a `float32` exactly as Go's `encoding/json` does.
+/// Format a `float32` exactly as Go's `encoding/json` does.  Non-finite
+/// values become `null`, as in [`format_float_json`].
 pub fn format_float_json32(v: f32) -> String {
+    if !v.is_finite() {
+        return "null".to_string();
+    }
     let abs = v.abs();
     let use_e = abs != 0.0 && (abs < 1e-6 || abs >= 1e21);
     let (neg, digits, dp) = shortest_digits(format!("{v:e}"));
@@ -135,14 +175,21 @@ pub fn format_float_json32(v: f32) -> String {
 }
 
 /// Format a `float64` exactly as Go's `strconv.FormatFloat(v, 'f',
-/// -1, 64)` does (shortest round-trip digits, never exponent form).
+/// -1, 64)` does (shortest round-trip digits, never exponent form;
+/// `NaN` and `±Inf` render as Go spells them).
 pub fn format_float_f(v: f64) -> String {
+    if let Some(text) = nonfinite_text(v) {
+        return text.to_string();
+    }
     let (neg, digits, dp) = shortest_digits(format!("{v:e}"));
     fmt_f(neg, &digits, dp)
 }
 
 /// Format a `float64` like Go's `fmt` verb `%v` (shortest `%g`).
 pub fn format_float_g(v: f64) -> String {
+    if let Some(text) = nonfinite_text(v) {
+        return text.to_string();
+    }
     let (neg, digits, dp) = shortest_digits(format!("{v:e}"));
     let exp = dp - 1;
     if exp < -4 || exp >= 6 {
@@ -154,6 +201,9 @@ pub fn format_float_g(v: f64) -> String {
 
 /// Format a `float32` like Go's `fmt` verb `%v` (shortest `%g`).
 pub fn format_float_g32(v: f32) -> String {
+    if let Some(text) = nonfinite_text(v as f64) {
+        return text.to_string();
+    }
     let (neg, digits, dp) = shortest_digits(format!("{v:e}"));
     let exp = dp - 1;
     if exp < -4 || exp >= 6 {
@@ -1024,6 +1074,44 @@ struct Reader<'a> {
     pos: usize,
 }
 
+/// Decode the one UTF-8 sequence starting at `data[at]` the way Go's
+/// `utf8.DecodeRune` does: a well-formed sequence yields its rune and
+/// its length in bytes, and anything else — a stray continuation byte,
+/// a truncated or overlong sequence, an encoded surrogate half — yields
+/// U+FFFD with a length of one.  That is exactly what Go's
+/// `encoding/json` `unquoteBytes` does with the contents of a string:
+/// it coerces to well-formed UTF-8 rather than failing, so malformed
+/// bytes can never panic the decoder.
+///
+/// The slice handed to the UTF-8 validator is capped at the four bytes
+/// a sequence can occupy, which makes this O(1) per character.
+/// Validating the whole unread remainder instead would make reading a
+/// non-ASCII string quadratic in its length.
+fn decode_rune(data: &[u8], at: usize) -> (char, usize) {
+    const MAX_SEQ_LEN: usize = 4;
+    let end = data.len().min(at.saturating_add(MAX_SEQ_LEN));
+    let Some(window) = data.get(at..end) else {
+        return (char::REPLACEMENT_CHARACTER, 1);
+    };
+    // A window cut off mid-sequence at the cap fails validation even
+    // though its leading character is well formed, so fall back to the
+    // longest valid prefix, which always covers that character.
+    let text = match core::str::from_utf8(window) {
+        Ok(text) => text,
+        Err(err) => match window
+            .get(..err.valid_up_to())
+            .and_then(|prefix| core::str::from_utf8(prefix).ok())
+        {
+            Some(text) => text,
+            None => return (char::REPLACEMENT_CHARACTER, 1),
+        },
+    };
+    match text.chars().next() {
+        Some(ch) => (ch, ch.len_utf8()),
+        None => (char::REPLACEMENT_CHARACTER, 1),
+    }
+}
+
 impl<'a> Reader<'a> {
     fn skip_ws(&mut self) {
         while self.pos < self.data.len()
@@ -1122,11 +1210,15 @@ impl<'a> Reader<'a> {
                 }
                 c if c < 0x80 => out.push(c as char),
                 _ => {
-                    // Multi-byte UTF-8: copy the full character.
-                    let s = core::str::from_utf8(&self.data[self.pos - 1..]).expect("utf8");
-                    let ch = s.chars().next().expect("char");
+                    // Multi-byte UTF-8: decode exactly this character.
+                    // The validator only ever sees the at most four
+                    // bytes one sequence can occupy, so a string of
+                    // non-ASCII text costs O(n) rather than
+                    // revalidating the whole remainder per character.
+                    let start = self.pos - 1;
+                    let (ch, size) = decode_rune(self.data, start);
                     out.push(ch);
-                    self.pos += ch.len_utf8() - 1;
+                    self.pos = start + size;
                 }
             }
         }

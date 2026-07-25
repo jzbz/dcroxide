@@ -51,6 +51,21 @@ impl dcroxide_standalone::SubsidyParams for RpcSubsidyParams {
     }
 }
 
+/// The error text a server seam's trait default reports when the
+/// daemon has not wired that seam up.
+///
+/// dcrd has no counterpart: every interface in its `rpcserver.Config`
+/// is satisfied by a concrete type at construction, so a seam without
+/// an implementation is a build defect rather than a chain failure.
+/// Reporting it as an ordinary error value — which the handlers wrap
+/// into the JSON-RPC internal error the same way they wrap a chain
+/// failure — keeps a request against an unwired seam from unwinding
+/// the handler thread, since a remote caller must never be able to
+/// panic a handler.
+pub(crate) fn unwired_seam(seam: &str) -> String {
+    format!("RPC server seam {seam} is not wired in this build")
+}
+
 /// The chain operations the ported handlers perform (the used subset
 /// of dcrd's `rpcserver.Chain` interface; it grows with each handler
 /// slice).
@@ -89,8 +104,12 @@ pub trait RpcChain {
         unimplemented!("block_height_by_hash")
     }
     /// The current chain tips (dcrd `ChainTips`).
+    ///
+    /// The signature cannot carry a failure, so the unwired default
+    /// reports no tips rather than unwinding a handler thread on a
+    /// remote request.
     fn chain_tips(&mut self) -> Vec<RpcChainTip> {
-        unimplemented!("chain_tips")
+        Vec::new()
     }
     /// The cumulative work of the block with the given hash (dcrd
     /// `ChainWork`).
@@ -158,7 +177,7 @@ pub trait RpcChain {
         _new_tickets: i64,
         _use_max_tickets: bool,
     ) -> Result<i64, String> {
-        unimplemented!("estimate_next_stake_difficulty")
+        Err(unwired_seam("estimate_next_stake_difficulty"))
     }
     /// Whether the ticket is currently live (dcrd `CheckLiveTicket`).
     fn check_live_ticket(&mut self, _hash: &Hash) -> bool {
@@ -171,8 +190,13 @@ pub trait RpcChain {
     }
     /// The final height of the stake version interval containing the
     /// given height (dcrd `CalcWantHeight`).
+    ///
+    /// The signature cannot carry a failure, so the unwired default
+    /// answers zero rather than unwinding a handler thread; every
+    /// caller pairs it with a fallible seam whose unwired default
+    /// then fails the request outright.
     fn calc_want_height(&mut self, _interval: i64, _height: i64) -> i64 {
-        unimplemented!("calc_want_height")
+        0
     }
     /// The stake versions of the count blocks ending at the given hash
     /// (dcrd `GetStakeVersions`).
@@ -181,7 +205,7 @@ pub trait RpcChain {
         _hash: &Hash,
         _count: i32,
     ) -> Result<Vec<RpcStakeVersions>, String> {
-        unimplemented!("get_stake_versions")
+        Err(unwired_seam("get_stake_versions"))
     }
     /// The agendas for the given vote version as of the given block
     /// (dcrd `GetVoteInfo`).
@@ -190,12 +214,15 @@ pub trait RpcChain {
         _hash: &Hash,
         _version: u32,
     ) -> Result<Vec<dcroxide_chaincfg::ConsensusDeployment>, VoteInfoFailure> {
-        unimplemented!("get_vote_info")
+        Err(VoteInfoFailure {
+            is_unknown_deployment_version: false,
+            message: unwired_seam("get_vote_info"),
+        })
     }
     /// The total number of votes cast with the given version (dcrd
     /// `CountVoteVersion`).
     fn count_vote_version(&mut self, _version: u32) -> Result<u32, String> {
-        unimplemented!("count_vote_version")
+        Err(unwired_seam("count_vote_version"))
     }
     /// The cumulative vote counts for the given agenda (dcrd
     /// `GetVoteCounts`).
@@ -204,7 +231,7 @@ pub trait RpcChain {
         _version: u32,
         _deployment_id: &str,
     ) -> Result<RpcVoteCounts, String> {
-        unimplemented!("get_vote_counts")
+        Err(unwired_seam("get_vote_counts"))
     }
     /// The total value of the live ticket pool (dcrd
     /// `TicketPoolValue`).
@@ -217,7 +244,11 @@ pub trait RpcChain {
         &mut self,
         _hash: &Hash,
     ) -> Result<RpcTreasuryBalance, TreasuryBalanceFailure> {
-        unimplemented!("treasury_balance")
+        Err(TreasuryBalanceFailure {
+            is_unknown_block: false,
+            is_no_treasury_balance: false,
+            message: unwired_seam("treasury_balance"),
+        })
     }
     /// The currently live tickets (dcrd `LiveTickets`).
     fn live_tickets(&mut self) -> Result<Vec<Hash>, String> {
@@ -244,23 +275,31 @@ pub trait RpcChain {
         &mut self,
         _addr: &dcroxide_txscript::stdaddr::Address,
     ) -> Result<Vec<Hash>, String> {
-        unimplemented!("tickets_with_address")
+        Err(unwired_seam("tickets_with_address"))
     }
     /// Manually invalidate the block as though it violated a
     /// consensus rule (dcrd `InvalidateBlock`).
     fn invalidate_block(&mut self, _hash: &Hash) -> Result<(), InvalidateBlockFailure> {
-        unimplemented!("invalidate_block")
+        Err(InvalidateBlockFailure {
+            is_unknown_block: false,
+            is_invalidate_genesis: false,
+            message: unwired_seam("invalidate_block"),
+        })
     }
     /// Manually reconsider a previously invalidated block (dcrd
     /// `ReconsiderBlock`).
     fn reconsider_block(&mut self, _hash: &Hash) -> Result<(), ReconsiderBlockFailure> {
-        unimplemented!("reconsider_block")
+        Err(ReconsiderBlockFailure {
+            is_unknown_block: false,
+            all_rule_errs: false,
+            message: unwired_seam("reconsider_block"),
+        })
     }
     /// The header of the main chain block at the given height (dcrd
     /// `HeaderByHeight`; the error text only feeds the wrapped
     /// internal error).
     fn header_by_height(&mut self, _height: i64) -> Result<BlockHeader, String> {
-        unimplemented!("header_by_height")
+        Err(unwired_seam("header_by_height"))
     }
     /// Whether the treasury agenda is active as of the block AFTER the
     /// given block (dcrd `IsTreasuryAgendaActive`).
@@ -286,7 +325,7 @@ pub trait RpcChain {
     /// The hashes of the blocks a treasury spend was mined in (dcrd
     /// `FetchTSpend`; the error only drives the not-found result).
     fn fetch_tspend(&mut self, _tspend: &Hash) -> Result<Vec<Hash>, String> {
-        unimplemented!("fetch_tspend")
+        Err(unwired_seam("fetch_tspend"))
     }
     /// The entire generation of blocks stemming from the parent of
     /// the current tip (dcrd `TipGeneration`).
@@ -297,7 +336,7 @@ pub trait RpcChain {
     /// `LotteryDataForBlock`; only the tickets are consumed and the
     /// failure is log-only).
     fn lottery_data_for_block(&mut self, _hash: &Hash) -> Result<Vec<Hash>, String> {
-        unimplemented!("lottery_data_for_block")
+        Err(unwired_seam("lottery_data_for_block"))
     }
     /// The (yes, no) vote tally for the treasury spend counted up to
     /// the given block (dcrd `TSpendCountVotes`; u32 tallies per
@@ -529,6 +568,12 @@ pub struct Config<C> {
     /// Whether mining is allowed without being connected and synced
     /// (dcrd `AllowUnsyncedMining`).
     pub allow_unsynced_mining: bool,
+    /// Whether the transport itself requires and verifies a TLS
+    /// client certificate (`--authtype=clientcert`).  dcrd leaves the
+    /// Basic auth MACs zero in that mode and relies entirely on the
+    /// TLS layer, so the zero-MAC acceptance is only sound when this
+    /// is set.
+    pub client_cert_auth: bool,
     /// The admin RPC username (dcrd `RPCUser`).
     pub rpc_user: String,
     /// The admin RPC password (dcrd `RPCPass`).
@@ -602,8 +647,12 @@ impl RpcCpuMiner for () {}
 /// `rpcserver.MixPooler` interface).
 pub trait RpcMixPooler {
     /// All current mixing pair request messages (dcrd `MixPRs`).
+    ///
+    /// The signature cannot carry a failure, so the unwired default
+    /// reports an empty pool rather than unwinding a handler thread
+    /// on a remote request.
     fn mix_prs(&mut self) -> Vec<MsgMixPairReq> {
-        unimplemented!("mix_prs")
+        Vec::new()
     }
     /// The mixing message with the given hash (dcrd `Message`; the
     /// error only drives the not-found result).
@@ -627,8 +676,12 @@ pub trait RpcProfilerManager {
     }
     /// The listener addresses the profile server is bound to, empty
     /// when not running (dcrd `Listeners`).
+    ///
+    /// The signature cannot carry a failure; an unwired seam has no
+    /// profile server running, which is exactly what the empty
+    /// default reports, so it never unwinds a handler thread.
     fn listeners(&mut self) -> Vec<String> {
-        unimplemented!("listeners")
+        Vec::new()
     }
 }
 
@@ -708,7 +761,7 @@ pub trait RpcSyncManager {
     /// Submit the mixing message to the mixpool, with the local node
     /// as the source (dcrd `AcceptMixMessage`).
     fn accept_mix_message(&mut self, _msg: &Message) -> Result<(), String> {
-        unimplemented!("accept_mix_message")
+        Err(unwired_seam("accept_mix_message"))
     }
 }
 
@@ -910,9 +963,11 @@ pub trait RpcConnManager {
     }
     /// Broadcast the message to all connected peers (dcrd
     /// `BroadcastMessage`).
-    fn broadcast_message(&mut self, _msg: &dcroxide_wire::Message) {
-        unimplemented!("broadcast_message")
-    }
+    ///
+    /// The signature cannot carry a failure, so the unwired default
+    /// drops the broadcast rather than unwinding a handler thread on
+    /// a remote request.
+    fn broadcast_message(&mut self, _msg: &dcroxide_wire::Message) {}
     /// Relay inventory vectors for newly accepted transactions (dcrd
     /// `RelayTransactions`).
     fn relay_transactions(&mut self, _tx_hashes: &[Hash]) {
@@ -924,9 +979,13 @@ pub trait RpcConnManager {
         unimplemented!("add_rebroadcast_inventory")
     }
     /// Relay the mixing messages to peers (dcrd `RelayMixMessages`).
-    fn relay_mix_messages(&mut self, _msgs: &[Message]) {
-        unimplemented!("relay_mix_messages")
-    }
+    ///
+    /// The signature cannot carry a failure, so the unwired default
+    /// drops the relay rather than unwinding a handler thread; the
+    /// only caller first passes the message through
+    /// [`RpcSyncManager::accept_mix_message`], whose unwired default
+    /// already fails the request outright.
+    fn relay_mix_messages(&mut self, _msgs: &[Message]) {}
 }
 
 impl RpcConnManager for () {}
