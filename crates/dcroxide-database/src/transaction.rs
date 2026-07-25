@@ -116,10 +116,11 @@ struct TxState {
     /// `pendingRemove`).
     pending_removes: std::collections::BTreeSet<Vec<u8>>,
     /// The metadata cache overlay as of transaction start (dcrd's
-    /// `dbCacheSnapshot`); an `Arc` clone, released at commit before
-    /// the cache applies this transaction so the overlay mutates in
-    /// place instead of copy-on-write cloning itself every commit.
-    cache_snap: Arc<crate::dbcache::CacheMap>,
+    /// `dbCacheSnapshot`): a layer stack held by an `Arc` clone, taken
+    /// and dropped in O(1).  A writable transaction releases it at
+    /// commit, before the cache applies this transaction, so the
+    /// cache's newest layer is unshared and takes the write in place.
+    cache_snap: Arc<crate::dbcache::CacheSnapshot>,
 }
 
 /// A database transaction over the metadata buckets and block storage
@@ -136,7 +137,7 @@ impl Transaction {
     pub(crate) fn new(
         db: Arc<DbInner>,
         kv: KvTxSeed,
-        cache_snap: Arc<crate::dbcache::CacheMap>,
+        cache_snap: Arc<crate::dbcache::CacheSnapshot>,
         managed: bool,
     ) -> Transaction {
         let (kv, writable) = match kv {
@@ -190,6 +191,9 @@ impl Transaction {
         if let Some(v) = state.pending_keys.get(key) {
             return Some(v.clone());
         }
+        // A cached entry answers the lookup whether it holds a value or
+        // a pending deletion (`None`); only a key no layer knows falls
+        // through to the store.
         if let Some(entry) = state.cache_snap.get(key) {
             return entry.clone();
         }
@@ -270,23 +274,13 @@ impl Transaction {
         };
 
         // Merge the layered views over the stored keys: the cache
-        // snapshot's live entries add and its deletions mask, then
-        // this transaction's own pending sets do the same on top.
+        // snapshot's live entries add and its deletions mask — with a
+        // newer overlay layer shadowing every older one for the same
+        // key — then this transaction's own pending sets do the same on
+        // top.
         let mut merged: std::collections::BTreeSet<Vec<u8>> =
             result.unwrap_or_default().into_iter().collect();
-        for (key, value) in state.cache_snap.range(prefix.to_vec()..) {
-            if !key.starts_with(prefix) {
-                break;
-            }
-            match value {
-                Some(_) => {
-                    merged.insert(key.clone());
-                }
-                None => {
-                    merged.remove(key);
-                }
-            }
-        }
+        state.cache_snap.merge_prefix_keys(prefix, &mut merged);
         for key in state.pending_removes.range(prefix.to_vec()..) {
             if !key.starts_with(prefix) {
                 break;
@@ -533,7 +527,7 @@ impl Transaction {
         state.pending_index.clear();
         state.pending_keys.clear();
         state.pending_removes.clear();
-        state.cache_snap = Arc::new(std::collections::BTreeMap::new());
+        state.cache_snap = Arc::new(crate::dbcache::CacheSnapshot::default());
     }
 
     /// Commit all changes made to metadata and block storage (dcrd
@@ -636,11 +630,11 @@ impl Transaction {
 
         let (puts, removes) = {
             let mut state = self.state.borrow_mut();
-            // Release this transaction's snapshot so the shared cache
-            // is unshared when it applies the changes below (the
-            // copy-on-write clone otherwise turns every commit into a
-            // full-map copy).
-            state.cache_snap = Arc::new(std::collections::BTreeMap::new());
+            // Release this transaction's snapshot so the cache's newest
+            // layer is unshared when it applies the changes below and
+            // can take them in place (a snapshot naming that layer
+            // forces the commit to seal a fresh layer instead).
+            state.cache_snap = Arc::new(crate::dbcache::CacheSnapshot::default());
             (
                 std::mem::take(&mut state.pending_keys),
                 std::mem::take(&mut state.pending_removes),

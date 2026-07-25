@@ -177,6 +177,23 @@ fn open_error(e: redb::DatabaseError) -> Error {
     }
 }
 
+#[cfg(test)]
+impl Database {
+    /// How many layers the metadata overlay currently holds.
+    ///
+    /// The layer count is an implementation detail everywhere except in
+    /// the overlay's own tests, which have to prove they are exercising a
+    /// real stack rather than the collapsed single-layer case.
+    pub(crate) fn overlay_layer_count(&self) -> usize {
+        self.inner
+            .cache
+            .lock()
+            .expect("cache lock poisoned")
+            .cached
+            .layer_count()
+    }
+}
+
 impl Database {
     /// Create a new database at the directory in the options; errors
     /// with `ErrDbExists` when one is already there (dcrd
