@@ -137,11 +137,33 @@ pub struct PeerTemplate {
     pub idle_timeout: Duration,
     /// How often to ping an otherwise-quiet peer.
     pub ping_interval: Duration,
+    /// Reports the chain tip for the `version` message's `last_block`
+    /// (dcrd's `Config.NewestBlock`, fed by `server.NewestBlock`).
+    ///
+    /// `None` advertises height 0, which is what the daemon did until
+    /// this was wired and is why it could not be a sync source for
+    /// anyone: dcrd's sync-peer candidate check requires a peer's
+    /// advertised height to reach its own, so a node claiming 0 is never
+    /// eligible.  A dcroxide peer syncing from one got as far as its
+    /// first sync-peer re-selection and then reported "no sync peer
+    /// candidates available" with the connection still up.  Left as an
+    /// `Option` because the protocol-only tests have no chain.
+    pub newest_block: Option<NewestBlockProvider>,
 }
+
+/// Reports the chain tip as (hash, height) for the version message.
+/// Shared rather than boxed because every connection needs its own
+/// `FnMut` and they all read the same chain.
+pub type NewestBlockProvider =
+    Arc<dyn Fn() -> Result<(dcroxide_chainhash::Hash, i64), String> + Send + Sync>;
 
 impl PeerTemplate {
     /// Build a fresh peer configuration for a new connection.
-    fn config(&self) -> Config {
+    ///
+    /// Public so a test can check what the connection will actually
+    /// advertise; the height this carries was unwired for a long time
+    /// without anything noticing.
+    pub fn config(&self) -> Config {
         Config {
             net: self.net,
             services: self.services,
@@ -149,6 +171,9 @@ impl PeerTemplate {
             user_agent_version: self.user_agent_version.clone(),
             protocol_version: self.protocol_version,
             idle_timeout_nanos: self.idle_timeout.as_nanos() as i64,
+            newest_block: self.newest_block.clone().map(|provider| {
+                Box::new(move || provider()) as Box<dyn FnMut() -> Result<_, String> + Send>
+            }),
             ..Config::default()
         }
     }
@@ -728,6 +753,7 @@ mod tests {
             user_agent_version: "0.1.0".to_string(),
             idle_timeout: Duration::from_secs(3600),
             ping_interval: Duration::from_secs(3600),
+            newest_block: None,
         };
         let mut csprng = dcroxide_connmgr::SystemCsprng::default();
         let manager = Arc::new(Mutex::new(dcroxide_connmgr::ConnManager::new(

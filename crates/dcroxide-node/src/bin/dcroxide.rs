@@ -1070,6 +1070,19 @@ fn build_server(
         user_agent_version: version::user_agent_version(),
         idle_timeout: Duration::from_nanos(DEFAULT_IDLE_TIMEOUT as u64),
         ping_interval: Duration::from_nanos(PING_INTERVAL as u64),
+        // Advertise the real tip in every `version` (dcrd's
+        // `server.NewestBlock`).  Without this the node claims height 0
+        // and no peer will ever choose it as a sync source.
+        newest_block: Some({
+            let chain = Arc::clone(&chain);
+            Arc::new(move || {
+                let chain = chain
+                    .lock()
+                    .map_err(|_| "chain mutex poisoned".to_string())?;
+                let best = chain.best_snapshot();
+                Ok((best.hash, best.height))
+            })
+        }),
     };
     // The mixing pool the getdata serve path and the sync manager share
     // (dcrd `newServer` building one `mixpool.Pool`).

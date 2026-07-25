@@ -81,6 +81,7 @@ fn template(name: &str) -> PeerTemplate {
         user_agent_version: "0.1.0".to_string(),
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        newest_block: None,
     }
 }
 
@@ -401,4 +402,69 @@ fn wire_na(ip: [u8; 4], port: u16) -> dcroxide_addrmgr::NetAddress {
         port,
         addr_type: dcroxide_addrmgr::NetAddressType::IPv4,
     }
+}
+
+/// The `version` message must advertise the node's real chain tip.
+///
+/// dcrd's sync-peer candidate check requires a peer's advertised height
+/// to reach its own, so a node that claims height 0 is never eligible as
+/// a sync source — for dcrd or for another dcroxide. The seam for this
+/// (`Config::newest_block`, dcrd's `Config.NewestBlock`) was ported
+/// correctly and then never wired by the daemon, so every dcroxide node
+/// advertised 0. It surfaced only when a dcroxide was pointed at another
+/// dcroxide as its single peer: the download ran to 94% on the sync peer
+/// chosen at startup (when both were at height 0, so the check passed),
+/// then the first sync-peer re-selection found no candidate and the node
+/// sat idle for hours with the connection still up and one line in the
+/// log.
+///
+/// This pins the template's plumbing: a provider, once set, is reached by
+/// every connection's own callback. What actually prevents a recurrence is
+/// structural rather than a test — `newest_block` is a mandatory field of
+/// `PeerTemplate` with no `Default`, so omitting it in the daemon is a
+/// compile error. That is the specific hole that let this through: the
+/// config was built with `..Config::default()`, which supplied `None`
+/// silently. Writing `None` there explicitly still compiles, so it is a
+/// visible choice at one site rather than an invisible omission — and
+/// `None` remains correct for the protocol-only tests, which have no
+/// chain to ask.
+#[test]
+fn the_peer_template_advertises_the_tip_it_is_given() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tmpl = template("dcroxide-tip");
+    let seen = Arc::clone(&calls);
+    tmpl.newest_block = Some(Arc::new(move || {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Ok((dcroxide_chainhash::Hash([7u8; 32]), 1_100_215))
+    }));
+
+    // Every connection gets its own callback, and each must reach the
+    // shared provider rather than the height-0 default.
+    for _ in 0..3 {
+        let mut cfg = tmpl.config();
+        let newest = cfg
+            .newest_block
+            .as_mut()
+            .expect("a template with a provider must produce a config with one");
+        let (hash, height) = newest().expect("the provider must answer");
+        assert_eq!(
+            height, 1_100_215,
+            "the config must report the given tip height"
+        );
+        assert_eq!(hash, dcroxide_chainhash::Hash([7u8; 32]));
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "each connection's callback must consult the shared provider"
+    );
+
+    // And without one the node advertises 0, the documented fallback.
+    let plain = template("dcroxide-no-chain");
+    assert!(
+        plain.config().newest_block.is_none(),
+        "no provider must leave the version message's last_block at 0"
+    );
 }

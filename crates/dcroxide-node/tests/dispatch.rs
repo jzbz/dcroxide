@@ -101,6 +101,7 @@ fn serve_genesis_chain() -> GenesisChainRig {
         user_agent_version: "0.1.0".to_string(),
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        newest_block: None,
     };
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
@@ -690,6 +691,7 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         user_agent_version: "0.1.0".to_string(),
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        newest_block: None,
     };
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
@@ -810,6 +812,7 @@ fn disconnects_a_stalled_header_sync_peer() {
         user_agent_version: "0.1.0".to_string(),
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        newest_block: None,
     };
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(
@@ -1022,6 +1025,7 @@ fn announces_connected_blocks_to_served_peers() {
         user_agent_version: "0.1.0".to_string(),
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        newest_block: None,
     };
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(

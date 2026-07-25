@@ -484,6 +484,7 @@ fn serve_genesis_chain() -> (
         user_agent_version: "0.1.0".to_string(),
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        newest_block: None,
     };
     let connected = ConnectedPeers::new();
     let runtime = ListenerRuntime::start(

@@ -2807,6 +2807,7 @@ mod tests {
             user_agent_version: "0.1.0".to_string(),
             idle_timeout: std::time::Duration::from_secs(3600),
             ping_interval: std::time::Duration::from_secs(3600),
+            newest_block: None,
         }
     }
 
