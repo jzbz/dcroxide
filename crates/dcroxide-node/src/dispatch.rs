@@ -11,19 +11,21 @@
 //! queues responses through the peer's [`OutboundQueue`], so all writes
 //! stay serialized on the output loop exactly like dcrd's `QueueMessage`.
 //!
-//! dcrd serves getdata batches asynchronously behind a semaphore and
-//! pending-request counters; this synchronous translation serves each
-//! batch inline on the input thread, so batches never overlap by
-//! construction and the intake gates see zero prior pending requests.
+//! getdata is the one exception: like dcrd, each served peer gets a
+//! dedicated serve worker (dcrd's `serveGetData` goroutine) fed by a
+//! bounded batch queue (`getDataQueue`), so the intake gates on the
+//! input thread see the real pending-batch and pending-item counts,
+//! the chain lock is taken per item rather than per batch, and the
+//! send pipeline stays bounded by dcrd's `maxPendingSend` slots.
 //! The address/relay handlers (`OnAddr`, `OnGetAddr`, inventory relay),
 //! the sync-manager forwards (`OnInv`, `OnHeaders`, block/tx intake),
 //! and the mempool/mixpool-backed fetches arrive with later pieces;
 //! messages without a handler are ignored, matching a dcrd node whose
 //! subsystems simply have nothing to do.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -43,10 +45,11 @@ use crate::peerconn::NodePeerEnv;
 use crate::peerloop::{OutboundQueue, ServeSignal};
 use crate::server::{
     GetAddrFacts, GetDataResolution, GetHeadersResponse, InitStateWants, MAX_BLOCKS_PER_MSG,
-    OnAddrFacts, OnAddrOutcome, OnGetDataOutcome, OnGetInitStateOutcome, OnGetMiningStateOutcome,
-    OnInvOutcome, PushAddrOutcome, ServeGetDataAction, ServerPeerAddrState,
-    build_get_blocks_response, build_get_headers_response, natf_supported, on_addr, on_get_addr,
-    on_get_data, on_get_init_state, on_get_mining_state, on_inv_classify, serve_get_data,
+    MAX_CONCURRENT_GETDATA_REQS, MAX_PENDING_SEND, OnAddrFacts, OnAddrOutcome, OnGetDataOutcome,
+    OnGetInitStateOutcome, OnGetMiningStateOutcome, OnInvOutcome, PushAddrOutcome, SendPipeline,
+    ServeGetDataItemAction, ServerPeerAddrState, build_get_blocks_response,
+    build_get_headers_response, natf_supported, on_addr, on_get_addr, on_get_data,
+    on_get_init_state, on_get_mining_state, on_inv_classify, serve_get_data_item,
 };
 use crate::sync::NodeSyncManager;
 
@@ -417,26 +420,41 @@ impl SyncPeers {
         })
     }
 
-    /// Drop the inventory the peer already knows and mark the survivors
-    /// known, returning what remains to send (dcrd `QueueInventory`'s
-    /// contains-check plus its mark-on-send).  An unregistered peer keeps
-    /// the whole list.
-    pub(crate) fn filter_and_mark_known(&self, id: i32, invs: Vec<InvVect>) -> Vec<InvVect> {
+    /// Drop the inventory the peer already knows, returning what remains
+    /// to send (dcrd `QueueInventory`'s contains-check).  An unregistered
+    /// peer keeps the whole list.
+    ///
+    /// Marking is deliberately *not* done here: dcrd marks each vector as
+    /// it batches it into the inv message it is about to hand to a
+    /// channel that cannot fail, so marking always accompanies a send
+    /// (`queueHandler`'s trickle timer).  The port's queue can refuse a
+    /// message, so the caller marks with [`SyncPeers::mark_known`] only
+    /// after the enqueue succeeds — otherwise the peer is permanently
+    /// convinced it knows inventory it was never sent.
+    pub(crate) fn filter_known(&self, id: i32, invs: Vec<InvVect>) -> Vec<InvVect> {
         let registry = self.inner.lock().expect("sync peers mutex poisoned");
         let Some(handles) = registry.get(&id) else {
             return invs;
         };
+        // `contains` refreshes the LRU recency, so the guard is mutable
+        // even though nothing is inserted here.
         let mut relay = handles.relay.lock().expect("relay state poisoned");
         invs.into_iter()
-            .filter(|inv| {
-                if relay.known_inventory.contains(inv) {
-                    false
-                } else {
-                    relay.known_inventory.put(*inv);
-                    true
-                }
-            })
+            .filter(|inv| !relay.known_inventory.contains(inv))
             .collect()
+    }
+
+    /// Record inventory as known to the peer, after it has really been
+    /// queued for sending (dcrd `AddKnownInventory`).
+    pub(crate) fn mark_known(&self, id: i32, invs: &[InvVect]) {
+        let registry = self.inner.lock().expect("sync peers mutex poisoned");
+        let Some(handles) = registry.get(&id) else {
+            return;
+        };
+        let mut relay = handles.relay.lock().expect("relay state poisoned");
+        for inv in invs {
+            relay.known_inventory.put(*inv);
+        }
     }
 
     /// Relay inventory to every registered peer that should receive it
@@ -506,11 +524,23 @@ impl SyncPeers {
                     // the headers message directly, bypassing the
                     // inventory queue and its known-inventory set).
                     if let Some(header) = header {
-                        let _ = handles.outbound.queue_message(Message::Headers(
+                        let queued = handles.outbound.try_queue(Message::Headers(
                             dcroxide_wire::MsgHeaders {
                                 headers: vec![*header],
                             },
                         ));
+                        if !queued {
+                            // The announcement never went out, so undo
+                            // the marker the decision core set: leaving
+                            // it would make the next announcement of
+                            // this block look like a duplicate and get
+                            // dropped as well.  dcrd cannot reach this
+                            // state — its enqueue blocks instead of
+                            // failing — so the marker is simply put
+                            // back the way an unannounced block leaves
+                            // it.
+                            *announced_block = None;
+                        }
                     }
                 }
                 crate::server::RelayPeerAction::QueueInventory
@@ -522,10 +552,30 @@ impl SyncPeers {
                     if known_inventory.contains(&inv) {
                         continue;
                     }
-                    known_inventory.put(inv);
-                    let _ = handles.outbound.queue_message(Message::Inv(MsgInv {
+                    // Record the item as known to the peer only once it
+                    // is really on its way.  dcrd marks it as it batches
+                    // the inv into a message it then hands to a channel
+                    // that cannot fail, so marking and queueing are one
+                    // step there (`queueHandler`'s trickle timer calling
+                    // `AddKnownInventory` per vector).  Marking first
+                    // here would permanently convince this peer it knows
+                    // an item it was never told about, and the
+                    // announcement would never be retried.
+                    if handles.outbound.try_queue(Message::Inv(MsgInv {
                         inv_list: vec![inv],
-                    }));
+                    })) {
+                        known_inventory.put(inv);
+                    } else if inv.inv_type == InvType::BLOCK {
+                        // Same undo as the headers branch above, which
+                        // this path was missing: a block announcement
+                        // that never went out must not leave the marker
+                        // set, or the second announcement pass (every
+                        // block is offered twice, once per drain) reads
+                        // it as a duplicate and drops it too — so a peer
+                        // that prefers inv over headers would never
+                        // learn the block from us at all.
+                        *announced_block = None;
+                    }
                 }
             }
         }
@@ -684,7 +734,59 @@ impl SyncPeers {
             match action {
                 Action::QueueMessage { peer, message } => {
                     if let Some(handles) = registry.get(&peer) {
-                        let _ = handles.outbound.queue_message(message);
+                        let command = message.command();
+                        match handles.outbound.queue_message(message) {
+                            Ok(()) => {}
+                            // The output loop already stopped, so the
+                            // connection is tearing down and the sync
+                            // manager will be told through the ordinary
+                            // disconnect path.
+                            Err(crate::peerloop::QueueError::Closed) => {}
+                            Err(crate::peerloop::QueueError::Full) => {
+                                // Do NOT disconnect here.  dcrd never
+                                // does: its `queueHandler` appends to an
+                                // unbounded `pendingMsgs`, so a full
+                                // queue is not a signal about the peer
+                                // at all.  Severing the connection
+                                // instead punishes an honest peer for
+                                // transient congestion — post-sync,
+                                // relay emits one inv message per item
+                                // per peer, so a peer on a slow link can
+                                // accumulate the whole queue purely
+                                // while we are pushing it a block it
+                                // asked for, and the next sync request
+                                // would kill it.
+                                //
+                                // What makes dropping safe is that the
+                                // depth can only stay full for a bounded
+                                // time: the output loop's write budget
+                                // is an absolute per-message deadline
+                                // (`write_all_by_deadline`), so a peer
+                                // whose socket never drains is torn down
+                                // by that deadline, and netsync's
+                                // ordinary disconnect handling then
+                                // re-requests elsewhere.  A peer that is
+                                // merely slow drains and keeps serving.
+                                //
+                                // Residual: the one refused request is
+                                // lost rather than re-queued, so that
+                                // peer's sync leg is idle until the
+                                // stall detector or the write deadline
+                                // acts.  Re-queueing needs a netsync
+                                // seam that does not exist yet; the
+                                // warning is the operator's signal.
+                                handles.outbound.report_full(command);
+                                crate::logging::warn(
+                                    "SYNC",
+                                    &format!(
+                                        "Outbound queue for peer {} is full -- dropping the \
+                                         {command} request; the peer's write deadline bounds \
+                                         how long this can persist",
+                                        handles.remote_addr.as_deref().unwrap_or("unknown")
+                                    ),
+                                );
+                            }
+                        }
                     }
                 }
                 Action::Disconnect { peer } => {
@@ -867,8 +969,10 @@ pub struct ServerPeerHandler {
     addr_state: ServerPeerAddrState,
     /// The block hash of the final inventory of a full getblocks
     /// response; serving that block triggers a best-tip inventory to
-    /// prompt the next batch (dcrd `serverPeer.continueHash`).
-    continue_hash: Option<Hash>,
+    /// prompt the next batch (dcrd `serverPeer.continueHash`, an
+    /// atomic pointer there because the serve goroutine clears it
+    /// while the input goroutine sets it).
+    continue_hash: Arc<Mutex<Option<Hash>>>,
     /// The clock-and-randomness environment for the handlers.
     env: NodePeerEnv,
     /// Whether the init state was already sent on this connection
@@ -899,6 +1003,344 @@ pub struct ServerPeerHandler {
     /// `Peer.Addr()`, stored at peer creation), so the address-keyed
     /// control RPCs match even when the socket clone failed.
     remote_addr: String,
+    /// The shared peer handle, kept so the getdata serve worker can
+    /// read the send accounting the output loop maintains and pace
+    /// its pipeline against it.  Set at `on_connected`; the input
+    /// thread holds the guard across the handlers, so it is only ever
+    /// cloned here, never locked.
+    peer_handle: Option<Arc<Mutex<Peer>>>,
+    /// The peer's getdata serve queue and its pending-request
+    /// counters, created on the first getdata (dcrd creates the
+    /// channel in `newServerPeer` and starts the goroutine in `Run`).
+    getdata_serve: Option<GetDataServe>,
+}
+
+/// How long the getdata serve worker waits for the peer's output loop
+/// to make progress before abandoning the rest of a batch.  A peer
+/// that stops reading its socket stalls the worker here instead of
+/// letting fetched data pile up; abandoning the batch leaves its
+/// remaining items counted as pending, so the peer's next getdata
+/// trips the pending-item limit and disconnects it — the same outcome
+/// dcrd reaches by blocking on its send semaphore until the peer is
+/// dropped.
+const GETDATA_SEND_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often the serve worker re-reads the peer's send accounting
+/// while its send pipeline is full.
+const GETDATA_SEND_POLL: Duration = Duration::from_millis(2);
+
+/// The size charged to the send pipeline for a queued mix message,
+/// which has no cheap serialized-size query.  It is deliberately
+/// generous: over-charging only makes the pipeline hold the slot
+/// longer, which is the safe direction.
+const NOMINAL_MIX_MESSAGE_BYTES: u64 = 32_768;
+
+/// The per-peer getdata serve queue: dcrd's `serverPeer.getDataQueue`
+/// channel, its `numPendingGetDataItemReqs` counter, and the handle
+/// used to stop the `serveGetData` goroutine.
+struct GetDataServe {
+    /// Batches handed to the serve worker.  The capacity is dcrd's
+    /// `maxConcurrentGetDataReqs`, so the intake gate that rejects the
+    /// (`maxConcurrentGetDataReqs` + 1)-th batch is exactly the check
+    /// that keeps this send from ever blocking.
+    queue: mpsc::SyncSender<Vec<InvVect>>,
+    /// Batches queued but not yet taken by the worker (dcrd's
+    /// `len(sp.getDataQueue)`).
+    pending_batches: Arc<AtomicUsize>,
+    /// Item requests accepted but not yet served (dcrd's
+    /// `numPendingGetDataItemReqs`).
+    pending_items: Arc<AtomicU32>,
+    /// Set when the peer is going away so the worker stops (dcrd's
+    /// `sp.quit`).
+    quit: Arc<AtomicBool>,
+}
+
+impl Drop for ServerPeerHandler {
+    fn drop(&mut self) {
+        self.stop_get_data_serve();
+    }
+}
+
+/// The state the getdata serve worker owns for one peer (the captured
+/// receiver side of dcrd's `serveGetData` goroutine).
+struct GetDataWorker {
+    ctx: Arc<ServerContext>,
+    outbound: OutboundQueue,
+    continue_hash: Arc<Mutex<Option<Hash>>>,
+    peer_handle: Option<Arc<Mutex<Peer>>>,
+    pending_batches: Arc<AtomicUsize>,
+    pending_items: Arc<AtomicU32>,
+    quit: Arc<AtomicBool>,
+}
+
+impl GetDataWorker {
+    /// Serve queued getdata batches until the peer goes away (dcrd
+    /// `serverPeer.serveGetData`).
+    fn run(self, batches: mpsc::Receiver<Vec<InvVect>>) {
+        let mut pipeline = SendPipeline::new();
+        let mut last_sent = self.peer_bytes_sent();
+        while let Ok(batch) = batches.recv() {
+            decrement_usize(&self.pending_batches, 1);
+            if self.quit.load(Ordering::SeqCst) {
+                return;
+            }
+            if !self.serve_batch(&batch, &mut pipeline, &mut last_sent) {
+                return;
+            }
+        }
+    }
+
+    /// Serve one batch item by item (dcrd
+    /// `serverPeer.handleServeGetData`), returning false once the peer
+    /// is gone.
+    fn serve_batch(
+        &self,
+        batch: &[InvVect],
+        pipeline: &mut SendPipeline,
+        last_sent: &mut u64,
+    ) -> bool {
+        // Repeated inventory items are resolved and served once.
+        //
+        // Divergence from dcrd, which serves a duplicate as many times
+        // as it was requested: 50,000 copies of one hash is 1.8 MB on
+        // the wire and would otherwise cost 50,000 database loads and
+        // deserializations of the same block.  A repeat is still
+        // charged the pending-item decrement it would have been
+        // charged had it been served, and unknown inventory types are
+        // left out of the dedupe entirely, so the pending-item
+        // accounting stays bit-for-bit dcrd's.
+        let mut seen: HashSet<InvVect> = HashSet::with_capacity(batch.len());
+        let mut not_found: Vec<InvVect> = Vec::new();
+        for iv in batch {
+            if self.quit.load(Ordering::SeqCst) {
+                return false;
+            }
+            let known_type = matches!(iv.inv_type, InvType::BLOCK | InvType::TX | InvType::MIX);
+            if known_type && !seen.insert(*iv) {
+                decrement_u32(&self.pending_items, 1);
+                continue;
+            }
+
+            let continue_hash = *self.continue_hash.lock().expect("continue hash poisoned");
+            let (message, best_hash) = self.resolve(*iv, continue_hash);
+            let resolution = match iv.inv_type {
+                _ if message.is_some() => GetDataResolution::Found,
+                InvType::BLOCK | InvType::TX | InvType::MIX => GetDataResolution::NotFound,
+                _ => GetDataResolution::UnknownType,
+            };
+            let outcome = serve_get_data_item(*iv, resolution, continue_hash, best_hash);
+            decrement_u32(&self.pending_items, outcome.pending_decrement);
+            if outcome.cleared_continue_hash {
+                let mut stored = self.continue_hash.lock().expect("continue hash poisoned");
+                if *stored == Some(iv.hash) {
+                    *stored = None;
+                }
+            }
+
+            let mut message = message;
+            for action in outcome.actions {
+                let queued = match action {
+                    ServeGetDataItemAction::QueueData(_) => {
+                        let msg = message.take().expect("a found item resolved to a message");
+                        let bytes = message_payload_bytes(&msg);
+                        self.queue_data(msg, bytes, pipeline, last_sent)
+                    }
+                    // The continuation inventory and the consolidated
+                    // notfound are queued outside the send pipeline,
+                    // exactly as dcrd passes them a nil done channel.
+                    ServeGetDataItemAction::QueueContinueInv(best) => {
+                        self.outbound.try_queue(Message::Inv(MsgInv {
+                            inv_list: vec![InvVect {
+                                inv_type: InvType::BLOCK,
+                                hash: best,
+                            }],
+                        }))
+                    }
+                    ServeGetDataItemAction::AccumulateNotFound(iv) => {
+                        not_found.push(iv);
+                        true
+                    }
+                };
+                if !queued {
+                    return false;
+                }
+            }
+        }
+
+        if !not_found.is_empty() {
+            return self.outbound.try_queue(Message::NotFound(MsgNotFound {
+                inv_list: not_found,
+            }));
+        }
+        true
+    }
+
+    /// Resolve one inventory item to its data message, plus the best
+    /// tip hash when this item is the advertised continuation.
+    ///
+    /// The chain lock is taken for this single item and released
+    /// before anything else is touched: it is the node-wide lock
+    /// netsync, the miner, the template generator and every chain RPC
+    /// contend for, so a batch of attacker-chosen hashes must never
+    /// hold it across more than one fetch.  Releasing it before the
+    /// mempool fetch is also required for correctness — the
+    /// transaction intake path locks the tx pool and then the chain,
+    /// so nesting the pool fetch inside the chain lock would form a
+    /// lock-order cycle and deadlock the node.
+    fn resolve(&self, iv: InvVect, continue_hash: Option<Hash>) -> (Option<Message>, Hash) {
+        match iv.inv_type {
+            InvType::BLOCK => {
+                let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
+                let block = chain.block_by_hash(&iv.hash);
+                // dcrd reads `BestSnapshot()` at the moment it queues
+                // the continuation inventory; it is only needed then.
+                let best = if block.is_some() && continue_hash == Some(iv.hash) {
+                    chain.best_snapshot().hash
+                } else {
+                    Hash([0u8; 32])
+                };
+                drop(chain);
+                (block.map(Message::Block), best)
+            }
+            InvType::TX => {
+                // Transactions serve from the recently-advertised
+                // cache first, then the pool, so announcements stay
+                // servable briefly after leaving it (dcrd's
+                // `handleServeGetData` order); confirmed transactions
+                // are deliberately not servable.
+                let advertised = self
+                    .ctx
+                    .recently_advertised
+                    .lock()
+                    .expect("recently advertised poisoned")
+                    .get(&iv.hash);
+                let fetched = advertised.or_else(|| {
+                    let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
+                    pool.fetch_transaction(&iv.hash)
+                });
+                (fetched.map(Message::Tx), Hash([0u8; 32]))
+            }
+            InvType::MIX => {
+                // dcrd's `s.mixMsgPool.RecentMessage` also consults the
+                // LRU of messages just removed from the pool, so a peer
+                // that advertised a now-confirmed message is still
+                // served it; a message the pool has never seen misses.
+                let fetched = self
+                    .ctx
+                    .mix_pool
+                    .lock()
+                    .expect("mix pool mutex poisoned")
+                    .recent_message(&iv.hash);
+                (
+                    fetched.map(crate::mixnode::pool_to_wire_message),
+                    Hash([0u8; 32]),
+                )
+            }
+            _ => (None, Hash([0u8; 32])),
+        }
+    }
+
+    /// Queue one resolved data message behind the send pipeline (dcrd
+    /// acquiring a `maxPendingSend` semaphore slot before
+    /// `QueueMessage`), returning false once the peer is gone or has
+    /// stalled its socket past the timeout.
+    fn queue_data(
+        &self,
+        msg: Message,
+        bytes: u64,
+        pipeline: &mut SendPipeline,
+        last_sent: &mut u64,
+    ) -> bool {
+        let deadline = Instant::now().checked_add(GETDATA_SEND_STALL_TIMEOUT);
+        loop {
+            self.record_send_progress(pipeline, last_sent);
+            if pipeline.has_room(MAX_PENDING_SEND) {
+                break;
+            }
+            if self.quit.load(Ordering::SeqCst) {
+                return false;
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return false;
+            }
+            thread::sleep(GETDATA_SEND_POLL);
+        }
+        // The pipeline above already bounds this path to
+        // `MAX_PENDING_SEND` unwritten items, so a full queue here means
+        // other producers filled it; either way the batch stops rather
+        // than pretending the data went out, and the drop is reported
+        // instead of vanishing.
+        if !self.outbound.try_queue(msg) {
+            return false;
+        }
+        pipeline.record_queued(bytes);
+        true
+    }
+
+    /// Fold the bytes the output loop has written since the last check
+    /// into the send pipeline, retiring the sends they completed (dcrd
+    /// draining `sendDoneChan` to release semaphore slots).
+    fn record_send_progress(&self, pipeline: &mut SendPipeline, last_sent: &mut u64) {
+        let Some(handle) = &self.peer_handle else {
+            // A peer that never registered has no send accounting to
+            // observe; the outbound queue's own depth stays the bound.
+            pipeline.record_sent(u64::MAX);
+            return;
+        };
+        let sent = handle
+            .lock()
+            .expect("peer mutex poisoned")
+            .stats_snapshot()
+            .bytes_sent;
+        let delta = sent.wrapping_sub(*last_sent);
+        *last_sent = sent;
+        if delta > 0 {
+            pipeline.record_sent(delta);
+        }
+    }
+
+    /// The peer's cumulative sent bytes, or zero without a handle.
+    fn peer_bytes_sent(&self) -> u64 {
+        match &self.peer_handle {
+            Some(handle) => {
+                handle
+                    .lock()
+                    .expect("peer mutex poisoned")
+                    .stats_snapshot()
+                    .bytes_sent
+            }
+            None => 0,
+        }
+    }
+}
+
+/// The bytes charged to the send pipeline for a queued data message.
+fn message_payload_bytes(msg: &Message) -> u64 {
+    match msg {
+        Message::Block(block) => block.serialize_size() as u64,
+        Message::Tx(tx) => tx.serialize_size() as u64,
+        _ => NOMINAL_MIX_MESSAGE_BYTES,
+    }
+}
+
+/// Subtract from a counter without ever wrapping below zero.
+fn decrement_usize(counter: &AtomicUsize, by: usize) {
+    if by == 0 {
+        return;
+    }
+    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        Some(current.saturating_sub(by))
+    });
+}
+
+/// Subtract from a counter without ever wrapping below zero.
+fn decrement_u32(counter: &AtomicU32, by: u32) {
+    if by == 0 {
+        return;
+    }
+    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        Some(current.saturating_sub(by))
+    });
 }
 
 impl ServerPeerHandler {
@@ -914,7 +1356,7 @@ impl ServerPeerHandler {
         ServerPeerHandler {
             ctx,
             addr_state: ServerPeerAddrState::new(is_whitelisted),
-            continue_hash: None,
+            continue_hash: Arc::new(Mutex::new(None)),
             env: NodePeerEnv::new(),
             init_state_sent: false,
             mining_state_sent: false,
@@ -924,6 +1366,55 @@ impl ServerPeerHandler {
             permanent,
             conn_req_id,
             remote_addr,
+            peer_handle: None,
+            getdata_serve: None,
+        }
+    }
+
+    /// The peer's getdata serve queue, starting its worker on first
+    /// use (dcrd's `serveGetData` goroutine, launched from
+    /// `serverPeer.Run`).  A worker that cannot be spawned yields
+    /// `None` and the request is dropped.
+    fn get_data_serve(&mut self, outbound: &OutboundQueue) -> Option<&GetDataServe> {
+        if self.getdata_serve.is_none() {
+            let (queue, batches) = mpsc::sync_channel(MAX_CONCURRENT_GETDATA_REQS);
+            let pending_batches = Arc::new(AtomicUsize::new(0));
+            let pending_items = Arc::new(AtomicU32::new(0));
+            let quit = Arc::new(AtomicBool::new(false));
+            let worker = GetDataWorker {
+                ctx: Arc::clone(&self.ctx),
+                outbound: outbound.clone(),
+                continue_hash: Arc::clone(&self.continue_hash),
+                peer_handle: self.peer_handle.clone(),
+                pending_batches: Arc::clone(&pending_batches),
+                pending_items: Arc::clone(&pending_items),
+                quit: Arc::clone(&quit),
+            };
+            thread::Builder::new()
+                .name("getdata-serve".to_string())
+                .spawn(move || worker.run(batches))
+                .ok()?;
+            self.getdata_serve = Some(GetDataServe {
+                queue,
+                pending_batches,
+                pending_items,
+                quit,
+            });
+        }
+        self.getdata_serve.as_ref()
+    }
+
+    /// Stop the getdata serve worker (dcrd closing `sp.quit`).
+    ///
+    /// This must happen while the connection is winding down and
+    /// before the peer's output loop is joined: the worker holds a
+    /// clone of the outbound queue's sender, and the output loop only
+    /// ends once every sender is dropped.  Dropping the batch channel
+    /// ends the worker's receive loop; the flag stops it mid-batch.
+    fn stop_get_data_serve(&mut self) {
+        if let Some(serve) = self.getdata_serve.take() {
+            serve.quit.store(true, Ordering::SeqCst);
+            drop(serve.queue);
         }
     }
 
@@ -1056,13 +1547,19 @@ impl ServerPeerHandler {
                         &[lna],
                     )
                 {
-                    let _ = outbound.queue_message(*msg);
+                    // A dropped local-address announcement costs the peer
+                    // one address it would have learned; the queue cannot
+                    // be full this early in a connection, and the drop is
+                    // reported if it ever is.
+                    outbound.try_queue(*msg);
                 }
             }
 
             // Request known addresses if the manager needs more.
             if mgr.need_more_addresses() {
-                let _ = outbound.queue_message(Message::GetAddr);
+                // Best effort: `need_more_addresses` stays true, so the
+                // next handshake asks again.
+                outbound.try_queue(Message::GetAddr);
             }
 
             // Mark the address as a known good address.
@@ -1093,6 +1590,9 @@ impl ServerPeerHandler {
             .as_ref()
             .and_then(|socket| socket.local_addr().ok())
             .map(|addr| addr.to_string());
+        // The getdata serve worker paces its send pipeline against the
+        // byte accounting the output loop keeps on this same handle.
+        self.peer_handle = Some(Arc::clone(peer_handle));
         self.ctx.sync_peers.register(
             id,
             outbound.clone(),
@@ -1123,6 +1623,11 @@ impl ServerPeerHandler {
     /// the re-request and sync-peer handoff actions it decides (dcrd
     /// `DonePeer` signalling `OnPeerDisconnected`).
     pub fn on_disconnected(&mut self, _peer: &mut Peer) {
+        // Stop the serve worker before anything else: the caller joins
+        // the peer's output loop right after this returns and the
+        // worker holds one of that queue's senders.
+        self.stop_get_data_serve();
+
         let Some(id) = self.sync_peer_id.take() else {
             return;
         };
@@ -1395,13 +1900,13 @@ impl ServerPeerHandler {
                         ServeSignal::Disconnect("ban score exceeds threshold".into())
                     }
                     crate::server::OnMemPoolOutcome::Inventory(invs) => {
-                        // Drop inventory the peer already knows and mark the
-                        // survivors, matching dcrd `OnMemPool` queuing each
-                        // tx through `QueueInventory` (which both filters
-                        // against and updates the peer's known-inventory
-                        // set) rather than sending the raw pool contents.
+                        // Drop inventory the peer already knows, matching
+                        // dcrd `OnMemPool` queuing each tx through
+                        // `QueueInventory` (which filters against the
+                        // peer's known-inventory set) rather than sending
+                        // the raw pool contents.
                         let invs = match self.sync_peer_id {
-                            Some(id) => self.ctx.sync_peers.filter_and_mark_known(id, invs),
+                            Some(id) => self.ctx.sync_peers.filter_known(id, invs),
                             None => invs,
                         };
                         // dcrd trickles through its inventory queue,
@@ -1411,9 +1916,22 @@ impl ServerPeerHandler {
                             if chunk.is_empty() {
                                 continue;
                             }
-                            let _ = outbound.queue_message(Message::Inv(MsgInv {
+                            // Each batch is marked known only once it is
+                            // queued (dcrd marks per vector as it fills
+                            // the inv message it then queues).  A full
+                            // queue stops the fan-out: the remaining
+                            // chunks would be refused too, and leaving
+                            // them unmarked means a later mempool
+                            // request, or ordinary relay, still
+                            // announces them.
+                            if !outbound.try_queue(Message::Inv(MsgInv {
                                 inv_list: chunk.to_vec(),
-                            }));
+                            })) {
+                                break;
+                            }
+                            if let Some(id) = self.sync_peer_id {
+                                self.ctx.sync_peers.mark_known(id, chunk);
+                            }
                         }
                         ServeSignal::Continue
                     }
@@ -1502,7 +2020,20 @@ impl ServerPeerHandler {
             GetHeadersResponse::Empty => Vec::new(),
             GetHeadersResponse::Headers(headers) => headers,
         };
-        let _ = outbound.queue_message(Message::Headers(MsgHeaders { headers }));
+        // A reply the peer is waiting on.  A full queue means the peer is
+        // not draining its socket; the response is dropped and reported
+        // rather than costing the peer its connection.  The queue is
+        // shared with relay and mempool announcements, so disconnecting
+        // here would let a burst of those to a momentarily slow but
+        // honest peer make its next legitimate request fatal — the exact
+        // shape of security fix that breaks honest users.  A peer that
+        // has really stopped reading is ended by the writer's per-message
+        // write deadline, and in the meantime it drops us over its own
+        // missing response.  dcrd never drops the reply at all: its
+        // enqueue blocks on a 5000-slot channel backed by an unbounded
+        // pending slice.  The other request/reply sites below take the
+        // same decision for the same reason.
+        outbound.try_queue(Message::Headers(MsgHeaders { headers }));
     }
 
     /// Answer a getblocks request with the located block inventory,
@@ -1527,31 +2058,44 @@ impl ServerPeerHandler {
                 .is_some_and(|id| self.ctx.sync_peers.is_known_inventory(id, iv))
         });
         if let Some(continue_hash) = response.continue_hash {
-            self.continue_hash = Some(continue_hash);
+            *self.continue_hash.lock().expect("continue hash poisoned") = Some(continue_hash);
         }
         if !response.inv.is_empty() {
-            let _ = outbound.queue_message(Message::Inv(MsgInv {
+            // A reply the peer is waiting on; a full queue drops it and
+            // reports it rather than disconnecting (see `on_get_headers`).
+            outbound.try_queue(Message::Inv(MsgInv {
                 inv_list: response.inv,
             }));
         }
     }
 
-    /// Gate and serve a getdata request: apply dcrd's intake gates
-    /// (ban empty requests, the decaying oversized-request ban score,
-    /// the pending-request limits), then serve the batch inline —
-    /// blocks from the chain, everything else answered in the
-    /// consolidated notfound since the mempool and mix pool are not
-    /// yet wired (matching a node whose pools are empty), and unknown
-    /// inventory types skipped entirely (dcrd `serverPeer.OnGetData`
-    /// plus `handleServeGetData`).
+    /// Gate a getdata request and hand it to the peer's serve worker:
+    /// apply dcrd's intake gates (ban empty requests, the decaying
+    /// oversized-request ban score, the concurrent-batch and pending-item
+    /// limits against the live counters), bump those counters, and queue
+    /// the batch (dcrd `serverPeer.OnGetData`).  The worker resolves and
+    /// queues each item, one chain-lock acquisition and one send-pipeline
+    /// slot at a time (dcrd `handleServeGetData` on the `serveGetData`
+    /// goroutine).
     fn on_get_data(&mut self, inv_list: &[InvVect], outbound: &OutboundQueue) -> ServeSignal {
-        // The synchronous translation serves each batch before the next
-        // getdata is read, so there are never prior pending requests.
+        // The live pending-request counters dcrd's gates read:
+        // `len(sp.getDataQueue)`, the batches accepted but not yet taken
+        // by the serve goroutine, and `numPendingGetDataItemReqs`, the
+        // individual item requests accepted but not yet served.  Before
+        // the first getdata there is no worker and both are zero,
+        // exactly as on a freshly constructed serverPeer.
+        let (pending_getdata_reqs, pending_item_reqs) = match &self.getdata_serve {
+            Some(serve) => (
+                serve.pending_batches.load(Ordering::SeqCst),
+                serve.pending_items.load(Ordering::SeqCst),
+            ),
+            None => (0, 0),
+        };
         let outcome = on_get_data(
             &mut self.addr_state,
             inv_list.len() as u32,
-            0,
-            0,
+            pending_getdata_reqs,
+            pending_item_reqs,
             self.ctx.disable_banning,
             self.ctx.ban_threshold,
             now_unix(),
@@ -1576,119 +2120,26 @@ impl ServerPeerHandler {
             OnGetDataOutcome::Enqueue { .. } => {}
         }
 
-        // Resolve each item, keeping the fetched blocks and transactions
-        // so the serve actions can queue them in request order.  Block
-        // items resolve under the chain lock, which is released BEFORE the
-        // mempool is touched: the transaction-intake path locks the tx
-        // pool and then the chain, so nesting the tx-pool fetch inside the
-        // chain lock here would form a lock-order cycle and deadlock the
-        // node.
-        let mut blocks = HashMap::new();
-        let mut txs: HashMap<dcroxide_chainhash::Hash, dcroxide_wire::MsgTx> = HashMap::new();
-        let best_hash = {
-            let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
-            for iv in inv_list.iter() {
-                if iv.inv_type == InvType::BLOCK
-                    && let Some(block) = chain.block_by_hash(&iv.hash)
-                {
-                    blocks.insert(iv.hash, block);
-                }
-            }
-            chain.best_snapshot().hash
+        // Account for the request and queue it for the serve worker
+        // (dcrd's `numPendingGetDataItemReqs.Add` followed by the
+        // buffered `getDataQueue` send).  The gates above guarantee the
+        // channel has room, so this never blocks the input thread; the
+        // batch itself is only inventory vectors, and the pending-item
+        // limit caps how many of those can be outstanding at once.
+        let new_items = inv_list.len() as u32;
+        let Some(serve) = self.get_data_serve(outbound) else {
+            // The serve worker could not be started; nothing can be
+            // served on this connection.
+            return ServeSignal::Disconnect("getdata serve worker unavailable".into());
         };
-
-        // Resolve transaction items against the mempool without holding
-        // the chain lock.  Transactions serve from the recently-advertised
-        // cache first, then the pool, so announcements stay servable
-        // briefly after leaving it (dcrd's handleServeGetData order);
-        // confirmed transactions are deliberately not servable.
-        for iv in inv_list.iter() {
-            if iv.inv_type == InvType::TX {
-                let advertised = self
-                    .ctx
-                    .recently_advertised
-                    .lock()
-                    .expect("recently advertised poisoned")
-                    .get(&iv.hash);
-                let fetched = advertised.or_else(|| {
-                    let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
-                    pool.fetch_transaction(&iv.hash)
-                });
-                if let Some(tx) = fetched {
-                    txs.insert(iv.hash, tx);
-                }
-            }
-        }
-
-        // Resolve mix items against the mixing pool (dcrd's
-        // `s.mixMsgPool.RecentMessage`, which also consults the LRU of
-        // messages just removed from the pool so a peer that advertised a
-        // now-confirmed message is still served it); a message the pool
-        // has never seen misses into the consolidated notfound.
-        let mut mixes: HashMap<dcroxide_chainhash::Hash, dcroxide_wire::Message> = HashMap::new();
-        for iv in inv_list.iter() {
-            if iv.inv_type == InvType::MIX {
-                let fetched = self
-                    .ctx
-                    .mix_pool
-                    .lock()
-                    .expect("mix pool mutex poisoned")
-                    .recent_message(&iv.hash);
-                if let Some(msg) = fetched {
-                    mixes.insert(iv.hash, crate::mixnode::pool_to_wire_message(msg));
-                }
-            }
-        }
-
-        // Classify each item in request order from the resolved sets.
-        let items: Vec<(InvVect, GetDataResolution)> = inv_list
-            .iter()
-            .map(|iv| {
-                let resolution = match iv.inv_type {
-                    InvType::BLOCK if blocks.contains_key(&iv.hash) => GetDataResolution::Found,
-                    InvType::TX if txs.contains_key(&iv.hash) => GetDataResolution::Found,
-                    InvType::MIX if mixes.contains_key(&iv.hash) => GetDataResolution::Found,
-                    InvType::BLOCK | InvType::TX | InvType::MIX => GetDataResolution::NotFound,
-                    _ => GetDataResolution::UnknownType,
-                };
-                (*iv, resolution)
-            })
-            .collect();
-
-        let outcome = serve_get_data(&items, self.continue_hash, best_hash);
-        for action in outcome.actions {
-            let queued = match action {
-                ServeGetDataAction::QueueData(iv) => {
-                    if let Some(block) = blocks.remove(&iv.hash) {
-                        outbound.queue_message(Message::Block(block))
-                    } else if let Some(tx) = txs.remove(&iv.hash) {
-                        outbound.queue_message(Message::Tx(tx))
-                    } else if let Some(mix) = mixes.remove(&iv.hash) {
-                        outbound.queue_message(mix)
-                    } else {
-                        Ok(())
-                    }
-                }
-                ServeGetDataAction::QueueContinueInv(best) => {
-                    outbound.queue_message(Message::Inv(MsgInv {
-                        inv_list: vec![InvVect {
-                            inv_type: InvType::BLOCK,
-                            hash: best,
-                        }],
-                    }))
-                }
-                ServeGetDataAction::QueueNotFound(inv_list) => {
-                    outbound.queue_message(Message::NotFound(MsgNotFound { inv_list }))
-                }
-            };
-            if queued.is_err() {
-                // The output loop already stopped; the input loop will
-                // observe the teardown on its next read.
-                return ServeSignal::Continue;
-            }
-        }
-        if outcome.cleared_continue_hash {
-            self.continue_hash = None;
+        serve.pending_batches.fetch_add(1, Ordering::SeqCst);
+        serve.pending_items.fetch_add(new_items, Ordering::SeqCst);
+        if serve.queue.try_send(inv_list.to_vec()).is_err() {
+            // The worker stopped, which only happens once the peer is
+            // being torn down; the input loop observes it on the next
+            // read.
+            decrement_usize(&serve.pending_batches, 1);
+            decrement_u32(&serve.pending_items, new_items);
         }
         ServeSignal::Continue
     }
@@ -1718,7 +2169,9 @@ impl ServerPeerHandler {
             &facts,
             &addr_cache,
         ) {
-            let _ = outbound.queue_message(*msg);
+            // A reply the peer is waiting on; a full queue drops it and
+            // reports it rather than disconnecting (see `on_get_headers`).
+            outbound.try_queue(*msg);
         }
     }
 
@@ -1830,7 +2283,9 @@ impl ServerPeerHandler {
         let Ok((filter, proof)) = fetched else {
             return;
         };
-        let _ = outbound.queue_message(Message::CFilterV2(MsgCFilterV2 {
+        // A reply the peer is waiting on; a full queue drops it and
+        // reports it rather than disconnecting (see `on_get_headers`).
+        outbound.try_queue(Message::CFilterV2(MsgCFilterV2 {
             block_hash,
             data: filter.bytes().to_vec(),
             proof_index: proof.proof_index,
@@ -1849,7 +2304,9 @@ impl ServerPeerHandler {
         let Ok(filters) = located else {
             return;
         };
-        let _ = outbound.queue_message(Message::CFiltersV2(filters));
+        // A reply the peer is waiting on; a full queue drops it and
+        // reports it rather than disconnecting (see `on_get_headers`).
+        outbound.try_queue(Message::CFiltersV2(filters));
     }
 
     /// Answer a getinitstate request once per connection (dcrd
@@ -1923,7 +2380,9 @@ impl ServerPeerHandler {
             },
             OnGetInitStateOutcome::BuildError => return ServeSignal::Continue,
         };
-        let _ = outbound.queue_message(Message::InitState(msg));
+        // A reply the peer is waiting on; a full queue drops it and
+        // reports it rather than disconnecting (see `on_get_headers`).
+        outbound.try_queue(Message::InitState(msg));
         ServeSignal::Continue
     }
 
@@ -1993,7 +2452,12 @@ impl ServerPeerHandler {
             vote_hashes,
         } = outcome
         {
-            let _ = outbound.queue_message(Message::MiningState(dcroxide_wire::MsgMiningState {
+            // A reply the peer is waiting on; a full queue drops it and
+            // reports it rather than disconnecting (see `on_get_headers`).
+            // `mining_state_sent` was already set above, deliberately: dcrd
+            // marks the state sent right after the gate, so a dropped
+            // response counts as the one allowed reply.
+            outbound.try_queue(Message::MiningState(dcroxide_wire::MsgMiningState {
                 // dcrd's NewMsgMiningState fixes the version at one.
                 version: 1,
                 height,
@@ -2723,5 +3187,191 @@ mod tests {
             other => panic!("expected headers, got {other:?}"),
         }
         assert!(rx_lite.try_recv().is_err(), "announced toggle suppresses");
+    }
+
+    /// Fill a peer's outbound queue to its cap, the way a peer that has
+    /// stopped reading its socket does.
+    fn fill_queue(queue: &crate::peerloop::OutboundQueue) {
+        for i in 0..crate::peerloop::MAX_OUTBOUND_QUEUE_DEPTH {
+            queue
+                .queue_message(Message::GetAddr)
+                .unwrap_or_else(|e| panic!("filler {i} within the cap must be accepted: {e}"));
+        }
+        assert!(
+            matches!(
+                queue.queue_message(Message::GetAddr),
+                Err(crate::peerloop::QueueError::Full)
+            ),
+            "the queue must refuse the message past its cap"
+        );
+    }
+
+    /// `filter_known` must not mark: the mempool inv fan-out filters
+    /// first, then queues each batch, then marks only the batches the
+    /// queue accepted.  If filtering marked as well, a batch refused by
+    /// a full queue would leave the peer recorded as knowing
+    /// transactions it was never sent, and they would never be
+    /// announced to it again.
+    #[test]
+    fn filter_known_leaves_marking_to_the_caller() {
+        let peers = SyncPeers::new();
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        peers.register(
+            1,
+            queue,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+            test_peer_handle(),
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let inv = tx_inv(0x21);
+        assert_eq!(peers.filter_known(1, vec![inv]), vec![inv]);
+        assert!(
+            !peers.is_known_inventory(1, &inv),
+            "filtering must not record the inventory as known"
+        );
+        // Filtering again still yields it, which is what makes a retry
+        // after a refused enqueue possible.
+        assert_eq!(peers.filter_known(1, vec![inv]), vec![inv]);
+
+        // Marking is the caller's step, taken once the batch is queued.
+        peers.mark_known(1, &[inv]);
+        assert!(peers.is_known_inventory(1, &inv));
+        assert!(
+            peers.filter_known(1, vec![inv]).is_empty(),
+            "a marked item is filtered out of later fan-outs"
+        );
+    }
+
+    /// An announcement that could not be queued must not leave the peer
+    /// marked as knowing the inventory: the item would then never be
+    /// announced again, so the peer would never learn about a
+    /// transaction or block that the rest of the network has.  Once the
+    /// peer drains its queue the retry gets through, which is only
+    /// possible because the dropped attempt left the known-inventory set
+    /// alone.
+    #[test]
+    fn a_dropped_announcement_is_not_recorded_as_known() {
+        let peers = SyncPeers::new();
+        let (queue, rx) = crate::peerloop::OutboundQueue::channel();
+        fill_queue(&queue);
+        peers.register(
+            1,
+            queue,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+            test_peer_handle(),
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+
+        // The relay gate still clears (a connected, relaying peer), so
+        // the transaction counts as advertised, but the announcement
+        // itself could not be queued.
+        let inv = tx_inv(0x11);
+        assert!(
+            peers.relay_inventory(&tx_relay_msg(&inv)),
+            "the peer clears the relay gate"
+        );
+        assert!(
+            !peers.is_known_inventory(1, &inv),
+            "an announcement that was never sent must not be recorded as known"
+        );
+
+        // The peer starts reading again.
+        for i in 0..crate::peerloop::MAX_OUTBOUND_QUEUE_DEPTH {
+            match rx.try_recv() {
+                Ok(Message::GetAddr) => {}
+                other => panic!("expected filler {i}, got {other:?}"),
+            }
+        }
+
+        // The retry reaches it, and only now is the item recorded.
+        assert!(peers.relay_inventory(&tx_relay_msg(&inv)));
+        match rx
+            .try_recv()
+            .expect("the retried announcement is delivered")
+        {
+            Message::Inv(msg) => assert_eq!(msg.inv_list, vec![inv]),
+            other => panic!("expected inv, got {other:?}"),
+        }
+        assert!(
+            peers.is_known_inventory(1, &inv),
+            "a delivered announcement is recorded as known"
+        );
+    }
+
+    /// A sync request refused by a full queue is dropped, and the peer
+    /// is left connected.
+    ///
+    /// Disconnecting here looked like the recovery path — the request is
+    /// recorded in flight and nothing retries it — but it severs honest
+    /// peers. Post-sync, relay emits one inv message per item per peer,
+    /// so a peer on a slow link fills the queue purely while we are
+    /// pushing it a block it asked for, and the next sync request would
+    /// kill it. dcrd never disconnects here either: its `queueHandler`
+    /// appends to an unbounded `pendingMsgs`, so a full queue says
+    /// nothing about the peer.
+    ///
+    /// What makes dropping safe is the output loop's absolute
+    /// per-message write deadline: a socket that never drains ends the
+    /// connection on its own, and netsync's ordinary disconnect handling
+    /// re-requests elsewhere.
+    #[test]
+    fn a_full_queue_drops_the_sync_request_without_disconnecting_the_peer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback socket");
+        let addr = listener.local_addr().expect("the bound address");
+        let ours = TcpStream::connect(addr).expect("connect to the loopback listener");
+        let (mut theirs, _) = listener.accept().expect("accept the loopback connection");
+        // Short, because we are proving the absence of a disconnect: a
+        // still-open socket has nothing to read, so this must time out.
+        theirs
+            .set_read_timeout(Some(std::time::Duration::from_millis(250)))
+            .expect("bound the remote read");
+
+        let peers = SyncPeers::new();
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        fill_queue(&queue);
+        peers.register(
+            7,
+            queue,
+            Some(ours),
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+            test_peer_handle(),
+            None,
+            false,
+            None,
+            Some(addr.to_string()),
+            None,
+        );
+
+        peers.execute(vec![Action::QueueMessage {
+            peer: 7,
+            message: Message::GetHeaders(dcroxide_wire::MsgGetHeaders(
+                dcroxide_wire::BlockLocator {
+                    protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+                    block_locator_hashes: Vec::new(),
+                    hash_stop: Hash::ZERO,
+                },
+            )),
+        }]);
+
+        // A clean `Ok(0)` is end of stream, i.e. our end was shut down.
+        // Anything else — a timeout, or bytes — means still connected.
+        let mut buf = [0u8; 1];
+        let read = std::io::Read::read(&mut theirs, &mut buf);
+        assert!(
+            !matches!(read, Ok(0)),
+            "a sync request refused by a full queue must not disconnect an \
+             otherwise healthy peer, but the remote saw end of stream"
+        );
     }
 }

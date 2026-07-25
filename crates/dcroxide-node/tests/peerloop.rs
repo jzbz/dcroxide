@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use dcroxide_node::peerconn::{NodePeerEnv, net_address_v2_from_socket};
 use dcroxide_node::peerloop::{
-    OutboundQueue, ServeSignal, run_peer_connection, run_peer_input, run_peer_output,
+    OutboundQueue, QueueError, ServeSignal, run_peer_connection, run_peer_input, run_peer_output,
     run_ping_timer,
 };
 use dcroxide_node::transport::WireTransport;
@@ -205,7 +205,9 @@ fn queue_message_fails_once_the_output_loop_has_stopped() {
     let err = queue
         .queue_message(Message::Pong(MsgPong { nonce: 1 }))
         .expect_err("queueing to a closed queue fails");
-    assert!(err.contains("closed"), "error: {err}");
+    // A closed queue is teardown, not a congested peer; the producers
+    // take opposite decisions on the two, so they must stay distinct.
+    assert_eq!(err, QueueError::Closed, "error: {err}");
 }
 
 #[test]
@@ -417,4 +419,117 @@ fn a_dribbled_message_read_ends_at_the_budget() {
     );
     drop(transport);
     let _ = dribbler.join();
+}
+
+/// A peer that stops reading must not be able to grow its outbound
+/// queue without bound: the queue is depth-capped and a send past the
+/// cap is refused instead of buffered.
+///
+/// This is dcroxide hardening, not a dcrd port — dcrd has no bound
+/// here.  `peer/peer.go` builds `outputQueue: make(chan outMsg, 5000)`
+/// and `queueHandler` moves anything the writer has not taken into a
+/// `pendingMsgs []outMsg` slice it grows with `append`, so dcrd buffers
+/// 5000 messages in the channel and an unlimited number after it.  (The
+/// three-slot semaphore sometimes cited as dcrd's bound is
+/// `maxPendingSend` in `server.go`; it limits concurrent getdata serve
+/// items only.)  The port's original `mpsc::channel` was unbounded too,
+/// so relay, mempool inv and getdata responses piled up for as long as
+/// an attacker refused to read.
+#[test]
+fn outbound_queue_is_depth_capped() {
+    let (queue, _receiver) = OutboundQueue::channel();
+
+    // Fill exactly to the cap: every send succeeds while the drain
+    // side never runs.
+    for i in 0..dcroxide_node::peerloop::MAX_OUTBOUND_QUEUE_DEPTH {
+        queue
+            .queue_message(Message::Ping(MsgPing { nonce: i as u64 }))
+            .unwrap_or_else(|e| panic!("send {i} within the cap must succeed: {e}"));
+    }
+
+    // One more is refused rather than buffered, and reported as a
+    // congested peer rather than as a closed queue: the producers act
+    // on the difference.
+    let err = queue
+        .queue_message(Message::Ping(MsgPing { nonce: u64::MAX }))
+        .expect_err("a send past the cap must fail instead of growing the queue");
+    assert_eq!(err, QueueError::Full, "unexpected error: {err}");
+
+    // `try_queue` is the producers' entry point: it reports the drop
+    // and answers "not queued" so the caller skips any bookkeeping that
+    // would claim the message was sent.
+    assert!(
+        !queue.try_queue(Message::Ping(MsgPing { nonce: 1 })),
+        "try_queue must report a full queue as not queued"
+    );
+}
+
+/// A full outbound queue must not kill the keepalive.  The ping timer is
+/// what keeps a live-but-quiet peer from tripping the idle read
+/// deadline, so a congested tick has to be skipped and retried: before
+/// this fix the timer returned on the first failed enqueue, ending the
+/// keepalive for the rest of the connection's life and costing a peer
+/// that had one transient burst its connection minutes later, when it
+/// was reading again.
+#[test]
+fn ping_timer_survives_a_full_outbound_queue() {
+    let peer = Mutex::new(Peer::new_inbound(config("dcroxide")));
+    let (queue, outbound) = OutboundQueue::channel();
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+
+    // Fill the queue to its cap, the way a peer that stopped reading
+    // its socket does.
+    for i in 0..dcroxide_node::peerloop::MAX_OUTBOUND_QUEUE_DEPTH {
+        queue
+            .queue_message(Message::Pong(MsgPong { nonce: i as u64 }))
+            .unwrap_or_else(|e| panic!("filler {i} within the cap must succeed: {e}"));
+    }
+
+    let timer = thread::spawn(move || {
+        let mut env = NodePeerEnv::new();
+        run_ping_timer(
+            &peer,
+            &mut env,
+            &queue,
+            Duration::from_millis(20),
+            &shutdown_rx,
+        );
+    });
+
+    // Several ticks pass with no room in the queue.
+    thread::sleep(Duration::from_millis(150));
+
+    // The peer starts reading again, so the backlog drains.
+    for i in 0..dcroxide_node::peerloop::MAX_OUTBOUND_QUEUE_DEPTH {
+        match outbound.recv_timeout(Duration::from_secs(5)) {
+            Ok(Message::Pong(_)) => {}
+            other => panic!("expected filler {i}, got {other:?}"),
+        }
+    }
+
+    // The keepalive is still running: a later tick gets through.  A
+    // timer that gave up on the congested tick has dropped its queue by
+    // now, so this receive fails instead.
+    match outbound.recv_timeout(Duration::from_secs(5)) {
+        Ok(Message::Ping(_)) => {}
+        other => panic!("the keepalive must survive a congested tick, got {other:?}"),
+    }
+
+    shutdown_tx.send(()).expect("signal shutdown");
+    timer.join().expect("timer thread");
+}
+
+/// The peer transport must arm a write deadline, so a peer advertising
+/// a zero receive window cannot park the writer thread forever.  This
+/// pins the plumbing: a transport with a write budget set still writes
+/// normally, and the budget is what `run_peer_connection` installs.
+#[test]
+fn transport_accepts_a_write_budget() {
+    use std::io::Cursor;
+    let mut transport = WireTransport::new(Cursor::new(Vec::new()), MAX_PROTOCOL_VERSION, NET);
+    transport.set_write_budget(Some(std::time::Duration::from_secs(5)));
+    transport
+        .write_message(&Message::Ping(MsgPing { nonce: 7 }))
+        .expect("a write under budget succeeds");
+    assert!(transport.bytes_written() > 0);
 }

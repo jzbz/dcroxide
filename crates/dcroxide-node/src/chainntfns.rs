@@ -19,6 +19,13 @@
 //! block accepted, connected, and disconnected events feed it too.
 //! The mix-observer refusal gate is skipped until the mixpool arrives
 //! — without a pool there are no misbehaving mix inputs to refuse.
+//!
+//! Lock order: the mixpool mutex is never taken while the chain mutex
+//! is held.  The mixpool reaches back into the chain for its tip and
+//! UTXO lookups, so chain-then-mixpool would close an AB-BA cycle
+//! against every peer's mix-message intake; see
+//! [`ChainNtfnHandler::drain_pending_winning_tickets`], the one place
+//! here that touches both.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -428,6 +435,18 @@ impl ChainNtfnHandler {
     /// `NotifyWinningTickets` + `lotteryDataBroadcast` insert).  dcrd
     /// gates the whole accepted case on the sync being current unless
     /// unsynced mining is allowed.
+    ///
+    /// LOCK ORDER: the mixpool mutex must NEVER be taken while the chain
+    /// mutex is held.  The pool reaches back into the chain — the peer
+    /// intake path locks the pool (`NodeSyncMixPool::accept_message`) and
+    /// the pool's own tip and UTXO lookups then lock the chain
+    /// (`NodeMixChain::current_tip`, `NodeMixUtxoFetcher::fetch_utxo_entry`)
+    /// — so mixpool-then-chain is the established order and nesting the
+    /// refusal check inside the chain guard here would close an AB-BA
+    /// cycle that any inbound peer's mix message could trigger.  The
+    /// drain therefore runs in three phases: fetch the refusal candidates
+    /// under the chain guard, drop it, ask the pool, then re-acquire the
+    /// chain guard for the lottery lookups.
     pub fn drain_pending_winning_tickets(
         &self,
         chain: &Arc<Mutex<Chain>>,
@@ -443,26 +462,56 @@ impl ChainNtfnHandler {
             return;
         }
 
-        let mut chain = chain.lock().expect("chain mutex poisoned");
-        if !self.allow_unsynced_mining
-            && !self
-                .sync_gate
-                .is_current_locked(&mut chain, adjusted_time_unix)
-        {
-            return;
-        }
-        for (block_hash, block_height) in pending {
-            // Refuse to notify winning tickets for a block spending
-            // misbehaving mix inputs (dcrd's `MisbehavingBlock` break
-            // in the same gated case), so clients are not prompted to
-            // vote on it.
-            if let Some(mix_pool) = &self.mix_pool
-                && let Some(block) = chain.block_by_hash(&block_hash)
-                && mix_pool
-                    .lock()
-                    .expect("mix pool mutex poisoned")
-                    .misbehaving_block(&block)
+        // Phase 1 — chain guard held, mixpool untouched: apply dcrd's
+        // sync gate and read the blocks the mix refusal needs.  The guard
+        // is released at the end of this scope, BEFORE the pool is asked.
+        let refusal_blocks: Vec<(Hash, dcroxide_wire::MsgBlock)> = {
+            let mut chain = chain.lock().expect("chain mutex poisoned");
+            if !self.allow_unsynced_mining
+                && !self
+                    .sync_gate
+                    .is_current_locked(&mut chain, adjusted_time_unix)
             {
+                return;
+            }
+            if self.mix_pool.is_none() {
+                Vec::new()
+            } else {
+                pending
+                    .iter()
+                    .filter_map(|(block_hash, _)| {
+                        chain
+                            .block_by_hash(block_hash)
+                            .map(|block| (*block_hash, block))
+                    })
+                    .collect()
+            }
+        };
+
+        // Phase 2 — no chain guard held: refuse to notify winning tickets
+        // for a block spending misbehaving mix inputs (dcrd's
+        // `MisbehavingBlock` break in the same gated case), so clients are
+        // not prompted to vote on it.  A block the chain could not supply
+        // is simply not a refusal candidate, exactly as the missing block
+        // short-circuited dcrd's check.
+        let refused: HashSet<Hash> = match &self.mix_pool {
+            None => HashSet::new(),
+            Some(mix_pool) => {
+                let mix_pool = mix_pool.lock().expect("mix pool mutex poisoned");
+                refusal_blocks
+                    .iter()
+                    .filter(|(_, block)| mix_pool.misbehaving_block(block))
+                    .map(|(block_hash, _)| *block_hash)
+                    .collect()
+            }
+        };
+        drop(refusal_blocks);
+
+        // Phase 3 — chain guard re-acquired with the mixpool released:
+        // the lottery lookups and their notifications.
+        let mut chain = chain.lock().expect("chain mutex poisoned");
+        for (block_hash, block_height) in pending {
+            if refused.contains(&block_hash) {
                 continue;
             }
             {

@@ -18,7 +18,10 @@ mod deadline;
 mod netaddress;
 mod peer;
 
-pub use deadline::maybe_add_deadline;
+pub use deadline::{
+    ArmOutcome, MAX_PENDING_INV_BURST, PendingDeadlines, Settles, StallDetector, StallReason,
+    check_deadlines, maybe_add_deadline, maybe_remove_deadline, settles,
+};
 pub use netaddress::{PeerAddr, new_net_address};
 pub use peer::{Config, NegotiateError, Peer, PeerEnv, PeerGlobals, StatsSnap};
 

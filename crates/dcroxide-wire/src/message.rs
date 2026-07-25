@@ -365,16 +365,37 @@ pub fn write_message(msg: &Message, pver: u32, net: CurrencyNet) -> Result<Vec<u
     Ok(out)
 }
 
-/// Read, validate, and decode the next message from `buf` (dcrd
-/// `ReadMessage`), returning the message and the number of bytes consumed.
-/// The validation order matches dcrd exactly: global payload limit, network
-/// magic, command form, known command, per-type payload limit, checksum,
-/// payload decode, trailing bytes.
-pub fn read_message(
+/// A validated fixed-size message header (dcrd `messageHeader` once
+/// `readMessageN` has run its pre-payload checks).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageHeader {
+    /// The command, with the trailing NUL padding removed.
+    pub command: String,
+    /// The declared payload length, already checked against both the
+    /// global cap and the per-type maximum for `command`.
+    pub payload_len: u32,
+    /// The first four bytes of the double-SHA256 of the payload.
+    pub checksum: [u8; 4],
+}
+
+/// Validate the fixed-size header at the front of `buf` without
+/// touching the payload (dcrd's `readMessageN` checks up to, but not
+/// including, `payload := make([]byte, hdr.length)`).
+///
+/// This exists so a reader can bound the payload allocation by the
+/// per-command maximum before reserving anything: the declared length
+/// arrives in 24 attacker-controlled bytes, and validating only after
+/// the payload has been buffered would let a peer reserve the global
+/// 32 MiB cap per connection and then never send the bytes.
+///
+/// The checks run in dcrd's order — global payload limit, network
+/// magic, command form, known command, per-type payload limit — so the
+/// error a peer sees does not depend on how the caller framed the read.
+pub fn read_message_header(
     buf: &[u8],
     pver: u32,
     net: CurrencyNet,
-) -> Result<(Message, usize), WireError> {
+) -> Result<MessageHeader, WireError> {
     let mut r = Cursor::new(buf);
     let magic = r.read_u32()?;
     let command_field: [u8; COMMAND_SIZE] = r.take_array()?;
@@ -412,6 +433,31 @@ pub fn read_message(
         });
     }
 
+    Ok(MessageHeader {
+        command,
+        payload_len,
+        checksum,
+    })
+}
+
+/// Read, validate, and decode the next message from `buf` (dcrd
+/// `ReadMessage`), returning the message and the number of bytes consumed.
+/// The validation order matches dcrd exactly: global payload limit, network
+/// magic, command form, known command, per-type payload limit, checksum,
+/// payload decode, trailing bytes.
+pub fn read_message(
+    buf: &[u8],
+    pver: u32,
+    net: CurrencyNet,
+) -> Result<(Message, usize), WireError> {
+    let MessageHeader {
+        command,
+        payload_len,
+        checksum,
+    } = read_message_header(buf, pver, net)?;
+
+    let mut r = Cursor::new(buf);
+    r.take(MESSAGE_HEADER_SIZE)?;
     let payload = r.take(payload_len as usize)?;
     let payload_hash = dcroxide_chainhash::hash_b(payload);
     if payload_hash[..4] != checksum {

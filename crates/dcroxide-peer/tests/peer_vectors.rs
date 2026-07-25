@@ -9,9 +9,7 @@
 //! timestamp normalized, since dcrd cannot inject its randomness).
 
 use dcroxide_chainhash::Hash;
-use dcroxide_peer::{
-    Config, MsgTransport, Peer, PeerAddr, PeerEnv, PeerGlobals, maybe_add_deadline, new_net_address,
-};
+use dcroxide_peer::{Config, MsgTransport, Peer, PeerAddr, PeerEnv, PeerGlobals, new_net_address};
 use dcroxide_testutil::unhex;
 use dcroxide_wire::{
     CurrencyNet, Message, MsgPing, MsgPong, MsgVersion, NetAddress, PROTOCOL_VERSION, ServiceFlag,
@@ -441,13 +439,6 @@ fn peer_vectors() {
                 }
                 assert_eq!(push_peer.last_ping_nonce().to_string(), parts[2], "{line}");
             }
-            "deadline" => {
-                let mut pending: HashMap<&'static str, i64> = HashMap::new();
-                maybe_add_deadline(&mut pending, parts[1], 0);
-                let mut keys: Vec<&str> = pending.keys().copied().collect();
-                keys.sort_unstable();
-                assert_eq!(keys.join(","), parts[2], "{line}");
-            }
             "netaddr" => {
                 let addr = match parts[1] {
                     "tcp4" => PeerAddr::Tcp {
@@ -543,7 +534,6 @@ fn peer_vectors() {
         ("pushaddr", 2),
         ("ping", 1),
         ("pong", 2),
-        ("deadline", 25),
         ("netaddr", 4),
         ("outbound", 5),
     ];

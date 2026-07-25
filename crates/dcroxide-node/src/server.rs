@@ -1728,6 +1728,117 @@ pub const MAX_CONCURRENT_GETDATA_REQS: usize = 1000;
 /// two full inventory messages).
 pub const MAX_PENDING_GETDATA_ITEM_REQS: u32 = 2 * MAX_INV_PER_MSG;
 
+/// The ban score charged for requesting one full inventory message
+/// worth of getdata items (dcrd's `numNewReqs*99/wire.MaxInvPerMsg`
+/// rate: 99 points, one short of the default ban threshold, so a
+/// single maximal query warns and a second one bans).
+pub const GETDATA_SCORE_PER_FULL_INV: u32 = 99;
+
+/// The ban score a `getdata` costs its sender (dcrd's
+/// `numNewReqs*99/wire.MaxInvPerMsg` in `OnGetData`).
+///
+/// This is Go integer division, so any request below
+/// `MAX_INV_PER_MSG / GETDATA_SCORE_PER_FULL_INV` items — 506 — costs
+/// nothing at all, and only the size of each individual request is
+/// charged, never the total across requests.
+///
+/// The truncation is deliberate parity, and an earlier version of this
+/// port "fixed" it by carrying the remainder into the next request so
+/// repeated 505-item batches were no longer free.  That is a regression,
+/// not an improvement: at 99 points per full inventory message the rate
+/// is 0.00198 points per item, and against dcrd's 60-second ban-score
+/// half-life and threshold of 100 the equilibrium is reached at ~583
+/// items per second sustained.  Both dcrd and this port request blocks
+/// in batches of `maxInFlightBlocks` (16), which truncates to zero, so
+/// dcrd charges an honestly syncing peer nothing — while a carry would
+/// charge it at the full per-item rate.  Early-chain blocks are ~1 KiB,
+/// so 583 blocks/s is only ~0.6 MB/s of upload: an ordinary peer
+/// bootstrapping from us over a fast link would be banned partway
+/// through the small-block window.
+///
+/// What actually bounds the getdata path is the machinery
+/// [`MAX_CONCURRENT_GETDATA_REQS`], [`MAX_PENDING_GETDATA_ITEM_REQS`]
+/// and [`MAX_PENDING_SEND`] provide; the audit finding here was that
+/// those counters were being passed as literal zeroes, not that the
+/// rate was wrong.
+pub fn getdata_ban_score_increase(num_new_reqs: u32) -> u32 {
+    let scaled = u64::from(num_new_reqs).saturating_mul(u64::from(GETDATA_SCORE_PER_FULL_INV));
+    u32::try_from(scaled / u64::from(MAX_INV_PER_MSG)).unwrap_or(u32::MAX)
+}
+
+/// The number of getdata response messages that may be loaded from
+/// the database and queued for send at once (dcrd `maxPendingSend` in
+/// `serveGetData`, "keeping the memory usage bounded to reasonable
+/// limits").
+pub const MAX_PENDING_SEND: usize = 3;
+
+/// The wire message header overhead added to each queued payload when
+/// tracking send progress (dcrd `wire.MessageHeaderSize`).
+pub const MESSAGE_HEADER_SIZE: u64 = 24;
+
+/// The send-pipeline bound for one peer's getdata serve: the port of
+/// dcrd's `maxPendingSend` semaphore and its `sendDoneChan`.
+///
+/// dcrd releases a semaphore slot when the output goroutine reports a
+/// completed write on the per-message done channel.  This port's
+/// output loop does not carry a per-message completion signal, so the
+/// pipeline derives one from the peer's cumulative send accounting
+/// (`Peer::record_send`, which the output loop updates after every
+/// write): a queued message is treated as written once the peer's
+/// sent-byte counter has advanced past the cumulative byte mark
+/// recorded when it was queued.
+///
+/// Bytes written for messages from other producers (relay inventory,
+/// pings, handshake traffic) also advance that counter, so a mark can
+/// retire slightly early; the resulting slack is bounded by whatever
+/// those producers wrote concurrently and never lets more than
+/// [`MAX_PENDING_SEND`] getdata payloads plus that slack sit unsent.
+/// The remaining hard bound is the outbound queue's own depth.
+#[derive(Debug, Clone, Default)]
+pub struct SendPipeline {
+    marks: std::collections::VecDeque<u64>,
+    queued: u64,
+    sent: u64,
+}
+
+impl SendPipeline {
+    /// A pipeline with nothing queued.
+    pub fn new() -> SendPipeline {
+        SendPipeline::default()
+    }
+
+    /// The number of queued data messages not yet known to have been
+    /// written (dcrd's occupied semaphore slots).
+    pub fn pending(&self) -> usize {
+        self.marks.len()
+    }
+
+    /// Whether another data message may be queued without exceeding
+    /// `capacity` outstanding sends (dcrd's semaphore acquisition).
+    pub fn has_room(&self, capacity: usize) -> bool {
+        self.marks.len() < capacity
+    }
+
+    /// Record that a data message of `bytes` payload was queued.
+    pub fn record_queued(&mut self, bytes: u64) {
+        self.queued = self
+            .queued
+            .saturating_add(bytes)
+            .saturating_add(MESSAGE_HEADER_SIZE);
+        self.marks.push_back(self.queued);
+    }
+
+    /// Fold in `bytes` newly written by the peer's output loop,
+    /// retiring every queued message the counter has passed (dcrd
+    /// draining `sendDoneChan` to release semaphore slots).
+    pub fn record_sent(&mut self, bytes: u64) {
+        self.sent = self.sent.saturating_add(bytes);
+        while self.marks.front().is_some_and(|mark| *mark <= self.sent) {
+            self.marks.pop_front();
+        }
+    }
+}
+
 /// What the getdata handler decided to do with the peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnGetDataOutcome {
@@ -1776,13 +1887,18 @@ pub fn on_get_data(
     // A decaying ban score increase is applied to prevent exhausting
     // resources with unusually large inventory queries.  Requesting
     // more than the maximum inventory vector length within a short
-    // period of time yields a score above the default ban threshold,
-    // while sustained bursts of small requests are not penalized.
+    // period of time yields a score above the default ban threshold.
+    //
+    // dcrd truncates the per-request rate to zero for any batch of 505
+    // items or fewer, and that truncation is reproduced exactly; see
+    // [`getdata_ban_score_increase`] for why charging the remainder
+    // instead would ban honest peers doing ordinary early-chain sync.
     let num_new_reqs = inv_len;
+    let transient = getdata_ban_score_increase(num_new_reqs);
     if add_ban_score(
         state,
         0,
-        num_new_reqs * 99 / MAX_INV_PER_MSG,
+        transient,
         disable_banning,
         ban_threshold,
         now_unix,
@@ -1973,13 +2089,92 @@ pub struct ServeGetDataOutcome {
     pub pending_decrements: u32,
 }
 
+/// A single action the getdata server takes for one inventory item,
+/// the per-item decomposition of [`ServeGetDataAction`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeGetDataItemAction {
+    /// Queue the resolved data message for the item.  This is the
+    /// only action dcrd gates behind its send semaphore.
+    QueueData(dcroxide_wire::InvVect),
+    /// Queue a single-item inventory of the current best tip after
+    /// the data message, triggering the peer's next getblocks batch.
+    QueueContinueInv(dcroxide_chainhash::Hash),
+    /// Accumulate the item into the batch's consolidated notfound,
+    /// which is queued once the whole batch has been walked.
+    AccumulateNotFound(dcroxide_wire::InvVect),
+}
+
+/// What the getdata server decided for one inventory item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeGetDataItemOutcome {
+    /// The actions in the exact order they are taken.
+    pub actions: Vec<ServeGetDataItemAction>,
+    /// Whether the stored continuation hash was cleared by this item.
+    pub cleared_continue_hash: bool,
+    /// The pending data item request decrement: one for served and
+    /// not-found items, zero for unknown types (dcrd skips those
+    /// without touching `numPendingGetDataItemReqs`).
+    pub pending_decrement: u32,
+}
+
+/// Decide what to do with one resolved getdata inventory item (one
+/// iteration of dcrd `serverPeer.handleServeGetData`'s loop).
+///
+/// Serving item by item is what lets the caller hold the chain lock
+/// for a single fetch instead of the whole batch and keep at most
+/// [`MAX_PENDING_SEND`] payloads in flight; [`serve_get_data`] is the
+/// batch fold over this and stays byte-for-byte identical.
+pub fn serve_get_data_item(
+    iv: dcroxide_wire::InvVect,
+    resolution: GetDataResolution,
+    continue_hash: Option<dcroxide_chainhash::Hash>,
+    best_hash: dcroxide_chainhash::Hash,
+) -> ServeGetDataItemOutcome {
+    let mut actions = Vec::new();
+    let mut cleared_continue_hash = false;
+    let mut pending_decrement = 0;
+
+    match resolution {
+        GetDataResolution::UnknownType => {
+            // Unknown inventory types are skipped without a notfound
+            // entry or a pending decrement.
+        }
+        GetDataResolution::NotFound => {
+            actions.push(ServeGetDataItemAction::AccumulateNotFound(iv));
+            pending_decrement = 1;
+        }
+        GetDataResolution::Found => {
+            actions.push(ServeGetDataItemAction::QueueData(iv));
+            pending_decrement = 1;
+
+            // When the served block was the advertised continuation,
+            // trigger the next getblocks batch — and clear the
+            // continuation so a getdata that lists the same block
+            // twice emits exactly one continue inv (dcrd
+            // `handleServeGetData` reloading `continueHash` each
+            // iteration and `Store(nil)` after the first match).
+            if iv.inv_type == dcroxide_wire::InvType::BLOCK && continue_hash == Some(iv.hash) {
+                actions.push(ServeGetDataItemAction::QueueContinueInv(best_hash));
+                cleared_continue_hash = true;
+            }
+        }
+    }
+
+    ServeGetDataItemOutcome {
+        actions,
+        cleared_continue_hash,
+        pending_decrement,
+    }
+}
+
 /// Serve a batch of getdata inventory items: queue each resolved data
 /// message in request order, accumulate the misses into a single
 /// notfound message sent last, and — when a served block was the
 /// advertised continuation — queue a best-tip inventory afterward and
 /// clear the continuation (dcrd `serverPeer.handleServeGetData`).
-/// dcrd's send semaphore and pipelining are concurrency machinery and
-/// are not reproduced; the item fetches are the caller's seams.
+/// The item fetches are the caller's seams; dcrd's send semaphore is
+/// ported as [`SendPipeline`], which the caller drives around the
+/// per-item [`serve_get_data_item`] this folds over.
 pub fn serve_get_data(
     items: &[(dcroxide_wire::InvVect, GetDataResolution)],
     mut continue_hash: Option<dcroxide_chainhash::Hash>,
@@ -1991,33 +2186,23 @@ pub fn serve_get_data(
     let mut pending_decrements = 0;
 
     for (iv, resolution) in items {
-        match resolution {
-            GetDataResolution::UnknownType => {
-                // Unknown inventory types are skipped without a
-                // notfound entry or a pending decrement.
-                continue;
-            }
-            GetDataResolution::NotFound => {
-                not_found.push(*iv);
-                pending_decrements += 1;
-            }
-            GetDataResolution::Found => {
-                actions.push(ServeGetDataAction::QueueData(*iv));
-                pending_decrements += 1;
-
-                // When the served block was the advertised
-                // continuation, trigger the next getblocks batch — and
-                // clear the continuation so a getdata that lists the same
-                // block twice emits exactly one continue inv (dcrd
-                // `handleServeGetData` reloading `continueHash` each
-                // iteration and `Store(nil)` after the first match).
-                if iv.inv_type == dcroxide_wire::InvType::BLOCK && continue_hash == Some(iv.hash) {
-                    actions.push(ServeGetDataAction::QueueContinueInv(best_hash));
-                    cleared_continue_hash = true;
-                    continue_hash = None;
+        let item = serve_get_data_item(*iv, *resolution, continue_hash, best_hash);
+        for action in item.actions {
+            match action {
+                ServeGetDataItemAction::QueueData(iv) => {
+                    actions.push(ServeGetDataAction::QueueData(iv));
                 }
+                ServeGetDataItemAction::QueueContinueInv(best) => {
+                    actions.push(ServeGetDataAction::QueueContinueInv(best));
+                }
+                ServeGetDataItemAction::AccumulateNotFound(iv) => not_found.push(iv),
             }
         }
+        if item.cleared_continue_hash {
+            cleared_continue_hash = true;
+            continue_hash = None;
+        }
+        pending_decrements += item.pending_decrement;
     }
 
     if !not_found.is_empty() {

@@ -30,7 +30,8 @@ use std::thread;
 use std::time::Duration;
 
 use dcroxide_peer::{
-    MAX_PROTOCOL_VERSION, MsgTransport, NEGOTIATE_TIMEOUT, Peer, PeerEnv, PeerGlobals,
+    ArmOutcome, MAX_PROTOCOL_VERSION, MsgTransport, NEGOTIATE_TIMEOUT, Peer, PeerEnv, PeerGlobals,
+    STALL_RESPONSE_TIMEOUT, STALL_TICK_INTERVAL, StallDetector, StallReason,
 };
 use dcroxide_wire::{CurrencyNet, Message, MsgPing};
 
@@ -179,11 +180,9 @@ where
     }
 }
 
-/// Read and dispatch messages until the peer disconnects.  Each message
-/// is given its protocol-level handling (queueing any immediate reply on
-/// the outbound queue) and then forwarded to the hooks' message handler,
-/// which queues its responses through the outbound queue and may request
-/// a disconnect, mirroring dcrd's `inHandler`.
+/// Read and dispatch messages until the peer disconnects, without stall
+/// detection (dcrd's `inHandler` for a peer whose stall handler is not
+/// running).
 pub fn run_peer_input<T, E, H>(
     peer: &Mutex<Peer>,
     transport: &mut T,
@@ -191,6 +190,39 @@ pub fn run_peer_input<T, E, H>(
     outbound: &OutboundQueue,
     hooks: &mut H,
     delayed: Vec<Message>,
+) -> DisconnectReason
+where
+    T: MsgTransport,
+    E: PeerEnv,
+    H: ServeHooks,
+{
+    run_peer_input_with_stall(peer, transport, env, outbound, hooks, delayed, None)
+}
+
+/// Read and dispatch messages until the peer disconnects.  Each message
+/// is given its protocol-level handling (queueing any immediate reply on
+/// the outbound queue) and then forwarded to the hooks' message handler,
+/// which queues its responses through the outbound queue and may request
+/// a disconnect, mirroring dcrd's `inHandler`.
+///
+/// Every received message is reported to the stall detector, clearing
+/// the deadlines it answers, and the handling of each message is
+/// bracketed by the detector's handler-active window (dcrd's
+/// `sccReceiveMessage`, `sccHandlerStart` and `sccHandlerDone`).  The
+/// bracket is what keeps a slow local callback from looking like a
+/// remote stall: the next message is not read until this one finishes
+/// processing, so the time spent here is credited back to every pending
+/// deadline.  The messages a legacy peer delayed past the handshake are
+/// replayed without stall signalling, exactly as dcrd's `inHandler`
+/// drains `delayedHandshakeMsgs` before its stall handler is involved.
+pub fn run_peer_input_with_stall<T, E, H>(
+    peer: &Mutex<Peer>,
+    transport: &mut T,
+    env: &mut E,
+    outbound: &OutboundQueue,
+    hooks: &mut H,
+    delayed: Vec<Message>,
+    stall: Option<&Mutex<StallDetector>>,
 ) -> DisconnectReason
 where
     T: MsgTransport,
@@ -205,10 +237,16 @@ where
         match classify_incoming(&mut peer, &msg, env) {
             IncomingAction::Disconnect(reason) => return DisconnectReason::Protocol(reason.into()),
             IncomingAction::Process { reply } => {
-                if let Some(reply) = reply
-                    && outbound.queue_message(*reply).is_err()
-                {
-                    return DisconnectReason::LocalShutdown;
+                if let Some(reply) = reply {
+                    let command = reply.command();
+                    match outbound.queue_message(*reply) {
+                        Ok(()) => {}
+                        // See the steady-state loop below: a full queue
+                        // drops the reply and is reported, it does not
+                        // end the connection.
+                        Err(QueueError::Full) => outbound.report_full(command),
+                        Err(QueueError::Closed) => return DisconnectReason::LocalShutdown,
+                    }
                 }
                 if let ServeSignal::Disconnect(reason) = hooks.on_message(&mut peer, &msg, outbound)
                 {
@@ -241,6 +279,20 @@ where
         let read_delta = transport.total_bytes_read().wrapping_sub(read_total);
         read_total = transport.total_bytes_read();
 
+        // Settle any deadline this message answers and open the
+        // handler-active window before taking any lock, so every
+        // moment between finishing the read and finishing the handling
+        // is credited to the local node rather than blamed on the peer.
+        if let Some(stall) = stall {
+            // Hash a mixing message before taking the lock: dcrd does
+            // this once in `readMessage`, and it must not happen with
+            // the stall mutex held.
+            let mix_hash = mix_message_hash(&msg);
+            let mut stall = stall.lock().expect("stall mutex poisoned");
+            stall.received_message(&msg, mix_hash);
+            stall.handler_start();
+        }
+
         let mut peer = peer.lock().expect("peer mutex poisoned");
         // Per-message receive accounting (dcrd stamping `lastRecv` in
         // `inHandler` after each read); transports without byte
@@ -252,12 +304,23 @@ where
             IncomingAction::Disconnect(reason) => return DisconnectReason::Protocol(reason.into()),
             IncomingAction::Process { reply } => {
                 // Immediate replies go through the outbound queue so all
-                // writes stay serialized on the output loop; a closed
-                // queue means the output loop already stopped.
-                if let Some(reply) = reply
-                    && outbound.queue_message(*reply).is_err()
-                {
-                    return DisconnectReason::LocalShutdown;
+                // writes stay serialized on the output loop.  A closed
+                // queue means the output loop already stopped, so this
+                // connection is over.  A full queue means the peer is
+                // not draining its socket, which is reported and the
+                // pong dropped: hanging up here would let a burst of
+                // relay announcements to a momentarily slow but honest
+                // peer cost it its connection, and the peer's own ping
+                // timeout, the writer's write deadline and the stall
+                // detector already bound a peer that has truly stopped
+                // reading.
+                if let Some(reply) = reply {
+                    let command = reply.command();
+                    match outbound.queue_message(*reply) {
+                        Ok(()) => {}
+                        Err(QueueError::Full) => outbound.report_full(command),
+                        Err(QueueError::Closed) => return DisconnectReason::LocalShutdown,
+                    }
                 }
                 if let ServeSignal::Disconnect(reason) = hooks.on_message(&mut peer, &msg, outbound)
                 {
@@ -265,6 +328,40 @@ where
                 }
             }
         }
+
+        // The message is handled: release the peer before closing the
+        // handler-active window, so this loop never holds the peer lock
+        // and the stall lock at once (the output loop takes them in the
+        // opposite order).
+        drop(peer);
+        if let Some(stall) = stall {
+            stall.lock().expect("stall mutex poisoned").handler_done();
+        }
+    }
+}
+
+/// The mixing-message identity hash for the eight mix commands, and
+/// `None` for anything else.
+///
+/// dcrd computes this once in `readMessage`, immediately after
+/// deserializing, and caches it on the wire message so
+/// `maybeRemoveDeadline` merely reads it back.  dcroxide keeps mix
+/// hashing in the mixing crate, so the input loop computes it once per
+/// received message and hands it to the stall detector — the same
+/// one-hash-per-message shape, with the cache in the caller.
+fn mix_message_hash(msg: &Message) -> Option<dcroxide_chainhash::Hash> {
+    match msg {
+        Message::MixPairReq(_)
+        | Message::MixKeyExchange(_)
+        | Message::MixCiphertexts(_)
+        | Message::MixSlotReserve(_)
+        | Message::MixFactoredPoly(_)
+        | Message::MixDCNet(_)
+        | Message::MixConfirm(_)
+        | Message::MixSecrets(_) => {
+            crate::mixnode::wire_to_pool_message(msg.clone()).and_then(|pool| pool.mix_hash().ok())
+        }
+        _ => None,
     }
 }
 
@@ -278,29 +375,180 @@ where
 /// refinements that arrive later; this is the plain message queue.
 #[derive(Clone)]
 pub struct OutboundQueue {
-    sender: mpsc::Sender<Message>,
+    sender: mpsc::SyncSender<Message>,
+    state: Arc<OutboundQueueState>,
 }
+
+/// The reporting state every clone of an [`OutboundQueue`] shares.
+struct OutboundQueueState {
+    /// The peer this queue feeds, for the congestion report; set once by
+    /// the connection assembly and left at its placeholder in the unit
+    /// tests, which have no socket.
+    label: std::sync::OnceLock<String>,
+    /// Whether a full-queue drop has already been reported since the
+    /// last successful enqueue.  A congested peer can otherwise turn
+    /// every relayed transaction into a log line, which is its own
+    /// resource-exhaustion lever, so one line is emitted per congestion
+    /// episode.
+    reported_full: std::sync::atomic::AtomicBool,
+}
+
+/// Why a message could not be handed to a peer's output loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueError {
+    /// The queue already holds [`MAX_OUTBOUND_QUEUE_DEPTH`] unsent
+    /// messages.  The output loop is blocked in a write, so the peer is
+    /// not draining its socket; the message cannot be queued without
+    /// growing the per-peer memory charge without bound.
+    Full,
+    /// The output loop has stopped and dropped the receiver, so the
+    /// connection is already tearing down.  This is the ordinary
+    /// shutdown path, not a peer fault.
+    Closed,
+}
+
+impl std::fmt::Display for QueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueueError::Full => write!(f, "peer output queue is full"),
+            QueueError::Closed => write!(f, "peer output queue is closed"),
+        }
+    }
+}
+
+/// The number of messages that may sit unsent in a peer's outbound
+/// queue.
+///
+/// This is a deliberate hardening choice, not a port of a dcrd bound —
+/// dcrd has no bound here.  dcrd's `peer.go` sets `outputBufferSize =
+/// 5000` and builds `outputQueue: make(chan outMsg, 5000)` alongside
+/// `sendQueue: make(chan outMsg, 1)`; `queueHandler` then moves
+/// everything the writer has not taken yet into a plain
+/// `pendingMsgs []outMsg` slice that it grows with `append`.  So dcrd
+/// buffers 5000 messages in the channel and an unlimited number in the
+/// pending slice, and `QueueMessage` blocks only after the 5000-slot
+/// channel fills.  (The three-slot semaphore often cited as the bound
+/// is `maxPendingSend` in `server.go`, which limits concurrent *getdata
+/// serve* items only; nothing throttles relay, announcements, addr,
+/// cfilter or init-state traffic.)
+///
+/// dcroxide's original port used `std::sync::mpsc::channel`, which is
+/// unbounded in the channel too, so a peer that stopped reading could
+/// pin unbounded heap.  128 slots caps that.  Against a byte budget the
+/// count is coarse: the largest message this queue carries is a
+/// max-size `MsgHeaders` (2000 headers x 180 bytes ~ 360 KB) or a
+/// max-size `MsgBlock` (~393 KB), so the worst case a peer can force by
+/// pipelining max-size requests without reading is ~46 MB per peer, or
+/// ~5.7 GB at the default `maxpeers` of 125.  That is still an order of
+/// magnitude tighter than dcrd's own 5000-plus-unbounded path, and the
+/// window is bounded by the writer's per-message write deadline: once
+/// the peer stops reading, the first blocked write times out and the
+/// connection is torn down.  Ordinary traffic is nowhere near it — a
+/// relay inv is ~40 bytes and a block announcement ~180 — so a
+/// congested honest peer's queue is well under 100 KB.  A byte-charged
+/// bound would be strictly better and is recorded as follow-up work
+/// rather than smuggled in here.
+///
+/// The depth is generous enough that ordinary bursts (a mempool inv
+/// fan-out, a headers response, the initial handshake traffic) never
+/// trip it.  When it is tripped, [`OutboundQueue::try_queue`] reports it
+/// instead of dropping the message silently; the per-call-site comments
+/// say what each producer does about it.
+pub const MAX_OUTBOUND_QUEUE_DEPTH: usize = 128;
 
 impl OutboundQueue {
     /// Create an outbound queue and the receiver its output loop drains.
     pub fn channel() -> (OutboundQueue, mpsc::Receiver<Message>) {
-        let (sender, receiver) = mpsc::channel();
-        (OutboundQueue { sender }, receiver)
+        let (sender, receiver) = mpsc::sync_channel(MAX_OUTBOUND_QUEUE_DEPTH);
+        let queue = OutboundQueue {
+            sender,
+            state: Arc::new(OutboundQueueState {
+                label: std::sync::OnceLock::new(),
+                reported_full: std::sync::atomic::AtomicBool::new(false),
+            }),
+        };
+        (queue, receiver)
     }
 
-    /// Queue a message to be sent to the peer.  Fails only once the
-    /// output loop has stopped and dropped the receiver.
-    pub fn queue_message(&self, msg: Message) -> Result<(), String> {
-        self.sender
-            .send(msg)
-            .map_err(|_| "peer output queue is closed".to_string())
+    /// Name the peer this queue feeds, so a congestion report identifies
+    /// it the way dcrd's peer logging does.  The first call wins.
+    pub fn set_peer_label(&self, label: String) {
+        let _ = self.state.label.set(label);
+    }
+
+    /// The peer label, or a placeholder when none was set (the unit
+    /// tests, which have no socket).
+    pub fn peer_label(&self) -> &str {
+        self.state.label.get().map(String::as_str).unwrap_or("peer")
+    }
+
+    /// Queue a message to be sent to the peer.
+    ///
+    /// [`QueueError::Full`] means the peer is not draining its socket
+    /// and the message was **not** queued; the caller must decide what
+    /// that means for its own state, and in particular must not record
+    /// the message as sent.  [`QueueError::Closed`] means the output
+    /// loop already stopped, which is the ordinary teardown path.
+    pub fn queue_message(&self, msg: Message) -> Result<(), QueueError> {
+        match self.sender.try_send(msg) {
+            Ok(()) => {
+                // Room again: re-arm the congestion report so the next
+                // episode is logged.
+                self.state
+                    .reported_full
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(mpsc::TrySendError::Full(_)) => Err(QueueError::Full),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(QueueError::Closed),
+        }
+    }
+
+    /// Queue a message, reporting a full queue instead of discarding it
+    /// silently, and return whether it was queued.
+    ///
+    /// This is the entry point for every producer that tolerates a drop.
+    /// The caller must treat `false` as "not sent" and skip any
+    /// bookkeeping that claims otherwise — a peer marked as knowing an
+    /// inventory item it was never told about never gets a retry.
+    /// A closed queue is teardown, so it is not reported.
+    pub fn try_queue(&self, msg: Message) -> bool {
+        let command = msg.command();
+        match self.queue_message(msg) {
+            Ok(()) => true,
+            Err(QueueError::Full) => {
+                self.report_full(command);
+                false
+            }
+            Err(QueueError::Closed) => false,
+        }
+    }
+
+    /// Log that a message was dropped because the queue is full, at most
+    /// once per congestion episode.  Exposed for the producers that take
+    /// their own action (a disconnect, say) on top of the report.
+    pub fn report_full(&self, command: &str) {
+        if self
+            .state
+            .reported_full
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        crate::logging::warn(
+            "PEER",
+            &format!(
+                "Outbound queue for peer {} is full ({MAX_OUTBOUND_QUEUE_DEPTH} messages \
+                 unsent) -- dropping {command}",
+                self.peer_label()
+            ),
+        );
     }
 }
 
 /// Write queued messages to the peer until the outbound queue is closed
-/// or a write fails (dcrd's `outHandler` draining the send queue).  Each
-/// completed write contributes its byte delta and timestamp to the
-/// peer's send accounting (dcrd's `writeMessage` bookkeeping).
+/// or a write fails, without stall detection (dcrd's `outHandler` for a
+/// peer whose stall handler is not running).
 pub fn run_peer_output<T, E>(
     peer: &Mutex<Peer>,
     transport: &mut T,
@@ -311,8 +559,60 @@ where
     T: MsgTransport,
     E: PeerEnv,
 {
+    run_peer_output_with_stall(peer, transport, env, outbound, None)
+}
+
+/// Write queued messages to the peer until the outbound queue is closed
+/// or a write fails (dcrd's `outHandler` draining the send queue).  Each
+/// completed write contributes its byte delta and timestamp to the
+/// peer's send accounting (dcrd's `writeMessage` bookkeeping).
+///
+/// Every message is reported to the stall detector just before it goes
+/// out, arming a deadline for the response it expects (dcrd's
+/// `sccSendMessage`, signalled from `outHandler` at the same point).
+pub fn run_peer_output_with_stall<T, E>(
+    peer: &Mutex<Peer>,
+    transport: &mut T,
+    env: &mut E,
+    outbound: mpsc::Receiver<Message>,
+    stall: Option<&Mutex<StallDetector>>,
+) -> DisconnectReason
+where
+    T: MsgTransport,
+    E: PeerEnv,
+{
     let mut write_total = transport.total_bytes_written();
     while let Ok(msg) = outbound.recv() {
+        // Arm the deadline before the write, and hold only the stall
+        // lock while doing so: the send accounting below takes the peer
+        // lock, and the input loop takes them in the opposite order.
+        if let Some(stall) = stall {
+            let outcome = stall
+                .lock()
+                .expect("stall mutex poisoned")
+                .sent_message(&msg);
+            if outcome == ArmOutcome::ExceededPendingBurst {
+                // dcrd logs and disconnects rather than arming, so the
+                // peer cannot run further ahead with inventory it has
+                // not served.  The message is dropped unsent.
+                //
+                // Logged here because the reason does not survive
+                // teardown: ending this loop shuts the socket down, and
+                // the connection's reason comes from the input loop,
+                // which by then sees only the resulting end of stream.
+                let label = peer.lock().expect("peer mutex poisoned").addr().to_string();
+                crate::logging::info(
+                    "PEER",
+                    &format!(
+                        "Peer {label} exceeded max pending inventory announcements \
+                         without serving data -- disconnecting"
+                    ),
+                );
+                return DisconnectReason::Protocol(
+                    "exceeded max pending inventory announcements without serving data".into(),
+                );
+            }
+        }
         if let Err(e) = transport.write_message(&msg) {
             return DisconnectReason::WriteError(e);
         }
@@ -330,6 +630,14 @@ where
 /// Send a ping to the peer every `interval` until shutdown is signalled
 /// or the outbound queue closes (dcrd's `pingHandler`).  Each ping gets
 /// a fresh nonce recorded on the peer so the answering pong can be timed.
+///
+/// A full queue does **not** end the timer.  The keepalive is what keeps
+/// a live-but-quiet peer from tripping the idle read deadline, so
+/// abandoning it because of one congested tick would turn a transient
+/// burst into a disconnect several minutes later, for a peer that is
+/// reading again by then.  The tick is skipped, reported, and the next
+/// one tries again; only a closed queue (the connection tearing down)
+/// stops the timer.
 pub fn run_ping_timer<E: PeerEnv>(
     peer: &Mutex<Peer>,
     env: &mut E,
@@ -344,17 +652,127 @@ pub fn run_ping_timer<E: PeerEnv>(
                 let ping = MsgPing {
                     nonce: env.rand_u64(),
                 };
-                peer.lock()
-                    .expect("peer mutex poisoned")
-                    .record_sent_ping(env, &ping);
-                if outbound.queue_message(Message::Ping(ping)).is_err() {
-                    return;
+                // Hold the peer lock across the enqueue so the nonce is
+                // recorded before the input loop can process the pong
+                // answering it, and record it only when the ping is
+                // really on its way — dcrd stamps `lastPingNonce` in
+                // `outHandler`, immediately before the write, so a ping
+                // that never leaves never becomes the pending nonce.
+                let mut peer = peer.lock().expect("peer mutex poisoned");
+                match outbound.queue_message(Message::Ping(ping)) {
+                    Ok(()) => peer.record_sent_ping(env, &ping),
+                    Err(QueueError::Full) => {
+                        // Report without the peer lock held.
+                        drop(peer);
+                        outbound.report_full("ping");
+                    }
+                    Err(QueueError::Closed) => return,
                 }
             }
             // Shutdown signalled, or the signalling half was dropped.
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+/// How long a stall detector waits between checks and how long it
+/// grants an expected response to arrive (dcrd's `stallTickInterval`
+/// and `stallResponseTimeout`).
+///
+/// [`StallConfig::default`] is dcrd's production pair; tests shorten
+/// both so a stall is observable in milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StallConfig {
+    /// The interval between stall checks.
+    pub tick: Duration,
+    /// The base deadline granted to an expected response.
+    pub response_timeout: Duration,
+}
+
+impl Default for StallConfig {
+    fn default() -> StallConfig {
+        StallConfig {
+            tick: Duration::from_nanos(STALL_TICK_INTERVAL.max(0) as u64),
+            response_timeout: Duration::from_nanos(STALL_RESPONSE_TIMEOUT.max(0) as u64),
+        }
+    }
+}
+
+/// Check the peer's pending responses every `tick` until shutdown is
+/// signalled, disconnecting it when one has not arrived by its adjusted
+/// deadline (dcrd's `stallHandler`).
+///
+/// dcrd funnels the stall events through a `stallControl` channel into a
+/// dedicated goroutine because that is Go's idiom for owning mutable
+/// state; the port shares the state behind its own mutex instead, which
+/// is the direct Rust idiom, keeps the I/O loops from ever blocking on a
+/// control channel, and removes the channel-versus-quit race entirely.
+/// The observable behavior is dcrd's: the same deadlines, the same
+/// per-tick check, and the same disconnect.
+///
+/// Disconnecting is a shutdown of the connection — the mechanism the
+/// input and output loops already use to break each other out of a
+/// blocked read or write — which unblocks the input loop's read and
+/// tears the whole connection down (dcrd's `Disconnect` closing the
+/// conn).  The stalled command is returned so the caller can report why
+/// the connection ended.
+pub fn run_stall_detector(
+    stall: &Mutex<StallDetector>,
+    conn: &TcpStream,
+    peer_label: &str,
+    tick: Duration,
+    shutdown: &mpsc::Receiver<()>,
+) -> Option<StallReason> {
+    loop {
+        // Wait a full tick unless shutdown arrives first.
+        match shutdown.recv_timeout(tick) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let stalled = stall.lock().expect("stall mutex poisoned").check();
+                if let Some(reason) = stalled {
+                    crate::logging::info(
+                        "PEER",
+                        &format!(
+                            "Peer {peer_label} appears to be stalled or misbehaving \
+                             (reason: {}) -- disconnecting",
+                            reason.exceeded_text()
+                        ),
+                    );
+                    let _ = conn.shutdown(Shutdown::Both);
+                    return Some(reason);
+                }
+            }
+            // Shutdown signalled, or the signalling half was dropped.
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
+/// Run a peer connection with dcrd's production stall timings.
+#[allow(clippy::too_many_arguments)] // Mirrors dcrd's connection surface.
+pub fn run_peer_connection<H>(
+    stream: TcpStream,
+    peer: Peer,
+    pver: u32,
+    net: CurrencyNet,
+    idle_timeout: Duration,
+    ping_interval: Duration,
+    net_totals: Option<Arc<crate::transport::NetByteTotals>>,
+    hooks: H,
+) -> DisconnectReason
+where
+    H: ServeHooks,
+{
+    run_peer_connection_with_stall(
+        stream,
+        peer,
+        pver,
+        net,
+        idle_timeout,
+        ping_interval,
+        net_totals,
+        hooks,
+        StallConfig::default(),
+    )
 }
 
 /// Run a peer connection from the negotiated handshake through the
@@ -364,14 +782,22 @@ pub fn run_ping_timer<E: PeerEnv>(
 /// The socket is split into read and write halves; the version handshake
 /// runs (inbound or outbound per the peer) before the loops start; then
 /// the output loop and the ping timer run on their own threads while the
-/// input loop runs on this thread.  When the input loop ends the ping
-/// timer is signalled and the outbound queue is closed so the other
-/// threads finish, and both are joined before returning the reason the
-/// connection stopped.  `idle_timeout` bounds each read so a silent peer
-/// eventually disconnects (dcrd's idle timer); `ping_interval` should be
-/// shorter so a live peer answers before that fires.
+/// input loop runs on this thread, with the stall detector ticking on a
+/// fourth.  When the input loop ends the ping timer and the stall
+/// detector are signalled and the outbound queue is closed so the other
+/// threads finish, and all three are joined before returning the reason
+/// the connection stopped.  `idle_timeout` bounds each read so a silent
+/// peer eventually disconnects (dcrd's idle timer); `ping_interval`
+/// should be shorter so a live peer answers before that fires.
+///
+/// The idle timer alone is not enough: a peer that keeps answering the
+/// keepalive pings while never serving the data it was asked for looks
+/// perfectly alive to it, yet pins every in-flight request slot
+/// forever.  `stall` is what bounds that — the pending responses are
+/// checked every `stall.tick` and the peer is disconnected once one has
+/// not arrived by its deadline (dcrd's `stallHandler`).
 #[allow(clippy::too_many_arguments)] // Mirrors dcrd's connection surface.
-pub fn run_peer_connection<H>(
+pub fn run_peer_connection_with_stall<H>(
     stream: TcpStream,
     mut peer: Peer,
     pver: u32,
@@ -380,6 +806,7 @@ pub fn run_peer_connection<H>(
     ping_interval: Duration,
     net_totals: Option<Arc<crate::transport::NetByteTotals>>,
     mut hooks: H,
+    stall: StallConfig,
 ) -> DisconnectReason
 where
     H: ServeHooks,
@@ -392,6 +819,12 @@ where
     let negotiate_timeout = Duration::from_nanos(NEGOTIATE_TIMEOUT.max(0) as u64);
     let write_stream = match stream.try_clone() {
         Ok(write_stream) => write_stream,
+        Err(e) => return DisconnectReason::WriteError(e.to_string()),
+    };
+    // A third handle on the same socket, so the stall detector can shut
+    // the connection down from its own thread (dcrd's `Disconnect`).
+    let stall_stream = match stream.try_clone() {
+        Ok(stall_stream) => stall_stream,
         Err(e) => return DisconnectReason::WriteError(e.to_string()),
     };
     // The handshake is framed at the local maximum protocol version (0
@@ -411,6 +844,10 @@ where
     // read tighter, exactly as dcrd's does.
     read_transport.set_read_budget(Some(negotiate_timeout.min(idle_timeout)));
     let mut write_transport = WireTransport::new(write_stream, handshake_pver, net);
+    // Every send is bounded by the same idle budget the reads use, so a
+    // peer that stops reading its socket is disconnected instead of
+    // parking the writer thread with the outbound queue held.
+    write_transport.set_write_budget(Some(idle_timeout));
     // Both halves contribute to the server-wide byte totals from the
     // handshake onward, exactly like dcrd's read/write listeners.
     if let Some(totals) = net_totals {
@@ -480,6 +917,10 @@ where
     // handshake).
     let peer = Arc::new(Mutex::new(peer));
     let (outbound, receiver) = OutboundQueue::channel();
+    // Name the queue so a congestion report identifies the peer.
+    outbound.set_peer_label(peer.lock().expect("peer mutex poisoned").addr().to_string());
+    // The queue is empty here, so this cannot fail with
+    // [`QueueError::Full`]; a failure is a closed queue.
     if outbound.queue_message(Message::SendHeaders).is_err() {
         return DisconnectReason::LocalShutdown;
     }
@@ -493,14 +934,24 @@ where
         remote_version.disable_relay_tx,
     );
 
+    // The stall state the three loops share: the output loop arms the
+    // deadlines, the input loop settles them and brackets the
+    // callbacks, and the stall thread checks them (dcrd's stall control
+    // channel into `stallHandler`).
+    let stall_state = Arc::new(Mutex::new(StallDetector::with_response_timeout(
+        i64::try_from(stall.response_timeout.as_nanos()).unwrap_or(i64::MAX),
+    )));
+
     let output_peer = Arc::clone(&peer);
+    let output_stall = Arc::clone(&stall_state);
     let output = thread::spawn(move || {
         let mut output_env = NodePeerEnv::new();
-        let reason = run_peer_output(
+        let reason = run_peer_output_with_stall(
             &output_peer,
             &mut write_transport,
             &mut output_env,
             receiver,
+            Some(&output_stall),
         );
         // Shut the socket down when the output loop ends (a write error
         // or a closed queue) so the input loop's blocking read unblocks
@@ -523,14 +974,33 @@ where
         );
     });
 
+    // Watch the pending responses on a fourth thread: a peer that keeps
+    // the connection alive while never serving what it was asked for is
+    // disconnected instead of pinning the request slots forever (dcrd's
+    // `stallHandler`).
+    let (stall_shutdown, stall_shutdown_rx) = mpsc::channel();
+    let stall_label = peer.lock().expect("peer mutex poisoned").addr().to_string();
+    let stall_tick = stall.tick;
+    let stall_thread_state = Arc::clone(&stall_state);
+    let stall_thread = thread::spawn(move || {
+        run_stall_detector(
+            &stall_thread_state,
+            &stall_stream,
+            &stall_label,
+            stall_tick,
+            &stall_shutdown_rx,
+        )
+    });
+
     // Drive the input loop on this thread until the peer disconnects.
-    let reason = run_peer_input(
+    let reason = run_peer_input_with_stall(
         &peer,
         &mut read_transport,
         &mut env,
         &outbound,
         &mut hooks,
         outcome.delayed,
+        Some(&stall_state),
     );
 
     // The connection is winding down (dcrd `DonePeer`).
@@ -538,14 +1008,22 @@ where
 
     // Tear down: shut the socket down so the output loop's blocking write
     // unblocks (a peer that stopped reading would otherwise wedge it),
-    // stop the ping timer, and close the outbound queue, then join both
-    // threads.
+    // stop the ping timer and the stall detector, and close the outbound
+    // queue, then join the three threads.
     let _ = read_transport.get_mut().shutdown(Shutdown::Both);
     let _ = ping_shutdown.send(());
+    let _ = stall_shutdown.send(());
     drop(outbound);
     let _ = ping.join();
     let _ = output.join();
-    reason
+    // A stall is the real reason the connection ended; the input loop
+    // only saw the socket the detector shut down under it.
+    match stall_thread.join() {
+        Ok(Some(command)) => DisconnectReason::Protocol(
+            format!("peer appears to be stalled or misbehaving, {command} timeout").into(),
+        ),
+        Ok(None) | Err(_) => reason,
+    }
 }
 
 #[cfg(test)]
