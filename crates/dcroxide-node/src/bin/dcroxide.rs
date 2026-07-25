@@ -932,10 +932,12 @@ fn run(cfg: Config) -> ExitCode {
         if seeders.is_empty() {
             None
         } else {
-            dcroxide_node::logging::info(
-                "SRVR",
-                &format!("Querying {} network seeder(s)", seeders.len()),
-            );
+            // No aggregate line here: dcrd emits none — `Querying`
+            // appears nowhere in its tree — and reports per seeder
+            // instead, naming each one and how many addresses it
+            // yielded (`addrmgr/seed.go` 161, 195, 198).  Those lines
+            // carry strictly more, and this one was also tagged `SRVR`
+            // where dcrd's seeder output is `AMGR`.
             // dcrd routes its seeder HTTP transport through `dcrdDial`,
             // so a proxied daemon queries the seeders over the SOCKS
             // proxy rather than leaking the traffic; without a proxy the

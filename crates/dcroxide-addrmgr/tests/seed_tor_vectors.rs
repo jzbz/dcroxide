@@ -294,3 +294,119 @@ fn seed_tor_vectors() {
         assert_eq!(counts.get(op), Some(want), "row count for {op}");
     }
 }
+
+/// The seeder must report what it found, naming the seeder, and must say
+/// which entries it threw away.
+///
+/// dcrd logs this per seeder at info (`addrmgr/seed.go` 161, 195, 198)
+/// and warns per malformed entry (170, 175, 180); the port logged none of
+/// it and instead emitted one invented aggregate line — "Querying N
+/// network seeder(s)", a string that appears nowhere in dcrd — under the
+/// `SRVR` tag where dcrd's seeder output is `AMGR`. An operator could see
+/// that seeding started and nothing about whether any seeder answered.
+///
+/// These are the lines a human reads when peering is not working, so they
+/// are worth pinning: the counts, the seeder's name, and the exclusion
+/// count when a seeder returns junk.
+#[test]
+fn a_seeder_round_reports_its_yield_and_what_it_discarded() {
+    #[derive(Default)]
+    struct RecordingEnv {
+        infos: Vec<String>,
+        warns: Vec<String>,
+    }
+    impl SeedEnv for RecordingEnv {
+        fn now_nanos(&mut self) -> i64 {
+            1_700_000_000 * 1_000_000_000
+        }
+        fn rand_duration(&mut self, _max: i64) -> i64 {
+            0
+        }
+        fn log_info(&mut self, msg: &str) {
+            self.infos.push(msg.to_string());
+        }
+        fn log_warn(&mut self, msg: &str) {
+            self.warns.push(msg.to_string());
+        }
+    }
+
+    let seeder = "test-seed.decred.org";
+    let filters = HttpsSeederFilters::default();
+
+    // Two good entries and three different kinds of junk.
+    let body = concat!(
+        r#"{"host":"1.2.3.4:9108","services":13,"pver":10}"#,
+        r#"{"host":"nocolon","services":1,"pver":10}"#,
+        r#"{"host":"1.2.3.4:notaport","services":1,"pver":10}"#,
+        r#"{"host":"example.com:9108","services":1,"pver":10}"#,
+        r#"{"host":"5.6.7.8:9108","services":1,"pver":10}"#,
+    );
+    let mut transport = ScriptedSeeder {
+        status: 200,
+        body: body.as_bytes().to_vec(),
+        url: None,
+    };
+    let mut env = RecordingEnv::default();
+    let addrs = seed_addrs(seeder, &mut transport, &mut env, &filters).expect("seed");
+
+    assert_eq!(addrs.len(), 2, "only the two IP entries are usable");
+    assert_eq!(
+        env.infos,
+        vec![format!(
+            "2 addresses found from seeder {seeder} (excluded 3 invalid)"
+        )],
+        "the summary must name the seeder and count what it discarded"
+    );
+    assert_eq!(
+        env.warns.len(),
+        3,
+        "one warning per discarded entry: {:?}",
+        env.warns
+    );
+    assert!(
+        env.warns.iter().any(|w| w.contains("invalid host")),
+        "{:?}",
+        env.warns
+    );
+    assert!(
+        env.warns.iter().any(|w| w.contains("invalid port")),
+        "{:?}",
+        env.warns
+    );
+    assert!(
+        env.warns.iter().any(|w| w.contains("not an IP address")),
+        "{:?}",
+        env.warns
+    );
+
+    // A seeder with nothing to give still says so, by name.
+    let mut transport = ScriptedSeeder {
+        status: 200,
+        body: Vec::new(),
+        url: None,
+    };
+    let mut env = RecordingEnv::default();
+    let addrs = seed_addrs(seeder, &mut transport, &mut env, &filters).expect("seed");
+    assert!(addrs.is_empty());
+    assert_eq!(
+        env.infos,
+        vec![format!("0 addresses found from seeder {seeder}")],
+        "an empty seeder must still be reported by name"
+    );
+
+    // And a clean round reports without an exclusion clause.
+    let mut transport = ScriptedSeeder {
+        status: 200,
+        body: r#"{"host":"1.2.3.4:9108","services":13,"pver":10}"#
+            .as_bytes()
+            .to_vec(),
+        url: None,
+    };
+    let mut env = RecordingEnv::default();
+    seed_addrs(seeder, &mut transport, &mut env, &filters).expect("seed");
+    assert_eq!(
+        env.infos,
+        vec![format!("1 addresses found from seeder {seeder}")],
+        "dcrd does not special-case the singular, and neither does this"
+    );
+}

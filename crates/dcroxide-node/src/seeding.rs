@@ -265,6 +265,16 @@ impl SeedEnv for SystemSeedEnv {
             .unwrap_or(0)
     }
 
+    /// dcrd's seeder output carries the `AMGR` tag because its addrmgr
+    /// logs through the logger the daemon injects there.
+    fn log_info(&mut self, msg: &str) {
+        crate::logging::info("AMGR", msg);
+    }
+
+    fn log_warn(&mut self, msg: &str) {
+        crate::logging::warn("AMGR", msg);
+    }
+
     fn rand_duration(&mut self, max_nanos: i64) -> i64 {
         let mut buf = [0u8; 8];
         getrandom::fill(&mut buf).expect("system random source");

@@ -74,6 +74,20 @@ pub trait SeedEnv {
     /// A uniformly random duration in `[0, max)` nanoseconds (dcrd
     /// `rand.Duration`).
     fn rand_duration(&mut self, max_nanos: i64) -> i64;
+
+    /// Report what a seeder round found, at info level.
+    ///
+    /// dcrd's addrmgr logs through a logger the daemon injects with
+    /// `addrmgr.UseLogger(amgrLog)` (`log.go` 84), which is why its
+    /// output carries the `AMGR` tag.  This trait is that injection
+    /// point: the crate cannot reach the daemon's logging module, and
+    /// threading a logger through would duplicate a seam already here.
+    /// The default is silent so the vector tests stay quiet.
+    fn log_info(&mut self, _msg: &str) {}
+
+    /// Report a malformed entry a seeder returned, at warn level (dcrd
+    /// `log.Warnf` in `querySeeder`).
+    fn log_warn(&mut self, _msg: &str) {}
 }
 
 /// The JSON object shape returned by the https seeders (dcrd `node`).
@@ -287,6 +301,7 @@ pub fn seed_addrs<T: SeederTransport, E: SeedEnv>(
 
     // Nothing more to do when no addresses are returned.
     if nodes.is_empty() {
+        env.log_info(&format!("0 addresses found from seeder {seeder}"));
         return Ok(Vec::new());
     }
 
@@ -294,12 +309,17 @@ pub fn seed_addrs<T: SeederTransport, E: SeedEnv>(
     let mut addrs = Vec::with_capacity(nodes.len());
     for (host_port, services, _pver) in &nodes {
         let Ok((host, port_str)) = split_host_port(host_port) else {
+            env.log_warn(&format!("seeder returned invalid host \"{host_port}\""));
             continue;
         };
         let Ok(port) = go_parse_port(&port_str) else {
+            env.log_warn(&format!("seeder returned invalid port \"{host_port}\""));
             continue;
         };
         let Some(ip) = parse_ip(&host) else {
+            env.log_warn(&format!(
+                "seeder returned a hostname that is not an IP address \"{host}\""
+            ));
             continue;
         };
 
@@ -312,6 +332,21 @@ pub fn seed_addrs<T: SeederTransport, E: SeedEnv>(
             ip,
             port,
         });
+    }
+
+    // dcrd reports the yield per seeder, naming it, and says how many
+    // entries it had to exclude when any were malformed.
+    if addrs.len() < nodes.len() {
+        env.log_info(&format!(
+            "{} addresses found from seeder {seeder} (excluded {} invalid)",
+            addrs.len(),
+            nodes.len().saturating_sub(addrs.len())
+        ));
+    } else {
+        env.log_info(&format!(
+            "{} addresses found from seeder {seeder}",
+            addrs.len()
+        ));
     }
 
     Ok(addrs)
