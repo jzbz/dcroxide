@@ -37,7 +37,7 @@ use crate::logsubsys::{LogLevels, parse_and_set_debug_levels};
 use crate::params::NodeParams;
 
 // Defaults for general application behavior options.
-const DEFAULT_CONFIG_FILENAME: &str = "dcrd.conf";
+const DEFAULT_CONFIG_FILENAME: &str = "dcroxide.conf";
 const DEFAULT_DATA_DIRNAME: &str = "data";
 const DEFAULT_LOG_DIRNAME: &str = "logs";
 const DEFAULT_LOG_SIZE: &str = "10M";
@@ -80,9 +80,12 @@ pub const AUTH_TYPE_CLIENT_CERT: &str = "clientcert";
 /// The supported database backends (dcrd `database.SupportedDrivers`).
 const KNOWN_DB_TYPES: [&str; 1] = ["ffldb"];
 
-/// The embedded sample dcrd.conf (dcrd `sampleconfig.Dcrd`).
-pub fn sample_dcrd_conf() -> &'static str {
-    include_str!("sample-dcrd.conf")
+/// The embedded sample config (dcrd `sampleconfig.Dcrd`, renamed for
+/// this daemon).  The option names, defaults and comment structure are
+/// dcrd's byte for byte; only the paths in the examples name this
+/// daemon's own directories.
+pub fn sample_dcroxide_conf() -> &'static str {
+    include_str!("sample-dcroxide.conf")
 }
 
 /// A single option assignment, already split from whatever syntax
@@ -1269,7 +1272,7 @@ pub fn create_default_config_file(
         crate::secretfile::create_dir_all_owner_only(parent).map_err(|e| e.to_string())?;
     }
 
-    let mut cfg = sample_dcrd_conf().to_string();
+    let mut cfg = sample_dcroxide_conf().to_string();
 
     // Set a randomized rpcuser and rpcpass under basic auth.
     if auth_type == AUTH_TYPE_BASIC {

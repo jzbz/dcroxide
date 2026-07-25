@@ -59,11 +59,19 @@ release-blocking findings and the hardening backlog are tracked in
 hidden. The standing gaps that matter most for anyone evaluating this
 code:
 
-- **Panic containment is weaker than Go's.** dcrd recovers per
-  goroutine and Go's mutexes do not poison. dcroxide has many
-  `.expect("… poisoned")` sites, so a panic on one thread can take
-  down consumers of the same lock. There is no `panic = "abort"`, so
-  the process can survive in a wedged state rather than restarting.
+- **A panic aborts the process** (`panic = "abort"` on the release
+  profile). Rust mutexes poison and Go's do not, so dcrd recovers per
+  goroutine where this port cannot: a panic on one thread poisons every
+  lock it held, and each other consumer then dies on
+  `.expect("… poisoned")` in turn. Aborting is the deliberate choice for
+  a consensus daemon — state a panic left half-mutated cannot be reasoned
+  about, so a supervisor restarting a clean node beats continuing on
+  unknown state. **Run it under a supervisor that restarts it**
+  (`Restart=on-failure` or equivalent): any reachable panic is an outage
+  until something restarts the process. The tradeoff is deliberate, and
+  loud beats the previous behaviour, where a poisoned lock wedged the node
+  while the RPC layer's `catch_unwind` kept it answering canned errors and
+  looking healthy.
 - **No fuzzing or sanitizer coverage in CI** beyond the targeted
   `cargo-fuzz` corpora committed for the wire and script codecs.
 - **The dependency set has not been audited** (no `cargo audit` /

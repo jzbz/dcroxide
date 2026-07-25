@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 
-use dcroxide_node::config::{Assignment, ConfigEnv, sample_dcrd_conf};
+use dcroxide_node::config::{Assignment, ConfigEnv, sample_dcroxide_conf};
 use dcroxide_node::{clean_and_expand_path, create_default_config_file, load_config};
 
 mod common;
@@ -82,7 +82,7 @@ fn config_pipeline_matches_dcrd() {
             }
             "csample" => {
                 assert_eq!(
-                    sample_dcrd_conf().as_bytes(),
+                    common::as_dcrd_names(sample_dcroxide_conf()).as_bytes(),
                     unhex(fields[1]),
                     "sample config"
                 );
@@ -94,7 +94,7 @@ fn config_pipeline_matches_dcrd() {
                     .to_string_lossy()
                     .into_owned();
                 create_default_config_file(&dest, fields[1], &|b: &mut [u8]| b.fill(0x42)).unwrap();
-                let mut got = fs::read_to_string(&dest).unwrap();
+                let mut got = common::as_dcrd_names(&fs::read_to_string(&dest).unwrap());
                 if fields[1] == "basic" {
                     got = normalize_creds(&got);
                 }
@@ -161,7 +161,7 @@ fn config_pipeline_matches_dcrd() {
         let home = home_dir.path().to_string_lossy().into_owned();
 
         if !sc.no_file {
-            fs::write(home_dir.path().join("dcrd.conf"), sc.conf.join("\n")).unwrap();
+            fs::write(home_dir.path().join("dcroxide.conf"), sc.conf.join("\n")).unwrap();
         }
         if !sc.alt_conf.is_empty() {
             fs::write(home_dir.path().join("alt.conf"), sc.alt_conf.join("\n")).unwrap();
@@ -214,7 +214,7 @@ fn config_pipeline_matches_dcrd() {
                     .expect_err
                     .as_ref()
                     .unwrap_or_else(|| panic!("scenario {n} {}: unexpected error {err}", sc.name));
-                let got = err.replace(&home, "@HOME@");
+                let got = common::as_dcrd_names(&err.replace(&home, "@HOME@"));
                 assert_eq!(&got, expected, "scenario {n}: {}", sc.name);
             }
         }
@@ -232,7 +232,7 @@ fn generated_config_file_is_not_readable_by_other_users() {
 
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("nested").join("dcrd");
-    let dest = dir.join("dcrd.conf").to_string_lossy().into_owned();
+    let dest = dir.join("dcroxide.conf").to_string_lossy().into_owned();
     create_default_config_file(&dest, "basic", &|b: &mut [u8]| b.fill(0x42)).unwrap();
 
     let file_mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
@@ -263,7 +263,7 @@ fn a_world_readable_config_is_restricted_before_the_new_rpcpass_lands() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::tempdir().unwrap();
-    let dest_path = tmp.path().join("dcrd.conf");
+    let dest_path = tmp.path().join("dcroxide.conf");
     let dest = dest_path.to_string_lossy().into_owned();
     fs::write(&dest_path, "rpcpass=stale\n").unwrap();
     fs::set_permissions(&dest_path, fs::Permissions::from_mode(0o644)).unwrap();

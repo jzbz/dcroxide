@@ -93,7 +93,7 @@ fn real_main() -> ExitCode {
         "macos" => "darwin",
         other => other,
     };
-    let home = app_data_dir(goos, "dcrd", false, &|name| std::env::var(name).ok());
+    let home = app_data_dir(goos, "dcroxide", false, &|name| std::env::var(name).ok());
 
     let env = ConfigEnv {
         default_home_dir: home,

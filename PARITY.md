@@ -83,12 +83,19 @@ expensive step, dcroxide moves it before.
 
 Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
 
-- **Panic containment is weaker than Go's.** `sync.Mutex` does not poison and
-  dcrd recovers per goroutine. dcroxide has ~300 `.expect("… poisoned")`
-  sites, so one thread's panic can take down every other consumer of that
-  lock, and with no `panic = "abort"` the process survives wedged rather than
-  restarting under `Restart=on-failure`. Fixed narrowly at `runtime.rs` and
-  `dispatch.rs`; the rest is mechanical and outstanding.
+- **Panic policy: abort, deliberately unlike dcrd.** `sync.Mutex` does not
+  poison and dcrd recovers per goroutine, so a panicking goroutine there
+  costs one request. Rust's mutexes poison, so one thread's panic takes
+  down every other consumer of that lock — and the RPC layer's
+  `catch_unwind` then kept the process alive answering canned errors, so
+  the node wedged while looking healthy and `Restart=on-failure` never
+  fired. `[profile.release]` now sets `panic = "abort"`: a consensus
+  daemon cannot reason about state a panic left half-mutated, so a clean
+  restart beats continuing. Dev and test builds keep unwinding (the
+  harness needs it, and several suites use `#[should_panic]`), which also
+  makes the remaining `catch_unwind` guards inert in release. Pinned by
+  `crates/dcroxide-node/tests/panic_policy.rs`, which fails if the
+  setting is dropped. Operators must run under a supervisor.
 - **`dbCache` overlay copy.** dcrd's `dbCache` is an immutable treap, so a
   reader's snapshot is O(1) and shares structure. The port uses
   `Arc<BTreeMap>`, so `Arc::make_mut` deep-copies the whole overlay when a

@@ -50,6 +50,28 @@ repository = "https://github.com/jzbz/dcroxide"
 codegen-units = 1
 lto = "thin"
 debug = "line-tables-only"
+# A panic terminates the process instead of unwinding.
+#
+# Rust mutexes poison on panic and Go's `sync.Mutex` does not, so dcrd
+# recovers per goroutine where this port cannot: a panic on one thread
+# poisons every lock it held, and each other consumer of those locks then
+# dies on `.expect("... poisoned")` in turn.  Unwinding also let the RPC
+# layer's `catch_unwind` keep the process alive answering canned errors,
+# so the node wedged while looking healthy and `Restart=on-failure` never
+# fired.
+#
+# Aborting is the honest choice for a consensus daemon: we cannot reason
+# about state a panic left half-mutated, so a supervisor restarting a
+# clean node beats continuing on unknown state.  The cost is that any
+# reachable panic becomes an outage until restart -- loud instead of
+# silent, which is what we want.
+#
+# Dev and test builds keep unwinding: the test harness requires it, and
+# several suites use `#[should_panic]` or `catch_unwind` deliberately.
+# That also means the `catch_unwind` guards in rpcrun.rs and
+# websocket.rs are inert in release builds and only meaningful under
+# `cargo test`.
+panic = "abort"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

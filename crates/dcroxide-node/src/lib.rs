@@ -53,7 +53,7 @@ pub use config::{
     LookupSelection, NORMALIZE_INTERFACE_ADDRS, NORMALIZE_INTERFACE_FIRST_ADDR, OnionSelection,
     TlsCurve, app_data_dir, clean_and_expand_path, create_default_config_file, load_config,
     load_config_from_argv, normalize_addresses, parse_listeners, parse_network_interfaces,
-    port_to_local_host_addr, remove_duplicate_addresses, sample_dcrd_conf, tls_curve,
+    port_to_local_host_addr, remove_duplicate_addresses, sample_dcroxide_conf, tls_curve,
     validate_profile_addr,
 };
 pub use flags::{OPTIONS, OptKind, OptSpec};

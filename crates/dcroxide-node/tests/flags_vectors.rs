@@ -67,7 +67,7 @@ fn flags_front_end_matches_dcrd() {
         let home_dir = tempfile::tempdir().unwrap();
         let home = home_dir.path().to_string_lossy().into_owned();
 
-        fs::write(home_dir.path().join("dcrd.conf"), sc.conf.join("\n")).unwrap();
+        fs::write(home_dir.path().join("dcroxide.conf"), sc.conf.join("\n")).unwrap();
 
         let args: Vec<String> = sc.args.iter().map(|a| a.replace("@HOME@", &home)).collect();
         let env_vars: BTreeMap<String, String> = sc
@@ -103,7 +103,7 @@ fn flags_front_end_matches_dcrd() {
                     .expect_err
                     .as_ref()
                     .unwrap_or_else(|| panic!("scenario {n} {}: unexpected error {err}", sc.name));
-                let got = err.replace(&home, "@HOME@");
+                let got = common::as_dcrd_names(&err.replace(&home, "@HOME@"));
                 assert_eq!(&got, expected, "scenario {n}: {}", sc.name);
             }
         }

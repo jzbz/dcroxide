@@ -157,6 +157,26 @@ pub struct Database {
     inner: Arc<DbInner>,
 }
 
+/// Classify a redb open failure.
+///
+/// redb takes an exclusive `flock` on the metadata file and reports
+/// `DatabaseAlreadyOpen` when another process already holds it, which is
+/// what stops two daemons from sharing one data directory.  That has to
+/// surface as [`ErrorKind::DbAlreadyOpen`] — dcrd's `ErrDbAlreadyOpen` —
+/// rather than a generic driver error, both because the operator needs an
+/// actionable message and because the lock is acquired before the flat
+/// block files are touched, making this the check that protects them.
+fn open_error(e: redb::DatabaseError) -> Error {
+    match e {
+        redb::DatabaseError::DatabaseAlreadyOpen => db_error(
+            ErrorKind::DbAlreadyOpen,
+            "the database is already open by another process -- only one \
+             instance may use a data directory at a time",
+        ),
+        other => db_error(ErrorKind::DriverSpecific, other.to_string()),
+    }
+}
+
 impl Database {
     /// Create a new database at the directory in the options; errors
     /// with `ErrDbExists` when one is already there (dcrd
@@ -174,8 +194,7 @@ impl Database {
         create_dir_all_owner_only(&opts.path)
             .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
 
-        let kv = redb::Database::create(&meta_path)
-            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        let kv = redb::Database::create(&meta_path).map_err(open_error)?;
 
         // Initialize the ffldb-layout bookkeeping rows: the bucket
         // index entry and fixed ID for the internal block index, the
@@ -244,8 +263,7 @@ impl Database {
             ));
         }
 
-        let kv = redb::Database::open(&meta_path)
-            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        let kv = redb::Database::open(&meta_path).map_err(open_error)?;
         let mut block_store = BlockStore::open(&opts.path, opts.network, opts.max_block_file_size)?;
 
         // Fetch the stored write cursor position.
@@ -491,5 +509,66 @@ mod dirmode_tests {
             "every directory created for the database must be owner-only"
         );
         assert_eq!(mode_of(&path), 0o700, "the database directory must be 0700");
+    }
+}
+
+#[cfg(test)]
+mod already_open_tests {
+    use super::*;
+
+    /// A second open of a live data directory must be refused, and must
+    /// say so as [`ErrorKind::DbAlreadyOpen`] rather than as an opaque
+    /// driver error.
+    ///
+    /// This is what stops two daemons from sharing one directory, which
+    /// matters more here than it would for dcrd: the flat block files are
+    /// written in dcrd's exact record format while the metadata lives in
+    /// redb rather than leveldb, so a shared directory yields block files
+    /// that look mutually readable alongside indexes that are not.  redb
+    /// takes the `flock` before any block file is touched, so the refusal
+    /// happens before damage is possible — the only thing that was
+    /// missing is the error kind, which dcrd has as `ErrDbAlreadyOpen`
+    /// and which nothing here ever produced.
+    #[test]
+    fn a_second_open_is_refused_as_already_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opts = Options::new(dir.path().join("blocks"), 0x1234_5678);
+
+        let first = Database::create(&opts).expect("first create");
+
+        let err = match Database::open(&opts) {
+            Err(e) => e,
+            Ok(_) => panic!("a live datadir must not open twice"),
+        };
+        assert_eq!(
+            err.kind,
+            ErrorKind::DbAlreadyOpen,
+            "expected dcrd's ErrDbAlreadyOpen, got {err:?}"
+        );
+        assert!(
+            err.description.contains("already open"),
+            "the message must tell the operator what is wrong: {err:?}"
+        );
+
+        // Creating over an existing directory is refused earlier, by the
+        // existence check, so it reports dcrd's ErrDbExists instead --
+        // the lock is never reached.
+        let err = match Database::create(&opts) {
+            Err(e) => e,
+            Ok(_) => panic!("an existing datadir must not be recreated"),
+        };
+        assert_eq!(err.kind, ErrorKind::DbExists);
+
+        // `close` flushes and marks the handle closed, mirroring dcrd's
+        // `Close`; the OS lock belongs to the open file, so it is released
+        // when the handle is dropped rather than when close returns.
+        first.close().expect("close");
+        assert!(
+            Database::open(&opts).is_err(),
+            "the lock belongs to the handle, so closing alone must not release it"
+        );
+        drop(first);
+        let reopened = Database::open(&opts).expect("reopen once the handle is dropped");
+        reopened.close().expect("close again");
     }
 }

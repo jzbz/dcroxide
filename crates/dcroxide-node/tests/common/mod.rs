@@ -18,10 +18,27 @@ pub fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Map this daemon's own product names back to dcrd's, so a dcrd-derived
+/// vector can be compared without editing it.
+///
+/// The vectors under `tests/data/` were dumped from dcrd itself, so they
+/// name dcrd's home directory and config file.  This port deliberately
+/// uses its own (`~/.dcroxide`, `dcroxide.conf`) so it can run alongside
+/// dcrd without sharing a data directory, whose on-disk format is not
+/// compatible.  Normalizing that one substitution keeps every assertion
+/// the vectors actually make — option names, defaults, ordering, comment
+/// structure, error texts — while parameterizing only the product name,
+/// exactly as the home directory is already tokenized to `@HOME@`.
+pub fn as_dcrd_names(s: &str) -> String {
+    s.replace("dcroxide.conf", "dcrd.conf")
+        .replace("~/.dcroxide", "~/.dcrd")
+        .replace("$LOCALAPPDATA/Dcroxide", "$LOCALAPPDATA/Dcrd")
+}
+
 /// Rebuild the dump's emitted key=value payload from the effective
 /// config.
 pub fn emit_cfg(cfg: &Config, remaining: &[String], home: &str, norm_creds: bool) -> String {
-    let rep = |s: &str| s.replace(home, "@HOME@");
+    let rep = |s: &str| as_dcrd_names(&s.replace(home, "@HOME@"));
     let reps = |v: &[String]| v.iter().map(|s| rep(s)).collect::<Vec<_>>().join(",");
     let dur = dcroxide_node::go_duration_string;
     let mut kv: Vec<String> = Vec::new();

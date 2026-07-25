@@ -65,7 +65,7 @@ fn real_main() -> Result<(), ()> {
         "macos" => "darwin",
         other => other,
     };
-    let home = app_data_dir(goos, "dcrd", false, &|name| std::env::var(name).ok());
+    let home = app_data_dir(goos, "dcroxide", false, &|name| std::env::var(name).ok());
     let default_data_dir = Path::new(&home).join("data").to_string_lossy().into_owned();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
