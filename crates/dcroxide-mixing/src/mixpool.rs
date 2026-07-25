@@ -62,6 +62,29 @@ const STRIKE_LIMIT: usize = 2;
 /// (20 minutes, in nanoseconds).
 const ORPHAN_EXPIRY_NANOS: i64 = 20 * 60 * 1_000_000_000;
 
+/// The maximum number of key exchange messages the pool holds at one
+/// time for a single mixing identity.
+///
+/// This is a deliberate divergence from dcrd, which has no equivalent
+/// limit.  A key exchange creates a session keyed by a session ID the
+/// sender derives from the pair request hashes it claims to have seen,
+/// and only the sender's own pair request has to be known to the pool
+/// -- every other referenced hash may be arbitrary.  A peer holding a
+/// single accepted pair request can therefore mint an unlimited number
+/// of distinct sessions, each one adding a pool entry (over a kilobyte
+/// of key exchange), a session, and an entry in the by-identity index,
+/// none of which is reclaimed until the pair request expires.  That is
+/// remote unbounded memory growth at line rate, so acceptance is
+/// capped per identity here.
+///
+/// The bound is chosen well above honest use: a wallet sends one key
+/// exchange per session per epoch, and a pair request may not outlive
+/// roughly an hour of blocks (`max_expiry`), which is about 7 mainnet
+/// epochs and about 21 testnet epochs.  Capacity is a live-state
+/// limit, not a lifetime counter: it is released as soon as the key
+/// exchanges are expired or otherwise removed from the pool.
+pub const MAX_KES_PER_IDENTITY: usize = 32;
+
 type IdPubKey = [u8; 33];
 type OutPointKey = ([u8; 32], u32, i8);
 type ActivePeers = HashMap<IdPubKey, (MsgMixPairReq, Vec<MsgMixKeyExchange>)>;
@@ -567,15 +590,34 @@ impl<B: MixBlockChain> Pool<B> {
     /// `ExpireMessagesInBackground`, which additionally schedules
     /// [`expire_scheduled_messages`](Pool::expire_scheduled_messages)
     /// to run after the current epoch ends; the daemon phase owns
-    /// that timer).
+    /// that timer and drives the pass on its epoch ticker).
+    ///
+    /// The latch keeps the newest height it has been armed with.  dcrd
+    /// instead keeps the first (`if p.expireHeight == 0`) and clears it
+    /// in the goroutine that runs the pass, so the height it expires
+    /// against is at most one epoch stale.  Here the driver is a single
+    /// shared epoch ticker that can coalesce several block connects
+    /// into one pass, and a first-wins latch would then expire against
+    /// a stale height, retaining pair requests that the tip has already
+    /// expired.  Tracking the newest height only ever removes a
+    /// superset -- the pass removes pair requests whose expiry is at or
+    /// below the height, and any such pair request is already unusable
+    /// at that tip (`check_accept_pr` rejects `cur_height >= expiry`).
     pub fn expire_messages_in_background(&mut self, height: u32) {
-        if self.expire_height == 0 {
+        if height > self.expire_height {
             self.expire_height = height;
         }
     }
 
     /// Perform the expiry that dcrd's background task runs after its
-    /// epoch sleep.
+    /// epoch sleep, draining the latch armed by
+    /// [`expire_messages_in_background`](Pool::expire_messages_in_background).
+    ///
+    /// The daemon calls this from its epoch ticker.  Nothing having
+    /// armed the latch is not a reason to skip the pass: the height
+    /// based removals are then no-ops (no accepted pair request or
+    /// session can expire at or below height zero), while the orphan
+    /// sweep is purely time based and still reclaims.
     pub fn expire_scheduled_messages(&mut self) {
         let height = self.expire_height;
         self.expire_height = 0;
@@ -1437,6 +1479,27 @@ impl<B: MixBlockChain> Pool<B> {
         Ok(())
     }
 
+    /// The number of key exchange messages the pool currently holds
+    /// for an identity; the quantity bounded by
+    /// [`MAX_KES_PER_IDENTITY`].  Non-key-exchange messages are
+    /// bounded by it too: every other message type is only accepted
+    /// into a session the identity already has an accepted key
+    /// exchange in, and at most one message of each type per identity
+    /// and session.
+    fn identity_ke_count(&self, id: &IdPubKey) -> usize {
+        let Some(hashes) = self.messages_by_identity.get(id) else {
+            return 0;
+        };
+        hashes
+            .iter()
+            .filter(|hash| {
+                self.pool
+                    .get(&hash.0)
+                    .is_some_and(|e| e.msgtype == MsgType::KE)
+            })
+            .count()
+    }
+
     fn accept_ke(
         &mut self,
         ke: &MsgMixKeyExchange,
@@ -1486,6 +1549,20 @@ impl<B: MixBlockChain> Pool<B> {
         if let Some(missing) = missing_own_pr {
             self.add_orphan(&PoolMessage::KE(Box::new(ke.clone())), &hash.0, id, src);
             return Err(PoolError::MissingOwnPR(missing));
+        }
+
+        // Bound the sessions and pool entries a single identity can
+        // create (see MAX_KES_PER_IDENTITY; a divergence from dcrd,
+        // which is unbounded here).  This is not a bannable rule
+        // violation: the peer that relayed the message is not
+        // necessarily the identity that authored it, and the capacity
+        // is released again by the expiry pass.
+        if self.identity_ke_count(id) >= MAX_KES_PER_IDENTITY {
+            return Err(rule_other(format!(
+                "identity {} already has the maximum of {} accepted key exchanges",
+                hex(id),
+                MAX_KES_PER_IDENTITY
+            )));
         }
 
         let sid = ke.session_id;
@@ -1944,6 +2021,38 @@ impl<B: MixBlockChain> Pool<B> {
                 )
             })
             .collect()
+    }
+
+    /// The sizes of every unbounded-by-construction map the pool
+    /// keeps: pair requests, pool entries, orphans, sessions, tracked
+    /// identities, and the total number of message hashes indexed by
+    /// identity.  Exposed so tests can assert that the expiry pass
+    /// actually reclaims.
+    #[doc(hidden)]
+    pub fn state_sizes(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self.prs.len(),
+            self.pool.len(),
+            self.orphans.len(),
+            self.sessions.len(),
+            self.messages_by_identity.len(),
+            self.messages_by_identity.values().map(Vec::len).sum(),
+        )
+    }
+
+    /// The number of key exchanges the pool holds for an identity;
+    /// exposed so tests can assert the [`MAX_KES_PER_IDENTITY`] cap.
+    #[doc(hidden)]
+    pub fn identity_key_exchange_count(&self, id: &[u8; 33]) -> usize {
+        self.identity_ke_count(id)
+    }
+
+    /// The height currently latched for the scheduled expiry, zero
+    /// when the pass has drained it; exposed so tests can assert that
+    /// the daemon's epoch ticker actually drives the pass.
+    #[doc(hidden)]
+    pub fn scheduled_expire_height(&self) -> u32 {
+        self.expire_height
     }
 
     /// A snapshot of the internal state; exposed for tests.

@@ -189,6 +189,35 @@ fn out_key(op: &OutPoint) -> OutKey {
     (op.hash.0, op.index, op.tree)
 }
 
+/// One pending transaction in the iterative redeemer cascade of
+/// [`TxPool::remove_transaction`], holding exactly the state a
+/// recursive call frame would have: which transaction is to be
+/// removed once its outputs have all been scanned, and how far the
+/// scan has progressed.
+struct RemovalFrame {
+    /// The hash of the transaction this frame removes.
+    tx_hash: Hash,
+    /// The tree its outputs live in, from its transaction type.
+    tree: i8,
+    /// The number of outputs to scan for redeemers.
+    num_outputs: u32,
+    /// The next output index to scan.
+    next_output: u32,
+}
+
+impl RemovalFrame {
+    /// A frame positioned at the first output of the transaction.
+    fn new(tx: &MsgTx, tx_hash: &Hash) -> RemovalFrame {
+        let tx_type = dcroxide_stake::determine_tx_type(tx);
+        RemovalFrame {
+            tx_hash: *tx_hash,
+            tree: tree_for_type(tx_type),
+            num_outputs: tx.tx_out.len() as u32,
+            next_output: 0,
+        }
+    }
+}
+
 /// The transaction tree for the given transaction type.
 fn tree_for_type(tx_type: TxType) -> i8 {
     if tx_type == TxType::Regular {
@@ -660,23 +689,65 @@ impl<C: PoolChain> TxPool<C> {
 
     /// Remove the transaction and, when requested, all transactions
     /// that redeem its outputs (dcrd `removeTransaction`).
+    ///
+    /// dcrd recurses into the redeemers, which is safe there because
+    /// Go grows goroutine stacks on demand.  Rust threads have a
+    /// fixed stack and overflowing it aborts the process instead of
+    /// unwinding, so the redeemer cascade runs off an explicit
+    /// worklist (the pattern `process_orphans_internal` uses).  There
+    /// is no limit on the length of a chain of unconfirmed
+    /// transactions, and both the expiry pruning and the double-spend
+    /// removal on every connected block drive this cascade with
+    /// relayed, attacker-chosen data.  The removal order, and the set
+    /// of transactions removed, are identical to the recursive form.
     pub fn remove_transaction(&mut self, tx: &MsgTx, tx_hash: &Hash, remove_redeemers: bool) {
-        if remove_redeemers {
-            // Remove any transactions which rely on this one.
-            let tx_type = dcroxide_stake::determine_tx_type(tx);
-            let tree = tree_for_type(tx_type);
-            for i in 0..tx.tx_out.len() as u32 {
-                let key = (tx_hash.0, i, tree);
-                if let Some(redeemer) = self.outpoints.get(&key).cloned() {
-                    self.remove_transaction(&redeemer.tx.clone(), &redeemer.tx_hash.clone(), true);
-                    continue;
-                }
-                if let Some(redeemer) = self.staged_outpoints.get(&key).cloned() {
-                    self.remove_staged_transaction(&redeemer);
-                }
-            }
+        if !remove_redeemers {
+            // Nothing depends on this removal, so the descendants
+            // left behind keep accurate statistics.
+            self.remove_pool_transaction(tx_hash, true);
+            return;
         }
 
+        // Remove any transactions which rely on this one, depth
+        // first: a transaction is removed only once every one of its
+        // outputs has been scanned for redeemers, exactly where the
+        // recursive form removed it on the way back up.  The scan is
+        // deliberately re-done against the live index at each output,
+        // because removing a redeemer clears the outpoint entries of
+        // every output it spent.
+        let mut frames: Vec<RemovalFrame> = vec![RemovalFrame::new(tx, tx_hash)];
+        while let Some(frame) = frames.last_mut() {
+            let frame_hash = frame.tx_hash;
+            let output = frame.next_output;
+            let exhausted = output >= frame.num_outputs;
+            if !exhausted {
+                frame.next_output = output.saturating_add(1);
+            }
+
+            if exhausted {
+                frames.pop();
+                // Every transaction reached through the cascade has
+                // redeemers of its own being removed, so descendant
+                // stats are not updated for any of them.
+                self.remove_pool_transaction(&frame_hash, false);
+                continue;
+            }
+
+            let key = (frame_hash.0, output, frame.tree);
+            if let Some(redeemer) = self.outpoints.get(&key).cloned() {
+                frames.push(RemovalFrame::new(&redeemer.tx, &redeemer.tx_hash));
+                continue;
+            }
+            if let Some(redeemer) = self.staged_outpoints.get(&key).cloned() {
+                self.remove_staged_transaction(&redeemer);
+            }
+        }
+    }
+
+    /// Drop the transaction from the main pool and every index that
+    /// tracks it, when it is there (the tail of dcrd
+    /// `removeTransaction`).
+    fn remove_pool_transaction(&mut self, tx_hash: &Hash, update_descendant_stats: bool) {
         // Remove the transaction if needed.
         if let Some(tx_desc) = self.pool.remove(&tx_hash.0) {
             // Mark the referenced outpoints as unspent by the pool.
@@ -687,7 +758,6 @@ impl<C: PoolChain> TxPool<C> {
             // Stop tracking this transaction in the mining view.  If
             // redeeming transactions are going to be removed from the
             // graph, then do not update their stats.
-            let update_descendant_stats = !remove_redeemers;
             self.mining_view
                 .remove_transaction(tx_hash, update_descendant_stats);
 
@@ -1987,5 +2057,301 @@ mod send_tests {
         }
         fn assert_send<T: Send>() {}
         assert_send::<TxPool<NeverChain>>();
+    }
+}
+
+#[cfg(test)]
+mod removal_cascade_tests {
+    use super::*;
+
+    use dcroxide_wire::{TX_TREE_REGULAR, TxIn, TxOut};
+    use std::sync::Mutex;
+
+    /// The stack size the cascade tests run their bodies under.  A
+    /// recursive redeemer walk needs a frame per link of the chain
+    /// built below, so reintroducing the recursion overflows the
+    /// guard page and aborts the test binary instead of quietly
+    /// passing.
+    const CASCADE_STACK_BYTES: usize = 512 * 1024;
+
+    /// The length of the unconfirmed chain the depth tests build.  A
+    /// peer can relay a chain of this length for free; there is no
+    /// package, ancestor, or descendant limit in the pool.
+    const DEEP_CHAIN_LEN: usize = 50_000;
+
+    /// The outpoint the head of every chain built here spends,
+    /// standing in for a confirmed output.
+    const SEED_HASH: Hash = Hash([7u8; 32]);
+
+    /// A chain backend answering only the wall-clock question the
+    /// removal paths ask.
+    struct StubChain;
+
+    impl PoolChain for StubChain {
+        fn next_stake_difficulty(&self) -> Result<i64, String> {
+            unimplemented!()
+        }
+        fn fetch_utxo_view(
+            &self,
+            _tx: &MsgTx,
+            _tx_hash: &Hash,
+            _tree: i8,
+            _tree_valid: bool,
+        ) -> Result<UtxoView, String> {
+            unimplemented!()
+        }
+        fn best_hash(&self) -> Hash {
+            unimplemented!()
+        }
+        fn best_height(&self) -> i64 {
+            unimplemented!()
+        }
+        fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
+            unimplemented!()
+        }
+        fn past_median_time(&self) -> i64 {
+            unimplemented!()
+        }
+        fn calc_sequence_lock(
+            &self,
+            _tx: &MsgTx,
+            _tx_hash: &Hash,
+            _view: &UtxoView,
+        ) -> Result<SequenceLock, PoolError> {
+            unimplemented!()
+        }
+        fn is_treasury_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_auto_revocations_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_subsidy_split_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_subsidy_split_r2_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn tspend_mined_on_ancestor(&self, _tspend: &Hash) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn standard_verify_flags(&self) -> Result<ScriptFlags, String> {
+            unimplemented!()
+        }
+        fn now_unix(&self) -> i64 {
+            1751800000
+        }
+    }
+
+    /// A fee estimator sink that records the order transactions leave
+    /// the pool, which is the observable removal order of the
+    /// cascade.
+    struct RemovalLog(Arc<Mutex<Vec<Hash>>>);
+
+    impl FeeEstimatorSink for RemovalLog {
+        fn add_mem_pool_transaction(
+            &mut self,
+            _tx_hash: &Hash,
+            _fee: i64,
+            _size: i64,
+            _tx_type: TxType,
+        ) {
+        }
+        fn remove_mem_pool_transaction(&mut self, tx_hash: &Hash) {
+            self.0.lock().expect("lock").push(*tx_hash);
+        }
+    }
+
+    /// A pool with ancestor tracking on, as the daemon runs it.
+    fn new_pool() -> TxPool<StubChain> {
+        let params = dcroxide_chaincfg::mainnet_params();
+        let policy = Policy {
+            accept_non_std: false,
+            max_orphan_txs: 100,
+            max_orphan_tx_size: 5000,
+            max_sig_ops_per_tx: 1000,
+            min_relay_tx_fee: 10000,
+            allow_old_votes: false,
+            max_vote_age: params.coinbase_maturity,
+            enable_ancestor_tracking: true,
+        };
+        TxPool::new(StubChain, policy, &params)
+    }
+
+    /// A one-in one-out regular transaction spending the given
+    /// outpoint, with a pay-to-pubkey-hash shaped output.
+    fn linked_tx(prev: OutPoint, expiry: u32) -> MsgTx {
+        let mut pk_script = vec![0x76, 0xa9, 0x14];
+        pk_script.extend_from_slice(&[0u8; 20]);
+        pk_script.extend_from_slice(&[0x88, 0xac]);
+        MsgTx {
+            tx_in: vec![TxIn {
+                previous_out_point: prev,
+                sequence: 0xffff_ffff,
+                value_in: 1_000_000,
+                block_height: 1,
+                block_index: 0,
+                signature_script: Vec::new(),
+            }],
+            tx_out: vec![TxOut {
+                value: 900_000,
+                version: 0,
+                pk_script,
+            }],
+            expiry,
+            ..MsgTx::default()
+        }
+    }
+
+    /// Insert a chain of `len` transactions into the pool, each
+    /// spending the single output of the one before it, and return
+    /// their hashes in chain order.  Only the head carries an expiry,
+    /// which is all an attacker needs to have the entire chain pruned
+    /// two blocks after it is accepted.
+    fn fill_chain(pool: &mut TxPool<StubChain>, len: usize, head_expiry: u32) -> Vec<Hash> {
+        let mut hashes = Vec::with_capacity(len);
+        let mut prev = OutPoint {
+            hash: SEED_HASH,
+            index: 0,
+            tree: TX_TREE_REGULAR,
+        };
+        for i in 0..len {
+            let expiry = if i == 0 { head_expiry } else { 0 };
+            let tx = linked_tx(prev, expiry);
+            let tx_hash = tx.tx_hash();
+            // The cascade keys redeemer lookups off the tree derived
+            // from the type, so the chain is only linked if these
+            // classify as regular.
+            assert_eq!(dcroxide_stake::determine_tx_type(&tx), TxType::Regular);
+            pool.add_transaction(Arc::new(TxDesc {
+                tx: tx.clone(),
+                tx_hash,
+                tree: TX_TREE_REGULAR,
+                tx_type: TxType::Regular,
+                added_unix: pool.chain.now_unix(),
+                height: 1,
+                fee: 100_000,
+                total_sig_ops: 1,
+                tx_size: 200,
+            }));
+            hashes.push(tx_hash);
+            prev = OutPoint {
+                hash: tx_hash,
+                index: 0,
+                tree: TX_TREE_REGULAR,
+            };
+        }
+        hashes
+    }
+
+    /// Run the body on a thread with a stack far too small for one
+    /// recursive frame per link of a [`DEEP_CHAIN_LEN`] chain.
+    fn on_a_small_stack<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(CASCADE_STACK_BYTES)
+            .spawn(body)
+            .expect("spawn")
+            .join()
+            .expect("join")
+    }
+
+    #[test]
+    fn a_long_redeemer_chain_is_removed_without_consuming_the_stack() {
+        let state = on_a_small_stack(|| {
+            let mut pool = new_pool();
+            let hashes = fill_chain(&mut pool, DEEP_CHAIN_LEN, 0);
+            assert_eq!(pool.count(), DEEP_CHAIN_LEN);
+
+            let head = pool.pool.get(&hashes[0].0).cloned().expect("head in pool");
+            pool.remove_transaction(&head.tx.clone(), &head.tx_hash, true);
+            (
+                pool.count(),
+                pool.outpoints.len(),
+                pool.mining_view.children(&hashes[0]).len(),
+                pool.mining_view.has_parents(&hashes[DEEP_CHAIN_LEN - 1]),
+            )
+        });
+
+        // The head and every transaction that redeems it, directly or
+        // through the chain, are gone along with their index entries.
+        assert_eq!(state, (0, 0, 0, false));
+    }
+
+    #[test]
+    fn expiry_pruning_cascades_without_consuming_the_stack() {
+        let count = on_a_small_stack(|| {
+            let mut pool = new_pool();
+            fill_chain(&mut pool, DEEP_CHAIN_LEN, 12);
+            assert_eq!(pool.count(), DEEP_CHAIN_LEN);
+
+            // The tip is at 11, so the next block is 12 and the head
+            // has expired; pruning it removes the whole chain.
+            pool.prune_expired_tx(11);
+            pool.count()
+        });
+
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn double_spend_removal_cascades_without_consuming_the_stack() {
+        let count = on_a_small_stack(|| {
+            let mut pool = new_pool();
+            fill_chain(&mut pool, DEEP_CHAIN_LEN, 0);
+            assert_eq!(pool.count(), DEEP_CHAIN_LEN);
+
+            // A block confirms a transaction spending the same seed
+            // output as the head of the chain, which is what every
+            // connected block runs against the pool.
+            let conflict = linked_tx(
+                OutPoint {
+                    hash: SEED_HASH,
+                    index: 0,
+                    tree: TX_TREE_REGULAR,
+                },
+                7,
+            );
+            let conflict_hash = conflict.tx_hash();
+            pool.remove_double_spends(&conflict, &conflict_hash);
+            pool.count()
+        });
+
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn the_cascade_removes_redeemers_before_their_parents() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut pool = new_pool();
+        pool.set_fee_estimator(Box::new(RemovalLog(log.clone())));
+        let hashes = fill_chain(&mut pool, 4, 0);
+
+        let head = pool.pool.get(&hashes[0].0).cloned().expect("head in pool");
+        pool.remove_transaction(&head.tx.clone(), &head.tx_hash, true);
+
+        // dcrd recurses into the redeemers before removing the
+        // transaction itself, so the deepest redeemer leaves the pool
+        // first and the head leaves last.
+        let removed = log.lock().expect("lock").clone();
+        assert_eq!(removed, vec![hashes[3], hashes[2], hashes[1], hashes[0]]);
+        assert_eq!(pool.count(), 0);
+    }
+
+    #[test]
+    fn removing_without_redeemers_leaves_the_rest_of_the_chain() {
+        let mut pool = new_pool();
+        let hashes = fill_chain(&mut pool, 3, 0);
+
+        let middle = pool
+            .pool
+            .get(&hashes[1].0)
+            .cloned()
+            .expect("middle in pool");
+        pool.remove_transaction(&middle.tx.clone(), &middle.tx_hash, false);
+
+        assert_eq!(pool.count(), 2);
+        assert!(pool.is_transaction_in_pool(&hashes[0]));
+        assert!(!pool.is_transaction_in_pool(&hashes[1]));
+        assert!(pool.is_transaction_in_pool(&hashes[2]));
     }
 }

@@ -250,12 +250,29 @@ fn run_epoch_ticker(
     }
 }
 
-/// Drive the mixpool's misbehavior observer on the epoch ticker (dcrd
-/// `Server.Run` running `s.mixObserver.Run(ctx)`): after each epoch
-/// completes, the previous epoch's sessions are checked for timeout
-/// misbehavior, feeding the strike set behind
-/// [`Pool::misbehaving_block`] and [`Pool::misbehaving_tx`].  A check
-/// error stops the observer, exactly as dcrd's `Run` returns it.
+/// Drive the mixpool's per-epoch background work on the epoch ticker.
+///
+/// This is both of dcrd's mixpool goroutines on one timer:
+///
+/// * the misbehavior observer (dcrd `Server.Run` running
+///   `s.mixObserver.Run(ctx)`): after each epoch completes, the
+///   previous epoch's sessions are checked for timeout misbehavior,
+///   feeding the strike set behind [`Pool::misbehaving_block`] and
+///   [`Pool::misbehaving_tx`]; and
+/// * the scheduled expiry (dcrd `Pool.ExpireMessagesInBackground`
+///   spawning `p.expireMessages`, which sleeps to the epoch boundary
+///   and then runs the pass): the height latched by every block
+///   connect is drained here and the expiry pass run, reclaiming
+///   expired pair requests, the sessions and messages chaining back to
+///   them, and stale orphans.  Without this the pool only ever grows,
+///   since nothing else drains the latch.
+///
+/// A misbehavior check failure is logged but does not stop the ticker.
+/// dcrd's `Run` returns that error and its observer goroutine exits,
+/// but its expiry goroutine is separate and keeps reclaiming; sharing
+/// one ticker here must not let an observer failure silently stop
+/// reclamation and reintroduce unbounded pool growth.  The expiry pass
+/// therefore also runs even when a check failed.
 pub fn start_mix_epoch_observer(pool: Arc<Mutex<NodeMixPool>>) -> MixObserver {
     let (stop, stopped) = std::sync::mpsc::channel::<()>();
     let epoch_secs = pool
@@ -268,19 +285,31 @@ pub fn start_mix_epoch_observer(pool: Arc<Mutex<NodeMixPool>>) -> MixObserver {
             std::time::Duration::from_secs(epoch_secs),
             &stopped,
             |prev_epoch| {
-                pool.lock()
-                    .expect("mix pool mutex poisoned")
-                    .check_prev_epoch(prev_epoch)
-                    .map_err(|e| {
-                        crate::logging::error("MIXP", &format!("mix observer check failed: {e:?}"));
-                        format!("{e:?}")
-                    })
+                run_epoch_tick(&pool, prev_epoch);
+                Ok(())
             },
         );
     });
     MixObserver {
         stop,
         join: Some(join),
+    }
+}
+
+/// One epoch tick's pool maintenance: the misbehavior check over the
+/// finished epoch, and then the scheduled expiry pass that drains the
+/// height latched by [`Pool::expire_messages_in_background`] on every
+/// block connect.  Both must run on every tick; see
+/// [`start_mix_epoch_observer`].
+fn run_epoch_tick<B: MixBlockChain>(pool: &Mutex<Pool<B>>, prev_epoch: u64) {
+    let mut pool = pool.lock().expect("mix pool mutex poisoned");
+    // The observer runs first: the expiry pass removes the very
+    // messages the previous epoch's sessions are judged on.
+    let checked = pool.check_prev_epoch(prev_epoch);
+    pool.expire_scheduled_messages();
+    drop(pool);
+    if let Err(e) = checked {
+        crate::logging::error("MIXP", &format!("mix observer check failed: {e:?}"));
     }
 }
 
@@ -435,5 +464,52 @@ mod tests {
     fn non_mix_message_is_not_converted() {
         assert!(wire_to_pool_message(Message::MemPool).is_none());
         assert!(wire_to_pool_message(Message::GetAddr).is_none());
+    }
+
+    /// A chain view for a pool built without the daemon's database
+    /// (the pool only reads the tip and the parameters).
+    struct StubChain {
+        params: Params,
+    }
+
+    impl MixBlockChain for StubChain {
+        fn chain_params(&self) -> &Params {
+            &self.params
+        }
+        fn current_tip(&self) -> (Hash, i64) {
+            (Hash([0u8; 32]), 100)
+        }
+    }
+
+    /// The epoch tick drains the expiry latch, i.e. the pool's expiry
+    /// pass is actually driven.  Every block connect arms the latch
+    /// (`expire_messages_in_background`) and only the scheduled pass
+    /// clears it and reclaims; when the driver is not wired up the
+    /// latch stays armed forever and nothing in the pool is ever
+    /// freed.
+    #[test]
+    fn epoch_tick_drives_the_scheduled_expiry() {
+        let pool: Mutex<Pool<StubChain>> = Mutex::new(Pool::new(
+            StubChain {
+                params: dcroxide_chaincfg::simnet_params(),
+            },
+            None,
+        ));
+        pool.lock()
+            .expect("pool")
+            .expire_messages_in_background(500);
+        assert_eq!(
+            pool.lock().expect("pool").scheduled_expire_height(),
+            500,
+            "a block connect arms the expiry latch"
+        );
+
+        run_epoch_tick(&pool, 0);
+
+        assert_eq!(
+            pool.lock().expect("pool").scheduled_expire_height(),
+            0,
+            "the epoch tick must run the expiry pass and drain the latch"
+        );
     }
 }

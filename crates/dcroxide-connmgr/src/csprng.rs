@@ -49,15 +49,14 @@ impl SystemCsprng {
 }
 
 impl Default for SystemCsprng {
+    /// Seed from OS entropy.  This keystream keys the outbound-group
+    /// SipHash, the inbound per-group rate limiter and the
+    /// probabilistic connection drop, so a predictable seed lets an
+    /// attacker choose which groups it collides with; dcrd draws all
+    /// of it from `crypto/rand` (`internal/connmgr/csprng.go`).
     fn default() -> SystemCsprng {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or_default();
         let mut seed = [0u8; 32];
-        seed[..8].copy_from_slice(&nanos.to_le_bytes());
-        seed[8..16].copy_from_slice(&(nanos ^ 0x5a5a_5a5a_5a5a_5a5a).to_be_bytes());
-        seed[16..24].copy_from_slice(&(std::process::id() as u64).to_le_bytes());
+        getrandom::fill(&mut seed).expect("system random source");
         SystemCsprng::from_seed(seed)
     }
 }

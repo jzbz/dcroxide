@@ -17,11 +17,15 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 550+ tests across 214 suites, most differential against dcrd
+runs 590+ tests across 222 suites, most differential against dcrd
 itself or replaying sessions generated inside dcrd's own packages.
-**It has not yet been soaked against the live network, and nothing
-here is ready to validate, relay, or hold funds.** Currently
-implemented:
+
+It has synced testnet and mainnet to the tip from genesis with full
+consensus validation. That says the consensus rules agree with dcrd's
+across the whole chain; it does not say the node is safe to operate.
+**Do not expose it to the internet and do not use it with funds** —
+see [SECURITY.md](SECURITY.md) for what is known to be missing and how
+to report a vulnerability. Currently implemented:
 
 - `dcroxide-crypto` — BLAKE-256 (vendored from
   [dcr-rs](https://github.com/jzbz/dcr-rs), KAT-pinned, differential-tested

@@ -80,8 +80,17 @@ pub trait AddrRng {
     fn read(&mut self, buf: &mut [u8]);
 }
 
-/// A ChaCha20-keyed default randomness source seeded from the system
-/// clock; the daemon phase will wire OS entropy.
+/// A ChaCha20-keyed default randomness source seeded from OS entropy.
+///
+/// The key this stream produces becomes the address manager's bucket
+/// key, which is what stops an attacker steering its own addresses
+/// into chosen new/tried buckets — the precondition for an eclipse —
+/// and it is persisted in `peers.json`, so a weak draw is permanent
+/// for the life of the data directory.  dcrd sources the same key and
+/// every selection/shuffle from `crypto/rand`
+/// (`addrmgr/addrmanager.go` `rand.Read(a.key[:])`).  An earlier
+/// clock-derived seed left the whole key a function of one nanosecond
+/// reading, which is brute-forceable.
 pub struct SystemRng {
     cipher: chacha20::ChaCha20,
 }
@@ -89,14 +98,10 @@ pub struct SystemRng {
 impl Default for SystemRng {
     fn default() -> SystemRng {
         use chacha20::cipher::KeyIvInit;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or_default();
         let mut key = [0u8; 32];
-        key[..8].copy_from_slice(&nanos.to_le_bytes());
-        key[8..16].copy_from_slice(&(nanos ^ 0xa5a5_a5a5_a5a5_a5a5).to_be_bytes());
-        let nonce = [0u8; 12];
+        getrandom::fill(&mut key).expect("system random source");
+        let mut nonce = [0u8; 12];
+        getrandom::fill(&mut nonce).expect("system random source");
         SystemRng {
             cipher: chacha20::ChaCha20::new(&key.into(), &nonce.into()),
         }

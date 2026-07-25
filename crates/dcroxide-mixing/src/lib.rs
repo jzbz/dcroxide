@@ -27,8 +27,8 @@ pub use dcnet::{
 };
 pub use field::{F, FieldInt, in_field_be_bytes};
 pub use mixpool::{
-    MAX_ORPHANS, MAX_POST_EVICTION_ORPHANS, MixBlockChain, MixUtxoEntry, MixUtxoFetcher, MsgType,
-    Pool, PoolError, PoolMessage, Received, RuleKind,
+    MAX_KES_PER_IDENTITY, MAX_ORPHANS, MAX_POST_EVICTION_ORPHANS, MixBlockChain, MixUtxoEntry,
+    MixUtxoFetcher, MsgType, Pool, PoolError, PoolMessage, Received, RuleKind,
 };
 pub use prng::{ChaCha20Prng, SEED_SIZE};
 pub use sid::{sort_prs_for_session, validate_session};

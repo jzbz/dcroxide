@@ -1,0 +1,79 @@
+# Security policy
+
+## Status: pre-alpha — do not expose to the internet, do not use with funds
+
+dcroxide is an in-progress reimplementation of dcrd. It has never been
+audited by anyone outside the project, it has never run in production,
+and it has no track record on a live network beyond the sync
+validations described in the README. **It is not a supported node
+implementation. Do not run it where it can be reached from the public
+internet, do not point a wallet at it, and do not rely on it to
+validate, relay, or hold funds.** Use [dcrd](https://github.com/decred/dcrd)
+for anything that matters.
+
+There are no supported versions. Nothing here carries a security
+guarantee, and there is no commitment to a fix timeline or to a
+coordinated-disclosure window.
+
+## Reporting a vulnerability
+
+Report privately through GitHub's security advisories:
+
+<https://github.com/jzbz/dcroxide/security/advisories/new>
+
+Please do not open a public issue for anything that looks exploitable
+against a running node, and please do not file it against dcrd — a bug
+in this repository is a bug in this port, not in dcrd, unless you have
+reproduced it against dcrd itself.
+
+Useful things to include: the affected file and function, whether the
+attacker needs to be an authenticated RPC client / a connected peer /
+a local user, and a reproducer or the minimal message or request that
+triggers it.
+
+## Scope
+
+**In scope.** Anything that a remote peer, an RPC client, or a local
+unprivileged user can do to a dcroxide node that dcrd would not permit:
+memory exhaustion or a wedge from unauthenticated P2P input,
+authentication or authorization bypass on the JSON-RPC and websocket
+surfaces, credential and private-key exposure through file permissions
+or logs, panics reachable from untrusted input, and any consensus
+divergence from dcrd (a fork is a security bug here even when it looks
+like a correctness bug).
+
+**Out of scope.** Behaviour that faithfully reproduces dcrd, including
+dcrd's own quirks and limits — those are the specification, and the
+deliberate ones are catalogued in [QUIRKS.md](QUIRKS.md). If you think
+dcrd itself is wrong, report it to
+[dcrd](https://github.com/decred/dcrd/security/policy) instead. Also out
+of scope: resource use under a workload dcrd would also struggle with,
+and anything requiring an already-privileged local attacker (they can
+read the datadir regardless).
+
+## Known gaps
+
+The project runs its own internal security review; the current
+release-blocking findings and the hardening backlog are tracked in
+[PARITY.md](PARITY.md) under the divergence notes rather than being
+hidden. The standing gaps that matter most for anyone evaluating this
+code:
+
+- **Panic containment is weaker than Go's.** dcrd recovers per
+  goroutine and Go's mutexes do not poison. dcroxide has many
+  `.expect("… poisoned")` sites, so a panic on one thread can take
+  down consumers of the same lock. There is no `panic = "abort"`, so
+  the process can survive in a wedged state rather than restarting.
+- **No fuzzing or sanitizer coverage in CI** beyond the targeted
+  `cargo-fuzz` corpora committed for the wire and script codecs.
+- **The dependency set has not been audited** (no `cargo audit` /
+  `cargo deny` gate yet).
+
+## What this project does instead of a guarantee
+
+Every ported package is tested against dcrd itself — differential
+tests through a Go oracle binary that links dcrd's published modules,
+plus replays of vectors dumped from inside dcrd's own test packages.
+That catches divergence, which is the failure mode this port is most
+exposed to. It does not catch a design flaw shared with dcrd, and it
+does not substitute for review by someone who did not write the code.

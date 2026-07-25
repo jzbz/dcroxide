@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+getrandom = "0.3"
 chacha20 = { version = "0.9", default-features = false }
 dcroxide-addrmgr = { path = "../dcroxide-addrmgr" }
 dcroxide-containers = { path = "../dcroxide-containers" }

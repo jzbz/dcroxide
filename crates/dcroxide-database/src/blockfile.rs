@@ -337,7 +337,14 @@ impl BlockStore {
 
         self.write_file = None;
         self.open_files.clear();
-        self.dirty_files.clear();
+        // Only the files this rollback discards leave the dirty list:
+        // everything at or above `file_num` is either deleted below or
+        // truncated and synced by the truncation itself.  Files *below*
+        // it keep bytes that survive the rollback, so dropping them here
+        // would lose the pending fsync and let the metadata that
+        // describes them be committed first — the exact ordering the
+        // dirty list exists to prevent.
+        self.dirty_files.retain(|&num| num < file_num);
 
         // Remove any files that are entirely after the target.
         let mut num = self.write_file_num;
@@ -371,5 +378,71 @@ impl BlockStore {
         self.write_file_num = file_num;
         self.write_offset = offset;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A small store whose files roll over after two blocks, so a test
+    /// can spread writes across several block files.
+    fn small_store(dir: &Path) -> BlockStore {
+        // Two records of eight payload bytes each fit in one file.
+        BlockStore::open(dir, 0x1234_5678, 2 * (8 + BLOCK_RECORD_OVERHEAD)).expect("open store")
+    }
+
+    /// Rolling back must not discard the pending fsync for files that
+    /// survive the rollback.  Those files still hold bytes the metadata
+    /// will refer to, and the dirty list is what guarantees they reach
+    /// the platter before the metadata that describes them; clearing it
+    /// wholesale silently drops that ordering.
+    #[test]
+    fn rollback_keeps_the_pending_sync_for_files_it_does_not_discard() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = small_store(dir.path());
+
+        // Fill file 0 and roll into file 1.
+        for i in 0..3u8 {
+            store.write_block(&[i; 8]).expect("write block");
+        }
+        assert_eq!(store.write_file_num, 1, "the writes must span two files");
+        assert_eq!(store.dirty_files, vec![0, 1]);
+
+        // Roll back to the start of file 1: file 0 is untouched and its
+        // bytes remain live, so its fsync is still owed.
+        store.rollback_to(1, 0).expect("rollback");
+        assert_eq!(
+            store.dirty_files,
+            vec![0],
+            "file 0 survived the rollback and still needs its fsync"
+        );
+
+        // The sync must then actually reach it, leaving nothing owed.
+        store.sync().expect("sync");
+        assert!(store.dirty_files.is_empty());
+    }
+
+    /// The files a rollback does discard leave the list: they are either
+    /// removed or truncated and synced by the rollback itself, so
+    /// syncing them again would fail on a path that no longer exists.
+    #[test]
+    fn rollback_drops_the_files_it_discards() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = small_store(dir.path());
+        for i in 0..3u8 {
+            store.write_block(&[i; 8]).expect("write block");
+        }
+        assert_eq!(store.dirty_files, vec![0, 1]);
+
+        // Back to the very start: file 1 is removed, file 0 truncated.
+        store.rollback_to(0, 0).expect("rollback");
+        assert!(
+            store.dirty_files.is_empty(),
+            "discarded files must not be left owing a sync: {:?}",
+            store.dirty_files
+        );
+        assert!(!block_file_path(dir.path(), 1).exists());
+        store.sync().expect("sync must not fail on a removed file");
     }
 }
