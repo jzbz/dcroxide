@@ -141,9 +141,55 @@ fn the_service_command_option_parses() {
 
 /// The rendered help matches go-flags' output for dcrd's option
 /// registry byte for byte (`tools/helpgen` regenerates the vector).
+///
+/// Rendered with dcrd's environment-variable names, because that is what
+/// the vector is a dump of.  The port reads `DCROXIDE_APPDATA` and
+/// `DCROXIDE_ALT_DNSNAMES` instead (see `ENV_DEFAULTS`), and those are
+/// four characters longer, which changes where go-flags wraps the
+/// `[$VAR]` annotation.  Feeding the vector's own names keeps this test
+/// measuring what it exists to measure — the column layout, the wrapping,
+/// the option ordering — instead of failing over an input the port
+/// deliberately changed.  The production rendering is pinned by
+/// `the_env_annotations_name_the_variables_actually_read`.
 #[test]
 fn help_text_matches_the_go_flags_vector() {
     let expected = include_str!("data/help_vector.txt");
-    let rendered = dcroxide_node::flags::render_help("dcroxide");
+    let as_dcrd: Vec<(&str, &str, Option<&str>)> = dcroxide_node::flags::HELP_DESCRIPTIONS
+        .iter()
+        .map(|&(long, desc, env)| {
+            let env = match env {
+                Some("DCROXIDE_APPDATA") => Some("DCRD_APPDATA"),
+                Some("DCROXIDE_ALT_DNSNAMES") => Some("DCRD_ALT_DNSNAMES"),
+                other => other,
+            };
+            (long, desc, env)
+        })
+        .collect();
+    let rendered = dcroxide_node::flags::render_help_with("dcroxide", &as_dcrd);
     assert_eq!(rendered, expected, "help text must match go-flags");
+}
+
+/// The help must advertise the variables the daemon actually reads.
+///
+/// The parity test above renders with dcrd's names on purpose, so without
+/// this one nothing would notice if the production annotation drifted back
+/// to `DCRD_*` — help that names a variable the code ignores is worse than
+/// no annotation, because it sends an operator to set something that has
+/// no effect.
+#[test]
+fn the_env_annotations_name_the_variables_actually_read() {
+    let rendered = dcroxide_node::flags::render_help("dcroxide");
+    for (_, var, _) in dcroxide_node::flags::ENV_DEFAULTS {
+        assert!(
+            rendered.contains(&format!("[${var}]")),
+            "the help must annotate {var}, which the daemon reads"
+        );
+    }
+    // And must not advertise dcrd's, which are no longer consulted.
+    for stale in ["$DCRD_APPDATA", "$DCRD_ALT_DNSNAMES"] {
+        assert!(
+            !rendered.contains(stale),
+            "the help still advertises {stale}, which the daemon ignores"
+        );
+    }
 }

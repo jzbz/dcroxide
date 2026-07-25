@@ -166,6 +166,28 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   continues, because otherwise any client that paused mid-request would be cut
   off. Pinned by `a_client_that_pauses_mid_request_is_still_served`, verified to
   fail when that arm is removed.
+- **The port answers to its own name throughout.** Data directory
+  `~/.dcroxide` (`$LOCALAPPDATA/Dcroxide`, `~/Library/Application
+  Support/Dcroxide`), config file `dcroxide.conf`, and environment defaults
+  `DCROXIDE_APPDATA` / `DCROXIDE_ALT_DNSNAMES` where dcrd uses `.dcrd`,
+  `dcrd.conf`, and `DCRD_*`. The point is running beside a dcrd without
+  either instance reaching into the other's state: a `DCRD_APPDATA`
+  exported for dcrd would otherwise redirect this node's entire data
+  directory at dcrd's, and a shared data directory is the one thing the
+  exclusive database lock exists to prevent. Deliberately no fallback to
+  the `DCRD_*` variables — honouring them would reintroduce exactly that
+  collision. Everything else about the configuration surface is dcrd's,
+  option names and error strings included, and the vectors stay faithful
+  dumps of dcrd's own output: the comparisons normalize the port's names
+  back to dcrd's (`tests/common/mod.rs`'s `as_dcrd_names`) rather than
+  editing what dcrd produced. One consequence worth naming, since it
+  cannot be normalized away: `DCROXIDE_APPDATA` is four characters longer
+  than `DCRD_APPDATA`, which pushes the `[$VAR]` annotation onto its own
+  line under go-flags' wrapping, so the *rendered* help differs from
+  dcrd's by that reflow. The layout algorithm is still pinned byte for
+  byte, by rendering the vector comparison with dcrd's names; what the
+  production help advertises is pinned separately, so help that named a
+  variable the daemon ignores would fail the suite.
 - **A half-present RPC cert pair is not regenerated.** dcrd guards `genCertPair`
   with `!keyFileExists && !certFileExists` (`server.go` 3846), so with one file
   present it generates nothing and startup fails on the missing one. The port

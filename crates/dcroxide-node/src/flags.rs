@@ -594,9 +594,30 @@ pub const OPTIONS: [OptSpec; 86] = [
 
 /// The environment default keys (go-flags `env` tags): the option
 /// long name, the variable, and the delimiter for slice values.
+///
+/// dcrd names these `DCRD_APPDATA` and `DCRD_ALT_DNSNAMES`; the port
+/// answers to its own names for the same reason it uses its own data
+/// directory and config file (`809c4c2`).  `DCRD_APPDATA` exported for a
+/// dcrd running alongside would otherwise redirect this node's entire
+/// data directory at dcrd's, silently, and a shared datadir is the one
+/// thing the exclusive database lock exists to prevent.  Deliberately no
+/// fallback to the `DCRD_*` names: honouring them would reintroduce
+/// exactly that collision.
+///
+/// The `[$VAR]` annotation `render_help` prints comes from
+/// [`HELP_DESCRIPTIONS`], which carries the same names, so the rendered
+/// help advertises what is actually read.  That makes the rendering
+/// diverge from dcrd's by more than the name — `DCROXIDE_APPDATA` is four
+/// characters longer, which pushes the annotation onto its own line under
+/// go-flags' wrapping.  The parity vector is a byte-exact dump of dcrd's
+/// own help, so it is compared against a rendering fed dcrd's names; see
+/// `help_text_matches_the_go_flags_vector`.  That keeps the layout
+/// algorithm under test, which is what the vector is for, while
+/// `the_env_annotations_name_the_variables_actually_read` pins the
+/// production rendering separately.
 pub const ENV_DEFAULTS: [(&str, &str, Option<&str>); 2] = [
-    ("appdata", "DCRD_APPDATA", None),
-    ("altdnsnames", "DCRD_ALT_DNSNAMES", Some(",")),
+    ("appdata", "DCROXIDE_APPDATA", None),
+    ("altdnsnames", "DCROXIDE_ALT_DNSNAMES", Some(",")),
 ];
 
 /// The help description and environment-variable annotation for each
@@ -608,7 +629,7 @@ pub const HELP_DESCRIPTIONS: [(&str, &str, Option<&str>); 86] = [
     (
         "appdata",
         "Path to application home directory",
-        Some("DCRD_APPDATA"),
+        Some("DCROXIDE_APPDATA"),
     ),
     ("configfile", "Path to configuration file", None),
     ("datadir", "Directory to store data", None),
@@ -691,7 +712,7 @@ pub const HELP_DESCRIPTIONS: [(&str, &str, Option<&str>); 86] = [
     (
         "altdnsnames",
         "Specify additional DNS names to use when generating the RPC server certificate",
-        Some("DCRD_ALT_DNSNAMES"),
+        Some("DCROXIDE_ALT_DNSNAMES"),
     ),
     (
         "notls",
@@ -945,6 +966,17 @@ pub const HELP_DESCRIPTIONS: [(&str, &str, Option<&str>); 86] = [
 /// Options tail.  dcrd's dedicated help pre-parse never adds the
 /// Windows service group, so neither does this.
 pub fn render_help(app_name: &str) -> String {
+    render_help_with(app_name, &HELP_DESCRIPTIONS)
+}
+
+/// [`render_help`] over an explicit description table.
+///
+/// The table supplies each option's help text and its optional
+/// environment-variable annotation, both of which feed go-flags' line
+/// wrapping — so substituting it is how the parity test renders with
+/// dcrd's variable names and keeps comparing byte for byte against dcrd's
+/// dumped help.  Production always passes [`HELP_DESCRIPTIONS`].
+pub fn render_help_with(app_name: &str, descriptions: &[(&str, &str, Option<&str>)]) -> String {
     // The alignment column counts "  " + the short slot + "--long"
     // WITHOUT the value marker: go-flags appends the "=" after
     // computing the alignment, so the marker eats into the padding
@@ -978,7 +1010,7 @@ pub fn render_help(app_name: &str) -> String {
     out.push_str(&format!("  {app_name} [OPTIONS]\n"));
     out.push_str("\nApplication Options:\n");
     for spec in OPTIONS.iter() {
-        let (_, desc, env) = HELP_DESCRIPTIONS
+        let (_, desc, env) = descriptions
             .iter()
             .find(|(long, _, _)| *long == spec.long)
             .copied()

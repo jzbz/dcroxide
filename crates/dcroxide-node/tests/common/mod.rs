@@ -33,6 +33,10 @@ pub fn as_dcrd_names(s: &str) -> String {
     s.replace("dcroxide.conf", "dcrd.conf")
         .replace("~/.dcroxide", "~/.dcrd")
         .replace("$LOCALAPPDATA/Dcroxide", "$LOCALAPPDATA/Dcrd")
+        .replace("Application Support/Dcroxide", "Application Support/Dcrd")
+        .replace("$homed/dcroxide", "$homed/dcrd")
+        .replace("DCROXIDE_APPDATA", "DCRD_APPDATA")
+        .replace("DCROXIDE_ALT_DNSNAMES", "DCRD_ALT_DNSNAMES")
 }
 
 /// Rebuild the dump's emitted key=value payload from the effective
