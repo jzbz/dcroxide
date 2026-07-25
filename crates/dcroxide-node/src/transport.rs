@@ -16,6 +16,17 @@
 //! by arming the stream's read timeout with the remaining budget
 //! before every receive, so a byte-dribbling peer cannot extend one
 //! message read past the budget the peer loop configures.
+//!
+//! That budget is minutes long, so the read is additionally chopped
+//! into [`READ_POLL_INTERVAL`] slices and a [`Cancel`] flag is checked
+//! between them.  Go's `Conn.Close` makes a goroutine blocked in `Read`
+//! return on every platform, so dcrd tears a connection down by closing
+//! it; the port has no equivalent, because `TcpStream::shutdown` on one
+//! `try_clone`d handle does not reliably abort a blocking `recv` already
+//! in flight on another handle under Winsock.  Waiting on the socket
+//! alone therefore left a peer the stall detector had already logged as
+//! disconnected parked until its idle timeout expired.  Polling a flag
+//! makes teardown promptness independent of that platform difference.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -27,6 +38,45 @@ use dcroxide_wire::{
     CurrencyNet, MESSAGE_HEADER_SIZE, Message, read_message as wire_read_message,
     read_message_header as wire_read_message_header, write_message as wire_write_message,
 };
+
+/// How long a single receive may block before the read loop comes back
+/// up to re-check the deadline and the [`Cancel`] flag.
+///
+/// This is a teardown-latency knob, not a timeout: the absolute budget
+/// still governs when a read fails, and a slice expiring is not an
+/// error.  A second is far inside dcrd's fifteen-second stall tick while
+/// costing one wake-up per second per idle connection — about 125 a
+/// second at the default `--maxpeers`, against the tens of thousands of
+/// messages a second the same threads handle mid-sync.
+pub const READ_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A one-way "stop reading" signal shared by a connection's loops.
+///
+/// The peer's threads cannot rely on the socket to carry this: see the
+/// module documentation on `shutdown` versus a blocking `recv` under
+/// Winsock.  Whoever decides the connection is over — the stall
+/// detector, the output loop, the server's shutdown — raises this, and
+/// the reader notices within [`READ_POLL_INTERVAL`] rather than
+/// whenever its idle budget happens to run out.
+#[derive(Clone, Default)]
+pub struct Cancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Cancel {
+    /// A flag that has not been raised.
+    pub fn new() -> Cancel {
+        Cancel::default()
+    }
+
+    /// Raise the flag.  Idempotent, and safe to call from any thread.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the flag has been raised.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 /// Server-wide wire byte totals (dcrd's `bytesReceived`/`bytesSent`
 /// atomic pair on the server, fed by every peer's reads and writes and
@@ -67,6 +117,9 @@ pub struct WireTransport<S> {
     /// daemon's accounting is wired (dcrd's `OnRead`/`OnWrite`
     /// listeners adding into the server's atomic counters).
     net_totals: Option<std::sync::Arc<NetByteTotals>>,
+    /// Raised when some other loop has decided the connection is over,
+    /// so a read in progress gives up instead of waiting out its budget.
+    cancel: Option<Cancel>,
 }
 
 impl<S> WireTransport<S> {
@@ -82,7 +135,15 @@ impl<S> WireTransport<S> {
             read_budget: None,
             write_budget: None,
             net_totals: None,
+            cancel: None,
         }
+    }
+
+    /// Share the connection's cancellation flag with this transport, so
+    /// a read in progress stops when another loop tears the connection
+    /// down instead of waiting out the idle budget.
+    pub fn set_cancel(&mut self, cancel: Cancel) {
+        self.cancel = Some(cancel);
     }
 
     /// Contribute this transport's reads and writes to the server-wide
@@ -139,19 +200,45 @@ impl<S> WireTransport<S> {
     }
 }
 
-/// Fill the buffer under an absolute deadline, re-arming the stream's
-/// read timeout with the remaining budget before every receive; with
-/// no deadline the reads run under the stream's own settings.
+/// Fill the buffer under an absolute deadline, in receives of at most
+/// [`READ_POLL_INTERVAL`] so `cancel` is honoured promptly; with no
+/// deadline the reads run under the stream's own settings.
+///
+/// The deadline is the bound that can fail the read.  A slice expiring
+/// is not a failure — it is the loop coming back up to look at the clock
+/// and the flag — so `WouldBlock`/`TimedOut` continues rather than
+/// ending the connection.  That distinction matters for an honest peer
+/// too: a large block arriving in dribbles used to die on the first
+/// receive that returned nothing, where now only the whole-message
+/// budget can end it, which is what dcrd's per-message
+/// `SetReadDeadline` actually means.
 fn read_exact_by_deadline<S: Read + SocketTimeout>(
     stream: &mut S,
     buf: &mut [u8],
     deadline: Option<Instant>,
+    cancel: Option<&Cancel>,
 ) -> std::io::Result<()> {
+    let cancelled = || {
+        std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "the connection was torn down locally",
+        )
+    };
     let Some(deadline) = deadline else {
+        // With no budget there is nothing to slice against, so the
+        // flag can only be checked before parking in the read.  The
+        // peer loop always sets a budget; this is the in-memory test
+        // path and the pre-handshake path.
+        if cancel.is_some_and(Cancel::is_cancelled) {
+            return Err(cancelled());
+        }
         return stream.read_exact(buf);
     };
     let mut filled = 0usize;
     while filled < buf.len() {
+        if cancel.is_some_and(Cancel::is_cancelled) {
+            return Err(cancelled());
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(std::io::Error::new(
@@ -159,7 +246,7 @@ fn read_exact_by_deadline<S: Read + SocketTimeout>(
                 "read timed out",
             ));
         }
-        stream.set_socket_read_timeout(Some(remaining));
+        stream.set_socket_read_timeout(Some(remaining.min(READ_POLL_INTERVAL)));
         match stream.read(&mut buf[filled..]) {
             Ok(0) => {
                 return Err(std::io::Error::new(
@@ -169,6 +256,14 @@ fn read_exact_by_deadline<S: Read + SocketTimeout>(
             }
             Ok(n) => filled = filled.saturating_add(n),
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A poll slice elapsed with nothing to read.  Only the
+            // deadline check above may end this read; loop back to it.
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
             Err(e) => return Err(e),
         }
     }
@@ -246,7 +341,7 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
         // known before any payload allocation (dcrd `readMessageHeader`
         // then the payload read).
         let mut buf = vec![0u8; MESSAGE_HEADER_SIZE];
-        read_exact_by_deadline(&mut self.stream, &mut buf, deadline)
+        read_exact_by_deadline(&mut self.stream, &mut buf, deadline, self.cancel.as_ref())
             .map_err(|e| dcroxide_peer::ReadError::io(e.to_string()))?;
 
         // Validate the header before reserving anything for the
@@ -263,8 +358,13 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
         let payload_len = header.payload_len as usize;
         if payload_len > 0 {
             buf.resize(MESSAGE_HEADER_SIZE.saturating_add(payload_len), 0);
-            read_exact_by_deadline(&mut self.stream, &mut buf[MESSAGE_HEADER_SIZE..], deadline)
-                .map_err(|e| dcroxide_peer::ReadError::io(e.to_string()))?;
+            read_exact_by_deadline(
+                &mut self.stream,
+                &mut buf[MESSAGE_HEADER_SIZE..],
+                deadline,
+                self.cancel.as_ref(),
+            )
+            .map_err(|e| dcroxide_peer::ReadError::io(e.to_string()))?;
         }
 
         // A codec failure is a wire-protocol violation (dcrd's
@@ -538,5 +638,128 @@ mod tests {
         let mut sink = Cursor::new(Vec::new());
         write_all_by_deadline(&mut sink, b"hello", None).expect("unbounded write");
         assert_eq!(sink.into_inner(), b"hello");
+    }
+
+    /// A read must give up when the connection's [`Cancel`] flag goes up,
+    /// without waiting out its budget.
+    ///
+    /// This is the property Windows CI failed on: the stall detector
+    /// logged a peer as disconnected and shut the socket down through a
+    /// cloned handle, but the input loop stayed parked in its receive, so
+    /// `run_peer_connection_with_stall` — which drives that loop on the
+    /// caller's own thread — could not return its reason until the idle
+    /// budget expired.  Go's `Conn.Close` makes a blocked `Read` return
+    /// on every platform and dcrd relies on exactly that; the port has to
+    /// poll instead.
+    ///
+    /// The socket is deliberately left alone here: this holds a peer that
+    /// simply never speaks, so the ONLY thing that can end the read is
+    /// the flag.  Reverting to a single receive armed with the whole
+    /// remaining budget makes this wait the full budget and fail.
+    #[test]
+    fn a_cancelled_read_returns_without_waiting_out_its_budget() {
+        // A budget far longer than the test may take, so finishing early
+        // can only be the flag's doing.
+        const BUDGET: Duration = Duration::from_secs(600);
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // A remote that connects and then says nothing at all.  It holds
+        // the socket open until told to let go, with a long backstop:
+        // without that, its close would hand the reader an EOF and the
+        // read would end for a reason that has nothing to do with the
+        // flag — which would make this test pass against the very bug it
+        // exists to catch.
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let mute = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let _ = stop_rx.recv_timeout(Duration::from_secs(10));
+            drop(stream);
+        });
+
+        let stream = std::net::TcpStream::connect(addr).expect("connect");
+        let mut transport = WireTransport::new(stream, 0, CurrencyNet::TEST_NET3);
+        transport.set_read_budget(Some(BUDGET));
+        let cancel = Cancel::new();
+        transport.set_cancel(cancel.clone());
+
+        // Raise the flag once the read is certainly parked in a receive.
+        let raiser = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(READ_POLL_INTERVAL / 4);
+                cancel.cancel();
+            })
+        };
+
+        let started = Instant::now();
+        let err = MsgTransport::read_message(&mut transport)
+            .expect_err("a cancelled read must not return a message");
+        let waited = started.elapsed();
+
+        raiser.join().expect("raiser");
+        let _ = stop_tx.send(());
+        let _ = mute.join();
+
+        // One poll interval to notice, plus slack for a loaded machine —
+        // and far, far short of the budget.
+        let bound = READ_POLL_INTERVAL * 4;
+        assert!(
+            waited < bound,
+            "the read waited {waited:?} for a cancellation it should have seen within \
+             {READ_POLL_INTERVAL:?} (bound {bound:?}, budget {BUDGET:?}): the receive is \
+             not being sliced, so teardown waits out the whole idle budget"
+        );
+        assert!(
+            err.message.contains("torn down locally"),
+            "the failure must name the local teardown, got: {}",
+            err.message
+        );
+    }
+
+    /// A poll slice elapsing is not a failure: only the whole-message
+    /// budget may end a read.
+    ///
+    /// Slicing the receive introduced a new way to get a `WouldBlock` or
+    /// `TimedOut` back from the stream that has nothing to do with the
+    /// budget being spent.  Treating those as fatal — which the
+    /// pre-slicing loop did, correctly, because its timeout WAS the
+    /// budget — would disconnect any peer that went quiet for a second
+    /// mid-message, which an honest peer on a slow link does routinely.
+    #[test]
+    fn a_quiet_peer_survives_longer_than_one_poll_slice() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // A remote that sends a ping only after several poll intervals
+        // have gone by with nothing on the wire.
+        let sender = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut out = WireTransport::new(stream, 0, CurrencyNet::TEST_NET3);
+            std::thread::sleep(READ_POLL_INTERVAL * 2 + READ_POLL_INTERVAL / 2);
+            MsgTransport::write_message(
+                &mut out,
+                &Message::Ping(dcroxide_wire::MsgPing { nonce: 42 }),
+            )
+            .expect("write ping");
+            // Hold the socket open until the reader has taken it.
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let stream = std::net::TcpStream::connect(addr).expect("connect");
+        let mut transport = WireTransport::new(stream, 0, CurrencyNet::TEST_NET3);
+        // A budget comfortably longer than the silence, so the silence is
+        // the only thing under test.
+        transport.set_read_budget(Some(READ_POLL_INTERVAL * 20));
+        transport.set_cancel(Cancel::new());
+
+        let msg = MsgTransport::read_message(&mut transport)
+            .expect("silence longer than a poll slice must not fail the read");
+        assert!(
+            matches!(&msg, Message::Ping(p) if p.nonce == 42),
+            "got {msg:?}"
+        );
+        sender.join().expect("sender");
     }
 }

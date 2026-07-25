@@ -712,13 +712,19 @@ impl Default for StallConfig {
 ///
 /// Disconnecting is a shutdown of the connection — the mechanism the
 /// input and output loops already use to break each other out of a
-/// blocked read or write — which unblocks the input loop's read and
-/// tears the whole connection down (dcrd's `Disconnect` closing the
+/// blocked read or write, and raises the connection's [`Cancel`] flag —
+/// which is what actually unblocks the input loop's read, since a
+/// `shutdown` issued on a different handle to the same socket is not a
+/// portable way to abort a receive already in flight.  Together they
+/// tear the whole connection down (dcrd's `Disconnect` closing the
 /// conn).  The stalled command is returned so the caller can report why
 /// the connection ended.
+///
+/// [`Cancel`]: crate::transport::Cancel
 pub fn run_stall_detector(
     stall: &Mutex<StallDetector>,
     conn: &TcpStream,
+    cancel: &crate::transport::Cancel,
     peer_label: &str,
     tick: Duration,
     shutdown: &mpsc::Receiver<()>,
@@ -737,6 +743,13 @@ pub fn run_stall_detector(
                             reason.exceeded_text()
                         ),
                     );
+                    // Both, and in this order.  The flag is what the
+                    // input loop actually watches — `shutdown` on this
+                    // cloned handle does not reliably abort a `recv`
+                    // already in flight on the loop's own handle under
+                    // Winsock — while the socket shutdown still delivers
+                    // the FIN the remote is owed.
+                    cancel.cancel();
                     let _ = conn.shutdown(Shutdown::Both);
                     return Some(reason);
                 }
@@ -897,6 +910,14 @@ where
     // SetReadDeadline(now + IdleTimeout) before every read).
     read_transport.set_read_budget(Some(idle_timeout));
 
+    // The connection's teardown signal.  The idle budget above is
+    // minutes long, so without something the reader polls, a peer this
+    // node has decided to drop stays parked in its receive until that
+    // budget runs out — the socket shutdown the other loops perform
+    // cannot be relied on to cut it short across platforms.
+    let cancel = crate::transport::Cancel::new();
+    read_transport.set_cancel(cancel.clone());
+
     // Fold the handshake's traffic into the peer's counters: dcrd's
     // negotiation reads and writes go through the same counted
     // `readMessage`/`writeMessage` bookkeeping as the session, and the
@@ -944,6 +965,7 @@ where
 
     let output_peer = Arc::clone(&peer);
     let output_stall = Arc::clone(&stall_state);
+    let output_cancel = cancel.clone();
     let output = thread::spawn(move || {
         let mut output_env = NodePeerEnv::new();
         let reason = run_peer_output_with_stall(
@@ -953,9 +975,12 @@ where
             receiver,
             Some(&output_stall),
         );
-        // Shut the socket down when the output loop ends (a write error
-        // or a closed queue) so the input loop's blocking read unblocks
-        // and the connection tears down instead of lingering.
+        // End the connection when the output loop ends (a write error or
+        // a closed queue): raise the flag the input loop polls, and shut
+        // the socket down so the remote gets its FIN.  The flag is the
+        // half that makes the input loop return promptly; see
+        // `run_stall_detector`.
+        output_cancel.cancel();
         let _ = write_transport.get_mut().shutdown(Shutdown::Both);
         reason
     });
@@ -982,10 +1007,12 @@ where
     let stall_label = peer.lock().expect("peer mutex poisoned").addr().to_string();
     let stall_tick = stall.tick;
     let stall_thread_state = Arc::clone(&stall_state);
+    let stall_thread_cancel = cancel.clone();
     let stall_thread = thread::spawn(move || {
         run_stall_detector(
             &stall_thread_state,
             &stall_stream,
+            &stall_thread_cancel,
             &stall_label,
             stall_tick,
             &stall_shutdown_rx,
@@ -1010,6 +1037,7 @@ where
     // unblocks (a peer that stopped reading would otherwise wedge it),
     // stop the ping timer and the stall detector, and close the outbound
     // queue, then join the three threads.
+    cancel.cancel();
     let _ = read_transport.get_mut().shutdown(Shutdown::Both);
     let _ = ping_shutdown.send(());
     let _ = stall_shutdown.send(());

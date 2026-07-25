@@ -238,7 +238,18 @@ impl BlockStore {
                     .map_err(|e| io_err(&e, "failed to sync file"))?;
             } else {
                 let path = block_file_path(&self.db_path, num);
-                let f = File::open(&path).map_err(|e| io_err(&e, "failed to open file to sync"))?;
+                // Opened for WRITING even though nothing is written here.
+                // `fsync(2)` is happy with a read-only descriptor, but
+                // Windows' `FlushFileBuffers` — which is what `sync_all`
+                // becomes there — requires write access on the handle and
+                // fails the whole flush with `ERROR_ACCESS_DENIED` (os
+                // error 5) without it.  `create` is deliberately absent:
+                // a dirty file that has gone missing must surface as an
+                // error, not be conjured up empty and reported synced.
+                let f = OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .map_err(|e| io_err(&e, "failed to open file to sync"))?;
                 f.sync_all()
                     .map_err(|e| io_err(&e, "failed to sync file"))?;
             }
@@ -419,6 +430,75 @@ mod tests {
         );
 
         // The sync must then actually reach it, leaving nothing owed.
+        store.sync().expect("sync");
+        assert!(store.dirty_files.is_empty());
+    }
+
+    /// The reopen a sync performs on a rolled-past file must ask for
+    /// WRITE access, even though it writes nothing.
+    ///
+    /// `fsync(2)` accepts a read-only descriptor, so a read-only reopen
+    /// works on Unix and this looks fine there.  Windows turns
+    /// `sync_all` into `FlushFileBuffers`, which requires write access
+    /// and fails with `ERROR_ACCESS_DENIED` without it — and because a
+    /// failed sync deliberately keeps its entry on the dirty list, every
+    /// later sync fails too.  The flush is the barrier `ProcessBlock`
+    /// runs before the metadata commit, so on Windows the node stopped
+    /// making progress permanently at the first block-file roll.
+    ///
+    /// The property is only directly observable on Windows, so this
+    /// reaches it from the other side: a file the process may read but
+    /// not write must make the sync FAIL.  A read-only reopen would
+    /// succeed here and this test is what notices.  The cost of that is
+    /// real but contrived — a block file an operator has chmod'ed to
+    /// read-only can no longer be synced — and it is strictly less
+    /// surprising than reporting a barrier that never ran.
+    #[cfg(unix)]
+    #[test]
+    fn syncing_a_rolled_past_file_needs_a_writable_handle() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // Root ignores the mode bits, so there the premise cannot be set
+        // up at all; skip rather than fail on somebody's CI container.
+        let canary = dir.path().join("canary");
+        fs::write(&canary, b"x").expect("write canary");
+        fs::set_permissions(&canary, fs::Permissions::from_mode(0o444)).expect("chmod canary");
+        if OpenOptions::new().write(true).open(&canary).is_ok() {
+            return;
+        }
+
+        let mut store = small_store(dir.path());
+        for i in 0..3u8 {
+            store.write_block(&[i; 8]).expect("write block");
+        }
+        assert_eq!(store.write_file_num, 1, "the writes must span two files");
+        assert_eq!(store.dirty_files, vec![0, 1]);
+
+        // File 0 has been rolled past: its handle is closed and the sync
+        // has to reopen it by path.  Make it unwritable.
+        let rolled_past = block_file_path(dir.path(), 0);
+        fs::set_permissions(&rolled_past, fs::Permissions::from_mode(0o444))
+            .expect("chmod the rolled-past file");
+
+        let err = store
+            .sync()
+            .expect_err("a sync that cannot open the file for writing must report it");
+        assert!(
+            err.to_string().contains("failed to open file to sync"),
+            "the failure must name the reopen, got: {err}"
+        );
+        assert_eq!(
+            store.dirty_files,
+            vec![0, 1],
+            "a failed sync must keep the whole dirty list so the barrier stays armed"
+        );
+
+        // And once it is writable again the sync completes, which is what
+        // proves the reopen was the only obstacle.
+        fs::set_permissions(&rolled_past, fs::Permissions::from_mode(0o644))
+            .expect("restore the mode");
         store.sync().expect("sync");
         assert!(store.dirty_files.is_empty());
     }

@@ -119,6 +119,30 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   already merged away, and those bytes stay allocated until the reader drops
   — uncounted, because they belong to a transaction's lifetime rather than
   the overlay's, which is where dcrd's accounting draws the same line.
+- **Peer teardown polls a flag where dcrd closes the connection.** dcrd ends a
+  peer by calling `Disconnect`, which closes the `net.Conn`; Go's runtime makes a
+  goroutine blocked in `Read` return on every platform, so the connection's
+  handlers unwind immediately. The port has no equivalent: `TcpStream::shutdown`
+  on one `try_clone`d handle does not reliably abort a `recv` already in flight on
+  another handle to the same socket under Winsock, and closing the descriptor out
+  from under a reading thread is not expressible without `unsafe`. So each
+  connection carries a `transport::Cancel` flag; whoever decides the connection is
+  over — the stall detector, the output loop, the server's own teardown — raises it
+  alongside the socket shutdown, and the read is issued in
+  `READ_POLL_INTERVAL` (1 s) slices so the reader observes it within a second
+  instead of whenever its idle budget runs out. Before this, a peer the stall
+  detector had already logged as disconnected stayed parked in its receive on
+  Windows until the idle timeout expired, holding its slot; the whole point of the
+  stall detector is to free that slot promptly. Slicing the receive also changed
+  what a receive returning nothing means: `WouldBlock`/`TimedOut` is now the slice
+  elapsing rather than the budget being spent, so it continues instead of failing
+  the read — without that, an honest peer that went quiet for a second mid-message
+  would be disconnected, which the pre-slicing loop never did because its timeout
+  *was* the budget. Pinned by `transport.rs`'s
+  `a_cancelled_read_returns_without_waiting_out_its_budget` and
+  `a_quiet_peer_survives_longer_than_one_poll_slice`, both verified to fail when
+  their mechanism is removed. The cost is one wake-up per second per idle
+  connection (~125 at the default `--maxpeers`).
 - **`--maxsameip` keys on the exact IP**, so an IPv6 /64 can occupy every
   connection slot. Exact dcrd parity (`connmanager.go` 685); the rate limiter
   groups by /64 but the per-host permit does not.
