@@ -144,9 +144,18 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   single fan-out goroutine head-of-line blocks every client behind one stalled
   TCP peer. Where the port is **weaker**: the single
   `Arc<Mutex<Server<NodeRpcChain>>>` is held for the whole of any one client's
-  request, so a multi-thousand-block `rescan` stalls notification *construction*
-  for every other client; dcrd's handlers hold no server-wide lock. That coupling
-  is the part still worth addressing, and it is tracked rather than papered over.
+  request, so a multi-thousand-block `rescan` serializes every other client's
+  request *and* notification construction, since the delivery thread needs the
+  same lock to build any notification. dcrd has neither problem, and the
+  difference is not incidental: `wsClient.serviceRequest`
+  (`internal/rpcserver/rpcwebsocket.go`) takes no server-wide lock at all — it
+  calls the handler directly — and `rpcserver.Server` carries only three
+  fine-grained mutexes, each guarding a single field (`hmacMu`, `statusLock`,
+  `blake256HaserMu`). The coarse lock is an artifact of wrapping the whole
+  ported server rather than its pieces. A comment at the lock site used to
+  justify it as "like dcrd's per-request locking", which was simply wrong;
+  it now says what dcrd actually does. Unpicking it means giving the ported
+  server dcrd's per-field locks, which is tracked rather than papered over.
 - **The RPC read is sliced for the same reason the peer read is.** dcrd's
   handlers are goroutines, so closing a connection makes the handler's `Read`
   return on any platform; the port's handlers are OS threads, and the

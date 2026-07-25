@@ -840,11 +840,26 @@ fn handle_ws_request_inner(
     }
 
     // Parse and dispatch the command through the ported websocket
-    // service handler (falling back to the standard handlers), holding
-    // the server for the duration like dcrd's per-request locking (the
-    // client state locks after the server, the order every path
-    // uses).  A not-yet-wired seam panics; it is caught and answered
-    // as an internal error so the connection survives.
+    // service handler, falling back to the standard handlers.  A
+    // not-yet-wired seam panics; it is caught and answered as an
+    // internal error so the connection survives.
+    //
+    // The server is held for the whole handler, and that is NOT dcrd's
+    // behaviour — an earlier comment here claimed it was.  dcrd's
+    // `wsClient.serviceRequest` takes no server-wide lock at all; it
+    // calls the handler directly, and `rpcserver.Server` carries only
+    // three fine-grained mutexes, each guarding one field (`hmacMu`,
+    // `statusLock`, `blake256HaserMu`).  The single
+    // `Arc<Mutex<Server<_>>>` here is an artifact of wrapping the whole
+    // ported server rather than its individual pieces, and it makes one
+    // client's long request — a `rescan` over thousands of blocks —
+    // serialize every other client's request AND notification
+    // construction, since the delivery thread needs the same lock to
+    // build any notification.  dcrd has neither problem.  Unpicking it
+    // means giving the ported server dcrd's per-field locks; until then
+    // this is a real divergence, recorded in PARITY.md rather than
+    // dressed up as parity.  The client state still locks after the
+    // server, the order every path uses.
     let jsonrpc = req.jsonrpc.clone();
     let id = req.id.clone();
     let method = req.method.clone();
