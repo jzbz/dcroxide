@@ -374,15 +374,19 @@ goleveldb's LSM commit is O(dirty) with background compaction, while
 redb is a copy-on-write B-tree with no background work, so commit cost
 tracks the size of the tree.
 
-At the tip the chain costs 24 GB on disk under dcrd and 33 GB under
-dcroxide. Block bytes are consensus data and the same on both sides,
-so the difference is metadata: dcroxide's 33 GB is 18 GB of flat
-`.fdb` block files plus a 14.48 GiB `metadata.redb` holding 5.65 GiB
-of stored payload across 76,302,003 rows — 43.8% page fill, and a full
-sorted rebuild reaches only 53.0%, redb's best case for this data.
-Both the flush-bound ingest and the page fill are open and tracked,
-not fixed. The full measurement record — the storage breakdown, the
-compaction and rebuild results, and why redb cannot pack tighter — is
+At the tip the same chain costs 23.73 GiB under dcrd and 32.06 GiB
+under dcroxide. Block bytes are consensus data and match to within a
+mebibyte — 17.580 GiB against 17.579 GiB — so the whole 8.33 GiB
+difference is metadata: dcrd's 6.045 GiB `blocks_ffldb/metadata`
+leveldb plus a 0.108 GiB `utxodb`, against one 14.483 GiB
+`metadata.redb`. Neither side compresses; dcrd opens its chain
+databases with `opt.NoCompression`. The redb file holds 5.65 GiB of
+payload over 76,302,003 rows, and the rest divides into 0.69 GiB of
+per-pair overhead, 3.44 GiB of intra-page slack at 64.86% B-tree fill,
+and 4.69 GiB of allocated-but-free pages. That last figure — free
+space the allocator holds rather than a packing loss — is the largest
+single component and the least understood. Both it and the flush-bound
+ingest are open and tracked, not fixed. The full measurement record is
 in [ADR-0004](docs/adr/0004-storage-backend.md); PARITY.md records the
 divergence from dcrd's two-database layout.
 

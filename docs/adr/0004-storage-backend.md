@@ -73,58 +73,119 @@ rather than the size of the batch.
 
 ### Space
 
-Chain on disk at tip: dcrd 24 GB, dcroxide 33 GB. Block bytes are consensus
-data and are the same on both sides (18 GB of flat `.fdb` files here), so
-the whole 9 GB difference is metadata. dcrd splits its metadata across a
-snappy-compressing goleveldb under `blocks_ffldb/metadata`
-and a second goleveldb at `utxodb` for the UTXO set; dcroxide keeps all of
-it uncompressed in one `metadata.redb`.
+Both data directories were measured directly, at the same height.
 
-That file is 14.48 GiB: 5.65 GiB stored, 0.69 b-tree metadata, 8.13
-fragmented. Page fill 43.8%, tree height 6, 2,175,036 leaf nodes,
-76,302,003 rows.
-redb's `fragmented_bytes` is the unused tail *inside* each allocated page
-(redb-2.6.3 `src/tree_store/btree.rs:963`) — a fill factor, not reclaimable
-free space between pages.
+| | dcrd | dcroxide |
+|---|---:|---:|
+| flat `.fdb` block files | 17.580 GiB | 17.579 GiB |
+| chain metadata | 6.045 GiB | 14.483 GiB |
+| UTXO set | 0.108 GiB | *(in the same file)* |
+| **total** | **23.73 GiB** | **32.06 GiB** |
 
-Three mechanisms in redb 2.6.3 produce that fill, all confirmed in its
-source: splits go to the byte midpoint with no append fast path
-(`btree_base.rs:565-577`); merges happen only below 33% fill
-(`btree_mutator.rs:610-618`); and the buddy allocator rounds every
-allocation up to a power of two — `required_order` is
-`ceil_log2(required_pages)`
+Block bytes are consensus data and match to within a mebibyte, so the whole
+8.33 GiB difference is metadata. dcrd splits its across a goleveldb under
+`blocks_ffldb/metadata` and a second goleveldb at `utxodb`; dcroxide keeps
+all of it in one `metadata.redb`.
+
+**Compression is not the explanation.** dcrd opens every chain leveldb with
+`Compression: opt.NoCompression` — `database/ffldb/db.go:2095` and
+`internal/blockchain/utxobackend.go:365`. Both sides store raw bytes, so the
+gap is per-key structural overhead, not codec choice. (dcrd does leave
+snappy on for one database, `<datadir>/feesdb`, which is half a megabyte.)
+
+`metadata.redb` decomposes as follows, read from the real file.
+
+| | GiB | share |
+|---|---:|---:|
+| payload (keys + values, 76,302,003 rows) | 5.65 | 39.0% |
+| redb per-pair overhead and branch pages | 0.69 | 4.8% |
+| intra-page slack | 3.44 | 23.7% |
+| allocated but free pages | 4.69 | 32.4% |
+
+The live B-tree is 9.79 GiB of that, giving a **page fill of 64.86%** — the
+tree packs reasonably. The single largest component is instead the 4.69 GiB
+of free pages: space the allocator holds and has not returned to the file.
+
+Beware `DatabaseStats::fragmented_bytes`, which reports 8.13 GiB here and
+looks like a fill figure but is not one. It sums the three trees' intra-page
+slack *and* `count_free_pages() * page_size`
+(redb-2.6.3 `src/transactions.rs:2298-2301`). Only the per-table
+`TableStats::fragmented_bytes` (`btree.rs:963`) is intra-page slack. Reading
+the database figure as a packing ratio understates the fill as 43.8% and
+charges free pages against the B-tree.
+
+Neither available remedy is what it appears to be. `Database::compact()` ran
+598.5 s to recover 0.12 GiB and a second pass returns false — it relocates
+pages with `copy_from_slice` and never repacks them. A full sorted copy-out
+rebuild (76.3M rows in 228 s plus a 10.5 s commit) does yield a smaller
+file, 12.00 GiB against 14.48, but **not by packing better**: it lands at
+58.29% fill against the original's 64.86%, and its live tree is *larger*,
+10.92 GiB against 9.79. The 2.48 GiB it saves is free pages, 4.69 GiB down
+to 1.08. Sequential insertion splits the rightmost leaf at the byte midpoint
+with no append fast path (`btree_base.rs:565-577`), so a rebuild trades
+denser packing for a cleaner allocator. Two further mechanisms bound the
+fill in either case: merges happen only below 33%
+(`btree_mutator.rs:610-618`), and the buddy allocator rounds every
+allocation to a power of two, `required_order = ceil_log2(required_pages)`
 (`tree_store/page_store/page_manager.rs:1058-1059`).
 
-Neither available remedy recovers the fragmented 8.13 GiB.
-`Database::compact()` ran 598.5 s to recover 0.12 GiB and a second pass
-returns false — it relocates pages with `copy_from_slice` and never repacks
-them. A full sorted copy-out
-rebuild (76.3M rows in 228 s plus a 10.5 s commit) yields a 12.00 GiB file
-at 53.0% fill, recovering 2.48 GiB, 17% of the file and not the 8.13 GiB
-the fragmentation figure suggests. 53.0% is redb's best case for this data,
-not a starting point that tuning improves on.
+Where the free pages come from is not established. One candidate is visible
+in this crate: `Database::begin` takes a redb `begin_read()` for the whole
+life of *every* ffldb transaction including read-only ones
+(`crates/dcroxide-database/src/lib.rs:386`), and redb will not return a
+freed page to the allocator past the oldest live read transaction
+(`transaction_tracker.rs:253-261`). A read held across writes therefore pins
+freed pages and the allocator grows the file instead of reusing them. That
+is a hypothesis with a mechanism, not a measurement.
 
 Payload by bucket, stored key+value bytes: `spendjournalv3` 2.46 GiB over
-1.1M rows; `existsaddridx` 1.55 GiB over 66,477,608 rows (the values are
-empty — the key is the datum); `gcsfilters` 0.41 GiB; `stakeblockundo`
+1,100,392 rows; `existsaddridx` 1.55 GiB over 66,495,032 rows (the values
+are empty — the key is the datum); `gcsfilters` 0.41 GiB; `stakeblockundo`
 0.39; `blockidxv3` 0.24; `ffldb-blockidx` 0.23; `ticketsinblock` 0.17;
-`utxosetv3` 0.13.
+`utxosetv3` 0.13. Attribution is near-exact: only 12 of 2,175,036 leaf pages
+straddle two buckets, since the buckets are contiguous key ranges.
 
 ### Verdict
 
 redb stays. It is crash-safe, pure Rust, needs no C toolchain, and carries
 the full mainnet chain; the gate asked whether it could sustain the load,
-and it can. The price is ~2.2x dcrd's initial-block-download time and 9 GB
-more on disk, all of it metadata. Both are properties of the engine, not
-of how the port drives it, so no amount of work in the layers above
-recovers them.
+and it can. The price is ~2.2x dcrd's initial-block-download time and
+8.33 GiB more on disk, all of it metadata.
 
-Four levers have been identified and **none is implemented or measured**:
-sizing redb's read cache against the working set; decoupling flush cadence
-from block connection so one commit amortizes over more work; compressing
-values, which dcrd gets for free from goleveldb; and shipping a rebuild
-tool for the 17% a copy-out recovers. Each is a hypothesis about where the
-cost goes, and each is tracked as open work rather than promised.
+How much of that price is inherent to redb is *not* settled, and an earlier
+draft of this section claimed it was. A copy-on-write B-tree costing more
+per commit than an LSM is structural. But the largest single component of
+the file is free pages, and the leading hypothesis for those points at how
+this crate drives redb rather than at redb itself. Until that is measured,
+the honest position is that some unknown fraction is recoverable in the
+layers above.
+
+Levers, **none implemented and none measured**:
+
+- **Audit long-lived read transactions.** Targets the 4.69 GiB of free
+  pages, the largest component, via the mechanism described above. Testable
+  without an on-disk format change.
+- **Size redb's read cache against the working set.** Targets flush time,
+  not space. A probe on the real tree took a 500k-key insert loop from
+  4.3-6.1 s to 1.3-1.5 s by raising the cache from the 1 GiB default to
+  8 GiB; that is a microbenchmark, not a sync.
+- **Decouple flush cadence from block connection**, so one commit amortizes
+  over more work.
+- **Shrink the two dominant buckets.** `spendjournalv3` (4.1 GiB of tree
+  footprint, 2402 B mean row) and `existsaddridx` (3.1 GiB over 66.5M rows
+  of a 25-byte key with an empty value) are 72% of the tree between them,
+  and they waste space by different mechanisms — large-value round-up
+  against fixed per-row overhead — so they need different treatments.
+
+Value compression is deliberately *not* on that list. dcrd stores the same
+data uncompressed and still fits it in 6.045 GiB, so compression would be a
+divergence from the reference implementation adopted to paper over an
+overhead dcrd does not pay. It stays available if the levers above fall
+short.
+
+A rebuild tool is not on the list either. A copy-out reclaims 2.48 GiB, but
+by clearing free pages while packing *worse*, so it treats a symptom of the
+first lever. Fix the free pages and the rebuild has little left to recover.
 
 The rocksdb fallback is resolved rather than retired: it was never
 exercised, because the condition that would have triggered it — redb

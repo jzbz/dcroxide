@@ -125,30 +125,41 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   already merged away, and those bytes stay allocated until the reader drops
   — uncounted, because they belong to a transaction's lifetime rather than
   the overlay's, which is where dcrd's accounting draws the same line.
-- **One redb table where dcrd has two databases, and the tree runs half
-  empty.** dcrd keeps chain metadata in a snappy-compressing goleveldb at
+- **One redb table where dcrd has two databases, at 2.4x the metadata cost.**
+  dcrd keeps chain metadata in a goleveldb at
   `<datadir>/blocks_ffldb/metadata` and the utxo set in a second goleveldb at
   `<datadir>/utxodb`; the port keeps the whole ffldb keyspace, utxo set
   included, in one redb table per accepted
   [ADR-0004](docs/adr/0004-storage-backend.md). At the mainnet tip that costs
-  disk: 33 GB against dcrd's 24 GB. The block bytes are consensus data and the
-  same on both sides (18 GB of flat `.fdb` files here), so the gap is
-  metadata — a 14.48 GiB `metadata.redb` over 76,302,003 rows whose stored key
-  and value bytes come to only 5.65 GiB, at 43.8% page fill. redb's
-  `fragmented_bytes` is the unused tail *inside* each allocated page, not
-  reclaimable space between them, so compaction does not reach it, and a full
-  sorted copy-out rebuild — the best case for this data — still lands at 53.0%
-  fill. The throughput cost is the same engine property from the other side: a
+  disk: 32.06 GiB against dcrd's 23.73 GiB. The block bytes are consensus data
+  and match to within a mebibyte (17.579 GiB against 17.580), so the whole
+  8.33 GiB gap is metadata — one 14.483 GiB `metadata.redb` against dcrd's
+  6.045 + 0.108 GiB. Compression is not the reason: dcrd opens its chain
+  databases with `opt.NoCompression` (`database/ffldb/db.go:2095`,
+  `internal/blockchain/utxobackend.go:365`), so both sides store raw bytes and
+  the gap is per-key structural overhead. The redb file carries 5.65 GiB of
+  payload over 76,302,003 rows, 0.69 GiB of per-pair overhead, 3.44 GiB of
+  intra-page slack at 64.86% B-tree fill, and 4.69 GiB of allocated-but-free
+  pages — that last being the largest single component, and space the
+  allocator holds rather than a packing loss. Compaction does not reach it,
+  and a sorted copy-out rebuild reclaims 2.48 GiB by clearing free pages while
+  packing *worse* (58.29% fill). The throughput cost is a separate engine
+  property: a
   copy-on-write B-tree does no background work, so commit cost tracks tree
   size, where goleveldb's LSM commit is O(dirty) and defers the rest to
   background compaction. Syncing mainnet from genesis the port spent 80.1% and
   82.4% of wall time (two runs) inside progress stalls over 20 s, while dcrd
   stalled 0 times in 754 windows. The node is flush-bound under fast ingest,
   and that — not validation — is why initial block download takes about 2.2x
-  as long as dcrd's. ADR-0004's 2026-07-26 amendment carries the full
-  measurement record: the four-way throughput matrix, the per-bucket payload
-  breakdown, the compaction and rebuild timings, and the three redb 2.6.3
-  mechanisms that cap the fill.
+  as long as dcrd's. How much of the space cost is inherent to redb is not
+  settled: the leading hypothesis for the free pages is that
+  `Database::begin` holds a redb read transaction for the life of every ffldb
+  transaction, read-only ones included (`lib.rs:386`), and redb will not
+  reclaim a freed page past the oldest live read. ADR-0004's 2026-07-26
+  amendment carries the full measurement record: both data directories
+  side by side, the four-way throughput matrix, the per-bucket payload
+  breakdown, the compaction and rebuild results, and the redb 2.6.3
+  mechanisms that bound the fill.
 - **The websocket notification pipeline is unbounded, as dcrd's is.** Two
   accumulators sit between a chain event and a client's socket: the manager's
   `std::sync::mpsc::channel()` (`websocket.rs` 146) and the per-client
