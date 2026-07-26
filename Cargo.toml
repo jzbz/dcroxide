@@ -73,6 +73,27 @@ debug = "line-tables-only"
 # `cargo test`.
 panic = "abort"
 
+# The profile release artifacts are cut from.
+#
+# `release` deliberately carries debug info so `perf` can symbolicate a
+# profile, and that is 41.5 MB of the 50.1 MB binary — the machine code
+# itself is 6.3 MB, near-identical to dcrd's 6.4 MB.  Shipping that to
+# operators serves nobody, so this profile drops it.
+#
+# `strip = "debuginfo"` rather than `"symbols"`, which would be ~1-2 MB
+# smaller: the symbol table stays so a panic still names functions in its
+# backtrace.  With `panic = "abort"` inherited from `release`, a panic is
+# a process death and an outage, and that backtrace is the whole
+# diagnostic — worth more than the megabyte.  Line numbers do go; if a
+# release ever needs those, `split-debuginfo = "packed"` keeps them in a
+# `.dwp` sidecar instead.
+#
+#   cargo build --profile dist -p dcroxide-node --bin dcroxide
+#   # -> target/dist/dcroxide
+[profile.dist]
+inherits = "release"
+strip = "debuginfo"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"
