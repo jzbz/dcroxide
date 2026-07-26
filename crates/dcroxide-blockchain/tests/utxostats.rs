@@ -286,3 +286,60 @@ fn ticket_minimal_outputs_decode_through_the_entry() {
     );
     assert_eq!(regular_entry(1).ticket_minimal_outputs(), None);
 }
+
+/// A chain with no database folds its in-memory backend to the same
+/// statistics the database-backed walk produces.
+///
+/// `Chain::new` leaves `db: None`, and `fetch_utxo_stats` then walks
+/// `utxo_backend` instead of the utxo bucket.  That branch has to sort
+/// by serialized key before folding, because the VLQ-coded output index
+/// makes serialized-key order diverge from the map's tuple order across
+/// VLQ length boundaries — and the merkle root over the entry hashes
+/// depends on that order.  The database branch gets the ordering for
+/// free from the bucket walk; this one does not.
+///
+/// `expected_stats` is the independent oracle both branches are checked
+/// against, so this also pins the two against each other.
+#[test]
+fn a_chain_without_a_database_folds_its_memory_backend_the_same_way() {
+    let params = dcroxide_chaincfg::simnet_params();
+    let mut chain = Chain::new(&params, params.assume_valid, false);
+    assert!(
+        chain.db.is_none(),
+        "Chain::new leaves the chain database-less; this test covers that branch"
+    );
+
+    // The two orders genuinely invert here.  `outpoint_key` lays a key
+    // out as prefix||hash||vlq(tree)||vlq(index) (utxoio.rs:43-60),
+    // while `utxo_backend`'s key is the tuple (hash, index, tree) —
+    // index before tree.  So for one transaction hash, an entry with a
+    // low index on the stake tree and one with a higher index on the
+    // regular tree sort opposite ways in the two orders, and folding
+    // the map without sorting yields a different merkle root.
+    let a = Hash([0x0a; 32]);
+    let b = Hash([0x0b; 32]);
+    let outpoint = |hash: Hash, index: u32, tree: i8| OutPoint { hash, index, tree };
+    let rows = [
+        // map order: (a,1,1) before (a,5,0); key order: tree 0 first.
+        (outpoint(a, 5, 0), regular_entry(1000)),
+        (outpoint(a, 1, 1), regular_entry(2500)),
+        (outpoint(a, 128, 0), regular_entry(3300)),
+        (outpoint(a, 0, 1), regular_entry(4100)),
+        (outpoint(b, 1, 0), regular_entry(7000)),
+    ];
+    for (op, entry) in &rows {
+        chain
+            .utxo_backend
+            .insert((op.hash.0, op.index, op.tree), entry.clone());
+    }
+
+    let stats = chain.fetch_utxo_stats().expect("stats");
+    assert_eq!(
+        stats,
+        expected_stats(&rows),
+        "the database-less fold matches the reference statistics"
+    );
+    assert_eq!(stats.utxos, 5, "every entry counted");
+    assert_eq!(stats.transactions, 2, "two distinct transactions");
+    assert_eq!(stats.total, 1000 + 2500 + 3300 + 4100 + 7000, "total value");
+}

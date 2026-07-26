@@ -105,6 +105,18 @@ enum KvTx {
 struct TxState {
     /// The underlying key/value transaction; `None` once closed.
     kv: Option<KvTx>,
+    /// The metadata table, opened once for the transaction's life.
+    ///
+    /// `ReadTransaction::open_table` resolves the table by name through
+    /// redb's master table tree on every call, and it returns an owned
+    /// `ReadOnlyTable` rather than a borrow — so opening it per key
+    /// lookup, as this used to, paid that walk on every `Bucket::get`
+    /// and on every step of a `for_each` or prefix scan.  The read
+    /// transaction is a snapshot, so which table it resolves cannot
+    /// change while it lives; opening once is the same answer for less
+    /// work.  `None` only if the table is somehow absent, which
+    /// preserves the previous "missing table reads as empty" behaviour.
+    table: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
     /// Blocks buffered by `store_block` to be written on commit, plus
     /// an index over them by hash (dcrd `pendingBlocks` /
     /// `pendingBlockData`).
@@ -144,10 +156,16 @@ impl Transaction {
             KvTxSeed::Read(t) => (KvTx::Read(t), false),
             KvTxSeed::Write(t) => (KvTx::Write(t), true),
         };
+        // Both variants hold a redb read transaction, so this is the
+        // owned `ReadOnlyTable` and can outlive the call.
+        let table = match &kv {
+            KvTx::Read(t) | KvTx::Write(t) => t.open_table(METADATA_TABLE).ok(),
+        };
         Transaction {
             db,
             state: RefCell::new(TxState {
                 kv: Some(kv),
+                table,
                 pending_blocks: Vec::new(),
                 pending_index: HashMap::new(),
                 pending_keys: std::collections::BTreeMap::new(),
@@ -197,12 +215,12 @@ impl Transaction {
         if let Some(entry) = state.cache_snap.get(key) {
             return entry.clone();
         }
-        match state.kv.as_ref()? {
-            KvTx::Read(t) | KvTx::Write(t) => {
-                let table = t.open_table(METADATA_TABLE).ok()?;
-                table.get(key).ok()?.map(|g| g.value().to_vec())
-            }
-        }
+        // `kv` is still consulted so a closed transaction reads as
+        // empty, exactly as before; the table itself is the one opened
+        // when the transaction began.
+        state.kv.as_ref()?;
+        let table = state.table.as_ref()?;
+        table.get(key).ok()?.map(|g| g.value().to_vec())
     }
 
     fn has_raw(&self, key: &[u8]) -> bool {
@@ -251,27 +269,19 @@ impl Transaction {
         };
 
         let state = self.state.borrow();
-        let Some(kv) = state.kv.as_ref() else {
+        if state.kv.is_none() {
             return Vec::new();
-        };
-        let result = match kv {
-            KvTx::Read(t) => t.open_table(METADATA_TABLE).ok().and_then(|table| {
-                let range = if bounded {
-                    table.range(prefix..end.as_slice())
-                } else {
-                    table.range(prefix..)
-                };
-                range.ok().map(collect)
-            }),
-            KvTx::Write(t) => t.open_table(METADATA_TABLE).ok().and_then(|table| {
-                let range = if bounded {
-                    table.range(prefix..end.as_slice())
-                } else {
-                    table.range(prefix..)
-                };
-                range.ok().map(collect)
-            }),
-        };
+        }
+        // One table for the whole scan, and one arm: both transaction
+        // kinds read through the same opened table.
+        let result = state.table.as_ref().and_then(|table| {
+            let range = if bounded {
+                table.range(prefix..end.as_slice())
+            } else {
+                table.range(prefix..)
+            };
+            range.ok().map(collect)
+        });
 
         // Merge the layered views over the stored keys: the cache
         // snapshot's live entries add and its deletions mask — with a
@@ -516,6 +526,13 @@ impl Transaction {
 
     fn close(&self) {
         let mut state = self.state.borrow_mut();
+        // Drop the opened table BEFORE the transaction it came from.
+        // `ReadOnlyTable` holds an `Arc<TransactionGuard>`, so leaving
+        // it here would keep the redb read transaction alive past
+        // close — and redb will not reclaim a freed page past the
+        // oldest live read transaction, so a leaked reader makes the
+        // allocator grow the file instead of reusing it.
+        state.table = None;
         if state.kv.take().is_some() && self.writable {
             // Release the writer semaphore (dcrd releases its write
             // lock when a writable transaction ends).

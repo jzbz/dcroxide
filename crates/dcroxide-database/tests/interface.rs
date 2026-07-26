@@ -465,3 +465,95 @@ fn update_rolls_back_on_error() {
     })
     .expect("view");
 }
+
+/// A closed transaction must release its redb read snapshot, even while
+/// the `Transaction` value itself is still in scope.
+///
+/// The metadata table is opened once when a transaction begins rather
+/// than per key lookup, and redb's `ReadOnlyTable` owns an
+/// `Arc<TransactionGuard>` — so leaving that table in place when the
+/// transaction closes would keep the underlying read snapshot alive for
+/// as long as the caller held the handle.  redb will not return a freed
+/// page to the allocator past the oldest live read transaction, so a
+/// pinned snapshot stops the file reusing space and it grows without
+/// bound instead.
+///
+/// Real negative: drop the `state.table = None;` line from
+/// `Transaction::close` and the growth assertion below fails.
+#[test]
+fn a_closed_transaction_releases_its_read_snapshot() {
+    let (dir, db) = new_db();
+    let path = dir.path().join("db").join("metadata.redb");
+
+    // A payload worth reclaiming: 1 KiB values that later rounds
+    // overwrite, so each round frees the previous round's pages.
+    const ROWS: usize = 2_000;
+    const ROUNDS: usize = 40;
+    let value = vec![0xABu8; 1024];
+
+    {
+        let tx = db.begin(true).expect("begin rw");
+        tx.metadata().create_bucket(b"churn").expect("create");
+        let meta = tx.metadata();
+        let bucket = meta.bucket(b"churn").expect("bucket");
+        for i in 0..ROWS {
+            bucket
+                .put(&(i as u32).to_be_bytes(), &value)
+                .expect("seed put");
+        }
+        tx.commit().expect("commit");
+    }
+    db.flush().expect("flush the seed");
+    let seeded = std::fs::metadata(&path).expect("stat").len();
+
+    // Each round closes a read transaction but keeps the handle alive,
+    // which is exactly the shape that would pin a snapshot, then churns
+    // the same keys so there is something to reclaim.
+    let mut closed_but_held = Vec::new();
+    for round in 0..ROUNDS {
+        let reader = db.begin(false).expect("begin ro");
+        assert!(
+            reader
+                .metadata()
+                .bucket(b"churn")
+                .expect("bucket")
+                .get(&0u32.to_be_bytes())
+                .is_some(),
+            "the reader saw the seeded row"
+        );
+        reader.rollback().expect("close the reader");
+        closed_but_held.push(reader);
+
+        let tx = db.begin(true).expect("begin rw");
+        let meta = tx.metadata();
+        let bucket = meta.bucket(b"churn").expect("bucket");
+        let mut v = value.clone();
+        v[0] = round as u8;
+        for i in 0..ROWS {
+            bucket
+                .put(&(i as u32).to_be_bytes(), &v)
+                .expect("churn put");
+        }
+        tx.commit().expect("commit");
+        db.flush().expect("flush the round");
+    }
+
+    let grown = std::fs::metadata(&path).expect("stat").len();
+    // Reclamation keeps this near the live payload.  A pinned snapshot
+    // per round makes every round's freed pages unreclaimable, so the
+    // file grows with ROUNDS instead of staying flat.
+    let ceiling = seeded * 4;
+    assert!(
+        grown <= ceiling,
+        "metadata.redb grew from {seeded} to {grown} bytes over {ROUNDS} rounds (ceiling \
+         {ceiling}): closed transactions are pinning their redb read snapshot, so freed pages \
+         cannot be reused"
+    );
+    // Guard against a vacuous pass: the churn must actually have written
+    // enough for a leak to have shown up.
+    assert!(
+        seeded > 1_000_000,
+        "the seed was only {seeded} bytes; too small for the growth check to mean anything"
+    );
+    drop(closed_but_held);
+}

@@ -235,15 +235,27 @@ impl IndexSubscriber {
                 ),
             ));
         } else {
-            let db = idx.lock().expect("indexer lock poisoned").db();
+            // Take the indexer guard BEFORE the write transaction, not
+            // after.  `Database::begin(true)` claims the writer
+            // semaphore, and every database commit in the daemon queues
+            // behind it — so acquiring it first and only then blocking on
+            // this mutex hands any holder of the mutex the power to stall
+            // every write in the process for as long as it likes.  In
+            // this order the semaphore is claimed last and released with
+            // the transaction, so nothing waits on another lock while
+            // holding it.
+            //
+            // Pinned by `dcroxide-node/tests/b6_indexlock.rs`.
+            let mut guard = idx.lock().expect("indexer lock poisoned");
+            let db = guard.db();
             let db_tx = db.begin(true)?;
-            match idx
-                .lock()
-                .expect("indexer lock poisoned")
-                .process_notification(&db_tx, ntfn)
-            {
-                Ok(()) => db_tx.commit()?,
+            match guard.process_notification(&db_tx, ntfn) {
+                Ok(()) => {
+                    drop(guard);
+                    db_tx.commit()?
+                }
                 Err(err) => {
+                    drop(guard);
                     let _ = db_tx.rollback();
                     return Err(err);
                 }

@@ -88,6 +88,18 @@ pub fn addr_to_key(addr: &Address) -> Result<[u8; ADDR_KEY_SIZE], IdxError> {
     Ok(result)
 }
 
+/// The memory-only index of addresses seen in unconfirmed transactions
+/// (dcrd `mpExistsAddr`), behind its own lock.
+///
+/// dcrd guards this map with a dedicated `unconfirmedLock`
+/// (`existsaddrindex.go` 292/451/572) and takes no index-wide lock to
+/// answer a query, so a lookup never blocks the index writer.  The port
+/// keeps `ExistsAddrIndex` itself behind one mutex because the daemon
+/// shares it across threads, which would put every query in the writer's
+/// way — so the overlay is split out here and reached through
+/// [`ExistsAddrQuery`] instead.
+type Unconfirmed = Arc<std::sync::RwLock<HashSet<[u8; ADDR_KEY_SIZE]>>>;
+
 /// The "ever seen" address index (dcrd `ExistsAddrIndex`).
 pub struct ExistsAddrIndex {
     db: Arc<Database>,
@@ -95,9 +107,95 @@ pub struct ExistsAddrIndex {
 
     // The memory-only index of addresses seen in unconfirmed
     // transactions (dcrd `mpExistsAddr`).
-    mp_exists_addr: HashSet<[u8; ADDR_KEY_SIZE]>,
+    mp_exists_addr: Unconfirmed,
 
     subscribers: Vec<SyncWaiter>,
+}
+
+/// Everything a lookup needs, detached from the index mutex: the shared
+/// database handle and the unconfirmed overlay (dcrd's `idx.db` plus the
+/// map behind `unconfirmedLock`).
+///
+/// dcrd's `ExistsAddress`/`ExistsAddresses` read the database with no
+/// index-wide lock held and take `unconfirmedLock` only for the overlay.
+/// Obtaining one of these costs two `Arc` clones, so a caller holding
+/// `Arc<Mutex<ExistsAddrIndex>>` can release the index guard before doing
+/// any database work and reach the same behaviour.  That matters because
+/// the index writer takes the database's writer semaphore *before* it
+/// waits on the index mutex (`subscriber.rs`), so a query that held the
+/// index mutex across its database reads would park the writer — and
+/// every database commit in the daemon serializes behind that semaphore.
+#[derive(Clone)]
+pub struct ExistsAddrQuery {
+    db: Arc<Database>,
+    mp_exists_addr: Unconfirmed,
+}
+
+impl ExistsAddrQuery {
+    /// Whether the key is in the unconfirmed overlay (dcrd's read under
+    /// `unconfirmedLock.RLock`).
+    fn unconfirmed_contains(&self, k: &[u8; ADDR_KEY_SIZE]) -> bool {
+        self.mp_exists_addr
+            .read()
+            .expect("unconfirmed overlay lock poisoned")
+            .contains(k)
+    }
+
+    /// Whether or not an address has been seen before (dcrd
+    /// `ExistsAddress`).
+    pub fn exists_address(&self, addr: &Address) -> Result<bool, IdxError> {
+        let k = addr_to_key(addr)?;
+
+        let db_tx = self.db.begin(false)?;
+        let exists = db_tx
+            .metadata()
+            .bucket(EXISTS_ADDR_INDEX_KEY)
+            .is_some_and(|bucket| bucket.get(&k).is_some());
+        db_tx.rollback()?;
+
+        // Only check the in memory map if needed.
+        if !exists {
+            return Ok(self.unconfirmed_contains(&k));
+        }
+        Ok(exists)
+    }
+
+    /// Whether or not each address in a slice of addresses has been
+    /// seen before (dcrd `ExistsAddresses`).
+    pub fn exists_addresses(&self, addrs: &[Address]) -> Result<Vec<bool>, IdxError> {
+        let mut addr_keys = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            addr_keys.push(addr_to_key(addr)?);
+        }
+        let mut exists = vec![false; addrs.len()];
+
+        let db_tx = self.db.begin(false)?;
+        // dcrd re-resolves the bucket inside its loop; hoisting it is a
+        // pure lookup saving with the same result, and this loop is
+        // caller-sized.
+        if let Some(bucket) = db_tx.metadata().bucket(EXISTS_ADDR_INDEX_KEY) {
+            for (i, key) in addr_keys.iter().enumerate() {
+                exists[i] = bucket.get(key).is_some();
+            }
+        }
+        db_tx.rollback()?;
+
+        // One overlay guard for the whole slice, as dcrd takes one
+        // `unconfirmedLock.RLock` around its own loop.
+        {
+            let overlay = self
+                .mp_exists_addr
+                .read()
+                .expect("unconfirmed overlay lock poisoned");
+            for (i, key) in addr_keys.iter().enumerate() {
+                if !exists[i] {
+                    exists[i] = overlay.contains(key);
+                }
+            }
+        }
+
+        Ok(exists)
+    }
 }
 
 impl ExistsAddrIndex {
@@ -124,7 +222,7 @@ impl ExistsAddrIndex {
         let idx = Arc::new(std::sync::Mutex::new(ExistsAddrIndex {
             db,
             chain,
-            mp_exists_addr: HashSet::new(),
+            mp_exists_addr: Arc::new(std::sync::RwLock::new(HashSet::new())),
             subscribers: Vec::new(),
         }));
 
@@ -172,53 +270,42 @@ impl ExistsAddrIndex {
         if bucket.get(k).is_some() {
             return true;
         }
-        self.mp_exists_addr.contains(k)
+        self.unconfirmed_contains(k)
+    }
+
+    /// Whether the key is in the unconfirmed overlay (dcrd's read under
+    /// `unconfirmedLock.RLock`).
+    fn unconfirmed_contains(&self, k: &[u8; ADDR_KEY_SIZE]) -> bool {
+        self.mp_exists_addr
+            .read()
+            .expect("unconfirmed overlay lock poisoned")
+            .contains(k)
+    }
+
+    /// A lookup handle that does not borrow the index (dcrd's queries
+    /// take no index-wide lock).
+    ///
+    /// Callers holding `Arc<Mutex<ExistsAddrIndex>>` should take this,
+    /// drop the index guard, and only then query — see
+    /// [`ExistsAddrQuery`] for why the guard must not span the database
+    /// reads.
+    pub fn query(&self) -> ExistsAddrQuery {
+        ExistsAddrQuery {
+            db: Arc::clone(&self.db),
+            mp_exists_addr: Arc::clone(&self.mp_exists_addr),
+        }
     }
 
     /// Whether or not an address has been seen before (dcrd
     /// `ExistsAddress`).
     pub fn exists_address(&self, addr: &Address) -> Result<bool, IdxError> {
-        let k = addr_to_key(addr)?;
-
-        let db_tx = self.db.begin(false)?;
-        let exists = db_tx
-            .metadata()
-            .bucket(EXISTS_ADDR_INDEX_KEY)
-            .is_some_and(|bucket| bucket.get(&k).is_some());
-        db_tx.rollback()?;
-
-        // Only check the in memory map if needed.
-        if !exists {
-            return Ok(self.mp_exists_addr.contains(&k));
-        }
-        Ok(exists)
+        self.query().exists_address(addr)
     }
 
     /// Whether or not each address in a slice of addresses has been
     /// seen before (dcrd `ExistsAddresses`).
     pub fn exists_addresses(&self, addrs: &[Address]) -> Result<Vec<bool>, IdxError> {
-        let mut addr_keys = Vec::with_capacity(addrs.len());
-        for addr in addrs {
-            addr_keys.push(addr_to_key(addr)?);
-        }
-        let mut exists = vec![false; addrs.len()];
-
-        let db_tx = self.db.begin(false)?;
-        for (i, key) in addr_keys.iter().enumerate() {
-            exists[i] = db_tx
-                .metadata()
-                .bucket(EXISTS_ADDR_INDEX_KEY)
-                .is_some_and(|bucket| bucket.get(key).is_some());
-        }
-        db_tx.rollback()?;
-
-        for (i, key) in addr_keys.iter().enumerate() {
-            if !exists[i] {
-                exists[i] = self.mp_exists_addr.contains(key);
-            }
-        }
-
-        Ok(exists)
+        self.query().exists_addresses(addrs)
     }
 
     /// Add all addresses associated with transactions in the provided
@@ -290,7 +377,12 @@ impl ExistsAddrIndex {
         // skipping any keys that already exist.  Write any addresses
         // seen in mempool at this time, too, then reset the
         // unconfirmed map.
-        for addr_key in self.mp_exists_addr.drain() {
+        for addr_key in self
+            .mp_exists_addr
+            .write()
+            .expect("unconfirmed overlay lock poisoned")
+            .drain()
+        {
             used_addrs.insert(addr_key);
         }
 
@@ -395,8 +487,12 @@ impl ExistsAddrIndex {
             }
             keys
         };
+        let mut overlay = self
+            .mp_exists_addr
+            .write()
+            .expect("unconfirmed overlay lock poisoned");
         for k in params_addrs {
-            self.mp_exists_addr.insert(k);
+            overlay.insert(k);
         }
     }
 }

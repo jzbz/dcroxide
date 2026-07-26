@@ -62,7 +62,15 @@ pub struct UtxoStats {
 
 /// A stats fold row: the serialized outpoint key the fold orders by,
 /// the serialized entry, its amount, and its transaction hash.
-type UtxoStatsRow = (Vec<u8>, Vec<u8>, i64, [u8; 32]);
+/// One utxo reduced to just what the set statistics need, in
+/// serialized-key order: the key it sorts by, the leaf hash of its
+/// serialized entry, that entry's length, its amount, and its
+/// transaction hash.
+///
+/// The entry bytes themselves are hashed on sight and dropped rather
+/// than carried, so walking the set costs a fixed ~88 bytes per utxo
+/// instead of holding every serialized entry at once.
+type UtxoStatsRow = (Vec<u8>, Hash, i64, i64, [u8; 32]);
 
 fn rule_error(kind: RuleErrorKind, description: impl Into<String>) -> RuleError {
     RuleError {
@@ -1685,6 +1693,18 @@ impl Chain {
         // sorted by their serialized keys rather than trusting the
         // map's tuple order.
         let mut rows: Vec<UtxoStatsRow> = Vec::new();
+        // The database walk is already in key order and so accumulates
+        // straight into these; the in-memory walk has to sort first and
+        // folds `rows` in afterwards.
+        let mut streamed = UtxoStats {
+            utxos: 0,
+            transactions: 0,
+            size: 0,
+            total: 0,
+            serialized_hash: Hash::ZERO,
+        };
+        let mut transactions: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut leaves: Vec<Hash> = Vec::new();
         if let Some(db) = &self.db {
             let mut corrupt: Option<String> = None;
             db.view(|tx| {
@@ -1708,12 +1728,17 @@ impl Chain {
                             }
                             match crate::utxoio::deserialize_utxo_entry(v, outpoint.index) {
                                 Ok(entry) => {
-                                    rows.push((
-                                        k.to_vec(),
-                                        v.to_vec(),
-                                        entry.amount(),
-                                        outpoint.hash.0,
-                                    ));
+                                    // `for_each` walks the bucket in
+                                    // serialized-key order, so the
+                                    // running totals and leaf order are
+                                    // already what the sorted pass
+                                    // below would produce — nothing
+                                    // needs collecting.
+                                    streamed.utxos += 1;
+                                    streamed.size += v.len() as i64;
+                                    streamed.total += entry.amount();
+                                    transactions.insert(outpoint.hash.0);
+                                    leaves.push(dcroxide_chainhash::hash_h(v));
                                 }
                                 Err(e) => corrupt = Some(format!("corrupt utxo entry: {e:?}")),
                             }
@@ -1738,32 +1763,28 @@ impl Chain {
                 };
                 let serialized = crate::utxoio::serialize_utxo_entry(entry)
                     .expect("the utxo backend never holds spent entries");
+                // Reduce to the leaf hash and the counters here; the
+                // serialized bytes are not needed past this point.
                 rows.push((
                     crate::utxoio::outpoint_key(&outpoint),
-                    serialized,
+                    dcroxide_chainhash::hash_h(&serialized),
+                    serialized.len() as i64,
                     entry.amount(),
                     key.0,
                 ));
             }
             rows.sort_by(|a, b| a.0.cmp(&b.0));
+            leaves.reserve(rows.len());
+            for (_, leaf, size, amount, tx_hash) in rows {
+                streamed.utxos += 1;
+                streamed.size += size;
+                streamed.total += amount;
+                transactions.insert(tx_hash);
+                leaves.push(leaf);
+            }
         }
 
-        let mut stats = UtxoStats {
-            utxos: 0,
-            transactions: 0,
-            size: 0,
-            total: 0,
-            serialized_hash: Hash::ZERO,
-        };
-        let mut transactions: BTreeSet<[u8; 32]> = BTreeSet::new();
-        let mut leaves: Vec<Hash> = Vec::with_capacity(rows.len());
-        for (_, serialized, amount, tx_hash) in rows {
-            stats.utxos += 1;
-            stats.size += serialized.len() as i64;
-            transactions.insert(tx_hash);
-            leaves.push(dcroxide_chainhash::hash_h(&serialized));
-            stats.total += amount;
-        }
+        let mut stats = streamed;
         stats.serialized_hash = dcroxide_standalone::calc_merkle_root_in_place(&mut leaves);
         stats.transactions = transactions.len() as i64;
         Ok(stats)

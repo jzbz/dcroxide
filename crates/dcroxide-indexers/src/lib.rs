@@ -23,8 +23,8 @@ mod txindex;
 pub use common::{ChainQueryer, Indexer, Interrupt, SyncWaiter};
 pub use error::{ErrorKind, IdxError, IndexerError};
 pub use existsaddrindex::{
-    ADDR_KEY_SIZE, EXISTS_ADDR_INDEX_KEY, EXISTS_ADDRESS_INDEX_NAME, ExistsAddrIndex, addr_to_key,
-    drop_exists_addr_index,
+    ADDR_KEY_SIZE, EXISTS_ADDR_INDEX_KEY, EXISTS_ADDRESS_INDEX_NAME, ExistsAddrIndex,
+    ExistsAddrQuery, addr_to_key, drop_exists_addr_index,
 };
 pub use legacydrops::{ADDR_INDEX_KEY, CF_INDEX_PARENT_BUCKET_KEY, drop_addr_index, drop_cf_index};
 pub use subscriber::{

@@ -151,15 +151,38 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   82.4% of wall time (two runs) inside progress stalls over 20 s, while dcrd
   stalled 0 times in 754 windows. The node is flush-bound under fast ingest,
   and that — not validation — is why initial block download takes about 2.2x
-  as long as dcrd's. How much of the space cost is inherent to redb is not
-  settled: the leading hypothesis for the free pages is that
-  `Database::begin` holds a redb read transaction for the life of every ffldb
-  transaction, read-only ones included (`lib.rs:386`), and redb will not
-  reclaim a freed page past the oldest live read. ADR-0004's 2026-07-26
-  amendment carries the full measurement record: both data directories
-  side by side, the four-way throughput matrix, the per-bucket payload
-  breakdown, the compaction and rebuild results, and the redb 2.6.3
-  mechanisms that bound the fill.
+  as long as dcrd's. The free pages are copy-on-write churn and nothing
+  more: an earlier note here suspected that `Database::begin` taking a redb
+  read transaction for the life of every ffldb transaction (`lib.rs:386`)
+  pinned them, since redb will not reclaim a freed page past the oldest live
+  read. Measured, that shape costs nothing — a reader opened before a write
+  and still live at its commit produces a byte-identical file to no reader at
+  all, because the next commit's reader is younger. A control run with no
+  reader in the process reached a larger free fraction than the real file
+  does. Only a reader spanning *many* commits hurts, and none exists: no type
+  in the workspace stores a `Transaction`, so every read transaction's
+  lifetime is bounded by one call frame. ADR-0004's 2026-07-26 amendment
+  carries the full measurement record: both data directories side by side,
+  the four-way throughput matrix, the per-bucket payload breakdown, the
+  compaction and rebuild results, and the redb 2.6.3 mechanisms that bound
+  the fill.
+- **The exists-address index answers queries off its mutex.** dcrd's
+  `ExistsAddress`/`ExistsAddresses` take no index-wide lock: they open a
+  database view directly and take `unconfirmedLock` only for the mempool
+  overlay (`internal/blockchain/indexers/existsaddrindex.go` 301-364). The
+  port shares one `ExistsAddrIndex` behind a mutex because the daemon hands
+  it to several threads, so reproducing dcrd's structure naively put every
+  lookup in the index writer's way — and since the writer claims the
+  database's writer semaphore before it waits on that mutex, and every
+  commit in the daemon queues behind that semaphore, one caller-sized
+  `existsaddresses` (limited-credential, up to the 8 MiB body cap) stalled
+  block connection for its whole duration. The overlay now sits behind its
+  own `RwLock` and lookups run through an `ExistsAddrQuery` handle taken
+  under the guard and used after releasing it, which is dcrd's locking
+  shape reached through different machinery. The subscriber also takes the
+  index guard before opening its write transaction rather than after, so
+  nothing waits on another lock while holding the writer semaphore. Pinned
+  by `dcroxide-node/tests/b6_indexlock.rs`.
 - **The websocket notification pipeline is unbounded, as dcrd's is.** Two
   accumulators sit between a chain event and a client's socket: the manager's
   `std::sync::mpsc::channel()` (`websocket.rs` 146) and the per-client

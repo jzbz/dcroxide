@@ -263,6 +263,27 @@ impl NodeRpcExistsAddresser {
     ) -> NodeRpcExistsAddresser {
         NodeRpcExistsAddresser { index, queryer }
     }
+
+    /// Take a lookup handle and release the index mutex immediately.
+    ///
+    /// The address lookups below are caller-sized — `existsaddresses`
+    /// accepts as many addresses as fit the request body — and the index
+    /// writer takes the database's writer semaphore *before* it waits on
+    /// this mutex (`dcroxide_indexers::subscriber`).  Holding the mutex
+    /// across the database reads therefore parks the writer while it owns
+    /// the semaphore every other database commit in the daemon queues
+    /// behind, so a single large request stalls block connection for its
+    /// whole duration.  dcrd has no equivalent stall: its
+    /// `ExistsAddresses` takes no index-wide lock at all
+    /// (`existsaddrindex.go` 331-364).
+    ///
+    /// Pinned by `tests/b6_indexlock.rs`.
+    fn query(&self) -> dcroxide_indexers::ExistsAddrQuery {
+        self.index
+            .lock()
+            .expect("exists addr index mutex poisoned")
+            .query()
+    }
 }
 
 impl RpcExistsAddresser for NodeRpcExistsAddresser {
@@ -287,17 +308,11 @@ impl RpcExistsAddresser for NodeRpcExistsAddresser {
     }
 
     fn exists_address(&mut self, addr: &Address) -> Result<bool, String> {
-        self.index
-            .lock()
-            .expect("exists addr index mutex poisoned")
-            .exists_address(addr)
-            .map_err(|e| e.to_string())
+        self.query().exists_address(addr).map_err(|e| e.to_string())
     }
 
     fn exists_addresses(&mut self, addrs: &[Address]) -> Result<Vec<bool>, String> {
-        self.index
-            .lock()
-            .expect("exists addr index mutex poisoned")
+        self.query()
             .exists_addresses(addrs)
             .map_err(|e| e.to_string())
     }
