@@ -49,15 +49,25 @@ dcrd itself is wrong, report it to
 [dcrd](https://github.com/decred/dcrd/security/policy) instead. Also out
 of scope: resource use under a workload dcrd would also struggle with,
 and anything requiring an already-privileged local attacker (they can
-read the datadir regardless).
+read the datadir regardless). Throughput is out of scope as well: this
+port syncs roughly 2.2x slower than dcrd and spends most of an initial
+block download stalled in storage commits. Both are measured and
+self-inflicted — the cost is in the storage engine's commit shape, not
+in validation, so the node is already committing as fast as it can and
+there is nothing there for a peer to amplify.
 
 ## Known gaps
 
-The project runs its own internal security review; the current
-release-blocking findings and the hardening backlog are tracked in
-[PARITY.md](PARITY.md) under the divergence notes rather than being
-hidden. The standing gaps that matter most for anyone evaluating this
-code:
+The project runs its own internal security review. A campaign closing
+its release-blocking findings landed this cycle — bounds on the peer
+message path, authentication and admission on the RPC surface,
+owner-only permissions on the files the daemon generates for itself,
+OS-seeded CSPRNGs, and the panic policy below. Every fix, the reasoning
+behind it, and the divergences from dcrd it introduced are itemized in
+[PARITY.md](PARITY.md) under "Deliberate divergences from dcrd" and its
+"Known remaining gaps" subsection, rather than being hidden. What
+follows is the residue: the standing gaps that matter most for anyone
+evaluating this code.
 
 - **A panic aborts the process** (`panic = "abort"` on the release
   profile). Rust mutexes poison and Go's do not, so dcrd recovers per
@@ -85,10 +95,31 @@ code:
   multi-thousand-block `rescan` — holds the server lock for its duration
   and stalls notification construction for every other client, where
   dcrd's handlers hold no server-wide lock.
-- **No fuzzing or sanitizer coverage in CI** beyond the targeted
-  `cargo-fuzz` corpora committed for the wire and script codecs.
-- **The dependency set has not been audited** (no `cargo audit` /
-  `cargo deny` gate yet).
+- **Fuzzing reaches the leaf codecs and nothing else.** Eleven
+  `cargo-fuzz` targets run for 60 seconds apiece on every push to
+  `master` and every pull request, and for ten minutes apiece nightly:
+  wire framing, the `tx` and `blockheader` decoders, the script engine,
+  `chainhash` parsing, DER signature parsing, public-key parsing, the
+  Schnorr and Ed25519 suites, `uint256`, and BLAKE-256. That is six of
+  the thirty-two crates, and all six are stateless — decoders,
+  cryptographic arithmetic, and a script interpreter that is a pure
+  function of its inputs. The stateful surfaces are unfuzzed — the
+  JSON-RPC and websocket dispatch, the peer and sync state machines,
+  the mempool, the database — and those are where a reachable panic or
+  an unbounded allocation is most likely to survive review. No corpus
+  is committed (`fuzz/corpus` is ignored), so every run starts cold and
+  has to rediscover structure inside its budget. Those jobs are also
+  the only sanitized build in CI, since `cargo fuzz` defaults to
+  AddressSanitizer; neither the test suite nor a running node is run
+  under a sanitizer.
+- **Nobody has read the dependencies.** `cargo-deny` does run on every
+  push to `master` and every pull request against `deny.toml`, gating
+  the RustSec advisory database, a licence allow-list, yanked crates,
+  and unknown registries or git sources. That is an automated check
+  against a list of problems someone else already found; it is not a
+  review. Nothing in the tree has been read, and the tree includes the
+  elliptic-curve implementations, the TLS stack, and the storage engine
+  that this node's key handling and on-disk consensus state rest on.
 
 ## What this project does instead of a guarantee
 
@@ -98,3 +129,19 @@ plus replays of vectors dumped from inside dcrd's own test packages.
 That catches divergence, which is the failure mode this port is most
 exposed to. It does not catch a design flaw shared with dcrd, and it
 does not substitute for review by someone who did not write the code.
+
+It also does not catch a control that is wrong in the other direction.
+Four of the security campaign's fixes, as first written, defended
+against an attacker by breaking things for legitimate users: a getdata
+ban score that would have banned peers doing ordinary early-chain sync,
+an RPC admission ceiling that turned a thread flood into a total
+outage, a full-queue disconnect that severed honest peers on slow
+links, and a write deadline that bounded each send instead of the
+message. None of the four was caught by reading the code; each came out
+of separately re-deriving what happens to an honest peer under load,
+which is now a standing question in the review rather than an
+afterthought. In the same campaign, five comments were found asserting
+the opposite of what the code beneath them did — including one that
+justified a coarse server-wide lock as dcrd's own per-request locking,
+where dcrd takes no server-wide lock at all. Comments in this
+repository are claims, not evidence.

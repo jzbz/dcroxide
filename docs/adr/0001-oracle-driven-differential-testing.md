@@ -1,7 +1,8 @@
 # ADR-0001 — Oracle rig: Go shim over line-JSON, pinned to dcrd release-v2.1.5
 
 - **Status:** Accepted
-- **Date:** 2026-07-03
+- **Date:** 2026-07-03 (accepted), 2026-07-26 (addendum: the pin moved with
+  the parity target)
 
 ## Context
 
@@ -45,3 +46,20 @@ failure so differential coverage can never silently disappear.
   module proxy provides pinned, checksummed sources. A submodule checkout for
   source-reading/test-porting convenience can be added when Phase 1 porting
   begins in earnest.
+
+## Addendum, 2026-07-26 — re-pinned to dcrd master `452c1a6c`
+
+The parity target moved from `release-v2.1.5` to dcrd master `452c1a6c`
+(version 2.2.0-pre), and `tools/oracle/go.mod` moved with it, which is the
+rule above working rather than an exception to it. Every module dcrd replaces
+with an in-tree directory whose source differs from its published release —
+`stake`, `standalone`, `edwards`, `secp256k1`, `gcs`, `txscript`, `wire` — is
+pinned to the pseudo-version at that commit, so the oracle links the code the
+dcrd binary at `452c1a6c` links. The remaining pins (`chainhash`, `chaincfg`,
+`blake256`, `dcrutil`, `uint256`, `base58`) are byte-identical to the in-tree
+sources at that commit and stay on their release versions.
+
+Nothing about the mechanism changed: one Go binary, line-delimited JSON on
+stdin/stdout, built on demand into `target/oracle/`, with
+`DCROXIDE_REQUIRE_ORACLE=1` set in CI so a missing toolchain fails instead of
+skipping. The dcrd source tree is still not vendored as a submodule.

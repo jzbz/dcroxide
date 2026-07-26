@@ -1,7 +1,7 @@
 # ADR-0006 — D3: secp256k1 backend split
 
 - **Status:** Proposed (draft for decision D3)
-- **Date:** 2026-07-03
+- **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: the split held)
 
 ## Context
 
@@ -39,3 +39,28 @@ risk R4.
   acceptance behavior (vectors pin it).
 - Final ratification blocked on: Phase 1 differential-fuzz soak results for
   all three types.
+
+## Addendum, 2026-07-26 — the split held
+
+The three backends named above are the ones the finished port uses.
+`crates/dcroxide-dcrec/Cargo.toml` depends on `secp256k1` 0.29 (imported
+under the alias `libsecp256k1`), `k256` 0.13, and `curve25519-dalek` 4, with
+dcrd's acceptance rules implemented in front of each rather than delegated to
+them. The escape hatch was never needed: the Schnorr path still runs on
+`k256`.
+
+The coverage the ratification gate asked for is only partly in place. All
+three verify paths are compared against dcrd live: `oracle_differential.rs`,
+`schnorr_differential.rs` and `edwards_differential.rs` under
+`crates/dcroxide-dcrec/tests/` drive the oracle's `ecdsa_*`, `schnorr_*` and
+`ed25519_*` commands over randomized keys, hashes, tampered scalars and
+malformed encodings, comparing verdicts, produced signatures and — where dcrd
+exposes them rather than returning a plain error — error kinds.
+The four fuzz targets under `fuzz/fuzz_targets/` — `dcrec_parse_der`,
+`dcrec_pubkey_parse`, `dcrec_schnorr`, `dcrec_ed25519` — are property fuzzers,
+not differential ones: they call no oracle and assert only that parsing and
+signing never panic and that signatures round-trip. So the differential
+coverage is a fixed-iteration test battery and the fuzzing is single-sided;
+the extended differential-*fuzz* soak the gate names has not been run (CI
+gives each target 60 s, the nightly job 10 minutes). Ratifying D3 remains the
+project owner's call.

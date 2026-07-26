@@ -1,9 +1,13 @@
 # Quirks ledger
 
-dcrd's behavior at the pinned tag (`release-v2.1.5`) is the specification —
-including where it deviates from written documentation (DCPs, `docs/`). Every
-intentional reproduction of such a deviation is recorded here, with a test
-pinning it so it cannot silently regress.
+dcrd's behavior at the pinned upstream (master `452c1a6c`, version `2.2.0-pre`)
+is the specification — including where it deviates from written documentation
+(DCPs, `docs/`). Every intentional reproduction of such a deviation is recorded
+here, with a test pinning it so it cannot silently regress; where that test has
+since been lost the entry says so. The parity target moved from the
+`release-v2.1.5` tag to master during the dcrd 2.2 campaign, and QK-0001 through
+QK-0008 were written against the tag; where upstream has changed in that window
+the entry keeps its number and records the change rather than being deleted.
 
 Entry format:
 
@@ -14,6 +18,8 @@ Entry format:
 - **What:** the behavior, and what the docs/spec say instead
 - **Why reproduced:** consensus / wire / RPC compatibility rationale
 - **Pinned by:** test name(s)
+- **Status:** present only when the entry no longer describes current
+  parity, or when nothing pins it any more
 ```
 
 ## QK-0001 — `reject` messages are write-only
@@ -35,18 +41,26 @@ Entry format:
 
 - **Where:** dcrd `mixing/mixpool` `acceptKE` / dcroxide-mixing
   `mixpool.rs` `accept_ke`
-- **What:** `acceptKE` intends to derive a new session's expiry as the
-  minimum expiry of its referenced pair requests, but the slice it
-  iterates is never appended to, so every session is created with
-  `^uint32(0)`. Sessions therefore never expire directly through
-  `ExpireMessages`; they only die when their pair requests expire and
-  `removePR` tears the session down.
+- **What:** at `release-v2.1.5`, `acceptKE` intends to derive a new
+  session's expiry as the minimum expiry of its referenced pair
+  requests, but the slice it iterates is never appended to, so every
+  session is created with `^uint32(0)`. Sessions therefore never expire
+  directly through `ExpireMessages`; they only die when their pair
+  requests expire and `removePR` tears the session down.
 - **Why reproduced:** relay/expiry behavior must match dcrd's on
   identical message streams (DoS parity), and the session lifetime is
   observable through message retention.
 - **Pinned by:** `mixpool_vectors` (the `expire 109`/`expire 110` rows
   show sessions surviving heights below their PR expiries with
   `expiry=4294967295` in the state snapshots)
+- **Status:** no longer a reproduction — an outstanding divergence.
+  dcrd fixed this in `d11ae7af` ("mixpool: Properly calculate session
+  expiry"), which is not in `release-v2.1.5` but is in the current
+  parity target: `acceptKE` now folds `pr.Expires()` into the running
+  minimum inside the loop over `ke.SeenPRs`. `accept_ke` still creates
+  every session with `u32::MAX`, so the port keeps sessions alive past
+  the point master retires them, and the pinned vectors pin the
+  pre-fix behavior. Tracked; not yet ported.
 
 ## QK-0003 — mixpool `Receive` capacity misuse wedges dcrd's pool
 
@@ -100,8 +114,8 @@ Entry format:
 
 ## QK-0006 — dcrd's ban score decay is platform-dependent
 
-- **Where:** dcrd `connmgr` `decayFactor` (via Go `math.Exp`) /
-  dcroxide-connmgr `banscore.rs` and `goexp.rs`
+- **Where:** dcrd `internal/connmgr` `decayFactor` (via Go `math.Exp`,
+  `dynamicbanscore.go`) / dcroxide-connmgr `banscore.rs` and `goexp.rs`
 - **What:** Go dispatches `math.Exp` to assembly on several
   architectures (amd64, arm64, loong64, s390x), and the assembly
   results differ from the portable Go implementation by one ulp on
@@ -110,16 +124,23 @@ Entry format:
   one-ulp difference can change the integer score near boundaries —
   dcrd on amd64 and dcrd built for a portable target can disagree
   with each other. There is therefore no single bit-exact truth; the
-  port follows the portable Go source, which is the specification at
-  the tag.
+  port follows the portable Go source, which is taken as the
+  specification here.
 - **Why reproduced:** ban thresholds decide peer disconnects and
   bans; the port must have a defined, defensible behavior even
   though dcrd's own is platform-dependent.
-- **Pinned by:** `connmgr_vectors` (the `decay` rows pin the whole
-  1801-value domain against the portable algorithm bit for bit, and
-  the `banscore` rows replay dcrd's own methods on ages where the
-  platform assembly agrees with the portable code, verified at dump
-  time)
+- **Pinned by:** nothing, currently.
+- **Status:** unpinned. The `connmgr_vectors` test that carried this —
+  1801 `decay` rows covering the whole domain bit for bit, plus 21
+  `banscore` rows replaying dcrd's own methods on ages where the
+  platform assembly agrees with the portable code — was deleted with
+  the rest of that file in `5720482`, the rewrite of the crate onto
+  dcrd 2.2's `internal/connmgr`. Its replacement,
+  `connmgr_v2_vectors`, covers the connection manager and does not
+  reach the ban score; `decay_factor_bits` is still exported from
+  `dcroxide-connmgr` for the vectors that no longer call it. The
+  behavior described above is unchanged in the code and unchanged in
+  dcrd at the current target. The rows need regenerating.
 
 ## QK-0007 — the Ed25519 certificate generator fails on non-ASCII hostnames
 
@@ -157,3 +178,40 @@ Entry format:
 - **Pinned by:** `peer_vectors` (the `neg in-ua-overlong` row pins a
   version message carrying only the default agent for a
   configuration with a 300-byte comment)
+
+## QK-0009 — getdata batches of 505 items or fewer cost nothing
+
+- **Where:** dcrd `server.go` `OnGetData` / dcroxide-node `server.rs`
+  `getdata_ban_score_increase`
+- **What:** the ban score a `getdata` costs its sender is
+  `numNewReqs*99/wire.MaxInvPerMsg` in Go integer division, and
+  `MaxInvPerMsg` is 50,000. The quotient truncates to zero for every
+  batch of 505 items or fewer, so a peer can request 505 items per
+  message without limit and never accrue a point; only the size of
+  each individual request is ever charged, never the total across
+  requests. dcrd's comment on the expression says only that "sustained
+  bursts of small requests are not penalized as that would potentially
+  ban peers performing the inintial chain sync" — 505 items per
+  message, sustained, is not what that describes.
+- **Why reproduced:** the score decides disconnects and bans, so it
+  must match dcrd's under identical request streams. It is also load
+  bearing in the honest direction: at 99 points per full inventory
+  message the rate is 0.00198 points per item, and against the 60 s
+  half-life and the threshold of 100 the equilibrium sits at ~583
+  items per second sustained. Both daemons request blocks in batches
+  of `maxInFlightBlocks` (16), which truncates to zero, so dcrd
+  charges an honestly syncing peer nothing at all. An earlier revision
+  of this port carried the truncated remainder into the next request
+  so that repeated 505-item batches were no longer free; that change
+  charges an ordinary peer the full per-item rate, and at ~1 KiB
+  early-chain blocks 583 blocks/s is ~0.6 MB/s of upload — a peer
+  bootstrapping from the node over an unremarkable link would be banned
+  partway through the small-block window. It was reverted. What bounds
+  this path instead is `MAX_CONCURRENT_GETDATA_REQS`,
+  `MAX_PENDING_GETDATA_ITEM_REQS` and `MAX_PENDING_SEND`.
+- **Pinned by:** `the_getdata_ban_score_matches_dcrds_truncating_rate`
+  in `crates/dcroxide-node/tests/srvgetdata_vectors.rs` (evaluates
+  dcrd's expression the way Go does across the domain, pins the 505/506
+  boundary at 0 and 1, and drives ten thousand consecutive 16-item
+  `getdata` requests through `on_get_data` without the peer ever
+  reaching the ban threshold)

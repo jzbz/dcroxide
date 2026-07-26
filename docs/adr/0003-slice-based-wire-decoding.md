@@ -1,7 +1,8 @@
 # ADR-0003 — Slice-based wire decoding with consumed-length semantics
 
 - **Status:** Accepted
-- **Date:** 2026-07-03
+- **Date:** 2026-07-03 (accepted), 2026-07-26 (addendum: the framing bound
+  came out tighter than predicted)
 
 ## Context
 
@@ -43,3 +44,22 @@ consumers; encoding appends to `Vec<u8>` and is infallible.
 - Differential tests compare decoded/re-encoded bytes and hashes rather than
   in-memory structure, so this model difference is continuously verified as
   behavior-neutral.
+
+## Addendum, 2026-07-26 — framing bounds by message type, not by the global cap
+
+The first consequence above predicted framing bounded by `MaxMessagePayload`
+(32 MiB). The shipped reader is tighter. `wire::read_message_header`
+(`crates/dcroxide-wire/src/message.rs` 394) applies dcrd's checks in dcrd's
+order — global cap, network magic, command form, known command, per-type
+payload maximum — and `read_message` allocates the payload only after all of
+them pass, so a peer cannot name 32 MiB in a 24-byte header for a message
+type whose own maximum is smaller.
+
+That order is not cosmetic: the port did bound the allocation by the global
+cap alone for a while, and `read_message` now delegates to
+`read_message_header` so the sequence stays single-sourced. `PARITY.md`'s
+divergence table records the correction.
+
+The rest of the model held as written. `from_bytes` still returns
+`(value, consumed)`, `WireError::UnexpectedEof` still collapses Go's two EOF
+errors, and `dcroxide-wire` is still `no_std` outside of tests.

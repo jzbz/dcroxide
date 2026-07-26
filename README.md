@@ -17,15 +17,28 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 590+ tests across 222 suites, most differential against dcrd
+runs 711 tests across 232 suites, most differential against dcrd
 itself or replaying sessions generated inside dcrd's own packages.
 
+Since the surface completed, three rounds of work have landed on it. A
+performance campaign: ffldb's metadata write cache, block scripts
+validated on dcrd's worker pool, a ported `SigCache`, one transaction
+hash per block, batched UTXO reads, and a layered dbCache overlay. A
+security campaign closing the blockers an audit found in the RPC and
+peer surfaces: authentication and admission control, bounded peer
+message paths with stall deadlines and queue limits, OS-seeded
+CSPRNGs, secret-file handling, and `panic = "abort"` in release
+builds. And the rename onto dcroxide's own identity — data directory
+`~/.dcroxide`, configuration file `dcroxide.conf`, `DCROXIDE_*`
+environment variables.
+
 It has synced testnet and mainnet to the tip from genesis with full
-consensus validation. That says the consensus rules agree with dcrd's
-across the whole chain; it does not say the node is safe to operate.
-**Do not expose it to the internet and do not use it with funds** —
-see [SECURITY.md](SECURITY.md) for what is known to be missing and how
-to report a vulnerability. Currently implemented:
+consensus validation, and syncs against dcrd in both directions (see
+[Performance](#performance)). That says the consensus rules agree with
+dcrd's across the whole chain; it does not say the node is safe to
+operate. **Do not expose it to the internet and do not use it with
+funds** — see [SECURITY.md](SECURITY.md) for what is known to be
+missing and how to report a vulnerability. Currently implemented:
 
 - `dcroxide-crypto` — BLAKE-256 (vendored from
   [dcr-rs](https://github.com/jzbz/dcr-rs), KAT-pinned, differential-tested
@@ -33,8 +46,9 @@ to report a vulnerability. Currently implemented:
 - `dcroxide-chainhash` — the 32-byte hash type with dcrd's byte-reversed
   string encoding, including its short-string parsing quirk
 - `dcroxide-wire` — message framing with dcrd's exact validation order and
-  error identities, plus **all 40 P2P message types** at protocol version 11,
-  including the eight StakeShuffle mixing messages; `MsgTx`, blocks, headers,
+  error identities, plus **all 41 P2P message types** at protocol version 12,
+  including `addrv2` with its typed `NetAddressV2` (IPv4/IPv6/TorV3) and the
+  eight StakeShuffle mixing messages; `MsgTx`, blocks, headers,
   filters, state, and mixing messages all under differential test, fuzzing,
   and round-trip property tests — including the first `QUIRKS.md` entry
   (write-only `reject`)
@@ -73,8 +87,9 @@ to report a vulnerability. Currently implemented:
   extraction, the `Hash256PRNG` ticket lottery, vote/revocation reward
   math (including auto-revocation remainder distribution), and revocation
   construction; dcrd's own test vectors replay oracle-free and the whole
-  surface is differentially matched against dcrd (the ticket-database
-  state machinery follows in the blockchain phase)
+  surface is differentially matched against dcrd; the ticket-database
+  state machinery also lives here and is described under
+  `dcroxide-blockchain`, which drives it
 - `dcroxide-standalone` — dcrd's `blockchain/standalone` consensus
   functions: merkle roots and inclusion proofs, compact-difficulty
   conversions and proof-of-work checks (including the BLAKE3 `PowHashV2`
@@ -88,16 +103,70 @@ to report a vulnerability. Currently implemented:
   `database` interface semantics (buckets, transactions, block storage
   APIs, all error kinds), backed by redb per ADR-0004 with dcrd's exact
   ffldb key layout and flat-file block record format, plus bulk block
-  import/export in dcrd's `addblock` bootstrap format; pinned by the
-  ported ffldb interface-test battery and a crash-consistency rig
-  (fresh-sync stance: no in-place dcrd datadir reuse)
-- `dcroxide-blockchain` — the beginnings of the chain engine: dcrd's
-  UTXO serialization layer (VLQs, the domain-specific script and amount
-  compression, UTXO entries, outpoint keys, and the set state) and the
-  legacy work/stake difficulty algorithms, the stake-version voting
-  machinery, the agenda threshold state machine, the agenda-driven algorithm selectors, the chain persistence formats, the context-free transaction validation and block sanity layers, the DCP0003 sequence lock calculation, the positional and contextual header validation layers, the full transaction input validation (tickets, votes, revocations, and treasury spends through the fee-computing CheckTransactionInputs), the block sigop and stake amount accounting, and the in-memory block index and chain view (skip-list ancestors, chain tips, best-chain candidates, invalidation propagation, and block locators), plus the immutable ticket treap, the ticket database serialization formats, and the full ticket pool state machine (connect/disconnect with lottery winners and undo data) in dcroxide-stake — now wired into validation through the completed header stake commitments, the ticket redeemer checks, and the full contextual block assembly (checkBlockContext) and the utxo viewpoint with block connect/disconnect and spend journaling, the fee-accounting checkTransactionsAndConnect loop, the full checkConnectBlock battery (treasury payouts, both tree connects, sequence locks, the header commitment filter, and block script execution), the headers-first processing layer (maybeAcceptBlockHeader over the real block index with assumed-valid tracking and old fork rejection), the stake node attachment layer (fetchStakeNode with the pruned-node regeneration walk and side chain replay), the reorganization engine (connectBlock/disconnectBlock with best state snapshots and reorganizeChain over dcrd-exact utxo cache semantics), the complete ProcessBlock intake path (duplicate/orphan/invalid handling, headers-first data linking, and best chain selection), the manual chain manipulation surface (InvalidateBlock/ReconsiderBlock/ForceHeadReorganization), the ticket database persistence layer over redb (byte-identical bucket rows against dcrd's ffldb), durable chain state (createChainState/initChainState with restart round trips over the reorganization ground truth), mining support (CheckConnectBlockTemplate, ticket exhaustion checks, and the chain query surface), the treasury account with the complete treasury spend checks (balances, vote tallies, and expenditure policies), and the RPC/netsync query surface (threshold state queries, vote counting, stake version walks, block locators, and the stake difficulty estimators), completing the internal/blockchain port — pinned by dcrd's own test vectors, by synthetic-chain
-  scenarios generated inside dcrd's internal package, and end to end by
-  dcrd's own full block test battery (`fullblocktests`): 573 instances of
+  import/export in dcrd's `addblock` bootstrap format, plus ffldb's
+  metadata write cache — layered snapshots over one durable flush per
+  window — so a sync commits on dcrd's schedule rather than per block;
+  pinned by the ported ffldb interface-test battery and a
+  crash-consistency rig (fresh-sync stance: no in-place dcrd datadir
+  reuse)
+- `dcroxide-blockchain` — the chain engine from dcrd's
+  `internal/blockchain`, ported complete.
+
+  The serialization and consensus-math foundations: dcrd's UTXO
+  serialization layer (VLQs, the domain-specific script and amount
+  compression, UTXO entries, outpoint keys, and the set state), the
+  legacy work and stake difficulty algorithms, the stake-version voting
+  machinery, the agenda threshold state machine, the agenda-driven
+  algorithm selectors, and the chain persistence formats.
+
+  The validation layers: context-free transaction validation and block
+  sanity, the DCP0003 sequence lock calculation, positional and
+  contextual header validation, the full transaction input validation
+  (tickets, votes, revocations, and treasury spends through the
+  fee-computing `CheckTransactionInputs`), and the block sigop and
+  stake amount accounting.
+
+  The chain state: the in-memory block index and chain view (skip-list
+  ancestors, chain tips, best-chain candidates, invalidation
+  propagation, and block locators), plus the immutable ticket treap,
+  the ticket database serialization formats, and the full ticket pool
+  state machine (connect/disconnect with lottery winners and undo data)
+  in `dcroxide-stake` — wired into validation through the header stake
+  commitments, the ticket redeemer checks, and the full contextual
+  block assembly (`checkBlockContext`).
+
+  Block connection: the utxo viewpoint with block connect/disconnect
+  and spend journaling, the fee-accounting
+  `checkTransactionsAndConnect` loop, and the full `checkConnectBlock`
+  battery (treasury payouts, both tree connects, sequence locks, the
+  header commitment filter, and block script execution).
+
+  Block intake: the headers-first processing layer
+  (`maybeAcceptBlockHeader` over the real block index with
+  assumed-valid tracking and old fork rejection), the stake node
+  attachment layer (`fetchStakeNode` with the pruned-node regeneration
+  walk and side chain replay), the reorganization engine
+  (`connectBlock`/`disconnectBlock` with best state snapshots and
+  `reorganizeChain` over dcrd-exact utxo cache semantics), the complete
+  `ProcessBlock` intake path (duplicate/orphan/invalid handling,
+  headers-first data linking, and best chain selection), and the manual
+  chain manipulation surface
+  (`InvalidateBlock`/`ReconsiderBlock`/`ForceHeadReorganization`).
+
+  Persistence and the consumer surface: the ticket database persistence
+  layer over redb (byte-identical bucket rows against dcrd's ffldb),
+  durable chain state (`createChainState`/`initChainState` with restart
+  round trips over the reorganization ground truth), mining support
+  (`CheckConnectBlockTemplate`, ticket exhaustion checks, and the chain
+  query surface), the treasury account with the complete treasury spend
+  checks (balances, vote tallies, and expenditure policies), and the
+  RPC/netsync query surface (threshold state queries, vote counting,
+  stake version walks, block locators, and the stake difficulty
+  estimators).
+
+  Pinned by dcrd's own test vectors, by synthetic-chain scenarios
+  generated inside dcrd's internal package, and end to end by dcrd's
+  own full block test battery (`fullblocktests`): 573 instances of
   fully signed blocks and invalid variants replayed through the real
   `ProcessBlock` with scripts on, matching every acceptance, rejection
   kind, and expected tip
@@ -144,9 +213,12 @@ to report a vulnerability. Currently implemented:
   `addrmgr`: address keys and network groups with dcrd's exact
   formatting, RFC-range routability and reachability, the new/tried
   bucket machinery over BLAKE-256 derivations with viability
-  tracking, and dcrd-compatible `peers.json` persistence, pinned by
-  grids and state transitions scripted inside dcrd's own package
-  with the randomized paths covered under an injected RNG
+  tracking, dcrd-compatible `peers.json` persistence, and the HTTPS
+  seeder and Tor SOCKS DNS resolution dcrd 2.2 moved into this
+  package, pinned by grids and state transitions scripted inside
+  dcrd's own package with the randomized paths covered under an
+  injected RNG, plus scripted proxy exchanges and seeder parse
+  batteries
 - `dcroxide-dcrjson` — the JSON-RPC command infrastructure from
   dcrd's `dcrjson/v4` module: Go's reflection-driven registry,
   marshalling, parameter parsing, usage, and help generation made
@@ -223,13 +295,28 @@ to report a vulnerability. Currently implemented:
   shape: Ed25519 pairs pin byte for byte and ECDSA pairs pin their
   to-be-signed bytes and keys, from a scripted session mirroring
   dcrd's template construction
-- `dcroxide-connmgr` — connection management from dcrd's `connmgr`:
-  the dynamic ban score over a bit-exact port of Go's portable
-  `math.Exp`, the connection manager as a synchronous state machine
-  with injectable dialers and event-driven retries, Tor SOCKS DNS
-  resolution, and HTTPS seeding, pinned by the full decay domain,
-  scripted proxy exchanges, and parse batteries generated inside
-  dcrd's own package
+- `dcroxide-ratelimit` — dcrd 2.2's `internal/ratelimit` token bucket:
+  a bucket seeded with `burst` tokens refilling at a fixed rate,
+  reproducing dcrd's `f64` operations in dcrd's order — including
+  `time.Duration.Seconds()`'s whole-second/nanosecond split — so the
+  token counts drift bit for bit with dcrd's, with Go's zero
+  `time.Time` refill saturation carried by an explicit sentinel and
+  Go's platform-defined `uint64(float64)` conversion pinned to the
+  oracle platform; pinned by differential vectors including the cases
+  where accumulated rounding error denies an event the documented
+  average rate would allow
+- `dcroxide-connmgr` — connection management from dcrd 2.2's
+  `internal/connmgr`: the dynamic ban score over a bit-exact port of
+  Go's portable `math.Exp`, and the rewritten connection manager as a
+  synchronous state machine with injectable dialers and event-driven
+  retries — inbound anti-flood admission over per-network-group token
+  buckets with the S-curve drop probability, outbound group spreading,
+  per-host permits, and the persistent retry policy with dcrd's
+  backoff scaling (including the upstream shift overflow, which the
+  wrapping port reproduces); pinned by the full decay domain and by a
+  state-machine dump driving dcrd's real `ConnManager` under a stub
+  dialer and a scripted CSPRNG. dcrd 2.2 relocated HTTPS seeding and
+  Tor DNS resolution into `addrmgr`, and the port follows
 - `dcroxide-mixing` — the StakeShuffle mixing support from dcrd's
   `mixing` package: message identity hashes and Schnorr signatures,
   session ID derivation and validation, the DC-net finite field and
@@ -243,30 +330,90 @@ to report a vulnerability. Currently implemented:
   dcrd's status transitions, and the `--service`
   install/remove/start/stop commands (the option registered only on
   Windows, exactly like dcrd)
+- `dcroxide-testutil` — the differential-test harness every crate
+  shares (no dcrd counterpart): the line-delimited JSON transport to
+  `tools/oracle`, the toolchain gate (a missing Go toolchain skips the
+  test, or fails it when `DCROXIDE_REQUIRE_ORACLE` is set), a
+  deterministic SplitMix64 PRNG that prints its seed so a failure
+  reproduces, and hex helpers; a dev-dependency only, never published
+- `dcroxide-bench` — the block replay harness (no dcrd counterpart):
+  `export` writes the main chain of a stopped data directory to a
+  bootstrap-format corpus, and `replay` drives that corpus back
+  through the live chain engine with full validation — a network sync
+  without the network — reporting throughput at a fixed block
+  interval, so an optimization is measured on the same blocks before
+  and after
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
   master `452c1a6c` module versions) as a test oracle over line-delimited JSON
 - `tools/helpgen` — the go-flags help-vector generator over dcrd's
   verbatim config struct
 
+## Performance
+
+Mainnet sync from genesis to the tip (~1,100,400 blocks) over
+loopback, one machine, a fresh data directory per run, both nodes
+`--norpc`: dcroxide 2.2.0-pre against dcrd 2.2.0-pre+452c1a6c3
+(go1.26.5), in all four combinations.
+
+| syncer / source | from dcroxide | from dcrd |
+|---|---|---|
+| dcroxide | 2.47 h — 124 blk/s | 2.51 h — 122 blk/s |
+| dcrd | 1.11 h — 276 blk/s | 1.02 h — 299 blk/s |
+
+The syncer decides the time and the source barely matters: swapping
+the source moves the result 1.6-8.8%, swapping the syncer moves it
+2.2x. **dcroxide is about 2.2x slower than dcrd at initial block
+download.** Interop holds in both directions — dcrd accepts
+`/dcrwire:1.0.0/dcroxide:2.2.0/` and dcroxide accepts
+`/dcrwire:1.0.0/dcrd:2.2.0(pre)/`, each reaching a matching tip.
+
+The cause is the storage engine's commit shape, not validation. Across
+its two runs dcroxide spent 80.1% and 82.4% of wall time in progress
+stalls over 20 seconds; dcrd stalled zero times in 754 windows.
+goleveldb's LSM commit is O(dirty) with background compaction, while
+redb is a copy-on-write B-tree with no background work, so commit cost
+tracks the size of the tree.
+
+At the tip the chain costs 24 GB on disk under dcrd and 33 GB under
+dcroxide. Block bytes are consensus data and the same on both sides,
+so the difference is metadata: dcroxide's 33 GB is 18 GB of flat
+`.fdb` block files plus a 14.48 GiB `metadata.redb` holding 5.65 GiB
+of stored payload across 76,302,003 rows — 43.8% page fill, and a full
+sorted rebuild reaches only 53.0%, redb's best case for this data.
+Both the flush-bound ingest and the page fill are open and tracked,
+not fixed. The full measurement record — the storage breakdown, the
+compaction and rebuild results, and why redb cannot pack tighter — is
+in [ADR-0004](docs/adr/0004-storage-backend.md); PARITY.md records the
+divergence from dcrd's two-database layout.
+
 ## Layout
 
-- `crates/` — the Cargo workspace (one crate per dcrd package, see PARITY.md)
+- `crates/` — the Cargo workspace: one crate per dcrd package (see
+  PARITY.md), plus the shared test harness and the replay bench
 - `tools/oracle/` — the dcrd differential-test oracle (Go)
+- `tools/helpgen/` — the go-flags help-vector generator (Go)
 - `fuzz/` — `cargo-fuzz` targets (nightly toolchain)
 - `docs/adr/` — architecture decision records
 
 ## Development
 
 Rust ≥ 1.88 (MSRV) and a Go toolchain (for the oracle-backed differential
-tests; without Go those tests skip).
+tests; without Go those tests skip). `DCROXIDE_REQUIRE_ORACLE=1` turns a
+missing toolchain into a failure instead, so a run cannot silently pass
+with the differential coverage skipped — CI sets it.
 
 ```sh
 cargo test --workspace          # unit + KAT + differential tests
+DCROXIDE_REQUIRE_ORACLE=1 cargo test --workspace   # oracle mandatory
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo +nightly fuzz list                       # requires cargo-fuzz
 cargo +nightly fuzz run wire_msgtx_decode
+cargo build --profile dist      # release artifacts
 ```
+
+`dist` inherits `release` and strips debug info. `release` itself sets
+`panic = "abort"`; dev and test builds keep unwinding.
 
 The workspace forbids `unsafe_code` and denies `missing_docs`
 everywhere (the one exception: `dcroxide-winsvc` denies rather than
