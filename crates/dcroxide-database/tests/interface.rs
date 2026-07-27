@@ -557,3 +557,103 @@ fn a_closed_transaction_releases_its_read_snapshot() {
     );
     drop(closed_but_held);
 }
+
+/// The configured cache size must actually reach redb.
+///
+/// redb splits `set_cache_size` 90/10 into a read cache and a write
+/// buffer (redb-2.6.3 `db.rs:1185-1188`). When a commit's dirty set
+/// exceeds the write buffer, redb spills those pages to the file,
+/// re-reads them to finalize checksums, and writes the buffer again — so
+/// a too-small buffer roughly doubles the bytes written per commit.
+///
+/// That amplification is the observable this asserts. An `Options` field
+/// that is never handed to `redb::Builder` would leave both runs on
+/// redb's default and the two byte counts would match, which is the
+/// ported-but-unwired failure this guards.
+///
+/// Real negative: drop `set_cache_size` from `redb_builder`, or restore
+/// either open path to a bare `redb::Database::create`/`open`, and the
+/// ratio collapses to ~1.0 and the assertion fails.
+///
+/// Linux only — it reads `/proc/self/io`. Elsewhere it skips, so the
+/// wiring is unguarded on macOS and Windows CI.
+#[test]
+fn the_configured_cache_size_reaches_redb() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        eprintln!("skipped: /proc/self/io is Linux-only");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        /// Bytes this process has passed to write syscalls.
+        ///
+        /// `wchar`, not `write_bytes`: the latter counts what reached the
+        /// block layer, which the page cache absorbs, so it reads zero
+        /// for a workload this size. The amplification being measured is
+        /// at the syscall boundary, which is what `wchar` records.
+        fn written() -> u64 {
+            let io = std::fs::read_to_string("/proc/self/io").expect("/proc/self/io");
+            for line in io.lines() {
+                if let Some(v) = line.strip_prefix("wchar:") {
+                    return v.trim().parse().expect("wchar");
+                }
+            }
+            panic!("wchar missing from /proc/self/io");
+        }
+
+        // Enough distinct pages that the dirty set clears the small
+        // write buffer (6.4 MiB) but stays inside the large one.
+        const ROWS: usize = 12_000;
+        const VALUE: usize = 2048;
+
+        let run = |cache: usize| -> u64 {
+            let dir = TempDir::new().expect("tempdir");
+            let mut opts = Options::new(dir.path().join("db"), NET);
+            opts.db_cache_bytes = cache;
+            let db = Database::create(&opts).expect("create");
+            {
+                let tx = db.begin(true).expect("begin rw");
+                tx.metadata().create_bucket(b"cache").expect("create");
+                tx.commit().expect("commit");
+            }
+            db.flush().expect("flush the bucket");
+
+            let value = vec![0x7Eu8; VALUE];
+            let before = written();
+            {
+                let tx = db.begin(true).expect("begin rw");
+                let meta = tx.metadata();
+                let bucket = meta.bucket(b"cache").expect("bucket");
+                for i in 0..ROWS {
+                    // Scatter so the writes land on distinct pages.
+                    let mut key = [0u8; 16];
+                    let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    key[..8].copy_from_slice(&h.to_be_bytes());
+                    key[8..].copy_from_slice(&(i as u64).to_be_bytes());
+                    bucket.put(&key, &value).expect("put");
+                }
+                tx.commit().expect("commit");
+            }
+            db.flush().expect("flush the rows");
+            written().saturating_sub(before)
+        };
+
+        // 64 MiB -> a 6.4 MiB write buffer, well under the dirty set.
+        let small = run(64 * 1024 * 1024);
+        // 1 GiB -> a 102.4 MiB buffer, comfortably over it.
+        let large = run(1024 * 1024 * 1024);
+
+        assert!(
+            small > 0 && large > 0,
+            "no writes were observed (small {small}, large {large}); /proc/self/io accounting \
+             did not see this workload and the test proved nothing"
+        );
+        // Amplification is ~2x in principle; require a clear margin so
+        // filesystem noise cannot manufacture a pass.
+        assert!(
+            small * 100 > large * 125,
+            "a 64 MiB cache wrote {small} bytes and a 1 GiB cache wrote {large} — within 25%, so \
+             the cache size is not reaching redb and both runs used its default"
+        );
+    }
+}

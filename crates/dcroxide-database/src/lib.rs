@@ -134,7 +134,46 @@ pub struct Options {
     /// unless overridden (small values are useful in tests to exercise
     /// file rollover).
     pub max_block_file_size: u32,
+    /// Bytes redb may use to cache database pages.
+    ///
+    /// This has no dcrd counterpart — goleveldb's block cache is sized
+    /// by ffldb's own write cache, whereas redb caches pages of the
+    /// single metadata file. It is a ceiling filled on demand, not an
+    /// allocation: the LRU stripes start empty
+    /// (redb-2.6.3 `cached_file.rs:208-216`) and a page enters only
+    /// while the total stays under the limit (`:268`), so a small
+    /// database never pays for a large setting and the resident cost is
+    /// bounded by the file size.
+    ///
+    /// redb splits the figure 90% read cache / 10% write buffer, a
+    /// hardcoded ratio with no separate setter (`db.rs:1185-1188`), so
+    /// the write buffer a commit spills into is a tenth of this. Once a
+    /// commit's dirty set exceeds that buffer, redb writes the spilled
+    /// pages, re-reads them to finalize checksums, then writes the
+    /// buffer again — measured at redb's 1 GiB default against the
+    /// mainnet metadata store, 62,323 dirty pages cost 124,430 pwrites
+    /// and 98,221 preads, against 62,323 and 4 with the buffer large
+    /// enough to hold them.
+    pub db_cache_bytes: usize,
 }
+
+/// redb's own default cache size, which is what the port used before
+/// this became configurable.
+///
+/// Kept as the default so raising it is an operator's decision rather
+/// than a silent change in resident memory. Measured on the mainnet
+/// metadata store (14.48 GiB), applying 2,000,000 scattered writes:
+///
+/// | cache | 250k per commit | 2M per commit |
+/// |---|---|---|
+/// | 1 GiB | 78.6 s | 43.0 s |
+/// | 4 GiB | 51.4 s | 19.6 s |
+/// | 8 GiB | 48.7 s | 16.1 s |
+///
+/// Cache size and flush cadence multiply rather than add: 1.8x from
+/// batching alone, 2.7x from cache alone, 4.9x together. The cadence
+/// half is already reachable through dcrd's own `--utxocachemaxsize`.
+pub const DEFAULT_DB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
 impl Options {
     /// Options with dcrd's defaults for the given directory and
@@ -144,8 +183,17 @@ impl Options {
             path: path.into(),
             network,
             max_block_file_size: blockfile::DEFAULT_MAX_BLOCK_FILE_SIZE,
+            db_cache_bytes: DEFAULT_DB_CACHE_BYTES,
         }
     }
+}
+
+/// The redb builder both open paths use, so the cache setting cannot be
+/// applied on one and forgotten on the other.
+fn redb_builder(opts: &Options) -> redb::Builder {
+    let mut builder = redb::Builder::new();
+    builder.set_cache_size(opts.db_cache_bytes);
+    builder
 }
 
 /// A handle to an open block/metadata database (dcrd `database.DB`).
@@ -211,7 +259,7 @@ impl Database {
         create_dir_all_owner_only(&opts.path)
             .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
 
-        let kv = redb::Database::create(&meta_path).map_err(open_error)?;
+        let kv = redb_builder(opts).create(&meta_path).map_err(open_error)?;
 
         // Initialize the ffldb-layout bookkeeping rows: the bucket
         // index entry and fixed ID for the internal block index, the
@@ -280,7 +328,7 @@ impl Database {
             ));
         }
 
-        let kv = redb::Database::open(&meta_path).map_err(open_error)?;
+        let kv = redb_builder(opts).open(&meta_path).map_err(open_error)?;
         let mut block_store = BlockStore::open(&opts.path, opts.network, opts.max_block_file_size)?;
 
         // Fetch the stored write cursor position.
