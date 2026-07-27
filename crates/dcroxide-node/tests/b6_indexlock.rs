@@ -125,7 +125,7 @@ fn a_large_exists_addresses_never_holds_the_index_mutex() {
     )
     .expect("exists address index");
 
-    let mut addresser = NodeRpcExistsAddresser::new(Arc::clone(&index), Arc::clone(&queryer));
+    let addresser = NodeRpcExistsAddresser::new(Arc::clone(&index), Arc::clone(&queryer));
 
     // Calibrate: time a small lookup — which also warms the path, so the
     // measured run is not paying first-touch costs — and size the real

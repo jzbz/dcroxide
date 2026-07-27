@@ -127,7 +127,7 @@ fn the_submit_seam_accepts_a_block_and_rejects_a_duplicate() {
         Arc::clone(&tx_pool),
         dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     )));
-    let mut rpc_sync = NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool));
+    let rpc_sync = NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool));
 
     // The submitted block runs through ProcessBlock and extends the tip.
     rpc_sync
@@ -207,7 +207,7 @@ fn a_submitted_block_drains_the_chain_handler() {
         .chain_mut()
         .set_chain_ntfn_handler(handler);
 
-    let mut rpc_sync = NodeRpcSyncManager::new(Arc::clone(&sync_manager), Arc::clone(&tx_pool));
+    let rpc_sync = NodeRpcSyncManager::new(Arc::clone(&sync_manager), Arc::clone(&tx_pool));
     rpc_sync
         .submit_block(next_block)
         .expect("the battery block is accepted through the seam");
@@ -254,10 +254,10 @@ fn submitblock_over_http_accepts_then_rejects_duplicate() {
         Arc::clone(&tx_pool),
         dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     )));
-    let server = Arc::new(Mutex::new(Server::new(Config {
+    let server = Arc::new(Server::new(Config {
         chain: NodeRpcChain::new(Arc::clone(&chain), params.clone()),
         chain_params: params.clone(),
-        subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool))),
@@ -298,7 +298,7 @@ fn submitblock_over_http_accepts_then_rejects_duplicate() {
         rpc_pass: "pass".to_string(),
         rpc_limit_user: String::new(),
         rpc_limit_pass: String::new(),
-    })));
+    }));
 
     let listener = start_rpc_listener(
         &["127.0.0.1:0".to_string()],

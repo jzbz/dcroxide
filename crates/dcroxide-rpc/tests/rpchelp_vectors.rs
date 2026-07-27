@@ -29,8 +29,8 @@ fn rpchelp_vectors() {
     // Separate cachers mirror the dump: one serves the method help
     // rows and the non-websocket usage (later poisoning the websocket
     // request), the other serves the websocket usage.
-    let mut cacher = HelpCacher::new();
-    let mut cacher2 = HelpCacher::new();
+    let cacher = HelpCacher::new();
+    let cacher2 = HelpCacher::new();
 
     let mut counts: HashMap<&str, usize> = HashMap::new();
     let mut rpc_handlers = Vec::new();

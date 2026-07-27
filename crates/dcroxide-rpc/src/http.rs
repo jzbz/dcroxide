@@ -379,7 +379,7 @@ pub fn unmarshal_request(body: &str) -> Result<RawRequest, String> {
 /// including the Bitcoin Core compatibility newline (the request
 /// handling inside dcrd `jsonRPCRead`; the connection hijacking and
 /// read-limit plumbing arrive with the daemon).
-pub fn process_body<C: RpcChain>(server: &mut Server<C>, body: &str, is_admin: bool) -> Vec<u8> {
+pub fn process_body<C: RpcChain>(server: &Server<C>, body: &str, is_admin: bool) -> Vec<u8> {
     let mut results: Vec<String> = Vec::new();
     let mut batch_size = 0usize;
 

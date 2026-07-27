@@ -124,7 +124,7 @@ struct MockChain11 {
 }
 
 impl RpcChain for MockChain11 {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         RpcBestState {
             hash: self.best_hash,
             prev_hash: self.header.prev_block,
@@ -136,16 +136,16 @@ impl RpcChain for MockChain11 {
             num_txns: 7,
         }
     }
-    fn best_header(&mut self) -> (Hash, i64) {
+    fn best_header(&self) -> (Hash, i64) {
         (Hash([0u8; 32]), self.best_header_height)
     }
-    fn is_current(&mut self) -> bool {
+    fn is_current(&self) -> bool {
         self.is_current
     }
-    fn header_by_hash(&mut self, _hash: &Hash) -> Result<BlockHeader, String> {
+    fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
         self.header_by_hash.clone().map(|()| self.header)
     }
-    fn is_blake3_pow_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+    fn is_blake3_pow_agenda_active(&self, _prev_blk_hash: &Hash) -> Result<bool, String> {
         Ok(self.blake3)
     }
 }
@@ -159,34 +159,41 @@ struct MockTemplater11 {
 }
 
 impl RpcBlockTemplater for MockTemplater11 {
-    fn current_template(&mut self) -> Result<Option<MsgBlock>, String> {
+    fn current_template(&self) -> Result<Option<MsgBlock>, String> {
         self.curr.clone()
     }
-    fn subscribe(&mut self) -> Box<dyn RpcTemplateSubscription + Send> {
+    fn subscribe(&self) -> Box<dyn RpcTemplateSubscription + Send> {
         Box::new(MockSub11 {
-            queue: self.ntfns.clone().into(),
+            queue: std::sync::Mutex::new(self.ntfns.clone().into()),
         })
     }
-    fn update_block_time(&mut self, _header: &mut BlockHeader) {}
+    fn update_block_time(&self, _header: &mut BlockHeader) {}
 }
 
 struct MockSub11 {
-    queue: VecDeque<MsgBlock>,
+    // The seam takes `&self` now, as dcrd's does, so the double
+    // carries its own lock rather than borrowing mutably.
+    queue: std::sync::Mutex<VecDeque<MsgBlock>>,
 }
 
 impl RpcTemplateSubscription for MockSub11 {
-    fn recv(&mut self) -> TemplateRecv {
+    fn recv(&self) -> TemplateRecv {
         TemplateRecv::Template(Box::new(
-            self.queue.pop_front().expect("unbounded recv notification"),
+            self.queue
+                .lock()
+                .expect("queue poisoned")
+                .pop_front()
+                .expect("unbounded recv notification"),
         ))
     }
-    fn recv_with_timeout(&mut self) -> TemplateRecv {
-        match self.queue.pop_front() {
+    fn recv_with_timeout(&self) -> TemplateRecv {
+        let popped = self.queue.lock().expect("queue poisoned").pop_front();
+        match popped {
             Some(block) => TemplateRecv::Template(Box::new(block)),
             None => TemplateRecv::Timeout,
         }
     }
-    fn stop(&mut self) {}
+    fn stop(&self) {}
 }
 
 /// The scripted sync manager (block submission only).
@@ -195,7 +202,7 @@ struct MockSyncMgr11 {
 }
 
 impl RpcSyncManager for MockSyncMgr11 {
-    fn submit_block(&mut self, _block: &MsgBlock) -> Result<(), SubmitBlockFailure> {
+    fn submit_block(&self, _block: &MsgBlock) -> Result<(), SubmitBlockFailure> {
         self.submit.clone()
     }
 }
@@ -206,7 +213,7 @@ struct MockConnMgr11 {
 }
 
 impl RpcConnManager for MockConnMgr11 {
-    fn connected_count(&mut self) -> i32 {
+    fn connected_count(&self) -> i32 {
         self.count
     }
 }
@@ -216,7 +223,7 @@ struct MockMiner11 {
 }
 
 impl RpcCpuMiner for MockMiner11 {
-    fn is_mining(&mut self) -> bool {
+    fn is_mining(&self) -> bool {
         self.is_mining
     }
 }
@@ -314,7 +321,9 @@ fn getwork_handler_matches_dcrd() {
         let mut server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
+                params.clone(),
+            ))),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(MockSyncMgr11 {
@@ -398,7 +407,7 @@ fn getwork_handler_matches_dcrd() {
                 results::get_work_result()
             };
 
-            match handlers::handle_get_work(&mut server, &cmd) {
+            match handlers::handle_get_work(&server, &cmd) {
                 Ok(value) => {
                     assert_eq!(result[3], "ok", "{name}: expected an error");
                     let got = gojson::encode(&typ, &value);

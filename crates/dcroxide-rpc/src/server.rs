@@ -71,36 +71,36 @@ pub(crate) fn unwired_seam(seam: &str) -> String {
 /// slice).
 pub trait RpcChain {
     /// The current best chain snapshot (dcrd `BestSnapshot`).
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         unimplemented!("best_snapshot")
     }
     /// The hash and height of the current best known header (dcrd
     /// `BestHeader`).
-    fn best_header(&mut self) -> (Hash, i64) {
+    fn best_header(&self) -> (Hash, i64) {
         unimplemented!("best_header")
     }
     /// The block with the given hash (dcrd `BlockByHash`).
-    fn block_by_hash(&mut self, _hash: &Hash) -> Result<MsgBlock, String> {
+    fn block_by_hash(&self, _hash: &Hash) -> Result<MsgBlock, String> {
         unimplemented!("block_by_hash")
     }
     /// The main chain block at the given height (dcrd
     /// `BlockByHeight`).
-    fn block_by_height(&mut self, _height: i64) -> Result<MsgBlock, String> {
+    fn block_by_height(&self, _height: i64) -> Result<MsgBlock, String> {
         unimplemented!("block_by_height")
     }
     /// The hash of the main chain block at the given height (dcrd
     /// `BlockHashByHeight`).
-    fn block_hash_by_height(&mut self, _height: i64) -> Result<Hash, String> {
+    fn block_hash_by_height(&self, _height: i64) -> Result<Hash, String> {
         unimplemented!("block_hash_by_height")
     }
     /// The hashes of the main chain blocks in the height range
     /// `[start, end)` (dcrd `HeightRange`).
-    fn height_range(&mut self, _start: i64, _end: i64) -> Result<Vec<Hash>, String> {
+    fn height_range(&self, _start: i64, _end: i64) -> Result<Vec<Hash>, String> {
         unimplemented!("height_range")
     }
     /// The height of the main chain block with the given hash (dcrd
     /// `BlockHeightByHash`).
-    fn block_height_by_hash(&mut self, _hash: &Hash) -> Result<i64, String> {
+    fn block_height_by_hash(&self, _hash: &Hash) -> Result<i64, String> {
         unimplemented!("block_height_by_hash")
     }
     /// The current chain tips (dcrd `ChainTips`).
@@ -108,47 +108,47 @@ pub trait RpcChain {
     /// The signature cannot carry a failure, so the unwired default
     /// reports no tips rather than unwinding a handler thread on a
     /// remote request.
-    fn chain_tips(&mut self) -> Vec<RpcChainTip> {
+    fn chain_tips(&self) -> Vec<RpcChainTip> {
         Vec::new()
     }
     /// The cumulative work of the block with the given hash (dcrd
     /// `ChainWork`).
-    fn chain_work(&mut self, _hash: &Hash) -> Result<Uint256, String> {
+    fn chain_work(&self, _hash: &Hash) -> Result<Uint256, String> {
         unimplemented!("chain_work")
     }
     /// The header of the block with the given hash (dcrd
     /// `HeaderByHash`).
-    fn header_by_hash(&mut self, _hash: &Hash) -> Result<BlockHeader, String> {
+    fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
         unimplemented!("header_by_hash")
     }
     /// Whether the chain believes it is current (dcrd `IsCurrent`).
-    fn is_current(&mut self) -> bool {
+    fn is_current(&self) -> bool {
         unimplemented!("is_current")
     }
     /// The headers after the first known block in the provided
     /// locators up to the stop hash (dcrd `LocateHeaders`).
-    fn locate_headers(&mut self, _locators: &[Hash], _hash_stop: &Hash) -> Vec<BlockHeader> {
+    fn locate_headers(&self, _locators: &[Hash], _hash_stop: &Hash) -> Vec<BlockHeader> {
         unimplemented!("locate_headers")
     }
     /// Whether the block is in the main chain (dcrd
     /// `MainChainHasBlock`).
-    fn main_chain_has_block(&mut self, _hash: &Hash) -> bool {
+    fn main_chain_has_block(&self, _hash: &Hash) -> bool {
         unimplemented!("main_chain_has_block")
     }
     /// The maximum allowed block size as of the given block (dcrd
     /// `MaxBlockSize`).
-    fn max_block_size(&mut self, _prev_blk_hash: &Hash) -> Result<i64, String> {
+    fn max_block_size(&self, _prev_blk_hash: &Hash) -> Result<i64, String> {
         unimplemented!("max_block_size")
     }
     /// The past median time of the block with the given hash, as unix
     /// seconds (dcrd `MedianTimeByHash`).
-    fn median_time_by_hash(&mut self, _hash: &Hash) -> Result<i64, String> {
+    fn median_time_by_hash(&self, _hash: &Hash) -> Result<i64, String> {
         unimplemented!("median_time_by_hash")
     }
     /// The next threshold state of the given agenda as of the given
     /// block (dcrd `NextThresholdState`).
     fn next_threshold_state(
-        &mut self,
+        &self,
         _prev_blk_hash: &Hash,
         _deployment_id: &str,
     ) -> Result<crate::helpers::threshold::State, String> {
@@ -156,23 +156,19 @@ pub trait RpcChain {
     }
     /// The height the agenda's state last changed (dcrd
     /// `StateLastChangedHeight`).
-    fn state_last_changed_height(
-        &mut self,
-        _hash: &Hash,
-        _deployment_id: &str,
-    ) -> Result<i64, String> {
+    fn state_last_changed_height(&self, _hash: &Hash, _deployment_id: &str) -> Result<i64, String> {
         unimplemented!("state_last_changed_height")
     }
     /// Whether the blake3 proof of work agenda is active (dcrd
     /// `IsBlake3PowAgendaActive`).
-    fn is_blake3_pow_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+    fn is_blake3_pow_agenda_active(&self, _prev_blk_hash: &Hash) -> Result<bool, String> {
         unimplemented!("is_blake3_pow_agenda_active")
     }
     /// The expected next stake difficulty given a number of new
     /// tickets, or assuming the max possible when set (dcrd
     /// `EstimateNextStakeDifficulty`).
     fn estimate_next_stake_difficulty(
-        &mut self,
+        &self,
         _hash: &Hash,
         _new_tickets: i64,
         _use_max_tickets: bool,
@@ -180,12 +176,12 @@ pub trait RpcChain {
         Err(unwired_seam("estimate_next_stake_difficulty"))
     }
     /// Whether the ticket is currently live (dcrd `CheckLiveTicket`).
-    fn check_live_ticket(&mut self, _hash: &Hash) -> bool {
+    fn check_live_ticket(&self, _hash: &Hash) -> bool {
         unimplemented!("check_live_ticket")
     }
     /// Whether each of the tickets is currently live (dcrd
     /// `CheckLiveTickets`).
-    fn check_live_tickets(&mut self, _hashes: &[Hash]) -> Vec<bool> {
+    fn check_live_tickets(&self, _hashes: &[Hash]) -> Vec<bool> {
         unimplemented!("check_live_tickets")
     }
     /// The final height of the stake version interval containing the
@@ -195,13 +191,13 @@ pub trait RpcChain {
     /// answers zero rather than unwinding a handler thread; every
     /// caller pairs it with a fallible seam whose unwired default
     /// then fails the request outright.
-    fn calc_want_height(&mut self, _interval: i64, _height: i64) -> i64 {
+    fn calc_want_height(&self, _interval: i64, _height: i64) -> i64 {
         0
     }
     /// The stake versions of the count blocks ending at the given hash
     /// (dcrd `GetStakeVersions`).
     fn get_stake_versions(
-        &mut self,
+        &self,
         _hash: &Hash,
         _count: i32,
     ) -> Result<Vec<RpcStakeVersions>, String> {
@@ -210,7 +206,7 @@ pub trait RpcChain {
     /// The agendas for the given vote version as of the given block
     /// (dcrd `GetVoteInfo`).
     fn get_vote_info(
-        &mut self,
+        &self,
         _hash: &Hash,
         _version: u32,
     ) -> Result<Vec<dcroxide_chaincfg::ConsensusDeployment>, VoteInfoFailure> {
@@ -221,13 +217,13 @@ pub trait RpcChain {
     }
     /// The total number of votes cast with the given version (dcrd
     /// `CountVoteVersion`).
-    fn count_vote_version(&mut self, _version: u32) -> Result<u32, String> {
+    fn count_vote_version(&self, _version: u32) -> Result<u32, String> {
         Err(unwired_seam("count_vote_version"))
     }
     /// The cumulative vote counts for the given agenda (dcrd
     /// `GetVoteCounts`).
     fn get_vote_counts(
-        &mut self,
+        &self,
         _version: u32,
         _deployment_id: &str,
     ) -> Result<RpcVoteCounts, String> {
@@ -235,15 +231,12 @@ pub trait RpcChain {
     }
     /// The total value of the live ticket pool (dcrd
     /// `TicketPoolValue`).
-    fn ticket_pool_value(&mut self) -> Result<i64, String> {
+    fn ticket_pool_value(&self) -> Result<i64, String> {
         unimplemented!("ticket_pool_value")
     }
     /// The treasury balance as of the given block (dcrd
     /// `TreasuryBalance`).
-    fn treasury_balance(
-        &mut self,
-        _hash: &Hash,
-    ) -> Result<RpcTreasuryBalance, TreasuryBalanceFailure> {
+    fn treasury_balance(&self, _hash: &Hash) -> Result<RpcTreasuryBalance, TreasuryBalanceFailure> {
         Err(TreasuryBalanceFailure {
             is_unknown_block: false,
             is_no_treasury_balance: false,
@@ -251,13 +244,13 @@ pub trait RpcChain {
         })
     }
     /// The currently live tickets (dcrd `LiveTickets`).
-    fn live_tickets(&mut self) -> Result<Vec<Hash>, String> {
+    fn live_tickets(&self) -> Result<Vec<Hash>, String> {
         unimplemented!("live_tickets")
     }
     /// The unspent output entry for the outpoint, `None` when it does
     /// not exist (dcrd `FetchUtxoEntry`).
     fn fetch_utxo_entry(
-        &mut self,
+        &self,
         _tx_hash: &Hash,
         _index: u32,
         _tree: i8,
@@ -266,20 +259,20 @@ pub trait RpcChain {
     }
     /// Statistics on the unspent transaction output set (dcrd
     /// `FetchUtxoStats`).
-    fn fetch_utxo_stats(&mut self) -> Result<RpcUtxoStats, String> {
+    fn fetch_utxo_stats(&self) -> Result<RpcUtxoStats, String> {
         unimplemented!("fetch_utxo_stats")
     }
     /// The live tickets paying to the given stake address (dcrd
     /// `TicketsWithAddress`).
     fn tickets_with_address(
-        &mut self,
+        &self,
         _addr: &dcroxide_txscript::stdaddr::Address,
     ) -> Result<Vec<Hash>, String> {
         Err(unwired_seam("tickets_with_address"))
     }
     /// Manually invalidate the block as though it violated a
     /// consensus rule (dcrd `InvalidateBlock`).
-    fn invalidate_block(&mut self, _hash: &Hash) -> Result<(), InvalidateBlockFailure> {
+    fn invalidate_block(&self, _hash: &Hash) -> Result<(), InvalidateBlockFailure> {
         Err(InvalidateBlockFailure {
             is_unknown_block: false,
             is_invalidate_genesis: false,
@@ -288,7 +281,7 @@ pub trait RpcChain {
     }
     /// Manually reconsider a previously invalidated block (dcrd
     /// `ReconsiderBlock`).
-    fn reconsider_block(&mut self, _hash: &Hash) -> Result<(), ReconsiderBlockFailure> {
+    fn reconsider_block(&self, _hash: &Hash) -> Result<(), ReconsiderBlockFailure> {
         Err(ReconsiderBlockFailure {
             is_unknown_block: false,
             all_rule_errs: false,
@@ -298,51 +291,51 @@ pub trait RpcChain {
     /// The header of the main chain block at the given height (dcrd
     /// `HeaderByHeight`; the error text only feeds the wrapped
     /// internal error).
-    fn header_by_height(&mut self, _height: i64) -> Result<BlockHeader, String> {
+    fn header_by_height(&self, _height: i64) -> Result<BlockHeader, String> {
         Err(unwired_seam("header_by_height"))
     }
     /// Whether the treasury agenda is active as of the block AFTER the
     /// given block (dcrd `IsTreasuryAgendaActive`).
-    fn is_treasury_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+    fn is_treasury_agenda_active(&self, _prev_blk_hash: &Hash) -> Result<bool, String> {
         unimplemented!("is_treasury_agenda_active")
     }
     /// Whether the DCP0010 subsidy split agenda is active (dcrd
     /// `IsSubsidySplitAgendaActive`).
-    fn is_subsidy_split_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+    fn is_subsidy_split_agenda_active(&self, _prev_blk_hash: &Hash) -> Result<bool, String> {
         unimplemented!("is_subsidy_split_agenda_active")
     }
     /// Whether the DCP0012 subsidy split agenda is active (dcrd
     /// `IsSubsidySplitR2AgendaActive`).
-    fn is_subsidy_split_r2_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+    fn is_subsidy_split_r2_agenda_active(&self, _prev_blk_hash: &Hash) -> Result<bool, String> {
         unimplemented!("is_subsidy_split_r2_agenda_active")
     }
     /// Whether the automatic ticket revocations agenda is active as of
     /// the block AFTER the given block (dcrd
     /// `IsAutoRevocationsAgendaActive`).
-    fn is_auto_revocations_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+    fn is_auto_revocations_agenda_active(&self, _prev_blk_hash: &Hash) -> Result<bool, String> {
         unimplemented!("is_auto_revocations_agenda_active")
     }
     /// The hashes of the blocks a treasury spend was mined in (dcrd
     /// `FetchTSpend`; the error only drives the not-found result).
-    fn fetch_tspend(&mut self, _tspend: &Hash) -> Result<Vec<Hash>, String> {
+    fn fetch_tspend(&self, _tspend: &Hash) -> Result<Vec<Hash>, String> {
         Err(unwired_seam("fetch_tspend"))
     }
     /// The entire generation of blocks stemming from the parent of
     /// the current tip (dcrd `TipGeneration`).
-    fn tip_generation(&mut self) -> Vec<Hash> {
+    fn tip_generation(&self) -> Vec<Hash> {
         unimplemented!("tip_generation")
     }
     /// The winning tickets of the block with the given hash (dcrd
     /// `LotteryDataForBlock`; only the tickets are consumed and the
     /// failure is log-only).
-    fn lottery_data_for_block(&mut self, _hash: &Hash) -> Result<Vec<Hash>, String> {
+    fn lottery_data_for_block(&self, _hash: &Hash) -> Result<Vec<Hash>, String> {
         Err(unwired_seam("lottery_data_for_block"))
     }
     /// The (yes, no) vote tally for the treasury spend counted up to
     /// the given block (dcrd `TSpendCountVotes`; u32 tallies per
     /// dcrd 2.2).
     fn tspend_count_votes(
-        &mut self,
+        &self,
         _check_block: &Hash,
         _tspend: &MsgTx,
     ) -> Result<(u32, u32), TSpendCountVotesFailure> {
@@ -378,22 +371,22 @@ pub struct RpcTxIndexEntry {
 /// used subset of dcrd's `rpcserver.TxIndexer` interface).
 pub trait RpcTxIndexer {
     /// The human-readable index name (dcrd `Name`).
-    fn name(&mut self) -> String {
+    fn name(&self) -> String {
         unimplemented!("name")
     }
     /// The current index tip (dcrd `Tip`).
-    fn tip(&mut self) -> Result<(i64, Hash), String> {
+    fn tip(&self) -> Result<(i64, Hash), String> {
         unimplemented!("tip")
     }
     /// The index entry for the transaction (dcrd `Entry`; `None` for
     /// an unindexed transaction).
-    fn entry(&mut self, _tx_hash: &Hash) -> Result<Option<RpcTxIndexEntry>, String> {
+    fn entry(&self, _tx_hash: &Hash) -> Result<Option<RpcTxIndexEntry>, String> {
         unimplemented!("entry")
     }
     /// Wait for the index to signal synchronization, returning whether
     /// the signal fired before dcrd's three-second timeout (dcrd
     /// selects `WaitForSync` against `syncWait`).
-    fn wait_for_sync(&mut self) -> bool {
+    fn wait_for_sync(&self) -> bool {
         unimplemented!("wait_for_sync")
     }
 }
@@ -406,7 +399,7 @@ pub trait RpcDb {
     /// Fetch the raw bytes of a block region (dcrd
     /// `Tx.FetchBlockRegion` under `DB.View`).
     fn fetch_block_region(
-        &mut self,
+        &self,
         _block_hash: &Hash,
         _offset: u32,
         _len: u32,
@@ -444,7 +437,7 @@ pub struct FilterFailure {
 pub trait RpcFiltererV2 {
     /// The filter and its commitment proof for the given block (dcrd
     /// `FilterByBlockHash`).
-    fn filter_by_block_hash(&mut self, _hash: &Hash) -> Result<RpcFilterProof, FilterFailure> {
+    fn filter_by_block_hash(&self, _hash: &Hash) -> Result<RpcFilterProof, FilterFailure> {
         unimplemented!("filter_by_block_hash")
     }
 }
@@ -499,46 +492,46 @@ pub struct Config<C> {
     /// The network parameters.
     pub chain_params: Params,
     /// The subsidy cache over the same parameters.
-    pub subsidy_cache: SubsidyCache<RpcSubsidyParams>,
+    pub subsidy_cache: std::sync::Mutex<SubsidyCache<RpcSubsidyParams>>,
     /// The minimum relay fee in atoms (dcrd `MinRelayTxFee`).
     pub min_relay_tx_fee: i64,
     /// The maximum protocol version the server supports (drives
     /// message serialization).
     pub max_protocol_version: u32,
     /// The sync manager (dcrd `SyncMgr`).
-    pub sync_mgr: Box<dyn RpcSyncManager + Send>,
+    pub sync_mgr: Box<dyn RpcSyncManager + Send + Sync>,
     /// The connection manager (dcrd `ConnMgr`).
-    pub conn_mgr: Box<dyn RpcConnManager + Send>,
+    pub conn_mgr: Box<dyn RpcConnManager + Send + Sync>,
     /// The mempool (dcrd `TxMempooler`).
-    pub tx_mempooler: Box<dyn RpcTxMempooler + Send>,
+    pub tx_mempooler: Box<dyn RpcTxMempooler + Send + Sync>,
     /// The clock (dcrd `Clock`).
-    pub clock: Box<dyn RpcClock + Send>,
+    pub clock: Box<dyn RpcClock + Send + Sync>,
     /// The local network interface lookup used by address
     /// normalization (dcrd resolves interface names live).
-    pub interfaces: Box<dyn crate::helpers::InterfaceLookup + Send>,
+    pub interfaces: Box<dyn crate::helpers::InterfaceLookup + Send + Sync>,
     /// The random nonce source (dcrd uses the global math/rand).
-    pub rand_u64: Box<dyn FnMut() -> u64 + Send>,
+    pub rand_u64: Box<dyn Fn() -> u64 + Send + Sync>,
     /// The optional transaction index (dcrd `TxIndexer`, nil when
     /// disabled).
-    pub tx_indexer: Option<Box<dyn RpcTxIndexer + Send>>,
+    pub tx_indexer: Option<Box<dyn RpcTxIndexer + Send + Sync>>,
     /// The block database (dcrd `DB`).
-    pub db: Box<dyn RpcDb + Send>,
+    pub db: Box<dyn RpcDb + Send + Sync>,
     /// The version 2 filter source (dcrd `FiltererV2`).
-    pub filterer_v2: Box<dyn RpcFiltererV2 + Send>,
+    pub filterer_v2: Box<dyn RpcFiltererV2 + Send + Sync>,
     /// The optional exists-address index (dcrd `ExistsAddresser`, nil
     /// when disabled).
-    pub exists_addresser: Option<Box<dyn RpcExistsAddresser + Send>>,
+    pub exists_addresser: Option<Box<dyn RpcExistsAddresser + Send + Sync>>,
     /// The log manager (dcrd `LogManager`).
-    pub log_manager: Box<dyn RpcLogManager + Send>,
+    pub log_manager: Box<dyn RpcLogManager + Send + Sync>,
     /// The smart fee estimator (dcrd `FeeEstimator`).
-    pub fee_estimator: Box<dyn RpcFeeEstimator + Send>,
+    pub fee_estimator: Box<dyn RpcFeeEstimator + Send + Sync>,
     /// The optional background block templater (dcrd
     /// `BlockTemplater`, nil when mining is not configured).
-    pub block_templater: Option<Box<dyn RpcBlockTemplater + Send>>,
+    pub block_templater: Option<Box<dyn RpcBlockTemplater + Send + Sync>>,
     /// The block sanity checker (dcrd `SanityChecker`).
-    pub sanity_checker: Box<dyn RpcSanityChecker + Send>,
+    pub sanity_checker: Box<dyn RpcSanityChecker + Send + Sync>,
     /// The median time source (dcrd `TimeSource`).
-    pub time_source: Box<dyn RpcTimeSource + Send>,
+    pub time_source: Box<dyn RpcTimeSource + Send + Sync>,
     /// The configured proxy address, empty when none (dcrd `Proxy`).
     pub proxy: String,
     /// Whether the server runs on a test network (dcrd `TestNet`).
@@ -547,13 +540,13 @@ pub struct Config<C> {
     /// command (dcrd embeds Go's `runtime.Version()`).
     pub runtime_version: String,
     /// The CPU miner (dcrd `CPUMiner`).
-    pub cpu_miner: Box<dyn RpcCpuMiner + Send>,
+    pub cpu_miner: Box<dyn RpcCpuMiner + Send + Sync>,
     /// The mixing message pool (dcrd `MixPooler`).
-    pub mix_pooler: Box<dyn RpcMixPooler + Send>,
+    pub mix_pooler: Box<dyn RpcMixPooler + Send + Sync>,
     /// The profile server manager (dcrd `ProfilerMgr`).
-    pub profiler_mgr: Box<dyn RpcProfilerManager + Send>,
+    pub profiler_mgr: Box<dyn RpcProfilerManager + Send + Sync>,
     /// The address manager (dcrd `AddrManager`).
-    pub addr_manager: Box<dyn RpcAddrManager + Send>,
+    pub addr_manager: Box<dyn RpcAddrManager + Send + Sync>,
     /// The configured mining payment addresses (dcrd `MiningAddrs`).
     pub mining_addrs: Vec<dcroxide_txscript::stdaddr::Address>,
     /// The user agent version string (dcrd `UserAgentVersion`).
@@ -564,7 +557,7 @@ pub struct Config<C> {
     pub services: u64,
     /// Request a graceful server shutdown (dcrd's non-blocking send
     /// on the server's `requestProcessShutdown` channel).
-    pub request_shutdown: Box<dyn FnMut() + Send>,
+    pub request_shutdown: Box<dyn Fn() + Send + Sync>,
     /// Whether mining is allowed without being connected and synced
     /// (dcrd `AllowUnsyncedMining`).
     pub allow_unsynced_mining: bool,
@@ -618,25 +611,25 @@ pub struct GenerateFailure {
 pub trait RpcCpuMiner {
     /// Mine the requested number of blocks onto the main chain (dcrd
     /// `GenerateNBlocks`).
-    fn generate_n_blocks(&mut self, _n: u32) -> Result<Vec<Hash>, GenerateFailure> {
+    fn generate_n_blocks(&self, _n: u32) -> Result<Vec<Hash>, GenerateFailure> {
         unimplemented!("generate_n_blocks")
     }
     /// Whether the miner is currently running (dcrd `IsMining`).
-    fn is_mining(&mut self) -> bool {
+    fn is_mining(&self) -> bool {
         unimplemented!("is_mining")
     }
     /// The current hashes per second, zero when not mining (dcrd
     /// `HashesPerSecond`).
-    fn hashes_per_second(&mut self) -> f64 {
+    fn hashes_per_second(&self) -> f64 {
         unimplemented!("hashes_per_second")
     }
     /// The number of mining worker goroutines (dcrd `NumWorkers`).
-    fn num_workers(&mut self) -> i32 {
+    fn num_workers(&self) -> i32 {
         unimplemented!("num_workers")
     }
     /// Set the number of mining workers, negative meaning the default
     /// (dcrd `SetNumWorkers`).
-    fn set_num_workers(&mut self, _workers: i32) {
+    fn set_num_workers(&self, _workers: i32) {
         unimplemented!("set_num_workers")
     }
 }
@@ -651,12 +644,12 @@ pub trait RpcMixPooler {
     /// The signature cannot carry a failure, so the unwired default
     /// reports an empty pool rather than unwinding a handler thread
     /// on a remote request.
-    fn mix_prs(&mut self) -> Vec<MsgMixPairReq> {
+    fn mix_prs(&self) -> Vec<MsgMixPairReq> {
         Vec::new()
     }
     /// The mixing message with the given hash (dcrd `Message`; the
     /// error only drives the not-found result).
-    fn message(&mut self, _query: &Hash) -> Result<Message, String> {
+    fn message(&self, _query: &Hash) -> Result<Message, String> {
         unimplemented!("message")
     }
 }
@@ -667,11 +660,11 @@ impl RpcMixPooler for () {}
 /// `rpcserver.ProfilerManager` interface).
 pub trait RpcProfilerManager {
     /// Start the profile server on the given address (dcrd `Start`).
-    fn start(&mut self, _listen_addr: &str, _allow_non_loopback: bool) -> Result<(), String> {
+    fn start(&self, _listen_addr: &str, _allow_non_loopback: bool) -> Result<(), String> {
         unimplemented!("start")
     }
     /// Stop the profile server (dcrd `Stop`).
-    fn stop(&mut self) -> Result<(), String> {
+    fn stop(&self) -> Result<(), String> {
         unimplemented!("stop")
     }
     /// The listener addresses the profile server is bound to, empty
@@ -680,7 +673,7 @@ pub trait RpcProfilerManager {
     /// The signature cannot carry a failure; an unwired seam has no
     /// profile server running, which is exactly what the empty
     /// default reports, so it never unwinds a handler thread.
-    fn listeners(&mut self) -> Vec<String> {
+    fn listeners(&self) -> Vec<String> {
         Vec::new()
     }
 }
@@ -692,7 +685,7 @@ impl RpcProfilerManager for () {}
 pub trait RpcAddrManager {
     /// The local addresses as (address, port) pairs (dcrd
     /// `LocalAddresses`).
-    fn local_addresses(&mut self) -> Vec<(String, u16)> {
+    fn local_addresses(&self) -> Vec<(String, u16)> {
         unimplemented!("local_addresses")
     }
 }
@@ -704,7 +697,7 @@ impl RpcAddrManager for () {}
 pub trait RpcSanityChecker {
     /// Perform the basic chain sanity checks on the block (dcrd
     /// `CheckBlockSanity`).
-    fn check_block_sanity(&mut self, _block: &MsgBlock) -> Result<(), String> {
+    fn check_block_sanity(&self, _block: &MsgBlock) -> Result<(), String> {
         unimplemented!("check_block_sanity")
     }
 }
@@ -716,7 +709,7 @@ impl RpcSanityChecker for () {}
 pub trait RpcTimeSource {
     /// The offset between the local clock and the network-adjusted
     /// time, in nanoseconds (dcrd `Offset`).
-    fn offset_nanos(&mut self) -> i64 {
+    fn offset_nanos(&self) -> i64 {
         unimplemented!("offset_nanos")
     }
 }
@@ -728,19 +721,19 @@ impl RpcTimeSource for () {}
 pub trait RpcSyncManager {
     /// The latest known block height being synced to (dcrd
     /// `SyncHeight`).
-    fn sync_height(&mut self) -> i64 {
+    fn sync_height(&self) -> i64 {
         unimplemented!("sync_height")
     }
     /// The id of the current sync peer, zero when none (dcrd
     /// `SyncPeerID`).
-    fn sync_peer_id(&mut self) -> i32 {
+    fn sync_peer_id(&self) -> i32 {
         unimplemented!("sync_peer_id")
     }
     /// Relay/validate the transaction through the mempool, returning
     /// the hashes of all newly accepted transactions (dcrd
     /// `ProcessTransaction`).
     fn process_transaction(
-        &mut self,
+        &self,
         _tx: &MsgTx,
         _allow_orphan: bool,
         _allow_high_fees: bool,
@@ -750,17 +743,17 @@ pub trait RpcSyncManager {
     }
     /// Whether the transaction was confirmed in a recent block (dcrd
     /// `RecentlyConfirmedTxn`).
-    fn recently_confirmed_txn(&mut self, _hash: &Hash) -> bool {
+    fn recently_confirmed_txn(&self, _hash: &Hash) -> bool {
         unimplemented!("recently_confirmed_txn")
     }
     /// Submit the block to the network after processing it locally
     /// (dcrd `SubmitBlock`).
-    fn submit_block(&mut self, _block: &MsgBlock) -> Result<(), SubmitBlockFailure> {
+    fn submit_block(&self, _block: &MsgBlock) -> Result<(), SubmitBlockFailure> {
         unimplemented!("submit_block")
     }
     /// Submit the mixing message to the mixpool, with the local node
     /// as the source (dcrd `AcceptMixMessage`).
-    fn accept_mix_message(&mut self, _msg: &Message) -> Result<(), String> {
+    fn accept_mix_message(&self, _msg: &Message) -> Result<(), String> {
         Err(unwired_seam("accept_mix_message"))
     }
 }
@@ -818,12 +811,12 @@ pub struct ReconsiderBlockFailure {
 /// subset of dcrd's `rpcserver.LogManager` interface).
 pub trait RpcLogManager {
     /// The supported logging subsystems (dcrd `SupportedSubsystems`).
-    fn supported_subsystems(&mut self) -> Vec<String> {
+    fn supported_subsystems(&self) -> Vec<String> {
         unimplemented!("supported_subsystems")
     }
     /// Parse and apply a debug level specification (dcrd
     /// `ParseAndSetDebugLevels`).
-    fn parse_and_set_debug_levels(&mut self, _level_spec: &str) -> Result<(), String> {
+    fn parse_and_set_debug_levels(&self, _level_spec: &str) -> Result<(), String> {
         unimplemented!("parse_and_set_debug_levels")
     }
 }
@@ -835,7 +828,7 @@ impl RpcLogManager for () {}
 pub trait RpcFeeEstimator {
     /// The estimated fee rate in atoms per kB for confirmation within
     /// the given target (dcrd `EstimateFee`).
-    fn estimate_fee(&mut self, _target_confirmations: i32) -> Result<i64, String> {
+    fn estimate_fee(&self, _target_confirmations: i32) -> Result<i64, String> {
         unimplemented!("estimate_fee")
     }
 }
@@ -848,24 +841,24 @@ impl RpcFeeEstimator for () {}
 pub trait RpcBlockTemplater {
     /// Ask the templater to generate a new template immediately (dcrd
     /// `ForceRegen`).
-    fn force_regen(&mut self) {
+    fn force_regen(&self) {
         unimplemented!("force_regen")
     }
     /// The current template block, `Ok(None)` during a chain
     /// reorganization (dcrd `CurrentTemplate`; the handlers only read
     /// the template's block).
-    fn current_template(&mut self) -> Result<Option<MsgBlock>, String> {
+    fn current_template(&self) -> Result<Option<MsgBlock>, String> {
         unimplemented!("current_template")
     }
     /// Subscribe to block template updates (dcrd `Subscribe`; the
     /// subscription immediately delivers the current template).
-    fn subscribe(&mut self) -> Box<dyn RpcTemplateSubscription + Send> {
+    fn subscribe(&self) -> Box<dyn RpcTemplateSubscription + Send> {
         unimplemented!("subscribe")
     }
     /// Update the timestamp in the passed header to the current time
     /// while taking the consensus rules into account (dcrd
     /// `UpdateBlockTime`).
-    fn update_block_time(&mut self, _header: &mut BlockHeader) {
+    fn update_block_time(&self, _header: &mut BlockHeader) {
         unimplemented!("update_block_time")
     }
 }
@@ -889,16 +882,16 @@ pub enum TemplateRecv {
 pub trait RpcTemplateSubscription {
     /// Wait for the next template notification (dcrd `<-C()` against
     /// the request context).
-    fn recv(&mut self) -> TemplateRecv {
+    fn recv(&self) -> TemplateRecv {
         unimplemented!("recv")
     }
     /// Wait for the next template notification with dcrd's known-
     /// template timeout.
-    fn recv_with_timeout(&mut self) -> TemplateRecv {
+    fn recv_with_timeout(&self) -> TemplateRecv {
         unimplemented!("recv_with_timeout")
     }
     /// Stop the subscription (dcrd `Stop`).
-    fn stop(&mut self) {
+    fn stop(&self) {
         unimplemented!("stop")
     }
 }
@@ -914,51 +907,51 @@ impl RpcSyncManager for () {}
 pub trait RpcConnManager {
     /// The number of currently connected peers (dcrd
     /// `ConnectedCount`).
-    fn connected_count(&mut self) -> i32 {
+    fn connected_count(&self) -> i32 {
         unimplemented!("connected_count")
     }
     /// The total bytes received and sent across all peers (dcrd
     /// `NetTotals`).
-    fn net_totals(&mut self) -> (u64, u64) {
+    fn net_totals(&self) -> (u64, u64) {
         unimplemented!("net_totals")
     }
     /// Add the address as a persistent or one-try peer (dcrd
     /// `Connect`).
-    fn connect(&mut self, _addr: &str, _permanent: bool) -> Result<(), String> {
+    fn connect(&self, _addr: &str, _permanent: bool) -> Result<(), String> {
         unimplemented!("connect")
     }
     /// Remove the persistent peer with the given id (dcrd
     /// `RemoveByID`).
-    fn remove_by_id(&mut self, _id: i32) -> Result<(), String> {
+    fn remove_by_id(&self, _id: i32) -> Result<(), String> {
         unimplemented!("remove_by_id")
     }
     /// Remove the persistent peer with the given address (dcrd
     /// `RemoveByAddr`).
-    fn remove_by_addr(&mut self, _addr: &str) -> Result<(), String> {
+    fn remove_by_addr(&self, _addr: &str) -> Result<(), String> {
         unimplemented!("remove_by_addr")
     }
     /// Disconnect the peer with the given id (dcrd `DisconnectByID`).
-    fn disconnect_by_id(&mut self, _id: i32) -> Result<(), String> {
+    fn disconnect_by_id(&self, _id: i32) -> Result<(), String> {
         unimplemented!("disconnect_by_id")
     }
     /// Disconnect the peer with the given address (dcrd
     /// `DisconnectByAddr`).
-    fn disconnect_by_addr(&mut self, _addr: &str) -> Result<(), String> {
+    fn disconnect_by_addr(&self, _addr: &str) -> Result<(), String> {
         unimplemented!("disconnect_by_addr")
     }
     /// The currently connected peers (the subset of dcrd
     /// `ConnectedPeers` the ported handlers read).
-    fn connected_peers(&mut self) -> Vec<RpcPeerInfo> {
+    fn connected_peers(&self) -> Vec<RpcPeerInfo> {
         unimplemented!("connected_peers")
     }
     /// The persistent (added) peers (the subset of dcrd
     /// `PersistentPeers` the ported handlers read).
-    fn persistent_peers(&mut self) -> Vec<RpcAddedNode> {
+    fn persistent_peers(&self) -> Vec<RpcAddedNode> {
         unimplemented!("persistent_peers")
     }
     /// DNS-resolve the host to its addresses rendered as strings
     /// (dcrd `Lookup`).
-    fn lookup(&mut self, _host: &str) -> Result<Vec<String>, String> {
+    fn lookup(&self, _host: &str) -> Result<Vec<String>, String> {
         unimplemented!("lookup")
     }
     /// Broadcast the message to all connected peers (dcrd
@@ -967,15 +960,15 @@ pub trait RpcConnManager {
     /// The signature cannot carry a failure, so the unwired default
     /// drops the broadcast rather than unwinding a handler thread on
     /// a remote request.
-    fn broadcast_message(&mut self, _msg: &dcroxide_wire::Message) {}
+    fn broadcast_message(&self, _msg: &dcroxide_wire::Message) {}
     /// Relay inventory vectors for newly accepted transactions (dcrd
     /// `RelayTransactions`).
-    fn relay_transactions(&mut self, _tx_hashes: &[Hash]) {
+    fn relay_transactions(&self, _tx_hashes: &[Hash]) {
         unimplemented!("relay_transactions")
     }
     /// Track a transaction for rebroadcast until it confirms (dcrd
     /// `AddRebroadcastInventory`).
-    fn add_rebroadcast_inventory(&mut self, _tx_hash: &Hash, _tx: &MsgTx) {
+    fn add_rebroadcast_inventory(&self, _tx_hash: &Hash, _tx: &MsgTx) {
         unimplemented!("add_rebroadcast_inventory")
     }
     /// Relay the mixing messages to peers (dcrd `RelayMixMessages`).
@@ -985,7 +978,7 @@ pub trait RpcConnManager {
     /// only caller first passes the message through
     /// [`RpcSyncManager::accept_mix_message`], whose unwired default
     /// already fails the request outright.
-    fn relay_mix_messages(&mut self, _msgs: &[Message]) {}
+    fn relay_mix_messages(&self, _msgs: &[Message]) {}
 }
 
 impl RpcConnManager for () {}
@@ -1054,30 +1047,27 @@ pub struct RpcAddedNode {
 /// interface).
 pub trait RpcExistsAddresser {
     /// The human-readable index name (dcrd `Name`).
-    fn name(&mut self) -> String {
+    fn name(&self) -> String {
         unimplemented!("name")
     }
     /// The current index tip (dcrd `Tip`).
-    fn tip(&mut self) -> Result<(i64, Hash), String> {
+    fn tip(&self) -> Result<(i64, Hash), String> {
         unimplemented!("tip")
     }
     /// Wait for the index to signal synchronization, returning whether
     /// the signal fired before dcrd's three-second timeout.
-    fn wait_for_sync(&mut self) -> bool {
+    fn wait_for_sync(&self) -> bool {
         unimplemented!("wait_for_sync")
     }
     /// Whether the address has ever been seen on chain (dcrd
     /// `ExistsAddress`).
-    fn exists_address(
-        &mut self,
-        _addr: &dcroxide_txscript::stdaddr::Address,
-    ) -> Result<bool, String> {
+    fn exists_address(&self, _addr: &dcroxide_txscript::stdaddr::Address) -> Result<bool, String> {
         unimplemented!("exists_address")
     }
     /// Whether each of the addresses has ever been seen on chain
     /// (dcrd `ExistsAddresses`).
     fn exists_addresses(
-        &mut self,
+        &self,
         _addrs: &[dcroxide_txscript::stdaddr::Address],
     ) -> Result<Vec<bool>, String> {
         unimplemented!("exists_addresses")
@@ -1120,32 +1110,32 @@ pub struct RpcVerboseMempoolTx {
 /// subset of dcrd's `rpcserver.TxMempooler` interface).
 pub trait RpcTxMempooler {
     /// The descriptors for all pool transactions (dcrd `TxDescs`).
-    fn tx_descs(&mut self) -> Vec<RpcMempoolTx> {
+    fn tx_descs(&self) -> Vec<RpcMempoolTx> {
         unimplemented!("tx_descs")
     }
     /// The number of transactions in the pool (dcrd `Count`).
-    fn count(&mut self) -> i64 {
+    fn count(&self) -> i64 {
         unimplemented!("count")
     }
     /// The hashes of the treasury spends currently in the pool (dcrd
     /// `TSpendHashes`).
-    fn tspend_hashes(&mut self) -> Vec<Hash> {
+    fn tspend_hashes(&self) -> Vec<Hash> {
         unimplemented!("tspend_hashes")
     }
     /// The verbose descriptors for all pool transactions (dcrd
     /// `VerboseTxDescs`).
-    fn verbose_tx_descs(&mut self) -> Vec<RpcVerboseMempoolTx> {
+    fn verbose_tx_descs(&self) -> Vec<RpcVerboseMempoolTx> {
         unimplemented!("verbose_tx_descs")
     }
     /// Whether each of the transactions is in the pool (dcrd
     /// `HaveTransactions`).
-    fn have_transactions(&mut self, _hashes: &[Hash]) -> Vec<bool> {
+    fn have_transactions(&self, _hashes: &[Hash]) -> Vec<bool> {
         unimplemented!("have_transactions")
     }
     /// The pool transaction with the given hash along with the tree
     /// it lives in (dcrd `FetchTransaction`; the error text is
     /// discarded by the handlers).
-    fn fetch_transaction(&mut self, _tx_hash: &Hash) -> Result<(MsgTx, i8), String> {
+    fn fetch_transaction(&self, _tx_hash: &Hash) -> Result<(MsgTx, i8), String> {
         unimplemented!("fetch_transaction")
     }
 }
@@ -1157,12 +1147,12 @@ impl RpcTxMempooler for () {}
 pub trait RpcClock {
     /// The current time as unix milliseconds (dcrd `Clock.Now` through
     /// the handler's millisecond conversion).
-    fn now_unix_millis(&mut self) -> i64 {
+    fn now_unix_millis(&self) -> i64 {
         unimplemented!("now_unix_millis")
     }
     /// The nanoseconds elapsed since the given unix-nanosecond time
     /// (dcrd `Clock.Since`).
-    fn since_nanos(&mut self, _t_unix_nanos: i64) -> i64 {
+    fn since_nanos(&self, _t_unix_nanos: i64) -> i64 {
         unimplemented!("since_nanos")
     }
 }
@@ -1272,10 +1262,23 @@ pub struct Server<C> {
     /// The configuration, treated as immutable after creation like
     /// dcrd's.
     pub cfg: Config<C>,
-    /// The getwork state (dcrd `workState`; the semaphore that
-    /// serializes concurrent invocations has no synchronous
-    /// counterpart here).
-    pub(crate) work_state: WorkState,
+    /// The getwork state (dcrd `workState`), guarded field by field the
+    /// way dcrd's embedded `sync.Mutex` guards it.
+    pub(crate) work_state: std::sync::Mutex<WorkState>,
+    /// Serializes whole `getwork` invocations — both work requests and
+    /// submissions — against each other, as dcrd's single-item
+    /// `workState.workSem` does (`rpcserver.go:568`, `makeSemaphore(1)`
+    /// at `:595`, acquired at `:4171` and released at `:4175`).  The
+    /// per-field `work_state` lock alone is not enough: the request path
+    /// releases it across the template wait, so without this two
+    /// invocations could interleave their four critical sections and one
+    /// could clear `wait_for_updated_template` after another re-armed it
+    /// for a newer tip, handing the next caller a template built on the
+    /// stale parent.  dcrd uses a semaphore rather than a mutex only so
+    /// a disconnecting client can cancel while queued; the port's
+    /// handler threads have no such cancellation point, so a mutex is
+    /// the faithful synchronous equivalent.
+    pub(crate) work_sem: std::sync::Mutex<()>,
     /// The command registry (dcrd registers commands globally in the
     /// dcrjson package).
     pub registry: dcroxide_dcrjson::Registry,
@@ -1291,7 +1294,7 @@ pub struct Server<C> {
     pub(crate) limitauthsha: [u8; 32],
     /// The websocket notification manager (dcrd builds `ntfnMgr` in
     /// `New`; the daemon replaces the default with the real fan-out).
-    pub ntfn_mgr: Box<dyn crate::websocket::RpcNtfnManager + Send>,
+    pub ntfn_mgr: Box<dyn crate::websocket::RpcNtfnManager + Send + Sync>,
 }
 
 /// The getwork request/submission state (dcrd `workState`).
@@ -1312,7 +1315,7 @@ impl<C: RpcChain> Server<C> {
     /// A new server over the given configuration (the used subset of
     /// dcrd `New`).
     pub fn new(cfg: Config<C>) -> Server<C> {
-        let mut cfg = cfg;
+        let cfg = cfg;
         let mut registry = dcroxide_dcrjson::Registry::new();
         dcroxide_rpctypes::register_all(&mut registry);
 
@@ -1325,7 +1328,8 @@ impl<C: RpcChain> Server<C> {
         }
         let mut server = Server {
             cfg,
-            work_state: WorkState::default(),
+            work_state: std::sync::Mutex::new(WorkState::default()),
+            work_sem: std::sync::Mutex::new(()),
             registry,
             help_cacher: crate::help::HelpCacher::new(),
             hmac_key,
@@ -1352,10 +1356,7 @@ impl<C: RpcChain> Server<C> {
     /// Whether the treasury agenda is active as of the block AFTER the
     /// given block, with chain failures wrapped as internal errors
     /// (dcrd `Server.isTreasuryAgendaActive`).
-    pub(crate) fn is_treasury_agenda_active(
-        &mut self,
-        prev_blk_hash: &Hash,
-    ) -> Result<bool, RPCError> {
+    pub(crate) fn is_treasury_agenda_active(&self, prev_blk_hash: &Hash) -> Result<bool, RPCError> {
         self.cfg
             .chain
             .is_treasury_agenda_active(prev_blk_hash)
@@ -1364,7 +1365,7 @@ impl<C: RpcChain> Server<C> {
 
     /// dcrd `Server.isSubsidySplitAgendaActive`.
     pub(crate) fn is_subsidy_split_agenda_active(
-        &mut self,
+        &self,
         prev_blk_hash: &Hash,
     ) -> Result<bool, RPCError> {
         self.cfg
@@ -1375,7 +1376,7 @@ impl<C: RpcChain> Server<C> {
 
     /// dcrd `Server.isBlake3PowAgendaActive`.
     pub(crate) fn is_blake3_pow_agenda_active(
-        &mut self,
+        &self,
         prev_blk_hash: &Hash,
     ) -> Result<bool, RPCError> {
         self.cfg
@@ -1386,7 +1387,7 @@ impl<C: RpcChain> Server<C> {
 
     /// dcrd `Server.isSubsidySplitR2AgendaActive`.
     pub(crate) fn is_subsidy_split_r2_agenda_active(
-        &mut self,
+        &self,
         prev_blk_hash: &Hash,
     ) -> Result<bool, RPCError> {
         self.cfg
@@ -1397,7 +1398,7 @@ impl<C: RpcChain> Server<C> {
 
     /// dcrd `Server.isAutoRevocationsAgendaActive`.
     pub(crate) fn is_auto_revocations_agenda_active(
-        &mut self,
+        &self,
         prev_blk_hash: &Hash,
     ) -> Result<bool, RPCError> {
         self.cfg

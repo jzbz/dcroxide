@@ -106,13 +106,13 @@ struct MockConnMgr6 {
 }
 
 impl RpcConnManager for MockConnMgr6 {
-    fn connected_peers(&mut self) -> Vec<RpcPeerInfo> {
+    fn connected_peers(&self) -> Vec<RpcPeerInfo> {
         self.peers.clone()
     }
-    fn persistent_peers(&mut self) -> Vec<RpcAddedNode> {
+    fn persistent_peers(&self) -> Vec<RpcAddedNode> {
         self.persistent.clone()
     }
-    fn lookup(&mut self, _host: &str) -> Result<Vec<String>, String> {
+    fn lookup(&self, _host: &str) -> Result<Vec<String>, String> {
         self.lookup.clone()
     }
 }
@@ -126,19 +126,19 @@ struct MockExistsAddresser {
 }
 
 impl RpcExistsAddresser for MockExistsAddresser {
-    fn name(&mut self) -> String {
+    fn name(&self) -> String {
         "testExistsAddresser".to_string()
     }
-    fn tip(&mut self) -> Result<(i64, Hash), String> {
+    fn tip(&self) -> Result<(i64, Hash), String> {
         self.tip.clone()
     }
-    fn wait_for_sync(&mut self) -> bool {
+    fn wait_for_sync(&self) -> bool {
         self.signal_on_wait
     }
-    fn exists_address(&mut self, _addr: &Address) -> Result<bool, String> {
+    fn exists_address(&self, _addr: &Address) -> Result<bool, String> {
         self.exists.clone()
     }
-    fn exists_addresses(&mut self, _addrs: &[Address]) -> Result<Vec<bool>, String> {
+    fn exists_addresses(&self, _addrs: &[Address]) -> Result<Vec<bool>, String> {
         self.exists_many.clone()
     }
 }
@@ -147,7 +147,7 @@ impl RpcExistsAddresser for MockExistsAddresser {
 struct MockSyncMgr6(i32);
 
 impl RpcSyncManager for MockSyncMgr6 {
-    fn sync_peer_id(&mut self) -> i32 {
+    fn sync_peer_id(&self) -> i32 {
         self.0
     }
 }
@@ -155,7 +155,7 @@ impl RpcSyncManager for MockSyncMgr6 {
 struct MockClock6(i64);
 
 impl RpcClock for MockClock6 {
-    fn since_nanos(&mut self, _t: i64) -> i64 {
+    fn since_nanos(&self, _t: i64) -> i64 {
         self.0
     }
 }
@@ -167,16 +167,16 @@ struct MockChain6 {
 }
 
 impl RpcChain for MockChain6 {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         self.best.clone()
     }
-    fn tickets_with_address(&mut self, _addr: &Address) -> Result<Vec<Hash>, String> {
+    fn tickets_with_address(&self, _addr: &Address) -> Result<Vec<Hash>, String> {
         self.tickets.clone()
     }
 }
 
 fn dispatch(
-    server: &mut Server<MockChain6>,
+    server: &Server<MockChain6>,
     method_name: &str,
     cmd: &GoValue,
 ) -> Result<(GoValue, GoType), RPCError> {
@@ -290,7 +290,7 @@ fn peer_address_handler_slice_matches_dcrd() {
 
         // The exists-addresser part of the row is either the single
         // "NONE" field or seven inline fields.
-        let (exists_addresser, rest): (Option<Box<dyn RpcExistsAddresser + Send>>, &[&str]) =
+        let (exists_addresser, rest): (Option<Box<dyn RpcExistsAddresser + Send + Sync>>, &[&str]) =
             if mock[4] == "NONE" {
                 (None, &mock[5..])
             } else {
@@ -355,10 +355,12 @@ fn peer_address_handler_slice_matches_dcrd() {
                 None => Ok(vec!["192.0.2.11".to_string(), "2001:db8::11".to_string()]),
             },
         };
-        let mut server = Server::new(Config {
+        let server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
+                params.clone(),
+            ))),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(MockSyncMgr6(mock[2].parse().unwrap())),
@@ -396,7 +398,7 @@ fn peer_address_handler_slice_matches_dcrd() {
             rpc_limit_pass: String::new(),
         });
 
-        match dispatch(&mut server, method_name, &cmd) {
+        match dispatch(&server, method_name, &cmd) {
             Ok((value, typ)) => {
                 assert_eq!(result[2], "ok", "{name}: expected an error");
                 let got = gojson::encode(&typ, &value);

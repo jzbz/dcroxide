@@ -863,11 +863,11 @@ impl NodeRpcBlockTemplater {
 }
 
 impl RpcBlockTemplater for NodeRpcBlockTemplater {
-    fn force_regen(&mut self) {
+    fn force_regen(&self) {
         self.sink.force_regen();
     }
 
-    fn current_template(&mut self) -> Result<Option<MsgBlock>, String> {
+    fn current_template(&self) -> Result<Option<MsgBlock>, String> {
         let current = self.current.lock().expect("shared template poisoned");
         if current.reorganizing {
             return Ok(None);
@@ -878,7 +878,7 @@ impl RpcBlockTemplater for NodeRpcBlockTemplater {
         Ok(current.block.clone())
     }
 
-    fn subscribe(&mut self) -> Box<dyn RpcTemplateSubscription + Send> {
+    fn subscribe(&self) -> Box<dyn RpcTemplateSubscription + Send> {
         let (sender, receiver) = mpsc::channel();
         // Register the subscription before delivering the current
         // template so a broadcast racing between registration and
@@ -911,7 +911,7 @@ impl RpcBlockTemplater for NodeRpcBlockTemplater {
         })
     }
 
-    fn update_block_time(&mut self, header: &mut BlockHeader) {
+    fn update_block_time(&self, header: &mut BlockHeader) {
         // A throwaway builder over the live chain, as in the generator
         // thread (dcrd `UpdateBlockTime` = `g.tg.UpdateBlockTime`).
         let builder = BlkTmplGenerator::new(
@@ -934,14 +934,14 @@ pub struct NodeTemplateSubscription {
 }
 
 impl RpcTemplateSubscription for NodeTemplateSubscription {
-    fn recv(&mut self) -> TemplateRecv {
+    fn recv(&self) -> TemplateRecv {
         match self.receiver.recv() {
             Ok(block) => TemplateRecv::Template(Box::new(block)),
             Err(_) => TemplateRecv::Canceled,
         }
     }
 
-    fn recv_with_timeout(&mut self) -> TemplateRecv {
+    fn recv_with_timeout(&self) -> TemplateRecv {
         match self.receiver.recv_timeout(MAX_TEMPLATE_TIMEOUT) {
             Ok(block) => TemplateRecv::Template(Box::new(block)),
             Err(mpsc::RecvTimeoutError::Timeout) => TemplateRecv::Timeout,
@@ -949,7 +949,7 @@ impl RpcTemplateSubscription for NodeTemplateSubscription {
         }
     }
 
-    fn stop(&mut self) {
+    fn stop(&self) {
         self.subscribers
             .lock()
             .expect("subscriber registry poisoned")

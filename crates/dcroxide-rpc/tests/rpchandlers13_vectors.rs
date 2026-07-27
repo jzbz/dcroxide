@@ -39,7 +39,7 @@ struct MockChain13 {
 }
 
 impl RpcChain for MockChain13 {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         RpcBestState {
             hash: self.header.block_hash(),
             prev_hash: self.header.prev_block,
@@ -75,7 +75,7 @@ fn new_server(
     Server::new(Config {
         chain: MockChain13 { header },
         chain_params: params.clone(),
-        subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params)),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params))),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(()),
@@ -198,8 +198,8 @@ fn auth_and_body_processing_matches_dcrd() {
                 let result: Vec<&str> = lines.next().expect("bres row").split('|').collect();
                 assert_eq!(result[0], "bres");
 
-                let mut server = new_server(header, "", "", "", "");
-                let got = process_body(&mut server, &body, is_admin);
+                let server = new_server(header, "", "", "", "");
+                let got = process_body(&server, &body, is_admin);
                 assert_eq!(
                     String::from_utf8_lossy(&got),
                     utf8(result[2]),

@@ -411,7 +411,7 @@ impl NodeRpcTxMempooler {
 }
 
 impl RpcTxMempooler for NodeRpcTxMempooler {
-    fn tx_descs(&mut self) -> Vec<RpcMempoolTx> {
+    fn tx_descs(&self) -> Vec<RpcMempoolTx> {
         self.locked()
             .tx_descs()
             .iter()
@@ -423,15 +423,15 @@ impl RpcTxMempooler for NodeRpcTxMempooler {
             .collect()
     }
 
-    fn count(&mut self) -> i64 {
+    fn count(&self) -> i64 {
         self.locked().count() as i64
     }
 
-    fn tspend_hashes(&mut self) -> Vec<Hash> {
+    fn tspend_hashes(&self) -> Vec<Hash> {
         self.locked().tspend_hashes()
     }
 
-    fn verbose_tx_descs(&mut self) -> Vec<RpcVerboseMempoolTx> {
+    fn verbose_tx_descs(&self) -> Vec<RpcVerboseMempoolTx> {
         let pool = self.locked();
         pool.tx_descs()
             .iter()
@@ -457,11 +457,11 @@ impl RpcTxMempooler for NodeRpcTxMempooler {
             .collect()
     }
 
-    fn have_transactions(&mut self, hashes: &[Hash]) -> Vec<bool> {
+    fn have_transactions(&self, hashes: &[Hash]) -> Vec<bool> {
         self.locked().have_transactions(hashes)
     }
 
-    fn fetch_transaction(&mut self, tx_hash: &Hash) -> Result<(MsgTx, i8), String> {
+    fn fetch_transaction(&self, tx_hash: &Hash) -> Result<(MsgTx, i8), String> {
         let pool = self.locked();
         let Some(tx) = pool.fetch_transaction(tx_hash) else {
             return Err("transaction is not in the pool".to_string());

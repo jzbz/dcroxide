@@ -36,7 +36,7 @@ const INTERNAL_ERROR_CODE: &str = "\"code\":-32603";
 struct UnwiredChain;
 
 impl RpcChain for UnwiredChain {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         RpcBestState {
             hash: Hash([0x11; 32]),
             prev_hash: Hash([0x22; 32]),
@@ -58,7 +58,7 @@ fn unwired_server() -> Server<UnwiredChain> {
     Server::new(Config {
         chain: UnwiredChain,
         chain_params: params.clone(),
-        subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params)),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params))),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(()),
@@ -100,16 +100,9 @@ fn unwired_server() -> Server<UnwiredChain> {
 /// Drive one request through the full dispatch path and return the
 /// marshalled response body.
 fn request(method: &str, raw_params: &[&str], is_admin: bool) -> String {
-    let mut server = unwired_server();
-    process_request(
-        &mut server,
-        "2.0",
-        method,
-        raw_params,
-        &RpcId::Int(1),
-        is_admin,
-    )
-    .expect("a request with a non-null id always produces a reply")
+    let server = unwired_server();
+    process_request(&server, "2.0", method, raw_params, &RpcId::Int(1), is_admin)
+        .expect("a request with a non-null id always produces a reply")
 }
 
 /// Assert the reply is a JSON-RPC internal error naming the seam that

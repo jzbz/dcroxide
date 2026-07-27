@@ -83,7 +83,7 @@ fn serve_ws(max_websockets: usize) -> (tempfile::TempDir, RpcListener, u16, Node
     let mut server = Server::new(Config {
         chain: NodeRpcChain::new(chain, params.clone()),
         chain_params: params.clone(),
-        subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool))),
@@ -127,7 +127,7 @@ fn serve_ws(max_websockets: usize) -> (tempfile::TempDir, RpcListener, u16, Node
     });
     let ntfn = NodeNtfnMgr::with_max_websockets(max_websockets);
     server.ntfn_mgr = Box::new(ntfn.clone());
-    let server = Arc::new(Mutex::new(server));
+    let server = Arc::new(server);
     ntfn.start(Arc::clone(&server)).expect("delivery thread");
 
     let listener = start_rpc_listener(

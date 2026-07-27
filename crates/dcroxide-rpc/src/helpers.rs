@@ -43,7 +43,7 @@ pub fn direction_string(inbound: bool) -> &'static str {
 pub trait InterfaceLookup {
     /// The interface's index and first address in CIDR form, when the
     /// host names an interface with addresses.
-    fn interface_addr(&mut self, name: &str) -> Option<(u32, String)>;
+    fn interface_addr(&self, name: &str) -> Option<(u32, String)>;
 }
 
 /// An interface lookup for systems where handlers never pass
@@ -52,7 +52,7 @@ pub trait InterfaceLookup {
 pub struct NoInterfaces;
 
 impl InterfaceLookup for NoInterfaces {
-    fn interface_addr(&mut self, _name: &str) -> Option<(u32, String)> {
+    fn interface_addr(&self, _name: &str) -> Option<(u32, String)> {
         None
     }
 }
@@ -61,7 +61,7 @@ impl InterfaceLookup for NoInterfaces {
 /// when one is missing, substituting the address of a local interface
 /// when the host names one (dcrd `normalizeAddress`).
 pub fn normalize_address<L: InterfaceLookup + ?Sized>(
-    lookup: &mut L,
+    lookup: &L,
     addr: &str,
     default_port: &str,
 ) -> String {

@@ -132,28 +132,28 @@ struct MockConnMgr {
 }
 
 impl RpcConnManager for MockConnMgr {
-    fn connected_count(&mut self) -> i32 {
+    fn connected_count(&self) -> i32 {
         self.count
     }
-    fn net_totals(&mut self) -> (u64, u64) {
+    fn net_totals(&self) -> (u64, u64) {
         (self.recv, self.sent)
     }
-    fn connect(&mut self, _addr: &str, _permanent: bool) -> Result<(), String> {
+    fn connect(&self, _addr: &str, _permanent: bool) -> Result<(), String> {
         self.connect.clone()
     }
-    fn remove_by_id(&mut self, _id: i32) -> Result<(), String> {
+    fn remove_by_id(&self, _id: i32) -> Result<(), String> {
         self.remove_by_id.clone()
     }
-    fn remove_by_addr(&mut self, _addr: &str) -> Result<(), String> {
+    fn remove_by_addr(&self, _addr: &str) -> Result<(), String> {
         self.remove_by_addr.clone()
     }
-    fn disconnect_by_id(&mut self, _id: i32) -> Result<(), String> {
+    fn disconnect_by_id(&self, _id: i32) -> Result<(), String> {
         self.disconnect_by_id.clone()
     }
-    fn disconnect_by_addr(&mut self, _addr: &str) -> Result<(), String> {
+    fn disconnect_by_addr(&self, _addr: &str) -> Result<(), String> {
         self.disconnect_by_addr.clone()
     }
-    fn connected_peers(&mut self) -> Vec<RpcPeerInfo> {
+    fn connected_peers(&self) -> Vec<RpcPeerInfo> {
         self.peers
             .iter()
             .map(|(id, addr)| RpcPeerInfo {
@@ -181,7 +181,7 @@ impl RpcConnManager for MockConnMgr {
             })
             .collect()
     }
-    fn broadcast_message(&mut self, _msg: &dcroxide_wire::Message) {}
+    fn broadcast_message(&self, _msg: &dcroxide_wire::Message) {}
 }
 
 /// The scripted mempool from the fixtures and a mock4 row.
@@ -193,19 +193,19 @@ struct MockMempooler {
 }
 
 impl RpcTxMempooler for MockMempooler {
-    fn tx_descs(&mut self) -> Vec<RpcMempoolTx> {
+    fn tx_descs(&self) -> Vec<RpcMempoolTx> {
         if self.empty {
             return Vec::new();
         }
         self.descs.clone()
     }
-    fn verbose_tx_descs(&mut self) -> Vec<RpcVerboseMempoolTx> {
+    fn verbose_tx_descs(&self) -> Vec<RpcVerboseMempoolTx> {
         if self.empty {
             return Vec::new();
         }
         self.verbose.clone()
     }
-    fn have_transactions(&mut self, _hashes: &[Hash]) -> Vec<bool> {
+    fn have_transactions(&self, _hashes: &[Hash]) -> Vec<bool> {
         self.have.clone()
     }
 }
@@ -214,7 +214,7 @@ impl RpcTxMempooler for MockMempooler {
 struct MockClock(i64);
 
 impl RpcClock for MockClock {
-    fn now_unix_millis(&mut self) -> i64 {
+    fn now_unix_millis(&self) -> i64 {
         self.0
     }
 }
@@ -223,7 +223,7 @@ impl RpcClock for MockClock {
 struct StubChain;
 
 impl RpcChain for StubChain {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         unimplemented!()
     }
 }
@@ -231,7 +231,7 @@ impl RpcChain for StubChain {
 type MockServer = Server<StubChain>;
 
 fn dispatch(
-    server: &mut MockServer,
+    server: &MockServer,
     method_name: &str,
     cmd: &GoValue,
 ) -> Result<(GoValue, GoType), RPCError> {
@@ -386,10 +386,12 @@ fn mempool_conn_handler_slice_matches_dcrd() {
                 .collect(),
             empty: name.contains("empty"),
         };
-        let mut server = Server::new(Config {
+        let server = Server::new(Config {
             chain: StubChain,
             chain_params: params.clone(),
-            subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
+                params.clone(),
+            ))),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(()),
@@ -427,7 +429,7 @@ fn mempool_conn_handler_slice_matches_dcrd() {
             rpc_limit_pass: String::new(),
         });
 
-        match dispatch(&mut server, method_name, &cmd) {
+        match dispatch(&server, method_name, &cmd) {
             Ok((value, typ)) => {
                 assert_eq!(result[2], "ok", "{name}: expected an error");
                 let got = gojson::encode(&typ, &value);

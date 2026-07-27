@@ -211,7 +211,7 @@ impl NodeRpcTxIndexer {
 }
 
 impl RpcTxIndexer for NodeRpcTxIndexer {
-    fn name(&mut self) -> String {
+    fn name(&self) -> String {
         self.index
             .lock()
             .expect("tx index mutex poisoned")
@@ -219,7 +219,7 @@ impl RpcTxIndexer for NodeRpcTxIndexer {
             .to_string()
     }
 
-    fn tip(&mut self) -> Result<(i64, Hash), String> {
+    fn tip(&self) -> Result<(i64, Hash), String> {
         self.index
             .lock()
             .expect("tx index mutex poisoned")
@@ -227,7 +227,7 @@ impl RpcTxIndexer for NodeRpcTxIndexer {
             .map_err(|e| e.to_string())
     }
 
-    fn entry(&mut self, tx_hash: &Hash) -> Result<Option<RpcTxIndexEntry>, String> {
+    fn entry(&self, tx_hash: &Hash) -> Result<Option<RpcTxIndexEntry>, String> {
         let entry = self
             .index
             .lock()
@@ -242,7 +242,7 @@ impl RpcTxIndexer for NodeRpcTxIndexer {
         }))
     }
 
-    fn wait_for_sync(&mut self) -> bool {
+    fn wait_for_sync(&self) -> bool {
         wait_for_index_sync(&self.index, &self.queryer, SYNC_WAIT)
     }
 }
@@ -287,7 +287,7 @@ impl NodeRpcExistsAddresser {
 }
 
 impl RpcExistsAddresser for NodeRpcExistsAddresser {
-    fn name(&mut self) -> String {
+    fn name(&self) -> String {
         self.index
             .lock()
             .expect("exists addr index mutex poisoned")
@@ -295,7 +295,7 @@ impl RpcExistsAddresser for NodeRpcExistsAddresser {
             .to_string()
     }
 
-    fn tip(&mut self) -> Result<(i64, Hash), String> {
+    fn tip(&self) -> Result<(i64, Hash), String> {
         self.index
             .lock()
             .expect("exists addr index mutex poisoned")
@@ -303,15 +303,15 @@ impl RpcExistsAddresser for NodeRpcExistsAddresser {
             .map_err(|e| e.to_string())
     }
 
-    fn wait_for_sync(&mut self) -> bool {
+    fn wait_for_sync(&self) -> bool {
         wait_for_index_sync(&self.index, &self.queryer, SYNC_WAIT)
     }
 
-    fn exists_address(&mut self, addr: &Address) -> Result<bool, String> {
+    fn exists_address(&self, addr: &Address) -> Result<bool, String> {
         self.query().exists_address(addr).map_err(|e| e.to_string())
     }
 
-    fn exists_addresses(&mut self, addrs: &[Address]) -> Result<Vec<bool>, String> {
+    fn exists_addresses(&self, addrs: &[Address]) -> Result<Vec<bool>, String> {
         self.query()
             .exists_addresses(addrs)
             .map_err(|e| e.to_string())
@@ -357,7 +357,7 @@ impl NodeRpcDb {
 
 impl RpcDb for NodeRpcDb {
     fn fetch_block_region(
-        &mut self,
+        &self,
         block_hash: &Hash,
         offset: u32,
         len: u32,
@@ -439,7 +439,7 @@ mod tests {
             .expect("genesis block");
         let serialized = genesis.serialize();
 
-        let mut rpc_db = NodeRpcDb::new(db);
+        let rpc_db = NodeRpcDb::new(db);
         let whole = rpc_db
             .fetch_block_region(&genesis_hash, 0, serialized.len() as u32)
             .expect("whole block region");
@@ -463,7 +463,7 @@ mod tests {
             start_indexes(interrupt, Arc::new(db), chain, params, true, true).expect("start");
         let tx_index = indexes.tx_index.as_ref().expect("tx index enabled");
 
-        let mut seam = NodeRpcTxIndexer::new(Arc::clone(tx_index), Arc::clone(&indexes.queryer));
+        let seam = NodeRpcTxIndexer::new(Arc::clone(tx_index), Arc::clone(&indexes.queryer));
         assert_eq!(seam.name(), "transaction index");
         assert_eq!(seam.tip(), Ok((0, genesis_hash)));
         assert!(matches!(seam.entry(&Hash([7u8; 32])), Ok(None)));
@@ -475,8 +475,7 @@ mod tests {
             .exists_addr_index
             .as_ref()
             .expect("exists index enabled");
-        let mut seam =
-            NodeRpcExistsAddresser::new(Arc::clone(exists), Arc::clone(&indexes.queryer));
+        let seam = NodeRpcExistsAddresser::new(Arc::clone(exists), Arc::clone(&indexes.queryer));
         assert_eq!(seam.name(), "exists address index");
         assert_eq!(seam.tip(), Ok((0, genesis_hash)));
         assert!(seam.wait_for_sync());

@@ -129,7 +129,7 @@ fn max_amount_v() -> String {
 /// the command is a `CreateRawTransactionCmd` value and the result is
 /// the serialized transaction hex string.
 pub fn handle_create_raw_transaction<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -259,7 +259,7 @@ pub fn handle_create_raw_transaction<C: RpcChain>(
 /// `CreateRawSStxCmd` value and the result is the serialized ticket
 /// purchase hex string.
 pub fn handle_create_raw_sstx<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -458,7 +458,7 @@ fn go_decode_hex(s: &str) -> Result<Vec<u8>, ()> {
 /// the result is a `TxRawDecodeResult` value with the vins carried
 /// through the custom Vin marshaler.
 pub fn handle_decode_raw_transaction<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -516,7 +516,7 @@ pub fn handle_decode_raw_transaction<C: RpcChain>(
 /// handledecodescript (dcrd `handleDecodeScript`); the result is a
 /// `DecodeScriptResult` value.
 pub fn handle_decode_script<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -586,7 +586,7 @@ pub fn handle_decode_script<C: RpcChain>(
 /// handleestimatefee (dcrd `handleEstimateFee`): the minimum relay
 /// fee in coins.
 pub fn handle_estimate_fee<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     Ok(GoValue::Float64(txresults::to_coin(
@@ -597,7 +597,7 @@ pub fn handle_estimate_fee<C: RpcChain>(
 /// handlegetblocksubsidy (dcrd `handleGetBlockSubsidy`); the result
 /// is a `GetBlockSubsidyResult` value.
 pub fn handle_get_block_subsidy<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -631,7 +631,11 @@ pub fn handle_get_block_subsidy<C: RpcChain>(
         dcroxide_standalone::SubsidySplitVariant::Original
     };
 
-    let subsidy_cache = &mut server.cfg.subsidy_cache;
+    let mut subsidy_cache = server
+        .cfg
+        .subsidy_cache
+        .lock()
+        .expect("subsidy cache poisoned");
     let dev = subsidy_cache.calc_treasury_subsidy(height, voters, is_treasury_enabled);
     let pos = subsidy_cache.calc_stake_vote_subsidy_v3(height - 1, subsidy_split_variant)
         * i64::from(voters);
@@ -649,7 +653,7 @@ pub fn handle_get_block_subsidy<C: RpcChain>(
 /// handlegetcurrentnet (dcrd `handleGetCurrentNet`): the network
 /// identifier as a number.
 pub fn handle_get_current_net<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     Ok(GoValue::Uint(u64::from(server.cfg.chain_params.net.0)))
@@ -659,7 +663,7 @@ pub fn handle_get_current_net<C: RpcChain>(
 /// is a `ValidateAddressChainResult` value.  An undecodable address
 /// yields the default (invalid) result with no error.
 pub fn handle_validate_address<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -775,7 +779,7 @@ fn go_std_base64_decode(input: &str) -> Result<Vec<u8>, String> {
 /// handleverifymessage (dcrd `handleVerifyMessage`): whether the
 /// compact signature commits to the message for the address.
 pub fn handle_verify_message<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -842,7 +846,7 @@ fn write_var_string(w: &mut Vec<u8>, s: &str) {
 /// handlegetbestblock (dcrd `handleGetBestBlock`); the result is a
 /// `GetBestBlockResult` value.
 pub fn handle_get_best_block<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let best = server.cfg.chain.best_snapshot();
@@ -854,7 +858,7 @@ pub fn handle_get_best_block<C: RpcChain>(
 
 /// handlegetbestblockhash (dcrd `handleGetBestBlockHash`).
 pub fn handle_get_best_block_hash<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let best = server.cfg.chain.best_snapshot();
@@ -863,7 +867,7 @@ pub fn handle_get_best_block_hash<C: RpcChain>(
 
 /// handlegetblockcount (dcrd `handleGetBlockCount`).
 pub fn handle_get_block_count<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     Ok(GoValue::Int(server.cfg.chain.best_snapshot().height))
@@ -871,7 +875,7 @@ pub fn handle_get_block_count<C: RpcChain>(
 
 /// handlegetcoinsupply (dcrd `handleGetCoinSupply`).
 pub fn handle_get_coin_supply<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     Ok(GoValue::Int(server.cfg.chain.best_snapshot().total_subsidy))
@@ -879,7 +883,7 @@ pub fn handle_get_coin_supply<C: RpcChain>(
 
 /// handlegetdifficulty (dcrd `handleGetDifficulty`).
 pub fn handle_get_difficulty<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let best = server.cfg.chain.best_snapshot();
@@ -891,7 +895,7 @@ pub fn handle_get_difficulty<C: RpcChain>(
 
 /// handlegetblockhash (dcrd `handleGetBlockHash`).
 pub fn handle_get_block_hash<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -908,7 +912,7 @@ pub fn handle_get_block_hash<C: RpcChain>(
 /// handlegetchaintips (dcrd `handleGetChainTips`); the result is a
 /// slice of `GetChainTipsResult` values.
 pub fn handle_get_chain_tips<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let tips = server.cfg.chain.chain_tips();
@@ -929,7 +933,7 @@ pub fn handle_get_chain_tips<C: RpcChain>(
 /// handlegetheaders (dcrd `handleGetHeaders`); the result is a
 /// `GetHeadersResult` value.
 pub fn handle_get_headers<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -963,7 +967,7 @@ struct VerboseBlockCommon {
 }
 
 fn verbose_block_common<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     hash: &Hash,
     header: &dcroxide_wire::BlockHeader,
 ) -> Result<VerboseBlockCommon, RPCError> {
@@ -1003,7 +1007,7 @@ fn verbose_block_common<C: RpcChain>(
 /// result is a `GetBlockHeaderVerboseResult` value and the
 /// non-verbose result is the serialized header hex string.
 pub fn handle_get_block_header<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -1079,7 +1083,7 @@ pub fn handle_get_block_header<C: RpcChain>(
 /// `GetBlockVerboseResult` value and the non-verbose result is the
 /// serialized block hex string.
 pub fn handle_get_block<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -1207,7 +1211,7 @@ pub fn handle_get_block<C: RpcChain>(
 /// handlegetblockchaininfo (dcrd `handleGetBlockchainInfo`); the
 /// result is a `GetBlockChainInfoResult` value.
 pub fn handle_get_blockchain_info<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let best = server.cfg.chain.best_snapshot();
@@ -1325,7 +1329,7 @@ fn bitset_bytes(flags: &[bool]) -> Vec<u8> {
 /// handleestimatestakediff (dcrd `handleEstimateStakeDiff`); the
 /// result is an `EstimateStakeDiffResult` value.
 pub fn handle_estimate_stake_diff<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -1393,7 +1397,7 @@ pub fn handle_estimate_stake_diff<C: RpcChain>(
 
 /// handleexistsliveticket (dcrd `handleExistsLiveTicket`).
 pub fn handle_exists_live_ticket<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -1407,7 +1411,7 @@ pub fn handle_exists_live_ticket<C: RpcChain>(
 /// handleexistslivetickets (dcrd `handleExistsLiveTickets`): the
 /// existence bits as a compacted hex string.
 pub fn handle_exists_live_tickets<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -1429,7 +1433,7 @@ pub fn handle_exists_live_tickets<C: RpcChain>(
 /// handlegetstakedifficulty (dcrd `handleGetStakeDifficulty`); the
 /// result is a `GetStakeDifficultyResult` value.
 pub fn handle_get_stake_difficulty<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let best = server.cfg.chain.best_snapshot();
@@ -1468,7 +1472,7 @@ fn version_counts(m: &std::collections::HashMap<i64, i64>) -> GoValue {
 /// handlegetstakeversioninfo (dcrd `handleGetStakeVersionInfo`); the
 /// result is a `GetStakeVersionInfoResult` value.
 pub fn handle_get_stake_version_info<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -1547,7 +1551,7 @@ pub fn handle_get_stake_version_info<C: RpcChain>(
 /// handlegetstakeversions (dcrd `handleGetStakeVersions`); the result
 /// is a `GetStakeVersionsResult` value.
 pub fn handle_get_stake_versions<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -1596,7 +1600,7 @@ pub fn handle_get_stake_versions<C: RpcChain>(
 /// handlegetvoteinfo (dcrd `handleGetVoteInfo`); the result is a
 /// `GetVoteInfoResult` value.
 pub fn handle_get_vote_info<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -1707,7 +1711,7 @@ pub fn handle_get_vote_info<C: RpcChain>(
 
 /// handlegetticketpoolvalue (dcrd `handleGetTicketPoolValue`).
 pub fn handle_get_ticket_pool_value<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let amt = server
@@ -1721,7 +1725,7 @@ pub fn handle_get_ticket_pool_value<C: RpcChain>(
 /// handlegettreasurybalance (dcrd `handleGetTreasuryBalance`); the
 /// result is a `GetTreasuryBalanceResult` value.
 pub fn handle_get_treasury_balance<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -1780,7 +1784,7 @@ pub fn handle_get_treasury_balance<C: RpcChain>(
 /// handlelivetickets (dcrd `handleLiveTickets`); the result is a
 /// `LiveTicketsResult` value.
 pub fn handle_live_tickets<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let lt = server
@@ -1810,15 +1814,14 @@ fn go_parse_ip_ok(s: &str) -> bool {
 
 /// handleaddnode (dcrd `handleAddNode`): no data unless an error.
 pub fn handle_add_node<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
     let (addr_arg, sub_cmd) = (s(&c[0]), s(&c[1]));
 
     let default_port = server.cfg.chain_params.default_port;
-    let addr =
-        crate::helpers::normalize_address(&mut *server.cfg.interfaces, addr_arg, default_port);
+    let addr = crate::helpers::normalize_address(&*server.cfg.interfaces, addr_arg, default_port);
     let result = match sub_cmd {
         "add" => server.cfg.conn_mgr.connect(&addr, true),
         "remove" => server.cfg.conn_mgr.remove_by_addr(&addr),
@@ -1839,7 +1842,7 @@ pub fn handle_add_node<C: RpcChain>(
 
 /// Whether a peer with the given address or id is currently connected
 /// (dcrd `peerExists`).
-fn peer_exists<C: RpcChain>(server: &mut Server<C>, addr: &str, node_id: i32) -> bool {
+fn peer_exists<C: RpcChain>(server: &Server<C>, addr: &str, node_id: i32) -> bool {
     server
         .cfg
         .conn_mgr
@@ -1849,10 +1852,7 @@ fn peer_exists<C: RpcChain>(server: &mut Server<C>, addr: &str, node_id: i32) ->
 }
 
 /// handlenode (dcrd `handleNode`): no data unless an error.
-pub fn handle_node<C: RpcChain>(
-    server: &mut Server<C>,
-    cmd: &GoValue,
-) -> Result<GoValue, RPCError> {
+pub fn handle_node<C: RpcChain>(server: &Server<C>, cmd: &GoValue) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
     let (sub_cmd, target) = (s(&c[0]).to_string(), s(&c[1]).to_string());
     let connect_sub_cmd = match &c[2] {
@@ -1874,7 +1874,7 @@ pub fn handle_node<C: RpcChain>(
                 server.cfg.conn_mgr.disconnect_by_id(id as i32)
             } else if crate::helpers::split_host_port(&target).is_ok() || go_parse_ip_ok(&target) {
                 addr = crate::helpers::normalize_address(
-                    &mut *server.cfg.interfaces,
+                    &*server.cfg.interfaces,
                     &target,
                     default_port,
                 );
@@ -1891,7 +1891,7 @@ pub fn handle_node<C: RpcChain>(
                 server.cfg.conn_mgr.remove_by_id(id as i32)
             } else if crate::helpers::split_host_port(&target).is_ok() || go_parse_ip_ok(&target) {
                 addr = crate::helpers::normalize_address(
-                    &mut *server.cfg.interfaces,
+                    &*server.cfg.interfaces,
                     &target,
                     default_port,
                 );
@@ -1903,11 +1903,8 @@ pub fn handle_node<C: RpcChain>(
             }
         }
         "connect" => {
-            addr = crate::helpers::normalize_address(
-                &mut *server.cfg.interfaces,
-                &target,
-                default_port,
-            );
+            addr =
+                crate::helpers::normalize_address(&*server.cfg.interfaces, &target, default_port);
 
             // Default to temporary connections.
             let sub = connect_sub_cmd.as_deref().unwrap_or("temp");
@@ -1960,7 +1957,7 @@ pub fn handle_node<C: RpcChain>(
 
 /// handlegetconnectioncount (dcrd `handleGetConnectionCount`).
 pub fn handle_get_connection_count<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     Ok(GoValue::Int(i64::from(
@@ -1971,7 +1968,7 @@ pub fn handle_get_connection_count<C: RpcChain>(
 /// handlegetnettotals (dcrd `handleGetNetTotals`); the result is a
 /// `GetNetTotalsResult` value.
 pub fn handle_get_net_totals<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let (total_bytes_recv, total_bytes_sent) = server.cfg.conn_mgr.net_totals();
@@ -1983,10 +1980,7 @@ pub fn handle_get_net_totals<C: RpcChain>(
 }
 
 /// handleping (dcrd `handlePing`): asks the server to ping all peers.
-pub fn handle_ping<C: RpcChain>(
-    server: &mut Server<C>,
-    _cmd: &GoValue,
-) -> Result<GoValue, RPCError> {
+pub fn handle_ping<C: RpcChain>(server: &Server<C>, _cmd: &GoValue) -> Result<GoValue, RPCError> {
     let nonce = (server.cfg.rand_u64)();
     server
         .cfg
@@ -1998,7 +1992,7 @@ pub fn handle_ping<C: RpcChain>(
 /// handlegetmempoolinfo (dcrd `handleGetMempoolInfo`); the result is
 /// a `GetMempoolInfoResult` value.
 pub fn handle_get_mempool_info<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let mempool_txns = server.cfg.tx_mempooler.tx_descs();
@@ -2018,7 +2012,7 @@ pub fn handle_get_mempool_info<C: RpcChain>(
 /// result is a map of `GetRawMempoolVerboseResult` values keyed by
 /// transaction hash and the plain result is the hash list.
 pub fn handle_get_raw_mempool<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -2102,7 +2096,7 @@ pub fn handle_get_raw_mempool<C: RpcChain>(
 /// handleexistsmempooltxs (dcrd `handleExistsMempoolTxs`): the
 /// existence bits as a compacted hex string.
 pub fn handle_exists_mempool_txs<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -2125,7 +2119,7 @@ pub fn handle_exists_mempool_txs<C: RpcChain>(
 /// verbose result is a `TxRawResult` value and the non-verbose
 /// result is the serialized transaction hex string.
 pub fn handle_get_raw_transaction<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -2143,7 +2137,7 @@ pub fn handle_get_raw_transaction<C: RpcChain>(
     let mut blk_index: u32 = 0;
     match server.cfg.tx_mempooler.fetch_transaction(&tx_hash) {
         Err(_) => {
-            let Some(tx_index) = server.cfg.tx_indexer.as_mut() else {
+            let Some(tx_index) = server.cfg.tx_indexer.as_ref() else {
                 return Err(rpc_internal_err(
                     "the transaction index must be enabled to query the \
                      blockchain (specify --txindex)",
@@ -2164,14 +2158,14 @@ pub fn handle_get_raw_transaction<C: RpcChain>(
             // Wait for the index to catch up to the current best tip,
             // failing after dcrd's three second timeout.
             if server.cfg.chain.best_snapshot().hash != t_hash {
-                let tx_index = server.cfg.tx_indexer.as_mut().expect("checked above");
+                let tx_index = server.cfg.tx_indexer.as_ref().expect("checked above");
                 if !tx_index.wait_for_sync() {
                     return Err(rpc_internal_err(&format!("{index_name}: index not synced")));
                 }
             }
 
             // Look up the location of the transaction.
-            let tx_index = server.cfg.tx_indexer.as_mut().expect("checked above");
+            let tx_index = server.cfg.tx_indexer.as_ref().expect("checked above");
             let idx_entry = tx_index.entry(&tx_hash).map_err(|e| rpc_internal_err(&e))?;
             let Some(idx_entry) = idx_entry else {
                 return Err(crate::rpcerrors::rpc_no_tx_info_error(&tx_hash));
@@ -2268,7 +2262,7 @@ pub fn handle_get_raw_transaction<C: RpcChain>(
 /// `GetTxOutResult` value, or null when the output does not exist or
 /// is spent.
 pub fn handle_get_tx_out<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -2394,7 +2388,7 @@ pub fn handle_get_tx_out<C: RpcChain>(
 /// stats error which its dispatch layer wraps; the wrapped internal
 /// error stands in until the dispatch layer is ported.
 pub fn handle_get_tx_out_set_info<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let best = server.cfg.chain.best_snapshot();
@@ -2418,7 +2412,7 @@ pub fn handle_get_tx_out_set_info<C: RpcChain>(
 /// handlegetcfilterv2 (dcrd `handleGetCFilterV2`); the result is a
 /// `GetCFilterV2Result` value.
 pub fn handle_get_cfilter_v2<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -2457,7 +2451,7 @@ pub fn handle_get_cfilter_v2<C: RpcChain>(
 /// handlegetpeerinfo (dcrd `handleGetPeerInfo`); the result is a
 /// slice of `GetPeerInfoResult` values sorted by peer id.
 pub fn handle_get_peer_info<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let peers = server.cfg.conn_mgr.connected_peers();
@@ -2505,7 +2499,7 @@ pub fn handle_get_peer_info<C: RpcChain>(
 /// result is either the address list or a slice of
 /// `GetAddedNodeInfoResult` values when the dns flag is set.
 pub fn handle_get_added_node_info<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -2591,8 +2585,8 @@ pub fn handle_get_added_node_info<C: RpcChain>(
 
 /// The exists-address index sync gauntlet shared by the two exists
 /// handlers (mirrors the tx index handling).
-fn exists_addr_index_synced<C: RpcChain>(server: &mut Server<C>) -> Result<(), RPCError> {
-    let addresser = server.cfg.exists_addresser.as_mut().expect("checked");
+fn exists_addr_index_synced<C: RpcChain>(server: &Server<C>) -> Result<(), RPCError> {
+    let addresser = server.cfg.exists_addresser.as_ref().expect("checked");
     let (t_height, t_hash) = addresser.tip().map_err(|e| rpc_internal_err(&e))?;
     let index_name = addresser.name();
 
@@ -2603,7 +2597,7 @@ fn exists_addr_index_synced<C: RpcChain>(server: &mut Server<C>) -> Result<(), R
     }
 
     if server.cfg.chain.best_snapshot().hash != t_hash {
-        let addresser = server.cfg.exists_addresser.as_mut().expect("checked");
+        let addresser = server.cfg.exists_addresser.as_ref().expect("checked");
         if !addresser.wait_for_sync() {
             return Err(rpc_internal_err(&format!("{index_name}: index not synced")));
         }
@@ -2613,7 +2607,7 @@ fn exists_addr_index_synced<C: RpcChain>(server: &mut Server<C>) -> Result<(), R
 
 /// handleexistsaddress (dcrd `handleExistsAddress`).
 pub fn handle_exists_address<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     if server.cfg.exists_addresser.is_none() {
@@ -2632,7 +2626,7 @@ pub fn handle_exists_address<C: RpcChain>(
     // Ensure the exists address index is synced.
     exists_addr_index_synced(server)?;
 
-    let addresser = server.cfg.exists_addresser.as_mut().expect("checked");
+    let addresser = server.cfg.exists_addresser.as_ref().expect("checked");
     let exists = addresser
         .exists_address(&addr)
         .map_err(|e| rpc_invalid_error(&format!("Could not query address: {e}")))?;
@@ -2643,7 +2637,7 @@ pub fn handle_exists_address<C: RpcChain>(
 /// handleexistsaddresses (dcrd `handleExistsAddresses`): the
 /// existence bits as a compacted hex string.
 pub fn handle_exists_addresses<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     if server.cfg.exists_addresser.is_none() {
@@ -2662,7 +2656,7 @@ pub fn handle_exists_addresses<C: RpcChain>(
     // Ensure the exists address index is synced.
     exists_addr_index_synced(server)?;
 
-    let addresser = server.cfg.exists_addresser.as_mut().expect("checked");
+    let addresser = server.cfg.exists_addresser.as_ref().expect("checked");
     let exists = addresser
         .exists_addresses(&addresses)
         .map_err(|e| rpc_invalid_error(&format!("Could not query address: {e}")))?;
@@ -2673,7 +2667,7 @@ pub fn handle_exists_addresses<C: RpcChain>(
 /// handleticketsforaddress (dcrd `handleTicketsForAddress`); the
 /// result is a `TicketsForAddressResult` value.
 pub fn handle_tickets_for_address<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -2733,7 +2727,7 @@ fn go_decode_hex_msg(s: &str) -> Result<Vec<u8>, String> {
 /// handlesendrawtransaction (dcrd `handleSendRawTransaction`): the
 /// accepted transaction hash string.
 pub fn handle_send_raw_transaction<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -2815,7 +2809,7 @@ pub fn handle_send_raw_transaction<C: RpcChain>(
 /// handlesubmitblock (dcrd `handleSubmitBlock`): null on acceptance
 /// or a rejection string.
 pub fn handle_submit_block<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -2852,7 +2846,7 @@ pub fn handle_submit_block<C: RpcChain>(
 /// handleinvalidateblock (dcrd `handleInvalidateBlock`): no data
 /// unless an error.
 pub fn handle_invalidate_block<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -2881,7 +2875,7 @@ pub fn handle_invalidate_block<C: RpcChain>(
 /// handlereconsiderblock (dcrd `handleReconsiderBlock`): no data
 /// unless an error.
 pub fn handle_reconsider_block<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -2921,10 +2915,10 @@ pub fn handle_reconsider_block<C: RpcChain>(
 /// handleregentemplate (dcrd `handleRegenTemplate`): no data unless
 /// an error.
 pub fn handle_regen_template<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
-    let Some(bt) = server.cfg.block_templater.as_mut() else {
+    let Some(bt) = server.cfg.block_templater.as_ref() else {
         return Err(rpc_internal_err("node is not configured for mining"));
     };
     bt.force_regen();
@@ -2933,7 +2927,7 @@ pub fn handle_regen_template<C: RpcChain>(
 
 /// handledebuglevel (dcrd `handleDebugLevel`).
 pub fn handle_debug_level<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -2960,7 +2954,7 @@ pub fn handle_debug_level<C: RpcChain>(
 /// handleestimatesmartfee (dcrd `handleEstimateSmartFee`); the
 /// result is an `EstimateSmartFeeResult` value.
 pub fn handle_estimate_smart_fee<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -3113,7 +3107,7 @@ impl FeeStats {
 /// The fee information for the given tx type in the mempool (dcrd
 /// `feeInfoForMempool`).
 fn fee_info_for_mempool<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     tx_type: dcroxide_stake::TxType,
 ) -> FeeStats {
     let tx_descs = server.cfg.tx_mempooler.tx_descs();
@@ -3165,7 +3159,7 @@ fn block_type_fees(bl: &MsgBlock, tx_type: dcroxide_stake::TxType) -> Vec<i64> {
 /// given height (dcrd `ticketFeeInfoForBlock`); the raw chain error
 /// feeds the caller's internal error.
 fn ticket_fee_info_for_block<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     height: i64,
     tx_type: dcroxide_stake::TxType,
 ) -> Result<FeeStats, String> {
@@ -3177,7 +3171,7 @@ fn ticket_fee_info_for_block<C: RpcChain>(
 /// The fee information for the given tx type over the height range
 /// `[start, end)` (dcrd `ticketFeeInfoForRange`).
 fn ticket_fee_info_for_range<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     start: i64,
     end: i64,
     tx_type: dcroxide_stake::TxType,
@@ -3209,7 +3203,7 @@ fn ticket_fee_info_for_range<C: RpcChain>(
 /// handleticketfeeinfo (dcrd `handleTicketFeeInfo`); the result is a
 /// `TicketFeeInfoResult` value.
 pub fn handle_ticket_fee_info<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -3246,7 +3240,7 @@ pub fn handle_ticket_fee_info<C: RpcChain>(
         let last_change = (best_height / win_len) * win_len;
 
         let mut items = Vec::new();
-        let push_window = |server: &mut Server<C>,
+        let push_window = |server: &Server<C>,
                            items: &mut Vec<GoValue>,
                            start: i64,
                            end: i64|
@@ -3291,7 +3285,7 @@ pub fn handle_ticket_fee_info<C: RpcChain>(
 /// handleticketvwap (dcrd `handleTicketVWAP`); the result is the
 /// volume weighted average ticket price as a float.
 pub fn handle_ticket_vwap<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -3350,7 +3344,7 @@ pub fn handle_ticket_vwap<C: RpcChain>(
 /// handletxfeeinfo (dcrd `handleTxFeeInfo`); the result is a
 /// `TxFeeInfoResult` value.
 pub fn handle_tx_fee_info<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -3426,7 +3420,7 @@ pub fn handle_tx_fee_info<C: RpcChain>(
 
 /// The chain verification loop (dcrd `verifyChain`); the error only
 /// feeds the boolean result.
-fn verify_chain<C: RpcChain>(server: &mut Server<C>, level: i64, depth: i64) -> Result<(), ()> {
+fn verify_chain<C: RpcChain>(server: &Server<C>, level: i64, depth: i64) -> Result<(), ()> {
     let best = server.cfg.chain.best_snapshot();
     let mut finish_height = best.height - depth;
     if finish_height < 0 {
@@ -3454,7 +3448,7 @@ fn verify_chain<C: RpcChain>(server: &mut Server<C>, level: i64, depth: i64) -> 
 /// handleverifychain (dcrd `handleVerifyChain`); the result is a
 /// boolean.
 pub fn handle_verify_chain<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -3468,7 +3462,7 @@ pub fn handle_verify_chain<C: RpcChain>(
 /// handlegetinfo (dcrd `handleGetInfo`); the result is an
 /// `InfoChainResult` value.
 pub fn handle_get_info<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let best = server.cfg.chain.best_snapshot();
@@ -3509,7 +3503,7 @@ const JSONRPC_SEMVER_STRING: &str = "8.3.0";
 /// handleversion (dcrd `handleVersion`); the result is a map of
 /// `VersionResult` values keyed by component.
 pub fn handle_version<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let runtime_ver = server.cfg.runtime_version.replace('.', "-");
@@ -3549,7 +3543,7 @@ pub fn handle_version<C: RpcChain>(
 /// handlecreaterawssrtx (dcrd `handleCreateRawSSRtx`); the result is
 /// the serialized revocation transaction hex string.
 pub fn handle_create_raw_ssrtx<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -3667,7 +3661,7 @@ pub fn handle_create_raw_ssrtx<C: RpcChain>(
 /// handlegenerate (dcrd `handleGenerate`); the result is the list of
 /// generated block hash strings.
 pub fn handle_generate<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     // Respond with an error if there are no addresses to pay the
@@ -3723,7 +3717,7 @@ pub fn handle_generate<C: RpcChain>(
 /// handlegetgenerate (dcrd `handleGetGenerate`); the result is a
 /// boolean.
 pub fn handle_get_generate<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     Ok(GoValue::Bool(server.cfg.cpu_miner.is_mining()))
@@ -3732,7 +3726,7 @@ pub fn handle_get_generate<C: RpcChain>(
 /// handlegethashespersec (dcrd `handleGetHashesPerSec`); the result
 /// is the truncated integer rate.
 pub fn handle_get_hashes_per_sec<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     Ok(GoValue::Int(server.cfg.cpu_miner.hashes_per_second() as i64))
@@ -3740,7 +3734,7 @@ pub fn handle_get_hashes_per_sec<C: RpcChain>(
 
 /// handlesetgenerate (dcrd `handleSetGenerate`); the result is null.
 pub fn handle_set_generate<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -3776,7 +3770,7 @@ pub fn handle_set_generate<C: RpcChain>(
 /// handlegetnetworkhashps (dcrd `handleGetNetworkHashPS`); the result
 /// is an `int64` rate.
 pub fn handle_get_network_hash_ps<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -3862,7 +3856,7 @@ pub fn handle_get_network_hash_ps<C: RpcChain>(
 /// handlegetmininginfo (dcrd `handleGetMiningInfo`); the result is a
 /// `GetMiningInfoResult` value.
 pub fn handle_get_mining_info<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     // Create a default getnetworkhashps command to use defaults and
@@ -3896,7 +3890,7 @@ pub fn handle_get_mining_info<C: RpcChain>(
 /// handlegetnetworkinfo (dcrd `handleGetNetworkInfo`); the result is
 /// a `GetNetworkInfoResult` value.
 pub fn handle_get_network_info<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let local_addrs: Vec<GoValue> = server
@@ -3953,7 +3947,7 @@ pub fn handle_get_network_info<C: RpcChain>(
 /// handlegetmixmessage (dcrd `handleGetMixMessage`); the result is a
 /// `GetMixMessageResult` value.
 pub fn handle_get_mix_message<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -3982,7 +3976,7 @@ pub fn handle_get_mix_message<C: RpcChain>(
 /// handlegetmixpairrequests (dcrd `handleGetMixPairRequests`); the
 /// result is the list of serialized pair request hex strings.
 pub fn handle_get_mix_pair_requests<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let prs = server.cfg.mix_pooler.mix_prs();
@@ -4044,7 +4038,7 @@ fn lazy_hex_decode(s: &str) -> (Vec<u8>, Option<String>) {
 /// handlesendrawmixmessage (dcrd `handleSendRawMixMessage`); the
 /// result is null.
 pub fn handle_send_raw_mix_message<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -4101,7 +4095,7 @@ pub fn handle_send_raw_mix_message<C: RpcChain>(
 /// handlestartprofiler (dcrd `handleStartProfiler`); the result is a
 /// `StartProfilerResult` value.
 pub fn handle_start_profiler<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -4137,7 +4131,7 @@ pub fn handle_start_profiler<C: RpcChain>(
 /// handlestopprofiler (dcrd `handleStopProfiler`); the result is a
 /// status string.
 pub fn handle_stop_profiler<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     if server.cfg.profiler_mgr.listeners().is_empty() {
@@ -4157,10 +4151,7 @@ pub fn handle_stop_profiler<C: RpcChain>(
 }
 
 /// handlestop (dcrd `handleStop`); the result is a status string.
-pub fn handle_stop<C: RpcChain>(
-    server: &mut Server<C>,
-    _cmd: &GoValue,
-) -> Result<GoValue, RPCError> {
+pub fn handle_stop<C: RpcChain>(server: &Server<C>, _cmd: &GoValue) -> Result<GoValue, RPCError> {
     (server.cfg.request_shutdown)();
     Ok(GoValue::String("dcrd stopping.".to_string()))
 }
@@ -4168,7 +4159,7 @@ pub fn handle_stop<C: RpcChain>(
 /// handlegettreasuryspendvotes (dcrd `handleGetTreasurySpendVotes`);
 /// the result is a `GetTreasurySpendVotesResult` value.
 pub fn handle_get_treasury_spend_votes<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -4434,14 +4425,14 @@ pub(crate) fn serialize_get_work_data(
 
 /// Generate and return work to the caller (dcrd
 /// `handleGetWorkRequest`).
-fn handle_get_work_request<C: RpcChain>(server: &mut Server<C>) -> Result<GoValue, RPCError> {
+fn handle_get_work_request<C: RpcChain>(server: &Server<C>) -> Result<GoValue, RPCError> {
     // Return an error immediately in the case of a failed background
     // template.  dcrd dereferences a nil templater; the mining address
     // gate makes that unreachable in practice.
     let bt = server
         .cfg
         .block_templater
-        .as_mut()
+        .as_ref()
         .expect("getwork requires a block templater");
     if let Err(err) = bt.current_template() {
         return Err(crate::rpcerrors::rpc_misc_error(&format!(
@@ -4450,18 +4441,29 @@ fn handle_get_work_request<C: RpcChain>(server: &mut Server<C>) -> Result<GoValu
     }
 
     // Prune old templates when the current best chain tip changes.
+    //
+    // The work state lock is taken and released around each short
+    // critical section, exactly where dcrd does (`rpcserver.go:3890`,
+    // `:3919`, `:3959`, `:3987`).  It is deliberately not held across
+    // the template waits below — the first is unbounded — nor across
+    // the chain query and serialization that follow them, both because
+    // that is dcrd's behaviour and because holding it over the wait
+    // would stall `getworksubmission`, which needs the same lock, on a
+    // miner who is merely waiting for work.
     let best = server.cfg.chain.best_snapshot();
-    let state = &mut server.work_state;
-    let tip_changed = state.prev_best_hash != Some(best.hash);
-    if tip_changed {
-        let prune_height = best.height - GETWORK_EXPIRATION_DIFF;
-        state
-            .template_pool
-            .retain(|_, block| i64::from(block.header.height) >= prune_height);
-        state.prev_best_hash = Some(best.hash);
-        state.wait_for_updated_template = true;
-    }
-    let wait_for_new_template = state.wait_for_updated_template;
+    let wait_for_new_template = {
+        let mut state = server.work_state.lock().expect("work state poisoned");
+        let tip_changed = state.prev_best_hash != Some(best.hash);
+        if tip_changed {
+            let prune_height = best.height - GETWORK_EXPIRATION_DIFF;
+            state
+                .template_pool
+                .retain(|_, block| i64::from(block.header.height) >= prune_height);
+            state.prev_best_hash = Some(best.hash);
+            state.wait_for_updated_template = true;
+        }
+        state.wait_for_updated_template
+    };
 
     // Wait for updated templates when the current best chain tip
     // changed.  Since the subscription immediately sends the current
@@ -4469,8 +4471,8 @@ fn handle_get_work_request<C: RpcChain>(server: &mut Server<C>) -> Result<GoValu
     // case wait for the updated template with an eventual timeout.
     let mut template: Option<MsgBlock> = None;
     if wait_for_new_template {
-        let bt = server.cfg.block_templater.as_mut().expect("checked above");
-        let mut sub = bt.subscribe();
+        let bt = server.cfg.block_templater.as_ref().expect("checked above");
+        let sub = bt.subscribe();
         match sub.recv() {
             crate::server::TemplateRecv::Template(block) => template = Some(*block),
             crate::server::TemplateRecv::Canceled => {
@@ -4482,7 +4484,12 @@ fn handle_get_work_request<C: RpcChain>(server: &mut Server<C>) -> Result<GoValu
             }
         }
         let template_key = get_work_template_key(&template.as_ref().expect("just received").header);
-        let template_known = server.work_state.template_pool.contains_key(&template_key);
+        let template_known = server
+            .work_state
+            .lock()
+            .expect("work state poisoned")
+            .template_pool
+            .contains_key(&template_key);
         if template_known {
             match sub.recv_with_timeout() {
                 crate::server::TemplateRecv::Template(block) => template = Some(*block),
@@ -4499,7 +4506,7 @@ fn handle_get_work_request<C: RpcChain>(server: &mut Server<C>) -> Result<GoValu
     // Grab the current template from the background generator when it
     // was not already obtained above.
     if template.is_none() {
-        let bt = server.cfg.block_templater.as_mut().expect("checked above");
+        let bt = server.cfg.block_templater.as_ref().expect("checked above");
         match bt.current_template() {
             Err(err) => {
                 // The context "Unable to retrieve work due to invalid
@@ -4519,7 +4526,11 @@ fn handle_get_work_request<C: RpcChain>(server: &mut Server<C>) -> Result<GoValu
     // Allow future invocations to immediately return the existing
     // background template.
     if wait_for_new_template {
-        server.work_state.wait_for_updated_template = false;
+        server
+            .work_state
+            .lock()
+            .expect("work state poisoned")
+            .wait_for_updated_template = false;
     }
 
     // Update the time of the block template to the current time while
@@ -4530,7 +4541,7 @@ fn handle_get_work_request<C: RpcChain>(server: &mut Server<C>) -> Result<GoValu
     server
         .cfg
         .block_templater
-        .as_mut()
+        .as_ref()
         .expect("checked above")
         .update_block_time(&mut header_copy);
 
@@ -4545,6 +4556,8 @@ fn handle_get_work_request<C: RpcChain>(server: &mut Server<C>) -> Result<GoValu
     let template_key = get_work_template_key(&header_copy);
     server
         .work_state
+        .lock()
+        .expect("work state poisoned")
         .template_pool
         .insert(template_key, template);
 
@@ -4567,7 +4580,7 @@ fn handle_get_work_request<C: RpcChain>(server: &mut Server<C>) -> Result<GoValu
 /// Check and submit solved work to the network (dcrd
 /// `handleGetWorkSubmission`).
 fn handle_get_work_submission<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     hex_data: &str,
 ) -> Result<GoValue, RPCError> {
     // Ensure the provided data is sane.  Both data lengths coincide at
@@ -4637,7 +4650,8 @@ fn handle_get_work_submission<C: RpcChain>(
     // Look up the full block for the provided data based on the merkle
     // and stake roots.
     let template_key = get_work_template_key(&submitted_header);
-    let Some(template_block) = server.work_state.template_pool.get(&template_key) else {
+    let work_state = server.work_state.lock().expect("work state poisoned");
+    let Some(template_block) = work_state.template_pool.get(&template_key) else {
         return Ok(GoValue::Bool(false));
     };
 
@@ -4664,7 +4678,7 @@ fn handle_get_work_submission<C: RpcChain>(
 /// handlegetwork (dcrd `handleGetWork`); the result is a
 /// `GetWorkResult` value for requests and a boolean for submissions.
 pub fn handle_get_work<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     if server.cfg.cpu_miner.is_mining() {
@@ -4705,9 +4719,17 @@ pub fn handle_get_work<C: RpcChain>(
         ));
     }
 
-    // dcrd serializes concurrent invocations through a single-item
-    // semaphore with early cancellation; invocations here are already
-    // sequential.
+    // Protect concurrent access from multiple RPC invocations for work
+    // requests and submission (dcrd's single-item `workState.workSem`,
+    // acquired at `rpcserver.go:4171` and released by the deferred
+    // `release()` at `:4175`).  Held for the rest of the call, including
+    // the template wait inside the request path, exactly as dcrd's
+    // deferred release does.  Every gate above this point is a read-only
+    // rejection, so they stay outside it as they do upstream.
+    let _work_sem = server
+        .work_sem
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     // When the caller provides data, it is a submission of a
     // supposedly solved block that needs to be checked and submitted
@@ -4730,10 +4752,7 @@ pub fn handle_get_work<C: RpcChain>(
 
 /// handlehelp (dcrd `handleHelp`); the result is the usage overview
 /// or the method help string.
-pub fn handle_help<C: RpcChain>(
-    server: &mut Server<C>,
-    cmd: &GoValue,
-) -> Result<GoValue, RPCError> {
+pub fn handle_help<C: RpcChain>(server: &Server<C>, cmd: &GoValue) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
     let command = match &c[0] {
         GoValue::Null => "",

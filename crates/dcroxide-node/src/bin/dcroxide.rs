@@ -643,7 +643,7 @@ fn run(cfg: Config) -> ExitCode {
                 Box::new(dcroxide_node::indexes::NodeRpcTxIndexer::new(
                     Arc::clone(index),
                     Arc::clone(&indexes.queryer),
-                )) as Box<dyn dcroxide_rpc::server::RpcTxIndexer + Send>
+                )) as Box<dyn dcroxide_rpc::server::RpcTxIndexer + Send + Sync>
             });
         let exists_addresser = indexes
             .as_ref()
@@ -657,7 +657,8 @@ fn run(cfg: Config) -> ExitCode {
                 Box::new(dcroxide_node::indexes::NodeRpcExistsAddresser::new(
                     Arc::clone(index),
                     Arc::clone(&indexes.queryer),
-                )) as Box<dyn dcroxide_rpc::server::RpcExistsAddresser + Send>
+                ))
+                    as Box<dyn dcroxide_rpc::server::RpcExistsAddresser + Send + Sync>
             });
         // The getwork seam over the running generator (dcrd assigning
         // `s.bg` to the rpcserver config's `BlockTemplater`); `None`
@@ -673,22 +674,23 @@ fn run(cfg: Config) -> ExitCode {
                 cfg.params.params.clone(),
                 mining_policy.clone(),
                 cfg.mining_time_offset,
-            )) as Box<dyn dcroxide_rpc::server::RpcBlockTemplater + Send>
+            )) as Box<dyn dcroxide_rpc::server::RpcBlockTemplater + Send + Sync>
         });
         // Hand the already-built CPU miner to the RPC server so
         // `generate`/`setgenerate`/`getmininginfo` reach it (dcrd
         // assigning `s.cpuMiner`); the idle stand-in when no mining
         // addresses are configured, so `generate` answers dcrd's "no
         // payment addresses" error.
-        let cpu_miner: Box<dyn dcroxide_rpc::server::RpcCpuMiner + Send> = match cpu_miner.take() {
-            Some(miner) => Box::new(miner),
-            None => Box::new(dcroxide_node::rpcrun::IdleCpuMiner),
-        };
+        let cpu_miner: Box<dyn dcroxide_rpc::server::RpcCpuMiner + Send + Sync> =
+            match cpu_miner.take() {
+                Some(miner) => Box::new(miner),
+                None => Box::new(dcroxide_node::rpcrun::IdleCpuMiner),
+            };
         // The `stop` RPC requests the same graceful shutdown as an
         // interrupt: set the shared interrupt flag and send on the
         // shutdown channel the idle wait blocks on (dcrd's non-blocking
         // send on the server's `requestProcessShutdown` channel).
-        let request_shutdown: Box<dyn FnMut() + Send> = {
+        let request_shutdown: Box<dyn Fn() + Send + Sync> = {
             let interrupt = Arc::clone(&interrupt);
             let shutdown_tx = shutdown_tx.clone();
             Box::new(move || {
@@ -728,7 +730,7 @@ fn run(cfg: Config) -> ExitCode {
             .clone()
             .expect("the manager exists when RPC is enabled");
         rpc_srv.ntfn_mgr = Box::new(ntfn.clone());
-        let rpc_server = Arc::new(Mutex::new(rpc_srv));
+        let rpc_server = Arc::new(rpc_srv);
         let ntfn_thread = ntfn.start(Arc::clone(&rpc_server));
         match dcroxide_node::rpcrun::start_rpc_listener(
             &cfg.rpc_listeners,
@@ -1297,14 +1299,14 @@ fn rpc_config(
     >,
     rebroadcast: dcroxide_node::rebroadcast::RebroadcastSink,
     ntfn: dcroxide_node::websocket::NodeNtfnMgr,
-    tx_indexer: Option<Box<dyn dcroxide_rpc::server::RpcTxIndexer + Send>>,
-    exists_addresser: Option<Box<dyn dcroxide_rpc::server::RpcExistsAddresser + Send>>,
+    tx_indexer: Option<Box<dyn dcroxide_rpc::server::RpcTxIndexer + Send + Sync>>,
+    exists_addresser: Option<Box<dyn dcroxide_rpc::server::RpcExistsAddresser + Send + Sync>>,
     db: Database,
-    block_templater: Option<Box<dyn dcroxide_rpc::server::RpcBlockTemplater + Send>>,
+    block_templater: Option<Box<dyn dcroxide_rpc::server::RpcBlockTemplater + Send + Sync>>,
     fee_estimator: dcroxide_node::fees::SharedFeeEstimator,
-    cpu_miner: Box<dyn dcroxide_rpc::server::RpcCpuMiner + Send>,
+    cpu_miner: Box<dyn dcroxide_rpc::server::RpcCpuMiner + Send + Sync>,
     addr_manager: Arc<Mutex<AddrManager>>,
-    request_shutdown: Box<dyn FnMut() + Send>,
+    request_shutdown: Box<dyn Fn() + Send + Sync>,
     outbound_control: dcroxide_node::outbound::OutboundControl,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
@@ -1316,9 +1318,9 @@ fn rpc_config(
     dcroxide_rpc::server::Config {
         chain: dcroxide_node::rpcrun::NodeRpcChain::new(chain, params.clone()),
         chain_params: params.clone(),
-        subsidy_cache: dcroxide_standalone::SubsidyCache::new(
+        subsidy_cache: std::sync::Mutex::new(dcroxide_standalone::SubsidyCache::new(
             dcroxide_rpc::server::RpcSubsidyParams(params),
-        ),
+        )),
         min_relay_tx_fee: cfg.min_relay_tx_fee_atoms,
         max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
         sync_mgr: Box::new(dcroxide_node::rpcrun::NodeRpcSyncManager::new(

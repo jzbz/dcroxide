@@ -119,11 +119,11 @@ struct MockChain9 {
     best_height: i64,
     block_hash: Result<(), String>,
     header_by_hash: Result<(), String>,
-    header_calls: u32,
+    header_calls: std::sync::atomic::AtomicU32,
 }
 
 impl RpcChain for MockChain9 {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         RpcBestState {
             hash: self.header.block_hash(),
             prev_hash: self.header.prev_block,
@@ -135,14 +135,16 @@ impl RpcChain for MockChain9 {
             num_txns: 7,
         }
     }
-    fn block_hash_by_height(&mut self, _height: i64) -> Result<Hash, String> {
+    fn block_hash_by_height(&self, _height: i64) -> Result<Hash, String> {
         self.block_hash.clone().map(|()| self.header.block_hash())
     }
-    fn header_by_hash(&mut self, _hash: &Hash) -> Result<BlockHeader, String> {
+    fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
         self.header_by_hash.clone().map(|()| {
             let mut h = self.header;
-            h.timestamp = self.header.timestamp + self.header_calls * 300;
-            self.header_calls += 1;
+            let n = self
+                .header_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            h.timestamp = self.header.timestamp + n * 300;
             h
         })
     }
@@ -157,19 +159,19 @@ struct MockMiner {
 }
 
 impl RpcCpuMiner for MockMiner {
-    fn generate_n_blocks(&mut self, _n: u32) -> Result<Vec<Hash>, GenerateFailure> {
+    fn generate_n_blocks(&self, _n: u32) -> Result<Vec<Hash>, GenerateFailure> {
         self.generate.clone()
     }
-    fn is_mining(&mut self) -> bool {
+    fn is_mining(&self) -> bool {
         self.is_mining
     }
-    fn hashes_per_second(&mut self) -> f64 {
+    fn hashes_per_second(&self) -> f64 {
         self.hashes_per_second
     }
-    fn num_workers(&mut self) -> i32 {
+    fn num_workers(&self) -> i32 {
         self.workers
     }
-    fn set_num_workers(&mut self, _workers: i32) {}
+    fn set_num_workers(&self, _workers: i32) {}
 }
 
 /// The scripted mixpool.
@@ -179,10 +181,10 @@ struct MockMixPooler {
 }
 
 impl RpcMixPooler for MockMixPooler {
-    fn mix_prs(&mut self) -> Vec<MsgMixPairReq> {
+    fn mix_prs(&self) -> Vec<MsgMixPairReq> {
         self.prs.clone()
     }
-    fn message(&mut self, _query: &Hash) -> Result<Message, String> {
+    fn message(&self, _query: &Hash) -> Result<Message, String> {
         self.msg.clone()
     }
 }
@@ -193,7 +195,7 @@ struct MockSyncMgr9 {
 }
 
 impl RpcSyncManager for MockSyncMgr9 {
-    fn accept_mix_message(&mut self, _msg: &Message) -> Result<(), String> {
+    fn accept_mix_message(&self, _msg: &Message) -> Result<(), String> {
         self.accept.clone()
     }
 }
@@ -202,10 +204,10 @@ impl RpcSyncManager for MockSyncMgr9 {
 struct MockConnMgr9;
 
 impl RpcConnManager for MockConnMgr9 {
-    fn connected_count(&mut self) -> i32 {
+    fn connected_count(&self) -> i32 {
         4
     }
-    fn relay_mix_messages(&mut self, _msgs: &[Message]) {}
+    fn relay_mix_messages(&self, _msgs: &[Message]) {}
 }
 
 /// The scripted mempool (count only).
@@ -214,7 +216,7 @@ struct MockMempool9 {
 }
 
 impl RpcTxMempooler for MockMempool9 {
-    fn count(&mut self) -> i64 {
+    fn count(&self) -> i64 {
         self.count
     }
 }
@@ -223,25 +225,25 @@ impl RpcTxMempooler for MockMempool9 {
 /// successful start binds the given address, a scripted variant does
 /// not, and stop only reports its scripted error.
 struct MockProfiler {
-    listeners: Vec<String>,
+    listeners: std::sync::Mutex<Vec<String>>,
     start: Result<(), String>,
     start_binds: bool,
     stop: Result<(), String>,
 }
 
 impl RpcProfilerManager for MockProfiler {
-    fn start(&mut self, listen_addr: &str, _allow_non_loopback: bool) -> Result<(), String> {
+    fn start(&self, listen_addr: &str, _allow_non_loopback: bool) -> Result<(), String> {
         self.start.clone()?;
         if self.start_binds {
-            self.listeners = vec![listen_addr.to_string()];
+            *self.listeners.lock().expect("listeners poisoned") = vec![listen_addr.to_string()];
         }
         Ok(())
     }
-    fn stop(&mut self) -> Result<(), String> {
+    fn stop(&self) -> Result<(), String> {
         self.stop.clone()
     }
-    fn listeners(&mut self) -> Vec<String> {
-        self.listeners.clone()
+    fn listeners(&self) -> Vec<String> {
+        self.listeners.lock().expect("listeners poisoned").clone()
     }
 }
 
@@ -251,7 +253,7 @@ struct MockAddrMgr {
 }
 
 impl RpcAddrManager for MockAddrMgr {
-    fn local_addresses(&mut self) -> Vec<(String, u16)> {
+    fn local_addresses(&self) -> Vec<(String, u16)> {
         self.locals.clone()
     }
 }
@@ -262,13 +264,13 @@ struct MockTime9 {
 }
 
 impl RpcTimeSource for MockTime9 {
-    fn offset_nanos(&mut self) -> i64 {
+    fn offset_nanos(&self) -> i64 {
         self.nanos
     }
 }
 
 fn dispatch(
-    server: &mut Server<MockChain9>,
+    server: &Server<MockChain9>,
     method_name: &str,
     cmd: &GoValue,
 ) -> Result<(GoValue, GoType), RPCError> {
@@ -466,12 +468,12 @@ fn mining_network_mix_handler_slice_matches_dcrd() {
             best_height: mock[3].parse().unwrap(),
             block_hash: err_or(mock[4]),
             header_by_hash: err_or(mock[5]),
-            header_calls: 0,
+            header_calls: std::sync::atomic::AtomicU32::new(0),
         };
-        let mut server = Server::new(Config {
+        let server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params)),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params))),
             min_relay_tx_fee: 10000,
             max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
             sync_mgr: Box::new(MockSyncMgr9 {
@@ -507,7 +509,7 @@ fn mining_network_mix_handler_slice_matches_dcrd() {
             }),
             mix_pooler: Box::new(MockMixPooler { msg: mix_msg, prs }),
             profiler_mgr: Box::new(MockProfiler {
-                listeners,
+                listeners: std::sync::Mutex::new(listeners),
                 start,
                 start_binds,
                 stop: err_or(mock[16]),
@@ -547,7 +549,7 @@ fn mining_network_mix_handler_slice_matches_dcrd() {
             rpc_limit_pass: String::new(),
         });
 
-        match dispatch(&mut server, method_name, &cmd) {
+        match dispatch(&server, method_name, &cmd) {
             Ok((value, typ)) => {
                 assert_eq!(result[2], "ok", "{name}: expected an error");
                 let got = gojson::encode(&typ, &value);

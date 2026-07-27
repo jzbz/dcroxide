@@ -117,7 +117,7 @@ impl NodeRpcFeeEstimator {
 }
 
 impl dcroxide_rpc::server::RpcFeeEstimator for NodeRpcFeeEstimator {
-    fn estimate_fee(&mut self, target_confirmations: i32) -> Result<i64, String> {
+    fn estimate_fee(&self, target_confirmations: i32) -> Result<i64, String> {
         self.estimator
             .lock()
             .expect("fee estimator mutex poisoned")
@@ -143,7 +143,7 @@ mod tests {
         let estimator = new_shared_estimator(10_000).expect("estimator");
 
         // An empty estimator has no data to estimate from.
-        let mut rpc = NodeRpcFeeEstimator::new(Arc::clone(&estimator));
+        let rpc = NodeRpcFeeEstimator::new(Arc::clone(&estimator));
         assert!(
             rpc.estimate_fee(1)
                 .unwrap_err()

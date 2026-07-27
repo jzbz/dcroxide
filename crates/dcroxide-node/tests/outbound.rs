@@ -237,7 +237,7 @@ fn removing_a_permanent_peer_stops_its_redial() {
         dial_server.sync_peers.clone(),
         Arc::clone(&dial_server.recently_advertised),
     );
-    let mut manager = dcroxide_node::rpcrun::NodeRpcConnManager::new(
+    let manager = dcroxide_node::rpcrun::NodeRpcConnManager::new(
         dial_connected.clone(),
         Arc::new(dcroxide_node::transport::NetByteTotals::new()),
     )

@@ -42,7 +42,7 @@ struct MockChain12 {
 }
 
 impl RpcChain for MockChain12 {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         RpcBestState {
             hash: self.header.block_hash(),
             prev_hash: self.header.prev_block,
@@ -54,7 +54,7 @@ impl RpcChain for MockChain12 {
             num_txns: 7,
         }
     }
-    fn block_hash_by_height(&mut self, _height: i64) -> Result<Hash, String> {
+    fn block_hash_by_height(&self, _height: i64) -> Result<Hash, String> {
         self.block_hash.clone().map(|()| self.header.block_hash())
     }
 }
@@ -109,10 +109,12 @@ fn dispatch_core_matches_dcrd() {
         };
 
         let chain = MockChain12 { header, block_hash };
-        let mut server = Server::new(Config {
+        let server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
+                params.clone(),
+            ))),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(()),
@@ -150,14 +152,7 @@ fn dispatch_core_matches_dcrd() {
             rpc_limit_pass: String::new(),
         });
 
-        let reply = process_request(
-            &mut server,
-            jsonrpc,
-            method_name,
-            &raw_params,
-            &id,
-            is_admin,
-        );
+        let reply = process_request(&server, jsonrpc, method_name, &raw_params, &id, is_admin);
         match result[2] {
             "none" => assert!(reply.is_none(), "{name}: expected no reply, got {reply:?}"),
             "reply" => {

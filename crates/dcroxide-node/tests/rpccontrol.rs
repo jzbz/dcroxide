@@ -156,7 +156,7 @@ fn control_and_chain_query_seams_over_http() {
 
     // The stop seam records that a graceful shutdown was requested.
     let shutdown_requested = Arc::new(AtomicBool::new(false));
-    let request_shutdown: Box<dyn FnMut() + Send> = {
+    let request_shutdown: Box<dyn Fn() + Send + Sync> = {
         let flag = Arc::clone(&shutdown_requested);
         Box::new(move || flag.store(true, Ordering::SeqCst))
     };
@@ -200,10 +200,10 @@ fn control_and_chain_query_seams_over_http() {
         },
     ];
 
-    let server = Arc::new(Mutex::new(Server::new(Config {
+    let server = Arc::new(Server::new(Config {
         chain: NodeRpcChain::new(Arc::clone(&chain), params.clone()),
         chain_params: params.clone(),
-        subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool))),
@@ -244,7 +244,7 @@ fn control_and_chain_query_seams_over_http() {
         rpc_pass: "pass".to_string(),
         rpc_limit_user: String::new(),
         rpc_limit_pass: String::new(),
-    })));
+    }));
 
     let listener = start_rpc_listener(
         &["127.0.0.1:0".to_string()],
@@ -335,7 +335,7 @@ fn control_and_chain_query_seams_over_http() {
 fn sanity_checker_seam_runs_the_checks() {
     let params = dcroxide_chaincfg::regnet_params();
     let (_now, blocks) = accepted_prefix(1);
-    let mut checker = NodeRpcSanityChecker::new(params.clone());
+    let checker = NodeRpcSanityChecker::new(params.clone());
 
     // A valid battery block passes the context-free checks.
     assert!(

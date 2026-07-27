@@ -144,4 +144,6 @@ afterthought. In the same campaign, five comments were found asserting
 the opposite of what the code beneath them did — including one that
 justified a coarse server-wide lock as dcrd's own per-request locking,
 where dcrd takes no server-wide lock at all. Comments in this
-repository are claims, not evidence.
+repository are claims, not evidence. (That lock has since been removed:
+the RPC server now carries dcrd's per-field locks, and the handler seams
+take `&self`. See PARITY.md's websocket-delivery note.)

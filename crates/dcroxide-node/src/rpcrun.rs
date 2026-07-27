@@ -90,7 +90,7 @@ impl NodeRpcChain {
 }
 
 impl RpcChain for NodeRpcChain {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         let chain = self.chain.lock().expect("chain mutex poisoned");
         let best = chain.best_snapshot();
         RpcBestState {
@@ -105,14 +105,14 @@ impl RpcChain for NodeRpcChain {
         }
     }
 
-    fn best_header(&mut self) -> (Hash, i64) {
+    fn best_header(&self) -> (Hash, i64) {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
             .best_header()
     }
 
-    fn block_by_hash(&mut self, hash: &Hash) -> Result<MsgBlock, String> {
+    fn block_by_hash(&self, hash: &Hash) -> Result<MsgBlock, String> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
@@ -120,7 +120,7 @@ impl RpcChain for NodeRpcChain {
             .ok_or_else(|| format!("block {hash} not found"))
     }
 
-    fn block_by_height(&mut self, height: i64) -> Result<MsgBlock, String> {
+    fn block_by_height(&self, height: i64) -> Result<MsgBlock, String> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
@@ -129,7 +129,7 @@ impl RpcChain for NodeRpcChain {
     }
 
     fn tspend_count_votes(
-        &mut self,
+        &self,
         check_block: &Hash,
         tspend: &dcroxide_wire::MsgTx,
     ) -> Result<(u32, u32), dcroxide_rpc::server::TSpendCountVotesFailure> {
@@ -151,7 +151,7 @@ impl RpcChain for NodeRpcChain {
         Ok((yes, no))
     }
 
-    fn block_hash_by_height(&mut self, height: i64) -> Result<Hash, String> {
+    fn block_hash_by_height(&self, height: i64) -> Result<Hash, String> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
@@ -159,7 +159,7 @@ impl RpcChain for NodeRpcChain {
             .ok_or_else(|| format!("no block at height {height}"))
     }
 
-    fn height_range(&mut self, start: i64, end: i64) -> Result<Vec<Hash>, String> {
+    fn height_range(&self, start: i64, end: i64) -> Result<Vec<Hash>, String> {
         Ok(self
             .chain
             .lock()
@@ -167,7 +167,7 @@ impl RpcChain for NodeRpcChain {
             .height_range(start, end))
     }
 
-    fn block_height_by_hash(&mut self, hash: &Hash) -> Result<i64, String> {
+    fn block_height_by_hash(&self, hash: &Hash) -> Result<i64, String> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
@@ -175,7 +175,7 @@ impl RpcChain for NodeRpcChain {
             .ok_or_else(|| format!("block {hash} not found"))
     }
 
-    fn chain_work(&mut self, hash: &Hash) -> Result<Uint256, String> {
+    fn chain_work(&self, hash: &Hash) -> Result<Uint256, String> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
@@ -183,7 +183,7 @@ impl RpcChain for NodeRpcChain {
             .ok_or_else(|| format!("no chain work for block {hash}"))
     }
 
-    fn header_by_hash(&mut self, hash: &Hash) -> Result<BlockHeader, String> {
+    fn header_by_hash(&self, hash: &Hash) -> Result<BlockHeader, String> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
@@ -191,28 +191,28 @@ impl RpcChain for NodeRpcChain {
             .ok_or_else(|| format!("block {hash} not found"))
     }
 
-    fn is_current(&mut self) -> bool {
+    fn is_current(&self) -> bool {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
             .is_current_at(adjusted_time_unix())
     }
 
-    fn locate_headers(&mut self, locators: &[Hash], hash_stop: &Hash) -> Vec<BlockHeader> {
+    fn locate_headers(&self, locators: &[Hash], hash_stop: &Hash) -> Vec<BlockHeader> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
             .locate_headers(locators, hash_stop)
     }
 
-    fn main_chain_has_block(&mut self, hash: &Hash) -> bool {
+    fn main_chain_has_block(&self, hash: &Hash) -> bool {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
             .main_chain_has_block(hash)
     }
 
-    fn median_time_by_hash(&mut self, hash: &Hash) -> Result<i64, String> {
+    fn median_time_by_hash(&self, hash: &Hash) -> Result<i64, String> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
@@ -220,21 +220,21 @@ impl RpcChain for NodeRpcChain {
             .ok_or_else(|| format!("block {hash} not found"))
     }
 
-    fn check_live_ticket(&mut self, hash: &Hash) -> bool {
+    fn check_live_ticket(&self, hash: &Hash) -> bool {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
             .check_live_ticket(hash)
     }
 
-    fn check_live_tickets(&mut self, hashes: &[Hash]) -> Vec<bool> {
+    fn check_live_tickets(&self, hashes: &[Hash]) -> Vec<bool> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
             .check_live_tickets(hashes)
     }
 
-    fn live_tickets(&mut self) -> Result<Vec<Hash>, String> {
+    fn live_tickets(&self) -> Result<Vec<Hash>, String> {
         Ok(self
             .chain
             .lock()
@@ -242,7 +242,7 @@ impl RpcChain for NodeRpcChain {
             .live_tickets())
     }
 
-    fn ticket_pool_value(&mut self) -> Result<i64, String> {
+    fn ticket_pool_value(&self) -> Result<i64, String> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
@@ -250,7 +250,7 @@ impl RpcChain for NodeRpcChain {
             .ok_or_else(|| "unable to compute the ticket pool value".to_string())
     }
 
-    fn max_block_size(&mut self, prev_blk_hash: &Hash) -> Result<i64, String> {
+    fn max_block_size(&self, prev_blk_hash: &Hash) -> Result<i64, String> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
@@ -259,7 +259,7 @@ impl RpcChain for NodeRpcChain {
     }
 
     fn next_threshold_state(
-        &mut self,
+        &self,
         prev_blk_hash: &Hash,
         deployment_id: &str,
     ) -> Result<dcroxide_rpc::helpers::threshold::State, String> {
@@ -282,11 +282,7 @@ impl RpcChain for NodeRpcChain {
         })
     }
 
-    fn state_last_changed_height(
-        &mut self,
-        hash: &Hash,
-        deployment_id: &str,
-    ) -> Result<i64, String> {
+    fn state_last_changed_height(&self, hash: &Hash, deployment_id: &str) -> Result<i64, String> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
@@ -295,7 +291,7 @@ impl RpcChain for NodeRpcChain {
     }
 
     fn fetch_utxo_entry(
-        &mut self,
+        &self,
         tx_hash: &Hash,
         index: u32,
         tree: i8,
@@ -334,7 +330,7 @@ impl RpcChain for NodeRpcChain {
         }))
     }
 
-    fn fetch_utxo_stats(&mut self) -> Result<dcroxide_rpc::server::RpcUtxoStats, String> {
+    fn fetch_utxo_stats(&self) -> Result<dcroxide_rpc::server::RpcUtxoStats, String> {
         let stats = self
             .chain
             .lock()
@@ -350,7 +346,7 @@ impl RpcChain for NodeRpcChain {
         })
     }
 
-    fn is_treasury_agenda_active(&mut self, prev_blk_hash: &Hash) -> Result<bool, String> {
+    fn is_treasury_agenda_active(&self, prev_blk_hash: &Hash) -> Result<bool, String> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
@@ -358,7 +354,7 @@ impl RpcChain for NodeRpcChain {
             .map_err(|e| e.description)
     }
 
-    fn is_auto_revocations_agenda_active(&mut self, prev_blk_hash: &Hash) -> Result<bool, String> {
+    fn is_auto_revocations_agenda_active(&self, prev_blk_hash: &Hash) -> Result<bool, String> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
@@ -366,7 +362,7 @@ impl RpcChain for NodeRpcChain {
             .map_err(|e| e.description)
     }
 
-    fn is_blake3_pow_agenda_active(&mut self, prev_blk_hash: &Hash) -> Result<bool, String> {
+    fn is_blake3_pow_agenda_active(&self, prev_blk_hash: &Hash) -> Result<bool, String> {
         self.chain
             .lock()
             .expect("chain mutex poisoned")
@@ -383,7 +379,7 @@ impl RpcChain for NodeRpcChain {
 pub struct EmptyTxMempooler;
 
 impl dcroxide_rpc::server::RpcTxMempooler for EmptyTxMempooler {
-    fn fetch_transaction(&mut self, _tx_hash: &Hash) -> Result<(dcroxide_wire::MsgTx, i8), String> {
+    fn fetch_transaction(&self, _tx_hash: &Hash) -> Result<(dcroxide_wire::MsgTx, i8), String> {
         Err("transaction is not in the pool".to_string())
     }
 }
@@ -393,14 +389,14 @@ impl dcroxide_rpc::server::RpcTxMempooler for EmptyTxMempooler {
 pub struct SystemClock;
 
 impl dcroxide_rpc::server::RpcClock for SystemClock {
-    fn now_unix_millis(&mut self) -> i64 {
+    fn now_unix_millis(&self) -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
     }
 
-    fn since_nanos(&mut self, t_unix_nanos: i64) -> i64 {
+    fn since_nanos(&self, t_unix_nanos: i64) -> i64 {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
@@ -417,7 +413,7 @@ impl dcroxide_rpc::server::RpcClock for SystemClock {
 pub struct SystemTimeSource;
 
 impl dcroxide_rpc::server::RpcTimeSource for SystemTimeSource {
-    fn offset_nanos(&mut self) -> i64 {
+    fn offset_nanos(&self) -> i64 {
         0
     }
 }
@@ -437,7 +433,7 @@ impl NodeRpcFiltererV2 {
 }
 
 impl RpcFiltererV2 for NodeRpcFiltererV2 {
-    fn filter_by_block_hash(&mut self, hash: &Hash) -> Result<RpcFilterProof, FilterFailure> {
+    fn filter_by_block_hash(&self, hash: &Hash) -> Result<RpcFilterProof, FilterFailure> {
         let fetched = {
             let chain = self.chain.lock().expect("chain mutex poisoned");
             chain.filter_by_block_hash(hash)
@@ -480,7 +476,7 @@ impl NodeRpcSanityChecker {
 }
 
 impl RpcSanityChecker for NodeRpcSanityChecker {
-    fn check_block_sanity(&mut self, block: &MsgBlock) -> Result<(), String> {
+    fn check_block_sanity(&self, block: &MsgBlock) -> Result<(), String> {
         dcroxide_blockchain::validate::check_block_sanity(
             block,
             crate::txmempool::now_unix(),
@@ -506,7 +502,7 @@ impl NodeRpcAddrManager {
 }
 
 impl RpcAddrManager for NodeRpcAddrManager {
-    fn local_addresses(&mut self) -> Vec<(String, u16)> {
+    fn local_addresses(&self) -> Vec<(String, u16)> {
         self.addr_manager
             .lock()
             .expect("addr manager mutex poisoned")
@@ -631,20 +627,20 @@ impl NodeRpcConnManager {
 }
 
 impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
-    fn connected_count(&mut self) -> i32 {
+    fn connected_count(&self) -> i32 {
         self.connected.len() as i32
     }
 
     /// Snapshot the live peers for `getpeerinfo` (dcrd
     /// `rpcConnManager.ConnectedPeers`); the handler sorts by id and
     /// flags the sync peer itself.
-    fn connected_peers(&mut self) -> Vec<dcroxide_rpc::server::RpcPeerInfo> {
+    fn connected_peers(&self) -> Vec<dcroxide_rpc::server::RpcPeerInfo> {
         self.sync_peers.connected_peer_infos()
     }
 
     /// The persistent peers for `getaddednodeinfo` (dcrd
     /// `rpcConnManager.PersistentPeers`).
-    fn persistent_peers(&mut self) -> Vec<dcroxide_rpc::server::RpcAddedNode> {
+    fn persistent_peers(&self) -> Vec<dcroxide_rpc::server::RpcAddedNode> {
         self.sync_peers.persistent_peers()
     }
 
@@ -652,7 +648,7 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
     /// `rpcConnManager.DisconnectByID`); a permanent or absent peer is
     /// "peer not found", which the `node` handler turns into its "use
     /// remove" hint.
-    fn disconnect_by_id(&mut self, id: i32) -> Result<(), String> {
+    fn disconnect_by_id(&self, id: i32) -> Result<(), String> {
         if self.sync_peers.disconnect_by_id(id) {
             Ok(())
         } else {
@@ -662,7 +658,7 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
 
     /// Disconnect the non-permanent peers at the given address (dcrd
     /// `rpcConnManager.DisconnectByAddr`).
-    fn disconnect_by_addr(&mut self, addr: &str) -> Result<(), String> {
+    fn disconnect_by_addr(&self, addr: &str) -> Result<(), String> {
         if self.sync_peers.disconnect_by_addr(addr) {
             Ok(())
         } else {
@@ -674,7 +670,7 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
     /// (dcrd `rpcConnManager.Connect`): the driver's event loop runs the
     /// duplicate, resolution, and max-peers checks and dials after
     /// replying.
-    fn connect(&mut self, addr: &str, permanent: bool) -> Result<(), String> {
+    fn connect(&self, addr: &str, permanent: bool) -> Result<(), String> {
         let outbound = self
             .outbound
             .as_ref()
@@ -688,7 +684,7 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
     /// redialed.  A temporary or unknown peer is "peer not found", which
     /// the `node` handler turns into its "use disconnect" hint when the
     /// peer is connected.
-    fn remove_by_id(&mut self, id: i32) -> Result<(), String> {
+    fn remove_by_id(&self, id: i32) -> Result<(), String> {
         match self.sync_peers.remove_persistent_by_id(id) {
             Some(conn_req_id) => {
                 self.stop_redial(conn_req_id);
@@ -714,7 +710,7 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
     /// matches, fall back to cancelling a pending connection request for
     /// the resolved address — an added peer that is still dialing or
     /// awaiting a retry.
-    fn remove_by_addr(&mut self, addr: &str) -> Result<(), String> {
+    fn remove_by_addr(&self, addr: &str) -> Result<(), String> {
         match self.sync_peers.remove_persistent_by_addr(addr) {
             Some(conn_req_id) => {
                 self.stop_redial(conn_req_id);
@@ -738,7 +734,7 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
     /// function; the system resolver here — a `.onion`/proxied host
     /// resolves through it rather than dcrd's SOCKS lookup, a documented
     /// divergence until the Tor path is wired).
-    fn lookup(&mut self, host: &str) -> Result<Vec<String>, String> {
+    fn lookup(&self, host: &str) -> Result<Vec<String>, String> {
         // dcrd `rpcConnManager.Lookup` runs the configured `dcrdLookup`,
         // so a proxied daemon resolves through Tor and a `.onion` host
         // takes the onion route (one minute bounds the resolution like
@@ -751,7 +747,7 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
 
     /// Announce submitted transactions to the network (dcrd
     /// `relayTransactions` from the RPC adaptor).
-    fn relay_transactions(&mut self, tx_hashes: &[Hash]) {
+    fn relay_transactions(&self, tx_hashes: &[Hash]) {
         let Some(relay) = &self.relay else {
             return;
         };
@@ -800,7 +796,7 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
         }
     }
 
-    fn add_rebroadcast_inventory(&mut self, tx_hash: &Hash, tx: &dcroxide_wire::MsgTx) {
+    fn add_rebroadcast_inventory(&self, tx_hash: &Hash, tx: &dcroxide_wire::MsgTx) {
         // Track user-submitted transactions for periodic rebroadcast
         // until they make it into a block (dcrd rpcConnManager
         // forwarding to the server's `AddRebroadcastInventory`).
@@ -810,7 +806,7 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
         relay.rebroadcast.add_rebroadcast_inventory(tx_hash, tx);
     }
 
-    fn net_totals(&mut self) -> (u64, u64) {
+    fn net_totals(&self) -> (u64, u64) {
         // Received first, sent second (dcrd `NetTotals`).
         (
             self.net_totals
@@ -847,14 +843,14 @@ impl NodeRpcSyncManager {
 }
 
 impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
-    fn sync_height(&mut self) -> i64 {
+    fn sync_height(&self) -> i64 {
         self.sync_manager
             .lock()
             .expect("sync manager poisoned")
             .sync_height()
     }
 
-    fn sync_peer_id(&mut self) -> i32 {
+    fn sync_peer_id(&self) -> i32 {
         self.sync_manager
             .lock()
             .expect("sync manager poisoned")
@@ -864,7 +860,7 @@ impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
     /// Submit a transaction to the pool (dcrd rpcSyncMgr's
     /// `ProcessTransaction`, which reaches the pool directly).
     fn process_transaction(
-        &mut self,
+        &self,
         tx: &dcroxide_wire::MsgTx,
         allow_orphan: bool,
         allow_high_fees: bool,
@@ -886,7 +882,7 @@ impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
 
     /// Whether the transaction confirmed in a recent block (dcrd
     /// `RecentlyConfirmedTxn` over the netsync APBF filter).
-    fn recently_confirmed_txn(&mut self, hash: &Hash) -> bool {
+    fn recently_confirmed_txn(&self, hash: &Hash) -> bool {
         // Take the shared filter handle so the check does not hold
         // the sync manager across the read.
         let filter = self
@@ -905,7 +901,7 @@ impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
     /// `syncManager.ProcessBlock`; the relay and prune run inside the
     /// manager's block processing exactly as for a network block).
     fn submit_block(
-        &mut self,
+        &self,
         block: &MsgBlock,
     ) -> Result<(), dcroxide_rpc::server::SubmitBlockFailure> {
         self.sync_manager
@@ -946,19 +942,19 @@ impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
 pub struct IdleCpuMiner;
 
 impl dcroxide_rpc::server::RpcCpuMiner for IdleCpuMiner {
-    fn is_mining(&mut self) -> bool {
+    fn is_mining(&self) -> bool {
         false
     }
 
     /// Zero while the miner is off (dcrd `cpuminer.HashesPerSecond`
     /// returns 0 when not normal-mining).
-    fn hashes_per_second(&mut self) -> f64 {
+    fn hashes_per_second(&self) -> f64 {
         0.0
     }
 
     /// dcrd's `cpuminer.NumWorkers` returns the configured worker count
     /// even while idle, which defaults to `defaultNumWorkers` (1).
-    fn num_workers(&mut self) -> i32 {
+    fn num_workers(&self) -> i32 {
         1
     }
 
@@ -966,7 +962,7 @@ impl dcroxide_rpc::server::RpcCpuMiner for IdleCpuMiner {
     /// but `setgenerate` still reaches this on its disable path (dcrd's
     /// handler unconditionally calls `SetNumWorkers(0)` before the
     /// address check), so it must answer rather than panic.
-    fn set_num_workers(&mut self, _workers: i32) {}
+    fn set_num_workers(&self, _workers: i32) {}
 }
 
 /// The current unix time for the chain's is-current resolution (dcrd's
@@ -1370,7 +1366,7 @@ pub fn load_or_generate_cert_pair(
 /// listeners).
 pub fn start_rpc_listener(
     listeners: &[String],
-    server: Arc<Mutex<Server<NodeRpcChain>>>,
+    server: Arc<Server<NodeRpcChain>>,
     transport: RpcTransport,
     ntfn: crate::websocket::NodeNtfnMgr,
     max_clients: usize,
@@ -1763,7 +1759,7 @@ impl Drop for PreAuthSlot {
 fn accept_loop(
     listener: &TcpListener,
     shutdown: &Arc<AtomicBool>,
-    server: &Arc<Mutex<Server<NodeRpcChain>>>,
+    server: &Arc<Server<NodeRpcChain>>,
     transport: &RpcTransport,
     ntfn: &crate::websocket::NodeNtfnMgr,
     max_clients: usize,
@@ -2357,7 +2353,7 @@ fn strip_port(host_port: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     mut stream: S,
-    server: &Arc<Mutex<Server<NodeRpcChain>>>,
+    server: &Arc<Server<NodeRpcChain>>,
     ntfn: &crate::websocket::NodeNtfnMgr,
     max_clients: usize,
     num_clients: &Arc<AtomicI32>,
@@ -2395,12 +2391,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     // must authenticate in-band (dcrd `checkAuth` with `require =
     // false`); serve it before touching a body.
     if is_websocket_upgrade(&head) {
-        let auth = {
-            let server = server
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            server.check_auth(head.authorization.as_deref(), false)
-        };
+        let auth = { server.check_auth(head.authorization.as_deref(), false) };
         let (authed, is_admin) = match auth {
             Ok(auth) => auth,
             Err(_) => {
@@ -2474,12 +2465,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     // Authenticate before allocating the body (dcrd runs `checkAuth`
     // before `jsonRPCRead`), so an unauthenticated client never drives a
     // full-body allocation from its declared Content-Length.
-    let auth = {
-        let server = server
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        server.check_auth(head.authorization.as_deref(), true)
-    };
+    let auth = { server.check_auth(head.authorization.as_deref(), true) };
     let is_admin = match auth {
         Ok((_, is_admin)) => is_admin,
         Err(_) => {
@@ -2553,10 +2539,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     // is caught and answered as an internal error; the lock recovers
     // from the poisoning so later requests keep working.
     let response = catch_unwind(AssertUnwindSafe(|| {
-        let mut server = server
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        dcroxide_rpc::http::process_body(&mut server, &body, is_admin)
+        dcroxide_rpc::http::process_body(server, &body, is_admin)
     }))
     .unwrap_or_else(|_| {
         br#"{"jsonrpc":"1.0","result":null,"error":{"code":-32603,"message":"internal error: the handler's daemon seam is not yet wired"},"id":null}"#
@@ -2593,6 +2576,22 @@ fn write_unauthorized<S: Write>(stream: &mut S) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use dcroxide_rpc::server::RpcConnManager;
+
+    /// The RPC server is shared across every handler thread and the
+    /// websocket delivery thread as a bare `Arc`, with no lock of its
+    /// own — dcrd's shape, where `wsClient.serviceRequest` calls the
+    /// handler directly and `rpcserver.Server` carries only per-field
+    /// mutexes.  That is only sound while the server is `Sync`, which
+    /// is exactly what a seam declared `Send` but not `Sync` would
+    /// break; the coarse `Arc<Mutex<Server<_>>>` this replaced existed
+    /// because it was not.  Assert the property here so reintroducing
+    /// such a seam fails to compile rather than quietly inviting the
+    /// mutex back.
+    #[test]
+    fn the_rpc_server_is_shareable_without_a_lock() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Server<NodeRpcChain>>();
+    }
 
     /// A minimal request head carrying only an `Origin` and `Host`, for
     /// exercising the websocket same-origin guard.
@@ -2681,7 +2680,7 @@ mod tests {
             None,
         );
 
-        let mut manager = NodeRpcConnManager::new(
+        let manager = NodeRpcConnManager::new(
             crate::runtime::ConnectedPeers::new(),
             Arc::new(crate::transport::NetByteTotals::new()),
         )
@@ -2695,7 +2694,7 @@ mod tests {
 
         // An empty (default) registry reports no peers rather than
         // panicking, so getpeerinfo is safe before any peer connects.
-        let mut idle = NodeRpcConnManager::new(
+        let idle = NodeRpcConnManager::new(
             crate::runtime::ConnectedPeers::new(),
             Arc::new(crate::transport::NetByteTotals::new()),
         );
@@ -2744,7 +2743,7 @@ mod tests {
             None,
         );
 
-        let mut manager = NodeRpcConnManager::new(
+        let manager = NodeRpcConnManager::new(
             crate::runtime::ConnectedPeers::new(),
             Arc::new(crate::transport::NetByteTotals::new()),
         )
@@ -2865,7 +2864,7 @@ mod tests {
         );
 
         let sync_peers = crate::dispatch::SyncPeers::new();
-        let mut manager = NodeRpcConnManager::new(
+        let manager = NodeRpcConnManager::new(
             connected.clone(),
             Arc::new(crate::transport::NetByteTotals::new()),
         )
@@ -3010,7 +3009,7 @@ mod tests {
             channel,
         );
 
-        let mut manager =
+        let manager =
             NodeRpcConnManager::new(connected, Arc::new(crate::transport::NetByteTotals::new()))
                 .with_outbound(control);
 

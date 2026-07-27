@@ -245,7 +245,7 @@ pub fn parse_cmd(
 /// `standardCmdResult`; the encoding in dcrd rides on the concrete Go
 /// result types).
 pub fn standard_cmd_result<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     method_name: &str,
     cmd: &GoValue,
 ) -> Result<(GoValue, GoType), RPCError> {
@@ -518,7 +518,7 @@ pub fn create_marshalled_reply(
 /// marshalling failures, which dcrd logs and drops, cannot occur for
 /// the id types accepted here).
 pub fn process_request<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     jsonrpc: &str,
     method_name: &str,
     raw_params: &[&str],

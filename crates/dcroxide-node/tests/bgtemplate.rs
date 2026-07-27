@@ -201,7 +201,7 @@ fn serves_getwork_over_the_live_generator() {
         params.clone(),
         policy.clone(),
         0,
-    )) as Box<dyn RpcBlockTemplater + Send>;
+    )) as Box<dyn RpcBlockTemplater + Send + Sync>;
 
     let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(
         Arc::clone(&chain),
@@ -212,10 +212,10 @@ fn serves_getwork_over_the_live_generator() {
         Arc::clone(&tx_pool),
         dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     )));
-    let server = Arc::new(Mutex::new(Server::new(Config {
+    let server = Arc::new(Server::new(Config {
         chain: NodeRpcChain::new(Arc::clone(&chain), params.clone()),
         chain_params: params.clone(),
-        subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool))),
@@ -256,7 +256,7 @@ fn serves_getwork_over_the_live_generator() {
         rpc_pass: "pass".to_string(),
         rpc_limit_user: String::new(),
         rpc_limit_pass: String::new(),
-    })));
+    }));
     let listener = start_rpc_listener(
         &["127.0.0.1:0".to_string()],
         server,
@@ -338,7 +338,7 @@ fn regentemplate_forces_a_new_template() {
     // Subscribe, drain the immediately-delivered current template,
     // then force a regeneration and observe the rebuilt template
     // arrive over the subscription.
-    let mut subscription = templater.subscribe();
+    let subscription = templater.subscribe();
     match subscription.recv() {
         TemplateRecv::Template(_) => {}
         other => panic!("subscription must deliver the current template: {other:?}"),
@@ -553,7 +553,7 @@ fn the_pre_current_wait_loop_forwards_reorg_events() {
         None,
     );
 
-    let mut templater = NodeRpcBlockTemplater::new(
+    let templater = NodeRpcBlockTemplater::new(
         generator.current_handle(),
         generator.subscribers_handle(),
         generator.sink(),

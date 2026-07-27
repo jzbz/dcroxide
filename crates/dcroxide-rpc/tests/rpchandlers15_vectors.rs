@@ -49,7 +49,7 @@ struct MockChain15 {
 }
 
 impl RpcChain for MockChain15 {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         RpcBestState {
             hash: self.header.block_hash(),
             prev_hash: self.header.prev_block,
@@ -61,10 +61,10 @@ impl RpcChain for MockChain15 {
             num_txns: 7,
         }
     }
-    fn is_treasury_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+    fn is_treasury_agenda_active(&self, _prev_blk_hash: &Hash) -> Result<bool, String> {
         Ok(true)
     }
-    fn is_blake3_pow_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+    fn is_blake3_pow_agenda_active(&self, _prev_blk_hash: &Hash) -> Result<bool, String> {
         Ok(false)
     }
 }
@@ -171,10 +171,12 @@ fn websocket_notifications_match_dcrd() {
         let chain = MockChain15 {
             header: block.header,
         };
-        let mut server = Server::new(Config {
+        let server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
+                params.clone(),
+            ))),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(()),
@@ -215,17 +217,15 @@ fn websocket_notifications_match_dcrd() {
         let mut refs: Vec<&mut WsClient> = clients.iter_mut().collect();
         let notifications: Vec<(u64, String)> = match name {
             "nb: blockconnected" | "nb: blockconnected outpoint" => {
-                notify_block_connected(&mut server, &mut refs, &block)
+                notify_block_connected(&server, &mut refs, &block)
             }
-            "nb: blockdisconnected" => notify_block_disconnected(&mut server, &refs, &block),
-            "nb: work 0" => {
-                notify_work(&mut server, &refs, &block, TemplateUpdateReason::NewParent)
-            }
-            "nb: work 1" => notify_work(&mut server, &refs, &block, TemplateUpdateReason::NewVotes),
-            "nb: work 2" => notify_work(&mut server, &refs, &block, TemplateUpdateReason::NewTxns),
-            "nb: tspend" => notify_tspend(&mut server, &refs, &tspend),
+            "nb: blockdisconnected" => notify_block_disconnected(&server, &refs, &block),
+            "nb: work 0" => notify_work(&server, &refs, &block, TemplateUpdateReason::NewParent),
+            "nb: work 1" => notify_work(&server, &refs, &block, TemplateUpdateReason::NewVotes),
+            "nb: work 2" => notify_work(&server, &refs, &block, TemplateUpdateReason::NewTxns),
+            "nb: tspend" => notify_tspend(&server, &refs, &tspend),
             "nb: reorganization" => notify_reorganization(
-                &mut server,
+                &server,
                 &refs,
                 &byte_hash(0x01),
                 432100,
@@ -233,25 +233,25 @@ fn websocket_notifications_match_dcrd() {
                 432101,
             ),
             "nb: winningtickets" => notify_winning_tickets_ntfn(
-                &mut server,
+                &server,
                 &refs,
                 &block.header.block_hash(),
                 432100,
                 &[byte_hash(0x0a), byte_hash(0x0b), byte_hash(0x0c)],
             ),
             "nb: newtickets" => notify_new_tickets(
-                &mut server,
+                &server,
                 &refs,
                 &block.header.block_hash(),
                 432100,
                 14428162590,
                 &[byte_hash(0x0d), byte_hash(0x0e)],
             ),
-            "nb: txaccepted" => notify_for_new_tx(&mut server, &refs, &block.transactions[1]),
+            "nb: txaccepted" => notify_for_new_tx(&server, &refs, &block.transactions[1]),
             "nb: relevanttx outpoint" | "nb: relevanttx address" => {
-                notify_relevant_tx_accepted(&mut server, &mut refs, &block.transactions[1], 0)
+                notify_relevant_tx_accepted(&server, &mut refs, &block.transactions[1], 0)
             }
-            "nb: mixmessage" => notify_mix_message(&mut server, &refs, &pr_msg),
+            "nb: mixmessage" => notify_mix_message(&server, &refs, &pr_msg),
             other => panic!("unknown case {other}"),
         };
 

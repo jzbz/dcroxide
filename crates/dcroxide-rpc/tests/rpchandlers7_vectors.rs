@@ -109,7 +109,7 @@ struct MockSyncMgr7 {
 
 impl RpcSyncManager for MockSyncMgr7 {
     fn process_transaction(
-        &mut self,
+        &self,
         _tx: &MsgTx,
         _allow_orphan: bool,
         _allow_high_fees: bool,
@@ -117,10 +117,10 @@ impl RpcSyncManager for MockSyncMgr7 {
     ) -> Result<Vec<Hash>, SendTxFailure> {
         self.process.clone()
     }
-    fn recently_confirmed_txn(&mut self, _hash: &Hash) -> bool {
+    fn recently_confirmed_txn(&self, _hash: &Hash) -> bool {
         self.recently_confirmed
     }
-    fn submit_block(&mut self, _block: &MsgBlock) -> Result<(), SubmitBlockFailure> {
+    fn submit_block(&self, _block: &MsgBlock) -> Result<(), SubmitBlockFailure> {
         self.submit.clone()
     }
 }
@@ -130,8 +130,8 @@ impl RpcSyncManager for MockSyncMgr7 {
 struct MockConnMgr7;
 
 impl RpcConnManager for MockConnMgr7 {
-    fn relay_transactions(&mut self, _tx_hashes: &[Hash]) {}
-    fn add_rebroadcast_inventory(&mut self, _tx_hash: &Hash, _tx: &MsgTx) {}
+    fn relay_transactions(&self, _tx_hashes: &[Hash]) {}
+    fn add_rebroadcast_inventory(&self, _tx_hash: &Hash, _tx: &MsgTx) {}
 }
 
 /// The scripted chain seam.
@@ -141,10 +141,10 @@ struct MockChain7 {
 }
 
 impl RpcChain for MockChain7 {
-    fn invalidate_block(&mut self, _hash: &Hash) -> Result<(), InvalidateBlockFailure> {
+    fn invalidate_block(&self, _hash: &Hash) -> Result<(), InvalidateBlockFailure> {
         self.invalidate.clone()
     }
-    fn reconsider_block(&mut self, _hash: &Hash) -> Result<(), ReconsiderBlockFailure> {
+    fn reconsider_block(&self, _hash: &Hash) -> Result<(), ReconsiderBlockFailure> {
         self.reconsider.clone()
     }
 }
@@ -155,13 +155,13 @@ struct MockLogMgr {
 }
 
 impl RpcLogManager for MockLogMgr {
-    fn supported_subsystems(&mut self) -> Vec<String> {
+    fn supported_subsystems(&self) -> Vec<String> {
         ["DCRD", "PEER", "RPCS", "SYNC"]
             .iter()
             .map(|s| s.to_string())
             .collect()
     }
-    fn parse_and_set_debug_levels(&mut self, _spec: &str) -> Result<(), String> {
+    fn parse_and_set_debug_levels(&self, _spec: &str) -> Result<(), String> {
         match &self.set_err {
             Some(err) => Err(err.clone()),
             None => Ok(()),
@@ -174,7 +174,7 @@ struct MockFeeEstimator {
 }
 
 impl RpcFeeEstimator for MockFeeEstimator {
-    fn estimate_fee(&mut self, _target: i32) -> Result<i64, String> {
+    fn estimate_fee(&self, _target: i32) -> Result<i64, String> {
         self.fee.clone()
     }
 }
@@ -182,11 +182,11 @@ impl RpcFeeEstimator for MockFeeEstimator {
 struct MockTemplater;
 
 impl RpcBlockTemplater for MockTemplater {
-    fn force_regen(&mut self) {}
+    fn force_regen(&self) {}
 }
 
 fn dispatch(
-    server: &mut Server<MockChain7>,
+    server: &Server<MockChain7>,
     method_name: &str,
     cmd: &GoValue,
 ) -> Result<(GoValue, GoType), RPCError> {
@@ -342,15 +342,18 @@ fn submission_handler_slice_matches_dcrd() {
                 None => Ok(()),
             },
         };
-        let block_templater: Option<Box<dyn RpcBlockTemplater + Send>> = if mock[9] == "true" {
+        let block_templater: Option<Box<dyn RpcBlockTemplater + Send + Sync>> = if mock[9] == "true"
+        {
             None
         } else {
             Some(Box::new(MockTemplater))
         };
-        let mut server = Server::new(Config {
+        let server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
+                params.clone(),
+            ))),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(sync_mgr),
@@ -395,7 +398,7 @@ fn submission_handler_slice_matches_dcrd() {
             rpc_limit_pass: String::new(),
         });
 
-        match dispatch(&mut server, method_name, &cmd) {
+        match dispatch(&server, method_name, &cmd) {
             Ok((value, typ)) => {
                 assert_eq!(result[2], "ok", "{name}: expected an error");
                 let got = gojson::encode(&typ, &value);

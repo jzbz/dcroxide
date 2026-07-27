@@ -49,60 +49,55 @@ pub static WS_HANDLER_METHODS: &[&str] = &[
 /// manager itself arrives with the notification fan-out).
 pub trait RpcNtfnManager {
     /// dcrd `RegisterBlockUpdates`.
-    fn register_block_updates(&mut self, _session_id: u64) {
+    fn register_block_updates(&self, _session_id: u64) {
         unimplemented!("register_block_updates")
     }
     /// dcrd `UnregisterBlockUpdates`.
-    fn unregister_block_updates(&mut self, _session_id: u64) {
+    fn unregister_block_updates(&self, _session_id: u64) {
         unimplemented!("unregister_block_updates")
     }
     /// dcrd `RegisterWorkUpdates`.
-    fn register_work_updates(&mut self, _session_id: u64) {
+    fn register_work_updates(&self, _session_id: u64) {
         unimplemented!("register_work_updates")
     }
     /// dcrd `UnregisterWorkUpdates`.
-    fn unregister_work_updates(&mut self, _session_id: u64) {
+    fn unregister_work_updates(&self, _session_id: u64) {
         unimplemented!("unregister_work_updates")
     }
     /// dcrd `RegisterTSpendUpdates`.
-    fn register_tspend_updates(&mut self, _session_id: u64) {
+    fn register_tspend_updates(&self, _session_id: u64) {
         unimplemented!("register_tspend_updates")
     }
     /// dcrd `UnregisterTSpendUpdates`.
-    fn unregister_tspend_updates(&mut self, _session_id: u64) {
+    fn unregister_tspend_updates(&self, _session_id: u64) {
         unimplemented!("unregister_tspend_updates")
     }
     /// dcrd `RegisterWinningTickets`.
-    fn register_winning_tickets(&mut self, _session_id: u64) {
+    fn register_winning_tickets(&self, _session_id: u64) {
         unimplemented!("register_winning_tickets")
     }
     /// dcrd `RegisterNewTickets`.
-    fn register_new_tickets(&mut self, _session_id: u64) {
+    fn register_new_tickets(&self, _session_id: u64) {
         unimplemented!("register_new_tickets")
     }
     /// dcrd `RegisterNewMempoolTxsUpdates`.
-    fn register_new_mempool_txs_updates(&mut self, _session_id: u64) {
+    fn register_new_mempool_txs_updates(&self, _session_id: u64) {
         unimplemented!("register_new_mempool_txs_updates")
     }
     /// dcrd `UnregisterNewMempoolTxsUpdates`.
-    fn unregister_new_mempool_txs_updates(&mut self, _session_id: u64) {
+    fn unregister_new_mempool_txs_updates(&self, _session_id: u64) {
         unimplemented!("unregister_new_mempool_txs_updates")
     }
     /// dcrd `RegisterMixMessages`.
-    fn register_mix_messages(&mut self, _session_id: u64) {
+    fn register_mix_messages(&self, _session_id: u64) {
         unimplemented!("register_mix_messages")
     }
     /// dcrd `UnregisterMixMessages`.
-    fn unregister_mix_messages(&mut self, _session_id: u64) {
+    fn unregister_mix_messages(&self, _session_id: u64) {
         unimplemented!("unregister_mix_messages")
     }
     /// dcrd `NotifyWinningTickets`.
-    fn notify_winning_tickets(
-        &mut self,
-        _block_hash: &Hash,
-        _block_height: i64,
-        _tickets: &[Hash],
-    ) {
+    fn notify_winning_tickets(&self, _block_hash: &Hash, _block_height: i64, _tickets: &[Hash]) {
         unimplemented!("notify_winning_tickets")
     }
 }
@@ -184,7 +179,7 @@ impl WsClientFilter {
 
     /// Whether the address is contained in the filter (dcrd
     /// `existsAddress`).
-    pub fn exists_address(&self, a: &stdaddr::Address) -> bool {
+    pub fn exists_address(&mut self, a: &stdaddr::Address) -> bool {
         match a {
             stdaddr::Address::PubKeyHashEcdsaSecp256k1V0 { .. } => {
                 return self
@@ -225,7 +220,7 @@ impl WsClientFilter {
 
     /// Whether the outpoint is contained in the filter (dcrd
     /// `existsUnspentOutPoint`).
-    pub fn exists_unspent_out_point(&self, op: &OutPoint) -> bool {
+    pub fn exists_unspent_out_point(&mut self, op: &OutPoint) -> bool {
         self.unspent.contains(&(op.hash, op.index, op.tree))
     }
 }
@@ -352,7 +347,7 @@ fn fields(v: &GoValue) -> &[GoValue] {
 /// help handler but over the websocket usage variant and the combined
 /// method lists.
 pub fn handle_websocket_help<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _wsc: &mut WsClient,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
@@ -396,7 +391,7 @@ pub fn handle_websocket_help<C: RpcChain>(
 
 /// handleloadtxfilter (dcrd `handleLoadTxFilter`).
 pub fn handle_load_tx_filter<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     wsc: &mut WsClient,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
@@ -477,7 +472,7 @@ pub fn handle_load_tx_filter<C: RpcChain>(
 /// handlesession (dcrd `handleSession`); the result is a
 /// `SessionResult` value.
 pub fn handle_session<C: RpcChain>(
-    _server: &mut Server<C>,
+    _server: &Server<C>,
     wsc: &mut WsClient,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
@@ -486,7 +481,7 @@ pub fn handle_session<C: RpcChain>(
 
 /// handlerebroadcastwinners (dcrd `handleRebroadcastWinners`).
 pub fn handle_rebroadcast_winners<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     _wsc: &mut WsClient,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
@@ -509,7 +504,7 @@ pub fn handle_rebroadcast_winners<C: RpcChain>(
 
 /// handlenotifynewtransactions (dcrd `handleNotifyNewTransactions`).
 pub fn handle_notify_new_transactions<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     wsc: &mut WsClient,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
@@ -529,7 +524,7 @@ pub fn handle_notify_new_transactions<C: RpcChain>(
 /// handlerescan (dcrd `handleRescan`); the result is a `RescanResult`
 /// value.
 pub fn handle_rescan<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     wsc: &mut WsClient,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
@@ -602,7 +597,7 @@ pub fn handle_rescan<C: RpcChain>(
 /// to the standard command dispatch (the routing inside dcrd
 /// `serviceRequest`).
 pub fn ws_cmd_result<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     wsc: &mut WsClient,
     method_name: &str,
     cmd: &GoValue,
@@ -683,7 +678,7 @@ pub fn ws_cmd_result<C: RpcChain>(
 /// Execute a parsed websocket request and build the marshalled reply
 /// (the reply construction inside dcrd `serviceRequest`).
 pub fn ws_service_request<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     wsc: &mut WsClient,
     jsonrpc: &str,
     method_name: &str,
@@ -750,7 +745,7 @@ fn marshal_ntfn<C: RpcChain>(
 /// parallel to the client list (dcrd `subscribedClients`, which also
 /// covers the ticket commitment address path).
 pub fn subscribed_clients<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     tx: &MsgTx,
     tree: i8,
     clients: &mut [&mut WsClient],
@@ -818,7 +813,7 @@ pub fn subscribed_clients<C: RpcChain>(
 /// pairs each notified client's session id with the marshalled
 /// notification (dcrd `notifyBlockConnected`).
 pub fn notify_block_connected<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     clients: &mut [&mut WsClient],
     block: &MsgBlock,
 ) -> Vec<(u64, String)> {
@@ -879,7 +874,7 @@ pub fn notify_block_connected<C: RpcChain>(
 /// Notify block-update clients about a disconnected block (dcrd
 /// `notifyBlockDisconnected`).
 pub fn notify_block_disconnected<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     clients: &[&mut WsClient],
     block: &MsgBlock,
 ) -> Vec<(u64, String)> {
@@ -910,7 +905,7 @@ pub fn notify_block_disconnected<C: RpcChain>(
 /// template to the pool and pruning it when the parent changed (dcrd
 /// `notifyWork`).
 pub fn notify_work<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     clients: &[&mut WsClient],
     template_block: &MsgBlock,
     reason: TemplateUpdateReason,
@@ -955,11 +950,15 @@ pub fn notify_work<C: RpcChain>(
         let prune_height = best_height - 3;
         server
             .work_state
+            .lock()
+            .expect("work state poisoned")
             .template_pool
             .retain(|_, block| i64::from(block.header.height) >= prune_height);
     }
     server
         .work_state
+        .lock()
+        .expect("work state poisoned")
         .template_pool
         .insert(template_key, template_block.clone());
 
@@ -972,7 +971,7 @@ pub fn notify_work<C: RpcChain>(
 /// Notify tspend clients about a new mempool treasury spend (dcrd
 /// `notifyTSpend`).
 pub fn notify_tspend<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     clients: &[&mut WsClient],
     tspend: &MsgTx,
 ) -> Vec<(u64, String)> {
@@ -996,7 +995,7 @@ pub fn notify_tspend<C: RpcChain>(
 /// Notify block-update clients about a chain reorganization (dcrd
 /// `notifyReorganization`).
 pub fn notify_reorganization<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     clients: &[&mut WsClient],
     old_hash: &Hash,
     old_height: i64,
@@ -1028,7 +1027,7 @@ pub fn notify_reorganization<C: RpcChain>(
 /// Notify winning-ticket clients (dcrd `notifyWinningTickets`; the
 /// tickets ride in a map keyed by their decimal index).
 pub fn notify_winning_tickets_ntfn<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     clients: &[&mut WsClient],
     block_hash: &Hash,
     block_height: i64,
@@ -1059,7 +1058,7 @@ pub fn notify_winning_tickets_ntfn<C: RpcChain>(
 
 /// Notify maturing-ticket clients (dcrd `notifyNewTickets`).
 pub fn notify_new_tickets<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     clients: &[&mut WsClient],
     hash: &Hash,
     height: i64,
@@ -1093,7 +1092,7 @@ pub fn notify_new_tickets<C: RpcChain>(
 /// the verbose variant for clients that requested it (dcrd
 /// `notifyForNewTx`).
 pub fn notify_for_new_tx<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     clients: &[&mut WsClient],
     tx: &MsgTx,
 ) -> Vec<(u64, String)> {
@@ -1167,7 +1166,7 @@ pub fn notify_for_new_tx<C: RpcChain>(
 /// Notify clients whose filters find the transaction relevant,
 /// watching discovered outputs (dcrd `notifyRelevantTxAccepted`).
 pub fn notify_relevant_tx_accepted<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     clients: &mut [&mut WsClient],
     tx: &MsgTx,
     tree: i8,
@@ -1228,7 +1227,7 @@ pub fn notify_relevant_tx_accepted<C: RpcChain>(
 /// Notify mix-message clients about an accepted mixing message (dcrd
 /// `notifyMixMessage`).
 pub fn notify_mix_message<C: RpcChain>(
-    server: &mut Server<C>,
+    server: &Server<C>,
     clients: &[&mut WsClient],
     msg: &Message,
 ) -> Vec<(u64, String)> {

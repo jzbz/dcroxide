@@ -123,7 +123,7 @@ struct MockChain10 {
 }
 
 impl RpcChain for MockChain10 {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         RpcBestState {
             hash: self.best_header.block_hash(),
             prev_hash: self.best_header.prev_block,
@@ -135,30 +135,30 @@ impl RpcChain for MockChain10 {
             num_txns: 7,
         }
     }
-    fn header_by_hash(&mut self, _hash: &Hash) -> Result<BlockHeader, String> {
+    fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
         self.header_by_hash.clone().map(|()| {
             let mut h = self.best_header;
             h.height = self.header_height;
             h
         })
     }
-    fn main_chain_has_block(&mut self, _hash: &Hash) -> bool {
+    fn main_chain_has_block(&self, _hash: &Hash) -> bool {
         self.main_chain
     }
-    fn fetch_tspend(&mut self, _tspend: &Hash) -> Result<Vec<Hash>, String> {
+    fn fetch_tspend(&self, _tspend: &Hash) -> Result<Vec<Hash>, String> {
         if self.fetch_tspend_mined {
             Ok(vec![self.mined_block.header.block_hash()])
         } else {
             Ok(Vec::new())
         }
     }
-    fn block_by_hash(&mut self, _hash: &Hash) -> Result<MsgBlock, String> {
+    fn block_by_hash(&self, _hash: &Hash) -> Result<MsgBlock, String> {
         self.block_by_hash
             .clone()
             .map(|()| self.mined_block.clone())
     }
     fn tspend_count_votes(
-        &mut self,
+        &self,
         _check_block: &Hash,
         _tspend: &MsgTx,
     ) -> Result<(u32, u32), TSpendCountVotesFailure> {
@@ -173,10 +173,10 @@ struct MockMempool10 {
 }
 
 impl RpcTxMempooler for MockMempool10 {
-    fn tspend_hashes(&mut self) -> Vec<Hash> {
+    fn tspend_hashes(&self) -> Vec<Hash> {
         self.tspend_hashes.clone()
     }
-    fn fetch_transaction(&mut self, _tx_hash: &Hash) -> Result<(MsgTx, i8), String> {
+    fn fetch_transaction(&self, _tx_hash: &Hash) -> Result<(MsgTx, i8), String> {
         self.fetch.clone().map(|tx| (tx, 1))
     }
 }
@@ -284,10 +284,12 @@ fn treasury_spend_votes_handler_matches_dcrd() {
             block_by_hash: err_or(mock[7]),
             votes,
         };
-        let mut server = Server::new(Config {
+        let server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
+                params.clone(),
+            ))),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(()),
@@ -328,7 +330,7 @@ fn treasury_spend_votes_handler_matches_dcrd() {
             rpc_limit_pass: String::new(),
         });
 
-        match handlers::handle_get_treasury_spend_votes(&mut server, &cmd) {
+        match handlers::handle_get_treasury_spend_votes(&server, &cmd) {
             Ok(value) => {
                 assert_eq!(result[2], "ok", "{name}: expected an error");
                 let got = gojson::encode(&results::get_treasury_spend_votes_result(), &value);

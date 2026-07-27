@@ -244,8 +244,8 @@ pub fn rpc_result_types(method: &str) -> Option<Vec<Option<GoType>>> {
 /// returned for both (QK-0005).
 pub struct HelpCacher {
     descs: HashMap<String, String>,
-    usage: String,
-    method_help: HashMap<String, String>,
+    usage: std::sync::Mutex<String>,
+    method_help: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl HelpCacher {
@@ -256,20 +256,25 @@ impl HelpCacher {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            usage: String::new(),
-            method_help: HashMap::new(),
+            usage: std::sync::Mutex::new(String::new()),
+            method_help: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     /// An RPC help string for the provided method (dcrd
     /// `RPCMethodHelp`).  The error is dcrd's plain error text.
     pub fn rpc_method_help(
-        &mut self,
+        &self,
         registry: &Registry,
         method_name: &str,
     ) -> Result<String, String> {
         // Return the cached method help if it exists.
-        if let Some(help) = self.method_help.get(method_name) {
+        if let Some(help) = self
+            .method_help
+            .lock()
+            .expect("help cache poisoned")
+            .get(method_name)
+        {
             return Ok(help.clone());
         }
 
@@ -286,6 +291,8 @@ impl HelpCacher {
             return Err(err.description);
         }
         self.method_help
+            .lock()
+            .expect("help cache poisoned")
             .insert(method_name.to_string(), help.clone());
         Ok(help)
     }
@@ -293,13 +300,16 @@ impl HelpCacher {
     /// One-line usage for all supported RPC commands (dcrd
     /// `RPCUsage`).
     pub fn rpc_usage(
-        &mut self,
+        &self,
         registry: &Registry,
         include_websockets: bool,
     ) -> Result<String, String> {
         // Return the cached usage if it is available.
-        if !self.usage.is_empty() {
-            return Ok(self.usage.clone());
+        {
+            let cached = self.usage.lock().expect("help usage cache poisoned");
+            if !cached.is_empty() {
+                return Ok(cached.clone());
+            }
         }
 
         // Generate a list of one-line usage for every command.
@@ -322,8 +332,9 @@ impl HelpCacher {
         }
 
         usage_texts.sort();
-        self.usage = usage_texts.join("\n");
-        Ok(self.usage.clone())
+        let mut usage = self.usage.lock().expect("help usage cache poisoned");
+        *usage = usage_texts.join("\n");
+        Ok(usage.clone())
     }
 }
 

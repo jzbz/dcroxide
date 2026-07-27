@@ -161,10 +161,10 @@ fn serve_txindex_rpc(
         dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
     )));
 
-    let server = Arc::new(Mutex::new(Server::new(Config {
+    let server = Arc::new(Server::new(Config {
         chain: NodeRpcChain::new(Arc::clone(&chain), params.clone()),
         chain_params: params.clone(),
-        subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool))),
@@ -216,7 +216,7 @@ fn serve_txindex_rpc(
         rpc_pass: "pass".to_string(),
         rpc_limit_user: String::new(),
         rpc_limit_pass: String::new(),
-    })));
+    }));
 
     let listener = start_rpc_listener(
         &["127.0.0.1:0".to_string()],

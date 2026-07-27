@@ -143,64 +143,64 @@ struct MockChain2 {
 }
 
 impl RpcChain for MockChain2 {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         self.best.clone()
     }
-    fn best_header(&mut self) -> (Hash, i64) {
+    fn best_header(&self) -> (Hash, i64) {
         self.best_header
     }
-    fn block_by_hash(&mut self, _hash: &Hash) -> Result<MsgBlock, String> {
+    fn block_by_hash(&self, _hash: &Hash) -> Result<MsgBlock, String> {
         self.block.get()
     }
-    fn block_hash_by_height(&mut self, _height: i64) -> Result<Hash, String> {
+    fn block_hash_by_height(&self, _height: i64) -> Result<Hash, String> {
         self.block_hash_by_height.get()
     }
-    fn chain_tips(&mut self) -> Vec<RpcChainTip> {
+    fn chain_tips(&self) -> Vec<RpcChainTip> {
         self.tips.clone()
     }
-    fn chain_work(&mut self, _hash: &Hash) -> Result<Uint256, String> {
+    fn chain_work(&self, _hash: &Hash) -> Result<Uint256, String> {
         self.chain_work.get()
     }
-    fn header_by_hash(&mut self, _hash: &Hash) -> Result<BlockHeader, String> {
+    fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
         self.header.get()
     }
-    fn header_by_height(&mut self, _height: i64) -> Result<BlockHeader, String> {
+    fn header_by_height(&self, _height: i64) -> Result<BlockHeader, String> {
         unreachable!("not used by the chain query slice")
     }
-    fn is_current(&mut self) -> bool {
+    fn is_current(&self) -> bool {
         self.is_current
     }
-    fn locate_headers(&mut self, _locators: &[Hash], _stop: &Hash) -> Vec<BlockHeader> {
+    fn locate_headers(&self, _locators: &[Hash], _stop: &Hash) -> Vec<BlockHeader> {
         self.locate.clone()
     }
-    fn main_chain_has_block(&mut self, _hash: &Hash) -> bool {
+    fn main_chain_has_block(&self, _hash: &Hash) -> bool {
         self.main_chain_has_block
     }
-    fn max_block_size(&mut self, _prev: &Hash) -> Result<i64, String> {
+    fn max_block_size(&self, _prev: &Hash) -> Result<i64, String> {
         self.max_block_size.get()
     }
-    fn median_time_by_hash(&mut self, _hash: &Hash) -> Result<i64, String> {
+    fn median_time_by_hash(&self, _hash: &Hash) -> Result<i64, String> {
         self.median_time.get()
     }
-    fn next_threshold_state(&mut self, _prev: &Hash, _id: &str) -> Result<State, String> {
+    fn next_threshold_state(&self, _prev: &Hash, _id: &str) -> Result<State, String> {
         self.state.get()
     }
-    fn state_last_changed_height(&mut self, _hash: &Hash, _id: &str) -> Result<i64, String> {
+    fn state_last_changed_height(&self, _hash: &Hash, _id: &str) -> Result<i64, String> {
         self.since.get()
     }
-    fn is_blake3_pow_agenda_active(&mut self, _prev: &Hash) -> Result<bool, String> {
+    fn is_blake3_pow_agenda_active(&self, _prev: &Hash) -> Result<bool, String> {
         self.blake3.get()
     }
-    fn is_treasury_agenda_active(&mut self, _prev: &Hash) -> Result<bool, String> {
+    fn is_treasury_agenda_active(&self, _prev: &Hash) -> Result<bool, String> {
         // The single error case is scripted through the treasury flag
         // name in the dump; the flag row carries only the boolean, so
         // the error variant is keyed off a sentinel set by the driver.
         Ok(self.treasury)
     }
-    fn is_subsidy_split_agenda_active(&mut self, _prev: &Hash) -> Result<bool, String> {
+    fn is_subsidy_split_agenda_active(&self, _prev: &Hash) -> Result<bool, String> {
         unreachable!("not used by the chain query slice")
     }
-    fn is_subsidy_split_r2_agenda_active(&mut self, _prev: &Hash) -> Result<bool, String> {
+    fn is_subsidy_split_r2_agenda_active(&self, _prev: &Hash) -> Result<bool, String> {
         unreachable!("not used by the chain query slice")
     }
 }
@@ -212,64 +212,64 @@ struct MockChain2OrTreasuryErr {
 }
 
 impl RpcChain for MockChain2OrTreasuryErr {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         self.inner.best_snapshot()
     }
-    fn best_header(&mut self) -> (Hash, i64) {
+    fn best_header(&self) -> (Hash, i64) {
         self.inner.best_header()
     }
-    fn block_by_hash(&mut self, hash: &Hash) -> Result<MsgBlock, String> {
+    fn block_by_hash(&self, hash: &Hash) -> Result<MsgBlock, String> {
         self.inner.block_by_hash(hash)
     }
-    fn block_hash_by_height(&mut self, height: i64) -> Result<Hash, String> {
+    fn block_hash_by_height(&self, height: i64) -> Result<Hash, String> {
         self.inner.block_hash_by_height(height)
     }
-    fn chain_tips(&mut self) -> Vec<RpcChainTip> {
+    fn chain_tips(&self) -> Vec<RpcChainTip> {
         self.inner.chain_tips()
     }
-    fn chain_work(&mut self, hash: &Hash) -> Result<Uint256, String> {
+    fn chain_work(&self, hash: &Hash) -> Result<Uint256, String> {
         self.inner.chain_work(hash)
     }
-    fn header_by_hash(&mut self, hash: &Hash) -> Result<BlockHeader, String> {
+    fn header_by_hash(&self, hash: &Hash) -> Result<BlockHeader, String> {
         self.inner.header_by_hash(hash)
     }
-    fn header_by_height(&mut self, height: i64) -> Result<BlockHeader, String> {
+    fn header_by_height(&self, height: i64) -> Result<BlockHeader, String> {
         self.inner.header_by_height(height)
     }
-    fn is_current(&mut self) -> bool {
+    fn is_current(&self) -> bool {
         self.inner.is_current()
     }
-    fn locate_headers(&mut self, locators: &[Hash], stop: &Hash) -> Vec<BlockHeader> {
+    fn locate_headers(&self, locators: &[Hash], stop: &Hash) -> Vec<BlockHeader> {
         self.inner.locate_headers(locators, stop)
     }
-    fn main_chain_has_block(&mut self, hash: &Hash) -> bool {
+    fn main_chain_has_block(&self, hash: &Hash) -> bool {
         self.inner.main_chain_has_block(hash)
     }
-    fn max_block_size(&mut self, prev: &Hash) -> Result<i64, String> {
+    fn max_block_size(&self, prev: &Hash) -> Result<i64, String> {
         self.inner.max_block_size(prev)
     }
-    fn median_time_by_hash(&mut self, hash: &Hash) -> Result<i64, String> {
+    fn median_time_by_hash(&self, hash: &Hash) -> Result<i64, String> {
         self.inner.median_time_by_hash(hash)
     }
-    fn next_threshold_state(&mut self, prev: &Hash, id: &str) -> Result<State, String> {
+    fn next_threshold_state(&self, prev: &Hash, id: &str) -> Result<State, String> {
         self.inner.next_threshold_state(prev, id)
     }
-    fn state_last_changed_height(&mut self, hash: &Hash, id: &str) -> Result<i64, String> {
+    fn state_last_changed_height(&self, hash: &Hash, id: &str) -> Result<i64, String> {
         self.inner.state_last_changed_height(hash, id)
     }
-    fn is_blake3_pow_agenda_active(&mut self, prev: &Hash) -> Result<bool, String> {
+    fn is_blake3_pow_agenda_active(&self, prev: &Hash) -> Result<bool, String> {
         self.inner.is_blake3_pow_agenda_active(prev)
     }
-    fn is_treasury_agenda_active(&mut self, prev: &Hash) -> Result<bool, String> {
+    fn is_treasury_agenda_active(&self, prev: &Hash) -> Result<bool, String> {
         if let Some(err) = &self.treasury_err {
             return Err(err.clone());
         }
         self.inner.is_treasury_agenda_active(prev)
     }
-    fn is_subsidy_split_agenda_active(&mut self, prev: &Hash) -> Result<bool, String> {
+    fn is_subsidy_split_agenda_active(&self, prev: &Hash) -> Result<bool, String> {
         self.inner.is_subsidy_split_agenda_active(prev)
     }
-    fn is_subsidy_split_r2_agenda_active(&mut self, prev: &Hash) -> Result<bool, String> {
+    fn is_subsidy_split_r2_agenda_active(&self, prev: &Hash) -> Result<bool, String> {
         self.inner.is_subsidy_split_r2_agenda_active(prev)
     }
 }
@@ -278,7 +278,7 @@ impl RpcChain for MockChain2OrTreasuryErr {
 struct MockSyncManager(i64);
 
 impl RpcSyncManager for MockSyncManager {
-    fn sync_height(&mut self) -> i64 {
+    fn sync_height(&self) -> i64 {
         self.0
     }
 }
@@ -297,7 +297,7 @@ fn state_from_name(name: &str) -> State {
 type MockServer = Server<MockChain2OrTreasuryErr>;
 
 fn dispatch(
-    server: &mut MockServer,
+    server: &MockServer,
     method_name: &str,
     cmd: &GoValue,
 ) -> Result<(GoValue, GoType), RPCError> {
@@ -463,10 +463,12 @@ fn chain_query_handler_slice_matches_dcrd() {
                 .contains("treasury err")
                 .then(|| "treasury lookup failed".to_string()),
         };
-        let mut server = Server::new(Config {
+        let server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
+                params.clone(),
+            ))),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(MockSyncManager(mock[14].parse().unwrap())),
@@ -504,7 +506,7 @@ fn chain_query_handler_slice_matches_dcrd() {
             rpc_limit_pass: String::new(),
         });
 
-        match dispatch(&mut server, method_name, &cmd) {
+        match dispatch(&server, method_name, &cmd) {
             Ok((value, typ)) => {
                 assert_eq!(result[2], "ok", "{name}: expected an error");
                 let got = gojson::encode(&typ, &value);

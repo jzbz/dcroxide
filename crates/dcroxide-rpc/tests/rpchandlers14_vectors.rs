@@ -108,7 +108,7 @@ struct MockChain14 {
 }
 
 impl RpcChain for MockChain14 {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         RpcBestState {
             hash: self.block.header.block_hash(),
             prev_hash: self.block.header.prev_block,
@@ -120,19 +120,19 @@ impl RpcChain for MockChain14 {
             num_txns: 7,
         }
     }
-    fn block_by_hash(&mut self, _hash: &Hash) -> Result<MsgBlock, String> {
+    fn block_by_hash(&self, _hash: &Hash) -> Result<MsgBlock, String> {
         self.block_by_hash.clone().map(|()| self.block.clone())
     }
-    fn is_treasury_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+    fn is_treasury_agenda_active(&self, _prev_blk_hash: &Hash) -> Result<bool, String> {
         Ok(true)
     }
-    fn tip_generation(&mut self) -> Vec<Hash> {
+    fn tip_generation(&self) -> Vec<Hash> {
         self.tip_generation.clone()
     }
-    fn lottery_data_for_block(&mut self, _hash: &Hash) -> Result<Vec<Hash>, String> {
+    fn lottery_data_for_block(&self, _hash: &Hash) -> Result<Vec<Hash>, String> {
         Ok(self.lottery.clone())
     }
-    fn best_header(&mut self) -> (Hash, i64) {
+    fn best_header(&self) -> (Hash, i64) {
         (Hash([0u8; 32]), 432100)
     }
 }
@@ -141,19 +141,19 @@ impl RpcChain for MockChain14 {
 struct NoopNtfnMgr;
 
 impl RpcNtfnManager for NoopNtfnMgr {
-    fn register_block_updates(&mut self, _session_id: u64) {}
-    fn unregister_block_updates(&mut self, _session_id: u64) {}
-    fn register_work_updates(&mut self, _session_id: u64) {}
-    fn unregister_work_updates(&mut self, _session_id: u64) {}
-    fn register_tspend_updates(&mut self, _session_id: u64) {}
-    fn unregister_tspend_updates(&mut self, _session_id: u64) {}
-    fn register_winning_tickets(&mut self, _session_id: u64) {}
-    fn register_new_tickets(&mut self, _session_id: u64) {}
-    fn register_new_mempool_txs_updates(&mut self, _session_id: u64) {}
-    fn unregister_new_mempool_txs_updates(&mut self, _session_id: u64) {}
-    fn register_mix_messages(&mut self, _session_id: u64) {}
-    fn unregister_mix_messages(&mut self, _session_id: u64) {}
-    fn notify_winning_tickets(&mut self, _hash: &Hash, _height: i64, _tickets: &[Hash]) {}
+    fn register_block_updates(&self, _session_id: u64) {}
+    fn unregister_block_updates(&self, _session_id: u64) {}
+    fn register_work_updates(&self, _session_id: u64) {}
+    fn unregister_work_updates(&self, _session_id: u64) {}
+    fn register_tspend_updates(&self, _session_id: u64) {}
+    fn unregister_tspend_updates(&self, _session_id: u64) {}
+    fn register_winning_tickets(&self, _session_id: u64) {}
+    fn register_new_tickets(&self, _session_id: u64) {}
+    fn register_new_mempool_txs_updates(&self, _session_id: u64) {}
+    fn unregister_new_mempool_txs_updates(&self, _session_id: u64) {}
+    fn register_mix_messages(&self, _session_id: u64) {}
+    fn unregister_mix_messages(&self, _session_id: u64) {}
+    fn notify_winning_tickets(&self, _hash: &Hash, _height: i64, _tickets: &[Hash]) {}
 }
 
 #[test]
@@ -203,7 +203,9 @@ fn websocket_client_core_matches_dcrd() {
         let mut server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
+                params.clone(),
+            ))),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(()),
@@ -259,7 +261,7 @@ fn websocket_client_core_matches_dcrd() {
                 .unwrap_or_else(|e| panic!("{name}/{step_name}: parse params: {e:?}"));
             let cmd = GoValue::Struct(cmd_instance.fields);
 
-            match ws_cmd_result(&mut server, &mut wsc, method_name, &cmd) {
+            match ws_cmd_result(&server, &mut wsc, method_name, &cmd) {
                 Ok((value, typ)) => {
                     assert_eq!(result[3], "ok", "{name}/{step_name}: expected an error");
                     let got = gojson::encode(&typ, &value);

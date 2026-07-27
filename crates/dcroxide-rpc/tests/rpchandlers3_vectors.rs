@@ -123,20 +123,20 @@ struct MockChain3 {
 }
 
 impl RpcChain for MockChain3 {
-    fn best_snapshot(&mut self) -> RpcBestState {
+    fn best_snapshot(&self) -> RpcBestState {
         self.best.clone()
     }
-    fn header_by_height(&mut self, _height: i64) -> Result<BlockHeader, String> {
+    fn header_by_height(&self, _height: i64) -> Result<BlockHeader, String> {
         self.header.clone()
     }
-    fn block_hash_by_height(&mut self, _height: i64) -> Result<Hash, String> {
+    fn block_hash_by_height(&self, _height: i64) -> Result<Hash, String> {
         self.block_hash_by_height.clone()
     }
-    fn next_threshold_state(&mut self, _prev: &Hash, _id: &str) -> Result<State, String> {
+    fn next_threshold_state(&self, _prev: &Hash, _id: &str) -> Result<State, String> {
         self.state.clone()
     }
     fn estimate_next_stake_difficulty(
-        &mut self,
+        &self,
         _hash: &Hash,
         new_tickets: i64,
         use_max_tickets: bool,
@@ -151,96 +151,93 @@ impl RpcChain for MockChain3 {
         }
         Ok(v)
     }
-    fn check_live_ticket(&mut self, _hash: &Hash) -> bool {
+    fn check_live_ticket(&self, _hash: &Hash) -> bool {
         self.check_live
     }
-    fn check_live_tickets(&mut self, _hashes: &[Hash]) -> Vec<bool> {
+    fn check_live_tickets(&self, _hashes: &[Hash]) -> Vec<bool> {
         self.check_lives.clone()
     }
-    fn calc_want_height(&mut self, _interval: i64, _height: i64) -> i64 {
+    fn calc_want_height(&self, _interval: i64, _height: i64) -> i64 {
         self.want_height
     }
     fn get_stake_versions(
-        &mut self,
+        &self,
         _hash: &Hash,
         _count: i32,
     ) -> Result<Vec<RpcStakeVersions>, String> {
         self.stake_versions.clone()
     }
     fn get_vote_info(
-        &mut self,
+        &self,
         _hash: &Hash,
         _version: u32,
     ) -> Result<Vec<ConsensusDeployment>, VoteInfoFailure> {
         self.vote_info.clone()
     }
-    fn count_vote_version(&mut self, _version: u32) -> Result<u32, String> {
+    fn count_vote_version(&self, _version: u32) -> Result<u32, String> {
         self.count_vote.clone()
     }
     fn get_vote_counts(
-        &mut self,
+        &self,
         _version: u32,
         _deployment_id: &str,
     ) -> Result<RpcVoteCounts, String> {
         self.vote_counts.clone()
     }
-    fn ticket_pool_value(&mut self) -> Result<i64, String> {
+    fn ticket_pool_value(&self) -> Result<i64, String> {
         self.ticket_pool_value.clone()
     }
-    fn treasury_balance(
-        &mut self,
-        _hash: &Hash,
-    ) -> Result<RpcTreasuryBalance, TreasuryBalanceFailure> {
+    fn treasury_balance(&self, _hash: &Hash) -> Result<RpcTreasuryBalance, TreasuryBalanceFailure> {
         self.treasury.clone()
     }
-    fn live_tickets(&mut self) -> Result<Vec<Hash>, String> {
+    fn live_tickets(&self) -> Result<Vec<Hash>, String> {
         self.live.clone()
     }
 
     // Unused by the stake query slice.
-    fn best_header(&mut self) -> (Hash, i64) {
+    fn best_header(&self) -> (Hash, i64) {
         unimplemented!()
     }
-    fn block_by_hash(&mut self, _hash: &Hash) -> Result<MsgBlock, String> {
+    fn block_by_hash(&self, _hash: &Hash) -> Result<MsgBlock, String> {
         unimplemented!()
     }
-    fn chain_tips(&mut self) -> Vec<dcroxide_rpc::server::RpcChainTip> {
+    fn chain_tips(&self) -> Vec<dcroxide_rpc::server::RpcChainTip> {
         unimplemented!()
     }
-    fn chain_work(&mut self, _hash: &Hash) -> Result<dcroxide_uint256::Uint256, String> {
+    fn chain_work(&self, _hash: &Hash) -> Result<dcroxide_uint256::Uint256, String> {
         unimplemented!()
     }
-    fn header_by_hash(&mut self, _hash: &Hash) -> Result<BlockHeader, String> {
+    fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
         unimplemented!()
     }
-    fn is_current(&mut self) -> bool {
+    fn is_current(&self) -> bool {
         unimplemented!()
     }
-    fn locate_headers(&mut self, _locators: &[Hash], _stop: &Hash) -> Vec<BlockHeader> {
+    fn locate_headers(&self, _locators: &[Hash], _stop: &Hash) -> Vec<BlockHeader> {
         unimplemented!()
     }
-    fn main_chain_has_block(&mut self, _hash: &Hash) -> bool {
+    fn main_chain_has_block(&self, _hash: &Hash) -> bool {
         unimplemented!()
     }
-    fn max_block_size(&mut self, _prev: &Hash) -> Result<i64, String> {
+    fn max_block_size(&self, _prev: &Hash) -> Result<i64, String> {
         unimplemented!()
     }
-    fn median_time_by_hash(&mut self, _hash: &Hash) -> Result<i64, String> {
+    fn median_time_by_hash(&self, _hash: &Hash) -> Result<i64, String> {
         unimplemented!()
     }
-    fn state_last_changed_height(&mut self, _hash: &Hash, _id: &str) -> Result<i64, String> {
+    fn state_last_changed_height(&self, _hash: &Hash, _id: &str) -> Result<i64, String> {
         unimplemented!()
     }
-    fn is_blake3_pow_agenda_active(&mut self, _prev: &Hash) -> Result<bool, String> {
+    fn is_blake3_pow_agenda_active(&self, _prev: &Hash) -> Result<bool, String> {
         unimplemented!()
     }
-    fn is_treasury_agenda_active(&mut self, _prev: &Hash) -> Result<bool, String> {
+    fn is_treasury_agenda_active(&self, _prev: &Hash) -> Result<bool, String> {
         unimplemented!()
     }
-    fn is_subsidy_split_agenda_active(&mut self, _prev: &Hash) -> Result<bool, String> {
+    fn is_subsidy_split_agenda_active(&self, _prev: &Hash) -> Result<bool, String> {
         unimplemented!()
     }
-    fn is_subsidy_split_r2_agenda_active(&mut self, _prev: &Hash) -> Result<bool, String> {
+    fn is_subsidy_split_r2_agenda_active(&self, _prev: &Hash) -> Result<bool, String> {
         unimplemented!()
     }
 }
@@ -249,7 +246,7 @@ impl RpcChain for MockChain3 {
 struct StubSyncManager;
 
 impl RpcSyncManager for StubSyncManager {
-    fn sync_height(&mut self) -> i64 {
+    fn sync_height(&self) -> i64 {
         unimplemented!()
     }
 }
@@ -273,7 +270,7 @@ fn or_err<T>(field: &str, parse: impl Fn(&str) -> T) -> Result<T, String> {
 }
 
 fn dispatch(
-    server: &mut Server<MockChain3>,
+    server: &Server<MockChain3>,
     method_name: &str,
     cmd: &GoValue,
 ) -> Result<(GoValue, GoType), RPCError> {
@@ -504,10 +501,12 @@ fn stake_query_handler_slice_matches_dcrd() {
                 .contains("estimate err")
                 .then(|| "estimate failed".to_string()),
         };
-        let mut server = Server::new(Config {
+        let server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
+                params.clone(),
+            ))),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(StubSyncManager),
@@ -545,7 +544,7 @@ fn stake_query_handler_slice_matches_dcrd() {
             rpc_limit_pass: String::new(),
         });
 
-        match dispatch(&mut server, method_name, &cmd) {
+        match dispatch(&server, method_name, &cmd) {
             Ok((value, typ)) => {
                 assert_eq!(result[2], "ok", "{name}: expected an error");
                 let got = gojson::encode(&typ, &value);

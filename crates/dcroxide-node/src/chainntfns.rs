@@ -531,13 +531,8 @@ impl ChainNtfnHandler {
                 continue;
             };
             if let Some(ntfn) = &self.ntfn {
-                let mut mgr = ntfn.clone();
-                RpcNtfnManager::notify_winning_tickets(
-                    &mut mgr,
-                    &block_hash,
-                    block_height,
-                    &winners,
-                );
+                let mgr = ntfn.clone();
+                RpcNtfnManager::notify_winning_tickets(&mgr, &block_hash, block_height, &winners);
             }
             self.lottery_data_broadcast
                 .lock()

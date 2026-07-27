@@ -117,7 +117,7 @@ struct MockChain8 {
 }
 
 impl RpcChain for MockChain8 {
-    fn best_snapshot(&mut self) -> dcroxide_rpc::server::RpcBestState {
+    fn best_snapshot(&self) -> dcroxide_rpc::server::RpcBestState {
         dcroxide_rpc::server::RpcBestState {
             hash: self.header.block_hash(),
             prev_hash: self.header.prev_block,
@@ -129,32 +129,32 @@ impl RpcChain for MockChain8 {
             num_txns: 0,
         }
     }
-    fn block_by_height(&mut self, _height: i64) -> Result<MsgBlock, String> {
+    fn block_by_height(&self, _height: i64) -> Result<MsgBlock, String> {
         self.block_by_height.clone().map(|()| self.block.clone())
     }
-    fn block_by_hash(&mut self, _hash: &Hash) -> Result<MsgBlock, String> {
+    fn block_by_hash(&self, _hash: &Hash) -> Result<MsgBlock, String> {
         Ok(self.block.clone())
     }
-    fn height_range(&mut self, _start: i64, _end: i64) -> Result<Vec<Hash>, String> {
+    fn height_range(&self, _start: i64, _end: i64) -> Result<Vec<Hash>, String> {
         self.height_range
             .clone()
             .map(|()| vec![self.header.block_hash()])
     }
-    fn header_by_height(&mut self, _height: i64) -> Result<BlockHeader, String> {
+    fn header_by_height(&self, _height: i64) -> Result<BlockHeader, String> {
         self.header_by_height.clone().map(|()| self.header)
     }
-    fn header_by_hash(&mut self, _hash: &Hash) -> Result<BlockHeader, String> {
+    fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
         self.header_by_hash.clone().map(|()| self.header)
     }
     fn fetch_utxo_entry(
-        &mut self,
+        &self,
         _tx_hash: &Hash,
         _index: u32,
         _tree: i8,
     ) -> Result<Option<RpcUtxoEntry>, String> {
         self.utxo.clone()
     }
-    fn is_auto_revocations_agenda_active(&mut self, _prev_blk_hash: &Hash) -> Result<bool, String> {
+    fn is_auto_revocations_agenda_active(&self, _prev_blk_hash: &Hash) -> Result<bool, String> {
         self.auto_rev.clone()
     }
 }
@@ -165,7 +165,7 @@ struct MockMempool8 {
 }
 
 impl RpcTxMempooler for MockMempool8 {
-    fn tx_descs(&mut self) -> Vec<RpcMempoolTx> {
+    fn tx_descs(&self) -> Vec<RpcMempoolTx> {
         self.descs.clone()
     }
 }
@@ -176,7 +176,7 @@ struct MockSanity8 {
 }
 
 impl RpcSanityChecker for MockSanity8 {
-    fn check_block_sanity(&mut self, _block: &MsgBlock) -> Result<(), String> {
+    fn check_block_sanity(&self, _block: &MsgBlock) -> Result<(), String> {
         match &self.err {
             Some(err) => Err(err.clone()),
             None => Ok(()),
@@ -190,7 +190,7 @@ struct MockTime8 {
 }
 
 impl RpcTimeSource for MockTime8 {
-    fn offset_nanos(&mut self) -> i64 {
+    fn offset_nanos(&self) -> i64 {
         self.nanos
     }
 }
@@ -199,13 +199,13 @@ impl RpcTimeSource for MockTime8 {
 struct MockConnMgr8;
 
 impl RpcConnManager for MockConnMgr8 {
-    fn connected_count(&mut self) -> i32 {
+    fn connected_count(&self) -> i32 {
         4
     }
 }
 
 fn dispatch(
-    server: &mut Server<MockChain8>,
+    server: &Server<MockChain8>,
     method_name: &str,
     cmd: &GoValue,
 ) -> Result<(GoValue, GoType), RPCError> {
@@ -376,10 +376,12 @@ fn fee_and_node_info_handler_slice_matches_dcrd() {
                 other => Err(other.strip_prefix("ERR:").unwrap().to_string()),
             },
         };
-        let mut server = Server::new(Config {
+        let server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
+                params.clone(),
+            ))),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(()),
@@ -421,7 +423,7 @@ fn fee_and_node_info_handler_slice_matches_dcrd() {
             rpc_limit_pass: String::new(),
         });
 
-        match dispatch(&mut server, method_name, &cmd) {
+        match dispatch(&server, method_name, &cmd) {
             Ok((value, typ)) => {
                 assert_eq!(result[2], "ok", "{name}: expected an error");
                 let got = gojson::encode(&typ, &value);

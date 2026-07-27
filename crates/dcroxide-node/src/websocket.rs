@@ -156,10 +156,7 @@ impl NodeNtfnMgr {
     /// Start the delivery thread over the RPC server (dcrd
     /// `wsNotificationManager.Run`'s notification handler).  Returns
     /// `None` when this manager's thread is already running.
-    pub fn start(
-        &self,
-        server: Arc<Mutex<Server<NodeRpcChain>>>,
-    ) -> Option<std::thread::JoinHandle<()>> {
+    pub fn start(&self, server: Arc<Server<NodeRpcChain>>) -> Option<std::thread::JoinHandle<()>> {
         let receiver = self.receiver.lock().expect("ntfn receiver").take()?;
         let subs = Arc::clone(&self.inner);
         let clients = Arc::clone(&self.clients);
@@ -340,60 +337,60 @@ impl Default for NodeNtfnMgr {
 }
 
 impl RpcNtfnManager for NodeNtfnMgr {
-    fn register_block_updates(&mut self, session_id: u64) {
+    fn register_block_updates(&self, session_id: u64) {
         self.inner.lock().expect("subs").blocks.insert(session_id);
     }
-    fn unregister_block_updates(&mut self, session_id: u64) {
+    fn unregister_block_updates(&self, session_id: u64) {
         self.inner.lock().expect("subs").blocks.remove(&session_id);
     }
-    fn register_work_updates(&mut self, session_id: u64) {
+    fn register_work_updates(&self, session_id: u64) {
         self.inner.lock().expect("subs").work.insert(session_id);
     }
-    fn unregister_work_updates(&mut self, session_id: u64) {
+    fn unregister_work_updates(&self, session_id: u64) {
         self.inner.lock().expect("subs").work.remove(&session_id);
     }
-    fn register_tspend_updates(&mut self, session_id: u64) {
+    fn register_tspend_updates(&self, session_id: u64) {
         self.inner.lock().expect("subs").tspends.insert(session_id);
     }
-    fn unregister_tspend_updates(&mut self, session_id: u64) {
+    fn unregister_tspend_updates(&self, session_id: u64) {
         self.inner.lock().expect("subs").tspends.remove(&session_id);
     }
-    fn register_winning_tickets(&mut self, session_id: u64) {
+    fn register_winning_tickets(&self, session_id: u64) {
         self.inner
             .lock()
             .expect("subs")
             .winning_tickets
             .insert(session_id);
     }
-    fn register_new_tickets(&mut self, session_id: u64) {
+    fn register_new_tickets(&self, session_id: u64) {
         self.inner
             .lock()
             .expect("subs")
             .new_tickets
             .insert(session_id);
     }
-    fn register_new_mempool_txs_updates(&mut self, session_id: u64) {
+    fn register_new_mempool_txs_updates(&self, session_id: u64) {
         self.inner
             .lock()
             .expect("subs")
             .mempool_txs
             .insert(session_id);
     }
-    fn unregister_new_mempool_txs_updates(&mut self, session_id: u64) {
+    fn unregister_new_mempool_txs_updates(&self, session_id: u64) {
         self.inner
             .lock()
             .expect("subs")
             .mempool_txs
             .remove(&session_id);
     }
-    fn register_mix_messages(&mut self, session_id: u64) {
+    fn register_mix_messages(&self, session_id: u64) {
         self.inner
             .lock()
             .expect("subs")
             .mix_messages
             .insert(session_id);
     }
-    fn unregister_mix_messages(&mut self, session_id: u64) {
+    fn unregister_mix_messages(&self, session_id: u64) {
         self.inner
             .lock()
             .expect("subs")
@@ -401,7 +398,7 @@ impl RpcNtfnManager for NodeNtfnMgr {
             .remove(&session_id);
     }
 
-    fn notify_winning_tickets(&mut self, block_hash: &Hash, block_height: i64, tickets: &[Hash]) {
+    fn notify_winning_tickets(&self, block_hash: &Hash, block_height: i64, tickets: &[Hash]) {
         let _ = self.events.send(NtfnEvent::WinningTickets {
             block_hash: *block_hash,
             block_height,
@@ -415,7 +412,7 @@ impl RpcNtfnManager for NodeNtfnMgr {
 /// subscribers' outbound queues.
 fn deliver_events(
     events: mpsc::Receiver<NtfnEvent>,
-    server: Arc<Mutex<Server<NodeRpcChain>>>,
+    server: Arc<Server<NodeRpcChain>>,
     subs: Arc<Mutex<Subscriptions>>,
     clients: Arc<Mutex<HashMap<u64, ClientHandle>>>,
 ) {
@@ -429,11 +426,13 @@ fn deliver_events(
 
 /// Fan one event out: pick the subscriber set the event notifies
 /// (dcrd's per-kind client maps), run the ported builder against those
-/// clients under the server lock, and queue the marshalled JSON on
-/// each target's outbound queue.
+/// clients, and queue the marshalled JSON on each target's outbound
+/// queue.  The builder needs no server-wide lock — dcrd's notification
+/// manager takes none either — so a handler thread serving a long
+/// request no longer blocks notification construction.
 fn deliver_one(
     event: &NtfnEvent,
-    server: &Arc<Mutex<Server<NodeRpcChain>>>,
+    server: &Arc<Server<NodeRpcChain>>,
     subs: &Arc<Mutex<Subscriptions>>,
     clients: &Arc<Mutex<HashMap<u64, ClientHandle>>>,
 ) {
@@ -473,22 +472,17 @@ fn deliver_one(
         return;
     }
 
-    let mut server_guard = server
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let out = match event {
-        NtfnEvent::BlockConnected(block) => build(&mut server_guard, &targets, |srv, refs| {
+        NtfnEvent::BlockConnected(block) => build(server, &targets, |srv, refs| {
             rpcws::notify_block_connected(srv, refs, block)
         }),
-        NtfnEvent::BlockDisconnected(block) => build(&mut server_guard, &targets, |srv, refs| {
+        NtfnEvent::BlockDisconnected(block) => build(server, &targets, |srv, refs| {
             rpcws::notify_block_disconnected(srv, refs, block)
         }),
-        NtfnEvent::Work(template_block, reason) => {
-            build(&mut server_guard, &targets, |srv, refs| {
-                rpcws::notify_work(srv, refs, template_block, *reason)
-            })
-        }
-        NtfnEvent::TSpend(tspend) => build(&mut server_guard, &targets, |srv, refs| {
+        NtfnEvent::Work(template_block, reason) => build(server, &targets, |srv, refs| {
+            rpcws::notify_work(srv, refs, template_block, *reason)
+        }),
+        NtfnEvent::TSpend(tspend) => build(server, &targets, |srv, refs| {
             rpcws::notify_tspend(srv, refs, tspend)
         }),
         NtfnEvent::Reorganization {
@@ -496,14 +490,14 @@ fn deliver_one(
             old_height,
             new_hash,
             new_height,
-        } => build(&mut server_guard, &targets, |srv, refs| {
+        } => build(server, &targets, |srv, refs| {
             rpcws::notify_reorganization(srv, refs, old_hash, *old_height, new_hash, *new_height)
         }),
         NtfnEvent::WinningTickets {
             block_hash,
             block_height,
             tickets,
-        } => build(&mut server_guard, &targets, |srv, refs| {
+        } => build(server, &targets, |srv, refs| {
             rpcws::notify_winning_tickets_ntfn(srv, refs, block_hash, *block_height, tickets)
         }),
         NtfnEvent::NewTickets {
@@ -511,7 +505,7 @@ fn deliver_one(
             height,
             stake_difficulty,
             tickets_new,
-        } => build(&mut server_guard, &targets, |srv, refs| {
+        } => build(server, &targets, |srv, refs| {
             rpcws::notify_new_tickets(srv, refs, hash, *height, *stake_difficulty, tickets_new)
         }),
         NtfnEvent::MempoolTx(tx, tree) => {
@@ -521,21 +515,20 @@ fn deliver_one(
             let mut out = if targets.is_empty() {
                 Vec::new()
             } else {
-                build(&mut server_guard, &targets, |srv, refs| {
+                build(server, &targets, |srv, refs| {
                     rpcws::notify_for_new_tx(srv, refs, tx)
                 })
             };
-            out.extend(build(&mut server_guard, &everyone, |srv, refs| {
+            out.extend(build(server, &everyone, |srv, refs| {
                 rpcws::notify_relevant_tx_accepted(srv, refs, tx, *tree)
             }));
             out
         }
-        NtfnEvent::MixMessage(msg) => build(&mut server_guard, &targets, |srv, refs| {
+        NtfnEvent::MixMessage(msg) => build(server, &targets, |srv, refs| {
             rpcws::notify_mix_message(srv, refs, msg)
         }),
         NtfnEvent::Shutdown => Vec::new(),
     };
-    drop(server_guard);
 
     // Queue the JSON on each target's outbound queue; the serving
     // loops write them out when their connections go idle.
@@ -559,12 +552,12 @@ fn deliver_one(
 /// locked, preserving the server-then-client order every path uses)
 /// and run a ported builder over them.
 fn build<F>(
-    server: &mut Server<NodeRpcChain>,
+    server: &Server<NodeRpcChain>,
     handles: &[(u64, ClientHandle)],
     builder: F,
 ) -> Vec<(u64, String)>
 where
-    F: FnOnce(&mut Server<NodeRpcChain>, &mut [&mut WsClient]) -> Vec<(u64, String)>,
+    F: FnOnce(&Server<NodeRpcChain>, &mut [&mut WsClient]) -> Vec<(u64, String)>,
 {
     let mut guards: Vec<_> = handles
         .iter()
@@ -598,7 +591,7 @@ pub fn serve_websocket<S: Read + Write>(
     head: &crate::rpcrun::HttpHead,
     pre_authenticated: bool,
     is_admin: bool,
-    server: &Arc<Mutex<Server<NodeRpcChain>>>,
+    server: &Arc<Server<NodeRpcChain>>,
     ntfn: &NodeNtfnMgr,
     shutdown: &std::sync::atomic::AtomicBool,
 ) {
@@ -781,7 +774,7 @@ fn panic_recovery_outcome() -> WsOutcome {
 /// a reader — so every step, including marshalling the client's own id,
 /// runs under the guard, and the recovery answers with a null id.
 fn handle_ws_request(
-    server: &Arc<Mutex<Server<NodeRpcChain>>>,
+    server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
     body: &str,
 ) -> WsOutcome {
@@ -795,7 +788,7 @@ fn handle_ws_request(
 /// limited-user gate, the notification-id skip, and dispatch through
 /// the ported service handler.
 fn handle_ws_request_inner(
-    server: &Arc<Mutex<Server<NodeRpcChain>>>,
+    server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
     body: &str,
 ) -> WsOutcome {
@@ -844,29 +837,21 @@ fn handle_ws_request_inner(
     // not-yet-wired seam panics; it is caught and answered as an
     // internal error so the connection survives.
     //
-    // The server is held for the whole handler, and that is NOT dcrd's
-    // behaviour — an earlier comment here claimed it was.  dcrd's
-    // `wsClient.serviceRequest` takes no server-wide lock at all; it
-    // calls the handler directly, and `rpcserver.Server` carries only
-    // three fine-grained mutexes, each guarding one field (`hmacMu`,
-    // `statusLock`, `blake256HaserMu`).  The single
-    // `Arc<Mutex<Server<_>>>` here is an artifact of wrapping the whole
-    // ported server rather than its individual pieces, and it makes one
-    // client's long request — a `rescan` over thousands of blocks —
-    // serialize every other client's request AND notification
-    // construction, since the delivery thread needs the same lock to
-    // build any notification.  dcrd has neither problem.  Unpicking it
-    // means giving the ported server dcrd's per-field locks; until then
-    // this is a real divergence, recorded in PARITY.md rather than
-    // dressed up as parity.  The client state still locks after the
-    // server, the order every path uses.
+    // The server is shared, not locked, which is dcrd's behaviour:
+    // `wsClient.serviceRequest` takes no server-wide lock, calling the
+    // handler directly, and `rpcserver.Server` carries only fine-grained
+    // mutexes each guarding one field (`hmacMu`, `statusLock`,
+    // `blake256HaserMu`).  The port reaches the same place: every seam
+    // takes `&self`, the three pieces that are genuinely mutable
+    // (`work_state`, the help caches, `subsidy_cache`) carry their own
+    // locks, and handlers run concurrently.  A long `rescan` no longer
+    // serializes other clients' requests or blocks the delivery thread
+    // from building notifications.  The client state still locks, and it
+    // is the only lock this path takes.
     let jsonrpc = req.jsonrpc.clone();
     let id = req.id.clone();
     let method = req.method.clone();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let mut server = server
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut wsc = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -875,7 +860,7 @@ fn handle_ws_request_inner(
             return create_marshalled_reply(&jsonrpc, &id, None, Some(&err)).ok();
         }
         let cmd = parsed.params.expect("a parsed command has params");
-        ws_service_request(&mut server, &mut wsc, &jsonrpc, &method, &cmd, &id)
+        ws_service_request(server, &mut wsc, &jsonrpc, &method, &cmd, &id)
     }));
     match outcome {
         Ok(Some(reply)) => WsOutcome::Reply(reply),
@@ -888,29 +873,19 @@ fn handle_ws_request_inner(
 /// client authenticated, and answer success — or disconnect on bad or
 /// missing credentials (dcrd's `authenticate` case).
 fn authenticate(
-    server: &Arc<Mutex<Server<NodeRpcChain>>>,
+    server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
     jsonrpc: &str,
     param_refs: &[&str],
     id: &RpcId,
 ) -> WsOutcome {
-    let server_guard = server
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let parsed = parse_cmd(
-        &server_guard.registry,
-        jsonrpc,
-        "authenticate",
-        param_refs,
-        id,
-    );
+    let parsed = parse_cmd(&server.registry, jsonrpc, "authenticate", param_refs, id);
     let Some(dcroxide_dcrjson::GoValue::Struct(fields)) = parsed.params else {
         return WsOutcome::Disconnect;
     };
     let username = struct_string(&fields, 0);
     let passphrase = struct_string(&fields, 1);
-    let (authed, is_admin) = server_guard.check_auth_user_pass(&username, &passphrase);
-    drop(server_guard);
+    let (authed, is_admin) = server.check_auth_user_pass(&username, &passphrase);
     if !authed {
         return WsOutcome::Disconnect;
     }
@@ -973,7 +948,7 @@ mod tests {
         let mgr = NodeNtfnMgr::new();
         mgr.add_client(7, Arc::new(Mutex::new(WsClient::new(7))), Arc::default());
         {
-            let mut m = mgr.clone();
+            let m = mgr.clone();
             m.register_block_updates(7);
             m.register_work_updates(7);
             m.register_tspend_updates(7);
@@ -1043,7 +1018,7 @@ mod tests {
                 Arc::clone(&outbound),
             )
             .expect("the first client fits the cap");
-            let mut subscriber = mgr.clone();
+            let subscriber = mgr.clone();
             subscriber.register_block_updates(7);
             subscriber.register_new_mempool_txs_updates(7);
             assert_eq!(mgr.num_clients(), 1);

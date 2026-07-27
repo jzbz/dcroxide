@@ -96,10 +96,10 @@ fn serve_rpc_capped_on(
     // transactions ever seen, answers dcrd's estimation error.
     let fee_estimator = dcroxide_node::fees::new_shared_estimator(10000).expect("fee estimator");
 
-    let server = Arc::new(Mutex::new(Server::new(Config {
+    let server = Arc::new(Server::new(Config {
         chain: NodeRpcChain::new(chain, params.clone()),
         chain_params: params.clone(),
-        subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool))),
@@ -140,7 +140,7 @@ fn serve_rpc_capped_on(
         rpc_pass: "pass".to_string(),
         rpc_limit_user: String::new(),
         rpc_limit_pass: String::new(),
-    })));
+    }));
 
     let listener = start_rpc_listener(
         listen,
@@ -594,10 +594,10 @@ fn serves_tls_with_a_generated_certificate() {
     let chain = Arc::new(Mutex::new(
         Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
     ));
-    let server = Arc::new(Mutex::new(Server::new(Config {
+    let server = Arc::new(Server::new(Config {
         chain: NodeRpcChain::new(chain, params.clone()),
         chain_params: params.clone(),
-        subsidy_cache: SubsidyCache::new(RpcSubsidyParams(params.clone())),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(()),
@@ -633,7 +633,7 @@ fn serves_tls_with_a_generated_certificate() {
         rpc_pass: "pass".to_string(),
         rpc_limit_user: String::new(),
         rpc_limit_pass: String::new(),
-    })));
+    }));
     let listener = start_rpc_listener(
         &["127.0.0.1:0".to_string()],
         server,

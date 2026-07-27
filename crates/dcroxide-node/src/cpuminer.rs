@@ -7,18 +7,22 @@
 //!
 //! The proof-of-work solve loop itself lives in the pure, chain-free
 //! `dcroxide_mining::cpuminer` core; this module drives it over OS
-//! threads.  [`NodeCpuMiner`] is the RPC-facing face held behind the one
-//! RPC server mutex; [`MinerRuntime`] is the daemon-held handle owning
+//! threads.  [`NodeCpuMiner`] is the RPC-facing face, shared across the
+//! handler threads and guarding its own state the way dcrd's `CPUMiner`
+//! guards its own; [`MinerRuntime`] is the daemon-held handle owning
 //! the two background threads (the speed monitor and the worker
 //! controller, which together replace dcrd's `Run` goroutine and its two
 //! subordinates).  `generate_n_blocks` runs synchronously on the RPC
 //! thread; `set_num_workers` starts or stops the continuous workers, and
 //! `hashes_per_second` reads the live rate over a request/reply channel.
 //!
-//! Divergences from dcrd, all documented at the call sites: the discrete
-//! and continuous work runs off dedicated threads while the RPC-facing
-//! methods hold the one server mutex, so a long `generate N` stalls
-//! other RPCs for its duration (the wider global-mutex-stall note); the
+//! The mutual-exclusion state — dcrd's `normalMining`/`discreteMining`
+//! pair — lives in one [`MiningMode`] behind one lock, mirroring the
+//! `sync.Mutex` dcrd's `CPUMiner` embeds and holds across each whole
+//! check-and-set.  A long `generate N` no longer stalls unrelated RPCs:
+//! the lock is released before the mining loop runs.
+//!
+//! Divergences from dcrd, all documented at the call sites: the
 //! `queryHashesPerSec` rendezvous becomes a `mpsc` request/reply; the
 //! `updateNumWorkers` signal becomes a poke with the count carried on an
 //! atomic; and dcrd's `notifyBlocks`/`BlockConnected` feed is not ported
@@ -82,14 +86,34 @@ enum MonitorCmd {
     Stop,
 }
 
-/// Clears the discrete-mining flag when dropped, so it is reset on every
-/// exit path from `generate_n_blocks` — including an unwinding panic —
-/// exactly as dcrd's `defer { m.discreteMining = false }` guarantees.
-struct DiscreteMiningGuard(Arc<AtomicBool>);
+/// The two mining-mode flags dcrd's `CPUMiner` keeps under its embedded
+/// `sync.Mutex` (`internal/mining/cpuminer/cpuminer.go`).  They are one
+/// struct behind one lock rather than two atomics because the guards that
+/// read them are cross-checks — `GenerateNBlocks` rejects on `normalMining`
+/// and `SetNumWorkers` rejects on `discreteMining` — and dcrd holds the
+/// lock across each whole check-and-set (`:833-856`, `:697-706`).  Split
+/// across two atomics the checks become check-then-act, and two concurrent
+/// RPC threads can both pass.
+#[derive(Default)]
+struct MiningMode {
+    /// dcrd `normalMining`: continuous mining via `setgenerate`.
+    normal: bool,
+    /// dcrd `discreteMining`: a `generate N` call in flight.
+    discrete: bool,
+}
+
+struct DiscreteMiningGuard(Arc<Mutex<MiningMode>>);
 
 impl Drop for DiscreteMiningGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        // Clear on every exit path including an unwinding panic, as
+        // dcrd's `defer func() { m.discreteMining = false }` does.  A
+        // poisoned lock is still recovered so a panicking generate
+        // cannot latch the flag and reject every later call.
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .discrete = false;
     }
 }
 
@@ -113,11 +137,9 @@ pub struct NodeCpuMiner {
     /// The target continuous worker count, shared with the controller
     /// (dcrd `numWorkers atomic.Uint32`).
     num_workers: Arc<AtomicU32>,
-    /// Whether continuous mining is active; only ever touched by the RPC
-    /// methods under the server mutex (dcrd's mutex-protected
-    /// `normalMining`).
-    normal_mining: bool,
-    discrete_mining: Arc<AtomicBool>,
+    /// The `normalMining`/`discreteMining` pair under one lock, mirroring
+    /// dcrd's embedded `sync.Mutex` (see [`MiningMode`]).
+    mining_mode: Arc<Mutex<MiningMode>>,
     /// The block hash of the template last successfully submitted, used
     /// to skip re-solving a template the subscription re-delivers while
     /// the generator has not yet produced a new one (dcrd's
@@ -135,8 +157,14 @@ pub struct NodeCpuMiner {
     quit: Arc<AtomicBool>,
     controller_tx: mpsc::Sender<ControllerCmd>,
     monitor_tx: mpsc::Sender<MonitorCmd>,
-    controller_rx: Option<mpsc::Receiver<ControllerCmd>>,
-    monitor_rx: Option<mpsc::Receiver<MonitorCmd>>,
+    /// The receiving halves of the two command channels, handed to their
+    /// threads by [`Self::start`] and `None` afterwards.  A
+    /// [`std::sync::mpsc::Receiver`] is `Send` but not `Sync`, so the
+    /// mutex is what lets the miner sit behind a shared reference in the
+    /// RPC config now that the server takes `&self`; it is uncontended
+    /// (taken once, at startup).
+    controller_rx: Mutex<Option<mpsc::Receiver<ControllerCmd>>>,
+    monitor_rx: Mutex<Option<mpsc::Receiver<MonitorCmd>>>,
 }
 
 impl NodeCpuMiner {
@@ -173,16 +201,15 @@ impl NodeCpuMiner {
             connected,
             permit_connectionless,
             num_workers: Arc::new(AtomicU32::new(DEFAULT_NUM_WORKERS)),
-            normal_mining: false,
-            discrete_mining: Arc::new(AtomicBool::new(false)),
+            mining_mode: Arc::new(Mutex::new(MiningMode::default())),
             discrete_prev_template: Arc::new(Mutex::new(None)),
             speed_stats: Arc::new(Mutex::new(HashMap::new())),
             mined_on_parents: Arc::new(Mutex::new(HashMap::new())),
             quit: Arc::new(AtomicBool::new(false)),
             controller_tx,
             monitor_tx,
-            controller_rx: Some(controller_rx),
-            monitor_rx: Some(monitor_rx),
+            controller_rx: Mutex::new(Some(controller_rx)),
+            monitor_rx: Mutex::new(Some(monitor_rx)),
         }
     }
 
@@ -197,8 +224,18 @@ impl NodeCpuMiner {
     /// [`Self::start`] with an injectable speed-monitor interval for
     /// tests.
     fn start_with_hps_interval(&mut self, interval: Duration) -> MinerRuntime {
-        let monitor_rx = self.monitor_rx.take().expect("miner started once");
-        let controller_rx = self.controller_rx.take().expect("miner started once");
+        let monitor_rx = self
+            .monitor_rx
+            .lock()
+            .expect("monitor channel poisoned")
+            .take()
+            .expect("miner started once");
+        let controller_rx = self
+            .controller_rx
+            .lock()
+            .expect("controller channel poisoned")
+            .take()
+            .expect("miner started once");
         let speed_stats = Arc::clone(&self.speed_stats);
         let speed_thread =
             thread::spawn(move || run_speed_monitor(monitor_rx, speed_stats, interval));
@@ -393,7 +430,7 @@ fn subscribe_over(
     policy: &MiningPolicy,
     mining_time_offset: i64,
 ) -> Box<dyn RpcTemplateSubscription + Send> {
-    let mut templater = NodeRpcBlockTemplater::new(
+    let templater = NodeRpcBlockTemplater::new(
         Arc::clone(current),
         Arc::clone(subscribers),
         sink.clone(),
@@ -573,7 +610,7 @@ fn generate_blocks(id: u64, cancel: Arc<AtomicBool>, shared: SolveShared) {
         speed_stats: Arc::clone(&shared.speed_stats),
     };
 
-    let mut subscription = shared.subscribe();
+    let subscription = shared.subscribe();
     let mut last_prev: Option<Hash> = None;
     // The currently running solver, and the previously-cancelled solvers
     // still winding down.  dcrd cancels the outgoing solver and lets it
@@ -900,55 +937,68 @@ fn max_num_workers() -> u32 {
 }
 
 impl RpcCpuMiner for NodeCpuMiner {
-    fn generate_n_blocks(&mut self, n: u32) -> Result<Vec<Hash>, GenerateFailure> {
-        // Reject a discrete call while continuous mining is active (dcrd's
-        // `normalMining` guard).  Both this reader and the writer
-        // (`set_num_workers`) run under the server mutex, so the check is
-        // race-free.
-        if self.normal_mining {
-            return Err(GenerateFailure {
-                is_ctx_err: false,
-                is_cancel_discrete: false,
-                message: "server is already CPU mining -- please call `setgenerate 0` \
-                          before calling discrete `generate` commands"
-                    .to_string(),
-            });
+    fn generate_n_blocks(&self, n: u32) -> Result<Vec<Hash>, GenerateFailure> {
+        // Both rejection guards and the activation happen under ONE hold
+        // of the mode lock, as dcrd's `GenerateNBlocks` does with its
+        // `m.Lock()` … `m.discreteMining = true` … `m.Unlock()`
+        // (`cpuminer.go:833-856`).  Splitting the check from the set lets
+        // two concurrent `generate` calls — each RPC connection now has
+        // its own handler thread, and no server-wide lock serializes them
+        // any more — both read `false` and both proceed, after which the
+        // first to finish clears the flag while the second is still
+        // mining.
+        {
+            let mut mode = self
+                .mining_mode
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            // Reject a discrete call while continuous mining is active
+            // (dcrd's `normalMining` guard).
+            if mode.normal {
+                return Err(GenerateFailure {
+                    is_ctx_err: false,
+                    is_cancel_discrete: false,
+                    message: "server is already CPU mining -- please call `setgenerate 0` \
+                              before calling discrete `generate` commands"
+                        .to_string(),
+                });
+            }
+
+            // Reject a second discrete call while one is already active
+            // (dcrd's `discreteMining && n != 0` guard).
+            if mode.discrete && n != 0 {
+                return Err(GenerateFailure {
+                    is_ctx_err: false,
+                    is_cancel_discrete: false,
+                    message: "server is already discrete mining -- please wait until \
+                              the existing call completes or cancel it"
+                        .to_string(),
+                });
+            }
+
+            // Zero blocks returns no hashes.  dcrd's `n == 0` path also
+            // cancels an in-flight discrete call through
+            // `generateCancelFn`; the port has no cancellation handle for
+            // the running solve, so a concurrent `generate 0` returns
+            // without stopping it — a divergence recorded in PARITY.md
+            // rather than one the removed server mutex was hiding.
+            if n == 0 {
+                return Ok(Vec::new());
+            }
+
+            mode.discrete = true;
         }
 
-        // Reject a second discrete call while one is already active
-        // (dcrd's `discreteMining && n != 0` guard).  The RPC server
-        // mutex is held for this whole call, so a concurrent dispatch is
-        // not actually reachable, but the guard is kept for fidelity.
-        if self.discrete_mining.load(Ordering::Acquire) && n != 0 {
-            return Err(GenerateFailure {
-                is_ctx_err: false,
-                is_cancel_discrete: false,
-                message: "server is already discrete mining -- please wait until \
-                          the existing call completes or cancel it"
-                    .to_string(),
-            });
-        }
-
-        // Zero blocks returns no hashes (dcrd's `n == 0` path also
-        // cancels an in-flight discrete call through `generateCancelFn`,
-        // but no concurrent call is reachable while the single RPC
-        // server mutex is held for this whole method, so there is
-        // nothing to cancel).
-        if n == 0 {
-            return Ok(Vec::new());
-        }
-
-        // Mark discrete mining active for its whole duration, clearing
-        // the flag on every exit path — including an unwinding panic —
-        // exactly as dcrd's `defer { m.discreteMining = false }` does, so
-        // a panic can never latch the flag and reject all later
+        // Clear the flag on every exit path — including an unwinding
+        // panic — exactly as dcrd's `defer { m.discreteMining = false }`
+        // does, so a panic can never latch it and reject all later
         // `generate` calls.
-        self.discrete_mining.store(true, Ordering::Release);
-        let _discrete_guard = DiscreteMiningGuard(Arc::clone(&self.discrete_mining));
+        let _discrete_guard = DiscreteMiningGuard(Arc::clone(&self.mining_mode));
         let orig_height = self.best_height();
         let target_height = orig_height.saturating_add(i64::from(n));
 
-        let mut subscription = self.subscribe();
+        let subscription = self.subscribe();
         let mut solve: Option<(JoinHandle<()>, Arc<AtomicBool>)> = None;
 
         loop {
@@ -1041,15 +1091,25 @@ impl RpcCpuMiner for NodeCpuMiner {
         Ok(hashes)
     }
 
-    fn is_mining(&mut self) -> bool {
+    fn is_mining(&self) -> bool {
         // Mining in either the continuous or discrete mode (dcrd
-        // `normalMining || discreteMining`).
-        self.normal_mining || self.discrete_mining.load(Ordering::Acquire)
+        // `normalMining || discreteMining`, read under the same lock that
+        // guards both).
+        let mode = self
+            .mining_mode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        mode.normal || mode.discrete
     }
 
-    fn hashes_per_second(&mut self) -> f64 {
+    fn hashes_per_second(&self) -> f64 {
         // Zero unless continuous mining is running (dcrd's short-circuit).
-        if !self.normal_mining {
+        if !self
+            .mining_mode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .normal
+        {
             return 0.0;
         }
         // Ask the speed monitor for the cached rate over a one-shot reply
@@ -1062,13 +1122,23 @@ impl RpcCpuMiner for NodeCpuMiner {
         reply_rx.recv().unwrap_or(0.0)
     }
 
-    fn num_workers(&mut self) -> i32 {
+    fn num_workers(&self) -> i32 {
         self.num_workers.load(Ordering::Acquire) as i32
     }
 
-    fn set_num_workers(&mut self, workers: i32) {
+    fn set_num_workers(&self, workers: i32) {
+        // The discrete-mode check and the `normal` write happen under one
+        // hold, as dcrd's `SetNumWorkers` does with `m.Lock()` +
+        // `defer m.Unlock()` over its whole body (`cpuminer.go:697-706`).
+        // The same lock guards `generate_n_blocks`' cross-check, so the
+        // two RPCs cannot both pass their guards.
+        let mut mode = self
+            .mining_mode
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         // Ignored while a discrete generate is running (dcrd's guard).
-        if self.discrete_mining.load(Ordering::Acquire) {
+        if mode.discrete {
             return;
         }
         // A negative count selects the default; the count is clamped to
@@ -1080,7 +1150,7 @@ impl RpcCpuMiner for NodeCpuMiner {
             (workers as u32).min(max_num_workers())
         };
         self.num_workers.store(target, Ordering::Release);
-        self.normal_mining = target != 0;
+        mode.normal = target != 0;
         let _ = self.controller_tx.send(ControllerCmd::Update);
     }
 }

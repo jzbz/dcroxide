@@ -206,20 +206,49 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   outbound mutex is released before the write), and cannot block the
   chain-notification callback, so it cannot stall block processing — dcrd's
   single fan-out goroutine head-of-line blocks every client behind one stalled
-  TCP peer. Where the port is **weaker**: the single
-  `Arc<Mutex<Server<NodeRpcChain>>>` is held for the whole of any one client's
-  request, so a multi-thousand-block `rescan` serializes every other client's
-  request *and* notification construction, since the delivery thread needs the
-  same lock to build any notification. dcrd has neither problem, and the
-  difference is not incidental: `wsClient.serviceRequest`
-  (`internal/rpcserver/rpcwebsocket.go`) takes no server-wide lock at all — it
-  calls the handler directly — and `rpcserver.Server` carries only three
-  fine-grained mutexes, each guarding a single field (`hmacMu`, `statusLock`,
-  `blake256HaserMu`). The coarse lock is an artifact of wrapping the whole
-  ported server rather than its pieces. A comment at the lock site used to
-  justify it as "like dcrd's per-request locking", which was simply wrong;
-  it now says what dcrd actually does. Unpicking it means giving the ported
-  server dcrd's per-field locks, which is tracked rather than papered over.
+  TCP peer. The port used to be **weaker** in one respect, since corrected: the
+  server was shared as a single `Arc<Mutex<Server<NodeRpcChain>>>` held for the
+  whole of any one client's request, so a multi-thousand-block `rescan`
+  serialized every other client's request *and* notification construction. dcrd
+  has no such lock — `wsClient.serviceRequest`
+  (`internal/rpcserver/rpcwebsocket.go`) calls the handler directly, and
+  `rpcserver.Server` carries only three fine-grained mutexes, each guarding a
+  single field (`hmacMu` at `rpcserver.go:5230`, `statusLock` at `:5235`,
+  `blake256HaserMu` at `:5244`). The port now matches that shape: every handler
+  seam takes `&self`, the server is shared as a plain `Arc<Server<…>>`, and the
+  only interior locks guard one field each — `work_state` (dcrd's `workState`
+  embeds `sync.Mutex`, `rpcserver.go:585`, and `handleGetWorkRequest` takes it in
+  four short sections at `:3890`, `:3919`, `:3959`, and `:3987`, holding it
+  across neither the unbounded template wait nor the chain query that follows;
+  the port's `handle_get_work_request` scopes it the same way), `subsidy_cache`
+  (dcrd's `SubsidyCache` guards its own state with an internal `sync.RWMutex`,
+  `blockchain/standalone/subsidy.go:100`, so the lock simply moved to the field
+  holding it), and the help cacher's `method_help`/`usage` (dcrd's `helpCacher`
+  embeds one `sync.Mutex` covering both fields, `rpcserverhelp.go:1058`; the port
+  gives each cache its own, and releases it across generation rather than holding
+  it, so two callers racing a cold cache can both generate — the generated text
+  is deterministic, so they agree, and the second simply overwrites).
+
+  Two pieces of serialization the coarse lock had been supplying by accident had
+  to be put back explicitly, because dcrd has its own mechanism for each and the
+  port had been leaning on the wrapper instead. First, `getwork`: dcrd serializes
+  whole invocations — requests *and* submissions — through a single-item
+  semaphore (`workState.workSem`, `rpcserver.go:568`, `makeSemaphore(1)` at
+  `:595`, acquired `:4171`, released `:4175`), which the per-field `work_state`
+  lock does not replace, since the request path deliberately releases that lock
+  across the template wait. Without it two invocations can interleave their four
+  critical sections and one can clear `wait_for_updated_template` after another
+  re-armed it for a newer tip, leaving the next caller a template built on the
+  stale parent. The port now takes a `work_sem` mutex at the same point; dcrd
+  uses a semaphore rather than a mutex only so a disconnecting client can cancel
+  while queued, and the port's handler threads have no such cancellation point.
+  Second, the CPU miner: dcrd's `CPUMiner` embeds one `sync.Mutex` and holds it
+  across the *whole* check-and-set in both `GenerateNBlocks`
+  (`cpuminer.go:833-856`) and `SetNumWorkers` (`:697-706`), because the two
+  guards are cross-checks — `generate` rejects on `normalMining`, `setgenerate`
+  ignores on `discreteMining`. Splitting that pair across two atomics turns both
+  into check-then-act, and two concurrent RPC threads can each pass; the port
+  keeps them as one `MiningMode` struct behind one lock.
 - **The RPC read is sliced for the same reason the peer read is.** dcrd's
   handlers are goroutines, so closing a connection makes the handler's `Read`
   return on any platform; the port's handlers are OS threads, and the

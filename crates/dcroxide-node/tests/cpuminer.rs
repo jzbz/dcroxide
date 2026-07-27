@@ -167,7 +167,7 @@ fn generate_mines_blocks_onto_the_chain() {
         .chain_mut()
         .set_chain_ntfn_handler(handler);
 
-    let mut miner = NodeCpuMiner::new(
+    let miner = NodeCpuMiner::new(
         generator.current_handle(),
         generator.subscribers_handle(),
         generator.sink(),
