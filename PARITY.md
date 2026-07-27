@@ -343,6 +343,21 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   reserves more), uncommitted, and one shot per connection because the ensuing
   short read is a bannable wire violation. Real only under `RLIMIT_AS`,
   `vm.overcommit_memory=2`, or 32-bit.
+- **`gettxoutsetinfo`'s forced flush still takes the chain lock, where dcrd
+  takes only its cache lock.** The expensive half is fixed: the walk of the
+  UTXO set now runs with no chain lock held, matching dcrd, whose
+  `backend.FetchStats()` (`utxobackend.go:529`) holds neither `chainLock` nor
+  `cacheLock`. The flush ahead of it is bounded by the cache size and is the
+  same write the connect path already performs, but dcrd confines it to
+  `cacheLock` (`utxocache.go:794`) while the port still holds the whole chain.
+  Closing that gap means giving the port's cache its own lock, which the
+  `no_std` blockchain crate makes a larger change than it looks. Note the port
+  is deliberately *stronger* than dcrd on one point here: dcrd reads
+  `bestChain.Tip()` in `FetchUtxoStats` without `chainLock` while its connect
+  path flushes before publishing the tip, so a stats call in that window can
+  leave a `lastFlushHash` one block behind a backend that already holds the
+  newer block — and the catch-up replay rejects the re-applied block rather
+  than absorbing it. Keeping the flush under the chain lock closes that window.
 - **A queued `getwork` cannot be cancelled by the client hanging up.**
   dcrd serializes getwork invocations with a single-item semaphore and selects
   on `ctx.Done()` while queued (`rpcserver.go:4171`), so a client that

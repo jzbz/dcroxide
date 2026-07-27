@@ -429,17 +429,37 @@ impl Database {
                 return Err(db_error(ErrorKind::DbNotOpen, "database is not open"));
             }
         }
-        let cache_snap =
-            std::sync::Arc::clone(&self.inner.cache.lock().expect("cache lock poisoned").cached);
+        // The overlay snapshot and the store snapshot are taken under
+        // one hold of the cache lock, because a transaction's view is
+        // the overlay shadowing the store: `fetch_raw` answers from
+        // `cache_snap` before consulting the table.  Taking them
+        // separately lets flushes land in between, and while one
+        // intervening flush is harmless — the same batch is then seen
+        // in both layers, with identical values — two are not.  Each
+        // flush empties the overlay, so after two the pinned layer is
+        // strictly older than the store for any key they share, and a
+        // key the second flush deleted is resurrected by the stale
+        // overlay.  The reader would then see a state that never
+        // existed at any commit point.
+        //
+        // `Database::flush` holds this same lock across redb's commit
+        // and the overlay clear (see `DbCache::flush`), so holding it
+        // here means a reader observes a flush either wholly or not at
+        // all.  The order is writer flag, then cache, then redb on both
+        // paths, so the two cannot deadlock against each other.
+        let cache = self.inner.cache.lock().expect("cache lock poisoned");
+        let cache_snap = std::sync::Arc::clone(&cache.cached);
         let kv = match self.inner.kv.begin_read() {
             Ok(t) => t,
             Err(e) => {
+                drop(cache);
                 if writable {
                     release(&self.inner);
                 }
                 return Err(db_error(ErrorKind::DriverSpecific, e.to_string()));
             }
         };
+        drop(cache);
         let seed = if writable {
             KvTxSeed::Write(kv)
         } else {

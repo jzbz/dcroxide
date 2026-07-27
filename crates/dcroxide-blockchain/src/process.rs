@@ -1671,31 +1671,70 @@ impl Chain {
         results
     }
 
-    /// Statistics on the current UTXO set (dcrd
-    /// `BlockChain.FetchUtxoStats`).  The cache is flushed first, and
-    /// the utxo set state is written for the current tip, exactly as
-    /// dcrd's forced cache flush does before its backend computes the
-    /// stats over the full set.
-    pub fn fetch_utxo_stats(&mut self) -> Result<UtxoStats, crate::chaindb::ChainDbError> {
+    /// Force the UTXO cache out to the backend at the current tip, so
+    /// the backend holds the full set for a stats walk (dcrd's
+    /// `FetchStats` opens with `maybeFlushFn(…, force: true, …)`,
+    /// `utxocache.go:532`).
+    ///
+    /// This is the half of the stats path that must run with exclusive
+    /// chain access, and it is deliberately kept that way.  dcrd reads
+    /// `bestChain.Tip()` in `FetchUtxoStats` (`utxocache.go:1084`)
+    /// without holding `chainLock`, while its connect path commits to
+    /// the cache and flushes *before* publishing the tip
+    /// (`chain.go:728`, `:739`, `:746`).  A stats call landing in that
+    /// window force-flushes against the previous tip and leaves a
+    /// `lastFlushHash` on disk that is one block behind a backend which
+    /// already contains the newer block; the catch-up replay then
+    /// reconnects an already-applied block, and both implementations
+    /// reject that rather than absorbing it — dcrd with
+    /// `AssertError("view missing input …")`
+    /// (`utxoviewpoint.go:292`, reached from the replay at
+    /// `utxocache.go:1015`), the port with the same guard in
+    /// `utxoview.rs` surfacing as `ChainDbError::Corrupt` out of
+    /// [`Self::initialize_utxo_state`].  Holding the chain lock across
+    /// the flush closes that window, so the port does not inherit the
+    /// race.  Only the walk below is safe to run unlocked.
+    pub fn flush_utxo_cache_for_stats(&mut self) -> Result<(), crate::chaindb::ChainDbError> {
         let tip = self.best_chain.tip().expect("best chain tip");
         let (tip_hash, tip_height) = {
             let n = self.store.node(tip);
             (n.hash, n.height)
         };
-        self.flush_utxo_cache(tip_hash, tip_height as u32)?;
+        self.flush_utxo_cache(tip_hash, tip_height as u32)
+    }
 
-        // The forced flush above means the backend holds the full
-        // set: the utxo bucket for database-backed chains — walked in
-        // serialized-key order exactly as dcrd's backend iterates —
-        // and the in-memory map otherwise.  The VLQ-coded output
-        // index makes serialized-key order diverge from numeric order
-        // across VLQ length boundaries, so the in-memory rows are
-        // sorted by their serialized keys rather than trusting the
-        // map's tuple order.
-        let mut rows: Vec<UtxoStatsRow> = Vec::new();
-        // The database walk is already in key order and so accumulates
-        // straight into these; the in-memory walk has to sort first and
-        // folds `rows` in afterwards.
+    /// Statistics on the current UTXO set (dcrd
+    /// `BlockChain.FetchUtxoStats`).  Flushes, then walks; callers that
+    /// hold the chain behind a lock should instead call
+    /// [`Self::flush_utxo_cache_for_stats`], release the lock, and walk
+    /// with [`Self::utxo_stats_from_backend`], which is what dcrd's
+    /// `FetchStats` does — its backend walk
+    /// (`utxobackend.go:529`) runs with no lock held at all.
+    pub fn fetch_utxo_stats(&mut self) -> Result<UtxoStats, crate::chaindb::ChainDbError> {
+        self.flush_utxo_cache_for_stats()?;
+        match &self.db {
+            Some(db) => Self::utxo_stats_from_backend(db),
+            None => self.utxo_stats_from_memory(),
+        }
+    }
+
+    /// Walk a database-backed UTXO set and fold it into the stats (dcrd
+    /// `levelDbUtxoBackend.FetchStats`, `utxobackend.go:529`).
+    ///
+    /// Takes only the backend handle — no `self` — so it structurally
+    /// cannot touch the chain, and therefore cannot be holding the
+    /// chain lock while it runs.  That signature is the guarantee: on
+    /// mainnet this walks millions of entries, and dcrd holds nothing
+    /// across the equivalent walk.  The caller must have forced a flush
+    /// first (see [`Self::flush_utxo_cache_for_stats`]), which is what
+    /// makes the backend a complete and consistent view.
+    pub fn utxo_stats_from_backend(
+        db: &dcroxide_database::Database,
+    ) -> Result<UtxoStats, crate::chaindb::ChainDbError> {
+        // The forced flush means the backend holds the full set: the
+        // utxo bucket, walked in serialized-key order exactly as dcrd's
+        // backend iterates.  The walk is already in key order, so the
+        // running totals and leaf order accumulate straight in.
         let mut streamed = UtxoStats {
             utxos: 0,
             transactions: 0,
@@ -1705,7 +1744,7 @@ impl Chain {
         };
         let mut transactions: BTreeSet<[u8; 32]> = BTreeSet::new();
         let mut leaves: Vec<Hash> = Vec::new();
-        if let Some(db) = &self.db {
+        {
             let mut corrupt: Option<String> = None;
             db.view(|tx| {
                 let Some(bucket) = tx.metadata().bucket(crate::chaindb::UTXO_SET_BUCKET_NAME)
@@ -1753,8 +1792,33 @@ impl Chain {
             if let Some(desc) = corrupt {
                 return Err(crate::chaindb::ChainDbError::Corrupt(desc));
             }
-        } else {
-            rows.reserve(self.utxo_backend.len());
+        }
+
+        let mut stats = streamed;
+        stats.serialized_hash = dcroxide_standalone::calc_merkle_root_in_place(&mut leaves);
+        stats.transactions = transactions.len() as i64;
+        Ok(stats)
+    }
+
+    /// Fold the in-memory UTXO backend into the stats, for the chains
+    /// without a backing database that the pure differential tests use.
+    /// The VLQ-coded output index makes serialized-key order diverge
+    /// from numeric order across VLQ length boundaries, so these rows
+    /// are sorted by their serialized keys rather than trusting the
+    /// map's tuple order — the database walk gets that ordering from
+    /// the bucket for free.
+    fn utxo_stats_from_memory(&self) -> Result<UtxoStats, crate::chaindb::ChainDbError> {
+        let mut streamed = UtxoStats {
+            utxos: 0,
+            transactions: 0,
+            size: 0,
+            total: 0,
+            serialized_hash: Hash::ZERO,
+        };
+        let mut transactions: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut leaves: Vec<Hash> = Vec::new();
+        {
+            let mut rows: Vec<UtxoStatsRow> = Vec::with_capacity(self.utxo_backend.len());
             for (key, entry) in &self.utxo_backend {
                 let outpoint = OutPoint {
                     hash: Hash(key.0),

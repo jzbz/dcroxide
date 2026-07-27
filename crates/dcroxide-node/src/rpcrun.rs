@@ -331,12 +331,42 @@ impl RpcChain for NodeRpcChain {
     }
 
     fn fetch_utxo_stats(&self) -> Result<dcroxide_rpc::server::RpcUtxoStats, String> {
-        let stats = self
-            .chain
-            .lock()
-            .expect("chain mutex poisoned")
-            .fetch_utxo_stats()
-            .map_err(|e| format!("{e:?}"))?;
+        // Split the way dcrd's FetchStats does: force the cache out to
+        // the backend under exclusive access, then walk the backend
+        // holding nothing.  dcrd's walk (`utxobackend.go:529`, reached
+        // from `utxocache.go:537`) runs with neither `chainLock` nor
+        // `cacheLock` held, which is why `gettxoutsetinfo` does not stall
+        // block connection there; holding the chain mutex across a walk
+        // of millions of entries is what made it stall here.
+        //
+        // The flush stays inside the lock deliberately — see
+        // `Chain::flush_utxo_cache_for_stats` for the tip-publication
+        // race that keeping it there closes.  It is bounded by the cache
+        // size and is the same write the connect path already performs.
+        let db = {
+            let mut chain = self.chain.lock().expect("chain mutex poisoned");
+            chain
+                .flush_utxo_cache_for_stats()
+                .map_err(|e| format!("{e:?}"))?;
+            // Cloning the handle shares the open database, as copies of
+            // dcrd's `database.DB` interface value do; the daemon
+            // already hands the same one to the chain and the indexes.
+            chain.db.clone()
+        };
+        let stats = match db {
+            Some(db) => dcroxide_blockchain::process::Chain::utxo_stats_from_backend(&db)
+                .map_err(|e| format!("{e:?}"))?,
+            // A chain with no backing database keeps its set on the
+            // chain itself, so that walk does need the lock back.  Only
+            // the pure differential-test chains are built that way; the
+            // daemon always has a database.
+            None => self
+                .chain
+                .lock()
+                .expect("chain mutex poisoned")
+                .fetch_utxo_stats()
+                .map_err(|e| format!("{e:?}"))?,
+        };
         Ok(dcroxide_rpc::server::RpcUtxoStats {
             utxos: stats.utxos,
             transactions: stats.transactions,

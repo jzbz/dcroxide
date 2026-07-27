@@ -343,3 +343,62 @@ fn a_chain_without_a_database_folds_its_memory_backend_the_same_way() {
     assert_eq!(stats.transactions, 2, "two distinct transactions");
     assert_eq!(stats.total, 1000 + 2500 + 3300 + 4100 + 7000, "total value");
 }
+
+/// The backend walk holds no chain state, so it can run while another
+/// thread owns the chain — which is the whole point of splitting it out
+/// of [`Chain::fetch_utxo_stats`].
+///
+/// dcrd's `FetchStats` force-flushes under `cacheLock`, releases it, and
+/// then walks the backend holding nothing at all
+/// (`utxocache.go:532`/`:537`, `utxobackend.go:529`), so `gettxoutsetinfo`
+/// never stalls block connection there.  The port used to hold the
+/// exclusive chain mutex across the walk, which on mainnet is millions of
+/// entries.
+///
+/// This is a real negative rather than a timing probe: the test holds the
+/// chain lock for the entire walk.  If the walk ever needs chain access
+/// again it either stops compiling — `utxo_stats_from_backend` takes only
+/// the database handle, no `self` — or, if routed back through the locked
+/// chain, deadlocks here instead of passing.
+#[test]
+fn the_backend_walk_needs_no_chain_access() {
+    let (_dir, mut chain) = open_chain();
+
+    let a = Hash([0x33; 32]);
+    let outpoint = |hash: Hash, index: u32| OutPoint {
+        hash,
+        index,
+        tree: 0,
+    };
+    let dirty = |amount: i64| {
+        let mut entry = regular_entry(amount);
+        // Only modified entries reach the backend on a flush.
+        entry.set_state_bits(
+            dcroxide_blockchain::UTXO_STATE_MODIFIED | dcroxide_blockchain::UTXO_STATE_FRESH,
+        );
+        entry
+    };
+    let rows = [(outpoint(a, 0), dirty(1200)), (outpoint(a, 7), dirty(3400))];
+    for (op, entry) in &rows {
+        chain
+            .utxo_cache
+            .borrow_mut()
+            .insert((op.hash.0, op.index, op.tree), Some(entry.clone()));
+    }
+
+    // Flush under exclusive access, exactly as the RPC seam does, then
+    // take the handle out so the walk can proceed without the chain.
+    chain.flush_utxo_cache_for_stats().expect("forced flush");
+    let db = chain.db.clone().expect("database-backed chain");
+
+    let chain = std::sync::Mutex::new(chain);
+    let held = chain.lock().expect("chain lock");
+    let stats = Chain::utxo_stats_from_backend(&db).expect("stats without the chain");
+    drop(held);
+
+    assert_eq!(
+        stats,
+        expected_stats(&rows),
+        "the unlocked walk produces the same statistics as the locked path"
+    );
+}
