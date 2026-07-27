@@ -102,6 +102,59 @@ struct MiningMode {
     discrete: bool,
 }
 
+/// dcrd's `GenerateNBlocks` entry gate: both rejection checks and the
+/// activation, under ONE hold of the mode lock, as dcrd does with its
+/// `m.Lock()` … `m.discreteMining = true` … `m.Unlock()`
+/// (`cpuminer.go:833-856`).  Returns `Ok(false)` for the `n == 0` case,
+/// which claims nothing.
+///
+/// It takes `&mut MiningMode` rather than the mutex deliberately: with
+/// no lock to acquire, the check and the set physically cannot span two
+/// acquisitions, so the atomicity is enforced by the signature instead of
+/// by a comment.  Splitting them would let two concurrent `generate`
+/// calls — each RPC connection has its own handler thread, and no
+/// server-wide lock serializes them any more — both read `false` and both
+/// proceed, after which the first to finish clears the flag while the
+/// second is still mining.
+fn begin_discrete(mode: &mut MiningMode, n: u32) -> Result<bool, GenerateFailure> {
+    // Reject a discrete call while continuous mining is active (dcrd's
+    // `normalMining` guard).
+    if mode.normal {
+        return Err(GenerateFailure {
+            is_ctx_err: false,
+            is_cancel_discrete: false,
+            message: "server is already CPU mining -- please call `setgenerate 0` \
+                      before calling discrete `generate` commands"
+                .to_string(),
+        });
+    }
+
+    // Reject a second discrete call while one is already active (dcrd's
+    // `discreteMining && n != 0` guard).
+    if mode.discrete && n != 0 {
+        return Err(GenerateFailure {
+            is_ctx_err: false,
+            is_cancel_discrete: false,
+            message: "server is already discrete mining -- please wait until \
+                      the existing call completes or cancel it"
+                .to_string(),
+        });
+    }
+
+    // Zero blocks claims nothing and returns no hashes.  dcrd's `n == 0`
+    // path also cancels an in-flight discrete call through
+    // `generateCancelFn`; the port has no cancellation handle for the
+    // running solve, so a concurrent `generate 0` returns without
+    // stopping it — a divergence recorded in PARITY.md rather than one
+    // the removed server mutex was hiding.
+    if n == 0 {
+        return Ok(false);
+    }
+
+    mode.discrete = true;
+    Ok(true)
+}
+
 struct DiscreteMiningGuard(Arc<Mutex<MiningMode>>);
 
 impl Drop for DiscreteMiningGuard {
@@ -938,56 +991,16 @@ fn max_num_workers() -> u32 {
 
 impl RpcCpuMiner for NodeCpuMiner {
     fn generate_n_blocks(&self, n: u32) -> Result<Vec<Hash>, GenerateFailure> {
-        // Both rejection guards and the activation happen under ONE hold
-        // of the mode lock, as dcrd's `GenerateNBlocks` does with its
-        // `m.Lock()` … `m.discreteMining = true` … `m.Unlock()`
-        // (`cpuminer.go:833-856`).  Splitting the check from the set lets
-        // two concurrent `generate` calls — each RPC connection now has
-        // its own handler thread, and no server-wide lock serializes them
-        // any more — both read `false` and both proceed, after which the
-        // first to finish clears the flag while the second is still
-        // mining.
+        // One hold of the mode lock spans the whole gate, as dcrd's
+        // `m.Lock()` … `m.discreteMining = true` … `m.Unlock()` does.
         {
             let mut mode = self
                 .mining_mode
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-            // Reject a discrete call while continuous mining is active
-            // (dcrd's `normalMining` guard).
-            if mode.normal {
-                return Err(GenerateFailure {
-                    is_ctx_err: false,
-                    is_cancel_discrete: false,
-                    message: "server is already CPU mining -- please call `setgenerate 0` \
-                              before calling discrete `generate` commands"
-                        .to_string(),
-                });
-            }
-
-            // Reject a second discrete call while one is already active
-            // (dcrd's `discreteMining && n != 0` guard).
-            if mode.discrete && n != 0 {
-                return Err(GenerateFailure {
-                    is_ctx_err: false,
-                    is_cancel_discrete: false,
-                    message: "server is already discrete mining -- please wait until \
-                              the existing call completes or cancel it"
-                        .to_string(),
-                });
-            }
-
-            // Zero blocks returns no hashes.  dcrd's `n == 0` path also
-            // cancels an in-flight discrete call through
-            // `generateCancelFn`; the port has no cancellation handle for
-            // the running solve, so a concurrent `generate 0` returns
-            // without stopping it — a divergence recorded in PARITY.md
-            // rather than one the removed server mutex was hiding.
-            if n == 0 {
+            if !begin_discrete(&mut mode, n)? {
                 return Ok(Vec::new());
             }
-
-            mode.discrete = true;
         }
 
         // Clear the flag on every exit path — including an unwinding
@@ -1158,6 +1171,36 @@ impl RpcCpuMiner for NodeCpuMiner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two guards are cross-checks over the same state, so a claimed
+    /// discrete run blocks continuous mining and vice versa — dcrd's
+    /// `normalMining`/`discreteMining` pair under one lock.
+    #[test]
+    fn the_two_mining_modes_exclude_each_other() {
+        // A discrete claim rejects a second one, but `n == 0` still
+        // passes through claiming nothing, as dcrd's guard does.
+        let mut mode = MiningMode::default();
+        assert_eq!(begin_discrete(&mut mode, 1).ok(), Some(true));
+        assert!(
+            begin_discrete(&mut mode, 1).is_err(),
+            "second generate rejected"
+        );
+        assert_eq!(
+            begin_discrete(&mut mode, 0).ok(),
+            Some(false),
+            "generate 0 claims nothing even while discrete mining"
+        );
+
+        // Continuous mining blocks a discrete claim.
+        let mut fresh = MiningMode {
+            normal: true,
+            discrete: false,
+        };
+        assert!(
+            begin_discrete(&mut fresh, 1).is_err(),
+            "generate rejected while setgenerate is active"
+        );
+    }
 
     /// `DiscreteMiningGuard` clears the flag on an unwinding panic, not
     /// just on a normal return — dcrd's `defer func() { m.discreteMining

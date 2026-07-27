@@ -343,30 +343,59 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   reserves more), uncommitted, and one shot per connection because the ensuing
   short read is a bannable wire violation. Real only under `RLIMIT_AS`,
   `vm.overcommit_memory=2`, or 32-bit.
-- **`gettxoutsetinfo`'s forced flush still takes the chain lock, where dcrd
-  takes only its cache lock.** The expensive half is fixed: the walk of the
-  UTXO set now runs with no chain lock held, matching dcrd, whose
-  `backend.FetchStats()` (`utxobackend.go:529`) holds neither `chainLock` nor
-  `cacheLock`. The flush ahead of it is bounded by the cache size and is the
-  same write the connect path already performs, but dcrd confines it to
-  `cacheLock` (`utxocache.go:794`) while the port still holds the whole chain.
-  Closing that gap means giving the port's cache its own lock, which the
-  `no_std` blockchain crate makes a larger change than it looks. Note the port
-  is deliberately *stronger* than dcrd on one point here: dcrd reads
-  `bestChain.Tip()` in `FetchUtxoStats` without `chainLock` while its connect
-  path flushes before publishing the tip, so a stats call in that window can
-  leave a `lastFlushHash` one block behind a backend that already holds the
-  newer block — and the catch-up replay rejects the re-applied block rather
-  than absorbing it. Keeping the flush under the chain lock closes that window.
+- **`gettxoutsetinfo`'s forced flush takes the chain lock where dcrd takes only
+  its cache lock — deliberately, and this one is settled rather than pending.**
+  The expensive half already matches: the walk of the UTXO set runs with no
+  chain lock held, as dcrd's `backend.FetchStats()` (`utxobackend.go:529`) runs
+  with neither `chainLock` nor `cacheLock`. Only the bounded forced flush ahead
+  of it still holds the whole chain, where dcrd confines it to `cacheLock`
+  (`utxocache.go:794`).
+
+  Moving the port's flush to a cache-only lock would be a regression, not a
+  fix. Both implementations connect a block as commit → flush → publish tip
+  (dcrd `chain.go:728`/`:739`/`:746`; the port `process.rs:2431`/`:2433`/
+  `:2437`), and dcrd reads `bestChain.Tip()` in `FetchUtxoStats`
+  (`utxocache.go:1084`) with no `chainLock`. A stats call landing between the
+  flush and the tip publication therefore force-flushes against the previous
+  tip and leaves a `lastFlushHash` one block behind a backend that already
+  holds the newer block. Neither implementation absorbs a re-applied block on
+  the catch-up replay — dcrd asserts `"view missing input"`
+  (`utxoviewpoint.go:292`, reached from `utxocache.go:1015`) and the port
+  raises the same guard as `Corrupt` — so the node fails to open. In the port
+  the flush, the tip read and the tip publication are all `&mut Chain` and so
+  all under one lock, which closes that window. Splitting the flush out would
+  open it. The port is intentionally stronger than upstream here.
 - **A queued `getwork` cannot be cancelled by the client hanging up.**
   dcrd serializes getwork invocations with a single-item semaphore and selects
   on `ctx.Done()` while queued (`rpcserver.go:4171`), so a client that
   disconnects while waiting gives up its place and gets
-  `rpcConnectionClosedError`. The port's `work_sem` is a mutex, and its handler
-  threads have no cancellation point, so a queued invocation waits until the
-  holder finishes regardless of whether its client is still there. The holder
-  can wait unboundedly for a template, so one stuck `getwork` delays later ones
-  indefinitely. This is strictly better than the coarse server mutex it
-  replaced — that blocked every RPC on the same wait, not just getwork — but
-  closing it needs a cancellation signal plumbed through the RPC dispatch to
-  the handlers.
+  `rpcConnectionClosedError`. The port's `work_sem` is a plain mutex and its
+  handler threads have no cancellation point, so a queued invocation waits
+  until the holder finishes regardless of whether its client is still there.
+  This is already better than the coarse server mutex it replaced, which
+  blocked every RPC on the same wait rather than just getwork.
+
+  In practice the holder is released by the next template, which arrives on
+  every new block and mempool change, so queued waiters drain; the wait is only
+  truly unbounded if the background generator is itself wedged — which dcrd's
+  is subject to as well. Still a real divergence, and the shape of the fix is
+  known. It is left as its own piece rather than folded into the lock work
+  because it adds a synchronization primitive rather than moving an existing
+  lock:
+
+  1. Replace `work_sem: Mutex<()>` with a single-permit semaphore over a
+     `Condvar`, exposing `acquire(&CancelToken) -> Option<Permit>` that polls
+     the token with `wait_timeout`. A plain mutex cannot wait on two
+     conditions.
+  2. Give the handler a per-request cancellation token. All 77 handlers take
+     `(server, cmd)`, so threading a parameter touches every one; a thread-local
+     set by the connection handler around `process_body` is sound instead, since
+     each connection is served on its own thread, and needs no signature churn.
+  3. Detect the disconnect. The connection handler already keeps a second socket
+     handle for shutdown, and the request body is fully read before dispatch, so
+     a watchdog can poll that handle and treat a zero-length peek as the client
+     having gone. That is TLS-agnostic — a FIN shows on the raw socket either
+     way.
+
+  Note this frees only the queued waiter, matching dcrd; neither implementation
+  interrupts the invocation that already holds the permit.
