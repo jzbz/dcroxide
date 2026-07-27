@@ -1274,11 +1274,11 @@ pub struct Server<C> {
     /// invocations could interleave their four critical sections and one
     /// could clear `wait_for_updated_template` after another re-armed it
     /// for a newer tip, handing the next caller a template built on the
-    /// stale parent.  dcrd uses a semaphore rather than a mutex only so
-    /// a disconnecting client can cancel while queued; the port's
-    /// handler threads have no such cancellation point, so a mutex is
-    /// the faithful synchronous equivalent.
-    pub(crate) work_sem: std::sync::Mutex<()>,
+    /// stale parent.  It is a condvar semaphore rather than a mutex so a
+    /// queued caller can give up when its request is cancelled, which a
+    /// mutex cannot express; see [`crate::worksem`] for what does and
+    /// does not raise that signal.
+    pub(crate) work_sem: crate::worksem::WorkSem,
     /// The command registry (dcrd registers commands globally in the
     /// dcrjson package).
     pub registry: dcroxide_dcrjson::Registry,
@@ -1329,7 +1329,7 @@ impl<C: RpcChain> Server<C> {
         let mut server = Server {
             cfg,
             work_state: std::sync::Mutex::new(WorkState::default()),
-            work_sem: std::sync::Mutex::new(()),
+            work_sem: crate::worksem::WorkSem::new(),
             registry,
             help_cacher: crate::help::HelpCacher::new(),
             hmac_key,

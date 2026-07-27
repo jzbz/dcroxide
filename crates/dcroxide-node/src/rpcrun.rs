@@ -1835,6 +1835,10 @@ fn accept_loop(
                     stream.try_clone().ok(),
                     now.checked_add(RPC_AUTH_TIMEOUT).unwrap_or(now),
                 );
+                // A third handle: the request-cancellation watchdog
+                // peeks at it to notice a client that hangs up while its
+                // handler is queued behind another.
+                let cancel_sock = stream.try_clone().ok();
                 // A failed spawn under thread exhaustion drops the
                 // connection (the guard and the socket close with the
                 // closure) instead of panicking the accept loop, which
@@ -1854,6 +1858,7 @@ fn accept_loop(
                                 watchdog,
                                 peer,
                                 slot,
+                                cancel_sock,
                             );
                         });
                     }
@@ -1877,6 +1882,7 @@ fn accept_loop(
                                 watchdog,
                                 peer,
                                 slot,
+                                cancel_sock,
                             );
                         });
                     }
@@ -2387,10 +2393,14 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     ntfn: &crate::websocket::NodeNtfnMgr,
     max_clients: usize,
     num_clients: &Arc<AtomicI32>,
-    shutdown: &AtomicBool,
+    shutdown: &Arc<AtomicBool>,
     watchdog: HandshakeWatchdog,
     peer: SocketAddr,
     slot: PreAuthSlot,
+    // A second handle to this connection's socket, used to notice the
+    // client hanging up while a handler is queued.  `None` (a failed
+    // `try_clone`) degrades to shutdown-only cancellation.
+    cancel_sock: Option<TcpStream>,
 ) {
     // The absolute deadline for the whole handshake (dcrd's HTTP
     // `ReadTimeout`), applied per read so a byte-dribbling client cannot
@@ -2564,6 +2574,16 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
         return;
     };
 
+    // Arm the request's cancellation signal for the dispatch phase.
+    // dcrd's handlers take a request context and getwork selects on it
+    // while queued on the work semaphore (`rpcserver.go:4171`), so a
+    // client that hangs up while waiting gives up its place.  The port's
+    // handlers take no context, so the flag reaches them through a
+    // thread-local scoped to this request; see `dcroxide_rpc::worksem`.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_watch = arm_request_cancel(Arc::clone(&cancel), cancel_sock, Arc::clone(shutdown));
+    let cancel_scope = dcroxide_rpc::worksem::scope_request_cancel(Arc::clone(&cancel));
+
     // Process the request body, holding the server for the duration
     // like dcrd's internal locking.  A panic from a not-yet-wired seam
     // is caught and answered as an internal error; the lock recovers
@@ -2576,7 +2596,104 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
             .to_vec()
     });
 
+    drop(cancel_scope);
+    cancel_watch.disarm();
+
     let _ = write_response(&mut stream, "200 OK", &response);
+}
+
+/// Watches for the two things that cancel an in-flight request — the
+/// daemon shutting down, and the client hanging up — and raises `cancel`
+/// when it sees either.  Only handlers that queue on a shared resource
+/// consult it; everything else runs to completion as before.
+///
+/// SCOPE, since the obvious reading overstates this: the hangup arm fires
+/// for an abrupt close only.  A TLS peer writes a `close_notify` record
+/// before closing, so the peek below finds bytes pending rather than a
+/// zero-length read and reports the client as still connected — and TLS
+/// is the default, required for any non-localhost bind, so for ordinary
+/// Decred tooling this arm does not fire at all.  It does fire for a
+/// killed or crashed client, a peer that omits `close_notify`, and the
+/// `--notls` localhost path.  A correct check wants the peer's half-close
+/// state (`POLLRDHUP`, or `TCP_INFO`) rather than pending bytes, and
+/// neither is reachable while the workspace forbids `unsafe_code` and
+/// socket2 exposes neither.  The shutdown arm is unaffected.
+///
+/// The client-gone check is a `MSG_PEEK` recv that must not disturb the
+/// socket the handler still owns.  Setting the socket non-blocking is not
+/// an option: `try_clone` dups the descriptor, and on Unix the file
+/// status flags live on the shared open file description, so it would
+/// make the handler's own reads non-blocking too.  `MSG_DONTWAIT` is a
+/// per-call flag instead, leaving the socket's state alone.  A zero-length
+/// peek is a FIN — the client is gone; `WouldBlock` means nothing is
+/// pending and it is still there; buffered bytes mean a pipelined request
+/// is waiting, which is also not a hangup.
+///
+/// The flag is only read where a handler would otherwise wait, so a false
+/// negative merely restores the previous behaviour.  Platforms without
+/// `MSG_DONTWAIT` fall back to shutdown-only cancellation rather than
+/// risking the shared socket state.
+fn arm_request_cancel(
+    cancel: Arc<AtomicBool>,
+    sock: Option<TcpStream>,
+    shutdown: Arc<AtomicBool>,
+) -> RequestCancelWatch {
+    let state = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let thread_state = Arc::clone(&state);
+    // A failed spawn under thread exhaustion degrades to no cancellation,
+    // which is the behaviour before this existed, rather than failing the
+    // request.
+    let _ = thread::Builder::new().spawn(move || {
+        let (done, bell) = &*thread_state;
+        let mut done = done.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*done {
+            if shutdown.load(Ordering::SeqCst) || client_hung_up(sock.as_ref()) {
+                cancel.store(true, Ordering::Release);
+                return;
+            }
+            let (guard, _) = bell
+                .wait_timeout(done, REQUEST_CANCEL_POLL)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            done = guard;
+        }
+    });
+    RequestCancelWatch { state }
+}
+
+/// How often the cancellation watchdog re-checks its two signals.
+const REQUEST_CANCEL_POLL: Duration = Duration::from_millis(100);
+
+/// Whether the peer has closed its side, checked without disturbing the
+/// socket's blocking state (see [`arm_request_cancel`]).
+#[cfg(unix)]
+fn client_hung_up(sock: Option<&TcpStream>) -> bool {
+    use std::mem::MaybeUninit;
+    let Some(sock) = sock else { return false };
+    let sock = socket2::SockRef::from(sock);
+    let mut probe = [MaybeUninit::<u8>::uninit(); 1];
+    let flags = libc::MSG_PEEK | libc::MSG_DONTWAIT;
+    matches!(sock.recv_with_flags(&mut probe, flags), Ok(0))
+}
+
+/// Without a per-call non-blocking flag there is no way to probe the
+/// socket without mutating state the handler's own reads depend on, so
+/// cancellation is limited to the shutdown signal.
+#[cfg(not(unix))]
+fn client_hung_up(_sock: Option<&TcpStream>) -> bool {
+    false
+}
+
+/// Stands the cancellation watchdog down when the request completes.
+struct RequestCancelWatch {
+    state: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl RequestCancelWatch {
+    fn disarm(self) {
+        let (done, bell) = &*self.state;
+        *done.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        bell.notify_all();
+    }
 }
 
 /// Write an HTTP response with dcrd's JSON content type.

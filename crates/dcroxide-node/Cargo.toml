@@ -67,6 +67,12 @@ ureq = "3"
 webpki-roots = "1"
 socket2 = "0.6.4"
 
+# Already in the tree via socket2 and getrandom; taken directly for
+# MSG_DONTWAIT, which lets the request-cancellation watchdog peek at a
+# connection without changing the socket state the handler depends on.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 dcroxide-winsvc = { path = "../dcroxide-winsvc" }
 

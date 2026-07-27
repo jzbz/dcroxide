@@ -239,9 +239,9 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   across the template wait. Without it two invocations can interleave their four
   critical sections and one can clear `wait_for_updated_template` after another
   re-armed it for a newer tip, leaving the next caller a template built on the
-  stale parent. The port now takes a `work_sem` mutex at the same point; dcrd
-  uses a semaphore rather than a mutex only so a disconnecting client can cancel
-  while queued, and the port's handler threads have no such cancellation point.
+  stale parent. The port takes a `work_sem` at the same point, as a condvar
+  semaphore so a queued caller can give up when cancelled (see the getwork
+  cancellation entry below for how far that reaches).
   Second, the CPU miner: dcrd's `CPUMiner` embeds one `sync.Mutex` and holds it
   across the *whole* check-and-set in both `GenerateNBlocks`
   (`cpuminer.go:833-856`) and `SetNumWorkers` (`:697-706`), because the two
@@ -365,37 +365,43 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   the flush, the tip read and the tip publication are all `&mut Chain` and so
   all under one lock, which closes that window. Splitting the flush out would
   open it. The port is intentionally stronger than upstream here.
-- **A queued `getwork` cannot be cancelled by the client hanging up.**
-  dcrd serializes getwork invocations with a single-item semaphore and selects
-  on `ctx.Done()` while queued (`rpcserver.go:4171`), so a client that
-  disconnects while waiting gives up its place and gets
-  `rpcConnectionClosedError`. The port's `work_sem` is a plain mutex and its
-  handler threads have no cancellation point, so a queued invocation waits
-  until the holder finishes regardless of whether its client is still there.
-  This is already better than the coarse server mutex it replaced, which
-  blocked every RPC on the same wait rather than just getwork.
+- **`getwork` cancellation is partial: the queue is abandoned, the holder is
+  not, and the hangup signal misses clean TLS closes.** dcrd cancels getwork in
+  three places, not one — the semaphore queue (`rpcserver.go:4170-4174`) and
+  both template waits inside the hold (`case <-ctx.Done()` at `:3914` and
+  `:3932`), with `defer s.workState.workSem.release()` at `:4175` freeing the
+  permit on any of them. The port implements the first only.
 
-  In practice the holder is released by the next template, which arrives on
-  every new block and mempool change, so queued waiters drain; the wait is only
-  truly unbounded if the background generator is itself wedged — which dcrd's
-  is subject to as well. Still a real divergence, and the shape of the fix is
-  known. It is left as its own piece rather than folded into the lock work
-  because it adds a synchronization primitive rather than moving an existing
-  lock:
+  `work_sem` is a condvar semaphore rather than a mutex, since a mutex cannot
+  wait on both the permit and a cancellation, and the signal reaches the handler
+  through a thread-local scoped to the request rather than a parameter, because
+  all 77 handlers take `(server, cmd)`. The transport raises the flag on daemon
+  shutdown and on an observed hangup.
 
-  1. Replace `work_sem: Mutex<()>` with a single-permit semaphore over a
-     `Condvar`, exposing `acquire(&CancelToken) -> Option<Permit>` that polls
-     the token with `wait_timeout`. A plain mutex cannot wait on two
-     conditions.
-  2. Give the handler a per-request cancellation token. All 77 handlers take
-     `(server, cmd)`, so threading a parameter touches every one; a thread-local
-     set by the connection handler around `process_body` is sound instead, since
-     each connection is served on its own thread, and needs no signature churn.
-  3. Detect the disconnect. The connection handler already keeps a second socket
-     handle for shutdown, and the request body is fully read before dispatch, so
-     a watchdog can poll that handle and treat a zero-length peek as the client
-     having gone. That is TLS-agnostic — a FIN shows on the raw socket either
-     way.
+  Two gaps remain, both real:
 
-  Note this frees only the queued waiter, matching dcrd; neither implementation
-  interrupts the invocation that already holds the permit.
+  1. **The holder is never interrupted.** `request_cancelled()` is read at
+     exactly one site — inside `WorkSem::acquire` — so once a caller holds the
+     permit the flag is a no-op. A caller whose client left while it waits in
+     `sub.recv()` keeps the permit for the rest of that wait: up to
+     `MAX_TEMPLATE_TIMEOUT` (5.5 s) in the known-template case, and until the
+     generator publishes during a reorganization, where `current_template()`
+     returns `Ok(None)` and `subscribe()` skips its immediate delivery. dcrd
+     returns at `:3916`/`:3934` and frees the permit at once. Closing this needs
+     a cancellable receive on `RpcTemplateSubscription`, which every
+     implementation and test double would have to grow.
+  2. **The hangup signal misses clean TLS closes.** `client_hung_up` peeks the
+     raw socket and treats `Ok(0)` as a FIN, but a TLS peer writes a
+     `close_notify` record before closing, so the peek returns bytes rather than
+     zero and the check reports "still connected". TLS is the default and is
+     required for non-localhost binds, so for the normal Decred tooling this arm
+     does not fire; it still fires for abrupt closes — a killed or crashed
+     client, a peer that omits `close_notify`, and the `--notls` localhost path.
+     A correct check needs the peer's half-close state rather than pending
+     bytes: `POLLRDHUP` or `TCP_INFO`. Neither is reachable today, because the
+     workspace sets `unsafe_code = "forbid"` and socket2 exposes neither, so
+     closing this needs a safe wrapper dependency or detection at the TLS layer.
+
+  What does work today: cancellation on daemon shutdown, and on abrupt client
+  loss, for a caller still queued. `getwork` over the websocket transport
+  installs no token at all and behaves as it did before.

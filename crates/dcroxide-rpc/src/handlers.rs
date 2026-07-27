@@ -4726,10 +4726,12 @@ pub fn handle_get_work<C: RpcChain>(
     // the template wait inside the request path, exactly as dcrd's
     // deferred release does.  Every gate above this point is a read-only
     // rejection, so they stay outside it as they do upstream.
-    let _work_sem = server
-        .work_sem
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A client that hangs up while queued gives up its place, as dcrd's
+    // `case <-ctx.Done()` arm does, rather than holding the slot until
+    // the permit comes free.
+    let Some(_work_sem) = server.work_sem.acquire() else {
+        return Err(crate::rpcerrors::rpc_connection_closed_error());
+    };
 
     // When the caller provides data, it is a submission of a
     // supposedly solved block that needs to be checked and submitted
