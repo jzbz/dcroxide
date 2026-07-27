@@ -1519,6 +1519,10 @@ impl<B: MixBlockChain> Pool<B> {
         // be compatible.
         let mut missing_own_pr: Option<Hash> = None;
         let mut pairing: Option<Vec<u8>> = None;
+        // The new session's expiry is the minimum expiry over the
+        // referenced pair requests that are actually known, folded in as
+        // the loop walks them (dcrd `acceptKE`, fixed in `d11ae7af`).
+        let mut expiry = u32::MAX;
         for (i, seen_pr) in ke.seen_prs.iter().enumerate() {
             let Some(pr) = self.prs.get(&seen_pr.0) else {
                 if i as u32 == ke.pos {
@@ -1526,6 +1530,7 @@ impl<B: MixBlockChain> Pool<B> {
                 }
                 continue;
             };
+            expiry = expiry.min(pr.expires());
             if i as u32 == ke.pos && pr.identity != ke.identity {
                 // This cannot be a bannable rule error: one peer may
                 // have sent an orphan KE first, then another peer the
@@ -1567,16 +1572,16 @@ impl<B: MixBlockChain> Pool<B> {
 
         let sid = ke.session_id;
 
-        // Create a session for the first KE.  Note that dcrd derives
-        // the expiry from an always-empty list of PRs here, so every
-        // session is created with the maximum expiry; ported bug for
-        // bug.
+        // Create a session for the first KE, with the minimum expiry
+        // folded above.  A KE that references no known pair request at
+        // all leaves `u32::MAX`, which is dcrd's behaviour too — the
+        // fold has nothing to reduce.
         self.sessions.entry(sid).or_insert_with(|| Session {
             sid,
             prs: ke.seen_prs.clone(),
             counts: [0; 7],
             hashes: HashSet::new(),
-            expiry: u32::MAX,
+            expiry,
         });
 
         self.accept_entry(

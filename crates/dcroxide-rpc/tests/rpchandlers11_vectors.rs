@@ -428,3 +428,192 @@ fn getwork_handler_matches_dcrd() {
     }
     assert_eq!(scenarios, 21, "unexpected scenario count");
 }
+
+/// A templater whose first `current_template` call parks until the
+/// test releases it.  The first call happens after `handle_get_work`
+/// has taken the work semaphore and before it takes any other lock,
+/// so a parked call holds the semaphore and nothing else.
+struct ParkingTemplater {
+    /// The template every call eventually returns.
+    block: MsgBlock,
+    /// Whether the next call is the first one and therefore parks.
+    first: std::sync::atomic::AtomicBool,
+    /// Signals the test that the first call has parked.
+    entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    /// The test sends here to let the parked call proceed.
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl RpcBlockTemplater for ParkingTemplater {
+    fn current_template(&self) -> Result<Option<MsgBlock>, String> {
+        if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered
+                .lock()
+                .expect("entered poisoned")
+                .send(())
+                .expect("the test thread is waiting for the park signal");
+            self.release
+                .lock()
+                .expect("release poisoned")
+                .recv()
+                .expect("the test thread releases the parked call");
+        }
+        Ok(Some(self.block.clone()))
+    }
+    fn subscribe(&self) -> Box<dyn RpcTemplateSubscription + Send> {
+        Box::new(ImmediateSub {
+            block: self.block.clone(),
+        })
+    }
+    fn update_block_time(&self, _header: &mut BlockHeader) {}
+}
+
+/// A subscription that immediately delivers the current template, as
+/// the real one does.
+struct ImmediateSub {
+    /// The template delivered on the first receive.
+    block: MsgBlock,
+}
+
+impl RpcTemplateSubscription for ImmediateSub {
+    fn recv(&self) -> TemplateRecv {
+        TemplateRecv::Template(Box::new(self.block.clone()))
+    }
+    fn recv_with_timeout(&self) -> TemplateRecv {
+        TemplateRecv::Timeout
+    }
+    fn stop(&self) {}
+}
+
+/// Two `getwork` invocations serialize against each other, as dcrd's
+/// single-item `workState.workSem` makes them (`rpcserver.go:4171`,
+/// released by the deferred `release()` at `:4175`).  One call is
+/// parked inside the handler with the semaphore held; the second must
+/// not finish until the first lets go.
+#[test]
+fn getwork_invocations_serialize() {
+    let params = mainnet_params();
+    let mut registry = Registry::new();
+    register_all(&mut registry);
+
+    // Real block 432,100, the template both calls are served.
+    let block: MsgBlock = include_str!("data/rpchandlers8_vectors.txt")
+        .lines()
+        .find_map(|line| {
+            let f: Vec<&str> = line.split('|').collect();
+            (f[0] == "blk").then(|| MsgBlock::from_bytes(&unhex(f[1])).unwrap().0)
+        })
+        .expect("block fixture");
+    let mining_addr =
+        dcroxide_txscript::stdaddr::decode_address("DsRah84zx6jdA4nMYboMfLERA5V3KhBr4ru", &params)
+            .unwrap();
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = Server::new(Config {
+        // Initial chain state (both heights zero) passes the sync
+        // gate, and the gates above the semaphore are all read-only.
+        chain: MockChain11 {
+            header: block.header,
+            best_hash: block.header.block_hash(),
+            best_height: 0,
+            best_header_height: 0,
+            is_current: true,
+            header_by_hash: Ok(()),
+            blake3: false,
+        },
+        chain_params: params.clone(),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
+        min_relay_tx_fee: 10000,
+        max_protocol_version: PROTOCOL_VERSION,
+        sync_mgr: Box::new(MockSyncMgr11 { submit: Ok(()) }),
+        conn_mgr: Box::new(MockConnMgr11 { count: 1 }),
+        client_cert_auth: false,
+        tx_mempooler: Box::new(()),
+        clock: Box::new(()),
+        interfaces: Box::new(NoInterfaces),
+        rand_u64: Box::new(|| 0),
+        tx_indexer: None,
+        db: Box::new(()),
+        filterer_v2: Box::new(()),
+        exists_addresser: None,
+        log_manager: Box::new(()),
+        fee_estimator: Box::new(()),
+        block_templater: Some(Box::new(ParkingTemplater {
+            block: block.clone(),
+            first: std::sync::atomic::AtomicBool::new(true),
+            entered: std::sync::Mutex::new(entered_tx),
+            release: std::sync::Mutex::new(release_rx),
+        })),
+        sanity_checker: Box::new(()),
+        time_source: Box::new(()),
+        proxy: String::new(),
+        test_net: false,
+        runtime_version: String::new(),
+        cpu_miner: Box::new(MockMiner11 { is_mining: false }),
+        mix_pooler: Box::new(()),
+        profiler_mgr: Box::new(()),
+        addr_manager: Box::new(()),
+        mining_addrs: vec![mining_addr],
+        user_agent_version: String::new(),
+        net_info: Vec::new(),
+        services: 0,
+        request_shutdown: Box::new(|| {}),
+        allow_unsynced_mining: true,
+        rpc_user: String::new(),
+        rpc_pass: String::new(),
+        rpc_limit_user: String::new(),
+        rpc_limit_pass: String::new(),
+    });
+
+    // A work request: no data, so no submission.
+    let cmd = GoValue::Struct(
+        parse_params(&registry, &method("getwork"), &[])
+            .expect("parse params")
+            .fields,
+    );
+
+    let server = &server;
+    let cmd = &cmd;
+    std::thread::scope(|scope| {
+        // The first call parks inside the handler holding the
+        // semaphore; wait for it to get there.
+        let first = scope.spawn(move || handlers::handle_get_work(server, cmd));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the first call reaches the templater inside the semaphore");
+
+        // The second call must block at the semaphore.  Nothing else
+        // in the handler is held while the first call is parked, so a
+        // completion here means the semaphore was never taken.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let second = scope.spawn(move || {
+            let result = handlers::handle_get_work(server, cmd);
+            done_tx.send(()).expect("the test thread outlives the call");
+            result
+        });
+        let blocked = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+
+        // Unpark the first call before asserting, so a failure here
+        // reports rather than deadlocking the scope's thread joins.
+        release_tx.send(()).expect("the parked call is waiting");
+        assert!(
+            matches!(blocked, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "the second getwork completed while the first held the work semaphore"
+        );
+
+        // Once the first call finishes, the second gets the semaphore
+        // and completes.
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the second call completes once the semaphore is released");
+        first
+            .join()
+            .expect("first call thread")
+            .expect("first getwork result");
+        second
+            .join()
+            .expect("second call thread")
+            .expect("second getwork result");
+    });
+}

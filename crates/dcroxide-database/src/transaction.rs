@@ -264,7 +264,13 @@ impl Transaction {
             }
         }
 
-        let collect = |iter: redb::Range<'_, &'static [u8], &'static [u8]>| -> Vec<Vec<u8>> {
+        // Collect straight into the set the layered merge below needs.
+        // The set itself is load-bearing — it dedups the stored keys
+        // against the cache snapshot and this transaction's pending
+        // writes, and keeps them in the byte order ffldb's cursor
+        // promises — but the intermediate `Vec` it used to be built
+        // from was not, and cost one extra allocation per scan.
+        let collect = |iter: redb::Range<'_, &'static [u8], &'static [u8]>| -> std::collections::BTreeSet<Vec<u8>> {
             iter.flatten().map(|(k, _)| k.value().to_vec()).collect()
         };
 
@@ -288,8 +294,7 @@ impl Transaction {
         // newer overlay layer shadowing every older one for the same
         // key — then this transaction's own pending sets do the same on
         // top.
-        let mut merged: std::collections::BTreeSet<Vec<u8>> =
-            result.unwrap_or_default().into_iter().collect();
+        let mut merged: std::collections::BTreeSet<Vec<u8>> = result.unwrap_or_default();
         state.cache_snap.merge_prefix_keys(prefix, &mut merged);
         for key in state.pending_removes.range(prefix.to_vec()..) {
             if !key.starts_with(prefix) {

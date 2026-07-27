@@ -1159,6 +1159,34 @@ impl RpcCpuMiner for NodeCpuMiner {
 mod tests {
     use super::*;
 
+    /// `DiscreteMiningGuard` clears the flag on an unwinding panic, not
+    /// just on a normal return — dcrd's `defer func() { m.discreteMining
+    /// = false }()` runs during a Go panic too.  Without this, a panic
+    /// inside `generate_n_blocks` would latch `discrete` and reject every
+    /// later `generate` for the life of the process, and `set_num_workers`
+    /// would be ignored forever.  The guard recovers the poisoned lock
+    /// for the same reason.
+    #[test]
+    fn a_panicking_generate_does_not_latch_discrete_mining() {
+        let mode = Arc::new(Mutex::new(MiningMode::default()));
+        mode.lock().expect("fresh lock").discrete = true;
+
+        let held = Arc::clone(&mode);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = DiscreteMiningGuard(held);
+            panic!("mining blew up");
+        }));
+        assert!(unwound.is_err(), "the closure must actually panic");
+
+        // The lock is poisoned by the panic; the guard still cleared the
+        // flag through it, and a later reader can still get at the state.
+        let mode = mode.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !mode.discrete,
+            "the drop guard must clear discrete mining even while unwinding"
+        );
+    }
+
     /// The speed monitor sums each worker's hashes-per-second and resets
     /// the per-worker counters on each recompute (dcrd's `Swap(0)` fold).
     #[test]

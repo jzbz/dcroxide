@@ -37,30 +37,30 @@ Entry format:
   `crates/dcroxide-wire/tests/frame_differential.rs` (differential against
   the dcrd oracle).
 
-## QK-0002 — mixpool sessions are created with the maximum expiry
+## QK-0002 — RETIRED: mixpool session expiry (fixed upstream, now ported)
 
 - **Where:** dcrd `mixing/mixpool` `acceptKE` / dcroxide-mixing
   `mixpool.rs` `accept_ke`
-- **What:** at `release-v2.1.5`, `acceptKE` intends to derive a new
-  session's expiry as the minimum expiry of its referenced pair
-  requests, but the slice it iterates is never appended to, so every
-  session is created with `^uint32(0)`. Sessions therefore never expire
-  directly through `ExpireMessages`; they only die when their pair
-  requests expire and `removePR` tears the session down.
-- **Why reproduced:** relay/expiry behavior must match dcrd's on
-  identical message streams (DoS parity), and the session lifetime is
-  observable through message retention.
-- **Pinned by:** `mixpool_vectors` (the `expire 109`/`expire 110` rows
-  show sessions surviving heights below their PR expiries with
-  `expiry=4294967295` in the state snapshots)
-- **Status:** no longer a reproduction — an outstanding divergence.
-  dcrd fixed this in `d11ae7af` ("mixpool: Properly calculate session
-  expiry"), which is not in `release-v2.1.5` but is in the current
-  parity target: `acceptKE` now folds `pr.Expires()` into the running
-  minimum inside the loop over `ke.SeenPRs`. `accept_ke` still creates
-  every session with `u32::MAX`, so the port keeps sessions alive past
-  the point master retires them, and the pinned vectors pin the
-  pre-fix behavior. Tracked; not yet ported.
+- **What it was:** at `release-v2.1.5`, `acceptKE` intended to derive a
+  new session's expiry as the minimum expiry of its referenced pair
+  requests, but the slice it iterated was allocated and never appended
+  to, so the fold ran zero times and every session was created with
+  `^uint32(0)`. Sessions therefore never expired directly through
+  `ExpireMessages`; they only died when their pair requests expired and
+  `removePR` tore the session down. The port reproduced this bug for
+  bug, as it does every observable dcrd behaviour.
+- **Status:** retired. dcrd fixed it in `d11ae7af` ("mixpool: Properly
+  calculate session expiry"), which is not in `release-v2.1.5` but is in
+  the current parity target `452c1a6c`: the fold moved inside the loop
+  over `ke.SeenPRs`, taking the running minimum of `pr.Expires()` over
+  the referenced pair requests that are actually known. `accept_ke` now
+  does the same, so this is no longer a quirk in either direction — it
+  is ordinary agreement with upstream. A KE that references no known
+  pair request still yields `u32::MAX`, in both implementations, because
+  the fold has nothing to reduce.
+- **Pinned by:** `mixpool_vectors`, regenerated from dcrd master so the
+  session rows now carry the real minimum expiries rather than
+  `4294967295`.
 
 ## QK-0003 — mixpool `Receive` capacity misuse wedges dcrd's pool
 
@@ -129,18 +129,27 @@ Entry format:
 - **Why reproduced:** ban thresholds decide peer disconnects and
   bans; the port must have a defined, defensible behavior even
   though dcrd's own is platform-dependent.
-- **Pinned by:** nothing, currently.
-- **Status:** unpinned. The `connmgr_vectors` test that carried this —
-  1801 `decay` rows covering the whole domain bit for bit, plus 21
-  `banscore` rows replaying dcrd's own methods on ages where the
-  platform assembly agrees with the portable code — was deleted with
-  the rest of that file in `5720482`, the rewrite of the crate onto
-  dcrd 2.2's `internal/connmgr`. Its replacement,
-  `connmgr_v2_vectors`, covers the connection manager and does not
-  reach the ban score; `decay_factor_bits` is still exported from
-  `dcroxide-connmgr` for the vectors that no longer call it. The
-  behavior described above is unchanged in the code and unchanged in
-  dcrd at the current target. The rows need regenerating.
+- **Pinned by:** `banscore_vectors` (1801 `decay` rows covering ages
+  0..1800 bit for bit, plus 21 `banscore` rows replaying dcrd's own
+  `Increase`/`int`/`String`/`Reset` on ages where the platform
+  assembly agrees with the portable code). The rows carried by
+  `connmgr_vectors` were deleted with the rest of that file in
+  `5720482`, the rewrite of the crate onto dcrd 2.2's
+  `internal/connmgr`; they were regenerated at master `452c1a6c` into
+  their own file, since their generator is unrelated to the
+  connection-manager exporter's.
+- **How the portable values were obtained:** the exporter carries a
+  verbatim copy of Go's portable `exp`/`expmulti`/`ldexp`/`normalize`
+  from `$GOROOT/src/math` and emits from that, not from `math.Exp`. It
+  self-checks two ways: on an assembly arch the copy must disagree
+  with `math.Exp` on exactly 276 of the 1801 ages, each by one ulp
+  (a run finding zero disagreements would mean the "portable" copy had
+  itself been dispatched to assembly); and the same test compiled for
+  `GOARCH=386` — which `math/exp_noasm.go` leaves on the portable path
+  — must find zero disagreements and write a byte-identical file,
+  which checks the transcription against Go's real portable code and
+  simultaneously confirms the 21 `banscore` rows land only on
+  agreement ages.
 
 ## QK-0007 — the Ed25519 certificate generator fails on non-ASCII hostnames
 

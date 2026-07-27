@@ -3,14 +3,28 @@
 //! mixing/mixpool package (`data/mixpool_vectors.txt`): message
 //! acceptance across every rule rejection, orphan flows with
 //! reconsideration cascades, pair request UTXO validation over a
-//! mocked fetcher, expiry with the max-session-expiry quirk,
-//! removals (sessions, confirmed sessions and mixes, spent and
-//! rejected and unresponsive pair requests), the pairing queries,
-//! the receive collection semantics, and two observer strike rounds
-//! against a timing-out peer — comparing the full pool state
-//! (pair requests, pool entries with types, orphans, sessions with
-//! their expiries and message counts, outpoint and latest-KE index
-//! sizes) and the strike table after every operation.
+//! mocked fetcher, expiry, removals (sessions, confirmed sessions and
+//! mixes, spent and rejected and unresponsive pair requests), the
+//! pairing queries, the receive collection semantics, and two observer
+//! strike rounds against a timing-out peer — comparing the full pool
+//! state (pair requests, pool entries with types, orphans, sessions
+//! with their expiries and message counts, outpoint and latest-KE
+//! index sizes) and the strike table after every operation.
+//!
+//! REGENERATING: dcrd's mixpool calls `time.Now()` directly and has no
+//! clock seam, while this script is time-sensitive — the last field of
+//! every `scenario` line is the wall time it was captured at, which the
+//! harness below injects as the pool clock, and the script contains a
+//! KE whose stated epoch is an hour past that recorded now, pinning
+//! dcrd's "KE received too early for stated epoch" rejection.  Replayed
+//! against a real clock that KE is *accepted* instead and the state
+//! cascades, so a regeneration run without the clock frozen silently
+//! drops that coverage and reads as a port divergence when it is not.
+//! The exporter must therefore be run under a `go test -overlay` that
+//! routes mixpool.go's `time.Now()` call sites through a seam set to the
+//! scenario's recorded time.  It is build-tagged `dcroxide_export` so
+//! that without the overlay it fails to compile rather than emitting
+//! wrong vectors.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
