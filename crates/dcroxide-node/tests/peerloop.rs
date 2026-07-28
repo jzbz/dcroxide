@@ -527,7 +527,10 @@ fn ping_timer_survives_a_full_outbound_queue() {
 fn transport_accepts_a_write_budget() {
     use std::io::Cursor;
     let mut transport = WireTransport::new(Cursor::new(Vec::new()), MAX_PROTOCOL_VERSION, NET);
-    transport.set_write_budget(Some(std::time::Duration::from_secs(5)));
+    transport.set_write_stall_policy(Some(dcroxide_node::transport::WriteStallPolicy {
+        base: std::time::Duration::from_secs(5),
+        bytes_per_sec: dcroxide_peer::WRITE_STALL_BYTES_PER_SEC,
+    }));
     transport
         .write_message(&Message::Ping(MsgPing { nonce: 7 }))
         .expect("a write under budget succeeds");

@@ -96,6 +96,48 @@ impl NetByteTotals {
     }
 }
 
+/// How long a single message write may take before the peer counts as
+/// stalled: a base allowance plus one second per `bytes_per_sec` bytes
+/// of the framed message (dcrd `writeStallTimeout` /
+/// `writeStallBytesPerSec`, applied at `peer/peer.go:1013-1016`).
+///
+/// Configurable rather than hard-wired to dcrd's constants so tests can
+/// drive the same arithmetic at millisecond scale; the daemon always
+/// passes the upstream values.
+#[derive(Clone, Copy, Debug)]
+pub struct WriteStallPolicy {
+    /// dcrd `writeStallTimeout`.
+    pub base: Duration,
+    /// dcrd `writeStallBytesPerSec`.
+    pub bytes_per_sec: usize,
+}
+
+impl WriteStallPolicy {
+    /// dcrd's constants (`peer/peer.go:84`, `:90`).
+    pub fn dcrd() -> WriteStallPolicy {
+        WriteStallPolicy {
+            base: Duration::from_nanos(dcroxide_peer::WRITE_STALL_TIMEOUT as u64),
+            bytes_per_sec: dcroxide_peer::WRITE_STALL_BYTES_PER_SEC,
+        }
+    }
+
+    /// The deadline a framed message of `msg_size` bytes gets.
+    ///
+    /// The division truncates, matching Go's
+    /// `time.Duration(msgSize/writeStallBytesPerSec) * time.Second`: one
+    /// byte short of the next multiple buys nothing, so 262,143 bytes
+    /// gets the base alone and 262,144 gets one extra second.  A zero
+    /// `bytes_per_sec` would divide by zero, so it yields no allowance
+    /// rather than panicking on a misconfiguration.
+    pub fn deadline_for(&self, msg_size: usize) -> Duration {
+        // `checked_div` covers the divide-by-zero a misconfigured
+        // policy would otherwise cause; dcrd cannot hit it because its
+        // divisor is a constant.
+        let allowance = msg_size.checked_div(self.bytes_per_sec).unwrap_or(0) as u64;
+        self.base.saturating_add(Duration::from_secs(allowance))
+    }
+}
+
 /// Frames [`Message`]s over a byte stream using dcrd's wire encoding.
 pub struct WireTransport<S> {
     stream: S,
@@ -107,12 +149,13 @@ pub struct WireTransport<S> {
     /// per-`readMessage` `SetReadDeadline`); `None` leaves the
     /// stream's own timeout, if any, to govern each receive.
     read_budget: Option<Duration>,
-    /// The budget each whole message write must complete within.  A
-    /// peer that stops reading otherwise parks this thread forever
-    /// while its outbound queue is held; dcrd never blocks
-    /// indefinitely on a send because `outHandler` drains an
-    /// unbuffered channel behind a bounded send semaphore.
-    write_budget: Option<Duration>,
+    /// How long each whole message write may take before the peer
+    /// counts as stalled.  A peer that stops reading otherwise parks
+    /// this thread forever while its outbound queue is held.  The bound
+    /// scales with the message, as dcrd's does since `62fd529a`: a flat
+    /// budget either cuts off a large block on a slow-but-honest link
+    /// or gives a peer stalling a tiny message far too long.
+    write_stall: Option<WriteStallPolicy>,
     /// The server-wide totals this transport contributes to, when the
     /// daemon's accounting is wired (dcrd's `OnRead`/`OnWrite`
     /// listeners adding into the server's atomic counters).
@@ -133,7 +176,7 @@ impl<S> WireTransport<S> {
             bytes_read: 0,
             bytes_written: 0,
             read_budget: None,
-            write_budget: None,
+            write_stall: None,
             net_totals: None,
             cancel: None,
         }
@@ -194,9 +237,10 @@ impl<S> WireTransport<S> {
         self.read_budget = budget;
     }
 
-    /// Set the budget each whole message write must complete within.
-    pub fn set_write_budget(&mut self, budget: Option<Duration>) {
-        self.write_budget = budget;
+    /// Set the write-stall policy each whole message write is bounded
+    /// by; `None` leaves writes unbounded.
+    pub fn set_write_stall_policy(&mut self, policy: Option<WriteStallPolicy>) {
+        self.write_stall = policy;
     }
 }
 
@@ -386,10 +430,19 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
         // that drip-feeds its receive window cannot park this thread
         // past the budget; a timeout surfaces as a write error and
         // disconnects the peer.
+        //
+        // `bytes` is the framed message — header plus payload — which is
+        // exactly dcrd's `wire.MessageHeaderSize + msg.SerializeSize()`
+        // (`peer/peer.go:1014`).  dcrd's `SerializeSize` is the encoded
+        // payload length, asserted against `len(buf.Bytes())` by its own
+        // wire tests, so the two sizes agree by construction and no
+        // separate size calculation is needed here.
         let now = Instant::now();
-        let deadline = self.write_budget.map(|b| now.checked_add(b).unwrap_or(now));
+        let deadline = self
+            .write_stall
+            .map(|p| now.checked_add(p.deadline_for(bytes.len())).unwrap_or(now));
         let result = write_all_by_deadline(&mut self.stream, &bytes, deadline);
-        if self.write_budget.is_some() {
+        if self.write_stall.is_some() {
             self.stream.set_socket_write_timeout(None);
         }
         result.map_err(|e| e.to_string())?;
@@ -436,6 +489,60 @@ mod tests {
         header[PAYLOAD_LEN_OFFSET..PAYLOAD_LEN_OFFSET + 4]
             .copy_from_slice(&payload_len.to_le_bytes());
         header
+    }
+
+    /// The write deadline follows dcrd's formula exactly: a twenty-second
+    /// base plus one whole second per 256 KiB of the *framed* message
+    /// (`peer/peer.go:1013-1016`, constants at `:84` and `:90`).
+    ///
+    /// The rows are computed from the constants rather than captured from
+    /// dcrd, because the arithmetic is the whole content of the change —
+    /// the boundary pair is what distinguishes a truncating division from
+    /// a rounding one, and the header term is what distinguishes the
+    /// framed size from the payload size.
+    #[test]
+    fn the_write_deadline_matches_dcrds_formula() {
+        let p = WriteStallPolicy::dcrd();
+        assert_eq!(p.base, Duration::from_secs(20), "dcrd writeStallTimeout");
+        assert_eq!(p.bytes_per_sec, 256 * 1024, "dcrd writeStallBytesPerSec");
+
+        let secs = |n: usize| p.deadline_for(n).as_secs();
+        // An empty framed message is the header alone.
+        assert_eq!(secs(MESSAGE_HEADER_SIZE), 20, "header only");
+        // The truncating boundary: one byte short buys nothing.
+        assert_eq!(secs(262_143), 20, "one byte below 256 KiB");
+        assert_eq!(secs(262_144), 21, "exactly 256 KiB");
+        assert_eq!(secs(524_287), 21, "one byte below 512 KiB");
+        assert_eq!(secs(524_288), 22, "exactly 512 KiB");
+        // The largest possible message gets roughly two extra minutes,
+        // which is the allowance dcrd's comment describes.
+        assert_eq!(secs(32 * 1024 * 1024), 148, "32 MiB");
+        // A misconfigured zero divisor yields no allowance, not a panic.
+        let degenerate = WriteStallPolicy {
+            base: Duration::from_secs(20),
+            bytes_per_sec: 0,
+        };
+        assert_eq!(degenerate.deadline_for(1 << 20).as_secs(), 20);
+    }
+
+    /// The size fed to the deadline is the framed message — header plus
+    /// payload — which is what makes it equal dcrd's
+    /// `wire.MessageHeaderSize + msg.SerializeSize()`.
+    #[test]
+    fn the_deadline_input_is_the_framed_length() {
+        for msg in [
+            Message::Ping(MsgPing { nonce: 1 }),
+            Message::VerAck,
+            Message::GetAddr,
+        ] {
+            let framed = wire_write_message(&msg, MAX_PROTOCOL_VERSION, NET).expect("frame");
+            let payload = framed.len().saturating_sub(MESSAGE_HEADER_SIZE);
+            assert_eq!(
+                framed.len(),
+                MESSAGE_HEADER_SIZE.saturating_add(payload),
+                "the framed length is the header plus the encoded payload"
+            );
+        }
     }
 
     #[test]
@@ -600,7 +707,12 @@ mod tests {
             .expect("reader accepted");
 
         let mut transport = WireTransport::new(sock, MAX_PROTOCOL_VERSION, NET);
-        transport.set_write_budget(Some(BUDGET));
+        transport.set_write_stall_policy(Some(WriteStallPolicy {
+            base: BUDGET,
+            // Large enough that this message's allowance is zero, so the
+            // test measures the base bound alone.
+            bytes_per_sec: usize::MAX,
+        }));
 
         let started = Instant::now();
         let result = write_all_by_deadline(

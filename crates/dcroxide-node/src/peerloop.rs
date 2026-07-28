@@ -36,7 +36,7 @@ use dcroxide_peer::{
 use dcroxide_wire::{CurrencyNet, Message, MsgPing};
 
 use crate::peerconn::NodePeerEnv;
-use crate::transport::WireTransport;
+use crate::transport::{WireTransport, WriteStallPolicy};
 
 /// The protocol-level handling an incoming message calls for, before it
 /// is forwarded to the server handlers.
@@ -857,10 +857,15 @@ where
     // read tighter, exactly as dcrd's does.
     read_transport.set_read_budget(Some(negotiate_timeout.min(idle_timeout)));
     let mut write_transport = WireTransport::new(write_stream, handshake_pver, net);
-    // Every send is bounded by the same idle budget the reads use, so a
-    // peer that stops reading its socket is disconnected instead of
-    // parking the writer thread with the outbound queue held.
-    write_transport.set_write_budget(Some(idle_timeout));
+    // Every send is bounded so a peer that stops reading its socket is
+    // disconnected instead of parking the writer thread with the
+    // outbound queue held.  The bound is dcrd's write-stall policy —
+    // twenty seconds plus a second per 256 KiB of the framed message —
+    // not the idle timeout: dcrd keeps the two separate, and a flat
+    // budget is wrong at both ends of the size range, cutting off a
+    // large block on an honest slow link while indulging a peer that
+    // stalls a tiny one.
+    write_transport.set_write_stall_policy(Some(WriteStallPolicy::dcrd()));
     // Both halves contribute to the server-wide byte totals from the
     // handshake onward, exactly like dcrd's read/write listeners.
     if let Some(totals) = net_totals {
