@@ -287,9 +287,10 @@ pub fn mainnet_params() -> Params {
             "mainnet-seed-1.decred.org",
             "mainnet-seed-2.decred.org",
             "mainnet-seed.jholdstock.uk",
-            // A deliberate dcroxide addition on top of dcrd's list; the
-            // chaincfg oracle differential excludes it when comparing
-            // against dcrd's dump.
+            // Upstream since dcrd `b9b64533`, so no longer a dcroxide
+            // addition.  The chaincfg oracle differential still excludes
+            // it, because the oracle links `chaincfg/v3 v3.3.0`, which
+            // predates that commit; see the note there.
             "dcr-seed.jz.bz",
         ],
     }

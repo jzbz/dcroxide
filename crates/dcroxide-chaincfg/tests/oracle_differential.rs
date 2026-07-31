@@ -25,13 +25,20 @@ fn params_dumps_match_dcrd() {
         let theirs_hex = oracle.call_ok("chaincfg_dump", name.as_bytes());
         let theirs = String::from_utf8(unhex(&theirs_hex)).expect("oracle dump is UTF-8");
 
-        // The dcr-seed.jz.bz mainnet seeder is a deliberate dcroxide
-        // addition on top of dcrd's list; make sure it is present and
-        // exclude it from the byte-for-byte comparison against dcrd.
+        // dcrd adopted the dcr-seed.jz.bz mainnet seeder in `b9b64533`,
+        // so it is no longer a dcroxide addition and this exclusion is
+        // now pure pin skew: the oracle links `chaincfg/v3 v3.3.0`,
+        // which predates that commit, so dcrd's dump still lacks the
+        // entry while ours carries it.
+        //
+        // DELETE the filter below when the oracle's chaincfg dependency
+        // moves past `b9b64533` — at that point dcrd's dump gains the
+        // seeder, the filter strips it from ours alone, and this test
+        // starts failing on a line that is actually in agreement.
         if name == "mainnet" {
             assert!(
                 params.seeders.contains(&"dcr-seed.jz.bz"),
-                "mainnet params must carry the dcroxide seeder"
+                "mainnet params must carry the seeder"
             );
         }
         let ours: String = params

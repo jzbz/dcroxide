@@ -3,6 +3,19 @@
 // ISC licensed. Known-answer vectors regenerated against dcrd
 // `crypto/blake256` v1.1.0 (the version pinned by dcrd release-v2.1.5) via
 // `tools/oracle`; see also `tests/oracle_differential.rs`.
+//
+// UPSTREAM DELTA, DELIBERATELY NOT TAKEN: dcr-rs later added a `Drop` impl
+// zeroizing `buf` and `h`, so that hashing secret material does not leave it
+// in freed memory. That is right for dcr-rs, which is signing firmware and
+// runs raw scalars through this hasher. It does not transfer to a full node:
+// dcroxide holds no private keys, and RPC credentials go through
+// `Hmac<Sha256>` (see `dcroxide-rpc` `http.rs`), so nothing secret reaches
+// BLAKE-256 here — it hashes txids, block hashes, merkle nodes and getwork
+// data. Adopting it would add a compiler fence to every hasher drop on the
+// hottest primitive in the codebase, and dcr-rs's own comment notes the cost
+// is "measurably so on short inputs", which is precisely this workload:
+// 32-byte merkle nodes and 180-byte headers, millions per sync. Re-evaluate
+// only if something secret ever starts flowing through this hasher.
 //! BLAKE-256 (the SHA-3 finalist, 14 rounds) — NOT BLAKE2/BLAKE3.
 //!
 //! Decred hashes *everything* with this: transaction IDs, block hashes
