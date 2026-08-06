@@ -55,6 +55,22 @@ const FAST_STALL: StallConfig = StallConfig {
     response_timeout: Duration::from_millis(250),
 };
 
+/// The timings for the burst-ceiling test, which is the one test here
+/// that is not about stalling.  Its first `getdata` carries a full
+/// inventory message — 50,000 items, close to 1.8 MB — and the output
+/// loop arms all 50,000 deadlines *before* starting that write, exactly
+/// as dcrd's `sccSendMessage` does.  Under [`FAST_STALL`] the 250 ms
+/// budget therefore has to cover pushing 1.8 MB across loopback and
+/// reading it back, which a loaded machine misses: the detector shuts
+/// the socket down mid-message and the read fails on the truncated
+/// stream rather than on anything the test is about.  A timeout that
+/// cannot expire leaves the burst ceiling as the only thing able to end
+/// the connection, which is the whole point of the test.
+const CEILING_STALL: StallConfig = StallConfig {
+    tick: Duration::from_millis(50),
+    response_timeout: NEVER,
+};
+
 fn config(user_agent_name: &str) -> Config {
     Config {
         net: NET,
@@ -403,6 +419,11 @@ fn answering_one_of_several_requested_blocks_does_not_settle_the_rest() {
 /// crossing it always takes more than one request — which is exactly the
 /// behaviour the guard is for: a peer that keeps asking for more without
 /// serving what it already asked for.
+///
+/// Runs under [`CEILING_STALL`] rather than [`FAST_STALL`]: the peer here
+/// never answers the first request either, so a live detector races the
+/// ceiling for the teardown and wins on a slow machine, failing the test
+/// on a truncated read long before the ceiling is reached.
 #[test]
 fn getdata_past_the_burst_ceiling_ends_the_connection() {
     fn blocks(range: std::ops::Range<usize>) -> Vec<InvVect> {
@@ -427,7 +448,7 @@ fn getdata_past_the_burst_ceiling_ends_the_connection() {
     let second = blocks(full..MAX_PENDING_INV_BURST + 1);
     assert_eq!(first.len() + second.len(), MAX_PENDING_INV_BURST + 1);
 
-    let (addr, reason_rx) = serve(FAST_STALL, move |msg, outbound| {
+    let (addr, reason_rx) = serve(CEILING_STALL, move |msg, outbound| {
         if let Message::Ping(ping) = msg {
             let batch = match ping.nonce {
                 1 => first.clone(),
@@ -460,9 +481,16 @@ fn getdata_past_the_burst_ceiling_ends_the_connection() {
             "the over-ceiling getdata must never reach the peer"
         );
     }
+    let reason = reason_rx
+        .recv_timeout(PATIENCE)
+        .expect("the connection must actually end");
+    // The detector cannot fire under `CEILING_STALL`, so the ceiling is
+    // the only thing left that could have ended the connection.  Without
+    // this the assertion above passes just as happily when a stall wins
+    // the race, which is how the timing bug hid.
     assert!(
-        reason_rx.recv_timeout(PATIENCE).is_ok(),
-        "the connection must actually end"
+        !reason.contains("stalled"),
+        "the burst ceiling must end the connection, not the stall detector, got: {reason}"
     );
     drop(transport);
 }
