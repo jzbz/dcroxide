@@ -1,0 +1,17 @@
+# The toolchain a commit is built with, which is not the same thing as the
+# toolchain it is required to build with: `rust-version` in Cargo.toml is the
+# support floor, checked separately by CI's `msrv` job.
+#
+# Pinned because `[profile.release]` sets `codegen-units = 1` with thin LTO,
+# so the compiler version materially determines the emitted binary.  "Whatever
+# stable happens to be installed" is not a reproducible contract for a node
+# whose release artifacts someone may want to verify.
+#
+# A point release rather than a `.0`: 1.97.0 shipped an LLVM miscompilation
+# that 1.97.1 fixed seven days later.  Consensus code gets the patched build.
+#
+# Anything that needs a different toolchain must override this file
+# explicitly — `cargo +nightly fuzz ...` locally, `RUSTUP_TOOLCHAIN` in CI.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

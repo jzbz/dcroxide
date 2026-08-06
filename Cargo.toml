@@ -40,7 +40,10 @@ exclude = ["fuzz"]
 version = "0.1.0"
 authors = ["The dcroxide developers"]
 edition = "2024"
-rust-version = "1.88"
+# Three releases behind current stable, bumped deliberately rather than left
+# to drift.  Held below the pinned build toolchain so packagers and the
+# MSRV-aware resolver (`resolver = "3"`) keep some headroom.
+rust-version = "1.94"
 license = "ISC"
 repository = "https://github.com/jzbz/dcroxide"
 

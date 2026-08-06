@@ -20,11 +20,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No toolchain action: rust-toolchain.toml names the version and its
+      # components, and duplicating it here is how the two drift apart.
+      # Installing before the cache step keeps the cache key on the right rustc.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  lint-latest:
+    name: clippy on latest stable (advisory)
+    runs-on: ubuntu-latest
+    # A new stable every six weeks means new lints, and `-D warnings` would
+    # turn them into red builds on pull requests that did not cause them.
+    # This job surfaces them the week they land without blocking anyone.
+    continue-on-error: true
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -36,7 +54,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Toolchain comes from rust-toolchain.toml (see the lint job).
+      - run: rustup toolchain install
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
@@ -45,11 +64,16 @@ jobs:
       - run: cargo test --workspace
 
   msrv:
-    name: MSRV build
+    name: MSRV build (1.94)
     runs-on: ubuntu-latest
+    env:
+      # Must beat rust-toolchain.toml, which outranks `rustup default` and
+      # would otherwise have this job re-check the pinned toolchain — passing
+      # while testing nothing about the floor it exists to defend.
+      RUSTUP_TOOLCHAIN: "1.94"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
@@ -63,6 +87,11 @@ jobs:
   fuzz-smoke:
     name: fuzz smoke (60s per target)
     runs-on: ubuntu-latest
+    env:
+      # cargo-fuzz needs nightly, and rust-toolchain.toml at the repo root
+      # applies inside fuzz/ as well — without this the pin would win and
+      # the build would fail on nightly-only flags.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -80,6 +109,9 @@ jobs:
     name: nightly fuzz (10m per target)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    env:
+      # See fuzz-smoke: the root pin reaches into fuzz/ and must be overridden.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
