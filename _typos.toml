@@ -1,0 +1,51 @@
+# typos configuration (crate-ci/typos), enforced by the CI typos job.
+#
+# A parity port cannot spell-check everything: dcrd's own typos are
+# load-bearing where its output is differential-tested byte for byte,
+# its identifiers and log tags are not English, and the frozen vectors
+# carry base58/hex material that tokenizes into word-shaped fragments.
+
+[files]
+extend-exclude = [
+    # dcrd-generated vectors and replay data, byte-for-byte upstream.
+    "crates/*/tests/data",
+    "crates/*/testdata",
+]
+
+[default]
+extend-ignore-re = [
+    # base58 material (addresses, keys, hashes) in comments and string
+    # literals.
+    "[0-9A-HJ-NP-Za-km-z]{25,}",
+]
+
+[default.extend-words]
+# dcrd's own typos, reproduced bug for bug. The RPC help text is
+# compared against dcrd's rpcserverhelp.go ("transacion", "eligibile"),
+# and QUIRKS.md quotes dcrd's server.go ban-score comment verbatim
+# ("inintial"). Correcting any of these is a parity break or a
+# misquote, not a fix.
+transacion = "transacion"
+eligibile = "eligibile"
+inintial = "inintial"
+# Decred domain terms and dcrd identifiers.
+asert = "asert" # the ASERT difficulty algorithm (DCP-0011)
+indx = "indx" # dcrd's INDX log subsystem tag
+ist = "ist" # dcrd's MaxIST* init-state wire constants
+nam = "nam" # PARITY.md quotes a dcrd truncation that yields "nam"
+unparseable = "unparseable" # legitimate variant, matches dcrd prose
+# Local variable names in ported code: chain-engine node handles,
+# parent nodes (also the Pn inside UPnP), ticket-hash lists, uint256
+# property-test operands, block-region plurals, and the "mis-" prefix
+# this repo hyphenates ("mis-paired", "mis-typed").
+nd = "nd"
+pn = "pn"
+ths = "ths"
+ba = "ba"
+datas = "datas"
+mis = "mis"
+# Field names in the frozen-vector formats, written by the exporters
+# running inside dcrd's packages and parsed literally by the replay
+# tests; renaming them means regenerating every affected vector set.
+prfix = "prfix"
+sems = "sems"

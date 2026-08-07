@@ -978,7 +978,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                     continue;
                 }
 
-                // Refresh the ancestor bundle and fee rate, requeueing
+                // Refresh the ancestor bundle and fee rate, requeuing
                 // or skipping when the rate decreased.
                 let ancestors = mining_view.ancestors(&tx_hash);
                 let (ancestor_stats, _) = mining_view.ancestor_stats(&tx_hash);

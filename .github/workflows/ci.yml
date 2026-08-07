@@ -50,7 +50,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # ubuntu-24.04-arm is there for consensus consistency, not
+        # coverage bookkeeping: QK-0006 records dcrd's own amd64
+        # assembly disagreeing with its portable Go by one ulp in
+        # ban-decay math, so platform-dependence has already bitten in
+        # exactly this problem domain, and arm64 behavior should be
+        # tested rather than assumed.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -83,6 +89,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  docs:
+    name: cargo doc (-D warnings)
+    runs-on: ubuntu-latest
+    # missing_docs is already denied at build time, but broken intra-doc
+    # links and malformed doc markup only surface under rustdoc — without
+    # this job they land silently and the enforced-docs investment rots.
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps
+
+  typos:
+    name: typos
+    runs-on: ubuntu-latest
+    # The prose is part of the product here: PARITY.md and QUIRKS.md are
+    # spec artifacts. _typos.toml carries the deliberate exceptions —
+    # dcrd's own typos are reproduced, not corrected.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: crate-ci/typos@v1.49.0
+
+  no-std:
+    name: no_std check (x86_64-unknown-none)
+    runs-on: ubuntu-latest
+    # The crates below advertise no_std via cfg_attr, but every other
+    # job builds with the std feature on, so nothing else ever compiles
+    # the claim. This job checks them on a no-OS target so a dependency
+    # or cfg mistake that drags std into a consensus core fails CI.
+    #
+    # Not yet listed, because std-needing dependencies (getrandom,
+    # once_cell, crypto-common) leak into their trees despite the
+    # cfg_attr: blockchain, dcrec, fees, gcs, mempool, mining, stake,
+    # txscript. Add each one as its dependency features are untangled.
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - run: rustup target add x86_64-unknown-none
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the no_std crates on a no-OS target
+        run: |
+          for c in base58 chaincfg chainhash crypto standalone uint256 wire; do
+            cargo check -p "dcroxide-$c" --no-default-features --target x86_64-unknown-none
+          done
 
   fuzz-smoke:
     name: fuzz smoke (60s per target)
