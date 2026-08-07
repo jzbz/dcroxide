@@ -38,6 +38,31 @@ run, both nodes `--norpc`.
 |---|---|---|---|---|---|
 | 2026-07 | m1 | unrecorded (2.2.0-pre, at the ADR-0004 amendment) | mainnet tip | dcroxide 32.06 GiB total (17.579 GiB blocks + 14.483 GiB metadata.redb); dcrd 23.73 GiB (17.580 GiB blocks + 6.045 GiB metadata leveldb + 0.108 GiB utxodb) | ADR-0004 amendment |
 
+## Storage decomposition
+
+`dcroxide-bench redbstat`, one JSON object per run. Totals alone hide the
+thing under study: a change that moves free pages without moving the file
+size is invisible in the table above, and the two have different causes.
+
+Reproduces ADR-0004's amendment, which was produced by a throwaway tool
+that is not in the tree — that agreement is what licenses using this
+instrument to score the levers.
+
+| date | machine | dcroxide commit | corpus | payload | overhead | slack | free pages | fill |
+|---|---|---|---|---|---|---|---|---|
+| 2026-08-07 | m1 | `b49bf92`+ | mainnet tip (baseline-2026-07-25 clone) | 5.65 GiB | 0.69 GiB | 3.44 GiB | 4.69 GiB | 64.86% |
+
+Live tree 9.79 GiB; `accounted_bytes` 15,551,077,894 against a file of
+15,551,119,360, so 41,466 bytes of redb header and region metadata are
+unexplained and everything else is. The walk takes about 1m53s on this
+tree, which is why the per-flush observer samples rather than measuring
+every commit.
+
+Note that measuring perturbs: `stats()` exists only on a write
+transaction, so each run allocates a little. Two runs against the same
+clone moved `allocated_pages` by ~1,000 and free pages by ~2 MiB. Take
+each measurement on a fresh clone.
+
 ## Preserved baselines
 
 The datadir every figure above was read from, kept because opening a redb

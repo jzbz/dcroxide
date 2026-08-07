@@ -123,6 +123,42 @@ pub(crate) struct DbInner {
     pub(crate) writer_busy: Mutex<bool>,
 }
 
+/// What one metadata flush did, handed to an [`Options::flush_observer`].
+///
+/// The point of collecting these is that the *shape* of the free-page curve
+/// over a run distinguishes mechanisms a single end-state measurement
+/// cannot tell apart: a monotone stair rising by roughly one flush's freed
+/// set is redb's one-generation reclaim lag, a single ratchet that never
+/// recovers is a high-water mark no layer above the engine can reclaim,
+/// growth that tracks reader overlap is a transaction held across a flush,
+/// and growth that tracks row size points at the buddy allocator's
+/// power-of-two rounding.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlushObservation {
+    /// Flush count since the database was opened, starting at 1.
+    pub sequence: u64,
+    /// Entries written or removed by this flush.
+    pub dirty_entries: usize,
+    /// Bytes the overlay was holding when the flush began.
+    pub dirty_bytes: u64,
+    /// Wall time for the whole flush, including the redb commit.
+    pub elapsed: std::time::Duration,
+    /// Footprint after this flush's writes and before its commit, present
+    /// only on sampled flushes.
+    ///
+    /// Sampled rather than always taken because redb's `stats()` walks
+    /// every branch and leaf page, which is seconds on a chain-sized
+    /// tree — collecting it per flush would dominate the very timings the
+    /// observer exists to measure.
+    pub stats: Option<RawStats>,
+}
+
+/// A callback invoked after each metadata flush.
+///
+/// Called on the flushing thread with the cache lock held, so it must not
+/// block or re-enter the database; append to a buffer and analyse later.
+pub type FlushObserver = Arc<dyn Fn(&FlushObservation) + Send + Sync>;
+
 /// Options controlling database creation and opening.
 pub struct Options {
     /// The database directory.
@@ -155,6 +191,28 @@ pub struct Options {
     /// and 98,221 preads, against 62,323 and 4 with the buffer large
     /// enough to hold them.
     pub db_cache_bytes: usize,
+    /// Called after every metadata flush, when set.
+    ///
+    /// `None` by default, which is exactly the behaviour the daemon had
+    /// before this existed: no observation, no cost, no branch beyond a
+    /// null check. This is measurement scaffolding for the storage work
+    /// tracked in ADR-0004, not a production feature.
+    pub flush_observer: Option<FlushObserver>,
+    /// Take a full [`RawStats`] on every Nth flush; 0 disables sampling.
+    ///
+    /// See [`FlushObservation::stats`] for why this is sampled at all.
+    pub flush_stats_every: u64,
+    /// Bytes the metadata overlay may hold before a commit flushes it.
+    ///
+    /// Was hardcoded until the ADR-0004 measurement work needed it: with a
+    /// fixed 100 MiB ceiling, a probe small enough to run in minutes never
+    /// reaches a flush, so the thing being measured never happens. It is
+    /// also half of that ADR's "decouple flush cadence from block
+    /// connection" lever, which could not be evaluated without a way to
+    /// set it.
+    pub cache_max_size: u64,
+    /// Seconds after which a commit flushes the overlay regardless of size.
+    pub cache_flush_interval_secs: u64,
 }
 
 /// redb's own default cache size, which is what the port used before
@@ -184,6 +242,10 @@ impl Options {
             network,
             max_block_file_size: blockfile::DEFAULT_MAX_BLOCK_FILE_SIZE,
             db_cache_bytes: DEFAULT_DB_CACHE_BYTES,
+            flush_observer: None,
+            flush_stats_every: 0,
+            cache_max_size: crate::dbcache::DEFAULT_CACHE_SIZE,
+            cache_flush_interval_secs: crate::dbcache::DEFAULT_FLUSH_SECS,
         }
     }
 }
@@ -203,6 +265,130 @@ fn redb_builder(opts: &Options) -> redb::Builder {
 #[derive(Clone)]
 pub struct Database {
     inner: Arc<DbInner>,
+}
+
+/// The metadata store's footprint, split into the parts that behave
+/// differently (see [`Database::raw_stats`]).
+///
+/// The split exists because redb's headline figure cannot be read as a
+/// packing ratio. `DatabaseStats::fragmented_bytes` sums the trees'
+/// intra-page slack **and** `count_free_pages() * page_size`
+/// (redb-2.6.3 `transactions.rs:2298-2301`), so it conflates space wasted
+/// *inside* live pages with space the allocator holds and has not returned.
+/// Those have different causes and different remedies: slack is a packing
+/// property of the B-tree, while free pages are an allocator property that
+/// no amount of repacking touches. Only [`Self::table_fragmented_bytes`] is
+/// slack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawStats {
+    /// redb's page size, the unit every page count below is in.
+    pub page_size: u64,
+    /// Pages the allocator holds, live or free.
+    pub allocated_pages: u64,
+    /// Traversal depth to the deepest pair.
+    pub tree_height: u32,
+    /// Database-wide: intra-page slack across all trees **plus** free
+    /// pages. Not a packing figure; see the type docs.
+    pub database_fragmented_bytes: u64,
+    /// Leaf pages of the metadata table.
+    pub leaf_pages: u64,
+    /// Branch pages of the metadata table.
+    pub branch_pages: u64,
+    /// Key and value bytes actually stored in the metadata table.
+    pub stored_leaf_bytes: u64,
+    /// redb's per-pair overhead and branch-page bytes for the table.
+    pub metadata_bytes: u64,
+    /// Intra-page slack for the metadata table alone — the real packing
+    /// figure.
+    pub table_fragmented_bytes: u64,
+}
+
+impl RawStats {
+    /// Bytes in pages the allocator holds but the tree does not use.
+    ///
+    /// Derived by subtracting the metadata table's intra-page slack from
+    /// the database-wide fragmented figure. The remainder is free pages
+    /// plus the slack of redb's own system and freed trees, which are
+    /// small next to a chain-sized table; treat it as free pages with that
+    /// caveat rather than as an exact count, which redb does not expose.
+    pub fn free_page_bytes(&self) -> u64 {
+        self.database_fragmented_bytes
+            .saturating_sub(self.table_fragmented_bytes)
+    }
+
+    /// Bytes the metadata table's live pages occupy: payload, redb's
+    /// per-pair and branch overhead, and the slack between them.
+    ///
+    /// Deliberately *not* `(leaf_pages + branch_pages) * page_size`. redb
+    /// spills a value too large for a page into overflow pages, which the
+    /// leaf count does not include, and this table's `spendjournalv3`
+    /// bucket has a mean row of roughly 2.4 KiB. On the mainnet store that
+    /// difference is 1.42 GiB — a page-count sum reports 8.46 GiB where
+    /// the tree really occupies 9.79 — so the sum of the three measured
+    /// components is the honest figure.
+    pub fn live_tree_bytes(&self) -> u64 {
+        self.stored_leaf_bytes
+            .saturating_add(self.metadata_bytes)
+            .saturating_add(self.table_fragmented_bytes)
+    }
+
+    /// Fraction of the live tree holding payload or overhead rather than
+    /// slack, in `0.0..=1.0`.
+    ///
+    /// This is the packing figure. redb's own `fragmented_bytes` cannot be
+    /// used for it — see the type docs.
+    pub fn fill_ratio(&self) -> f64 {
+        let live = self.live_tree_bytes();
+        if live == 0 {
+            return 0.0;
+        }
+        let used = self.stored_leaf_bytes.saturating_add(self.metadata_bytes);
+        used as f64 / live as f64
+    }
+
+    /// Bytes this decomposition accounts for: live pages plus free ones.
+    ///
+    /// Should land within a couple of megabytes of the `metadata.redb`
+    /// file size — redb's header and region metadata are the remainder.
+    /// A larger gap means the decomposition has stopped describing the
+    /// file and the figures below it should not be trusted.
+    pub fn accounted_bytes(&self) -> u64 {
+        self.allocated_bytes()
+            .saturating_add(self.free_page_bytes())
+    }
+
+    /// Total bytes the allocator holds.
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocated_pages.saturating_mul(self.page_size)
+    }
+
+    /// Render as one JSON object, so a run is a diffable ledger row.
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{\"page_size\":{},\"allocated_pages\":{},\"allocated_bytes\":{},",
+                "\"tree_height\":{},\"leaf_pages\":{},\"branch_pages\":{},",
+                "\"stored_leaf_bytes\":{},\"metadata_bytes\":{},",
+                "\"table_fragmented_bytes\":{},\"database_fragmented_bytes\":{},",
+                "\"free_page_bytes\":{},\"live_tree_bytes\":{},\"accounted_bytes\":{},",
+                "\"fill_ratio\":{:.6}}}"
+            ),
+            self.page_size,
+            self.allocated_pages,
+            self.allocated_bytes(),
+            self.tree_height,
+            self.leaf_pages,
+            self.branch_pages,
+            self.stored_leaf_bytes,
+            self.metadata_bytes,
+            self.table_fragmented_bytes,
+            self.database_fragmented_bytes,
+            self.free_page_bytes(),
+            self.live_tree_bytes(),
+            self.accounted_bytes(),
+            self.fill_ratio(),
+        )
+    }
 }
 
 /// Classify a redb open failure.
@@ -305,7 +491,12 @@ impl Database {
                 kv,
                 block_store: Mutex::new(block_store),
                 closed: AtomicBool::new(false),
-                cache: Mutex::new(crate::dbcache::DbCache::new()),
+                cache: Mutex::new({
+                    let mut cache = crate::dbcache::DbCache::new();
+                    cache.set_observer(opts.flush_observer.clone(), opts.flush_stats_every);
+                    cache.set_limits(opts.cache_max_size, opts.cache_flush_interval_secs);
+                    cache
+                }),
                 writer_cv: Condvar::new(),
                 writer_busy: Mutex::new(false),
             }),
@@ -373,7 +564,12 @@ impl Database {
                 kv,
                 block_store: Mutex::new(block_store),
                 closed: AtomicBool::new(false),
-                cache: Mutex::new(crate::dbcache::DbCache::new()),
+                cache: Mutex::new({
+                    let mut cache = crate::dbcache::DbCache::new();
+                    cache.set_observer(opts.flush_observer.clone(), opts.flush_stats_every);
+                    cache.set_limits(opts.cache_max_size, opts.cache_flush_interval_secs);
+                    cache
+                }),
                 writer_cv: Condvar::new(),
                 writer_busy: Mutex::new(false),
             }),
@@ -383,6 +579,55 @@ impl Database {
     /// The database driver type (dcrd `Type`).
     pub fn db_type(&self) -> &'static str {
         DB_TYPE
+    }
+
+    /// Decompose the metadata store's on-disk footprint.
+    ///
+    /// **This opens a write transaction.** redb exposes `stats()` only on
+    /// `WriteTransaction`, so measuring necessarily takes the writer, and a
+    /// database that has to be repaired on open is repaired before anything
+    /// is read. Measure a copy, never an artifact whose figures matter: on
+    /// btrfs `cp -a --reflink=always` clones a datadir in seconds at no
+    /// space cost. The transaction is aborted rather than committed, so no
+    /// data changes, but the file is still opened for writing.
+    ///
+    /// The walk is proportional to the tree: redb's `stats()` recurses
+    /// through every branch and leaf page. On a mainnet-sized metadata
+    /// store that is seconds, which is why the per-flush observer samples
+    /// rather than calling this on every commit.
+    pub fn raw_stats(&self) -> Result<RawStats, Error> {
+        self.check_open()?;
+        let tx = self
+            .inner
+            .kv
+            .begin_write()
+            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        let stats = {
+            let db_stats = tx
+                .stats()
+                .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+            let table = tx
+                .open_table(METADATA_TABLE)
+                .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+            let table_stats = redb::ReadableTableMetadata::stats(&table)
+                .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+            RawStats {
+                page_size: db_stats.page_size() as u64,
+                allocated_pages: db_stats.allocated_pages(),
+                tree_height: db_stats.tree_height(),
+                database_fragmented_bytes: db_stats.fragmented_bytes(),
+                leaf_pages: table_stats.leaf_pages(),
+                branch_pages: table_stats.branch_pages(),
+                stored_leaf_bytes: table_stats.stored_bytes(),
+                metadata_bytes: table_stats.metadata_bytes(),
+                table_fragmented_bytes: table_stats.fragmented_bytes(),
+            }
+        };
+        // Abort explicitly: committing would rewrite the root for a
+        // read-only question.
+        tx.abort()
+            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        Ok(stats)
     }
 
     fn check_open(&self) -> Result<(), Error> {
@@ -655,5 +900,110 @@ mod already_open_tests {
         drop(first);
         let reopened = Database::open(&opts).expect("reopen once the handle is dropped");
         reopened.close().expect("close again");
+    }
+}
+
+#[cfg(test)]
+mod raw_stats_tests {
+    use super::*;
+
+    /// The components `raw_stats` read from the real mainnet metadata
+    /// store (14.483 GiB, 76,302,003 rows) on 2026-08-07.
+    fn mainnet_sample() -> RawStats {
+        RawStats {
+            page_size: 4096,
+            allocated_pages: 2_566_169,
+            tree_height: 6,
+            database_fragmented_bytes: 8_732_251_030,
+            leaf_pages: 2_175_036,
+            branch_pages: 43_580,
+            stored_leaf_bytes: 6_069_306_631,
+            metadata_bytes: 745_293_161,
+            table_fragmented_bytes: 3_692_201_360,
+        }
+    }
+
+    const GIB: f64 = (1024 * 1024 * 1024) as f64;
+
+    /// The derived figures must reproduce the decomposition ADR-0004's
+    /// amendment published, which was produced independently by a
+    /// throwaway tool that no longer exists.
+    ///
+    /// This is the only check that the arithmetic here means what the ADR
+    /// means, and it already caught one error: deriving the live tree as
+    /// `(leaf_pages + branch_pages) * page_size` reports 8.46 GiB against
+    /// the true 9.79, because redb spills large values into overflow
+    /// pages that the leaf count excludes.
+    #[test]
+    fn derived_figures_match_the_adr_0004_decomposition() {
+        let s = mainnet_sample();
+
+        let payload = s.stored_leaf_bytes as f64 / GIB;
+        assert!(
+            (payload - 5.65).abs() < 0.01,
+            "payload {payload:.2} GiB, ADR says 5.65"
+        );
+
+        let overhead = s.metadata_bytes as f64 / GIB;
+        assert!(
+            (overhead - 0.69).abs() < 0.01,
+            "overhead {overhead:.2} GiB, ADR says 0.69"
+        );
+
+        let slack = s.table_fragmented_bytes as f64 / GIB;
+        assert!(
+            (slack - 3.44).abs() < 0.01,
+            "slack {slack:.2} GiB, ADR says 3.44"
+        );
+
+        let free = s.free_page_bytes() as f64 / GIB;
+        assert!(
+            (free - 4.69).abs() < 0.01,
+            "free pages {free:.2} GiB, ADR says 4.69"
+        );
+
+        let live = s.live_tree_bytes() as f64 / GIB;
+        assert!(
+            (live - 9.79).abs() < 0.01,
+            "live tree {live:.2} GiB, ADR says 9.79"
+        );
+
+        let fill = s.fill_ratio();
+        assert!(
+            (fill - 0.6486).abs() < 0.0001,
+            "fill {fill:.4}, ADR says 0.6486"
+        );
+    }
+
+    /// Live plus free must account for the file, bar redb's header and
+    /// region metadata. A drift here means the decomposition has stopped
+    /// describing the file it claims to describe.
+    #[test]
+    fn accounted_bytes_reconstructs_the_file_size() {
+        let s = mainnet_sample();
+        // The metadata.redb the sample was read from.
+        const FILE_BYTES: u64 = 15_551_119_360;
+        let accounted = s.accounted_bytes();
+        let gap = FILE_BYTES.abs_diff(accounted);
+        assert!(
+            gap < 4 * 1024 * 1024,
+            "accounted {accounted} vs file {FILE_BYTES}: {gap} bytes unexplained"
+        );
+    }
+
+    /// The free-page figure must not silently absorb the table's slack:
+    /// redb's database-wide `fragmented_bytes` is the sum of the two, and
+    /// reading it whole is the mistake the type documents.
+    #[test]
+    fn free_pages_exclude_intra_page_slack() {
+        let s = mainnet_sample();
+        assert_eq!(
+            s.free_page_bytes(),
+            s.database_fragmented_bytes - s.table_fragmented_bytes
+        );
+        assert!(
+            s.free_page_bytes() < s.database_fragmented_bytes,
+            "the database figure must be the larger of the two"
+        );
     }
 }

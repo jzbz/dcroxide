@@ -10,6 +10,7 @@
 
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use dcroxide_blockchain::process::Chain;
@@ -35,6 +36,28 @@ Usage:
       reporting throughput every <n> blocks (default 5000).  The work
       directory (default: a fresh directory next to the corpus) must
       not already exist and is left behind for inspection.
+
+  dcroxide-bench redbstat --appdata <dir> [--net <name>]
+      Decompose the metadata store's footprint into payload, redb
+      overhead, intra-page slack and free pages, as one JSON object.
+
+      This OPENS THE DATABASE FOR WRITING: redb exposes stats() only on
+      a write transaction, and opening can repair.  Point it at a copy.
+      On btrfs, `cp -a --reflink=always <datadir> <copy>` clones in
+      seconds at no space cost.
+
+  dcroxide-bench pinprobe --appdata <dir> [--net <name>] [--writes <n>]
+                          [--commits <n>] [--hold <mode>] [--cachemib <n>]
+      Apply <writes> scattered metadata writes over <commits> commits
+      and print a JSON line per flush, so the free-page curve can be
+      read.  --hold selects what is held across the run: none (the
+      default), all (one read transaction open throughout), or two (a
+      reader spanning exactly two flushes).
+
+      Comparing the arms answers whether a long-lived reader is what
+      retains free pages, which ADR-0004 named as its leading
+      hypothesis and its 2026-08-07 addendum argues against.  Same
+      warning as redbstat: run it on a copy.
 
   --net is one of mainnet, testnet, simnet, regnet (default mainnet).
 ";
@@ -316,6 +339,138 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Print the metadata store's footprint decomposition as JSON.
+fn cmd_redbstat(args: &Args) -> Result<(), String> {
+    let data_dir = PathBuf::from(args.require("appdata")?);
+    let (params, _) = net_params(args.get("net").unwrap_or("mainnet"))?;
+    let db = open_db(&data_dir, params.net.0, false)?;
+    let stats = db.raw_stats().map_err(|e| e.to_string())?;
+    println!("{}", stats.to_json());
+    Ok(())
+}
+
+/// What is held open across the probe's flushes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// Nothing held; the control arm.
+    None,
+    /// One read transaction open for the whole run.
+    All,
+    /// A reader spanning exactly two flushes, then released.
+    Two,
+}
+
+/// Apply scattered writes and report the footprint after each flush.
+///
+/// The question is whether free pages accumulate because a read
+/// transaction pins them, or for a reason no reader controls. Running the
+/// same write load with and without a held reader answers it directly: if
+/// the curves diverge the reader is the mechanism, and if they coincide it
+/// is not, whatever the mechanism turns out to be.
+fn cmd_pinprobe(args: &Args) -> Result<(), String> {
+    let data_dir = PathBuf::from(args.require("appdata")?);
+    let (params, _) = net_params(args.get("net").unwrap_or("mainnet"))?;
+    let writes: u64 = match args.get("writes") {
+        Some(v) => v.parse().map_err(|e| format!("bad --writes: {e}"))?,
+        None => 200_000,
+    };
+    let commits: u64 = match args.get("commits") {
+        Some(v) => v.parse().map_err(|e| format!("bad --commits: {e}"))?,
+        None => 20,
+    };
+    let cache_mib: u64 = match args.get("cachemib") {
+        Some(v) => v.parse().map_err(|e| format!("bad --cachemib: {e}"))?,
+        None => 8,
+    };
+    let hold = match args.get("hold").unwrap_or("none") {
+        "none" => Hold::None,
+        "all" => Hold::All,
+        "two" => Hold::Two,
+        other => return Err(format!("--hold must be none, all or two (got {other})")),
+    };
+    if commits == 0 {
+        return Err("--commits must be at least 1".to_string());
+    }
+
+    // Observations are appended from the flushing thread and drained here.
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&log);
+    let db_path = data_dir.join("blocks_ffldb");
+    let mut opts = Options::new(&db_path, params.net.0);
+    opts.flush_stats_every = 1;
+    // A small ceiling on purpose: the probe has to reach flushes, and at
+    // the 100 MiB production default a run short enough to iterate on
+    // would never trigger one.
+    opts.cache_max_size = cache_mib.saturating_mul(1024 * 1024);
+    opts.flush_observer = Some(Arc::new(
+        move |obs: &dcroxide_database::FlushObservation| {
+            let stats = obs
+                .stats
+                .map(|s| s.to_json())
+                .unwrap_or_else(|| "null".to_string());
+            sink.lock().expect("log poisoned").push(format!(
+            "{{\"flush\":{},\"dirty_entries\":{},\"dirty_bytes\":{},\"elapsed_ms\":{:.3},\"stats\":{}}}",
+            obs.sequence,
+            obs.dirty_entries,
+            obs.dirty_bytes,
+            obs.elapsed.as_secs_f64() * 1000.0,
+            stats,
+        ));
+        },
+    ));
+
+    let db = Database::open(&opts).map_err(|e| e.to_string())?;
+    eprintln!(
+        "pinprobe: {writes} writes over {commits} commits, hold={}",
+        match hold {
+            Hold::None => "none",
+            Hold::All => "all",
+            Hold::Two => "two",
+        }
+    );
+
+    // Held for the whole run in the `all` arm; dropped after two flushes
+    // in the `two` arm.
+    let mut held = match hold {
+        Hold::None => None,
+        _ => Some(db.begin(false).map_err(|e| e.to_string())?),
+    };
+
+    let per_commit = writes.div_ceil(commits);
+    let mut written = 0u64;
+    for commit in 0..commits {
+        let tx = db.begin(true).map_err(|e| e.to_string())?;
+        {
+            let meta = tx.metadata();
+            let bucket = meta
+                .create_bucket_if_not_exists(b"pinprobe")
+                .map_err(|e| e.to_string())?;
+            for i in 0..per_commit {
+                if written >= writes {
+                    break;
+                }
+                // Scatter by hashing the counter, so writes land across the
+                // keyspace rather than appending to one edge.
+                let key = dcroxide_chainhash::hash_b(&written.to_le_bytes());
+                bucket.put(&key, &key).map_err(|e| e.to_string())?;
+                written = written.saturating_add(1);
+                let _ = i;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+
+        if hold == Hold::Two && commit == 1 {
+            held = None;
+        }
+    }
+    drop(held);
+
+    for line in log.lock().expect("log poisoned").iter() {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 fn main() -> std::process::ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let Some((cmd, rest)) = raw.split_first() else {
@@ -331,6 +486,12 @@ fn main() -> std::process::ExitCode {
             &["in", "net", "workdir", "assumevalid", "max", "report"],
         )
         .and_then(|a| cmd_replay(&a)),
+        "redbstat" => Args::parse(rest, &["appdata", "net"]).and_then(|a| cmd_redbstat(&a)),
+        "pinprobe" => Args::parse(
+            rest,
+            &["appdata", "net", "writes", "commits", "hold", "cachemib"],
+        )
+        .and_then(|a| cmd_pinprobe(&a)),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(())

@@ -305,6 +305,13 @@ pub(crate) struct DbCache {
     max_size: u64,
     /// The time threshold before a flush (dcrd `flushInterval`).
     flush_interval: Duration,
+    /// Observer for the storage-measurement work in ADR-0004; `None`
+    /// in every ordinary build, in which case flush is unchanged.
+    observer: Option<crate::FlushObserver>,
+    /// Take full stats every Nth flush; 0 disables.
+    stats_every: u64,
+    /// Flushes since open, so an observation can be ordered.
+    flush_seq: u64,
 }
 
 impl DbCache {
@@ -315,7 +322,26 @@ impl DbCache {
             last_flush: Instant::now(),
             max_size: DEFAULT_CACHE_SIZE,
             flush_interval: Duration::from_secs(DEFAULT_FLUSH_SECS),
+            observer: None,
+            stats_every: 0,
+            flush_seq: 0,
         }
+    }
+
+    /// Set the overlay's size ceiling and time-based flush interval.
+    pub(crate) fn set_limits(&mut self, max_size: u64, flush_interval_secs: u64) {
+        self.max_size = max_size;
+        self.flush_interval = Duration::from_secs(flush_interval_secs);
+    }
+
+    /// Attach a flush observer and its sampling interval.
+    pub(crate) fn set_observer(
+        &mut self,
+        observer: Option<crate::FlushObserver>,
+        stats_every: u64,
+    ) {
+        self.observer = observer;
+        self.stats_every = stats_every;
     }
 
     /// Apply a committed transaction's pending sets to the overlay
@@ -436,7 +462,8 @@ impl DbCache {
         kv: &redb::Database,
         block_store: &std::sync::Mutex<BlockStore>,
     ) -> Result<(), Error> {
-        self.last_flush = Instant::now();
+        let flush_started = Instant::now();
+        self.last_flush = flush_started;
 
         block_store
             .lock()
@@ -447,9 +474,14 @@ impl DbCache {
             return Ok(());
         }
 
+        // Captured before the flush clears them, for the observer below.
+        let dirty_bytes = self.total_size;
+        let mut dirty_entries = 0usize;
+
         let tx = kv
             .begin_write()
             .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        let mut sampled = None;
         {
             let mut table = tx
                 .open_table(METADATA_TABLE)
@@ -457,6 +489,7 @@ impl DbCache {
             // The merged view yields every cached key once, in key
             // order, with the newest layer's entry winning.
             for (key, entry) in self.cached.merged() {
+                dirty_entries = dirty_entries.saturating_add(1);
                 match entry {
                     Some(v) => {
                         table
@@ -470,12 +503,48 @@ impl DbCache {
                     }
                 }
             }
+            // Read the footprint from the transaction that is already
+            // open, so sampling costs the tree walk and nothing else --
+            // no extra write transaction, no extra commit.
+            let take_stats = self.stats_every > 0
+                && self
+                    .flush_seq
+                    .saturating_add(1)
+                    .is_multiple_of(self.stats_every);
+            if take_stats && self.observer.is_some() {
+                let db_stats = tx
+                    .stats()
+                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+                let table_stats = redb::ReadableTableMetadata::stats(&table)
+                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+                sampled = Some(crate::RawStats {
+                    page_size: db_stats.page_size() as u64,
+                    allocated_pages: db_stats.allocated_pages(),
+                    tree_height: db_stats.tree_height(),
+                    database_fragmented_bytes: db_stats.fragmented_bytes(),
+                    leaf_pages: table_stats.leaf_pages(),
+                    branch_pages: table_stats.branch_pages(),
+                    stored_leaf_bytes: table_stats.stored_bytes(),
+                    metadata_bytes: table_stats.metadata_bytes(),
+                    table_fragmented_bytes: table_stats.fragmented_bytes(),
+                });
+            }
         }
         tx.commit()
             .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
 
         self.publish(Vec::new());
         self.total_size = 0;
+        self.flush_seq = self.flush_seq.saturating_add(1);
+        if let Some(observer) = &self.observer {
+            observer(&crate::FlushObservation {
+                sequence: self.flush_seq,
+                dirty_entries,
+                dirty_bytes,
+                elapsed: flush_started.elapsed(),
+                stats: sampled,
+            });
+        }
         Ok(())
     }
 }
