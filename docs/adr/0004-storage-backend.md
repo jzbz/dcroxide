@@ -132,7 +132,9 @@ allocation to a power of two, `required_order = ceil_log2(required_pages)`
 Where the free pages come from is not established. One candidate is visible
 in this crate: `Database::begin` takes a redb `begin_read()` for the whole
 life of *every* ffldb transaction including read-only ones
-(`crates/dcroxide-database/src/lib.rs:386`), and redb will not return a
+(`crates/dcroxide-database/src/lib.rs`, in `begin_seed` — the citation
+here read `:386` until the 2026-08-07 addendum corrected it; that line is
+now the closing brace of `db_type`), and redb will not return a
 freed page to the allocator past the oldest live read transaction
 (`transaction_tracker.rs:253-261`). A read held across writes therefore pins
 freed pages and the allocator grows the file instead of reusing them. That
@@ -160,11 +162,16 @@ this crate drives redb rather than at redb itself. Until that is measured,
 the honest position is that some unknown fraction is recoverable in the
 layers above.
 
-Levers, **none implemented and none measured**:
+Levers, **none implemented and none measured** (and see the 2026-08-07
+addendum, which demotes the first of them and fixes the order the rest
+should be attempted in):
 
 - **Audit long-lived read transactions.** Targets the 4.69 GiB of free
   pages, the largest component, via the mechanism described above. Testable
-  without an on-disk format change.
+  without an on-disk format change. *Demoted 2026-08-07: the mechanism does
+  not hold for the transaction that triggers its own flush, and the cache
+  mutex prevents a new reader from straddling one. What is left is a bounded
+  audit of cross-thread read-only transaction lifetimes.*
 - **Size redb's read cache against the working set.** Targets flush time,
   not space. A probe on the real tree took a 500k-key insert loop from
   4.3-6.1 s to 1.3-1.5 s by raising the cache from the 1 GiB default to
@@ -199,3 +206,83 @@ crate's internals; only its callers and the flat block files, which sit
 outside the metadata store, are genuinely insulated. It would also trade
 the C/C++ toolchain requirement back in, which the Consequences above
 weighed and declined.
+
+## Addendum, 2026-08-07 — the free-page hypothesis does not survive reading
+
+The amendment above named the long-lived read transaction as the leading
+candidate for the 4.69 GiB of allocated-but-free pages, with the honest
+caveat that it was "a hypothesis with a mechanism, not a measurement." A
+static audit of that mechanism, against redb 2.6.3 and this crate, says it
+is the wrong candidate. Nothing here has been measured either; what has
+changed is that the cheap explanation is now ruled out on the code, so the
+measurement to run is a different one.
+
+**The mechanism, followed through.** redb keys freed pages by the write
+transaction that freed them and releases keys strictly below `free_until`,
+which is `oldest_live_read.next()` when a read transaction is live and the
+committing transaction's own id otherwise (`transactions.rs:1936-1940`,
+`2129-2160`, `2200-2262`). The only steady-state writer to the metadata
+store is `DbCache::flush`. It is reached from `Transaction::commit_internal`
+(`transaction.rs:634-641`), where the committing transaction's read snapshot
+sits at the last committed id `R` and the flush's own write lands at `R+1`.
+`free_until` is therefore `R+1` whether or not that reader exists: the
+transaction that triggers its own flush pins nothing.
+
+The second path is closed by locking rather than arithmetic.
+`Database::begin` takes the cache mutex and holds it across `begin_read()`
+(`lib.rs:450-462`), and `commit_internal` takes that same mutex before
+calling `cache.flush`. A read transaction therefore cannot come into
+existence while a flush is running, so no *new* reader can straddle one.
+
+What remains is a read-only ffldb transaction opened on another thread
+before a flush and still alive after it. That is a real exposure and worth
+bounding — but the sync that produced every figure in the amendment ran
+`--norpc`, which removes the main source of concurrent readers. The
+hypothesis is a poor fit for the measurement it was invented to explain.
+
+**What the measurement should ask instead.** A one-generation lag is
+structural: pages freed by flush `W` become reclaimable only at `W+1`, so
+free pages are bounded below by the largest single flush's freed set, and
+redb never returns space to the filesystem. 4.69 GiB may simply be a
+high-water mark — in which case no lever in the layers above recovers it,
+and the honest reading is that more of the 8.33 GiB is inherent than the
+amendment supposed.
+
+Two levers move on this. Lever (a) is demoted: it is now a bounded audit of
+cross-thread read-only transaction lifetimes, not the leading explanation.
+Lever (d)'s `existsaddridx` half is close to settled by arithmetic —
+66,495,032 rows of a 25-byte key with an empty value cost 33 B/pair
+including redb's two `u32` leaf offsets, which at the file's 64.86% fill is
+3.15 GiB against the measured 3.1 GiB. The entire recoverable amount is the
+8 B/pair of offsets, roughly 0.75 GiB, and claiming it means giving each
+bucket its own table with a fixed-width key, which breaks the single
+contiguous ffldb keyspace that `scan_prefix_keys` and the cursor merge
+depend on. That may be the lever to decline.
+
+**Sequencing.** The instrument comes first: the decomposition that produced
+the amendment's table was a throwaway and is not in the tree, so no lever
+can be scored before and after until it is rebuilt as a `dcroxide-bench`
+subcommand emitting machine-readable output. Then a per-flush observer on
+`DbCache::flush` (flush sequence, dirty entries, bytes, elapsed, allocated
+and free pages) produces the curve whose *shape* distinguishes the
+candidates: a monotone stair stepping by one flush's freed set is the
+structural lag, a single ratchet that never recovers is a high-water mark
+no lever fixes, growth tracking reader overlap revives lever (a), and
+growth tracking row-size distribution points at allocator rounding.
+
+Levers (b) and (c) are not worth booking until that curve exists. Cache
+size and flush cadence interact with free pages in opposite directions —
+fewer, larger commits amortize better while raising the per-generation
+freed set that sets the high-water mark — so either measured alone yields a
+number nobody can interpret. Neither is adjustable today in any case:
+`DbCache::new` hardcodes its 100 MiB size and 300 s interval, and
+`dcroxide-bench` has no page-cache flag, so every replay silently runs at
+the 1 GiB default.
+
+**Preserving the baseline.** Every figure in the amendment comes from one
+datadir, and opening it is not read-only — redb can quick-repair on open,
+and `Database::open` rolls the block files back when the metadata trails
+them (`lib.rs:365-369`). It has been reflink-cloned to
+`artifacts/dcroxide-bench/m1/baseline-2026-07-25/` (btrfs, 22 s, no
+additional space); the clone is what probes open, and the original is not
+to be touched.

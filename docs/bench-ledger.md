@@ -38,6 +38,18 @@ run, both nodes `--norpc`.
 |---|---|---|---|---|---|
 | 2026-07 | m1 | unrecorded (2.2.0-pre, at the ADR-0004 amendment) | mainnet tip | dcroxide 32.06 GiB total (17.579 GiB blocks + 14.483 GiB metadata.redb); dcrd 23.73 GiB (17.580 GiB blocks + 6.045 GiB metadata leveldb + 0.108 GiB utxodb) | ADR-0004 amendment |
 
+## Preserved baselines
+
+The datadir every figure above was read from, kept because opening a redb
+database is not a read-only act (quick-repair on open, and `Database::open`
+rolls the block files back when the metadata trails them). Probes open a
+fresh reflink clone of the snapshot; neither the original nor the snapshot
+is opened directly.
+
+| date | machine | what | path | notes |
+|---|---|---|---|---|
+| 2026-08-07 | m1 | mainnet datadir behind the 2026-07 sync and storage rows | `artifacts/dcroxide-bench/m1/baseline-2026-07-25/blocks_ffldb/` | reflink clone of `artifacts/p2p-sync/data/mainnet/blocks_ffldb/`, written 2026-07-25; 31 GiB apparent, no additional space on btrfs, 22 s. `metadata.redb` is 15,551,119,360 B, the 14.483 GiB the ADR decomposes. |
+
 ## Replay throughput (dcroxide-bench)
 
 Identical-corpus replays via `dcroxide-bench export` / `replay`
