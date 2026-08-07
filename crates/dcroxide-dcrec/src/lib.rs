@@ -12,9 +12,19 @@
 //! acceptance, low-S serialization, error identities — is implemented here
 //! and differential-tested against dcrd's own code via `tools/oracle`.
 //!
-//! Unlike the codec crates this one is not `no_std`: the C bindings require
-//! std (embedded consumers should use dcr-rs, where this crate's vendored
-//! primitives originate).
+//! Like the codec crates this one is `no_std` without its default `std`
+//! feature, and needs `alloc` (libsecp256k1 context creation and the DER
+//! `Vec`).  `std` selects two pure-performance options — libsecp256k1's
+//! process-wide context and k256's precomputed generator tables — and
+//! changes no acceptance rule, error identity, or encoded byte; the vectors
+//! run in both configurations.  Note that this makes the *Rust* side
+//! std-free: `secp256k1-sys` still compiles the C library, so a genuinely
+//! freestanding build additionally needs a cross C toolchain and a global
+//! allocator.
+
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
+
+extern crate alloc;
 
 pub mod edwards;
 pub mod secp256k1;

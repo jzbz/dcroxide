@@ -8,6 +8,31 @@ pub mod ecdsa;
 pub mod nonce;
 pub mod schnorr;
 
+/// Run `f` against a libsecp256k1 context.
+///
+/// With `std` this is the crate's process-wide `SECP256K1`, the same
+/// object the code used unconditionally before the crate gained a no_std
+/// configuration; libsecp256k1's `global-context` feature is defined as
+/// `global-context = ["std"]`, so it cannot follow the crate into no_std.
+/// Without `std` a context is built per call, which the verification
+/// benchmark puts at roughly 1.5% of an ECDSA verify.  Neither arm changes
+/// a result: the context carries precomputation, not policy.
+#[cfg(feature = "std")]
+pub(crate) fn with_context<R>(
+    f: impl FnOnce(&libsecp256k1::Secp256k1<libsecp256k1::All>) -> R,
+) -> R {
+    f(libsecp256k1::SECP256K1)
+}
+
+/// See the `std` arm above; this one pays a context construction per call
+/// so the crate can build without an allocator-backed static.
+#[cfg(not(feature = "std"))]
+pub(crate) fn with_context<R>(
+    f: impl FnOnce(&libsecp256k1::Secp256k1<libsecp256k1::All>) -> R,
+) -> R {
+    f(&libsecp256k1::Secp256k1::new())
+}
+
 /// The secp256k1 field prime P as 32 big-endian bytes.
 pub const FIELD_PRIME_BYTES: [u8; 32] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -249,7 +274,7 @@ impl PrivateKey {
     /// The corresponding public key.
     pub fn public_key(&self) -> PublicKey {
         PublicKey {
-            inner: self.inner.public_key(libsecp256k1::SECP256K1),
+            inner: with_context(|secp| self.inner.public_key(secp)),
         }
     }
 

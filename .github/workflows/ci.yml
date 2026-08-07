@@ -122,10 +122,21 @@ jobs:
     # the claim. This job checks them on a no-OS target so a dependency
     # or cfg mistake that drags std into a consensus core fails CI.
     #
-    # Not yet listed, because std-needing dependencies (getrandom,
-    # once_cell, crypto-common) leak into their trees despite the
-    # cfg_attr: blockchain, dcrec, fees, gcs, mempool, mining, stake,
-    # txscript. Add each one as its dependency features are untangled.
+    # For dcrec this proves the *Rust* side is std-free. secp256k1-sys
+    # still compiles the C library with the host compiler for this
+    # triple, and `cargo check` never links, so a genuinely freestanding
+    # build would additionally need a cross C toolchain and a global
+    # allocator. The check is still worth having: it is what catches a
+    # `use std::` or a default-features dependency creeping back in.
+    #
+    # Not yet listed: blockchain, fees, gcs, mempool, mining, stake, and
+    # txscript. Every one of them fails on the same five crates
+    # (secp256k1-sys, once_cell, getrandom, crypto-common, der) pulled in
+    # through dcroxide-dcrec's default features, so each needs
+    # `default-features = false` on its dcroxide-* path dependencies plus
+    # a `std` feature that re-enables them. dcroxide-database is NOT the
+    # blocker it looks like — making it optional in stake was tried and
+    # changed nothing.
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
@@ -133,7 +144,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check the no_std crates on a no-OS target
         run: |
-          for c in base58 chaincfg chainhash crypto standalone uint256 wire; do
+          for c in base58 chaincfg chainhash crypto dcrec standalone uint256 wire; do
             cargo check -p "dcroxide-$c" --no-default-features --target x86_64-unknown-none
           done
 

@@ -5,9 +5,12 @@
 //! accepts high-S signatures (as dcrd does), and RFC6979 deterministic
 //! signing.
 
+use alloc::vec::Vec;
 use core::fmt;
 
-use super::{GROUP_ORDER_BYTES, HALF_GROUP_ORDER, PrivateKey, PublicKey, is_zero, negate_mod_n};
+use super::{
+    GROUP_ORDER_BYTES, HALF_GROUP_ORDER, PrivateKey, PublicKey, is_zero, negate_mod_n, with_context,
+};
 
 /// The ASN.1 identifier for a sequence.
 const ASN1_SEQUENCE_ID: u8 = 0x30;
@@ -192,9 +195,7 @@ impl Signature {
             .expect("r and s are reduced scalars");
 
         let msg = libsecp256k1::Message::from_digest(*hash);
-        libsecp256k1::SECP256K1
-            .verify_ecdsa(&msg, &sig, pub_key.inner())
-            .is_ok()
+        with_context(|secp| secp.verify_ecdsa(&msg, &sig, pub_key.inner()).is_ok())
     }
 }
 
@@ -358,9 +359,7 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
     let sig = libsecp256k1::ecdsa::RecoverableSignature::from_compact(&signature[1..], recovery_id)
         .map_err(|_| ())?;
     let msg = libsecp256k1::Message::from_digest(*hash);
-    let inner = libsecp256k1::SECP256K1
-        .recover_ecdsa(&msg, &sig)
-        .map_err(|_| ())?;
+    let inner = with_context(|secp| secp.recover_ecdsa(&msg, &sig)).map_err(|_| ())?;
     Ok((PublicKey::from_inner(inner), was_compressed))
 }
 
@@ -368,7 +367,7 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
 /// matching dcrd `ecdsa.Sign` byte-for-byte (verified differentially).
 pub fn sign(priv_key: &PrivateKey, hash: &[u8; 32]) -> Signature {
     let msg = libsecp256k1::Message::from_digest(*hash);
-    let sig = libsecp256k1::SECP256K1.sign_ecdsa(&msg, priv_key.inner());
+    let sig = with_context(|secp| secp.sign_ecdsa(&msg, priv_key.inner()));
     let compact = sig.serialize_compact();
     let mut r = [0u8; 32];
     let mut s = [0u8; 32];
