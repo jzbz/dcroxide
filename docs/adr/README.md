@@ -13,6 +13,7 @@ than rewriting what was decided. Use [template.md](template.md).
 - [ADR-0005](0005-concurrency-model.md) — D2: tokio for I/O, runtime-free consensus, validation pool *(Accepted; ratified 2026-08-07 as shipped — threads, not tokio; see the addenda)*
 - [ADR-0006](0006-secp256k1-backend.md) — D3: libsecp bindings for ECDSA, `k256` for Schnorr-DCRv0 *(Proposed; addendum 2026-07-26 — the split held)*
 - [ADR-0007](0007-json-emission-strategy.md) — D4: controlled serde emission + Go-float formatter + golden captures *(Proposed; serde not used — see the 2026-07-26 addendum)*
+- [ADR-0008](0008-clippy-lint-policy.md) — Curated lint set: `iter_over_hash_type`/`allow_attributes`/`unreachable_pub` adopted, cast lints refused or deferred, with the measured fallout *(Accepted)*
 
 ## Pending decisions (from the project brief, §9)
 

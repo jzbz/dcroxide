@@ -16,6 +16,13 @@
 //! text output is [`Uint256::text`], which matches dcrd's `Text` exactly).
 
 #![cfg_attr(not(test), no_std)]
+// This crate holds no hashed containers: every map and set in it is
+// ordered.  That is a property worth keeping rather than rediscovering
+// -- iteration order over a consensus structure must not depend on a
+// per-process hash seed.  Denied here rather than workspace-wide
+// because the P2P, RPC and mixing crates legitimately hash (see
+// ADR-0008); note the lint fires only on `for` loops.
+#![deny(clippy::iter_over_hash_type)]
 // This crate is 2^256 modular arithmetic: wrapping is the specified
 // semantics, carried out through explicit carry/borrow helpers, and all
 // indexing is over fixed 4/5-word arrays with statically bounded loops.
