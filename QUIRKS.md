@@ -224,3 +224,37 @@ Entry format:
   boundary at 0 and 1, and drives ten thousand consecutive 16-item
   `getdata` requests through `on_get_data` without the peer ever
   reaching the ban threshold)
+
+## QK-0010 — a `mixdcnet` message can decode but not re-encode
+
+- **Where:** dcrd `wire/msgmixdcnet.go` `readMixVects` /
+  `writeMessageNoSignature`; dcroxide-wire `msg_mix.rs`
+  `read_mix_vects` / `MsgMixDCNet::encode`
+- **What:** the two directions disagree about an empty DC-net. On the
+  way in, `readMixVects` reads the outer dimension `x`, and when it is
+  zero returns immediately with no vectors and no error — the inner
+  dimensions are never read and no minimum is enforced. On the way
+  out, `writeMessageNoSignature` rejects `mcount == 0` outright with
+  `ErrInvalidMsg`. A `mixdcnet` frame declaring zero mix vectors is
+  therefore accepted by the decoder and produces a message the encoder
+  refuses to serialize, so a node can hold a message it cannot relay.
+  The same asymmetry exists in `MsgMixSlotReserve`, whose decoder
+  enforces `mcount != 0` and so does not admit the empty case.
+- **Why reproduced:** decoder acceptance is what decides whether a peer
+  is banned for a malformed message, and encoder rejection is what
+  decides whether the node relays it. Both are observable to a peer,
+  and tightening either one changes behaviour dcrd exhibits: rejecting
+  the empty vector at decode would ban a peer dcrd tolerates, and
+  accepting it at encode would relay a message dcrd drops.
+- **Pinned by:** `qk_0010_empty_mixdcnet_decodes_but_does_not_reencode`
+  in `crates/dcroxide-wire/tests/codec_properties.rs`, which asserts
+  both halves — the frame decodes to an empty DC-net, and encoding the
+  result returns dcrd's `ErrInvalidMsg` identity.
+- **How found:** the `wire_frame_structured` fuzz target, within
+  seconds of first being run. The older `wire_frame_decode` target
+  asserted that every decoded message re-encodes, which is false for
+  exactly this case; it never fired because libFuzzer cannot forge the
+  BLAKE-256 payload checksum that would let a `mixdcnet` frame reach
+  the decoder at all. Both targets now treat an encode failure as an
+  acceptable outcome and assert only that a message which *does*
+  re-encode decodes back unchanged.

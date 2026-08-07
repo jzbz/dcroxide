@@ -10,7 +10,7 @@
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use dcroxide_chaincfg::{Params, mainnet_params, regnet_params, simnet_params, testnet3_params};
 use dcroxide_testutil::{Oracle, SplitMix64, hex, oracle_or_skip};
@@ -143,8 +143,12 @@ fn key_address(entry: &KeyEntry, p2pkh: bool, params: &Params) -> Address {
     }
 }
 
-type KeyMap = HashMap<String, KeyEntry>;
-type ScriptMap = HashMap<String, Vec<u8>>;
+// Ordered, not hashed: the oracle request below serializes these maps
+// entry by entry, so under a `HashMap` the request bytes would follow
+// `RandomState` rather than the seed `from_entropy` prints — and a
+// mismatch would not reproduce from the seed reported alongside it.
+type KeyMap = BTreeMap<String, KeyEntry>;
+type ScriptMap = BTreeMap<String, Vec<u8>>;
 
 /// Run our SignTxOutput with map-backed databases.
 #[allow(clippy::too_many_arguments)]

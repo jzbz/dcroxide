@@ -168,6 +168,16 @@ jobs:
           for t in $(cargo fuzz list); do
             cargo fuzz run "$t" -- -max_total_time=60
           done
+      # Without this a crash is only ever a red X: the input that caused
+      # it lives in fuzz/artifacts on a runner that is about to be
+      # destroyed, so nobody can reproduce or minimize it.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-smoke
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
 
   nightly-fuzz:
     name: nightly fuzz (10m per target)
@@ -185,3 +195,12 @@ jobs:
           for t in $(cargo fuzz list); do
             cargo fuzz run "$t" -- -max_total_time=600
           done
+      # See the smoke job: a nightly crash is the one most likely to be
+      # noticed hours later, so the reproducer has to outlive the runner.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-nightly
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

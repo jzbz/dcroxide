@@ -75,6 +75,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "wire_frame_structured"
+path = "fuzz_targets/wire_frame_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "wire_msgtx_decode"
 path = "fuzz_targets/wire_msgtx_decode.rs"
 test = false

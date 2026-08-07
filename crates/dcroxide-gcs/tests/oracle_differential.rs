@@ -8,7 +8,7 @@
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use dcroxide_chaincfg::mainnet_params;
 use dcroxide_chainhash::Hash;
@@ -162,7 +162,7 @@ fn filter_differential() {
 // blockcf2 differential.
 // ----------------------------------------------------------------------
 
-struct MapPrevScripts(HashMap<(Hash, u32, i8), (u16, Vec<u8>)>);
+struct MapPrevScripts(BTreeMap<(Hash, u32, i8), (u16, Vec<u8>)>);
 
 impl blockcf2::PrevScripter for MapPrevScripts {
     fn prev_script(&self, out: &OutPoint) -> Option<(u16, &[u8])> {
@@ -457,7 +457,13 @@ fn blockcf2_differential() {
 
         // Previous scripts for every input in the block; occasionally
         // drop one to exercise the missing-script error.
-        let mut prevs: HashMap<(Hash, u32, i8), (u16, Vec<u8>)> = HashMap::new();
+        //
+        // Ordered, not hashed: both the dropped key below and the
+        // oracle request's field order are read straight out of this
+        // map, and under a `HashMap` both would follow `RandomState`,
+        // which the seed printed by `from_entropy` does not capture.
+        // A failure would then be unreproducible from its own seed.
+        let mut prevs: BTreeMap<(Hash, u32, i8), (u16, Vec<u8>)> = BTreeMap::new();
         for tx in block
             .transactions
             .iter()
