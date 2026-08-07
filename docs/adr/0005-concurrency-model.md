@@ -1,8 +1,9 @@
 # ADR-0005 — D2: Concurrency model
 
-- **Status:** Proposed (draft for decision D2) — the tokio choice was not
-  taken; see the 2026-07-26 addendum
-- **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: what shipped)
+- **Status:** Accepted (decision D2) — ratified 2026-08-07 as shipped: the
+  thread-per-peer fallback, not the tokio proposal; see the addenda
+- **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: what shipped),
+  2026-08-07 (ratified)
 
 ## Context
 
@@ -64,3 +65,48 @@ alive answering canned errors. `[profile.release]` therefore sets
 release builds and requires operators to run the node under a supervisor;
 dev and test builds keep unwinding. The full reasoning, and the test that
 fails if the setting is dropped, are in `PARITY.md`'s "Known remaining gaps".
+
+## Addendum, 2026-08-07 — ratified as shipped
+
+The model the previous addendum describes — OS threads over
+`std::sync::mpsc`, runtime-free consensus crates, a single chain-state
+writer — is the accepted decision for D2. Two developments since the
+proposal retire both the ratification gate and the standing reason to
+revisit the choice.
+
+The gate is met. Ratification was blocked on a peer read/write loop
+demonstrating stall handling and backpressure equivalent to dcrd's. That
+machinery shipped and is pinned: the stall detector and the stall-carrying
+peer loops in `dcroxide-node`'s `peerloop.rs` port dcrd's `stallHandler`,
+and `tests/b4_stall.rs` exercises them over real loopback TCP — including
+the handler-active accounting that keeps the detector from firing on
+honest peers. Both networks have synced from genesis to tip through these
+loops, and the node syncs against dcrd in both directions.
+
+The performance question belongs to another layer. The one open
+performance gap — initial block download at ~2.2x dcrd — is localized by
+ADR-0004's amendment in the storage engine's commit shape, not in
+threading or validation: the profiled syncs spent 80.1% / 82.4% of wall
+time in progress stalls longer than 20 s while dcrd stalled zero times in
+754 windows. No concurrency model removes those stalls. The IBD gap is to
+be closed in the storage layer, through ADR-0004's levers, and is not
+grounds for reopening this decision.
+
+External corroboration, for the record. Cuprate — the from-scratch Rust
+Monero node — took the other fork: tokio, with tower services at every
+internal boundary. Its published record points the same way. The
+0.1.0-preview release notes report a single-wallet workload tied with
+monerod, with the architecture's measured wins confined to multi-client
+RPC scaling; the large sync-speed gain arrived with the April 2026
+storage rewrite (github.com/Cuprate/cuprate/pull/587), not with the
+runtime; and its own documentation concedes the abstraction's costs — a
+p2p core it calls verbose, and a generic database service layer deleted
+in that same rewrite. An async re-architecture buys multi-client scaling,
+a surface this node has not yet needed, and it would forfeit the
+structural property the port depends on: OS threads over channels mirror
+dcrd's goroutine-per-concern layout thread for goroutine, which is what
+keeps the line-by-line parity audit tractable. Multi-client RPC/websocket
+concurrency stays an honest open question — it is to be measured against
+dcrd before wallet integrations land, not assumed — but its answer,
+either way, arrives as targeted fixes behind the existing seams, not as a
+runtime swap.

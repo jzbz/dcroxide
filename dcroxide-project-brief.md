@@ -469,10 +469,11 @@ pins this policy asks for.
 > - **D1** — ratified as [ADR-0004](docs/adr/0004-storage-backend.md)
 >   (Accepted): `redb` behind dcrd's database semantics, flat block files,
 >   fresh sync only.
-> - **D2** — [ADR-0005](docs/adr/0005-concurrency-model.md), still *Proposed*.
->   The recommendation was not taken: there is no tokio in the dependency
->   graph and the node is OS-threaded throughout, which is the ADR's own
->   documented fallback. Its addendum records what shipped.
+> - **D2** — [ADR-0005](docs/adr/0005-concurrency-model.md), *Accepted*
+>   (ratified 2026-08-07). The recommendation was not taken: there is no
+>   tokio in the dependency graph and the node is OS-threaded throughout,
+>   which is the ADR's own documented fallback. Its addenda record what
+>   shipped and the evidence behind ratification.
 > - **D3** — [ADR-0006](docs/adr/0006-secp256k1-backend.md), still *Proposed*.
 >   The split held: libsecp256k1 bindings for ECDSA, `k256` for
 >   Schnorr-DCRv0, curve25519-dalek for Ed25519.
