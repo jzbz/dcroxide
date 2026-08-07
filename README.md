@@ -350,6 +350,10 @@ work). Currently implemented:
   master `452c1a6c` module versions) as a test oracle over line-delimited JSON
 - `tools/helpgen` — the go-flags help-vector generator over dcrd's
   verbatim config struct
+- `tools/pinbump` — given two dcrd commits, resolves the upstream files
+  they touch to the dcroxide crates that port them, via PARITY.md's own
+  table, so moving the parity pin starts from a review list rather than
+  a whole-diff read
 
 ## Performance
 
@@ -401,6 +405,7 @@ per machine, commit, and corpus in
   PARITY.md), plus the shared test harness and the replay bench
 - `tools/oracle/` — the dcrd differential-test oracle (Go)
 - `tools/helpgen/` — the go-flags help-vector generator (Go)
+- `tools/pinbump/` — the parity-pin bump review-list generator (Go)
 - `fuzz/` — `cargo-fuzz` targets (nightly toolchain)
 - `docs/adr/` — architecture decision records
 

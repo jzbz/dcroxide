@@ -26,7 +26,10 @@ than rewriting what was decided. Use [template.md](template.md).
   superseding them, is the project owner's call.
 - **D5** — Upstream tracking cadence. The port has followed dcrd master twice
   (`release-v2.1.5` → `452c1a6c` → `29f17894`, version 2.2.0-pre); the
-  standing cadence is still undecided
+  standing cadence is still undecided. The mechanical half is no longer
+  manual: `tools/pinbump` resolves an upstream delta to the crates that
+  port it through PARITY.md's table, so a bump starts from a review list.
+  What remains undecided is how often to look, not how to look.
 - **D6** — dcr-rs relationship (upstream vs. fork) — partially covered by ADR-0002
 - **D7** — MSRV, platform tiers, release signing/reproducibility (MSRV
   currently 1.94 via workspace `rust-version`; formal ADR pending).  The
