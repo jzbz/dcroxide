@@ -17,7 +17,7 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 711 tests across 232 suites, most differential against dcrd
+runs 729 tests across 234 suites, most differential against dcrd
 itself or replaying sessions generated inside dcrd's own packages.
 
 Since the surface completed, three rounds of work have landed on it. A
