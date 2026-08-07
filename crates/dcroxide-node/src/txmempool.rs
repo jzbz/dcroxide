@@ -276,6 +276,16 @@ impl PoolChain for NodePoolChain {
         now_unix()
     }
 
+    /// Drawn from the OS CSPRNG.  This picks which orphan is evicted
+    /// under pressure, so a predictable draw is one an attacker grinds
+    /// against to keep their own orphans resident; see
+    /// `TxPool::limit_num_orphans`.
+    fn random_u64(&self) -> u64 {
+        let mut buf = [0u8; 8];
+        getrandom::fill(&mut buf).expect("system random source");
+        u64::from_le_bytes(buf)
+    }
+
     /// The chain's shared signature verification cache, so block
     /// connects reuse the mempool's successful verifications (dcrd
     /// wires `s.sigCache` into `mempool.Config.SigCache`).

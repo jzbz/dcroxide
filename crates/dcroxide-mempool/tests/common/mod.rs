@@ -228,6 +228,13 @@ impl PoolChain for FakeChain {
         // time-driven and deliberately untriggered).
         1751800000
     }
+
+    fn random_u64(&self) -> u64 {
+        // Fixed, like the clock above: the replayed dcrd scenarios
+        // must not depend on a draw, and none of them evicts an
+        // orphan by the random path.
+        0
+    }
 }
 
 /// The pool policy dcrd's `newPoolHarness` configures for mainnet.

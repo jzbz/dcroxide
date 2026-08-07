@@ -132,6 +132,18 @@ pub trait PoolChain {
     /// The current wall clock as unix seconds (dcrd's direct
     /// `time.Now()` calls, injected for determinism).
     fn now_unix(&self) -> i64;
+    /// A random draw, standing in for the per-process randomness of
+    /// Go's map iteration order.
+    ///
+    /// dcrd reaches for that randomness implicitly, by taking the first
+    /// entry of a `range` over a map; this port stores the same data in
+    /// ordered containers, so the equivalent unpredictability has to be
+    /// asked for.  It is injected rather than drawn in-crate to keep
+    /// this crate free of an entropy dependency and to leave the draw
+    /// deterministic under test.  Production implementations must use a
+    /// CSPRNG: see `TxPool::limit_num_orphans` for what an attacker
+    /// does with a predictable draw.
+    fn random_u64(&self) -> u64;
     /// The chain's shared signature verification cache, threaded into
     /// the acceptance-path script validation so successful mempool
     /// verifications are reused when the block connects (dcrd wires
@@ -489,10 +501,29 @@ impl<C: PoolChain> TxPool<C> {
     }
 
     /// Limit the number of orphans by evicting expired entries and, if
-    /// still needed, an arbitrary orphan (dcrd `limitNumOrphans`;
-    /// dcrd's random map eviction is an ordering-irrelevant choice by
-    /// its own documentation, realized here as the first hash in
-    /// order).
+    /// still needed, a uniformly chosen orphan (dcrd
+    /// `limitNumOrphans`).
+    ///
+    /// dcrd evicts by taking the first entry of a `range` over its
+    /// orphan map, and its comment argues the order does not matter
+    /// because "an adversary would have to be able to pull off preimage
+    /// attacks on the hashing function in order to target eviction of
+    /// specific entries."  That holds for a Go map, whose iteration
+    /// order is randomized per process and whose buckets are keyed by a
+    /// seeded hash.  It does **not** hold for the `BTreeMap` this port
+    /// stores orphans in: the first entry is always the numerically
+    /// smallest transaction hash, and grinding a *large* hash is a few
+    /// milliseconds of work rather than a preimage attack.  Taking the
+    /// first entry would therefore let an attacker make their own
+    /// orphans effectively immune to eviction while honest low-hash
+    /// orphans churn — the opposite of dcrd's property.
+    ///
+    /// The choice is drawn from the chain's random source instead,
+    /// which restores what dcrd's map iteration provides: a selection
+    /// the submitter cannot steer.  Any arbitrary choice is conformant
+    /// here, since dcrd's own is explicitly unspecified.  The modulo
+    /// bias over a `u64` is on the order of one part in `2^57` for a
+    /// pool this size and is not worth rejection sampling.
     fn limit_num_orphans(&mut self) {
         // Scan through the orphan pool and remove any expired orphans
         // when it's time.
@@ -522,11 +553,15 @@ impl<C: PoolChain> TxPool<C> {
             return;
         }
 
-        // Evict an arbitrary orphan.  Don't remove redeemers in the
-        // case of a random eviction since it is quite possible it
+        // Evict a uniformly chosen orphan.  Don't remove redeemers in
+        // the case of a random eviction since it is quite possible it
         // might be needed again shortly.
-        if let Some(hash) = self.orphans.values().next().map(|otx| otx.tx_hash) {
-            self.remove_orphan(&hash, false);
+        let len = self.orphans.len();
+        if len > 0 {
+            let index = (self.chain.random_u64() % len as u64) as usize;
+            if let Some(hash) = self.orphans.values().nth(index).map(|otx| otx.tx_hash) {
+                self.remove_orphan(&hash, false);
+            }
         }
     }
 
@@ -2054,6 +2089,9 @@ mod send_tests {
             fn now_unix(&self) -> i64 {
                 unimplemented!()
             }
+            fn random_u64(&self) -> u64 {
+                unimplemented!()
+            }
         }
         fn assert_send<T: Send>() {}
         assert_send::<TxPool<NeverChain>>();
@@ -2140,6 +2178,12 @@ mod removal_cascade_tests {
         }
         fn now_unix(&self) -> i64 {
             1751800000
+        }
+        /// Fixed so eviction is reproducible in these tests; the
+        /// eviction-uniformity property is pinned separately, by a
+        /// test that drives the draw itself.
+        fn random_u64(&self) -> u64 {
+            0
         }
     }
 
@@ -2353,5 +2397,178 @@ mod removal_cascade_tests {
         assert!(pool.is_transaction_in_pool(&hashes[0]));
         assert!(!pool.is_transaction_in_pool(&hashes[1]));
         assert!(pool.is_transaction_in_pool(&hashes[2]));
+    }
+}
+
+#[cfg(test)]
+mod orphan_eviction_tests {
+    use super::*;
+
+    use core::cell::Cell;
+    use dcroxide_wire::{TX_TREE_REGULAR, TxIn, TxOut};
+
+    /// A chain backend answering only the two injected questions the
+    /// orphan limiter asks, with the random draw under the test's
+    /// control.
+    struct DrawChain {
+        draw: Cell<u64>,
+    }
+
+    impl PoolChain for DrawChain {
+        fn next_stake_difficulty(&self) -> Result<i64, String> {
+            unimplemented!()
+        }
+        fn fetch_utxo_view(
+            &self,
+            _tx: &MsgTx,
+            _tx_hash: &Hash,
+            _tree: i8,
+            _tree_valid: bool,
+        ) -> Result<UtxoView, String> {
+            unimplemented!()
+        }
+        fn best_hash(&self) -> Hash {
+            unimplemented!()
+        }
+        fn best_height(&self) -> i64 {
+            unimplemented!()
+        }
+        fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
+            unimplemented!()
+        }
+        fn past_median_time(&self) -> i64 {
+            unimplemented!()
+        }
+        fn calc_sequence_lock(
+            &self,
+            _tx: &MsgTx,
+            _tx_hash: &Hash,
+            _view: &UtxoView,
+        ) -> Result<SequenceLock, PoolError> {
+            unimplemented!()
+        }
+        fn is_treasury_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_auto_revocations_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_subsidy_split_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_subsidy_split_r2_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn tspend_mined_on_ancestor(&self, _tspend: &Hash) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn standard_verify_flags(&self) -> Result<ScriptFlags, String> {
+            unimplemented!()
+        }
+        fn now_unix(&self) -> i64 {
+            1751800000
+        }
+        fn random_u64(&self) -> u64 {
+            self.draw.get()
+        }
+    }
+
+    /// A distinct orphan whose hash the caller chooses, so the test can
+    /// reason about hash order directly.
+    fn orphan_with_hash(pool: &mut TxPool<DrawChain>, byte: u8) -> Hash {
+        let hash = Hash([byte; 32]);
+        let tx = MsgTx {
+            tx_in: vec![TxIn {
+                previous_out_point: OutPoint {
+                    hash: Hash([0xee; 32]),
+                    index: u32::from(byte),
+                    tree: TX_TREE_REGULAR,
+                },
+                sequence: 0xffff_ffff,
+                value_in: 0,
+                block_height: 0,
+                block_index: 0,
+                signature_script: Vec::new(),
+            }],
+            tx_out: vec![TxOut {
+                value: 1,
+                version: 0,
+                pk_script: vec![0x51],
+            }],
+            ..Default::default()
+        };
+        pool.add_orphan(&tx, &hash, 0);
+        hash
+    }
+
+    fn pool_capped_at(max_orphan_txs: i64, draw: u64) -> TxPool<DrawChain> {
+        let params = dcroxide_chaincfg::mainnet_params();
+        let policy = Policy {
+            accept_non_std: false,
+            max_orphan_txs,
+            max_orphan_tx_size: 5000,
+            max_sig_ops_per_tx: 1000,
+            min_relay_tx_fee: 10000,
+            allow_old_votes: false,
+            max_vote_age: params.coinbase_maturity,
+            enable_ancestor_tracking: true,
+        };
+        TxPool::new(
+            DrawChain {
+                draw: Cell::new(draw),
+            },
+            policy,
+            &params,
+        )
+    }
+
+    /// The orphan evicted under pressure must be the one the random
+    /// draw selects, not the numerically smallest hash.
+    ///
+    /// dcrd evicts the first entry of a `range` over a Go map, which is
+    /// unpredictable per process.  Reading the first entry of this
+    /// port's `BTreeMap` instead would always evict the smallest hash,
+    /// and an attacker grinds a large hash in milliseconds to make
+    /// their own orphans permanently resident while honest ones churn.
+    /// This pins the draw as the thing that decides.
+    #[test]
+    fn eviction_follows_the_random_draw_not_the_hash_order() {
+        // Four orphans, hashes ascending: 0x01 < 0x02 < 0x03 < 0x04.
+        // The draw selects index 2, so the third-smallest goes.
+        let mut pool = pool_capped_at(4, 2);
+        for byte in 1..=4u8 {
+            orphan_with_hash(&mut pool, byte);
+        }
+        assert_eq!(pool.orphans.len(), 4);
+
+        orphan_with_hash(&mut pool, 5);
+
+        assert_eq!(pool.orphans.len(), 4, "the cap still holds");
+        assert!(
+            !pool.orphans.contains_key(&[3u8; 32]),
+            "the draw selected index 2, so the third-smallest hash must go"
+        );
+        assert!(
+            pool.orphans.contains_key(&[1u8; 32]),
+            "the smallest hash must survive -- evicting it unconditionally is \
+             the grindable behaviour this guards against"
+        );
+    }
+
+    /// Every index the draw can name is reachable, so no orphan is
+    /// structurally immune to eviction.
+    #[test]
+    fn every_orphan_is_reachable_by_some_draw() {
+        for (draw, expected) in [(0u64, 1u8), (1, 2), (2, 3), (3, 4)] {
+            let mut pool = pool_capped_at(4, draw);
+            for byte in 1..=4u8 {
+                orphan_with_hash(&mut pool, byte);
+            }
+            orphan_with_hash(&mut pool, 5);
+            assert!(
+                !pool.orphans.contains_key(&[expected; 32]),
+                "draw {draw} must evict the orphan at that index"
+            );
+        }
     }
 }
