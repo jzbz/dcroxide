@@ -13,9 +13,10 @@
 
 use std::env;
 use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Encode bytes as lowercase hex.
 pub fn hex(b: &[u8]) -> String {
@@ -209,4 +210,229 @@ impl Drop for Oracle {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// The dcrd commit this port is a parity port of.  A dcrd binary built from
+/// anything else is a different specification, so the interop harness below
+/// refuses to run against one.
+pub const DCRD_PARITY_COMMIT: &str = "29f17894";
+
+/// A dcrd process running on simnet, for interop tests over a real socket.
+///
+/// The Go oracle links dcrd's packages in-process, which is the right tool
+/// for comparing function results and cannot test the seam where two
+/// programs talk to each other: version negotiation over TCP, framing across
+/// real reads, and the timing of what each side sends when.  This runs the
+/// actual daemon.
+///
+/// simnet is used because its proof of work is trivial (`PowLimitBits`
+/// `0x207fffff`) and `GenerateSupported` is true, so blocks can be produced
+/// on demand, and because it has no seeders to reach for.
+pub struct DcrdNode {
+    child: Child,
+    /// The P2P address to dial.
+    pub p2p_addr: String,
+    _datadir: TempDir,
+}
+
+impl DcrdNode {
+    /// Spawn dcrd on simnet with a temporary data directory and an
+    /// ephemeral P2P port, waiting until it is listening.
+    ///
+    /// The binary comes from `DCROXIDE_DCRD_BIN`.  It must have been built
+    /// from [`DCRD_PARITY_COMMIT`]: `dcrd --version` reports the VCS
+    /// revision that `debug.ReadBuildInfo` recorded, and this checks it, so
+    /// a release binary or a stale build fails loudly instead of quietly
+    /// testing against the wrong specification.
+    pub fn spawn() -> DcrdNode {
+        DcrdNode::spawn_inner(None)
+    }
+
+    /// Spawn dcrd told to dial `addr` as a persistent peer.
+    ///
+    /// dcrd takes its connect targets at startup, so the listener has to
+    /// exist before the daemon does; this is how the reverse direction (dcrd
+    /// initiating to dcroxide) is exercised without an RPC surface.
+    pub fn spawn_connecting_to(addr: &str) -> DcrdNode {
+        DcrdNode::spawn_inner(Some(addr))
+    }
+
+    fn spawn_inner(connect: Option<&str>) -> DcrdNode {
+        let bin = env::var("DCROXIDE_DCRD_BIN").expect("DCROXIDE_DCRD_BIN must name a dcrd binary");
+        assert_dcrd_revision(&bin);
+
+        let datadir = TempDir::new("dcrd-simnet");
+        let port = free_port();
+        let p2p_addr = format!("127.0.0.1:{port}");
+
+        let mut cmd = Command::new(&bin);
+        cmd.arg("--simnet")
+            .arg(format!("--appdata={}", datadir.path().display()))
+            .arg(format!("--listen={p2p_addr}"))
+            .arg("--norpc")
+            // No seeders: this node talks only to what the test names.
+            .arg("--nodnsseed")
+            .arg("--debuglevel=info");
+        if let Some(addr) = connect {
+            cmd.arg(format!("--connect={addr}"));
+        }
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawning {bin}: {e}"));
+
+        // Wait for the socket rather than for a log line: the log format is
+        // not a stable interface and a bound port is the thing under test.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if TcpStream::connect_timeout(
+                &p2p_addr.parse().expect("valid loopback address"),
+                Duration::from_millis(200),
+            )
+            .is_ok()
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("dcrd did not listen on {p2p_addr} within 30s");
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("dcrd exited before listening: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        DcrdNode {
+            child,
+            p2p_addr,
+            _datadir: datadir,
+        }
+    }
+}
+
+impl Drop for DcrdNode {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Fail unless the binary was built from the parity commit.
+///
+/// dcrd stamps its VCS revision into `--version` through
+/// `debug.ReadBuildInfo`, printing `2.2.0-pre+<revision>`. When that
+/// revision is present it must be the pin: a release binary, or a build from
+/// any other commit, is a different specification and would turn this
+/// harness into a test of the wrong thing.
+///
+/// Go only stamps when it can read the repository, which excludes builds
+/// from a linked git worktree (`.git` there is a file, not a directory) —
+/// those print a bare `2.2.0-pre`. Rather than accept an unidentifiable
+/// binary silently, that case demands `DCROXIDE_DCRD_ALLOW_UNSTAMPED`, so a
+/// local convenience can never become CI's blind spot. CI builds from a
+/// clone and a checkout, which stamps.
+fn assert_dcrd_revision(bin: &str) {
+    let out = Command::new(bin)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|e| panic!("running {bin} --version: {e}"));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let version = text.trim();
+
+    if version.contains(DCRD_PARITY_COMMIT) {
+        return;
+    }
+
+    // A stamped build carries "+<hex revision>" after the version.
+    let stamped = version
+        .split_whitespace()
+        .any(|w| w.contains('+') && w.rsplit('+').next().is_some_and(|r| r.len() >= 8));
+    assert!(
+        !stamped,
+        "dcrd at {bin} reports a VCS revision that is not the parity commit \
+         {DCRD_PARITY_COMMIT}; that is a different specification. Got: {version}"
+    );
+    assert!(
+        env::var_os("DCROXIDE_DCRD_ALLOW_UNSTAMPED").is_some(),
+        "dcrd at {bin} carries no VCS revision ({version}), so it cannot be \
+         confirmed to be the parity commit {DCRD_PARITY_COMMIT}. Build it from \
+         a clone checked out at that commit, or set \
+         DCROXIDE_DCRD_ALLOW_UNSTAMPED to accept an unidentified binary."
+    );
+}
+
+/// An OS-assigned free TCP port.  Racy in principle; the listener is dropped
+/// immediately and dcrd binds within milliseconds.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    listener.local_addr().expect("local addr").port()
+}
+
+/// A directory removed when dropped.
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(prefix: &str) -> TempDir {
+        let mut base = env::temp_dir();
+        let unique = format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        );
+        base.push(unique);
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        TempDir(base)
+    }
+
+    /// The directory path.
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A dcrd node, or `None` when `DCROXIDE_DCRD_BIN` is unset.
+///
+/// Mirrors [`oracle_or_skip`]: absent locally, mandatory in CI.  With
+/// `DCROXIDE_REQUIRE_DCRD` set, a missing binary panics rather than skipping,
+/// so the interop leg cannot silently stop testing anything.
+pub fn dcrd_or_skip() -> Option<DcrdNode> {
+    if env::var_os("DCROXIDE_DCRD_BIN").is_none() {
+        assert!(
+            env::var_os("DCROXIDE_REQUIRE_DCRD").is_none(),
+            "DCROXIDE_REQUIRE_DCRD is set but DCROXIDE_DCRD_BIN names no binary"
+        );
+        eprintln!(
+            "skipping: DCROXIDE_DCRD_BIN unset (set DCROXIDE_REQUIRE_DCRD to make this an error)"
+        );
+        return None;
+    }
+    Some(DcrdNode::spawn())
+}
+
+/// Whether the interop harness can run, applying the same skip-or-fail rule
+/// as [`dcrd_or_skip`] without spawning a node — for tests that must bind a
+/// listener before dcrd starts.
+pub fn dcrd_available() -> bool {
+    if env::var_os("DCROXIDE_DCRD_BIN").is_none() {
+        assert!(
+            env::var_os("DCROXIDE_REQUIRE_DCRD").is_none(),
+            "DCROXIDE_REQUIRE_DCRD is set but DCROXIDE_DCRD_BIN names no binary"
+        );
+        eprintln!(
+            "skipping: DCROXIDE_DCRD_BIN unset (set DCROXIDE_REQUIRE_DCRD to make this an error)"
+        );
+        return false;
+    }
+    true
 }

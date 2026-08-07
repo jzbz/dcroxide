@@ -83,6 +83,53 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
+  dcrd-interop:
+    name: dcrd interop (live socket)
+    runs-on: ubuntu-latest
+    # The Go oracle links dcrd's packages in-process, which cannot test the
+    # seam where two programs talk: negotiation over TCP, framing across real
+    # reads, and who sends what when. This runs the actual daemon.
+    #
+    # One Linux leg deliberately. The value is in the seam, not in repeating
+    # it per OS, and a per-OS matrix would triple the dcrd build for coverage
+    # the unit suites already give on those platforms.
+    env:
+      # dcrd at the parity pin requires Go 1.25; the oracle job pins 1.24.
+      # These are separate toolchains on purpose — the oracle's version is
+      # chosen for the module graph it links, not for building the daemon.
+      DCRD_COMMIT: 29f17894e586d65b34db6c6116a63ce47b8874d9
+      # A missing binary must fail this job rather than skip its tests.
+      DCROXIDE_REQUIRE_DCRD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Cache the dcrd binary
+        id: dcrd-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/dcrd-bin
+          key: dcrd-${{ env.DCRD_COMMIT }}-${{ runner.os }}
+      # Built from a clone at the pinned commit, never a release download: a
+      # release is a different specification. The clone (rather than a
+      # worktree) is what lets Go stamp the VCS revision into --version,
+      # which dcroxide-testutil checks before it will run against the binary.
+      - name: Build dcrd at the parity commit
+        if: steps.dcrd-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --filter=blob:none https://github.com/decred/dcrd.git /tmp/dcrd-src
+          git -C /tmp/dcrd-src checkout --detach "$DCRD_COMMIT"
+          mkdir -p ~/dcrd-bin
+          (cd /tmp/dcrd-src && go build -buildvcs=true -o ~/dcrd-bin/dcrd .)
+          ~/dcrd-bin/dcrd --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Interop tests against a live dcrd
+        run: |
+          export DCROXIDE_DCRD_BIN="$HOME/dcrd-bin/dcrd"
+          cargo test -p dcroxide-node --test dcrd_interop -- --test-threads=1
+
   deny:
     name: cargo-deny (licenses, advisories, sources)
     runs-on: ubuntu-latest
