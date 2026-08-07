@@ -388,7 +388,9 @@ space the allocator holds rather than a packing loss — is the largest
 single component and the least understood. Both it and the flush-bound
 ingest are open and tracked, not fixed. The full measurement record is
 in [ADR-0004](docs/adr/0004-storage-backend.md); PARITY.md records the
-divergence from dcrd's two-database layout.
+divergence from dcrd's two-database layout. Measurements are recorded
+per machine, commit, and corpus in
+[docs/bench-ledger.md](docs/bench-ledger.md).
 
 ## Layout
 
