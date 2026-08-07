@@ -120,6 +120,12 @@ evaluating this code.
   review. Nothing in the tree has been read, and the tree includes the
   elliptic-curve implementations, the TLS stack, and the storage engine
   that this node's key handling and on-disk consensus state rest on.
+  [docs/dependency-ledger.md](docs/dependency-ledger.md) does not close
+  this gap, but it bounds it: the twelve crates that are consensus-
+  observable or touch key material now carry an explicit decision each,
+  so their trust status is stated rather than assumed and a version bump
+  of one of them is a decision rather than a silent lockfile change.
+  Most of those decisions are still "accepted without a read."
 
 ## What this project does instead of a guarantee
 

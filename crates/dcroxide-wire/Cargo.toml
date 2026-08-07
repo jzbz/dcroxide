@@ -11,7 +11,7 @@ repository.workspace = true
 [dependencies]
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-crypto = { path = "../dcroxide-crypto" }
-blake3 = { version = "1", default-features = false }
+blake3 = { version = "1", default-features = false, features = ["pure"] }
 
 [dev-dependencies]
 dcroxide-testutil = { path = "../dcroxide-testutil" }
