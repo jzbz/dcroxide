@@ -18,7 +18,9 @@ use dcroxide_node::peerloop::{
 };
 use dcroxide_node::transport::WireTransport;
 use dcroxide_peer::{Config, MAX_PROTOCOL_VERSION, MsgTransport, Peer, PeerEnv, PeerGlobals};
-use dcroxide_wire::{CurrencyNet, Message, MsgFeeFilter, MsgPing, MsgPong, ServiceFlag};
+use dcroxide_wire::{
+    CurrencyNet, Message, MsgFeeFilter, MsgPing, MsgPong, MsgTx, ServiceFlag, TxOut,
+};
 
 const NET: CurrencyNet = CurrencyNet::TEST_NET3;
 
@@ -461,6 +463,112 @@ fn outbound_queue_is_depth_capped() {
     assert!(
         !queue.try_queue(Message::Ping(MsgPing { nonce: 1 })),
         "try_queue must report a full queue as not queued"
+    );
+}
+
+/// A transaction message whose charge is dominated by one output script
+/// of `script_len` bytes, for driving the queue's byte ceiling without
+/// the 128-message depth cap getting there first.
+fn bulky_tx(script_len: usize) -> Message {
+    let mut tx = MsgTx::default();
+    tx.tx_out.push(TxOut {
+        value: 0,
+        version: 0,
+        pk_script: vec![0; script_len],
+    });
+    Message::Tx(tx)
+}
+
+/// The queue's primary bound is bytes, not messages: the depth cap
+/// alone let a peer that pipelines max-size requests without reading
+/// pin ~46 MB (128 x ~393 KB blocks), so each message is charged its
+/// framed size against `MAX_OUTBOUND_QUEUE_BYTES` on enqueue and
+/// uncharged when the output loop takes it.  Half-megabyte messages
+/// must therefore trip the ceiling long before the 128th slot, and
+/// draining one must make room again — the drop-not-disconnect
+/// semantics are unchanged, only the ceiling is byte-shaped.
+#[test]
+fn outbound_queue_is_byte_capped_before_the_depth_cap() {
+    let (queue, receiver) = OutboundQueue::channel();
+
+    // Fill with ~500 KB transactions until the byte ceiling refuses
+    // one.  The depth cap must play no part: 128 of these would be
+    // ~64 MB, sixteen times the byte budget.
+    let mut queued = 0usize;
+    loop {
+        match queue.queue_message(bulky_tx(500_000)) {
+            Ok(()) => {
+                queued += 1;
+                assert!(
+                    queued < dcroxide_node::peerloop::MAX_OUTBOUND_QUEUE_DEPTH,
+                    "the byte ceiling must trip before the depth cap"
+                );
+            }
+            Err(e) => {
+                assert_eq!(e, QueueError::Full, "a byte-full queue reports Full: {e}");
+                break;
+            }
+        }
+    }
+    assert!(
+        queued >= 2,
+        "the budget must admit several large messages, admitted {queued}"
+    );
+    assert!(
+        queued * 500_000 <= dcroxide_node::peerloop::MAX_OUTBOUND_QUEUE_BYTES,
+        "admitted messages must fit the byte budget, admitted {queued}"
+    );
+
+    // The producers' entry point sees the same refusal.
+    assert!(
+        !queue.try_queue(bulky_tx(500_000)),
+        "try_queue must report a byte-full queue as not queued"
+    );
+
+    // Draining one message releases its charge, so the queue accepts
+    // again — a congested peer that starts reading recovers, exactly
+    // as under the depth cap.
+    match receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(Message::Tx(_)) => {}
+        other => panic!("expected a queued transaction, got {other:?}"),
+    }
+    assert!(
+        queue.try_queue(bulky_tx(500_000)),
+        "draining a message must make room under the byte ceiling"
+    );
+}
+
+/// A message larger than the whole byte budget is admitted into an
+/// empty queue instead of being refused forever: refusing it every time
+/// would wedge the connection on a message the write path is perfectly
+/// able to send (bounded by the write deadline).  No current message
+/// type can exceed the budget — this pins the behavior for any future
+/// one.  While the oversized message is queued the budget still holds:
+/// everything else is refused until it drains.
+#[test]
+fn oversized_message_is_admitted_alone_then_the_budget_holds() {
+    let (queue, receiver) = OutboundQueue::channel();
+
+    let oversized = 2 * dcroxide_node::peerloop::MAX_OUTBOUND_QUEUE_BYTES;
+    assert!(
+        queue.try_queue(bulky_tx(oversized)),
+        "an empty queue must admit a message larger than the budget"
+    );
+
+    // The budget is over-committed, so even a ping is refused.
+    let err = queue
+        .queue_message(Message::Ping(MsgPing { nonce: 7 }))
+        .expect_err("an over-budget queue must refuse further messages");
+    assert_eq!(err, QueueError::Full, "error: {err}");
+
+    // Draining the oversized message releases its whole charge.
+    match receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(Message::Tx(_)) => {}
+        other => panic!("expected the oversized transaction, got {other:?}"),
+    }
+    assert!(
+        queue.try_queue(Message::Ping(MsgPing { nonce: 8 })),
+        "draining the oversized message must restore the budget"
     );
 }
 

@@ -33,7 +33,9 @@ use dcroxide_peer::{
     ArmOutcome, MAX_PROTOCOL_VERSION, MsgTransport, NEGOTIATE_TIMEOUT, Peer, PeerEnv, PeerGlobals,
     STALL_RESPONSE_TIMEOUT, STALL_TICK_INTERVAL, StallDetector, StallReason,
 };
-use dcroxide_wire::{CurrencyNet, Message, MsgPing};
+use dcroxide_wire::{
+    CurrencyNet, MESSAGE_HEADER_SIZE, Message, MsgPing, write_message as wire_write_message,
+};
 
 use crate::peerconn::NodePeerEnv;
 use crate::transport::{WireTransport, WriteStallPolicy};
@@ -375,8 +377,50 @@ fn mix_message_hash(msg: &Message) -> Option<dcroxide_chainhash::Hash> {
 /// refinements that arrive later; this is the plain message queue.
 #[derive(Clone)]
 pub struct OutboundQueue {
-    sender: mpsc::SyncSender<Message>,
+    sender: mpsc::SyncSender<QueuedMessage>,
     state: Arc<OutboundQueueState>,
+}
+
+/// A queued message carrying the byte charge it holds against
+/// [`MAX_OUTBOUND_QUEUE_BYTES`] until the output loop takes it.
+struct QueuedMessage {
+    msg: Message,
+    charge: usize,
+}
+
+/// The draining end of an [`OutboundQueue`].  Every receive releases the
+/// message's byte charge, so the queue's accounting tracks exactly the
+/// messages that are still queued unsent (the one message the output
+/// loop is currently writing is bounded separately, by the write
+/// deadline).
+pub struct OutboundReceiver {
+    inner: mpsc::Receiver<QueuedMessage>,
+    state: Arc<OutboundQueueState>,
+}
+
+impl OutboundReceiver {
+    fn take(&self, queued: QueuedMessage) -> Message {
+        self.state
+            .bytes
+            .fetch_sub(queued.charge, std::sync::atomic::Ordering::Relaxed);
+        queued.msg
+    }
+
+    /// Receive the next queued message, blocking until one is queued or
+    /// every sender is dropped.
+    pub fn recv(&self) -> Result<Message, mpsc::RecvError> {
+        self.inner.recv().map(|q| self.take(q))
+    }
+
+    /// Receive the next queued message, waiting at most `timeout`.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Message, mpsc::RecvTimeoutError> {
+        self.inner.recv_timeout(timeout).map(|q| self.take(q))
+    }
+
+    /// Receive the next queued message without blocking.
+    pub fn try_recv(&self) -> Result<Message, mpsc::TryRecvError> {
+        self.inner.try_recv().map(|q| self.take(q))
+    }
 }
 
 /// The reporting state every clone of an [`OutboundQueue`] shares.
@@ -385,6 +429,15 @@ struct OutboundQueueState {
     /// the connection assembly and left at its placeholder in the unit
     /// tests, which have no socket.
     label: std::sync::OnceLock<String>,
+    /// The framing parameters the byte charge is computed under, set
+    /// once by the connection assembly after the handshake (the queue
+    /// only ever carries session traffic, framed at the negotiated
+    /// version).  The unit tests leave the default, the local maximum
+    /// over mainnet.
+    wire: std::sync::OnceLock<(u32, CurrencyNet)>,
+    /// Bytes charged for the queued-but-unsent messages, against
+    /// [`MAX_OUTBOUND_QUEUE_BYTES`].
+    bytes: std::sync::atomic::AtomicUsize,
     /// Whether a full-queue drop has already been reported since the
     /// last successful enqueue.  A congested peer can otherwise turn
     /// every relayed transaction into a log line, which is its own
@@ -397,9 +450,11 @@ struct OutboundQueueState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueError {
     /// The queue already holds [`MAX_OUTBOUND_QUEUE_DEPTH`] unsent
-    /// messages.  The output loop is blocked in a write, so the peer is
-    /// not draining its socket; the message cannot be queued without
-    /// growing the per-peer memory charge without bound.
+    /// messages, or queuing this message would push the unsent bytes
+    /// past [`MAX_OUTBOUND_QUEUE_BYTES`].  The output loop is blocked in
+    /// a write, so the peer is not draining its socket; the message
+    /// cannot be queued without growing the per-peer memory charge
+    /// without bound.
     Full,
     /// The output loop has stopped and dropped the receiver, so the
     /// connection is already tearing down.  This is the ordinary
@@ -434,20 +489,17 @@ impl std::fmt::Display for QueueError {
 ///
 /// dcroxide's original port used `std::sync::mpsc::channel`, which is
 /// unbounded in the channel too, so a peer that stopped reading could
-/// pin unbounded heap.  128 slots caps that.  Against a byte budget the
-/// count is coarse: the largest message this queue carries is a
-/// max-size `MsgHeaders` (2000 headers x 180 bytes ~ 360 KB) or a
-/// max-size `MsgBlock` (~393 KB), so the worst case a peer can force by
-/// pipelining max-size requests without reading is ~46 MB per peer, or
-/// ~5.7 GB at the default `maxpeers` of 125.  That is still an order of
-/// magnitude tighter than dcrd's own 5000-plus-unbounded path, and the
-/// window is bounded by the writer's per-message write deadline: once
-/// the peer stops reading, the first blocked write times out and the
-/// connection is torn down.  Ordinary traffic is nowhere near it — a
-/// relay inv is ~40 bytes and a block announcement ~180 — so a
-/// congested honest peer's queue is well under 100 KB.  A byte-charged
-/// bound would be strictly better and is recorded as follow-up work
-/// rather than smuggled in here.
+/// pin unbounded heap.  128 slots caps that, and
+/// [`MAX_OUTBOUND_QUEUE_BYTES`] charges what the slots actually hold:
+/// against a byte budget the count alone is coarse, since the largest
+/// message this queue carries is a max-size `MsgHeaders` (2000 headers
+/// x 180 bytes ~ 360 KB) or a max-size `MsgBlock` (~393 KB), and 128 of
+/// those is ~46 MB per peer — ~5.7 GB at the default `maxpeers` of 125.
+/// The byte charge is the primary memory bound; the depth stays as the
+/// secondary guard against a flood of tiny messages, and the window is
+/// further bounded by the writer's per-message write deadline: once the
+/// peer stops reading, the first blocked write times out and the
+/// connection is torn down.
 ///
 /// The depth is generous enough that ordinary bursts (a mempool inv
 /// fan-out, a headers response, the initial handshake traffic) never
@@ -456,18 +508,75 @@ impl std::fmt::Display for QueueError {
 /// say what each producer does about it.
 pub const MAX_OUTBOUND_QUEUE_DEPTH: usize = 128;
 
+/// The bytes that may sit unsent in a peer's outbound queue, charged at
+/// each message's framed size (header plus encoded payload).
+///
+/// Like the depth above this is a deliberate hardening choice with no
+/// dcrd counterpart — dcrd's `queueHandler` buffers without bound.  The
+/// charge is computed on enqueue and released when the output loop takes
+/// the message: exact arithmetic for the two messages that dominate any
+/// real queue (`MsgBlock` and `MsgTx`, whose ported `serialize_size`
+/// methods are cheap), and one measuring serialization for everything
+/// else, whose sizes are control-plane small (the extra encode never
+/// touches the block-serving hot path).
+///
+/// 4 MiB caps the pipelining worst case near ~500 MiB across a full
+/// default peer set — down from ~5.7 GB under the count bound alone —
+/// while staying far above honest traffic: a congested honest peer's
+/// queue is well under 100 KB (a relay inv is ~40 bytes, a block
+/// announcement ~180), and the serve path holds at most dcrd's
+/// `maxPendingSend` (3) getdata items at a time, ~1.2 MB of blocks.  A
+/// message larger than the whole budget — none exists today — is
+/// admitted into an empty queue rather than wedging the connection.
+pub const MAX_OUTBOUND_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
+/// The byte charge for a message: its framed wire size under the
+/// queue's negotiated parameters.  `MsgBlock` and `MsgTx` take the
+/// arithmetic path (their `serialize_size` is a ported dcrd
+/// `SerializeSize`, exact by upstream's own tests); every other message
+/// is measured by framing it once, which is exact and cheap at
+/// control-plane sizes.  A message the codec refuses to frame is
+/// charged the header alone — the output loop's write will surface the
+/// same error and tear the connection down.
+fn message_charge(msg: &Message, pver: u32, net: CurrencyNet) -> usize {
+    match msg {
+        Message::Block(block) => MESSAGE_HEADER_SIZE.saturating_add(block.serialize_size()),
+        Message::Tx(tx) => MESSAGE_HEADER_SIZE.saturating_add(tx.serialize_size()),
+        _ => wire_write_message(msg, pver, net)
+            .map(|frame| frame.len())
+            .unwrap_or(MESSAGE_HEADER_SIZE),
+    }
+}
+
 impl OutboundQueue {
     /// Create an outbound queue and the receiver its output loop drains.
-    pub fn channel() -> (OutboundQueue, mpsc::Receiver<Message>) {
+    pub fn channel() -> (OutboundQueue, OutboundReceiver) {
         let (sender, receiver) = mpsc::sync_channel(MAX_OUTBOUND_QUEUE_DEPTH);
+        let state = Arc::new(OutboundQueueState {
+            label: std::sync::OnceLock::new(),
+            wire: std::sync::OnceLock::new(),
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            reported_full: std::sync::atomic::AtomicBool::new(false),
+        });
         let queue = OutboundQueue {
             sender,
-            state: Arc::new(OutboundQueueState {
-                label: std::sync::OnceLock::new(),
-                reported_full: std::sync::atomic::AtomicBool::new(false),
-            }),
+            state: Arc::clone(&state),
         };
-        (queue, receiver)
+        (
+            queue,
+            OutboundReceiver {
+                inner: receiver,
+                state,
+            },
+        )
+    }
+
+    /// Set the framing parameters the byte charge is computed under —
+    /// the negotiated protocol version and the network — so the charge
+    /// matches what the write transport will actually frame.  The first
+    /// call wins.
+    pub fn set_wire_params(&self, pver: u32, net: CurrencyNet) {
+        let _ = self.state.wire.set((pver, net));
     }
 
     /// Name the peer this queue feeds, so a congestion report identifies
@@ -484,13 +593,36 @@ impl OutboundQueue {
 
     /// Queue a message to be sent to the peer.
     ///
-    /// [`QueueError::Full`] means the peer is not draining its socket
+    /// [`QueueError::Full`] means the peer is not draining its socket —
+    /// either ceiling, [`MAX_OUTBOUND_QUEUE_DEPTH`] messages or
+    /// [`MAX_OUTBOUND_QUEUE_BYTES`] charged bytes, refuses the message —
     /// and the message was **not** queued; the caller must decide what
     /// that means for its own state, and in particular must not record
     /// the message as sent.  [`QueueError::Closed`] means the output
     /// loop already stopped, which is the ordinary teardown path.
     pub fn queue_message(&self, msg: Message) -> Result<(), QueueError> {
-        match self.sender.try_send(msg) {
+        let (pver, net) = self
+            .state
+            .wire
+            .get()
+            .copied()
+            .unwrap_or((MAX_PROTOCOL_VERSION, CurrencyNet::MAIN_NET));
+        let charge = message_charge(&msg, pver, net);
+        // Charge first, then admit: concurrent producers may briefly
+        // over-count, which errs on the refusing side.  An empty queue
+        // admits any single message so an oversized one cannot wedge
+        // the connection by being refused forever.
+        let prev = self
+            .state
+            .bytes
+            .fetch_add(charge, std::sync::atomic::Ordering::Relaxed);
+        if prev > 0 && prev.saturating_add(charge) > MAX_OUTBOUND_QUEUE_BYTES {
+            self.state
+                .bytes
+                .fetch_sub(charge, std::sync::atomic::Ordering::Relaxed);
+            return Err(QueueError::Full);
+        }
+        match self.sender.try_send(QueuedMessage { msg, charge }) {
             Ok(()) => {
                 // Room again: re-arm the congestion report so the next
                 // episode is logged.
@@ -499,8 +631,18 @@ impl OutboundQueue {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
-            Err(mpsc::TrySendError::Full(_)) => Err(QueueError::Full),
-            Err(mpsc::TrySendError::Disconnected(_)) => Err(QueueError::Closed),
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.state
+                    .bytes
+                    .fetch_sub(charge, std::sync::atomic::Ordering::Relaxed);
+                Err(QueueError::Full)
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.state
+                    .bytes
+                    .fetch_sub(charge, std::sync::atomic::Ordering::Relaxed);
+                Err(QueueError::Closed)
+            }
         }
     }
 
@@ -535,11 +677,12 @@ impl OutboundQueue {
         {
             return;
         }
+        let unsent_kib = self.state.bytes.load(std::sync::atomic::Ordering::Relaxed) / 1024;
         crate::logging::warn(
             "PEER",
             &format!(
-                "Outbound queue for peer {} is full ({MAX_OUTBOUND_QUEUE_DEPTH} messages \
-                 unsent) -- dropping {command}",
+                "Outbound queue for peer {} is full ({unsent_kib} KiB in at most \
+                 {MAX_OUTBOUND_QUEUE_DEPTH} unsent messages) -- dropping {command}",
                 self.peer_label()
             ),
         );
@@ -553,7 +696,7 @@ pub fn run_peer_output<T, E>(
     peer: &Mutex<Peer>,
     transport: &mut T,
     env: &mut E,
-    outbound: mpsc::Receiver<Message>,
+    outbound: OutboundReceiver,
 ) -> DisconnectReason
 where
     T: MsgTransport,
@@ -574,7 +717,7 @@ pub fn run_peer_output_with_stall<T, E>(
     peer: &Mutex<Peer>,
     transport: &mut T,
     env: &mut E,
-    outbound: mpsc::Receiver<Message>,
+    outbound: OutboundReceiver,
     stall: Option<&Mutex<StallDetector>>,
 ) -> DisconnectReason
 where
@@ -943,8 +1086,11 @@ where
     // handshake).
     let peer = Arc::new(Mutex::new(peer));
     let (outbound, receiver) = OutboundQueue::channel();
-    // Name the queue so a congestion report identifies the peer.
+    // Name the queue so a congestion report identifies the peer, and
+    // frame its byte charges at the negotiated version the write
+    // transport uses.
     outbound.set_peer_label(peer.lock().expect("peer mutex poisoned").addr().to_string());
+    outbound.set_wire_params(negotiated_pver, net);
     // The queue is empty here, so this cannot fail with
     // [`QueueError::Full`]; a failure is a closed queue.
     if outbound.queue_message(Message::SendHeaders).is_err() {
