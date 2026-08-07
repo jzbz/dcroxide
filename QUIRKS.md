@@ -51,7 +51,7 @@ Entry format:
   bug, as it does every observable dcrd behaviour.
 - **Status:** retired. dcrd fixed it in `d11ae7af` ("mixpool: Properly
   calculate session expiry"), which is not in `release-v2.1.5` but is in
-  the current parity target `452c1a6c`: the fold moved inside the loop
+  the `452c1a6c` parity target: the fold moved inside the loop
   over `ke.SeenPRs`, taking the running minimum of `pr.Expires()` over
   the referenced pair requests that are actually known. `accept_ke` now
   does the same, so this is no longer a quirk in either direction — it

@@ -21,9 +21,9 @@ than rewriting what was decided. Use [template.md](template.md).
   gates final ratification, and each now carries a dated addendum recording
   what shipped: D2 and D4 diverged from their drafts, D3 did not. Ratifying
   them, or superseding them, is the project owner's call.
-- **D5** — Upstream tracking cadence. The port has followed dcrd master once
-  (`release-v2.1.5` → `452c1a6c`, version 2.2.0-pre); the standing cadence is
-  still undecided
+- **D5** — Upstream tracking cadence. The port has followed dcrd master twice
+  (`release-v2.1.5` → `452c1a6c` → `29f17894`, version 2.2.0-pre); the
+  standing cadence is still undecided
 - **D6** — dcr-rs relationship (upstream vs. fork) — partially covered by ADR-0002
 - **D7** — MSRV, platform tiers, release signing/reproducibility (MSRV
   currently 1.94 via workspace `rust-version`; formal ADR pending)
