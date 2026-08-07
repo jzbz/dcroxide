@@ -11,7 +11,8 @@
 //! address a peer is associated with.
 //!
 //! With these in hand a [`Peer`](dcroxide_peer::Peer) negotiates the
-//! version exchange straight over a [`WireTransport`]; the verack
+//! version exchange straight over a
+//! [`WireTransport`](crate::transport::WireTransport); the verack
 //! exchange and the steady-state message loops arrive with the per-peer
 //! loop piece.
 

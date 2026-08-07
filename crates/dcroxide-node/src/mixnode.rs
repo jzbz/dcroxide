@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! The daemon's seams for the ported mixing pool (dcrd's `mixpool.Pool`
-//! wired into `server.go`).  [`NodeMixChain`] and [`NodeMixUtxoFetcher`]
+//! wired into `server.go`).  [`NodeMixChain`] and `NodeMixUtxoFetcher`
 //! adapt the shared chain to the pool's `BlockChain` and UTXO-fetch
 //! interfaces, [`shared_mix_pool`] builds the pool the daemon shares
 //! between the getdata serve path and the netsync manager, and

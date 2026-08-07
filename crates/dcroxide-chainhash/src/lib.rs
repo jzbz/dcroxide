@@ -2,7 +2,7 @@
 //! The Decred chain hash type, mirroring dcrd's `chaincfg/chainhash` package
 //! (module version v1.0.5, as pinned by dcrd release-v2.1.5).
 //!
-//! A [`Hash`] is 32 bytes stored in "natural" (internal) byte order and
+//! A [`Hash`](struct@Hash) is 32 bytes stored in "natural" (internal) byte order and
 //! displayed/parsed as the hexadecimal string of the *byte-reversed* value,
 //! exactly like dcrd (and Bitcoin) block/transaction hashes.
 //!
@@ -20,7 +20,7 @@
 use core::fmt;
 use core::str::FromStr;
 
-/// The size of a [`Hash`] in bytes.
+/// The size of a [`Hash`](struct@Hash) in bytes.
 pub const HASH_SIZE: usize = 32;
 
 /// The maximum length of a hash string (`HASH_SIZE * 2`).
@@ -181,7 +181,7 @@ pub fn hash_b(b: &[u8]) -> [u8; HASH_SIZE] {
     dcroxide_crypto::blake256::sum256(b)
 }
 
-/// BLAKE-256 of `b` as a [`Hash`] (dcrd `chainhash.HashH`).
+/// BLAKE-256 of `b` as a [`Hash`](struct@Hash) (dcrd `chainhash.HashH`).
 pub fn hash_h(b: &[u8]) -> Hash {
     Hash(dcroxide_crypto::blake256::sum256(b))
 }

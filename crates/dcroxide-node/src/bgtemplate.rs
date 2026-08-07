@@ -8,7 +8,7 @@
 //!
 //! dcrd's concurrency shell has no synchronous counterpart, so this
 //! thread reconstructs it: the `regenEvent` queue is an mpsc channel
-//! ([`GenCommand`]), the regen handler goroutine is the thread's
+//! (`GenCommand`), the regen handler goroutine is the thread's
 //! `recv_timeout` loop, the four `time.After`/`time.Timer` timeouts are
 //! absolute [`Instant`] deadlines reconciled from the state machine's
 //! armed flags after every mutation, and the asynchronous

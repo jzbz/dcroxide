@@ -1,0 +1,123 @@
+# Operating dcroxide
+
+Read [SECURITY.md](../SECURITY.md) first. **This node is pre-alpha: do
+not expose it to the internet and do not use it with funds.** Use
+[dcrd](https://github.com/decred/dcrd) for anything that matters. What
+follows is for people running it deliberately anyway — on a private
+network, against testnet or simnet, or to reproduce a measurement.
+
+The operator-facing requirements are collected here because two of them
+are traps: the node **must** run under a supervisor, and it **cannot**
+adopt a dcrd data directory.
+
+## A supervisor is required, not recommended
+
+Release builds set `panic = "abort"`. A panic terminates the process
+instead of unwinding, so **any reachable panic is an outage until
+something restarts the node**. This is deliberate — Rust mutexes poison
+on panic where Go's do not, so a panic that unwound would leave the
+daemon wedged behind poisoned locks while the RPC layer kept answering
+canned errors and looking healthy. Aborting is loud instead of silent,
+and loud is what a consensus daemon wants. The full reasoning is in
+`[profile.release]` in the workspace `Cargo.toml`, and a test fails if
+the setting is dropped.
+
+The consequence is an operational requirement: run it under something
+that restarts it. A systemd unit needs at least
+
+```ini
+Restart=on-failure
+RestartSec=5s
+```
+
+Anything equivalent works — a supervisor, a container restart policy,
+runit. A node run by hand from a shell will simply stop on the first
+panic.
+
+Pair it with a memory limit. A websocket client that subscribes and then
+stops reading grows node memory without bound; the notification queues
+are unbounded exactly as dcrd's are, so nothing is dropped or reordered
+and the whole cost is paid in memory. That is not reachable without RPC
+credentials, but a `MemoryMax=` (or the container equivalent) plus the
+restart policy above bounds the damage from a subscriber you do not
+control.
+
+## Fresh sync only — a dcrd data directory will not work
+
+dcroxide does not read dcrd's on-disk format. There is no migration from
+an existing dcrd data directory, and pointing it at one is not a
+supported configuration. Syncing from genesis is the accepted default
+(ADR-0004's C6 stance); `addblock`-format import is the bulk path when
+you already have the blocks.
+
+Budget for it: initial block download runs about **2.2x slower than
+dcrd** — roughly 2.5 hours against dcrd's 1.1 for mainnet from genesis on
+the machine in [bench-ledger.md](bench-ledger.md) — and the chain costs
+more on disk, 32.06 GiB against dcrd's 23.73 GiB at the same tip. Both
+numbers are measured, tracked, and attributed to the storage engine's
+commit shape rather than to validation; see
+[ADR-0004](adr/0004-storage-backend.md).
+
+## Identity: paths, files, and environment
+
+dcroxide uses its own identity throughout. Nothing falls back to a
+`dcrd` path or a `DCRD_*` variable — if you are migrating a
+configuration, every name changes.
+
+| | dcroxide | dcrd |
+|---|---|---|
+| data directory (Linux) | `~/.dcroxide` | `~/.dcrd` |
+| data directory (macOS) | `~/Library/Application Support/Dcroxide` | `…/Dcrd` |
+| data directory (Windows) | `%LOCALAPPDATA%\Dcroxide` | `…\Dcrd` |
+| configuration file | `dcroxide.conf` | `dcrd.conf` |
+| data directory override | `--appdata`, `DCROXIDE_APPDATA` | `DCRD_APPDATA` |
+| extra TLS DNS names | `DCROXIDE_ALT_DNSNAMES` | `DCRD_ALT_DNSNAMES` |
+
+Those two environment variables are the only ones read. Everything else
+is a command-line flag or a `dcroxide.conf` entry, and the flag set is a
+verbatim port of dcrd's — same names, same semantics, same help text.
+
+The daemon generates `rpc.cert` and `rpc.key` in the data directory on
+first start if they are absent, owner-readable only. Back up or replace
+them the way you would dcrd's; a client that pinned dcrd's certificate
+needs the new one.
+
+Default ports are dcrd's, unchanged: mainnet 9108 (P2P) and 9109 (RPC).
+
+## Running it
+
+Build from source. Binaries are not published, and the release process —
+signing, platform tiers, reproducibility — is an open decision (D7 in
+[the ADR index](adr/README.md)); it is a hard gate before anything ships
+as a binary.
+
+```bash
+cargo build --release
+```
+
+The release profile is deliberate: one codegen unit, thin LTO, line
+tables kept for profiling, and the `panic = "abort"` discussed above.
+The toolchain is pinned in `rust-toolchain.toml` so artifacts are
+reproducible from the same source.
+
+Start it against simnet or testnet rather than mainnet while evaluating:
+
+```bash
+./target/release/dcroxide --testnet --appdata=/path/outside/the/repo
+```
+
+`--norpc` disables the RPC and websocket surfaces entirely, which is the
+right default if you only want a syncing node — it removes the entire
+authenticated surface from the process.
+
+## Status of what you are running
+
+Per-package parity status is in [PARITY.md](../PARITY.md), which also
+records every deliberate divergence from dcrd and the known remaining
+gaps. Bug-for-bug reproductions of dcrd behavior — the ones that look
+like defects and are not — are catalogued in [QUIRKS.md](../QUIRKS.md).
+
+There is no per-RPC-method status ledger yet. It is planned alongside
+the ecosystem-acceptance work (the `dcrdtest` harness, a `dcrctl`
+sweep, dcrwallet integration), none of which has been run; the project
+brief tracks that as unmet.

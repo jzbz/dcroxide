@@ -166,7 +166,7 @@ impl PoolChain for NodePoolChain {
 
     /// The unspent view for the transaction's inputs and its own
     /// outputs from the tip's point of view
-    /// ([`chain_fetch_utxo_view`]; the pool's votes disapproving the
+    /// (`chain_fetch_utxo_view`; the pool's votes disapproving the
     /// tip's regular tree is the unset flag).
     fn fetch_utxo_view(
         &self,
@@ -267,7 +267,7 @@ impl PoolChain for NodePoolChain {
     }
 
     /// The script verification flags for standardness
-    /// ([`chain_standard_verify_flags`]).
+    /// (`chain_standard_verify_flags`).
     fn standard_verify_flags(&self) -> Result<ScriptFlags, String> {
         chain_standard_verify_flags(&self.locked(), &self.params)
     }

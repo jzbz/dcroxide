@@ -1032,7 +1032,7 @@ impl RpcListener {
     /// The pre-authentication budget: the nominal number of such
     /// connections, past which admitting a new one disconnects the
     /// oldest, and the absolute ceiling past which a new connection is
-    /// refused outright.  See [`PreAuthGate`].
+    /// refused outright.  See `PreAuthGate`.
     pub fn pre_auth_budget(&self) -> (usize, usize) {
         (self.pre_auth.soft, self.pre_auth.hard)
     }

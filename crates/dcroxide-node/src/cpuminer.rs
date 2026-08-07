@@ -17,7 +17,7 @@
 //! `hashes_per_second` reads the live rate over a request/reply channel.
 //!
 //! The mutual-exclusion state — dcrd's `normalMining`/`discreteMining`
-//! pair — lives in one [`MiningMode`] behind one lock, mirroring the
+//! pair — lives in one `MiningMode` behind one lock, mirroring the
 //! `sync.Mutex` dcrd's `CPUMiner` embeds and holds across each whole
 //! check-and-set.  A long `generate N` no longer stalls unrelated RPCs:
 //! the lock is released before the mining loop runs.

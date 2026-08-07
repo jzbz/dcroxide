@@ -257,7 +257,7 @@ pub fn calc_signature_hash_checked(
     calc_signature_hash(script, hash_type, tx, idx)
 }
 
-/// Convenience wrapper returning the sighash as a [`Hash`].
+/// Convenience wrapper returning the sighash as a [`Hash`](struct@Hash).
 pub fn calc_signature_hash_as_hash(
     script: &[u8],
     hash_type: SigHashType,

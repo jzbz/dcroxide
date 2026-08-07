@@ -3282,7 +3282,7 @@ const CHECK_FOR_DUPLICATE_HASHES: bool = false;
 
 /// Prevent duplicate transaction hashes from overwriting unspent
 /// outputs (dcrd `checkDupTxs`); a no-op at this dcrd version per
-/// [`CHECK_FOR_DUPLICATE_HASHES`].
+/// `CHECK_FOR_DUPLICATE_HASHES`.
 pub fn check_dup_txs<'a>(
     txs: &[MsgTx],
     lookup_entry: impl Fn(&OutPoint) -> Option<&'a crate::UtxoEntry>,

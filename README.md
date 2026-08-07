@@ -38,7 +38,10 @@ consensus validation, and syncs against dcrd in both directions (see
 dcrd's across the whole chain; it does not say the node is safe to
 operate. **Do not expose it to the internet and do not use it with
 funds** — see [SECURITY.md](SECURITY.md) for what is known to be
-missing and how to report a vulnerability. Currently implemented:
+missing and how to report a vulnerability, and
+[docs/operating.md](docs/operating.md) for what running it deliberately
+requires (a supervisor is mandatory, and a dcrd data directory will not
+work). Currently implemented:
 
 - `dcroxide-crypto` — BLAKE-256 (vendored from
   [dcr-rs](https://github.com/jzbz/dcr-rs), KAT-pinned, differential-tested

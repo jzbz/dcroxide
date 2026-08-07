@@ -165,7 +165,7 @@ impl TemplateChain for NodeTemplateChain {
 
     /// The unspent view for the transaction's inputs and its own
     /// outputs from the tip's point of view
-    /// ([`chain_fetch_utxo_view`], the same `BlockChain.FetchUtxoView`
+    /// (`chain_fetch_utxo_view`, the same `BlockChain.FetchUtxoView`
     /// dcrd wires into its mempool config).
     fn fetch_utxo_view(
         &self,
@@ -298,7 +298,7 @@ impl TemplateChain for NodeTemplateChain {
     }
 
     /// The script verification flags for the next block
-    /// ([`chain_standard_verify_flags`], the same
+    /// (`chain_standard_verify_flags`, the same
     /// `standardScriptVerifyFlags` dcrd wires into its mempool
     /// config).
     fn standard_verify_flags(&self) -> Result<ScriptFlags, String> {
