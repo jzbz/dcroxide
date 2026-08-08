@@ -273,10 +273,35 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
         None => 100,
     };
 
-    // Observations accumulate in memory and are written once at the end:
-    // the observer runs on the flushing thread with the cache lock held,
-    // so it must not touch the filesystem.
-    let flush_records: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // Observations go out over a channel to a writer thread, which appends
+    // and flushes each line as it arrives.
+    //
+    // Not accumulated until the end, and not written from the observer
+    // either. The observer runs on the flushing thread with the cache lock
+    // held, so it must not block on a syscall; but buffering the whole run
+    // in memory loses all of it when the run is interrupted, which a replay
+    // long enough to be worth measuring frequently is. A channel send is
+    // neither.
+    let (flush_tx, flush_rx) = std::sync::mpsc::channel::<String>();
+    let writer = match &flush_log {
+        Some(path) => {
+            let file = std::fs::File::create(path)
+                .map_err(|e| format!("unable to create {}: {e}", path.display()))?;
+            Some(std::thread::spawn(move || -> std::io::Result<u64> {
+                let mut out = BufWriter::new(file);
+                let mut count = 0u64;
+                for line in flush_rx {
+                    writeln!(out, "{line}")?;
+                    // Flushed per record so an interrupted run keeps every
+                    // observation it managed to produce.
+                    out.flush()?;
+                    count = count.saturating_add(1);
+                }
+                Ok(count)
+            }))
+        }
+        None => None,
+    };
     let db = {
         let db_path = workdir.join("blocks_ffldb");
         std::fs::create_dir_all(&db_path)
@@ -285,14 +310,16 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
         opts.cache_max_size = meta_cache_mib.saturating_mul(1024 * 1024);
         if flush_log.is_some() {
             opts.flush_stats_every = stats_every;
-            let sink = Arc::clone(&flush_records);
+            let sink = flush_tx.clone();
             opts.flush_observer = Some(Arc::new(
                 move |obs: &dcroxide_database::FlushObservation| {
                     let stats = obs
                         .stats
                         .map(|s| s.to_json())
                         .unwrap_or_else(|| "null".to_string());
-                    sink.lock().expect("flush log poisoned").push(format!(
+                    // A closed receiver means the writer is gone; a lost
+                    // log line is not worth failing the replay over.
+                    let _ = sink.send(format!(
                         "{{\"flush\":{},\"dirty_entries\":{},\"dirty_bytes\":{},\"elapsed_ms\":{:.3},\"stats\":{}}}",
                         obs.sequence,
                         obs.dirty_entries,
@@ -390,21 +417,19 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
         peak_rss_kib() / 1024,
     );
 
-    if let Some(path) = flush_log {
-        let records = flush_records.lock().expect("flush log poisoned");
-        let mut out = BufWriter::new(
-            std::fs::File::create(&path)
-                .map_err(|e| format!("unable to create {}: {e}", path.display()))?,
-        );
-        for line in records.iter() {
-            writeln!(out, "{line}").map_err(|e| format!("writing flush log: {e}"))?;
+    if let Some(writer) = writer {
+        // The observer holds the only other sender and lives inside the
+        // database the chain owns, so the writer's loop cannot end until
+        // the chain is dropped.
+        drop(chain);
+        drop(flush_tx);
+        let count = writer
+            .join()
+            .map_err(|_| "flush log writer panicked".to_string())?
+            .map_err(|e| format!("writing flush log: {e}"))?;
+        if let Some(path) = flush_log {
+            println!("wrote {count} flush records to {}", path.display());
         }
-        out.flush().map_err(|e| format!("writing flush log: {e}"))?;
-        println!(
-            "wrote {} flush records to {}",
-            records.len(),
-            path.display()
-        );
     }
     Ok(())
 }
