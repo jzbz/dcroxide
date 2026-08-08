@@ -341,3 +341,61 @@ the observer attached to a replay, which is now possible and was not before.
 Sampling is not free and perturbs slightly: `stats()` walks every branch and
 leaf page (~1m53s on this tree) and requires a write transaction, so each
 flush here cost ~206 s and each measurement takes a fresh clone.
+
+## Addendum, 2026-08-08 — free pages under sync churn are a sawtooth
+
+The previous addendum closed lever (a) but scoped its claim narrowly: the
+probe applied scattered inserts, where a sync also frees pages through
+updates and deletes, over far more flushes. The observer has now been
+attached to a replay — 250,000 mainnet blocks, 1,925,867 regular
+transactions, full validation, the production 100 MiB overlay ceiling, with
+the decomposition sampled on every one of the 17 flushes.
+
+Free pages neither stair-step nor ratchet. They oscillate, by nearly the
+size of the file:
+
+| flush | free MiB | live MiB | free/alloc | fill |
+|---:|---:|---:|---:|---:|
+| 1 | 0.0 | 105.4 | 0.00 | 0.6222 |
+| 4 | 24.9 | 317.5 | 0.05 | 0.6263 |
+| 5 | 334.2 | 415.7 | 0.51 | 0.6311 |
+| 7 | 49.5 | 595.5 | 0.05 | 0.6328 |
+| 8 | 994.3 | 673.4 | **0.96** | 0.6335 |
+| 12 | 657.0 | 953.3 | 0.48 | 0.6360 |
+| 16 | 352.5 | 1190.7 | 0.21 | 0.6311 |
+
+A commit frees a large batch — flush 8 held 945 MiB more than flush 7 — and
+the following commits draw it back down, at about 80 MiB consumed per flush
+against 65 MiB of live tree added, until the next spike. Across the run free
+pages ranged from **0.0% to 96.2% of the allocated file**.
+
+**What this costs the amendment's table.** The 4.69 GiB of free pages
+recorded at mainnet tip is 32.4% of that file — squarely inside the range
+this run sweeps through repeatedly. It is one sample of an oscillation, taken
+wherever the sync happened to stop. Stopping a few commits earlier or later
+would have recorded a materially different figure and therefore a different
+decomposition. The free-page row is not a stable property of the store, and
+the 8.33 GiB metadata gap should not be attributed against it as though it
+were. That is a sharper statement than the previous addendum's "may simply be
+a high-water mark," and it points the same way: nothing in the layers above
+the engine recovers this, because there is no steady quantity there to
+recover.
+
+**What is stable is the fill.** Across the whole run it moved between 0.6169
+and 0.6360 — a spread of 0.019 — while the live tree grew from 105 MiB to
+1.19 GiB, and mainnet tip sits at 0.6486 on a tree eight times larger again.
+Page fill is a structural constant of this B-tree near 63-65%, which makes
+the roughly 35% of the live tree spent on intra-page slack — 3.44 GiB at
+tip — the durable and genuinely attributable target. Any storage work should
+be scored against slack and against commit cost, not against free pages.
+
+**Commit cost, measured on one monotonic run.** Throughput fell from 745
+blk/s over the first 50,000 blocks to 324 by block 200,000, and the full
+mainnet sync on a far larger tree ran at 124. Flush duration rose with the
+tree over the same run, 630 ms to 2,973 ms for comparable dirty sets. This is
+the copy-on-write signature the amendment inferred from two separate syncs,
+now visible within a single one.
+
+Note also what a genesis slice cannot stand in for: this run averaged 445
+blk/s where the real sync managed 124. Slices are informative about shape and
+misleading about magnitude.

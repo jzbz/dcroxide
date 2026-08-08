@@ -96,3 +96,19 @@ in what is held open across the flushes.
 
 Each sampled flush costs about 206 s here, roughly half of it the
 `stats()` tree walk, so a three-arm run is around an hour.
+
+## Flush curves under replay (`dcroxide-bench replay --flushlog`)
+
+Free-page behaviour under real sync churn — updates and deletes, not the
+synthetic inserts pinprobe applies.
+
+| date | machine | dcroxide commit | workload | flushes | result |
+|---|---|---|---|---|---|
+| 2026-08-08 | m1 | `52903af` | 250k mainnet blocks, 1,925,867 regular txs, 100 MiB overlay, `--statsevery 1` | 17 | Free pages are a sawtooth: 0.0 to 994.3 MiB within one run, 0.0% to 96.2% of the allocated file. Spikes are drawn down at ~80 MiB per flush against ~65 MiB of live tree added. Fill ratio is stable at 0.6169-0.6360 while the tree grows 105 MiB to 1.19 GiB. Throughput 745 to 324 blk/s across the run. |
+
+Raw records: `artifacts/dcroxide-bench/m1/replay-flush-all.jsonl`; corpus
+`mainnet-250k.corpus` (2.43 GB, exported from the 2026-07-25 baseline).
+
+The run averaged 445 blk/s where the full mainnet sync managed 124, so
+this slice is informative about curve shape and misleading about
+magnitude.
