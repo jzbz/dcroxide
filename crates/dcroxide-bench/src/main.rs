@@ -32,12 +32,24 @@ Usage:
 
   dcroxide-bench replay --in <file> [--net <name>] [--workdir <dir>]
                         [--assumevalid <hash>] [--max <n>] [--report <n>]
+                        [--flushlog <file>] [--statsevery <n>]
+                        [--metacache <MiB>]
       Replay the corpus into a fresh chain with full live validation,
       reporting throughput every <n> blocks (default 5000).  The work
       directory (default: a fresh directory next to the corpus) must
       not already exist and is left behind for inspection.
 
+      --flushlog writes one JSON line per metadata flush, which is how
+      the free-page curve is read under real sync churn rather than the
+      synthetic inserts pinprobe applies.  --statsevery N takes the full
+      decomposition on every Nth flush (default 25); it walks the whole
+      tree, so sampling too often dominates the run it is measuring.
+      --metacache sets the overlay ceiling in MiB (default 100, the
+      production value).
+
   dcroxide-bench redbstat --appdata <dir> [--net <name>]
+      (--appdata is the node data directory, as for export: the store
+      is read from <dir>/data/<net>/blocks_ffldb.)
       Decompose the metadata store's footprint into payload, redb
       overhead, intra-page slack and free pages, as one JSON object.
 
@@ -251,7 +263,48 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
     let file = std::fs::File::open(&input).map_err(|e| format!("unable to open corpus: {e}"))?;
     let mut r = BufReader::new(file);
 
-    let db = open_db(&workdir, params.net.0, true)?;
+    let flush_log = args.get("flushlog").map(PathBuf::from);
+    let stats_every: u64 = match args.get("statsevery") {
+        Some(v) => v.parse().map_err(|e| format!("bad --statsevery: {e}"))?,
+        None => 25,
+    };
+    let meta_cache_mib: u64 = match args.get("metacache") {
+        Some(v) => v.parse().map_err(|e| format!("bad --metacache: {e}"))?,
+        None => 100,
+    };
+
+    // Observations accumulate in memory and are written once at the end:
+    // the observer runs on the flushing thread with the cache lock held,
+    // so it must not touch the filesystem.
+    let flush_records: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let db = {
+        let db_path = workdir.join("blocks_ffldb");
+        std::fs::create_dir_all(&db_path)
+            .map_err(|e| format!("unable to create database directory: {e}"))?;
+        let mut opts = Options::new(&db_path, params.net.0);
+        opts.cache_max_size = meta_cache_mib.saturating_mul(1024 * 1024);
+        if flush_log.is_some() {
+            opts.flush_stats_every = stats_every;
+            let sink = Arc::clone(&flush_records);
+            opts.flush_observer = Some(Arc::new(
+                move |obs: &dcroxide_database::FlushObservation| {
+                    let stats = obs
+                        .stats
+                        .map(|s| s.to_json())
+                        .unwrap_or_else(|| "null".to_string());
+                    sink.lock().expect("flush log poisoned").push(format!(
+                        "{{\"flush\":{},\"dirty_entries\":{},\"dirty_bytes\":{},\"elapsed_ms\":{:.3},\"stats\":{}}}",
+                        obs.sequence,
+                        obs.dirty_entries,
+                        obs.dirty_bytes,
+                        obs.elapsed.as_secs_f64() * 1000.0,
+                        stats,
+                    ));
+                },
+            ));
+        }
+        Database::create(&opts).map_err(|e| e.to_string())?
+    };
     let mut chain = Chain::open(db, &params, assume_valid, false, now_unix())
         .map_err(|e| format!("unable to initialize chain: {e:?}"))?;
 
@@ -336,13 +389,31 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
         best.height,
         peak_rss_kib() / 1024,
     );
+
+    if let Some(path) = flush_log {
+        let records = flush_records.lock().expect("flush log poisoned");
+        let mut out = BufWriter::new(
+            std::fs::File::create(&path)
+                .map_err(|e| format!("unable to create {}: {e}", path.display()))?,
+        );
+        for line in records.iter() {
+            writeln!(out, "{line}").map_err(|e| format!("writing flush log: {e}"))?;
+        }
+        out.flush().map_err(|e| format!("writing flush log: {e}"))?;
+        println!(
+            "wrote {} flush records to {}",
+            records.len(),
+            path.display()
+        );
+    }
     Ok(())
 }
 
 /// Print the metadata store's footprint decomposition as JSON.
 fn cmd_redbstat(args: &Args) -> Result<(), String> {
-    let data_dir = PathBuf::from(args.require("appdata")?);
-    let (params, _) = net_params(args.get("net").unwrap_or("mainnet"))?;
+    let appdata = PathBuf::from(args.require("appdata")?);
+    let (params, net_dir) = net_params(args.get("net").unwrap_or("mainnet"))?;
+    let data_dir = appdata.join("data").join(net_dir);
     let db = open_db(&data_dir, params.net.0, false)?;
     let stats = db.raw_stats().map_err(|e| e.to_string())?;
     println!("{}", stats.to_json());
@@ -368,8 +439,9 @@ enum Hold {
 /// the curves diverge the reader is the mechanism, and if they coincide it
 /// is not, whatever the mechanism turns out to be.
 fn cmd_pinprobe(args: &Args) -> Result<(), String> {
-    let data_dir = PathBuf::from(args.require("appdata")?);
-    let (params, _) = net_params(args.get("net").unwrap_or("mainnet"))?;
+    let appdata = PathBuf::from(args.require("appdata")?);
+    let (params, net_dir) = net_params(args.get("net").unwrap_or("mainnet"))?;
+    let data_dir = appdata.join("data").join(net_dir);
     let writes: u64 = match args.get("writes") {
         Some(v) => v.parse().map_err(|e| format!("bad --writes: {e}"))?,
         None => 200_000,
@@ -483,7 +555,17 @@ fn main() -> std::process::ExitCode {
         }
         "replay" => Args::parse(
             rest,
-            &["in", "net", "workdir", "assumevalid", "max", "report"],
+            &[
+                "in",
+                "net",
+                "workdir",
+                "assumevalid",
+                "max",
+                "report",
+                "flushlog",
+                "statsevery",
+                "metacache",
+            ],
         )
         .and_then(|a| cmd_replay(&a)),
         "redbstat" => Args::parse(rest, &["appdata", "net"]).and_then(|a| cmd_redbstat(&a)),
