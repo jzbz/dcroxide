@@ -84,3 +84,15 @@ campaign exported.
 
 | date | machine | dcroxide commit | corpus | result | raw run |
 |---|---|---|---|---|---|
+
+## Free-page probes (`dcroxide-bench pinprobe`)
+
+Three arms per experiment, each on its own reflink clone, differing only
+in what is held open across the flushes.
+
+| date | machine | dcroxide commit | workload | arms | result |
+|---|---|---|---|---|---|
+| 2026-08-07 | m1 | `6a2951b` | 400k scattered writes, 8 commits, 8 MiB overlay, mainnet clone | none / all / two | Free-page curves identical. Flushes 1-2 byte-for-byte across all arms; flush 3 differs by 41,782 B (0.0008%) between `all` and `none`, in the direction opposite to pinning. Free pages fell 48.5 MiB while payload grew 20.4 MiB and the file did not grow. ADR-0004 lever (a) closed. |
+
+Each sampled flush costs about 206 s here, roughly half of it the
+`stats()` tree walk, so a three-arm run is around an hour.

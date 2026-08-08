@@ -171,7 +171,9 @@ should be attempted in):
   without an on-disk format change. *Demoted 2026-08-07: the mechanism does
   not hold for the transaction that triggers its own flush, and the cache
   mutex prevents a new reader from straddling one. What is left is a bounded
-  audit of cross-thread read-only transaction lifetimes.*
+  audit of cross-thread read-only transaction lifetimes. **Closed
+  2026-08-07 by measurement** — see the second addendum: a reader held
+  across every flush of a probe run moved free pages by 0.0008%.*
 - **Size redb's read cache against the working set.** Targets flush time,
   not space. A probe on the real tree took a 500k-key insert loop from
   4.3-6.1 s to 1.3-1.5 s by raising the cache from the 1 GiB default to
@@ -286,3 +288,56 @@ them (`lib.rs:365-369`). It has been reflink-cloned to
 `artifacts/dcroxide-bench/m1/baseline-2026-07-25/` (btrfs, 22 s, no
 additional space); the clone is what probes open, and the original is not
 to be touched.
+
+## Addendum, 2026-08-07 (second) — the reader hypothesis is measured dead
+
+The addendum above ruled out the long-lived read transaction by reading
+redb's reclaim logic. `dcroxide-bench pinprobe` now tests it directly, and
+the reading holds.
+
+Three arms, each on its own reflink clone of the mainnet store: 400,000
+scattered writes over 8 commits with an 8 MiB overlay ceiling, sampling the
+full decomposition after every flush. The arms differ only in what is held
+open — nothing, one read transaction for the whole run, or a reader
+spanning exactly two flushes.
+
+| flush | `none` | `all` | `two` |
+|---|---:|---:|---:|
+| 1 | 5,018,687,597 | 5,018,687,597 | 5,018,687,597 |
+| 2 | 5,003,313,221 | 5,003,313,221 | 5,003,313,221 |
+| 3 | 4,967,783,213 | 4,967,741,431 | 4,967,783,213 |
+
+Free-page bytes. The first two flushes agree byte for byte across all three
+arms. At the third, `none` and `two` are still identical and `all` differs
+by 41,782 bytes — 0.0008% of 4.97 GiB, and *fewer* free pages with the
+reader held, which is the opposite of what pinning would produce. A reader
+held across every flush of the run changes nothing measurable. Lever (a) is
+closed.
+
+**What the run says instead.** Free pages fell 48.5 MiB while stored payload
+grew 20,400,020 bytes, and `accounted_bytes` fell by 4.2 MB: the file did
+not grow. redb absorbed 300,000 new rows out of the free pool rather than
+extending the store. That is the behaviour of reusable working space, not
+of retained garbage, and it is the strongest evidence yet for the
+high-water-mark reading — with the consequence that **the largest single
+component of the metadata gap is not recoverable from the layers above the
+engine.**
+
+What remains addressable is smaller than the 8.33 GiB headline: the 3.44 GiB
+of intra-page slack at 64.86% fill, and `existsaddridx`, whose arithmetic
+above caps the recoverable amount near 0.75 GiB at the cost of the
+contiguous ffldb keyspace. A gap that is mostly inherent to a copy-on-write
+B-tree argues for changing the storage shape rather than tuning it — which
+is the conclusion Cuprate reached after three years on a generic key-value
+layer, and the case for specialising by access shape beneath the
+`database/v3` interface rather than for another round of levers.
+
+**Scope of the claim.** This settles the reader question and nothing wider.
+The workload is scattered inserts into a fresh bucket over three flushes; a
+sync performs far more flushes and generates freed pages through updates and
+deletes as well. Characterising free-page behaviour under sync load needs
+the observer attached to a replay, which is now possible and was not before.
+
+Sampling is not free and perturbs slightly: `stats()` walks every branch and
+leaf page (~1m53s on this tree) and requires a write transaction, so each
+flush here cost ~206 s and each measurement takes a fresh clone.
