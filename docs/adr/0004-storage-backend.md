@@ -35,6 +35,48 @@ project brief; fresh sync plus a bulk importer is the accepted default.
   the interface abstraction makes swapping in rocksdb a contained change
   and this ADR gets superseded rather than silently amended.
 
+## Findings as of 2026-08-09 (read this first)
+
+Six dated addenda follow the amendment below, and later ones supersede
+earlier ones — including a retraction. This section states what is currently
+believed and points at the evidence; nothing below it has been rewritten.
+
+**The decomposition is validated.** Replaying the full chain with
+`--addrindex` alone, matching the baseline datadir's composition, reproduces
+it on every metric: live tree 9.82 GiB against 9.79, fill 0.6462 against
+0.6486, free-page share 33.0% against 32.4%. The instrument
+(`dcroxide-bench redbstat`) also reproduces the amendment's original table,
+which a throwaway tool produced. Measurements can be scored against this.
+
+| component | GiB | share | status |
+|---|---:|---:|---|
+| payload | 5.65 | 39.0% | the data itself |
+| redb per-pair and branch overhead | 0.69 | 4.8% | inherent to the engine |
+| **intra-page slack** | **3.44** | **23.7%** | **the target.** Fill sits at 0.62-0.65 across every run, tree size and index configuration, and converges on the real store's value when composition matches |
+| allocated but free pages | 4.69 | 32.4% | attributable and reproducible for a given configuration, but *reused working space* the allocator draws down — not recoverable from any layer above the engine |
+
+**Levers.** (a) *audit long-lived read transactions* — **closed**, measured
+dead: three probe arms differed by 0.0008%, in the direction opposite to
+pinning. (b) *size the read cache* and (c) *decouple flush cadence* — still
+unmeasured; (c) is now adjustable via `Options::cache_max_size` and
+`cache_flush_interval_secs`, which it was not. (d) *shrink the dominant
+buckets* — `existsaddridx` is capped near 0.75 GiB by arithmetic and costs
+the contiguous ffldb keyspace to claim; `spendjournalv3`'s page-size
+hypothesis is untested.
+
+**Commit cost.** 9.4 us per dirty entry at the end of a full un-indexed
+replay against 1.59 at the start — 9.4x over 66x of tree growth. Earlier text
+quotes 4.9x from raw milliseconds; that figure is confounded by dirty-set
+size and should not be used. Of the optional indexes, the transaction index
+carries the write-path cost (23.27 us/entry with both) and the address index
+essentially none (13.70, marginally under un-indexed).
+
+**Two measurement traps, both hit here.** `DatabaseStats::fragmented_bytes`
+is slack *plus* free pages, not a fill figure. And redb's `stats()` walk
+scales with the tree — 5 ms early, 6.6 s at tip — so a timer spanning it
+reports instrument overhead as commit cost; `FlushObservation` separates the
+two.
+
 ## Amendment, 2026-07-26 — write-load validation (gate resolved)
 
 The Phase 7/8 write-load gate has been run at mainnet scale. redb sustains
@@ -105,6 +147,8 @@ snappy on for one database, `<datadir>/feesdb`, which is half a megabyte.)
 The live B-tree is 9.79 GiB of that, giving a **page fill of 64.86%** — the
 tree packs reasonably. The single largest component is instead the 4.69 GiB
 of free pages: space the allocator holds and has not returned to the file.
+(What that row means was worked out later: it is reused working space, not
+retained garbage. See the findings section above.)
 
 Beware `DatabaseStats::fragmented_bytes`, which reports 8.13 GiB here and
 looks like a fill figure but is not one. It sums the three trees' intra-page
@@ -138,7 +182,9 @@ now the closing brace of `db_type`), and redb will not return a
 freed page to the allocator past the oldest live read transaction
 (`transaction_tracker.rs:253-261`). A read held across writes therefore pins
 freed pages and the allocator grows the file instead of reusing them. That
-is a hypothesis with a mechanism, not a measurement.
+is a hypothesis with a mechanism, not a measurement. **Superseded:** it was
+subsequently ruled out on the code and then killed by measurement — see the
+2026-08-07 addenda.
 
 Payload by bucket, stored key+value bytes: `spendjournalv3` 2.46 GiB over
 1,100,392 rows; `existsaddridx` 1.55 GiB over 66,495,032 rows (the values
@@ -162,9 +208,9 @@ this crate drives redb rather than at redb itself. Until that is measured,
 the honest position is that some unknown fraction is recoverable in the
 layers above.
 
-Levers, **none implemented and none measured** (and see the 2026-08-07
-addendum, which demotes the first of them and fixes the order the rest
-should be attempted in):
+Levers, **none implemented and none measured** at the time this was written
+(one has since been closed by measurement and another made adjustable — the
+findings section at the top of this file has their current state):
 
 - **Audit long-lived read transactions.** Targets the 4.69 GiB of free
   pages, the largest component, via the mechanism described above. Testable
