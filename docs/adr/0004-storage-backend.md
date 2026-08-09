@@ -479,3 +479,54 @@ without the transaction index. The replayed live tree is 11.56 GiB against
 the synced 9.79. For a size-comparable run, use `--addrindex` alone; the fill
 and per-entry figures above are not sensitive to the difference, the absolute
 tree size obviously is.
+
+## Addendum, 2026-08-09 (second) — retraction: free pages are attributable after all
+
+Replaying the full chain with `--addrindex` alone — matching the payload
+listing above, which names `existsaddridx` and no transaction-index bucket —
+reproduces the synced datadir on every metric:
+
+| | live tree | free pages | fill |
+|---|---:|---:|---:|
+| this replay | 9.82 GiB | 3.97 GiB (33.0%) | 0.6462 |
+| synced datadir | 9.79 GiB | 4.69 GiB (32.4%) | 0.6486 |
+
+Live tree within 0.3%, fill within 0.0024, free-page share within 0.6
+percentage points.
+
+**What this retracts.** The previous addendum argued that free pages are "not
+a quantity", on the grounds that three runs of the identical chain ended at
+0.31, 1.59 and 4.69 GiB — a fifteenfold spread — and concluded that the
+amendment's free-page row should not be attributed against. That comparison
+was invalid, and the invalidity was self-inflicted: those three runs had
+*different index configurations*. Comparing them was apples to oranges. With
+the configuration matched to the baseline, the figure reproduces. The 4.69 GiB
+row is a real property of that datadir, not an artifact of where a sync
+stopped.
+
+**What survives.** Free pages remain the most volatile component and the one
+most sensitive to *when* it is read. Within this run the share swings from 0%
+to 94.6%, and across the final ten flushes alone it ranges 1.6% to 33.0% —
+so the close agreement above is a matched *stopping point* as well as a
+matched configuration, and a run halted a few flushes earlier would report a
+much smaller figure. The pinprobe result also stands: the pool is reused
+working space, so attributing it is not the same as being able to recover it.
+
+Fill is stable in both senses, which is what makes it the better target: it
+varies only with composition (0.6258 un-indexed, 0.6462 address index, 0.6546
+both) and barely at all within a run.
+
+**A second correction, on where index cost lands.** The previous addendum
+attributed the rise in per-entry flush cost to the address index being "in
+the write path". The three runs say otherwise:
+
+| run | us per dirty entry, first -> last |
+|---|---|
+| un-indexed | 1.59 -> 14.87 (9.4x) |
+| address index | 1.80 -> 13.70 (7.6x) |
+| both indexes | 1.77 -> 23.27 (13.2x) |
+
+The address index costs essentially nothing per entry — it ends marginally
+cheaper than the un-indexed run, within run-to-run variation. The 70% rise
+belongs to the **transaction index**. Anything scoring write-path cost should
+treat those two separately rather than as "indexes".
