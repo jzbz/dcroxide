@@ -36,7 +36,9 @@ Usage:
   dcroxide-bench replay --in <file> [--net <name>] [--workdir <dir>]
                         [--assumevalid <hash>] [--max <n>] [--report <n>]
                         [--flushlog <file>] [--statsevery <n>]
-                        [--metacache <MiB>] [--txindex] [--addrindex]
+                        [--metacache <MiB>] [--dbcache <MiB>]
+                        [--utxocache <MiB>]
+                        [--txindex] [--addrindex]
       Replay the corpus into a fresh chain with full live validation,
       reporting throughput every <n> blocks (default 5000).  The work
       directory (default: a fresh directory next to the corpus) must
@@ -48,7 +50,18 @@ Usage:
       decomposition on every Nth flush (default 25); it walks the whole
       tree, so sampling too often dominates the run it is measuring.
       --metacache sets the overlay ceiling in MiB (default 100, the
-      production value).
+      production value) -- ADR-0004's flush-cadence lever.  --dbcache
+      sets redb's page cache in MiB (default 1024, redb's own default)
+      -- ADR-0004's read-cache lever.  The two interact, so a run that
+      moves one without the other answers half a question.
+
+      --utxocache sets the UTXO cache ceiling in MiB (dcrd's
+      --utxocachemaxsize, default 150).  It belongs with --metacache
+      rather than beside it: connecting a block flushes the UTXO cache
+      when that ceiling is reached, and that flush forces a durable
+      metadata commit whatever the overlay ceiling says.  Raising
+      --metacache alone therefore does not decouple flush cadence from
+      block connection, which is what ADR-0004's lever (c) proposes.
 
       --txindex and --addrindex build the optional indexes the daemon
       builds when configured, which Chain::open does not.  Without them
@@ -304,6 +317,10 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
         Some(v) => v.parse().map_err(|e| format!("bad --statsevery: {e}"))?,
         None => 25,
     };
+    let db_cache_mib: Option<u64> = match args.get("dbcache") {
+        Some(v) => Some(v.parse().map_err(|e| format!("bad --dbcache: {e}"))?),
+        None => None,
+    };
     let meta_cache_mib: u64 = match args.get("metacache") {
         Some(v) => v.parse().map_err(|e| format!("bad --metacache: {e}"))?,
         None => 100,
@@ -347,6 +364,9 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
             .map_err(|e| format!("unable to create database directory: {e}"))?;
         let mut opts = Options::new(&db_path, params.net.0);
         opts.cache_max_size = meta_cache_mib.saturating_mul(1024 * 1024);
+        if let Some(mib) = db_cache_mib {
+            opts.db_cache_bytes = (mib as usize).saturating_mul(1024 * 1024);
+        }
         if flush_log.is_some() {
             opts.flush_stats_every = stats_every;
             let sink = flush_tx.clone();
@@ -377,10 +397,22 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
     let want_tx_index = args.get("txindex").is_some();
     let want_addr_index = args.get("addrindex").is_some();
 
+    let utxo_cache_mib: Option<u64> = match args.get("utxocache") {
+        Some(v) => Some(v.parse().map_err(|e| format!("bad --utxocache: {e}"))?),
+        None => None,
+    };
+
     let chain = Arc::new(Mutex::new(
         Chain::open((*db).clone(), &params, assume_valid, false, now_unix())
             .map_err(|e| format!("unable to initialize chain: {e:?}"))?,
     ));
+
+    if let Some(mib) = utxo_cache_mib {
+        chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .set_utxo_cache_max_bytes(mib.saturating_mul(1024 * 1024));
+    }
 
     // The indexes the daemon builds when configured. Chain::open builds
     // none of them, so a replay without these produces a store that is
@@ -418,6 +450,17 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
             assume_valid.to_string()
         },
         workdir.display()
+    );
+
+    println!(
+        "settings: metacache {} MiB, dbcache {} MiB, utxocache {}, txindex {}, addrindex {}",
+        meta_cache_mib,
+        db_cache_mib.unwrap_or((dcroxide_database::DEFAULT_DB_CACHE_BYTES / (1024 * 1024)) as u64),
+        utxo_cache_mib
+            .map(|m| format!("{m} MiB"))
+            .unwrap_or_else(|| "default".to_string()),
+        want_tx_index,
+        want_addr_index,
     );
 
     let start = Instant::now();
@@ -781,6 +824,8 @@ fn main() -> std::process::ExitCode {
                 "metacache",
                 "txindex",
                 "addrindex",
+                "dbcache",
+                "utxocache",
             ],
         )
         .and_then(|a| cmd_replay(&a)),
