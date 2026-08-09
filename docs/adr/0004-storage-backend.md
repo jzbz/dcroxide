@@ -439,3 +439,43 @@ at 6.81 GiB against the synced datadir's 9.79 — a gap close to
 metadata under real block churn, not a fully indexed node's store. The curve
 shape, the fill invariant and the commit-cost growth all hold for what it
 does cover; absolute totals should still be read from a real sync.
+
+## Addendum, 2026-08-09 — the same run with the indexes built
+
+`Chain::open` builds none of the optional indexes, so every replay above
+measured a store smaller than a synced node's. `dcroxide-bench replay` can
+now build them, and the full chain was replayed again with `--txindex` and
+`--addrindex`: 1,100,392 blocks, 168 flushes, every one sampled.
+
+**The fill invariant now matches a real datadir.** It ends at **0.6546**
+against the synced tip's 0.6486 — within 0.006, where the un-indexed replay
+sat 0.023 low at 0.6258. Fill is not merely stable across tree sizes; it
+converges on the real store's value once the store has the real store's
+composition. That is the strongest form of the claim these runs support:
+packing is the property worth optimising against.
+
+**Free pages give a third answer for the same chain.** They range 0.0 to
+4,465 MiB across the run and end at 1,629 MiB — 10.6% of the file. The three
+runs of this identical chain therefore end at **0.31, 1.59 and 4.69 GiB**, a
+fifteenfold spread. No further argument about that row should be necessary.
+
+**A correction to the previous addendum.** It reported flush cost rising
+528 ms to 2,590 ms, "a factor of 4.9", and read that as sublinear growth.
+The comparison was confounded: the final flush of that run carried 174,146
+dirty entries against the first flush's 332,714, so raw milliseconds
+*understated* the growth. Per dirty entry the un-indexed run rose 1.59 us to
+14.87 us — **9.4x**, not 4.9x. Still sublinear against 66x of tree growth,
+but less comfortably so, and the earlier figure should not be quoted.
+
+**Indexes cost per entry, not just in bulk.** The indexed run rose 1.77 us to
+23.27 us per dirty entry, 13.2x, ending 56% more expensive per entry than the
+un-indexed run at the same height. The address index is in the write path and
+its cost grows with the tree rather than sitting beside it.
+
+**One thing this run overshoots.** It enabled both indexes, where the payload
+listing in the amendment above names `existsaddridx` and no transaction-index
+bucket — so the baseline datadir was synced with the address index and
+without the transaction index. The replayed live tree is 11.56 GiB against
+the synced 9.79. For a size-comparable run, use `--addrindex` alone; the fill
+and per-entry figures above are not sensitive to the difference, the absolute
+tree size obviously is.
