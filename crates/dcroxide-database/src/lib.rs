@@ -141,8 +141,17 @@ pub struct FlushObservation {
     pub dirty_entries: usize,
     /// Bytes the overlay was holding when the flush began.
     pub dirty_bytes: u64,
-    /// Wall time for the whole flush, including the redb commit.
+    /// Wall time for the whole flush, including the redb commit **and**
+    /// any stats walk this flush was sampled with.
+    ///
+    /// Subtract [`Self::stats_elapsed`] to get the cost of the flush
+    /// itself. The distinction is not cosmetic: the walk is proportional
+    /// to the tree, so on a chain-sized store it is minutes and would
+    /// otherwise be indistinguishable from the commit cost being measured.
     pub elapsed: std::time::Duration,
+    /// Of `elapsed`, the part spent walking the tree for
+    /// [`Self::stats`]. Zero on unsampled flushes.
+    pub stats_elapsed: std::time::Duration,
     /// Footprint after this flush's writes and before its commit, present
     /// only on sampled flushes.
     ///

@@ -105,10 +105,13 @@ synthetic inserts pinprobe applies.
 | date | machine | dcroxide commit | workload | flushes | result |
 |---|---|---|---|---|---|
 | 2026-08-08 | m1 | `52903af` | 250k mainnet blocks, 1,925,867 regular txs, 100 MiB overlay, `--statsevery 1` | 17 | Free pages are a sawtooth: 0.0 to 994.3 MiB within one run, 0.0% to 96.2% of the allocated file. Spikes are drawn down at ~80 MiB per flush against ~65 MiB of live tree added. Fill ratio is stable at 0.6169-0.6360 while the tree grows 105 MiB to 1.19 GiB. Throughput 745 to 324 blk/s across the run. |
+| 2026-08-08 | m1 | `ff36811`+ | full mainnet: 1,100,392 blocks, 7,935,579 regular txs, 100 MiB overlay, `--statsevery 1` | 122 | Free pages 0.0 to 3,983 MiB (0% to 96.2% of file), **ending at 313 MiB / 4.0%** against the live-synced datadir's 4.69 GiB / 32.4%. Fill 0.6169-0.6360 across a 66x tree growth. Flush cost 528 to 2,590 ms (4.9x); stats walk 5 to 6,568 ms (1,302x) — unseparated these would read as a 17.2x commit slowdown. Replay live tree 6.81 GiB vs synced 9.79: `Chain::open` builds no optional indexes. Total 3,271 s at 336 blk/s. |
 
 Raw records: `artifacts/dcroxide-bench/m1/replay-flush-all.jsonl`; corpus
 `mainnet-250k.corpus` (2.43 GB, exported from the 2026-07-25 baseline).
 
 The run averaged 445 blk/s where the full mainnet sync managed 124, so
 this slice is informative about curve shape and misleading about
-magnitude.
+magnitude. Raw records for the full run:
+`artifacts/dcroxide-bench/m1/full-flush.jsonl`; corpus
+`mainnet-full.corpus` (18.87 GB).

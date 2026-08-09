@@ -399,3 +399,43 @@ now visible within a single one.
 Note also what a genesis slice cannot stand in for: this run averaged 445
 blk/s where the real sync managed 124. Slices are informative about shape and
 misleading about magnitude.
+
+## Addendum, 2026-08-08 (second) — the same chain, replayed, ends with 4% free pages
+
+The sawtooth above was measured on a 250,000-block slice. Repeating it over
+the whole chain — 1,100,392 blocks, 7,935,579 regular transactions, 17.99 GiB
+of block data, the production 100 MiB overlay, every one of the 122 flushes
+sampled — settles the amplitude question and, incidentally, the attribution
+question with it.
+
+**Free pages, full scale.** They swing from 0.0 MiB to 3,983 MiB, which is
+0% to 96.2% of the allocated file, and the run *ends* at 313 MiB — **4.0%**.
+The datadir this project measured at tip, from a live sync of the same chain,
+ended at 4.69 GiB — **32.4%**. Same consensus data, same engine, same overlay
+ceiling; an eightfold difference in the figure the amendment's table lists as
+a component of the metadata gap. Whatever else is true, that row is not a
+property of the stored chain. It records where in the allocate-and-reuse cycle
+a particular run happened to stop.
+
+**Fill, full scale.** 0.6169 to 0.6360 across all 122 flushes — a spread of
+0.019, which is the same spread the 250,000-block run produced while the tree
+grew from 105 MiB to 6.81 GiB, a factor of 66. Page fill is the invariant
+here. It is what a storage change should be scored against.
+
+**Commit cost, and why the timing split mattered.** Flush cost rose 528 ms to
+2,590 ms, a factor of 4.9, over that 66x growth — sublinear, which is what a
+copy-on-write B-tree rewriting a root path of depth O(log n) should do. The
+stats walk over the same span rose 5 ms to 6,568 ms, a factor of 1,302, and
+by the end it was 2.5x the flush it was measuring. Had the observation not
+separated them, the combined figure would have read 533 ms to 9,158 ms and
+the honest-looking conclusion would have been a **17.2x** commit slowdown —
+three and a half times the real one. Instrument overhead that scales with the
+thing under study is not noise; it is a wrong answer waiting to be reported.
+
+**What this run is not.** The replay drives `Chain::open`, which does not
+build the optional indexes the daemon wires separately, so its live tree ends
+at 6.81 GiB against the synced datadir's 9.79 — a gap close to
+`existsaddridx`'s 3.1 GiB footprint. It measures the chain engine's own
+metadata under real block churn, not a fully indexed node's store. The curve
+shape, the fill invariant and the commit-cost growth all hold for what it
+does cover; absolute totals should still be read from a real sync.

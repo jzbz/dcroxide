@@ -482,6 +482,7 @@ impl DbCache {
             .begin_write()
             .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
         let mut sampled = None;
+        let mut stats_elapsed = Duration::ZERO;
         {
             let mut table = tx
                 .open_table(METADATA_TABLE)
@@ -512,6 +513,7 @@ impl DbCache {
                     .saturating_add(1)
                     .is_multiple_of(self.stats_every);
             if take_stats && self.observer.is_some() {
+                let stats_started = Instant::now();
                 let db_stats = tx
                     .stats()
                     .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
@@ -528,6 +530,7 @@ impl DbCache {
                     metadata_bytes: table_stats.metadata_bytes(),
                     table_fragmented_bytes: table_stats.fragmented_bytes(),
                 });
+                stats_elapsed = stats_started.elapsed();
             }
         }
         tx.commit()
@@ -542,6 +545,7 @@ impl DbCache {
                 dirty_entries,
                 dirty_bytes,
                 elapsed: flush_started.elapsed(),
+                stats_elapsed,
                 stats: sampled,
             });
         }
