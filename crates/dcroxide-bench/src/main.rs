@@ -85,6 +85,22 @@ Usage:
   --net is one of mainnet, testnet, simnet, regnet (default mainnet).
 ";
 
+/// What the flush observer sends to the log writer.
+///
+/// The writer stops on `Done` rather than on the channel closing. Closing
+/// requires every sender to drop, which means every `Arc` transitively
+/// holding the observer — the database, the chain, the index handles, the
+/// queryer — must be released in the right order first. That held until
+/// the indexes were wired in, then silently stopped holding: a completed
+/// full-chain replay hung in `join()` with all its records already on
+/// disk. An explicit sentinel does not care who else has a sender.
+enum FlushMsg {
+    /// One JSON record to append.
+    Record(String),
+    /// Stop; the replay is finished.
+    Done,
+}
+
 /// Flags that stand alone rather than taking a value.
 ///
 /// The parser otherwise consumes the next token as a value, which would
@@ -302,7 +318,7 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
     // in memory loses all of it when the run is interrupted, which a replay
     // long enough to be worth measuring frequently is. A channel send is
     // neither.
-    let (flush_tx, flush_rx) = std::sync::mpsc::channel::<String>();
+    let (flush_tx, flush_rx) = std::sync::mpsc::channel::<FlushMsg>();
     let writer = match &flush_log {
         Some(path) => {
             let file = std::fs::File::create(path)
@@ -310,7 +326,10 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
             Some(std::thread::spawn(move || -> std::io::Result<u64> {
                 let mut out = BufWriter::new(file);
                 let mut count = 0u64;
-                for line in flush_rx {
+                for msg in flush_rx {
+                    let FlushMsg::Record(line) = msg else {
+                        break;
+                    };
                     writeln!(out, "{line}")?;
                     // Flushed per record so an interrupted run keeps every
                     // observation it managed to produce.
@@ -339,7 +358,7 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
                         .unwrap_or_else(|| "null".to_string());
                     // A closed receiver means the writer is gone; a lost
                     // log line is not worth failing the replay over.
-                    let _ = sink.send(format!(
+                    let _ = sink.send(FlushMsg::Record(format!(
                         "{{\"flush\":{},\"dirty_entries\":{},\"dirty_bytes\":{},\"elapsed_ms\":{:.3},\"stats_ms\":{:.3},\"flush_ms\":{:.3},\"stats\":{}}}",
                         obs.sequence,
                         obs.dirty_entries,
@@ -348,7 +367,7 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
                         obs.stats_elapsed.as_secs_f64() * 1000.0,
                         obs.elapsed.saturating_sub(obs.stats_elapsed).as_secs_f64() * 1000.0,
                         stats,
-                    ));
+                    )));
                 },
             ));
         }
@@ -509,11 +528,9 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
     );
 
     if let Some(writer) = writer {
-        // The observer holds the only other sender and lives inside the
-        // database the chain owns, so the writer's loop cannot end until
-        // the chain is dropped.
-        drop(chain);
-        drop(flush_tx);
+        // Tell the writer to stop rather than waiting for every sender to
+        // drop; see FlushMsg.
+        let _ = flush_tx.send(FlushMsg::Done);
         let count = writer
             .join()
             .map_err(|_| "flush log writer panicked".to_string())?
