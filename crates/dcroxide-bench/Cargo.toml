@@ -13,6 +13,7 @@ dcroxide-blockchain = { path = "../dcroxide-blockchain", features = ["std"] }
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-database = { path = "../dcroxide-database" }
+dcroxide-indexers = { path = "../dcroxide-indexers" }
 dcroxide-wire = { path = "../dcroxide-wire" }
 
 [lints]

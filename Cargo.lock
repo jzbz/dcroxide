@@ -323,6 +323,7 @@ dependencies = [
  "dcroxide-chaincfg",
  "dcroxide-chainhash",
  "dcroxide-database",
+ "dcroxide-indexers",
  "dcroxide-wire",
 ]
 

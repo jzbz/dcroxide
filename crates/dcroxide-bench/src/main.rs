@@ -17,7 +17,10 @@ use dcroxide_blockchain::process::Chain;
 use dcroxide_chaincfg::{Params, mainnet_params, regnet_params, simnet_params, testnet3_params};
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{Database, Options, bootstrap};
-use dcroxide_wire::MsgBlock;
+use dcroxide_indexers::{
+    CONNECT_NTFN, ChainQueryer, ExistsAddrIndex, IndexNtfn, IndexSubscriber, Interrupt, TxIndex,
+};
+use dcroxide_wire::{BlockHeader, MsgBlock};
 
 /// The command-line help.
 const HELP: &str = "\
@@ -33,7 +36,7 @@ Usage:
   dcroxide-bench replay --in <file> [--net <name>] [--workdir <dir>]
                         [--assumevalid <hash>] [--max <n>] [--report <n>]
                         [--flushlog <file>] [--statsevery <n>]
-                        [--metacache <MiB>]
+                        [--metacache <MiB>] [--txindex] [--addrindex]
       Replay the corpus into a fresh chain with full live validation,
       reporting throughput every <n> blocks (default 5000).  The work
       directory (default: a fresh directory next to the corpus) must
@@ -47,9 +50,17 @@ Usage:
       --metacache sets the overlay ceiling in MiB (default 100, the
       production value).
 
+      --txindex and --addrindex build the optional indexes the daemon
+      builds when configured, which Chain::open does not.  Without them
+      a replayed store is materially smaller than a synced one -- the
+      address index alone is around 3 GiB of tree at mainnet tip -- so
+      absolute totals are only comparable to a real datadir when the
+      same indexes are enabled.
+
   dcroxide-bench redbstat --appdata <dir> [--net <name>]
-      (--appdata is the node data directory, as for export: the store
-      is read from <dir>/data/<net>/blocks_ffldb.)
+      (--appdata is a node data directory, read from
+      <dir>/data/<net>/blocks_ffldb, or a replay --workdir, which holds
+      blocks_ffldb at its root; whichever exists is used.)
       Decompose the metadata store's footprint into payload, redb
       overhead, intra-page slack and free pages, as one JSON object.
 
@@ -73,6 +84,12 @@ Usage:
 
   --net is one of mainnet, testnet, simnet, regnet (default mainnet).
 ";
+
+/// Flags that stand alone rather than taking a value.
+///
+/// The parser otherwise consumes the next token as a value, which would
+/// silently swallow the following flag.
+const BOOL_FLAGS: [&str; 2] = ["txindex", "addrindex"];
 
 /// A parsed flag map over the raw arguments.
 struct Args {
@@ -100,6 +117,9 @@ impl Args {
             };
             match name.split_once('=') {
                 Some((n, v)) => push(&mut values, n, v.to_string())?,
+                None if BOOL_FLAGS.contains(&name) => {
+                    push(&mut values, name, "true".to_string())?;
+                }
                 None => {
                     let value = it
                         .next()
@@ -332,10 +352,43 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
                 },
             ));
         }
-        Database::create(&opts).map_err(|e| e.to_string())?
+        Arc::new(Database::create(&opts).map_err(|e| e.to_string())?)
     };
-    let mut chain = Chain::open(db, &params, assume_valid, false, now_unix())
-        .map_err(|e| format!("unable to initialize chain: {e:?}"))?;
+    let db_handle = Arc::clone(&db);
+    let want_tx_index = args.get("txindex").is_some();
+    let want_addr_index = args.get("addrindex").is_some();
+
+    let chain = Arc::new(Mutex::new(
+        Chain::open((*db).clone(), &params, assume_valid, false, now_unix())
+            .map_err(|e| format!("unable to initialize chain: {e:?}"))?,
+    ));
+
+    // The indexes the daemon builds when configured. Chain::open builds
+    // none of them, so a replay without these produces a store that is
+    // not comparable in size to a synced datadir.
+    let queryer: Arc<dyn ChainQueryer> = Arc::new(BenchChainQueryer {
+        chain: Arc::clone(&chain),
+        params: params.clone(),
+    });
+    let interrupt: Interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut subscriber = IndexSubscriber::new(Arc::clone(&interrupt));
+    if want_tx_index {
+        TxIndex::new(
+            &mut subscriber,
+            Arc::clone(&db_handle),
+            Arc::clone(&queryer),
+        )
+        .map_err(|e| format!("unable to create the transaction index: {e}"))?;
+    }
+    if want_addr_index {
+        ExistsAddrIndex::new(
+            &mut subscriber,
+            Arc::clone(&db_handle),
+            Arc::clone(&queryer),
+        )
+        .map_err(|e| format!("unable to create the exists-address index: {e}"))?;
+    }
+    let indexing = want_tx_index || want_addr_index;
 
     println!(
         "replaying {} (assumevalid {}) into {}",
@@ -366,14 +419,22 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
 
         // Skip blocks the chain already has (a foreign corpus may
         // include genesis), like the importer and dcrd's addblock.
-        if chain.main_chain_has_block(&block.header.block_hash()) {
+        if chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .main_chain_has_block(&block.header.block_hash())
+        {
             skipped = skipped.saturating_add(1);
             continue;
         }
         bytes = bytes.saturating_add(serialized.len() as u64);
         txs = txs.saturating_add(block.transactions.len() as u64);
 
-        let (_, errs) = chain.process_block(&block, now_unix() as i64, &params);
+        let (_, errs) = chain.lock().expect("chain mutex poisoned").process_block(
+            &block,
+            now_unix() as i64,
+            &params,
+        );
         if !errs.is_empty() {
             return Err(format!(
                 "block {} at height {} rejected: {}",
@@ -383,13 +444,36 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
             ));
         }
 
+        let block_height = block.header.height;
+
+        // Drive the indexes exactly as the daemon does, with the chain
+        // lock released: the queryer below takes it, and nesting the two
+        // would deadlock the replay.
+        if indexing {
+            let prev = block.header.prev_block;
+            let parent = queryer
+                .block_by_hash(&prev)
+                .map_err(|e| format!("index parent {prev}: {e}"))?;
+            let is_treasury_enabled = queryer
+                .is_treasury_agenda_active(&prev)
+                .map_err(|e| format!("index treasury state at {prev}: {e}"))?;
+            subscriber
+                .notify(&IndexNtfn {
+                    ntfn_type: CONNECT_NTFN,
+                    block: Arc::new(block),
+                    parent,
+                    is_treasury_enabled,
+                })
+                .map_err(|e| format!("index update failed: {e}"))?;
+        }
+
         blocks = blocks.saturating_add(1);
         window_blocks = window_blocks.saturating_add(1);
         if window_blocks == report {
             let elapsed = window_start.elapsed().as_secs_f64();
             println!(
                 "height {:>8}: {report} blocks in {elapsed:>7.2}s ({:>7.1} blk/s)",
-                block.header.height,
+                block_height,
                 window_blocks as f64 / elapsed,
             );
             window_blocks = 0;
@@ -401,11 +485,16 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
     // sync pays it too, and without it the work directory's tail
     // rolls back on the next open.
     chain
+        .lock()
+        .expect("chain mutex poisoned")
         .flush(&params)
         .map_err(|e| format!("flush failed: {e:?}"))?;
 
     let elapsed = start.elapsed().as_secs_f64();
-    let best = chain.best_snapshot();
+    let best_height = {
+        let guard = chain.lock().expect("chain mutex poisoned");
+        guard.best_snapshot().height
+    };
     println!("---");
     println!(
         "replayed {blocks} blocks ({txs} regular txs, {:.1} MiB, {skipped} already known) in {elapsed:.2}s",
@@ -415,7 +504,7 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
         "rate {:.1} blk/s, {:.2} MiB/s; tip height {}; peak RSS {} MiB",
         blocks as f64 / elapsed,
         bytes as f64 / (1024.0 * 1024.0) / elapsed,
-        best.height,
+        best_height,
         peak_rss_kib() / 1024,
     );
 
@@ -436,11 +525,92 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// A [`ChainQueryer`] over the replay's chain, so the indexes can be
+/// driven exactly as the daemon drives them.
+///
+/// Mirrors `dcroxide-node`'s `NodeChainQueryer`. It is duplicated rather
+/// than shared because the daemon crate carries the whole P2P and RPC
+/// surface, none of which a replay needs; the trait is eight thin
+/// accessors, and the alternative was a dependency an order of magnitude
+/// larger than the thing being measured.
+struct BenchChainQueryer {
+    chain: Arc<Mutex<Chain>>,
+    params: Params,
+}
+
+impl BenchChainQueryer {
+    fn locked(&self) -> std::sync::MutexGuard<'_, Chain> {
+        self.chain.lock().expect("chain mutex poisoned")
+    }
+}
+
+impl ChainQueryer for BenchChainQueryer {
+    fn main_chain_has_block(&self, hash: &Hash) -> bool {
+        self.locked().main_chain_has_block(hash)
+    }
+
+    fn chain_params(&self) -> &Params {
+        &self.params
+    }
+
+    fn best(&self) -> (i64, Hash) {
+        let chain = self.locked();
+        let best = chain.best_snapshot();
+        (best.height, best.hash)
+    }
+
+    fn block_header_by_hash(&self, hash: &Hash) -> Result<BlockHeader, String> {
+        self.locked()
+            .header_by_hash(hash)
+            .ok_or_else(|| format!("block {hash} is not known"))
+    }
+
+    fn block_hash_by_height(&self, height: i64) -> Result<Hash, String> {
+        self.locked()
+            .block_hash_by_height(height)
+            .ok_or_else(|| format!("no block at height {height} exists"))
+    }
+
+    fn block_height_by_hash(&self, hash: &Hash) -> Result<i64, String> {
+        self.locked()
+            .block_height_by_hash(hash)
+            .ok_or_else(|| format!("block {hash} is not in the main chain"))
+    }
+
+    fn block_by_hash(&self, hash: &Hash) -> Result<Arc<MsgBlock>, String> {
+        self.locked()
+            .block_by_hash(hash)
+            .map(Arc::new)
+            .ok_or_else(|| format!("unable to fetch block {hash}"))
+    }
+
+    fn is_treasury_agenda_active(&self, hash: &Hash) -> Result<bool, String> {
+        self.locked()
+            .is_treasury_agenda_active(hash, &self.params)
+            .map_err(|e| e.description)
+    }
+}
+
+/// Resolve a directory that may be either a node data directory or a
+/// `replay --workdir`, which holds `blocks_ffldb` at its root.
+///
+/// Accepting both matters in practice: the natural thing to do after a
+/// replay is to decompose what it produced, and demanding the node layout
+/// there would mean the two subcommands could not be pointed at the same
+/// path.
+fn resolve_store_dir(appdata: &Path, net_dir: &str) -> PathBuf {
+    let node_layout = appdata.join("data").join(net_dir);
+    if node_layout.join("blocks_ffldb").is_dir() {
+        return node_layout;
+    }
+    appdata.to_path_buf()
+}
+
 /// Print the metadata store's footprint decomposition as JSON.
 fn cmd_redbstat(args: &Args) -> Result<(), String> {
     let appdata = PathBuf::from(args.require("appdata")?);
     let (params, net_dir) = net_params(args.get("net").unwrap_or("mainnet"))?;
-    let data_dir = appdata.join("data").join(net_dir);
+    let data_dir = resolve_store_dir(&appdata, net_dir);
     let db = open_db(&data_dir, params.net.0, false)?;
     let stats = db.raw_stats().map_err(|e| e.to_string())?;
     println!("{}", stats.to_json());
@@ -468,7 +638,7 @@ enum Hold {
 fn cmd_pinprobe(args: &Args) -> Result<(), String> {
     let appdata = PathBuf::from(args.require("appdata")?);
     let (params, net_dir) = net_params(args.get("net").unwrap_or("mainnet"))?;
-    let data_dir = appdata.join("data").join(net_dir);
+    let data_dir = resolve_store_dir(&appdata, net_dir);
     let writes: u64 = match args.get("writes") {
         Some(v) => v.parse().map_err(|e| format!("bad --writes: {e}"))?,
         None => 200_000,
@@ -592,6 +762,8 @@ fn main() -> std::process::ExitCode {
                 "flushlog",
                 "statsevery",
                 "metacache",
+                "txindex",
+                "addrindex",
             ],
         )
         .and_then(|a| cmd_replay(&a)),
