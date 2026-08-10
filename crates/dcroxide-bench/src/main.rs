@@ -98,7 +98,7 @@ Usage:
 
   dcroxide-bench sweep --in <file> --arms <file> --out <file>
                        [--reps <n>] [--net <name>] [--max <n>]
-                       [--workdirroot <dir>]
+                       [--workdirroot <dir>] [--warmup <n>]
       Compare replay configurations so the comparison survives drift.
 
       Each line of the arms file is a name, whitespace, then the extra
@@ -116,11 +116,23 @@ Usage:
       spreads that drift across all arms instead of loading it onto the
       last one, and repetition makes it visible.
 
+      --warmup <n> discards the first n runs from the summary (default
+      1).  They are still recorded, flagged, so the cost is visible.
+      This is not fussiness: the first full-chain run of a sweep took
+      6,440 s against 3,866-3,888 s for the same configuration later,
+      a 66% cold-start penalty that the drift check then misreported as
+      a trend.
+
       Results are written as one JSON object per run, with the machine
       state at the time of the run, and a summary is printed with each
       arm's median and the drift between the first and second half of
       the sweep.  Read the drift line first: if it is comparable to the
       differences between arms, the sweep has not measured anything.
+
+      The summary also reports whether each arm's range overlaps the
+      first arm's.  Prefer that to the medians: disjoint ranges are a
+      claim about every observation, where a median difference smaller
+      than the drift is a claim about nothing.
 
   --net is one of mainnet, testnet, simnet, regnet (default mainnet).
 ";
@@ -808,6 +820,10 @@ fn cmd_sweep(args: &Args) -> Result<(), String> {
     if reps == 0 {
         return Err("--reps must be at least 1".to_string());
     }
+    let warmup: usize = match args.get("warmup") {
+        Some(v) => v.parse().map_err(|e| format!("bad --warmup: {e}"))?,
+        None => 1,
+    };
     let net = args.get("net").unwrap_or("mainnet").to_string();
     let workdir_root = PathBuf::from(
         args.get("workdirroot")
@@ -878,13 +894,15 @@ fn cmd_sweep(args: &Args) -> Result<(), String> {
             }
             let _ = std::fs::remove_dir_all(&wd);
 
+            let warming = run_no <= warmup;
             writeln!(
                 out,
-                "{{\"run\":{},\"rep\":{},\"arm\":\"{}\",\"seconds\":{:.2},\"load1\":\"{}\",\"mem_avail_kb\":{},\"disk_avail_kb\":{},\"cpu_mhz\":\"{}\"}}",
+                "{{\"run\":{},\"rep\":{},\"arm\":\"{}\",\"seconds\":{:.2},\"warmup\":{},\"load1\":\"{}\",\"mem_avail_kb\":{},\"disk_avail_kb\":{},\"cpu_mhz\":\"{}\"}}",
                 run_no,
                 rep.saturating_add(1),
                 arm.name,
                 seconds,
+                warming,
                 env.load1,
                 env.mem_available_kb,
                 env.disk_avail_kb,
@@ -892,11 +910,18 @@ fn cmd_sweep(args: &Args) -> Result<(), String> {
             )
             .map_err(|e| format!("writing results: {e}"))?;
             out.flush().map_err(|e| format!("writing results: {e}"))?;
-            results.push((idx, seconds));
+            if warming {
+                eprintln!("      (warm-up, excluded from the summary)");
+            } else {
+                results.push((idx, seconds));
+            }
         }
     }
 
-    println!("\n--- sweep summary ({} runs)", results.len());
+    println!(
+        "\n--- sweep summary ({} runs, {warmup} warm-up discarded)",
+        results.len()
+    );
     // Drift first: it decides whether anything below it means anything.
     let half = results.len() / 2;
     if half > 0 {
@@ -917,6 +942,7 @@ fn cmd_sweep(args: &Args) -> Result<(), String> {
     }
     println!();
     let mut baseline: Option<f64> = None;
+    let mut base_range: Option<(f64, f64)> = None;
     for (i, arm) in arms.iter().enumerate() {
         let mut times: Vec<f64> = results
             .iter()
@@ -937,8 +963,19 @@ fn cmd_sweep(args: &Args) -> Result<(), String> {
             Some(b) if b > 0.0 => format!("{:.2}x baseline", med / b),
             Some(_) => String::new(),
         };
+        // Prefer this to the medians: disjoint ranges are a claim about
+        // every observation, where a median difference smaller than the
+        // drift is a claim about nothing.
+        let overlap = match base_range {
+            None => {
+                base_range = Some((lo, hi));
+                String::new()
+            }
+            Some((blo, bhi)) if hi < blo || lo > bhi => String::from("   disjoint from baseline"),
+            Some(_) => String::from("   OVERLAPS baseline"),
+        };
         println!(
-            "{:<16} median {med:>8.1}s   min {lo:>8.1}s   max {hi:>8.1}s   spread {:>5.1}%   {rel}",
+            "{:<16} median {med:>8.1}s   min {lo:>8.1}s   max {hi:>8.1}s   spread {:>5.1}%   {rel}{overlap}",
             arm.name,
             if med > 0.0 {
                 100.0 * (hi - lo) / med
@@ -1116,7 +1153,16 @@ fn main() -> std::process::ExitCode {
         .and_then(|a| cmd_replay(&a)),
         "sweep" => Args::parse(
             rest,
-            &["in", "arms", "reps", "out", "net", "max", "workdirroot"],
+            &[
+                "in",
+                "arms",
+                "reps",
+                "out",
+                "net",
+                "max",
+                "workdirroot",
+                "warmup",
+            ],
         )
         .and_then(|a| cmd_sweep(&a)),
         "redbstat" => Args::parse(rest, &["appdata", "net"]).and_then(|a| cmd_redbstat(&a)),

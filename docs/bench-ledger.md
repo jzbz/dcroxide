@@ -129,6 +129,7 @@ durable metadata commit regardless.
 |---|---|---|---|---|
 | 2026-08-09 | m1 | `a471db2` | 4 arms, `--metacache` only, no drift control | **Void.** The unchanged baseline measured 4,767 s and 6,780 s hours apart (total flush time 863 s vs 3,462 s) while the disk filled from 343G to 523G. Also measured the wrong knob: the 800 MiB arm produced *more* flushes (164) than the 100 MiB arm (128). |
 | 2026-08-09 | m1 | `a471db2` | 5 arms with `--utxocache`, baseline first **and** last, each arm decomposed then deleted | **Throughput void, space clean.** Baselines 4,198 s vs 6,865 s — 1.64x drift against lever effects of 0.88x-1.12x, so no timing may be quoted. Space: fill 0.6450-0.6462 across all five arms (spread 0.0011) — neither lever moves packing; payload bit-identical at 6,069,302,981 bytes across arms; lever (c) raises free pages to 8.40 GiB against the baseline 6.17. |
+| 2026-08-10 | m1 | `62f65f4` | `sweep`: 4 arms x 3 reps, full mainnet, `--addrindex`, interleaved + rotated, 1 warm-up discarded | **First defensible throughput result.** All arms disjoint from baseline (3866-3888 s): cache 8 GiB **5125-6294 s, 1.50x — 50% slower**; cadence 800/1200 **3424-3467 s, 0.89x**; both 3459-3511 s, 0.90x. Lever (b) reverses its microbenchmark premise; lever (c) gives 11%; the cache penalty vanishes when cadence is raised, confirming the interaction. Cold-start run 1 at 6,440 s prompted the warm-up discard. |
 
 Raw records: `artifacts/dcroxide-bench/m1/s2-*.jsonl` and `lever-sweep2.log`.
 
@@ -136,3 +137,6 @@ A valid throughput measurement needs alternating rather than sequential
 arms, repetitions per configuration, and control for sustained-load state.
 One pass of five hour-long arms cannot separate a 10% effect from a 64%
 drift; the second sweep is the evidence for that, not a counterexample.
+The third row above is that rig, built as `dcroxide-bench sweep`, and the
+measurement it made possible. Raw records:
+`artifacts/dcroxide-bench/m1/sweep-levers.jsonl`.

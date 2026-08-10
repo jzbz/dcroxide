@@ -656,3 +656,48 @@ alternating arms rather than sequential blocks, several repetitions per
 configuration, and a rig that either controls for sustained-load state or
 measures it. A single pass of five hour-long arms cannot separate a 10%
 effect from a 64% drift, and this attempt is the evidence.
+
+## Addendum, 2026-08-10 — levers (b) and (c) measured for throughput; (b) is inverted
+
+The earlier sweeps could not measure throughput: one turned the wrong knob,
+the other was voided by a 1.64x drift. `dcroxide-bench sweep` fixes the
+method — arms interleaved with the order rotated each repetition, a fresh
+process and workdir per run, machine state recorded, a discarded warm-up, and
+a summary that reports drift and range overlap before any median.
+
+Twelve full-chain runs, four arms at three repetitions, `--addrindex`,
+excluding the cold-start first run:
+
+| arm | dbcache / metacache / utxocache | range (s) | vs baseline | |
+|---|---|---|---:|---|
+| baseline | 1024 / 100 / 150 | 3866-3888 | 1.00x | |
+| **cache** | 8192 / 100 / 150 | 5125-6294 | **1.50x** | disjoint |
+| **cadence** | 1024 / 800 / 1200 | 3424-3467 | **0.89x** | disjoint |
+| both | 8192 / 800 / 1200 | 3459-3511 | 0.90x | disjoint |
+
+Every arm's range is disjoint from the baseline's, which is a claim about
+every observation rather than a comparison of medians against a noise floor.
+
+**Lever (b) does not merely fail; it reverses.** Its entire basis was a
+500,000-key insert microbenchmark in which raising the page cache from 1 GiB
+to 8 GiB cut the loop from 4.3-6.1 s to 1.3-1.5 s. Over a full chain the same
+change makes the replay **50% slower**. A plausible mechanism is in this
+file's own `Options` documentation: redb splits `db_cache_bytes` 90/10 into
+read cache and write buffer, so an eightfold figure mostly buys read cache a
+sequential sync does not reuse, while the LRU accounting grows with it. The
+microbenchmark measured a workload whose working set fits; a sync's does not.
+**Lever (b) is closed, in the opposite direction to its premise.**
+
+**Lever (c) is a real 11% gain** — the first lever to show a measured
+throughput benefit, and modest against a 2.2x gap.
+
+**They interact, as this ADR insisted they would.** The 50% cache penalty
+disappears when cadence is raised: `both` matches `cadence`. Measuring either
+alone would have produced a number that could not be interpreted, and the
+instruction to measure them together was right.
+
+**A method note.** The first run of the sweep took 6,440 s against 3,866-3,888
+for the same configuration later — a 66% cold-start penalty that the
+first-half/second-half drift check misreported as a trend. `sweep` now
+discards a warm-up run by default and reports range overlap, which does not
+confuse a single outlier with drift.
