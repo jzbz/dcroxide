@@ -10,6 +10,7 @@
 
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -94,6 +95,32 @@ Usage:
       retains free pages, which ADR-0004 named as its leading
       hypothesis and its 2026-08-07 addendum argues against.  Same
       warning as redbstat: run it on a copy.
+
+  dcroxide-bench sweep --in <file> --arms <file> --out <file>
+                       [--reps <n>] [--net <name>] [--max <n>]
+                       [--workdirroot <dir>]
+      Compare replay configurations so the comparison survives drift.
+
+      Each line of the arms file is a name, whitespace, then the extra
+      replay flags for that arm; blank lines and # comments are
+      skipped.  Every arm is run <reps> times (default 3), INTERLEAVED
+      rather than blocked, with the order rotated each repetition so no
+      arm keeps a fixed position.  Every run gets a fresh workdir and a
+      fresh process, and the workdir is deleted before the next run.
+
+      This exists because the obvious design does not work.  Running
+      arms in blocks -- all of A, then all of B -- confounds the arms
+      with anything that changes over the sweep: two attempts at
+      ADR-0004's levers were voided that way, one by a 1.64x drift
+      between two runs of an identical configuration.  Interleaving
+      spreads that drift across all arms instead of loading it onto the
+      last one, and repetition makes it visible.
+
+      Results are written as one JSON object per run, with the machine
+      state at the time of the run, and a summary is printed with each
+      arm's median and the drift between the first and second half of
+      the sweep.  Read the drift line first: if it is comparable to the
+      differences between arms, the sweep has not measured anything.
 
   --net is one of mainnet, testnet, simnet, regnet (default mainnet).
 ";
@@ -666,6 +693,264 @@ fn resolve_store_dir(appdata: &Path, net_dir: &str) -> PathBuf {
     appdata.to_path_buf()
 }
 
+/// One arm of a sweep: a name and the extra `replay` flags it adds.
+struct SweepArm {
+    name: String,
+    flags: Vec<String>,
+}
+
+/// Machine state at the moment a run started, so a suspicious result can
+/// be checked against the conditions that produced it rather than
+/// re-litigated from memory.
+struct RunEnv {
+    load1: String,
+    mem_available_kb: u64,
+    disk_avail_kb: u64,
+    cpu_mhz: String,
+}
+
+impl RunEnv {
+    fn capture(workdir_root: &Path) -> RunEnv {
+        let load1 = std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|s| s.split_whitespace().next().map(str::to_string))
+            .unwrap_or_else(|| "?".to_string());
+        let mem_available_kb = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("MemAvailable:"))
+                    .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse().ok()))
+            })
+            .unwrap_or(0);
+        let cpu_mhz = std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("cpu MHz"))
+                    .and_then(|l| l.split(':').nth(1).map(|v| v.trim().to_string()))
+            })
+            .unwrap_or_else(|| "?".to_string());
+        let disk_avail_kb = disk_avail_kb(workdir_root);
+        RunEnv {
+            load1,
+            mem_available_kb,
+            disk_avail_kb,
+            cpu_mhz,
+        }
+    }
+}
+
+/// Available space under `path` in kibibytes, via `df` (0 when unknown).
+fn disk_avail_kb(path: &Path) -> u64 {
+    Command::new("df")
+        .arg("-Pk")
+        .arg(path)
+        .output()
+        .ok()
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .nth(1)
+                .and_then(|l| l.split_whitespace().nth(3).and_then(|v| v.parse().ok()))
+        })
+        .unwrap_or(0)
+}
+
+/// Parse the arms file: `name  <flags...>` per line, `#` comments skipped.
+fn parse_arms(path: &Path) -> Result<Vec<SweepArm>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("unable to read {}: {e}", path.display()))?;
+    let mut arms = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let name = parts
+            .next()
+            .ok_or_else(|| format!("{}:{}: empty arm", path.display(), i.saturating_add(1)))?;
+        arms.push(SweepArm {
+            name: name.to_string(),
+            flags: parts.map(str::to_string).collect(),
+        });
+    }
+    if arms.is_empty() {
+        return Err(format!("{} defines no arms", path.display()));
+    }
+    Ok(arms)
+}
+
+/// The median of a slice, by value.
+fn median(values: &mut [f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[mid.saturating_sub(1)] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    }
+}
+
+/// Run a sweep: every arm, every repetition, interleaved and rotated.
+fn cmd_sweep(args: &Args) -> Result<(), String> {
+    let corpus = PathBuf::from(args.require("in")?);
+    let arms = parse_arms(Path::new(args.require("arms")?))?;
+    let out_path = PathBuf::from(args.require("out")?);
+    let reps: usize = match args.get("reps") {
+        Some(v) => v.parse().map_err(|e| format!("bad --reps: {e}"))?,
+        None => 3,
+    };
+    if reps == 0 {
+        return Err("--reps must be at least 1".to_string());
+    }
+    let net = args.get("net").unwrap_or("mainnet").to_string();
+    let workdir_root = PathBuf::from(
+        args.get("workdirroot")
+            .map(str::to_string)
+            .unwrap_or_else(|| ".".to_string()),
+    );
+    let exe = std::env::current_exe().map_err(|e| format!("locating this binary: {e}"))?;
+
+    let mut out = BufWriter::new(
+        std::fs::File::create(&out_path)
+            .map_err(|e| format!("unable to create {}: {e}", out_path.display()))?,
+    );
+    // (arm index, seconds), in execution order, so drift can be read off
+    // the sequence rather than assumed absent.
+    let mut results: Vec<(usize, f64)> = Vec::new();
+    let total = reps.saturating_mul(arms.len());
+    let mut run_no = 0usize;
+
+    for rep in 0..reps {
+        // Rotate the order each repetition: an arm that always ran last
+        // would absorb whatever the sweep accumulates.
+        for offset in 0..arms.len() {
+            let idx = offset
+                .saturating_add(rep)
+                .checked_rem(arms.len())
+                .unwrap_or(0);
+            let arm = &arms[idx];
+            run_no = run_no.saturating_add(1);
+            let wd = workdir_root.join(format!("sweep-{}-r{}", arm.name, rep.saturating_add(1)));
+            let _ = std::fs::remove_dir_all(&wd);
+
+            let env = RunEnv::capture(&workdir_root);
+            eprintln!(
+                "[{run_no}/{total}] rep {} arm {} (load {}, {} MiB free RAM, {} GiB free disk)",
+                rep.saturating_add(1),
+                arm.name,
+                env.load1,
+                env.mem_available_kb / 1024,
+                env.disk_avail_kb / (1024 * 1024),
+            );
+
+            let mut cmd = Command::new(&exe);
+            cmd.arg("replay")
+                .arg("--in")
+                .arg(&corpus)
+                .arg("--workdir")
+                .arg(&wd)
+                .arg("--net")
+                .arg(&net)
+                .arg("--report")
+                .arg("1000000");
+            if let Some(max) = args.get("max") {
+                cmd.arg("--max").arg(max);
+            }
+            for f in &arm.flags {
+                cmd.arg(f);
+            }
+
+            let started = Instant::now();
+            let status = cmd
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .status()
+                .map_err(|e| format!("spawning replay: {e}"))?;
+            let seconds = started.elapsed().as_secs_f64();
+            if !status.success() {
+                return Err(format!("arm {} failed: {status}", arm.name));
+            }
+            let _ = std::fs::remove_dir_all(&wd);
+
+            writeln!(
+                out,
+                "{{\"run\":{},\"rep\":{},\"arm\":\"{}\",\"seconds\":{:.2},\"load1\":\"{}\",\"mem_avail_kb\":{},\"disk_avail_kb\":{},\"cpu_mhz\":\"{}\"}}",
+                run_no,
+                rep.saturating_add(1),
+                arm.name,
+                seconds,
+                env.load1,
+                env.mem_available_kb,
+                env.disk_avail_kb,
+                env.cpu_mhz,
+            )
+            .map_err(|e| format!("writing results: {e}"))?;
+            out.flush().map_err(|e| format!("writing results: {e}"))?;
+            results.push((idx, seconds));
+        }
+    }
+
+    println!("\n--- sweep summary ({} runs)", results.len());
+    // Drift first: it decides whether anything below it means anything.
+    let half = results.len() / 2;
+    if half > 0 {
+        let mut first: Vec<f64> = results[..half].iter().map(|(_, s)| *s).collect();
+        let mut second: Vec<f64> = results[half..].iter().map(|(_, s)| *s).collect();
+        let (a, b) = (median(&mut first), median(&mut second));
+        let drift = if a > 0.0 { b / a } else { 0.0 };
+        println!(
+            "drift  first half {a:.1}s vs second half {b:.1}s = {drift:.2}x \
+             (arms are interleaved, so this is elapsed-time drift, not an arm effect)"
+        );
+        if !(0.91..=1.10).contains(&drift) {
+            println!(
+                "  WARNING: drift exceeds 10%. Treat any arm difference smaller than \
+                 this as unmeasured."
+            );
+        }
+    }
+    println!();
+    let mut baseline: Option<f64> = None;
+    for (i, arm) in arms.iter().enumerate() {
+        let mut times: Vec<f64> = results
+            .iter()
+            .filter(|(a, _)| *a == i)
+            .map(|(_, s)| *s)
+            .collect();
+        if times.is_empty() {
+            continue;
+        }
+        let lo = times.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let med = median(&mut times);
+        let rel = match baseline {
+            None => {
+                baseline = Some(med);
+                String::from("(baseline)")
+            }
+            Some(b) if b > 0.0 => format!("{:.2}x baseline", med / b),
+            Some(_) => String::new(),
+        };
+        println!(
+            "{:<16} median {med:>8.1}s   min {lo:>8.1}s   max {hi:>8.1}s   spread {:>5.1}%   {rel}",
+            arm.name,
+            if med > 0.0 {
+                100.0 * (hi - lo) / med
+            } else {
+                0.0
+            },
+        );
+    }
+    println!("\nper-run records: {}", out_path.display());
+    Ok(())
+}
+
 /// Print the metadata store's footprint decomposition as JSON.
 fn cmd_redbstat(args: &Args) -> Result<(), String> {
     let appdata = PathBuf::from(args.require("appdata")?);
@@ -829,6 +1114,11 @@ fn main() -> std::process::ExitCode {
             ],
         )
         .and_then(|a| cmd_replay(&a)),
+        "sweep" => Args::parse(
+            rest,
+            &["in", "arms", "reps", "out", "net", "max", "workdirroot"],
+        )
+        .and_then(|a| cmd_sweep(&a)),
         "redbstat" => Args::parse(rest, &["appdata", "net"]).and_then(|a| cmd_redbstat(&a)),
         "pinprobe" => Args::parse(
             rest,

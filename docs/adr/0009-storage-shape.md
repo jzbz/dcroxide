@@ -90,11 +90,15 @@ that would change the design, then decide.**
 2. **dcrd's payload, measured.** Iterate its ffldb metadata and `utxodb`,
    sum key and value bytes per bucket, and record the run's index flags.
    Without this there is no legitimate density comparison, only file sizes.
-3. **A repeatable throughput rig.** Alternating rather than sequential arms,
-   repetitions per configuration, and control for sustained-load state. The
-   current rig cannot separate a 10% effect from a 64% drift, so no rework
-   can be judged on IBD until this exists. This is a prerequisite, not a
-   follow-up.
+3. **A repeatable throughput rig.** ~~Prerequisite~~ **Built**, as
+   `dcroxide-bench sweep`: arms interleaved rather than blocked, the order
+   rotated each repetition so no arm holds a fixed position, a fresh process
+   and workdir per run, machine state captured per run, and a summary that
+   reports **drift first** — the median of the sweep's first half against its
+   second — before any arm comparison, with a warning when drift exceeds 10%.
+   A validation run measured 0.93x drift and separated a 1.28x arm effect
+   from it, which the previous rig could not have done. What remains is to
+   re-run levers (b) and (c) through it at full scale.
 4. **Candidate engine benchmark.** Load the exported `mainnet-full.corpus`
    into each candidate LSM with compression off; record on-disk bytes, wall
    time, and behaviour under `kill -9`. No engine is named in this ADR
