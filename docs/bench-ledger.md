@@ -140,3 +140,13 @@ drift; the second sweep is the evidence for that, not a counterexample.
 The third row above is that rig, built as `dcroxide-bench sweep`, and the
 measurement it made possible. Raw records:
 `artifacts/dcroxide-bench/m1/sweep-levers.jsonl`.
+
+## Per-bucket decomposition (`dcroxide-bench redbstat --buckets`)
+
+Scores ADR-0004's lever (d) per bucket: rows, payload, mean row size, rows
+per page and the slack that implies. Read-only, so unlike `redbstat` alone
+it does not perturb the store it measures.
+
+| date | machine | dcroxide commit | store | result |
+|---|---|---|---|---|
+| 2026-08-10 | m1 | `98b0f37` | full `--addrindex` replay (reproduces the synced datadir) | `spendjournalv3` is **1 row/page** at a 2402 B mean row — 1,777.6 MiB of predicted slack, 75% of the 2.33 GiB predicted total, against 3.44 GiB measured. Its predicted footprint (4,298 MiB) matches ADR-0004's independently measured 4.1 GiB. Every other bucket packs at 10+ rows/page. redb gates `set_page_size` behind `cfg(any(fuzzing, test))`, so the page-size remedy needs a fork; a row under ~2040 B would fit two per page. |

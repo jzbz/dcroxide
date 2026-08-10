@@ -71,7 +71,11 @@ Usage:
       absolute totals are only comparable to a real datadir when the
       same indexes are enabled.
 
-  dcroxide-bench redbstat --appdata <dir> [--net <name>]
+  dcroxide-bench redbstat --appdata <dir> [--net <name>] [--buckets]
+      --buckets additionally reports each bucket's rows, payload and
+      mean row size, with how many rows fit a page and the slack that
+      implies -- ADR-0004's lever (d) scored per bucket.
+
       (--appdata is a node data directory, read from
       <dir>/data/<net>/blocks_ffldb, or a replay --workdir, which holds
       blocks_ffldb at its root; whichever exists is used.)
@@ -157,7 +161,7 @@ enum FlushMsg {
 ///
 /// The parser otherwise consumes the next token as a value, which would
 /// silently swallow the following flag.
-const BOOL_FLAGS: [&str; 2] = ["txindex", "addrindex"];
+const BOOL_FLAGS: [&str; 3] = ["txindex", "addrindex", "buckets"];
 
 /// A parsed flag map over the raw arguments.
 struct Args {
@@ -994,6 +998,42 @@ fn cmd_redbstat(args: &Args) -> Result<(), String> {
     let (params, net_dir) = net_params(args.get("net").unwrap_or("mainnet"))?;
     let data_dir = resolve_store_dir(&appdata, net_dir);
     let db = open_db(&data_dir, params.net.0, false)?;
+
+    if args.get("buckets").is_some() {
+        // Per-bucket first: it is read-only, where raw_stats below opens a
+        // write transaction and perturbs the figures slightly.
+        let buckets = db.bucket_stats().map_err(|e| e.to_string())?;
+        let page = 4096u64;
+        println!(
+            "{:<22} {:>12} {:>12} {:>10} {:>9} {:>12} {:>12}",
+            "bucket", "rows", "payload MiB", "mean row", "rows/page", "pred MiB", "pred slack"
+        );
+        let mut total_slack = 0u64;
+        for b in &buckets {
+            let slack = b.predicted_slack_bytes(page);
+            total_slack = total_slack.saturating_add(slack);
+            println!(
+                "{:<22} {:>12} {:>12.1} {:>10.0} {:>9} {:>12.1} {:>12.1}",
+                b.name,
+                b.rows,
+                b.payload_bytes as f64 / (1024.0 * 1024.0),
+                b.mean_row_bytes(),
+                b.rows_per_page(page),
+                b.predicted_pages(page).saturating_mul(page) as f64 / (1024.0 * 1024.0),
+                slack as f64 / (1024.0 * 1024.0),
+            );
+        }
+        println!(
+            "\npredicted slack across all buckets at a {page}-byte page: {:.2} GiB",
+            total_slack as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+        println!(
+            "note: redb gates set_page_size behind cfg(any(fuzzing, test)), so the page \
+             size cannot be changed from here; a bucket showing 1 row/page is paying the \
+             remainder of every page as slack and can only be helped by a denser row."
+        );
+    }
+
     let stats = db.raw_stats().map_err(|e| e.to_string())?;
     println!("{}", stats.to_json());
     Ok(())
@@ -1165,7 +1205,9 @@ fn main() -> std::process::ExitCode {
             ],
         )
         .and_then(|a| cmd_sweep(&a)),
-        "redbstat" => Args::parse(rest, &["appdata", "net"]).and_then(|a| cmd_redbstat(&a)),
+        "redbstat" => {
+            Args::parse(rest, &["appdata", "net", "buckets"]).and_then(|a| cmd_redbstat(&a))
+        }
         "pinprobe" => Args::parse(
             rest,
             &["appdata", "net", "writes", "commits", "hold", "cachemib"],

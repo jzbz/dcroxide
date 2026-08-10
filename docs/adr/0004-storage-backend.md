@@ -64,17 +64,28 @@ spanned 0.6450 to 0.6462, a spread of 0.0011. Lever (c) does raise free
 pages as predicted (8.40 GiB against 6.17), which is a cost rather than a
 gain. Their *throughput* claims remain unproven: that half of the sweep was
 voided by a 1.64x drift between two runs of the identical baseline. (d)
-*shrink the dominant buckets* — `existsaddridx` is capped near 0.75 GiB by
-arithmetic and costs the contiguous ffldb keyspace to claim;
-`spendjournalv3`'s page-size hypothesis is untested.
+*shrink the dominant buckets* — **measured per bucket, and it is one bucket**:
+`spendjournalv3` holds a 2402-byte mean row against a 4096-byte page, so it
+gets one row per page and pays 1.74 GiB of the 2.33 GiB predicted slack,
+about 75%. Every other bucket packs at 10 rows per page or better.
+`existsaddridx` remains capped near 0.75 GiB and costs the contiguous ffldb
+keyspace to claim. **The page-size remedy is unreachable** — redb gates
+`set_page_size` behind `cfg(any(fuzzing, test))` — so the lever is costed
+rather than closed: a spend-journal row under ~2040 bytes would fit two per
+page and recover most of it.
 
-**So tuning above the engine has not moved the one property worth
-optimising against** — with the exception of lever (d) on `spendjournalv3`,
-which is untested and targets that property directly. The gate this ADR set
-for revisiting the backend is therefore *not* satisfied;
-[ADR-0009](0009-storage-shape.md) records what still has to be measured, and
-withdraws a density comparison against dcrd that this file's figures do not
-support (dcrd's payload was never measured, only its file sizes).
+**Throughput, measured properly at last.** Twelve full-chain runs through
+`dcroxide-bench sweep`, interleaved and repeated, every arm's range disjoint
+from the baseline's: an 8 GiB page cache is **50% slower**, reversing lever
+(b)'s microbenchmark premise; raising flush cadence gives **11% faster**; and
+the cache penalty vanishes when cadence is raised, confirming the interaction
+this ADR predicted.
+
+**So tuning above the engine buys 11% against a 2.2x gap, and the only
+un-closed lever needs the port to re-encode its own spend-journal rows.**
+[ADR-0009](0009-storage-shape.md) records what remains, and withdraws a
+density comparison against dcrd that this file's figures do not support
+(dcrd's payload was never measured, only its file sizes).
 
 **Commit cost.** 9.4 us per dirty entry at the end of a full un-indexed
 replay against 1.59 at the start — 9.4x over 66x of tree growth. Earlier text
@@ -701,3 +712,53 @@ for the same configuration later — a 66% cold-start penalty that the
 first-half/second-half drift check misreported as a trend. `sweep` now
 discards a warm-up run by default and reports range overlap, which does not
 confuse a single outlier with drift.
+
+## Addendum, 2026-08-10 (second) — lever (d) measured: one bucket, and a blocked remedy
+
+`dcroxide-bench redbstat --buckets` reports each bucket's rows, payload and
+mean row size, with how many rows fit a page and the slack that implies. Run
+against the store that reproduces the synced datadir:
+
+| bucket | rows | payload MiB | mean row | rows/page | predicted slack MiB |
+|---|---:|---:|---:|---:|---:|
+| **spendjournalv3** | 1,100,392 | 2,520.8 | **2402 B** | **1** | **1,777.6** |
+| `d` (existsaddridx) | 66,494,886 | 1,585.4 | 25 B | 124 | 509.4 |
+| gcsfilters | 1,100,393 | 414.4 | 395 B | 10 | 15.4 |
+| stakeblockundo | 1,100,393 | 402.7 | 384 B | 10 | 27.1 |
+| blockidxv3 | 1,100,393 | 243.7 | 232 B | 17 | 9.1 |
+| ffldb-blockidx | 1,100,393 | 239.3 | 228 B | 17 | 13.6 |
+| utxosetv3 | 1,849,177 | 128.8 | 73 B | 50 | 15.7 |
+
+Predicted slack across all buckets: **2.33 GiB**, against the 3.44 GiB
+measured — the model accounts for two thirds of it, and its prediction for
+`spendjournalv3`'s footprint (4,298 MiB) lands on the 4.1 GiB this ADR
+measured independently. The mechanism this lever proposed is real and
+located.
+
+**It is one bucket.** `spendjournalv3` contributes 1.74 GiB of the predicted
+2.33, about 75%. Its 2402-byte mean row is over half a 4096-byte page, so two
+rows can never share one and roughly 1694 bytes of every page is slack. Every
+other bucket packs at 10 rows per page or better and contributes little.
+
+**The obvious remedy is unreachable.** Raising the page size to 8 KiB would
+fit three of those rows. redb gates `Builder::set_page_size` behind
+`#[cfg(any(fuzzing, test))]` (`db.rs:1176`) and exposes no feature that
+enables it, so testing the page-size variant of this lever means forking the
+dependency. That is a fact about redb, not a result about dcroxide, and it is
+why the lever stayed untested for so long.
+
+**What is reachable is a denser row.** Anything that brings a spend-journal
+entry below about 2040 bytes fits two per page and recovers most of the
+1.74 GiB. dcrd's own domain-level compressed amount and script encodings are
+the precedent, and are the same mechanism [ADR-0009](0009-storage-shape.md)
+identifies behind dcrd's smaller `utxodb`. That is a change to what the port
+stores, not to how redb stores it, so it needs weighing against parity: the
+spend journal is dcroxide's own serialization, but its *contents* are
+consensus rewind data.
+
+**So the gate.** Lever (d) is now measured rather than assumed. Its upside is
+bounded at roughly 1.74 GiB, concentrated in one bucket, reachable only by
+re-encoding that bucket's rows and not by any storage-engine setting. Set
+against the 3.44 GiB of slack and the 8.33 GiB total gap, it is a real but
+partial remedy — and unlike levers (a), (b) and (c) it is not closed, only
+costed.

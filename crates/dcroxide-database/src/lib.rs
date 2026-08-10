@@ -276,6 +276,56 @@ pub struct Database {
     inner: Arc<DbInner>,
 }
 
+/// One bucket's payload and row-size distribution, from
+/// [`Database::bucket_stats`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketStats {
+    /// The four-byte bucket id that prefixes every key in it.
+    pub id: [u8; 4],
+    /// The bucket's name, or a rendering of its id when the index row
+    /// naming it was not found.
+    pub name: String,
+    /// Rows in the bucket.
+    pub rows: u64,
+    /// Key plus value bytes actually stored.
+    pub payload_bytes: u64,
+    /// The largest single row, key plus value.
+    pub largest_row_bytes: u64,
+}
+
+impl BucketStats {
+    /// Mean stored bytes per row.
+    pub fn mean_row_bytes(&self) -> f64 {
+        if self.rows == 0 {
+            return 0.0;
+        }
+        self.payload_bytes as f64 / self.rows as f64
+    }
+
+    /// Rows that fit in one page of `page_size`, charging redb's eight
+    /// bytes of leaf offsets per pair.
+    ///
+    /// One is the bad case: it means every row occupies a page of its own
+    /// and the rest of that page is slack.
+    pub fn rows_per_page(&self, page_size: u64) -> u64 {
+        let per_row = self.mean_row_bytes().max(1.0) + 8.0;
+        let fits = (page_size as f64 / per_row).floor() as u64;
+        fits.max(1)
+    }
+
+    /// Pages this bucket is predicted to occupy at `page_size`.
+    pub fn predicted_pages(&self, page_size: u64) -> u64 {
+        self.rows.div_ceil(self.rows_per_page(page_size).max(1))
+    }
+
+    /// Bytes predicted to be slack: what the pages hold minus the payload.
+    pub fn predicted_slack_bytes(&self, page_size: u64) -> u64 {
+        self.predicted_pages(page_size)
+            .saturating_mul(page_size)
+            .saturating_sub(self.payload_bytes)
+    }
+}
+
 /// The metadata store's footprint, split into the parts that behave
 /// differently (see [`Database::raw_stats`]).
 ///
@@ -588,6 +638,83 @@ impl Database {
     /// The database driver type (dcrd `Type`).
     pub fn db_type(&self) -> &'static str {
         DB_TYPE
+    }
+
+    /// Per-bucket payload and row-size distribution.
+    ///
+    /// This is what scores ADR-0004's lever (d). redb splits a leaf when
+    /// its contents exceed one page, so a bucket whose mean row is over
+    /// half a page cannot fit two rows in one and spends the remainder as
+    /// slack. Knowing each bucket's row size says which buckets carry the
+    /// slack and how much a denser layout could recover — the page size
+    /// itself cannot be changed, since redb gates `set_page_size` behind
+    /// `cfg(any(fuzzing, test))`.
+    ///
+    /// Read-only: this iterates rather than opening a write transaction,
+    /// so unlike [`Self::raw_stats`] it does not perturb what it measures.
+    pub fn bucket_stats(&self) -> Result<Vec<BucketStats>, Error> {
+        self.check_open()?;
+        let tx = self
+            .inner
+            .kv
+            .begin_read()
+            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        let table = tx
+            .open_table(METADATA_TABLE)
+            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+
+        // Bucket id -> name, from the `bidx<parent><name>` index rows.
+        let mut names: std::collections::BTreeMap<[u8; 4], String> =
+            std::collections::BTreeMap::new();
+        // Bucket id -> (rows, payload bytes, largest row).
+        let mut agg: std::collections::BTreeMap<[u8; 4], (u64, u64, u64)> =
+            std::collections::BTreeMap::new();
+
+        let iter = redb::ReadableTable::range::<&[u8]>(&table, ..)
+            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        for entry in iter {
+            let (k, v) = entry.map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+            let key = k.value();
+            let val = v.value();
+            if key.starts_with(BUCKET_INDEX_PREFIX) {
+                // `bidx` + parent id (4) + name; the value is the child id.
+                if val.len() == 4 && key.len() > BUCKET_INDEX_PREFIX.len() + 4 {
+                    let mut id = [0u8; 4];
+                    id.copy_from_slice(val);
+                    let name = String::from_utf8_lossy(
+                        &key[BUCKET_INDEX_PREFIX.len().saturating_add(4)..],
+                    )
+                    .into_owned();
+                    names.insert(id, name);
+                }
+                continue;
+            }
+            if key.len() < 4 {
+                continue;
+            }
+            let mut id = [0u8; 4];
+            id.copy_from_slice(&key[..4]);
+            let bytes = (key.len() as u64).saturating_add(val.len() as u64);
+            let slot = agg.entry(id).or_insert((0, 0, 0));
+            slot.0 = slot.0.saturating_add(1);
+            slot.1 = slot.1.saturating_add(bytes);
+            slot.2 = slot.2.max(bytes);
+        }
+
+        let mut out: Vec<BucketStats> = agg
+            .into_iter()
+            .map(|(id, (rows, payload, largest))| BucketStats {
+                id,
+                name: names.get(&id).cloned().unwrap_or_else(|| {
+                    format!("<id {:02x}{:02x}{:02x}{:02x}>", id[0], id[1], id[2], id[3])
+                }),
+                rows,
+                payload_bytes: payload,
+                largest_row_bytes: largest,
+            })
+            .collect();
+        out.sort_by_key(|b| core::cmp::Reverse(b.payload_bytes));
+        Ok(out)
     }
 
     /// Decompose the metadata store's on-disk footprint.

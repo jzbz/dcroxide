@@ -80,13 +80,21 @@ part is 0.69 GiB of engine overhead plus 3.44 GiB of slack.
 ## Decision (proposed)
 
 **Do not start a rework yet. Run four measurements that the gate requires and
-that would change the design, then decide.**
+that would change the design, then decide.** Two are now done, and both
+narrowed the case for a rework rather than strengthening it: lever (d) is one
+bucket's row encoding, and the only tuning gain measured anywhere is 11%.
 
-1. **Lever (d) on `spendjournalv3`.** The instrument exists; one replay arm
-   with a changed value layout or a dedicated table scores it against fill.
-   It targets the largest bucket and the stated target metric directly. If it
-   recovers a large share of the 3.44 GiB, the rework is smaller or
-   unnecessary.
+1. **Lever (d) on `spendjournalv3`.** ~~Prerequisite~~ **Measured**, by
+   `redbstat --buckets`: the bucket holds a 2402-byte mean row against a
+   4096-byte page, takes one row per page, and accounts for 1.74 GiB of the
+   2.33 GiB predicted slack — 75%, concentrated in one bucket, with every
+   other bucket packing at 10 rows per page or better. The page-size remedy
+   is unreachable, since redb gates `set_page_size` behind
+   `cfg(any(fuzzing, test))`. What remains reachable is a denser row: under
+   about 2040 bytes two would share a page. That is a change to what this
+   port stores rather than how redb stores it, and it competes with the
+   rework rather than being subsumed by it — a re-encoded spend journal is a
+   far smaller change than a new storage engine for most of the same GiB.
 2. **dcrd's payload, measured.** Iterate its ffldb metadata and `utxodb`,
    sum key and value bytes per bucket, and record the run's index flags.
    Without this there is no legitimate density comparison, only file sizes.
