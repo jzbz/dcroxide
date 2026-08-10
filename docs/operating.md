@@ -58,6 +58,45 @@ numbers are measured, tracked, and attributed to the storage engine's
 commit shape rather than to validation; see
 [ADR-0004](adr/0004-storage-backend.md).
 
+## Storage tuning: one knob helps, one hurts
+
+Two settings change how the metadata store behaves. Both have been measured
+over full mainnet replays; the numbers are in
+[bench-ledger.md](bench-ledger.md) and the reasoning in
+[ADR-0004](adr/0004-storage-backend.md).
+
+**`--utxocachemaxsize` (default 150 MiB) is the one worth raising.**
+Connecting a block flushes the UTXO cache when it fills, and that flush
+forces a durable metadata commit — so the ceiling governs how often the node
+commits. Raising it, together with the metadata overlay, measured **11%
+faster** over a full chain: 3424-3467 s against a baseline of 3866-3888 s,
+across three repetitions with non-overlapping ranges. dcrd has the same flag
+and the same 150 MiB default; the ceiling here is 32 GiB.
+
+Two caveats before you turn it up. The measured arm moved the UTXO cache
+*and* the metadata overlay, and only the former is reachable from the command
+line, so the share belonging to `--utxocachemaxsize` alone is being measured
+separately. And a larger cache means more work lost on an unclean stop:
+nothing is corrupted — the flush ordering holds — but more of the recent
+window has to be redone.
+
+**`DCROXIDE_DB_CACHE` is the one to leave alone.** It sets redb's page cache
+in MiB, defaulting to 1024. Raising it to 8192 made a full-chain replay
+**50% slower** — 5125-6294 s against the same 3866-3888 s baseline, again
+with non-overlapping ranges. That is the opposite of what the setting
+suggests, and the opposite of what a 500,000-key microbenchmark predicted
+when the knob was added. redb splits the figure 90/10 into read cache and
+write buffer, so most of an increase buys read cache that a sequential sync
+never reuses, while the cache's own accounting grows with it.
+
+Whether the 1024 MiB default is itself too large is open, and being
+measured. Until that lands, the safe advice is to leave it unset.
+
+**Neither knob changes how densely the store packs.** Page fill sits at
+0.62-0.65 regardless of either setting, so neither shrinks the data
+directory. They are throughput settings, and the storage size gap against
+dcrd is a separate, unresolved matter recorded in ADR-0004.
+
 ## Identity: paths, files, and environment
 
 dcroxide uses its own identity throughout. Nothing falls back to a
