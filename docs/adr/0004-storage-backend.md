@@ -57,12 +57,20 @@ which a throwaway tool produced. Measurements can be scored against this.
 
 **Levers.** (a) *audit long-lived read transactions* — **closed**, measured
 dead: three probe arms differed by 0.0008%, in the direction opposite to
-pinning. (b) *size the read cache* and (c) *decouple flush cadence* — still
-unmeasured; (c) is now adjustable via `Options::cache_max_size` and
-`cache_flush_interval_secs`, which it was not. (d) *shrink the dominant
-buckets* — `existsaddridx` is capped near 0.75 GiB by arithmetic and costs
-the contiguous ffldb keyspace to claim; `spendjournalv3`'s page-size
-hypothesis is untested.
+pinning. (b) *size the read cache* and (c) *decouple flush cadence* —
+**measured for space, and neither moves fill**: across a five-arm full-chain
+sweep with an eightfold page cache and an eightfold flush cadence, fill
+spanned 0.6450 to 0.6462, a spread of 0.0011. Lever (c) does raise free
+pages as predicted (8.40 GiB against 6.17), which is a cost rather than a
+gain. Their *throughput* claims remain unproven: that half of the sweep was
+voided by a 1.64x drift between two runs of the identical baseline. (d)
+*shrink the dominant buckets* — `existsaddridx` is capped near 0.75 GiB by
+arithmetic and costs the contiguous ffldb keyspace to claim;
+`spendjournalv3`'s page-size hypothesis is untested.
+
+**So tuning above the engine has not moved the one property worth
+optimising against.** That does not prove a shape change would, but it
+removes the cheaper alternative to trying one.
 
 **Commit cost.** 9.4 us per dirty entry at the end of a full un-indexed
 replay against 1.59 at the start — 9.4x over 66x of tree growth. Earlier text
@@ -576,3 +584,71 @@ The address index costs essentially nothing per entry — it ends marginally
 cheaper than the un-indexed run, within run-to-run variation. The 70% rise
 belongs to the **transaction index**. Anything scoring write-path cost should
 treat those two separately rather than as "indexes".
+
+## Addendum, 2026-08-09 (third) — levers (b) and (c): no effect on fill
+
+Both remaining levers were measurable for the first time. Lever (b) needed
+`--dbcache` to reach redb's page cache, and lever (c) needed `--utxocache`:
+the metadata overlay ceiling does not govern flush cadence, because
+connecting a block calls `maybe_flush_utxo_cache`, and that flush forces a
+durable metadata commit whatever the overlay says. An earlier sweep moved
+`--metacache` alone and produced *more* flushes at 800 MiB than at 100 MiB,
+which is the signature of turning the wrong knob.
+
+Five arms over the full chain, `--addrindex`, `--statsevery 0`, each
+decomposed and then deleted so no arm ran on a fuller disk than the one
+before it. The baseline configuration ran first **and last** as a drift
+control.
+
+**The throughput half is void.** The identical baseline measured 4,198 s at
+the start and 6,865 s at the end — a 1.64x drift against lever effects of
+0.88x to 1.12x. Nothing between the two baselines is comparable, and the
+arms' timings should not be quoted. The control is what makes that statement
+possible rather than a suspicion; without it these numbers would have read as
+"the page cache costs 12% and cadence buys 12%", both inside the noise. Disk
+stayed flat at 289 GB used and the machine was at 50 C afterwards, so the
+cause is not disk fill; sustained load over ~6.5 hours is the likeliest
+explanation and is not something this rig currently controls for.
+
+**The space half is clean**, since it does not depend on wall time.
+
+| arm | dbcache / metacache / utxocache | fill | live GiB | free GiB |
+|---|---|---:|---:|---:|
+| base-first | 1024 / 100 / 150 | 0.646166 | 9.823 | 6.17 |
+| cache | 8192 / 100 / 150 | 0.646171 | 9.823 | 6.17 |
+| cadence | 1024 / 800 / 1200 | 0.645363 | 9.835 | 8.40 |
+| both | 8192 / 800 / 1200 | 0.645042 | 9.840 | 6.15 |
+| base-last | 1024 / 100 / 150 | 0.646120 | 9.824 | 4.18 |
+
+Three results survive the drift:
+
+- **Neither lever moves fill.** The spread across all five arms is 0.0011.
+  An eightfold page cache and an eightfold flush cadence change packing by
+  nothing. Since intra-page slack is the component identified as the real
+  target, **neither lever addresses it.**
+- **Stored payload is bit-identical across all five arms** (6,069,302,981
+  bytes). The replay is deterministic in what it stores, which is what
+  licenses comparing the arms at all.
+- **Lever (c) raises free pages, as this ADR predicted.** The cadence arm
+  ends at 8.40 GiB against the baseline's 6.17 — larger commits amortize
+  over more work while raising the per-generation freed set that sets the
+  high-water mark. Note the baseline itself moved 6.17 to 4.18 between its
+  two runs, so the sawtooth's phase sensitivity sits underneath this and the
+  effect is a tendency rather than a constant.
+
+**Where this leaves the levers.** (a) closed by measurement. (b) no effect on
+fill; its throughput claim rests on a 500k-key microbenchmark that a full
+replay has not reproduced and this rig cannot currently test. (c) no effect
+on fill, a measured cost in free pages, and an unproven throughput benefit.
+(d) `existsaddridx` capped near 0.75 GiB by arithmetic at the cost of the
+contiguous keyspace; `spendjournalv3`'s page-size hypothesis untested.
+
+Tuning above the engine has not moved the one property that is stable enough
+to optimise against. That is not proof that a shape change would, but it
+removes the cheaper alternative to trying one.
+
+**What a valid throughput measurement would need**, if anyone wants one:
+alternating arms rather than sequential blocks, several repetitions per
+configuration, and a rig that either controls for sustained-load state or
+measures it. A single pass of five hour-long arms cannot separate a 10%
+effect from a 64% drift, and this attempt is the evidence.
