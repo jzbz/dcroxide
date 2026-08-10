@@ -69,8 +69,12 @@ arithmetic and costs the contiguous ffldb keyspace to claim;
 `spendjournalv3`'s page-size hypothesis is untested.
 
 **So tuning above the engine has not moved the one property worth
-optimising against.** That does not prove a shape change would, but it
-removes the cheaper alternative to trying one.
+optimising against** — with the exception of lever (d) on `spendjournalv3`,
+which is untested and targets that property directly. The gate this ADR set
+for revisiting the backend is therefore *not* satisfied;
+[ADR-0009](0009-storage-shape.md) records what still has to be measured, and
+withdraws a density comparison against dcrd that this file's figures do not
+support (dcrd's payload was never measured, only its file sizes).
 
 **Commit cost.** 9.4 us per dirty entry at the end of a full un-indexed
 replay against 1.59 at the start — 9.4x over 66x of tree growth. Earlier text
