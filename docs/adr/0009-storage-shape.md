@@ -95,9 +95,16 @@ bucket's row encoding, and the only tuning gain measured anywhere is 11%.
    port stores rather than how redb stores it, and it competes with the
    rework rather than being subsumed by it — a re-encoded spend journal is a
    far smaller change than a new storage engine for most of the same GiB.
-2. **dcrd's payload, measured.** Iterate its ffldb metadata and `utxodb`,
-   sum key and value bytes per bucket, and record the run's index flags.
-   Without this there is no legitimate density comparison, only file sizes.
+2. **dcrd's payload, measured.** The instrument is built —
+   `tools/dcrdstat` walks ffldb's metadata and the `utxodb`, attributing
+   every row to its bucket by the same four-byte id prefix
+   `redbstat --buckets` uses, so the two sides report the same two numbers
+   and are directly comparable. What it needs is a dcrd datadir, and none
+   exists on this machine: the 2026-07 baseline's was not kept, which is
+   also why its index configuration is unrecorded. Producing one is a
+   mainnet sync of about an hour at dcrd's measured 276 blk/s, with the
+   index flags recorded this time. Until then the comparison rests on file
+   sizes, and the withdrawn ratio stays withdrawn.
 3. **A repeatable throughput rig.** ~~Prerequisite~~ **Built**, as
    `dcroxide-bench sweep`: arms interleaved rather than blocked, the order
    rotated each repetition so no arm holds a fixed position, a fresh process

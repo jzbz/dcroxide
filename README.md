@@ -350,6 +350,9 @@ work). Currently implemented:
   master `452c1a6c` module versions) as a test oracle over line-delimited JSON
 - `tools/helpgen` — the go-flags help-vector generator over dcrd's
   verbatim config struct
+- `tools/dcrdstat` — sums the payload dcrd actually stores, per ffldb
+  bucket, so a density comparison against dcroxide rests on both sides'
+  measured bytes rather than on file sizes alone
 - `tools/pinbump` — given two dcrd commits, resolves the upstream files
   they touch to the dcroxide crates that port them, via PARITY.md's own
   table, so moving the parity pin starts from a review list rather than
@@ -406,6 +409,7 @@ per machine, commit, and corpus in
 - `tools/oracle/` — the dcrd differential-test oracle (Go)
 - `tools/helpgen/` — the go-flags help-vector generator (Go)
 - `tools/pinbump/` — the parity-pin bump review-list generator (Go)
+- `tools/dcrdstat/` — dcrd payload measurement over ffldb + utxodb (Go)
 - `fuzz/` — `cargo-fuzz` targets (nightly toolchain)
 - `docs/adr/` — architecture decision records
 
