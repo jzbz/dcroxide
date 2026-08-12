@@ -396,7 +396,17 @@ per-pair overhead, 3.44 GiB of intra-page slack at 64.86% B-tree fill,
 and 4.69 GiB of allocated-but-free pages. That last figure — free
 space the allocator holds rather than a packing loss — is the largest
 single component and the least understood. Both it and the flush-bound
-ingest are open and tracked, not fixed. The full measurement record is
+ingest are open and tracked, not fixed.
+
+Since 2026-08-11 the difference has a measured explanation rather than
+an inferred one. Feeding dcrd the identical block bytes and recording
+the index composition on both sides, the two implementations store the
+**same payload** — 6,061,905,929 B against 6,069,302,583 B, fifteen
+buckets equal to the byte, the remainder accounted for by a four-byte
+bucket-id prefix dcroxide adds to each UTXO row. So none of the gap is
+data dcroxide keeps and dcrd does not, and none of it is a denser dcrd
+encoding. Over each store's own payload it is 1.081x under goleveldb
+against 1.738x for redb's live B-tree. The full measurement record is
 in [ADR-0004](docs/adr/0004-storage-backend.md); PARITY.md records the
 divergence from dcrd's two-database layout. Measurements are recorded
 per machine, commit, and corpus in

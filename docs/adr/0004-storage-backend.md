@@ -35,11 +35,23 @@ project brief; fresh sync plus a bulk importer is the accepted default.
   the interface abstraction makes swapping in rocksdb a contained change
   and this ADR gets superseded rather than silently amended.
 
-## Findings as of 2026-08-09 (read this first)
+## Findings as of 2026-08-11 (read this first)
 
-Six dated addenda follow the amendment below, and later ones supersede
-earlier ones — including a retraction. This section states what is currently
+Dated addenda follow the amendment below, and later ones supersede earlier
+ones — including a retraction. This section states what is currently
 believed and points at the evidence; nothing below it has been rewritten.
+
+**The dcrd comparison is now measured on both sides, and it holds.** The
+2026-08-11 addendum reports dcrd's payload at matched index composition,
+against the same block bytes: the two implementations store the *same
+payload*, fifteen buckets agreeing to the byte and the whole-store
+difference 54 bytes on 6.06 GB. Two consequences run through everything
+below. First, the density comparison ADR-0009 withdrew is reinstated — the
+premise it was withdrawn on (that dcrd's domain encodings must be denser) is
+measured false. Second, the remaining gap is the storage layer with no
+domain-level component left in it: the same payload occupies 6.10 GiB under
+goleveldb and 9.82 GiB in redb's live tree, 1.08x against 1.74x over each
+store's own payload.
 
 **The decomposition is validated.** Replaying the full chain with
 `--addrindex` alone, matching the baseline datadir's composition, reproduces
@@ -83,9 +95,13 @@ this ADR predicted.
 
 **So tuning above the engine buys 11% against a 2.2x gap, and the only
 un-closed lever needs the port to re-encode its own spend-journal rows.**
-[ADR-0009](0009-storage-shape.md) records what remains, and withdraws a
-density comparison against dcrd that this file's figures do not support
-(dcrd's payload was never measured, only its file sizes).
+[ADR-0009](0009-storage-shape.md) records what remains. Its withdrawal of
+the density comparison is superseded by the 2026-08-11 addendum, which
+measures dcrd's payload rather than deriving it: the comparison is sound and
+the figures below do support it. What that addendum removes instead is the
+*precedent* for lever (d) — dcrd stores `spendjournalv3` at exactly the same
+bytes, so a denser row is a divergence to invent, not a dcrd behaviour this
+port is failing to copy.
 
 **Commit cost.** 9.4 us per dirty entry at the end of a full un-indexed
 replay against 1.59 at the start — 9.4x over 66x of tree growth. Earlier text
@@ -756,9 +772,133 @@ stores, not to how redb stores it, so it needs weighing against parity: the
 spend journal is dcroxide's own serialization, but its *contents* are
 consensus rewind data.
 
+> **Correction, 2026-08-11.** The precedent named in that paragraph does not
+> exist, and neither does the mechanism it attributes to `utxodb`. dcrd
+> stores `spendjournalv3` at 1,100,392 rows and 2,643,223,854 bytes — the
+> same rows and the same bytes as dcroxide, because dcroxide already uses
+> dcrd's compressed amount and script encodings. There is no denser dcrd
+> encoding to copy. dcrd's `utxodb` is not smaller in payload either
+> (127,657,896 B against dcroxide's 135,054,499 for the same 1,849,177
+> entries, the difference being a 4-byte bucket-id prefix); its *file* is
+> smaller than its own payload because goleveldb elides shared key prefixes,
+> which is an engine property, not an encoding. See the addendum below. The
+> arithmetic in the paragraph stands — a row under ~2040 bytes still fits two
+> per page and still recovers ~1.74 GiB — but it would be a divergence from
+> dcrd rather than a convergence with it, which raises the parity cost the
+> paragraph already flags.
+
 **So the gate.** Lever (d) is now measured rather than assumed. Its upside is
 bounded at roughly 1.74 GiB, concentrated in one bucket, reachable only by
 re-encoding that bucket's rows and not by any storage-engine setting. Set
 against the 3.44 GiB of slack and the 8.33 GiB total gap, it is a real but
 partial remedy — and unlike levers (a), (b) and (c) it is not closed, only
 costed.
+
+## Addendum, 2026-08-11 — dcrd's payload, measured: the same bytes, a different engine
+
+Every dcrd figure in this file until now was a *file size*. This addendum
+measures dcrd's payload with `tools/dcrdstat`, which defines payload exactly
+as `dcroxide-bench redbstat --buckets` does — every key/value pair,
+`len(key) + len(value)`, attributed by ffldb's four-byte bucket id — so the
+two sides report the same quantity rather than two analogous ones.
+
+**Method, stated because composition is what this project has lost before.**
+dcroxide exported `mainnet-full.corpus` from its own datadir in dcrd's
+`addblock` bootstrap format; dcrd imported that exact file. Both sides
+therefore ingested byte-identical blocks, with no network sync on either.
+Index composition was **recorded**: exists-address index on, transaction
+index off, on both sides. One trap is worth naming — `addblock` logs
+"Exists address index is enabled" and then does not build it; the index
+subscriber only catches up when the daemon runs, so the store was 4.09 GiB
+with no `existsaddridx` bucket until `dcrd --norpc --nolisten
+--connect=127.0.0.1:1` brought it to 5.98 GiB. A comparison drawn before
+that step would have been the 2026-07 baseline's error over again. The
+datadir is preserved and rowed in [bench-ledger.md](../bench-ledger.md).
+
+**The result: the two implementations store the same payload.**
+
+| | payload | consumed on disk | over its own payload |
+|---|---:|---:|---:|
+| dcrd, goleveldb, two stores | 6,061,905,929 B (5.646 GiB) | 6.102 GiB | **1.081x** |
+| dcroxide, redb, live B-tree | 6,069,302,583 B (5.652 GiB) | 9.823 GiB | **1.738x** |
+| dcroxide, whole file, uncompacted | " | 14.505 GiB | 2.566x |
+| dcroxide, whole file, compacted | " | 12.052 GiB | 2.132x |
+
+Fifteen buckets agree **to the byte**, including `spendjournalv3`
+(2,643,223,854 B over 1,100,392 rows on both sides) and `existsaddridx`
+(1,662,372,150 B over 66,494,886). The whole-store difference is 7,396,654 B
+against 7,396,708 B predicted from the 4-byte bucket-id prefix dcroxide adds
+to each of 1,849,177 UTXO rows — a **54-byte residual on 6.06 GB**. The
+per-bucket table is in the ledger.
+
+Note what that measures: equal row counts and equal summed key+value
+lengths, not a content diff. A sum cannot see offsetting differences. But
+fifteen buckets agreeing simultaneously at byte resolution is not something
+two different encodings produce, and a digest over each side's sorted stream
+would settle it outright.
+
+**Which figure to quote.** The live tree, 1.738x. It reproduces — 9.79 to
+9.82 GiB across runs, 0.3% — where the whole-file figure does not: matched
+composition has produced 14.00, 14.48 and 16.00 GiB apparent, with free
+pages at 4.18, 4.69 and 6.17 GiB. Free pages are working space (see the
+2026-08-09 retraction), so the live tree is also the honest structural term.
+Two asymmetries belong in the same breath as any ratio:
+
+- **goleveldb's 1.081x is not a pure packing figure.** Its sstable blocks
+  store only each key's non-shared suffix relative to its predecessor, with
+  compression explicitly off on both stores (`Compression: opt.NoCompression`
+  in dcrd's `database/ffldb/db.go` and `internal/blockchain/utxobackend.go`).
+  That is why `utxodb` holds 127,657,896 B of payload in a 119,405,557 B
+  file — **0.935x its own payload**, which ADR-0009 called impossible. It is
+  not impossible; it is prefix elision on sorted 34-byte outpoint keys that
+  repeat a 32-byte txid. A file size can never bound a store's payload, and
+  that single error is what sent the earlier comparison wrong.
+- **The two stores were not written on the same schedule.** dcrd's
+  66,494,886 address-index rows — 92% of all rows — were appended in one
+  catch-up pass over an otherwise finished database, while dcroxide's were
+  interleaved across 1.1M block commits. Insertion order is a first-order
+  determinant of leaf fill and free-page retention in a copy-on-write
+  B-tree, and largely erased by compaction in an LSM. So this bounds the
+  gap as a storage-layer gap; it does not isolate the engine term from the
+  write-schedule term. Doing that needs dcroxide replayed with a matched
+  two-phase index build.
+
+**What it settles.** ADR-0009's withdrawal of the density comparison is
+reversed: dcrd's payload is measured, not derived, and the encodings are not
+denser. The *domain-level* explanation for the disk gap is dead — there is
+none left, because the payload underneath is the same. What remains is the
+storage layer, and within it the two terms above.
+
+**What it closes and does not close.** It closes lever (d)'s precedent, not
+lever (d): re-encoding `spendjournalv3` still recovers ~1.74 GiB
+arithmetically, but with no dcrd behaviour to copy it becomes a deliberate
+divergence. A re-*keying* that splits the row while storing dcrd's exact
+bytes is a third option this file has never considered and nobody has
+tested.
+
+**Compaction, since free pages are the largest remaining term.**
+`redb::Database::compact` is never called in dcroxide. Measured twice now,
+it disagrees with itself by 20x on the same chain: 0.12 GiB in 598.5 s on
+the 2026-07 datadir, 2.453 GiB consumed in 137.9 s on the replay store. The
+disagreement is the result — compaction relocates pages forward and
+truncates, so the yield depends on where free pages sit rather than how many
+there are. It never repacks: `fill_ratio` was 0.646166 before and after, to
+the digit, and every bucket's payload was identical afterwards. Neither
+figure is characteristic, and it is not an operator knob on this evidence.
+
+**A measurement trap worth recording.** `metadata.redb` is sparse. The
+replay store reads 17,182,003,200 B apparent but consumes 15,574,482,944 — a
+1.497 GiB hole to EOF — while dcrd's 3,179 files round *up* to 4 KiB blocks,
+consuming 6,552,084,480 against 6,545,168,267 apparent. Comparing apparent
+sizes overstates redb's cost by about 10% and understates dcrd's. Use
+`st_blocks`.
+
+**A tool bug this exposed, now fixed.** Both instruments reported
+`existsaddridx` as a bucket named `d`. `bidx-cbid` — the bucket-id counter —
+shares the `bidx` prefix and parses as an index row: nine bytes with a
+four-byte value, so the split reads `-cbi` as the parent and `d` as the
+name, then binds it to the id the counter holds, which is the most recently
+allocated bucket. It sorts after the real row (`-` is 0x2d against the root
+parent's 0x00) and overwrote it. Every per-bucket table this project has
+produced carried the wrong label for its second-largest bucket; no number
+was affected. Fixed in both tools, with a test that fails without the fix.

@@ -2,15 +2,24 @@
 
 // Command dcrdstat measures how many payload bytes dcrd actually stores.
 //
-// ADR-0004 compares dcrd's 6.15 GiB of metadata against dcroxide's 14.48
-// and treats the difference as structural overhead. ADR-0009 withdrew the
-// ratio that framing produced, because only dcrd's *file sizes* were ever
-// measured: dividing by dcroxide's payload assumes both stores hold
-// identical bytes, and one cross-check falsifies that — dcrd's whole utxodb
-// is 0.108 GiB where dcroxide's utxosetv3 payload alone is 0.13, which no
-// amount of structural efficiency can produce over the same bytes. dcrd's
-// domain-level compressed encodings are smaller payload, not smaller
-// overhead, and the two effects cannot be separated without this number.
+// ADR-0004 compares dcrd's metadata against dcroxide's and treats the
+// difference as structural overhead. ADR-0009 withdrew the ratio that
+// framing produced, because only dcrd's *file sizes* were ever measured,
+// and it argued from one cross-check — dcrd's whole utxodb is 0.108 GiB
+// where dcroxide's utxosetv3 payload alone is 0.13 — that dcrd must hold
+// smaller payload, since no structural efficiency can put a file under the
+// bytes it stores.
+//
+// That last step is wrong, and this tool exists partly to show why. A
+// goleveldb file CAN be smaller than its own payload with compression off:
+// sstable blocks store only each key's non-shared suffix relative to its
+// predecessor, and sorted outpoint keys repeat a 32-byte txid across a
+// transaction's outputs. Measured here at matched index composition on
+// 2026-08-11, dcrd's utxodb holds 127,657,896 bytes of payload in a
+// 119,405,557-byte store — 0.935x its own payload — with
+// `Compression: opt.NoCompression` set (dcrd internal/blockchain/
+// utxobackend.go). A file size can never bound a store's payload, which is
+// why the comparison needed measuring on both sides rather than deriving.
 //
 // The measurement mirrors `dcroxide-bench redbstat --buckets` so the two
 // sides are directly comparable: iterate every key/value pair, attribute it
@@ -44,7 +53,12 @@ import (
 )
 
 // ffldb's key layout, from dcrd database/ffldb/db.go.
-var bucketIndexPrefix = []byte("bidx")
+var (
+	bucketIndexPrefix = []byte("bidx")
+	// The bucket-id counter, which shares that prefix without being an
+	// index row. See the skip in walkMetadata.
+	curBucketIDKey = []byte("bidx-cbid")
+)
 
 // bucketTotals accumulates one bucket's rows and stored bytes.
 type bucketTotals struct {
@@ -111,6 +125,17 @@ func scanMetadata(path string) (map[[4]byte]*bucketTotals, map[[4]byte]string, u
 		payload += uint64(len(key)) + uint64(len(val))
 
 		if bytes.HasPrefix(key, bucketIndexPrefix) {
+			// `bidx-cbid` is the bucket-id counter, not an index row, and it
+			// parses as one: nine bytes with a four-byte value, so the split
+			// below reads `-cbi` as the parent and `d` as the name, binding
+			// `d` to the id the counter holds — the most recently allocated
+			// bucket. `-` (0x2d) sorts after the root parent's 0x00, so it
+			// lands last and overwrites the real name. This is what reported
+			// `existsaddridx` as `d` on both sides of the 2026-08-11
+			// comparison; dcroxide's redbstat carried the identical bug.
+			if bytes.Equal(key, curBucketIDKey) {
+				continue
+			}
 			// `bidx` + parent id (4) + name -> child bucket id (4).
 			if len(val) == 4 && len(key) > len(bucketIndexPrefix)+4 {
 				var id [4]byte

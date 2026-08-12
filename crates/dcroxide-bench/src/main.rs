@@ -1023,6 +1023,14 @@ fn cmd_redbstat(args: &Args) -> Result<(), String> {
                 slack as f64 / (1024.0 * 1024.0),
             );
         }
+        // Byte-exact rows as well, because the table above rounds to 0.1 MiB
+        // and the comparison this feeds is a claim of equality: dcrd's
+        // `dcrdstat -json` reports whole bytes, so at 0.1 MiB resolution a
+        // per-bucket difference of tens of kilobytes would print as agreement.
+        println!("\nper-bucket payload in bytes (compare `dcrdstat -json`):");
+        for b in &buckets {
+            println!("  {:<22} {:>12} {:>14}", b.name, b.rows, b.payload_bytes);
+        }
         println!(
             "\npredicted slack across all buckets at a {page}-byte page: {:.2} GiB",
             total_slack as f64 / (1024.0 * 1024.0 * 1024.0)

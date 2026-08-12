@@ -17,6 +17,20 @@ comparison invalid and the design wrong on its own premises. Both are
 recorded below rather than quietly dropped, because the errors are
 instructive and because the ADR's evidence base is the point of the file.
 
+**That withdrawal was itself half wrong, and the half matters.** The design
+was wrong for the reasons given, and stays withdrawn. The *comparison* was
+withdrawn on the premise that dcrd must hold less payload — inferred from
+its `utxodb` file being smaller than dcroxide's `utxosetv3` payload, on the
+reasoning that no structural efficiency can put a file under the bytes it
+stores. That reasoning is false: goleveldb's sstable blocks store only each
+key's non-shared suffix, so with compression off dcrd's `utxodb` really does
+hold 127,657,896 B of payload in a 119,405,557 B file, 0.935x. Measuring
+both sides instead of deriving one (2026-08-11, prerequisite 2 below) shows
+the payloads are the same to 54 bytes in 6.06 GB. The comparison is
+reinstated, with bases named; the specific number "156%" is not, because it
+was computed on the whole-file figure, which is the least reproducible
+quantity in this whole investigation.
+
 ### What is measured
 
 - **Lever (a), long-lived read transactions: closed.** Three probe arms
@@ -34,26 +48,45 @@ instructive and because the ADR's evidence base is the point of the file.
 - **On-disk totals at the same height:** dcrd 6.15 GiB of metadata across two
   goleveldb databases; dcroxide 14.48 GiB in one `metadata.redb`, of which
   the live tree is 9.79 GiB and the payload 5.65 GiB.
+- **Payload, both sides, matched composition (2026-08-11).** The same
+  payload: dcrd 6,061,905,929 B against dcroxide 6,069,302,583 B, fifteen
+  buckets equal to the byte, the difference accounted for to 54 bytes by a
+  4-byte bucket-id prefix on 1,849,177 UTXO rows. Over each store's own
+  payload, consumed on disk: goleveldb **1.081x**, redb's live tree
+  **1.738x**, redb's whole file 2.566x uncompacted and 2.132x compacted.
 
 ### What is not measured, and blocks the gate
 
-- **Lever (d) is untested where it matters.** `existsaddridx` is capped near
-  0.75 GiB *by arithmetic* and declined on the cost of the contiguous
-  keyspace — not found ineffective. `spendjournalv3`'s page-size hypothesis
-  has never been run, and it is the largest bucket (4.1 GiB of tree
-  footprint, 2402 B mean row), which makes it the most plausible single
-  source of the 3.44 GiB of slack this ADR would target. **ADR-0004's gate is
-  therefore not satisfied.**
-- **dcrd's payload is unknown.** Only its file sizes were measured. Deriving
-  its overhead ratio from *dcroxide's* payload assumes both stores hold
-  identical bytes, and one cross-check falsifies that: dcrd's entire
-  `utxodb` is 0.108 GiB while dcroxide's `utxosetv3` payload alone is
-  0.13 GiB. Negative overhead is impossible over identical bytes, so dcrd's
-  domain-level compressed amount and script encodings are smaller *payload*,
-  not smaller overhead. The "9% versus 156%" framing is withdrawn.
-- **The dcrd baseline's index configuration was never recorded** and its
-  datadir is gone. This project has already retracted one conclusion for
-  exactly this failure mode.
+- **Lever (d) is measured, and half closed.** `spendjournalv3` is one row per
+  4096-byte page at a 2402 B mean, 1.74 GiB of the 2.33 GiB of predicted
+  slack. The page-size remedy is unreachable (redb gates `set_page_size`
+  behind `cfg(any(fuzzing, test))`). The row-encoding remedy lost its
+  precedent on 2026-08-11: dcrd stores that bucket at exactly the same
+  2,643,223,854 B over the same 1,100,392 rows, so a denser row is a
+  divergence to invent rather than a dcrd behaviour to copy. What is **not**
+  closed is the arithmetic — a row under ~2040 B still recovers ~1.74 GiB —
+  nor a re-*keying* that splits the row while storing dcrd's exact bytes,
+  which has never been tested. **ADR-0004's gate is therefore still not
+  formally satisfied**, though what remains under it is narrow.
+- ~~**dcrd's payload is unknown.**~~ **Measured, 2026-08-11.** The argument
+  that stood here — that dcrd's whole `utxodb` being 0.108 GiB against
+  dcroxide's 0.13 GiB `utxosetv3` payload proves denser dcrd encodings,
+  since "negative overhead is impossible over identical bytes" — was wrong
+  twice. It compared a *file* against a *payload*, and its premise is false:
+  goleveldb elides shared key prefixes, so a file under its own payload is
+  routine, not impossible. Measured payload against payload, the two stores
+  hold the same bytes and dcrd's encodings are not denser. See
+  prerequisite 2.
+- **The 2026-07 dcrd baseline's index configuration was never recorded** and
+  its datadir is gone; this project has already retracted one conclusion for
+  exactly that failure mode. The 2026-08-11 pair fixes it going forward —
+  composition recorded on both sides, datadir preserved and rowed in
+  [bench-ledger.md](../bench-ledger.md) — but it does not recover the old
+  one. That figure can be bounded (dcrd metadata is 4.09 GiB without the
+  address index and 5.98 with it, so 6.045 GiB excludes any composition
+  differing by a bucket of hundreds of MiB) but not identified: a file size
+  is not a composition fingerprint. Retire the 2026-07 figure rather than
+  back-filling a composition onto a datadir that no longer exists.
 - **Commit cost is not established as the dominant term.** The 2.2x IBD gap
   is attributed to commit shape by a progress-stall statistic — which records
   that progress halted, not what halted it — and no profile exists. The
@@ -77,12 +110,43 @@ this ADR's own evidence calls them working space:
 So redb's *structural* overhead is about 73%, not 156%. The attributable
 part is 0.69 GiB of engine overhead plus 3.44 GiB of slack.
 
+Since 2026-08-11 that table has a counterpart on the other side, over the
+*same* payload, disk measured as consumed rather than apparent:
+
+| | over its own payload |
+|---|---:|
+| dcrd, goleveldb, both stores | **1.081x** |
+| dcroxide, redb live B-tree | **1.738x** |
+| dcroxide, whole file, compacted | 2.132x |
+| dcroxide, whole file, uncompacted | 2.566x |
+
+Quote the first two. The whole-file rows move 8.5% between matched-
+composition runs while the live tree reproduces to 0.3%, and goleveldb's
+1.081x is itself net of shared-key-prefix elision, so it is not a pure
+packing figure to set against redb's 0.646 fill. Two caveats travel with any
+of these numbers: the write schedules differed (dcrd's index built in one
+catch-up pass, dcroxide's interleaved across 1.1M commits, which a
+copy-on-write B-tree feels and an LSM largely does not), and equality of
+payload is equality of *summed* key and value lengths, not a content diff.
+
 ## Decision (proposed)
 
 **Do not start a rework yet. Run four measurements that the gate requires and
-that would change the design, then decide.** Two are now done, and both
-narrowed the case for a rework rather than strengthening it: lever (d) is one
-bucket's row encoding, and the only tuning gain measured anywhere is 11%.
+that would change the design, then decide.** Three are now done. The first
+two narrowed the case — lever (d) is one bucket's row encoding, and the only
+tuning gain measured anywhere is 11% — and the third widens it: with payload
+identity established, no part of the storage gap has a domain-level
+explanation left. The same 5.65 GiB occupies 6.10 GiB under goleveldb and
+9.82 GiB in redb's live tree.
+
+That is a real change of direction on the *size* question and no change at
+all on the *speed* one, and the two must not be run together. A rework
+justified on size would still be judged by this ADR's stop rule, which is
+stated in IBD terms — and the ledger bounds what storage can buy there:
+the matched `--addrindex` replay spent 863 s of 4,767 in flushes, so
+eliminating the storage cost *entirely* moves 230.8 to 281.9 blk/s, 1.22x,
+against a 1.5x stop rule. Whatever else is true, an engine swap cannot be
+sold on IBD.
 
 1. **Lever (d) on `spendjournalv3`.** ~~Prerequisite~~ **Measured**, by
    `redbstat --buckets`: the bucket holds a 2402-byte mean row against a
@@ -95,16 +159,30 @@ bucket's row encoding, and the only tuning gain measured anywhere is 11%.
    port stores rather than how redb stores it, and it competes with the
    rework rather than being subsumed by it — a re-encoded spend journal is a
    far smaller change than a new storage engine for most of the same GiB.
-2. **dcrd's payload, measured.** The instrument is built —
-   `tools/dcrdstat` walks ffldb's metadata and the `utxodb`, attributing
-   every row to its bucket by the same four-byte id prefix
-   `redbstat --buckets` uses, so the two sides report the same two numbers
-   and are directly comparable. What it needs is a dcrd datadir, and none
-   exists on this machine: the 2026-07 baseline's was not kept, which is
-   also why its index configuration is unrecorded. Producing one is a
-   mainnet sync of about an hour at dcrd's measured 276 blk/s, with the
-   index flags recorded this time. Until then the comparison rests on file
-   sizes, and the withdrawn ratio stays withdrawn.
+   **Amended 2026-08-11:** that remedy no longer has dcrd behind it. dcrd
+   stores the same bucket at the same 2,643,223,854 B over the same
+   1,100,392 rows, so dcroxide is already using dcrd's encoding and a denser
+   row means inventing one dcrd does not have — a deliberate divergence,
+   which raises the parity cost without changing the 1.74 GiB arithmetic.
+   dcrd needs none of it because goleveldb has no page round-up at all, so
+   "no dcrd headroom" is the expected result and says nothing about what is
+   recoverable here. The untested third option is a re-*keying* that splits
+   the row across two entries while storing dcrd's exact bytes.
+2. **dcrd's payload, measured.** ~~Prerequisite~~ **Done, 2026-08-11**, and
+   it reverses this ADR's withdrawal. Rather than a network sync, dcrd was
+   fed the identical bytes: dcroxide exported `mainnet-full.corpus` in
+   dcrd's `addblock` bootstrap format from its own datadir and dcrd imported
+   that exact file, so the block data is the same on both sides by
+   construction. Index composition was recorded — exists-address index on,
+   transaction index off — and the datadir preserved. (`addblock` *enables*
+   the index without *building* it; the daemon has to run once for catch-up,
+   and a comparison taken before that step would have repeated the 2026-07
+   error.) Result: the two store the same payload, fifteen buckets equal to
+   the byte, 54 bytes of residual on 6.06 GB. So the encoding explanation is
+   dead and the gap is the storage layer — 1.081x against 1.738x over each
+   store's own payload. Full numbers in
+   [ADR-0004's 2026-08-11 addendum](0004-storage-backend.md) and
+   [bench-ledger.md](../bench-ledger.md).
 3. **A repeatable throughput rig.** ~~Prerequisite~~ **Built**, as
    `dcroxide-bench sweep`: arms interleaved rather than blocked, the order
    rotated each repetition so no arm holds a fixed position, a fresh process
@@ -123,12 +201,14 @@ bucket's row encoding, and the only tuning gain measured anywhere is 11%.
    Consequences weighed and declined.
 
 **If those land in favour of a change, the shape to propose is a single
-LSM metadata store, not a split.** dcrd achieves 6.15 GiB with *one*
+LSM metadata store, not a split.** dcrd achieves 6.10 GiB with *one*
 general-purpose store holding block index, spend journal and hash-keyed
-indexes together. The earlier draft's claim that a split "converges with
-dcrd" was backwards. On ADR-0004's own bucket figures the append-only half is
-worth roughly 0.26 GiB beyond what an LSM swap already gives — and it costs
-the atomicity below.
+indexes together — over 6,061,905,929 B of payload measured to be the same
+payload dcroxide holds, so the argument no longer rests on any assumption
+about what the two store. The earlier draft's claim that a split "converges
+with dcrd" was backwards. On ADR-0004's own bucket figures the append-only
+half is worth roughly 0.26 GiB beyond what an LSM swap already gives — and
+it costs the atomicity below.
 
 ## Why the earlier split design was withdrawn
 
@@ -179,7 +259,9 @@ Each from a cost someone else already paid, and each survives the redesign.
 ## Consequences
 
 - Deciding now is deferred by the cost of the four measurements — days, not
-  months, and three of them are useful regardless of the outcome.
+  months, and three of them are useful regardless of the outcome. Three are
+  now done; the deferral cost is one measurement, the candidate engine
+  benchmark.
 - The throughput rig is the long pole and the one with value beyond this
   decision: without it, no storage change can be judged on the metric that
   motivates it.
@@ -187,7 +269,11 @@ Each from a cost someone else already paid, and each survives the redesign.
   dcroxide carries a larger metadata store than dcrd and a slower IBD, both
   documented, on a node that is pre-alpha and not yet safe to operate. That
   is a defensible state to be in while ecosystem acceptance and the security
-  gaps in SECURITY.md are unaddressed.
+  gaps in SECURITY.md are unaddressed. **As of 2026-08-11 the size half is
+  no longer a matter of differing designs**: it is the same payload costing
+  1.081x under one engine and 1.738x under another, with nothing above the
+  engine left to explain it. The speed half is unchanged and still
+  unattributed.
 - **Stop rule for the rework itself, if it starts:** if IBD does not improve
   by at least 1.5x on the repaired rig at the first milestone, abandon it and
   record why. A rewrite of `dcroxide-database`'s internals with no stop rule
@@ -197,14 +283,26 @@ Each from a cost someone else already paid, and each survives the redesign.
 
 - **Start the rework now.** Rejected: the gate is unmet, the motivating
   comparison is withdrawn, no engine is benchmarked, and there is no rig to
-  judge the result.
+  judge the result. **Two of those four grounds are gone as of 2026-08-11** —
+  the comparison is reinstated and measured on both sides, and the rig
+  exists (prerequisite 3). Still rejected, on the two that remain: no
+  candidate engine has been benchmarked, and lever (d) is not formally
+  closed. The rejection is now narrow enough that prerequisite 4 decides it.
 - **More tuning.** Partly rejected — (a), (b), (c) are measured and do not
   move fill — but lever (d) on `spendjournalv3` is exactly the tuning that
-  has *not* been tried, and it is prerequisite 1.
+  has *not* been tried, and it is prerequisite 1. Now measured: one bucket,
+  1.74 GiB, page-size remedy unreachable, row-encoding remedy stripped of
+  its dcrd precedent. A row re-keying remains untried. Add one more untried
+  item found while measuring: `redb::Database::compact` is never called in
+  production here, but its yield varies 20x between two stores of the same
+  chain (0.12 GiB against 2.45 GiB consumed), it never repacks, and it is
+  not an operator knob on that evidence.
 - **Value compression.** Still rejected on ADR-0004's grounds for codec
-  compression. Note the dcrd comparison above suggests dcrd's *domain-level*
-  encodings are denser, which is a different question and belongs with
-  prerequisite 2.
+  compression. The note that used to stand here — that dcrd's domain-level
+  encodings look denser — is deleted: measured, they are not. What dcrd does
+  have is *structural*, not domain: goleveldb elides shared key prefixes
+  between adjacent sstable entries, which is why its `utxodb` file is 0.935x
+  its own payload. That belongs with the engine question, not this one.
 - **Do nothing, indefinitely.** Defensible. The chain grows a few percent a
   year and the rework's difficulty does not track chain size, so deferral is
   cheap. What it displaces matters more: the per-block state comparator, the

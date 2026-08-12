@@ -37,6 +37,7 @@ run, both nodes `--norpc`.
 | date | machine | dcroxide commit | corpus | result | source |
 |---|---|---|---|---|---|
 | 2026-07 | m1 | unrecorded (2.2.0-pre, at the ADR-0004 amendment) | mainnet tip | dcroxide 32.06 GiB total (17.579 GiB blocks + 14.483 GiB metadata.redb); dcrd 23.73 GiB (17.580 GiB blocks + 6.045 GiB metadata leveldb + 0.108 GiB utxodb) | ADR-0004 amendment |
+| 2026-08-11 | m1 | `6cb2f56` | mainnet tip, both sides fed `mainnet-full.corpus` | **Matched composition, payload measured on both sides.** Metadata store, consumed bytes: dcrd 6.102 GiB (6,552,084,480) against dcroxide 14.505 GiB uncompacted (15,574,482,944) and 12.052 GiB compacted (12,940,464,128); dcroxide's live B-tree 9.823 GiB (10,547,314,688). Payload: dcrd 6,061,905,929 B, dcroxide 6,069,302,583 B. Over each store's *own* payload: dcrd 1.081x, dcroxide 1.738x on the live tree, 2.566x on the uncompacted file. | this file, below |
 
 ## Storage decomposition
 
@@ -74,6 +75,7 @@ is opened directly.
 | date | machine | what | path | notes |
 |---|---|---|---|---|
 | 2026-08-07 | m1 | mainnet datadir behind the 2026-07 sync and storage rows | `artifacts/dcroxide-bench/m1/baseline-2026-07-25/blocks_ffldb/` | reflink clone of `artifacts/p2p-sync/data/mainnet/blocks_ffldb/`, written 2026-07-25; 31 GiB apparent, no additional space on btrfs, 22 s. `metadata.redb` is 15,551,119,360 B, the 14.483 GiB the ADR decomposes. |
+| 2026-08-11 | m1 | **dcrd** datadir behind the matched-composition rows | `artifacts/dcroxide-bench/m1/dcrd-payload/data/mainnet/` | dcrd 2.2.0-pre at the parity commit `29f17894`. Built by `tools/addblock -i mainnet-full.corpus` (12m17s, 1,493 blk/s) and then `dcrd --appdata … --norpc --nolisten --connect=127.0.0.1:1` to drive index catch-up. **Composition recorded, which is the point of keeping it:** exists-address index ON, transaction index OFF — `addblock` defaults, no `--txindex`. Kept because ADR-0009 records that losing the 2026-07 baseline's composition cost this project a conclusion. |
 
 ## Replay throughput (dcroxide-bench)
 
@@ -159,3 +161,89 @@ it does not perturb the store it measures.
 | date | machine | dcroxide commit | store | result |
 |---|---|---|---|---|
 | 2026-08-10 | m1 | `98b0f37` | full `--addrindex` replay (reproduces the synced datadir) | `spendjournalv3` is **1 row/page** at a 2402 B mean row — 1,777.6 MiB of predicted slack, 75% of the 2.33 GiB predicted total, against 3.44 GiB measured. Its predicted footprint (4,298 MiB) matches ADR-0004's independently measured 4.1 GiB. Every other bucket packs at 10+ rows/page. redb gates `set_page_size` behind `cfg(any(fuzzing, test))`, so the page-size remedy needs a fork; a row under ~2040 B would fit two per page. |
+
+## Payload, both implementations (2026-08-11)
+
+`tools/dcrdstat` against dcrd and `dcroxide-bench redbstat --buckets`
+against dcroxide, at matched index composition, both fed the identical
+`mainnet-full.corpus`. The two tools define payload the same way — every
+key/value pair, `len(key) + len(value)`, attributed by ffldb's four-byte
+bucket-id prefix — so the columns are comparable rather than analogous.
+
+Byte-exact, because the printed MiB columns round to 0.1 and the claim
+here is one of *equality*:
+
+| bucket | rows | dcrd bytes | dcroxide bytes | delta |
+|---|---:|---:|---:|---:|
+| `spendjournalv3` | 1,100,392 | 2,643,223,854 | 2,643,223,854 | 0 |
+| `existsaddridx` | 66,494,886 | 1,662,372,150 | 1,662,372,150 | 0 |
+| `gcsfilters` | 1,100,393 | 434,544,067 | 434,544,067 | 0 |
+| `stakeblockundo` | 1,100,393 | 422,306,856 | 422,306,856 | 0 |
+| `blockidxv3` | 1,100,393 | 255,544,549 | 255,544,549 | 0 |
+| `ffldb-blockidx` | 1,100,393 | 250,889,604 | 250,889,604 | 0 |
+| `ticketsinblock` | 1,100,393 | 186,711,336 | 186,711,336 | 0 |
+| `hdrcmts` | 668,905 | 46,154,445 | 46,154,445 | 0 |
+| `treasury` | 547,945 | 26,818,360 | 26,818,360 | 0 |
+| `revokedtickets` | 97,514 | 3,998,074 | 3,998,074 | 0 |
+| `livetickets` | 41,000 | 1,681,000 | 1,681,000 | 0 |
+| `tspend` | 42 | 3,192 | 3,192 | 0 |
+| `dbinfo` | 5 | 79 | 79 | 0 |
+| `idxtips` | 2 | 75 | 75 | 0 |
+| `stakedbinfo` | 1 | 23 | 23 | 0 |
+| root (`<id 00000000>`) | 4 / 5 | 369 | 420 | **+51** |
+| UTXO set | 1,849,182 / 1,849,177 | 127,657,896 | 135,054,499 | **+7,396,603** |
+| **total** | | **6,061,905,929** | **6,069,302,583** | **+7,396,654** |
+
+Fifteen buckets agree **to the byte**. Both exceptions are placement, not
+content:
+
+- The **root** difference is 51 B, which is `utxosetstate` — dcroxide keeps
+  it in the metadata root (`chaindb.rs`, `UTXO_SET_STATE_KEY_NAME`) where
+  dcrd keeps it in `utxodb`. 4 B bucket id + 12 B name + 32 B hash + a VLQ
+  height is 51 B, so it is accounted exactly rather than approximately.
+- The **UTXO set** difference is keying. dcrd's utxo keys are *not*
+  unprefixed: every one carries a 2-byte key-set/version prefix
+  (`utxoPrefixUtxoSet = {3,3}`), which dcroxide ports verbatim and then
+  prepends ffldb's 4-byte bucket id on top. Net 4 B/row over 1,849,177 rows
+  is 7,396,708 B predicted against 7,396,654 B observed for the whole
+  store — a **54-byte residual on 6.06 GB**, 9 parts per billion, the
+  remainder being the handful of housekeeping rows the two place
+  differently. dcrd's five extra rows are its four `dbinfo` keys plus
+  `utxosetstate`.
+
+Two bytes of that four are pure redundancy on dcroxide's side — a key-set
+discriminator inside a bucket that already discriminates key sets — worth
+about 3.5 MiB with no parity cost. It is noted, not proposed.
+
+**What this does and does not establish.** It measures equal row counts and
+equal summed key+value lengths, not a content diff; a sum cannot see
+offsetting differences. But twelve buckets agreeing simultaneously at byte
+resolution, over stores built from the same block bytes, is not something
+two different encodings produce. A digest over each side's sorted key/value
+stream would convert it from overwhelming to proof, and both tools already
+iterate every row.
+
+## Compaction (`redb::Database::compact`)
+
+Never called in dcroxide; measured here because ADR-0004 named free pages
+as the leading term and this is the only mechanism that returns them.
+
+| date | machine | store | result |
+|---|---|---|---|
+| 2026-08-09 | m1 | 2026-07 mainnet datadir (14.483 GiB, 4.69 GiB free pages) | 598.5 s to recover **0.12 GiB**; a second pass returns `false` |
+| 2026-08-11 | m1 | full `--addrindex` replay (14.505 GiB consumed, 6.17 GiB free pages) | 137.9 s to recover **2.453 GiB consumed** (3.950 GiB apparent). Free pages 6.17 → 2.22 GiB. `live_tree_bytes` and `fill_ratio` (0.646166) **unchanged to the digit**; every bucket's payload identical afterwards. |
+
+The two disagree by 20x on the same chain at the same composition, and the
+disagreement is the finding: `compact()` relocates pages toward the front
+and truncates, so its yield depends on where free pages happen to sit, not
+on how many there are. Neither figure is characteristic. It never repacks —
+fill is untouched in both runs — which is consistent with ADR-0004's
+reading of the mechanism.
+
+**Measurement trap: `metadata.redb` is sparse.** The replay store's
+apparent size is 17,182,003,200 B but it consumes 15,574,482,944 — a
+1.497 GiB hole running to EOF. Compaction removes the hole, so an
+apparent-size reading credits it with 3.950 GiB where the disk gives back
+2.453. dcrd's side errs the other way: 3,179 files rounded to 4 KiB blocks
+consume 6,552,084,480 against 6,545,168,267 apparent. Quote `st_blocks`,
+not `st_size`, whenever the two stores are compared.

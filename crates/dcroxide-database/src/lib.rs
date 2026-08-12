@@ -677,6 +677,19 @@ impl Database {
             let key = k.value();
             let val = v.value();
             if key.starts_with(BUCKET_INDEX_PREFIX) {
+                // `bidx-cbid` shares the `bidx` prefix but is the bucket-id
+                // counter, not an index row, and it parses as one: nine bytes
+                // long with a four-byte value, so the naive split reads `-cbi`
+                // as the parent and `d` as the name, then binds that name to
+                // whatever id the counter currently holds -- the most recently
+                // allocated bucket. It sorts after the real row (`-` is 0x2d
+                // against the root parent's 0x00), so it silently renamed the
+                // highest-id bucket to `d`. That is how `existsaddridx` came
+                // to be reported as `d` on both sides of the 2026-08-11 dcrd
+                // comparison.
+                if key == CUR_BUCKET_ID_KEY {
+                    continue;
+                }
                 // `bidx` + parent id (4) + name; the value is the child id.
                 if val.len() == 4 && key.len() > BUCKET_INDEX_PREFIX.len() + 4 {
                     let mut id = [0u8; 4];
@@ -1141,5 +1154,53 @@ mod raw_stats_tests {
             s.free_page_bytes() < s.database_fragmented_bytes,
             "the database figure must be the larger of the two"
         );
+    }
+}
+
+#[cfg(test)]
+mod bucket_stats_tests {
+    use super::*;
+
+    /// `bidx-cbid` is the bucket-id counter, not a bucket-index row, but it
+    /// shares the `bidx` prefix and parses as one: the naive split reads
+    /// `-cbi` as the parent id and `d` as the name, and binds `d` to the id
+    /// the counter holds — the most recently allocated bucket. Because `-`
+    /// (0x2d) sorts after the root parent's 0x00, the counter is read last
+    /// and overwrites the real name.
+    ///
+    /// This is not hypothetical: it renamed `existsaddridx` to `d` in every
+    /// per-bucket table this project has produced, on both sides of the
+    /// 2026-08-11 dcrd comparison, because `tools/dcrdstat` ports the same
+    /// parse. Nothing about the numbers was wrong, which is exactly why it
+    /// survived — a mislabelled 66-million-row bucket looks like a real one.
+    #[test]
+    fn the_bucket_id_counter_is_not_read_as_a_bucket_name() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = Database::create(&Options::new(&tmp.path().join("blocks_redb"), 0x0709_1101))
+            .expect("create");
+
+        // Two buckets, so the counter has advanced past the first and would
+        // rename the second rather than a bucket nothing else names.
+        let tx = db.begin(true).expect("begin");
+        for name in [b"existsaddridx".as_slice(), b"utxosetv3".as_slice()] {
+            let bucket = tx.metadata().create_bucket(name).expect("create bucket");
+            bucket.put(b"k", b"v").expect("put");
+        }
+        tx.commit().expect("commit");
+        // A commit stages into the metadata cache; `bucket_stats` reads redb
+        // directly, so the rows have to be pushed down first.
+        db.flush().expect("flush");
+
+        let stats = db.bucket_stats().expect("bucket stats");
+        let names: Vec<&str> = stats.iter().map(|b| b.name.as_str()).collect();
+        assert!(
+            !names.contains(&"d"),
+            "the `bidx-cbid` counter was read as a bucket named `d`: {names:?}"
+        );
+        assert!(
+            names.contains(&"existsaddridx") && names.contains(&"utxosetv3"),
+            "both real buckets must keep their names: {names:?}"
+        );
+        db.close().expect("close");
     }
 }

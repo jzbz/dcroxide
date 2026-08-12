@@ -54,9 +54,18 @@ Budget for it: initial block download runs about **2.2x slower than
 dcrd** — roughly 2.5 hours against dcrd's 1.1 for mainnet from genesis on
 the machine in [bench-ledger.md](bench-ledger.md) — and the chain costs
 more on disk, 32.06 GiB against dcrd's 23.73 GiB at the same tip. Both
-numbers are measured, tracked, and attributed to the storage engine's
-commit shape rather than to validation; see
+numbers are measured and tracked; see
 [ADR-0004](adr/0004-storage-backend.md).
+
+The two have different explanations, and only one of them is settled. The
+**disk** difference is the storage engine and nothing else: as of
+2026-08-11 both nodes have been measured to store the same payload for the
+same chain at the same index composition — fifteen buckets equal to the
+byte — so the extra space is how redb lays those bytes out, not extra data
+dcroxide keeps. Block files match to within a mebibyte. The **time**
+difference is attributed to commit shape but not yet demonstrated to be
+dominated by it; storage accounts for 18% of a full replay's wall time, so
+something outside the storage path is the larger term.
 
 ## Storage tuning: one knob helps, one hurts
 
