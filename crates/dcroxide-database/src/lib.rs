@@ -1176,7 +1176,7 @@ mod bucket_stats_tests {
     #[test]
     fn the_bucket_id_counter_is_not_read_as_a_bucket_name() {
         let tmp = tempfile::tempdir().expect("temp dir");
-        let db = Database::create(&Options::new(&tmp.path().join("blocks_redb"), 0x0709_1101))
+        let db = Database::create(&Options::new(tmp.path().join("blocks_redb"), 0x0709_1101))
             .expect("create");
 
         // Two buckets, so the counter has advanced past the first and would
