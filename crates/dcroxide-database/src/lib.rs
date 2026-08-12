@@ -291,6 +291,16 @@ pub struct BucketStats {
     pub payload_bytes: u64,
     /// The largest single row, key plus value.
     pub largest_row_bytes: u64,
+    /// Row sizes bucketed by `floor(log2(bytes))`, so index `i` counts
+    /// rows of `2^i .. 2^(i+1)` bytes.
+    ///
+    /// A mean is not enough to reason about packing, and assuming it was
+    /// cost this project a retraction: `spendjournalv3` has a mean row of
+    /// 2402 bytes but a *median* of 1248, a p99 of 13748 and a largest row
+    /// of 66699. The mean is set by a long tail and describes almost no
+    /// actual row, which made a bucket that mostly packs several rows per
+    /// leaf look like one that packs none.
+    pub size_log2: [u64; 40],
 }
 
 impl BucketStats {
@@ -302,27 +312,28 @@ impl BucketStats {
         self.payload_bytes as f64 / self.rows as f64
     }
 
-    /// Rows that fit in one page of `page_size`, charging redb's eight
-    /// bytes of leaf offsets per pair.
+    /// The row size at percentile `p` (0.0 to 1.0), as the lower bound of
+    /// the `log2` band it falls in.
     ///
-    /// One is the bad case: it means every row occupies a page of its own
-    /// and the rest of that page is slack.
-    pub fn rows_per_page(&self, page_size: u64) -> u64 {
-        let per_row = self.mean_row_bytes().max(1.0) + 8.0;
-        let fits = (page_size as f64 / per_row).floor() as u64;
-        fits.max(1)
-    }
-
-    /// Pages this bucket is predicted to occupy at `page_size`.
-    pub fn predicted_pages(&self, page_size: u64) -> u64 {
-        self.rows.div_ceil(self.rows_per_page(page_size).max(1))
-    }
-
-    /// Bytes predicted to be slack: what the pages hold minus the payload.
-    pub fn predicted_slack_bytes(&self, page_size: u64) -> u64 {
-        self.predicted_pages(page_size)
-            .saturating_mul(page_size)
-            .saturating_sub(self.payload_bytes)
+    /// Approximate by construction — a band spans a factor of two — but a
+    /// measured approximation, which is the distinction that matters here.
+    /// This replaced a `rows_per_page` / `predicted_slack_bytes` model that
+    /// divided the page size by the *mean* row. That model put
+    /// `spendjournalv3` at one row per page and 1.74 GiB of recoverable
+    /// slack; the bucket measures 1.55 rows per leaf node and 1.536 GiB of
+    /// slack, none of which any re-keying reaches (2026-08-12 addendum to
+    /// ADR-0004). It was close enough to look confirmed and wrong about the
+    /// mechanism, which is the worst combination a model can have.
+    pub fn size_percentile(&self, p: f64) -> u64 {
+        let target = (self.rows as f64 * p.clamp(0.0, 1.0)) as u64;
+        let mut seen = 0u64;
+        for (i, &count) in self.size_log2.iter().enumerate() {
+            seen = seen.saturating_add(count);
+            if seen >= target && count > 0 {
+                return 1u64 << i;
+            }
+        }
+        self.largest_row_bytes
     }
 }
 
@@ -378,13 +389,17 @@ impl RawStats {
     /// Bytes the metadata table's live pages occupy: payload, redb's
     /// per-pair and branch overhead, and the slack between them.
     ///
-    /// Deliberately *not* `(leaf_pages + branch_pages) * page_size`. redb
-    /// spills a value too large for a page into overflow pages, which the
-    /// leaf count does not include, and this table's `spendjournalv3`
-    /// bucket has a mean row of roughly 2.4 KiB. On the mainnet store that
-    /// difference is 1.42 GiB — a page-count sum reports 8.46 GiB where
-    /// the tree really occupies 9.79 — so the sum of the three measured
-    /// components is the honest figure.
+    /// Deliberately *not* `(leaf_pages + branch_pages) * page_size`, which
+    /// on the mainnet store reports 8.46 GiB where the tree really occupies
+    /// 9.79 — a 1.42 GiB shortfall. The reason is that `leaf_pages` counts
+    /// leaf *nodes*, one per node, while a node's allocation is rounded to
+    /// a power-of-two run of pages (`required_order = ceil_log2`), so a
+    /// single row too large to share a leaf can occupy 2, 4 or 32 pages and
+    /// still be counted once. (An earlier version of this comment blamed
+    /// "overflow pages"; redb 2.6.3 has no such mechanism, and the real one
+    /// is the allocator rounding — which is also where 14% of this store's
+    /// slack comes from.) Summing the three measured components is the
+    /// honest figure.
     pub fn live_tree_bytes(&self) -> u64 {
         self.stored_leaf_bytes
             .saturating_add(self.metadata_bytes)
@@ -643,12 +658,20 @@ impl Database {
     /// Per-bucket payload and row-size distribution.
     ///
     /// This is what scores ADR-0004's lever (d). redb splits a leaf when
-    /// its contents exceed one page, so a bucket whose mean row is over
-    /// half a page cannot fit two rows in one and spends the remainder as
-    /// slack. Knowing each bucket's row size says which buckets carry the
-    /// slack and how much a denser layout could recover — the page size
-    /// itself cannot be changed, since redb gates `set_page_size` behind
-    /// `cfg(any(fuzzing, test))`.
+    /// its serialized form exceeds one page **unless the leaf holds a
+    /// single pair**, which is then given a power-of-two run of pages
+    /// (`btree_base.rs` `should_split`). So the threshold that matters is
+    /// per row, not per mean: with a 36-byte key a value over about 4048
+    /// bytes can never share a leaf, and two rows share only when each is
+    /// under about 2002.
+    ///
+    /// Read the distribution, not the mean. An earlier comment here said a
+    /// bucket whose *mean* row exceeds half a page "cannot fit two rows in
+    /// one"; that is false, and believing it put a 1.74 GiB recoverable-slack
+    /// figure into two ADRs. `spendjournalv3` has a 2402-byte mean and a
+    /// 1248-byte median, packs 1.55 rows per leaf node, and its 1.536 GiB of
+    /// slack survives every re-keying measured — see ADR-0004's 2026-08-12
+    /// addendum.
     ///
     /// Read-only: this iterates rather than opening a write transaction,
     /// so unlike [`Self::raw_stats`] it does not perturb what it measures.
@@ -667,7 +690,9 @@ impl Database {
         let mut names: std::collections::BTreeMap<[u8; 4], String> =
             std::collections::BTreeMap::new();
         // Bucket id -> (rows, payload bytes, largest row).
-        let mut agg: std::collections::BTreeMap<[u8; 4], (u64, u64, u64)> =
+        // (rows, payload, largest, log2 size bands)
+        #[allow(clippy::type_complexity)]
+        let mut agg: std::collections::BTreeMap<[u8; 4], (u64, u64, u64, [u64; 40])> =
             std::collections::BTreeMap::new();
 
         let iter = redb::ReadableTable::range::<&[u8]>(&table, ..)
@@ -708,15 +733,20 @@ impl Database {
             let mut id = [0u8; 4];
             id.copy_from_slice(&key[..4]);
             let bytes = (key.len() as u64).saturating_add(val.len() as u64);
-            let slot = agg.entry(id).or_insert((0, 0, 0));
+            let slot = agg
+                .entry(id)
+                .or_insert_with(|| (0u64, 0u64, 0u64, [0u64; 40]));
             slot.0 = slot.0.saturating_add(1);
             slot.1 = slot.1.saturating_add(bytes);
             slot.2 = slot.2.max(bytes);
+            // floor(log2(bytes)), so the band is [2^i, 2^(i+1)).
+            let band = (u64::BITS - 1).saturating_sub(bytes.max(1).leading_zeros()) as usize;
+            slot.3[band.min(39)] = slot.3[band.min(39)].saturating_add(1);
         }
 
         let mut out: Vec<BucketStats> = agg
             .into_iter()
-            .map(|(id, (rows, payload, largest))| BucketStats {
+            .map(|(id, (rows, payload, largest, size_log2))| BucketStats {
                 id,
                 name: names.get(&id).cloned().unwrap_or_else(|| {
                     format!("<id {:02x}{:02x}{:02x}{:02x}>", id[0], id[1], id[2], id[3])
@@ -724,6 +754,7 @@ impl Database {
                 rows,
                 payload_bytes: payload,
                 largest_row_bytes: largest,
+                size_log2,
             })
             .collect();
         out.sort_by_key(|b| core::cmp::Reverse(b.payload_bytes));
@@ -1200,6 +1231,69 @@ mod bucket_stats_tests {
         assert!(
             names.contains(&"existsaddridx") && names.contains(&"utxosetv3"),
             "both real buckets must keep their names: {names:?}"
+        );
+        db.close().expect("close");
+    }
+
+    /// A mean is not a distribution, and treating it as one cost this
+    /// project a 1.74 GiB figure that reached two ADRs and nearly a storage
+    /// format change. `spendjournalv3`'s real shape is a mostly-small
+    /// bucket with a long tail: mean 2402, median 1248, largest 66699.
+    ///
+    /// This builds that shape deliberately — many small rows, a few very
+    /// large — and asserts the percentiles separate from the mean. If
+    /// someone reintroduces a mean-derived packing estimate, the numbers
+    /// here are the counterexample.
+    #[test]
+    fn percentiles_separate_a_long_tail_from_the_mean() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = Database::create(&Options::new(tmp.path().join("blocks_redb"), 0x0709_1101))
+            .expect("create");
+
+        let tx = db.begin(true).expect("begin");
+        {
+            let bucket = tx
+                .metadata()
+                .create_bucket(b"skewed")
+                .expect("create bucket");
+            // 990 rows of ~64 B and 10 of ~64 KiB: the mean lands an order
+            // of magnitude above where almost every row actually is.
+            for i in 0..990u32 {
+                bucket.put(&i.to_be_bytes(), &[0u8; 60]).expect("put");
+            }
+            for i in 990..1000u32 {
+                bucket.put(&i.to_be_bytes(), &[0u8; 65_536]).expect("put");
+            }
+        }
+        tx.commit().expect("commit");
+        db.flush().expect("flush");
+
+        let stats = db.bucket_stats().expect("bucket stats");
+        let b = stats
+            .iter()
+            .find(|b| b.name == "skewed")
+            .expect("skewed bucket");
+
+        assert_eq!(b.rows, 1000);
+        let mean = b.mean_row_bytes();
+        let p50 = b.size_percentile(0.50);
+        assert!(
+            mean > 600.0,
+            "the tail must drag the mean up, got {mean:.0}"
+        );
+        assert!(
+            p50 <= 128,
+            "the median must stay with the 99% of small rows, got {p50}"
+        );
+        assert!(
+            (mean / p50 as f64) > 5.0,
+            "mean {mean:.0} and median {p50} must separate, or the test is not \
+             exercising the thing that misled"
+        );
+        assert!(
+            b.largest_row_bytes >= 65_536,
+            "largest row {} must see the tail",
+            b.largest_row_bytes
         );
         db.close().expect("close");
     }

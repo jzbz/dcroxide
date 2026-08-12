@@ -91,8 +91,16 @@ Usage:
 
   dcroxide-bench redbstat --appdata <dir> [--net <name>] [--buckets]
       --buckets additionally reports each bucket's rows, payload and
-      mean row size, with how many rows fit a page and the slack that
-      implies -- ADR-0004's lever (d) scored per bucket.
+      row-size DISTRIBUTION -- mean, p50, p90, p99 and largest.
+
+      It used to report rows-per-page and a predicted slack instead,
+      modelled by dividing the page size by the mean row.  Those columns
+      are gone: the model was 13% high on slack and wrong about the
+      mechanism, and it drove a proposed storage-format change that
+      measurement then refuted.  redb reports page counts per table and
+      never per bucket, so a per-bucket page figure is not something this
+      tool can measure -- only model.  Read p50 against mean instead;
+      where they diverge the mean is a tail artifact.
 
       (--appdata is a node data directory, read from
       <dir>/data/<net>/blocks_ffldb, or a replay --workdir, which holds
@@ -1121,24 +1129,21 @@ fn cmd_redbstat(args: &Args) -> Result<(), String> {
         // Per-bucket first: it is read-only, where raw_stats below opens a
         // write transaction and perturbs the figures slightly.
         let buckets = db.bucket_stats().map_err(|e| e.to_string())?;
-        let page = 4096u64;
         println!(
-            "{:<22} {:>12} {:>12} {:>10} {:>9} {:>12} {:>12}",
-            "bucket", "rows", "payload MiB", "mean row", "rows/page", "pred MiB", "pred slack"
+            "{:<22} {:>12} {:>12} {:>9} {:>9} {:>9} {:>9} {:>10}",
+            "bucket", "rows", "payload MiB", "mean", "p50", "p90", "p99", "largest"
         );
-        let mut total_slack = 0u64;
         for b in &buckets {
-            let slack = b.predicted_slack_bytes(page);
-            total_slack = total_slack.saturating_add(slack);
             println!(
-                "{:<22} {:>12} {:>12.1} {:>10.0} {:>9} {:>12.1} {:>12.1}",
+                "{:<22} {:>12} {:>12.1} {:>9.0} {:>9} {:>9} {:>9} {:>10}",
                 b.name,
                 b.rows,
                 b.payload_bytes as f64 / (1024.0 * 1024.0),
                 b.mean_row_bytes(),
-                b.rows_per_page(page),
-                b.predicted_pages(page).saturating_mul(page) as f64 / (1024.0 * 1024.0),
-                slack as f64 / (1024.0 * 1024.0),
+                b.size_percentile(0.50),
+                b.size_percentile(0.90),
+                b.size_percentile(0.99),
+                b.largest_row_bytes,
             );
         }
         // Byte-exact rows as well, because the table above rounds to 0.1 MiB
@@ -1163,13 +1168,17 @@ fn cmd_redbstat(args: &Args) -> Result<(), String> {
              additionally counts the `bidx` bucket-index rows)"
         );
         println!(
-            "\npredicted slack across all buckets at a {page}-byte page: {:.2} GiB",
-            total_slack as f64 / (1024.0 * 1024.0 * 1024.0)
-        );
-        println!(
-            "note: redb gates set_page_size behind cfg(any(fuzzing, test)), so the page \
-             size cannot be changed from here; a bucket showing 1 row/page is paying the \
-             remainder of every page as slack and can only be helped by a denser row."
+            "\nnote: these columns are all MEASURED. This tool used to print a modelled \
+             rows/page and predicted slack, derived by dividing the page size by the MEAN \
+             row; that model put spendjournalv3 at one row per page and 1.74 GiB of \
+             recoverable slack, and the figure reached two ADRs before being measured. \
+             The bucket in fact packs 1.55 rows per leaf node and carries 1.536 GiB of \
+             slack that no re-keying reaches -- every split tested made the tree LARGER \
+             (ADR-0004, 2026-08-12). Read p50 against mean: where they diverge, the mean \
+             is a tail artifact and says nothing about how the bucket packs. For the \
+             store's real slack use `redbstat` without --buckets: \
+             table_fragmented_bytes is measured, and redb reports it per table, never \
+             per bucket."
         );
     }
 

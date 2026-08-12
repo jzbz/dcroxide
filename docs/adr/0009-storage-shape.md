@@ -68,6 +68,15 @@ quantity in this whole investigation.
   nor a re-*keying* that splits the row while storing dcrd's exact bytes,
   which has never been tested. **ADR-0004's gate is therefore still not
   formally satisfied**, though what remains under it is narrow.
+  **Superseded 2026-08-12.** The re-keying is now tested and refuted — six
+  layouts built at the bucket's real dimensions, today's the smallest, every
+  split costing 0.18–0.38 GiB — and the slack measures 1.536 GiB against the
+  modelled 1.74, of which ~86% is B-tree leaf under-fill and ~14% the
+  allocator's power-of-two rounding. The "1 row per page" premise was a model
+  artifact; the bucket packs 1.55 rows per leaf node. All four levers are now
+  measured and none is sufficient, so **ADR-0004's revisit gate is
+  satisfied**. The only remedy left inside this engine is an encoding denser
+  than the reference implementation's.
 - ~~**dcrd's payload is unknown.**~~ **Measured, 2026-08-11.** The argument
   that stood here — that dcrd's whole `utxodb` being 0.108 GiB against
   dcroxide's 0.13 GiB `utxosetv3` payload proves denser dcrd encodings,
@@ -183,6 +192,15 @@ sold on IBD.
    "no dcrd headroom" is the expected result and says nothing about what is
    recoverable here. The untested third option is a re-*keying* that splits
    the row across two entries while storing dcrd's exact bytes.
+   **Measured 2026-08-12, and refuted.** Six layouts were built at the
+   bucket's real dimensions: today's is the smallest, and every split costs
+   0.18–0.38 GiB, raising slack as well as payload. Splitting only the 16.7%
+   of rows that provably cannot share a leaf loses too. The slack is real —
+   1.536 GiB measured, against the 1.74 GiB the model predicted — but ~86% of
+   it is ordinary B-tree leaf under-fill and ~14% the allocator's
+   power-of-two rounding, neither of which a key layout reaches. **Lever (d)
+   is closed at this layer**, leaving only an encoding denser than dcrd's or
+   a different engine.
 2. **dcrd's payload, measured.** ~~Prerequisite~~ **Done, 2026-08-11**, and
    it reverses this ADR's withdrawal. Rather than a network sync, dcrd was
    fed the identical bytes: dcroxide exported `mainnet-full.corpus` in
@@ -298,11 +316,16 @@ Each from a cost someone else already paid, and each survives the redesign.
 
 - **Start the rework now.** Rejected: the gate is unmet, the motivating
   comparison is withdrawn, no engine is benchmarked, and there is no rig to
-  judge the result. **Two of those four grounds are gone as of 2026-08-11** —
-  the comparison is reinstated and measured on both sides, and the rig
-  exists (prerequisite 3). Still rejected, on the two that remain: no
-  candidate engine has been benchmarked, and lever (d) is not formally
-  closed. The rejection is now narrow enough that prerequisite 4 decides it.
+  judge the result. **Three of those four grounds are now gone** — the
+  comparison is reinstated and measured on both sides (2026-08-11), the rig
+  exists (prerequisite 3), and lever (d) is closed by measurement
+  (2026-08-12), which satisfies ADR-0004's gate. **Only one ground remains:
+  no candidate engine has been benchmarked.** Prerequisite 4 now decides this
+  ADR on its own, and it is the last thing standing between "rejected" and a
+  real decision. Note what closing lever (d) did and did not establish: it
+  showed the slack is not reachable from above the engine, which is a reason
+  to look *at* the engine — not evidence that a different one would do
+  better, which remains unmeasured.
 - **More tuning.** Partly rejected — (a), (b), (c) are measured and do not
   move fill — but lever (d) on `spendjournalv3` is exactly the tuning that
   has *not* been tried, and it is prerequisite 1. Now measured: one bucket,

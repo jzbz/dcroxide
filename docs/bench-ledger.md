@@ -162,6 +162,50 @@ it does not perturb the store it measures.
 |---|---|---|---|---|
 | 2026-08-10 | m1 | `98b0f37` | full `--addrindex` replay (reproduces the synced datadir) | `spendjournalv3` is **1 row/page** at a 2402 B mean row — 1,777.6 MiB of predicted slack, 75% of the 2.33 GiB predicted total, against 3.44 GiB measured. Its predicted footprint (4,298 MiB) matches ADR-0004's independently measured 4.1 GiB. Every other bucket packs at 10+ rows/page. redb gates `set_page_size` behind `cfg(any(fuzzing, test))`, so the page-size remedy needs a fork; a row under ~2040 B would fit two per page. |
 
+> **The 2026-08-10 row's rows/page, predicted-footprint and predicted-slack
+> cells are MODEL OUTPUT, refuted 2026-08-12.** This file is append-only, so
+> the row stands as written; read it with the row below. The model divided
+> the page size by the *mean* row. The bucket's median row is 1248 bytes, it
+> packs 1.55 rows per leaf node rather than one, and its slack measures
+> 1.536 GiB rather than 1.74. The estimate being close is why nobody checked
+> it. The generating code has been deleted from `BucketStats`.
+>
+> **Rule adopted from it:** a bench tool may not print a modelled quantity
+> beside measured ones without labelling it; no ADR may quote a modelled
+> figure without a measured counterpart; every row here names its instrument.
+
+| date | machine | dcroxide commit | store | result |
+|---|---|---|---|---|
+| 2026-08-12 | m1 | `23940c7` | standalone redb 2.6.3 probe at `spendjournalv3`'s real row lengths | **Measured, replacing the row above.** Tree 4,349,997,056 B over 2,643,223,854 B payload: slack **1,649,264,978 B (1.536 GiB)**, fill 0.6076, 708,672 leaf nodes for 1,100,392 rows = **1.55 rows/node**. Distribution: mean 2402, p50 1248, p99 13748, largest 66699 — 16.7% of rows exceed 4048 B and can never share a leaf. |
+
+## Re-keying `spendjournalv3` (ADR-0004 lever (d), 2026-08-12)
+
+Six layouts built at the bucket's real row lengths, same pseudo-random key
+order and commit cadence, measured on `TableStats` (per-table
+`fragmented_bytes` is intra-page slack; the database-wide figure is not).
+Raw log: `artifacts/dcroxide-bench/m1/rekey2.log`.
+
+| arm | tree bytes | payload | slack | fill | vs today |
+|---|---:|---:|---:|---:|---:|
+| **k=1, today** | **4,349,997,056** | 2,643,223,854 | 1,649,264,978 | 0.6076 | — |
+| k=2 | 4,622,987,264 | 2,687,202,978 | 1,851,670,202 | 0.5813 | +0.254 GiB |
+| k=4 | 4,608,131,072 | 2,770,796,214 | 1,729,445,984 | 0.6013 | +0.240 GiB |
+| split >4048 into 2002 | 4,724,146,176 | 2,666,495,856 | 1,975,077,422 | 0.5644 | +0.348 GiB |
+| split >4048 into 1300 | 4,542,418,944 | 2,680,449,684 | 1,771,169,188 | 0.5901 | +0.179 GiB |
+| split >2002 into 2002 | 4,757,565,440 | 2,672,015,696 | 2,000,235,630 | 0.5616 | +0.380 GiB |
+
+Today's layout is the smallest. Every split raises slack as well as payload,
+so it packs worse rather than merely paying for extra keys.
+
+**A voided first pass, recorded because it is this project's own documented
+trap.** The probe initially read `WriteTransaction::stats()`, whose
+`fragmented_bytes` includes `count_free_pages() * page_size`. Its headline
+column therefore tracked a 6.44 GB file holding 2.09 GB of free pages, inside
+which the tree and the free pool moved oppositely and cancelled: every arm
+landed within 0.045% and the conclusion drawn was that re-keying was neutral
+*and the slack was a model artifact*. Both were wrong. ADR-0004's findings
+header names this exact trap as measurement trap number one.
+
 ## Payload, both implementations (2026-08-11)
 
 `tools/dcrdstat` against dcrd and `dcroxide-bench redbstat --buckets`

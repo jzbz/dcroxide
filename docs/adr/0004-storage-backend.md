@@ -77,14 +77,24 @@ pages as predicted (8.40 GiB against 6.17), which is a cost rather than a
 gain. Their *throughput* claims remain unproven: that half of the sweep was
 voided by a 1.64x drift between two runs of the identical baseline. (d)
 *shrink the dominant buckets* — **measured per bucket, and it is one bucket**:
-`spendjournalv3` holds a 2402-byte mean row against a 4096-byte page, so it
-gets one row per page and pays 1.74 GiB of the 2.33 GiB predicted slack,
-about 75%. Every other bucket packs at 10 rows per page or better.
-`existsaddridx` remains capped near 0.75 GiB and costs the contiguous ffldb
-keyspace to claim. **The page-size remedy is unreachable** — redb gates
-`set_page_size` behind `cfg(any(fuzzing, test))` — so the lever is costed
-rather than closed: a spend-journal row under ~2040 bytes would fit two per
-page and recover most of it.
+`spendjournalv3` carries 1.536 GiB of slack, 44% of the store's, measured on
+the per-table statistic. `existsaddridx` remains capped near 0.75 GiB and
+costs the contiguous ffldb keyspace to claim. **The page-size remedy is
+unreachable** — redb gates `set_page_size` behind `cfg(any(fuzzing, test))`.
+**The re-keying remedy is closed by measurement** (2026-08-12 addendum): six
+layouts were built at the bucket's real dimensions and today's is the
+smallest; every split costs 0.18–0.38 GiB. What remains untested is a denser
+row, which has no dcrd precedent to copy.
+
+> **Correction, 2026-08-12.** This paragraph read "holds a 2402-byte mean row
+> against a 4096-byte page, so it gets one row per page and pays 1.74 GiB of
+> the 2.33 GiB predicted slack, about 75%. Every other bucket packs at 10
+> rows per page or better." Those figures were *modelled*, not measured —
+> `floor(page_size / mean_row)` — and the mean misdescribes the bucket: the
+> median row is 1248 bytes and the bucket packs 1.55 rows per leaf node. The
+> slack is real and close to the estimate (1.536 GiB measured against 1.74
+> predicted), which is why the model was never questioned; the mechanism was
+> wrong, and the remedy it implied does not work.
 
 **Throughput, measured properly at last.** Twelve full-chain runs through
 `dcroxide-bench sweep`, interleaved and repeated, every arm's range disjoint
@@ -1017,3 +1027,94 @@ ADR-0009's remaining blockers — the candidate engine benchmark and lever
 (d)'s untested re-keying — are untouched. And it says nothing about the 2.2x
 IBD gap, which is a live-network measurement of a path this offline replay
 does not exercise.
+
+## Addendum, 2026-08-12 (second) — lever (d): the slack is real, the re-keying does not reach it
+
+ADR-0009 kept one option alive under lever (d): re-key `spendjournalv3` so
+each row is split across several keys, letting chunks from different blocks
+share a page without changing a stored byte. It was the last remedy that did
+not require inventing an encoding dcrd does not have. It has now been built
+and measured, and it does not work.
+
+**The instrument.** A standalone probe (redb 2.6.3 only, no dcroxide code)
+reads the real value length of every `spendjournalv3` row out of a live
+store, then builds fresh databases inserting each row as *k* keys whose
+values partition the original. Identical pseudo-random key order and commit
+cadence across arms — the write schedule moves fill on its own, as the
+previous addendum establishes.
+
+| arm | tree bytes | payload | slack | fill | vs today |
+|---|---:|---:|---:|---:|---:|
+| **k=1, today** | **4,349,997,056** | 2,643,223,854 | 1,649,264,978 | 0.6076 | — |
+| k=2 | 4,622,987,264 | 2,687,202,978 | 1,851,670,202 | 0.5813 | +0.254 GiB |
+| k=4 | 4,608,131,072 | 2,770,796,214 | 1,729,445,984 | 0.6013 | +0.240 GiB |
+| split >4048 into 2002 | 4,724,146,176 | 2,666,495,856 | 1,975,077,422 | 0.5644 | +0.348 GiB |
+| split >4048 into 1300 | 4,542,418,944 | 2,680,449,684 | 1,771,169,188 | 0.5901 | +0.179 GiB |
+| split >2002 into 2002 | 4,757,565,440 | 2,672,015,696 | 2,000,235,630 | 0.5616 | +0.380 GiB |
+
+**Today's layout is the smallest of the six.** Every re-keying raises *slack*
+as well as payload, so it is not merely paying for the extra keys — it packs
+worse too. The selective arms, which split only the rows that provably cannot
+share a leaf, lose as well.
+
+**The slack is real: 1.536 GiB**, 44% of the store's, and the model that
+predicted 1.74 GiB was 13% high rather than fabricated. That is why it went
+unchallenged for days.
+
+**The mechanism, which the model had wrong.** redb splits a leaf when its
+serialized form exceeds one page *unless the leaf holds a single pair*, which
+is then given a power-of-two run of pages (`btree_base.rs` `should_split`).
+So the threshold is per row, not per mean: with a 36-byte key a value over
+about 4048 bytes can never share a leaf, and two rows share only when each is
+under about 2002. `spendjournalv3` is therefore two populations — 83% of rows
+that already share leaves, and 16.7% large enough to need their own page
+runs — and chunking makes the first population worse to help the second.
+Roughly 86% of the slack is ordinary B-tree leaf under-fill, an artifact of
+splitting at the byte midpoint under random keys, and 14% is the allocator's
+power-of-two rounding. Neither is addressable by a key layout.
+
+**What this leaves of lever (d).** The page-size remedy is unreachable, the
+re-keying remedy is refuted, and the denser-row remedy lost its dcrd
+precedent in the 2026-08-11 addendum — dcrd stores this bucket byte for byte
+as dcroxide does. So the 1.536 GiB is real, attributable, and reachable only
+by inventing an encoding denser than the reference implementation's, or by a
+different storage engine. **The lever is closed at this layer.** That is a
+finding for ADR-0009's engine question, not against it.
+
+### The measurement error, recorded because it is this file's own trap
+
+The probe's first pass reported every arm within 0.045% of the baseline and
+concluded that re-keying was neutral and the slack was a model artifact. Both
+were wrong. It had called `WriteTransaction::stats()`, whose
+`fragmented_bytes` adds `count_free_pages() * page_size`
+(`redb transactions.rs:2298`) — so its headline column tracked a 6.44 GB
+*file* containing 2.09 GB of free pages, inside which the tree and the free
+pool moved in opposite directions and cancelled. The correct statistic is the
+per-table `TableStats::fragmented_bytes`, which is exactly what this file's
+findings header names as measurement trap number one, and what
+`RawStats::live_tree_bytes` already computes.
+
+Two further errors came from the same pass and are corrected here: redb's
+`leaf_pages()` counts leaf *nodes*, not 4096-byte pages, so "708,672 leaf
+pages for 1,100,392 rows" is 1.55 rows per node and not 0.64 pages per row;
+and redb 2.6.3 has no overflow-page mechanism at all — the 1.42 GiB
+discrepancy this file previously attributed to overflow pages is the
+allocator's power-of-two rounding, which is the same mechanism lever (d)
+turns on. Both doc comments in `dcroxide-database` are fixed.
+
+### The model is deleted
+
+`BucketStats::rows_per_page`, `predicted_pages` and `predicted_slack_bytes`
+are removed. They were untested, had one consumer, and printed modelled
+columns in the same table and typeface as measured ones with no provenance
+marker. `redbstat --buckets` now reports the measured distribution instead —
+mean, p50, p90, p99 and `largest_row_bytes`, the last of which was computed
+all along and read by nothing. On the real store it prints mean 2402 against
+a p50 of 1024 and a largest of 66699, which is the shape that would have
+killed the mean-row reading on day one.
+
+The rule this implies, and which the ledger now carries: a bench tool may not
+print a modelled quantity beside measured ones without labelling it, and no
+ADR may quote a modelled figure without a measured counterpart. redb reports
+page counts per *table* and never per bucket, so a per-bucket page figure is
+not something this project can measure — only model.
