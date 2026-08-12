@@ -223,6 +223,95 @@ two different encodings produce. A digest over each side's sorted key/value
 stream would convert it from overwhelming to proof, and both tools already
 iterate every row.
 
+## Write schedule (`dcroxide-bench indexcatchup`, 2026-08-12)
+
+Closes the standing objection to the payload comparison above: dcrd's
+66,494,886 exists-address rows were appended in one catch-up pass over a
+finished database, where `replay --addrindex` interleaves them across 1.1M
+block commits. Two arms at identical composition, order alternated
+twophase / interleave / interleave / twophase, `mainnet-full.corpus`,
+commit `73ac17e`, raw records in `artifacts/dcroxide-bench/m1/schedule-sweep.jsonl`.
+
+| arm | live tree | fill | intra-page slack | leaf pages | branch pages | apparent |
+|---|---:|---:|---:|---:|---:|---:|
+| twophase (dcrd's schedule) | 10,475,610,112 | 0.650482 | 3,661,410,507 | 2,162,269 | 48,795 | 17,182,003,200 |
+| interleave (shipped path) | 10,547,240,960 | 0.646171 | 3,731,920,971 | 2,184,891 | 43,722 | 17,182,003,200 |
+
+Both reps of each arm are **byte-identical on every storage figure** — the
+replay is deterministic — while wall times differ (two-phase replay 3,025.40
+and 2,783.89 s; interleave 4,127.27 and 4,118.58). Payload is identical
+across arms and scales, so catch-up builds exactly the index the interleaved
+path builds.
+
+**Result: the schedule is a second-order effect.** Building the index dcrd's
+way makes dcroxide marginally *better* — live tree −0.68%, fill +0.004,
+slack −1.9% — moving the structural multiple over payload from **1.738x to
+1.726x**. Against goleveldb's 1.081x that closes about 1.8% of the excess.
+The reviewer's mechanism is confirmed in sign (batch-building does pack
+better) and refuted in magnitude (it was predicted first-order).
+
+**Do not quote these two figures**, both of which point the other way:
+
+- *Consumed bytes* (16,291,467,264 twophase against 15,574,482,944
+  interleave, a 4.6% "win" for interleaving). Both files have **byte-identical
+  length**; the entire 716,984,320 B difference is sparse tail, matching the
+  hole difference exactly (890,535,936 against 1,607,520,256). It measures how
+  far into the last region each run had written when it stopped.
+- *Free pages* (6.233 against 6.169 GiB). With apparent length identical,
+  free pages are the live-tree figure with the sign flipped —
+  `allocated + free` reconstructs the file length to within ~30 KB in both
+  arms — so it is not an independent measurement. Free pages have moved 4x at
+  250k, 2.01x across five matched cache/cadence arms with the live tree
+  pinned, and 55% between two ledger runs of the same arm; they are not a
+  comparison metric.
+
+**Bounded, not closed.** Only exists-address rows changed schedule —
+`spendjournalv3`, the largest bucket, is written per block in both arms.
+Neither arm was compacted, while dcrd was measured after its compactor had
+quiesced. redb persists its allocator across a clean close, so phase 2 writes
+into free pages phase 1 reserved, which is not goleveldb's situation. And
+goleveldb's own schedule sensitivity — the premise of the objection — was
+never measured, so the asymmetry is closed in one direction only.
+
+**Timing, reported but not established:** two-phase finished ahead in both
+replicates (61.0 and 56.5 min including 10.6 and 10.0 min of catch-up,
+against 68.9 and 68.8). The ordering separates cleanly — the slowest
+two-phase beat the fastest interleave by 7.8 min — but n=2, the order was
+blocked rather than interleaved, the within-two-phase spread is 8.0%, no
+drift was measured, and catch-up's block reads may have been served from a
+page cache phase 1 warmed. It was not run through `sweep`, which exists for
+exactly this comparison class. Treat as a hypothesis worth re-measuring.
+
+### redb's file-growth ladder (why the 250k smoke result was void)
+
+A 250,000-block pilot showed interleaving costing 32% more disk — the
+opposite of the full-chain result — and it was an artifact worth recording,
+because the same trap will catch the next small-corpus comparison.
+
+redb grows in two regimes (`page_manager.rs` `grow()`): while the file holds
+no full region it **doubles** the trailing region; above that it adds whole
+4 GiB regions. `MAX_USABLE_REGION_SPACE` is 4 GiB and the page size is 4096,
+both un-settable outside `cfg(test)`. File length is
+`4096 + Σ (130 + 1,048,576) × 4096` per full region — a 1-page super header
+plus a 130-page region header. So lengths land on a fixed ladder, verified
+byte-exactly by a synthetic probe sharing nothing with dcroxide but the
+engine:
+
+- 250k two-phase: **2,156,408,832 B** (usable 257 × 2¹¹ pages)
+- 250k interleave: **4,295,503,872 B** (clamped to one full region)
+- full chain, both arms: **17,182,003,200 B** = exactly four full regions
+
+The pilot's two arms sat on *consecutive rungs*, so its apparent, free-page
+and consumed figures were decided by a single growth event rather than by the
+schedule. What the crossing does show is directional — interleaving drove
+peak allocator demand past 2.008 GiB where two-phase did not — and the two
+unquantised figures, live tree and fill, agree in sign with the full chain at
+both scales.
+
+Note the ladder also bounds the full-chain comparison: equal apparent length
+means both arms fell inside the same 4 GiB quantum, which pins the schedule's
+effect on *file* size only to within one region.
+
 ## Compaction (`redb::Database::compact`)
 
 Never called in dcroxide; measured here because ADR-0004 named free pages
@@ -240,10 +329,28 @@ on how many there are. Neither figure is characteristic. It never repacks —
 fill is untouched in both runs — which is consistent with ADR-0004's
 reading of the mechanism.
 
-**Measurement trap: `metadata.redb` is sparse.** The replay store's
-apparent size is 17,182,003,200 B but it consumes 15,574,482,944 — a
-1.497 GiB hole running to EOF. Compaction removes the hole, so an
-apparent-size reading credits it with 3.950 GiB where the disk gives back
-2.453. dcrd's side errs the other way: 3,179 files rounded to 4 KiB blocks
-consume 6,552,084,480 against 6,545,168,267 apparent. Quote `st_blocks`,
-not `st_size`, whenever the two stores are compared.
+**Measurement trap: `metadata.redb` is sparse** — and the obvious reading of
+that is wrong, so read this before quoting a disk figure.
+
+The replay store's apparent size is 17,182,003,200 B while it consumes
+15,574,482,944 — a 1.497 GiB hole running to EOF. dcrd's side errs the other
+way: its files round *up* to 4 KiB blocks, consuming 6,552,084,480 against
+6,545,168,267 apparent, a dense 1.001x.
+
+The trap is that **`st_blocks` is not the conservative choice here.** redb
+extends its file with a bare `set_len` and never calls `fallocate` or punches
+a hole, so the sparse tail is simply the region no page has been written into
+*yet*. It only ever shrinks: writing scattered pages into a copy of the 250k
+store left the length bit-identical while consumed rose 398 MiB. So
+`st_blocks` is a high-water mark of what a particular run happened to touch
+before it stopped, not a steady-state footprint, and an operator's `du` walks
+toward `st_size` as the node keeps running.
+
+**Quote apparent length (or the live tree) for redb; either is fine for
+dcrd.** The corollary for the compaction rows above: the honest saving is the
+**3.950 GiB** the file's claim shrank by, not the 2.453 GiB the filesystem
+handed back that day — the uncompacted file would have gone on materialising
+its tail. Two figures from the same run pointing opposite ways is the signal
+that one of them is not a property of the store: see the write-schedule rows
+below, where the entire consumed difference between two byte-identical-length
+files is sparse tail.

@@ -71,6 +71,24 @@ Usage:
       absolute totals are only comparable to a real datadir when the
       same indexes are enabled.
 
+  dcroxide-bench indexcatchup --workdir <dir> [--net <name>]
+                              [--txindex] [--addrindex] [--metacache <mib>]
+      Build an index over a FINISHED store in one pass, as dcrd does.
+
+      `replay --addrindex` interleaves index rows across every block
+      commit.  dcrd cannot: `addblock` enables indexes without building
+      them, so the daemon adds them afterwards in a dedicated catch-up
+      pass over a complete database.  That difference is not cosmetic
+      for a copy-on-write B-tree, where insertion order drives leaf fill
+      and free-page retention, and it confounded the 2026-08-11 payload
+      comparison -- which established that the two implementations store
+      the same bytes, but could not say how much of the on-disk gap was
+      the engine and how much was the write schedule.
+
+      `replay` with no index flags, then this, reproduces dcrd's
+      schedule.  Comparing that against `replay --addrindex` isolates
+      the schedule term; comparing it against dcrd isolates the engine.
+
   dcroxide-bench redbstat --appdata <dir> [--net <name>] [--buckets]
       --buckets additionally reports each bucket's rows, payload and
       mean row size, with how many rows fit a page and the slack that
@@ -628,6 +646,106 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Build an index over a finished store in one pass, the way dcrd does.
+///
+/// This exists to remove a confound rather than to be fast. The
+/// 2026-08-11 dcrd comparison built dcrd's exists-address index in a
+/// dedicated catch-up pass over an already-complete database (`addblock`
+/// enables indexes without building them, so the daemon has to run once),
+/// while dcroxide's `replay --addrindex` interleaved the same 66.5M rows
+/// across 1.1M block commits. Insertion order is a first-order determinant
+/// of leaf fill and free-page retention in a copy-on-write B-tree, and
+/// largely erased by compaction in an LSM, so the two stores were not
+/// comparable on schedule even though they were comparable on content.
+///
+/// `replay` with no index flags followed by this subcommand reproduces
+/// dcrd's schedule exactly, which is what makes the difference between the
+/// two runs the engine term rather than the schedule term.
+fn cmd_indexcatchup(args: &Args) -> Result<(), String> {
+    let workdir = PathBuf::from(args.require("workdir")?);
+    let (params, _net_dir) = net_params(args.get("net").unwrap_or("mainnet"))?;
+
+    let db_path = workdir.join("blocks_ffldb");
+    if !db_path.exists() {
+        return Err(format!(
+            "{} holds no blocks_ffldb: point --workdir at a finished replay",
+            workdir.display()
+        ));
+    }
+    let mut opts = Options::new(&db_path, params.net.0);
+    if let Some(v) = args.get("metacache") {
+        let mib: u64 = v.parse().map_err(|e| format!("bad --metacache: {e}"))?;
+        opts.cache_max_size = mib.saturating_mul(1024 * 1024);
+    }
+    // `open`, not `create`: the store already exists, which is the whole
+    // point of this pass.
+    let db = Arc::new(Database::open(&opts).map_err(|e| e.to_string())?);
+    let db_handle = Arc::clone(&db);
+
+    let chain = Arc::new(Mutex::new(
+        Chain::open((*db).clone(), &params, Hash([0u8; 32]), false, now_unix())
+            .map_err(|e| format!("unable to initialize chain: {e:?}"))?,
+    ));
+    let queryer: Arc<dyn ChainQueryer> = Arc::new(BenchChainQueryer {
+        chain: Arc::clone(&chain),
+        params: params.clone(),
+    });
+
+    let interrupt: Interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut subscriber = IndexSubscriber::new(Arc::clone(&interrupt));
+    let want_tx_index = args.get("txindex").is_some();
+    let want_addr_index = args.get("addrindex").is_some();
+    if !want_tx_index && !want_addr_index {
+        return Err("nothing to build: pass --txindex and/or --addrindex".to_string());
+    }
+    if want_tx_index {
+        TxIndex::new(
+            &mut subscriber,
+            Arc::clone(&db_handle),
+            Arc::clone(&queryer),
+        )
+        .map_err(|e| format!("unable to create the transaction index: {e}"))?;
+    }
+    if want_addr_index {
+        ExistsAddrIndex::new(
+            &mut subscriber,
+            Arc::clone(&db_handle),
+            Arc::clone(&queryer),
+        )
+        .map_err(|e| format!("unable to create the exists-address index: {e}"))?;
+    }
+
+    let (best_height, _) = queryer.best();
+    println!(
+        "catching up txindex {} addrindex {} to height {best_height} in {}",
+        want_tx_index,
+        want_addr_index,
+        workdir.display()
+    );
+
+    let start = Instant::now();
+    subscriber
+        .catch_up(&*queryer)
+        .map_err(|e| format!("index catch-up failed: {e}"))?;
+    let elapsed = start.elapsed();
+
+    // The store has to be durable before it is measured, and the flush is
+    // part of what the schedule comparison is measuring.
+    let flush_start = Instant::now();
+    db.flush().map_err(|e| e.to_string())?;
+    let flush_elapsed = flush_start.elapsed();
+    db.close().map_err(|e| e.to_string())?;
+
+    println!(
+        "catch-up {:.1} s over {} blocks ({:.1} blk/s), final flush {:.1} s",
+        elapsed.as_secs_f64(),
+        best_height,
+        best_height as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+        flush_elapsed.as_secs_f64(),
+    );
+    Ok(())
+}
+
 /// A [`ChainQueryer`] over the replay's chain, so the indexes can be
 /// driven exactly as the daemon drives them.
 ///
@@ -1028,9 +1146,22 @@ fn cmd_redbstat(args: &Args) -> Result<(), String> {
         // `dcrdstat -json` reports whole bytes, so at 0.1 MiB resolution a
         // per-bucket difference of tens of kilobytes would print as agreement.
         println!("\nper-bucket payload in bytes (compare `dcrdstat -json`):");
+        let mut total_rows = 0u64;
+        let mut total_payload = 0u64;
         for b in &buckets {
+            total_rows = total_rows.saturating_add(b.rows);
+            total_payload = total_payload.saturating_add(b.payload_bytes);
             println!("  {:<22} {:>12} {:>14}", b.name, b.rows, b.payload_bytes);
         }
+        // Printed rather than left to the caller: the unnamed root bucket
+        // renders as `<id 00000000>`, which contains a space, so summing
+        // this table with awk silently drops that row. It cost 420 bytes of
+        // confusion once already.
+        println!("  {:<22} {total_rows:>12} {total_payload:>14}", "TOTAL");
+        println!(
+            "  (this is bucket-attributed payload; raw_stats' stored_leaf_bytes \
+             additionally counts the `bidx` bucket-index rows)"
+        );
         println!(
             "\npredicted slack across all buckets at a {page}-byte page: {:.2} GiB",
             total_slack as f64 / (1024.0 * 1024.0 * 1024.0)
@@ -1213,6 +1344,11 @@ fn main() -> std::process::ExitCode {
             ],
         )
         .and_then(|a| cmd_sweep(&a)),
+        "indexcatchup" => Args::parse(
+            rest,
+            &["workdir", "net", "txindex", "addrindex", "metacache"],
+        )
+        .and_then(|a| cmd_indexcatchup(&a)),
         "redbstat" => {
             Args::parse(rest, &["appdata", "net", "buckets"]).and_then(|a| cmd_redbstat(&a))
         }

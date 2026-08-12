@@ -116,18 +116,33 @@ Since 2026-08-11 that table has a counterpart on the other side, over the
 | | over its own payload |
 |---|---:|
 | dcrd, goleveldb, both stores | **1.081x** |
-| dcroxide, redb live B-tree | **1.738x** |
+| dcroxide, redb live B-tree | **1.738x** (1.726x on dcrd's write schedule) |
 | dcroxide, whole file, compacted | 2.132x |
-| dcroxide, whole file, uncompacted | 2.566x |
+| dcroxide, whole file, uncompacted | 2.832x |
 
-Quote the first two. The whole-file rows move 8.5% between matched-
-composition runs while the live tree reproduces to 0.3%, and goleveldb's
-1.081x is itself net of shared-key-prefix elision, so it is not a pure
-packing figure to set against redb's 0.646 fill. Two caveats travel with any
-of these numbers: the write schedules differed (dcrd's index built in one
-catch-up pass, dcroxide's interleaved across 1.1M commits, which a
-copy-on-write B-tree feels and an LSM largely does not), and equality of
-payload is equality of *summed* key and value lengths, not a content diff.
+Quote the first two, and quote the redb side as *apparent* length or live
+tree — never `st_blocks`. redb extends with a bare `set_len` and never
+punches a hole, so consumed bytes are a high-water mark that climbs toward
+the claimed length as the node runs; two stores of byte-identical length have
+already been measured 717 MB apart on that metric alone. goleveldb's 1.081x
+is itself net of shared-key-prefix elision, so it is not a pure packing
+figure to set against redb's 0.646 fill.
+
+Two caveats travelled with these numbers. One is now measured:
+
+- ~~The write schedules differed.~~ **Measured 2026-08-12.** Rebuilding the
+  address index dcroxide-side in one catch-up pass — dcrd's schedule, via
+  `dcroxide-bench indexcatchup` — moves the live tree −0.68% and fill +0.004,
+  *in dcroxide's favour*. The schedule-matched structural figure is **1.726x**
+  against the shipped path's 1.738x, so the schedule accounts for about 1.8%
+  of the excess over goleveldb's 1.081x. The mechanism was right and the
+  magnitude was not. Bounded rather than closed: only exists-address rows
+  changed schedule, neither arm was compacted, and goleveldb's own schedule
+  sensitivity — the premise of the objection — was never measured.
+- **Equality of payload is equality of *summed* key and value lengths**, not
+  a content diff. Fifteen buckets agreeing at byte resolution makes
+  coincidence implausible, but a digest over each side's sorted stream is
+  what would make it proof.
 
 ## Decision (proposed)
 
