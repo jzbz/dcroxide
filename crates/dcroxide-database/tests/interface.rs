@@ -560,11 +560,21 @@ fn a_closed_transaction_releases_its_read_snapshot() {
 
 /// The configured cache size must actually reach redb.
 ///
-/// redb splits `set_cache_size` 90/10 into a read cache and a write
-/// buffer (redb-2.6.3 `db.rs:1185-1188`). When a commit's dirty set
-/// exceeds the write buffer, redb spills those pages to the file,
-/// re-reads them to finalize checksums, and writes the buffer again — so
-/// a too-small buffer roughly doubles the bytes written per commit.
+/// redb 4.1.0 takes one `set_cache_size` figure (`db.rs:1161`) and
+/// partitions it dynamically: the write buffer never exceeds 50% of the
+/// total (`cached_file.rs:205`) and the read cache may grow to 100% when
+/// no write is in flight. When a commit's dirty set exceeds the write
+/// buffer, redb spills those pages to the file, re-reads them to
+/// finalize checksums, and writes the buffer again — so a too-small
+/// buffer roughly doubles the bytes written per commit.
+///
+/// redb 2.6.3 cut the same figure 90/10 (`db.rs:1186-1187`), so the
+/// small arm's buffer grew fivefold across the upgrade, from 6.4 MiB to
+/// 32. The parameters below still clear it: measured after the upgrade,
+/// the small arm writes 96,293,184 bytes against the large arm's
+/// 49,754,432, a ratio of **1.935** against the 1.25 bar, byte-identical
+/// across five runs. Deleting the `set_cache_size` call collapses it to
+/// exactly 1.000.
 ///
 /// That amplification is the observable this asserts. An `Options` field
 /// that is never handed to `redb::Builder` would leave both runs on
@@ -602,7 +612,10 @@ fn the_configured_cache_size_reaches_redb() {
         }
 
         // Enough distinct pages that the dirty set clears the small
-        // write buffer (6.4 MiB) but stays inside the large one.
+        // write buffer but stays inside the large one. A 2048-byte value
+        // under a 20-byte key cannot share a 4 KiB page with another, so
+        // this dirties about 49 MiB: over the small arm's 32 MiB buffer,
+        // well under the large arm's 512.
         const ROWS: usize = 12_000;
         const VALUE: usize = 2048;
 
@@ -638,9 +651,9 @@ fn the_configured_cache_size_reaches_redb() {
             written().saturating_sub(before)
         };
 
-        // 64 MiB -> a 6.4 MiB write buffer, well under the dirty set.
+        // 64 MiB -> a write buffer capped at 32 MiB, under the dirty set.
         let small = run(64 * 1024 * 1024);
-        // 1 GiB -> a 102.4 MiB buffer, comfortably over it.
+        // 1 GiB -> capped at 512 MiB, comfortably over it.
         let large = run(1024 * 1024 * 1024);
 
         assert!(
