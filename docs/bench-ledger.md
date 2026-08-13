@@ -430,12 +430,42 @@ The first row is the one that shows the test works: 10 batches had been
 committed but the store claims 9, so redb discarded an incomplete
 transaction rather than half-applying it.
 
-The fjall arm was still verifying when this was written — its first kill
-committed **55 batches in the same 25 s that got redb to 10**, and the
-verifier reconstructs every expected row before checking it, so each arm
-takes far longer than the kill it follows. Append its rows here when they
-land. The gate-C verdict below does not depend on them: it fails on the
-open-upstream-issue condition, which a `kill -9` cannot exercise.
+Both engines, re-run 2026-08-13 with a sampled verifier (below). Every arm
+passes:
+
+| engine | kill | claims | rows checked | missing | wrong | leaked |
+|---|---|---:|---:|---:|---:|---:|
+| redb 2.6.3 | 25 s | batch 14 | 517,918 | 0 | 0 | 0 |
+| redb 2.6.3 | 60 s | batch 25 | 636,598 | 0 | 0 | 0 |
+| redb 2.6.3 | 110 s | batch 38 | 1,121,670 | 0 | 0 | 0 |
+| fjall 3.1.8 | 25 s | batch 19 | 500,254 | 0 | 0 | 0 |
+| fjall 3.1.8 | 60 s | batch 104 | 1,467,647 | 0 | 0 | 0 |
+| fjall 3.1.8 | 110 s | batch 129 | 1,844,689 | 0 | 0 | 0 |
+
+fjall's write throughput shows here too: the 110 s kill caught it after all
+130 batches, where redb had reached 38.
+
+**The verifier is sampled, and the reason is worth recording.** The first
+version reconstructed every expected row in a hash map: over an hour per
+arm, ~5 GB resident, and it drove the host into swap. The property under
+test is per-key, so a deterministic 1-in-64 sample keyed on an FNV hash of
+the key answers it at the same confidence — validated by reproducing the
+exhaustive verifier's verdict on the redb control in **3.5 s against 76
+minutes**. Two things stay exhaustive because sampling is the wrong tool for
+them: every row of the *boundary* batch, since a torn commit tears exactly
+there, and every row the *next* batch would have written, since that is the
+leaked-data direction a lost-data-only check misses. Both engines were
+re-run rather than only fjall — comparing arms measured with different
+instruments is the confound that has voided three measurements here.
+
+One redb arm first reported FAIL and was **a harness bug, not an engine
+result**: `DatabaseAlreadyOpen`, because the previous iteration's loader
+still held the lock. Re-run with a wait-for-exit, it passes. Recorded
+because a crash-test failure that turns out to be the rig is exactly the
+kind of thing that gets quietly dropped.
+
+None of this changes the gate-C verdict, which fails on the
+open-upstream-issue condition that no `kill -9` can exercise.
 
 **What this test does not cover.** `kill -9` is process death, not power
 loss, and not a write failure. The arms commit with
