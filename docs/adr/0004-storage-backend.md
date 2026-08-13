@@ -35,11 +35,23 @@ project brief; fresh sync plus a bulk importer is the accepted default.
   the interface abstraction makes swapping in rocksdb a contained change
   and this ADR gets superseded rather than silently amended.
 
-## Findings as of 2026-08-11 (read this first)
+## Findings as of 2026-08-13 (read this first)
 
 Dated addenda follow the amendment below, and later ones supersede earlier
 ones — including a retraction. This section states what is currently
 believed and points at the evidence; nothing below it has been rewritten.
+
+**The metadata store now runs redb 4.1.0** (addendum, 2026-08-13). The
+on-disk format changed with it: redb 4 reads only format 3 and returns
+`UpgradeRequired` for a 2.x file, mapped here to a typed error that names
+redb 2.x — a data directory written before 2026-08-13 is refused rather
+than misread, and has to be re-synced or re-imported; the chain data itself
+is not damaged. Every decomposition figure below — payload, overhead,
+slack, free pages, the 0.6486 fill — was measured on 2.6.3, and the packing
+half of it holds: 4.1.0 reproduces the 2.6.3 tree to four decimals on a
+250,000-block replay. Its 9.4% fewer bytes of file come entirely out of
+free-page retention, which is the one row above that a 4.1.0 store reports
+smaller.
 
 **The engine is now measured against candidates, and redb loses on this
 workload.** Handed the identical engine-level journal, fjall 3.1.8 holds
@@ -759,7 +771,7 @@ confuse a single outlier with drift.
 mean row size, with how many rows fit a page and the slack that implies. Run
 against the store that reproduces the synced datadir:
 
-| bucket | rows | payload MiB | mean row | rows/page | predicted slack MiB |
+| bucket | rows | payload MiB | mean row | rows/page (modelled) | predicted slack MiB (modelled) |
 |---|---:|---:|---:|---:|---:|
 | **spendjournalv3** | 1,100,392 | 2,520.8 | **2402 B** | **1** | **1,777.6** |
 | `d` (existsaddridx) | 66,494,886 | 1,585.4 | 25 B | 124 | 509.4 |
@@ -768,6 +780,14 @@ against the store that reproduces the synced datadir:
 | blockidxv3 | 1,100,393 | 243.7 | 232 B | 17 | 9.1 |
 | ffldb-blockidx | 1,100,393 | 239.3 | 228 B | 17 | 13.6 |
 | utxosetv3 | 1,849,177 | 128.8 | 73 B | 50 | 15.7 |
+
+> **Correction, 2026-08-12.** The last two columns are *modelled* —
+> `floor(page_size / mean_row)` — and the model has since been deleted from
+> `redbstat` (see the second 2026-08-12 addendum below). Measured,
+> `spendjournalv3` carries **1.536 GiB** of slack against the 1,777.6 MiB
+> predicted here, 13% high, and the mean the model divides by hides two
+> populations: p50 1024 B, largest row 66,699 B. Read those two columns, and
+> the two paragraphs after this table, as resting on that model.
 
 Predicted slack across all buckets: **2.33 GiB**, against the 3.44 GiB
 measured — the model accounts for two thirds of it, and its prediction for
@@ -779,6 +799,20 @@ located.
 2.33, about 75%. Its 2402-byte mean row is over half a 4096-byte page, so two
 rows can never share one and roughly 1694 bytes of every page is slack. Every
 other bucket packs at 10 rows per page or better and contributes little.
+
+> **Correction, 2026-08-12.** Modelled, and the mechanism is wrong. redb
+> splits a leaf whose serialized form exceeds a page *unless the leaf holds
+> a single pair* (`btree_base.rs` `should_split`), so the threshold is per
+> row rather than per mean: with a 36-byte key a value over about 4048 bytes
+> can never share a leaf, and two rows share only when each is under about
+> 2002. `spendjournalv3` is two populations — 83% of rows that already share
+> leaves and 16.7% large enough to need their own page runs — so "two rows
+> can never share one" is false for five sixths of them. The measured slack
+> is 1.536 GiB, roughly 86% ordinary leaf under-fill and 14% allocator
+> power-of-two rounding, neither of which a key layout reaches: the
+> re-keying this mechanism implies was built and refuted (see the second
+> 2026-08-12 addendum). "The mechanism this lever proposed is real and
+> located", above, is wrong in the same way.
 
 **The obvious remedy is unreachable.** Raising the page size to 8 KiB would
 fit three of those rows. redb gates `Builder::set_page_size` behind

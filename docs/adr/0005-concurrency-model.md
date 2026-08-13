@@ -3,7 +3,7 @@
 - **Status:** Accepted (decision D2) — ratified 2026-08-07 as shipped: the
   thread-per-peer fallback, not the tokio proposal; see the addenda
 - **Date:** 2026-07-03 (proposed), 2026-07-26 (addendum: what shipped),
-  2026-08-07 (ratified)
+  2026-08-07 (ratified), 2026-08-13 (addendum: the storage levers closed)
 
 ## Context
 
@@ -110,3 +110,35 @@ concurrency stays an honest open question — it is to be measured against
 dcrd before wallet integrations land, not assumed — but its answer,
 either way, arrives as targeted fixes behind the existing seams, not as a
 runtime swap.
+
+## Addendum, 2026-08-13 — the levers closed; the gap did not move
+
+The 2026-08-07 performance paragraph closed on the IBD gap being "to be
+closed in the storage layer, through ADR-0004's levers". That no longer
+holds. All four levers are measured and closed. (a) *audit long-lived read
+transactions*: dead, three probe arms within 0.0008% and in the direction
+opposite to pinning. (b) *size the read cache*: inverted, an 8 GiB page
+cache is 50% slower over a full replay. (c) *decouple flush cadence*: a real
+11%, the only tuning gain measured anywhere. (d) *shrink the dominant
+buckets*: one bucket, `spendjournalv3`, holding 1.536 GiB of measured slack
+that the page-size remedy cannot reach (redb gates `set_page_size` behind
+`cfg(any(fuzzing, test))`), that re-keying makes worse (six layouts built at
+the bucket's real dimensions, every split larger than today's), and that a
+denser row reaches only by inventing an encoding dcrd does not have — dcrd
+stores the same bucket byte for byte. Tuning above the engine buys 11%
+against a 2.2x gap.
+
+Its attribution is weaker than it reads, as well. A progress-stall statistic
+records that progress halted, not what halted it, and no profile exists of
+either sync. The matched `--addrindex` replay bounds the storage term from
+the other side: 863 s of 4,767 s in flushes, 18% of wall time, so
+eliminating the storage cost *entirely* moves 230.8 to 281.9 blk/s — 1.22x,
+not 2.2x. The larger unexplained term is elsewhere: that replay runs at
+230.8 blk/s where the live sync manages 124 on an identical engine, which
+puts close to half of live IBD wall time outside anything the replay
+measures.
+
+D2 is unaffected either way. No concurrency model removes those stalls, and
+neither term implicates threading. What remains of the storage question is
+ADR-0009's engine decision, and the 1.22x bound is why it cannot be sold on
+IBD.

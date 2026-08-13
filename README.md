@@ -104,14 +104,16 @@ work). Currently implemented:
   against dcrd
 - `dcroxide-database` — block and metadata storage with dcrd's
   `database` interface semantics (buckets, transactions, block storage
-  APIs, all error kinds), backed by redb per ADR-0004 with dcrd's exact
-  ffldb key layout and flat-file block record format, plus bulk block
-  import/export in dcrd's `addblock` bootstrap format, plus ffldb's
-  metadata write cache — layered snapshots over one durable flush per
-  window — so a sync commits on dcrd's schedule rather than per block;
-  pinned by the ported ffldb interface-test battery and a
+  APIs, all error kinds), backed by redb 4.1.0 per ADR-0004 with
+  dcrd's exact ffldb key layout and flat-file block record format, plus
+  bulk block import/export in dcrd's `addblock` bootstrap format, plus
+  ffldb's metadata write cache — layered snapshots over one durable
+  flush per window — so a sync commits on dcrd's schedule rather than
+  per block; pinned by the ported ffldb interface-test battery and a
   crash-consistency rig (fresh-sync stance: no in-place dcrd datadir
-  reuse)
+  reuse, and no in-place upgrade from a pre-2026-08-13 dcroxide datadir
+  either — redb 4 refuses a 2.x file with a typed error naming the
+  version, and the chain must be re-synced or re-imported)
 - `dcroxide-blockchain` — the chain engine from dcrd's
   `internal/blockchain`, ported complete.
 
@@ -377,15 +379,24 @@ download.** Interop holds in both directions — dcrd accepts
 `/dcrwire:1.0.0/dcroxide:2.2.0/` and dcroxide accepts
 `/dcrwire:1.0.0/dcrd:2.2.0(pre)/`, each reaching a matching tip.
 
-The cause is the storage engine's commit shape, not validation. Across
-its two runs dcroxide spent 80.1% and 82.4% of wall time in progress
-stalls over 20 seconds; dcrd stalled zero times in 754 windows.
-goleveldb's LSM commit is O(dirty) with background compaction, while
-redb is a copy-on-write B-tree with no background work, so commit cost
-tracks the size of the tree.
+The gap is attributed to the storage engine's commit shape rather than
+to validation. Across its two runs dcroxide spent 80.1% and 82.4% of
+wall time in progress stalls over 20 seconds; dcrd stalled zero times
+in 754 windows. goleveldb's LSM commit is O(dirty) with background
+compaction, while redb is a copy-on-write B-tree with no background
+work, so commit cost tracks the size of the tree.
 
-At the tip the same chain costs 23.73 GiB under dcrd and 32.06 GiB
-under dcroxide. Block bytes are consensus data and match to within a
+That attribution is not established. A stall statistic records that
+progress halted, not what halted it, and no profile exists. The matched
+`--addrindex` replay spent 863 s of 4,767 in flushes — 18% — and ran at
+230.8 blk/s against the live sync's 124, so eliminating the storage
+cost entirely moves 230.8 to 281.9 blk/s, 1.22x. A different engine
+does not close 2.2x on its own, and the replay-versus-sync gap is the
+larger unexplained term.
+
+At the tip the same chain cost 23.73 GiB under dcrd and 32.06 GiB
+under dcroxide, measured 2026-07 under redb 2.6.3 and not re-run since
+the 4.1.0 upgrade. Block bytes are consensus data and match to within a
 mebibyte — 17.580 GiB against 17.579 GiB — so the whole 8.33 GiB
 difference is metadata: dcrd's 6.045 GiB `blocks_ffldb/metadata`
 leveldb plus a 0.108 GiB `utxodb`, against one 14.483 GiB
@@ -393,10 +404,15 @@ leveldb plus a 0.108 GiB `utxodb`, against one 14.483 GiB
 databases with `opt.NoCompression`. The redb file holds 5.65 GiB of
 payload over 76,302,003 rows, and the rest divides into 0.69 GiB of
 per-pair overhead, 3.44 GiB of intra-page slack at 64.86% B-tree fill,
-and 4.69 GiB of allocated-but-free pages. That last figure — free
-space the allocator holds rather than a packing loss — is the largest
-single component and the least understood. Both it and the flush-bound
-ingest are open and tracked, not fixed.
+and 4.69 GiB of allocated-but-free pages. That last figure is reused
+working space the allocator draws down, not a packing loss and not a
+comparison metric: it has moved 4x at 250,000 blocks, 2.01x across five
+matched cache/cadence arms with the live tree pinned, and 55% between
+two runs of the same arm. The figure to quote is the live B-tree, which
+reproduces at 9.79-9.82 GiB across runs of matching composition. All
+four of ADR-0004's levers are measured and closed; what stays open is
+the flush-bound ingest and the engine question in
+[ADR-0009](docs/adr/0009-storage-shape.md).
 
 Since 2026-08-11 the difference has a measured explanation rather than
 an inferred one. Feeding dcrd the identical block bytes and recording
@@ -406,8 +422,9 @@ buckets equal to the byte, the remainder accounted for by a four-byte
 bucket-id prefix dcroxide adds to each UTXO row. So none of the gap is
 data dcroxide keeps and dcrd does not, and none of it is a denser dcrd
 encoding. Over each store's own payload it is 1.081x under goleveldb
-against 1.738x for redb's live B-tree. The full measurement record is
-in [ADR-0004](docs/adr/0004-storage-backend.md); PARITY.md records the
+against 1.738x for redb's live B-tree (1.726x on dcrd's write
+schedule). The full measurement record is in
+[ADR-0004](docs/adr/0004-storage-backend.md); PARITY.md records the
 divergence from dcrd's two-database layout. Measurements are recorded
 per machine, commit, and corpus in
 [docs/bench-ledger.md](docs/bench-ledger.md).

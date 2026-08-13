@@ -1,7 +1,30 @@
 # ADR-0009 — Storage rework: what the evidence supports, and what must be measured first
 
-- **Status:** Proposed
-- **Date:** 2026-08-10
+- **Status:** Proposed — **all four prerequisites measured as of 2026-08-13,
+  and the three conditions this ADR set on an engine change are met. What
+  remains is a decision, not a measurement, and ratifying or superseding
+  this ADR is the project owner's call.**
+- **Date:** 2026-08-10 (proposed), 2026-08-13 (prerequisites complete)
+
+**Read this first.** The ADR below is a record of an investigation that
+changed direction more than once, and the reasoning it superseded is kept
+deliberately. The current position, in four lines:
+
+- The metadata gap is the storage engine and nothing else. Both
+  implementations store the *same payload*, so no encoding or
+  data-difference explanation survives.
+- Nothing above the engine shrinks the store. All four ADR-0004 levers are
+  measured and closed, which satisfies that ADR's revisit gate.
+- A candidate engine reaches goleveldb's density on dcroxide's own write
+  pattern: 5.80 GiB against redb's 16.00 for byte-identical content, with
+  faster reads. The rig that measured it reproduces a known baseline to
+  0.008% and its oracle arm confirms the target is real.
+- The blockers this ADR placed on adopting it are cleared. **That is not a
+  recommendation to adopt it.** It is a pre-alpha node with unaddressed
+  security and ecosystem-acceptance work; this ADR's own "do nothing,
+  indefinitely" alternative argues deferral is cheap because the rework's
+  difficulty does not track chain size. Whether 10 GiB of disk is worth a
+  storage migration now is a priorities judgement, and it has not been made.
 
 ## Context
 
@@ -52,8 +75,11 @@ quantity in this whole investigation.
   payload: dcrd 6,061,905,929 B against dcroxide 6,069,302,583 B, fifteen
   buckets equal to the byte, the difference accounted for to 54 bytes by a
   4-byte bucket-id prefix on 1,849,177 UTXO rows. Over each store's own
-  payload, consumed on disk: goleveldb **1.081x**, redb's live tree
-  **1.738x**, redb's whole file 2.566x uncompacted and 2.132x compacted.
+  payload, apparent length on disk: goleveldb **1.081x**, redb's live tree
+  **1.738x**, redb's whole file 2.832x uncompacted and 2.132x compacted.
+  (**Corrected 2026-08-12:** this line read "consumed on disk" and 2.566x
+  for the uncompacted file, which is the retracted `st_blocks` figure. The
+  compacted file is dense, so the two metrics agree at 2.132x.)
 
 ### What is not measured, and blocks the gate
 
@@ -116,11 +142,17 @@ this ADR's own evidence calls them working space:
 | live B-tree | 9.79 | **1.73x** |
 | whole file, including free pages | 14.48 | 2.56x (not a structural figure) |
 
+That 14.48 GiB is the 2026-07 live-synced store. The 2.832x in the table
+above it is a *different* store — the matched-composition replay, 16.00 GiB
+apparent — so the two whole-file multiples are not a discrepancy but they
+are not comparable either, which is the point of quoting the live tree
+instead.
+
 So redb's *structural* overhead is about 73%, not 156%. The attributable
 part is 0.69 GiB of engine overhead plus 3.44 GiB of slack.
 
 Since 2026-08-11 that table has a counterpart on the other side, over the
-*same* payload, disk measured as consumed rather than apparent:
+*same* payload, disk measured as apparent length rather than consumed:
 
 | | over its own payload |
 |---|---:|
@@ -133,9 +165,12 @@ Quote the first two, and quote the redb side as *apparent* length or live
 tree — never `st_blocks`. redb extends with a bare `set_len` and never
 punches a hole, so consumed bytes are a high-water mark that climbs toward
 the claimed length as the node runs; two stores of byte-identical length have
-already been measured 717 MB apart on that metric alone. goleveldb's 1.081x
-is itself net of shared-key-prefix elision, so it is not a pure packing
-figure to set against redb's 0.646 fill.
+already been measured 717 MB apart on that metric alone. The choice moves
+only redb's side: goleveldb's 3,179 files consume 1.001x their apparent
+length, rounding up to 4 KiB blocks, so the 2026-08-12 correction left its
+column where it was. goleveldb's 1.081x is itself net of shared-key-prefix
+elision, so it is not a pure packing figure to set against redb's 0.646
+fill.
 
 Two caveats travelled with these numbers. One is now measured:
 
@@ -251,15 +286,28 @@ written wider than a kill test, and the wider half fails:
    success.
 
    Two defects were found in passing and are **not** fixed here, because
-   they are node policy rather than storage:
+   they are node policy rather than storage. **Both were fixed 2026-08-13
+   in `51f3891`, after this was written:**
    - A storage failure is indistinguishable from a consensus rejection.
      It surfaces as a non-rule `ProcessBlockFailure`, gets logged, and sync
      continues, so a transient disk error makes a valid block look invalid
      and blames the peer. With the latch this becomes loud and permanent
      rather than silent, which is better but still wrong.
+     **Fixed:** `Database::is_fatal` is public and threaded
+     into `combine_process_block_result` (`sync.rs:166-168`), so a latched
+     store reports a disk fault instead of a rule error attributed to the
+     peer. Two tests pin both directions: a real rule violation stays the
+     peer's, a storage failure does not become one.
    - `dcroxide.rs` logs a failed shutdown flush and exits `SUCCESS`, in the
      one place whose own comment says that failure wedges the node on next
      start.
+     **Fixed:** `dcroxide.rs:1063` returns `ExitCode::FAILURE` there.
+
+   What was deliberately not done: a fatal storage error still does not
+   shut the node down. The store latches and the manager logs "Failed to
+   process block" rather than blaming the peer, but the process keeps
+   running, so a supervisor has the exit code and that line to key on and
+   nothing else.
 2. ~~Durability enforced at the wrapper boundary.~~ **Done, 2026-08-13.**
    Every write transaction in `dcroxide-database` now goes through one
    helper that sets `Durability::Immediate` explicitly, and a policy test

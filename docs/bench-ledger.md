@@ -39,6 +39,26 @@ run, both nodes `--norpc`.
 | 2026-07 | m1 | unrecorded (2.2.0-pre, at the ADR-0004 amendment) | mainnet tip | dcroxide 32.06 GiB total (17.579 GiB blocks + 14.483 GiB metadata.redb); dcrd 23.73 GiB (17.580 GiB blocks + 6.045 GiB metadata leveldb + 0.108 GiB utxodb) | ADR-0004 amendment |
 | 2026-08-11 | m1 | `6cb2f56` | mainnet tip, both sides fed `mainnet-full.corpus` | **Matched composition, payload measured on both sides.** Metadata store, consumed bytes: dcrd 6.102 GiB (6,552,084,480) against dcroxide 14.505 GiB uncompacted (15,574,482,944) and 12.052 GiB compacted (12,940,464,128); dcroxide's live B-tree 9.823 GiB (10,547,314,688). Payload: dcrd 6,061,905,929 B, dcroxide 6,069,302,583 B. Over each store's *own* payload: dcrd 1.081x, dcroxide 1.738x on the live tree, 2.566x on the uncompacted file. | this file, below |
 
+> **The 2026-08-11 row's store sizes are CONSUMED BYTES, superseded by the
+> apparent-size rule adopted 2026-08-12.** This file is append-only, so the
+> row stands as written; read it with the trap recorded at the end of this
+> file — redb extends with a bare `set_len` and never punches a hole, so
+> consumed is a high-water mark of what one run happened to touch before it
+> stopped. Read dcroxide's uncompacted store as **17,182,003,200 B apparent
+> (16.00 GiB), 2.831x** over its own payload, not 14.505 GiB and 2.566x, and
+> the drop to the compacted figure as the **3.950 GiB** the file's claim
+> shrank by, not the 2.453 GiB the two consumed columns imply. The compacted
+> file is dense, so 12.052 GiB and 2.132x stand; dcrd's files round *up* to
+> 4 KiB blocks (1.001x), so its 1.081x is unaffected either way.
+>
+> **The live tree is the figure to quote** — 9.823 GiB, **1.738x** over
+> payload, measured directly and untouched by any of this. Whole-file
+> figures are the least reproducible quantity in this file: the same chain
+> at the same composition has landed at 14.483 GiB apparent live-synced
+> (the row above) and 16.00 GiB replayed. Both were taken on redb 2.6.3;
+> 4.1.0 holds identical content in 9.4% less file, which is free-page
+> retention and leaves packing unchanged.
+
 ## Storage decomposition
 
 `dcroxide-bench redbstat`, one JSON object per run. Totals alone hide the

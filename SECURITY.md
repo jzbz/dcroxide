@@ -52,9 +52,12 @@ and anything requiring an already-privileged local attacker (they can
 read the datadir regardless). Throughput is out of scope as well: this
 port syncs roughly 2.2x slower than dcrd and spends most of an initial
 block download stalled in storage commits. Both are measured and
-self-inflicted — the cost is in the storage engine's commit shape, not
-in validation, so the node is already committing as fast as it can and
-there is nothing there for a peer to amplify.
+self-inflicted. That the cost is the storage engine's commit shape
+rather than validation is an attribution, not a finding — a matched
+replay on the same engine spent 863 s of 4,767 in flushes, 18%, and no
+profile exists. But whatever the dominant term turns out to be, it is
+work the node does to itself rather than work a peer can add to, so
+there is nothing here for a peer to amplify.
 
 ## Known gaps
 
@@ -125,7 +128,18 @@ evaluating this code.
   observable or touch key material now carry an explicit decision each,
   so their trust status is stated rather than assumed and a version bump
   of one of them is a decision rather than a silent lockfile change.
-  Most of those decisions are still "accepted without a read."
+  Most of those decisions are still "accepted without a read." The
+  storage engine exercised that bound this cycle: redb went 2.6.3 to
+  4.1.0 on 2026-08-13, across two majors and a changed on-disk format,
+  argued in ADR-0004's upgrade addendum rather than arriving as a
+  lockfile change. It is maintenance, not hardening. 4.1.0 carries four
+  known open issues, none a regression against 2.6.3 and all concerning
+  a file that is already damaged or hostile: #1331 and #1332 abort the
+  process on malformed on-disk structures (an unvalidated 5-bit page
+  order, and a cyclic branch pointer reached from ordinary reads),
+  #1333 leaves a file permanently unopenable when the repair path
+  itself panics, and read paths do not verify page checksums until a
+  fix that is currently master-only.
 
 ## What this project does instead of a guarantee
 

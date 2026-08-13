@@ -1190,12 +1190,18 @@ fn start_listeners(
 ///
 /// The default leaves redb's own 1 GiB in place, so an untouched node
 /// keeps exactly the resident footprint it had before this was
-/// configurable. Raising it is worth real time on a large database:
-/// measured against the 14.48 GiB mainnet metadata store, applying
-/// 2,000,000 scattered writes took 78.6 s at 1 GiB with the current
-/// flush cadence and 16.1 s at 8 GiB with a larger one. The cache is a
-/// ceiling filled on demand and bounded by the file size, so a small
-/// chain does not pay for a large setting.
+/// configurable. Leave it there: this is the one storage knob that
+/// hurts. Over a full mainnet replay 8192 MiB measured 50% slower —
+/// 5125-6294 s against a 3866-3888 s baseline, ranges disjoint — while
+/// 256 and 512 MiB are indistinguishable from the default, ranges
+/// overlapping it. The probe that motivated the knob (78.6 s at 1 GiB
+/// against 16.1 s at 8 GiB, 2,000,000 scattered writes into the
+/// 14.48 GiB mainnet metadata store) is superseded: the full chain
+/// reverses it, and its 8 GiB arm raised the flush cadence as well, so
+/// it never isolated the cache. Cadence is the half that pays, at
+/// 11-12%, and dcrd's own `--utxocachemaxsize` already reaches it. The
+/// cache is a ceiling filled on demand and bounded by the file size,
+/// so a small chain does not pay for a large setting.
 ///
 /// A value that does not parse, or is zero, is ignored with a warning
 /// rather than being fatal: it is a tuning hint, and refusing to start

@@ -262,20 +262,25 @@ pub struct Options {
     /// by ffldb's own write cache, whereas redb caches pages of the
     /// single metadata file. It is a ceiling filled on demand, not an
     /// allocation: the LRU stripes start empty
-    /// (redb-2.6.3 `cached_file.rs:208-216`) and a page enters only
-    /// while the total stays under the limit (`:268`), so a small
-    /// database never pays for a large setting and the resident cost is
-    /// bounded by the file size.
+    /// (redb-4.1.0 `cached_file.rs:247-249`) and a miss that would carry
+    /// the total past the limit evicts a page's worth before returning
+    /// (`:467-488`), so a small database never pays for a large setting
+    /// and the resident cost is bounded by the file size.
     ///
-    /// redb splits the figure 90% read cache / 10% write buffer, a
-    /// hardcoded ratio with no separate setter (`db.rs:1185-1188`), so
-    /// the write buffer a commit spills into is a tenth of this. Once a
-    /// commit's dirty set exceeds that buffer, redb writes the spilled
-    /// pages, re-reads them to finalize checksums, then writes the
-    /// buffer again — measured at redb's 1 GiB default against the
-    /// mainnet metadata store, 62,323 dirty pages cost 124,430 pwrites
-    /// and 98,221 preads, against 62,323 and 4 with the buffer large
-    /// enough to hold them.
+    /// redb 4.1.0 keeps one cache figure and partitions it dynamically
+    /// (`db.rs:1161-1164`, `cached_file.rs:203-214`): the write buffer
+    /// never exceeds 50% of it, flushing the excess straight to disk
+    /// (`:557-583`), and the read cache may grow to 100% when no write
+    /// is in flight. Once a commit's dirty set exceeds the write buffer,
+    /// redb writes the spilled pages, re-reads them to finalize
+    /// checksums, then writes the buffer again — measured against the
+    /// mainnet metadata store on redb 2.6.3, whose `set_cache_size` cut
+    /// the figure 90/10 into read cache and write buffer with no
+    /// separate setter (redb-2.6.3 `db.rs:1186-1187`): at its 1 GiB
+    /// default, 62,323 dirty pages cost 124,430 pwrites and 98,221
+    /// preads, against 62,323 and 4 with the buffer large enough to hold
+    /// them. The mechanism survives the upgrade; the counts were taken
+    /// at a write buffer five times smaller than 4.1.0 permits.
     pub db_cache_bytes: usize,
     /// Called after every metadata flush, when set.
     ///
@@ -310,8 +315,16 @@ pub struct Options {
 /// this became configurable.
 ///
 /// Kept as the default so raising it is an operator's decision rather
-/// than a silent change in resident memory. Measured on the mainnet
-/// metadata store (14.48 GiB), applying 2,000,000 scattered writes:
+/// than a silent change in resident memory — and the decision is to
+/// leave it where it is. Over full mainnet replays an 8192 MiB cache
+/// measured 50% slower (5125-6294 s against a 3866-3888 s baseline,
+/// disjoint), while 256 and 512 MiB both overlap the baseline, so this
+/// value is correctly sized in both directions (the 2026-08-10 and
+/// 2026-08-11 sweeps in `docs/bench-ledger.md`).
+///
+/// The table below is the superseded microbenchmark those replays
+/// reversed: 2,000,000 scattered writes against the mainnet metadata
+/// store (14.48 GiB).
 ///
 /// | cache | 250k per commit | 2M per commit |
 /// |---|---|---|
@@ -319,9 +332,10 @@ pub struct Options {
 /// | 4 GiB | 51.4 s | 19.6 s |
 /// | 8 GiB | 48.7 s | 16.1 s |
 ///
-/// Cache size and flush cadence multiply rather than add: 1.8x from
-/// batching alone, 2.7x from cache alone, 4.9x together. The cadence
-/// half is already reachable through dcrd's own `--utxocachemaxsize`.
+/// Its multiplicative reading — 1.8x from batching alone, 2.7x from
+/// cache alone, 4.9x together — is withdrawn. Only the flush-cadence
+/// half survived the full chain, at 11-12%, and that half is reachable
+/// through dcrd's own `--utxocachemaxsize`.
 pub const DEFAULT_DB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
 impl Options {
@@ -1251,8 +1265,13 @@ mod raw_stats_tests {
     /// This is the only check that the arithmetic here means what the ADR
     /// means, and it already caught one error: deriving the live tree as
     /// `(leaf_pages + branch_pages) * page_size` reports 8.46 GiB against
-    /// the true 9.79, because redb spills large values into overflow
-    /// pages that the leaf count excludes.
+    /// the true 9.79, because `leaf_pages` counts leaf *nodes* while the
+    /// allocator rounds each node to a power-of-two run of pages
+    /// (`required_order = ceil_log2`, redb-4.1.0 `page_manager.rs:946`),
+    /// so a single row too large to share a leaf can occupy 2, 4 or 32
+    /// pages and still be counted once. Not overflow pages: redb has no
+    /// such mechanism in 2.6.3 or 4.1.0. See
+    /// [`RawStats::live_tree_bytes`].
     #[test]
     fn derived_figures_match_the_adr_0004_decomposition() {
         let s = mainnet_sample();
@@ -1462,10 +1481,13 @@ mod fatal_latch_tests {
     /// latch. That wiring is three `map_err(|e| self.inner.mark_fatal(e))`
     /// calls, one per path that hands a durable commit to the engine
     /// (`Database::flush`, `Database::close`, and the flush inside
-    /// `Transaction::commit_internal`). A fault-injection test that fills
-    /// a size-limited filesystem would close that gap and is Linux-only;
-    /// it is not written yet, and ADR-0009 says so rather than implying
-    /// this test is more than it is.
+    /// `Transaction::commit_internal`). `tests/enospc.rs` closes that
+    /// gap: it fills a 2 MiB filesystem under a live database and asserts
+    /// that the resulting `ENOSPC` arrives as an error, latches the
+    /// store, and leaves reads working. It is Linux-only and skips
+    /// loudly where it cannot mount one, with CI setting
+    /// `DCROXIDE_REQUIRE_FAULT_INJECTION=1` so a skip there is a
+    /// failure.
     #[test]
     fn a_failed_durable_write_closes_the_handle_to_further_writes() {
         let tmp = tempfile::tempdir().expect("temp dir");

@@ -9,16 +9,20 @@ than rewriting what was decided. Use [template.md](template.md).
 - [ADR-0001](0001-oracle-driven-differential-testing.md) — Oracle rig: Go shim over line-JSON, pinned to dcrd `release-v2.1.5` *(Accepted; addendum 2026-07-26 — re-pinned to master `452c1a6c`)*
 - [ADR-0002](0002-vendor-blake256-from-dcr-rs.md) — Vendor BLAKE-256 from dcr-rs *(Accepted)*
 - [ADR-0003](0003-slice-based-wire-decoding.md) — Slice-based wire decoding with consumed-length semantics *(Accepted; addendum 2026-07-26 — framing bounds per message type)*
-- [ADR-0004](0004-storage-backend.md) — D1: dcrd's database semantics over `redb`, flat block files, fresh-sync C6 stance *(Accepted; amended 2026-07-26, then six dated addenda through 2026-08-09 including one retraction — the "Findings as of" section at the top carries the current state)*
+- [ADR-0004](0004-storage-backend.md) — D1: dcrd's database semantics over `redb`, flat block files, fresh-sync C6 stance *(Accepted; amended 2026-07-26, then dated addenda through 2026-08-13 including one retraction and several corrections — the "Findings as of" section at the top carries the current state. Its revisit gate is now **satisfied**: all four levers measured and none sufficient. Now on redb 4.1.0, which changed the on-disk format.)*
 - [ADR-0005](0005-concurrency-model.md) — D2: tokio for I/O, runtime-free consensus, validation pool *(Accepted; ratified 2026-08-07 as shipped — threads, not tokio; see the addenda)*
 - [ADR-0006](0006-secp256k1-backend.md) — D3: libsecp bindings for ECDSA, `k256` for Schnorr-DCRv0 *(Proposed; addendum 2026-07-26 — the split held)*
 - [ADR-0007](0007-json-emission-strategy.md) — D4: controlled serde emission + Go-float formatter + golden captures *(Proposed; serde not used — see the 2026-07-26 addendum)*
 - [ADR-0008](0008-clippy-lint-policy.md) — Curated lint set: `iter_over_hash_type`/`allow_attributes`/`unreachable_pub` adopted, cast lints refused or deferred, with the measured fallout *(Accepted)*
-- [ADR-0009](0009-storage-shape.md) — Storage rework: what the evidence supports, and the four measurements the ADR-0004 gate still needs *(Proposed; an earlier split-by-access-shape draft was withdrawn under review and the reasons are recorded in it)*
+- [ADR-0009](0009-storage-shape.md) — Storage rework: what the evidence supports, and the four measurements the ADR-0004 gate needed *(Proposed; **all four measured as of 2026-08-13** and the three conditions on an engine change met, so what remains is a priorities decision rather than evidence — ratifying or superseding is the owner's call. An earlier split-by-access-shape draft was withdrawn under review, and a later partial withdrawal was itself corrected; both are recorded in it.)*
 
 ## Pending decisions (from the project brief, §9)
 
-- **D1** — accepted as ADR-0004; the write-load gate it named is resolved
+- **D1** — accepted as ADR-0004; the write-load gate it named is resolved,
+  and as of 2026-08-13 so is the *revisit* gate: all four storage levers are
+  measured and none is sufficient. ADR-0009 carries the follow-on question
+  (whether to change engine at all), and that one is open by choice rather
+  than for want of evidence.
 - **D2** — accepted: ADR-0005 was ratified 2026-08-07 as shipped (threads
   over channels, not tokio); its final addendum records the evidence
 - **D3–D4** — still Proposed as ADR-0006/0007. Each names the prototype that

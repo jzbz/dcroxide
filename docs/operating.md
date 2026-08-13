@@ -78,8 +78,15 @@ Budget for it: initial block download runs about **2.2x slower than
 dcrd** — roughly 2.5 hours against dcrd's 1.1 for mainnet from genesis on
 the machine in [bench-ledger.md](bench-ledger.md) — and the chain costs
 more on disk, 32.06 GiB against dcrd's 23.73 GiB at the same tip. Both
-numbers are measured and tracked; see
-[ADR-0004](adr/0004-storage-backend.md).
+were measured in 2026-07 under redb 2.6.3 and have not been re-run since
+the 4.1.0 upgrade, which holds identical content in 9.4% less space
+(15,568,752,640 B against 17,182,003,200 on the same journal) and loaded
+21% faster. That 9.4% is free-page retention rather than denser packing,
+and free pages are the one quantity this investigation withdrew as
+non-reproducible, so it does not license a projection of what a fresh
+sync costs today — that number wants re-measuring, not arithmetic. The
+2.2x has the same provenance and is likewise unverified against 4.1.0.
+See [ADR-0004](adr/0004-storage-backend.md).
 
 The two have different explanations, and only one of them is settled. The
 **disk** difference is the storage engine and nothing else: as of
@@ -116,9 +123,10 @@ in MiB, defaulting to 1024. Raising it to 8192 made a full-chain replay
 **50% slower** — 5125-6294 s against the same 3866-3888 s baseline, again
 with non-overlapping ranges. That is the opposite of what the setting
 suggests, and the opposite of what a 500,000-key microbenchmark predicted
-when the knob was added. redb splits the figure 90/10 into read cache and
-write buffer, so most of an increase buys read cache that a sequential sync
-never reuses, while the cache's own accounting grows with it.
+when the knob was added. There is no fixed split to reason from: redb 4.1.0
+keeps a single cache figure and partitions it on demand, capping the write
+buffer at half of it and letting the read cache grow into all of it. The
+advice rests on the full-chain measurement, not on a mechanism.
 
 Lowering it does not help either: 256 MiB and 512 MiB both measured
 indistinguishable from the 1024 MiB default, with ranges overlapping it.
@@ -127,8 +135,11 @@ it, so leave the variable unset.
 
 **Neither knob changes how densely the store packs.** Page fill sits at
 0.62-0.65 regardless of either setting, so neither shrinks the data
-directory. They are throughput settings, and the storage size gap against
-dcrd is a separate, unresolved matter recorded in ADR-0004.
+directory. They are throughput settings. The size gap against dcrd is
+settled in cause — the engine's page layout, not extra data dcroxide keeps
+— and nothing above the engine reaches it: all four of ADR-0004's levers
+have now been measured and closed. What is still open is the engine choice
+itself, in [ADR-0009](adr/0009-storage-shape.md).
 
 ## Identity: paths, files, and environment
 
@@ -144,10 +155,14 @@ configuration, every name changes.
 | configuration file | `dcroxide.conf` | `dcrd.conf` |
 | data directory override | `--appdata`, `DCROXIDE_APPDATA` | `DCRD_APPDATA` |
 | extra TLS DNS names | `DCROXIDE_ALT_DNSNAMES` | `DCRD_ALT_DNSNAMES` |
+| metadata page cache | `DCROXIDE_DB_CACHE` (MiB, default 1024) | — |
 
-Those two environment variables are the only ones read. Everything else
-is a command-line flag or a `dcroxide.conf` entry, and the flag set is a
-verbatim port of dcrd's — same names, same semantics, same help text.
+Those three environment variables are the only ones read; only the first
+two have dcrd counterparts, since the page cache is a property of redb,
+which dcrd does not use, and it is the one to leave unset — see the
+storage tuning above. Everything else is a command-line flag or a
+`dcroxide.conf` entry, and the flag set is a verbatim port of dcrd's —
+same names, same semantics, same help text.
 
 The daemon generates `rpc.cert` and `rpc.key` in the data directory on
 first start if they are absent, owner-readable only. Back up or replace

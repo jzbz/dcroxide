@@ -103,11 +103,13 @@ What Phase 15 has covered so far:
 
   The syncer decides the time and the source barely matters: swapping the
   source moves the figure 1.6–8.8%, swapping the syncer moves it 2.2x.
-  **dcroxide is ~2.2x slower than dcrd at initial block download.** The cause
-  is the storage engine's commit shape, not validation — dcroxide spent 80.1%
-  and 82.4% of wall time in progress stalls over 20 s, where dcrd stalled 0
-  times in 754 windows. Interop was verified in both directions: dcrd accepts
-  `/dcrwire:1.0.0/dcroxide:2.2.0/` and dcroxide accepts
+  **dcroxide is ~2.2x slower than dcrd at initial block download.** The gap
+  is attributed to the storage engine's commit shape rather than validation —
+  dcroxide spent 80.1% and 82.4% of wall time in progress stalls over 20 s,
+  where dcrd stalled 0 times in 754 windows — but the attribution is not
+  established: storage accounts for 18% of a full replay's wall time on the
+  same engine, 863 s of 4,767. Interop was verified in both directions: dcrd
+  accepts `/dcrwire:1.0.0/dcroxide:2.2.0/` and dcroxide accepts
   `/dcrwire:1.0.0/dcrd:2.2.0(pre)/`, each syncing to a matching tip. Chain on
   disk at tip: dcrd 24 GB, dcroxide 33 GB — identical consensus block bytes,
   the difference is metadata.
@@ -126,8 +128,13 @@ Named open items, tracked and not fixed:
 - The RPC `Server` uses one coarse mutex where dcrd has per-field locks, so a
   single long request — a multi-thousand-block `rescan` — stalls notification
   construction for every other client.
-- The redb metadata tree runs at 43.8% page fill; a full sorted rebuild reaches
-  only 53.0%, which is redb's best case for this data.
+- The redb metadata tree packs at 64.86% page fill (0.645–0.649 across every
+  run; the fill figure is the per-table `TableStats::fragmented_bytes` —
+  `DatabaseStats::fragmented_bytes` charges the allocator's free pool against
+  the tree and reads 43.8%). That is the best case for this data: a sorted
+  copy-out rebuild packs *worse*, 58.29%, on a larger live tree, 10.92 GiB
+  against 9.79. The 1.536 GiB of intra-page slack in `spendjournalv3` is real
+  and unreachable inside this engine.
 - The node is flush-bound under fast ingest (the 80% stall figure above).
 
 **The node is still pre-alpha. Do not expose it to the internet and do not use
@@ -205,9 +212,14 @@ Every task in this project serves one of six compatibility surfaces. They are li
 > plus dcrd-style flat block files, **fresh sync only**, `addblock`-format
 > import as the migration path, and ffldb/goleveldb read-compat explicitly out
 > of scope. A dcroxide datadir is therefore not a dcrd datadir and cannot be
-> swapped either way. At mainnet tip the two occupy 24 GB (dcrd) against 33 GB
-> (dcroxide); the block bytes are consensus data and identical, so the
-> difference is metadata — see the status block for the fill-factor figures.
+> swapped either way — and since the 2026-08-13 bump to redb 4.1.0 the same
+> stance holds inside the port: a dcroxide datadir written before that date is
+> refused outright with a typed error, not misread, and has to be re-synced or
+> re-imported. The block bytes are consensus data and identical, and so is the
+> metadata payload — 54 B of residual difference on 6.06 GB across fifteen
+> buckets — so the disk gap is entirely the engine's page layout: goleveldb
+> holds that payload in 1.081x its size, redb's live B-tree in 1.738x at
+> 64.86% page fill.
 
 ---
 
