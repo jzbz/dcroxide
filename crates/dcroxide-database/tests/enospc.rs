@@ -51,42 +51,85 @@ fn a_real_enospc_reaches_the_fatal_latch() {
         return;
     }
 
-    // The child is this same test binary, re-executed inside a user
-    // namespace so it can mount. Running the assertions in Rust rather
-    // than a shell is the whole point: the thing under test is which
-    // error kind comes back.
+    // Two ways to get a small filesystem, tried in order, because the
+    // two environments this has to run in allow different ones.
+    //
+    //   1. A user namespace. Needs no privileges but does need
+    //      unprivileged CLONE_NEWUSER, which GitHub's hosted runners
+    //      refuse -- "write failed /proc/self/uid_map: Operation not
+    //      permitted". Works on an ordinary developer machine.
+    //   2. Passwordless sudo. The reverse: GitHub's runners grant it,
+    //      most developer machines do not (and `sudo -n` fails rather
+    //      than prompting, so trying costs nothing).
+    //
+    // Neither is universal, which is why both are here.
     let exe = std::env::current_exe().expect("test binary path");
-    let output = Command::new("unshare")
+    let child = format!(
+        "{} --exact a_real_enospc_reaches_the_fatal_latch --nocapture",
+        exe.display()
+    );
+
+    let via_namespace = Command::new("unshare")
         .args(["-U", "-m", "--map-root-user"])
         .arg("sh")
         .arg("-c")
         .arg(format!(
-            "mkdir -p {MOUNT} && mount -t tmpfs -o size=2M tmpfs {MOUNT} && \
-             exec {} --exact a_real_enospc_reaches_the_fatal_latch --nocapture",
-            exe.display()
+            "mkdir -p {MOUNT} && mount -t tmpfs -o size=2M tmpfs {MOUNT} && exec {child}"
         ))
         .env(INSIDE, "1")
         .output();
 
-    let output = match output {
-        Ok(o) => o,
-        Err(e) => return skip(&format!("could not run unshare: {e}")),
+    let output = match via_namespace {
+        Ok(o) if o.status.success() => o,
+        other => {
+            let why = match &other {
+                Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                Err(e) => e.to_string(),
+            };
+            // mode=1777 because the mount is made by root and the test
+            // runs as the ordinary user.
+            let via_sudo = Command::new("sudo")
+                .arg("-n")
+                .arg("sh")
+                .arg("-c")
+                .arg(format!(
+                    "mkdir -p {MOUNT} && mount -t tmpfs -o size=2M,mode=1777 tmpfs {MOUNT}"
+                ))
+                .output();
+            let mounted = matches!(&via_sudo, Ok(o) if o.status.success());
+            if !mounted {
+                return skip(&format!(
+                    "no way to mount a small filesystem here. user namespace: {why}. \
+                     passwordless sudo: {}",
+                    match &via_sudo {
+                        Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                        Err(e) => e.to_string(),
+                    }
+                ));
+            }
+            let run = Command::new("sh")
+                .arg("-c")
+                .arg(&child)
+                .env(INSIDE, "1")
+                .output();
+            // Unmount whatever happened, so a failure does not leave a
+            // mount behind on a developer's machine.
+            let _ = Command::new("sudo")
+                .arg("-n")
+                .args(["umount", MOUNT])
+                .output();
+            match run {
+                Ok(o) => o,
+                Err(e) => panic!("could not run the in-namespace half under sudo: {e}"),
+            }
+        }
     };
+
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success()
-        && (stderr.contains("Operation not permitted")
-            || stderr.contains("Permission denied")
-            || stderr.contains("unshare: unshare failed"))
-    {
-        return skip(&format!(
-            "unprivileged user namespaces are unavailable here: {}",
-            stderr.trim()
-        ));
-    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "the in-namespace half failed.\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        "the fault-injection half failed.\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
     // Anti-vacuity guard, and not a hypothetical one: a mistyped filter
     // makes the child run zero tests and exit 0, which the status check
@@ -98,7 +141,6 @@ fn a_real_enospc_reaches_the_fatal_latch() {
          have passed having checked nothing.\n--- stdout ---\n{stdout}\n\
          --- stderr ---\n{stderr}"
     );
-    // Echo it, so a passing run leaves evidence it did something.
     for line in stdout
         .lines()
         .filter(|l| l.starts_with("first failure") || l.starts_with("ENOSPC"))
