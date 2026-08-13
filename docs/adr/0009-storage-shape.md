@@ -247,8 +247,25 @@ written wider than a kill test, and the wider half fails:
    - `dcroxide.rs` logs a failed shutdown flush and exits `SUCCESS`, in the
      one place whose own comment says that failure wedges the node on next
      start.
-2. Durability enforced at the wrapper boundary, so no call site can
-   construct a non-durable commit, with a test that fails if one can.
+2. ~~Durability enforced at the wrapper boundary.~~ **Done, 2026-08-13.**
+   Every write transaction in `dcroxide-database` now goes through one
+   helper that sets `Durability::Immediate` explicitly, and a policy test
+   scans the crate's own source and fails if any other call site opens a
+   write transaction, or if the helper's level is weakened.
+
+   redb already defaults to `Immediate`, so this changes no behaviour
+   today — which is the reason to do it now rather than later. The property
+   currently holds by luck, and fjall defaults the other way:
+   `Database::batch()` hands back `PersistMode::Buffer`, whose `commit()`
+   returns `Ok` having called no fsync. A port relying on an inherited
+   default would have gone silently non-durable on the day it switched, in
+   a commit that looked like a dependency bump. The seam now exists and is
+   enforced, so that day is a compile-and-test problem rather than a silent
+   one.
+
+   Both assertions were checked by mutation: routing one call site around
+   the helper fails the first test with the file and line, and weakening
+   the level to `Durability::None` fails the second.
 3. ~~`crash.rs` rebuilt into an actual gate first.~~ **Done, 2026-08-13.**
    The suite went from four tests that never wrote metadata to nine that
    reproduce `Chain::flush`'s pairing — block index rows, UTXO entries and

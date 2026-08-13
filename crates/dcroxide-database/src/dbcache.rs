@@ -497,9 +497,7 @@ impl DbCache {
         let dirty_bytes = self.total_size;
         let mut dirty_entries = 0usize;
 
-        let tx = kv
-            .begin_write()
-            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        let tx = crate::begin_durable_write(kv)?;
         let mut sampled = None;
         let mut stats_elapsed = Duration::ZERO;
         {

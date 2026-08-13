@@ -101,6 +101,36 @@ pub fn create_dir_all_owner_only(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
 }
 
+/// Begin a write transaction with durability set **explicitly**.
+///
+/// This is the only place in the crate that may call
+/// `redb::Database::begin_write`, and `durability_policy.rs` fails the
+/// build's test suite if that stops being true.
+///
+/// **Why not just rely on the engine's default.** redb happens to default
+/// to `Durability::Immediate`, so today this call changes nothing. That is
+/// the point: durability is a property this node must *assert*, not one it
+/// inherits and hopes stays put. The engine dcroxide measured as a
+/// replacement (fjall) defaults the other way — its `Database::batch()`
+/// hands back `PersistMode::Buffer`, whose `commit()` returns `Ok` having
+/// fsynced nothing — so a port that had been relying on an inherited
+/// default would have become silently non-durable on the day it switched,
+/// with no diff to point at. ADR-0009 records that as one of the
+/// conditions on any engine change; this is the seam that satisfies it.
+///
+/// A commit reaching disk is what the chain's paired write depends on:
+/// `Chain::flush` puts block index rows, UTXO entries and both state
+/// markers in one transaction so a crash cannot leave them disagreeing,
+/// and that guarantee is worth nothing if the commit was never durable.
+fn begin_durable_write(kv: &redb::Database) -> Result<redb::WriteTransaction, Error> {
+    let mut tx = kv
+        .begin_write()
+        .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+    tx.set_durability(redb::Durability::Immediate)
+        .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+    Ok(tx)
+}
+
 /// Releases the writer semaphore on drop.
 struct WriterGuard<'a> {
     db: &'a DbInner,
@@ -595,9 +625,7 @@ impl Database {
         // index entry and fixed ID for the internal block index, the
         // bucket ID counter, and the initial block-file write cursor.
         {
-            let wtx = kv
-                .begin_write()
-                .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+            let wtx = begin_durable_write(&kv)?;
             {
                 let mut table = wtx
                     .open_table(METADATA_TABLE)
@@ -851,11 +879,7 @@ impl Database {
     /// rather than calling this on every commit.
     pub fn raw_stats(&self) -> Result<RawStats, Error> {
         self.check_open()?;
-        let tx = self
-            .inner
-            .kv
-            .begin_write()
-            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        let tx = begin_durable_write(&self.inner.kv)?;
         let stats = {
             let db_stats = tx
                 .stats()
