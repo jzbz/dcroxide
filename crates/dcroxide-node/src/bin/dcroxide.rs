@@ -1049,7 +1049,18 @@ fn run(cfg: Config) -> ExitCode {
         .expect("chain mutex poisoned")
         .flush(&cfg.params.params)
     {
-        log_error(&format!("Unable to flush the block database: {e:?}"));
+        // Not merely logged: the comment above says what this flush is
+        // for, and if it fails that is exactly what happens -- the next
+        // start loads a best state ahead of the persisted UTXO set and
+        // wedges on the first block. Exiting SUCCESS after that tells a
+        // supervisor, an operator, and any script reading $? that a node
+        // whose state did not reach disk shut down cleanly.
+        log_error(&format!(
+            "Unable to flush the block database: {e:?} -- the chain state on disk is \
+             behind the state this node was running with, and the next start may \
+             refuse to make progress. Investigate the storage before restarting."
+        ));
+        return ExitCode::FAILURE;
     }
 
     log_info("Shutdown complete");

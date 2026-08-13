@@ -891,6 +891,18 @@ impl Database {
         Ok(())
     }
 
+    /// Whether a durable write has failed on this store.
+    ///
+    /// Exposed so callers above the storage layer can tell a *storage*
+    /// failure from a consensus one. They look identical otherwise:
+    /// `Chain::process_block` renders a persistence failure as a
+    /// `RuleError` so it can flow through the existing error paths, and a
+    /// caller that took that at face value would blame the peer that sent
+    /// a perfectly good block.
+    pub fn is_fatal(&self) -> bool {
+        self.inner.fatal.load(Ordering::SeqCst)
+    }
+
     /// Refuse a write once a durable write has failed.
     ///
     /// Deliberately **not** applied to reads. Data that reached disk is

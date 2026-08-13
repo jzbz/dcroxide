@@ -154,7 +154,18 @@ impl SyncChain for NodeSyncChain {
             handler.drain_pending(&self.chain, adjusted_time_unix());
         }
 
-        combine_process_block_result(fork_len, errs)
+        // Ask the store whether it has failed, and pass that down: the
+        // chain renders a persistence failure as a RuleError so it can
+        // flow through the existing error paths, which makes a disk fault
+        // indistinguishable from a peer sending a bad block unless
+        // something checks.
+        let storage_failed = self
+            .locked()
+            .db
+            .as_ref()
+            .is_some_and(dcroxide_database::Database::is_fatal);
+
+        combine_process_block_result(fork_len, errs, storage_failed)
     }
 }
 
@@ -171,15 +182,29 @@ impl SyncChain for NodeSyncChain {
 fn combine_process_block_result(
     fork_len: i64,
     errs: Vec<RuleError>,
+    storage_failed: bool,
 ) -> Result<i64, ProcessBlockFailure> {
     match errs.first() {
         None => Ok(fork_len),
         Some(first) => Err(ProcessBlockFailure {
             is_duplicate_block: first.kind == RuleErrorKind::DuplicateBlock,
-            // Every failure the chain surfaces here is a rule error
-            // (dcrd's non-rule process failures come from its database
-            // layer, which the port reports through panics instead).
-            is_rule_error: true,
+            // A failure is a rule error unless the store has latched
+            // fatal, in which case this is a disk fault wearing a rule
+            // error's clothes.
+            //
+            // `Chain::flush` converts a persistence failure into a
+            // `RuleError` (`persist_rule_error`) so it can travel the
+            // existing paths, and dcrd has no equivalent because its
+            // database failures are plain errors. Reporting one as a rule
+            // error tells the manager a peer sent an invalid block: it
+            // logs "Rejected block ... from <peer>" at INFO and carries
+            // on, so a failing disk reads as a misbehaving network. The
+            // store's own latch is the only thing that can tell them
+            // apart from here.
+            //
+            // An earlier comment here claimed the port surfaces database
+            // failures through panics. It does not, and never did.
+            is_rule_error: !storage_failed,
             message: render_multi_error(&errs),
         }),
     }
@@ -347,7 +372,10 @@ mod tests {
 
     #[test]
     fn no_errors_yields_the_fork_length() {
-        assert_eq!(combine_process_block_result(3, Vec::new()).unwrap(), 3);
+        assert_eq!(
+            combine_process_block_result(3, Vec::new(), false).unwrap(),
+            3
+        );
     }
 
     #[test]
@@ -361,6 +389,7 @@ mod tests {
                 RuleErrorKind::DuplicateBlock,
                 "already have block abc",
             )],
+            false,
         )
         .unwrap_err();
         assert!(failure.is_duplicate_block);
@@ -383,12 +412,63 @@ mod tests {
                 rule_err(RuleErrorKind::BadMerkleRoot, "reorg-err-1"),
                 rule_err(RuleErrorKind::BadMerkleRoot, "reorg-err-2"),
             ],
+            false,
         )
         .unwrap_err();
         assert!(!failure.is_duplicate_block);
         assert_eq!(
             failure.message,
             "multiple errors (3):\n - accept-err\n - reorg-err-1\n - reorg-err-2\n"
+        );
+    }
+
+    /// A consensus rejection is a rule error, so the manager may blame
+    /// the peer that sent it.
+    #[test]
+    fn a_consensus_rejection_stays_a_rule_error() {
+        let failure = combine_process_block_result(
+            0,
+            vec![rule_err(RuleErrorKind::BadMerkleRoot, "bad merkle root")],
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            failure.is_rule_error,
+            "a real rule violation must remain attributable to the peer"
+        );
+    }
+
+    /// A storage failure is NOT, even though the chain hands it over
+    /// wearing a rule error's clothes.
+    ///
+    /// `Chain::flush` converts a persistence failure into a `RuleError`
+    /// (`persist_rule_error`) so it can travel the existing paths. Taken
+    /// at face value that tells the sync manager a peer sent an invalid
+    /// block: it logs "Rejected block ... from <peer>" at INFO and keeps
+    /// syncing, so a failing disk reads as a misbehaving network and the
+    /// real fault is never surfaced. The store's fatal latch is what
+    /// distinguishes them.
+    ///
+    /// The kind used here is deliberately the one `persist_rule_error`
+    /// fabricates, so this test breaks if that mapping changes.
+    #[test]
+    fn a_storage_failure_is_not_blamed_on_the_peer() {
+        let failure = combine_process_block_result(
+            0,
+            vec![rule_err(
+                RuleErrorKind::UnknownBlock,
+                "chain database failure: Db(Error { kind: Fatal, .. })",
+            )],
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            !failure.is_rule_error,
+            "a disk fault must not be reported as a consensus violation"
+        );
+        assert!(
+            !failure.is_duplicate_block,
+            "and must not be swallowed as a duplicate"
         );
     }
 }

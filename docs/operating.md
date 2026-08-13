@@ -34,6 +34,21 @@ Anything equivalent works — a supervisor, a container restart policy,
 runit. A node run by hand from a shell will simply stop on the first
 panic.
 
+A storage failure now stops the node rather than being retried. If a
+durable write to the metadata store fails — a full disk, an I/O error — the
+store refuses every later write, so the node makes no further progress until
+it is restarted. Reads keep working, so RPC still answers. This trades
+availability for integrity deliberately: the alternative is retrying a write
+whose failure may have left the store in a state that a restart silently
+rolls back, which is worse for a consensus daemon than stopping. Two things
+follow for an operator. A node that has stopped making progress with
+`ErrFatal` in its log has a storage problem, not a network one. And **a
+non-zero exit after "Flushing the block database to disk..." means the
+shutdown flush failed** — the on-disk chain state is behind what the node
+was running with, and the next start may refuse to make progress, so
+investigate the storage before restarting rather than restarting into the
+same fault.
+
 Pair it with a memory limit. A websocket client that subscribes and then
 stops reading grows node memory without bound; the notification queues
 are unbounded exactly as dcrd's are, so nothing is dropped or reordered
