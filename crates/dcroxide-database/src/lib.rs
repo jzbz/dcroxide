@@ -53,6 +53,10 @@ pub use transaction::{BlockRegion, Bucket, Cursor, Transaction};
 
 use crate::error::db_error;
 
+// redb 4 moved `begin_read` onto a trait; importing it keeps the call
+// sites unchanged. See the ADR-0004 upgrade note for why we are on 4.x.
+use redb::ReadableDatabase as _;
+
 /// The single redb table holding the entire ffldb-layout keyspace.
 pub(crate) const METADATA_TABLE: redb::TableDefinition<'static, &'static [u8], &'static [u8]> =
     redb::TableDefinition::new("metadata");
@@ -497,6 +501,23 @@ fn open_error(e: redb::DatabaseError) -> Error {
             ErrorKind::DbAlreadyOpen,
             "the database is already open by another process -- only one \
              instance may use a data directory at a time",
+        ),
+        // A data directory written by a dcroxide built against redb 2.x.
+        // redb 4 reads only file format 3 and reports this rather than
+        // guessing, which is the behaviour that makes the upgrade safe:
+        // an old directory is refused, not misread. There is no in-place
+        // migration and ADR-0004's fresh-sync stance means there does not
+        // need to be, but the operator has to be told which of the two
+        // things happened, because "delete the data directory and re-sync"
+        // and "your disk is damaged" call for very different reactions.
+        redb::DatabaseError::UpgradeRequired(version) => db_error(
+            ErrorKind::Invalid,
+            format!(
+                "the metadata store is redb file format {version}, which this build \
+                 cannot read -- it was written by a dcroxide built against redb 2.x. \
+                 There is no in-place upgrade: remove the data directory and sync \
+                 again (see docs/operating.md). The chain is not damaged."
+            ),
         ),
         other => db_error(ErrorKind::DriverSpecific, other.to_string()),
     }

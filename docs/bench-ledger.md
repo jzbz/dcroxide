@@ -453,6 +453,20 @@ indistinguishable from a torn tail and presents as silent truncation. Both
 land on the cross-bucket atomicity `process.rs:908-916` depends on, and
 neither is reachable by killing a healthy process.
 
+### The upgrade arm, taken
+
+redb 4.1.0 was adopted on 2026-08-13 (`redb = "4"` in
+`dcroxide-database`). It holds the identical content in 9.4% less space and
+loaded 21% faster on this journal, and a 250,000-block replay reproduces the
+2.6.3 tree exactly — live tree 1.355 GiB, fill 0.6373, both versions, to
+four decimals — so the gain is free-page retention and not packing. The
+1.738x structural figure is unchanged, which is why this is a dependency
+bump rather than an answer to ADR-0009.
+
+The on-disk format changed with it: 4.x reads only file format 3 and refuses
+a 2.x directory with a typed error rather than misreading it. Data
+directories written before that date must be re-synced.
+
 ### Excluded candidates, with the reason recorded
 
 - **rocksdb** — the build fails on this machine even with g++ 16.2.1 and 32

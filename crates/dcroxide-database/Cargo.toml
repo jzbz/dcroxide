@@ -12,11 +12,15 @@ repository.workspace = true
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-wire = { path = "../dcroxide-wire" }
 crc = "3"
-redb = "2"
+redb = "4"
 
 [dev-dependencies]
 crc = "3"
 dcroxide-testutil = { path = "../dcroxide-testutil" }
+# The previous major, to write a file in the old on-disk format so the
+# upgrade test can prove the new one refuses it legibly rather than
+# misreading it. Test-only: it is not linked into the daemon.
+redb2 = { package = "redb", version = "=2.6.3" }
 tempfile = "3"
 
 [lints]

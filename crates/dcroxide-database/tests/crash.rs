@@ -658,3 +658,57 @@ fn deletes_are_atomic_with_the_puts_beside_them() {
     .expect("view");
     db.close().expect("close");
 }
+
+/// A data directory written by a dcroxide built against redb 2.x must be
+/// refused with an actionable message, not misread and not reported as
+/// damage.
+///
+/// The 4.x upgrade changed the on-disk format, and dcroxide has no
+/// in-place migration — ADR-0004's fresh-sync stance means it does not
+/// need one. What it does need is for the two failures an operator can
+/// hit to look different: "this directory predates the upgrade, re-sync"
+/// and "this directory is corrupt" call for opposite reactions, and a
+/// generic driver error would conflate them.
+///
+/// This writes a genuine old-format file with the previous major rather
+/// than a handcrafted fixture, so it keeps testing the real thing if
+/// either version moves.
+#[test]
+fn a_redb2_data_directory_is_refused_with_an_upgrade_message() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("db");
+    std::fs::create_dir_all(&db_path).expect("mkdir");
+    let metadata = db_path.join("metadata.redb");
+
+    // A real redb 2.x store, written by redb 2.x.
+    {
+        let old = redb2::Database::create(&metadata).expect("create v2");
+        let tx = old.begin_write().expect("begin");
+        {
+            let table: redb2::TableDefinition<&[u8], &[u8]> =
+                redb2::TableDefinition::new("metadata");
+            let mut t = tx.open_table(table).expect("open");
+            t.insert(b"k".as_slice(), b"v".as_slice()).expect("insert");
+        }
+        tx.commit().expect("commit");
+    }
+
+    let err = match Database::open(&Options::new(&db_path, NET)) {
+        Ok(_) => panic!("a redb 2.x store must not open under redb 4"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.kind,
+        ErrorKind::Invalid,
+        "an old format must not be reported as corruption: {err}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("redb 2.x") && msg.contains("sync again"),
+        "the message must tell the operator what to do, got: {msg}"
+    );
+    assert!(
+        msg.contains("not damaged"),
+        "the message must distinguish this from corruption, got: {msg}"
+    );
+}

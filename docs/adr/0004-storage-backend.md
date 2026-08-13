@@ -1132,3 +1132,47 @@ print a modelled quantity beside measured ones without labelling it, and no
 ADR may quote a modelled figure without a measured counterpart. redb reports
 page counts per *table* and never per bucket, so a per-bucket page figure is
 not something this project can measure — only model.
+
+## Addendum, 2026-08-13 — redb 2.6.3 to 4.1.0
+
+Taken on the strength of [ADR-0009](0009-storage-shape.md)'s candidate
+engine benchmark, which measured the upgrade arm alongside the swap
+candidates. It is a dependency bump, not the storage rework that ADR
+discusses, and it should not be read as a step toward one.
+
+**What it buys, measured on the identical engine-level journal.** The same
+76,301,856 rows occupy 15,568,752,640 B under 4.1.0 against 17,182,003,200
+under 2.6.3 — **9.4% less** — and the load ran 3,842 s against 4,884 s.
+
+**What it does not buy, and this is the point.** Packing is untouched. A
+250,000-block replay under 4.1.0 reproduces the 2.6.3 tree exactly: live
+tree 1.355 GiB and fill 0.6373 on both, to four decimals. The gain is
+entirely in free-page retention, which is the allocator, not the B-tree. So
+this does nothing for the 1.738x structural figure that motivates ADR-0009,
+and an engine that stores the same payload in 1.026x remains the open
+question. Anyone reading this addendum as "the space problem is being
+addressed incrementally" has read it wrong.
+
+**The on-disk format changed, and old data directories are refused.** redb 4
+reads only file format 3 and returns `UpgradeRequired` for a 2.x file, so it
+cannot misread one. That is mapped to `ErrorKind::Invalid` with a message
+that names redb 2.x, says to sync again, and says the chain is not damaged —
+the two failures an operator can hit here need to look different from each
+other. There is no in-place migration and ADR-0004's fresh-sync stance means
+there does not need to be. A test writes a genuine 2.x store with the
+previous major as a dev-dependency and asserts the refusal, so the behaviour
+keeps being tested if either version moves.
+
+**MSRV is unaffected:** redb 4.1.0 requires 1.89 against this workspace's
+1.94 floor.
+
+**Known open issues in 4.1.0**, recorded so the upgrade is not mistaken for
+a robustness improvement: #1331 and #1332 abort the process on malformed
+on-disk structures (an unvalidated 5-bit page order, and a cyclic branch
+pointer reached from ordinary reads), #1333 leaves a file permanently
+unopenable when the repair path itself panics, and read paths do not verify
+page checksums until a fix that is currently master-only. These concern
+files that are already damaged or hostile; they are not regressions against
+2.6.3, which shares the lineage. They are a reason to treat the upgrade as
+routine maintenance rather than a hardening step, and a reason the
+crash-safety question in ADR-0009 stays open.

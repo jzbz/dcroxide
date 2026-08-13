@@ -50,6 +50,15 @@ supported configuration. Syncing from genesis is the accepted default
 (ADR-0004's C6 stance); `addblock`-format import is the bulk path when
 you already have the blocks.
 
+**A data directory written before 2026-08-13 also has to be re-synced.**
+The metadata store moved from redb 2.x to 4.x, which changed the on-disk
+format. There is no in-place upgrade. An old directory is *refused*, not
+misread — the node stops with a message naming redb 2.x and telling you to
+sync again, and it says the chain is not damaged, because "this predates
+the upgrade" and "your disk is failing" want opposite reactions from you.
+Delete the data directory and sync from genesis, or re-import with
+`addblock`. Nothing else about operating the node changes.
+
 Budget for it: initial block download runs about **2.2x slower than
 dcrd** — roughly 2.5 hours against dcrd's 1.1 for mainnet from genesis on
 the machine in [bench-ledger.md](bench-ledger.md) — and the chain costs
