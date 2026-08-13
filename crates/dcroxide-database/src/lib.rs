@@ -168,6 +168,17 @@ pub struct FlushObservation {
 /// block or re-enter the database; append to a buffer and analyse later.
 pub type FlushObserver = Arc<dyn Fn(&FlushObservation) + Send + Sync>;
 
+/// A callback invoked once per key/value the engine is handed, in the
+/// order it is handed them, with `None` for a delete.
+///
+/// Called inside the flush transaction with the cache lock held, so it
+/// must not block or re-enter the database. It exists to capture the
+/// engine-level write sequence for ADR-0009's candidate engine benchmark:
+/// the order the storage engine actually sees is neither block order nor
+/// the sorted contents of the finished store, and picking either would
+/// decide that benchmark by itself.
+pub type WriteLogSink = Arc<dyn Fn(&[u8], Option<&[u8]>) + Send + Sync>;
+
 /// Options controlling database creation and opening.
 pub struct Options {
     /// The database directory.
@@ -211,6 +222,11 @@ pub struct Options {
     ///
     /// See [`FlushObservation::stats`] for why this is sampled at all.
     pub flush_stats_every: u64,
+    /// Called once per key/value handed to the engine, when set.
+    ///
+    /// `None` by default, and the same "no observation, no cost" contract
+    /// as [`Self::flush_observer`]. See [`WriteLogSink`].
+    pub write_log: Option<WriteLogSink>,
     /// Bytes the metadata overlay may hold before a commit flushes it.
     ///
     /// Was hardcoded until the ADR-0004 measurement work needed it: with a
@@ -253,6 +269,7 @@ impl Options {
             db_cache_bytes: DEFAULT_DB_CACHE_BYTES,
             flush_observer: None,
             flush_stats_every: 0,
+            write_log: None,
             cache_max_size: crate::dbcache::DEFAULT_CACHE_SIZE,
             cache_flush_interval_secs: crate::dbcache::DEFAULT_FLUSH_SECS,
         }
@@ -568,6 +585,7 @@ impl Database {
                 cache: Mutex::new({
                     let mut cache = crate::dbcache::DbCache::new();
                     cache.set_observer(opts.flush_observer.clone(), opts.flush_stats_every);
+                    cache.set_write_log(opts.write_log.clone());
                     cache.set_limits(opts.cache_max_size, opts.cache_flush_interval_secs);
                     cache
                 }),
@@ -641,6 +659,7 @@ impl Database {
                 cache: Mutex::new({
                     let mut cache = crate::dbcache::DbCache::new();
                     cache.set_observer(opts.flush_observer.clone(), opts.flush_stats_every);
+                    cache.set_write_log(opts.write_log.clone());
                     cache.set_limits(opts.cache_max_size, opts.cache_flush_interval_secs);
                     cache
                 }),

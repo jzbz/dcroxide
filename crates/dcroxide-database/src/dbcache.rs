@@ -312,6 +312,19 @@ pub(crate) struct DbCache {
     stats_every: u64,
     /// Flushes since open, so an observation can be ordered.
     flush_seq: u64,
+    /// Records every key/value the engine is handed, in the order it is
+    /// handed them; `None` in every ordinary build.
+    ///
+    /// This exists for ADR-0009's candidate engine benchmark, where the
+    /// insertion *order* decides the answer: a sorted bulk load is an
+    /// LSM's best case and a copy-on-write B-tree's worst (a sorted
+    /// rebuild of this store measured 58.29% fill against 64.86%), and a
+    /// random one is the reverse. Neither is what the engine actually
+    /// sees. It sees this: one transaction per flush, each a sorted sweep
+    /// over a scattered subset, carrying overwrites and deletes. Capturing
+    /// it once and replaying it into every candidate eliminates the
+    /// confound rather than balancing it.
+    write_log: Option<crate::WriteLogSink>,
 }
 
 impl DbCache {
@@ -325,6 +338,7 @@ impl DbCache {
             observer: None,
             stats_every: 0,
             flush_seq: 0,
+            write_log: None,
         }
     }
 
@@ -342,6 +356,11 @@ impl DbCache {
     ) {
         self.observer = observer;
         self.stats_every = stats_every;
+    }
+
+    /// Attach a write-log sink. See [`Self::write_log`].
+    pub(crate) fn set_write_log(&mut self, sink: Option<crate::WriteLogSink>) {
+        self.write_log = sink;
     }
 
     /// Apply a committed transaction's pending sets to the overlay
@@ -491,6 +510,9 @@ impl DbCache {
             // order, with the newest layer's entry winning.
             for (key, entry) in self.cached.merged() {
                 dirty_entries = dirty_entries.saturating_add(1);
+                if let Some(sink) = &self.write_log {
+                    sink(key, entry.as_ref().map(|v| v.as_slice()));
+                }
                 match entry {
                     Some(v) => {
                         table

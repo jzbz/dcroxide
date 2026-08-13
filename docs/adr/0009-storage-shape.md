@@ -155,6 +155,76 @@ Two caveats travelled with these numbers. One is now measured:
 
 ## Decision (proposed)
 
+**All four prerequisites are measured as of 2026-08-13. The recommendation
+is: take the redb 4.1.0 upgrade now, and propose fjall as a conditional
+change that does not start until three named conditions are met.**
+
+The size case is no longer arguable. On the identical engine-level journal,
+dcroxide's 76,301,856 rows occupy **5.80 GiB under fjall against 16.00 GiB
+under redb 2.6.3** — 1.026x payload against 2.831x, marginally denser than
+goleveldb itself, with reads 3.5x faster and a bulk load 22x faster. Every
+pre-registered size and speed threshold clears with room:
+
+| gate | threshold, set before any arm ran | fjall | |
+|---|---|---|---|
+| A — size settled | ≤ 1.25x payload | 1.026x | ✓ |
+| A — size peak | ≤ 1.60x payload | 1.519x | ✓ |
+| B — point reads | ≤ 1.5x redb | 0.29x | ✓ |
+| B — full scan | ≤ 1.5x redb | 0.12x | ✓ |
+| B — load time | ≤ 1.15x redb | 0.04x | ✓ |
+| D — constraints | pure Rust, no C toolchain | no LZ4, no bindgen | ✓ |
+| **C — crash safety** | **zero failures AND no open upstream issue on the atomicity invariant** | **see below** | **✗** |
+
+**Gate C is not met, and it is the gate ADR-0004 chose redb for.** The
+mechanical half passes: three `kill -9`s per engine, each batch writing a
+marker inside its own atomic unit, zero missing rows, zero wrong values,
+zero rows leaked from an uncommitted batch. But gate C was deliberately
+written wider than a kill test, and the wider half fails:
+
+- **fjall #308 is open, filed against 3.1.8, and lands exactly on this
+  project's hard requirement.** `WriteBatch::commit()` does not poison the
+  database when a journal write fails; a later batch then commits after the
+  unterminated record and returns `Ok`, and recovery truncates from the
+  first bad record on reopen. That is `commit()` returning success for a
+  batch that does not survive restart — the precise thing
+  `process.rs:908-916` exists to prevent. A `kill -9` does not exercise it,
+  because it needs a *write failure*, not process death.
+- **fjall #311 is open**: no strict recovery mode, so mid-journal corruption
+  is indistinguishable from a torn tail and presents as silent truncation
+  rather than a loud failure.
+- **The default is not durable.** `Database::batch()` hands back
+  `PersistMode::Buffer`, which returns `Ok` with no fsync. The arms here
+  used `SyncData` explicitly. redb gives durability unless asked otherwise;
+  fjall gives speed unless asked otherwise, which inverts the polarity of
+  ADR-0004's durable-defaults rule and leaves a standing footgun in every
+  future code path that forgets it.
+
+**So the three conditions before a fjall migration starts:**
+
+1. #308 fixed upstream, **or** proven unreachable by dcroxide's usage with a
+   regression test that would fail if it became reachable again. Accepting
+   it in prose is the third option the gate allows, and it is the one this
+   ADR declines to take.
+2. Durability enforced at the wrapper boundary, so no call site can
+   construct a non-durable commit, with a test that fails if one can.
+3. `crash.rs` rebuilt into an actual gate first. Its four tests exercise
+   only `store_block`/`fetch_block`/`has_block` and none writes metadata,
+   so today it cannot fail a wrong storage change. That was true before this
+   benchmark and is the cheapest of the three to fix.
+
+**Take redb 4.1.0 now, independently.** Measured on the same journal, it
+holds the identical content in 14.50 GiB against 2.6.3's 16.00 — 9.4%
+smaller — and loads 21% faster. It does not touch the 1.738x structural
+figure (its leaf layout is unchanged), so it is not an answer to the space
+problem; it is a dependency bump that gives back 1.5 GiB and forecloses
+nothing. Note it carries its own open issues (#1331, #1332, #1333: process
+aborts and unopenable files on malformed input, with read-path checksum
+verification only on master), which argue for the upgrade being routine
+maintenance rather than a security improvement.
+
+Everything below this line predates the 2026-08-13 measurement and is kept
+because the reasoning is checkable.
+
 **Do not start a rework yet. Run four measurements that the gate requires and
 that would change the design, then decide.** Three are now done. The first
 two narrowed the case — lever (d) is one bucket's row encoding, and the only
@@ -225,13 +295,32 @@ sold on IBD.
    A validation run measured 0.93x drift and separated a 1.28x arm effect
    from it, which the previous rig could not have done. What remains is to
    re-run levers (b) and (c) through it at full scale.
-4. **Candidate engine benchmark.** Load the exported `mainnet-full.corpus`
-   into each candidate LSM with compression off; record on-disk bytes, wall
-   time, and behaviour under `kill -9`. No engine is named in this ADR
-   because none has been measured, and ADR-0004 chose redb partly for
-   crash-safety — a pure-Rust LSM's record there is shorter than
-   goleveldb's, and rocksdb reintroduces the C toolchain that ADR-0004's
-   Consequences weighed and declined.
+4. **Candidate engine benchmark.** ~~Prerequisite~~ **Done, 2026-08-13.**
+   Rather than loading `mainnet-full.corpus`, every arm was handed the
+   *engine-level journal* — what dcroxide's storage engine was actually
+   given, batch for batch, 102,686,859 records in 130 batches, captured by
+   `replay --writelog`. Loading the sorted corpus instead would have decided
+   the benchmark by itself: a sorted bulk load is an LSM's best case and a
+   copy-on-write B-tree's worst.
+
+   | engine | settled | over payload | reads (200k point) | full scan |
+   |---|---:|---:|---:|---:|
+   | **fjall 3.1.8** | 6,227,582,792 | **1.026x** | 29.80 µs | 11.2 s |
+   | goleveldb, *oracle* | 6,421,155,136 | 1.058x | — | — |
+   | redb 4.1.0 | 15,568,752,640 | 2.565x | — | — |
+   | redb 2.6.3, incumbent | 17,182,003,200 | 2.831x | 104.26 µs | 93.4 s |
+
+   Two controls make the numbers quotable. The **redb 2.6.3 arm reproduced
+   the measured baseline** — live tree within 0.008%, fill within 0.0001 —
+   which was the pre-registered abort condition on the rig. And the
+   **goleveldb oracle landed at 1.058x, inside its pre-registered 1.05–1.12x
+   band**, which establishes that dcrd's 1.081x is a property of the engine
+   class rather than of dcrd's write schedule. That was the sleeper
+   condition: had it failed, the answer was "stay on redb" regardless of
+   what any candidate measured.
+
+   Full detail, including the excluded candidates and a voided first
+   goleveldb run, is in [bench-ledger.md](../bench-ledger.md).
 
 **If those land in favour of a change, the shape to propose is a single
 LSM metadata store, not a split.** dcrd achieves 6.10 GiB with *one*

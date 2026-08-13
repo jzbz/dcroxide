@@ -356,6 +356,118 @@ Note the ladder also bounds the full-chain comparison: equal apparent length
 means both arms fell inside the same 4 GiB quantum, which pins the schedule's
 effect on *file* size only to within one region.
 
+## Candidate engine benchmark (ADR-0009 prerequisite 4, 2026-08-13)
+
+Every arm is handed the **identical journal**: what dcroxide's engine was
+actually given, batch for batch, captured by `replay --writelog` and
+replayed with one atomic durable commit per dcroxide flush. 102,686,859
+write records in 130 batches, producing 76,301,856 rows and 6,069,302,955 B
+of payload. Insertion order therefore cannot decide the result — a sorted
+bulk load is an LSM's best case and a copy-on-write B-tree's worst, and
+neither is what the engine sees.
+
+Compression off everywhere (fjall built `default-features = false`, so LZ4
+is absent rather than unconfigured; goleveldb with dcrd's own
+`opt.NoCompression`). Sizes are **apparent**, and LSM arms are measured
+after compaction quiesces — an engine measured mid-compaction is not
+comparable to one that has settled.
+
+| engine | settled | over payload | peak | load |
+|---|---:|---:|---:|---:|
+| **fjall 3.1.8** | 6,227,582,792 | **1.026x** | 1.519x | 219 s |
+| goleveldb (dcrd's), *oracle* | 6,421,155,136 | **1.058x** | 1.130x | 485 s |
+| redb 4.1.0 | 15,568,752,640 | 2.565x | 2.831x | 3,842 s |
+| redb 2.6.3 (incumbent) | 17,182,003,200 | 2.831x | 2.831x | 4,884 s |
+
+All four hold identical content: 76,301,856 rows, 6,069,302,955 payload
+bytes, every arm.
+
+**The rig reproduces a known answer.** The redb 2.6.3 control landed at live
+tree 10,548,097,024 against the measured baseline's 10,547,240,960 (0.008%,
+abort threshold 2%) and fill 0.6461 against 0.6462 (0.0001, threshold
+0.005). That check was pre-registered: no candidate number may be quoted
+from a rig that cannot reproduce a known answer.
+
+**The oracle validates the target.** goleveldb, handed our journal, lands at
+1.058x — inside the pre-registered 1.05–1.12x band. So dcrd's 1.081x is a
+property of the engine class, not of dcrd's write schedule. Had it landed
+outside, the pre-registration made the answer "stay on redb" regardless of
+what any candidate did.
+
+The first goleveldb run read 1.2465x and was **voided**: it measured the
+store as closed, with L0 files outstanding, where dcrd's reference figure
+was taken after its compactor had quiesced. The tell was `settled` exceeding
+`peak`, which is impossible for a store that has settled.
+
+### Reads (gate B: non-regression, threshold ≤1.5x redb)
+
+| | 200k point reads | per read | full scan |
+|---|---:|---:|---:|
+| redb 2.6.3 | 20.85 s | 104.26 µs | 93.4 s |
+| fjall 3.1.8 | 5.96 s | **29.80 µs** | **11.2 s** |
+
+0.29x and 0.12x against a 1.5x ceiling. Both returned 200,000 hits with
+identical value bytes. Caveat: not true-cold — dropping caches needs root,
+so each arm was preceded by streaming the 18.9 GB block corpus through the
+page cache, which is crude but symmetric. Part of fjall's advantage is that
+a 5.8 GiB store survives caching better than a 16.0 GiB one, which
+conflates engine speed with store size; store size is the finding, so the
+gain is real even though the attribution is mixed.
+
+### Crash safety (gate C: pass/fail, no trade against size)
+
+`kill -9` on the process group mid-load, three times per engine at
+different points. Each batch writes a marker key **inside its own atomic
+unit**, so the store's claim about itself must match its contents exactly.
+
+| control (redb 2.6.3) | claims | expected rows | missing | wrong | leaked | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| kill @25s | batch 9 | 3,647,531 | 0 | 0 | 0 | PASS |
+| kill @60s | batch 15 | 5,705,334 | 0 | 0 | 0 | PASS |
+| kill @110s | batch 22 | 7,817,058 | 0 | 0 | 0 | PASS |
+
+The first row is the one that shows the test works: 10 batches had been
+committed but the store claims 9, so redb discarded an incomplete
+transaction rather than half-applying it.
+
+The fjall arm was still verifying when this was written — its first kill
+committed **55 batches in the same 25 s that got redb to 10**, and the
+verifier reconstructs every expected row before checking it, so each arm
+takes far longer than the kill it follows. Append its rows here when they
+land. The gate-C verdict below does not depend on them: it fails on the
+open-upstream-issue condition, which a `kill -9` cannot exercise.
+
+**What this test does not cover.** `kill -9` is process death, not power
+loss, and not a write failure. The arms commit with
+`PersistMode::SyncData`, so the data reached the device — but fjall's
+*default* is `PersistMode::Buffer`, which returns `Ok` with no fsync at all.
+Adopting fjall would mean enforcing durability in the wrapper rather than
+inheriting it, which inverts ADR-0004's durable-defaults rule.
+
+**Two open upstream issues decide gate C, and no kill test reaches them.**
+fjall #308 (open, filed against 3.1.8) has `WriteBatch::commit()` return
+`Ok` for a batch that does not survive restart, when an earlier journal
+*write failure* left an unterminated record and recovery truncates from it.
+fjall #311 (open) has no strict recovery mode, so mid-journal corruption is
+indistinguishable from a torn tail and presents as silent truncation. Both
+land on the cross-bucket atomicity `process.rs:908-916` depends on, and
+neither is reachable by killing a healthy process.
+
+### Excluded candidates, with the reason recorded
+
+- **rocksdb** — the build fails on this machine even with g++ 16.2.1 and 32
+  cores, because bindgen needs libclang. Adopting it means every build host
+  on three OS tiers acquires an LLVM dependency, not merely a C++ compiler,
+  which is more than ADR-0004's weighed decision priced.
+- **LMDB / heed** — best measured case ~1.30–1.35x, below the adopt
+  threshold before it starts; structural floor of 1.463x on `existsaddridx`
+  even with a perfectly sorted `MDB_APPEND` load. No page checksums, on a
+  node that ingests attacker-supplied blocks.
+- **sled 0.34.7** — measured at 3.44x against redb's 2.07x on the same host:
+  worse than the engine it would replace. No range scans inside a
+  transaction (issue #1143, open since 2020), which dcroxide's cursors
+  require. Last release 2021.
+
 ## Compaction (`redb::Database::compact`)
 
 Never called in dcroxide; measured here because ADR-0004 named free pages

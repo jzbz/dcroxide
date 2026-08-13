@@ -36,7 +36,7 @@ Usage:
 
   dcroxide-bench replay --in <file> [--net <name>] [--workdir <dir>]
                         [--assumevalid <hash>] [--max <n>] [--report <n>]
-                        [--flushlog <file>] [--statsevery <n>]
+                        [--flushlog <file>] [--writelog <dir>] [--statsevery <n>]
                         [--metacache <MiB>] [--dbcache <MiB>]
                         [--utxocache <MiB>]
                         [--txindex] [--addrindex]
@@ -55,6 +55,18 @@ Usage:
       sets redb's page cache in MiB (default 1024, redb's own default)
       -- ADR-0004's read-cache lever.  The two interact, so a run that
       moves one without the other answers half a question.
+
+      --writelog captures what the storage ENGINE is handed: one record
+      per key/value in the order given, batched on flush boundaries, as
+      journal.bin plus a journal.idx of batch offsets.  It exists for
+      ADR-0009's candidate engine benchmark, where insertion order would
+      otherwise decide the answer -- a sorted bulk load is an LSM's best
+      case and a copy-on-write B-tree's worst (a sorted rebuild of this
+      store measured 58.29% fill against 64.86%), and a random one is the
+      reverse.  Neither is what the engine sees.  It sees one sorted
+      sweep per flush over a scattered subset, carrying overwrites and
+      deletes.  Capturing that once and replaying it into every candidate
+      eliminates the confound instead of balancing it.
 
       --utxocache sets the UTXO cache ceiling in MiB (dcrd's
       --utxocachemaxsize, default 150).  It belongs with --metacache
@@ -179,6 +191,23 @@ Usage:
 enum FlushMsg {
     /// One JSON record to append.
     Record(String),
+    /// Stop; the replay is finished.
+    Done,
+}
+
+/// One message to the engine write-log writer.
+///
+/// The log records what the storage engine is handed and in what order,
+/// which is the input ADR-0009's candidate benchmark needs: neither block
+/// order nor the sorted finished store, but one sorted sweep per flush
+/// carrying overwrites and deletes. Batches are delimited on the flush
+/// boundary so a replay into another engine can commit exactly where
+/// dcroxide commits.
+enum WriteLogMsg {
+    /// `op` is 0 for a put and 1 for a delete.
+    Record(u8, Vec<u8>, Option<Vec<u8>>),
+    /// The flush that was accumulating has committed.
+    EndBatch,
     /// Stop; the replay is finished.
     Done,
 }
@@ -382,6 +411,7 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
     let mut r = BufReader::new(file);
 
     let flush_log = args.get("flushlog").map(PathBuf::from);
+    let write_log = args.get("writelog").map(PathBuf::from);
     let stats_every: u64 = match args.get("statsevery") {
         Some(v) => v.parse().map_err(|e| format!("bad --statsevery: {e}"))?,
         None => 25,
@@ -427,20 +457,120 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
         }
         None => None,
     };
+    // The engine-level write log, for ADR-0009's candidate benchmark. It
+    // runs on its own thread for the same reason the flush log does: this
+    // sink fires inside the flush transaction, ~102M times over a full
+    // chain, and anything slower than a channel send would be measuring
+    // the instrument. Records are framed
+    // `[u8 op][u32 klen][u32 vlen][key][value]`, one batch per flush,
+    // delimited by the batch index written alongside.
+    let (wl_tx, wl_rx) = std::sync::mpsc::channel::<WriteLogMsg>();
+    let wl_writer = match &write_log {
+        Some(dir) => {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("unable to create {}: {e}", dir.display()))?;
+            let bin_path = dir.join("journal.bin");
+            let idx_path = dir.join("journal.idx");
+            let bin = std::fs::File::create(&bin_path)
+                .map_err(|e| format!("unable to create {}: {e}", bin_path.display()))?;
+            let idx = std::fs::File::create(&idx_path)
+                .map_err(|e| format!("unable to create {}: {e}", idx_path.display()))?;
+            Some(std::thread::spawn(
+                move || -> std::io::Result<(u64, u64)> {
+                    let mut bin = BufWriter::with_capacity(1 << 22, bin);
+                    let mut idx = BufWriter::with_capacity(1 << 16, idx);
+                    let (mut offset, mut records, mut batches) = (0u64, 0u64, 0u64);
+                    let (mut batch_start, mut batch_records) = (0u64, 0u64);
+                    for msg in wl_rx {
+                        match msg {
+                            WriteLogMsg::Record(op, key, val) => {
+                                let vlen = val.as_ref().map(|v| v.len()).unwrap_or(0) as u32;
+                                bin.write_all(&[op])?;
+                                bin.write_all(&(key.len() as u32).to_le_bytes())?;
+                                bin.write_all(&vlen.to_le_bytes())?;
+                                bin.write_all(&key)?;
+                                if let Some(v) = &val {
+                                    bin.write_all(v)?;
+                                }
+                                offset = offset
+                                    .saturating_add(9)
+                                    .saturating_add(key.len() as u64)
+                                    .saturating_add(u64::from(vlen));
+                                records = records.saturating_add(1);
+                                batch_records = batch_records.saturating_add(1);
+                            }
+                            WriteLogMsg::EndBatch => {
+                                // batch_seq, offset, record_count
+                                idx.write_all(&batches.to_le_bytes())?;
+                                idx.write_all(&batch_start.to_le_bytes())?;
+                                idx.write_all(&batch_records.to_le_bytes())?;
+                                batches = batches.saturating_add(1);
+                                batch_start = offset;
+                                batch_records = 0;
+                            }
+                            WriteLogMsg::Done => break,
+                        }
+                    }
+                    // Records written after the last flush observation -- the
+                    // close-time flush -- would otherwise sit in journal.bin
+                    // with no index entry, and a loader driven by the index
+                    // would silently skip them. Caught by the smoke replay
+                    // landing 26 payload bytes short of the store it captured.
+                    if batch_records > 0 {
+                        idx.write_all(&batches.to_le_bytes())?;
+                        idx.write_all(&batch_start.to_le_bytes())?;
+                        idx.write_all(&batch_records.to_le_bytes())?;
+                        batches = batches.saturating_add(1);
+                    }
+                    bin.flush()?;
+                    idx.flush()?;
+                    Ok((records, batches))
+                },
+            ))
+        }
+        None => None,
+    };
+
     let db = {
         let db_path = workdir.join("blocks_ffldb");
         std::fs::create_dir_all(&db_path)
             .map_err(|e| format!("unable to create database directory: {e}"))?;
         let mut opts = Options::new(&db_path, params.net.0);
         opts.cache_max_size = meta_cache_mib.saturating_mul(1024 * 1024);
+        if write_log.is_some() {
+            let sink = wl_tx.clone();
+            opts.write_log = Some(Arc::new(move |key: &[u8], val: Option<&[u8]>| {
+                let _ = sink.send(WriteLogMsg::Record(
+                    u8::from(val.is_none()),
+                    key.to_vec(),
+                    val.map(|v| v.to_vec()),
+                ));
+            }));
+        }
         if let Some(mib) = db_cache_mib {
             opts.db_cache_bytes = (mib as usize).saturating_mul(1024 * 1024);
+        }
+        // The batch delimiter rides on the flush observer, which fires once
+        // per flush after the transaction commits — so a batch in the
+        // journal is exactly one redb transaction, which is the property
+        // that makes the replay faithful.
+        if write_log.is_some() && flush_log.is_none() {
+            let sink = wl_tx.clone();
+            opts.flush_observer = Some(Arc::new(
+                move |_obs: &dcroxide_database::FlushObservation| {
+                    let _ = sink.send(WriteLogMsg::EndBatch);
+                },
+            ));
         }
         if flush_log.is_some() {
             opts.flush_stats_every = stats_every;
             let sink = flush_tx.clone();
+            let wl_sink = write_log.is_some().then(|| wl_tx.clone());
             opts.flush_observer = Some(Arc::new(
                 move |obs: &dcroxide_database::FlushObservation| {
+                    if let Some(wl) = &wl_sink {
+                        let _ = wl.send(WriteLogMsg::EndBatch);
+                    }
                     let stats = obs
                         .stats
                         .map(|s| s.to_json())
@@ -649,6 +779,20 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
             .map_err(|e| format!("writing flush log: {e}"))?;
         if let Some(path) = flush_log {
             println!("wrote {count} flush records to {}", path.display());
+        }
+    }
+
+    if let Some(writer) = wl_writer {
+        let _ = wl_tx.send(WriteLogMsg::Done);
+        let (records, batches) = writer
+            .join()
+            .map_err(|_| "write log writer panicked".to_string())?
+            .map_err(|e| format!("writing write log: {e}"))?;
+        if let Some(dir) = write_log {
+            println!(
+                "wrote {records} write records in {batches} batches to {}",
+                dir.display()
+            );
         }
     }
     Ok(())
@@ -1330,6 +1474,7 @@ fn main() -> std::process::ExitCode {
                 "max",
                 "report",
                 "flushlog",
+                "writelog",
                 "statsevery",
                 "metacache",
                 "txindex",

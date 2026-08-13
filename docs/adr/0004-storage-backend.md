@@ -41,6 +41,20 @@ Dated addenda follow the amendment below, and later ones supersede earlier
 ones — including a retraction. This section states what is currently
 believed and points at the evidence; nothing below it has been rewritten.
 
+**The engine is now measured against candidates, and redb loses on this
+workload.** Handed the identical engine-level journal, fjall 3.1.8 holds
+dcroxide's 76,301,856 rows in 5.80 GiB where redb 2.6.3 needs 16.00 — 1.026x
+payload against 2.831x — with point reads 3.5x faster and a bulk load 22x
+faster. A goleveldb control lands at 1.058x, confirming the target is a
+property of the engine class rather than of dcrd's write schedule, and a
+redb 2.6.3 control reproduces this file's own baseline to 0.008%. That does
+not by itself decide anything: the crash-safety gate this ADR chose redb for
+is *not* met by fjall today, on two open upstream issues that land on the
+cross-bucket atomicity invariant. [ADR-0009](0009-storage-shape.md) records
+the measurement, the gates, and the three conditions a migration would have
+to clear. A free result alongside it: **redb 4.1.0 holds the same content in
+14.50 GiB against 2.6.3's 16.00, and loads 21% faster.**
+
 **The dcrd comparison is now measured on both sides, and it holds.** The
 2026-08-11 addendum reports dcrd's payload at matched index composition,
 against the same block bytes: the two implementations store the *same
