@@ -207,10 +207,23 @@ written wider than a kill test, and the wider half fails:
    ADR declines to take.
 2. Durability enforced at the wrapper boundary, so no call site can
    construct a non-durable commit, with a test that fails if one can.
-3. `crash.rs` rebuilt into an actual gate first. Its four tests exercise
-   only `store_block`/`fetch_block`/`has_block` and none writes metadata,
-   so today it cannot fail a wrong storage change. That was true before this
-   benchmark and is the cheapest of the three to fix.
+3. ~~`crash.rs` rebuilt into an actual gate first.~~ **Done, 2026-08-13.**
+   The suite went from four tests that never wrote metadata to nine that
+   reproduce `Chain::flush`'s pairing — block index rows, UTXO entries and
+   both state markers in one transaction — and tear it: a torn commit
+   spanning buckets, repeated tears at varying commit sizes, block data and
+   metadata rolling back together across the two durability domains, durable
+   metadata surviving the block-file rollback, and deletes being atomic with
+   the puts beside them (the disconnect shape, which is how the spend
+   journal shrinks). Desync is checked in **both** directions: a marker
+   claiming more rows than survive is lost data, one claiming fewer is
+   uncommitted data that leaked, and a suite checking only the first passes
+   on an engine that keeps writes it never committed.
+
+   Verified by breaking the store on purpose. Deleting the state-marker
+   write from `DbCache::flush` fails four of the new tests and **passes all
+   five of the old ones**, which is the concrete form of the complaint this
+   item recorded.
 
 **Take redb 4.1.0 now, independently.** Measured on the same journal, it
 holds the identical content in 14.50 GiB against 2.6.3's 16.00 — 9.4%
