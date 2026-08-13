@@ -201,10 +201,52 @@ written wider than a kill test, and the wider half fails:
 
 **So the three conditions before a fjall migration starts:**
 
-1. #308 fixed upstream, **or** proven unreachable by dcroxide's usage with a
-   regression test that would fail if it became reachable again. Accepting
-   it in prose is the third option the gate allows, and it is the one this
-   ADR declines to take.
+1. ~~#308 fixed upstream, or proven unreachable by dcroxide's usage.~~
+   **Checked 2026-08-13: it was reachable, and is now closed by a change.**
+
+   The check found that dcroxide supplied all three conditions the bug
+   needs. (i) fjall issues the unpoisoned write only for batches over its
+   8 KiB journal buffer — `WriteBatch::commit` calls `write_batch` with a
+   bare `?` (`src/batch/mod.rs:115`) where the `persist` two lines below
+   poisons and even rewrites the error to `Error::Poisoned` — and
+   dcroxide's flush batch, block index rows plus UTXO entries plus both
+   state markers, is far over that. (ii) Nothing excludes a journal write
+   failure; the `kill -9` suite cannot produce one, which is why the
+   existing evidence never touched it. (iii) **dcroxide would issue a later
+   commit after a failed one.** `DbCache::flush` returns at the `?` before
+   clearing the dirty set, so the failed batch survives in the cache and
+   the next flush retries it; `DbInner` carried one `AtomicBool`, `closed`,
+   written only by `Database::close`; and a storage error reaches
+   `SyncManager::on_block`, is logged, and sync continues. Worse for the
+   interval case, `last_flush` is set *before* the commit, so a failed
+   timed flush resets the timer and the next commit returns `Ok` without
+   touching the engine.
+
+   The fix is a fail-closed latch in `dcroxide-database`: a `fatal` flag
+   set by every path that hands a durable commit to the engine, checked
+   before any write. Once a durable write fails, no later write on that
+   store can report success — which is the property the bug needs and now
+   cannot have, whatever engine is underneath. Reads stay available
+   deliberately: data that reached disk is still valid, and refusing it
+   would turn a write fault into a total outage for no integrity gain.
+
+   The regression test pins the consequence on every platform. It does
+   **not** induce a real `ENOSPC`, so it does not prove a genuine device
+   failure reaches the latch — that wiring is three `map_err` calls, and a
+   fault-injection test filling a size-limited filesystem would close the
+   gap. It is Linux-only and is not written; this ADR says so rather than
+   letting a green suite imply more than it tested.
+
+   Two defects were found in passing and are **not** fixed here, because
+   they are node policy rather than storage:
+   - A storage failure is indistinguishable from a consensus rejection.
+     It surfaces as a non-rule `ProcessBlockFailure`, gets logged, and sync
+     continues, so a transient disk error makes a valid block look invalid
+     and blames the peer. With the latch this becomes loud and permanent
+     rather than silent, which is better but still wrong.
+   - `dcroxide.rs` logs a failed shutdown flush and exits `SUCCESS`, in the
+     one place whose own comment says that failure wedges the node on next
+     start.
 2. Durability enforced at the wrapper boundary, so no call site can
    construct a non-durable commit, with a test that fails if one can.
 3. ~~`crash.rs` rebuilt into an actual gate first.~~ **Done, 2026-08-13.**

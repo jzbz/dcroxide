@@ -25,6 +25,15 @@ pub enum ErrorKind {
     Invalid,
     /// A checksum failure or a corrupted database in some other way.
     Corruption,
+    /// A durable write failed, so the store is no longer trustworthy and
+    /// every later write on this handle is refused.
+    ///
+    /// No dcrd counterpart: ffldb has no such latch, because goleveldb's
+    /// failure modes differ. It exists here to make one specific bug class
+    /// unreachable — a store that reports a commit as successful after an
+    /// earlier commit failed. See [`crate::Database`] and ADR-0009's
+    /// gate C.
+    Fatal,
     /// An operation was attempted against a closed transaction.
     TxClosed,
     /// An operation that requires a writable transaction was attempted
@@ -70,6 +79,7 @@ impl ErrorKind {
             ErrorKind::DbAlreadyOpen => "ErrDbAlreadyOpen",
             ErrorKind::Invalid => "ErrInvalid",
             ErrorKind::Corruption => "ErrCorruption",
+            ErrorKind::Fatal => "ErrFatal",
             ErrorKind::TxClosed => "ErrTxClosed",
             ErrorKind::TxNotWritable => "ErrTxNotWritable",
             ErrorKind::BucketNotFound => "ErrBucketNotFound",

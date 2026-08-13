@@ -106,6 +106,35 @@ struct WriterGuard<'a> {
     db: &'a DbInner,
 }
 
+impl DbInner {
+    /// Latch the store fatal and return the error that caused it.
+    ///
+    /// Every path that hands a durable commit to the engine routes its
+    /// failure through here, so no call site can forget to latch.
+    ///
+    /// **Why a latch and not a retry.** A failed flush leaves the write
+    /// cache holding its dirty set, so the next flush would retry it and
+    /// could return `Ok`. That is the sequence one class of storage bug
+    /// needs in order to lose data silently: the engine reports a commit
+    /// as durable when the write that preceded it left the log in a state
+    /// recovery will truncate, and the node believes state it will not
+    /// have after a restart. dcroxide's chain writes block index rows,
+    /// UTXO entries and both state markers in one transaction precisely
+    /// so a crash cannot leave them disagreeing
+    /// (`process.rs`, `Chain::flush`); a commit that reports success and
+    /// then evaporates defeats that.
+    ///
+    /// The trade is availability for integrity: a transient `ENOSPC` that
+    /// today would be retried now stops the handle until the process
+    /// restarts. That is the right way round for a consensus daemon,
+    /// which already runs under a supervisor because release builds abort
+    /// on panic (see `docs/operating.md`).
+    pub(crate) fn mark_fatal(&self, e: Error) -> Error {
+        self.fatal.store(true, Ordering::SeqCst);
+        e
+    }
+}
+
 impl Drop for WriterGuard<'_> {
     fn drop(&mut self) {
         let mut busy = self.db.writer_busy.lock().expect("writer flag poisoned");
@@ -118,6 +147,9 @@ pub(crate) struct DbInner {
     kv: redb::Database,
     pub(crate) block_store: Mutex<BlockStore>,
     closed: AtomicBool,
+    /// Set when a durable write has failed. Every later write on this
+    /// handle is then refused. See [`DbInner::mark_fatal`].
+    fatal: AtomicBool,
     /// The metadata write cache (dcrd ffldb's `dbCache`).
     pub(crate) cache: Mutex<crate::dbcache::DbCache>,
     /// Serializes writable transactions for their whole lifetime
@@ -603,6 +635,7 @@ impl Database {
                 kv,
                 block_store: Mutex::new(block_store),
                 closed: AtomicBool::new(false),
+                fatal: AtomicBool::new(false),
                 cache: Mutex::new({
                     let mut cache = crate::dbcache::DbCache::new();
                     cache.set_observer(opts.flush_observer.clone(), opts.flush_stats_every);
@@ -677,6 +710,7 @@ impl Database {
                 kv,
                 block_store: Mutex::new(block_store),
                 closed: AtomicBool::new(false),
+                fatal: AtomicBool::new(false),
                 cache: Mutex::new({
                     let mut cache = crate::dbcache::DbCache::new();
                     cache.set_observer(opts.flush_observer.clone(), opts.flush_stats_every);
@@ -857,6 +891,26 @@ impl Database {
         Ok(())
     }
 
+    /// Refuse a write once a durable write has failed.
+    ///
+    /// Deliberately **not** applied to reads. Data that reached disk is
+    /// still valid, and refusing to serve it would turn a write fault into
+    /// a total outage — the RPC surface and every query would fail — for
+    /// no gain in integrity. Only the paths that could produce a *new*
+    /// commit are latched, because a new commit is the thing that must
+    /// not report success after a failure.
+    fn check_writable(&self) -> Result<(), Error> {
+        if self.inner.fatal.load(Ordering::SeqCst) {
+            return Err(db_error(
+                ErrorKind::Fatal,
+                "a durable write to the metadata store failed; this handle refuses \
+                 further writes -- stop the node, investigate the storage, and \
+                 restart",
+            ));
+        }
+        Ok(())
+    }
+
     /// Start a transaction, read-only or read-write per the flag (dcrd
     /// `Begin`).  Multiple read-only transactions may run concurrently;
     /// starting a read-write transaction blocks until any current one
@@ -954,6 +1008,9 @@ impl Database {
     /// serialize on the writer semaphore.
     pub fn begin(&self, writable: bool) -> Result<Transaction, Error> {
         self.check_open()?;
+        if writable {
+            self.check_writable()?;
+        }
         let (seed, cache_snap) = self.begin_seed(writable)?;
         Ok(Transaction::new(
             Arc::clone(&self.inner),
@@ -965,6 +1022,9 @@ impl Database {
 
     fn begin_managed(&self, writable: bool) -> Result<Transaction, Error> {
         self.check_open()?;
+        if writable {
+            self.check_writable()?;
+        }
         let (seed, cache_snap) = self.begin_seed(writable)?;
         Ok(Transaction::new(
             Arc::clone(&self.inner),
@@ -1012,7 +1072,8 @@ impl Database {
             .cache
             .lock()
             .expect("cache lock poisoned")
-            .flush(&self.inner.kv, &self.inner.block_store)?;
+            .flush(&self.inner.kv, &self.inner.block_store)
+            .map_err(|e| self.inner.mark_fatal(e))?;
         Ok(())
     }
 
@@ -1021,12 +1082,14 @@ impl Database {
     /// write cache.
     pub fn flush(&self) -> Result<(), Error> {
         self.check_open()?;
+        self.check_writable()?;
         let _writer = self.exclusive_writer();
         self.inner
             .cache
             .lock()
             .expect("cache lock poisoned")
-            .flush(&self.inner.kv, &self.inner.block_store)?;
+            .flush(&self.inner.kv, &self.inner.block_store)
+            .map_err(|e| self.inner.mark_fatal(e))?;
         Ok(())
     }
 }
@@ -1336,5 +1399,113 @@ mod bucket_stats_tests {
             b.largest_row_bytes
         );
         db.close().expect("close");
+    }
+}
+
+#[cfg(test)]
+mod fatal_latch_tests {
+    use super::*;
+
+    /// Once a durable write has failed, every later write on the handle
+    /// must fail too.
+    ///
+    /// This is the property that makes one storage-bug class unreachable:
+    /// the bug needs a *second* commit to report success after a first one
+    /// failed, and this forbids dcroxide from issuing it. It is stated
+    /// without reference to any engine, so it survives an engine change —
+    /// which is the point, since the engine dcroxide would move to
+    /// (fjall 3.1.8) has exactly that bug open upstream as #308: its
+    /// `WriteBatch::commit` does not poison on a journal write failure the
+    /// way its `persist` does, so a later batch can commit after an
+    /// unterminated record and be truncated away on recovery.
+    ///
+    /// **What this test covers and what it does not.** It pins the
+    /// consequence — latched means closed to writes — deterministically,
+    /// on every platform. It does *not* induce a real `ENOSPC` or `EIO`,
+    /// so it does not prove that a genuine device failure reaches the
+    /// latch. That wiring is three `map_err(|e| self.inner.mark_fatal(e))`
+    /// calls, one per path that hands a durable commit to the engine
+    /// (`Database::flush`, `Database::close`, and the flush inside
+    /// `Transaction::commit_internal`). A fault-injection test that fills
+    /// a size-limited filesystem would close that gap and is Linux-only;
+    /// it is not written yet, and ADR-0009 says so rather than implying
+    /// this test is more than it is.
+    #[test]
+    fn a_failed_durable_write_closes_the_handle_to_further_writes() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let opts = Options::new(tmp.path().join("blocks_redb"), 0x0709_1101);
+        let db = Database::create(&opts).expect("create");
+
+        // A durable generation, so there is committed state to protect.
+        db.update(|tx| {
+            let b = tx.metadata().create_bucket(b"data")?;
+            b.put(b"k", b"v")
+        })
+        .expect("write");
+        db.flush().expect("flush");
+
+        // The latch, set through the same path the production code uses.
+        let err = db.inner.mark_fatal(db_error(
+            ErrorKind::DriverSpecific,
+            "simulated write failure",
+        ));
+        assert_eq!(
+            err.kind,
+            ErrorKind::DriverSpecific,
+            "the cause is returned unchanged"
+        );
+
+        // Every write path now refuses, with the fatal kind rather than
+        // DbNotOpen -- an operator told "not open" would look in the
+        // wrong place.
+        for (what, got) in [
+            (
+                "update",
+                db.update(|tx| tx.metadata().put(b"probe", b"x"))
+                    .unwrap_err(),
+            ),
+            ("flush", db.flush().unwrap_err()),
+            ("begin(true)", db.begin(true).map(|_| ()).unwrap_err()),
+        ] {
+            assert_eq!(
+                got.kind,
+                ErrorKind::Fatal,
+                "{what} must refuse with ErrorKind::Fatal, got {got}"
+            );
+        }
+
+        // Reads of already-committed state stay available: the data that
+        // reached disk is still valid, and refusing reads would turn a
+        // write fault into a total outage for no integrity gain.
+        db.view(|tx| {
+            let b = tx.metadata().bucket(b"data").expect("bucket");
+            assert_eq!(b.get(b"k").as_deref(), Some(b"v".as_slice()));
+            Ok(())
+        })
+        .expect("reads stay available");
+    }
+
+    /// The latch is on the shared state, not the handle, so a second
+    /// handle cannot be used to route around it.
+    #[test]
+    fn the_latch_is_shared_by_every_clone_of_the_handle() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let opts = Options::new(tmp.path().join("blocks_redb"), 0x0709_1101);
+        let db = Database::create(&opts).expect("create");
+        let other = db.clone();
+
+        db.inner.mark_fatal(db_error(
+            ErrorKind::DriverSpecific,
+            "simulated write failure",
+        ));
+
+        assert_eq!(
+            other
+                .update(|tx| tx.metadata().put(b"probe", b"x"))
+                .unwrap_err()
+                .kind,
+            ErrorKind::Fatal,
+            "a clone shares Arc<DbInner> and must refuse too"
+        );
     }
 }

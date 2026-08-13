@@ -647,7 +647,10 @@ impl Transaction {
                 .expect("store lock")
                 .rollback_to(rollback_pos.0, rollback_pos.1);
             self.close();
-            return Err(e);
+            // Latch the store: the dirty set is still in the cache, so
+            // without this the next commit retries it and can report
+            // success after this failure. See DbInner::mark_fatal.
+            return Err(self.db.mark_fatal(e));
         }
 
         let (puts, removes) = {
