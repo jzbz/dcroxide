@@ -13,6 +13,13 @@ env:
   CARGO_TERM_COLOR: always
   # Differential tests must run in CI — a missing oracle is a failure, not a skip.
   DCROXIDE_REQUIRE_ORACLE: "1"
+  # Same rule for fault injection: the ENOSPC test mounts a size-limited
+  # tmpfs in a user namespace to prove a real storage failure reaches the
+  # fatal latch, and a fault-injection test that skips quietly is worse
+  # than none — the suite goes green having checked nothing. The test is
+  # Linux-only (`cfg(target_os = "linux")`), so this has no effect on the
+  # macOS and Windows matrix entries.
+  DCROXIDE_REQUIRE_FAULT_INJECTION: "1"
 
 jobs:
   lint:

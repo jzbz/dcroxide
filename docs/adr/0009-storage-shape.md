@@ -230,12 +230,25 @@ written wider than a kill test, and the wider half fails:
    deliberately: data that reached disk is still valid, and refusing it
    would turn a write fault into a total outage for no integrity gain.
 
-   The regression test pins the consequence on every platform. It does
-   **not** induce a real `ENOSPC`, so it does not prove a genuine device
-   failure reaches the latch — that wiring is three `map_err` calls, and a
-   fault-injection test filling a size-limited filesystem would close the
-   gap. It is Linux-only and is not written; this ADR says so rather than
-   letting a green suite imply more than it tested.
+   The regression test pins the consequence on every platform, and a
+   second test — added 2026-08-13 — now proves the cause. It mounts a
+   2 MiB `tmpfs` inside a user namespace (no root needed), fills it under
+   a live database, and checks what comes back: a real `ENOSPC` arrives as
+   an error rather than a panic, latches the store, and leaves reads
+   working. Linux-only, since it needs unprivileged `CLONE_NEWUSER`; CI
+   sets `DCROXIDE_REQUIRE_FAULT_INJECTION=1` so it fails rather than skips
+   there, and it asserts the child process actually ran its assertions
+   because a mistyped test filter would otherwise exit 0 having checked
+   nothing.
+
+   That test measured something worth recording: with the latch removed,
+   the write after the failure still fails — with redb's own message,
+   "Previous I/O error occurred. Please close and re-open the database".
+   **redb poisons itself; fjall's `write_batch` path does not.** That
+   asymmetry is the argument for the latch living in dcroxide rather than
+   being left to the engine: on redb it is belt and braces, on fjall it is
+   the only thing between a failed write and a commit that reports
+   success.
 
    Two defects were found in passing and are **not** fixed here, because
    they are node policy rather than storage:
