@@ -375,6 +375,18 @@ eliminating the storage cost *entirely* moves 230.8 to 281.9 blk/s, 1.22x,
 against a 1.5x stop rule. Whatever else is true, an engine swap cannot be
 sold on IBD.
 
+> **Caveat, 2026-08-14: that bound may not transfer to the daemon.** The 18%
+> comes from a *replay*, which validates every block. The daemon syncs
+> headers first, finds mainnet's assume-valid anchor, and skips connect
+> validation for roughly 93% of the chain — so the same storage work is a
+> share of a much smaller total, and storage is plausibly a *larger* fraction
+> of daemon IBD than 18%, not a smaller one. That would cut against the
+> conclusion this paragraph draws. It is a caveat and not a correction: the
+> 2026-08-14 profiling attempt that raised it could not measure the daemon's
+> composition reliably, and its own figure is withdrawn. What is established
+> is that a replay is not a proxy for daemon IBD and that this bound was
+> derived from one. See [bench-ledger.md](../bench-ledger.md).
+
 1. **Lever (d) on `spendjournalv3`.** ~~Prerequisite~~ **Measured**, by
    `redbstat --buckets`: the bucket holds a 2402-byte mean row against a
    4096-byte page, takes one row per page, and accounts for 1.74 GiB of the

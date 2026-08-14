@@ -376,6 +376,70 @@ Note the ladder also bounds the full-chain comparison: equal apparent length
 means both arms fell inside the same 4 GiB quantum, which pins the schedule's
 effect on *file* size only to within one region.
 
+## IBD profiling attempt (2026-08-14) — and why replay cannot proxy for it
+
+ADR-0009 records the 2.2x IBD gap as attributed to commit shape "by a
+progress-stall statistic — which records that progress halted, not what
+halted it — and no profile exists." This attempted the profile. **It did not
+identify the bottleneck, and the reason is the useful part.**
+
+Two arms to mainnet tip, same binary (`b6d0c63`), same machine, sequential,
+on an idle host; a first attempt was voided by ambient load and restarted.
+
+| arm | wall | rate | in-window cores (800k–1.1M) |
+|---|---:|---:|---:|
+| `replay --addrindex` | 4,545 s | 242.1 blk/s | 2.86 |
+| daemon syncing from a local dcrd | 5,568 s | 197.6 blk/s | 0.68 |
+
+**These two arms are not comparable, and no flag makes them so.** The replay
+validates every block. The daemon syncs headers first, finds mainnet's
+assume-valid anchor, and skips connect validation for roughly 93% of the
+chain. `--assumevalid` on the replay is accepted and does nothing below the
+anchor: `is_assume_valid_ancestor` needs `assume_valid_node`, set only once
+the chain has *seen* the anchor block, which a sequential replay reaches only
+at the end. Measured directly — identical CPU with the flag set and unset,
+2.86/2.89/2.68 cores against 2.66/2.86/2.65 over the same heights.
+
+So every replay-versus-sync ratio here compares full validation against
+almost none. **Withdrawn**: the 1.23x whole-chain and 1.62x in-window ratios
+as measures of anything, "script validation is not the workload", the
+57%-storage composition of the sync's hot thread, and "the documented 2.2x is
+stale" (no dcrd arm was run).
+
+**What survives, measured:**
+
+- The daemon synced 1,100,392 blocks in **5,568 s (197.6 blk/s)** from a
+  local dcrd on an idle host, exists-address index on.
+- It runs at **0.68 cores** in the dense range on a 32-thread host. Not a
+  ptrace artifact: the CPU-delta window excludes the sampling burst, and a
+  ptrace-free run of the same arm measured 0.926 mean.
+- The parallel validation pool spawns **≥276 OS threads per second** —
+  `workers = cores × 3` (96 here) created and joined per `validate_items`
+  call, gated at 16 items. A lower bound; 2 ms polling misses short-lived
+  threads. Shared by both paths, so not the arm difference, but a real cost
+  nobody had measured.
+
+**A load-bearing ADR number is now in doubt.** ADR-0009 bounds what storage
+can buy in IBD with "the matched `--addrindex` replay spent 863 s of 4,767 in
+flushes", 18%, concluding at most 1.22x. That fraction comes from a run that
+validates every block. The daemon skips most of that validation, so storage
+is plausibly a *larger* share of daemon IBD than 18% — which would cut
+against the ADR's own conclusion that a rework cannot be sold on IBD. Not
+established: the sync-side composition figure that suggested it is one of the
+withdrawals above.
+
+**Two instrument failures, recorded so the next attempt skips them.** Leaf
+sampling of the hottest thread is blind to the validation pool: `hot_tid`
+ranks by a 1 s CPU delta and the pool's scoped threads live milliseconds, so
+the persistent leader always wins. Sampling *all* threads inclusively fails
+differently — 787 of 845 worker stacks came back at depth 0, caught
+mid-creation or mid-teardown. 846 distinct TIDs appeared in 60 passes. To
+profile the pool, sample it from inside the process rather than from outside.
+
+**The experiment that would answer the question** is daemon against daemon —
+dcroxide and dcrd both syncing from a common source, each doing its own real
+work — which is what the 2026-07 campaign did and what the 2.2x came from.
+
 ## Candidate engine benchmark (ADR-0009 prerequisite 4, 2026-08-13)
 
 Every arm is handed the **identical journal**: what dcroxide's engine was

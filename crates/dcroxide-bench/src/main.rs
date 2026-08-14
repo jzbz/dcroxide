@@ -45,6 +45,26 @@ Usage:
       directory (default: a fresh directory next to the corpus) must
       not already exist and is left behind for inspection.
 
+      --assumevalid IS ACCEPTED AND HAS NO EFFECT BELOW THE ANCHOR, and
+      that is not a bug here but a property of replay.  Assume-valid
+      skips connect validation only for blocks that
+      `is_assume_valid_ancestor` accepts, and that requires
+      `assume_valid_node` to be set -- which happens only once the chain
+      has SEEN the anchor block -- plus a best header far enough ahead
+      (`process.rs`, `maybe_update_assume_valid` and
+      `is_assume_valid_ancestor`).  The daemon gets both because it syncs
+      headers first; a replay walks blocks in order and has neither until
+      it reaches the anchor, by which point there is nothing left to skip.
+      Measured 2026-08-14: identical CPU with the flag set and unset
+      (2.86/2.89/2.68 cores against 2.66/2.86/2.65 over the same heights).
+
+      The consequence is worth stating because it invalidated a day of
+      measurement: A REPLAY IS NOT A PROXY FOR DAEMON IBD.  The replay
+      validates every block; the daemon skips validation for roughly 93%
+      of mainnet.  Any replay-versus-sync comparison is therefore full
+      validation against almost none, whatever flags are passed.  Compare
+      daemon against daemon instead.
+
       --flushlog writes one JSON line per metadata flush, which is how
       the free-page curve is read under real sync churn rather than the
       synthetic inserts pinprobe applies.  --statsevery N takes the full
