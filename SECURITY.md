@@ -50,9 +50,10 @@ dcrd itself is wrong, report it to
 of scope: resource use under a workload dcrd would also struggle with,
 and anything requiring an already-privileged local attacker (they can
 read the datadir regardless). Throughput is out of scope as well: this
-port syncs roughly 2.2x slower than dcrd and spends most of an initial
-block download stalled in storage commits. Both are measured and
-self-inflicted. That the cost is the storage engine's commit shape
+port syncs about 1.29x slower than dcrd (measured 2026-08-15; the
+2.2x quoted through 2026-07 is superseded) and spends much of an
+initial block download stalled in storage commits. Both are measured
+and self-inflicted. That the cost is the storage engine's commit shape
 rather than validation is an attribution, not a finding — a matched
 replay on the same engine spent 863 s of 4,767 in flushes, 18%, and no
 profile exists. But whatever the dominant term turns out to be, it is

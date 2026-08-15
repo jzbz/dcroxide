@@ -374,29 +374,53 @@ loopback, one machine, a fresh data directory per run, both nodes
 
 The syncer decides the time and the source barely matters: swapping
 the source moves the result 1.6-8.8%, swapping the syncer moves it
-2.2x. **dcroxide is about 2.2x slower than dcrd at initial block
-download.** Interop holds in both directions — dcrd accepts
+2.2x. Interop holds in both directions — dcrd accepts
 `/dcrwire:1.0.0/dcroxide:2.2.0/` and dcroxide accepts
 `/dcrwire:1.0.0/dcrd:2.2.0(pre)/`, each reaching a matching tip.
 
-The gap is attributed to the storage engine's commit shape rather than
-to validation. Across its two runs dcroxide spent 80.1% and 82.4% of
-wall time in progress stalls over 20 seconds; dcrd stalled zero times
-in 754 windows. goleveldb's LSM commit is O(dirty) with background
-compaction, while redb is a copy-on-write B-tree with no background
-work, so commit cost tracks the size of the tree.
+**That 2.2x is superseded. Re-measured on 2026-08-15, the gap is
+1.29x** — both daemons syncing mainnet from one shared dcrd server,
+defaults intact, index composition verified on both sides:
 
-That attribution is not established. A stall statistic records that
-progress halted, not what halted it, and no profile exists. The matched
-`--addrindex` replay spent 863 s of 4,767 in flushes — 18% — and ran at
-230.8 blk/s against the live sync's 124, so eliminating the storage
-cost entirely moves 230.8 to 281.9 blk/s, 1.22x. A different engine
-does not close 2.2x on its own, and the replay-versus-sync gap is the
-larger unexplained term.
+| arm | wall | rate | mean cores |
+|---|---|---|---|
+| dcrd | 3,220.5 s | 341.7 blk/s | 1.50 |
+| dcroxide | 4,153 s | 265.0 blk/s | 0.76 |
+
+Both sides improved — dcroxide 124 → 265 blk/s, dcrd 276 → 342 — and
+dcrd improving too is the sign that part of the 2026-07 figure was its
+harness, which had the two nodes syncing from each other on one
+machine. Read 1.29x as a bound rather than a point estimate: the arms
+ran ~12 h apart under unmatched load average (4.62 against 2.45), n=1
+each, and the dcroxide binary predates the fan-out fix. Each of those
+can only have cost dcroxide, not flattered it.
+
+**dcroxide reaches that at roughly half dcrd's CPU** — 0.76 cores
+against 1.50, on a 32-thread host. So the open question is not how much
+compute is missing but what the node is blocked on. A load average of
+4.62 at 0.76 cores is either another tenant or dcroxide's own threads
+parked in D-state on redb writes, and this run does not separate them.
+
+The gap was attributed to the storage engine's commit shape rather than
+to validation: across its two 2026-07 runs dcroxide spent 80.1% and
+82.4% of wall time in progress stalls over 20 seconds, where dcrd
+stalled zero times in 754 windows. goleveldb's LSM commit is O(dirty)
+with background compaction, while redb is a copy-on-write B-tree with
+no background work, so commit cost tracks the size of the tree.
+
+That attribution is still not established. A stall statistic records
+that progress halted, not what halted it, and no profile exists — an
+attempt on 2026-08-14 failed and is written up in the
+[bench ledger](docs/bench-ledger.md). The matched `--addrindex` replay
+spent 863 s of 4,767 in flushes, 18%, but a replay validates every
+block where the daemon skips roughly 93% of it under mainnet's
+assume-valid anchor, so that fraction does not transfer to a sync.
 
 At the tip the same chain cost 23.73 GiB under dcrd and 32.06 GiB
-under dcroxide, measured 2026-07 under redb 2.6.3 and not re-run since
-the 4.1.0 upgrade. Block bytes are consensus data and match to within a
+under dcroxide, measured 2026-07 under redb 2.6.3. The 2026-08-15 pair
+above, under redb 4.1.0 with composition verified, puts it at 23.69 GiB
+against 33.58 — dcrd flat across the year, dcroxide up 1.5 GiB, 1.42x.
+Block bytes are consensus data and match to within a
 mebibyte — 17.580 GiB against 17.579 GiB — so the whole 8.33 GiB
 difference is metadata: dcrd's 6.045 GiB `blocks_ffldb/metadata`
 leveldb plus a 0.108 GiB `utxodb`, against one 14.483 GiB

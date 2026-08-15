@@ -129,8 +129,10 @@ from the baseline's: an 8 GiB page cache is **50% slower**, reversing lever
 the cache penalty vanishes when cadence is raised, confirming the interaction
 this ADR predicted.
 
-**So tuning above the engine buys 11% against a 2.2x gap, and the only
-un-closed lever needs the port to re-encode its own spend-journal rows.**
+**So tuning above the engine buys 11% against what was then a 2.2x gap** (the
+2026-08-15 addendum re-measures it at 1.29x, which makes that 11% a larger
+share of what is left) **and the only un-closed lever needs the port to
+re-encode its own spend-journal rows.**
 [ADR-0009](0009-storage-shape.md) records what remains. Its withdrawal of
 the density comparison is superseded by the 2026-08-11 addendum, which
 measures dcrd's payload rather than deriving it: the comparison is sound and
@@ -179,6 +181,11 @@ synthetic write load.
 The syncer decides the time and the source barely matters: swapping the
 source moves the run 1.6–8.8%, swapping the syncer moves it 2.2x. dcroxide
 is ~2.2x slower than dcrd at initial block download.
+
+> **Superseded by the 2026-08-15 addendum**, which re-measures the gap at
+> 1.29x daemon-against-daemon. This table stands as measured; it is the
+> ratio's currency that has lapsed, and part of it was this harness — both
+> nodes syncing from each other on one machine.
 
 The cause is the storage engine's commit shape, not validation. dcroxide
 spent 80.1% / 82.4% of wall time in progress stalls longer than 20 s; dcrd
@@ -273,7 +280,8 @@ straddle two buckets, since the buckets are contiguous key ranges.
 redb stays. It is crash-safe, pure Rust, needs no C toolchain, and carries
 the full mainnet chain; the gate asked whether it could sustain the load,
 and it can. The price is ~2.2x dcrd's initial-block-download time and
-8.33 GiB more on disk, all of it metadata.
+8.33 GiB more on disk, all of it metadata. (Re-measured 2026-08-15: **1.29x
+and 9.89 GiB** — see the addendum at the end of this file.)
 
 How much of that price is inherent to redb is *not* settled, and an earlier
 draft of this section claimed it was. A copy-on-write B-tree costing more
@@ -752,7 +760,9 @@ microbenchmark measured a workload whose working set fits; a sync's does not.
 **Lever (b) is closed, in the opposite direction to its premise.**
 
 **Lever (c) is a real 11% gain** — the first lever to show a measured
-throughput benefit, and modest against a 2.2x gap.
+throughput benefit, and modest against the 2.2x gap as it stood when this was
+written. Against the 1.29x measured 2026-08-15 it is a materially larger
+share of the remainder.
 
 **They interact, as this ADR insisted they would.** The 50% cache penalty
 disappears when cadence is raised: `both` matches `cadence`. Measuring either
@@ -1210,3 +1220,52 @@ files that are already damaged or hostile; they are not regressions against
 2.6.3, which shares the lineage. They are a reason to treat the upgrade as
 routine maintenance rather than a hardening step, and a reason the
 crash-safety question in ADR-0009 stays open.
+
+## Addendum, 2026-08-15 — the IBD gap re-measured: 1.29x, not 2.2x
+
+The 2026-07 amendment above put dcroxide at ~2.2x dcrd's initial block
+download, and every downstream claim in this repo descends from it. Measured
+again, daemon against daemon, the gap is **1.29x**.
+
+Both daemons sync mainnet genesis to tip from **one shared dcrd server** on
+loopback, sequentially, defaults intact. Index composition was verified in
+both logs — exists-address index on, no transaction index, both sides — rather
+than assumed, because assuming it is what cost the 2026-07 baseline its
+conclusion.
+
+| arm | blocks | wall | rate | mean cores | mean loadavg |
+|---|---:|---:|---:|---:|---:|
+| dcrd 2.2.0-pre+452c1a6c3 | 1,100,392 | 3,220.5 s | 341.7 blk/s | 1.50 | 2.45 |
+| dcroxide `b6d0c63` | 1,100,392 | 4,153 s | 265.0 blk/s | 0.76 | 4.62 |
+
+**Both sides improved**: dcroxide 124 → 265 blk/s (2.14x), dcrd 276 → 342
+(1.24x). dcrd improving on the same hardware is the tell that part of the
+original figure belonged to its harness — the 2026-07 campaign ran the two
+nodes syncing *from each other*, contending for one machine. That inflated
+both arms and the ratio between them.
+
+**This is a bound, not a point estimate.** The arms ran ~12 h apart, under
+load averages of 4.62 and 2.45, n=1 each, and the dcroxide binary predates
+`c091b46` (one validation worker per core, 6.1% on the replay corpus). Every
+one of those can only have cost dcroxide, so the true gap is 1.29x or better.
+The [bench ledger](../bench-ledger.md) records the full caveat list and the
+harness fault behind it.
+
+**What it changes for this ADR.** The verdict's price — "~2.2x dcrd's
+initial-block-download time and 8.33 GiB more on disk" — is now ~1.29x and
+9.89 GiB (23.69 GiB against 33.58, apparent size, composition verified). And
+the framing that the lever results were measured against: lever (c)'s 11% is
+11% of a 1.29x gap, not of a 2.2x one, which makes above-the-engine tuning a
+materially larger share of what is left to win than this ADR assumed.
+
+**What it does not change.** It is not evidence about *where* the remaining
+time goes. The commit-shape attribution rests on the same 2026-07 stall
+statistic, which records that progress halted rather than what halted it, and
+the 2026-08-14 profiling attempt failed. If anything the new run sharpens the
+question rather than answering it: **dcroxide reaches 1.29x while using 0.76
+cores against dcrd's 1.50**, so it is not compute-starved, it is waiting. A
+load average of 4.62 at 0.76 cores is either another tenant on the box or
+dcroxide's own threads in uninterruptible sleep on redb writes — the second
+would be direct evidence for the storage attribution this ADR has never been
+able to establish, and separating the two is the next measurement worth
+making.

@@ -84,12 +84,14 @@ honest peers. Both networks have synced from genesis to tip through these
 loops, and the node syncs against dcrd in both directions.
 
 The performance question belongs to another layer. The one open
-performance gap — initial block download at ~2.2x dcrd — is localized by
-ADR-0004's amendment in the storage engine's commit shape, not in
-threading or validation: the profiled syncs spent 80.1% / 82.4% of wall
-time in progress stalls longer than 20 s while dcrd stalled zero times in
-754 windows. No concurrency model removes those stalls. The IBD gap is to
-be closed in the storage layer, through ADR-0004's levers, and is not
+performance gap — initial block download, ~2.2x dcrd when ADR-0004's
+amendment measured it and **1.29x** when re-measured daemon-against-daemon
+on 2026-08-15 — is localized by that amendment in the storage engine's
+commit shape, not in threading or validation: the profiled syncs spent
+80.1% / 82.4% of wall time in progress stalls longer than 20 s while dcrd
+stalled zero times in 754 windows. No concurrency model removes those
+stalls. The IBD gap is to be closed in the storage layer, through
+ADR-0004's levers, and is not
 grounds for reopening this decision.
 
 External corroboration, for the record. Cuprate — the from-scratch Rust
@@ -126,19 +128,21 @@ that the page-size remedy cannot reach (redb gates `set_page_size` behind
 the bucket's real dimensions, every split larger than today's), and that a
 denser row reaches only by inventing an encoding dcrd does not have — dcrd
 stores the same bucket byte for byte. Tuning above the engine buys 11%
-against a 2.2x gap.
+against what was a 2.2x gap, and is a larger share of the 1.29x the gap
+measured on 2026-08-15.
 
 Its attribution is weaker than it reads, as well. A progress-stall statistic
 records that progress halted, not what halted it, and no profile exists of
-either sync. The matched `--addrindex` replay bounds the storage term from
-the other side: 863 s of 4,767 s in flushes, 18% of wall time, so
-eliminating the storage cost *entirely* moves 230.8 to 281.9 blk/s — 1.22x,
-not 2.2x. The larger unexplained term is elsewhere: that replay runs at
-230.8 blk/s where the live sync manages 124 on an identical engine, which
-puts close to half of live IBD wall time outside anything the replay
-measures.
+either sync — the 2026-08-14 attempt failed. The matched `--addrindex` replay
+appeared to bound the storage term from the other side, 863 s of 4,767 s in
+flushes, 18% of wall time. That bound does not hold: a replay validates every
+block where the daemon skips roughly 93% of validation under mainnet's
+assume-valid anchor, so the replay's composition is not the sync's, and
+storage may be a larger share of daemon IBD than 18%, not a smaller one.
 
 D2 is unaffected either way. No concurrency model removes those stalls, and
 neither term implicates threading. What remains of the storage question is
-ADR-0009's engine decision, and the 1.22x bound is why it cannot be sold on
-IBD.
+ADR-0009's engine decision, which no longer has a usable bound in either
+direction: the 1.22x that once argued it could not be sold on IBD rested on
+the replay's 18%, and the gap it would be closing is now 1.29x rather than
+2.2x. Smaller prize, weaker bound, same open question.

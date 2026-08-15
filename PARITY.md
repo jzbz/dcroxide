@@ -152,7 +152,9 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   `<datadir>/utxodb`; the port keeps the whole ffldb keyspace, utxo set
   included, in one redb table per accepted
   [ADR-0004](docs/adr/0004-storage-backend.md). At the mainnet tip that costs
-  disk: 32.06 GiB against dcrd's 23.73 GiB, measured 2026-07 under redb 2.6.3.
+  disk: 32.06 GiB against dcrd's 23.73 GiB, measured 2026-07 under redb 2.6.3,
+  and 33.58 against 23.69 when the pair was re-measured 2026-08-15 under
+  4.1.0 with composition verified on both sides.
   The block bytes are consensus data and match to within a mebibyte
   (17.579 GiB against 17.580), so the whole 8.33 GiB gap is metadata — one
   14.483 GiB `metadata.redb` against dcrd's 6.045 + 0.108 GiB. None of it is
@@ -187,10 +189,12 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   the rest to background compaction. Syncing mainnet from genesis the port
   spent 80.1% and 82.4% of wall time (two runs) inside progress stalls over
   20 s, while dcrd stalled 0 times in 754 windows. The node is flush-bound
-  under fast ingest, which is the leading explanation for the ~2.2x initial
-  block download gap but is not established as the dominant term: an
+  under fast ingest, which is the leading explanation for the initial block
+  download gap — re-measured 2026-08-15 at **1.29x**, superseding the ~2.2x
+  quoted through 2026-07 — but is not established as the dominant term: an
   identical-engine `--addrindex` replay spent 863 s of 4,767 in flushes, 18%
-  of wall time, and still ran at 230.8 blk/s against the live sync's 124. The
+  of wall time, and a replay validates every block where the daemon skips
+  ~93% of it under assume-valid, so the fraction does not transfer. The
   free pages are copy-on-write churn and nothing more: an earlier note here
   suspected that `Database::begin` taking a redb read transaction for the life
   of every ffldb transaction (`lib.rs:386`) pinned them, since redb will not

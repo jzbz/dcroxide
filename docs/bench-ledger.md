@@ -10,8 +10,9 @@ below), the dcroxide commit measured, the workload, and where the raw
 run lives. Raw exports, logs, and profiles stay out of the tree, under
 `/home/jz/zx/dev/artifacts/dcroxide-bench/<machine>/<commit>/` on the
 machine that ran them. Record a row for every storage-rework milestone,
-so the campaign against the 2.2x IBD gap produces a curve, not
-before/after anecdotes.
+so the campaign against the IBD gap produces a curve, not before/after
+anecdotes. That gap was 2.23x when the campaign opened in 2026-07 and
+measured 1.29x on 2026-08-15; the curve is the point of this file.
 
 ## Machines
 
@@ -31,6 +32,7 @@ run, both nodes `--norpc`.
 | date | machine | dcroxide commit | vs dcrd | corpus | result | source |
 |---|---|---|---|---|---|---|
 | 2026-07 | m1 | unrecorded (2.2.0-pre, at the ADR-0004 amendment) | 2.2.0-pre+452c1a6c3 (go1.26.5) | mainnet, ~1,100,400 blocks | syncer dcroxide: 2.47 h — 124 blk/s (from dcroxide), 2.51 h — 122 blk/s (from dcrd); syncer dcrd: 1.11 h — 276 blk/s, 1.02 h — 299 blk/s | ADR-0004 amendment |
+| 2026-08-15 | m1 | `b6d0c63` (fan-out fix `c091b46` **not** in the binary) | 2.2.0-pre+452c1a6c3 (go1.26.5) | mainnet, 1,100,392 blocks | Both daemons from one shared dcrd server, sequential, defaults, exists-address index verified on both: dcroxide 4,153 s — **265.0 blk/s** at 0.76 mean cores; dcrd 3,220.5 s — **341.7 blk/s** at 1.50. **1.29x**, not the 2.23x above. Arms ~12 h apart under unmatched loadavg (4.62 vs 2.45), n=1 — a bound, not a point estimate | this file, below |
 
 ## Storage at tip
 
@@ -38,6 +40,7 @@ run, both nodes `--norpc`.
 |---|---|---|---|---|---|
 | 2026-07 | m1 | unrecorded (2.2.0-pre, at the ADR-0004 amendment) | mainnet tip | dcroxide 32.06 GiB total (17.579 GiB blocks + 14.483 GiB metadata.redb); dcrd 23.73 GiB (17.580 GiB blocks + 6.045 GiB metadata leveldb + 0.108 GiB utxodb) | ADR-0004 amendment |
 | 2026-08-11 | m1 | `6cb2f56` | mainnet tip, both sides fed `mainnet-full.corpus` | **Matched composition, payload measured on both sides.** Metadata store, consumed bytes: dcrd 6.102 GiB (6,552,084,480) against dcroxide 14.505 GiB uncompacted (15,574,482,944) and 12.052 GiB compacted (12,940,464,128); dcroxide's live B-tree 9.823 GiB (10,547,314,688). Payload: dcrd 6,061,905,929 B, dcroxide 6,069,302,583 B. Over each store's *own* payload: dcrd 1.081x, dcroxide 1.738x on the live tree, 2.566x on the uncompacted file. | this file, below |
+| 2026-08-15 | m1 | `b6d0c63` | mainnet tip, both daemons synced from one shared dcrd server, exists-address index on both, no transaction index | **Apparent size**, whole appdata: dcroxide 36,055,044,196 B (33.58 GiB) against dcrd 25,433,938,876 B (23.69 GiB) — 1.42x. Same pair as the 2026-08-15 sync row above; both daemons' own datadirs, not a replay. | this file, below |
 
 > **The 2026-08-11 row's store sizes are CONSUMED BYTES, superseded by the
 > apparent-size rule adopted 2026-08-12.** This file is append-only, so the
@@ -469,6 +472,91 @@ profile the pool, sample it from inside the process rather than from outside.
 **The experiment that would answer the question** is daemon against daemon —
 dcroxide and dcrd both syncing from a common source, each doing its own real
 work — which is what the 2026-07 campaign did and what the 2.2x came from.
+
+## Daemon against daemon (2026-08-15) — the 2.2x is at most 1.29x
+
+The experiment the previous section names as the one that would answer the
+question. Both daemons sync mainnet genesis to tip from **one shared dcrd
+server** on loopback, each doing its own real work, defaults intact
+(`--norpc --nolisten --connect=127.0.0.1:19108 --nodnsseed`). Composition was
+verified in both logs rather than assumed — exists-address index on, no
+transaction index, on both sides — because losing that check is what cost the
+2026-07 baseline its conclusion.
+
+| arm | blocks | wall | rate | mean cores | mean loadavg |
+|---|---:|---:|---:|---:|---:|
+| dcrd 2.2.0-pre+452c1a6c3 | 1,100,392 | 3,220.5 s | **341.7 blk/s** | 1.50 | 2.45 |
+| dcroxide `b6d0c63` | 1,100,392 | 4,153 s | **265.0 blk/s** | 0.76 | 4.62 |
+
+**1.29x, against the 2.23x this repo has documented since 2026-07.** Both
+sides moved: dcroxide 124 → 265 blk/s (2.14x), dcrd 276 → 342 (1.24x). That
+dcrd improved too is the tell that part of the change is the harness — the
+2026-07 campaign ran the two nodes syncing *from each other*, contending for
+one machine, where these ran sequentially against a quiet server. That
+inflated both arms then, and inflated the ratio between them.
+
+**Read this as a bound, not a point estimate.** Four reasons, recorded so the
+next run tightens them instead of rediscovering them:
+
+- **The arms were neither simultaneous nor matched.** dcroxide ran
+  03:32–04:41, dcrd 16:37–17:31, about 12 h apart. Same machine, same server
+  binary, same corpus — not the same ambient conditions.
+- **Mean loadavg differed, 4.62 against 2.45.** Whether that is ambient or
+  self-inflicted is unresolved; see below. If ambient, it can only have slowed
+  dcroxide, which makes 1.29x an upper bound on the gap.
+- **n=1 per arm.** No repetition, so no dispersion estimate.
+- **The dcroxide binary predates the fan-out fix.** Built 2026-08-13 20:14 at
+  `b6d0c63`; `c091b46` (one validation worker per core, 6.1% on the replay
+  corpus) is not in it. The current tree should be at or above 265 blk/s.
+
+**Load average is confounded with the thing being measured.** Linux counts
+uninterruptible-sleep tasks in loadavg, so a node blocked on disk shows high
+load at low CPU with no other tenant on the box. dcroxide averaged 4.62 load
+at 0.76 cores — roughly 3.9 tasks not explained by its own CPU. Two readings,
+which this run does not separate: another workload was present (the confound
+that voided the first attempt at this experiment), or dcroxide's own threads
+were parked in D-state on redb writes. The second reading is precisely the
+storage-bound signature the 2026-08-14 profiling attempt failed to capture, so
+it is worth separating deliberately — sample per-process D-state counts
+alongside CPU.
+
+Within the dcroxide arm, load and height are collinear: every sample below
+block 699k sits at load ≤3.0 and every sample above 688k above it. So this run
+cannot attribute its own slowdown to either one. That is a design fault in the
+harness, recorded as such, not a result.
+
+**Storage at tip, same pair, apparent size** (the rule adopted 2026-08-12):
+
+| | apparent bytes | GiB |
+|---|---:|---:|
+| dcroxide | 36,055,044,196 | 33.58 |
+| dcrd | 25,433,938,876 | 23.69 |
+
+1.42x, against 1.35x in the 2026-07 row whose composition was never recorded.
+dcrd is flat across the year (23.73 → 23.69 GiB); dcroxide grew 32.06 → 33.58.
+redb's apparent length is a high-water mark, so this figure is the honest
+operator-facing number and an overstatement of live data at the same time.
+
+**What this supersedes.** Every "~2.2x slower than dcrd at IBD" in this repo —
+README, PARITY, SECURITY, the project brief, ADR-0004, ADR-0005, ADR-0009 —
+descends from that single 2026-07 row. The row is not withdrawn; it was
+measured. It is superseded as a description of the port's current standing.
+The gap is 1.29x or better, and dcroxide reaches it at roughly half dcrd's
+CPU — which relocates the open question from "how much compute is missing" to
+"what is the node blocked on".
+
+**Harness bug worth recording.** The first dcrd arm died 30 s in: its tip
+detector matched `height [0-9]+`, which also matches the peer's advertised
+`Syncing headers to block height 1100392 from peer`. The replacement pattern
+then assumed dcrd's daemon log ends in a timestamp — that is `addblock`'s
+format, not the daemon's. Both daemons write `…, height N, progress P%`, and
+the original `daemon-vs.sh` pattern (`height [0-9]+, progress`) was correct for
+both all along. dcrd's wall time above is therefore recovered from its own log
+timestamps, process start to last block-progress line, not from the harness
+clock.
+
+Raw: `artifacts/dcroxide-bench/m1/daemon-vs/` — `rox.log`, `rox-cpu-VALID.txt`,
+`dcrd2.log`, `dcrd-cpu.txt`, `server.log`, `server2.log`.
 
 ## Candidate engine benchmark (ADR-0009 prerequisite 4, 2026-08-13)
 

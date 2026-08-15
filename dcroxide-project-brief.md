@@ -103,16 +103,25 @@ What Phase 15 has covered so far:
 
   The syncer decides the time and the source barely matters: swapping the
   source moves the figure 1.6–8.8%, swapping the syncer moves it 2.2x.
-  **dcroxide is ~2.2x slower than dcrd at initial block download.** The gap
-  is attributed to the storage engine's commit shape rather than validation —
-  dcroxide spent 80.1% and 82.4% of wall time in progress stalls over 20 s,
-  where dcrd stalled 0 times in 754 windows — but the attribution is not
-  established: storage accounts for 18% of a full replay's wall time on the
-  same engine, 863 s of 4,767. Interop was verified in both directions: dcrd
-  accepts `/dcrwire:1.0.0/dcroxide:2.2.0/` and dcroxide accepts
-  `/dcrwire:1.0.0/dcrd:2.2.0(pre)/`, each syncing to a matching tip. Chain on
-  disk at tip: dcrd 24 GB, dcroxide 33 GB — identical consensus block bytes,
-  the difference is metadata.
+  Interop was verified in both directions: dcrd accepts
+  `/dcrwire:1.0.0/dcroxide:2.2.0/` and dcroxide accepts
+  `/dcrwire:1.0.0/dcrd:2.2.0(pre)/`, each syncing to a matching tip.
+- **IBD gap re-measured 2026-08-15: 1.29x, superseding the 2.2x above.** Both
+  daemons syncing mainnet from one shared dcrd server, defaults, index
+  composition verified on both sides: dcroxide 4,153 s (265.0 blk/s) against
+  dcrd 3,220.5 s (341.7 blk/s). Both sides improved since 2026-07 — dcroxide
+  124 → 265, dcrd 276 → 342 — and dcrd improving too indicates part of the
+  original figure was its harness, which ran the two nodes syncing from each
+  other on one machine. A bound rather than a point estimate: arms ~12 h
+  apart, unmatched load average, n=1 each, all of which can only have cost
+  dcroxide. **It reaches 1.29x at half dcrd's CPU** (0.76 cores against 1.50),
+  so the open question is what the node blocks on, not what compute it lacks.
+  The gap is still attributed to the storage engine's commit shape rather
+  than validation — dcroxide spent 80.1% and 82.4% of wall time in progress
+  stalls over 20 s, where dcrd stalled 0 times in 754 windows — and the
+  attribution is still not established. Chain on disk at tip: dcrd 23.69 GiB,
+  dcroxide 33.58 GiB — identical consensus block bytes, the difference is
+  metadata.
 - **Security-blocker campaign.** The release blockers, highs, and mediums from
   an audit of the ported surface: RPC authentication and admission, peer
   message-path bounds (stall deadlines, getdata, queue and write limits),

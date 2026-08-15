@@ -122,14 +122,22 @@ quantity in this whole investigation.
   differing by a bucket of hundreds of MiB) but not identified: a file size
   is not a composition fingerprint. Retire the 2026-07 figure rather than
   back-filling a composition onto a datadir that no longer exists.
-- **Commit cost is not established as the dominant term.** The 2.2x IBD gap
-  is attributed to commit shape by a progress-stall statistic — which records
-  that progress halted, not what halted it — and no profile exists. The
-  ledger bounds it the other way: the full `--addrindex` replay spent 863 s
-  of 4,767 s in flushes, 18%, and ran at 230.8 blk/s against the live sync's
-  124. Roughly half of IBD wall time is outside the storage path on an
-  identical engine. **An LSM cannot close 2.2x on its own**, and the
-  replay-versus-sync gap is the larger unexplained term.
+- **Commit cost is not established as the dominant term.** The IBD gap is
+  attributed to commit shape by a progress-stall statistic — which records
+  that progress halted, not what halted it — and no profile exists; the
+  2026-08-14 attempt failed, and is written up in the ledger. The ledger
+  bounds it the other way: the full `--addrindex` replay spent 863 s of
+  4,767 s in flushes, 18%. That bound is weaker than it looks — a replay
+  validates every block, where the daemon skips roughly 93% of validation
+  under mainnet's assume-valid anchor, so the fraction does not transfer to a
+  sync and storage is plausibly a *larger* share of daemon IBD than 18%.
+  **The gap itself is smaller than this ADR was written against**: re-measured
+  daemon-against-daemon on 2026-08-15 it is **1.29x**, not 2.2x, and dcroxide
+  reaches that at 0.76 cores against dcrd's 1.50. A node that is waiting
+  rather than computing is consistent with the commit-shape attribution
+  without establishing it — the load-average reading that would separate the
+  two was not taken. An engine swap has a smaller gap to close than 2.2x, and
+  a less well-characterised one.
 
 ### The corrected structural figure
 

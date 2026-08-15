@@ -74,18 +74,22 @@ the upgrade" and "your disk is failing" want opposite reactions from you.
 Delete the data directory and sync from genesis, or re-import with
 `addblock`. Nothing else about operating the node changes.
 
-Budget for it: initial block download runs about **2.2x slower than
-dcrd** — roughly 2.5 hours against dcrd's 1.1 for mainnet from genesis on
-the machine in [bench-ledger.md](bench-ledger.md) — and the chain costs
-more on disk, 32.06 GiB against dcrd's 23.73 GiB at the same tip. Both
-were measured in 2026-07 under redb 2.6.3 and have not been re-run since
-the 4.1.0 upgrade, which holds identical content in 9.4% less space
-(15,568,752,640 B against 17,182,003,200 on the same journal) and loaded
-21% faster. That 9.4% is free-page retention rather than denser packing,
-and free pages are the one quantity this investigation withdrew as
-non-reproducible, so it does not license a projection of what a fresh
-sync costs today — that number wants re-measuring, not arithmetic. The
-2.2x has the same provenance and is likewise unverified against 4.1.0.
+Budget for it: initial block download runs about **1.29x slower than
+dcrd** — roughly 1.15 hours against dcrd's 0.9 for mainnet from genesis
+on the machine in [bench-ledger.md](bench-ledger.md) — and the chain
+costs more on disk, 33.58 GiB against dcrd's 23.69 GiB at the same tip.
+Both were measured 2026-08-15 under redb 4.1.0, with both daemons
+syncing from one shared dcrd server and the index composition verified
+on each side. They replace 2026-07 figures of 2.2x and 32.06 GiB against
+23.73, taken under redb 2.6.3 with the two nodes syncing from each other
+on one machine — a setup that inflated both arms.
+
+Treat 1.29x as an upper bound on the gap rather than a precise ratio:
+the two arms ran about 12 hours apart under different background load,
+once each. What is not in doubt is the direction — the port has roughly
+halved its distance to dcrd since 2026-07 — and that it does the work at
+about half dcrd's CPU, 0.76 cores against 1.50. If your host is busy
+with other work, expect the sync to stretch more than dcrd's would.
 See [ADR-0004](adr/0004-storage-backend.md).
 
 The two have different explanations, and only one of them is settled. The
