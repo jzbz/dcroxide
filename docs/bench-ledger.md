@@ -376,6 +376,36 @@ Note the ladder also bounds the full-chain comparison: equal apparent length
 means both arms fell inside the same 4 GiB quantum, which pins the schedule's
 effect on *file* size only to within one region.
 
+## Script validation fan-out (2026-08-14)
+
+`validate_items` spawned `runtime.NumCPU()*3` scoped OS threads per call,
+copied from dcrd's goroutine count. A goroutine costs a couple of
+microseconds; an OS thread costs tens. Measured on the 250k corpus with
+`--addrindex`, arms alternated, two repetitions each, thread creation
+sampled 120 s in:
+
+| workers | wall | distinct TIDs / 10 s |
+|---|---:|---:|
+| `cores * 3` = 96 (baseline) | 458.5–460.2 s | 27,706–28,974 |
+| **`cores` = 32 (adopted)** | **431.1–431.5 s** | 17,396–18,637 |
+| `items / 32` capped at cores (rejected) | 488.4–490.3 s | 2,291–2,445 |
+
+One worker per core is **6.1% faster** than the baseline on disjoint ranges,
+with within-arm spread of 0.1–0.4%.
+
+**The rejected arm is the instructive one.** Sizing workers by the batch cut
+thread creation 12x — by far the biggest mechanical improvement of the three
+— and ran **4.6% slower** on disjoint ranges, because a 100-item batch then
+ran on three threads while 29 cores idled. The mechanism moved exactly as
+intended and the outcome went the other way. Fan-out has to stay
+proportional to the machine, not to the batch; the work-stealing loop is
+what lets one worker per core suffice.
+
+Two earlier churn figures in this file are superseded by these: a ">=276
+threads/second" measurement taken early in the chain, where blocks are too
+sparse to reach the 16-item parallel threshold, understated the steady-state
+rate by roughly an order of magnitude.
+
 ## IBD profiling attempt (2026-08-14) — and why replay cannot proxy for it
 
 ADR-0009 records the 2.2x IBD gap as attributed to commit shape "by a

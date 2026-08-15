@@ -4440,15 +4440,40 @@ fn validate_item(
     })
 }
 
-/// Validate the items across a worker pool sized like dcrd's
-/// (`runtime.NumCPU()*3` capped at the item count), cancelling the
-/// remaining work on the first failure.  Small batches run inline —
-/// the thread spawn costs more than the scripts (a scheduling-only
-/// difference; dcrd's goroutines are cheap enough not to care).
-/// When several items are invalid, which failure surfaces depends on
-/// scheduling, exactly like dcrd's first-off-the-channel error.
-/// Threads need the standard library: without the `std` feature this
-/// crate is `no_std` and the serial fallback below runs instead.
+/// Validate the items across a worker pool, cancelling the remaining
+/// work on the first failure.
+///
+/// **One worker per core, not dcrd's `runtime.NumCPU()*3`.** dcrd spawns
+/// three goroutines per core; this port spawned that many OS threads,
+/// capped at the item count, and a goroutine costs a couple of
+/// microseconds where an OS thread costs tens. Copying the count without
+/// the cost model made spawning compete with the work it was handing off:
+/// a full-chain replay created 27,000-31,000 threads every ten seconds.
+///
+/// Measured on the 250k corpus, arms alternated, two repetitions each
+/// (2026-08-14, m1):
+///
+/// | workers | wall | threads/10 s |
+/// |---|---|---|
+/// | `cores * 3` (96) | 458.5-460.2 s | 27,706-28,974 |
+/// | `cores` (32) | **431.1-431.5 s** | 17,396-18,637 |
+///
+/// 6.1% faster on disjoint ranges, so the spawns were real cost rather
+/// than noise.
+///
+/// A first attempt sized workers by the batch instead — one worker per 32
+/// items — and was **4.6% slower** on disjoint ranges, because a 100-item
+/// batch then ran on three threads while 29 cores idled. That is the trap
+/// here: the fan-out must stay proportional to the *machine*, not to the
+/// batch. The work-stealing loop below is what makes one worker per core
+/// sufficient — workers pull from a shared index rather than owning a
+/// fixed slice, so an uneven batch still balances without oversubscribing.
+///
+/// Small batches still run inline. Which failure surfaces when several
+/// items are invalid remains scheduling-dependent, exactly like dcrd's
+/// first-off-the-channel error. Threads need the standard library:
+/// without the `std` feature this crate is `no_std` and the serial
+/// fallback below runs instead.
 #[cfg(any(test, feature = "std"))]
 fn validate_items(
     items: &[ValidateItem<'_>],
@@ -4459,7 +4484,7 @@ fn validate_items(
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let workers = cores.saturating_mul(3).min(items.len());
+    let workers = cores.min(items.len());
     if items.len() < MIN_PARALLEL_ITEMS || workers <= 1 {
         for item in items {
             validate_item(item, script_flags, sig_cache)?;
