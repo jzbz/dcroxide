@@ -1323,8 +1323,16 @@ and 99.4% of its blocked samples have nothing else runnable, so this is
 critical-path wall time rather than an occupancy figure. It tracks tree growth
 exactly as this ADR predicted: 1.3% below block 300,000, **50.9% above block
 900,000**. Removing it moves dcroxide to 346.6 blk/s against dcrd's own
-counterfactual 346.9 — **the stall is the entire gap**. That supersedes
-ADR-0009's 18%/1.22x bound with ~23–35% and ~1.5x.
+counterfactual 346.9.
+
+> **Corrected 2026-08-16.** "The stall is the entire gap" and the ~1.5x prize
+> drawn from it are withdrawn. The 34.6% is real, but the sampler records
+> kernel wait channels rather than user stacks, so none of it is attributed to
+> `DbCache::flush`; 14–37% of it sits in one to two thousand sub-second events
+> no commit restructuring reaches; and the only direct flush measurement, over
+> a replay, is 8.0% of wall. What a background committer recovers is bounded
+> above by 34.6% and below by nothing until a daemon sync is run with the
+> flush observer on. See the correction in [bench-ledger.md](../bench-ledger.md).
 
 **What it does not settle.** Whether the stall is *removable*. dcrd shows the
 work can be overlapped with compute; it does not show redb can overlap it. Two

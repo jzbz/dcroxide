@@ -199,10 +199,14 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   the port's own. Its share of sync wall time is measured too: the port is
   **fully stalled — zero runnable threads — for 34.6% of block-sync wall
   time** against dcrd's 0.9%, rising to 50.9% above block 900,000 as the tree
-  grows, and removing that stall brings both implementations to the same ~346
-  blk/s. That supersedes the 18% derived from an identical-engine
+  grows, and removing all of it would bring both implementations to the same
+  ~346 blk/s. That supersedes the 18% derived from an identical-engine
   `--addrindex` replay (863 s of 4,767), which validates every block where the
-  daemon skips ~93% under assume-valid. The
+  daemon skips ~93% under assume-valid — but it is a ceiling on storage's
+  worth rather than a prize any one change collects: corrected 2026-08-16, the
+  stall is not attributed to a call site, 14–37% of it is in sub-second events
+  no commit restructuring reaches, and the only direct flush measurement is
+  8.0% of a replay's wall. The
   free pages are copy-on-write churn and nothing more: an earlier note here
   suspected that `Database::begin` taking a redb read transaction for the life
   of every ffldb transaction (`lib.rs:386`) pinned them, since redb will not

@@ -917,3 +917,64 @@ That distinction is the difference between "swap the engine" and "restructure
 the commit", and this measurement does not choose between them.
 
 Derived from `rox.jsonl` / `dcrd.jsonl` in the run directory above; no new run.
+
+### Correction, 2026-08-16 — the 34.6% is measured, its attribution is not
+
+The section above ends "the stall is the entire gap" and derives a ~1.5x prize
+from it. **The arithmetic stands and the attribution does not.** The
+correction matters because the prize is what ADR-0009's engine decision now
+rests on.
+
+**What the instrument can and cannot see.** `dsample.py` records per-thread
+scheduler state and the kernel wait channel (`wchan`). It records no user
+stacks. So "storage-blocked" means *a thread is parked in an uninterruptible
+wait on a btrfs symbol* — it does **not** mean *inside `DbCache::flush`*.
+Every statement that the stall is the metadata commit is an inference from
+that, not a measurement of it. This is the same species of error as the 18%
+figure it replaced: a number measured on one thing and read as another.
+
+**What the stall is actually shaped like.** Decomposing the 33,421 block-sync
+samples into contiguous stalled episodes:
+
+| | strict | ≤2-sample gap tolerated |
+|---|---:|---:|
+| episodes | 2,985 | 1,409 |
+| median episode | 0.10 s | 0.30 s |
+| longest | 10.0 s | 36.6 s |
+| episodes ≥2 s | 329, holding **63%** of stall time | 305, holding **86%** |
+| sub-2 s events | 2,656, holding 37% | 1,104, holding 14% |
+
+The multi-second episodes carry most of the time and their *count* (305–329)
+is the right order for a flush population, so the flush-shaped reading
+survives for the bulk of it. But **14–37% of the stall sits in one to two
+thousand sub-second events, roughly one per 400 blocks**, which is not a
+flush cadence and which moving the commit off the critical path would not
+touch.
+
+**The one direct flush measurement available points lower.** dcroxide's own
+flush observer over the full mainnet replay: 122 flushes totalling **260.9 s
+of a 3,271 s run — 8.0% of wall**, longest single flush 4.86 s. A replay is
+not a daemon (it validates every block where the daemon skips ~93% under
+assume-valid), so 8.0% does not transfer any more than 18% did. But the
+distance between 8% and 34.6% is unexplained, and it is exactly the quantity
+Option A's value depends on.
+
+> **Trap in that file:** `elapsed_ms` is flush *plus* the stats walk, and the
+> stats walk totals 442.5 s against the flush's 260.9 s. Summing `elapsed_ms`
+> gives 703.4 s and reads as a 21.5% flush share — nearly triple the truth.
+> Use `flush_ms`. The ledger already records the same trap in the 2026-08-08
+> row, where an unseparated stats walk read as a 17.2x commit slowdown.
+
+**What is withdrawn:** "the stall is the entire gap", "outside storage stalls
+the two implementations process blocks at the same rate", and the ~1.5x prize
+as a figure Option A can be expected to collect. **What stands:** the 34.6%
+fully-stalled measurement itself, the 11.7x kernel-side ratio, the 30x-per-GiB
+blocking ratio, and the write-shape conclusion — none of which depend on
+attributing the stall to a call site.
+
+**The experiment that settles it is cheap and has not been run:** sync the
+daemon with the flush observer enabled and compare summed `flush_ms` against
+the sampled stall over the same window. dcroxide already has the instrument;
+the D-state run simply did not turn it on. Until that exists, treat the share
+of IBD that a background committer can recover as bounded above by 34.6% and
+below by nothing.

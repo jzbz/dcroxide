@@ -427,17 +427,22 @@ stalled — zero runnable threads — for 34.6% of block-sync wall time,
 against dcrd's 0.9%.** It tracks tree growth, which is the
 copy-on-write prediction: 1.3% of wall time below block 300,000 and
 **50.9% above block 900,000**, where the port spends half its time
-completely stopped. Removing that stall moves dcroxide to 346.6 blk/s
-and dcrd to 346.9 — they converge, so outside storage stalls the two
-process blocks at the same rate, and **the stall is the whole gap**.
+completely stopped. Removing *all* of that stall would move dcroxide to
+346.6 blk/s and dcrd to 346.9 — they converge, which bounds how much
+storage can be worth here.
 
-That supersedes the 18% figure this project reasoned from, which came
-from a replay that validates every block where the daemon skips ~93%
-under assume-valid. What it does *not* settle is whether the stall is
-removable: dcrd shows the work can be overlapped, not that redb can
-overlap it. Two or more dcroxide threads block at once in only 0.2% of
-samples, so its storage path is serialized — implicating a synchronous
-fsync on the critical path as much as the engine choice. Full figures
+**Read that as a ceiling, not a prize.** The sampler records kernel
+wait channels rather than user stacks, so the stall is not attributed
+to any particular call site — an earlier draft of this section said
+"the stall is the whole gap", and that inference is withdrawn.
+Roughly 14–37% of it sits in one to two thousand sub-second events that
+no commit restructuring reaches, and the one direct measurement of
+flush cost, over a full replay, is 8.0% of wall. Nor is it settled that
+the stall is *removable*: dcrd shows the work can be overlapped, not
+that redb can overlap it. Two or more dcroxide threads block at once in
+only 0.2% of samples, so its storage path is serialized — implicating a
+synchronous fsync on the critical path as much as the engine choice.
+Full figures
 in the [bench ledger](docs/bench-ledger.md).
 
 At the tip the same chain cost 23.73 GiB under dcrd and 32.06 GiB

@@ -101,7 +101,9 @@ dcroxide keeps. Block files match to within a mebibyte. The **time**
 difference is commit shape, and as of 2026-08-15 that is measured rather
 than attributed: the node is fully stalled on storage — nothing runnable at
 all — for **34.6% of block-sync wall time**, against dcrd's 0.9%, and
-removing that stall brings both to the same ~346 blk/s. The earlier 18%
+removing all of it would bring both to the same ~346 blk/s. Which part of
+that is recoverable is not settled: the measurement locates the stall in
+storage waits but not in any particular call site. The earlier 18%
 figure came from a replay, which validates every block where a syncing
 daemon skips ~93% under assume-valid, so it understated the daemon's share.
 
@@ -152,10 +154,13 @@ compiled defaults, so an untouched node behaves exactly as before.
 These are untuned: no value has been measured yet, which is why no
 recommendation appears here. What motivates exposing them is the 2026-08-15
 measurement that the node is *fully stalled* — nothing runnable at all — for
-**34.6% of block-sync wall time**, and that the time goes to a small number
-of very large durable commits rather than many small ones. `--utxocachemaxsize`
-is the trigger with a measured 12%; whether the overlay's ceiling has
-comparable headroom is exactly the open question these knobs make testable.
+**34.6% of block-sync wall time**. Most of that time — 63–86% depending on
+how episodes are counted — is in multi-second events, which is the shape a
+large durable commit makes, though nothing yet attributes it to one; the
+remainder is in one to two thousand sub-second events that cadence tuning
+would not reach. `--utxocachemaxsize` is the trigger with a measured 12%;
+whether the overlay's ceiling has comparable headroom is exactly the open
+question these knobs make testable.
 Treat them as instruments, not as advice, and pair a raised value with the
 supervisor above — as with the UTXO cache, a larger overlay means more of the
 recent window replays after an unclean stop.

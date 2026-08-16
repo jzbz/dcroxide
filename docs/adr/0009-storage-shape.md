@@ -133,7 +133,10 @@ quantity in this whole investigation.
   storage for 34.6% of block-sync wall time against dcrd's 0.9%, rising to
   50.9% above block 900,000, and removing it brings both implementations to
   the same ~346 blk/s.** That supersedes the 18%/1.22x bound this ADR reasons
-  from below, and it clears the 1.5x stop rule. The ledger
+  from below. It does **not** establish that the stop rule is cleared: the
+  2026-08-16 correction below records that the stall is not attributed to a
+  call site, so 34.6% is a ceiling on all storage stall rather than the share
+  any one change recovers. The ledger
   bounds it the other way: the full `--addrindex` replay spent 863 s of
   4,767 s in flushes, 18%. That bound is weaker than it looks — a replay
   validates every block, where the daemon skips roughly 93% of validation
@@ -413,13 +416,22 @@ sold on IBD.
 > 900,000**.
 >
 > **Removing it moves dcroxide from 228.2 to 346.6 blk/s, and dcrd's own
-> counterfactual is 346.9** — they converge within 0.1%, so outside storage
-> stalls the two implementations process blocks at the same rate. That is a
-> **~1.5x** prize, not 1.22x, and it **meets this ADR's 1.5x stop rule**
-> rather than falling short of it. The earlier arm of the same day
-> cross-checks: 265.0 blk/s against the same ~346 ceiling implies a ~23% stall
-> and a 1.31x gap, against 1.29x measured. The share is 23–35% depending on
-> I/O contention; either end clears 18%.
+> counterfactual is 346.9** — they converge within 0.1%. The earlier arm of
+> the same day cross-checks: 265.0 blk/s against the same ~346 ceiling implies
+> a ~23% stall and a 1.31x gap, against 1.29x measured.
+>
+> **Corrected 2026-08-16: that counterfactual is an upper bound on ALL storage
+> stall, not a prize any one change collects, and it does NOT clear the stop
+> rule as claimed.** The sampler records kernel wait channels, not user
+> stacks, so it cannot attribute the stall to `DbCache::flush` — the same
+> error as the 18% it replaced. Episode analysis puts 63–86% of the stall in
+> multi-second events whose count fits a flush population, but 14–37% in one
+> to two thousand sub-second events that no commit restructuring reaches. And
+> the only direct flush measurement, over a full replay, is **8.0%** of wall.
+> The honest state is that the recoverable share is bounded above by 34.6% and
+> below by nothing, and the experiment that would fix that — a daemon sync
+> with the flush observer enabled — has not been run. See the 2026-08-16
+> correction in [bench-ledger.md](../bench-ledger.md).
 >
 > **What this does not license.** The counterfactual assumes the stall is
 > removable, and dcrd demonstrates only that the work *can* be overlapped, not
@@ -428,11 +440,15 @@ sold on IBD.
 > serialized — one thread waits and the process stops. That implicates the
 > commit *structure*, a synchronous fsync on the critical path, at least as
 > much as the engine. **A faster engine that stayed synchronous would collect
-> much less of the 1.5x than an asynchronous or background-committed one.**
-> So "an engine swap cannot be sold on IBD" is withdrawn as stated, and what
-> replaces it is narrower than its opposite: *a storage rework* can now be
-> sold on IBD, but this measurement does not establish that swapping the
-> engine is the form it should take.
+> much less of the ceiling than an asynchronous or background-committed one.**
+> So "an engine swap cannot be sold on IBD" is withdrawn as stated — but with
+> the 2026-08-16 correction, what replaces it is weaker still: the 18%/1.22x
+> bound is gone, and nothing sound has taken its place. A storage rework
+> *might* be sellable on IBD, on a ceiling of 34.6% that no measurement yet
+> divides between the metadata commit, the block-file writes, and ambient
+> writeback. **This ADR should not be resolved in either direction until the
+> daemon has been synced with its own flush observer enabled** — the one
+> cheap experiment that would turn the ceiling into a share.
 
 1. **Lever (d) on `spendjournalv3`.** ~~Prerequisite~~ **Measured**, by
    `redbstat --buckets`: the bucket holds a 2402-byte mean row against a
