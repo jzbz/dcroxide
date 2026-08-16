@@ -122,15 +122,18 @@ quantity in this whole investigation.
   differing by a bucket of hundreds of MiB) but not identified: a file size
   is not a composition fingerprint. Retire the 2026-07 figure rather than
   back-filling a composition onto a datadir that no longer exists.
-- **Commit cost is established as a real term, but not quantified as the
-  dominant one.** The attribution no longer rests on the progress-stall
+- **Commit cost is established as the dominant term, and measured.** The
+  attribution no longer rests on the progress-stall
   statistic: a 2026-08-15 task-state decomposition measured the mechanism
   directly. dcroxide drives **11.7x** the kernel-side storage work dcrd does
   (1.64 tasks against 0.14, mostly `dmcrypt_write`) while dcrd writes 1.16x
   more bytes at 1.74x the rate and blocks 30x less per GiB — so the cost is
   the write *shape*, and it is largely paid outside the process, in kernel
-  writeback. What remains unquantified is the share of IBD wall time it
-  accounts for, which is the number this ADR actually needs. The ledger
+  writeback. **The share is now measured too: dcroxide is fully stalled on
+  storage for 34.6% of block-sync wall time against dcrd's 0.9%, rising to
+  50.9% above block 900,000, and removing it brings both implementations to
+  the same ~346 blk/s.** That supersedes the 18%/1.22x bound this ADR reasons
+  from below, and it clears the 1.5x stop rule. The ledger
   bounds it the other way: the full `--addrindex` replay spent 863 s of
   4,767 s in flushes, 18%. That bound is weaker than it looks — a replay
   validates every block, where the daemon skips roughly 93% of validation
@@ -399,6 +402,37 @@ sold on IBD.
 > composition reliably, and its own figure is withdrawn. What is established
 > is that a replay is not a proxy for daemon IBD and that this bound was
 > derived from one. See [bench-ledger.md](../bench-ledger.md).
+
+> **Correction, 2026-08-15: the bound was wrong, and the caveat above guessed
+> the direction right.** Measured on the daemon rather than a replay, by
+> sampling every thread's scheduler state through a full mainnet sync:
+> dcroxide is **fully stalled on storage — zero runnable threads — for 34.6%
+> of block-sync wall time**, against dcrd's 0.9%. Not 18%, and not a share of
+> a replay's inflated total. The stall tracks tree growth exactly as this ADR
+> set predicted: 1.3% of wall time below block 300,000, **50.9% above block
+> 900,000**.
+>
+> **Removing it moves dcroxide from 228.2 to 346.6 blk/s, and dcrd's own
+> counterfactual is 346.9** — they converge within 0.1%, so outside storage
+> stalls the two implementations process blocks at the same rate. That is a
+> **~1.5x** prize, not 1.22x, and it **meets this ADR's 1.5x stop rule**
+> rather than falling short of it. The earlier arm of the same day
+> cross-checks: 265.0 blk/s against the same ~346 ceiling implies a ~23% stall
+> and a 1.31x gap, against 1.29x measured. The share is 23–35% depending on
+> I/O contention; either end clears 18%.
+>
+> **What this does not license.** The counterfactual assumes the stall is
+> removable, and dcrd demonstrates only that the work *can* be overlapped, not
+> that redb can overlap it. Two or more of dcroxide's threads are blocked
+> simultaneously in just 0.2% of samples, so its storage path is effectively
+> serialized — one thread waits and the process stops. That implicates the
+> commit *structure*, a synchronous fsync on the critical path, at least as
+> much as the engine. **A faster engine that stayed synchronous would collect
+> much less of the 1.5x than an asynchronous or background-committed one.**
+> So "an engine swap cannot be sold on IBD" is withdrawn as stated, and what
+> replaces it is narrower than its opposite: *a storage rework* can now be
+> sold on IBD, but this measurement does not establish that swapping the
+> engine is the form it should take.
 
 1. **Lever (d) on `spendjournalv3`.** ~~Prerequisite~~ **Measured**, by
    `redbstat --buckets`: the bucket holds a 2402-byte mean row against a

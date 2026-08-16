@@ -196,10 +196,13 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   (mostly dm-crypt writeback) and blocks **30x more per GiB written**, while
   dcrd writes 1.16x more bytes at 1.74x the rate — so it is the write shape,
   not the volume, and most of the cost is paid in kernel threads rather than
-  the port's own. Its share of sync wall time is still unquantified: an
-  identical-engine `--addrindex` replay spent 863 s of 4,767 in flushes, 18%
-  of wall time, and a replay validates every block where the daemon skips
-  ~93% of it under assume-valid, so the fraction does not transfer. The
+  the port's own. Its share of sync wall time is measured too: the port is
+  **fully stalled — zero runnable threads — for 34.6% of block-sync wall
+  time** against dcrd's 0.9%, rising to 50.9% above block 900,000 as the tree
+  grows, and removing that stall brings both implementations to the same ~346
+  blk/s. That supersedes the 18% derived from an identical-engine
+  `--addrindex` replay (863 s of 4,767), which validates every block where the
+  daemon skips ~93% under assume-valid. The
   free pages are copy-on-write churn and nothing more: an earlier note here
   suspected that `Database::begin` taking a redb read transaction for the life
   of every ffldb transaction (`lib.rs:386`) pinned them, since redb will not

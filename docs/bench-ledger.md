@@ -846,3 +846,74 @@ between arms. n=1 per arm.
 Raw: `artifacts/dcroxide-bench/m1/dstate/` — `rox.jsonl`, `dcrd.jsonl` (34,083
 and 31,979 samples), `rox.log`, `dcrd.log`, `run.log`. Sampler and harness:
 `artifacts/dcroxide-bench/m1/dsample.py`, `dstate.sh`.
+
+### The wall-time share, from the same samples (2026-08-15)
+
+The section above measured the mechanism but left the number ADR-0009 actually
+needs — the *share* of sync wall time storage costs. It is in the same
+samples. **It is 34.6%, and it accounts for essentially the whole gap to
+dcrd.**
+
+First, that the D state is storage and not something else: **97.8%** of
+dcroxide's blocked-thread wait channels are storage symbols (`folio_wait_bit`,
+`handle_reserve_ticket`, `wait_for_commit`, `btrfs_*`), the remainder being 15
+samples of `exit_mm` and 5 of `__vm_munmap`. For dcrd it is 100%.
+
+Second, and this is what makes it a wall-time figure rather than an occupancy
+one: **when dcroxide blocks on storage, 99.4% of the time it has zero runnable
+threads.** The process is not merely blocking a worker, it is stopped. Only
+0.2% of samples have two or more threads blocked, so the storage path is
+effectively serialized — one thread waits and nothing else proceeds. dcrd
+blocks too, but keeps working through it (mean 1.465 runnable threads while
+blocked) and is fully stalled for only 0.9% of its run.
+
+| | ≥1 own thread blocked | fully stalled (nothing runnable) |
+|---|---:|---:|
+| dcroxide | 34.8% | **34.6%** |
+| dcrd | 11.3% | **0.9%** |
+
+**The stall tracks tree growth**, which is the copy-on-write prediction this
+ADR set has carried since 2026-07, now with a curve rather than an assertion:
+
+| height band | dcroxide stalled | dcrd stalled |
+|---|---:|---:|
+| 0–300,000 | 1.3% | 1.8% |
+| 300,000–600,000 | 1.7% | 0.4% |
+| 600,000–900,000 | 29.2% | 0.7% |
+| 900,000–1,100,392 | **50.9%** | 1.0% |
+
+By the last third of the chain dcroxide spends **half its wall time completely
+stopped**. dcrd stays near 1% throughout.
+
+**The counterfactual: the stall is the gap.** Removing dcroxide's 1,646 s of
+stall puts it at **346.6 blk/s**; giving dcrd the same treatment puts it at
+**346.9**. They converge within 0.1%. The observed ratio for this run is
+1.506x and the stall alone predicts 1.52x, so outside of storage stalls the
+two implementations process blocks at the same rate — which is what should be
+expected, since both skip the same validation under the same assume-valid
+anchor.
+
+**It cross-checks against the other run of the same day.** At 265.0 blk/s
+against that same ~346 ceiling, the earlier arm implies a ~23% stall share and
+a 1.31x gap, against the 1.29x actually measured. Both runs are internally
+consistent: in each, the gap equals the stall. **So the share is 23–35%
+depending on I/O contention** — this run carried more ambient, which lengthens
+storage waits and inflates the figure.
+
+**This overturns the bound ADR-0009 reasons from.** That ADR concluded a
+rework "cannot be sold on IBD" from the replay's 863 s of 4,767 in flushes,
+18%, giving at most 1.22x. Both halves are wrong for a daemon: the replay
+validates every block where the daemon skips ~93%, and the measured daemon
+figure is 23–35% with a counterfactual of **~1.5x**.
+
+**What the counterfactual does and does not license.** It assumes the stall is
+removable. dcrd demonstrates the *work* can be overlapped with compute — it is
+not evidence that redb can overlap it. The near-total absence of ≥2 blocked
+threads says dcroxide's storage path is serialized, so this points at the
+commit structure — a synchronous fsync on the critical path — as much as at
+the engine. A faster engine that stayed synchronous would collect less of the
+1.5x than an asynchronous or background-committed one, possibly much less.
+That distinction is the difference between "swap the engine" and "restructure
+the commit", and this measurement does not choose between them.
+
+Derived from `rox.jsonl` / `dcrd.jsonl` in the run directory above; no new run.

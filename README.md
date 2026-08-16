@@ -422,13 +422,23 @@ waits, and it reads 99x more than dcrd during ingest. Most of the cost
 lands outside the process, which is why profiling the port's own
 threads never found it.
 
-What is still not quantified is the *share* of IBD wall time this
-accounts for — so how much a different engine would buy remains open in
-both directions. The matched `--addrindex` replay spent 863 s of 4,767
-in flushes, 18%, but a replay validates every block where the daemon
-skips roughly 93% of it under mainnet's assume-valid anchor, so that
-fraction does not transfer to a sync. Full figures in the
-[bench ledger](docs/bench-ledger.md).
+**The share is measured too, from the same samples: dcroxide is fully
+stalled — zero runnable threads — for 34.6% of block-sync wall time,
+against dcrd's 0.9%.** It tracks tree growth, which is the
+copy-on-write prediction: 1.3% of wall time below block 300,000 and
+**50.9% above block 900,000**, where the port spends half its time
+completely stopped. Removing that stall moves dcroxide to 346.6 blk/s
+and dcrd to 346.9 — they converge, so outside storage stalls the two
+process blocks at the same rate, and **the stall is the whole gap**.
+
+That supersedes the 18% figure this project reasoned from, which came
+from a replay that validates every block where the daemon skips ~93%
+under assume-valid. What it does *not* settle is whether the stall is
+removable: dcrd shows the work can be overlapped, not that redb can
+overlap it. Two or more dcroxide threads block at once in only 0.2% of
+samples, so its storage path is serialized — implicating a synchronous
+fsync on the critical path as much as the engine choice. Full figures
+in the [bench ledger](docs/bench-ledger.md).
 
 At the tip the same chain cost 23.73 GiB under dcrd and 32.06 GiB
 under dcroxide, measured 2026-07 under redb 2.6.3. The 2026-08-15 pair

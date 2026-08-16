@@ -1317,9 +1317,21 @@ background work, so commit cost tracks the size of the tree" — is now
 evidence rather than inference. **Read it with the correction that the cost is
 largely paid outside the process**, in kernel writeback and dm-crypt.
 
-**What it does not settle.** It does not quantify what fraction of IBD wall
-time this accounts for, so ADR-0009's engine question keeps its open bound in
-both directions. It is n=1 per arm, ambient was not matched between arms, and
+**The share, from the same samples.** dcroxide is **fully stalled — zero
+runnable threads — for 34.6% of block-sync wall time**, against dcrd's 0.9%,
+and 99.4% of its blocked samples have nothing else runnable, so this is
+critical-path wall time rather than an occupancy figure. It tracks tree growth
+exactly as this ADR predicted: 1.3% below block 300,000, **50.9% above block
+900,000**. Removing it moves dcroxide to 346.6 blk/s against dcrd's own
+counterfactual 346.9 — **the stall is the entire gap**. That supersedes
+ADR-0009's 18%/1.22x bound with ~23–35% and ~1.5x.
+
+**What it does not settle.** Whether the stall is *removable*. dcrd shows the
+work can be overlapped with compute; it does not show redb can overlap it. Two
+or more dcroxide threads block simultaneously in only 0.2% of samples, so its
+storage path is serialized — which implicates the commit structure, a
+synchronous fsync on the critical path, as much as the engine choice. It is
+n=1 per arm, ambient was not matched between arms, and
 thread-state counts are not strictly commensurable between a Rust
 thread-per-operation process and a Go runtime — which is why the argument
 rests on kernel-side and per-GiB figures rather than the own-thread

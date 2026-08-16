@@ -121,8 +121,13 @@ What Phase 15 has covered so far:
   mechanism: the port drives **11.7x** the kernel-side storage work dcrd does
   and blocks **30x more per GiB written**, while dcrd writes 1.16x more bytes
   at 1.74x the rate — the write shape, not the volume, and mostly paid in
-  kernel writeback rather than the port's own threads. Its share of sync wall
-  time remains unquantified. Chain on disk at tip: dcrd 23.69 GiB,
+  kernel writeback rather than the port's own threads. **Its share of wall
+  time: the port is fully stalled on storage for 34.6% of block sync against
+  dcrd's 0.9%, and 50.9% above block 900,000; removing that stall brings both
+  to the same ~346 blk/s, so the stall is the whole gap.** Whether it is
+  removable is open — dcroxide's storage path is serialized (two threads block
+  at once in 0.2% of samples), implicating synchronous commit as much as the
+  engine. Chain on disk at tip: dcrd 23.69 GiB,
   dcroxide 33.58 GiB — identical consensus block bytes, the difference is
   metadata.
 - **Security-blocker campaign.** The release blockers, highs, and mediums from

@@ -140,12 +140,20 @@ kernel threads rather than in either daemon's own. The matched `--addrindex` rep
 appeared to bound the storage term from the other side, 863 s of 4,767 s in
 flushes, 18% of wall time. That bound does not hold: a replay validates every
 block where the daemon skips roughly 93% of validation under mainnet's
-assume-valid anchor, so the replay's composition is not the sync's, and
-storage may be a larger share of daemon IBD than 18%, not a smaller one.
+assume-valid anchor, so the replay's composition is not the sync's. Measured
+on the daemon, storage is indeed the larger share, not the smaller: 34.6% of
+block-sync wall time against the replay-derived 18%.
 
-D2 is unaffected either way. No concurrency model removes those stalls, and
-neither term implicates threading. What remains of the storage question is
+D2 is unaffected, and now for a measured reason rather than an assumed one:
+the stalls are storage waits with nothing else runnable — 99.4% of dcroxide's
+blocked samples have zero runnable threads — so they are not contention
+between its own threads, and no scheduling policy reaches them. What remains
+of the storage question is
 ADR-0009's engine decision, which no longer has a usable bound in either
-direction: the 1.22x that once argued it could not be sold on IBD rested on
-the replay's 18%, and the gap it would be closing is now 1.29x rather than
-2.2x. Smaller prize, weaker bound, same open question.
+direction. The 1.22x that once argued it could not be sold on IBD rested on
+the replay's 18%; measured on the daemon, dcroxide is fully stalled on storage
+for **34.6%** of block-sync wall time against dcrd's 0.9%, and removing that
+brings both to the same ~346 blk/s. So the prize is ~1.5x and clears the stop
+rule. What that leaves open is the *form*: two or more of its threads block
+simultaneously in 0.2% of samples, so the storage path is serialized, and a
+synchronous fsync on the critical path is implicated as much as the engine.
