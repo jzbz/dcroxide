@@ -30,10 +30,25 @@
 //!   them is a real state a crash can land in: block bytes on disk that no
 //!   metadata references.
 //!
-//! The crash primitive is `drop` without `close`, which discards the write
-//! cache exactly as process death would. It does not simulate power loss —
-//! nothing here proves an fsync reached the platter — so these tests bound
-//! the engine's transactional behaviour, not the device's.
+//! There are two crash primitives, and the difference between them is
+//! the whole point.
+//!
+//! `drop` without `close` discards the write cache exactly as process
+//! death would, and bounds the engine's transactional behaviour. It does
+//! **not** model power loss: the page cache survives it, so every byte
+//! written but never `fsync`ed is still readable after the reopen.
+//! Killing the process outright would be no better for the same reason.
+//! Every test using it passes on a store that never syncs at all.
+//!
+//! `PowerLossBackend` closes that gap by discarding what was never
+//! synced, which is the only thing that tells a durable commit from a
+//! merely-written one. It exists because the async-commit work in
+//! ADR-0009 would defer exactly that step, and the suite could not have
+//! caught a mistake there. `power_loss_detects_a_store_that_never_syncs`
+//! is the control: it runs the same sequence against a backend whose
+//! `sync_data` is a no-op and requires the data to be GONE, so if the
+//! rig ever stops testing durability that test fails rather than the
+//! other two silently passing.
 //!
 //! **These tests were checked against a broken store, not just a working
 //! one.** Deleting the state-marker write from `DbCache::flush` — so the
@@ -710,5 +725,245 @@ fn a_redb2_data_directory_is_refused_with_an_upgrade_message() {
     assert!(
         msg.contains("not damaged"),
         "the message must distinguish this from corruption, got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Power loss
+//
+// Everything above this line uses `drop` without `close` as its crash
+// primitive. That models process death and nothing more: the page cache
+// survives it, so every byte written but never `fsync`ed is still
+// readable after the reopen. Killing the process outright would be no
+// better for the same reason. A store that skipped its durability step
+// entirely passes all of it.
+//
+// The tests below close that gap with storage that discards what was
+// never synced, which is the one thing that tells a durable commit from
+// a merely-written one. They exist ahead of any deferred-fsync work
+// rather than after it, because that work is exactly what they guard —
+// and `power_loss_detects_a_store_that_never_syncs` checks that they can
+// actually fail, by running the same sequence against a backend whose
+// `sync_data` does nothing.
+// ---------------------------------------------------------------------
+
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::{Arc, Mutex};
+
+/// Storage that models power loss.
+///
+/// Every write is forwarded to a real file, but the bytes it overwrote
+/// are kept first, so `cut_power` can put the file back exactly as it
+/// stood at the last successful `sync_data`. An extending write is
+/// undone by the recorded durable length rather than by its old bytes,
+/// since it had none.
+///
+/// `honest_sync` is what gives the rig teeth: with it false the backend
+/// acknowledges `sync_data` without doing anything, which is precisely
+/// the mistake a deferred-fsync design can make, and the suite must
+/// notice.
+#[derive(Debug)]
+struct PowerLossBackend {
+    file: Mutex<std::fs::File>,
+    /// `(offset, previous bytes)` for each write since the last sync,
+    /// oldest first; replayed in reverse to undo them.
+    undo: Mutex<Vec<(u64, Vec<u8>)>>,
+    /// File length as of the last sync, so extensions are truncated away.
+    durable_len: Mutex<u64>,
+    honest_sync: bool,
+}
+
+impl PowerLossBackend {
+    fn create(path: &std::path::Path, honest_sync: bool) -> Arc<PowerLossBackend> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .expect("open backing file");
+        let len = file.metadata().expect("metadata").len();
+        Arc::new(PowerLossBackend {
+            file: Mutex::new(file),
+            undo: Mutex::new(Vec::new()),
+            durable_len: Mutex::new(len),
+            honest_sync,
+        })
+    }
+
+    /// Discard every write since the last successful sync, as a power
+    /// cut would.
+    fn cut_power(&self) {
+        let mut file = self.file.lock().expect("file lock");
+        let mut undo = self.undo.lock().expect("undo lock");
+        let durable = *self.durable_len.lock().expect("len lock");
+        // Reverse order: a region written twice must end up holding what
+        // it held before the FIRST of those writes.
+        for (offset, previous) in undo.drain(..).rev() {
+            if offset < durable {
+                let keep =
+                    std::cmp::min(previous.len() as u64, durable.saturating_sub(offset)) as usize;
+                file.seek(SeekFrom::Start(offset)).expect("seek");
+                file.write_all(&previous[..keep]).expect("undo write");
+            }
+        }
+        file.set_len(durable).expect("truncate to durable length");
+        file.sync_all().expect("sync after power cut");
+    }
+}
+
+impl redb::StorageBackend for PowerLossBackend {
+    fn len(&self) -> Result<u64, std::io::Error> {
+        Ok(self.file.lock().expect("file lock").metadata()?.len())
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+        let mut file = self.file.lock().expect("file lock");
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(out)
+    }
+
+    fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+        self.file.lock().expect("file lock").set_len(len)
+    }
+
+    fn sync_data(&self) -> Result<(), std::io::Error> {
+        if !self.honest_sync {
+            // Acknowledge without persisting: the failure mode under test.
+            return Ok(());
+        }
+        let file = self.file.lock().expect("file lock");
+        file.sync_data()?;
+        let len = file.metadata()?.len();
+        drop(file);
+        self.undo.lock().expect("undo lock").clear();
+        *self.durable_len.lock().expect("len lock") = len;
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+        let mut file = self.file.lock().expect("file lock");
+        let len = file.metadata()?.len();
+        // Keep whatever this write is about to destroy, but only the part
+        // that exists: past EOF there is nothing to restore and the
+        // truncate in `cut_power` removes it instead.
+        if offset < len {
+            let keep = std::cmp::min(data.len() as u64, len.saturating_sub(offset)) as usize;
+            let mut previous = vec![0u8; keep];
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut previous)?;
+            self.undo
+                .lock()
+                .expect("undo lock")
+                .push((offset, previous));
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(data)
+    }
+}
+
+/// Options wired to a power-loss backend over this directory's metadata
+/// file, plus the handle the test keeps to cut power with.
+fn power_loss_opts(dir: &std::path::Path, honest_sync: bool) -> (Options, Arc<PowerLossBackend>) {
+    std::fs::create_dir_all(dir).expect("mkdir");
+    let backend = PowerLossBackend::create(&dir.join("metadata.redb"), honest_sync);
+    let mut opts = Options::new(dir, NET);
+    opts.backend = Some(Arc::clone(&backend) as dcroxide_database::SharedBackend);
+    (opts, backend)
+}
+
+/// A durably flushed generation survives a power cut intact.
+#[test]
+fn power_loss_after_a_flush_keeps_the_flushed_generation() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_dir = dir.path().join("db");
+    let (opts, backend) = power_loss_opts(&db_dir, true);
+
+    let db = Database::create(&opts).expect("create");
+    write_paired_generation(&db, 1, 64).expect("generation 1");
+    db.flush().expect("flush");
+    drop(db);
+    backend.cut_power();
+
+    // Reopen WITHOUT the backend: the file now holds only what was synced.
+    let reopened = Database::open(&Options::new(&db_dir, NET)).expect("reopen");
+    assert_markers_agree_with_rows(&reopened, "after power loss following a flush");
+    reopened
+        .view(|tx| {
+            assert_eq!(
+                tx.metadata().get(UTXO_STATE_KEY),
+                Some(marker(1, 64).to_vec()),
+                "the flushed generation must survive a power cut"
+            );
+            Ok(())
+        })
+        .expect("view");
+}
+
+/// An unflushed window is lost, but what survives is internally
+/// consistent — the property a node actually needs, since it re-syncs
+/// the rest.
+#[test]
+fn power_loss_before_a_flush_stays_internally_consistent() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_dir = dir.path().join("db");
+    let (opts, backend) = power_loss_opts(&db_dir, true);
+
+    let db = Database::create(&opts).expect("create");
+    write_paired_generation(&db, 1, 64).expect("generation 1");
+    db.flush().expect("flush");
+    // Committed to the overlay but never flushed: the window a crash eats.
+    write_paired_generation(&db, 2, 64).expect("generation 2");
+    drop(db);
+    backend.cut_power();
+
+    let reopened = Database::open(&Options::new(&db_dir, NET)).expect("reopen");
+    assert_markers_agree_with_rows(&reopened, "after power loss before a flush");
+    reopened
+        .view(|tx| {
+            assert_eq!(
+                tx.metadata().get(UTXO_STATE_KEY),
+                Some(marker(1, 64).to_vec()),
+                "the store must land on the last DURABLE generation, not a later one"
+            );
+            Ok(())
+        })
+        .expect("view");
+}
+
+/// The rig has teeth.
+///
+/// Same sequence as the first test, against a backend that acknowledges
+/// `sync_data` without doing anything — the mistake a deferred-fsync
+/// design makes. The flushed generation must NOT survive. If this ever
+/// starts passing, the two tests above have stopped testing durability
+/// and are only testing that files can be written.
+#[test]
+fn power_loss_detects_a_store_that_never_syncs() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_dir = dir.path().join("db");
+    let (opts, backend) = power_loss_opts(&db_dir, false);
+
+    let db = Database::create(&opts).expect("create");
+    write_paired_generation(&db, 1, 64).expect("generation 1");
+    db.flush().expect("flush");
+    drop(db);
+    backend.cut_power();
+
+    // Everything the "flush" claimed to persist is gone, so the store is
+    // either unopenable or empty of that generation. Both are detections;
+    // silently returning generation 1 is not.
+    let mut survived: Option<Vec<u8>> = None;
+    if let Ok(reopened) = Database::open(&Options::new(&db_dir, NET)) {
+        let _ = reopened.view(|tx| {
+            survived = tx.metadata().get(UTXO_STATE_KEY);
+            Ok(())
+        });
+    }
+    assert_ne!(
+        survived,
+        Some(marker(1, 64).to_vec()),
+        "a backend that never syncs must not be able to produce a surviving flush — \
+         if it can, these tests cannot detect a missing fsync and the rig is decorative"
     );
 }

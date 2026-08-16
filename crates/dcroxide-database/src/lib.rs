@@ -309,6 +309,55 @@ pub struct Options {
     pub cache_max_size: u64,
     /// Seconds after which a commit flushes the overlay regardless of size.
     pub cache_flush_interval_secs: u64,
+    /// Storage to hand redb instead of letting it open `metadata.redb`
+    /// itself.  `None` — the default and the only value the daemon uses
+    /// — opens the file directly, exactly as before.
+    ///
+    /// Exists so a test can model **power loss**, which the crash suite
+    /// otherwise cannot reach. Its other primitive is an in-process
+    /// `drop`, and killing the process outright would be no better: both
+    /// leave the page cache intact, so every byte written but never
+    /// `fsync`ed is still readable after the reopen and a store that
+    /// skipped its durability step passes anyway. Only storage that
+    /// *discards what was never synced* distinguishes them — which is
+    /// precisely the property any deferred-fsync work would put at risk,
+    /// and the reason this hook exists before that work rather than
+    /// after it.
+    pub backend: Option<SharedBackend>,
+}
+
+/// Storage shared between the caller and redb, so a test can keep a
+/// handle on the backend it installed (to fail it, or to drop its
+/// unsynced writes) while redb owns its own.
+pub type SharedBackend = Arc<dyn redb::StorageBackend>;
+
+/// Adapts a [`SharedBackend`] to the by-value `impl StorageBackend` that
+/// `redb::Builder::create_with_backend` takes.  Every method on the
+/// trait takes `&self`, so sharing costs one pointer hop and no
+/// synchronisation of its own.
+#[derive(Debug)]
+struct SharedBackendHandle(SharedBackend);
+
+impl redb::StorageBackend for SharedBackendHandle {
+    fn len(&self) -> Result<u64, std::io::Error> {
+        self.0.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), std::io::Error> {
+        self.0.read(offset, out)
+    }
+
+    fn set_len(&self, len: u64) -> Result<(), std::io::Error> {
+        self.0.set_len(len)
+    }
+
+    fn sync_data(&self) -> Result<(), std::io::Error> {
+        self.0.sync_data()
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), std::io::Error> {
+        self.0.write(offset, data)
+    }
 }
 
 /// redb's own default cache size, which is what the port used before
@@ -352,7 +401,23 @@ impl Options {
             write_log: None,
             cache_max_size: crate::dbcache::DEFAULT_CACHE_SIZE,
             cache_flush_interval_secs: crate::dbcache::DEFAULT_FLUSH_SECS,
+            backend: None,
         }
+    }
+}
+
+/// Open the metadata store, through `opts.backend` when one is
+/// installed and directly otherwise.
+///
+/// `create_with_backend` is redb's only backend entry point and carries
+/// its create-or-open semantics, so both call sites route through here
+/// rather than one of them quietly ignoring the hook.
+fn open_metadata(opts: &Options, meta_path: &Path) -> Result<redb::Database, redb::DatabaseError> {
+    match &opts.backend {
+        Some(shared) => {
+            redb_builder(opts).create_with_backend(SharedBackendHandle(Arc::clone(shared)))
+        }
+        None => redb_builder(opts).create(meta_path),
     }
 }
 
@@ -622,7 +687,12 @@ impl Database {
     /// `database.Create`).
     pub fn create(opts: &Options) -> Result<Database, Error> {
         let meta_path = opts.path.join(METADATA_FILE);
-        if meta_path.exists() {
+        // The guard protects against clobbering a store that lives at
+        // this path. A caller-supplied backend IS the store, so the path
+        // says nothing about whether one exists and the check would only
+        // reject storage the caller already opened. The daemon never
+        // sets a backend, so its behaviour is unchanged.
+        if opts.backend.is_none() && meta_path.exists() {
             return Err(db_error(
                 ErrorKind::DbExists,
                 "database already exists at the provided path",
@@ -633,7 +703,7 @@ impl Database {
         create_dir_all_owner_only(&opts.path)
             .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
 
-        let kv = redb_builder(opts).create(&meta_path).map_err(open_error)?;
+        let kv = open_metadata(opts, &meta_path).map_err(open_error)?;
 
         // Initialize the ffldb-layout bookkeeping rows: the bucket
         // index entry and fixed ID for the internal block index, the
@@ -707,7 +777,11 @@ impl Database {
             ));
         }
 
-        let kv = redb_builder(opts).open(&meta_path).map_err(open_error)?;
+        // Both paths check `meta_path.exists()` above, so redb's own
+        // create-or-open distinction is not what enforces "must already
+        // exist" here and routing through the backend hook cannot
+        // weaken it.
+        let kv = open_metadata(opts, &meta_path).map_err(open_error)?;
         let mut block_store = BlockStore::open(&opts.path, opts.network, opts.max_block_file_size)?;
 
         // Fetch the stored write cursor position.
