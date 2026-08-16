@@ -470,10 +470,24 @@ sold on IBD.
 > storage in general — so the rework this ADR contemplates has a target. What
 > it still does not supply is a multiplier: the only counterfactual available
 > projects a rate *faster than dcrd*, which shows the model is too generous
-> rather than the prize enormous. Decide the rework on the 48%/90-98%
-> attribution, not on a speedup figure, and note that the attribution points
-> at the commit's **structure** — one synchronous fsync on the critical path —
-> at least as much as at the engine underneath it.
+> rather than the prize enormous.
+>
+> **The "restructure the commit" branch is now closed by measurement.** A
+> background committer was built and measured on 2026-08-16: **210.0 blk/s
+> against 232.1 synchronous, 9.5% slower**, and it hid *less* commit time than
+> the synchronous version even after normalising for the differing flush
+> totals (0.757 against 0.708 seconds stalled per second of commit). The
+> reason is structural: **flushes occupy 68–71% of block-sync wall time**, so
+> commits are nearly back-to-back rather than punctual, and redb permits one
+> writer holding its lock across the fsync — a second commit can never overlap
+> the first. Moving where the connection thread waits does not reduce how long
+> it waits. Reverted; see [bench-ledger.md](../bench-ledger.md).
+>
+> **So the remaining lever is the cost of a commit, not its schedule**, which
+> is this ADR's own subject: the write shape. dcroxide writes *fewer* bytes
+> than dcrd and blocks 30x more per GiB, because scattered copy-on-write
+> overwrites onto btrfs are near the worst case for that stack where an LSM's
+> sequential compaction is near the best.
 
 1. **Lever (d) on `spendjournalv3`.** ~~Prerequisite~~ **Measured**, by
    `redbstat --buckets`: the bucket holds a 2402-byte mean row against a

@@ -1069,3 +1069,67 @@ defensible multiplier.
 Raw: `artifacts/dcroxide-bench/m1/flushobs/` — `rox.jsonl` (26,391 samples),
 `flush.jsonl` (130 records), `rox.log`, `run.log`. Harness `flushobs.sh`,
 sampler `dsample.py`.
+
+## Background commit (2026-08-16) — implemented, measured, and NOT shipped
+
+ADR-0009's remaining question was whether the metadata commit could be moved
+off the block-connection thread to recover the 48% of wall time the node
+spends fully stalled in it. **It was built, measured, and reverted: it is
+9.5% slower, and the reason is structural rather than a bug in the
+implementation.**
+
+The design: a committer thread per flush, holding an `Arc<DbInner>` so the
+database cannot be destroyed mid-commit; the previous commit joined before the
+next begins, which gives backpressure (at most one in flight) and flush
+ordering for free; `Database::flush`/`close` drain first and stay synchronous
+to durability; a background failure latches fatal and is reported to the next
+caller. It built clean, passed the full suite, and synced mainnet to tip
+without error.
+
+| | baseline (synchronous commit) | background commit |
+|---|---:|---:|
+| rate | **232.1 blk/s** | **210.0 blk/s** |
+| wall | 4,741 s | 5,241 s |
+| fully stalled | 48.1% | 53.7% |
+| flushes | 130 | 132 |
+| flush duty cycle | 68% of wall | 71% |
+| mean ambient load | 6.83 | 8.57 |
+
+**Why it cannot work, normalised so the load difference does not decide it.**
+Stall per second of commit work: **0.708 s baseline against 0.757 s
+backgrounded.** The background version hid *less* commit time than the
+synchronous one, on a measure that divides out the differing flush totals.
+
+The premise was that the process sits idle during a commit and could be doing
+other work. That is only about 30% true: **flushes occupy 68–71% of block-sync
+wall time in both runs.** Commits are nearly back-to-back, not punctual events
+with gaps between them. redb permits exactly one writer and holds its write
+lock across the fsync, so a second commit can never overlap the first — the
+next flush trigger fires while the previous commit is still running, and the
+connection thread then blocks at the *drain* instead of at the commit. Moving
+where it waits does not reduce how long it waits, and the in-flight window
+lets the overlay accumulate, so the following batch is larger.
+
+**What this means for the engine question.** The 48% stall is real and it is
+the metadata commit (90–98%, measured the same day). But it is not recoverable
+by restructuring *when* the commit runs, because the commits are already
+saturating the available time and cannot be parallelised against each other by
+construction. **The remaining lever is the cost of a commit, not its
+schedule** — which is the write-shape finding: dcroxide writes fewer bytes
+than dcrd and blocks 30x more per GiB, because scattered copy-on-write
+overwrites on btrfs are close to the worst case for that stack, where an LSM's
+sequential compaction is close to the best.
+
+So ADR-0009's question narrows to the engine and the write shape, and the
+"restructure the commit" branch is closed by measurement rather than left
+open. The ~1.5x that an earlier counterfactual attached to this is not
+available from scheduling.
+
+**What was kept.** The Phase 1 work this was built on top of — releasing the
+cache lock across the commit, the `compact` barrier, and the split flush
+accounting — is committed and stands on its own: it unblocks readers for the
+26.9 s median flush, and it costs nothing. Only the handoff was reverted.
+
+Raw: `artifacts/dcroxide-bench/m1/phase2/` against
+`artifacts/dcroxide-bench/m1/flushobs/`, same harness, same server, same
+machine, hours apart.
