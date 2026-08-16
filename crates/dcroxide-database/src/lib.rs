@@ -387,6 +387,41 @@ impl redb::StorageBackend for SharedBackendHandle {
 /// through dcrd's own `--utxocachemaxsize`.
 pub const DEFAULT_DB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 
+/// Run one flush with the cache lock released across the commit.
+///
+/// The caller must already hold the writer semaphore, which is what
+/// serialises flushes against each other; the cache lock only has to be
+/// held for the capture and the retirement. Holding it across the commit
+/// as well — which is what this code used to do — blocks every reader in
+/// the process for an fsync that the 2026-08-16 measurement puts at a
+/// median of 26.9 s.
+///
+/// Synchronous to durability: it returns only once the data is on disk,
+/// because `Database::flush` and `Database::close` are the chain's
+/// durability barrier and the daemon's shutdown path.
+fn flush_locked(inner: &DbInner) -> Result<(), Error> {
+    let batch = {
+        let mut cache = inner.cache.lock().expect("cache lock poisoned");
+        cache.begin_flush()
+    };
+    let (outcome, failure) =
+        match crate::dbcache::DbCache::run_flush(&batch, &inner.kv, &inner.block_store) {
+            Ok(outcome) => (Some(outcome), None),
+            Err(e) => (None, Some(e)),
+        };
+    // Retire (or restore) under the lock either way: on failure the
+    // overlay still holds every captured byte, and the accounting has to
+    // go back or the cache never trips its own ceiling again.
+    {
+        let mut cache = inner.cache.lock().expect("cache lock poisoned");
+        cache.finish_flush(batch, outcome);
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 impl Options {
     /// Options with dcrd's defaults for the given directory and
     /// network.
@@ -1192,12 +1227,7 @@ impl Database {
         // everything (dcrd `Close` flushes the cache), waiting out any
         // committing transaction first (dcrd's close/write locks).
         let _writer = self.exclusive_writer();
-        self.inner
-            .cache
-            .lock()
-            .expect("cache lock poisoned")
-            .flush(&self.inner.kv, &self.inner.block_store)
-            .map_err(|e| self.inner.mark_fatal(e))?;
+        flush_locked(&self.inner).map_err(|e| self.inner.mark_fatal(e))?;
         Ok(())
     }
 
@@ -1208,12 +1238,7 @@ impl Database {
         self.check_open()?;
         self.check_writable()?;
         let _writer = self.exclusive_writer();
-        self.inner
-            .cache
-            .lock()
-            .expect("cache lock poisoned")
-            .flush(&self.inner.kv, &self.inner.block_store)
-            .map_err(|e| self.inner.mark_fatal(e))?;
+        flush_locked(&self.inner).map_err(|e| self.inner.mark_fatal(e))?;
         Ok(())
     }
 }

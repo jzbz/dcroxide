@@ -631,12 +631,36 @@ impl Transaction {
         // the commit with this transaction unapplied (the files roll
         // back below) — and only then publish this transaction's
         // changes to the cache.
+        // The capture and the retirement take the cache lock; the commit
+        // between them does not, so readers are not held for its fsync.
+        // This transaction holds the writer semaphore throughout, which
+        // is what keeps two flushes from overlapping.
         let flush_result = {
-            let mut cache = self.db.cache.lock().expect("cache lock poisoned");
-            if cache.needs_flush() {
-                cache.flush(&self.db.kv, &self.db.block_store)
-            } else {
-                Ok(())
+            let batch = {
+                let mut cache = self.db.cache.lock().expect("cache lock poisoned");
+                cache.needs_flush().then(|| cache.begin_flush())
+            };
+            match batch {
+                None => Ok(()),
+                Some(batch) => {
+                    let (outcome, failure) = match crate::dbcache::DbCache::run_flush(
+                        &batch,
+                        &self.db.kv,
+                        &self.db.block_store,
+                    ) {
+                        Ok(outcome) => (Some(outcome), None),
+                        Err(e) => (None, Some(e)),
+                    };
+                    self.db
+                        .cache
+                        .lock()
+                        .expect("cache lock poisoned")
+                        .finish_flush(batch, outcome);
+                    match failure {
+                        Some(e) => Err(e),
+                        None => Ok(()),
+                    }
+                }
             }
         };
         if let Err(e) = flush_result {

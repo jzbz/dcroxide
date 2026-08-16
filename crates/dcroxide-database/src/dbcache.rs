@@ -56,6 +56,42 @@ pub(crate) const DEFAULT_FLUSH_SECS: u64 = 300;
 /// `None` for a pending deletion of a stored key.
 pub(crate) type CacheLayer = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
+/// An overlay capture handed to [`DbCache::run_flush`], which persists it
+/// with no lock held.
+///
+/// It owns `Arc`s on the captured layers, which does two things: the
+/// contents cannot change under the commit (every `Arc::try_unwrap` in
+/// the write path fails while it is held, so writers seal a new layer
+/// instead of mutating one of these), and the layers stay alive even
+/// though they are still published for readers.
+pub(crate) struct FlushBatch {
+    layers: Vec<Arc<CacheLayer>>,
+    bytes: u64,
+    write_log: Option<crate::WriteLogSink>,
+    take_stats: bool,
+    started: Instant,
+}
+
+/// What a completed commit reports back for the observer.
+pub(crate) struct FlushOutcome {
+    dirty_entries: usize,
+    stats_elapsed: Duration,
+    sampled: Option<crate::RawStats>,
+}
+
+impl FlushOutcome {
+    /// A successful outcome with nothing to report, for tests that drive
+    /// retirement without running a real commit.
+    #[cfg(test)]
+    fn for_test() -> FlushOutcome {
+        FlushOutcome {
+            dirty_entries: 0,
+            stats_elapsed: Duration::ZERO,
+            sampled: None,
+        }
+    }
+}
+
 /// The ceiling on how many layers a snapshot may hold.  Every layer a
 /// lookup must probe before it can answer "not cached" costs one
 /// `BTreeMap` search, so the depth is a direct multiplier on the miss
@@ -262,12 +298,34 @@ fn merge_newest_pair(layers: &mut Vec<Arc<CacheLayer>>) -> u64 {
 /// [`MAX_LAYERS`] then forces merges of the newest (and, under the rule
 /// above, smallest) pair if the stack is ever deeper than the lookup
 /// path should walk.
-fn compact(layers: &mut Vec<Arc<CacheLayer>>) -> u64 {
+/// `pinned` is the number of layers at the TAIL that an in-flight flush
+/// is persisting, which must not be merged.
+///
+/// A flush captures the stack, releases the cache lock, and retires
+/// exactly those layers when its commit lands. `merge_newest_pair` would
+/// break that: it removes `layers[0]` and `layers[1]` and inserts one new
+/// `Arc` in their place, so a captured layer folded together with a newer
+/// one loses its identity. Retiring "the tail" would then either drop the
+/// newer layer's uncommitted writes — a whole `Chain::flush` unit, block
+/// index rows and UTXO entries and both state markers — or, if retirement
+/// went by pointer identity, match nothing and leave the overlay unable
+/// to drain.
+///
+/// The barrier is why `commit_pending`'s Arc back-off is not enough on
+/// its own: pinning makes `Arc::try_unwrap` fail, and the merge path
+/// *clones* on failure rather than backing off the way the top-layer path
+/// does.
+fn compact(layers: &mut Vec<Arc<CacheLayer>>, pinned: usize) -> u64 {
     let mut reclaimed = 0u64;
-    while layers.len() >= 2 && layers[0].len().saturating_mul(2) >= layers[1].len() {
+    // `layers.len() - pinned >= 2` keeps both arguments of every merge
+    // above the barrier: layers are only ever prepended, so the pinned
+    // region stays the tail for as long as it is pinned.
+    while layers.len().saturating_sub(pinned) >= 2
+        && layers[0].len().saturating_mul(2) >= layers[1].len()
+    {
         reclaimed = reclaimed.saturating_add(merge_newest_pair(layers));
     }
-    while layers.len() > MAX_LAYERS {
+    while layers.len().saturating_sub(pinned) > MAX_LAYERS {
         reclaimed = reclaimed.saturating_add(merge_newest_pair(layers));
     }
     reclaimed
@@ -325,6 +383,22 @@ pub(crate) struct DbCache {
     /// it once and replaying it into every candidate eliminates the
     /// confound rather than balancing it.
     write_log: Option<crate::WriteLogSink>,
+    /// Layers at the TAIL that an in-flight flush is persisting.
+    ///
+    /// They stay published for the whole commit, because the durable
+    /// store does not hold them yet and a reader must still find them.
+    /// Non-zero only between `begin_flush` and `finish_flush`, and the
+    /// barrier [`compact`] honours so their identity survives.
+    in_flight_layers: usize,
+    /// Retained bytes those layers account for, moved out of
+    /// `total_size` at capture.
+    ///
+    /// Kept separate so `needs_flush` disarms the moment a flush is
+    /// handed off rather than staying armed for its whole duration —
+    /// otherwise every commit inside the window re-triggers a flush of
+    /// data already being written. Restored to `total_size` if the
+    /// commit fails, since the overlay still holds it.
+    in_flight_size: u64,
 }
 
 impl DbCache {
@@ -338,6 +412,8 @@ impl DbCache {
             observer: None,
             stats_every: 0,
             flush_seq: 0,
+            in_flight_layers: 0,
+            in_flight_size: 0,
             write_log: None,
         }
     }
@@ -447,7 +523,7 @@ impl DbCache {
         }
 
         layers.insert(0, Arc::new(top));
-        let reclaimed = compact(&mut layers);
+        let reclaimed = compact(&mut layers, self.in_flight_layers);
         self.total_size = self.total_size.saturating_sub(reclaimed);
         self.publish(layers);
     }
@@ -472,43 +548,89 @@ impl DbCache {
         total > self.max_size
     }
 
-    /// Flush the overlay: sync the flat block files first so the
-    /// metadata never describes bytes that could vanish in a crash,
-    /// then write everything in one durable transaction and clear
-    /// (dcrd `dbCache.flush`).
-    pub(crate) fn flush(
-        &mut self,
+    /// Capture the overlay for a flush, under the cache lock.
+    ///
+    /// Returns `None` when there is nothing to write. The captured
+    /// layers STAY PUBLISHED: the durable store does not hold them yet,
+    /// so a reader must still be able to find them, and they are retired
+    /// only once the commit that persisted them succeeds. That is what
+    /// lets the caller drop the cache lock across the commit — the
+    /// expensive part — instead of holding it through an fsync that
+    /// blocks every reader in the process.
+    ///
+    /// Capture happens BEFORE the block files are synced, which is the
+    /// opposite of the order this code used when the whole flush ran
+    /// under one lock hold. It has to: syncing first and capturing
+    /// second would let a block written in between be described by
+    /// metadata this commit persists, while its bytes are not yet on
+    /// disk. Capturing first means the sync covers at least everything
+    /// the metadata names.
+    pub(crate) fn begin_flush(&mut self) -> FlushBatch {
+        self.last_flush = Instant::now();
+        let layers = self.cached.layers.clone();
+        let bytes = self.total_size;
+        // Move the bytes out of the figure `needs_flush` gates on, so
+        // the trigger disarms at handoff rather than staying armed for
+        // the whole commit and re-firing on every commit inside it.
+        self.total_size = 0;
+        self.in_flight_size = bytes;
+        self.in_flight_layers = layers.len();
+        // The sequence is assigned in `finish_flush`, so an empty flush --
+        // which syncs block files and commits nothing -- does not consume
+        // a number the observer would then appear to skip.
+        let take_stats = self.stats_every > 0
+            && self
+                .flush_seq
+                .saturating_add(1)
+                .is_multiple_of(self.stats_every);
+        FlushBatch {
+            layers,
+            bytes,
+            write_log: self.write_log.clone(),
+            take_stats: take_stats && self.observer.is_some(),
+            started: Instant::now(),
+        }
+    }
+
+    /// Persist a captured batch. Runs WITHOUT the cache lock held, so
+    /// readers and the overlay's writers proceed while it works.
+    pub(crate) fn run_flush(
+        batch: &FlushBatch,
         kv: &redb::Database,
         block_store: &std::sync::Mutex<BlockStore>,
-    ) -> Result<(), Error> {
-        let flush_started = Instant::now();
-        self.last_flush = flush_started;
-
+    ) -> Result<FlushOutcome, Error> {
+        // Block files before metadata, so the metadata never describes
+        // bytes that could vanish in a crash.
         block_store
             .lock()
             .expect("block store lock poisoned")
             .sync()?;
 
-        if self.cached.is_empty() {
-            return Ok(());
+        let view = CacheSnapshot {
+            layers: batch.layers.clone(),
+        };
+        if view.is_empty() {
+            // Nothing to commit, but the block files above still needed
+            // their sync -- that is the half of a flush that runs even on
+            // an empty overlay.
+            return Ok(FlushOutcome {
+                dirty_entries: 0,
+                stats_elapsed: Duration::ZERO,
+                sampled: None,
+            });
         }
 
-        // Captured before the flush clears them, for the observer below.
-        let dirty_bytes = self.total_size;
         let mut dirty_entries = 0usize;
-
-        let tx = crate::begin_durable_write(kv)?;
         let mut sampled = None;
         let mut stats_elapsed = Duration::ZERO;
+        let tx = crate::begin_durable_write(kv)?;
         {
             let mut table = tx
                 .open_table(METADATA_TABLE)
                 .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
-            // The merged view yields every cached key once, in key
-            // order, with the newest layer's entry winning.
-            for (key, entry) in self.cached.merged() {
+            for (key, entry) in view.merged() {
                 dirty_entries = dirty_entries.saturating_add(1);
-                if let Some(sink) = &self.write_log {
+                if let Some(sink) = &batch.write_log {
                     sink(key, entry.as_ref().map(|v| v.as_slice()));
                 }
                 match entry {
@@ -524,15 +646,7 @@ impl DbCache {
                     }
                 }
             }
-            // Read the footprint from the transaction that is already
-            // open, so sampling costs the tree walk and nothing else --
-            // no extra write transaction, no extra commit.
-            let take_stats = self.stats_every > 0
-                && self
-                    .flush_seq
-                    .saturating_add(1)
-                    .is_multiple_of(self.stats_every);
-            if take_stats && self.observer.is_some() {
+            if batch.take_stats {
                 let stats_started = Instant::now();
                 let db_stats = tx
                     .stats()
@@ -555,21 +669,56 @@ impl DbCache {
         }
         tx.commit()
             .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        Ok(FlushOutcome {
+            dirty_entries,
+            stats_elapsed,
+            sampled,
+        })
+    }
 
-        self.publish(Vec::new());
-        self.total_size = 0;
+    /// Retire a batch under the cache lock once its commit has landed,
+    /// or put its bytes back when it failed.
+    pub(crate) fn finish_flush(&mut self, batch: FlushBatch, outcome: Option<FlushOutcome>) {
+        let pinned = self.in_flight_layers;
+        self.in_flight_layers = 0;
+        let bytes = self.in_flight_size;
+        self.in_flight_size = 0;
+
+        let Some(outcome) = outcome else {
+            // The commit failed: the overlay still holds every captured
+            // byte, so the accounting has to go back or the cache grows
+            // without ever tripping its own ceiling again.
+            self.total_size = self.total_size.saturating_add(bytes);
+            return;
+        };
+
+        let mut layers = self.cached.layers.clone();
+        debug_assert!(
+            layers.len() >= pinned
+                && layers[layers.len() - pinned..]
+                    .iter()
+                    .zip(batch.layers.iter())
+                    .all(|(a, b)| Arc::ptr_eq(a, b)),
+            "the pinned tail is no longer the layers this flush captured; \
+             `compact`'s barrier is the thing that guarantees it"
+        );
+        layers.truncate(layers.len().saturating_sub(pinned));
+        self.publish(layers);
+
+        if outcome.dirty_entries == 0 {
+            return;
+        }
         self.flush_seq = self.flush_seq.saturating_add(1);
         if let Some(observer) = &self.observer {
             observer(&crate::FlushObservation {
                 sequence: self.flush_seq,
-                dirty_entries,
-                dirty_bytes,
-                elapsed: flush_started.elapsed(),
-                stats_elapsed,
-                stats: sampled,
+                dirty_entries: outcome.dirty_entries,
+                dirty_bytes: batch.bytes,
+                elapsed: batch.started.elapsed(),
+                stats_elapsed: outcome.stats_elapsed,
+                stats: outcome.sampled,
             });
         }
-        Ok(())
     }
 }
 
@@ -1171,6 +1320,106 @@ mod tests {
             "the mean layer depth is {:.2} against a ceiling of {MAX_LAYERS}, \
              so the stack is pinned near it",
             total as f64 / ROUNDS as f64
+        );
+    }
+}
+
+#[cfg(test)]
+mod flush_barrier_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use super::{DbCache, FlushOutcome};
+
+    fn put(cache: &mut DbCache, keys: &[&str]) {
+        let mut puts = BTreeMap::new();
+        for k in keys {
+            puts.insert(k.as_bytes().to_vec(), vec![0xcc; 8]);
+        }
+        cache.commit_pending(puts, std::iter::empty());
+    }
+
+    /// A commit landing WHILE a flush is in flight must not lose either
+    /// side, and the captured layers must still be identifiable when the
+    /// commit returns.
+    ///
+    /// This interleaving cannot occur through the public API today —
+    /// every flush call site holds the writer semaphore for its whole
+    /// duration, so no second writer can reach `commit_pending`. It is
+    /// forced here because the barrier that makes it safe would
+    /// otherwise be untested code that first runs for real when the
+    /// commit moves to a background thread.
+    ///
+    /// Without the `pinned` argument to `compact`, this fails: the new
+    /// layer and the captured one satisfy the geometric merge rule, get
+    /// folded into one fresh `Arc`, and retirement then either drops the
+    /// new layer's writes or matches nothing at all.
+    #[test]
+    fn a_commit_during_a_flush_neither_merges_into_it_nor_is_lost_by_it() {
+        let mut cache = DbCache::new();
+        put(&mut cache, &["captured-a", "captured-b", "captured-c"]);
+        let captured = cache.cached.layers.clone();
+        assert_eq!(captured.len(), 1, "setup: one layer to capture");
+
+        let batch = cache.begin_flush();
+        assert_eq!(
+            cache.total_size, 0,
+            "captured bytes leave the flush trigger"
+        );
+
+        // The concurrent writer. Sized so `compact`'s geometric rule
+        // WOULD fire — `layers[0].len() * 2 >= layers[1].len()`, i.e.
+        // 2*2 >= 3 — because a smaller layer leaves the merge dormant
+        // and the test vacuous. Checked by removing the barrier and
+        // watching this fail.
+        put(&mut cache, &["fresh-1", "fresh-2"]);
+        assert_eq!(
+            cache.cached.layers.len(),
+            2,
+            "the barrier must keep the captured layer out of the merge"
+        );
+        assert!(
+            Arc::ptr_eq(&cache.cached.layers[1], &captured[0]),
+            "the captured layer must still be the tail, and the same Arc"
+        );
+
+        cache.finish_flush(batch, Some(FlushOutcome::for_test()));
+
+        assert_eq!(cache.cached.layers.len(), 1, "the captured layer retired");
+        assert!(
+            !Arc::ptr_eq(&cache.cached.layers[0], &captured[0]),
+            "what remains is the writer's layer, not the retired one"
+        );
+        let view = &cache.cached;
+        assert!(
+            view.get(b"fresh-1").is_some() && view.get(b"fresh-2").is_some(),
+            "the concurrent commit's write survived the retirement"
+        );
+        assert!(
+            view.get(b"captured-a").is_none(),
+            "the flushed keys left the overlay -- they are in the store now"
+        );
+    }
+
+    /// A failed commit puts the bytes back, or the overlay grows without
+    /// ever tripping its own ceiling again.
+    #[test]
+    fn a_failed_flush_restores_the_accounting_and_keeps_the_layers() {
+        let mut cache = DbCache::new();
+        put(&mut cache, &["a", "b"]);
+        let before = cache.total_size;
+        let layers = cache.cached.layers.clone();
+
+        let batch = cache.begin_flush();
+        assert_eq!(cache.total_size, 0);
+        cache.finish_flush(batch, None);
+
+        assert_eq!(cache.total_size, before, "the bytes came back");
+        assert_eq!(cache.cached.layers.len(), layers.len(), "layers kept");
+        assert!(Arc::ptr_eq(&cache.cached.layers[0], &layers[0]));
+        assert!(
+            cache.cached.get(b"a").is_some(),
+            "the data is still readable"
         );
     }
 }
