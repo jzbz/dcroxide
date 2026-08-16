@@ -122,10 +122,15 @@ quantity in this whole investigation.
   differing by a bucket of hundreds of MiB) but not identified: a file size
   is not a composition fingerprint. Retire the 2026-07 figure rather than
   back-filling a composition onto a datadir that no longer exists.
-- **Commit cost is not established as the dominant term.** The IBD gap is
-  attributed to commit shape by a progress-stall statistic — which records
-  that progress halted, not what halted it — and no profile exists; the
-  2026-08-14 attempt failed, and is written up in the ledger. The ledger
+- **Commit cost is established as a real term, but not quantified as the
+  dominant one.** The attribution no longer rests on the progress-stall
+  statistic: a 2026-08-15 task-state decomposition measured the mechanism
+  directly. dcroxide drives **11.7x** the kernel-side storage work dcrd does
+  (1.64 tasks against 0.14, mostly `dmcrypt_write`) while dcrd writes 1.16x
+  more bytes at 1.74x the rate and blocks 30x less per GiB — so the cost is
+  the write *shape*, and it is largely paid outside the process, in kernel
+  writeback. What remains unquantified is the share of IBD wall time it
+  accounts for, which is the number this ADR actually needs. The ledger
   bounds it the other way: the full `--addrindex` replay spent 863 s of
   4,767 s in flushes, 18%. That bound is weaker than it looks — a replay
   validates every block, where the daemon skips roughly 93% of validation

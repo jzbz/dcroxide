@@ -54,9 +54,11 @@ port syncs about 1.29x slower than dcrd (measured 2026-08-15; the
 2.2x quoted through 2026-07 is superseded) and spends much of an
 initial block download stalled in storage commits. Both are measured
 and self-inflicted. That the cost is the storage engine's commit shape
-rather than validation is an attribution, not a finding — a matched
-replay on the same engine spent 863 s of 4,767 in flushes, 18%, and no
-profile exists. But whatever the dominant term turns out to be, it is
+rather than validation was measured on 2026-08-15: the port drives
+11.7x the kernel-side storage work dcrd does for the same chain, and
+blocks 30x more per GiB written. What share of sync wall time that
+accounts for is still not quantified. But whatever the dominant term
+turns out to be, it is
 work the node does to itself rather than work a peer can add to, so
 there is nothing here for a peer to amplify.
 

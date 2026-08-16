@@ -116,10 +116,13 @@ What Phase 15 has covered so far:
   apart, unmatched load average, n=1 each, all of which can only have cost
   dcroxide. **It reaches 1.29x at half dcrd's CPU** (0.76 cores against 1.50),
   so the open question is what the node blocks on, not what compute it lacks.
-  The gap is still attributed to the storage engine's commit shape rather
-  than validation — dcroxide spent 80.1% and 82.4% of wall time in progress
-  stalls over 20 s, where dcrd stalled 0 times in 754 windows — and the
-  attribution is still not established. Chain on disk at tip: dcrd 23.69 GiB,
+  The gap is attributed to the storage engine's commit shape rather than
+  validation, and a 2026-08-15 task-state decomposition measured that
+  mechanism: the port drives **11.7x** the kernel-side storage work dcrd does
+  and blocks **30x more per GiB written**, while dcrd writes 1.16x more bytes
+  at 1.74x the rate — the write shape, not the volume, and mostly paid in
+  kernel writeback rather than the port's own threads. Its share of sync wall
+  time remains unquantified. Chain on disk at tip: dcrd 23.69 GiB,
   dcroxide 33.58 GiB — identical consensus block bytes, the difference is
   metadata.
 - **Security-blocker campaign.** The release blockers, highs, and mediums from

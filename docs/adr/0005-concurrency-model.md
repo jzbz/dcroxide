@@ -131,9 +131,12 @@ stores the same bucket byte for byte. Tuning above the engine buys 11%
 against what was a 2.2x gap, and is a larger share of the 1.29x the gap
 measured on 2026-08-15.
 
-Its attribution is weaker than it reads, as well. A progress-stall statistic
-records that progress halted, not what halted it, and no profile exists of
-either sync — the 2026-08-14 attempt failed. The matched `--addrindex` replay
+Its attribution no longer rests on the stall statistic. A 2026-08-15
+task-state decomposition measured the mechanism: the port drives 11.7x the
+kernel-side storage work dcrd does, and its blocked threads park in btrfs
+writeback and transaction-commit waits. That confirms the cost is storage
+commit shape — and confirms it is not threading, since most of it is paid in
+kernel threads rather than in either daemon's own. The matched `--addrindex` replay
 appeared to bound the storage term from the other side, 863 s of 4,767 s in
 flushes, 18% of wall time. That bound does not hold: a replay validates every
 block where the daemon skips roughly 93% of validation under mainnet's

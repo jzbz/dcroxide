@@ -33,6 +33,7 @@ run, both nodes `--norpc`.
 |---|---|---|---|---|---|---|
 | 2026-07 | m1 | unrecorded (2.2.0-pre, at the ADR-0004 amendment) | 2.2.0-pre+452c1a6c3 (go1.26.5) | mainnet, ~1,100,400 blocks | syncer dcroxide: 2.47 h — 124 blk/s (from dcroxide), 2.51 h — 122 blk/s (from dcrd); syncer dcrd: 1.11 h — 276 blk/s, 1.02 h — 299 blk/s | ADR-0004 amendment |
 | 2026-08-15 | m1 | `b6d0c63` (fan-out fix `c091b46` **not** in the binary) | 2.2.0-pre+452c1a6c3 (go1.26.5) | mainnet, 1,100,392 blocks | Both daemons from one shared dcrd server, sequential, defaults, exists-address index verified on both: dcroxide 4,153 s — **265.0 blk/s** at 0.76 mean cores; dcrd 3,220.5 s — **341.7 blk/s** at 1.50. **1.29x**, not the 2.23x above. Arms ~12 h apart under unmatched loadavg (4.62 vs 2.45), n=1 — a bound, not a point estimate | this file, below |
+| 2026-08-15 (second) | m1 | `8b27d20` (fan-out fix included) | 2.2.0-pre+452c1a6c3 (go1.26.5) | mainnet, 1,100,392 blocks | Same shared server, arms back to back on a quiet box, page cache pre-warmed before each: dcroxide 4,821.4 s — **228.2 blk/s**; dcrd 3,200.8 s — **343.8 blk/s**. Ratio **1.51x**. dcrd reproduced to 0.6% across the two 2026-08-15 runs; dcroxide fell 14% under higher ambient (a browser active in its arm only). Both runs carried more ambient in the dcroxide arm, so **1.29x above remains the tighter upper bound** — this row is the D-state run's throughput, not a supersession | this file, below |
 
 ## Storage at tip
 
@@ -756,3 +757,92 @@ its tail. Two figures from the same run pointing opposite ways is the signal
 that one of them is not a property of the store: see the write-schedule rows
 below, where the entire consumed difference between two byte-identical-length
 files is sparse tail.
+
+## D-state decomposition (2026-08-15) — the commit-shape attribution, measured
+
+The 2026-08-15 daemon-against-daemon row left one thing unresolved: dcroxide
+averaged 4.62 load at 0.76 cores, and Linux counts uninterruptible tasks in
+the load average, so that gap was either other tenants on the box or the port
+blocking on its own storage. Only the second reading is evidence for the
+commit-shape attribution ADR-0004 has carried since 2026-07 on a
+progress-stall statistic. **This separates them, and the attribution survives
+— by a mechanism the hypothesis had wrong.**
+
+Both daemons syncing mainnet from one shared dcrd server, back to back on a
+quiet box (load 0.55 at launch), server chain pre-read into page cache before
+*each* arm, per-thread scheduler states sampled at 10 Hz and the whole task
+table walked at 1 Hz. dcroxide built at `8b27d20`, so unlike the earlier row
+the fan-out fix is included.
+
+**Mean tasks during block sync** (load average counts R + D):
+
+| arm | own R | own D | kernel thr | server | other userspace | loadavg |
+|---|---:|---:|---:|---:|---:|---:|
+| dcroxide | 0.77 | 0.38 | **1.64** | 0.08 | 1.72 | 5.54 |
+| dcrd | 1.86 | 0.12 | **0.14** | 0.10 | 1.23 | 2.62 |
+
+**The port's own threads are not the blocked ones.** At 0.38 they are far too
+few to explain the gap. What separates the two daemons is kernel-side storage
+work — 1.64 against 0.14, **11.7x** — overwhelmingly `dmcrypt_write` (1,002
+blocked samples against 23). Bucketing kernel threads separately is what makes
+this visible: charging them to "ambient", which is the obvious design, shows
+dcroxide's own D at 0.38, concludes "not self-inflicted", and is wrong.
+
+**It is the write shape, not the write volume:**
+
+| | wrote | rate | datadir | write amp | read | dm-crypt D per GiB |
+|---|---:|---:|---:|---:|---:|---:|
+| dcroxide | 331.29 GiB | 70.4 MiB/s | 31.58 GiB | 10.5x | 42.48 GiB | **3.0** |
+| dcrd | 382.64 GiB | 122.4 MiB/s | 23.69 GiB | 16.2x | 0.43 GiB | **0.1** |
+
+dcrd writes **1.16x more bytes at 1.74x the rate and blocks 30x less per
+GiB**. The LSM has the *higher* write amplification of the two and still costs
+less, because compaction is sequential and off the write path; the
+copy-on-write B-tree writes fewer bytes synchronously, one fsync per commit.
+dcroxide also reads **99x** more during ingest (42.48 GiB against 0.43) — the
+B-tree fetching pages in order to copy them.
+
+**The wait channels name the mechanism.** dcroxide's blocked threads park in
+`folio_wait_bit_common` (729 samples, page writeback), `handle_reserve_ticket`
+(113, btrfs metadata reservation), `wait_for_commit` (101, transaction commit)
+and `btrfs_btree_wait_writeback_range` (27). dcrd's park in
+`folio_wait_bit_common` (159) and `barrier_all_devices` (95).
+
+So ADR-0004's hypothesis — "goleveldb's LSM commit is O(dirty) with background
+compaction, while redb is a copy-on-write B-tree with no background work, so
+commit cost tracks the size of the tree" — is now measured rather than
+inferred from a stall statistic. **The correction to it is that the cost lands
+mostly outside the process**, in kernel writeback and dm-crypt, which is why
+every profiler pointed at the port's own threads has failed to find it.
+
+**Two instruments are blind to this workload, recorded so the next attempt
+skips them.** `/proc/stat`'s `procs_blocked` counts only tasks in
+`io_schedule()`: three threads in a write+fsync loop measured D=2.93 in a task
+walk against `procs_blocked` = 1.54, *lower than the target's own count*, so
+any "ambient = procs_blocked − target" residual goes negative. Delay
+accounting fails the same way and for the same reason — with
+`kernel.task_delayacct=1` confirmed live (O_DIRECT reads logged 4.44 s of
+blkio delay in 6 s wall), dcroxide's whole sync logged **0.000** blkio ticks
+per sample. btrfs fsync blocking is `TASK_UNINTERRUPTIBLE` and counted by the
+load average, but it is not block-device wait, so both cheap counters report
+nothing. Only a task-state walk sees it.
+
+**Throughput, and why it does not supersede the 1.29x row.** This run measured
+dcroxide 4,821 s (228.2 blk/s) against dcrd 3,201 s (343.8), a ratio of
+**1.51x**. dcrd reproduced to 0.6% across the two runs (343.8 against 341.7)
+while dcroxide fell 14% (265.0 to 228.2). The sampler is not the cause — it
+cost 0.06% of the box. The cause is in the data: ambient load was higher in
+every height band than the earlier run, with a browser active during the
+dcroxide arm (`ThreadPoolForeg`, 740 blocked samples against 10 in the dcrd
+arm). **Both runs carried more ambient during the dcroxide arm, so both ratios
+are upper bounds and 1.29x remains the tighter one.** The row above stands.
+
+**Caveats.** Thread-state counts are not strictly commensurable between a Rust
+thread-per-operation process and a Go runtime that parks an M and may start
+another, which is why the argument above rests on kernel-side and per-GiB
+evidence rather than on the own-thread comparison. Ambient was not matched
+between arms. n=1 per arm.
+
+Raw: `artifacts/dcroxide-bench/m1/dstate/` — `rox.jsonl`, `dcrd.jsonl` (34,083
+and 31,979 samples), `rox.log`, `dcrd.log`, `run.log`. Sampler and harness:
+`artifacts/dcroxide-bench/m1/dsample.py`, `dstate.sh`.

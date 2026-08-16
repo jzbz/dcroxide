@@ -191,7 +191,12 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   20 s, while dcrd stalled 0 times in 754 windows. The node is flush-bound
   under fast ingest, which is the leading explanation for the initial block
   download gap — re-measured 2026-08-15 at **1.29x**, superseding the ~2.2x
-  quoted through 2026-07 — but is not established as the dominant term: an
+  quoted through 2026-07. A task-state decomposition the same day measured the
+  mechanism: the port drives **11.7x** the kernel-side storage work dcrd does
+  (mostly dm-crypt writeback) and blocks **30x more per GiB written**, while
+  dcrd writes 1.16x more bytes at 1.74x the rate — so it is the write shape,
+  not the volume, and most of the cost is paid in kernel threads rather than
+  the port's own. Its share of sync wall time is still unquantified: an
   identical-engine `--addrindex` replay spent 863 s of 4,767 in flushes, 18%
   of wall time, and a replay validates every block where the daemon skips
   ~93% of it under assume-valid, so the fraction does not transfer. The

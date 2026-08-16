@@ -408,13 +408,27 @@ stalled zero times in 754 windows. goleveldb's LSM commit is O(dirty)
 with background compaction, while redb is a copy-on-write B-tree with
 no background work, so commit cost tracks the size of the tree.
 
-That attribution is still not established. A stall statistic records
-that progress halted, not what halted it, and no profile exists — an
-attempt on 2026-08-14 failed and is written up in the
-[bench ledger](docs/bench-ledger.md). The matched `--addrindex` replay
-spent 863 s of 4,767 in flushes, 18%, but a replay validates every
-block where the daemon skips roughly 93% of it under mainnet's
-assume-valid anchor, so that fraction does not transfer to a sync.
+**That attribution was measured on 2026-08-15 and holds** — by a
+mechanism the hypothesis had wrong. Sampling every thread's scheduler
+state through both syncs, dcroxide's *own* threads are barely blocked
+(0.38 tasks); what separates the daemons is kernel-side storage work,
+**1.64 tasks against dcrd's 0.14**, mostly dm-crypt writeback. It is
+the write shape rather than the volume: dcrd writes 1.16x more bytes at
+1.74x the rate and blocks 30x less per GiB, because LSM compaction is
+sequential and off the write path while a copy-on-write B-tree writes
+synchronously, one fsync per commit. dcroxide's blocked threads park in
+btrfs page-writeback, metadata-reservation and transaction-commit
+waits, and it reads 99x more than dcrd during ingest. Most of the cost
+lands outside the process, which is why profiling the port's own
+threads never found it.
+
+What is still not quantified is the *share* of IBD wall time this
+accounts for — so how much a different engine would buy remains open in
+both directions. The matched `--addrindex` replay spent 863 s of 4,767
+in flushes, 18%, but a replay validates every block where the daemon
+skips roughly 93% of it under mainnet's assume-valid anchor, so that
+fraction does not transfer to a sync. Full figures in the
+[bench ledger](docs/bench-ledger.md).
 
 At the tip the same chain cost 23.73 GiB under dcrd and 32.06 GiB
 under dcroxide, measured 2026-07 under redb 2.6.3. The 2026-08-15 pair

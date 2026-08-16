@@ -1269,3 +1269,70 @@ dcroxide's own threads in uninterruptible sleep on redb writes — the second
 would be direct evidence for the storage attribution this ADR has never been
 able to establish, and separating the two is the next measurement worth
 making.
+
+## Addendum, 2026-08-15 (second) — the commit-shape attribution, finally measured
+
+This ADR has claimed since 2026-07 that the IBD gap is the storage engine's
+commit shape rather than validation, on the strength of a progress-stall
+statistic — which records that progress halted, not what halted it. Every
+attempt to profile it failed, most recently on 2026-08-14. **The mechanism is
+now measured, and the claim holds. The hypothesis was wrong about where the
+cost lands, which is why the profilers kept missing it.**
+
+Both daemons syncing mainnet from one shared dcrd server, back to back on a
+quiet box, with per-thread scheduler states sampled at 10 Hz and the whole
+system's task table walked at 1 Hz. Mean tasks during block sync — the load
+average counts runnable *and* uninterruptible:
+
+| arm | own R | own D | kernel thr | server | other userspace | loadavg |
+|---|---:|---:|---:|---:|---:|---:|
+| dcroxide | 0.77 | 0.38 | **1.64** | 0.08 | 1.72 | 5.54 |
+| dcrd | 1.86 | 0.12 | **0.14** | 0.10 | 1.23 | 2.62 |
+
+**The port's own threads are not the blocked ones** — 0.38 is far too few to
+explain the gap. What separates the daemons is kernel-side storage work,
+**1.64 against 0.14, 11.7x**, overwhelmingly `dmcrypt_write` (1,002 blocked
+samples against 23). This is why profiling dcroxide's threads never found the
+cost: most of it is not in the process.
+
+**It is the write shape, not the write volume.** dcrd wrote **1.16x more
+bytes at 1.74x the rate** (382.64 GiB against 331.29, 122.4 MiB/s against
+70.4) and blocked **30x less per GiB** (0.1 dm-crypt-D samples per GiB against
+3.0). The LSM has the *higher* write amplification of the two — 16.2x against
+the B-tree's 10.5x — and still costs less, because compaction is sequential
+and off the write path, while the copy-on-write B-tree writes fewer bytes
+synchronously with one fsync per commit. dcroxide also reads **99x** more
+during ingest (42.48 GiB against 0.43): the B-tree fetching pages to copy
+them, a cost this ADR had not accounted for at all.
+
+**The wait channels name it.** dcroxide's blocked threads park in
+`folio_wait_bit_common` (page writeback), `handle_reserve_ticket` (btrfs
+metadata reservation), `wait_for_commit` (transaction commit) and
+`btrfs_btree_wait_writeback_range`. dcrd's park in `folio_wait_bit_common` and
+`barrier_all_devices`.
+
+So the sentence this ADR has carried — "goleveldb's LSM commit is O(dirty)
+with background compaction, while redb is a copy-on-write B-tree with no
+background work, so commit cost tracks the size of the tree" — is now
+evidence rather than inference. **Read it with the correction that the cost is
+largely paid outside the process**, in kernel writeback and dm-crypt.
+
+**What it does not settle.** It does not quantify what fraction of IBD wall
+time this accounts for, so ADR-0009's engine question keeps its open bound in
+both directions. It is n=1 per arm, ambient was not matched between arms, and
+thread-state counts are not strictly commensurable between a Rust
+thread-per-operation process and a Go runtime — which is why the argument
+rests on kernel-side and per-GiB figures rather than the own-thread
+comparison. The filesystem is btrfs on LUKS; how much of the dm-crypt term
+survives on a different stack is untested.
+
+**Two cheap instruments are blind to this and should not be reached for.**
+`/proc/stat`'s `procs_blocked` counts only tasks in `io_schedule()`: three
+threads in a write+fsync loop measure D=2.93 in a task walk while
+`procs_blocked` reads 1.54, *below the target's own count*. Delay accounting
+fails identically — with `kernel.task_delayacct=1` confirmed live against
+O_DIRECT reads, dcroxide's entire sync logged **zero** blkio ticks. btrfs
+fsync blocking is uninterruptible and counted by the load average, but it is
+not block-device wait. Only a task-state walk sees it.
+
+Full figures, caveats and raw paths in [bench-ledger.md](../bench-ledger.md).
