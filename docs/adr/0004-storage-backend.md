@@ -1326,13 +1326,22 @@ exactly as this ADR predicted: 1.3% below block 300,000, **50.9% above block
 counterfactual 346.9.
 
 > **Corrected 2026-08-16.** "The stall is the entire gap" and the ~1.5x prize
-> drawn from it are withdrawn. The 34.6% is real, but the sampler records
-> kernel wait channels rather than user stacks, so none of it is attributed to
-> `DbCache::flush`; 14–37% of it sits in one to two thousand sub-second events
-> no commit restructuring reaches; and the only direct flush measurement, over
-> a replay, is 8.0% of wall. What a background committer recovers is bounded
-> above by 34.6% and below by nothing until a daemon sync is run with the
-> flush observer on. See the correction in [bench-ledger.md](../bench-ledger.md).
+> drawn from it are withdrawn: the counterfactual removing only the commit
+> stall projects 373.7 blk/s, *faster than dcrd*, which shows the model is too
+> generous rather than the prize large. A flush is not pure blocking — median
+> 26.9 s, occupying 59% of wall — and a background committer relocates its CPU
+> half rather than removing it.
+>
+> **What survives, measured the same day by pairing the sampler with
+> dcroxide's own flush observer:** the metadata commit is **90–98% of the
+> fully-stalled time** on every weighting, and the stall is **48% of
+> block-sync wall time** once the sampler's own starvation is corrected for
+> (34.6% was a count-weighting artifact; both runs agree at 48–51% when
+> weighted by represented time). During a flush the process is stalled 40.9%
+> of the time at 0.55 cores; outside one, 3.2% at 1.38. So this ADR's
+> commit-shape attribution is confirmed at the call site, not merely at the
+> mechanism. Full figures and the method's two weaknesses in
+> [bench-ledger.md](../bench-ledger.md).
 
 **What it does not settle.** Whether the stall is *removable*. dcrd shows the
 work can be overlapped with compute; it does not show redb can overlap it. Two

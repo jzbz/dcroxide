@@ -202,11 +202,13 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   grows, and removing all of it would bring both implementations to the same
   ~346 blk/s. That supersedes the 18% derived from an identical-engine
   `--addrindex` replay (863 s of 4,767), which validates every block where the
-  daemon skips ~93% under assume-valid — but it is a ceiling on storage's
-  worth rather than a prize any one change collects: corrected 2026-08-16, the
-  stall is not attributed to a call site, 14–37% of it is in sub-second events
-  no commit restructuring reaches, and the only direct flush measurement is
-  8.0% of a replay's wall. The
+  daemon skips ~93% under assume-valid. Attributed 2026-08-16 by pairing the
+  sampler with dcroxide's own flush observer: **90–98% of the stalled time is
+  inside a metadata-flush window**, and the stall is **48% of wall** once the
+  sampler's own starvation is corrected (34.6% was a count-weighting
+  artifact). The counterfactual is not quotable as a prize — removing only the
+  commit stall projects a rate faster than dcrd's, so the model is too
+  generous. The
   free pages are copy-on-write churn and nothing more: an earlier note here
   suspected that `Database::begin` taking a redb read transaction for the life
   of every ffldb transaction (`lib.rs:386`) pinned them, since redb will not

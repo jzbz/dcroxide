@@ -978,3 +978,94 @@ the sampled stall over the same window. dcroxide already has the instrument;
 the D-state run simply did not turn it on. Until that exists, treat the share
 of IBD that a background committer can recover as bounded above by 34.6% and
 below by nothing.
+
+## Flush-observer attribution (2026-08-16) — the stall IS the commit, and 34.6% was a weighting artifact
+
+The correction above says the recoverable share is "bounded above by 34.6% and
+below by nothing" and names the experiment that would fix that: a daemon sync
+with dcroxide's own flush observer enabled. This is that run. **It attributes
+the stall, and it also finds that both of the figures either side of the
+argument were wrong.**
+
+Same harness as the D-state run — one shared dcrd server, page cache
+pre-warmed, quiet box (load 1.14 at launch) — with `DCROXIDE_DB_FLUSHLOG`
+recording every metadata flush's end instant and duration, and the sampler now
+stamping absolute time so the two can be aligned. Stats sampling deliberately
+left off: redb's `stats()` cost 442.5 s against the flushes' own 260.9 s in the
+replay, and would have swamped the quantity being measured.
+
+**1,100,392 blocks in 4,741 s (232.1 blk/s), 130 flushes.** The D-state run
+managed 228.2, so the two agree to 1.7%.
+
+### The attribution, which is what the run was for
+
+| gap treatment | stall, % of wall | **of that stall, inside a flush** | commit, % of wall |
+|---|---:|---:|---:|
+| count-weighted | 18.7% | **89.8%** | 16.8% |
+| 0.2 s cap | 21.4% | **91.4%** | 19.6% |
+| 1 s cap | 32.3% | **95.3%** | 30.8% |
+| 2 s cap | 39.2% | **96.6%** | 37.9% |
+| gaps fully attributed | 48.1% | **97.8%** | 47.0% |
+
+**The size of the stall depends on weighting; the attribution does not.**
+Between 90% and 98% of the time the node spends fully stalled falls inside a
+metadata-flush window, on every treatment. Corroborated without any weighting
+at all: during a flush window the process is fully stalled 40.9% of the time
+and runs at 0.55 cores; outside one it is stalled 3.2% and runs at 1.38.
+
+So **the 2026-08-15 attribution was substantially right and the 2026-08-16
+correction over-withdrew it.** The sub-second events that correction worried
+about are real and are 2–10% of the stall, not the third to a half it
+suggested. That correction was written from a review summary that had not been
+checked against the data; the same species of error it was correcting.
+
+### 34.6% was a count-weighting artifact
+
+The sampler is starved during exactly the periods it measures — median
+interval 100 ms, but gaps to 9 s, and those gaps sit inside stalls. Counting
+samples therefore under-weights the stalled time. Weighting each sample by the
+interval it represents:
+
+| run | count-weighted | gaps fully attributed |
+|---|---:|---:|
+| D-state (2026-08-15, browser active) | 34.6% | **51.1%** |
+| flush observer (2026-08-16, quiet box) | 18.6% | **48.1%** |
+
+**The two runs agree at 48–51%.** Count-weighted they read 34.6% and 18.6%,
+and the apparent halving between them — which looked like ambient load — is
+the instrument, not the node. Quote the time-weighted figure, and quote it as
+a band: the gap-cap column is the honest uncertainty, not a number to pick
+from.
+
+### The counterfactual is too generous to quote
+
+Removing only the commit stall projects **373.7 blk/s — faster than dcrd's
+343.8.** A counterfactual that beats the reference implementation is evidence
+the model is wrong, not that the prize is large. It assumes the stalled time
+*vanishes*, when a flush is not pure blocking: median flush **26.9 s** (mean
+24.4, max 79.5, 61 of 130 over 30 s), windows occupying 59.4% of wall, and the
+process stalled for only part of that. The rest is CPU work building the
+transaction, which a background committer **relocates rather than removes** —
+it can overlap with validation on another core, but it still has to happen.
+
+So: what a background committer can recover is the stalled fraction, 48% of
+wall at the upper end, *minus* whatever cannot overlap. The honest statement is
+that it is large and worth pursuing, and that no arithmetic here yields a
+defensible multiplier.
+
+### Two weaknesses in the method, recorded rather than buried
+
+- **Attribution is by time overlap, not by stack.** A reader blocked on the
+  cache mutex while a flush runs is counted as flush-attributed. That is the
+  right accounting for "would moving the commit off the critical path help",
+  and it is not a profile. A thread blocked on a block-file write *inside* a
+  flush window is also counted to the flush.
+- **The sampler's starvation is correlated with the signal**, which is why the
+  stall figure moves 18.7% → 48.1% across gap treatments. The gap-cap column
+  exists to expose that rather than hide it behind a point estimate. A sampler
+  that could not be starved — sampling from inside the process, or a fixed
+  wall-clock schedule that records its own misses — would close it.
+
+Raw: `artifacts/dcroxide-bench/m1/flushobs/` — `rox.jsonl` (26,391 samples),
+`flush.jsonl` (130 records), `rox.log`, `run.log`. Harness `flushobs.sh`,
+sampler `dsample.py`.

@@ -433,6 +433,22 @@ sold on IBD.
 > with the flush observer enabled — has not been run. See the 2026-08-16
 > correction in [bench-ledger.md](../bench-ledger.md).
 >
+> **That experiment has now been run, and it restores most of what this block
+> withdrew.** Pairing the sampler with dcroxide's own flush observer,
+> **90–98% of the fully-stalled time falls inside a metadata-flush window** on
+> every weighting — during a flush the process is stalled 40.9% of the time at
+> 0.55 cores, outside one 3.2% at 1.38. The sub-second events this correction
+> leaned on are 2–10% of the stall, not a third of it. The attribution stands.
+>
+> Two figures either side of it were nonetheless wrong. **34.6% was a
+> count-weighting artifact**: the sampler is starved during the stalls it
+> measures, and weighting by represented time puts both runs at **48–51%**.
+> And the counterfactual **over**shoots — removing only the commit stall
+> projects 373.7 blk/s against dcrd's 343.8, which is evidence the model is
+> too generous rather than that the prize is large, because a flush is not
+> pure blocking (median 26.9 s, occupying 59% of wall) and a background
+> committer relocates its CPU half rather than removing it.
+>
 > **What this does not license.** The counterfactual assumes the stall is
 > removable, and dcrd demonstrates only that the work *can* be overlapped, not
 > that redb can overlap it. Two or more of dcroxide's threads are blocked
@@ -444,11 +460,20 @@ sold on IBD.
 > So "an engine swap cannot be sold on IBD" is withdrawn as stated — but with
 > the 2026-08-16 correction, what replaces it is weaker still: the 18%/1.22x
 > bound is gone, and nothing sound has taken its place. A storage rework
-> *might* be sellable on IBD, on a ceiling of 34.6% that no measurement yet
-> divides between the metadata commit, the block-file writes, and ambient
-> writeback. **This ADR should not be resolved in either direction until the
-> daemon has been synced with its own flush observer enabled** — the one
-> cheap experiment that would turn the ceiling into a share.
+> *might* be sellable on IBD, on a ceiling that at the time no measurement
+> divided between the metadata commit, the block-file writes, and ambient
+> writeback.
+>
+> **The 2026-08-16 flush-observer run divides it: the metadata commit is
+> 90–98% of the stall, and the stall is 48% of block-sync wall time.** That is
+> a real and large prize, and it is the commit specifically rather than
+> storage in general — so the rework this ADR contemplates has a target. What
+> it still does not supply is a multiplier: the only counterfactual available
+> projects a rate *faster than dcrd*, which shows the model is too generous
+> rather than the prize enormous. Decide the rework on the 48%/90-98%
+> attribution, not on a speedup figure, and note that the attribution points
+> at the commit's **structure** — one synchronous fsync on the critical path —
+> at least as much as at the engine underneath it.
 
 1. **Lever (d) on `spendjournalv3`.** ~~Prerequisite~~ **Measured**, by
    `redbstat --buckets`: the bucket holds a 2402-byte mean row against a

@@ -431,19 +431,26 @@ completely stopped. Removing *all* of that stall would move dcroxide to
 346.6 blk/s and dcrd to 346.9 — they converge, which bounds how much
 storage can be worth here.
 
-**Read that as a ceiling, not a prize.** The sampler records kernel
-wait channels rather than user stacks, so the stall is not attributed
-to any particular call site — an earlier draft of this section said
-"the stall is the whole gap", and that inference is withdrawn.
-Roughly 14–37% of it sits in one to two thousand sub-second events that
-no commit restructuring reaches, and the one direct measurement of
-flush cost, over a full replay, is 8.0% of wall. Nor is it settled that
-the stall is *removable*: dcrd shows the work can be overlapped, not
-that redb can overlap it. Two or more dcroxide threads block at once in
-only 0.2% of samples, so its storage path is serialized — implicating a
-synchronous fsync on the critical path as much as the engine choice.
-Full figures
-in the [bench ledger](docs/bench-ledger.md).
+**The stall is the metadata commit.** Pairing that sampler with
+dcroxide's own flush observer on 2026-08-16, **90–98% of the
+fully-stalled time falls inside a flush window** on every weighting:
+during a flush the process is stalled 40.9% of the time at 0.55 cores,
+outside one 3.2% at 1.38. Two figures around it needed correcting
+though. **34.6% was a count-weighting artifact** — the sampler is
+starved during the very stalls it measures, and weighting each sample
+by the time it represents puts both runs at **48–51%**. And the
+counterfactual above **overshoots**: removing only the commit stall
+projects 373.7 blk/s, faster than dcrd, which shows the model is too
+generous rather than the prize enormous. A flush is not pure blocking
+(median 26.9 s, occupying 59% of wall), and moving it to a background
+thread relocates its CPU half rather than removing it.
+
+Nor is it settled that the stall is *removable*: dcrd shows the work
+can be overlapped, not that redb can overlap it. Two or more dcroxide
+threads block at once in only 0.2% of samples, so its storage path is
+serialized — implicating a synchronous fsync on the critical path as
+much as the engine choice. Full figures, and the two weaknesses in the
+method, in the [bench ledger](docs/bench-ledger.md).
 
 At the tip the same chain cost 23.73 GiB under dcrd and 32.06 GiB
 under dcroxide, measured 2026-07 under redb 2.6.3. The 2026-08-15 pair

@@ -124,14 +124,15 @@ What Phase 15 has covered so far:
   kernel writeback rather than the port's own threads. **Its share of wall
   time: the port is fully stalled on storage for 34.6% of block sync against
   dcrd's 0.9%, and 50.9% above block 900,000; removing all of it would bring
-  both to the same ~346 blk/s.** That is a ceiling on what storage is worth,
-  not a prize: corrected 2026-08-16, the stall is not attributed to a call
-  site (the sampler records kernel wait channels, not user stacks), 14–37% of
-  it is in sub-second events no commit restructuring reaches, and the only
-  direct flush measurement is 8.0% of a replay's wall. Whether it is even
-  removable is open — dcroxide's storage path is serialized (two threads block
-  at once in 0.2% of samples), implicating synchronous commit as much as the
-  engine. Chain on disk at tip: dcrd 23.69 GiB,
+  both to the same ~346 blk/s.** Attributed 2026-08-16 with dcroxide's own
+  flush observer: **90–98% of the stalled time is inside a metadata-flush
+  window**, and the stall is **48% of wall** once the sampler's starvation is
+  corrected for (34.6% was a count-weighting artifact; both runs agree at
+  48–51% time-weighted). No multiplier is quotable — the counterfactual
+  projects a rate faster than dcrd's, so it is too generous. Whether the stall
+  is even removable is open — dcroxide's storage path is serialized (two
+  threads block at once in 0.2% of samples), implicating synchronous commit as
+  much as the engine. Chain on disk at tip: dcrd 23.69 GiB,
   dcroxide 33.58 GiB — identical consensus block bytes, the difference is
   metadata.
 - **Security-blocker campaign.** The release blockers, highs, and mediums from

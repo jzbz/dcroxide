@@ -154,11 +154,14 @@ direction. The 1.22x that once argued it could not be sold on IBD rested on
 the replay's 18%; measured on the daemon, dcroxide is fully stalled on storage
 for **34.6%** of block-sync wall time against dcrd's 0.9%, and removing that
 brings both to the same ~346 blk/s. That convergence is an upper bound on all
-storage stall rather than a prize one change collects: corrected 2026-08-16,
-the stall is not attributed to a call site (the sampler records wait channels,
-not user stacks), 14–37% of it is in sub-second events no commit
-restructuring reaches, and the only direct flush measurement is 8.0% of a
-replay's wall. Whether it clears the 1.5x stop rule is therefore unsettled.
+storage stall rather than a prize one change collects. Attributed 2026-08-16
+with the flush observer, 90–98% of the stalled time is inside a metadata-flush
+window, and the stall is 48% of wall once the sampler's own starvation is
+corrected (34.6% was a count-weighting artifact). But no multiplier follows:
+the counterfactual projects a rate faster than dcrd's, which means the model
+over-credits it. Whether the 1.5x stop rule is cleared remains unsettled —
+though the target is now specific, and it is the commit rather than storage
+at large.
 
 Also open is the *form* a rework would take: two or more of the port's
 threads block simultaneously in 0.2% of samples, so the storage path is

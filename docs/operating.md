@@ -100,10 +100,13 @@ byte — so the extra space is how redb lays those bytes out, not extra data
 dcroxide keeps. Block files match to within a mebibyte. The **time**
 difference is commit shape, and as of 2026-08-15 that is measured rather
 than attributed: the node is fully stalled on storage — nothing runnable at
-all — for **34.6% of block-sync wall time**, against dcrd's 0.9%, and
-removing all of it would bring both to the same ~346 blk/s. Which part of
-that is recoverable is not settled: the measurement locates the stall in
-storage waits but not in any particular call site. The earlier 18%
+all — for **48% of block-sync wall time**, against dcrd's 0.9%. A
+2026-08-16 run with the flush observer enabled puts **90–98% of that inside
+a metadata-flush window**, so it is the commit specifically rather than
+storage in general. (An earlier figure of 34.6% for the same runs was
+count-weighted; the sampler is starved during the stalls it measures, and
+weighting by represented time raises it to 48–51%.) How much of it is
+*recoverable* is still open — a flush is not pure blocking. The earlier 18%
 figure came from a replay, which validates every block where a syncing
 daemon skips ~93% under assume-valid, so it understated the daemon's share.
 
@@ -152,14 +155,14 @@ not be pulled. `DCROXIDE_DB_OVERLAY` sets the ceiling in MiB and
 compiled defaults, so an untouched node behaves exactly as before.
 
 These are untuned: no value has been measured yet, which is why no
-recommendation appears here. What motivates exposing them is the 2026-08-15
-measurement that the node is *fully stalled* — nothing runnable at all — for
-**34.6% of block-sync wall time**. Most of that time — 63–86% depending on
-how episodes are counted — is in multi-second events, which is the shape a
-large durable commit makes, though nothing yet attributes it to one; the
-remainder is in one to two thousand sub-second events that cadence tuning
-would not reach. `--utxocachemaxsize` is the trigger with a measured 12%;
-whether the overlay's ceiling has comparable headroom is exactly the open
+recommendation appears here. What motivates exposing them is that the node is
+*fully stalled* — nothing runnable at all — for **48% of block-sync wall
+time**, and the 2026-08-16 flush-observer run places **90–98% of that inside a
+metadata-flush window**. Flushes are large: median **26.9 s**, longest 79.5 s,
+130 of them over a full sync. Cadence decides how many of those there are and
+how big each is, which is precisely what these two knobs and
+`--utxocachemaxsize` control. `--utxocachemaxsize` is the trigger with a
+measured 12%; whether the overlay's ceiling has comparable headroom is the open
 question these knobs make testable.
 Treat them as instruments, not as advice, and pair a raised value with the
 supervisor above — as with the UTXO cache, a larger overlay means more of the
@@ -190,14 +193,19 @@ configuration, every name changes.
 | metadata page cache | `DCROXIDE_DB_CACHE` (MiB, default 1024) | — |
 | metadata overlay flush size | `DCROXIDE_DB_OVERLAY` (MiB, default 100) | — |
 | metadata overlay flush interval | `DCROXIDE_DB_FLUSH_SECS` (s, default 300) | — |
+| metadata flush log (JSONL path) | `DCROXIDE_DB_FLUSHLOG` (unset = off) | — |
 
-Those five environment variables are the only ones read; only the first
-two have dcrd counterparts, since the page cache and the overlay are
-properties of redb, which dcrd does not use. Of the three storage
-variables, `DCROXIDE_DB_CACHE` is the one to leave unset and the other
-two are untuned instruments — see the storage tuning above. A malformed
-or zero value in any of the three warns and falls back to the default
-rather than refusing to start, since they are tuning hints. Everything
+Those six environment variables are the only ones read; only the first
+two have dcrd counterparts, since the page cache, the overlay and the
+flush log are properties of redb, which dcrd does not use. Of the four
+storage variables, `DCROXIDE_DB_CACHE` is the one to leave unset, the
+next two are untuned instruments — see the storage tuning above — and
+`DCROXIDE_DB_FLUSHLOG` is diagnostic: it appends one JSON object per
+metadata flush (sequence, end instant, duration, entries, bytes), which
+is how the 90–98% attribution above was measured. Leave it unset in
+normal operation; it writes a line inside each flush. A malformed or
+zero value in any of the tuning variables warns and falls back to the
+default rather than refusing to start, since they are hints. Everything
 else is a command-line flag or a `dcroxide.conf` entry, and the flag set
 is a verbatim port of dcrd's — same names, same semantics, same help
 text.

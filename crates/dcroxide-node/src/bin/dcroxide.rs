@@ -1300,6 +1300,65 @@ fn apply_overlay_tuning(opts: &mut Options) {
     }
 }
 
+/// Record every metadata flush to the JSONL path in
+/// `DCROXIDE_DB_FLUSHLOG`, when one is set.
+///
+/// Exists to settle what the 2026-08-15 D-state measurement could not.
+/// That run found the node fully stalled for 34.6% of block-sync wall
+/// time, but the sampler reads kernel wait channels rather than user
+/// stacks, so it cannot say whether a stalled thread is inside the
+/// metadata commit or writing a block file. The observer knows exactly,
+/// and pairing its windows against the sampler's timestamps attributes
+/// the stall directly instead of by inference.
+///
+/// One line per flush: the sequence, the wall-clock instant the flush
+/// ENDED, and its duration. The observer fires after the commit, so
+/// `end - elapsed` reconstructs the window it occupied.
+///
+/// Stats sampling is deliberately left off (`flush_stats_every` stays
+/// 0). redb's `stats()` walks every branch and leaf page, which on a
+/// chain-sized tree cost 442.5 s against the flushes' own 260.9 s in the
+/// replay that motivated this — enabling it here would swamp the
+/// quantity being measured.
+fn flush_log_observer() -> Option<dcroxide_database::FlushObserver> {
+    let path = std::env::var("DCROXIDE_DB_FLUSHLOG").ok()?;
+    let file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            log_warn(&format!(
+                "DCROXIDE_DB_FLUSHLOG={path} is not writable ({e}); not logging"
+            ));
+            return None;
+        }
+    };
+    log_info(&format!("Logging metadata flushes to {path}"));
+    let sink = std::sync::Mutex::new(std::io::BufWriter::new(file));
+    Some(std::sync::Arc::new(
+        move |obs: &dcroxide_database::FlushObservation| {
+            use std::io::Write as _;
+            let end = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            // A few hundred bytes per flush, and a full mainnet sync makes
+            // only a few hundred of them, so the write is far below the
+            // seconds-long commit it describes.
+            if let Ok(mut out) = sink.lock() {
+                let _ = writeln!(
+                    out,
+                    "{{\"seq\":{},\"end\":{:.3},\"elapsed_ms\":{:.3},\"entries\":{},\"bytes\":{}}}",
+                    obs.sequence,
+                    end,
+                    obs.elapsed.as_secs_f64() * 1000.0,
+                    obs.dirty_entries,
+                    obs.dirty_bytes
+                );
+                let _ = out.flush();
+            }
+        },
+    ))
+}
+
 /// the enabled indexes.
 fn open_block_db(cfg: &Config) -> Result<Database, String> {
     let params = &cfg.params.params;
@@ -1307,6 +1366,7 @@ fn open_block_db(cfg: &Config) -> Result<Database, String> {
     let mut opts = Options::new(&db_path, params.net.0);
     opts.db_cache_bytes = db_cache_bytes();
     apply_overlay_tuning(&mut opts);
+    opts.flush_observer = flush_log_observer();
 
     // Open the existing database, creating it when it does not yet
     // exist (dcrd's `database.Open` then `database.Create` fallback).
