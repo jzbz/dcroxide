@@ -98,14 +98,17 @@ The two have different explanations, and only one of them is settled. The
 same chain at the same index composition — fifteen buckets equal to the
 byte — so the extra space is how redb lays those bytes out, not extra data
 dcroxide keeps. Block files match to within a mebibyte. The **time**
-difference is attributed to commit shape but not yet demonstrated to be
-dominated by it; storage accounts for 18% of a full replay's wall time, so
-something outside the storage path is the larger term.
+difference is commit shape, and as of 2026-08-15 that is measured rather
+than attributed: the node is fully stalled on storage — nothing runnable at
+all — for **34.6% of block-sync wall time**, against dcrd's 0.9%, and
+removing that stall brings both to the same ~346 blk/s. The earlier 18%
+figure came from a replay, which validates every block where a syncing
+daemon skips ~93% under assume-valid, so it understated the daemon's share.
 
-## Storage tuning: one knob helps, one hurts
+## Storage tuning: one knob helps, one hurts, two are untested
 
-Two settings change how the metadata store behaves. Both have been measured
-over full mainnet replays; the numbers are in
+Four settings change how the metadata store behaves. The first two have been
+measured over full mainnet replays and the last two have not; the numbers are in
 [bench-ledger.md](bench-ledger.md) and the reasoning in
 [ADR-0004](adr/0004-storage-backend.md).
 
@@ -137,7 +140,27 @@ indistinguishable from the 1024 MiB default, with ranges overlapping it.
 The default is the right value — the only thing that matters is not raising
 it, so leave the variable unset.
 
-**Neither knob changes how densely the store packs.** Page fill sits at
+**`DCROXIDE_DB_OVERLAY` and `DCROXIDE_DB_FLUSH_SECS` reach the other flush
+trigger.** Connecting a block forces a durable commit when *either* the UTXO
+cache fills or the metadata overlay does — and until now only the first was
+reachable. The overlay has its own ceiling, 100 MiB, and its own interval,
+300 seconds; both were fixed at compile time, so half the cadence lever could
+not be pulled. `DCROXIDE_DB_OVERLAY` sets the ceiling in MiB and
+`DCROXIDE_DB_FLUSH_SECS` the interval in seconds. Unset, both keep the
+compiled defaults, so an untouched node behaves exactly as before.
+
+These are untuned: no value has been measured yet, which is why no
+recommendation appears here. What motivates exposing them is the 2026-08-15
+measurement that the node is *fully stalled* — nothing runnable at all — for
+**34.6% of block-sync wall time**, and that the time goes to a small number
+of very large durable commits rather than many small ones. `--utxocachemaxsize`
+is the trigger with a measured 12%; whether the overlay's ceiling has
+comparable headroom is exactly the open question these knobs make testable.
+Treat them as instruments, not as advice, and pair a raised value with the
+supervisor above — as with the UTXO cache, a larger overlay means more of the
+recent window replays after an unclean stop.
+
+**Neither page-cache knob changes how densely the store packs.** Page fill sits at
 0.62-0.65 regardless of either setting, so neither shrinks the data
 directory. They are throughput settings. The size gap against dcrd is
 settled in cause — the engine's page layout, not extra data dcroxide keeps
@@ -160,13 +183,19 @@ configuration, every name changes.
 | data directory override | `--appdata`, `DCROXIDE_APPDATA` | `DCRD_APPDATA` |
 | extra TLS DNS names | `DCROXIDE_ALT_DNSNAMES` | `DCRD_ALT_DNSNAMES` |
 | metadata page cache | `DCROXIDE_DB_CACHE` (MiB, default 1024) | — |
+| metadata overlay flush size | `DCROXIDE_DB_OVERLAY` (MiB, default 100) | — |
+| metadata overlay flush interval | `DCROXIDE_DB_FLUSH_SECS` (s, default 300) | — |
 
-Those three environment variables are the only ones read; only the first
-two have dcrd counterparts, since the page cache is a property of redb,
-which dcrd does not use, and it is the one to leave unset — see the
-storage tuning above. Everything else is a command-line flag or a
-`dcroxide.conf` entry, and the flag set is a verbatim port of dcrd's —
-same names, same semantics, same help text.
+Those five environment variables are the only ones read; only the first
+two have dcrd counterparts, since the page cache and the overlay are
+properties of redb, which dcrd does not use. Of the three storage
+variables, `DCROXIDE_DB_CACHE` is the one to leave unset and the other
+two are untuned instruments — see the storage tuning above. A malformed
+or zero value in any of the three warns and falls back to the default
+rather than refusing to start, since they are tuning hints. Everything
+else is a command-line flag or a `dcroxide.conf` entry, and the flag set
+is a verbatim port of dcrd's — same names, same semantics, same help
+text.
 
 The daemon generates `rpc.cert` and `rpc.key` in the data directory on
 first start if they are absent, owner-readable only. Back up or replace

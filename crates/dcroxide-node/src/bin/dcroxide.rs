@@ -1236,12 +1236,77 @@ fn db_cache_bytes() -> usize {
     }
 }
 
+/// A positive whole number from `var`, or `None` when it is unset,
+/// malformed, or zero.
+///
+/// Shared by the overlay knobs below, which follow `DCROXIDE_DB_CACHE`'s
+/// policy: a bad value warns and falls back rather than being fatal,
+/// because these are tuning hints and refusing to start over a malformed
+/// one would be a worse failure than running with the default.
+fn env_tuning_u64(var: &str, unit: &str) -> Option<u64> {
+    let raw = std::env::var(var).ok()?;
+    let trimmed = raw.trim();
+    match trimmed.parse::<u64>() {
+        Ok(value) if value > 0 => Some(value),
+        _ => {
+            log_warn(&format!(
+                "{var}={trimmed} is not a positive whole number of {unit}; using the default"
+            ));
+            None
+        }
+    }
+}
+
+/// Apply the metadata overlay's size and time flush triggers from
+/// `DCROXIDE_DB_OVERLAY` (MiB) and `DCROXIDE_DB_FLUSH_SECS` (seconds).
+///
+/// These are the second of the two flush triggers, and until now the
+/// unreachable one. Connecting a block flushes the UTXO cache when it
+/// fills, and `--utxocachemaxsize` governs that; the overlay has its own
+/// independent ceiling (100 MiB) and interval (300 s) that no flag or
+/// variable reached, so half the cadence lever was fixed at compile time.
+///
+/// Cadence is the half that pays. `--utxocachemaxsize` alone measured
+/// **12% faster** over a full chain at 1200 MiB and 7% at 600 MiB, three
+/// repetitions each with ranges disjoint from the baseline's — the only
+/// defensible IBD gain any tuning has produced. What makes the overlay
+/// worth reaching is the 2026-08-15 measurement: the node is *fully
+/// stalled*, with nothing runnable, for 34.6% of block-sync wall time,
+/// and that time is spent in a small number of very large durable
+/// commits rather than many small ones. Both triggers force such a
+/// commit, so leaving one of them unreachable caps what cadence tuning
+/// can be asked to do.
+///
+/// Environment variables rather than flags, for `DCROXIDE_DB_CACHE`'s
+/// reason: dcrd has no counterpart, and the generated `-h` output is
+/// pinned byte-for-byte against dcrd's.
+///
+/// Unset leaves the compiled defaults exactly as they were, so an
+/// untouched node behaves identically. Raising either means more work
+/// redone after an unclean stop — the flush ordering holds and nothing
+/// is corrupted, but more of the recent window replays.
+fn apply_overlay_tuning(opts: &mut Options) {
+    if let Some(mib) = env_tuning_u64("DCROXIDE_DB_OVERLAY", "MiB") {
+        opts.cache_max_size = mib.saturating_mul(1024 * 1024);
+        log_info(&format!(
+            "Metadata overlay flush size set to {mib} MiB by DCROXIDE_DB_OVERLAY"
+        ));
+    }
+    if let Some(secs) = env_tuning_u64("DCROXIDE_DB_FLUSH_SECS", "seconds") {
+        opts.cache_flush_interval_secs = secs;
+        log_info(&format!(
+            "Metadata overlay flush interval set to {secs} s by DCROXIDE_DB_FLUSH_SECS"
+        ));
+    }
+}
+
 /// the enabled indexes.
 fn open_block_db(cfg: &Config) -> Result<Database, String> {
     let params = &cfg.params.params;
     let db_path = Path::new(&cfg.data_dir).join(format!("blocks_{}", cfg.db_type));
     let mut opts = Options::new(&db_path, params.net.0);
     opts.db_cache_bytes = db_cache_bytes();
+    apply_overlay_tuning(&mut opts);
 
     // Open the existing database, creating it when it does not yet
     // exist (dcrd's `database.Open` then `database.Create` fallback).
