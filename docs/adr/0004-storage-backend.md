@@ -1284,7 +1284,7 @@ quiet box, with per-thread scheduler states sampled at 10 Hz and the whole
 system's task table walked at 1 Hz. Mean tasks during block sync — the load
 average counts runnable *and* uninterruptible:
 
-| arm | own R | own D | kernel thr | server | other userspace | loadavg |
+| arm | own R | own D | kernel threads | server | other userspace | loadavg |
 |---|---:|---:|---:|---:|---:|---:|
 | dcroxide | 0.77 | 0.38 | **1.64** | 0.08 | 1.72 | 5.54 |
 | dcrd | 1.86 | 0.12 | **0.14** | 0.10 | 1.23 | 2.62 |
