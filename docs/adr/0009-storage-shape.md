@@ -275,13 +275,27 @@ written wider than a kill test, and the wider half fails:
 > presents a consistent view of a chain state that silently rolled back by
 > hundreds of generations.
 >
-> **So gate C's status is now a judgement rather than a missing measurement.**
-> fjall wins on size, on write shape, and survives power loss; a single
-> corrupted journal record silently discards every commit after it. Whether
-> that disqualifies it depends on operational context — a node that re-syncs
-> from peers can recover from silent truncation *if it notices* — and that is
-> the project owner's call. What is no longer true is that the gate is blocked
-> for want of an instrument.
+> **The "if it notices" question is answered: it would not, and the damage is
+> worse than a rollback.** `reconcileDB` compares the block-file cursor
+> against the block files and nothing else, so a metadata store that rolled
+> *backward* takes its silent branch — the files are truncated to match and
+> the node starts, indistinguishable from an unclean shutdown. And the
+> rollback is not necessarily a clean prefix: corrupting the journal at five
+> points, **three left rows the state marker does not account for**, because
+> rows and markers sit in different fjall keyspaces whose memtables flush on
+> independent schedules. UTXO rows past the recorded state are phantom
+> spendable outputs, and the daemon's startup path does not check the marker
+> against them — only `crash.rs` does.
+>
+> **Two experiments decide the verdict, and neither is expensive.** The
+> tearing is cross-keyspace, and dcroxide keeps its whole ffldb keyspace in
+> one redb table: a fjall port using a **single keyspace** would have one
+> memtable and one flush schedule, and truncation should then be a clean
+> prefix that a re-sync recovers. Untested, and it is the difference between
+> #311 disqualifying fjall and merely constraining how a fjall backend is laid
+> out. Separately, a **startup check that the state markers agree with the
+> rows they name** — which `crash.rs` implements and the daemon does not —
+> would catch this class of damage whatever engine produced it.
 
 - **The default is not durable.** `Database::batch()` hands back
   `PersistMode::Buffer`, which returns `Ok` with no fsync. The arms here

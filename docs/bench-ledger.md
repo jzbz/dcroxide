@@ -1416,3 +1416,65 @@ disqualifying is a judgement about operational context (a node that
 re-syncs from peers can recover from silent truncation if it *notices*),
 and it is the project owner's call, not a measurement. What is no longer
 true is that gate C is blocked for want of an instrument.
+
+### Would `reconcileDB` notice a #311 truncation? No — and the state can be torn (2026-08-17)
+
+The entry above leaves #311's severity as a judgement about whether a
+re-syncing node would notice a silent rollback. It would not, and the rollback
+is worse than a rollback.
+
+**`reconcileDB` takes the silent branch.** Its comparison is block-file cursor
+against block-file contents (`lib.rs:843-857`):
+
+```
+if stored > scanned { return Err(Corruption) }        // metadata AHEAD  — loud
+if stored < scanned { block_store.rollback_to(...) }  // metadata BEHIND — silent
+```
+
+A journal truncation rolls the metadata *backward*, so it lands on the second
+branch: the block files are quietly truncated back to what the metadata knows
+and the node starts. That is the correct handling of an unclean shutdown, and
+it is indistinguishable from one. Nothing at database open compares the state
+markers against the rows they name.
+
+**And the rollback is not necessarily a clean prefix.** Corrupting 64 bytes at
+five points inside the journal's written extent, with rows and both markers
+committed in one batch:
+
+| corruption point | result |
+|---|---|
+| 25% | **TORN** — 100 rows visible past the marker |
+| 40% | **TORN** |
+| 55% | **TORN** |
+| 70% | clean prefix |
+| 85% | clean prefix |
+
+**Three of five leave rows the marker does not account for** — the desync
+`Chain::flush` pairs its writes to forbid. The batch *was* atomic when it
+committed; recovery breaks it afterwards.
+
+**The mechanism is cross-keyspace flushing.** Rows and markers live in
+separate fjall keyspaces, each with its own memtable and flush schedule.
+Truncating the journal drops records, but whatever already reached an SSTable
+survives — so if the rows keyspace had flushed generation G+1 and the markers
+keyspace had not, the rows persist while the marker naming them does not.
+
+**Why this is consensus-relevant and not merely wasteful.** UTXO rows past the
+recorded state are not lost data, they are phantom spendable outputs. The
+paired markers exist precisely so that cannot happen, `crash.rs` asserts it in
+both directions, and **the daemon's startup path does not check it** —
+`reconcileDB` validates the block-file cursor and nothing else.
+
+**The open experiment, which could change the verdict.** The tearing is
+cross-keyspace, and dcroxide keeps its entire ffldb keyspace in **one** redb
+table. A fjall port using a single keyspace would have one memtable and one
+flush schedule, and truncation should then be a clean prefix — recoverable by
+re-sync, exactly the documented crash contract. That is untested. It is the
+cheapest remaining experiment on this thread and it decides whether #311 is
+disqualifying or merely a constraint on how a fjall backend must be laid out.
+
+**A second one worth running regardless of engine:** a startup check that the
+state markers agree with the rows they name, which `crash.rs` already
+implements and the daemon does not. It would catch this class of damage
+whatever produced it, and it is cheap against a store that already reads both
+markers at open.
