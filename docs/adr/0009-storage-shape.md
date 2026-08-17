@@ -257,7 +257,7 @@ written wider than a kill test, and the wider half fails:
 > without persisting.
 >
 > **Power loss, tested the same day with the shim that was missing.** An
-> `LD_PRELOAD` undo-log shim (`artifacts/dcroxide-tools/powerloss/`) makes the
+> `LD_PRELOAD` undo-log shim ([`tools/powerloss/`](../../tools/powerloss/)) makes the
 > primitive engine-independent by working at the libc boundary. Validated
 > against a known case — an unsynced overwrite and an unsynced extension are
 > both undone while the synced state survives — and then pointed at fjall:

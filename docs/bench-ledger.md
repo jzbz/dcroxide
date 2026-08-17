@@ -845,7 +845,8 @@ between arms. n=1 per arm.
 
 Raw: `artifacts/dcroxide-bench/m1/dstate/` — `rox.jsonl`, `dcrd.jsonl` (34,083
 and 31,979 samples), `rox.log`, `dcrd.log`, `run.log`. Sampler and harness:
-`artifacts/dcroxide-bench/m1/dsample.py`, `dstate.sh`.
+[`tools/dsample/dsample.py`](../tools/dsample/dsample.py); harness
+`artifacts/dcroxide-bench/m1/dstate.sh`.
 
 ### The wall-time share, from the same samples (2026-08-15)
 
@@ -1068,7 +1069,7 @@ defensible multiplier.
 
 Raw: `artifacts/dcroxide-bench/m1/flushobs/` — `rox.jsonl` (26,391 samples),
 `flush.jsonl` (130 records), `rox.log`, `run.log`. Harness `flushobs.sh`,
-sampler `dsample.py`.
+sampler [`tools/dsample/dsample.py`](../tools/dsample/dsample.py).
 
 ## Background commit (2026-08-16) — implemented, measured, and NOT shipped
 
@@ -1271,7 +1272,7 @@ power-loss primitive is a `redb::StorageBackend`, fjall exposes no injectable
 IO layer, and asking a candidate engine the durability question needed a
 syscall-level shim that did not exist. **It exists now, and fjall passes.**
 
-`artifacts/dcroxide-tools/powerloss/` — an `LD_PRELOAD` shim intercepting
+[`tools/powerloss/`](../tools/powerloss/) — an `LD_PRELOAD` shim intercepting
 `open`/`openat`, `write`, `pwrite`/`pwrite64`, `ftruncate`, `fsync` and
 `fdatasync`, plus a replay tool. Every write to a file under
 `$POWERLOSS_DIR` is preceded by a record of what it destroys (the overwritten

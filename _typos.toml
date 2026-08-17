@@ -34,6 +34,11 @@ indx = "indx" # dcrd's INDX log subsystem tag
 ist = "ist" # dcrd's MaxIST* init-state wire constants
 nam = "nam" # PARITY.md quotes a dcrd truncation that yields "nam"
 unparseable = "unparseable" # legitimate variant, matches dcrd prose
+# A field name in the JSONL tools/dsample/dsample.py writes.
+# docs/bench-ledger.md cites those recordings as the raw evidence
+# behind the 2026-08 stall figures, so renaming the field would split
+# the schema between the data on disk and the tool that reads it.
+othr = "othr"
 # Local variable names in ported code: chain-engine node handles,
 # parent nodes (also the Pn inside UPnP), ticket-hash lists, uint256
 # property-test operands, block-region plurals, and the "mis-" prefix
