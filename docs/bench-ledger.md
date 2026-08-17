@@ -1478,3 +1478,13 @@ state markers agree with the rows they name, which `crash.rs` already
 implements and the daemon does not. It would catch this class of damage
 whatever produced it, and it is cheap against a store that already reads both
 markers at open.
+
+> **Added 2026-08-17**, in the narrower form the live data allows. The
+> catch-up path already refuses a marker naming a block absent from the index;
+> it now also refuses one whose **height disagrees with the index's** for that
+> same hash — the signature of two durability domains rolled back by different
+> amounts. The row-counting form `crash.rs` uses has nothing to compare
+> against here, since a live utxo set records no expected row count. Costs one
+> field comparison on a node the catch-up already loads, and
+> `a_utxo_state_height_disagreeing_with_the_index_stops_the_node` fails when
+> the comparison is disabled.

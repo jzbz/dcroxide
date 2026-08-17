@@ -1419,6 +1419,33 @@ impl Chain {
                     state.last_flush_hash, state.last_flush_height
                 )
             });
+
+        // The marker must also agree with the index about that block's
+        // HEIGHT, which the lookup above does not check.
+        //
+        // This is the one place a rolled-back metadata store is cheaply
+        // detectable. `reconcileDB` compares the block-file cursor against
+        // the block files and nothing else, so a store that lost recent
+        // commits comes up looking like an ordinary unclean shutdown; the
+        // 2026-08-17 fjall work found a journal truncation leaving rows the
+        // marker does not account for, and nothing at startup noticed. A
+        // marker and an index that disagree about the same hash's height is
+        // the signature of exactly that: two durability domains that rolled
+        // back by different amounts.
+        //
+        // It is narrower than the invariant `crash.rs` asserts, which counts
+        // the rows a marker names. A live UTXO set records no expected row
+        // count, so that check has nothing to compare against here. This one
+        // costs a field comparison on a node already loaded.
+        let indexed_height = self.store.node(last_flushed).height;
+        if indexed_height as u32 != state.last_flush_height {
+            panic!(
+                "utxo set state names block {} at height {}, but the block index has it at \
+                 height {indexed_height}: the metadata store and the block index disagree, \
+                 which a consistent shutdown cannot produce",
+                state.last_flush_hash, state.last_flush_height
+            );
+        }
         let fork = self.best_chain.find_fork(&self.store, last_flushed);
 
         let mut view = UtxoView::new();

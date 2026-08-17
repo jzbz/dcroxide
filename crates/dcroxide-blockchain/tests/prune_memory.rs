@@ -280,3 +280,61 @@ fn an_unflushed_utxo_set_catches_up_on_reopen() {
         "the caught-up utxo set state records the tip"
     );
 }
+
+/// A utxo set state marker whose height disagrees with the block index
+/// must stop the node, not be replayed over.
+///
+/// `reconcileDB` compares the block-file write cursor against the block
+/// files and nothing else, so a metadata store that lost recent commits
+/// reopens looking exactly like an ordinary unclean shutdown. The
+/// 2026-08-17 engine work found a journal truncation that left rows the
+/// state marker did not account for, and nothing on the startup path
+/// noticed. A marker and an index that disagree about the same hash's
+/// height is that damage made visible: two durability domains rolled back
+/// by different amounts.
+///
+/// Narrower than what `crash.rs` asserts, which counts the rows a marker
+/// names — a live utxo set records no expected row count, so there is
+/// nothing here to count against. This costs one field comparison on a
+/// node the catch-up already loads.
+#[test]
+#[should_panic(expected = "the metadata store and the block index disagree")]
+fn a_utxo_state_height_disagreeing_with_the_index_stops_the_node() {
+    let params = regnet_params();
+    let dir = TempDir::new().expect("tempdir");
+    let opts = Options::new(dir.path().join("chain"), params.net.0);
+    let db = Database::create(&opts).expect("create database");
+    let mut chain = Chain::open(db, &params, Hash::ZERO, true, 0).expect("open chain");
+    replay_battery(&mut chain, &params, 48 * 60 * 60);
+
+    // Take the recorded state and put its own hash back at a height the
+    // index does not agree with, which is what a partial rollback across
+    // two durability domains produces.
+    let mut recorded: Option<dcroxide_blockchain::UtxoSetState> = None;
+    chain
+        .db
+        .as_ref()
+        .expect("db")
+        .view(|tx| {
+            recorded = dcroxide_blockchain::chaindb::db_fetch_utxo_set_state(tx).expect("state");
+            Ok(())
+        })
+        .expect("read state");
+    let mut torn = recorded.expect("a recorded utxo set state");
+    torn.last_flush_height = torn.last_flush_height.saturating_add(1);
+    chain
+        .db
+        .as_ref()
+        .expect("db")
+        .update(|tx| {
+            dcroxide_blockchain::chaindb::db_put_utxo_set_state(tx, &torn).expect("put state");
+            Ok(())
+        })
+        .expect("write torn state");
+    chain.db.as_ref().expect("db").flush().expect("db flush");
+    drop(chain);
+
+    // The reopen must refuse rather than replay over the disagreement.
+    let db = Database::open(&opts).expect("reopen database");
+    let _ = Chain::open(db, &params, Hash::ZERO, true, 0);
+}
