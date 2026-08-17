@@ -288,14 +288,19 @@ written wider than a kill test, and the wider half fails:
 > against them — only `crash.rs` does.
 >
 > **Two experiments decide the verdict, and neither is expensive.** The
-> tearing is cross-keyspace, and dcroxide keeps its whole ffldb keyspace in
-> one redb table: a fjall port using a **single keyspace** would have one
-> memtable and one flush schedule, and truncation should then be a clean
-> prefix that a re-sync recovers. Untested, and it is the difference between
-> #311 disqualifying fjall and merely constraining how a fjall backend is laid
-> out. Separately, a **startup check that the state markers agree with the
-> rows they name** — which `crash.rs` implements and the daemon does not —
-> would catch this class of damage whatever engine produced it.
+> tearing looked cross-keyspace, and dcroxide keeps its whole ffldb keyspace
+> in one redb table, so a fjall port using a **single keyspace** should have
+> given a clean prefix. **Tested 2026-08-17 and refuted**: same offsets, one
+> keyspace, identical result — 2 clean and 3 torn either way. That mitigation
+> does not exist, and #311 stands on its own terms. The mechanism is not
+> established; the obvious one (one batch, one memtable, one flush) predicts a
+> clean prefix and is contradicted.
+>
+> Separately, a **startup check that the state markers agree with the rows
+> they name** — which `crash.rs` implements and the daemon did not — is now
+> added in the narrower form live data allows: the catch-up refuses a marker
+> whose height disagrees with the block index's for the same hash. It catches
+> this damage class whatever engine produced it.
 
 - **The default is not durable.** `Database::batch()` hands back
   `PersistMode::Buffer`, which returns `Ok` with no fsync. The arms here

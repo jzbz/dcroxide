@@ -1465,13 +1465,30 @@ paired markers exist precisely so that cannot happen, `crash.rs` asserts it in
 both directions, and **the daemon's startup path does not check it** —
 `reconcileDB` validates the block-file cursor and nothing else.
 
-**The open experiment, which could change the verdict.** The tearing is
+**The open experiment, which could change the verdict.** The tearing looked
 cross-keyspace, and dcroxide keeps its entire ffldb keyspace in **one** redb
-table. A fjall port using a single keyspace would have one memtable and one
-flush schedule, and truncation should then be a clean prefix — recoverable by
-re-sync, exactly the documented crash contract. That is untested. It is the
-cheapest remaining experiment on this thread and it decides whether #311 is
-disqualifying or merely a constraint on how a fjall backend must be laid out.
+table, so a fjall port using a single keyspace would have one memtable and one
+flush schedule and truncation should then be a clean prefix.
+
+> **Run 2026-08-17: refuted.** Same corruption offsets, rows and markers in
+> ONE keyspace, everything else identical:
+>
+> | | clean prefix | torn |
+> |---|---:|---:|
+> | two keyspaces | 2 | 3 |
+> | one keyspace | 2 | 3 |
+>
+> Identical, and at the identical offsets — 25/40/55% tear, 70/85% do not. A
+> single-keyspace layout does **not** fix #311, so the mitigation this
+> paragraph proposed does not exist and #311 stands on its own terms.
+>
+> **The mechanism is not established, and the obvious one is contradicted.**
+> Rows and markers in one batch share a memtable and a flush, which predicts a
+> clean prefix; the result says otherwise. The failure is offset-dependent
+> rather than layout-dependent, so something about how a repeatedly-overwritten
+> key (the marker is the same key every generation, unlike the per-generation
+> rows) survives flush and compaction is involved. Recorded as unexplained
+> rather than guessed at.
 
 **A second one worth running regardless of engine:** a startup check that the
 state markers agree with the rows they name, which `crash.rs` already
