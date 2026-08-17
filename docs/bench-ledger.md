@@ -1204,3 +1204,62 @@ Raw: `artifacts/dcroxide-bench/m1/writeshape.jsonl` (fjall first) and
 `writeshape2.jsonl` (redb first, journal pre-warmed). Harness
 `writeshape.sh` / `writeshape2.sh`, arm binary
 `artifacts/dcroxide-tools/engbench/src/bin/writeshape.rs`.
+
+## fjall against the crash gate (2026-08-17)
+
+ADR-0009 makes crash safety a condition on any engine change, and names the
+property: `Chain::flush` writes block index rows, UTXO entries and **both**
+state markers in one transaction, so a crash can never leave the markers
+disagreeing with the rows they name. `crash.rs` enforces that for redb. This
+asks it of fjall, which the size and write-shape measurements otherwise
+favour.
+
+**Batch atomicity under SIGKILL: 12 rounds, 12 consistent.** A writer commits
+one paired generation per batch — 200 rows plus both markers, one
+`PersistMode::SyncAll` commit — and is killed at a randomised point inside a
+batch. Every reopen found the markers agreeing with each other, agreeing with
+the rows they name, and nothing visible past them.
+
+**The rig has teeth, checked the way this file requires.** A control mode
+commits the rows and the markers in *separate* batches, so they are not atomic
+with each other. That is **detected in 7 of 12 rounds**, with the diagnostic
+naming the failure ("rows visible past the marker"). Without the control the
+clean 12/12 would mean nothing.
+
+**The durability trap is confirmed rather than assumed.** 400 commits under
+each mode:
+
+| | wall | bytes to device | write syscalls |
+|---|---:|---:|---:|
+| `PersistMode::Buffer` | 0.016 s | 7.3 MB | 1,200 |
+| `PersistMode::SyncAll` | 0.170 s | 41.0 MB | 1,200 |
+
+Identical syscall counts, **5.6x more bytes actually reaching the disk and
+10.6x slower** — `Buffer`'s `commit()` really does return `Ok` having left the
+data in page cache. Any port on fjall must set `SyncAll` explicitly, which is
+the same requirement `begin_durable_write` encodes on the redb side and the
+reason ADR-0009 lists an asserted-durability seam as a condition.
+
+### What this does NOT establish, which is the part that matters
+
+**It is a process kill, not power loss.** The page cache survives, so it
+cannot detect a missing fsync — the same limitation the redb suite had before
+the 2026-08-15 power-loss backend, and the reason that backend was built.
+**fjall exposes no injectable IO layer** (neither does `lsm-tree` beneath it),
+so the `PowerLossBackend` cannot be pointed at it; the general form needs a
+syscall-level shim intercepting write/fsync with an undo log, which does not
+exist. Until it does, fjall's behaviour under power loss is untested here.
+
+Also unreached: fjall **#308** (a commit does not poison the keyspace when the
+journal write fails — needs fault injection, not a kill) and the full form of
+**#311** (no strict recovery). Both are ADR-0009's stated reasons for
+caution and neither is addressed by this.
+
+So the engine picture is: fjall wins on size (1.026x its own payload against
+redb's 2.831x), wins on write shape (4.27x mean write, 9.7x fewer syscalls,
+3.2–3.5x less blocking), and **clears batch atomicity under process kill**.
+Its power-loss behaviour and two upstream durability issues remain open, and
+they are the half a consensus node cannot compromise on.
+
+Harness: `artifacts/dcroxide-tools/engbench/src/bin/fjallcrash.rs`
+(`write`, `writesplit` control, `verify`, `sync`).

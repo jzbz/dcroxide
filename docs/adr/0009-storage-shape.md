@@ -246,6 +246,25 @@ written wider than a kill test, and the wider half fails:
 - **fjall #311 is open**: no strict recovery mode, so mid-journal corruption
   is indistinguishable from a torn tail and presents as silent truncation
   rather than a loud failure.
+> **Re-tested 2026-08-17 with a wider rig; the verdict is unchanged and its
+> two halves are now separated by measurement.** Batch atomicity under
+> SIGKILL: **12 rounds, 12 consistent**, markers agreeing with their rows in
+> both directions — and the rig has teeth, since a control committing rows and
+> markers in *separate* batches is caught in 7 of 12. The non-durable default
+> is confirmed rather than inferred: 400 commits take 0.016 s under `Buffer`
+> against 0.170 s under `SyncAll`, with identical write-syscall counts and
+> **5.6x more bytes reaching the device** — `Buffer` really does acknowledge
+> without persisting.
+>
+> **What still blocks gate C is what a process kill cannot reach.** The page
+> cache survives it, so it cannot detect a missing fsync; #308 needs a write
+> *failure* rather than process death; #311 needs mid-journal corruption. The
+> power-loss primitive built 2026-08-15 is a `redb::StorageBackend`, and
+> **fjall exposes no injectable IO layer** — nor does `lsm-tree` beneath it —
+> so pointing it at fjall requires a syscall-level shim that does not exist.
+> Gate C therefore stays **✗**, and the specific missing instrument is now
+> named.
+
 - **The default is not durable.** `Database::batch()` hands back
   `PersistMode::Buffer`, which returns `Ok` with no fsync. The arms here
   used `SyncData` explicitly. redb gives durability unless asked otherwise;
