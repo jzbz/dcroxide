@@ -1133,3 +1133,74 @@ accounting — is committed and stands on its own: it unblocks readers for the
 Raw: `artifacts/dcroxide-bench/m1/phase2/` against
 `artifacts/dcroxide-bench/m1/flushobs/`, same harness, same server, same
 machine, hours apart.
+
+## Write shape: redb 4.1.0 against fjall 3.1.8 (2026-08-17)
+
+The background-commit result closed rescheduling as a lever and left the
+*cost* of a commit as the only one. This measures it, with the engine as the
+only variable: both engines replay the **identical journal** dcroxide's
+storage layer was handed — 130 batches, 102,686,859 write records, 6.07 GB of
+payload, captured by `replay --writelog` — with one durable commit per batch.
+fjall is forced to `PersistMode::SyncAll`, not its buffered default whose
+`commit()` returns `Ok` having fsynced nothing.
+
+**Run twice with the arm order reversed**, because the first run's read figure
+turned out to follow the order rather than the engine.
+
+| | fjall 3.1.8 | redb 4.1.0 | ratio |
+|---|---:|---:|---:|
+| mean write size | 18,681 / 18,451 B | **4,348 / 4,340 B** | **4.27x** |
+| write syscalls | 765,076 / 761,500 | **7,371,980 / 7,371,980** | **9.7x** |
+| bytes written | 14.29 / 14.05 GB | 32.05 / 31.99 GB | **2.26x** |
+| wall | 91.4 / 89.1 s | 238.0 / 200.8 s | 2.3–2.6x |
+| blocked fraction | 0.089 / 0.064 | 0.313 / 0.204 | 3.2–3.5x |
+
+**redb's mean write is one 4 KiB page.** Copy-on-write updates scatter single
+pages across a growing file; an LSM appends sequential segments. redb issues
+**9.7x more write syscalls to move 2.26x more bytes**, and spends **3.2–3.5x**
+more of its life blocked. Its syscall count and store size are *bit-identical*
+across the two runs — the pattern is deterministic — and every write-shape
+figure reproduces within 2%. Absolute blocking fell on the quieter second run
+while the ratio held.
+
+This is the engine-isolated form of what the daemon comparison found: dcroxide
+writes *fewer* bytes than dcrd and blocks 30x more per GiB. Scattered
+copy-on-write overwrites onto btrfs-over-dm-crypt are near the worst case for
+that stack; sequential compaction is near the best.
+
+### Two figures this harness cannot supply
+
+**`read_bytes` is not usable, and an earlier reading of it here was wrong.**
+The first run had fjall first and showed fjall reading 8.2 GB against redb's
+7 MB; an 8-batch smoke with redb first showed the reverse. The quantity was
+the 8.1 GB journal being faulted in by whichever arm ran first. With the
+journal pre-read before *each* arm, **redb reads 163,840 bytes and fjall
+reads 0**. So this benchmark does **not** demonstrate read amplification, and
+the claim that it corroborated the daemon's 99x is **withdrawn**. That daemon
+figure (42.5 GiB against dcrd's 0.43) rests on its own evidence; a plausible
+reason it does not reproduce here is that the replay's working set stays
+cache-resident where a full sync's does not. Third time in this campaign that
+an arm-order page-cache effect produced a credible wrong number, which is why
+the reversed order was run rather than a plain repeat.
+
+**`store_bytes` is not usable either.** fjall's moved 32% between runs (1.36
+against 0.92 GB), both far below its own 6.07 GB payload, because this harness
+measures immediately after load without quiescing compaction — which the
+2026-08-13 engine benchmark deliberately did. Its settled figure, **6.23 GB /
+1.026x payload against redb's 2.831x**, remains the size answer.
+
+### What it establishes, and what it does not
+
+Established: the write-shape mechanism is real, engine-attributable, and
+large — 4.27x on write size, 9.7x on syscalls, 3.2–3.5x on blocking.
+
+Not established: any daemon throughput prediction. This is a replay, and a
+replay is not a daemon — the distinction that invalidated the 18% figure
+earlier in this campaign. It measures how the two engines respond to identical
+input, which is what the engine decision needs, and it does not say what IBD
+would do.
+
+Raw: `artifacts/dcroxide-bench/m1/writeshape.jsonl` (fjall first) and
+`writeshape2.jsonl` (redb first, journal pre-warmed). Harness
+`writeshape.sh` / `writeshape2.sh`, arm binary
+`artifacts/dcroxide-tools/engbench/src/bin/writeshape.rs`.

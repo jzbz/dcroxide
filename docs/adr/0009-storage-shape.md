@@ -488,6 +488,21 @@ sold on IBD.
 > than dcrd and blocks 30x more per GiB, because scattered copy-on-write
 > overwrites onto btrfs are near the worst case for that stack where an LSM's
 > sequential compaction is near the best.
+>
+> **That lever is now measured with the engine as the only variable.**
+> Replaying the identical journal through both engines, one durable commit per
+> batch, run twice with the arm order reversed: redb's **mean write is one
+> 4 KiB page (4,344 B) against fjall's 18,566 — 4.27x**; it issues **9.7x more
+> write syscalls** to move **2.26x more bytes**; and it is blocked **3.2–3.5x**
+> as often. redb's syscall count and store size are bit-identical across runs,
+> so the pattern is deterministic. Together with the settled size figure
+> (fjall 1.026x its own payload against redb's 2.831x), both halves of this
+> ADR's question now have numbers.
+>
+> The caveat that decides how they are used: this is a **replay, not a
+> daemon**. It establishes the mechanism and its size, not an IBD prediction —
+> the same distinction that invalidated the 18% figure. So it is evidence for
+> the engine decision and not a throughput promise.
 
 1. **Lever (d) on `spendjournalv3`.** ~~Prerequisite~~ **Measured**, by
    `redbstat --buckets`: the bucket holds a 2402-byte mean row against a
