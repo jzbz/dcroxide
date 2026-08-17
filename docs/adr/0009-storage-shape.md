@@ -1,10 +1,50 @@
 # ADR-0009 — Storage rework: what the evidence supports, and what must be measured first
 
-- **Status:** Proposed — **all four prerequisites measured as of 2026-08-13,
-  and the three conditions this ADR set on an engine change are met. What
-  remains is a decision, not a measurement, and ratifying or superseding
-  this ADR is the project owner's call.**
-- **Date:** 2026-08-10 (proposed), 2026-08-13 (prerequisites complete)
+- **Status:** **Closed — the engine stays redb** (decided by the project owner,
+  2026-08-17). Every prerequisite and gate is measured; the decision went
+  against the swap on crash safety. The evidence below stands as the record of
+  what was measured and remains the basis for reopening if the trade changes.
+- **Date:** 2026-08-10 (proposed), 2026-08-13 (prerequisites complete),
+  2026-08-17 (decided)
+
+## Decision: redb stays
+
+**What the candidate won.** fjall reaches goleveldb's density on dcroxide's own
+write pattern — 1.026x its own payload against redb's 2.831x — and its write
+*shape* is better by as much again: a mean write of 18,566 B against redb's
+4,344 (one page), 9.7x fewer write syscalls to move 2.26x more bytes, and
+3.2–3.5x less time blocked, replaying the identical journal. It survives real
+power loss (10/10) and batch atomicity under kill (12/12), and **#308 does not
+reproduce**.
+
+**What decided it.** **#311 reproduces.** Sixty-four corrupted bytes inside
+the journal's written extent silently discard hundreds of acknowledged
+commits, and the reopen *succeeds* — no error. Three of five corruption points
+leave rows the state marker does not account for, which in this store means
+phantom spendable outputs. The single-keyspace layout that looked like a
+mitigation was **tested and refuted**: identical results, same offsets.
+
+**Why the ecosystem precedent does not transfer.** Cuprate does ship fjall at
+chain scale (PR #587, 2026-04-19, replacing their heed/redb abstraction) — but
+for *hash-keyed lookups*, with append-only Tapes as the source of truth and
+**fjall rebuilt on detected desync**. Silent truncation costs them a rebuild.
+dcroxide would put fjall in the authoritative role for the whole ffldb
+keyspace, where there is nothing to rebuild from and a truncation discards the
+only copy.
+
+**What this does not retract.** The gap it was meant to close is real and
+measured: IBD at 1.29x dcrd, the node fully stalled on storage for ~48% of
+block-sync wall time, 90–98% of that inside a metadata-flush window, and the
+write-shape mechanism above. Staying on redb accepts that cost; it does not
+dispute it.
+
+**What would reopen this.** An engine matching fjall's size and write shape
+without #311's failure mode; a fjall release that fixes it; or the
+architectural change cuprate's PR #587 actually made — making the metadata
+store *derivable* from the append-only block files, which dcroxide already
+half has. That last one changes what is authoritative rather than which engine
+is used, and it would reduce #311 to a rebuild for dcroxide exactly as it does
+for cuprate.
 
 **Read this first.** The ADR below is a record of an investigation that
 changed direction more than once, and the reasoning it superseded is kept

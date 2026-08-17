@@ -1,8 +1,20 @@
 # ADR-0004 — D1: Storage backend & datadir-compatibility stance
 
-- **Status:** Accepted (decision D1 ratified by the project owner)
+- **Status:** Accepted (decision D1 ratified by the project owner).
+  **Revisit gate satisfied and closed 2026-08-17: the engine stays redb.**
 - **Date:** 2026-07-03 (proposed), 2026-07-05 (accepted),
-  2026-07-26 (write-load gate resolved — see the amendment below)
+  2026-07-26 (write-load gate resolved — see the amendment below),
+  2026-08-17 (revisit concluded — [ADR-0009](0009-storage-shape.md))
+
+> **The revisit this ADR set up has run its course.** Its gate — revisit only
+> after all four levers are measured and found insufficient — was satisfied on
+> 2026-08-12, and ADR-0009 then measured a candidate engine against every
+> condition. The candidate won on size and on write shape and lost on crash
+> safety (fjall #311: a corrupted journal record silently discards
+> acknowledged commits, and the reopen succeeds). **redb stays.** The costs
+> that motivated the revisit are not retracted — 1.29x dcrd at IBD, ~48% of
+> block-sync wall time stalled on storage, 90–98% of it in the metadata commit
+> — they are accepted.
 
 ## Context
 
