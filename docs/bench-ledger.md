@@ -1337,9 +1337,31 @@ the kill window has to start past it. The tell was the undo log's size, not
 the pass/fail result — which is the general lesson: a crash test that passes
 without the instrument having anything to undo has not run.
 
-**What is not separated here:** the summary reports one file touched per
-round, and does not distinguish `.fdb` appends from `metadata.redb`
-extensions. That the undos are all length rewinds with zero region restores
-points at appends rather than in-place overwrites, so the block files are the
-likely subject, but the shim would need to report per-path counts to say so
-outright.
+**Corrected 2026-08-17, with per-path counts added to the replay tool.**
+The inference above — that the undos were `.fdb` appends because they were
+length rewinds — was **wrong**, and the truth is a better result. A round
+killed at height 130,165 with 1.14 GB of block files reports:
+
+    71,679 regions (304 MB) restored, 1 file touched
+        .../blocks_ffldb/metadata.redb
+
+**Only the metadata store had anything to undo.** Not because the shim misses
+block files — it records 299,196, 214,228 and 20,820 writes across the three
+`.fdb` files, with their syncs — but because by kill time every one of those
+writes was already covered by an fsync.
+
+**That is the files-before-metadata ordering working, and it is why a random
+kill lands where it does.** `DbCache::flush` syncs the block files first,
+clearing their pending records, and only then runs the metadata commit — which
+the 2026-08-16 measurement puts at 68–71% of block-sync wall time. So a kill
+at an arbitrary instant almost always falls *inside* the metadata commit, with
+the block bytes already durable and the metadata naming them still in flight.
+Power loss then rewinds the metadata behind the files, `reconcileDB` truncates
+the orphaned block data on reopen, and the node continues — the designed
+recovery path, exercised end to end.
+
+So the earlier rounds tested something real, just not the thing they were
+described as testing: they demonstrate that the ordering keeps block bytes
+durable ahead of the metadata that names them, which is the invariant's whole
+purpose. The per-path counts are what made the difference between inferring
+that and knowing it.
