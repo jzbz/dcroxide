@@ -1304,3 +1304,42 @@ control. What remains open on gate C is narrower than before and unchanged by
 this: **#308** needs an injected write *failure* rather than a kill, and
 **#311** needs mid-journal corruption. The shim is the right place to build
 both — it already sits on the write path — and neither is done.
+
+### dcroxide's own block files under power loss (2026-08-17)
+
+The shim's reason for existing beyond fjall: the 2026-08-15 primitive is a
+`redb::StorageBackend`, so it reaches the metadata store and **not** the flat
+`.fdb` block files. Those are the other half of the invariant `DbCache::flush`
+maintains — block files are fsynced *before* the metadata commit, so metadata
+can never name bytes a crash could take. The suite tested that half only under
+`drop`, which cannot lose an unsynced append.
+
+The daemon syncing mainnet from a local dcrd, `LD_PRELOAD`ed, killed with
+SIGKILL deep in block sync, undo log replayed, then reopened:
+
+| round | killed at height | `.fdb` written | reopened at | undo applied |
+|---|---:|---:|---:|---|
+| 1 | 81,465 | 735 MB | 93,518 | 7,168 lengths rewound |
+| 2 | 177,707 | 1.69 GB | 177,707 | 9,392 |
+| 3 | 162,496 | 1.52 GB | 162,496 | 4,928 |
+
+**Three rounds, three clean reopens, zero corruption** — and not vacuously:
+each round had thousands of unsynced appends actually undone, against 0.7–1.7
+GB of block data on disk. `reconcileDB` recovered every time, and the metadata
+never claimed more block data than survived, which is the failure the ordering
+exists to prevent and the one `ErrCorruption` would have reported.
+
+**A first attempt at this was vacuous and is worth recording.** Killing at
+38–60 s landed inside headers sync, before any block file is written: every
+round reported "killed at height 0" with a 16 KB undo log touching one file,
+and passed while testing nothing. Headers sync takes ~56 s on this host, so
+the kill window has to start past it. The tell was the undo log's size, not
+the pass/fail result — which is the general lesson: a crash test that passes
+without the instrument having anything to undo has not run.
+
+**What is not separated here:** the summary reports one file touched per
+round, and does not distinguish `.fdb` appends from `metadata.redb`
+extensions. That the undos are all length rewinds with zero region restores
+points at appends rather than in-place overwrites, so the block files are the
+likely subject, but the shim would need to report per-path counts to say so
+outright.
