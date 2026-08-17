@@ -35,6 +35,30 @@ run, both nodes `--norpc`.
 | 2026-08-15 | m1 | `b6d0c63` (fan-out fix `c091b46` **not** in the binary) | 2.2.0-pre+452c1a6c3 (go1.26.5) | mainnet, 1,100,392 blocks | Both daemons from one shared dcrd server, sequential, defaults, exists-address index verified on both: dcroxide 4,153 s — **265.0 blk/s** at 0.76 mean cores; dcrd 3,220.5 s — **341.7 blk/s** at 1.50. **1.29x**, not the 2.23x above. Arms ~12 h apart under unmatched loadavg (4.62 vs 2.45), n=1 — a bound, not a point estimate | this file, below |
 | 2026-08-15 (second) | m1 | `8b27d20` (fan-out fix included) | 2.2.0-pre+452c1a6c3 (go1.26.5) | mainnet, 1,100,392 blocks | Same shared server, arms back to back on a quiet box, page cache pre-warmed before each: dcroxide 4,821.4 s — **228.2 blk/s**; dcrd 3,200.8 s — **343.8 blk/s**. Ratio **1.51x**. dcrd reproduced to 0.6% across the two 2026-08-15 runs; dcroxide fell 14% under higher ambient (a browser active in its arm only). Both runs carried more ambient in the dcroxide arm, so **1.29x above remains the tighter upper bound** — this row is the D-state run's throughput, not a supersession | this file, below |
 
+> **The headline 1.29x predates the fan-out fix, so it is conservative for
+> master.** That figure was measured on `b6d0c63`; `c091b46` (one validation
+> worker per core, 6.1% on the replay corpus) landed after it, along with
+> `d5aa17f` (the cache lock released across the metadata commit, which
+> unblocks readers and is not expected to move IBD). Every prose citation of
+> 1.29x — README, PARITY, the project brief, ADR-0004, operating.md — is
+> therefore an upper bound on the gap for current master in two independent
+> ways: the ambient-load asymmetry recorded in the row itself, and this.
+>
+> **Re-measuring it needs repetitions, not another single run.** dcroxide
+> measured 265.0 and 232.1 blk/s eleven hours apart (the two rows above), a
+> 14% spread — wider than the effect being looked for. A single new arm would
+> return a number indistinguishable from that variance. The form that would
+> settle it is two arms, dcroxide-from-dcrd and dcrd-from-dcrd, three
+> alternating repetitions each so drift cannot load onto one arm, in one
+> session on a quiet box: about six hours, and the first figure this
+> comparison has ever had with error bars. The four-combination shape of the
+> 2026-07 row is not needed — its question, whether the *source* matters, was
+> answered there (1.6–8.8%) and has not been in doubt since.
+>
+> Not scheduled: ADR-0009 closed on 2026-08-17, so this number informs no
+> pending decision and is documentation accuracy. Worth running before a
+> release, or after any change expected to move IBD.
+
 ## Storage at tip
 
 | date | machine | dcroxide commit | corpus | result | source |
