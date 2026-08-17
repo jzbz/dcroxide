@@ -51,6 +51,7 @@
 // through, so the shim costs nothing outside the store.
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -79,6 +80,17 @@ static char *fd_path[MAXFD];
 static int log_fd = -1;
 static char track_dir[PATH_MAX];
 static size_t track_len;
+// Fault injection, for the failure modes a kill cannot produce: after
+// $POWERLOSS_FAIL_AFTER successful writes to a path containing
+// $POWERLOSS_FAIL_MATCH, every further write to it fails with EIO. That is
+// what fjall #308 needs -- a journal write that FAILS, rather than a
+// process that dies -- to see whether a later commit still reports success.
+static char fail_match[PATH_MAX];
+static size_t fail_match_len;
+static long fail_after = -1;
+static long fail_count = -1; // how many writes to fail; -1 = all of them
+static long fail_seen;
+static long failed_so_far;
 static __thread int in_shim; // re-entrancy guard: our own IO must not recurse
 
 static void init(void) {
@@ -99,10 +111,33 @@ static void init(void) {
     const char *l = getenv("POWERLOSS_LOG");
     if (d) { snprintf(track_dir, sizeof track_dir, "%s", d); track_len = strlen(track_dir); }
     if (l) log_fd = real_open64(l, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    const char *fm = getenv("POWERLOSS_FAIL_MATCH");
+    const char *fa = getenv("POWERLOSS_FAIL_AFTER");
+    if (fm) { snprintf(fail_match, sizeof fail_match, "%s", fm); fail_match_len = strlen(fail_match); }
+    if (fa) fail_after = atol(fa);
+    const char *fc = getenv("POWERLOSS_FAIL_COUNT");
+    if (fc) fail_count = atol(fc);
 }
 
 static int tracked(const char *path) {
     return track_len && path && strncmp(path, track_dir, track_len) == 0;
+}
+
+// Should this write be failed? Counts matching writes first, so the target
+// gets a working store before the fault lands mid-stream.
+static int should_fail(int fd) {
+    if (fail_after < 0 || !fail_match_len) return 0;
+    if (fd < 0 || fd >= MAXFD || !fd_path[fd]) return 0;
+    if (!strstr(fd_path[fd], fail_match)) return 0;
+    if (fail_seen++ < fail_after) return 0;
+    // A TRANSIENT fault is the interesting one: fjall #308 is about a
+    // journal write failing and writes then RESUMING, so a later commit
+    // lands after an unterminated record and still reports success. A
+    // permanent fault only shows that every subsequent commit errors,
+    // which is the engine behaving correctly and not the bug.
+    if (fail_count >= 0 && failed_so_far >= fail_count) return 0;
+    failed_so_far++;
+    return 1;
 }
 
 // Record layout: [type u8][pathlen u16][path][off u64][len u32][prevlen u64][data]
@@ -186,18 +221,21 @@ ssize_t write(int fd, const void *buf, size_t n) {
         if (cur >= 0) save_before(fd, (uint64_t)cur, n);
         in_shim = 0;
     }
+    if (should_fail(fd)) { errno = EIO; return -1; }
     return real_write(fd, buf, n);
 }
 
 ssize_t pwrite(int fd, const void *buf, size_t n, off_t off) {
     init();
     if (!in_shim) { in_shim = 1; save_before(fd, (uint64_t)off, n); in_shim = 0; }
+    if (should_fail(fd)) { errno = EIO; return -1; }
     return real_pwrite(fd, buf, n, off);
 }
 
 ssize_t pwrite64(int fd, const void *buf, size_t n, off64_t off) {
     init();
     if (!in_shim) { in_shim = 1; save_before(fd, (uint64_t)off, n); in_shim = 0; }
+    if (should_fail(fd)) { errno = EIO; return -1; }
     return real_pwrite64 ? real_pwrite64(fd, buf, n, off) : real_pwrite(fd, buf, n, (off_t)off);
 }
 

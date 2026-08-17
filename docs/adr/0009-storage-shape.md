@@ -265,13 +265,23 @@ written wider than a kill test, and the wider half fails:
 > committing rows and markers separately caught in 4 of 8. fjall's durability
 > half now has the same standing as its size and write-shape halves.
 >
-> **Gate C nonetheless stays ✗, on a narrower basis than before.** #308 needs
-> an injected write *failure* rather than process death, and #311 needs
-> mid-journal corruption. Neither is a kill and neither is done. The shim is
-> the right place to build both, since it already sits on the write path — a
-> failure can be returned from its interposed `write`, and a record corrupted
-> in place. Until those exist, the open upstream issues stand unexercised
-> against this project's own requirement.
+> **Both blockers exercised 2026-08-17, and they diverge.** #308 **does not
+> reproduce**: with a transient journal write failure (1–3 writes failed, then
+> resuming) fjall returned `Err` for all 250 subsequent commits — it poisoned
+> — and every acknowledged generation survived. #311 **reproduces, in the
+> most damaging form**: 64 bytes corrupted inside the journal's written extent
+> discards **280 of 400 acknowledged commits**, and the reopen *succeeds* with
+> no error. Recovery truncates from the first bad record and the store
+> presents a consistent view of a chain state that silently rolled back by
+> hundreds of generations.
+>
+> **So gate C's status is now a judgement rather than a missing measurement.**
+> fjall wins on size, on write shape, and survives power loss; a single
+> corrupted journal record silently discards every commit after it. Whether
+> that disqualifies it depends on operational context — a node that re-syncs
+> from peers can recover from silent truncation *if it notices* — and that is
+> the project owner's call. What is no longer true is that the gate is blocked
+> for want of an instrument.
 
 - **The default is not durable.** `Database::batch()` hands back
   `PersistMode::Buffer`, which returns `Ok` with no fsync. The arms here

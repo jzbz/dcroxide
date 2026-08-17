@@ -1366,3 +1366,53 @@ described as testing: they demonstrate that the ordering keeps block bytes
 durable ahead of the metadata that names them, which is the invariant's whole
 purpose. The per-path counts are what made the difference between inferring
 that and knowing it.
+
+### fjall #308 and #311, exercised (2026-08-17)
+
+The two upstream issues ADR-0009 names as gate C's remaining blockers, both
+previously unreachable: #308 needs a journal write to *fail* rather than a
+process to die, and #311 needs mid-journal corruption. The shim's new fault
+injection (`POWERLOSS_FAIL_MATCH` / `_AFTER` / `_COUNT`) supplies the first;
+the second needs no shim.
+
+**#308 — does not reproduce against 3.1.8.** The issue describes `commit()`
+failing to poison the database on a journal write failure, with a later batch
+committing after the unterminated record and returning `Ok`. Reproducing it
+needs a **transient** fault: a permanent one only shows every later commit
+erroring, which is correct behaviour rather than the bug. With 1 or 3 journal
+writes failed and writes then resuming, fjall returned `Err` for **all 250
+subsequent commits** — it poisoned — and every acknowledged generation
+survived the reopen. Three variations (fail 1 after 150, fail 3 after 150,
+fail 1 after 250), same result each time.
+
+**#311 — reproduces, and it is the serious one.** 400 generations committed
+with `SyncAll`, each acknowledged `Ok`. Corrupting **64 bytes inside the
+journal's written extent**, then reopening:
+
+| corruption point | acknowledged | survived | lost |
+|---|---:|---:|---:|
+| 30% of written extent | 400 | 120 | **280** |
+| 70% of written extent | 400 | 280 | **120** |
+
+**The reopen succeeds.** No error, no warning, no indication anything is
+missing. Recovery truncates from the first bad record and the store comes up
+presenting a consistent view of a chain state that has silently rolled back by
+hundreds of generations. That is precisely the shape a consensus node cannot
+tolerate: not a crash, which a supervisor handles, but committed state
+disappearing behind a healthy-looking startup.
+
+**Note the file layout trap.** fjall preallocates the journal to 64 MiB, so
+corrupting at "30% of the file" lands in unwritten space and changes nothing —
+a first attempt did exactly that and read as a clean pass. The written extent
+was 686,800 B of the 67,108,864 B file. A corruption test that does not
+locate the written region tests nothing, which is the same class of vacuous
+pass as the crash rounds that never wrote a block file.
+
+**Where this leaves gate C.** One of the two blockers is not reproducible and
+the other is, in the most damaging form available. fjall wins on size, on
+write shape, and survives power loss — and a single corrupted record in its
+journal silently discards every commit after it. Whether that is
+disqualifying is a judgement about operational context (a node that
+re-syncs from peers can recover from silent truncation if it *notices*),
+and it is the project owner's call, not a measurement. What is no longer
+true is that gate C is blocked for want of an instrument.
