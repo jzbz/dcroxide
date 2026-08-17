@@ -256,14 +256,22 @@ written wider than a kill test, and the wider half fails:
 > **5.6x more bytes reaching the device** — `Buffer` really does acknowledge
 > without persisting.
 >
-> **What still blocks gate C is what a process kill cannot reach.** The page
-> cache survives it, so it cannot detect a missing fsync; #308 needs a write
-> *failure* rather than process death; #311 needs mid-journal corruption. The
-> power-loss primitive built 2026-08-15 is a `redb::StorageBackend`, and
-> **fjall exposes no injectable IO layer** — nor does `lsm-tree` beneath it —
-> so pointing it at fjall requires a syscall-level shim that does not exist.
-> Gate C therefore stays **✗**, and the specific missing instrument is now
-> named.
+> **Power loss, tested the same day with the shim that was missing.** An
+> `LD_PRELOAD` undo-log shim (`artifacts/dcroxide-tools/powerloss/`) makes the
+> primitive engine-independent by working at the libc boundary. Validated
+> against a known case — an unsynced overwrite and an unsynced extension are
+> both undone while the synced state survives — and then pointed at fjall:
+> **10 rounds under real power loss, 10 consistent**, with a control
+> committing rows and markers separately caught in 4 of 8. fjall's durability
+> half now has the same standing as its size and write-shape halves.
+>
+> **Gate C nonetheless stays ✗, on a narrower basis than before.** #308 needs
+> an injected write *failure* rather than process death, and #311 needs
+> mid-journal corruption. Neither is a kill and neither is done. The shim is
+> the right place to build both, since it already sits on the write path — a
+> failure can be returned from its interposed `write`, and a record corrupted
+> in place. Until those exist, the open upstream issues stand unexercised
+> against this project's own requirement.
 
 - **The default is not durable.** `Database::batch()` hands back
   `PersistMode::Buffer`, which returns `Ok` with no fsync. The arms here

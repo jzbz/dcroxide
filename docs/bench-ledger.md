@@ -1263,3 +1263,44 @@ they are the half a consensus node cannot compromise on.
 
 Harness: `artifacts/dcroxide-tools/engbench/src/bin/fjallcrash.rs`
 (`write`, `writesplit` control, `verify`, `sync`).
+
+### Power loss, engine-independent (2026-08-17)
+
+The entry above closes with the missing instrument named: the 2026-08-15
+power-loss primitive is a `redb::StorageBackend`, fjall exposes no injectable
+IO layer, and asking a candidate engine the durability question needed a
+syscall-level shim that did not exist. **It exists now, and fjall passes.**
+
+`artifacts/dcroxide-tools/powerloss/` — an `LD_PRELOAD` shim intercepting
+`open`/`openat`, `write`, `pwrite`/`pwrite64`, `ftruncate`, `fsync` and
+`fdatasync`, plus a replay tool. Every write to a file under
+`$POWERLOSS_DIR` is preceded by a record of what it destroys (the overwritten
+bytes and the file's prior length); a successful sync of that file clears its
+pending records, because those bytes can no longer be taken by a power cut.
+Kill the target, replay what remains in reverse, and the tree is exactly as of
+its last successful sync. It works at the libc boundary, so it is
+engine-independent — and unlike the redb backend it also covers the flat
+block-file path.
+
+**The instrument is validated, not assumed.** A victim writes `AAAA`, fsyncs,
+then writes `BBBB` over it and `CCCC` past the end, and is killed. Before
+replay the file reads `BBBBBBBB` at 128 bytes; after replay it reads
+`AAAAAAAA` at 64 — the unsynced overwrite *and* the unsynced extension are
+both undone, and only the synced state survives.
+
+**fjall under real power loss: 10 rounds, 10 consistent.** Paired generations,
+one `SyncAll` batch each, killed at randomised points, everything since the
+last successful fsync discarded. Markers agree with each other, agree with the
+rows they name, nothing visible past them.
+
+**With teeth, twice over.** The shim demonstrably engages on fjall's files —
+a 16.4 MB undo log for one ~1 s round, with regions restored and lengths
+rewound on replay. And the control that commits rows and markers in *separate*
+batches is **caught in 4 of 8 rounds** under power loss, naming the failure.
+
+So fjall's durability half now has the same standing as its size and
+write-shape halves: measured, with a validated instrument and a failing
+control. What remains open on gate C is narrower than before and unchanged by
+this: **#308** needs an injected write *failure* rather than a kill, and
+**#311** needs mid-journal corruption. The shim is the right place to build
+both — it already sits on the write path — and neither is done.
