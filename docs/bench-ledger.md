@@ -1529,3 +1529,55 @@ markers at open.
 > field comparison on a node the catch-up already loads, and
 > `a_utxo_state_height_disagreeing_with_the_index_stops_the_node` fails when
 > the comparison is disabled.
+
+## Overlay flush cadence: +12.7% on IBD (2026-08-17)
+
+`DCROXIDE_DB_OVERLAY` was exposed on 2026-08-16 as an untuned instrument: a
+durable commit is forced by *either* the UTXO cache filling or the metadata
+overlay filling, and only the first had ever been measured
+(`--utxocachemaxsize`, 12% at 8x its default). This asks whether the second
+trigger has comparable headroom. **It does.**
+
+Four full mainnet syncs from one shared dcrd server, **alternating A B A B**,
+same binary throughout, page cache pre-warmed before each arm:
+
+| arm | overlay | rate | flushes |
+|---|---|---:|---:|
+| a1 | default (100 MiB) | 256.1 blk/s | 129 |
+| b1 | **800 MiB** | **288.4** | 119 |
+| a2 | default | 272.7 | 130 |
+| b2 | **800 MiB** | **307.5** | 119 |
+
+**+12.7%** (264.4 → 297.9 mean), and it clears this file's own bar for a
+defensible result three ways:
+
+- **Ranges are disjoint.** A spans [256.1, 272.7], B spans [288.4, 307.5].
+- **Both adjacent pairs agree to 0.2 points**: a1→b1 is 12.6%, a2→b2 is 12.8%.
+- **The mechanism is confirmed, not assumed.** Flush count drops 130 → 119,
+  8.1% fewer. The knob engaged. An arm pair with identical flush counts would
+  have meant the throughput numbers were measuring noise, which is the vacuous
+  result this file has recorded three times in two days.
+
+### The alternation was load-bearing
+
+**Both arms drifted upward by ~6.5% across the run** — A from 256.1 to 272.7,
+B from 288.4 to 307.5 — almost certainly page cache warming across successive
+syncs on the same server. Run as A A B B, that drift would have inflated B by
+roughly half the claimed effect. Because the arms alternate, it cancels within
+each adjacent pair, which is why both pairs land on the same figure. Two
+earlier sweeps in this campaign were voided by exactly this confound; this is
+the first one where the design caught it in the act.
+
+### Two things this does not say
+
+**The absolutes are not comparable across sessions.** The default arm runs
+264 blk/s here where 2026-08-16 measured 228–232 at the same setting — a
+quieter box and a warmer cache, not a code change. Only the within-session A/B
+is valid. Reading these absolutes against another day's is the error that
+produced the 265-against-232 confusion in the first place.
+
+**Whether it composes with `--utxocachemaxsize` is untested.** Both levers
+measure ~12% and both act on the same durable commit through independent
+triggers. They may stack toward ~25%, or both may be approaching the same
+ceiling and together give ~12%. One more A/B answers it, and it is the obvious
+next experiment on this thread.

@@ -110,14 +110,18 @@ weighting by represented time raises it to 48–51%.) How much of it is
 figure came from a replay, which validates every block where a syncing
 daemon skips ~93% under assume-valid, so it understated the daemon's share.
 
-## Storage tuning: one knob helps, one hurts, two are untested
+## Storage tuning: two knobs help, one hurts, one is untested
 
-Four settings change how the metadata store behaves. The first two have been
-measured over full mainnet replays and the last two have not; the numbers are in
-[bench-ledger.md](bench-ledger.md) and the reasoning in
-[ADR-0004](adr/0004-storage-backend.md).
+Four settings change how the metadata store behaves. Three are measured and
+one is not; the numbers are in [bench-ledger.md](bench-ledger.md) and the
+reasoning in [ADR-0004](adr/0004-storage-backend.md).
 
-**`--utxocachemaxsize` (default 150 MiB) is the one worth raising.**
+The two that help are the two flush triggers, and they are worth understanding
+together: a durable metadata commit is forced when **either** the UTXO cache
+fills or the metadata overlay fills. Each ceiling governs one of them, raising
+either reduces how often the node commits, and each measured ~12% on its own.
+
+**`--utxocachemaxsize` (default 150 MiB) is one of the two.**
 Connecting a block flushes the UTXO cache when it fills, and that flush
 forces a durable metadata commit — so the ceiling governs how often the node
 commits. Raising it on its own measured **12% faster** over a full chain at
@@ -154,19 +158,30 @@ not be pulled. `DCROXIDE_DB_OVERLAY` sets the ceiling in MiB and
 `DCROXIDE_DB_FLUSH_SECS` the interval in seconds. Unset, both keep the
 compiled defaults, so an untouched node behaves exactly as before.
 
-These are untuned: no value has been measured yet, which is why no
-recommendation appears here. What motivates exposing them is that the node is
-*fully stalled* — nothing runnable at all — for **48% of block-sync wall
-time**, and the 2026-08-16 flush-observer run places **90–98% of that inside a
-metadata-flush window**. Flushes are large: median **26.9 s**, longest 79.5 s,
-130 of them over a full sync. Cadence decides how many of those there are and
-how big each is, which is precisely what these two knobs and
-`--utxocachemaxsize` control. `--utxocachemaxsize` is the trigger with a
-measured 12%; whether the overlay's ceiling has comparable headroom is the open
-question these knobs make testable.
-Treat them as instruments, not as advice, and pair a raised value with the
-supervisor above — as with the UTXO cache, a larger overlay means more of the
-recent window replays after an unclean stop.
+**`DCROXIDE_DB_OVERLAY=800` measured 12.7% faster**, which makes it the
+second knob worth raising. Four alternating full-mainnet syncs, 256.1 and
+272.7 blk/s at the default against 288.4 and 307.5 at 800 MiB — ranges
+disjoint, and both adjacent pairs agreeing to 0.2 points. The mechanism is
+visible in the flush count, which drops 130 to 119.
+
+Why it works: the node is *fully stalled* — nothing runnable at all — for
+**48% of block-sync wall time**, and **90–98% of that is inside a
+metadata-flush window**. Flushes are large, a median of 26.9 s and a longest
+of 79.5 s. Cadence decides how many there are, and a durable commit is forced
+by *either* the UTXO cache filling or the overlay filling. Raising one ceiling
+leaves the other still firing, which is why both knobs matter.
+
+Whether the two **compose** is untested. `--utxocachemaxsize` measures 12% and
+this measures 12.7%, on independent triggers of the same commit; they may
+stack toward ~25% or may both be nearing one ceiling. Raising both is
+reasonable and unmeasured.
+
+`DCROXIDE_DB_FLUSH_SECS` (the time trigger, default 300) remains untuned — no
+value has been measured, and on a syncing node the size trigger fires long
+before the interval does.
+
+Pair any raised value with the supervisor above: as with the UTXO cache, a
+larger overlay means more of the recent window replays after an unclean stop.
 
 **Neither page-cache knob changes how densely the store packs.** Page fill sits at
 0.62-0.65 regardless of either setting, so neither shrinks the data
