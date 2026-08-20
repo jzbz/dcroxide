@@ -121,7 +121,17 @@ fn real_main() -> ExitCode {
         rand_bytes: Box::new(|buf| getrandom::fill(buf).expect("system random source")),
     };
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = match dcroxide_node::flags::args_after_program() {
+        Ok(args) => args,
+        Err(bad) => {
+            eprintln!(
+                "invalid UTF-8 in command line argument: {}",
+                bad.to_string_lossy()
+            );
+            eprintln!("Use {APP_NAME} -h to show usage");
+            return ExitCode::FAILURE;
+        }
+    };
     match load_config_from_argv(&args, &env) {
         Ok((cfg, _remaining_args)) => {
             // Perform a requested service command and exit (dcrd's

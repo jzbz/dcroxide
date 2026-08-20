@@ -305,7 +305,16 @@ fn prompt() {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = match dcroxide_node::flags::args_after_program() {
+        Ok(args) => args,
+        Err(bad) => {
+            eprintln!(
+                "invalid UTF-8 in command line argument: {}",
+                bad.to_string_lossy()
+            );
+            std::process::exit(1);
+        }
+    };
     let n = match parse_args(&args) {
         ParsedArgs::Run(n) => n,
         ParsedArgs::Help => {

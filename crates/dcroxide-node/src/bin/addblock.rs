@@ -68,7 +68,16 @@ fn real_main() -> Result<(), ()> {
     let home = app_data_dir(goos, "dcroxide", false, &|name| std::env::var(name).ok());
     let default_data_dir = Path::new(&home).join("data").to_string_lossy().into_owned();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = match dcroxide_node::flags::args_after_program() {
+        Ok(args) => args,
+        Err(bad) => {
+            log_error(&format!(
+                "invalid UTF-8 in command line argument: {}",
+                bad.to_string_lossy()
+            ));
+            return Err(());
+        }
+    };
     let (cfg, params) = match load_addblock_config(&args, &default_data_dir) {
         Ok(loaded) => loaded,
         Err(AddblockConfigError::Help) => {

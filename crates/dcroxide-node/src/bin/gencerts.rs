@@ -174,7 +174,13 @@ fn main() {
     };
     let mut help = false;
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = match dcroxide_node::flags::args_after_program() {
+        Ok(args) => args,
+        Err(bad) => fatalf(&format!(
+            "invalid UTF-8 in command line argument: {}\n",
+            bad.to_string_lossy()
+        )),
+    };
     let (state, err) = dcroxide_node::flags::scan_args_in(
         &GENCERTS_OPTIONS,
         &mut |spec, value| {

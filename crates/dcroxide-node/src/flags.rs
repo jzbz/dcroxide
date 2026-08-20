@@ -1597,6 +1597,27 @@ pub(crate) fn parse_ini(content: &str, filename: &str) -> Result<Vec<IniAssignme
     Ok(out)
 }
 
+/// The process arguments after the program name, as UTF-8 strings.
+///
+/// `std::env::args` panics on an argument that is not valid Unicode, and
+/// release builds abort on panic, so a single bad byte in argv kills the
+/// process before anything can say why.  Go strings are arbitrary bytes,
+/// so dcrd simply takes such an argument -- on unix a path need not be
+/// UTF-8 at all.
+///
+/// Matching that byte for byte would mean threading `OsStr` through every
+/// option, value, and config-file path; short of that, the offending
+/// argument is returned so the caller can report it and exit cleanly
+/// rather than abort silently.  Callers deliberately reject where dcrd
+/// would accept, which only affects argv this port could not represent
+/// anyway.
+pub fn args_after_program() -> Result<Vec<String>, std::ffi::OsString> {
+    std::env::args_os()
+        .skip(1)
+        .map(std::ffi::OsString::into_string)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
