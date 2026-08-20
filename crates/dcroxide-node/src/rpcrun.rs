@@ -399,6 +399,38 @@ impl RpcChain for NodeRpcChain {
             .is_blake3_pow_agenda_active(prev_blk_hash, &self.params)
             .map_err(|e| e.description)
     }
+
+    // The three seams below were never wired, so `getblocksubsidy` above
+    // the tip and ws `rebroadcastwinners` reached the trait defaults.
+    // Those defaults panicked, and release builds set `panic = "abort"`,
+    // so a limited-credential client -- the cheapest one -- could stop the
+    // node with a single call. The defaults are errors now, but an error
+    // is still the wrong answer when the chain can supply the real one:
+    // `crates/dcroxide-node/src/mining.rs:242,248,275` has been calling
+    // exactly these, with these signatures, all along.
+
+    fn is_subsidy_split_agenda_active(&self, prev_blk_hash: &Hash) -> Result<bool, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .is_subsidy_split_agenda_active(prev_blk_hash, &self.params)
+            .map_err(|e| e.description)
+    }
+
+    fn is_subsidy_split_r2_agenda_active(&self, prev_blk_hash: &Hash) -> Result<bool, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .is_subsidy_split_r2_agenda_active(prev_blk_hash, &self.params)
+            .map_err(|e| e.description)
+    }
+
+    fn tip_generation(&self) -> Vec<Hash> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .tip_generation()
+    }
 }
 
 /// The mempool seam for a daemon that has no mempool yet: every
