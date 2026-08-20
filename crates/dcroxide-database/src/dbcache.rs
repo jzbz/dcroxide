@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use crate::METADATA_TABLE;
 use crate::blockfile::BlockStore;
-use crate::error::{Error, ErrorKind, db_error};
+use crate::error::Error;
 
 /// The default size for the database cache (dcrd `defaultCacheSize`,
 /// 100 MiB).
@@ -643,7 +643,7 @@ impl DbCache {
         {
             let mut table = tx
                 .open_table(METADATA_TABLE)
-                .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+                .map_err(crate::storage_error)?;
             for (key, entry) in view.merged() {
                 dirty_entries = dirty_entries.saturating_add(1);
                 if let Some(sink) = &batch.write_log {
@@ -653,22 +653,18 @@ impl DbCache {
                     Some(v) => {
                         table
                             .insert(key, v.as_slice())
-                            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+                            .map_err(crate::storage_error)?;
                     }
                     None => {
-                        table
-                            .remove(key)
-                            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+                        table.remove(key).map_err(crate::storage_error)?;
                     }
                 }
             }
             if batch.take_stats {
                 let stats_started = Instant::now();
-                let db_stats = tx
-                    .stats()
-                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
-                let table_stats = redb::ReadableTableMetadata::stats(&table)
-                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+                let db_stats = tx.stats().map_err(crate::storage_error)?;
+                let table_stats =
+                    redb::ReadableTableMetadata::stats(&table).map_err(crate::storage_error)?;
                 sampled = Some(crate::RawStats {
                     page_size: db_stats.page_size() as u64,
                     allocated_pages: db_stats.allocated_pages(),
@@ -683,8 +679,7 @@ impl DbCache {
                 stats_elapsed = stats_started.elapsed();
             }
         }
-        tx.commit()
-            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        tx.commit().map_err(crate::storage_error)?;
         Ok(FlushOutcome {
             dirty_entries,
             stats_elapsed,

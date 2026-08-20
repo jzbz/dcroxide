@@ -123,11 +123,9 @@ pub fn create_dir_all_owner_only(path: &Path) -> std::io::Result<()> {
 /// markers in one transaction so a crash cannot leave them disagreeing,
 /// and that guarantee is worth nothing if the commit was never durable.
 fn begin_durable_write(kv: &redb::Database) -> Result<redb::WriteTransaction, Error> {
-    let mut tx = kv
-        .begin_write()
-        .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+    let mut tx = kv.begin_write().map_err(storage_error)?;
     tx.set_durability(redb::Durability::Immediate)
-        .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        .map_err(storage_error)?;
     Ok(tx)
 }
 
@@ -662,6 +660,43 @@ impl RawStats {
     }
 }
 
+/// Classify a redb error the way dcrd's `convertErr` classifies a
+/// leveldb one (`ffldb/db.go:138-166`): corruption gets its own kind
+/// and a closed engine reads as "not open", everything else is
+/// driver-specific.
+///
+/// redb reports corruption through several types -- `StorageError`,
+/// `TransactionError`, `CommitError`, `TableError` -- so this takes
+/// anything that converts into `redb::Error` and matches once there.
+/// `PreviousIo` and `RepairAborted` join `Corrupted` because all three
+/// mean the file cannot be trusted as it stands: a prior I/O failure
+/// left writes in an unknown state, and an aborted repair left the
+/// recovery half-done.
+///
+/// Nothing outside this crate branches on the kind today; the value is
+/// that `PARITY.md`'s claim about `convertErr` is true.
+///
+/// This is narrower than it looks, and deliberately so.  A physically
+/// damaged metadata page does not reach here at all: redb 4.1.0 hits
+/// `unreachable!()` in its btree walk and aborts the process under
+/// this workspace's `panic = "abort"` (redb #1331/#1332, recorded in
+/// `docs/adr/0004-storage-backend.md`).  What does reach here is the
+/// corruption redb *reports* -- checksum mismatches on the paths that
+/// verify, an aborted repair, a poisoned handle after a prior I/O
+/// failure.  Classifying those is worth the twenty lines; it is not a
+/// substitute for the reporting redb does not do.
+pub(crate) fn storage_error<E: Into<redb::Error>>(e: E) -> Error {
+    let e = e.into();
+    let kind = match &e {
+        redb::Error::Corrupted(_) | redb::Error::PreviousIo | redb::Error::RepairAborted => {
+            ErrorKind::Corruption
+        }
+        redb::Error::DatabaseClosed => ErrorKind::DbNotOpen,
+        _ => ErrorKind::DriverSpecific,
+    };
+    db_error(kind, e.to_string())
+}
+
 /// Classify a redb open failure.
 ///
 /// redb takes an exclusive `flock` on the metadata file and reports
@@ -735,6 +770,8 @@ impl Database {
         }
         // dcrd's ffldb only creates the tree when the database does not
         // exist (the guard above), and creates it 0700.
+        // Not a redb error: `storage_error` would relabel it "I/O
+        // error: ..." on the way through redb's own wrapper.
         create_dir_all_owner_only(&opts.path)
             .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
 
@@ -746,9 +783,7 @@ impl Database {
         {
             let wtx = begin_durable_write(&kv)?;
             {
-                let mut table = wtx
-                    .open_table(METADATA_TABLE)
-                    .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+                let mut table = wtx.open_table(METADATA_TABLE).map_err(storage_error)?;
                 let mut bidx_key =
                     Vec::with_capacity(BUCKET_INDEX_PREFIX.len() + 4 + BLOCK_IDX_BUCKET_NAME.len());
                 bidx_key.extend_from_slice(BUCKET_INDEX_PREFIX);
@@ -767,13 +802,10 @@ impl Database {
                     ),
                 ];
                 for (k, v) in ops {
-                    table
-                        .insert(k, v)
-                        .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+                    table.insert(k, v).map_err(storage_error)?;
                 }
             }
-            wtx.commit()
-                .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+            wtx.commit().map_err(storage_error)?;
         }
 
         let block_store = BlockStore::open(&opts.path, opts.network, opts.max_block_file_size)?;
@@ -821,17 +853,13 @@ impl Database {
 
         // Fetch the stored write cursor position.
         let (stored_file, stored_offset) = {
-            let rtx = kv
-                .begin_read()
-                .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
-            let table = rtx
-                .open_table(METADATA_TABLE)
-                .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+            let rtx = kv.begin_read().map_err(storage_error)?;
+            let table = rtx.open_table(METADATA_TABLE).map_err(storage_error)?;
             let mut key = METADATA_BUCKET_ID.to_vec();
             key.extend_from_slice(WRITE_LOC_KEY);
             let row = table
                 .get(key.as_slice())
-                .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?
+                .map_err(storage_error)?
                 .ok_or_else(|| {
                     db_error(ErrorKind::Corruption, "missing block-file write cursor row")
                 })?;
@@ -902,14 +930,8 @@ impl Database {
     /// so unlike [`Self::raw_stats`] it does not perturb what it measures.
     pub fn bucket_stats(&self) -> Result<Vec<BucketStats>, Error> {
         self.check_open()?;
-        let tx = self
-            .inner
-            .kv
-            .begin_read()
-            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
-        let table = tx
-            .open_table(METADATA_TABLE)
-            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        let tx = self.inner.kv.begin_read().map_err(storage_error)?;
+        let table = tx.open_table(METADATA_TABLE).map_err(storage_error)?;
 
         // Bucket id -> name, from the `bidx<parent><name>` index rows.
         let mut names: std::collections::BTreeMap<[u8; 4], String> =
@@ -920,10 +942,9 @@ impl Database {
         let mut agg: std::collections::BTreeMap<[u8; 4], (u64, u64, u64, [u64; 40])> =
             std::collections::BTreeMap::new();
 
-        let iter = redb::ReadableTable::range::<&[u8]>(&table, ..)
-            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        let iter = redb::ReadableTable::range::<&[u8]>(&table, ..).map_err(storage_error)?;
         for entry in iter {
-            let (k, v) = entry.map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+            let (k, v) = entry.map_err(storage_error)?;
             let key = k.value();
             let val = v.value();
             if key.starts_with(BUCKET_INDEX_PREFIX) {
@@ -1004,14 +1025,9 @@ impl Database {
         self.check_open()?;
         let tx = begin_durable_write(&self.inner.kv)?;
         let stats = {
-            let db_stats = tx
-                .stats()
-                .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
-            let table = tx
-                .open_table(METADATA_TABLE)
-                .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
-            let table_stats = redb::ReadableTableMetadata::stats(&table)
-                .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+            let db_stats = tx.stats().map_err(storage_error)?;
+            let table = tx.open_table(METADATA_TABLE).map_err(storage_error)?;
+            let table_stats = redb::ReadableTableMetadata::stats(&table).map_err(storage_error)?;
             RawStats {
                 page_size: db_stats.page_size() as u64,
                 allocated_pages: db_stats.allocated_pages(),
@@ -1026,8 +1042,7 @@ impl Database {
         };
         // Abort explicitly: committing would rewrite the root for a
         // read-only question.
-        tx.abort()
-            .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
+        tx.abort().map_err(storage_error)?;
         Ok(stats)
     }
 
@@ -1134,7 +1149,7 @@ impl Database {
                 if writable {
                     release(&self.inner);
                 }
-                return Err(db_error(ErrorKind::DriverSpecific, e.to_string()));
+                return Err(storage_error(e));
             }
         };
         drop(cache);
@@ -1223,6 +1238,15 @@ impl Database {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return Err(db_error(ErrorKind::DbNotOpen, "database is not open"));
         }
+        // A latched handle does not get one last flush.  The latch
+        // exists because a failed durable write leaves the cache
+        // holding its dirty set, so a retry can report success for a
+        // batch the engine already mishandled (`mark_fatal`); shutdown
+        // is a retry like any other, and the one whose `Ok` is most
+        // likely to be believed.  The handle is still marked closed
+        // first, matching dcrd's `Close`, which marks it closed even
+        // when the cache close fails (`ffldb/db.go:1978-1989`).
+        self.check_writable()?;
         // Flush the metadata write cache so a clean shutdown persists
         // everything (dcrd `Close` flushes the cache), waiting out any
         // committing transaction first (dcrd's close/write locks).
@@ -1663,6 +1687,91 @@ mod fatal_latch_tests {
                 .kind,
             ErrorKind::Fatal,
             "a clone shares Arc<DbInner> and must refuse too"
+        );
+    }
+
+    /// Shutdown does not get one last flush past the latch.
+    ///
+    /// `close` flushes the write cache, and the cache still holds the
+    /// dirty set the failed durable write left behind -- so without the
+    /// check it is a retry, and a retry that reports `Ok` is exactly the
+    /// sequence `mark_fatal` exists to prevent, arriving at the moment
+    /// its answer is least likely to be questioned.  dcrd has no latch
+    /// to respect, but it does mark the handle closed even when the
+    /// cache close fails (`ffldb/db.go:1978-1989`), so the ordering
+    /// here matches: closed first, then refuse.
+    #[test]
+    fn close_refuses_to_flush_a_latched_handle() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let opts = Options::new(tmp.path().join("blocks_redb"), 0x0709_1101);
+        let db = Database::create(&opts).expect("create");
+
+        db.inner.mark_fatal(db_error(
+            ErrorKind::DriverSpecific,
+            "simulated write failure",
+        ));
+
+        assert_eq!(
+            db.close().unwrap_err().kind,
+            ErrorKind::Fatal,
+            "close must not flush a latched cache"
+        );
+        // Still idempotent: the handle was marked closed regardless.
+        assert_eq!(
+            db.close().unwrap_err().kind,
+            ErrorKind::DbNotOpen,
+            "the handle is closed even though the flush was refused"
+        );
+    }
+}
+
+/// The redb-error classifier against dcrd's `convertErr` table.
+#[cfg(test)]
+mod storage_error_tests {
+    use super::*;
+
+    /// dcrd's `convertErr` gives corruption its own kind and reads a
+    /// closed engine as "not open" (`ffldb/db.go:138-166`); everything
+    /// else stays driver-specific.  redb splits its errors across four
+    /// types, so the mapping is checked through the two the port
+    /// actually receives -- a bare `StorageError` and the `CommitError`
+    /// a durable commit returns -- to prove the conversion, not just
+    /// the match arms.
+    #[test]
+    fn redb_errors_carry_dcrds_kinds() {
+        let cases: Vec<(redb::StorageError, ErrorKind)> = vec![
+            (
+                redb::StorageError::Corrupted("bad checksum".to_string()),
+                ErrorKind::Corruption,
+            ),
+            (redb::StorageError::PreviousIo, ErrorKind::Corruption),
+            (redb::StorageError::DatabaseClosed, ErrorKind::DbNotOpen),
+            (
+                redb::StorageError::ValueTooLarge(1 << 32),
+                ErrorKind::DriverSpecific,
+            ),
+            (
+                redb::StorageError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                ErrorKind::DriverSpecific,
+            ),
+        ];
+        for (raw, want) in cases {
+            let text = raw.to_string();
+            let via_commit = storage_error(redb::CommitError::from(raw)).kind;
+            assert_eq!(via_commit, want, "{text}");
+        }
+
+        // An aborted repair only exists as a `DatabaseError`, and means
+        // the recovery stopped half-done.
+        assert_eq!(
+            storage_error(redb::DatabaseError::RepairAborted).kind,
+            ErrorKind::Corruption,
+        );
+
+        // The description is redb's own text, unwrapped.
+        assert_eq!(
+            storage_error(redb::StorageError::Corrupted("bad checksum".to_string())).description,
+            "DB corrupted: bad checksum",
         );
     }
 }

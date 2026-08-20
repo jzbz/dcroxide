@@ -349,13 +349,20 @@ impl BlockStore {
         self.write_file = None;
         self.open_files.clear();
         // Only the files this rollback discards leave the dirty list:
-        // everything at or above `file_num` is either deleted below or
-        // truncated and synced by the truncation itself.  Files *below*
+        // everything *above* `file_num` is deleted below.  Files below
         // it keep bytes that survive the rollback, so dropping them here
         // would lose the pending fsync and let the metadata that
         // describes them be committed first — the exact ordering the
         // dirty list exists to prevent.
-        self.dirty_files.retain(|&num| num < file_num);
+        //
+        // `file_num` itself stays until its truncation has been synced.
+        // The truncate is what discharges its fsync, so dropping it up
+        // front would leave an unsynced prefix owed to nobody on every
+        // path where the truncate does not happen: an unwritable file,
+        // a full disk, an `EIO` out of `sync_all`.  Each returns an
+        // error, and the store keeps running — the next `sync` has to
+        // still know about it.
+        self.dirty_files.retain(|&num| num <= file_num);
 
         // Remove any files that are entirely after the target.
         let mut num = self.write_file_num;
@@ -371,7 +378,8 @@ impl BlockStore {
         let path = block_file_path(&self.db_path, file_num);
         if offset == 0 && !path.exists() {
             // Rolling back to the very start of a file that was never
-            // created.
+            // created: there are no bytes to truncate and none to sync.
+            self.dirty_files.retain(|&num| num != file_num);
             self.write_file_num = file_num;
             self.write_offset = 0;
             return Ok(());
@@ -385,6 +393,9 @@ impl BlockStore {
             .map_err(|e| io_err(&e, "failed to truncate block file"))?;
         file.sync_all()
             .map_err(|e| io_err(&e, "failed to sync truncated block file"))?;
+        // The truncation is on the platter, so the target file owes
+        // nothing further.
+        self.dirty_files.retain(|&num| num != file_num);
 
         self.write_file_num = file_num;
         self.write_offset = offset;
@@ -432,6 +443,59 @@ mod tests {
         // The sync must then actually reach it, leaving nothing owed.
         store.sync().expect("sync");
         assert!(store.dirty_files.is_empty());
+    }
+
+    /// A rollback whose truncation fails still owes the target file its
+    /// fsync.
+    ///
+    /// The dirty list is the barrier between the block bytes and the
+    /// metadata that names them, and the truncation is what discharges
+    /// the target's entry.  Dropping the entry before the truncation
+    /// runs means an unwritable file, a full disk, or an `EIO` out of
+    /// `sync_all` leaves an unsynced prefix that no later `sync` knows
+    /// about -- and `rollback_to` returning an error does not stop the
+    /// store, so there is a later `sync`.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rollback_truncation_keeps_the_target_file_dirty() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // Root ignores the mode bits, so skip rather than fail there.
+        let canary = dir.path().join("canary");
+        fs::write(&canary, b"x").expect("write canary");
+        fs::set_permissions(&canary, fs::Permissions::from_mode(0o444)).expect("chmod canary");
+        if OpenOptions::new().write(true).open(&canary).is_ok() {
+            return;
+        }
+
+        let mut store = small_store(dir.path());
+        for i in 0..2u8 {
+            store.write_block(&[i; 8]).expect("write block");
+        }
+        assert_eq!(store.dirty_files, vec![0]);
+
+        // Make file 0 unwritable, so the rollback cannot open it to
+        // truncate.
+        let path = block_file_path(dir.path(), 0);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).expect("chmod block file");
+
+        let err = store
+            .rollback_to(0, 8 + BLOCK_RECORD_OVERHEAD)
+            .expect_err("the truncation cannot open a read-only file");
+        assert!(
+            format!("{err}").contains("truncation"),
+            "the failure is the truncating open: {err}"
+        );
+        assert_eq!(
+            store.dirty_files,
+            vec![0],
+            "the fsync the truncation would have discharged is still owed"
+        );
+
+        // Restore the mode so the temp dir can be cleaned up.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("restore mode");
     }
 
     /// The reopen a sync performs on a rolled-past file must ask for
