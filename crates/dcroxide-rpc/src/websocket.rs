@@ -11,6 +11,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 
 use dcroxide_chainhash::Hash;
 use dcroxide_dcrjson::{GoType, GoValue, RPCError, RpcId, codes};
@@ -322,6 +323,24 @@ pub struct WsClient {
     pub filter_data: Option<WsClientFilter>,
 }
 
+/// Take the client's lock, ignoring poisoning.
+///
+/// dcrd's `wsClient` embeds one mutex and takes it a field at a time
+/// (`rpcwebsocket.go:1331`, `:303`, `:2333-2340`, `:2354-2356`).  The
+/// port had been holding it across the whole request instead, which is
+/// how one client's long call stalled notification fan-out to every
+/// other client: the delivery thread locks each target's state to build
+/// a notification, and a request that waits -- a rescan, a `generate`, a
+/// `getwork` template wait -- held that lock the entire time.
+///
+/// A Rust mutex poisons where Go's does not, and a handler that panicked
+/// mid-request leaves nothing this path needs to distrust: the client's
+/// own serving thread is its only writer, and the panic already became
+/// an error reply.
+pub fn lock_client(wsc: &Mutex<WsClient>) -> std::sync::MutexGuard<'_, WsClient> {
+    wsc.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl WsClient {
     /// A new client with the given session id (the synchronous parts
     /// of dcrd `newWebsocketClient`).
@@ -348,7 +367,7 @@ fn fields(v: &GoValue) -> &[GoValue] {
 /// method lists.
 pub fn handle_websocket_help<C: RpcChain>(
     server: &Server<C>,
-    _wsc: &mut WsClient,
+    _wsc: &Mutex<WsClient>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -392,7 +411,7 @@ pub fn handle_websocket_help<C: RpcChain>(
 /// handleloadtxfilter (dcrd `handleLoadTxFilter`).
 pub fn handle_load_tx_filter<C: RpcChain>(
     server: &Server<C>,
-    wsc: &mut WsClient,
+    wsc: &Mutex<WsClient>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -448,7 +467,12 @@ pub fn handle_load_tx_filter<C: RpcChain>(
         out_points.push(OutPoint { hash, index, tree });
     }
 
-    match wsc.filter_data.as_mut() {
+    // One guard across the read and the swap: they are a check-then-act
+    // pair, and although only this client's serving thread ever writes
+    // the slot, splitting them would invite a later reader to assume
+    // otherwise.
+    let mut client = lock_client(wsc);
+    match client.filter_data.as_mut() {
         Some(filter) if !reload => {
             for a in &addresses {
                 filter.add_address_str(a, &server.cfg.chain_params);
@@ -458,7 +482,7 @@ pub fn handle_load_tx_filter<C: RpcChain>(
             }
         }
         _ => {
-            wsc.filter_data = Some(WsClientFilter::new(
+            client.filter_data = Some(WsClientFilter::new(
                 &addresses,
                 &out_points,
                 &server.cfg.chain_params,
@@ -473,16 +497,18 @@ pub fn handle_load_tx_filter<C: RpcChain>(
 /// `SessionResult` value.
 pub fn handle_session<C: RpcChain>(
     _server: &Server<C>,
-    wsc: &mut WsClient,
+    wsc: &Mutex<WsClient>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
-    Ok(GoValue::Struct(vec![GoValue::Uint(wsc.session_id)]))
+    Ok(GoValue::Struct(vec![GoValue::Uint(
+        lock_client(wsc).session_id,
+    )]))
 }
 
 /// handlerebroadcastwinners (dcrd `handleRebroadcastWinners`).
 pub fn handle_rebroadcast_winners<C: RpcChain>(
     server: &Server<C>,
-    _wsc: &mut WsClient,
+    _wsc: &Mutex<WsClient>,
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let best_height = server.cfg.chain.best_snapshot().height;
@@ -505,7 +531,7 @@ pub fn handle_rebroadcast_winners<C: RpcChain>(
 /// handlenotifynewtransactions (dcrd `handleNotifyNewTransactions`).
 pub fn handle_notify_new_transactions<C: RpcChain>(
     server: &Server<C>,
-    wsc: &mut WsClient,
+    wsc: &Mutex<WsClient>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
@@ -514,10 +540,15 @@ pub fn handle_notify_new_transactions<C: RpcChain>(
         GoValue::Bool(b) => *b,
         other => panic!("expected optional bool field, got {other:?}"),
     };
-    wsc.verbose_tx_updates = verbose;
-    server
-        .ntfn_mgr
-        .register_new_mempool_txs_updates(wsc.session_id);
+    // Set then register, under one guard: the registration is what makes
+    // the flag observable to the delivery thread, so publishing them out
+    // of order would let a notification be built against the old flag.
+    let session_id = {
+        let mut client = lock_client(wsc);
+        client.verbose_tx_updates = verbose;
+        client.session_id
+    };
+    server.ntfn_mgr.register_new_mempool_txs_updates(session_id);
     Ok(GoValue::Null)
 }
 
@@ -525,11 +556,11 @@ pub fn handle_notify_new_transactions<C: RpcChain>(
 /// value.
 pub fn handle_rescan<C: RpcChain>(
     server: &Server<C>,
-    wsc: &mut WsClient,
+    wsc: &Mutex<WsClient>,
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     // The client's transaction filter must exist in order to continue.
-    if wsc.filter_data.is_none() {
+    if lock_client(wsc).filter_data.is_none() {
         return Err(RPCError::new(
             codes::MISC,
             "Transaction filter must be loaded before rescanning",
@@ -575,13 +606,30 @@ pub fn handle_rescan<C: RpcChain>(
         // Determine if the treasury rules are active as of the block.
         let is_treasury_enabled = server.is_treasury_agenda_active(&prev_blk_hash)?;
 
-        let filter = wsc.filter_data.as_mut().expect("checked above");
-        let transactions = rescan_block(
-            filter,
-            &block,
-            &server.cfg.chain_params,
-            is_treasury_enabled,
-        );
+        // Taken per block, not across the rescan: this is the request
+        // that made one client's long call stall notification delivery
+        // to every other client.
+        //
+        // The slot was checked above, and only this client's serving
+        // thread -- which is inside this call -- ever clears it, so the
+        // miss below is unreachable.  It is an error rather than an
+        // empty result anyway: a silent `Vec::new()` here would tell a
+        // wallet the block held nothing for it.
+        let transactions = {
+            let mut client = lock_client(wsc);
+            let Some(filter) = client.filter_data.as_mut() else {
+                return Err(RPCError::new(
+                    codes::MISC,
+                    "Transaction filter was unloaded during the rescan",
+                ));
+            };
+            rescan_block(
+                filter,
+                &block,
+                &server.cfg.chain_params,
+                is_treasury_enabled,
+            )
+        };
         if !transactions.is_empty() {
             discovered_data.push(GoValue::Struct(vec![
                 GoValue::String(block_hash.to_string()),
@@ -598,10 +646,13 @@ pub fn handle_rescan<C: RpcChain>(
 /// `serviceRequest`).
 pub fn ws_cmd_result<C: RpcChain>(
     server: &Server<C>,
-    wsc: &mut WsClient,
+    wsc: &Mutex<WsClient>,
     method_name: &str,
     cmd: &GoValue,
 ) -> Result<(GoValue, GoType), RPCError> {
+    // Immutable for the client's lifetime, so one read serves the whole
+    // dispatch and the registrations below take no lock at all.
+    let session_id = lock_client(wsc).session_id;
     let pair = match method_name {
         "help" => (handle_websocket_help(server, wsc, cmd)?, GoType::String),
         "loadtxfilter" => (
@@ -609,23 +660,23 @@ pub fn ws_cmd_result<C: RpcChain>(
             GoType::Int64.ptr(),
         ),
         "notifyblocks" => {
-            server.ntfn_mgr.register_block_updates(wsc.session_id);
+            server.ntfn_mgr.register_block_updates(session_id);
             (GoValue::Null, GoType::Int64.ptr())
         }
         "notifywork" => {
-            server.ntfn_mgr.register_work_updates(wsc.session_id);
+            server.ntfn_mgr.register_work_updates(session_id);
             (GoValue::Null, GoType::Int64.ptr())
         }
         "notifytspend" => {
-            server.ntfn_mgr.register_tspend_updates(wsc.session_id);
+            server.ntfn_mgr.register_tspend_updates(session_id);
             (GoValue::Null, GoType::Int64.ptr())
         }
         "notifywinningtickets" => {
-            server.ntfn_mgr.register_winning_tickets(wsc.session_id);
+            server.ntfn_mgr.register_winning_tickets(session_id);
             (GoValue::Null, GoType::Int64.ptr())
         }
         "notifynewtickets" => {
-            server.ntfn_mgr.register_new_tickets(wsc.session_id);
+            server.ntfn_mgr.register_new_tickets(session_id);
             (GoValue::Null, GoType::Int64.ptr())
         }
         "notifynewtransactions" => (
@@ -633,7 +684,7 @@ pub fn ws_cmd_result<C: RpcChain>(
             GoType::Int64.ptr(),
         ),
         "notifymixmessages" => {
-            server.ntfn_mgr.register_mix_messages(wsc.session_id);
+            server.ntfn_mgr.register_mix_messages(session_id);
             (GoValue::Null, GoType::Int64.ptr())
         }
         "rebroadcastwinners" => (
@@ -649,25 +700,25 @@ pub fn ws_cmd_result<C: RpcChain>(
             dcroxide_rpctypes::chainsvrwsresults::session_result(),
         ),
         "stopnotifyblocks" => {
-            server.ntfn_mgr.unregister_block_updates(wsc.session_id);
+            server.ntfn_mgr.unregister_block_updates(session_id);
             (GoValue::Null, GoType::Int64.ptr())
         }
         "stopnotifywork" => {
-            server.ntfn_mgr.unregister_work_updates(wsc.session_id);
+            server.ntfn_mgr.unregister_work_updates(session_id);
             (GoValue::Null, GoType::Int64.ptr())
         }
         "stopnotifytspend" => {
-            server.ntfn_mgr.unregister_tspend_updates(wsc.session_id);
+            server.ntfn_mgr.unregister_tspend_updates(session_id);
             (GoValue::Null, GoType::Int64.ptr())
         }
         "stopnotifynewtransactions" => {
             server
                 .ntfn_mgr
-                .unregister_new_mempool_txs_updates(wsc.session_id);
+                .unregister_new_mempool_txs_updates(session_id);
             (GoValue::Null, GoType::Int64.ptr())
         }
         "stopnotifymixmessages" => {
-            server.ntfn_mgr.unregister_mix_messages(wsc.session_id);
+            server.ntfn_mgr.unregister_mix_messages(session_id);
             (GoValue::Null, GoType::Int64.ptr())
         }
         _ => standard_cmd_result(server, method_name, cmd)?,
@@ -679,7 +730,7 @@ pub fn ws_cmd_result<C: RpcChain>(
 /// (the reply construction inside dcrd `serviceRequest`).
 pub fn ws_service_request<C: RpcChain>(
     server: &Server<C>,
-    wsc: &mut WsClient,
+    wsc: &Mutex<WsClient>,
     jsonrpc: &str,
     method_name: &str,
     cmd: &GoValue,

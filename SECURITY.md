@@ -106,10 +106,11 @@ evaluating this code.
   links, so it stays. Operators running many subscribers, or exposing the
   websocket to clients they do not control, should bound the process
   (a memory limit plus a supervisor) rather than expect the node to shed.
-  One port-specific amplifier: a single long request — a
-  multi-thousand-block `rescan` — holds the server lock for its duration
-  and stalls notification construction for every other client, where
-  dcrd's handlers hold no server-wide lock.
+  The port-specific amplifier this used to carry — a single long request
+  holding a lock that stalled notification construction for every other
+  client — is fixed: the server-wide lock is gone, and the per-client
+  lock is now taken a field at a time where it is used, as dcrd takes
+  its own, rather than across the whole request.
 - **Fuzzing reaches the leaf codecs and nothing else.** Eleven
   `cargo-fuzz` targets run for 60 seconds apiece on every push to
   `master` and every pull request, and for ten minutes apiece nightly:

@@ -287,6 +287,22 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   it, so two callers racing a cold cache can both generate — the generated text
   is deterministic, so they agree, and the second simply overwrites).
 
+  The per-client state took one round of this too. dcrd's `wsClient` embeds a
+  single mutex it takes a field at a time (`rpcwebsocket.go:1331`, `:303`,
+  `:2333-2340`, `:2354-2356`); the port had been holding that lock across the
+  whole request. The delivery thread locks each target client's state to build a
+  notification, and `MempoolTx` targets every connected client, so one client's
+  long call — a rescan, a `generate`, a `getwork` template wait — stalled fan-out
+  to all of them. The handlers take it where they use it now, and `rescan` takes
+  it per block rather than across the scan, which is where dcrd takes its own.
+  Three check-then-act pairs survive that split because the client's own serving
+  thread is the sole writer of the filter slot and the delivery thread only ever
+  adds outpoints to an existing filter; the two that could be split without harm
+  are kept under one guard anyway, so a later reader is not invited to assume
+  otherwise. Pinned by `a_parked_rescan_does_not_hold_the_client_lock`, which
+  measures whether the lock is free *while* a scan is parked — an earlier version
+  asserted only that it came free eventually, and passed against the bug.
+
   Two pieces of serialization the coarse lock had been supplying by accident had
   to be put back explicitly, because dcrd has its own mechanism for each and the
   port had been leaning on the wrapper instead. First, `getwork`: dcrd serializes

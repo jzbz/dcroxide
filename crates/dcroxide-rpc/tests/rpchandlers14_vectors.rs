@@ -243,7 +243,7 @@ fn websocket_client_core_matches_dcrd() {
             rpc_limit_pass: String::new(),
         });
         server.ntfn_mgr = Box::new(NoopNtfnMgr);
-        let mut wsc = WsClient::new(4660);
+        let wsc = std::sync::Mutex::new(WsClient::new(4660));
 
         while i < lines.len() && lines[i].starts_with("wstep|") {
             let step: Vec<&str> = lines[i].split('|').collect();
@@ -261,7 +261,7 @@ fn websocket_client_core_matches_dcrd() {
                 .unwrap_or_else(|e| panic!("{name}/{step_name}: parse params: {e:?}"));
             let cmd = GoValue::Struct(cmd_instance.fields);
 
-            match ws_cmd_result(&server, &mut wsc, method_name, &cmd) {
+            match ws_cmd_result(&server, &wsc, method_name, &cmd) {
                 Ok((value, typ)) => {
                     assert_eq!(result[3], "ok", "{name}/{step_name}: expected an error");
                     let got = gojson::encode(&typ, &value);

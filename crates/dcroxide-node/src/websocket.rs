@@ -844,23 +844,26 @@ fn handle_ws_request_inner(
     // `blake256HaserMu`).  The port reaches the same place: every seam
     // takes `&self`, the three pieces that are genuinely mutable
     // (`work_state`, the help caches, `subsidy_cache`) carry their own
-    // locks, and handlers run concurrently.  A long `rescan` no longer
-    // serializes other clients' requests or blocks the delivery thread
-    // from building notifications.  The client state still locks, and it
-    // is the only lock this path takes.
+    // locks, and handlers run concurrently.
+    //
+    // The client's own state is the last lock on this path, and it is no
+    // longer held across the request.  dcrd's `wsClient` embeds one mutex
+    // taken a field at a time (`rpcwebsocket.go:1331`, `:303`,
+    // `:2333-2340`); holding it for the whole call meant a request that
+    // waits -- a rescan, a `generate`, a `getwork` template wait -- stalled
+    // the delivery thread, which locks each target client's state to
+    // build a notification, and so stalled fan-out to every other client
+    // as well.  The handlers take it where they use it now.
     let jsonrpc = req.jsonrpc.clone();
     let id = req.id.clone();
     let method = req.method.clone();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let mut wsc = state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let parsed = parse_cmd(&server.registry, &jsonrpc, &method, &param_refs, &id);
         if let Some(err) = parsed.err {
             return create_marshalled_reply(&jsonrpc, &id, None, Some(&err)).ok();
         }
         let cmd = parsed.params.expect("a parsed command has params");
-        ws_service_request(server, &mut wsc, &jsonrpc, &method, &cmd, &id)
+        ws_service_request(server, state, &jsonrpc, &method, &cmd, &id)
     }));
     match outcome {
         Ok(Some(reply)) => WsOutcome::Reply(reply),
