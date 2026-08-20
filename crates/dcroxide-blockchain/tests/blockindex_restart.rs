@@ -20,9 +20,10 @@
 use std::sync::{Arc, Mutex};
 
 use dcroxide_blockchain::blockindex::BlockStatus;
-use dcroxide_blockchain::chaindb::db_put_deployment_ver;
+use dcroxide_blockchain::chaindb::{db_fetch_deployment_ver, db_put_deployment_ver};
 use dcroxide_blockchain::chainio::decode_block_index_entry;
 use dcroxide_blockchain::process::Chain;
+use dcroxide_blockchain::thresholdstate::current_deployment_version;
 use dcroxide_chaincfg::{Params, simnet_params};
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{Database, Options};
@@ -192,13 +193,14 @@ fn the_first_flush_after_a_restart_rewrites_no_block_index_rows() {
 }
 
 /// The one thing the un-marking split must not break: a row the load
-/// loop *changes* still gets marked.
+/// loop *changes* still reaches disk.
 ///
 /// The new-rules pass clears `VALIDATE_FAILED`/`INVALID_ANCESTOR` from
 /// blocks that failed under rules predating a newly detected agenda.
-/// Without the `status_changed` mark the cleared status would live in
-/// memory and never reach disk, and the block would fail again on the
-/// next restart.
+/// Startup flushes those rows and then advances the stored deployment
+/// version, so the pass does not run again -- which means an unmarked
+/// row would keep its failure forever, and the block would be rejected
+/// on every subsequent start.
 ///
 /// Arming it takes two adjustments.  The stored deployment version is
 /// pushed back to 0 so the binary's version leads it.  And simnet's next
@@ -206,7 +208,7 @@ fn the_first_flush_after_a_restart_rewrites_no_block_index_rows() {
 /// (`new_rules_start_time != 0`), so that start time is moved to 1 --
 /// below every corpus timestamp, so the median-time gate opens.
 #[test]
-fn the_new_rules_unmark_marks_the_node_it_changed() {
+fn the_new_rules_unmark_persists_the_node_it_changed() {
     let mut params = simnet_params();
     {
         let next = params
@@ -224,6 +226,7 @@ fn the_new_rules_unmark_marks_the_node_it_changed() {
         deployments.first_mut().expect("a deployment").start_time = 1;
     }
     let params = params;
+
     let dir = tempfile::tempdir().expect("tempdir");
     let opts = Options::new(dir.path().join("chain"), params.net.0);
     let seeded = seed(&opts, &params);
@@ -241,7 +244,7 @@ fn the_new_rules_unmark_marks_the_node_it_changed() {
         assert_ne!(
             Some(target),
             chain.index.lookup_node(&params.genesis_hash),
-            "the failed block must not be genesis, or the marking assertion collapses",
+            "the failed block must not be genesis, or the assertions collapse",
         );
         chain
             .index
@@ -255,30 +258,57 @@ fn the_new_rules_unmark_marks_the_node_it_changed() {
         db.close().expect("close");
     }
 
+    // The open that runs the pass: it clears the flag, flushes the row,
+    // and advances the stored version.
+    {
+        let db = Database::open(&opts).expect("reopen database");
+        let chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("reopen chain");
+        let node = chain
+            .index
+            .lookup_node(&failed_hash)
+            .expect("the failed block is in the index");
+        assert!(
+            !chain.store.node(node).status.known_validate_failed(),
+            "the new-rules pass did not clear VALIDATE_FAILED; the test arms nothing",
+        );
+        chain
+            .db
+            .as_ref()
+            .expect("db-backed")
+            .close()
+            .expect("close");
+    }
+
+    // The open that proves it: the version has advanced, so the pass
+    // cannot run again, and the flag must be clear because it was
+    // written rather than merely cleared in memory.
     let db = Database::open(&opts).expect("reopen database");
-    let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("reopen chain");
+    let chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("reopen chain");
+
+    let stored = {
+        let tx = chain
+            .db
+            .as_ref()
+            .expect("db-backed")
+            .begin(false)
+            .expect("begin read");
+        let v = db_fetch_deployment_ver(&tx);
+        tx.rollback().expect("rollback");
+        v
+    };
+    assert_eq!(
+        stored,
+        current_deployment_version(&params),
+        "the stored deployment version must have advanced, or the pass re-runs forever",
+    );
+
     let node = chain
         .index
         .lookup_node(&failed_hash)
         .expect("the failed block is in the index");
-
-    // Anti-vacuity: the pass must actually have cleared the flag, or the
-    // marking assertion below would be about nothing.
     assert!(
         !chain.store.node(node).status.known_validate_failed(),
-        "the new-rules pass did not clear VALIDATE_FAILED; the test arms nothing",
-    );
-
-    let genesis = chain
-        .index
-        .lookup_node(&params.genesis_hash)
-        .expect("genesis is in the index");
-    let mut dirty = chain.index.take_modified();
-    dirty.sort();
-    let mut want = vec![genesis, node];
-    want.sort();
-    assert_eq!(
-        dirty, want,
-        "the changed node must be marked, and nothing untouched should be",
+        "the cleared status never reached disk: the pass will not run again, so the block \
+         stays failed for the life of this data directory",
     );
 }

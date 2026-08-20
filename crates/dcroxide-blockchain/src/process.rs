@@ -617,9 +617,11 @@ impl Chain {
 
         // Load the chain state (dcrd `initChainState`).
         let mut load_err: Option<chaindb::ChainDbError> = None;
+        let mut new_rules_start_time = 0u64;
         db.view(|tx| {
-            if let Err(err) = chain.load_chain_state(tx, params) {
-                load_err = Some(err);
+            match chain.load_chain_state(tx, params) {
+                Ok(start_time) => new_rules_start_time = start_time,
+                Err(err) => load_err = Some(err),
             }
             Ok(())
         })?;
@@ -627,6 +629,16 @@ impl Chain {
             return Err(err);
         }
         chain.db = Some(db);
+
+        // The load's new-rules pass clears validation failures from
+        // blocks that failed under rules predating a newly detected
+        // agenda.  Those rows go down before the deployment version
+        // advances, so a crash between the two re-runs the pass rather
+        // than skipping it (dcrd `chainio.go:1776-1793`).
+        if new_rules_start_time != 0 {
+            chain.flush_block_index(params)?;
+        }
+        chain.update_deployment_version(params)?;
 
         // Catch the utxo set up to the tip of the best chain: the
         // cache only flushes periodically, so an unclean shutdown
@@ -640,11 +652,16 @@ impl Chain {
     /// data from the database transaction (the body of dcrd
     /// `initChainState` after initialization is known to have
     /// happened).
+    ///
+    /// Returns the start time of the newly detected deployments, which
+    /// the caller needs: a non-zero one means the load changed block
+    /// index rows, and dcrd flushes those before advancing the stored
+    /// deployment version (`chainio.go:1776-1793`).
     fn load_chain_state(
         &mut self,
         tx: &dcroxide_database::Transaction,
         params: &Params,
-    ) -> Result<(), crate::chaindb::ChainDbError> {
+    ) -> Result<u64, crate::chaindb::ChainDbError> {
         use crate::chaindb;
 
         let state = chaindb::db_fetch_best_state(tx)?;
@@ -724,11 +741,6 @@ impl Chain {
                 self.index.mark_modified(node);
             }
         }
-        if cur_version != 0 && cur_version != prev_version {
-            // dcrd updates the stored version here; deferred to the
-            // caller's update transaction via flush.
-        }
-
         // Set the best chain to the stored state.
         let tip = self.index.lookup_node(&state.hash).ok_or_else(|| {
             crate::chaindb::ChainDbError::Corrupt(format!(
@@ -898,7 +910,37 @@ impl Chain {
             missed_tickets: stake_node.missed_tickets(),
             next_final_state: stake_node.final_state(),
         };
-        Ok(())
+        Ok(new_rules_start_time)
+    }
+
+    /// Advance the stored deployment version to the binary's (dcrd
+    /// `updateDeploymentVersion`, `chainio.go:1547-1572`).
+    ///
+    /// Its own transaction, after the block index flush, because the
+    /// stored version is what tells the next startup whether the
+    /// new-rules pass still has work: writing it before those rows are
+    /// durable would let a crash in between skip the pass forever.
+    fn update_deployment_version(
+        &self,
+        params: &Params,
+    ) -> Result<(), crate::chaindb::ChainDbError> {
+        let cur_version = crate::thresholdstate::current_deployment_version(params);
+        // Zero means the network does not track deployments and always
+        // uses the latest rules, so there is nothing to record.
+        if cur_version == 0 {
+            return Ok(());
+        }
+        let Some(db) = &self.db else {
+            return Ok(());
+        };
+        db.update(|tx| {
+            if crate::chaindb::db_fetch_deployment_ver(tx) != cur_version {
+                crate::chaindb::db_put_deployment_ver(tx, cur_version)
+                    .map_err(chain_db_to_db_error)?;
+            }
+            Ok(())
+        })
+        .map_err(crate::chaindb::ChainDbError::Db)
     }
 
     /// Flush the durable chain state: the modified block index rows,
