@@ -344,8 +344,8 @@ pub fn new_sync_manager(
 ) -> NodeSyncManager {
     SyncManager::new(Config {
         chain: NodeSyncChain::new(chain, params.clone()),
-        tx_mem_pool: crate::txmempool::NodeSyncTxPool::new(tx_pool),
-        mix_pool: crate::mixnode::NodeSyncMixPool::new(mix_pool),
+        tx_mem_pool: crate::txmempool::NodeSyncTxPool::new(Arc::clone(&tx_pool)),
+        mix_pool: crate::mixnode::NodeSyncMixPool::new(mix_pool, tx_pool),
         min_known_chain_work: params.min_known_chain_work,
         net: params.net,
         target_time_per_block_secs: params.target_time_per_block_secs,

@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use dcroxide_chaincfg::{Params, simnet_params, testnet3_params};
 use dcroxide_chainhash::Hash;
+use dcroxide_mixing::no_mempool_spent;
 use dcroxide_mixing::{
     MixBlockChain, MixUtxoEntry, MixUtxoFetcher, Pool, PoolError, PoolMessage, Received, RuleKind,
 };
@@ -310,7 +311,7 @@ fn mixpool_vectors() {
                 let src: u64 = f[3].parse().expect("src");
                 let hash = msg.mix_hash().expect("hash");
                 sc.msgs.insert(hash.0, msg.clone());
-                let res = sc.pool.accept_message(&msg, src);
+                let res = sc.pool.accept_message(&msg, src, &no_mempool_spent);
                 let want = lines.next().expect("res line");
                 let got = match &res {
                     Ok(accepted) => {

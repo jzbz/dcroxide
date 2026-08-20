@@ -439,6 +439,24 @@ pub struct Pool<B: MixBlockChain> {
     now_fn: lru::Clock,
 }
 
+/// Whether the transaction memory pool already spends an outpoint
+/// (dcrd `mempool.TxPool.IsSpent`, consulted by `mixpoolChain
+/// .FetchUtxoEntry` at `server.go:3752-3754`).
+///
+/// A predicate rather than a pool handle on purpose.  dcrd answers this
+/// question from inside its utxo fetcher, which runs under the mixpool's
+/// own mutex; doing that here would take the tx-pool lock while holding
+/// the mixpool's, closing an AB-BA against the acceptance gauntlet's
+/// mixpool probe, which takes them the other way round.  The caller
+/// answers it first and passes the answer in.
+pub type MempoolSpent<'a> = &'a dyn Fn(&OutPoint) -> bool;
+
+/// The answer for a pool with no transaction memory pool behind it
+/// (dcrd's wallet-side pools, built without the `mixpoolChain` wrapper).
+pub fn no_mempool_spent(_: &OutPoint) -> bool {
+    false
+}
+
 impl<B: MixBlockChain> Pool<B> {
     /// A new mixing pool that accepts and validates mixing messages
     /// required for distributed transaction mixing (dcrd `NewPool`).
@@ -1023,6 +1041,7 @@ impl<B: MixBlockChain> Pool<B> {
         &mut self,
         msg: &PoolMessage,
         src: u64,
+        mempool_spent: MempoolSpent<'_>,
     ) -> Result<Vec<PoolMessage>, PoolError> {
         if msg.run() != 0 {
             return Err(rule_other("nonzero reruns are unsupported"));
@@ -1043,7 +1062,7 @@ impl<B: MixBlockChain> Pool<B> {
 
         let msgtype = match msg {
             PoolMessage::PR(pr) => {
-                self.check_accept_pr(pr)?;
+                self.check_accept_pr(pr, mempool_spent)?;
 
                 let accepted = self.accept_pr(pr, &hash, &id)?;
                 if !accepted {
@@ -1175,7 +1194,11 @@ impl<B: MixBlockChain> Pool<B> {
         }
     }
 
-    fn check_accept_pr(&self, pr: &MsgMixPairReq) -> Result<(), PoolError> {
+    fn check_accept_pr(
+        &self,
+        pr: &MsgMixPairReq,
+        mempool_spent: MempoolSpent<'_>,
+    ) -> Result<(), PoolError> {
         check_pr_limits(pr)?;
 
         let mut input_value = pr.input_value;
@@ -1248,6 +1271,18 @@ impl<B: MixBlockChain> Pool<B> {
             }
 
             if let Some(fetcher) = &self.utxo_fetcher {
+                // dcrd asks the memory pool before the chain
+                // (`server.go:3752-3754`) and returns a nil entry when it
+                // answers yes, which `mixpool.go:1448` folds into the
+                // same rejection as a spent one.  A pair request whose
+                // output an unmined transaction already spends is
+                // therefore refused rather than pooled and relayed.
+                if mempool_spent(&utxo.out_point) {
+                    return Err(rule_other(format!(
+                        "output {} is not unspent",
+                        op_string(&utxo.out_point)
+                    )));
+                }
                 let entry = fetcher
                     .fetch_utxo_entry(&utxo.out_point)
                     .map_err(PoolError::UtxoFetch)?;

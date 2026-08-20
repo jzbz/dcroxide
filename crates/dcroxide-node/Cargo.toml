@@ -77,6 +77,7 @@ libc = "0.2"
 dcroxide-winsvc = { path = "../dcroxide-winsvc" }
 
 [dev-dependencies]
+dcroxide-dcrec = { path = "../dcroxide-dcrec" }
 dcroxide-testutil = { path = "../dcroxide-testutil" }
 tempfile = "3"
 

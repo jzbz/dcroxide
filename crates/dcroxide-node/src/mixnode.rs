@@ -152,12 +152,46 @@ impl dcroxide_mempool::MixpoolProbe for NodeMixpoolProbe {
 /// reads.
 pub struct NodeSyncMixPool {
     pool: Arc<Mutex<NodeMixPool>>,
+    tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
 }
 
 impl NodeSyncMixPool {
     /// Adapt the shared pool for the sync manager.
-    pub fn new(pool: Arc<Mutex<NodeMixPool>>) -> NodeSyncMixPool {
-        NodeSyncMixPool { pool }
+    ///
+    /// Takes the transaction pool so pair-request acceptance can ask
+    /// whether an unmined transaction already spends the outputs a
+    /// request claims, which dcrd asks inside its utxo fetcher
+    /// (`server.go:3752-3754`).
+    pub fn new(
+        pool: Arc<Mutex<NodeMixPool>>,
+        tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
+    ) -> NodeSyncMixPool {
+        NodeSyncMixPool { pool, tx_pool }
+    }
+}
+
+/// The outpoint identity the snapshot is keyed on; `OutPoint` is not
+/// `Hash`, so the tuple stands in for it.
+type OutPointKey = ([u8; 32], u32, i8);
+
+fn op_key(op: &OutPoint) -> OutPointKey {
+    (op.hash.0, op.index, op.tree)
+}
+
+impl NodeSyncMixPool {
+    /// Which of the message's claimed outputs the memory pool already
+    /// spends (dcrd `mempool.TxPool.IsSpent`).
+    fn mempool_spent_outpoints(&self, msg: &PoolMessage) -> std::collections::HashSet<OutPointKey> {
+        let PoolMessage::PR(pr) = msg else {
+            // Only a pair request claims outputs.
+            return std::collections::HashSet::new();
+        };
+        let pool = self.tx_pool.lock().expect("tx pool mutex poisoned");
+        pr.utxos
+            .iter()
+            .filter(|utxo| pool.is_spent(&utxo.out_point))
+            .map(|utxo| op_key(&utxo.out_point))
+            .collect()
     }
 }
 
@@ -177,10 +211,23 @@ impl SyncMixPool for NodeSyncMixPool {
         msg: &PoolMessage,
         source: u64,
     ) -> Result<Vec<PoolMessage>, PoolError> {
+        // Answered before the mixpool guard is taken, and deliberately.
+        // dcrd asks this from inside its utxo fetcher, which runs under
+        // the mixpool's own mutex; doing the same here would take the
+        // tx-pool lock while holding the mixpool's, and the acceptance
+        // gauntlet's mixpool probe already takes them the other way
+        // round -- tx pool, then mixpool.  Asking first keeps the one
+        // order and closes no cycle.
+        //
+        // The snapshot covers only the outpoints this message names, so
+        // it is bounded by the wire's 512-outpoint cap on a pair
+        // request; every other message type names none.
+        let spent = self.mempool_spent_outpoints(msg);
+        let spent_fn = |op: &OutPoint| spent.contains(&op_key(op));
         self.pool
             .lock()
             .expect("mix pool mutex poisoned")
-            .accept_message(msg, source)
+            .accept_message(msg, source, &spent_fn)
     }
 
     fn recent_message(&mut self, hash: &Hash) -> bool {

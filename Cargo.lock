@@ -553,6 +553,7 @@ dependencies = [
  "dcroxide-connmgr",
  "dcroxide-containers",
  "dcroxide-database",
+ "dcroxide-dcrec",
  "dcroxide-dcrjson",
  "dcroxide-fees",
  "dcroxide-indexers",

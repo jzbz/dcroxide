@@ -19,6 +19,7 @@ use std::sync::Arc;
 use dcroxide_chaincfg::{Params, simnet_params};
 use dcroxide_chainhash::Hash;
 use dcroxide_dcrec::secp256k1::PrivateKey;
+use dcroxide_mixing::no_mempool_spent;
 use dcroxide_mixing::{
     MAX_KES_PER_IDENTITY, MixBlockChain, Pool, PoolMessage, SCRIPT_CLASS_P2PKH_V0, sign_message,
     sort_prs_for_session,
@@ -178,11 +179,11 @@ fn key_exchange(
 fn fill(pool: &mut Pool<StubChain>, seed: u8, expiry: u32, kes: u32) -> [u8; 33] {
     let (priv_key, id) = identity(seed);
     let pr = pair_request(&priv_key, id, expiry, seed);
-    pool.accept_message(&PoolMessage::PR(pr.clone()), 1)
+    pool.accept_message(&PoolMessage::PR(pr.clone()), 1, &no_mempool_spent)
         .expect("pair request is accepted");
     for n in 0..kes {
         let ke = key_exchange(&priv_key, id, &pr, n);
-        pool.accept_message(&PoolMessage::KE(Box::new(ke)), 1)
+        pool.accept_message(&PoolMessage::KE(Box::new(ke)), 1, &no_mempool_spent)
             .expect("key exchange is accepted");
     }
     id
@@ -284,7 +285,7 @@ fn key_exchange_flood_stops_at_the_per_identity_cap() {
     let mut pool = new_pool();
     let (priv_key, id) = identity(1);
     let pr = pair_request(&priv_key, id, 110, 1);
-    pool.accept_message(&PoolMessage::PR(pr.clone()), 1)
+    pool.accept_message(&PoolMessage::PR(pr.clone()), 1, &no_mempool_spent)
         .expect("pair request is accepted");
 
     let flood = MAX_KES_PER_IDENTITY as u32 + 64;
@@ -292,7 +293,7 @@ fn key_exchange_flood_stops_at_the_per_identity_cap() {
     let mut first_rejection = None;
     for n in 0..flood {
         let ke = key_exchange(&priv_key, id, &pr, n);
-        match pool.accept_message(&PoolMessage::KE(Box::new(ke)), 1) {
+        match pool.accept_message(&PoolMessage::KE(Box::new(ke)), 1, &no_mempool_spent) {
             Ok(msgs) => {
                 assert_eq!(msgs.len(), 1, "an accepted key exchange is relayed");
                 accepted += 1;
@@ -338,7 +339,7 @@ fn key_exchange_flood_stops_at_the_per_identity_cap() {
         MAX_KES_PER_IDENTITY - 1
     );
     let ke = key_exchange(&priv_key, id, &pr, flood);
-    pool.accept_message(&PoolMessage::KE(Box::new(ke)), 1)
+    pool.accept_message(&PoolMessage::KE(Box::new(ke)), 1, &no_mempool_spent)
         .expect("a freed slot accepts a key exchange again");
     assert_eq!(pool.identity_key_exchange_count(&id), MAX_KES_PER_IDENTITY);
 
