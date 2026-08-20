@@ -6,16 +6,15 @@ incomparable — after the fact. Prose snapshots (README, ADRs) cite
 these rows; this file is the record.
 
 Rules: append rows, never rewrite them. A row names the machine (table
-below), the dcroxide commit measured, the workload, and where the raw
-run lives. Raw exports, logs, and profiles stay out of the tree, under
-`/home/jz/zx/dev/artifacts/dcroxide-bench/<machine>/<commit>/` on the
-machine that ran them. **As of 2026-08-20 that directory does not exist
-on m1: every `Raw:` pointer below, both `Preserved baselines` datadirs,
-and the `artifacts/dcroxide-tools/engbench/` arm binaries record where a
-run was written, not a path anyone can still open.** Record a row for every storage-rework milestone,
-so the campaign against the IBD gap produces a curve, not before/after
-anecdotes. That gap was 2.23x when the campaign opened in 2026-07 and
-measured 1.29x on 2026-08-15; the curve is the point of this file.
+below), the dcroxide commit measured, the workload, and the raw export
+it came from. Raw exports, logs, and profiles stay out of the tree and
+are not retained: a `Raw:` line names the files a run produced so the
+row can say what it rests on, not a location anyone can open. **The
+figures in this file are the record.** Record a row for every
+storage-rework milestone, so the campaign against the IBD gap produces
+a curve, not before/after anecdotes. That gap was 2.23x when the
+campaign opened in 2026-07 and measured 1.29x on 2026-08-15; the curve
+is the point of this file.
 
 ## Machines
 
@@ -123,10 +122,10 @@ rolls the block files back when the metadata trails them). Probes open a
 fresh reflink clone of the snapshot; neither the original nor the snapshot
 is opened directly.
 
-| date | machine | what | path | notes |
+| date | machine | what | export | notes |
 |---|---|---|---|---|
-| 2026-08-07 | m1 | mainnet datadir behind the 2026-07 sync and storage rows | `artifacts/dcroxide-bench/m1/baseline-2026-07-25/blocks_ffldb/` | reflink clone of `artifacts/p2p-sync/data/mainnet/blocks_ffldb/`, written 2026-07-25; 31 GiB apparent, no additional space on btrfs, 22 s. `metadata.redb` is 15,551,119,360 B, the 14.483 GiB the ADR decomposes. |
-| 2026-08-11 | m1 | **dcrd** datadir behind the matched-composition rows | `artifacts/dcroxide-bench/m1/dcrd-payload/data/mainnet/` | dcrd 2.2.0-pre at the parity commit `29f17894`. Built by `tools/addblock -i mainnet-full.corpus` (12m17s, 1,493 blk/s) and then `dcrd --appdata … --norpc --nolisten --connect=127.0.0.1:1` to drive index catch-up. **Composition recorded, which is the point of keeping it:** exists-address index ON, transaction index OFF — `addblock` defaults, no `--txindex`. Kept because ADR-0009 records that losing the 2026-07 baseline's composition cost this project a conclusion. |
+| 2026-08-07 | m1 | mainnet datadir behind the 2026-07 sync and storage rows | `baseline-2026-07-25/blocks_ffldb/` | reflink clone of `artifacts/p2p-sync/data/mainnet/blocks_ffldb/`, written 2026-07-25; 31 GiB apparent, no additional space on btrfs, 22 s. `metadata.redb` is 15,551,119,360 B, the 14.483 GiB the ADR decomposes. |
+| 2026-08-11 | m1 | **dcrd** datadir behind the matched-composition rows | `dcrd-payload/data/mainnet/` | dcrd 2.2.0-pre at the parity commit `29f17894`. Built by `tools/addblock -i mainnet-full.corpus` (12m17s, 1,493 blk/s) and then `dcrd --appdata … --norpc --nolisten --connect=127.0.0.1:1` to drive index catch-up. **Composition recorded, which is the point of keeping it:** exists-address index ON, transaction index OFF — `addblock` defaults, no `--txindex`. Kept because ADR-0009 records that losing the 2026-07 baseline's composition cost this project a conclusion. |
 
 ## Replay throughput (dcroxide-bench)
 
@@ -162,13 +161,13 @@ synthetic inserts pinprobe applies.
 | 2026-08-09 | m1 | `7e74895` | full mainnet **with `--txindex --addrindex`**, 100 MiB overlay, `--statsevery 1` | 168 | Fill ends **0.6546** against the synced tip's 0.6486 (un-indexed 0.6258) — the invariant converges once composition matches. Free pages 0.0 to 4,465 MiB, ending 1,629 MiB / 10.6%; the same chain has now ended at 0.31, 1.59 and 4.69 GiB across three runs. Flush cost per dirty entry 1.77 to 23.27 us (13.2x) against un-indexed 1.59 to 14.87 us (9.4x). Live tree 11.56 GiB vs synced 9.79: both indexes enabled where the baseline had the address index only. |
 | 2026-08-09 | m1 | `14a1907` | full mainnet **with `--addrindex` alone** (matches the baseline's composition), 100 MiB overlay, `--statsevery 1` | 130 | **Reproduces the synced datadir**: live 9.82 GiB vs 9.79, free 3.97 GiB / 33.0% vs 4.69 / 32.4%, fill 0.6462 vs 0.6486. Retracts the "free pages are not a quantity" reading — the earlier 0.31/1.59/4.69 spread compared runs with different index configurations. Per dirty entry 1.80 to 13.70 us (7.6x), marginally cheaper than un-indexed, so the write-path cost of "indexes" belongs to the transaction index, not the address index. Free share still swings 0% to 94.6% within the run and 1.6% to 33.0% across the last ten flushes. Total 4,767 s at 230.8 blk/s. |
 
-Raw records: `artifacts/dcroxide-bench/m1/replay-flush-all.jsonl`; corpus
+Raw records: `replay-flush-all.jsonl`; corpus
 `mainnet-250k.corpus` (2.43 GB, exported from the 2026-07-25 baseline).
 
 The run averaged 445 blk/s where the full mainnet sync managed 124, so
 this slice is informative about curve shape and misleading about
 magnitude. Raw records for the full run:
-`artifacts/dcroxide-bench/m1/full-flush.jsonl`; corpus
+`full-flush.jsonl`; corpus
 `mainnet-full.corpus` (18.87 GB).
 
 ## Lever sweeps (`dcroxide-bench replay --dbcache/--metacache/--utxocache`)
@@ -185,7 +184,7 @@ durable metadata commit regardless.
 | 2026-08-10 | m1 | `62f65f4` | `sweep`: 4 arms x 3 reps, full mainnet, `--addrindex`, interleaved + rotated, 1 warm-up discarded | **First defensible throughput result.** All arms disjoint from baseline (3866-3888 s): cache 8 GiB **5125-6294 s, 1.50x — 50% slower**; cadence 800/1200 **3424-3467 s, 0.89x**; both 3459-3511 s, 0.90x. Lever (b) reverses its microbenchmark premise; lever (c) gives 11%; the cache penalty vanishes when cadence is raised, confirming the interaction. Cold-start run 1 at 6,440 s prompted the warm-up discard. |
 | 2026-08-11 | m1 | `49a53ef` | `sweep`: 5 arms x 3 reps, full mainnet, `--addrindex`, isolating the two operator-reachable knobs | **drift 1.00x.** `--utxocachemaxsize` alone carries the gain: utxo1200 **5490-6049 s, 0.88x — 12% faster**, utxo600 5608-6079 s, 0.93x, both **disjoint** from baseline 6332-6501 s. The page cache is correctly sized: db256 (1.01x) and db512 (1.00x) both **overlap** baseline, and 8192 was already 50% slower — so do not raise it, and nothing is gained by lowering it. |
 
-Raw records: `artifacts/dcroxide-bench/m1/s2-*.jsonl` and `lever-sweep2.log`.
+Raw records: `s2-*.jsonl` and `lever-sweep2.log`.
 
 **Absolute seconds are not comparable across sweeps.** The identical
 baseline configuration measured 3866-3888 s in the 2026-08-10 lever sweep
@@ -201,7 +200,7 @@ One pass of five hour-long arms cannot separate a 10% effect from a 64%
 drift; the second sweep is the evidence for that, not a counterexample.
 The third row above is that rig, built as `dcroxide-bench sweep`, and the
 measurement it made possible. Raw records:
-`artifacts/dcroxide-bench/m1/sweep-levers.jsonl`.
+`sweep-levers.jsonl`.
 
 ## Per-bucket decomposition (`dcroxide-bench redbstat --buckets`)
 
@@ -234,7 +233,7 @@ it does not perturb the store it measures.
 Six layouts built at the bucket's real row lengths, same pseudo-random key
 order and commit cadence, measured on `TableStats` (per-table
 `fragmented_bytes` is intra-page slack; the database-wide figure is not).
-Raw log: `artifacts/dcroxide-bench/m1/rekey2.log`.
+Raw log: `rekey2.log`.
 
 | arm | tree bytes | payload | slack | fill | vs today |
 |---|---:|---:|---:|---:|---:|
@@ -325,7 +324,7 @@ Closes the standing objection to the payload comparison above: dcrd's
 finished database, where `replay --addrindex` interleaves them across 1.1M
 block commits. Two arms at identical composition, order alternated
 twophase / interleave / interleave / twophase, `mainnet-full.corpus`,
-commit `73ac17e`, raw records in `artifacts/dcroxide-bench/m1/schedule-sweep.jsonl`.
+commit `73ac17e`, raw records in `schedule-sweep.jsonl`.
 
 | arm | live tree | fill | intra-page slack | leaf pages | branch pages | apparent |
 |---|---:|---:|---:|---:|---:|---:|
@@ -583,7 +582,7 @@ both all along. dcrd's wall time above is therefore recovered from its own log
 timestamps, process start to last block-progress line, not from the harness
 clock.
 
-Raw: `artifacts/dcroxide-bench/m1/daemon-vs/` — `rox.log`, `rox-cpu-VALID.txt`,
+Raw: `daemon-vs/` — `rox.log`, `rox-cpu-VALID.txt`,
 `dcrd2.log`, `dcrd-cpu.txt`, `server.log`, `server2.log`.
 
 ## Candidate engine benchmark (ADR-0009 prerequisite 4, 2026-08-13)
@@ -869,10 +868,10 @@ another, which is why the argument above rests on kernel-side and per-GiB
 evidence rather than on the own-thread comparison. Ambient was not matched
 between arms. n=1 per arm.
 
-Raw: `artifacts/dcroxide-bench/m1/dstate/` — `rox.jsonl`, `dcrd.jsonl` (34,083
+Raw: `dstate/` — `rox.jsonl`, `dcrd.jsonl` (34,083
 and 31,979 samples), `rox.log`, `dcrd.log`, `run.log`. Sampler and harness:
 [`tools/dsample/dsample.py`](../tools/dsample/dsample.py); harness
-`artifacts/dcroxide-bench/m1/dstate.sh`.
+`dstate.sh`.
 
 ### The wall-time share, from the same samples (2026-08-15)
 
@@ -1093,7 +1092,7 @@ defensible multiplier.
   that could not be starved — sampling from inside the process, or a fixed
   wall-clock schedule that records its own misses — would close it.
 
-Raw: `artifacts/dcroxide-bench/m1/flushobs/` — `rox.jsonl` (26,391 samples),
+Raw: `flushobs/` — `rox.jsonl` (26,391 samples),
 `flush.jsonl` (130 records), `rox.log`, `run.log`. Harness `flushobs.sh`,
 sampler [`tools/dsample/dsample.py`](../tools/dsample/dsample.py).
 
@@ -1157,8 +1156,8 @@ cache lock across the commit, the `compact` barrier, and the split flush
 accounting — is committed and stands on its own: it unblocks readers for the
 26.9 s median flush, and it costs nothing. Only the handoff was reverted.
 
-Raw: `artifacts/dcroxide-bench/m1/phase2/` against
-`artifacts/dcroxide-bench/m1/flushobs/`, same harness, same server, same
+Raw: `phase2/` against
+`flushobs/`, same harness, same server, same
 machine, hours apart.
 
 ## Write shape: redb 4.1.0 against fjall 3.1.8 (2026-08-17)
@@ -1227,10 +1226,10 @@ earlier in this campaign. It measures how the two engines respond to identical
 input, which is what the engine decision needs, and it does not say what IBD
 would do.
 
-Raw: `artifacts/dcroxide-bench/m1/writeshape.jsonl` (fjall first) and
+Raw: `writeshape.jsonl` (fjall first) and
 `writeshape2.jsonl` (redb first, journal pre-warmed). Harness
 `writeshape.sh` / `writeshape2.sh`, arm binary
-`artifacts/dcroxide-tools/engbench/src/bin/writeshape.rs`.
+`engbench/src/bin/writeshape.rs`.
 
 ## fjall against the crash gate (2026-08-17)
 
@@ -1288,7 +1287,7 @@ redb's 2.831x), wins on write shape (4.27x mean write, 9.7x fewer syscalls,
 Its power-loss behaviour and two upstream durability issues remain open, and
 they are the half a consensus node cannot compromise on.
 
-Harness: `artifacts/dcroxide-tools/engbench/src/bin/fjallcrash.rs`
+Harness: `engbench/src/bin/fjallcrash.rs`
 (`write`, `writesplit` control, `verify`, `sync`).
 
 ### Power loss, engine-independent (2026-08-17)

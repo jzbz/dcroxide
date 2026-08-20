@@ -429,7 +429,7 @@ the 1 GiB default.
 datadir, and opening it is not read-only — redb can quick-repair on open,
 and `Database::open` rolls the block files back when the metadata trails
 them (`lib.rs:882-884`). It has been reflink-cloned to
-`artifacts/dcroxide-bench/m1/baseline-2026-07-25/` (btrfs, 22 s, no
+`baseline-2026-07-25/` (btrfs, 22 s, no
 additional space); the clone is what probes open, and the original is not
 to be touched.
 
