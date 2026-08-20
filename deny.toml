@@ -18,7 +18,35 @@ allow = [
 ]
 
 [bans]
-multiple-versions = "warn"
+# A new duplicate should fail the build, which is only meaningful once
+# the ones already in Cargo.lock are enumerated below.  Under "warn" a
+# fresh duplicate is just a fourth warning nobody reads.  Flipping to
+# "deny" is safe because Cargo.lock is committed, so the check is
+# deterministic and can only trip on a deliberate lockfile change.
+#
+# cargo-deny ignores versions reachable only through dev-dependencies
+# (bans.multiple-versions-include-dev has defaulted to false since
+# 0.14.2), so the test-only redb 2.6.3 and the rand_core 0.9 /
+# getrandom 0.4 / r-efi 6 that proptest and tempfile drag in are
+# deliberately absent.  Listing them would be dead config that
+# cargo-deny reports back as unmatched-skip -- three duplicate warnings
+# traded for three unmatched-skip warnings is a net loss.
+#
+# Semver-range specs rather than exact pins, so a transitive patch bump
+# does not turn an entry into an unmatched-skip warning.
+multiple-versions = "deny"
+
+[[bans.skip]]
+crate = "cpufeatures:0.2"
+reason = "sha2, sha1, keccak, chacha20 and curve25519-dalek pin cpufeatures 0.2; blake3 is on 0.3"
+
+[[bans.skip]]
+crate = "getrandom:0.2"
+reason = "rand_core 0.6 (crypto-bigint -> elliptic-curve -> k256/p256/p384/p521) and ring 0.17 pin getrandom 0.2; the dcroxide crates use 0.3 directly"
+
+[[bans.skip]]
+crate = "windows-sys:0.52"
+reason = "ring 0.17 pins windows-sys 0.52; ctrlc, socket2 0.6 and windows-service 0.8 are on 0.61"
 
 [sources]
 unknown-registry = "deny"

@@ -134,9 +134,13 @@ impl Filter {
     /// items than the returned value will cause the oldest items to
     /// be expired.
     pub fn capacity(&self) -> u32 {
-        u32::from(self.l)
-            .wrapping_add(1)
-            .wrapping_mul(self.items_per_generation)
+        // dcrd computes `uint32(f.l+1)` and `f.l` is a uint8
+        // (`filter.go:122,172-174`), so the increment happens in eight
+        // bits: at l == 255 it wraps to zero and the reported capacity
+        // is 0, not 256 generations.  Widening before the add silently
+        // disagrees there.  The outer multiply is genuinely uint32 in
+        // Go and wraps too, so only the `+1` moves.
+        u32::from(self.l.wrapping_add(1)).wrapping_mul(self.items_per_generation)
     }
 
     /// The actual false positive rate for the filter (dcrd `FPRate`).

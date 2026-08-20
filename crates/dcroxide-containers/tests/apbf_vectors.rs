@@ -135,3 +135,24 @@ fn apbf_vectors() {
     }
     assert_eq!(counts, [5, 96, 15, 18, 9, 1], "row counts");
 }
+
+/// dcrd's `Capacity` computes `uint32(f.l+1)` with `f.l` a uint8, so
+/// the increment wraps at l == 255 and the reported capacity is zero.
+///
+/// Confirmed against dcrd at the parity pin: `NewFilterKL(1000, 1, 255)`
+/// reports 0 and `NewFilterKL(1000, 1, 254)` reports 1020. The frozen
+/// vector corpus cannot reach this -- its only `newkl` rows are
+/// `250 20 14` and `10 3 2` -- and the generator lives inside dcrd's
+/// package rather than in tools/, so the dcrd-verified constants are
+/// asserted directly.
+///
+/// No in-tree path reaches l == 255: both filter constructions go
+/// through `new_filter`, whose `near_optimal_l` caps l at 100. This is
+/// parity discipline on a public API, and it is what `PARITY.md`'s
+/// claim of "dcrd's exact wrapping arithmetic" for the capacity
+/// derivation actually requires.
+#[test]
+fn apbf_capacity_wraps_at_max_l() {
+    assert_eq!(new_filter_kl(1000, 1, 255).capacity(), 0);
+    assert_eq!(new_filter_kl(1000, 1, 254).capacity(), 1020);
+}
