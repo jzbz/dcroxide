@@ -7,6 +7,7 @@ use dcroxide_wire::{
     CurrencyNet, InvVect, Message, MsgAddr, MsgGetBlocks, MsgGetHeaders, MsgPing, MsgPong,
     MsgVersion, NetAddress, NetAddressV2, ServiceFlag,
 };
+use std::sync::Mutex;
 
 use crate::{MAX_KNOWN_INVENTORY, MAX_KNOWN_INVENTORY_TTL, MAX_PROTOCOL_VERSION, MsgTransport};
 
@@ -39,32 +40,68 @@ pub trait PeerEnv {
 /// shared across peers: the peer id counter and the nonces of sent
 /// version messages used to detect self connections.
 pub struct PeerGlobals {
-    node_count: i32,
-    sent_nonces: lru::Set<u64>,
+    node_count: core::sync::atomic::AtomicI32,
+    /// The nonce cache behind its own lock.
+    ///
+    /// `lru::Set::contains` promotes the entry, so it needs `&mut self`
+    /// even to read; a `Mutex` is the smallest thing that gives one from
+    /// a shared handle.  It is taken for the lookup and the insert only,
+    /// never across the handshake -- one shared lock held over a 30
+    /// second negotiate window would let a single slow peer stall every
+    /// new connection, which is a worse problem than the one this fixes.
+    sent_nonces: Mutex<lru::Set<u64>>,
     /// Bypass for the self-connection check (dcrd's test-only
-    /// `allowSelfConns`).
-    pub allow_self_conns: bool,
+    /// `allowSelfConns`, `peer.go:90-93`).
+    ///
+    /// Needed for the same reason dcrd needs it: the check compares a
+    /// nonce against every nonce this *process* has sent, so a harness
+    /// that stands up two nodes in one process is indistinguishable
+    /// from a node dialling itself, and dcrd's own tests set the
+    /// package variable for exactly that.
+    allow_self_conns: core::sync::atomic::AtomicBool,
 }
 
 impl PeerGlobals {
     /// Fresh globals (dcrd package init).
     pub fn new() -> PeerGlobals {
         PeerGlobals {
-            node_count: 0,
-            sent_nonces: lru::Set::new(crate::SENT_NONCES_LIMIT),
-            allow_self_conns: false,
+            node_count: core::sync::atomic::AtomicI32::new(0),
+            sent_nonces: Mutex::new(lru::Set::new(crate::SENT_NONCES_LIMIT)),
+            allow_self_conns: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn next_id(&mut self) -> i32 {
-        self.node_count = self.node_count.wrapping_add(1);
+    fn next_id(&self) -> i32 {
+        // dcrd's `atomic.AddInt32(&nodeCount, 1)` (`peer.go:1043`).
         self.node_count
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1)
+    }
+
+    /// Bypass the self-connection check (dcrd's `allowSelfConns = true`
+    /// in `peer_test.go:916`).  Tests only.
+    #[doc(hidden)]
+    pub fn set_allow_self_conns(&self, allow: bool) {
+        self.allow_self_conns
+            .store(allow, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a nonce is one this node sent, promoting it on a hit
+    /// exactly as `lru.Set.Contains` does.
+    fn sent_nonce(&self, nonce: u64) -> bool {
+        self.nonces().contains(&nonce)
+    }
+
+    fn nonces(&self) -> std::sync::MutexGuard<'_, lru::Set<u64>> {
+        self.sent_nonces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Insert a nonce into the sent-nonce cache directly.
     #[doc(hidden)]
-    pub fn put_sent_nonce(&mut self, nonce: u64) {
-        self.sent_nonces.put(nonce);
+    pub fn put_sent_nonce(&self, nonce: u64) {
+        self.nonces().put(nonce);
     }
 }
 
@@ -766,7 +803,7 @@ impl Peer {
         &mut self,
         transport: &mut T,
         env: &mut E,
-        globals: &mut PeerGlobals,
+        globals: &PeerGlobals,
         on_version: Option<&mut OnVersionFn<'_>>,
     ) -> Result<MsgVersion, NegotiateError> {
         // Read their version message.
@@ -787,7 +824,11 @@ impl Peer {
         };
 
         // Detect self connections.
-        if !globals.allow_self_conns && globals.sent_nonces.contains(&msg.nonce) {
+        if !globals
+            .allow_self_conns
+            .load(core::sync::atomic::Ordering::Relaxed)
+            && globals.sent_nonce(msg.nonce)
+        {
             return Err(NegotiateError::typed(
                 NegotiateErrorKind::SelfConnection,
                 "disconnecting peer connected to self",
@@ -847,7 +888,7 @@ impl Peer {
     fn local_version_msg<E: PeerEnv>(
         &mut self,
         env: &mut E,
-        globals: &mut PeerGlobals,
+        globals: &PeerGlobals,
     ) -> Result<MsgVersion, String> {
         let mut block_num: i64 = 0;
         if let Some(newest) = self.cfg.newest_block.as_mut() {
@@ -918,7 +959,7 @@ impl Peer {
         // Generate a unique nonce for this peer so self connections
         // can be detected.
         let nonce = env.rand_u64();
-        globals.sent_nonces.put(nonce);
+        globals.put_sent_nonce(nonce);
 
         // Version message.
         let mut msg = MsgVersion {
@@ -962,7 +1003,7 @@ impl Peer {
         &mut self,
         transport: &mut T,
         env: &mut E,
-        globals: &mut PeerGlobals,
+        globals: &PeerGlobals,
     ) -> Result<(), NegotiateError> {
         let local_ver_msg = self
             .local_version_msg(env, globals)
@@ -1050,7 +1091,7 @@ impl Peer {
         &mut self,
         transport: &mut T,
         env: &mut E,
-        globals: &mut PeerGlobals,
+        globals: &PeerGlobals,
         on_version: Option<&mut OnVersionFn<'_>>,
     ) -> Result<HandshakeOutcome, NegotiateError> {
         let remote = self.read_remote_version_msg(transport, env, globals, on_version)?;
@@ -1074,7 +1115,7 @@ impl Peer {
         &mut self,
         transport: &mut T,
         env: &mut E,
-        globals: &mut PeerGlobals,
+        globals: &PeerGlobals,
         on_version: Option<&mut OnVersionFn<'_>>,
     ) -> Result<HandshakeOutcome, NegotiateError> {
         self.write_local_version_msg(transport, env, globals)?;

@@ -165,10 +165,10 @@ fn dial(addr: SocketAddr) -> WireTransport<TcpStream> {
         .expect("set read timeout");
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let mut peer =
         Peer::new_outbound(config("dcroxide-out"), &addr.to_string()).expect("outbound peer");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("outbound negotiation");
     transport
 }

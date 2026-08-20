@@ -903,6 +903,29 @@ pub fn run_stall_detector(
     }
 }
 
+/// The peer state dcrd keeps in package globals: the id counter and the
+/// nonces of version messages this node has sent.
+///
+/// Process-wide for the same reason dcrd's are — self-connection
+/// detection compares a nonce arriving on one connection against the
+/// nonces sent on all the others, so a per-connection cache can never
+/// match.
+/// Bypass self-connection detection for in-process harnesses.
+///
+/// The check compares an arriving nonce against every nonce this
+/// *process* has sent, so two nodes stood up in one test process look
+/// exactly like a node dialling itself.  dcrd carries the same escape
+/// for the same reason (`peer.go:90-93`, set at `peer_test.go:916`).
+#[doc(hidden)]
+pub fn allow_self_connections() {
+    peer_globals().set_allow_self_conns(true);
+}
+
+fn peer_globals() -> &'static PeerGlobals {
+    static GLOBALS: std::sync::LazyLock<PeerGlobals> = std::sync::LazyLock::new(PeerGlobals::new);
+    &GLOBALS
+}
+
 /// Run a peer connection with dcrd's production stall timings.
 #[allow(clippy::too_many_arguments)] // Mirrors dcrd's connection surface.
 pub fn run_peer_connection<H>(
@@ -1021,21 +1044,27 @@ where
     // exactly where dcrd 2.2's `onVersion` callback runs.  The read
     // transport is full duplex, so it also writes the local messages.
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    // Shared by every connection, because that is the only way the check
+    // it feeds can fire.  dcrd keeps `sentNonces` and `nodeCount` in
+    // package globals (`peer/peer.go:83-92`); a fresh set per connection
+    // means the outbound half holds only its own nonce and the inbound
+    // half checks against an empty set, so a node that dials itself
+    // completes the handshake and peers with itself.
+    let globals = peer_globals();
     let outcome = {
         let mut on_version = |p: &Peer, msg: &dcroxide_wire::MsgVersion| hooks.on_version(p, msg);
         let negotiated = if peer.inbound() {
             peer.negotiate_inbound_protocol(
                 &mut read_transport,
                 &mut env,
-                &mut globals,
+                globals,
                 Some(&mut on_version),
             )
         } else {
             peer.negotiate_outbound_protocol(
                 &mut read_transport,
                 &mut env,
-                &mut globals,
+                globals,
                 Some(&mut on_version),
             )
         };

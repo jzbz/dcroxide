@@ -43,11 +43,11 @@ fn negotiates_version_between_inbound_and_outbound_peers() {
             .expect("set read timeout");
         let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
         let mut env = NodePeerEnv::new();
-        let mut globals = PeerGlobals::new();
+        let globals = PeerGlobals::new();
         let mut peer = Peer::new_outbound(config("dcroxide-out"), &server_addr.to_string())
             .expect("build outbound peer");
         let remote = peer
-            .negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+            .negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
             .expect("outbound negotiation");
         (
             peer.protocol_version(),
@@ -64,12 +64,12 @@ fn negotiates_version_between_inbound_and_outbound_peers() {
         .expect("set read timeout");
     let mut transport = WireTransport::new(server_stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let mut peer = Peer::new_inbound(config("dcroxide-in"));
     let na = net_address_v2_from_socket(remote_addr, ServiceFlag(0)).expect("remote net address");
     peer.associate(&remote_addr.to_string(), na, env.now_nanos());
     let remote = peer
-        .negotiate_inbound_protocol(&mut transport, &mut env, &mut globals, None)
+        .negotiate_inbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("inbound negotiation");
 
     // The inbound peer learned the outbound peer's advertised details.

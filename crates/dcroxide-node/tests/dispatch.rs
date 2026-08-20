@@ -122,14 +122,14 @@ fn serve_genesis_chain() -> GenesisChainRig {
         .expect("set read timeout");
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let config = Config {
         net: NET,
         protocol_version: 0,
         ..Config::default()
     };
     let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("negotiate");
     // The handshake exchanged the veracks; the served peer then
     // requests header announcements (dcrd `serverPeer.Run` queueing
@@ -246,14 +246,14 @@ fn bans_malformed_wire_messages() {
     let mut raw = stream.try_clone().expect("clone the socket");
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let config = Config {
         net: NET,
         protocol_version: 0,
         ..Config::default()
     };
     let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("negotiate");
     assert_eq!(
         transport.read_message().expect("read sendheaders"),
@@ -306,7 +306,7 @@ fn bans_malformed_wire_messages() {
     .expect("outbound");
     assert!(
         retry_peer
-            .negotiate_outbound_protocol(&mut retry, &mut env, &mut globals, None)
+            .negotiate_outbound_protocol(&mut retry, &mut env, &globals, None)
             .is_err(),
         "a banned host's handshake should be refused"
     );
@@ -574,7 +574,7 @@ fn serves_cfilters_and_init_state() {
         .expect("set read timeout");
     let mut retry = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let config = Config {
         net: NET,
         protocol_version: 0,
@@ -582,7 +582,7 @@ fn serves_cfilters_and_init_state() {
     };
     let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
     assert!(
-        peer.negotiate_outbound_protocol(&mut retry, &mut env, &mut globals, None)
+        peer.negotiate_outbound_protocol(&mut retry, &mut env, &globals, None)
             .is_err(),
         "a banned host's handshake should be refused"
     );
@@ -717,7 +717,7 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         .expect("set read timeout");
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let config = Config {
         net: NET,
         protocol_version: 0,
@@ -725,7 +725,7 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         ..Config::default()
     };
     let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("negotiate");
 
     // The daemon initiates the header sync: among the first messages
@@ -840,7 +840,7 @@ fn disconnects_a_stalled_header_sync_peer() {
         .expect("set read timeout");
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let config = Config {
         net: NET,
         protocol_version: 0,
@@ -848,7 +848,7 @@ fn disconnects_a_stalled_header_sync_peer() {
         ..Config::default()
     };
     let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("negotiate");
 
     // The daemon initiates the header sync, then this peer stalls: it
@@ -1057,14 +1057,14 @@ fn announces_connected_blocks_to_served_peers() {
         .expect("set read timeout");
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, net);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let config = Config {
         net,
         protocol_version: 0,
         ..Config::default()
     };
     let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("negotiate");
     // The handshake exchanged the veracks; the served peer then
     // requests header announcements (dcrd `serverPeer.Run` queueing

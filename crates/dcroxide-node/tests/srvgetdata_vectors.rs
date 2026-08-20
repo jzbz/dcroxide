@@ -506,14 +506,14 @@ fn serve_genesis_chain() -> (
         .expect("set read timeout");
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, SERVE_NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let config = Config {
         net: SERVE_NET,
         protocol_version: 0,
         ..Config::default()
     };
     let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("negotiate");
     assert_eq!(
         transport.read_message().expect("read sendheaders"),

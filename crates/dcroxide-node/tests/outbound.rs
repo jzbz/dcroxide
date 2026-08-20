@@ -94,6 +94,10 @@ fn template(name: &str) -> PeerTemplate {
 /// listener tears everything down.
 #[test]
 fn dials_and_serves_a_permanent_connection() {
+    // Two nodes in one process: the dialer's version nonce is one this
+    // process sent, so self-connection detection would fire on it.  dcrd's
+    // own tests take the same escape.
+    dcroxide_node::peerloop::allow_self_connections();
     let dir = tempfile::tempdir().expect("temp dir");
 
     // The listening daemon.
@@ -195,6 +199,10 @@ fn retries_an_unreachable_permanent_connection() {
 /// `connManager.Remove`).
 #[test]
 fn removing_a_permanent_peer_stops_its_redial() {
+    // Two nodes in one process: the dialer's version nonce is one this
+    // process sent, so self-connection detection would fire on it.  dcrd's
+    // own tests take the same escape.
+    dcroxide_node::peerloop::allow_self_connections();
     use dcroxide_rpc::server::RpcConnManager;
 
     let dir = tempfile::tempdir().expect("temp dir");

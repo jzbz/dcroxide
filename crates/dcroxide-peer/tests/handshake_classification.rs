@@ -92,8 +92,8 @@ fn inbound_classification(scripted: Vec<Message>, err: ReadError) -> bool {
     let mut transport = FailAfter { scripted, err };
     let mut peer = Peer::new_inbound(cfg());
     let mut env = FixedEnv;
-    let mut globals = PeerGlobals::new();
-    match peer.negotiate_inbound_protocol(&mut transport, &mut env, &mut globals, None) {
+    let globals = PeerGlobals::new();
+    match peer.negotiate_inbound_protocol(&mut transport, &mut env, &globals, None) {
         Ok(_) => panic!("the scripted read was supposed to fail the handshake"),
         Err(e) => e.wire_violation,
     }

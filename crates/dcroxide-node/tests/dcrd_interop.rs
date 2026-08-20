@@ -57,12 +57,12 @@ fn dcroxide_dials_dcrd_and_negotiates() {
 
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let mut peer = Peer::new_outbound(config("dcroxide-interop"), &dcrd.p2p_addr)
         .expect("build outbound peer");
 
     let outcome = peer
-        .negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+        .negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("dcrd must accept dcroxide's version handshake");
 
     let remote_agent = outcome.remote_version.user_agent;
@@ -104,11 +104,11 @@ fn dcrd_dials_dcroxide_and_negotiates() {
 
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let mut peer = Peer::new_inbound(config("dcroxide-interop"));
 
     let outcome = peer
-        .negotiate_inbound_protocol(&mut transport, &mut env, &mut globals, None)
+        .negotiate_inbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("dcroxide must accept dcrd's version handshake");
 
     let remote_agent = outcome.remote_version.user_agent;

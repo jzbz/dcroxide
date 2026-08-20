@@ -117,7 +117,7 @@ fn serves_an_inbound_peer_through_the_handler() {
         .expect("set read timeout");
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let client_config = Config {
         net: NET,
         services: ServiceFlag(1),
@@ -129,7 +129,7 @@ fn serves_an_inbound_peer_through_the_handler() {
     let mut peer =
         Peer::new_outbound(client_config, &format!("127.0.0.1:{port}")).expect("outbound peer");
     let outcome = peer
-        .negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+        .negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("negotiate with the server");
     let remote = outcome.remote_version;
     assert!(
@@ -195,14 +195,14 @@ fn disconnecting_all_peers_tears_down_a_served_connection() {
         .expect("set read timeout");
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let config = Config {
         net: NET,
         protocol_version: 0,
         ..Config::default()
     };
     let mut peer = Peer::new_outbound(config, &format!("127.0.0.1:{port}")).expect("outbound peer");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("negotiate");
 
     // The peer should register shortly after the handshake.

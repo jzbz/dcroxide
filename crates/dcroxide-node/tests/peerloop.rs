@@ -53,12 +53,12 @@ fn inbound_peer_answers_verack_and_ping_through_the_output_queue() {
         let mut read_transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
         let mut write_transport = WireTransport::new(write_stream, MAX_PROTOCOL_VERSION, NET);
         let mut env = NodePeerEnv::new();
-        let mut globals = PeerGlobals::new();
+        let globals = PeerGlobals::new();
         let mut peer = Peer::new_inbound(config("dcroxide-in"));
         let na = net_address_v2_from_socket(remote_addr, ServiceFlag(0)).expect("net address");
         peer.associate(&remote_addr.to_string(), na, env.now_nanos());
         let outcome = peer
-            .negotiate_inbound_protocol(&mut read_transport, &mut env, &mut globals, None)
+            .negotiate_inbound_protocol(&mut read_transport, &mut env, &globals, None)
             .expect("inbound negotiation");
 
         let peer = std::sync::Arc::new(Mutex::new(peer));
@@ -107,10 +107,10 @@ fn inbound_peer_answers_verack_and_ping_through_the_output_queue() {
         .expect("set read timeout");
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let mut peer = Peer::new_outbound(config("dcroxide-out"), &server_addr.to_string())
         .expect("outbound peer");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("outbound negotiation");
 
     // The handshake already exchanged the veracks; send a ping.
@@ -288,10 +288,10 @@ fn run_peer_connection_negotiates_and_serves_until_the_remote_closes() {
         .expect("set read timeout");
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let mut peer = Peer::new_outbound(config("dcroxide-out"), &server_addr.to_string())
         .expect("outbound peer");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("outbound negotiation");
 
     transport
@@ -360,10 +360,10 @@ fn run_peer_connection_frames_at_the_negotiated_version_not_the_sentinel() {
         .expect("set read timeout");
     let mut transport = WireTransport::new(stream, MAX_PROTOCOL_VERSION, NET);
     let mut env = NodePeerEnv::new();
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let mut peer = Peer::new_outbound(config("dcroxide-out"), &server_addr.to_string())
         .expect("outbound peer");
-    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+    peer.negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
         .expect("outbound negotiation");
 
     // feefilter is version-gated (FEE_FILTER_VERSION = 5); it decodes only

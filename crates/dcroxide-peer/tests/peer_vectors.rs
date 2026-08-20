@@ -249,7 +249,7 @@ fn normalize_version_frame(msg: &MsgVersion) -> Vec<u8> {
 
 #[test]
 fn peer_vectors() {
-    let mut globals = PeerGlobals::new();
+    let globals = PeerGlobals::new();
     let mut env = FixedEnv;
     let mut counts: HashMap<&str, usize> = HashMap::new();
 
@@ -298,9 +298,9 @@ fn peer_vectors() {
                 let (mut peer, inbound) = peer_for(label);
                 let mut transport = Scripted::new(&unhex(parts[3]));
                 let result = if inbound {
-                    peer.negotiate_inbound_protocol(&mut transport, &mut env, &mut globals, None)
+                    peer.negotiate_inbound_protocol(&mut transport, &mut env, &globals, None)
                 } else {
-                    peer.negotiate_outbound_protocol(&mut transport, &mut env, &mut globals, None)
+                    peer.negotiate_outbound_protocol(&mut transport, &mut env, &globals, None)
                 };
                 match &result {
                     Ok(outcome) => {
