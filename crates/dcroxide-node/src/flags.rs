@@ -1090,6 +1090,45 @@ pub const SERVICE_OPTIONS: [OptSpec; 1] = [OptSpec {
 
 /// Find an option by its long name in the given registry
 /// (short-only options carry an empty long name and never match).
+/// go-flags' built-in help option, registered only on the parser dcrd
+/// builds with `flags.HelpFlag` -- the help pre-parse at
+/// `config.go:653-659`.  The config-file pre-parse (`flags.None`) and
+/// the final parse (`flags.PassDoubleDash`) do not have it, which is
+/// why `--help=x` ends as ``unknown flag `help'``.
+/// A `static` rather than a `const`: the store callback identifies the
+/// injected spec by address, and `&CONST` is const-promoted per use
+/// site, so two promotions of the same const need not compare equal.
+pub static HELP_OPTION: OptSpec = OptSpec {
+    long: "help",
+    short: Some('h'),
+    field: "Help",
+    kind: OptKind::Bool,
+};
+
+/// Registry lookup that also consults the built-in help option, on the
+/// one parse that registers it.
+fn find_long_for(
+    registry: &'static [OptSpec],
+    mode: ScanMode,
+    name: &str,
+) -> Option<&'static OptSpec> {
+    find_long_in(registry, name).or(match mode {
+        ScanMode::IgnoreUnknown if name == "help" => Some(&HELP_OPTION),
+        _ => None,
+    })
+}
+
+fn find_short_for(
+    registry: &'static [OptSpec],
+    mode: ScanMode,
+    name: char,
+) -> Option<&'static OptSpec> {
+    find_short_in(registry, name).or(match mode {
+        ScanMode::IgnoreUnknown if name == 'h' => Some(&HELP_OPTION),
+        _ => None,
+    })
+}
+
 fn find_long_in(registry: &'static [OptSpec], name: &str) -> Option<&'static OptSpec> {
     find_long_with(registry, name, has_service_group(registry))
 }
@@ -1354,11 +1393,21 @@ pub(crate) fn scan_args<'a>(
     cfg: &mut Config,
     args: &'a [String],
     mode: ScanMode,
+    help: &mut bool,
 ) -> (ScanState<'a>, Option<ScanError>) {
     let mut pass = ParsePass::default();
     scan_args_in(
         &OPTIONS,
-        &mut |spec, value| set_option(cfg, &mut pass, spec, value),
+        &mut |spec, value| {
+            // The injected help spec has no `Config` field; it is the
+            // parse's own result, like go-flags' `ErrHelp`.
+            if core::ptr::eq(spec, &HELP_OPTION) {
+                *help = true;
+                Ok(())
+            } else {
+                set_option(cfg, &mut pass, spec, value)
+            }
+        },
         args,
         mode,
     )
@@ -1407,7 +1456,7 @@ pub fn scan_args_in<'a>(
                 Some((name, value)) => (name, Some(value.to_string())),
                 None => (rest, None),
             };
-            match find_long_in(registry, name) {
+            match find_long_for(registry, state.mode, name) {
                 Some(spec) => parse_option(store, &mut state, spec, true, argument),
                 None => Err(ScanError::UnknownFlag(name.to_string())),
             }
@@ -1457,7 +1506,7 @@ fn parse_shorts(
         if let Some(first) = chars.next() {
             let rest: String = chars.collect();
             if !rest.is_empty()
-                && let Some(spec) = find_short_in(registry, first)
+                && let Some(spec) = find_short_for(registry, state.mode, first)
                 && spec.kind != OptKind::Bool
             {
                 argument = Some(rest);
@@ -1468,7 +1517,7 @@ fn parse_shorts(
 
     let total = names.chars().count();
     for (i, c) in names.chars().enumerate() {
-        let Some(spec) = find_short_in(registry, c) else {
+        let Some(spec) = find_short_for(registry, state.mode, c) else {
             return Err(ScanError::UnknownFlag(c.to_string()));
         };
         // Only the last short option may consume a separate

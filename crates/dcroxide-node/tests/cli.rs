@@ -171,3 +171,48 @@ fn startup_serves_peer_connections_on_a_listener() {
         line.contains("Serving peer-to-peer connections on 127.0.0.1:")
     });
 }
+
+/// go-flags never lifts `--help` out of an argument position.
+///
+/// Help is an ordinary registered option on dcrd's help pre-parse
+/// (`config.go:653-659`, `flags.HelpFlag`), so it is parsed in argument
+/// order. After an option that takes a value, go-flags pops it as that
+/// value and then rejects it in `isValidValue` because it looks like an
+/// option -- `ErrExpectedArgument`, not `ErrHelp`, so the pre-parse
+/// does not exit and the same error resurfaces from the final parse.
+///
+/// The port used to scan argv positionally for `-h`/`--help` before the
+/// grammar ran, so these printed usage and exited 0: a command line
+/// dcrd rejects, reported to a supervisor as a successful run.
+#[test]
+fn help_after_an_argument_taking_option_is_an_error() {
+    for (tail, shown) in [("--help", "--help"), ("-h", "-h")] {
+        let (stdout, stderr, code) = run(&["--rpcuser", tail]);
+        assert_eq!(code, 1, "{tail}: stdout: {stdout}");
+        assert!(
+            stderr.contains(&format!(
+                "expected argument for flag `-u, --rpcuser', but got option `{shown}'"
+            )),
+            "{tail}: stderr: {stderr}"
+        );
+        assert!(!stdout.contains("Usage:"), "{tail}: usage was printed");
+    }
+}
+
+/// `-h` inside a short cluster is the help option, wherever it sits.
+///
+/// The positional prescan had no notion of clusters: `-Vh` printed the
+/// version and `-hV` reported ``unknown flag `h'``, where go-flags
+/// prints help and exits 0 for both.
+#[test]
+fn help_inside_a_short_cluster_requests_help() {
+    for cluster in ["-Vh", "-hV"] {
+        let (stdout, stderr, code) = run(&[cluster]);
+        assert_eq!(code, 0, "{cluster}: stderr: {stderr}");
+        assert!(stdout.contains("Usage:"), "{cluster}: stdout: {stdout}");
+        assert!(
+            !stdout.contains("dcroxide version"),
+            "{cluster}: the version preempted help"
+        );
+    }
+}

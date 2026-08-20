@@ -1399,10 +1399,6 @@ pub fn load_config_from_argv(
     args: &[String],
     env: &ConfigEnv<'_>,
 ) -> Result<(Config, Vec<String>), String> {
-    // The built-in help option exits before anything else.
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        return Err(ERR_HELP_REQUESTED.to_string());
-    }
     load_config_impl(&CliSource::Argv(args), env)
 }
 
@@ -1448,8 +1444,21 @@ fn load_config_impl(
     match cli {
         CliSource::Assignments { opts, .. } => assignments_pre_pass(&mut cfg, opts, env),
         CliSource::Argv(args) => {
-            let (state, err) =
-                crate::flags::scan_args(&mut cfg, args, crate::flags::ScanMode::IgnoreUnknown);
+            // Help is a registered option on this parse alone (dcrd's
+            // `flags.HelpFlag` pre-parse), so it is recognized in
+            // argument order and inside short clusters rather than by
+            // position -- and, like go-flags, it loses to an error
+            // raised before it is reached.
+            let mut help = false;
+            let (state, err) = crate::flags::scan_args(
+                &mut cfg,
+                args,
+                crate::flags::ScanMode::IgnoreUnknown,
+                &mut help,
+            );
+            if help && err.is_none() {
+                return Err(ERR_HELP_REQUESTED.to_string());
+            }
             if err.is_none() {
                 crate::flags::apply_env_defaults(&mut cfg, &state.set_names, &env.getenv);
             }
@@ -1463,8 +1472,12 @@ fn load_config_impl(
     match cli {
         CliSource::Assignments { opts, .. } => assignments_pre_pass(&mut pre_cfg, opts, env),
         CliSource::Argv(args) => {
-            let (state, err) =
-                crate::flags::scan_args(&mut pre_cfg, args, crate::flags::ScanMode::Plain);
+            let (state, err) = crate::flags::scan_args(
+                &mut pre_cfg,
+                args,
+                crate::flags::ScanMode::Plain,
+                &mut false,
+            );
             if err.is_none() {
                 crate::flags::apply_env_defaults(&mut pre_cfg, &state.set_names, &env.getenv);
             }
@@ -1597,8 +1610,12 @@ fn load_config_impl(
             positional.to_vec()
         }
         CliSource::Argv(args) => {
-            let (state, err) =
-                crate::flags::scan_args(&mut cfg, args, crate::flags::ScanMode::PassDoubleDash);
+            let (state, err) = crate::flags::scan_args(
+                &mut cfg,
+                args,
+                crate::flags::ScanMode::PassDoubleDash,
+                &mut false,
+            );
             if let Some(err) = err {
                 return Err(err.message());
             }
