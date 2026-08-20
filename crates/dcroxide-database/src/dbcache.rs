@@ -147,19 +147,35 @@ impl CacheSnapshot {
         LayerMerge::new(&self.layers, None)
     }
 
-    /// The merged view restricted to keys at or after the prefix,
-    /// ascending; the caller stops when the keys leave the prefix.
-    fn merged_from(&self, prefix: &[u8]) -> LayerMerge<'_> {
-        LayerMerge::new(&self.layers, Some(prefix))
-    }
-
     /// Fold the overlay's entries for the prefix into a set of keys
     /// gathered from the durable store: a live entry adds its key and a
     /// pending deletion masks it, with newer layers shadowing older
     /// ones (dcrd's snapshot iterator merged over the store iterator).
-    pub(crate) fn merge_prefix_keys(&self, prefix: &[u8], merged: &mut BTreeSet<Vec<u8>>) {
-        for (key, entry) in self.merged_from(prefix) {
+    ///
+    /// `after` skips keys an earlier window already returned, and
+    /// `upto` is the inclusive last key of the span the store scan
+    /// covered.  Both `None` folds the whole prefix.
+    ///
+    /// Overlay keys beyond `upto` are left for the next window rather
+    /// than dropped.  `None` for `upto` means the store scan reached the
+    /// end of the prefix, so there is no next window and the whole
+    /// remaining overlay belongs to this one.
+    pub(crate) fn merge_prefix_keys_window(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        upto: Option<&[u8]>,
+        merged: &mut BTreeSet<Vec<u8>>,
+    ) {
+        let from = after.unwrap_or(prefix);
+        for (key, entry) in LayerMerge::new(&self.layers, Some(from)) {
             if !key.starts_with(prefix) {
+                break;
+            }
+            if after.is_some_and(|a| key <= a) {
+                continue;
+            }
+            if upto.is_some_and(|u| key > u) {
                 break;
             }
             match entry {

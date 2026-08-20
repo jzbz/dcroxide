@@ -6,7 +6,9 @@
 
 use dcroxide_database::Database;
 
-use crate::common::{Interrupt, drop_index_metadata, exists_index, incremental_flat_drop};
+use crate::common::{
+    Interrupt, MAX_DELETIONS_PER_BATCH, drop_index_metadata, exists_index, incremental_flat_drop,
+};
 use crate::error::IdxError;
 
 /// The key of the legacy address index and the db bucket used to
@@ -27,7 +29,7 @@ pub fn drop_addr_index(interrupt: &Interrupt, db: &Database) -> Result<(), IdxEr
 
     // Since the indexes can be so large, use a cursor to delete a
     // maximum number of entries out of the bucket at a time.
-    incremental_flat_drop(interrupt, db, ADDR_INDEX_KEY)?;
+    incremental_flat_drop(interrupt, db, ADDR_INDEX_KEY, MAX_DELETIONS_PER_BATCH)?;
 
     // Remove the index tip, version, bucket, and in-progress drop
     // flag now that all index entries have been removed.

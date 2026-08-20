@@ -247,22 +247,69 @@ impl Transaction {
         Ok(())
     }
 
-    /// All raw keys beginning with the prefix, in raw byte order.
-    fn scan_prefix_keys(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
+    /// The exclusive upper bound of a prefix scan: the prefix with its
+    /// last incrementable byte incremented (goleveldb
+    /// `util.BytesPrefix` semantics).  `None` for an all-0xff prefix,
+    /// which scans to the end of the keyspace.
+    ///
+    /// Shared by the whole-prefix and windowed scans so the two cannot
+    /// drift apart.
+    fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
         let mut end = prefix.to_vec();
-        // The exclusive upper bound is the prefix with its last byte
-        // that can be incremented, incremented (goleveldb
-        // util.BytesPrefix semantics); an all-0xff prefix scans to the
-        // end of the keyspace.
-        let mut bounded = false;
         for i in (0..end.len()).rev() {
             if end[i] != 0xff {
                 end[i] += 1;
                 end.truncate(i + 1);
-                bounded = true;
-                break;
+                return Some(end);
             }
         }
+        None
+    }
+
+    /// All raw keys beginning with the prefix, in raw byte order.
+    fn scan_prefix_keys(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
+        self.scan_prefix_keys_window(prefix, None, None)
+    }
+
+    /// [`Self::scan_prefix_keys`] bounded to at most `limit` keys
+    /// starting strictly after `after`.
+    ///
+    /// The whole-prefix form materializes every key of the prefix at
+    /// once, which is what made dcrd's 2,000,000-key incremental drop
+    /// quadratic here: dcrd's cursor is a pair of lazy merged
+    /// iterators, so its batching bounds memory, while rebuilding this
+    /// one per batch re-read the entire bucket every time --
+    /// 66,494,886 rows for mainnet's `existsaddridx`.
+    ///
+    /// The bound has two cases, and conflating them loses keys.  When
+    /// the store range yields a full `limit`, the window is
+    /// store-bounded: the overlay may only contribute inside the span
+    /// the store covered, because overlay keys past its last key belong
+    /// to the next window.  When the store range yields fewer -- the
+    /// store portion of the prefix is exhausted -- there is no next
+    /// window to leave them to, so the rest of the overlay is merged
+    /// unbounded.  Bounding that case by the last store key would drop
+    /// every live key that exists only in the cache and sorts after it,
+    /// and the caller, seeing a short batch, would stop.
+    ///
+    /// Memory is O(`limit`) in the first case.  In the second it is
+    /// bounded by the cache ceiling rather than by `limit`, which is
+    /// finite but not the same claim.
+    fn scan_prefix_keys_window(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> Vec<Vec<u8>> {
+        let end = Self::prefix_upper_bound(prefix);
+        let bounded = end.is_some();
+        let end = end.unwrap_or_default();
+        // A resume key from below the prefix would start the overlay
+        // merge outside it, where the first key ends the walk -- so the
+        // window would return a neighbouring bucket's rows and none of
+        // its own.  The whole-prefix range this replaced supplied that
+        // bound implicitly.
+        let after = after.filter(|a| *a >= prefix);
 
         // Collect straight into the set the layered merge below needs.
         // The set itself is load-bearing — it dedups the stored keys
@@ -270,49 +317,109 @@ impl Transaction {
         // writes, and keeps them in the byte order ffldb's cursor
         // promises — but the intermediate `Vec` it used to be built
         // from was not, and cost one extra allocation per scan.
-        let collect = |iter: redb::Range<'_, &'static [u8], &'static [u8]>| -> std::collections::BTreeSet<Vec<u8>> {
-            iter.flatten().map(|(k, _)| k.value().to_vec()).collect()
-        };
-
+        let want = limit.unwrap_or(usize::MAX);
         let state = self.state.borrow();
         if state.kv.is_none() {
             return Vec::new();
         }
-        // One table for the whole scan, and one arm: both transaction
-        // kinds read through the same opened table.
-        let result = state.table.as_ref().and_then(|table| {
-            let range = if bounded {
-                table.range(prefix..end.as_slice())
-            } else {
-                table.range(prefix..)
-            };
-            range.ok().map(collect)
-        });
 
-        // Merge the layered views over the stored keys: the cache
-        // snapshot's live entries add and its deletions mask — with a
-        // newer overlay layer shadowing every older one for the same
-        // key — then this transaction's own pending sets do the same on
-        // top.
-        let mut merged: std::collections::BTreeSet<Vec<u8>> = result.unwrap_or_default();
-        state.cache_snap.merge_prefix_keys(prefix, &mut merged);
-        for key in state.pending_removes.range(prefix.to_vec()..) {
-            if !key.starts_with(prefix) {
+        let mut out: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+        let mut cursor_after: Option<Vec<u8>> = after.map(<[u8]>::to_vec);
+
+        loop {
+            let remaining = want.saturating_sub(out.len());
+            if remaining == 0 {
                 break;
             }
-            merged.remove(key);
-        }
-        for key in state
-            .pending_keys
-            .range::<Vec<u8>, _>(prefix.to_vec()..)
-            .map(|(k, _)| k)
-        {
-            if !key.starts_with(prefix) {
-                break;
+
+            // `after` is exclusive, so a resumed window never re-reads
+            // its own last key.
+            let lower: std::ops::Bound<&[u8]> = match cursor_after.as_deref() {
+                Some(a) => std::ops::Bound::Excluded(a),
+                None => std::ops::Bound::Included(prefix),
+            };
+            let upper: std::ops::Bound<&[u8]> = if bounded {
+                std::ops::Bound::Excluded(end.as_slice())
+            } else {
+                std::ops::Bound::Unbounded
+            };
+            // Collect straight into the set the layered merge needs.
+            // The set is load-bearing — it dedups the stored keys
+            // against the cache snapshot and this transaction's pending
+            // writes, and keeps them in the byte order ffldb's cursor
+            // promises.
+            let mut window: std::collections::BTreeSet<Vec<u8>> = state
+                .table
+                .as_ref()
+                .and_then(|table| {
+                    table.range::<&[u8]>((lower, upper)).ok().map(|iter| {
+                        iter.flatten()
+                            .map(|(k, _)| k.value().to_vec())
+                            .take(remaining)
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+
+            // A full store range means more store keys may follow, so
+            // the overlay contributes only within the span just
+            // covered.  A short one means the store is exhausted for
+            // this prefix, and the remaining overlay belongs to this
+            // window entirely.
+            let store_exhausted = window.len() < remaining;
+            let span_end = if store_exhausted {
+                None
+            } else {
+                window.last().cloned()
+            };
+
+            state.cache_snap.merge_prefix_keys_window(
+                prefix,
+                cursor_after.as_deref(),
+                span_end.as_deref(),
+                &mut window,
+            );
+
+            let in_window = |key: &[u8]| {
+                key.starts_with(prefix)
+                    && cursor_after.as_deref().is_none_or(|a| key > a)
+                    && span_end.as_deref().is_none_or(|u| key <= u)
+            };
+            let from = cursor_after.clone().unwrap_or_else(|| prefix.to_vec());
+            for key in state.pending_removes.range(from.clone()..) {
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                if in_window(key) {
+                    window.remove(key);
+                }
             }
-            merged.insert(key.clone());
+            for key in state
+                .pending_keys
+                .range::<Vec<u8>, _>(from..)
+                .map(|(k, _)| k)
+            {
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                if in_window(key) {
+                    window.insert(key.clone());
+                }
+            }
+
+            out.append(&mut window);
+
+            // Masking can leave a store-bounded window short of the
+            // limit.  Advancing past the span and pulling again is what
+            // keeps a batch full: returning short would tell the caller
+            // the prefix is finished when it is not.
+            match span_end {
+                Some(next) if !store_exhausted => cursor_after = Some(next),
+                _ => break,
+            }
         }
-        merged.into_iter().collect()
+
+        out.into_iter().take(want).collect()
     }
 
     /// Allocate the next bucket ID (dcrd `nextBucketID`).
@@ -923,6 +1030,63 @@ impl<'tx> Bucket<'tx> {
         }
     }
 
+    /// A cursor over at most `limit` keys starting strictly after
+    /// `after` (`None` from the beginning).
+    ///
+    /// [`Self::cursor`] snapshots the whole bucket, which is fine for a
+    /// bucket read once but quadratic for dcrd's batched
+    /// `incrementalFlatDrop`: dcrd's cursor is a pair of lazy merged
+    /// iterators, so restarting it per batch costs nothing, while
+    /// restarting this one re-materializes every remaining key.
+    ///
+    /// The nested-bucket index rows are appended only when the window
+    /// reaches the end of the key range, so a flat drop of a bucket
+    /// that wrongly has children still fails with
+    /// [`ErrorKind::IncompatibleValue`] -- at the end of the walk
+    /// rather than partway through it.
+    pub fn cursor_window(&self, after: Option<&[u8]>, limit: usize) -> Cursor<'tx> {
+        if self.tx.check_closed().is_err() {
+            return Cursor {
+                tx: self.tx,
+                bucket_id: self.id,
+                keys: Vec::new(),
+                pos: CursorPos::Exhausted,
+                parked: None,
+            };
+        }
+
+        // The cursor's keys carry the bucket id prefix, so a resume key
+        // from a previous window is already in the right space.
+        let mut keys = self
+            .tx
+            .scan_prefix_keys_window(&self.id, after, Some(limit));
+        if keys.len() < limit {
+            let mut prefix = Vec::with_capacity(BUCKET_INDEX_PREFIX.len() + 4);
+            prefix.extend_from_slice(BUCKET_INDEX_PREFIX);
+            prefix.extend_from_slice(&self.id);
+            // These sort after the key/value rows, so they fill the tail
+            // of the walk -- but they have to respect the window like
+            // everything else.  Scanning them unbounded overruns
+            // `limit`, and re-appending them on every window makes a
+            // caller that resumes from the last key walk forever.
+            let bidx_after = after.filter(|a| a.starts_with(BUCKET_INDEX_PREFIX));
+            keys.extend(self.tx.scan_prefix_keys_window(
+                &prefix,
+                bidx_after,
+                Some(limit.saturating_sub(keys.len())),
+            ));
+        }
+        keys.sort();
+
+        Cursor {
+            tx: self.tx,
+            bucket_id: self.id,
+            keys,
+            pos: CursorPos::Unpositioned,
+            parked: None,
+        }
+    }
+
     /// Whether the bucket is writable (dcrd `Writable`).
     pub fn writable(&self) -> bool {
         self.tx.writable
@@ -1197,6 +1361,21 @@ impl Cursor<'_> {
             return Some(raw[BUCKET_INDEX_PREFIX.len() + 4..].to_vec());
         }
         Some(raw[4..].to_vec())
+    }
+
+    /// The current key including its bucket prefix, for resuming a
+    /// [`Bucket::cursor_window`] walk where this one stopped.
+    ///
+    /// [`Self::key`] strips the prefix, which is what callers want to
+    /// read but not what the windowed scan ranges over.
+    pub fn raw_key(&self) -> Option<Vec<u8>> {
+        if self.tx.check_closed().is_err() {
+            return None;
+        }
+        match &self.parked {
+            Some((k, _)) => Some(k.clone()),
+            None => self.current_raw().map(<[u8]>::to_vec),
+        }
     }
 
     /// The current value; `None` when exhausted or pointing at a nested

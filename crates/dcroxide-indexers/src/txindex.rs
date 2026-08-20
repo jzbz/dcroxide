@@ -11,9 +11,10 @@ use dcroxide_database::{BlockRegion, Database, Transaction};
 use dcroxide_wire::{MsgBlock, var_int_serialize_size};
 
 use crate::common::{
-    ChainQueryer, INTERRUPT_MSG, Indexer, Interrupt, SyncWaiter, create_index, db_put_indexer_tip,
-    drop_index_metadata, exists_index, finish_drop, incremental_flat_drop, interrupt_requested,
-    make_db_err, mark_index_deletion, notify_sync_subscribers, tip, upgrade_index,
+    ChainQueryer, INTERRUPT_MSG, Indexer, Interrupt, MAX_DELETIONS_PER_BATCH, SyncWaiter,
+    create_index, db_put_indexer_tip, drop_index_metadata, exists_index, finish_drop,
+    incremental_flat_drop, interrupt_requested, make_db_err, mark_index_deletion,
+    notify_sync_subscribers, tip, upgrade_index,
 };
 use crate::error::{ErrorKind, IdxError, indexer_error};
 use crate::subscriber::{
@@ -601,7 +602,7 @@ pub fn drop_tx_index(interrupt: &Interrupt, db: &Database) -> Result<(), IdxErro
     // process is complete.
     mark_index_deletion(db, TX_INDEX_KEY)?;
 
-    incremental_flat_drop(interrupt, db, TX_INDEX_KEY)?;
+    incremental_flat_drop(interrupt, db, TX_INDEX_KEY, MAX_DELETIONS_PER_BATCH)?;
 
     // Call extra index specific deinitialization for the transaction
     // index.

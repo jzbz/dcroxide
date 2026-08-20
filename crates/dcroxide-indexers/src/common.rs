@@ -244,16 +244,33 @@ pub(crate) fn exists_index(db: &Database, idx_key: &[u8]) -> Result<bool, IdxErr
     Ok(exists)
 }
 
+/// Deletions per database update, matching dcrd's `incrementalFlatDrop`
+/// (`indexers.go`'s `maxDeletions`).
+pub(crate) const MAX_DELETIONS_PER_BATCH: u64 = 2_000_000;
+
 /// Remove key/value pairs from a flat index over multiple database
 /// updates (dcrd `incrementalFlatDrop`).
+///
+/// `max_deletions` is dcrd's fixed 2,000,000 in every caller; it is a
+/// parameter so the batching itself can be exercised, which needs a cap
+/// small enough to make the walk take more than one round.
 pub(crate) fn incremental_flat_drop(
     interrupt: &Interrupt,
     db: &Database,
     idx_key: &[u8],
+    max_deletions: u64,
 ) -> Result<(), IdxError> {
-    const MAX_DELETIONS: u64 = 2_000_000;
-    let mut num_deleted = MAX_DELETIONS;
-    while num_deleted == MAX_DELETIONS {
+    let mut num_deleted = max_deletions;
+    // Where the previous batch stopped.  dcrd's cursor is a pair of lazy
+    // merged iterators, so it can restart from the beginning each batch
+    // for free; this one materializes the keys it walks, so restarting
+    // it re-read the whole bucket every time -- 66,494,886 rows for
+    // mainnet's `existsaddridx`, once per 2,000,000-key batch.
+    //
+    // Deliberately not carried across calls to this function: an
+    // interrupted drop must start from whatever is actually left.
+    let mut resume: Option<Vec<u8>> = None;
+    while num_deleted == max_deletions {
         num_deleted = 0;
         let db_tx = db.begin(true)?;
         let res: Result<(), dcroxide_database::Error> = (|| {
@@ -261,12 +278,17 @@ pub(crate) fn incremental_flat_drop(
             let Some(bucket) = meta.bucket(idx_key) else {
                 return Ok(());
             };
-            let mut cursor = bucket.cursor();
+            let mut cursor = bucket.cursor_window(resume.as_deref(), max_deletions as usize);
             let mut ok = cursor.first();
             while ok {
+                // Captured before the delete: a nested-bucket row that
+                // `delete` refuses must not become the resume point, or
+                // the next batch would skip past everything before it.
+                let at = cursor.raw_key();
                 cursor.delete()?;
+                resume = at;
                 num_deleted = num_deleted.saturating_add(1);
-                ok = cursor.next() && num_deleted < MAX_DELETIONS;
+                ok = cursor.next() && num_deleted < max_deletions;
             }
             Ok(())
         })();
@@ -350,7 +372,7 @@ pub(crate) fn drop_flat_index(
     // process is complete.
     mark_index_deletion(db, idx_key)?;
 
-    incremental_flat_drop(interrupt, db, idx_key)?;
+    incremental_flat_drop(interrupt, db, idx_key, MAX_DELETIONS_PER_BATCH)?;
 
     drop_index_metadata(db, idx_key)
 }
@@ -492,4 +514,76 @@ pub(crate) fn maybe_notify_subscribers(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dcroxide_database::Options;
+
+    /// The batched walk empties a bucket whose keys straddle a flush.
+    ///
+    /// This calls [`incremental_flat_drop`] directly rather than
+    /// `drop_addr_index`, because that wrapper follows the walk with
+    /// `drop_index_metadata`, whose `delete_bucket` removes the bucket
+    /// unconditionally — an end-to-end assertion that the bucket is gone
+    /// passes even when the walk does nothing at all.
+    ///
+    /// The cap is small so the walk takes many rounds, which is the
+    /// point: a window that under-fills while keys remain ends the loop
+    /// early (`num_deleted < max_deletions`), exactly as dcrd's does.
+    ///
+    /// What this covers is the walk finishing the bucket. It does *not*
+    /// pin the window's store/overlay bound: the drop's own commits
+    /// flush as it proceeds, so overlay-only keys become store-resident
+    /// before a wrong bound can strand them. That bound is pinned where
+    /// it can be held still, in `dcroxide-database`'s
+    /// `cursor_window.rs`.
+    #[test]
+    fn the_batched_walk_empties_a_bucket_that_straddles_a_flush() {
+        const KEYS: u32 = 200;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = Options::new(dir.path().join("db"), 0x12141c16);
+        let db = Database::create(&opts).expect("create");
+        let idx_key: &[u8] = b"flatidx";
+
+        let tx = db.begin(true).expect("begin");
+        {
+            let bucket = tx.metadata().create_bucket(idx_key).expect("create bucket");
+            for i in 0..KEYS / 2 {
+                bucket.put(&i.to_be_bytes(), b"v").expect("put");
+            }
+        }
+        tx.commit().expect("commit");
+        db.flush().expect("flush the first half to the store");
+
+        let tx = db.begin(true).expect("begin");
+        {
+            let bucket = tx.metadata().bucket(idx_key).expect("bucket");
+            for i in KEYS / 2..KEYS {
+                bucket.put(&i.to_be_bytes(), b"v").expect("put");
+            }
+        }
+        tx.commit().expect("commit");
+
+        let interrupt: Interrupt = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        incremental_flat_drop(&interrupt, &db, idx_key, 7).expect("incremental drop");
+
+        // The bucket itself is untouched by the walk; what must be gone
+        // is every key in it.
+        let tx = db.begin(false).expect("begin");
+        let left = {
+            let bucket = tx.metadata().bucket(idx_key).expect("bucket still exists");
+            let mut cursor = bucket.cursor();
+            let mut n = 0usize;
+            let mut ok = cursor.first();
+            while ok {
+                n += 1;
+                ok = cursor.next();
+            }
+            n
+        };
+        tx.rollback().expect("rollback");
+        assert_eq!(left, 0, "{left} of {KEYS} keys survived the batched walk");
+    }
 }
