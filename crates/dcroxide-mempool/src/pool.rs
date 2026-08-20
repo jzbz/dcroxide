@@ -299,6 +299,26 @@ pub trait UnconfirmedAddrIndexer: Send {
     fn add_unconfirmed_tx(&mut self, tx: &MsgTx);
 }
 
+/// The mixpool's view of which outpoints are reserved by a current pair
+/// request (dcrd's mempool config carrying `mixpool.NonMixSpendsPairRequest`).
+///
+/// `None` on the pool means "no", matching dcrd's nil-closure guard at
+/// `mempool.go:1353`.
+///
+/// **Lock order.** The implementation takes the mixpool lock, and the pool
+/// calls it while holding its own, creating a tx-pool -> mixpool edge. The
+/// reverse edge must not exist: `chainntfns.rs:23-28` records that the
+/// mixpool never calls into the tx pool while holding its own lock, and
+/// RVW-001's fix (consulting mempool spentness during pair-request
+/// acceptance) must therefore do so BEFORE taking the mixpool lock, which
+/// is also how dcrd structures it -- `checkAcceptPR` runs ahead of
+/// `p.mtx.Lock()` at `mixpool.go:1206-1211`.
+pub trait MixpoolProbe: Send {
+    /// Whether a NON-mix transaction spends an outpoint a current pair
+    /// request depends on (dcrd `NonMixSpendsPairRequest`).
+    fn non_mix_spends_pair_request(&self, tx: &MsgTx) -> bool;
+}
+
 /// The optional vote-received hook (dcrd mempool `Config`'s
 /// `OnVoteReceived` callback, wired to the background template
 /// generator's `VoteReceived`): the pool forwards every accepted vote
@@ -333,6 +353,7 @@ pub struct TxPool<C: PoolChain> {
     exists_addr_index: Option<Box<dyn UnconfirmedAddrIndexer>>,
     vote_receiver: Option<Box<dyn VoteReceiver>>,
     fee_estimator: Option<Box<dyn FeeEstimatorSink>>,
+    mixpool_probe: Option<Box<dyn MixpoolProbe>>,
 }
 
 impl<C: PoolChain> TxPool<C> {
@@ -361,6 +382,7 @@ impl<C: PoolChain> TxPool<C> {
             exists_addr_index: None,
             vote_receiver: None,
             fee_estimator: None,
+            mixpool_probe: None,
         }
     }
 
@@ -383,6 +405,28 @@ impl<C: PoolChain> TxPool<C> {
     /// the fee-estimation closures).
     pub fn set_fee_estimator(&mut self, estimator: Box<dyn FeeEstimatorSink>) {
         self.fee_estimator = Some(estimator);
+    }
+
+    /// Whether a mixpool probe is installed, and so whether the
+    /// acceptance gauntlet actually runs its `NonMixSpendsPairRequest`
+    /// step.
+    ///
+    /// A pool without one skips the step silently, which is the way this
+    /// fix fails: correct in the gauntlet, never reached in the daemon.
+    /// Exposed so the node side can assert its wiring rather than trust
+    /// it.
+    pub fn has_mixpool_probe(&self) -> bool {
+        self.mixpool_probe.is_some()
+    }
+
+    /// Install the mixpool probe the acceptance gauntlet consults for
+    /// dcrd's `NonMixSpendsPairRequest` step.
+    ///
+    /// Installed after construction because the mixpool is built later in
+    /// daemon startup than the tx pool; without this call the step is
+    /// inert and the gauntlet silently keeps its pre-fix behaviour.
+    pub fn set_mixpool_probe(&mut self, probe: Box<dyn MixpoolProbe>) {
+        self.mixpool_probe = Some(probe);
     }
 
     /// Insert a vote into the map of block votes (dcrd `insertVote`).
@@ -1254,6 +1298,18 @@ impl<C: PoolChain> TxPool<C> {
                 );
                 return Err(tx_rule_error(ErrorKind::InsufficientFee, str).into());
             }
+        }
+
+        // A non-mix transaction may not spend an output a current mixpool
+        // pair request depends on (dcrd `mempool.go:1351-1357`). Applies to
+        // every transaction type, so it sits ahead of the vote/revocation
+        // branch rather than inside it.
+        if let Some(mix) = &self.mixpool_probe
+            && mix.non_mix_spends_pair_request(&tx)
+        {
+            let str =
+                format!("non-mix transaction {tx_hash} spends current mixpool pair request UTXOs");
+            return Err(tx_rule_error(ErrorKind::MixpoolDoubleSpend, str).into());
         }
 
         // Aside from a few exceptions for votes and revocations, the

@@ -55,7 +55,7 @@ fn serve_ws() -> (
         8,
         1000,
         Arc::clone(&tx_pool),
-        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
     )));
     let mut server = Server::new(Config {
         chain: NodeRpcChain::new(chain, params.clone()),
@@ -331,6 +331,15 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
     let params = dcroxide_chaincfg::testnet3_params();
     // Unsynced mining allowed so the drain's is-current gate stays
     // open over the genesis-only fixture chain.
+    let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+        Arc::clone(&chain),
+        &params,
+        false,
+        100,
+        10000,
+        false,
+        false,
+    );
     let handler = dcroxide_node::chainntfns::ChainNtfnHandler::new(
         Some(ntfn.clone()),
         params.clone(),
@@ -341,16 +350,9 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
         Some(dcroxide_node::mixnode::shared_mix_pool(
             Arc::clone(&chain),
             params.clone(),
+            &tx_pool,
         )),
-        dcroxide_node::txmempool::new_shared_tx_pool(
-            Arc::clone(&chain),
-            &params,
-            false,
-            100,
-            10000,
-            false,
-            false,
-        ),
+        Arc::clone(&tx_pool),
         dcroxide_node::dispatch::SyncPeers::new(),
         dcroxide_node::dispatch::new_recently_advertised(),
     );

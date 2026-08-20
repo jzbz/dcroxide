@@ -1109,7 +1109,10 @@ fn build_server(
     };
     // The mixing pool the getdata serve path and the sync manager share
     // (dcrd `newServer` building one `mixpool.Pool`).
-    let mix_pool = dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone());
+    // Building it installs the tx pool's pair-request probe, so the
+    // acceptance gauntlet runs dcrd's `NonMixSpendsPairRequest` step.
+    let mix_pool =
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool);
     // The sync manager shares the chain with the message handlers
     // (dcrd `newServer` building its `netsync.Config`).
     let sync_manager = Arc::new(Mutex::new(dcroxide_node::sync::new_sync_manager(

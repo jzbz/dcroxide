@@ -210,7 +210,7 @@ fn serves_getwork_over_the_live_generator() {
         8,
         1000,
         Arc::clone(&tx_pool),
-        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
     )));
     let server = Arc::new(Server::new(Config {
         chain: NodeRpcChain::new(Arc::clone(&chain), params.clone()),

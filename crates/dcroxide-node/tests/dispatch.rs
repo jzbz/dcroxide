@@ -80,7 +80,7 @@ fn serve_genesis_chain() -> GenesisChainRig {
             8,
             1000,
             Arc::clone(&tx_pool),
-            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
@@ -90,7 +90,11 @@ fn serve_genesis_chain() -> GenesisChainRig {
         ntfn: None,
         recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
 
-        mix_pool: dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+        mix_pool: dcroxide_node::mixnode::shared_mix_pool(
+            Arc::clone(&chain),
+            params.clone(),
+            &tx_pool,
+        ),
     });
 
     let template = PeerTemplate {
@@ -671,7 +675,7 @@ fn initiates_header_sync_with_a_data_serving_peer() {
             8,
             1000,
             Arc::clone(&tx_pool),
-            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
@@ -681,7 +685,11 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         ntfn: None,
         recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
 
-        mix_pool: dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+        mix_pool: dcroxide_node::mixnode::shared_mix_pool(
+            Arc::clone(&chain),
+            params.clone(),
+            &tx_pool,
+        ),
     });
     let template = PeerTemplate {
         net: NET,
@@ -771,7 +779,7 @@ fn disconnects_a_stalled_header_sync_peer() {
         8,
         1000,
         Arc::clone(&tx_pool),
-        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
     )));
     // A short stall timeout so the test observes the watchdog firing.
     let stall_timer = dcroxide_node::dispatch::start_stall_timer(
@@ -802,7 +810,11 @@ fn disconnects_a_stalled_header_sync_peer() {
         ntfn: None,
         recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
 
-        mix_pool: dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+        mix_pool: dcroxide_node::mixnode::shared_mix_pool(
+            Arc::clone(&chain),
+            params.clone(),
+            &tx_pool,
+        ),
     });
     let template = PeerTemplate {
         net: NET,
@@ -980,7 +992,7 @@ fn announces_connected_blocks_to_served_peers() {
             8,
             1000,
             Arc::clone(&tx_pool),
-            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
         ))),
         sync_peers: sync_peers.clone(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
@@ -990,7 +1002,11 @@ fn announces_connected_blocks_to_served_peers() {
         ntfn: None,
         recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
 
-        mix_pool: dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+        mix_pool: dcroxide_node::mixnode::shared_mix_pool(
+            Arc::clone(&chain),
+            params.clone(),
+            &tx_pool,
+        ),
     });
 
     // The daemon's chain handler wiring: the callback queues the
@@ -1133,8 +1149,8 @@ fn sync_gate_latches_over_the_manager_state() {
         false,
         8,
         1000,
-        tx_pool,
-        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+        Arc::clone(&tx_pool),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
     );
     let gate = dcroxide_node::sync::SyncGate::from_manager(&manager);
 

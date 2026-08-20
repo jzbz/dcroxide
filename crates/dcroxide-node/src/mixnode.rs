@@ -90,12 +90,61 @@ impl MixUtxoEntry for NodeMixUtxo {
 
 /// Build the shared mixing pool over the daemon's chain (dcrd
 /// `newServer` building `mixpool.NewPool`).
-pub fn shared_mix_pool(chain: Arc<Mutex<Chain>>, params: Params) -> Arc<Mutex<NodeMixPool>> {
+///
+/// Takes the transaction pool so it can install [`NodeMixpoolProbe`] on
+/// the way out: dcrd's mempool config carries
+/// `mixpool.NonMixSpendsPairRequest`, and a pool built without it silently
+/// skips that step of the acceptance gauntlet.  Threading it through the
+/// constructor rather than leaving it to a separate call at the one daemon
+/// site makes the wiring impossible to omit.
+pub fn shared_mix_pool(
+    chain: Arc<Mutex<Chain>>,
+    params: Params,
+    tx_pool: &Arc<Mutex<crate::txmempool::NodeTxPool>>,
+) -> Arc<Mutex<NodeMixPool>> {
     let utxo_fetcher = Arc::new(NodeMixUtxoFetcher {
         chain: Arc::clone(&chain),
     });
     let pool = Pool::new(NodeMixChain { params, chain }, Some(utxo_fetcher));
-    Arc::new(Mutex::new(pool))
+    let pool = Arc::new(Mutex::new(pool));
+    tx_pool
+        .lock()
+        .expect("tx pool mutex poisoned")
+        .set_mixpool_probe(Box::new(NodeMixpoolProbe::new(Arc::clone(&pool))));
+    pool
+}
+
+/// The mixpool as the transaction memory pool consults it, for dcrd's
+/// `NonMixSpendsPairRequest` step of the acceptance gauntlet.
+///
+/// Lock order: **tx pool then mixpool then chain**.  The tx pool holds its
+/// own guard across this call, and `Pool::non_mix_spends_pr` is a pure
+/// in-memory lookup that never reaches back into the chain, so the edge
+/// composes with the mixpool-then-chain order pinned by `b5_lockorder`.
+/// Nothing takes the tx-pool mutex while holding either of the other two:
+/// [`crate::chainntfns::ChainNtfnHandler::handle`] only queues inside the
+/// chain's critical section, and every tx-pool acquisition happens in a
+/// drain that runs after the chain guard is dropped.  A mixpool-to-tx-pool
+/// edge would close the cycle, so anything that consults the mempool from
+/// the mix-message path must do so before taking the mixpool guard.
+pub struct NodeMixpoolProbe {
+    pool: Arc<Mutex<NodeMixPool>>,
+}
+
+impl NodeMixpoolProbe {
+    /// Adapt the shared mixpool as the tx pool's pair-request probe.
+    pub fn new(pool: Arc<Mutex<NodeMixPool>>) -> NodeMixpoolProbe {
+        NodeMixpoolProbe { pool }
+    }
+}
+
+impl dcroxide_mempool::MixpoolProbe for NodeMixpoolProbe {
+    fn non_mix_spends_pair_request(&self, tx: &MsgTx) -> bool {
+        self.pool
+            .lock()
+            .expect("mixpool mutex poisoned")
+            .non_mix_spends_pr(tx)
+    }
 }
 
 /// The mixing pool as the sync manager drives it (dcrd's mixpool behind

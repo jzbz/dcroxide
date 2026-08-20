@@ -66,9 +66,6 @@ fn the_winning_tickets_drain_never_holds_the_chain_across_the_mixpool() {
     let chain = Arc::new(Mutex::new(
         Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
     ));
-    // The real shared pool, holding its own Arc to the same chain — the
-    // edge that makes mixpool-then-chain the mandatory order.
-    let mix_pool = dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone());
     let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
         Arc::clone(&chain),
         &params,
@@ -78,6 +75,10 @@ fn the_winning_tickets_drain_never_holds_the_chain_across_the_mixpool() {
         false,
         false,
     );
+    // The real shared pool, holding its own Arc to the same chain — the
+    // edge that makes mixpool-then-chain the mandatory order.
+    let mix_pool =
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool);
 
     // The genesis block is the only block this chain has, and the drain
     // must find it: a hash the chain cannot supply short-circuits the

@@ -464,7 +464,7 @@ fn serve_genesis_chain() -> (
             8,
             1000,
             Arc::clone(&tx_pool),
-            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
         next_peer_id: std::sync::atomic::AtomicI32::new(1),
@@ -473,7 +473,11 @@ fn serve_genesis_chain() -> (
         tx_pool: Arc::clone(&tx_pool),
         ntfn: None,
         recently_advertised: dcroxide_node::dispatch::new_recently_advertised(),
-        mix_pool: dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+        mix_pool: dcroxide_node::mixnode::shared_mix_pool(
+            Arc::clone(&chain),
+            params.clone(),
+            &tx_pool,
+        ),
     });
 
     let template = PeerTemplate {

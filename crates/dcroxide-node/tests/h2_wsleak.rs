@@ -78,7 +78,7 @@ fn serve_ws(max_websockets: usize) -> (tempfile::TempDir, RpcListener, u16, Node
         8,
         1000,
         Arc::clone(&tx_pool),
-        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone()),
+        dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
     )));
     let mut server = Server::new(Config {
         chain: NodeRpcChain::new(chain, params.clone()),
