@@ -6,9 +6,11 @@
 //! <network (4 bytes, LE)><block length (4, LE)><serialized block> ...
 //! ```
 //!
-//! A clean end-of-file at a record boundary terminates the stream; a
-//! network mismatch or a block length beyond `wire.MaxBlockPayload` is
-//! an error, exactly like dcrd's reader.
+//! A clean end-of-file at a record boundary terminates the stream, and
+//! anything short of a whole record does not: a trailing fragment is an
+//! error, as it is for dcrd's reader, which distinguishes `io.EOF` from
+//! `io.ErrUnexpectedEOF`.  A network mismatch or a block length beyond
+//! `wire.MaxBlockPayload` is an error too.
 //!
 //! The import here is storage-level only: blocks are checked for
 //! well-formedness by deserializing them and already-known blocks are
@@ -16,7 +18,7 @@
 //! blocks through the chain engine, which arrives with the blockchain
 //! phase and will layer on top of this).
 
-use std::io::{ErrorKind as IoErrorKind, Read, Write};
+use std::io::{Read, Write};
 
 use dcroxide_wire::{MAX_BLOCK_PAYLOAD, MsgBlock};
 
@@ -40,19 +42,28 @@ pub fn read_block(r: &mut impl Read, network: u32) -> Result<Option<Vec<u8>>, Er
     // The block file format is:
     //  <network> <block length> <serialized block>
     let mut net_bytes = [0u8; 4];
-    match r.read_exact(&mut net_bytes) {
-        Ok(()) => {}
-        Err(e) if e.kind() == IoErrorKind::UnexpectedEof => {
-            // No block and no error means there are no more blocks to
-            // read.
-            return Ok(None);
-        }
+    // The first byte alone decides whether this is a clean end.  Go's
+    // `binary.Read` returns `io.EOF` only when it read nothing at all
+    // and `io.ErrUnexpectedEOF` for a partial fill, and dcrd tests for
+    // the former (`cmd/addblock/import.go:66-74`), so a trailing
+    // fragment is an error there.  Rust's `read_exact` collapses both
+    // into `UnexpectedEof`, which reported a truncated import as a
+    // complete one.
+    match r.read(&mut net_bytes[..1]) {
+        Ok(0) => return Ok(None),
+        Ok(_) => {}
         Err(e) => {
             return Err(db_error(
                 ErrorKind::DriverSpecific,
                 format!("failed to read network: {e}"),
             ));
         }
+    }
+    if let Err(e) = r.read_exact(&mut net_bytes[1..]) {
+        return Err(db_error(
+            ErrorKind::DriverSpecific,
+            format!("failed to read network: {e}"),
+        ));
     }
     let net = u32::from_le_bytes(net_bytes);
     if net != network {

@@ -1363,8 +1363,11 @@ pub fn load_or_generate_cert_pair(
     key_path: &Path,
     extra_hosts: &[String],
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let cert_exists = cert_path.exists();
-    let key_exists = key_path.exists();
+    // dcrd's `fileExists` semantics, not `Path::exists()`: a stat that
+    // fails for any reason other than not-found counts as present, so a
+    // permission failure does not read as "regenerate over it".
+    let cert_exists = crate::config::file_exists(&cert_path.to_string_lossy());
+    let key_exists = crate::config::file_exists(&key_path.to_string_lossy());
     if cert_exists && key_exists {
         let cert = std::fs::read(cert_path)
             .map_err(|e| format!("unable to read the RPC certificate: {e}"))?;

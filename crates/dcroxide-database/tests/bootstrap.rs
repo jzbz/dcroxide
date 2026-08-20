@@ -121,6 +121,22 @@ fn reader_error_behaviors() {
     assert!(bootstrap::read_block(&mut r, NET).expect("read").is_some());
     assert!(bootstrap::read_block(&mut r, NET).expect("eof").is_none());
 
+    // A trailing fragment is NOT a clean termination.  Go's
+    // `binary.Read` gives `io.ErrUnexpectedEOF` for a partial fill and
+    // dcrd tests only for `io.EOF`, so it reports the truncation; Rust's
+    // `read_exact` collapses both, which reported a truncated import as
+    // a complete one.
+    for fragment in 1..4usize {
+        let mut stream = bootstrap_bytes(std::slice::from_ref(&block), NET);
+        stream.extend_from_slice(&[0u8; 4][..fragment]);
+        let mut r = Cursor::new(&stream);
+        assert!(bootstrap::read_block(&mut r, NET).expect("read").is_some());
+        assert!(
+            bootstrap::read_block(&mut r, NET).is_err(),
+            "a {fragment}-byte trailing fragment must not read as a clean end of stream",
+        );
+    }
+
     // An empty stream is a clean termination too.
     let mut r = Cursor::new(&[] as &[u8]);
     assert!(bootstrap::read_block(&mut r, NET).expect("eof").is_none());

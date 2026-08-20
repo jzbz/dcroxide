@@ -1328,9 +1328,20 @@ fn new_amount(f: f64) -> Result<i64, String> {
     })
 }
 
-/// Whether the named file or directory exists (dcrd `fileExists`).
-fn file_exists(name: &str) -> bool {
-    std::path::Path::new(name).exists()
+/// Whether the named file or directory exists (dcrd `fileExists`,
+/// `config.go:448-455`).
+///
+/// Go returns true unless the stat error is specifically not-found;
+/// `Path::exists()` returns false on *any* stat error, including a
+/// permission failure on a parent directory.  That difference has teeth
+/// at the caller below: a stat that fails for some other reason while
+/// the create still succeeds would truncate an operator's existing
+/// config file and replace their credentials.
+pub(crate) fn file_exists(name: &str) -> bool {
+    match std::fs::metadata(name) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// The command line input for [`load_config`]: pre-tokenized

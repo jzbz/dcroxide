@@ -1,9 +1,12 @@
 [package]
 name = "dcroxide-winsvc"
-version = "0.1.0"
-edition = "2024"
-license = "ISC"
 description = "dcrd's Windows service wrapper (service_windows.go) over the windows-service crate"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
