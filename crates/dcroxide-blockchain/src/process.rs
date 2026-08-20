@@ -3694,7 +3694,23 @@ impl Chain {
         // Context-free sanity checks, skipping the proof of work.
         crate::validate::check_block_sanity(block, adjusted_time_unix, true, params)?;
 
-        // The positional checks over the parent branch.
+        // The positional checks over the parent branch.  dcrd's
+        // `checkBlockPositional` is a method on the chain and reads the
+        // fork rejection checkpoint from its own index, so the check is
+        // live on this path (`validate.go:1372-1393`, whose sole caller
+        // is `CheckConnectBlockTemplate` at `:4432`).  Supplying `None`
+        // here made `ErrForkTooOld` structurally unreachable for the
+        // one consumer dcrd has.
+        //
+        // `block_in_index` is looked up rather than assumed false: dcrd
+        // evaluates `b.index.LookupNode(&blockHash) == nil` on this
+        // path too, and a caller may hand over a block already in the
+        // index.
+        let fork_rejection = self.reject_forks_checkpoint.map(|cp| ForkRejection {
+            checkpoint_height: self.store.node(cp).height,
+            prev_is_checkpoint_ancestor: self.store.is_ancestor_of(prev_node, cp),
+            block_in_index: self.index.lookup_node(&block.header.block_hash()).is_some(),
+        });
         {
             let view = NodeBranchView {
                 store: &self.store,
@@ -3705,6 +3721,7 @@ impl Chain {
                 block,
                 Some(prev_height),
                 false,
+                fork_rejection.as_ref(),
                 params,
             )?;
         }

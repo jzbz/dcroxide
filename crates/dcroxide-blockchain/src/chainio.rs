@@ -17,8 +17,7 @@ use dcroxide_wire::{BlockHeader, MAX_BLOCK_HEADER_PAYLOAD, MsgTx};
 
 use crate::compress::{
     compress_tx_out_amount, compressed_tx_out_size, decode_compressed_tx_out, decode_flags,
-    decompress_tx_out_amount, deserialize_vlq, encode_flags, put_compressed_tx_out, put_vlq,
-    serialize_size_vlq,
+    decompress_tx_out_amount, deserialize_vlq, put_compressed_tx_out, put_vlq, serialize_size_vlq,
 };
 use crate::error::{Error, deserialize_error};
 use crate::utxoio::read_deserialize_size_of_minimal_outputs;
@@ -244,10 +243,24 @@ impl SpentTxOut {
     }
 }
 
+/// The flags byte dcrd writes for a spent output: `encodeFlags` fed
+/// from the accessors, which reassembles exactly the low six bits of
+/// the packed byte.
+///
+/// `TransactionType` casts the extracted bits to `stake.TxType`
+/// unchecked (`chainio.go:562-565`), so an undefined type value keeps
+/// its bit pattern, and `encodeFlags` shifts inside a `uint8`
+/// (`compress.go:670,690-692`), so bits 6-7 are dropped rather than
+/// preserved.  With the bitmask at 0x3c and the two flag bits at 0x01
+/// and 0x02, the round trip is `packed & 0x3f` for all 256 inputs.
+fn encoded_flags(stxo: &SpentTxOut) -> u8 {
+    stxo.packed_flags & 0x3f
+}
+
 /// The serialized size of the spent output (dcrd
 /// `spentTxOutSerializeSize`).
 pub fn spent_tx_out_serialize_size(stxo: &SpentTxOut) -> usize {
-    let flags = stxo.packed_flags;
+    let flags = encoded_flags(stxo);
     let mut size = serialize_size_vlq(u64::from(flags));
     const HAS_AMOUNT: bool = false;
     size += compressed_tx_out_size(
@@ -265,14 +278,7 @@ pub fn spent_tx_out_serialize_size(stxo: &SpentTxOut) -> usize {
 /// Serialize the spent output into the target (dcrd `putSpentTxOut`);
 /// returns the bytes written.
 pub fn put_spent_tx_out(target: &mut [u8], stxo: &SpentTxOut) -> usize {
-    // dcrd re-encodes the flags from the accessors; the layouts are
-    // identical so this is the packed byte.
-    let flags = encode_flags(
-        stxo.is_coin_base(),
-        stxo.has_expiry(),
-        // The raw bits survive like dcrd's unchecked TxType cast.
-        unsafe_tx_type(stxo.transaction_type()),
-    );
+    let flags = encoded_flags(stxo);
     let mut offset = put_vlq(target, u64::from(flags));
     const HAS_AMOUNT: bool = false;
     offset += put_compressed_tx_out(
@@ -287,20 +293,6 @@ pub fn put_spent_tx_out(target: &mut [u8], stxo: &SpentTxOut) -> usize {
         offset += min_outs.len();
     }
     offset
-}
-
-/// Reconstruct a `TxType` from raw bits like dcrd's unchecked cast; out
-/// of range values keep their bit pattern through `encode_flags`.
-fn unsafe_tx_type(bits: u8) -> dcroxide_stake::TxType {
-    match bits {
-        0 => dcroxide_stake::TxType::Regular,
-        1 => dcroxide_stake::TxType::SStx,
-        2 => dcroxide_stake::TxType::SSGen,
-        3 => dcroxide_stake::TxType::SSRtx,
-        4 => dcroxide_stake::TxType::TAdd,
-        5 => dcroxide_stake::TxType::TSpend,
-        _ => dcroxide_stake::TxType::TreasuryBase,
-    }
 }
 
 /// Decode a spent output from the front of the serialized data (dcrd

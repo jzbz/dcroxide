@@ -16,6 +16,7 @@
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
 
+use dcroxide_blockchain::RuleErrorKind;
 use dcroxide_blockchain::UtxoEntry;
 use dcroxide_blockchain::process::Chain;
 use dcroxide_blockchain::utxoview::UtxoView;
@@ -174,4 +175,108 @@ fn template_vectors() {
         }
     }
     assert_eq!(counts, [8, 12, 7, 2, 135, 8], "row counts");
+}
+
+/// `ErrForkTooOld` must be reachable through the template path.
+///
+/// dcrd's `checkBlockPositional` is a method on the chain and reads the
+/// fork rejection checkpoint out of its own index, so the check is live
+/// for its only consumer, `CheckConnectBlockTemplate`
+/// (`validate.go:1372-1393`, called at `:4432`). The port passed a
+/// literal `None` instead, which made the rule structurally unreachable
+/// for the one path that can trigger it.
+///
+/// The state is built rather than replayed because `Chain::new` sets
+/// `allow_old_forks` whenever `assume_valid` is zero — which every test
+/// chain does — so the checkpoint is never discovered on simnet.
+#[test]
+fn a_template_forking_before_the_checkpoint_is_rejected() {
+    let params = simnet_params();
+    let mut chain = Chain::new(&params, Hash::ZERO, false);
+    chain.bulk_import_mode = true;
+    let data = include_str!("data/template_vectors.txt");
+    let now: i64 = 2_000_000_000;
+
+    // The two templates the battery expects to pass: one at height 13
+    // building on the tip, one at height 12 building on the tip's
+    // parent (the disconnect path).
+    let mut on_tip: Option<MsgBlock> = None;
+    let mut off_tip: Option<MsgBlock> = None;
+
+    for line in data.lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        match f[0] {
+            "u" => {
+                let op = OutPoint {
+                    hash: parse_hash(f[1]),
+                    index: f[2].parse().expect("idx"),
+                    tree: f[3].parse().expect("tree"),
+                };
+                let mut entry = UtxoEntry::new(
+                    f[4].parse().expect("amt"),
+                    unhex(f[9]),
+                    f[5].parse().expect("h"),
+                    f[6].parse().expect("bi"),
+                    f[7].parse().expect("sv"),
+                    false,
+                    false,
+                    TxType::Regular,
+                    None,
+                );
+                entry.set_packed_flags_bits(f[8].parse().expect("fl"));
+                entry.set_state_bits(1);
+                let mut seed_view = UtxoView::new();
+                seed_view.insert_entry(&op, entry);
+                chain.commit_view(&mut seed_view);
+            }
+            "blk" => {
+                let (block, _) = MsgBlock::from_bytes(&unhex(f[1])).expect("block");
+                let (_, errs) = chain.process_block(&block, now, &params);
+                assert!(errs.is_empty(), "{line}: {errs:?}");
+            }
+            "cbt" if f[2] == "ok" => {
+                let (block, _) = MsgBlock::from_bytes(&unhex(f[1])).expect("block");
+                if block.header.height == 13 {
+                    on_tip = Some(block);
+                } else {
+                    off_tip = Some(block);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let on_tip = on_tip.expect("a height-13 template");
+    let off_tip = off_tip.expect("a height-12 template");
+    assert_eq!(off_tip.header.height, 12, "the off-tip template's height");
+
+    // Both templates pass with no checkpoint set.
+    assert!(
+        chain
+            .check_connect_block_template(&off_tip, now, &params)
+            .is_ok(),
+        "the off-tip template is valid without a checkpoint"
+    );
+
+    // Put a node at height 13 in the index to anchor the checkpoint on:
+    // the height-13 template is a fully valid block on the tip, so its
+    // header is accepted unchanged.
+    let node13 = chain
+        .maybe_accept_block_header(&on_tip.header, false, now, &params)
+        .expect("accept the height-13 header");
+    assert_eq!(chain.store.node(node13).height, 13);
+
+    chain.allow_old_forks = false;
+    chain.reject_forks_checkpoint = Some(node13);
+
+    // The off-tip template is at height 12, below the checkpoint at 13,
+    // and is not itself in the index -- so dcrd rejects it.
+    let err = chain
+        .check_connect_block_template(&off_tip, now, &params)
+        .expect_err("a template below the checkpoint must be refused");
+    assert_eq!(
+        err.kind,
+        RuleErrorKind::ForkTooOld,
+        "expected ErrForkTooOld, got {err:?}"
+    );
 }

@@ -11,9 +11,10 @@
 use dcroxide_blockchain::chainio::{
     BestChainState, BlockIndexEntry, SpentTxOut, block_index_entry_serialize_size,
     decode_block_index_entry, deserialize_best_chain_state, deserialize_header_commitments,
-    deserialize_spend_journal_entry, deserialize_to_minimal_outputs, put_tx_to_minimal_outputs,
-    serialize_best_chain_state, serialize_block_index_entry, serialize_header_commitments,
-    serialize_size_for_minimal_outputs, serialize_spend_journal_entry,
+    deserialize_spend_journal_entry, deserialize_to_minimal_outputs, put_spent_tx_out,
+    put_tx_to_minimal_outputs, serialize_best_chain_state, serialize_block_index_entry,
+    serialize_header_commitments, serialize_size_for_minimal_outputs,
+    serialize_spend_journal_entry, spent_tx_out_serialize_size,
 };
 use dcroxide_chainhash::Hash;
 use dcroxide_testutil::{hex, unhex};
@@ -179,4 +180,47 @@ fn chainio_vectors() {
     assert_eq!(pending_stxos, pending_decoded, "final stxo mismatch");
 
     assert_eq!(counts, [40, 40, 30, 20, 20], "row counts");
+}
+
+/// dcrd computes the flags byte the same way in the sizing function and
+/// the writing function, so the two agree for any packed byte -- the
+/// unused high bits a corrupt journal could carry included.
+///
+/// Both are `encodeFlags(IsCoinBase(), HasExpiry(), TransactionType())`
+/// (`chainio.go:572-575` and `:592-594`), which reassembles exactly
+/// `packed & 0x3f`: the type bitmask is 0x3c, the two flag bits are
+/// 0x01 and 0x02, `TransactionType` casts unchecked so an undefined
+/// type keeps its bits, and `txOutFlags` is a `uint8` so the shift
+/// drops bits 6-7.
+///
+/// The frozen `chainio_vectors.txt` corpus cannot reach this: its 127
+/// `stxo` rows all carry flag values 0..7, every one of them canonical.
+/// This must also drive `put_spent_tx_out` directly rather than going
+/// through `serialize_spend_journal_entry`, whose `debug_assert_eq!`
+/// would abort the test instead of reporting the mismatch.
+#[test]
+fn spent_tx_out_size_matches_bytes_written_for_noncanonical_flags() {
+    for packed in [0x00u8, 0x01, 0x02, 0x3f, 0x40, 0x80, 0xc1, 0xff] {
+        let stxo = SpentTxOut {
+            amount: 5,
+            pk_script: vec![0x51],
+            ticket_min_outs: None,
+            block_height: 1,
+            block_index: 0,
+            script_version: 0,
+            packed_flags: packed,
+        };
+        let size = spent_tx_out_serialize_size(&stxo);
+        let mut buf = vec![0u8; size];
+        let written = put_spent_tx_out(&mut buf, &stxo);
+        assert_eq!(
+            written, size,
+            "size disagrees with the write for {packed:#04x}"
+        );
+        assert_eq!(
+            buf[0],
+            packed & 0x3f,
+            "the flags byte written for {packed:#04x} is not dcrd's"
+        );
+    }
 }

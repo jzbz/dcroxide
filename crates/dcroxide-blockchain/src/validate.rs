@@ -1205,6 +1205,7 @@ pub fn check_block_positional(
     block: &MsgBlock,
     prev_height: Option<i64>,
     fast_add: bool,
+    fork_rejection: Option<&ForkRejection>,
     params: &Params,
 ) -> Result<(), RuleError> {
     // The genesis block is valid by definition.
@@ -1212,7 +1213,14 @@ pub fn check_block_positional(
         return Ok(());
     }
 
-    check_block_header_positional(view, &block.header, prev_height, fast_add, None, params)?;
+    check_block_header_positional(
+        view,
+        &block.header,
+        prev_height,
+        fast_add,
+        fork_rejection,
+        params,
+    )?;
     check_block_data_positional(block, prev_height, fast_add)
 }
 

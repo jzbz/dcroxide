@@ -177,6 +177,10 @@ fn positional_vectors() {
                         &block,
                         Some(tip_height),
                         fast_add,
+                        // The dcrd generator ran with no fork rejection
+                        // checkpoint set, so the frozen expectations
+                        // pin the no-checkpoint behaviour.
+                        None,
                         &params
                     )),
                     f[3],
