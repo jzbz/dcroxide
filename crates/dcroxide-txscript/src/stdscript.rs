@@ -847,8 +847,20 @@ pub fn multi_sig_script_v0(threshold: i64, pub_keys: &[&[u8]]) -> Result<Vec<u8>
         .add_int64(pub_keys.len() as i64)
         .add_op(OP_CHECKMULTISIG);
 
-    // The builder cannot fail here in practice (sizes are bounded well
-    // below the limits), but mirror dcrd by propagating.
+    // The builder can fail: nothing here bounds `pub_keys`, and each
+    // strict compressed key costs 34 bytes (`OP_DATA_33` plus the key)
+    // against MAX_SCRIPT_SIZE (16384), so 481 keys is the largest set
+    // that builds and the 482nd `add_data` latches the error.  dcrd does
+    // not pre-check either; `MultiSigScriptV0` returns `builder.Script()`
+    // unchanged.  A multisig that large is unspendable regardless,
+    // since OP_CHECKMULTISIG caps the count at MAX_PUB_KEYS_PER_MULTI_SIG.
+    //
+    // Two departures from dcrd, both confined to this failure path:
+    // dcrd's `Script()` returns the bytes built before the failure
+    // alongside the error, which this `Result` does not carry (see
+    // `ScriptBuilder::unchecked_script` for those bytes), and dcrd's
+    // error is txscript's `ErrScriptNotCanonical`, which has no
+    // stdscript counterpart, so this re-labels it.
     builder
         .script()
         .map_err(|e| make_error(StdScriptErrorKind::UnsupportedScriptVersion, format!("{e}")))

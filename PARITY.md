@@ -392,6 +392,30 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   rather than `std::fs::write`'s 0666, which under a permissive umask would
   leave it group- and world-writable — an integrity question, since anyone able
   to write it can swap the identity the node serves.
+- **RPC TLS material is loaded once and never reloaded.** dcrd hangs a
+  `GetConfigForClient` callback off the listener's `tls.Config`
+  (`server.go:3796-3822`, `makeReloadableTLSConfig`, wired at `:3860`), so an
+  arriving connection re-stats `rpc.cert`, `rpc.key` and, under
+  `--authtype=clientcert`, the `--clientcafile` bundle (`clients.pem` by
+  default) — at most once every five seconds (`needsReload`, `:3662-3671`,
+  over `watchedFile.updated`'s size-or-mtime comparison at `:3617-3637`) —
+  and swaps in a freshly parsed config when any of them changed, keeping the
+  last working one when the new files fail to load and warning unless the
+  same error was already reported (`configFileClient`, `:3708-3736`). The
+  port builds a single `rustls::ServerConfig` at startup in
+  `tls_server_config`, called once from `bin/dcroxide.rs`, which reads
+  `--clientcafile` in the same place, stores it in `RpcTransport::Tls`, and
+  hands that same `Arc` to every `rustls::ServerConnection`; no path is
+  re-read afterwards. For the server pair the consequence is operational: a
+  rotated certificate is not served, and a key replaced because the old one
+  leaked stays in use, until the daemon restarts. Under
+  `--authtype=clientcert` it is also an access-control divergence — neither
+  dcrd nor the port consults a CRL or OCSP, so editing that bundle is the
+  whole revocation mechanism, and dcrd honours a removal on the first
+  connection after its five-second window elapses while the port keeps
+  trusting a removed issuer, and keeps rejecting a newly added one, until
+  restart. Upstream since `488b8163` (2023-07-10), first carried by a dcrd
+  release in 2.0.0, so a standing gap rather than a 2.2 delta.
 - **Peer teardown polls a flag where dcrd closes the connection.** dcrd ends a
   peer by calling `Disconnect`, which closes the `net.Conn`; Go's runtime makes a
   goroutine blocked in `Read` return on every platform, so the connection's

@@ -438,6 +438,29 @@ pub fn db_put_utxo_set_state(tx: &Transaction, state: &UtxoSetState) -> Result<(
 }
 
 /// Fetch the UTXO set state row when present.
+///
+/// dcrd's `levelDbUtxoBackend.FetchState` folds a zero-length row into
+/// "no state" alongside an absent one
+/// (`internal/blockchain/utxobackend.go:517-522`).  That fold is
+/// deliberately not matched: the empty row goes to
+/// `deserialize_utxo_set_state`, which fails with "unexpected end of
+/// data after height", and `Chain::open` returns the error instead of
+/// starting.
+///
+/// An empty row is not a fresh backend, and answering "no state" for
+/// one makes `initialize_utxo_state` record the state at the current
+/// tip and return early (dcrd's `UtxoCache.Initialize`,
+/// `utxocache.go:831-856`), skipping the disconnect/replay a set
+/// lagging the chain needs — so the fold would turn a damaged marker
+/// into a silently wrong UTXO set that every descendant inherits.  It
+/// is a laxity local to `FetchState` rather than a storage limit: the
+/// same `Get` returns `nil` only for `leveldb.ErrNotFound`
+/// (`:392-402`), and `dbFetchUtxoEntry` treats a non-nil zero-length
+/// row as an `AssertError` (`:472-477`) — the rule
+/// [`db_fetch_utxo_entry`] above ports.  Neither implementation writes
+/// a zero-length row (`serialize_utxo_set_state` is a VLQ height plus
+/// a 32-byte hash, 33 bytes minimum), so only corruption or an
+/// out-of-band writer produces one.
 pub fn db_fetch_utxo_set_state(tx: &Transaction) -> Result<Option<UtxoSetState>, ChainDbError> {
     match tx.metadata().get(UTXO_SET_STATE_KEY_NAME) {
         None => Ok(None),

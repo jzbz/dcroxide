@@ -228,7 +228,13 @@ text.
 The daemon generates `rpc.cert` and `rpc.key` in the data directory on
 first start if they are absent, owner-readable only. Back up or replace
 them the way you would dcrd's; a client that pinned dcrd's certificate
-needs the new one.
+needs the new one. Replacing them is not live, though: dcrd re-reads the
+pair on the first connection after a change, checking at most once every
+five seconds, while this daemon loads `rpc.cert`, `rpc.key`, and (under
+`--authtype=clientcert`) the `--clientcafile` bundle once at startup, so
+a new certificate, a replaced key, or an edit to `clients.pem` that adds
+or revokes a client takes effect only after a restart. `SIGHUP` will not
+do it: it stops the daemon, exactly as it does in dcrd.
 
 Default ports are dcrd's, unchanged: mainnet 9108 (P2P) and 9109 (RPC).
 
