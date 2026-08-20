@@ -106,7 +106,12 @@ a metadata-flush window**, so it is the commit specifically rather than
 storage in general. (An earlier figure of 34.6% for the same runs was
 count-weighted; the sampler is starved during the stalls it measures, and
 weighting by represented time raises it to 48–51%.) How much of it is
-*recoverable* is still open — a flush is not pure blocking. The earlier 18%
+*recoverable* was settled on 2026-08-16: moving the metadata commit off
+the block-connection thread was built, measured at 9.5% slower (232.1 to
+210.0 blk/s, with the stalled share rising from 48.1% to 53.7%), and
+reverted. The stall is real and it is the commit, but it is not
+recoverable by rescheduling *when* the commit runs — the remaining lever
+is what a commit costs. The earlier 18%
 figure came from a replay, which validates every block where a syncing
 daemon skips ~93% under assume-valid, so it understated the daemon's share.
 
@@ -188,8 +193,11 @@ larger overlay means more of the recent window replays after an unclean stop.
 directory. They are throughput settings. The size gap against dcrd is
 settled in cause — the engine's page layout, not extra data dcroxide keeps
 — and nothing above the engine reaches it: all four of ADR-0004's levers
-have now been measured and closed. What is still open is the engine choice
-itself, in [ADR-0009](adr/0009-storage-shape.md).
+have now been measured and closed. The engine choice itself was the last
+thing open and is now settled: [ADR-0009](adr/0009-storage-shape.md)
+closed on 2026-08-17 with redb staying. The candidate won on density and
+on write shape and lost on crash safety, so the disk and commit costs
+above are accepted rather than retracted.
 
 ## Identity: paths, files, and environment
 
@@ -199,18 +207,24 @@ configuration, every name changes.
 
 | | dcroxide | dcrd |
 |---|---|---|
-| data directory (Linux) | `~/.dcroxide` | `~/.dcrd` |
-| data directory (macOS) | `~/Library/Application Support/Dcroxide` | `…/Dcrd` |
-| data directory (Windows) | `%LOCALAPPDATA%\Dcroxide` | `…\Dcrd` |
+| application home directory (Linux) | `~/.dcroxide` | `~/.dcrd` |
+| application home directory (macOS) | `~/Library/Application Support/Dcroxide` | `…/Dcrd` |
+| application home directory (Windows) | `%LOCALAPPDATA%\Dcroxide` | `…\Dcrd` |
 | configuration file | `dcroxide.conf` | `dcrd.conf` |
-| data directory override | `--appdata`, `DCROXIDE_APPDATA` | `DCRD_APPDATA` |
+| home directory override | `--appdata`, `DCROXIDE_APPDATA` | `DCRD_APPDATA` |
+| data directory override | `--datadir` | `--datadir` |
 | extra TLS DNS names | `DCROXIDE_ALT_DNSNAMES` | `DCRD_ALT_DNSNAMES` |
 | metadata page cache | `DCROXIDE_DB_CACHE` (MiB, default 1024) | — |
 | metadata overlay flush size | `DCROXIDE_DB_OVERLAY` (MiB, default 100) | — |
 | metadata overlay flush interval | `DCROXIDE_DB_FLUSH_SECS` (s, default 300) | — |
 | metadata flush log (JSONL path) | `DCROXIDE_DB_FLUSHLOG` (unset = off) | — |
 
-Those six environment variables are the only ones read; only the first
+The chain itself lives under the home directory, not at it: `--datadir`
+defaults to `<home>/data` with the network appended, so on Linux the
+blocks are in `~/.dcroxide/data/mainnet` while `dcroxide.conf`,
+`rpc.cert`, `rpc.key` and `logs/` sit in `~/.dcroxide` itself.
+
+Those six are the only `DCROXIDE_*` variables read; only the first
 two have dcrd counterparts, since the page cache, the overlay and the
 flush log are properties of redb, which dcrd does not use. Of the four
 storage variables, `DCROXIDE_DB_CACHE` is the one to leave unset, the
@@ -222,11 +236,17 @@ normal operation; it writes a line inside each flush. A malformed or
 zero value in any of the tuning variables warns and falls back to the
 default rather than refusing to start, since they are hints. Everything
 else is a command-line flag or a `dcroxide.conf` entry, and the flag set
-is a verbatim port of dcrd's — same names, same semantics, same help
-text.
+is a verbatim port of dcrd's — same names, same semantics, and the same
+help text apart from the two environment annotations, which name
+`DCROXIDE_APPDATA` and `DCROXIDE_ALT_DNSNAMES` where dcrd's name
+`DCRD_APPDATA` and `DCRD_ALT_DNSNAMES`.
 
-The daemon generates `rpc.cert` and `rpc.key` in the data directory on
-first start if they are absent, owner-readable only. Back up or replace
+The daemon generates `rpc.cert` and `rpc.key` in the application home
+directory — alongside `dcroxide.conf`, not under `data/` — on first
+start, and only when *both* are absent: one present with the other
+missing is an error naming the missing half rather than a regeneration
+over the key that is still there. The modes are dcrd's, the certificate
+`0644` and the key `0600`. Back up or replace
 them the way you would dcrd's; a client that pinned dcrd's certificate
 needs the new one. Replacing them is not live, though: dcrd re-reads the
 pair on the first connection after a change, checking at most once every

@@ -26,7 +26,7 @@ Explicit non-goals: wallet functionality (that is `dcrwallet`), the mixing **cli
 
 ---
 
-## Status against this plan — 2026-07-26
+## Status against this plan — 2026-08-16
 
 *A signpost, not a second README. Per-package detail lives in
 [PARITY.md](PARITY.md), deliberate bug-for-bug reproductions in
@@ -42,7 +42,7 @@ assembles them end to end: config and CLI, the chain engine with full
 consensus validation, mempool and fee estimation, mining and the CPU miner, the
 P2P server with sync, relay, and StakeShuffle mixing message relay, the
 JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle, and the
-Windows service wrapper. The gate runs 729 tests across 234 suites, most of them
+Windows service wrapper. The gate runs 847 tests across 257 suites, most of them
 differential against dcrd or replaying sessions generated inside dcrd's own
 packages. The parity target moved twice during the port, from
 `release-v2.1.5` to upstream master `452c1a6c` and then to `29f17894`
@@ -67,14 +67,12 @@ exit criteria have not been demonstrated, and those are listed here too:
 - **Phase 0 — the CI gates are partly wired.** `.github/workflows/ci.yml` runs
   rustfmt and `clippy -D warnings`, `cargo test --workspace` on all three OSes
   with the oracle required (`DCROXIDE_REQUIRE_ORACLE=1`), a `cargo check` at
-  the 1.94 MSRV, `cargo-deny` over licenses/advisories/sources, a
+  the 1.94 MSRV, `cargo-deny` over licenses/advisories/sources/bans, a
   60-second-per-target fuzz smoke — all of those on every push to `master`
   and every pull request — and a nightly
-  10-minute-per-target run over the 11 fuzz targets. Not wired: coverage
+  10-minute-per-target run over the 12 fuzz targets. Not wired: coverage
   reporting (`cargo-llvm-cov`), `cargo-vet`, `cargo-mutants`, and any sanitizer
-  coverage beyond the AddressSanitizer `cargo fuzz` builds in by default. No
-  manual dependency audit or version freeze has been recorded either, which is
-  a Phase 15 item.
+  coverage beyond the AddressSanitizer `cargo fuzz` builds in by default. [docs/dependency-ledger.md](docs/dependency-ledger.md) records a decision per load-bearing crate — vendored, reviewed@V, accepted, or declined — while stating outright that it is not a review; a full manual audit and a version freeze are still Phase 15 items.
 - Three further ledger rows sit at "—" for reasons that are not debt:
   `crypto/rand` (the daemon seeds its CSPRNGs from `getrandom` rather than
   porting dcrd's package), `dcrutil` (its contents were distributed rather than
@@ -147,9 +145,9 @@ What Phase 15 has covered so far:
 
 Named open items, tracked and not fixed:
 
-- The RPC `Server` uses one coarse mutex where dcrd has per-field locks, so a
-  single long request — a multi-thousand-block `rescan` — stalls notification
-  construction for every other client.
+- Named open items, tracked and not fixed:
+
+- The redb metadata tree packs at 64.86% page fill
 - The redb metadata tree packs at 64.86% page fill (0.645–0.649 across every
   run; the fill figure is the per-table `TableStats::fragmented_bytes` —
   `DatabaseStats::fragmented_bytes` charges the allocator's free pool against
@@ -157,7 +155,7 @@ Named open items, tracked and not fixed:
   copy-out rebuild packs *worse*, 58.29%, on a larger live tree, 10.92 GiB
   against 9.79. The 1.536 GiB of intra-page slack in `spendjournalv3` is real
   and unreachable inside this engine.
-- The node is flush-bound under fast ingest (the 80% stall figure above).
+- The node is flush-bound under fast ingest (the 48%-of-wall stall figure above, 90–98% of it inside a metadata-flush window).
 
 **The node is still pre-alpha. Do not expose it to the internet and do not use
 it with funds.**
@@ -476,16 +474,13 @@ Not needed by the daemon (avoid scope creep): CBOR/airgap bits of dcr-rs, BIP39,
 There is no async runtime: `tokio` is not in the dependency graph and the daemon
 is OS-threaded throughout. There is no HTTP or websocket framework either —
 `hyper` and `tokio-tungstenite` were not adopted, and the RPC listener speaks
-HTTP/1.1 and RFC 6455 directly over `rustls` (ring provider only, so nothing
-pulls a C crypto library into a workspace that forbids `unsafe`). The RPC crates
+HTTP/1.1 and RFC 6455 directly over `rustls` (ring provider only, which keeps rustls' default `aws-lc-rs` provider out of the build; `ring` itself is still ~151k lines of C and assembly and `secp256k1-sys` another ~59k, so the workspace's `forbid(unsafe_code)` covers its own crates and not its dependencies). The RPC crates
 declare no serde dependency at all: dcrd's `dcrjson` is reflection-driven, so
 the port carries a runtime Go type model with `encoding/json` reimplemented over
 it, Go float formatting and all (ADR-0007). `certgen` is a direct port of dcrd's
 package rather than `rcgen`, with the divergences PARITY.md records (dcrd's
 RSA4096 algorithm is omitted, among others). Storage went to `redb` per
-ADR-0004. Of the policy half: `cargo-deny` gates licenses, advisories, and
-sources in CI against `deny.toml`, but `cargo-vet` was never adopted, no manual
-audit or version freeze of the dependency set has been recorded, and the
+ADR-0004. Of the policy half: `cargo-deny` gates licenses, advisories, sources, and bans in CI against `deny.toml`, but `cargo-vet` was never adopted, [docs/dependency-ledger.md](docs/dependency-ledger.md) records a decision per load-bearing crate rather than a review of the whole set, no version freeze has been recorded, and the
 manifests carry caret ranges with a committed `Cargo.lock` rather than the exact
 pins this policy asks for.
 

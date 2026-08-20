@@ -9,7 +9,10 @@ Rules: append rows, never rewrite them. A row names the machine (table
 below), the dcroxide commit measured, the workload, and where the raw
 run lives. Raw exports, logs, and profiles stay out of the tree, under
 `/home/jz/zx/dev/artifacts/dcroxide-bench/<machine>/<commit>/` on the
-machine that ran them. Record a row for every storage-rework milestone,
+machine that ran them. **As of 2026-08-20 that directory does not exist
+on m1: every `Raw:` pointer below, both `Preserved baselines` datadirs,
+and the `artifacts/dcroxide-tools/engbench/` arm binaries record where a
+run was written, not a path anyone can still open.** Record a row for every storage-rework milestone,
 so the campaign against the IBD gap produces a curve, not before/after
 anecdotes. That gap was 2.23x when the campaign opened in 2026-07 and
 measured 1.29x on 2026-08-15; the curve is the point of this file.
@@ -45,7 +48,7 @@ run, both nodes `--norpc`.
 > ways: the ambient-load asymmetry recorded in the row itself, and this.
 >
 > **Re-measuring it needs repetitions, not another single run.** dcroxide
-> measured 265.0 and 232.1 blk/s eleven hours apart (the two rows above), a
+> measured 265.0 and 228.2 blk/s eleven hours apart (the two rows above), a
 > 14% spread — wider than the effect being looked for. A single new arm would
 > return a number indistinguishable from that variance. The form that would
 > settle it is two arms, dcroxide-from-dcrd and dcrd-from-dcrd, three
@@ -309,7 +312,7 @@ about 3.5 MiB with no parity cost. It is noted, not proposed.
 
 **What this does and does not establish.** It measures equal row counts and
 equal summed key+value lengths, not a content diff; a sum cannot see
-offsetting differences. But twelve buckets agreeing simultaneously at byte
+offsetting differences. But fifteen buckets agreeing simultaneously at byte
 resolution, over stores built from the same block bytes, is not something
 two different encodings produce. A digest over each side's sorted key/value
 stream would convert it from overwhelming to proof, and both tools already
@@ -423,7 +426,7 @@ with within-arm spread of 0.1–0.4%.
 
 **The rejected arm is the instructive one.** Sizing workers by the batch cut
 thread creation 12x — by far the biggest mechanical improvement of the three
-— and ran **4.6% slower** on disjoint ranges, because a 100-item batch then
+— and ran **6.5% slower** on disjoint ranges, because a 100-item batch then
 ran on three threads while 29 cores idled. The mechanism moved exactly as
 intended and the outcome went the other way. Fan-out has to stay
 proportional to the machine, not to the batch; the work-stealing loop is
@@ -706,8 +709,7 @@ fjall #308 (open, filed against 3.1.8) has `WriteBatch::commit()` return
 `Ok` for a batch that does not survive restart, when an earlier journal
 *write failure* left an unterminated record and recovery truncates from it.
 fjall #311 (open) has no strict recovery mode, so mid-journal corruption is
-indistinguishable from a torn tail and presents as silent truncation. Both
-land on the cross-bucket atomicity `process.rs:908-916` depends on, and
+indistinguishable from a torn tail and presents as silent truncation. Both land on the cross-bucket atomicity `Chain::flush` (`process.rs:973-1000`) depends on, and
 neither is reachable by killing a healthy process.
 
 ### The upgrade arm, taken
@@ -1068,7 +1070,7 @@ Removing only the commit stall projects **373.7 blk/s — faster than dcrd's
 343.8.** A counterfactual that beats the reference implementation is evidence
 the model is wrong, not that the prize is large. It assumes the stalled time
 *vanishes*, when a flush is not pure blocking: median flush **26.9 s** (mean
-24.4, max 79.5, 61 of 130 over 30 s), windows occupying 59.4% of wall, and the
+24.4, max 79.5, 61 of 130 over 30 s), windows occupying 68% of wall, and the
 process stalled for only part of that. The rest is CPU work building the
 transaction, which a background committer **relocates rather than removes** —
 it can overlap with validation on another core, but it still has to happen.
@@ -1448,7 +1450,7 @@ re-syncing node would notice a silent rollback. It would not, and the rollback
 is worse than a rollback.
 
 **`reconcileDB` takes the silent branch.** Its comparison is block-file cursor
-against block-file contents (`lib.rs:843-857`):
+against block-file contents (`lib.rs:869-885`):
 
 ```
 if stored > scanned { return Err(Corruption) }        // metadata AHEAD  — loud

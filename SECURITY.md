@@ -68,7 +68,7 @@ amplify.
 The project runs its own internal security review. A campaign closing
 its release-blocking findings landed this cycle — bounds on the peer
 message path, authentication and admission on the RPC surface,
-owner-only permissions on the files the daemon generates for itself,
+owner-only permissions on the secret files the daemon generates for itself,
 OS-seeded CSPRNGs, and the panic policy below. Every fix, the reasoning
 behind it, and the divergences from dcrd it introduced are itemized in
 [PARITY.md](PARITY.md) under "Deliberate divergences from dcrd" and its
@@ -111,7 +111,7 @@ evaluating this code.
   client — is fixed: the server-wide lock is gone, and the per-client
   lock is now taken a field at a time where it is used, as dcrd takes
   its own, rather than across the whole request.
-- **Fuzzing reaches the leaf codecs and nothing else.** Eleven
+- **Fuzzing reaches the leaf codecs and nothing else.** Twelve
   `cargo-fuzz` targets run for 60 seconds apiece on every push to
   `master` and every pull request, and for ten minutes apiece nightly:
   wire framing, the `tx` and `blockheader` decoders, the script engine,
@@ -133,9 +133,11 @@ evaluating this code.
   the RustSec advisory database, a licence allow-list, yanked crates,
   and unknown registries or git sources. That is an automated check
   against a list of problems someone else already found; it is not a
-  review. Nothing in the tree has been read, and the tree includes the
-  elliptic-curve implementations, the TLS stack, and the storage engine
-  that this node's key handling and on-disk consensus state rest on.
+  review. Almost nothing in the tree has been read — one ledger entry
+  is marked `reviewed@`, and one more was read in a single respect —
+  and the tree includes the elliptic-curve implementations, the TLS
+  stack, and the storage engine that this node's key handling and
+  on-disk consensus state rest on.
   [docs/dependency-ledger.md](docs/dependency-ledger.md) does not close
   this gap, but it bounds it: the twelve crates that are consensus-
   observable or touch key material now carry an explicit decision each,
@@ -174,7 +176,8 @@ message. None of the four was caught by reading the code; each came out
 of separately re-deriving what happens to an honest peer under load,
 which is now a standing question in the review rather than an
 afterthought. In the same campaign, five comments were found asserting
-the opposite of what the code beneath them did — including one that
+the opposite of what the code beneath them did — and a later sweep
+retired twelve more — — including one that
 justified a coarse server-wide lock as dcrd's own per-request locking,
 where dcrd takes no server-wide lock at all. Comments in this
 repository are claims, not evidence. (That lock has since been removed:

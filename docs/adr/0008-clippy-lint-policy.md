@@ -5,8 +5,9 @@
 
 ## Context
 
-The workspace denies `unsafe_code`, denies `missing_docs`, and warns
+The workspace forbids `unsafe_code`, denies `missing_docs`, and warns
 `clippy::all` plus `clippy::arithmetic_side_effects`; CI escalates warnings
+to errors. CI escalates warnings
 to errors. That is clippy's default groups and two additions. Cuprate — the
 from-scratch Rust Monero node — instead curates roughly 280 lints at deny,
 adopted through a documented cold/warm/hot process, and keeps the lints it
@@ -103,9 +104,9 @@ rule, not the container.
 - **`iter_over_hash_type`** — cheap ratchet, not a bug-finder, and worth
   saying why. The consensus crates hold no hash containers at all:
   `dcroxide-blockchain` is 69 ordered containers to 0 hashed,
-  `dcroxide-mining` 66 to 0, `dcroxide-mempool` 26 to 0, and `stake`,
-  `chaincfg`, `chainhash`, `wire`, `uint256`, `dcrec`, `crypto`,
-  `standalone`, `gcs` and `fees` hold neither. All 33 source hits are in
+  `dcroxide-mining` 66 to 0, `dcroxide-mempool` 26 to 0, `dcroxide-mining` 66 to 0, `dcroxide-mempool` 26 to 0; `stake`,
+  `chaincfg`, `chainhash`, `wire`, `uint256`, `dcrec` and `crypto` hold
+  neither kind, and `standalone`, `gcs` and `fees` hold only ordered ones. All 33 source hits are in
   P2P, RPC, mixing and node code — 18 in `dcroxide-mixing/src/mixpool.rs`,
   6 in `dcroxide-addrmgr/src/manager.rs`, the rest scattered. So the lint
   defends a property the consensus core already has by construction. Adopt

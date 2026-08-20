@@ -10,7 +10,7 @@
 dcrd is goroutine-per-concern: per-peer read/write loops, a sync manager
 event loop, RPC handlers, and worker pools for signature validation. Rust
 offers async (tokio) or OS threads; consensus validation is CPU-bound while
-p2p/RPC are I/O-bound with modest connection counts (default ~133 peers max).
+p2p/RPC are I/O-bound with modest connection counts (default 125 peers max).
 
 ## Decision (proposed)
 
@@ -44,10 +44,14 @@ manifest in the workspace, and no crate contains an `async fn`. The
 documented fallback above — thread-per-peer, closer to dcrd's structure — is
 what was built: OS threads over `std::sync::mpsc` channels for every I/O
 surface (listener, per-peer input and output loops, outbound dialer, RPC and
-websocket handlers, the seeder and the IPC runtime). The validation pool is
-`std::thread::scope` in `dcroxide-blockchain`'s `validate_items`, sized like
-dcrd's (`runtime.NumCPU()*3` capped at the item count, running inline below
-16 items), rather than rayon.
+websocket handlers, the seeder and the IPC runtime). The validation pool is `std::thread::scope` in `dcroxide-blockchain`'s
+`validate_items`, capped at the item count and running inline below 16
+items, rather than rayon. Its width is **one worker per core**
+(`std::thread::available_parallelism`), deliberately not dcrd's
+`runtime.NumCPU()*3` (`internal/blockchain/scriptval.go` 120): the port
+copied that count until 2026-08-14, when spawning OS threads at three per
+core measured slower than one per core — the measurement is recorded on
+`validate_items` itself.
 
 Two clauses of the proposal did hold and are load-bearing: no consensus crate
 is async, and chain state sits behind a single writer. One did not — the

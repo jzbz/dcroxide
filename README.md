@@ -17,10 +17,10 @@ JSON-RPC/websocket server, the tool commands, the pipe IPC lifecycle,
 and the Windows service wrapper. The deliberate non-ports are small
 and documented in PARITY.md (Go GC tuning, the pprof servers, UPnP,
 the Windows event log, and the wallet-side mixclient). The test suite
-runs 729 tests across 234 suites, most differential against dcrd
+runs 847 tests across 258 suites, most differential against dcrd
 itself or replaying sessions generated inside dcrd's own packages.
 
-Since the surface completed, three rounds of work have landed on it. A
+Since the surface completed, four rounds of work have landed on it. A
 performance campaign: ffldb's metadata write cache, block scripts
 validated on dcrd's worker pool, a ported `SigCache`, one transaction
 hash per block, batched UTXO reads, and a layered dbCache overlay. A
@@ -30,7 +30,12 @@ message paths with stall deadlines and queue limits, OS-seeded
 CSPRNGs, secret-file handling, and `panic = "abort"` in release
 builds. And the rename onto dcroxide's own identity — data directory
 `~/.dcroxide`, configuration file `dcroxide.conf`, `DCROXIDE_*`
-environment variables.
+environment variables. And a line-by-line review against dcrd covering
+the whole surface, whose fixes reach consensus code rather than only
+the RPC and peer edges: the EMA retarget divided the way Go's
+`big.Int.Div` does, vote payment outputs counted in signed arithmetic,
+the in-block fraud proof pass run at height 1, and the block index
+flushed during header sync instead of accumulating a million entries.
 
 It has synced testnet and mainnet to the tip from genesis with full
 consensus validation, and syncs against dcrd in both directions (see
@@ -359,6 +364,11 @@ work). Currently implemented:
   they touch to the dcroxide crates that port them, via PARITY.md's own
   table, so moving the parity pin starts from a review list rather than
   a whole-diff read
+- `tools/dsample` — the per-thread scheduler-state sampler behind the
+  bench ledger's stall measurements (Python)
+- `tools/powerloss` — an `LD_PRELOAD` shim over the write path plus a
+  replay driver, so crash consistency is tested the same way against
+  any storage engine (C + Python)
 
 ## Performance
 
@@ -497,6 +507,9 @@ per machine, commit, and corpus in
 - `tools/helpgen/` — the go-flags help-vector generator (Go)
 - `tools/pinbump/` — the parity-pin bump review-list generator (Go)
 - `tools/dcrdstat/` — dcrd payload measurement over ffldb + utxodb (Go)
+- `tools/dsample/` — per-thread scheduler-state sampler (Python)
+- `tools/powerloss/` — write-interception shim and replay driver for
+  engine-independent crash-consistency testing (C + Python)
 - `fuzz/` — `cargo-fuzz` targets (nightly toolchain)
 - `docs/adr/` — architecture decision records
 

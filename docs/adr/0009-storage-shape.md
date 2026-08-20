@@ -12,7 +12,7 @@
 **What the candidate won.** fjall reaches goleveldb's density on dcroxide's own
 write pattern — 1.026x its own payload against redb's 2.831x — and its write
 *shape* is better by as much again: a mean write of 18,566 B against redb's
-4,344 (one page), 9.7x fewer write syscalls to move 2.26x more bytes, and
+4,344 (one page), 9.7x fewer write syscalls to move 2.26x fewer bytes, and
 3.2–3.5x less time blocked, replaying the identical journal. It survives real
 power loss (10/10) and batch atomicity under kill (12/12), and **#308 does not
 reproduce**.
@@ -121,7 +121,7 @@ quantity in this whole investigation.
   for the uncompacted file, which is the retracted `st_blocks` figure. The
   compacted file is dense, so the two metrics agree at 2.132x.)
 
-### What is not measured, and blocks the gate
+### What blocked the gate, and how each was settled
 
 - **Lever (d) is measured, and half closed.** `spendjournalv3` is one row per
   4096-byte page at a 2402 B mean, 1.74 GiB of the 2.33 GiB of predicted
@@ -281,7 +281,7 @@ written wider than a kill test, and the wider half fails:
   unterminated record and returns `Ok`, and recovery truncates from the
   first bad record on reopen. That is `commit()` returning success for a
   batch that does not survive restart — the precise thing
-  `process.rs:908-916` exists to prevent. A `kill -9` does not exercise it,
+  `Chain::flush`'s single-transaction commit (`process.rs`) exists to prevent. A `kill -9` does not exercise it,
   because it needs a *write failure*, not process death.
 - **fjall #311 is open**: no strict recovery mode, so mid-journal corruption
   is indistinguishable from a torn tail and presents as silent truncation
@@ -416,7 +416,7 @@ written wider than a kill test, and the wider half fails:
    - `dcroxide.rs` logs a failed shutdown flush and exits `SUCCESS`, in the
      one place whose own comment says that failure wedges the node on next
      start.
-     **Fixed:** `dcroxide.rs:1063` returns `ExitCode::FAILURE` there.
+     **Fixed:** `dcroxide.rs:1158` returns `ExitCode::FAILURE` there.
 
    What was deliberately not done: a fatal storage error still does not
    shut the node down. The store latches and the manager logs "Failed to
@@ -456,8 +456,8 @@ written wider than a kill test, and the wider half fails:
    on an engine that keeps writes it never committed.
 
    Verified by breaking the store on purpose. Deleting the state-marker
-   write from `DbCache::flush` fails four of the new tests and **passes all
-   five of the old ones**, which is the concrete form of the complaint this
+   write from `DbCache::flush` fails four of the five new tests and **passes
+   all four of the old ones**, which is the concrete form of the complaint this
    item recorded.
 
 **Take redb 4.1.0 now, independently.** Measured on the same journal, it
@@ -465,9 +465,10 @@ holds the identical content in 14.50 GiB against 2.6.3's 16.00 — 9.4%
 smaller — and loads 21% faster. It does not touch the 1.738x structural
 figure (its leaf layout is unchanged), so it is not an answer to the space
 problem; it is a dependency bump that gives back 1.5 GiB and forecloses
-nothing. Note it carries its own open issues (#1331, #1332, #1333: process
-aborts and unopenable files on malformed input, with read-path checksum
-verification only on master), which argue for the upgrade being routine
+nothing. Note that 4.1.0 carries three issues (#1331, #1332, #1333: process
+aborts and unopenable files on malformed input) that were closed upstream on
+2026-08-13 and fixed in redb 4.2.0 of 2026-08-17, which this workspace has not
+taken -- `Cargo.lock` still pins 4.1.0, which argue for the upgrade being routine
 maintenance rather than a security improvement.
 
 Everything below this line predates the 2026-08-13 measurement and is kept
@@ -700,7 +701,7 @@ Recorded because the errors are checkable and someone will propose it again.
   (`db_remove_spend_journal_entry`). `ffldb-blockidx` is likewise keyed by
   hash. "Written once, in order, read by a monotone key" is false for the
   data it named.
-- **It broke atomicity the chain depends on.** `process.rs:908-916` writes
+- **It broke atomicity the chain depends on.** `Chain::flush`'s single-transaction commit (`process.rs`) writes
   block index rows, UTXO entries and both state markers in one
   transaction, with a comment that a crash must never leave the flushed set
   ahead of or behind its recorded state. The split crossed exactly that

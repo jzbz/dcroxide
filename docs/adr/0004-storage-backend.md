@@ -141,8 +141,8 @@ from the baseline's: an 8 GiB page cache is **50% slower**, reversing lever
 the cache penalty vanishes when cadence is raised, confirming the interaction
 this ADR predicted.
 
-**So tuning above the engine buys 11% against what was then a 2.2x gap** (the
-2026-08-15 addendum re-measures it at 1.29x, which makes that 11% a larger
+**So tuning above the engine buys 12.7% against what was then a 2.2x gap** (the
+2026-08-15 addendum re-measures it at 1.29x, which makes that 12.7% a larger
 share of what is left) **and the only un-closed lever needs the port to
 re-encode its own spend-journal rows.**
 [ADR-0009](0009-storage-shape.md) records what remains. Its withdrawal of
@@ -153,7 +153,7 @@ the figures below do support it. What that addendum removes instead is the
 bytes, so a denser row is a divergence to invent, not a dcrd behaviour this
 port is failing to copy.
 
-**Commit cost.** 9.4 us per dirty entry at the end of a full un-indexed
+**Commit cost.** 14.87 us per dirty entry at the end of a full un-indexed
 replay against 1.59 at the start — 9.4x over 66x of tree growth. Earlier text
 quotes 4.9x from raw milliseconds; that figure is confounded by dirty-set
 size and should not be used. Of the optional indexes, the transaction index
@@ -271,8 +271,8 @@ Where the free pages come from is not established. One candidate is visible
 in this crate: `Database::begin` takes a redb `begin_read()` for the whole
 life of *every* ffldb transaction including read-only ones
 (`crates/dcroxide-database/src/lib.rs`, in `begin_seed` — the citation
-here read `:386` until the 2026-08-07 addendum corrected it; that line is
-now the closing brace of `db_type`), and redb will not return a
+here read `:386` until the 2026-08-07 addendum corrected it; that line now
+holds `DEFAULT_DB_CACHE_BYTES`), and redb will not return a
 freed page to the allocator past the oldest live read transaction
 (`transaction_tracker.rs:253-261`). A read held across writes therefore pins
 freed pages and the allocator grows the file instead of reusing them. That
@@ -365,17 +365,20 @@ transaction that freed them and releases keys strictly below `free_until`,
 which is `oldest_live_read.next()` when a read transaction is live and the
 committing transaction's own id otherwise (`transactions.rs:1936-1940`,
 `2129-2160`, `2200-2262`). The only steady-state writer to the metadata
-store is `DbCache::flush`. It is reached from `Transaction::commit_internal`
-(`transaction.rs:634-641`), where the committing transaction's read snapshot
+store is `DbCache::run_flush`. It is reached from `Transaction::commit_internal`
+(`transaction.rs:671`), where the committing transaction's read snapshot
 sits at the last committed id `R` and the flush's own write lands at `R+1`.
 `free_until` is therefore `R+1` whether or not that reader exists: the
 transaction that triggers its own flush pins nothing.
 
 The second path is closed by locking rather than arithmetic.
 `Database::begin` takes the cache mutex and holds it across `begin_read()`
-(`lib.rs:450-462`), and `commit_internal` takes that same mutex before
-calling `cache.flush`. A read transaction therefore cannot come into
-existence while a flush is running, so no *new* reader can straddle one.
+(`lib.rs:1143-1155`, in `begin_seed`). It no longer holds it across the flush:
+since `d5aa17f` (2026-08-16) `flush_locked` takes the cache lock only to
+`begin_flush` and `finish_flush`, releasing it across `DbCache::run_flush` and
+redb's commit (`lib.rs:400-421`), so a *new* reader can now come into existence
+while a flush is running. The in-flight layers stay published for the duration
+instead, which preserves what a reader sees but not this argument.
 
 What remains is a read-only ffldb transaction opened on another thread
 before a flush and still alive after it. That is a real exposure and worth
@@ -425,7 +428,7 @@ the 1 GiB default.
 **Preserving the baseline.** Every figure in the amendment comes from one
 datadir, and opening it is not read-only — redb can quick-repair on open,
 and `Database::open` rolls the block files back when the metadata trails
-them (`lib.rs:365-369`). It has been reflink-cloned to
+them (`lib.rs:882-884`). It has been reflink-cloned to
 `artifacts/dcroxide-bench/m1/baseline-2026-07-25/` (btrfs, 22 s, no
 additional space); the clone is what probes open, and the original is not
 to be touched.
@@ -1222,8 +1225,8 @@ keeps being tested if either version moves.
 **MSRV is unaffected:** redb 4.1.0 requires 1.89 against this workspace's
 1.94 floor.
 
-**Known open issues in 4.1.0**, recorded so the upgrade is not mistaken for
-a robustness improvement: #1331 and #1332 abort the process on malformed
+**Known issues in 4.1.0, since fixed upstream**, recorded so the upgrade is
+not mistaken for a robustness improvement: #1331 and #1332 abort the process on malformed
 on-disk structures (an unvalidated 5-bit page order, and a cyclic branch
 pointer reached from ordinary reads), #1333 leaves a file permanently
 unopenable when the repair path itself panics, and read paths do not verify

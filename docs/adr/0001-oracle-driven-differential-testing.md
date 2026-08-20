@@ -49,9 +49,19 @@ failure so differential coverage can never silently disappear.
 
 ## Addendum, 2026-07-26 — re-pinned to dcrd master `452c1a6c`
 
-The parity target moved from `release-v2.1.5` to dcrd master `452c1a6c`
-(version 2.2.0-pre), and `tools/oracle/go.mod` moved with it, which is the
-rule above working rather than an exception to it. Every module dcrd replaces
+## Addendum, 2026-08-20 — the target moved again; the oracle pin did not
+
+The parity target is now dcrd master `29f17894` (still 2.2.0-pre): `PARITY.md`
+tracks against it, and `crates/dcroxide-testutil/src/lib.rs`'s
+`DCRD_PARITY_COMMIT` refuses to run the interop harness against a daemon built
+from any other commit. `tools/oracle/go.mod` did **not** move with it — every
+module is still on its `452c1a6c` pseudo-version — so this is an exception to
+the rule above rather than the rule working. The reason is recorded in
+`PARITY.md`'s "Oracle pin" paragraph: nothing in the `452c1a6c..29f17894`
+delta changes what any exporter emits, several vector sets are expensive to
+reproduce, and one of them (mixpool) can only be regenerated with a clock
+overlay. Move the module pins when a delta actually requires it, not on every
+target bump. Every module dcrd replaces
 with an in-tree directory whose source differs from its published release —
 `stake`, `standalone`, `edwards`, `secp256k1`, `gcs`, `txscript`, `wire` — is
 pinned to the pseudo-version at that commit, so the oracle links the code the

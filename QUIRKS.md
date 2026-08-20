@@ -238,8 +238,10 @@ Entry format:
   `ErrInvalidMsg`. A `mixdcnet` frame declaring zero mix vectors is
   therefore accepted by the decoder and produces a message the encoder
   refuses to serialize, so a node can hold a message it cannot relay.
-  The same asymmetry exists in `MsgMixSlotReserve`, whose decoder
-  enforces `mcount != 0` and so does not admit the empty case.
+  The same encoder-side rule guards `MsgMixSlotReserve`
+  (`msgmixslotreserve.go:186-190`), but not the asymmetry: its decoder
+  enforces `mcount != 0` as well (`:65-68`), so the empty case never
+  reaches a message value there.
 - **Why reproduced:** decoder acceptance is what decides whether a peer
   is banned for a malformed message, and encoder rejection is what
   decides whether the node relays it. Both are observable to a peer,
