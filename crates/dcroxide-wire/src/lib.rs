@@ -16,10 +16,22 @@
 //! reject trailing bytes; `from_bytes` constructors return the number of
 //! bytes consumed so callers can enforce their own framing.
 //!
-//! Encoding of every implemented type is canonical (dcrd rejects
-//! non-canonical varints), so `encode(decode(bytes)) == bytes` holds for the
-//! consumed prefix — a property exercised by the fuzz targets and
-//! differential tests.
+//! The serialized types re-encode canonically: varints, [`MsgTx`] and
+//! [`BlockHeader`] reproduce exactly the bytes they consumed (dcrd rejects
+//! non-canonical varints), pinned by the proptests in
+//! `tests/codec_properties.rs`, the `MsgTx` arm of
+//! `tests/oracle_differential.rs`, and the `wire_msgtx_decode` /
+//! `wire_blockheader_decode` fuzz targets.
+//!
+//! Whole P2P frames do **not** obey that law, here or in dcrd.
+//! [`MsgVersion`] stops decoding when the payload runs out but always
+//! encodes every field, so a short but valid `version` frame re-encodes
+//! longer than it arrived; its relay flag accepts any non-zero byte and
+//! re-encodes as `0x01`; and an empty `mixdcnet` decodes but cannot be
+//! re-encoded at all (QUIRKS QK-0010).  The frame-level fuzz targets
+//! therefore assert canonical-form stability instead: whatever the
+//! encoder produces decodes back to an equal message, consuming exactly
+//! what was written.
 
 #![cfg_attr(not(test), no_std)]
 // This crate holds no hashed containers: every map and set in it is

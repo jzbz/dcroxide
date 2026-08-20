@@ -426,3 +426,69 @@ fn a_stalling_proxy_cannot_outlive_the_dial_timeout() {
         "the dial gave up within one budget, not one per step: {elapsed:?}"
     );
 }
+
+/// A fake resolver that answers with an arbitrary reply head and
+/// payload, so the IPv6 answer type can be exercised.
+fn fake_tor_resolver_raw(head: [u8; 4], payload: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind resolver");
+    let addr = listener.local_addr().expect("addr").to_string();
+    std::thread::spawn(move || {
+        let Ok((mut conn, _)) = listener.accept() else {
+            return;
+        };
+        let _ = conn.set_read_timeout(Some(TIMEOUT));
+        let mut greeting = [0u8; 3];
+        if conn.read_exact(&mut greeting).is_err() {
+            return;
+        }
+        if conn.write_all(&[5, 0]).is_err() {
+            return;
+        }
+        let mut req = [0u8; 5];
+        if conn.read_exact(&mut req).is_err() {
+            return;
+        }
+        let mut host = vec![0u8; req[4] as usize];
+        if conn.read_exact(&mut host).is_err() {
+            return;
+        }
+        let mut port = [0u8; 2];
+        if conn.read_exact(&mut port).is_err() {
+            return;
+        }
+        let _ = conn.write_all(&head);
+        let _ = conn.write_all(&payload);
+        // Hold the connection so the client reads what was written.
+        std::thread::sleep(Duration::from_millis(500));
+    });
+    addr
+}
+
+/// The daemon's resolver refuses an IPv6 answer dcrd would accept.
+///
+/// dcrd's `TorLookupIP` validates only a six-byte minimum --
+/// `if replyLen <= 4+2 { ... }` then `addr = net.IP(reply[0:replyLen-2])`
+/// -- so a nine-byte reply hands back a seven-byte `net.IP`. The
+/// daemon's lookup returns `std::net::IpAddr`, which cannot hold one,
+/// so the length check is forced by the type rather than chosen. See
+/// PARITY.md; `dcroxide-addrmgr`'s `tor_lookup_ip` reproduces dcrd's
+/// unvalidated version and is pinned by its own frozen vectors.
+#[test]
+fn the_daemon_resolver_refuses_an_ipv6_answer_dcrd_would_accept() {
+    // Seven address bytes plus the two port bytes: past dcrd's minimum.
+    let resolver = fake_tor_resolver_raw([5, 0, 0, 4], vec![1, 2, 3, 4, 5, 6, 7, 0, 0]);
+    assert_eq!(
+        tor_lookup_ip("example.com", &resolver, TIMEOUT).err(),
+        Some("invalid IPV6 address".to_string()),
+    );
+
+    // A well-formed sixteen-byte answer still round-trips.
+    let mut ok = vec![0u8; 16];
+    ok[15] = 1;
+    ok.extend_from_slice(&[0, 0]);
+    let resolver = fake_tor_resolver_raw([5, 0, 0, 4], ok);
+    assert_eq!(
+        tor_lookup_ip("example.com", &resolver, TIMEOUT).expect("resolve"),
+        vec!["::1".parse::<std::net::IpAddr>().expect("ip")],
+    );
+}

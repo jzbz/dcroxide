@@ -227,6 +227,71 @@ fn serves_chain_backed_requests() {
     runtime.shutdown();
 }
 
+/// Repeated inventory items in one getdata are resolved and served once.
+///
+/// A deliberate divergence from dcrd, whose `handleServeGetData` walks
+/// the list verbatim (`server.go:532`) and serves every copy -- the
+/// dcrd-generated `dupcontinue` row in `srvservedata_vectors.txt`
+/// records exactly that. Naming one hash 50,000 times in a 1.8 MB
+/// getdata makes dcrd return up to 50,000 x MaxBlockPayload, and its
+/// 12-entry recentBlocks LRU is never populated by the serve path, so
+/// every copy past the first is a fresh database read. See PARITY.md.
+///
+/// The pending-item counter is unaffected: a skipped repeat is charged
+/// the same single decrement it would have been charged had it been
+/// served, so the intake gate reads dcrd's number.
+#[test]
+fn getdata_serves_repeated_items_once() {
+    let (_dir, runtime, _connected, mut transport, genesis_hash, _addrmgr, _server) =
+        serve_genesis_chain();
+
+    let genesis_iv = InvVect {
+        inv_type: InvType::BLOCK,
+        hash: genesis_hash,
+    };
+    let missing_tx = InvVect {
+        inv_type: InvType::TX,
+        hash: Hash([0x66; 32]),
+    };
+    transport
+        .write_message(&Message::GetData(MsgGetData {
+            inv_list: vec![genesis_iv, genesis_iv, genesis_iv, missing_tx, missing_tx],
+        }))
+        .expect("send getdata with repeats");
+
+    // One block for the three copies.
+    match transport.read_message().expect("read block") {
+        Message::Block(block) => assert_eq!(block.header.block_hash(), genesis_hash),
+        other => panic!("expected block, got {other:?}"),
+    }
+
+    // Then one notfound naming the miss once, not twice.  If a repeat
+    // were served, the next frame would be a second block instead.
+    match transport.read_message().expect("read notfound") {
+        Message::NotFound(not_found) => assert_eq!(
+            not_found.inv_list,
+            vec![missing_tx],
+            "a repeated miss must appear once in notfound"
+        ),
+        other => panic!("expected notfound, got {other:?}"),
+    }
+
+    // The connection still serves afterwards, so nothing was left
+    // half-processed by the skips.
+    transport
+        .write_message(&Message::GetData(MsgGetData {
+            inv_list: vec![genesis_iv],
+        }))
+        .expect("send a follow-up getdata");
+    match transport.read_message().expect("read block") {
+        Message::Block(block) => assert_eq!(block.header.block_hash(), genesis_hash),
+        other => panic!("expected block, got {other:?}"),
+    }
+
+    drop(transport);
+    runtime.shutdown();
+}
+
 /// A frame that fails wire decoding bans the host (dcrd `OnRead`
 /// observing a `wire.ErrorCode` and calling `BanPeer` with the
 /// malformed-wire reason) and the connection drops with the read
