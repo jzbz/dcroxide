@@ -973,15 +973,17 @@ impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
             .expect("sync manager poisoned")
             .process_block(block)
             .map_err(|err| dcroxide_rpc::server::SubmitBlockFailure {
-                // Every block-processing failure here classifies as a
-                // rule error: the ported `Chain::process_block` only
-                // ever surfaces `RuleError`s (database and assertion
-                // faults panic per the project's decision-core
-                // convention), and dcrd's `ErrDuplicateBlock` is itself
-                // a `blockchain.RuleError`, so dcrd's non-rule
-                // internal-error branch (the getwork-submission split)
-                // is unreachable and `submitblock` never wrongly reports
-                // an internal error where dcrd would `rejected: ...`.
+                // dcrd's getwork submission returns an internal RPC
+                // error for anything that is not a
+                // `blockchain.RuleError` and `rejected: ...` for one
+                // that is (`rpcserver.go:4102-4113`), so the
+                // classification the sync layer already computed has to
+                // travel rather than being hard-coded.  An earlier
+                // comment here asserted that database and assertion
+                // faults panic instead; both claims are false -- a
+                // persistence fault latches and is rendered as a
+                // `RuleError` by `persist_rule_error`, and the view
+                // assertion returns one too.
                 // The message renders every block-processing error
                 // exactly as dcrd's `blockchain.MultiError.Error`
                 // combines them: a lone error unadorned (the common
@@ -992,7 +994,7 @@ impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
                 // error slice `NodeSyncChain::process_block` returns
                 // renders byte-for-byte identically for the rare block
                 // that both fails acceptance and then errors reorganizing.
-                is_rule_error: true,
+                is_rule_error: err.is_rule_error,
                 message: err.message,
             })
     }

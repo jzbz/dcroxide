@@ -362,10 +362,21 @@ impl UtxoView {
         );
     }
 
+    /// The internal-consistency assertion dcrd raises when the view
+    /// lost an input it was asked to spend (`utxoviewpoint.go:290-294`,
+    /// `connectTransaction`).
+    ///
+    /// dcrd renders this through `AssertError`, whose `Error()`
+    /// prefixes `assertion failed: ` (`error.go:17-25`), and formats
+    /// the outpoint as `hash:index` via `wire.OutPoint.String`.  The
+    /// port has no separate assertion type -- it carries dcrd's
+    /// `ErrUtxoBackendCorruption` kind, which `is_rule_violation`
+    /// classifies out of the peer-blaming branch -- but the text can
+    /// match, so it does.
     fn assert_missing(outpoint: &OutPoint) -> RuleError {
         crate::ruleerror::rule_error(
             RuleErrorKind::UtxoBackendCorruption,
-            alloc::format!("view missing input {outpoint:?}"),
+            alloc::format!("assertion failed: view missing input {outpoint}"),
         )
     }
 

@@ -204,7 +204,16 @@ fn combine_process_block_result(
             //
             // An earlier comment here claimed the port surfaces database
             // failures through panics. It does not, and never did.
-            is_rule_error: !storage_failed,
+            //
+            // The latch only catches persistence faults.  dcrd also
+            // splits on the error's *class*: `AssertError` for an
+            // internal inconsistency and `ContextError` for a backend
+            // or deployment fault are both outside
+            // `blockchain.RuleError`, so neither reaches the peer-
+            // blaming branch.  The port folds all three into one
+            // `RuleError` carrying dcrd's kind name, so the kind is
+            // what reconstructs the split.
+            is_rule_error: !storage_failed && first.kind.is_rule_violation(),
             message: render_multi_error(&errs),
         }),
     }
@@ -469,6 +478,61 @@ mod tests {
         assert!(
             !failure.is_duplicate_block,
             "and must not be swallowed as a duplicate"
+        );
+    }
+
+    /// An internal inconsistency is not the peer's fault either.
+    ///
+    /// dcrd's `connectTransaction` raises `AssertError("view missing
+    /// input ...")` when the view lost an input
+    /// (`utxoviewpoint.go:290-294`).  `AssertError` is not a
+    /// `blockchain.RuleError`, so dcrd's sync manager takes the
+    /// `Failed to process block` branch (`manager.go:1263`) rather than
+    /// `Rejected block %v from %s`.
+    ///
+    /// The port has no separate assertion type -- it carries dcrd's
+    /// `ErrUtxoBackendCorruption` kind -- so the kind is what has to
+    /// reconstruct the split.  No storage fault is latched here on
+    /// purpose: an internal inconsistency never sets the database's
+    /// fatal flag, which is exactly why the latch alone was not enough.
+    #[test]
+    fn an_internal_inconsistency_is_not_blamed_on_the_peer() {
+        let failure = combine_process_block_result(
+            0,
+            vec![rule_err(
+                RuleErrorKind::UtxoBackendCorruption,
+                "assertion failed: view missing input \
+                 0000000000000000000000000000000000000000000000000000000000000000:0",
+            )],
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            !failure.is_rule_error,
+            "a local view/backend inconsistency must not be reported as a consensus violation"
+        );
+    }
+
+    /// The split is kind-level, not a one-off for the view assertion.
+    ///
+    /// `ErrUnknownDeploymentID` is raised from inside block validation
+    /// and is a `contextError` in dcrd
+    /// (`thresholdstate.go:472` among others), so it carries the same
+    /// misclassification and the same fix.
+    #[test]
+    fn a_deployment_context_error_is_not_blamed_on_the_peer() {
+        let failure = combine_process_block_result(
+            0,
+            vec![rule_err(
+                RuleErrorKind::UnknownDeploymentID,
+                "unknown deployment ID",
+            )],
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            !failure.is_rule_error,
+            "a context error must not be reported as a consensus violation"
         );
     }
 }

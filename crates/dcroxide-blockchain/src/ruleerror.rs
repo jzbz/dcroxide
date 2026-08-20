@@ -178,6 +178,61 @@ pub enum RuleErrorKind {
 }
 
 impl RuleErrorKind {
+    /// Whether dcrd raises this kind as a `blockchain.RuleError` -- a
+    /// block the sending peer got wrong -- rather than a
+    /// `blockchain.ContextError` or an `AssertError`, both of which
+    /// mean something went wrong locally.
+    ///
+    /// The port models all three as one `RuleError` type carrying
+    /// dcrd's kind name, so the kind is the only thing that can
+    /// reconstruct the distinction.  dcrd splits on
+    /// `errors.As(err, &blockchain.RuleError{})` in two places that
+    /// matter: its sync manager, which otherwise logs
+    /// `Rejected block %v from %s` and blames the peer
+    /// (`internal/netsync/manager.go:1258-1264`), and its getwork
+    /// submission arm, which otherwise returns an internal RPC error
+    /// (`internal/rpcserver/rpcserver.go:4102-4113`).
+    ///
+    /// The listed kinds are exactly those dcrd builds with
+    /// `contextError` in production code.  `ErrMissingParent` and
+    /// `ErrSerializeHeader` are deliberately absent: they appear with
+    /// `contextError` only in dcrd's tests, while production builds
+    /// both with `ruleError` (`process.go:194`, `validate.go:2730`),
+    /// so an orphan block stays a peer's problem.
+    #[must_use]
+    pub fn is_rule_violation(self) -> bool {
+        !matches!(
+            self,
+            RuleErrorKind::DBTooOldToUpgrade
+                | RuleErrorKind::DeploymentBadChoiceBits
+                | RuleErrorKind::DeploymentBadMask
+                | RuleErrorKind::DeploymentChoiceAbstain
+                | RuleErrorKind::DeploymentDuplicateChoice
+                | RuleErrorKind::DeploymentMissingAbstain
+                | RuleErrorKind::DeploymentMissingChoiceID
+                | RuleErrorKind::DeploymentMissingNo
+                | RuleErrorKind::DeploymentNonExclusiveFlags
+                | RuleErrorKind::DeploymentTooManyAbstain
+                | RuleErrorKind::DeploymentTooManyChoices
+                | RuleErrorKind::DeploymentTooManyNo
+                | RuleErrorKind::DuplicateDeployment
+                | RuleErrorKind::ForcedMainNetChoice
+                | RuleErrorKind::InvalidateGenesisBlock
+                | RuleErrorKind::NoFilter
+                | RuleErrorKind::NoTreasuryBalance
+                | RuleErrorKind::NotAnAncestor
+                | RuleErrorKind::RequestTooLarge
+                | RuleErrorKind::UnknownBlock
+                | RuleErrorKind::UnknownDeploymentChoice
+                | RuleErrorKind::UnknownDeploymentID
+                | RuleErrorKind::UnknownDeploymentVersion
+                | RuleErrorKind::UtxoBackend
+                | RuleErrorKind::UtxoBackendCorruption
+                | RuleErrorKind::UtxoBackendNotOpen
+                | RuleErrorKind::UtxoBackendTxClosed
+        )
+    }
+
     /// dcrd's name for this error kind.
     pub fn kind_name(self) -> &'static str {
         match self {
