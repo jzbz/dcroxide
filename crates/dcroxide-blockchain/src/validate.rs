@@ -2392,7 +2392,7 @@ pub fn check_vote_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
     // an OP_RETURN block reference, an OP_RETURN with the vote bits,
     // and one output per ticket commitment (plus an optional treasury
     // vote output).
-    let mut extra = 0usize;
+    let mut extra = 0i64;
     if is_treasury_enabled {
         let has_tv = dcroxide_stake::check_ssgen_votes(tx)
             .map(|v| !v.is_empty())
@@ -2401,15 +2401,23 @@ pub fn check_vote_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
             extra = 1;
         }
     }
-    let num_vote_payments = tx.tx_out.len() - 2 - extra;
-    if num_vote_payments * 2 != ticket_outs.len() - 1 {
+    // Signed, because dcrd's is (`validate.go:2978` over Go ints).  A
+    // vote carrying fewer outputs than the two mandatory ones plus the
+    // treasury vote makes this negative, and dcrd falls straight into
+    // the rejection below.  The same expression over usize underflows
+    // instead: a two-output vote whose vote-bits output doubles as a
+    // treasury-vote payload reaches here with extra == 1, which panics
+    // any overflow-checked build and only reaches dcrd's verdict in
+    // release by wrapping far enough to fail the comparison anyway.
+    let num_vote_payments = tx.tx_out.len() as i64 - 2 - extra;
+    let num_commitments = ticket_outs.len() as i64 - 1;
+    if num_vote_payments * 2 != num_commitments {
         let vote_hash = tx.tx_hash();
         return Err(rule_error(
             RuleErrorKind::BadNumPayees,
             format!(
                 "vote {vote_hash} makes {num_vote_payments} payments when the input \
-                 ticket has {} commitments",
-                ticket_outs.len() - 1
+                 ticket has {num_commitments} commitments"
             ),
         ));
     }
