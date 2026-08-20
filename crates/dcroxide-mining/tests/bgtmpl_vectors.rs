@@ -23,7 +23,7 @@ use dcroxide_chaincfg::mainnet_params;
 use dcroxide_chainhash::Hash;
 use dcroxide_mining::bg_generator::{
     BgGenerator, BgRegenEvent, BgTemplateState, handle_regen_event,
-    handle_track_side_chains_timeout,
+    handle_track_side_chains_timeout, handle_vote,
 };
 use dcroxide_mining::{
     BlockTemplate, TemplateBest, TemplateChain, TemplateTxSource, TxMiningView, VoteDesc,
@@ -637,4 +637,74 @@ fn bg_template_generator_matches_dcrd() {
 
         assert_eq!(rig.step, steps.len(), "scenario {scen}: steps consumed");
     }
+}
+
+/// A vote for the base block that regenerates nothing must still reach
+/// the side chain min-votes check.
+///
+/// dcrd's `handleVote` puts its `return` inside the
+/// `numVotes >= maxVotesPerBlock || maxVotesTimeout == nil` branch and
+/// closes the outer block without one (`bgblktmplgenerator.go:1072`
+/// and `:1074`), so control falls through to the side chain reorg at
+/// `:1083`.  The port returned unconditionally and skipped it.
+///
+/// The state is built directly rather than driven through
+/// `handle_regen_event`, because no sequence of real events produces
+/// it: `awaiting_side_chain_min_votes` only ever holds siblings of the
+/// current tip, populated while the tip lacks minimum votes, at which
+/// point `base_block_hash` is the tip's parent -- one height below.
+/// This pins `handle_vote`'s contract against dcrd, not a reachable
+/// node condition, which is also why the replayed dcrd dump above
+/// cannot detect the divergence.
+#[test]
+fn a_vote_on_the_base_block_still_reaches_the_side_chain_check() {
+    let params = mainnet_params();
+    let mut g = BgGenerator::new(
+        params.tickets_per_block,
+        params.stake_validation_height,
+        false,
+    );
+    let mut state = BgTemplateState::new();
+    let tip = byte_hash(0xb0);
+    let sibling = byte_hash(0xb1);
+
+    let mut chain = BgChain {
+        tip: TemplateBest {
+            hash: tip,
+            prev_hash: byte_hash(0xa0),
+            height: 1000,
+            ..TemplateBest::default()
+        },
+        generation: Vec::new(),
+        reorg_fails: BTreeSet::new(),
+        reorgs: Vec::new(),
+    };
+    let mut src = BgSource { votes: Vec::new() };
+
+    // The sibling is both the block the next template builds on and a
+    // tracked side chain candidate, with at least the minimum but
+    // fewer than the maximum votes and the max-votes timeout still
+    // armed -- exactly dcrd's fall-through case.
+    state.base_block_hash = sibling;
+    state.awaiting_side_chain_min_votes.insert(sibling);
+    state.max_votes_timeout_armed = true;
+    src.set_votes(&sibling, usize::from(g.min_votes_required));
+
+    let vote = make_vote(&sibling, 1000);
+    let chain_tip = chain.tip.clone();
+    handle_vote(&mut g, &mut state, &mut chain, &src, &vote, &chain_tip);
+
+    assert!(
+        g.gen_requests.is_empty(),
+        "fewer than max votes with the timeout armed must not regenerate"
+    );
+    assert_eq!(
+        chain.reorgs,
+        vec![format!("OK:{tip}>{sibling}")],
+        "the side chain min-votes reorg must still be attempted"
+    );
+    assert!(
+        state.awaiting_side_chain_min_votes.is_empty(),
+        "a successful reorg clears side chain tracking"
+    );
 }

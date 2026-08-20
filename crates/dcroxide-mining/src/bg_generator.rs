@@ -502,8 +502,12 @@ pub fn handle_vote(
             state.stop_regen_timer();
             state.failed_gen_retry_timeout_armed = false;
             g.gen_template_async(tpl_update_reason);
+            return;
         }
-        return;
+        // No return here.  dcrd closes the outer block without one
+        // (`bgblktmplgenerator.go:1074`), so a vote for the base block
+        // that regenerates nothing still reaches the side chain
+        // min-votes check below.
     }
 
     // Reorganize to an alternative tip when it receives the minimum

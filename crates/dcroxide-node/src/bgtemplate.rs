@@ -175,19 +175,33 @@ pub struct SharedTemplate {
     reorganizing: bool,
 }
 
+/// dcrd's per-subscription buffer: twice the number of regenerations
+/// the votes on one parent can induce (`Subscribe`'s
+/// `maxVoteInducedRegens*2`, `bgblktmplgenerator.go:503-504`).  Six on
+/// mainnet, where `TicketsPerBlock` is 5 and `minVotesRequired` is 3.
+fn subscription_buffer(tickets_per_block: u16) -> usize {
+    let tpb = usize::from(tickets_per_block);
+    // Saturating throughout so a degenerate zero cannot underflow, and
+    // never zero so the channel is never a rendezvous.
+    let min_votes = tpb.wrapping_div(2).saturating_add(1);
+    tpb.saturating_sub(min_votes)
+        .saturating_add(1)
+        .saturating_mul(2)
+}
+
 /// The subscriber registry the thread broadcasts each new template
 /// block through (dcrd's `notifySubscribersHandler` fanning template
 /// notifications out to every `TemplateSubscription`).
 #[derive(Default)]
 pub struct SubscriberRegistry {
     next_id: u64,
-    subscribers: HashMap<u64, mpsc::Sender<MsgBlock>>,
+    subscribers: HashMap<u64, mpsc::SyncSender<MsgBlock>>,
 }
 
 impl SubscriberRegistry {
     /// Register a new subscription channel, returning its id (dcrd
     /// `Subscribe` adding to the subscription map).
-    fn register(&mut self, sender: mpsc::Sender<MsgBlock>) -> u64 {
+    fn register(&mut self, sender: mpsc::SyncSender<MsgBlock>) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         self.subscribers.insert(id, sender);
@@ -200,12 +214,23 @@ impl SubscriberRegistry {
         self.subscribers.remove(&id);
     }
 
-    /// Broadcast the template block to every subscriber, dropping any
-    /// whose receiver is gone (dcrd's non-blocking sends over each
-    /// subscription channel).
+    /// Broadcast the template block to every subscriber (dcrd's
+    /// non-blocking sends over each subscription channel).
+    ///
+    /// A full buffer drops the notification and keeps the subscriber,
+    /// which is dcrd's `select { case s.privC <- ntfn: default: }`
+    /// (`bgblktmplgenerator.go:460-469`, whose type doc says outright
+    /// that notifications are dropped to make up for slow receivers).
+    /// Only a receiver that is gone deregisters -- testing `is_ok()`
+    /// instead would silently drop every subscriber that is merely
+    /// busy, which is worse than the unbounded queue this replaces.
     fn broadcast(&mut self, block: &MsgBlock) {
-        self.subscribers
-            .retain(|_, sender| sender.send(block.clone()).is_ok());
+        self.subscribers.retain(|_, sender| {
+            !matches!(
+                sender.try_send(block.clone()),
+                Err(mpsc::TrySendError::Disconnected(_))
+            )
+        });
     }
 }
 
@@ -879,7 +904,8 @@ impl RpcBlockTemplater for NodeRpcBlockTemplater {
     }
 
     fn subscribe(&self) -> Box<dyn RpcTemplateSubscription + Send> {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) =
+            mpsc::sync_channel(subscription_buffer(self.params.tickets_per_block));
         // Register the subscription before delivering the current
         // template so a broadcast racing between registration and
         // delivery reaches the new subscriber rather than being lost
@@ -901,7 +927,7 @@ impl RpcBlockTemplater for NodeRpcBlockTemplater {
                 && current.err.is_none()
                 && let Some(block) = &current.block
             {
-                let _ = sender.send(block.clone());
+                let _ = sender.try_send(block.clone());
             }
         }
         Box::new(NodeTemplateSubscription {
@@ -1133,5 +1159,53 @@ mod tests {
         reconcile_timers(&mut deadlines, &state, false);
         assert!(nearest_deadline(&deadlines).is_none());
         assert_eq!(deadlines.regen_millis, 0);
+    }
+
+    /// A subscriber that stops draining must bound its backlog and stay
+    /// registered.
+    ///
+    /// dcrd gives each subscription a channel of `maxVoteInducedRegens*2`
+    /// and drops on a full buffer -- `select { case s.privC <- ntfn:
+    /// default: }` (`bgblktmplgenerator.go:460-469`) -- so a slow
+    /// receiver loses notifications rather than growing a queue. The
+    /// previous unbounded channel grew without limit behind a receiver
+    /// that was alive but idle.
+    ///
+    /// The second assertion guards the shape of the fix: deregistering
+    /// on any send error, rather than only on a disconnected receiver,
+    /// would silently drop every subscriber that is merely busy.
+    #[test]
+    fn a_full_subscriber_drops_notifications_and_stays_registered() {
+        let mut reg = SubscriberRegistry::default();
+        let cap = subscription_buffer(5);
+        assert_eq!(cap, 6, "mainnet's maxVoteInducedRegens*2");
+
+        let (tx, rx) = mpsc::sync_channel(cap);
+        reg.register(tx);
+        let block = dcroxide_chaincfg::regnet_params().genesis_block.clone();
+
+        // Nobody drains.
+        for _ in 0..64 {
+            reg.broadcast(&block);
+        }
+
+        assert_eq!(
+            reg.subscribers.len(),
+            1,
+            "a subscriber that is merely full must stay registered"
+        );
+        let mut queued = 0;
+        while rx.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, cap, "the backlog is capped at dcrd's buffer");
+
+        // A receiver that is gone does deregister.
+        drop(rx);
+        reg.broadcast(&block);
+        assert!(
+            reg.subscribers.is_empty(),
+            "a disconnected receiver deregisters"
+        );
     }
 }
