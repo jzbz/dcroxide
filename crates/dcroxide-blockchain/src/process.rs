@@ -167,6 +167,9 @@ impl crate::utxoview::UtxoResolver for ChainUtxoResolver<'_> {
 /// database flushes and locks are not reproduced; index persistence
 /// arrives with the engine wiring.
 pub struct Chain {
+    /// Accepted headers that force a block index flush; see
+    /// [`Chain::HEADER_FLUSH_THRESHOLD`].
+    header_flush_threshold: usize,
     /// The block tree arena.
     pub store: NodeStore,
     /// The block index over the arena.
@@ -410,6 +413,7 @@ impl Chain {
         }
 
         Chain {
+            header_flush_threshold: Chain::HEADER_FLUSH_THRESHOLD,
             store,
             index,
             assume_valid: config_assume_valid,
@@ -1003,6 +1007,20 @@ impl Chain {
             return Err(crate::chaindb::ChainDbError::Db(e));
         }
         Ok(())
+    }
+
+    /// Flush the modified block index rows without failing on the
+    /// write (dcrd `flushBlockIndexWarnOnly`).
+    ///
+    /// The administrative paths use this: their work is already done by
+    /// the time they reach it, and dcrd does not fail an
+    /// `invalidateblock` because the write did not land.
+    ///
+    /// dcrd logs the error; this crate has no logging facility, so it is
+    /// dropped instead. The control flow is the same either way -- dcrd
+    /// does not propagate it -- but the operator loses the line.
+    fn flush_block_index_warn_only(&mut self, params: &Params) {
+        let _ = self.flush_block_index(params);
     }
 
     /// Write the modified block index entries to the database,
@@ -2322,18 +2340,51 @@ impl Chain {
         Ok(new_node)
     }
 
+    /// The accepted-header count that forces a block index flush.
+    ///
+    /// dcrd flushes after every header (`process.go:267-271`), which it
+    /// can afford because ffldb batches. This port's writes are
+    /// `Durability::Immediate`, so per-header would be an fsync per
+    /// header -- about a million on a mainnet sync. One `headers`
+    /// message worth is the compromise: the same cadence the sync
+    /// manager already works in, ~525 flushes for mainnet, and a
+    /// bounded set to materialize when the first block connects.
+    pub const HEADER_FLUSH_THRESHOLD: usize = dcroxide_wire::MAX_BLOCK_HEADERS_PER_MSG as usize;
+
+    /// Lower the threshold, so the batching itself can be exercised.
+    ///
+    /// Reaching the default needs 2000 accepted headers, which is past
+    /// every network's stake validation height, so a headers-only
+    /// fixture cannot get there.
+    pub fn set_header_flush_threshold(&mut self, headers: usize) {
+        self.header_flush_threshold = headers;
+    }
+
     /// Insert a new block header into the chain using headers-first
-    /// semantics (dcrd `ProcessBlockHeader`).  dcrd additionally
-    /// flushes modified block index entries to the database here;
-    /// index persistence arrives with the engine wiring.
+    /// semantics (dcrd `ProcessBlockHeader`).
+    ///
+    /// dcrd flushes the modified block index entries here, since a new
+    /// header always adds one. This flushes on the same event but not at
+    /// the same rate -- see [`Self::HEADER_FLUSH_THRESHOLD`].
+    ///
+    /// Without it nothing drained the set until a block connected, and
+    /// sync is strictly headers-first: the whole header chain
+    /// accumulated, so the first connect materialized every row at once
+    /// -- roughly 250 MB for mainnet, a header apiece -- and none of it
+    /// was durable in the meantime, so a host that could not afford that
+    /// allocation re-downloaded every header and failed at the same
+    /// point again.
     pub fn process_block_header(
         &mut self,
         header: &BlockHeader,
         adjusted_time_unix: i64,
         params: &Params,
     ) -> Result<(), RuleError> {
-        self.maybe_accept_block_header(header, true, adjusted_time_unix, params)
-            .map(|_| ())
+        self.maybe_accept_block_header(header, true, adjusted_time_unix, params)?;
+        if self.index.modified_len() >= self.header_flush_threshold {
+            self.flush_block_index(params).map_err(persist_rule_error)?;
+        }
+        Ok(())
     }
 
     /// Connect the block to the end of the best chain: record the
@@ -3344,6 +3395,7 @@ impl Chain {
         if !self.best_chain.contains(&self.store, node) {
             self.index
                 .mark_block_failed_validation(&mut self.store, node);
+            self.flush_block_index_warn_only(params);
             return Vec::new();
         }
 
@@ -3356,6 +3408,7 @@ impl Chain {
         }
         self.index
             .mark_block_failed_validation(&mut self.store, node);
+        self.flush_block_index_warn_only(params);
 
         // Reset whether the chain believes it is current since the
         // best chain was just invalidated.
@@ -3400,6 +3453,7 @@ impl Chain {
 
         // Reorganize to the best remaining candidate.
         let target = self.index.find_best_chain_candidate(&self.store);
+        self.flush_block_index_warn_only(params);
         self.reorganize_chain(target, adjusted_time_unix, params)
     }
 
@@ -3539,6 +3593,7 @@ impl Chain {
         // candidate, then force pruning of the cached chain tips.
         self.is_current_latch = false;
         let target = self.index.find_best_chain_candidate(&self.store);
+        self.flush_block_index_warn_only(params);
         let errs = self.reorganize_chain(target, adjusted_time_unix, params);
         let best = self.best_chain.tip().expect("best chain tip");
         self.index.prune_cached_tips(&self.store, best);

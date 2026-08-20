@@ -769,6 +769,15 @@ impl BlockIndex {
         self.modified.insert(node);
     }
 
+    /// How many nodes carry unflushed changes.
+    ///
+    /// The headers-first sync path consults this to bound the set: every
+    /// accepted header marks a node, and nothing drains the set until a
+    /// *block* connects.
+    pub fn modified_len(&self) -> usize {
+        self.modified.len()
+    }
+
     /// Drain the set of nodes with unflushed changes (used by the
     /// block index flush).
     pub fn take_modified(&mut self) -> alloc::vec::Vec<NodeId> {
