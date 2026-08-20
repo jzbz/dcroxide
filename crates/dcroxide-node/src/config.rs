@@ -1337,7 +1337,7 @@ fn new_amount(f: f64) -> Result<i64, String> {
 /// at the caller below: a stat that fails for some other reason while
 /// the create still succeeds would truncate an operator's existing
 /// config file and replace their credentials.
-pub(crate) fn file_exists(name: &str) -> bool {
+pub fn file_exists(name: &str) -> bool {
     match std::fs::metadata(name) {
         Ok(_) => true,
         Err(e) => e.kind() != std::io::ErrorKind::NotFound,

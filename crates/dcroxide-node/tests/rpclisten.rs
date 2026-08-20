@@ -575,14 +575,22 @@ fn serves_tls_with_a_generated_certificate() {
     // Generate the certificate pair like the daemon's first start.
     let cert_path = dir.path().join("rpc.cert");
     let key_path = dir.path().join("rpc.key");
-    let (cert_pem, key_pem) =
-        dcroxide_node::rpcrun::load_or_generate_cert_pair(&cert_path, &key_path, &[])
-            .expect("generate cert pair");
+    let (cert_pem, key_pem) = dcroxide_node::rpcrun::load_or_generate_cert_pair(
+        &cert_path,
+        &key_path,
+        &[],
+        dcroxide_certgen::Curve::P256,
+    )
+    .expect("generate cert pair");
     assert!(cert_path.exists() && key_path.exists());
     // A second load reuses the written pair.
-    let (cert_again, _) =
-        dcroxide_node::rpcrun::load_or_generate_cert_pair(&cert_path, &key_path, &[])
-            .expect("reload cert pair");
+    let (cert_again, _) = dcroxide_node::rpcrun::load_or_generate_cert_pair(
+        &cert_path,
+        &key_path,
+        &[],
+        dcroxide_certgen::Curve::P256,
+    )
+    .expect("reload cert pair");
     assert_eq!(cert_pem, cert_again);
 
     let tls = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, None)
@@ -893,9 +901,13 @@ fn client_cert_auth_requires_usable_certificate_authorities() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let cert_path = dir.path().join("rpc.cert");
     let key_path = dir.path().join("rpc.key");
-    let (cert_pem, key_pem) =
-        dcroxide_node::rpcrun::load_or_generate_cert_pair(&cert_path, &key_path, &[])
-            .expect("generate cert pair");
+    let (cert_pem, key_pem) = dcroxide_node::rpcrun::load_or_generate_cert_pair(
+        &cert_path,
+        &key_path,
+        &[],
+        dcroxide_certgen::Curve::P256,
+    )
+    .expect("generate cert pair");
 
     // Empty and garbage CA material both fail closed.
     for cas in [&b""[..], &b"not a certificate at all"[..]] {
@@ -939,8 +951,13 @@ fn a_half_present_pair_is_not_regenerated_over_the_surviving_file() {
     let provisioned = b"-----BEGIN EC PRIVATE KEY-----\nthe operator's key\n";
     std::fs::write(&key_path, provisioned).expect("seed the key");
 
-    let err = dcroxide_node::rpcrun::load_or_generate_cert_pair(&cert_path, &key_path, &[])
-        .expect_err("a missing certificate beside a present key must not regenerate");
+    let err = dcroxide_node::rpcrun::load_or_generate_cert_pair(
+        &cert_path,
+        &key_path,
+        &[],
+        dcroxide_certgen::Curve::P256,
+    )
+    .expect_err("a missing certificate beside a present key must not regenerate");
     assert!(
         err.contains("rpc.cert") && err.contains("is missing"),
         "the error must name the missing file: {err}"
@@ -958,8 +975,13 @@ fn a_half_present_pair_is_not_regenerated_over_the_surviving_file() {
     // And symmetrically, with the certificate present and the key gone.
     std::fs::remove_file(&key_path).expect("remove the key");
     std::fs::write(&cert_path, b"the operator's cert").expect("seed the cert");
-    let err = dcroxide_node::rpcrun::load_or_generate_cert_pair(&cert_path, &key_path, &[])
-        .expect_err("a missing key beside a present certificate must not regenerate");
+    let err = dcroxide_node::rpcrun::load_or_generate_cert_pair(
+        &cert_path,
+        &key_path,
+        &[],
+        dcroxide_certgen::Curve::P256,
+    )
+    .expect_err("a missing key beside a present certificate must not regenerate");
     assert!(
         err.contains("rpc.key") && err.contains("is missing"),
         "the error must name the missing file: {err}"
@@ -988,8 +1010,13 @@ fn generated_rpc_key_is_owner_only() {
 
     // Neither file exists, which is the only condition under which
     // anything is generated (dcrd's `!keyFileExists && !certFileExists`).
-    dcroxide_node::rpcrun::load_or_generate_cert_pair(&cert_path, &key_path, &[])
-        .expect("generate cert pair");
+    dcroxide_node::rpcrun::load_or_generate_cert_pair(
+        &cert_path,
+        &key_path,
+        &[],
+        dcroxide_certgen::Curve::P256,
+    )
+    .expect("generate cert pair");
 
     let mode = std::fs::metadata(&key_path)
         .expect("key metadata")
@@ -1031,8 +1058,13 @@ fn an_unplaceable_rpc_key_fails_startup_and_removes_the_certificate() {
         return;
     }
 
-    let err = dcroxide_node::rpcrun::load_or_generate_cert_pair(&cert_path, &key_path, &[])
-        .expect_err("an unwritable key must not be ignored");
+    let err = dcroxide_node::rpcrun::load_or_generate_cert_pair(
+        &cert_path,
+        &key_path,
+        &[],
+        dcroxide_certgen::Curve::P256,
+    )
+    .expect_err("an unwritable key must not be ignored");
     assert!(
         err.contains("unable to write the RPC key"),
         "unexpected error: {err}"

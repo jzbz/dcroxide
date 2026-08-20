@@ -235,7 +235,24 @@ pub fn new_tls_cert_pair_parts<E: CertEnv>(
     if valid_until_unix < now {
         return Err("validUntil would create an already-expired certificate".to_string());
     }
-    let scalar = env.ec_private_scalar(curve);
+    // Rejection sampling, which the caller cannot do for itself: a
+    // uniform draw of the curve's byte length can land at or above the
+    // group order, and `from_slice` then refuses it.  For P-521 the
+    // order is just under 2^521 against a 66-byte (2^528) draw, so about
+    // 99.2% of draws are refused -- a single draw would fail to generate
+    // a certificate almost every time.  P-256's order is close enough to
+    // 2^256 that a rejection is vanishingly rare, which is why this was
+    // invisible while the curve was hardcoded.
+    let scalar = loop {
+        let candidate = env.ec_private_scalar(curve);
+        let accepted = match curve {
+            Curve::P256 => p256::ecdsa::SigningKey::from_slice(&candidate).is_ok(),
+            Curve::P521 => p521::ecdsa::SigningKey::from_slice(&candidate).is_ok(),
+        };
+        if accepted {
+            break candidate;
+        }
+    };
     let template = build_template(env, now, organization, valid_until_unix, extra_hosts, true)?;
 
     match curve {

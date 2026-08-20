@@ -635,10 +635,41 @@ fn run(cfg: Config) -> ExitCode {
         let transport = if cfg.disable_tls {
             dcroxide_node::rpcrun::RpcTransport::Plain
         } else {
+            // dcrd warns when additional names are asked for but the
+            // certificates already exist, because they will not be
+            // included (`server.go:3839-3845`).
+            if !cfg.alt_dns_names.is_empty()
+                && (dcroxide_node::config::file_exists(&cfg.rpc_cert)
+                    || dcroxide_node::config::file_exists(&cfg.rpc_key))
+            {
+                dcroxide_node::logging::warn(
+                    "RPCS",
+                    "Additional DNS names specified when TLS certificates already exist \
+                     will NOT be included:",
+                );
+                dcroxide_node::logging::warn(
+                    "RPCS",
+                    &format!(
+                        "- In order to create TLS certs that include the additional DNS \
+                         names, delete {:?} and {:?} and restart the server",
+                        cfg.rpc_key, cfg.rpc_cert
+                    ),
+                );
+            }
+            // The certificate's subject alternative names come from
+            // --altdnsnames, which is what dcrd passes to genCertPair;
+            // --externalip is the P2P advertisement list and has no
+            // business in a TLS certificate.
             let config = dcroxide_node::rpcrun::load_or_generate_cert_pair(
                 Path::new(&cfg.rpc_cert),
                 Path::new(&cfg.rpc_key),
-                &cfg.external_ips,
+                &cfg.alt_dns_names,
+                match dcroxide_node::config::tls_curve(&cfg.tls_curve) {
+                    Ok(dcroxide_node::config::TlsCurve::P521) => dcroxide_certgen::Curve::P521,
+                    // Validated during configuration, so the error arm
+                    // is unreachable; the default is dcrd's default.
+                    _ => dcroxide_certgen::Curve::P256,
+                },
             )
             .and_then(|(cert, key)| {
                 // Client certificate authentication demands the CA
