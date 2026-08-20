@@ -469,8 +469,8 @@ impl<B: MixBlockChain> Pool<B> {
         Pool::new_with_clock(
             blockchain,
             utxo_fetcher,
-            // The LRU clock must be Send + Sync, unlike the mixpool's
-            // single-threaded internal Rc structures.
+            // The LRU clock must be Send + Sync, so it is an `Arc`
+            // rather than the plain closure the rest of the pool uses.
             std::sync::Arc::new(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -651,10 +651,11 @@ impl<B: MixBlockChain> Pool<B> {
     }
 
     fn expire_messages_now(&mut self, height: u32) {
-        // Expire sessions and their messages.  Note that dcrd creates
-        // every session with the maximum possible expiry (see
-        // accept_ke), so in practice sessions only die through PR
-        // expiry below.
+        // Expire sessions and their messages.  `accept_ke` folds each
+        // referenced pair request's expiry into the session's running
+        // minimum, so a session can die here on its own -- the earlier
+        // behaviour, where every session carried the maximum expiry,
+        // was dcrd's own bug and is retired (QK-0002).
         let expired_sids: Vec<[u8; 32]> = self
             .sessions
             .iter()

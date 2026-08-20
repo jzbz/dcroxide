@@ -3,9 +3,9 @@
 //! semantics including P2SH handling, conditional-execution tracking, and
 //! dcrd's exact validation order and error identities.
 //!
-//! dcrd's optional `SigCache` is not reproduced: it is a concurrency
-//! optimization that memoizes successful verifications and has no effect
-//! on results (see PARITY.md); this engine always verifies directly.
+//! dcrd's optional `SigCache` is ported (see `sigcache`); an engine
+//! given one records and consults verified signature results rather
+//! than re-verifying.
 
 use alloc::format;
 use alloc::string::String;

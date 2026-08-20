@@ -236,8 +236,9 @@ pub fn rpc_result_types(method: &str) -> Option<Vec<Option<GoType>>> {
 }
 
 /// Help and usage provider for the RPC server commands that caches
-/// its results (dcrd `helpCacher`).  dcrd's mutex is daemon-phase
-/// concurrency; the port takes `&mut self`.
+/// its results (dcrd `helpCacher`).  dcrd guards its caches with one
+/// mutex; this guards each cache with its own, so a usage lookup and a
+/// method lookup do not serialize against each other.
 ///
 /// The usage cache holds a single string regardless of the websocket
 /// flag, exactly like dcrd: whichever variant is requested first is

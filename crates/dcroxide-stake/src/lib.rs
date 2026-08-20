@@ -246,8 +246,8 @@ fn is_small_int(op: u8) -> bool {
 }
 
 /// Whether the script is a null data script by the stake package's rules
-/// (dcrd stake `IsNullDataScript`; note the pushed data limit differs
-/// from stdscript's).
+/// (dcrd stake `IsNullDataScript`).  The pushed data limit is the same
+/// 256 bytes stdscript uses, as it is upstream.
 pub fn is_null_data_script(script_version: u16, script: &[u8]) -> bool {
     // The only supported script version is 0.
     if script_version != 0 {

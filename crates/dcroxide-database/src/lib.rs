@@ -15,8 +15,8 @@
 //! ffldb interface test battery.
 //!
 //! Deliberate divergences from ffldb, all within the interface
-//! contract: no goleveldb-style treap write cache (redb transactions
-//! natively provide read-your-writes and snapshot isolation), no LRU
+//! contract: the metadata write cache is a layered overlay rather than
+//! goleveldb's treap pair (see `dbcache`), no LRU
 //! block-file handle cache, cursors materialize their view at creation
 //! (the interface contract already declares cursors invalidated by any
 //! bucket modification other than `Cursor::delete`), and

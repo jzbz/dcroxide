@@ -6,12 +6,14 @@
 //! headers, and body are parsed with dcrd's authenticated read limit,
 //! the Authorization header runs through the ported `checkAuth`, and
 //! the body flows through the ported `jsonRPCRead` pipeline
-//! (`process_body`), holding the shared server for the duration of the
-//! request — the OS-threads translation of dcrd's per-client handler
-//! with its internal locking.  A handler that reaches a seam the
-//! daemon has not wired yet panics on the connection thread; the panic
-//! is caught and answered with an internal error so the server
-//! survives.
+//! (`process_body`) over a shared `Arc<Server<_>>` — the OS-threads
+//! translation of dcrd's per-client handler, with the coarse mutex that
+//! once wrapped it retired in favour of the fine-grained locks dcrd
+//! itself uses.  A handler that reaches a seam the daemon has not wired
+//! yet panics on the connection thread; release builds set
+//! `panic = "abort"`, so that ends the process rather than the request
+//! — the `catch_unwind` below is meaningful only under `cargo test`, as
+//! the workspace manifest records.
 //!
 //! dcrd's default mode serves TLS over a self-generated certificate
 //! pair: [`load_or_generate_cert_pair`] mirrors dcrd's `genCertPair`
@@ -61,11 +63,11 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// so a byte-dribbling slowloris on the `--notls` path is bounded to the
 /// deadline rather than resetting a per-read timeout indefinitely.
 ///
-/// Two gaps remain, both tracked as follow-ups: over TLS a single
-/// `rustls` read loops many internal `sock.read` syscalls under one
-/// re-armed `SO_RCVTIMEO`, so the absolute bound does not reach the TLS
-/// record loop (std exposes no absolute read deadline; a per-connection
-/// watchdog is the fix), and there is no write-side deadline, so a
+/// Over TLS a single `rustls` read loops many internal `sock.read`
+/// syscalls under one re-armed `SO_RCVTIMEO`, so the absolute bound does
+/// not reach the TLS record loop; [`arm_handshake_watchdog`] closes that
+/// by bounding the whole pre-request phase from outside the connection
+/// thread.  One gap remains: there is no write-side deadline, so a
 /// zero-window reader can stall a response write.
 const RPC_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -2616,10 +2618,11 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     let cancel_watch = arm_request_cancel(Arc::clone(&cancel), cancel_sock, Arc::clone(shutdown));
     let cancel_scope = dcroxide_rpc::worksem::scope_request_cancel(Arc::clone(&cancel));
 
-    // Process the request body, holding the server for the duration
-    // like dcrd's internal locking.  A panic from a not-yet-wired seam
-    // is caught and answered as an internal error; the lock recovers
-    // from the poisoning so later requests keep working.
+    // Process the request body over the shared server; there is no
+    // longer a server-wide lock to hold, and so none to poison.  Under
+    // `cargo test` a panic from a not-yet-wired seam is caught here and
+    // answered as an internal error.  In release `panic = "abort"` means
+    // it never arrives.
     let response = catch_unwind(AssertUnwindSafe(|| {
         dcroxide_rpc::http::process_body(server, &body, is_admin)
     }))

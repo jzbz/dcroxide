@@ -17,8 +17,9 @@
 //! template generator (present when mining addresses are configured),
 //! halting and resuming template generation around the reorg; the
 //! block accepted, connected, and disconnected events feed it too.
-//! The mix-observer refusal gate is skipped until the mixpool arrives
-//! — without a pool there are no misbehaving mix inputs to refuse.
+//! The mix-observer refusal gate runs when a mixpool is present, which
+//! it is in the daemon; without one there are no misbehaving mix inputs
+//! to refuse and the gate is skipped.
 //!
 //! Lock order: the mixpool mutex is never taken while the chain mutex
 //! is held.  The mixpool reaches back into the chain for its tip and

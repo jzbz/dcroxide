@@ -3,10 +3,9 @@
 //! Headers-first chain processing from dcrd's
 //! `internal/blockchain/process.go`: accepting block headers to the
 //! block index with full context-free and positional validation, the
-//! known-invalid short circuits, and the assumed-valid and old fork
-//! rejection checkpoint tracking.  The full block processing path
-//! (`ProcessBlock` and the reorganization machinery it drives)
-//! arrives with the chain engine.
+//! known-invalid short circuits, the assumed-valid and old fork
+//! rejection checkpoint tracking, and the full block processing path
+//! (`ProcessBlock` and the reorganization machinery it drives).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -162,10 +161,11 @@ impl crate::utxoview::UtxoResolver for ChainUtxoResolver<'_> {
 }
 
 /// The growing chain state: the block tree arena and index together
-/// with the header-processing configuration (the subset of dcrd's
-/// `BlockChain` struct the headers-first path reads).  dcrd's
-/// database flushes and locks are not reproduced; index persistence
-/// arrives with the engine wiring.
+/// with the chain state and configuration (the subset of dcrd's
+/// `BlockChain` struct this port reads).  dcrd's locks are not
+/// reproduced -- the daemon holds one mutex over the whole chain --
+/// but its database flush points are; see
+/// [`Chain::HEADER_FLUSH_THRESHOLD`].
 pub struct Chain {
     /// Accepted headers that force a block index flush; see
     /// [`Chain::HEADER_FLUSH_THRESHOLD`].
@@ -692,7 +692,8 @@ impl Chain {
             let block_hash = entry.header.block_hash();
             if i == 0 {
                 // The first entry is the genesis block, which the
-                // constructor already created; update its status.
+                // constructor already created, so there is nothing to
+                // add -- only the shape to check.
                 if block_hash != genesis_hash {
                     return Err(chaindb::ChainDbError::Corrupt(
                         "expected first block index entry to be the genesis block".into(),
@@ -3278,8 +3279,11 @@ impl Chain {
         }
 
         // Accept the block data and determine the blocks now eligible
-        // for full validation.  dcrd flushes the block index to the
-        // database here; index persistence arrives with the wiring.
+        // for full validation.  dcrd also flushes the block index here
+        // (`process.go:543`); this port does not, because `connect_block`
+        // flushes moments later and the data-stored bits self-heal
+        // through the store-block dedup window, so it would be a write
+        // per block for nothing.
         let linked = match self.maybe_accept_block_data(node, block, fast_add, params) {
             Ok(linked) => linked,
             Err(err) => return (0, alloc::vec![err]),

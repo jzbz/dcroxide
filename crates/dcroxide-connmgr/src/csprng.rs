@@ -9,8 +9,7 @@
 //! unpredictability, not reproducibility — dcrd's own generator is
 //! seeded from OS entropy and cannot be replayed — so the default
 //! implementation follows the workspace's [`AddrRng`] pattern: a
-//! ChaCha20 keystream seeded from the system clock, with OS entropy
-//! wired by the daemon phase.
+//! ChaCha20 keystream seeded from OS entropy.
 //!
 //! [`AddrRng`]: dcroxide_addrmgr::AddrRng
 
@@ -30,9 +29,8 @@ pub trait Csprng {
     }
 }
 
-/// A ChaCha20-keystream randomness source seeded from the system
-/// clock (the same construction as the address manager's default
-/// source); the daemon phase wires OS entropy.
+/// A ChaCha20-keystream randomness source seeded from OS entropy (the
+/// same construction as the address manager's default source).
 pub struct SystemCsprng {
     cipher: chacha20::ChaCha20,
 }

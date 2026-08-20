@@ -268,12 +268,14 @@ impl NodeRpcExistsAddresser {
     ///
     /// The address lookups below are caller-sized — `existsaddresses`
     /// accepts as many addresses as fit the request body — and the index
-    /// writer takes the database's writer semaphore *before* it waits on
-    /// this mutex (`dcroxide_indexers::subscriber`).  Holding the mutex
-    /// across the database reads therefore parks the writer while it owns
-    /// the semaphore every other database commit in the daemon queues
-    /// behind, so a single large request stalls block connection for its
-    /// whole duration.  dcrd has no equivalent stall: its
+    /// writer takes this mutex *before* it opens its write transaction
+    /// (`dcroxide_indexers::subscriber`, pinned by `b6_indexlock`), so
+    /// the writer's semaphore is claimed last and never held while it
+    /// waits here.  Holding the mutex across the database reads
+    /// therefore stalls the indexer, but not every other commit in the
+    /// process, which is the whole point of that ordering.  Releasing
+    /// the guard before the reads keeps even the indexer moving.  dcrd
+    /// has no equivalent stall: its
     /// `ExistsAddresses` takes no index-wide lock at all
     /// (`existsaddrindex.go` 331-364).
     ///

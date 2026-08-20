@@ -121,10 +121,11 @@ pub struct ExistsAddrIndex {
 /// Obtaining one of these costs two `Arc` clones, so a caller holding
 /// `Arc<Mutex<ExistsAddrIndex>>` can release the index guard before doing
 /// any database work and reach the same behaviour.  That matters because
-/// the index writer takes the database's writer semaphore *before* it
-/// waits on the index mutex (`subscriber.rs`), so a query that held the
-/// index mutex across its database reads would park the writer — and
-/// every database commit in the daemon serializes behind that semaphore.
+/// the index writer takes this mutex *before* it opens its write
+/// transaction (`subscriber.rs`, pinned by `b6_indexlock`): the writer's
+/// semaphore is claimed last and never held while it waits here, so a
+/// query that held the mutex across its database reads would stall the
+/// indexer without stalling every other commit in the process.
 #[derive(Clone)]
 pub struct ExistsAddrQuery {
     db: Arc<Database>,
