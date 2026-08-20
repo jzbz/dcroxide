@@ -4429,9 +4429,20 @@ fn validate_item(
         item.script_version,
     )
     .map_err(|e| {
+        // Engine construction failing is a malformed script, not a
+        // failed validation: dcrd's shared handler gives
+        // `ErrScriptMalformed` here and keeps `ErrScriptValidation` for
+        // execution (`scriptval.go:80-101`).  The port's own
+        // single-transaction path already made that distinction, so the
+        // two entry points disagreed with each other -- and this one is
+        // the block path, reachable on peer input via a non-push-only
+        // P2SH signature script.
         rule_error(
-            RuleErrorKind::ScriptValidation,
-            format!("failed to create script engine: {e:?}"),
+            RuleErrorKind::ScriptMalformed,
+            format!(
+                "failed to parse input {}:{tx_in_idx} - {e:?}",
+                item.tx.tx_hash()
+            ),
         )
     })?;
     if let Some(sig_cache) = sig_cache {

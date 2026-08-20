@@ -109,10 +109,9 @@ fn a_non_utf8_config_file_is_still_read() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("dcroxide.conf");
     let mut f = std::fs::File::create(&path).expect("create config");
-    // A comment carrying one invalid byte, then a real setting that
-    // must take effect. `simnet` is observable in --version's output
-    // path without starting the node.
-    f.write_all(b"# caf\xe9\nnodnsseed=1\n")
+    // A comment carrying one invalid byte, then a real setting whose
+    // effect is observable on stderr.
+    f.write_all(b"# note \xff\nnodnsseed=1\n")
         .expect("write config");
     drop(f);
 

@@ -143,10 +143,13 @@ fn begin_discrete(mode: &mut MiningMode, n: u32) -> Result<bool, GenerateFailure
 
     // Zero blocks claims nothing and returns no hashes.  dcrd's `n == 0`
     // path also cancels an in-flight discrete call through
-    // `generateCancelFn`; the port has no cancellation handle for the
-    // running solve, so a concurrent `generate 0` returns without
-    // stopping it — a divergence recorded in PARITY.md rather than one
-    // the removed server mutex was hiding.
+    // `generateCancelFn` (`cpuminer.go:845-851`); this port has no
+    // cancellation handle for the running solve, so a concurrent
+    // `generate 0` returns without stopping it.
+    //
+    // Recorded under PARITY.md's known remaining gaps.  The comment here
+    // previously said it was recorded there when it was not, which is
+    // exactly the kind of claim the ledger exists to make checkable.
     if n == 0 {
         return Ok(false);
     }

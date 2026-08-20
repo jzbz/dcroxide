@@ -111,6 +111,18 @@ expensive step, dcroxide moves it before.
 
 Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
 
+- **`generate 0` does not cancel an in-flight discrete mining call.** dcrd
+  keeps a `generateCancelFn` while discrete mining is active and invokes it on
+  the `n == 0` path (`internal/mining/cpuminer/cpuminer.go:159-163`,
+  `:845-851`), so a concurrent `generate 0` stops the running solve. This port
+  has no cancellation handle for the solve, so `generate 0` returns without
+  stopping it. The RPC layer already carries dcrd's error arm for the
+  cancelled case (`server.rs`'s `is_cancel_discrete`, consumed at
+  `handlers.rs:3698`), and every daemon producer sets it false, so that arm is
+  unreachable outside the vectors — implementing the flag would retire it.
+  Testing-surface only: discrete mining is a `--generate` and regnet/simnet
+  facility.
+
 - **Panic policy: abort, deliberately unlike dcrd.** `sync.Mutex` does not
   poison and dcrd recovers per goroutine, so a panicking goroutine there
   costs one request. Rust's mutexes poison, so one thread's panic takes
