@@ -205,6 +205,29 @@ fn split_raw_array(data: &str) -> Vec<String> {
     elems
 }
 
+/// Whether a decoded JSON key names the given ASCII struct field, the
+/// way Go's `foldName` does.
+///
+/// Go folds with `unicode.SimpleFold`, and U+017F (LATIN SMALL LETTER
+/// LONG S) and U+212A (KELVIN SIGN) are the only runes whose fold cycle
+/// reaches ASCII -- they fold to `s` and `k`. Every field name here is
+/// ASCII, so mapping those two and comparing ASCII-insensitively is
+/// exactly Go's result, without carrying a fold table.
+fn fold_eq(key: &str, field: &str) -> bool {
+    if key.is_ascii() {
+        return key.eq_ignore_ascii_case(field);
+    }
+    let folded: String = key
+        .chars()
+        .map(|c| match c {
+            '\u{017f}' => 's',
+            '\u{212a}' => 'k',
+            other => other,
+        })
+        .collect();
+    folded.eq_ignore_ascii_case(field)
+}
+
 /// Split a JSON object into raw (key, value) text pairs.  The input
 /// must be a syntax-valid object.
 fn split_raw_object(data: &str) -> Vec<(String, String)> {
@@ -262,7 +285,14 @@ fn split_raw_object(data: &str) -> Vec<(String, String)> {
             }
             end += 1;
         }
-        let key = member[1..end].to_string();
+        // Decoded, not raw: Go unmarshals the key before matching it to a
+        // struct field, so `"\u006dethod"` names `method` there. Taking
+        // the escaped text verbatim silently ignored such a member -- and
+        // with it, the command the caller asked for.
+        let key = match gojson::decode(&dcroxide_dcrjson::GoType::String, &member[..=end]) {
+            Ok(dcroxide_dcrjson::GoValue::String(decoded)) => decoded,
+            _ => member[1..end].to_string(),
+        };
         let colon = member[end..].find(':').expect("valid object member") + end;
         pairs.push((key, member[colon + 1..].trim().to_string()));
     }
@@ -303,12 +333,12 @@ pub fn unmarshal_request(body: &str) -> Result<RawRequest, String> {
     };
     for (key, raw) in split_raw_object(trimmed) {
         // Go matches JSON keys to struct fields case-insensitively.
-        if key.eq_ignore_ascii_case("jsonrpc") || key.eq_ignore_ascii_case("method") {
+        if fold_eq(&key, "jsonrpc") || fold_eq(&key, "method") {
             let value = match gojson::decode(&dcroxide_dcrjson::GoType::String, &raw) {
                 Ok(dcroxide_dcrjson::GoValue::String(s)) => s,
                 Ok(_) => String::new(), // null leaves the field zeroed
                 Err(_) => {
-                    let field = if key.eq_ignore_ascii_case("jsonrpc") {
+                    let field = if fold_eq(&key, "jsonrpc") {
                         "jsonrpc"
                     } else {
                         "method"
@@ -320,12 +350,12 @@ pub fn unmarshal_request(body: &str) -> Result<RawRequest, String> {
                     ));
                 }
             };
-            if key.eq_ignore_ascii_case("jsonrpc") {
+            if fold_eq(&key, "jsonrpc") {
                 req.jsonrpc = value;
             } else {
                 req.method = value;
             }
-        } else if key.eq_ignore_ascii_case("params") {
+        } else if fold_eq(&key, "params") {
             match raw.as_bytes().first() {
                 Some(b'[') => req.params = split_raw_array(&raw),
                 Some(b'n') => req.params = Vec::new(),
@@ -337,7 +367,7 @@ pub fn unmarshal_request(body: &str) -> Result<RawRequest, String> {
                     ));
                 }
             }
-        } else if key.eq_ignore_ascii_case("id") {
+        } else if fold_eq(&key, "id") {
             // Go unmarshals into interface{}: numbers become float64,
             // strings and null map directly, and every other kind is
             // rejected later by the response id validity check.
