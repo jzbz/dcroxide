@@ -125,7 +125,7 @@ fn difficulty_vectors() {
 
     assert_eq!(merges, 40, "merge samples");
     assert_eq!(supplies, 36, "supply samples");
-    assert_eq!(scenarios, 35, "chain scenarios");
+    assert_eq!(scenarios, 38, "chain scenarios");
 }
 
 /// The stake difficulty functions return the minimum before any tickets

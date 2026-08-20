@@ -144,7 +144,11 @@ pub fn calc_next_blake256_diff(
 
     // Declare some useful variables.
     let raf_big = BigInt::from(params.retarget_adjustment_factor);
-    let next_diff_big_min = compact_to_big(prev_node.bits) / &raf_big;
+    // dcrd `difficulty.go:90`.  `check_proof_of_work` rejects bits
+    // carrying the sign bit, so this numerator cannot be negative and
+    // the two rules cannot differ here; routed through the shared helper
+    // anyway rather than leaving one of the three on a different rule.
+    let next_diff_big_min = go_big_div(&compact_to_big(prev_node.bits), &raf_big);
     let next_diff_big_max = compact_to_big(prev_node.bits) * &raf_big;
 
     let alpha = params.work_diff_alpha;
@@ -182,7 +186,9 @@ pub fn calc_next_blake256_diff(
             time_dif_big <<= 32u32; // Add padding
             let target_temp = BigInt::from(params.target_timespan_secs);
 
-            let mut window_adjusted = time_dif_big / target_temp;
+            // dcrd `difficulty.go:126`.  The window time difference is
+            // signed, so this is where the rules part.
+            let mut window_adjusted = go_big_div(&time_dif_big, &target_temp);
 
             // Weight it exponentially.  Be aware that this could at
             // some point overflow if alpha or the number of blocks
@@ -219,9 +225,11 @@ pub fn calc_next_blake256_diff(
         weighted_sum += change;
     }
 
-    // Divide by the sum of all weights.
+    // Divide by the sum of all weights (dcrd `difficulty.go:163`).  The
+    // weighted sum inherits the sign of the window differences above, so
+    // this parts too.
     let weights_big = BigInt::from(weights as i64);
-    let weighted_sum_div = weighted_sum / weights_big;
+    let weighted_sum_div = go_big_div(&weighted_sum, &weights_big);
 
     // Multiply by the old difficulty to get the new difficulty.
     let mut next_diff_big = weighted_sum_div * &old_diff_big;
@@ -1130,4 +1138,75 @@ pub fn estimate_next_stake_difficulty_v2(
         prev_pool_size_all,
         estimated_pool_size_all,
     ))
+}
+
+/// Go's `big.Int.Div`: Euclidean division, where the remainder is never
+/// negative (`math/big`'s `Div` documentation).
+///
+/// num-bigint's `/` truncates toward zero, which agrees with this for
+/// every non-negative numerator and differs by exactly one when the
+/// numerator is negative and the division is inexact.  dcrd's
+/// exponentially-weighted retarget divides a signed window time
+/// difference, so the two rules part on any window whose blocks span a
+/// net-negative time, and the exponential weight then amplifies that
+/// difference before it reaches the compact bits.
+///
+/// dcrd's choice is deliberate rather than incidental: ASERT divides
+/// with the truncating `Quo` (`blockchain/standalone/pow.go:343`), so
+/// both rules appear in the same codebase, each where it is meant.
+///
+/// The file's other divisions keep `/`: their numerators are provably
+/// non-negative.  `merge_difficulty` divides shifted positive
+/// difficulties, the stake algorithms clamp their pool-size skew to at
+/// least 1 before dividing, and the stake EMA sums those clamped terms.
+pub(crate) fn go_big_div(x: &BigInt, y: &BigInt) -> BigInt {
+    let q = x / y;
+    let r = x % y;
+    if r.sign() == Sign::Minus {
+        if y.sign() == Sign::Minus {
+            q + 1
+        } else {
+            q - 1
+        }
+    } else {
+        q
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(x: i64, y: i64) -> i64 {
+        let q = go_big_div(&BigInt::from(x), &BigInt::from(y));
+        i64::try_from(q).expect("fits")
+    }
+
+    /// Go's `Div` against hand-checked values, including the two places
+    /// it is not simply "floor": a negative divisor.
+    ///
+    /// Not a discriminator for the retarget change -- it exists so a
+    /// later sign slip in the shim is caught here rather than in a
+    /// chain vector.
+    #[test]
+    fn go_big_div_is_euclidean() {
+        // Exact division agrees with every rule.
+        assert_eq!(d(6, 3), 2);
+        assert_eq!(d(-6, 3), -2);
+        assert_eq!(d(6, -3), -2);
+        assert_eq!(d(-6, -3), 2);
+
+        // Inexact with a positive divisor: floor, one below truncation.
+        assert_eq!(d(7, 3), 2);
+        assert_eq!(d(-7, 3), -3, "truncation would give -2");
+
+        // Inexact with a negative divisor: the remainder must stay
+        // non-negative, so this rounds *up*, where floor rounds down.
+        assert_eq!(d(7, -3), -2, "floor would give -3");
+        assert_eq!(d(-7, -3), 3, "floor would give 2");
+
+        // The retarget's own shape: a padded negative window time over
+        // mainnet's target timespan.
+        assert_eq!(d(-1i64 << 32, 43200), -99421, "truncation gives -99420");
+    }
 }
