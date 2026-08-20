@@ -338,3 +338,83 @@ fn a_utxo_state_height_disagreeing_with_the_index_stops_the_node() {
     let db = Database::open(&opts).expect("reopen database");
     let _ = Chain::open(db, &params, Hash::ZERO, true, 0);
 }
+
+/// Blocks that never reach the best chain must not stay resident.
+///
+/// `prune_chain_memory` walks `parent` from the best-chain tip, so it
+/// only ever visits that tip's ancestors.  Everything else -- side-chain
+/// blocks, blocks a reorg disconnected, and blocks that cleared the
+/// positional checks and were then rejected by a contextual or connect
+/// check -- is never visited, and before the sweep stayed resident for
+/// the life of the process.  dcrd has nothing to prune here because it
+/// never accumulates them: bodies live in a `recentBlockCacheSize = 12`
+/// LRU (`chain.go:43-48`) and everything else is served from the block
+/// database.
+///
+/// The second half of the test is what proves the sweep is safe rather
+/// than merely effective: every dropped block must still answer, out of
+/// the database.
+#[test]
+fn pruning_bounds_the_bodies_that_never_reach_the_best_chain() {
+    let params = regnet_params();
+    let dir = TempDir::new().expect("tempdir");
+    let opts = Options::new(dir.path().join("chain"), params.net.0);
+    let db = Database::create(&opts).expect("create database");
+    let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("open chain");
+
+    let data = include_str!("data/fullblock_vectors.txt");
+    let mut now: i64 = 0;
+    // The battery marks blocks that do not end up on the best chain.
+    let mut off_chain: Vec<Hash> = Vec::new();
+
+    for line in data.lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        match f[0] {
+            "now" => now = f[1].parse().expect("now"),
+            "accept" => {
+                let (block, _) = MsgBlock::from_bytes(&unhex(f[4])).expect("block");
+                let hash = block.header.block_hash();
+                let (_, errs) = chain.process_block(&block, now, &params);
+                let is_orphan = errs.len() == 1 && errs[0].kind == RuleErrorKind::MissingParent;
+                assert!(errs.is_empty() || is_orphan, "accept {}: {errs:?}", f[1]);
+                if !is_orphan && f[2] == "false" {
+                    off_chain.push(hash);
+                }
+            }
+            // Blocks rejected after the positional checks are the
+            // largest resident population, and the one dcrd's own
+            // comment goes out of its way to keep on disk.
+            "reject" => {
+                if let Ok((block, _)) = MsgBlock::from_bytes(&unhex(f[3])) {
+                    let _ = chain.process_block(&block, now, &params);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        off_chain.len() > 10,
+        "the battery must fork off the best chain: {} off-chain",
+        off_chain.len()
+    );
+
+    chain.prune_chain_memory(2);
+
+    // The keep window is two blocks; a handful of side-chain blocks may
+    // sit inside it legitimately.  What must not happen is the whole
+    // off-chain population staying resident.
+    assert!(
+        chain.blocks.len() <= 8,
+        "bodies off the best chain stay resident: {} left",
+        chain.blocks.len()
+    );
+
+    // And every one of them still answers, from the database.
+    for hash in &off_chain {
+        assert!(
+            chain.block_by_hash(hash).is_some(),
+            "off-chain block {hash} must still be served from the database"
+        );
+    }
+}

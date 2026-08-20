@@ -4209,6 +4209,51 @@ impl Chain {
             self.stake_undo.remove(&height);
             self.stake_new_tickets.remove(&height);
         }
+
+        // The walk above follows `parent` from the best-chain tip, so it
+        // only ever visits ancestors of that tip.  Three populations are
+        // therefore never visited and stay resident for the life of the
+        // process: side-chain blocks, blocks disconnected by a reorg,
+        // and blocks that cleared the positional checks and were then
+        // rejected by a contextual or connect check.
+        //
+        // dcrd has no equivalent leak to prune, because it never
+        // accumulates bodies in the first place: `maybeAcceptBlockData`
+        // stores to the *database* only (`process.go:331-337`, whose
+        // comment says keeping doomed-but-proof-of-work-valid blocks on
+        // disk is deliberate), and the sole in-memory copy is a fixed
+        // `recentBlockCacheSize = 12` LRU (`chain.go:43-48`).  Its
+        // steady-state body footprint is 12 whatever the fork history.
+        // Its spend journal, filters and header commitments have no
+        // in-memory mirror at all.
+        //
+        // Dropping these costs a database read: every one was written by
+        // `maybe_accept_block_data`, and `block_data` already falls back
+        // to `db_fetch_stored_block`.  Only a chain that *has* a
+        // database may drop them -- without one the map is the only
+        // copy, and `prune_chain_memory` is `pub`, so the guard belongs
+        // here rather than only in `prune_if_needed`.
+        if self.db.is_some() {
+            let keep_from = self.store.node(prune_to).height;
+            let stale: Vec<[u8; 32]> = self
+                .blocks
+                .keys()
+                .copied()
+                .filter(|raw| match self.index.lookup_node(&Hash(*raw)) {
+                    Some(id) => {
+                        let height = self.store.node(id).height;
+                        height > 0 && height < keep_from
+                    }
+                    None => false,
+                })
+                .collect();
+            for raw in stale {
+                self.blocks.remove(&raw);
+                self.spend_journal.remove(&raw);
+                self.filters.remove(&raw);
+                self.header_commitments.remove(&raw);
+            }
+        }
     }
 
     /// The block with the given hash when its data is available (dcrd
