@@ -3,10 +3,10 @@
 //! package at master `452c1a6c` (the dcrd 2.2 campaign parity
 //! target; wire protocol 12).
 //!
-//! Currently implemented: variable-length integers, transactions ([`MsgTx`])
-//! with all three serialization types and their BLAKE-256 hashes, and the
-//! 180-byte [`BlockHeader`]. The remaining message types land with Phase 2 of
-//! the project plan.
+//! Implemented: variable-length integers, transactions ([`MsgTx`])
+//! with all three serialization types and their BLAKE-256 hashes, the
+//! 180-byte [`BlockHeader`], and all 41 protocol-12 message types
+//! behind the [`Message`] enum, with the framing that carries them.
 //!
 //! # Decoding model
 //!

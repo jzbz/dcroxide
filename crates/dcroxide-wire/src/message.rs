@@ -374,7 +374,7 @@ pub struct MessageHeader {
     /// The declared payload length, already checked against both the
     /// global cap and the per-type maximum for `command`.
     pub payload_len: u32,
-    /// The first four bytes of the double-SHA256 of the payload.
+    /// The first four bytes of the BLAKE-256 of the payload.
     pub checksum: [u8; 4],
 }
 
