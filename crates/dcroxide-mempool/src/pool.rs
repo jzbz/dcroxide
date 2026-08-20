@@ -319,6 +319,16 @@ pub trait MixpoolProbe: Send {
     fn non_mix_spends_pair_request(&self, tx: &MsgTx) -> bool;
 }
 
+/// The optional tspend-received hook (dcrd mempool `Config`'s
+/// `OnTSpendReceived` callback, wired to the RPC server's
+/// `NotifyTSpend`): the pool forwards every accepted treasury spend so
+/// subscribed websocket clients get their `tspendnew` notification.
+pub trait TSpendReceiver: Send {
+    /// A treasury spend was accepted into the pool (dcrd's
+    /// `OnTSpendReceived` firing `rpcServer.NotifyTSpend`).
+    fn tspend_received(&mut self, tspend: &MsgTx);
+}
+
 /// The optional vote-received hook (dcrd mempool `Config`'s
 /// `OnVoteReceived` callback, wired to the background template
 /// generator's `VoteReceived`): the pool forwards every accepted vote
@@ -352,6 +362,7 @@ pub struct TxPool<C: PoolChain> {
     next_expire_scan_unix: i64,
     exists_addr_index: Option<Box<dyn UnconfirmedAddrIndexer>>,
     vote_receiver: Option<Box<dyn VoteReceiver>>,
+    tspend_receiver: Option<Box<dyn TSpendReceiver>>,
     fee_estimator: Option<Box<dyn FeeEstimatorSink>>,
     mixpool_probe: Option<Box<dyn MixpoolProbe>>,
 }
@@ -381,6 +392,7 @@ impl<C: PoolChain> TxPool<C> {
             next_expire_scan_unix,
             exists_addr_index: None,
             vote_receiver: None,
+            tspend_receiver: None,
             fee_estimator: None,
             mixpool_probe: None,
         }
@@ -398,6 +410,13 @@ impl<C: PoolChain> TxPool<C> {
     /// `OnVoteReceived`).
     pub fn set_vote_receiver(&mut self, receiver: Box<dyn VoteReceiver>) {
         self.vote_receiver = Some(receiver);
+    }
+
+    /// Install the optional tspend-received hook the pool notifies of
+    /// every accepted treasury spend (dcrd's mempool config carrying
+    /// `OnTSpendReceived`).
+    pub fn set_tspend_receiver(&mut self, receiver: Box<dyn TSpendReceiver>) {
+        self.tspend_receiver = Some(receiver);
     }
 
     /// Install the optional fee estimator the pool notifies as
@@ -1590,6 +1609,13 @@ impl<C: PoolChain> TxPool<C> {
         // Only allow treasury spends that have a valid expiry.
         if is_treasury_enabled && is_tspend {
             self.check_tspend_policy(&tx, &tx_hash, next_block_height)?;
+            // dcrd notifies here, inside the policy block and before the
+            // transaction is added (`mempool.go:1737-1740`), so a tspend
+            // that clears policy is announced even if a later step keeps
+            // it out of the pool.
+            if let Some(receiver) = &mut self.tspend_receiver {
+                receiver.tspend_received(&tx);
+            }
         }
 
         let tx_desc = Arc::new(TxDesc {
@@ -1664,7 +1690,7 @@ impl<C: PoolChain> TxPool<C> {
         let vote_start = match dcroxide_standalone::calc_tspend_window(tx.expiry, tvi, mul) {
             Ok((vote_start, _)) => vote_start,
             Err(err) => {
-                let str = format!("Invalid tspend expiry {}: {err:?} ", tx.expiry);
+                let str = format!("Invalid tspend expiry {}: {err} ", tx.expiry);
                 return Err(tx_rule_error(ErrorKind::TSpendInvalidExpiry, str).into());
             }
         };
@@ -1696,7 +1722,7 @@ impl<C: PoolChain> TxPool<C> {
         let (signature, pub_key) = match dcroxide_stake::check_tspend(tx) {
             Ok(parts) => parts,
             Err(err) => {
-                let str = format!("Mempool invalid TSpend: {err:?}");
+                let str = format!("Mempool invalid TSpend: {err}");
                 return Err(tx_rule_error(ErrorKind::Invalid, str).into());
             }
         };

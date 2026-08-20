@@ -27,11 +27,28 @@ use dcroxide_wire::BlockHeader;
 
 /// Run one harness section's rows against a fresh pool, returning the
 /// per-row-kind counts.
+/// Records every treasury spend the pool announces (dcrd's mempool
+/// `OnTSpendReceived`).
+#[derive(Clone, Default)]
+struct TSpendRecorder(std::sync::Arc<std::sync::Mutex<Vec<dcroxide_chainhash::Hash>>>);
+
+impl dcroxide_mempool::TSpendReceiver for TSpendRecorder {
+    fn tspend_received(&mut self, tspend: &dcroxide_wire::MsgTx) {
+        self.0.lock().expect("recorder").push(tspend.tx_hash());
+    }
+}
+
 fn run_section(params: &Params, lines: &[&str], counts: &mut [usize; 6]) {
     let init: Vec<&str> = lines[0].split(' ').collect();
     let chain = chain_from_init(&init);
     let policy = harness_policy(params.coinbase_maturity);
     let mut pool = TxPool::new(chain, policy, params);
+    // Every treasury spend the pool accepts must also be announced:
+    // dcrd fires `OnTSpendReceived` inside the policy block that admits
+    // it (`mempool.go:1737-1740`), and that is the only path to a
+    // websocket client's `tspendnew`.
+    let announced = TSpendRecorder::default();
+    pool.set_tspend_receiver(Box::new(announced.clone()));
 
     for line in &lines[1..] {
         let f: Vec<&str> = line.split(' ').collect();
@@ -130,6 +147,20 @@ fn run_section(params: &Params, lines: &[&str], counts: &mut [usize; 6]) {
         }
     }
     counts[5] += 1;
+
+    // The pool tracks a treasury spend the moment it is added; the
+    // announcement fires a few checks earlier, so every tracked hash
+    // must appear among the announced ones.  A superset check rather
+    // than equality, because a rejection announces nothing -- and not
+    // vacuous, since the treasury section tracks seven.
+    let announced = announced.0.lock().expect("recorder");
+    for tracked in pool.tspend_hashes() {
+        assert!(
+            announced.contains(&tracked),
+            "tspend {tracked} entered the pool without being announced, so a client \
+             subscribed to tspendnew never hears about it",
+        );
+    }
 }
 
 /// The vote-received hook fires for every accepted vote (dcrd

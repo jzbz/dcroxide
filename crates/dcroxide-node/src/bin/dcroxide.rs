@@ -539,6 +539,19 @@ fn run(cfg: Config) -> ExitCode {
             )));
     }
 
+    // Forward accepted treasury spends from the pool to the websocket
+    // notification manager (dcrd's mempool `OnTSpendReceived` firing
+    // `s.rpcServer.NotifyTSpend`, guarded there by a non-nil rpc server
+    // exactly as this is guarded by the manager's presence).
+    if let Some(ntfn) = &ntfn {
+        tx_pool
+            .lock()
+            .expect("tx pool mutex poisoned")
+            .set_tspend_receiver(Box::new(dcroxide_node::websocket::NodeTSpendReceiver::new(
+                ntfn.clone(),
+            )));
+    }
+
     // The chain's block and reorganization events feed the background
     // template generator (dcrd's chain notifications driving `s.bg`).
     if let Some(generator) = &generator {

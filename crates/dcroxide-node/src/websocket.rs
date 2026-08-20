@@ -942,6 +942,26 @@ fn write_bad_request<S: Write>(stream: &mut S) -> std::io::Result<()> {
     stream.flush()
 }
 
+/// Forwards accepted treasury spends from the transaction pool to the
+/// websocket notification manager (dcrd's mempool `OnTSpendReceived`
+/// firing `s.rpcServer.NotifyTSpend`, `server.go:4097-4101`).
+pub struct NodeTSpendReceiver {
+    ntfn: NodeNtfnMgr,
+}
+
+impl NodeTSpendReceiver {
+    /// A receiver feeding the given notification manager.
+    pub fn new(ntfn: NodeNtfnMgr) -> NodeTSpendReceiver {
+        NodeTSpendReceiver { ntfn }
+    }
+}
+
+impl dcroxide_mempool::TSpendReceiver for NodeTSpendReceiver {
+    fn tspend_received(&mut self, tspend: &MsgTx) {
+        self.ntfn.notify_tspend(tspend.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
