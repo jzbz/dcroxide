@@ -203,6 +203,12 @@ impl SyncMixPool for NodeSyncMixPool {
         // A message that cannot be hashed is rejected downstream; a zero
         // hash is never a real message id, so the rejected-message
         // bookkeeping keyed on it is harmless.
+        //
+        // Unreachable from the wire: the remaining fallible checks are
+        // ones the decoder also enforces, so anything that arrived over
+        // the network has passed them.  The one shape that decodes but
+        // does not re-encode, an empty `mixdcnet`, hashes in dcrd's
+        // non-validating mode now (RVW-002) rather than landing here.
         msg.mix_hash().unwrap_or(Hash([0u8; 32]))
     }
 

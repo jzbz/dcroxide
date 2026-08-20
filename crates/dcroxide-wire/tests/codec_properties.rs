@@ -111,3 +111,83 @@ fn qk_0010_empty_mixdcnet_decodes_but_does_not_reencode() {
         "expected dcrd's ErrInvalidMsg identity, got {err:?}"
     );
 }
+
+/// An empty `mixdcnet` still hashes, because dcrd's hasher path skips
+/// the checks the wire path enforces (RVW-002).
+///
+/// `writeMessageNoSignature` gates its structural checks on the
+/// destination not being a `hash.Hash` (`msgmixdcnet.go:130-145`), and
+/// `WriteHash` discards the error it could not produce anyway
+/// (`:113-117`). So the message QK-0010 describes — decodable, not
+/// re-encodable — reaches dcrd's `AcceptMessage` carrying a real
+/// identity hash, gets its signature verified, and is pooled or
+/// orphaned like any other.
+///
+/// Hashing it through the validating encoder instead made the hash
+/// fail, and the pool dropped it at intake as an untyped error. That is
+/// not merely a different code path: a bad signature on this message is
+/// bannable at every service level, and an intake drop is not, so a peer
+/// could send unlimited badly-signed empty DC-nets for free.
+///
+/// The re-encode assertion is the guard on the other side: the fix must
+/// not become "delete the mcount check", which would relay a message
+/// dcrd drops.
+#[test]
+fn an_empty_mixdcnet_hashes_even_though_it_cannot_be_re_encoded() {
+    use dcroxide_wire::{CurrencyNet, PROTOCOL_VERSION, write_message};
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&[0u8; 64]);
+    payload.extend_from_slice(&[0u8; 33]);
+    payload.extend_from_slice(&[0u8; 32]);
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.push(0); // mix vector count
+    payload.push(0); // seen slot reserves count
+
+    let net = CurrencyNet::MAIN_NET;
+    let checksum = dcroxide_chainhash::hash_b(&payload);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&net.0.to_le_bytes());
+    let mut command = [0u8; 12];
+    command[.."mixdcnet".len()].copy_from_slice(b"mixdcnet");
+    frame.extend_from_slice(&command);
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&checksum[..4]);
+    frame.extend_from_slice(&payload);
+
+    let (msg, _) = dcroxide_wire::read_message(&frame, PROTOCOL_VERSION, net).expect("decodes");
+    let dcnet = match &msg {
+        dcroxide_wire::Message::MixDCNet(m) => m,
+        other => panic!("expected a mixdcnet message, got {other:?}"),
+    };
+    assert!(
+        dcnet.dc_net.is_empty(),
+        "the fixture must be the empty case"
+    );
+
+    // dcrd hashes exactly the bytes it would have written, which for
+    // this message are the payload it was decoded from.
+    let hash = dcnet
+        .mix_hash()
+        .expect("the hasher path has no checks to fail");
+    assert_eq!(
+        hash.0,
+        dcroxide_crypto::blake256::sum256(&payload),
+        "the identity hash must be taken over the message's own bytes",
+    );
+
+    // And the signed-data preimage, which shares the same mode.
+    let signed = dcnet
+        .signed_data()
+        .expect("the signed-data path has no checks to fail either");
+    assert!(
+        signed.ends_with(&payload[64..]),
+        "the preimage must carry the message bytes after the signature",
+    );
+
+    // The wire path still refuses it.
+    assert!(
+        write_message(&msg, PROTOCOL_VERSION, net).is_err(),
+        "relaying it would send a message dcrd drops",
+    );
+}

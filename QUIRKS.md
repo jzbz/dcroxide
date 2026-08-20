@@ -250,6 +250,18 @@ Entry format:
   in `crates/dcroxide-wire/tests/codec_properties.rs`, which asserts
   both halves — the frame decodes to an empty DC-net, and encoding the
   result returns dcrd's `ErrInvalidMsg` identity.
+- **Consequence, and the reason it is not only a codec curiosity:**
+  dcrd gates those checks on the destination not being a hasher
+  (`msgmixdcnet.go:130-145`), and `WriteHash` discards the error it then
+  cannot produce (`:113-117`), so dcrd hashes and signs this message and
+  pools it. Computing the identity hash through the validating encoder
+  instead made the hash fail, and the pool dropped the message at intake
+  as an untyped error -- where a bad signature on it is bannable at every
+  service level. The port now mirrors dcrd's hashing mode for
+  `mixdcnet`; see `an_empty_mixdcnet_hashes_even_though_it_cannot_be_re_encoded`.
+  A peer that then requests the pooled message over getdata is
+  disconnected on the serve write, because the relay path still refuses
+  to encode it -- which is what dcrd does too.
 - **How found:** the `wire_frame_structured` fuzz target, within
   seconds of first being run. The older `wire_frame_decode` target
   asserted that every decoded message re-encodes, which is false for

@@ -128,6 +128,15 @@ fn read_seen_hashes(r: &mut Cursor<'_>) -> Result<Vec<Hash>, WireError> {
     Ok(seen)
 }
 
+/// The seen-hash list without its count check, for the hashing mode
+/// (dcrd's `!hashing && srcount > MaxMixPeers`).
+fn write_seen_hashes_unchecked(w: &mut Vec<u8>, seen: &[Hash]) {
+    write_var_int(w, seen.len() as u64);
+    for hash in seen {
+        w.extend_from_slice(hash.as_bytes());
+    }
+}
+
 fn write_seen_hashes(w: &mut Vec<u8>, seen: &[Hash]) -> Result<(), WireError> {
     if seen.len() as u64 > MAX_MIX_PEERS {
         return Err(WireError::TooManyPrevMixMsgs {
@@ -703,11 +712,32 @@ impl MsgMixDCNet {
     }
 
     pub(crate) fn encode(&self, w: &mut Vec<u8>, pver: u32) -> Result<(), WireError> {
+        self.write_no_signature(w, pver, false)
+    }
+
+    /// dcrd `writeMessageNoSignature`, whose structural checks are
+    /// skipped when the destination is a hasher rather than a wire
+    /// buffer (`msgmixdcnet.go:130-145`, each guarded by `!hashing`).
+    ///
+    /// That mode is not a convenience: a `mixdcnet` with a zero outer
+    /// dimension decodes but does not re-encode (QK-0010), and dcrd
+    /// still hashes and signs it, so it reaches `AcceptMessage` with a
+    /// real identity hash, gets its signature verified, and is pooled or
+    /// orphaned. Hashing it through the validating encoder instead made
+    /// the hash fail, which dropped the message at intake as an untyped
+    /// error -- unbannable, where a bad signature on it is bannable at
+    /// any service level.
+    pub(crate) fn write_no_signature(
+        &self,
+        w: &mut Vec<u8>,
+        pver: u32,
+        hashing: bool,
+    ) -> Result<(), WireError> {
         if pver < MIX_VERSION {
             return Err(WireError::MsgInvalidForPVer);
         }
         let mcount = self.dc_net.len() as u64;
-        if mcount == 0 || mcount > MAX_MIX_MCOUNT {
+        if !hashing && (mcount == 0 || mcount > MAX_MIX_MCOUNT) {
             return Err(WireError::InvalidMsg);
         }
         w.extend_from_slice(&self.signature);
@@ -715,6 +745,10 @@ impl MsgMixDCNet {
         w.extend_from_slice(&self.session_id);
         w.extend_from_slice(&self.run.to_le_bytes());
         write_mix_vects(w, &self.dc_net);
+        if hashing {
+            write_seen_hashes_unchecked(w, &self.seen_slot_reserves);
+            return Ok(());
+        }
         write_seen_hashes(w, &self.seen_slot_reserves)
     }
 
@@ -893,6 +927,19 @@ macro_rules! mix_message_hashes {
         impl $msg {
             /// The mixing message identity hash (dcrd
             /// `WriteHash`/`Hash`).
+            ///
+            /// dcrd's is total: `WriteHash` discards
+            /// `writeMessageNoSignature`'s error, so an invalid message
+            /// is hashed over whatever prefix was written before the
+            /// check fired.  This one surfaces the error instead.
+            ///
+            /// The difference is unreachable from the wire for these
+            /// types: every check that can fire here is one dcrd also
+            /// enforces at decode, so a message that arrived over the
+            /// network has already passed it.  `MsgMixDCNet` is the
+            /// exception -- it has a check dcrd skips while hashing and
+            /// a shape the decoder accepts -- and carries its own pair
+            /// below.
             pub fn mix_hash(&self) -> Result<Hash, WireError> {
                 let mut buf = Vec::new();
                 self.encode(&mut buf, MIX_VERSION)?;
@@ -920,6 +967,32 @@ mix_message_hashes!(MsgMixKeyExchange, "mixkeyxchg");
 mix_message_hashes!(MsgMixCiphertexts, "mixcphrtxt");
 mix_message_hashes!(MsgMixSlotReserve, "mixslotres");
 mix_message_hashes!(MsgMixFactoredPoly, "mixfactpoly");
-mix_message_hashes!(MsgMixDCNet, "mixdcnet");
 mix_message_hashes!(MsgMixConfirm, "mixconfirm");
 mix_message_hashes!(MsgMixSecrets, "mixsecrets");
+
+impl MsgMixDCNet {
+    /// The mixing message identity hash (dcrd `WriteHash`/`Hash`).
+    ///
+    /// Total, because dcrd's is: `WriteHash` discards
+    /// `writeMessageNoSignature`'s error entirely
+    /// (`msgmixdcnet.go:113-117`), and in hashing mode it has none to
+    /// give.  The `Result` stays for the shape the other seven share.
+    pub fn mix_hash(&self) -> Result<Hash, WireError> {
+        let mut buf = Vec::new();
+        self.write_no_signature(&mut buf, MIX_VERSION, true)?;
+        Ok(Hash(dcroxide_crypto::blake256::sum256(&buf)))
+    }
+
+    /// The preimage of the data committed to by the message signature
+    /// (dcrd `WriteSignedData`), in the same hashing mode.
+    pub fn signed_data(&self) -> Result<Vec<u8>, WireError> {
+        let mut msg_buf = Vec::new();
+        self.write_no_signature(&mut msg_buf, MIX_VERSION, true)?;
+        let cmd = "mixdcnet-sig";
+        let mut buf = Vec::with_capacity(1 + cmd.len() + msg_buf.len() - 64);
+        write_var_int(&mut buf, cmd.len() as u64);
+        buf.extend_from_slice(cmd.as_bytes());
+        buf.extend_from_slice(&msg_buf[64..]);
+        Ok(buf)
+    }
+}
