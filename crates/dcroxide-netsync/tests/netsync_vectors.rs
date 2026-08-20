@@ -1287,3 +1287,94 @@ fn block_path_log_lines() {
     );
     assert!(actions.contains(&Action::Disconnect { peer: 8 }));
 }
+
+/// `request_from_peer` honours the pending-request caps (RVW-063).
+///
+/// dcrd breaks out of both loops once the map is full
+/// (`manager.go:2107` for blocks, `:2136` for transactions). The port's
+/// on-headers path already did; this entry point did not, so a peer
+/// could grow the maps past the bound that exists to hold them.
+#[test]
+fn request_from_peer_stops_at_the_pending_request_caps() {
+    let params = regnet_params();
+    let chain = ChainAdapter {
+        chain: Chain::new(&params, Hash::ZERO, false),
+        params: params.clone(),
+        now: 0,
+    };
+    let mut m = SyncManager::new(config(&params, chain));
+    m.on_peer_connected(Peer::new(
+        3,
+        "10.0.0.3:9108".to_string(),
+        false,
+        ServiceFlag(1),
+        PROTOCOL_VERSION,
+        50,
+    ));
+
+    // More distinct hashes than the cap allows.
+    let over = dcroxide_netsync::manager::MAX_REQUESTED_BLOCKS + 500;
+    let blocks: Vec<Hash> = (0..over)
+        .map(|i| {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            Hash(h)
+        })
+        .collect();
+
+    m.request_from_peer(3, &blocks, &[], &[]);
+    assert!(
+        m.requested_block_count() <= dcroxide_netsync::manager::MAX_REQUESTED_BLOCKS,
+        "requested {} blocks against a cap of {}",
+        m.requested_block_count(),
+        dcroxide_netsync::manager::MAX_REQUESTED_BLOCKS,
+    );
+}
+
+/// A peer is known to hold what it sent us, not only what it announced
+/// (RVW-064).
+///
+/// dcrd marks at receipt in `OnTx`, `OnBlock` and `OnMixMsg`
+/// (`server.go:1338`, `:1363`, `:1764`). The disconnect sweep
+/// re-requests a departing peer's outstanding data from whoever else is
+/// known to hold it, and it reads this cache -- so marking only on
+/// announcement made its source set a strict subset of dcrd's.
+#[test]
+fn a_peer_is_known_to_hold_the_transaction_it_sent() {
+    let params = regnet_params();
+    let chain = ChainAdapter {
+        chain: Chain::new(&params, Hash::ZERO, false),
+        params: params.clone(),
+        now: 0,
+    };
+    let tx = dcroxide_wire::MsgTx::default();
+    let mut cfg = config(&params, chain);
+    // The scripted pool panics on anything it was not told about; this
+    // is the arm that simply accepts.
+    cfg.tx_mem_pool.orphan_hash = tx.tx_hash();
+    let mut m = SyncManager::new(cfg);
+    m.on_peer_connected(Peer::new(
+        4,
+        "10.0.0.4:9108".to_string(),
+        false,
+        ServiceFlag(1),
+        PROTOCOL_VERSION,
+        50,
+    ));
+
+    let inv = InvVect {
+        inv_type: InvType::TX,
+        hash: tx.tx_hash(),
+    };
+    assert!(
+        !m.peer_holds(4, &inv),
+        "nothing announced it yet, so this must start false",
+    );
+
+    m.on_tx(4, &tx);
+    assert!(
+        m.peer_holds(4, &inv),
+        "a peer that sent us a transaction is known to hold it; the disconnect sweep \
+         reads this to decide who to re-request from",
+    );
+}

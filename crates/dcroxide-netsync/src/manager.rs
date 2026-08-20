@@ -624,6 +624,20 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         self.peers.get(&id)
     }
 
+    /// How many block requests are outstanding, for the bound at
+    /// [`MAX_REQUESTED_BLOCKS`].
+    pub fn requested_block_count(&self) -> usize {
+        self.requested_blocks.len()
+    }
+
+    /// Whether the peer is known to hold the inventory, which is what
+    /// the disconnect sweep consults when re-requesting.
+    pub fn peer_holds(&mut self, id: i32, inv: &InvVect) -> bool {
+        self.peers
+            .get_mut(&id)
+            .is_some_and(|peer| peer.is_known_inventory(inv))
+    }
+
     /// The registered peer with the given id, mutably (the
     /// known-inventory cache updates recency on lookup).
     pub fn peer_mut(&mut self, id: i32) -> Option<&mut Peer> {
@@ -1096,6 +1110,22 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         actions
     }
 
+    /// Record that a peer holds the inventory it just sent us (dcrd's
+    /// `sp.AddKnownInventory` in the `OnTx`, `OnBlock` and `OnMixMsg`
+    /// handlers, `server.go:1338`, `:1363`, `:1764`).
+    ///
+    /// The disconnect sweep re-requests a departing peer's outstanding
+    /// data from whoever else is known to hold it, and it reads this
+    /// cache.  Marking only on announcement made the source set a
+    /// strict subset of dcrd's, so a leg the peer sent unannounced --
+    /// which is every leg it sent because we asked -- could be dropped
+    /// instead of re-requested.
+    fn mark_peer_holds(&mut self, peer_id: i32, inv_type: InvType, hash: Hash) {
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.add_known_inventory(InvVect { inv_type, hash });
+        }
+    }
+
     /// Process a transaction received from a remote peer, returning
     /// the hashes of the transactions accepted to the mempool (dcrd
     /// `OnTx`).
@@ -1107,6 +1137,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // There is deliberately no check to disconnect peers for
         // sending unsolicited transactions (legacy interoperability).
         let tx_hash = tx.tx_hash();
+        self.mark_peer_holds(peer_id, InvType::TX, tx_hash);
 
         // Ignore transactions that have already been rejected.  The
         // transaction was unsolicited if it was already previously
@@ -1154,6 +1185,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // message was unsolicited if it was already previously
         // rejected.
         let mix_hash = self.cfg.mix_pool.mix_hash(msg);
+        self.mark_peer_holds(peer_id, InvType::MIX, mix_hash);
         if self.rejected_mix_msgs.contains(&mix_hash.0) {
             return Ok(Vec::new());
         }
@@ -1280,6 +1312,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // The remote peer is misbehaving when the block was not
         // requested.
         let block_hash = block.header.block_hash();
+        self.mark_peer_holds(peer_id, InvType::BLOCK, block_hash);
         let requested = self.requested_blocks.get(&block_hash) == Some(&peer_id);
         if !requested {
             let peer_display = self
@@ -2153,6 +2186,14 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // Request as many needed blocks as possible at once.
         let mut inv_list = Vec::new();
         for block_hash in blocks {
+            // The pending-request map is bounded (dcrd `manager.go:2107`).
+            // The on-headers path already honours this; this one did not,
+            // so a peer could grow the map past the cap that exists to
+            // bound it.
+            if self.requested_blocks.len() + 1 > MAX_REQUESTED_BLOCKS {
+                break;
+            }
+
             // Skip the block when it has already been requested or is
             // already known.
             if self.requested_blocks.contains_key(block_hash)
@@ -2181,6 +2222,11 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // as possible at once.
         for hashes in [vote_hashes, tspend_hashes] {
             for tx_hash in hashes {
+                // Bounded the same way (dcrd `manager.go:2136`).
+                if self.requested_txns.len() + 1 > MAX_REQUESTED_TXNS {
+                    break;
+                }
+
                 // Skip the transaction when it has already been
                 // requested or is otherwise not needed.
                 if self.requested_txns.contains_key(tx_hash) || !self.need_tx(tx_hash) {
