@@ -696,7 +696,11 @@ impl Chain {
             }
 
             // Unmark blocks that failed validation before newly
-            // detected consensus rules took effect.
+            // detected consensus rules took effect.  This is the only
+            // place the load loop changes a row, so it is the only place
+            // that has to mark one: everything else here reconstructs
+            // exactly what came off disk.
+            let mut status_changed = false;
             if new_rules_start_time != 0 {
                 let status = self.store.node(node).status;
                 if status.known_validate_failed() || status.known_invalid_ancestor() {
@@ -708,6 +712,7 @@ impl Chain {
                                 & !(crate::blockindex::BlockStatus::VALIDATE_FAILED.0
                                     | crate::blockindex::BlockStatus::INVALID_ANCESTOR.0),
                         );
+                        status_changed = true;
                     }
                 }
             }
@@ -715,6 +720,9 @@ impl Chain {
             let parent_can_validate = self.index.can_validate(&self.store, parent);
             self.store.node_mut(node).is_fully_linked = parent_can_validate;
             self.index.add_node_from_db(&self.store, node);
+            if status_changed {
+                self.index.mark_modified(node);
+            }
         }
         if cur_version != 0 && cur_version != prev_version {
             // dcrd updates the stored version here; deferred to the

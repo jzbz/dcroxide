@@ -501,10 +501,20 @@ impl BlockIndex {
             .is_some_and(|id| store.node(id).status.have_data())
     }
 
-    /// Add the provided node to the index (dcrd `addNode`/`AddNode`).
-    /// Duplicate entries are not checked.
+    /// Add the provided node to the index and mark it for the next
+    /// flush (dcrd `AddNode`).  Duplicate entries are not checked.
     pub fn add_node(&mut self, store: &NodeStore, node: NodeId) {
-        self.modified.insert(node);
+        self.add_node_unmarked(store, node);
+        self.mark_modified(node);
+    }
+
+    /// Add the provided node to the index without marking it (dcrd
+    /// `addNode`, the inner form its exported sibling wraps).
+    ///
+    /// Loading the index from storage goes through here: those rows came
+    /// off disk unchanged, so marking them would make the first flush
+    /// after every restart rewrite the entire index byte for byte.
+    pub fn add_node_unmarked(&mut self, store: &NodeStore, node: NodeId) {
         let (hash, height, parent, invalid) = {
             let n = store.node(node);
             (n.hash, n.height, n.parent, n.status.known_invalid())
@@ -539,7 +549,7 @@ impl BlockIndex {
     /// dependencies and best invalid block as needed (dcrd
     /// `addNodeFromDB`).
     pub fn add_node_from_db(&mut self, store: &NodeStore, node: NodeId) {
-        self.add_node(store, node);
+        self.add_node_unmarked(store, node);
 
         let n = store.node(node);
         let (fully_linked, have_data, parent, invalid) = (
@@ -752,6 +762,11 @@ impl BlockIndex {
             out.extend(entry.other_tips.iter().copied());
         }
         out
+    }
+
+    /// Mark a node for the next flush (dcrd's `bi.modified[node] = struct{}{}`).
+    pub fn mark_modified(&mut self, node: NodeId) {
+        self.modified.insert(node);
     }
 
     /// Drain the set of nodes with unflushed changes (used by the
