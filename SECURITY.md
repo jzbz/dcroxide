@@ -76,6 +76,14 @@ behind it, and the divergences from dcrd it introduced are itemized in
 follows is the residue: the standing gaps that matter most for anyone
 evaluating this code.
 
+- **A data directory written before the treasury-commit fix may hold a
+  hole.** Until the treasury rows moved into the block connect path's
+  single transaction, a crash could leave a durable best state whose
+  treasury balance row was not, and `calculate_treasury_balance` reads a
+  missing row as zero for that block and every descendant. New writes
+  are atomic, but existing directories are not scanned or repaired on
+  startup. Re-sync rather than carry one forward.
+
 - **A panic aborts the process** (`panic = "abort"` on the release
   profile). Rust mutexes poison and Go's do not, so dcrd recovers per
   goroutine where this port cannot: a panic on one thread poisons every

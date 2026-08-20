@@ -2406,6 +2406,18 @@ impl Chain {
         self.filters.insert(node_hash.0, filter.clone());
         self.header_commitments
             .insert(node_hash.0, hdr_commitment_leaves.clone());
+        // The treasury account and spend rows when the agenda is active
+        // (dcrd `connectBlock` taking the flag once at `chain.go:616`).
+        // Computed before the transaction opens and published after it
+        // commits, so the rows travel with the best state they belong
+        // to: dcrd writes both inside its single `db.Update`
+        // (`chain.go:671-719`), and a durable best state whose treasury
+        // row is missing reads back as a zero balance that every
+        // descendant then inherits.
+        let treasury_records = check_tx_flags
+            .is_treasury_enabled()
+            .then(|| self.treasury_records_for_block(node, block, params));
+
         if self.db.is_some() {
             self.flush_block_index(params).map_err(persist_rule_error)?;
             let work_sum = self.store.node(node).work_sum;
@@ -2425,6 +2437,9 @@ impl Chain {
                     .map_err(chain_db_to_db_error)?;
                 dcroxide_stake::stakedb::write_connected_best_node(tx, &stake_node, &node_hash)
                     .map_err(|e| db_driver_error(format!("stake db: {e:?}")))?;
+                if let Some((block_hash, ts, tspend_updates)) = &treasury_records {
+                    Self::db_write_treasury_records(tx, block_hash, ts, tspend_updates)?;
+                }
                 crate::chaindb::db_put_gcs_filter(tx, &node_hash, &filter)
                     .map_err(chain_db_to_db_error)?;
                 crate::chaindb::db_put_header_commitments(tx, &node_hash, &hdr_commitment_leaves)
@@ -2434,18 +2449,10 @@ impl Chain {
             .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
         }
 
-        // The treasury account and spend records when the agenda is
-        // active.
-        let is_treasury_enabled = {
-            let parent_view = NodeBranchView {
-                store: &self.store,
-                tip: parent_id,
-            };
-            crate::agendas::is_treasury_agenda_active(&parent_view, prev_height, params)
-                .map_err(|_| unknown_deployment_error())?
-        };
-        if is_treasury_enabled {
-            self.put_treasury_records(node, block, params)?;
+        // The rows are durable now (or there is no database), so the
+        // mirrors consensus reads can catch up.
+        if let Some((block_hash, ts, tspend_updates)) = treasury_records {
+            self.apply_treasury_records(block_hash, ts, &tspend_updates);
         }
 
         // Commit all entries in the view to the UTXO set, then
@@ -5100,21 +5107,36 @@ impl Chain {
         ts.balance + net_value
     }
 
-    /// Record the treasury state and spend rows for a connected block
-    /// (dcrd's method forms of `dbPutTreasuryBalance` and
-    /// `dbPutTSpend`), writing through to the database when
-    /// persistent.
-    pub fn put_treasury_records(
-        &mut self,
+    /// The treasury state and spend rows a connected block produces
+    /// (dcrd's method forms of `dbPutTreasuryBalance` and `dbPutTSpend`,
+    /// up to the point where they write).
+    ///
+    /// Pure, so the rows can be written inside `connect_block`'s single
+    /// transaction and the in-memory mirrors published only once that
+    /// transaction commits.  Reading the existing spend list rather than
+    /// inserting into it is what keeps the mirror from moving ahead of
+    /// the write.
+    ///
+    /// One divergence follows from that read: a block carrying the same
+    /// tspend hash twice yields `[H]` where the mutating form yielded
+    /// `[H, H]`.  Consensus cannot produce such a block --
+    /// `check_block_sanity` rejects duplicate transactions -- but
+    /// [`Self::put_treasury_records`] is public and harnesses drive it
+    /// directly.
+    fn treasury_records_for_block(
+        &self,
         node: NodeId,
         block: &MsgBlock,
         params: &Params,
-    ) -> Result<(), RuleError> {
+    ) -> (
+        Hash,
+        crate::treasurydb::TreasuryState,
+        Vec<(Hash, Vec<Hash>)>,
+    ) {
         let parent = self.store.node(node).parent.expect("connected parent");
         let balance = self.calculate_treasury_balance(parent, params);
         let ts = crate::treasurydb::treasury_state_for_block(block, balance);
         let block_hash = self.store.node(node).hash;
-        self.treasury_state.insert(block_hash.0, ts.clone());
 
         let mut tspend_updates: Vec<(Hash, Vec<Hash>)> = Vec::new();
         for stx in &block.stransactions {
@@ -5122,23 +5144,71 @@ impl Chain {
                 continue;
             }
             let tx_hash = stx.tx_hash();
-            let blocks = self.tspend_blocks.entry(tx_hash.0).or_default();
+            let mut blocks = self
+                .tspend_blocks
+                .get(&tx_hash.0)
+                .cloned()
+                .unwrap_or_default();
             blocks.push(block_hash);
-            tspend_updates.push((tx_hash, blocks.clone()));
+            tspend_updates.push((tx_hash, blocks));
         }
 
-        if let Some(db) = &self.db {
-            db.update(|tx| {
-                crate::treasurydb::db_put_treasury_balance(tx, &block_hash, &ts)
-                    .map_err(chain_db_to_db_error)?;
-                for (tx_hash, blocks) in &tspend_updates {
-                    crate::treasurydb::db_put_tspend(tx, tx_hash, blocks)
-                        .map_err(chain_db_to_db_error)?;
-                }
-                Ok(())
-            })
-            .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
+        (block_hash, ts, tspend_updates)
+    }
+
+    /// Publish the treasury rows to the in-memory mirrors consensus
+    /// reads, after the transaction carrying them has committed.
+    fn apply_treasury_records(
+        &mut self,
+        block_hash: Hash,
+        ts: crate::treasurydb::TreasuryState,
+        tspend_updates: &[(Hash, Vec<Hash>)],
+    ) {
+        self.treasury_state.insert(block_hash.0, ts);
+        for (tx_hash, blocks) in tspend_updates {
+            self.tspend_blocks.insert(tx_hash.0, blocks.clone());
         }
+    }
+
+    /// Write the treasury rows for a connected block inside the caller's
+    /// transaction (dcrd `connectBlock`'s `dbPutTreasuryBalance` and
+    /// `dbPutTSpend` calls, `chain.go:691-703`).
+    fn db_write_treasury_records(
+        tx: &dcroxide_database::Transaction,
+        block_hash: &Hash,
+        ts: &crate::treasurydb::TreasuryState,
+        tspend_updates: &[(Hash, Vec<Hash>)],
+    ) -> Result<(), dcroxide_database::Error> {
+        crate::treasurydb::db_put_treasury_balance(tx, block_hash, ts)
+            .map_err(chain_db_to_db_error)?;
+        for (tx_hash, blocks) in tspend_updates {
+            crate::treasurydb::db_put_tspend(tx, tx_hash, blocks).map_err(chain_db_to_db_error)?;
+        }
+        Ok(())
+    }
+
+    /// Record the treasury state and spend rows for a connected block
+    /// (dcrd's method forms of `dbPutTreasuryBalance` and
+    /// `dbPutTSpend`), writing through to the database when
+    /// persistent.
+    ///
+    /// `connect_block` does not call this: it folds the same rows into
+    /// its own transaction so the best state and the treasury cannot
+    /// land on opposite sides of a crash.  Kept for the harnesses that
+    /// drive the treasury database directly.
+    pub fn put_treasury_records(
+        &mut self,
+        node: NodeId,
+        block: &MsgBlock,
+        params: &Params,
+    ) -> Result<(), RuleError> {
+        let (block_hash, ts, tspend_updates) = self.treasury_records_for_block(node, block, params);
+
+        if let Some(db) = &self.db {
+            db.update(|tx| Self::db_write_treasury_records(tx, &block_hash, &ts, &tspend_updates))
+                .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
+        }
+        self.apply_treasury_records(block_hash, ts, &tspend_updates);
         Ok(())
     }
 
