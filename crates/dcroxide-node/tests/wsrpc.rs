@@ -99,8 +99,8 @@ fn serve_ws() -> (
         allow_unsynced_mining: false,
         rpc_user: "user".to_string(),
         rpc_pass: "pass".to_string(),
-        rpc_limit_user: String::new(),
-        rpc_limit_pass: String::new(),
+        rpc_limit_user: "limit".to_string(),
+        rpc_limit_pass: "limitpass".to_string(),
     });
     let ntfn = dcroxide_node::websocket::NodeNtfnMgr::new();
     server.ntfn_mgr = Box::new(ntfn.clone());
@@ -478,5 +478,46 @@ fn a_bad_upgrade_request_is_refused() {
     let _ = stream.read_to_string(&mut response);
     assert!(response.starts_with("HTTP/1.1 400"), "{response}");
 
+    listener.shutdown();
+}
+
+/// dcrd answers the single-message limited-user gate with an empty
+/// version string (`rpcwebsocket.go:1518`), which `MarshalResponse`
+/// coerces to "1.0" (`dcrjson/jsonrpc.go:152-154`) -- so the refusal
+/// reads `"jsonrpc":"1.0"` even when the request said 2.0.  Echoing
+/// the request's version back is the natural thing to write and the
+/// wrong bytes.  dcrd's *batch* gate (`:1727`) does pass the version
+/// through, which is why the two paths must not share one rule.
+#[test]
+fn the_limited_user_refusal_answers_in_version_1_0() {
+    let (_dir, listener, port, _ntfn, _chain) = serve_ws();
+    let mut ws = handshake(port);
+
+    write_client_frame(
+        &mut ws,
+        br#"{"jsonrpc":"2.0","method":"authenticate","params":["limit","limitpass"],"id":1}"#,
+    );
+    let reply = read_server_frame(&mut ws);
+    assert!(
+        reply.contains("\"error\":null"),
+        "limited user authenticates: {reply}"
+    );
+
+    // `stop` is admin-only, so this draws the gate's refusal.
+    write_client_frame(
+        &mut ws,
+        br#"{"jsonrpc":"2.0","method":"stop","params":[],"id":2}"#,
+    );
+    let reply = read_server_frame(&mut ws);
+    assert!(
+        reply.contains("limited user not authorized for this method"),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("\"jsonrpc\":\"1.0\""),
+        "the refusal is coerced to 1.0: {reply}"
+    );
+
+    drop(ws);
     listener.shutdown();
 }

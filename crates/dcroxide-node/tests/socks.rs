@@ -352,3 +352,77 @@ fn onion_routing_rules() {
     conn.read_exact(&mut reply).expect("read");
     assert_eq!(&reply, b"ok");
 }
+
+/// A proxy that answers each step just inside the dial timeout spends
+/// the whole budget over again on every step.
+///
+/// go-socks converts the caller's context deadline into one absolute
+/// deadline on the connection (`dial.go:115-117`), so the connect and
+/// every read and write of the handshake come out of a single budget.
+/// A per-operation socket timeout is not that: this proxy stalls twice
+/// for 700ms against a 1s dial timeout, which no single operation
+/// exceeds, and the exchange runs to 1.4s -- with as many steps as the
+/// handshake has, a proxy can hold a dialing thread for a multiple of
+/// the timeout the operator configured.
+#[test]
+fn a_stalling_proxy_cannot_outlive_the_dial_timeout() {
+    const STALL: Duration = Duration::from_millis(700);
+    const BUDGET: Duration = Duration::from_secs(1);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_addr = listener.local_addr().expect("addr").to_string();
+    std::thread::spawn(move || {
+        let Ok((mut conn, _)) = listener.accept() else {
+            return;
+        };
+        // The greeting, then a stall before naming the auth method.
+        let mut head = [0u8; 2];
+        if conn.read_exact(&mut head).is_err() {
+            return;
+        }
+        let mut methods = vec![0u8; head[1] as usize];
+        if conn.read_exact(&mut methods).is_err() {
+            return;
+        }
+        std::thread::sleep(STALL);
+        if conn.write_all(&[5, 0]).is_err() {
+            return;
+        }
+        // The connect request, then a second stall before the reply.
+        let mut request = [0u8; 4];
+        if conn.read_exact(&mut request).is_err() {
+            return;
+        }
+        let mut len = [0u8; 1];
+        if conn.read_exact(&mut len).is_err() {
+            return;
+        }
+        let mut rest = vec![0u8; len[0] as usize + 2];
+        if conn.read_exact(&mut rest).is_err() {
+            return;
+        }
+        std::thread::sleep(STALL);
+        let _ = conn.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]);
+        // Hold the connection open so a successful dial is observable.
+        std::thread::sleep(Duration::from_secs(2));
+    });
+
+    let proxy = Proxy {
+        addr: proxy_addr,
+        username: String::new(),
+        password: String::new(),
+        tor_isolation: false,
+    };
+    let start = std::time::Instant::now();
+    let result = proxy.dial("example.com:9108", BUDGET);
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "the second stall falls outside the budget the first one spent"
+    );
+    assert!(
+        elapsed < STALL * 2,
+        "the dial gave up within one budget, not one per step: {elapsed:?}"
+    );
+}

@@ -1395,3 +1395,46 @@ fn the_pre_auth_budget_is_shared_across_listen_addresses() {
         listener.shutdown();
     }
 }
+
+/// Two `Authorization` headers on one request: dcrd's header map keeps
+/// every occurrence in arrival order and it authenticates against
+/// `authhdr[0]` (`rpcserver.go:5525-5536`), so the first one decides.
+/// The concrete case is a reverse proxy that injects its own header:
+/// with last-wins the client's copy overrides the proxy's, which is the
+/// opposite of dcrd's answer in both directions.
+#[test]
+fn the_first_authorization_header_decides() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+
+    let send = |first: &str, second: &str| -> String {
+        let body = r#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}"#;
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {}\r\nAuthorization: Basic {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            dcroxide_rpc::http::base64_std_encode(first.as_bytes()),
+            dcroxide_rpc::http::base64_std_encode(second.as_bytes()),
+            body.len()
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.write_all(request.as_bytes()).expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        response
+    };
+
+    // Valid first, garbage second: the request is served.
+    let response = send("user:pass", "user:wrong");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "the first header authenticates: {response}"
+    );
+
+    // Garbage first, valid second: the request is refused.  A
+    // last-wins reader answers 200 here.
+    let response = send("user:wrong", "user:pass");
+    assert!(
+        response.starts_with("HTTP/1.1 401"),
+        "a later header cannot rescue the first: {response}"
+    );
+
+    listener.shutdown();
+}

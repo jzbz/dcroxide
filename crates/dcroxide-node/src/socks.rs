@@ -18,7 +18,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A SOCKS5 proxy client (go-socks `socks.Proxy`).
 #[derive(Clone, Debug, Default)]
@@ -63,15 +63,82 @@ const ERR_INVALID_PROXY_RESPONSE: &str = "invalid proxy response";
 const ERR_NO_ACCEPTABLE_AUTH: &str = "no acceptable authentication method";
 const ERR_AUTH_FAILED: &str = "authentication failed";
 
-fn read_full(conn: &mut TcpStream, buf: &mut [u8]) -> Result<(), String> {
-    conn.read_exact(buf).map_err(|e| e.to_string())
+/// The instant the exchange must be finished by.
+///
+/// go-socks takes the context deadline once, applies it to the
+/// connection as an absolute instant (`dial.go:115-117`), and clears
+/// it before handing the connection back (`:271`), so every read and
+/// write of the handshake shares one budget.  Rust's socket timeouts
+/// are per-operation instead: arming each one with the full dial
+/// timeout would let a proxy that answers just inside it stretch the
+/// exchange to that timeout *per operation*.  Carrying the deadline
+/// and arming each operation with what is left of it restores the
+/// single budget.
+#[derive(Clone, Copy)]
+struct Deadline(Instant);
+
+impl Deadline {
+    fn after(timeout: Duration) -> Self {
+        Deadline(Instant::now() + timeout)
+    }
+
+    /// Arm both socket timeouts with the remaining budget, or report
+    /// Go's timeout text once it is spent.  A zero `Duration` means
+    /// "no timeout" to the socket API, so an expired deadline has to
+    /// be caught here rather than passed down.
+    fn arm(&self, conn: &TcpStream) -> Result<(), String> {
+        let left = self.0.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("i/o timeout".to_string());
+        }
+        conn.set_read_timeout(Some(left))
+            .map_err(|e| e.to_string())?;
+        conn.set_write_timeout(Some(left))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Fill `buf` within the deadline (Go `io.ReadFull` over a connection
+/// carrying one): re-armed per syscall, because a peer trickling a
+/// byte at a time would otherwise restart a per-operation timeout on
+/// every one of them.  Go's zero-bytes/partial split is preserved.
+fn read_full(conn: &mut TcpStream, buf: &mut [u8], deadline: Deadline) -> Result<(), String> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        deadline.arm(conn)?;
+        match conn.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(if filled == 0 { "EOF" } else { "unexpected EOF" }.to_string());
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// Write all of `buf` within the deadline, re-armed per syscall for
+/// the same reason as `read_full`.
+fn write_full(conn: &mut TcpStream, buf: &[u8], deadline: Deadline) -> Result<(), String> {
+    let mut written = 0;
+    while written < buf.len() {
+        deadline.arm(conn)?;
+        match conn.write(&buf[written..]) {
+            Ok(0) => return Err("write: connection closed".to_string()),
+            Ok(n) => written += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
 }
 
 /// Connect to a `host:port` proxy address like Go's `net.Dialer`:
 /// resolve the name (a hostname proxy such as Tor's default
 /// `localhost:9050` is common) and connect to the resolved addresses
 /// in order until one succeeds.
-fn connect_proxy(addr: &str, timeout: Duration) -> Result<TcpStream, String> {
+fn connect_proxy(addr: &str, deadline: Deadline) -> Result<TcpStream, String> {
     use std::net::ToSocketAddrs;
     let resolved: Vec<std::net::SocketAddr> = addr
         .to_socket_addrs()
@@ -79,7 +146,14 @@ fn connect_proxy(addr: &str, timeout: Duration) -> Result<TcpStream, String> {
         .collect();
     let mut last_err = format!("no addresses found for proxy {addr}");
     for socket in resolved {
-        match TcpStream::connect_timeout(&socket, timeout) {
+        // Go's dialer draws each attempt's timeout from the same
+        // deadline, so a name resolving to several addresses cannot
+        // spend the budget more than once.
+        let left = deadline.0.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("i/o timeout".to_string());
+        }
+        match TcpStream::connect_timeout(&socket, left) {
             Ok(conn) => return Ok(conn),
             Err(e) => last_err = e.to_string(),
         }
@@ -89,18 +163,20 @@ fn connect_proxy(addr: &str, timeout: Duration) -> Result<TcpStream, String> {
 
 impl Proxy {
     /// Connect to `addr` (host:port) through the proxy (go-socks
-    /// `Proxy.DialContext` with the dial timeout applied to the whole
-    /// exchange, like a context deadline).
+    /// `Proxy.DialContext`).  `timeout` is the whole exchange's
+    /// budget, connect included, the way the context deadline dcrd
+    /// passes is (`connmgr/connmanager.go:902`).
     pub fn dial(&self, addr: &str, timeout: Duration) -> Result<TcpStream, String> {
         let (host, port_str) = crate::gostd::split_host_port(addr)?;
         let port: u16 = port_str
             .parse::<u16>()
             .map_err(|e| format!("strconv.Atoi: parsing \"{port_str}\": {e}"))?;
 
-        let mut conn = connect_proxy(&self.addr, timeout)?;
-        // The context deadline bounds the whole handshake.
-        let _ = conn.set_read_timeout(Some(timeout));
-        let _ = conn.set_write_timeout(Some(timeout));
+        // The deadline is taken before the connect, because Go's is:
+        // `dialer.DialContext` and the handshake that follows share
+        // the one the caller's context carries.
+        let deadline = Deadline::after(timeout);
+        let mut conn = connect_proxy(&self.addr, deadline)?;
 
         // Tor isolation overrides the credentials with random ones.
         let (user, pass) = if self.tor_isolation {
@@ -118,11 +194,11 @@ impl Proxy {
         } else {
             vec![PROTOCOL_VERSION, 2, AUTH_NONE, AUTH_USERNAME_PASSWORD]
         };
-        conn.write_all(&greeting).map_err(|e| e.to_string())?;
+        write_full(&mut conn, &greeting, deadline)?;
 
         // The server's auth choice.
         let mut reply = [0u8; 2];
-        read_full(&mut conn, &mut reply)?;
+        read_full(&mut conn, &mut reply, deadline)?;
         if reply[0] != PROTOCOL_VERSION {
             return Err(ERR_INVALID_PROXY_RESPONSE.to_string());
         }
@@ -136,9 +212,9 @@ impl Proxy {
                 auth.extend_from_slice(user.as_bytes());
                 auth.push(pass.len() as u8);
                 auth.extend_from_slice(pass.as_bytes());
-                conn.write_all(&auth).map_err(|e| e.to_string())?;
+                write_full(&mut conn, &auth, deadline)?;
                 let mut status = [0u8; 2];
-                read_full(&mut conn, &mut status)?;
+                read_full(&mut conn, &mut status, deadline)?;
                 if status[0] != 1 {
                     return Err(ERR_INVALID_PROXY_RESPONSE.to_string());
                 }
@@ -163,13 +239,13 @@ impl Proxy {
         request.extend_from_slice(host.as_bytes());
         request.push((port >> 8) as u8);
         request.push((port & 0xff) as u8);
-        conn.write_all(&request).map_err(|e| e.to_string())?;
+        write_full(&mut conn, &request, deadline)?;
 
         // The reply header, then the bound address it describes (read
         // and discarded; the runtime keys the peer on the dialed
         // address).
         let mut header = [0u8; 4];
-        read_full(&mut conn, &mut header)?;
+        read_full(&mut conn, &mut header, deadline)?;
         if header[0] != PROTOCOL_VERSION {
             return Err(ERR_INVALID_PROXY_RESPONSE.to_string());
         }
@@ -181,22 +257,22 @@ impl Proxy {
         match header[3] {
             ADDRESS_TYPE_IPV4 => {
                 let mut bound = [0u8; 4];
-                read_full(&mut conn, &mut bound)?;
+                read_full(&mut conn, &mut bound, deadline)?;
             }
             ADDRESS_TYPE_IPV6 => {
                 let mut bound = [0u8; 16];
-                read_full(&mut conn, &mut bound)?;
+                read_full(&mut conn, &mut bound, deadline)?;
             }
             ADDRESS_TYPE_DOMAIN => {
                 let mut len = [0u8; 1];
-                read_full(&mut conn, &mut len)?;
+                read_full(&mut conn, &mut len, deadline)?;
                 let mut bound = vec![0u8; len[0] as usize];
-                read_full(&mut conn, &mut bound)?;
+                read_full(&mut conn, &mut bound, deadline)?;
             }
             _ => return Err(ERR_INVALID_PROXY_RESPONSE.to_string()),
         }
         let mut bound_port = [0u8; 2];
-        read_full(&mut conn, &mut bound_port)?;
+        read_full(&mut conn, &mut bound_port, deadline)?;
 
         // go-socks clears the handshake deadline before returning;
         // the caller applies the peer read deadline itself.
@@ -217,15 +293,13 @@ pub fn tor_lookup_ip(
     proxy: &str,
     timeout: Duration,
 ) -> Result<Vec<std::net::IpAddr>, String> {
-    let mut conn = connect_proxy(proxy, timeout)?;
-    let _ = conn.set_read_timeout(Some(timeout));
-    let _ = conn.set_write_timeout(Some(timeout));
+    let deadline = Deadline::after(timeout);
+    let mut conn = connect_proxy(proxy, deadline)?;
 
     // The greeting offers only authNone.
-    conn.write_all(&[0x05, 0x01, 0x00])
-        .map_err(|e| e.to_string())?;
+    write_full(&mut conn, &[0x05, 0x01, 0x00], deadline)?;
     let mut reply = [0u8; 2];
-    read_full(&mut conn, &mut reply)?;
+    read_full(&mut conn, &mut reply, deadline)?;
     if reply[0] != 0x05 {
         return Err("invalid SOCKS proxy version".to_string());
     }
@@ -243,10 +317,10 @@ pub fn tor_lookup_ip(
     request.extend_from_slice(host.as_bytes());
     request.push(0); // port 0 high
     request.push(0); // port 0 low (Go writes one zero into a zeroed buffer)
-    conn.write_all(&request).map_err(|e| e.to_string())?;
+    write_full(&mut conn, &request, deadline)?;
 
     let mut header = [0u8; 4];
-    read_full(&mut conn, &mut header)?;
+    read_full(&mut conn, &mut header, deadline)?;
     if header[0] != 5 {
         return Err("invalid SOCKS proxy version".to_string());
     }
@@ -271,6 +345,7 @@ pub fn tor_lookup_ip(
     // dcrd reads the address and port in one raw read and validates
     // the length against the announced type.
     let mut reply = [0u8; 32 + 2];
+    deadline.arm(&conn)?;
     let reply_len = conn.read(&mut reply).map_err(|e| e.to_string())?;
     match header[3] {
         1 => {

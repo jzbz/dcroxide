@@ -2339,7 +2339,16 @@ fn read_http_head<S: Read + SocketTimeout>(
         if let Some((name, value)) = line.split_once(':') {
             let value = value.trim();
             if name.eq_ignore_ascii_case("authorization") {
-                head.authorization = Some(value.to_string());
+                // Go's header map keeps every occurrence in arrival
+                // order and dcrd authenticates against `authhdr[0]`
+                // (`rpcserver.go:5525-5536`), so a duplicate header
+                // never displaces the first.  Overwriting here would
+                // hand the decision to whichever copy arrived last --
+                // behind a reverse proxy that injects its own
+                // Authorization header, the opposite of dcrd's answer.
+                if head.authorization.is_none() {
+                    head.authorization = Some(value.to_string());
+                }
             } else if name.eq_ignore_ascii_case("content-length") {
                 head.content_length = value.parse().map_err(|_| "bad content length")?;
             } else if name.eq_ignore_ascii_case("transfer-encoding") {

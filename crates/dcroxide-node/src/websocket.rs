@@ -824,12 +824,12 @@ fn handle_ws_request_inner(
             err_rpc_invalid_params().code,
             "limited user not authorized for this method",
         );
-        return reply_or_skip(create_marshalled_reply(
-            &req.jsonrpc,
-            &req.id,
-            None,
-            Some(&json_err),
-        ));
+        // dcrd passes an empty version here (`rpcwebsocket.go:1518`),
+        // which `MarshalResponse` coerces to "1.0" -- so this reply
+        // reads `"jsonrpc":"1.0"` even for a 2.0 request.  The batch
+        // path in `process_request` does pass the request's version
+        // through, matching dcrd's other gate at `:1727`.
+        return reply_or_skip(create_marshalled_reply("", &req.id, None, Some(&json_err)));
     }
 
     // Parse and dispatch the command through the ported websocket
