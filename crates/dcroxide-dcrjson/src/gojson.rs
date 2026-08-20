@@ -20,6 +20,9 @@
 // caller observes them, matching assignField's err != nil checks.
 #![allow(clippy::result_unit_err)]
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
 use crate::gotype::{GoType, GoValue, Kind, resolve};
 
 // ---------------------------------------------------------------------
@@ -1506,6 +1509,15 @@ fn decode_object(typ: &GoType, r: &mut Reader<'_>, out: &mut GoValue) -> Result<
         GoType::Map(_, velem) => {
             r.next_token(); // '{'
             let mut entries: Vec<(String, GoValue)> = Vec::new();
+            // Go's map decode is a hash insert per key (`encoding/json`
+            // `object`), so a duplicate key costs the same as a fresh
+            // one.  `entries` alone would mean rescanning every key seen
+            // so far, which an 8 MiB body of distinct keys turns into
+            // minutes of CPU on a request any limited-credential client
+            // can make.  The vector still carries first-seen order --
+            // observable through `GoValue` equality and the raw-tx
+            // handlers -- and this only indexes it.
+            let mut slots: HashMap<String, usize> = HashMap::new();
             r.skip_ws();
             if r.peek() == Some(b'}') {
                 r.pos += 1;
@@ -1519,10 +1531,14 @@ fn decode_object(typ: &GoType, r: &mut Reader<'_>, out: &mut GoValue) -> Result<
                     r.pos += 1; // ':'
                     let mut v = GoValue::zero(velem);
                     decode_value(velem, r, &mut v)?;
-                    if let Some(slot) = entries.iter_mut().find(|(k, _)| *k == key) {
-                        slot.1 = v;
-                    } else {
-                        entries.push((key, v));
+                    match slots.entry(key) {
+                        // Last value wins, in the first-seen slot.
+                        Entry::Occupied(slot) => entries[*slot.get()].1 = v,
+                        Entry::Vacant(slot) => {
+                            let idx = entries.len();
+                            entries.push((slot.key().clone(), v));
+                            slot.insert(idx);
+                        }
                     }
                     r.skip_ws();
                     if r.peek() == Some(b',') {
