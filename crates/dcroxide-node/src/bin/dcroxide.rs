@@ -145,6 +145,13 @@ fn real_main() -> ExitCode {
                 }
                 return ExitCode::SUCCESS;
             }
+            // dcrd writes these to stderr as it parses
+            // (`config.go:818-824` and the Tor-isolation notices); the
+            // port collected them and printed none, so a deprecated
+            // option or an overridden proxy credential passed silently.
+            for warning in &cfg.warnings {
+                eprintln!("{warning}");
+            }
             run(cfg)
         }
         Err(msg) => match msg.as_str() {
@@ -181,6 +188,11 @@ fn run(cfg: Config) -> ExitCode {
     // (dcrd's loadConfig calling parseAndSetDebugLevels).
     dcroxide_node::logging::set_levels(cfg.log_levels.clone());
     print!("{}", logo::startup_banner(version::version_string()));
+    // Logged rather than printed, and only here: dcrd defers it until
+    // the rest of the configuration succeeds (`config.go:1348-1352`).
+    if let Some(warning) = &cfg.config_file_warning {
+        dcroxide_node::logging::warn("MAIN", warning);
+    }
     println!();
 
     log_info(&format!(

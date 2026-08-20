@@ -597,7 +597,14 @@ pub struct Config {
     pub onion: OnionSelection,
     /// Warnings dcrd prints to stderr or the daemon log (deprecated
     /// options, missing config file); informational only.
+    /// Warnings dcrd writes to stderr as it parses (its
+    /// `fmt.Fprintln(os.Stderr, ...)` deprecation and Tor-isolation
+    /// notices).
     pub warnings: Vec<String>,
+    /// The missing-config-file notice, which dcrd logs rather than
+    /// printing (`config.go:1348-1352`, `dcrdLog.Warnf`), and only
+    /// after the rest of the configuration succeeds.
+    pub config_file_warning: Option<String>,
 }
 
 fn empty_net_info(name: &str) -> RpcNetworkInfo {
@@ -715,6 +722,7 @@ impl Config {
             lookup: LookupSelection::System,
             onion: OnionSelection::SameAsMain,
             warnings: Vec::new(),
+            config_file_warning: None,
         }
     }
 }
@@ -1517,8 +1525,16 @@ fn load_config_impl(
     let mut parser_set_names: Vec<&'static str> = Vec::new();
     let mut config_file_error: Option<String> = None;
     if !(cfg.sim_net || cfg.reg_net) || pre_cfg.config_file != default_config_file {
-        match fs::read_to_string(&pre_cfg.config_file) {
-            Ok(content) => {
+        // Read as bytes, not as a `String`: Go's ini reader is
+        // byte-oriented, and `read_to_string` turns one invalid byte into
+        // an `InvalidData` error that the arm below treats as a missing
+        // file.  The file is then silently discarded -- and the sharp
+        // case is not `rpcuser`, which fails closed, but `testnet=1`: an
+        // operator who believes they are on testnet comes up on mainnet
+        // with nothing said.
+        match fs::read(&pre_cfg.config_file) {
+            Ok(bytes) => {
+                let content = String::from_utf8_lossy(&bytes);
                 let assignments = crate::flags::parse_ini(&content, &pre_cfg.config_file)
                     .map_err(|e| format!("Error parsing config file: {e}"))?;
                 let mut pass = ParsePass::default();
@@ -2098,7 +2114,7 @@ fn load_config_impl(
     // Warn about a missing config file only after all other
     // configuration is done.
     if let Some(err) = config_file_error {
-        cfg.warnings.push(err);
+        cfg.config_file_warning = Some(err);
     }
 
     Ok((cfg, remaining_args))
