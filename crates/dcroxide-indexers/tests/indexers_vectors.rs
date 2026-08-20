@@ -610,6 +610,104 @@ fn sync_waiters_and_legacy_drops() {
     db_tx.rollback().expect("rollback");
 }
 
+/// A short row in the block ID index is a typed corruption error, not a
+/// panic (RVW-023's sibling, RVW-031).
+///
+/// The node only ever writes 32-byte values there, so reaching this
+/// needs metadata corruption -- local tampering or bit rot, which redb
+/// 4.1.0 does not checksum on read (SECURITY.md's known gap).  The
+/// consequence was disproportionate: `db_fetch_block_hash_by_serialized_id`
+/// sliced `hash_bytes[..HASH_SIZE]` unchecked, and `TxIndex::new`'s
+/// highest-used-id scan called it behind `is_err()`, where a panic is not
+/// an error but an abort under `panic = "abort"`.  One short row failed
+/// every startup, in a loop, until datadir surgery.
+///
+/// dcrd cannot reach either outcome: `copy(hash[:], hashBytes)`
+/// (`txindex.go:157-167`) zero-pads a short row and reports success, so
+/// the damage surfaces later as a recoverable block-not-found.
+#[test]
+fn a_short_block_id_index_row_is_a_corruption_error_not_a_panic() {
+    let params = leaked_params();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let opts = Options::new(dir.path().join("db"), params.net.0);
+    let db = Arc::new(Database::create(&opts).expect("db"));
+    let chain = Arc::new(TestChain::new(params));
+    let mut subber = IndexSubscriber::new(Arc::new(core::sync::atomic::AtomicBool::new(false)));
+    let idx = TxIndex::new(
+        &mut subber,
+        db.clone(),
+        chain.clone() as Arc<dyn ChainQueryer>,
+    )
+    .expect("tx index");
+
+    // One real block through the index, so block ID 1 is a live entry
+    // with a live transaction pointing at it.
+    let block_hex = include_str!("data/indexers_vectors.txt")
+        .lines()
+        .find_map(|line| line.strip_prefix("block bk1 "))
+        .expect("bk1 hex");
+    let block = parse_block(block_hex);
+    chain.add_block(block.clone());
+    subber
+        .notify(&IndexNtfn {
+            ntfn_type: CONNECT_NTFN,
+            block: block.clone(),
+            parent: Arc::new(params.genesis_block.clone()),
+            is_treasury_enabled: false,
+        })
+        .expect("notify");
+
+    let tx_hash = block.transactions[0].tx_hash();
+    assert!(
+        idx.lock()
+            .expect("indexer lock poisoned")
+            .entry(&tx_hash)
+            .expect("lookup over an intact index")
+            .is_some(),
+        "the block's transaction must be indexed before the row is corrupted",
+    );
+
+    // Shorten block ID 1's hash to 16 bytes, the shape bit rot produces.
+    let db_tx = db.begin(true).expect("begin");
+    let bucket = db_tx
+        .metadata()
+        .bucket(HASH_BY_ID_INDEX_BUCKET_NAME)
+        .expect("block ID index bucket");
+    let key = 1u32.to_le_bytes();
+    let intact = bucket.get(&key).expect("block ID 1 must be live");
+    assert_eq!(intact.len(), 32, "the intact row is a full hash");
+    bucket.put(&key, &intact[..16]).expect("truncate the row");
+    db_tx.commit().expect("commit");
+
+    // The lookup path: a typed error rather than a slice panic.
+    let err = idx
+        .lock()
+        .expect("indexer lock poisoned")
+        .entry(&tx_hash)
+        .expect_err("a corrupt block ID row must not resolve");
+    assert!(
+        format!("{err}").contains("corrupt"),
+        "expected a corruption error, got: {err}",
+    );
+
+    // The startup path: the scan refuses with an error instead of
+    // aborting the process, and instead of reading the corrupt row as an
+    // unused id and handing block ID 1 out a second time.
+    let mut fresh_subber =
+        IndexSubscriber::new(Arc::new(core::sync::atomic::AtomicBool::new(false)));
+    let err = TxIndex::new(
+        &mut fresh_subber,
+        db.clone(),
+        chain.clone() as Arc<dyn ChainQueryer>,
+    )
+    .err()
+    .expect("startup over a corrupt block ID index must fail loudly");
+    assert!(
+        format!("{err}").contains("corrupt"),
+        "expected a corruption error, got: {err}",
+    );
+}
+
 /// The daemon drives the indexes from its own threads, so the index
 /// state and the shared handles it hands out must cross thread
 /// boundaries.  This pins the conversion off `Rc`/`RefCell`/`Cell` at

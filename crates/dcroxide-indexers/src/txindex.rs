@@ -137,15 +137,54 @@ fn db_fetch_block_hash_by_serialized_id(
         .get(serialized_id)
         .ok_or_else(|| IdxError::Other("no entry in the block ID index".into()))?;
 
+    // dcrd's `copy(hash[:], hashBytes)` (`txindex.go:157-167`) truncates
+    // a short row into a zero-padded hash and reports no error, so the
+    // corruption surfaces later as a recoverable block-not-found.
+    // Slicing panics instead -- and `TxIndex::new`'s recovery scan calls
+    // this behind `is_err()`, where a panic is not an error but an abort,
+    // so one short row would fail every startup in a loop.  Fail the way
+    // the siblings do (`db_fetch_tx_index_entry` below,
+    // `db_fetch_indexer_tip` in `common.rs`): a typed corruption error,
+    // which the scan reads as a missing id and the lookup paths surface.
+    if hash_bytes.len() < HASH_SIZE {
+        return Err(make_db_err(
+            dcroxide_database::ErrorKind::Corruption,
+            format!("corrupt block ID index entry for block ID {serialized_id:02x?}"),
+        ));
+    }
+
     let mut hash = Hash::ZERO;
     hash.0.copy_from_slice(&hash_bytes[..HASH_SIZE]);
     Ok(hash)
 }
 
-/// Retrieve the hash for the provided block id (dcrd
-/// `dbFetchBlockHashByID`).
-fn db_fetch_block_hash_by_id(db_tx: &Transaction, id: u32) -> Result<Hash, IdxError> {
-    db_fetch_block_hash_by_serialized_id(db_tx, &id.to_le_bytes())
+/// Whether the block id has an entry in the block ID index, for the
+/// highest-used-id scan in [`TxIndex::new`] (dcrd `dbFetchBlockHashByID`,
+/// `txindex.go:171`, which exists only to be asked this at
+/// `txindex.go:376` and `:397`).
+///
+/// dcrd reads any error from that fetch as "not used yet", which is exact
+/// there because the fetch fails only when the row is absent: a short row
+/// is zero-padded by `copy` and reported as present.  Here the fetch also
+/// fails on a corrupt row, and reading that as absence would restart the
+/// id counter over live entries and overwrite them.  So absence is
+/// `Ok(false)`, and corruption propagates -- refusing the startup with a
+/// message naming the row instead of silently compounding the damage.
+fn block_id_used(db_tx: &Transaction, id: u32) -> Result<bool, IdxError> {
+    let meta = db_tx.metadata();
+    let id_index = meta
+        .bucket(HASH_BY_ID_INDEX_BUCKET_NAME)
+        .ok_or_else(|| bucket_missing(HASH_BY_ID_INDEX_BUCKET_NAME))?;
+    let Some(hash_bytes) = id_index.get(&id.to_le_bytes()) else {
+        return Ok(false);
+    };
+    if hash_bytes.len() < HASH_SIZE {
+        return Err(make_db_err(
+            dcroxide_database::ErrorKind::Corruption,
+            format!("corrupt block ID index entry for block ID {id}"),
+        ));
+    }
+    Ok(true)
 }
 
 /// Serialize a transaction index entry (dcrd `putTxIndexEntry`).
@@ -357,7 +396,7 @@ impl TxIndex {
             let mut test_block_id = 1u32;
             const INCREMENT: u32 = 100_000;
             loop {
-                if db_fetch_block_hash_by_id(&db_tx, test_block_id).is_err() {
+                if !block_id_used(&db_tx, test_block_id)? {
                     next_unknown = test_block_id;
                     break;
                 }
@@ -373,10 +412,10 @@ impl TxIndex {
                 // block id.
                 loop {
                     test_block_id = highest_known.midpoint(next_unknown);
-                    if db_fetch_block_hash_by_id(&db_tx, test_block_id).is_err() {
-                        next_unknown = test_block_id;
-                    } else {
+                    if block_id_used(&db_tx, test_block_id)? {
                         highest_known = test_block_id;
+                    } else {
+                        next_unknown = test_block_id;
                     }
                     if highest_known.saturating_add(1) == next_unknown {
                         break;
