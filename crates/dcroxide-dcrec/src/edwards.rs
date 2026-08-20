@@ -218,11 +218,22 @@ pub fn verify_raw(pub_key: &PublicKey, message: &[u8], sig: &[u8; SIGNATURE_SIZE
     h.update(message);
     let k = Scalar::from_bytes_mod_order_wide(&h.finalize().into());
 
-    // R' = s*B - k*A; the scalar multiplication implicitly reduces any
+    // R' = s*B + k*(-A); the scalar multiplication implicitly reduces any
     // s >= L, matching the byte-driven ladder in agl/ed25519.
+    //
+    // The negation MUST be on the POINT, not on the scalar. agl negates A
+    // (`FeNeg(&A.X); FeNeg(&A.T)`, ed25519.go:106-107) and then computes
+    // `k*(-A) + s*B`. Negating the scalar instead computes `(L-k)*A`, and
+    // those agree only on the prime-order subgroup: for a pubkey carrying
+    // an order-8 torsion component T, `(L-k)*T != -(k*T)` because
+    // `L mod 8 = 5`, not 0. Both dcrd and this port accept torsion-carrying
+    // keys (neither does a subgroup check), so the difference is reachable
+    // on the consensus OP_CHECKSIGALT type-1 path with a pubkey an attacker
+    // can grind in ~8-64 hashes -- a signature dcrd accepts that this port
+    // would reject. See the torsion rows in tests/edwards_differential.rs.
     let s_bytes: [u8; 32] = sig[32..].try_into().expect("32 bytes");
     let s = Scalar::from_bytes_mod_order(s_bytes);
-    let r_prime = EdwardsPoint::vartime_double_scalar_mul_basepoint(&-k, &pub_key.point, &s);
+    let r_prime = EdwardsPoint::vartime_double_scalar_mul_basepoint(&k, &(-pub_key.point), &s);
 
     r_prime.compress().as_bytes() == &sig[..32]
 }
