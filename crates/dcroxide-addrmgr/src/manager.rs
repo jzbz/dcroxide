@@ -1172,7 +1172,12 @@ impl AddrManager {
         filter: NetAddressTypeFilter,
     ) -> NetAddress {
         let mut bestreach = NetAddressReach::Default;
-        let mut bestscore = -1i32;
+        // dcrd's `var bestscore AddressPriority` starts at the zero
+        // value, 0, not -1 (`addrmanager.go:1323`).  With -1 a score-0
+        // local wins a Default-reach tie here and loses it there, so the
+        // port would announce a routable local where dcrd falls through
+        // to the unroutable fallback.
+        let mut bestscore = 0i32;
         let mut best_address: Option<&NetAddress> = None;
         for la in self.local_addresses.values() {
             if !filter(la.na.addr_type) {
@@ -1237,13 +1242,18 @@ impl AddrManager {
     /// Create a network address from a "host:port" string, stamping
     /// it with the current time (dcrd `newNetAddressFromString`).
     fn new_net_address_from_string(&self, addr: &str) -> Result<NetAddress, AddrError> {
-        let (host, port_str) = split_host_port(addr).ok_or_else(|| {
+        // The crate carried a second, hand-rolled splitter here that
+        // disagreed with the Go-faithful one in `seed`: it accepted an
+        // unbracketed multi-colon host like `::1:9108`, and `"+9108"`
+        // parses as a `u16` where Go's `ParseUint` rejects the sign.
+        // One implementation now, so they cannot drift again.
+        let (host, port_str) = crate::seed::split_host_port(addr).map_err(|_| {
             make_error(
                 ErrorKind::UnknownAddressType,
                 format!("failed to deserialize address {addr}"),
             )
         })?;
-        let port: u16 = port_str.parse().map_err(|_| {
+        let port = crate::seed::go_parse_port(&port_str).map_err(|()| {
             make_error(
                 ErrorKind::UnknownAddressType,
                 format!("failed to deserialize address {addr}"),
@@ -1360,7 +1370,11 @@ impl AddrManager {
                 if secs == GO_ZERO_TIME_UNIX {
                     None
                 } else {
-                    Some(secs * NANOS_PER_SEC)
+                    // The seconds come off disk.  Go's `time.Unix`
+                    // cannot overflow here because it keeps seconds and
+                    // nanoseconds apart; this multiply can, and does so
+                    // loudly under `cargo test` and silently in release.
+                    Some(secs.saturating_mul(NANOS_PER_SEC))
                 }
             };
             let ka = Arc::new(Mutex::new(KnownAddress {
@@ -1522,16 +1536,4 @@ fn go_unix(t: Option<i64>) -> i64 {
         Some(nanos) => nanos.div_euclid(NANOS_PER_SEC),
         None => GO_ZERO_TIME_UNIX,
     }
-}
-
-/// Split a "host:port" string, handling bracketed IPv6 hosts (Go
-/// `net.SplitHostPort`).
-fn split_host_port(addr: &str) -> Option<(String, String)> {
-    let idx = addr.rfind(':')?;
-    let (host, port) = (&addr[..idx], &addr[idx + 1..]);
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    Some((host.to_string(), port.to_string()))
 }

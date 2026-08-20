@@ -140,6 +140,15 @@ fn next_value_extent(data: &[u8], pos: usize) -> Result<Option<(usize, usize)>, 
     if pos >= data.len() {
         return Ok(None);
     }
+    // A closing bracket at the top level ends the stream rather than
+    // starting a value.  Go's `Decoder.More` reports no further element
+    // and the caller keeps what it already decoded; treating it as a
+    // malformed value failed the whole `seed_addrs` call and discarded
+    // every address parsed before it -- which the seeder retry path then
+    // repeats under a capped backoff.
+    if matches!(data[pos], b']' | b'}') {
+        return Ok(None);
+    }
     let start = pos;
     let mut depth = 0usize;
     let mut in_string = false;
@@ -186,7 +195,7 @@ fn next_value_extent(data: &[u8], pos: usize) -> Result<Option<(usize, usize)>, 
 
 /// Split host and port like Go's `net.SplitHostPort`, returning the
 /// host and port strings.
-fn split_host_port(hostport: &str) -> Result<(String, String), String> {
+pub(crate) fn split_host_port(hostport: &str) -> Result<(String, String), String> {
     let missing_port = || format!("address {hostport}: missing port in address");
     let too_many_colons = || format!("address {hostport}: too many colons in address");
     let bytes = hostport.as_bytes();
@@ -353,7 +362,7 @@ pub fn seed_addrs<T: SeederTransport, E: SeedEnv>(
 }
 
 /// Parse a port like Go's `strconv.ParseUint(portStr, 10, 16)`.
-fn go_parse_port(s: &str) -> Result<u16, ()> {
+pub(crate) fn go_parse_port(s: &str) -> Result<u16, ()> {
     if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
         return Err(());
     }
