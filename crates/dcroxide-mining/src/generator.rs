@@ -1439,34 +1439,45 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                     }
                 }
             }
+        }
 
-            // Resolve the zero-conf fraud proofs against the block's
-            // own regular tree.
-            for i in 1..block_txns_regular.len() {
-                let mut updates: Vec<(usize, i64, u32)> = Vec::new();
-                for (in_idx, tx_in) in block_txns_regular[i].tx_in.iter().enumerate() {
-                    if tx_in.block_index == dcroxide_wire::NULL_BLOCK_INDEX {
-                        let Some(idx) = tx_index_from_tx_list(
-                            &tx_in.previous_out_point.hash,
-                            &block_txns_regular_hashes,
-                        ) else {
-                            return Err(format!(
-                                "ErrFraudProofIndex: failed find hash in tx list for fraud \
-                                 proof; tx in hash {}",
-                                tx_in.previous_out_point.hash
-                            ));
-                        };
-                        let origin_idx = tx_in.previous_out_point.index as usize;
-                        let amt = block_txns_regular[idx].tx_out[origin_idx].value;
-                        updates.push((in_idx, amt, idx as u32));
-                    }
+        // Resolve the zero-conf fraud proofs against the block's own
+        // regular tree.
+        //
+        // Unguarded, where the chain-view refill above is not.  dcrd
+        // puts the height-1 escape inside pass one's loop as a `break`
+        // (`mining.go:2188-2190`) and leaves this pass, including its
+        // `ErrFraudProofIndex` return, to run at every height
+        // (`mining.go:2224-2253`).  `wire.NewTxIn` defaults `BlockIndex`
+        // to the null sentinel and the mempool's refresh only fills
+        // inputs the chain view knows, so a zero-conf parent reaches
+        // here unresolved in both implementations -- dcrd fills it from
+        // the block's own tree, and skipping that emitted a template
+        // whose inputs still carried the sentinel.
+        for i in 1..block_txns_regular.len() {
+            let mut updates: Vec<(usize, i64, u32)> = Vec::new();
+            for (in_idx, tx_in) in block_txns_regular[i].tx_in.iter().enumerate() {
+                if tx_in.block_index == dcroxide_wire::NULL_BLOCK_INDEX {
+                    let Some(idx) = tx_index_from_tx_list(
+                        &tx_in.previous_out_point.hash,
+                        &block_txns_regular_hashes,
+                    ) else {
+                        return Err(format!(
+                            "ErrFraudProofIndex: failed find hash in tx list for fraud \
+                             proof; tx in hash {}",
+                            tx_in.previous_out_point.hash
+                        ));
+                    };
+                    let origin_idx = tx_in.previous_out_point.index as usize;
+                    let amt = block_txns_regular[idx].tx_out[origin_idx].value;
+                    updates.push((in_idx, amt, idx as u32));
                 }
-                for (in_idx, amt, idx) in updates {
-                    let tx_in = &mut block_txns_regular[i].tx_in[in_idx];
-                    tx_in.value_in = amt;
-                    tx_in.block_height = next_block_height as u32;
-                    tx_in.block_index = idx;
-                }
+            }
+            for (in_idx, amt, idx) in updates {
+                let tx_in = &mut block_txns_regular[i].tx_in[in_idx];
+                tx_in.value_in = amt;
+                tx_in.block_height = next_block_height as u32;
+                tx_in.block_index = idx;
             }
         }
 

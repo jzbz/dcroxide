@@ -564,3 +564,262 @@ fn newtemplate_vectors() {
     }
     assert_eq!(counts, [9, 5], "row counts");
 }
+
+/// A chain fixture with nothing in it, for the height-1 checks below.
+fn empty_generator(
+    params: &'static dcroxide_chaincfg::Params,
+    best_height: i64,
+) -> BlkTmplGenerator<'static, FakeChain, ThinSource> {
+    // The generator reads the tip's header, so the fixture needs one.
+    let tip = MsgBlock {
+        header: BlockHeader {
+            version: 1,
+            prev_block: Hash::ZERO,
+            merkle_root: Hash::ZERO,
+            stake_root: Hash::ZERO,
+            vote_bits: 1,
+            final_state: [0u8; 6],
+            voters: 0,
+            fresh_stake: 0,
+            revocations: 0,
+            pool_size: 0,
+            bits: 0x2000_0000,
+            sbits: 1,
+            height: best_height as u32,
+            size: 0,
+            timestamp: 1,
+            nonce: 0,
+            extra_data: [0u8; 32],
+            stake_version: 0,
+        },
+        transactions: Vec::new(),
+        stransactions: Vec::new(),
+    };
+    let mut blocks = HashMap::new();
+    blocks.insert(Hash::ZERO.0, tip);
+
+    let chain = FakeChain {
+        best: TemplateBest {
+            height: best_height,
+            median_time_unix: 1,
+            next_stake_diff: 1,
+            next_pool_size: 0,
+            ..TemplateBest::default()
+        },
+        blocks,
+        utxos: UtxoView::new(),
+        difficulty: 0x2000_0000,
+        stake_version: 0,
+        max_expenditure: 0,
+        tip_generation: Vec::new(),
+        hdr_cmt_active: true,
+        treasury_active: true,
+        auto_rev_active: false,
+        ss_active: false,
+        ssr2_active: false,
+        difficulty_err: false,
+        stake_version_err: false,
+        connect_err: false,
+        treasury_agenda_err: false,
+        adjusted_time: 1,
+        subsidy_cache: RefCell::new(SubsidyCache::new(ChainSubsidyParams(params))),
+        script_flags: ScriptFlags(ScriptFlags::VERIFY_CLEAN_STACK.0),
+    };
+    let policy = MiningPolicy {
+        block_max_size: 375000,
+        tx_min_free_fee: 10000,
+        aggressive_mining: true,
+    };
+    BlkTmplGenerator::new(policy, params, chain, ThinSource::new(), 0)
+}
+
+/// A confirmed anyone-can-spend output for the chain to fund from.
+fn funding() -> MsgTx {
+    let mut tx = MsgTx::default();
+    tx.tx_in.push(dcroxide_wire::TxIn {
+        previous_out_point: OutPoint {
+            hash: Hash([9u8; 32]),
+            index: 0,
+            tree: TX_TREE_REGULAR,
+        },
+        sequence: 0xffff_ffff,
+        value_in: 5_000_000,
+        block_height: 1,
+        block_index: 0,
+        signature_script: Vec::new(),
+    });
+    tx.tx_out.push(dcroxide_wire::TxOut {
+        value: 5_000_000,
+        version: 0,
+        pk_script: vec![0x51],
+    });
+    tx
+}
+
+/// An anyone-can-spend output, so script validation runs for real
+/// without signing.
+fn payer(funding: &MsgTx, value: i64) -> MsgTx {
+    let mut tx = MsgTx::default();
+    tx.tx_in.push(dcroxide_wire::TxIn {
+        previous_out_point: OutPoint {
+            hash: funding.tx_hash(),
+            index: 0,
+            tree: TX_TREE_REGULAR,
+        },
+        sequence: 0xffff_ffff,
+        value_in: 5_000_000,
+        block_height: 1,
+        block_index: 0,
+        signature_script: Vec::new(),
+    });
+    tx.tx_out.push(dcroxide_wire::TxOut {
+        value,
+        version: 0,
+        pk_script: vec![0x51],
+    });
+    tx
+}
+
+/// A child spending `parent`'s first output, with the fraud proof left
+/// at the null sentinels `wire.NewTxIn` defaults to.
+fn spender(parent: &MsgTx, value: i64) -> MsgTx {
+    let mut tx = MsgTx::default();
+    tx.tx_in.push(dcroxide_wire::TxIn {
+        previous_out_point: OutPoint {
+            hash: parent.tx_hash(),
+            index: 0,
+            tree: TX_TREE_REGULAR,
+        },
+        sequence: 0xffff_ffff,
+        value_in: dcroxide_wire::NULL_VALUE_IN,
+        block_height: dcroxide_wire::NULL_BLOCK_HEIGHT,
+        block_index: dcroxide_wire::NULL_BLOCK_INDEX,
+        signature_script: Vec::new(),
+    });
+    tx.tx_out.push(dcroxide_wire::TxOut {
+        value,
+        version: 0,
+        pk_script: vec![0x51],
+    });
+    tx
+}
+
+fn source_desc(tx: MsgTx, height: i64) -> Arc<TxDesc> {
+    let tx_hash = tx.tx_hash();
+    let tx_size = tx.serialize_size() as i64;
+    Arc::new(TxDesc {
+        tx,
+        tx_hash,
+        tree: TX_TREE_REGULAR,
+        tx_type: TxType::Regular,
+        added_unix: 0,
+        height,
+        fee: 20_000,
+        total_sig_ops: 1,
+        tx_size,
+    })
+}
+
+/// The in-block fraud proof pass runs at height 1 (RVW-005).
+///
+/// dcrd guards only the chain-view refill with the height-1 escape — a
+/// `break` inside that loop (`mining.go:2188-2190`) — and leaves the
+/// second pass, which resolves inputs still carrying the null sentinel
+/// against the block's own regular tree, to run at every height
+/// (`mining.go:2224-2253`). The port wrapped both, so at height 1 it
+/// neither resolved nor errored, and emitted a template whose inputs
+/// still carried `NullBlockIndex`.
+///
+/// Not reachable on a live network: genesis pays a single zero-value
+/// output, `createChainState` creates no utxo entries, and zero-value
+/// spends are rejected, so no chain reaches height 1 with a spendable
+/// parent. This is parity repair.
+///
+/// The pass's other half — the `ErrFraudProofIndex` return when the
+/// parent is not in the block at all — is not covered here. Reaching it
+/// needs the child selected while its parent is left out, and the
+/// selector will not produce that from a fixture: with the parent absent
+/// from both the source and the utxo view the child is simply never
+/// chosen, so a test written that way asserts nothing.
+#[test]
+fn the_in_block_fraud_proof_pass_runs_at_height_one() {
+    let params = leaked_params();
+    let mut g = empty_generator(params, 0);
+    let fund = funding();
+    g.chain.utxos.add_tx_outs(&fund, 1, 0, false);
+    let parent = payer(&fund, 4_000_000);
+    let child = spender(&parent, 3_000_000);
+    let child_hash = child.tx_hash();
+    g.tx_source.add(source_desc(parent.clone(), 1));
+    g.tx_source.add(source_desc(child, 1));
+
+    let template = g
+        .new_block_template(
+            None,
+            &ExtraNonces {
+                coinbase: 0,
+                treasury: 0,
+            },
+        )
+        .expect("a height-1 template with a chained pair")
+        .expect("a template, not none");
+    let block = &template.block;
+
+    let idx = block
+        .transactions
+        .iter()
+        .position(|t| t.tx_hash() == child_hash)
+        .expect("the child is in the block");
+    let parent_idx = block
+        .transactions
+        .iter()
+        .position(|t| t.tx_hash() == parent.tx_hash())
+        .expect("the parent is in the block");
+    let tx_in = &block.transactions[idx].tx_in[0];
+
+    // Pre-fix these are the sentinels the mempool put there.
+    assert_eq!(
+        (tx_in.value_in, tx_in.block_height, tx_in.block_index),
+        (4_000_000, 1, parent_idx as u32),
+        "the zero-conf fraud proof must be resolved from the block's own tree",
+    );
+}
+
+/// The anti-regression anchor: the same pair still resolves above
+/// height 1. Passes before and after — it exists so a later "fix" that
+/// deletes pass one, or moves the guard onto pass two's contents,
+/// cannot pass the two tests above.
+#[test]
+fn the_pair_still_resolves_above_height_one() {
+    let params = leaked_params();
+    let mut g = empty_generator(params, 100);
+    let fund = funding();
+    g.chain.utxos.add_tx_outs(&fund, 1, 0, false);
+    let parent = payer(&fund, 4_000_000);
+    let child = spender(&parent, 3_000_000);
+    let child_hash = child.tx_hash();
+    g.tx_source.add(source_desc(parent.clone(), 100));
+    g.tx_source.add(source_desc(child, 100));
+
+    let template = g
+        .new_block_template(
+            None,
+            &ExtraNonces {
+                coinbase: 0,
+                treasury: 0,
+            },
+        )
+        .expect("a height-101 template with a chained pair")
+        .expect("a template, not none");
+    let block = &template.block;
+    let idx = block
+        .transactions
+        .iter()
+        .position(|t| t.tx_hash() == child_hash)
+        .expect("the child is in the block");
+    assert_ne!(
+        block.transactions[idx].tx_in[0].block_index,
+        dcroxide_wire::NULL_BLOCK_INDEX,
+        "the fraud proof must be resolved above height 1 too",
+    );
+}

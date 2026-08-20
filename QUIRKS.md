@@ -258,3 +258,34 @@ Entry format:
   the decoder at all. Both targets now treat an encode failure as an
   acceptable outcome and assert only that a message which *does*
   re-encode decodes back unchanged.
+
+## QK-0011 — dcrd rewrites the tx source's own transactions at height 1
+
+- **Where:** dcrd `internal/mining/mining.go:2185-2221` (the chain-view
+  fraud-proof pass) and `:2205-2207` (`dcrutil.NewTxDeepTxIns`);
+  dcroxide-mining `generator.rs` `new_block_template`
+- **What:** dcrd deep-copies a candidate's inputs before filling in
+  their fraud proofs, so the mempool's stored transaction is left
+  alone. The height-1 escape is a `break` at the top of that loop's
+  body, and it fires *before* the copy — so at height 1 dcrd goes on to
+  the second pass holding the tx source's own `*dcrutil.Tx` and writes
+  `ValueIn`, `BlockHeight`, and `BlockIndex` straight into it. The
+  mempool's copy is mutated by template generation, and its cached
+  transaction hash no longer agrees with its bytes, because the fraud
+  proof fields are not covered by the hash.
+- **Why it does not matter to dcrd:** height 1 is unreachable on any
+  live network. Genesis pays a single zero-value output,
+  `createChainState` records no utxo entries for it, and zero-value
+  spends are rejected (`internal/blockchain/validate.go:3349-3354`), so
+  no chain arrives at height 1 with a spendable parent to chain from.
+- **What this port does:** clones unconditionally
+  (`generator.rs`'s copy ahead of both passes), so the source's
+  transactions are never written through. Reproducing dcrd's mutation
+  would be reproducing a bug, and one whose only effect is on state
+  dcrd itself never reaches.
+- **Pinned by:** `the_in_block_fraud_proof_pass_runs_at_height_one` and
+  `the_pair_still_resolves_above_height_one` in
+  `crates/dcroxide-mining/tests/newtemplate_vectors.rs`, which assert
+  the emitted template's inputs while leaving the source untouched.
+- **How found:** reviewing the height-1 guard, which wrapped both
+  fraud-proof passes here where dcrd guards only the first.
