@@ -2174,6 +2174,21 @@ impl ServerPeerHandler {
             sim_or_reg_net: self.ctx.sim_or_reg_net,
             inbound: peer.inbound(),
         };
+        // Gate BEFORE building the cache, as dcrd does (`OnGetAddr`
+        // returns on each of these before touching the address manager).
+        // `address_cache` is O(all known addresses) and runs under the
+        // global addrmgr mutex -- the same lock the outbound dialer and
+        // addr intake need -- so building it first let an unauthenticated
+        // peer flood `getaddr` and saturate that lock even though every
+        // one of those requests was going to be dropped.
+        //
+        // This must NOT set `addrs_sent`: the pinned decision core below
+        // re-reads it (server.rs:669), so mutating here would make every
+        // getaddr look already-answered and the node would stop replying
+        // at all. All state changes stay in the core.
+        if facts.sim_or_reg_net || !facts.inbound || self.addr_state.addrs_sent {
+            return;
+        }
         let addr_cache = {
             let mut mgr = self
                 .ctx

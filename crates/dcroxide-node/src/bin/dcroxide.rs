@@ -1496,7 +1496,7 @@ fn rpc_config(
         db: Box::new(dcroxide_node::indexes::NodeRpcDb::new(db)),
         filterer_v2: Box::new(filterer_v2),
         exists_addresser,
-        log_manager: Box::new(()),
+        log_manager: Box::new(dcroxide_node::rpcrun::NodeRpcLogManager),
         fee_estimator: Box::new(dcroxide_node::fees::NodeRpcFeeEstimator::new(fee_estimator)),
         block_templater,
         sanity_checker: Box::new(sanity_checker),

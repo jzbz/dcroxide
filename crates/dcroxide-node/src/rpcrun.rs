@@ -2751,6 +2751,34 @@ fn write_unauthorized<S: Write>(stream: &mut S) -> std::io::Result<()> {
     stream.flush()
 }
 
+/// The daemon's logging subsystems, for `debuglevel`.
+///
+/// `supported_subsystems` reached a trait default that called
+/// `unimplemented!()`, so `debuglevel show` -- an admin-credential method
+/// -- aborted the process under `panic = "abort"` (RVW-015). The list it
+/// needs has been in `logsubsys::SUBSYSTEM_IDS` all along; only the
+/// adapter was missing.
+///
+/// `parse_and_set_debug_levels` is deliberately NOT wired here. Setting
+/// levels at runtime needs mutable access to the process-wide levels, and
+/// `logging::LEVELS` is a `OnceLock` written once at startup
+/// (`logging.rs:18,23`) -- so wiring it means changing how the logger
+/// holds its state, not adding an adapter. Until that happens the trait
+/// default returns the unwired-seam error, which surfaces to the caller
+/// as an invalid-parameter response rather than stopping the node.
+pub struct NodeRpcLogManager;
+
+impl dcroxide_rpc::server::RpcLogManager for NodeRpcLogManager {
+    fn supported_subsystems(&self) -> Vec<String> {
+        let mut ids: Vec<String> = crate::logsubsys::SUBSYSTEM_IDS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
