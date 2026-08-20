@@ -411,10 +411,27 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
             .map_err(|e| dcroxide_peer::ReadError::io(e.to_string()))?;
         }
 
-        // A codec failure is a wire-protocol violation (dcrd's
-        // `wire.ErrorCode`), which the daemon bans on.
-        let (msg, consumed) = wire_read_message(&buf, self.pver, self.net)
-            .map_err(|e| dcroxide_peer::ReadError::wire(e.to_string()))?;
+        // A codec failure is a wire-protocol violation the daemon bans
+        // on -- but only when it carries a dcrd `wire.ErrorCode`.
+        // dcrd's `wire/message.go` returns `BtcDecode`'s error raw, so a
+        // truncated or malformed payload body surfaces as Go's
+        // `io.ErrUnexpectedEOF`, `errors.As(err, &errCode)` fails, and
+        // the peer is dropped without a ban.  Only dcrd's own
+        // `messageError` paths -- checksum, trailing bytes, the header
+        // checks, the coded limits inside the decoders -- ban.
+        //
+        // `kind_name()` is that test: it is empty exactly for
+        // `WireError::UnexpectedEof`, which is where both Go io errors
+        // land.  Over-banning here would cost an honest peer 24 hours
+        // over a decoder parity gap, and the handshake reads below are
+        // unauthenticated.
+        let (msg, consumed) = wire_read_message(&buf, self.pver, self.net).map_err(|e| {
+            if e.kind_name().is_empty() {
+                dcroxide_peer::ReadError::io(e.to_string())
+            } else {
+                dcroxide_peer::ReadError::wire(e.to_string())
+            }
+        })?;
         self.bytes_read = self.bytes_read.saturating_add(consumed as u64);
         if let Some(totals) = &self.net_totals {
             totals
@@ -489,6 +506,49 @@ mod tests {
         header[PAYLOAD_LEN_OFFSET..PAYLOAD_LEN_OFFSET + 4]
             .copy_from_slice(&payload_len.to_le_bytes());
         header
+    }
+
+    /// A payload that runs out mid-decode is an I/O failure, not a
+    /// bannable wire violation.
+    ///
+    /// dcrd's `wire/message.go` returns `BtcDecode`'s error raw, so a
+    /// short body surfaces as Go's `io.ErrUnexpectedEOF`,
+    /// `errors.As(err, &errCode)` finds no `wire.ErrorCode`, and
+    /// `serverPeer.OnRead` drops the peer without banning it.  The
+    /// framing here is entirely well-formed -- correct magic, known
+    /// command, honest length, matching checksum -- so the only thing
+    /// that can fail is the decoder running out of bytes, which is
+    /// exactly the case a from-scratch decoder is most likely to
+    /// disagree with dcrd about.  Banning on it would cost an honest
+    /// peer 24 hours, and the handshake reads are unauthenticated.
+    #[test]
+    fn a_payload_that_ends_mid_decode_is_io_not_a_wire_violation() {
+        // A `ping` is an 8-byte nonce; hand the decoder 4 of them.
+        let framed = dcroxide_wire::write_message(
+            &dcroxide_wire::Message::Ping(MsgPing {
+                nonce: 0x0123_4567_89ab_cdef,
+            }),
+            MAX_PROTOCOL_VERSION,
+            NET,
+        )
+        .expect("frame a ping");
+        let short_payload = &framed[MESSAGE_HEADER_SIZE..MESSAGE_HEADER_SIZE + 4];
+
+        let mut frame = framed[..MESSAGE_HEADER_SIZE].to_vec();
+        frame[PAYLOAD_LEN_OFFSET..PAYLOAD_LEN_OFFSET + 4]
+            .copy_from_slice(&(short_payload.len() as u32).to_le_bytes());
+        let checksum = dcroxide_chainhash::hash_b(short_payload);
+        frame[PAYLOAD_LEN_OFFSET + 4..MESSAGE_HEADER_SIZE].copy_from_slice(&checksum[..4]);
+        frame.extend_from_slice(short_payload);
+
+        let mut transport = WireTransport::new(Cursor::new(frame), MAX_PROTOCOL_VERSION, NET);
+        let err = transport
+            .read_message()
+            .expect_err("a short ping payload cannot decode");
+        assert!(
+            !err.wire_violation,
+            "a short body must not ban; dcrd surfaces it untyped: {err}",
+        );
     }
 
     /// The write deadline follows dcrd's formula exactly: a twenty-second

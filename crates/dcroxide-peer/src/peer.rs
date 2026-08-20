@@ -185,6 +185,16 @@ pub struct NegotiateError {
     pub kind: Option<NegotiateErrorKind>,
     /// The remote version message, when one was read.
     pub remote_version: Option<Box<MsgVersion>>,
+    /// Whether the failure was a wire-protocol violation (dcrd's
+    /// `wire.ErrorCode`) rather than an IO, timeout, or negotiation
+    /// failure.
+    ///
+    /// dcrd's `OnRead` listener runs on the version and verack reads
+    /// too (`peer.go:1912`, `:1983`, `:2012`), and `serverPeer.OnRead`
+    /// bans on any `wire.ErrorCode` with no handshake-state guard
+    /// (`server.go:1851-1857`).  Collapsing a read failure into an
+    /// untyped negotiation error loses that.
+    pub wire_violation: bool,
 }
 
 /// The typed handshake error kinds (dcrd 2.2 `peer/error.go`); each
@@ -221,11 +231,23 @@ impl NegotiateErrorKind {
 }
 
 impl NegotiateError {
+    /// A read failure during the handshake, preserving whether the
+    /// transport classified it as a wire-protocol violation.
+    fn from_read(err: &crate::ReadError) -> NegotiateError {
+        NegotiateError {
+            message: err.message.clone(),
+            kind: None,
+            remote_version: None,
+            wire_violation: err.wire_violation,
+        }
+    }
+
     fn new(message: &str) -> NegotiateError {
         NegotiateError {
             message: message.to_string(),
             kind: None,
             remote_version: None,
+            wire_violation: false,
         }
     }
 
@@ -235,6 +257,7 @@ impl NegotiateError {
             message: message.to_string(),
             kind: Some(kind),
             remote_version: None,
+            wire_violation: false,
         }
     }
 }
@@ -749,7 +772,7 @@ impl Peer {
         // Read their version message.
         let remote_msg = transport
             .read_message()
-            .map_err(|e| NegotiateError::new(&e.message))?;
+            .map_err(|e| NegotiateError::from_read(&e))?;
 
         // Disconnect clients if the first message is not a version
         // message.
@@ -812,6 +835,7 @@ impl Peer {
                 message: format!("protocol version must be {req_protocol_version} or greater"),
                 kind: Some(NegotiateErrorKind::ProtocolVerTooOld),
                 remote_version: Some(Box::new(msg)),
+                wire_violation: false,
             });
         }
 
@@ -957,7 +981,7 @@ impl Peer {
     ) -> Result<(), NegotiateError> {
         let remote_msg = transport
             .read_message()
-            .map_err(|e| NegotiateError::new(&e.message))?;
+            .map_err(|e| NegotiateError::from_read(&e))?;
         match remote_msg {
             Message::VerAck => {
                 self.verack_received = true;
@@ -983,7 +1007,7 @@ impl Peer {
         for _ in 0..MAX_NON_VER_ACKS {
             let msg = transport
                 .read_message()
-                .map_err(|e| NegotiateError::new(&e.message))?;
+                .map_err(|e| NegotiateError::from_read(&e))?;
             match msg {
                 Message::VerAck => {
                     self.verack_received = true;
