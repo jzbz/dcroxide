@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Container data structures mirroring dcrd's `container` packages at
-//! `release-v2.1.5`: the age-partitioned bloom filter used for P2P
+//! the age-partitioned bloom filter used for P2P
 //! relay deduplication and the generic LRU map and set with optional
 //! time-based expiration.
 //!

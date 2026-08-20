@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! The Decred chain hash type, mirroring dcrd's `chaincfg/chainhash` package
-//! (module version v1.0.5, as pinned by dcrd release-v2.1.5).
+//! (module version v1.0.5).
 //!
 //! A [`Hash`](struct@Hash) is 32 bytes stored in "natural" (internal) byte order and
 //! displayed/parsed as the hexadecimal string of the *byte-reversed* value,

@@ -3,9 +3,11 @@
 //! `452c1a6c`, the dcrd 2.2 campaign parity target):
 //! defaults, config file and command line precedence, and the full
 //! validation and derivation gauntlet with dcrd's exact error
-//! strings.  The command line front-end replicating go-flags syntax
-//! arrives with a later piece; the pipeline consumes already-split
-//! option assignments and reproduces go-flags' observable
+//! strings, over the go-flags v1.6.1 syntax layer in [`crate::flags`]
+//! reproducing the command line scanner, the INI grammar and the
+//! environment defaults.  `load_config` still accepts already-split
+//! option assignments, which is what the frozen pipeline vectors
+//! drive, and the pipeline reproduces go-flags' observable
 //! application order (the help pre-parse applies the command line
 //! before the config file, so repeated slice options accumulate
 //! command-line values first, then file values, then the

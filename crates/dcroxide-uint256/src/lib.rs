@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Fixed-precision unsigned 256-bit integer arithmetic, ported from dcrd's
-//! `math/uint256` package (module v1.0.2, as pinned by dcrd release-v2.1.5).
+//! `math/uint256` package (module v1.0.2).
 //!
 //! All operations are performed modulo 2^256 with "wrap around" semantics,
 //! exactly like dcrd. The consensus consumers are difficulty and cumulative

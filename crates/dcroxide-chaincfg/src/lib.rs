@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Decred network parameters, mirroring dcrd's `chaincfg` package (module
-//! v3.3.0, as pinned by dcrd release-v2.1.5): all four networks' genesis
+//! v3.3.0): all four networks' genesis
 //! blocks, consensus agenda deployments, block-one (premine) ledgers, and
 //! every constant the consensus and policy code consumes.
 //!

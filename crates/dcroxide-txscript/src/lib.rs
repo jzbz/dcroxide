@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! The Decred script engine, mirroring dcrd's `txscript` package (module
-//! v4.1.2, as pinned by dcrd release-v2.1.5): tokenizer, script numbers,
+//! v4.1.2): tokenizer, script numbers,
 //! the full 256-opcode set including Decred's stake and treasury opcodes,
 //! the execution engine with all flag combinations, strict-encoding
 //! checks, signature hashing, and the script builder.

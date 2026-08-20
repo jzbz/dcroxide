@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 // Vendored from dcr-rs (https://github.com/jzbz/dcr-rs) at commit fd32c1a,
 // ISC licensed. Known-answer vectors regenerated against dcrd
-// `crypto/blake256` v1.1.0 (the version pinned by dcrd release-v2.1.5) via
+// `crypto/blake256` v1.1.0 via
 // `tools/oracle`; see also `tests/oracle_differential.rs`.
 //
 // UPSTREAM DELTA, DELIBERATELY NOT TAKEN: dcr-rs later added a `Drop` impl

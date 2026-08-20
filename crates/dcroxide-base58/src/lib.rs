@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Modified base58 and Decred base58check, mirroring `decred/base58` at
-//! v1.0.6 (dcrd's pin at release-v2.1.5).
+//! v1.0.6.
 //!
 //! Behavioral quirks preserved deliberately: [`decode`] returns an *empty
 //! vector* — not an error — for both empty input and input containing any

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! The CPU miner's proof-of-work solve core, ported from dcrd's
-//! `internal/mining/cpuminer` package at release-v2.1.5: the
+//! `internal/mining/cpuminer` package: the
 //! `solveBlock` loop that searches the nonce and extra-nonce space of a
 //! block header for a hash below the target difficulty.
 //!

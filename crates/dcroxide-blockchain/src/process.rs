@@ -3408,6 +3408,11 @@ impl Chain {
         let parent = self.store.node(node).parent.expect("non-genesis parent");
         let errs = self.reorganize_chain(Some(parent), adjusted_time_unix, params);
         if !errs.is_empty() {
+            // dcrd flushes warn-only before returning here
+            // (`process.go:715-719`).  The roll-back already moved the
+            // tip and marked descendants, so the modified set holds
+            // work that a restart would otherwise redo.
+            self.flush_block_index_warn_only(params);
             return errs;
         }
         self.index
@@ -3657,7 +3662,13 @@ impl Chain {
                 "block data is not available",
             )];
         }
-        self.reorganize_chain(Some(new_best_node), adjusted_time_unix, params)
+        // dcrd flushes warn-only after the reorganization whether or
+        // not it succeeded, "as the only time the index will be
+        // modified is if the block failed to connect"
+        // (`chain.go:1453-1458`).
+        let errs = self.reorganize_chain(Some(new_best_node), adjusted_time_unix, params);
+        self.flush_block_index_warn_only(params);
+        errs
     }
 
     /// Fully validate that connecting the block template to the

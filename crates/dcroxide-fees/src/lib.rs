@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Smart fee estimation, ported from dcrd's `internal/fees` package
-//! at release-v2.1.5: the exponentially-bucketed confirmation
+//! the exponentially-bucketed confirmation
 //! tracking estimator behind the `estimatesmartfee` RPC, including
 //! its exact floating point accounting and the database row codec.
 //! The leveldb-backed persistence plumbing arrives with the daemon

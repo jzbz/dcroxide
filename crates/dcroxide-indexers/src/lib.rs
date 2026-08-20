@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Optional block chain indexes mirroring dcrd's
-//! `internal/blockchain/indexers` package at `release-v2.1.5`: the
+//! `internal/blockchain/indexers` package: the
 //! shared indexer machinery (the index tips bucket with its version
 //! and drop-marker keys, creation, upgrade, recovery, and the
 //! incremental drop paths), the index update subscriber with

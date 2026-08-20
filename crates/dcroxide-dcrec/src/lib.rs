@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Decred signature types, mirroring dcrd's `dcrec` packages at the pinned
-//! parity tag (`release-v2.1.5`; module `dcrec/secp256k1/v4` v4.4.0).
+//! module `dcrec/secp256k1/v4` v4.4.0.
 //!
 //! Decred scripts use three signature types; this crate implements all
 //! three: **type 0 (ECDSA-secp256k1)**, **type 1 (Ed25519)**, and **type 2

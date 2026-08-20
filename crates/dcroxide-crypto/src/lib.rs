@@ -2,7 +2,7 @@
 //! Decred cryptographic primitives for dcroxide.
 //!
 //! Mirrors dcrd's `crypto/*` packages at the pinned parity tag
-//! (`release-v2.1.5`). Provides BLAKE-256 (vendored) and RIPEMD-160
+//! Provides BLAKE-256 (vendored) and RIPEMD-160
 //! (RustCrypto-backed, mirroring dcrd's `crypto/ripemd160`); the CSPRNG
 //! wrapper lands later in Phase 1.
 //!

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! Daemon assembly, ported from dcrd's package main at
-//! release-v2.1.5: the network parameter groupings with their RPC
+//! the network parameter groupings with their RPC
 //! ports and the configuration pipeline (`config.go`) — defaults,
 //! config file and command line precedence, and the full validation
 //! and derivation gauntlet with dcrd's exact error strings.  The

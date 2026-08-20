@@ -77,12 +77,33 @@ const ORPHAN_EXPIRY_NANOS: i64 = 20 * 60 * 1_000_000_000;
 /// remote unbounded memory growth at line rate, so acceptance is
 /// capped per identity here.
 ///
-/// The bound is chosen well above honest use: a wallet sends one key
-/// exchange per session per epoch, and a pair request may not outlive
-/// roughly an hour of blocks (`max_expiry`), which is about 7 mainnet
-/// epochs and about 21 testnet epochs.  Capacity is a live-state
-/// limit, not a lifetime counter: it is released as soon as the key
-/// exchanges are expired or otherwise removed from the pool.
+/// The bound counts session *runs*, not epochs, and the headroom it
+/// leaves honest use is narrower than that distinction makes it sound.
+/// A wallet broadcasts one key exchange per run; dcrd's client forms a
+/// run on every epoch tick for as long as the pair request lives, and
+/// does so deliberately even when it already knows too few peers to
+/// mix, because "a run is still formed so that KEs can be broadcast"
+/// (`mixing/mixclient/client.go:942-945`); and it reruns inside the
+/// epoch, under a freshly derived session ID, on blame or when the
+/// agreed pair requests exceed the coinjoin limits.  A pair request may
+/// not outlive roughly an hour of blocks (`max_expiry`), which is about
+/// 6 mainnet epochs and about 20 testnet3 epochs, so that many runs are
+/// honest before a single rerun.
+///
+/// Nothing reclaims an abandoned run before the pair request itself
+/// goes away.  `removeSession`'s callers are `RemoveSession`,
+/// `RemoveConfirmedMixes`, `RemoveSpentPRs` and `removePR`
+/// (`mixing/mixpool/mixpool.go:621`, `:723`, `:738`, `:1354`); of those
+/// a daemon runs `RemoveSpentPRs` over every connected block
+/// (`internal/netsync/manager.go:1354-1355`, mirrored here) and
+/// `removePR` on height expiry, both of which retire the pair request
+/// and all its sessions together rather than reclaiming one abandoned
+/// run.  Capacity is a live-state limit, not a lifetime counter, but in
+/// practice it is released only when the pair request goes.
+///
+/// Refusal is not a ban: `rule_other` is not bannable, so the message
+/// is dropped and not relayed rather than costing the sender its
+/// connection.
 pub const MAX_KES_PER_IDENTITY: usize = 32;
 
 type IdPubKey = [u8; 33];

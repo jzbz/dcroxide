@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 //! StakeShuffle mixing primitives mirroring dcrd's `mixing` package
-//! at `release-v2.1.5`: message identities and signatures over the
+//! message identities and signatures over the
 //! wire mix messages, session ID derivation and validation, the
 //! DC-net finite field and vector math, the per-run ChaCha20 PRNG,
 //! UTXO ownership proofs, and the mixing limits.

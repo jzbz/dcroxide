@@ -111,6 +111,15 @@ fn sig_hash_witness_serialize_size(num_tx_ins: usize, sign_script: &[u8]) -> usi
     // 2) number of inputs varint
     // 3) per input: the signing script for the input being signed and a
     //    nil script (a single 0x00 varint byte) for the numTxIns-1 others.
+    // The saturation is load-bearing only for `num_tx_ins == 0`, which
+    // no transaction has: with `wrapping_sub` the count would go to
+    // `usize::MAX` and the sum would wrap back onto dcrd's answer
+    // anyway, but only because release builds have overflow checks off.
+    // Under `cargo test` -- where they are on -- `wrapping_sub` is fine
+    // and a plain `- 1` panics, so a "simplification" here is caught
+    // only if a zero-input case is exercised.  dcrd computes the same
+    // count in `int` arithmetic that cannot trap
+    // (`sighash.go:sigHashWitnessSerializeSize`).
     4 + var_int_serialize_size(num_tx_ins as u64)
         + num_tx_ins.saturating_sub(1)
         + var_int_serialize_size(sign_script.len() as u64)
