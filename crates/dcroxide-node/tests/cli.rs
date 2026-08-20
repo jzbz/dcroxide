@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A unique application data directory under the system temp directory,
 /// so a spawned daemon neither reads nor writes the real user
@@ -215,4 +215,73 @@ fn help_inside_a_short_cluster_requests_help() {
             "{cluster}: the version preempted help"
         );
     }
+}
+
+/// --dumpblockchain writes the flat file and refuses to start.
+///
+/// dcrd runs the dump inside `newServer`, after the index catch-up, and
+/// returns an error either way -- so nothing binds a listener and the
+/// exit is non-zero even when the dump succeeded
+/// (`server.go:4149-4157`). The option parsed and appeared in --help
+/// here while nothing read it, so asking for a one-shot offline dump
+/// started a normal node that dialled the network instead.
+///
+/// Bounded rather than using `run`, because the failure mode being
+/// guarded against is a daemon that ignores the flag and idles: a
+/// regression must fail here, not hang.
+///
+/// A fresh database is genesis-only and dcrd's loop starts at height 1,
+/// so the file is created and left empty.
+#[test]
+fn dumpblockchain_writes_the_file_and_refuses_to_start() {
+    let home = isolated_appdata("dumpchain");
+    let file = home.join("blocks.dat");
+    std::fs::create_dir_all(&home).expect("appdata");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dcroxide"))
+        .args(["--simnet", "--nolisten", "--norpc"])
+        .arg(format!("--appdata={}", home.display()))
+        .arg(format!("--dumpblockchain={}", file.display()))
+        .env_remove("DCRD_APPDATA")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dcroxide binary");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("wait") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = std::fs::remove_dir_all(&home);
+                panic!("the daemon kept running instead of dumping and exiting");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+
+    let out = child.wait_with_output().expect("output");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dumped = std::fs::metadata(&file).map(|m| m.len());
+    let _ = std::fs::remove_dir_all(&home);
+
+    assert_eq!(status.code(), Some(1), "log: {log}");
+    assert!(
+        log.contains("Successfully dumped the blockchain (0 blocks)"),
+        "log: {log}"
+    );
+    assert!(
+        log.contains("Unable to start server: closing after dumping blockchain"),
+        "log: {log}"
+    );
+    assert_eq!(
+        dumped.expect("the dump file must exist"),
+        0,
+        "a genesis-only chain dumps no records"
+    );
 }

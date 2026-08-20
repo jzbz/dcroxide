@@ -358,6 +358,35 @@ fn run(cfg: Config) -> ExitCode {
         None
     };
 
+    // The flat-file dump runs here and the daemon then stops: dcrd
+    // puts it inside `newServer` after the index catch-up and returns
+    // an error, so nothing binds a listener and the exit is non-zero
+    // even on success (`server.go:4149-4157`).
+    if !cfg.dump_blockchain.is_empty() {
+        let tip_height = {
+            let guard = chain.lock().expect("chain poisoned");
+            guard.best_snapshot().height
+        };
+        let dump = dcroxide_node::blockdb::dump_block_chain(
+            cfg.params.params.net.0,
+            &cfg.dump_blockchain,
+            tip_height,
+            &|height| {
+                chain
+                    .lock()
+                    .expect("chain poisoned")
+                    .block_by_height(height)
+            },
+            &mut |subsystem, line| dcroxide_node::logging::info(subsystem, &line),
+        );
+        if let Err(e) = dump {
+            log_error(&format!("Unable to start server: {e}"));
+            return ExitCode::FAILURE;
+        }
+        log_error("Unable to start server: closing after dumping blockchain");
+        return ExitCode::FAILURE;
+    }
+
     // Create the address manager and load any persisted peers (dcrd
     // `newServer`'s `addrmgr.New(cfg.DataDir)`).
     let mut addr_manager = AddrManager::new(Path::new(&cfg.data_dir));

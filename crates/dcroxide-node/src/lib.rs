@@ -12,6 +12,7 @@
 
 pub mod addblock;
 pub mod bgtemplate;
+pub mod blockdb;
 pub mod chainntfns;
 pub mod config;
 pub mod cpuminer;
