@@ -615,12 +615,9 @@ pub fn serve_websocket<S: Read + Write>(
         );
         return;
     }
-    let version_ok = head
-        .sec_websocket_version
-        .as_deref()
-        .map(|v| v.split(',').any(|t| t.trim() == "13"))
-        .unwrap_or(false);
-    if !version_ok {
+    // The version is a `1#token` header too, so gorilla scans every
+    // copy of it with the same grammar (`server.go:141`).
+    if !crate::rpcrun::header_has_token(&head.sec_websocket_version, "13") {
         let _ = write_handshake_error(&mut stream, "400 Bad Request", "Bad Request");
         return;
     }

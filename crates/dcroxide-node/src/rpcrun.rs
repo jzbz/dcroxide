@@ -2320,10 +2320,12 @@ pub struct HttpHead {
     /// Whether more than one `Transfer-Encoding` header arrived, which
     /// Go rejects outright; see `body_framing`.
     transfer_encoding_repeated: bool,
-    pub(crate) upgrade: Option<String>,
-    pub(crate) connection: Option<String>,
+    /// Every copy, in arrival order: gorilla's `tokenListContainsValue`
+    /// scans them all, so one cannot displace another.
+    pub(crate) upgrade: Vec<String>,
+    pub(crate) connection: Vec<String>,
     pub(crate) sec_websocket_key: Option<String>,
-    pub(crate) sec_websocket_version: Option<String>,
+    pub(crate) sec_websocket_version: Vec<String>,
     /// The `Origin` request header, consulted by the websocket
     /// same-origin guard (dcrd's `CheckOrigin`).
     origin: Option<String>,
@@ -2466,10 +2468,10 @@ fn read_http_head<S: Read + SocketTimeout>(
         content_length: 0,
         transfer_encoding: None,
         transfer_encoding_repeated: false,
-        upgrade: None,
-        connection: None,
+        upgrade: Vec::new(),
+        connection: Vec::new(),
         sec_websocket_key: None,
-        sec_websocket_version: None,
+        sec_websocket_version: Vec::new(),
         origin: None,
         host: None,
     };
@@ -2521,9 +2523,9 @@ fn read_http_head<S: Read + SocketTimeout>(
                     head.transfer_encoding = Some(value.to_string());
                 }
             } else if name.eq_ignore_ascii_case("upgrade") {
-                head.upgrade = Some(value.to_string());
+                head.upgrade.push(value.to_string());
             } else if name.eq_ignore_ascii_case("connection") {
-                head.connection = Some(value.to_string());
+                head.connection.push(value.to_string());
             } else if name.eq_ignore_ascii_case("sec-websocket-key") {
                 // `Header.Get` returns the first copy, and gorilla
                 // reads the key through it (`server.go:157`).
@@ -2531,7 +2533,7 @@ fn read_http_head<S: Read + SocketTimeout>(
                     head.sec_websocket_key = Some(value.to_string());
                 }
             } else if name.eq_ignore_ascii_case("sec-websocket-version") {
-                head.sec_websocket_version = Some(value.to_string());
+                head.sec_websocket_version.push(value.to_string());
             } else if name.eq_ignore_ascii_case("origin") {
                 // dcrd's `CheckOrigin` reads `r.Header["Origin"][0]`
                 // (`rpcserver.go:5975-5982`), so a decoy first copy is
@@ -2619,13 +2621,65 @@ fn parse_content_length(value: &str) -> Result<usize, &'static str> {
     usize::try_from(parsed).map_err(|_| "bad content length")
 }
 
-/// Whether a comma-separated header lists a token, the test gorilla
-/// makes with `tokenListContainsValue` (`server.go:129`, `:133`).
-pub(crate) fn header_has_token(header: &Option<String>, token: &str) -> bool {
-    header
-        .as_deref()
-        .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
-        .unwrap_or(false)
+/// Whether a `1#token` header lists a token, the test gorilla makes
+/// with `tokenListContainsValue` (`util.go:202-225`).
+///
+/// This is not "split on commas and trim".  gorilla walks *every* copy
+/// of the header, and within a copy it takes an RFC 2616 token, skips
+/// linear whitespace, and then demands a comma or the end of the
+/// value -- anything else abandons that copy entirely, as does an empty
+/// leading token.  So `keep-alive;q=1, upgrade` does not list
+/// `upgrade`, and neither does `,upgrade`, while a second
+/// `Connection:` line naming it does.  A looser reading upgrades
+/// requests dcrd refuses, which is the direction that matters: a header
+/// an intermediary considers malformed would still open a websocket.
+pub(crate) fn header_has_token(values: &[String], token: &str) -> bool {
+    'values: for value in values {
+        let mut rest = value.as_bytes();
+        loop {
+            rest = skip_linear_space(rest);
+            let end = rest
+                .iter()
+                .position(|b| !is_token_octet(*b))
+                .unwrap_or(rest.len());
+            let (found, tail) = rest.split_at(end);
+            if found.is_empty() {
+                continue 'values;
+            }
+            let tail = skip_linear_space(tail);
+            if !tail.is_empty() && tail[0] != b',' {
+                continue 'values;
+            }
+            if found.eq_ignore_ascii_case(token.as_bytes()) {
+                return true;
+            }
+            let Some((_, after_comma)) = tail.split_first() else {
+                continue 'values;
+            };
+            rest = after_comma;
+        }
+    }
+    false
+}
+
+/// Drop leading RFC 2616 linear whitespace (gorilla's `skipSpace`,
+/// `util.go:117-125`): spaces and tabs only.
+fn skip_linear_space(s: &[u8]) -> &[u8] {
+    let i = s
+        .iter()
+        .position(|b| *b != b' ' && *b != b'\t')
+        .unwrap_or(s.len());
+    &s[i..]
+}
+
+/// gorilla's `isTokenOctet` table (`util.go:19-113`): the 77 printable
+/// ASCII bytes that are neither control characters nor RFC 2616
+/// separators.
+fn is_token_octet(b: u8) -> bool {
+    matches!(b,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+        | b'^' | b'_' | b'`' | b'|' | b'~'
+        | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
 }
 
 /// Whether a websocket upgrade's `Origin` header is allowed, mirroring
@@ -3138,12 +3192,60 @@ mod tests {
             content_length: 0,
             transfer_encoding: None,
             transfer_encoding_repeated: false,
-            upgrade: None,
-            connection: None,
+            upgrade: Vec::new(),
+            connection: Vec::new(),
             sec_websocket_key: None,
-            sec_websocket_version: None,
+            sec_websocket_version: Vec::new(),
             origin: origin.map(str::to_string),
             host: host.map(str::to_string),
+        }
+    }
+
+    /// `header_has_token` against gorilla's own `tokenListContainsValue`.
+    ///
+    /// Every expectation below was produced by running the real
+    /// `gorilla/websocket` v1.5.1 `Upgrader` over these exact header
+    /// sets, not derived from reading its source.  The interesting rows
+    /// are the ones a comma-split-and-trim reading gets wrong in the
+    /// permissive direction -- `keep-alive;q=1, upgrade` and
+    /// `,upgrade` both look like they list the token and do not -- and
+    /// the two multi-copy rows, which it gets wrong in the other
+    /// direction by keeping only the last copy.
+    #[test]
+    fn header_tokens_match_gorillas_grammar() {
+        let cases: &[(&[&str], bool)] = &[
+            (&["upgrade"], true),
+            (&["Upgrade"], true),
+            (&["UPGRADE"], true),
+            (&["keep-alive, upgrade"], true),
+            (&["keep-alive,upgrade"], true),
+            // A parameter on an earlier token abandons the whole value.
+            (&["keep-alive;q=1, upgrade"], false),
+            // An empty leading token does the same.
+            (&[",upgrade"], false),
+            (&["upgrade;"], false),
+            (&[" upgrade "], true),
+            (&["\tupgrade"], true),
+            (&["upgrade,"], true),
+            (&["keep-alive"], false),
+            (&[""], false),
+            (&["up grade"], false),
+            (&["\"upgrade\""], false),
+            (&["upgrade extra"], false),
+            // Both copies are scanned, whichever carries the token.
+            (&["keep-alive", "upgrade"], true),
+            (&["upgrade", "keep-alive"], true),
+            (&["a,b,c,upgrade"], true),
+            (&["a, b ,  upgrade"], true),
+            (&["upgra de"], false),
+        ];
+        for (values, expected) in cases {
+            let owned: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+            assert_eq!(
+                header_has_token(&owned, "upgrade"),
+                *expected,
+                "gorilla answers {expected} for {values:?}"
+            );
         }
     }
 

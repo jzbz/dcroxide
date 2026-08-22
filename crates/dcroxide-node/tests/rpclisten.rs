@@ -1686,6 +1686,42 @@ fn the_websocket_route_answers_gorillas_statuses() {
     listener.shutdown();
 }
 
+/// End to end over the wire: the framing headers a websocket handshake
+/// is judged by are `1#token` lists, so every copy counts and a
+/// parameter on an earlier token voids the value it sits in.  Verified
+/// against the real `gorilla/websocket` v1.5.1 `Upgrader`; the unit
+/// test `header_tokens_match_gorillas_grammar` carries the full table.
+#[test]
+fn upgrade_tokens_are_read_across_every_copy() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+    let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
+
+    // The token is in the first of two copies; a reader that kept only
+    // the last would refuse this handshake gorilla completes.
+    let response = send_raw(
+        port,
+        &format!("GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nConnection: keep-alive\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n"),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 101"),
+        "a token in an earlier copy still counts: {response:?}"
+    );
+
+    // A parameter on the earlier token abandons the value, so this one
+    // does not list `upgrade` at all -- gorilla answers 400 where a
+    // split-on-commas reading would upgrade.
+    let response = send_raw(
+        port,
+        &format!("GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: keep-alive;q=1, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n"),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request"),
+        "a parameterised value does not list the token: {response:?}"
+    );
+
+    listener.shutdown();
+}
+
 /// A websocket handshake that declares a request body is refused, and
 /// the connection is dropped without an answer.  gorilla inspects the
 /// hijacked reader and closes outright on any byte that arrived with
