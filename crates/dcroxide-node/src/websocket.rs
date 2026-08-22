@@ -595,18 +595,45 @@ pub fn serve_websocket<S: Read + Write>(
     ntfn: &NodeNtfnMgr,
     shutdown: &std::sync::atomic::AtomicBool,
 ) {
-    // Validate the remaining upgrade requirements (gorilla's checks
-    // after the method and header tokens): version 13 and a 16-byte
-    // base64 key.
+    // gorilla's `Upgrade` runs its checks in one fixed order
+    // (`gorilla/websocket@v1.5.1 server.go:126-191`), and each failure
+    // goes out through `returnError`, whose body is the status text and
+    // whose one extra header is the version hint.  The order is
+    // observable: a request wrong in two of these ways gets the answer
+    // for whichever is tested first.
+    if !crate::rpcrun::header_has_token(&head.connection, "upgrade")
+        || !crate::rpcrun::header_has_token(&head.upgrade, "websocket")
+    {
+        let _ = write_handshake_error(&mut stream, "400 Bad Request", "Bad Request");
+        return;
+    }
+    if !head.method.eq_ignore_ascii_case("GET") {
+        let _ = write_handshake_error(
+            &mut stream,
+            "405 Method Not Allowed",
+            "Method Not Allowed",
+        );
+        return;
+    }
     let version_ok = head
         .sec_websocket_version
         .as_deref()
         .map(|v| v.split(',').any(|t| t.trim() == "13"))
         .unwrap_or(false);
+    if !version_ok {
+        let _ = write_handshake_error(&mut stream, "400 Bad Request", "Bad Request");
+        return;
+    }
+    // The origin check sits between the version and the key, and dcrd
+    // supplies its own (`rpcserver.go:5972-6007`).
+    if !crate::rpcrun::check_origin(head) {
+        let _ = write_handshake_error(&mut stream, "403 Forbidden", "Forbidden");
+        return;
+    }
     let key = match &head.sec_websocket_key {
-        Some(key) if version_ok && valid_ws_key(key) => key.clone(),
+        Some(key) if valid_ws_key(key) => key.clone(),
         _ => {
-            let _ = write_bad_request(&mut stream);
+            let _ = write_handshake_error(&mut stream, "400 Bad Request", "Bad Request");
             return;
         }
     };
@@ -953,16 +980,24 @@ fn valid_ws_key(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
-/// Write a bare 400 for a rejected upgrade (gorilla's handshake error
-/// response, with the version hint every failure carries).
-fn write_bad_request<S: Write>(stream: &mut S) -> std::io::Result<()> {
-    let body = b"Bad Request";
+/// Answer a rejected upgrade the way gorilla's `returnError` does
+/// (`server.go:83-93`): the version hint, then `http.Error` with the
+/// status text as the message -- so text/plain, the sniffing opt-out,
+/// and the trailing newline `Fprintln` adds.  The reason gorilla builds
+/// goes into the error it returns to the caller, never into the
+/// response, and dcrd only logs it (`rpcserver.go:6010-6015`).
+fn write_handshake_error<S: Write>(
+    stream: &mut S,
+    status: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let body = format!("{body}\n");
     let header = format!(
-        "HTTP/1.1 400 Bad Request\r\nSec-WebSocket-Version: 13\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nSec-Websocket-Version: 13\r\nContent-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes())?;
-    stream.write_all(body)?;
+    stream.write_all(body.as_bytes())?;
     stream.flush()
 }
 

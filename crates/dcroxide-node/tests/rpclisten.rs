@@ -1481,6 +1481,211 @@ fn an_undelivered_body_does_not_swallow_the_401() {
     listener.shutdown();
 }
 
+/// Every error dcrd's connection loop writes carries `errorHeaders`
+/// (`net/http/server.go:2064`) -- text/plain, no `Content-Length` --
+/// and a body that is the bare status text, never the server's own
+/// diagnosis.  Answering these as `application/json` mislabels them for
+/// every client that inspects the type.
+#[test]
+fn connection_level_errors_are_go_shaped() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+
+    // A conflicting Content-Length is Go's plain 400.
+    let response = send_raw(
+        port,
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nContent-Length: 7\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request"),
+        "conflicting lengths are 400: {response:?}"
+    );
+    assert!(
+        response.contains("Content-Type: text/plain; charset=utf-8"),
+        "the error is text/plain, not JSON: {response:?}"
+    );
+    assert!(
+        !response.contains("Content-Length:"),
+        "errorHeaders declares no length: {response:?}"
+    );
+    assert!(
+        response.ends_with("400 Bad Request"),
+        "the body is the status text, with no reason echoed: {response:?}"
+    );
+
+    // A head past the cap is 431, not 400 (`server.go:2067-2076`).
+    // The *shape* is Go's; the threshold is not -- dcroxide caps at
+    // `MAX_HEAD_SIZE` (8 KiB) where Go's default is a megabyte, so a
+    // 9000-byte head that dcrd serves 200 is refused here.  That is a
+    // deliberate divergence, recorded in PARITY.md.
+    let long = "x".repeat(9000);
+    let response = send_raw(
+        port,
+        &format!("POST / HTTP/1.1\r\nHost: localhost\r\nX-Pad: {long}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 431 Request Header Fields Too Large"),
+        "an oversized head is 431: {response:?}"
+    );
+
+    // A version Go parses but will not serve is 505, with the reason
+    // folded into the status line as `statusError` renders it.
+    let response = send_raw(
+        port,
+        "POST / HTTP/2.0\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 505 HTTP Version Not Supported: unsupported protocol version"),
+        "an unservable version is 505: {response:?}"
+    );
+
+    // An unparseable version is a plain 400, like any malformed head.
+    let response = send_raw(
+        port,
+        "POST / HTTP/1.10\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request"),
+        "a malformed version is 400: {response:?}"
+    );
+
+    listener.shutdown();
+}
+
+/// Go's silence is narrower than "the client went away".  A close
+/// before any byte arrives is `io.EOF`, which `isCommonNetReadError`
+/// forgives (`net/http/server.go:1915-1926`, used at `:2090-2091`), but
+/// a close *after* the head has started is rewritten to
+/// `io.ErrUnexpectedEOF` (`request.go:1108-1112`), which is not in that
+/// set and falls through to the bare 400.
+#[test]
+fn only_a_connection_that_never_spoke_goes_unanswered() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+
+    // Started, then cut off: answered.
+    let response = send_raw(port, "POST / HTTP/1.1\r\nHost: localhost\r\n");
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request"),
+        "a truncated head is still answered: {response:?}"
+    );
+
+    // Never spoke: silence.
+    let response = send_raw(port, "");
+    assert!(
+        response.is_empty(),
+        "a connection that sent nothing gets no reply: {response:?}"
+    );
+
+    listener.shutdown();
+}
+
+/// The transfer encoding is parsed before the protocol version
+/// (`readTransfer` inside `readRequest`, ahead of the version gate at
+/// `net/http/server.go:1062`), so a head wrong in both ways answers 501
+/// rather than 505.
+#[test]
+fn transfer_encoding_outranks_the_version_gate() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+
+    let response = send_raw(
+        port,
+        "POST / HTTP/2.0\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 501 Not Implemented"),
+        "the unreadable encoding decides, not the version: {response:?}"
+    );
+
+    listener.shutdown();
+}
+
+/// An HTTP/1.1 request must name a host, and Go renders the reason into
+/// the status line as well as the body (`server.go:1069-1073` through
+/// the `statusError` arm at `:2094-2096`).  A second Host is refused
+/// outright (`request.go:1160-1162`).
+#[test]
+fn the_host_header_is_required_and_singular() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+
+    let response = send_raw(port, "POST / HTTP/1.1\r\nConnection: close\r\n\r\n");
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request: missing required Host header"),
+        "a missing host is named in the status line: {response:?}"
+    );
+    assert!(
+        response.ends_with("400 Bad Request: missing required Host header"),
+        "and repeated as the body: {response:?}"
+    );
+
+    let response = send_raw(
+        port,
+        "POST / HTTP/1.1\r\nHost: localhost\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request"),
+        "a second host is refused: {response:?}"
+    );
+
+    listener.shutdown();
+}
+
+/// dcrd registers no method check on `/` (`rpcserver.go:5936-5958`), so
+/// a GET is authenticated and dispatched like any other request rather
+/// than being turned away with a 405 dcrd never sends.
+#[test]
+fn the_rpc_endpoint_has_no_method_check() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+
+    let response = send_raw(
+        port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 401"),
+        "an unauthenticated GET is refused by auth, not by method: {response:?}"
+    );
+    assert!(
+        response.contains("X-Content-Type-Options: nosniff"),
+        "http.Error sets the sniffing opt-out: {response:?}"
+    );
+
+    listener.shutdown();
+}
+
+/// A `/ws` request that is not a valid upgrade belongs to gorilla, and
+/// gorilla's order decides the answer: the `Connection`/`Upgrade`
+/// tokens first, then the method (`server.go:129-140`).
+#[test]
+fn the_websocket_route_answers_gorillas_statuses() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+    let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
+
+    // No upgrade tokens: 400 before the method is ever looked at.
+    let response = send_raw(
+        port,
+        &format!("GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request"),
+        "a bare GET /ws is gorilla's 400: {response:?}"
+    );
+    assert!(
+        response.contains("Sec-Websocket-Version: 13"),
+        "returnError carries the version hint: {response:?}"
+    );
+
+    // Tokens present but the wrong method: 405.
+    let response = send_raw(
+        port,
+        &format!("POST /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 405 Method Not Allowed"),
+        "a non-GET upgrade is 405: {response:?}"
+    );
+
+    listener.shutdown();
+}
+
 /// A websocket handshake that declares a request body is refused, and
 /// the connection is dropped without an answer.  gorilla inspects the
 /// hijacked reader and closes outright on any byte that arrived with

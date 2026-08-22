@@ -2312,7 +2312,7 @@ fn drain_declared_body<S: Read + SocketTimeout>(
 /// The parsed head of an HTTP/1.1 request: the request line pieces and
 /// the headers the RPC and websocket endpoints consult.
 pub struct HttpHead {
-    method: String,
+    pub(crate) method: String,
     path: String,
     authorization: Option<String>,
     content_length: usize,
@@ -2320,8 +2320,8 @@ pub struct HttpHead {
     /// Whether more than one `Transfer-Encoding` header arrived, which
     /// Go rejects outright; see `body_framing`.
     transfer_encoding_repeated: bool,
-    upgrade: Option<String>,
-    connection: Option<String>,
+    pub(crate) upgrade: Option<String>,
+    pub(crate) connection: Option<String>,
     pub(crate) sec_websocket_key: Option<String>,
     pub(crate) sec_websocket_version: Option<String>,
     /// The `Origin` request header, consulted by the websocket
@@ -2339,30 +2339,125 @@ const MAX_HEAD_SIZE: usize = 1 << 13;
 /// terminator, leaving the stream positioned exactly at the body (or
 /// at the first websocket frame), so the websocket path never
 /// over-reads into frame data.
+/// Why a request head could not be served, and therefore which answer
+/// Go's connection loop gives (`net/http/server.go:2062-2101`).
+enum HeadError {
+    /// Nothing is written at all.  Go's silent set is narrow:
+    /// `isCommonNetReadError` (`server.go:1915-1926`, used at
+    /// `:2090-2091`) forgives `io.EOF` and read timeouts, but a close
+    /// *after* the head has started is rewritten to
+    /// `io.ErrUnexpectedEOF` (`request.go:1108-1112`) and falls through
+    /// to the bare 400.  So only a connection that never sent a byte,
+    /// or one that ran out the deadline, goes unanswered.
+    Unanswerable,
+    /// The head outgrew its limit: Go's `errTooLarge` answers 431
+    /// (`server.go:2067-2076`).
+    TooLarge,
+    /// A transfer encoding the server will not read, answered 501
+    /// (`server.go:2078-2088`).  Go decides this inside `readTransfer`,
+    /// before it looks at the protocol version, so a head that is both
+    /// mis-framed and mis-versioned is a 501 rather than a 505.
+    UnsupportedTransferEncoding,
+    /// Go's `statusError`: the reason is rendered into the status line
+    /// *and* repeated as the body (`server.go:2094-2096`).
+    Status(&'static str, &'static str),
+    /// Anything else, which Go answers with a bare 400 carrying no
+    /// detail at all (`server.go:2098-2099`).
+    Malformed,
+}
+
+/// How a single head byte read ended.  The distinction decides whether
+/// the client is answered at all; see [`HeadError::Unanswerable`].
+enum ByteRead {
+    Ok,
+    /// The peer closed, or the read failed outright.
+    Closed,
+    /// The handshake deadline elapsed with nothing more to read.
+    TimedOut,
+}
+
+/// Read one byte of the request head, reporting *how* it ended rather
+/// than just that it did.
+fn read_head_byte<S: Read + SocketTimeout>(
+    stream: &mut S,
+    byte: &mut [u8; 1],
+    deadline: Instant,
+) -> ByteRead {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return ByteRead::TimedOut;
+        }
+        stream.set_socket_read_timeout(Some(remaining.min(RPC_READ_POLL_INTERVAL)));
+        match stream.read(byte) {
+            Ok(0) => return ByteRead::Closed,
+            Ok(_) => return ByteRead::Ok,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => return ByteRead::Closed,
+        }
+    }
+}
+
+/// Parse an HTTP version token exactly as Go's `ParseHTTPVersion` does
+/// (`net/http/request.go:827-852`): the two common spellings, else
+/// `HTTP/X.Y` with a single digit on each side, so `HTTP/1.10` is
+/// malformed rather than 1.10.
+fn parse_http_version(text: &str) -> Option<(u32, u32)> {
+    match text {
+        "HTTP/1.1" => return Some((1, 1)),
+        "HTTP/1.0" => return Some((1, 0)),
+        _ => {}
+    }
+    let (major, minor) = text.strip_prefix("HTTP/")?.split_once('.')?;
+    if major.len() != 1 || minor.len() != 1 {
+        return None;
+    }
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
 fn read_http_head<S: Read + SocketTimeout>(
     stream: &mut S,
     deadline: Instant,
-) -> Result<HttpHead, &'static str> {
+) -> Result<HttpHead, HeadError> {
     let mut raw = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        if !read_exact_by_deadline(stream, &mut byte, deadline) {
-            return Err("read failure");
+        match read_head_byte(stream, &mut byte, deadline) {
+            ByteRead::Ok => {}
+            // Whatever arrived, running out the clock is Go's silent
+            // timeout branch.
+            ByteRead::TimedOut => return Err(HeadError::Unanswerable),
+            // A connection that closed before sending anything is Go's
+            // bare `io.EOF`; once a byte has arrived the same close is
+            // `io.ErrUnexpectedEOF`, which Go answers 400.
+            ByteRead::Closed if raw.is_empty() => return Err(HeadError::Unanswerable),
+            ByteRead::Closed => return Err(HeadError::Malformed),
         }
         raw.push(byte[0]);
         if raw.ends_with(b"\r\n\r\n") {
             break;
         }
         if raw.len() > MAX_HEAD_SIZE {
-            return Err("request head too large");
+            return Err(HeadError::TooLarge);
         }
     }
-    let text = core::str::from_utf8(&raw).map_err(|_| "invalid head")?;
+    let text = core::str::from_utf8(&raw).map_err(|_| HeadError::Malformed)?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split(' ');
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("").to_string();
+    // Go parses the version while splitting the request line, and an
+    // unparseable one is a plain 400 like any other malformed head.
+    let Some(version) = parse_http_version(parts.next().unwrap_or("")) else {
+        return Err(HeadError::Malformed);
+    };
 
     let mut head = HttpHead {
         method,
@@ -2385,6 +2480,7 @@ fn read_http_head<S: Read + SocketTimeout>(
     // therefore held as the first spelling seen and compared against
     // every later copy (`net/http/transfer.go` `fixLength`).
     let mut content_length: Option<&str> = None;
+    let mut content_length_conflict = false;
     for line in lines {
         if line.is_empty() {
             break;
@@ -2409,9 +2505,10 @@ fn read_http_head<S: Read + SocketTimeout>(
                 // numbers instead would accept a pair dcrd rejects.
                 match content_length {
                     None => content_length = Some(value),
-                    Some(first) if first != value => {
-                        return Err("multiple content lengths");
-                    }
+                    // Recorded rather than returned: `readTransfer`
+                    // parses the transfer encoding before it calls
+                    // `fixLength`, so a 501 outranks this 400.
+                    Some(first) if first != value => content_length_conflict = true,
                     Some(_) => {}
                 }
             } else if name.eq_ignore_ascii_case("transfer-encoding") {
@@ -2428,18 +2525,65 @@ fn read_http_head<S: Read + SocketTimeout>(
             } else if name.eq_ignore_ascii_case("connection") {
                 head.connection = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("sec-websocket-key") {
-                head.sec_websocket_key = Some(value.to_string());
+                // `Header.Get` returns the first copy, and gorilla
+                // reads the key through it (`server.go:157`).
+                if head.sec_websocket_key.is_none() {
+                    head.sec_websocket_key = Some(value.to_string());
+                }
             } else if name.eq_ignore_ascii_case("sec-websocket-version") {
                 head.sec_websocket_version = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("origin") {
-                head.origin = Some(value.to_string());
+                // dcrd's `CheckOrigin` reads `r.Header["Origin"][0]`
+                // (`rpcserver.go:5975-5982`), so a decoy first copy is
+                // the one that decides -- taking the last would let a
+                // cross-origin page slip a permitted value in behind
+                // it and open a websocket dcrd answers 403 to.
+                if head.origin.is_none() {
+                    head.origin = Some(value.to_string());
+                }
             } else if name.eq_ignore_ascii_case("host") {
+                // Go refuses a second Host outright
+                // (`request.go:1160-1162`).
+                if head.host.is_some() {
+                    return Err(HeadError::Malformed);
+                }
                 head.host = Some(value.to_string());
             }
         }
     }
+    // From here the order is Go's, and it is observable whenever a head
+    // is wrong in more than one way: `readRequest` runs `readTransfer`
+    // -- transfer encoding, then content length -- before the version
+    // gate at `server.go:1062`, and the Host checks after it at
+    // `:1069-1073`.
+    if matches!(body_framing(&head), BodyFraming::Unsupported) {
+        return Err(HeadError::UnsupportedTransferEncoding);
+    }
+    if content_length_conflict {
+        return Err(HeadError::Malformed);
+    }
     if let Some(value) = content_length {
-        head.content_length = parse_content_length(value)?;
+        head.content_length = parse_content_length(value).map_err(|_| HeadError::Malformed)?;
+    }
+    // Every HTTP/1.x is served; the one exception past that is the
+    // `PRI * HTTP/2.0` preface, which Go admits so a handler can run
+    // its own upgrade.
+    match version {
+        (1, _) => {}
+        (2, 0) if head.method == "PRI" && head.path == "*" => {}
+        _ => {
+            return Err(HeadError::Status(
+                "505 HTTP Version Not Supported",
+                "unsupported protocol version",
+            ));
+        }
+    }
+    // HTTP/1.1 must name a host; HTTP/1.0 need not.
+    if version >= (1, 1) && head.host.is_none() && head.method != "CONNECT" {
+        return Err(HeadError::Status(
+            "400 Bad Request",
+            "missing required Host header",
+        ));
     }
     Ok(head)
 }
@@ -2475,19 +2619,13 @@ fn parse_content_length(value: &str) -> Result<usize, &'static str> {
     usize::try_from(parsed).map_err(|_| "bad content length")
 }
 
-/// Whether the request head is a websocket upgrade for the `/ws`
-/// endpoint (dcrd serves websockets only at the dedicated path).
-fn is_websocket_upgrade(head: &HttpHead) -> bool {
-    let has_token = |header: &Option<String>, token: &str| {
-        header
-            .as_deref()
-            .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
-            .unwrap_or(false)
-    };
-    head.path == "/ws"
-        && head.method.eq_ignore_ascii_case("GET")
-        && has_token(&head.connection, "upgrade")
-        && has_token(&head.upgrade, "websocket")
+/// Whether a comma-separated header lists a token, the test gorilla
+/// makes with `tokenListContainsValue` (`server.go:129`, `:133`).
+pub(crate) fn header_has_token(header: &Option<String>, token: &str) -> bool {
+    header
+        .as_deref()
+        .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
+        .unwrap_or(false)
 }
 
 /// Whether a websocket upgrade's `Origin` header is allowed, mirroring
@@ -2498,7 +2636,7 @@ fn is_websocket_upgrade(head: &HttpHead) -> bool {
 /// port and folding ASCII case; a malformed origin is rejected.  This
 /// blocks a cross-origin web page (or a DNS-rebinding attack against a
 /// `--notls` localhost RPC) from opening a websocket.
-fn check_origin(head: &HttpHead) -> bool {
+pub(crate) fn check_origin(head: &HttpHead) -> bool {
     let Some(origin) = head.origin.as_deref() else {
         return true;
     };
@@ -2528,7 +2666,7 @@ fn check_origin(head: &HttpHead) -> bool {
 /// and falling back to the whole value when it does not parse as a
 /// host-port pair (dcrd's `if host, _, err := net.SplitHostPort(...);
 /// err == nil` fallback).
-fn strip_port(host_port: &str) -> String {
+pub(crate) fn strip_port(host_port: &str) -> String {
     crate::gostd::split_host_port(host_port)
         .map(|(host, _)| host)
         .unwrap_or_else(|_| host_port.to_string())
@@ -2560,28 +2698,46 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     let deadline = now.checked_add(RPC_AUTH_TIMEOUT).unwrap_or(now);
     let head = match read_http_head(&mut stream, deadline) {
         Ok(head) => head,
-        Err(reason) => {
-            let _ = write_response(&mut stream, "400 Bad Request", reason.as_bytes());
+        // Go says nothing when the client simply went away, and never
+        // echoes a reason for the rest: the 400 body is the literal
+        // status text.
+        Err(HeadError::Unanswerable) => return,
+        Err(HeadError::TooLarge) => {
+            let too_large = "431 Request Header Fields Too Large";
+            let _ = write_protocol_error(&mut stream, too_large, too_large);
+            return;
+        }
+        Err(HeadError::UnsupportedTransferEncoding) => {
+            let _ = write_protocol_error(
+                &mut stream,
+                "501 Not Implemented",
+                "Unsupported transfer encoding",
+            );
+            return;
+        }
+        // Go folds the reason into the status line as well as the body
+        // for a `statusError` (`server.go:2095`).
+        Err(HeadError::Status(status, reason)) => {
+            let rendered = format!("{status}: {reason}");
+            let _ = write_protocol_error(&mut stream, &rendered, &rendered);
+            return;
+        }
+        Err(HeadError::Malformed) => {
+            let _ = write_protocol_error(&mut stream, "400 Bad Request", "400 Bad Request");
             return;
         }
     };
 
-    // A transfer encoding the server cannot read fails the request
-    // before any routing (Go's `net/http` answers 501 Unsupported
-    // Transfer-Encoding while reading the request).
-    if matches!(body_framing(&head), BodyFraming::Unsupported) {
-        let _ = write_response(
-            &mut stream,
-            "501 Not Implemented",
-            b"Unsupported transfer encoding",
-        );
-        return;
-    }
-
-    // The websocket upgrade allows an unauthenticated connection that
-    // must authenticate in-band (dcrd `checkAuth` with `require =
-    // false`); serve it before touching a body.
-    if is_websocket_upgrade(&head) {
+    // dcrd's mux sends `/ws` to the websocket handler and everything
+    // else to the JSON-RPC handler (`rpcserver.go:5936`, `:5961`), so
+    // the path alone decides here too.  A `/ws` request that is not a
+    // valid upgrade is gorilla's to refuse -- it must not fall through
+    // to the RPC endpoint, which would answer a different status for
+    // the same request dcrd hands to `Upgrade`.
+    if head.path == "/ws" {
+        // The upgrade allows an unauthenticated connection that must
+        // authenticate in-band (dcrd `checkAuth` with `require =
+        // false`), and it runs before `Upgrade` does.
         let auth = { server.check_auth(head.authorization.as_deref(), false) };
         let (authed, is_admin) = match auth {
             Ok(auth) => auth,
@@ -2590,16 +2746,6 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
                 return;
             }
         };
-        // Reject a cross-origin upgrade (dcrd's `CheckOrigin`), after the
-        // auth 401 so the ordering matches dcrd's auth-then-origin.
-        if !check_origin(&head) {
-            let _ = write_response(
-                &mut stream,
-                "403 Forbidden",
-                b"websocket: request origin not allowed",
-            );
-            return;
-        }
         // Drop to the notification poll interval: an idle read wakes
         // the serving loop to write queued notifications, and dcrd
         // websocket connections have no read deadline, so the 30
@@ -2620,10 +2766,6 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
         return;
     }
 
-    if !head.method.eq_ignore_ascii_case("POST") {
-        let _ = write_response(&mut stream, "405 Method Not Allowed", b"method not allowed");
-        return;
-    }
     // Shed load once the concurrent standard-client count has reached the
     // cap, before any authentication work (dcrd's `limitConnections`
     // answering 503 when `numClients+1 > RPCMaxClients`).  A cap of zero —
@@ -2642,13 +2784,11 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
         // Answer first, then discard whatever body the request
         // declared, so the close is clean without the response waiting
         // on bytes that may never arrive (Go's order; see
-        // `drain_declared_body`).  dcrd's 503 body is text/plain via
-        // http.Error; write_response uses the JSON content type, a
-        // cosmetic divergence.
-        let _ = write_response(
+        // `drain_declared_body`).
+        let _ = write_handler_error(
             &mut stream,
             "503 Service Unavailable",
-            b"503 Too busy.  Try again later.\n",
+            "503 Too busy.  Try again later.",
         );
         drain_declared_body(&mut stream, &head, deadline);
         return;
@@ -2692,7 +2832,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
                 // be waited out and answered with nothing.  The declared
                 // length is above the authenticated limit and so above
                 // the discard cap, which leaves nothing to drain.
-                let _ = write_response(&mut stream, "400 Bad Request", b"request too large");
+                let _ = write_handler_error(&mut stream, "400 Bad Request", "request too large");
                 drain_declared_body(&mut stream, &head, deadline);
                 return;
             }
@@ -2711,11 +2851,11 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
             match read_chunked_body(&mut stream, deadline, RPC_READ_LIMIT_AUTHENTICATED, true) {
                 ChunkedBody::Body(body) => body,
                 ChunkedBody::TooLarge => {
-                    let _ = write_response(&mut stream, "400 Bad Request", b"request too large");
+                    let _ = write_handler_error(&mut stream, "400 Bad Request", "request too large");
                     return;
                 }
                 ChunkedBody::Malformed => {
-                    let _ = write_response(&mut stream, "400 Bad Request", b"invalid chunked body");
+                    let _ = write_handler_error(&mut stream, "400 Bad Request", "invalid chunked body");
                     return;
                 }
                 ChunkedBody::Io => return,
@@ -2730,7 +2870,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     watchdog.disarm();
 
     let Ok(body) = String::from_utf8(body) else {
-        let _ = write_response(&mut stream, "400 Bad Request", b"invalid body");
+        let _ = write_handler_error(&mut stream, "400 Bad Request", "invalid body");
         return;
     };
 
@@ -2760,7 +2900,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     drop(cancel_scope);
     cancel_watch.disarm();
 
-    let _ = write_response(&mut stream, "200 OK", &response);
+    let _ = write_json_response(&mut stream, "200 OK", &response);
 }
 
 /// Watches for the two things that cancel an in-flight request — the
@@ -2857,8 +2997,13 @@ impl RequestCancelWatch {
     }
 }
 
-/// Write an HTTP response with dcrd's JSON content type.
-fn write_response<S: Write>(stream: &mut S, status: &str, body: &[u8]) -> std::io::Result<()> {
+/// Write the JSON-RPC reply, the one response that carries dcrd's
+/// `application/json` content type (set on every `/` reply at
+/// `rpcserver.go:5938`).  Error answers do not: `http.Error` resets the
+/// header to text/plain, and the connection loop never sets it at all,
+/// so they go through [`write_handler_error`] and
+/// [`write_protocol_error`] instead.
+fn write_json_response<S: Write>(stream: &mut S, status: &str, body: &[u8]) -> std::io::Result<()> {
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -2870,13 +3015,67 @@ fn write_response<S: Write>(stream: &mut S, status: &str, body: &[u8]) -> std::i
 
 /// Write dcrd's 401 with its authenticate realm (dcrd `jsonAuthFail`).
 fn write_unauthorized<S: Write>(stream: &mut S) -> std::io::Result<()> {
-    let body = b"401 Unauthorized.\n";
-    let header = format!(
-        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"dcrd RPC\"\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
+    // dcrd adds the challenge and then answers through `http.Error`
+    // (`jsonAuthFail`, `rpcserver.go:5874-5877`), so the body, the
+    // content type, and the sniffing opt-out are that helper's.
+    write_handler_error_with(
+        stream,
+        "401 Unauthorized",
+        "401 Unauthorized.",
+        &[("WWW-Authenticate", "Basic realm=\"dcrd RPC\"")],
+    )
+}
+
+/// Write an error Go's connection loop answers before any handler runs.
+///
+/// `conn.serve` writes its own bytes for these, using one fixed header
+/// block -- `errorHeaders` at `net/http/server.go:2064` -- which carries
+/// the content type and `Connection: close` and *no* `Content-Length`,
+/// so the body simply runs to the close.  There is no
+/// `X-Content-Type-Options` here; that one belongs to `http.Error`,
+/// which these paths never reach.
+fn write_protocol_error<S: Write>(
+    stream: &mut S,
+    status: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{body}"
     );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()
+}
+
+/// Write an error the way a Go handler does, through `http.Error`
+/// (`net/http/server.go:2353-2371`): the content type reset to
+/// text/plain, the sniffing opt-out, and the message newline-terminated
+/// by its `Fprintln`.  The `Content-Length` is there because the
+/// response writer buffers a body this small and fills it in, and
+/// `Connection: close` because dcrd's handlers set it on every reply
+/// (`rpcserver.go:5937`).
+fn write_handler_error<S: Write>(stream: &mut S, status: &str, body: &str) -> std::io::Result<()> {
+    write_handler_error_with(stream, status, body, &[])
+}
+
+/// As [`write_handler_error`], with headers a caller set on the
+/// response before calling `http.Error`.
+fn write_handler_error_with<S: Write>(
+    stream: &mut S,
+    status: &str,
+    body: &str,
+    extra: &[(&str, &str)],
+) -> std::io::Result<()> {
+    let body = format!("{body}\n");
+    let mut header = format!("HTTP/1.1 {status}\r\n");
+    for (name, value) in extra {
+        header.push_str(&format!("{name}: {value}\r\n"));
+    }
+    header.push_str(&format!(
+        "Content-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    ));
     stream.write_all(header.as_bytes())?;
-    stream.write_all(body)?;
+    stream.write_all(body.as_bytes())?;
     stream.flush()
 }
 
