@@ -1438,3 +1438,126 @@ fn the_first_authorization_header_decides() {
 
     listener.shutdown();
 }
+
+/// Send one raw request and read whatever comes back, for the framing
+/// checks below that need malformed heads no builder would produce.
+///
+/// The write side is half-closed and the read is tolerant, as in
+/// `an_oversized_body_is_refused_before_it_is_read`: these requests are
+/// answered from the head alone and the connection is then dropped.
+fn send_raw(port: u16, request: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.write_all(request.as_bytes()).expect("write");
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .expect("half close");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    response
+}
+
+/// Duplicate `Content-Length` headers follow Go's `fixLength`
+/// (`net/http/transfer.go`), which dcrd's RPC server runs because it
+/// serves over a real `http.Server` (`rpcserver.go:5918`): copies that
+/// disagree are 400 before routing, copies that agree are deduplicated
+/// and the request is served.  A last-wins reader answers 200 to the
+/// first case, which is the CL.CL smuggling shape.
+#[test]
+fn duplicate_content_length_headers_follow_go() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+    let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
+    let body = r#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}"#;
+
+    // Two values that disagree: rejected before the body is routed.
+    let response = send_raw(
+        port,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "conflicting content lengths are refused: {response}"
+    );
+
+    // The same value twice: Go deduplicates and serves the request.
+    let response = send_raw(
+        port,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {len}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+            len = body.len()
+        ),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "identical duplicates are deduplicated: {response}"
+    );
+
+    listener.shutdown();
+}
+
+/// `strconv.ParseUint(cl, 10, 63)` accepts ASCII digits and nothing
+/// else, so the leading `+` that Rust's own integer parser takes is a
+/// 400 in dcrd.
+#[test]
+fn a_signed_content_length_is_refused() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+    let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
+    let body = r#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}"#;
+
+    let response = send_raw(
+        port,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: +{}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "a signed content length is refused: {response}"
+    );
+
+    listener.shutdown();
+}
+
+/// Go supports exactly one `Transfer-Encoding` header — `if len(raw)
+/// != 1` is `unsupportedTEError` before the values are compared — so a
+/// repeat answers 501 even when both copies say `chunked`.  Go keeps
+/// this strict because disagreeing copies are the TE.TE smuggling
+/// shape; a last-wins reader accepts the body as chunked instead.
+#[test]
+fn duplicate_transfer_encoding_headers_are_unsupported() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+    let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
+
+    // Both copies name the encoding the server does implement.
+    let response = send_raw(
+        port,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 501"),
+        "a repeated transfer encoding is unsupported: {response}"
+    );
+
+    // An unreadable encoding hiding behind a readable one: the same
+    // 501, where a last-wins reader would decode the body as chunked.
+    let response = send_raw(
+        port,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nTransfer-Encoding: cheese\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 501"),
+        "a repeat is refused whatever the values say: {response}"
+    );
+
+    listener.shutdown();
+}

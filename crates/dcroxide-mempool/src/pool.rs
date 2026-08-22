@@ -880,7 +880,7 @@ impl<C: PoolChain> TxPool<C> {
             if let Some(redeemer) = self.outpoints.get(&key).cloned()
                 && redeemer.tx_hash != *tx_hash
             {
-                self.remove_transaction(&redeemer.tx.clone(), &redeemer.tx_hash.clone(), true);
+                self.remove_transaction(&redeemer.tx, &redeemer.tx_hash, true);
             }
             if let Some(redeemer) = self.staged_outpoints.get(&key).cloned()
                 && redeemer.tx_hash != *tx_hash
@@ -1646,7 +1646,7 @@ impl<C: PoolChain> TxPool<C> {
         if !is_new && tx_type == TxType::Regular {
             for redeemer in Self::collect_redeemers(&self.outpoints, &tx, &tx_hash) {
                 if redeemer.tx_type == TxType::SStx {
-                    self.remove_transaction(&redeemer.tx.clone(), &redeemer.tx_hash.clone(), true);
+                    self.remove_transaction(&redeemer.tx, &redeemer.tx_hash, true);
                     self.stage_transaction(redeemer);
                 }
             }
@@ -1936,24 +1936,24 @@ impl<C: PoolChain> TxPool<C> {
         for tx_desc in pool_descs {
             let tx_type = tx_desc.tx_type;
             if tx_type == TxType::SStx && tx_desc.height + HEIGHT_DIFF_TO_PRUNE_TICKET < height {
-                self.remove_transaction(&tx_desc.tx.clone(), &tx_desc.tx_hash.clone(), true);
+                self.remove_transaction(&tx_desc.tx, &tx_desc.tx_hash, true);
                 continue;
             }
             if tx_type == TxType::SStx && tx_desc.tx.tx_out[0].value < required_stake_difficulty {
-                self.remove_transaction(&tx_desc.tx.clone(), &tx_desc.tx_hash.clone(), true);
+                self.remove_transaction(&tx_desc.tx, &tx_desc.tx_hash, true);
                 continue;
             }
             if (tx_type == TxType::SSRtx || tx_type == TxType::SSGen)
                 && tx_desc.height + HEIGHT_DIFF_TO_PRUNE_VOTES < height
             {
-                self.remove_transaction(&tx_desc.tx.clone(), &tx_desc.tx_hash.clone(), true);
+                self.remove_transaction(&tx_desc.tx, &tx_desc.tx_hash, true);
                 continue;
             }
             if is_auto_revocations_enabled && tx_type == TxType::SSRtx {
                 // When the automatic ticket revocations agenda is
                 // active, any revocations that remain in the mempool
                 // are no longer valid after a new block.
-                self.remove_transaction(&tx_desc.tx.clone(), &tx_desc.tx_hash.clone(), true);
+                self.remove_transaction(&tx_desc.tx, &tx_desc.tx_hash, true);
                 continue;
             }
         }
@@ -1969,7 +1969,7 @@ impl<C: PoolChain> TxPool<C> {
                 continue;
             }
             if is_auto_revocations_enabled && tx_type == TxType::SSRtx {
-                self.remove_transaction(&tx_desc.tx.clone(), &tx_desc.tx_hash.clone(), true);
+                self.remove_transaction(&tx_desc.tx, &tx_desc.tx_hash, true);
                 continue;
             }
         }
@@ -1997,7 +1997,7 @@ impl<C: PoolChain> TxPool<C> {
         let pool_descs: Vec<Arc<TxDesc>> = self.pool.values().cloned().collect();
         for tx_desc in pool_descs {
             if is_expired_tx(&tx_desc.tx, next_block_height) {
-                self.remove_transaction(&tx_desc.tx.clone(), &tx_desc.tx_hash.clone(), true);
+                self.remove_transaction(&tx_desc.tx, &tx_desc.tx_hash, true);
             }
         }
 
@@ -2389,7 +2389,7 @@ mod removal_cascade_tests {
             assert_eq!(pool.count(), DEEP_CHAIN_LEN);
 
             let head = pool.pool.get(&hashes[0].0).cloned().expect("head in pool");
-            pool.remove_transaction(&head.tx.clone(), &head.tx_hash, true);
+            pool.remove_transaction(&head.tx, &head.tx_hash, true);
             (
                 pool.count(),
                 pool.outpoints.len(),
@@ -2453,7 +2453,7 @@ mod removal_cascade_tests {
         let hashes = fill_chain(&mut pool, 4, 0);
 
         let head = pool.pool.get(&hashes[0].0).cloned().expect("head in pool");
-        pool.remove_transaction(&head.tx.clone(), &head.tx_hash, true);
+        pool.remove_transaction(&head.tx, &head.tx_hash, true);
 
         // dcrd recurses into the redeemers before removing the
         // transaction itself, so the deepest redeemer leaves the pool
@@ -2473,7 +2473,7 @@ mod removal_cascade_tests {
             .get(&hashes[1].0)
             .cloned()
             .expect("middle in pool");
-        pool.remove_transaction(&middle.tx.clone(), &middle.tx_hash, false);
+        pool.remove_transaction(&middle.tx, &middle.tx_hash, false);
 
         assert_eq!(pool.count(), 2);
         assert!(pool.is_transaction_in_pool(&hashes[0]));

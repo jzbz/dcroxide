@@ -2234,9 +2234,10 @@ fn read_chunked_body<S: Read + SocketTimeout>(
 
 /// Whether the request declares a chunked body, and whether its
 /// transfer encoding is one the server can read at all.  Go's server
-/// accepts exactly `chunked` and answers anything else with 501
-/// Unsupported Transfer-Encoding; per RFC 7230 a chunked message's
-/// Content-Length is ignored.
+/// accepts exactly one `Transfer-Encoding` header whose value is
+/// `chunked`, and answers anything else with 501 Unsupported
+/// Transfer-Encoding; per RFC 7230 a chunked message's Content-Length
+/// is ignored.
 enum BodyFraming {
     /// No Transfer-Encoding: the Content-Length declares the body.
     Length,
@@ -2247,6 +2248,14 @@ enum BodyFraming {
 }
 
 fn body_framing(head: &HttpHead) -> BodyFraming {
+    // A repeat is `unsupportedTEError` in Go before the values are
+    // even looked at (`transfer.go` `parseTransferEncoding`: `if
+    // len(raw) != 1`), so two copies are 501 even when both say
+    // `chunked`.  Go keeps this "strict and simple" precisely because
+    // the header is a request-smuggling surface.
+    if head.transfer_encoding_repeated {
+        return BodyFraming::Unsupported;
+    }
     match head.transfer_encoding.as_deref() {
         None => BodyFraming::Length,
         Some(value) if value.trim().eq_ignore_ascii_case("chunked") => BodyFraming::Chunked,
@@ -2277,6 +2286,9 @@ pub struct HttpHead {
     authorization: Option<String>,
     content_length: usize,
     transfer_encoding: Option<String>,
+    /// Whether more than one `Transfer-Encoding` header arrived, which
+    /// Go rejects outright; see `body_framing`.
+    transfer_encoding_repeated: bool,
     upgrade: Option<String>,
     connection: Option<String>,
     pub(crate) sec_websocket_key: Option<String>,
@@ -2327,6 +2339,7 @@ fn read_http_head<S: Read + SocketTimeout>(
         authorization: None,
         content_length: 0,
         transfer_encoding: None,
+        transfer_encoding_repeated: false,
         upgrade: None,
         connection: None,
         sec_websocket_key: None,
@@ -2334,6 +2347,13 @@ fn read_http_head<S: Read + SocketTimeout>(
         origin: None,
         host: None,
     };
+    // Go decides both framing headers over its whole header map after
+    // reading, not header-by-header, and rejects a disagreement
+    // between copies before routing -- that disagreement is the
+    // classic request-smuggling primitive.  `Content-Length` is
+    // therefore held as the first spelling seen and compared against
+    // every later copy (`net/http/transfer.go` `fixLength`).
+    let mut content_length: Option<&str> = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -2352,9 +2372,26 @@ fn read_http_head<S: Read + SocketTimeout>(
                     head.authorization = Some(value.to_string());
                 }
             } else if name.eq_ignore_ascii_case("content-length") {
-                head.content_length = value.parse().map_err(|_| "bad content length")?;
+                // `fixLength` compares the *trimmed strings*, so `5`
+                // and `05` conflict and answer 400 while two identical
+                // spellings are simply deduplicated.  Comparing parsed
+                // numbers instead would accept a pair dcrd rejects.
+                match content_length {
+                    None => content_length = Some(value),
+                    Some(first) if first != value => {
+                        return Err("multiple content lengths");
+                    }
+                    Some(_) => {}
+                }
             } else if name.eq_ignore_ascii_case("transfer-encoding") {
-                head.transfer_encoding = Some(value.to_string());
+                // Keeping the first copy mirrors Go's `raw[0]`; the
+                // repeat itself is what decides the request, in
+                // `body_framing`.
+                if head.transfer_encoding.is_some() {
+                    head.transfer_encoding_repeated = true;
+                } else {
+                    head.transfer_encoding = Some(value.to_string());
+                }
             } else if name.eq_ignore_ascii_case("upgrade") {
                 head.upgrade = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("connection") {
@@ -2370,7 +2407,29 @@ fn read_http_head<S: Read + SocketTimeout>(
             }
         }
     }
+    if let Some(value) = content_length {
+        head.content_length = parse_content_length(value)?;
+    }
     Ok(head)
+}
+
+/// Parse a `Content-Length` value the way dcrd's Go server does.
+///
+/// `parseContentLength` (`net/http/transfer.go`) runs
+/// `strconv.ParseUint(cl, 10, 63)`, which takes ASCII digits and
+/// nothing else -- no sign, no underscores -- and refuses anything
+/// above 2^63-1; an empty value is its own 400.  Rust's integer
+/// `FromStr` accepts a leading `+`, so parsing straight into `usize`
+/// would take a `Content-Length: +5` that dcrd answers 400.
+fn parse_content_length(value: &str) -> Result<usize, &'static str> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("bad content length");
+    }
+    let parsed: u64 = value.parse().map_err(|_| "bad content length")?;
+    if parsed > i64::MAX as u64 {
+        return Err("bad content length");
+    }
+    usize::try_from(parsed).map_err(|_| "bad content length")
 }
 
 /// Whether the request head is a websocket upgrade for the `/ws`
@@ -2827,6 +2886,7 @@ mod tests {
             authorization: None,
             content_length: 0,
             transfer_encoding: None,
+            transfer_encoding_repeated: false,
             upgrade: None,
             connection: None,
             sec_websocket_key: None,

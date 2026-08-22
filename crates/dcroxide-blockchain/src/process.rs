@@ -1184,10 +1184,20 @@ impl Chain {
     /// utxo set bucket on disk for database-backed chains (dcrd
     /// `levelDbUtxoBackend.FetchEntry`) and the in-memory map for the
     /// pure-memory test chains.  Missing outputs return `None`;
-    /// entries for spent outputs, undecodable rows, and database read
-    /// failures all panic — the resolver seam has no error channel,
-    /// so the whole class dcrd surfaces as backend errors aborts
-    /// here (a documented divergence).
+    /// entries for spent outputs and undecodable rows panic — the
+    /// resolver seam has no error channel, so the class dcrd surfaces
+    /// as backend errors aborts here (a documented divergence).
+    ///
+    /// A redb *read* error never reaches this seam to be panicked on:
+    /// `Transaction::fetch_raw` has already turned it into `None`, so
+    /// for the rest of the current transaction a storage fault reads
+    /// as a missing output, and a valid block can be rejected with
+    /// `ErrMissingTxOut` on the strength of a failing disk.  That
+    /// window is one transaction wide — redb latches the failure, so
+    /// the next transaction cannot open the metadata table and this
+    /// function aborts instead.  dcrd does distinguish the two on this
+    /// path: `levelDbUtxoBackend.Get` separates `ErrNotFound` from a
+    /// real error and `dbFetchUtxoEntry` propagates it.
     fn backend_fetch_entry(&self, key: &OutPointKey) -> Option<UtxoEntry> {
         let Some(db) = &self.db else {
             return self.utxo_backend.get(key).cloned();

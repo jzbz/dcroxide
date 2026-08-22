@@ -4489,7 +4489,7 @@ fn validate_item(
 /// than noise.
 ///
 /// A first attempt sized workers by the batch instead — one worker per 32
-/// items — and was **4.6% slower** on disjoint ranges, because a 100-item
+/// items — and was **6.5% slower** on disjoint ranges, because a 100-item
 /// batch then ran on three threads while 29 cores idled. That is the trap
 /// here: the fan-out must stay proportional to the *machine*, not to the
 /// batch. The work-stealing loop below is what makes one worker per core

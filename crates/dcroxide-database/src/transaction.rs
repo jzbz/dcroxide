@@ -114,8 +114,14 @@ struct TxState {
     /// and on every step of a `for_each` or prefix scan.  The read
     /// transaction is a snapshot, so which table it resolves cannot
     /// change while it lives; opening once is the same answer for less
-    /// work.  `None` only if the table is somehow absent, which
-    /// preserves the previous "missing table reads as empty" behaviour.
+    /// work.  `None` when the table is absent, which preserves the
+    /// previous "missing table reads as empty" behaviour -- but also
+    /// when `open_table` fails with `TableError::Storage`, and then
+    /// every key in the transaction reads as missing rather than just
+    /// the ones a caller asks for.  redb latches the underlying I/O
+    /// failure, so the next transaction cannot open the table either
+    /// and the resolver seam aborts; the empty view is bounded to this
+    /// transaction rather than silently permanent.
     table: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
     /// Blocks buffered by `store_block` to be written on commit, plus
     /// an index over them by hash (dcrd `pendingBlocks` /
