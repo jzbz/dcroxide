@@ -1439,6 +1439,48 @@ fn the_first_authorization_header_decides() {
     listener.shutdown();
 }
 
+/// The 401 must reach a client that declared a body and never sent it,
+/// without waiting out the handshake deadline.  dcrd answers straight
+/// away: its `/` handler sets `Connection: close`
+/// (`rpcserver.go:5937`), so Go flushes the response in
+/// `finishRequest` and only then closes the body, and `body.Close`
+/// reads nothing at all when the request was closing
+/// (`net/http/transfer.go:996-998`).  Draining first instead means the
+/// handshake watchdog shuts the socket down before the 401 is written
+/// and the client is answered with silence.
+///
+/// This is the same shape as
+/// `unauthenticated_post_is_rejected_before_reading_the_body`, minus
+/// the client half-close that test uses — a real client does not send
+/// one, and dcrd does not need it to.
+#[test]
+fn an_undelivered_body_does_not_swallow_the_401() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+
+    let request = "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 4000000\r\nConnection: close\r\n\r\n";
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.write_all(request.as_bytes()).expect("write");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+
+    let started = std::time::Instant::now();
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    let elapsed = started.elapsed();
+
+    assert!(
+        response.starts_with("HTTP/1.1 401"),
+        "the 401 is written before any body is drained: {response:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "answered without waiting out the handshake deadline, took {elapsed:?}"
+    );
+
+    listener.shutdown();
+}
+
 /// Send one raw request and read whatever comes back, for the framing
 /// checks below that need malformed heads no builder would produce.
 ///

@@ -2105,11 +2105,11 @@ fn drain_body<S: Read + SocketTimeout>(stream: &mut S, mut remaining: usize, dea
     }
 }
 
-/// How much of an unread chunked body an error path drains before
-/// closing, bounding a client that keeps sending (Go's
-/// `maxPostHandlerReadBytes` discard cap serves the same clean-close
-/// purpose).
-const CHUNKED_DRAIN_LIMIT: usize = 1 << 18;
+/// How much of an unread body an error path discards before closing,
+/// bounding a client that keeps sending.  This is Go's
+/// `maxPostHandlerReadBytes` (`net/http/server.go:1164`) to the byte,
+/// and like it governs both framings.
+const POST_RESPONSE_DRAIN_LIMIT: usize = 256 << 10;
 
 /// The longest accepted chunk-size line, extensions included (Go's
 /// `maxLineLength` in `internal/chunked`).
@@ -2265,6 +2265,32 @@ fn body_framing(head: &HttpHead) -> BodyFraming {
 
 /// Drain whatever body the request declared before an error response,
 /// so the close is clean (see `drain_body`).
+///
+/// Two things about Go's shape matter here, and the port follows it on
+/// one of them and deliberately does not on the other.
+///
+/// *Order*: Go discards only after the response is flushed --
+/// `finishRequest` writes, then closes the request body
+/// (`server.go:1701-1717`).  Discarding first instead makes a client
+/// that declares a `Content-Length` and never sends it wait out the
+/// whole handshake budget, at which point the watchdog shuts the
+/// socket down and the answer is never written at all.  So the answer
+/// goes out first here too.
+///
+/// *Cap*: `body.Close` gives up without reading a byte when more than
+/// `maxPostHandlerReadBytes` is still declared (`transfer.go:1002-1004`),
+/// which is what keeps an undelivered body from stalling the close.
+/// Reproduced exactly.
+///
+/// The deliberate divergence is Go's third arm: when the request said
+/// `Connection: close`, `body.Close` reads nothing at all ("no point in
+/// reading to EOF", `transfer.go:996-998`).  Doing that here closes the
+/// socket over the unread body of every ordinary `dcrctl`-shaped
+/// request -- which sends `Connection: close` -- and the resulting TCP
+/// reset truncates away the error response the client is still
+/// reading.  Draining a body that has already arrived is what makes the
+/// close clean, which is the whole reason `drain_body` exists; the cost
+/// is reading bytes Go would leave, which no client can observe.
 fn drain_declared_body<S: Read + SocketTimeout>(
     stream: &mut S,
     head: &HttpHead,
@@ -2272,9 +2298,14 @@ fn drain_declared_body<S: Read + SocketTimeout>(
 ) {
     match body_framing(head) {
         BodyFraming::Chunked => {
-            let _ = read_chunked_body(stream, deadline, CHUNKED_DRAIN_LIMIT, false);
+            let _ = read_chunked_body(stream, deadline, POST_RESPONSE_DRAIN_LIMIT, false);
         }
-        _ => drain_body(stream, head.content_length, deadline),
+        _ => {
+            if head.content_length > POST_RESPONSE_DRAIN_LIMIT {
+                return;
+            }
+            drain_body(stream, head.content_length, deadline);
+        }
     }
 }
 
@@ -2596,16 +2627,18 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
             &MAX_CLIENTS_LOG,
             &format!("Max RPC clients exceeded [{max_clients}] - disconnecting client {peer}"),
         );
-        // Drain the declared body before closing so the 503 reaches the
-        // client cleanly rather than resetting the socket over unread
-        // bytes.  dcrd's 503 body is text/plain via http.Error;
-        // write_response uses the JSON content type, a cosmetic divergence.
-        drain_declared_body(&mut stream, &head, deadline);
+        // Answer first, then discard whatever body the request
+        // declared, so the close is clean without the response waiting
+        // on bytes that may never arrive (Go's order; see
+        // `drain_declared_body`).  dcrd's 503 body is text/plain via
+        // http.Error; write_response uses the JSON content type, a
+        // cosmetic divergence.
         let _ = write_response(
             &mut stream,
             "503 Service Unavailable",
             b"503 Too busy.  Try again later.\n",
         );
+        drain_declared_body(&mut stream, &head, deadline);
         return;
     }
     let _client_guard = RpcClientGuard::new(num_clients);
@@ -2619,11 +2652,12 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
         Err(_) => {
             // Release the client slot before draining so an
             // unauthenticated client cannot occupy a cap slot for the
-            // drain's duration, then drain the small body so the 401
-            // closes cleanly.
+            // drain's duration.  The 401 goes out before the drain, as
+            // it does in Go: a client that declares a body and never
+            // sends it is answered at once rather than waited out.
             drop(_client_guard);
-            drain_declared_body(&mut stream, &head, deadline);
             let _ = write_unauthorized(&mut stream);
+            drain_declared_body(&mut stream, &head, deadline);
             return;
         }
     };
@@ -2640,8 +2674,14 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     let body = match body_framing(&head) {
         BodyFraming::Length => {
             if head.content_length > RPC_READ_LIMIT_AUTHENTICATED {
-                drain_body(&mut stream, head.content_length, deadline);
+                // Answer before discarding, for the same reason the
+                // pre-authentication paths do: a client that declares
+                // an oversized body and never sends it would otherwise
+                // be waited out and answered with nothing.  The declared
+                // length is above the authenticated limit and so above
+                // the discard cap, which leaves nothing to drain.
                 let _ = write_response(&mut stream, "400 Bad Request", b"request too large");
+                drain_declared_body(&mut stream, &head, deadline);
                 return;
             }
             // Read the authenticated body under the same absolute
