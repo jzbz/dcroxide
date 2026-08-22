@@ -1481,6 +1481,46 @@ fn an_undelivered_body_does_not_swallow_the_401() {
     listener.shutdown();
 }
 
+/// A websocket handshake that declares a request body is refused, and
+/// the connection is dropped without an answer.  gorilla inspects the
+/// hijacked reader and closes outright on any byte that arrived with
+/// the handshake -- "client sent data before handshake is complete"
+/// (`gorilla/websocket@v1.5.1 server.go:186-191`) -- which dcrd
+/// surfaces only as a log line (`rpcserver.go:6010-6015`).  Without the
+/// check those bytes are read as the first RFC 6455 frames, so a proxy
+/// that forwarded them as a `Content-Length` body and this server
+/// disagree about where the request ended.
+#[test]
+fn a_websocket_upgrade_declaring_a_body_is_refused() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+    let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
+
+    let request = format!(
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\nContent-Length: 5\r\n\r\nABCDE"
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.write_all(request.as_bytes()).expect("write");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .expect("read timeout");
+    // Read raw rather than to EOF: the refusal closes over the unread
+    // body, and a reset would discard a buffered response before
+    // `read_to_string` returned it -- which would pass this assertion
+    // for the wrong reason.
+    let mut buf = [0u8; 512];
+    let response = match stream.read(&mut buf) {
+        Ok(n) => String::from_utf8_lossy(&buf[..n]).to_string(),
+        Err(_) => String::new(),
+    };
+
+    assert!(
+        !response.starts_with("HTTP/1.1 101"),
+        "the upgrade must not be completed over a declared body: {response:?}"
+    );
+
+    listener.shutdown();
+}
+
 /// Send one raw request and read whatever comes back, for the framing
 /// checks below that need malformed heads no builder would produce.
 ///

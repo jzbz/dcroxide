@@ -2444,6 +2444,18 @@ fn read_http_head<S: Read + SocketTimeout>(
     Ok(head)
 }
 
+impl HttpHead {
+    /// Whether the request declared a body, in either framing.  A
+    /// websocket handshake must not carry one (RFC 6455 4.1), and the
+    /// upgrade path refuses it; see `serve_websocket`.
+    pub(crate) fn declares_body(&self) -> bool {
+        match body_framing(self) {
+            BodyFraming::Chunked => true,
+            _ => self.content_length > 0,
+        }
+    }
+}
+
 /// Parse a `Content-Length` value the way dcrd's Go server does.
 ///
 /// `parseContentLength` (`net/http/transfer.go`) runs

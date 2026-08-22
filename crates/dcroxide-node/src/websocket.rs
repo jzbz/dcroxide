@@ -611,6 +611,30 @@ pub fn serve_websocket<S: Read + Write>(
         }
     };
 
+    // Refuse a handshake that declared a request body, dropping the
+    // connection with no answer at all.  gorilla inspects the hijacked
+    // reader and closes outright on any byte that arrived alongside the
+    // handshake -- "client sent data before handshake is complete"
+    // (`gorilla/websocket@v1.5.1 server.go:186-191`) -- which dcrd
+    // surfaces only as a log line, never as a response
+    // (`rpcserver.go:6009-6015`).  Without this the declared bytes are
+    // read as the first RFC 6455 frames, so a proxy that forwarded them
+    // as a `Content-Length` body and this server disagree about where
+    // the request ended.
+    //
+    // The test differs from gorilla's because the reader here cannot
+    // hold what gorilla's inspects: `read_http_head` takes the head one
+    // byte at a time and stops on the blank line, so nothing is ever
+    // buffered past it and there is no arrival to detect -- the
+    // declared framing is what can be tested.  That is stricter for a
+    // body declared but not yet sent (gorilla upgrades, this refuses)
+    // and looser for bytes pipelined without a `Content-Length`
+    // (gorilla refuses, this upgrades); only the declared form can
+    // desync a proxy, which is the case that matters.
+    if head.declares_body() {
+        return;
+    }
+
     // Answer the handshake.
     let response = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
