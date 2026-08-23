@@ -608,11 +608,7 @@ pub fn serve_websocket<S: Read + Write>(
         return;
     }
     if !head.method.eq_ignore_ascii_case("GET") {
-        let _ = write_handshake_error(
-            &mut stream,
-            "405 Method Not Allowed",
-            "Method Not Allowed",
-        );
+        let _ = write_handshake_error(&mut stream, "405 Method Not Allowed", "Method Not Allowed");
         return;
     }
     // The version is a `1#token` header too, so gorilla scans every

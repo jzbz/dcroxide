@@ -1520,7 +1520,9 @@ fn connection_level_errors_are_go_shaped() {
     let long = "x".repeat(9000);
     let response = send_raw(
         port,
-        &format!("POST / HTTP/1.1\r\nHost: localhost\r\nX-Pad: {long}\r\nConnection: close\r\n\r\n"),
+        &format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nX-Pad: {long}\r\nConnection: close\r\n\r\n"
+        ),
     );
     assert!(
         response.starts_with("HTTP/1.1 431 Request Header Fields Too Large"),
@@ -1534,7 +1536,8 @@ fn connection_level_errors_are_go_shaped() {
         "POST / HTTP/2.0\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     );
     assert!(
-        response.starts_with("HTTP/1.1 505 HTTP Version Not Supported: unsupported protocol version"),
+        response
+            .starts_with("HTTP/1.1 505 HTTP Version Not Supported: unsupported protocol version"),
         "an unservable version is 505: {response:?}"
     );
 
@@ -1662,7 +1665,9 @@ fn the_websocket_route_answers_gorillas_statuses() {
     // No upgrade tokens: 400 before the method is ever looked at.
     let response = send_raw(
         port,
-        &format!("GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: close\r\n\r\n"),
+        &format!(
+            "GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: close\r\n\r\n"
+        ),
     );
     assert!(
         response.starts_with("HTTP/1.1 400 Bad Request"),
@@ -1676,7 +1681,9 @@ fn the_websocket_route_answers_gorillas_statuses() {
     // Tokens present but the wrong method: 405.
     let response = send_raw(
         port,
-        &format!("POST /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"),
+        &format!(
+            "POST /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+        ),
     );
     assert!(
         response.starts_with("HTTP/1.1 405 Method Not Allowed"),
@@ -1753,18 +1760,42 @@ fn a_malformed_head_is_refused_the_way_go_refuses_it() {
         );
     };
 
-    bare("G(ET / HTTP/1.1\r\nHost: localhost\r\n\r\n", "a method with a non-token byte");
+    bare(
+        "G(ET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "a method with a non-token byte",
+    );
     bare(" / HTTP/1.1\r\nHost: localhost\r\n\r\n", "an empty method");
-    bare("GET / HTTP/1.1 junk\r\nHost: localhost\r\n\r\n", "a fourth request-line field");
-    bare("GET  / HTTP/1.1\r\nHost: localhost\r\n\r\n", "a doubled space");
-    bare("GET / HTTP/1.1\r\nHost: localhost\r\nNoColonHere\r\n\r\n", "a line with no colon");
-    bare("GET / HTTP/1.1\r\nHost: localhost\r\nBad(Name): x\r\n\r\n", "a non-token field name");
-    bare("GET / HTTP/1.1\r\nHost: localhost\r\nX-Bad: a\u{1}b\r\n\r\n", "a control byte in a value");
-    bare("GET / HTTP/1.1\r\nHost: a\u{1}b\r\n\r\n", "a control byte in the host");
+    bare(
+        "GET / HTTP/1.1 junk\r\nHost: localhost\r\n\r\n",
+        "a fourth request-line field",
+    );
+    bare(
+        "GET  / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "a doubled space",
+    );
+    bare(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nNoColonHere\r\n\r\n",
+        "a line with no colon",
+    );
+    bare(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nBad(Name): x\r\n\r\n",
+        "a non-token field name",
+    );
+    bare(
+        "GET / HTTP/1.1\r\nHost: localhost\r\nX-Bad: a\u{1}b\r\n\r\n",
+        "a control byte in a value",
+    );
+    bare(
+        "GET / HTTP/1.1\r\nHost: a\u{1}b\r\n\r\n",
+        "a control byte in the host",
+    );
 
     // These two reach Go's own checks and carry their reason in the
     // status line as well as the body.
-    let response = send_raw(port, "GET / HTTP/1.1\r\nHost: localhost\r\nBad Name: x\r\n\r\n");
+    let response = send_raw(
+        port,
+        "GET / HTTP/1.1\r\nHost: localhost\r\nBad Name: x\r\n\r\n",
+    );
     assert!(
         response.starts_with("HTTP/1.1 400 Bad Request: invalid header name"),
         "a space in a field name is named: {response:?}"
@@ -1777,7 +1808,10 @@ fn a_malformed_head_is_refused_the_way_go_refuses_it() {
 
     // A lowercase method is a method, not a misspelling, and a host
     // with a port is ordinary.
-    let response = send_raw(port, "get / HTTP/1.1\r\nHost: localhost:9109\r\nConnection: close\r\n\r\n");
+    let response = send_raw(
+        port,
+        "get / HTTP/1.1\r\nHost: localhost:9109\r\nConnection: close\r\n\r\n",
+    );
     assert!(
         response.starts_with("HTTP/1.1 401"),
         "a lowercase method is served, then refused by auth: {response:?}"
@@ -1796,7 +1830,9 @@ fn the_websocket_route_survives_a_query_and_redirects_uncanonical_targets() {
     let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
     let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
     let handshake = |target: &str| {
-        format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n")
+        format!(
+            "GET {target} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n"
+        )
     };
 
     let response = send_raw(port, &handshake("/ws?token=abc"));
@@ -1856,7 +1892,9 @@ fn upgrade_tokens_are_read_across_every_copy() {
     // the last would refuse this handshake gorilla completes.
     let response = send_raw(
         port,
-        &format!("GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nConnection: keep-alive\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n"),
+        &format!(
+            "GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nConnection: keep-alive\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n"
+        ),
     );
     assert!(
         response.starts_with("HTTP/1.1 101"),
@@ -1868,7 +1906,9 @@ fn upgrade_tokens_are_read_across_every_copy() {
     // split-on-commas reading would upgrade.
     let response = send_raw(
         port,
-        &format!("GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: keep-alive;q=1, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n"),
+        &format!(
+            "GET /ws HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: keep-alive;q=1, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n"
+        ),
     );
     assert!(
         response.starts_with("HTTP/1.1 400 Bad Request"),

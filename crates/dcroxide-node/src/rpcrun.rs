@@ -2464,10 +2464,24 @@ fn path_byte_kept(b: u8) -> bool {
 /// waved through on top of the unescaped set.
 fn valid_encoded_path(raw: &str) -> bool {
     raw.bytes().all(|b| {
-        matches!(b,
-            b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b','
-            | b';' | b'=' | b':' | b'@' | b'[' | b']' | b'%')
-            || path_byte_kept(b)
+        matches!(
+            b,
+            b'!' | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+                | b'['
+                | b']'
+                | b'%'
+        ) || path_byte_kept(b)
     })
 }
 
@@ -2643,10 +2657,7 @@ fn route(head: &HttpHead) -> Route {
 /// fragment -- Go leaves a `#` in the path, so `/ws#f` matches neither
 /// pattern -- and treating one as a delimiter would route a target dcrd
 /// sends to the catch-all straight into the websocket handler.
-fn split_request_target(
-    method: &str,
-    target: &str,
-) -> Option<(String, Option<String>)> {
+fn split_request_target(method: &str, target: &str) -> Option<(String, Option<String>)> {
     if target.is_empty() {
         return None;
     }
@@ -2753,8 +2764,7 @@ fn read_http_head<S: Read + SocketTimeout>(
     // target, or one that does not begin with a slash -- is a 400
     // before routing, as is a malformed percent escape anywhere in the
     // path.
-    let (path, query) =
-        split_request_target(&method, &target).ok_or(HeadError::Malformed)?;
+    let (path, query) = split_request_target(&method, &target).ok_or(HeadError::Malformed)?;
     // Go parses the version while splitting the request line, and an
     // unparseable one is a plain 400 like any other malformed head.
     let Some(version) = parse_http_version(version_token) else {
@@ -2804,10 +2814,7 @@ fn read_http_head<S: Read + SocketTimeout>(
             // server.
             if !name.bytes().all(is_token_octet) {
                 if name.contains(' ') {
-                    return Err(HeadError::Status(
-                        "400 Bad Request",
-                        "invalid header name",
-                    ));
+                    return Err(HeadError::Status("400 Bad Request", "invalid header name"));
                 }
                 return Err(HeadError::Malformed);
             }
@@ -3266,11 +3273,13 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
             match read_chunked_body(&mut stream, deadline, RPC_READ_LIMIT_AUTHENTICATED, true) {
                 ChunkedBody::Body(body) => body,
                 ChunkedBody::TooLarge => {
-                    let _ = write_handler_error(&mut stream, "400 Bad Request", "request too large");
+                    let _ =
+                        write_handler_error(&mut stream, "400 Bad Request", "request too large");
                     return;
                 }
                 ChunkedBody::Malformed => {
-                    let _ = write_handler_error(&mut stream, "400 Bad Request", "invalid chunked body");
+                    let _ =
+                        write_handler_error(&mut stream, "400 Bad Request", "invalid chunked body");
                     return;
                 }
                 ChunkedBody::Io => return,
@@ -3499,11 +3508,7 @@ fn write_empty_ok<S: Write>(stream: &mut S, status: &str) -> std::io::Result<()>
 /// so the body simply runs to the close.  There is no
 /// `X-Content-Type-Options` here; that one belongs to `http.Error`,
 /// which these paths never reach.
-fn write_protocol_error<S: Write>(
-    stream: &mut S,
-    status: &str,
-    body: &str,
-) -> std::io::Result<()> {
+fn write_protocol_error<S: Write>(stream: &mut S, status: &str, body: &str) -> std::io::Result<()> {
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{body}"
     );
@@ -3723,8 +3728,8 @@ mod tests {
             ("//ws?", "redirect:/ws"),
         ];
         for (target, expected) in cases {
-            let (path, query) =
-                split_request_target("GET", target).unwrap_or_else(|| panic!("{target:?} must parse"));
+            let (path, query) = split_request_target("GET", target)
+                .unwrap_or_else(|| panic!("{target:?} must parse"));
             let head = HttpHead {
                 method: "GET".to_string(),
                 target: target.to_string(),
