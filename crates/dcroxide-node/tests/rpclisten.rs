@@ -1686,6 +1686,106 @@ fn the_websocket_route_answers_gorillas_statuses() {
     listener.shutdown();
 }
 
+/// `Date` rides on every answer Go writes through its `ResponseWriter`
+/// -- handler replies, the mux's redirect, the `OPTIONS *` 200 -- and
+/// on none of the ones its connection loop writes straight to the
+/// socket, which never touch the header map.  Both halves are checked,
+/// because emitting it everywhere would be as wrong as nowhere.
+#[test]
+fn the_date_header_follows_who_wrote_the_response() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+    let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
+    let body = r#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}"#;
+
+    let dated = |request: &str| -> bool { send_raw(port, request).contains("\r\nDate: ") };
+
+    // Written through the response writer.
+    assert!(
+        dated(&format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )),
+        "the JSON reply carries a date"
+    );
+    assert!(
+        dated("POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        "the 401 carries a date"
+    );
+    assert!(
+        dated("GET //ws HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        "the redirect carries a date"
+    );
+    assert!(
+        dated("OPTIONS * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
+        "the asterisk 200 carries a date"
+    );
+
+    // Written straight to the socket by the connection loop.
+    assert!(
+        !dated("GET  HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        "a parse-level 400 carries none"
+    );
+    assert!(
+        !dated("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\n"),
+        "the 501 carries none"
+    );
+    assert!(
+        !dated("POST / HTTP/2.0\r\nHost: localhost\r\n\r\n"),
+        "the 505 carries none"
+    );
+
+    listener.shutdown();
+}
+
+/// The request line is exactly three fields and the method is a token;
+/// a header line needs a colon, a field name must be a token, a field
+/// value carries no control bytes, and a host is held to a narrower set
+/// still.  The two reason-bearing refusals are distinguished from the
+/// bare ones, since Go answers them at different layers.
+#[test]
+fn a_malformed_head_is_refused_the_way_go_refuses_it() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+    let bare = |request: &str, why: &str| {
+        let response = send_raw(port, request);
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
+            "{why}: {response:?}"
+        );
+    };
+
+    bare("G(ET / HTTP/1.1\r\nHost: localhost\r\n\r\n", "a method with a non-token byte");
+    bare(" / HTTP/1.1\r\nHost: localhost\r\n\r\n", "an empty method");
+    bare("GET / HTTP/1.1 junk\r\nHost: localhost\r\n\r\n", "a fourth request-line field");
+    bare("GET  / HTTP/1.1\r\nHost: localhost\r\n\r\n", "a doubled space");
+    bare("GET / HTTP/1.1\r\nHost: localhost\r\nNoColonHere\r\n\r\n", "a line with no colon");
+    bare("GET / HTTP/1.1\r\nHost: localhost\r\nBad(Name): x\r\n\r\n", "a non-token field name");
+    bare("GET / HTTP/1.1\r\nHost: localhost\r\nX-Bad: a\u{1}b\r\n\r\n", "a control byte in a value");
+    bare("GET / HTTP/1.1\r\nHost: a\u{1}b\r\n\r\n", "a control byte in the host");
+
+    // These two reach Go's own checks and carry their reason in the
+    // status line as well as the body.
+    let response = send_raw(port, "GET / HTTP/1.1\r\nHost: localhost\r\nBad Name: x\r\n\r\n");
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request: invalid header name"),
+        "a space in a field name is named: {response:?}"
+    );
+    let response = send_raw(port, "GET / HTTP/1.1\r\nHost: a b\r\n\r\n");
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request: malformed Host header"),
+        "a space in the host is named: {response:?}"
+    );
+
+    // A lowercase method is a method, not a misspelling, and a host
+    // with a port is ordinary.
+    let response = send_raw(port, "get / HTTP/1.1\r\nHost: localhost:9109\r\nConnection: close\r\n\r\n");
+    assert!(
+        response.starts_with("HTTP/1.1 401"),
+        "a lowercase method is served, then refused by auth: {response:?}"
+    );
+
+    listener.shutdown();
+}
+
 /// Over the wire: a query string must not cost a client the websocket
 /// route, and an uncanonical target must be redirected rather than
 /// handed to the JSON-RPC endpoint.  The first is the browser-visible

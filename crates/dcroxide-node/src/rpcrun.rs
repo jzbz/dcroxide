@@ -2433,6 +2433,19 @@ enum Route {
     NotFound,
 }
 
+/// Bytes Go accepts in a `Host` header (`httpguts.ValidHostHeader`).
+///
+/// Enumerated byte by byte against a real server rather than derived:
+/// it is the token set plus `( ) , ; = [ ] :` and without `#` `/` `?`
+/// `@` and the rest, so a tab or a space in a host is refused with its
+/// own reason where a control byte is a bare 400.
+fn is_host_byte(b: u8) -> bool {
+    matches!(b,
+        b'!' | b'$' | b'%' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b'-' | b'.'
+        | b':' | b';' | b'=' | b'[' | b']' | b'_' | b'~'
+        | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+}
+
 /// Bytes Go's `escape(_, encodePath)` leaves alone.
 ///
 /// Enumerated by running `url.URL{Path: …}.EscapedPath()` over all 256
@@ -2718,9 +2731,23 @@ fn read_http_head<S: Read + SocketTimeout>(
     let text = core::str::from_utf8(&raw).map_err(|_| HeadError::Malformed)?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next().unwrap_or("");
+    // Go cuts the request line at exactly two spaces and hands the
+    // whole remainder to `ParseHTTPVersion` (`request.go:1037-1044`), so
+    // a trailing field, or a doubled space, is a 400 rather than
+    // something quietly ignored.
     let mut parts = request_line.split(' ');
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().unwrap_or("").to_string();
+    let version_token = parts.next().unwrap_or("");
+    if parts.next().is_some() {
+        return Err(HeadError::Malformed);
+    }
+    // `validMethod` (`request.go:855`): a non-empty run of token
+    // octets, and case-sensitive -- a lowercase `get` is a method in
+    // its own right, not a spelling of `GET`.
+    if method.is_empty() || !method.bytes().all(is_token_octet) {
+        return Err(HeadError::Malformed);
+    }
     // `url.ParseRequestURI` accepts an origin-form path, an
     // absolute-form URL, or the asterisk; anything else -- an empty
     // target, or one that does not begin with a slash -- is a 400
@@ -2730,7 +2757,7 @@ fn read_http_head<S: Read + SocketTimeout>(
         split_request_target(&method, &target).ok_or(HeadError::Malformed)?;
     // Go parses the version while splitting the request line, and an
     // unparseable one is a plain 400 like any other malformed head.
-    let Some(version) = parse_http_version(parts.next().unwrap_or("")) else {
+    let Some(version) = parse_http_version(version_token) else {
         return Err(HeadError::Malformed);
     };
 
@@ -2762,8 +2789,33 @@ fn read_http_head<S: Read + SocketTimeout>(
         if line.is_empty() {
             break;
         }
-        if let Some((name, value)) = line.split_once(':') {
+        // A line with no colon is not a header, and Go refuses the
+        // whole request rather than skipping it.
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(HeadError::Malformed);
+        };
+        {
             let value = value.trim();
+            // The field name must be a token.  A space in it is the one
+            // byte that reaches Go's own check and answers with its
+            // reason; every other non-token byte is refused a step
+            // earlier, by the MIME reader, with a bare 400.  Both
+            // classes were enumerated byte by byte against a real
+            // server.
+            if !name.bytes().all(is_token_octet) {
+                if name.contains(' ') {
+                    return Err(HeadError::Status(
+                        "400 Bad Request",
+                        "invalid header name",
+                    ));
+                }
+                return Err(HeadError::Malformed);
+            }
+            // Field values carry no control bytes; a tab is the one
+            // exception, being ordinary linear whitespace.
+            if value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+                return Err(HeadError::Malformed);
+            }
             if name.eq_ignore_ascii_case("authorization") {
                 // Go's header map keeps every occurrence in arrival
                 // order and dcrd authenticates against `authhdr[0]`
@@ -2823,6 +2875,14 @@ fn read_http_head<S: Read + SocketTimeout>(
                 // (`request.go:1160-1162`).
                 if head.host.is_some() {
                     return Err(HeadError::Malformed);
+                }
+                // And it holds the host itself to a narrower set than a
+                // header value generally -- also enumerated by probe.
+                if !value.bytes().all(is_host_byte) {
+                    return Err(HeadError::Status(
+                        "400 Bad Request",
+                        "malformed Host header",
+                    ));
                 }
                 head.host = Some(value.to_string());
             }
@@ -3360,7 +3420,8 @@ impl RequestCancelWatch {
 /// [`write_protocol_error`] instead.
 fn write_json_response<S: Write>(stream: &mut S, status: &str, body: &[u8]) -> std::io::Result<()> {
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nDate: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        http_date(),
         body.len()
     );
     stream.write_all(header.as_bytes())?;
@@ -3381,6 +3442,20 @@ fn write_unauthorized<S: Write>(stream: &mut S) -> std::io::Result<()> {
     )
 }
 
+/// The `Date` every response written through Go's `ResponseWriter`
+/// carries, in the one format `net/http` uses
+/// (`TimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"`).
+///
+/// It is deliberately absent from [`write_protocol_error`]: those
+/// answers are written straight to the socket by Go's connection loop,
+/// which never touches the header map, so a parse-level 400, a 501 and
+/// a 505 all arrive without one.
+pub(crate) fn http_date() -> String {
+    chrono::Utc::now()
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string()
+}
+
 /// Write the redirect `ServeMux` sends when cleaning changed the path.
 ///
 /// `http.Redirect` with `StatusTemporaryRedirect` sets `Location`, and
@@ -3395,7 +3470,8 @@ fn write_redirect<S: Write>(stream: &mut S, location: &str) -> std::io::Result<(
         .replace('\'', "&#39;");
     let body = format!("<a href=\"{escaped}\">Temporary Redirect</a>.\n\n");
     let header = format!(
-        "HTTP/1.1 307 Temporary Redirect\r\nContent-Type: text/html; charset=utf-8\r\nLocation: {location}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 307 Temporary Redirect\r\nContent-Type: text/html; charset=utf-8\r\nLocation: {location}\r\nDate: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        http_date(),
         body.len()
     );
     stream.write_all(header.as_bytes())?;
@@ -3407,8 +3483,10 @@ fn write_redirect<S: Write>(stream: &mut S, location: &str) -> std::io::Result<(
 /// global options handler, and the 400 the mux gives every other
 /// asterisk request.  Neither carries a content type or a body.
 fn write_empty_ok<S: Write>(stream: &mut S, status: &str) -> std::io::Result<()> {
-    let response =
-        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let response = format!(
+        "HTTP/1.1 {status}\r\nDate: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        http_date()
+    );
     stream.write_all(response.as_bytes())?;
     stream.flush()
 }
@@ -3458,7 +3536,8 @@ fn write_handler_error_with<S: Write>(
         header.push_str(&format!("{name}: {value}\r\n"));
     }
     header.push_str(&format!(
-        "Content-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nDate: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        http_date(),
         body.len()
     ));
     stream.write_all(header.as_bytes())?;

@@ -990,7 +990,8 @@ fn write_handshake_error<S: Write>(
 ) -> std::io::Result<()> {
     let body = format!("{body}\n");
     let header = format!(
-        "HTTP/1.1 {status}\r\nSec-Websocket-Version: 13\r\nContent-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nSec-Websocket-Version: 13\r\nContent-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nDate: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        crate::rpcrun::http_date(),
         body.len()
     );
     stream.write_all(header.as_bytes())?;
