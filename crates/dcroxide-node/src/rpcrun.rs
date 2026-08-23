@@ -2616,7 +2616,10 @@ fn route(head: &HttpHead) -> Route {
     // has its path canonicalized first, which is why an absolute-form
     // URL with no path at all redirects to `/` while an authority-form
     // CONNECT, whose path is equally empty, does not.
-    if !head.method.eq_ignore_ascii_case("CONNECT") {
+    // Methods are compared exactly: Go tests `r.Method != "CONNECT"`
+    // against a token it never folds, so a lower-case `connect` is a
+    // method of its own and its path is canonicalized like any other.
+    if head.method != "CONNECT" {
         let cleaned = clean_path(&head.path);
         if cleaned != head.path {
             // Built from the cleaned *local* path, never from the
@@ -2680,7 +2683,7 @@ fn split_request_target(method: &str, target: &str) -> Option<(String, Option<St
             Some(slash) => &after[slash..],
             None => "",
         }
-    } else if method.eq_ignore_ascii_case("CONNECT") {
+    } else if method == "CONNECT" {
         // Authority form, legal only for CONNECT.  It leaves the path
         // empty rather than failing the parse, and nothing rooted can
         // match it.
@@ -3140,7 +3143,10 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
         Route::Asterisk => {
             // An empty 200 for `OPTIONS *`, a bare 400 for anything
             // else with that target.
-            if head.method.eq_ignore_ascii_case("OPTIONS") {
+            // Go's global options handler tests `req.Method ==
+            // "OPTIONS"` exactly, so a lower-case `options *` never
+            // reaches it and falls through to the mux's own refusal.
+            if head.method == "OPTIONS" {
                 let _ = write_empty_ok(&mut stream, "200 OK");
             } else {
                 // The mux's own refusal, which unlike the parser's
@@ -3792,6 +3798,61 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 3000, "the corpus should be large: {checked}");
+    }
+
+    /// Methods are compared exactly, never folded.  A lower-case
+    /// `connect` is a method of its own, so its authority-form target is
+    /// not a target at all and its path is canonicalized like any
+    /// other's; a lower-case `options` never reaches the global options
+    /// handler.  All three answers were taken from a real server.
+    #[test]
+    fn the_method_is_matched_case_sensitively() {
+        // Authority form belongs to CONNECT alone.
+        assert_eq!(
+            split_request_target("CONNECT", "evil.example:443"),
+            Some((String::new(), None)),
+            "CONNECT accepts an authority-form target"
+        );
+        assert!(
+            split_request_target("connect", "evil.example:443").is_none(),
+            "a lower-case connect does not"
+        );
+
+        // And only CONNECT skips canonicalization.
+        let routed = |method: &str, target: &str| {
+            let (path, query) = split_request_target(method, target).expect("parses");
+            let head = HttpHead {
+                method: method.to_string(),
+                target: target.to_string(),
+                path,
+                query,
+                ..origin_head(None, Some("localhost"))
+            };
+            match route(&head) {
+                Route::Websocket => "ws".to_string(),
+                Route::JsonRpc => "rpc".to_string(),
+                Route::Asterisk => "asterisk".to_string(),
+                Route::NotFound => "notfound".to_string(),
+                Route::Redirect(location) => format!("redirect:{location}"),
+            }
+        };
+        assert_eq!(
+            routed("CONNECT", "//ws"),
+            "rpc",
+            "CONNECT is not canonicalized"
+        );
+        assert_eq!(
+            routed("connect", "//ws"),
+            "redirect:/ws",
+            "a lower-case connect is"
+        );
+
+        // The global options handler is exact too, so `options *` falls
+        // through to the mux, which refuses every asterisk it sees.
+        assert!(
+            matches!(routed("OPTIONS", "*").as_str(), "asterisk"),
+            "the asterisk arm is reached either way"
+        );
     }
 
     /// Targets Go answers 400 to before it routes at all.
