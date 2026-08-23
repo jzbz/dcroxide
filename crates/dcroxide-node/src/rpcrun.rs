@@ -2313,7 +2313,16 @@ fn drain_declared_body<S: Read + SocketTimeout>(
 /// the headers the RPC and websocket endpoints consult.
 pub struct HttpHead {
     pub(crate) method: String,
+    /// The request target exactly as it arrived, Go's `RequestURI`.
+    /// The asterisk form is recognised on this, not on the path.
+    target: String,
+    /// The escaped path: the target with any absolute-form prefix and
+    /// any query removed.  Still escaped, because that is the form the
+    /// mux cleans.
     path: String,
+    /// Everything after the first `?`, verbatim, carried only so a
+    /// redirect can put it back.
+    query: Option<String>,
     authorization: Option<String>,
     content_length: usize,
     transfer_encoding: Option<String>,
@@ -2406,6 +2415,263 @@ fn read_head_byte<S: Read + SocketTimeout>(
     }
 }
 
+/// Where a request target sends the connection.  dcrd registers two
+/// patterns and nothing else (`rpcserver.go:5936`, `:5961`), so this is
+/// the whole of its mux.
+enum Route {
+    /// The `/ws` pattern.
+    Websocket,
+    /// The `/` pattern, which catches every other rooted path.
+    JsonRpc,
+    /// Cleaning changed the path, so the mux answers a redirect itself
+    /// rather than running either handler.
+    Redirect(String),
+    /// The asterisk target, answered before a pattern is consulted.
+    Asterisk,
+    /// No pattern matched at all, which only an authority-form CONNECT
+    /// can reach: its path is empty, and both patterns are rooted.
+    NotFound,
+}
+
+/// Bytes Go's `escape(_, encodePath)` leaves alone.
+///
+/// Enumerated by running `url.URL{Path: …}.EscapedPath()` over all 256
+/// bytes rather than transcribed from the RFC, because the set is not
+/// the one the RFC suggests: space and `*` are escaped, while `$ & + ,
+/// ; = : @` are not.
+fn path_byte_kept(b: u8) -> bool {
+    matches!(b,
+        b'$' | b'&' | b'+' | b',' | b'-' | b'.' | b'/' | b':' | b';' | b'=' | b'@' | b'_' | b'~'
+        | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
+}
+
+/// Whether a raw path is already a valid path encoding, in which case
+/// Go keeps it verbatim rather than re-deriving one
+/// (`net/url/url.go:703-724`).  The sub-delims and `[` `]` `%` are
+/// waved through on top of the unescaped set.
+fn valid_encoded_path(raw: &str) -> bool {
+    raw.bytes().all(|b| {
+        matches!(b,
+            b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b','
+            | b';' | b'=' | b':' | b'@' | b'[' | b']' | b'%')
+            || path_byte_kept(b)
+    })
+}
+
+/// Percent-encode a decoded path as `escape(_, encodePath)` does, with
+/// upper-case hex digits.
+fn escape_path(decoded: &[u8]) -> String {
+    let mut out = String::with_capacity(decoded.len());
+    for &byte in decoded {
+        if path_byte_kept(byte) {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Percent-decode, rejecting a malformed escape the way
+/// `url.ParseRequestURI` does -- Go answers such a target 400 before
+/// any routing.
+fn percent_decode(text: &str) -> Option<Vec<u8>> {
+    let raw = text.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0usize;
+    while let Some(&byte) = raw.get(i) {
+        if byte == b'%' {
+            let hex = raw.get(i.saturating_add(1)..i.saturating_add(3))?;
+            let digit = |b: u8| (b as char).to_digit(16).and_then(|d| u8::try_from(d).ok());
+            let high = digit(*hex.first()?)?;
+            let low = digit(*hex.get(1)?)?;
+            out.push(high.checked_mul(16)?.checked_add(low)?);
+            i = i.saturating_add(3);
+        } else {
+            out.push(byte);
+            i = i.saturating_add(1);
+        }
+    }
+    Some(out)
+}
+
+/// The path form the mux cleans and matches against: `EscapedPath()`.
+///
+/// This is the step that makes the whole thing work, and it is not
+/// obvious.  Go keeps the target's own escaping only while it is a
+/// *valid* one; a target carrying anything that has to be escaped --
+/// `#`, `{`, a backslash, any non-ASCII byte -- is instead re-derived
+/// from the decoded path, which turns a `%2f` in it into a real
+/// separator and lets a `..` beside it resolve.  So `/#/%2f../ws`
+/// cleans to `/ws` and redirects, while `/ws%2f..%2ffoo`, whose
+/// encoding is valid, is left alone entirely.  Cleaning the raw target
+/// instead gets both of those wrong.
+fn escaped_path(raw: &str) -> Option<String> {
+    let decoded = percent_decode(raw)?;
+    if valid_encoded_path(raw) {
+        return Some(raw.to_string());
+    }
+    Some(escape_path(&decoded))
+}
+
+/// Clean a path the way `ServeMux` does before matching (`cleanPath`):
+/// `path.Clean` over a rooted copy, with the trailing slash put back,
+/// since `Clean` drops it and the mux distinguishes `/ws` from `/ws/`.
+fn clean_path(target: &str) -> String {
+    if target.is_empty() {
+        return "/".to_string();
+    }
+    let rooted;
+    let target = if target.starts_with('/') {
+        target
+    } else {
+        rooted = format!("/{target}");
+        &rooted
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    for segment in target.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                kept.pop();
+            }
+            other => kept.push(other),
+        }
+    }
+    let mut cleaned = if kept.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", kept.join("/"))
+    };
+    if target.ends_with('/') && cleaned != "/" {
+        cleaned.push('/');
+    }
+    cleaned
+}
+
+/// The decoded path patterns are matched against.  Go splits the
+/// escaped path on literal separators and unescapes each segment
+/// afterwards, so a `%2f` stays inside its own segment and can never
+/// create a boundary.
+fn decoded_path(escaped: &str) -> Option<String> {
+    let mut out = String::new();
+    for (index, segment) in escaped.split('/').enumerate() {
+        if index > 0 {
+            out.push('/');
+        }
+        out.push_str(&String::from_utf8_lossy(&percent_decode(segment)?));
+    }
+    Some(out)
+}
+
+/// Percent-escape the bytes a `Location` may not carry raw, the way
+/// `hexEscapeNonASCII` does (`net/http/http.go:156`) -- note the
+/// lower-case hex, where the path escaping above uses upper case.
+fn hex_escape_non_ascii(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte < 0x80 {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02x}"));
+        }
+    }
+    out
+}
+
+/// Route a parsed head the way `ServeMux` routes a request.
+fn route(head: &HttpHead) -> Route {
+    if head.target == "*" {
+        return Route::Asterisk;
+    }
+    // CONNECT is routed on the path as it stands; every other method
+    // has its path canonicalized first, which is why an absolute-form
+    // URL with no path at all redirects to `/` while an authority-form
+    // CONNECT, whose path is equally empty, does not.
+    if !head.method.eq_ignore_ascii_case("CONNECT") {
+        let cleaned = clean_path(&head.path);
+        if cleaned != head.path {
+            // Built from the cleaned *local* path, never from the
+            // request's authority, so an absolute-form target naming
+            // another host cannot steer it: `//evil/ws` cleans to the
+            // local path `/evil/ws`.  An empty query is dropped rather
+            // than leaving a bare `?`.
+            let mut location = cleaned;
+            match &head.query {
+                Some(query) if !query.is_empty() => {
+                    location.push('?');
+                    location.push_str(query);
+                }
+                _ => {}
+            }
+            return Route::Redirect(hex_escape_non_ascii(&location));
+        }
+    }
+    // Both patterns are rooted, so an empty path matches neither.
+    if head.path.is_empty() {
+        return Route::NotFound;
+    }
+    match decoded_path(&head.path).as_deref() {
+        Some("/ws") => Route::Websocket,
+        _ => Route::JsonRpc,
+    }
+}
+
+/// Split a request target into the escaped path the mux works on and
+/// the query, the way `url.ParseRequestURI` does for the forms a server
+/// sees.
+///
+/// Returns `None` for a target Go rejects outright with a 400: one that
+/// is empty, one in origin form that does not begin with a slash, or
+/// one whose path carries a malformed percent escape.
+///
+/// The fragment is deliberately not split off.  A request target has no
+/// fragment -- Go leaves a `#` in the path, so `/ws#f` matches neither
+/// pattern -- and treating one as a delimiter would route a target dcrd
+/// sends to the catch-all straight into the websocket handler.
+fn split_request_target(
+    method: &str,
+    target: &str,
+) -> Option<(String, Option<String>)> {
+    if target.is_empty() {
+        return None;
+    }
+    if target == "*" {
+        return Some((String::new(), None));
+    }
+    // Absolute form: drop scheme and authority, keeping the path that
+    // follows.  A URL with no path at all has an empty one, which
+    // cleans to "/" and therefore redirects.
+    let rest = if target.starts_with('/') {
+        // Origin form.  A target beginning with a slash is never read
+        // as absolute, so `/://ws` is a path that cleans to `/:/ws`
+        // rather than a URL with an empty authority.
+        target
+    } else if let Some((_scheme, after)) = target.split_once("://") {
+        // Absolute form: drop scheme and authority, keep the path.  A
+        // URL with no path has an empty one, which cleans to `/` and so
+        // redirects.
+        match after.find('/') {
+            Some(slash) => &after[slash..],
+            None => "",
+        }
+    } else if method.eq_ignore_ascii_case("CONNECT") {
+        // Authority form, legal only for CONNECT.  It leaves the path
+        // empty rather than failing the parse, and nothing rooted can
+        // match it.
+        return Some((String::new(), None));
+    } else {
+        // Neither rooted nor absolute: not a request target at all.
+        return None;
+    };
+    let (path, query) = match rest.split_once('?') {
+        Some((path, query)) => (path, Some(query.to_string())),
+        None => (rest, None),
+    };
+    Some((escaped_path(path)?, query))
+}
+
 /// Parse an HTTP version token exactly as Go's `ParseHTTPVersion` does
 /// (`net/http/request.go:827-852`): the two common spellings, else
 /// `HTTP/X.Y` with a single digit on each side, so `HTTP/1.10` is
@@ -2454,7 +2720,14 @@ fn read_http_head<S: Read + SocketTimeout>(
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split(' ');
     let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("").to_string();
+    let target = parts.next().unwrap_or("").to_string();
+    // `url.ParseRequestURI` accepts an origin-form path, an
+    // absolute-form URL, or the asterisk; anything else -- an empty
+    // target, or one that does not begin with a slash -- is a 400
+    // before routing, as is a malformed percent escape anywhere in the
+    // path.
+    let (path, query) =
+        split_request_target(&method, &target).ok_or(HeadError::Malformed)?;
     // Go parses the version while splitting the request line, and an
     // unparseable one is a plain 400 like any other malformed head.
     let Some(version) = parse_http_version(parts.next().unwrap_or("")) else {
@@ -2463,7 +2736,9 @@ fn read_http_head<S: Read + SocketTimeout>(
 
     let mut head = HttpHead {
         method,
+        target,
         path,
+        query,
         authorization: None,
         content_length: 0,
         transfer_encoding: None,
@@ -2572,7 +2847,7 @@ fn read_http_head<S: Read + SocketTimeout>(
     // its own upgrade.
     match version {
         (1, _) => {}
-        (2, 0) if head.method == "PRI" && head.path == "*" => {}
+        (2, 0) if head.method == "PRI" && head.target == "*" => {}
         _ => {
             return Err(HeadError::Status(
                 "505 HTTP Version Not Supported",
@@ -2788,7 +3063,33 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     // valid upgrade is gorilla's to refuse -- it must not fall through
     // to the RPC endpoint, which would answer a different status for
     // the same request dcrd hands to `Upgrade`.
-    if head.path == "/ws" {
+    let route = route(&head);
+    match &route {
+        // The mux answers these two itself, before either handler runs.
+        Route::Redirect(location) => {
+            let _ = write_redirect(&mut stream, location);
+            return;
+        }
+        Route::Asterisk => {
+            // An empty 200 for `OPTIONS *`, a bare 400 for anything
+            // else with that target.
+            if head.method.eq_ignore_ascii_case("OPTIONS") {
+                let _ = write_empty_ok(&mut stream, "200 OK");
+            } else {
+                // The mux's own refusal, which unlike the parser's
+                // carries no content type and no body.
+                let _ = write_empty_ok(&mut stream, "400 Bad Request");
+            }
+            return;
+        }
+        Route::NotFound => {
+            let _ = write_handler_error(&mut stream, "404 Not Found", "404 page not found");
+            return;
+        }
+        Route::Websocket | Route::JsonRpc => {}
+    }
+
+    if matches!(route, Route::Websocket) {
         // The upgrade allows an unauthenticated connection that must
         // authenticate in-band (dcrd `checkAuth` with `require =
         // false`), and it runs before `Upgrade` does.
@@ -3080,6 +3381,38 @@ fn write_unauthorized<S: Write>(stream: &mut S) -> std::io::Result<()> {
     )
 }
 
+/// Write the redirect `ServeMux` sends when cleaning changed the path.
+///
+/// `http.Redirect` with `StatusTemporaryRedirect` sets `Location`, and
+/// for a GET it also writes the little HTML body Go generates, with the
+/// target HTML-escaped inside the anchor.
+fn write_redirect<S: Write>(stream: &mut S, location: &str) -> std::io::Result<()> {
+    let escaped = location
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&#34;")
+        .replace('\'', "&#39;");
+    let body = format!("<a href=\"{escaped}\">Temporary Redirect</a>.\n\n");
+    let header = format!(
+        "HTTP/1.1 307 Temporary Redirect\r\nContent-Type: text/html; charset=utf-8\r\nLocation: {location}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()
+}
+
+/// Write a bodiless answer: the 200 Go gives `OPTIONS *` from its
+/// global options handler, and the 400 the mux gives every other
+/// asterisk request.  Neither carries a content type or a body.
+fn write_empty_ok<S: Write>(stream: &mut S, status: &str) -> std::io::Result<()> {
+    let response =
+        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    stream.write_all(response.as_bytes())?;
+    stream.flush()
+}
+
 /// Write an error Go's connection loop answers before any handler runs.
 ///
 /// `conn.serve` writes its own bytes for these, using one fixed header
@@ -3187,7 +3520,9 @@ mod tests {
     fn origin_head(origin: Option<&str>, host: Option<&str>) -> HttpHead {
         HttpHead {
             method: "GET".to_string(),
+            target: "/ws".to_string(),
             path: "/ws".to_string(),
+            query: None,
             authorization: None,
             content_length: 0,
             transfer_encoding: None,
@@ -3198,6 +3533,191 @@ mod tests {
             sec_websocket_version: Vec::new(),
             origin: origin.map(str::to_string),
             host: host.map(str::to_string),
+        }
+    }
+
+    /// `clean_path` against Go's own `cleanPath`.
+    ///
+    /// Every expectation was produced by running Go's `cleanPath` --
+    /// `path.Clean` plus the trailing-slash rule -- over these inputs,
+    /// not derived from reading it.  The rows that matter most are the
+    /// ones where cleaning must *not* happen: an encoded slash is an
+    /// ordinary character here, so `/ws%2f..%2ffoo` comes back
+    /// untouched rather than resolving into `/foo`.
+    #[test]
+    fn clean_path_matches_go() {
+        let cases: &[(&str, &str)] = &[
+            ("/", "/"),
+            ("/ws", "/ws"),
+            ("//ws", "/ws"),
+            ("///ws", "/ws"),
+            ("/./ws", "/ws"),
+            ("/a/../ws", "/ws"),
+            ("/ws/", "/ws/"),
+            ("/ws//", "/ws/"),
+            ("/a/b/../../ws", "/ws"),
+            ("/../ws", "/ws"),
+            ("/../../ws", "/ws"),
+            ("/a/./b/", "/a/b/"),
+            ("/a//b//c", "/a/b/c"),
+            ("", "/"),
+            ("ws", "/ws"),
+            ("/.", "/"),
+            ("/..", "/"),
+            ("/a/..", "/"),
+            ("/a/../", "/"),
+            ("/./", "/"),
+            ("//", "/"),
+            ("/a/b/c/../../../..", "/"),
+            ("/ws/.", "/ws"),
+            ("/ws/..", "/"),
+            ("/ws/../ws", "/ws"),
+            ("/%77s", "/%77s"),
+            ("/ws%2f..%2ffoo", "/ws%2f..%2ffoo"),
+            ("/foo/./../ws/", "/ws/"),
+            ("/a/b/../c/./d//e", "/a/c/d/e"),
+            ("/...", "/..."),
+            ("/....", "/...."),
+            ("/a/...", "/a/..."),
+            ("/ws%23f", "/ws%23f"),
+            ("/ws.", "/ws."),
+            ("/.ws", "/.ws"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                clean_path(input),
+                *expected,
+                "Go cleans {input:?} to {expected:?}"
+            );
+        }
+    }
+
+    /// Routing against the outcomes a real `http.Server` gives, driven
+    /// over raw sockets with dcrd's two mux patterns registered.
+    #[test]
+    fn routing_matches_go_servemux() {
+        let cases: &[(&str, &str)] = &[
+            ("/ws", "ws"),
+            ("/ws?x=1", "ws"),
+            ("/%77s", "ws"),
+            ("/w%73", "ws"),
+            ("http://localhost/ws", "ws"),
+            ("http://evil.example/ws", "ws"),
+            ("/ws?a=/b", "ws"),
+            ("/ws?a=?b", "ws"),
+            // Exact pattern, so the trailing slash misses it.
+            ("/ws/", "rpc"),
+            ("/WS", "rpc"),
+            ("/ws%20", "rpc"),
+            ("/foo", "rpc"),
+            ("/", "rpc"),
+            ("/ws#frag", "rpc"),
+            // An encoded slash stays inside its own segment.
+            ("/ws%2f..%2ffoo", "rpc"),
+            ("/foo%2f..%2fws", "rpc"),
+            ("/%2fws", "rpc"),
+            ("/..%2fws", "rpc"),
+            ("/ws%3fx=1", "rpc"),
+            ("/\\ws", "rpc"),
+            // Cleaning changed the path, so the mux redirects instead.
+            ("//ws", "redirect:/ws"),
+            ("/./ws", "redirect:/ws"),
+            ("/a/../ws", "redirect:/ws"),
+            ("///ws", "redirect:/ws"),
+            ("/ws//", "redirect:/ws/"),
+            ("//ws?x=1", "redirect:/ws?x=1"),
+            ("/./ws?x=1", "redirect:/ws?x=1"),
+            ("//ws#f", "redirect:/ws%23f"),
+            // Never an open redirect: the authority becomes a path.
+            ("//evil.example/ws", "redirect:/evil.example/ws"),
+            ("*", "asterisk"),
+            // These four are why the escaped path, not the raw target,
+            // is what gets cleaned: each carries a byte that forces
+            // re-escaping, which decodes the `%2f` into a separator and
+            // lets the `..` beside it resolve.
+            ("/#/%2f../ws", "redirect:/ws"),
+            ("//{/%2f../ws", "redirect:/ws"),
+            ("/\\/%2f../ws", "redirect:/ws"),
+            // A valid encoding is left exactly as it arrived.
+            ("/%2e%2e/ws", "rpc"),
+            // An empty query leaves no trailing question mark behind.
+            ("//ws?", "redirect:/ws"),
+        ];
+        for (target, expected) in cases {
+            let (path, query) =
+                split_request_target("GET", target).unwrap_or_else(|| panic!("{target:?} must parse"));
+            let head = HttpHead {
+                method: "GET".to_string(),
+                target: target.to_string(),
+                path,
+                query,
+                ..origin_head(None, Some("localhost"))
+            };
+            let actual = match route(&head) {
+                Route::Websocket => "ws".to_string(),
+                Route::JsonRpc => "rpc".to_string(),
+                Route::Asterisk => "asterisk".to_string(),
+                Route::Redirect(location) => format!("redirect:{location}"),
+                Route::NotFound => "notfound".to_string(),
+            };
+            assert_eq!(actual, *expected, "Go routes {target:?} to {expected:?}");
+        }
+    }
+
+    /// The whole routing pipeline against a real `net/http` `ServeMux`.
+    ///
+    /// `tests/data/muxroute.tsv` was generated by driving raw request
+    /// lines at a stock `http.Server` carrying dcrd's two registrations
+    /// and recording what came back -- handler, redirect target, or
+    /// refusal.  It is 4,016 targets built by combining separators,
+    /// dot segments, encoded separators and dots, non-ASCII bytes, and
+    /// the characters that force a path to be re-escaped, which is the
+    /// combination the escaped-path rule turns on.
+    ///
+    /// This is the only check that covers the request-target parser
+    /// itself rather than the routing decision on top of it.
+    #[test]
+    fn routing_matches_go_over_the_generated_corpus() {
+        let vectors = include_str!("../tests/data/muxroute.tsv");
+        let mut checked = 0usize;
+        for line in vectors.lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let (target, expected) = line.split_once('\t').expect("two columns");
+            let actual = match split_request_target("GET", target) {
+                None => "reject".to_string(),
+                Some((path, query)) => {
+                    let head = HttpHead {
+                        method: "GET".to_string(),
+                        target: target.to_string(),
+                        path,
+                        query,
+                        ..origin_head(None, Some("localhost"))
+                    };
+                    match route(&head) {
+                        Route::Websocket => "ws".to_string(),
+                        Route::JsonRpc => "rpc".to_string(),
+                        Route::Asterisk => "asterisk".to_string(),
+                        Route::NotFound => "notfound".to_string(),
+                        Route::Redirect(location) => format!("redirect:{location}"),
+                    }
+                }
+            };
+            assert_eq!(actual, expected, "Go routes {target:?} to {expected:?}");
+            checked += 1;
+        }
+        assert!(checked > 3000, "the corpus should be large: {checked}");
+    }
+
+    /// Targets Go answers 400 to before it routes at all.
+    #[test]
+    fn unroutable_targets_are_refused() {
+        for target in ["", "ws", "/ws%zz", "/w%7"] {
+            assert!(
+                split_request_target("GET", target).is_none(),
+                "{target:?} is a 400 in Go, not a route"
+            );
         }
     }
 

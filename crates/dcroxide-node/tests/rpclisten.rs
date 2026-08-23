@@ -1686,6 +1686,62 @@ fn the_websocket_route_answers_gorillas_statuses() {
     listener.shutdown();
 }
 
+/// Over the wire: a query string must not cost a client the websocket
+/// route, and an uncanonical target must be redirected rather than
+/// handed to the JSON-RPC endpoint.  The first is the browser-visible
+/// case -- `new WebSocket("ws://host/ws?token=…")` sends `GET
+/// /ws?token=…`, which dcrd upgrades.
+#[test]
+fn the_websocket_route_survives_a_query_and_redirects_uncanonical_targets() {
+    let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
+    let auth = dcroxide_rpc::http::base64_std_encode(b"user:pass");
+    let handshake = |target: &str| {
+        format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n")
+    };
+
+    let response = send_raw(port, &handshake("/ws?token=abc"));
+    assert!(
+        response.starts_with("HTTP/1.1 101"),
+        "a query does not leave the websocket route: {response:?}"
+    );
+
+    // Percent-encoding is decoded before the pattern is compared.
+    let response = send_raw(port, &handshake("/%77s"));
+    assert!(
+        response.starts_with("HTTP/1.1 101"),
+        "the path is matched decoded: {response:?}"
+    );
+
+    // Cleaning changed the path, so the mux answers instead of either
+    // handler -- before authentication and before any upgrade.
+    let response = send_raw(port, &handshake("//ws?token=abc"));
+    assert!(
+        response.starts_with("HTTP/1.1 307 Temporary Redirect"),
+        "an uncanonical target is redirected: {response:?}"
+    );
+    assert!(
+        response.contains("Location: /ws?token=abc"),
+        "the query rides along to the cleaned path: {response:?}"
+    );
+
+    // An encoded slash is not a separator, so it cannot walk into the
+    // websocket route.
+    let response = send_raw(port, &handshake("/%2fws"));
+    assert!(
+        !response.starts_with("HTTP/1.1 101"),
+        "an encoded slash must not reach the upgrade: {response:?}"
+    );
+
+    // Never an open redirect: the authority becomes part of the path.
+    let response = send_raw(port, &handshake("//evil.example/ws"));
+    assert!(
+        response.contains("Location: /evil.example/ws"),
+        "the redirect stays local: {response:?}"
+    );
+
+    listener.shutdown();
+}
+
 /// End to end over the wire: the framing headers a websocket handshake
 /// is judged by are `1#token` lists, so every copy counts and a
 /// parameter on an earlier token voids the value it sits in.  Verified
