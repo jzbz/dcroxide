@@ -364,10 +364,11 @@ pub fn deserialize_ticket_hashes(b: &[u8]) -> Result<Vec<Hash>, TicketDbError> {
         ));
     }
     let mut ths = Vec::with_capacity(b.len() / 32);
-    for chunk in b.chunks_exact(32) {
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(chunk);
-        ths.push(Hash(hash));
+    // The length was checked to be a whole number of hashes above, so
+    // the remainder here is always empty.
+    let (chunks, _rem) = b.as_chunks::<32>();
+    for chunk in chunks {
+        ths.push(Hash(*chunk));
     }
     Ok(ths)
 }

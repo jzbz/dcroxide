@@ -185,16 +185,16 @@ impl Blake256 {
             }
         }
 
-        // Full blocks straight from the input.
-        let mut chunks = data.chunks_exact(BLOCK_LEN);
-        for blk in &mut chunks {
+        // Full blocks straight from the input.  `as_chunks` hands back
+        // `&[u8; BLOCK_LEN]` already, which is what `compress` takes, so
+        // the block goes in without the copy through a local array that
+        // `chunks_exact` forced.
+        let (blocks, rem) = data.as_chunks::<BLOCK_LEN>();
+        for block in blocks {
             self.compressed_bits += (BLOCK_LEN as u64) * 8;
-            let mut b = [0u8; BLOCK_LEN];
-            b.copy_from_slice(blk);
-            self.compress(&b, self.compressed_bits);
+            self.compress(block, self.compressed_bits);
         }
 
-        let rem = chunks.remainder();
         self.buf[..rem.len()].copy_from_slice(rem);
         self.buf_len = rem.len();
     }
