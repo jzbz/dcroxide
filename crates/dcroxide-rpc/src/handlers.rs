@@ -2131,11 +2131,10 @@ pub fn handle_get_raw_transaction<C: RpcChain>(
 
     // Try to fetch the transaction from the memory pool and if that
     // fails, try the block database.
-    let mtx: MsgTx;
     let mut blk_hash: Option<Hash> = None;
     let mut blk_height: i64 = 0;
     let mut blk_index: u32 = 0;
-    match server.cfg.tx_mempooler.fetch_transaction(&tx_hash) {
+    let mtx: MsgTx = match server.cfg.tx_mempooler.fetch_transaction(&tx_hash) {
         Err(_) => {
             let Some(tx_index) = server.cfg.tx_indexer.as_ref() else {
                 return Err(rpc_internal_err(
@@ -2198,7 +2197,7 @@ pub fn handle_get_raw_transaction<C: RpcChain>(
             // Deserialize the transaction.
             let (msg_tx, _) =
                 MsgTx::from_bytes(&tx_bytes).map_err(|e| rpc_internal_err(&format!("{e:?}")))?;
-            mtx = msg_tx;
+            msg_tx
         }
         Ok((tx, _tree)) => {
             // When the verbose flag isn't set, simply return the
@@ -2209,9 +2208,9 @@ pub fn handle_get_raw_transaction<C: RpcChain>(
                 return Ok(GoValue::String(mtx_hex));
             }
 
-            mtx = tx;
+            tx
         }
-    }
+    };
 
     // The verbose flag is set, so generate the JSON object and return
     // it.
