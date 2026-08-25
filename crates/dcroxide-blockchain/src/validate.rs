@@ -778,6 +778,82 @@ const BLOCK_962928_HASH: Hash = Hash([
     0x13, 0x57, 0xf5, 0x6f, 0x45, 0x1d, 0x11, 0x39, 0xfd, 0x67, 0xb2, 0xd1, 0x4f, 0x00, 0x00, 0x00,
 ]);
 
+/// Utxos on the main network that were valid under old consensus rules
+/// but are no longer valid.  They are part of the historical main chain
+/// and so must be allowed, or an initial sync would reject the blocks
+/// that contain them (dcrd `sbssViolations`).  Hashes are in internal
+/// byte order, as `BLOCK_413762_HASH` and friends above are.
+const SBSS_VIOLATIONS: &[(i64, Hash)] = &[
+    (
+        1106817,
+        Hash([
+            0x3b, 0x61, 0x39, 0xb9, 0xe3, 0xe5, 0x2d, 0x88, 0x09, 0xdb, 0x3a, 0x2a, 0x88, 0x39, 0x66, 0x78,
+            0x5e, 0x5b, 0xfd, 0x31, 0x43, 0xd5, 0xe0, 0x6e, 0xaa, 0xc8, 0x12, 0x5f, 0xdc, 0xec, 0x75, 0x08,
+        ]),
+    ),
+    (
+        1106831,
+        Hash([
+            0x27, 0xee, 0x80, 0x7c, 0xc3, 0xb0, 0xae, 0xfe, 0xcd, 0xba, 0x38, 0x7b, 0xa6, 0x0c, 0x44, 0xa3,
+            0x3e, 0xd4, 0x53, 0x08, 0x90, 0xd2, 0x0f, 0x48, 0x33, 0xcd, 0x37, 0x89, 0x35, 0x71, 0x4e, 0x71,
+        ]),
+    ),
+    (
+        1106837,
+        Hash([
+            0x18, 0xcd, 0xda, 0x2c, 0x3c, 0xa3, 0x38, 0x9f, 0xd6, 0x88, 0x3f, 0x26, 0x3c, 0x64, 0xa7, 0xcd,
+            0x37, 0xbd, 0x40, 0x7f, 0xf2, 0x68, 0x3e, 0xc1, 0xe3, 0x34, 0xa3, 0xef, 0xa4, 0x09, 0xba, 0xae,
+        ]),
+    ),
+    (
+        1106854,
+        Hash([
+            0x39, 0xa4, 0xc7, 0x70, 0x14, 0x15, 0xc8, 0x28, 0xcf, 0xb3, 0xdb, 0xd2, 0xa9, 0xc2, 0x55, 0xd7,
+            0xa6, 0xac, 0x19, 0x93, 0x47, 0x2e, 0xaa, 0x84, 0x70, 0xdd, 0xd6, 0xd9, 0x66, 0x82, 0x22, 0x17,
+        ]),
+    ),
+    (
+        1106860,
+        Hash([
+            0x6d, 0x4e, 0xfc, 0x70, 0x92, 0x9b, 0x1f, 0x06, 0x58, 0xfd, 0x7d, 0x45, 0x66, 0x57, 0x03, 0x5e,
+            0xc2, 0x52, 0xf4, 0xa1, 0xdc, 0x74, 0x94, 0x96, 0x03, 0x9f, 0x60, 0x1b, 0xed, 0xd3, 0xd6, 0x20,
+        ]),
+    ),
+    (
+        1107195,
+        Hash([
+            0xd3, 0xb2, 0x0a, 0xac, 0x85, 0xab, 0xd3, 0x4d, 0xa6, 0xde, 0xe8, 0x6b, 0x82, 0xf1, 0x72, 0x97,
+            0x8d, 0xcf, 0xb3, 0x6f, 0x90, 0xb1, 0x95, 0xb7, 0x1c, 0x63, 0x0c, 0xfe, 0x98, 0x18, 0x2e, 0x5d,
+        ]),
+    ),
+];
+
+/// The same exception for the version 3 test network (dcrd
+/// `sbssViolationsTestnet3`).
+const SBSS_VIOLATIONS_TESTNET3: &[(i64, Hash)] = &[
+    (
+        1980161,
+        Hash([
+            0x58, 0xbb, 0xdc, 0xb3, 0x76, 0xa6, 0xb7, 0xc6, 0x5f, 0xb7, 0xad, 0x63, 0xd8, 0xb7, 0xbe, 0x4c,
+            0x44, 0x9e, 0x0a, 0xe1, 0xdb, 0xc1, 0xb5, 0xbb, 0xc5, 0x7b, 0x77, 0x1a, 0xed, 0x6e, 0x1b, 0x45,
+        ]),
+    ),
+];
+
+/// Whether the utxo at the given height is one that was valid under old
+/// consensus rules but is no longer valid, and so would be incorrectly
+/// rejected during an initial sync (dcrd `isSBSSpendViolation`).
+fn is_sbss_spend_violation(params: &Params, tx_height: i64, utxo_hash: &Hash) -> bool {
+    let table = match params.net {
+        dcroxide_wire::CurrencyNet::MAIN_NET => SBSS_VIOLATIONS,
+        dcroxide_wire::CurrencyNet::TEST_NET3 => SBSS_VIOLATIONS_TESTNET3,
+        _ => return false,
+    };
+    table
+        .iter()
+        .any(|(height, hash)| *height == tx_height && hash == utxo_hash)
+}
+
 /// The DCP0005 hash constants in dump order, exposed so the parity
 /// vectors can pin the exact bytes against dcrd's literals.
 pub fn dcp0005_constants() -> [(&'static str, Hash); 6] {
@@ -2683,6 +2759,7 @@ pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
     // is range checked and contributes to the input sum (its fee is
     // zero for a valid treasurybase, as before).
     let is_treasury_base = is_treasury_enabled && dcroxide_standalone::is_treasury_base(tx);
+    let is_treasury_add = dcroxide_stake::is_tadd(tx);
 
     // Coinbase transactions have no inputs.
     if !is_treasury_base && dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled) {
@@ -2763,6 +2840,15 @@ pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
         check_treasury_spend_inputs(tx)?;
     }
 
+    // Every stake transaction type, for the same-block spend check in
+    // the input loop below (dcrd's `isStakeTx`).
+    let is_stake_tx = is_ticket
+        || is_vote
+        || is_revocation
+        || is_treasury_add
+        || is_treasury_spend
+        || is_treasury_base;
+
     // General transaction testing (and a few stake exceptions).
     //
     // Accumulate the total input amount while ensuring the accumulator
@@ -2818,6 +2904,22 @@ pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
                 ));
             }
         };
+
+        // Stake transactions are never allowed to spend transactions
+        // from the regular or stake tree of the same block.
+        if is_stake_tx
+            && utxo_entry.block_height() == tx_height
+            && !is_sbss_spend_violation(params, tx_height, tx_in_hash)
+        {
+            let tx_hash = tx.tx_hash();
+            return Err(rule_error(
+                RuleErrorKind::MissingTxOut,
+                format!(
+                    "stake transaction input {tx_hash}:{idx} tried to spend output \
+                     {tx_in_outpoint} at same height {tx_height}"
+                ),
+            ));
+        }
 
         // Using zero value outputs as inputs is banned.
         if utxo_entry.amount() == 0 {
@@ -4737,6 +4839,15 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     // Load all of the utxos referenced by the block that are not
     // already in the view.
     view.fetch_input_utxos(block, &regular_tx_hashes, resolver, is_treasury_enabled);
+
+    // Add utxo entries that were valid under old consensus rules but
+    // are no longer valid and would therefore cause the block to be
+    // incorrectly rejected during an initial sync (dcrd `a38c0195`).
+    for (idx, tx) in block.transactions.iter().enumerate() {
+        if is_sbss_spend_violation(params, node_height, &regular_tx_hashes[idx]) {
+            view.add_tx_out(tx, 0, node_height, idx as u32, is_treasury_enabled);
+        }
+    }
 
     // Determine the subsidy split.
     let split = crate::agendas::is_agenda_active(

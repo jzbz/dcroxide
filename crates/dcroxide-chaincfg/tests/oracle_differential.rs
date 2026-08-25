@@ -25,16 +25,13 @@ fn params_dumps_match_dcrd() {
         let theirs_hex = oracle.call_ok("chaincfg_dump", name.as_bytes());
         let theirs = String::from_utf8(unhex(&theirs_hex)).expect("oracle dump is UTF-8");
 
-        // dcrd adopted the dcr-seed.jz.bz mainnet seeder in `b9b64533`,
-        // so it is no longer a dcroxide addition and this exclusion is
-        // now pure pin skew: the oracle links `chaincfg/v3 v3.3.0`,
-        // which predates that commit, so dcrd's dump still lacks the
-        // entry while ours carries it.
-        //
-        // DELETE the filter below when the oracle's chaincfg dependency
-        // moves past `b9b64533` — at that point dcrd's dump gains the
-        // seeder, the filter strips it from ours alone, and this test
-        // starts failing on a line that is actually in agreement.
+        // The dcr-seed.jz.bz mainnet seeder arrived upstream in
+        // `b9b64533`.  While the oracle still linked `chaincfg/v3
+        // v3.3.0`, which predates that commit, dcrd's dump lacked the
+        // entry and ours carried it, so this comparison filtered the
+        // line out of ours.  The oracle now links chaincfg at the
+        // parity pin, both dumps carry the seeder, and the filter is
+        // gone — the assertion below keeps the entry itself pinned.
         if name == "mainnet" {
             assert!(
                 params.seeders.contains(&"dcr-seed.jz.bz"),
@@ -44,7 +41,6 @@ fn params_dumps_match_dcrd() {
         let ours: String = params
             .dump()
             .lines()
-            .filter(|line| *line != "seeder=dcr-seed.jz.bz")
             .map(|line| format!("{line}\n"))
             .collect();
         if ours != theirs {

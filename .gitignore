@@ -9,6 +9,9 @@ Cargo.lock.orig
 # Go oracle build output (built into /target/oracle by the test harness)
 tools/oracle/dcrd-oracle
 tools/oracle/dcrd-oracle.exe
+# ... and the default name `go build ./...` produces when run in-dir
+tools/oracle/oracle
+tools/fullblockgen/fullblockgen
 
 # Editors
 *.swp
