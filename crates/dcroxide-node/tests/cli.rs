@@ -86,16 +86,38 @@ fn unknown_flag_exits_one_with_error() {
     assert!(stderr.contains("Use dcroxide -h"), "stderr: {stderr}");
 }
 
-/// Spawn the daemon with `args` (plus an isolated app data directory),
-/// then wait up to 20s for a stdout or stderr line satisfying `wanted`,
-/// returning that line.  On timeout the panic message includes every
-/// line the daemon printed, so a startup failure on a CI platform that
-/// cannot be reproduced locally is still diagnosable rather than a bare
-/// "line never appeared".
+/// Spawn the daemon with `args` (plus an isolated app data directory,
+/// `--norpc` and `--noseeders`), then wait up to 20s for a stdout or
+/// stderr line satisfying `wanted`, returning that line.  On timeout the
+/// panic message includes every line the daemon printed, so a startup
+/// failure on a CI platform that cannot be reproduced locally is still
+/// diagnosable rather than a bare "line never appeared".
+///
+/// `--norpc` is supplied here rather than by each caller because it is
+/// isolation, the same category as the unique app data directory above,
+/// and it belongs wherever that does.  The RPC server binds the default
+/// `rpclisten` port, which is fixed rather than per-process, so two
+/// daemons alive at once — this binary's tests running in parallel, or
+/// any other test in the workspace that starts one — collide on it.  The
+/// daemon treats that bind failure as fatal, so the collision does not
+/// surface as a port error but as the awaited line never arriving, which
+/// reads exactly like the behaviour under test having broken.  No caller
+/// here exercises RPC; one that needs to must pass its own
+/// `--rpclisten=127.0.0.1:0` and not use this helper.
+///
+/// `--noseeders` is here for the same reason.  These tests run on
+/// mainnet, so without it the daemon resolves the real DNS seeders and
+/// dials whatever they return — four of them answered on a plain run
+/// while this helper was being fixed.  A unit test of argument handling
+/// and startup ordering has no business reaching the network: it makes
+/// the suite depend on DNS, on the seeders being up, and on the machine
+/// having a route, none of which the assertions are about.
 fn wait_for_daemon_line(tag: &str, args: &[&str], wanted: impl Fn(&str) -> bool) -> String {
     let home = isolated_appdata(tag);
     let mut child = Command::new(env!("CARGO_BIN_EXE_dcroxide"))
         .args(args)
+        .arg("--norpc")
+        .arg("--noseeders")
         .arg(format!("--appdata={}", home.display()))
         .env_remove("DCRD_APPDATA")
         .stdout(Stdio::piped())
@@ -164,9 +186,13 @@ fn startup_opens_block_database_and_loads_genesis() {
 
 #[test]
 fn startup_serves_peer_connections_on_a_listener() {
-    // Bind an ephemeral loopback port so the test neither uses a fixed
-    // port nor touches the network.  The helper panics with the captured
-    // daemon output if the announcement never arrives.
+    // Bind an ephemeral loopback port rather than a fixed one, so two
+    // daemons alive at once do not collide on the peer-to-peer listener.
+    // The RPC listener and the seeders are handled by the helper, which
+    // is what keeps this off the network — an earlier version of this
+    // comment claimed the flag below did that, and it never did.  The
+    // helper panics with the captured daemon output if the announcement
+    // never arrives.
     wait_for_daemon_line("listen", &["--listen=127.0.0.1:0"], |line| {
         line.contains("Serving peer-to-peer connections on 127.0.0.1:")
     });
