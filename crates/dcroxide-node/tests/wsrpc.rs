@@ -156,8 +156,14 @@ fn handshake(port: u16) -> TcpStream {
 fn write_client_frame(stream: &mut TcpStream, payload: &[u8]) {
     let mut frame = vec![0x81]; // FIN + text.
     let len = payload.len();
-    assert!(len < 126, "test payloads stay small");
-    frame.push(0x80 | len as u8); // MASK + length.
+    // The two short length encodings; batch bodies outgrow the first.
+    if len < 126 {
+        frame.push(0x80 | len as u8); // MASK + length.
+    } else {
+        assert!(len <= usize::from(u16::MAX), "test payloads stay small");
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(len as u16).to_be_bytes());
+    }
     let mask = [0x12u8, 0x34, 0x56, 0x78];
     frame.extend_from_slice(&mask);
     for (i, byte) in payload.iter().enumerate() {
@@ -516,6 +522,206 @@ fn the_limited_user_refusal_answers_in_version_1_0() {
     assert!(
         reply.contains("\"jsonrpc\":\"1.0\""),
         "the refusal is coerced to 1.0: {reply}"
+    );
+
+    drop(ws);
+    listener.shutdown();
+}
+
+/// A batched request is processed entry by entry and answered with an
+/// array, the way dcrd's `inHandler` batch arm does
+/// (`rpcwebsocket.go:1405`, `:1560-1790`).
+///
+/// The port previously ran every websocket message through the single
+/// request unmarshal, so any body starting `[` came back as one
+/// `-32700` parse error. Reported as RVW-001.
+#[test]
+fn a_batched_request_is_answered_entry_by_entry() {
+    let (_dir, listener, port, _ntfn, _chain) = serve_ws();
+    let mut ws = handshake(port);
+    write_client_frame(
+        &mut ws,
+        br#"{"jsonrpc":"1.0","method":"authenticate","params":["user","pass"],"id":1}"#,
+    );
+    let _ = read_server_frame(&mut ws);
+
+    write_client_frame(
+        &mut ws,
+        br#"[{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":2},{"jsonrpc":"1.0","method":"getbestblockhash","params":[],"id":3}]"#,
+    );
+    let reply = read_server_frame(&mut ws);
+    assert!(
+        reply.starts_with('['),
+        "batch reply must be an array: {reply}"
+    );
+    assert!(
+        reply.ends_with(']'),
+        "batch reply must be an array: {reply}"
+    );
+    assert!(reply.contains("\"id\":2"), "first entry answered: {reply}");
+    assert!(reply.contains("\"id\":3"), "second entry answered: {reply}");
+    assert!(
+        !reply.contains("-32700"),
+        "the batch must not be answered as a parse error: {reply}"
+    );
+
+    drop(ws);
+    listener.shutdown();
+}
+
+/// An empty batch draws dcrd's `Invalid request: empty batch`, and a
+/// batch entry with no `params` array draws its malformed reply -- the
+/// batch arm treats a missing params array as malformed where the
+/// single arm does not (`rpcwebsocket.go:1633`).
+#[test]
+fn batch_edge_cases_match_dcrds_arms() {
+    let (_dir, listener, port, _ntfn, _chain) = serve_ws();
+    let mut ws = handshake(port);
+    write_client_frame(
+        &mut ws,
+        br#"{"jsonrpc":"1.0","method":"authenticate","params":["user","pass"],"id":1}"#,
+    );
+    let _ = read_server_frame(&mut ws);
+
+    write_client_frame(&mut ws, b"[]");
+    let reply = read_server_frame(&mut ws);
+    assert!(
+        reply.contains("Invalid request: empty batch"),
+        "empty batch: {reply}"
+    );
+
+    write_client_frame(
+        &mut ws,
+        br#"[{"jsonrpc":"1.0","method":"getblockcount","id":2}]"#,
+    );
+    let reply = read_server_frame(&mut ws);
+    assert!(
+        reply.contains("Invalid request: malformed"),
+        "an entry without params is malformed: {reply}"
+    );
+
+    drop(ws);
+    listener.shutdown();
+}
+
+/// An empty method is answered `Invalid request: malformed` before
+/// authentication, and the connection stays open
+/// (`rpcwebsocket.go:1433-1447`).
+///
+/// Every other rejection on this path closes the socket, which is why
+/// the port had no such arm: it modelled the HTTP ladder, where the
+/// arm lives after the auth gate. Reported as RVW-003.
+#[test]
+fn an_empty_method_is_malformed_and_keeps_the_connection() {
+    let (_dir, listener, port, _ntfn, _chain) = serve_ws();
+    let mut ws = handshake(port);
+
+    write_client_frame(&mut ws, br#"{"jsonrpc":"1.0","method":"","id":1}"#);
+    let reply = read_server_frame(&mut ws);
+    assert!(
+        reply.contains("Invalid request: malformed"),
+        "unauthenticated empty method: {reply}"
+    );
+
+    // The socket survived it, so authentication still works afterwards.
+    write_client_frame(
+        &mut ws,
+        br#"{"jsonrpc":"1.0","method":"authenticate","params":["user","pass"],"id":2}"#,
+    );
+    let reply = read_server_frame(&mut ws);
+    assert!(reply.contains("\"error\":null"), "still usable: {reply}");
+
+    drop(ws);
+    listener.shutdown();
+}
+
+/// A limited client's bad parameters draw the parse error, not the
+/// limited-user refusal: dcrd's websocket arm runs `parseCmd` and
+/// answers its error before the `rpcLimited` gate
+/// (`rpcwebsocket.go:1456-1476` then `:1511-1530`), the opposite of its
+/// own HTTP ladder, which the port had copied. Reported as RVW-003.
+#[test]
+fn parse_errors_precede_the_limited_gate_on_the_websocket() {
+    let (_dir, listener, port, _ntfn, _chain) = serve_ws();
+    let mut ws = handshake(port);
+    write_client_frame(
+        &mut ws,
+        br#"{"jsonrpc":"1.0","method":"authenticate","params":["limit","limitpass"],"id":1}"#,
+    );
+    let reply = read_server_frame(&mut ws);
+    assert!(reply.contains("\"error\":null"), "limited auth: {reply}");
+
+    // notifywork is admin-only, so the limited gate would refuse it --
+    // but its parameters are wrong, and dcrd answers that first.
+    write_client_frame(
+        &mut ws,
+        br#"{"jsonrpc":"1.0","method":"notifywork","params":[123],"id":2}"#,
+    );
+    let reply = read_server_frame(&mut ws);
+    assert!(
+        !reply.contains("limited user not authorized"),
+        "the parse error must come first: {reply}"
+    );
+
+    drop(ws);
+    listener.shutdown();
+}
+
+/// An id-less request is a notification, and that gate runs before the
+/// authenticate arm: an unauthenticated sender is disconnected even
+/// with valid credentials, so an id-less `authenticate` can never
+/// authenticate anyone (`rpcwebsocket.go:1449-1455`, ahead of the auth
+/// switch at `:1479-1510`).
+///
+/// The port checked for the authenticate method first, so valid
+/// credentials with no id authenticated the session and drew an
+/// `"id":null` success where dcrd breaks the connection. Reported as
+/// RVW-002.
+#[test]
+fn an_id_less_authenticate_is_a_notification_not_an_authentication() {
+    let (_dir, listener, port, _ntfn, _chain) = serve_ws();
+    let mut ws = handshake(port);
+
+    write_client_frame(
+        &mut ws,
+        br#"{"jsonrpc":"1.0","method":"authenticate","params":["user","pass"]}"#,
+    );
+    let mut byte = [0u8; 1];
+    assert!(
+        ws.read_exact(&mut byte).is_err(),
+        "an id-less authenticate must drop the connection, not authenticate it"
+    );
+
+    listener.shutdown();
+}
+
+/// The same gate seen from the other side: once authenticated, an
+/// id-less request is ignored and the connection carries on, where the
+/// port's authenticate-first order disconnected on a repeat
+/// authenticate.
+#[test]
+fn an_id_less_request_from_an_authenticated_client_is_ignored() {
+    let (_dir, listener, port, _ntfn, _chain) = serve_ws();
+    let mut ws = handshake(port);
+    write_client_frame(
+        &mut ws,
+        br#"{"jsonrpc":"1.0","method":"authenticate","params":["user","pass"],"id":1}"#,
+    );
+    let _ = read_server_frame(&mut ws);
+
+    // No id: silently skipped, no reply, socket intact.
+    write_client_frame(
+        &mut ws,
+        br#"{"jsonrpc":"1.0","method":"authenticate","params":["user","pass"]}"#,
+    );
+    write_client_frame(
+        &mut ws,
+        br#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":2}"#,
+    );
+    let reply = read_server_frame(&mut ws);
+    assert!(
+        reply.contains("\"id\":2"),
+        "the id-less request drew no reply and the socket survived: {reply}"
     );
 
     drop(ws);

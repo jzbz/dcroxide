@@ -130,6 +130,14 @@ pub struct RawRequest {
     pub method: String,
     /// The raw JSON texts of the parameters.
     pub params: Vec<String>,
+    /// Whether the request carried a `params` array at all.
+    ///
+    /// Go's `Params []json.RawMessage` is nil when the key is absent or
+    /// null and a non-nil empty slice for `[]`, and dcrd's websocket
+    /// batch arm tests that difference (`rpcwebsocket.go:1633`).
+    /// `params` alone cannot express it, since both cases leave it
+    /// empty.
+    pub params_present: bool,
     /// The request id.
     pub id: RpcId,
 }
@@ -148,7 +156,7 @@ fn json_value_kind(raw: &str) -> &'static str {
 
 /// Split a JSON array into the raw JSON text of its elements.  The
 /// input must be a syntax-valid array.
-fn split_raw_array(data: &str) -> Vec<String> {
+pub fn split_raw_array(data: &str) -> Vec<String> {
     let bytes = data.as_bytes();
     let mut elems = Vec::new();
     let mut depth = 0i32;
@@ -316,6 +324,7 @@ pub fn unmarshal_request(body: &str) -> Result<RawRequest, String> {
                 jsonrpc: String::new(),
                 method: String::new(),
                 params: Vec::new(),
+                params_present: false,
                 id: RpcId::Null,
             });
         }
@@ -329,6 +338,7 @@ pub fn unmarshal_request(body: &str) -> Result<RawRequest, String> {
         jsonrpc: String::new(),
         method: String::new(),
         params: Vec::new(),
+        params_present: false,
         id: RpcId::Null,
     };
     for (key, raw) in split_raw_object(trimmed) {
@@ -357,7 +367,10 @@ pub fn unmarshal_request(body: &str) -> Result<RawRequest, String> {
             }
         } else if fold_eq(&key, "params") {
             match raw.as_bytes().first() {
-                Some(b'[') => req.params = split_raw_array(&raw),
+                Some(b'[') => {
+                    req.params = split_raw_array(&raw);
+                    req.params_present = true;
+                }
                 Some(b'n') => req.params = Vec::new(),
                 _ => {
                     return Err(format!(

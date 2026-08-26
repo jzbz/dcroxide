@@ -27,9 +27,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, mpsc};
 
 use dcroxide_chainhash::Hash;
-use dcroxide_dcrjson::{RPCError, RpcId, err_rpc_internal, err_rpc_invalid_params, err_rpc_parse};
+use dcroxide_dcrjson::{
+    RPCError, RpcId, err_rpc_internal, err_rpc_invalid_params, err_rpc_invalid_request,
+    err_rpc_parse,
+};
 use dcroxide_rpc::dispatch::{RPC_LIMITED, create_marshalled_reply, parse_cmd};
-use dcroxide_rpc::http::unmarshal_request;
+use dcroxide_rpc::http::{split_raw_array, unmarshal_request};
 use dcroxide_rpc::server::Server;
 use dcroxide_rpc::websocket::{self as rpcws, RpcNtfnManager, WsClient, ws_service_request};
 use dcroxide_wire::{Message, MsgBlock, MsgTx};
@@ -828,10 +831,34 @@ fn handle_ws_request(
     .unwrap_or_else(|_| panic_recovery_outcome())
 }
 
-/// The dcrd `inHandler` body: the authenticate state machine, the
-/// limited-user gate, the notification-id skip, and dispatch through
-/// the ported service handler.
+/// The dcrd `inHandler` body: the batch branch, then the single-request
+/// ladder.
+///
+/// The order of the arms below is dcrd's, and it is not the order the
+/// HTTP transport uses.  `processRequest` gates the limited user before
+/// parsing the command; `inHandler` parses first and answers the parse
+/// error, so a limited client learns whether a method exists from a
+/// different oracle on each transport.  The port modelled the HTTP
+/// ladder here for both, which diverged in three ways at once; all
+/// three are reproduced now (RVW-001, RVW-002 and RVW-003 of an
+/// external review of `382864f5`).
 fn handle_ws_request_inner(
+    server: &Arc<Server<NodeRpcChain>>,
+    state: &Arc<Mutex<WsClient>>,
+    body: &str,
+) -> WsOutcome {
+    // dcrd tests the raw first byte (`bytes.HasPrefix(msg,
+    // batchedRequestPrefix)`), so a leading space makes an array a
+    // single request that then fails to unmarshal, not a batch.
+    if body.as_bytes().first() == Some(&b'[') {
+        return handle_ws_batch(server, state, body);
+    }
+    handle_ws_single(server, state, body)
+}
+
+/// One non-batched websocket request (dcrd `inHandler`'s
+/// `!batchedRequest` arm).
+fn handle_ws_single(
     server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
     body: &str,
@@ -841,72 +868,99 @@ fn handle_ws_request_inner(
         Ok(req) => req,
         Err(err_text) => return parse_error_outcome(authenticated, &err_text),
     };
-    let param_refs: Vec<&str> = req.params.iter().map(|s| s.as_str()).collect();
 
-    // The authenticate command drives the auth state machine.
-    if req.method == "authenticate" {
-        if authenticated {
-            // A second authenticate is a protocol violation.
+    // A malformed request is answered before authentication and leaves
+    // the connection open, unlike every other rejection here.
+    if req.method.is_empty() {
+        let json_err = RPCError::new(err_rpc_invalid_request().code, "Invalid request: malformed");
+        return reply_or_skip(create_marshalled_reply(
+            &req.jsonrpc,
+            &req.id,
+            None,
+            Some(&json_err),
+        ));
+    }
+
+    // Valid requests with no id are notifications and draw no response.
+    // This gate sits ahead of the authenticate arm, so an id-less
+    // authenticate never reaches it: an unauthenticated sender is
+    // disconnected and an authenticated one is ignored.
+    if matches!(req.id, RpcId::Null) {
+        return if authenticated {
+            WsOutcome::Skip
+        } else {
+            WsOutcome::Disconnect
+        };
+    }
+
+    let param_refs: Vec<&str> = req.params.iter().map(|s| s.as_str()).collect();
+    let parsed = parse_cmd(
+        &server.registry,
+        &req.jsonrpc,
+        &req.method,
+        &param_refs,
+        &req.id,
+    );
+    if let Some(err) = parsed.err {
+        if !authenticated {
             return WsOutcome::Disconnect;
         }
-        return authenticate(server, state, &req.jsonrpc, &param_refs, &req.id);
+        return reply_or_skip(create_marshalled_reply(
+            &req.jsonrpc,
+            &req.id,
+            None,
+            Some(&err),
+        ));
     }
 
-    // Every other command requires an authenticated client.
-    if !authenticated {
-        return WsOutcome::Disconnect;
+    // The authenticate state machine, keyed on whether the parsed
+    // command is the authenticate one.
+    let is_auth_cmd = req.method == "authenticate";
+    match (authenticated, is_auth_cmd) {
+        (true, true) => return WsOutcome::Disconnect,
+        (false, false) => return WsOutcome::Disconnect,
+        (false, true) => {
+            return authenticate(server, state, &req.jsonrpc, parsed.params.as_ref(), &req.id);
+        }
+        (true, false) => {}
     }
 
-    // A request without an id is a notification and draws no reply.
-    if matches!(req.id, RpcId::Null) {
-        return WsOutcome::Skip;
-    }
-
-    // Limited users may only call the limited method set.
+    // dcrd passes an empty version here (`rpcwebsocket.go:1518`), which
+    // `MarshalResponse` coerces to "1.0" -- so this reply reads
+    // `"jsonrpc":"1.0"` even for a 2.0 request.  The batch arm passes
+    // the request's version through, matching dcrd's gate at `:1727`.
     if !is_admin && !RPC_LIMITED.contains(&req.method.as_str()) {
         let json_err = RPCError::new(
             err_rpc_invalid_params().code,
             "limited user not authorized for this method",
         );
-        // dcrd passes an empty version here (`rpcwebsocket.go:1518`),
-        // which `MarshalResponse` coerces to "1.0" -- so this reply
-        // reads `"jsonrpc":"1.0"` even for a 2.0 request.  The batch
-        // path in `process_request` does pass the request's version
-        // through, matching dcrd's other gate at `:1727`.
         return reply_or_skip(create_marshalled_reply("", &req.id, None, Some(&json_err)));
     }
 
-    // Parse and dispatch the command through the ported websocket
-    // service handler, falling back to the standard handlers.  A
-    // not-yet-wired seam panics; it is caught and answered as an
-    // internal error so the connection survives.
-    //
-    // The server is shared, not locked, which is dcrd's behaviour:
-    // `wsClient.serviceRequest` takes no server-wide lock, calling the
-    // handler directly, and `rpcserver.Server` carries only fine-grained
-    // mutexes each guarding one field (`hmacMu`, `statusLock`,
-    // `blake256HaserMu`).  The port reaches the same place: every seam
-    // takes `&self`, the three pieces that are genuinely mutable
-    // (`work_state`, the help caches, `subsidy_cache`) carry their own
-    // locks, and handlers run concurrently.
-    //
-    // The client's own state is the last lock on this path, and it is no
-    // longer held across the request.  dcrd's `wsClient` embeds one mutex
-    // taken a field at a time (`rpcwebsocket.go:1331`, `:303`,
-    // `:2333-2340`); holding it for the whole call meant a request that
-    // waits -- a rescan, a `generate`, a `getwork` template wait -- stalled
-    // the delivery thread, which locks each target client's state to
-    // build a notification, and so stalled fan-out to every other client
-    // as well.  The handlers take it where they use it now.
+    dispatch_ws_command(server, state, &req, parsed.params)
+}
+
+/// Dispatch one fully-gated command, under the panic guard.
+///
+/// The server is shared, not locked, which is dcrd's behaviour:
+/// `wsClient.serviceRequest` takes no server-wide lock, calling the
+/// handler directly, and `rpcserver.Server` carries only fine-grained
+/// mutexes each guarding one field.  The client's own state is not held
+/// across the request either: dcrd's `wsClient` embeds one mutex taken a
+/// field at a time, and holding it for the whole call meant a request
+/// that waits -- a rescan, a `generate`, a `getwork` template wait --
+/// stalled the delivery thread and so the fan-out to every other client.
+fn dispatch_ws_command(
+    server: &Arc<Server<NodeRpcChain>>,
+    state: &Arc<Mutex<WsClient>>,
+    req: &dcroxide_rpc::http::RawRequest,
+    params: Option<dcroxide_dcrjson::GoValue>,
+) -> WsOutcome {
     let jsonrpc = req.jsonrpc.clone();
     let id = req.id.clone();
     let method = req.method.clone();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let parsed = parse_cmd(&server.registry, &jsonrpc, &method, &param_refs, &id);
-        if let Some(err) = parsed.err {
-            return create_marshalled_reply(&jsonrpc, &id, None, Some(&err)).ok();
-        }
-        let cmd = parsed.params.expect("a parsed command has params");
+        let cmd = params.expect("a parsed command has params");
         ws_service_request(server, state, &jsonrpc, &method, &cmd, &id)
     }));
     match outcome {
@@ -916,6 +970,194 @@ fn handle_ws_request_inner(
     }
 }
 
+/// A batched websocket request (dcrd `inHandler`'s `batchedRequest`
+/// arm).
+///
+/// Each entry runs the same ladder as a single request, with three
+/// differences dcrd's own code carries: a malformed entry is one whose
+/// method is empty *or* that has no `params` array at all, an
+/// unparseable entry is answered `Invalid request` at version "2.0"
+/// rather than a parse error, and the limited gate passes the request's
+/// own version through where the single arm passes an empty one.
+///
+/// A disconnect anywhere abandons the whole message, as dcrd's
+/// `break out` does: the replies already collected are dropped with the
+/// connection.
+fn handle_ws_batch(
+    server: &Arc<Server<NodeRpcChain>>,
+    state: &Arc<Mutex<WsClient>>,
+    body: &str,
+) -> WsOutcome {
+    let (authenticated, _) = client_flags(state);
+    let mut results: Vec<String> = Vec::new();
+    let mut batch_size = 0usize;
+
+    match dcroxide_dcrjson::gojson::validate(body) {
+        Err(err) => {
+            if !authenticated {
+                return WsOutcome::Disconnect;
+            }
+            let json_err = RPCError::new(
+                err_rpc_parse().code,
+                &format!("Failed to parse request: {}", err.go_message()),
+            );
+            if let Ok(reply) = create_marshalled_reply("2.0", &RpcId::Null, None, Some(&json_err)) {
+                results.push(reply);
+            }
+        }
+        Ok(()) => {
+            let entries = split_raw_array(body.trim_start_matches([' ', '\t', '\n', '\r']));
+            if entries.is_empty() {
+                if !authenticated {
+                    return WsOutcome::Disconnect;
+                }
+                let json_err = RPCError::new(
+                    err_rpc_invalid_request().code,
+                    "Invalid request: empty batch",
+                );
+                if let Ok(reply) =
+                    create_marshalled_reply("2.0", &RpcId::Null, None, Some(&json_err))
+                {
+                    results.push(reply);
+                }
+            } else {
+                batch_size = entries.len();
+                for entry in entries {
+                    match handle_ws_batch_entry(server, state, &entry) {
+                        WsOutcome::Reply(reply) => results.push(reply),
+                        WsOutcome::Skip => {}
+                        WsOutcome::Disconnect => return WsOutcome::Disconnect,
+                    }
+                }
+            }
+        }
+    }
+
+    // dcrd sends whatever payload this produces, including the empty
+    // one a batch of pure notifications leaves behind.
+    if batch_size > 0 {
+        if results.is_empty() {
+            return WsOutcome::Reply(String::new());
+        }
+        return WsOutcome::Reply(alloc_batch_array(&results));
+    }
+    match results.into_iter().next() {
+        Some(first) => WsOutcome::Reply(first),
+        None => WsOutcome::Reply(String::new()),
+    }
+}
+
+/// The batched response json: the entry replies joined in one array.
+fn alloc_batch_array(results: &[String]) -> String {
+    let mut out = String::new();
+    out.push('[');
+    let mut rest = results.len();
+    for reply in results {
+        out.push_str(reply);
+        rest = rest.saturating_sub(1);
+        if rest == 0 {
+            out.push(']');
+        } else {
+            out.push(',');
+        }
+    }
+    out
+}
+
+/// One entry of a batch, returning the reply to collect, `Skip` for a
+/// notification, or `Disconnect` to abandon the message.
+fn handle_ws_batch_entry(
+    server: &Arc<Server<NodeRpcChain>>,
+    state: &Arc<Mutex<WsClient>>,
+    entry: &str,
+) -> WsOutcome {
+    let (authenticated, is_admin) = client_flags(state);
+    let req = match unmarshal_request(entry) {
+        Ok(req) => req,
+        Err(err_text) => {
+            if !authenticated {
+                return WsOutcome::Disconnect;
+            }
+            let json_err = RPCError::new(
+                err_rpc_invalid_request().code,
+                &format!("Invalid request: {err_text}"),
+            );
+            return reply_or_skip(create_marshalled_reply(
+                "2.0",
+                &RpcId::Null,
+                None,
+                Some(&json_err),
+            ));
+        }
+    };
+
+    // The batch arm calls an entry with no params array malformed too,
+    // which the single arm does not.
+    if req.method.is_empty() || !req.params_present {
+        let json_err = RPCError::new(err_rpc_invalid_request().code, "Invalid request: malformed");
+        return reply_or_skip(create_marshalled_reply(
+            &req.jsonrpc,
+            &req.id,
+            None,
+            Some(&json_err),
+        ));
+    }
+
+    if matches!(req.id, RpcId::Null) {
+        return if authenticated {
+            WsOutcome::Skip
+        } else {
+            WsOutcome::Disconnect
+        };
+    }
+
+    let param_refs: Vec<&str> = req.params.iter().map(|s| s.as_str()).collect();
+    let parsed = parse_cmd(
+        &server.registry,
+        &req.jsonrpc,
+        &req.method,
+        &param_refs,
+        &req.id,
+    );
+    if let Some(err) = parsed.err {
+        if !authenticated {
+            return WsOutcome::Disconnect;
+        }
+        return reply_or_skip(create_marshalled_reply(
+            &req.jsonrpc,
+            &req.id,
+            None,
+            Some(&err),
+        ));
+    }
+
+    let is_auth_cmd = req.method == "authenticate";
+    match (authenticated, is_auth_cmd) {
+        (true, true) => return WsOutcome::Disconnect,
+        (false, false) => return WsOutcome::Disconnect,
+        (false, true) => {
+            return authenticate(server, state, &req.jsonrpc, parsed.params.as_ref(), &req.id);
+        }
+        (true, false) => {}
+    }
+
+    // Unlike the single arm, this one passes the request's version.
+    if !is_admin && !RPC_LIMITED.contains(&req.method.as_str()) {
+        let json_err = RPCError::new(
+            err_rpc_invalid_params().code,
+            "limited user not authorized for this method",
+        );
+        return reply_or_skip(create_marshalled_reply(
+            &req.jsonrpc,
+            &req.id,
+            None,
+            Some(&json_err),
+        ));
+    }
+
+    dispatch_ws_command(server, state, &req, parsed.params)
+}
+
 /// Handle the `authenticate` command: verify the credentials, mark the
 /// client authenticated, and answer success — or disconnect on bad or
 /// missing credentials (dcrd's `authenticate` case).
@@ -923,15 +1165,17 @@ fn authenticate(
     server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
     jsonrpc: &str,
-    param_refs: &[&str],
+    params: Option<&dcroxide_dcrjson::GoValue>,
     id: &RpcId,
 ) -> WsOutcome {
-    let parsed = parse_cmd(&server.registry, jsonrpc, "authenticate", param_refs, id);
-    let Some(dcroxide_dcrjson::GoValue::Struct(fields)) = parsed.params else {
+    // The command was parsed by the caller, which is where dcrd parses
+    // it too: `inHandler` runs `parseCmd` before the authenticate switch
+    // and hands the switch the parsed params.
+    let Some(dcroxide_dcrjson::GoValue::Struct(fields)) = params else {
         return WsOutcome::Disconnect;
     };
-    let username = struct_string(&fields, 0);
-    let passphrase = struct_string(&fields, 1);
+    let username = struct_string(fields, 0);
+    let passphrase = struct_string(fields, 1);
     let (authed, is_admin) = server.check_auth_user_pass(&username, &passphrase);
     if !authed {
         return WsOutcome::Disconnect;
