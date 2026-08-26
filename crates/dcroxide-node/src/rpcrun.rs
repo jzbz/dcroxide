@@ -1629,6 +1629,16 @@ struct PreAuthEntry {
     /// is evicted so its blocked read errors out; `None` once evicted
     /// (an entry is never evicted twice) or when the clone failed.
     sock: Option<TcpStream>,
+    /// Whether this connection has finished sending a request head.
+    ///
+    /// Set by the handler once `read_http_head` returns, and read by
+    /// the eviction search, which prefers a connection that has not got
+    /// that far.  Shedding the stalled arrivals rather than the ones
+    /// making progress is the whole justification for this tier: a
+    /// connection that never sends a request is the one costing a
+    /// thread for nothing, and dcrd has no equivalent pre-auth pool to
+    /// inherit a rule from.
+    head_done: Arc<AtomicBool>,
 }
 
 /// The pre-authentication pool's contents, in arrival order.
@@ -1756,21 +1766,44 @@ impl PreAuthGate {
             } else {
                 // At the nominal budget, disconnect the oldest connection
                 // that has not been evicted already.
-                if state.live.len() >= self.soft
-                    && let Some(entry) = state.live.iter_mut().find(|entry| entry.sock.is_some())
-                    && let Some(victim) = entry.sock.take()
-                {
-                    let _ = victim.shutdown(Shutdown::Both);
-                    shed = Shed::Evicted;
+                if state.live.len() >= self.soft {
+                    // Oldest first, but skipping connections that have
+                    // already sent a request head: those are being
+                    // served, and killing one answers nothing while the
+                    // stalled arrival that provoked the pressure lives
+                    // on.  Only when every live connection has sent a
+                    // head does the search fall back to the oldest of
+                    // them, since the tier must still shed something to
+                    // stay under its ceiling.
+                    let victim = state
+                        .live
+                        .iter()
+                        .position(|entry| {
+                            entry.sock.is_some() && !entry.head_done.load(Ordering::Relaxed)
+                        })
+                        .or_else(|| state.live.iter().position(|entry| entry.sock.is_some()));
+                    if let Some(index) = victim
+                        && let Some(entry) = state.live.get_mut(index)
+                        && let Some(sock) = entry.sock.take()
+                    {
+                        let _ = sock.shutdown(Shutdown::Both);
+                        shed = Shed::Evicted;
+                    }
                 }
                 state.next_ticket = state.next_ticket.wrapping_add(1);
                 let ticket = state.next_ticket;
+                let head_done = Arc::new(AtomicBool::new(false));
                 // Registered under the lock, so no release can race
                 // ahead of the registration it belongs to.
-                state.live.push_back(PreAuthEntry { ticket, sock });
+                state.live.push_back(PreAuthEntry {
+                    ticket,
+                    sock,
+                    head_done: Arc::clone(&head_done),
+                });
                 Some(PreAuthSlot {
                     gate: Arc::clone(self),
                     ticket,
+                    head_done,
                 })
             }
         };
@@ -1815,6 +1848,16 @@ impl PreAuthGate {
 struct PreAuthSlot {
     gate: Arc<PreAuthGate>,
     ticket: u64,
+    head_done: Arc<AtomicBool>,
+}
+
+impl PreAuthSlot {
+    /// Record that this connection has sent a complete request head, so
+    /// the eviction search passes over it while any connection that has
+    /// not remains.
+    fn mark_head_done(&self) {
+        self.head_done.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Drop for PreAuthSlot {
@@ -3096,7 +3139,13 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
     let now = Instant::now();
     let deadline = now.checked_add(RPC_AUTH_TIMEOUT).unwrap_or(now);
     let head = match read_http_head(&mut stream, deadline) {
-        Ok(head) => head,
+        Ok(head) => {
+            // This connection is no longer a stalled arrival, so the
+            // pre-authentication tier evicts elsewhere while any
+            // connection that has not got this far is still live.
+            slot.mark_head_done();
+            head
+        }
         // Go says nothing when the client simply went away, and never
         // echoes a reason for the rest: the 400 body is the literal
         // status text.
@@ -4438,6 +4487,95 @@ mod tests {
             pre_auth_budget(usize::MAX),
             (128, 256),
             "an absurd cap saturates at the thread roof rather than overflowing"
+        );
+    }
+
+    /// Eviction passes over a connection that has sent a request head
+    /// and takes a stalled one instead, even though the stalled one
+    /// arrived later.
+    ///
+    /// Shedding the arrivals that never send a request is the entire
+    /// justification for this tier -- they are the ones costing a thread
+    /// for nothing -- and `PARITY.md`'s divergences row states it as the
+    /// rule.  Taking the oldest regardless would kill a client that is
+    /// being served and answer it nothing, while the stall that caused
+    /// the pressure survived.  Reported as RVW-010 by an external review
+    /// of `382864f5`, which found the row describing a control the code
+    /// did not implement.
+    #[test]
+    fn eviction_prefers_a_connection_that_has_not_sent_a_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let gate = Arc::new(PreAuthGate::with_budget(2, 3));
+
+        let open = |gate: &Arc<PreAuthGate>| {
+            let client = TcpStream::connect(addr).expect("connect");
+            let (server, peer) = listener.accept().expect("accept");
+            let slot = gate.admit(server.try_clone().ok(), &peer);
+            (client, server, slot)
+        };
+
+        // The oldest connection is mid-request: it has sent a head.
+        let (mut serving, _serving_server, serving_slot) = open(&gate);
+        serving_slot.as_ref().expect("admitted").mark_head_done();
+        // A later arrival that has sent nothing.
+        let (mut stalled, _stalled_server, _stalled_slot) = open(&gate);
+        assert_eq!(gate.live(), 2, "the nominal budget is full");
+
+        let (_third, _third_server, third_slot) = open(&gate);
+        assert!(third_slot.is_some(), "the arrival is admitted");
+
+        stalled
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut buf = [0u8; 1];
+        assert!(
+            matches!(stalled.read(&mut buf), Ok(0)),
+            "the stalled connection is the one disconnected, not the older one being served"
+        );
+
+        // The connection that had sent a head is untouched.
+        serving
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("read timeout");
+        let mut buf = [0u8; 1];
+        assert!(
+            serving.read(&mut buf).is_err(),
+            "a connection that sent a request head must not be evicted while a stalled one lives"
+        );
+    }
+
+    /// When every live connection has sent a head there is no stalled
+    /// one to prefer, and the tier still has to shed something to stay
+    /// under its ceiling, so it falls back to the oldest.
+    #[test]
+    fn eviction_falls_back_to_the_oldest_when_all_have_sent_a_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let gate = Arc::new(PreAuthGate::with_budget(2, 3));
+
+        let open = |gate: &Arc<PreAuthGate>| {
+            let client = TcpStream::connect(addr).expect("connect");
+            let (server, peer) = listener.accept().expect("accept");
+            let slot = gate.admit(server.try_clone().ok(), &peer);
+            (client, server, slot)
+        };
+
+        let (mut oldest, _oldest_server, oldest_slot) = open(&gate);
+        oldest_slot.as_ref().expect("admitted").mark_head_done();
+        let (_newer, _newer_server, newer_slot) = open(&gate);
+        newer_slot.as_ref().expect("admitted").mark_head_done();
+
+        let (_third, _third_server, third_slot) = open(&gate);
+        assert!(third_slot.is_some(), "the arrival is admitted");
+
+        oldest
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut buf = [0u8; 1];
+        assert!(
+            matches!(oldest.read(&mut buf), Ok(0)),
+            "with no stalled connection to shed, the oldest goes"
         );
     }
 
