@@ -2918,6 +2918,7 @@ impl Chain {
                 if let Err(err) = context_result {
                     self.index
                         .mark_block_failed_validation(&mut self.store, node);
+                    self.forget_rejected_block_body(node);
                     return Err(err);
                 }
 
@@ -2964,6 +2965,7 @@ impl Chain {
                     Err(err) => {
                         self.index
                             .mark_block_failed_validation(&mut self.store, node);
+                        self.forget_rejected_block_body(node);
                         return Err(err);
                     }
                 }
@@ -3186,6 +3188,7 @@ impl Chain {
             ) {
                 self.index
                     .mark_block_failed_validation(&mut self.store, node);
+                self.forget_rejected_block_body(node);
                 return (nodes[..i].to_vec(), Some(err));
             }
 
@@ -4189,6 +4192,34 @@ impl Chain {
         self.prune_chain_memory(Self::MIN_MEMORY_STAKE_NODES);
     }
 
+    /// Drop a rejected block's body from the in-memory mirror.
+    ///
+    /// `maybe_accept_block_data` stores every block that clears the
+    /// positional checks, which is before the contextual and connect
+    /// checks run, so a block that fails one of those has already been
+    /// cloned into `blocks`.  The stale sweep in `prune_chain_memory`
+    /// only reaches heights below `tip - MIN_MEMORY_STAKE_NODES`, so a
+    /// peer that keeps feeding proof-of-work-valid blocks that fail a
+    /// later check at a stationary tip holds every one of them resident
+    /// for as long as the flood lasts.  dcrd cannot grow this way: it
+    /// stores bodies to the database only and mirrors just
+    /// `recentBlockCacheSize = 12` of them, and its own comment is
+    /// explicit that proof-of-work is what makes filling the *disk*
+    /// prohibitive -- it never puts the memory at stake in the first
+    /// place.
+    ///
+    /// Only a chain that has a database may drop them: without one the
+    /// map is the only copy.  That is the same guard the stale sweep
+    /// uses, and for the same reason -- `block_data` falls back to
+    /// `db_fetch_stored_block`, and every block reaching here was
+    /// written by `maybe_accept_block_data` on the way in.
+    fn forget_rejected_block_body(&mut self, node: NodeId) {
+        if self.db.is_some() {
+            let hash = self.store.node(node).hash;
+            self.blocks.remove(&hash.0);
+        }
+    }
+
     /// dcrd `pruneStakeNodes`, extended for the port's recent-window
     /// mirrors: clear the stake-related fields on block nodes deeper
     /// than the keep depth below the tip, and evict those blocks'
@@ -4250,10 +4281,19 @@ impl Chain {
 
         // The walk above follows `parent` from the best-chain tip, so it
         // only ever visits ancestors of that tip.  Three populations are
-        // therefore never visited and stay resident for the life of the
-        // process: side-chain blocks, blocks disconnected by a reorg,
-        // and blocks that cleared the positional checks and were then
-        // rejected by a contextual or connect check.
+        // therefore never visited: side-chain blocks, blocks
+        // disconnected by a reorg, and blocks that cleared the
+        // positional checks and were then rejected by a contextual or
+        // connect check.
+        //
+        // The third is dropped at the point of rejection now, by
+        // `forget_rejected_block_body`, because it was the one an
+        // attacker controls: a peer feeding proof-of-work-valid blocks
+        // that fail a later check does not move the tip, so nothing it
+        // sends ever falls below the sweep horizon and the map grew for
+        // as long as the flood ran.  The other two are bounded by
+        // honest fork churn rather than by an attacker, and are left to
+        // the height sweep below.
         //
         // dcrd has no equivalent leak to prune, because it never
         // accumulates bodies in the first place: `maybeAcceptBlockData`

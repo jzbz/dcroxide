@@ -418,3 +418,90 @@ fn pruning_bounds_the_bodies_that_never_reach_the_best_chain() {
         );
     }
 }
+
+/// A block rejected by validation does not keep its body in memory.
+///
+/// `maybe_accept_block_data` stores every block that clears the
+/// positional checks, which happens before the contextual and connect
+/// checks, so a block failing one of those is already in the in-memory
+/// mirror.  The stale sweep only reaches heights below
+/// `tip - MIN_MEMORY_STAKE_NODES`, so without an explicit drop a peer
+/// feeding proof-of-work-valid blocks that fail a later check at a
+/// stationary tip keeps every one of them resident for the duration.
+/// dcrd stores bodies to disk only and mirrors `recentBlockCacheSize`
+/// of them, twelve, whatever the fork history looks like.
+///
+/// The assertion is over blocks the index marked `VALIDATE_FAILED`,
+/// which is exactly the population the drop targets.  Blocks retained
+/// for other reasons are out of scope here and stay: a re-submitted
+/// block that draws `ErrDuplicateBlock` is a previously *accepted*
+/// block whose body is legitimately resident, and a stored side-chain
+/// block that never got connected because an ancestor failed is the
+/// separate population `prune_chain_memory`'s comment names.
+///
+/// dcrd's own battery supplies the sample -- several hundred rejects
+/// spanning every kind its generator produces, far broader than a
+/// hand-built block.
+#[test]
+fn blocks_that_fail_validation_do_not_keep_their_bodies() {
+    let params = regnet_params();
+    let dir = TempDir::new().expect("tempdir");
+    let opts = Options::new(dir.path().join("chain"), params.net.0);
+    let db = Database::create(&opts).expect("create database");
+    let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("open chain");
+
+    let data = include_str!("data/fullblock_vectors.txt");
+    let mut now: i64 = 0;
+    let mut submitted: Vec<Hash> = Vec::new();
+
+    for line in data.lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        match f[0] {
+            "now" => now = f[1].parse().expect("now"),
+            "accept" => {
+                let (block, _) = MsgBlock::from_bytes(&unhex(f[4])).expect("block");
+                let _ = chain.process_block(&block, now, &params);
+            }
+            "reject" => {
+                let (block, _) = MsgBlock::from_bytes(&unhex(f[3])).expect("block");
+                let hash = block.header.block_hash();
+                let (_, errs) = chain.process_block(&block, now, &params);
+                assert!(
+                    !errs.is_empty(),
+                    "reject {} should have been rejected",
+                    f[1]
+                );
+                submitted.push(hash);
+            }
+            _ => {}
+        }
+    }
+
+    let failed: Vec<&Hash> = submitted
+        .iter()
+        .filter(|h| match chain.index.lookup_node(h) {
+            Some(node) => chain
+                .index
+                .node_status(&chain.store, node)
+                .known_validate_failed(),
+            None => false,
+        })
+        .collect();
+    assert!(
+        failed.len() > 50,
+        "battery should mark a broad sample validation-failed, got {}",
+        failed.len()
+    );
+
+    let retained: Vec<&&Hash> = failed
+        .iter()
+        .filter(|h| chain.blocks.contains_key(&h.0))
+        .collect();
+    assert!(
+        retained.is_empty(),
+        "{} of {} validation-failed block bodies stayed in memory (first: {})",
+        retained.len(),
+        failed.len(),
+        retained.first().map(|h| h.to_string()).unwrap_or_default()
+    );
+}
