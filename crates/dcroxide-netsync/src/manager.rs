@@ -2338,6 +2338,24 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
 /// arbitrary entry when adding the new value would overflow it (dcrd
 /// `limitAdd`, which evicts a random entry via Go's map iteration
 /// order).
+///
+/// The victim is the first key of a `std::collections::HashMap`, whose
+/// `RandomState` seeds SipHash per instance from the OS, so it is not
+/// something an attacker can compute or grind toward -- which is the
+/// property dcrd's comment relies on.  This is deliberately *not* the
+/// case the mempool's orphan eviction and rival-orphan ordering had to
+/// fix: those iterate a `BTreeMap` keyed by transaction hash, where the
+/// first entry is the numerically smallest and a nonce grind reaches it
+/// in a handful of tries.  An external review of `382864f5` filed this
+/// as the same hazard (RVW-018); it is not, and no draw is taken here.
+///
+/// One real difference remains, smaller than that one: Go re-randomizes
+/// on every `range`, while a `HashMap`'s order is fixed for the life of
+/// the instance once seeded.  An attacker who could observe many
+/// evictions might learn this instance's order where Go's stays
+/// unlearnable.  Reaching that requires seeing which entry died, which
+/// this map -- the node's own record of what it has requested -- does
+/// not report.
 fn limit_add(m: &mut HashMap<Hash, i32>, hash: Hash, peer: i32, limit: usize) {
     // Replace existing entries.
     if let Some(entry) = m.get_mut(&hash) {
