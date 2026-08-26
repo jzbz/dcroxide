@@ -339,6 +339,18 @@ pub trait VoteReceiver: Send {
     fn vote_received(&mut self, vote: &MsgTx);
 }
 
+/// Shuffle in place with Fisher-Yates, drawing from `draw`.
+///
+/// Used for the trial order of rival orphans; see the call site for why
+/// the order must not follow hash order.  Fewer than two elements need
+/// no draw, so a caller with nothing to decide costs nothing.
+fn shuffle_trial_order<T>(items: &mut [T], mut draw: impl FnMut() -> u64) {
+    for i in (1..items.len()).rev() {
+        let j = (draw() % (i as u64 + 1)) as usize;
+        items.swap(i, j);
+    }
+}
+
 /// The transaction memory pool (dcrd `TxPool`).
 pub struct TxPool<C: PoolChain> {
     /// The chain backend.
@@ -1807,11 +1819,29 @@ impl<C: PoolChain> TxPool<C> {
                 // Look up all orphans that redeem the output that is
                 // now available.
                 let key = (process_hash.0, tx_out_idx, tree);
-                let orphans: Vec<(Hash, Arc<MsgTx>)> = self
+                let mut orphans: Vec<(Hash, Arc<MsgTx>)> = self
                     .orphans_by_prev
                     .get(&key)
                     .map(|m| m.iter().map(|(k, v)| (Hash(*k), v.clone())).collect())
                     .unwrap_or_default();
+
+                // Try them in a random order.  Only one child of a
+                // given output can be accepted -- the loop below takes
+                // the first that succeeds and breaks -- so whatever
+                // decides this order decides which of several rival
+                // spends of the same outpoint enters the pool.  dcrd
+                // ranges over a Go map, so its choice is unpredictable
+                // per execution, and it treats tracking several
+                // children of one output as anti-griefing machinery
+                // (`mempool.go:1968-1990`).  `orphans_by_prev`'s inner
+                // map is a `BTreeMap` keyed by child hash, so iterating
+                // it would hand the win to the numerically smallest
+                // hash every time, which an attacker reaches by
+                // grinding a nonce for a handful of tries.  Drawing the
+                // order restores the property dcrd relies on, the same
+                // way the eviction source above does; both are recorded
+                // in PARITY.md's divergences table.
+                shuffle_trial_order(&mut orphans, || self.chain.random_u64());
 
                 // Potentially accept an orphan into the tx pool.
                 for (orphan_hash, orphan_tx) in orphans {
@@ -2635,6 +2665,70 @@ mod orphan_eviction_tests {
             "the smallest hash must survive -- evicting it unconditionally is \
              the grindable behaviour this guards against"
         );
+    }
+
+    /// The rival-orphan trial order follows the draw, not hash order.
+    ///
+    /// Only one child of a given output can be accepted, so whatever
+    /// orders the candidates decides which rival spend wins.  Iterating
+    /// `orphans_by_prev`'s inner `BTreeMap` would always try the
+    /// smallest child hash first, which an attacker reaches by grinding
+    /// a nonce; dcrd's Go map order is unpredictable per execution.
+    ///
+    /// This pins the shuffle itself.  It does not exercise
+    /// `process_orphans_internal` end to end: that needs two rival
+    /// transactions the fake chain will accept, and no such scenario
+    /// exists in the replayed dcrd corpus yet.
+    #[test]
+    fn trial_order_follows_the_draw_not_the_input_order() {
+        // Two rivals, ascending like the BTreeMap would yield them.
+        // With one element to place, the draw decides directly:
+        // an odd draw keeps the order, an even draw reverses it.
+        for (draw, want) in [(1u64, ["low", "high"]), (0, ["high", "low"])] {
+            let mut rivals = ["low", "high"];
+            shuffle_trial_order(&mut rivals, || draw);
+            assert_eq!(rivals, want, "draw {draw} must decide the order");
+        }
+    }
+
+    /// Every rival can reach the front, so none is structurally
+    /// unable to win.  A shuffle that could not place some element
+    /// first would still pass the test above while leaving that
+    /// element permanently last.
+    #[test]
+    fn every_rival_can_be_tried_first() {
+        let mut seen_first = std::collections::BTreeSet::new();
+        for draw in 0..24u64 {
+            let mut rivals = [1u8, 2, 3];
+            let mut calls = 0u64;
+            shuffle_trial_order(&mut rivals, || {
+                calls += 1;
+                draw / calls
+            });
+            seen_first.insert(rivals[0]);
+        }
+        assert_eq!(
+            seen_first,
+            [1u8, 2, 3].into_iter().collect(),
+            "each rival must be reachable at the front"
+        );
+    }
+
+    /// The shuffle is a permutation: it neither drops nor duplicates a
+    /// rival.  Losing one would silently discard a spend.
+    #[test]
+    fn the_shuffle_preserves_every_rival() {
+        for draw in 0..8u64 {
+            let mut rivals = [1u8, 2, 3, 4, 5];
+            shuffle_trial_order(&mut rivals, || draw);
+            let mut sorted = rivals;
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                [1, 2, 3, 4, 5],
+                "draw {draw} lost or duplicated a rival"
+            );
+        }
     }
 
     /// Every index the draw can name is reachable, so no orphan is

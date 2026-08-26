@@ -231,8 +231,10 @@ impl PoolChain for FakeChain {
 
     fn random_u64(&self) -> u64 {
         // Fixed, like the clock above: the replayed dcrd scenarios
-        // must not depend on a draw, and none of them evicts an
-        // orphan by the random path.
+        // must not depend on a draw.  Two paths would consume one --
+        // random orphan eviction and the rival-orphan trial order --
+        // and no scenario in the corpus reaches either, which was
+        // checked by making this panic and replaying them all.
         0
     }
 }
