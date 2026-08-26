@@ -9,7 +9,10 @@ allow = [
     "ISC",
     "MIT",
     "Apache-2.0",
-    "BSD-2-Clause",
+    # BSD-2-Clause was dropped when blake3 1.8.7 stopped needing arrayref,
+    # the only crate carrying it; an allowance nothing matches is the dead
+    # config the bans note below argues against, so it goes until a crate
+    # brings it back.
     "BSD-3-Clause",
     "Unicode-3.0",
     "CC0-1.0",
@@ -47,6 +50,10 @@ reason = "rand_core 0.6 (crypto-bigint -> elliptic-curve -> k256/p256/p384/p521)
 [[bans.skip]]
 crate = "windows-sys:0.52"
 reason = "ring 0.17 pins windows-sys 0.52; ctrlc, socket2 0.6 and windows-service 0.8 are on 0.61"
+
+[[bans.skip]]
+crate = "syn:2"
+reason = "the ecosystem is mid-migration to syn 3: serde_derive, displaydoc and zerovec-derive are on 3, while curve25519-dalek-derive, synstructure, wasm-bindgen-macro-support, windows-implement, windows-interface, yoke-derive, zerocopy-derive and zerofrom-derive still pin 2 -- both majors are present until the laggards move, and neither side is ours to choose"
 
 [sources]
 unknown-registry = "deny"
