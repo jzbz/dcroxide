@@ -1566,7 +1566,9 @@ impl Chain {
                         crate::chaindb::ChainDbError::Corrupt("unknown deployment".into())
                     })?
             };
-            let stxos = self.fetch_spend_journal(&block, is_treasury_enabled);
+            let stxos = self
+                .fetch_spend_journal(&block, is_treasury_enabled)
+                .map_err(|e| crate::chaindb::ChainDbError::Corrupt(e.description.clone()))?;
             view.disconnect_block(
                 &block,
                 &parent,
@@ -1967,7 +1969,7 @@ impl Chain {
         &self,
         block: &MsgBlock,
         is_treasury_enabled: bool,
-    ) -> Vec<SpentTxOut> {
+    ) -> Result<Vec<SpentTxOut>, RuleError> {
         let serialized = self
             .spend_journal_row(&block.header.block_hash())
             .unwrap_or_default();
@@ -1986,8 +1988,35 @@ impl Chain {
         }
         block_txns.extend(block.transactions.iter().skip(1).cloned());
 
-        crate::chainio::deserialize_spend_journal_entry(&serialized, &block_txns)
-            .expect("valid spend journal serialization")
+        // dcrd separates two failures here and the port had merged
+        // them.  Journal data missing for a block that spends anything
+        // is a broken invariant and it panics (`panicf("missing spend
+        // journal data for %s")`), but a row that is present and fails
+        // to decode is corruption: `dbFetchSpendJournalEntry` returns
+        // it as `database.ErrCorruption` and the reorg fails cleanly
+        // with the node still up.  Panicking on that arm too meant a
+        // corrupt row killed the process under `panic = "abort"` the
+        // next time any disconnect touched it.
+        if !block_txns.is_empty() && serialized.is_empty() {
+            panic!(
+                "missing spend journal data for {}",
+                block.header.block_hash()
+            );
+        }
+        crate::chainio::deserialize_spend_journal_entry(&serialized, &block_txns).map_err(|e| {
+            // Carried as `ErrUtxoBackendCorruption` for the reason
+            // `UtxoView::assert_missing` carries it: dcrd expresses this
+            // through a type the port has no counterpart for, and the
+            // kind is what keeps `is_rule_violation` from blaming the
+            // peer for local corruption.
+            rule_error(
+                RuleErrorKind::UtxoBackendCorruption,
+                alloc::format!(
+                    "corrupt spend information for {}: {e:?}",
+                    block.header.block_hash()
+                ),
+            )
+        })
     }
 
     /// The full block data for a node.  The data must have been
@@ -2838,7 +2867,7 @@ impl Chain {
 
             // Load the spent txos for the block from the spend
             // journal and update the view to unspend them.
-            let stxos = self.fetch_spend_journal(&block, is_treasury_enabled);
+            let stxos = self.fetch_spend_journal(&block, is_treasury_enabled)?;
             view.disconnect_block(
                 &block,
                 &parent,
@@ -3827,7 +3856,7 @@ impl Chain {
         // the tip block to reach the template's point of view.
         let tip_block = self.block_by_node(tip);
         let parent = self.block_by_node(prev_node);
-        let stxos = self.fetch_spend_journal(&tip_block, is_treasury_enabled);
+        let stxos = self.fetch_spend_journal(&tip_block, is_treasury_enabled)?;
         view.disconnect_block(
             &tip_block,
             &parent,
@@ -3908,7 +3937,9 @@ impl Chain {
         // remove the utxos created by the tip block.  Also, if the
         // block votes against its parent, reconnect all of the
         // regular transactions.
-        let stxos = self.fetch_spend_journal(&tip_block, is_treasury_enabled);
+        let stxos = self
+            .fetch_spend_journal(&tip_block, is_treasury_enabled)
+            .map_err(|e| e.description.clone())?;
         view.disconnect_block(
             &tip_block,
             &parent,

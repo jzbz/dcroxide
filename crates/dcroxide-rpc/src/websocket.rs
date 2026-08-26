@@ -335,8 +335,16 @@ pub struct WsClient {
 ///
 /// A Rust mutex poisons where Go's does not, and a handler that panicked
 /// mid-request leaves nothing this path needs to distrust: the client's
-/// own serving thread is its only writer, and the panic already became
-/// an error reply.
+/// own serving thread is its only writer, so a poisoned guard carries
+/// state no other thread could have torn.
+///
+/// An earlier version of this note added "and the panic already became
+/// an error reply", which is true only under `cargo test`.  The release
+/// profile sets `panic = "abort"`, so a panicking handler takes the
+/// process down before any reply exists and the `catch_unwind` guards
+/// that would have produced one never run.  Recovering the guard is
+/// still right -- it just cannot be justified by a reply that, in the
+/// build that ships, was never written.
 pub fn lock_client(wsc: &Mutex<WsClient>) -> std::sync::MutexGuard<'_, WsClient> {
     wsc.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }

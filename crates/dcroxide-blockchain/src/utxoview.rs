@@ -847,13 +847,13 @@ impl UtxoView {
         &mut self,
         block: &MsgBlock,
         parent: &MsgBlock,
-        parent_stxos: impl FnOnce() -> Vec<SpentTxOut>,
+        parent_stxos: impl FnOnce() -> Result<Vec<SpentTxOut>, RuleError>,
         resolver: &impl UtxoResolver,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
         if !crate::validate::header_approves_parent(&block.header) {
-            let parent_stxos = parent_stxos();
+            let parent_stxos = parent_stxos()?;
             self.disconnect_disapproved_block(
                 parent,
                 &parent_stxos,

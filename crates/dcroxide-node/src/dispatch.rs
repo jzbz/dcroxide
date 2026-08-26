@@ -1846,23 +1846,25 @@ impl ServerPeerHandler {
                 if !accepted.is_empty()
                     && let Some(ntfn) = &self.ctx.ntfn
                 {
-                    let pairs: Vec<(dcroxide_wire::MsgTx, i8)> = {
-                        let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
-                        accepted
-                            .iter()
-                            .filter_map(|hash| {
-                                let tx = pool.fetch_transaction(hash)?;
-                                let tree = if dcroxide_stake::determine_tx_type(&tx)
-                                    == dcroxide_stake::TxType::Regular
-                                {
-                                    dcroxide_wire::TX_TREE_REGULAR
-                                } else {
-                                    dcroxide_wire::TX_TREE_STAKE
-                                };
-                                Some((tx, tree))
-                            })
-                            .collect()
-                    };
+                    // Announce from the values the accept returned, not
+                    // from a second pool lookup.  dcrd carries the
+                    // `*dcrutil.Tx` through, so nothing it accepted can
+                    // go unannounced; re-fetching meant a transaction
+                    // evicted between the accept and this lock was
+                    // dropped from the notification without a trace.
+                    let pairs: Vec<(dcroxide_wire::MsgTx, i8)> = accepted
+                        .iter()
+                        .map(|(_, tx)| {
+                            let tree = if dcroxide_stake::determine_tx_type(tx)
+                                == dcroxide_stake::TxType::Regular
+                            {
+                                dcroxide_wire::TX_TREE_REGULAR
+                            } else {
+                                dcroxide_wire::TX_TREE_STAKE
+                            };
+                            (tx.clone(), tree)
+                        })
+                        .collect();
                     ntfn.notify_new_transactions(pairs);
                 }
                 // The inventory half of dcrd's AnnounceNewTransactions:
@@ -1872,11 +1874,7 @@ impl ServerPeerHandler {
                 // known to the source peer (done up front above); a
                 // released orphan is not, so it still relays to the peer
                 // that supplied its parent — matching dcrd.
-                for hash in &accepted {
-                    let fetched = {
-                        let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
-                        pool.fetch_transaction(hash)
-                    };
+                for (hash, tx) in &accepted {
                     let advertised =
                         self.ctx
                             .sync_peers
@@ -1891,12 +1889,12 @@ impl ServerPeerHandler {
                     // Only cache the transaction as recently advertised
                     // when a peer actually qualified for the relay, as
                     // dcrd's per-peer `recentlyAdvertisedTxns.Put` does.
-                    if advertised && let Some(tx) = fetched {
+                    if advertised {
                         self.ctx
                             .recently_advertised
                             .lock()
                             .expect("recently advertised poisoned")
-                            .put(*hash, tx);
+                            .put(*hash, tx.clone());
                     }
                 }
                 ServeSignal::Continue

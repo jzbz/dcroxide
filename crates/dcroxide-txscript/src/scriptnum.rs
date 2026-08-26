@@ -120,15 +120,25 @@ pub fn make_script_num(v: &[u8], script_num_len: usize) -> Result<ScriptNum, Scr
     }
 
     // Decode from little endian.
+    //
+    // Go defines a shift at or past the operand width as producing
+    // zero, while Rust masks the shift count modulo the width, so a
+    // byte at index eight or beyond would fold back into the low
+    // positions here instead of vanishing.  `checked_shl` reproduces
+    // Go's rule.  A caller cannot reach that today -- the length check
+    // above rejects anything longer than `script_num_len`, and every
+    // consensus caller passes four or five -- but this is a public
+    // function and the length is its caller's to choose.
+    let shift_to_zero = |value: i64, places: u32| value.checked_shl(places).unwrap_or(0);
     let mut result: i64 = 0;
     for (i, val) in v.iter().enumerate() {
-        result |= i64::from(*val) << (8 * i as u32);
+        result |= shift_to_zero(i64::from(*val), 8 * i as u32);
     }
 
     // When the most significant byte of the input has the sign bit set,
     // remove it from the result and negate.
     if v[v.len() - 1] & 0x80 != 0 {
-        result &= !(0x80i64 << (8 * (v.len() - 1) as u32));
+        result &= !shift_to_zero(0x80i64, 8 * (v.len() - 1) as u32);
         return Ok(ScriptNum(-result));
     }
 

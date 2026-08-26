@@ -558,3 +558,59 @@ fn peer_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<Peer>();
 }
+
+/// A request with no locator disarms the duplicate filter, so a request
+/// that was filtered before it goes out again afterwards.
+///
+/// dcrd records the begin hash on every push, nil included
+/// (`peer/peer.go:919-922`), and its duplicate test requires a non-nil
+/// recorded begin -- so an empty locator clears the pair and the next
+/// identical request is sent.  The port skipped the update when the
+/// locator was empty, leaving the previous pair standing and filtering
+/// a request dcrd sends.  Reported as RVW-024 by an external review of
+/// `382864f5`; the dumped vectors do not cover the sequence, because
+/// they never re-issue the original request after the empty one.
+#[test]
+fn an_empty_locator_disarms_the_duplicate_filter() {
+    let hash_a = Hash({
+        let mut h = [0u8; 32];
+        h[0] = 0x0a;
+        h
+    });
+    let stop = Hash({
+        let mut h = [0u8; 32];
+        h[0] = 0x51;
+        h
+    });
+
+    for headers in [false, true] {
+        let mut peer = Peer::new_inbound(Config {
+            protocol_version: 11,
+            ..base_cfg()
+        });
+        let mut push = |locator: &[Hash]| {
+            if headers {
+                peer.push_get_headers_msg(locator, &stop)
+            } else {
+                peer.push_get_blocks_msg(locator, &stop)
+            }
+        };
+
+        assert!(
+            push(&[hash_a]).is_some(),
+            "headers={headers}: first goes out"
+        );
+        assert!(
+            push(&[hash_a]).is_none(),
+            "headers={headers}: the immediate repeat is filtered"
+        );
+        assert!(
+            push(&[]).is_some(),
+            "headers={headers}: an empty locator is always sent"
+        );
+        assert!(
+            push(&[hash_a]).is_some(),
+            "headers={headers}: the empty locator must have disarmed the filter"
+        );
+    }
+}

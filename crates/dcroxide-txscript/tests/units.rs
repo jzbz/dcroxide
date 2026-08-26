@@ -160,3 +160,23 @@ fn opcode_name_lookup() {
     assert_eq!(opcode_by_name("OP_NOP3"), Some(0xb2));
     assert_eq!(opcode_by_name("OP_NONEXISTENT"), None);
 }
+
+/// Bytes past the eighth shift to zero, as Go defines, rather than
+/// folding back into the low positions as a masked Rust shift would.
+///
+/// Unreachable through the consensus callers, which pass a
+/// `script_num_len` of four or five, but `make_script_num` is public and
+/// the length is the caller's to choose.  Reported as RVW-021 by an
+/// external review of `382864f5`.
+#[test]
+fn decoding_beyond_eight_bytes_drops_the_high_bytes_like_go() {
+    // Nine bytes: value 1 in the low byte, then a byte at index eight.
+    // Go shifts that byte by 64 and gets zero, leaving 1.  A masked
+    // shift would fold it back to index zero and give 1 | 2 == 3.
+    let bytes = [0x01u8, 0, 0, 0, 0, 0, 0, 0, 0x02];
+    let decoded = make_script_num(&bytes, 9).expect("length is within the caller's limit");
+    assert_eq!(
+        decoded.0, 1,
+        "the ninth byte must vanish, not wrap into the low byte"
+    );
+}

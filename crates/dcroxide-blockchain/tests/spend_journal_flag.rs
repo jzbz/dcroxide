@@ -161,7 +161,7 @@ fn parent_journal_decode_depends_on_the_treasury_flag() {
 
     // Decoding with the parent's own (inactive) flag round-trips every
     // stxo.
-    let correct = chain.fetch_spend_journal(&parent, false);
+    let correct = chain.fetch_spend_journal(&parent, false).expect("decodes");
     assert_eq!(correct, vec![stake_stxo.clone(), reg_stxo.clone()]);
 
     // Decoding with the child's (active) flag skips the parent's first
@@ -169,9 +169,95 @@ fn parent_journal_decode_depends_on_the_treasury_flag() {
     // spend is silently dropped and the list is one short — a length
     // that would trip `disconnect_disapproved_block`'s stxo-count
     // assertion on the disapprove path.
-    let wrong = chain.fetch_spend_journal(&parent, true);
+    let wrong = chain.fetch_spend_journal(&parent, true).expect("decodes");
     assert_eq!(wrong, vec![reg_stxo]);
     assert_ne!(wrong.len(), count_spent_outputs(&parent));
+}
+
+/// A chain holding one pre-activation parent block whose spend journal
+/// row is present and valid: the shape the two tests below perturb.
+fn journal_fixture() -> (Chain, MsgBlock, MsgBlock) {
+    let params = simnet_params();
+    let mut chain = Chain::new(&params, Hash::ZERO, false);
+    let stake_stxo = stxo(vec![0x76, 0xa9, 0x14], 1_000, 500_000, 3);
+    let reg_stxo = stxo(vec![0x51], 2_000, 499_999, 1);
+    let parent = block(
+        552_447,
+        vec![
+            coinbase(0),
+            spend_tx(
+                2,
+                reg_stxo.amount,
+                reg_stxo.block_height,
+                reg_stxo.block_index,
+            ),
+        ],
+        vec![spend_tx(
+            0,
+            stake_stxo.amount,
+            stake_stxo.block_height,
+            stake_stxo.block_index,
+        )],
+    );
+    let child = block(552_448, vec![coinbase(1)], Vec::new());
+    let serialized = serialize_spend_journal_entry(&[stake_stxo, reg_stxo]).expect("journal");
+    chain
+        .spend_journal
+        .insert(parent.header.block_hash().0, serialized);
+    (chain, parent, child)
+}
+
+/// Bytes that are present and non-empty but are not a journal row: a
+/// compact-size length that runs off the end of the buffer.
+fn alloc_bad_row() -> Vec<u8> {
+    vec![0xff, 0xff, 0xff, 0xff]
+}
+
+/// A journal row that is present but does not decode is corruption,
+/// not an invariant break: it comes back as an error and the caller
+/// fails the reorg with the node still running.
+///
+/// dcrd draws the same line.  `dbFetchSpendJournalEntry` panics only
+/// when the row is *missing* for a block that spends something, and
+/// returns `database.ErrCorruption` when a present row fails to
+/// deserialize.  The port had one `expect` covering both, so under
+/// `panic = "abort"` a corrupt row killed the process the next time any
+/// disconnect touched it.  Reported as RVW-020 by an external review of
+/// `382864f5`.
+#[test]
+fn a_corrupt_spend_journal_row_is_an_error_not_a_panic() {
+    let (mut chain, parent, _child) = journal_fixture();
+
+    // A row that is present, non-empty, and not a valid journal.
+    chain
+        .spend_journal
+        .insert(parent.header.block_hash().0, alloc_bad_row());
+
+    let err = chain
+        .fetch_spend_journal(&parent, false)
+        .expect_err("a corrupt row must not decode");
+    assert_eq!(
+        err.kind.kind_name(),
+        "ErrUtxoBackendCorruption",
+        "corruption must not be classified as a rule violation the peer is blamed for: {err:?}"
+    );
+    assert!(
+        err.description.contains("corrupt spend information"),
+        "the message names the failure: {}",
+        err.description
+    );
+}
+
+/// A row missing entirely for a block that spends something is the
+/// invariant break dcrd panics on (`panicf("missing spend journal data
+/// for %s")`), and the port keeps panicking there rather than turning
+/// it into a recoverable error.
+#[test]
+#[should_panic(expected = "missing spend journal data")]
+fn a_missing_spend_journal_row_still_panics() {
+    let (mut chain, parent, _child) = journal_fixture();
+    chain.spend_journal.remove(&parent.header.block_hash().0);
+    let _ = chain.fetch_spend_journal(&parent, false);
 }
 
 /// `connect_block` must not touch the parent spend journal on the
@@ -201,7 +287,7 @@ fn connect_block_fetches_parent_journal_only_on_disapprove() {
             &parent,
             || {
                 calls.set(calls.get() + 1);
-                Vec::new()
+                Ok(Vec::new())
             },
             &none_resolver,
             None,
@@ -227,7 +313,7 @@ fn connect_block_fetches_parent_journal_only_on_disapprove() {
             &parent,
             || {
                 calls.set(calls.get() + 1);
-                Vec::new()
+                Ok(Vec::new())
             },
             &none_resolver,
             None,

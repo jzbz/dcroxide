@@ -334,8 +334,14 @@ pub struct Peer {
     handshake_done: bool,
 
     known_inventory: lru::Set<InvVect>,
-    prev_get_blocks: Option<(Hash, Hash)>,
-    prev_get_hdrs: Option<(Hash, Hash)>,
+    /// The begin and stop hashes of the last getblocks sent, for
+    /// duplicate filtering.  The begin half is optional because dcrd
+    /// records it even for a locator that had none (`prevGetBlocksBegin`
+    /// is a nil pointer then), and a nil begin is what disarms the
+    /// filter until the next request that has one.
+    prev_get_blocks: Option<(Option<Hash>, Hash)>,
+    /// The same for getheaders (dcrd `prevGetHdrsBegin`/`prevGetHdrsStop`).
+    prev_get_hdrs: Option<(Option<Hash>, Hash)>,
 
     time_offset: i64,
     time_connected_nanos: i64,
@@ -584,6 +590,16 @@ impl Peer {
     /// Update the last known block height (dcrd
     /// `UpdateLastBlockHeight`).
     pub fn update_last_block_height(&mut self, new_height: i64) {
+        // dcrd refuses decreases (`peer/peer.go:562-566`).  The project
+        // split dcrd's method into this copy and netsync's, and only
+        // netsync's kept the guard, so the two disagreed about what a
+        // lower height means.  Nothing in-tree calls this one today --
+        // both call sites resolve to the netsync twin -- but it is a
+        // public API of this crate and would have been wrong for its
+        // first caller.
+        if new_height <= self.last_block {
+            return;
+        }
         self.last_block = new_height;
     }
 
@@ -709,7 +725,8 @@ impl Peer {
         let begin_hash = locator.first().copied();
 
         // Filter duplicate getblocks requests.
-        if let (Some((prev_begin, prev_stop)), Some(begin)) = (&self.prev_get_blocks, begin_hash)
+        if let (Some((Some(prev_begin), prev_stop)), Some(begin)) =
+            (&self.prev_get_blocks, begin_hash)
             && *stop_hash == *prev_stop
             && begin == *prev_begin
         {
@@ -722,11 +739,12 @@ impl Peer {
             hash_stop: *stop_hash,
         }));
 
-        // Update the previous getblocks request information.  dcrd
-        // records the begin hash only when the locator had one.
-        if let Some(begin) = begin_hash {
-            self.prev_get_blocks = Some((begin, *stop_hash));
-        }
+        // Record the request unconditionally, as dcrd does.  A locator
+        // with no hashes records a begin of `None`, which disarms the
+        // filter above until a request that has one re-arms it --
+        // skipping the update instead left the previous pair standing,
+        // so a later identical request was filtered where dcrd sends it.
+        self.prev_get_blocks = Some((begin_hash, *stop_hash));
         Some(msg)
     }
 
@@ -737,7 +755,8 @@ impl Peer {
         let begin_hash = locator.first().copied();
 
         // Filter duplicate getheaders requests.
-        if let (Some((prev_begin, prev_stop)), Some(begin)) = (&self.prev_get_hdrs, begin_hash)
+        if let (Some((Some(prev_begin), prev_stop)), Some(begin)) =
+            (&self.prev_get_hdrs, begin_hash)
             && *stop_hash == *prev_stop
             && begin == *prev_begin
         {
@@ -751,9 +770,8 @@ impl Peer {
             hash_stop: *stop_hash,
         }));
 
-        if let Some(begin) = begin_hash {
-            self.prev_get_hdrs = Some((begin, *stop_hash));
-        }
+        // Recorded unconditionally, as in the getblocks twin above.
+        self.prev_get_hdrs = Some((begin_hash, *stop_hash));
         Some(msg)
     }
 

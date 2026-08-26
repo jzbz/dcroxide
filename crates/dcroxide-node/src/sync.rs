@@ -235,6 +235,16 @@ impl SyncTxPool for NullTxPool {
         Err("the transaction mempool is not yet wired".to_string())
     }
 
+    fn process_transaction_accepted(
+        &mut self,
+        _tx: &MsgTx,
+        _allow_orphan: bool,
+        _allow_high_fees: bool,
+        _tag: u64,
+    ) -> Result<Vec<(Hash, MsgTx)>, String> {
+        Err("the transaction mempool is not yet wired".to_string())
+    }
+
     fn have_transaction(&mut self, _hash: &Hash) -> bool {
         false
     }

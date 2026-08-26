@@ -4786,7 +4786,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     node_vote_bits: u16,
     block: &MsgBlock,
     parent: &MsgBlock,
-    parent_stxos: impl FnOnce() -> Vec<crate::chainio::SpentTxOut>,
+    parent_stxos: impl FnOnce() -> Result<Vec<crate::chainio::SpentTxOut>, RuleError>,
     view: &mut crate::utxoview::UtxoView,
     resolver: &impl crate::utxoview::UtxoResolver,
     mut stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
@@ -4859,7 +4859,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     // disapproves them.  The parent spend journal is only decoded here,
     // on the disapprove path, exactly like dcrd.
     if node_height > 1 && !vote_bits_approve_parent(node_vote_bits) {
-        let parent_stxos = parent_stxos();
+        let parent_stxos = parent_stxos()?;
         view.disconnect_disapproved_block(parent, &parent_stxos, resolver, is_treasury_enabled)?;
     }
 

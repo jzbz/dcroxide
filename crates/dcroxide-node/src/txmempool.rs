@@ -79,7 +79,9 @@ pub(crate) fn chain_fetch_utxo_view(
         let tip_block = chain
             .block_by_hash(&best.hash)
             .ok_or_else(|| format!("no block data for tip {}", best.hash))?;
-        let stxos = chain.fetch_spend_journal(&tip_block, is_treasury_enabled);
+        let stxos = chain
+            .fetch_spend_journal(&tip_block, is_treasury_enabled)
+            .map_err(|e| e.description)?;
         view.disconnect_disapproved_block(
             &tip_block,
             &stxos,
@@ -377,6 +379,18 @@ impl SyncTxPool for NodeSyncTxPool {
     ) -> Result<Vec<Hash>, String> {
         self.locked()
             .process_transaction(tx, allow_orphan, allow_high_fees, tag)
+            .map_err(|e| pool_error_text(&e))
+    }
+
+    fn process_transaction_accepted(
+        &mut self,
+        tx: &MsgTx,
+        allow_orphan: bool,
+        allow_high_fees: bool,
+        tag: u64,
+    ) -> Result<Vec<(Hash, MsgTx)>, String> {
+        self.locked()
+            .process_transaction_accepted(tx, allow_orphan, allow_high_fees, tag)
             .map_err(|e| pool_error_text(&e))
     }
 

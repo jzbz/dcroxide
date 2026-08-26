@@ -905,6 +905,20 @@ impl<C: PoolChain> TxPool<C> {
     /// Add the passed transaction to the memory pool without
     /// validation (dcrd `addTransaction`).
     fn add_transaction(&mut self, tx_desc: Arc<TxDesc>) {
+        // Notify about the vote first, before the transaction is in the
+        // pool at all.  dcrd fires `OnVoteReceived` as the opening
+        // statement of `addTransaction` (`mempool.go:905-908`) and
+        // inserts afterwards, so a synchronous receiver -- the port's
+        // is a direct call, where dcrd's reaches the background template
+        // generator -- observes the pool without this vote.  Firing it
+        // from the tail of `maybe_accept_transaction` instead, as this
+        // did, showed the receiver a pool that already contained it.
+        if dcroxide_stake::determine_tx_type(&tx_desc.tx) == TxType::SSGen
+            && let Some(receiver) = &mut self.vote_receiver
+        {
+            receiver.vote_received(&tx_desc.tx);
+        }
+
         // Add the transaction to the pool and mark the referenced
         // outpoints as spent by the pool.  The mining view is updated
         // between the two, matching dcrd's call order, so the
@@ -1667,13 +1681,6 @@ impl<C: PoolChain> TxPool<C> {
         // Keep track of votes separately.
         if is_vote {
             self.insert_vote(&tx, &tx_hash);
-
-            // Notify the background template generator of the accepted
-            // vote so it can react as votes propagate (dcrd's
-            // `OnVoteReceived` firing `s.bg.VoteReceived`).
-            if let Some(receiver) = &mut self.vote_receiver {
-                receiver.vote_received(&tx);
-            }
         }
 
         // Keep track of tspends separately.
@@ -1803,8 +1810,8 @@ impl<C: PoolChain> TxPool<C> {
         accepted_tx: &MsgTx,
         accepted_hash: &Hash,
         check_tx_flags: AgendaFlags,
-    ) -> Vec<Hash> {
-        let mut accepted_txns: Vec<Hash> = Vec::new();
+    ) -> Vec<(Hash, MsgTx)> {
+        let mut accepted_txns: Vec<(Hash, MsgTx)> = Vec::new();
         let mut accepted_msgs: Vec<MsgTx> = Vec::new();
 
         // Start with processing at least the passed transaction.
@@ -1872,7 +1879,7 @@ impl<C: PoolChain> TxPool<C> {
                             // process any orphans that depend on it
                             // too.  Only one transaction for this
                             // outpoint can be accepted.
-                            accepted_txns.push(orphan_hash);
+                            accepted_txns.push((orphan_hash, (*orphan_tx).clone()));
                             accepted_msgs.push((*orphan_tx).clone());
                             self.remove_orphan(&orphan_hash, false);
                             process_list.push(((*orphan_tx).clone(), orphan_hash));
@@ -1901,6 +1908,23 @@ impl<C: PoolChain> TxPool<C> {
         accepted_tx: &MsgTx,
         check_tx_flags: AgendaFlags,
     ) -> Vec<Hash> {
+        self.process_orphans_accepted(accepted_tx, check_tx_flags)
+            .into_iter()
+            .map(|(hash, _)| hash)
+            .collect()
+    }
+
+    /// The same, keeping each accepted transaction alongside its hash.
+    ///
+    /// dcrd's `ProcessOrphans` hands back the `*dcrutil.Tx` values and
+    /// its callers announce from those, so nothing has to look a
+    /// transaction up again after accepting it -- and nothing can miss
+    /// one that left the pool in between.
+    pub fn process_orphans_accepted(
+        &mut self,
+        accepted_tx: &MsgTx,
+        check_tx_flags: AgendaFlags,
+    ) -> Vec<(Hash, MsgTx)> {
         let hash = accepted_tx.tx_hash();
         self.process_orphans_internal(accepted_tx, &hash, check_tx_flags)
     }
@@ -1915,6 +1939,24 @@ impl<C: PoolChain> TxPool<C> {
         allow_high_fees: bool,
         tag: Tag,
     ) -> Result<Vec<Hash>, PoolError> {
+        Ok(self
+            .process_transaction_accepted(tx, allow_orphan, allow_high_fees, tag)?
+            .into_iter()
+            .map(|(hash, _)| hash)
+            .collect())
+    }
+
+    /// The same, keeping each accepted transaction alongside its hash
+    /// so callers announce from the values rather than looking them up
+    /// again (dcrd `ProcessTransaction`, whose result carries the
+    /// `*dcrutil.Tx` values).
+    pub fn process_transaction_accepted(
+        &mut self,
+        tx: &MsgTx,
+        allow_orphan: bool,
+        allow_high_fees: bool,
+        tag: Tag,
+    ) -> Result<Vec<(Hash, MsgTx)>, PoolError> {
         let check_tx_flags = self.determine_check_tx_flags()?;
         let tx_hash = tx.tx_hash();
 
@@ -1931,7 +1973,7 @@ impl<C: PoolChain> TxPool<C> {
 
             // Add the parent transaction first so remote nodes do not
             // add orphans.
-            accepted.push(tx_hash);
+            accepted.push((tx_hash, tx.clone()));
             accepted.extend(new_txs);
             return Ok(accepted);
         }

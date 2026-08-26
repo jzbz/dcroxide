@@ -262,6 +262,20 @@ pub trait SyncTxPool {
         allow_high_fees: bool,
         tag: u64,
     ) -> Result<Vec<Hash>, String>;
+    /// The same, keeping each accepted transaction alongside its hash.
+    ///
+    /// dcrd's announce path works from the `*dcrutil.Tx` values its
+    /// process result carries, so a transaction that leaves the pool
+    /// between acceptance and announcement is still announced.  A
+    /// hash-only result forces the caller to look each one up again and
+    /// silently lose the ones already gone.
+    fn process_transaction_accepted(
+        &mut self,
+        tx: &MsgTx,
+        allow_orphan: bool,
+        allow_high_fees: bool,
+        tag: u64,
+    ) -> Result<Vec<(Hash, MsgTx)>, String>;
     /// Whether the pool already has the transaction, main or orphan
     /// (dcrd `HaveTransaction`).
     fn have_transaction(&mut self, hash: &Hash) -> bool;
@@ -1129,7 +1143,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// Process a transaction received from a remote peer, returning
     /// the hashes of the transactions accepted to the mempool (dcrd
     /// `OnTx`).
-    pub fn on_tx(&mut self, peer_id: i32, tx: &MsgTx) -> Vec<Hash> {
+    pub fn on_tx(&mut self, peer_id: i32, tx: &MsgTx) -> Vec<(Hash, MsgTx)> {
         if self.shutdown {
             return Vec::new();
         }
@@ -1149,10 +1163,12 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // Process the transaction to include validation, insertion in
         // the memory pool, orphan handling, etc.
         let allow_orphans = self.cfg.max_orphan_txs > 0;
-        let result =
-            self.cfg
-                .tx_mem_pool
-                .process_transaction(tx, allow_orphans, true, peer_id as u64);
+        let result = self.cfg.tx_mem_pool.process_transaction_accepted(
+            tx,
+            allow_orphans,
+            true,
+            peer_id as u64,
+        );
 
         // Remove transaction from request maps.  Either the
         // mempool/chain already knows about it and as such we

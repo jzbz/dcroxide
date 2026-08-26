@@ -174,7 +174,7 @@ fn connectblock_vectors() {
                     block.header.vote_bits,
                     &block,
                     parent,
-                    Vec::new,
+                    || Ok(Vec::new()),
                     &mut view,
                     &none_resolver,
                     Some(&mut stxos),

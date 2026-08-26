@@ -170,6 +170,22 @@ impl SyncTxPool for ScriptedTxPool {
         panic!("unexpected transaction {hash}");
     }
 
+    fn process_transaction_accepted(
+        &mut self,
+        tx: &MsgTx,
+        allow_orphan: bool,
+        allow_high_fees: bool,
+        tag: u64,
+    ) -> Result<Vec<(Hash, MsgTx)>, String> {
+        // The scripted pool never accepts anything, so pairing the
+        // hashes back up with the delivered transaction is enough.
+        Ok(self
+            .process_transaction(tx, allow_orphan, allow_high_fees, tag)?
+            .into_iter()
+            .map(|hash| (hash, tx.clone()))
+            .collect())
+    }
+
     fn have_transaction(&mut self, hash: &Hash) -> bool {
         self.have.contains(hash)
     }
