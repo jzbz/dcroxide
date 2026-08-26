@@ -35,19 +35,30 @@ observable.
   pinned by dcrd's own battery: the regenerated `fullblock_vectors.txt`
   carries `bmf25` and `bmf35` at `ErrMissingTxOut`, which only passes if the
   check fires ahead of the maturity check exactly as upstream's does.
-- **Not yet assessed against the port:** `589dd4c5` gives dcrd its own per-peer
-  queued-output byte cap (40 MiB, disconnect on exceed), which turns the
-  *Per-peer outbound queue* row below from a divergence in kind into one in
-  value and action; `cc5e1d63` treats ORCHIDv2 addresses as unroutable;
-  `3d1c81e1` validates RS hashes during mixing blame assignment; `8f6ff12a`
-  changes mixclient CM publish ordering.
+- **Assessed by walking `tools/pinbump`'s crate list:** `cc5e1d63` treats
+  ORCHIDv2 (`2001:20::/28`) as unroutable and the port did not — now ported,
+  pinned by `orchid_v2_addresses_are_unroutable`. `3d1c81e1` and `8f6ff12a`
+  are `mixclient` changes, and `mixclient` is not ported (deferred with
+  `keyagreement.go`, per the mixing row below). `589dd4c5` gives dcrd its own
+  per-peer queued-output byte cap (40 MiB, disconnect on exceed), which turns
+  the *Per-peer outbound queue* row below from a divergence in kind into one in
+  value and action; reconciling the two is a deliberate choice about honest
+  peers on slow links, not a porting gap, and is still open.
 - **Not observable:** `01208035` narrows an in-flight utxo add from O(n) to
   O(1) over outputs the port already adds singly; `efc7e3d9` and `ae4c5818`
-  stop a subsidy cache inserting duplicate intervals under concurrency;
-  `036b7090` tightens a `getByIndex` bounds guard from `>` to `>=`; `085eb08c`
+  stop a subsidy cache inserting duplicate intervals under concurrency, which
+  cannot arise here because the port's cache is a `BTreeMap` with no parallel
+  sorted-interval vector to grow; `085eb08c`
   is secp256k1 byte clearing over a layer the port delegates to `k256`; and
   `9ae5864c`, `ffecb8e0`, `025e7c6e`, `495124df`, `7080c11c`, `885ea18c`,
   `e201209e` and `500ce093` are build, docs, module-version and test-only.
+- **Mis-bucketed on the first pass:** `036b7090` tightens a `getByIndex`
+  bounds guard from `>` to `>=`, recorded here as not observable because it
+  only changes which panic fires.  The port had the same off-by-one, and the
+  same blind spot in the test that should have caught it -- asserting only
+  that an out-of-range index panicked, which the walk running off the end
+  satisfied.  Both are fixed; the test now asserts the panic came from the
+  bounds check.
 
 `QK-NNNN` references in the notes below are entries in
 [QUIRKS.md](QUIRKS.md), which catalogues the deliberate bug-for-bug

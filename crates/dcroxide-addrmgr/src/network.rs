@@ -153,6 +153,16 @@ fn is_rfc4193(ip: &[u8]) -> bool {
     contains_v6(v6(&[0xfc]), 7, ip)
 }
 
+/// RFC7343, the IPv6 ORCHIDv2 block (2001:20::/28).
+///
+/// Added upstream in `cc5e1d63`, after the parity pin moved past
+/// `29f17894`: dcrd's `IsRoutable` counts these as unroutable, so
+/// leaving them out here would have relayed and dialled addresses dcrd
+/// discards.
+fn is_rfc7343(ip: &[u8]) -> bool {
+    contains_v6(v6(&[0x20, 0x01, 0x00, 0x20]), 28, ip)
+}
+
 /// RFC4380 (2001::/32).
 pub(crate) fn is_rfc4380(ip: &[u8]) -> bool {
     contains_v6(v6(&[0x20, 0x01, 0x00, 0x00]), 32, ip)
@@ -231,6 +241,7 @@ pub fn is_routable(ip: &[u8]) -> bool {
             || is_rfc4843(ip)
             || is_rfc5737(ip)
             || is_rfc6598(ip)
+            || is_rfc7343(ip)
             || is_local(ip)
             || is_rfc4193(ip))
 }

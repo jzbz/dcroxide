@@ -88,10 +88,21 @@ fn immutable_sequential() {
         assert_eq!(v, value, "get_by_index value #{i}");
     }
     {
+        // The panic must come from the bounds check, not from the walk
+        // running off the end of the treap.  Asserting only that it
+        // panicked is what let dcrd's own test miss this off-by-one
+        // until `036b7090`: the wrong panic satisfied it just as well.
         let treap = treap.clone();
+        let panicked = std::panic::catch_unwind(move || treap.get_by_index(num_items))
+            .expect_err("get_by_index(len) must panic");
+        let message = panicked
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panicked.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default();
         assert!(
-            std::panic::catch_unwind(move || treap.get_by_index(num_items)).is_err(),
-            "get_by_index(len) must panic"
+            message.contains("getByIndex index out of bounds"),
+            "the bounds check must be what rejects an index of len, not the walk: {message:?}"
         );
     }
     assert!(treap.heap_invariant_ok(), "heap invariant");

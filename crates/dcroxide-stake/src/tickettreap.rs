@@ -122,9 +122,17 @@ impl Immutable {
 
     /// The key and value at the given in-order index; panics when the
     /// index is out of bounds exactly like dcrd (dcrd `GetByIndex`).
+    ///
+    /// The bound is `<` rather than `<=`: an index equal to the size is
+    /// one past the last element.  dcrd carried the same off-by-one and
+    /// fixed it in `036b7090`, noting that its own test had not caught
+    /// it because the out-of-range index still panicked -- just from the
+    /// runtime walking off the end rather than from this check, so the
+    /// test's "did it panic" assertion was satisfied by the wrong panic.
+    /// The port inherited both the bug and that blind spot.
     pub fn get_by_index(&self, idx: usize) -> (Key, Value) {
         let root = self.root.as_deref().expect("getByIndex on empty treap");
-        assert!(idx <= root.size as usize, "getByIndex index out of bounds");
+        assert!(idx < root.size as usize, "getByIndex index out of bounds");
         let mut node = root;
         let mut idx = idx;
         loop {

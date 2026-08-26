@@ -453,3 +453,42 @@ fn addr_manager_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<AddrManager>();
 }
+
+/// ORCHIDv2 addresses are unroutable, as dcrd's `IsRoutable` has
+/// counted them since `cc5e1d63`.
+///
+/// The rule arrived upstream after the previous parity pin, so the port
+/// treated `2001:20::/28` as ordinary routable space and would have
+/// relayed and dialled addresses dcrd discards.  Found by walking
+/// `tools/pinbump`'s re-review list for the `29f17894..036b7090` delta.
+#[test]
+fn orchid_v2_addresses_are_unroutable() {
+    use dcroxide_addrmgr::is_routable;
+
+    // 2001:20:: — the first address of the block.
+    let mut inside = [0u8; 16];
+    inside[0] = 0x20;
+    inside[1] = 0x01;
+    inside[3] = 0x20;
+    assert!(!is_routable(&inside), "2001:20:: must be unroutable");
+
+    // The last address of the /28: 2001:2f:ffff:...
+    let mut last = [0xffu8; 16];
+    last[0] = 0x20;
+    last[1] = 0x01;
+    last[2] = 0x00;
+    last[3] = 0x2f;
+    assert!(!is_routable(&last), "the end of the /28 must be unroutable");
+
+    // 2001:30:: is one past the block and stays routable, so the mask
+    // is a /28 rather than something looser.
+    let mut outside = [0u8; 16];
+    outside[0] = 0x20;
+    outside[1] = 0x01;
+    outside[3] = 0x30;
+    outside[15] = 0x01;
+    assert!(
+        is_routable(&outside),
+        "2001:30:: is outside the block and must stay routable"
+    );
+}
