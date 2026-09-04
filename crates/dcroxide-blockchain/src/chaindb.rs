@@ -11,6 +11,7 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt;
 
 use dcroxide_chainhash::Hash;
 use dcroxide_database::Transaction;
@@ -93,6 +94,19 @@ impl From<dcroxide_database::Error> for ChainDbError {
 impl From<crate::Error> for ChainDbError {
     fn from(err: crate::Error) -> ChainDbError {
         ChainDbError::Serial(err)
+    }
+}
+
+impl fmt::Display for ChainDbError {
+    /// The analogue of Go's `%v` on the error `flushBlockIndex`
+    /// returns: the underlying description, since dcrd's
+    /// `database.Error` renders as its own description text.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChainDbError::Db(e) => write!(f, "{e}"),
+            ChainDbError::Serial(e) => write!(f, "{e}"),
+            ChainDbError::Corrupt(s) => f.write_str(s),
+        }
     }
 }
 

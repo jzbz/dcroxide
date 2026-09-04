@@ -29,8 +29,8 @@ use crate::blockindex::{BlockIndex, BlockStatus, NodeId, NodeStore};
 use crate::chainio::SpentTxOut;
 use crate::chainview_nodes::{NodeBranchView, NodeChainView};
 use crate::notifications::{
-    BlockAcceptedNtfnsData, BlockConnectedNtfnsData, BlockDisconnectedNtfnsData, Notification,
-    NotificationCallback, ReorganizationNtfnsData, TicketNotificationsData,
+    BlockAcceptedNtfnsData, BlockConnectedNtfnsData, BlockDisconnectedNtfnsData, LogCallback,
+    LogLevel, Notification, NotificationCallback, ReorganizationNtfnsData, TicketNotificationsData,
 };
 use crate::ruleerror::RuleErrorKind;
 use crate::stakever::calc_want_height;
@@ -289,6 +289,10 @@ pub struct Chain {
     /// The chain event callback (dcrd `BlockChain.notifications`);
     /// invoked synchronously from the processing paths when installed.
     notifications: Option<crate::notifications::NotificationCallback>,
+    /// The package log sink (dcrd's `internal/blockchain` package
+    /// `log`, installed by its `UseLogger`).  `None` is dcrd's
+    /// `slog.Disabled` default, under which the package logs nothing.
+    log_sink: Option<LogCallback>,
     /// The shared signature verification cache threaded into every
     /// script engine the connect and mempool paths create (dcrd wires
     /// `s.sigCache` into `blockchain.Config.SigCache`).  Defaults to
@@ -450,6 +454,7 @@ impl Chain {
             treasury_spend_limit_floor: (params.base_subsidy / 10)
                 * (params.treasury_vote_interval * params.treasury_vote_interval_multiplier) as i64,
             notifications: None,
+            log_sink: None,
             sig_cache: Some(Arc::new(dcroxide_txscript::SigCache::new(
                 DEFAULT_SIG_CACHE_MAX_ENTRIES,
             ))),
@@ -482,6 +487,22 @@ impl Chain {
     ) {
         if let Some(callback) = notifications {
             callback(notification);
+        }
+    }
+
+    /// Install the package log sink (dcrd `blockchain.UseLogger`,
+    /// which dcrd's `log.go:85` calls at init with the `CHAN` logger).
+    /// Until one is installed the chain logs nothing, exactly as dcrd's
+    /// `slog.Disabled` package default does.
+    pub fn set_log_callback(&mut self, callback: LogCallback) {
+        self.log_sink = Some(callback);
+    }
+
+    /// Emit a log line when a sink is installed (dcrd's package-level
+    /// `log` calls, which are no-ops under `slog.Disabled`).
+    fn log(&mut self, level: LogLevel, message: &str) {
+        if let Some(sink) = &mut self.log_sink {
+            sink(level, message);
         }
     }
 
@@ -1010,24 +1031,51 @@ impl Chain {
         Ok(())
     }
 
-    /// Flush the modified block index rows without failing on the
-    /// write (dcrd `flushBlockIndexWarnOnly`).
+    /// Flush the modified block index rows and warn rather than fail
+    /// on the write (dcrd `flushBlockIndexWarnOnly`,
+    /// `chain.go:1516-1520`).
     ///
     /// The administrative paths use this: their work is already done by
     /// the time they reach it, and dcrd does not fail an
     /// `invalidateblock` because the write did not land.
     ///
-    /// dcrd logs the error; this crate has no logging facility, so it is
-    /// dropped instead. The control flow is the same either way -- dcrd
-    /// does not propagate it -- but the operator loses the line.
+    /// The warning goes to the package log sink, which the daemon
+    /// renders under dcrd's `CHAN` tag; with no sink installed nothing
+    /// is emitted, exactly as dcrd's `slog.Disabled` package default.
+    /// The text after the colon is this storage layer's own error
+    /// description, not dcrd's.
+    ///
+    /// Note that dcrd's `blockIndex.Flush` clears its modified set only
+    /// after a successful write, so a failed flush there is retried by
+    /// the next one; here the rows are already drained by the time the
+    /// failure is seen, so nothing retries them.  That divergence is
+    /// recorded in PARITY.md and is not changed by this warning.
     fn flush_block_index_warn_only(&mut self, params: &Params) {
-        let _ = self.flush_block_index(params);
+        if let Err(e) = self.flush_block_index(params) {
+            self.log(
+                LogLevel::Warn,
+                &format!("Unable to flush block index changes to db: {e}"),
+            );
+        }
     }
 
     /// Write the modified block index entries to the database,
     /// populating pruned ticket info first (dcrd `flushBlockIndex`).
     fn flush_block_index(&mut self, params: &Params) -> Result<(), crate::chaindb::ChainDbError> {
         if self.db.is_none() {
+            return Ok(());
+        }
+        // Nothing to flush when no node is modified: dcrd's
+        // `blockIndex.Flush` returns before it touches the database at
+        // all (`blockindex.go:1409-1414`).  Without this the
+        // unconditional `db.update` below still opens a write
+        // transaction, which a closed or write-latched store refuses
+        // (`check_open`/`check_writable` run before the closure), so
+        // `flush_block_index_warn_only` would warn where dcrd is
+        // silent -- notably on `force_head_reorganization`'s success
+        // path, where dcrd's own comment says the index is modified
+        // only if the block failed to connect.
+        if self.index.modified_len() == 0 {
             return Ok(());
         }
         let rows = self.take_block_index_rows(params);
@@ -3394,8 +3442,8 @@ impl Chain {
     /// Manually invalidate the block as if it had violated a
     /// consensus rule, mark its descendants as having an invalid
     /// ancestor, and reorganize to the best remaining valid chain
-    /// (dcrd `InvalidateBlock`; the context check cache and block
-    /// index flushes are not reproduced).
+    /// (dcrd `InvalidateBlock`; the context check cache is not
+    /// reproduced).
     pub fn invalidate_block(
         &mut self,
         hash: &Hash,

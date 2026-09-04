@@ -31,13 +31,33 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use dcroxide_blockchain::notifications::{BlockAcceptedNtfnsData, Notification};
+use dcroxide_blockchain::notifications::{
+    BlockAcceptedNtfnsData, LogCallback, LogLevel as ChainLogLevel, Notification,
+};
+
 use dcroxide_blockchain::process::Chain;
 use dcroxide_blockchain::validate::{AgendaFlags, header_approves_parent};
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_rpc::websocket::RpcNtfnManager;
 use dcroxide_wire::{BlockHeader, CurrencyNet};
+
+/// The subsystem tag dcrd's `log.go:64` gives `internal/blockchain`.
+const CHAN_LOG_SUBSYSTEM: &str = "CHAN";
+
+/// The chain's package log sink (dcrd `log.go:85`,
+/// `blockchain.UseLogger(chanLog)`): the chain formats dcrd's line and
+/// this renders it under the `CHAN` tag, so `--debuglevel CHAN=`
+/// governs it exactly as upstream.
+pub fn chain_log_sink() -> LogCallback {
+    Box::new(|level, msg| match level {
+        ChainLogLevel::Trace => crate::logging::trace(CHAN_LOG_SUBSYSTEM, msg),
+        ChainLogLevel::Debug => crate::logging::debug(CHAN_LOG_SUBSYSTEM, msg),
+        ChainLogLevel::Info => crate::logging::info(CHAN_LOG_SUBSYSTEM, msg),
+        ChainLogLevel::Warn => crate::logging::warn(CHAN_LOG_SUBSYSTEM, msg),
+        ChainLogLevel::Error => crate::logging::error(CHAN_LOG_SUBSYSTEM, msg),
+    })
+}
 
 use crate::websocket::NodeNtfnMgr;
 
@@ -867,6 +887,24 @@ pub fn should_notify_winning_tickets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tag the chain sink renders under must be one `--debuglevel`
+    /// accepts, so `--debuglevel CHAN=off` suppresses these lines the
+    /// way dcrd's `subsystemLoggers["CHAN"]` (`log.go:106`) does.
+    ///
+    /// Without this, a typo compiles, wires cleanly, prints under a tag
+    /// nothing recognises, and silently ignores the level setting.
+    #[test]
+    fn chan_log_subsystem_is_a_registered_tag() {
+        assert!(
+            crate::logsubsys::SUBSYSTEM_IDS.contains(&CHAN_LOG_SUBSYSTEM),
+            "{CHAN_LOG_SUBSYSTEM} is not a --debuglevel subsystem"
+        );
+        // Compile-checks the closure against `LogCallback`'s `Send +
+        // 'static` bound, which would otherwise fail only at the
+        // daemon's wiring line in the bin.
+        let _sink: LogCallback = chain_log_sink();
+    }
 
     fn header(height: u32, version: i32) -> BlockHeader {
         BlockHeader {

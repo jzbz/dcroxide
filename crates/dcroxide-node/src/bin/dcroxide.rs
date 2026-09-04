@@ -1518,6 +1518,14 @@ fn open_chain(cfg: &Config, db: Database) -> Result<Chain, String> {
     // `txscript.NewSigCache`).  The open-time catch-up replay above
     // runs no scripts, so sizing after open is equivalent.
     chain.set_sig_cache_max_entries(usize::try_from(cfg.sig_cache_max_size).unwrap_or(usize::MAX));
+    // dcrd's `log.go` init hands `internal/blockchain` the CHAN logger
+    // (`blockchain.UseLogger(chanLog)`, `log.go:85`).  The per-subsystem
+    // levels are already resolved by the time this runs
+    // (`logging::set_levels` in `run`), so `--debuglevel CHAN=` governs
+    // these lines as it does upstream.  Note this cannot carry any line
+    // from chain construction itself: `Chain::open` above has already
+    // run.
+    chain.set_log_callback(dcroxide_node::chainntfns::chain_log_sink());
     Ok(chain)
 }
 

@@ -122,3 +122,41 @@ pub enum Notification<'a> {
 /// `NotificationCallback`); `Send` because the chain is shared across
 /// the daemon's threads.
 pub type NotificationCallback = Box<dyn FnMut(&Notification<'_>) + Send>;
+
+/// The level a chain log line carries (decred/slog's levels, which
+/// dcrd's `internal/blockchain` logs through its package-level `log`).
+///
+/// The five the daemon has a wrapper for, rather than only the one in
+/// use: dcrd's package sink is a full `slog.Logger`, so the daemon-side
+/// mapping is written once instead of growing a variant per ported
+/// line.  `Critical` is deliberately absent -- dcrd's
+/// `internal/blockchain` reaches it only through `panicf`
+/// (`chain.go:57-62`), which logs and then panics, and this port has no
+/// ported counterpart of that path to log through; add the variant with
+/// the first one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    /// dcrd `log.Tracef`.
+    Trace,
+    /// dcrd `log.Debugf`.
+    Debug,
+    /// dcrd `log.Infof`.
+    Info,
+    /// dcrd `log.Warnf`.
+    Warn,
+    /// dcrd `log.Errorf`.
+    Error,
+}
+
+/// The package log sink (dcrd's `internal/blockchain` package-level
+/// `log`, installed by its `UseLogger`); `Send` for the same reason
+/// [`NotificationCallback`] is.
+///
+/// dcrd's blockchain package carries no logging framework either: its
+/// package `log` starts at `slog.Disabled` and the daemon injects the
+/// `CHAN` logger at init (`dcrd/log.go:85`).  `None` here is that
+/// disabled default -- a chain with no sink installed logs nothing at
+/// all.  This is deliberately a separate seam from
+/// [`NotificationCallback`], exactly as it is upstream: dcrd's
+/// `NotificationType` has no logging constant.
+pub type LogCallback = Box<dyn FnMut(LogLevel, &str) + Send>;
