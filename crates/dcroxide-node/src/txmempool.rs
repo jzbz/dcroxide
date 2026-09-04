@@ -19,6 +19,7 @@ use dcroxide_blockchain::sequencelock::SequenceLock;
 use dcroxide_blockchain::utxoview::UtxoView;
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
+use dcroxide_connmgr::{Csprng, SystemCsprng};
 use dcroxide_mempool::{
     MAX_STANDARD_TX_SIZE, Policy, PoolChain, PoolError, RuleErrorSource, TxPool, chain_rule_error,
 };
@@ -148,12 +149,38 @@ pub(crate) fn chain_standard_verify_flags(
 pub struct NodePoolChain {
     chain: Arc<Mutex<Chain>>,
     params: Params,
+    /// The pool's random source: a ChaCha20 keystream seeded from the
+    /// OS once, at construction, the same way the address manager's
+    /// bucket key and the connection manager's source are.  Behind a
+    /// mutex because `PoolChain::random_u64` takes `&self`.
+    rng: Mutex<SystemCsprng>,
 }
 
 impl NodePoolChain {
     /// Adapt the shared chain for the pool.
+    ///
+    /// Seeding the pool's random source is the only step here that can
+    /// fail, and it happens where dcrd's does: the daemon builds the
+    /// pool at startup, before any listener accepts, and dcrd's
+    /// `crypto/rand` panics in package `init` if the kernel will not
+    /// answer (`crypto/rand/prng.go:116-122`).  On a machine where
+    /// that fails the daemon has already died earlier anyway --
+    /// `AddrManager::new` seeds its own source first.
     pub fn new(chain: Arc<Mutex<Chain>>, params: Params) -> NodePoolChain {
-        NodePoolChain { chain, params }
+        NodePoolChain::with_rng(chain, params, SystemCsprng::default())
+    }
+
+    /// The same, over a caller-supplied random source.
+    ///
+    /// Nothing in the daemon calls this; it exists so a test can pin
+    /// the draw sequence with `SystemCsprng::from_seed` and so prove
+    /// the source is seeded once rather than read per draw.
+    pub fn with_rng(chain: Arc<Mutex<Chain>>, params: Params, rng: SystemCsprng) -> NodePoolChain {
+        NodePoolChain {
+            chain,
+            params,
+            rng: Mutex::new(rng),
+        }
     }
 
     fn locked(&self) -> MutexGuard<'_, Chain> {
@@ -278,14 +305,36 @@ impl PoolChain for NodePoolChain {
         now_unix()
     }
 
-    /// Drawn from the OS CSPRNG.  This picks which orphan is evicted
-    /// under pressure, so a predictable draw is one an attacker grinds
-    /// against to keep their own orphans resident; see
-    /// `TxPool::limit_num_orphans`.
+    /// Drawn from the ChaCha20 keystream seeded at construction.  This
+    /// picks which orphan is evicted under pressure
+    /// (`TxPool::limit_num_orphans`), so a predictable draw is one an
+    /// attacker grinds against to keep their own orphans resident.
+    ///
+    /// dcrd draws nothing at that seam: `limitNumOrphans` walks a Go
+    /// map and breaks (`internal/mempool/mempool.go:490-501`), and its
+    /// mempool imports no randomness package at all.  What is borrowed
+    /// from dcrd here is the *source's* contract, not the seam.
+    /// `crypto/rand` acquires kernel entropy fatally exactly once, in
+    /// package `init` (`crypto/rand/prng.go:116-122`); afterwards it
+    /// keeps reading the kernel on each rekey but ignores a failure
+    /// (`prng.go:68-70`, `:101`), so no draw can fail -- "The default
+    /// global PRNG will never panic after package init"
+    /// (`crypto/rand/README.md:18`).  Reading the kernel per draw
+    /// instead put a fallible call on a path a peer paces by pushing
+    /// orphans, and under `panic = "abort"` that is an outage dcrd's
+    /// map walk has no way to cause.
     fn random_u64(&self) -> u64 {
-        let mut buf = [0u8; 8];
-        getrandom::fill(&mut buf).expect("system random source");
-        u64::from_le_bytes(buf)
+        // A poisoned lock has no invariant to protect here: the
+        // guarded state is a keystream, every value it yields is
+        // conformant, and `SystemCsprng` rekeys long before its block
+        // counter runs out, so it has no reachable panic of its own to
+        // poison with.  Recovering the guard rather than expecting on
+        // it keeps the abort off the path this seam exists to make
+        // infallible.
+        self.rng
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .uint64()
     }
 
     /// The chain's shared signature verification cache, so block
