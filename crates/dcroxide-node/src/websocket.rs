@@ -574,12 +574,18 @@ where
     builder(server, &mut refs)
 }
 
-/// A random session id for a websocket client (dcrd draws it from
-/// `crypto/rand`).
+/// A random session id for a websocket client (dcrd
+/// `newWebsocketClient`, `internal/rpcserver/rpcwebsocket.go:2034`).
+///
+/// From the process-wide generator, not a fresh kernel read: dcrd
+/// imports `crypto/rand` and calls the package function
+/// (`rpcwebsocket.go:25`, `:2037`), and the draw happens after the 101
+/// but before a client has had to authenticate, so an unauthenticated
+/// caller sets its rate.  Under this workspace's `panic = "abort"`
+/// release profile a failed read there would be an outage; the package
+/// generator cannot fail once seeded, which the daemon does at startup.
 fn new_session_id() -> u64 {
-    let mut buf = [0u8; 8];
-    getrandom::fill(&mut buf).expect("system random source");
-    u64::from_le_bytes(buf)
+    dcroxide_crypto::rand::uint64()
 }
 
 /// Complete the RFC 6455 handshake and serve the client's requests

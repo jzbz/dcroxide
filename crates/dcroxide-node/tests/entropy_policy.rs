@@ -137,8 +137,8 @@ fn the_pool_seed_comes_from_the_os_not_a_constant() {
 /// `dcroxide-crypto/src/rand.rs`, the port of dcrd's `crypto/rand`,
 /// which the address manager and the connection manager draw from
 /// through instances of their own and the peer environment draws from
-/// through that module's process-wide one — which is why `peerconn.rs`
-/// no longer appears below. That module holds two reads — the fatal one in `Prng::new`,
+/// through that module's process-wide one — which is why neither
+/// `peerconn.rs` nor `websocket.rs` appears below. That module holds two reads — the fatal one in `Prng::new`,
 /// which runs at construction, and the one in `Prng::reseed`, which
 /// recurs every 4 MiB and deliberately ignores a failure. That last
 /// one follows dcrd's structure rather than its behaviour: dcrd's own
@@ -161,7 +161,6 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
         ("rpcrun.rs", (3, "startup: the self-signed TLS ed25519 seed, EC scalar and certificate serial, generated at boot")),
         ("seeding.rs", (1, "debt: seeder retry jitter, node-paced")),
         ("socks.rs", (1, "already correct: the surrounding SOCKS exchange is fallible for a dozen other reasons, so the failure is returned rather than aborting")),
-        ("websocket.rs", (1, "debt: new_session_id, drawn after the 101 and before authentication is required")),
     ]
     .into_iter()
     .collect();
@@ -210,6 +209,17 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
         "peerconn.rs must not read kernel entropy: a peer paces the \
          address shuffle through getaddr, and the handshake nonce is \
          drawn once per accepted connection"
+    );
+
+    // The websocket session id is the third converted, and the last one
+    // an unauthenticated *caller* can pace directly: the draw happens
+    // after the 101 and before authentication is required.  dcrd draws
+    // it from the same package function
+    // (`internal/rpcserver/rpcwebsocket.go:2034-2037`).
+    assert!(
+        !observed.contains_key("websocket.rs"),
+        "websocket.rs must not read kernel entropy: new_session_id is \
+         drawn after the 101 and before a client has authenticated"
     );
 
     let expected_counts: BTreeMap<String, usize> = expected

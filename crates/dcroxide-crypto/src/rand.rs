@@ -3,11 +3,12 @@
 //! keystream that rekeys itself from kernel entropy on a byte budget,
 //! so a draw can never fail.
 //!
-//! dcrd has one generator type and three ways of reaching it.  The
-//! address manager draws from the package global
+//! dcrd has one generator type and two ways of reaching it.  Most
+//! packages draw from the package global -- the address manager
 //! (`addrmgr/addrmanager.go:809` `rand.Read(a.key[:])`, `:341`,
-//! `:797`, `:909-968`), and so does the peer package
-//! (`peer/peer.go:842`, `:873`, `:1629`, `:1813`, `:2186`); the
+//! `:797`, `:909-968`), the peer package (`peer/peer.go:842`, `:873`,
+//! `:1629`, `:1813`, `:2186`) and the RPC server
+//! (`internal/rpcserver/rpcwebsocket.go:2037`) among them; the
 //! connection manager holds an instance of its own
 //! (`internal/connmgr/csprng.go`).  [`Prng`] is that one type;
 //! `dcroxide_addrmgr::SystemRng` and `dcroxide_connmgr::SystemCsprng`
