@@ -143,6 +143,17 @@ pub trait PoolChain {
     /// deterministic under test.  Production implementations must use a
     /// CSPRNG: see `TxPool::limit_num_orphans` for what an attacker
     /// does with a predictable draw.
+    ///
+    /// Both consumers reduce this by modulo, so the contract is on the
+    /// whole value rather than on its high half: every bit must be
+    /// unpredictable.  Nothing in this crate rejects a draw, so no
+    /// return value is forbidden and a scripted implementation cannot
+    /// stall a caller -- which is what the `PoolChain` doubles in this
+    /// crate's tests and in `tests/common/mod.rs` rely on.  A reduction
+    /// that rejected and redrew (dcrd's `Uint64N`,
+    /// `crypto/rand/uniform.go:143-145`) would not terminate against a
+    /// constant source for any non-power-of-two bound, and the default
+    /// `max_orphan_txs` of 100 is not one.
     fn random_u64(&self) -> u64;
     /// The chain's shared signature verification cache, threaded into
     /// the acceptance-path script validation so successful mempool
@@ -344,6 +355,16 @@ pub trait VoteReceiver: Send {
 /// Used for the trial order of rival orphans; see the call site for why
 /// the order must not follow hash order.  Fewer than two elements need
 /// no draw, so a caller with nothing to decide costs nothing.
+///
+/// The index is reduced by modulo, and that is not a shortfall against
+/// upstream: dcrd orders these by ranging over a Go map and reduces
+/// nothing.  What is required is that every rival can reach the front
+/// and that no submitter can predict which does.  Modulo over a CSPRNG
+/// draw supplies both, costs exactly one draw per position, and --
+/// unlike `crypto/rand`'s multiply-shift
+/// (`crypto/rand/uniform.go:102-148`) -- never rejects, so a constant
+/// draw source terminates here.  Every `PoolChain` double in this
+/// repository is such a source.
 fn shuffle_trial_order<T>(items: &mut [T], mut draw: impl FnMut() -> u64) {
     for i in (1..items.len()).rev() {
         let j = (draw() % (i as u64 + 1)) as usize;
@@ -596,9 +617,30 @@ impl<C: PoolChain> TxPool<C> {
     /// The choice is drawn from the chain's random source instead,
     /// which restores what dcrd's map iteration provides: a selection
     /// the submitter cannot steer.  Any arbitrary choice is conformant
-    /// here, since dcrd's own is explicitly unspecified.  The modulo
-    /// bias over a `u64` is on the order of one part in `2^57` for a
-    /// pool this size and is not worth rejection sampling.
+    /// here, since dcrd's own is explicitly unspecified.
+    ///
+    /// Uniformity is deliberately not the target, because dcrd's own
+    /// selection is not uniform and its comment is inaccurate about
+    /// why.  Go randomises the starting *slot*, not the starting
+    /// *entry*: `Iter.Init` seeds `entryOffset` and `dirOffset` from
+    /// `rand()` and `Iter.Next` scans forward from there past empty
+    /// control bytes (`internal/runtime/maps/table.go:710`, `:757-758`,
+    /// `:1025`), so an entry is yielded first in proportion to the run
+    /// of empty slots preceding it, and the table is at most 7/8 full
+    /// (`maps/group.go:20`).  Measured over 300,000 ranges of a
+    /// 100-entry map, the favoured entry came first about 5.5x more
+    /// often than uniform and the least favoured about 0.75x.  Eight
+    /// entries is the one size that comes out uniform, because eight
+    /// fill a group exactly -- which is what confirms the mechanism.
+    ///
+    /// So dcrd's eviction is off uniform by a factor of several, while
+    /// the modulo here is off by about one part in `2^57`.  What dcrd
+    /// supplies is full support and a placement no submitter can steer,
+    /// following a per-map hash seed it cannot observe; modulo over a
+    /// CSPRNG draw supplies both, so rejection sampling would buy
+    /// distance from a distribution upstream does not have.  It would
+    /// also put a redrawing loop behind `PoolChain::random_u64`, which
+    /// the test doubles answer with a constant.
     fn limit_num_orphans(&mut self) {
         // Scan through the orphan pool and remove any expired orphans
         // when it's time.
@@ -633,6 +675,13 @@ impl<C: PoolChain> TxPool<C> {
         // might be needed again shortly.
         let len = self.orphans.len();
         if len > 0 {
+            // Modulo rather than `crypto/rand`'s multiply-shift: there
+            // is no upstream reduction to match (dcrd draws nothing
+            // here) and modulo is the total one.  Lemire rejects and
+            // redraws, which turns the scripted `PoolChain` doubles
+            // this crate tests through into non-terminating sources.
+            // See this function's doc comment and PARITY.md's orphan
+            // eviction row.
             let index = (self.chain.random_u64() % len as u64) as usize;
             if let Some(hash) = self.orphans.values().nth(index).map(|otx| otx.tx_hash) {
                 self.remove_orphan(&hash, false);
@@ -2674,6 +2723,59 @@ mod orphan_eviction_tests {
             policy,
             &params,
         )
+    }
+
+    /// Eviction stays reachable at a pool size the reduction does not
+    /// divide exactly.
+    ///
+    /// The eviction tests below cap the pool at four, where `% 4` is a
+    /// mask and every reduction of a full-width draw agrees, so none
+    /// of them can see the reduction at all.  Three is the smallest
+    /// size that separates them: `crypto/rand`'s multiply-shift would
+    /// evict the same orphan for all three draws here, where modulo
+    /// evicts a different one each time.
+    #[test]
+    fn eviction_is_reachable_at_a_non_power_of_two_pool_size() {
+        for (draw, survives_removed) in [(0u64, 1u8), (1, 2), (2, 3)] {
+            let mut pool = pool_capped_at(3, draw);
+            for byte in 1..=3u8 {
+                orphan_with_hash(&mut pool, byte);
+            }
+            assert_eq!(pool.orphans.len(), 3, "the pool filled to its cap");
+
+            orphan_with_hash(&mut pool, 4);
+            assert_eq!(pool.orphans.len(), 3, "the cap still holds");
+            assert!(
+                !pool.orphans.contains_key(&Hash([survives_removed; 32]).0),
+                "draw {draw} must evict orphan {survives_removed} at cap 3"
+            );
+        }
+    }
+
+    /// The shuffle consumes exactly one draw per position it fills.
+    ///
+    /// One draw per position is what keeps a constant draw source
+    /// usable, and every `PoolChain` double in this repository is one.
+    ///
+    /// What this actually catches, stated rather than overstated: a
+    /// reduction that rejected *this* draw would push the count past
+    /// two and fail here.  It does not catch every rejection scheme --
+    /// a zone-and-retry over a constant zero accepts on the first try,
+    /// so its count is two as well -- and it does not catch
+    /// `crypto/rand`'s multiply-shift at all, because that one does not
+    /// fail against a constant zero, it hangs: `2^64 mod 3` is 1, so a
+    /// zero product never clears the threshold and the loop never ends.
+    /// The guard against that is the trait contract on
+    /// `PoolChain::random_u64`, not this assertion.
+    #[test]
+    fn the_shuffle_draws_once_per_position() {
+        let mut rivals = [1u8, 2, 3];
+        let mut calls = 0usize;
+        shuffle_trial_order(&mut rivals, || {
+            calls += 1;
+            0
+        });
+        assert_eq!(calls, 2, "one draw per position, no rejection");
     }
 
     /// The orphan evicted under pressure must be the one the random

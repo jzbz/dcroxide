@@ -69,10 +69,15 @@
 //! What this does *not* change: `SystemRng` and `SystemCsprng` keep
 //! the rejection loops they already have, so no value either of them
 //! draws moves.  What did change is the two daemon sites that reduced
-//! by raw modulo -- the peer environment's address shuffles and the
-//! mining-address pick -- which now use dcrd's reduction.  That
-//! narrows PARITY.md's reduction-of-a-draw row rather than closing it;
-//! `dcroxide-mempool/src/pool.rs:636` is the last modulo.
+//! by raw modulo where dcrd's own arithmetic was the target -- the
+//! peer environment's address shuffles, the mining-address pick and
+//! the seeder's backdating -- which now use dcrd's reduction.  The two
+//! raw modulos left, both in `dcroxide-mempool`, are deliberate and
+//! are not work in progress: dcrd draws nothing at either site, so
+//! there is no reduction to converge on, and [`Prng::uint64n`] rejects
+//! and redraws where that crate's test doubles answer with a constant.
+//! See PARITY.md's *Orphan eviction source* row and
+//! `PoolChain::random_u64`'s contract before changing them.
 
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 

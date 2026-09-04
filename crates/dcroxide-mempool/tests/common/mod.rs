@@ -231,7 +231,11 @@ impl PoolChain for FakeChain {
 
     fn random_u64(&self) -> u64 {
         // Fixed, like the clock above: the replayed dcrd scenarios
-        // must not depend on a draw.  Two paths would consume one --
+        // must not depend on a draw.  A constant is safe here because
+        // both consumers reduce by modulo and neither rejects, so a
+        // constant source always terminates; see
+        // `PoolChain::random_u64`'s contract, which a rejecting
+        // reduction would break.  Two paths would consume a draw --
         // random orphan eviction and the rival-orphan trial order --
         // and no scenario in the corpus reaches either, which was
         // checked by making this panic and replaying them all.
