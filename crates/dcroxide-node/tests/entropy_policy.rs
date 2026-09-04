@@ -29,6 +29,11 @@
 //! reaches it, and under `panic = "abort"` a failed read there is an
 //! outage.
 //!
+//! Not every entry below is a debt. Two are one-shot startup or tool
+//! draws where aborting is the right answer, and `socks.rs` is already
+//! correct, returning its error rather than aborting; only the three
+//! marked `debt` still want converting.
+//!
 //! What these tests pin is the mechanism: no kernel read on the
 //! peer-paced path, a stream that is seeded once from the OS, and an
 //! explicit account of every remaining `getrandom` call in the crate.
@@ -137,8 +142,10 @@ fn the_pool_seed_comes_from_the_os_not_a_constant() {
 /// `dcroxide-crypto/src/rand.rs`, the port of dcrd's `crypto/rand`,
 /// which the address manager and the connection manager draw from
 /// through instances of their own and the peer environment draws from
-/// through that module's process-wide one — which is why neither
-/// `peerconn.rs` nor `websocket.rs` appears below. That module holds two reads — the fatal one in `Prng::new`,
+/// through that module's process-wide one, as do the websocket session
+/// id, the template generator and the CPU miner — which is why none of
+/// `peerconn.rs`, `websocket.rs`, `bgtemplate.rs` or `cpuminer.rs`
+/// appears below. That module holds two reads — the fatal one in `Prng::new`,
 /// which runs at construction, and the one in `Prng::reseed`, which
 /// recurs every 4 MiB and deliberately ignores a failure. That last
 /// one follows dcrd's structure rather than its behaviour: dcrd's own
@@ -155,10 +162,9 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
     let expected: BTreeMap<&str, (usize, &str)> = [
         ("bin/dcroxide.rs", (2, "one startup, one debt: the rand_bytes closure writes the RPC credential file before any listener opens; the rand_u64 closure is drawn four times at startup for the RPC auth HMAC key in Server::new and per-request through handle_ping")),
         ("bin/gencerts.rs", (1, "tool: a standalone binary with no peers; refusing to emit a key beats emitting a weak one")),
-        ("cpuminer.rs", (1, "debt: per-worker extra-nonce offset, CPU miner only")),
         ("rebroadcast.rs", (1, "debt: node-paced rebroadcast jitter, a rejection loop so one call can read several times")),
         ("rpcrun.rs", (3, "startup: the self-signed TLS ed25519 seed, EC scalar and certificate serial, generated at boot")),
-        ("seeding.rs", (1, "debt: seeder retry jitter, node-paced")),
+        ("seeding.rs", (1, "debt: rand_duration, backdating each discovered address by three to seven days (dcrd addrmgr/seed.go:188); drawn once per address the seeder returns, so the count per round is bounded by the reply rather than by the node -- at most MAX_NODES = 16. Also the port's second raw-modulo reduction, where dcrd rand.Duration goes through the bias-free Uint64N")),
         ("socks.rs", (1, "already correct: the surrounding SOCKS exchange is fallible for a dozen other reasons, so the failure is returned rather than aborting")),
     ]
     .into_iter()
@@ -210,8 +216,18 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
          drawn once per accepted connection"
     );
 
-    // The template generator is the fourth converted, and the last one
-    // a peer could reach at all: a relayed block drives a regeneration
+    // The CPU miner is the fifth converted: an offset is drawn per
+    // template a worker solves,
+    // and templates follow block connects, so a `--generate` node was
+    // paced by a relayed block.  dcrd draws it from the package global
+    // (`internal/mining/cpuminer/cpuminer.go:273`).
+    assert!(
+        !observed.contains_key("cpuminer.rs"),
+        "cpuminer.rs must not read kernel entropy: a peer relaying a \
+         block paces the extra-nonce offset on a --generate node"
+    );
+
+    // The template generator is the fourth converted: a relayed block drives a regeneration
     // through `BlockConnected`, and on a node started with
     // `--miningaddr` each regeneration drew a mining-address index and
     // two extra nonces.  dcrd draws all three from the package global
@@ -260,7 +276,7 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
         .count();
     assert_eq!(
         (expected.len(), per_event, one_shot),
-        (7, 4, 2),
+        (6, 3, 2),
         "PARITY.md's crypto/rand row and gaps bullet quote these three \
          numbers, all counted by FILE ENTRY rather than by call site: \
          total files, files with a per-event draw, files that are \

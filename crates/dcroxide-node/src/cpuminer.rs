@@ -974,11 +974,20 @@ fn solve_and_submit(mut job: SolveJob) {
     }
 }
 
-/// A fresh random 64-bit extra-nonce offset (dcrd `rand.Uint64`).
+/// A fresh random 64-bit extra-nonce offset (dcrd `rand.Uint64()` in
+/// `solveBlock`, `internal/mining/cpuminer/cpuminer.go:273`).
+///
+/// From the process-wide generator, not a fresh kernel read: dcrd's
+/// cpuminer imports `crypto/rand` and calls the package function
+/// (`cpuminer.go:21`, `:273`).  An offset is drawn each time a worker
+/// takes up a template, and templates follow block connects, so on a
+/// `--generate` node a peer relaying a block paces this -- the same
+/// path that paced the template generator's own draws before those
+/// moved.  Under `panic = "abort"` a failed read here would be an
+/// outage; the package generator cannot fail once seeded, which the
+/// daemon does at startup.
 fn random_u64() -> u64 {
-    let mut buf = [0u8; 8];
-    getrandom::fill(&mut buf).expect("system random source");
-    u64::from_le_bytes(buf)
+    dcroxide_crypto::rand::uint64()
 }
 
 /// The maximum number of mining workers (dcrd `MaxNumWorkers =
