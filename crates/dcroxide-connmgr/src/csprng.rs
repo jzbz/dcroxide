@@ -11,9 +11,11 @@
 //! implementation draws from [`Prng`], the workspace's single port of
 //! dcrd's `crypto/rand` generator -- the same type the address
 //! manager's default source draws from.  dcrd has one `rand.PRNG`
-//! reached two ways, its addrmgr through the package global and this
-//! package through its own instance (`internal/connmgr/csprng.go`),
-//! and so does this.
+//! reached three ways -- its addrmgr and peer packages through the
+//! package global, this package through its own instance
+//! (`internal/connmgr/csprng.go`) -- and so does this port, whose
+//! global lives in `dcroxide_crypto::rand`.  This source stays an
+//! instance because dcrd's is one.
 //!
 //! [`Prng`]: dcroxide_crypto::rand::Prng
 

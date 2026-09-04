@@ -23,6 +23,10 @@ getrandom = { version = "0.3", optional = true }
 # `default-features = false`, so making this a default feature would
 # break that job through every one of them.  The two consumers --
 # dcroxide-addrmgr and dcroxide-connmgr -- ask for it explicitly.
+# It is also the only part of this crate that links `std`: the port of
+# dcrd's package global (`crypto/rand/prng.go:111-122`) is a
+# `OnceLock<Mutex<Prng>>`, and `core` has neither type.  Both reasons
+# point the same way, and the no_std job passes `--no-default-features`.
 rand = ["dep:chacha20", "dep:getrandom"]
 
 [dev-dependencies]

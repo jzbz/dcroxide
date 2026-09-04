@@ -3,19 +3,37 @@
 //! keystream that rekeys itself from kernel entropy on a byte budget,
 //! so a draw can never fail.
 //!
-//! dcrd has one generator type and two ways of reaching it.  The
+//! dcrd has one generator type and three ways of reaching it.  The
 //! address manager draws from the package global
-//! (`addrmgr/addrmanager.go:809` `rand.Read(a.key[:])`, `:341`, `:797`,
-//! `:909-968`); the connection manager holds an instance of its own
-//! (`internal/connmgr/csprng.go`).  [`Prng`] is that one type, and
+//! (`addrmgr/addrmanager.go:809` `rand.Read(a.key[:])`, `:341`,
+//! `:797`, `:909-968`), and so does the peer package
+//! (`peer/peer.go:842`, `:873`, `:1629`, `:1813`, `:2186`); the
+//! connection manager holds an instance of its own
+//! (`internal/connmgr/csprng.go`).  [`Prng`] is that one type;
 //! `dcroxide_addrmgr::SystemRng` and `dcroxide_connmgr::SystemCsprng`
-//! are the two instances.  Stating the budget once is the point: it is
-//! a magic number whose only justification is a panic no test can reach
-//! in bounded time, and copies of such a number drift.
+//! are two instances of it, and the process-wide generator [`init`]
+//! seeds is the third reach.  Stating the budget once is the point: it
+//! is a magic number whose only justification is a panic no test can
+//! reach in bounded time, and copies of such a number drift.
 //!
 //! Ported: `maxCipherRead` (`prng.go:20`), `nonce.inc` (`:26-40`),
-//! `NewPRNG` (`:55-63`), `PRNG.seed` (`:67-81`) and `PRNG.Read`
-//! including its mid-buffer split loop (`:85-105`).
+//! `NewPRNG` (`:55-63`), `PRNG.seed` (`:67-81`), `PRNG.Read` including
+//! its mid-buffer split loop (`:85-105`); `uniform.go`'s `PRNG.Uint64`
+//! (`:54-58`), `PRNG.Uint64N` (`:102-148`) and `PRNG.Shuffle`
+//! (`:214-230`); and the package globals -- `lockingPRNG`
+//! (`prng.go:111-114`), the `init` that seeds it (`:116-122`), and the
+//! `default.go` entry points the peer module's draws go through:
+//! `Uint64` (`default.go:37-42`), `Shuffle` (`:136-141`) and
+//! `ShuffleSlice` (`:144-148`).
+//!
+//! The globals are ported because dcrd's peer module reaches
+//! randomness through nothing else: `rand.Uint64()` for the ping and
+//! version nonces (`peer/peer.go:1813`, `:2186`) and
+//! `rand.ShuffleSlice` for both addr relays (`:842`, `:873`), with no
+//! per-peer generator anywhere in that file.  Go runs `init` before
+//! `main`; Rust has no equivalent, so the seeding here is lazy and
+//! [`init`] is the explicit hook a peer-serving binary calls first to
+//! put dcrd's one fatal kernel read back at startup.
 //!
 //! Not ported, and why:
 //!
@@ -23,17 +41,30 @@
 //!   at `:86-95`).  The byte budget alone removes the panic the rekey
 //!   exists to prevent, and a duration would put a clock read on every
 //!   draw.  Unobservable outside the process; recorded in PARITY.md.
-//! * `uniform.go`'s integer reductions.  Each consumer keeps the
-//!   rejection loop it already has, so this module alters no drawn
-//!   value.  The modulo-versus-Lemire difference is pre-existing and
-//!   already recorded in PARITY.md's divergences table.
-//! * The package globals -- `globalRand`, `lockingPRNG` and
-//!   `default.go`.  This port has no process-wide `init`; each
-//!   consumer owns an instance instead, which is the shape dcrd's own
-//!   connection manager uses.  Where a consumer needs one shared across
-//!   threads it wraps it itself, as the address manager does.
+//! * `uniform.go`'s `Uint32N` and the `is32bit` delegation to it
+//!   (`:61-97`, `:99`, `:103-104`).  Go's own comment says the 32-bit
+//!   arithmetic is there "to preserve the exact output sequence
+//!   observed on 64-bit machines" (`:69-71`), so the 64-bit
+//!   [`Prng::uint64n`] ported here yields the same values on every
+//!   target and the split is a Go performance detail.
+//! * `Shuffle`'s `(n, swap)` callback form (`uniform.go:214-230`,
+//!   `default.go:136-141`).  Go needs a swap closure because it cannot
+//!   name a generic slice-element swap; `<[T]>::swap` is that closure,
+//!   so the two Go functions collapse into [`shuffle_slice`].
+//! * The `default.go` entry points no consumer reaches: `Reader`,
+//!   `Read`, `Uint32`, `Uint32N`, `Uint64N`, and the
+//!   `Int*`/`UintN`/`Duration`/`BigInt`/`Float64` wrappers.  Each is
+//!   two lines over [`Prng`] when a consumer appears; `rand.Duration`
+//!   is the next one due, for the inventory trickle timeout
+//!   (`peer/peer.go:1629`), whose port is not yet wired.
 //! * The OpenBSD `arc4random` build variant
 //!   (`crypto/rand/prng_arc4random.go`), a Go-toolchain fallback.
+//!
+//! What this does *not* change: `SystemRng` and `SystemCsprng` keep
+//! the rejection loops they already have, so no value either of them
+//! draws moves.  Only the daemon's peer environment changes, from a
+//! raw modulo to dcrd's reduction -- which narrows PARITY.md's
+//! reduction-of-a-draw row rather than closing it.
 
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 
@@ -217,4 +248,173 @@ impl Prng {
         self.cipher.apply_keystream(rest);
         self.read = self.read.saturating_add(rest.len());
     }
+
+    /// A uniform random `u64` (dcrd `PRNG.Uint64`,
+    /// `crypto/rand/uniform.go:54-58`).
+    ///
+    /// Little-endian, as Go's `binary.LittleEndian.Uint64` is.
+    /// [`Prng::read`] XORs rather than fills (see QK-0012), so the
+    /// zeroed buffer is what makes this a draw.
+    pub fn uint64(&mut self) -> u64 {
+        let mut buf = [0u8; 8];
+        self.read(&mut buf);
+        u64::from_le_bytes(buf)
+    }
+
+    /// A uniform random `u64` in `[0, n)` without modulo bias (dcrd
+    /// `PRNG.Uint64N`, `crypto/rand/uniform.go:102-148`).
+    ///
+    /// Lemire's multiply-shift, not a modulo: the high half of the
+    /// double-width product `x * n` is already the reduced value, and
+    /// the low half says whether `x` fell in the short residue class
+    /// that would bias it.  Go skips the `-n % n` division unless
+    /// `lo < n`, because the threshold is always below `n` and the
+    /// rejection loop therefore almost never runs (`:141-146`); that
+    /// shortcut is reproduced because it decides the draw count, and
+    /// the draw count is observable through a shared stream.
+    ///
+    /// A zero bound takes the power-of-two branch exactly as Go's does
+    /// -- `0 & (0 - 1)` is `u64::MAX`, so the mask is the whole range
+    /// (`:106-108`) -- and yields an unconstrained draw.  That branch
+    /// is reachable upstream, from `connmgr`'s `backoffWithJitter` on a
+    /// single-nanosecond backoff, so it is reproduced rather than
+    /// asserted away.
+    ///
+    /// Go's `is32bit` delegation to `Uint32N` (`:103-104`) is not
+    /// reproduced; the module documentation says why it cannot change
+    /// a value.
+    pub fn uint64n(&mut self, n: u64) -> u64 {
+        // `n` is a power of two -- zero included, as in Go -- so the
+        // reduction is a mask (`uniform.go:106-108`).
+        if n & n.wrapping_sub(1) == 0 {
+            return self.uint64() & n.wrapping_sub(1);
+        }
+        let (mut hi, mut lo) = wide_mul(self.uint64(), n);
+        if lo < n {
+            // Go's `-n % n`, i.e. `2^64 mod n` (`uniform.go:142`).  `n`
+            // is nonzero on this branch, so the remainder is defined;
+            // `checked_rem` is the spelling that spares this module an
+            // `arithmetic_side_effects` allow.
+            let thresh = n.wrapping_neg().checked_rem(n).unwrap_or(0);
+            while lo < thresh {
+                (hi, lo) = wide_mul(self.uint64(), n);
+            }
+        }
+        hi
+    }
+
+    /// Randomize the order of every element in `s` (dcrd
+    /// `PRNG.Shuffle`, `crypto/rand/uniform.go:214-230`).
+    ///
+    /// Fisher-Yates drawing each index through [`Prng::uint64n`].  Two
+    /// things here are load-bearing.  The reduction is what makes the
+    /// permutation uniform: a full-width draw reduced by modulo -- what
+    /// the daemon's peer environment did before this -- is not, and
+    /// dcrd does not do it.  And the direction is upstream's
+    /// (`:225-228`): descending from `n - 1` with a draw in `[0, i]` is
+    /// the Fisher-Yates that is uniform over permutations; the
+    /// ascending variant with a draw in `[0, n)` is not.
+    ///
+    /// Go's `Shuffle` takes a swap closure and `ShuffleSlice` supplies
+    /// the slice one (`default.go:144-148`); `<[T]>::swap` is that
+    /// closure, so the two Go functions collapse into this one.  Go's
+    /// `n < 0` panic (`:215-217`) has no counterpart, because a slice
+    /// length cannot be negative.
+    pub fn shuffle<T>(&mut self, s: &mut [T]) {
+        let len = s.len();
+        for i in (1..len).rev() {
+            // dcrd's `j := int(p.Uint64N(uint64(i + 1)))` (`:226`).
+            // `i` is below `len`, so the increment cannot overflow; the
+            // saturating form is what spares this module an
+            // `arithmetic_side_effects` allow.
+            let bound = (i as u64).saturating_add(1);
+            let j = self.uint64n(bound) as usize;
+            s.swap(i, j);
+        }
+    }
+}
+
+/// The double-width product of two `u64`s as `(hi, lo)` (Go
+/// `math/bits.Mul64`, which `Uint64N` calls at
+/// `crypto/rand/uniform.go:140`).
+fn wide_mul(x: u64, y: u64) -> (u64, u64) {
+    let wide = u128::from(x).wrapping_mul(u128::from(y));
+    ((wide >> 64) as u64, wide as u64)
+}
+
+/// The process-wide generator the functions below draw from (dcrd
+/// `globalRand *lockingPRNG`, `crypto/rand/default.go:20`,
+/// `crypto/rand/prng.go:111-114`).
+///
+/// dcrd seeds this in package `init` and panics when the first read of
+/// the kernel fails (`prng.go:116-122`); that panic is the whole basis
+/// of the package's promise that "The default global PRNG will never
+/// panic after package init" (`crypto/rand/README.md:18`).  Rust has
+/// no pre-`main` `init`, so the seeding is lazy here and [`init`] is
+/// the explicit hook that puts it back at startup.  Laziness is the
+/// fallback, not the design: a daemon that never calls [`init`] moves
+/// its one fallible read to whichever draw comes first, which for a
+/// node serving peers is a handshake nonce on an accepted connection.
+static GLOBAL: std::sync::OnceLock<std::sync::Mutex<Prng>> = std::sync::OnceLock::new();
+
+fn global() -> &'static std::sync::Mutex<Prng> {
+    GLOBAL.get_or_init(|| {
+        // dcrd's package `init` panics on a failed first seeding
+        // (`crypto/rand/prng.go:116-122`).  Every draw after it is
+        // infallible, which is the property this module exists to
+        // provide.
+        std::sync::Mutex::new(Prng::new().expect("system random source"))
+    })
+}
+
+/// The global generator, recovering a poisoned lock.
+///
+/// A panic while the guard was held cannot leave a [`Prng`] in a state
+/// later draws must avoid -- [`Prng::read`] XORs a buffer and advances
+/// a counter, and a partially applied keystream is still keystream --
+/// so the poison flag carries no information here, while honouring it
+/// would turn one unrelated panic on one peer's thread into a failure
+/// on every later draw in the process.  `dcroxide_peer::PeerGlobals`
+/// treats its own lock the same way, for the same reason.
+fn locked() -> std::sync::MutexGuard<'static, Prng> {
+    global()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Seed the process-wide generator now, panicking if the operating
+/// system cannot supply the first key (dcrd `crypto/rand`'s package
+/// `init`, `crypto/rand/prng.go:116-122`).
+///
+/// Go runs that `init` before `main`, so upstream's one fatal kernel
+/// read is always a startup read and every later draw is infallible.
+/// A binary that serves peers calls this first to inherit the same
+/// guarantee.  Calling it more than once is a no-op; not calling it is
+/// safe but relocates the fallible read to the first draw.
+pub fn init() {
+    let _ = global();
+}
+
+/// A uniform random `u64` from the process-wide generator (dcrd
+/// `rand.Uint64`, `crypto/rand/default.go:37-42`).
+pub fn uint64() -> u64 {
+    locked().uint64()
+}
+
+/// Randomize the order of every element in `s` using the process-wide
+/// generator (dcrd `rand.ShuffleSlice`,
+/// `crypto/rand/default.go:144-148`).
+///
+/// One lock acquisition covers the whole shuffle, which is dcrd's
+/// shape rather than a shortcut taken here: `ShuffleSlice` calls
+/// `Shuffle`, and `Shuffle` takes `globalRand.Lock()` once and defers
+/// the unlock past the entire loop (`default.go:136-141`).  Taking it
+/// per swap would be a divergence and slower besides.  The longest
+/// hold the daemon can be made to produce is one over-full addr relay:
+/// the address cache is capped at `getKnownAddressLimit = 2500`
+/// (`addrmgr/addrmanager.go:234`), so at most 2499 reductions, and at
+/// most once per inbound connection, because a second getaddr is not
+/// answered (`serverPeer.addrsSent`).
+pub fn shuffle_slice<T>(s: &mut [T]) {
+    locked().shuffle(s);
 }

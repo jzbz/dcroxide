@@ -91,9 +91,13 @@ pub trait AddrRng {
 ///
 /// dcrd's address manager draws from that package's global
 /// (`addrmgr/addrmanager.go:809` `rand.Read(a.key[:])`, `:341`,
-/// `:797`, `:909-968`).  This port has no process-wide `init`, so the
-/// manager owns an instance instead -- the shape dcrd's own connection
-/// manager uses (`internal/connmgr/csprng.go`).
+/// `:797`, `:909-968`).  This port has that global too, in
+/// `dcroxide_crypto::rand`, but the manager keeps an instance of its
+/// own -- the shape dcrd's connection manager uses
+/// (`internal/connmgr/csprng.go`).  Nothing here needs the global's
+/// cross-thread serialisation: the manager already draws under its own
+/// lock, and moving it onto the shared stream would change every value
+/// it draws, the bucket key included, for no parity gain.
 ///
 /// The first 32 bytes this stream produces become the address
 /// manager's bucket key, which is what stops an attacker steering its
