@@ -2,13 +2,15 @@
 //! Decred cryptographic primitives for dcroxide.
 //!
 //! Mirrors dcrd's `crypto/*` packages at the pinned parity tag
-//! Provides BLAKE-256 (vendored) and RIPEMD-160
-//! (RustCrypto-backed, mirroring dcrd's `crypto/ripemd160`); the CSPRNG
-//! wrapper lands later in Phase 1.
+//! Provides BLAKE-256 (vendored), RIPEMD-160 (RustCrypto-backed,
+//! mirroring dcrd's `crypto/ripemd160`), and -- behind the `rand`
+//! feature -- dcrd's `crypto/rand` userspace CSPRNG.
 //!
-//! Everything here is `no_std`-compatible: these primitives are also useful
-//! to embedded/hardware-wallet consumers (the vendored BLAKE-256 originates
-//! from one).
+//! Everything outside the `rand` feature is `no_std`-compatible: these
+//! primitives are also useful to embedded/hardware-wallet consumers (the
+//! vendored BLAKE-256 originates from one).  `rand` is the one part that
+//! needs an operating system to seed from, which is why it is not a
+//! default feature.
 
 #![cfg_attr(not(test), no_std)]
 // This crate holds no hashed containers: every map and set in it is
@@ -20,4 +22,6 @@
 #![deny(clippy::iter_over_hash_type)]
 
 pub mod blake256;
+#[cfg(feature = "rand")]
+pub mod rand;
 pub mod ripemd160;

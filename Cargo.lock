@@ -379,11 +379,11 @@ dependencies = [
  "chacha20",
  "dcroxide-addrmgr",
  "dcroxide-containers",
+ "dcroxide-crypto",
  "dcroxide-dcrjson",
  "dcroxide-ratelimit",
  "dcroxide-testutil",
  "dcroxide-wire",
- "getrandom 0.3.4",
  "siphasher",
 ]
 
@@ -399,7 +399,10 @@ dependencies = [
 name = "dcroxide-crypto"
 version = "0.1.0"
 dependencies = [
+ "chacha20",
+ "dcroxide-crypto",
  "dcroxide-testutil",
+ "getrandom 0.3.4",
  "ripemd",
 ]
 

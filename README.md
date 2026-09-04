@@ -50,7 +50,10 @@ work). Currently implemented:
 
 - `dcroxide-crypto` — BLAKE-256 (vendored from
   [dcr-rs](https://github.com/jzbz/dcr-rs), KAT-pinned, differential-tested
-  against dcrd live) and RIPEMD-160 (RustCrypto-backed, KAT-pinned)
+  against dcrd live), RIPEMD-160 (RustCrypto-backed, KAT-pinned), and —
+  behind the non-default `rand` feature, so the rest stays `no_std` —
+  dcrd's `crypto/rand` userspace CSPRNG, which the address and
+  connection managers both draw from
 - `dcroxide-chainhash` — the 32-byte hash type with dcrd's byte-reversed
   string encoding, including its short-string parsing quirk
 - `dcroxide-wire` — message framing with dcrd's exact validation order and

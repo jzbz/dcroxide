@@ -10,9 +10,28 @@ repository.workspace = true
 
 [dependencies]
 ripemd = { version = "0.1.3", default-features = false }
+chacha20 = { version = "0.9", default-features = false, optional = true }
+getrandom = { version = "0.3", optional = true }
+
+[features]
+# dcrd's `crypto/rand`.  Off by default: it is the only part of this
+# crate that needs an operating system to seed from, and the no_std CI
+# job builds base58, chaincfg, chainhash, crypto, dcrec, standalone,
+# uint256 and wire against `x86_64-unknown-none`, where `getrandom` has
+# no backend.  Six of the other seven reach this crate (uint256 does
+# not, and standalone does so transitively) and none of them declares
+# `default-features = false`, so making this a default feature would
+# break that job through every one of them.  The two consumers --
+# dcroxide-addrmgr and dcroxide-connmgr -- ask for it explicitly.
+rand = ["dep:chacha20", "dep:getrandom"]
 
 [dev-dependencies]
 dcroxide-testutil = { path = "../dcroxide-testutil" }
+# Turns `rand` on for this package's own test targets, so
+# `cargo test -p dcroxide-crypto` compiles `rand.rs` and can link the
+# reference cipher.  Without it that command fails to build
+# `tests/rand_prng.rs`.
+dcroxide-crypto = { path = ".", features = ["rand"] }
 
 [lints]
 workspace = true
