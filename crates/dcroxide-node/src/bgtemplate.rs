@@ -355,22 +355,27 @@ fn map_reason(reason: BgTemplateUpdateReason) -> TemplateUpdateReason {
     }
 }
 
-/// A uniformly-drawn index into the mining addresses (dcrd's
-/// `rand.IntN(len(g.cfg.MiningAddrs))`); the modulo is over the
-/// non-empty address slice length.
-#[allow(clippy::arithmetic_side_effects)]
+/// A uniformly-drawn index into the mining addresses (dcrd
+/// `rand.IntN(len(g.cfg.MiningAddrs))`,
+/// `internal/mining/bgblktmplgenerator.go:728`).
+///
+/// From the process-wide generator, and reduced the way dcrd reduces.
+/// The code this replaced took a full-width kernel draw and reduced it
+/// by modulo, which is biased where `IntN` is not, and read the kernel
+/// per template build -- a build a peer can drive by relaying a block
+/// (`BlockConnected`) on a node started with `--miningaddr`.
 fn rand_index(len: usize) -> usize {
-    let mut buf = [0u8; 8];
-    getrandom::fill(&mut buf).expect("system random source");
-    (u64::from_le_bytes(buf) % len as u64) as usize
+    dcroxide_crypto::rand::int_n(len)
 }
 
-/// A random extra nonce (dcrd injects random coinbase and treasurybase
-/// extra nonces before each template generation).
+/// A random extra nonce (dcrd `rand.Uint64()` in
+/// `standardCoinbaseOpReturn` and `standardTreasurybaseOpReturn`,
+/// `internal/mining/mining.go:481`, `:498`).
+///
+/// Two of these are drawn per template build, from the same package
+/// generator dcrd's mining package imports (`mining.go:20`).
 fn rand_nonce() -> u64 {
-    let mut buf = [0u8; 8];
-    getrandom::fill(&mut buf).expect("system random source");
-    u64::from_le_bytes(buf)
+    dcroxide_crypto::rand::uint64()
 }
 
 /// The shared handles and configuration the thread's build path needs,

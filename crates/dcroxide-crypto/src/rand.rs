@@ -23,9 +23,10 @@
 //! (`:54-58`), `PRNG.Uint64N` (`:102-148`) and `PRNG.Shuffle`
 //! (`:214-230`); and the package globals -- `lockingPRNG`
 //! (`prng.go:111-114`), the `init` that seeds it (`:116-122`), and the
-//! `default.go` entry points the peer module's draws go through:
-//! `Uint64` (`default.go:37-42`), `Shuffle` (`:136-141`) and
-//! `ShuffleSlice` (`:144-148`).
+//! `default.go` entry points the daemon's draws go through:
+//! `Uint64` (`default.go:37-42`) and `ShuffleSlice` (`:144-148`) over
+//! `Shuffle` (`:136-141`) for the peer module, and `IntN`
+//! (`:109-114`) for the mining package's address pick.
 //!
 //! The globals are ported because dcrd's peer module reaches
 //! randomness through nothing else: `rand.Uint64()` for the ping and
@@ -53,19 +54,22 @@
 //!   name a generic slice-element swap; `<[T]>::swap` is that closure,
 //!   so the two Go functions collapse into [`shuffle_slice`].
 //! * The `default.go` entry points no consumer reaches: `Reader`,
-//!   `Read`, `Uint32`, `Uint32N`, `Uint64N`, and the
+//!   `Read`, `Uint32`, `Uint32N`, `Uint64N`, and the remaining
 //!   `Int*`/`UintN`/`Duration`/`BigInt`/`Float64` wrappers.  Each is
-//!   two lines over [`Prng`] when a consumer appears; `rand.Duration`
-//!   is the next one due, for the inventory trickle timeout
+//!   two lines over [`Prng`] when a consumer appears -- which is how
+//!   `IntN` arrived, with the mining-address pick.  `rand.Duration` is
+//!   the next one due, for the inventory trickle timeout
 //!   (`peer/peer.go:1629`), whose port is not yet wired.
 //! * The OpenBSD `arc4random` build variant
 //!   (`crypto/rand/prng_arc4random.go`), a Go-toolchain fallback.
 //!
 //! What this does *not* change: `SystemRng` and `SystemCsprng` keep
 //! the rejection loops they already have, so no value either of them
-//! draws moves.  Only the daemon's peer environment changes, from a
-//! raw modulo to dcrd's reduction -- which narrows PARITY.md's
-//! reduction-of-a-draw row rather than closing it.
+//! draws moves.  What did change is the two daemon sites that reduced
+//! by raw modulo -- the peer environment's address shuffles and the
+//! mining-address pick -- which now use dcrd's reduction.  That
+//! narrows PARITY.md's reduction-of-a-draw row rather than closing it;
+//! `dcroxide-mempool/src/pool.rs:636` is the last modulo.
 
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 
@@ -304,6 +308,18 @@ impl Prng {
         hi
     }
 
+    /// A uniform index in `[0, n)` without modulo bias (dcrd
+    /// `PRNG.IntN`, `crypto/rand/uniform.go:190-195`).
+    ///
+    /// dcrd takes and returns an `int` and panics for `n <= 0`
+    /// (`:191-193`); this takes a `usize`, so only the zero case can
+    /// occur and only that half of the guard survives.  The message is
+    /// dcrd's.
+    pub fn int_n(&mut self, n: usize) -> usize {
+        assert!(n > 0, "rand: invalid argument to IntN");
+        self.uint64n(n as u64) as usize
+    }
+
     /// Randomize the order of every element in `s` (dcrd
     /// `PRNG.Shuffle`, `crypto/rand/uniform.go:214-230`).
     ///
@@ -400,6 +416,12 @@ pub fn init() {
 /// `rand.Uint64`, `crypto/rand/default.go:37-42`).
 pub fn uint64() -> u64 {
     locked().uint64()
+}
+
+/// A uniform index in `[0, n)` from the process-wide generator (dcrd
+/// `rand.IntN`, `crypto/rand/default.go:109-114`).
+pub fn int_n(n: usize) -> usize {
+    locked().int_n(n)
 }
 
 /// Randomize the order of every element in `s` using the process-wide

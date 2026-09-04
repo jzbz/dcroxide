@@ -117,6 +117,41 @@ fn shuffle_is_dcrds_fisher_yates_over_its_own_reduction() {
     );
 }
 
+/// `int_n` is `uint64n` with dcrd's positive-argument guard.
+///
+/// The mining-address pick reduced a full-width draw by modulo before
+/// this; replaying that over the same stream shows the two are
+/// distinguishable, which is what makes the conversion a bias fix
+/// rather than a rename.
+#[test]
+fn int_n_is_dcrds_reduction_not_a_modulo() {
+    let seed = [37u8; 32];
+    let mut got = Prng::from_seed(seed);
+    let mut want = Prng::from_seed(seed);
+    let mut modulo = Prng::from_seed(seed);
+
+    let mut differed = 0;
+    for n in [1usize, 2, 3, 7, 10, 100, 1000] {
+        let g = got.int_n(n);
+        assert_eq!(g, dcrd_uint64n(&mut want, n as u64) as usize);
+        assert!(g < n, "index {g} must be below {n}");
+        if (modulo.uint64() % (n as u64)) as usize != g {
+            differed += 1;
+        }
+    }
+    assert!(
+        differed > 0,
+        "the test must be able to tell dcrd's reduction from a modulo"
+    );
+}
+
+/// A zero bound panics with dcrd's message (`uniform.go:191-193`).
+#[test]
+#[should_panic(expected = "rand: invalid argument to IntN")]
+fn int_n_rejects_a_zero_bound_as_dcrd_does() {
+    Prng::from_seed([41u8; 32]).int_n(0);
+}
+
 /// The old modulo shuffle produced a different permutation.
 ///
 /// The daemon's peer environment reduced a full-width draw by modulo

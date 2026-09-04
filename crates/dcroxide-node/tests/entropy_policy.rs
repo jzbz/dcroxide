@@ -153,8 +153,7 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
     let expected: BTreeMap<&str, (usize, &str)> = [
-        ("bgtemplate.rs", (2, "debt: mining-address pick and extra nonce, once per template build; dcrd draws both from its never-failing crypto/rand")),
-        ("bin/dcroxide.rs", (2, "one startup, one debt: the rand_bytes closure writes the RPC credential file before any listener opens; the rand_u64 closure is per-request through handle_ping")),
+        ("bin/dcroxide.rs", (2, "one startup, one debt: the rand_bytes closure writes the RPC credential file before any listener opens; the rand_u64 closure is drawn four times at startup for the RPC auth HMAC key in Server::new and per-request through handle_ping")),
         ("bin/gencerts.rs", (1, "tool: a standalone binary with no peers; refusing to emit a key beats emitting a weak one")),
         ("cpuminer.rs", (1, "debt: per-worker extra-nonce offset, CPU miner only")),
         ("rebroadcast.rs", (1, "debt: node-paced rebroadcast jitter, a rejection loop so one call can read several times")),
@@ -211,6 +210,19 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
          drawn once per accepted connection"
     );
 
+    // The template generator is the fourth converted, and the last one
+    // a peer could reach at all: a relayed block drives a regeneration
+    // through `BlockConnected`, and on a node started with
+    // `--miningaddr` each regeneration drew a mining-address index and
+    // two extra nonces.  dcrd draws all three from the package global
+    // (`internal/mining/bgblktmplgenerator.go:728`,
+    // `internal/mining/mining.go:481`, `:498`).
+    assert!(
+        !observed.contains_key("bgtemplate.rs"),
+        "bgtemplate.rs must not read kernel entropy: a peer relaying a \
+         block drives a template regeneration on a mining node"
+    );
+
     // The websocket session id is the third converted, and the last one
     // an unauthenticated *caller* can pace directly: the draw happens
     // after the 101 and before authentication is required.  dcrd draws
@@ -231,6 +243,28 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
         observed, expected_counts,
         "the kernel-entropy sites in this crate changed; update the \
          ledger in this test with the reason each one is allowed to stay"
+    );
+
+    // PARITY.md restates these counts in prose, and three consecutive
+    // conversions left one or another of them stale.  Asserting them
+    // here gives that prose one authority to copy: when this fails,
+    // the numbers in PARITY.md's `crypto/rand` row and its
+    // Known-remaining-gaps bullet are the thing to update.
+    let per_event = expected
+        .values()
+        .filter(|(_, reason)| reason.contains("debt"))
+        .count();
+    let one_shot = expected
+        .values()
+        .filter(|(_, reason)| reason.starts_with("startup") || reason.starts_with("tool"))
+        .count();
+    assert_eq!(
+        (expected.len(), per_event, one_shot),
+        (7, 4, 2),
+        "PARITY.md's crypto/rand row and gaps bullet quote these three \
+         numbers, all counted by FILE ENTRY rather than by call site: \
+         total files, files with a per-event draw, files that are \
+         purely one-shot startup or tool draws"
     );
 }
 
