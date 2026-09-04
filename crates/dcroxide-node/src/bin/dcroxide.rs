@@ -1602,11 +1602,15 @@ fn rpc_config(
         tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(tx_pool)),
         clock: Box::new(dcroxide_node::rpcrun::SystemClock),
         interfaces: Box::new(dcroxide_rpc::helpers::NoInterfaces),
-        rand_u64: Box::new(|| {
-            let mut buf = [0u8; 8];
-            getrandom::fill(&mut buf).expect("system random source");
-            u64::from_le_bytes(buf)
-        }),
+        // The process-wide generator, not a fresh kernel read: dcrd's
+        // rpcserver imports `crypto/rand` and calls the package
+        // functions for both draws this closure serves -- the ping
+        // nonce in `handlePing` (`internal/rpcserver/rpcserver.go:42`,
+        // `:4269`) and the auth HMAC key at server construction
+        // (`:6234-6235`).  The nonce is drawn per request, so an
+        // authenticated client sets its rate, and under
+        // `panic = "abort"` a failed read there would be an outage.
+        rand_u64: Box::new(dcroxide_crypto::rand::uint64),
         tx_indexer,
         db: Box::new(dcroxide_node::indexes::NodeRpcDb::new(db)),
         filterer_v2: Box::new(filterer_v2),

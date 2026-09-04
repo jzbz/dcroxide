@@ -31,8 +31,8 @@
 //!
 //! Not every entry below is a debt. Two are one-shot startup or tool
 //! draws where aborting is the right answer, and `socks.rs` is already
-//! correct, returning its error rather than aborting; only the two
-//! marked `debt` still want converting.
+//! correct, returning its error rather than aborting; only the one
+//! marked `debt` still wants converting.
 //!
 //! What these tests pin is the mechanism: no kernel read on the
 //! peer-paced path, a stream that is seeded once from the OS, and an
@@ -160,7 +160,7 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
     let expected: BTreeMap<&str, (usize, &str)> = [
-        ("bin/dcroxide.rs", (2, "one startup, one debt: the rand_bytes closure writes the RPC credential file before any listener opens; the rand_u64 closure is drawn four times at startup for the RPC auth HMAC key in Server::new and per-request through handle_ping")),
+        ("bin/dcroxide.rs", (1, "startup: the rand_bytes closure writes the RPC credential file before any listener opens")),
         ("bin/gencerts.rs", (1, "tool: a standalone binary with no peers; refusing to emit a key beats emitting a weak one")),
         ("rebroadcast.rs", (1, "debt: node-paced rebroadcast jitter, a rejection loop so one call can read several times")),
         ("rpcrun.rs", (3, "startup: the self-signed TLS ed25519 seed, EC scalar and certificate serial, generated at boot")),
@@ -215,6 +215,12 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
          drawn once per accepted connection"
     );
 
+    // The RPC rand_u64 closure is the seventh converted, taking the
+    // auth HMAC key with it: dcrd draws both from the package global
+    // (`internal/rpcserver/rpcserver.go:4269`, `:6234-6235`).  The
+    // file keeps one read, the startup credential write, which is why
+    // it is still listed above rather than asserted absent.
+    //
     // The seeder is the sixth converted, and the last whose count a
     // remote party influenced: one draw per address a seeder returns,
     // bounded by the reply rather than by this node.  dcrd draws it
@@ -285,7 +291,7 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
         .count();
     assert_eq!(
         (expected.len(), per_event, one_shot),
-        (5, 2, 2),
+        (5, 1, 3),
         "PARITY.md's crypto/rand row and gaps bullet quote these three \
          numbers, all counted by FILE ENTRY rather than by call site: \
          total files, files with a per-event draw, files that are \
