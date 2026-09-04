@@ -8,12 +8,26 @@
 //! global PRNG will never panic after package init"
 //! (`crypto/rand/README.md:18`).
 //!
-//! This port has no process-wide init seam, so the same policy has to be
-//! kept site by site: seed a stream at construction, where an abort is
-//! the right answer, and stream from it afterwards on any path an
-//! outsider can pace. The mempool's orphan-eviction draw was the case
-//! that mattered — a peer pushing orphans past `max_orphan_txs` reaches
-//! it, and under `panic = "abort"` a failed read there is an outage.
+//! This port now has that seam. `dcroxide_crypto::rand` carries dcrd's
+//! `globalRand` and the `default.go` entry points over it, and
+//! `dcroxide_crypto::rand::init` is the daemon's first statement, so the
+//! one fatal read lands at startup where dcrd's package `init` puts it.
+//! The peer environment draws through that global, as dcrd's peer
+//! module does — the highest-rate site in the ledger below, gone. That
+//! relocation matters more than the rate suggests: `getrandom`'s
+//! realistic failure on Linux is the `/dev/urandom` fallback hitting fd
+//! exhaustion, and fd exhaustion is the state a connection flood
+//! produces, so a read on a peer-paced path fails in correlation with
+//! the attack rather than independently of it.
+//!
+//! What is left predates the seam. Each remaining site still reads the
+//! kernel per event and each has to be converted on its own: onto the
+//! global where dcrd reaches the package function, or onto an instance
+//! seeded at construction where dcrd owns a generator, which is what
+//! the mempool's orphan-eviction draw did. That draw was the case that
+//! mattered first — a peer pushing orphans past `max_orphan_txs`
+//! reaches it, and under `panic = "abort"` a failed read there is an
+//! outage.
 //!
 //! What these tests pin is the mechanism: no kernel read on the
 //! peer-paced path, a stream that is seeded once from the OS, and an
@@ -121,8 +135,10 @@ fn the_pool_seed_comes_from_the_os_not_a_constant() {
 /// a one-shot tool construction where an abort is the right answer,
 /// and every other workspace read now lives in one place:
 /// `dcroxide-crypto/src/rand.rs`, the port of dcrd's `crypto/rand`,
-/// which the address manager and the connection manager both draw
-/// from. That module holds two reads — the fatal one in `Prng::new`,
+/// which the address manager and the connection manager draw from
+/// through instances of their own and the peer environment draws from
+/// through that module's process-wide one — which is why `peerconn.rs`
+/// no longer appears below. That module holds two reads — the fatal one in `Prng::new`,
 /// which runs at construction, and the one in `Prng::reseed`, which
 /// recurs every 4 MiB and deliberately ignores a failure. That last
 /// one follows dcrd's structure rather than its behaviour: dcrd's own
@@ -141,7 +157,6 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
         ("bin/dcroxide.rs", (2, "one startup, one debt: the rand_bytes closure writes the RPC credential file before any listener opens; the rand_u64 closure is per-request through handle_ping")),
         ("bin/gencerts.rs", (1, "tool: a standalone binary with no peers; refusing to emit a key beats emitting a weak one")),
         ("cpuminer.rs", (1, "debt: per-worker extra-nonce offset, CPU miner only")),
-        ("peerconn.rs", (1, "debt, highest rate: the handshake nonce plus the Fisher-Yates address shuffles, up to one read per swap on an unauthenticated getaddr")),
         ("rebroadcast.rs", (1, "debt: node-paced rebroadcast jitter, a rejection loop so one call can read several times")),
         ("rpcrun.rs", (3, "startup: the self-signed TLS ed25519 seed, EC scalar and certificate serial, generated at boot")),
         ("seeding.rs", (1, "debt: seeder retry jitter, node-paced")),
@@ -184,6 +199,19 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
          orphan-eviction draw, so a failed read there aborts the daemon"
     );
 
+    // The peer environment is the second site converted, and for the
+    // same reason as the first: an unauthenticated getaddr paces the
+    // address shuffle, so a failed read there aborts the daemon.  Its
+    // draws come from the port of dcrd's `crypto/rand` package global,
+    // which is what dcrd's own peer module reaches
+    // (`peer/peer.go:842`, `:873`, `:1813`, `:2186`).
+    assert!(
+        !observed.contains_key("peerconn.rs"),
+        "peerconn.rs must not read kernel entropy: a peer paces the \
+         address shuffle through getaddr, and the handshake nonce is \
+         drawn once per accepted connection"
+    );
+
     let expected_counts: BTreeMap<String, usize> = expected
         .iter()
         .map(|(file, (count, _))| ((*file).to_string(), *count))
@@ -193,5 +221,39 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
         observed, expected_counts,
         "the kernel-entropy sites in this crate changed; update the \
          ledger in this test with the reason each one is allowed to stay"
+    );
+}
+
+/// The daemon seeds the process-wide generator at startup.
+///
+/// This is the pin for the one thing lazy initialisation cannot
+/// guarantee, and nothing else catches it. Delete the `init()` call and
+/// the code still compiles, every other test still passes, and the
+/// single fallible kernel read silently relocates from startup to
+/// whichever draw comes first — which for a node serving peers is a
+/// handshake nonce on an accepted connection, exactly the placement
+/// this whole line of work exists to undo.
+///
+/// Asserting on the source rather than at runtime because `main` is not
+/// callable from a test, and because the property is about ordering
+/// within `main`: `init()` must also precede the Windows service
+/// dispatch, since Go's package `init` runs before `winServiceMain`.
+#[test]
+fn the_daemon_seeds_the_process_wide_generator_at_startup() {
+    let main_rs = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("bin")
+        .join("dcroxide.rs");
+    let text = std::fs::read_to_string(&main_rs).expect("read dcroxide.rs");
+
+    let seed_at = text
+        .find("dcroxide_crypto::rand::init()")
+        .expect("main must seed the process-wide generator");
+    let dispatch_at = text.find("real_main()").expect("main must reach real_main");
+
+    assert!(
+        seed_at < dispatch_at,
+        "the seeding must run before the service dispatch and before \
+         real_main, where Go's crypto/rand package init runs"
     );
 }

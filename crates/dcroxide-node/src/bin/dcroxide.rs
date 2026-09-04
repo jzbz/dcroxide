@@ -64,6 +64,15 @@ fn request_service_shutdown() {
 }
 
 fn main() -> ExitCode {
+    // Seed the process-wide CSPRNG before anything else, where Go runs
+    // `crypto/rand`'s package `init` (`crypto/rand/prng.go:116-122`).
+    // This is the one kernel read the daemon is allowed to die on, and
+    // taking it here is what makes every later draw infallible -- the
+    // handshake nonce on an accepted connection and the address shuffle
+    // on a getaddr included.  Before the service dispatch below, since
+    // Go's `init` also precedes `winServiceMain`.
+    dcroxide_crypto::rand::init();
+
     // Run under the service control manager when invoked as a Windows
     // service (dcrd `main` calling `winServiceMain` first); interactive
     // operation falls through.

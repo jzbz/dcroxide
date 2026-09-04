@@ -6,9 +6,10 @@
 //! clock and randomness dcrd takes from the standard library) and the
 //! [`WireTransport`](crate::transport::WireTransport) framing.  This
 //! module supplies the daemon's concrete [`PeerEnv`] — the real system
-//! clock, the system random source, and a uniform address shuffle — and
-//! the conversion from an accepted socket address into the wire network
-//! address a peer is associated with.
+//! clock, and the nonce and address-shuffle draws routed to the port of
+//! dcrd's `crypto/rand` package global, which is what dcrd's own peer
+//! module reaches — and the conversion from an accepted socket address
+//! into the wire network address a peer is associated with.
 //!
 //! With these in hand a [`Peer`](dcroxide_peer::Peer) negotiates the
 //! version exchange straight over a
@@ -22,9 +23,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use dcroxide_peer::{PeerAddr, PeerEnv, new_net_address};
 use dcroxide_wire::{NetAddress, ServiceFlag};
 
-/// The daemon's [`PeerEnv`]: the wall clock, the system random source,
-/// and a uniform shuffle, standing in for dcrd's `time.Now`,
-/// `rand.Uint64`, and `rand.ShuffleSlice`.
+/// The daemon's [`PeerEnv`]: the wall clock, and the randomness dcrd's
+/// peer package takes from the `crypto/rand` package global, standing
+/// in for `time.Now`, `rand.Uint64` and `rand.ShuffleSlice`.
+///
+/// A unit struct, and deliberately so.  dcrd's peer module holds no
+/// generator either -- it imports `crypto/rand` and calls the package
+/// functions (`peer/peer.go:1813`, `:2186`, `:842`, `:873`) -- and a
+/// zero-sized environment is what keeps `NodePeerEnv::new()` free at
+/// `runtime.rs:350`, `:363`, `:396` and `:413`, which build one only to
+/// read the clock and drop it.  Pinned by
+/// `tests/peerenv_rand.rs::the_environment_carries_no_generator`.
 #[derive(Debug, Default)]
 pub struct NodePeerEnv;
 
@@ -44,41 +53,29 @@ impl PeerEnv for NodePeerEnv {
     }
 
     fn rand_u64(&mut self) -> u64 {
-        let mut buf = [0u8; 8];
-        getrandom::fill(&mut buf).expect("system random source");
-        u64::from_le_bytes(buf)
+        // The process-wide generator, not one held here: dcrd's peer
+        // module imports `crypto/rand` and calls the package function
+        // for both nonces it draws (`peer/peer.go:1813` ping, `:2186`
+        // version).  It cannot fail, which matters because the version
+        // nonce is drawn on every accepted connection and this
+        // workspace's release profile aborts on panic.
+        dcroxide_crypto::rand::uint64()
     }
 
     fn shuffle_addrs(&mut self, addrs: &mut [NetAddress]) {
-        // Fisher-Yates over the system random source; the exact
-        // permutation is not observable across peers, only that it is a
-        // uniform reordering (dcrd `rand.ShuffleSlice`).
-        let len = addrs.len();
-        for i in (1..len).rev() {
-            // A uniform index in 0..=i; the modulo bias over a full
-            // 64-bit draw is negligible for address relay ordering.  The
-            // divisor is at least two here, so `checked_rem` never
-            // yields `None`.
-            let bound = (i as u64).saturating_add(1);
-            let j = self.rand_u64().checked_rem(bound).unwrap_or(0) as usize;
-            addrs.swap(i, j);
-        }
+        // dcrd `rand.ShuffleSlice(msg.AddrList)` in `PushAddrMsg`
+        // (`peer/peer.go:842`).  Reached only when the list exceeds
+        // `MAX_ADDR_PER_MSG`, on a getaddr an unauthenticated peer
+        // sends; the loop this replaced read the kernel once per swap
+        // and reduced by a raw modulo, where dcrd reduces through the
+        // bias-free `Uint64N`.
+        dcroxide_crypto::rand::shuffle_slice(addrs);
     }
 
     fn shuffle_addrs_v2(&mut self, addrs: &mut [dcroxide_wire::NetAddressV2]) {
-        // Fisher-Yates over the system random source; the exact
-        // permutation is not observable across peers, only that it is a
-        // uniform reordering (dcrd `rand.ShuffleSlice`).
-        let len = addrs.len();
-        for i in (1..len).rev() {
-            // A uniform index in 0..=i; the modulo bias over a full
-            // 64-bit draw is negligible for address relay ordering.  The
-            // divisor is at least two here, so `checked_rem` never
-            // yields `None`.
-            let bound = (i as u64).saturating_add(1);
-            let j = self.rand_u64().checked_rem(bound).unwrap_or(0) as usize;
-            addrs.swap(i, j);
-        }
+        // dcrd `rand.ShuffleSlice(addrs)` in `PushAddrV2Msg`
+        // (`peer/peer.go:873`).
+        dcroxide_crypto::rand::shuffle_slice(addrs);
     }
 }
 

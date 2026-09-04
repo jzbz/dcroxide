@@ -35,6 +35,7 @@ dcroxide-uint256 = { path = "../dcroxide-uint256" }
 dcroxide-database = { path = "../dcroxide-database" }
 dcroxide-connmgr = { path = "../dcroxide-connmgr" }
 dcroxide-containers = { path = "../dcroxide-containers" }
+dcroxide-crypto = { path = "../dcroxide-crypto", features = ["rand"] }
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-dcrjson = { path = "../dcroxide-dcrjson" }

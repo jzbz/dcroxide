@@ -547,6 +547,7 @@ dependencies = [
  "dcroxide-chainhash",
  "dcroxide-connmgr",
  "dcroxide-containers",
+ "dcroxide-crypto",
  "dcroxide-database",
  "dcroxide-dcrec",
  "dcroxide-dcrjson",
