@@ -15,15 +15,25 @@
 
 use dcroxide_node::server::{
     MAX_CONCURRENT_GETDATA_REQS, MAX_INV_PER_MSG, MAX_PENDING_GETDATA_ITEM_REQS, OnGetDataOutcome,
-    OnInvOutcome, ServerPeerAddrState, on_get_data, on_inv_classify,
+    OnInvOutcome, ServerPeerAddrState, inv_is_marked_known, on_get_data, on_inv_classify,
 };
-use dcroxide_wire::InvType;
+use dcroxide_wire::{InvType, InvVect};
 
 const VECTORS: &str = include_str!("data/srvintake_vectors.txt");
 
 const NOW_UNIX: i64 = 1_700_000_000;
 const BAN_THRESHOLD: u32 = 100;
 const PEER_HOST: &str = "10.0.0.2";
+
+/// An inventory vector of the given type; the hash is irrelevant to
+/// the classification, which switches on the type alone (dcrd
+/// `server.go:1392`).
+fn iv(inv_type: InvType) -> InvVect {
+    InvVect {
+        inv_type,
+        hash: dcroxide_chainhash::Hash::ZERO,
+    }
+}
 
 /// Look up a `gd|` row by its second field.
 fn row<'a>(name: &str) -> Vec<&'a str> {
@@ -152,7 +162,7 @@ fn server_intake_gates_match_dcrd() {
 
     // --- inv: blocksonly disconnects a transaction announcement -----------
     let f = iv_row("blocksonlytx");
-    let out = on_inv_classify(&[InvType::BLOCK, InvType::TX], true);
+    let out = on_inv_classify(&[iv(InvType::BLOCK), iv(InvType::TX)], true);
     assert_eq!(out, OnInvOutcome::DisconnectAnnouncement("transactions"));
     let (banned, connected) = inv_ban_state(out);
     assert_eq!(banned, f[2]);
@@ -160,7 +170,7 @@ fn server_intake_gates_match_dcrd() {
 
     // --- inv: blocksonly disconnects a mix announcement -------------------
     let f = iv_row("blocksonlymix");
-    let out = on_inv_classify(&[InvType::MIX], true);
+    let out = on_inv_classify(&[iv(InvType::MIX)], true);
     assert_eq!(out, OnInvOutcome::DisconnectAnnouncement("mix messages"));
     let (banned, connected) = inv_ban_state(out);
     assert_eq!(banned, f[2]);
@@ -170,11 +180,11 @@ fn server_intake_gates_match_dcrd() {
     // ported sync manager, which is not reachable from this dump; the
     // classification is still exercised here.
     assert_eq!(
-        on_inv_classify(&[InvType::TX], false),
+        on_inv_classify(&[iv(InvType::TX)], false),
         OnInvOutcome::Forward
     );
     assert_eq!(
-        on_inv_classify(&[InvType::BLOCK, InvType::BLOCK], true),
+        on_inv_classify(&[iv(InvType::BLOCK), iv(InvType::BLOCK)], true),
         OnInvOutcome::Forward
     );
 }
@@ -203,6 +213,44 @@ fn get_data_ban_state(out: OnGetDataOutcome, prior_pending: u32) -> BanState {
             pending: new_pending_items,
         },
     }
+}
+
+/// The known-inventory record covers exactly the three types dcrd's
+/// netsync switch handles.
+///
+/// `SyncManager.OnInv` calls `AddKnownInventory` inside its block,
+/// transaction and mixing cases (`internal/netsync/manager.go:1908`,
+/// `:1917`, `:1942`) and the switch closes at `:1961` with no default
+/// arm, so anything else is forwarded without entering the set.
+#[test]
+fn inv_marks_only_the_types_dcrds_switch_handles() {
+    for marked in [InvType::BLOCK, InvType::TX, InvType::MIX] {
+        assert!(
+            inv_is_marked_known(marked),
+            "{marked} is a case in dcrd's switch"
+        );
+    }
+    for ignored in [InvType::ERROR, InvType::FILTERED_BLOCK, InvType(99)] {
+        assert!(
+            !inv_is_marked_known(ignored),
+            "{ignored} has no case in dcrd's switch, so it never enters the set"
+        );
+    }
+}
+
+/// Blocks-only mode disconnects on transactions and mix messages only.
+///
+/// dcrd's blocks-only loop hits `default: continue` for anything else
+/// (`server.go:1397-1398`) and falls through to the forward at `:1405`.
+/// No other case here reaches a type outside TX, MIX and BLOCK, so
+/// this is the only check that would catch the type scan turning into
+/// a catch-all.
+#[test]
+fn blocks_only_forwards_types_other_than_tx_and_mix() {
+    assert_eq!(
+        on_inv_classify(&[iv(InvType::FILTERED_BLOCK), iv(InvType::ERROR)], true),
+        OnInvOutcome::Forward
+    );
 }
 
 /// Map an inv outcome to the observable ban and connection state.

@@ -405,6 +405,45 @@ impl SyncPeers {
         }
     }
 
+    /// Mark a whole announcement's inventory as known to the peer
+    /// (dcrd `AddKnownInventory` per vector inside
+    /// `SyncManager.OnInv`, `internal/netsync/manager.go:1908`,
+    /// `:1917`, `:1942`).
+    ///
+    /// The registry handle is cloned out and the map lock released
+    /// before any put -- as [`SyncPeers::outbound_mix_counts`] does --
+    /// so an announcement costs one registry acquisition instead of
+    /// one per vector; the per-vector lookup is the port's own
+    /// addition, since dcrd reaches the peer directly and has no
+    /// registry on this path.  The relay lock is then taken and
+    /// released per put rather than held across the batch, which is
+    /// exactly what dcrd does (`peer/peer.go:578` into
+    /// `container/lru/map.go:284`: one mutex, locked and unlocked per
+    /// item).  Holding it across a remote-sized batch would also
+    /// stall the registry transitively, because the relay fan-out
+    /// takes the map lock and then blocks on each peer's relay lock
+    /// in turn (see `relay_to_peers`).
+    pub(crate) fn mark_known_inventory_batch(
+        &self,
+        id: i32,
+        invs: impl IntoIterator<Item = InvVect>,
+    ) {
+        let relay = {
+            let registry = self.inner.lock().expect("sync peers mutex poisoned");
+            let Some(handles) = registry.get(&id) else {
+                return;
+            };
+            Arc::clone(&handles.relay)
+        };
+        for inv in invs {
+            relay
+                .lock()
+                .expect("relay state poisoned")
+                .known_inventory
+                .put(inv);
+        }
+    }
+
     /// Whether the peer already knows this inventory (dcrd
     /// `IsKnownInventory`), so a getblocks response can omit it.  An
     /// unregistered peer knows nothing.
@@ -1783,16 +1822,7 @@ impl ServerPeerHandler {
             | Message::MixConfirm(_)
             | Message::MixFactoredPoly(_)
             | Message::MixSecrets(_) => self.on_mix_message(msg.clone(), peer.services()),
-            Message::Inv(inv) => {
-                // Inventory the peer announces is known to it, so the
-                // relay never echoes it back (dcrd `AddKnownInventory`).
-                if let Some(id) = self.sync_peer_id {
-                    for iv in &inv.inv_list {
-                        self.ctx.sync_peers.mark_known_inventory(id, *iv);
-                    }
-                }
-                self.on_inv(inv)
-            }
+            Message::Inv(inv) => self.on_inv(inv),
             Message::Headers(headers) => {
                 self.drive_sync(|manager, id| manager.on_headers(id, headers));
                 ServeSignal::Continue
@@ -2277,6 +2307,18 @@ impl ServerPeerHandler {
     }
 }
 
+/// The vectors from an announcement that enter the peer's
+/// known-inventory set, in announcement order (dcrd's
+/// `SyncManager.OnInv` calling `AddKnownInventory` inside its block,
+/// transaction and mixing cases only -- `internal/netsync/manager.go`
+/// `:1908`, `:1917`, `:1942`).
+pub(crate) fn announcement_known_inventory(inv: &MsgInv) -> impl Iterator<Item = InvVect> + '_ {
+    inv.inv_list
+        .iter()
+        .copied()
+        .filter(|iv| crate::server::inv_is_marked_known(iv.inv_type))
+}
+
 impl ServerPeerHandler {
     /// Gate an inventory announcement: ban empty announcements, and in
     /// blocks-only mode disconnect peers announcing transactions or
@@ -2284,8 +2326,7 @@ impl ServerPeerHandler {
     /// pass forward to the sync manager, whose driver arrives with the
     /// netsync pieces.
     fn on_inv(&mut self, inv: &MsgInv) -> ServeSignal {
-        let inv_types: Vec<InvType> = inv.inv_list.iter().map(|iv| iv.inv_type).collect();
-        match on_inv_classify(&inv_types, self.ctx.blocks_only) {
+        match on_inv_classify(&inv.inv_list, self.ctx.blocks_only) {
             // The ban outcome records the host in the shared banned map
             // and drops the connection.
             OnInvOutcome::BanEmpty => {
@@ -2299,6 +2340,24 @@ impl ServerPeerHandler {
                 ServeSignal::Disconnect("announcing mix messages in blocks-only mode".into())
             }
             OnInvOutcome::Forward => {
+                // The announced inventory is known to the peer, so the
+                // relay never echoes it back.  dcrd records it inside
+                // `SyncManager.OnInv` (`internal/netsync/manager.go`
+                // `:1908`, `:1917`, `:1942`), which is reached only
+                // after the two gates above return
+                // (`server.go:1382`, `:1402`), and only for the three
+                // types that switch handles -- it has no default arm,
+                // so an error, filtered-block or unknown vector is
+                // forwarded without entering the set.  The registry
+                // lock is taken once for the announcement and released
+                // before any put, so nothing is held when `drive_sync`
+                // re-enters the registry to apply the manager's
+                // actions.
+                if let Some(id) = self.sync_peer_id {
+                    self.ctx
+                        .sync_peers
+                        .mark_known_inventory_batch(id, announcement_known_inventory(inv));
+                }
                 self.drive_sync(|manager, id| manager.on_inv(id, inv));
                 ServeSignal::Continue
             }
@@ -2650,6 +2709,152 @@ mod tests {
             inv_type: InvType::TX,
             hash: Hash([byte; 32]),
         }
+    }
+
+    /// Register a peer with a relay state the caller keeps a handle to.
+    fn register_relay(peers: &SyncPeers, id: i32, relay: Arc<Mutex<RelayPeerState>>) {
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        peers.register(
+            id,
+            queue,
+            None,
+            relay,
+            test_peer_handle(),
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        // The receiver is dropped: these tests read the known-inventory
+        // set, never the outbound queue.
+    }
+
+    /// Announced vectors of a type dcrd ignores never enter the set, so
+    /// they cannot evict what dcrd would still remember.
+    ///
+    /// dcrd's `SyncManager.OnInv` switch calls `AddKnownInventory` in
+    /// its block, transaction and mixing cases only and has no default
+    /// arm (`internal/netsync/manager.go:1895-1961`).  The set holds
+    /// `dcroxide_peer::MAX_KNOWN_INVENTORY` entries, so marking every
+    /// announced type -- as this port did -- lets a peer flush its own
+    /// record with vectors upstream would have skipped.
+    ///
+    /// The honest limit of this pin: it covers the helper the Inv arm
+    /// calls, not the arm's use of it. `is_known_inventory` is
+    /// `pub(crate)` and the end-to-end harness cannot read the relay
+    /// set, so that wiring is held by review.
+    #[test]
+    fn announced_junk_types_never_evict_known_inventory() {
+        let peers = SyncPeers::new();
+        let relay = Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false))));
+        register_relay(&peers, 1, relay);
+
+        let remembered = tx_inv(0x01);
+        peers.mark_known_inventory(1, remembered);
+
+        // One more than the cache holds, every hash distinct, so
+        // marking them would evict `remembered` rather than merely
+        // refresh a handful of repeated keys.
+        let msg = MsgInv {
+            inv_list: (0..=dcroxide_peer::MAX_KNOWN_INVENTORY)
+                .map(|i| {
+                    let mut hash = [0u8; 32];
+                    hash[..4].copy_from_slice(&i.to_le_bytes());
+                    InvVect {
+                        inv_type: InvType::FILTERED_BLOCK,
+                        hash: Hash(hash),
+                    }
+                })
+                .collect(),
+        };
+        peers.mark_known_inventory_batch(1, announcement_known_inventory(&msg));
+
+        assert!(
+            peers.is_known_inventory(1, &remembered),
+            "a type dcrd ignores must not evict a transaction dcrd would remember"
+        );
+        assert!(
+            !peers.is_known_inventory(1, &msg.inv_list[0]),
+            "a filtered-block vector must never enter the set at all"
+        );
+    }
+
+    /// The batch records every vector, and tolerates an unregistered
+    /// peer exactly as the single-vector sibling does.
+    #[test]
+    fn mark_known_inventory_batch_records_every_vector() {
+        let peers = SyncPeers::new();
+        let relay = Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false))));
+        register_relay(&peers, 1, relay);
+
+        let invs = [tx_inv(0xa1), tx_inv(0xa2), tx_inv(0xa3)];
+        peers.mark_known_inventory_batch(1, invs);
+        for iv in &invs {
+            assert!(peers.is_known_inventory(1, iv), "every vector is recorded");
+        }
+
+        // An unregistered peer is a silent no-op, as `mark_known_inventory`
+        // and `mark_known` already are.
+        peers.mark_known_inventory_batch(9, [tx_inv(0xb1)]);
+        assert!(
+            !peers.is_known_inventory(9, &tx_inv(0xb1)),
+            "an unregistered peer records nothing"
+        );
+    }
+
+    /// Neither lock is held between two puts.
+    ///
+    /// This is dcrd's shape: `AddKnownInventory` takes the LRU's own
+    /// mutex and releases it per item (`peer/peer.go:578` into
+    /// `container/lru/map.go:284-286`), and there is no registry on
+    /// that path at all.  Holding either lock across a remote-sized
+    /// batch would stall the relay fan-out, which takes the map lock
+    /// and then blocks on each peer's relay lock in turn.
+    ///
+    /// Probed from the iterator rather than from a second thread, so
+    /// there is no start-order race and no timeout.  `try_lock` on a
+    /// `std::sync::Mutex` already held by this thread returns
+    /// `WouldBlock` rather than deadlocking, which is what makes the
+    /// probe safe.
+    #[test]
+    fn mark_known_inventory_batch_holds_no_lock_between_puts() {
+        struct Probe<'a> {
+            peers: &'a SyncPeers,
+            relay: Arc<Mutex<RelayPeerState>>,
+            left: Vec<InvVect>,
+            free: Vec<bool>,
+        }
+        impl Iterator for Probe<'_> {
+            type Item = InvVect;
+            fn next(&mut self) -> Option<InvVect> {
+                let iv = self.left.pop()?;
+                let registry_free = self.peers.inner.try_lock().is_ok();
+                let relay_free = self.relay.try_lock().is_ok();
+                self.free.push(registry_free && relay_free);
+                Some(iv)
+            }
+        }
+
+        let peers = SyncPeers::new();
+        let relay = Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false))));
+        register_relay(&peers, 1, Arc::clone(&relay));
+
+        let mut probe = Probe {
+            peers: &peers,
+            relay: Arc::clone(&relay),
+            left: vec![tx_inv(0xc1), tx_inv(0xc2), tx_inv(0xc3)],
+            free: Vec::new(),
+        };
+        peers.mark_known_inventory_batch(1, &mut probe);
+
+        assert_eq!(probe.free.len(), 3, "every vector was drawn from the probe");
+        assert!(
+            probe.free.iter().all(|free| *free),
+            "neither the registry nor the relay lock may be held between \
+             puts, saw {:?}",
+            probe.free
+        );
     }
 
     fn tx_relay_msg(inv: &InvVect) -> crate::server::RelayInvFacts {

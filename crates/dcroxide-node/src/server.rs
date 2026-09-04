@@ -1941,9 +1941,14 @@ pub enum OnInvOutcome {
 /// in blocks-only mode disconnect peers that announce transactions
 /// or mix messages, otherwise forward to the sync manager (dcrd
 /// `serverPeer.OnInv`).  The forward is ported netsync machinery.
-pub fn on_inv_classify(inv_types: &[dcroxide_wire::InvType], blocks_only: bool) -> OnInvOutcome {
+///
+/// The whole vectors are taken rather than their types alone because
+/// dcrd reads `invVect.Type` straight off `msg.InvList`
+/// (`server.go:1390`) and materializes nothing; a caller holding a
+/// `MsgInv` passes `&inv.inv_list` with no intermediate list.
+pub fn on_inv_classify(inv_list: &[dcroxide_wire::InvVect], blocks_only: bool) -> OnInvOutcome {
     // Ban peers sending empty inventory announcements.
-    if inv_types.is_empty() {
+    if inv_list.is_empty() {
         return OnInvOutcome::BanEmpty;
     }
 
@@ -1951,16 +1956,37 @@ pub fn on_inv_classify(inv_types: &[dcroxide_wire::InvType], blocks_only: bool) 
         return OnInvOutcome::Forward;
     }
 
-    for inv_type in inv_types {
-        if *inv_type == dcroxide_wire::InvType::TX {
+    for iv in inv_list {
+        if iv.inv_type == dcroxide_wire::InvType::TX {
             return OnInvOutcome::DisconnectAnnouncement("transactions");
         }
-        if *inv_type == dcroxide_wire::InvType::MIX {
+        if iv.inv_type == dcroxide_wire::InvType::MIX {
             return OnInvOutcome::DisconnectAnnouncement("mix messages");
         }
     }
 
     OnInvOutcome::Forward
+}
+
+/// Whether an announced inventory vector enters the peer's known
+/// inventory (dcrd `SyncManager.OnInv`).  dcrd's switch handles the
+/// block, transaction and mixing cases and has no default arm
+/// (`internal/netsync/manager.go:1894-1961`, with `AddKnownInventory`
+/// at `:1908`, `:1917` and `:1942`), so an error, filtered-block or
+/// unknown vector is forwarded without ever entering the set.  That
+/// matters beyond bookkeeping: the set holds only
+/// `dcroxide_peer::MAX_KNOWN_INVENTORY` entries, so a type dcrd
+/// ignores must not evict a block or transaction dcrd would still
+/// remember.
+///
+/// The getdata path matches the same three types elsewhere in the
+/// daemon; that one tracks dcrd's `OnGetData` switch, which is a
+/// different switch, and the two must not be unified.
+pub fn inv_is_marked_known(inv_type: dcroxide_wire::InvType) -> bool {
+    matches!(
+        inv_type,
+        dcroxide_wire::InvType::BLOCK | dcroxide_wire::InvType::TX | dcroxide_wire::InvType::MIX
+    )
 }
 
 /// The maximum number of block inventory vectors per message (dcrd
