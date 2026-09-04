@@ -1319,13 +1319,18 @@ impl<C: RpcChain> Server<C> {
         let mut registry = dcroxide_dcrjson::Registry::new();
         dcroxide_rpctypes::register_all(&mut registry);
 
-        // The auth HMAC key (dcrd reads it from crypto/rand); the
-        // stored MACs only ever compare against MACs under the same
-        // key, so the configured randomness source decides.
+        // The auth HMAC key, drawn the way dcrd draws it: one
+        // `rand.Read` of thirty-two bytes from the package generator
+        // (`internal/rpcserver/rpcserver.go:6234-6235`).  Not taken
+        // through `cfg.rand_u64` -- dcrd does not inject this one, and
+        // assembling it from four `u64` draws took the generator's
+        // lock four times where dcrd takes it once, leaving room for
+        // another thread's draws to interleave.  The key is never
+        // compared across processes: the stored MACs only ever check
+        // against MACs made under this same key, so nothing observes
+        // it and nothing needs to inject it.
         let mut hmac_key = [0u8; 32];
-        for chunk in hmac_key.chunks_mut(8) {
-            chunk.copy_from_slice(&(cfg.rand_u64)().to_le_bytes());
-        }
+        dcroxide_crypto::rand::read(&mut hmac_key);
         let mut server = Server {
             cfg,
             work_state: std::sync::Mutex::new(WorkState::default()),

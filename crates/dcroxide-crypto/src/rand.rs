@@ -27,8 +27,9 @@
 //! `default.go` entry points the daemon's draws go through:
 //! `Uint64` (`default.go:37-42`) and `ShuffleSlice` (`:144-148`) over
 //! `Shuffle` (`:136-141`) for the peer module, `IntN` (`:109-114`)
-//! for the mining package's address pick, and `Duration`
-//! (`:126-131`) for the seeder's address backdating.
+//! for the mining package's address pick, `Duration` (`:126-131`) for
+//! the seeder's address backdating and the rebroadcast timer, and
+//! `Read` (`:22-26`) for the RPC server's auth HMAC key.
 //!
 //! The globals are ported because dcrd's peer module reaches
 //! randomness through nothing else: `rand.Uint64()` for the ping and
@@ -56,7 +57,7 @@
 //!   name a generic slice-element swap; `<[T]>::swap` is that closure,
 //!   so the two Go functions collapse into [`shuffle_slice`].
 //! * The `default.go` entry points no consumer reaches: `Reader`,
-//!   `Read`, `Uint32`, `Uint32N`, `Uint64N`, and the remaining
+//!   `Uint32`, `Uint32N`, `Uint64N`, and the remaining
 //!   `Int*`/`UintN`/`BigInt`/`Float64` wrappers.  Each is two lines
 //!   over [`Prng`] when a consumer appears -- which is how `IntN`
 //!   arrived with the mining-address pick and `Duration` with the
@@ -433,6 +434,18 @@ fn locked() -> std::sync::MutexGuard<'static, Prng> {
 /// safe but relocates the fallible read to the first draw.
 pub fn init() {
     let _ = global();
+}
+
+/// XOR `buf` with the process-wide generator's keystream (dcrd
+/// `rand.Read`, `crypto/rand/default.go:22-26`).
+///
+/// One lock acquisition covers the whole buffer, as dcrd's does -- its
+/// comment at `:24` says so explicitly.  Like every `Read` in this
+/// module it XORs rather than fills (see QK-0012); dcrd's callers pass
+/// a freshly allocated slice, so the two coincide, and a caller here
+/// wanting bytes passes a zeroed buffer for the same reason.
+pub fn read(buf: &mut [u8]) {
+    locked().read(buf);
 }
 
 /// A uniform random `u64` from the process-wide generator (dcrd

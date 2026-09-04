@@ -134,6 +134,24 @@ fn read_xors_in_place_as_go_does() {
     assert_eq!(buf.to_vec(), want);
 }
 
+/// The package `read` fills a zeroed buffer from one shared stream.
+///
+/// dcrd's `rand.Read` takes the generator's lock once for the whole
+/// buffer (`crypto/rand/default.go:22-26`, whose comment says so), and
+/// its callers pass a freshly allocated slice, so XOR and fill
+/// coincide. Two calls must not repeat, and a 32-byte draw must not
+/// come back zero — the shape the RPC auth HMAC key relies on.
+#[test]
+fn the_package_read_draws_from_the_shared_generator() {
+    let mut first = [0u8; 32];
+    let mut second = [0u8; 32];
+    dcroxide_crypto::rand::read(&mut first);
+    dcroxide_crypto::rand::read(&mut second);
+
+    assert_ne!(first, [0u8; 32], "a zeroed buffer must come back drawn");
+    assert_ne!(first, second, "two reads must not repeat");
+}
+
 /// Two kernel-seeded generators do not share a stream.
 ///
 /// Every other test here goes through `from_seed`, so all of them would
