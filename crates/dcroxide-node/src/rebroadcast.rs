@@ -147,21 +147,20 @@ impl PendingInvs {
 }
 
 /// A uniformly random duration in `[0, max)` without modulo bias
-/// (dcrd's `crypto/rand.Duration`), drawn from the system random
-/// source.
-// The modulo arithmetic is over a nonzero constant bound.
-#[allow(clippy::arithmetic_side_effects)]
+/// (dcrd `rand.Duration(30 * time.Minute)` resetting the rebroadcast
+/// timer, `server.go:3345`).
+///
+/// From the process-wide generator, and reduced the way dcrd reduces.
+/// The loop this replaced drew from the kernel and rejected outside a
+/// zone of `(u64::MAX / n) * n`, which reaches the same distribution by
+/// different arithmetic and a different draw count; dcrd's `Duration`
+/// (`crypto/rand/uniform.go:202-209`) goes through `Uint64N`'s
+/// multiply-shift (`:102-148`).  Both are bias-free, so nothing
+/// about the timer's spread changes -- what changes is that the draw no
+/// longer reads the kernel, on a path that fires every rebroadcast
+/// round for the life of the process.
 fn rand_duration(max: Duration) -> Duration {
-    let n = max.as_nanos() as u64;
-    let zone = (u64::MAX / n) * n;
-    loop {
-        let mut buf = [0u8; 8];
-        getrandom::fill(&mut buf).expect("system random source");
-        let v = u64::from_le_bytes(buf);
-        if v < zone {
-            return Duration::from_nanos(v % n);
-        }
-    }
+    Duration::from_nanos(dcroxide_crypto::rand::duration(max.as_nanos() as i64) as u64)
 }
 
 /// The cheap cloneable feeder the RPC connection manager and the

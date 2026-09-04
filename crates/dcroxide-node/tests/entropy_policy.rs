@@ -20,19 +20,27 @@
 //! produces, so a read on a peer-paced path fails in correlation with
 //! the attack rather than independently of it.
 //!
-//! What is left predates the seam. Each remaining site still reads the
-//! kernel per event and each has to be converted on its own: onto the
-//! global where dcrd reaches the package function, or onto an instance
-//! seeded at construction where dcrd owns a generator, which is what
-//! the mempool's orphan-eviction draw did. That draw was the case that
-//! mattered first — a peer pushing orphans past `max_orphan_txs`
-//! reaches it, and under `panic = "abort"` a failed read there is an
-//! outage.
+//! Every draw this crate makes that an event could pace and that could
+//! abort has been converted — onto the global where dcrd reaches the
+//! package function, or onto an instance seeded at construction where
+//! dcrd owns a generator, which is what the mempool's orphan-eviction
+//! draw did. That draw was the case that mattered first: a peer
+//! pushing orphans past `max_orphan_txs` reaches it, and under
+//! `panic = "abort"` a failed read there is an outage.
 //!
-//! Not every entry below is a debt. Two are one-shot startup or tool
-//! draws where aborting is the right answer, and `socks.rs` is already
-//! correct, returning its error rather than aborting; only the one
-//! marked `debt` still wants converting.
+//! What is left is NOT all one-shot, and the claim that it was is
+//! exactly the kind this file exists to stop. `socks.rs` still reads
+//! the kernel once per outbound dial under `--torisolation`, which the
+//! node's own connect schedule paces. It stays that way deliberately:
+//! upstream's go-socks draws there from Go's standard-library
+//! `crypto/rand`, not from dcrd's package generator, so routing it
+//! onto the process generator would be the divergence — and it already
+//! returns its error where upstream returns one too, so it cannot
+//! abort. The rest read the kernel once, at startup or in a tool.
+//!
+//! The scope is this crate's own source. Dependencies draw their own
+//! entropy — rustls and ring do so per TLS handshake — and nothing
+//! here says otherwise.
 //!
 //! What these tests pin is the mechanism: no kernel read on the
 //! peer-paced path, a stream that is seeded once from the OS, and an
@@ -145,7 +153,7 @@ fn the_pool_seed_comes_from_the_os_not_a_constant() {
 /// through that module's process-wide one, as do the websocket session
 /// id, the template generator, the CPU miner and the seeder — which is
 /// why none of `peerconn.rs`, `websocket.rs`, `bgtemplate.rs`,
-/// `cpuminer.rs` or `seeding.rs` appears below. That module holds two reads — the fatal one in `Prng::new`,
+/// `cpuminer.rs`, `seeding.rs` or `rebroadcast.rs` appears below. That module holds two reads — the fatal one in `Prng::new`,
 /// which runs at construction, and the one in `Prng::reseed`, which
 /// recurs every 4 MiB and deliberately ignores a failure. That last
 /// one follows dcrd's structure rather than its behaviour: dcrd's own
@@ -160,11 +168,10 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
     let expected: BTreeMap<&str, (usize, &str)> = [
-        ("bin/dcroxide.rs", (1, "startup: the rand_bytes closure writes the RPC credential file before any listener opens")),
-        ("bin/gencerts.rs", (1, "tool: a standalone binary with no peers; refusing to emit a key beats emitting a weak one")),
-        ("rebroadcast.rs", (1, "debt: node-paced rebroadcast jitter, a rejection loop so one call can read several times")),
-        ("rpcrun.rs", (3, "startup: the self-signed TLS ed25519 seed, EC scalar and certificate serial, generated at boot")),
-        ("socks.rs", (1, "already correct: the surrounding SOCKS exchange is fallible for a dozen other reasons, so the failure is returned rather than aborting")),
+        ("bin/dcroxide.rs", (1, "one-shot startup: the rand_bytes closure writes the RPC credential file before any listener opens")),
+        ("bin/gencerts.rs", (1, "one-shot tool: a standalone binary with no peers; refusing to emit a key beats emitting a weak one")),
+        ("rpcrun.rs", (3, "one-shot startup: the self-signed TLS ed25519 seed, EC scalar and certificate serial, generated at boot")),
+        ("socks.rs", (1, "per-event but correct, and deliberately not converted: one draw per outbound dial under --torisolation, paced by the node's connect schedule; upstream go-socks draws there from Go's standard-library crypto/rand rather than dcrd's package generator, so moving it onto the process generator would be the divergence, and the surrounding SOCKS exchange is fallible for a dozen other reasons, so the failure is returned rather than aborting")),
     ]
     .into_iter()
     .collect();
@@ -213,6 +220,17 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
         "peerconn.rs must not read kernel entropy: a peer paces the \
          address shuffle through getaddr, and the handshake nonce is \
          drawn once per accepted connection"
+    );
+
+    // Rebroadcast jitter is the eighth and last: dcrd resets that
+    // timer with `rand.Duration(30 * time.Minute)` (`server.go:3345`),
+    // and with it converted no per-event kernel read is left in this
+    // crate.  What remains below is startup and tool draws, plus
+    // `socks.rs`, which returns its error rather than aborting.
+    assert!(
+        !observed.contains_key("rebroadcast.rs"),
+        "rebroadcast.rs must not read kernel entropy: the jitter draw \
+         fires every rebroadcast round for the life of the process"
     );
 
     // The RPC rand_u64 closure is the seventh converted, taking the
@@ -279,23 +297,34 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
     // PARITY.md restates these counts in prose, and three consecutive
     // conversions left one or another of them stale.  Asserting them
     // here gives that prose one authority to copy: when this fails,
-    // the numbers in PARITY.md's `crypto/rand` row and its
-    // Known-remaining-gaps bullet are the thing to update.
-    let per_event = expected
-        .values()
-        .filter(|(_, reason)| reason.contains("debt"))
-        .count();
-    let one_shot = expected
-        .values()
-        .filter(|(_, reason)| reason.starts_with("startup") || reason.starts_with("tool"))
-        .count();
+    // the numbers in PARITY.md's `crypto/rand` row are the thing to
+    // update.
+    // Classified by an explicit marker rather than by sniffing the
+    // prose, which is how a per-event site once landed in neither
+    // bucket and let this assertion report zero of them: `socks.rs`
+    // began "already correct:" and so matched neither "debt" nor
+    // "startup"/"tool".  Every reason string must start with one of
+    // these three words, and the assertion below fails if one does not.
+    let paced = |kind: &str| {
+        expected
+            .values()
+            .filter(|(_, reason)| reason.starts_with(kind))
+            .count()
+    };
+    let (per_event, one_shot) = (paced("per-event"), paced("one-shot"));
+    assert_eq!(
+        per_event + one_shot,
+        expected.len(),
+        "every ledger reason must begin `per-event` or `one-shot`, so \
+         the counts below measure pacing rather than wording"
+    );
     assert_eq!(
         (expected.len(), per_event, one_shot),
-        (5, 1, 3),
-        "PARITY.md's crypto/rand row and gaps bullet quote these three \
-         numbers, all counted by FILE ENTRY rather than by call site: \
-         total files, files with a per-event draw, files that are \
-         purely one-shot startup or tool draws"
+        (4, 1, 3),
+        "PARITY.md's crypto/rand row quotes these three numbers, all \
+         counted by FILE ENTRY rather than by call site: total files, \
+         files with a draw an event paces, files that draw only once \
+         at startup or in a tool"
     );
 }
 
