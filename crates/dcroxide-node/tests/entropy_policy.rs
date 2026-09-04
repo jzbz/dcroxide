@@ -31,7 +31,7 @@
 //!
 //! Not every entry below is a debt. Two are one-shot startup or tool
 //! draws where aborting is the right answer, and `socks.rs` is already
-//! correct, returning its error rather than aborting; only the three
+//! correct, returning its error rather than aborting; only the two
 //! marked `debt` still want converting.
 //!
 //! What these tests pin is the mechanism: no kernel read on the
@@ -143,9 +143,9 @@ fn the_pool_seed_comes_from_the_os_not_a_constant() {
 /// which the address manager and the connection manager draw from
 /// through instances of their own and the peer environment draws from
 /// through that module's process-wide one, as do the websocket session
-/// id, the template generator and the CPU miner — which is why none of
-/// `peerconn.rs`, `websocket.rs`, `bgtemplate.rs` or `cpuminer.rs`
-/// appears below. That module holds two reads — the fatal one in `Prng::new`,
+/// id, the template generator, the CPU miner and the seeder — which is
+/// why none of `peerconn.rs`, `websocket.rs`, `bgtemplate.rs`,
+/// `cpuminer.rs` or `seeding.rs` appears below. That module holds two reads — the fatal one in `Prng::new`,
 /// which runs at construction, and the one in `Prng::reseed`, which
 /// recurs every 4 MiB and deliberately ignores a failure. That last
 /// one follows dcrd's structure rather than its behaviour: dcrd's own
@@ -164,7 +164,6 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
         ("bin/gencerts.rs", (1, "tool: a standalone binary with no peers; refusing to emit a key beats emitting a weak one")),
         ("rebroadcast.rs", (1, "debt: node-paced rebroadcast jitter, a rejection loop so one call can read several times")),
         ("rpcrun.rs", (3, "startup: the self-signed TLS ed25519 seed, EC scalar and certificate serial, generated at boot")),
-        ("seeding.rs", (1, "debt: rand_duration, backdating each discovered address by three to seven days (dcrd addrmgr/seed.go:188); drawn once per address the seeder returns, so the count per round is bounded by the reply rather than by the node -- at most MAX_NODES = 16. Also the port's second raw-modulo reduction, where dcrd rand.Duration goes through the bias-free Uint64N")),
         ("socks.rs", (1, "already correct: the surrounding SOCKS exchange is fallible for a dozen other reasons, so the failure is returned rather than aborting")),
     ]
     .into_iter()
@@ -214,6 +213,16 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
         "peerconn.rs must not read kernel entropy: a peer paces the \
          address shuffle through getaddr, and the handshake nonce is \
          drawn once per accepted connection"
+    );
+
+    // The seeder is the sixth converted, and the last whose count a
+    // remote party influenced: one draw per address a seeder returns,
+    // bounded by the reply rather than by this node.  dcrd draws it
+    // from the package global (`addrmgr/seed.go:188`).
+    assert!(
+        !observed.contains_key("seeding.rs"),
+        "seeding.rs must not read kernel entropy: rand_duration is \
+         drawn once per address a seeder returns"
     );
 
     // The CPU miner is the fifth converted: an offset is drawn per
@@ -276,7 +285,7 @@ fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
         .count();
     assert_eq!(
         (expected.len(), per_event, one_shot),
-        (6, 3, 2),
+        (5, 2, 2),
         "PARITY.md's crypto/rand row and gaps bullet quote these three \
          numbers, all counted by FILE ENTRY rather than by call site: \
          total files, files with a per-event draw, files that are \

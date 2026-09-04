@@ -275,12 +275,18 @@ impl SeedEnv for SystemSeedEnv {
         crate::logging::warn("AMGR", msg);
     }
 
+    /// dcrd `rand.Duration(duration4Days)` in the seeder's address
+    /// conversion (`addrmgr/seed.go:188`).
+    ///
+    /// From the process-wide generator, and reduced the way dcrd
+    /// reduces.  The code this replaced took a full-width kernel draw
+    /// and reduced it by modulo over four days in nanoseconds, about
+    /// `2^48`, so the bias was near one part in `2^16` where dcrd's
+    /// `rand.Duration` goes through the bias-free `Uint64N`.  It also
+    /// read the kernel once per address a seeder returns, so the count
+    /// per round was set by the reply rather than by this node.
     fn rand_duration(&mut self, max_nanos: i64) -> i64 {
-        let mut buf = [0u8; 8];
-        getrandom::fill(&mut buf).expect("system random source");
-        u64::from_le_bytes(buf)
-            .checked_rem(max_nanos.max(1) as u64)
-            .unwrap_or(0) as i64
+        dcroxide_crypto::rand::duration(max_nanos)
     }
 }
 

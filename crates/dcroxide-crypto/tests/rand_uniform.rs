@@ -152,6 +152,41 @@ fn int_n_rejects_a_zero_bound_as_dcrd_does() {
     Prng::from_seed([41u8; 32]).int_n(0);
 }
 
+/// `duration` is `uint64n` in nanoseconds, with dcrd's guard.
+///
+/// The seeder's backdating reduced by modulo over four days in
+/// nanoseconds before this, a bias near one part in 2^16 — big enough
+/// that the two disagree on the very first draw, which is what this
+/// asserts rather than sampling for skew.
+#[test]
+fn duration_is_dcrds_reduction_not_a_modulo() {
+    const FOUR_DAYS_NANOS: i64 = 4 * 24 * 60 * 60 * 1_000_000_000;
+    let seed = [43u8; 32];
+    let mut got = Prng::from_seed(seed);
+    let mut want = Prng::from_seed(seed);
+    let mut modulo = Prng::from_seed(seed);
+
+    let d = got.duration(FOUR_DAYS_NANOS);
+    assert_eq!(d, dcrd_uint64n(&mut want, FOUR_DAYS_NANOS as u64) as i64);
+    assert!(
+        (0..FOUR_DAYS_NANOS).contains(&d),
+        "{d} must fall inside the four-day window"
+    );
+    assert_ne!(
+        d,
+        (modulo.uint64() % (FOUR_DAYS_NANOS as u64)) as i64,
+        "dcrd's reduction and the modulo it replaced must be distinguishable"
+    );
+}
+
+/// A non-positive bound panics with dcrd's message
+/// (`uniform.go:203-205`), where the port used to coerce it to one.
+#[test]
+#[should_panic(expected = "rand: invalid argument to Duration")]
+fn duration_rejects_a_non_positive_bound_as_dcrd_does() {
+    Prng::from_seed([47u8; 32]).duration(0);
+}
+
 /// The old modulo shuffle produced a different permutation.
 ///
 /// The daemon's peer environment reduced a full-width draw by modulo

@@ -20,13 +20,15 @@
 //! Ported: `maxCipherRead` (`prng.go:20`), `nonce.inc` (`:26-40`),
 //! `NewPRNG` (`:55-63`), `PRNG.seed` (`:67-81`), `PRNG.Read` including
 //! its mid-buffer split loop (`:85-105`); `uniform.go`'s `PRNG.Uint64`
-//! (`:54-58`), `PRNG.Uint64N` (`:102-148`) and `PRNG.Shuffle`
-//! (`:214-230`); and the package globals -- `lockingPRNG`
+//! (`:54-58`), `PRNG.Uint64N` (`:102-148`), `PRNG.Duration`
+//! (`:202-209`) and `PRNG.Shuffle` (`:214-230`); and the package
+//! globals -- `lockingPRNG`
 //! (`prng.go:111-114`), the `init` that seeds it (`:116-122`), and the
 //! `default.go` entry points the daemon's draws go through:
 //! `Uint64` (`default.go:37-42`) and `ShuffleSlice` (`:144-148`) over
-//! `Shuffle` (`:136-141`) for the peer module, and `IntN`
-//! (`:109-114`) for the mining package's address pick.
+//! `Shuffle` (`:136-141`) for the peer module, `IntN` (`:109-114`)
+//! for the mining package's address pick, and `Duration`
+//! (`:126-131`) for the seeder's address backdating.
 //!
 //! The globals are ported because dcrd's peer module reaches
 //! randomness through nothing else: `rand.Uint64()` for the ping and
@@ -55,11 +57,12 @@
 //!   so the two Go functions collapse into [`shuffle_slice`].
 //! * The `default.go` entry points no consumer reaches: `Reader`,
 //!   `Read`, `Uint32`, `Uint32N`, `Uint64N`, and the remaining
-//!   `Int*`/`UintN`/`Duration`/`BigInt`/`Float64` wrappers.  Each is
-//!   two lines over [`Prng`] when a consumer appears -- which is how
-//!   `IntN` arrived, with the mining-address pick.  `rand.Duration` is
-//!   the next one due, for the inventory trickle timeout
-//!   (`peer/peer.go:1629`), whose port is not yet wired.
+//!   `Int*`/`UintN`/`BigInt`/`Float64` wrappers.  Each is two lines
+//!   over [`Prng`] when a consumer appears -- which is how `IntN`
+//!   arrived with the mining-address pick and `Duration` with the
+//!   seeder's backdating.  `peer/peer.go:1629`'s inventory trickle
+//!   timeout is a further `rand.Duration` caller whose port is not
+//!   yet wired.
 //! * The OpenBSD `arc4random` build variant
 //!   (`crypto/rand/prng_arc4random.go`), a Go-toolchain fallback.
 //!
@@ -320,6 +323,21 @@ impl Prng {
         self.uint64n(n as u64) as usize
     }
 
+    /// A uniform duration in `[0, n)` nanoseconds (dcrd
+    /// `PRNG.Duration`, `crypto/rand/uniform.go:202-209`).
+    ///
+    /// Nanoseconds as an `i64` because that is what Go's
+    /// `time.Duration` is, so the bound and the result carry dcrd's own
+    /// range.  Panics for a non-positive bound with dcrd's message
+    /// (`:203-205`); the port had been coercing such a bound to one
+    /// instead, which is a divergence no caller reaches -- every
+    /// production bound is a positive constant -- but which would have
+    /// hidden the mistake if one ever did.
+    pub fn duration(&mut self, n: i64) -> i64 {
+        assert!(n > 0, "rand: invalid argument to Duration");
+        self.uint64n(n as u64) as i64
+    }
+
     /// Randomize the order of every element in `s` (dcrd
     /// `PRNG.Shuffle`, `crypto/rand/uniform.go:214-230`).
     ///
@@ -422,6 +440,12 @@ pub fn uint64() -> u64 {
 /// `rand.IntN`, `crypto/rand/default.go:109-114`).
 pub fn int_n(n: usize) -> usize {
     locked().int_n(n)
+}
+
+/// A uniform duration in `[0, n)` nanoseconds from the process-wide
+/// generator (dcrd `rand.Duration`, `crypto/rand/default.go:126-131`).
+pub fn duration(n: i64) -> i64 {
+    locked().duration(n)
 }
 
 /// Randomize the order of every element in `s` using the process-wide
