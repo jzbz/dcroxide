@@ -166,17 +166,6 @@ expensive step, dcroxide moves it before.
 
 Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
 
-- **`dcroxide_addrmgr::SystemRng` is a ChaCha20 stream with no rekey.**
-  `SystemCsprng` now rekeys every 4 MiB because the port's ChaCha20 is the
-  96-bit-nonce variant, whose `u32` block counter makes `apply_keystream` panic
-  rather than error at `(2^32 - 1) * 64` bytes. `SystemRng` (`manager.rs:94-131`)
-  has the identical shape and no rekey, and its `int_n` rejection loop can
-  consume several blocks per logical call, so it carries the same latent panic
-  at roughly 256 GiB of keystream. Its draws are node-paced — the bucket key,
-  selection and shuffle run on the daemon's own connection schedule rather than
-  on a peer's — which is why it is recorded here rather than changed alongside
-  the mempool finding. The fix is the same rekey.
-
 - **Kernel entropy is still read per event at seven sites.** The mempool's
   orphan-eviction draw was converted to a seeded stream because a peer paces
   it; the same shape survives elsewhere, and in dcrd every one of these is
@@ -194,8 +183,9 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   production construction sites, so converting it is a shape change across the
   connection glue rather than a one-line edit, and four `PeerEnv` test doubles
   move with it. `crates/dcroxide-node/tests/entropy_policy.rs` holds the list
-  and fails if a site is added or silently converted.
-
+  and fails if a site is added or silently converted. Each now has a type to
+  adopt rather than a pattern to copy: converting `NodePeerEnv` is a field plus
+  a shape change through the connection glue, not a fourth hand-rolled stream.
 
 - **External-address selection models superseded upstream code.** The port's
   `NaSubmissionCache` and `resolve_local_address` (`node/src/server.rs`) follow

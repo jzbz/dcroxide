@@ -303,3 +303,32 @@ Entry format:
   the emitted template's inputs while leaving the source untouched.
 - **How found:** reviewing the height-1 guard, which wrapped both
   fraud-proof passes here where dcrd guards only the first.
+
+## QK-0012 — `crypto/rand`'s `Read` XORs where its documentation says it fills
+
+- **Where:** dcrd `crypto/rand` `PRNG.Read` (`prng.go:83-105`) /
+  `dcroxide-crypto` `rand.rs` `Prng::read`, reached through
+  `dcroxide_addrmgr::AddrRng::read`
+- **What:** the doc comment is "Read fills s with len(s) of
+  cryptographically-secure random bytes" (`prng.go:83`), and the code is
+  `p.cipher.XORKeyStream(s, s)` (`:105`) — it XORs the keystream into
+  whatever the caller already had. For a zeroed buffer the two are the
+  same thing, which is why the difference is invisible at every dcrd
+  call site but one.
+- **Why reproduced:** that one site decides the address manager's bucket
+  key on the reload-after-malformed-peers-file path. `deserializePeers`
+  copies the file's key into `a.key` (`addrmgr/addrmanager.go:614`), a
+  later
+  address entry can still fail, and the fallthrough `a.reset()` (`:586`)
+  re-randomizes a key that is no longer zero at `:809`. dcrd's
+  replacement key is therefore `file_key XOR keystream`, where a fill
+  would give `keystream` alone. Both are uniform to any observer — the
+  point is not strength but that the port computes what dcrd computes,
+  since the bucket key decides which buckets an address lands in.
+- **Pinned by:** `a_second_reset_xors_into_the_key_the_file_supplied` in
+  `crates/dcroxide-addrmgr/tests/addrrng_bound.rs`, which drives the
+  real reload-failure path, and `read_xors_in_place_as_go_does` in
+  `crates/dcroxide-crypto/tests/rand_prng.rs`, which pins the primitive.
+- **How found:** porting `crypto/rand` once for both randomness sources,
+  where the fill-versus-XOR difference between the port and upstream
+  stopped being a detail of two separate implementations.

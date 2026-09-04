@@ -71,52 +71,90 @@ const GO_ZERO_TIME_UNIX: i64 = -62_135_596_800;
 /// daemon's threads.
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
-/// A source of randomness for the address manager (dcrd uses
-/// `crypto/rand`); injectable so tests are deterministic.
+/// A source of randomness for the address manager (dcrd draws from
+/// `crypto/rand`'s package global); injectable so tests are
+/// deterministic.
 pub trait AddrRng {
-    /// A uniform random integer in `[0, n)`.
+    /// A uniform random integer in `[0, n)` (dcrd `rand.IntN`,
+    /// `addrmgr/addrmanager.go:909-968`).
     fn int_n(&mut self, n: usize) -> usize;
-    /// Fill the buffer with random bytes.
+    /// XOR the buffer with random bytes in place (dcrd `rand.Read`,
+    /// which is documented as filling the buffer and implemented as
+    /// `XORKeyStream(s, s)`; see QK-0012).  A caller wanting bytes
+    /// rather than a XOR passes a zeroed buffer -- `reset` deliberately
+    /// does not on its second call, because dcrd's does not either.
     fn read(&mut self, buf: &mut [u8]);
 }
 
-/// A ChaCha20-keyed default randomness source seeded from OS entropy.
+/// The address manager's default randomness source: an instance of
+/// dcrd's `crypto/rand` PRNG.
 ///
-/// The key this stream produces becomes the address manager's bucket
-/// key, which is what stops an attacker steering its own addresses
-/// into chosen new/tried buckets — the precondition for an eclipse —
-/// and it is persisted in `peers.json`, so a weak draw is permanent
-/// for the life of the data directory.  dcrd sources the same key and
-/// every selection/shuffle from `crypto/rand`
-/// (`addrmgr/addrmanager.go` `rand.Read(a.key[:])`).  An earlier
+/// dcrd's address manager draws from that package's global
+/// (`addrmgr/addrmanager.go:809` `rand.Read(a.key[:])`, `:341`,
+/// `:797`, `:909-968`).  This port has no process-wide `init`, so the
+/// manager owns an instance instead -- the shape dcrd's own connection
+/// manager uses (`internal/connmgr/csprng.go`).
+///
+/// The first 32 bytes this stream produces become the address
+/// manager's bucket key, which is what stops an attacker steering its
+/// own addresses into chosen new/tried buckets -- the precondition for
+/// an eclipse -- and it is persisted in `peers.json`, so a weak draw is
+/// permanent for the life of the data directory.  An earlier
 /// clock-derived seed left the whole key a function of one nanosecond
 /// reading, which is brute-forceable.
+///
+/// The 4 MiB rekey that keeps a draw infallible lives in [`Prng`] and
+/// is documented there; without it one cipher runs out at
+/// `(2^32 - 1) * 64` bytes and `apply_keystream` panics rather than
+/// erroring, which under `panic = "abort"` is an outage on whichever
+/// path happened to draw.
+///
+/// [`Prng`]: dcroxide_crypto::rand::Prng
 pub struct SystemRng {
-    cipher: chacha20::ChaCha20,
+    prng: dcroxide_crypto::rand::Prng,
+}
+
+impl SystemRng {
+    /// A source keyed from the provided 32 bytes of seed material, so
+    /// a test can predict the stream.  dcrd has no equivalent.
+    pub fn from_seed(seed: [u8; 32]) -> SystemRng {
+        SystemRng {
+            prng: dcroxide_crypto::rand::Prng::from_seed(seed),
+        }
+    }
 }
 
 impl Default for SystemRng {
+    /// Seed from OS entropy.  Failing here is correct and is where
+    /// dcrd fails: `crypto/rand` acquires kernel entropy fatally
+    /// exactly once, in package `init` (`crypto/rand/prng.go:116-122`),
+    /// and every later read is allowed to fail silently (`:68-70`,
+    /// `:101`).
     fn default() -> SystemRng {
-        use chacha20::cipher::KeyIvInit;
-        let mut key = [0u8; 32];
-        getrandom::fill(&mut key).expect("system random source");
-        let mut nonce = [0u8; 12];
-        getrandom::fill(&mut nonce).expect("system random source");
         SystemRng {
-            cipher: chacha20::ChaCha20::new(&key.into(), &nonce.into()),
+            prng: dcroxide_crypto::rand::Prng::new().expect("system random source"),
         }
     }
 }
 
 impl AddrRng for SystemRng {
     fn int_n(&mut self, n: usize) -> usize {
-        use chacha20::cipher::StreamCipher;
+        // Matches dcrd, whose `IntN` panics for `n <= 0`
+        // (`crypto/rand/uniform.go:190-193`).  The address manager
+        // reaches the same argument check with `2 * refs` from the 2N
+        // re-add likelihood (`addrmgr/addrmanager.go:341`), through
+        // `Int32N`, which has its own identically-shaped guard.
         assert!(n > 0, "int_n of zero");
-        // Rejection sampling for a uniform value.
+        // Rejection sampling for a uniform value.  Each candidate --
+        // accepted or rejected -- is a charged eight-byte draw, so a
+        // loop that spins rekeys rather than marching toward the
+        // block-counter cap.  dcrd reduces with Lemire multiply-shift
+        // instead (`crypto/rand/uniform.go:140`); that pre-existing
+        // divergence is recorded in PARITY.md and not touched here.
         let bound = u64::MAX - u64::MAX % n as u64;
         loop {
             let mut buf = [0u8; 8];
-            self.cipher.apply_keystream(&mut buf);
+            self.prng.read(&mut buf);
             let v = u64::from_le_bytes(buf);
             if v < bound {
                 return (v % n as u64) as usize;
@@ -125,11 +163,7 @@ impl AddrRng for SystemRng {
     }
 
     fn read(&mut self, buf: &mut [u8]) {
-        use chacha20::cipher::StreamCipher;
-        for b in buf.iter_mut() {
-            *b = 0;
-        }
-        self.cipher.apply_keystream(buf);
+        self.prng.read(buf);
     }
 }
 

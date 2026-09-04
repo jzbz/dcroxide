@@ -117,15 +117,21 @@ fn the_pool_seed_comes_from_the_os_not_a_constant() {
 /// Three limits, stated rather than implied. The scan matches the
 /// literal text `getrandom::`, so `use getrandom::fill;` followed by a
 /// bare `fill(..)`, or any other entropy crate, walks straight past it.
-/// It covers this crate only. Of the workspace sites outside it,
-/// `addrmgr/src/manager.rs` and `certgen/src/gentool.rs` are one-shot
-/// constructions where an abort is the right answer, and
-/// `connmgr/src/csprng.rs` holds two: the aborting seed in its
-/// `Default`, also one-shot, and the read inside
-/// `SystemCsprng::reseed`, which recurs every 4 MiB and deliberately
-/// ignores a failure exactly as dcrd's post-init reseed does. And the
-/// reasons below are a debt ledger, not a permission list — entries
-/// marked `debt` may be removed as they are converted, never added to.
+/// It covers this crate only. Outside it, `certgen/src/gentool.rs` is
+/// a one-shot tool construction where an abort is the right answer,
+/// and every other workspace read now lives in one place:
+/// `dcroxide-crypto/src/rand.rs`, the port of dcrd's `crypto/rand`,
+/// which the address manager and the connection manager both draw
+/// from. That module holds two reads — the fatal one in `Prng::new`,
+/// which runs at construction, and the one in `Prng::reseed`, which
+/// recurs every 4 MiB and deliberately ignores a failure. That last
+/// one follows dcrd's structure rather than its behaviour: dcrd's own
+/// guard for it is dead code, because `crypto/rand.Read` kills the
+/// process rather than returning an error on any toolchain dcrd builds
+/// with. The divergence is recorded in PARITY.md. And the reasons
+/// below are a debt
+/// ledger, not a permission list — entries marked `debt` may be
+/// removed as they are converted, never added to.
 #[test]
 fn every_kernel_entropy_read_in_the_daemon_crate_is_accounted_for() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
