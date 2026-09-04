@@ -166,31 +166,22 @@ expensive step, dcroxide moves it before.
 
 Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
 
-- **External-address selection models superseded upstream code.** The port's
-  `NaSubmissionCache` and `resolve_local_address` (`node/src/server.rs`) follow
-  dcrd's `release-v2.1.5`-era `peerState.ResolveLocalAddress`, which the doc
-  comment still cites. Neither that function nor `naSubmissionCache` exists at
-  the parity pin: `036b7090` decides external addresses through
-  `considerReportedAddr` and `considerReportedAddrOutbound` over an LRU bounded
-  by `maxExternalAddrCandidates = 20` (`server.go:96-98`, `:2518`, `:2595`).
-  The machinery is wired, not dead -- `resolve_local_address` is called from
-  `server.rs` and the cache is constructed at startup -- so this is a live
-  subsystem tracking an upstream shape that moved, and re-porting it is a
-  piece of work rather than a deletion. Reported as RVW-012 by an external
-  review of `382864f5`, whose "unwired" label is the one part that does not
-  hold.
+Two kinds of entry live here and they call for opposite actions, so each now
+sits under its own heading. Reading the whole section as a work list sent
+three separate investigations at settled entries -- the SOCKS isolation
+credentials, `--maxsameip`, and nearly the mempool's modulo reductions -- each
+of which ended in "this already matches dcrd, leave it" only after a full dig.
+An entry moves between the two subsections when the code moves, not when the
+prose is rewritten.
 
-- **`generate 0` does not cancel an in-flight discrete mining call.** dcrd
-  keeps a `generateCancelFn` while discrete mining is active and invokes it on
-  the `n == 0` path (`internal/mining/cpuminer/cpuminer.go:159-163`,
-  `:845-851`), so a concurrent `generate 0` stops the running solve. This port
-  has no cancellation handle for the solve, so `generate 0` returns without
-  stopping it. The RPC layer already carries dcrd's error arm for the
-  cancelled case (`server.rs`'s `is_cancel_discrete`, consumed at
-  `handlers.rs:3698`), and every daemon producer sets it false, so that arm is
-  unreachable outside the vectors — implementing the flag would retire it.
-  Testing-surface only: discrete mining is a `--generate` and regnet/simnet
-  facility.
+#### Accepted: the port matches dcrd here
+
+Closing one of these would introduce a divergence, which this project treats as
+a security bug in its own right (SECURITY.md, *Scope*). They are recorded
+because the behaviour is worth knowing about -- an unbounded structure, a
+resource cost, a deliberate departure that is settled -- not because anyone
+should act on them. Where a bullet reads like a complaint, the complaint is
+against upstream and the port is faithful.
 
 - **Panic policy: abort, deliberately unlike dcrd.** `sync.Mutex` does not
   poison and dcrd recovers per goroutine, so a panicking goroutine there
@@ -205,6 +196,7 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   makes the remaining `catch_unwind` guards inert in release. Pinned by
   `crates/dcroxide-node/tests/panic_policy.rs`, which fails if the
   setting is dropped. Operators must run under a supervisor.
+
 - **`dbCache` overlay layering.** dcrd's `dbCache` is an immutable treap, so
   a reader's snapshot is O(1) and shares structure with the writer. The port
   reaches the same property with a layered overlay rather than a treap: an
@@ -228,6 +220,7 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   already merged away, and those bytes stay allocated until the reader drops
   — uncounted, because they belong to a transaction's lifetime rather than
   the overlay's, which is where dcrd's accounting draws the same line.
+
 - **One redb table where dcrd has two databases, at 1.738x its own payload
   against goleveldb's 1.081x.** dcrd keeps chain metadata in a goleveldb at
   `<datadir>/blocks_ffldb/metadata` and the utxo set in a second goleveldb at
@@ -305,6 +298,7 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   measurement record: both data directories side by side, the four-way
   throughput matrix, the per-bucket payload breakdown, the compaction and
   rebuild results, and the redb 2.6.3 mechanisms that bound the fill.
+
 - **The exists-address index answers queries off its mutex.** dcrd's
   `ExistsAddress`/`ExistsAddresses` take no index-wide lock: they open a
   database view directly and take `unconfirmedLock` only for the mempool
@@ -322,6 +316,7 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   index guard before opening its write transaction rather than after, so
   nothing waits on another lock while holding the writer semaphore. Pinned
   by `dcroxide-node/tests/b6_indexlock.rs`.
+
 - **The websocket notification pipeline is unbounded, as dcrd's is.** Two
   accumulators sit between a chain event and a client's socket: the manager's
   `std::sync::mpsc::channel()` (`websocket.rs` 146) and the per-client
@@ -404,6 +399,7 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   ignores on `discreteMining`. Splitting that pair across two atomics turns both
   into check-then-act, and two concurrent RPC threads can each pass; the port
   keeps them as one `MiningMode` struct behind one lock.
+
 - **The RPC read is sliced for the same reason the peer read is.** dcrd's
   handlers are goroutines, so closing a connection makes the handler's `Read`
   return on any platform; the port's handlers are OS threads, and the
@@ -423,6 +419,7 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   continues, because otherwise any client that paused mid-request would be cut
   off. Pinned by `a_client_that_pauses_mid_request_is_still_served`, verified to
   fail when that arm is removed.
+
 - **The port answers to its own name throughout.** Data directory
   `~/.dcroxide` (`$LOCALAPPDATA/Dcroxide`, `~/Library/Application
   Support/Dcroxide`), config file `dcroxide.conf`, and environment defaults
@@ -445,6 +442,7 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   byte, by rendering the vector comparison with dcrd's names; what the
   production help advertises is pinned separately, so help that named a
   variable the daemon ignores would fail the suite.
+
 - **A half-present RPC cert pair is not regenerated.** dcrd guards `genCertPair`
   with `!keyFileExists && !certFileExists` (`server.go` 3846), so with one file
   present it generates nothing and startup fails on the missing one. The port
@@ -461,6 +459,79 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   rather than `std::fs::write`'s 0666, which under a permissive umask would
   leave it group- and world-writable — an integrity question, since anyone able
   to write it can swap the identity the node serves.
+
+- **`--maxsameip` keys on the exact IP**, so an IPv6 /64 can occupy every
+  connection slot. Exact dcrd parity (`connmanager.go` 685); the rate limiter
+  groups by /64 but the per-host permit does not.
+
+- **`banned_hosts` grows without bound**, reclaimed only lazily on reconnect
+  from that exact host. Exact dcrd parity (`server.go` 2201). The analogous
+  structure at `ratelimiter.rs` is bounded at `MAX_GROUP_LIMITERS`; the same
+  pattern applies here.
+
+- **Decode capacity hints are sized from the 32 MiB global constant**
+  (`msgtx.rs`), so a 10-byte `tx` reserves ~142 MiB of address space inside a
+  frame capped at 1.25 MiB. Exact dcrd parity (`msgtx.go` 641-678, which
+  reserves more), uncommitted, and one shot per connection because the ensuing
+  short read ends it. (That read is not bannable: it carries no
+  `wire.ErrorCode`, so dcrd disconnects without banning and so does this.) Real only under `RLIMIT_AS`,
+  `vm.overcommit_memory=2`, or 32-bit.
+
+- **`gettxoutsetinfo`'s forced flush takes the chain lock where dcrd takes only
+  its cache lock — deliberately, and this one is settled rather than pending.**
+  The expensive half already matches: the walk of the UTXO set runs with no
+  chain lock held, as dcrd's `backend.FetchStats()` (`utxobackend.go:529`) runs
+  with neither `chainLock` nor `cacheLock`. Only the bounded forced flush ahead
+  of it still holds the whole chain, where dcrd confines it to `cacheLock`
+  (`utxocache.go:794`).
+
+  Moving the port's flush to a cache-only lock would be a regression, not a
+  fix. Both implementations connect a block as commit → flush → publish tip
+  (dcrd `chain.go:728`/`:739`/`:746`; the port `process.rs:2431`/`:2433`/
+  `:2437`), and dcrd reads `bestChain.Tip()` in `FetchUtxoStats`
+  (`utxocache.go:1084`) with no `chainLock`. A stats call landing between the
+  flush and the tip publication therefore force-flushes against the previous
+  tip and leaves a `lastFlushHash` one block behind a backend that already
+  holds the newer block. Neither implementation absorbs a re-applied block on
+  the catch-up replay — dcrd asserts `"view missing input"`
+  (`utxoviewpoint.go:292`, reached from `utxocache.go:1015`) and the port
+  raises the same guard as `Corrupt` — so the node fails to open. In the port
+  the flush, the tip read and the tip publication are all `&mut Chain` and so
+  all under one lock, which closes that window. Splitting the flush out would
+  open it. The port is intentionally stronger than upstream here.
+
+#### Open: the port does not match dcrd here
+
+These are real divergences from the parity pin and someone should eventually
+close them. Each says what upstream does, what the port does instead, and what
+closing it would cost.
+
+- **External-address selection models superseded upstream code.** The port's
+  `NaSubmissionCache` and `resolve_local_address` (`node/src/server.rs`) follow
+  dcrd's `release-v2.1.5`-era `peerState.ResolveLocalAddress`, which the doc
+  comment still cites. Neither that function nor `naSubmissionCache` exists at
+  the parity pin: `036b7090` decides external addresses through
+  `considerReportedAddr` and `considerReportedAddrOutbound` over an LRU bounded
+  by `maxExternalAddrCandidates = 20` (`server.go:96-98`, `:2518`, `:2595`).
+  The machinery is wired, not dead -- `resolve_local_address` is called from
+  `server.rs` and the cache is constructed at startup -- so this is a live
+  subsystem tracking an upstream shape that moved, and re-porting it is a
+  piece of work rather than a deletion. Reported as RVW-012 by an external
+  review of `382864f5`, whose "unwired" label is the one part that does not
+  hold.
+
+- **`generate 0` does not cancel an in-flight discrete mining call.** dcrd
+  keeps a `generateCancelFn` while discrete mining is active and invokes it on
+  the `n == 0` path (`internal/mining/cpuminer/cpuminer.go:159-163`,
+  `:845-851`), so a concurrent `generate 0` stops the running solve. This port
+  has no cancellation handle for the solve, so `generate 0` returns without
+  stopping it. The RPC layer already carries dcrd's error arm for the
+  cancelled case (`server.rs`'s `is_cancel_discrete`, consumed at
+  `handlers.rs:3698`), and every daemon producer sets it false, so that arm is
+  unreachable outside the vectors — implementing the flag would retire it.
+  Testing-surface only: discrete mining is a `--generate` and regnet/simnet
+  facility.
+
 - **RPC TLS material is loaded once and never reloaded.** dcrd hangs a
   `GetConfigForClient` callback off the listener's `tls.Config`
   (`server.go:3796-3822`, `makeReloadableTLSConfig`, wired at `:3860`), so an
@@ -485,6 +556,7 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   trusting a removed issuer, and keeps rejecting a newly added one, until
   restart. Upstream since `488b8163` (2023-07-10), first carried by a dcrd
   release in 2.0.0, so a standing gap rather than a 2.2 delta.
+
 - **Peer teardown polls a flag where dcrd closes the connection.** dcrd ends a
   peer by calling `Disconnect`, which closes the `net.Conn`; Go's runtime makes a
   goroutine blocked in `Read` return on every platform, so the connection's
@@ -493,8 +565,7 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   another handle to the same socket under Winsock, and closing the descriptor out
   from under a reading thread is not expressible without `unsafe`. So each
   connection carries a `transport::Cancel` flag; whoever decides the connection is
-  over — the stall detector, the output loop, the server's own teardown — raises it
-  alongside the socket shutdown, and the read is issued in
+  over raises it alongside the socket shutdown, and the read is issued in
   `READ_POLL_INTERVAL` (1 s) slices so the reader observes it within a second
   instead of whenever its idle budget runs out. Before this, a peer the stall
   detector had already logged as disconnected stayed parked in its receive on
@@ -509,42 +580,20 @@ Tracked rather than hidden; see [SECURITY.md](SECURITY.md).
   `a_quiet_peer_survives_longer_than_one_poll_slice`, both verified to fail when
   their mechanism is removed. The cost is one wake-up per second per idle
   connection (~125 at the default `--maxpeers`).
-- **`--maxsameip` keys on the exact IP**, so an IPv6 /64 can occupy every
-  connection slot. Exact dcrd parity (`connmanager.go` 685); the rate limiter
-  groups by /64 but the per-host permit does not.
-- **`banned_hosts` grows without bound**, reclaimed only lazily on reconnect
-  from that exact host. Exact dcrd parity (`server.go` 2201). The analogous
-  structure at `ratelimiter.rs` is bounded at `MAX_GROUP_LIMITERS`; the same
-  pattern applies here.
-- **Decode capacity hints are sized from the 32 MiB global constant**
-  (`msgtx.rs`), so a 10-byte `tx` reserves ~142 MiB of address space inside a
-  frame capped at 1.25 MiB. Exact dcrd parity (`msgtx.go` 641-678, which
-  reserves more), uncommitted, and one shot per connection because the ensuing
-  short read ends it. (That read is not bannable: it carries no
-  `wire.ErrorCode`, so dcrd disconnects without banning and so does this.) Real only under `RLIMIT_AS`,
-  `vm.overcommit_memory=2`, or 32-bit.
-- **`gettxoutsetinfo`'s forced flush takes the chain lock where dcrd takes only
-  its cache lock — deliberately, and this one is settled rather than pending.**
-  The expensive half already matches: the walk of the UTXO set runs with no
-  chain lock held, as dcrd's `backend.FetchStats()` (`utxobackend.go:529`) runs
-  with neither `chainLock` nor `cacheLock`. Only the bounded forced flush ahead
-  of it still holds the whole chain, where dcrd confines it to `cacheLock`
-  (`utxocache.go:794`).
 
-  Moving the port's flush to a cache-only lock would be a regression, not a
-  fix. Both implementations connect a block as commit → flush → publish tip
-  (dcrd `chain.go:728`/`:739`/`:746`; the port `process.rs:2431`/`:2433`/
-  `:2437`), and dcrd reads `bestChain.Tip()` in `FetchUtxoStats`
-  (`utxocache.go:1084`) with no `chainLock`. A stats call landing between the
-  flush and the tip publication therefore force-flushes against the previous
-  tip and leaves a `lastFlushHash` one block behind a backend that already
-  holds the newer block. Neither implementation absorbs a re-applied block on
-  the catch-up replay — dcrd asserts `"view missing input"`
-  (`utxoviewpoint.go:292`, reached from `utxocache.go:1015`) and the port
-  raises the same guard as `Corrupt` — so the node fails to open. In the port
-  the flush, the tip read and the tip publication are all `&mut Chain` and so
-  all under one lock, which closes that window. Splitting the flush out would
-  open it. The port is intentionally stronger than upstream here.
+  The mechanism is settled; its coverage is not, and that is why this entry
+  sits here rather than under *Accepted*. Only the stall detector, the output
+  loop and `serve_peer`'s own post-input-loop teardown raise the flag, all
+  inside `peerloop.rs`. The server proper does not: `node disconnect`, `node
+  remove` and the sync manager's ban and misbehaviour disconnects
+  (`dispatch.rs`), and the connection manager's `DialedConn::close`
+  (`outbound.rs`), call `shutdown` alone — the exact mechanism this entry says
+  cannot be relied on to abort an in-flight `recv` under Winsock. dcrd routes
+  all of them through `Disconnect`, which closes the connection, so its reader
+  unwinds immediately on every platform. The residue is Windows-only and
+  bounded by whichever write next fails, but it holds the outbound-group slot
+  until then. Raising `Cancel` at those sites is the work.
+
 - **`getwork` cancellation is partial: the queue is abandoned, the holder is
   not, and the hangup signal misses clean TLS closes.** dcrd cancels getwork in
   three places, not one — the semaphore queue (`rpcserver.go:4170-4174`) and
