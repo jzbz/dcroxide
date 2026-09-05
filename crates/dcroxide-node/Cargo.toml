@@ -91,8 +91,14 @@ rustix = { version = "1.1.4", default-features = false, features = ["std", "even
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["event"] }
 
+# The same safe poll the unix arm uses: rustix routes it to WSAPoll on
+# Windows (`backend/libc/winsock_c.rs` aliases `WSAPoll as poll`), and
+# only its `RDHUP` flag is gated away, not `poll` itself.  Every crate
+# this pulls -- rustix, errno, windows-sys -- is already pinned in the
+# lockfile through ctrlc, socket2, tempfile and windows-service.
 [target.'cfg(windows)'.dependencies]
 dcroxide-winsvc = { path = "../dcroxide-winsvc" }
+rustix = { version = "1.1.4", default-features = false, features = ["std", "event"] }
 
 [dev-dependencies]
 dcroxide-dcrec = { path = "../dcroxide-dcrec" }

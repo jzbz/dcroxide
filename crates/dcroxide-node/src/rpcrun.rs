@@ -3735,13 +3735,15 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
 /// SCOPE: the hangup arm fires for a clean TLS close as well as an
 /// abrupt one on every Unix -- `POLLRDHUP` on Linux, FreeBSD and
 /// illumos, `EVFILT_READ`'s `EV_EOF` on macOS and the other kqueue
-/// platforms -- because [`peer_half_closed`] reads the peer's half-close
-/// state rather than what happens to be buffered.  On Windows it fires
-/// for nothing: there is no peek there either, so cancellation is
-/// limited to the shutdown signal.  Since TLS is the default and is
-/// required for any non-localhost bind, that leaves the ordinary case
-/// for Decred tooling on Windows uncovered, and it stays open in
-/// PARITY.  The shutdown arm is unaffected everywhere.
+/// platforms, and `WSAPoll`'s `POLLHUP` on Windows -- because
+/// [`peer_half_closed`] reads the peer's half-close state rather than
+/// what happens to be buffered.
+///
+/// One semantic is unverified and CI decides it: whether `WSAPoll`
+/// reports `POLLHUP` while data is still buffered, which is what the
+/// clean TLS close needs.  If it does not, Windows keeps the
+/// abrupt-close detection the `FIONREAD` arm gives it and the TLS case
+/// stays open in PARITY.  The shutdown arm is unaffected everywhere.
 ///
 /// Neither probe may disturb the socket the handler still owns, which is
 /// why the fallback peeks with `MSG_DONTWAIT` and the poll uses a zero
@@ -3953,10 +3955,65 @@ fn peeked_eof(sock: &TcpStream) -> bool {
     matches!(sock.recv_with_flags(&mut probe, flags), Ok(0))
 }
 
-/// Without a per-call non-blocking flag there is no way to probe the
-/// socket without mutating state the handler's own reads depend on, so
-/// cancellation is limited to the shutdown signal.
-#[cfg(not(unix))]
+/// The Windows half-close probe.
+///
+/// Windows has no `POLLRDHUP`, but `WSAPoll` reports `POLLHUP` when the
+/// peer disconnects gracefully and `POLLHUP | POLLERR` when it aborts,
+/// which is the same "the client is gone" mask the other Unixes read.
+/// rustix reaches it safely: its `poll` is exported unconditionally and
+/// the libc backend aliases `WSAPoll as poll` on Windows, so only the
+/// `RDHUP` flag is unavailable, not the call.
+///
+/// The second arm stands in for [`peeked_eof`], which cannot be written
+/// on Windows: Winsock's `recv` takes `MSG_PEEK` but has no
+/// `MSG_DONTWAIT`, and the socket must stay blocking because the
+/// handler still reads from it through a duplicate that shares its
+/// mode. Asking `FIONREAD` how many bytes are queued answers the same
+/// question without reading and without blocking -- readable with
+/// nothing queued is a FIN.
+///
+/// Conservative in the same way the kqueue arm is, and for the same
+/// reason: nothing here can be exercised on the development host, so
+/// only a positive observation answers and everything else declines.
+#[cfg(windows)]
+fn peer_half_closed(sock: &TcpStream) -> Option<bool> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+    let gone = PollFlags::HUP | PollFlags::ERR;
+    let mut fds = [PollFd::new(sock, PollFlags::RDNORM)];
+    let zero = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    match poll(&mut fds, Some(&zero)) {
+        Ok(_) => {
+            let revents = fds[0].revents();
+            if revents.intersects(gone) {
+                return Some(true);
+            }
+            if revents.intersects(PollFlags::RDNORM)
+                && rustix::io::ioctl_fionread(sock).is_ok_and(|queued| queued == 0)
+            {
+                return Some(true);
+            }
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// Whether the peer has closed its side (see [`peer_half_closed`]).
+///
+/// There is no peek to fall back to here, so the probe answers alone.
+#[cfg(windows)]
+fn client_hung_up(sock: Option<&TcpStream>) -> bool {
+    let Some(sock) = sock else { return false };
+    peer_half_closed(sock).unwrap_or(false)
+}
+
+/// Everywhere else there is no probe at all, so cancellation is limited
+/// to the shutdown signal.
+#[cfg(not(any(unix, windows)))]
 fn client_hung_up(_sock: Option<&TcpStream>) -> bool {
     false
 }
@@ -5290,7 +5347,7 @@ mod tests {
     }
 
     /// A connected loopback pair, with the accepted server side first.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn loopback_pair() -> (TcpStream, TcpStream) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
@@ -5324,22 +5381,25 @@ mod tests {
     /// wrong the test fails loudly on macOS instead of the arm quietly
     /// doing nothing.
     #[test]
-    #[cfg(all(
-        unix,
-        any(
-            target_os = "freebsd",
-            target_os = "illumos",
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "tvos",
-            target_os = "watchos",
-            target_os = "visionos",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "dragonfly",
-            all(
-                any(target_os = "linux", target_os = "android"),
-                not(any(target_arch = "sparc", target_arch = "sparc64"))
+    #[cfg(any(
+        windows,
+        all(
+            unix,
+            any(
+                target_os = "freebsd",
+                target_os = "illumos",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "watchos",
+                target_os = "visionos",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+                all(
+                    any(target_os = "linux", target_os = "android"),
+                    not(any(target_arch = "sparc", target_arch = "sparc64"))
+                )
             )
         )
     ))]
@@ -5356,14 +5416,19 @@ mod tests {
         // level-triggered, so this only has to be long enough once.
         std::thread::sleep(Duration::from_millis(50));
 
+        // The Unix half of the point: the peek cannot see past the
+        // pending bytes, which is why a half-close probe is needed at
+        // all.  Windows has no peek to contrast with.
+        #[cfg(unix)]
         assert!(
             !peeked_eof(&server),
-            "the peek must find the pending bytes, not the FIN --              if this fails the test is no longer covering the TLS shape"
+            "the peek must find the pending bytes, not the FIN -- if this \
+             fails the test is no longer covering the TLS shape"
         );
         assert_eq!(
             peer_half_closed(&server),
             Some(true),
-            "RDHUP must report the half-close that the peek missed"
+            "the half-close probe must report what a peek cannot see"
         );
         assert!(
             client_hung_up(Some(&server)),
@@ -5374,7 +5439,7 @@ mod tests {
     /// The abrupt close that already worked, which must keep working:
     /// a FIN with nothing buffered ahead of it.
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn a_bare_hangup_is_still_seen() {
         let (server, client) = loopback_pair();
         client
@@ -5382,6 +5447,9 @@ mod tests {
             .expect("half-close");
         std::thread::sleep(Duration::from_millis(50));
 
+        // The peek is the Unix mechanism; Windows answers the same
+        // question through FIONREAD inside `peer_half_closed`.
+        #[cfg(unix)]
         assert!(peeked_eof(&server), "a bare FIN peeks as zero-length");
         assert!(
             client_hung_up(Some(&server)),
@@ -5395,7 +5463,7 @@ mod tests {
     /// in Go's net/http: a byte arriving is a pipelined request, and
     /// only a read *error* cancels).
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn a_live_connection_is_not_reported_gone() {
         use std::io::Write;
         let (server, mut client) = loopback_pair();

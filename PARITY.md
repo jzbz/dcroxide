@@ -760,44 +760,59 @@ closing it would cost.
   in its own subprocess -- the `mpchan|` rows of
   `crates/dcroxide-node/tests/data/srvtargetout_vectors.txt`.
 
-- **`getwork` cancellation is complete except on Windows.** dcrd cancels
-  getwork in three places -- the semaphore queue (`rpcserver.go:4170-4174`)
-  and both template waits inside the hold (`:3914`, `:3932`) -- and all three
-  are ported. What was partial is the signal that drives them: detecting that
-  the client has gone.
+- **`getwork` cancellation is complete; one Windows semantic is unverified.**
+  dcrd cancels getwork in three places -- the semaphore queue
+  (`rpcserver.go:4170-4174`) and both template waits inside the hold
+  (`:3914`, `:3932`) -- and all three are ported. What was partial is the
+  signal that drives them: detecting that the client has gone.
 
-  `POLLRDHUP` reports the peer's half-close whatever is buffered ahead of it,
-  which is what a clean TLS close needs -- the peer writes a `close_notify`
-  before the FIN and the handler, blocked in the hold, never reads it, so a
-  `MSG_PEEK` finds bytes and reports the client present. rustix exposes
-  `POLLRDHUP` safely but gates it to Linux, FreeBSD and illumos. macOS is now
-  covered by the kqueue equivalent: `EVFILT_READ` sets `EV_EOF` once the peer
-  shuts down its writing side, and nix exposes `Kqueue::kevent` as a safe
-  `pub fn` where rustix's is `pub unsafe fn`. nix was already a dependency
-  through ctrlc and its `event` feature is an empty list, so this added no
-  crate -- one line of lockfile.
+  A `MSG_PEEK` cannot answer it, because a TLS peer writes a `close_notify`
+  before the FIN and the handler, blocked in the hold, never reads it, so the
+  peek finds bytes rather than a zero-length read. The probe has to read the
+  peer's half-close state instead, and there is now one on every platform the
+  port builds for: `POLLRDHUP` through rustix on Linux, FreeBSD and illumos;
+  `EVFILT_READ`'s `EV_EOF` through nix's safe `Kqueue::kevent` on macOS and
+  the other BSDs; and `WSAPoll`'s `POLLHUP`/`POLLERR` through rustix on
+  Windows, with `FIONREAD` standing in for the peek that Winsock cannot
+  express. None of it needed a new crate.
 
-  That arm is verified by CI rather than here, and the distinction matters.
-  The development host is Linux, so it cannot be exercised locally at all,
-  and the macOS VM was unreachable when this landed. Its API usage was
-  checked by cross-compiling the function verbatim for `aarch64-apple-darwin`
-  in a standalone probe -- which caught one real error Linux could not,
-  `kevent` taking a `libc::timespec` rather than nix's `TimeSpec` wrapper --
-  but that proves types, not runtime semantics. The claim actually at risk is
-  that `EV_EOF` is reported while data is still buffered, and
-  `a_hangup_behind_pending_bytes_is_seen` now runs on the kqueue platforms
-  precisely so CI settles it: if the assumption is wrong the test fails
-  loudly on macOS. The arm is also written to only ever add detection --
-  only an observed `EV_EOF` answers, anything else defers to the peek -- so
-  a wrong assumption costs a red test, never a behaviour regression.
+  An earlier version of this entry claimed no safe Windows probe existed,
+  because "socket2's `WSAPoll` use is `pub(crate)` and rustix's poll is
+  `cfg(not(windows))`". The first half is true; the second is false, and it
+  was the load-bearing half. rustix exports `poll` unconditionally
+  (`event/mod.rs:16`, `:32`, neither carrying a cfg, in visible contrast to
+  the `#[cfg(bsd)]` on `kqueue`) and its libc backend aliases `WSAPoll as
+  poll` on Windows (`backend/libc/winsock_c.rs:36`). Only the `RDHUP` flag is
+  gated away, not the call. `ioctl_fionread` is likewise excluded only for
+  espidf, horizon and vita.
 
-  Windows keeps the older behaviour, and there the hangup arm fires for
-  nothing at all, since even the peek is unavailable. Winsock has no
-  `MSG_DONTWAIT`, `set_nonblocking` mutates state the handler's own reads
-  share through the cloned handle, and no crate in the tree exposes a
-  readability probe safely -- socket2's `WSAPoll` use is `pub(crate)` and
-  rustix's poll is `cfg(not(windows))`. Closing it wants a safe `WSAPoll`
-  wrapper, or a Windows-specific dependency the tree does not yet carry. The
-  shutdown arm works everywhere, and `getwork` over the websocket transport
-  still installs no token; `scope_request_cancel` is called only from the
-  HTTP path.
+  What remains genuinely unverified is one semantic, and it is the same shape
+  on both platforms the development host cannot run: whether the half-close
+  is reported while data is still buffered. For kqueue that is now settled
+  from primary sources -- FreeBSD's `filt_soread` computes `kn_data` and then
+  takes the `SBS_CANTRCVMORE` branch setting `EV_EOF` without testing the
+  byte count, and XNU's `filt_soread_common` does the same. For `WSAPoll` it
+  is not: MSDN documents `POLLHUP` on a graceful peer disconnect, but not
+  whether it fires behind pending data, and Windows has no `RDHUP` in the
+  WSAPoll vocabulary at all. The kernel's real equivalent,
+  `AFD_POLL_DISCONNECT`, is reachable only through the undocumented
+  `\Device\Afd` IOCTL that mio and polling drive with unsafe FFI.
+
+  So `a_hangup_behind_pending_bytes_is_seen` runs on the kqueue platforms and
+  on Windows, and CI settles it. If `POLLHUP` does not fire behind buffered
+  data the test fails loudly on Windows and the TLS case there stays open,
+  while the `FIONREAD` arm still gives Windows the abrupt-close detection it
+  previously lacked entirely. Both untestable arms answer only a positive
+  observation and decline otherwise, so a wrong assumption costs a red test
+  rather than a behaviour regression.
+
+  The eventual platform-independent answer is not a better socket probe but
+  `rustls::IoState::peer_has_closed` (`common_state.rs:841`), which sees the
+  `close_notify` itself. It is unreachable today because the handler owns the
+  `ServerConnection` and is parked in the hold, so nothing is driving
+  `process_new_packets`; reaching it means restructuring who reads the TLS
+  session during a getwork hold.
+
+  The shutdown arm works everywhere, and `getwork` over the websocket
+  transport still installs no token; `scope_request_cancel` is called only
+  from the HTTP path.
