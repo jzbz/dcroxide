@@ -401,6 +401,7 @@ impl NodeCpuMiner {
         template_hash: Hash,
         target_height: i64,
         cancel: Arc<AtomicBool>,
+        generate_cancel: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         let quit = Arc::clone(&self.quit);
         let chain = Arc::clone(&self.chain);
@@ -417,6 +418,7 @@ impl NodeCpuMiner {
                 template_hash,
                 target_height,
                 cancel,
+                generate_cancel,
                 quit,
                 chain,
                 sync_manager,
@@ -931,6 +933,15 @@ struct SolveJob {
     template_hash: Hash,
     target_height: i64,
     cancel: Arc<AtomicBool>,
+    /// The discrete call's own cancellation, so a `generate 0` reaches
+    /// the worker as promptly as it reaches the loop.
+    ///
+    /// dcrd derives the solve context from the generate context --
+    /// `solveCtx, cancel := context.WithCancel(genCtx)` -- so cancelling
+    /// the latter cancels the former at once. Without this the worker
+    /// would keep hashing until the loop noticed and stopped it, and
+    /// could submit in between a block dcrd would have suppressed.
+    generate_cancel: Arc<AtomicBool>,
     quit: Arc<AtomicBool>,
     chain: Arc<Mutex<Chain>>,
     sync_manager: Arc<Mutex<NodeSyncManager>>,
@@ -960,8 +971,13 @@ fn solve_and_submit(mut job: SolveJob) {
     };
 
     let cancel = Arc::clone(&job.cancel);
+    let generate_cancel = Arc::clone(&job.generate_cancel);
     let quit = Arc::clone(&job.quit);
-    let mut should_cancel = move || cancel.load(Ordering::Acquire) || quit.load(Ordering::Acquire);
+    let mut should_cancel = move || {
+        cancel.load(Ordering::Acquire)
+            || generate_cancel.load(Ordering::Acquire)
+            || quit.load(Ordering::Acquire)
+    };
 
     let mut now_micros = || start.elapsed().as_micros() as u64;
 
@@ -981,7 +997,10 @@ fn solve_and_submit(mut job: SolveJob) {
     // Avoid submitting a solution found in the window between a stop
     // signal and the worker actually stopping, or one that would extend
     // the chain past the target height (dcrd's two post-solve guards).
-    if job.cancel.load(Ordering::Acquire) || job.quit.load(Ordering::Acquire) {
+    if job.cancel.load(Ordering::Acquire)
+        || job.generate_cancel.load(Ordering::Acquire)
+        || job.quit.load(Ordering::Acquire)
+    {
         return;
     }
     {
@@ -1122,6 +1141,7 @@ impl RpcCpuMiner for NodeCpuMiner {
                         template_hash,
                         target_height,
                         Arc::clone(&cancel),
+                        Arc::clone(&generate_cancel),
                     );
                     solve = Some((handle, cancel));
                 }

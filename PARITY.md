@@ -633,6 +633,24 @@ against upstream and the port is faithful.
   port previously carried a paraphrase there, harmless only because no
   reachable path reached that arm.
 
+  The cancellation reaches the solve worker as well as the loop, because
+  dcrd's does: `solveCtx, cancel := context.WithCancel(genCtx)` makes the
+  worker's context a child of the generate context, so cancelling the latter
+  stops the former at once, and dcrd checks it both inside the hash loop and
+  again after a solution is found, to suppress one discovered between the
+  signal and the stop. The port passes the same flag into `SolveJob` and
+  reads it at both points, alongside the per-solve flag that was already
+  there. Without it the worker would keep hashing until the loop noticed and
+  stopped it, and could submit in that window a block dcrd would have
+  suppressed.
+
+  That last half has no automated control, which is worth stating rather
+  than implying otherwise. The window is bounded by one
+  `CANCEL_POLL_INTERVAL`, and measured on this harness no block lands inside
+  it either way -- solving a regnet template takes longer than 50ms -- so an
+  assertion on chain height would pass with the guard removed and prove
+  nothing. It is verified by construction against dcrd's two checks instead.
+
   What still differs is timing, bounded and small: dcrd's `select` wakes at
   once on `genCtx.Done()` while the port notices within one
   `CANCEL_POLL_INTERVAL` (50ms) of the template wait it is sitting in.
