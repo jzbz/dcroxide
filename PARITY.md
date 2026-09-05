@@ -662,6 +662,61 @@ These are real divergences from the parity pin and someone should eventually
 close them. Each says what upstream does, what the port does instead, and what
 closing it would cost.
 
+- **Websocket requests are serviced on the reading thread, so nothing else on
+  that connection moves while one runs.** dcrd gives each websocket client
+  three goroutines -- `inHandler`, `notificationQueueHandler` and `outHandler`
+  (`rpcwebsocket.go:1998-2011`) -- and services a non-batched command by
+  acquiring a per-client semaphore of capacity `RPCMaxConcurrentReqs` and then
+  spawning (`:1549-1553`), so the read loop keeps reading and `outHandler`
+  keeps writing while the handler runs. Batched requests it services inline
+  (`:1748`). The port collapses all three into one poll loop: `serve_websocket`
+  drains the outbound queue, reads with a 50ms timeout (`WS_POLL_INTERVAL`),
+  and dispatches inline. `wsframe.rs:41-49` names that as the translation, so
+  this is a chosen shape rather than an oversight.
+
+  The consequences are latency, never incorrectness, and they are confined to
+  the client issuing the slow request -- an earlier fix already stopped the
+  client mutex being held across a wait, which had stalled the fan-out to every
+  other client. They also need admin credentials: `rescan` is in `rpcLimited`
+  on both sides but `loadtxfilter` is not, so a limited client's rescan has no
+  filter to match and nothing else it may call runs long.
+
+  * No notification reaches a client while one of its own requests is in
+    flight, bounded by that request's duration: 5.5s for a `getwork` waiting on
+    a known template, unbounded for the template wait above it, and as long as
+    the block list for a `rescan`. A miner on `notifywork` gets the work
+    notification for a block no sooner than the reply to its own submission.
+  * Two requests on one connection serialise where dcrd runs up to
+    `RPCMaxConcurrentReqs`. Mining barely notices, since `workState.workSem` is
+    `makeSemaphore(1)` node-wide and serialises `getwork` anyway.
+  * A client that hangs up mid-request goes unnoticed until it ends -- the
+    other side of the cancellation gap recorded above.
+
+  Closing it was weighed and declined. Spawning per request means the reply no
+  longer belongs to the reading thread, so it routes through the outbound
+  queue and inherits up to the same 50ms, where today it is written
+  immediately and where dcrd's `outHandler` writes on channel receipt. That
+  trades the stall for a new divergence in the other direction, on every
+  reply. Avoiding it needs the worker to write directly, which needs the write
+  half shared with the reader; under TLS both are one `rustls::StreamOwned`
+  that cannot be split, so it becomes a mutex the reader must not hold across
+  its blocking read -- a transport rewrite, owed to latency behind admin
+  credentials. If revisited, the narrower shape is a per-connection writer
+  thread, dcrd's `outHandler` one for one: it closes the first point with no
+  semaphore, no reply reordering and no thread per request, and leaves the
+  rest.
+
+  `rpcmaxconcurrentreqs` is parsed and validated against dcrd's `< 0` rule
+  (`config.rs:1891`; `config.go:1070`) and then consumed nowhere, because
+  there is no per-client semaphore for it to size. Wiring it alone would be
+  theatre: with synchronous dispatch its only faithful value is 1. It also
+  hides a divergence where the port is the safer of the two, which is still a
+  divergence -- `makeSemaphore` is `make(chan struct{}, n)` and `acquire` a
+  bare send (`rpcwebsocket.go:62-67`), so at capacity 0 the channel is
+  unbuffered and the send never completes. `--rpcmaxconcurrentreqs=0` wedges
+  every websocket request in dcrd forever, and dcrd accepts the value because
+  it checks only for negatives. The port serves them normally.
+
 - **The RPC server issues no session tickets, so it never resumes.** Go's
   server resumes only from tickets, and dcrd leaves ticketing at its
   defaults. rustls's default ticketer is `NeverProducesTickets`
@@ -875,52 +930,3 @@ closing it would cost.
   wires `block_templater: None`. The guard's per-request semantics are pinned
   by `the_cancel_scope_does_not_leak_across_requests`; the line installing it
   is verified by construction.
-
-  Two dead ends are recorded so nobody walks back into them. Detection by
-  inspecting the peeked bytes cannot work: TLS 1.3 wraps an alert in outer
-  content type 23, so an encrypted `close_notify` is indistinguishable from
-  application data. And a pipelined request is deliberately not treated as a
-  hangup -- Go's `net/http` says so explicitly and cancels only on a read
-  *error* (`server.go:748-771`) -- which is why every arm here reads
-  half-close state rather than treating pending bytes as a signal in either
-  direction. This paragraph was written into the entry by `ac6967b` and lost
-  when `74caff7` rewrote it; that is the sort of deletion the ledger exists
-  to prevent, so it is restored rather than silently reconstructed.
-
-  The eventual platform-independent answer is not a better socket probe but
-  `rustls::IoState::peer_has_closed` (`common_state.rs:841`), which sees the
-  `close_notify` itself. It is unreachable today because the handler owns the
-  `ServerConnection` and is parked in the hold, so nothing is driving
-  `process_new_packets`; reaching it means restructuring who reads the TLS
-  session during a getwork hold.
-
-  The shutdown arm works everywhere, including over the websocket transport,
-  which now installs a token of its own -- and installs only the shutdown
-  signal, deliberately.
-
-  dcrd services a websocket command through the same handlers as HTTP:
-  `serviceRequest` falls through to `standardCmdResult(ctx, r)` for any method
-  not in its websocket-only table (`rpcwebsocket.go:1807-1819`), and getwork
-  is not in that table. The context it passes is the UPGRADE request's
-  (`rpcserver.go:6041`), which descends from the server's through
-  `BaseContext` (`rpcserver.go:5921-5927`) and so is cancelled on shutdown.
-  It is not cancelled when the websocket client goes away: the upgrade
-  hijacks the connection, and Go's `hijackLocked` calls `abortPendingRead`
-  (`net/http/server.go:318-322`), stopping the background read that is the
-  only thing that would cancel it. dcrd's own comment beside `BaseContext`
-  says handlers can "react to both client disconnects as well as shutdown",
-  which holds for plain HTTP and not for a hijacked websocket.
-
-  So the port installs the shutdown flag and nothing else at the one dispatch
-  point in the websocket loop. Reusing the HTTP path's watchdog would have
-  cancelled on hangup too, which sounds like an improvement and is a
-  divergence: it would abandon work dcrd runs to completion.
-
-  That one line has no automated test, which is worth stating rather than
-  implying otherwise. The guard's per-request semantics are already pinned by
-  `the_cancel_scope_does_not_leak_across_requests`, but observing the flag
-  through a websocket needs a request already in flight when shutdown is
-  raised -- the loop checks shutdown before its next read, so a request sent
-  afterwards is never dispatched -- and getwork itself is not callable in the
-  websocket harness, which wires `block_templater: None`. It is verified by
-  construction instead.
