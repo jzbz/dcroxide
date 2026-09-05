@@ -3463,7 +3463,7 @@ pub(crate) fn strip_port(host_port: &str) -> String {
 /// serve the websocket upgrade at `/ws` or process one JSON-RPC POST
 /// (dcrd's HTTP handler routing between `/` and `/ws`).
 #[allow(clippy::too_many_arguments)]
-fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
+fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
     mut stream: S,
     server: &Arc<Server<NodeRpcChain>>,
     ntfn: &crate::websocket::NodeNtfnMgr,

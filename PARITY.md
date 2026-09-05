@@ -662,60 +662,74 @@ These are real divergences from the parity pin and someone should eventually
 close them. Each says what upstream does, what the port does instead, and what
 closing it would cost.
 
-- **Websocket requests are serviced on the reading thread, so nothing else on
-  that connection moves while one runs.** dcrd gives each websocket client
-  three goroutines -- `inHandler`, `notificationQueueHandler` and `outHandler`
-  (`rpcwebsocket.go:1998-2011`) -- and services a non-batched command by
-  acquiring a per-client semaphore of capacity `RPCMaxConcurrentReqs` and then
-  spawning (`:1549-1553`), so the read loop keeps reading and `outHandler`
-  keeps writing while the handler runs. Batched requests it services inline
-  (`:1748`). The port collapses all three into one poll loop: `serve_websocket`
-  drains the outbound queue, reads with a 50ms timeout (`WS_POLL_INTERVAL`),
-  and dispatches inline. `wsframe.rs:41-49` names that as the translation, so
-  this is a chosen shape rather than an oversight.
+- **Websocket requests are still serviced on the reading thread, so one
+  request blocks the next.** dcrd gives each websocket client three
+  goroutines -- `inHandler`, `notificationQueueHandler` and `outHandler`
+  (`rpcwebsocket.go:1998-2011`) -- and services a non-batched command on a
+  fourth, acquiring a per-client semaphore of capacity `RPCMaxConcurrentReqs`
+  and then spawning (`:1549-1553`); batches it services inline (`:1748`). The
+  port now has two of those: a reading loop and a writer thread. Concurrent
+  dispatch was evaluated separately and declined -- routing replies through
+  the queue to make it work would cost every reply the read poll interval,
+  and avoiding that needs the write half split from the read half, which
+  under TLS is one `rustls::StreamOwned` that cannot be split.
 
-  The consequences are latency, never incorrectness, and they are confined to
-  the client issuing the slow request -- an earlier fix already stopped the
-  client mutex being held across a wait, which had stalled the fan-out to every
-  other client. They also need admin credentials: `rescan` is in `rpcLimited`
-  on both sides but `loadtxfilter` is not, so a limited client's rescan has no
-  filter to match and nothing else it may call runs long.
+  The writer thread closes the largest consequence: a notification now
+  reaches a client while one of that client's own requests is still running,
+  which is what `outHandler` gives dcrd. Replies are queued rather than
+  written inline, as dcrd queues its own through `SendMessage`
+  (`:1925-1940`), so one writer drains one queue and output keeps its order.
+  Measured, because the shape invites a latency regression and the first
+  draft had one: thirty sequential round trips average 41.3ms here against
+  41.4ms before the change.
 
-  * No notification reaches a client while one of its own requests is in
-    flight, bounded by that request's duration: 5.5s for a `getwork` waiting on
-    a known template, unbounded for the template wait above it, and as long as
-    the block list for a `rescan`. A miner on `notifywork` gets the work
-    notification for a block no sooner than the reply to its own submission.
+  What remains, all latency rather than incorrectness, and all needing admin
+  credentials -- `rescan` is in `rpcLimited` on both sides but `loadtxfilter`
+  is not, so a limited client's rescan has no filter to match:
+
   * Two requests on one connection serialise where dcrd runs up to
-    `RPCMaxConcurrentReqs`. Mining barely notices, since `workState.workSem` is
+    `RPCMaxConcurrentReqs`. Mining barely notices: `workState.workSem` is
     `makeSemaphore(1)` node-wide and serialises `getwork` anyway.
-  * A client that hangs up mid-request goes unnoticed until it ends -- the
-    other side of the cancellation gap recorded above.
+  * A client that hangs up mid-request goes unnoticed until it ends, since
+    nothing is reading -- the other side of the cancellation gap above.
+  * A reply queues behind a notification backlog. dcrd's does not:
+    `notificationQueueHandler` keeps a `pendingNtfns` list and promotes only
+    one notification into `sendChan` at a time (`:1849-1863`), so a reply
+    overtakes the rest. Reproducing that means a third concurrent structure,
+    and it was judged not worth adding to an area that had already produced
+    a writer-starvation bug during this change. Reachable only behind a deep
+    backlog, which needs a client that has stopped reading.
 
-  Closing it was weighed and declined. Spawning per request means the reply no
-  longer belongs to the reading thread, so it routes through the outbound
-  queue and inherits up to the same 50ms, where today it is written
-  immediately and where dcrd's `outHandler` writes on channel receipt. That
-  trades the stall for a new divergence in the other direction, on every
-  reply. Avoiding it needs the worker to write directly, which needs the write
-  half shared with the reader; under TLS both are one `rustls::StreamOwned`
-  that cannot be split, so it becomes a mutex the reader must not hold across
-  its blocking read -- a transport rewrite, owed to latency behind admin
-  credentials. If revisited, the narrower shape is a per-connection writer
-  thread, dcrd's `outHandler` one for one: it closes the first point with no
-  semaphore, no reply reordering and no thread per request, and leaves the
-  rest.
+  Two hazards the shape does have, both handled and worth stating because
+  they are what makes it work rather than incidental. A plain mutex is not
+  fair: the reader releases the stream and immediately asks for it again for
+  another read, barging past a writer already waiting, indefinitely -- that
+  starved notifications outright until the reader was made to wait for the
+  queue to drain first. And the writer parks on a condvar, so the queue is
+  closed from a `Drop` guard rather than a trailing statement, for the reason
+  `ClientRegistration` already documents: an unwind that skipped the close
+  would leave the writer parked and `thread::scope` joining forever.
+  Closing discards what is queued rather than draining it, because dcrd's
+  `Disconnect` closes the socket out from under `sendChan`
+  (`:1981-1990`) -- draining would deliver more than dcrd does and could put
+  a data frame after the close frame already sent.
+
+  The interleaving itself has no end-to-end test. The only lever in the
+  websocket harness that parks a handler is the chain mutex, and the
+  notification fan-out needs it too, through `subscribed_clients` resolving
+  outpoints, so holding it blocks both sides. The queue's contract is pinned
+  by unit tests instead, one of which hangs the suite when the writer's exit
+  is not accounted for.
 
   `rpcmaxconcurrentreqs` is parsed and validated against dcrd's `< 0` rule
   (`config.rs:1891`; `config.go:1070`) and then consumed nowhere, because
-  there is no per-client semaphore for it to size. Wiring it alone would be
-  theatre: with synchronous dispatch its only faithful value is 1. It also
-  hides a divergence where the port is the safer of the two, which is still a
-  divergence -- `makeSemaphore` is `make(chan struct{}, n)` and `acquire` a
-  bare send (`rpcwebsocket.go:62-67`), so at capacity 0 the channel is
-  unbuffered and the send never completes. `--rpcmaxconcurrentreqs=0` wedges
-  every websocket request in dcrd forever, and dcrd accepts the value because
-  it checks only for negatives. The port serves them normally.
+  there is still no per-client semaphore for it to size. That hides a
+  divergence where the port is the safer of the two: `makeSemaphore` is
+  `make(chan struct{}, n)` and `acquire` a bare send
+  (`rpcwebsocket.go:62-67`), so at capacity 0 the channel is unbuffered and
+  the send never completes. `--rpcmaxconcurrentreqs=0` wedges every
+  websocket request in dcrd forever, and dcrd accepts the value because it
+  checks only for negatives. The port serves them normally.
 
 - **The RPC server issues no session tickets, so it never resumes.** Go's
   server resumes only from tickets, and dcrd leaves ticketing at its

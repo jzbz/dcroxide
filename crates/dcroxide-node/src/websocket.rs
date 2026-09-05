@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use dcroxide_chainhash::Hash;
 use dcroxide_dcrjson::{
@@ -83,14 +83,143 @@ struct Subscriptions {
     mix_messages: HashSet<u64>,
 }
 
+/// A client's pending output and the signal that wakes its writer
+/// (dcrd's buffered `sendChan`, which `outHandler` drains at
+/// `rpcwebsocket.go:1896-1922`).
+///
+/// The flag lives under the same mutex as the items so a push cannot
+/// land between the writer finding the queue empty and going to sleep;
+/// that is the wakeup this would otherwise lose.
+#[derive(Default)]
+pub struct OutboundQueue {
+    /// The queued messages and whether the connection has ended.
+    pending: Mutex<Pending>,
+    /// Signalled by every push and by [`OutboundQueue::close`].
+    wake: Condvar,
+}
+
+/// The mutex-guarded half of [`OutboundQueue`].
+#[derive(Default)]
+struct Pending {
+    /// Messages waiting to be written, oldest first.
+    items: VecDeque<String>,
+    /// Set once nothing further will be queued.
+    closed: bool,
+    /// Set when the writer has stopped, so a reader waiting for the
+    /// queue to drain is never left waiting on a writer that is gone.
+    writer_done: bool,
+}
+
+impl OutboundQueue {
+    /// Queue one message and wake the writer.
+    ///
+    /// One writer draining one queue keeps output in the order it was
+    /// queued.
+    ///
+    /// That is NOT quite dcrd, and the difference is recorded in PARITY
+    /// rather than papered over: replies and notifications do both end
+    /// on `sendChan`, but `notificationQueueHandler` holds a
+    /// `pendingNtfns` list and promotes only one notification into it at
+    /// a time (`rpcwebsocket.go:1849-1863`), so upstream a reply can
+    /// overtake a notification backlog. Here it queues behind one.
+    fn push(&self, json: String) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .items
+            .push_back(json);
+        self.wake.notify_all();
+    }
+
+    /// Stop the writer, discarding anything still queued, and wake it if
+    /// it is asleep.
+    ///
+    /// Discarding is dcrd's behaviour, not an economy: `Disconnect`
+    /// closes the connection outright -- `close(c.quit)` then
+    /// `c.conn.Close()` (`rpcwebsocket.go:1981-1990`) -- and whatever
+    /// was still on `sendChan` goes with it. Draining instead would
+    /// deliver more than dcrd does, and would put data frames on the
+    /// wire after the close frame the read loop has already sent, which
+    /// RFC 6455 forbids.
+    fn close(&self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.items.clear();
+        pending.closed = true;
+        drop(pending);
+        self.wake.notify_all();
+    }
+
+    /// Everything queued, waiting until there is something or the queue
+    /// is closed.  `None` means closed and drained, which is the
+    /// writer's signal to return -- so the writer can never park on a
+    /// queue nobody will fill.
+    fn take_all_blocking(&self) -> Option<Vec<String>> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if !pending.items.is_empty() {
+                let batch = pending.items.drain(..).collect();
+                // Wakes a reader waiting for the queue to empty before
+                // it takes the stream back.
+                self.wake.notify_all();
+                return Some(batch);
+            }
+            if pending.closed {
+                return None;
+            }
+            pending = self
+                .wake
+                .wait(pending)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Record that the writer has stopped and wake anyone waiting on it.
+    fn writer_finished(&self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .writer_done = true;
+        self.wake.notify_all();
+    }
+
+    /// Block until the writer has taken everything queued.
+    ///
+    /// The reader calls this before reclaiming the stream, because a
+    /// plain mutex is not fair: releasing it and immediately asking for
+    /// it again lets the reader barge past a writer already waiting,
+    /// and with a 50ms read in between it can do so indefinitely --
+    /// which starved notifications outright rather than merely delaying
+    /// them, as the first draft of this change did. Waiting for the
+    /// drain makes the handoff a fact rather than a hope. Returns at
+    /// once once the writer has stopped, so a failed write cannot wedge
+    /// the reader here.
+    fn wait_until_drained(&self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !pending.items.is_empty() && !pending.writer_done {
+            pending = self
+                .wake
+                .wait(pending)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
 /// One connected client: its shared request state (the ported
 /// `WsClient` with its transaction filter) and the outbound
-/// notification queue its serving loop drains (dcrd's per-client
-/// pending-notification list).
+/// queue its writer drains (dcrd's `sendChan`).
 #[derive(Clone)]
 struct ClientHandle {
     state: Arc<Mutex<WsClient>>,
-    outbound: Arc<Mutex<VecDeque<String>>>,
+    outbound: Arc<OutboundQueue>,
 }
 
 /// A chain or mempool event awaiting fan-out (dcrd's
@@ -256,7 +385,7 @@ impl NodeNtfnMgr {
         &self,
         session_id: u64,
         state: Arc<Mutex<WsClient>>,
-        outbound: Arc<Mutex<VecDeque<String>>>,
+        outbound: Arc<OutboundQueue>,
     ) -> bool {
         let mut clients = self.clients.lock().expect("ws clients");
         if clients.len() >= self.max_websockets {
@@ -320,7 +449,7 @@ impl<'a> ClientRegistration<'a> {
         ntfn: &'a NodeNtfnMgr,
         session_id: u64,
         state: Arc<Mutex<WsClient>>,
-        outbound: Arc<Mutex<VecDeque<String>>>,
+        outbound: Arc<OutboundQueue>,
     ) -> Option<ClientRegistration<'a>> {
         ntfn.add_client(session_id, state, outbound)
             .then(|| ClientRegistration { ntfn, session_id })
@@ -542,11 +671,7 @@ fn deliver_one(
         .collect();
     for (session_id, json) in out {
         if let Some(handle) = by_id.get(&session_id) {
-            handle
-                .outbound
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push_back(json);
+            handle.outbound.push(json);
         }
     }
 }
@@ -595,7 +720,7 @@ fn new_session_id() -> u64 {
 /// `authenticate` before any other command.  The client registers with
 /// the notification manager for delivery, and its outbound queue is
 /// drained whenever the connection goes idle or between requests.
-pub fn serve_websocket<S: Read + Write>(
+pub fn serve_websocket<S: Read + Write + Send>(
     mut stream: S,
     head: &crate::rpcrun::HttpHead,
     pre_authenticated: bool,
@@ -680,7 +805,7 @@ pub fn serve_websocket<S: Read + Write>(
         wsc.is_admin = is_admin;
         wsc
     }));
-    let outbound: Arc<Mutex<VecDeque<String>>> = Arc::default();
+    let outbound: Arc<OutboundQueue> = Arc::default();
     // Register the client, or refuse it when the websocket cap is
     // reached: dropping `stream` closes the connection with no close
     // frame, exactly as dcrd's `conn.Close()` does.  Returning here
@@ -694,8 +819,67 @@ pub fn serve_websocket<S: Read + Write>(
     else {
         return;
     };
-    let mut conn = WsConn::new(stream);
+    // dcrd gives each client an `outHandler` goroutine that owns the
+    // write side and drains `sendChan` (`rpcwebsocket.go:1896-1922`),
+    // which is why a notification reaches a client while one of its own
+    // requests is still running.  This is that goroutine.
+    //
+    // Read and write cannot be split apart here: under TLS the stream is
+    // one `rustls::StreamOwned`, so both share a mutex.  The reader holds
+    // it only across `read_message`, never across a handler, so the
+    // writer runs during a request -- the whole point.  The writer is
+    // scoped rather than detached so it is always joined, and the queue
+    // is closed on every exit so it can never park on a queue nobody
+    // will fill.
+    let conn = Mutex::new(WsConn::new(stream));
+    let write_failed = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while let Some(batch) = outbound.take_all_blocking() {
+                let mut conn = conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                for json in batch {
+                    if conn.write_text(json.as_bytes()).is_err() {
+                        write_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                        drop(conn);
+                        outbound.writer_finished();
+                        return;
+                    }
+                }
+            }
+            outbound.writer_finished();
+        });
+        // Closing from a guard rather than a trailing statement, for
+        // the reason `ClientRegistration` already documents: a panic
+        // anywhere in the read loop that is not caught by the dispatch
+        // guard would otherwise skip the close, leave the writer parked
+        // on the condvar, and hang `thread::scope`'s join forever --
+        // turning an unwind into a stuck connection thread.
+        struct CloseOnExit<'a>(&'a OutboundQueue);
+        impl Drop for CloseOnExit<'_> {
+            fn drop(&mut self) {
+                self.0.close();
+            }
+        }
+        let _close = CloseOnExit(&outbound);
+        serve_ws_reads(&conn, &outbound, &write_failed, &state, server, shutdown);
+    });
+}
 
+/// The read half of the serving loop: dcrd's `inHandler`.
+///
+/// Every reply is queued rather than written here, because dcrd queues
+/// its own through `SendMessage` onto the very channel `outHandler`
+/// drains (`rpcwebsocket.go:1925-1940`).  One writer means replies and
+/// notifications leave in the order they were queued, which two writers
+/// could not promise.
+fn serve_ws_reads<S: Read + Write>(
+    conn: &Mutex<WsConn<S>>,
+    outbound: &Arc<OutboundQueue>,
+    write_failed: &std::sync::atomic::AtomicBool,
+    state: &Arc<Mutex<WsClient>>,
+    server: &Arc<Server<NodeRpcChain>>,
+    shutdown: &Arc<std::sync::atomic::AtomicBool>,
+) {
     loop {
         // A server shutdown ends the connection like dcrd's
         // `close(s.quit)` unblocking every websocket loop; the poll
@@ -703,35 +887,32 @@ pub fn serve_websocket<S: Read + Write>(
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }
-        // Drain queued notifications before waiting for the next
-        // request (the poll-loop translation of dcrd's out handler).
-        let mut write_failed = false;
-        loop {
-            let next = {
-                outbound
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .pop_front()
-            };
-            let Some(json) = next else { break };
-            if conn.write_text(json.as_bytes()).is_err() {
-                write_failed = true;
-                break;
-            }
-        }
-        if write_failed {
+        // A failed write means the connection is gone; the writer saw
+        // it first and this ends the read loop the way the inline write
+        // used to.
+        if write_failed.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }
 
-        let authenticated = client_flags(&state).0;
+        let authenticated = client_flags(state).0;
         let read_limit = if authenticated {
             READ_LIMIT_AUTHENTICATED
         } else {
             READ_LIMIT_UNAUTHENTICATED
         };
-        let message = match conn.read_message(read_limit) {
+        // Hand the stream to the writer before taking it back; see
+        // `wait_until_drained`.
+        outbound.wait_until_drained();
+        // The lock is held for the read and released before dispatch,
+        // so the writer is free while a handler runs.
+        let read = {
+            let mut conn = conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            conn.read_message(read_limit)
+        };
+        let message = match read {
             Ok(WsIn::Text(payload)) => payload,
-            // An idle read wakes the loop to drain notifications.
+            // An idle read just returns to the top of the loop; the
+            // writer, not this thread, delivers what is queued.
             Ok(WsIn::Idle) => continue,
             // A close frame, a clean disconnect, or a protocol error
             // ends the connection.
@@ -774,16 +955,12 @@ pub fn serve_websocket<S: Read + Write>(
                 // carry here; see PARITY for what closing the rest would
                 // take.
                 let _cancel = dcroxide_rpc::worksem::scope_request_cancel(Arc::clone(shutdown));
-                handle_ws_request(server, &state, &body)
+                handle_ws_request(server, state, &body)
             }
             Err(_) => parse_error_outcome(authenticated, "invalid UTF-8"),
         };
         match outcome {
-            WsOutcome::Reply(reply) => {
-                if conn.write_text(reply.as_bytes()).is_err() {
-                    break;
-                }
-            }
+            WsOutcome::Reply(reply) => outbound.push(reply),
             WsOutcome::Skip => {}
             WsOutcome::Disconnect => break,
         }
@@ -1302,6 +1479,80 @@ impl dcroxide_mempool::TSpendReceiver for NodeTSpendReceiver {
 mod tests {
     use super::*;
 
+    /// The handoff the writer thread depends on: the reader waits until
+    /// the writer has taken everything before reclaiming the stream.
+    ///
+    /// Without it a plain mutex lets the reader barge -- release, then
+    /// immediately re-acquire for a 50ms read -- past a writer that is
+    /// already waiting, indefinitely. The first draft of the writer
+    /// thread did exactly that and starved notifications outright.
+    #[test]
+    fn the_reader_waits_for_the_writer_to_take_the_queue() {
+        let queue = Arc::new(OutboundQueue::default());
+        queue.push("first".to_string());
+        queue.push("second".to_string());
+
+        let writer = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.take_all_blocking())
+        };
+        // Returns only once that drain has happened.
+        queue.wait_until_drained();
+        let batch = writer.join().expect("writer").expect("a batch");
+        assert_eq!(
+            batch,
+            vec!["first".to_string(), "second".to_string()],
+            "queue order is preserved, as dcrd's single sendChan preserves it"
+        );
+    }
+
+    /// And it cannot wedge: a writer that has stopped releases the
+    /// reader even with messages still queued, which is what happens
+    /// when a write fails on a dead connection.
+    #[test]
+    fn a_stopped_writer_releases_the_reader() {
+        let queue = OutboundQueue::default();
+        queue.push("undeliverable".to_string());
+        queue.writer_finished();
+        // Would block forever if the writer's exit were not accounted
+        // for; the test harness would hang rather than fail.
+        queue.wait_until_drained();
+    }
+
+    /// Closing wakes a parked writer and tells it to stop, so the
+    /// scoped thread is always joinable.
+    #[test]
+    fn closing_the_queue_stops_a_parked_writer() {
+        let queue = Arc::new(OutboundQueue::default());
+        let writer = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.take_all_blocking())
+        };
+        queue.close();
+        assert!(
+            writer.join().expect("writer").is_none(),
+            "a closed and drained queue is the writer's signal to return"
+        );
+    }
+
+    /// A close DISCARDS what is still queued, as dcrd's `Disconnect`
+    /// does by closing the socket out from under `sendChan`.
+    ///
+    /// Delivering it instead would be more than dcrd delivers, and
+    /// would put a data frame after the close frame the read loop has
+    /// already sent.
+    #[test]
+    fn closing_discards_what_is_still_queued() {
+        let queue = OutboundQueue::default();
+        queue.push("undelivered".to_string());
+        queue.close();
+        assert_eq!(
+            queue.take_all_blocking(),
+            None,
+            "a closed queue hands the writer nothing further to write"
+        );
+    }
+
     #[test]
     fn removing_a_client_clears_every_subscription_except_mix() {
         let mgr = NodeNtfnMgr::new();
@@ -1367,7 +1618,7 @@ mod tests {
     fn an_unwind_past_the_serving_loop_releases_the_registration() {
         // A cap of one makes a leaked slot immediately visible.
         let mgr = NodeNtfnMgr::with_max_websockets(1);
-        let outbound: Arc<Mutex<VecDeque<String>>> = Arc::default();
+        let outbound: Arc<OutboundQueue> = Arc::default();
 
         let unwound = catch_unwind(AssertUnwindSafe(|| {
             let _registration = ClientRegistration::register(
