@@ -708,25 +708,30 @@ fn run(cfg: Config) -> ExitCode {
                     _ => dcroxide_certgen::Curve::P256,
                 },
             )
-            .and_then(|(cert, key)| {
-                // Client certificate authentication demands the CA
-                // roots; dcrd reads the file in `newTLSConfig` and
-                // fails startup when it is missing or empty.
+            .and_then(|(_cert, _key)| {
+                // The pair is on disk by now, generated above when it was
+                // absent.  From here the paths are what matter, not those
+                // bytes: the configuration is rebuilt from the files
+                // whenever they change, so a rotated certificate is served
+                // without a restart.  dcrd does the same, calling
+                // `genCertPair` and then handing `makeReloadableTLSConfig`
+                // the three paths (`server.go:3840-3862`).
+                //
+                // Client certificate authentication demands the CA roots;
+                // dcrd reads the file in `newTLSConfig` and fails startup
+                // when it is missing or empty, and watches it thereafter.
                 let client_cas =
                     if cfg.rpc_auth_type == dcroxide_node::config::AUTH_TYPE_CLIENT_CERT {
-                        match std::fs::read(&cfg.rpc_client_cas) {
-                            Ok(pem) => Some(pem),
-                            Err(e) => {
-                                return Err(format!(
-                                    "unable to read the client CA file {}: {e}",
-                                    cfg.rpc_client_cas
-                                ));
-                            }
-                        }
+                        Some(Path::new(&cfg.rpc_client_cas))
                     } else {
                         None
                     };
-                dcroxide_node::rpcrun::tls_server_config(&cert, &key, client_cas.as_deref())
+                dcroxide_node::rpcrun::reloadable_tls_config(
+                    Path::new(&cfg.rpc_cert),
+                    Path::new(&cfg.rpc_key),
+                    client_cas,
+                    dcroxide_node::rpcrun::RPC_TLS_MIN_RELOAD_CHECK_DELAY,
+                )
             });
             match config {
                 Ok(config) => dcroxide_node::rpcrun::RpcTransport::Tls(config),

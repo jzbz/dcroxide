@@ -575,7 +575,7 @@ fn serves_tls_with_a_generated_certificate() {
     // Generate the certificate pair like the daemon's first start.
     let cert_path = dir.path().join("rpc.cert");
     let key_path = dir.path().join("rpc.key");
-    let (cert_pem, key_pem) = dcroxide_node::rpcrun::load_or_generate_cert_pair(
+    let (cert_pem, _key_pem) = dcroxide_node::rpcrun::load_or_generate_cert_pair(
         &cert_path,
         &key_path,
         &[],
@@ -593,8 +593,16 @@ fn serves_tls_with_a_generated_certificate() {
     .expect("reload cert pair");
     assert_eq!(cert_pem, cert_again);
 
-    let tls = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, None)
-        .expect("build tls config");
+    // The listener takes the reloadable configuration the daemon builds,
+    // reading the pair back from the paths it was just written to, as
+    // dcrd's `makeReloadableTLSConfig` does after `genCertPair`.
+    let tls = dcroxide_node::rpcrun::reloadable_tls_config(
+        &cert_path,
+        &key_path,
+        None,
+        dcroxide_node::rpcrun::RPC_TLS_MIN_RELOAD_CHECK_DELAY,
+    )
+    .expect("build tls config");
 
     // A chain-backed server exactly like the plain-HTTP fixture.
     let opts = Options::new(dir.path().join("blocks"), params.net.0);

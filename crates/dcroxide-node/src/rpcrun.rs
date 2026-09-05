@@ -29,7 +29,7 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -1232,8 +1232,288 @@ impl Drop for HandlerGuard {
 pub enum RpcTransport {
     /// Plain HTTP (`--notls` on localhost).
     Plain,
-    /// TLS with the server certificate (dcrd's default).
-    Tls(Arc<rustls::ServerConfig>),
+    /// TLS with the server certificate (dcrd's default), reloaded from
+    /// disk when the files change.
+    Tls(Arc<ReloadableTlsConfig>),
+}
+
+/// How long dcrd waits between checking the watched certificate files
+/// (`server.go:3803`, `minReloadCheckDelay := 5 * time.Second`).
+pub const RPC_TLS_MIN_RELOAD_CHECK_DELAY: Duration = Duration::from_secs(5);
+
+/// A file watched for updates (dcrd `watchedFile`, `server.go:3602`).
+struct WatchedFile {
+    /// The path, or `None` for a file that is not watched at all --
+    /// dcrd's empty-string path, which `updated` reports unchanged.
+    path: Option<PathBuf>,
+    /// The modification time seen last, or `None` when the platform
+    /// would not report one (dcrd's zero `time.Time`).
+    cur_time: Option<std::time::SystemTime>,
+    /// The size seen last.
+    cur_size: u64,
+}
+
+impl WatchedFile {
+    /// Whether the file changed since the last check, updating the
+    /// remembered details when it did (dcrd `watchedFile.updated`,
+    /// `server.go:3612-3637`).
+    ///
+    /// Two of dcrd's choices are reproduced deliberately. A file that no
+    /// longer exists reports changed *without* refreshing the remembered
+    /// details, so it keeps reporting changed on every later check --
+    /// which makes a deleted certificate retry forever rather than
+    /// latch. Any other stat error reports unchanged, so an unexpected
+    /// failure does not masquerade as a rotation.
+    fn updated(&mut self) -> bool {
+        let Some(path) = self.path.as_ref() else {
+            return false;
+        };
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+        };
+        let size = meta.len();
+        let time = meta.modified().ok();
+        let changed = size != self.cur_size || time != self.cur_time;
+        if changed {
+            self.cur_size = size;
+            self.cur_time = time;
+        }
+        changed
+    }
+}
+
+/// The mutable half of [`ReloadableTlsConfig`], all of it behind the one
+/// mutex dcrd uses (`reloadableTLSConfig.mtx`, `server.go:3640`).
+struct ReloadState {
+    /// The floor on how often the files are stat'd.
+    min_reload_check_delay: Duration,
+    /// The earliest instant at which the files may be checked again.
+    next_reload_check: Instant,
+    /// `rpc.cert`.
+    cert: WatchedFile,
+    /// `rpc.key`.
+    key: WatchedFile,
+    /// `--clientcafile`, watched only under `--authtype=clientcert`.
+    client_cas: WatchedFile,
+    /// The configuration handed to connections right now.
+    cached_config: Arc<rustls::ServerConfig>,
+    /// The last reload error, so an unchanged one is not re-logged.
+    prev_attempt_err: Option<String>,
+    /// The client CA bundle as last loaded, compared by content rather
+    /// than by stat: it decides only whether resumption state may be
+    /// carried across a reload, never whether one happens.
+    client_cas_bytes: Option<Vec<u8>>,
+}
+
+/// A TLS configuration that reloads the server certificate, key and
+/// client CAs when the files behind them change (dcrd
+/// `reloadableTLSConfig`, `server.go:3639-3651`).
+///
+/// dcrd hangs `configFileClient` off `tls.Config.GetConfigForClient`, so
+/// the check runs when a client connects rather than on a timer, and at
+/// most once every [`RPC_TLS_MIN_RELOAD_CHECK_DELAY`]. The port has the
+/// same hook by construction: it builds a `rustls::ServerConnection` per
+/// accepted connection, so [`ReloadableTlsConfig::config_for_client`]
+/// stands exactly where dcrd's callback does.
+///
+/// The one timing difference is that dcrd's callback fires after the
+/// ClientHello and this fires just before it. Nothing here reads the
+/// ClientHello -- dcrd ignores its `*tls.ClientHelloInfo` argument
+/// outright -- so the configuration produced is the same either way.
+/// What does differ is which connections advance the clock: a bare TCP
+/// connection that never speaks TLS consumes a check here where it
+/// would not upstream, so under port-scanner noise a rotation can be
+/// served up to one interval later than dcrd would serve it. Closing
+/// that means driving the accept path through `rustls::Acceptor` to
+/// reach the real ClientHello, which is a good deal more machinery on
+/// the hot path than the bound is worth; it is recorded in PARITY
+/// rather than hidden.
+///
+/// Resumption state is carried across a reload rather than discarded,
+/// because dcrd's survives one: Go resolves ticket keys through
+/// `originalConfig.ticketKeys(configForClient)`, which falls back to
+/// the long-lived outer config when the reloaded one sets none, and
+/// dcrd's never does. It is dropped for the one case where keeping it
+/// would be weaker than dcrd -- a changed client CA bundle -- because
+/// rustls does not re-verify a resumed chain where Go does. See
+/// the reload path's own comment.
+pub struct ReloadableTlsConfig {
+    /// Everything mutable, behind dcrd's single mutex.
+    state: Mutex<ReloadState>,
+}
+
+impl ReloadableTlsConfig {
+    /// The configuration for an arriving connection, reloading first
+    /// when the files changed and enough time has passed (dcrd
+    /// `configFileClient`, `server.go:3708-3736`).
+    ///
+    /// A reload that fails leaves the working configuration in place,
+    /// which is the whole point of the cache: replacing the files with
+    /// malformed data, or deleting them, must not take the RPC server
+    /// down. The warning is suppressed when it repeats the previous
+    /// failure verbatim, so a broken file logs once rather than on
+    /// every connection.
+    pub fn config_for_client(&self) -> Arc<rustls::ServerConfig> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.needs_reload() {
+            return Arc::clone(&state.cached_config);
+        }
+        match state.reload() {
+            Err(e) => {
+                if state.prev_attempt_err.as_deref() != Some(e.as_str()) {
+                    crate::logging::warn(
+                        RPC_LOG_SUBSYSTEM,
+                        &format!(
+                            "RPC certificates modification detected, but existing \
+                             configuration preserved because the certificates failed \
+                             to reload: {e}"
+                        ),
+                    );
+                }
+                state.prev_attempt_err = Some(e);
+            }
+            Ok((config, client_cas)) => {
+                state.prev_attempt_err = None;
+                crate::logging::info(RPC_LOG_SUBSYSTEM, "Reloaded modified RPC certificates");
+                state.cached_config = config;
+                state.client_cas_bytes = client_cas;
+            }
+        }
+        Arc::clone(&state.cached_config)
+    }
+}
+
+impl ReloadState {
+    /// Whether the watched files need re-reading (dcrd `needsReload`,
+    /// `server.go:3662-3671`).
+    ///
+    /// The `||` chain short-circuits, in Rust exactly as in Go, and that
+    /// is observable rather than incidental: when the certificate has
+    /// changed, the key and client CAs are never stat'd on that pass, so
+    /// their remembered details stay stale. Rotating a cert and key
+    /// together therefore reloads twice -- once for the cert, then again
+    /// on the next check when the key finally notices -- and logs twice.
+    /// Statting all three would be tidier and would not be dcrd.
+    fn needs_reload(&mut self) -> bool {
+        let now = Instant::now();
+        if now < self.next_reload_check {
+            return false;
+        }
+        self.next_reload_check = now.checked_add(self.min_reload_check_delay).unwrap_or(now);
+        self.cert.updated() || self.key.updated() || self.client_cas.updated()
+    }
+
+    /// Re-read the watched files into a fresh configuration (dcrd
+    /// `newTLSConfig`, `server.go:3673-3701`), carrying the resumption
+    /// state over unless the trust roots changed.
+    ///
+    /// Carrying it is what keeps the port level with dcrd rather than
+    /// stricter. Go looks up ticket keys with
+    /// `originalConfig.ticketKeys(configForClient)`
+    /// (`handshake_server.go:177`), and because the reloaded config sets
+    /// none of its own it falls through to the long-lived outer config's
+    /// automatically rotated keys (`common.go:1095-1124`) -- so a client
+    /// resuming across a certificate rotation is not forced into a full
+    /// handshake upstream, and must not be here.
+    ///
+    /// Not carrying it when the client CAs changed is what keeps the
+    /// port from being *weaker* than dcrd. Go re-verifies a resumed
+    /// session's stored client chain against the reloaded `ClientCAs`
+    /// and declines to resume when it no longer chains
+    /// (`handshake_server_tls13.go:373-381`); rustls restores
+    /// `peer_certificates` straight from the stored session with no
+    /// verifier call (`server/tls12.rs:289`, `server/tls13.rs:354`), so
+    /// a revoked client would keep resuming on a cache that outlived
+    /// its issuer. Dropping the cache for exactly that case reaches
+    /// dcrd's outcome -- revocation takes effect at once -- by the only
+    /// means rustls offers.
+    fn reload(&self) -> Result<(Arc<rustls::ServerConfig>, Option<Vec<u8>>), String> {
+        let read = |watched: &WatchedFile| -> Result<Option<Vec<u8>>, String> {
+            let Some(path) = watched.path.as_ref() else {
+                return Ok(None);
+            };
+            std::fs::read(path)
+                .map(Some)
+                .map_err(|e| format!("unable to read {}: {e}", path.display()))
+        };
+        let cert = read(&self.cert)?.ok_or_else(|| "no RPC certificate path".to_string())?;
+        let key = read(&self.key)?.ok_or_else(|| "no RPC key path".to_string())?;
+        let client_cas = read(&self.client_cas)?;
+        let mut config = build_server_config(&cert, &key, client_cas.as_deref())?;
+        if client_cas == self.client_cas_bytes {
+            config.session_storage = Arc::clone(&self.cached_config.session_storage);
+            config.ticketer = Arc::clone(&self.cached_config.ticketer);
+        }
+        Ok((Arc::new(config), client_cas))
+    }
+}
+
+/// Build the reloadable TLS configuration from the configured paths
+/// (dcrd `makeReloadableTLSConfig`, `server.go:3796-3822`).
+///
+/// `client_cas` is supplied only under `--authtype=clientcert`, matching
+/// the empty path dcrd passes for every other auth type
+/// (`server.go:3856-3859`).
+///
+/// Startup fails when the initial load does, exactly as dcrd's does; it
+/// is only *later* failures that preserve the cached configuration. The
+/// remembered file details are primed here -- all three unconditionally,
+/// where the check itself short-circuits -- and the first
+/// check is put a full delay out, so a file rewritten within the first
+/// few seconds of uptime is not noticed until then.
+pub fn reloadable_tls_config(
+    cert_path: &Path,
+    key_path: &Path,
+    client_cas_path: Option<&Path>,
+    min_reload_check_delay: Duration,
+) -> Result<Arc<ReloadableTlsConfig>, String> {
+    let cert = std::fs::read(cert_path)
+        .map_err(|e| format!("unable to read {}: {e}", cert_path.display()))?;
+    let key = std::fs::read(key_path)
+        .map_err(|e| format!("unable to read {}: {e}", key_path.display()))?;
+    let client_cas = match client_cas_path {
+        Some(path) => Some(
+            std::fs::read(path).map_err(|e| format!("unable to read {}: {e}", path.display()))?,
+        ),
+        None => None,
+    };
+    let cached_config = tls_server_config(&cert, &key, client_cas.as_deref())?;
+
+    let now = Instant::now();
+    let mut state = ReloadState {
+        min_reload_check_delay,
+        next_reload_check: now.checked_add(min_reload_check_delay).unwrap_or(now),
+        cert: WatchedFile {
+            path: Some(cert_path.to_path_buf()),
+            cur_time: None,
+            cur_size: 0,
+        },
+        key: WatchedFile {
+            path: Some(key_path.to_path_buf()),
+            cur_time: None,
+            cur_size: 0,
+        },
+        client_cas: WatchedFile {
+            path: client_cas_path.map(Path::to_path_buf),
+            cur_time: None,
+            cur_size: 0,
+        },
+        cached_config,
+        prev_attempt_err: None,
+        client_cas_bytes: client_cas,
+    };
+    // Prime the file details, as dcrd does at `server.go:3814-3817`.
+    state.cert.updated();
+    state.key.updated();
+    state.client_cas.updated();
+
+    Ok(Arc::new(ReloadableTlsConfig {
+        state: Mutex::new(state),
+    }))
 }
 
 /// Build the rustls server configuration from the PEM certificate
@@ -1246,11 +1526,11 @@ pub enum RpcTransport {
 /// certificate chaining to those roots, and a file holding no usable
 /// certificate is a hard startup error rather than a silently
 /// unauthenticated endpoint.
-pub fn tls_server_config(
+fn build_server_config(
     cert_pem: &[u8],
     key_pem: &[u8],
     client_cas_pem: Option<&[u8]>,
-) -> Result<Arc<rustls::ServerConfig>, String> {
+) -> Result<rustls::ServerConfig, String> {
     use rustls::pki_types::pem::PemObject;
     // Pin the process-level crypto provider: both bundled providers
     // are compiled in through the dependency tree, and rustls requires
@@ -1286,7 +1566,23 @@ pub fn tls_server_config(
     let config = builder
         .with_single_cert(certs, key)
         .map_err(|e| format!("unable to build the RPC TLS configuration: {e}"))?;
-    Ok(Arc::new(config))
+    Ok(config)
+}
+
+/// Build the rustls server configuration from the PEM certificate
+/// pair, wrapped for sharing across connections (dcrd loading
+/// `rpc.cert`/`rpc.key` into its `tls.Config`).
+///
+/// `client_cas_pem` carries the contents of `--clientcafile` and is
+/// supplied only under `--authtype=clientcert`, exactly like dcrd's
+/// `newTLSConfig`, which passes an empty path for every other auth
+/// type.
+pub fn tls_server_config(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    client_cas_pem: Option<&[u8]>,
+) -> Result<Arc<rustls::ServerConfig>, String> {
+    build_server_config(cert_pem, key_pem, client_cas_pem).map(Arc::new)
 }
 
 /// The system environment for certificate generation: the clock, the
@@ -1945,8 +2241,11 @@ fn accept_loop(
                             );
                         });
                     }
-                    RpcTransport::Tls(config) => {
-                        let config = Arc::clone(config);
+                    RpcTransport::Tls(reloadable) => {
+                        // dcrd's `GetConfigForClient` hook: the check for
+                        // rotated certificates happens here, once per
+                        // arriving connection (`server.go:3708`).
+                        let config = reloadable.config_for_client();
                         let _ = thread::Builder::new().spawn(move || {
                             let _guard = guard;
                             // A session that cannot be built returns
@@ -4828,6 +5127,47 @@ mod tests {
             Some(format!("{message} (4 more suppressed)").as_str()),
             "the next line accounts for the events the flood cost"
         );
+    }
+
+    /// dcrd's `watchedFile` reports a file that no longer exists as
+    /// changed *without* refreshing the remembered details
+    /// (`server.go:3626-3628` returns before the refresh at `:3634`), so
+    /// it keeps reporting changed on every later check instead of
+    /// latching. A deleted certificate therefore retries on every
+    /// connection until it comes back, rather than going quiet.
+    #[test]
+    fn a_missing_watched_file_keeps_reporting_changed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("watched");
+        std::fs::write(&path, b"contents").expect("write");
+
+        let mut watched = WatchedFile {
+            path: Some(path.clone()),
+            cur_time: None,
+            cur_size: 0,
+        };
+        assert!(watched.updated(), "the first check primes the details");
+        assert!(!watched.updated(), "an unchanged file reports unchanged");
+
+        std::fs::remove_file(&path).expect("delete");
+        assert!(watched.updated(), "a deleted file reports changed");
+        assert!(
+            watched.updated(),
+            "and keeps reporting changed rather than latching"
+        );
+    }
+
+    /// dcrd skips a watched file with an empty path, which is how the
+    /// client CA bundle is left unwatched for every auth type other
+    /// than `clientcert` (`server.go:3620-3622`, `:3856-3859`).
+    #[test]
+    fn an_unwatched_file_never_reports_changed() {
+        let mut watched = WatchedFile {
+            path: None,
+            cur_time: None,
+            cur_size: 0,
+        };
+        assert!(!watched.updated(), "an unwatched file is never changed");
     }
 
     /// A connected loopback pair, with the accepted server side first.

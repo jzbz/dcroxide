@@ -547,6 +547,75 @@ against upstream and the port is faithful.
   remains of it is admission bookkeeping the runtime already does its own way.
   That is a separate question from external-address discovery, which is now
   live.
+- **RPC TLS material reloads when the files change.** dcrd hangs a
+  `GetConfigForClient` callback off the listener's `tls.Config`
+  (`makeReloadableTLSConfig`, `server.go:3796-3822`, wired at `:3860`), so an
+  arriving connection re-stats `rpc.cert`, `rpc.key` and, under
+  `--authtype=clientcert`, the `--clientcafile` bundle -- at most once every
+  five seconds -- and swaps in a freshly parsed config when any of them
+  changed. The port now has the same subsystem: `ReloadableTlsConfig` in
+  `node/src/rpcrun.rs` mirrors `reloadableTLSConfig`, `WatchedFile` mirrors
+  `watchedFile`, and `config_for_client` stands exactly where dcrd's callback
+  does, because the port already built a `rustls::ServerConnection` per
+  accepted connection. A rotated certificate is served without a restart, and
+  under `--authtype=clientcert` a removed issuer stops being trusted on the
+  first connection after the interval elapses -- which matters because editing
+  that bundle is the whole revocation mechanism, neither implementation
+  consulting a CRL or OCSP.
+
+  Three of dcrd's warts come across deliberately. `needsReload`'s `||` chain
+  short-circuits, so a cert and key rotated together reload twice -- once when
+  the cert is noticed, then again on the next check when the key finally
+  stats against details that went stale -- and log twice; Rust's `||`
+  short-circuits identically, so a direct translation inherits it, and
+  statting all three would be tidier and would not be dcrd. A file that no
+  longer exists reports changed without refreshing its remembered details, so
+  a deleted certificate retries on every connection rather than latching. And
+  the first check is a full interval out from startup, so a file rewritten in
+  the first five seconds of uptime is not noticed until then.
+
+  A failed reload keeps the working configuration and warns only when the
+  error differs from the previous one, so replacing the files with malformed
+  data or deleting them cannot take the RPC server down, and a repair is
+  picked up on the next check.
+
+  Resumption needed care in both directions, and the naive reading is wrong
+  twice over. dcrd does NOT lose resumption across a reload: Go resolves
+  ticket keys with `originalConfig.ticketKeys(configForClient)`
+  (`handshake_server.go:177`), which falls through to the long-lived outer
+  config's automatically rotated keys when the reloaded config sets none
+  (`common.go:1095-1124`), and dcrd never sets any. So the port carries its
+  `session_storage` and ticketer into the rebuilt configuration; dropping
+  them would force a full handshake that upstream does not, which is stricter
+  rather than faithful. But it does drop them when the client CA bundle
+  changed, because Go re-verifies a resumed session's stored client chain
+  against the reloaded roots and refuses to resume when it no longer chains
+  (`handshake_server_tls13.go:373-381`), while rustls restores
+  `peer_certificates` from the stored session with no verifier call
+  (`server/tls12.rs:289`). Keeping the cache there would let an issuer that
+  was just revoked go on resuming -- weaker than dcrd, and precisely the
+  thing this entry exists to protect. That decision is made by comparing the
+  bundle's bytes, not its stat, so it never affects whether a reload happens.
+
+  One resumption difference is older than this entry and is not addressed
+  here: rustls's default ticketer is `NeverProducesTickets`, so the port
+  issues no stateless tickets at all and resumes statefully out of the
+  default memory cache, where Go's server resumes only from tickets. That is
+  a separate question about which resumption mechanism the port offers, not
+  about reloading.
+
+  One bounded difference remains. dcrd's callback runs after the ClientHello,
+  so only a peer that actually speaks TLS advances the five-second clock,
+  while the port chooses the configuration as the connection is accepted and
+  so lets a bare TCP connection consume a check. Under port-scanner noise a
+  rotation can therefore be served up to one interval later than dcrd would
+  serve it -- never more, since the interval bounds both. Closing it means
+  driving the accept path through `rustls::Acceptor` to reach the real
+  ClientHello, which is materially more machinery on the hot path than the
+  bound justifies.
+
+  Upstream since `488b8163` (2023-07-10), first carried by a dcrd release in
+  2.0.0.
 
 #### Open: the port does not match dcrd here
 
@@ -589,31 +658,6 @@ closing it would cost.
   unreachable outside the vectors — implementing the flag would retire it.
   Testing-surface only: discrete mining is a `--generate` and regnet/simnet
   facility.
-
-- **RPC TLS material is loaded once and never reloaded.** dcrd hangs a
-  `GetConfigForClient` callback off the listener's `tls.Config`
-  (`server.go:3796-3822`, `makeReloadableTLSConfig`, wired at `:3860`), so an
-  arriving connection re-stats `rpc.cert`, `rpc.key` and, under
-  `--authtype=clientcert`, the `--clientcafile` bundle (`clients.pem` by
-  default) — at most once every five seconds (`needsReload`, `:3662-3671`,
-  over `watchedFile.updated`'s size-or-mtime comparison at `:3617-3637`) —
-  and swaps in a freshly parsed config when any of them changed, keeping the
-  last working one when the new files fail to load and warning unless the
-  same error was already reported (`configFileClient`, `:3708-3736`). The
-  port builds a single `rustls::ServerConfig` at startup in
-  `tls_server_config`, called once from `bin/dcroxide.rs`, which reads
-  `--clientcafile` in the same place, stores it in `RpcTransport::Tls`, and
-  hands that same `Arc` to every `rustls::ServerConnection`; no path is
-  re-read afterwards. For the server pair the consequence is operational: a
-  rotated certificate is not served, and a key replaced because the old one
-  leaked stays in use, until the daemon restarts. Under
-  `--authtype=clientcert` it is also an access-control divergence — neither
-  dcrd nor the port consults a CRL or OCSP, so editing that bundle is the
-  whole revocation mechanism, and dcrd honours a removal on the first
-  connection after its five-second window elapses while the port keeps
-  trusting a removed issuer, and keeps rejecting a newly added one, until
-  restart. Upstream since `488b8163` (2023-07-10), first carried by a dcrd
-  release in 2.0.0, so a standing gap rather than a 2.2 delta.
 
 - **`getwork` cancellation is complete except on macOS and Windows.** dcrd
   cancels getwork in three places: the semaphore queue
