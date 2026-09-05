@@ -332,3 +332,37 @@ Entry format:
 - **How found:** porting `crypto/rand` once for both randomness sources,
   where the fill-versus-XOR difference between the port and upstream
   stopped being a detail of two separate implementations.
+
+## QK-0013 — an inbound peer can never corroborate an external address candidate
+
+- **Where:** dcrd `server.go:2591-2614` (`considerReportedAddr`) against
+  `server.go:2557-2558` (`considerReportedAddrOutbound`) / dcroxide-node
+  `server.rs` `consider_reported_addr`
+- **What:** the outbound path stores a candidate under the bare IP
+  (`addr.IP.String()`, e.g. `8.8.8.8`), while the inbound path looks one up
+  under `net.JoinHostPort(addr.IP.String(), strconv.Itoa(int(addr.Port)))`
+  (e.g. `8.8.8.8:9108`, `[2001:4860:4860::8888]:9108`). The two key spaces are
+  disjoint — the joined form always carries `:<port>` and brackets IPv6, the
+  bare form never does — so the lookup always misses and an inbound peer can
+  never increment a score. The cache's own doc comment says the opposite:
+  "inbound peers can only corroborate addresses that have otherwise already
+  been discovered", describing a corroboration path that cannot fire. The miss
+  is not entirely silent: because the code calls `Get` rather than `Peek`, it
+  still ticks the LRU's miss counter and moves its hit ratio, so the port uses
+  `get` there too.
+- **Why reproduced:** it sets how many reports it takes to move an address over
+  the 60% majority in `considerReportedAddrOutbound`. Making the inbound lookup
+  work would let inbound peers — who choose to connect to us, and are therefore
+  the cheap ones for an attacker to supply in bulk — corroborate an
+  attacker-chosen external address that dcrd would require outbound peers to
+  agree on. dcroxide must be neither stronger nor weaker than dcrd here; the
+  dead path is the specification. The port previously keyed the inbound lookup
+  on the bare IP, so its corroboration worked and it was accidentally stronger
+  than upstream.
+- **Pinned by:** `server_external_addresses_match_dcrd` in
+  `crates/dcroxide-node/tests/srvextaddr_vectors.rs` — rows `ecra|beforeinbound`
+  and `ecra|afterinbound` (inbound reports leave the score untouched) and
+  `ecrakey|v4`/`ecrakey|v6` (the two key forms). Keying the inbound lookup on
+  the bare IP fails `ecra|afterinbound`, verified by reverting it.
+- **How found:** re-porting the subsystem from `release-v2.1.5`'s shape to the
+  parity pin, where the two key forms sit four lines apart.

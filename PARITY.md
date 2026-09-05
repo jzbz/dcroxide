@@ -526,20 +526,31 @@ These are real divergences from the parity pin and someone should eventually
 close them. Each says what upstream does, what the port does instead, and what
 closing it would cost.
 
-- **External-address selection models superseded upstream code.** The port's
-  `NaSubmissionCache` and `resolve_local_address` (`node/src/server.rs`) follow
-  dcrd's `release-v2.1.5`-era `peerState.ResolveLocalAddress`, which the doc
-  comment still cites. Neither that function nor `naSubmissionCache` exists at
-  the parity pin: `036b7090` decides external addresses through
-  `considerReportedAddr` and `considerReportedAddrOutbound` over an LRU bounded
-  by `maxExternalAddrCandidates = 20` (`server.go:96-98`, `:2518`, `:2595`).
-  The machinery is wired, not dead -- `resolve_local_address` is called from
-  `server.rs` and the cache is constructed at startup -- so this is a live
-  subsystem tracking an upstream shape that moved, and re-porting it is a
-  piece of work rather than a deletion. Reported as RVW-012 by an external
-  review of `382864f5`, whose "unwired" label is the one part that does not
-  hold.
-
+- **External-address selection is ported but has no daemon caller.** The
+  subsystem now follows the parity pin: `ExternalAddrCandidate`,
+  `ExternalAddrCandidateCache` over `dcroxide_containers::lru::Map`,
+  `best_candidate`, `resolve_external_address`,
+  `consider_reported_addr_outbound` and `consider_reported_addr`
+  (`node/src/server.rs`) mirror `036b7090`'s `server.go:2373-2614`, and
+  `handle_add_peer` calls `consider_reported_addr` once, unconditionally, ahead
+  of the peer-state insert (`server.go:2670`). What remains open is the wiring.
+  Nothing outside `crates/dcroxide-node/tests/srvextaddr_vectors.rs` and
+  `srvadmit_vectors.rs` constructs a candidate cache or calls
+  `handle_add_peer`, so no live peer's reported address reaches the subsystem
+  and the address manager never learns a discovered external address. dcrd
+  stores the reported address into `sp.reportedLocalAddr` from `OnVersion`
+  (`server.go:1038`) and holds the cache as a server field
+  (`server.go:424-427`, constructed at `:3947`); the port has neither. Closing
+  it means giving the runtime peer a reported-local-address slot, hanging the
+  cache off the server-level state, and routing peer admission through
+  `handle_add_peer` -- and restoring `handleAddPeer`'s
+  advertise/`NeedMoreAddresses`/`Good` block, which the port does not have and
+  which is gated on `cfg.SimNet`/`cfg.RegNet` rather than on
+  `chainParams.Name` as the discovery gate is. Reported as RVW-012 by an
+  external review of `382864f5`; the "superseded upstream shape" half of that
+  finding is closed, the "unwired" half is what is left -- and it was unwired
+  all along, contrary to this entry's previous claim that
+  `resolve_local_address` was called from live code.
 - **`generate 0` does not cancel an in-flight discrete mining call.** dcrd
   keeps a `generateCancelFn` while discrete mining is active and invokes it on
   the `n == 0` path (`internal/mining/cpuminer/cpuminer.go:159-163`,

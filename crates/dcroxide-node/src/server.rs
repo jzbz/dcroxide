@@ -17,127 +17,471 @@ use std::collections::BTreeMap;
 
 use dcroxide_addrmgr::{
     AddrManager, AddressPriority, NetAddress, NetAddressReach, NetAddressType, encode_host,
-    new_net_address_from_ip_port, new_net_address_from_params,
+    is_routable, new_net_address_from_ip_port, new_net_address_from_params,
 };
 use dcroxide_wire::ServiceFlag;
 
-use crate::gostd::split_host_port;
+use crate::gostd::{join_host_port, split_host_port};
 
 /// The default number of outbound peers to maintain (dcrd
 /// `defaultTargetOutbound`).
 pub const DEFAULT_TARGET_OUTBOUND: i64 = 8;
 
-/// The maximum number of cached network address submissions (dcrd
-/// `maxCachedNaSubmissions`).
-pub const MAX_CACHED_NA_SUBMISSIONS: usize = 20;
+/// The maximum number of candidates used for automatic discovery of
+/// external addresses to allow (dcrd `maxExternalAddrCandidates`).
+pub const MAX_EXTERNAL_ADDR_CANDIDATES: u32 = 20;
 
-/// A DNS resolver like Go's `net.LookupIP`, returning IP addresses.
-pub type ResolveIpFn<'a> = dyn Fn(&str) -> Result<Vec<std::net::IpAddr>, String> + 'a;
+/// Render a wire address's 16-byte IP the way Go's `net.IP.String`
+/// does.  dcrd reads `candidate.addr.IP.String()` on the RAW WIRE IP
+/// throughout this subsystem, never the address manager's
+/// `ipString`, which renders an unknown-typed address as the literal
+/// `unsupported IP type ...` and a Tor v3 one as a .onion string.
+fn wire_ip_string(ip: &[u8; 16]) -> String {
+    crate::config::go_ip_string(ip)
+}
 
-/// A network address submission from an outbound peer (dcrd
-/// `naSubmission`).
-#[derive(Debug, Clone)]
-pub struct NaSubmission {
-    /// The submitted address (dcrd carries the wire form; the
-    /// address manager form holds the same bytes).
-    pub na: NetAddress,
+/// Parse a listener port exactly like Go's `strconv.ParseUint(portStr,
+/// 10, 16)`: decimal digits only, no sign, no base prefix, no
+/// underscores.  Rust's `str::parse::<u16>` accepts a leading `+`,
+/// which Go rejects, and `gostd::go_parse_uint` implements Go's
+/// base-0 form, which accepts `0x10` and rejects `08`.
+fn go_parse_port(s: &str) -> Option<u16> {
+    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u16>().ok()
+}
+
+/// An external address candidate (dcrd `externalAddrCandidate`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalAddrCandidate {
+    /// The reported address in its wire form; dcrd stores the
+    /// `*wire.NetAddress` the version message carried, and the
+    /// inbound corroboration path reads its port.
+    pub addr: dcroxide_wire::NetAddress,
     /// The network type of the address.
     pub net_type: NetAddressType,
     /// The reachability of the address.
     pub reach: NetAddressReach,
-    /// The submission score.
+    /// The number of times remote peers reported this address.
     pub score: u32,
-    /// The last access time in Unix seconds.
-    pub last_accessed: i64,
 }
 
-/// A bounded map for network address submissions (dcrd
-/// `naSubmissionCache`).  dcrd guards the map with a mutex; the port
-/// is single-threaded.
-pub struct NaSubmissionCache {
-    /// The submissions keyed by the address's IP string.
-    pub cache: BTreeMap<String, NaSubmission>,
-    /// The cache limit.
-    pub limit: usize,
+/// Candidates for potentially reachable external addresses (aka
+/// local addresses) of the server (dcrd
+/// `externalAddrCandidateCache`).
+///
+/// The overall goal is to automatically discover external addresses
+/// for the server that are then advertised to the network.  A
+/// variety of heuristics are used including a scoring system that
+/// tracks how many times remote peers report a given address as what
+/// they see for connections with the local server.  That is, a local
+/// address from the perspective of the server.
+///
+/// Several measures are taken to help prevent malicious behavior.
+/// For example, unroutable addresses are ignored and inbound peers
+/// can only corroborate addresses that have otherwise already been
+/// discovered -- though see [`consider_reported_addr`], where dcrd's
+/// inbound corroboration cannot actually fire.
+///
+/// dcrd embeds a `sync.Mutex` that guards the whole subsystem and is
+/// held across the address manager calls in
+/// [`resolve_external_address`]; the port passes `&mut` borrows for
+/// the same duration.
+pub struct ExternalAddrCandidateCache {
+    /// The candidates keyed by the wire IP's Go string form.
+    pub entries: dcroxide_containers::lru::Map<String, ExternalAddrCandidate>,
 }
 
-impl NaSubmissionCache {
-    /// An empty cache with the given limit.
-    pub fn new(limit: usize) -> NaSubmissionCache {
-        NaSubmissionCache {
-            cache: BTreeMap::new(),
-            limit,
+impl Default for ExternalAddrCandidateCache {
+    fn default() -> ExternalAddrCandidateCache {
+        ExternalAddrCandidateCache::new()
+    }
+}
+
+impl ExternalAddrCandidateCache {
+    /// A new external address candidate cache that is ready to use
+    /// (dcrd `makeExternalAddrCandidateCache`).  It makes use of a
+    /// size-limited LRU to protect against malicious behavior.  dcrd
+    /// takes no limit here; the constant is baked in.
+    pub fn new() -> ExternalAddrCandidateCache {
+        const LIMIT: u32 = MAX_EXTERNAL_ADDR_CANDIDATES;
+        ExternalAddrCandidateCache {
+            entries: dcroxide_containers::lru::Map::new(LIMIT),
         }
     }
 
-    /// Cache the provided address submission (dcrd `add`); the clock
-    /// is injected as Unix seconds.
-    pub fn add(&mut self, mut sub: NaSubmission, now_unix: i64) -> Result<(), String> {
-        let key = sub.na.ip_string();
-        if key.is_empty() {
-            return Err("submission key cannot be an empty string".to_string());
-        }
-
-        // Remove the oldest submission if the cache limit has been
-        // reached.  dcrd breaks last-accessed ties by Go's random
-        // map iteration; iteration here is in key order.
-        if self.cache.len() == self.limit {
-            let oldest = self
-                .cache
-                .values()
-                .min_by_key(|sub| sub.last_accessed)
-                .map(|sub| sub.na.ip_string());
-            if let Some(oldest) = oldest {
-                self.cache.remove(&oldest);
-            }
-        }
-
-        sub.score = 1;
-        sub.last_accessed = now_unix;
-        self.cache.insert(key, sub);
-        Ok(())
-    }
-
-    /// Whether the provided key exists in the cache (dcrd `exists`).
-    pub fn exists(&self, key: &str) -> bool {
-        if key.is_empty() {
-            return false;
-        }
-        self.cache.contains_key(key)
-    }
-
-    /// Increase the score of the submission referenced by the key by
-    /// one (dcrd `incrementScore`).
-    pub fn increment_score(&mut self, key: &str, now_unix: i64) -> Result<(), String> {
-        if key.is_empty() {
-            return Err("submission key cannot be an empty string".to_string());
-        }
-        let Some(sub) = self.cache.get_mut(key) else {
-            return Err(format!("submission key not found: {key}"));
-        };
-        sub.score += 1;
-        sub.last_accessed = now_unix;
-        Ok(())
-    }
-
-    /// The best scoring submission of the provided network type
-    /// (dcrd `bestSubmission`); dcrd breaks score ties by Go's
-    /// random map iteration, while iteration here is in key order.
-    pub fn best_submission(&self, net: NetAddressType) -> Option<&NaSubmission> {
-        let mut best: Option<&NaSubmission> = None;
-        for sub in self.cache.values() {
-            if sub.net_type != net {
+    /// The candidate for the given network type with the best score,
+    /// or `None` when no suitable candidate exists (dcrd
+    /// `bestCandidate`).
+    ///
+    /// `values` walks the LRU from least to most recently used and
+    /// does not promote, and the comparison is strictly `>`, so on a
+    /// score tie the LEAST recently used of the tied candidates wins.
+    /// This is fully deterministic: there is no Go map iteration
+    /// anywhere in this function, so the superseded cache's comment
+    /// about random tie-breaking does not apply and must not be
+    /// carried forward.
+    pub fn best_candidate(&self, net: NetAddressType) -> Option<ExternalAddrCandidate> {
+        let mut best: Option<ExternalAddrCandidate> = None;
+        for candidate in self.entries.values() {
+            if candidate.net_type != net {
                 continue;
             }
-            match best {
-                None => best = Some(sub),
-                Some(b) if sub.score > b.score => best = Some(sub),
+            match &best {
+                None => best = Some(candidate),
+                Some(b) if candidate.score > b.score => best = Some(candidate),
                 Some(_) => {}
             }
         }
         best
     }
 }
+
+/// Apply dcrd's guarded score increment and write the result back
+/// into the cache.
+///
+/// dcrd holds `*externalAddrCandidate` pointers, so `candidate.score++`
+/// after a `Get` mutates the entry the map already owns and there is
+/// no second `Put`.  `dcroxide_containers::lru::Map` is `V: Clone` and
+/// `get` hands back a clone, so the mutated value must be written
+/// back explicitly.  A `put` on a key that `get` (or the create path)
+/// just promoted replaces the value and re-promotes an already
+/// most-recently-used entry: it evicts nothing and leaves the LRU
+/// order identical to dcrd's in-place mutation.
+fn bump_score(
+    entries: &mut dcroxide_containers::lru::Map<String, ExternalAddrCandidate>,
+    key: &str,
+    mut candidate: ExternalAddrCandidate,
+) {
+    // Spelled as dcrd spells it -- `if candidate.score <
+    // math.MaxUint32 { candidate.score++ }` -- rather than as a
+    // `saturating_add`, because this guard is the ported line and a
+    // reader comparing the two should see the same shape.
+    #[allow(clippy::implicit_saturating_add)]
+    if candidate.score < u32::MAX {
+        candidate.score += 1;
+    }
+    let _ = entries.put(key.to_string(), candidate);
+}
+
+/// The configuration and server facts the external address
+/// subsystem reads; dcrd reaches them through the `cfg` package
+/// global and the `server` fields.
+pub struct ExternalAddrFacts {
+    /// The configured listeners (dcrd `cfg.Listeners`), already
+    /// normalized to the `host:port` form.
+    pub listeners: Vec<String>,
+    /// Whether a proxy or onion proxy is configured (dcrd
+    /// `cfg.Proxy != "" || cfg.OnionProxy != ""`).
+    pub has_proxy: bool,
+    /// Whether automatic network address discovery is disabled (dcrd
+    /// `cfg.NoDiscoverIP`).
+    pub no_discover_ip: bool,
+    /// Whether external IPs are explicitly configured (dcrd
+    /// `len(cfg.ExternalIPs) > 0`).
+    pub has_external_ips: bool,
+    /// Whether listening is disabled OR no listeners exist (dcrd
+    /// `cfg.DisableListen || len(cfg.Listeners) == 0`).
+    pub listen_disabled: bool,
+    /// Whether the active network is simnet or regnet.  dcrd tests
+    /// `s.chainParams.Name` against the simnet and regnet params
+    /// here, NOT `cfg.SimNet`/`cfg.RegNet`; `handleAddPeer`'s own
+    /// advertise block tests the cfg booleans instead, and the two
+    /// sources are independent.
+    pub sim_or_reg_net: bool,
+    /// The services the server supports (dcrd `s.services`, always
+    /// `SFNodeNetwork` on this path).
+    pub services: ServiceFlag,
+    /// The target outbound peer count (dcrd `s.targetOutbound`),
+    /// already clamped to `min(DEFAULT_TARGET_OUTBOUND, max_peers)`
+    /// at server construction.
+    pub target_outbound: u32,
+}
+
+/// Potenentially add the provided external address candidate as a
+/// known external (aka local) address for the server (dcrd
+/// `server.resolveExternalAddress`).
+///
+/// The address must either match one of the configured listeners or
+/// at least possibly be reachable via one of them.  There is no
+/// score logic here: the 60% majority gate lives in
+/// [`consider_reported_addr_outbound`].
+pub fn resolve_external_address(
+    candidate: &ExternalAddrCandidate,
+    addr_mgr: &mut AddrManager,
+    facts: &ExternalAddrFacts,
+    resolver: &ResolveIpFn<'_>,
+    now_unix: i64,
+) {
+    let add_local_address =
+        |best_suggestion: &str, port: u16, services: ServiceFlag, addr_mgr: &mut AddrManager| {
+            let na = match host_to_net_address(best_suggestion, port, services, resolver, now_unix)
+            {
+                Ok(na) => na,
+                // dcrd logs "unable to generate network address using
+                // host %v: %v" and returns.  Unreachable in practice:
+                // the suggestion is always an IP literal that
+                // `encode_host` recognizes, so the resolver is never
+                // consulted.
+                Err(_) => return,
+            };
+
+            if !addr_mgr.has_local_address(&na) {
+                // dcrd logs "unable to add local address: %v" and
+                // returns.
+                let _ = addr_mgr.add_local_address(&na, AddressPriority::Manual);
+            }
+        };
+
+    let candidate_ip = wire_ip_string(&candidate.addr.ip);
+    for listener in &facts.listeners {
+        let Ok((host, port_str)) = split_host_port(listener) else {
+            // dcrd logs "unable to split network address: %v" and
+            // CONTINUES.  One malformed listener must not abort the
+            // remaining listeners.
+            continue;
+        };
+
+        let Some(port) = go_parse_port(&port_str) else {
+            // dcrd logs "unable to parse port: %v" and CONTINUES.
+            continue;
+        };
+
+        // Strip IPv6 zone id if present.  dcrd tests `zoneIndex > 0`
+        // strictly, so a host that is exactly "%foo" is left alone.
+        let host = match host.rfind('%') {
+            Some(idx) if idx > 0 => host[..idx].to_string(),
+            _ => host,
+        };
+
+        // Add a local address if the candidate matches a listener.
+        if candidate_ip == host {
+            add_local_address(&candidate_ip, port, facts.services, addr_mgr);
+            continue;
+        }
+
+        // Add a local address if the listener is generic (applies for
+        // both IPv4 and IPv6).  dcrd's condition is
+        // `host == "" || (host == "*" && runtime.GOOS == "plan9")`;
+        // dcroxide does not target plan9, so the second arm is
+        // carried as this comment rather than implemented.
+        if host.is_empty() {
+            add_local_address(&candidate_ip, port, facts.services, addr_mgr);
+            continue;
+        }
+
+        let Ok(listener_ip) = host.parse::<std::net::IpAddr>() else {
+            // dcrd logs "unable to parse listener: %v" and CONTINUES.
+            continue;
+        };
+
+        // Add a local address if the network address is a probable
+        // external endpoint of the listener.  `To4() != nil` is true
+        // only for a 4-byte IP and an IPv4-MAPPED one, so
+        // `to_ipv4_mapped` is the match and `to_ipv4` (which also
+        // accepts IPv4-compatible `::a.b.c.d`) is not.
+        let l_net = match listener_ip {
+            std::net::IpAddr::V4(_) => NetAddressType::IPv4,
+            std::net::IpAddr::V6(v6) => {
+                if v6.to_ipv4_mapped().is_some() {
+                    NetAddressType::IPv4
+                } else {
+                    NetAddressType::IPv6
+                }
+            }
+        };
+
+        // Go's `&&` binds tighter than `||`, so dcrd's missing
+        // parentheses around the IPv6 half are harmless; the shape is
+        // `(A && B) || (C && (D || E || F))`.  Note this list accepts
+        // Ipv6Weak, Ipv6Strong and Teredo but NOT Default, while
+        // `is_external_addr_candidate` DOES accept Default on the
+        // IPv6 side: an address can be a good candidate and still
+        // never match an IPv6 listener.  The two lists are
+        // deliberately different; do not harmonize them.
+        let valid_external = (l_net == NetAddressType::IPv4
+            && candidate.reach == NetAddressReach::Ipv4)
+            || l_net == NetAddressType::IPv6
+                && (candidate.reach == NetAddressReach::Ipv6Weak
+                    || candidate.reach == NetAddressReach::Ipv6Strong
+                    || candidate.reach == NetAddressReach::Teredo);
+
+        if valid_external {
+            add_local_address(&candidate_ip, port, facts.services, addr_mgr);
+            continue;
+        }
+    }
+}
+
+/// Consider the provided address, as reported by an outbound peer,
+/// as a potential external address candidate for the server (dcrd
+/// `server.considerReportedAddrOutbound`).
+///
+/// The address is expected to already have passed all checks in
+/// [`consider_reported_addr`].
+#[allow(clippy::too_many_arguments)] // Mirrors dcrd's parameter surface.
+pub fn consider_reported_addr_outbound(
+    cache: &mut ExternalAddrCandidateCache,
+    addr_mgr: &mut AddrManager,
+    addr: &dcroxide_wire::NetAddress,
+    remote_addr: &NetAddress,
+    facts: &ExternalAddrFacts,
+    resolver: &ResolveIpFn<'_>,
+    now_unix: i64,
+) {
+    // Only consider the suggested public IP from the outbound peer if
+    // there are no prevailing conditions to disable automatic network
+    // address discovery:
+    //  - There is a proxy set (--proxy, --onion)
+    //  - Automatic network address discovery is explicitly disabled
+    //    (--nodiscoverip)
+    //  - There is an external IP explicitly set (--externalip)
+    //  - Listening has been disabled (--nolisten, listen disabled
+    //    because of --connect, etc)
+    //  - The active network is simnet or regnet
+    if facts.has_proxy
+        || facts.no_discover_ip
+        || facts.has_external_ips
+        || facts.listen_disabled
+        || facts.sim_or_reg_net
+    {
+        return;
+    }
+
+    // Determine if the reported address is a candidate for an
+    // external address of the server.
+    let local_addr = wire_to_addrmgr_net_address(addr);
+    let (good, reach) = addr_mgr.is_external_addr_candidate(&local_addr, remote_addr);
+    if !good {
+        return;
+    }
+
+    // dcrd derives this from the wire IP, after the good check, while
+    // `is_external_addr_candidate` derived `local_addr.addr_type`
+    // through `derive_net_address_type`.  Keep the two derivations
+    // separate.
+    let net = if wire_ip_is_v4(&addr.ip) {
+        NetAddressType::IPv4
+    } else {
+        NetAddressType::IPv6
+    };
+
+    // Increase score for addresses that have already been seen and
+    // create a new entry for ones that haven't.  The key is the BARE
+    // IP with no port; see [`consider_reported_addr`] for why that
+    // matters.  `get` promotes the entry to most recently used and
+    // counts a hit or a miss, exactly as dcrd's does.
+    let candidate_key = wire_ip_string(&addr.ip);
+    let candidate = match cache.entries.get(&candidate_key) {
+        Some(existing) => existing,
+        None => {
+            let fresh = ExternalAddrCandidate {
+                addr: *addr,
+                net_type: net,
+                reach,
+                score: 0,
+            };
+            // May evict the least recently used entry at the limit.
+            let _ = cache.entries.put(candidate_key.clone(), fresh.clone());
+            fresh
+        }
+    };
+    // Runs for a brand-new candidate too: created at 0, it lands at 1
+    // in this same call.
+    bump_score(&mut cache.entries, &candidate_key, candidate);
+
+    // Attempt to find the best candidate for the given network type
+    // as determined by the one with the best score.
+    let Some(best_candidate) = cache.best_candidate(net) else {
+        return;
+    };
+
+    // The best candidate must have been reported by at least a 60%
+    // majority of the target number of outbound peers to be
+    // considered valid.  dcrd's expression is unsigned integer
+    // arithmetic, not a float ceiling.
+    // `div_ceil` would say the same thing, but dcrd's expression is
+    // unsigned integer arithmetic written out, and the vector rows
+    // pin it in that form.
+    #[allow(clippy::manual_div_ceil)]
+    if best_candidate.score < ((facts.target_outbound * 60) + 99) / 100 {
+        return;
+    }
+
+    // Potenentially add the best candidate as a known external (aka
+    // local) address for the server.  dcrd still holds the candidate
+    // cache mutex here, so the address manager is mutated under it.
+    resolve_external_address(&best_candidate, addr_mgr, facts, resolver, now_unix);
+}
+
+/// Consider the provided address as a potential external address
+/// candidate for the server (dcrd `server.considerReportedAddr`).
+#[allow(clippy::too_many_arguments)] // Mirrors dcrd's parameter surface.
+pub fn consider_reported_addr(
+    cache: &mut ExternalAddrCandidateCache,
+    addr_mgr: &mut AddrManager,
+    addr: Option<&dcroxide_wire::NetAddress>,
+    inbound: bool,
+    remote_addr: &NetAddress,
+    facts: &ExternalAddrFacts,
+    resolver: &ResolveIpFn<'_>,
+    now_unix: i64,
+) {
+    // dcrd's `addr == nil` case: no version message has stored a
+    // reported local address yet.  The routability test is the
+    // PACKAGE-level `addrmgr.IsRoutable` on the raw IP, not the
+    // `NetAddress` method, which returns true unconditionally for Tor
+    // v3.  It applies to inbound and outbound alike.
+    let Some(addr) = addr else {
+        return;
+    };
+    if !is_routable(&addr.ip) {
+        return;
+    }
+
+    // Inbound peers can only corroborate existing external address
+    // candidates.
+    //
+    // DELIBERATE UPSTREAM DEFECT -- DO NOT "FIX" THIS (QK-0013).
+    // dcrd builds the lookup key here with `net.JoinHostPort`, so it
+    // is `8.8.8.8:9108` or `[2001:db8::1]:9108`, while
+    // `consider_reported_addr_outbound` stores under the BARE
+    // `addr.IP.String()`, e.g. `8.8.8.8`.  The two key spaces are
+    // disjoint -- the joined form always carries `:<port>` and
+    // brackets IPv6, the bare form never does -- so this lookup
+    // ALWAYS misses and an inbound peer can NEVER bump a score,
+    // notwithstanding the cache's own doc comment.  Rewriting this to
+    // key on the bare IP would make dcroxide stronger than dcrd and
+    // would lower the number of reports an attacker needs to push an
+    // address over the 60% majority, since inbound peers are the
+    // cheap ones to supply in bulk.  The miss is also not invisible:
+    // `get` ticks the LRU's miss counter and moves its hit ratio, so
+    // `exists` or `peek` would diverge here too.  Pinned by the
+    // `ecra|beforeinbound`, `ecra|afterinbound`, `ecrakey|*` and
+    // `ecra|inboundhitjoinedkey` vector rows.
+    if inbound {
+        let port_str = addr.port.to_string();
+        let candidate_key = join_host_port(&wire_ip_string(&addr.ip), &port_str);
+        if let Some(candidate) = cache.entries.get(&candidate_key) {
+            bump_score(&mut cache.entries, &candidate_key, candidate);
+        }
+        return;
+    }
+
+    consider_reported_addr_outbound(
+        cache,
+        addr_mgr,
+        addr,
+        remote_addr,
+        facts,
+        resolver,
+        now_unix,
+    );
+}
+
+/// A DNS resolver like Go's `net.LookupIP`, returning IP addresses.
+pub type ResolveIpFn<'a> = dyn Fn(&str) -> Result<Vec<std::net::IpAddr>, String> + 'a;
 
 /// Parse and return an address manager network address given a
 /// hostname, resolving through the provided DNS resolver when the
@@ -168,114 +512,6 @@ pub fn host_to_net_address(
         std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
     };
     Ok(new_net_address_from_ip_port(&ip_bytes, port, services, 0))
-}
-
-/// Pick the best suggested network address from the submissions per
-/// the provided network type and add it as a local address when the
-/// suggestion has a majority and matches a listener (dcrd
-/// `peerState.ResolveLocalAddress`); errors are logged by dcrd and
-/// abort or skip exactly as the port does.
-#[allow(clippy::too_many_arguments)] // Mirrors dcrd's parameter surface.
-pub fn resolve_local_address(
-    sub_cache: &NaSubmissionCache,
-    net_type: NetAddressType,
-    addr_mgr: &mut AddrManager,
-    services: ServiceFlag,
-    listeners: &[String],
-    max_peers: i64,
-    resolver: &ResolveIpFn<'_>,
-    now_unix: i64,
-) {
-    let Some(best) = sub_cache.best_submission(net_type) else {
-        return;
-    };
-
-    let mut target_outbound = DEFAULT_TARGET_OUTBOUND;
-    if max_peers < target_outbound {
-        target_outbound = max_peers;
-    }
-
-    // A valid best address suggestion must have a majority (60
-    // percent majority) of outbound peers concluding on the same
-    // result.
-    if (best.score as f64) < (target_outbound as f64 * 0.6).ceil() {
-        return;
-    }
-
-    let mut add_local_address = |best_suggestion: &str, port: u16| {
-        let na = match host_to_net_address(best_suggestion, port, services, resolver, now_unix) {
-            Ok(na) => na,
-            // dcrd logs the failure and skips the listener.
-            Err(_) => return,
-        };
-        if !addr_mgr.has_local_address(&na) {
-            // An add failure is logged and skipped.
-            let _ = addr_mgr.add_local_address(&na, AddressPriority::Manual);
-        }
-    };
-
-    let strip_ipv6_zone = |ip: &str| -> String {
-        // Strip the IPv6 zone id if present.
-        match ip.rfind('%') {
-            Some(idx) if idx > 0 => ip[..idx].to_string(),
-            _ => ip.to_string(),
-        }
-    };
-
-    let best_ip = best.na.ip_string();
-    for listener in listeners {
-        // dcrd logs and aborts the whole resolution on a listener
-        // that fails to split or parse.
-        let Ok((host, port_str)) = split_host_port(listener) else {
-            return;
-        };
-        let Ok(port) = port_str.parse::<u16>() else {
-            return;
-        };
-        let host = strip_ipv6_zone(&host);
-
-        // Add a local address if the best suggestion is referenced
-        // by a listener.
-        if best_ip == host {
-            add_local_address(&best_ip, port);
-            continue;
-        }
-
-        // Add a local address if the listener is generic (applies
-        // for both IPv4 and IPv6).
-        if host.is_empty() {
-            add_local_address(&best_ip, port);
-            continue;
-        }
-
-        let Ok(listener_ip) = host.parse::<std::net::IpAddr>() else {
-            return;
-        };
-
-        // Add a local address if the network address is a probable
-        // external endpoint of the listener.
-        let l_net = match listener_ip {
-            std::net::IpAddr::V4(_) => NetAddressType::IPv4,
-            std::net::IpAddr::V6(v6) => {
-                if v6.to_ipv4_mapped().is_some() {
-                    NetAddressType::IPv4
-                } else {
-                    NetAddressType::IPv6
-                }
-            }
-        };
-
-        let valid_external = (l_net == NetAddressType::IPv4 && best.reach == NetAddressReach::Ipv4)
-            || l_net == NetAddressType::IPv6
-                && (best.reach == NetAddressReach::Ipv6Weak
-                    || best.reach == NetAddressReach::Ipv6Strong
-                    || best.reach == NetAddressReach::Teredo);
-
-        if valid_external {
-            add_local_address(&best_ip, port);
-            continue;
-        }
-    }
 }
 
 /// Convert a wire v2 network address type to an address manager type
@@ -1162,8 +1398,6 @@ pub struct PeerState {
     pub persistent_peers: BTreeMap<i32, PeerStateEntry>,
     /// The banned hosts and the Unix nanosecond times the bans lift.
     pub banned: BTreeMap<String, i64>,
-    /// The network address submission cache.
-    pub sub_cache: NaSubmissionCache,
 }
 
 impl Default for PeerState {
@@ -1180,7 +1414,6 @@ impl PeerState {
             outbound_peers: BTreeMap::new(),
             persistent_peers: BTreeMap::new(),
             banned: BTreeMap::new(),
-            sub_cache: NaSubmissionCache::new(MAX_CACHED_NA_SUBMISSIONS),
         }
     }
 
@@ -1261,32 +1494,18 @@ pub struct AddPeerFacts {
     pub persistent: bool,
     /// Whether the peer is whitelisted.
     pub is_whitelisted: bool,
-    /// The peer's network address (dcrd `sp.NA()`).
+    /// The peer's network address (dcrd `sp.NA()`); the address
+    /// manager form of it is dcrd's `sp.remoteAddr`.
     pub na: dcroxide_wire::NetAddress,
     /// The remote peer's view of the local address from its version
-    /// message, when one was stored (dcrd `sp.peerNa`).
+    /// message, when one was stored (dcrd
+    /// `sp.reportedLocalAddr.Load()`).
     pub peer_na: Option<dcroxide_wire::NetAddress>,
     /// The single-IP connection limit (dcrd `cfg.MaxSameIP`).
     pub max_same_ip: i64,
-    /// The maximum peer count (dcrd `cfg.MaxPeers`).
-    pub max_peers: i64,
-    /// Whether a proxy or onion proxy is configured.
-    pub has_proxy: bool,
-    /// Whether automatic network address discovery is disabled.
-    pub no_discover_ip: bool,
-    /// Whether external IPs are explicitly configured.
-    pub has_external_ips: bool,
-    /// Whether listening is disabled or no listeners exist.
-    pub listen_disabled: bool,
-    /// Whether the active network is the simulation or regression
-    /// test network.
-    pub sim_or_reg_net: bool,
-    /// The services the server supports.
-    pub services: ServiceFlag,
-    /// The configured listeners (dcrd `cfg.Listeners`).
-    pub listeners: Vec<String>,
+    /// The configuration the external address subsystem reads.
+    pub external: ExternalAddrFacts,
 }
-
 /// What the admission handler decided and did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AddPeerOutcome {
@@ -1295,24 +1514,17 @@ pub struct AddPeerOutcome {
     pub rejected: Option<AddPeerReject>,
     /// An expired ban entry for the host was removed.
     pub unbanned: bool,
-    /// An inbound peer corroborated an existing address submission.
-    pub corroborated: bool,
-    /// An outbound peer's suggestion was added as a new submission.
-    pub sub_added: bool,
-    /// An outbound peer's suggestion incremented an existing
-    /// submission.
-    pub sub_incremented: bool,
-    /// The local address resolution ran after the submission.
-    pub resolved_local: bool,
 }
-
-/// Deal with adding new peers: categorize the peer, enforce the ban
-/// list and the connection limits, track it in the peer state maps,
-/// and feed the local external address discovery (dcrd
-/// `server.handleAddPeer`).  A rejection in the outcome means dcrd
-/// disconnected the peer and returned false.
+/// Add a peer to the server's state, categorising it, enforcing the
+/// connection limits, and considering the address it reported for the
+/// local connection as an external address candidate (dcrd
+/// `server.handleAddPeer`, `server.go:2625`).
+///
+/// Returns what was decided; dcrd returns a bool and disconnects the
+/// peer itself on a rejection.
 pub fn handle_add_peer(
     state: &mut PeerState,
+    cache: &mut ExternalAddrCandidateCache,
     addr_mgr: &mut AddrManager,
     facts: &AddPeerFacts,
     resolver: &ResolveIpFn<'_>,
@@ -1326,6 +1538,31 @@ pub fn handle_add_peer(
         return outcome;
     }
 
+    // dcrd updates the address manager and requests known addresses
+    // from the remote peer for outbound connections here, gated on
+    // `!cfg.SimNet && !cfg.RegNet && !sp.Inbound()`.  That block
+    // needs the sync manager and the local-address advertisement and
+    // arrives with the daemon wiring; note its gate reads the cfg
+    // booleans, while the discovery gate below reads the chain params
+    // name, and the two are independent.
+
+    // Consider the address the remote peer reported for the local
+    // connection as a potential external address candidate for the
+    // server.  Called once, unconditionally, before the peer state
+    // lock and before the peer is inserted into any map.
+    let now_unix = now_nanos / 1_000_000_000;
+    let remote_addr = wire_to_addrmgr_net_address(&facts.na);
+    consider_reported_addr(
+        cache,
+        addr_mgr,
+        facts.peer_na.as_ref(),
+        facts.inbound,
+        &remote_addr,
+        &facts.external,
+        resolver,
+        now_unix,
+    );
+
     // dcrd 2.2 rejects banned connections before the handshake
     // ([`handle_banned_conn`]) and enforces the connection limits in
     // the connection manager, so the only add-time gate left is the
@@ -1335,101 +1572,18 @@ pub fn handle_add_peer(
         inbound: facts.inbound,
         persistent: facts.persistent,
     };
-    let now_unix = now_nanos / 1_000_000_000;
 
     // Add the new peer.
     if facts.inbound {
         state.inbound_peers.insert(facts.id, entry);
-
-        if let Some(peer_na) = &facts.peer_na {
-            let id = wire_to_addrmgr_net_address(peer_na).ip_string();
-
-            // Inbound peers can only corroborate existing address
-            // submissions; an increment failure is logged and
-            // returns early.
-            if state.sub_cache.exists(&id) {
-                if state.sub_cache.increment_score(&id, now_unix).is_err() {
-                    return outcome;
-                }
-                outcome.corroborated = true;
-            }
-        }
-
         return outcome;
     }
 
     // The peer is an outbound peer at this point.
-    let remote_addr = wire_to_addrmgr_net_address(&facts.na);
     if facts.persistent {
         state.persistent_peers.insert(facts.id, entry);
     } else {
         state.outbound_peers.insert(facts.id, entry);
-    }
-
-    // Fetch the suggested public IP from the outbound peer unless a
-    // prevailing condition disables automatic network address
-    // discovery: a proxy, explicit disablement, explicit external
-    // IPs, disabled listening, or the simulation networks (dcrd 2.2
-    // dropped the removed UPnP option from this gate).
-    if facts.has_proxy
-        || facts.no_discover_ip
-        || facts.has_external_ips
-        || facts.listen_disabled
-        || facts.sim_or_reg_net
-    {
-        return outcome;
-    }
-
-    if let Some(peer_na) = &facts.peer_na {
-        let net = if wire_ip_is_v4(&peer_na.ip) {
-            NetAddressType::IPv4
-        } else {
-            NetAddressType::IPv6
-        };
-
-        let local_addr = wire_to_addrmgr_net_address(peer_na);
-        let (good, reach) = addr_mgr.is_external_addr_candidate(&local_addr, &remote_addr);
-        if !good {
-            return outcome;
-        }
-
-        let id = local_addr.ip_string();
-        if state.sub_cache.exists(&id) {
-            // Increment the submission score if it already exists;
-            // a failure is logged and returns early.
-            if state.sub_cache.increment_score(&id, now_unix).is_err() {
-                return outcome;
-            }
-            outcome.sub_incremented = true;
-        } else {
-            // Create a cache entry for a new submission; a failure
-            // is logged and returns early.
-            let sub = NaSubmission {
-                na: local_addr,
-                net_type: net,
-                reach,
-                score: 0,
-                last_accessed: 0,
-            };
-            if state.sub_cache.add(sub, now_unix).is_err() {
-                return outcome;
-            }
-            outcome.sub_added = true;
-        }
-
-        // Pick the local address for the provided network based on
-        // submission scores.
-        resolve_local_address(
-            &state.sub_cache,
-            net,
-            addr_mgr,
-            facts.services,
-            &facts.listeners,
-            facts.max_peers,
-            resolver,
-            now_unix,
-        );
-        outcome.resolved_local = true;
     }
 
     outcome

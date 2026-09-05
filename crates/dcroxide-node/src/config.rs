@@ -245,7 +245,7 @@ impl IpPrefix {
 
 /// Format IP bytes like Go's `net.IP.String`: dotted for IPv4 (and
 /// IPv4-mapped IPv6), RFC 5952 for IPv6.
-fn go_ip_string(ip: &[u8]) -> String {
+pub(crate) fn go_ip_string(ip: &[u8]) -> String {
     if ip.len() == 4 {
         return format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
     }

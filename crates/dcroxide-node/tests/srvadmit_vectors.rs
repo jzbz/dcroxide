@@ -16,8 +16,9 @@
 use dcroxide_addrmgr::AddrManager;
 use dcroxide_node::config::IpPrefix;
 use dcroxide_node::server::{
-    AddPeerFacts, AddPeerOutcome, DonePeerFacts, NaSubmission, PeerState, PeerStateEntry,
-    disconnect_peer, handle_add_peer, is_whitelisted, wire_to_addrmgr_net_address,
+    AddPeerFacts, AddPeerOutcome, DonePeerFacts, ExternalAddrCandidateCache, ExternalAddrFacts,
+    PeerState, PeerStateEntry, disconnect_peer, handle_add_peer, is_whitelisted,
+    wire_to_addrmgr_net_address,
 };
 use dcroxide_wire::{NetAddress, ServiceFlag};
 
@@ -58,16 +59,18 @@ fn base_facts(id: i32, remote: &str) -> AddPeerFacts {
         na: wire_addr(host, port.parse().unwrap()),
         peer_na: None,
         max_same_ip: 0,
-        max_peers: 125,
-        has_proxy: false,
-        // The dump's base config disables discovery and has no
-        // listeners.
-        no_discover_ip: true,
-        has_external_ips: false,
-        listen_disabled: true,
-        sim_or_reg_net: false,
-        services: ServiceFlag::NODE_NETWORK,
-        listeners: Vec::new(),
+        external: ExternalAddrFacts {
+            listeners: Vec::new(),
+            has_proxy: false,
+            // The dump's base config disables discovery and has no
+            // listeners.
+            no_discover_ip: true,
+            has_external_ips: false,
+            listen_disabled: true,
+            sim_or_reg_net: false,
+            services: ServiceFlag::NODE_NETWORK,
+            target_outbound: 8,
+        },
     }
 }
 
@@ -94,11 +97,22 @@ fn server_peer_admission_matches_dcrd() {
         lines: VECTORS.lines(),
     };
     let no_dns = |_: &str| -> Result<Vec<std::net::IpAddr>, String> { Err("no dns".to_string()) };
-    let add =
-        |state: &mut PeerState,
-         addr_mgr: &mut AddrManager,
-         facts: &AddPeerFacts|
-         -> AddPeerOutcome { handle_add_peer(state, addr_mgr, facts, &no_dns, NOW_NANOS) };
+    // A fresh candidate cache per call: these scenarios all run with
+    // discovery disabled, so nothing is ever stored in it, and the pin
+    // keeps it on the server rather than on the peer state.
+    let add = |state: &mut PeerState,
+               addr_mgr: &mut AddrManager,
+               facts: &AddPeerFacts|
+     -> AddPeerOutcome {
+        handle_add_peer(
+            state,
+            &mut ExternalAddrCandidateCache::new(),
+            addr_mgr,
+            facts,
+            &no_dns,
+            NOW_NANOS,
+        )
+    };
     let amgr_dir = || tempfile::tempdir().unwrap();
 
     // --- banned host gate (dcrd 2.2 handleBannedConn, before the
@@ -133,40 +147,6 @@ fn server_peer_admission_matches_dcrd() {
     assert_eq!(out.rejected, None);
     assert_eq!(state.inbound_peers.len().to_string(), fields[4]);
 
-    // --- inbound submission corroboration ------------------------------------
-    let mut state = PeerState::new();
-    state
-        .sub_cache
-        .add(
-            NaSubmission {
-                na: wire_to_addrmgr_net_address(&wire_addr("52.91.30.1", 9108)),
-                net_type: dcroxide_addrmgr::NetAddressType::IPv4,
-                reach: dcroxide_addrmgr::NetAddressReach::Ipv4,
-                score: 0,
-                last_accessed: 0,
-            },
-            NOW_NANOS / 1_000_000_000,
-        )
-        .unwrap();
-    let mut facts = base_facts(1, "10.0.0.2:34567");
-    facts.peer_na = Some(wire_addr("52.91.30.1", 9108));
-    let out = add(&mut state, &mut amgr, &facts);
-    let fields = rows.next("inboundcorroborate");
-    assert_eq!(out.rejected.is_none().to_string(), fields[2]);
-    assert!(out.corroborated);
-    let score = state.sub_cache.cache["52.91.30.1"].score;
-    assert_eq!(score.to_string(), fields[3]);
-
-    // Inbound peers cannot create new submissions.
-    let mut state = PeerState::new();
-    let mut facts = base_facts(1, "10.0.0.2:34567");
-    facts.peer_na = Some(wire_addr("52.91.30.2", 9108));
-    let out = add(&mut state, &mut amgr, &facts);
-    let fields = rows.next("inboundnosub");
-    assert_eq!(out.rejected.is_none().to_string(), fields[2]);
-    assert!(!out.corroborated);
-    assert_eq!(state.sub_cache.exists("52.91.30.2").to_string(), fields[3]);
-
     // --- outbound placement and groups ----------------------------------------
     let mut state = PeerState::new();
     let mut facts = base_facts(1, "52.91.77.2:34567");
@@ -174,7 +154,6 @@ fn server_peer_admission_matches_dcrd() {
     let out = add(&mut state, &mut amgr, &facts);
     let fields = rows.next("outboundgroup");
     assert_eq!(out.rejected.is_none().to_string(), fields[2]);
-    assert!(!out.resolved_local);
     assert_eq!(state.outbound_peers.len().to_string(), fields[3]);
     // fields[4] carried the v2.1.5 peer-state group count; dcrd 2.2
     // tracks outbound groups in the connection manager instead.
@@ -213,71 +192,11 @@ fn server_peer_admission_matches_dcrd() {
     // fields[4]: the v2.1.5 group count, now in the connection
     // manager.
 
-    // --- outbound discovery submissions -----------------------------------------
-    let discovery_facts = |id: i32, remote: &str| -> AddPeerFacts {
-        let mut facts = base_facts(id, remote);
-        facts.inbound = false;
-        facts.no_discover_ip = false;
-        facts.listen_disabled = false;
-        facts.max_peers = 2;
-        facts.listeners = vec!["52.91.77.1:9108".to_string()];
-        facts.peer_na = Some(wire_addr("52.91.77.1", 9108));
-        facts
-    };
-    let dir = amgr_dir();
-    let mut amgr = AddrManager::new(dir.path());
-    let mut state = PeerState::new();
-    let local_na = wire_to_addrmgr_net_address(&wire_addr("52.91.77.1", 9108));
-    let out = add(
-        &mut state,
-        &mut amgr,
-        &discovery_facts(1, "52.91.77.2:34567"),
-    );
-    let fields = rows.next("outbounddiscovery1");
-    assert_eq!(out.rejected.is_none().to_string(), fields[2]);
-    assert!(out.sub_added && out.resolved_local);
-    assert_eq!(
-        state.sub_cache.cache["52.91.77.1"].score.to_string(),
-        fields[3]
-    );
-    assert_eq!(amgr.has_local_address(&local_na).to_string(), fields[4]);
-
-    let out = add(
-        &mut state,
-        &mut amgr,
-        &discovery_facts(2, "52.91.77.3:34567"),
-    );
-    let fields = rows.next("outbounddiscovery2");
-    assert_eq!(out.rejected.is_none().to_string(), fields[2]);
-    assert!(out.sub_incremented && out.resolved_local);
-    assert_eq!(
-        state.sub_cache.cache["52.91.77.1"].score.to_string(),
-        fields[3]
-    );
-    assert_eq!(amgr.has_local_address(&local_na).to_string(), fields[4]);
-
-    // Discovery is skipped entirely when disabled.
-    let mut state = PeerState::new();
-    let mut facts = base_facts(1, "52.91.77.2:34567");
-    facts.inbound = false;
-    facts.peer_na = Some(wire_addr("52.91.77.1", 9108));
-    let out = add(&mut state, &mut amgr, &facts);
-    let fields = rows.next("discoveryskipped");
-    assert_eq!(out.rejected.is_none().to_string(), fields[2]);
-    assert!(!out.sub_added && !out.resolved_local);
-    assert_eq!(state.sub_cache.exists("52.91.77.1").to_string(), fields[3]);
-
-    // A local suggested address is not an external address candidate.
-    let dir = amgr_dir();
-    let mut amgr = AddrManager::new(dir.path());
-    let mut state = PeerState::new();
-    let mut facts = discovery_facts(1, "52.91.77.2:34567");
-    facts.peer_na = Some(wire_addr("127.0.0.1", 9108));
-    let out = add(&mut state, &mut amgr, &facts);
-    let fields = rows.next("badcandidate");
-    assert_eq!(out.rejected.is_none().to_string(), fields[2]);
-    assert!(!out.sub_added && !out.resolved_local);
-    assert_eq!(state.sub_cache.exists("127.0.0.1").to_string(), fields[3]);
+    // The outbound discovery scenarios that used to sit here moved to
+    // `srvextaddr_vectors.rs`: at the pin they run through
+    // `consider_reported_addr` over the server's candidate cache
+    // rather than through the peer state, and their rows are dumped
+    // from 036b7090 rather than from release-v2.1.5.
 
     // --- DonePeer for untracked peers ---------------------------------------------
     let seed_amgr = |amgr: &mut AddrManager| {
