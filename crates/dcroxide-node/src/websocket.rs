@@ -105,9 +105,6 @@ struct Pending {
     items: VecDeque<String>,
     /// Set once nothing further will be queued.
     closed: bool,
-    /// Set when the writer has stopped, so a reader waiting for the
-    /// queue to drain is never left waiting on a writer that is gone.
-    writer_done: bool,
 }
 
 impl OutboundQueue {
@@ -152,25 +149,25 @@ impl OutboundQueue {
         self.wake.notify_all();
     }
 
-    /// Everything queued, waiting until there is something or the queue
-    /// is closed.  `None` means closed and drained, which is the
-    /// writer's signal to return -- so the writer can never park on a
-    /// queue nobody will fill.
-    fn take_all_blocking(&self) -> Option<Vec<String>> {
+    /// Wait until there is something to write, or the queue closes.
+    ///
+    /// Returns `false` once closed, which is the writer's signal to
+    /// stop -- so it can never park on a queue nobody will fill. It
+    /// deliberately does NOT take the items: the writer collects them
+    /// under the stream lock, so that whoever holds the stream is the
+    /// one draining and output cannot be reordered by two drainers
+    /// racing.
+    fn wait_for_items(&self) -> bool {
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
             if !pending.items.is_empty() {
-                let batch = pending.items.drain(..).collect();
-                // Wakes a reader waiting for the queue to empty before
-                // it takes the stream back.
-                self.wake.notify_all();
-                return Some(batch);
+                return true;
             }
             if pending.closed {
-                return None;
+                return false;
             }
             pending = self
                 .wake
@@ -179,37 +176,21 @@ impl OutboundQueue {
         }
     }
 
-    /// Record that the writer has stopped and wake anyone waiting on it.
-    fn writer_finished(&self) {
+    /// Everything queued right now, without waiting.
+    ///
+    /// Called only with the stream lock held, by whichever thread holds
+    /// it. That is what keeps the writes ordered, and it is why the
+    /// reader can never be starved of output: it drains here itself
+    /// immediately before each read, so a writer that keeps losing the
+    /// stream costs latency inside one read interval rather than
+    /// forever.
+    fn take_all_now(&self) -> Vec<String> {
         self.pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .writer_done = true;
-        self.wake.notify_all();
-    }
-
-    /// Block until the writer has taken everything queued.
-    ///
-    /// The reader calls this before reclaiming the stream, because a
-    /// plain mutex is not fair: releasing it and immediately asking for
-    /// it again lets the reader barge past a writer already waiting,
-    /// and with a 50ms read in between it can do so indefinitely --
-    /// which starved notifications outright rather than merely delaying
-    /// them, as the first draft of this change did. Waiting for the
-    /// drain makes the handoff a fact rather than a hope. Returns at
-    /// once once the writer has stopped, so a failed write cannot wedge
-    /// the reader here.
-    fn wait_until_drained(&self) {
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while !pending.items.is_empty() && !pending.writer_done {
-            pending = self
-                .wake
-                .wait(pending)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
+            .items
+            .drain(..)
+            .collect()
     }
 }
 
@@ -835,18 +816,19 @@ pub fn serve_websocket<S: Read + Write + Send>(
     let write_failed = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            while let Some(batch) = outbound.take_all_blocking() {
+            // Waits without the stream, then drains with it: the lock
+            // order is pending (released) then conn here, and conn then
+            // pending in the reader, so neither holds one while asking
+            // for the other in the opposite order.
+            while outbound.wait_for_items() {
                 let mut conn = conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                for json in batch {
+                for json in outbound.take_all_now() {
                     if conn.write_text(json.as_bytes()).is_err() {
                         write_failed.store(true, std::sync::atomic::Ordering::SeqCst);
-                        drop(conn);
-                        outbound.writer_finished();
                         return;
                     }
                 }
             }
-            outbound.writer_finished();
         });
         // Closing from a guard rather than a trailing statement, for
         // the reason `ClientRegistration` already documents: a panic
@@ -900,13 +882,21 @@ fn serve_ws_reads<S: Read + Write>(
         } else {
             READ_LIMIT_UNAUTHENTICATED
         };
-        // Hand the stream to the writer before taking it back; see
-        // `wait_until_drained`.
-        outbound.wait_until_drained();
-        // The lock is held for the read and released before dispatch,
-        // so the writer is free while a handler runs.
+        // One acquisition: write whatever is queued, then read. Draining
+        // here is what makes the writer's fairness irrelevant -- a plain
+        // mutex lets this thread barge, and it does, so it takes the
+        // output with it rather than leaving it for a writer it keeps
+        // outrunning. The lock is released before dispatch, which is
+        // when the writer gets its turn and the whole point of having
+        // one.
         let read = {
             let mut conn = conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for json in outbound.take_all_now() {
+                if conn.write_text(json.as_bytes()).is_err() {
+                    write_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+            }
             conn.read_message(read_limit)
         };
         let message = match read {
@@ -1479,44 +1469,36 @@ impl dcroxide_mempool::TSpendReceiver for NodeTSpendReceiver {
 mod tests {
     use super::*;
 
-    /// The handoff the writer thread depends on: the reader waits until
-    /// the writer has taken everything before reclaiming the stream.
-    ///
-    /// Without it a plain mutex lets the reader barge -- release, then
-    /// immediately re-acquire for a 50ms read -- past a writer that is
-    /// already waiting, indefinitely. The first draft of the writer
-    /// thread did exactly that and starved notifications outright.
+    /// Whoever holds the stream drains the queue, so two drainers can
+    /// never reorder output.  The writer waits without the stream and
+    /// takes it before draining; the reader drains under the lock it
+    /// already holds for its read.
     #[test]
-    fn the_reader_waits_for_the_writer_to_take_the_queue() {
-        let queue = Arc::new(OutboundQueue::default());
+    fn a_drain_takes_everything_in_order() {
+        let queue = OutboundQueue::default();
         queue.push("first".to_string());
         queue.push("second".to_string());
-
-        let writer = {
-            let queue = Arc::clone(&queue);
-            std::thread::spawn(move || queue.take_all_blocking())
-        };
-        // Returns only once that drain has happened.
-        queue.wait_until_drained();
-        let batch = writer.join().expect("writer").expect("a batch");
         assert_eq!(
-            batch,
+            queue.take_all_now(),
             vec!["first".to_string(), "second".to_string()],
-            "queue order is preserved, as dcrd's single sendChan preserves it"
+            "queue order is the wire order"
+        );
+        assert!(
+            queue.take_all_now().is_empty(),
+            "a second drain finds nothing"
         );
     }
 
-    /// And it cannot wedge: a writer that has stopped releases the
-    /// reader even with messages still queued, which is what happens
-    /// when a write fails on a dead connection.
+    /// The writer parks until there is something to write.
     #[test]
-    fn a_stopped_writer_releases_the_reader() {
-        let queue = OutboundQueue::default();
-        queue.push("undeliverable".to_string());
-        queue.writer_finished();
-        // Would block forever if the writer's exit were not accounted
-        // for; the test harness would hang rather than fail.
-        queue.wait_until_drained();
+    fn the_writer_waits_for_work() {
+        let queue = Arc::new(OutboundQueue::default());
+        let writer = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || queue.wait_for_items())
+        };
+        queue.push("wake up".to_string());
+        assert!(writer.join().expect("writer"), "a push wakes the writer");
     }
 
     /// Closing wakes a parked writer and tells it to stop, so the
@@ -1526,31 +1508,27 @@ mod tests {
         let queue = Arc::new(OutboundQueue::default());
         let writer = {
             let queue = Arc::clone(&queue);
-            std::thread::spawn(move || queue.take_all_blocking())
+            std::thread::spawn(move || queue.wait_for_items())
         };
         queue.close();
         assert!(
-            writer.join().expect("writer").is_none(),
-            "a closed and drained queue is the writer's signal to return"
+            !writer.join().expect("writer"),
+            "a closed queue is the writer's signal to return"
         );
     }
 
     /// A close DISCARDS what is still queued, as dcrd's `Disconnect`
     /// does by closing the socket out from under `sendChan`.
-    ///
-    /// Delivering it instead would be more than dcrd delivers, and
-    /// would put a data frame after the close frame the read loop has
-    /// already sent.
     #[test]
     fn closing_discards_what_is_still_queued() {
         let queue = OutboundQueue::default();
         queue.push("undelivered".to_string());
         queue.close();
-        assert_eq!(
-            queue.take_all_blocking(),
-            None,
+        assert!(
+            queue.take_all_now().is_empty(),
             "a closed queue hands the writer nothing further to write"
         );
+        assert!(!queue.wait_for_items(), "and stops it");
     }
 
     #[test]

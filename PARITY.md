@@ -702,10 +702,14 @@ closing it would cost.
 
   Two hazards the shape does have, both handled and worth stating because
   they are what makes it work rather than incidental. A plain mutex is not
-  fair: the reader releases the stream and immediately asks for it again for
-  another read, barging past a writer already waiting, indefinitely -- that
-  starved notifications outright until the reader was made to wait for the
-  queue to drain first. And the writer parks on a condvar, so the queue is
+  fair, and the reader releases the stream only to ask for it again for
+  another read, so it barges past a writer already waiting -- indefinitely,
+  which starves notifications outright rather than delaying them. Making the
+  writer wait its turn only narrowed that window; what closes it is that
+  whoever holds the stream drains the queue, so the reader carries the
+  pending output itself immediately before each read and the writer's
+  fairness stops mattering. Worst case is then one read interval rather than
+  forever. And the writer parks on a condvar, so the queue is
   closed from a `Drop` guard rather than a trailing statement, for the reason
   `ClientRegistration` already documents: an unwind that skipped the close
   would leave the writer parked and `thread::scope` joining forever.
