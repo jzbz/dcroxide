@@ -1038,6 +1038,30 @@ impl RpcTemplateSubscription for NodeTemplateSubscription {
         }
     }
 
+    fn recv_with_timeout_until(&self, cancel: &std::sync::atomic::AtomicBool) -> TemplateRecv {
+        // As `recv_with_timeout`, but watching one more thing. The extra
+        // flag is shared rather than thread-local because the caller that
+        // raises it -- a `generate 0` on another connection -- is on a
+        // different thread, so it is passed by reference instead.
+        let started = Instant::now();
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) || request_cancelled() {
+                return TemplateRecv::Canceled;
+            }
+            let Some(left) = MAX_TEMPLATE_TIMEOUT.checked_sub(started.elapsed()) else {
+                return TemplateRecv::Timeout;
+            };
+            if left.is_zero() {
+                return TemplateRecv::Timeout;
+            }
+            match self.receiver.recv_timeout(left.min(CANCEL_POLL_INTERVAL)) {
+                Ok(block) => return TemplateRecv::Template(Box::new(block)),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return TemplateRecv::Canceled,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
     fn stop(&self) {
         self.subscribers
             .lock()

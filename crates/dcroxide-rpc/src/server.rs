@@ -890,6 +890,19 @@ pub trait RpcTemplateSubscription {
     fn recv_with_timeout(&self) -> TemplateRecv {
         unimplemented!("recv_with_timeout")
     }
+    /// Wait with dcrd's known-template timeout, giving up early when
+    /// `cancel` is raised as well as on the request's own cancellation.
+    ///
+    /// dcrd's discrete mining selects on a context that a concurrent
+    /// `generate 0` cancels (`cpuminer.go:845-851`), which a
+    /// thread-local cannot express because that call arrives on another
+    /// connection's thread. The flag is passed instead. The default
+    /// ignores it, so an implementation with no notion of cancellation
+    /// -- the test doubles, and anything driving handlers directly --
+    /// needs no change.
+    fn recv_with_timeout_until(&self, _cancel: &std::sync::atomic::AtomicBool) -> TemplateRecv {
+        self.recv_with_timeout()
+    }
     /// Stop the subscription (dcrd `Stop`).
     fn stop(&self) {
         unimplemented!("stop")

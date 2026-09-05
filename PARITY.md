@@ -616,6 +616,42 @@ against upstream and the port is faithful.
 
   Upstream since `488b8163` (2023-07-10), first carried by a dcrd release in
   2.0.0.
+- **`generate 0` cancels an in-flight discrete mining call.** dcrd keeps a
+  `generateCancelFn` while discrete mining is active and invokes it on the
+  `n == 0` path (`internal/mining/cpuminer/cpuminer.go:159-163`, `:845-851`),
+  so a concurrent `generate 0` stops the running solve, returns nothing
+  itself, and leaves the cancelled caller with `ErrCancelDiscreteMining`.
+  `MiningMode` now carries the same handle -- an `Arc<AtomicBool>` rather than
+  a `context.CancelFunc`, since what it cancels is a wait on a channel and it
+  is set from whichever connection ran `generate 0` while being read on the
+  mining thread. It is published under the same lock that claims discrete
+  mining and dropped by `DiscreteMiningGuard` alongside the flag, so a
+  `generate 0` can neither cancel a call that has not started nor one that
+  has already returned.
+
+  The distinction between the two cancellations is the part worth checking.
+  dcrd returns `ErrCancelDiscreteMining` for a `generate 0` *and* for a client
+  that hung up, then tells them apart in `handleGenerate` by asking the
+  request context first (`rpcserver.go:1850-1856`): a dead connection is
+  `rpcConnectionClosedError`, everything else is `rpcCancelError`. The port
+  carries that across in `GenerateFailure`'s two flags and checks them in
+  dcrd's order, so `handle_generate`'s arms select the same way. This also
+  retires the note that `is_cancel_discrete` had no reachable daemon producer
+  and existed only for the vectors: it has one now.
+
+  Two details came out of the port. The wait had to learn a second
+  cancellation source, since the thread-local installed for a request cannot
+  be reached from the connection running `generate 0`; `recv_with_timeout_until`
+  takes the shared flag as an argument and defaults to ignoring it, so no test
+  double changed. And the cancellation message is dcrd's
+  `"discrete mining process canceled"` verbatim, because `rpcCancelError`
+  formats it into the reply -- it is RPC surface, not an internal label. The
+  port previously carried a paraphrase there, harmless only because no
+  reachable path reached that arm.
+
+  What still differs is timing, bounded and small: dcrd's `select` wakes at
+  once on `genCtx.Done()` while the port notices within one
+  `CANCEL_POLL_INTERVAL` (50ms) of the template wait it is sitting in.
 
 #### Open: the port does not match dcrd here
 
@@ -674,18 +710,6 @@ closing it would cost.
   threshold and admitting it is invented. Measured at the pin, per input, each
   in its own subprocess -- the `mpchan|` rows of
   `crates/dcroxide-node/tests/data/srvtargetout_vectors.txt`.
-
-- **`generate 0` does not cancel an in-flight discrete mining call.** dcrd
-  keeps a `generateCancelFn` while discrete mining is active and invokes it on
-  the `n == 0` path (`internal/mining/cpuminer/cpuminer.go:159-163`,
-  `:845-851`), so a concurrent `generate 0` stops the running solve. This port
-  has no cancellation handle for the solve, so `generate 0` returns without
-  stopping it. The RPC layer already carries dcrd's error arm for the
-  cancelled case (`server.rs`'s `is_cancel_discrete`, consumed at
-  `handlers.rs:3698`), and every daemon producer sets it false, so that arm is
-  unreachable outside the vectors — implementing the flag would retire it.
-  Testing-surface only: discrete mining is a `--generate` and regnet/simnet
-  facility.
 
 - **`getwork` cancellation is complete except on macOS and Windows.** dcrd
   cancels getwork in three places: the semaphore queue

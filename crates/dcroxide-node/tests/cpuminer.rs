@@ -241,16 +241,69 @@ fn generate_mines_blocks_onto_the_chain() {
         );
     }
 
+    // A concurrent `generate 0` cancels the call in flight (dcrd
+    // `cpuminer.go:845-851`), and the caller learns which cancellation it
+    // was: `is_ctx_err` false and `is_cancel_discrete` true, which
+    // `handle_generate` maps to dcrd's `rpcCancelError` rather than to
+    // `rpcConnectionClosedError` (`rpcserver.go:1850-1856`).
+    //
+    // Not a sleep race: the target is far enough away that the call
+    // cannot reach it, and the cancelling thread waits on `is_mining`
+    // rather than on a clock, so the cancellation always lands mid-flight.
+    let miner = Arc::new(miner);
+    {
+        let mining = Arc::clone(&miner);
+        let started = Instant::now();
+        let inflight = std::thread::spawn(move || mining.generate_n_blocks(10_000));
+
+        while !miner.is_mining() {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the in-flight generate never claimed discrete mining"
+            );
+            std::thread::yield_now();
+        }
+
+        assert!(
+            miner
+                .generate_n_blocks(0)
+                .expect("generate 0 never fails")
+                .is_empty(),
+            "generate 0 claims no blocks of its own"
+        );
+
+        let failure = inflight
+            .join()
+            .expect("the mining thread did not panic")
+            .expect_err("a cancelled generate must not answer with hashes");
+        assert!(
+            !failure.is_ctx_err,
+            "a generate 0 is not a closed connection"
+        );
+        assert!(
+            failure.is_cancel_discrete,
+            "it is dcrd's ErrCancelDiscreteMining"
+        );
+        assert_eq!(
+            failure.message, "discrete mining process canceled",
+            "the text reaches the client through rpcCancelError, so it is dcrd's"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the cancellation did not stop the mining promptly"
+        );
+        assert!(
+            !miner.is_mining(),
+            "and the discrete flag is released afterwards"
+        );
+    }
+
     // And the discrete-mining flag is released even on that path, so the
     // next caller is not locked out by a client that left.
     assert!(
         !miner.is_mining(),
         "a cancelled generate still clears the discrete-mining flag"
     );
-    let hashes = miner
-        .generate_n_blocks(1)
-        .expect("generate still works after a cancelled call");
-    assert_eq!(hashes.len(), 1, "one hash for one block");
 
     // The discrete-mining flag is cleared after each call, so the miner
     // is idle again (the Drop guard ran on every return path).

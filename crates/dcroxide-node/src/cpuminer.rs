@@ -101,7 +101,23 @@ struct MiningMode {
     normal: bool,
     /// dcrd `discreteMining`: a `generate N` call in flight.
     discrete: bool,
+    /// dcrd `generateCancelFn` (`cpuminer.go:159-163`): the handle a
+    /// concurrent `generate 0` uses to stop the call in flight.
+    ///
+    /// A flag rather than a closure because the thing it cancels is a
+    /// wait on a channel, and because it is read from the mining thread
+    /// while being set from whichever connection ran `generate 0`.
+    /// Cleared with `discrete`, so a `generate 0` arriving after the
+    /// call returned raises a flag nobody reads -- which is what dcrd's
+    /// deferred `generateCancelFn(); = nil` amounts to.
+    generate_cancel: Option<Arc<AtomicBool>>,
 }
+
+/// dcrd `ErrCancelDiscreteMining` (`cpuminer.go:63`).  Reproduced
+/// verbatim because it reaches the client: `handleGenerate` formats it
+/// into `rpcCancelError` (`rpcserver.go:1854-1855`), so the text is part
+/// of the RPC surface rather than an internal label.
+const ERR_CANCEL_DISCRETE_MINING: &str = "discrete mining process canceled";
 
 /// dcrd's `GenerateNBlocks` entry gate: both rejection checks and the
 /// activation, under ONE hold of the mode lock, as dcrd does with its
@@ -117,7 +133,10 @@ struct MiningMode {
 /// server-wide lock serializes them any more — both read `false` and both
 /// proceed, after which the first to finish clears the flag while the
 /// second is still mining.
-fn begin_discrete(mode: &mut MiningMode, n: u32) -> Result<bool, GenerateFailure> {
+fn begin_discrete(
+    mode: &mut MiningMode,
+    n: u32,
+) -> Result<Option<Arc<AtomicBool>>, GenerateFailure> {
     // Reject a discrete call while continuous mining is active (dcrd's
     // `normalMining` guard).
     if mode.normal {
@@ -142,21 +161,34 @@ fn begin_discrete(mode: &mut MiningMode, n: u32) -> Result<bool, GenerateFailure
         });
     }
 
-    // Zero blocks claims nothing and returns no hashes.  dcrd's `n == 0`
-    // path also cancels an in-flight discrete call through
-    // `generateCancelFn` (`cpuminer.go:845-851`); this port has no
-    // cancellation handle for the running solve, so a concurrent
-    // `generate 0` returns without stopping it.
+    // Zero blocks claims nothing and returns no hashes, but it does
+    // cancel a call in flight, which is the whole point of the form
+    // (dcrd `cpuminer.go:845-851`):
     //
-    // Recorded under PARITY.md's known remaining gaps.  The comment here
-    // previously said it was recorded there when it was not, which is
-    // exactly the kind of claim the ledger exists to make checkable.
+    // ```go
+    // if n == 0 {
+    //     if m.generateCancelFn != nil {
+    //         m.generateCancelFn()
+    //     }
+    //     m.Unlock()
+    //     return nil, nil
+    // }
+    // ```
+    //
+    // Raising the flag under the same lock that publishes it is what
+    // makes it impossible to cancel a call that has not started or one
+    // that has already cleared its handle.
     if n == 0 {
-        return Ok(false);
+        if let Some(cancel) = mode.generate_cancel.as_ref() {
+            cancel.store(true, Ordering::Release);
+        }
+        return Ok(None);
     }
 
+    let cancel = Arc::new(AtomicBool::new(false));
+    mode.generate_cancel = Some(Arc::clone(&cancel));
     mode.discrete = true;
-    Ok(true)
+    Ok(Some(cancel))
 }
 
 struct DiscreteMiningGuard(Arc<Mutex<MiningMode>>);
@@ -167,10 +199,15 @@ impl Drop for DiscreteMiningGuard {
         // dcrd's `defer func() { m.discreteMining = false }` does.  A
         // poisoned lock is still recovered so a panicking generate
         // cannot latch the flag and reject every later call.
-        self.0
+        let mut mode = self
+            .0
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .discrete = false;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        mode.discrete = false;
+        // dcrd's deferred `m.generateCancelFn(); m.generateCancelFn = nil`.
+        // Dropping the handle is what stops a later `generate 0` from
+        // cancelling a call that has already returned.
+        mode.generate_cancel = None;
     }
 }
 
@@ -1006,15 +1043,18 @@ impl RpcCpuMiner for NodeCpuMiner {
     fn generate_n_blocks(&self, n: u32) -> Result<Vec<Hash>, GenerateFailure> {
         // One hold of the mode lock spans the whole gate, as dcrd's
         // `m.Lock()` … `m.discreteMining = true` … `m.Unlock()` does.
-        {
+        let generate_cancel = {
             let mut mode = self
                 .mining_mode
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !begin_discrete(&mut mode, n)? {
-                return Ok(Vec::new());
+            match begin_discrete(&mut mode, n)? {
+                Some(cancel) => cancel,
+                // `generate 0`: it cancelled whatever was running and
+                // claims nothing of its own.
+                None => return Ok(Vec::new()),
             }
-        }
+        };
 
         // Clear the flag on every exit path — including an unwinding
         // panic — exactly as dcrd's `defer { m.discreteMining = false }`
@@ -1031,7 +1071,7 @@ impl RpcCpuMiner for NodeCpuMiner {
             if self.quit.load(Ordering::Acquire) {
                 break;
             }
-            match subscription.recv_with_timeout() {
+            match subscription.recv_with_timeout_until(&generate_cancel) {
                 TemplateRecv::Template(block) => {
                     // Stop once the chain reaches the target height.
                     if self.best_height() >= target_height {
@@ -1128,11 +1168,32 @@ impl RpcCpuMiner for NodeCpuMiner {
         // that landed.  `handle_generate` then turns this into dcrd's
         // `rpcConnectionClosedError` (`rpcserver.go:1851-1852`) rather
         // than answering a departed client with a hash list.
+        // dcrd returns ErrCancelDiscreteMining for either cancellation and
+        // lets `handleGenerate` tell them apart by asking the REQUEST
+        // context first (`rpcserver.go:1850-1856`):
+        //
+        // ```go
+        // case ctx.Err() != nil:
+        //     return nil, rpcConnectionClosedError()
+        // case errors.Is(err, cpuminer.ErrCancelDiscreteMining):
+        //     return nil, rpcCancelError(...)
+        // ```
+        //
+        // So the order here is dcrd's order, and the two flags carry the
+        // distinction across: a client that left reports the connection
+        // closed, a `generate 0` reports the cancellation.
         if request_cancelled() {
             return Err(GenerateFailure {
                 is_ctx_err: true,
                 is_cancel_discrete: true,
-                message: "discrete mining cancelled".to_string(),
+                message: ERR_CANCEL_DISCRETE_MINING.to_string(),
+            });
+        }
+        if generate_cancel.load(Ordering::Acquire) {
+            return Err(GenerateFailure {
+                is_ctx_err: false,
+                is_cancel_discrete: true,
+                message: ERR_CANCEL_DISCRETE_MINING.to_string(),
             });
         }
         let chain = self.chain.lock().expect("chain mutex poisoned");
@@ -1209,6 +1270,112 @@ impl RpcCpuMiner for NodeCpuMiner {
 
 #[cfg(test)]
 mod tests {
+
+    /// dcrd's `generate 0` cancels the call in flight and claims nothing
+    /// (`cpuminer.go:845-851`).  Exercised on the gate itself, where the
+    /// whole decision lives, so it does not depend on thread timing.
+    #[test]
+    fn generate_zero_trips_the_handle_of_the_call_in_flight() {
+        let mut mode = MiningMode {
+            normal: false,
+            discrete: false,
+            generate_cancel: None,
+        };
+
+        // A real call claims discrete mining and publishes its handle.
+        let cancel = begin_discrete(&mut mode, 5)
+            .expect("a first discrete call is admitted")
+            .expect("and is handed its cancellation handle");
+        assert!(mode.discrete, "discrete mining is claimed");
+        assert!(!cancel.load(Ordering::Acquire), "and is not cancelled yet");
+
+        // `generate 0` claims nothing and trips that handle.
+        assert!(
+            begin_discrete(&mut mode, 0)
+                .expect("generate 0 is always admitted")
+                .is_none(),
+            "generate 0 claims no handle of its own"
+        );
+        assert!(
+            cancel.load(Ordering::Acquire),
+            "generate 0 must cancel the call in flight"
+        );
+        assert!(
+            mode.discrete,
+            "but must not clear the flag out from under it -- \
+             the running call's guard owns that"
+        );
+    }
+
+    /// With nothing running there is nothing to cancel, and `generate 0`
+    /// must not leave anything behind that would cancel the NEXT call.
+    #[test]
+    fn generate_zero_with_nothing_running_cancels_nothing() {
+        let mut mode = MiningMode {
+            normal: false,
+            discrete: false,
+            generate_cancel: None,
+        };
+        assert!(
+            begin_discrete(&mut mode, 0)
+                .expect("generate 0 is admitted")
+                .is_none()
+        );
+        assert!(!mode.discrete, "and claims nothing");
+
+        let cancel = begin_discrete(&mut mode, 3)
+            .expect("a later call is admitted")
+            .expect("with its own handle");
+        assert!(
+            !cancel.load(Ordering::Acquire),
+            "the later call must not start out cancelled"
+        );
+    }
+
+    /// The guard drops the handle with the flag, so a `generate 0` that
+    /// arrives after the call returned cannot cancel an unrelated later
+    /// one (dcrd's deferred `generateCancelFn(); = nil`).
+    #[test]
+    fn a_finished_call_leaves_no_handle_to_cancel() {
+        let mode = Arc::new(Mutex::new(MiningMode {
+            normal: false,
+            discrete: false,
+            generate_cancel: None,
+        }));
+        let first = {
+            let mut m = mode.lock().expect("mode");
+            begin_discrete(&mut m, 5)
+                .expect("admitted")
+                .expect("handle")
+        };
+        drop(DiscreteMiningGuard(Arc::clone(&mode)));
+        assert!(
+            mode.lock().expect("mode").generate_cancel.is_none(),
+            "the guard drops the handle"
+        );
+
+        // A late `generate 0` now finds nothing, and the next call is
+        // unaffected.
+        {
+            let mut m = mode.lock().expect("mode");
+            assert!(begin_discrete(&mut m, 0).expect("admitted").is_none());
+        }
+        let second = {
+            let mut m = mode.lock().expect("mode");
+            begin_discrete(&mut m, 5)
+                .expect("admitted")
+                .expect("handle")
+        };
+        assert!(
+            !second.load(Ordering::Acquire),
+            "a late generate 0 must not cancel the next call"
+        );
+        assert!(
+            !first.load(Ordering::Acquire),
+            "nor retroactively the finished one"
+        );
+    }
+
     use super::*;
 
     /// The two guards are cross-checks over the same state, so a claimed
@@ -1219,14 +1386,20 @@ mod tests {
         // A discrete claim rejects a second one, but `n == 0` still
         // passes through claiming nothing, as dcrd's guard does.
         let mut mode = MiningMode::default();
-        assert_eq!(begin_discrete(&mut mode, 1).ok(), Some(true));
+        assert!(
+            begin_discrete(&mut mode, 1)
+                .expect("a first generate is admitted")
+                .is_some(),
+            "and is handed a cancellation handle"
+        );
         assert!(
             begin_discrete(&mut mode, 1).is_err(),
             "second generate rejected"
         );
-        assert_eq!(
-            begin_discrete(&mut mode, 0).ok(),
-            Some(false),
+        assert!(
+            begin_discrete(&mut mode, 0)
+                .expect("generate 0 is admitted")
+                .is_none(),
             "generate 0 claims nothing even while discrete mining"
         );
 
@@ -1234,6 +1407,7 @@ mod tests {
         let mut fresh = MiningMode {
             normal: true,
             discrete: false,
+            generate_cancel: None,
         };
         assert!(
             begin_discrete(&mut fresh, 1).is_err(),
