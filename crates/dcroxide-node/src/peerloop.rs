@@ -24,7 +24,6 @@
 //! `SetReadDeadline` before each read); a read timeout ends the loop exactly
 //! like dcrd's idle disconnect.
 
-use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -853,21 +852,19 @@ impl Default for StallConfig {
 /// The observable behavior is dcrd's: the same deadlines, the same
 /// per-tick check, and the same disconnect.
 ///
-/// Disconnecting is a shutdown of the connection — the mechanism the
-/// input and output loops already use to break each other out of a
-/// blocked read or write, and raises the connection's [`Cancel`] flag —
-/// which is what actually unblocks the input loop's read, since a
-/// `shutdown` issued on a different handle to the same socket is not a
-/// portable way to abort a receive already in flight.  Together they
-/// tear the whole connection down (dcrd's `Disconnect` closing the
-/// conn).  The stalled command is returned so the caller can report why
-/// the connection ended.
+/// Disconnecting ends the connection through its [`Teardown`] handle,
+/// which raises the flag the input loop polls and shuts the socket down
+/// in one call — the mechanism every teardown in the daemon now shares,
+/// and the reason a `shutdown` alone is not enough: issued on a
+/// different handle to the same socket it is not a portable way to
+/// abort a receive already in flight (dcrd's `Disconnect` closing the
+/// conn does both).  The stalled command is returned so the caller can
+/// report why the connection ended.
 ///
-/// [`Cancel`]: crate::transport::Cancel
+/// [`Teardown`]: crate::transport::Teardown
 pub fn run_stall_detector(
     stall: &Mutex<StallDetector>,
-    conn: &TcpStream,
-    cancel: &crate::transport::Cancel,
+    conn: &crate::transport::Teardown,
     peer_label: &str,
     tick: Duration,
     shutdown: &mpsc::Receiver<()>,
@@ -892,8 +889,9 @@ pub fn run_stall_detector(
                     // already in flight on the loop's own handle under
                     // Winsock — while the socket shutdown still delivers
                     // the FIN the remote is owed.
-                    cancel.cancel();
-                    let _ = conn.shutdown(Shutdown::Both);
+                    // Both halves, in this order; see
+                    // `Teardown::disconnect`.
+                    conn.disconnect();
                     return Some(reason);
                 }
             }
@@ -929,7 +927,7 @@ fn peer_globals() -> &'static PeerGlobals {
 /// Run a peer connection with dcrd's production stall timings.
 #[allow(clippy::too_many_arguments)] // Mirrors dcrd's connection surface.
 pub fn run_peer_connection<H>(
-    stream: TcpStream,
+    conn: crate::transport::Teardown,
     peer: Peer,
     pver: u32,
     net: CurrencyNet,
@@ -942,7 +940,7 @@ where
     H: ServeHooks,
 {
     run_peer_connection_with_stall(
-        stream,
+        conn,
         peer,
         pver,
         net,
@@ -977,7 +975,7 @@ where
 /// not arrived by its deadline (dcrd's `stallHandler`).
 #[allow(clippy::too_many_arguments)] // Mirrors dcrd's connection surface.
 pub fn run_peer_connection_with_stall<H>(
-    stream: TcpStream,
+    conn: crate::transport::Teardown,
     mut peer: Peer,
     pver: u32,
     net: CurrencyNet,
@@ -996,16 +994,22 @@ where
     // instead of holding a serving thread for the full idle window; the
     // idle timeout takes over once the session begins.
     let negotiate_timeout = Duration::from_nanos(NEGOTIATE_TIMEOUT.max(0) as u64);
-    let write_stream = match stream.try_clone() {
+    let write_stream = match conn.try_clone() {
         Ok(write_stream) => write_stream,
         Err(e) => return DisconnectReason::WriteError(e.to_string()),
     };
-    // A third handle on the same socket, so the stall detector can shut
-    // the connection down from its own thread (dcrd's `Disconnect`).
-    let stall_stream = match stream.try_clone() {
+    // A third handle on the same connection, so the stall detector can
+    // tear it down from its own thread (dcrd's `Disconnect`).
+    let stall_stream = match conn.try_clone() {
         Ok(stall_stream) => stall_stream,
         Err(e) => return DisconnectReason::WriteError(e.to_string()),
     };
+    // The connection's teardown flag, minted with the socket at the
+    // accept or the dial rather than here, so the server's own
+    // disconnect paths -- which never enter this function -- raise the
+    // one flag this transport polls.  Taken before the transport
+    // consumes the handle.
+    let cancel = conn.cancel();
     // The handshake is framed at the local maximum protocol version (0
     // is dcrd's "package maximum" sentinel); the transport is lowered to
     // the negotiated version below.
@@ -1014,7 +1018,7 @@ where
     } else {
         pver
     };
-    let mut read_transport = WireTransport::new(stream, handshake_pver, net);
+    let mut read_transport = WireTransport::new(conn, handshake_pver, net);
     // The negotiate deadline bounds the handshake message read
     // absolutely, so a peer dribbling bytes cannot stretch the
     // handshake past it; dcrd's negotiation reads also run under the
@@ -1104,8 +1108,11 @@ where
     // minutes long, so without something the reader polls, a peer this
     // node has decided to drop stays parked in its receive until that
     // budget runs out — the socket shutdown the other loops perform
-    // cannot be relied on to cut it short across platforms.
-    let cancel = crate::transport::Cancel::new();
+    // cannot be relied on to cut it short across platforms.  The flag
+    // was minted with the socket, so raising it is the same act for the
+    // server's disconnect paths as for this connection's own loops:
+    // dcrd's `Peer.Disconnect` reaches every teardown because the conn
+    // is the shared object, and here the `Teardown` is.
     read_transport.set_cancel(cancel.clone());
 
     // Fold the handshake's traffic into the peer's counters: dcrd's
@@ -1158,7 +1165,6 @@ where
 
     let output_peer = Arc::clone(&peer);
     let output_stall = Arc::clone(&stall_state);
-    let output_cancel = cancel.clone();
     let output = thread::spawn(move || {
         let mut output_env = NodePeerEnv::new();
         let reason = run_peer_output_with_stall(
@@ -1173,8 +1179,11 @@ where
         // the socket down so the remote gets its FIN.  The flag is the
         // half that makes the input loop return promptly; see
         // `run_stall_detector`.
-        output_cancel.cancel();
-        let _ = write_transport.get_mut().shutdown(Shutdown::Both);
+        // End the connection when the output loop ends (a write error
+        // or a closed queue).  One call raises the flag the input loop
+        // polls and shuts the socket so the remote gets its FIN; see
+        // `Teardown::disconnect`.
+        write_transport.get_ref().disconnect();
         reason
     });
 
@@ -1200,12 +1209,10 @@ where
     let stall_label = peer.lock().expect("peer mutex poisoned").addr().to_string();
     let stall_tick = stall.tick;
     let stall_thread_state = Arc::clone(&stall_state);
-    let stall_thread_cancel = cancel.clone();
     let stall_thread = thread::spawn(move || {
         run_stall_detector(
             &stall_thread_state,
             &stall_stream,
-            &stall_thread_cancel,
             &stall_label,
             stall_tick,
             &stall_shutdown_rx,
@@ -1230,8 +1237,7 @@ where
     // unblocks (a peer that stopped reading would otherwise wedge it),
     // stop the ping timer and the stall detector, and close the outbound
     // queue, then join the three threads.
-    cancel.cancel();
-    let _ = read_transport.get_mut().shutdown(Shutdown::Both);
+    read_transport.get_ref().disconnect();
     let _ = ping_shutdown.send(());
     let _ = stall_shutdown.send(());
     drop(outbound);

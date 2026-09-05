@@ -84,7 +84,7 @@ fn drive(frames: Vec<Vec<u8>>) -> Vec<String> {
         let na = net_address_v2_from_socket(remote_addr, ServiceFlag(0)).expect("net address");
         peer.associate(&remote_addr.to_string(), na, 0);
         run_peer_connection(
-            stream,
+            dcroxide_node::transport::Teardown::new(stream),
             peer,
             MAX_PROTOCOL_VERSION,
             NET,

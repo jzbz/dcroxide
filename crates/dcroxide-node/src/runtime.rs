@@ -50,7 +50,7 @@ pub struct ConnectedPeers {
 #[derive(Default)]
 struct ConnectedPeersInner {
     next_id: u64,
-    peers: HashMap<u64, TcpStream>,
+    peers: HashMap<u64, crate::transport::Teardown>,
 }
 
 impl ConnectedPeers {
@@ -70,11 +70,11 @@ impl ConnectedPeers {
     }
 
     /// Register a live connection, returning the handle used to remove it.
-    fn register(&self, stream: TcpStream) -> u64 {
+    fn register(&self, conn: crate::transport::Teardown) -> u64 {
         let mut inner = self.locked();
         let id = inner.next_id;
         inner.next_id = inner.next_id.wrapping_add(1);
-        inner.peers.insert(id, stream);
+        inner.peers.insert(id, conn);
         id
     }
 
@@ -93,13 +93,18 @@ impl ConnectedPeers {
         self.len() == 0
     }
 
-    /// Disconnect every live connection by shutting down its socket,
-    /// which unblocks each peer's read loop so it winds down (dcrd's
-    /// server shutdown disconnecting all peers).
+    /// Disconnect every live connection, which unblocks each peer's
+    /// read loop so it winds down (dcrd's server shutdown running
+    /// `ForAllPeers(sp.Disconnect)`).
+    ///
+    /// Through each connection's teardown handle, so the flag its reader
+    /// polls goes up with the socket shutdown rather than leaving the
+    /// reader parked until its idle budget runs out; see
+    /// `transport::Teardown::disconnect`.
     pub fn disconnect_all(&self) {
         let inner = self.locked();
-        for stream in inner.peers.values() {
-            let _ = stream.shutdown(Shutdown::Both);
+        for conn in inner.peers.values() {
+            conn.disconnect();
         }
     }
 }
@@ -363,7 +368,19 @@ fn serve_inbound_peer(
     peer.associate(&addr.to_string(), na, NodePeerEnv::new().now_nanos());
     // An inbound peer is never a persistent (added) node and has no
     // connection request.
-    serve_connection(stream, peer, addr, template, connected, server, false, None);
+    // The connection's teardown handle is minted here, where the socket
+    // first has a reader ahead of it, so every later holder shares one
+    // flag (dcrd shares the `net.Conn` itself).
+    serve_connection(
+        crate::transport::Teardown::new(stream),
+        peer,
+        addr,
+        template,
+        connected,
+        server,
+        false,
+        None,
+    );
 }
 
 /// Build, associate, and run a single outbound peer to completion,
@@ -374,7 +391,7 @@ fn serve_inbound_peer(
 /// the manual-control RPCs can remove the request (dcrd's
 /// `serverPeer.connReq`).
 pub(crate) fn serve_outbound_peer(
-    stream: TcpStream,
+    conn: crate::transport::Teardown,
     addr: SocketAddr,
     template: &PeerTemplate,
     connected: &ConnectedPeers,
@@ -417,7 +434,7 @@ pub(crate) fn serve_outbound_peer(
     };
 
     serve_connection(
-        stream,
+        conn,
         peer,
         addr,
         template,
@@ -434,7 +451,7 @@ pub(crate) fn serve_outbound_peer(
 /// for both directions).
 #[allow(clippy::too_many_arguments)]
 fn serve_connection(
-    stream: TcpStream,
+    conn: crate::transport::Teardown,
     peer: Peer,
     addr: SocketAddr,
     template: &PeerTemplate,
@@ -446,7 +463,7 @@ fn serve_connection(
     // Register a socket handle so a shutdown can interrupt this peer's
     // blocking read; a failed clone just leaves it unregistered.  The
     // guard deregisters on every exit path, panics included.
-    let _guard = stream.try_clone().ok().map(|h| DeregisterGuard {
+    let _guard = conn.try_clone().ok().map(|h| DeregisterGuard {
         connected,
         id: connected.register(h),
     });
@@ -463,7 +480,7 @@ fn serve_connection(
             InboundHooks::Server(ServerPeerHandler::new(
                 ctx,
                 whitelisted,
-                stream.try_clone().ok(),
+                conn.try_clone().ok(),
                 permanent,
                 conn_req_id,
                 addr.to_string(),
@@ -477,7 +494,7 @@ fn serve_connection(
         InboundHooks::NoOp => None,
     };
     let _ = run_peer_connection(
-        stream,
+        conn,
         peer,
         template.protocol_version,
         template.net,
@@ -491,6 +508,12 @@ fn serve_connection(
 /// The lifecycle hooks a served inbound connection runs: the full
 /// server dispatch when a [`ServerContext`] is available, or plain
 /// protocol serving for tests exercising just the plumbing.
+// The server variant carries the whole per-peer dispatch and the plain
+// one carries nothing, so the size gap is inherent rather than an
+// oversight; boxing it would put an allocation on every inbound
+// connection to save a discriminant's worth of stack in the arm that
+// never runs in production.
+#[allow(clippy::large_enum_variant)]
 enum InboundHooks {
     Server(ServerPeerHandler),
     NoOp,
@@ -671,6 +694,61 @@ fn accept_loop(listener: &TcpListener, shutdown: &AtomicBool, handler: &InboundH
 mod tests {
     use super::*;
 
+    /// Server shutdown ends every connection through its teardown
+    /// handle.
+    ///
+    /// dcrd's equivalent is `ForAllPeers(sp.Disconnect)` — the same
+    /// `Disconnect` as every other site, which is why the port having a
+    /// weaker one here was a divergence rather than a nicety. Cannot
+    /// pin the Windows latency this buys.
+    #[test]
+    fn server_shutdown_ends_every_connection_through_its_teardown() {
+        use std::io::Read as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let bound = listener.local_addr().expect("addr");
+        let connected = ConnectedPeers::new();
+
+        let mut clients = Vec::new();
+        let mut flags = Vec::new();
+        for _ in 0..2 {
+            let client = std::net::TcpStream::connect(bound).expect("connect");
+            let (server, _) = listener.accept().expect("accept");
+            let conn = crate::transport::Teardown::new(server);
+            flags.push(conn.cancel());
+            connected.register(conn);
+            clients.push(client);
+        }
+
+        // Registered but never handed to the registry: proves the sweep
+        // reaches the registry's entries rather than every handle alive.
+        let stray_client = std::net::TcpStream::connect(bound).expect("connect");
+        let (stray_server, _) = listener.accept().expect("accept");
+        let stray = crate::transport::Teardown::new(stray_server);
+        let stray_flag = stray.cancel();
+
+        for f in &flags {
+            assert!(!f.is_cancelled(), "registration must not raise");
+        }
+
+        connected.disconnect_all();
+
+        for (n, (f, c)) in flags.iter().zip(clients.iter()).enumerate() {
+            assert!(f.is_cancelled(), "connection {n}'s flag must be raised");
+            let mut buf = [0u8; 1];
+            assert_eq!(
+                (&*c).read(&mut buf).expect("read"),
+                0,
+                "connection {n} must still get its FIN"
+            );
+        }
+        assert!(
+            !stray_flag.is_cancelled(),
+            "an unregistered connection must be left alone"
+        );
+        drop((stray, stray_client));
+    }
+
     #[test]
     fn resolves_wildcard_bind_addresses() {
         assert_eq!(bind_address("tcp4", ":9108"), "0.0.0.0:9108");
@@ -715,7 +793,7 @@ mod tests {
         let _ = std::thread::spawn(move || {
             let _guard = DeregisterGuard {
                 connected: &registered,
-                id: registered.register(stream),
+                id: registered.register(crate::transport::Teardown::new(stream)),
             };
             assert_eq!(registered.len(), 1);
             panic!("unwind through the guard");
@@ -742,7 +820,7 @@ mod tests {
         let connected = ConnectedPeers::new();
         let _held_client = TcpStream::connect(bound).expect("connect held");
         let (held_server, _) = listener.accept().expect("accept held");
-        connected.register(held_server);
+        connected.register(crate::transport::Teardown::new(held_server));
         assert_eq!(connected.len(), 1);
 
         let template = PeerTemplate {

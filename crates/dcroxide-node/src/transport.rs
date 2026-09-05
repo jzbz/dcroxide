@@ -78,6 +78,119 @@ impl Cancel {
     }
 }
 
+/// A connection's teardown handle: a socket handle to shut down and the
+/// [`Cancel`] flag its reader polls, bound together so neither half can
+/// be raised without the other (dcrd `peer.Peer.Disconnect`,
+/// `peer/peer.go:1974-1986`, which closes `p.conn` and CASes
+/// `p.disconnect` / closes `p.quit` inside one method under one mutex).
+///
+/// dcrd needs no such pairing at its call sites: `Conn.Close` alone
+/// aborts every blocked `Read`, so `Disconnect` is the whole teardown
+/// and its callers in `server.go` cannot get it half right.  The port
+/// needs both halves -- see this module's documentation on `shutdown`
+/// versus a blocking `recv` under Winsock -- and used to write them out
+/// by hand at each site, which is why the server's own disconnect paths
+/// shut the socket down and left the flag alone while the peer loops
+/// raised both.  Owning both here makes the mismatch unrepresentable: a
+/// disconnect path holds a `Teardown` rather than a `TcpStream`, so it
+/// has no lone socket handle to shut down.
+pub struct Teardown {
+    conn: std::net::TcpStream,
+    cancel: Cancel,
+}
+
+impl Teardown {
+    /// A teardown handle for a freshly accepted or dialed connection,
+    /// its flag lowered.
+    pub fn new(conn: std::net::TcpStream) -> Teardown {
+        Teardown {
+            conn,
+            cancel: Cancel::new(),
+        }
+    }
+
+    /// Another handle on the same connection, sharing this one's flag.
+    ///
+    /// Sharing is the invariant the whole mechanism rests on: the reader
+    /// polls the flag its transport was handed, so a handle carrying a
+    /// second flag would raise one nobody reads -- the pre-fix
+    /// behaviour, reintroduced silently.  Deliberately fallible, exactly
+    /// like the `TcpStream::try_clone` it wraps, so the callers that
+    /// already tolerate a failed clone keep doing so unchanged.
+    pub fn try_clone(&self) -> std::io::Result<Teardown> {
+        Ok(Teardown {
+            conn: self.conn.try_clone()?,
+            cancel: self.cancel.clone(),
+        })
+    }
+
+    /// This connection's flag, to hand its read transport
+    /// ([`WireTransport::set_cancel`]).
+    pub fn cancel(&self) -> Cancel {
+        self.cancel.clone()
+    }
+
+    /// Borrow the socket handle, for the address queries the server
+    /// makes of it (`local_addr`, reported as `getpeerinfo`'s
+    /// `addrlocal`).  Not a teardown seam: end a connection with
+    /// [`Teardown::disconnect`], never with a bare `shutdown` here.
+    pub fn get_ref(&self) -> &std::net::TcpStream {
+        &self.conn
+    }
+
+    /// End the connection: raise the flag the reader polls, then shut
+    /// the socket down so the remote gets its FIN (dcrd
+    /// `peer.Peer.Disconnect`, whose single `p.conn.Close()` does both).
+    /// Idempotent, and safe to call from any thread.
+    ///
+    /// It takes no lock -- the flag is one relaxed atomic store and the
+    /// shutdown is a syscall -- so it is safe to call while a registry
+    /// mutex is held, which is where the server's disconnect paths call
+    /// it from.  dcrd does the same: `disconnectNode` calls
+    /// `Disconnect()` under `peerState.Lock()`.
+    ///
+    /// The flag goes up first, the order `run_stall_detector` already
+    /// used, so there is never a moment when the socket is dead and the
+    /// flag is still down.
+    pub fn disconnect(&self) {
+        self.cancel.cancel();
+        let _ = self.conn.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+// Framing runs directly over the teardown handle rather than over a
+// further clone of the socket, so pairing the flag with the handle costs
+// a connection no extra descriptors.  `&TcpStream` is itself `Read` and
+// `Write` in std, which is what makes the delegation free.
+impl Read for Teardown {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&self.conn).read(buf)
+    }
+}
+
+impl Write for Teardown {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&self.conn).write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&self.conn).flush()
+    }
+}
+
+// The impl lives here rather than in `socktimeout.rs`, whose module
+// documentation places it there for types belonging to neither caller;
+// `Teardown` is this module's own.
+impl SocketTimeout for Teardown {
+    fn set_socket_read_timeout(&self, timeout: Option<Duration>) {
+        let _ = self.conn.set_read_timeout(timeout);
+    }
+
+    fn set_socket_write_timeout(&self, timeout: Option<Duration>) {
+        let _ = self.conn.set_write_timeout(timeout);
+    }
+}
+
 /// Server-wide wire byte totals (dcrd's `bytesReceived`/`bytesSent`
 /// atomic pair on the server, fed by every peer's reads and writes and
 /// served by the getnettotals RPC).
@@ -484,6 +597,64 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cloned teardown handle shares one flag, and `disconnect` does
+    /// both halves.
+    ///
+    /// This is the foundation every disconnect site rests on: the flag
+    /// is raised from a handle other than the one the reader holds,
+    /// which is the geometry of all six of them.
+    ///
+    /// What it cannot pin: that a raised flag actually returns a
+    /// blocked `recv` under Winsock. That is the platform behaviour
+    /// this whole mechanism exists for and it is unobservable here.
+    #[test]
+    fn a_cloned_teardown_shares_one_flag_and_disconnect_does_both_halves() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = std::net::TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+
+        let conn = Teardown::new(server);
+        let flag = conn.cancel();
+        let _first = conn.try_clone().expect("clone");
+        let second = conn.try_clone().expect("clone");
+
+        assert!(!flag.is_cancelled(), "the flag starts down");
+        second.disconnect();
+        assert!(
+            flag.is_cancelled(),
+            "a clone must share the original's flag, not mint its own"
+        );
+
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            (&client).read(&mut buf).expect("read"),
+            0,
+            "the FIN must still go out: disconnect is not flag-only"
+        );
+    }
+
+    /// Two independently minted handles over one socket do NOT share a
+    /// flag -- the pre-fix shape, and the regression this guards.
+    #[test]
+    fn separately_minted_teardowns_do_not_share_a_flag() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let _client = std::net::TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+
+        let one = Teardown::new(server.try_clone().expect("clone"));
+        let two = Teardown::new(server);
+        let flag = one.cancel();
+
+        two.disconnect();
+        assert!(
+            !flag.is_cancelled(),
+            "a separately minted handle raises a flag nobody reads -- \
+             the bug this type exists to make unrepresentable"
+        );
+    }
     use std::io::Cursor;
 
     use dcroxide_peer::MAX_PROTOCOL_VERSION;

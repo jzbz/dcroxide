@@ -264,7 +264,7 @@ fn run_peer_connection_negotiates_and_serves_until_the_remote_closes() {
         let forwarded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Message>::new()));
         let sink = std::sync::Arc::clone(&forwarded);
         let reason = run_peer_connection(
-            stream,
+            dcroxide_node::transport::Teardown::new(stream),
             peer,
             MAX_PROTOCOL_VERSION,
             NET,
@@ -339,7 +339,7 @@ fn run_peer_connection_frames_at_the_negotiated_version_not_the_sentinel() {
         let forwarded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Message>::new()));
         let sink = std::sync::Arc::clone(&forwarded);
         let _ = run_peer_connection(
-            stream,
+            dcroxide_node::transport::Teardown::new(stream),
             peer,
             0,
             NET,

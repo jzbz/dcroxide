@@ -24,7 +24,6 @@
 //! subsystems simply have nothing to do.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -154,7 +153,7 @@ pub fn new_recently_advertised()
 /// and the local connection address.
 struct SyncPeerHandles {
     outbound: OutboundQueue,
-    socket: Option<TcpStream>,
+    socket: Option<crate::transport::Teardown>,
     relay: Arc<Mutex<RelayPeerState>>,
     peer: Arc<Mutex<Peer>>,
     local_addr: Option<String>,
@@ -230,7 +229,7 @@ impl SyncPeers {
         &self,
         id: i32,
         outbound: OutboundQueue,
-        socket: Option<TcpStream>,
+        socket: Option<crate::transport::Teardown>,
         relay: Arc<Mutex<RelayPeerState>>,
         peer: Arc<Mutex<Peer>>,
         local_addr: Option<String>,
@@ -676,7 +675,7 @@ impl SyncPeers {
         if let Some(handles) = registry.remove(&id)
             && let Some(socket) = &handles.socket
         {
-            let _ = socket.shutdown(Shutdown::Both);
+            socket.disconnect();
         }
         true
     }
@@ -705,7 +704,7 @@ impl SyncPeers {
             if let Some(handles) = registry.remove(id)
                 && let Some(socket) = &handles.socket
             {
-                let _ = socket.shutdown(Shutdown::Both);
+                socket.disconnect();
             }
         }
         !ids.is_empty()
@@ -736,7 +735,7 @@ impl SyncPeers {
             .map(|(id, _)| *id)?;
         let handles = registry.remove(&id).expect("found above");
         if let Some(socket) = &handles.socket {
-            let _ = socket.shutdown(Shutdown::Both);
+            socket.disconnect();
         }
         Some(handles.conn_req_id)
     }
@@ -834,7 +833,7 @@ impl SyncPeers {
                         ..
                     }) = registry.get(&peer)
                     {
-                        let _ = socket.shutdown(Shutdown::Both);
+                        socket.disconnect();
                     }
                 }
                 Action::Log { level, message } => match level {
@@ -1028,7 +1027,7 @@ pub struct ServerPeerHandler {
     sync_peer_id: Option<i32>,
     /// A socket handle handed to the registry so disconnect actions
     /// can interrupt this peer's read.
-    socket: Option<TcpStream>,
+    socket: Option<crate::transport::Teardown>,
     /// Whether this is a persistent outbound peer (dcrd's
     /// `serverPeer.persistent`); recorded in the registry so
     /// `getaddednodeinfo` lists it and `node disconnect` skips it.
@@ -1387,7 +1386,7 @@ impl ServerPeerHandler {
     pub fn new(
         ctx: Arc<ServerContext>,
         is_whitelisted: bool,
-        socket: Option<TcpStream>,
+        socket: Option<crate::transport::Teardown>,
         permanent: bool,
         conn_req_id: Option<u64>,
         remote_addr: String,
@@ -1627,7 +1626,7 @@ impl ServerPeerHandler {
         let local_addr = self
             .socket
             .as_ref()
-            .and_then(|socket| socket.local_addr().ok())
+            .and_then(|socket| socket.get_ref().local_addr().ok())
             .map(|addr| addr.to_string());
         // The getdata serve worker paces its send pipeline against the
         // byte accounting the output loop keeps on this same handle.
@@ -2685,6 +2684,7 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpStream;
 
     fn relay_facts(disable_relay_tx: bool) -> crate::server::RelayPeerFacts {
         crate::server::RelayPeerFacts {
@@ -3063,6 +3063,86 @@ mod tests {
         );
     }
 
+    use std::io::Read as _;
+    use std::net::TcpListener;
+
+    // Register `id` over a loopback connection, returning the client
+    // end, the remote address and the registered handle's flag, so a
+    // test can watch the teardown from outside the registry.
+    fn register_watched(
+        peers: &SyncPeers,
+        listener: &TcpListener,
+        id: i32,
+        permanent: bool,
+    ) -> (TcpStream, String, crate::transport::Cancel) {
+        let bound = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(bound).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let remote = server.peer_addr().expect("peer addr").to_string();
+        let conn = crate::transport::Teardown::new(server);
+        let flag = conn.cancel();
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        peers.register(
+            id,
+            queue,
+            Some(conn),
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+            test_peer_handle(),
+            None,
+            permanent,
+            None,
+            Some(remote.clone()),
+            None,
+        );
+        (client, remote, flag)
+    }
+
+    /// Every server-side disconnect ends the connection through its
+    /// teardown handle, raising the flag the reader polls as well as
+    /// shutting the socket.
+    ///
+    /// Written as a flag assertion rather than a latency one on
+    /// purpose: on Linux `shutdown` already cuts the read, so a
+    /// latency test would have passed before the fix. What it cannot
+    /// pin is the Windows behaviour the flag exists for.
+    #[test]
+    fn every_server_disconnect_path_ends_the_connection_through_its_teardown() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let peers = SyncPeers::new();
+
+        let (c1, _a1, f1) = register_watched(&peers, &listener, 1, false);
+        let (c2, a2, f2) = register_watched(&peers, &listener, 2, false);
+        let (c3, _a3, f3) = register_watched(&peers, &listener, 3, true);
+        let (c4, _a4, f4) = register_watched(&peers, &listener, 4, false);
+        // A bystander, never targeted: proves each raise is aimed
+        // rather than a registry-wide sweep.
+        let (c5, _a5, f5) = register_watched(&peers, &listener, 5, false);
+
+        for (n, f) in [(1, &f1), (2, &f2), (3, &f3), (4, &f4), (5, &f5)] {
+            assert!(!f.is_cancelled(), "peer {n} starts undisturbed");
+        }
+
+        assert!(peers.disconnect_by_id(1), "peer 1 is disconnectable");
+        assert!(peers.disconnect_by_addr(&a2), "peer 2 matches by address");
+        assert!(
+            peers.remove_persistent_by_id(3).is_some(),
+            "peer 3 is a persistent peer"
+        );
+        peers.execute(vec![Action::Disconnect { peer: 4 }]);
+
+        for (n, f, c) in [(1, &f1, &c1), (2, &f2, &c2), (3, &f3, &c3), (4, &f4, &c4)] {
+            assert!(f.is_cancelled(), "peer {n}'s flag must be raised");
+            let mut buf = [0u8; 1];
+            assert_eq!(
+                (&*c).read(&mut buf).expect("read"),
+                0,
+                "peer {n} must still get its FIN: the shutdown is additive"
+            );
+        }
+        assert!(!f5.is_cancelled(), "an untargeted peer must be left alone");
+        drop(c5);
+    }
+
     /// `getaddednodeinfo` lists only the permanent peers, and `node
     /// disconnect` shuts the non-permanent peer's socket, deletes it
     /// synchronously (so a repeat is "not found"), and treats a permanent
@@ -3089,7 +3169,7 @@ mod tests {
             peers.register(
                 id,
                 queue,
-                Some(server),
+                Some(crate::transport::Teardown::new(server)),
                 Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
                 test_peer_handle(),
                 None,
@@ -3218,7 +3298,7 @@ mod tests {
             peers.register(
                 id,
                 queue,
-                Some(server),
+                Some(crate::transport::Teardown::new(server)),
                 Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
                 test_peer_handle(),
                 None,
@@ -3581,7 +3661,7 @@ mod tests {
         peers.register(
             7,
             queue,
-            Some(ours),
+            Some(crate::transport::Teardown::new(ours)),
             Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
             test_peer_handle(),
             None,

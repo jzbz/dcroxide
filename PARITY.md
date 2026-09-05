@@ -500,6 +500,26 @@ against upstream and the port is faithful.
   all under one lock, which closes that window. Splitting the flush out would
   open it. The port is intentionally stronger than upstream here.
 
+- **Peer teardown raises a flag where dcrd closes the connection.** dcrd ends a
+  connection with `Peer.Disconnect`, which closes the `net.Conn` *and* CASes
+  `p.disconnect` / closes `p.quit` in one method under one mutex, so every
+  server-side teardown gets both halves and its reader unwinds immediately on
+  every platform. The port cannot close a descriptor out from under a reading
+  thread without `unsafe`, and `shutdown` does not reliably cut a pending
+  `recv` under Winsock, so each connection carries a `transport::Cancel` the
+  reader polls in `READ_POLL_INTERVAL` (1 s) slices. That much was already
+  true; what was divergent was that the port wrote dcrd's one method out as two
+  statements at each site, and three of them performed only the `shutdown`
+  half. `transport::Teardown` now owns the socket handle and the flag together
+  and exposes one `disconnect()`, and it has replaced the bare `TcpStream` in
+  every field and parameter on a disconnect path, so a site with a lone socket
+  to shut down no longer exists. The flag is minted at the accept and at the
+  dial rather than inside `serve_peer`, so every holder shares one. Pinned at
+  each of the six sites plus the clone-sharing invariant beneath them. The
+  residual cost is dcrd's own shape reproduced: one wake-up per second per idle
+  connection (~125 at the default `--maxpeers`), against dcrd's blocking read
+  with no poll at all.
+
 #### Open: the port does not match dcrd here
 
 These are real divergences from the parity pin and someone should eventually
@@ -556,43 +576,6 @@ closing it would cost.
   trusting a removed issuer, and keeps rejecting a newly added one, until
   restart. Upstream since `488b8163` (2023-07-10), first carried by a dcrd
   release in 2.0.0, so a standing gap rather than a 2.2 delta.
-
-- **Peer teardown polls a flag where dcrd closes the connection.** dcrd ends a
-  peer by calling `Disconnect`, which closes the `net.Conn`; Go's runtime makes a
-  goroutine blocked in `Read` return on every platform, so the connection's
-  handlers unwind immediately. The port has no equivalent: `TcpStream::shutdown`
-  on one `try_clone`d handle does not reliably abort a `recv` already in flight on
-  another handle to the same socket under Winsock, and closing the descriptor out
-  from under a reading thread is not expressible without `unsafe`. So each
-  connection carries a `transport::Cancel` flag; whoever decides the connection is
-  over raises it alongside the socket shutdown, and the read is issued in
-  `READ_POLL_INTERVAL` (1 s) slices so the reader observes it within a second
-  instead of whenever its idle budget runs out. Before this, a peer the stall
-  detector had already logged as disconnected stayed parked in its receive on
-  Windows until the idle timeout expired, holding its slot; the whole point of the
-  stall detector is to free that slot promptly. Slicing the receive also changed
-  what a receive returning nothing means: `WouldBlock`/`TimedOut` is now the slice
-  elapsing rather than the budget being spent, so it continues instead of failing
-  the read — without that, an honest peer that went quiet for a second mid-message
-  would be disconnected, which the pre-slicing loop never did because its timeout
-  *was* the budget. Pinned by `transport.rs`'s
-  `a_cancelled_read_returns_without_waiting_out_its_budget` and
-  `a_quiet_peer_survives_longer_than_one_poll_slice`, both verified to fail when
-  their mechanism is removed. The cost is one wake-up per second per idle
-  connection (~125 at the default `--maxpeers`).
-
-  The mechanism is settled; its coverage is not, and that is why this entry
-  sits here rather than under *Accepted*. Only the stall detector, the output
-  loop and `serve_peer`'s own post-input-loop teardown raise the flag, all
-  inside `peerloop.rs`. The server proper does not: `node disconnect`, `node
-  remove` and the sync manager's ban and misbehaviour disconnects
-  (`dispatch.rs`), and the connection manager's `DialedConn::close`
-  (`outbound.rs`), call `shutdown` alone — the exact mechanism this entry says
-  cannot be relied on to abort an in-flight `recv` under Winsock. dcrd routes
-  all of them through `Disconnect`, which closes the connection, so its reader
-  unwinds immediately on every platform. The residue is Windows-only and
-  bounded by whichever write next fails, but it holds the outbound-group slot
-  until then. Raising `Cancel` at those sites is the work.
 
 - **`getwork` cancellation is partial: the queue is abandoned, the holder is
   not, and the hangup signal misses clean TLS closes.** dcrd cancels getwork in

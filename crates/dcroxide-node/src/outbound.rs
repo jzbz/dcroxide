@@ -24,7 +24,7 @@
 //! custom duplicate strings are gone upstream).
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -45,17 +45,24 @@ pub type SharedConnManager = Arc<Mutex<ConnManager>>;
 /// attempt time in unix seconds.
 pub type AddressSource = Box<dyn FnMut() -> Result<(NetAddress, i64), String> + Send>;
 
-/// A dialed connection handle: the established stream for the serve
-/// thread, and a shutdown clone so `Disconnect`/`Remove` can force
-/// the socket closed (dcrd closing the `net.Conn`).
+/// A dialed connection handle: the established connection for the serve
+/// thread, and a teardown clone so `Disconnect`/`Remove` can end it
+/// (dcrd closing the `net.Conn`).
+///
+/// Both halves are `Teardown`s sharing one flag, so ending the
+/// connection from the driver raises the same flag the serve thread's
+/// reader polls.  Holding a bare socket here was the bug: `close` shut
+/// the socket down and left the flag alone, which is the half this
+/// module's transport documentation says cannot be relied on to abort
+/// an in-flight `recv` under Winsock.
 struct DialedConn {
-    stream: Arc<Mutex<Option<TcpStream>>>,
-    shutdown: TcpStream,
+    stream: Arc<Mutex<Option<crate::transport::Teardown>>>,
+    shutdown: crate::transport::Teardown,
 }
 
 impl DialedConn {
     fn close(&self) {
-        let _ = self.shutdown.shutdown(Shutdown::Both);
+        self.shutdown.disconnect();
     }
 }
 
@@ -410,9 +417,14 @@ fn dial(
     if let Some(addr_manager) = addr_manager {
         mark_dial_attempt(addr_manager, dialer, addr, timeout)?;
     }
-    let stream = dialer
-        .dial(addr, timeout)
-        .map_err(|e| format!("dial failed: {e}"))?;
+    // The connection's teardown handle is minted here, at the dial, so
+    // the driver's `close` and the serve thread's reader share one flag
+    // (dcrd shares the `net.Conn` itself).
+    let stream = crate::transport::Teardown::new(
+        dialer
+            .dial(addr, timeout)
+            .map_err(|e| format!("dial failed: {e}"))?,
+    );
     let shutdown = stream
         .try_clone()
         .map_err(|e| format!("dial clone failed: {e}"))?;
@@ -1045,6 +1057,59 @@ fn spawn_timer(delay_nanos: i64, commands: mpsc::Sender<Command>, command: Comma
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Closing a dialed entry raises the flag the serve thread will
+    /// poll, across the take-once handoff.
+    ///
+    /// The handoff is the only place the driver's control handle and
+    /// the serve thread's connection could have drifted apart, which is
+    /// what holding a bare socket here used to do: `close` shut the
+    /// socket and left the flag alone. Cannot pin that `apply_remove`
+    /// is reached in a real driver run, nor the Windows behaviour.
+    #[test]
+    fn closing_a_dialed_entry_raises_the_flag_the_serve_thread_will_poll() {
+        use std::io::Read as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let bound = listener.local_addr().expect("addr");
+        let peer_end = std::net::TcpStream::connect(bound).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+
+        // Built the way `dial` builds one.
+        let dialed = crate::transport::Teardown::new(server);
+        let shutdown = dialed.try_clone().expect("clone");
+        let conn = DialedConn {
+            stream: Arc::new(Mutex::new(Some(dialed))),
+            shutdown,
+        };
+
+        // The handle the serve thread receives, taken as
+        // `handle_dial_done` takes it.
+        let handed = conn
+            .stream
+            .lock()
+            .expect("dialed stream mutex poisoned")
+            .take()
+            .expect("the dialed stream is taken once");
+        let flag = handed.cancel();
+        assert!(
+            !flag.is_cancelled(),
+            "neither construction nor the handoff may raise it"
+        );
+
+        conn.close();
+
+        assert!(
+            flag.is_cancelled(),
+            "the driver's close must raise the flag the serve thread polls"
+        );
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            (&peer_end).read(&mut buf).expect("read"),
+            0,
+            "the FIN must still go out"
+        );
+    }
 
     /// dcrd `attemptDcrdDial`'s bookkeeping: a routable dial target the
     /// manager never learned joins it (AddAddresses with itself as the

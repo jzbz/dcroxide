@@ -4077,7 +4077,7 @@ mod tests {
         sync_peers.register(
             3,
             queue,
-            Some(server),
+            Some(crate::transport::Teardown::new(server)),
             Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
                 crate::server::RelayPeerFacts {
                     connected: true,
@@ -4282,7 +4282,7 @@ mod tests {
         sync_peers.register(
             1,
             queue,
-            Some(reg_socket),
+            Some(crate::transport::Teardown::new(reg_socket)),
             Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
                 crate::server::RelayPeerFacts {
                     connected: true,

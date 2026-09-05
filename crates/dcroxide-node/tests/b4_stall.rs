@@ -128,7 +128,7 @@ where
         peer.associate(&remote_addr.to_string(), na, 0);
 
         let reason = run_peer_connection_with_stall(
-            stream,
+            dcroxide_node::transport::Teardown::new(stream),
             peer,
             MAX_PROTOCOL_VERSION,
             NET,
