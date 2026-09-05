@@ -68,6 +68,27 @@ struct Scenario {
     expect_err: Option<String>,
 }
 
+/// Scenarios where the port deliberately answers differently from dcrd.
+///
+/// The vector rows are dcrd's answers, dumped from dcrd, and stay that
+/// way: editing one to match the port would turn the oracle into a
+/// mirror and lose the only record of what upstream does. A divergence
+/// is declared here instead, next to the substring the port's error must
+/// contain, so it is visible in the harness rather than hidden in a
+/// rewritten expectation.
+///
+/// Each entry needs a PARITY entry to go with it.
+fn deliberate_divergence(name: &str) -> Option<&'static str> {
+    match name {
+        // PARITY: "`--tlscurve=P-521` is refused where dcrd accepts it".
+        // rustls's ring provider signs P-256 and P-384 only, so accepting
+        // the flag would only defer the failure to listener setup, where
+        // it reads as a key-format problem.
+        "tlscurve p521" => Some("P-521"),
+        _ => None,
+    }
+}
+
 #[test]
 fn config_pipeline_matches_dcrd() {
     let mut localhost: Vec<String> = Vec::new();
@@ -199,8 +220,15 @@ fn config_pipeline_matches_dcrd() {
             rand_bytes: Box::new(|b: &mut [u8]| b.fill(0x42)),
         };
 
+        let divergence = deliberate_divergence(&sc.name);
         match load_config(&cli, &positional, &env) {
             Ok((cfg, remaining)) => {
+                assert!(
+                    divergence.is_none(),
+                    "scenario {n} {}: declared a deliberate divergence, but the port \
+                     now agrees with dcrd -- delete the declaration and its PARITY entry",
+                    sc.name
+                );
                 let expected = sc
                     .expect_ok
                     .as_ref()
@@ -210,6 +238,21 @@ fn config_pipeline_matches_dcrd() {
                 assert_eq!(&got, expected, "scenario {n}: {}", sc.name);
             }
             Err(err) => {
+                if let Some(needle) = divergence {
+                    assert!(
+                        sc.expect_err.is_none(),
+                        "scenario {n} {}: declared a deliberate divergence, but dcrd \
+                         rejects this configuration too -- it is not a divergence",
+                        sc.name
+                    );
+                    assert!(
+                        err.contains(needle),
+                        "scenario {n} {}: a declared divergence must say why; \
+                         expected the error to mention {needle:?}, got {err}",
+                        sc.name
+                    );
+                    continue;
+                }
                 let expected = sc
                     .expect_err
                     .as_ref()

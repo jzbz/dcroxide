@@ -1526,15 +1526,36 @@ pub fn reloadable_tls_config(
 /// certificate chaining to those roots, and a file holding no usable
 /// certificate is a hard startup error rather than a silently
 /// unauthenticated endpoint.
+/// Whether a private key's DER names the secp521r1 curve.
+///
+/// `1.3.132.0.35`, as it appears in the parameters of a SEC1
+/// `ECPrivateKey` and in the algorithm identifier of a PKCS#8 one. The
+/// OID is searched for rather than parsed out: its DER encoding is
+/// seven self-delimiting bytes that cannot occur by accident in a key
+/// this short, and a real DER walk here would be a parser to maintain
+/// for a single yes-or-no question.
+fn p521_key(key_der: &[u8]) -> bool {
+    const SECP521R1_OID_DER: &[u8] = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23];
+    key_der
+        .windows(SECP521R1_OID_DER.len())
+        .any(|window| window == SECP521R1_OID_DER)
+}
+
 fn build_server_config(
     cert_pem: &[u8],
     key_pem: &[u8],
     client_cas_pem: Option<&[u8]>,
 ) -> Result<rustls::ServerConfig, String> {
     use rustls::pki_types::pem::PemObject;
-    // Pin the process-level crypto provider: both bundled providers
-    // are compiled in through the dependency tree, and rustls requires
-    // an explicit choice when more than one is present.
+    // Pin the process-level crypto provider.  Only `ring` is enabled in
+    // the tree, so this is unambiguous today; installing it explicitly
+    // keeps it that way if a dependency ever brings the other one in,
+    // since rustls refuses to guess when two are present.
+    //
+    // The choice has a visible consequence: ring signs with P-256 and
+    // P-384 only (`rustls/src/crypto/ring/sign.rs:48-57`), so a P-521
+    // key cannot serve, which is why [`p521_key`] exists and why
+    // `--tlscurve=P-521` is refused during configuration.  See PARITY.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<_, _>>()
@@ -1563,6 +1584,21 @@ fn build_server_config(
         }
         None => rustls::ServerConfig::builder().with_no_client_auth(),
     };
+    // Say what is actually wrong before rustls says something that is
+    // not.  A P-521 key parses as PEM and as SEC1, so it reaches
+    // `with_single_cert`, which rejects it with "failed to parse private
+    // key as RSA, ECDSA, or EdDSA" -- a message that points at the
+    // format when the format is fine and the curve is the problem.  The
+    // pair is reachable without `--tlscurve=P-521`: dcrd generates one
+    // for the same paths, and an older dcroxide did too.
+    if p521_key(key.secret_der()) {
+        return Err(
+            "the RPC key is on the P-521 curve, which the RPC server's TLS \
+             implementation cannot sign with; delete the certificate and key \
+             to regenerate them on P-256"
+                .to_string(),
+        );
+    }
     let config = builder
         .with_single_cert(certs, key)
         .map_err(|e| format!("unable to build the RPC TLS configuration: {e}"))?;

@@ -623,6 +623,34 @@ These are real divergences from the parity pin and someone should eventually
 close them. Each says what upstream does, what the port does instead, and what
 closing it would cost.
 
+- **`--tlscurve=P-521` is refused where dcrd accepts it.** dcrd generates a
+  P-521 RPC certificate on request and serves TLS with it: Go offers
+  `ECDSAWithP521AndSHA512` in its default signature algorithms
+  (`crypto/tls/defaults.go:63`) and selects exactly that scheme for a P-521
+  key (`crypto/tls/auth.go:227`). The port cannot. Its TLS stack is rustls
+  over the `ring` provider, which signs with P-256 and P-384 only
+  (`rustls/src/crypto/ring/sign.rs:48-57`), so the pair generates fine and
+  then cannot serve. Before this was addressed the daemon accepted the flag
+  and died at listener setup with `failed to parse private key as RSA, ECDSA,
+  or EdDSA` -- a message about formats, when the format is ordinary SEC1 PEM
+  and the curve is the problem.
+
+  The port now refuses the value during configuration, alongside dcrd's own
+  `tlsCurve` validation (`config.go:1344`), and names the curve when a P-521
+  key is found on disk -- reachable without the flag, since dcrd writes one to
+  the same paths and so did an older dcroxide. `tls_curve` itself still maps
+  both curves, so the divergence sits in one place rather than smeared through
+  a function that is otherwise a faithful port.
+
+  Closing it properly means the `aws-lc-rs` provider, which does sign
+  `ECDSA_NISTP521_SHA512` (`rustls/src/crypto/aws_lc_rs/sign.rs:63`). That was
+  weighed and declined for now: it is not in the tree, it vendors a BoringSSL
+  fork requiring cmake and bindgen, it would enter the shipping binary as the
+  crypto backend for all RPC TLS rather than only for P-521, and it is
+  materially harder to build for the Windows and macOS targets CI covers than
+  ring is. The cost is a curve almost nobody selects -- P-256 is the default
+  on both sides -- against a large C library in the trusted computing base.
+
 - **A `--maxpeers` large enough to exhaust memory kills dcrd and not the
   port.** `newServer` builds its relay and broadcast queues as `make(chan
   relayMsg, cfg.MaxPeers)` and `make(chan broadcastMsg, cfg.MaxPeers)`

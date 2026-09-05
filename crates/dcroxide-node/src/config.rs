@@ -2141,6 +2141,22 @@ fn load_config_impl(
     // Prevent using an unsupported curve.
     tls_curve(&cfg.tls_curve)?;
 
+    // And, unlike dcrd, prevent using P-521.  dcrd accepts it and serves
+    // TLS with the resulting certificate; the port's TLS stack cannot
+    // sign with a P-521 key, so accepting the flag here only defers the
+    // failure to listener setup, where it surfaces as "failed to parse
+    // private key as RSA, ECDSA, or EdDSA" and says nothing about the
+    // curve.  Refusing it during configuration is a divergence, recorded
+    // in PARITY; the message is the one dcrd would have to print if it
+    // had the same limitation.
+    if tls_curve(&cfg.tls_curve)? == TlsCurve::P521 {
+        return Err(format!(
+            "the tlscurve option does not support {} -- the RPC server's TLS \
+             implementation can sign with P-256 only",
+            cfg.tls_curve
+        ));
+    }
+
     // Warn about a missing config file only after all other
     // configuration is done.
     if let Some(err) = config_file_error {
