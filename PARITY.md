@@ -615,43 +615,46 @@ closing it would cost.
   restart. Upstream since `488b8163` (2023-07-10), first carried by a dcrd
   release in 2.0.0, so a standing gap rather than a 2.2 delta.
 
-- **`getwork` cancellation is partial: the queue is abandoned, the holder is
-  not, and the hangup signal misses clean TLS closes.** dcrd cancels getwork in
-  three places, not one — the semaphore queue (`rpcserver.go:4170-4174`) and
-  both template waits inside the hold (`case <-ctx.Done()` at `:3914` and
-  `:3932`), with `defer s.workState.workSem.release()` at `:4175` freeing the
-  permit on any of them. The port implements the first only.
+- **`getwork` cancellation is complete except on macOS and Windows.** dcrd
+  cancels getwork in three places: the semaphore queue
+  (`rpcserver.go:4170-4174`) and both template waits inside the hold
+  (`case <-ctx.Done()` at `:3914` and `:3932`), with `defer
+  s.workState.workSem.release()` at `:4175` freeing the permit on any of them.
+  All three are now ported, and the signal that drives them sees a clean TLS
+  close wherever `POLLRDHUP` exists.
 
   `work_sem` is a condvar semaphore rather than a mutex, since a mutex cannot
-  wait on both the permit and a cancellation, and the signal reaches the handler
-  through a thread-local scoped to the request rather than a parameter, because
-  all 77 handlers take `(server, cmd)`. The transport raises the flag on daemon
-  shutdown and on an observed hangup.
+  wait on both the permit and a cancellation, and the signal reaches the
+  handler through a thread-local scoped to the request rather than a
+  parameter, because all 77 handlers take `(server, cmd)`. The two template
+  waits slice their receive and re-read that flag between slices, which is how
+  a `std::sync::mpsc::Receiver` stands in for a `select`. A wait with no token
+  installed -- the CPU miner's generator thread, the test harnesses -- keeps
+  its original blocking shape rather than waking to poll a flag that cannot
+  change.
 
-  Two gaps remain, both real:
+  What remains open is one platform gap. `POLLRDHUP` reports the peer's
+  half-close whatever is buffered ahead of it, which is what a clean TLS close
+  needs: the peer writes a `close_notify` record before the FIN, and the
+  handler is blocked in the hold rather than reading it, so a `MSG_PEEK` finds
+  bytes and reports the client present. rustix exposes `POLLRDHUP` safely, but
+  gates it to Linux, FreeBSD and illumos; its macOS equivalent,
+  `rustix::event::kqueue::kevent`, is declared `pub unsafe fn`, and the
+  workspace forbids `unsafe_code`. So on macOS and Windows the hangup arm
+  still fires only for an abrupt close -- a killed or crashed client, a peer
+  that omits `close_notify`, and the `--notls` localhost path -- while TLS is
+  the default and is required for any non-localhost bind. Closing it wants a
+  safe kqueue wrapper, or detection inside the TLS layer. The latter is not as
+  close as it looks: rustls only learns of a `close_notify` when something
+  pumps I/O on the connection, and the thread that owns that right is
+  precisely the one blocked in the hold.
 
-  1. **The holder is never interrupted.** `request_cancelled()` is read at
-     exactly one site — inside `WorkSem::acquire` — so once a caller holds the
-     permit the flag is a no-op. A caller whose client left while it waits in
-     `sub.recv()` keeps the permit for the rest of that wait: up to
-     `MAX_TEMPLATE_TIMEOUT` (5.5 s) in the known-template case, and until the
-     generator publishes during a reorganization, where `current_template()`
-     returns `Ok(None)` and `subscribe()` skips its immediate delivery. dcrd
-     returns at `:3916`/`:3934` and frees the permit at once. Closing this needs
-     a cancellable receive on `RpcTemplateSubscription`, which every
-     implementation and test double would have to grow.
-  2. **The hangup signal misses clean TLS closes.** `client_hung_up` peeks the
-     raw socket and treats `Ok(0)` as a FIN, but a TLS peer writes a
-     `close_notify` record before closing, so the peek returns bytes rather than
-     zero and the check reports "still connected". TLS is the default and is
-     required for non-localhost binds, so for the normal Decred tooling this arm
-     does not fire; it still fires for abrupt closes — a killed or crashed
-     client, a peer that omits `close_notify`, and the `--notls` localhost path.
-     A correct check needs the peer's half-close state rather than pending
-     bytes: `POLLRDHUP` or `TCP_INFO`. Neither is reachable today, because the
-     workspace sets `unsafe_code = "forbid"` and socket2 exposes neither, so
-     closing this needs a safe wrapper dependency or detection at the TLS layer.
+  Two things this is deliberately not. It is not detection by inspecting the
+  peeked bytes: TLS 1.3 wraps an alert in outer content type 23, so an
+  encrypted `close_notify` is indistinguishable from data. And a pipelined
+  request is not a hangup -- Go's `net/http` says so explicitly and cancels
+  only on a read *error* (`server.go:748-771`), which is why the check reads
+  half-close state rather than treating pending bytes as a signal either way.
 
-  What does work today: cancellation on daemon shutdown, and on abrupt client
-  loss, for a caller still queued. `getwork` over the websocket transport
-  installs no token at all and behaves as it did before.
+  `getwork` over the websocket transport still installs no token and behaves
+  as it did before; `scope_request_cancel` is called only from the HTTP path.

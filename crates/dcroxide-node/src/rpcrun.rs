@@ -3387,32 +3387,23 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
 /// when it sees either.  Only handlers that queue on a shared resource
 /// consult it; everything else runs to completion as before.
 ///
-/// SCOPE, since the obvious reading overstates this: the hangup arm fires
-/// for an abrupt close only.  A TLS peer writes a `close_notify` record
-/// before closing, so the peek below finds bytes pending rather than a
-/// zero-length read and reports the client as still connected — and TLS
-/// is the default, required for any non-localhost bind, so for ordinary
-/// Decred tooling this arm does not fire at all.  It does fire for a
-/// killed or crashed client, a peer that omits `close_notify`, and the
-/// `--notls` localhost path.  A correct check wants the peer's half-close
-/// state (`POLLRDHUP`, or `TCP_INFO`) rather than pending bytes, and
-/// neither is reachable while the workspace forbids `unsafe_code` and
-/// socket2 exposes neither.  The shutdown arm is unaffected.
+/// SCOPE: the hangup arm fires for a clean TLS close as well as an
+/// abrupt one wherever `POLLRDHUP` exists — Linux, FreeBSD and illumos —
+/// because [`peer_half_closed`] reads the peer's half-close state rather
+/// than what happens to be buffered.  On macOS and Windows it still
+/// fires only for an abrupt close: a TLS peer writes a `close_notify`
+/// before closing, the peek finds those bytes rather than a zero-length
+/// read, and reports the client as still connected.  Since TLS is the
+/// default and is required for any non-localhost bind, that is the
+/// ordinary case for Decred tooling on those platforms, and it stays
+/// open in PARITY.  The shutdown arm is unaffected everywhere.
 ///
-/// The client-gone check is a `MSG_PEEK` recv that must not disturb the
-/// socket the handler still owns.  Setting the socket non-blocking is not
-/// an option: `try_clone` dups the descriptor, and on Unix the file
-/// status flags live on the shared open file description, so it would
-/// make the handler's own reads non-blocking too.  `MSG_DONTWAIT` is a
-/// per-call flag instead, leaving the socket's state alone.  A zero-length
-/// peek is a FIN — the client is gone; `WouldBlock` means nothing is
-/// pending and it is still there; buffered bytes mean a pipelined request
-/// is waiting, which is also not a hangup.
+/// Neither probe may disturb the socket the handler still owns, which is
+/// why the fallback peeks with `MSG_DONTWAIT` and the poll uses a zero
+/// timeout; [`peeked_eof`] carries the reasoning for the peek.
 ///
 /// The flag is only read where a handler would otherwise wait, so a false
-/// negative merely restores the previous behaviour.  Platforms without
-/// `MSG_DONTWAIT` fall back to shutdown-only cancellation rather than
-/// risking the shared socket state.
+/// negative merely restores the previous behaviour.
 fn arm_request_cancel(
     cancel: Arc<AtomicBool>,
     sock: Option<TcpStream>,
@@ -3445,10 +3436,99 @@ const REQUEST_CANCEL_POLL: Duration = Duration::from_millis(100);
 
 /// Whether the peer has closed its side, checked without disturbing the
 /// socket's blocking state (see [`arm_request_cancel`]).
+///
+/// Asks for the half-close state first and falls back to the peek, since
+/// the two answer different questions: `POLLRDHUP` reports that the peer
+/// shut down its writing side whatever is buffered, while the peek can
+/// only see a zero-length read, which pending bytes hide.
 #[cfg(unix)]
 fn client_hung_up(sock: Option<&TcpStream>) -> bool {
-    use std::mem::MaybeUninit;
     let Some(sock) = sock else { return false };
+    match peer_half_closed(sock) {
+        Some(gone) => gone,
+        None => peeked_eof(sock),
+    }
+}
+
+/// The peer's half-close state via `POLLRDHUP`, or `None` where the
+/// platform has no such flag or the call failed.
+///
+/// This is what makes cancellation work for a TLS client. A TLS peer
+/// writes a `close_notify` record before closing, so the record sits
+/// unread in the receive buffer -- the handler is blocked in the getwork
+/// hold and is not reading it -- and [`peeked_eof`] finds bytes rather
+/// than a zero-length read. `POLLRDHUP` is set by the FIN itself and is
+/// indifferent to what is queued ahead of it.
+///
+/// dcrd gets this for free: it serves RPC over `tls.Listen`
+/// (`server.go:3868`), so Go's `http.Server` holds a `*tls.Conn` as its
+/// `rwc`, `connReader.backgroundRead` reads *through* TLS, a
+/// `close_notify` surfaces as `io.EOF`, and `handleReadErrorLocked`
+/// cancels the request context.
+///
+/// A zero timeout, so this never blocks the watchdog. `HUP` and `ERR`
+/// count too: the kernel reports them whether or not they were asked
+/// for, and both mean the connection is finished.
+#[cfg(all(
+    unix,
+    any(
+        target_os = "freebsd",
+        target_os = "illumos",
+        all(
+            any(target_os = "linux", target_os = "android"),
+            not(any(target_arch = "sparc", target_arch = "sparc64"))
+        )
+    )
+))]
+fn peer_half_closed(sock: &TcpStream) -> Option<bool> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let gone = PollFlags::RDHUP | PollFlags::HUP | PollFlags::ERR;
+    let mut fds = [PollFd::new(sock, PollFlags::RDHUP)];
+    let zero = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    match poll(&mut fds, Some(&zero)) {
+        Ok(_) => Some(fds[0].revents().intersects(gone)),
+        // A failed poll says nothing about the peer, so defer to the
+        // peek rather than reporting a hangup that may not have
+        // happened; a false negative only restores the older behaviour.
+        Err(_) => None,
+    }
+}
+
+/// Where `POLLRDHUP` does not exist -- macOS and the rest -- there is
+/// no half-close answer to give, so the peek decides alone and a clean
+/// TLS close still goes unnoticed. rustix's kqueue equivalent is an
+/// `unsafe fn`, which the workspace forbids; see PARITY.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "freebsd",
+        target_os = "illumos",
+        all(
+            any(target_os = "linux", target_os = "android"),
+            not(any(target_arch = "sparc", target_arch = "sparc64"))
+        )
+    ))
+))]
+fn peer_half_closed(_sock: &TcpStream) -> Option<bool> {
+    None
+}
+
+/// A zero-length `MSG_PEEK` read, which is a FIN with nothing buffered
+/// ahead of it.
+///
+/// Setting the socket non-blocking is not an option: `try_clone` dups
+/// the descriptor, and on Unix the file status flags live on the shared
+/// open file description, so it would make the handler's own reads
+/// non-blocking too. `MSG_DONTWAIT` is a per-call flag instead, leaving
+/// the socket's state alone. `WouldBlock` means nothing is pending and
+/// the peer is still there; buffered bytes mean either a pipelined
+/// request or an unread `close_notify`, and this cannot tell them apart.
+#[cfg(unix)]
+fn peeked_eof(sock: &TcpStream) -> bool {
+    use std::mem::MaybeUninit;
     let sock = socket2::SockRef::from(sock);
     let mut probe = [MaybeUninit::<u8>::uninit(); 1];
     let flags = libc::MSG_PEEK | libc::MSG_DONTWAIT;
@@ -4748,5 +4828,117 @@ mod tests {
             Some(format!("{message} (4 more suppressed)").as_str()),
             "the next line accounts for the events the flood cost"
         );
+    }
+
+    /// A connected loopback pair, with the accepted server side first.
+    #[cfg(unix)]
+    fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        (server, client)
+    }
+
+    /// The case that motivated the whole change: a peer that writes
+    /// before closing, which is what every TLS client does because it
+    /// sends a `close_notify` record ahead of the FIN.
+    ///
+    /// The peek cannot see past those bytes, so on its own it reports
+    /// the client as still connected and `getwork` keeps holding the
+    /// work semaphore for a caller that is gone. `POLLRDHUP` is set by
+    /// the FIN regardless of what is queued in front of it.
+    ///
+    /// Deterministic: the write and the shutdown both complete before
+    /// anything is asserted, and both flags are level-triggered, so
+    /// there is no window to lose.
+    ///
+    /// Gated to the platforms that have `POLLRDHUP`, matching
+    /// [`peer_half_closed`]. On macOS and Windows this case is the open
+    /// half of the PARITY entry, so asserting it there would be
+    /// asserting a gap the port does not claim to have closed.
+    #[test]
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "freebsd",
+            target_os = "illumos",
+            all(
+                any(target_os = "linux", target_os = "android"),
+                not(any(target_arch = "sparc", target_arch = "sparc64"))
+            )
+        )
+    ))]
+    fn a_hangup_behind_pending_bytes_is_seen() {
+        use std::io::Write;
+        let (server, mut client) = loopback_pair();
+
+        // A close_notify-shaped prelude, then the FIN.
+        client.write_all(b"\x15\x03\x03\x00\x02").expect("write");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close");
+        // Let the loopback deliver both; the assertions below are
+        // level-triggered, so this only has to be long enough once.
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert!(
+            !peeked_eof(&server),
+            "the peek must find the pending bytes, not the FIN --              if this fails the test is no longer covering the TLS shape"
+        );
+        assert_eq!(
+            peer_half_closed(&server),
+            Some(true),
+            "RDHUP must report the half-close that the peek missed"
+        );
+        assert!(
+            client_hung_up(Some(&server)),
+            "the combined check must report the client as gone"
+        );
+    }
+
+    /// The abrupt close that already worked, which must keep working:
+    /// a FIN with nothing buffered ahead of it.
+    #[test]
+    #[cfg(unix)]
+    fn a_bare_hangup_is_still_seen() {
+        let (server, client) = loopback_pair();
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("half-close");
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert!(peeked_eof(&server), "a bare FIN peeks as zero-length");
+        assert!(
+            client_hung_up(Some(&server)),
+            "the combined check still reports the client as gone"
+        );
+    }
+
+    /// And a live connection is not mistaken for a dead one, with and
+    /// without unread data pending -- the pipelined-request case, which
+    /// dcrd deliberately does NOT treat as a hangup (`server.go:748-771`
+    /// in Go's net/http: a byte arriving is a pipelined request, and
+    /// only a read *error* cancels).
+    #[test]
+    #[cfg(unix)]
+    fn a_live_connection_is_not_reported_gone() {
+        use std::io::Write;
+        let (server, mut client) = loopback_pair();
+
+        assert!(
+            !client_hung_up(Some(&server)),
+            "an idle live connection is not a hangup"
+        );
+
+        client.write_all(b"{\"jsonrpc\":\"1.0\"}").expect("write");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !client_hung_up(Some(&server)),
+            "a pipelined request is not a hangup"
+        );
+
+        // Keep the client alive to here, so nothing above raced a drop.
+        drop(client);
     }
 }

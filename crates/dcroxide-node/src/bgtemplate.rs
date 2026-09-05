@@ -41,6 +41,7 @@ use dcroxide_mining::bg_generator::{
 };
 use dcroxide_mining::{BlkTmplGenerator, ExtraNonces, MiningPolicy, TemplateChain};
 use dcroxide_rpc::server::{RpcBlockTemplater, RpcTemplateSubscription, TemplateRecv};
+use dcroxide_rpc::worksem::{CANCEL_POLL_INTERVAL, request_cancelled, request_is_cancellable};
 use dcroxide_txscript::stdaddr::Address;
 use dcroxide_wire::{BlockHeader, MsgBlock, MsgTx};
 
@@ -966,17 +967,74 @@ pub struct NodeTemplateSubscription {
 
 impl RpcTemplateSubscription for NodeTemplateSubscription {
     fn recv(&self) -> TemplateRecv {
-        match self.receiver.recv() {
-            Ok(block) => TemplateRecv::Template(Box::new(block)),
-            Err(_) => TemplateRecv::Canceled,
+        // dcrd selects the notification against the request context
+        // (`rpcserver.go:3910-3917`), so a client that leaves during this
+        // wait -- which is unbounded, since it runs until the generator
+        // publishes -- stops waiting and frees the work semaphore at
+        // once.  A `mpsc::Receiver` cannot select, so the wait is sliced
+        // and the flag re-read between slices, the same shape
+        // `WorkSem::acquire` uses for dcrd's other cancellation arm.
+        //
+        // `Disconnected` stays a cancellation for its own reason: it
+        // means the generator is gone, which is dcrd's nil-template
+        // path rather than its context path.
+        //
+        // With no token installed there is nothing to poll for, so the
+        // wait stays a plain blocking receive.  That is the CPU miner's
+        // generator thread, which also waits here and would otherwise
+        // start waking twenty times a second to re-read a flag that
+        // cannot change.
+        if !request_is_cancellable() {
+            return match self.receiver.recv() {
+                Ok(block) => TemplateRecv::Template(Box::new(block)),
+                Err(_) => TemplateRecv::Canceled,
+            };
+        }
+        loop {
+            if request_cancelled() {
+                return TemplateRecv::Canceled;
+            }
+            match self.receiver.recv_timeout(CANCEL_POLL_INTERVAL) {
+                Ok(block) => return TemplateRecv::Template(Box::new(block)),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return TemplateRecv::Canceled,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
         }
     }
 
     fn recv_with_timeout(&self) -> TemplateRecv {
-        match self.receiver.recv_timeout(MAX_TEMPLATE_TIMEOUT) {
-            Ok(block) => TemplateRecv::Template(Box::new(block)),
-            Err(mpsc::RecvTimeoutError::Timeout) => TemplateRecv::Timeout,
-            Err(mpsc::RecvTimeoutError::Disconnected) => TemplateRecv::Canceled,
+        // The same slicing against dcrd's second context arm
+        // (`rpcserver.go:3928-3935`), inside the known-template timeout
+        // rather than instead of it: the deadline is still
+        // MAX_TEMPLATE_TIMEOUT from entry, so a client that stays
+        // connected sees exactly the wait it saw before.
+        if !request_is_cancellable() {
+            return match self.receiver.recv_timeout(MAX_TEMPLATE_TIMEOUT) {
+                Ok(block) => TemplateRecv::Template(Box::new(block)),
+                Err(mpsc::RecvTimeoutError::Timeout) => TemplateRecv::Timeout,
+                Err(mpsc::RecvTimeoutError::Disconnected) => TemplateRecv::Canceled,
+            };
+        }
+        // Measured as elapsed-since-entry rather than as an absolute
+        // deadline: `Instant::now() + MAX_TEMPLATE_TIMEOUT` is fallible
+        // addition, and a `Duration` subtraction that saturates to
+        // `None` says "the budget is spent" without one.
+        let started = Instant::now();
+        loop {
+            if request_cancelled() {
+                return TemplateRecv::Canceled;
+            }
+            let Some(left) = MAX_TEMPLATE_TIMEOUT.checked_sub(started.elapsed()) else {
+                return TemplateRecv::Timeout;
+            };
+            if left.is_zero() {
+                return TemplateRecv::Timeout;
+            }
+            match self.receiver.recv_timeout(left.min(CANCEL_POLL_INTERVAL)) {
+                Ok(block) => return TemplateRecv::Template(Box::new(block)),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return TemplateRecv::Canceled,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
         }
     }
 
@@ -1211,6 +1269,145 @@ mod tests {
         assert!(
             reg.subscribers.is_empty(),
             "a disconnected receiver deregisters"
+        );
+    }
+
+    /// A subscription whose sender is alive but silent, so a wait on it
+    /// ends only by cancellation or by the timeout -- never by a
+    /// delivery, and never by `Disconnected`.
+    fn silent_subscription() -> (mpsc::SyncSender<MsgBlock>, NodeTemplateSubscription) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let mut reg = SubscriberRegistry::default();
+        let id = reg.register(tx.clone());
+        (
+            tx,
+            NodeTemplateSubscription {
+                id,
+                receiver: rx,
+                subscribers: Arc::new(Mutex::new(reg)),
+            },
+        )
+    }
+
+    /// dcrd's first context arm (`rpcserver.go:3914`): the unbounded
+    /// template wait gives up when the request is cancelled, rather than
+    /// holding the work semaphore until the generator publishes.
+    ///
+    /// Race-free by construction: the flag is already raised before
+    /// `recv` is called, so the pre-wait check decides it and no timing
+    /// is involved.  Without the flag the same call would block until
+    /// the test harness killed it.
+    #[test]
+    fn an_unbounded_template_wait_gives_up_when_the_request_is_cancelled() {
+        let (_tx, sub) = silent_subscription();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _scope = dcroxide_rpc::worksem::scope_request_cancel(Arc::clone(&flag));
+
+        let started = Instant::now();
+        assert!(
+            matches!(sub.recv(), TemplateRecv::Canceled),
+            "an already-cancelled request must not join the wait"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the cancelled wait returned, but only after blocking"
+        );
+    }
+
+    /// The same arm when the hangup lands *during* the wait, which is
+    /// the case that actually frees a pinned permit.  The bound is
+    /// generous -- the poll interval is 50ms and the assertion allows
+    /// 60x that -- so it measures "returns promptly", not a deadline.
+    #[test]
+    fn a_template_wait_notices_a_hangup_that_arrives_mid_wait() {
+        let (_tx, sub) = silent_subscription();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _scope = dcroxide_rpc::worksem::scope_request_cancel(Arc::clone(&flag));
+
+        let raiser = Arc::clone(&flag);
+        let hangup = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            raiser.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        let started = Instant::now();
+        assert!(
+            matches!(sub.recv(), TemplateRecv::Canceled),
+            "a hangup during the wait must end it"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the wait outlived the hangup by too much to be polling"
+        );
+        hangup.join().expect("raiser thread");
+    }
+
+    /// The SLICED bounded wait still honours dcrd's known-template
+    /// timeout: a request that is cancellable but not cancelled must
+    /// wait exactly as long as one that cannot be cancelled at all.
+    /// This is the path the fix actually changed -- the loop's deadline
+    /// arithmetic -- and it also proves the loop terminates rather than
+    /// re-slicing forever.
+    #[test]
+    fn a_cancellable_bounded_wait_still_times_out_at_dcrds_deadline() {
+        let (_tx, sub) = silent_subscription();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _scope = dcroxide_rpc::worksem::scope_request_cancel(Arc::clone(&flag));
+
+        let started = Instant::now();
+        assert!(
+            matches!(sub.recv_with_timeout(), TemplateRecv::Timeout),
+            "a cancellable but uncancelled wait still ends in dcrd's timeout"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= MAX_TEMPLATE_TIMEOUT,
+            "the sliced wait returned early: {waited:?} < {MAX_TEMPLATE_TIMEOUT:?}"
+        );
+        // Generous, but it would catch a slice that reset the deadline
+        // each iteration and so never ended.
+        assert!(
+            waited < MAX_TEMPLATE_TIMEOUT.saturating_mul(2),
+            "the sliced wait overran its deadline: {waited:?}"
+        );
+    }
+
+    /// The uncancellable path keeps its original single-shot shape, so
+    /// the CPU miner's generator thread blocks as it always did rather
+    /// than waking to poll a flag that cannot change.
+    #[test]
+    fn the_bounded_wait_still_times_out_when_nothing_cancels() {
+        let (_tx, sub) = silent_subscription();
+        // No cancellation scope at all -- the in-process case, where
+        // `request_cancelled` is always false.
+        let started = Instant::now();
+        assert!(
+            matches!(sub.recv_with_timeout(), TemplateRecv::Timeout),
+            "an uncancelled bounded wait ends in dcrd's timeout"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= MAX_TEMPLATE_TIMEOUT,
+            "the sliced wait returned early: {waited:?} < {MAX_TEMPLATE_TIMEOUT:?}"
+        );
+    }
+
+    /// And it still cancels, which is dcrd's second context arm
+    /// (`rpcserver.go:3932`).  Race-free the same way as the first.
+    #[test]
+    fn the_bounded_wait_gives_up_when_the_request_is_cancelled() {
+        let (_tx, sub) = silent_subscription();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _scope = dcroxide_rpc::worksem::scope_request_cancel(Arc::clone(&flag));
+
+        let started = Instant::now();
+        assert!(
+            matches!(sub.recv_with_timeout(), TemplateRecv::Canceled),
+            "a cancelled bounded wait must not run out the timeout"
+        );
+        assert!(
+            started.elapsed() < MAX_TEMPLATE_TIMEOUT,
+            "the cancelled wait ran the full timeout instead of returning"
         );
     }
 }

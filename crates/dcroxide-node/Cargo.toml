@@ -71,8 +71,16 @@ socket2 = "0.6.4"
 # Already in the tree via socket2 and getrandom; taken directly for
 # MSG_DONTWAIT, which lets the request-cancellation watchdog peek at a
 # connection without changing the socket state the handler depends on.
+#
+# rustix supplies the POLLRDHUP that peek cannot: a TLS peer writes a
+# close_notify before closing, so pending bytes hide the FIN from a peek
+# but not from RDHUP.  It is a safe wrapper -- the workspace forbids
+# unsafe_code -- and adds no crate the lockfile did not already carry:
+# rustix and linux-raw-sys arrive via tempfile for tests, and bitflags
+# already ships through nix.  Only the `event` API is enabled.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { version = "1.1.4", default-features = false, features = ["std", "event"] }
 
 [target.'cfg(windows)'.dependencies]
 dcroxide-winsvc = { path = "../dcroxide-winsvc" }

@@ -46,6 +46,7 @@ use dcroxide_mining::{BlkTmplGenerator, MiningPolicy};
 use dcroxide_rpc::server::{
     GenerateFailure, RpcBlockTemplater, RpcCpuMiner, RpcTemplateSubscription, TemplateRecv,
 };
+use dcroxide_rpc::worksem::request_cancelled;
 use dcroxide_wire::{BlockHeader, MsgBlock};
 
 use crate::bgtemplate::{GeneratorSink, NodeRpcBlockTemplater, SharedTemplate, SubscriberRegistry};
@@ -1108,6 +1109,32 @@ impl RpcCpuMiner for NodeCpuMiner {
         // Return the hashes that ultimately extended the main chain,
         // regardless of their origin (dcrd's `BlockHashByHeight` sweep;
         // a zero hash stands in for a lookup miss).
+        //
+        // Before that, the cancellation check dcrd runs in the same
+        // place (`cpuminer.go`, after the solve waitgroup):
+        //
+        // ```go
+        // if genCtx.Err() != nil {
+        //     return nil, ErrCancelDiscreteMining
+        // }
+        // ```
+        //
+        // `TemplateRecv::Canceled` conflates two of dcrd's arms -- its
+        // `<-genCtx.Done()`, which is an error, and its `<-m.quit`,
+        // which is not -- so the break alone cannot say which happened.
+        // Asking the flag afterwards separates them exactly as dcrd's
+        // post-loop `genCtx.Err()` does: a request that went away is a
+        // failure, a generator that shut down still reports the blocks
+        // that landed.  `handle_generate` then turns this into dcrd's
+        // `rpcConnectionClosedError` (`rpcserver.go:1851-1852`) rather
+        // than answering a departed client with a hash list.
+        if request_cancelled() {
+            return Err(GenerateFailure {
+                is_ctx_err: true,
+                is_cancel_discrete: true,
+                message: "discrete mining cancelled".to_string(),
+            });
+        }
         let chain = self.chain.lock().expect("chain mutex poisoned");
         let mut hashes = Vec::with_capacity(n as usize);
         for height in (orig_height.saturating_add(1))..=target_height {

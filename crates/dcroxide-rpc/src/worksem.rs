@@ -36,10 +36,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-/// How often a queued waiter re-checks the cancellation flag.  The wait
+/// How often a waiter re-checks the cancellation flag.  A queued waiter
 /// is otherwise woken by the permit's release, so this only bounds how
 /// long a *cancelled* waiter lingers, and never delays a normal handoff.
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// The template waits inside the hold poll on the same interval, so the
+/// two halves of dcrd's cancellation respond alike.
+pub const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 thread_local! {
     /// The cancellation flag for the request this thread is serving, if
@@ -75,12 +77,30 @@ pub fn scope_request_cancel(flag: Arc<AtomicBool>) -> RequestCancelGuard {
 }
 
 /// Whether the request this thread is serving has been cancelled.
-fn request_cancelled() -> bool {
+///
+/// Read by [`WorkSem::acquire`] before it queues, and by the template
+/// waits that run while the permit is *held* -- dcrd cancels in all
+/// three places (`rpcserver.go:4170-4174`, `:3914`, `:3932`), and a
+/// signal the holder never reads would leave the permit pinned for the
+/// rest of a wait the client is no longer listening to.
+pub fn request_cancelled() -> bool {
     REQUEST_CANCEL.with(|slot| {
         slot.borrow()
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Acquire))
     })
+}
+
+/// Whether anything at all can cancel the work this thread is doing.
+///
+/// `false` means no token was installed -- the CPU miner's generator
+/// thread, the in-process test harnesses, any caller driving handlers
+/// directly -- and a waiter should then block outright rather than wake
+/// periodically to re-read a flag that cannot change.  dcrd's
+/// equivalent is a `context.Background()` whose `Done()` channel is nil
+/// and so never selects.
+pub fn request_is_cancellable() -> bool {
+    REQUEST_CANCEL.with(|slot| slot.borrow().is_some())
 }
 
 /// A single-permit semaphore whose queue can be abandoned (dcrd

@@ -217,6 +217,41 @@ fn generate_mines_blocks_onto_the_chain() {
         "generate 0 mines nothing"
     );
 
+    // A client that hangs up mid-generate gets dcrd's error, not a hash
+    // list.  dcrd checks `genCtx.Err()` after its loop and returns
+    // `ErrCancelDiscreteMining` (`cpuminer.go`), which `handleGenerate`
+    // turns into `rpcConnectionClosedError` via its `ctx.Err() != nil`
+    // arm (`rpcserver.go:1851-1852`).  Race-free: the flag is raised
+    // before the call, so the first template wait decides it.
+    {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _scope = dcroxide_rpc::worksem::scope_request_cancel(Arc::clone(&flag));
+        let (before, _) = best(&chain);
+        let failure = miner
+            .generate_n_blocks(1)
+            .expect_err("a cancelled generate must not answer with hashes");
+        assert!(
+            failure.is_ctx_err,
+            "the request context arm is what dcrd reports for a hangup"
+        );
+        let (after, _) = best(&chain);
+        assert_eq!(
+            after, before,
+            "a cancelled generate must not have extended the chain"
+        );
+    }
+
+    // And the discrete-mining flag is released even on that path, so the
+    // next caller is not locked out by a client that left.
+    assert!(
+        !miner.is_mining(),
+        "a cancelled generate still clears the discrete-mining flag"
+    );
+    let hashes = miner
+        .generate_n_blocks(1)
+        .expect("generate still works after a cancelled call");
+    assert_eq!(hashes.len(), 1, "one hash for one block");
+
     // The discrete-mining flag is cleared after each call, so the miner
     // is idle again (the Drop guard ran on every return path).
     assert!(!miner.is_mining(), "the miner is idle after generate");
