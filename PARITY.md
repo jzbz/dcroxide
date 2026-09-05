@@ -831,6 +831,96 @@ closing it would cost.
   `process_new_packets`; reaching it means restructuring who reads the TLS
   session during a getwork hold.
 
-  The shutdown arm works everywhere, and `getwork` over the websocket
-  transport still installs no token; `scope_request_cancel` is called only
-  from the HTTP path.
+  The shutdown arm works everywhere, including over the websocket transport,
+  which now installs a token of its own where it previously installed none.
+
+  dcrd services a websocket command through the same handlers as HTTP:
+  `serviceRequest` falls through to `standardCmdResult(ctx, r)` for any method
+  not in its websocket-only table (`rpcwebsocket.go:1807-1819`), and getwork
+  is not in that table. The context is the UPGRADE request's
+  (`rpcserver.go:6041`), descending from the server's through `BaseContext`
+  (`rpcserver.go:5921-5927`), so shutdown cancels it.
+
+  dcrd reaches it on a client hangup too, which is worth stating carefully
+  because the obvious derivation says otherwise. The upgrade hijacks the
+  connection and Go's `hijackLocked` calls `abortPendingRead`
+  (`net/http/server.go:318-322`), which does kill the background read that
+  cancels an ordinary request. But `conn.serve` also calls `w.cancelCtx()`
+  right after `ServeHTTP` returns, unconditionally and before the
+  `c.hijacked()` check (`server.go:2137-2140`), and that is the cancel for
+  `r.Context()` (`:1089`, `:1106`). A non-batched command runs in a goroutine
+  (`rpcwebsocket.go:1550`) that `Run`'s `wg.Add(3)` does not cover
+  (`:1998-2011`), so an in-flight getwork outlives the teardown and is still
+  selecting on the context when that fires.
+
+  Not on every arm, though. dcrd degrades to shutdown-only wherever it stops
+  reading: a batched request, serviced inline in `inHandler`
+  (`rpcwebsocket.go:1748`), and any request arriving once the per-client
+  `serviceRequestSem` is exhausted, since it is acquired before the spawn
+  (`:1549`) with capacity `RPCMaxConcurrentReqs`.
+
+  The port is always in that second case. Its websocket loop dispatches
+  synchronously, so while a request runs nothing is reading and a hangup
+  cannot be observed at all -- no token could carry it. Installing the
+  shutdown flag is therefore the whole of what is reachable without making
+  websocket dispatch concurrent, which is a structural change well beyond
+  this one. Recorded here rather than left implicit: the port matches dcrd's
+  batched and saturated arms exactly, and diverges from its concurrent arm by
+  not cancelling an in-flight websocket getwork when that client goes away.
+
+  That one line has no automated test. Observing the flag through a websocket
+  needs a request already in flight when shutdown is raised -- the loop checks
+  shutdown before its next read, so anything sent afterwards is never
+  dispatched -- and getwork is not callable in the websocket harness, which
+  wires `block_templater: None`. The guard's per-request semantics are pinned
+  by `the_cancel_scope_does_not_leak_across_requests`; the line installing it
+  is verified by construction.
+
+  Two dead ends are recorded so nobody walks back into them. Detection by
+  inspecting the peeked bytes cannot work: TLS 1.3 wraps an alert in outer
+  content type 23, so an encrypted `close_notify` is indistinguishable from
+  application data. And a pipelined request is deliberately not treated as a
+  hangup -- Go's `net/http` says so explicitly and cancels only on a read
+  *error* (`server.go:748-771`) -- which is why every arm here reads
+  half-close state rather than treating pending bytes as a signal in either
+  direction. This paragraph was written into the entry by `ac6967b` and lost
+  when `74caff7` rewrote it; that is the sort of deletion the ledger exists
+  to prevent, so it is restored rather than silently reconstructed.
+
+  The eventual platform-independent answer is not a better socket probe but
+  `rustls::IoState::peer_has_closed` (`common_state.rs:841`), which sees the
+  `close_notify` itself. It is unreachable today because the handler owns the
+  `ServerConnection` and is parked in the hold, so nothing is driving
+  `process_new_packets`; reaching it means restructuring who reads the TLS
+  session during a getwork hold.
+
+  The shutdown arm works everywhere, including over the websocket transport,
+  which now installs a token of its own -- and installs only the shutdown
+  signal, deliberately.
+
+  dcrd services a websocket command through the same handlers as HTTP:
+  `serviceRequest` falls through to `standardCmdResult(ctx, r)` for any method
+  not in its websocket-only table (`rpcwebsocket.go:1807-1819`), and getwork
+  is not in that table. The context it passes is the UPGRADE request's
+  (`rpcserver.go:6041`), which descends from the server's through
+  `BaseContext` (`rpcserver.go:5921-5927`) and so is cancelled on shutdown.
+  It is not cancelled when the websocket client goes away: the upgrade
+  hijacks the connection, and Go's `hijackLocked` calls `abortPendingRead`
+  (`net/http/server.go:318-322`), stopping the background read that is the
+  only thing that would cancel it. dcrd's own comment beside `BaseContext`
+  says handlers can "react to both client disconnects as well as shutdown",
+  which holds for plain HTTP and not for a hijacked websocket.
+
+  So the port installs the shutdown flag and nothing else at the one dispatch
+  point in the websocket loop. Reusing the HTTP path's watchdog would have
+  cancelled on hangup too, which sounds like an improvement and is a
+  divergence: it would abandon work dcrd runs to completion.
+
+  That one line has no automated test, which is worth stating rather than
+  implying otherwise. The guard's per-request semantics are already pinned by
+  `the_cancel_scope_does_not_leak_across_requests`, but observing the flag
+  through a websocket needs a request already in flight when shutdown is
+  raised -- the loop checks shutdown before its next read, so a request sent
+  afterwards is never dispatched -- and getwork itself is not callable in the
+  websocket harness, which wires `block_templater: None`. It is verified by
+  construction instead.

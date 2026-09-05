@@ -602,7 +602,7 @@ pub fn serve_websocket<S: Read + Write>(
     is_admin: bool,
     server: &Arc<Server<NodeRpcChain>>,
     ntfn: &NodeNtfnMgr,
-    shutdown: &std::sync::atomic::AtomicBool,
+    shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     // gorilla's `Upgrade` runs its checks in one fixed order
     // (`gorilla/websocket@v1.5.1 server.go:126-191`), and each failure
@@ -742,7 +742,40 @@ pub fn serve_websocket<S: Read + Write>(
         // parse-error reply and an unauthenticated one is disconnected,
         // rather than the frame being dropped silently.
         let outcome = match String::from_utf8(message) {
-            Ok(body) => handle_ws_request(server, &state, &body),
+            Ok(body) => {
+                // dcrd services a websocket command with a context, the
+                // same one the standard HTTP handlers get: `serviceRequest`
+                // falls through to `standardCmdResult(ctx, r)` for any
+                // method not in its websocket-only table, and getwork is
+                // not in that table (`rpcwebsocket.go:1807-1819`).
+                //
+                // That context is the UPGRADE request's
+                // (`rpcserver.go:6041` passing `r.Context()`), which
+                // descends from the server's through `BaseContext`
+                // (`rpcserver.go:5921-5927`), so shutdown cancels it.
+                //
+                // dcrd also reaches it on a client hangup, but only where
+                // it dispatches concurrently: a non-batched command runs
+                // in a goroutine (`rpcwebsocket.go:1550`) that `Run`'s
+                // `wg.Add(3)` does not cover (`:1998-2011`), so it
+                // outlives the client teardown and is still selecting on
+                // the context when `conn.serve` fires `w.cancelCtx()`
+                // after `ServeHTTP` returns -- unconditionally, before
+                // the `c.hijacked()` check (`net/http/server.go:2137-2140`).
+                //
+                // This loop dispatches synchronously, so while a request
+                // runs nothing is reading and a hangup cannot be noticed
+                // at all.  That is dcrd's own behaviour on the two arms
+                // where it also stops reading: a batched request, which
+                // it services inline (`rpcwebsocket.go:1748`), and any
+                // request once `serviceRequestSem` is exhausted, since
+                // that is acquired before the spawn (`:1549`).  So the
+                // shutdown flag is the whole of what this token can
+                // carry here; see PARITY for what closing the rest would
+                // take.
+                let _cancel = dcroxide_rpc::worksem::scope_request_cancel(Arc::clone(shutdown));
+                handle_ws_request(server, &state, &body)
+            }
             Err(_) => parse_error_outcome(authenticated, "invalid UTF-8"),
         };
         match outcome {
