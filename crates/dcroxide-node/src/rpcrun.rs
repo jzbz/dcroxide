@@ -3739,11 +3739,10 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
 /// [`peer_half_closed`] reads the peer's half-close state rather than
 /// what happens to be buffered.
 ///
-/// One semantic is unverified and CI decides it: whether `WSAPoll`
-/// reports `POLLHUP` while data is still buffered, which is what the
-/// clean TLS close needs.  If it does not, Windows keeps the
-/// abrupt-close detection the `FIONREAD` arm gives it and the TLS case
-/// stays open in PARITY.  The shutdown arm is unaffected everywhere.
+/// The half-close is reported with bytes still queued on every one of
+/// them, which is what the clean TLS close needs and what the peek
+/// cannot see; measured on macOS and Windows rather than assumed, with
+/// the table in PARITY.  The shutdown arm is unaffected everywhere.
 ///
 /// Neither probe may disturb the socket the handler still owns, which is
 /// why the fallback peeks with `MSG_DONTWAIT` and the poll uses a zero
@@ -3858,11 +3857,11 @@ fn peer_half_closed(sock: &TcpStream) -> Option<bool> {
 ///
 /// Deliberately conservative: only an observed `EV_EOF` answers, and
 /// anything else defers to [`peeked_eof`]. On the `POLLRDHUP` platforms
-/// a negative poll is authoritative and answers `Some(false)`, but that
-/// semantics is verified there by a test that runs on the same machine.
-/// This arm cannot be exercised on the development host at all, so it is
-/// written to only ever ADD detection: if `EV_EOF` never arrives the
-/// behaviour is exactly what it was before this existed.
+/// a negative poll is authoritative and answers `Some(false)`; this arm
+/// declines instead, so it can only ever ADD detection. That shape was
+/// chosen when the semantics were unverified here, and is kept now that
+/// they are measured -- an `EV_EOF` that failed to arrive would cost a
+/// missed cancellation, never a wrongly cancelled request.
 #[cfg(all(
     unix,
     any(
@@ -3972,9 +3971,12 @@ fn peeked_eof(sock: &TcpStream) -> bool {
 /// question without reading and without blocking -- readable with
 /// nothing queued is a FIN.
 ///
-/// Conservative in the same way the kqueue arm is, and for the same
-/// reason: nothing here can be exercised on the development host, so
-/// only a positive observation answers and everything else declines.
+/// Conservative in the same way the kqueue arm is: only a positive
+/// observation answers and everything else declines, so a probe that
+/// went quiet would cost a missed cancellation rather than a wrongly
+/// cancelled request.  Measured on Windows 11: the TLS shape reports
+/// `POLLHUP | POLLRDNORM` with the bytes still queued, while a
+/// pipelined request reports `POLLRDNORM` alone.
 #[cfg(windows)]
 fn peer_half_closed(sock: &TcpStream) -> Option<bool> {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};

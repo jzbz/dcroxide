@@ -787,25 +787,31 @@ closing it would cost.
   gated away, not the call. `ioctl_fionread` is likewise excluded only for
   espidf, horizon and vita.
 
-  What remains genuinely unverified is one semantic, and it is the same shape
-  on both platforms the development host cannot run: whether the half-close
-  is reported while data is still buffered. For kqueue that is now settled
-  from primary sources -- FreeBSD's `filt_soread` computes `kn_data` and then
-  takes the `SBS_CANTRCVMORE` branch setting `EV_EOF` without testing the
-  byte count, and XNU's `filt_soread_common` does the same. For `WSAPoll` it
-  is not: MSDN documents `POLLHUP` on a graceful peer disconnect, but not
-  whether it fires behind pending data, and Windows has no `RDHUP` in the
-  WSAPoll vocabulary at all. The kernel's real equivalent,
-  `AFD_POLL_DISCONNECT`, is reachable only through the undocumented
-  `\Device\Afd` IOCTL that mio and polling drive with unsafe FFI.
+  The load-bearing semantic -- whether the half-close is reported while data
+  is still buffered -- is measured on both platforms rather than assumed.
+  Driving a loopback pair through the four shapes that matter, on macOS
+  26.6.2 and on Windows 11 build 26200:
 
-  So `a_hangup_behind_pending_bytes_is_seen` runs on the kqueue platforms and
-  on Windows, and CI settles it. If `POLLHUP` does not fire behind buffered
-  data the test fails loudly on Windows and the TLS case there stays open,
-  while the `FIONREAD` arm still gives Windows the abrupt-close detection it
-  previously lacked entirely. Both untestable arms answer only a positive
-  observation and decline otherwise, so a wrong assumption costs a red test
-  rather than a behaviour regression.
+  | case | kqueue `EV_EOF` | `WSAPoll` revents | `MSG_PEEK` |
+  | --- | --- | --- | --- |
+  | data then FIN (the TLS shape) | set, `data`=5 | `0x0102` (HUP+RDNORM) | 1 byte |
+  | bare FIN | set, `data`=0 | `0x0002` (HUP) | 0 |
+  | data, no FIN (pipelined) | clear | `0x0100` (RDNORM) | 1 byte |
+  | idle | no event | `0x0000` | would block |
+
+  Both probes report the half-close with bytes still queued, which is the
+  case the peek cannot see -- note it returns a byte, not a zero-length read,
+  in exactly that row. Both stay silent for a pipelined request, so neither
+  can cancel a client that is merely mid-conversation. The kqueue result
+  matches the kernel sources: FreeBSD's `filt_soread` computes `kn_data` and
+  then takes the `SBS_CANTRCVMORE` branch setting `EV_EOF` without testing
+  the byte count, and XNU's `filt_soread_common` does the same. Windows has
+  no `RDHUP` in the WSAPoll vocabulary, but `POLLHUP` turns out to carry it.
+
+  `a_hangup_behind_pending_bytes_is_seen` runs on the kqueue platforms and on
+  Windows so CI keeps checking what these measurements established once. Both
+  arms answer only a positive observation and decline otherwise, so a
+  regression costs a red test rather than a silent behaviour change.
 
   Two dead ends are recorded so nobody walks back into them. Detection by
   inspecting the peeked bytes cannot work: TLS 1.3 wraps an alert in outer
