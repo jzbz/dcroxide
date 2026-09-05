@@ -82,6 +82,15 @@ socket2 = "0.6.4"
 libc = "0.2"
 rustix = { version = "1.1.4", default-features = false, features = ["std", "event"] }
 
+# The kqueue half of the same problem, for the platforms rustix gates
+# POLLRDHUP away from.  nix is the only safe wrapper available: rustix's
+# own `kevent` is `pub unsafe fn`, which the workspace forbids.  It is
+# already in the tree as a real dependency through ctrlc, and `event` is
+# an empty feature list, so this adds no crate and no code beyond the
+# module itself.
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["event"] }
+
 [target.'cfg(windows)'.dependencies]
 dcroxide-winsvc = { path = "../dcroxide-winsvc" }
 

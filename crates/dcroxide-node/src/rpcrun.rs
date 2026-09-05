@@ -3733,15 +3733,15 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout>(
 /// consult it; everything else runs to completion as before.
 ///
 /// SCOPE: the hangup arm fires for a clean TLS close as well as an
-/// abrupt one wherever `POLLRDHUP` exists — Linux, FreeBSD and illumos —
-/// because [`peer_half_closed`] reads the peer's half-close state rather
-/// than what happens to be buffered.  On macOS and Windows it still
-/// fires only for an abrupt close: a TLS peer writes a `close_notify`
-/// before closing, the peek finds those bytes rather than a zero-length
-/// read, and reports the client as still connected.  Since TLS is the
-/// default and is required for any non-localhost bind, that is the
-/// ordinary case for Decred tooling on those platforms, and it stays
-/// open in PARITY.  The shutdown arm is unaffected everywhere.
+/// abrupt one on every Unix -- `POLLRDHUP` on Linux, FreeBSD and
+/// illumos, `EVFILT_READ`'s `EV_EOF` on macOS and the other kqueue
+/// platforms -- because [`peer_half_closed`] reads the peer's half-close
+/// state rather than what happens to be buffered.  On Windows it fires
+/// for nothing: there is no peek there either, so cancellation is
+/// limited to the shutdown signal.  Since TLS is the default and is
+/// required for any non-localhost bind, that leaves the ordinary case
+/// for Decred tooling on Windows uncovered, and it stays open in
+/// PARITY.  The shutdown arm is unaffected everywhere.
 ///
 /// Neither probe may disturb the socket the handler still owns, which is
 /// why the fallback peeks with `MSG_DONTWAIT` and the poll uses a zero
@@ -3842,10 +3842,73 @@ fn peer_half_closed(sock: &TcpStream) -> Option<bool> {
     }
 }
 
-/// Where `POLLRDHUP` does not exist -- macOS and the rest -- there is
-/// no half-close answer to give, so the peek decides alone and a clean
-/// TLS close still goes unnoticed. rustix's kqueue equivalent is an
-/// `unsafe fn`, which the workspace forbids; see PARITY.
+/// The kqueue answer to the same question, for the platforms rustix
+/// gates `POLLRDHUP` away from.
+///
+/// `EVFILT_READ` on a socket sets `EV_EOF` once the peer has shut down
+/// its writing side, and the kqueue(2) manual is explicit that this can
+/// be reported while data is still pending in the socket buffer -- which
+/// is the whole reason to prefer it over the peek, since a TLS
+/// `close_notify` is exactly such pending data.
+///
+/// rustix's `kevent` is `pub unsafe fn` and so unusable here; nix's
+/// `Kqueue::kevent` is safe, and nix already ships through ctrlc.
+///
+/// Deliberately conservative: only an observed `EV_EOF` answers, and
+/// anything else defers to [`peeked_eof`]. On the `POLLRDHUP` platforms
+/// a negative poll is authoritative and answers `Some(false)`, but that
+/// semantics is verified there by a test that runs on the same machine.
+/// This arm cannot be exercised on the development host at all, so it is
+/// written to only ever ADD detection: if `EV_EOF` never arrives the
+/// behaviour is exactly what it was before this existed.
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )
+))]
+fn peer_half_closed(sock: &TcpStream) -> Option<bool> {
+    use std::os::fd::AsRawFd;
+
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+
+    let Ok(kq) = Kqueue::new() else {
+        return None;
+    };
+    let probe = KEvent::new(
+        sock.as_raw_fd() as usize,
+        EventFilter::EVFILT_READ,
+        // Registered and removed by the same call, so the socket the
+        // handler still owns is left exactly as it was found.
+        EvFlags::EV_ADD | EvFlags::EV_ONESHOT,
+        FilterFlag::empty(),
+        0,
+        0,
+    );
+    let mut events = [probe];
+    // A zero timeout, so the watchdog never blocks here.  `kevent` takes
+    // a raw `libc::timespec` rather than nix's `TimeSpec` wrapper.
+    let zero = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    match kq.kevent(&[probe], &mut events, Some(zero)) {
+        Ok(n) if n > 0 && events[0].flags().intersects(EvFlags::EV_EOF) => Some(true),
+        _ => None,
+    }
+}
+
+/// Where neither `POLLRDHUP` nor kqueue is available -- Windows, and any
+/// Unix outside the two lists -- there is no half-close answer to give,
+/// so the peek decides alone and a clean TLS close still goes unnoticed.
+/// See PARITY.
 #[cfg(all(
     unix,
     not(any(
@@ -3855,6 +3918,16 @@ fn peer_half_closed(sock: &TcpStream) -> Option<bool> {
             any(target_os = "linux", target_os = "android"),
             not(any(target_arch = "sparc", target_arch = "sparc64"))
         )
+    )),
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
     ))
 ))]
 fn peer_half_closed(_sock: &TcpStream) -> Option<bool> {
@@ -5239,16 +5312,31 @@ mod tests {
     /// anything is asserted, and both flags are level-triggered, so
     /// there is no window to lose.
     ///
-    /// Gated to the platforms that have `POLLRDHUP`, matching
-    /// [`peer_half_closed`]. On macOS and Windows this case is the open
-    /// half of the PARITY entry, so asserting it there would be
-    /// asserting a gap the port does not claim to have closed.
+    /// Gated to every platform [`peer_half_closed`] claims to answer on
+    /// -- the `POLLRDHUP` set and the kqueue set. Windows is excluded
+    /// because it is still the open half of the PARITY entry.
+    ///
+    /// The kqueue half of this gate is doing real work rather than
+    /// decorating: the development host is Linux, so the macOS arm
+    /// cannot be exercised here at all, and this assertion running under
+    /// CI is the only thing that checks `EV_EOF` is reported while the
+    /// `close_notify` bytes are still buffered. If that assumption is
+    /// wrong the test fails loudly on macOS instead of the arm quietly
+    /// doing nothing.
     #[test]
     #[cfg(all(
         unix,
         any(
             target_os = "freebsd",
             target_os = "illumos",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "visionos",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
             all(
                 any(target_os = "linux", target_os = "android"),
                 not(any(target_arch = "sparc", target_arch = "sparc64"))

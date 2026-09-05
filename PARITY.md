@@ -760,46 +760,44 @@ closing it would cost.
   in its own subprocess -- the `mpchan|` rows of
   `crates/dcroxide-node/tests/data/srvtargetout_vectors.txt`.
 
-- **`getwork` cancellation is complete except on macOS and Windows.** dcrd
-  cancels getwork in three places: the semaphore queue
-  (`rpcserver.go:4170-4174`) and both template waits inside the hold
-  (`case <-ctx.Done()` at `:3914` and `:3932`), with `defer
-  s.workState.workSem.release()` at `:4175` freeing the permit on any of them.
-  All three are now ported, and the signal that drives them sees a clean TLS
-  close wherever `POLLRDHUP` exists.
+- **`getwork` cancellation is complete except on Windows.** dcrd cancels
+  getwork in three places -- the semaphore queue (`rpcserver.go:4170-4174`)
+  and both template waits inside the hold (`:3914`, `:3932`) -- and all three
+  are ported. What was partial is the signal that drives them: detecting that
+  the client has gone.
 
-  `work_sem` is a condvar semaphore rather than a mutex, since a mutex cannot
-  wait on both the permit and a cancellation, and the signal reaches the
-  handler through a thread-local scoped to the request rather than a
-  parameter, because all 77 handlers take `(server, cmd)`. The two template
-  waits slice their receive and re-read that flag between slices, which is how
-  a `std::sync::mpsc::Receiver` stands in for a `select`. A wait with no token
-  installed -- the CPU miner's generator thread, the test harnesses -- keeps
-  its original blocking shape rather than waking to poll a flag that cannot
-  change.
+  `POLLRDHUP` reports the peer's half-close whatever is buffered ahead of it,
+  which is what a clean TLS close needs -- the peer writes a `close_notify`
+  before the FIN and the handler, blocked in the hold, never reads it, so a
+  `MSG_PEEK` finds bytes and reports the client present. rustix exposes
+  `POLLRDHUP` safely but gates it to Linux, FreeBSD and illumos. macOS is now
+  covered by the kqueue equivalent: `EVFILT_READ` sets `EV_EOF` once the peer
+  shuts down its writing side, and nix exposes `Kqueue::kevent` as a safe
+  `pub fn` where rustix's is `pub unsafe fn`. nix was already a dependency
+  through ctrlc and its `event` feature is an empty list, so this added no
+  crate -- one line of lockfile.
 
-  What remains open is one platform gap. `POLLRDHUP` reports the peer's
-  half-close whatever is buffered ahead of it, which is what a clean TLS close
-  needs: the peer writes a `close_notify` record before the FIN, and the
-  handler is blocked in the hold rather than reading it, so a `MSG_PEEK` finds
-  bytes and reports the client present. rustix exposes `POLLRDHUP` safely, but
-  gates it to Linux, FreeBSD and illumos; its macOS equivalent,
-  `rustix::event::kqueue::kevent`, is declared `pub unsafe fn`, and the
-  workspace forbids `unsafe_code`. So on macOS and Windows the hangup arm
-  still fires only for an abrupt close -- a killed or crashed client, a peer
-  that omits `close_notify`, and the `--notls` localhost path -- while TLS is
-  the default and is required for any non-localhost bind. Closing it wants a
-  safe kqueue wrapper, or detection inside the TLS layer. The latter is not as
-  close as it looks: rustls only learns of a `close_notify` when something
-  pumps I/O on the connection, and the thread that owns that right is
-  precisely the one blocked in the hold.
+  That arm is verified by CI rather than here, and the distinction matters.
+  The development host is Linux, so it cannot be exercised locally at all,
+  and the macOS VM was unreachable when this landed. Its API usage was
+  checked by cross-compiling the function verbatim for `aarch64-apple-darwin`
+  in a standalone probe -- which caught one real error Linux could not,
+  `kevent` taking a `libc::timespec` rather than nix's `TimeSpec` wrapper --
+  but that proves types, not runtime semantics. The claim actually at risk is
+  that `EV_EOF` is reported while data is still buffered, and
+  `a_hangup_behind_pending_bytes_is_seen` now runs on the kqueue platforms
+  precisely so CI settles it: if the assumption is wrong the test fails
+  loudly on macOS. The arm is also written to only ever add detection --
+  only an observed `EV_EOF` answers, anything else defers to the peek -- so
+  a wrong assumption costs a red test, never a behaviour regression.
 
-  Two things this is deliberately not. It is not detection by inspecting the
-  peeked bytes: TLS 1.3 wraps an alert in outer content type 23, so an
-  encrypted `close_notify` is indistinguishable from data. And a pipelined
-  request is not a hangup -- Go's `net/http` says so explicitly and cancels
-  only on a read *error* (`server.go:748-771`), which is why the check reads
-  half-close state rather than treating pending bytes as a signal either way.
-
-  `getwork` over the websocket transport still installs no token and behaves
-  as it did before; `scope_request_cancel` is called only from the HTTP path.
+  Windows keeps the older behaviour, and there the hangup arm fires for
+  nothing at all, since even the peek is unavailable. Winsock has no
+  `MSG_DONTWAIT`, `set_nonblocking` mutates state the handler's own reads
+  share through the cloned handle, and no crate in the tree exposes a
+  readability probe safely -- socket2's `WSAPoll` use is `pub(crate)` and
+  rustix's poll is `cfg(not(windows))`. Closing it wants a safe `WSAPoll`
+  wrapper, or a Windows-specific dependency the tree does not yet carry. The
+  shutdown arm works everywhere, and `getwork` over the websocket transport
+  still installs no token; `scope_request_cancel` is called only from the
+  HTTP path.
