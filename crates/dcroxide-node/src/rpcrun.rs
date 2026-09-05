@@ -1602,9 +1602,14 @@ fn build_server_config(
     // default ticketer is `NeverProducesTickets`, so the port resumes not
     // at all where dcrd resumes from tickets. That leaves it stricter
     // rather than weaker, and installing a ticketer would trade the one
-    // for the other, since rustls skips the same client-certificate
-    // checks on a ticket resumption (`server/tls13.rs:350-355`) that Go
-    // performs (`crypto/tls/handshake_server_tls13.go:362-381`). See
+    // for the other, since rustls skips on a ticket resumption
+    // (`server/tls13.rs:350-355`) the client-certificate checks Go
+    // performs on BOTH its paths -- re-verification against the current
+    // roots, an expiry check, and a seven day cap on the ticket's age
+    // (`crypto/tls/handshake_server_tls13.go:362-381` and
+    // `handshake_server.go:479-482`, `:508-526`). That matters most
+    // under `--authtype=clientcert`, where no Basic credentials are set
+    // and the completed handshake is itself the authentication. See
     // PARITY.
     config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
     Ok(config)
