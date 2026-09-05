@@ -586,7 +586,8 @@ against upstream and the port is faithful.
   over, on the grounds that dcrd's resumption survives a rotation -- Go
   resolves ticket keys with `originalConfig.ticketKeys(configForClient)`
   (`handshake_server.go:177`), which falls through to the long-lived outer
-  config. That reasoning was sound and is now moot.
+  config's automatically rotated keys when the reloaded one sets none
+  (`common.go:1095-1124`). That reasoning was sound and is now moot.
 
   One bounded difference remains. dcrd's callback runs after the ClientHello,
   so only a peer that actually speaks TLS advances the five-second clock,
@@ -805,6 +806,17 @@ closing it would cost.
   previously lacked entirely. Both untestable arms answer only a positive
   observation and decline otherwise, so a wrong assumption costs a red test
   rather than a behaviour regression.
+
+  Two dead ends are recorded so nobody walks back into them. Detection by
+  inspecting the peeked bytes cannot work: TLS 1.3 wraps an alert in outer
+  content type 23, so an encrypted `close_notify` is indistinguishable from
+  application data. And a pipelined request is deliberately not treated as a
+  hangup -- Go's `net/http` says so explicitly and cancels only on a read
+  *error* (`server.go:748-771`) -- which is why every arm here reads
+  half-close state rather than treating pending bytes as a signal in either
+  direction. This paragraph was written into the entry by `ac6967b` and lost
+  when `74caff7` rewrote it; that is the sort of deletion the ledger exists
+  to prevent, so it is restored rather than silently reconstructed.
 
   The eventual platform-independent answer is not a better socket probe but
   `rustls::IoState::peer_has_closed` (`common_state.rs:841`), which sees the
