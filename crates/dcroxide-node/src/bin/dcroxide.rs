@@ -1243,6 +1243,38 @@ fn build_server(
         ban_duration_nanos: cfg.ban_duration_nanos,
         addr_manager,
         sim_or_reg_net: cfg.sim_net || cfg.reg_net,
+        // One cache for the process (dcrd's `server.externalAddrCandidates`,
+        // built once in `newServer`).
+        external_addr_candidates: std::sync::Mutex::new(Default::default()),
+        external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
+            listeners: cfg.listeners.clone(),
+            has_proxy: !cfg.proxy.is_empty() || !cfg.onion_proxy.is_empty(),
+            no_discover_ip: cfg.no_discover_ip,
+            has_external_ips: !cfg.external_ips.is_empty(),
+            // dcrd's condition is `cfg.DisableListen || len(cfg.Listeners) == 0`.
+            listen_disabled: cfg.disable_listen || cfg.listeners.is_empty(),
+            // Deliberately the ACTIVE PARAMS NAME, not the cfg flags:
+            // `considerReportedAddrOutbound` reads `s.chainParams.Name`
+            // while the advertise block above it reads `cfg.SimNet` /
+            // `cfg.RegNet`.  The two sources are independent upstream and
+            // must stay independent here.
+            sim_or_reg_net: params.name == "simnet" || params.name == "regnet",
+            services: ServiceFlag::NODE_NETWORK,
+            // dcrd casts to uint32 BEFORE comparing (`server.go:4273`:
+            // `if uint32(cfg.MaxPeers) < s.targetOutbound`), so a negative
+            // --maxpeers leaves the target at its default.  Doing the `min`
+            // in signed space and casting after would turn -1 into
+            // u32::MAX, which then overflows `target_outbound * 60` in the
+            // majority expression this feeds.
+            target_outbound: (dcroxide_node::DEFAULT_TARGET_OUTBOUND as u32)
+                .min(cfg.max_peers as u32),
+        },
+        // dcrd's `dcrdLookup`, which routes through the proxy when set.
+        lookup: {
+            let dialer = dcroxide_node::socks::NodeDialer::from_config(cfg);
+            let timeout = std::time::Duration::from_secs(30);
+            Box::new(move |host: &str| dialer.lookup(host, timeout))
+        },
         stake_validation_height: params.stake_validation_height,
         blocks_only: cfg.blocks_only,
         sync_manager,

@@ -60,6 +60,18 @@ fn serve_genesis_chain() -> GenesisChainRig {
         false,
     );
     let server = Arc::new(ServerContext {
+        external_addr_candidates: std::sync::Mutex::new(Default::default()),
+        external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
+            listeners: Vec::new(),
+            has_proxy: false,
+            no_discover_ip: true,
+            has_external_ips: false,
+            listen_disabled: true,
+            sim_or_reg_net: false,
+            services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+            target_outbound: 8,
+        },
+        lookup: Box::new(|_| Err("no resolver in tests".to_string())),
         target_outbound: 8,
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
@@ -720,6 +732,18 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         false,
     );
     let server = Arc::new(ServerContext {
+        external_addr_candidates: std::sync::Mutex::new(Default::default()),
+        external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
+            listeners: Vec::new(),
+            has_proxy: false,
+            no_discover_ip: true,
+            has_external_ips: false,
+            listen_disabled: true,
+            sim_or_reg_net: false,
+            services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+            target_outbound: 8,
+        },
+        lookup: Box::new(|_| Err("no resolver in tests".to_string())),
         target_outbound: 8,
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
@@ -853,6 +877,18 @@ fn disconnects_a_stalled_header_sync_peer() {
         Duration::from_millis(300),
     );
     let server = Arc::new(ServerContext {
+        external_addr_candidates: std::sync::Mutex::new(Default::default()),
+        external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
+            listeners: Vec::new(),
+            has_proxy: false,
+            no_discover_ip: true,
+            has_external_ips: false,
+            listen_disabled: true,
+            sim_or_reg_net: false,
+            services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+            target_outbound: 8,
+        },
+        lookup: Box::new(|_| Err("no resolver in tests".to_string())),
         target_outbound: 8,
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,
@@ -1037,6 +1073,18 @@ fn announces_connected_blocks_to_served_peers() {
     );
     let sync_peers = dcroxide_node::dispatch::SyncPeers::new();
     let server = Arc::new(ServerContext {
+        external_addr_candidates: std::sync::Mutex::new(Default::default()),
+        external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
+            listeners: Vec::new(),
+            has_proxy: false,
+            no_discover_ip: true,
+            has_external_ips: false,
+            listen_disabled: true,
+            sim_or_reg_net: false,
+            services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+            target_outbound: 8,
+        },
+        lookup: Box::new(|_| Err("no resolver in tests".to_string())),
         target_outbound: 8,
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,

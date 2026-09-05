@@ -520,37 +520,40 @@ against upstream and the port is faithful.
   connection (~125 at the default `--maxpeers`), against dcrd's blocking read
   with no poll at all.
 
+- **External-address selection is ported and wired.** The subsystem follows the
+  parity pin -- `ExternalAddrCandidate`, `ExternalAddrCandidateCache` over
+  `dcroxide_containers::lru::Map`, `best_candidate`,
+  `resolve_external_address`, `consider_reported_addr_outbound` and
+  `consider_reported_addr` mirror `036b7090`'s `server.go:2373-2614` -- and it
+  now has a live caller. `ServerPeerHandler` stores the address a peer reports
+  for the connection from its version message (dcrd
+  `serverPeer.reportedLocalAddr`, `server.go:1038`), `ServerContext` holds one
+  candidate cache for the process behind its own mutex (dcrd's server field,
+  `server.go:424-427`), and `on_connected` calls `consider_reported_addr` once,
+  unconditionally, after the outbound-only advertise block and before the
+  peer-state insert, which is where dcrd calls it (`server.go:2670`). The
+  advertise block itself was already present, in `on_connected` rather than in
+  `handle_add_peer` -- a placement difference, not a missing behaviour, and
+  this entry previously claimed the port did not have it at all.
+  Two gates read deliberately different sources, as upstream does: the
+  advertise block reads the cfg `--simnet`/`--regnet` flags while the discovery
+  gate one level down reads the active chain params name. Pinned end to end by
+  `crates/dcroxide-node/tests/srvextaddr_wired.rs`, which drives a real
+  handshake over a loopback socket through `run_peer_connection`, and row for
+  row against the pin by `srvextaddr_vectors.rs`.
+
+  `handle_add_peer` itself still has no daemon caller: the peer-state maps it
+  maintains are the port's `SyncPeers` registry, populated elsewhere, so what
+  remains of it is admission bookkeeping the runtime already does its own way.
+  That is a separate question from external-address discovery, which is now
+  live.
+
 #### Open: the port does not match dcrd here
 
 These are real divergences from the parity pin and someone should eventually
 close them. Each says what upstream does, what the port does instead, and what
 closing it would cost.
 
-- **External-address selection is ported but has no daemon caller.** The
-  subsystem now follows the parity pin: `ExternalAddrCandidate`,
-  `ExternalAddrCandidateCache` over `dcroxide_containers::lru::Map`,
-  `best_candidate`, `resolve_external_address`,
-  `consider_reported_addr_outbound` and `consider_reported_addr`
-  (`node/src/server.rs`) mirror `036b7090`'s `server.go:2373-2614`, and
-  `handle_add_peer` calls `consider_reported_addr` once, unconditionally, ahead
-  of the peer-state insert (`server.go:2670`). What remains open is the wiring.
-  Nothing outside `crates/dcroxide-node/tests/srvextaddr_vectors.rs` and
-  `srvadmit_vectors.rs` constructs a candidate cache or calls
-  `handle_add_peer`, so no live peer's reported address reaches the subsystem
-  and the address manager never learns a discovered external address. dcrd
-  stores the reported address into `sp.reportedLocalAddr` from `OnVersion`
-  (`server.go:1038`) and holds the cache as a server field
-  (`server.go:424-427`, constructed at `:3947`); the port has neither. Closing
-  it means giving the runtime peer a reported-local-address slot, hanging the
-  cache off the server-level state, and routing peer admission through
-  `handle_add_peer` -- and restoring `handleAddPeer`'s
-  advertise/`NeedMoreAddresses`/`Good` block, which the port does not have and
-  which is gated on `cfg.SimNet`/`cfg.RegNet` rather than on
-  `chainParams.Name` as the discovery gate is. Reported as RVW-012 by an
-  external review of `382864f5`; the "superseded upstream shape" half of that
-  finding is closed, the "unwired" half is what is left -- and it was unwired
-  all along, contrary to this entry's previous claim that
-  `resolve_local_address` was called from live code.
 - **`generate 0` does not cancel an in-flight discrete mining call.** dcrd
   keeps a `generateCancelFn` while discrete mining is active and invokes it on
   the `n == 0` path (`internal/mining/cpuminer/cpuminer.go:159-163`,

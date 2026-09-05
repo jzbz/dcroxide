@@ -362,7 +362,9 @@ Entry format:
 - **Pinned by:** `server_external_addresses_match_dcrd` in
   `crates/dcroxide-node/tests/srvextaddr_vectors.rs` — rows `ecra|beforeinbound`
   and `ecra|afterinbound` (inbound reports leave the score untouched) and
-  `ecrakey|v4`/`ecrakey|v6` (the two key forms). Keying the inbound lookup on
-  the bare IP fails `ecra|afterinbound`, verified by reverting it.
+  `ecrakey|v4`/`ecrakey|v6` (the two key forms), and at the live-path level by
+  `an_inbound_peers_reported_address_corroborates_nothing` in
+  `crates/dcroxide-node/tests/srvextaddr_wired.rs`. Keying the inbound lookup
+  on the bare IP fails both, verified by reverting it.
 - **How found:** re-porting the subsystem from `release-v2.1.5`'s shape to the
   parity pin, where the two key forms sit four lines apart.

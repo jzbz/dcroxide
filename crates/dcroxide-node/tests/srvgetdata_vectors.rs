@@ -444,6 +444,18 @@ fn serve_genesis_chain() -> (
         false,
     );
     let server = Arc::new(ServerContext {
+        external_addr_candidates: std::sync::Mutex::new(Default::default()),
+        external_addr_facts: dcroxide_node::server::ExternalAddrFacts {
+            listeners: Vec::new(),
+            has_proxy: false,
+            no_discover_ip: true,
+            has_external_ips: false,
+            listen_disabled: true,
+            sim_or_reg_net: false,
+            services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+            target_outbound: 8,
+        },
+        lookup: Box::new(|_| Err("no resolver in tests".to_string())),
         target_outbound: 8,
         chain: Arc::clone(&chain),
         min_known_work: params.min_known_chain_work,

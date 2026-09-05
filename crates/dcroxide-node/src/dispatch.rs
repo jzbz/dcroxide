@@ -52,6 +52,10 @@ use crate::server::{
 };
 use crate::sync::NodeSyncManager;
 
+/// The configured name resolver the server hands the external-address
+/// subsystem (dcrd's `dcrdLookup`, a package-level function there).
+pub type ServerLookupFn = Box<dyn Fn(&str) -> Result<Vec<std::net::IpAddr>, String> + Send + Sync>;
+
 /// The daemon-wide state the server handlers consult, shared across
 /// every served peer (the relevant slice of dcrd's `server`).
 pub struct ServerContext {
@@ -106,6 +110,26 @@ pub struct ServerContext {
     /// Whether the daemon accepts incoming connections (`--nolisten`);
     /// gates the local-address advertisement to outbound peers.
     pub disable_listen: bool,
+    /// Candidates for the server's own external address, scored by how
+    /// many outbound peers report seeing them (dcrd's
+    /// `server.externalAddrCandidates`, `server.go:424-427`,
+    /// constructed once in `newServer` at `:3947`).
+    ///
+    /// One cache for the process, behind its own mutex rather than the
+    /// peer state's, exactly as dcrd separates the two.  The guard is
+    /// held across the address-manager calls inside
+    /// `resolve_external_address`, which is dcrd's lock order.
+    pub external_addr_candidates: Mutex<crate::server::ExternalAddrCandidateCache>,
+    /// The configuration the external-address subsystem reads (dcrd's
+    /// `cfg` globals and `server.services`).
+    pub external_addr_facts: crate::server::ExternalAddrFacts,
+    /// The configured name resolver (dcrd's `dcrdLookup`, which routes
+    /// through the proxy when one is set).  Reached only if a
+    /// candidate's host is ever not an IP literal, which
+    /// `resolve_external_address` does not currently produce; it is
+    /// wired rather than stubbed so that stays true by construction
+    /// instead of by assumption.
+    pub lookup: ServerLookupFn,
     /// The server-wide wire byte totals every peer transport feeds
     /// (dcrd's `bytesReceived`/`bytesSent` pair; getnettotals serves
     /// them).
@@ -1013,6 +1037,14 @@ pub struct ServerPeerHandler {
     continue_hash: Arc<Mutex<Option<Hash>>>,
     /// The clock-and-randomness environment for the handlers.
     env: NodePeerEnv,
+    /// The address the remote peer said it saw for this connection,
+    /// taken from its version message (dcrd
+    /// `serverPeer.reportedLocalAddr`, stored in `OnVersion` at
+    /// `server.go:1038`).  An atomic pointer there because dcrd's
+    /// version handler and peer-state goroutine differ; here both run
+    /// on the connection's own thread, so a plain field says the same
+    /// thing.
+    reported_local_addr: Option<dcroxide_wire::NetAddress>,
     /// Whether the init state was already sent on this connection
     /// (dcrd `serverPeer.initStateSent`).
     init_state_sent: bool,
@@ -1396,6 +1428,7 @@ impl ServerPeerHandler {
             addr_state: ServerPeerAddrState::new(is_whitelisted),
             continue_hash: Arc::new(Mutex::new(None)),
             env: NodePeerEnv::new(),
+            reported_local_addr: None,
             init_state_sent: false,
             mining_state_sent: false,
             init_state_received: false,
@@ -1507,6 +1540,11 @@ impl ServerPeerHandler {
         peer: &Peer,
         msg: &dcroxide_wire::MsgVersion,
     ) -> Result<(), String> {
+        // What the remote says it sees for this connection, kept for
+        // the external-address candidate consideration that runs once
+        // the handshake completes (dcrd `server.go:1038`).
+        self.reported_local_addr = Some(msg.addr_you);
+
         let (num_outbound, num_mix_capable_outbound) = self.ctx.sync_peers.outbound_mix_counts();
         let facts = crate::server::OnVersionFacts {
             inbound: peer.inbound(),
@@ -1602,6 +1640,42 @@ impl ServerPeerHandler {
 
             // Mark the address as a known good address.
             let _ = mgr.good(&remote);
+        }
+
+        // Consider the address the remote reported for this connection
+        // as a candidate for the server's own external address (dcrd
+        // `handleAddPeer` calling `considerReportedAddr`,
+        // `server.go:2670`).  Unconditional: the block above is
+        // outbound-only, this is not, and dcrd runs it for inbound
+        // peers too -- where, per QK-0013, its lookup can never hit.
+        // Above the peer-state insert, as upstream is.
+        //
+        // The candidate cache lock is taken before the address manager
+        // and held across `resolve_external_address`'s calls into it,
+        // which is dcrd's order.
+        if let Some(reported) = self.reported_local_addr {
+            let remote_na = crate::server::wire_v2_to_addrmgr_net_address(peer.na())
+                .expect("the peer net address is well formed");
+            let mut cache = self
+                .ctx
+                .external_addr_candidates
+                .lock()
+                .expect("external address candidates poisoned");
+            let mut mgr = self
+                .ctx
+                .addr_manager
+                .lock()
+                .expect("addrmgr mutex poisoned");
+            crate::server::consider_reported_addr(
+                &mut cache,
+                &mut mgr,
+                Some(&reported),
+                peer.inbound(),
+                &remote_na,
+                &self.ctx.external_addr_facts,
+                &|host| (self.ctx.lookup)(host),
+                self.env.now_nanos() / 1_000_000_000,
+            );
         }
 
         let id = self.ctx.next_peer_id.fetch_add(1, Ordering::SeqCst);

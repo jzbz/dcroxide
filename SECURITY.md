@@ -138,17 +138,6 @@ evaluating this code.
   and the tree includes the elliptic-curve implementations, the TLS
   stack, and the storage engine that this node's key handling and
   on-disk consensus state rest on.
-
-- **No automatic external-address discovery.** dcrd learns its own public
-  address from what remote peers report seeing, scores the candidates, and
-  advertises the winner (`server.go:2373-2614`, `:2670`). dcroxide ports that
-  subsystem faithfully as of this commit but does not yet call it from the
-  daemon: no live peer's reported address reaches the candidate cache, so the
-  address manager never gains a discovered local address and the node
-  advertises only what `--externalip` and the configured listeners give it.
-  The effect is reduced reachability and weaker address-book quality for
-  peers, not a vulnerability in itself. Tracked as the open PARITY entry
-  "External-address selection is ported but has no daemon caller".
   [docs/dependency-ledger.md](docs/dependency-ledger.md) does not close
   this gap, but it bounds it: the twelve crates that are consensus-
   observable or touch key material now carry an explicit decision each,
