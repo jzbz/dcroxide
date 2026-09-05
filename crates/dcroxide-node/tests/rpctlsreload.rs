@@ -191,15 +191,32 @@ fn a_deleted_certificate_preserves_the_config_and_recovers() {
     );
 }
 
-/// Resumption state survives a certificate rotation, because dcrd's
-/// does. Go resolves ticket keys with
-/// `originalConfig.ticketKeys(configForClient)`
-/// (`handshake_server.go:177`) and falls through to the long-lived
-/// outer config when the reloaded one sets none -- which dcrd's never
-/// does -- so a client resuming across a rotation is not forced into a
-/// full handshake upstream, and must not be here.
+/// The port does not resume statefully, because Go's server does not.
+/// Go's TLS1.2 `checkForResumption` reads only `clientHello.sessionTicket`
+/// (`crypto/tls/handshake_server.go:450-465`) and merely echoes the
+/// session id (`:565`), while rustls would look that id up in
+/// `session_storage` and restore the stored client certificate chain
+/// without re-verifying it or checking its expiry
+/// (`server/tls12.rs:146-160`, `:289`, `server/hs.rs:39-58`).
+///
+/// `can_cache` is the switch rustls itself consults before offering a
+/// session id at all (`server/tls12.rs:177-178`), so asserting on it
+/// asserts on the thing that decides the behaviour.
 #[test]
-fn a_rotation_carries_the_resumption_state_over() {
+fn stateful_resumption_is_disabled() {
+    let (_dir, reloadable) = reloader(Duration::ZERO);
+    let config = reloadable.config_for_client();
+    assert!(
+        !config.session_storage.can_cache(),
+        "a session cache would resume clients dcrd would make handshake again"
+    );
+}
+
+/// And a reload does not quietly restore it: every rebuilt configuration
+/// goes through the same builder, so the property holds for the life of
+/// the process rather than only at startup.
+#[test]
+fn a_reload_does_not_restore_stateful_resumption() {
     let (dir, reloadable) = reloader(Duration::ZERO);
     let cert = dir.path().join("rpc.cert");
     let key = dir.path().join("rpc.key");
@@ -207,63 +224,13 @@ fn a_rotation_carries_the_resumption_state_over() {
     let before = reloadable.config_for_client();
     write_pair(&cert, &key, 5);
     let after = reloadable.config_for_client();
-
     assert!(
         !Arc::ptr_eq(&before, &after),
         "the rotation must actually have reloaded, or this proves nothing"
     );
     assert!(
-        Arc::ptr_eq(&before.session_storage, &after.session_storage),
-        "a rotated certificate must not throw away resumption state"
-    );
-    assert!(
-        Arc::ptr_eq(&before.ticketer, &after.ticketer),
-        "nor the ticketer"
-    );
-}
-
-/// But a changed client CA bundle drops it, which is the one place
-/// keeping it would be weaker than dcrd. Go re-verifies a resumed
-/// session's stored client chain against the reloaded roots and
-/// declines to resume when it no longer chains
-/// (`handshake_server_tls13.go:373-381`); rustls restores
-/// `peer_certificates` with no verifier call (`server/tls12.rs:289`),
-/// so a cache that outlived its issuer would keep admitting a revoked
-/// client.
-#[test]
-fn a_changed_client_ca_bundle_drops_the_resumption_state() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let cert = dir.path().join("rpc.cert");
-    let key = dir.path().join("rpc.key");
-    let cas = dir.path().join("clients.pem");
-    write_pair(&cert, &key, 0);
-
-    // A bundle holding one self-signed authority, then two.
-    let ca_one = dir.path().join("ca1.cert");
-    let ca_one_key = dir.path().join("ca1.key");
-    write_pair(&ca_one, &ca_one_key, 0);
-    let first = std::fs::read(&ca_one).expect("read ca1");
-    std::fs::write(&cas, &first).expect("write bundle");
-
-    let reloadable = reloadable_tls_config(&cert, &key, Some(&cas), Duration::ZERO)
-        .expect("build with a client CA bundle");
-    let before = reloadable.config_for_client();
-
-    let ca_two = dir.path().join("ca2.cert");
-    let ca_two_key = dir.path().join("ca2.key");
-    write_pair(&ca_two, &ca_two_key, 0);
-    let mut both = first.clone();
-    both.extend_from_slice(&std::fs::read(&ca_two).expect("read ca2"));
-    std::fs::write(&cas, &both).expect("rewrite bundle");
-
-    let after = reloadable.config_for_client();
-    assert!(
-        !Arc::ptr_eq(&before, &after),
-        "the bundle change must actually have reloaded"
-    );
-    assert!(
-        !Arc::ptr_eq(&before.session_storage, &after.session_storage),
-        "a changed trust bundle must not leave sessions resumable on the old roots"
+        !after.session_storage.can_cache(),
+        "the rebuilt configuration must not resume statefully either"
     );
 }
 

@@ -1300,10 +1300,6 @@ struct ReloadState {
     cached_config: Arc<rustls::ServerConfig>,
     /// The last reload error, so an unchanged one is not re-logged.
     prev_attempt_err: Option<String>,
-    /// The client CA bundle as last loaded, compared by content rather
-    /// than by stat: it decides only whether resumption state may be
-    /// carried across a reload, never whether one happens.
-    client_cas_bytes: Option<Vec<u8>>,
 }
 
 /// A TLS configuration that reloads the server certificate, key and
@@ -1330,14 +1326,10 @@ struct ReloadState {
 /// the hot path than the bound is worth; it is recorded in PARITY
 /// rather than hidden.
 ///
-/// Resumption state is carried across a reload rather than discarded,
-/// because dcrd's survives one: Go resolves ticket keys through
-/// `originalConfig.ticketKeys(configForClient)`, which falls back to
-/// the long-lived outer config when the reloaded one sets none, and
-/// dcrd's never does. It is dropped for the one case where keeping it
-/// would be weaker than dcrd -- a changed client CA bundle -- because
-/// rustls does not re-verify a resumed chain where Go does. See
-/// the reload path's own comment.
+/// There is no resumption state to carry across a reload: the port
+/// disables stateful resumption and installs no ticketer, matching Go's
+/// server on the first and falling short of it on the second. See
+/// the configuration builder's own comment, and PARITY.
 pub struct ReloadableTlsConfig {
     /// Everything mutable, behind dcrd's single mutex.
     state: Mutex<ReloadState>,
@@ -1376,11 +1368,10 @@ impl ReloadableTlsConfig {
                 }
                 state.prev_attempt_err = Some(e);
             }
-            Ok((config, client_cas)) => {
+            Ok(config) => {
                 state.prev_attempt_err = None;
                 crate::logging::info(RPC_LOG_SUBSYSTEM, "Reloaded modified RPC certificates");
                 state.cached_config = config;
-                state.client_cas_bytes = client_cas;
             }
         }
         Arc::clone(&state.cached_config)
@@ -1408,30 +1399,19 @@ impl ReloadState {
     }
 
     /// Re-read the watched files into a fresh configuration (dcrd
-    /// `newTLSConfig`, `server.go:3673-3701`), carrying the resumption
-    /// state over unless the trust roots changed.
+    /// `newTLSConfig`, `server.go:3673-3701`).
     ///
-    /// Carrying it is what keeps the port level with dcrd rather than
-    /// stricter. Go looks up ticket keys with
-    /// `originalConfig.ticketKeys(configForClient)`
-    /// (`handshake_server.go:177`), and because the reloaded config sets
-    /// none of its own it falls through to the long-lived outer config's
-    /// automatically rotated keys (`common.go:1095-1124`) -- so a client
-    /// resuming across a certificate rotation is not forced into a full
-    /// handshake upstream, and must not be here.
-    ///
-    /// Not carrying it when the client CAs changed is what keeps the
-    /// port from being *weaker* than dcrd. Go re-verifies a resumed
-    /// session's stored client chain against the reloaded `ClientCAs`
-    /// and declines to resume when it no longer chains
-    /// (`handshake_server_tls13.go:373-381`); rustls restores
-    /// `peer_certificates` straight from the stored session with no
-    /// verifier call (`server/tls12.rs:289`, `server/tls13.rs:354`), so
-    /// a revoked client would keep resuming on a cache that outlived
-    /// its issuer. Dropping the cache for exactly that case reaches
-    /// dcrd's outcome -- revocation takes effect at once -- by the only
-    /// means rustls offers.
-    fn reload(&self) -> Result<(Arc<rustls::ServerConfig>, Option<Vec<u8>>), String> {
+    /// Nothing is carried across from the old configuration. An earlier
+    /// version moved the session cache and ticketer over, to match dcrd
+    /// keeping resumption alive across a rotation -- Go resolves ticket
+    /// keys through `originalConfig.ticketKeys(configForClient)`
+    /// (`handshake_server.go:177`), which falls through to the
+    /// long-lived outer config. That reasoning no longer applies:
+    /// `build_server_config` disables stateful resumption and installs
+    /// no ticketer, so there is no resumption state to preserve and
+    /// nothing a rotation could interrupt. If a ticketer is ever added,
+    /// the question comes back with it.
+    fn reload(&self) -> Result<Arc<rustls::ServerConfig>, String> {
         let read = |watched: &WatchedFile| -> Result<Option<Vec<u8>>, String> {
             let Some(path) = watched.path.as_ref() else {
                 return Ok(None);
@@ -1443,12 +1423,7 @@ impl ReloadState {
         let cert = read(&self.cert)?.ok_or_else(|| "no RPC certificate path".to_string())?;
         let key = read(&self.key)?.ok_or_else(|| "no RPC key path".to_string())?;
         let client_cas = read(&self.client_cas)?;
-        let mut config = build_server_config(&cert, &key, client_cas.as_deref())?;
-        if client_cas == self.client_cas_bytes {
-            config.session_storage = Arc::clone(&self.cached_config.session_storage);
-            config.ticketer = Arc::clone(&self.cached_config.ticketer);
-        }
-        Ok((Arc::new(config), client_cas))
+        build_server_config(&cert, &key, client_cas.as_deref()).map(Arc::new)
     }
 }
 
@@ -1504,7 +1479,6 @@ pub fn reloadable_tls_config(
         },
         cached_config,
         prev_attempt_err: None,
-        client_cas_bytes: client_cas,
     };
     // Prime the file details, as dcrd does at `server.go:3814-3817`.
     state.cert.updated();
@@ -1599,9 +1573,40 @@ fn build_server_config(
                 .to_string(),
         );
     }
-    let config = builder
+    let mut config = builder
         .with_single_cert(certs, key)
         .map_err(|e| format!("unable to build the RPC TLS configuration: {e}"))?;
+
+    // Turn off stateful session resumption, which Go's server does not
+    // have and rustls enables by default.
+    //
+    // Go resumes only from tickets: TLS1.2's `checkForResumption` reads
+    // `clientHello.sessionTicket` and nothing else
+    // (`crypto/tls/handshake_server.go:450-465`), and the session id is
+    // echoed rather than used as a key (`:565`). rustls instead looks the
+    // client's session id up in `session_storage`
+    // (`server/tls12.rs:146-160`) behind `can_resume`, which compares the
+    // cipher suite, extended master secret and SNI and nothing else
+    // (`server/hs.rs:39-58`) -- no expiry check on the stored client
+    // certificate and no re-verification, while the chain is restored
+    // verbatim (`server/tls12.rs:289`). The default cache is bounded by
+    // count and not by time, so on a quiet server an entry can outlive
+    // the certificate that created it.
+    //
+    // Under `--authtype=clientcert` that is the port admitting a client
+    // dcrd would turn away. `NoServerSessionStorage` also makes rustls
+    // send an empty session id (`server/tls12.rs:177-178`), which is what
+    // a server that cannot resume statefully should offer.
+    //
+    // What this does NOT do is add the ticket resumption Go has: rustls's
+    // default ticketer is `NeverProducesTickets`, so the port resumes not
+    // at all where dcrd resumes from tickets. That leaves it stricter
+    // rather than weaker, and installing a ticketer would trade the one
+    // for the other, since rustls skips the same client-certificate
+    // checks on a ticket resumption (`server/tls13.rs:350-355`) that Go
+    // performs (`crypto/tls/handshake_server_tls13.go:362-381`). See
+    // PARITY.
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
     Ok(config)
 }
 

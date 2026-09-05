@@ -730,7 +730,7 @@ fn serves_tls_with_a_generated_certificate() {
             .with_no_client_auth(),
     );
     let name = rustls::pki_types::ServerName::try_from("localhost").expect("name");
-    let session = rustls::ClientConnection::new(client_config, name).expect("client");
+    let session = rustls::ClientConnection::new(Arc::clone(&client_config), name).expect("client");
     let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     let mut tls_stream = rustls::StreamOwned::new(session, tcp);
 
@@ -745,6 +745,36 @@ fn serves_tls_with_a_generated_certificate() {
     let _ = tls_stream.read_to_string(&mut response);
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.contains("\"result\":0"), "{response}");
+
+    // A second connection over the SAME client config -- which keeps
+    // rustls's default in-memory client session store, so it will offer
+    // whatever the first handshake gave it -- must handshake in full.
+    //
+    // dcrd's server resumes only from tickets whose keys live on the
+    // long-lived config, and re-verifies the stored client chain against
+    // the current roots before accepting one
+    // (`crypto/tls/handshake_server_tls13.go:362-381`). rustls does no
+    // such re-verification, and with no ticketer configured its TLS1.3
+    // "ticket" is a 32-byte key into `session_storage` with a 24 hour
+    // lifetime (`server/tls13.rs:1309-1317`), which an ordinary Go client
+    // would store and present again. Disabling the store is what keeps a
+    // client the daemon would now reject from resuming its way back in.
+    let session = rustls::ClientConnection::new(
+        Arc::clone(&client_config),
+        rustls::pki_types::ServerName::try_from("localhost").expect("name"),
+    )
+    .expect("second client");
+    let tcp = TcpStream::connect(("127.0.0.1", port)).expect("reconnect");
+    let mut second = rustls::StreamOwned::new(session, tcp);
+    second.write_all(request.as_bytes()).expect("write");
+    let mut response = String::new();
+    let _ = second.read_to_string(&mut response);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_eq!(
+        second.conn.handshake_kind(),
+        Some(rustls::HandshakeKind::Full),
+        "the second connection must not have resumed"
+    );
 
     listener.shutdown();
 }

@@ -579,30 +579,14 @@ against upstream and the port is faithful.
   data or deleting them cannot take the RPC server down, and a repair is
   picked up on the next check.
 
-  Resumption needed care in both directions, and the naive reading is wrong
-  twice over. dcrd does NOT lose resumption across a reload: Go resolves
-  ticket keys with `originalConfig.ticketKeys(configForClient)`
+  Resumption is no longer carried across a reload, because there is none to
+  carry: the port disables stateful resumption outright, for reasons that
+  belong to the separate entry below rather than to reloading. An earlier
+  version of this entry argued for carrying the session cache and ticketer
+  over, on the grounds that dcrd's resumption survives a rotation -- Go
+  resolves ticket keys with `originalConfig.ticketKeys(configForClient)`
   (`handshake_server.go:177`), which falls through to the long-lived outer
-  config's automatically rotated keys when the reloaded config sets none
-  (`common.go:1095-1124`), and dcrd never sets any. So the port carries its
-  `session_storage` and ticketer into the rebuilt configuration; dropping
-  them would force a full handshake that upstream does not, which is stricter
-  rather than faithful. But it does drop them when the client CA bundle
-  changed, because Go re-verifies a resumed session's stored client chain
-  against the reloaded roots and refuses to resume when it no longer chains
-  (`handshake_server_tls13.go:373-381`), while rustls restores
-  `peer_certificates` from the stored session with no verifier call
-  (`server/tls12.rs:289`). Keeping the cache there would let an issuer that
-  was just revoked go on resuming -- weaker than dcrd, and precisely the
-  thing this entry exists to protect. That decision is made by comparing the
-  bundle's bytes, not its stat, so it never affects whether a reload happens.
-
-  One resumption difference is older than this entry and is not addressed
-  here: rustls's default ticketer is `NeverProducesTickets`, so the port
-  issues no stateless tickets at all and resumes statefully out of the
-  default memory cache, where Go's server resumes only from tickets. That is
-  a separate question about which resumption mechanism the port offers, not
-  about reloading.
+  config. That reasoning was sound and is now moot.
 
   One bounded difference remains. dcrd's callback runs after the ClientHello,
   so only a peer that actually speaks TLS advances the five-second clock,
@@ -658,6 +642,42 @@ against upstream and the port is faithful.
 These are real divergences from the parity pin and someone should eventually
 close them. Each says what upstream does, what the port does instead, and what
 closing it would cost.
+
+- **The RPC server issues no session tickets, so it never resumes.** Go's
+  server resumes only from tickets, and dcrd leaves ticketing at its
+  defaults, so a returning client normally resumes. rustls's default
+  ticketer is `NeverProducesTickets` (`server/builder.rs:116`), so the port
+  issues none and every connection is a full handshake. That is stricter
+  than dcrd rather than weaker, and costs handshake work rather than
+  safety.
+
+  Closing it means installing `rustls::crypto::ring::Ticketer`, and that
+  was declined for now because it would trade this gap for a worse one.
+  rustls restores a resumed session's stored client certificate chain with
+  no verifier call and no expiry check, on the ticket path
+  (`server/tls13.rs:350-355`) exactly as on the stateful one
+  (`server/tls12.rs:289`), gated only by `can_resume`'s cipher-suite,
+  extended-master-secret and SNI comparison (`server/hs.rs:39-58`). Go
+  re-verifies that chain against the current `ClientCAs` and refuses a
+  resumption whose certificate has expired or no longer chains
+  (`handshake_server_tls13.go:362-381`). So a ticketer would restore
+  resumption and, under `--authtype=clientcert`, let a client dcrd would
+  turn away resume its way back in. Closing this properly wants a resumption
+  path that re-runs the client verifier, which rustls does not currently
+  offer.
+
+  The related divergence in the other direction is closed:
+  `build_server_config` sets `session_storage` to `NoServerSessionStorage`,
+  so the port no longer resumes statefully where dcrd never does. That was
+  not the narrow TLS1.2 curiosity it first looked like. With no ticketer
+  configured, rustls's TLS1.3 "ticket" is a 32-byte key into
+  `session_storage` carrying a 24 hour lifetime (`server/tls13.rs:1309-1317`),
+  which an ordinary Go client stores and presents again -- so the path was
+  reachable by dcrctl and dcrwallet, not merely by third-party tooling doing
+  TLS1.2 session-id resumption. Pinned end to end in
+  `serves_tls_with_a_generated_certificate`, which reconnects on the same
+  client config and requires a full handshake; with the default store
+  restored, that second connection reports `Resumed`.
 
 - **`--tlscurve=P-521` is refused where dcrd accepts it.** dcrd generates a
   P-521 RPC certificate on request and serves TLS with it: Go offers
