@@ -368,3 +368,60 @@ Entry format:
   on the bare IP fails both, verified by reverting it.
 - **How found:** re-porting the subsystem from `release-v2.1.5`'s shape to the
   parity pin, where the two key forms sit four lines apart.
+
+## QK-0014 — `--maxpeers` yields two different outbound targets, which disagree
+
+- **Where:** dcrd `server.go:4132-4142` (the netsync target) against
+  `server.go:3927` / `:4273-4274` (the server field), both downstream of
+  `server.go:3931-3932` / dcroxide-node `server.rs`
+  `netsync_max_outbound_peers` and `server_target_outbound`
+- **What:** `newServer` derives an outbound target from `cfg.MaxPeers` twice,
+  140 lines apart, and the two are not the same computation written twice. The
+  netsync target compares in signed space and widens afterwards (`if
+  cfg.MaxPeers < targetOutbound`, then `uint64(targetOutbound)`); the server
+  field converts first and compares unsigned (`if uint32(cfg.MaxPeers) <
+  s.targetOutbound`). Nothing validates `--maxpeers`, and the two disagree in
+  *opposite* directions:
+
+  | `--maxpeers` | server field | netsync target |
+  | --- | --- | --- |
+  | `-1` | 8 | 18446744073709551615 |
+  | `4294967296` | 0 | 8 |
+
+  The catch, and the reason this is a quirk rather than a live divergence, is
+  that **dcrd cannot reach either line for any input where they disagree.**
+  Two hundred lines earlier `newServer` builds its relay and broadcast queues
+  as `make(chan relayMsg, cfg.MaxPeers)` and `make(chan broadcastMsg,
+  cfg.MaxPeers)` (`server.go:3931-3932`), and Go's `make` takes the capacity
+  as a signed `int`: every negative value raises `panic: makechan: size out of
+  range`, and every value large enough to matter dies as `fatal error:
+  runtime: out of memory`. Nothing on dcrd's startup path recovers either. So
+  upstream the two targets agree wherever dcrd survives to compute them, and
+  where they disagree the process is already gone.
+- **Why reproduced:** dcroxide has no such queues — relay and broadcast are
+  synchronous fan-outs over the peer registry — so unlike dcrd it *does* reach
+  both computations for every input, and cannot dodge the question of which
+  one is right by dying first. Reproducing both is the only option that is
+  correct for whichever value the port ends up observing: the server field
+  reaches `connmgr.Config.TargetOutbound` and the version handler's
+  mix-capable rejection at `server.go:1016`, while the netsync target only
+  gates a "no sync peer candidates" warning
+  (`internal/netsync/manager.go:632`). Collapsing the two into one shared
+  value is the obvious tidy-up and is wrong: it silently changes one of them.
+  What the port should do about surviving inputs that kill dcrd outright is a
+  separate question, tracked in PARITY.
+- **Pinned by:** `target_outbound_arithmetic_matches_dcrd` and
+  `the_two_targets_disagree_in_both_directions` in
+  `crates/dcroxide-node/tests/srvtargetout_vectors.rs`, against rows dumped
+  from in-package Go tests at the pin whose expressions are copied verbatim
+  from `server.go`. Rewriting either helper to the other's shape fails the
+  replay, verified by doing it. The `mpchan|` rows record what dcrd's
+  `newServer` actually does with each `--maxpeers` — which of them panic,
+  which exhaust memory, and which allocate — measured by running the real
+  `make` calls with the real element types, each in its own subprocess because
+  the out-of-memory death is not recoverable.
+- **How found:** auditing the three `target_outbound` computations left
+  inconsistent by `39d4f16`, which fixed one of them without asking why the
+  others differed. The channel allocation turned up only on a sweep for
+  consumers nobody had accounted for, and inverted the reading: the arithmetic
+  the audit set out to fix is arithmetic dcrd never executes.

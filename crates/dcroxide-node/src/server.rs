@@ -27,6 +27,82 @@ use crate::gostd::{join_host_port, split_host_port};
 /// `defaultTargetOutbound`).
 pub const DEFAULT_TARGET_OUTBOUND: i64 = 8;
 
+/// dcrd's server-level outbound target: the default, lowered to
+/// `--maxpeers` only when that is smaller *as a `uint32`*
+/// (`server.go:3927` sets the field, `:4273-4274` lowers it).
+///
+/// ```text
+/// s.targetOutbound = defaultTargetOutbound
+/// if uint32(cfg.MaxPeers) < s.targetOutbound {
+///     s.targetOutbound = uint32(cfg.MaxPeers)
+/// }
+/// ```
+///
+/// The conversion happens BEFORE the comparison, so it truncates to
+/// the low 32 bits and a negative `--maxpeers` reads as a huge
+/// positive: `-1` leaves the target at 8 rather than lowering it,
+/// while `4294967296` truncates to 0 and lowers it to nothing.
+///
+/// This is NOT the same computation as [`netsync_max_outbound_peers`],
+/// which dcrd runs on the same flag 140 lines earlier in signed space
+/// and which disagrees with this one in both directions.  Reproducing
+/// both, rather than picking whichever looks right, is QK-0014.
+pub fn server_target_outbound(max_peers: i64) -> u32 {
+    (DEFAULT_TARGET_OUTBOUND as u32).min(max_peers as u32)
+}
+
+/// dcrd's netsync outbound target: the default, lowered to `--maxpeers`
+/// when that is smaller *as a signed `int`*, and widened only
+/// afterwards (`server.go:4132-4142`).
+///
+/// ```text
+/// targetOutbound := defaultTargetOutbound
+/// if cfg.MaxPeers < targetOutbound {
+///     targetOutbound = cfg.MaxPeers
+/// }
+/// ...
+/// MaxOutboundPeers: uint64(targetOutbound),
+/// ```
+///
+/// The comparison is signed and the widening comes AFTER, so a
+/// negative `--maxpeers` becomes an enormous `uint64` instead of a
+/// small one: `-1` yields `u64::MAX`, and `4294967296` is not below
+/// the default at all so the target stays 8.  Both are the opposite of
+/// what [`server_target_outbound`] produces for the same flag; see
+/// QK-0014.
+pub fn netsync_max_outbound_peers(max_peers: i64) -> u64 {
+    DEFAULT_TARGET_OUTBOUND.min(max_peers) as u64
+}
+
+/// Whether dcrd's `newServer` can build its relay queues for this
+/// `--maxpeers` (`server.go:3931-3932`):
+///
+/// ```text
+/// relayInv:  make(chan relayMsg, cfg.MaxPeers),
+/// broadcast: make(chan broadcastMsg, cfg.MaxPeers),
+/// ```
+///
+/// Go takes a channel capacity as a signed `int` and rejects a negative
+/// one with `panic: makechan: size out of range`.  Nothing on dcrd's
+/// startup path recovers it, and nothing validates the flag beforehand,
+/// so `dcrd --maxpeers=-1` dies in `newServer` roughly 200 lines before
+/// it reaches either outbound target -- which is why the two targets
+/// can disagree there without anyone upstream noticing (QK-0014).
+///
+/// dcroxide relays synchronously and allocates no such queue, so it
+/// would boot where dcrd refuses to, and would do so with
+/// `MaxNormalConns` set to `uint32(-1)`: no peer limit at all, from a
+/// typo that stops dcrd dead.  Reproducing the refusal is what keeps
+/// the port from being the more permissive of the two.
+///
+/// Only the negative half is deterministic upstream.  A large enough
+/// `--maxpeers` also kills dcrd, but as an unrecoverable out-of-memory
+/// death whose threshold is the machine's rather than the flag's, so
+/// that half is not reproduced; see PARITY.
+pub fn max_peers_is_startable(max_peers: i64) -> bool {
+    max_peers >= 0
+}
+
 /// The maximum number of candidates used for automatic discovery of
 /// external addresses to allow (dcrd `maxExternalAddrCandidates`).
 pub const MAX_EXTERNAL_ADDR_CANDIDATES: u32 = 20;

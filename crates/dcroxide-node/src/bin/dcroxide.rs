@@ -33,9 +33,8 @@ use dcroxide_node::dispatch::ServerContext;
 use dcroxide_node::outbound::{OutboundConfig, start_outbound};
 use dcroxide_node::runtime::{ConnectedPeers, ListenerRuntime, PeerTemplate, inbound_peer_handler};
 use dcroxide_node::{
-    Config, ConfigEnv, DEFAULT_TARGET_OUTBOUND, ERR_HELP_REQUESTED, ERR_SHOW_SUBSYSTEMS,
-    ERR_VERSION_REQUESTED, app_data_dir, load_config_from_argv, logo, parse_listeners,
-    supported_subsystems, version,
+    Config, ConfigEnv, ERR_HELP_REQUESTED, ERR_SHOW_SUBSYSTEMS, ERR_VERSION_REQUESTED,
+    app_data_dir, load_config_from_argv, logo, parse_listeners, supported_subsystems, version,
 };
 use dcroxide_peer::{DEFAULT_IDLE_TIMEOUT, PING_INTERVAL};
 use dcroxide_rpc::server::RpcCpuMiner;
@@ -862,6 +861,25 @@ fn run(cfg: Config) -> ExitCode {
         }
     };
 
+    // dcrd cannot start at all with a negative --maxpeers: `newServer`
+    // builds its relay queues as `make(chan relayMsg, cfg.MaxPeers)`
+    // (`server.go:3931-3932`) and Go panics on a negative capacity, with
+    // nothing to recover it.  Refuse here rather than boot with no peer
+    // limit, which is what the faithful `uint32` casts below would
+    // otherwise produce.  See QK-0014.
+    //
+    // dcrd reaches its panic just after `initListeners`, so it binds the
+    // peer-to-peer listeners and then dies; refusing before binding them
+    // is the one ordering difference, and it is not observable beyond a
+    // socket that upstream holds for a few microseconds.
+    if !dcroxide_node::max_peers_is_startable(cfg.max_peers) {
+        log_error(&format!(
+            "The maxpeers option may not be less than 0 -- parsed [{}]",
+            cfg.max_peers
+        ));
+        return ExitCode::FAILURE;
+    }
+
     // The connection manager decision core (dcrd 2.2's connmgr.New in
     // newServer): the policy limits, the CIDR whitelist matcher, and
     // the network default port for address selection.
@@ -872,9 +890,15 @@ fn run(cfg: Config) -> ExitCode {
         Arc::new(std::sync::Mutex::new(dcroxide_connmgr::ConnManager::new(
             dcroxide_connmgr::ManagerConfig {
                 default_port,
-                max_normal_conns: cfg.max_peers.max(0) as u32,
-                max_conns_per_host: cfg.max_same_ip.max(0) as u32,
-                target_outbound: (DEFAULT_TARGET_OUTBOUND as u32).min(cfg.max_peers.max(0) as u32),
+                // dcrd casts both straight to uint32 (`server.go:4283-4284`:
+                // `MaxNormalConns: uint32(cfg.MaxPeers)`,
+                // `MaxConnsPerHost: uint32(cfg.MaxSameIP)`), which truncates
+                // rather than clamping.  Neither dcrd nor this port validates
+                // the two flags, so a negative reaches here and must read as
+                // the huge positive dcrd sees, not as zero.
+                max_normal_conns: cfg.max_peers as u32,
+                max_conns_per_host: cfg.max_same_ip as u32,
+                target_outbound: dcroxide_node::server_target_outbound(cfg.max_peers),
                 retry_duration_nanos: DEFAULT_RETRY_DURATION,
                 is_whitelisted: Box::new(move |addr| {
                     whitelists.iter().any(|net| net.contains(&addr.ip))
@@ -1223,8 +1247,10 @@ fn build_server(
         Arc::clone(&chain),
         params,
         cfg.no_mining_state_sync,
-        // dcrd's targetOutbound: the default capped by --maxpeers.
-        DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u64,
+        // dcrd's OTHER outbound target -- signed comparison, widened
+        // afterwards (`server.go:4132-4142`).  Deliberately not the same
+        // computation as the server's; see QK-0014.
+        dcroxide_node::netsync_max_outbound_peers(cfg.max_peers),
         cfg.max_orphan_txs as usize,
         Arc::clone(&tx_pool),
         Arc::clone(&mix_pool),
@@ -1232,7 +1258,7 @@ fn build_server(
     // The daemon-wide state the served peers' message handlers consult
     // (dcrd `newServer` deriving `minKnownWork` from the params).
     let server = Arc::new(ServerContext {
-        target_outbound: dcroxide_node::DEFAULT_TARGET_OUTBOUND.min(cfg.max_peers) as u32,
+        target_outbound: dcroxide_node::server_target_outbound(cfg.max_peers),
         chain,
         min_known_work: params.min_known_chain_work,
         params: params.clone(),
@@ -1260,14 +1286,10 @@ fn build_server(
             // must stay independent here.
             sim_or_reg_net: params.name == "simnet" || params.name == "regnet",
             services: ServiceFlag::NODE_NETWORK,
-            // dcrd casts to uint32 BEFORE comparing (`server.go:4273`:
-            // `if uint32(cfg.MaxPeers) < s.targetOutbound`), so a negative
-            // --maxpeers leaves the target at its default.  Doing the `min`
-            // in signed space and casting after would turn -1 into
-            // u32::MAX, which then overflows `target_outbound * 60` in the
-            // majority expression this feeds.
-            target_outbound: (dcroxide_node::DEFAULT_TARGET_OUTBOUND as u32)
-                .min(cfg.max_peers as u32),
+            // The same `s.targetOutbound` the version handler reads;
+            // bounded by 8, so the `target_outbound * 60` majority
+            // expression this feeds can never overflow.
+            target_outbound: dcroxide_node::server_target_outbound(cfg.max_peers),
         },
         // dcrd's `dcrdLookup`, which routes through the proxy when set.
         lookup: {

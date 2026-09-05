@@ -554,6 +554,30 @@ These are real divergences from the parity pin and someone should eventually
 close them. Each says what upstream does, what the port does instead, and what
 closing it would cost.
 
+- **A `--maxpeers` large enough to exhaust memory kills dcrd and not the
+  port.** `newServer` builds its relay and broadcast queues as `make(chan
+  relayMsg, cfg.MaxPeers)` and `make(chan broadcastMsg, cfg.MaxPeers)`
+  (`server.go:3931-3932`) before it computes anything from the flag, and Go
+  takes a channel capacity as a signed `int`. Both halves of the invalid range
+  are fatal upstream: a negative capacity raises `panic: makechan: size out of
+  range`, and a large one dies as `fatal error: runtime: out of memory`.
+  Nothing on dcrd's startup path recovers either, and nothing validates the
+  flag beforehand. dcroxide relays synchronously and allocates no such queue,
+  so it reaches decisions dcrd never survives to make -- which is the whole
+  reason QK-0014's two disagreeing outbound targets matter here and not
+  upstream. The negative half is now reproduced: `max_peers_is_startable`
+  refuses it at startup, since without that the faithful `uint32(cfg.MaxPeers)`
+  cast into `MaxNormalConns` would leave the port running with no peer limit
+  at all on a typo that stops dcrd dead. The large-positive half is not
+  reproduced, because its threshold belongs to the machine's available memory
+  rather than to the flag: the same `--maxpeers` that aborts dcrd on one host
+  starts it on another, so there is no value the port could refuse that would
+  be right anywhere else. Closing it would mean either allocating a queue the
+  port has no use for purely to inherit its failure mode, or picking a
+  threshold and admitting it is invented. Measured at the pin, per input, each
+  in its own subprocess -- the `mpchan|` rows of
+  `crates/dcroxide-node/tests/data/srvtargetout_vectors.txt`.
+
 - **`generate 0` does not cancel an in-flight discrete mining call.** dcrd
   keeps a `generateCancelFn` while discrete mining is active and invokes it on
   the `n == 0` path (`internal/mining/cpuminer/cpuminer.go:159-163`,

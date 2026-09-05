@@ -1,0 +1,69 @@
+tout|-9223372036854775808|0|9223372036854775808|0|0|0|0
+tout|-4294967297|8|18446744069414584319|4294967295|8|5|3
+tout|-4294967296|0|18446744069414584320|0|0|0|0
+tout|-125|8|18446744073709551491|4294967171|8|5|3
+tout|-9|8|18446744073709551607|4294967287|8|5|3
+tout|-8|8|18446744073709551608|4294967288|8|5|3
+tout|-1|8|18446744073709551615|4294967295|8|5|3
+tout|0|0|0|0|0|0|0
+tout|1|1|1|1|1|1|1
+tout|7|7|7|7|7|5|3
+tout|8|8|8|8|8|5|3
+tout|9|8|8|9|8|5|3
+tout|125|8|8|125|8|5|3
+tout|2147483647|8|8|2147483647|8|5|3
+tout|2147483648|8|8|2147483648|8|5|3
+tout|4294967295|8|8|4294967295|8|5|3
+tout|4294967296|0|8|0|0|0|0
+tout|4294967297|1|8|1|1|1|1
+tout|9223372036854775807|8|8|4294967295|8|5|3
+tsip|-4294967296|0
+tsip|-1|4294967295
+tsip|0|0
+tsip|1|1
+tsip|5|5
+tsip|4294967296|0
+tsip|9223372036854775807|4294967295
+tmix|0|0|0|true
+tmix|0|1|0|true
+tmix|0|5|0|true
+tmix|0|7|0|true
+tmix|0|8|0|true
+tmix|0|125|0|true
+tmix|3|0|3|true
+tmix|3|1|3|true
+tmix|3|5|3|true
+tmix|3|7|3|true
+tmix|3|8|3|true
+tmix|3|125|3|true
+tmix|8|0|3|false
+tmix|8|1|3|false
+tmix|8|5|3|true
+tmix|8|7|3|true
+tmix|8|8|3|true
+tmix|8|125|3|true
+tmix|4294967295|0|3|false
+tmix|4294967295|1|3|false
+tmix|4294967295|5|3|false
+tmix|4294967295|7|3|false
+tmix|4294967295|8|3|false
+tmix|4294967295|125|3|false
+mpchan|-9223372036854775808|panic:makechan: size out of range
+mpchan|-4294967297|panic:makechan: size out of range
+mpchan|-4294967296|panic:makechan: size out of range
+mpchan|-125|panic:makechan: size out of range
+mpchan|-9|panic:makechan: size out of range
+mpchan|-8|panic:makechan: size out of range
+mpchan|-1|panic:makechan: size out of range
+mpchan|0|ok:0:0
+mpchan|1|ok:1:1
+mpchan|7|ok:7:7
+mpchan|8|ok:8:8
+mpchan|9|ok:9:9
+mpchan|125|ok:125:125
+mpchan|2147483647|fatal
+mpchan|2147483648|fatal
+mpchan|4294967295|fatal
+mpchan|4294967296|fatal
+mpchan|4294967297|fatal
+mpchan|9223372036854775807|panic:makechan: size out of range
