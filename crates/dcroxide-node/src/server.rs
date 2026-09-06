@@ -74,6 +74,32 @@ pub fn netsync_max_outbound_peers(max_peers: i64) -> u64 {
     DEFAULT_TARGET_OUTBOUND.min(max_peers) as u64
 }
 
+/// Go's `maxAlloc` on every 64-bit target dcrd ships:
+/// `(1 << heapAddrBits) - (1-_64bit)` with `heapAddrBits` = 48
+/// (`runtime/malloc.go:220`, `:213`).  32-bit dcrd never reaches the
+/// limit below by a different route -- its `int` is 32 bits, so
+/// go-flags rejects anything past 2147483647 while parsing.
+const GO_MAX_ALLOC: i64 = 1 << 48;
+
+/// `unsafe.Sizeof(hchan{})` rounded to `maxAlign` (`runtime/chan.go`).
+/// Measured as 104 under go1.27.  The limit below is the same integer
+/// for any value in `[104, 136]`, which spans the plausible range and
+/// covers both toolchains CI pins (`ci.yml:74` 1.24, `:115` 1.25), so
+/// the constant does not track the Go release.
+const GO_HCHAN_SIZE: i64 = 104;
+
+/// `unsafe.Sizeof(relayMsg{})`, measured in the pin; `broadcastMsg` is
+/// the same 40 bytes (`server.go:225-230`, `:204-207`).
+const GO_RELAY_MSG_SIZE: i64 = 40;
+
+/// The smallest `--maxpeers` dcrd cannot start with because the
+/// capacity itself is rejected rather than the allocation failing:
+/// 7_036_874_417_764.  Derived rather than measured, from the three
+/// cited quantities; bisecting the pin corroborates it, at
+/// 7036874417763 dying `out of memory` and 7036874417764 dying
+/// `panic: makechan: size out of range`.
+pub const MAX_PEERS_MAKECHAN_LIMIT: i64 = (GO_MAX_ALLOC - GO_HCHAN_SIZE) / GO_RELAY_MSG_SIZE + 1;
+
 /// Whether dcrd's `newServer` can build its relay queues for this
 /// `--maxpeers` (`server.go:3931-3932`):
 ///
@@ -95,12 +121,31 @@ pub fn netsync_max_outbound_peers(max_peers: i64) -> u64 {
 /// typo that stops dcrd dead.  Reproducing the refusal is what keeps
 /// the port from being the more permissive of the two.
 ///
-/// Only the negative half is deterministic upstream.  A large enough
-/// `--maxpeers` also kills dcrd, but as an unrecoverable out-of-memory
-/// death whose threshold is the machine's rather than the flag's, so
-/// that half is not reproduced; see PARITY.
+/// `makechan` rejects on two disjuncts of one `if`, not one
+/// (`runtime/chan.go:87`):
+///
+/// ```text
+/// if overflow || mem > maxAlloc-hchanSize || size < 0 { panic(...) }
+/// ```
+///
+/// Neither disjunct consults installed memory, so both are reproduced.
+/// Between them lies a genuinely host-dependent band where the capacity
+/// is accepted and the *allocation* is what fails; that band is not
+/// reproduced, and it is all that remains open here -- see PARITY.
+///
+/// An earlier version of this comment called the whole positive half
+/// "an unrecoverable out-of-memory death whose threshold is the
+/// machine's rather than the flag's".  That is wrong at the top of the
+/// range, and wrong in the direction that mattered:
+/// `dcrd --maxpeers=9223372036854775807` dies with the very same
+/// `panic: makechan: size out of range` as `--maxpeers=-1`, before a
+/// byte is allocated.  Nor are the two inputs merely analogous here --
+/// `uint32(-1)` and `uint32(2^63-1)` are both 4294967295, so they reach
+/// `MaxNormalConns` byte-identical, and the port refused one while
+/// booting the other into precisely the no-peer-limit state the
+/// refusal above exists to prevent.
 pub fn max_peers_is_startable(max_peers: i64) -> bool {
-    max_peers >= 0
+    (0..MAX_PEERS_MAKECHAN_LIMIT).contains(&max_peers)
 }
 
 /// The maximum number of candidates used for automatic discovery of

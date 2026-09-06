@@ -878,8 +878,19 @@ fn run(cfg: Config) -> ExitCode {
     // is the one ordering difference, and it is not observable beyond a
     // socket that upstream holds for a few microseconds.
     if !dcroxide_node::max_peers_is_startable(cfg.max_peers) {
+        // Upstream dies the same way at both ends of the range -- one
+        // `panic: makechan: size out of range` -- but which end it was
+        // is worth telling apart for whoever reads the log.
+        let bound = if cfg.max_peers < 0 {
+            String::from("may not be less than 0")
+        } else {
+            format!(
+                "may not be {} or greater, the capacity dcrd's relay queue is refused at",
+                dcroxide_node::MAX_PEERS_MAKECHAN_LIMIT
+            )
+        };
         log_error(&format!(
-            "The maxpeers option may not be less than 0 -- parsed [{}]",
+            "The maxpeers option {bound} -- parsed [{}]",
             cfg.max_peers
         ));
         return ExitCode::FAILURE;

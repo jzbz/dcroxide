@@ -66,4 +66,6 @@ mpchan|2147483648|fatal
 mpchan|4294967295|fatal
 mpchan|4294967296|fatal
 mpchan|4294967297|fatal
+mpchan|7036874417763|fatal
+mpchan|7036874417764|panic:makechan: size out of range
 mpchan|9223372036854775807|panic:makechan: size out of range

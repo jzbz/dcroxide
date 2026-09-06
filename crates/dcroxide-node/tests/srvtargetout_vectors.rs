@@ -134,22 +134,22 @@ fn target_outbound_arithmetic_matches_dcrd() {
                     (0..=125).contains(&max_peers),
                     "line {lineno}: dcrd survivability for --maxpeers={max_peers}",
                 );
-                // The port refuses exactly the negatives, which is the
-                // deterministic half of dcrd's death.  The positive half is
-                // an out-of-memory threshold that belongs to the machine, so
-                // a `fatal` row on a positive value is expected NOT to be
-                // refused here.
+                // The port refuses exactly where dcrd's `makechan` rejects
+                // the capacity itself, which is both disjuncts of one `if`
+                // (`runtime/chan.go:87`) -- the negative one, and the one
+                // past `maxAlloc-hchanSize`.  A `fatal` row is the band
+                // between them, where the capacity is accepted and the
+                // allocation is what fails; that threshold is the host's
+                // rather than the flag's, so those are expected NOT to be
+                // refused.  This assertion carried an `&& max_peers < 0`
+                // guard that exempted the one `panic:` row sitting on a
+                // positive value, which is how the divergence stayed
+                // invisible while its counterexample sat in the fixture.
                 assert_eq!(
                     max_peers_is_startable(max_peers),
-                    max_peers >= 0,
+                    !outcome.starts_with("panic:"),
                     "line {lineno}: startability for --maxpeers={max_peers}",
                 );
-                if outcome.starts_with("panic:") && max_peers < 0 {
-                    assert!(
-                        !max_peers_is_startable(max_peers),
-                        "line {lineno}: dcrd panics here, so the port must refuse",
-                    );
-                }
                 if survives {
                     assert!(
                         max_peers_is_startable(max_peers),
@@ -175,8 +175,8 @@ fn target_outbound_arithmetic_matches_dcrd() {
         }
     }
 
-    assert_eq!(rows, 69, "vector count");
-    assert_eq!((tout, tsip, tmix, mpchan), (19, 7, 24, 19), "row kinds");
+    assert_eq!(rows, 71, "vector count");
+    assert_eq!((tout, tsip, tmix, mpchan), (19, 7, 24, 21), "row kinds");
 }
 
 /// The whole point of QK-0014, stated as an assertion rather than as

@@ -63,8 +63,8 @@ pub use ipc::{LifetimeAction, LifetimeEventId, PipeMessage};
 pub use logsubsys::{LogLevel, LogLevels, parse_and_set_debug_levels, supported_subsystems};
 pub use params::{ActiveNet, NodeParams};
 pub use server::{
-    DEFAULT_TARGET_OUTBOUND, addrmgr_to_wire_net_address, has_services, host_to_net_address,
-    is_supported_net_addr_type_v1, max_peers_is_startable, natf_supported,
+    DEFAULT_TARGET_OUTBOUND, MAX_PEERS_MAKECHAN_LIMIT, addrmgr_to_wire_net_address, has_services,
+    host_to_net_address, is_supported_net_addr_type_v1, max_peers_is_startable, natf_supported,
     netsync_max_outbound_peers, server_target_outbound, wire_to_addrmgr_net_address,
     wire_to_addrmgr_net_addresses,
 };

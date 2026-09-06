@@ -845,30 +845,51 @@ closing it would cost.
   ring is. The cost is a curve almost nobody selects -- P-256 is the default
   on both sides -- against a large C library in the trusted computing base.
 
-- **A `--maxpeers` large enough to exhaust memory kills dcrd and not the
-  port.** `newServer` builds its relay and broadcast queues as `make(chan
-  relayMsg, cfg.MaxPeers)` and `make(chan broadcastMsg, cfg.MaxPeers)`
-  (`server.go:3931-3932`) before it computes anything from the flag, and Go
-  takes a channel capacity as a signed `int`. Both halves of the invalid range
-  are fatal upstream: a negative capacity raises `panic: makechan: size out of
-  range`, and a large one dies as `fatal error: runtime: out of memory`.
-  Nothing on dcrd's startup path recovers either, and nothing validates the
-  flag beforehand. dcroxide relays synchronously and allocates no such queue,
-  so it reaches decisions dcrd never survives to make -- which is the whole
-  reason QK-0014's two disagreeing outbound targets matter here and not
-  upstream. The negative half is now reproduced: `max_peers_is_startable`
-  refuses it at startup, since without that the faithful `uint32(cfg.MaxPeers)`
-  cast into `MaxNormalConns` would leave the port running with no peer limit
-  at all on a typo that stops dcrd dead. The large-positive half is not
-  reproduced, because its threshold belongs to the machine's available memory
-  rather than to the flag: the same `--maxpeers` that aborts dcrd on one host
-  starts it on another, so there is no value the port could refuse that would
-  be right anywhere else. Closing it would mean either allocating a queue the
-  port has no use for purely to inherit its failure mode, or picking a
-  threshold and admitting it is invented. Measured at the pin, per input, each
-  in its own subprocess -- the `mpchan|` rows of
-  `crates/dcroxide-node/tests/data/srvtargetout_vectors.txt`.
+- **A `--maxpeers` inside the host-dependent band exhausts memory in dcrd
+  and not the port.** `newServer` builds its relay and broadcast queues as
+  `make(chan relayMsg, cfg.MaxPeers)` and `make(chan broadcastMsg,
+  cfg.MaxPeers)` (`server.go:3931-3932`) before it computes anything from the
+  flag, and Go takes a channel capacity as a signed `int`. Nothing validates
+  the flag first -- `config.go:167` declares `MaxPeers int` with no range --
+  and nothing on the startup path recovers.
 
+  `makechan` refuses on two disjuncts of one `if` (`runtime/chan.go:87`):
+  `size < 0`, and `mem > maxAlloc-hchanSize`. Both raise `panic: makechan:
+  size out of range`, neither consults installed memory, and both are now
+  reproduced by `max_peers_is_startable`. Between them lies a third regime
+  that an earlier version of this entry mistook for the whole positive half:
+  a capacity Go accepts and then cannot allocate, dying `fatal error:
+  runtime: out of memory`. That threshold really is the host's, so it is not
+  reproduced, and it is all that remains open here. dcroxide relays
+  synchronously and allocates no such queue, so within that band it still
+  reaches decisions dcrd never survives to make -- which is why QK-0014's two
+  disagreeing outbound targets matter here and not upstream.
+
+  The upper bound is derived rather than invented:
+  `(maxAlloc - hchanSize) / sizeof(relayMsg) + 1`, which is `(2^48 - 104)/40
+  + 1` = 7036874417764 on every 64-bit target dcrd ships. It does not track
+  the Go release -- at 40 bytes an element any `hchanSize` in `[104, 136]`
+  yields the same integer, covering both toolchains CI pins (`ci.yml:74`,
+  `:115`). A 32-bit build never reaches the regime by another route: `int` is
+  32 bits there, so go-flags rejects the value while parsing, as it does past
+  `int64` max on any build -- `--maxpeers=9223372036854775808` exits 1 without
+  starting.
+
+  Measured against the pin binary rather than a `makechan` probe, each input
+  in its own subprocess: `125` starts, `7036874417763` dies out of memory
+  asking for a 281TB block, and `7036874417764` and `9223372036854775807`
+  both panic at `server.go:3931` before allocating a byte. The `mpchan|` rows
+  of `crates/dcroxide-node/tests/data/srvtargetout_vectors.txt` carry them.
+
+  What made the deterministic half worth reproducing was not the threshold
+  but a contradiction inside the port's own rule. `uint32(-1)` and
+  `uint32(2^63-1)` are the same value, 4294967295, so `--maxpeers=-1` and
+  `--maxpeers=9223372036854775807` reach `MaxNormalConns` byte-identical and
+  kill dcrd at the same line with the same message -- yet the port refused
+  the first and booted the second into precisely the no-peer-limit state that
+  first refusal exists to prevent. The counterexample was already in the
+  fixture, and the assertion over those rows carried an `&& max_peers < 0`
+  clause that exempted it, so a suppressed divergence read as an open one.
 - **`getwork` cancellation is complete; one Windows semantic is unverified.**
   dcrd cancels getwork in three places -- the semaphore queue
   (`rpcserver.go:4170-4174`) and both template waits inside the hold
