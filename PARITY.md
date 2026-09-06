@@ -669,10 +669,45 @@ closing it would cost.
   fourth, acquiring a per-client semaphore of capacity `RPCMaxConcurrentReqs`
   and then spawning (`:1549-1553`); batches it services inline (`:1748`). The
   port now has two of those: a reading loop and a writer thread. Concurrent
-  dispatch was evaluated separately and declined -- routing replies through
-  the queue to make it work would cost every reply the read poll interval,
-  and avoiding that needs the write half split from the read half, which
-  under TLS is one `rustls::StreamOwned` that cannot be split.
+  dispatch was evaluated separately and declined; re-evaluated once the
+  writer thread existed, it is still declined, but on narrower ground than
+  the earlier note gave, and two of that note's premises have since gone
+  false. Replies already route through the outbound queue
+  (`websocket.rs:992`), as dcrd's spawned `serviceRequest` (`:1807`) ends on
+  `SendMessage` (`:1925`) and so onto `sendChan` (`:1936`) -- that cost is
+  paid, and measured below. Nor is the write half unsplit: reader and writer
+  share the stream as a `Mutex<WsConn<S>>` (`websocket.rs:854`).
+
+  What is not paid is the wakeup, and that is the whole objection. dcrd's
+  `outHandler` writes `c.conn` while `inHandler` is blocked reading it,
+  neither taking a lock, so a reply enqueued while the reader waits goes out
+  at once. The port cannot copy that, because a `rustls::StreamOwned` is one
+  object serving both directions: the reader holds the shared mutex across
+  `read_message` (`websocket.rs:931-940`), whose socket timeout is
+  `WS_POLL_INTERVAL` (`rpcrun.rs:76`, armed at `:3586`). Since 96e9eb5
+  whoever holds the stream drains the queue, and that is exactly what makes
+  inline dispatch fast -- the handler runs with the lock free, so the reader
+  writes its own reply microseconds later on the next pass of the loop. Move
+  dispatch to a worker and the reader returns to the poll immediately,
+  holding the mutex, so a reply finishing 1ms later waits out the remaining
+  49. A standalone model of the loop -- shared mutex, drain and read under
+  one guard, 50ms socket timeout, condvar writer -- measures 0.02ms per round
+  trip inline against 51.2ms spawned, stable over three runs. That is a full
+  poll interval added to every reply, spent closing a divergence that costs
+  only pipelining, only for the client issuing the slow request, and only
+  with admin credentials: weaker than dcrd on every reply to stop being
+  weaker than dcrd on one.
+
+  The prerequisite, if this is ever revisited, is therefore not splitting the
+  stream but a readiness wait taken without the stream lock -- which under
+  TLS must also account for plaintext already decrypted and sitting in
+  `rustls::ServerConnection`, where the socket has nothing pending yet a
+  whole message is available. Two invariants stated in comments today also
+  assume one request at a time per connection and would have to move first:
+  the thread-local carrying the cancellation token is sound only because
+  "the transport ... processes one request at a time" (`worksem.rs:27-29`),
+  and ignoring mutex poisoning on the client state is justified by its
+  serving thread being "its only writer" (`rpc/websocket.rs:326`).
 
   The writer thread closes the largest consequence: a notification now
   reaches a client while one of that client's own requests is still running,
