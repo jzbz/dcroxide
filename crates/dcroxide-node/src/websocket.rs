@@ -101,8 +101,16 @@ pub struct OutboundQueue {
 /// The mutex-guarded half of [`OutboundQueue`].
 #[derive(Default)]
 struct Pending {
-    /// Messages waiting to be written, oldest first.
+    /// Messages handed to the writer, oldest first: dcrd's `sendChan`.
+    /// Holds every reply and at most one notification.
     items: VecDeque<String>,
+    /// Notifications held back while one is already with the writer:
+    /// dcrd's `pendingNtfns` (`rpcwebsocket.go:1849`).
+    held_notifications: VecDeque<String>,
+    /// Whether a notification is with the writer: dcrd's `waiting`
+    /// (`:1850`). True exactly when one notification sits in `items`,
+    /// so `items` is empty only if `held_notifications` is too.
+    waiting: bool,
     /// Set once nothing further will be queued.
     closed: bool,
 }
@@ -110,21 +118,41 @@ struct Pending {
 impl OutboundQueue {
     /// Queue one message and wake the writer.
     ///
-    /// One writer draining one queue keeps output in the order it was
-    /// queued.
+    /// Queue a reply, which goes straight to the writer.
     ///
-    /// That is NOT quite dcrd, and the difference is recorded in PARITY
-    /// rather than papered over: replies and notifications do both end
-    /// on `sendChan`, but `notificationQueueHandler` holds a
-    /// `pendingNtfns` list and promotes only one notification into it at
-    /// a time (`rpcwebsocket.go:1849-1863`), so upstream a reply can
-    /// overtake a notification backlog. Here it queues behind one.
-    fn push(&self, json: String) {
+    /// dcrd's replies go through `SendMessage` onto `sendChan` with no
+    /// throttle (`rpcwebsocket.go:1925-1940`), so a reply waits behind
+    /// at most the one notification already there -- never behind a
+    /// backlog.
+    fn push_reply(&self, json: String) {
         self.pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .items
             .push_back(json);
+        self.wake.notify_all();
+    }
+
+    /// Queue a notification, holding it back if one is already with the
+    /// writer.
+    ///
+    /// This is `notificationQueueHandler` (`rpcwebsocket.go:1837-1888`):
+    /// the first notification goes to the writer and the rest wait in a
+    /// list, so only ever one is ahead of a reply. Without the throttle
+    /// a reply queues behind every notification, which is the whole
+    /// reason dcrd separates the two paths.
+    fn push_notification(&self, json: String) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.waiting {
+            pending.held_notifications.push_back(json);
+        } else {
+            pending.items.push_back(json);
+        }
+        pending.waiting = true;
+        drop(pending);
         self.wake.notify_all();
     }
 
@@ -144,6 +172,8 @@ impl OutboundQueue {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pending.items.clear();
+        pending.held_notifications.clear();
+        pending.waiting = false;
         pending.closed = true;
         drop(pending);
         self.wake.notify_all();
@@ -185,12 +215,21 @@ impl OutboundQueue {
     /// stream costs latency inside one read interval rather than
     /// forever.
     fn take_all_now(&self) -> Vec<String> {
-        self.pending
+        let mut pending = self
+            .pending
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .items
-            .drain(..)
-            .collect()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let batch: Vec<String> = pending.items.drain(..).collect();
+        // The notification that was with the writer has just left, so
+        // the next one takes its place -- dcrd promoting from
+        // `pendingNtfns` when `ntfnSentChan` fires (`:1868-1880`).
+        if pending.waiting {
+            match pending.held_notifications.pop_front() {
+                Some(next) => pending.items.push_back(next),
+                None => pending.waiting = false,
+            }
+        }
+        batch
     }
 }
 
@@ -652,7 +691,7 @@ fn deliver_one(
         .collect();
     for (session_id, json) in out {
         if let Some(handle) = by_id.get(&session_id) {
-            handle.outbound.push(json);
+            handle.outbound.push_notification(json);
         }
     }
 }
@@ -950,7 +989,7 @@ fn serve_ws_reads<S: Read + Write>(
             Err(_) => parse_error_outcome(authenticated, "invalid UTF-8"),
         };
         match outcome {
-            WsOutcome::Reply(reply) => outbound.push(reply),
+            WsOutcome::Reply(reply) => outbound.push_reply(reply),
             WsOutcome::Skip => {}
             WsOutcome::Disconnect => break,
         }
@@ -1470,14 +1509,12 @@ mod tests {
     use super::*;
 
     /// Whoever holds the stream drains the queue, so two drainers can
-    /// never reorder output.  The writer waits without the stream and
-    /// takes it before draining; the reader drains under the lock it
-    /// already holds for its read.
+    /// never reorder output.
     #[test]
     fn a_drain_takes_everything_in_order() {
         let queue = OutboundQueue::default();
-        queue.push("first".to_string());
-        queue.push("second".to_string());
+        queue.push_reply("first".to_string());
+        queue.push_reply("second".to_string());
         assert_eq!(
             queue.take_all_now(),
             vec!["first".to_string(), "second".to_string()],
@@ -1489,6 +1526,49 @@ mod tests {
         );
     }
 
+    /// dcrd's `notificationQueueHandler`: only one notification is ever
+    /// with the writer, so a reply overtakes the backlog instead of
+    /// queueing behind all of it.
+    #[test]
+    fn a_reply_overtakes_a_notification_backlog() {
+        let queue = OutboundQueue::default();
+        for i in 0..5 {
+            queue.push_notification(format!("ntfn{i}"));
+        }
+        queue.push_reply("reply".to_string());
+
+        // One notification went to the writer; the other four are held,
+        // so the reply is second out rather than sixth.
+        assert_eq!(
+            queue.take_all_now(),
+            vec!["ntfn0".to_string(), "reply".to_string()],
+            "a reply waits behind one notification, never behind the backlog"
+        );
+    }
+
+    /// And the backlog still drains, one per pass, in order.
+    #[test]
+    fn held_notifications_are_promoted_one_at_a_time() {
+        let queue = OutboundQueue::default();
+        for i in 0..3 {
+            queue.push_notification(format!("ntfn{i}"));
+        }
+        for i in 0..3 {
+            assert_eq!(
+                queue.take_all_now(),
+                vec![format!("ntfn{i}")],
+                "one notification per pass, oldest first"
+            );
+        }
+        assert!(
+            queue.take_all_now().is_empty(),
+            "and then the backlog is empty"
+        );
+        // The throttle resets, so a later notification is not held back.
+        queue.push_notification("later".to_string());
+        assert_eq!(queue.take_all_now(), vec!["later".to_string()]);
+    }
+
     /// The writer parks until there is something to write.
     #[test]
     fn the_writer_waits_for_work() {
@@ -1497,7 +1577,7 @@ mod tests {
             let queue = Arc::clone(&queue);
             std::thread::spawn(move || queue.wait_for_items())
         };
-        queue.push("wake up".to_string());
+        queue.push_reply("wake up".to_string());
         assert!(writer.join().expect("writer"), "a push wakes the writer");
     }
 
@@ -1517,12 +1597,15 @@ mod tests {
         );
     }
 
-    /// A close DISCARDS what is still queued, as dcrd's `Disconnect`
-    /// does by closing the socket out from under `sendChan`.
+    /// A close DISCARDS what is still queued, held notifications
+    /// included, as dcrd's `Disconnect` does by closing the socket out
+    /// from under `sendChan`.
     #[test]
     fn closing_discards_what_is_still_queued() {
         let queue = OutboundQueue::default();
-        queue.push("undelivered".to_string());
+        queue.push_reply("undelivered".to_string());
+        queue.push_notification("also undelivered".to_string());
+        queue.push_notification("held".to_string());
         queue.close();
         assert!(
             queue.take_all_now().is_empty(),

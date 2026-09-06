@@ -683,6 +683,13 @@ closing it would cost.
   draft had one: thirty sequential round trips average 41.3ms here against
   41.4ms before the change.
 
+  `notificationQueueHandler` is ported with it (`:1837-1888`). Only one
+  notification is ever handed to the writer; the rest wait in a held list
+  and are promoted one at a time as each leaves, so a reply queues behind
+  at most one notification rather than behind the whole backlog. That is
+  the point of dcrd keeping two paths into one channel, and without it a
+  client with a deep backlog would see its replies delayed by all of it.
+
   What remains, all latency rather than incorrectness, and all needing admin
   credentials -- `rescan` is in `rpcLimited` on both sides but `loadtxfilter`
   is not, so a limited client's rescan has no filter to match:
@@ -692,13 +699,6 @@ closing it would cost.
     `makeSemaphore(1)` node-wide and serialises `getwork` anyway.
   * A client that hangs up mid-request goes unnoticed until it ends, since
     nothing is reading -- the other side of the cancellation gap above.
-  * A reply queues behind a notification backlog. dcrd's does not:
-    `notificationQueueHandler` keeps a `pendingNtfns` list and promotes only
-    one notification into `sendChan` at a time (`:1849-1863`), so a reply
-    overtakes the rest. Reproducing that means a third concurrent structure,
-    and it was judged not worth adding to an area that had already produced
-    a writer-starvation bug during this change. Reachable only behind a deep
-    backlog, which needs a client that has stopped reading.
 
   Two hazards the shape does have, both handled and worth stating because
   they are what makes it work rather than incidental. A plain mutex is not
