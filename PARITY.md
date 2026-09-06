@@ -800,10 +800,50 @@ closing it would cost.
   `rpcserver.go:5518-5523`): under that auth type the completed handshake IS
   the authentication, so a resumption that skips certificate validation is an
   unauthenticated admin session rather than merely an unwanted client.
-  Closing this properly wants a resumption path that re-runs the client
-  verifier, which rustls does not offer -- `ServerSessionValue` and its
-  decoding are crate-private, so a custom `StoresServerSessions` sees only
-  opaque bytes and cannot inspect the chain it is holding.
+  Closing it is possible, which an earlier version of this entry denied. It
+  said rustls offers no resumption path that re-runs the client verifier, on
+  the premise that `ServerSessionValue` and its decoding are crate-private.
+  Neither half holds. The chain can be re-verified above rustls rather than
+  inside it: `handshake_kind()` (`common_state.rs:188`), `peer_certificates()`
+  (`:139`, documented at `:127` as available on resumed handshakes) and
+  `ClientCertVerifier::verify_client_cert` (`verify.rs:219`) are all public,
+  and the port already holds a `WebPkiClientVerifier` exactly where it would
+  need one (`rpcrun.rs:1554`). `serves_tls_with_a_generated_certificate` --
+  the test this entry already cites as pinning the behaviour -- calls
+  `handshake_kind()` itself (`rpclisten.rs:774`) to assert the second
+  connection was `Full`, so the tree used the API the entry called absent.
+  `ServerSessionValue` is reachable too, through `#[doc(hidden)] pub mod
+  internal` (`lib.rs:466-470`, `:498`), though that is explicitly not stable
+  interface and nothing should be built on it.
+
+  It is declined on what closing it would cost, which is the stronger reason.
+  Go rejects a stale ticket with `continue` and falls through to a full
+  handshake -- every arm of `checkForResumption` does
+  (`handshake_server_tls13.go:351`, `:365`, `:368`, `:371`, `:380`). rustls
+  sets `peer_certificates` while handling the ClientHello and exposes it only
+  after the handshake, so the port's only remedy is to tear down a connection
+  already established. That is a new behavioural divergence, and it lands in
+  the one operator-visible case: rotate `--clientcafile` and a `dcrctl` that
+  dcrd would silently re-handshake gets a reset instead. That file is also
+  the whole revocation mechanism, dcrd shipping neither CRL nor OCSP, and
+  `reload` builds a fresh configuration per rotation carrying nothing across
+  -- so a ticketer scoped to that configuration preserves no resumption at
+  all, while hoisting one out to gain any is precisely what lets ticket keys
+  outlive a CA rotation. Set against a client population that is empty, the
+  measured benefit is a few microseconds of server CPU on an endpoint that
+  caps at ten clients and sets `Connection: close` on every response.
+
+  Two findings worth recording for anyone who revisits it. Installing a
+  ticketer would *close* a hazard rather than open one: `early_data_configured`
+  requires stateful resumption (`server/tls13.rs:650`), so 0-RTT is
+  unreachable once a ticketer is installed and reachable only on the stateful
+  path the port already disabled. And rustls applies no age cap whatever --
+  `can_resume` compares cipher suite, extended master secret and SNI
+  (`server/hs.rs:39-58`) and nothing else, while every resumption re-mints a
+  ticket carrying the restored chain with a fresh creation time
+  (`server/tls13.rs:1263-1273`, `server/tls12.rs:289-299`). Go's seven day cap
+  has no rustls counterpart, so a ticketer would need that bound enforced
+  above it as well.
 
   The related divergence in the other direction is closed:
   `build_server_config` sets `session_storage` to `NoServerSessionStorage`,
