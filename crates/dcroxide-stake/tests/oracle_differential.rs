@@ -158,10 +158,22 @@ fn build_ticket(rng: &mut SplitMix64, params: &dcroxide_chaincfg::Params) -> Msg
     let ticket_price = rng.below(1 << 40) as i64 + n as i64;
     tx.tx_out.push(out(ticket_price, submission));
 
-    for _ in 0..n {
+    for out_idx in 0..n {
         tx.tx_in.push(funding_input(rng));
         let commit_addr = random_stake_addr(rng, params);
-        let amount = rng.below(1 << 40) as i64 + 1;
+        // Zero is a valid commitment amount by consensus, and it is the
+        // boundary dcrd's own helper got wrong until `5dd4ca59`.  The
+        // generator excluded it with a `+ 1`, which is why the port
+        // carried the same off-by-one without this test noticing.  Only
+        // a later output may be zero: the reward split divides by the
+        // total contribution, and an all-zero ticket -- which cannot
+        // exist on chain, since the commitments fund the ticket price --
+        // divides by zero in both implementations.
+        let amount = if out_idx > 0 && rng.below(4) == 0 {
+            0
+        } else {
+            rng.below(1 << 40) as i64 + 1
+        };
         let vote_fee = if rng.below(2) == 0 {
             0
         } else {

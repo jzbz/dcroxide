@@ -6,6 +6,17 @@
 //! revocations, and treasury adds, against a parent stake node
 //! reconstructed step-for-step through the ported ticket pool state
 //! machine from the dump's recorded connect inputs.
+//!
+//! Two `cbc true` rows were re-expected by hand when the pin moved to
+//! `b9634e01` rather than regenerated: `ead8ba7a` moves the block size
+//! and merkle root checks out of the `BFFastAdd` exemption, and those
+//! two rows carry blocks whose header claims 3 MiB, so the size check
+//! upstream now runs rejects them where the old fast-add path did not.
+//! The check is the same one, moved, with its error identity unchanged,
+//! and the other two `cbc true` rows (5000-byte blocks) are unaffected
+//! -- which is why a hand edit was judged safe here.  The exporter that
+//! produced this file was not preserved, so a full regeneration would
+//! mean reconstructing it.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]

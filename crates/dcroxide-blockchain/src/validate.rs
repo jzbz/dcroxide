@@ -3823,24 +3823,28 @@ pub fn check_block_context(
         }
     }
 
+    // The header's claimed size must not exceed the agenda-driven
+    // maximum block size.  Checked even on the fast-add path: dcrd
+    // exempted it until `ead8ba7a`, which moved this and the merkle
+    // roots above the `BFFastAdd` gate because the hashing is now cheap
+    // enough that keeping them costs little and dropping them invites
+    // harassment during initial sync.
+    let max_block_size = crate::agendas::max_block_size(view, Some(prev_height), params);
+    let serialized_size = i64::from(header.size);
+    if serialized_size > max_block_size {
+        return Err(rule_error(
+            RuleErrorKind::BlockTooBig,
+            format!(
+                "serialized block is too big - got {serialized_size}, max \
+                 {max_block_size}"
+            ),
+        ));
+    }
+
+    // The merkle root commitments must be valid, likewise on both paths.
+    check_merkle_roots(view, block, prev_height, params)?;
+
     if !fast_add {
-        // The header's claimed size must not exceed the agenda-driven
-        // maximum block size.
-        let max_block_size = crate::agendas::max_block_size(view, Some(prev_height), params);
-        let serialized_size = i64::from(header.size);
-        if serialized_size > max_block_size {
-            return Err(rule_error(
-                RuleErrorKind::BlockTooBig,
-                format!(
-                    "serialized block is too big - got {serialized_size}, max \
-                     {max_block_size}"
-                ),
-            ));
-        }
-
-        // The merkle root commitments must be valid.
-        check_merkle_roots(view, block, prev_height, params)?;
-
         // All transactions must be finalized, relative to the past
         // median time once the LN features agenda is active.
         let mut block_time = i64::from(header.timestamp);

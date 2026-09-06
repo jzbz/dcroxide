@@ -3,7 +3,7 @@
 A from-scratch Rust implementation of the Decred full-node daemon, built as a
 drop-in replacement for [dcrd](https://github.com/decred/dcrd).
 
-Parity target: **dcrd master `29f17894`** (version 2.2.0-pre) — wire protocol
+Parity target: **dcrd master `b9634e01`** (version 2.2.0-pre) — wire protocol
 12, JSON-RPC API 8.3.0. dcrd's behavior at that commit is the specification; see
 [QUIRKS.md](QUIRKS.md) for deliberate bug-for-bug reproductions and
 [PARITY.md](PARITY.md) for per-package status. The full plan lives in

@@ -1277,7 +1277,7 @@ pub fn create_revocation_from_ticket(
     let mut fee_applied = false;
     for (i, pay_to_hash) in info.addresses.iter().enumerate() {
         // The amount must be in the valid monetary range.
-        if info.amounts[i] <= 0 || info.amounts[i] > MAX_AMOUNT {
+        if info.amounts[i] < 0 || info.amounts[i] > MAX_AMOUNT {
             return Err(stake_rule_error(
                 ErrorKind::SStxBadCommitAmount,
                 format!(
