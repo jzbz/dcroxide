@@ -319,14 +319,18 @@ against upstream and the port is faithful.
 
 - **The websocket notification pipeline is unbounded, as dcrd's is.** Two
   accumulators sit between a chain event and a client's socket: the manager's
-  `std::sync::mpsc::channel()` (`websocket.rs` 146) and the per-client
-  `VecDeque<String>` (`websocket.rs` 90), plus four `Vec` staging queues in the
-  chain callback (`chainntfns.rs` 72-83), which only queues because it runs
-  inside the chain's critical section. dcrd is unbounded in the same two places
-  — the manager's `q []any` slice behind `queueHandler`'s select loop and each
-  client's `pendingNtfns [][]byte` behind `notificationQueueHandler` — with no
-  drop policy, no slow-client disconnect, and no write deadline on the data-frame
-  write. So a client that stops reading grows node memory in both
+  `std::sync::mpsc::channel()` (`websocket.rs:298`) and the per-client
+  `OutboundQueue`, plus four `Vec` staging queues in the chain callback
+  (`chainntfns.rs:93`, `:98`, `:101`, `:104`), which only queues because it runs
+  inside the chain's critical section. The per-client half is two deques rather
+  than the one this entry used to describe, because dcrd's is two: `items` is
+  `sendChan`, carrying every reply and at most one notification, and
+  `held_notifications` is `pendingNtfns`, holding the rest behind a `waiting`
+  flag (`websocket.rs:106`, `:109`, `:113`). dcrd is unbounded in the same two
+  places — the manager's `q []any` slice behind `queueHandler`'s select loop and
+  each client's `pendingNtfns [][]byte` behind `notificationQueueHandler` — with
+  no drop policy, no slow-client disconnect, and no write deadline on the
+  data-frame write. So a client that stops reading grows node memory in both
   implementations; the cost of a slow reader is borne by the node, and no
   notification is ever dropped or reordered. Capping it with drops or a
   slowness disconnect was considered and rejected: it would diverge from dcrd
@@ -336,11 +340,15 @@ against upstream and the port is faithful.
   apply it here.
 
   Where the port is **stronger** than dcrd: a stalled client cannot block writes
-  to other clients (each writes on its own thread holding no shared lock, and the
-  outbound mutex is released before the write), and cannot block the
-  chain-notification callback, so it cannot stall block processing — dcrd's
+  to other clients — each connection has its own writer thread and its own
+  stream mutex, so no lock is shared across clients — and cannot block the
+  chain-notification callback, so it cannot stall block processing, where dcrd's
   single fan-out goroutine head-of-line blocks every client behind one stalled
-  TCP peer. The port used to be **weaker** in one respect, since corrected: the
+  TCP peer. That writer thread, and the `pendingNtfns` throttle above, landed
+  after this entry was first written (`a6b8650`, `96e9eb5`, `4609e44`); its
+  citations pointed at unrelated code until this commit, and it described the
+  port as writing notifications inline from the delivery thread, which it no
+  longer does. The port used to be **weaker** in one respect, since corrected: the
   server was shared as a single `Arc<Mutex<Server<NodeRpcChain>>>` held for the
   whole of any one client's request, so a multi-thousand-block `rescan`
   serialized every other client's request *and* notification construction. dcrd
@@ -487,8 +495,8 @@ against upstream and the port is faithful.
 
   Moving the port's flush to a cache-only lock would be a regression, not a
   fix. Both implementations connect a block as commit → flush → publish tip
-  (dcrd `chain.go:728`/`:739`/`:746`; the port `process.rs:2431`/`:2433`/
-  `:2437`), and dcrd reads `bestChain.Tip()` in `FetchUtxoStats`
+  (dcrd `chain.go:728`/`:739`/`:746`; the port `process.rs:2654`/`:2656`/
+  `:2659`), and dcrd reads `bestChain.Tip()` in `FetchUtxoStats`
   (`utxocache.go:1084`) with no `chainLock`. A stats call landing between the
   flush and the tip publication therefore force-flushes against the previous
   tip and leaves a `lastFlushHash` one block behind a backend that already
