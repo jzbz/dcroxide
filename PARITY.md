@@ -876,14 +876,66 @@ closing it would cost.
   both curves, so the divergence sits in one place rather than smeared through
   a function that is otherwise a faithful port.
 
-  Closing it properly means the `aws-lc-rs` provider, which does sign
-  `ECDSA_NISTP521_SHA512` (`rustls/src/crypto/aws_lc_rs/sign.rs:63`). That was
-  weighed and declined for now: it is not in the tree, it vendors a BoringSSL
-  fork requiring cmake and bindgen, it would enter the shipping binary as the
-  crypto backend for all RPC TLS rather than only for P-521, and it is
-  materially harder to build for the Windows and macOS targets CI covers than
-  ring is. The cost is a curve almost nobody selects -- P-256 is the default
-  on both sides -- against a large C library in the trusted computing base.
+  An earlier version of this entry said closing it properly means the
+  `aws-lc-rs` provider, and weighed a BoringSSL fork needing cmake and bindgen
+  against a curve almost nobody selects. That was wrong in both directions.
+  Adopting it would breach a policy the tree has already written down --
+  `unsafe_code = "forbid"` (`Cargo.toml:101`), which `dcroxide-node`'s own
+  manifest cites as why default features are off, calling aws-lc-rs "a 68 MB
+  C/assembly crypto library into a workspace that otherwise forbids unsafe
+  code" (`crates/dcroxide-node/Cargo.toml:54-58`). And it is not the only
+  route. rustls's signing is an open extension point: `SigningKey` and
+  `Signer` are public (`crypto/signer.rs:59`, `:76`, re-exported at
+  `lib.rs:685`), the scheme is known (`ECDSA_NISTP521_SHA512` = 0x0603,
+  `enums.rs:511`), and the client's offered list reaches `choose_scheme`
+  filtered only by `supported_in_tls13` (`server/tls13.rs:153`, `:804`),
+  which drops MD5, SHA1, SHA224 and RSA-PKCS1 and passes P-521 through.
+  ring's limit lives entirely inside `any_ecdsa_type`
+  (`crypto/ring/sign.rs:45-65`), the one path `with_single_cert` has to a
+  key; building the `CertifiedKey` by hand and installing it with
+  `with_cert_resolver` never reaches it.
+
+  The signer needs no new dependency either. `p521` 0.13.3 is already a
+  direct dependency of `dcroxide-certgen` with the feature set this wants, it
+  reaches the shipping binary through `dcroxide-node`, and the port already
+  signs with it (`certgen.rs:287`). A prototype of that shape -- rustls
+  pinned to `dcroxide-node`'s exact features, serving a certificate from the
+  port's own certgen -- completed TLS1.3 and TLS1.2 handshakes against a Go
+  client verifying the chain, with `openssl s_client -verify_return_error`
+  reporting `Peer signature type: ecdsa_secp521r1_sha512` and
+  `Verification: OK` on both. Implementing `public_key()` preserves the SPKI
+  consistency check `with_single_cert` would otherwise have made.
+
+  It is held anyway, on a narrower reason than the one it replaces. `p521`
+  draws its nonce straight from the RNG -- `let k = Scalar::random(rng)`
+  (`src/ecdsa.rs:145`, `TODO: use RFC6979` still open at `:40`) -- where
+  `ring`, which signs every P-256 and P-384 handshake this server already
+  serves, folds the message into the nonce to hedge against a faulty RNG
+  (`ring/src/ec/suite_b/ecdsa/signing.rs:183-192`), and Go hedges on every
+  curve. Serving P-521 through the obvious path would hand it a weaker nonce
+  than P-256 gets in the same binary, an asymmetry dcrd does not have. The
+  alternative is composing the hedge here -- the one piece of this with no
+  dcrd counterpart to differential-test against, in the category where a bias
+  does not degrade gracefully but discloses the key.
+
+  The deterministic answer is unavailable for a reason that expires.
+  `try_sign_prehashed_rfc6979` requires
+  `D: FixedOutput<OutputSize = FieldBytesSize<C>>`
+  (`ecdsa-0.16.9/src/hazmat.rs:101`); P-521's field is 66 bytes and SHA-512
+  gives 64, so no SHA-2 digest satisfies the bound and `p521` rolls its own
+  randomized signer instead. The 0.14 curve set closes that, and
+  `deny.toml:40` sets `multiple-versions = "deny"`, so `p256`, `p384`, `k256`
+  and `p521` move together -- `k256` being the consensus signing crate, that
+  bump is the trigger. Revisit it there, where the hedge stops being
+  something written here.
+
+  Two things stay open past that in any case. A P-521 *client* certificate
+  remains refused under `--authtype=clientcert`, because
+  `WebPkiClientVerifier` (`rpcrun.rs:1552-1557`) draws from ring's supported
+  algorithms, which stop at P-384 (`crypto/ring/mod.rs:108-111`). And no
+  in-tree Rust client can exercise a P-521 listener: a rustls client on ring
+  never offers 0x0603, so the handshake ends at `NoSignatureSchemesInCommon`
+  before any certificate is examined.
 
 - **A `--maxpeers` inside the host-dependent band exhausts memory in dcrd
   and not the port.** `newServer` builds its relay and broadcast queues as
