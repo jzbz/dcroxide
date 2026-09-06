@@ -890,11 +890,12 @@ closing it would cost.
   first refusal exists to prevent. The counterexample was already in the
   fixture, and the assertion over those rows carried an `&& max_peers < 0`
   clause that exempted it, so a suppressed divergence read as an open one.
-- **`getwork` cancellation is complete; one Windows semantic is unverified.**
-  dcrd cancels getwork in three places -- the semaphore queue
-  (`rpcserver.go:4170-4174`) and both template waits inside the hold
-  (`:3914`, `:3932`) -- and all three are ported. What was partial is the
-  signal that drives them: detecting that the client has gone.
+- **`getwork` cancellation is complete on every platform over HTTP; over a
+  websocket a client hangup goes unnoticed.** dcrd cancels getwork in three
+  places -- the semaphore queue (`rpcserver.go:4170-4174`) and both template
+  waits inside the hold (`:3914`, `:3932`) -- and all three are ported. What
+  was partial is the signal that drives them: detecting that the client has
+  gone.
 
   A `MSG_PEEK` cannot answer it, because a TLS peer writes a `close_notify`
   before the FIN and the handler, blocked in the hold, never reads it, so the
@@ -941,6 +942,14 @@ closing it would cost.
   Windows so CI keeps checking what these measurements established once. Both
   arms answer only a positive observation and decline otherwise, so a
   regression costs a red test rather than a silent behaviour change.
+
+  The title said "one Windows semantic is unverified" until this commit.
+  `838e3e7` wrote that while landing the Windows arm and never revised it,
+  though the semantic it meant -- the `WSAPoll` row of the table above -- had
+  already been measured in `76f33e8`, an ancestor of it, and has been checked
+  by that test on every Windows CI run since. Nothing in the body ever
+  supported the title; the word appeared nowhere else in the entry. What
+  keeps this open is the websocket arm below.
 
   Two dead ends are recorded so nobody walks back into them. Detection by
   inspecting the peeked bytes cannot work: TLS 1.3 wraps an alert in outer
