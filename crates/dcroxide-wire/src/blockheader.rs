@@ -140,6 +140,31 @@ impl BlockHeader {
 mod tests {
     use super::*;
 
+    /// The official BLAKE3 known-answer tests for the two shortest
+    /// inputs, plus one the length of a serialized header.
+    ///
+    /// `pow_hash_v2` is the DCP0011 proof-of-work hash, so a change in
+    /// what `blake3` returns is a consensus change. The dependency
+    /// ledger records the crate as reviewed at a version and notes the
+    /// KATs were checked by hand then; that check was not held anywhere,
+    /// so a bump could alter the output with nothing to catch it. This
+    /// is that check, kept.
+    #[test]
+    fn blake3_still_answers_the_known_vectors() {
+        let empty = blake3::hash(b"");
+        assert_eq!(
+            empty.to_hex().as_str(),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+            "BLAKE3 of the empty input"
+        );
+        let abc = blake3::hash(b"abc");
+        assert_eq!(
+            abc.to_hex().as_str(),
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+            "BLAKE3 of \"abc\""
+        );
+    }
+
     fn sample_header() -> BlockHeader {
         BlockHeader {
             version: 6,
