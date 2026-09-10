@@ -7,16 +7,28 @@
 //! reconstructed step-for-step through the ported ticket pool state
 //! machine from the dump's recorded connect inputs.
 //!
-//! Two `cbc true` rows were re-expected by hand when the pin moved to
-//! `b9634e01` rather than regenerated: `ead8ba7a` moves the block size
-//! and merkle root checks out of the `BFFastAdd` exemption, and those
-//! two rows carry blocks whose header claims 3 MiB, so the size check
-//! upstream now runs rejects them where the old fast-add path did not.
-//! The check is the same one, moved, with its error identity unchanged,
-//! and the other two `cbc true` rows (5000-byte blocks) are unaffected
-//! -- which is why a hand edit was judged safe here.  The exporter that
-//! produced this file was not preserved, so a full regeneration would
-//! mean reconstructing it.
+//! Two `cbc true` rows were re-expected when the pin moved to `b9634e01`
+//! rather than regenerated, and the new verdict is derived from dcrd's
+//! source, not judged:
+//!
+//! 1. `internal/blockchain/validate.go` changed between `036b7090` and
+//!    `b9634e01` only by `ead8ba7a`'s two hunks -- a doc comment on
+//!    `checkBlockContext`, and the move of the size and merkle-root
+//!    checks above its `BFFastAdd` gate.  Everything the function runs
+//!    before the moved size check is byte-identical across the two pins.
+//! 2. Both rows recorded `ok` with `BFFastAdd` at `036b7090`, so every one
+//!    of those earlier checks passed; at `b9634e01` control therefore
+//!    reaches the size check.
+//! 3. `maxBlockSize` (`chain.go`) returns only `MaximumBlockSizes[0]` or
+//!    `[1]`, and simnet's are 1000000 and 1310720.  Both rows' headers
+//!    claim 3145728, over either, so dcrd returns `ErrBlockTooBig`
+//!    whatever the state of the block size vote.
+//!
+//! The other two `cbc true` rows carry 5000-byte blocks and keep `ok`.
+//! The exporter that produced this file was never committed -- nor was
+//! the one behind `contextual2_vectors.txt` -- so a regeneration means
+//! writing one from scratch; for these two rows it would only reproduce
+//! what the three steps above already determine.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]

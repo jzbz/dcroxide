@@ -7,8 +7,16 @@ go 1.24.0
 // published release uses the pseudo-version at that commit (stake, standalone,
 // edwards, secp256k1, gcs, txscript, wire, and now chaincfg and blake256), so
 // the oracle links the same code the dcrd binary at b9634e01 does.  The
-// remaining pins (chainhash, dcrutil, uint256, ripemd160, dcrec, base58) are
-// byte-identical to the in-tree sources at that commit.
+// remaining in-tree pins (chainhash, dcrutil, uint256, ripemd160, dcrec) are
+// byte-identical to the in-tree sources at that commit.  base58 is not an
+// in-tree module: dcrd's own go.mod requires github.com/decred/base58 v1.0.6
+// from its separate repository, and this pin matches that requirement.
+//
+// Re-derived at b9634e01 rather than carried forward: for each of the sixteen
+// in-tree modules, its directory at the target (nested modules excluded) was
+// diffed against its latest tag in the same major.  Every tag-pinned module
+// showed no difference in .go, go.mod or go.sum; every pseudo-pinned module
+// differed in .go files; none differed in go.mod or go.sum alone.
 //
 // chaincfg and blake256 moved into the pseudo-version set when the target
 // advanced past 452c1a6c: `b9b64533` adds the dcr-seed.jz.bz mainnet seeder to
