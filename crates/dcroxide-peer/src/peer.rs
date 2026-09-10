@@ -227,7 +227,7 @@ pub struct NegotiateError {
     /// failure.
     ///
     /// dcrd's `OnRead` listener runs on the version and verack reads
-    /// too (`peer.go:1912`, `:1983`, `:2012`), and `serverPeer.OnRead`
+    /// too (`peer.go:1998`, `:2069`, `:2098`), and `serverPeer.OnRead`
     /// bans on any `wire.ErrorCode` with no handshake-state guard
     /// (`server.go:1851-1857`).  Collapsing a read failure into an
     /// untyped negotiation error loses that.

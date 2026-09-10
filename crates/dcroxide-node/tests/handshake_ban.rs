@@ -3,7 +3,7 @@
 //!
 //! dcrd installs its read listener before `Handshake` for both
 //! directions and runs it on the version and verack reads
-//! (`peer/peer.go:1912`, `:1983`, `:2012`); `serverPeer.OnRead` bans on
+//! (`peer/peer.go:1998`, `:2069`, `:2098`); `serverPeer.OnRead` bans on
 //! any `wire.ErrorCode` with no handshake-state guard
 //! (`server.go:1851-1857`).
 //!

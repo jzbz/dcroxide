@@ -1078,7 +1078,7 @@ where
                 // A wire violation bans during the handshake too.
                 // dcrd installs its read listener before `Handshake`
                 // for both directions and runs it on the version and
-                // verack reads (`peer.go:1912`, `:1983`, `:2012`), and
+                // verack reads (`peer.go:1998`, `:2069`, `:2098`), and
                 // `serverPeer.OnRead` bans on any `wire.ErrorCode` with
                 // no handshake-state guard (`server.go:1851-1857`).
                 // Without this a peer could violate the protocol

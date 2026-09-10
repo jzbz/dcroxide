@@ -3,7 +3,7 @@
 //! (RVW-012).
 //!
 //! dcrd runs its `OnRead` listener on the version and verack reads too
-//! (`peer/peer.go:1912`, `:1983`, `:2012`), and `serverPeer.OnRead` bans
+//! (`peer/peer.go:1998`, `:2069`, `:2098`), and `serverPeer.OnRead` bans
 //! on any `wire.ErrorCode` with no handshake-state guard
 //! (`server.go:1851-1857`).  All three of the port's handshake reads
 //! collapsed their `ReadError` into an untyped `NegotiateError`, so the
