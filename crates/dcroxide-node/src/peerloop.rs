@@ -1050,7 +1050,7 @@ where
     let mut env = NodePeerEnv::new();
     // Shared by every connection, because that is the only way the check
     // it feeds can fire.  dcrd keeps `sentNonces` and `nodeCount` in
-    // package globals (`peer/peer.go:83-92`); a fresh set per connection
+    // package globals (`peer/peer.go:100-106`); a fresh set per connection
     // means the outbound half holds only its own nonce and the inbound
     // half checks against an empty set, so a node that dials itself
     // completes the handshake and peers with itself.

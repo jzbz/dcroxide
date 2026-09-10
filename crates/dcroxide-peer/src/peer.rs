@@ -51,7 +51,7 @@ pub struct PeerGlobals {
     /// new connection, which is a worse problem than the one this fixes.
     sent_nonces: Mutex<lru::Set<u64>>,
     /// Bypass for the self-connection check (dcrd's test-only
-    /// `allowSelfConns`, `peer.go:90-93`).
+    /// `allowSelfConns`, `peer.go:108-111`).
     ///
     /// Needed for the same reason dcrd needs it: the check compares a
     /// nonce against every nonce this *process* has sent, so a harness

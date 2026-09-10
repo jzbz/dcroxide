@@ -72,13 +72,13 @@ pub const PING_INTERVAL: i64 = DEFAULT_IDLE_TIMEOUT - 13 * 1_000_000_000;
 
 /// The base time a single message write may take before the peer counts
 /// as stalled, in nanoseconds (dcrd `writeStallTimeout`,
-/// `peer/peer.go:84`).  A size-proportional allowance is added on top;
+/// `peer/peer.go:90`).  A size-proportional allowance is added on top;
 /// see [`WRITE_STALL_BYTES_PER_SEC`].
 pub const WRITE_STALL_TIMEOUT: i64 = 20 * 1_000_000_000;
 
 /// The message bytes that buy one extra second on top of
 /// [`WRITE_STALL_TIMEOUT`] (dcrd `writeStallBytesPerSec`,
-/// `peer/peer.go:90`), so the largest possible message — 32 MiB — gets
+/// `peer/peer.go:96`), so the largest possible message — 32 MiB — gets
 /// roughly two extra minutes.
 pub const WRITE_STALL_BYTES_PER_SEC: usize = 256 * 1024;
 

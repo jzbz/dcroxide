@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! Self-connection detection needs one shared nonce cache (RVW-038).
 //!
-//! dcrd keeps `sentNonces` in a package global (`peer/peer.go:83-92`):
+//! dcrd keeps `sentNonces` in a package global (`peer/peer.go:104-106`):
 //! the nonce written when pushing a version message on one connection is
 //! what the *next* connection's inbound handshake checks against. A node
 //! that dials its own address sees its own nonce come back and
