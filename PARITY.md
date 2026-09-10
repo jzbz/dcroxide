@@ -494,11 +494,14 @@ against upstream and the port is faithful.
   regardless. The certificate is written with an explicit 0644 (dcrd's mode)
   rather than `std::fs::write`'s 0666, which under a permissive umask would
   leave it group- and world-writable — an integrity question, since anyone able
-  to write it can swap the identity the node serves.
+  to write it can swap the identity the node serves. Pinned by
+  `a_half_present_pair_is_not_regenerated_over_the_surviving_file`
+  (`rpclisten.rs`).
 
 - **`--maxsameip` keys on the exact IP**, so an IPv6 /64 can occupy every
   connection slot. Exact dcrd parity (`connmanager.go` 685); the rate limiter
-  groups by /64 but the per-host permit does not.
+  groups by /64 but the per-host permit does not. Pinned by the `tsip|` rows of
+  `srvtargetout_vectors.rs`, which replay dcrd's own arithmetic for the flag.
 
 - **`banned_hosts` grows without bound**, reclaimed only lazily on reconnect
   from that exact host. Exact dcrd parity (`server.go` 2201). The analogous
@@ -551,8 +554,11 @@ against upstream and the port is faithful.
   every field and parameter on a disconnect path, so a site with a lone socket
   to shut down no longer exists. The flag is minted at the accept and at the
   dial rather than inside `serve_peer`, so every holder shares one. Pinned at
-  each of the six sites plus the clone-sharing invariant beneath them. The
-  residual cost is dcrd's own shape reproduced: one wake-up per second per idle
+  each of the six sites plus the clone-sharing invariant beneath them --
+  `a_cloned_teardown_shares_one_flag_and_disconnect_does_both_halves` and
+  `separately_minted_teardowns_do_not_share_a_flag`, both unit tests in
+  `transport.rs` rather than in `tests/`. The residual cost is dcrd's own shape
+  reproduced: one wake-up per second per idle
   connection (~125 at the default `--maxpeers`), against dcrd's blocking read
   with no poll at all.
 
