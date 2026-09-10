@@ -290,7 +290,7 @@ Entry format:
 - **Why it does not matter to dcrd:** height 1 is unreachable on any
   live network. Genesis pays a single zero-value output,
   `createChainState` records no utxo entries for it, and zero-value
-  spends are rejected (`internal/blockchain/validate.go:3349-3354`), so
+  spends are rejected (`internal/blockchain/validate.go:3399-3402`), so
   no chain arrives at height 1 with a spendable parent to chain from.
 - **What this port does:** clones unconditionally
   (`generator.rs`'s copy ahead of both passes), so the source's

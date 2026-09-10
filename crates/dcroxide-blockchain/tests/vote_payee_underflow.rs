@@ -4,7 +4,7 @@
 //!
 //! dcrd counts a vote's payment outputs in signed ints —
 //! `numVotePayments := len(msgTx.TxOut) - 2 - extra`
-//! (internal/blockchain/validate.go:2978) — so a vote with only the two
+//! (internal/blockchain/validate.go:2996) — so a vote with only the two
 //! mandatory OP_RETURN outputs, whose vote-bits output doubles as a
 //! `'T','V'` treasury-vote payload, yields -1 and falls into the
 //! `ErrBadNumPayees` rejection just below.

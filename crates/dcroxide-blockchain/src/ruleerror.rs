@@ -197,7 +197,7 @@ impl RuleErrorKind {
     /// `contextError` in production code.  `ErrMissingParent` and
     /// `ErrSerializeHeader` are deliberately absent: they appear with
     /// `contextError` only in dcrd's tests, while production builds
-    /// both with `ruleError` (`process.go:194`, `validate.go:2730`),
+    /// both with `ruleError` (`process.go:194`, `validate.go:2748`),
     /// so an orphan block stays a peer's problem.
     #[must_use]
     pub fn is_rule_violation(self) -> bool {

@@ -182,7 +182,7 @@ fn template_vectors() {
 /// dcrd's `checkBlockPositional` is a method on the chain and reads the
 /// fork rejection checkpoint out of its own index, so the check is live
 /// for its only consumer, `CheckConnectBlockTemplate`
-/// (`validate.go:1372-1393`, called at `:4432`). The port passed a
+/// (`validate.go:1372-1393`, called at `:4491`). The port passed a
 /// literal `None` instead, which made the rule structurally unreachable
 /// for the one path that can trigger it.
 ///

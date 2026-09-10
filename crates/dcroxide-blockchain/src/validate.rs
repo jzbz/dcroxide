@@ -2515,7 +2515,7 @@ pub fn check_vote_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
             extra = 1;
         }
     }
-    // Signed, because dcrd's is (`validate.go:2978` over Go ints).  A
+    // Signed, because dcrd's is (`validate.go:2996` over Go ints).  A
     // vote carrying fewer outputs than the two mandatory ones plus the
     // treasury vote makes this negative, and dcrd falls straight into
     // the rejection below.  The same expression over usize underflows
