@@ -445,8 +445,18 @@ fn lottery_differential() {
     for round in 0..ROUNDS {
         let seed = rng.bytes(64);
         let n_rand = rng.below(64) as usize + 1;
-        let pool_size = rng.below(8192) as u32 + 1;
-        let winners = (rng.below(6) + 1).min(u64::from(pool_size)) as u16;
+        // An empty live-ticket pool and a zero-winner draw are both
+        // reachable states that `rng.below(n) + 1` could never generate.
+        let pool_size = if rng.below(16) == 0 {
+            0
+        } else {
+            rng.below(8192) as u32 + 1
+        };
+        let winners = if rng.below(16) == 0 {
+            0
+        } else {
+            (rng.below(6) + 1).min(u64::from(pool_size)) as u16
+        };
 
         // Ours.
         let mut w = String::new();
@@ -492,13 +502,24 @@ fn rewards_differential() {
     const ROUNDS: usize = 400;
     for round in 0..ROUNDS {
         let n = rng.below(5) as usize + 1;
-        let contribs: Vec<i64> = (0..n)
-            .map(|_| match rng.below(4) {
+        // A zero contribution is legal and is the boundary the sibling
+        // revocation helper got wrong upstream until `5dd4ca59`; drawing
+        // it explicitly rather than hoping a `1 << 20` draw lands on it.
+        let mut contribs: Vec<i64> = (0..n)
+            .map(|_| match rng.below(5) {
                 0 => 1,
-                1 => rng.below(1 << 20) as i64 + 1,
-                _ => rng.below(1 << 44) as i64 + 1,
+                1 => 0,
+                2 => rng.below(1 << 20) as i64,
+                _ => rng.below(1 << 44) as i64,
             })
             .collect();
+        // Not every contribution may be zero: the split divides by the
+        // total, and both implementations panic on a zero divisor by
+        // design (`uint256::div2`), so an all-zero set is out of
+        // contract for each rather than a divergence between them.
+        if contribs.iter().all(|c| *c == 0) {
+            contribs[0] = 1;
+        }
         let total: i64 = contribs.iter().sum();
         // Purchase near total contributions to exercise remainders.
         let purchase = (total - rng.below(64) as i64).max(1);

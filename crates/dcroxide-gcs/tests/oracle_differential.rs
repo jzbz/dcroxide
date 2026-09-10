@@ -266,12 +266,26 @@ fn build_ticket(rng: &mut SplitMix64, params: &dcroxide_chaincfg::Params) -> Msg
     let (_, submission) = random_stake_addr(rng, params)
         .voting_rights_script()
         .expect("stake address");
-    tx.tx_out
-        .push(out(rng.below(1 << 40) as i64 + 1, submission));
+    // A zero-value submission and a zero committed amount are both legal
+    // and were unreachable while these drew `rng.below(n) + 1`.
+    let submission_value = if rng.below(8) == 0 {
+        0
+    } else {
+        rng.below(1 << 40) as i64 + 1
+    };
+    tx.tx_out.push(out(submission_value, submission));
     for _ in 0..n {
         tx.tx_in.push(funding_input(rng, 0));
         let (_, commitment) = random_stake_addr(rng, params)
-            .reward_commitment_script(rng.below(1 << 40) as i64 + 1, 0, 0)
+            .reward_commitment_script(
+                if rng.below(8) == 0 {
+                    0
+                } else {
+                    rng.below(1 << 40) as i64 + 1
+                },
+                0,
+                0,
+            )
             .expect("stake address");
         tx.tx_out.push(out(0, commitment));
         let (_, change) = random_stake_addr(rng, params)
