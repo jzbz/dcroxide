@@ -39,7 +39,8 @@ than rewriting what was decided. Use [template.md](template.md).
   What remains undecided is how often to look, not how to look.
 - **D6** — dcr-rs relationship (upstream vs. fork) — partially covered by ADR-0002
 - **D7** — MSRV, platform tiers, release signing/reproducibility (MSRV
-  currently 1.94 via workspace `rust-version`; formal ADR pending).  The
+  currently the pinned toolchain itself, 1.98.1, via workspace
+  `rust-version`; formal ADR pending).  The
   ADR is a hard gate before any binary is published, and it must decide
   the pre-1.0 stale-binary question explicitly — a Cuprate-style expiry
   or a recorded refusal.  The threat model is Decred's, not Monero's: a
@@ -47,5 +48,5 @@ than rewriting what was decided. Use [template.md](template.md).
   ticket votes, so a stale pre-release self-isolates rather than
   splitting the network, and the concentrated harm is to its own
   operator — a voting wallet or VSP behind a wedged node bleeds missed
-  votes.  The pinned 1.97.1 toolchain and `codegen-units = 1` already
+  votes.  The pinned 1.98.1 toolchain and `codegen-units = 1` already
   make reproducible-artifact verification attainable as a release gate.

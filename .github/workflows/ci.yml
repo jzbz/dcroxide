@@ -76,20 +76,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
-  msrv:
-    name: MSRV build (1.94)
-    runs-on: ubuntu-latest
-    env:
-      # Must beat rust-toolchain.toml, which outranks `rustup default` and
-      # would otherwise have this job re-check the pinned toolchain — passing
-      # while testing nothing about the floor it exists to defend.
-      RUSTUP_TOOLCHAIN: "1.94"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets
-
   dcrd-interop:
     name: dcrd interop (live socket)
     runs-on: ubuntu-latest

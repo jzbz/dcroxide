@@ -518,15 +518,15 @@ per machine, commit, and corpus in
 
 ## Development
 
-Rust ≥ 1.94 (MSRV) and a Go toolchain (for the oracle-backed differential
+Rust 1.98.1 and a Go toolchain (for the oracle-backed differential
 tests; without Go those tests skip). `DCROXIDE_REQUIRE_ORACLE=1` turns a
 missing toolchain into a failure instead, so a run cannot silently pass
 with the differential coverage skipped — CI sets it.
 
 `rust-toolchain.toml` pins the toolchain builds actually use, so a commit
-compiles with one rustc everywhere; the MSRV above is the older floor CI
-checks separately. Commands needing another toolchain say so explicitly
-(`cargo +nightly fuzz ...`).
+compiles with one rustc everywhere, and the workspace `rust-version` names
+the same release, so there is no older floor to check separately. Commands
+needing another toolchain say so explicitly (`cargo +nightly fuzz ...`).
 
 ```sh
 cargo test --workspace          # unit + KAT + differential tests
