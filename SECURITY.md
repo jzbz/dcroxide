@@ -147,14 +147,21 @@ evaluating this code.
   storage engine exercised that bound this cycle: redb went 2.6.3 to
   4.1.0 on 2026-08-13, across two majors and a changed on-disk format,
   argued in ADR-0004's upgrade addendum rather than arriving as a
-  lockfile change. It is maintenance, not hardening. 4.1.0 carries four
-  known open issues, none a regression against 2.6.3 and all concerning
-  a file that is already damaged or hostile: #1331 and #1332 abort the
-  process on malformed on-disk structures (an unvalidated 5-bit page
-  order, and a cyclic branch pointer reached from ordinary reads),
-  #1333 leaves a file permanently unopenable when the repair path
-  itself panics, and read paths do not verify page checksums until a
-  fix that is currently master-only.
+  lockfile change. It is maintenance, not hardening. 4.1.0 carried four
+  known issues, none a regression against 2.6.3 and all concerning a
+  file that is already damaged or hostile. The lock now pins 4.3.0, and
+  redb 4.2.0 shipped a fix for three of them, each with a regression
+  test that names the issue: #1331, an unvalidated 5-bit page order
+  that aborted the process, and #1332, a cyclic branch pointer reached
+  from ordinary reads, are now reported as corruption, and #1333, a
+  repair-path panic that left a file permanently unopenable, now
+  returns an error for the corrupt freed-page entry that caused it.
+  Read-path checksum verification is not in 4.3.0: reads do not compare
+  page checksums, which redb checks only when `check_integrity` or
+  repair walks whole trees. Some damage still aborts the process, too —
+  a page whose type byte is neither leaf nor branch reaches an
+  `unreachable!()` in redb's btree descent, and this workspace builds
+  with `panic = "abort"`.
 
 ## What this project does instead of a guarantee
 

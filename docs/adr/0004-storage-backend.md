@@ -53,8 +53,9 @@ Dated addenda follow the amendment below, and later ones supersede earlier
 ones — including a retraction. This section states what is currently
 believed and points at the evidence; nothing below it has been rewritten.
 
-**The metadata store now runs redb 4.1.0** (addendum, 2026-08-13). The
-on-disk format changed with it: redb 4 reads only format 3 and returns
+**The metadata store now runs redb 4** (addendum, 2026-08-13, which took
+4.1.0; `Cargo.lock` now pins 4.3.0). The on-disk format changed with it:
+redb 4 reads only format 3 and returns
 `UpgradeRequired` for a 2.x file, mapped here to a typed error that names
 redb 2.x — a data directory written before 2026-08-13 is refused rather
 than misread, and has to be re-synced or re-imported; the chain data itself
@@ -63,7 +64,9 @@ slack, free pages, the 0.6486 fill — was measured on 2.6.3, and the packing
 half of it holds: 4.1.0 reproduces the 2.6.3 tree to four decimals on a
 250,000-block replay. Its 9.4% fewer bytes of file come entirely out of
 free-page retention, which is the one row above that a 4.1.0 store reports
-smaller.
+smaller. None of these figures has been re-measured under 4.3.0, which
+shortens the branch keys of `&[u8]`-keyed tables, this crate's one table
+among them, to minimal separators.
 
 **The engine is now measured against candidates, and redb loses on this
 workload.** Handed the identical engine-level journal, fjall 3.1.8 holds
@@ -1215,12 +1218,15 @@ addressed incrementally" has read it wrong.
 **The on-disk format changed, and old data directories are refused.** redb 4
 reads only file format 3 and returns `UpgradeRequired` for a 2.x file, so it
 cannot misread one. That is mapped to `ErrorKind::Invalid` with a message
-that names redb 2.x, says to sync again, and says the chain is not damaged —
-the two failures an operator can hit here need to look different from each
-other. There is no in-place migration and ADR-0004's fresh-sync stance means
-there does not need to be. A test writes a genuine 2.x store with the
-previous major as a dev-dependency and asserts the refusal, so the behaviour
-keeps being tested if either version moves.
+that names the format it found, says to sync again, and says the chain is
+not damaged — the two failures an operator can hit here need to look
+different from each other. There is no in-place migration and ADR-0004's
+fresh-sync stance means there does not need to be. A test wrote a genuine
+2.x store with the previous major as a dev-dependency and asserted the
+refusal; on 2026-09-18 both were dropped, because dcroxide has never been
+released and no 2.x store exists to refuse. The mapping stays and no longer
+names a version, so it reads correctly for whatever the next format change
+is.
 
 **MSRV is unaffected:** redb 4.1.0 requires 1.89 against this workspace's
 1.94 floor.

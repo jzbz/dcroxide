@@ -84,7 +84,7 @@ const GO_MAX_ALLOC: i64 = 1 << 48;
 /// `unsafe.Sizeof(hchan{})` rounded to `maxAlign` (`runtime/chan.go`).
 /// Measured as 104 under go1.27.  The limit below is the same integer
 /// for any value in `[104, 136]`, which spans the plausible range and
-/// covers both toolchains CI pins (`ci.yml:74` 1.24, `:115` 1.25), so
+/// covers both toolchains CI pins (`ci.yml:74` 1.24, `:106` 1.25), so
 /// the constant does not track the Go release.
 const GO_HCHAN_SIZE: i64 = 104;
 

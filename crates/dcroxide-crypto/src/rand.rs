@@ -91,11 +91,11 @@ pub const MAX_CIPHER_READ: usize = 4 * 1024 * 1024;
 ///
 /// The rekey is not hygiene, it is what keeps a draw infallible.
 /// `chacha20::ChaCha20` is the 96-bit-nonce variant, whose block
-/// counter is a `u32` (`chacha20-0.9.1/src/lib.rs`,
+/// counter is a `u32` (`chacha20-0.10.2/src/variants.rs:37`,
 /// `type Counter = u32`), so one cipher yields `(2^32 - 1) * 64` bytes
 /// and then stops -- and stops by panicking, because `apply_keystream`
-/// is `try_apply_keystream(..).unwrap()`
-/// (`cipher-0.4.4/src/stream.rs:119`).  Under this workspace's
+/// is `try_apply_keystream(buf).expect("end of keystream reached")`
+/// (`cipher-0.5.2/src/stream.rs:185-188`).  Under this workspace's
 /// `panic = "abort"` release profile that is a process outage on
 /// whichever path happened to draw.  Rekeying every [`MAX_CIPHER_READ`]
 /// bytes keeps a cipher five orders of magnitude short of the cap,

@@ -66,8 +66,8 @@ exit criteria have not been demonstrated, and those are listed here too:
   is weaker than comparing chain state at every height.
 - **Phase 0 — the CI gates are partly wired.** `.github/workflows/ci.yml` runs
   rustfmt and `clippy -D warnings`, `cargo test --workspace` on all three OSes
-  with the oracle required (`DCROXIDE_REQUIRE_ORACLE=1`), a `cargo check` at
-  the 1.94 MSRV, `cargo-deny` over licenses/advisories/sources/bans, a
+  with the oracle required (`DCROXIDE_REQUIRE_ORACLE=1`), `cargo-deny` over
+  licenses/advisories/sources/bans, a
   60-second-per-target fuzz smoke — all of those on every push to `master`
   and every pull request — and a nightly
   10-minute-per-target run over the 12 fuzz targets. Not wired: coverage
@@ -515,9 +515,9 @@ pins this policy asks for.
 > - **D5** (upstream tracking cadence) and **D7** (MSRV, platform tiers,
 >   release signing and reproducibility) have no ADR. Facts on the ground:
 >   the parity target did move to master `452c1a6c` and again to `29f17894`,
->   MSRV is pinned at 1.94
->   through the workspace `rust-version` with a CI job that `cargo check`s the
->   workspace at it, and CI tests on Linux, macOS, and Windows. Release signing
+>   MSRV is the pinned toolchain itself, 1.98.1, through the workspace
+>   `rust-version`, with no separate CI job, and CI tests on Linux, macOS, and
+>   Windows. Release signing
 >   and reproducible builds are neither decided nor built.
 > - **D6** is partially covered by
 >   [ADR-0002](docs/adr/0002-vendor-blake256-from-dcr-rs.md): dcr-rs is

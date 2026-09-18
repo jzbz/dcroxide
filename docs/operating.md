@@ -65,14 +65,13 @@ supported configuration. Syncing from genesis is the accepted default
 (ADR-0004's C6 stance); `addblock`-format import is the bulk path when
 you already have the blocks.
 
-**A data directory written before 2026-08-13 also has to be re-synced.**
-The metadata store moved from redb 2.x to 4.x, which changed the on-disk
+The same holds if a future release changes the metadata store's on-disk
 format. There is no in-place upgrade. An old directory is *refused*, not
-misread — the node stops with a message naming redb 2.x and telling you to
-sync again, and it says the chain is not damaged, because "this predates
-the upgrade" and "your disk is failing" want opposite reactions from you.
-Delete the data directory and sync from genesis, or re-import with
-`addblock`. Nothing else about operating the node changes.
+misread — the node stops with a message naming the format it found and
+telling you to sync again, and it says the chain is not damaged, because
+"this predates the upgrade" and "your disk is failing" want opposite
+reactions from you. No released format change has happened, so nothing on
+disk is in that position today.
 
 Budget for it: initial block download runs about **1.29x slower than
 dcrd** — roughly 1.15 hours against dcrd's 0.9 for mainnet from genesis
@@ -144,10 +143,11 @@ in MiB, defaulting to 1024. Raising it to 8192 made a full-chain replay
 **50% slower** — 5125-6294 s against the same 3866-3888 s baseline, again
 with non-overlapping ranges. That is the opposite of what the setting
 suggests, and the opposite of what a 500,000-key microbenchmark predicted
-when the knob was added. There is no fixed split to reason from: redb 4.1.0
-keeps a single cache figure and partitions it on demand, capping the write
-buffer at half of it and letting the read cache grow into all of it. The
-advice rests on the full-chain measurement, not on a mechanism.
+when the knob was added. There is no fixed split to reason from: redb 4.3.0
+keeps a single cache figure and partitions it on demand, holding the write
+buffer at or below half of it, best effort, and letting the read cache grow
+into all of it. The advice rests on the full-chain measurement, not on a
+mechanism.
 
 Lowering it does not help either: 256 MiB and 512 MiB both measured
 indistinguishable from the 1024 MiB default, with ranges overlapping it.

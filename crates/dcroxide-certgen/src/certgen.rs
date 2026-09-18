@@ -259,11 +259,7 @@ pub fn new_tls_cert_pair_parts<E: CertEnv>(
         Curve::P256 => {
             let key = p256::ecdsa::SigningKey::from_slice(&scalar)
                 .map_err(|e| format!("invalid P-256 scalar: {e}"))?;
-            let public = key
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes()
-                .to_vec();
+            let public = key.verifying_key().to_sec1_point(false).as_bytes().to_vec();
             let alg = SigAlg::EcdsaP256;
             let tbs = x509::build_tbs(&template, &alg, &public)?;
             let sig: p256::ecdsa::Signature = key.sign(&tbs);
@@ -279,7 +275,7 @@ pub fn new_tls_cert_pair_parts<E: CertEnv>(
             let key = p521::ecdsa::SigningKey::from_slice(&scalar)
                 .map_err(|e| format!("invalid P-521 scalar: {e}"))?;
             let public = p521::ecdsa::VerifyingKey::from(&key)
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes()
                 .to_vec();
             let alg = SigAlg::EcdsaP521;

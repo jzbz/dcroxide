@@ -19,7 +19,7 @@ use core::fmt;
 
 use k256::elliptic_curve::PrimeField;
 use k256::elliptic_curve::group::Group;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::{ProjectivePoint, Scalar};
 
 use super::nonce::nonce_rfc6979;
@@ -157,7 +157,7 @@ impl Signature {
 
         // Step 9: fail if R.y is odd.
         let affine = big_r.to_affine();
-        let encoded = affine.to_encoded_point(false);
+        let encoded = affine.to_sec1_point(false);
         let y = encoded.y().expect("non-identity affine point has y");
         if y[31] & 1 == 1 {
             return Err(Error::SigRYIsOdd);
@@ -216,7 +216,7 @@ fn sign_with_nonce(
     // Step 4: R = kG.
     let mut k = Scalar::from_repr((*nonce).into()).expect("nonce is a valid scalar");
     let big_r = (ProjectivePoint::GENERATOR * k).to_affine();
-    let encoded = big_r.to_encoded_point(false);
+    let encoded = big_r.to_sec1_point(false);
 
     // Step 5: negate k if R.y is odd.
     let y = encoded.y().expect("kG is never the identity for k != 0");
@@ -251,7 +251,7 @@ pub fn sign(priv_key: &PrivateKey, hash: &[u8]) -> Result<Signature, Error> {
     // construction of PrivateKey.
     let hash: &[u8; 32] = hash.try_into().map_err(|_| Error::InvalidHashLen)?;
 
-    let priv_bytes = priv_key.inner().secret_bytes();
+    let priv_bytes = priv_key.inner().to_secret_bytes();
     let priv_scalar = Scalar::from_repr(priv_bytes.into()).expect("private key is a valid scalar");
 
     // Step 3 + retry loop: RFC6979 nonces domain-separated for this scheme.

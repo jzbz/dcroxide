@@ -10,35 +10,35 @@ repository.workspace = true
 
 [features]
 default = ["std"]
-# `std` buys two pure-performance choices and nothing semantic: libsecp256k1's
-# process-wide context (its `global-context` feature is literally
-# `global-context = ["std"]`) and k256's precomputed generator tables (whose
-# `precomputed-tables` carries a `compile_error!` demanding `std` or
-# `critical-section`).  Without it the crate creates a context per call --
-# measured at 314 ns against a 21.3 us ECDSA verify -- and computes the
-# tables.  Every acceptance rule, error identity, and byte encoding is
-# identical either way, which the crate's own vectors run in both
-# configurations.
-std = [
-    "libsecp256k1/std",
-    "libsecp256k1/global-context",
-    "k256/std",
-    "k256/precomputed-tables",
-]
+# `std` buys one pure-performance choice and nothing semantic.  secp256k1
+# runs its key, sign, verify and recover functions against a context it
+# manages itself: with `std`, one per thread, allocated on first use; without
+# it, one built on the stack for every call.  Every acceptance rule, error
+# identity, and byte encoding is identical either way, which the crate's own
+# vectors run in both configurations.
+#
+# k256's `std` and `precomputed-tables` are deliberately left off.  The
+# Schnorr code multiplies with `ProjectivePoint::GENERATOR * s`, which goes
+# through `lincomb` and never reads the basepoint table -- only
+# `mul_by_generator` reads it, joined in 0.14 by `mul_by_generator_vartime`,
+# and the Schnorr code calls neither -- so the tables bought
+# nothing, and from 0.14 `k256/std` also pulls an OS RNG (getrandom) into a
+# crate that never draws randomness.
+std = ["libsecp256k1/std"]
 
 [dependencies]
 # The audited libsecp256k1 C library; dcrd's exact parsing/acceptance rules
 # are enforced by our own layer in front of it (ADR-0006).
-libsecp256k1 = { package = "secp256k1", version = "0.29", default-features = false, features = ["alloc", "recovery"] }
+libsecp256k1 = { package = "secp256k1", version = "0.33", default-features = false, features = ["recovery"] }
 # Pure-Rust scalar/point arithmetic for EC-Schnorr-DCRv0, which needs raw
 # group operations no packaged signing API exposes (ADR-0006).
-k256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+k256 = { version = "0.14", default-features = false, features = ["arithmetic"] }
 # RFC6979 nonce generation (dcrd's exact variant, ported in this crate).
-hmac = { version = "0.12", default-features = false }
-sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.13", default-features = false }
+sha2 = { version = "0.11", default-features = false }
 # Ed25519 group/scalar primitives; dcrd's exact (2017-agl) acceptance
 # behavior is implemented in our edwards module on top of these.
-curve25519-dalek = "4"
+curve25519-dalek = "5"
 # BLAKE-256 for the EC-Schnorr-DCRv0 challenge.
 dcroxide-crypto = { path = "../dcroxide-crypto" }
 

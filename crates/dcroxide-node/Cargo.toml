@@ -27,7 +27,7 @@ path = "src/bin/gencerts.rs"
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ctrlc = { version = "3", features = ["termination"] }
-getrandom = "0.3"
+getrandom = "0.4"
 dcroxide-addrmgr = { path = "../dcroxide-addrmgr" }
 dcroxide-blockchain = { path = "../dcroxide-blockchain", features = ["std"] }
 dcroxide-certgen = { path = "../dcroxide-certgen" }
@@ -56,13 +56,13 @@ dcroxide-wire = { path = "../dcroxide-wire" }
 # C/assembly crypto library into a workspace that otherwise forbids
 # unsafe code, and leaving two providers registered so rustls cannot
 # pick one without an explicit install_default().
-rustls = { version = "0.23", default-features = false, features = [
+rustls = { version = "0.23.45", default-features = false, features = [
     "ring",
     "std",
     "tls12",
     "logging",
 ] }
-sha1 = { version = "0.10.6", default-features = false }
+sha1 = { version = "0.11", default-features = false }
 rustls-pki-types = "1"
 ureq = "3"
 webpki-roots = "1"

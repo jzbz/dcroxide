@@ -72,18 +72,10 @@ impl ToolKeyPair {
     /// point for EC keys and the raw public key for Ed25519.
     pub fn public_bytes(&self) -> Vec<u8> {
         match self {
-            ToolKeyPair::P256(key) => key
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes()
-                .to_vec(),
-            ToolKeyPair::P384(key) => key
-                .verifying_key()
-                .to_encoded_point(false)
-                .as_bytes()
-                .to_vec(),
+            ToolKeyPair::P256(key) => key.verifying_key().to_sec1_point(false).as_bytes().to_vec(),
+            ToolKeyPair::P384(key) => key.verifying_key().to_sec1_point(false).as_bytes().to_vec(),
             ToolKeyPair::P521(key) => p521::ecdsa::VerifyingKey::from(key)
-                .to_encoded_point(false)
+                .to_sec1_point(false)
                 .as_bytes()
                 .to_vec(),
             ToolKeyPair::Ed25519(seed) => dcroxide_dcrec::edwards::SecretKey::from_seed(*seed)

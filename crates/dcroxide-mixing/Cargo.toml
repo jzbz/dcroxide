@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-chacha20 = { version = "0.9", default-features = false }
+chacha20 = { version = "0.10.2", default-features = false, features = ["cipher"] }
 dcroxide-chaincfg = { path = "../dcroxide-chaincfg" }
 dcroxide-containers = { path = "../dcroxide-containers" }
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }

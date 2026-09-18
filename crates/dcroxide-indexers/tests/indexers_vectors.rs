@@ -615,7 +615,7 @@ fn sync_waiters_and_legacy_drops() {
 ///
 /// The node only ever writes 32-byte values there, so reaching this
 /// needs metadata corruption -- local tampering or bit rot, which redb
-/// 4.1.0 does not checksum on read (SECURITY.md's known gap).  The
+/// 4.3.0 does not checksum on read (SECURITY.md's known gap).  The
 /// consequence was disproportionate: `db_fetch_block_hash_by_serialized_id`
 /// sliced `hash_bytes[..HASH_SIZE]` unchecked, and `TxIndex::new`'s
 /// highest-used-id scan called it behind `is_err()`, where a panic is not

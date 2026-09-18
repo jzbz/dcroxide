@@ -75,6 +75,11 @@ jobs:
           cache-dependency-path: tools/oracle/go.sum
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+      # dcroxide-dcrec's vectors again without its default `std`. The run
+      # above only builds the crate with `std` on, and without it
+      # libsecp256k1 builds a context on the stack for every call where
+      # `std` keeps one per thread, so both configurations need running.
+      - run: cargo test -p dcroxide-dcrec --no-default-features
 
   dcrd-interop:
     name: dcrd interop (live socket)
@@ -170,13 +175,17 @@ jobs:
     # `use std::` or a default-features dependency creeping back in.
     #
     # Not yet listed: blockchain, fees, gcs, mempool, mining, stake, and
-    # txscript. Every one of them fails on the same five crates
-    # (secp256k1-sys, once_cell, getrandom, crypto-common, der) pulled in
-    # through dcroxide-dcrec's default features, so each needs
-    # `default-features = false` on its dcroxide-* path dependencies plus
-    # a `std` feature that re-enables them. dcroxide-database is NOT the
-    # blocker it looks like — making it optional in stake was tried and
-    # changed nothing.
+    # txscript. All seven reach secp256k1-sys with its `std` feature on
+    # through dcroxide-dcrec's default features, and secp256k1-sys does
+    # not build for this target that way: txscript fails on it and on
+    # nothing else. So each needs `default-features = false` on its
+    # dcroxide-* path dependencies plus a `std` feature that re-enables
+    # them. That is not the whole job for the six that also reach
+    # dcroxide-database (all but txscript): it builds redb with redb's
+    # default `std` feature, and stake fails on redb as well as on
+    # secp256k1-sys. Turning redb's default features off is not enough on
+    # its own: 4.3.0 builds without `std` only when `std` is off and its
+    # `experimental-api-5` preview is on (`build.rs:5-13`).
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install

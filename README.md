@@ -112,16 +112,16 @@ work). Currently implemented:
   against dcrd
 - `dcroxide-database` — block and metadata storage with dcrd's
   `database` interface semantics (buckets, transactions, block storage
-  APIs, all error kinds), backed by redb 4.1.0 per ADR-0004 with
+  APIs, all error kinds), backed by redb 4.3.0 per ADR-0004 with
   dcrd's exact ffldb key layout and flat-file block record format, plus
   bulk block import/export in dcrd's `addblock` bootstrap format, plus
   ffldb's metadata write cache — layered snapshots over one durable
   flush per window — so a sync commits on dcrd's schedule rather than
   per block; pinned by the ported ffldb interface-test battery and a
   crash-consistency rig (fresh-sync stance: no in-place dcrd datadir
-  reuse, and no in-place upgrade from a pre-2026-08-13 dcroxide datadir
-  either — redb 4 refuses a 2.x file with a typed error naming the
-  version, and the chain must be re-synced or re-imported)
+  reuse, and no in-place upgrade across a redb format change either —
+  an older file format is refused with a typed error naming it, and the
+  chain must be re-synced or re-imported)
 - `dcroxide-blockchain` — the chain engine from dcrd's
   `internal/blockchain`, ported complete.
 

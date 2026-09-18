@@ -8,7 +8,7 @@
 //! reduced mod N first), and the `extra_iterations` parameter skips that
 //! many valid candidates from the DRBG stream rather than re-seeding.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use super::{GROUP_ORDER_BYTES, is_zero};

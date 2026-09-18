@@ -5,7 +5,7 @@
 //! `SystemRng` used to be a ChaCha20 keystream seeded once and never
 //! rekeyed. chacha20's block counter is a `u32`, so one cipher yields
 //! `(2^32 - 1) * 64` bytes and then panics rather than erroring —
-//! `apply_keystream` is `try_apply_keystream(..).unwrap()` — and under
+//! `apply_keystream` is `try_apply_keystream(..).expect(..)` — and under
 //! `panic = "abort"` that is an outage. It now draws from
 //! `dcroxide_crypto::rand::Prng`, which rekeys on dcrd's 4 MiB budget;
 //! the budget's mechanics are pinned in that crate's own tests, and

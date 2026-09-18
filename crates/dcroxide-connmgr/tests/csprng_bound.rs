@@ -3,11 +3,12 @@
 //!
 //! `SystemCsprng` promises an infallible draw, and that promise is not
 //! free. `chacha20::ChaCha20` is the 96-bit-nonce variant, whose block
-//! counter is a `u32` (`chacha20-0.9.1/src/lib.rs` `type Counter = u32`),
-//! so one cipher yields `(2^32 - 1) * 64` bytes and then stops. The
-//! stopping is not an error a caller can see: `apply_keystream` is
-//! `try_apply_keystream(buf).unwrap()` (`cipher-0.4.4/src/stream.rs:119`),
-//! and its own doc says it "will panic". Under `panic = "abort"` that is
+//! counter is a `u32` (`chacha20-0.10.2/src/variants.rs:37`
+//! `type Counter = u32`), so one cipher yields `(2^32 - 1) * 64` bytes and
+//! then stops. The stopping is not an error a caller can see:
+//! `apply_keystream` is `try_apply_keystream(buf).expect(..)`
+//! (`cipher-0.5.2/src/stream.rs:185-188`), and its own doc says it panics
+//! "If the end of the keystream is reached". Under `panic = "abort"` that is
 //! a process outage on whichever path happened to draw.
 //!
 //! dcrd never reaches its own equivalent because it rekeys every 4 MiB

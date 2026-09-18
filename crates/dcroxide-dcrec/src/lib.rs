@@ -13,11 +13,11 @@
 //! and differential-tested against dcrd's own code via `tools/oracle`.
 //!
 //! Like the codec crates this one is `no_std` without its default `std`
-//! feature, and needs `alloc` (libsecp256k1 context creation and the DER
-//! `Vec`).  `std` selects two pure-performance options — libsecp256k1's
-//! process-wide context and k256's precomputed generator tables — and
-//! changes no acceptance rule, error identity, or encoded byte; the vectors
-//! run in both configurations.  Note that this makes the *Rust* side
+//! feature, and needs `alloc` (the DER `Vec`).  `std` selects one
+//! pure-performance option — a libsecp256k1 context kept per thread instead
+//! of one built on the stack for every call — and changes no
+//! acceptance rule, error identity, or encoded byte; the vectors run in both
+//! configurations.  Note that this makes the *Rust* side
 //! std-free: `secp256k1-sys` still compiles the C library, so a genuinely
 //! freestanding build additionally needs a cross C toolchain and a global
 //! allocator.

@@ -29,7 +29,8 @@ impl ChaCha20Prng {
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(&run.to_le_bytes());
 
-        let cipher = ChaCha20::new(seed.into(), (&nonce).into());
+        let key = <&chacha20::Key>::try_from(seed).expect("seed length asserted above");
+        let cipher = ChaCha20::new(key, (&nonce).into());
         ChaCha20Prng { cipher }
     }
 

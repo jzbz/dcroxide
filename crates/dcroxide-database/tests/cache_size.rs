@@ -19,18 +19,18 @@ const NET: u32 = 0x12141c16; // simnet magic
 
 /// The configured cache size must actually reach redb.
 ///
-/// redb 4.1.0 takes one `set_cache_size` figure (`db.rs:1161`) and
-/// partitions it dynamically: the write buffer never exceeds 50% of the
-/// total (`cached_file.rs:205`) and the read cache may grow to 100% when
-/// no write is in flight. When a commit's dirty set exceeds the write
-/// buffer, redb spills those pages to the file, re-reads them to
-/// finalize checksums, and writes the buffer again — so a too-small
-/// buffer roughly doubles the bytes written per commit.
+/// redb 4.3.0 takes one `set_cache_size` figure (`db.rs:2153`) and
+/// partitions it dynamically: the write buffer is held at or below 50% of
+/// the total, best effort (`cached_file.rs:287-289`), and the read cache
+/// may grow to 100% when no write is in flight. When a commit's dirty set
+/// exceeds the write buffer, redb spills those pages to the file,
+/// re-reads them to finalize checksums, and writes the buffer again — so
+/// a too-small buffer roughly doubles the bytes written per commit.
 ///
 /// redb 2.6.3 cut the same figure 90/10 (`db.rs:1186-1187`), so the
 /// small arm's buffer grew fivefold across the upgrade, from 6.4 MiB to
-/// 32. The parameters below still clear it: measured after the upgrade,
-/// the small arm writes 96,293,184 bytes against the large arm's
+/// 32. The parameters below still clear it: measured on redb 4.1.0 after
+/// the upgrade, the small arm writes 96,293,184 bytes against the large arm's
 /// 49,754,432, a ratio of **1.935** against the 1.25 bar, byte-identical
 /// across five runs. Deleting the `set_cache_size` call collapses it to
 /// exactly 1.000.

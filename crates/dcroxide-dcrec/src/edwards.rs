@@ -323,6 +323,42 @@ mod tests {
     use super::*;
     use dcroxide_testutil::unhex;
 
+    /// Ed25519 verification hashes `R || A || m` with SHA-512 from `sha2`
+    /// (`verify_raw` above), which is consensus for signature type 1. From
+    /// 0.11 `sha2` selects a SHA-512 backend on the ARMv8 SHA3 extension at
+    /// runtime on aarch64 (`sha2-0.11.0/src/sha512.rs`), where 0.10 ran
+    /// portable code there; x86 keeps the runtime-selected AVX2 backend 0.10
+    /// already had. A backend that disagreed with FIPS 180 would split
+    /// consensus on the machines that select it and nowhere else. These are
+    /// FIPS 180's examples -- one block, two blocks, and a million bytes --
+    /// on whichever backend the test host selects.
+    #[test]
+    fn sha512_still_answers_the_known_vectors() {
+        let million = vec![b'a'; 1_000_000];
+        let cases: [(&[u8], &str); 3] = [
+            (
+                b"abc",
+                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+            ),
+            (
+                b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+                "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909",
+            ),
+            (
+                &million,
+                "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973ebde0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b",
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                dcroxide_testutil::hex(&Sha512::digest(input)),
+                want,
+                "SHA-512 of a {}-byte input",
+                input.len()
+            );
+        }
+    }
+
     /// RFC 8032 section 7.1 TEST 1: empty message.
     #[test]
     fn rfc8032_test_1() {

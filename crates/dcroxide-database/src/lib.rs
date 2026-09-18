@@ -260,16 +260,16 @@ pub struct Options {
     /// by ffldb's own write cache, whereas redb caches pages of the
     /// single metadata file. It is a ceiling filled on demand, not an
     /// allocation: the LRU stripes start empty
-    /// (redb-4.1.0 `cached_file.rs:247-249`) and a miss that would carry
+    /// (redb-4.3.0 `cached_file.rs:348-353`) and a miss that would carry
     /// the total past the limit evicts a page's worth before returning
-    /// (`:467-488`), so a small database never pays for a large setting
+    /// (`:724-746`), so a small database never pays for a large setting
     /// and the resident cost is bounded by the file size.
     ///
-    /// redb 4.1.0 keeps one cache figure and partitions it dynamically
-    /// (`db.rs:1161-1164`, `cached_file.rs:203-214`): the write buffer
-    /// never exceeds 50% of it, flushing the excess straight to disk
-    /// (`:557-583`), and the read cache may grow to 100% when no write
-    /// is in flight. Once a commit's dirty set exceeds the write buffer,
+    /// redb 4.3.0 keeps one cache figure and partitions it dynamically
+    /// (`db.rs:2153-2156`, `cached_file.rs:285-300`): the write buffer
+    /// is held at or below 50% of it, flushing the excess to disk best
+    /// effort (`:897-932`), and the read cache may grow to 100% when no
+    /// write is in flight. Once a commit's dirty set exceeds the write buffer,
     /// redb writes the spilled pages, re-reads them to finalize
     /// checksums, then writes the buffer again — measured against the
     /// mainnet metadata store on redb 2.6.3, whose `set_cache_size` cut
@@ -278,7 +278,7 @@ pub struct Options {
     /// default, 62,323 dirty pages cost 124,430 pwrites and 98,221
     /// preads, against 62,323 and 4 with the buffer large enough to hold
     /// them. The mechanism survives the upgrade; the counts were taken
-    /// at a write buffer five times smaller than 4.1.0 permits.
+    /// at a write buffer five times smaller than 4.3.0 permits.
     pub db_cache_bytes: usize,
     /// Called after every metadata flush, when set.
     ///
@@ -676,15 +676,27 @@ impl RawStats {
 /// Nothing outside this crate branches on the kind today; the value is
 /// that `PARITY.md`'s claim about `convertErr` is true.
 ///
-/// This is narrower than it looks, and deliberately so.  A physically
-/// damaged metadata page does not reach here at all: redb 4.1.0 hits
-/// `unreachable!()` in its btree walk and aborts the process under
-/// this workspace's `panic = "abort"` (redb #1331/#1332, recorded in
-/// `docs/adr/0004-storage-backend.md`).  What does reach here is the
+/// This is narrower than it looks, and deliberately so.  Not every
+/// damaged metadata page reaches here.  Since 4.2.0 redb reports as
+/// `Corrupted` three malformed structures that used to abort the process,
+/// so they now arrive here as [`ErrorKind::Corruption`]: a branch cycle
+/// or over-deep chain, cut off at depth 128 (redb #1332; redb-4.3.0
+/// `btree.rs:1097-1118`, `btree_cursor.rs:170-174`), an oversized page
+/// order (#1331, `page_manager.rs:1251-1260`), and a corrupt freed-page
+/// entry met while rebuilding the allocator (#1333,
+/// `page_manager.rs:1554-1575`).  A page whose type byte is neither leaf
+/// nor branch still hits `unreachable!()` in the descent
+/// (`btree.rs:1112`) and aborts the process under this workspace's
+/// `panic = "abort"`.  No read compares a page's checksum either: redb
+/// does that only when verifying whole trees (`db.rs:816-850`), which
+/// `check_integrity` and repair do, so damage that leaves a page
+/// well-formed comes back as data.  The issues are recorded in
+/// `docs/adr/0004-storage-backend.md`.  What does reach here is the
 /// corruption redb *reports* -- checksum mismatches on the paths that
-/// verify, an aborted repair, a poisoned handle after a prior I/O
-/// failure.  Classifying those is worth the twenty lines; it is not a
-/// substitute for the reporting redb does not do.
+/// verify, the malformed structures above, an aborted repair, a
+/// poisoned handle after a prior I/O failure.  Classifying those is
+/// worth the twenty lines; it is not a substitute for the reporting
+/// redb does not do.
 pub(crate) fn storage_error<E: Into<redb::Error>>(e: E) -> Error {
     let e = e.into();
     let kind = match &e {
@@ -699,10 +711,17 @@ pub(crate) fn storage_error<E: Into<redb::Error>>(e: E) -> Error {
 
 /// Classify a redb open failure.
 ///
-/// redb takes an exclusive `flock` on the metadata file and reports
-/// `DatabaseAlreadyOpen` when another process already holds it, which is
-/// what stops two daemons from sharing one data directory.  That has to
-/// surface as [`ErrorKind::DbAlreadyOpen`] — dcrd's `ErrDbAlreadyOpen` —
+/// redb locks the metadata file exclusively and reports
+/// `DatabaseAlreadyOpen` when another process already holds the lock,
+/// which is what stops two daemons from sharing one data directory.
+/// redb-4.3.0 takes it before reading anything from the file
+/// (`page_manager.rs:699-700`, `:1099`): byte-range locks on the open
+/// file description on Linux and Apple targets
+/// (`file_backend/range_lock.rs:377-394`), `LockFileEx` range locks on
+/// Windows (`:95-307`), and on Linux also a best-effort whole-file
+/// `flock`, the lock earlier redb versions take
+/// (`file_backend/optimized.rs:87-104`).  That has to surface as
+/// [`ErrorKind::DbAlreadyOpen`] — dcrd's `ErrDbAlreadyOpen` —
 /// rather than a generic driver error, both because the operator needs an
 /// actionable message and because the lock is acquired before the flat
 /// block files are touched, making this the check that protects them.
@@ -713,21 +732,21 @@ fn open_error(e: redb::DatabaseError) -> Error {
             "the database is already open by another process -- only one \
              instance may use a data directory at a time",
         ),
-        // A data directory written by a dcroxide built against redb 2.x.
-        // redb 4 reads only file format 3 and reports this rather than
-        // guessing, which is the behaviour that makes the upgrade safe:
-        // an old directory is refused, not misread. There is no in-place
-        // migration and ADR-0004's fresh-sync stance means there does not
-        // need to be, but the operator has to be told which of the two
-        // things happened, because "delete the data directory and re-sync"
-        // and "your disk is damaged" call for very different reactions.
+        // A data directory on an older redb file format. redb reads only
+        // the current one and reports this rather than guessing, which is
+        // the behaviour that makes a format change safe: an old directory
+        // is refused, not misread. There is no in-place migration and
+        // ADR-0004's fresh-sync stance means there does not need to be,
+        // but the operator has to be told which of the two things
+        // happened, because "delete the data directory and re-sync" and
+        // "your disk is damaged" call for very different reactions.
         redb::DatabaseError::UpgradeRequired(version) => db_error(
             ErrorKind::Invalid,
             format!(
                 "the metadata store is redb file format {version}, which this build \
-                 cannot read -- it was written by a dcroxide built against redb 2.x. \
-                 There is no in-place upgrade: remove the data directory and sync \
-                 again (see docs/operating.md). The chain is not damaged."
+                 cannot read -- it was written by an older dcroxide. There is no \
+                 in-place upgrade: remove the data directory and sync again (see \
+                 docs/operating.md). The chain is not damaged."
             ),
         ),
         other => db_error(ErrorKind::DriverSpecific, other.to_string()),
@@ -1311,7 +1330,7 @@ mod already_open_tests {
     /// written in dcrd's exact record format while the metadata lives in
     /// redb rather than leveldb, so a shared directory yields block files
     /// that look mutually readable alongside indexes that are not.  redb
-    /// takes the `flock` before any block file is touched, so the refusal
+    /// takes its file lock before any block file is touched, so the refusal
     /// happens before damage is possible — the only thing that was
     /// missing is the error kind, which dcrd has as `ErrDbAlreadyOpen`
     /// and which nothing here ever produced.
@@ -1390,10 +1409,10 @@ mod raw_stats_tests {
     /// `(leaf_pages + branch_pages) * page_size` reports 8.46 GiB against
     /// the true 9.79, because `leaf_pages` counts leaf *nodes* while the
     /// allocator rounds each node to a power-of-two run of pages
-    /// (`required_order = ceil_log2`, redb-4.1.0 `page_manager.rs:946`),
+    /// (`required_order = ceil_log2`, redb-4.3.0 `page_manager.rs:2217`),
     /// so a single row too large to share a leaf can occupy 2, 4 or 32
     /// pages and still be counted once. Not overflow pages: redb has no
-    /// such mechanism in 2.6.3 or 4.1.0. See
+    /// such mechanism in 2.6.3, 4.1.0 or 4.3.0. See
     /// [`RawStats::live_tree_bytes`].
     #[test]
     fn derived_figures_match_the_adr_0004_decomposition() {

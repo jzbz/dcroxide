@@ -1603,7 +1603,7 @@ fn build_server_config(
     // at all where dcrd resumes from tickets. That leaves it stricter
     // rather than weaker, and installing a ticketer would trade the one
     // for the other, since rustls skips on a ticket resumption
-    // (`server/tls13.rs:350-355`) the client-certificate checks Go
+    // (`server/tls13.rs:371-376`) the client-certificate checks Go
     // performs on BOTH its paths -- re-verification against the current
     // roots, an expiry check, and a seven day cap on the ticket's age
     // (`crypto/tls/handshake_server_tls13.go:362-381` and

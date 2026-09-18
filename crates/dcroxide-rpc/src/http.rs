@@ -10,7 +10,7 @@
 // Scanner index arithmetic and base64 packing mirror Go.
 #![allow(clippy::arithmetic_side_effects)]
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use dcroxide_dcrjson::{

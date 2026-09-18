@@ -756,7 +756,7 @@ fn serves_tls_with_a_generated_certificate() {
     // (`crypto/tls/handshake_server_tls13.go:362-381`). rustls does no
     // such re-verification, and with no ticketer configured its TLS1.3
     // "ticket" is a 32-byte key into `session_storage` with a 24 hour
-    // lifetime (`server/tls13.rs:1309-1317`), which an ordinary Go client
+    // lifetime (`server/tls13.rs:1330-1338`), which an ordinary Go client
     // would store and present again. Disabling the store is what keeps a
     // client the daemon would now reject from resuming its way back in.
     let session = rustls::ClientConnection::new(
