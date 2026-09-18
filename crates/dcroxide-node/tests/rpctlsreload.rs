@@ -17,9 +17,9 @@
 //! deterministic rather than dependent on timestamp granularity. PEM
 //! parsers ignore trailing whitespace, so the padded files stay valid.
 //!
-//! The curve stays P-256 throughout: P-521 pairs are generated fine but
-//! cannot be loaded by the RPC TLS setup at all, which is a separate
-//! defect and not this file's subject.
+//! The curve stays P-256 throughout. A P-521 pair builds the same
+//! configuration (pinned below), and serving one is pinned end to end in
+//! `rpclisten.rs`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -235,41 +235,121 @@ fn a_reload_does_not_restore_stateful_resumption() {
 }
 
 /// dcrd accepts `--tlscurve=P-521` and serves TLS with the resulting
-/// certificate; this port cannot, because rustls's ring provider signs
-/// P-256 and P-384 only. The pair still reaches the TLS setup without
-/// that flag -- dcrd writes one to the same paths, and so did an older
-/// dcroxide -- so the failure must name the curve rather than blaming
-/// the key's format, which is fine.
+/// certificate, and so does the port. The pair builds a configuration,
+/// and so does the reloader, which shares the builder. The key is SEC1
+/// PEM, the form dcrd's `certgen` writes.
 #[test]
-fn a_p521_key_is_refused_by_curve_and_not_by_format() {
+fn a_p521_pair_builds_a_configuration() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cert = dir.path().join("rpc.cert");
     let key = dir.path().join("rpc.key");
     let (cert_pem, key_pem) =
         load_or_generate_cert_pair(&cert, &key, &[], Curve::P521).expect("generate a P-521 pair");
-
-    // The pair itself is well formed: dcrd would serve it.
     assert!(
         key_pem.starts_with(b"-----BEGIN EC PRIVATE KEY-----"),
-        "the key is ordinary SEC1 PEM, so the format is not the problem"
+        "the key is SEC1 PEM"
     );
 
-    let err = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, None)
-        .expect_err("a P-521 key cannot serve");
-    assert!(
-        err.contains("P-521"),
-        "the error must name the curve, got: {err}"
-    );
-    assert!(
-        !err.contains("failed to parse private key"),
-        "and must not blame the format, got: {err}"
-    );
-
-    // The reloader reports it the same way, since it shares the builder.
-    match reloadable_tls_config(&cert, &key, None, Duration::ZERO) {
-        Ok(_) => panic!("a P-521 pair must not build a reloadable config either"),
-        Err(err) => assert!(err.contains("P-521"), "got: {err}"),
+    dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, None)
+        .expect("a P-521 pair builds a configuration");
+    if let Err(err) = reloadable_tls_config(&cert, &key, None, Duration::ZERO) {
+        panic!("and so does the reloader: {err}");
     }
+}
+
+/// The hand-built P-521 path keeps the check `with_single_cert` makes for
+/// every other key: a key that does not belong to the certificate is
+/// refused at startup, rather than serving handshakes no client can verify.
+#[test]
+fn a_p521_key_for_another_certificate_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (cert_a, _) = load_or_generate_cert_pair(
+        &dir.path().join("a.cert"),
+        &dir.path().join("a.key"),
+        &[],
+        Curve::P521,
+    )
+    .expect("pair a");
+    let (_, key_b) = load_or_generate_cert_pair(
+        &dir.path().join("b.cert"),
+        &dir.path().join("b.key"),
+        &[],
+        Curve::P521,
+    )
+    .expect("pair b");
+    let err = dcroxide_node::rpcrun::tls_server_config(&cert_a, &key_b, None)
+        .expect_err("a key for another certificate must not build");
+    assert!(
+        err.contains("unable to build the RPC TLS configuration"),
+        "got: {err}"
+    );
+}
+
+/// A SEC1 private key rewritten by `edit`, as PEM: the P-521 pair the port
+/// generates, its `ECPrivateKey` bytes changed before re-encoding.
+fn p521_pair_with_edited_key(edit: impl Fn(&[u8]) -> Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+    use rustls::pki_types::pem::PemObject;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (cert_pem, key_pem) = load_or_generate_cert_pair(
+        &dir.path().join("rpc.cert"),
+        &dir.path().join("rpc.key"),
+        &[],
+        Curve::P521,
+    )
+    .expect("generate a P-521 pair");
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem).expect("parse key");
+    let der = key.secret_der();
+    // SEQUENCE (long form, one length byte), INTEGER 1, OCTET STRING of 66.
+    assert_eq!(&der[..2], &[0x30, 0x81], "a long-form SEQUENCE");
+    assert_eq!(
+        &der[3..8],
+        &[0x02, 0x01, 0x01, 0x04, 0x42],
+        "version 1, a 66-byte scalar"
+    );
+    let edited = edit(der);
+    let b64 = dcroxide_rpc::http::base64_std_encode(&edited);
+    let mut pem = String::from("-----BEGIN EC PRIVATE KEY-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+        pem.push('\n');
+    }
+    pem.push_str("-----END EC PRIVATE KEY-----\n");
+    (cert_pem, pem.into_bytes())
+}
+
+/// Go drops zero padding in front of a private scalar
+/// (`crypto/x509/sec1.go:115-122`), so dcrd serves a P-521 key whose scalar
+/// is 67 bytes with a leading zero, and so does the port.
+#[test]
+fn a_zero_padded_p521_key_serves_as_it_does_in_dcrd() {
+    let (cert_pem, key_pem) = p521_pair_with_edited_key(|der| {
+        let len = der[2]
+            .checked_add(1)
+            .expect("the key stays under 256 bytes");
+        let mut out = vec![0x30, 0x81, len, 0x02, 0x01, 0x01, 0x04, 0x43, 0x00];
+        out.extend_from_slice(&der[8..]);
+        out
+    });
+    dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, None)
+        .expect("a zero-padded P-521 scalar serves");
+}
+
+/// Go refuses an `ECPrivateKey` whose version is not 1
+/// (`crypto/x509/sec1.go:98-100`), so dcrd will not load the pair, and
+/// neither does the port.
+#[test]
+fn a_p521_key_with_an_unknown_version_is_refused_as_in_dcrd() {
+    let (cert_pem, key_pem) = p521_pair_with_edited_key(|der| {
+        let mut out = der.to_vec();
+        out[5] = 0x02;
+        out
+    });
+    let err = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, None)
+        .expect_err("a version 2 key must not load");
+    assert!(
+        err.contains("unable to build the RPC TLS configuration"),
+        "got: {err}"
+    );
 }
 
 /// And P-256, the default, is unaffected.
@@ -285,9 +365,7 @@ fn a_p256_key_still_builds() {
 }
 
 /// `tls_curve` stays a faithful port of dcrd's `tlsCurve`, which knows
-/// both curves. The refusal lives one level up, at the validation dcrd
-/// performs in `loadConfig` (`config.go:1344`), so the divergence is in
-/// one place rather than smeared through the mapping.
+/// both curves.
 #[test]
 fn the_curve_mapping_still_matches_dcrd() {
     assert_eq!(
@@ -301,12 +379,11 @@ fn the_curve_mapping_still_matches_dcrd() {
     assert!(dcroxide_node::config::tls_curve("P-384").is_err());
 }
 
-/// Loading a configuration with `--tlscurve=P-521` fails, so an operator
-/// is told at startup rather than watching the RPC listener fail with a
-/// message about key formats. dcrd accepts this configuration; refusing
-/// it is the divergence recorded in PARITY.
+/// Loading a configuration with `--tlscurve=P-521` succeeds, as it does in
+/// dcrd, whose `loadConfig` accepts every curve `tlsCurve` maps
+/// (`config.go:1344`).
 #[test]
-fn loading_a_p521_configuration_fails() {
+fn loading_a_p521_configuration_succeeds() {
     let home = tempfile::tempdir().expect("temp home");
     let env = ConfigEnv {
         default_home_dir: home.path().to_string_lossy().into_owned(),
@@ -318,24 +395,7 @@ fn loading_a_p521_configuration_fails() {
     };
 
     let args = vec!["dcroxide".to_string(), "--tlscurve=P-521".to_string()];
-    match load_config_from_argv(&args, &env) {
-        Ok(_) => panic!("--tlscurve=P-521 must not load"),
-        Err(e) => {
-            assert!(
-                e.contains("P-521"),
-                "the error must name the curve, got: {e}"
-            );
-            assert!(
-                e.contains("tlscurve"),
-                "and the option, so it is actionable, got: {e}"
-            );
-        }
+    if let Err(e) = load_config_from_argv(&args, &env) {
+        panic!("--tlscurve=P-521 loads in dcrd and must load here: {e}");
     }
-
-    // The default is unaffected.
-    let args = vec!["dcroxide".to_string(), "--tlscurve=P-256".to_string()];
-    assert!(
-        load_config_from_argv(&args, &env).is_ok(),
-        "P-256 still loads"
-    );
 }

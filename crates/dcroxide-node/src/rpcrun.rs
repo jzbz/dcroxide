@@ -1490,6 +1490,141 @@ pub fn reloadable_tls_config(
     }))
 }
 
+/// The process-wide generator ([`dcroxide_crypto::rand`]) as the random
+/// source a hedged ECDSA signature draws from.
+///
+/// A signature per TLS handshake is a peer-paced draw, which this crate
+/// keeps off the kernel (see `tests/entropy_policy.rs`); the global
+/// generator cannot fail once seeded.  It produces keystream by XOR, so
+/// every buffer is zeroed before the draw.
+struct ProcessRng;
+
+impl p521::ecdsa::signature::rand_core::TryRng for ProcessRng {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut buf = [0u8; 4];
+        dcroxide_crypto::rand::read(&mut buf);
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(dcroxide_crypto::rand::uint64())
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        dst.fill(0);
+        dcroxide_crypto::rand::read(dst);
+        Ok(())
+    }
+}
+
+impl p521::ecdsa::signature::rand_core::TryCryptoRng for ProcessRng {}
+
+/// A P-521 RPC key the TLS server signs handshakes with.
+///
+/// dcrd serves whatever pair `--tlscurve` produced, P-521 included: Go
+/// offers `ECDSAWithP521AndSHA512` by default (`crypto/tls/defaults.go:63`)
+/// and in TLS 1.3 selects exactly that scheme for a P-521 key
+/// (`crypto/tls/auth.go:227`).  In TLS 1.2 Go signs with the first ECDSA
+/// hash the client lists instead (`:211-219`, `:290-296`), while this key
+/// signs with SHA-512 in both versions; PARITY records the difference.
+/// rustls's `ring` provider cannot load the key
+/// (`rustls/src/crypto/ring/sign.rs:45-65`), but a certified key may carry
+/// any [`rustls::sign::SigningKey`], so this one signs with `p521`.
+///
+/// Each signature is RFC 6979 with 66 bytes from [`ProcessRng`] mixed in
+/// as additional data (`ecdsa-0.17.0/src/signing.rs:225`, reaching
+/// `hazmat.rs:102`): the nonce stays safe if the draw is weak, and still
+/// differs between signatures of the same transcript.
+struct P521SigningKey {
+    key: Arc<p521::ecdsa::SigningKey>,
+    spki: rustls::pki_types::SubjectPublicKeyInfoDer<'static>,
+}
+
+impl std::fmt::Debug for P521SigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("P521SigningKey")
+    }
+}
+
+impl P521SigningKey {
+    /// The signing key for `key` when it is a P-521 key, read with the
+    /// certificate tooling's parser, which takes the two EC forms Go's
+    /// `tls.X509KeyPair` accepts: SEC 1 `EC PRIVATE KEY` and PKCS#8
+    /// `PRIVATE KEY`.  Any other key, or one that parser refuses, is `None`
+    /// and goes to rustls, which reports on it as it does for every other
+    /// curve.
+    fn from_key_der(key: &rustls::pki_types::PrivateKeyDer<'_>) -> Option<P521SigningKey> {
+        let block_type = match key {
+            rustls::pki_types::PrivateKeyDer::Sec1(_) => "EC PRIVATE KEY",
+            rustls::pki_types::PrivateKeyDer::Pkcs8(_) => "PRIVATE KEY",
+            _ => return None,
+        };
+        let Ok(dcroxide_certgen::gentool::ToolKeyPair::P521(key)) =
+            dcroxide_certgen::gentool::parse_private_key(block_type, key.secret_der())
+        else {
+            return None;
+        };
+        let point = key.verifying_key().to_sec1_point(false);
+        let spki = rustls::sign::public_key_to_spki(
+            &rustls::pki_types::alg_id::ECDSA_P521,
+            point.as_bytes(),
+        );
+        Some(P521SigningKey {
+            key: Arc::new(key),
+            spki,
+        })
+    }
+}
+
+impl rustls::sign::SigningKey for P521SigningKey {
+    fn choose_scheme(
+        &self,
+        offered: &[rustls::SignatureScheme],
+    ) -> Option<Box<dyn rustls::sign::Signer>> {
+        // The one scheme this key signs with, in both versions.  Go picks it
+        // for a P-521 key in TLS 1.3 and takes the client's first ECDSA hash
+        // in TLS 1.2 (see PARITY).
+        offered
+            .contains(&rustls::SignatureScheme::ECDSA_NISTP521_SHA512)
+            .then(|| Box::new(P521Signer(Arc::clone(&self.key))) as Box<dyn rustls::sign::Signer>)
+    }
+
+    fn public_key(&self) -> Option<rustls::pki_types::SubjectPublicKeyInfoDer<'_>> {
+        Some(self.spki.clone())
+    }
+
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        rustls::SignatureAlgorithm::ECDSA
+    }
+}
+
+/// One handshake's signer for a [`P521SigningKey`].
+struct P521Signer(Arc<p521::ecdsa::SigningKey>);
+
+impl std::fmt::Debug for P521Signer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("P521Signer")
+    }
+}
+
+impl rustls::sign::Signer for P521Signer {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+        use p521::ecdsa::signature::RandomizedSigner;
+        // ASN.1 DER, the encoding TLS carries ECDSA signatures in.
+        let signature: p521::ecdsa::DerSignature = self
+            .0
+            .try_sign_with_rng(&mut ProcessRng, message)
+            .map_err(|e| rustls::Error::General(format!("P-521 signing failed: {e}")))?;
+        Ok(signature.as_bytes().to_vec())
+    }
+
+    fn scheme(&self) -> rustls::SignatureScheme {
+        rustls::SignatureScheme::ECDSA_NISTP521_SHA512
+    }
+}
+
 /// Build the rustls server configuration from the PEM certificate
 /// pair (dcrd loading `rpc.cert`/`rpc.key` into its `tls.Config`).
 ///
@@ -1500,21 +1635,6 @@ pub fn reloadable_tls_config(
 /// certificate chaining to those roots, and a file holding no usable
 /// certificate is a hard startup error rather than a silently
 /// unauthenticated endpoint.
-/// Whether a private key's DER names the secp521r1 curve.
-///
-/// `1.3.132.0.35`, as it appears in the parameters of a SEC1
-/// `ECPrivateKey` and in the algorithm identifier of a PKCS#8 one. The
-/// OID is searched for rather than parsed out: its DER encoding is
-/// seven self-delimiting bytes that cannot occur by accident in a key
-/// this short, and a real DER walk here would be a parser to maintain
-/// for a single yes-or-no question.
-fn p521_key(key_der: &[u8]) -> bool {
-    const SECP521R1_OID_DER: &[u8] = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23];
-    key_der
-        .windows(SECP521R1_OID_DER.len())
-        .any(|window| window == SECP521R1_OID_DER)
-}
-
 fn build_server_config(
     cert_pem: &[u8],
     key_pem: &[u8],
@@ -1527,9 +1647,8 @@ fn build_server_config(
     // since rustls refuses to guess when two are present.
     //
     // The choice has a visible consequence: ring signs with P-256 and
-    // P-384 only (`rustls/src/crypto/ring/sign.rs:48-57`), so a P-521
-    // key cannot serve, which is why [`p521_key`] exists and why
-    // `--tlscurve=P-521` is refused during configuration.  See PARITY.
+    // P-384 only (`rustls/src/crypto/ring/sign.rs:45-65`), so a P-521
+    // key is served around the provider, through [`P521SigningKey`].
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<_, _>>()
@@ -1558,24 +1677,22 @@ fn build_server_config(
         }
         None => rustls::ServerConfig::builder().with_no_client_auth(),
     };
-    // Say what is actually wrong before rustls says something that is
-    // not.  A P-521 key parses as PEM and as SEC1, so it reaches
-    // `with_single_cert`, which rejects it with "failed to parse private
-    // key as RSA, ECDSA, or EdDSA" -- a message that points at the
-    // format when the format is fine and the curve is the problem.  The
-    // pair is reachable without `--tlscurve=P-521`: dcrd generates one
-    // for the same paths, and an older dcroxide did too.
-    if p521_key(key.secret_der()) {
-        return Err(
-            "the RPC key is on the P-521 curve, which the RPC server's TLS \
-             implementation cannot sign with; delete the certificate and key \
-             to regenerate them on P-256"
-                .to_string(),
-        );
-    }
-    let mut config = builder
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("unable to build the RPC TLS configuration: {e}"))?;
+    // A P-521 key never reaches `with_single_cert`, whose only path to a
+    // key is the provider's parser (`CertifiedKey::from_der`,
+    // `crypto/signer.rs:159-174`), where ring refuses the curve.  The
+    // certified key is built by hand instead, and `keys_match` is the
+    // same certificate-against-key check `from_der` makes.
+    let mut config = if let Some(p521_key) = P521SigningKey::from_key_der(&key) {
+        let certified = rustls::sign::CertifiedKey::new(certs, Arc::new(p521_key));
+        certified
+            .keys_match()
+            .map_err(|e| format!("unable to build the RPC TLS configuration: {e}"))?;
+        builder.with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(certified)))
+    } else {
+        builder
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("unable to build the RPC TLS configuration: {e}"))?
+    };
 
     // Turn off stateful session resumption, which Go's server does not
     // have and rustls enables by default.

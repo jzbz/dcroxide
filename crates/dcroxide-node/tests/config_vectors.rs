@@ -77,16 +77,12 @@ struct Scenario {
 /// contain, so it is visible in the harness rather than hidden in a
 /// rewritten expectation.
 ///
-/// Each entry needs a PARITY entry to go with it.
-fn deliberate_divergence(name: &str) -> Option<&'static str> {
-    match name {
-        // PARITY: "`--tlscurve=P-521` is refused where dcrd accepts it".
-        // rustls's ring provider signs P-256 and P-384 only, so accepting
-        // the flag would only defer the failure to listener setup, where
-        // it reads as a key-format problem.
-        "tlscurve p521" => Some("P-521"),
-        _ => None,
-    }
+/// Each entry needs a PARITY entry to go with it. There are none at
+/// present: the last, `--tlscurve=P-521`, closed when the RPC server
+/// learned to sign with a P-521 key, and its row is compared against
+/// dcrd like every other.
+fn deliberate_divergence(_name: &str) -> Option<&'static str> {
+    None
 }
 
 #[test]
@@ -295,9 +291,9 @@ fn generated_config_file_is_not_readable_by_other_users() {
     assert!(body.lines().any(|l| l.starts_with("rpcpass=")));
 }
 
-/// A `dcrd.conf` left behind world-readable — by an older dcroxide, by
-/// an editor, by a tarball unpacked with a lax umask — must be
-/// restricted before the fresh `rpcpass` is written into it, not after.
+/// A `dcrd.conf` left behind world-readable — by an editor, by a
+/// tarball unpacked with a lax umask — must be restricted before the
+/// fresh `rpcpass` is written into it, not after.
 /// `open(2)` only applies its mode when it creates the file, so this is
 /// a distinct path from the test above.
 #[cfg(unix)]

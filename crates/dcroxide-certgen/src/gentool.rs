@@ -729,38 +729,55 @@ fn parse_time(tag: u8, content: &[u8]) -> Result<i64, String> {
 }
 
 /// The curve OIDs the EC key loader recognizes.
+///
+/// The scalar is normalized as Go's `x509` does before building the key
+/// (`crypto/x509/sec1.go:115-127`): zero padding past the field size is
+/// dropped and any other excess refused, and a short scalar is left-padded.
 fn ec_key_from_scalar(curve_oid: &[u8], scalar: &[u8]) -> Result<ToolKeyPair, String> {
     let p256_oid = der::oid(&[1, 2, 840, 10045, 3, 1, 7]);
     let p384_oid = der::oid(&[1, 3, 132, 0, 34]);
     let p521_oid = der::oid(&[1, 3, 132, 0, 35]);
-    if curve_oid == &p256_oid[..] {
-        Ok(ToolKeyPair::P256(
-            p256::ecdsa::SigningKey::from_slice(scalar).map_err(|e| e.to_string())?,
-        ))
+    let size = if curve_oid == &p256_oid[..] {
+        32
     } else if curve_oid == &p384_oid[..] {
-        Ok(ToolKeyPair::P384(
-            p384::ecdsa::SigningKey::from_slice(scalar).map_err(|e| e.to_string())?,
-        ))
+        48
     } else if curve_oid == &p521_oid[..] {
-        Ok(ToolKeyPair::P521(
-            p521::ecdsa::SigningKey::from_slice(scalar).map_err(|e| e.to_string())?,
-        ))
+        66
     } else {
-        Err("tls: failed to parse private key".to_string())
+        return Err("tls: failed to parse private key".to_string());
+    };
+    let mut scalar = scalar;
+    while scalar.len() > size {
+        match scalar.split_first() {
+            Some((0, rest)) => scalar = rest,
+            _ => return Err("x509: invalid private key length".to_string()),
+        }
     }
+    let mut padded = vec![0u8; size];
+    padded[size - scalar.len()..].copy_from_slice(scalar);
+    let invalid = |_| "invalid elliptic curve private key value".to_string();
+    Ok(match size {
+        32 => ToolKeyPair::P256(p256::ecdsa::SigningKey::from_slice(&padded).map_err(invalid)?),
+        48 => ToolKeyPair::P384(p384::ecdsa::SigningKey::from_slice(&padded).map_err(invalid)?),
+        _ => ToolKeyPair::P521(p521::ecdsa::SigningKey::from_slice(&padded).map_err(invalid)?),
+    })
 }
 
 /// Parse a private key from its PEM block (PKCS#8 `PRIVATE KEY` or
 /// SEC 1 `EC PRIVATE KEY`, the forms Go's `tls.X509KeyPair` accepts
 /// that the Decred tools emit).
-fn parse_private_key(block_type: &str, key_der: &[u8]) -> Result<ToolKeyPair, String> {
+pub fn parse_private_key(block_type: &str, key_der: &[u8]) -> Result<ToolKeyPair, String> {
     let parse_err = || "tls: failed to parse private key".to_string();
     if block_type == "EC PRIVATE KEY" {
         // SEC 1 ECPrivateKey with the [0] curve parameters inside.
         let mut r = Reader::new(key_der);
         let (seq, _) = r.expect(0x30)?;
         let mut r = Reader::new(seq);
-        r.expect(0x02)?;
+        // Go refuses any version but 1 (`crypto/x509/sec1.go:98-100`).
+        let (version, _) = r.expect(0x02)?;
+        if version != [1] {
+            return Err("x509: unknown EC private key version".to_string());
+        }
         let (scalar, _) = r.expect(0x04)?;
         let (params, _) = r.expect(0xa0)?;
         return ec_key_from_scalar(params, scalar);
@@ -784,7 +801,10 @@ fn parse_private_key(block_type: &str, key_der: &[u8]) -> Result<ToolKeyPair, St
         let mut inner = Reader::new(key_octets);
         let (ec_seq, _) = inner.expect(0x30)?;
         let mut inner = Reader::new(ec_seq);
-        inner.expect(0x02)?;
+        let (version, _) = inner.expect(0x02)?;
+        if version != [1] {
+            return Err("x509: unknown EC private key version".to_string());
+        }
         let (scalar, _) = inner.expect(0x04)?;
         ec_key_from_scalar(&curve, scalar)
     } else if alg_oid == ed_oid {
