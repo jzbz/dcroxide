@@ -26,7 +26,7 @@ jobs:
     name: rustfmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # No toolchain action: rust-toolchain.toml names the version and its
       # components, and duplicating it here is how the two drift apart.
       # Installing before the cache step keeps the cache key on the right rustc.
@@ -45,7 +45,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: stable
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -66,10 +66,10 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Toolchain comes from rust-toolchain.toml (see the lint job).
       - run: rustup toolchain install
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.24"
           cache-dependency-path: tools/oracle/go.sum
@@ -99,14 +99,14 @@ jobs:
       # A missing binary must fail this job rather than skip its tests.
       DCROXIDE_REQUIRE_DCRD: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.25"
       - name: Cache the dcrd binary
         id: dcrd-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/dcrd-bin
           key: dcrd-${{ env.DCRD_COMMIT }}-${{ runner.os }}
@@ -132,7 +132,7 @@ jobs:
     name: cargo-deny (licenses, advisories, sources, bans)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   docs:
@@ -144,7 +144,7 @@ jobs:
     env:
       RUSTDOCFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --no-deps
@@ -156,7 +156,7 @@ jobs:
     # spec artifacts. _typos.toml carries the deliberate exceptions —
     # dcrd's own typos are reproduced, not corrected.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: crate-ci/typos@v1.49.0
 
   no-std:
@@ -187,7 +187,7 @@ jobs:
     # its own: 4.3.0 builds without `std` only when `std` is off and its
     # `experimental-api-5` preview is on (`build.rs:5-13`).
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install
       - run: rustup target add x86_64-unknown-none
       - uses: Swatinem/rust-cache@v2
@@ -206,7 +206,7 @@ jobs:
       # the build would fail on nightly-only flags.
       RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
@@ -222,7 +222,7 @@ jobs:
       # destroyed, so nobody can reproduce or minimize it.
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts-smoke
           path: fuzz/artifacts/
@@ -236,7 +236,7 @@ jobs:
       # See fuzz-smoke: the root pin reaches into fuzz/ and must be overridden.
       RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - run: cargo install cargo-fuzz --locked
       - name: Run every fuzz target for 10 minutes
@@ -248,7 +248,7 @@ jobs:
       # noticed hours later, so the reproducer has to outlive the runner.
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts-nightly
           path: fuzz/artifacts/
