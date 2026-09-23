@@ -29,7 +29,8 @@ Every dcrd module dependency in `tools/oracle/go.mod` is pinned to the exact
 version required by dcrd `release-v2.1.5`'s `go.mod` — the parity target.
 Versions move only when the parity target moves.
 
-Rust tests build the oracle on demand (`go build` into `target/oracle/`) and
+Rust tests build the oracle on demand (`go build` into
+`<target-dir>/<profile>/oracle/`, found from the test binary's own path) and
 spawn it. Locally, a missing Go toolchain skips differential tests with a
 notice; in CI, `DCROXIDE_REQUIRE_ORACLE=1` turns a missing toolchain into a
 failure so differential coverage can never silently disappear.
@@ -70,6 +71,6 @@ dcrd binary at `452c1a6c` links. The remaining pins (`chainhash`, `chaincfg`,
 sources at that commit and stay on their release versions.
 
 Nothing about the mechanism changed: one Go binary, line-delimited JSON on
-stdin/stdout, built on demand into `target/oracle/`, with
+stdin/stdout, built on demand into the cargo target directory, with
 `DCROXIDE_REQUIRE_ORACLE=1` set in CI so a missing toolchain fails instead of
 skipping. The dcrd source tree is still not vendored as a submodule.

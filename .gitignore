@@ -6,7 +6,8 @@ fuzz/corpus
 fuzz/coverage
 Cargo.lock.orig
 
-# Go oracle build output (built into /target/oracle by the test harness)
+# Go oracle build output from a manual `go build` in tools/oracle (the test
+# harness builds into <target-dir>/<profile>/oracle instead)
 tools/oracle/dcrd-oracle
 tools/oracle/dcrd-oracle.exe
 # ... and the default name `go build ./...` produces when run in-dir

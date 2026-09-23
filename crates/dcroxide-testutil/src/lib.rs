@@ -112,7 +112,26 @@ fn repo_root() -> &'static Path {
         .expect("crate lives two levels below the repo root")
 }
 
-/// Build the oracle into `target/oracle/` and return the binary path.
+/// The directory the oracle is built into: `oracle/` in the running test
+/// binary's profile directory, `<target-dir>/<profile>/oracle/`.
+///
+/// Derived from the test binary's own location rather than the source tree,
+/// so the build lands wherever cargo's target directory is configured to be
+/// (`CARGO_TARGET_DIR`, `build.target-dir`) and `cargo clean` removes it.
+/// Test and bench harnesses run from `<profile>/deps`, one level down.
+fn oracle_dir() -> PathBuf {
+    let exe = env::current_exe().expect("locate the running test binary");
+    let mut dir = exe
+        .parent()
+        .expect("test binary lives in a directory")
+        .to_path_buf();
+    if dir.file_name().is_some_and(|name| name == "deps") {
+        dir.pop();
+    }
+    dir.join("oracle")
+}
+
+/// Build the oracle into [`oracle_dir`] and return the binary path.
 ///
 /// Multiple test binaries run concurrently and all build the oracle, so the
 /// build goes to a process-unique path first and is then atomically renamed
@@ -120,8 +139,8 @@ fn repo_root() -> &'static Path {
 /// cache makes the duplicate builds cheap).
 fn build_oracle() -> PathBuf {
     let root = repo_root();
-    let out_dir = root.join("target").join("oracle");
-    std::fs::create_dir_all(&out_dir).expect("create target/oracle");
+    let out_dir = oracle_dir();
+    std::fs::create_dir_all(&out_dir).expect("create the oracle build directory");
     let suffix = if cfg!(windows) { ".exe" } else { "" };
     let bin = out_dir.join(format!("dcrd-oracle{suffix}"));
     // Unique per process *and* per calling thread: tests within one binary
