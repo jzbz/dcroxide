@@ -308,12 +308,35 @@ impl UtxoView {
         block_index: u32,
         is_treasury_enabled: bool,
     ) {
+        self.add_tx_out_with_hash(
+            tx,
+            &tx.tx_hash(),
+            tx_out_idx,
+            block_height,
+            block_index,
+            is_treasury_enabled,
+        );
+    }
+
+    /// [`Self::add_tx_out`] with the transaction's hash supplied by a
+    /// caller that already has it (dcrd's `dcrutil.Tx` memoizes the
+    /// hash; the port passes it along instead of recomputing it).  An
+    /// out-of-range output index adds nothing, as in dcrd `AddTxOut`.
+    pub fn add_tx_out_with_hash(
+        &mut self,
+        tx: &MsgTx,
+        tx_hash: &Hash,
+        tx_out_idx: u32,
+        block_height: i64,
+        block_index: u32,
+        is_treasury_enabled: bool,
+    ) {
         if tx_out_idx >= tx.tx_out.len() as u32 {
             return;
         }
         self.add_tx_outs_internal(
             tx,
-            &tx.tx_hash(),
+            tx_hash,
             tx_out_idx,
             tx_out_idx + 1,
             block_height,
@@ -659,10 +682,9 @@ impl UtxoView {
     /// Queue an outpoint whose entry is missing from the view for a
     /// batched resolve (the `add` of dcrd's `ViewFilteredSet`:
     /// outpoints already in the view are skipped).  Duplicates within
-    /// a block are not filtered here — they are rare (only invalid
-    /// blocks or the in-flight index corner produce them), and both
-    /// [`Self::resolve_queued`] and the chain's batch fetch handle
-    /// them exactly like the old sequential resolve did.
+    /// a block are not filtered here: they only arise from invalid
+    /// blocks, and [`Self::resolve_queued`] writes the same backend
+    /// result for each copy, so a set and a list resolve alike.
     fn queue_missing(&self, needed: &mut Vec<OutPoint>, outpoint: &OutPoint) {
         if self.entries.contains_key(&key(outpoint)) {
             return;
@@ -670,10 +692,22 @@ impl UtxoView {
         needed.push(*outpoint);
     }
 
-    /// Resolve the queued outpoints in one batch and add the entries
-    /// that exist to the view, skipping any outpoint another entry
-    /// filled in the meantime (the resolve half of dcrd's
-    /// `fetchUtxosMain` over `UtxoCache.FetchEntries`).
+    /// Resolve the queued outpoints in one batch and write each result
+    /// into the view (the resolve half of dcrd's `fetchUtxosMain` over
+    /// `UtxoCache.FetchEntries`).
+    ///
+    /// The write is unconditional, as in dcrd: an entry that exists is
+    /// inserted over whatever the view holds, and a missing one
+    /// removes it (an absent entry is the port's form of dcrd's nil
+    /// entry).  The overwrite matters for a forward reference, an input
+    /// that spends an output of a transaction later in the same block:
+    /// it is queued because the output is not in the view yet, and a
+    /// later input that legitimately spends the same origin can then
+    /// add that output before the resolve runs.  dcrd resets it to the
+    /// backend's nil, so the forward reference fails with
+    /// `ErrMissingTxOut`; keeping the in-flight entry instead would let
+    /// the earlier transaction spend an output its origin re-adds as
+    /// unspent when it connects.
     fn resolve_queued(&mut self, resolver: &impl UtxoResolver, needed: &[OutPoint]) {
         if needed.is_empty() {
             return;
@@ -682,11 +716,13 @@ impl UtxoView {
         debug_assert_eq!(needed.len(), resolved.len(), "resolver batch size mismatch");
         for (outpoint, entry) in needed.iter().zip(resolved) {
             let k = key(outpoint);
-            if self.entries.contains_key(&k) {
-                continue;
-            }
-            if let Some(entry) = entry {
-                self.entries.insert(k, entry);
+            match entry {
+                Some(entry) => {
+                    self.entries.insert(k, entry);
+                }
+                None => {
+                    self.entries.remove(&k);
+                }
             }
         }
     }
@@ -712,17 +748,24 @@ impl UtxoView {
             for tx_in in &tx.tx_in {
                 let origin_hash = &tx_in.previous_out_point.hash;
                 if let Some(&in_flight_index) = tx_in_flight.get(&origin_hash.0) {
-                    // NOTE: dcrd compares the enumeration index of the
-                    // slice that skips the coinbase, so an input can
-                    // reference the output of the transaction at the
-                    // next index; reproduced exactly.
-                    // dcrd compares the coinbase-skipping slice index,
-                    // equivalent to i - 1 >= in_flight_index here.
+                    // Only a transaction earlier in the block may be
+                    // referenced.  dcrd compares the index of the
+                    // coinbase-skipping slice (`i >= inFlightIndex`),
+                    // which is one less than the block position used
+                    // here, so the two comparisons are the same rule.
                     if i > in_flight_index {
+                        // Add only the referenced output (dcrd
+                        // `AddTxOut(originTx, originIdx)`, since
+                        // 01208035).  Adding every output would also
+                        // mark unspent any sibling output a disapproved
+                        // parent's disconnect left spent in the view,
+                        // and it would keep such siblings out of the
+                        // fetch set, where dcrd resolves them to nil.
                         let origin_tx = &block.transactions[in_flight_index];
-                        self.add_tx_outs_with_hash(
+                        self.add_tx_out_with_hash(
                             origin_tx,
                             &regular_tx_hashes[in_flight_index],
+                            tx_in.previous_out_point.index,
                             height,
                             in_flight_index as u32,
                             is_treasury_enabled,

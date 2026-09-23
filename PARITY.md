@@ -72,8 +72,22 @@ observable.
   the *Per-peer outbound queue* row below from a divergence in kind into one in
   value and action; reconciling the two is a deliberate choice about honest
   peers on slow links, not a porting gap, and is still open.
-- **Not observable:** `01208035` narrows an in-flight utxo add from O(n) to
-  O(1) over outputs the port already adds singly; `efc7e3d9` and `ae4c5818`
+- **Ported late, after being misfiled here as not observable:** `01208035`
+  makes an in-flight utxo add cover only the referenced output
+  (`AddTxOut(originTx, originIdx)`) rather than every output of the origin
+  transaction. This ledger once claimed the port "already adds singly"; it
+  never did. `queue_regular_input_utxos` called `add_tx_outs_with_hash` for
+  the whole origin, and the difference decides acceptance: a disapproved
+  parent's disconnect leaves its outputs spent in the view, and re-adding a
+  re-mined transaction's unreferenced siblings marked them unspent again, so a
+  forward reference to one of them passed where dcrd fails it with
+  `ErrMissingTxOut`. The same review found `resolve_queued` keeping an entry
+  that a later in-flight add had filled after the outpoint was queued, where
+  dcrd's `UtxoCache.FetchEntries` overwrites every queued outpoint with the
+  backend result, so a forward reference whose origin a later transaction also
+  spends was accepted as well. Both now follow dcrd, pinned by
+  `tests/inflight_utxo.rs` (each case fails against the old code).
+- **Not observable:** `efc7e3d9` and `ae4c5818`
   stop a subsidy cache inserting duplicate intervals under concurrency, which
   cannot arise here because the port's cache is a `BTreeMap` with no parallel
   sorted-interval vector to grow; `085eb08c`
