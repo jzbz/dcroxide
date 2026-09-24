@@ -29,13 +29,19 @@ fn opt_hex(s: &str) -> Vec<u8> {
     if s == "-" { Vec::new() } else { unhex(s) }
 }
 
+/// The spent-by-zero-confirmation state bit (`UTXO_STATE_SPENT_BY_ZERO_CONF`).
+const STATE_SPENT_BY_ZERO_CONF: u8 = 1 << 2;
+
 /// Compare the view's entries and best hash against an emitted
-/// snapshot, consuming its rows from the iterator.
+/// snapshot, consuming its rows from the iterator.  When
+/// `unmarked_height` is set, entries created at that height are not
+/// compared on the spent-by-zero-confirmation bit.
 fn check_snapshot<'a>(
     view: &UtxoView,
     header: &[&str],
     lines: &mut impl Iterator<Item = &'a str>,
     tag: &str,
+    unmarked_height: Option<u32>,
 ) {
     let count: usize = header[1].parse().expect("count");
     let best = parse_hash(header[2]);
@@ -73,11 +79,11 @@ fn check_snapshot<'a>(
             f[7].parse::<u16>().expect("sv"),
             "{tag}: sver"
         );
-        assert_eq!(
-            entry.state_bits(),
-            f[8].parse::<u8>().expect("st"),
-            "{tag}: state {line}"
-        );
+        let mut want_state = f[8].parse::<u8>().expect("st");
+        if unmarked_height == Some(entry.block_height() as u32) {
+            want_state &= !STATE_SPENT_BY_ZERO_CONF;
+        }
+        assert_eq!(entry.state_bits(), want_state, "{tag}: state {line}");
         assert_eq!(
             entry.packed_flags_bits(),
             f[9].parse::<u8>().expect("fl"),
@@ -207,7 +213,7 @@ fn utxoview_vectors() {
                 parent = Some(blk);
             }
             "pstxos" => check_stxos(&parent_stxos, &f, &mut lines, "pstxos"),
-            "afterparent" => check_snapshot(&view, &f, &mut lines, "afterparent"),
+            "afterparent" => check_snapshot(&view, &f, &mut lines, "afterparent", None),
             "block" => {
                 let (blk, _) = MsgBlock::from_bytes(&unhex(f[1])).expect("block");
                 let parent = parent.as_ref().expect("parent first");
@@ -233,8 +239,18 @@ fn utxoview_vectors() {
                 block = Some(blk);
             }
             "stxos" => check_stxos(&stxos, &f, &mut lines, "stxos"),
-            "afterconnect" => check_snapshot(&view, &f, &mut lines, "afterconnect"),
-            "afterdisconnect" => check_snapshot(&view, &f, &mut lines, "afterdisconnect"),
+            // The child disapproves its parent, and a block that
+            // disapproves its parent does not mark zero-confirmation
+            // spends of its own outputs
+            // (`UtxoView::connect_regular_transaction`).
+            "afterconnect" => check_snapshot(
+                &view,
+                &f,
+                &mut lines,
+                "afterconnect",
+                block.as_ref().map(|b| b.header.height),
+            ),
+            "afterdisconnect" => check_snapshot(&view, &f, &mut lines, "afterdisconnect", None),
             other => panic!("unknown row tag {other}"),
         }
         // Disconnect after verifying the connect snapshot.

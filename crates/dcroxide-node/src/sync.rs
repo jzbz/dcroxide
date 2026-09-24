@@ -626,6 +626,7 @@ mod tests {
                 1,
                 1,
                 &mut std::collections::BTreeMap::new(),
+                true,
                 None,
                 false,
             )

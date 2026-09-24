@@ -473,7 +473,10 @@ impl UtxoView {
     /// Connect a regular tree transaction, tracking in-flight spends
     /// of outputs created earlier in the same block (dcrd
     /// `connectRegularTransaction`).  The caller supplies the
-    /// transaction's hash, computed once per block.
+    /// transaction's hash, computed once per block.  Spends of
+    /// in-flight outputs are marked as zero-confirmation spends only
+    /// when `mark_zero_conf` is set, which callers derive from whether
+    /// the block approves its parent.
     #[allow(clippy::too_many_arguments)]
     pub fn connect_regular_transaction(
         &mut self,
@@ -482,6 +485,7 @@ impl UtxoView {
         block_height: i64,
         block_index: u32,
         in_flight_tx: &mut BTreeMap<[u8; 32], u32>,
+        mark_zero_conf: bool,
         mut stxos: Option<&mut Vec<SpentTxOut>>,
         is_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
@@ -500,7 +504,8 @@ impl UtxoView {
             }
             entry.spend();
             // Mark spends of outputs created earlier in this block.
-            if let Some(&in_flight_idx) = in_flight_tx.get(&prev_out.hash.0)
+            if mark_zero_conf
+                && let Some(&in_flight_idx) = in_flight_tx.get(&prev_out.hash.0)
                 && block_index > in_flight_idx
             {
                 entry.state |= UTXO_STATE_SPENT_BY_ZERO_CONF;
@@ -527,6 +532,7 @@ impl UtxoView {
             "one hash per regular transaction"
         );
         let height = i64::from(block.header.height);
+        let mark_zero_conf = crate::validate::header_approves_parent(&block.header);
         let mut in_flight_tx: BTreeMap<[u8; 32], u32> = BTreeMap::new();
         for (i, (tx, tx_hash)) in block.transactions.iter().zip(regular_tx_hashes).enumerate() {
             self.connect_regular_transaction(
@@ -535,6 +541,7 @@ impl UtxoView {
                 height,
                 i as u32,
                 &mut in_flight_tx,
+                mark_zero_conf,
                 stxos.as_deref_mut(),
                 is_treasury_enabled,
             )?;

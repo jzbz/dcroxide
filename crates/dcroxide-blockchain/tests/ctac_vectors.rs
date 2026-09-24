@@ -101,6 +101,7 @@ fn ctac_vectors() {
                     height,
                     Hash::default(),
                     voters,
+                    1,
                     &prev_header,
                     &txs,
                     &tx_hashes,

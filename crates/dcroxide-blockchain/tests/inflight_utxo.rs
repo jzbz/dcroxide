@@ -128,6 +128,7 @@ fn op(tx: &MsgTx, index: u32) -> OutPoint {
 fn block(height: u32, transactions: Vec<MsgTx>) -> MsgBlock {
     let (mut header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
     header.height = height;
+    header.vote_bits = 1; // approves its parent
     MsgBlock {
         header,
         transactions,
@@ -154,6 +155,7 @@ fn connect(
         i64::from(block.header.height),
         Hash::default(),
         0,
+        block.header.vote_bits,
         &prev_header,
         &block.transactions,
         &hashes,
@@ -297,7 +299,8 @@ fn disapproved_parent_output_stays_spent_for_a_forward_reference() {
     let (mut view, t1, resolver) = disapproved_parent();
     let t0 = tx(vec![input(op(&t1, 1), OUT_VALUE, HEIGHT, 2)], 1);
     let t2 = tx(vec![input(op(&t1, 0), OUT_VALUE, HEIGHT, 2)], 1);
-    let block = block(HEIGHT, vec![coinbase(HEIGHT, 0), t0, t1.clone(), t2]);
+    let mut block = block(HEIGHT, vec![coinbase(HEIGHT, 0), t0, t1.clone(), t2]);
+    block.header.vote_bits = 0;
     assert_missing_tx_out(
         connect(&mut view, &block, &resolver),
         "forward reference to a disapproved parent's output",
@@ -310,6 +313,7 @@ fn disapproved_parent_transaction_can_be_reincluded() {
     // the block is valid.
     let (mut view, t1, resolver) = disapproved_parent();
     let t2 = tx(vec![input(op(&t1, 0), OUT_VALUE, HEIGHT, 1)], 1);
-    let block = block(HEIGHT, vec![coinbase(HEIGHT, 0), t1, t2]);
+    let mut block = block(HEIGHT, vec![coinbase(HEIGHT, 0), t1, t2]);
+    block.header.vote_bits = 0;
     connect(&mut view, &block, &resolver).expect("re-included transaction connects");
 }
