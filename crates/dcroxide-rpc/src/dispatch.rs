@@ -503,21 +503,27 @@ pub fn standard_cmd_result<C: RpcChain>(
 /// A new marshalled JSON-RPC response for the given parameters (dcrd
 /// `createMarshalledReply`; every error the port produces is already
 /// an RPC error, so the internal-error conversion for other kinds
-/// does not arise).
+/// does not arise).  It fails where dcrd's `dcrjson.MarshalResponse`
+/// does, with the Go error text: a result `json.Marshal` refuses -- a
+/// non-finite float, such as getvoteinfo's `0/0` choice progress -- or
+/// an id of an invalid type.  Every caller drops the reply on failure,
+/// as dcrd's do.
 pub fn create_marshalled_reply(
     rpc_version: &str,
     id: &RpcId,
     result: Option<(&GoType, &GoValue)>,
     reply_err: Option<&RPCError>,
-) -> Result<String, dcroxide_dcrjson::DcrjsonError> {
-    let marshalled = result.map(|(typ, value)| gojson::encode(typ, value));
-    marshal_response(rpc_version, id, marshalled.as_deref(), reply_err)
+) -> Result<String, String> {
+    let marshalled = match result {
+        Some((typ, value)) => Some(gojson::try_encode(typ, value).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    marshal_response(rpc_version, id, marshalled.as_deref(), reply_err).map_err(|e| e.to_string())
 }
 
 /// Parse the request, execute it, and return the marshalled response;
-/// `None` when the request is a notification (dcrd `processRequest`;
-/// marshalling failures, which dcrd logs and drops, cannot occur for
-/// the id types accepted here).
+/// `None` when the request is a notification, or when the reply fails
+/// to marshal, which dcrd logs and drops (dcrd `processRequest`).
 pub fn process_request<C: RpcChain>(
     server: &Server<C>,
     jsonrpc: &str,

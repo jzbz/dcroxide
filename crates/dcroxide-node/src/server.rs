@@ -1,19 +1,31 @@
 // SPDX-License-Identifier: ISC
 //! The P2P server's decision core (the ported slices of dcrd's
-//! `server.go`): the bounded network address submission cache fed by
-//! outbound peers, the best-suggestion local address resolution, the
-//! host-to-network-address conversion, the wire/address-manager
-//! conversion and service helpers, the serverPeer address relay,
-//! ban, and abuse-control handlers, the version handshake, the peer
-//! state maps and admission, and the relay and broadcast decisions.
-//! The chain-backed handlers, the mining and mix handlers, and the
-//! server lifecycle arrive with later slices (the rebroadcast
-//! machinery lives in the `rebroadcast` module).
+//! `server.go`): the external address candidate cache and the local
+//! address resolution, the host-to-network-address conversion, the
+//! wire/address-manager conversion and service helpers, the serverPeer
+//! address relay, ban, and abuse-control handlers, the version
+//! handshake decisions, the getdata intake gates, send pipeline and
+//! per-item serve decisions, the getinitstate and getminingstate
+//! handlers, and the relay decisions.  The daemon calls them from the
+//! per-peer handlers and the getdata serve worker in `dispatch` and
+//! from connection setup in `runtime`; the rebroadcast machinery lives
+//! in the `rebroadcast` module.
+//!
+//! A few items here are decision models the daemon never calls:
+//! [`PeerState`] with [`handle_add_peer`] and [`done_peer`], the batch
+//! fold [`serve_get_data`], [`should_broadcast_to_peer`] and
+//! [`on_ver_ack`].  The daemon keeps no server peer-state maps: peer
+//! registration and teardown happen in `dispatch::ServerPeerHandler`'s
+//! `on_connected` and `on_disconnected`, the connection limits in the
+//! connection manager, and the post-handshake sendheaders in
+//! `peerloop`.  The models are replayed only by the `srv*_vectors`
+//! tests, so changing one changes nothing the daemon does.
 
 // Bounded cache and majority arithmetic mirroring Go.
 #![allow(clippy::arithmetic_side_effects)]
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 
 use dcroxide_addrmgr::{
     AddrManager, AddressPriority, NetAddress, NetAddressReach, NetAddressType, encode_host,
@@ -791,6 +803,11 @@ pub struct ServerPeerAddrState {
     /// Whether the peer is exempt from banning (dcrd
     /// `isWhitelisted`).
     pub is_whitelisted: bool,
+    /// The peer as dcrd's misbehavior log lines print it (`Peer.String`:
+    /// the remote address and the connection direction).  The server
+    /// handler sets it; it is empty in the pure-function vectors, which
+    /// check decisions rather than log lines.
+    pub peer_label: String,
 }
 
 impl ServerPeerAddrState {
@@ -804,6 +821,7 @@ impl ServerPeerAddrState {
             addrs_sent: false,
             ban_score: std::sync::Arc::default(),
             is_whitelisted,
+            peer_label: String::new(),
         }
     }
 
@@ -910,14 +928,16 @@ pub fn push_addr_msg<E: dcroxide_peer::PeerEnv>(
 }
 
 /// Increase the peer's ban score, returning whether the peer is now
-/// banned (dcrd `serverPeer.addBanScore`); dcrd's warning logs are
-/// daemon output.  The caller performs the ban itself via
-/// [`ban_peer`] exactly as dcrd's `BanPeer` does.
+/// banned (dcrd `serverPeer.addBanScore`), and log dcrd's warning once
+/// the score passes half the threshold.  The caller performs the ban
+/// itself via [`ban_peer`] exactly as dcrd's `BanPeer` does, with the
+/// reason "ban score exceeds threshold".
 #[allow(clippy::too_many_arguments)] // Mirrors dcrd's config surface.
 pub fn add_ban_score(
     state: &mut ServerPeerAddrState,
     persistent: u32,
     transient: u32,
+    reason: &str,
     disable_banning: bool,
     ban_threshold: u32,
     now_unix: i64,
@@ -928,19 +948,43 @@ pub fn add_ban_score(
         return false;
     }
 
+    // Nothing to do when the score is not being increased.
+    if transient == 0 && persistent == 0 {
+        return false;
+    }
+
     // dcrd 2.2 increments whitelisted peers' scores (visible through
-    // getpeerinfo) and only skips the ban itself; the zero-increase
-    // warning branch is gone.
+    // getpeerinfo) and only skips the ban itself.
     let warn_threshold = ban_threshold >> 1;
     let score = state
         .ban_score
         .lock()
         .expect("ban score poisoned")
         .increase_at(persistent, transient, now_unix);
-    if score > warn_threshold && score > ban_threshold && !state.is_whitelisted {
-        return true;
+    if score > warn_threshold {
+        crate::logging::warn("SRVR", &ban_score_warning(state, reason, score));
+
+        // Ban the peer once the threshold is exceeded unless it is
+        // whitelisted.
+        if score > ban_threshold && !state.is_whitelisted {
+            return true;
+        }
     }
     false
+}
+
+/// The warning dcrd's `addBanScore` logs once a peer's ban score passes
+/// half the ban threshold.
+pub fn ban_score_warning(state: &ServerPeerAddrState, reason: &str, score: u32) -> String {
+    let peer_str = if state.is_whitelisted {
+        "whitelisted peer"
+    } else {
+        "peer"
+    };
+    format!(
+        "Misbehaving {peer_str} {}: {reason} -- ban score increased to {score}",
+        state.peer_label
+    )
 }
 
 /// The observable outcome of banning a peer (dcrd
@@ -964,8 +1008,8 @@ pub enum BanPeerOutcome {
 }
 
 /// Ban the peer at the given address (dcrd `server.BanPeer`); the
-/// caller owns the banned-host map until the peer state slice
-/// lands.
+/// caller owns the banned-host map (the daemon's is
+/// `ServerContext::banned_hosts`).
 pub fn ban_peer(
     banned: &mut std::collections::BTreeMap<String, i64>,
     addr: &str,
@@ -985,10 +1029,32 @@ pub fn ban_peer(
     let Ok((host, _)) = split_host_port(addr) else {
         return BanPeerOutcome::DisconnectOnly;
     };
+    let host = strip_zone(&host).to_string();
 
-    let until_nanos = now_nanos + ban_duration_nanos;
+    // dcrd's `time.Now().Add(cfg.BanDuration)` cannot wrap: Go's
+    // `Time.Add` carries whole seconds in a 64-bit count from year 1 and
+    // saturates there, so even the largest duration `--banduration`
+    // accepts (about 292 years) lands in the future.  Unix nanoseconds
+    // top out in 2262 instead, so the sum saturates rather than wrapping
+    // to a past time that would lift the ban at once.
+    let until_nanos = now_nanos.saturating_add(ban_duration_nanos);
     banned.insert(host.clone(), until_nanos);
     BanPeerOutcome::Banned { host, until_nanos }
+}
+
+/// The host with any IPv6 `%zone` suffix removed.
+///
+/// Every host dcrd bans or checks against the whitelist comes from the
+/// address manager's `NetAddress`, which carries no zone: `BanPeer`
+/// splits `sp.Addr()`, the zone-free `NetAddress.String`, and
+/// `handleBannedConn` keys on `net.IP(remoteAddr.IP).String()`.  The
+/// daemon's inbound address string is Rust's `SocketAddr` rendering
+/// instead, which prints a link-local peer's interface scope as
+/// `[fe80::1%2]:9108`.  Dropping the zone keys a ban the way the
+/// pre-handshake check looks it up (`addr.ip().to_string()`) and lets
+/// the host parse against the whitelist.
+fn strip_zone(host: &str) -> &str {
+    host.split_once('%').map_or(host, |(ip, _)| ip)
 }
 
 /// The peer facts the getaddr handler consumes.
@@ -1041,7 +1107,8 @@ pub struct OnAddrFacts {
     /// address to stop early on concurrent disconnects; the
     /// synchronous port samples it once).
     pub connected: bool,
-    /// The peer's network address (dcrd `sp.NA()`).
+    /// The peer's remote address, the source the addresses are
+    /// credited to (dcrd `sp.remoteAddr`).
     pub peer_na: NetAddress,
 }
 
@@ -1122,24 +1189,35 @@ pub enum OnMemPoolOutcome {
 
 /// Handle a mempool request (dcrd `serverPeer.OnMemPool`): a
 /// decaying ban score increase prevents flooding, and the pool's
-/// transaction hashes become queued inventory.
+/// transaction hashes become queued inventory.  `tx_hashes` snapshots
+/// the pool and is only called once the ban score has been applied,
+/// so a flooding peer is banned without the pool being enumerated
+/// (dcrd's `addBanScore` returns before `TxDescs`, `server.go:1057`).
 pub fn on_mem_pool(
     state: &mut ServerPeerAddrState,
-    tx_hashes: &[dcroxide_chainhash::Hash],
+    tx_hashes: impl FnOnce() -> Vec<dcroxide_chainhash::Hash>,
     disable_banning: bool,
     ban_threshold: u32,
     now_unix: i64,
 ) -> OnMemPoolOutcome {
     // The score decays each minute to half of its value.
-    if add_ban_score(state, 0, 33, disable_banning, ban_threshold, now_unix) {
+    if add_ban_score(
+        state,
+        0,
+        33,
+        "mempool",
+        disable_banning,
+        ban_threshold,
+        now_unix,
+    ) {
         return OnMemPoolOutcome::Banned;
     }
 
-    let invs = tx_hashes
-        .iter()
+    let invs = tx_hashes()
+        .into_iter()
         .map(|hash| dcroxide_wire::InvVect {
             inv_type: dcroxide_wire::InvType::TX,
-            hash: *hash,
+            hash,
         })
         .collect();
     OnMemPoolOutcome::Inventory(invs)
@@ -1232,6 +1310,7 @@ pub fn on_not_found(
             state,
             20 * num_blocks,
             0,
+            &reason,
             disable_banning,
             ban_threshold,
             now_unix,
@@ -1246,6 +1325,7 @@ pub fn on_not_found(
             state,
             0,
             10 * num_txns,
+            &reason,
             disable_banning,
             ban_threshold,
             now_unix,
@@ -1260,6 +1340,7 @@ pub fn on_not_found(
             state,
             0,
             10 * num_mix_msgs,
+            &reason,
             disable_banning,
             ban_threshold,
             now_unix,
@@ -1482,8 +1563,11 @@ pub fn version_rejection_text(
     }
 }
 
-/// Handle a verack message (dcrd `serverPeer.OnVerAck`): request
-/// all block announcements via full headers.
+/// The message requesting all block announcements via full headers
+/// once the handshake is complete (dcrd `serverPeer.Run` queueing
+/// `wire.NewMsgSendHeaders()` before `AddPeer`; dcrd at the pin has no
+/// verack handler).  The daemon queues it in `peerloop` right after the
+/// handshake and does not call this.
 pub fn on_ver_ack() -> dcroxide_wire::Message {
     dcroxide_wire::Message::SendHeaders
 }
@@ -1499,7 +1583,7 @@ fn wire_ip_is_v4(ip: &[u8; 16]) -> bool {
 /// the live `*serverPeer`).
 #[derive(Debug, Clone)]
 pub struct PeerStateEntry {
-    /// The peer's network address (dcrd `sp.NA()`).
+    /// The peer's network address in wire form (dcrd `sp.remoteAddr`).
     pub na: dcroxide_wire::NetAddress,
     /// Whether the peer is inbound.
     pub inbound: bool,
@@ -1508,8 +1592,9 @@ pub struct PeerStateEntry {
 }
 
 /// The state of inbound, persistent, and outbound peers as well as
-/// banned peers and outbound groups (dcrd `peerState`).  dcrd guards
-/// the maps with a mutex; the port is single-threaded.
+/// banned peers (dcrd `peerState`).  A decision model only: the daemon
+/// keeps no such maps, and its banned hosts live in
+/// `ServerContext::banned_hosts` (see the module documentation).
 pub struct PeerState {
     /// The inbound peers by peer ID.
     pub inbound_peers: BTreeMap<i32, PeerStateEntry>,
@@ -1541,23 +1626,6 @@ impl PeerState {
     /// The count of all known peers (dcrd `count`).
     pub fn count(&self) -> i64 {
         (self.inbound_peers.len() + self.outbound_peers.len() + self.persistent_peers.len()) as i64
-    }
-
-    /// The number of connections with the given wire IP (dcrd
-    /// `connectionsWithIP`).
-    pub fn connections_with_ip(&self, ip: &[u8; 16]) -> i64 {
-        let mut total = 0;
-        for entry in self
-            .inbound_peers
-            .values()
-            .chain(self.outbound_peers.values())
-            .chain(self.persistent_peers.values())
-        {
-            if entry.na.ip == *ip {
-                total += 1;
-            }
-        }
-        total
     }
 }
 
@@ -1602,28 +1670,26 @@ pub fn handle_banned_conn(
 }
 
 /// The peer and configuration facts the admission handler consumes.
+/// The pin's `handleAddPeer` reads neither `sp.Addr()` nor the
+/// whitelist flag: the ban split and the whitelisted-inbound bypass of
+/// the connection limits that release-v2.1.5 did here moved to
+/// `handleBannedConn` and the connection manager.
 pub struct AddPeerFacts {
     /// Whether the server is shutting down.
     pub shutdown: bool,
     /// The peer ID (dcrd `sp.ID()`).
     pub id: i32,
-    /// The peer's address string (dcrd `sp.Addr()`).
-    pub addr: String,
     /// Whether the peer is inbound.
     pub inbound: bool,
     /// Whether the peer is a persistent outbound peer.
     pub persistent: bool,
-    /// Whether the peer is whitelisted.
-    pub is_whitelisted: bool,
-    /// The peer's network address (dcrd `sp.NA()`); the address
-    /// manager form of it is dcrd's `sp.remoteAddr`.
+    /// The peer's network address in wire form; its address manager
+    /// form is dcrd's `sp.remoteAddr`.
     pub na: dcroxide_wire::NetAddress,
     /// The remote peer's view of the local address from its version
     /// message, when one was stored (dcrd
     /// `sp.reportedLocalAddr.Load()`).
     pub peer_na: Option<dcroxide_wire::NetAddress>,
-    /// The single-IP connection limit (dcrd `cfg.MaxSameIP`).
-    pub max_same_ip: i64,
     /// The configuration the external address subsystem reads.
     pub external: ExternalAddrFacts,
 }
@@ -1633,13 +1699,10 @@ pub struct AddPeerOutcome {
     /// The rejection when the peer was refused and disconnected;
     /// dcrd returns false from `handleAddPeer`.
     pub rejected: Option<AddPeerReject>,
-    /// An expired ban entry for the host was removed.
-    pub unbanned: bool,
 }
-/// Add a peer to the server's state, categorising it, enforcing the
-/// connection limits, and considering the address it reported for the
-/// local connection as an external address candidate (dcrd
-/// `server.handleAddPeer`, `server.go:2625`).
+/// Add a peer to the server's state, categorising it and considering
+/// the address it reported for the local connection as an external
+/// address candidate (dcrd `server.handleAddPeer`, `server.go:2625`).
 ///
 /// Returns what was decided; dcrd returns a bool and disconnects the
 /// peer itself on a rejection.
@@ -1661,11 +1724,11 @@ pub fn handle_add_peer(
 
     // dcrd updates the address manager and requests known addresses
     // from the remote peer for outbound connections here, gated on
-    // `!cfg.SimNet && !cfg.RegNet && !sp.Inbound()`.  That block
-    // needs the sync manager and the local-address advertisement and
-    // arrives with the daemon wiring; note its gate reads the cfg
-    // booleans, while the discovery gate below reads the chain params
-    // name, and the two are independent.
+    // `!cfg.SimNet && !cfg.RegNet && !sp.Inbound()`.  That block needs
+    // the sync manager and the local-address advertisement, so the
+    // daemon runs it in `dispatch::ServerPeerHandler::on_connected`;
+    // note its gate reads the cfg booleans, while the discovery gate
+    // below reads the chain params name, and the two are independent.
 
     // Consider the address the remote peer reported for the local
     // connection as a potential external address candidate for the
@@ -1718,15 +1781,10 @@ pub struct DonePeerFacts {
     pub inbound: bool,
     /// Whether the peer is a persistent outbound peer.
     pub persistent: bool,
-    /// Whether the version handshake stored the peer's version.
-    pub version_known: bool,
-    /// Whether the peer acknowledged the local version.
-    pub ver_ack_received: bool,
-    /// The peer's network address; dcrd's is always set once the
-    /// handshake completed.
-    pub na: Option<dcroxide_wire::NetAddress>,
-    /// Whether a connection manager request is attached to the peer.
-    pub has_conn_req: bool,
+    /// The peer's network address in wire form; its address manager
+    /// form is dcrd's `sp.remoteAddr`, known from the moment the
+    /// connection is made.
+    pub na: dcroxide_wire::NetAddress,
     /// Whether the simulation or regression test network is active
     /// (dcrd `cfg.SimNet || cfg.RegNet`).
     pub sim_or_reg_net: bool,
@@ -1737,16 +1795,20 @@ pub struct DonePeerFacts {
 pub struct DonePeerOutcome {
     /// The peer was removed from its tracking map.
     pub removed: bool,
-    /// The connection manager was told to disconnect the request.
-    pub conn_mgr_disconnect: bool,
     /// The address manager recorded the connection time.
     pub marked_connected: bool,
 }
 
-/// Remove a disconnected peer from the server: update the tracking
-/// maps and outbound groups, release the connection manager request,
-/// and record the last seen time for negotiated untracked peers
-/// (dcrd `server.DonePeer`).
+/// Remove a disconnected peer from the server (dcrd 2.2
+/// `server.DonePeer`): a tracked peer is dropped from its map and
+/// nothing else happens; a peer that was never tracked has its last
+/// seen time recorded in the address manager, except on the simulation
+/// and regression test networks.
+///
+/// Release-v2.1.5 also released the connection manager request and
+/// gated the address manager update on a completed version exchange.
+/// The pin does neither: the connection manager tracks its own
+/// connections, and `sp.remoteAddr` is set before the handshake.
 pub fn done_peer(
     state: &mut PeerState,
     addr_mgr: &mut AddrManager,
@@ -1754,42 +1816,25 @@ pub fn done_peer(
 ) -> DonePeerOutcome {
     let mut outcome = DonePeerOutcome::default();
 
-    let tracked = if facts.persistent {
-        state.persistent_peers.contains_key(&facts.id)
+    let list = if facts.persistent {
+        &mut state.persistent_peers
     } else if facts.inbound {
-        state.inbound_peers.contains_key(&facts.id)
+        &mut state.inbound_peers
     } else {
-        state.outbound_peers.contains_key(&facts.id)
+        &mut state.outbound_peers
     };
-    if tracked {
-        if !facts.inbound && facts.has_conn_req {
-            outcome.conn_mgr_disconnect = true;
-        }
-        if facts.persistent {
-            state.persistent_peers.remove(&facts.id);
-        } else if facts.inbound {
-            state.inbound_peers.remove(&facts.id);
-        } else {
-            state.outbound_peers.remove(&facts.id);
-        }
+    if list.remove(&facts.id).is_some() {
         outcome.removed = true;
         return outcome;
     }
 
-    if facts.has_conn_req {
-        outcome.conn_mgr_disconnect = true;
-    }
-
-    // Update the address manager with the last seen time when the
-    // peer has acknowledged our version and has sent us its version
-    // as well; skipped on the simulation and regression test
-    // networks.
-    if !facts.sim_or_reg_net
-        && facts.ver_ack_received
-        && facts.version_known
-        && let Some(na) = &facts.na
-    {
-        let remote_addr = wire_to_addrmgr_net_address(na);
+    // Update the address manager with the last seen time.  This is
+    // skipped when running on the simulation and regression test
+    // networks since they are only intended to connect to specified
+    // peers and actively avoid advertising and connecting to
+    // discovered peers.
+    if !facts.sim_or_reg_net {
+        let remote_addr = wire_to_addrmgr_net_address(&facts.na);
         // A failure is logged and ignored.
         outcome.marked_connected = addr_mgr.connected(&remote_addr).is_ok();
     }
@@ -1797,27 +1842,12 @@ pub fn done_peer(
     outcome
 }
 
-/// Disconnect and remove the first peer in the list the comparison
-/// selects, returning it for the caller's when-found handling (dcrd
-/// `disconnectPeer` with its `whenFound` callback).  dcrd iterates
-/// the map in Go's random order; iteration here is in key order.
-pub fn disconnect_peer(
-    peer_list: &mut BTreeMap<i32, PeerStateEntry>,
-    compare: impl Fn(i32, &PeerStateEntry) -> bool,
-) -> Option<(i32, PeerStateEntry)> {
-    let id = peer_list
-        .iter()
-        .find(|(id, entry)| compare(**id, entry))
-        .map(|(id, _)| *id)?;
-    let entry = peer_list.remove(&id)?;
-    Some((id, entry))
-}
-
 /// Whether the peer address is within a whitelisted network (dcrd
 /// `connmgr.IsWhitelisted`); unsplittable addresses and unparseable
 /// hosts are not whitelisted.  The candidate is parsed through the
 /// `To4`-normalized form the address manager canonicalizes remote
-/// addresses into before dcrd hands them to the connection manager.
+/// addresses into before dcrd hands them to the connection manager,
+/// without the IPv6 zone that address never carries.
 pub fn is_whitelisted(whitelists: &[crate::config::IpPrefix], addr: &str) -> bool {
     if whitelists.is_empty() {
         return false;
@@ -1826,7 +1856,7 @@ pub fn is_whitelisted(whitelists: &[crate::config::IpPrefix], addr: &str) -> boo
     let Ok((host, _)) = split_host_port(addr) else {
         return false;
     };
-    let Some(ip) = crate::config::parse_ip_go(&host) else {
+    let Some(ip) = crate::config::parse_ip_go(strip_zone(&host)) else {
         return false;
     };
 
@@ -2063,12 +2093,19 @@ pub const MESSAGE_HEADER_SIZE: u64 = 24;
 /// sent-byte counter has advanced past the cumulative byte mark
 /// recorded when it was queued.
 ///
+/// The mark is exact only if each payload is charged its real framed
+/// size: every payload the output loop writes then advances the counter
+/// by at least its own charge, so once the queued payloads are written
+/// every mark has retired and the pipeline cannot wait on bytes that
+/// will never be written.
+///
 /// Bytes written for messages from other producers (relay inventory,
 /// pings, handshake traffic) also advance that counter, so a mark can
 /// retire slightly early; the resulting slack is bounded by whatever
-/// those producers wrote concurrently and never lets more than
-/// [`MAX_PENDING_SEND`] getdata payloads plus that slack sit unsent.
-/// The remaining hard bound is the outbound queue's own depth.
+/// those producers wrote while the pipeline's payloads were
+/// outstanding, because credit beyond everything queued is discarded
+/// rather than banked against payloads queued later.  The remaining
+/// hard bound is the outbound queue's own depth.
 #[derive(Debug, Clone, Default)]
 pub struct SendPipeline {
     marks: std::collections::VecDeque<u64>,
@@ -2106,8 +2143,15 @@ impl SendPipeline {
     /// Fold in `bytes` newly written by the peer's output loop,
     /// retiring every queued message the counter has passed (dcrd
     /// draining `sendDoneChan` to release semaphore slots).
+    ///
+    /// The counter never runs ahead of what was queued: bytes other
+    /// producers write while nothing of the pipeline's is outstanding
+    /// say nothing about payloads queued afterwards, and banking them
+    /// would retire those payloads before they were written, so the
+    /// pipeline would stop bounding anything on a connection that had
+    /// carried enough other traffic.
     pub fn record_sent(&mut self, bytes: u64) {
-        self.sent = self.sent.saturating_add(bytes);
+        self.sent = self.sent.saturating_add(bytes).min(self.queued);
         while self.marks.front().is_some_and(|mark| *mark <= self.sent) {
             self.marks.pop_front();
         }
@@ -2142,8 +2186,9 @@ pub enum OnGetDataOutcome {
 /// enforce the concurrent-request and pending-item limits, and
 /// otherwise queue the request to be served (dcrd
 /// `serverPeer.OnGetData` up to the point the serve queue takes
-/// over).  The serving itself is chain-backed and lands with a later
-/// slice.
+/// over).  The serving itself runs on the daemon's per-peer getdata
+/// serve worker in `dispatch`, item by item through
+/// [`serve_get_data_item`].
 #[allow(clippy::too_many_arguments)] // Mirrors dcrd's fact surface.
 pub fn on_get_data(
     state: &mut ServerPeerAddrState,
@@ -2174,6 +2219,7 @@ pub fn on_get_data(
         state,
         0,
         transient,
+        "getdata",
         disable_banning,
         ban_threshold,
         now_unix,
@@ -2334,16 +2380,17 @@ pub enum GetHeadersResponse {
 /// compared against the minimum known work by the ported uint256
 /// ordering; a chain work lookup error skips the empty-response gate.
 /// The `LocateHeaders` walk is the ported chain query, pinned
-/// separately.
+/// separately; `located` runs it, and only once the gate has passed,
+/// as dcrd returns before `LocateHeaders` (`server.go:1515-1522`).
 pub fn build_get_headers_response(
     chain_work_errored: bool,
     tip_work_below_min: bool,
-    located: Vec<dcroxide_wire::BlockHeader>,
+    located: impl FnOnce() -> Vec<dcroxide_wire::BlockHeader>,
 ) -> GetHeadersResponse {
     if !chain_work_errored && tip_work_below_min {
         return GetHeadersResponse::Empty;
     }
-    GetHeadersResponse::Headers(located)
+    GetHeadersResponse::Headers(located())
 }
 
 /// The outcome of resolving a single getdata inventory item against
@@ -2565,6 +2612,32 @@ pub struct InitStateWants {
     pub tspends: bool,
 }
 
+/// The checks dcrd's `serverPeer.OnGetInitState` makes before it reads
+/// the tip generation or the mempool (`server.go:1230-1245`): a
+/// repeated request bans before the chain is consulted at all, and a
+/// chain short of stake validation answers blank.  `best_height` is
+/// only read once the latch has passed.  `Continue` carries the best
+/// height the response is to be assembled at; only then does the
+/// caller fetch the eligible blocks and treasury spends.
+pub fn get_init_state_gate(
+    init_state_sent: bool,
+    best_height: impl FnOnce() -> i64,
+    stake_validation_height: i64,
+) -> ControlFlow<OnGetInitStateOutcome, i64> {
+    if init_state_sent {
+        return ControlFlow::Break(OnGetInitStateOutcome::Ban(
+            "sent more than one getinitstate".to_string(),
+        ));
+    }
+
+    // Send an empty init state message early in the chain.
+    let best_height = best_height();
+    if best_height < stake_validation_height - 1 {
+        return ControlFlow::Break(OnGetInitStateOutcome::Blank);
+    }
+    ControlFlow::Continue(best_height)
+}
+
 /// Assemble the init state response: ignore duplicate requests on a
 /// connection, send an empty message before stake validation, and
 /// otherwise fill the requested head blocks (capped), their votes,
@@ -2583,13 +2656,10 @@ pub fn on_get_init_state(
     votes_for: impl Fn(&dcroxide_chainhash::Hash) -> Vec<dcroxide_chainhash::Hash>,
     tspends: &[dcroxide_chainhash::Hash],
 ) -> OnGetInitStateOutcome {
-    if init_state_sent {
-        return OnGetInitStateOutcome::Ban("sent more than one getinitstate".to_string());
-    }
-
-    // Send an empty init state message early in the chain.
-    if best_height < stake_validation_height - 1 {
-        return OnGetInitStateOutcome::Blank;
+    if let ControlFlow::Break(outcome) =
+        get_init_state_gate(init_state_sent, || best_height, stake_validation_height)
+    {
+        return outcome;
     }
 
     // Fetch head block hashes if either they or their votes are
@@ -2670,6 +2740,44 @@ pub enum OnGetMiningStateOutcome {
     },
 }
 
+/// The checks dcrd's `serverPeer.OnGetMiningState` makes before it
+/// reads the tip generation or the mempool (`server.go:1113-1143`):
+/// the protocol-version violation and a repeated request ban before
+/// the chain is consulted at all, and early in the chain nothing is
+/// sent (the blank push aborts on zero blocks).  `best_height` is only
+/// read once both bans have passed.  `Continue` carries the best
+/// height the response is to be assembled at; only then does the
+/// caller sort the eligible blocks.
+pub fn get_mining_state_gate(
+    protocol_version: u32,
+    mining_state_sent: bool,
+    best_height: impl FnOnce() -> i64,
+    stake_validation_height: i64,
+) -> ControlFlow<OnGetMiningStateOutcome, i64> {
+    // Ban peers requesting the initial state via the legacy message
+    // once the protocol version makes it a knowing violation, and
+    // peers repeating the request (both new in dcrd 2.2).
+    if protocol_version >= dcroxide_wire::INIT_STATE_VERSION {
+        return ControlFlow::Break(OnGetMiningStateOutcome::Ban(format!(
+            "sent getminings request with protocol version {protocol_version} >= {}",
+            dcroxide_wire::INIT_STATE_VERSION
+        )));
+    }
+    if mining_state_sent {
+        return ControlFlow::Break(OnGetMiningStateOutcome::Ban(
+            "sent more than one getminings".to_string(),
+        ));
+    }
+
+    // Early in the chain dcrd pushes a blank state, and the push
+    // aborts on an empty block list — so nothing is sent.
+    let best_height = best_height();
+    if best_height < stake_validation_height - 1 {
+        return ControlFlow::Break(OnGetMiningStateOutcome::Nothing);
+    }
+    ControlFlow::Continue(best_height)
+}
+
 /// Assemble the mining state response, the legacy sibling of the init
 /// state exchange (dcrd `serverPeer.OnGetMiningState` +
 /// `pushMiningStateMsg`): ignore duplicate requests on a connection,
@@ -2688,23 +2796,13 @@ pub fn on_get_mining_state(
     eligible_blocks: &[dcroxide_chainhash::Hash],
     votes_for: impl Fn(&dcroxide_chainhash::Hash) -> Vec<dcroxide_chainhash::Hash>,
 ) -> OnGetMiningStateOutcome {
-    // Ban peers requesting the initial state via the legacy message
-    // once the protocol version makes it a knowing violation, and
-    // peers repeating the request (both new in dcrd 2.2).
-    if protocol_version >= dcroxide_wire::INIT_STATE_VERSION {
-        return OnGetMiningStateOutcome::Ban(format!(
-            "sent getminings request with protocol version {protocol_version} >= {}",
-            dcroxide_wire::INIT_STATE_VERSION
-        ));
-    }
-    if mining_state_sent {
-        return OnGetMiningStateOutcome::Ban("sent more than one getminings".to_string());
-    }
-
-    // Early in the chain dcrd pushes a blank state, and the push
-    // aborts on an empty block list — so nothing is sent.
-    if best_height < stake_validation_height - 1 {
-        return OnGetMiningStateOutcome::Nothing;
+    if let ControlFlow::Break(outcome) = get_mining_state_gate(
+        protocol_version,
+        mining_state_sent,
+        || best_height,
+        stake_validation_height,
+    ) {
+        return outcome;
     }
 
     // Cap the eligible list to the message maximum; nothing is sent
@@ -2819,5 +2917,141 @@ mod mining_state_tests {
             }
             other => panic!("expected filled, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod handler_gate_tests {
+    use super::*;
+    use core::cell::Cell;
+
+    /// The getminingstate gates run in dcrd's order and read the best
+    /// height only once both bans have passed: the protocol-version ban
+    /// and the repeat ban never consult the chain, early in the chain
+    /// nothing is sent, and past stake validation the height is handed
+    /// on for the response.
+    #[test]
+    fn mining_state_gate_bans_before_reading_the_chain() {
+        let svh = 100i64;
+        let read = Cell::new(false);
+        let height = |h: i64| {
+            let read = &read;
+            move || {
+                read.set(true);
+                h
+            }
+        };
+
+        let out = get_mining_state_gate(dcroxide_wire::INIT_STATE_VERSION, false, height(200), svh);
+        assert!(matches!(
+            out,
+            ControlFlow::Break(OnGetMiningStateOutcome::Ban(_))
+        ));
+        assert!(!read.get(), "the protocol-version ban reads no chain state");
+
+        let out = get_mining_state_gate(7, true, height(200), svh);
+        assert_eq!(
+            out,
+            ControlFlow::Break(OnGetMiningStateOutcome::Ban(
+                "sent more than one getminings".to_string()
+            ))
+        );
+        assert!(!read.get(), "the repeat ban reads no chain state");
+
+        let out = get_mining_state_gate(7, false, height(svh - 2), svh);
+        assert_eq!(out, ControlFlow::Break(OnGetMiningStateOutcome::Nothing));
+        assert!(read.get(), "the early-chain check reads the best height");
+
+        assert_eq!(
+            get_mining_state_gate(7, false, height(svh - 1), svh),
+            ControlFlow::Continue(svh - 1)
+        );
+    }
+
+    /// The getinitstate gates run in dcrd's order: a repeat is banned
+    /// without the chain being read, an early chain is answered blank,
+    /// and past that the best height is handed on.
+    #[test]
+    fn init_state_gate_bans_before_reading_the_chain() {
+        let svh = 100i64;
+        let read = Cell::new(false);
+        let out = get_init_state_gate(
+            true,
+            || {
+                read.set(true);
+                200
+            },
+            svh,
+        );
+        assert_eq!(
+            out,
+            ControlFlow::Break(OnGetInitStateOutcome::Ban(
+                "sent more than one getinitstate".to_string()
+            ))
+        );
+        assert!(!read.get(), "the repeat ban reads no chain state");
+
+        assert_eq!(
+            get_init_state_gate(false, || svh - 2, svh),
+            ControlFlow::Break(OnGetInitStateOutcome::Blank)
+        );
+        assert_eq!(
+            get_init_state_gate(false, || svh - 1, svh),
+            ControlFlow::Continue(svh - 1)
+        );
+    }
+
+    /// The header walk runs only once the low-work gate has passed, as
+    /// dcrd returns before `LocateHeaders`; a chain-work lookup error
+    /// skips the gate and walks.
+    #[test]
+    fn get_headers_walks_only_past_the_low_work_gate() {
+        let walked = Cell::new(false);
+        let walk = || {
+            walked.set(true);
+            Vec::new()
+        };
+        assert_eq!(
+            build_get_headers_response(false, true, walk),
+            GetHeadersResponse::Empty
+        );
+        assert!(
+            !walked.get(),
+            "a below-min-work tip must not walk the headers"
+        );
+
+        assert_eq!(
+            build_get_headers_response(true, true, walk),
+            GetHeadersResponse::Headers(Vec::new())
+        );
+        assert!(walked.get(), "a chain-work error skips the gate");
+    }
+
+    /// The mempool flood guard applies its ban score before the pool is
+    /// snapshotted, so a banned peer costs no enumeration.
+    #[test]
+    fn mem_pool_bans_before_snapshotting_the_pool() {
+        let mut state = ServerPeerAddrState::new(false);
+        let snapshots = Cell::new(0u32);
+        let snapshot = || {
+            snapshots.set(snapshots.get() + 1);
+            vec![dcroxide_chainhash::Hash([1u8; 32])]
+        };
+        for _ in 0..3 {
+            assert!(matches!(
+                on_mem_pool(&mut state, snapshot, false, 100, 1_000),
+                OnMemPoolOutcome::Inventory(invs) if invs.len() == 1
+            ));
+        }
+        assert_eq!(snapshots.get(), 3);
+        assert_eq!(
+            on_mem_pool(&mut state, snapshot, false, 100, 1_000),
+            OnMemPoolOutcome::Banned
+        );
+        assert_eq!(
+            snapshots.get(),
+            3,
+            "the banned request never snapshots the pool"
+        );
     }
 }

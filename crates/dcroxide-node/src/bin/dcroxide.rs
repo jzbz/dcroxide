@@ -36,7 +36,6 @@ use dcroxide_node::{
     Config, ConfigEnv, ERR_HELP_REQUESTED, ERR_SHOW_SUBSYSTEMS, ERR_VERSION_REQUESTED,
     app_data_dir, load_config_from_argv, logo, parse_listeners, supported_subsystems, version,
 };
-use dcroxide_peer::{DEFAULT_IDLE_TIMEOUT, PING_INTERVAL};
 use dcroxide_rpc::server::RpcCpuMiner;
 use dcroxide_wire::ServiceFlag;
 
@@ -57,12 +56,34 @@ static SERVICE_STOP_EARLY: core::sync::atomic::AtomicBool =
 fn request_service_shutdown() {
     SERVICE_STOP_EARLY.store(true, core::sync::atomic::Ordering::SeqCst);
     if let Some((interrupt, shutdown)) = SERVICE_SHUTDOWN.get() {
-        interrupt.store(true, core::sync::atomic::Ordering::SeqCst);
-        let _ = shutdown.send(());
+        request_process_shutdown(interrupt, shutdown);
     }
 }
 
+/// A shutdown request from one of the daemon's own subsystems -- the
+/// `stop` RPC, the parent closing `--piperx`, the service control
+/// manager -- as dcrd's `shutdownListener` takes one from its
+/// `shutdownRequestChannel`: the first request cancels the daemon
+/// context (the interrupt flag and the idle wait's channel here) and
+/// logs `Shutdown requested.  Shutting down...`, and every later one
+/// logs the `Already shutting down...` form, so an operator can tell
+/// the process has not hung.  A request after a signal is a later one.
+fn request_process_shutdown(interrupt: &dcroxide_indexers::Interrupt, shutdown: &mpsc::Sender<()>) {
+    if interrupt.swap(true, core::sync::atomic::Ordering::SeqCst) {
+        log_info("Shutdown requested.  Already shutting down...");
+    } else {
+        log_info("Shutdown requested.  Shutting down...");
+    }
+    let _ = shutdown.send(());
+}
+
 fn main() -> ExitCode {
+    // Lift the soft descriptor limit to just below the hard one, which
+    // the Go runtime's `syscall` package init does for dcrd before any
+    // of its code runs (`syscall/rlimit.go`).  Without it the daemon
+    // ran at whatever soft limit it inherited, 1024 under systemd.
+    dcroxide_node::limits::raise_nofile_like_go_runtime();
+
     // Seed the process-wide CSPRNG before anything else, where Go runs
     // `crypto/rand`'s package `init` (`crypto/rand/prng.go:116-122`).
     // This is the one kernel read the daemon is allowed to die on, and
@@ -71,6 +92,12 @@ fn main() -> ExitCode {
     // on a getaddr included.  Before the service dispatch below, since
     // Go's `init` also precedes `winServiceMain`.
     dcroxide_crypto::rand::init();
+
+    // Up some limits (dcrd `main`, before the service dispatch).
+    if let Err(e) = dcroxide_node::limits::set_limits() {
+        eprintln!("failed to set limits: {e}");
+        return ExitCode::FAILURE;
+    }
 
     // Run under the service control manager when invoked as a Windows
     // service (dcrd `main` calling `winServiceMain` first); interactive
@@ -119,7 +146,7 @@ fn real_main() -> ExitCode {
         getenv: Box::new(|name| std::env::var(name).ok()),
         user_home: Box::new(|name| {
             if name.is_empty() {
-                std::env::var("HOME").ok()
+                current_user_home()
             } else {
                 // Resolving other users' home directories is not yet
                 // wired.
@@ -142,17 +169,6 @@ fn real_main() -> ExitCode {
     };
     match load_config_from_argv(&args, &env) {
         Ok((cfg, _remaining_args)) => {
-            // Perform a requested service command and exit (dcrd's
-            // loadConfig hook; the flag parses everywhere but acts
-            // only on Windows, where dcrd prints any error and exits
-            // zero either way).
-            #[cfg(windows)]
-            if !cfg.service_command.is_empty() {
-                if let Err(e) = dcroxide_winsvc::run_service_command(&cfg.service_command) {
-                    eprintln!("{e}");
-                }
-                return ExitCode::SUCCESS;
-            }
             // dcrd writes these to stderr as it parses
             // (`config.go:818-824` and the Tor-isolation notices); the
             // port collected them and printed none, so a deprecated
@@ -161,6 +177,19 @@ fn real_main() -> ExitCode {
                 eprintln!("{warning}");
             }
             run(cfg)
+        }
+        // Perform a requested service command and exit (dcrd's
+        // loadConfig hook, run straight after the version check on the
+        // command-line pre-parse alone, so no config file or validation
+        // error can block it; only Windows registers the option, and
+        // dcrd prints any error and exits zero either way).
+        #[cfg(windows)]
+        Err(msg) if msg.starts_with(dcroxide_node::config::ERR_SERVICE_COMMAND_PREFIX) => {
+            let command = &msg[dcroxide_node::config::ERR_SERVICE_COMMAND_PREFIX.len()..];
+            if let Err(e) = dcroxide_winsvc::run_service_command(command) {
+                eprintln!("{e}");
+            }
+            ExitCode::SUCCESS
         }
         Err(msg) => match msg.as_str() {
             ERR_HELP_REQUESTED => {
@@ -186,22 +215,150 @@ fn real_main() -> ExitCode {
     }
 }
 
+/// The current user's home directory as Go's `user.Current().HomeDir`
+/// reports it to dcrd's `cleanAndExpandPath` for a leading `~`.
+///
+/// On the unixes other than Apple's, dcrd's cgo-free build reads the
+/// password file: the entry for the real user id (`os/user`'s
+/// `lookupUserId`), and only when the account has none does it fall
+/// back to `$HOME`, which it then takes only alongside a non-empty
+/// `$USER` (`lookup_stubs.go` `current`).
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn current_user_home() -> Option<String> {
+    let uid = rustix::process::getuid().as_raw().to_string();
+    std::fs::read_to_string("/etc/passwd")
+        .ok()
+        .and_then(|passwd| passwd_home(&passwd, &uid))
+        .or_else(|| {
+            let non_empty = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+            non_empty("USER").and(non_empty("HOME"))
+        })
+}
+
+/// Elsewhere std's lookup stands in, and it is not quite Go's.  On Apple
+/// platforms Go asks the directory service for the real user id's entry
+/// (`getpwuid_r`, `cgo_lookup_unix.go` `current`) and nothing else,
+/// where std takes `$HOME` first and asks the directory service only
+/// without one.  On Windows Go takes the process token's profile
+/// directory (`GetUserProfileDirectory`, `lookup_windows.go` `current`)
+/// and nothing else, where std takes a non-empty `%USERPROFILE%` first.
+/// The two differ only when that variable points away from the
+/// account's own directory.
+#[cfg(not(all(unix, not(target_vendor = "apple"))))]
+fn current_user_home() -> Option<String> {
+    std::env::home_dir().and_then(|home| home.into_os_string().into_string().ok())
+}
+
+/// The home directory of the password-file entry for `uid`, parsed as
+/// Go's cgo-free `lookupUserId` does (`os/user/lookup_unix.go`): lines
+/// are trimmed, blank and `#` lines skipped, and an entry must carry
+/// six colons, the uid in its third field, a name that is not empty and
+/// does not start with `+` or `-`, and integer uid and gid fields.
+#[cfg(any(all(unix, not(target_vendor = "apple")), test))]
+fn passwd_home(passwd: &str, uid: &str) -> Option<String> {
+    let needle = format!(":{uid}:");
+    passwd.lines().map(str::trim).find_map(|line| {
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        if !line.contains(&needle) || line.matches(':').count() < 6 {
+            return None;
+        }
+        let parts: Vec<&str> = line.splitn(7, ':').collect();
+        if parts.len() < 6
+            || parts[2] != uid
+            || parts[0].is_empty()
+            || parts[0].starts_with(['+', '-'])
+            || parts[2].parse::<i64>().is_err()
+            || parts[3].parse::<i64>().is_err()
+        {
+            return None;
+        }
+        Some(parts[5].to_string())
+    })
+}
+
+/// Closes the block database however [`run_node`] returns once it has
+/// opened it (dcrd's deferred `db.Close()` straight after `loadBlockDB`,
+/// with its `lifetimeEventDBOpen` shutdown event and log line), so the
+/// metadata committed since the last flush reaches disk on every path:
+/// the index-drop exits, the startup failures and the shutdown-request
+/// checks as well as the normal shutdown.  Held from right after the
+/// open, it drops after everything built later.
+struct BlockDbCloser {
+    db: Database,
+    pipe_notifier: dcroxide_node::pipeserve::PipeNotifier,
+}
+
+impl Drop for BlockDbCloser {
+    fn drop(&mut self) {
+        // Ensure the database is sync'd and closed on shutdown.
+        self.pipe_notifier
+            .notify_shutdown_event(dcroxide_node::ipc::LifetimeAction::DbOpen);
+        log_info("Gracefully shutting down the block database...");
+        if let Err(e) = self.db.close() {
+            // dcrd discards the error; it is logged here so a close
+            // whose flush failed does not pass silently.
+            log_error(&format!("Unable to close the block database: {e}"));
+        }
+    }
+}
+
+/// Waits for the `--pipetx` writer to write what the daemon queued
+/// before [`run_node`] returns, however it returns (see
+/// `PipeNotifier::wait_written`).  Held from right after the notifier is
+/// built, it drops after [`BlockDbCloser`], whose `DbOpen` shutdown
+/// event is the last message queued.
+struct PipeDrainOnExit(dcroxide_node::pipeserve::PipeNotifier);
+
+impl Drop for PipeDrainOnExit {
+    fn drop(&mut self) {
+        self.0.wait_written(PIPE_DRAIN_TIMEOUT);
+    }
+}
+
+/// How long the exit waits for the queued pipe messages to be written,
+/// so a parent that stopped reading its pipe cannot hold the process up.
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Whether a shutdown has been requested -- an interrupt or termination
+/// signal, the `stop` RPC, the service control manager, or the parent
+/// closing `--piperx` (dcrd `shutdownRequested`, a non-blocking check of
+/// the daemon context).
+fn shutdown_requested(interrupt: &dcroxide_indexers::Interrupt) -> bool {
+    interrupt.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// Run the daemon and log `Shutdown complete` however it returns (dcrd's
+/// `defer dcrdLog.Info("Shutdown complete")` at the top of `dcrdMain`,
+/// which runs on the failure returns too).
+fn run(cfg: Config) -> ExitCode {
+    let code = run_node(cfg);
+    log_info("Shutdown complete");
+    code
+}
+
 /// Bring the daemon up and idle until a shutdown signal.  This is the
 /// portion of `dcrdMain` after a successful configuration load: it opens
 /// the block database and chain, creates the address manager, binds the
 /// peer listeners, starts outbound dialing, seeding, and the RPC server,
 /// then idles on the shutdown listener before tearing everything down.
-fn run(cfg: Config) -> ExitCode {
+fn run_node(cfg: Config) -> ExitCode {
     // Install the per-subsystem log levels the configuration parsed
     // (dcrd's loadConfig calling parseAndSetDebugLevels).
     dcroxide_node::logging::set_levels(cfg.log_levels.clone());
-    print!("{}", logo::startup_banner(version::version_string()));
+    // The banner shares the log's sink and its tolerance of a stdout
+    // that stopped taking writes.
+    dcroxide_node::logging::write_stdout(
+        logo::startup_banner(version::version_string()).as_bytes(),
+    );
     // Logged rather than printed, and only here: dcrd defers it until
-    // the rest of the configuration succeeds (`config.go:1348-1352`).
+    // the rest of the configuration succeeds, then logs it through
+    // `dcrdLog`, so under DCRD (`config.go:1348-1352`).
     if let Some(warning) = &cfg.config_file_warning {
-        dcroxide_node::logging::warn("MAIN", warning);
+        log_warn(warning);
     }
-    println!();
+    dcroxide_node::logging::write_stdout(b"\n");
 
     log_info(&format!(
         "Version {} ({})",
@@ -242,9 +399,10 @@ fn run(cfg: Config) -> ExitCode {
     // Publish the handles for the Windows service control handler and
     // honor a stop that arrived before they existed.
     let _ = SERVICE_SHUTDOWN.set((Arc::clone(&interrupt), shutdown_tx.clone()));
-    if SERVICE_STOP_EARLY.load(core::sync::atomic::Ordering::SeqCst) {
-        interrupt.store(true, core::sync::atomic::Ordering::SeqCst);
-        let _ = shutdown_tx.send(());
+    if SERVICE_STOP_EARLY.load(core::sync::atomic::Ordering::SeqCst)
+        && !shutdown_requested(&interrupt)
+    {
+        request_process_shutdown(&interrupt, &shutdown_tx);
     }
     {
         let signal_interrupt = Arc::clone(&interrupt);
@@ -255,6 +413,12 @@ fn run(cfg: Config) -> ExitCode {
         // channel, which its signal handler also sends on).
         let signal_shutdown = shutdown_tx.clone();
         if let Err(e) = ctrlc::set_handler(move || {
+            // dcrd's `shutdownListener` logs `Received signal (%s).
+            // Shutting down...` here, and the `Already shutting down...`
+            // form for a repeat, but both name the signal, and ctrlc does
+            // not report which of SIGINT, SIGTERM and SIGHUP arrived, so a
+            // signal cancels without a line.  A later `stop` or pipe close
+            // still logs as a repeat.
             signal_interrupt.store(true, core::sync::atomic::Ordering::SeqCst);
             let _ = signal_shutdown.send(());
         }) {
@@ -265,20 +429,26 @@ fn run(cfg: Config) -> ExitCode {
 
     // The pipe IPC lifecycle (dcrd `dcrdMain`'s lifetimeNotifier and
     // service control pipes): the writer serves --pipetx, the watcher
-    // treats the parent closing --piperx as a shutdown request, and
-    // the lifetime events fire only under --lifetimeevents.
+    // treats the parent closing --piperx as a shutdown request, the
+    // lifetime events fire only under --lifetimeevents, and the bound
+    // listener addresses only under --boundaddrevents.
     let pipe_notifier =
-        dcroxide_node::pipeserve::new_pipe_notifier(cfg.pipe_tx, cfg.lifetime_events);
+        dcroxide_node::pipeserve::new_pipe_notifier(cfg.pipe_tx, cfg.lifetime_events)
+            .with_bound_addr_events(cfg.bound_addr_events);
+    let _pipe_drain = PipeDrainOnExit(pipe_notifier.clone());
     if cfg.pipe_rx != 0 {
         let rx_interrupt = Arc::clone(&interrupt);
         let rx_shutdown = shutdown_tx.clone();
         dcroxide_node::pipeserve::start_pipe_rx(
             cfg.pipe_rx,
-            Box::new(move || {
-                rx_interrupt.store(true, core::sync::atomic::Ordering::SeqCst);
-                let _ = rx_shutdown.send(());
-            }),
+            Box::new(move || request_process_shutdown(&rx_interrupt, &rx_shutdown)),
         );
+    }
+
+    // Return now if a shutdown signal was triggered (dcrd's check ahead
+    // of `loadBlockDB`).
+    if shutdown_requested(&interrupt) {
+        return ExitCode::SUCCESS;
     }
 
     // Load the block database and initialize the chain state, creating
@@ -292,6 +462,17 @@ fn run(cfg: Config) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let _db_closer = BlockDbCloser {
+        db: db.clone(),
+        pipe_notifier: pipe_notifier.clone(),
+    };
+
+    // Return now if a shutdown signal was triggered (dcrd checks after
+    // `loadBlockDB` and again after `LoadUtxoDB`; the port keeps the
+    // UTXO set in the block database, so the two are one check here).
+    if shutdown_requested(&interrupt) {
+        return ExitCode::SUCCESS;
+    }
 
     // Always drop the legacy address index, drop any other indexes
     // and exit if requested, then drop the legacy v1 committed filter
@@ -299,32 +480,62 @@ fn run(cfg: Config) -> ExitCode {
     // the order matters because dropping the tx index also drops the
     // address index since it relied on it).
     if let Err(e) = dcroxide_indexers::drop_addr_index(&interrupt, &db) {
-        log_info(&format!("{e}"));
+        log_error(&format!("{e}"));
         return ExitCode::FAILURE;
     }
     if cfg.drop_tx_index {
         if let Err(e) = dcroxide_indexers::drop_tx_index(&interrupt, &db) {
-            log_info(&format!("{e}"));
+            log_error(&format!("{e}"));
             return ExitCode::FAILURE;
         }
         return ExitCode::SUCCESS;
     }
     if cfg.drop_exists_addr_index {
         if let Err(e) = dcroxide_indexers::drop_exists_addr_index(&interrupt, &db) {
-            log_info(&format!("{e}"));
+            log_error(&format!("{e}"));
             return ExitCode::FAILURE;
         }
         return ExitCode::SUCCESS;
     }
     if let Err(e) = dcroxide_indexers::drop_cf_index(&db) {
-        log_info(&format!("{e}"));
+        log_error(&format!("{e}"));
         return ExitCode::FAILURE;
     }
 
-    let chain = match open_chain(&cfg, db.clone()) {
+    // Create the server: dcrd sends this event just ahead of
+    // `newServer`, and everything from here to the startup-complete
+    // event is `newServer`'s work -- the fee estimator, the chain load
+    // with its UTXO catch-up replay, the index catch-up, the address
+    // manager, the mempool and the listeners -- so a parent sees those
+    // phases as the P2P server starting.
+    pipe_notifier.notify_startup_event(dcroxide_node::ipc::LifetimeAction::P2pServer);
+
+    // The shared fee estimator dcrd always builds in `newServer` and
+    // hands to both the mempool (fed as transactions enter and leave)
+    // and the RPC server (read by estimatesmartfee).  It starts
+    // disabled until the first accepted block and empty each run — the
+    // on-disk statistics store is deferred in the port.  dcrd builds it
+    // ahead of the chain (`server.go:3959-3976`), and a configuration it
+    // refuses -- `--minrelaytxfee=0` makes both bucket bounds zero, so
+    // "maximum bucket fee should not be lower than minimum bucket fee"
+    // -- fails `newServer`, which `dcrdMain` reports as it reports every
+    // server construction failure.
+    let fee_estimator = match dcroxide_node::fees::new_shared_estimator(cfg.min_relay_tx_fee_atoms)
+    {
+        Ok(estimator) => estimator,
+        Err(e) => {
+            log_error(&format!("Unable to start server: {e}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The chain is built inside dcrd's `newServer`, so a failure logs
+    // as that one's does (`dcrd.go:243`): an interrupted startup catch-up
+    // reads "Unable to start server: interrupt requested".
+    let chain = match open_chain(&cfg, db.clone(), &interrupt) {
         Ok(chain) => chain,
         Err(e) => {
-            log_error(&format!("Unable to load block database: {e}"));
+            log_error(&format!("Unable to start server: {e}"));
             return ExitCode::FAILURE;
         }
     };
@@ -395,6 +606,16 @@ fn run(cfg: Config) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Return now if a shutdown signal was triggered: dcrd checks once
+    // more when `newServer` returns, before `Run` accepts or dials
+    // anything.  The chain load and the index catch-up above are the
+    // long part of `newServer`; what follows here is quick, and starts
+    // the threads dcrd's `Run` starts -- the RPC and peer listeners, the
+    // dialer and the seeders among them -- so the check sits ahead of it.
+    if shutdown_requested(&interrupt) {
+        return ExitCode::SUCCESS;
+    }
+
     // Create the address manager and load any persisted peers (dcrd
     // `newServer`'s `addrmgr.New(cfg.DataDir)`).
     let mut addr_manager = AddrManager::new(Path::new(&cfg.data_dir));
@@ -427,13 +648,7 @@ fn run(cfg: Config) -> ExitCode {
         cfg.allow_old_votes,
         !cfg.mining_addrs.is_empty(),
     );
-    // The shared fee estimator dcrd always builds in `newServer` and
-    // hands to both the mempool (fed as transactions enter and leave)
-    // and the RPC server (read by estimatesmartfee).  It starts
-    // disabled until the first accepted block and empty each run — the
-    // on-disk statistics store is deferred in the port.
-    let fee_estimator = dcroxide_node::fees::new_shared_estimator(cfg.min_relay_tx_fee_atoms)
-        .expect("build the fee estimator");
+    // Feed the fee estimator built above from the pool.
     tx_pool
         .lock()
         .expect("tx pool mutex poisoned")
@@ -464,7 +679,6 @@ fn run(cfg: Config) -> ExitCode {
             cfg.rpc_max_websockets.max(0) as usize,
         ))
     };
-    pipe_notifier.notify_startup_event(dcroxide_node::ipc::LifetimeAction::P2pServer);
     let (server, connected, template, stall_timer) = build_server(
         &cfg,
         Arc::clone(&chain),
@@ -613,6 +827,10 @@ fn run(cfg: Config) -> ExitCode {
             .expect("chain mutex poisoned")
             .set_notification_callback(Box::new(move |n| callback_handler.handle(n)));
     }
+    // The RPC chain adapter drains the same handler after the manual
+    // invalidateblock/reconsiderblock reorganizations (dcrd runs
+    // `handleBlockchainNotification` whichever caller moved the tip).
+    let rpc_ntfn_handler = handler.clone();
     server
         .sync_manager
         .lock()
@@ -656,8 +874,12 @@ fn run(cfg: Config) -> ExitCode {
     // The outbound driver's command channel is created ahead of the RPC
     // server so its control handle can back the manual peer-control
     // RPCs (`addnode`, `node connect`/`remove`); the driver itself
-    // starts below with the other peer activity.
-    let outbound_channel = dcroxide_node::outbound::outbound_channel();
+    // starts below with the other peer activity.  Their targets resolve
+    // through the configured routing (dcrd's dcrdLookup), so a proxied
+    // daemon resolves them over Tor.
+    let outbound_channel = dcroxide_node::outbound::outbound_channel_with_dialer(
+        dcroxide_node::socks::NodeDialer::from_config(&cfg),
+    );
 
     // Serve the JSON-RPC endpoint (dcrd's RPC server): TLS over the
     // generated certificate pair by default, plain HTTP under the
@@ -665,6 +887,9 @@ fn run(cfg: Config) -> ExitCode {
     // listeners come up, like dcrd's rpc server existing before
     // `server.Run` starts any peer activity (the chain notification
     // callback installs even earlier, above, with the handler).
+    // The bound RPC addresses are kept for the --boundaddrevents pipe
+    // messages, which follow the peer-to-peer ones below.
+    let mut rpc_bound_addrs: Vec<std::net::SocketAddr> = Vec::new();
     let rpc_listener = if cfg.disable_rpc {
         dcroxide_node::logging::info("RPCS", "RPC service is disabled");
         None
@@ -795,20 +1020,25 @@ fn run(cfg: Config) -> ExitCode {
                 None => Box::new(dcroxide_node::rpcrun::IdleCpuMiner),
             };
         // The `stop` RPC requests the same graceful shutdown as an
-        // interrupt: set the shared interrupt flag and send on the
-        // shutdown channel the idle wait blocks on (dcrd's non-blocking
-        // send on the server's `requestProcessShutdown` channel).
+        // interrupt.  Only its first request reaches the shutdown
+        // listener: dcrd's `newServer` forwards one receive from the
+        // server's `requestProcessShutdown` channel to
+        // `shutdownRequestChannel`, and `handleStop`'s non-blocking send
+        // finds no receiver after that.
         let request_shutdown: Box<dyn Fn() + Send + Sync> = {
             let interrupt = Arc::clone(&interrupt);
             let shutdown_tx = shutdown_tx.clone();
+            let forwarded = core::sync::atomic::AtomicBool::new(false);
             Box::new(move || {
-                interrupt.store(true, core::sync::atomic::Ordering::SeqCst);
-                let _ = shutdown_tx.send(());
+                if !forwarded.swap(true, core::sync::atomic::Ordering::SeqCst) {
+                    request_process_shutdown(&interrupt, &shutdown_tx);
+                }
             })
         };
         let mut rpc_srv = dcroxide_rpc::server::Server::new(rpc_config(
             &cfg,
             Arc::clone(&chain),
+            rpc_ntfn_handler,
             connected.clone(),
             Arc::clone(&server.sync_manager),
             Arc::clone(&server.net_totals),
@@ -830,6 +1060,7 @@ fn run(cfg: Config) -> ExitCode {
             Arc::clone(&addr_manager),
             request_shutdown,
             outbound_channel.control(),
+            Arc::clone(&server.mix_pool),
         ));
         // Install the websocket notification manager (dcrd's
         // wsNotificationManager) and start its delivery thread over
@@ -848,19 +1079,22 @@ fn run(cfg: Config) -> ExitCode {
             cfg.rpc_max_clients.max(0) as usize,
         ) {
             Ok(listener) => {
-                let addrs: Vec<String> = listener
-                    .bound_addrs()
-                    .iter()
-                    .map(|addr| addr.to_string())
-                    .collect();
-                dcroxide_node::logging::info(
-                    "RPCS",
-                    &format!("RPC server listening on {}", addrs.join(", ")),
-                );
+                // One line per listener, as dcrd's `Run` logs from each
+                // listener's serving goroutine.
+                for addr in listener.bound_addrs() {
+                    dcroxide_node::logging::info(
+                        "RPCS",
+                        &format!("RPC server listening on {addr}"),
+                    );
+                }
+                rpc_bound_addrs = listener.bound_addrs().to_vec();
                 Some((listener, ntfn, ntfn_thread))
             }
+            // dcrd fails `newServer` when the listen addresses do not
+            // parse or none of them bound, and `dcrdMain` reports that as
+            // it reports every other server construction failure.
             Err(e) => {
-                log_error(&format!("Unable to start RPC server: {e}"));
+                log_error(&format!("Unable to start server: {e}"));
                 return ExitCode::FAILURE;
             }
         }
@@ -937,31 +1171,53 @@ fn run(cfg: Config) -> ExitCode {
             Arc::clone(&server),
             Arc::clone(&conn_manager),
         ) {
+            // Each listener announces itself as dcrd connmgr's
+            // `listenHandler` does, "Server listening on <addr>".
             Ok(runtime) => {
-                let addrs: Vec<String> = runtime
+                // The rest of dcrd's `initListeners`: each bound listener
+                // is announced to the parent process under
+                // --boundaddrevents, then the node's own addresses are
+                // registered so the handshake can advertise one and
+                // getnetworkinfo can list them -- every --externalip,
+                // or else every bound listener.
+                let bound: Vec<String> = runtime
                     .bound_addrs()
                     .iter()
-                    .map(|addr| addr.to_string())
+                    .map(dcroxide_node::listenaddrs::go_tcp_addr_string)
                     .collect();
-                dcroxide_node::logging::info(
-                    "SRVR",
-                    &format!(
-                        "Serving peer-to-peer connections on {}",
-                        if addrs.is_empty() {
-                            "(no listeners bound)".to_string()
-                        } else {
-                            addrs.join(", ")
-                        }
-                    ),
-                );
+                for addr in &bound {
+                    pipe_notifier.notify_p2p_address(addr);
+                }
+                if let Err(e) = dcroxide_node::listenaddrs::add_listener_local_addresses(
+                    &addr_manager,
+                    &cfg.external_ips,
+                    cfg.params.params.default_port,
+                    &bound,
+                    ServiceFlag::NODE_NETWORK,
+                    &*server.lookup,
+                    &|| Ok(dcroxide_node::rpcrun::system_interface_addrs()),
+                    wall_clock_unix(),
+                ) {
+                    log_error(&format!("Unable to start server: {e}"));
+                    return ExitCode::FAILURE;
+                }
                 Some(runtime)
             }
+            // dcrd's `newServer` failure as `dcrdMain` reports it:
+            // nothing bound ("no valid listen address") or a listener
+            // that does not parse.
             Err(e) => {
-                log_error(&format!("Unable to start peer-to-peer listeners: {e}"));
+                log_error(&format!("Unable to start server: {e}"));
                 return ExitCode::FAILURE;
             }
         }
     };
+    // dcrd's `setupRPCListeners` announces each bound RPC listener too,
+    // later in `newServer` than `initListeners`, so these follow the
+    // peer-to-peer addresses.
+    for addr in &rpc_bound_addrs {
+        pipe_notifier.notify_rpc_address(&dcroxide_node::listenaddrs::go_tcp_addr_string(addr));
+    }
 
     // Open outbound connections through the connection manager: the
     // permanent `--connect` peers when configured, otherwise automatic
@@ -1018,9 +1274,9 @@ fn run(cfg: Config) -> ExitCode {
         &cfg.add_peers
     };
     let mut persistent = Vec::with_capacity(persistent_targets.len());
+    let target_dialer = dcroxide_node::socks::NodeDialer::from_config(&cfg);
     for addr in persistent_targets {
-        let added = dcroxide_node::outbound::addr_string_to_socket_addr(addr)
-            .map(|resolved| dcroxide_node::outbound::socket_addr_to_net_address(&resolved))
+        let added = dcroxide_node::outbound::addr_string_to_net_address(addr, &target_dialer)
             .and_then(|net_addr| {
                 let mut manager = conn_manager.lock().expect("connmgr mutex poisoned");
                 manager
@@ -1087,22 +1343,31 @@ fn run(cfg: Config) -> ExitCode {
             // dcrd routes its seeder HTTP transport through `dcrdDial`,
             // so a proxied daemon queries the seeders over the SOCKS
             // proxy rather than leaking the traffic; without a proxy the
-            // battle-tested ureq transport does the direct dial.
+            // battle-tested ureq transport does the direct dial.  The
+            // seeder host lookup for the source address is dcrd's
+            // `dcrdLookup(seeder)` either way: through Tor under --proxy
+            // (unless --noonion), so the names never reach the system
+            // resolver (one minute bounds it, like the transport).
             let services = ServiceFlag::NODE_NETWORK.0;
+            let lookup_dialer = dcroxide_node::socks::NodeDialer::from_config(&cfg);
+            let lookup =
+                move |host: &str| lookup_dialer.lookup(host, std::time::Duration::from_secs(60));
             if cfg.dial == dcroxide_node::config::DialSelection::SocksProxy {
                 let dialer = dcroxide_node::socks::NodeDialer::from_config(&cfg);
-                Some(dcroxide_node::seeding::start_seeding(
+                Some(dcroxide_node::seeding::start_seeding_with_lookup(
                     seeders,
                     Arc::clone(&addr_manager),
                     services,
                     move || dcroxide_node::seeding::ProxySeederTransport::new(dialer.clone()),
+                    lookup,
                 ))
             } else {
-                Some(dcroxide_node::seeding::start_seeding(
+                Some(dcroxide_node::seeding::start_seeding_with_lookup(
                     seeders,
                     Arc::clone(&addr_manager),
                     services,
                     dcroxide_node::seeding::UreqTransport::new,
+                    lookup,
                 ))
             }
         }
@@ -1116,11 +1381,14 @@ fn run(cfg: Config) -> ExitCode {
     pipe_notifier.notify_startup_complete();
     log_info("Serving peers until a shutdown signal is received.");
 
-    // Idle until the signal handler armed at startup reports an
-    // interrupt (SIGINT) or termination (SIGTERM) signal, mirroring
-    // dcrd's shutdown listener.
+    // Idle until a shutdown is requested -- an interrupt, termination
+    // or hangup signal, the `stop` RPC, the parent closing `--piperx` or
+    // the service control manager -- mirroring dcrd's `svr.Run` blocking
+    // on the daemon context.
     let _ = shutdown_rx.recv();
-    pipe_notifier.notify_shutdown_event(dcroxide_node::ipc::LifetimeAction::P2pServer);
+    dcroxide_node::logging::warn("SRVR", "Server shutting down");
+    // No block is processed from here on, whoever delivers it.
+    stop_block_processing(&server.sync_manager);
 
     // Stop seeding and dialing, stop the watchdog, disconnect the live
     // peers, and stop accepting new connections (dcrd's server
@@ -1155,9 +1423,11 @@ fn run(cfg: Config) -> ExitCode {
         rebroadcaster.shutdown();
     }
     // Stop the miner's background threads before the generator so its
-    // workers deregister their template subscriptions first, and while
-    // the chain, sync manager, and database are still live for any
-    // in-flight block submission to complete.
+    // workers deregister their template subscriptions first.  A block
+    // one of them, or `generate`, submits now is not connected: the sync
+    // manager closed at `stop_block_processing` above drops it and
+    // reports success, as dcrd's `SyncManager.ProcessBlock` returns nil
+    // once shutdown is requested.
     if let Some(runtime) = miner_runtime {
         runtime.shutdown();
     }
@@ -1181,34 +1451,63 @@ fn run(cfg: Config) -> ExitCode {
     }
 
     // Flush the chain's in-memory UTXO cache and modified block index to
-    // the database now that no thread can process another block (dcrd's
-    // clean-shutdown flush).  Every connect persists the best state but
-    // holds the UTXO changes in the cache, so without this a restart
-    // loads a best state ahead of the persisted UTXO set and wedges the
-    // node on the next block.
-    pipe_notifier.notify_shutdown_event(dcroxide_node::ipc::LifetimeAction::DbOpen);
-    log_info("Flushing the block database to disk...");
-    if let Err(e) = chain
+    // the database (dcrd `Run`'s `ShutdownUtxoCache`).  Nothing connects
+    // a block past this point: the sync manager has refused every block
+    // since `stop_block_processing` above, whether a peer, the RPC server
+    // or the miner delivered it, and the miner and the template
+    // generator are stopped.  Only an RPC handler abandoned past the
+    // server's bounded drain could still move the tip, through
+    // invalidateblock or reconsiderblock, and that is recovered the same
+    // way as a missing flush.  Every connect persists the best state but
+    // holds the UTXO changes in the cache, so a start after an exit
+    // without this flush finds the recorded UTXO set state behind the
+    // best chain and replays the blocks between them before serving
+    // anything (`initialize_utxo_state`, dcrd's `UtxoCache.Initialize`);
+    // the flush spares it that replay.  The database itself closes
+    // after this, as `run_node` returns (`BlockDbCloser`).
+    let flushed = chain
         .lock()
         .expect("chain mutex poisoned")
-        .flush(&cfg.params.params)
-    {
-        // Not merely logged: the comment above says what this flush is
-        // for, and if it fails that is exactly what happens -- the next
-        // start loads a best state ahead of the persisted UTXO set and
-        // wedges on the first block. Exiting SUCCESS after that tells a
-        // supervisor, an operator, and any script reading $? that a node
-        // whose state did not reach disk shut down cleanly.
+        .flush(&cfg.params.params);
+    if let Err(e) = &flushed {
+        // dcrd discards this error (`ShutdownUtxoCache` ignores what
+        // `MaybeFlush` returns).  Here it is logged and fails the exit
+        // status: the store refused a write, and the storage fault behind
+        // that is what a supervisor, an operator and any script reading
+        // $? need to hear about.  What is on disk is not damaged by it --
+        // the store keeps the last flush that completed, an older
+        // consistent state the next start replays forward from.
         log_error(&format!(
             "Unable to flush the block database: {e:?} -- the chain state on disk is \
-             behind the state this node was running with, and the next start may \
-             refuse to make progress. Investigate the storage before restarting."
+             the last flush that completed, behind the state this node was running \
+             with, and the next start replays forward from it. Investigate the \
+             storage fault before restarting."
         ));
+    }
+    dcroxide_node::logging::info("SRVR", "Server shutdown complete");
+    // dcrd defers this event once startup completes, so it fires as
+    // `dcrdMain` returns from `svr.Run`: after the server's whole
+    // teardown and before the database closes.
+    pipe_notifier.notify_shutdown_event(dcroxide_node::ipc::LifetimeAction::P2pServer);
+
+    if flushed.is_err() {
         return ExitCode::FAILURE;
     }
-
-    log_info("Shutdown complete");
     ExitCode::SUCCESS
+}
+
+/// Stop the sync manager handling anything more, as dcrd's
+/// `SyncManager.Run` closes `quit` once the daemon context is cancelled:
+/// every handler then returns at once and `process_block` connects
+/// nothing, so no block reaches the chain after the shutdown flush,
+/// whether a peer, the RPC server or the miner delivered it.  The flag
+/// is set under the manager's lock, so a block being processed as this
+/// is called finishes first.
+fn stop_block_processing(sync_manager: &Mutex<dcroxide_node::sync::NodeSyncManager>) {
+    sync_manager
+        .lock()
+        .expect("sync manager mutex poisoned")
+        .request_shutdown();
 }
 
 /// Build the daemon-wide server state: the shared context the peer
@@ -1227,20 +1526,13 @@ fn build_server(
     dcroxide_node::dispatch::StallTimer,
 ) {
     let params = &cfg.params.params;
-    let template = PeerTemplate {
-        net: params.net,
-        // 0 selects the package's maximum protocol version.
-        protocol_version: 0,
-        // dcrd's `defaultServices`.
-        services: ServiceFlag::NODE_NETWORK,
-        user_agent_name: APP_NAME.to_string(),
-        user_agent_version: version::user_agent_version(),
-        idle_timeout: Duration::from_nanos(DEFAULT_IDLE_TIMEOUT as u64),
-        ping_interval: Duration::from_nanos(PING_INTERVAL as u64),
+    let template = PeerTemplate::from_config(
+        cfg,
+        APP_NAME,
         // Advertise the real tip in every `version` (dcrd's
         // `server.NewestBlock`).  Without this the node claims height 0
         // and no peer will ever choose it as a sync source.
-        newest_block: Some({
+        Some({
             let chain = Arc::clone(&chain);
             Arc::new(move || {
                 let chain = chain
@@ -1250,7 +1542,7 @@ fn build_server(
                 Ok((best.hash, best.height))
             })
         }),
-    };
+    );
     // The mixing pool the getdata serve path and the sync manager share
     // (dcrd `newServer` building one `mixpool.Pool`).
     // Building it installs the tx pool's pair-request probe, so the
@@ -1317,7 +1609,6 @@ fn build_server(
         blocks_only: cfg.blocks_only,
         sync_manager,
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
-        next_peer_id: std::sync::atomic::AtomicI32::new(1),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: cfg.disable_listen,
         tx_pool,
@@ -1352,9 +1643,6 @@ fn start_listeners(
     .map_err(|e| e.to_string())
 }
 
-/// Open (or create) the block database (dcrd `dcrdMain`'s
-/// `loadBlockDB`).  The block database lives at
-/// `<datadir>/blocks_<dbtype>`; the same handle backs the chain and
 /// How many bytes redb may cache, from `DCROXIDE_DB_CACHE` (MiB).
 ///
 /// An environment variable rather than a command-line option on purpose.
@@ -1490,7 +1778,15 @@ fn apply_overlay_tuning(opts: &mut Options) {
 ///
 /// One line per flush: the sequence, the wall-clock instant the flush
 /// ENDED, and its duration. The observer fires after the commit, so
-/// `end - elapsed` reconstructs the window it occupied.
+/// `end - elapsed` reconstructs the window it occupied. Each of the
+/// flush's three phases -- the block-file sync, the insert loop and the
+/// commit -- gets its own time and, on Linux, the bytes the flushing
+/// thread read from storage and the bytes it dirtied in it. The time
+/// and the bytes read are what say whether a stall in the window was
+/// waiting on reads: `write_bytes` counts pages when they are dirtied,
+/// not when they are written back, so writeback time shows in a phase's
+/// `ms` and not in its `write_bytes`, and the block-file sync reads
+/// about 0 there however much it flushes.
 ///
 /// Stats sampling is deliberately left off (`flush_stats_every` stays
 /// 0). redb's `stats()` walks every branch and leaf page, which on a
@@ -1523,12 +1819,15 @@ fn flush_log_observer() -> Option<dcroxide_database::FlushObserver> {
             if let Ok(mut out) = sink.lock() {
                 let _ = writeln!(
                     out,
-                    "{{\"seq\":{},\"end\":{:.3},\"elapsed_ms\":{:.3},\"entries\":{},\"bytes\":{}}}",
+                    "{{\"seq\":{},\"end\":{:.3},\"elapsed_ms\":{:.3},\"entries\":{},\"bytes\":{},\"sync\":{},\"insert\":{},\"commit\":{}}}",
                     obs.sequence,
                     end,
                     obs.elapsed.as_secs_f64() * 1000.0,
                     obs.dirty_entries,
-                    obs.dirty_bytes
+                    obs.dirty_bytes,
+                    obs.block_sync.to_json(),
+                    obs.insert.to_json(),
+                    obs.commit.to_json()
                 );
                 let _ = out.flush();
             }
@@ -1536,6 +1835,9 @@ fn flush_log_observer() -> Option<dcroxide_database::FlushObserver> {
     ))
 }
 
+/// Open (or create) the block database (dcrd `dcrdMain`'s
+/// `loadBlockDB`).  The block database lives at
+/// `<datadir>/blocks_<dbtype>`; the same handle backs the chain and
 /// the enabled indexes.
 fn open_block_db(cfg: &Config) -> Result<Database, String> {
     let params = &cfg.params.params;
@@ -1544,6 +1846,10 @@ fn open_block_db(cfg: &Config) -> Result<Database, String> {
     opts.db_cache_bytes = db_cache_bytes();
     apply_overlay_tuning(&mut opts);
     opts.flush_observer = flush_log_observer();
+    // dcrd's `log.go:88` hands the database driver the BCDB logger
+    // (`database.UseLogger(bcdbLog)`): the unclean-shutdown repair, the
+    // corruption warning and the ROLLBACK lines.
+    opts.log = Some(dcroxide_node::logging::bcdb_log_sink());
 
     // Open the existing database, creating it when it does not yet
     // exist (dcrd's `database.Open` then `database.Create` fallback).
@@ -1565,18 +1871,36 @@ fn open_block_db(cfg: &Config) -> Result<Database, String> {
 
 /// Initialize the chain state over the open block database (the chain
 /// construction inside dcrd's `newServer`); a fresh database creates
-/// the genesis chain state.
-fn open_chain(cfg: &Config, db: Database) -> Result<Chain, String> {
+/// the genesis chain state.  The interrupt is the context dcrd hands
+/// `blockchain.New`: a shutdown signal stops the startup UTXO catch-up.
+fn open_chain(
+    cfg: &Config,
+    db: Database,
+    interrupt: &dcroxide_indexers::Interrupt,
+) -> Result<Chain, String> {
     let params = &cfg.params.params;
 
-    // The assume-valid hash defaults to the network's hard-coded value
-    // and is overridden by the command line when provided.
-    let assume_valid = if cfg.assume_valid.is_empty() {
+    // dcrd `newServer` announces --allowoldforks between the fee
+    // estimator and the assume-valid setting.
+    if cfg.allow_old_forks {
+        dcroxide_node::logging::info("SRVR", "Processing forks deep in history is enabled");
+    }
+
+    // Set assume valid when enabled (dcrd `newServer`): exactly "0"
+    // disables it, an empty value keeps the network's hard-coded hash,
+    // and anything else overrides it.
+    let assume_valid = if cfg.assume_valid == "0" {
+        dcroxide_node::logging::info("SRVR", "Assume valid is disabled");
+        Hash::ZERO
+    } else if cfg.assume_valid.is_empty() {
         params.assume_valid
     } else {
-        cfg.assume_valid
+        let hash = cfg
+            .assume_valid
             .parse::<Hash>()
-            .map_err(|e| format!("invalid assumevalid hash: {e:?}"))?
+            .map_err(|e| format!("invalid hex for --assumevalid: {e}"))?;
+        dcroxide_node::logging::info("SRVR", &format!("Assume valid set to {hash}"));
+        hash
     };
 
     let created_unix = SystemTime::now()
@@ -1584,8 +1908,17 @@ fn open_chain(cfg: &Config, db: Database) -> Result<Chain, String> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let mut chain = Chain::open(db, params, assume_valid, cfg.allow_old_forks, created_unix)
-        .map_err(|e| format!("unable to initialize chain: {e:?}"))?;
+    let mut chain = Chain::open_with_interrupt(
+        db,
+        params,
+        assume_valid,
+        cfg.allow_old_forks,
+        created_unix,
+        Some(Arc::clone(interrupt)),
+    )
+    // `newServer` returns `blockchain.New`'s error as is, which `%v`
+    // renders as its bare description.
+    .map_err(|e| e.to_string())?;
     // dcrd's --utxocachemaxsize (megabytes) bounds the UTXO cache
     // before a flush evicts it down.  The open-time catch-up replay
     // above ran at the default size; the configured value governs
@@ -1616,6 +1949,7 @@ fn open_chain(cfg: &Config, db: Database) -> Result<Chain, String> {
 fn rpc_config(
     cfg: &Config,
     chain: Arc<Mutex<Chain>>,
+    ntfn_handler: dcroxide_node::chainntfns::ChainNtfnHandler,
     connected: ConnectedPeers,
     sync_manager: Arc<Mutex<dcroxide_node::sync::NodeSyncManager>>,
     net_totals: Arc<dcroxide_node::transport::NetByteTotals>,
@@ -1635,6 +1969,7 @@ fn rpc_config(
     addr_manager: Arc<Mutex<AddrManager>>,
     request_shutdown: Box<dyn Fn() + Send + Sync>,
     outbound_control: dcroxide_node::outbound::OutboundControl,
+    mix_pool: Arc<Mutex<dcroxide_node::mixnode::NodeMixPool>>,
 ) -> dcroxide_rpc::server::Config<dcroxide_node::rpcrun::NodeRpcChain> {
     let params = cfg.params.params.clone();
     // The version 2 filter source shares the live chain (cloned before it
@@ -1643,17 +1978,20 @@ fn rpc_config(
     let filterer_v2 = dcroxide_node::rpcrun::NodeRpcFiltererV2::new(Arc::clone(&chain));
     let sanity_checker = dcroxide_node::rpcrun::NodeRpcSanityChecker::new(params.clone());
     dcroxide_rpc::server::Config {
-        chain: dcroxide_node::rpcrun::NodeRpcChain::new(chain, params.clone()),
+        chain: dcroxide_node::rpcrun::NodeRpcChain::new(chain, params.clone())
+            .with_chain_ntfn_handler(ntfn_handler),
         chain_params: params.clone(),
         subsidy_cache: std::sync::Mutex::new(dcroxide_standalone::SubsidyCache::new(
             dcroxide_rpc::server::RpcSubsidyParams(params),
         )),
         min_relay_tx_fee: cfg.min_relay_tx_fee_atoms,
         max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
-        sync_mgr: Box::new(dcroxide_node::rpcrun::NodeRpcSyncManager::new(
-            sync_manager,
-            Arc::clone(&tx_pool),
-        )),
+        // The mixing pool behind sendrawmixmessage (dcrd's
+        // `AcceptMixMessage` adaptor over `s.mixMsgPool`).
+        sync_mgr: Box::new(
+            dcroxide_node::rpcrun::NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool))
+                .with_mix_pool(Arc::clone(&mix_pool)),
+        ),
         conn_mgr: Box::new(
             dcroxide_node::rpcrun::NodeRpcConnManager::new(connected, net_totals)
                 .with_relay(
@@ -1671,7 +2009,9 @@ fn rpc_config(
         client_cert_auth: cfg.rpc_auth_type == dcroxide_node::config::AUTH_TYPE_CLIENT_CERT,
         tx_mempooler: Box::new(dcroxide_node::txmempool::NodeRpcTxMempooler::new(tx_pool)),
         clock: Box::new(dcroxide_node::rpcrun::SystemClock),
-        interfaces: Box::new(dcroxide_rpc::helpers::NoInterfaces),
+        // addnode and node dial an interface's first address when the
+        // host names one (dcrd `normalizeAddress`).
+        interfaces: Box::new(dcroxide_node::rpcrun::SystemInterfaces),
         // The process-wide generator, not a fresh kernel read: dcrd's
         // rpcserver imports `crypto/rand` and calls the package
         // functions for both draws this closure serves -- the ping
@@ -1693,12 +2033,14 @@ fn rpc_config(
         proxy: cfg.proxy.clone(),
         test_net: cfg.test_net,
         runtime_version: String::new(),
-        // The generating CPU miner arrives with a later piece; the idle
-        // stand-in reports not-mining so the getwork handler's mining
-        // gate allows work polling and submission (dcrd's miner is off
-        // by default).
+        // The CPU miner built above whenever mining addresses are
+        // configured, behind generate, setgenerate, getgenerate,
+        // gethashespersec and getmininginfo; without them the idle
+        // stand-in, which reports the miner off and refuses to generate.
         cpu_miner,
-        mix_pooler: Box::new(()),
+        // getmixpairrequests and getmixmessage read the same shared pool
+        // the peers feed (dcrd's `MixPooler: s.mixMsgPool`).
+        mix_pooler: Box::new(dcroxide_node::rpcrun::NodeRpcMixPooler::new(mix_pool)),
         profiler_mgr: Box::new(()),
         addr_manager: Box::new(dcroxide_node::rpcrun::NodeRpcAddrManager::new(addr_manager)),
         mining_addrs: cfg.mining_addrs.clone(),
@@ -1721,10 +2063,18 @@ fn rpc_config(
     }
 }
 
-/// The current time as unix seconds (matching the sync adapter's
+/// The median-adjusted time as unix seconds (the sync adapter's
 /// `adjusted_time_unix`), for driving the chain handler's deferred
 /// maintenance from the generator's drain hook.
 fn now_unix() -> i64 {
+    dcroxide_node::mediantime::adjusted_time_unix()
+}
+
+/// The wall-clock time as unix seconds, for the timestamps dcrd takes
+/// from `time.Now()` rather than the median-adjusted clock (the local
+/// addresses `initListeners` registers, stamped by
+/// `addrmgr.NewNetAddressFromIPPort`).
+fn wall_clock_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1745,4 +2095,81 @@ fn log_warn(msg: &str) {
 /// A package-main error line (dcrd `dcrdLog.Errorf`).
 fn log_error(msg: &str) {
     dcroxide_node::logging::error("DCRD", msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{passwd_home, stop_block_processing};
+    use std::sync::{Arc, Mutex};
+
+    /// `~` resolves through the account's password-file entry, parsed
+    /// with Go's cgo-free rules: the old lookup read `$HOME` alone, so a
+    /// unit without one expanded `~` under the working directory.
+    #[test]
+    fn the_home_comes_from_the_password_file_as_go_reads_it() {
+        let passwd = concat!(
+            "# comment:x:1000:1000::/commented:/bin/sh\n",
+            "+nis:x:1000:1000::/nis:/bin/sh\n",
+            "root:x:0:0:root:/root:/bin/bash\n",
+            "short:x:1000:1000:/short\n",
+            "badgid:x:1000:gid::/badgid:/bin/sh\n",
+            "\t node:x:1000:1000:Node,,,:/home/node:/bin/bash \n",
+            "other:x:1001:1001::/home/other:/bin/sh\n",
+        );
+        assert_eq!(passwd_home(passwd, "1000").as_deref(), Some("/home/node"));
+        assert_eq!(passwd_home(passwd, "0").as_deref(), Some("/root"));
+        assert_eq!(passwd_home(passwd, "1001").as_deref(), Some("/home/other"));
+        assert_eq!(passwd_home(passwd, "4242"), None);
+    }
+
+    /// The shutdown closes the sync manager's gate as dcrd's closed
+    /// `quit` does, so a block handed over after it -- by a peer thread
+    /// that was waiting on the manager, the RPC server or the miner --
+    /// is dropped rather than connected after the final flush.  Nothing
+    /// used to close it: `request_shutdown` had no caller.
+    #[test]
+    fn stopping_block_processing_closes_the_sync_manager() {
+        let params = dcroxide_chaincfg::simnet_params();
+        let dir = tempfile::tempdir().expect("database directory");
+        let opts = dcroxide_database::Options::new(dir.path().join("blocks_ffldb"), params.net.0);
+        dcroxide_database::create_dir_all_owner_only(&opts.path).expect("create the directory");
+        let db = dcroxide_database::Database::create(&opts).expect("create the database");
+        let chain = Arc::new(Mutex::new(
+            dcroxide_blockchain::process::Chain::open(db, &params, params.assume_valid, false, 0)
+                .expect("open the chain"),
+        ));
+        let tx_pool = dcroxide_node::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            false,
+            100,
+            10_000,
+            false,
+            false,
+        );
+        let mix_pool =
+            dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool);
+        let manager = Mutex::new(dcroxide_node::sync::new_sync_manager(
+            chain, &params, false, 8, 100, tx_pool, mix_pool,
+        ));
+
+        // The genesis block again: processing it fails, which is what
+        // shows whether it was processed at all.
+        let block = params.genesis_block.clone();
+        assert!(
+            manager
+                .lock()
+                .expect("manager")
+                .process_block(&block)
+                .is_err(),
+            "a running manager processes the block"
+        );
+        stop_block_processing(&manager);
+        let mut manager = manager.lock().expect("manager");
+        assert!(
+            manager.process_block(&block).is_ok(),
+            "a stopped manager drops the block unprocessed"
+        );
+        assert!(manager.on_block(1, &block).is_empty());
+    }
 }

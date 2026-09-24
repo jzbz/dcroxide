@@ -81,10 +81,14 @@ socket2 = "0.6.4"
 # but not from RDHUP.  It is a safe wrapper -- the workspace forbids
 # unsafe_code -- and adds no crate the lockfile did not already carry:
 # rustix and linux-raw-sys arrive via tempfile for tests, and bitflags
-# already ships through nix.  Only the `event` API is enabled.
+# already ships through nix.  Only the `event` API is enabled, plus
+# `process` for the safe `getrlimit`/`setrlimit` behind the descriptor
+# limit raise dcrd gets from the Go runtime and `limits.SetLimits`
+# (`limits.rs`); that feature only turns on linux-raw-sys's `prctl`
+# module, so it adds no crate either.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-rustix = { version = "1.1.4", default-features = false, features = ["std", "event"] }
+rustix = { version = "1.1.4", default-features = false, features = ["std", "event", "process"] }
 
 # The kqueue half of the same problem, for the platforms rustix gates
 # POLLRDHUP away from.  nix is the only safe wrapper available: rustix's

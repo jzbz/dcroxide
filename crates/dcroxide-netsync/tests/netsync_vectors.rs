@@ -21,8 +21,8 @@ use dcroxide_chaincfg::{Params, mainnet_params, regnet_params};
 use dcroxide_chainhash::Hash;
 use dcroxide_containers::apbf;
 use dcroxide_netsync::{
-    Action, BestSnapshot, Config, LogLevel, Peer, ProcessBlockFailure, SyncChain, SyncManager,
-    SyncMixPool, SyncTxPool,
+    Action, BestSnapshot, Config, LogLevel, Peer, ProcessBlockFailure, ProcessTxFailure, SyncChain,
+    SyncManager, SyncMixPool, SyncTxPool,
 };
 use dcroxide_wire::{
     BlockHeader, InvType, InvVect, MsgBlock, MsgHeaders, MsgInv, MsgNotFound, MsgTx,
@@ -117,12 +117,17 @@ impl SyncChain for ChainAdapter {
         })
     }
 
-    fn process_block_header(&mut self, header: &BlockHeader) -> Result<(), String> {
+    fn process_block_header(&mut self, header: &BlockHeader) -> Result<(), ProcessBlockFailure> {
         let now = self.now;
         let params = self.params.clone();
         self.chain
             .process_block_header(header, now, &params)
-            .map_err(|e| format!("{:?}", e.kind))
+            .map_err(|e| ProcessBlockFailure {
+                is_duplicate_block: false,
+                is_rule_error: true,
+                is_corruption: false,
+                message: format!("{:?}", e.kind),
+            })
     }
 
     fn process_block(&mut self, block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
@@ -135,6 +140,7 @@ impl SyncChain for ChainAdapter {
         Err(ProcessBlockFailure {
             is_duplicate_block: errs[0].kind == RuleErrorKind::DuplicateBlock,
             is_rule_error: true,
+            is_corruption: false,
             message: errs[0].description.clone(),
         })
     }
@@ -176,11 +182,15 @@ impl SyncTxPool for ScriptedTxPool {
         allow_orphan: bool,
         allow_high_fees: bool,
         tag: u64,
-    ) -> Result<Vec<(Hash, MsgTx)>, String> {
+    ) -> Result<Vec<(Hash, MsgTx)>, ProcessTxFailure> {
         // The scripted pool never accepts anything, so pairing the
         // hashes back up with the delivered transaction is enough.
         Ok(self
-            .process_transaction(tx, allow_orphan, allow_high_fees, tag)?
+            .process_transaction(tx, allow_orphan, allow_high_fees, tag)
+            .map_err(|message| ProcessTxFailure {
+                is_rule_error: true,
+                message,
+            })?
             .into_iter()
             .map(|hash| (hash, tx.clone()))
             .collect())
@@ -263,13 +273,19 @@ impl SyncChain for StubChain {
     fn have_block(&mut self, _hash: &Hash) -> bool {
         false
     }
-    fn process_block_header(&mut self, _header: &BlockHeader) -> Result<(), String> {
-        Err("stub".to_string())
+    fn process_block_header(&mut self, _header: &BlockHeader) -> Result<(), ProcessBlockFailure> {
+        Err(ProcessBlockFailure {
+            is_duplicate_block: false,
+            is_rule_error: true,
+            is_corruption: false,
+            message: "stub".to_string(),
+        })
     }
     fn process_block(&mut self, _block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
         Err(ProcessBlockFailure {
             is_duplicate_block: false,
             is_rule_error: true,
+            is_corruption: false,
             message: "stub".to_string(),
         })
     }
@@ -412,8 +428,9 @@ fn netsync_scenario_matches_dcrd() {
                 // the stall timer has no dcrd-observable counterpart,
                 // the known-inventory marks and the sync log lines are
                 // pinned natively (the dump captured no log output),
-                // and the progress accumulations feed the daemon-side
-                // throttle.
+                // the progress accumulations feed the daemon-side
+                // throttle, and the height mirror only moves the value
+                // the peer shadows already read off the manager.
                 Action::Disconnect { .. }
                 | Action::MarkKnownInventory { .. }
                 | Action::Log { .. }
@@ -421,7 +438,8 @@ fn netsync_scenario_matches_dcrd() {
                 | Action::LogHeaderProgress { .. }
                 | Action::ResetProgressLogTime
                 | Action::ResetHeaderSyncStallTimeout
-                | Action::StopHeaderSyncStallTimeout => {}
+                | Action::StopHeaderSyncStallTimeout
+                | Action::UpdateLastBlockHeight { .. } => {}
             }
         }
     };
@@ -512,7 +530,7 @@ fn netsync_scenario_matches_dcrd() {
                     }
                     "ontx" => {
                         let tx = &txs[f[4]];
-                        let accepted = m.on_tx(peer_id, tx);
+                        let (accepted, _) = m.on_tx(peer_id, tx);
                         // The accepted count row is checked below via
                         // txresult; stash it in the shadow-free way.
                         step_msgs
@@ -871,12 +889,17 @@ impl SyncChain for ScriptedHeaderChain {
     fn have_block(&mut self, _hash: &Hash) -> bool {
         false
     }
-    fn process_block_header(&mut self, _header: &BlockHeader) -> Result<(), String> {
+    fn process_block_header(&mut self, _header: &BlockHeader) -> Result<(), ProcessBlockFailure> {
         if self.processed < self.accept {
             self.processed += 1;
             Ok(())
         } else {
-            Err("scripted header rejection".to_string())
+            Err(ProcessBlockFailure {
+                is_duplicate_block: false,
+                is_rule_error: true,
+                is_corruption: false,
+                message: "scripted header rejection".to_string(),
+            })
         }
     }
     fn process_block(&mut self, _block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
@@ -885,6 +908,7 @@ impl SyncChain for ScriptedHeaderChain {
             .unwrap_or(Err(ProcessBlockFailure {
                 is_duplicate_block: false,
                 is_rule_error: true,
+                is_corruption: false,
                 message: "unused".to_string(),
             }))
     }
@@ -1190,6 +1214,7 @@ fn block_path_log_lines() {
         Err(ProcessBlockFailure {
             is_duplicate_block: false,
             is_rule_error: true,
+            is_corruption: false,
             message: "the block violates a rule".to_string(),
         }),
     ]

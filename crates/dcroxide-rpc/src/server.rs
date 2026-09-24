@@ -915,6 +915,18 @@ impl RpcTemplateSubscription for () {}
 /// exercise.
 impl RpcSyncManager for () {}
 
+/// The error [`RpcConnManager::connect`] returns for a connection
+/// attempt that was canceled.  The text is Go's `context.Canceled`,
+/// and the `addnode` and `node connect` handlers answer it with dcrd's
+/// cancel error.
+pub const CONNECT_CANCELED: &str = "context canceled";
+
+/// The error [`RpcConnManager::connect`] returns for a connection
+/// attempt that ran out its dial timeout.  The text is Go's
+/// `context.DeadlineExceeded`, and the `addnode` and `node connect`
+/// handlers answer it with dcrd's timeout error.
+pub const CONNECT_DEADLINE_EXCEEDED: &str = "context deadline exceeded";
+
 /// The connection manager operations the ported handlers perform
 /// (the used subset of dcrd's `rpcserver.ConnManager` interface).
 pub trait RpcConnManager {
@@ -929,7 +941,9 @@ pub trait RpcConnManager {
         unimplemented!("net_totals")
     }
     /// Add the address as a persistent or one-try peer (dcrd
-    /// `Connect`).
+    /// `Connect`).  A canceled attempt fails with [`CONNECT_CANCELED`]
+    /// and a timed-out one with [`CONNECT_DEADLINE_EXCEEDED`], the
+    /// errors dcrd's handlers test with `errors.Is`.
     fn connect(&self, _addr: &str, _permanent: bool) -> Result<(), String> {
         Err(unwired_seam("connect"))
     }
@@ -1090,11 +1104,19 @@ pub trait RpcExistsAddresser {
 impl RpcExistsAddresser for () {}
 
 /// A mempool transaction descriptor (the used subset of dcrd
-/// `mempool.TxDesc`).
+/// `mempool.TxDesc`).  The handlers read only the transaction's
+/// serialized size, never the transaction itself, so the adapter
+/// carries the size rather than a copy of the transaction: dcrd hands
+/// out descriptor pointers, and deep-copying every pool transaction
+/// for a fee-stats call is a cost dcrd does not pay.
 #[derive(Debug, Clone)]
 pub struct RpcMempoolTx {
-    /// The transaction.
-    pub tx: MsgTx,
+    /// The serialized size of the transaction in bytes (dcrd
+    /// `desc.Tx.MsgTx().SerializeSize()`).
+    pub serialize_size: usize,
+    /// The transaction hash the pool cached at admission (dcrd reads
+    /// `TxDesc.Tx.Hash()`, cached on the `dcrutil.Tx`).
+    pub tx_hash: Hash,
     /// The stake type of the transaction.
     pub tx_type: dcroxide_stake::TxType,
     /// The fee the transaction pays in atoms (dcrd `TxDesc.Fee`).
@@ -1102,11 +1124,15 @@ pub struct RpcMempoolTx {
 }
 
 /// A verbose mempool transaction descriptor (the used subset of dcrd
-/// `mempool.VerboseTxDesc`).
+/// `mempool.VerboseTxDesc`), carrying the serialized size in place of
+/// the transaction for the same reason as [`RpcMempoolTx`].
 #[derive(Debug, Clone)]
 pub struct RpcVerboseMempoolTx {
-    /// The transaction.
-    pub tx: MsgTx,
+    /// The serialized size of the transaction in bytes (dcrd
+    /// `desc.Tx.MsgTx().SerializeSize()`).
+    pub serialize_size: usize,
+    /// The transaction hash the pool cached at admission.
+    pub tx_hash: Hash,
     /// The stake type of the transaction.
     pub tx_type: dcroxide_stake::TxType,
     /// When the transaction was added to the pool, as unix seconds.
@@ -1115,7 +1141,10 @@ pub struct RpcVerboseMempoolTx {
     pub height: i64,
     /// The total fee in atoms.
     pub fee: i64,
-    /// The hashes of unconfirmed pool transactions this one redeems.
+    /// The hashes of unconfirmed pool transactions this one redeems,
+    /// one per redeeming input (dcrd `VerboseTxDesc.Depends`, which
+    /// repeats a parent the transaction spends more than one output
+    /// of).
     pub depends: Vec<Hash>,
 }
 

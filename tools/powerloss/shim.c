@@ -16,7 +16,7 @@
 // Results that depend on this tool, all in docs/bench-ledger.md: fjall
 // surviving 10 rounds of real power loss, and dcroxide's own block files
 // surviving 3 -- the latter showing that only metadata.redb ever has
-// anything to undo, because DbCache::flush syncs the block files first and
+// anything to undo, because DbCache::run_flush syncs the block files first and
 // the metadata commit is 68-71% of block-sync wall time, so a kill at an
 // arbitrary instant lands inside it.
 //

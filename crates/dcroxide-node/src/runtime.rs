@@ -3,13 +3,16 @@
 //! translation of the backbone of dcrd `server.go`'s `Run` and
 //! `peerHandler` goroutines.
 //!
-//! This first slice binds the configured listeners and accepts inbound
-//! connections on a dedicated thread per listener, coordinating a
-//! graceful shutdown by signalling those threads and joining them.  The
-//! connection manager (outbound dialing and seeding), the peer version
-//! handshake, the per-peer input and output loops, the sync manager,
-//! and the RPC server arrive with later pieces and plug into this same
-//! shutdown coordination.
+//! It binds the configured peer-to-peer listeners and accepts inbound
+//! connections on a dedicated thread per listener, and serves every
+//! peer -- accepted here or dialed by the connection manager
+//! ([`crate::outbound`]) -- on a thread of its own through the version
+//! handshake and the per-peer input and output loops, with the
+//! server's message handlers and the sync manager behind them.  The
+//! connected-peer registry lets a shutdown disconnect them all, and
+//! the listeners stop by signalling their threads and joining them.
+//! The daemon binary starts these alongside the RPC server and stops
+//! them in its teardown.
 
 use std::collections::HashMap;
 use std::io;
@@ -19,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use dcroxide_addrmgr::NetAddress;
 use dcroxide_peer::{Config, Peer, PeerEnv};
 use dcroxide_wire::{CurrencyNet, ServiceFlag};
 
@@ -26,12 +30,45 @@ use dcroxide_wire::Message;
 
 use crate::dispatch::{ServerContext, ServerPeerHandler};
 use crate::peerconn::{NodePeerEnv, net_address_v2_from_socket};
-use crate::peerloop::{OutboundQueue, ServeHooks, ServeSignal, run_peer_connection};
+use crate::peerloop::{
+    DisconnectReason, OutboundQueue, ServeHooks, ServeSignal, run_peer_connection,
+};
 use crate::server::is_whitelisted;
 
 /// The interval the accept loops wait between polling for shutdown when
 /// no connection is pending.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Start a thread on a connection path, handing back the OS's refusal
+/// instead of panicking.
+///
+/// `std::thread::spawn` panics when the OS refuses a thread (`EAGAIN`
+/// under `RLIMIT_NPROC` or a cgroup `pids.max`, `ENOMEM` for its stack),
+/// and release builds abort on a panic, so a peer arriving under thread
+/// exhaustion took the whole node down.  dcrd has no such failure: its
+/// connections run as goroutines.  Every thread a remote peer's arrival
+/// causes starts here, and each caller treats a refusal as a dropped
+/// connection or a failed dial, as the RPC accept loop already does.
+pub(crate) fn spawn_conn_thread<F, T>(name: &str, work: F) -> io::Result<JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    #[cfg(test)]
+    if REFUSE_CONN_THREADS.with(std::cell::Cell::get) {
+        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+    }
+    thread::Builder::new().name(name.to_string()).spawn(work)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`spawn_conn_thread`] on this thread fail the way the OS
+    /// refuses a thread, which a test cannot otherwise arrange without
+    /// starving the whole test process.
+    pub(crate) static REFUSE_CONN_THREADS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 /// A handler invoked for each accepted inbound connection (dcrd
 /// `server.inboundPeerConnected`).  It runs on the listener's accept
@@ -138,10 +175,22 @@ pub struct PeerTemplate {
     pub user_agent_name: String,
     /// The user agent version to advertise.
     pub user_agent_version: String,
-    /// How long a peer may be silent before it is disconnected.
+    /// How long a peer may be silent before it is disconnected (dcrd's
+    /// `IdleTimeout: cfg.PeerIdleTimeout`).
     pub idle_timeout: Duration,
     /// How often to ping an otherwise-quiet peer.
     pub ping_interval: Duration,
+    /// Whether the `version` message asks the remote not to relay
+    /// transactions (dcrd's `DisableRelayTx: cfg.BlocksOnly`).  A dcrd
+    /// peer honours it by leaving transaction and mix inventory out of
+    /// what it relays here; without it, a blocks-only node invited that
+    /// inventory and then disconnected every peer that sent it.
+    pub disable_relay_tx: bool,
+    /// The configured SOCKS proxy in host:port form, empty for none
+    /// (dcrd's `Proxy: cfg.Proxy`).  The `version` message sends a
+    /// connection arriving from the proxy's host an all-zero address as
+    /// its `addr_you`, so the proxy's address does not leak.
+    pub proxy: String,
     /// Reports the chain tip for the `version` message's `last_block`
     /// (dcrd's `Config.NewestBlock`, fed by `server.NewestBlock`).
     ///
@@ -163,18 +212,62 @@ pub type NewestBlockProvider =
     Arc<dyn Fn() -> Result<(dcroxide_chainhash::Hash, i64), String> + Send + Sync>;
 
 impl PeerTemplate {
-    /// Build a fresh peer configuration for a new connection.
+    /// The daemon's template, taking dcrd `newPeerConfig`'s
+    /// configuration-driven fields from the parsed config: the network,
+    /// `IdleTimeout` from `--peeridletimeout`, `DisableRelayTx` from
+    /// `--blocksonly` and `Proxy` from `--proxy`.  The services are
+    /// dcrd's `defaultServices`, the protocol version the package
+    /// maximum (dcrd's `maxProtocolVersion`), and the ping interval
+    /// dcrd's constant, which `--peeridletimeout` does not move.
+    ///
+    /// Here rather than in the binary so a test can check the wiring:
+    /// while `main` built the template, all three options stopped at
+    /// the parser, the idle timeout hard-coded to its default.
+    pub fn from_config(
+        cfg: &crate::config::Config,
+        user_agent_name: &str,
+        newest_block: Option<NewestBlockProvider>,
+    ) -> PeerTemplate {
+        PeerTemplate {
+            net: cfg.params.params.net,
+            // 0 selects the package's maximum protocol version.
+            protocol_version: 0,
+            services: ServiceFlag::NODE_NETWORK,
+            user_agent_name: user_agent_name.to_string(),
+            user_agent_version: crate::version::user_agent_version(),
+            // Validated to at least 15 seconds by the config pipeline.
+            idle_timeout: Duration::from_nanos(cfg.peer_idle_timeout_nanos.max(0) as u64),
+            ping_interval: Duration::from_nanos(dcroxide_peer::PING_INTERVAL as u64),
+            disable_relay_tx: cfg.blocks_only,
+            proxy: cfg.proxy.clone(),
+            newest_block,
+        }
+    }
+
+    /// Build a fresh peer configuration for a new connection (dcrd
+    /// `newPeerConfig`).
     ///
     /// Public so a test can check what the connection will actually
     /// advertise; the height this carries was unwired for a long time
     /// without anything noticing.
     pub fn config(&self) -> Config {
+        // dcrd advertises the version's pre-release portion as the one
+        // user agent comment, `.../dcrd:2.2.0(pre)/`.
+        let pre_release = &crate::version::version_components().pre_release;
+        let user_agent_comments = if pre_release.is_empty() {
+            Vec::new()
+        } else {
+            vec![pre_release.clone()]
+        };
         Config {
             net: self.net,
             services: self.services,
             user_agent_name: self.user_agent_name.clone(),
             user_agent_version: self.user_agent_version.clone(),
+            user_agent_comments,
             protocol_version: self.protocol_version,
+            disable_relay_tx: self.disable_relay_tx,
+            proxy: self.proxy.clone(),
             idle_timeout_nanos: self.idle_timeout.as_nanos() as i64,
             newest_block: self.newest_block.clone().map(|provider| {
                 Box::new(move || provider()) as Box<dyn FnMut() -> Result<_, String> + Send>
@@ -249,7 +342,12 @@ pub fn inbound_peer_handler(
         let template = template.clone();
         let connected = connected.clone();
         let server = server.clone();
-        thread::spawn(move || {
+        // Released by the serving thread when the peer is done, or here
+        // when the OS refuses that thread: the socket closes with the
+        // refused closure, and the admission's permits go back exactly
+        // as they would for a connection that ended at once.
+        let release = admitted.clone();
+        let spawned = spawn_conn_thread("peer-inbound", move || {
             serve_inbound_peer(stream, addr, &template, &connected, server);
             if let Some((manager, conn_id)) = admitted {
                 manager
@@ -258,6 +356,18 @@ pub fn inbound_peer_handler(
                     .conn_closed(conn_id);
             }
         });
+        if let Err(e) = spawned {
+            crate::logging::warn(
+                "SRVR",
+                &format!("Unable to start a thread for inbound peer {addr}: {e} -- dropping it"),
+            );
+            if let Some((manager, conn_id)) = release {
+                manager
+                    .lock()
+                    .expect("connmgr mutex poisoned")
+                    .conn_closed(conn_id);
+            }
+        }
     })
 }
 
@@ -294,7 +404,7 @@ fn log_inbound_drop(
                 ),
             );
             let manager = Arc::clone(manager);
-            thread::spawn(move || {
+            let spawned = spawn_conn_thread("drop-log-reset", move || {
                 thread::sleep(std::time::Duration::from_nanos(
                     reset_after_nanos.max(0) as u64
                 ));
@@ -303,20 +413,31 @@ fn log_inbound_drop(
                     .expect("connmgr mutex poisoned")
                     .inbound_limiter
                     .finish_suppression();
-                if let Some(dropped) = summary {
-                    let noun = if dropped == 1 {
-                        "connection"
-                    } else {
-                        "connections"
-                    };
-                    crate::logging::debug(
-                        "CMGR",
-                        &format!("Dropped {dropped} {noun} while suppressed"),
-                    );
-                }
+                log_suppressed_drops(summary);
             });
+            // With no timer to end it, the suppression would last
+            // forever; end it now instead, so the next drop logs again.
+            if spawned.is_err() {
+                log_suppressed_drops(mgr.inbound_limiter.finish_suppression());
+            }
         }
         dcroxide_connmgr::LogDropsOutcome::Suppressed => {}
+    }
+}
+
+/// Log how many inbound drops a finished suppression swallowed (dcrd
+/// `inboundRateLimiter`'s reset timer).
+fn log_suppressed_drops(summary: Option<u64>) {
+    if let Some(dropped) = summary {
+        let noun = if dropped == 1 {
+            "connection"
+        } else {
+            "connections"
+        };
+        crate::logging::debug(
+            "CMGR",
+            &format!("Dropped {dropped} {noun} while suppressed"),
+        );
     }
 }
 
@@ -374,7 +495,7 @@ fn serve_inbound_peer(
     serve_connection(
         crate::transport::Teardown::new(stream),
         peer,
-        addr,
+        &addr.to_string(),
         template,
         connected,
         server,
@@ -389,10 +510,13 @@ fn serve_inbound_peer(
 /// connection manager driver once a dial has established the socket;
 /// `conn_req_id` is the manager's request id, carried with the peer so
 /// the manual-control RPCs can remove the request (dcrd's
-/// `serverPeer.connReq`).
+/// `serverPeer.connReq`).  `addr` is the address the manager dialed,
+/// a Tor onion key as well as an IP address (dcrd's
+/// `conn.RemoteAddr()` as an `*addrmgr.NetAddress`); the peer is keyed
+/// on its `Key` form, dcrd's `addr.String()`.
 pub(crate) fn serve_outbound_peer(
     conn: crate::transport::Teardown,
-    addr: SocketAddr,
+    addr: &NetAddress,
     template: &PeerTemplate,
     connected: &ConnectedPeers,
     server: Option<Arc<ServerContext>>,
@@ -404,7 +528,7 @@ pub(crate) fn serve_outbound_peer(
     // check since the connection manager is unaware of banned
     // addresses.
     if let Some(server) = &server {
-        let host = addr.ip().to_string();
+        let host = banned_conn_host(addr);
         let mut banned = server
             .banned_hosts
             .lock()
@@ -421,13 +545,14 @@ pub(crate) fn serve_outbound_peer(
     // its addr_you carries zero services (dcrd's outbound
     // `newNetAddress(remoteAddr, remoteServices)` with remoteServices
     // still zero).
-    let na = match net_address_v2_from_socket(addr, dcroxide_wire::ServiceFlag(0)) {
+    let na = match outbound_net_address_v2(addr) {
         Ok(na) => na,
         Err(_) => return,
     };
-    let peer = match Peer::new_outbound(template.config(), &addr.to_string()) {
+    let key = addr.key();
+    let peer = match Peer::new_outbound(template.config(), &key) {
         Ok(mut peer) => {
-            peer.associate(&addr.to_string(), na, NodePeerEnv::new().now_nanos());
+            peer.associate(&key, na, NodePeerEnv::new().now_nanos());
             peer
         }
         Err(_) => return,
@@ -436,13 +561,52 @@ pub(crate) fn serve_outbound_peer(
     serve_connection(
         conn,
         peer,
-        addr,
+        &key,
         template,
         connected,
         server,
         permanent,
         conn_req_id,
     );
+}
+
+/// dcrd `handleBannedConn`'s ban key for a dialed address,
+/// `net.IP(remoteAddr.IP).String()`.  That is the address manager's
+/// rendering for an IP address.  For a Tor v3 address, whose 32-byte
+/// key is neither IP length, Go renders `"?"` and the hex bytes, which
+/// no ban can match: bans are keyed by the host of the peer's address
+/// (`BanPeer`), the `.onion` name.
+fn banned_conn_host(addr: &NetAddress) -> String {
+    match addr.addr_type {
+        dcroxide_addrmgr::NetAddressType::IPv4 | dcroxide_addrmgr::NetAddressType::IPv6 => {
+            addr.ip_string()
+        }
+        _ => {
+            let hex: String = addr.ip.iter().map(|b| format!("{b:02x}")).collect();
+            format!("?{hex}")
+        }
+    }
+}
+
+/// The dialed address as the outbound peer's wire address, with the
+/// timestamp and services still zero because the remote has not sent
+/// its version yet.  An IP address takes the socket form the inbound
+/// path uses; a Tor v3 address keeps its onion key and type (dcrd's
+/// `HostToNetAddress` over the `.onion` host), which the version message
+/// sends as an all-zero address as dcrd's does.
+fn outbound_net_address_v2(addr: &NetAddress) -> Result<dcroxide_wire::NetAddressV2, String> {
+    if addr.addr_type == dcroxide_addrmgr::NetAddressType::TorV3 {
+        return Ok(crate::server::addrmgr_to_wire_net_address_v2(&NetAddress {
+            timestamp: 0,
+            services: dcroxide_wire::ServiceFlag(0),
+            ..addr.clone()
+        }));
+    }
+    let socket = addr
+        .key()
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("unservable address {}: {e}", addr.key()))?;
+    net_address_v2_from_socket(socket, dcroxide_wire::ServiceFlag(0))
 }
 
 /// Register a connected peer, run it through the connection runtime
@@ -453,7 +617,7 @@ pub(crate) fn serve_outbound_peer(
 fn serve_connection(
     conn: crate::transport::Teardown,
     peer: Peer,
-    addr: SocketAddr,
+    addr: &str,
     template: &PeerTemplate,
     connected: &ConnectedPeers,
     server: Option<Arc<ServerContext>>,
@@ -476,7 +640,7 @@ fn serve_connection(
         .map(|ctx| std::sync::Arc::clone(&ctx.net_totals));
     let hooks = match server {
         Some(ctx) => {
-            let whitelisted = is_whitelisted(&ctx.whitelists, &addr.to_string());
+            let whitelisted = is_whitelisted(&ctx.whitelists, addr);
             InboundHooks::Server(ServerPeerHandler::new(
                 ctx,
                 whitelisted,
@@ -493,7 +657,12 @@ fn serve_connection(
         InboundHooks::Server(_) => server_net_totals,
         InboundHooks::NoOp => None,
     };
-    let _ = run_peer_connection(
+    let direction = if peer.inbound() {
+        "inbound"
+    } else {
+        "outbound"
+    };
+    let reason = run_peer_connection(
         conn,
         peer,
         template.protocol_version,
@@ -503,6 +672,16 @@ fn serve_connection(
         net_totals,
         hooks,
     );
+    // dcrd's `inboundPeerConnected`/`outboundPeerConnected` report a
+    // failed `Handshake` at debug (`server.go:2291`, `:2324`); the
+    // session's own endings are logged by the peer loops, as dcrd's
+    // `inHandler` logs them.
+    if let DisconnectReason::Negotiate(err) = &reason {
+        crate::logging::debug(
+            "SRVR",
+            &format!("Failed handshake for {direction} peer {addr}: {err}"),
+        );
+    }
 }
 
 /// The lifecycle hooks a served inbound connection runs: the full
@@ -533,35 +712,36 @@ impl ServeHooks for InboundHooks {
 
     fn on_connected(
         &mut self,
-        peer: &mut Peer,
-        peer_handle: &Arc<Mutex<Peer>>,
+        peer: &Arc<Mutex<Peer>>,
         outbound: &OutboundQueue,
         remote_disable_relay_tx: bool,
     ) {
         if let InboundHooks::Server(handler) = self {
-            handler.on_connected(peer, peer_handle, outbound, remote_disable_relay_tx);
+            handler.on_connected(peer, outbound, remote_disable_relay_tx);
         }
     }
 
     fn on_message(
         &mut self,
-        peer: &mut Peer,
-        msg: &Message,
+        peer: &Mutex<Peer>,
+        msg: Message,
+        mix_hash: Option<dcroxide_chainhash::Hash>,
         outbound: &OutboundQueue,
     ) -> ServeSignal {
         match self {
-            InboundHooks::Server(handler) => handler.handle_message(peer, msg, outbound),
+            InboundHooks::Server(handler) => handler.handle_message(peer, msg, mix_hash, outbound),
             InboundHooks::NoOp => ServeSignal::Continue,
         }
     }
 
-    fn on_wire_violation(&mut self, err: &str) {
-        if let InboundHooks::Server(handler) = self {
-            handler.on_wire_violation(err);
+    fn on_wire_violation(&mut self, err: &str) -> ServeSignal {
+        match self {
+            InboundHooks::Server(handler) => handler.on_wire_violation(err),
+            InboundHooks::NoOp => ServeSignal::Continue,
         }
     }
 
-    fn on_disconnected(&mut self, peer: &mut Peer) {
+    fn on_disconnected(&mut self, peer: &Mutex<Peer>) {
         if let InboundHooks::Server(handler) = self {
             handler.on_disconnected(peer);
         }
@@ -584,7 +764,16 @@ fn bind_address(net: &str, addr: &str) -> String {
 /// dual-stack host (Linux `bindv6only=0`) refuses the `[::]` wildcard
 /// with "address in use" once the `0.0.0.0` wildcard for the same port —
 /// the other half of the default listener pair — is already bound.
-fn bind_listener(net: &str, addr: &str) -> io::Result<TcpListener> {
+///
+/// Both kinds set `SO_REUSEADDR` outside Windows, as Go's
+/// `setDefaultListenerSockopts` (net/sockopt_linux.go, sockopt_bsd.go)
+/// does for every listener: std's bind sets it for the `tcp4` one, and
+/// the hand-built `tcp6` socket sets it itself.  Without it a restart
+/// failed to bind `[::]` for as long as the previous run's IPv6 inbound
+/// connections sat in `TIME_WAIT` (they inherit the listener's setting),
+/// which is a minute on Linux.  Neither sets it on Windows, where it
+/// would let another socket take the port.
+pub(crate) fn bind_listener(net: &str, addr: &str) -> io::Result<TcpListener> {
     let bind_addr = bind_address(net, addr);
     if net == "tcp6" {
         // The address is an IP:port by the time it reaches here (the
@@ -593,6 +782,10 @@ fn bind_listener(net: &str, addr: &str) -> io::Result<TcpListener> {
         if let Ok(sock_addr) = bind_addr.parse::<SocketAddr>() {
             let socket = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)?;
             socket.set_only_v6(true)?;
+            // Go leaves it unset on Windows, where it would let another
+            // socket take over a port in use; std's bind does the same.
+            #[cfg(not(windows))]
+            socket.set_reuse_address(true)?;
             socket.bind(&sock_addr.into())?;
             socket.listen(128)?;
             return Ok(socket.into());
@@ -612,9 +805,13 @@ pub struct ListenerRuntime {
 impl ListenerRuntime {
     /// Bind each `(network, address)` listener spec (as produced by
     /// `parse_listeners`) and start accepting inbound connections,
-    /// invoking `on_inbound` for each accepted connection.  A bind
-    /// failure aborts startup and returns the error, matching dcrd's
-    /// refusal to start when it cannot listen on a requested address.
+    /// invoking `on_inbound` for each accepted connection.
+    ///
+    /// A spec that cannot be bound is logged and skipped, as dcrd's
+    /// `initListeners` does, so a host where only one half of the
+    /// default `tcp4`/`tcp6` pair binds (IPv6 disabled, say) serves on
+    /// the other.  Startup fails only when nothing binds, with
+    /// `newServer`'s "no valid listen address".
     pub fn start(
         specs: &[(&str, String)],
         on_inbound: InboundHandler,
@@ -624,19 +821,34 @@ impl ListenerRuntime {
         let mut bound = Vec::with_capacity(specs.len());
 
         for (net, addr) in specs {
-            let listener = bind_listener(net, addr)?;
             // Non-blocking accept so the loop can observe shutdown
             // promptly without a separate wakeup connection.
-            listener.set_nonblocking(true)?;
-            bound.push(listener.local_addr()?);
+            let listened = bind_listener(net, addr).and_then(|listener| {
+                listener.set_nonblocking(true)?;
+                let local = listener.local_addr()?;
+                Ok((listener, local))
+            });
+            let (listener, local) = match listened {
+                Ok(listened) => listened,
+                Err(e) => {
+                    // dcrd logs the spec as given (its `simpleAddr`),
+                    // ":9108" for the default pair.
+                    crate::logging::warn("SRVR", &format!("Can't listen on {addr}: {e}"));
+                    continue;
+                }
+            };
+            bound.push(local);
 
             let shutdown = Arc::clone(&shutdown);
             let handler = Arc::clone(&on_inbound);
             threads.push(std::thread::spawn(move || {
-                accept_loop(&listener, &shutdown, &handler);
+                accept_loop(&listener, local, &shutdown, &handler);
             }));
         }
 
+        if bound.is_empty() {
+            return Err(io::Error::other("no valid listen address"));
+        }
         Ok(ListenerRuntime {
             shutdown,
             threads,
@@ -662,8 +874,15 @@ impl ListenerRuntime {
 }
 
 /// Accept inbound connections on the listener until shutdown is
-/// signalled, handing each to the handler.
-fn accept_loop(listener: &TcpListener, shutdown: &AtomicBool, handler: &InboundHandler) {
+/// signalled, handing each to the handler (dcrd connmgr's
+/// `listenHandler`, with its log lines).
+fn accept_loop(
+    listener: &TcpListener,
+    local: SocketAddr,
+    shutdown: &AtomicBool,
+    handler: &InboundHandler,
+) {
+    crate::logging::info("CMGR", &format!("Server listening on {local}"));
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
             // The listener is non-blocking so this loop can poll for
@@ -674,20 +893,46 @@ fn accept_loop(listener: &TcpListener, shutdown: &AtomicBool, handler: &InboundH
             // so it is dropped rather than served.
             Ok((stream, addr)) => {
                 if stream.set_nonblocking(false).is_ok() {
+                    // Go sets TCP_NODELAY on every connection it accepts,
+                    // ignoring a failure (`newTCPConn`, `net/tcpsock.go`),
+                    // so a small message queued behind unacknowledged data
+                    // never waits on Nagle's algorithm for the peer's
+                    // delayed ACK.
+                    let _ = stream.set_nodelay(true);
                     handler(stream, addr);
                 }
             }
-            // WouldBlock means no connection is pending; anything else
-            // is a transient accept error (a peer resetting between the
-            // SYN queue and accept, descriptor pressure) that must not
-            // kill the listener — dcrd logs and keeps accepting.  Either
-            // way wait a poll interval, which also keeps a persistent
-            // error from spinning hot.
-            Err(_) => {
+            // No connection pending, or an accept error that must not
+            // kill the listener (descriptor pressure, say): dcrd logs the
+            // error and keeps accepting.  Either way wait a poll
+            // interval, which also keeps a persistent error from
+            // spinning hot.
+            Err(e) => {
+                if let Some(msg) = accept_error_log(&e, shutdown.load(Ordering::SeqCst)) {
+                    crate::logging::error("CMGR", &msg);
+                }
                 std::thread::sleep(ACCEPT_POLL_INTERVAL);
             }
         }
     }
+    crate::logging::trace("CMGR", &format!("Listener handler done for {local}"));
+}
+
+/// The line dcrd's `listenHandler` logs for a failed accept, "Can't
+/// accept connection", or `None` when it logs nothing.  It stays quiet
+/// during shutdown, and for what never reaches it as an error: the
+/// non-blocking poll finding nothing pending, and the `EINTR` and
+/// `ECONNABORTED` (a connection reset while still queued) that Go's
+/// `Accept` retries internally.
+fn accept_error_log(err: &io::Error, shutting_down: bool) -> Option<String> {
+    let retried = matches!(
+        err.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+    );
+    if retried || shutting_down {
+        return None;
+    }
+    Some(format!("Can't accept connection: {err}"))
 }
 
 #[cfg(test)]
@@ -806,6 +1051,70 @@ mod tests {
         );
     }
 
+    /// A serving thread the OS refuses drops the accepted connection and
+    /// gives its admission back, instead of panicking the accept loop —
+    /// which aborted a release build, since `std::thread::spawn` panics
+    /// on the refusal.
+    #[test]
+    fn a_refused_serving_thread_releases_the_admission() {
+        use std::io::Read;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let bound = listener.local_addr().expect("addr");
+        let template = PeerTemplate {
+            net: CurrencyNet::TEST_NET3,
+            protocol_version: 0,
+            services: ServiceFlag(1),
+            user_agent_name: "dcroxide".to_string(),
+            user_agent_version: "0.1.0".to_string(),
+            idle_timeout: Duration::from_secs(3600),
+            ping_interval: Duration::from_secs(3600),
+            disable_relay_tx: false,
+            proxy: String::new(),
+            newest_block: None,
+        };
+        let mut csprng = dcroxide_connmgr::SystemCsprng::default();
+        let manager = Arc::new(Mutex::new(dcroxide_connmgr::ConnManager::new(
+            dcroxide_connmgr::ManagerConfig {
+                max_normal_conns: 1,
+                ..Default::default()
+            },
+            &mut csprng,
+        )));
+        let connected = ConnectedPeers::new();
+        let handler = inbound_peer_handler(
+            template,
+            connected.clone(),
+            None,
+            Some(Arc::clone(&manager)),
+        );
+
+        let mut client = TcpStream::connect(bound).expect("connect");
+        let (server, addr) = listener.accept().expect("accept");
+        REFUSE_CONN_THREADS.with(|refuse| refuse.set(true));
+        handler(server, addr);
+        REFUSE_CONN_THREADS.with(|refuse| refuse.set(false));
+
+        assert!(
+            manager
+                .lock()
+                .expect("connmgr mutex")
+                .total_normal_conns_sem
+                .try_acquire(),
+            "the admission's connection permit must be released"
+        );
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            client.read(&mut buf).expect("read"),
+            0,
+            "the unserved connection is closed"
+        );
+        assert!(connected.is_empty());
+    }
+
     /// An inbound connection accepted while the registry is already at the
     /// peer limit is refused: its socket is shut down without a serving
     /// thread, so the client reads end-of-file.
@@ -831,6 +1140,8 @@ mod tests {
             user_agent_version: "0.1.0".to_string(),
             idle_timeout: Duration::from_secs(3600),
             ping_interval: Duration::from_secs(3600),
+            disable_relay_tx: false,
+            proxy: String::new(),
             newest_block: None,
         };
         let mut csprng = dcroxide_connmgr::SystemCsprng::default();
@@ -869,5 +1180,218 @@ mod tests {
 
         // The under-limit connection is untouched by admission control.
         assert_eq!(connected.len(), 1);
+    }
+
+    /// An outbound onion peer gets dcrd's forms: its wire address keeps
+    /// the onion key and type (the version message then sends the
+    /// all-zero address dcrd sends), and the pre-handshake ban check
+    /// uses Go's rendering of a 32-byte IP, `"?"` and hex, which no ban
+    /// keyed by the `.onion` host matches.  An IP address keeps the
+    /// socket forms it had.
+    #[test]
+    fn an_onion_peer_gets_dcrds_address_forms() {
+        let onion = "aaaqeayeaudaocajbifqydiob4ibceqtcqkrmfyydenbwha5dyp3kead.onion";
+        let (addr_type, key) = dcroxide_addrmgr::encode_host(onion);
+        let addr = dcroxide_addrmgr::new_net_address_from_params(
+            addr_type,
+            &key,
+            9108,
+            1_700_000_000_000_000_000,
+            ServiceFlag(1),
+        )
+        .expect("onion address");
+
+        let na = outbound_net_address_v2(&addr).expect("an onion peer is servable");
+        assert_eq!(na.addr_type, dcroxide_wire::NetAddressType::TOR_V3);
+        assert_eq!(na.encoded_addr, key);
+        assert_eq!(na.port, 9108);
+        assert_eq!(na.timestamp, 0);
+        assert_eq!(na.services, ServiceFlag(0));
+
+        let hex: String = (0u8..32).map(|b| format!("{b:02x}")).collect();
+        assert_eq!(banned_conn_host(&addr), format!("?{hex}"));
+
+        let ip = crate::outbound::socket_addr_to_net_address(
+            &"192.0.2.1:9108".parse().expect("socket address"),
+        );
+        assert_eq!(banned_conn_host(&ip), "192.0.2.1");
+        assert_eq!(
+            outbound_net_address_v2(&ip),
+            net_address_v2_from_socket(
+                "192.0.2.1:9108".parse().expect("socket address"),
+                ServiceFlag(0)
+            )
+        );
+    }
+
+    /// Serve one inbound peer from `template` and return the `version`
+    /// message it sends a client connecting from loopback.
+    fn served_version(template: PeerTemplate) -> dcroxide_wire::MsgVersion {
+        let runtime = ListenerRuntime::start(
+            &[("tcp4", "127.0.0.1:0".to_string())],
+            inbound_peer_handler(template.clone(), ConnectedPeers::new(), None, None),
+        )
+        .expect("start serving runtime");
+        let port = runtime.bound_addrs()[0].port();
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut transport = crate::transport::WireTransport::new(
+            stream,
+            dcroxide_peer::MAX_PROTOCOL_VERSION,
+            template.net,
+        );
+        let client = Config {
+            net: template.net,
+            ..Config::default()
+        };
+        let mut peer = Peer::new_outbound(client, &format!("127.0.0.1:{port}")).expect("peer");
+        let outcome = peer
+            .negotiate_outbound_protocol(
+                &mut transport,
+                &mut NodePeerEnv::new(),
+                &dcroxide_peer::PeerGlobals::new(),
+                None,
+            )
+            .expect("negotiate with the served peer");
+        drop(transport);
+        runtime.shutdown();
+        *outcome.remote_version
+    }
+
+    /// The daemon's template carries dcrd `newPeerConfig`'s
+    /// configuration-driven fields into every connection's `version`:
+    /// `--blocksonly` as `DisableRelayTx`, `--proxy` hiding the address
+    /// of a connection from the proxy's host, and `--peeridletimeout` as
+    /// the idle timeout, with the pre-release user agent comment.  The
+    /// daemon advertised relay under `--blocksonly`, so every dcrd peer
+    /// relayed transactions to it and was disconnected for it.
+    #[test]
+    fn the_daemon_template_carries_the_config_into_the_version() {
+        let mut cfg = crate::config::Config::defaults("/nonexistent/dcroxide-home");
+        let defaults = PeerTemplate::from_config(&cfg, "dcroxide", None);
+        assert!(!defaults.disable_relay_tx);
+        assert_eq!(defaults.proxy, "");
+        assert_eq!(defaults.idle_timeout, Duration::from_secs(120));
+
+        cfg.blocks_only = true;
+        cfg.proxy = "127.0.0.1:9050".to_string();
+        cfg.peer_idle_timeout_nanos = 30_000_000_000;
+        let template = PeerTemplate::from_config(&cfg, "dcroxide", None);
+        assert_eq!(template.idle_timeout, Duration::from_secs(30));
+        assert_eq!(
+            template.ping_interval,
+            Duration::from_nanos(dcroxide_peer::PING_INTERVAL as u64),
+            "dcrd's ping interval is a constant"
+        );
+        let peer_cfg = template.config();
+        assert!(peer_cfg.disable_relay_tx);
+        assert_eq!(peer_cfg.proxy, "127.0.0.1:9050");
+        assert_eq!(peer_cfg.idle_timeout_nanos, 30_000_000_000);
+        assert_eq!(peer_cfg.user_agent_comments, vec!["pre".to_string()]);
+
+        let version = served_version(template);
+        assert!(version.disable_relay_tx, "blocks-only asks for no tx relay");
+        assert_eq!(
+            (version.addr_you.ip, version.addr_you.port),
+            ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], 0),
+            "a connection from the proxy's host is told 0.0.0.0:0"
+        );
+        let agent = format!("dcroxide:{}(pre)/", crate::version::user_agent_version());
+        assert!(
+            version.user_agent.ends_with(&agent),
+            "{}",
+            version.user_agent
+        );
+
+        let version = served_version(defaults);
+        assert!(!version.disable_relay_tx);
+        assert_eq!(
+            version.addr_you.ip,
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1],
+            "without a proxy the remote's own address goes back"
+        );
+    }
+
+    /// A `tcp6` listener rebinds its port while the previous listener's
+    /// connections are still closing, as Go's listeners do through
+    /// `SO_REUSEADDR`.  Without it the accepted socket, closed first by
+    /// the node, held the port in `TIME_WAIT` and a restart failed with
+    /// "address in use" for a minute.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_tcp6_listener_rebinds_over_its_closing_connections() {
+        use std::io::Read as _;
+
+        // A host without IPv6 loopback has nothing to test.
+        let Ok(first) = bind_listener("tcp6", "[::1]:0") else {
+            return;
+        };
+        let port = first.local_addr().expect("addr").port();
+        let mut client = TcpStream::connect(("::1", port)).expect("connect");
+        let (server, _) = first.accept().expect("accept");
+        // The node closes first, so the port's side of the connection
+        // is the one left in FIN_WAIT/TIME_WAIT.
+        drop(server);
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut buf = [0u8; 1];
+        assert_eq!(client.read(&mut buf).expect("read"), 0);
+        drop(client);
+        drop(first);
+
+        let second = bind_listener("tcp6", &format!("[::1]:{port}"))
+            .expect("the port rebinds while its closed connection lingers");
+        assert_eq!(second.local_addr().expect("addr").port(), port);
+    }
+
+    /// A listener that cannot bind is skipped and the rest serve, as
+    /// dcrd's `initListeners` warns and carries on; only when nothing
+    /// binds does startup fail, with `newServer`'s error.
+    #[test]
+    fn a_listener_that_cannot_bind_is_skipped() {
+        let taken = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let taken_addr = taken.local_addr().expect("addr").to_string();
+        let handler: InboundHandler = Arc::new(|_stream, _addr| {});
+
+        let runtime = ListenerRuntime::start(
+            &[
+                ("tcp4", taken_addr.clone()),
+                ("tcp4", "127.0.0.1:0".to_string()),
+            ],
+            Arc::clone(&handler),
+        )
+        .expect("the listener that binds serves");
+        assert_eq!(runtime.bound_addrs().len(), 1);
+        assert_ne!(runtime.bound_addrs()[0].to_string(), taken_addr);
+        runtime.shutdown();
+
+        let err = match ListenerRuntime::start(&[("tcp4", taken_addr)], handler) {
+            Ok(_) => panic!("nothing bound"),
+            Err(e) => e,
+        };
+        assert_eq!(err.to_string(), "no valid listen address");
+    }
+
+    /// A failed accept is logged with dcrd's `listenHandler` text unless
+    /// it is one Go's `Accept` retries internally or the listener is
+    /// shutting down; the port slept through every error silently.
+    #[test]
+    fn accept_errors_are_logged_like_dcrds() {
+        let emfile = io::Error::from_raw_os_error(24);
+        assert_eq!(
+            accept_error_log(&emfile, false),
+            Some(format!("Can't accept connection: {emfile}"))
+        );
+        assert_eq!(accept_error_log(&emfile, true), None);
+        for quiet in [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            assert_eq!(accept_error_log(&io::Error::from(quiet), false), None);
+        }
     }
 }

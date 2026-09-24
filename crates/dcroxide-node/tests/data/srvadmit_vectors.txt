@@ -11,5 +11,3 @@ wl|notcontained|false
 wl|v6loopback|true
 wl|badhostport|false
 wl|badip|false
-dp|found|true|1|1|false
-dp|notfound|false|1

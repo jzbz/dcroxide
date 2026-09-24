@@ -4,10 +4,9 @@
 //! and mixpool instances.
 //!
 //! [`NodeSyncChain`] adapts the shared chain behind its mutex to the
-//! manager's [`SyncChain`] trait, injecting the system clock where
-//! dcrd's blockchain reads its median-time source (the daemon has no
-//! time samples yet, so the adjusted time is the system time, exactly
-//! like a dcrd node before its first version exchange).  The mempool
+//! manager's [`SyncChain`] trait, injecting the server's median-adjusted
+//! time ([`crate::mediantime`]) where dcrd's blockchain reads its
+//! median-time source.  The mempool
 //! and mixpool are not wired yet, so [`NullTxPool`] and [`NullMixPool`]
 //! answer like empty pools that reject everything; the real pools
 //! replace them with later pieces.  The manager itself is constructed
@@ -16,14 +15,14 @@
 //! the following pieces.
 
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use dcroxide_blockchain::process::Chain;
+use dcroxide_blockchain::process::{Chain, is_persisted_db_corruption};
 use dcroxide_blockchain::{RuleError, RuleErrorKind, render_multi_error};
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_netsync::manager::{
-    BestSnapshot, Config, ProcessBlockFailure, SyncChain, SyncManager, SyncMixPool, SyncTxPool,
+    BestSnapshot, Config, ProcessBlockFailure, ProcessTxFailure, SyncChain, SyncManager,
+    SyncMixPool, SyncTxPool,
 };
 use dcroxide_uint256::Uint256;
 use dcroxide_wire::{BlockHeader, MsgBlock, MsgTx};
@@ -74,13 +73,11 @@ impl NodeSyncChain {
     }
 }
 
-/// The current unix time standing in for dcrd's median-adjusted time
-/// source (no samples are collected yet, so they are identical).
+/// The current unix time adjusted by the median of the peers' clock
+/// samples (dcrd's `timeSource.AdjustedTime()`, the chain's and sync
+/// manager's time source).
 fn adjusted_time_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::mediantime::adjusted_time_unix()
 }
 
 impl SyncChain for NodeSyncChain {
@@ -135,10 +132,26 @@ impl SyncChain for NodeSyncChain {
         self.locked().have_block(hash)
     }
 
-    fn process_block_header(&mut self, header: &BlockHeader) -> Result<(), String> {
-        self.locked()
-            .process_block_header(header, adjusted_time_unix(), &self.params)
-            .map_err(|e| e.description)
+    fn process_block_header(&mut self, header: &BlockHeader) -> Result<(), ProcessBlockFailure> {
+        let mut chain = self.locked();
+        let err = match chain.process_block_header(header, adjusted_time_unix(), &self.params) {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+
+        // Classified the way a block failure is (see
+        // `combine_process_block_result`): a persistence failure
+        // latched by the store is a disk fault, not a rejected header.
+        let storage_failed = chain
+            .db
+            .as_ref()
+            .is_some_and(dcroxide_database::Database::is_fatal);
+        Err(ProcessBlockFailure {
+            is_duplicate_block: false,
+            is_rule_error: !storage_failed && err.kind.is_rule_violation(),
+            is_corruption: is_corruption(&err),
+            message: err.description,
+        })
     }
 
     fn process_block(&mut self, block: &MsgBlock) -> Result<i64, ProcessBlockFailure> {
@@ -214,9 +227,38 @@ fn combine_process_block_result(
             // `RuleError` carrying dcrd's kind name, so the kind is
             // what reconstructs the split.
             is_rule_error: !storage_failed && first.kind.is_rule_violation(),
+            // dcrd's `MultiError` answers `errors.Is` for any of its
+            // errors, so any corruption among them counts.
+            is_corruption: errs.iter().any(is_corruption),
             message: render_multi_error(&errs),
         }),
     }
+}
+
+/// Whether the chain error is one dcrd's sync manager singles out with
+/// its `Critical failure` line: `database.ErrCorruption` or
+/// `blockchain.ErrUtxoBackendCorruption` (`manager.go:1265-1269`,
+/// `:1646-1648`).
+///
+/// The port hands both over as a `RuleError`, so the split is
+/// reconstructed from what each carries:
+///
+/// - The UTXO backend and spend journal corruption the chain detects
+///   carry dcrd's `ErrUtxoBackendCorruption` kind, and dcrd reports
+///   the spend journal case as `database.ErrCorruption`.  The same kind
+///   also stands in for dcrd's missing-input `AssertError`
+///   (`UtxoView::assert_missing`), which dcrd's check does not match;
+///   it renders with `AssertError`'s `assertion failed: ` prefix.
+/// - A database corruption the store reports travels through
+///   `persist_rule_error`, which keeps the database error's
+///   `ErrorKind::Corruption` (dcrd `database.ErrCorruption`) only in
+///   its rendered text; the chain crate reads it back next to the code
+///   that writes it ([`is_persisted_db_corruption`]).
+fn is_corruption(err: &RuleError) -> bool {
+    if err.kind == RuleErrorKind::UtxoBackendCorruption {
+        return !err.description.starts_with("assertion failed: ");
+    }
+    is_persisted_db_corruption(err)
 }
 
 /// A transaction pool that behaves like an empty pool rejecting
@@ -241,8 +283,13 @@ impl SyncTxPool for NullTxPool {
         _allow_orphan: bool,
         _allow_high_fees: bool,
         _tag: u64,
-    ) -> Result<Vec<(Hash, MsgTx)>, String> {
-        Err("the transaction mempool is not yet wired".to_string())
+    ) -> Result<Vec<(Hash, MsgTx)>, ProcessTxFailure> {
+        // A rejection, like the empty pool it stands in for, not an
+        // internal failure to log.
+        Err(ProcessTxFailure {
+            is_rule_error: true,
+            message: "the transaction mempool is not yet wired".to_string(),
+        })
     }
 
     fn have_transaction(&mut self, _hash: &Hash) -> bool {
@@ -544,5 +591,107 @@ mod tests {
             !failure.is_rule_error,
             "a context error must not be reported as a consensus violation"
         );
+    }
+
+    /// The rule error the chain's `persist_rule_error` makes of a
+    /// database error of the given kind.
+    fn persisted_db_error(kind: dcroxide_database::ErrorKind) -> RuleError {
+        dcroxide_blockchain::process::persist_rule_error(
+            dcroxide_blockchain::chaindb::ChainDbError::Db(dcroxide_database::Error {
+                kind,
+                description: "bad checksum".to_string(),
+            }),
+        )
+    }
+
+    /// The rule error the chain's view raises for an input it lost
+    /// (`UtxoView::assert_missing`, dcrd's `AssertError`): a regular
+    /// transaction spending an output an empty view does not hold.
+    fn missing_input_assertion() -> RuleError {
+        let tx = dcroxide_wire::MsgTx {
+            tx_in: vec![dcroxide_wire::TxIn {
+                previous_out_point: dcroxide_wire::OutPoint {
+                    hash: Hash([1; 32]),
+                    index: 0,
+                    tree: 0,
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = dcroxide_blockchain::utxoview::UtxoView::new()
+            .connect_regular_transaction(
+                &tx,
+                &tx.tx_hash(),
+                1,
+                1,
+                &mut std::collections::BTreeMap::new(),
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, RuleErrorKind::UtxoBackendCorruption);
+        err
+    }
+
+    /// dcrd's sync manager adds a `Critical failure` error line for
+    /// `database.ErrCorruption` and `blockchain.ErrUtxoBackendCorruption`
+    /// (`manager.go:1265-1269`).  The port hands both over as rule
+    /// errors, so the adapter has to recognise them: a corrupt spend
+    /// journal or UTXO backend by its kind, a database corruption by the
+    /// kind `persist_rule_error` records in its text.  Neither the
+    /// missing-input assertion that shares the UTXO kind nor any other
+    /// database failure counts.  Both texts come from the chain's own
+    /// producers, so a change to either breaks this test.
+    #[test]
+    fn corruption_is_classified_for_the_critical_failure_line() {
+        let classify = |errs: Vec<RuleError>, storage_failed: bool| {
+            combine_process_block_result(0, errs, storage_failed)
+                .unwrap_err()
+                .is_corruption
+        };
+
+        assert!(classify(
+            vec![rule_err(
+                RuleErrorKind::UtxoBackendCorruption,
+                "corrupt spend information for 00ab: Deserialize",
+            )],
+            false,
+        ));
+        assert!(classify(
+            vec![persisted_db_error(dcroxide_database::ErrorKind::Corruption)],
+            true,
+        ));
+
+        assert!(!classify(vec![missing_input_assertion()], false));
+        assert!(!classify(
+            vec![persisted_db_error(dcroxide_database::ErrorKind::Fatal)],
+            true,
+        ));
+        // The chain's own consistency failures on the block paths (a
+        // missing bucket, a spent entry reaching the UTXO writer) are
+        // not the database's `ErrCorruption`: dcrd has no error value
+        // there (a nil bucket, and a spent entry is deleted instead).
+        assert!(!classify(
+            vec![dcroxide_blockchain::process::persist_rule_error(
+                dcroxide_blockchain::chaindb::ChainDbError::Corrupt(
+                    "missing utxo set bucket".to_string()
+                ),
+            )],
+            true,
+        ));
+        assert!(!classify(
+            vec![rule_err(RuleErrorKind::BadMerkleRoot, "bad merkle root")],
+            false,
+        ));
+
+        // dcrd's `MultiError.Is` matches any of its errors.
+        assert!(classify(
+            vec![
+                rule_err(RuleErrorKind::BadMerkleRoot, "accept-err"),
+                persisted_db_error(dcroxide_database::ErrorKind::Corruption),
+            ],
+            false,
+        ));
     }
 }

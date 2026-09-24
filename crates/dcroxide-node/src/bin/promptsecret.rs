@@ -10,7 +10,7 @@
 //! through `stty` on unix — a non-terminal stdin fails exactly like
 //! Go's `ReadPassword` on a pipe — and reports echo control as
 //! unsupported on windows (where the console API requires unsafe
-//! calls; the Windows service wrapper is likewise not ported).
+//! calls).
 //! Go's `flag` package drives the tiny command line, so its exit
 //! codes and error texts are kept: parse errors print the message
 //! and usage and exit 2, `-h` prints the usage and exits 0.
@@ -182,13 +182,16 @@ fn underscore_ok(s: &str) -> bool {
 /// termios calls): the saved `stty -g` form restores the ORIGINAL
 /// state afterward exactly as x/term restores its snapshot, and the
 /// entered mode is x/term's — echo off with canonical mode, signals,
-/// and CR-to-NL mapping forced on.  `stty` reads the terminal from
-/// its inherited stdin, so a piped stdin fails with the same
-/// inappropriate-ioctl condition Go's `ReadPassword` surfaces.
+/// and CR-to-NL mapping forced on.  `stty` works on the terminal its
+/// stdin names, so each call hands it this process's stdin (`output`
+/// would otherwise give it a null one, which no terminal backs), and a
+/// piped stdin fails with the same inappropriate-ioctl condition Go's
+/// `ReadPassword` surfaces.
 #[cfg(unix)]
 fn enter_password_mode() -> Result<String, String> {
     let saved = std::process::Command::new("stty")
         .arg("-g")
+        .stdin(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::null())
         .output()
         .map_err(|e| e.to_string())?;
@@ -201,6 +204,7 @@ fn enter_password_mode() -> Result<String, String> {
 
     let status = std::process::Command::new("stty")
         .args(["-echo", "icanon", "isig", "icrnl"])
+        .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -215,6 +219,7 @@ fn enter_password_mode() -> Result<String, String> {
 fn restore_terminal(saved: &str) {
     let _ = std::process::Command::new("stty")
         .arg(saved)
+        .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
@@ -228,18 +233,43 @@ fn enter_password_mode() -> Result<String, String> {
 #[cfg(not(unix))]
 fn restore_terminal(_saved: &str) {}
 
+/// An unbuffered handle on a standard stream, which reaches the
+/// descriptor on every call as Go's `os.Stdin` and `os.Stdout` do.
+/// std's own `Stdin` reads ahead into an 8 KiB buffer and `Stdout`
+/// holds a line in one, and a buffer keeps a copy of the secret that the
+/// zeroing never reaches for the rest of the process.
+#[cfg(unix)]
+fn unbuffered(stream: impl std::os::fd::AsFd) -> std::io::Result<std::fs::File> {
+    Ok(std::fs::File::from(stream.as_fd().try_clone_to_owned()?))
+}
+
+#[cfg(windows)]
+fn unbuffered(stream: impl std::os::windows::io::AsHandle) -> std::io::Result<std::fs::File> {
+    Ok(std::fs::File::from(
+        stream.as_handle().try_clone_to_owned()?,
+    ))
+}
+
 /// Read a secret from stdin with terminal echo disabled (Go
 /// `term.ReadPassword` over x/term's `readPasswordLine`): the line up
-/// to the newline, with backspaces applied destructively and carriage
-/// returns skipped.  A read that ends at EOF with bytes in hand
-/// returns them; an immediate EOF is an error, like Go's.
+/// to the newline, read a byte at a time straight from the descriptor,
+/// with backspaces applied destructively and carriage returns skipped.
+/// A read that ends at EOF with bytes in hand returns them; an
+/// immediate EOF is an error, like Go's.
 fn read_password() -> Result<Vec<u8>, String> {
     let saved = enter_password_mode()?;
+    let mut stdin = match unbuffered(std::io::stdin()) {
+        Ok(stdin) => stdin,
+        Err(e) => {
+            restore_terminal(&saved);
+            return Err(e.to_string());
+        }
+    };
 
     let mut secret = Vec::new();
     let mut byte = [0u8; 1];
     let result = loop {
-        match std::io::stdin().read(&mut byte) {
+        match stdin.read(&mut byte) {
             Ok(0) => {
                 if secret.is_empty() {
                     break Err("EOF".to_string());
@@ -295,13 +325,20 @@ fn prompt() {
         }
     };
 
-    let written = std::io::stdout().write_all(&secret);
+    // Straight to the descriptor, as `os.Stdout.Write` goes, so no
+    // stdout buffer keeps a copy past the zeroing.
+    let written = unbuffered(std::io::stdout())
+        .and_then(|mut stdout| stdout.write_all(&secret).map(|()| stdout));
     zero(&mut secret);
-    if let Err(e) = written {
-        eprintln!("unable to write to stdout: {e}");
-        std::process::exit(1);
-    }
-    println!();
+    let mut stdout = match written {
+        Ok(stdout) => stdout,
+        Err(e) => {
+            eprintln!("unable to write to stdout: {e}");
+            std::process::exit(1);
+        }
+    };
+    // dcrd discards the result of the newline's write.
+    let _ = stdout.write_all(b"\n");
 }
 
 fn main() {

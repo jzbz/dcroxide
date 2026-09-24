@@ -70,7 +70,6 @@ fn genesis_server(dir: &std::path::Path, name: &str) -> (Arc<ServerContext>, Con
             dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
-        next_peer_id: std::sync::atomic::AtomicI32::new(1),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
@@ -97,6 +96,8 @@ fn template(name: &str) -> PeerTemplate {
         user_agent_version: "0.1.0".to_string(),
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        disable_relay_tx: false,
+        proxy: String::new(),
         newest_block: None,
     }
 }
@@ -324,9 +325,11 @@ fn add_persistent(
     manager: &dcroxide_node::outbound::SharedConnManager,
     addr: &str,
 ) -> Vec<(u64, dcroxide_addrmgr::NetAddress)> {
-    let resolved =
-        dcroxide_node::outbound::addr_string_to_socket_addr(addr).expect("resolve persistent");
-    let na = dcroxide_node::outbound::socket_addr_to_net_address(&resolved);
+    let na = dcroxide_node::outbound::addr_string_to_net_address(
+        addr,
+        &dcroxide_node::socks::NodeDialer::direct(),
+    )
+    .expect("resolve persistent");
     let id = manager
         .lock()
         .expect("connmgr mutex")

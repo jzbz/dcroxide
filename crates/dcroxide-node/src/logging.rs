@@ -9,29 +9,95 @@
 //! on).  The rotating file backend (`jrick/logrotate`) remains
 //! unwired; stdout is the only sink.
 
-use std::sync::OnceLock;
+use std::io::Write;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
-use crate::logsubsys::{LogLevel, LogLevels};
+use crate::logsubsys::{LogLevel, LogLevels, SUBSYSTEM_IDS};
 
-/// The installed per-subsystem levels; every subsystem defaults to
-/// `Info` until [`set_levels`] runs (slog's default level).
-static LEVELS: OnceLock<LogLevels> = OnceLock::new();
+/// Every level in declaration order, so a level's discriminant indexes
+/// it back out of the slots in [`LEVELS`].
+const LEVEL_BY_DISCRIMINANT: [LogLevel; 7] = [
+    LogLevel::Trace,
+    LogLevel::Debug,
+    LogLevel::Info,
+    LogLevel::Warn,
+    LogLevel::Error,
+    LogLevel::Critical,
+    LogLevel::Off,
+];
+
+/// The installed per-subsystem levels, one slot per [`SUBSYSTEM_IDS`]
+/// entry in its order, each holding a [`LogLevel`] discriminant; every
+/// subsystem reads slog's default `Info` until [`set_levels`] runs.
+/// They change while the node runs -- the `debuglevel` RPC sets them --
+/// and every log call reads one, so each is an atomic, as each slog
+/// logger's level is (`Logger.SetLevel` stores it atomically).
+static LEVELS: [AtomicU8; SUBSYSTEM_IDS.len()] =
+    [const { AtomicU8::new(LogLevel::Info as u8) }; SUBSYSTEM_IDS.len()];
+
+/// Serializes the writers of [`LEVELS`], so a `debuglevel` call's read,
+/// update and store of the slots cannot interleave with another's.
+static LEVELS_WRITER: Mutex<()> = Mutex::new(());
+
+/// The level a slot holds.
+fn decode_level(slot: &AtomicU8) -> LogLevel {
+    LEVEL_BY_DISCRIMINANT
+        .get(usize::from(slot.load(Ordering::Relaxed)))
+        .copied()
+        .unwrap_or(LogLevel::Info)
+}
+
+/// Store every subsystem level the map carries into its slot.
+fn store_levels(levels: &LogLevels) {
+    for (id, slot) in SUBSYSTEM_IDS.iter().zip(&LEVELS) {
+        if let Some(level) = levels.0.get(id) {
+            slot.store(*level as u8, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Install the per-subsystem levels parsed from `--debuglevel`
 /// (dcrd's `parseAndSetDebugLevels` feeding the subsystem loggers).
-/// Only the first call takes effect.
 pub fn set_levels(levels: LogLevels) {
-    let _ = LEVELS.set(levels);
+    let _writer = LEVELS_WRITER.lock().unwrap_or_else(PoisonError::into_inner);
+    store_levels(&levels);
+}
+
+/// The levels every subsystem runs at now.
+fn current_levels() -> LogLevels {
+    LogLevels(
+        SUBSYSTEM_IDS
+            .iter()
+            .zip(&LEVELS)
+            .map(|(id, slot)| (*id, decode_level(slot)))
+            .collect(),
+    )
+}
+
+/// Parse a debug level specification and apply it to the running node
+/// (dcrd's `rpcLogManager.ParseAndSetDebugLevels`, which is
+/// `parseAndSetDebugLevels`, behind the `debuglevel` RPC).  As in dcrd,
+/// the subsystem/level pairs ahead of an invalid one stay applied when
+/// the specification fails: dcrd sets each pair's logger as it walks
+/// them and returns at the first bad one.
+pub fn parse_and_set_debug_levels(debug_level: &str) -> Result<(), String> {
+    let _writer = LEVELS_WRITER.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut levels = current_levels();
+    let result = crate::logsubsys::parse_and_set_debug_levels(&mut levels, debug_level);
+    store_levels(&levels);
+    result
 }
 
 /// The configured level for a subsystem; unknown tags — such as the
 /// tool binaries' `MAIN` — and an uninstalled configuration read as
 /// slog's default `Info`.
-fn subsystem_level(subsys: &str) -> LogLevel {
-    LEVELS
-        .get()
-        .and_then(|levels| levels.0.get(subsys).copied())
-        .unwrap_or(LogLevel::Info)
+pub(crate) fn subsystem_level(subsys: &str) -> LogLevel {
+    SUBSYSTEM_IDS
+        .iter()
+        .zip(&LEVELS)
+        .find(|(id, _)| **id == subsys)
+        .map_or(LogLevel::Info, |(_, slot)| decode_level(slot))
 }
 
 /// Whether a message at the level passes the subsystem's configured
@@ -98,13 +164,44 @@ pub fn local_offset_label() -> String {
     local_offset().to_string()
 }
 
+/// The exit status a shell reports for a process `SIGPIPE` killed
+/// (128 plus the signal number, 13 on every unix).
+#[cfg(unix)]
+const SIGPIPE_EXIT_STATUS: i32 = 128 + 13;
+
+/// Write to standard output the way dcrd's `logWriter` does (`log.go`),
+/// discarding the result of `os.Stdout.Write`: a terminal that hung up
+/// (`EIO`) or a full disk behind a redirect (`ENOSPC`) never stops the
+/// node, where `println!` panics and `panic = "abort"` then takes the
+/// process down, mid-shutdown when the hangup was what started it.
+///
+/// The one failure Go does not let pass is a broken pipe: its runtime
+/// answers `EPIPE` on descriptor 1 or 2 by killing the process with
+/// `SIGPIPE` (`os.epipecheck`, `runtime.sigpipe`), which dcrd does not
+/// catch.  Rust ignores `SIGPIPE`, and with `unsafe` forbidden there is
+/// no restoring its default action to raise it, so the process exits at
+/// once with the status a shell reports for that death instead.  Go
+/// makes no such check on Windows, where every error is discarded.
+pub fn write_stdout(bytes: &[u8]) {
+    let result = std::io::stdout().lock().write_all(bytes);
+    #[cfg(unix)]
+    if let Err(e) = &result
+        && e.kind() == std::io::ErrorKind::BrokenPipe
+    {
+        std::process::exit(SIGPIPE_EXIT_STATUS);
+    }
+    let _ = result;
+}
+
 /// Emit a log line for the subsystem at the level when its
 /// configured level allows it.
 pub fn log(subsys: &str, level: LogLevel, msg: &str) {
     if !enabled(level, subsystem_level(subsys)) {
         return;
     }
-    println!("{}", render(&timestamp(), level, subsys, msg));
+    let mut line = render(&timestamp(), level, subsys, msg);
+    line.push('\n');
+    write_stdout(line.as_bytes());
 }
 
 /// A trace-level line.
@@ -130,6 +227,26 @@ pub fn warn(subsys: &str, msg: &str) {
 /// An error-level line.
 pub fn error(subsys: &str, msg: &str) {
     log(subsys, LogLevel::Error, msg);
+}
+
+/// The block database's package log sink, rendered under `BCDB`: the
+/// unclean-shutdown repair, the corruption warning and the ROLLBACK
+/// lines.  The daemon installs it as dcrd's `log.go:88` does
+/// (`database.UseLogger(bcdbLog)`) and addblock as dcrd's
+/// `cmd/addblock/addblock.go:76` does, so both print what their dcrd
+/// counterparts print.
+pub fn bcdb_log_sink() -> dcroxide_database::LogSink {
+    std::sync::Arc::new(|level: dcroxide_database::LogLevel, msg: &str| {
+        use dcroxide_database::LogLevel as DbLevel;
+        let level = match level {
+            DbLevel::Trace => LogLevel::Trace,
+            DbLevel::Debug => LogLevel::Debug,
+            DbLevel::Info => LogLevel::Info,
+            DbLevel::Warn => LogLevel::Warn,
+            DbLevel::Error => LogLevel::Error,
+        };
+        log("BCDB", level, msg);
+    })
 }
 
 #[cfg(test)]
@@ -246,6 +363,17 @@ mod tests {
         assert!(!enabled(LogLevel::Debug, LogLevel::Info));
         assert!(enabled(LogLevel::Trace, LogLevel::Trace));
         assert!(!enabled(LogLevel::Critical, LogLevel::Off));
+    }
+
+    /// Each level's discriminant indexes it back out of the table the
+    /// atomic slots are decoded through.
+    #[test]
+    fn level_slots_round_trip() {
+        for (discriminant, level) in LEVEL_BY_DISCRIMINANT.iter().enumerate() {
+            assert_eq!(*level as usize, discriminant);
+            let slot = AtomicU8::new(*level as u8);
+            assert_eq!(decode_level(&slot), *level);
+        }
     }
 
     #[test]

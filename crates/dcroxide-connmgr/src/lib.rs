@@ -18,6 +18,7 @@ pub mod goexp;
 mod groups;
 pub mod manager;
 mod ratelimiter;
+mod target_outbound;
 
 pub use banscore::{DynamicBanScore, HALFLIFE, LIFETIME, decay_factor_bits};
 pub use conntype::{ConnectionType, NUM_CONN_TYPES, conn_type_string};
@@ -27,13 +28,14 @@ pub use manager::{
     ClosePlan, ConnManager, ConnRecord, DEFAULT_MAX_NORMAL_CONNS, DEFAULT_MAX_PER_OUTBOUND_GROUP,
     DEFAULT_MAX_RETRY_DURATION, DEFAULT_RETRY_DURATION, DEFAULT_TARGET_OUTBOUND, DisconnectAction,
     InboundDecision, MAX_FAILED_ATTEMPTS, MAX_PERSISTENT, ManagerConfig, NO_SUITABLE_ADDR_MSG,
-    PersistentEntry, SemCount, addr_host_key,
+    PICK_OUTBOUND_RETRIES, PersistentEntry, SemCount, addr_host_key,
 };
 pub use ratelimiter::{
     DROP_LOG_BURST_LIMIT, DROP_LOG_RATE_LIMIT, FLOOD_HIGH_FACTOR, FLOOD_LOW, FLOOD_MAX_DROP_PROB,
     FLOOD_MIN_DROP_PROB, FLOOD_RAMP, GROUP_BURST_LIMIT, GROUP_RATE_LIMIT, InboundGroupKey,
     InboundRateLimiter, LogDropsOutcome, MAX_GROUP_LIMITERS, MAX_PER_GROUP_TTL,
 };
+pub use target_outbound::{AutoBegin, AutoPermits};
 
 /// A kind of connection manager error (dcrd `internal/connmgr`
 /// `ErrorKind` at master).

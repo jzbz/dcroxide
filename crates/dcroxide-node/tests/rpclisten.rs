@@ -1038,8 +1038,8 @@ fn answers_a_chunked_transfer_request() {
         "{response}"
     );
 
-    // Bare-LF size and trailer lines are tolerated exactly as Go's
-    // readChunkLine tolerates them (the after-data CRLF stays strict).
+    // A bare-LF size line is refused, as Go's readChunkLine has refused
+    // it since the CVE-2025-22871 fix: chunk lines must end in CRLF.
     let request = format!(
         "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\n{body}\r\n0\n\n",
         body.len(),
@@ -1048,7 +1048,11 @@ fn answers_a_chunked_transfer_request() {
     stream.write_all(request.as_bytes()).expect("write");
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read");
-    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        response.contains("error reading JSON message: chunked line ends with bare LF"),
+        "{response}"
+    );
 
     listener.shutdown();
 }
@@ -1079,7 +1083,10 @@ fn rejects_bad_transfer_encodings() {
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read");
     assert!(response.starts_with("HTTP/1.1 400"), "{response}");
-    assert!(response.contains("invalid chunked body"), "{response}");
+    assert!(
+        response.contains("400 error reading JSON message: invalid byte in chunk length"),
+        "{response}"
+    );
 
     listener.shutdown();
 }
@@ -1963,10 +1970,11 @@ fn the_websocket_route_answers_gorillas_statuses() {
 }
 
 /// `Date` rides on every answer Go writes through its `ResponseWriter`
-/// -- handler replies, the mux's redirect, the `OPTIONS *` 200 -- and
-/// on none of the ones its connection loop writes straight to the
-/// socket, which never touch the header map.  Both halves are checked,
-/// because emitting it everywhere would be as wrong as nowhere.
+/// -- handler errors, the mux's redirect, the `OPTIONS *` 200 -- and
+/// on none of the ones written straight to the socket: the connection
+/// loop's, and the JSON-RPC reply dcrd writes by hand on the hijacked
+/// connection.  Both halves are checked, because emitting it everywhere
+/// would be as wrong as nowhere.
 #[test]
 fn the_date_header_follows_who_wrote_the_response() {
     let (_dir, listener, port, _genesis_hash, _chain) = serve_rpc();
@@ -1976,13 +1984,6 @@ fn the_date_header_follows_who_wrote_the_response() {
     let dated = |request: &str| -> bool { send_raw(port, request).contains("\r\nDate: ") };
 
     // Written through the response writer.
-    assert!(
-        dated(&format!(
-            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )),
-        "the JSON reply carries a date"
-    );
     assert!(
         dated("POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
         "the 401 carries a date"
@@ -1994,6 +1995,15 @@ fn the_date_header_follows_who_wrote_the_response() {
     assert!(
         dated("OPTIONS * HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"),
         "the asterisk 200 carries a date"
+    );
+
+    // Written by hand on the hijacked connection (`rpcserver.go:5858`).
+    assert!(
+        !dated(&format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )),
+        "the JSON reply carries none"
     );
 
     // Written straight to the socket by the connection loop.

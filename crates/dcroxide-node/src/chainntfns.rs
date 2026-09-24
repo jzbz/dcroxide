@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: ISC
 //! The daemon's chain event handler (dcrd server.go
 //! `handleBlockchainNotification`): the chain's notification callback
-//! forwards connected, disconnected, reorganization, and new-ticket
-//! events straight into the websocket notification manager, and runs
-//! dcrd's winning-tickets announcement gate over accepted blocks.
+//! relays the early checked-block announcement on the spot, queues the
+//! connected, disconnected, reorganization, and new-ticket events for
+//! the websocket notification manager in the chain's emission order,
+//! and runs dcrd's winning-tickets announcement gate over accepted
+//! blocks.
 //!
 //! The callback executes inside the chain's critical section (the
 //! daemon holds the chain mutex through the whole processing call
@@ -12,6 +14,14 @@
 //! The gate-passing blocks queue instead, and the sync adapter drains
 //! them right after the processing call returns with the mutex free,
 //! which is exactly the lock situation dcrd's handler runs under.
+//!
+//! The early checked-block announcement is the exception: dcrd relays
+//! it from the callback with its chain lock held, so the block spreads
+//! while the expensive connect runs, and the port does the same.  The
+//! relay takes only the peer registry and per-peer relay locks, which
+//! are leaves — nothing holding either ever waits on the chain mutex
+//! (every enqueue under them is a non-blocking `try_send`) — so taking
+//! them under the chain mutex cannot close a cycle.
 //!
 //! The reorg-started and reorg-done events feed dcrd's background
 //! template generator (present when mining addresses are configured),
@@ -91,16 +101,12 @@ pub struct ChainNtfnHandler {
     lottery_data_broadcast: Arc<Mutex<HashSet<Hash>>>,
     /// Gate-passing accepted blocks awaiting their lottery lookup.
     pending_winning_tickets: Arc<Mutex<Vec<(Hash, i64)>>>,
-    /// Early checked-block announcements awaiting their relay fan-out
-    /// (dcrd's `RelayBlockAnnouncement` send from the
-    /// NTNewTipBlockChecked case; the callback runs under the chain
-    /// mutex, so they queue for the post-processing drain).
-    pending_checked_announcements: Arc<Mutex<Vec<BlockHeader>>>,
     /// Accepted-block announcements awaiting their gated relay
     /// fan-out (the send at the end of dcrd's NTBlockAccepted case).
     pending_accepted_announcements: Arc<Mutex<Vec<BlockHeader>>>,
     /// Connected and disconnected blocks awaiting their mempool
-    /// maintenance.
+    /// maintenance, with the new-ticket and reorganization events
+    /// interleaved in the chain's emission order.
     pending_block_events: Arc<Mutex<Vec<PendingBlockEvent>>>,
     /// Serializes the whole deferred-notification drain: both the
     /// netsync post-process path and the generator's drain hook run the
@@ -161,6 +167,27 @@ enum PendingBlockEvent {
         parent: Arc<dcroxide_wire::MsgBlock>,
         check_tx_flags: AgendaFlags,
     },
+    /// Tickets matured from the most recently connected block (dcrd
+    /// NTNewTickets, which the chain sends right after that block's
+    /// NTBlockConnected).  It rides the same queue as the block events
+    /// so the websocket manager sees newtickets after blockconnected,
+    /// as every dcrd client does.
+    NewTickets {
+        hash: Hash,
+        height: i64,
+        stake_difficulty: i64,
+        tickets_new: Vec<Hash>,
+    },
+    /// The chain reorganized (dcrd NTReorganization, which the chain
+    /// sends after every disconnect and connect of the reorg).  Queued
+    /// behind those block events so a notifyblocks client sees the
+    /// blockdisconnected and blockconnected frames first, as in dcrd.
+    Reorganization {
+        old_hash: Hash,
+        old_height: i64,
+        new_hash: Hash,
+        new_height: i64,
+    },
 }
 
 impl ChainNtfnHandler {
@@ -185,7 +212,6 @@ impl ChainNtfnHandler {
             mix_pool,
             lottery_data_broadcast: Arc::default(),
             pending_winning_tickets: Arc::default(),
-            pending_checked_announcements: Arc::default(),
             pending_accepted_announcements: Arc::default(),
             pending_block_events: Arc::default(),
             drain_lock: Arc::default(),
@@ -246,7 +272,8 @@ impl ChainNtfnHandler {
     }
 
     /// The chain callback body (dcrd `handleBlockchainNotification`);
-    /// runs inside the chain's critical section and only queues.
+    /// runs inside the chain's critical section and, apart from the
+    /// early checked-block relay, only queues.
     pub fn handle(&self, notification: &Notification<'_>) {
         match notification {
             // A block extending the current tip passed the sanity
@@ -254,11 +281,16 @@ impl ChainNtfnHandler {
             // nodes (dcrd's NTNewTipBlockChecked case calling
             // `RelayBlockAnnouncement(block, SFNodeNetwork)`; the
             // chain already gated the emission on being current).
+            // Relayed here, under the chain mutex, exactly as dcrd does
+            // with its chain lock held, so the announcement goes out
+            // before the expensive connect rather than after it; the
+            // registry and relay locks it takes are leaves (see the
+            // module comment).
             Notification::NewTipBlockChecked(block) => {
-                self.pending_checked_announcements
-                    .lock()
-                    .expect("pending checked announcements")
-                    .push(block.header);
+                self.sync_peers.relay_block_announcement(
+                    &block.header,
+                    dcroxide_wire::ServiceFlag::NODE_NETWORK,
+                );
             }
             Notification::BlockAccepted(data) => {
                 if let Some(generator) = &self.generator {
@@ -325,24 +357,38 @@ impl ChainNtfnHandler {
                     generator.chain_reorg_done();
                 }
             }
+            // The reorganization and new-ticket websocket notifications
+            // queue behind the deferred block events they follow in the
+            // chain's emission order (dcrd sends NTReorganization after
+            // the reorg's disconnects and connects, and NTNewTickets
+            // right after its block's NTBlockConnected, all into the
+            // one notification queue), so no client sees them ahead of
+            // the blockdisconnected/blockconnected frames.  Only queued
+            // when the RPC server runs (dcrd's `s.rpcServer != nil`).
             Notification::Reorganization(data) => {
-                if let Some(ntfn) = &self.ntfn {
-                    ntfn.notify_reorganization(
-                        data.old_hash,
-                        data.old_height,
-                        data.new_hash,
-                        data.new_height,
-                    );
+                if self.ntfn.is_some() {
+                    self.pending_block_events
+                        .lock()
+                        .expect("pending block events")
+                        .push(PendingBlockEvent::Reorganization {
+                            old_hash: data.old_hash,
+                            old_height: data.old_height,
+                            new_hash: data.new_hash,
+                            new_height: data.new_height,
+                        });
                 }
             }
             Notification::NewTickets(data) => {
-                if let Some(ntfn) = &self.ntfn {
-                    ntfn.notify_new_tickets(
-                        data.hash,
-                        data.height,
-                        data.stake_difficulty,
-                        data.tickets_new.clone(),
-                    );
+                if self.ntfn.is_some() {
+                    self.pending_block_events
+                        .lock()
+                        .expect("pending block events")
+                        .push(PendingBlockEvent::NewTickets {
+                            hash: data.hash,
+                            height: data.height,
+                            stake_difficulty: data.stake_difficulty,
+                            tickets_new: data.tickets_new.clone(),
+                        });
                 }
             }
         }
@@ -382,26 +428,6 @@ impl ChainNtfnHandler {
             .lock()
             .expect("pending accepted announcements")
             .push(data.block.header);
-    }
-
-    /// Fan the early checked-block announcements out to the full-node
-    /// peers now that the chain mutex is free (dcrd's
-    /// `RelayBlockAnnouncement(block, SFNodeNetwork)` from the
-    /// NTNewTipBlockChecked case; the chain gated the emission on
-    /// being current, so no further gate applies).  Runs before the
-    /// block-event drain so the wire order matches dcrd's single
-    /// relay queue.
-    pub fn drain_pending_checked_announcements(&self) {
-        let pending: Vec<BlockHeader> = core::mem::take(
-            &mut *self
-                .pending_checked_announcements
-                .lock()
-                .expect("pending checked announcements"),
-        );
-        for header in pending {
-            self.sync_peers
-                .relay_block_announcement(&header, dcroxide_wire::ServiceFlag::NODE_NETWORK);
-        }
     }
 
     /// Fan the accepted-block announcements out to every peer that
@@ -565,24 +591,35 @@ impl ChainNtfnHandler {
 
 impl ChainNtfnHandler {
     /// Run the whole deferred-notification drain as one serialized unit:
-    /// the early checked-block announcements, the connected/disconnected
-    /// mempool maintenance, the accepted-block announcements, then the
-    /// queued winning-ticket lookups.  This fixed order preserves the
-    /// per-observer orderings that dcrd's single notification goroutine
-    /// produces — the peer relay order (a checked announcement before an
-    /// accepted one) and, within the block-event drain, txaccepted before
-    /// blockconnected — while the cross-sink orderings (a winning-tickets
-    /// websocket notification versus an accepted-block peer relay, which
-    /// dcrd emits in the opposite order inside its single NTBlockAccepted
-    /// case) are not observable by any one client.  The whole sequence
-    /// holds the drain lock so the two drivers — the netsync post-process
-    /// path and the background generator's drain hook — can never
-    /// interleave two runs and split a reorg batch, which would process
-    /// the maintenance, announcements, and index notifications out of
-    /// order (and could permanently cancel the index subscriber).
+    /// the connected/disconnected mempool maintenance with the block,
+    /// new-ticket, and reorganization websocket notifications in the
+    /// chain's emission order, the accepted-block announcements, then
+    /// the queued winning-ticket lookups.  (The early checked-block
+    /// announcement is not deferred: the callback relays it.)  This
+    /// fixed order preserves the per-client orderings that dcrd's single
+    /// notification queue produces — the peer relay order (a checked
+    /// announcement before an accepted one) and, within the block-event
+    /// drain, txaccepted before blockconnected, blockconnected before
+    /// newtickets, and the reorg's block frames before reorganization.
+    /// Two known orderings still differ from dcrd's.  One spans two
+    /// sinks: dcrd sends a block's winning-tickets websocket
+    /// notification before its accepted-block peer relay inside the
+    /// single NTBlockAccepted case, and no one client observes both.
+    /// The other is visible to a single client: the background template
+    /// generator is fed at callback time (see the BlockConnected arm of
+    /// `handle`), so a client subscribed to both notifyblocks and
+    /// notifywork can receive the new template's work notification
+    /// ahead of the deferred blockconnected frame, where dcrd queues
+    /// `NotifyBlockConnected` before calling `s.bg.BlockConnected` in
+    /// its NTBlockConnected case.  The whole sequence holds the drain
+    /// lock so the two drivers — the netsync post-process path and the
+    /// background generator's drain hook — can never interleave two runs
+    /// and split a reorg batch, which would process the maintenance,
+    /// announcements, and index notifications out of order (an index
+    /// fed out of order fails every update until the heights line up
+    /// again).
     pub fn drain_pending(&self, chain: &Arc<Mutex<Chain>>, adjusted_time_unix: i64) {
         let _drain = self.drain_lock.lock().expect("drain lock poisoned");
-        self.drain_pending_checked_announcements();
         self.drain_pending_block_events();
         self.drain_pending_accepted_announcements(chain, adjusted_time_unix);
         self.drain_pending_winning_tickets(chain, adjusted_time_unix);
@@ -591,9 +628,11 @@ impl ChainNtfnHandler {
     /// Run the queued mempool maintenance for the connected and
     /// disconnected blocks, in order, now that the chain mutex is
     /// free (dcrd `handleBlockchainNotification`'s NTBlockConnected
-    /// and NTBlockDisconnected mempool halves with the confirmed-
-    /// transaction bookkeeping and the rebroadcast prunes; the
-    /// fee-estimator feed arrives with a later piece).  Serialized by
+    /// and NTBlockDisconnected mempool halves with the fee-estimator
+    /// feed, the confirmed-transaction bookkeeping and the rebroadcast
+    /// prunes), sending the queued new-ticket and reorganization
+    /// notifications at their places in the same sequence (dcrd's
+    /// NTNewTickets and NTReorganization cases).  Serialized by
     /// [`ChainNtfnHandler::drain_pending`], which every production
     /// caller runs the whole drain through.
     pub fn drain_pending_block_events(&self) {
@@ -653,15 +692,46 @@ impl ChainNtfnHandler {
                         ntfn.notify_block_disconnected(block);
                     }
                 }
+                // dcrd NTNewTickets: `NotifyNewTickets`, after the
+                // block-connected frame of the block that matured them.
+                PendingBlockEvent::NewTickets {
+                    hash,
+                    height,
+                    stake_difficulty,
+                    tickets_new,
+                } => {
+                    if let Some(ntfn) = &self.ntfn {
+                        ntfn.notify_new_tickets(hash, height, stake_difficulty, tickets_new);
+                    }
+                }
+                // dcrd NTReorganization: `NotifyReorganization`, after
+                // every block frame of the reorg.
+                PendingBlockEvent::Reorganization {
+                    old_hash,
+                    old_height,
+                    new_hash,
+                    new_height,
+                } => {
+                    if let Some(ntfn) = &self.ntfn {
+                        ntfn.notify_reorganization(old_hash, old_height, new_hash, new_height);
+                    }
+                }
             }
         }
     }
 
     /// Notify the subscribed indexes for a drained block event (dcrd's
-    /// `s.indexSubscriber.Notify`).  A failed update marks the
-    /// subscriber cancelled and later notifications skip it, like dcrd's
-    /// handler goroutine logging the error and cancelling its context so
-    /// the quit channel absorbs further sends.
+    /// `s.indexSubscriber.Notify` feeding `handleIndexUpdates`).  A
+    /// failed update is logged and ends this notification's walk over
+    /// the subscriptions, and every later notification is still
+    /// processed, exactly as in dcrd: the `s.cancel()` there cancels
+    /// only the context the indexes were initialized with, while the
+    /// handler loop runs on the server's context and keeps consuming
+    /// notifications.  An index that missed an update therefore logs
+    /// dcrd's missing-notification error for each later block and
+    /// resumes on its own once the heights line up again (a reorg
+    /// replacing the failed block).  The subscriber's `cancelled` latch,
+    /// dcrd's cancelled context, is deliberately not consulted.
     fn notify_index_subscriber(
         &self,
         ntfn_type: dcroxide_indexers::IndexNtfnType,
@@ -673,9 +743,6 @@ impl ChainNtfnHandler {
             return;
         };
         let mut subscriber = subscriber.lock().expect("index subscriber mutex poisoned");
-        if subscriber.cancelled() {
-            return;
-        }
         let ntfn = dcroxide_indexers::IndexNtfn {
             ntfn_type,
             block,
@@ -683,15 +750,9 @@ impl ChainNtfnHandler {
             is_treasury_enabled: check_tx_flags.is_treasury_enabled(),
         };
         if let Err(e) = subscriber.notify(&ntfn) {
-            // The only operator-visible diagnostic for a halted index
-            // (dcrd logs the error right before cancelling).  Emit on
-            // stdout with dcrd's level + subsystem tag (INDX, ERROR) so
-            // an operator capturing the daemon's stdout sees why the
-            // index halted (dcrd logs this via `indxLog.Error`).
-            crate::logging::error(
-                "INDX",
-                &format!("index update failed, index maintenance halted: {e}"),
-            );
+            // dcrd's `log.Error(err)` under the INDX subsystem, once per
+            // failed notification.
+            crate::logging::error("INDX", &e.to_string());
         }
     }
 
@@ -743,15 +804,21 @@ impl ChainNtfnHandler {
             .zip(regular_tail_hashes)
             .chain(stake.iter().zip(stake_tail_hashes))
         {
+            // The accepted orphans come back as values (dcrd's
+            // `ProcessOrphans` returning the `*dcrutil.Tx` orphans it
+            // accepted) and are announced from those, so nothing the
+            // pool accepted can go unannounced and the announcement
+            // carries the orphan dcrd announces rather than the pool's
+            // fraud-proof-updated copy.
             let accepted = {
                 let mut pool = self.tx_pool.lock().expect("tx pool mutex poisoned");
                 pool.remove_transaction(tx, tx_hash, false);
                 pool.maybe_accept_dependents(tx, tx_hash, is_treasury_enabled);
                 pool.remove_double_spends(tx, tx_hash);
                 pool.remove_orphan_pub(tx_hash);
-                pool.process_orphans(tx, check_tx_flags)
+                pool.process_orphans_accepted(tx, check_tx_flags)
             };
-            self.announce_transactions(&accepted);
+            self.announce_transactions(accepted);
 
             // Now that this block is in the blockchain, mark the
             // transaction as no longer needing rebroadcasting and
@@ -805,34 +872,41 @@ impl ChainNtfnHandler {
             }
         }
 
-        let mut readmit: Vec<dcroxide_wire::MsgTx> =
-            block.transactions.get(1..).unwrap_or(&[]).to_vec();
-        readmit.extend_from_slice(if is_treasury_enabled {
-            block.stransactions.get(1..).unwrap_or(&[])
-        } else {
-            &block.stransactions[..]
-        });
+        // Two separate readmissions, the regular tree first and then the
+        // stake tree, as dcrd's `handleDisconnectedBlockTxns` runs them:
+        // each call walks its slice in reverse with only its own
+        // transactions in the transient map, so merging the trees would
+        // readmit every stake transaction (votes included, which move
+        // the tip's known-disapproved tally) before any regular one.
+        let regular = block.transactions.get(1..).unwrap_or(&[]);
         let _errs = self
             .tx_pool
             .lock()
             .expect("tx pool mutex poisoned")
-            .maybe_accept_transactions(&readmit);
+            .maybe_accept_transactions(regular);
+        let stake = if is_treasury_enabled {
+            // Skip the treasurybase.
+            block.stransactions.get(1..).unwrap_or(&[])
+        } else {
+            &block.stransactions[..]
+        };
+        let _errs = self
+            .tx_pool
+            .lock()
+            .expect("tx pool mutex poisoned")
+            .maybe_accept_transactions(stake);
     }
 
     /// The announce cascade for transactions the maintenance accepted
     /// (dcrd `AnnounceNewTransactions`): websocket notifications, the
-    /// recently-advertised cache, and the peer inventory relay.
-    fn announce_transactions(&self, accepted: &[Hash]) {
+    /// recently-advertised cache, and the peer inventory relay, all
+    /// from the accepted values themselves.
+    fn announce_transactions(&self, accepted: Vec<(Hash, dcroxide_wire::MsgTx)>) {
         if accepted.is_empty() {
             return;
         }
-        let mut pairs = Vec::new();
-        for hash in accepted {
-            let fetched = {
-                let pool = self.tx_pool.lock().expect("tx pool mutex poisoned");
-                pool.fetch_transaction(hash)
-            };
-            let Some(tx) = fetched else { continue };
+        let mut pairs = Vec::with_capacity(accepted.len());
+        for (hash, tx) in accepted {
             let tree = if dcroxide_stake::determine_tx_type(&tx) == dcroxide_stake::TxType::Regular
             {
                 dcroxide_wire::TX_TREE_REGULAR
@@ -843,7 +917,7 @@ impl ChainNtfnHandler {
                 .sync_peers
                 .relay_inventory(&crate::server::RelayInvFacts {
                     inv_type: dcroxide_wire::InvType::TX,
-                    inv_hash: *hash,
+                    inv_hash: hash,
                     req_services: dcroxide_wire::ServiceFlag(0),
                     immediate: false,
                     data_is_block_header: false,
@@ -855,7 +929,7 @@ impl ChainNtfnHandler {
                 self.recently_advertised
                     .lock()
                     .expect("recently advertised poisoned")
-                    .put(*hash, tx.clone());
+                    .put(hash, tx.clone());
             }
             pairs.push((tx, tree));
         }
@@ -1045,7 +1119,6 @@ mod tests {
                 fork_len: 0,
                 block: &genesis,
             }));
-            handler.drain_pending_checked_announcements();
             handler.drain_pending_accepted_announcements(&chain, now);
             let mut got = Vec::new();
             while let Ok(msg) = rx.try_recv() {
@@ -1068,10 +1141,10 @@ mod tests {
     }
 
     /// The combined `drain_pending` entry point drives the whole
-    /// deferred sequence under one lock: two distinct queued
-    /// announcements (a checked one for a fresh hash and an accepted one
-    /// for another) both relay from a single call, so neither sub-drain
-    /// is skipped (P3-1).
+    /// deferred sequence under one lock: with a checked announcement for
+    /// a fresh hash (relayed by the callback itself) and an accepted one
+    /// for another (queued), a single call leaves both relayed, so the
+    /// accepted sub-drain is not skipped (P3-1).
     #[test]
     fn drain_pending_drives_the_whole_sequence() {
         let params = dcroxide_chaincfg::testnet3_params();
@@ -1145,8 +1218,9 @@ mod tests {
             block: &other,
         }));
 
-        // A single combined drain runs both the checked and accepted
-        // sub-drains: two distinct announced hashes relay two messages.
+        // A single combined drain runs the accepted sub-drain: with the
+        // callback's checked relay, two distinct announced hashes relay
+        // two messages.
         handler.drain_pending(&chain, now);
         let mut got = Vec::new();
         while let Ok(msg) = rx.try_recv() {
@@ -1220,6 +1294,615 @@ mod tests {
         assert!(
             enabled_after_drain(true),
             "unsynced mining enables the estimator at the accepted height"
+        );
+    }
+
+    /// Register one connected full-node peer that relays transactions
+    /// and prefers inventory announcements, handing back the receiving
+    /// end of its outbound queue.
+    fn full_node_peer(peers: &crate::dispatch::SyncPeers) -> crate::peerloop::OutboundReceiver {
+        let (queue, rx) = crate::peerloop::OutboundQueue::channel();
+        peers.register(
+            1,
+            queue,
+            None,
+            Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
+                crate::server::RelayPeerFacts {
+                    connected: true,
+                    services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+                    wants_headers: false,
+                    disable_relay_tx: false,
+                    protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+                },
+            ))),
+            Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
+                dcroxide_peer::Config::default(),
+            ))),
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        rx
+    }
+
+    /// The early checked-block announcement leaves from the chain
+    /// callback itself, before any drain runs, as dcrd's
+    /// NTNewTipBlockChecked case relays it with the chain lock held so
+    /// the block spreads while the expensive connect runs.  The
+    /// accepted-block announcement still waits for the drain.
+    ///
+    /// Regression for the checked announcement queueing until the
+    /// post-processing drain, which runs only after the whole connect
+    /// and its commit.
+    #[test]
+    fn the_checked_announcement_relays_from_the_callback() {
+        let params = dcroxide_chaincfg::testnet3_params();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opts = dcroxide_database::Options::new(dir.path().join("blocks"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create database");
+        let chain = Arc::new(Mutex::new(
+            dcroxide_blockchain::process::Chain::open(db, &params, params.assume_valid, false, 0)
+                .expect("open chain"),
+        ));
+        let tx_pool = crate::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            false,
+            100,
+            10000,
+            false,
+            false,
+        );
+        let genesis = chain
+            .lock()
+            .expect("chain")
+            .block_by_hash(&params.genesis_hash)
+            .expect("genesis block");
+        let mut accepted = genesis.clone();
+        accepted.header.version = 0x5eed;
+
+        let peers = crate::dispatch::SyncPeers::new();
+        let rx = full_node_peer(&peers);
+        let handler = ChainNtfnHandler::new(
+            None,
+            params.clone(),
+            true,
+            crate::sync::SyncGate::always_current(),
+            None,
+            Arc::clone(&tx_pool),
+            peers,
+            crate::dispatch::new_recently_advertised(),
+        );
+
+        handler.handle(&Notification::NewTipBlockChecked(&genesis));
+        match rx.try_recv() {
+            Ok(dcroxide_wire::Message::Inv(inv)) => {
+                assert_eq!(inv.inv_list.len(), 1);
+                assert_eq!(inv.inv_list[0].hash, genesis.header.block_hash());
+            }
+            other => panic!("the checked announcement must relay from the callback: {other:?}"),
+        }
+
+        handler.handle(&Notification::BlockAccepted(BlockAcceptedNtfnsData {
+            best_height: 0,
+            fork_len: 0,
+            block: &accepted,
+        }));
+        assert!(
+            rx.try_recv().is_err(),
+            "the accepted announcement waits for the drain"
+        );
+        handler.drain_pending(&chain, 2_000_000_000);
+        match rx.try_recv() {
+            Ok(dcroxide_wire::Message::Inv(inv)) => {
+                assert_eq!(inv.inv_list[0].hash, accepted.header.block_hash());
+            }
+            other => panic!("the drain relays the accepted announcement: {other:?}"),
+        }
+    }
+
+    /// A failed index update does not stop index maintenance.  dcrd's
+    /// `handleIndexUpdates` logs the error and goes on to the next
+    /// notification (its `s.cancel()` touches only the context the
+    /// indexes were initialized with), so an update that skips a height
+    /// fails with the missing-notification error and the next
+    /// notification whose height lines up with the index tip is still
+    /// applied.
+    ///
+    /// Regression for the handler skipping every notification once the
+    /// subscriber had latched its cancelled flag.
+    #[test]
+    fn a_failed_index_update_leaves_later_updates_running() {
+        use dcroxide_blockchain::notifications::BlockConnectedNtfnsData;
+        use dcroxide_indexers::{ChainQueryer, ExistsAddrIndex, IndexSubscriber, Indexer};
+
+        let params = dcroxide_chaincfg::simnet_params();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opts = dcroxide_database::Options::new(dir.path().join("blocks"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create database");
+        let chain = Arc::new(Mutex::new(
+            dcroxide_blockchain::process::Chain::open(
+                db.clone(),
+                &params,
+                params.assume_valid,
+                false,
+                0,
+            )
+            .expect("open chain"),
+        ));
+        let queryer = Arc::new(crate::indexes::NodeChainQueryer::new(
+            Arc::clone(&chain),
+            params.clone(),
+        ));
+        let mut subscriber = IndexSubscriber::new(dcroxide_indexers::Interrupt::default());
+        let index = ExistsAddrIndex::new(
+            &mut subscriber,
+            Arc::new(db),
+            queryer as Arc<dyn ChainQueryer>,
+        )
+        .expect("exists address index");
+        let subscriber = Arc::new(Mutex::new(subscriber));
+
+        let tx_pool = crate::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            false,
+            100,
+            10000,
+            false,
+            false,
+        );
+        let mut handler = ChainNtfnHandler::new(
+            None,
+            params.clone(),
+            false,
+            crate::sync::SyncGate::always_current(),
+            None,
+            tx_pool,
+            crate::dispatch::SyncPeers::new(),
+            crate::dispatch::new_recently_advertised(),
+        );
+        handler.set_index_subscriber(Arc::clone(&subscriber));
+
+        let genesis = Arc::new(params.genesis_block.clone());
+        let at_height = |height: u32| {
+            let mut block = params.genesis_block.clone();
+            block.header.height = height;
+            Arc::new(block)
+        };
+        let connect = |block: Arc<dcroxide_wire::MsgBlock>| {
+            handler.handle(&Notification::BlockConnected(BlockConnectedNtfnsData {
+                block,
+                parent_block: Arc::clone(&genesis),
+                check_tx_flags: AgendaFlags::default(),
+            }));
+            handler.drain_pending_block_events();
+        };
+        let tip = || index.lock().expect("index").tip().expect("index tip").0;
+        assert_eq!(tip(), 0, "the fresh index sits at genesis");
+
+        // Height 2 skips height 1: the update fails and the subscriber
+        // latches dcrd's cancelled context.
+        connect(at_height(2));
+        assert_eq!(tip(), 0, "the out-of-order update is refused");
+        assert!(
+            subscriber.lock().expect("subscriber").cancelled(),
+            "the failure cancels the subscriber's context"
+        );
+
+        // The next notification lines up with the index tip again and is
+        // applied, as dcrd's handler loop applies it.
+        connect(at_height(1));
+        assert_eq!(
+            tip(),
+            1,
+            "index maintenance carries on after a failed update"
+        );
+    }
+
+    /// The first linear main-chain blocks of dcrd's full-block battery
+    /// (fully signed regnet blocks) up to and including the first one
+    /// the predicate accepts, with the battery's generation time.
+    fn battery_prefix_through(
+        mut stop: impl FnMut(&dcroxide_wire::MsgBlock) -> bool,
+    ) -> (i64, Vec<dcroxide_wire::MsgBlock>) {
+        let params = dcroxide_chaincfg::regnet_params();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../dcroxide-blockchain/tests/data/fullblock_vectors.txt"
+        );
+        let data = std::fs::read_to_string(path).expect("fullblock vectors");
+        let mut now: i64 = 0;
+        let mut tip = params.genesis_hash;
+        let mut blocks = Vec::new();
+        for line in data.lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            match f[0] {
+                "now" => now = f[1].parse().expect("generation time"),
+                // accept <name> <mainchain> <orphan> <blockhex>
+                "accept" => {
+                    let (block, _) =
+                        dcroxide_wire::MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4]))
+                            .expect("block");
+                    if f[2] != "true" || block.header.prev_block != tip {
+                        continue;
+                    }
+                    tip = block.header.block_hash();
+                    let done = stop(&block);
+                    blocks.push(block);
+                    if done {
+                        return (now, blocks);
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the battery's main chain never satisfied the predicate");
+    }
+
+    /// A regnet chain with the given battery blocks processed.
+    fn battery_chain(
+        blocks: &[dcroxide_wire::MsgBlock],
+        now: i64,
+    ) -> (tempfile::TempDir, Arc<Mutex<Chain>>) {
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opts = dcroxide_database::Options::new(dir.path().join("blocks"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create database");
+        let mut chain =
+            Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain");
+        for block in blocks {
+            let (_, errs) = chain.process_block(block, now, &params);
+            assert!(errs.is_empty(), "battery block must accept: {errs:?}");
+        }
+        (dir, Arc::new(Mutex::new(chain)))
+    }
+
+    /// Driven by a real chain, the checked announcement is on the peer's
+    /// queue by the time the chain emits it — inside the processing
+    /// call, with the chain mutex held and the block not yet connected —
+    /// exactly where dcrd's NTNewTipBlockChecked case relays it.  Relaying
+    /// under the chain mutex neither deadlocks nor waits for the connect.
+    #[test]
+    fn the_checked_announcement_leaves_before_the_connect() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let params = dcroxide_chaincfg::regnet_params();
+        let (now, blocks) = battery_prefix_through(|block| block.header.height >= 4);
+        let (next, history) = blocks.split_last().expect("battery blocks");
+        let (_dir, chain) = battery_chain(history, now);
+        let tx_pool = crate::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            false,
+            100,
+            10000,
+            false,
+            false,
+        );
+        let peers = crate::dispatch::SyncPeers::new();
+        let rx = full_node_peer(&peers);
+        let handler = ChainNtfnHandler::new(
+            None,
+            params.clone(),
+            true,
+            crate::sync::SyncGate::always_current(),
+            None,
+            tx_pool,
+            peers,
+            crate::dispatch::new_recently_advertised(),
+        );
+
+        // Whether the announcement was queued when the chain emitted it,
+        // and whether the block had been connected by then.
+        let checked_emitted = Arc::new(AtomicBool::new(false));
+        let queued_at_emission = Arc::new(AtomicBool::new(false));
+        let connected_first = Arc::new(AtomicBool::new(false));
+        {
+            let (checked_emitted, queued_at_emission, connected_first) = (
+                Arc::clone(&checked_emitted),
+                Arc::clone(&queued_at_emission),
+                Arc::clone(&connected_first),
+            );
+            let expected = next.header.block_hash();
+            let callback = handler.clone();
+            chain
+                .lock()
+                .expect("chain")
+                .set_notification_callback(Box::new(move |n| {
+                    callback.handle(n);
+                    match n {
+                        Notification::NewTipBlockChecked(_) => {
+                            checked_emitted.store(true, Ordering::SeqCst);
+                            let queued = matches!(
+                                rx.try_recv(),
+                                Ok(dcroxide_wire::Message::Inv(inv)) if inv.inv_list[0].hash == expected
+                            );
+                            queued_at_emission.store(queued, Ordering::SeqCst);
+                        }
+                        Notification::BlockConnected(_) if !checked_emitted.load(Ordering::SeqCst) => {
+                            connected_first.store(true, Ordering::SeqCst);
+                        }
+                        _ => {}
+                    }
+                }));
+        }
+        let (_, errs) = chain
+            .lock()
+            .expect("chain")
+            .process_block(next, now, &params);
+        assert!(errs.is_empty(), "the next battery block accepts: {errs:?}");
+
+        assert!(
+            checked_emitted.load(Ordering::SeqCst),
+            "the current battery chain emits the early checked event"
+        );
+        assert!(
+            !connected_first.load(Ordering::SeqCst),
+            "the chain emits the checked event before connecting the block"
+        );
+        assert!(
+            queued_at_emission.load(Ordering::SeqCst),
+            "the announcement is queued before the processing call returns"
+        );
+    }
+
+    /// The battery's pay-to-script-hash output over a lone `OP_TRUE`,
+    /// which anyone can spend with [`OP_TRUE_SIG_SCRIPT`].
+    fn op_true_p2sh() -> Vec<u8> {
+        let mut script = vec![0xa9, 0x14]; // OP_HASH160 OP_DATA_20
+        script.extend_from_slice(&dcroxide_txscript::stdaddr::hash160(&[0x51]));
+        script.push(0x87); // OP_EQUAL
+        script
+    }
+
+    /// The signature script pushing the `OP_TRUE` redeem script.
+    const OP_TRUE_SIG_SCRIPT: [u8; 2] = [0x01, 0x51];
+
+    /// A transaction spending the given pay-to-`OP_TRUE` output back to
+    /// the same script, less a fee, with the given input fraud proof.
+    fn spend_op_true(
+        previous_out_point: dcroxide_wire::OutPoint,
+        value: i64,
+        value_in: i64,
+    ) -> dcroxide_wire::MsgTx {
+        dcroxide_wire::MsgTx {
+            tx_in: vec![dcroxide_wire::TxIn {
+                previous_out_point,
+                sequence: u32::MAX,
+                value_in,
+                block_height: 0,
+                block_index: 0,
+                signature_script: OP_TRUE_SIG_SCRIPT.to_vec(),
+            }],
+            tx_out: vec![dcroxide_wire::TxOut {
+                value: value
+                    .checked_sub(100_000)
+                    .expect("the output covers the fee"),
+                version: 0,
+                pk_script: op_true_p2sh(),
+            }],
+            ..dcroxide_wire::MsgTx::default()
+        }
+    }
+
+    /// The orphans a connected block releases are announced as the
+    /// values the pool accepted — dcrd's `ProcessOrphans` hands
+    /// `AnnounceNewTransactions` the orphan objects themselves — rather
+    /// than looked up in the pool again: the relayed copy is the orphan
+    /// as it arrived, while the pool keeps its fraud-proof-updated copy.
+    ///
+    /// Regression for the hash-only orphan processing whose announce
+    /// cascade re-fetched each transaction from the pool.
+    #[test]
+    fn connected_block_orphans_announce_the_accepted_values() {
+        let params = dcroxide_chaincfg::regnet_params();
+        // Stop at the first battery block carrying a regular transaction
+        // besides its coinbase that pays to OP_TRUE.
+        let (now, blocks) = battery_prefix_through(|block| {
+            block
+                .transactions
+                .get(1..)
+                .unwrap_or(&[])
+                .iter()
+                .any(|tx| tx.tx_out.iter().any(|out| out.pk_script == op_true_p2sh()))
+        });
+        let (confirming, history) = blocks.split_last().expect("battery blocks");
+        let (_dir, chain) = battery_chain(history, now);
+
+        let parent = confirming.transactions[1..]
+            .iter()
+            .find(|tx| tx.tx_out.iter().any(|out| out.pk_script == op_true_p2sh()))
+            .expect("parent transaction");
+        let (index, parent_out) = parent
+            .tx_out
+            .iter()
+            .enumerate()
+            .find(|(_, out)| out.pk_script == op_true_p2sh())
+            .expect("pay-to-OP_TRUE output");
+        let orphan = spend_op_true(
+            dcroxide_wire::OutPoint {
+                hash: parent.tx_hash(),
+                index: u32::try_from(index).expect("output index"),
+                tree: dcroxide_wire::TX_TREE_REGULAR,
+            },
+            parent_out.value,
+            0,
+        );
+        let orphan_hash = orphan.tx_hash();
+
+        let tx_pool = crate::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            true,
+            100,
+            10000,
+            false,
+            false,
+        );
+        {
+            let mut pool = tx_pool.lock().expect("tx pool");
+            let accepted = pool
+                .process_transaction(&orphan, true, true, 0)
+                .expect("the orphan is admitted");
+            assert!(accepted.is_empty(), "the parent is not confirmed yet");
+            assert!(pool.is_orphan_in_pool(&orphan_hash));
+        }
+
+        let peers = crate::dispatch::SyncPeers::new();
+        let _rx = full_node_peer(&peers);
+        let recently_advertised = crate::dispatch::new_recently_advertised();
+        let handler = ChainNtfnHandler::new(
+            None,
+            params.clone(),
+            true,
+            crate::sync::SyncGate::always_current(),
+            None,
+            Arc::clone(&tx_pool),
+            peers,
+            Arc::clone(&recently_advertised),
+        );
+        {
+            let mut chain = chain.lock().expect("chain");
+            let callback = handler.clone();
+            chain.set_notification_callback(Box::new(move |n| callback.handle(n)));
+            let (_, errs) = chain.process_block(confirming, now, &params);
+            assert!(
+                errs.is_empty(),
+                "the confirming block must accept: {errs:?}"
+            );
+        }
+        handler.drain_pending_block_events();
+
+        let pooled = tx_pool
+            .lock()
+            .expect("tx pool")
+            .fetch_transaction(&orphan_hash)
+            .expect("the confirmed parent releases the orphan");
+        assert_eq!(
+            pooled.tx_in[0].value_in, parent_out.value,
+            "the pool filled in its own copy's fraud proof"
+        );
+        let announced = recently_advertised
+            .lock()
+            .expect("recently advertised")
+            .peek(&orphan_hash)
+            .expect("the released orphan is announced");
+        assert_eq!(
+            announced.tx_in[0].value_in, 0,
+            "the announcement carries the orphan as accepted, as dcrd's does"
+        );
+    }
+
+    /// A disconnected block's transactions are readmitted in dcrd's two
+    /// passes, the regular tree first and then the stake tree, each with
+    /// only its own transactions in the transient map.  A regular
+    /// transaction spending a stake-tree transaction of the same block
+    /// therefore finds its parent missing and is dropped, where one
+    /// readmission over both trees would readmit the stake transaction
+    /// first and keep the regular one.
+    ///
+    /// Regression for the merged readmission, which reversed dcrd's
+    /// regular-then-stake order.
+    #[test]
+    fn disconnect_readmits_the_regular_tree_before_the_stake_tree() {
+        use dcroxide_blockchain::notifications::BlockDisconnectedNtfnsData;
+
+        let params = dcroxide_chaincfg::regnet_params();
+        let (now, blocks) = battery_prefix_through(|block| block.header.height >= 24);
+        let (_dir, chain) = battery_chain(&blocks, now);
+
+        // A mature, unspent pay-to-OP_TRUE coinbase output.
+        let (outpoint, value) = {
+            let chain = chain.lock().expect("chain");
+            let next_height = chain.best_snapshot().height.saturating_add(1);
+            blocks
+                .iter()
+                .filter(|block| {
+                    next_height.saturating_sub(i64::from(block.header.height))
+                        >= i64::from(params.coinbase_maturity)
+                })
+                .flat_map(|block| {
+                    let coinbase = &block.transactions[0];
+                    let hash = coinbase.tx_hash();
+                    coinbase.tx_out.iter().enumerate().map(move |(index, out)| {
+                        (
+                            dcroxide_wire::OutPoint {
+                                hash,
+                                index: u32::try_from(index).expect("output index"),
+                                tree: dcroxide_wire::TX_TREE_REGULAR,
+                            },
+                            out.clone(),
+                        )
+                    })
+                })
+                .find(|(outpoint, out)| {
+                    out.pk_script == op_true_p2sh()
+                        && chain
+                            .fetch_utxo_entry(outpoint)
+                            .is_some_and(|entry| !entry.is_spent())
+                })
+                .map(|(outpoint, out)| (outpoint, out.value))
+                .expect("a mature unspent coinbase output")
+        };
+        let stake_side = spend_op_true(outpoint, value, value);
+        let regular_side = spend_op_true(
+            dcroxide_wire::OutPoint {
+                hash: stake_side.tx_hash(),
+                index: 0,
+                tree: dcroxide_wire::TX_TREE_REGULAR,
+            },
+            stake_side.tx_out[0].value,
+            stake_side.tx_out[0].value,
+        );
+
+        // The disconnected block: its header approves the parent, so only
+        // the readmission runs, over the regular transaction and the
+        // stake-tree transaction it spends.
+        let parent = blocks.last().expect("tip").clone();
+        let mut disconnected = parent.clone();
+        disconnected.header.vote_bits = 1;
+        disconnected.transactions = vec![parent.transactions[0].clone(), regular_side.clone()];
+        disconnected.stransactions = vec![stake_side.clone()];
+
+        let tx_pool = crate::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            true,
+            100,
+            10000,
+            false,
+            false,
+        );
+        let handler = ChainNtfnHandler::new(
+            None,
+            params.clone(),
+            true,
+            crate::sync::SyncGate::always_current(),
+            None,
+            Arc::clone(&tx_pool),
+            crate::dispatch::SyncPeers::new(),
+            crate::dispatch::new_recently_advertised(),
+        );
+        handler.handle(&Notification::BlockDisconnected(
+            BlockDisconnectedNtfnsData {
+                block: Arc::new(disconnected),
+                parent_block: Arc::new(parent),
+                check_tx_flags: AgendaFlags::default(),
+            },
+        ));
+        handler.drain_pending_block_events();
+
+        let pool = tx_pool.lock().expect("tx pool");
+        assert!(
+            pool.is_transaction_in_pool(&stake_side.tx_hash()),
+            "the stake-tree transaction is readmitted"
+        );
+        assert!(
+            !pool.is_transaction_in_pool(&regular_side.tx_hash()),
+            "the regular tree is readmitted first, before its stake-tree parent is back"
         );
     }
 }

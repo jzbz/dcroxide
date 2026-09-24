@@ -534,8 +534,8 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
         // checks, the coded limits inside the decoders -- ban.
         //
         // `kind_name()` is that test: it is empty exactly for
-        // `WireError::UnexpectedEof`, which is where both Go io errors
-        // land.  Over-banning here would cost an honest peer 24 hours
+        // `WireError::Eof` and `WireError::UnexpectedEof`, the two Go io
+        // errors.  Over-banning here would cost an honest peer 24 hours
         // over a decoder parity gap, and the handshake reads below are
         // unauthenticated.
         let (msg, consumed) = wire_read_message(&buf, self.pver, self.net).map_err(|e| {

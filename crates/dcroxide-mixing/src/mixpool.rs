@@ -5,12 +5,17 @@
 //!
 //! dcrd guards the pool with mutexes, delivers `Receive` results by
 //! blocking on a broadcast channel, and runs background expiry and
-//! observer goroutines; this port is synchronous with identical state
-//! transitions: `receive` collects what is currently accepted
-//! (matching dcrd's pre-cancelled-context path, which is also what
-//! the observer uses), and the scheduled expiry latch is exposed for
-//! the daemon to drive.  The clock is injectable so expiration
-//! behavior is fully deterministic under test.
+//! observer goroutines; this port is synchronous and makes dcrd's state
+//! transitions except for three deliberate divergences, each documented
+//! where it lives: the per-identity key exchange cap
+//! ([`MAX_KES_PER_IDENTITY`]), the one-message-per-type rule applied to
+//! un-orphaned messages as well (`reconsider_orphans`), and the expiry
+//! latch that keeps the newest height and is drained on the daemon's
+//! epoch ticker ([`Pool::expire_messages_in_background`]).  `receive`
+//! collects what is currently accepted (matching dcrd's
+//! pre-cancelled-context path, which is also what the observer uses).
+//! The wall and monotonic clocks are injectable so expiration behavior
+//! is fully deterministic under test.
 
 // Bounded pool arithmetic mirrors Go; genuinely wrapping math uses
 // explicit wrapping operations.
@@ -62,6 +67,46 @@ const STRIKE_LIMIT: usize = 2;
 /// (20 minutes, in nanoseconds).
 const ORPHAN_EXPIRY_NANOS: i64 = 20 * 60 * 1_000_000_000;
 
+const NANOS_PER_SEC: i64 = 1_000_000_000;
+
+/// Seconds from Go's internal time origin, January 1 of year 1, to the
+/// Unix epoch (Go `unixToInternal`).  `time.Unix` adds it to the
+/// caller's seconds in plain, wrapping int64 arithmetic.
+const UNIX_TO_INTERNAL: i64 = 62_135_596_800;
+
+/// A Unix-nanosecond wall reading as Go's internal seconds and
+/// nanosecond remainder (the `sec()`/`nsec()` pair `Before` and `Sub`
+/// compare).
+fn go_wall(now: i64) -> (i64, i64) {
+    (
+        now.div_euclid(NANOS_PER_SEC) + UNIX_TO_INTERNAL,
+        now.rem_euclid(NANOS_PER_SEC),
+    )
+}
+
+/// Go's `time.Now().Add(d).Before(time.Unix(secs, 0))` for a wall
+/// reading `now`.  The comparison is on the wall clock, since the
+/// `time.Unix` operand carries no monotonic reading, and on Go's
+/// internal seconds, so a `secs` whose offset overflows int64 wraps to
+/// the far past exactly as it does in dcrd.
+fn go_before_unix(now: i64, d: i64, secs: i64) -> bool {
+    let (t_sec, _) = go_wall(now.saturating_add(d));
+    // time.Unix(secs, 0) has a zero nanosecond part, so only the seconds
+    // decide.
+    t_sec < secs.wrapping_add(UNIX_TO_INTERNAL)
+}
+
+/// Go's `time.Since(time.Unix(secs, 0))` for a wall reading `now`: the
+/// wall-clock difference in nanoseconds, saturated to the Duration
+/// range as `Time.Sub` does when it overflows.
+fn go_since_unix(now: i64, secs: i64) -> i64 {
+    let (t_sec, t_nsec) = go_wall(now);
+    let u_sec = secs.wrapping_add(UNIX_TO_INTERNAL);
+    let d =
+        (i128::from(t_sec) - i128::from(u_sec)) * i128::from(NANOS_PER_SEC) + i128::from(t_nsec);
+    i64::try_from(d).unwrap_or(if d < 0 { i64::MIN } else { i64::MAX })
+}
+
 /// The maximum number of key exchange messages the pool holds at one
 /// time for a single mixing identity.
 ///
@@ -104,6 +149,19 @@ const ORPHAN_EXPIRY_NANOS: i64 = 20 * 60 * 1_000_000_000;
 /// Refusal is not a ban: `rule_other` is not bannable, so the message
 /// is dropped and not relayed rather than costing the sender its
 /// connection.
+///
+/// The cap bounds the identity's other messages only because each is
+/// accepted into a session the identity holds a key exchange in, and at
+/// most one of each type per identity and session.  dcrd enforces that
+/// second rule on the direct path alone: when a key exchange un-orphans
+/// the identity's waiting messages it accepts every one of them for the
+/// session (`reconsiderOrphans`, `mixing/mixpool/mixpool.go:1585-1629`),
+/// so a sender could park an orphan pool's worth of one message type
+/// before its key exchange and have them all pooled and relayed at once.
+/// The port applies the same-type conflict check there too, keeping the
+/// earliest-received message and dropping the rest -- also a divergence,
+/// and one honest senders never reach, since they send one message of
+/// each type per session.
 pub const MAX_KES_PER_IDENTITY: usize = 32;
 
 type IdPubKey = [u8; 33];
@@ -220,6 +278,88 @@ impl PoolMessage {
             PoolMessage::FP(_) => Some(MsgType::FP),
             PoolMessage::RS(_) => Some(MsgType::RS),
         }
+    }
+}
+
+/// A mixing message together with what dcrd works out once per received
+/// message: its identity hash, which `peer.readMessage` caches on the
+/// message (`WriteHash`) and every later `Hash()` call returns, and its
+/// signature verdict, which `AcceptMessage` computes with
+/// `mixing.VerifySignedMessage` before it takes the pool's mutex
+/// (`mixing/mixpool/mixpool.go:1198`).
+///
+/// Build it before taking the sync manager's and the pool's locks, with
+/// [`HashedMessage::with_hash`] when the hash was already computed as the
+/// message was read, or [`HashedMessage::new`] otherwise.  Serializing
+/// and hashing a message is proportional to its size (a DC-net may be
+/// megabytes), and without the cache the sync manager and the pool each
+/// re-derived both under their own mutexes.  The verdict is only
+/// consulted where dcrd verifies, after the rerun check and the
+/// already-accepted check, so which error a message earns is unchanged.
+#[derive(Clone)]
+pub struct HashedMessage {
+    msg: PoolMessage,
+    hash: Result<Hash, PoolError>,
+    sig_valid: bool,
+}
+
+impl HashedMessage {
+    /// Hash the message and verify its signature.
+    pub fn new(msg: PoolMessage) -> HashedMessage {
+        let hash = msg.mix_hash();
+        HashedMessage::verified(msg, hash)
+    }
+
+    /// Verify the signature of a message whose identity hash the caller
+    /// already computed from this same message, as dcrd's
+    /// `peer.readMessage` does once, right after decoding, with
+    /// `WriteHash`.  `hash` must be what [`PoolMessage::mix_hash`] returns
+    /// for `msg`: the pool keys the message by it.  Debug builds check
+    /// that.
+    pub fn with_hash(msg: PoolMessage, hash: Hash) -> HashedMessage {
+        debug_assert!(
+            msg.mix_hash() == Ok(hash),
+            "precomputed mix hash does not match the message"
+        );
+        HashedMessage::verified(msg, Ok(hash))
+    }
+
+    fn verified(msg: PoolMessage, hash: Result<Hash, PoolError>) -> HashedMessage {
+        // A rerun, or a message that cannot be hashed, is refused before
+        // dcrd verifies anything, so its verdict is never read.
+        let sig_valid =
+            msg.run() == 0 && hash.is_ok() && verify_signed_message(msg.as_mix_message());
+        HashedMessage {
+            msg,
+            hash,
+            sig_valid,
+        }
+    }
+
+    /// A message the pool accepted: its hash is the pool's key for it,
+    /// and its signature was verified before it was pooled or orphaned.
+    fn accepted(msg: PoolMessage, hash: Hash) -> HashedMessage {
+        HashedMessage {
+            msg,
+            hash: Ok(hash),
+            sig_valid: true,
+        }
+    }
+
+    /// The message.
+    pub fn message(&self) -> &PoolMessage {
+        &self.msg
+    }
+
+    /// The message, consuming the carrier.
+    pub fn into_message(self) -> PoolMessage {
+        self.msg
+    }
+
+    /// The cached identity hash (dcrd `Hash`), or the error hashing it
+    /// failed with.
+    pub fn hash(&self) -> Result<Hash, PoolError> {
+        self.hash.clone()
     }
 }
 
@@ -395,6 +535,8 @@ struct Entry {
 struct OrphanMsg {
     message: PoolMessage,
     src: u64,
+    /// The monotonic clock reading when the orphan was stored (dcrd's
+    /// `time.Now()`, whose monotonic reading `time.Since` uses).
     accepted: i64,
 }
 
@@ -457,19 +599,29 @@ pub struct Pool<B: MixBlockChain> {
     // Observer state (dcrd `Observer.strikes`).
     strikes: HashMap<OutPointKey, StrikeSetRef>,
 
+    /// The wall clock, in Unix nanoseconds: the key exchange epoch
+    /// comparisons, which dcrd makes against `time.Unix` values that
+    /// carry no monotonic reading.
     now_fn: lru::Clock,
+    /// The monotonic clock, in nanoseconds from an arbitrary origin: the
+    /// orphan age and the recently-removed cache's TTL, which dcrd
+    /// measures between two `time.Now()` readings and so on Go's
+    /// monotonic clock.
+    mono_fn: lru::Clock,
 }
 
 /// Whether the transaction memory pool already spends an outpoint
 /// (dcrd `mempool.TxPool.IsSpent`, consulted by `mixpoolChain
 /// .FetchUtxoEntry` at `server.go:3752-3754`).
 ///
-/// A predicate rather than a pool handle on purpose.  dcrd answers this
-/// question from inside its utxo fetcher, which runs under the mixpool's
-/// own mutex; doing that here would take the tx-pool lock while holding
-/// the mixpool's, closing an AB-BA against the acceptance gauntlet's
-/// mixpool probe, which takes them the other way round.  The caller
-/// answers it first and passes the answer in.
+/// A predicate rather than a pool handle on purpose.  dcrd asks this from
+/// its utxo fetcher inside `checkAcceptPR`, which `AcceptMessage` runs
+/// before it takes the mixpool's mutex (`mixing/mixpool/mixpool.go:
+/// 1206-1210`).  Here the whole acceptance runs under the mixpool guard,
+/// so asking from inside would take the tx-pool lock while holding the
+/// mixpool's, closing an AB-BA against the acceptance gauntlet's mixpool
+/// probe, which takes them the other way round.  The caller answers it
+/// before taking the guard and passes the answer in.
 pub type MempoolSpent<'a> = &'a dyn Fn(&OutPoint) -> bool;
 
 /// The answer for a pool with no transaction memory pool behind it
@@ -487,7 +639,12 @@ impl<B: MixBlockChain> Pool<B> {
         blockchain: B,
         utxo_fetcher: Option<Arc<dyn MixUtxoFetcher + Send + Sync>>,
     ) -> Pool<B> {
-        Pool::new_with_clock(
+        // Go's time.Now() carries a monotonic reading that time.Since
+        // and the LRU's Before/After comparisons use; Instant is its
+        // counterpart.  The origin is arbitrary: only differences are
+        // taken.
+        let origin = std::time::Instant::now();
+        Pool::new_with_clocks(
             blockchain,
             utxo_fetcher,
             // The LRU clock must be Send + Sync, so it is an `Arc`
@@ -498,16 +655,32 @@ impl<B: MixBlockChain> Pool<B> {
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or_default()
             }),
+            std::sync::Arc::new(move || {
+                i64::try_from(origin.elapsed().as_nanos()).unwrap_or(i64::MAX)
+            }),
         )
     }
 
-    /// [`new`](Pool::new) with an injectable clock; exposed so tests
-    /// can control expiration deterministically.
+    /// [`new`](Pool::new) with one injectable clock serving as both the
+    /// wall and the monotonic clock; exposed so tests can control
+    /// expiration deterministically.
     #[doc(hidden)]
     pub fn new_with_clock(
         blockchain: B,
         utxo_fetcher: Option<Arc<dyn MixUtxoFetcher + Send + Sync>>,
         now_fn: lru::Clock,
+    ) -> Pool<B> {
+        Pool::new_with_clocks(blockchain, utxo_fetcher, now_fn.clone(), now_fn)
+    }
+
+    /// [`new`](Pool::new) with separately injectable wall and monotonic
+    /// clocks; exposed so tests can step the wall clock alone.
+    #[doc(hidden)]
+    pub fn new_with_clocks(
+        blockchain: B,
+        utxo_fetcher: Option<Arc<dyn MixUtxoFetcher + Send + Sync>>,
+        now_fn: lru::Clock,
+        mono_fn: lru::Clock,
     ) -> Pool<B> {
         // XXX (dcrd): mainnet epoch; add to chainparams.
         let mut epoch_secs = 10 * 60;
@@ -529,13 +702,14 @@ impl<B: MixBlockChain> Pool<B> {
             recent_mix_msgs: lru::Map::new_with_default_ttl_and_clock(
                 MAX_RECENTLY_REMOVED_MIX_MSGS,
                 MAX_RECENT_MIX_MSGS_TTL_NANOS,
-                now_fn.clone(),
+                mono_fn.clone(),
             ),
             blockchain,
             utxo_fetcher,
             fee_rate: FEE_RATE,
             strikes: HashMap::new(),
             now_fn,
+            mono_fn,
         }
     }
 
@@ -642,6 +816,18 @@ impl<B: MixBlockChain> Pool<B> {
     /// superset -- the pass removes pair requests whose expiry is at or
     /// below the height, and any such pair request is already unusable
     /// at that tip (`check_accept_pr` rejects `cur_height >= expiry`).
+    ///
+    /// The timing differs too, and that is part of the same divergence.
+    /// dcrd's goroutine sleeps until the second epoch boundary after the
+    /// call (`waitForExpiry`, `now.Truncate(p.epoch).Add(2 * p.epoch)`,
+    /// `mixing/mixpool/mixpool.go:439-444`), so an expired pair request
+    /// survives at least one full epoch after the block that expired it.
+    /// The daemon's ticker drains the latch at the next boundary, which
+    /// can be seconds after that block, so such a pair request -- and the
+    /// sessions built on it -- can go up to an epoch sooner here.  dcrd's
+    /// own mix client expires its pool on every epoch tick with the latest
+    /// height (`mixing/mixclient/client.go:917`, `:1070-1071`), so wallets
+    /// stop pairing it at that same boundary.
     pub fn expire_messages_in_background(&mut self, height: u32) {
         if height > self.expire_height {
             self.expire_height = height;
@@ -705,14 +891,19 @@ impl<B: MixBlockChain> Pool<B> {
         // Expire orphans with old receive times, and in the case of
         // any orphan KE, expire those with old epochs.
         let now = (self.now_fn)();
+        let mono_now = (self.mono_fn)();
         let expired_orphans: Vec<([u8; 32], IdPubKey)> = self
             .orphans
             .iter()
             .filter(|(_, o)| {
-                let mut expire = now - o.accepted >= ORPHAN_EXPIRY_NANOS;
+                // time.Since(o.accepted): both readings carry Go's
+                // monotonic clock, so a wall-clock step moves neither,
+                // and subMono saturates.
+                let mut expire = mono_now.saturating_sub(o.accepted) >= ORPHAN_EXPIRY_NANOS;
                 if !expire && let PoolMessage::KE(ke) = &o.message {
-                    let epoch_nanos = (ke.epoch as i64).wrapping_mul(1_000_000_000);
-                    expire = now - epoch_nanos >= ORPHAN_EXPIRY_NANOS;
+                    // time.Since(time.Unix(int64(ke.Epoch), 0)): wall
+                    // clock, since time.Unix has no monotonic reading.
+                    expire = go_since_unix(now, ke.epoch as i64) >= ORPHAN_EXPIRY_NANOS;
                 }
                 expire
             })
@@ -1038,7 +1229,7 @@ impl<B: MixBlockChain> Pool<B> {
         let orphan = Arc::new(OrphanMsg {
             message: msg.clone(),
             src,
-            accepted: (self.now_fn)(),
+            accepted: (self.mono_fn)(),
         });
         self.orphans.insert(*hash, orphan.clone());
         self.orphans_by_id
@@ -1065,11 +1256,49 @@ impl<B: MixBlockChain> Pool<B> {
         src: u64,
         mempool_spent: MempoolSpent<'_>,
     ) -> Result<Vec<PoolMessage>, PoolError> {
+        let accepted = self.accept_inner(msg, None, src, mempool_spent)?;
+        Ok(accepted
+            .into_iter()
+            .map(HashedMessage::into_message)
+            .collect())
+    }
+
+    /// [`accept_message`](Pool::accept_message) for a message whose hash
+    /// and signature verdict were worked out before the pool's guard was
+    /// taken, returning the accepted messages with their hashes.  This is
+    /// the daemon's intake path: nothing here re-serializes the message.
+    pub fn accept_hashed(
+        &mut self,
+        msg: &HashedMessage,
+        src: u64,
+        mempool_spent: MempoolSpent<'_>,
+    ) -> Result<Vec<HashedMessage>, PoolError> {
+        self.accept_inner(
+            &msg.msg,
+            Some((&msg.hash, msg.sig_valid)),
+            src,
+            mempool_spent,
+        )
+    }
+
+    /// dcrd `AcceptMessage`.  `pre` carries the hash and signature
+    /// verdict when the caller already has them; otherwise both are
+    /// derived here, at the points where dcrd derives them.
+    fn accept_inner(
+        &mut self,
+        msg: &PoolMessage,
+        pre: Option<(&Result<Hash, PoolError>, bool)>,
+        src: u64,
+        mempool_spent: MempoolSpent<'_>,
+    ) -> Result<Vec<HashedMessage>, PoolError> {
         if msg.run() != 0 {
             return Err(rule_other("nonzero reruns are unsupported"));
         }
 
-        let hash = msg.mix_hash()?;
+        let hash = match pre {
+            Some((hash, _)) => hash.clone()?,
+            None => msg.mix_hash()?,
+        };
 
         // Check if already accepted.
         if self.pool.contains_key(&hash.0) || self.prs.contains_key(&hash.0) {
@@ -1077,7 +1306,11 @@ impl<B: MixBlockChain> Pool<B> {
         }
 
         // Require message to be signed by the presented identity.
-        if !verify_signed_message(msg.as_mix_message()) {
+        let sig_valid = match pre {
+            Some((_, sig_valid)) => sig_valid,
+            None => verify_signed_message(msg.as_mix_message()),
+        };
+        if !sig_valid {
             return Err(rule(RuleKind::InvalidSignature));
         }
         let id = msg.identity();
@@ -1090,7 +1323,7 @@ impl<B: MixBlockChain> Pool<B> {
                 if !accepted {
                     return Ok(Vec::new());
                 }
-                return Ok(self.reconsider_orphans(msg.clone(), &id));
+                return Ok(self.reconsider_orphans(msg.clone(), &hash, &id));
             }
             PoolMessage::KE(ke) => {
                 self.check_accept_ke(ke)?;
@@ -1099,7 +1332,7 @@ impl<B: MixBlockChain> Pool<B> {
                 if !accepted {
                     return Ok(Vec::new());
                 }
-                return Ok(self.reconsider_orphans(msg.clone(), &id));
+                return Ok(self.reconsider_orphans(msg.clone(), &hash, &id));
             }
             PoolMessage::CT(ct) => {
                 check_ct_limits(ct)?;
@@ -1168,7 +1401,7 @@ impl<B: MixBlockChain> Pool<B> {
         }
 
         self.accept_entry(msg.clone(), msgtype, &hash, &id, &sid);
-        Ok(vec![msg.clone()])
+        Ok(vec![HashedMessage::accepted(msg.clone(), hash)])
     }
 
     /// Remove a pair request message and all other messages and
@@ -1255,7 +1488,9 @@ impl<B: MixBlockChain> Pool<B> {
         if is_dust_amount(pr.mix_amount, P2PKHV0_PK_SCRIPT_SIZE, FEE_RATE) {
             return Err(rule(RuleKind::MixDust));
         }
-        if input_value < i64::from(pr.message_count) * pr.mix_amount {
+        // Go's int64 product wraps; a negative mix amount the dust check
+        // above lets through (its product wraps too) can overflow here.
+        if input_value < i64::from(pr.message_count).wrapping_mul(pr.mix_amount) {
             return Err(rule(RuleKind::InvalidTotalMixAmount));
         }
 
@@ -1420,8 +1655,17 @@ impl<B: MixBlockChain> Pool<B> {
     /// due to a missing previous PR message (in the case of KE
     /// orphans) or missing the identity's KE in a matching session
     /// (for all other messages) (dcrd `reconsiderOrphans`).
-    fn reconsider_orphans(&mut self, accepted: PoolMessage, id: &IdPubKey) -> Vec<PoolMessage> {
-        let mut accepted_messages = vec![accepted.clone()];
+    ///
+    /// Un-orphaned messages other than key exchanges are held to the
+    /// direct path's one-message-per-type rule, which dcrd does not do
+    /// here; see [`MAX_KES_PER_IDENTITY`].
+    fn reconsider_orphans(
+        &mut self,
+        accepted: PoolMessage,
+        hash: &Hash,
+        id: &IdPubKey,
+    ) -> Vec<HashedMessage> {
+        let mut accepted_messages = vec![HashedMessage::accepted(accepted.clone(), *hash)];
 
         let mut kes: Vec<MsgMixKeyExchange> = Vec::new();
         if let PoolMessage::KE(ke) = &accepted {
@@ -1430,19 +1674,19 @@ impl<B: MixBlockChain> Pool<B> {
 
         // If the accepted message was a PR, there may be KE orphans
         // that can be accepted now.
-        if let PoolMessage::PR(pr) = &accepted {
-            let Ok(pr_hash) = pr.mix_hash() else {
-                return accepted_messages;
-            };
-            let orphan_kes: Vec<(MsgMixKeyExchange, u64)> = self
+        if let PoolMessage::PR(_) = &accepted {
+            let pr_hash = *hash;
+            // The orphan's key is its hash, which dcrd reads from the
+            // message's cache (`orphanKE.Hash()`).
+            let orphan_kes: Vec<([u8; 32], MsgMixKeyExchange, u64)> = self
                 .orphans_by_id
                 .get(id)
                 .map(|by_id| {
                     by_id
-                        .values()
-                        .filter_map(|o| match &o.message {
+                        .iter()
+                        .filter_map(|(orphan_hash, o)| match &o.message {
                             PoolMessage::KE(ke) if ke.seen_prs.contains(&pr_hash) => {
-                                Some(((**ke).clone(), o.src))
+                                Some((*orphan_hash, (**ke).clone(), o.src))
                             }
                             _ => None,
                         })
@@ -1450,10 +1694,8 @@ impl<B: MixBlockChain> Pool<B> {
                 })
                 .unwrap_or_default();
 
-            for (orphan_ke, src) in orphan_kes {
-                let Ok(orphan_ke_hash) = orphan_ke.mix_hash() else {
-                    continue;
-                };
+            for (orphan_ke_hash, orphan_ke, src) in orphan_kes {
+                let orphan_ke_hash = Hash(orphan_ke_hash);
                 match self.accept_ke(&orphan_ke, &orphan_ke_hash, &orphan_ke.identity, src) {
                     Ok(_) => {}
                     Err(_) => continue,
@@ -1462,7 +1704,10 @@ impl<B: MixBlockChain> Pool<B> {
                 kes.push(orphan_ke.clone());
                 self.remove_orphan(&orphan_ke_hash.0, id);
 
-                accepted_messages.push(PoolMessage::KE(Box::new(orphan_ke)));
+                accepted_messages.push(HashedMessage::accepted(
+                    PoolMessage::KE(Box::new(orphan_ke)),
+                    orphan_ke_hash,
+                ));
             }
             if self.orphans_by_id.get(id).is_none_or(|m| m.is_empty()) {
                 return accepted_messages;
@@ -1477,22 +1722,51 @@ impl<B: MixBlockChain> Pool<B> {
                 continue;
             }
 
-            let orphan_entries: Vec<([u8; 32], PoolMessage)> = self
+            // Earliest received first, so the one-per-type rule below
+            // keeps the message the direct path would have kept; the
+            // hash breaks ties.
+            let mut orphan_entries: Vec<(i64, [u8; 32], PoolMessage)> = self
                 .orphans_by_id
                 .get(id)
                 .map(|by_id| {
                     by_id
                         .iter()
                         .filter(|(_, o)| o.message.sid() == Some(ke.session_id))
-                        .map(|(hash, o)| (*hash, o.message.clone()))
+                        .map(|(hash, o)| (o.accepted, *hash, o.message.clone()))
                         .collect()
                 })
                 .unwrap_or_default();
+            orphan_entries.sort_by_key(|e| (e.0, e.1));
 
-            for (orphan_hash, orphan) in orphan_entries {
-                let Some(msgtype) = orphan.msgtype() else {
-                    continue;
+            // The message types this identity already holds in the
+            // session (the direct path's conflict check, `accept_message`).
+            let mut held = [false; 7];
+            if let Some(hashes) = self.messages_by_identity.get(id) {
+                for e in hashes.iter().filter_map(|h| self.pool.get(&h.0)) {
+                    if e.sid == ke.session_id {
+                        held[e.msgtype as usize] = true;
+                    }
+                }
+            }
+
+            for (_, orphan_hash, orphan) in orphan_entries {
+                // dcrd's type switch has no key exchange case: an
+                // orphan KE sharing the session ID falls to `default`,
+                // is logged, and stays an orphan until its own PR
+                // arrives and `accept_ke` judges it.
+                let msgtype = match orphan.msgtype() {
+                    None | Some(MsgType::KE) => continue,
+                    Some(msgtype) => msgtype,
                 };
+
+                // A second message of a type the identity already holds
+                // in this session is what the direct path refuses as a
+                // conflict; drop it rather than pool it.
+                if held[msgtype as usize] {
+                    self.remove_orphan(&orphan_hash, id);
+                    continue;
+                }
+                held[msgtype as usize] = true;
 
                 self.accept_entry(
                     orphan.clone(),
@@ -1502,7 +1776,7 @@ impl<B: MixBlockChain> Pool<B> {
                     &ke.session_id,
                 );
 
-                accepted_messages.push(orphan);
+                accepted_messages.push(HashedMessage::accepted(orphan, Hash(orphan_hash)));
                 self.remove_orphan(&orphan_hash, id);
             }
             if self.orphans_by_id.get(id).is_none_or(|m| m.is_empty()) {
@@ -1527,9 +1801,11 @@ impl<B: MixBlockChain> Pool<B> {
             return Err(rule(RuleKind::PeerPositionOutOfBounds));
         }
 
+        // now.Add(earlyKEDuration).Before(time.Unix(int64(ke.Epoch), 0)),
+        // compared in Go's internal seconds rather than as nanoseconds,
+        // which would overflow for epochs past the year 2262.
         let now = (self.now_fn)();
-        let ke_epoch_nanos = (ke.epoch as i64).wrapping_mul(1_000_000_000);
-        if now.wrapping_add(EARLY_KE_DURATION_NANOS) < ke_epoch_nanos {
+        if go_before_unix(now, EARLY_KE_DURATION_NANOS, ke.epoch as i64) {
             return Err(rule_other("KE received too early for stated epoch"));
         }
 
@@ -1542,7 +1818,8 @@ impl<B: MixBlockChain> Pool<B> {
     /// bounded by it too: every other message type is only accepted
     /// into a session the identity already has an accepted key
     /// exchange in, and at most one message of each type per identity
-    /// and session.
+    /// and session, on the direct path and when un-orphaned alike
+    /// (`reconsider_orphans`).
     fn identity_ke_count(&self, id: &IdPubKey) -> usize {
         let Some(hashes) = self.messages_by_identity.get(id) else {
             return 0;
@@ -1783,23 +2060,9 @@ impl<B: MixBlockChain> Pool<B> {
                     continue;
                 }
 
-                let mut r = Received {
-                    sid: *sid,
-                    kes: None,
-                    cts: Some(Vec::new()),
-                    srs: Some(Vec::new()),
-                    dcs: Some(Vec::new()),
-                    cms: Some(Vec::new()),
-                    fps: None,
-                    rss: Some(Vec::new()),
-                    receive_all: true,
-                };
-                let _ = self.receive(&mut r);
-                let cts = r.cts.unwrap_or_default();
-                let srs = r.srs.unwrap_or_default();
-                let dcs = r.dcs.unwrap_or_default();
-                let cms = r.cms.unwrap_or_default();
-                let rss = r.rss.unwrap_or_default();
+                // dcrd `Receive` with the CT, SR, DC, CM and RS slices
+                // requested and its error ignored; see session_senders.
+                let [cts, srs, dcs, cms, rss] = self.session_senders(sid);
 
                 // When no ciphertext messages were received, a
                 // session was not formed, and timeout can not be
@@ -1835,26 +2098,26 @@ impl<B: MixBlockChain> Pool<B> {
                 if cts.is_empty() {
                     continue;
                 } else if cts.len() < ses_kes.len() {
-                    for ct in &cts {
-                        ids.remove(&ct.identity);
+                    for id in &cts {
+                        ids.remove(id);
                     }
                 } else if srs.is_empty() {
                     continue;
                 } else if srs.len() < ses_kes.len() {
-                    for sr in &srs {
-                        ids.remove(&sr.identity);
+                    for id in &srs {
+                        ids.remove(id);
                     }
                 } else if dcs.is_empty() {
                     continue;
                 } else if dcs.len() < ses_kes.len() {
-                    for dc in &dcs {
-                        ids.remove(&dc.identity);
+                    for id in &dcs {
+                        ids.remove(id);
                     }
                 } else if cms.is_empty() {
                     continue;
                 } else if cms.len() < ses_kes.len() {
-                    for cm in &cms {
-                        ids.remove(&cm.identity);
+                    for id in &cms {
+                        ids.remove(id);
                     }
                 }
                 let timed_out_ids = timed_out.entry(pairing.clone()).or_default();
@@ -1917,6 +2180,36 @@ impl<B: MixBlockChain> Pool<B> {
         self.update_strikes(prev_epoch, &active, &pr_by_ke, &completed);
 
         Ok(())
+    }
+
+    /// The senders of a session's pooled CT, SR, DC, CM and RS
+    /// messages, in that order: what the observer reads from dcrd's
+    /// `Receive` with those slices requested (`CheckPrevEpoch`).  It
+    /// only counts the messages and reads their identities, so this
+    /// collects the identities instead of copying every body, which
+    /// [`receive`](Pool::receive) would do where dcrd appends pointers.
+    /// An unknown session yields nothing, as the observer's ignored
+    /// `Receive` error leaves its slices empty.
+    fn session_senders(&self, sid: &[u8; 32]) -> [Vec<IdPubKey>; 5] {
+        let mut senders: [Vec<IdPubKey>; 5] = Default::default();
+        let Some(ses) = self.sessions.get(sid) else {
+            return senders;
+        };
+        for hash in &ses.hashes {
+            let Some(e) = self.pool.get(hash) else {
+                continue;
+            };
+            let slot = match e.msgtype {
+                MsgType::CT => 0,
+                MsgType::SR => 1,
+                MsgType::DC => 2,
+                MsgType::CM => 3,
+                MsgType::RS => 4,
+                MsgType::KE | MsgType::FP => continue,
+            };
+            senders[slot].push(e.msg.identity());
+        }
+        senders
     }
 
     fn update_strikes(
@@ -2222,9 +2515,13 @@ fn is_dust_amount(amount: i64, script_size: usize, relay_fee_per_kb: i64) -> boo
 }
 
 fn check_fee(pr: &MsgMixPairReq, fee_rate: i64) -> Result<(), PoolError> {
-    let mut fee = pr.input_value - i64::from(pr.message_count).wrapping_mul(pr.mix_amount);
+    // Go's int64 arithmetic wraps, and an input value near the maximum
+    // less a negative total mix amount overflows.
+    let mut fee = pr
+        .input_value
+        .wrapping_sub(i64::from(pr.message_count).wrapping_mul(pr.mix_amount));
     if let Some(change) = &pr.change {
-        fee -= change.value;
+        fee = fee.wrapping_sub(change.value);
     }
 
     let estimated_size = estimate_p2pkh_v0_serialize_size(

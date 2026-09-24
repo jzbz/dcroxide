@@ -13,8 +13,30 @@
 //! absolute [`Instant`] deadlines reconciled from the state machine's
 //! armed flags after every mutation, and the asynchronous
 //! `genTemplateAsync` goroutines collapse into a synchronous build in
-//! `drain_and_build` (dcrd cancels any in-flight generation, so only
-//! the last queued request matters).
+//! `drain_and_build`.
+//!
+//! dcrd's regen handler keeps running while a generation goroutine
+//! builds, and a later `genTemplateAsync` cancels that goroutine, which
+//! then neither sets the current template nor notifies.  The thread
+//! cannot service events mid-build, so when a build returns, every
+//! command and timer that came due during it runs through the state
+//! machine *before* the result is installed.  If any of them requested
+//! a new generation, the finished build is dropped as a cancelled
+//! goroutine's result is and the newest request is built instead;
+//! otherwise the result is installed after those events, as dcrd's
+//! goroutine installs it after the handler has processed them.  That
+//! covers the reorganization bracket a build's own forced
+//! reorganization emits: it is serviced before the template that build
+//! produced is installed, not after, where its clear would wipe it.
+//! Only the timing differs: dcrd's cancelled goroutine also runs its
+//! `NewBlockTemplate` to completion, but concurrently with the build
+//! that replaces it, while the thread finishes it first.
+//!
+//! Template retrieval waits the way dcrd's `currentTemplate` waits on
+//! `staleTemplateWg`: the state machine's stale-template count (raised
+//! by new-parent and new-votes generations and by a reorganization,
+//! released when they finish) is published with the template, and the
+//! getwork reads block while it is nonzero.
 //!
 //! The feedback ordering matches dcrd's `genTemplateAsync` goroutine
 //! body exactly: after a build, [`BgGenerator::process_generated_template`]
@@ -27,7 +49,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -35,9 +57,10 @@ use dcroxide_blockchain::process::Chain;
 use dcroxide_chaincfg::Params;
 use dcroxide_mempool::VoteReceiver;
 use dcroxide_mining::bg_generator::{
-    BgGenerator, BgRegenEvent, BgTemplateState, BgTemplateUpdateReason, MAX_VOTE_TIMEOUT_MILLIS,
-    MIN_VOTES_TIMEOUT_MILLIS, handle_failed_gen_retry_timeout, handle_max_votes_timeout,
-    handle_regen_event, handle_regen_timer_expired, handle_track_side_chains_timeout,
+    BgGenerator, BgRegenEvent, BgTemplateState, BgTemplateUpdateReason, GenRequest,
+    MAX_VOTE_TIMEOUT_MILLIS, MIN_VOTES_TIMEOUT_MILLIS, handle_failed_gen_retry_timeout,
+    handle_max_votes_timeout, handle_regen_event, handle_regen_timer_expired,
+    handle_track_side_chains_timeout,
 };
 use dcroxide_mining::{BlkTmplGenerator, ExtraNonces, MiningPolicy, TemplateChain};
 use dcroxide_rpc::server::{RpcBlockTemplater, RpcTemplateSubscription, TemplateRecv};
@@ -170,10 +193,76 @@ pub struct SharedTemplate {
     /// The error associated with the current template, if any (dcrd
     /// `templateErr`).
     err: Option<String>,
-    /// Whether the chain is reorganizing, during which the getwork RPC
-    /// reports no work (dcrd `CurrentTemplate` blocks on the stale
-    /// template wait group; the port reports `Ok(None)`).
+    /// Whether the chain is reorganizing.  A retrieval waits a
+    /// reorganization out through `stale`, as dcrd's does; this flag
+    /// only decides what a retrieval that stopped waiting early (its
+    /// request was cancelled, or the generator is gone) reports: no
+    /// work.
     reorganizing: bool,
+    /// Whether template retrieval must wait (dcrd's `staleTemplateWg`
+    /// is nonzero): a new-parent or new-votes generation is in flight,
+    /// or a reorganization has started and not finished.
+    stale: bool,
+    /// Whether the generator thread has exited, after which nothing
+    /// clears `stale`, so no retrieval may wait on it.
+    closed: bool,
+    /// Signalled on every publish, waking retrievals that wait out a
+    /// stale window.
+    changed: Arc<Condvar>,
+}
+
+impl SharedTemplate {
+    /// Whether template retrieval currently waits for a pending
+    /// template (dcrd's `staleTemplateWg` is nonzero).
+    pub fn is_stale(&self) -> bool {
+        self.stale
+    }
+}
+
+/// Lock the mirror once dcrd's stale-template window is over (dcrd
+/// `currentTemplate` calling `staleTemplateWg.Wait()` before it reads
+/// the template, `bgblktmplgenerator.go:401-402`, which both
+/// `CurrentTemplate` and `Subscribe` go through).
+///
+/// The window is a build or a reorganization, both of which end, so
+/// the wait is bounded the way dcrd's is.  It also ends when the
+/// generator thread is gone, and -- like the port's other template
+/// waits, which dcrd's `Wait` has no counterpart for -- when the RPC
+/// request is cancelled, so a client that hangs up stops holding its
+/// work permit; what such a caller then reads nobody receives.
+fn wait_for_current(current: &Mutex<SharedTemplate>) -> MutexGuard<'_, SharedTemplate> {
+    let mut guard = current.lock().expect("shared template poisoned");
+    let cancellable = request_is_cancellable();
+    while guard.stale && !guard.closed {
+        if cancellable && request_cancelled() {
+            break;
+        }
+        let changed = Arc::clone(&guard.changed);
+        guard = if cancellable {
+            changed
+                .wait_timeout(guard, CANCEL_POLL_INTERVAL)
+                .expect("shared template poisoned")
+                .0
+        } else {
+            changed.wait(guard).expect("shared template poisoned")
+        };
+    }
+    guard
+}
+
+/// Marks the getwork mirror closed when the generator thread exits by
+/// any path, so no retrieval waits on a stale window nothing will end.
+struct CloseOnExit(Arc<Mutex<SharedTemplate>>);
+
+impl Drop for CloseOnExit {
+    fn drop(&mut self) {
+        let mut current = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        current.closed = true;
+        current.changed.notify_all();
+    }
 }
 
 /// dcrd's per-subscription buffer: twice the number of regenerations
@@ -395,6 +484,21 @@ struct BuildCtx {
     current: Arc<Mutex<SharedTemplate>>,
     subscribers: Arc<Mutex<SubscriberRegistry>>,
     ntfn: Option<NodeNtfnMgr>,
+    /// The chain handler's deferred-maintenance drain (see
+    /// [`start_generator`]).
+    drain_hook: Option<Box<dyn Fn() + Send>>,
+}
+
+impl BuildCtx {
+    /// The generator's `IsCurrent` callback: the netsync gate evaluated at
+    /// the server's median-adjusted time, since dcrd's
+    /// `SyncManager.IsCurrent` asks the chain, whose `isCurrent` reads
+    /// `b.timeSource.AdjustedTime()`.  The regen timers keep the wall
+    /// clock, as dcrd's `time.Now()` does.
+    fn sync_is_current(&self) -> bool {
+        self.sync_gate
+            .is_current(&self.chain, crate::mediantime::adjusted_time_unix())
+    }
 }
 
 /// Publish the generator's current template state to the getwork mirror
@@ -411,7 +515,10 @@ struct BuildCtx {
 /// read path (which locks the same mirror) never contends behind a
 /// whole-block clone.  dcrd swaps a `*BlockTemplate` pointer under
 /// `templateMtx`; the port copies, so the copy is kept out of the
-/// critical section and only three moves happen under the lock.
+/// critical section and only a few moves happen under the lock.
+///
+/// The stale-template count travels with the template, and every
+/// publish wakes the retrievals waiting for it to reach zero.
 fn publish_current_template(
     current: &Arc<Mutex<SharedTemplate>>,
     g: &BgGenerator,
@@ -420,36 +527,18 @@ fn publish_current_template(
     let block = g.template.as_ref().map(|t| t.block.clone());
     let err = g.template_err.clone();
     let reorganizing = state.is_reorganizing;
+    let stale = g.stale_template_count > 0;
     let mut current = current.lock().expect("shared template poisoned");
     current.block = block;
     current.err = err;
     current.reorganizing = reorganizing;
+    current.stale = stale;
+    current.changed.notify_all();
 }
 
-/// Run the last queued generation request, mirroring dcrd's
-/// `genTemplateAsync` goroutine: dcrd cancels any in-flight generation
-/// so only the final request matters.  Builds the template, feeds the
-/// results back through the state machine in dcrd's order, publishes
-/// the current template, and fans any resulting notification out to
-/// the subscribers and the work sink.
-fn drain_and_build(
-    ctx: &BuildCtx,
-    g: &mut BgGenerator,
-    state: &mut BgTemplateState,
-    deadlines: &mut TimerDeadlines,
-) {
-    let requests = core::mem::take(&mut g.gen_requests);
-    let Some(request) = requests.into_iter().last() else {
-        // No queued generation, but the preceding event may still have
-        // changed the current template (a reorg-started event clears it;
-        // a reorg-done event awaiting votes rebuilds the base without
-        // queuing a build), so resync the getwork mirror to whatever the
-        // generator now holds rather than leaving a stale pre-reorg
-        // template exposed once the reorganizing flag clears.
-        publish_current_template(&ctx.current, g, state);
-        return;
-    };
-
+/// Build a template for the generation request (the body of dcrd's
+/// `genTemplateAsync` goroutine up to `NewBlockTemplate` returning).
+fn build_template(ctx: &BuildCtx) -> (Option<dcroxide_mining::BlockTemplate>, Option<String>) {
     // Pick a mining address at random and generate a template paying
     // to it (dcrd `payToAddr := g.cfg.MiningAddrs[rand.IntN(len)]`).
     let pay_addr = if ctx.mining_addrs.is_empty() {
@@ -471,63 +560,174 @@ fn drain_and_build(
         NodeTemplateTxSource::new(Arc::clone(&ctx.pool)),
         ctx.mining_time_offset,
     );
-    let (template, err) = match builder.new_block_template(pay_addr, &nonces) {
+    match builder.new_block_template(pay_addr, &nonces) {
         Ok(template) => (template, None),
         Err(e) => (None, Some(e)),
-    };
-    drop(builder);
-
-    // Set the current template and obtain the subscriber notification
-    // (dcrd `setCurrentTemplate`), then feed the queued template-update
-    // event to sync the base block and arm the regen timer (dcrd's
-    // `rtTemplateUpdated` running `handleTemplateUpdate`, which never
-    // notifies).
-    let notification = g.process_generated_template(
-        template,
-        request.reason,
-        err.clone(),
-        request.block_retrieval,
-    );
-    let built = g.template.clone();
-    let now = now_unix();
-    let is_current = ctx.allow_unsynced_mining || ctx.sync_gate.is_current(&ctx.chain, now);
-    {
-        let mut chain = NodeTemplateChain::new(Arc::clone(&ctx.chain), ctx.params.clone());
-        let tx_source = NodeTemplateTxSource::new(Arc::clone(&ctx.pool));
-        handle_regen_event(
-            g,
-            state,
-            &mut chain,
-            &tx_source,
-            BgRegenEvent::TemplateUpdated(built.as_ref(), err.is_some()),
-            is_current,
-            now,
-        );
-    }
-    // The template-update feed re-arms only the variable regen timer,
-    // never the fixed-duration timeouts, so no fixed re-arm applies.
-    reconcile_timers(deadlines, state, false);
-
-    // Publish the current template for the getwork RPC.
-    publish_current_template(&ctx.current, g, state);
-
-    // Fan the notification out to the subscribers and the websocket
-    // work sink (dcrd's send on `notifySubscribers`).
-    if let Some((template, reason)) = notification {
-        ctx.subscribers
-            .lock()
-            .expect("subscriber registry poisoned")
-            .broadcast(&template.block);
-        if let Some(ntfn) = &ctx.ntfn {
-            ntfn.notify_work(template.block.clone(), map_reason(reason));
-        }
     }
 }
 
-/// Feed one regen event through the state machine and rebuild
-/// (mirroring dcrd's `handleRegenEvent` followed by any queued
-/// `genTemplateAsync`).
-fn process_event(
+/// Release the stale-template hold of a generation that will never
+/// install (dcrd's cancelled goroutine still runs its deferred
+/// `staleTemplateWg.Done()`).
+fn release_cancelled(g: &mut BgGenerator, request: &GenRequest) {
+    if request.block_retrieval {
+        g.stale_template_count = g.stale_template_count.saturating_sub(1);
+    }
+}
+
+/// Run the queued generation requests, mirroring dcrd's
+/// `genTemplateAsync` goroutines.  Builds the newest request, services
+/// whatever queued up during the build, and then either drops the
+/// build (a new request arrived, which in dcrd cancels the goroutine)
+/// and builds again, or feeds the result back through the state
+/// machine in dcrd's order, publishes the current template, and fans
+/// any resulting notification out to the subscribers and the work
+/// sink.
+///
+/// Returns `false` when a stop command arrived during a build, which
+/// in dcrd cancels the goroutine before it installs anything.
+fn drain_and_build(
+    ctx: &BuildCtx,
+    g: &mut BgGenerator,
+    state: &mut BgTemplateState,
+    deadlines: &mut TimerDeadlines,
+    receiver: &mpsc::Receiver<GenCommand>,
+) -> bool {
+    loop {
+        let mut requests = core::mem::take(&mut g.gen_requests);
+        let Some(request) = requests.pop() else {
+            // No queued generation, but the preceding event may still
+            // have changed the current template (a reorg-started event
+            // clears it; a reorg-done event awaiting votes rebuilds the
+            // base without queuing a build), so resync the getwork
+            // mirror to whatever the generator now holds rather than
+            // leaving a stale pre-reorg template exposed once the
+            // reorganizing flag clears.
+            publish_current_template(&ctx.current, g, state);
+            return true;
+        };
+        // The earlier requests were superseded before they could
+        // start: dcrd cancelled each in turn.
+        for superseded in &requests {
+            release_cancelled(g, superseded);
+        }
+
+        // Publish the stale-template hold before building so retrieval
+        // waits for this template (dcrd's `staleTemplateWg.Add(1)` in
+        // `genTemplateAsync` precedes the goroutine).
+        publish_current_template(&ctx.current, g, state);
+
+        let (template, err) = build_template(ctx);
+
+        // Run the chain handler's deferred maintenance for a
+        // reorganization the build itself forced
+        // (`force_head_reorganization` inside `new_block_template`)
+        // before the events that reorganization queued are serviced.
+        run_drain(&ctx.drain_hook);
+
+        // Service what arrived while the build ran, as dcrd's regen
+        // handler does concurrently with the goroutine.
+        let running = service_pending(ctx, g, state, deadlines, receiver);
+        if !running || !g.gen_requests.is_empty() {
+            // Cancelled: dcrd's goroutine sees `ctx.Err() != nil` and
+            // returns before `setCurrentTemplate` and before notifying
+            // (`bgblktmplgenerator.go:737-739`).
+            release_cancelled(g, &request);
+            if !running {
+                publish_current_template(&ctx.current, g, state);
+                return false;
+            }
+            continue;
+        }
+
+        // Set the current template and obtain the subscriber
+        // notification (dcrd `setCurrentTemplate`), then feed the
+        // queued template-update event to sync the base block and arm
+        // the regen timer (dcrd's `rtTemplateUpdated` running
+        // `handleTemplateUpdate`, which never notifies).
+        let notification = g.process_generated_template(
+            template,
+            request.reason,
+            err.clone(),
+            request.block_retrieval,
+        );
+        let built = g.template.clone();
+        let now = now_unix();
+        let is_current = ctx.allow_unsynced_mining || ctx.sync_is_current();
+        {
+            let mut chain = NodeTemplateChain::new(Arc::clone(&ctx.chain), ctx.params.clone());
+            let tx_source = NodeTemplateTxSource::new(Arc::clone(&ctx.pool));
+            handle_regen_event(
+                g,
+                state,
+                &mut chain,
+                &tx_source,
+                BgRegenEvent::TemplateUpdated(built.as_ref(), err.is_some()),
+                is_current,
+                now,
+            );
+        }
+        // The template-update feed re-arms only the variable regen
+        // timer, never the fixed-duration timeouts, so no fixed re-arm
+        // applies.
+        reconcile_timers(deadlines, state, false);
+
+        // Publish the current template for the getwork RPC.
+        publish_current_template(&ctx.current, g, state);
+
+        // Fan the notification out to the subscribers and the
+        // websocket work sink (dcrd's send on `notifySubscribers`).
+        if let Some((template, reason)) = notification {
+            ctx.subscribers
+                .lock()
+                .expect("subscriber registry poisoned")
+                .broadcast(&template.block);
+            if let Some(ntfn) = &ctx.ntfn {
+                ntfn.notify_work(template.block.clone(), map_reason(reason));
+            }
+        }
+        return true;
+    }
+}
+
+/// Feed the commands and timers that came due during a build through
+/// the state machine without building (dcrd's regen handler servicing
+/// its queue and timeouts while a generation goroutine runs).  Queued
+/// commands go first, as the main loop's `recv_timeout` hands out a
+/// queued command before it reports an elapsed deadline.  Returns
+/// `false` on a stop command.
+fn service_pending(
+    ctx: &BuildCtx,
+    g: &mut BgGenerator,
+    state: &mut BgTemplateState,
+    deadlines: &mut TimerDeadlines,
+    receiver: &mpsc::Receiver<GenCommand>,
+) -> bool {
+    loop {
+        match receiver.try_recv() {
+            Ok(GenCommand::Event(event)) => step_event(ctx, g, state, deadlines, event.as_ref()),
+            Ok(GenCommand::ForceRegen) => step_force_regen(ctx, g, state, deadlines),
+            Ok(GenCommand::Stop) => return false,
+            // A disconnected channel ends the thread at its next
+            // receive; nothing more can arrive here.
+            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {
+                match nearest_deadline(deadlines) {
+                    Some((at, fired)) if at <= Instant::now() => {
+                        step_timer(ctx, g, state, deadlines, fired);
+                    }
+                    _ => return true,
+                }
+            }
+        }
+        // Drive the chain handler's deferred maintenance for any
+        // reorganization the step initiated, as the main loop does.
+        run_drain(&ctx.drain_hook);
+    }
+}
+
+/// Feed one regen event through the state machine (dcrd's
+/// `handleRegenEvent`), leaving any generation it requests queued.
+fn step_event(
     ctx: &BuildCtx,
     g: &mut BgGenerator,
     state: &mut BgTemplateState,
@@ -535,7 +735,7 @@ fn process_event(
     event: &OwnedRegenEvent,
 ) {
     let now = now_unix();
-    let is_current = ctx.allow_unsynced_mining || ctx.sync_gate.is_current(&ctx.chain, now);
+    let is_current = ctx.allow_unsynced_mining || ctx.sync_is_current();
     {
         let mut chain = NodeTemplateChain::new(Arc::clone(&ctx.chain), ctx.params.clone());
         let tx_source = NodeTemplateTxSource::new(Arc::clone(&ctx.pool));
@@ -555,23 +755,38 @@ fn process_event(
     // a fresh countdown (dcrd's `time.After` in `handleBlockConnected`).
     let rearmed_fixed = matches!(event, OwnedRegenEvent::BlockConnected(_));
     reconcile_timers(deadlines, state, rearmed_fixed);
-    // `drain_and_build` republishes the full current-template state
-    // (block, error, and the reorganizing flag) on every path, including
-    // the no-build path a reorg event takes, so the getwork mirror always
-    // reflects the state machine after this event.
-    drain_and_build(ctx, g, state, deadlines);
 }
 
-/// Feed a force-regeneration request through the state machine and
-/// rebuild (dcrd's `rtForceRegen` running `handleForceRegen`).
-fn process_force_regen(
+/// Feed one regen event through the state machine and rebuild
+/// (mirroring dcrd's `handleRegenEvent` followed by any queued
+/// `genTemplateAsync`).  Returns `false` when the thread must stop.
+fn process_event(
+    ctx: &BuildCtx,
+    g: &mut BgGenerator,
+    state: &mut BgTemplateState,
+    deadlines: &mut TimerDeadlines,
+    receiver: &mpsc::Receiver<GenCommand>,
+    event: &OwnedRegenEvent,
+) -> bool {
+    step_event(ctx, g, state, deadlines, event);
+    // `drain_and_build` republishes the full current-template state
+    // (block, error, the reorganizing flag and the stale-template
+    // hold) on every path, including the no-build path a reorg event
+    // takes, so the getwork mirror always reflects the state machine
+    // after this event.
+    drain_and_build(ctx, g, state, deadlines, receiver)
+}
+
+/// Feed a force-regeneration request through the state machine
+/// (dcrd's `rtForceRegen` running `handleForceRegen`).
+fn step_force_regen(
     ctx: &BuildCtx,
     g: &mut BgGenerator,
     state: &mut BgTemplateState,
     deadlines: &mut TimerDeadlines,
 ) {
     let now = now_unix();
-    let is_current = ctx.allow_unsynced_mining || ctx.sync_gate.is_current(&ctx.chain, now);
+    let is_current = ctx.allow_unsynced_mining || ctx.sync_is_current();
     {
         let mut chain = NodeTemplateChain::new(Arc::clone(&ctx.chain), ctx.params.clone());
         let tx_source = NodeTemplateTxSource::new(Arc::clone(&ctx.pool));
@@ -587,12 +802,24 @@ fn process_force_regen(
     }
     // A forced regeneration never arms the fixed-duration timeouts.
     reconcile_timers(deadlines, state, false);
-    drain_and_build(ctx, g, state, deadlines);
 }
 
-/// Run the fired timer's handler and rebuild (the corresponding select
-/// arms of dcrd's `regenHandler`).
-fn process_timer(
+/// Feed a force-regeneration request through the state machine and
+/// rebuild.  Returns `false` when the thread must stop.
+fn process_force_regen(
+    ctx: &BuildCtx,
+    g: &mut BgGenerator,
+    state: &mut BgTemplateState,
+    deadlines: &mut TimerDeadlines,
+    receiver: &mpsc::Receiver<GenCommand>,
+) -> bool {
+    step_force_regen(ctx, g, state, deadlines);
+    drain_and_build(ctx, g, state, deadlines, receiver)
+}
+
+/// Run the fired timer's handler (the corresponding select arms of
+/// dcrd's `regenHandler`).
+fn step_timer(
     ctx: &BuildCtx,
     g: &mut BgGenerator,
     state: &mut BgTemplateState,
@@ -629,7 +856,20 @@ fn process_timer(
     }
     // No timer-fire handler re-arms a fixed-duration timeout.
     reconcile_timers(deadlines, state, false);
-    drain_and_build(ctx, g, state, deadlines);
+}
+
+/// Run the fired timer's handler and rebuild.  Returns `false` when
+/// the thread must stop.
+fn process_timer(
+    ctx: &BuildCtx,
+    g: &mut BgGenerator,
+    state: &mut BgTemplateState,
+    deadlines: &mut TimerDeadlines,
+    receiver: &mpsc::Receiver<GenCommand>,
+    fired: FiredTimer,
+) -> bool {
+    step_timer(ctx, g, state, deadlines, fired);
+    drain_and_build(ctx, g, state, deadlines, receiver)
 }
 
 /// The running generator thread and the handles the RPC serving reads.
@@ -691,7 +931,8 @@ fn run_drain(drain_hook: &Option<Box<dyn Fn() + Send>>) {
 /// `BgBlkTmplGenerator` and `server.Run` launching its handlers).
 ///
 /// `drain_hook` runs the chain notification handler's deferred
-/// maintenance after every processed event and timer.  A reorg the
+/// maintenance after every processed event and timer, and after each
+/// template build before the events it queued are serviced.  A reorg the
 /// generator itself starts (`force_head_reorganization` from a vote or
 /// the side-chain timeout) fires the chain callback synchronously on
 /// this thread, which only queues; the sync adapter's post-process
@@ -717,6 +958,8 @@ pub fn start_generator(
     let thread_current = Arc::clone(&current);
     let thread_subscribers = Arc::clone(&subscribers);
     let thread = std::thread::spawn(move || {
+        // However the thread ends, retrieval must stop waiting on it.
+        let _close_on_exit = CloseOnExit(Arc::clone(&thread_current));
         let mut g = BgGenerator::new(
             params.tickets_per_block,
             params.stake_validation_height,
@@ -736,6 +979,7 @@ pub fn start_generator(
             current: thread_current,
             subscribers: thread_subscribers,
             ntfn,
+            drain_hook,
         };
 
         // dcrd's initial startup handler waits for the chain to be
@@ -743,8 +987,7 @@ pub fn start_generator(
         // a synthetic block-connected event to prime the state machine.
         if !allow_unsynced_mining {
             loop {
-                let now = now_unix();
-                if ctx.sync_gate.is_current(&ctx.chain, now) {
+                if ctx.sync_is_current() {
                     break;
                 }
                 match receiver.recv_timeout(Duration::from_secs(1)) {
@@ -765,7 +1008,16 @@ pub fn start_generator(
                             OwnedRegenEvent::ReorgStarted | OwnedRegenEvent::ReorgDone
                         ) =>
                     {
-                        process_event(&ctx, &mut g, &mut state, &mut deadlines, event.as_ref());
+                        if !process_event(
+                            &ctx,
+                            &mut g,
+                            &mut state,
+                            &mut deadlines,
+                            &receiver,
+                            event.as_ref(),
+                        ) {
+                            return;
+                        }
                     }
                     // Other events before the chain is current are
                     // dropped; the tip inject below reflects the current
@@ -786,17 +1038,20 @@ pub fn start_generator(
                     publish_current_template(&ctx.current, &g, &state);
                 }
                 Ok(tip_block) => {
-                    process_event(
+                    if !process_event(
                         &ctx,
                         &mut g,
                         &mut state,
                         &mut deadlines,
+                        &receiver,
                         &OwnedRegenEvent::BlockConnected(Arc::new(tip_block)),
-                    );
+                    ) {
+                        return;
+                    }
                 }
             }
         }
-        run_drain(&drain_hook);
+        run_drain(&ctx.drain_hook);
         // A settling pass over the deadlines; the tip inject above
         // already reconciled, so nothing is re-armed here.
         reconcile_timers(&mut deadlines, &state, false);
@@ -806,24 +1061,40 @@ pub fn start_generator(
                 Some((at, _)) => at.saturating_duration_since(Instant::now()),
                 None => IDLE_WAIT,
             };
-            match receiver.recv_timeout(wait) {
-                Ok(GenCommand::Event(event)) => {
-                    process_event(&ctx, &mut g, &mut state, &mut deadlines, event.as_ref());
-                }
+            let running = match receiver.recv_timeout(wait) {
+                Ok(GenCommand::Event(event)) => process_event(
+                    &ctx,
+                    &mut g,
+                    &mut state,
+                    &mut deadlines,
+                    &receiver,
+                    event.as_ref(),
+                ),
                 Ok(GenCommand::ForceRegen) => {
-                    process_force_regen(&ctx, &mut g, &mut state, &mut deadlines);
+                    process_force_regen(&ctx, &mut g, &mut state, &mut deadlines, &receiver)
                 }
                 Ok(GenCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // The nearest deadline elapsed; fire its handler.
-                    if let Some((_, fired)) = nearest_deadline(&deadlines) {
-                        process_timer(&ctx, &mut g, &mut state, &mut deadlines, fired);
+                    match nearest_deadline(&deadlines) {
+                        Some((_, fired)) => process_timer(
+                            &ctx,
+                            &mut g,
+                            &mut state,
+                            &mut deadlines,
+                            &receiver,
+                            fired,
+                        ),
+                        None => true,
                     }
                 }
+            };
+            if !running {
+                return;
             }
             // Drive the chain handler's deferred maintenance for any
             // reorg this event or timer initiated on the chain.
-            run_drain(&drain_hook);
+            run_drain(&ctx.drain_hook);
         }
     });
 
@@ -899,7 +1170,7 @@ impl RpcBlockTemplater for NodeRpcBlockTemplater {
     }
 
     fn current_template(&self) -> Result<Option<MsgBlock>, String> {
-        let current = self.current.lock().expect("shared template poisoned");
+        let current = wait_for_current(&self.current);
         if current.reorganizing {
             return Ok(None);
         }
@@ -923,12 +1194,14 @@ impl RpcBlockTemplater for NodeRpcBlockTemplater {
             .expect("subscriber registry poisoned")
             .register(sender.clone());
         // Immediately deliver the current template under the same gate
-        // the getwork current-template read uses: skip it during a
-        // reorganization or when the template errored, so a stale
-        // orphan-parent template is never handed out (dcrd `Subscribe`
-        // delivers `currentTemplate()`).
+        // the getwork current-template read uses: wait out a pending
+        // new-parent, new-votes or reorganization template, then skip
+        // it during a reorganization or when the template errored, so
+        // a stale orphan-parent template is never handed out (dcrd
+        // `Subscribe` delivers `currentTemplate()`, which waits on
+        // `staleTemplateWg`).
         {
-            let current = self.current.lock().expect("shared template poisoned");
+            let current = wait_for_current(&self.current);
             if !current.reorganizing
                 && current.err.is_none()
                 && let Some(block) = &current.block
@@ -1433,5 +1706,292 @@ mod tests {
             started.elapsed() < MAX_TEMPLATE_TIMEOUT,
             "the cancelled wait ran the full timeout instead of returning"
         );
+    }
+
+    /// A generator thread over a regnet battery chain two blocks tall
+    /// with the real pool, and a templater over its handles.
+    struct LiveGenerator {
+        _dir: tempfile::TempDir,
+        chain: Arc<Mutex<Chain>>,
+        pool: Arc<Mutex<NodeTxPool>>,
+        generator: Generator,
+    }
+
+    impl LiveGenerator {
+        fn start() -> LiveGenerator {
+            let params = dcroxide_chaincfg::regnet_params();
+            let (now, blocks) = crate::txmempool::test_support::accepted_prefix(2);
+            let (dir, chain) = crate::txmempool::test_support::regnet_chain(now, &blocks, 2);
+            let chain = Arc::new(Mutex::new(chain));
+            let pool = crate::txmempool::new_shared_tx_pool(
+                Arc::clone(&chain),
+                &params,
+                false,
+                100,
+                10000,
+                false,
+                false,
+            );
+            let mining_addr = dcroxide_txscript::stdaddr::decode_address(
+                "RsKrWb7Vny1jnzL1sDLgKTAteh9RZcRr5g6",
+                &params,
+            )
+            .expect("mining address");
+            let generator = start_generator(
+                Arc::clone(&chain),
+                Arc::clone(&pool),
+                params.clone(),
+                vec![mining_addr],
+                Self::policy(),
+                0,
+                true,
+                crate::sync::SyncGate::always_current(),
+                None,
+                None,
+            );
+            LiveGenerator {
+                _dir: dir,
+                chain,
+                pool,
+                generator,
+            }
+        }
+
+        fn policy() -> MiningPolicy {
+            let params = dcroxide_chaincfg::regnet_params();
+            MiningPolicy {
+                block_max_size: params.maximum_block_sizes[0] as u32,
+                tx_min_free_fee: 10000,
+                aggressive_mining: true,
+            }
+        }
+
+        fn templater(&self) -> NodeRpcBlockTemplater {
+            NodeRpcBlockTemplater::new(
+                self.generator.current_handle(),
+                self.generator.subscribers_handle(),
+                self.generator.sink(),
+                Arc::clone(&self.chain),
+                Arc::clone(&self.pool),
+                dcroxide_chaincfg::regnet_params(),
+                Self::policy(),
+                0,
+            )
+        }
+
+        /// The first template, once the startup build has published it.
+        fn startup_template(&self) -> MsgBlock {
+            let templater = self.templater();
+            let started = Instant::now();
+            loop {
+                if let Ok(Some(block)) = templater.current_template() {
+                    return block;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "no startup template"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// Re-announce the tip as connected, which below stake
+        /// validation height requests a new-parent build (dcrd
+        /// `handleBlockConnected` calling `genTemplateAsync`).
+        fn reconnect_tip(&self) {
+            let tip = {
+                let chain = self.chain.lock().expect("chain");
+                let best = chain.best_snapshot().hash;
+                chain.block_by_hash(&best).expect("tip block")
+            };
+            self.generator.sink().block_connected(Arc::new(tip));
+        }
+
+        /// Poll the getwork mirror until the predicate holds.
+        fn await_mirror(&self, what: &str, pred: impl Fn(&SharedTemplate) -> bool) {
+            let started = Instant::now();
+            while !pred(&self.generator.current.lock().expect("mirror")) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "timed out waiting for {what}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    fn block_id(block: &MsgBlock) -> dcroxide_chainhash::Hash {
+        block.header.block_hash()
+    }
+
+    /// dcrd's `currentTemplate` waits on `staleTemplateWg`, which a
+    /// new-parent generation holds from `genTemplateAsync` until the
+    /// goroutine ends (`bgblktmplgenerator.go:401-402`, `:716-724`), so
+    /// getwork never hands out the template the build is replacing.
+    /// The build is held at the pool lock, so the retrieval can only
+    /// return early by not waiting.
+    #[test]
+    fn retrieval_waits_for_an_in_flight_new_parent_template() {
+        let live = LiveGenerator::start();
+        let before = live.startup_template();
+
+        let gate = live.pool.lock().expect("pool");
+        live.reconnect_tip();
+        live.await_mirror("the in-flight build's stale hold", |m| m.stale);
+
+        let templater = live.templater();
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = tx.send(templater.current_template());
+        });
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(300)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "retrieval must wait while the new-parent build runs"
+        );
+
+        drop(gate);
+        let fresh = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("retrieval returns once the build installs")
+            .expect("no template error")
+            .expect("a template");
+        reader.join().expect("reader thread");
+        assert_ne!(
+            block_id(&fresh),
+            block_id(&before),
+            "the waiting retrieval gets the new build, not the one it replaces"
+        );
+        let mirror = live.generator.current.lock().expect("mirror");
+        assert_eq!(
+            mirror.block.as_ref().map(block_id),
+            Some(block_id(&fresh)),
+            "and that is the installed template"
+        );
+        assert!(!mirror.stale, "the hold is released with the install");
+    }
+
+    /// A generation superseded while it builds is dropped like dcrd's
+    /// cancelled goroutine (`if ctx.Err() != nil { return }` before
+    /// `setCurrentTemplate` and the subscriber send,
+    /// `bgblktmplgenerator.go:737-739`): subscribers hear only of the
+    /// build that replaced it.
+    #[test]
+    fn a_build_superseded_mid_flight_is_neither_installed_nor_notified() {
+        let live = LiveGenerator::start();
+        let before = live.startup_template();
+        let (tx, rx) = mpsc::sync_channel(16);
+        live.generator
+            .subscribers
+            .lock()
+            .expect("registry")
+            .register(tx);
+
+        let gate = live.pool.lock().expect("pool");
+        live.reconnect_tip();
+        live.await_mirror("the first build's stale hold", |m| m.stale);
+        // A second new-parent request while the first build runs.
+        live.reconnect_tip();
+        drop(gate);
+
+        let installed = live
+            .templater()
+            .current_template()
+            .expect("no template error")
+            .expect("a template");
+        assert_ne!(block_id(&installed), block_id(&before));
+        // The generator publishes a template before it notifies the
+        // subscribers, so the startup build's own notification can still
+        // reach the registration made after its publish.  It is the only
+        // one that can: the thread notifies each template before it
+        // publishes the next.  Its random extra nonces keep its id apart
+        // from every later build's.
+        let mut notified = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the replacing build notifies");
+        if block_id(&notified) == block_id(&before) {
+            notified = rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the replacing build notifies");
+        }
+        assert_eq!(
+            block_id(&notified),
+            block_id(&installed),
+            "the first notification is the installed template"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "the superseded build was never notified"
+        );
+        let mirror = live.generator.current.lock().expect("mirror");
+        assert!(!mirror.stale, "both builds released their holds");
+    }
+
+    /// The events that arrive while a build runs reach the state machine
+    /// before its result is installed, as dcrd's regen handler services
+    /// them concurrently with the goroutine.  A reorganization start
+    /// queued mid-build clears the old template and requests nothing,
+    /// so the finished build then installs over the cleared state and
+    /// stays current through the reorganization (retrieval waits it
+    /// out), instead of being installed first and wiped by the clear.
+    #[test]
+    fn a_reorg_start_queued_during_a_build_is_serviced_before_the_install() {
+        let live = LiveGenerator::start();
+        let before = live.startup_template();
+
+        let gate = live.pool.lock().expect("pool");
+        live.reconnect_tip();
+        live.await_mirror("the build's stale hold", |m| m.stale);
+        live.generator.sink().chain_reorg_started();
+        drop(gate);
+
+        live.await_mirror("the build installed after the reorg start", |m| {
+            m.reorganizing
+                && m.block
+                    .as_ref()
+                    .is_some_and(|block| block_id(block) != block_id(&before))
+        });
+        assert!(
+            live.generator.current.lock().expect("mirror").stale,
+            "retrieval waits out the reorganization"
+        );
+
+        // The reorganization finishes: the tip is re-evaluated, which
+        // below stake validation height builds anew.
+        live.generator.sink().chain_reorg_done();
+        let after = live
+            .templater()
+            .current_template()
+            .expect("no template error")
+            .expect("a template once the reorganization is done");
+        assert_eq!(after.header.height, 3);
+        assert!(!live.generator.current.lock().expect("mirror").stale);
+    }
+
+    /// Retrieval never waits on a generator that is gone.
+    #[test]
+    fn retrieval_does_not_wait_on_a_stopped_generator() {
+        let current = Arc::new(Mutex::new(SharedTemplate::default()));
+        current.lock().expect("mirror").stale = true;
+        let closer = CloseOnExit(Arc::clone(&current));
+        let waiter_current = Arc::clone(&current);
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let reorganizing = wait_for_current(&waiter_current).reorganizing;
+            let _ = tx.send(reorganizing);
+        });
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a stale mirror holds retrieval"
+        );
+        drop(closer);
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("closing the mirror releases the wait");
+        waiter.join().expect("waiter thread");
     }
 }

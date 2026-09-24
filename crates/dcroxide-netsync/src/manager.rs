@@ -4,7 +4,7 @@
 // Counter and height arithmetic mirrors Go.
 #![allow(clippy::arithmetic_side_effects)]
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
@@ -175,6 +175,22 @@ pub enum Action {
     /// Prevent the header sync progress stall timer from firing (dcrd
     /// `headerSyncState.StopStallTimeout`).
     StopHeaderSyncStallTimeout,
+    /// Raise the peer's last known block height in the daemon's peer
+    /// record, which `getpeerinfo` reports as `currentheight`.
+    ///
+    /// dcrd's `netsync.Peer` embeds the `*peer.Peer`, so its
+    /// `UpdateLastBlockHeight` calls (`maybeUpdateBestAnnouncedBlock`
+    /// and the orphan-header path of `OnHeaders`) move the one
+    /// `lastBlock` field that `StatsSnapshot` reads.  The port keeps
+    /// the manager's copy in [`Peer`], so each rise is emitted for the
+    /// daemon to mirror.
+    UpdateLastBlockHeight {
+        /// The unique id of the peer.
+        peer: i32,
+        /// The new last known block height (always higher than the
+        /// previous one; dcrd ignores anything lower).
+        height: i64,
+    },
 }
 
 /// The best chain snapshot fields the manager consumes (a subset of
@@ -189,17 +205,36 @@ pub struct BestSnapshot {
     pub next_stake_diff: i64,
 }
 
-/// A block processing failure (the error from dcrd
-/// `blockchain.ProcessBlock` with the classification the manager
-/// needs).
+/// A block or header processing failure (the error from dcrd
+/// `blockchain.ProcessBlock` or `ProcessBlockHeader` with the
+/// classification the manager needs).
 #[derive(Debug, Clone)]
 pub struct ProcessBlockFailure {
-    /// Whether the failure is dcrd `blockchain.ErrDuplicateBlock`.
+    /// Whether the failure is dcrd `blockchain.ErrDuplicateBlock`
+    /// (header processing never reports one).
     pub is_duplicate_block: bool,
     /// Whether the failure is a `blockchain.RuleError` (a rejected
-    /// block) as opposed to an internal processing error; selects
-    /// between dcrd's `Rejected block` info line and its `Failed to
-    /// process block` error line.
+    /// block or header) as opposed to an internal processing error;
+    /// selects between dcrd's `Rejected block` info line and its
+    /// `Failed to process block` error line, and whether a header
+    /// failure gets dcrd's `Failed to process block header` error line.
+    pub is_rule_error: bool,
+    /// Whether the failure is dcrd `database.ErrCorruption` or
+    /// `blockchain.ErrUtxoBackendCorruption`, which dcrd additionally
+    /// logs as a critical failure.
+    pub is_corruption: bool,
+    /// The error text (log only).
+    pub message: String,
+}
+
+/// A transaction processing failure (the error from dcrd
+/// `mempool.ProcessTransaction` with the classification the manager
+/// needs).
+#[derive(Debug, Clone)]
+pub struct ProcessTxFailure {
+    /// Whether the failure is a `mempool.RuleError` (a rejected
+    /// transaction) as opposed to an internal processing error, which
+    /// dcrd logs as `Failed to process transaction` at the error level.
     pub is_rule_error: bool,
     /// The error text (log only).
     pub message: String,
@@ -240,9 +275,9 @@ pub trait SyncChain {
     fn have_header(&mut self, hash: &Hash) -> bool;
     /// Whether the block data is available (dcrd `HaveBlock`).
     fn have_block(&mut self, hash: &Hash) -> bool;
-    /// Process the header (dcrd `ProcessBlockHeader`; the error text
-    /// only feeds logs).
-    fn process_block_header(&mut self, header: &BlockHeader) -> Result<(), String>;
+    /// Process the header (dcrd `ProcessBlockHeader`; the failure
+    /// only feeds logs, so it is classified like a block's).
+    fn process_block_header(&mut self, header: &BlockHeader) -> Result<(), ProcessBlockFailure>;
     /// Process the block, returning the fork length on success (dcrd
     /// `ProcessBlock`).
     fn process_block(&mut self, block: &MsgBlock) -> Result<i64, ProcessBlockFailure>;
@@ -269,13 +304,16 @@ pub trait SyncTxPool {
     /// between acceptance and announcement is still announced.  A
     /// hash-only result forces the caller to look each one up again and
     /// silently lose the ones already gone.
+    ///
+    /// The failure keeps dcrd's rule/non-rule split, which selects
+    /// whether [`SyncManager::on_tx`] logs it as an error.
     fn process_transaction_accepted(
         &mut self,
         tx: &MsgTx,
         allow_orphan: bool,
         allow_high_fees: bool,
         tag: u64,
-    ) -> Result<Vec<(Hash, MsgTx)>, String>;
+    ) -> Result<Vec<(Hash, MsgTx)>, ProcessTxFailure>;
     /// Whether the pool already has the transaction, main or orphan
     /// (dcrd `HaveTransaction`).
     fn have_transaction(&mut self, hash: &Hash) -> bool;
@@ -460,6 +498,21 @@ impl Peer {
         self.last_block = new_height;
     }
 
+    /// [`Self::update_last_block_height`], emitting a rise as an
+    /// [`Action::UpdateLastBlockHeight`] so the daemon's peer record,
+    /// the one field dcrd's embedded `*peer.Peer` shares with netsync,
+    /// follows it.
+    fn raise_last_block_height(&mut self, new_height: i64, actions: &mut Vec<Action>) {
+        let before = self.last_block;
+        self.update_last_block_height(new_height);
+        if self.last_block != before {
+            actions.push(Action::UpdateLastBlockHeight {
+                peer: self.id,
+                height: self.last_block,
+            });
+        }
+    }
+
     /// The getheaders push with dcrd `peer.PushGetHeadersMsg`'s
     /// duplicate-request filter: the message is suppressed when both
     /// the begin and stop hashes match the previous request.
@@ -575,9 +628,9 @@ pub struct SyncManager<C, T, M: SyncMixPool> {
 
     /// Pending requests for data from all peers, keyed by hash with
     /// the id of the peer the data was requested from.
-    requested_txns: HashMap<Hash, i32>,
-    requested_blocks: HashMap<Hash, i32>,
-    requested_mix_msgs: HashMap<Hash, i32>,
+    requested_txns: RequestMap,
+    requested_blocks: RequestMap,
+    requested_mix_msgs: RequestMap,
 
     sync_peer: Option<i32>,
     warn_on_no_sync: bool,
@@ -611,9 +664,9 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
             min_known_work,
             rejected_txns: apbf::new_filter(MAX_REJECTED_TXNS, REJECTED_TXNS_FP_RATE),
             rejected_mix_msgs: apbf::new_filter(MAX_REJECTED_MIX_MSGS, REJECTED_MIX_MSGS_FP_RATE),
-            requested_txns: HashMap::new(),
-            requested_blocks: HashMap::new(),
-            requested_mix_msgs: HashMap::new(),
+            requested_txns: RequestMap::default(),
+            requested_blocks: RequestMap::default(),
+            requested_mix_msgs: RequestMap::default(),
             sync_peer: None,
             warn_on_no_sync: true,
             peers: BTreeMap::new(),
@@ -663,6 +716,28 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         &mut self.cfg.chain
     }
 
+    /// A handle on the mempool the manager validates transactions
+    /// against, for a caller that runs [`SyncManager::begin_tx`] and
+    /// [`SyncManager::finish_tx`] around its own call into the pool
+    /// with the manager's lock released.
+    pub fn tx_mem_pool_handle(&self) -> T
+    where
+        T: Clone,
+    {
+        self.cfg.tx_mem_pool.clone()
+    }
+
+    /// A handle on the mixpool the manager accepts mixing messages
+    /// into, for a caller that runs [`SyncManager::begin_mix_msg`] and
+    /// [`SyncManager::finish_mix_msg`] around its own call into the
+    /// pool with the manager's lock released.
+    pub fn mix_pool_handle(&self) -> M
+    where
+        M: Clone,
+    {
+        self.cfg.mix_pool.clone()
+    }
+
     /// The recently confirmed transactions filter (shared with the
     /// daemon, which records confirmations).
     pub fn recently_confirmed_txns(&self) -> std::sync::Arc<std::sync::Mutex<apbf::Filter>> {
@@ -672,7 +747,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// The hashes and requesting peers of the in-flight requests, for
     /// inspection (sorted by hash).
     pub fn requested_snapshot(&self) -> [Vec<(Hash, i32)>; 3] {
-        let sorted = |m: &HashMap<Hash, i32>| {
+        let sorted = |m: &RequestMap| {
             let mut v: Vec<(Hash, i32)> = m.iter().map(|(h, p)| (*h, *p)).collect();
             v.sort_unstable_by_key(|e| e.0.0);
             v
@@ -1066,31 +1141,30 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // order, so when several other peers announced the same data
         // the replacement choice is arbitrary there, as is the entry
         // order within each rebuilt getdata message; here both walks
-        // are in deterministic order (arbitrary hash-map order for the
-        // requests, ascending id for the peers).
+        // are in deterministic order (the request map's entry order for
+        // the requests, ascending id for the peers).
         let mut request_queues: BTreeMap<i32, Vec<InvVect>> = BTreeMap::new();
-        let mut requeue = |requested: &mut HashMap<Hash, i32>,
-                           peers: &mut BTreeMap<i32, Peer>,
-                           inv_type: InvType| {
-            let hashes: Vec<Hash> = requested
-                .iter()
-                .filter(|&(_, from)| *from == peer_id)
-                .map(|(h, _)| *h)
-                .collect();
-            'hashes: for hash in hashes {
-                let inv = InvVect { inv_type, hash };
-                for (id, pp) in peers.iter_mut() {
-                    if !pp.is_known_inventory(&inv) {
-                        continue;
+        let mut requeue =
+            |requested: &mut RequestMap, peers: &mut BTreeMap<i32, Peer>, inv_type: InvType| {
+                let hashes: Vec<Hash> = requested
+                    .iter()
+                    .filter(|&(_, from)| *from == peer_id)
+                    .map(|(h, _)| *h)
+                    .collect();
+                'hashes: for hash in hashes {
+                    let inv = InvVect { inv_type, hash };
+                    for (id, pp) in peers.iter_mut() {
+                        if !pp.is_known_inventory(&inv) {
+                            continue;
+                        }
+                        request_queues.entry(*id).or_default().push(inv);
+                        requested.insert(hash, *id);
+                        continue 'hashes;
                     }
-                    request_queues.entry(*id).or_default().push(inv);
-                    requested.insert(hash, *id);
-                    continue 'hashes;
+                    // No peers found that have announced this data.
+                    requested.remove(&hash);
                 }
-                // No peers found that have announced this data.
-                requested.remove(&hash);
-            }
-        };
+            };
         requeue(&mut self.requested_txns, &mut self.peers, InvType::TX);
         requeue(&mut self.requested_blocks, &mut self.peers, InvType::BLOCK);
         requeue(&mut self.requested_mix_msgs, &mut self.peers, InvType::MIX);
@@ -1141,49 +1215,101 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     }
 
     /// Process a transaction received from a remote peer, returning
-    /// the hashes of the transactions accepted to the mempool (dcrd
-    /// `OnTx`).
-    pub fn on_tx(&mut self, peer_id: i32, tx: &MsgTx) -> Vec<(Hash, MsgTx)> {
-        if self.shutdown {
-            return Vec::new();
-        }
-
-        // There is deliberately no check to disconnect peers for
-        // sending unsolicited transactions (legacy interoperability).
+    /// the transactions accepted to the mempool with their hashes (dcrd
+    /// `OnTx`), and the actions to execute: dcrd's error line for a
+    /// failure that is not a rule error.
+    ///
+    /// The pool is asked between [`SyncManager::begin_tx`] and
+    /// [`SyncManager::finish_tx`]; a caller sharing the manager behind a
+    /// lock runs the three itself so the validation holds only the
+    /// pool's own lock, as dcrd's does.
+    pub fn on_tx(&mut self, peer_id: i32, tx: &MsgTx) -> (Vec<(Hash, MsgTx)>, Vec<Action>) {
         let tx_hash = tx.tx_hash();
-        self.mark_peer_holds(peer_id, InvType::TX, tx_hash);
-
-        // Ignore transactions that have already been rejected.  The
-        // transaction was unsolicited if it was already previously
-        // rejected.
-        if self.rejected_txns.contains(&tx_hash.0) {
-            return Vec::new();
-        }
-
-        // Process the transaction to include validation, insertion in
-        // the memory pool, orphan handling, etc.
-        let allow_orphans = self.cfg.max_orphan_txs > 0;
+        let Some(allow_orphans) = self.begin_tx(peer_id, &tx_hash) else {
+            return (Vec::new(), Vec::new());
+        };
         let result = self.cfg.tx_mem_pool.process_transaction_accepted(
             tx,
             allow_orphans,
             true,
             peer_id as u64,
         );
+        self.finish_tx(&tx_hash, result)
+    }
+
+    /// The part of dcrd `OnTx` that runs before the mempool is asked:
+    /// the shutdown check, recording that the peer holds the
+    /// transaction, and the previously-rejected filter.  Returns `None`
+    /// when the transaction is to be ignored, and otherwise whether the
+    /// pool may keep it as an orphan (dcrd's `allowOrphans`), for the
+    /// caller to pass to the pool's `process_transaction_accepted`
+    /// with the peer id as the tag before calling
+    /// [`SyncManager::finish_tx`].
+    ///
+    /// dcrd holds no manager-wide lock across `ProcessTransaction`:
+    /// the mempool validates under its own mutex, and only the
+    /// request-map delete afterwards takes `requestMtx`
+    /// (`internal/netsync/manager.go:994-1003`).
+    pub fn begin_tx(&mut self, peer_id: i32, tx_hash: &Hash) -> Option<bool> {
+        if self.shutdown {
+            return None;
+        }
+
+        // There is deliberately no check to disconnect peers for
+        // sending unsolicited transactions (legacy interoperability).
+        self.mark_peer_holds(peer_id, InvType::TX, *tx_hash);
+
+        // Ignore transactions that have already been rejected.  The
+        // transaction was unsolicited if it was already previously
+        // rejected.
+        if self.rejected_txns.contains(&tx_hash.0) {
+            return None;
+        }
+
+        // Process the transaction to include validation, insertion in
+        // the memory pool, orphan handling, etc.
+        Some(self.cfg.max_orphan_txs > 0)
+    }
+
+    /// The part of dcrd `OnTx` that runs after the mempool answered:
+    /// the request-map removal and, on failure, the rejected-filter add
+    /// and the error log for a failure that is not a rule error.
+    pub fn finish_tx(
+        &mut self,
+        tx_hash: &Hash,
+        result: Result<Vec<(Hash, MsgTx)>, ProcessTxFailure>,
+    ) -> (Vec<(Hash, MsgTx)>, Vec<Action>) {
+        let mut actions = Vec::new();
 
         // Remove transaction from request maps.  Either the
         // mempool/chain already knows about it and as such we
         // shouldn't have any more instances of trying to fetch it, or
         // we failed to insert and thus we'll retry next time we get an
         // inv.
-        self.requested_txns.remove(&tx_hash);
+        self.requested_txns.remove(tx_hash);
 
         match result {
-            Ok(accepted_txns) => accepted_txns,
-            Err(_) => {
+            Ok(accepted_txns) => (accepted_txns, actions),
+            Err(failure) => {
                 // Do not request this transaction again until a new
                 // block has been processed.
                 self.rejected_txns.add(&tx_hash.0);
-                Vec::new()
+
+                // A rule error means the transaction was simply
+                // rejected as opposed to something actually going
+                // wrong (dcrd logs that at the debug level, which is
+                // not ported).  Otherwise, something really did go
+                // wrong, so log it as an actual error.
+                if !failure.is_rule_error {
+                    actions.push(Action::Log {
+                        level: LogLevel::Error,
+                        message: format!(
+                            "Failed to process transaction {tx_hash}: {}",
+                            failure.message
+                        ),
+                    });
+                }
+                (Vec::new(), actions)
             }
         }
     }
@@ -1192,9 +1318,31 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// the messages accepted to the mixpool or the pool's structured
     /// acceptance error (dcrd `OnMixMsg`), which the server inspects
     /// for the missing-own-PR request and the bannable check.
+    ///
+    /// The pool is asked between [`SyncManager::begin_mix_msg`] and
+    /// [`SyncManager::finish_mix_msg`], which a caller sharing the
+    /// manager behind a lock runs itself, as with [`SyncManager::on_tx`].
     pub fn on_mix_msg(&mut self, peer_id: i32, msg: &M::Msg) -> Result<Vec<M::Msg>, M::Err> {
-        if self.shutdown {
+        let Some(mix_hash) = self.begin_mix_msg(peer_id, msg) else {
             return Ok(Vec::new());
+        };
+        let result = self.cfg.mix_pool.accept_message(msg, peer_id as u64);
+        self.finish_mix_msg(&mix_hash, result)
+    }
+
+    /// The part of dcrd `OnMixMsg` that runs before the mixpool is
+    /// asked: the shutdown check, recording that the peer holds the
+    /// message, and the previously-rejected filter.  Returns the
+    /// message hash when the pool is to be asked (with the peer id as
+    /// the source) before calling [`SyncManager::finish_mix_msg`], and
+    /// `None` when the message is to be ignored.
+    ///
+    /// dcrd holds no manager-wide lock across `AcceptMessage`, only
+    /// `requestMtx` around the request-map delete afterwards
+    /// (`internal/netsync/manager.go:1060-1068`).
+    pub fn begin_mix_msg(&mut self, peer_id: i32, msg: &M::Msg) -> Option<Hash> {
+        if self.shutdown {
+            return None;
         }
 
         // Ignore mix messages that have already been rejected.  The
@@ -1203,16 +1351,24 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         let mix_hash = self.cfg.mix_pool.mix_hash(msg);
         self.mark_peer_holds(peer_id, InvType::MIX, mix_hash);
         if self.rejected_mix_msgs.contains(&mix_hash.0) {
-            return Ok(Vec::new());
+            return None;
         }
+        Some(mix_hash)
+    }
 
-        let result = self.cfg.mix_pool.accept_message(msg, peer_id as u64);
-
+    /// The part of dcrd `OnMixMsg` that runs after the mixpool
+    /// answered: the request-map removal and, on failure, the
+    /// rejected-filter add.  The pool's result passes through.
+    pub fn finish_mix_msg(
+        &mut self,
+        mix_hash: &Hash,
+        result: Result<Vec<M::Msg>, M::Err>,
+    ) -> Result<Vec<M::Msg>, M::Err> {
         // Remove message from request maps.  Either the mixpool
         // already knows about it and as such we shouldn't have any
         // more instances of trying to fetch it, or we failed to insert
         // and thus we'll retry next time we get an inv.
-        self.requested_mix_msgs.remove(&mix_hash);
+        self.requested_mix_msgs.remove(mix_hash);
 
         match result {
             Ok(accepted) => Ok(accepted),
@@ -1250,6 +1406,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         peer_id: i32,
         hash: &Hash,
         header: &BlockHeader,
+        actions: &mut Vec<Action>,
     ) {
         let Some(work_sum) = self.cfg.chain.chain_work(hash) else {
             return;
@@ -1268,14 +1425,14 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         if exceeds {
             peer.best_announced_block = Some(*hash);
             peer.best_announced_work = Some(work_sum);
-            peer.update_last_block_height(header.height as i64);
+            peer.raise_last_block_height(header.height as i64, actions);
         }
     }
 
     /// Potentially resolve the most recently announced block by the
     /// peer that did not connect to any known headers at announcement
     /// time (dcrd `maybeResolveOrphanBlock`).
-    fn maybe_resolve_orphan_block(&mut self, peer_id: i32) {
+    fn maybe_resolve_orphan_block(&mut self, peer_id: i32, actions: &mut Vec<Action>) {
         // Nothing to do if there isn't a pending orphan block
         // announcement that has not yet been resolved or the block
         // still isn't known.
@@ -1296,7 +1453,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         let Some(header) = self.cfg.chain.header_by_hash(&block_hash) else {
             return;
         };
-        self.maybe_update_best_announced_block(peer_id, &block_hash, &header);
+        self.maybe_update_best_announced_block(peer_id, &block_hash, &header, actions);
     }
 
     /// Process the provided block using the internal chain instance
@@ -1392,6 +1549,12 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                             "Failed to process block {block_hash}: {}",
                             failure.message
                         ),
+                    });
+                }
+                if failure.is_corruption {
+                    actions.push(Action::Log {
+                        level: LogLevel::Error,
+                        message: format!("Critical failure: {}", failure.message),
                     });
                 }
 
@@ -1610,7 +1773,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // is complete.
         let peer_ids: Vec<i32> = self.peers.keys().copied().collect();
         for id in peer_ids {
-            self.maybe_resolve_orphan_block(id);
+            self.maybe_resolve_orphan_block(id, actions);
             let Some(peer) = self.peers.get(&id) else {
                 continue;
             };
@@ -1699,7 +1862,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                 // from this peer or others.
                 let final_header = &headers[headers.len() - 1];
                 let final_header_hash = final_header.block_hash();
-                self.maybe_resolve_orphan_block(peer_id);
+                self.maybe_resolve_orphan_block(peer_id, &mut actions);
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.announced_orphan_block = Some(final_header_hash);
 
@@ -1709,7 +1872,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                     // initial headers sync process is still in
                     // progress.
                     if !headers_synced {
-                        peer.update_last_block_height(final_header.height as i64);
+                        peer.raise_last_block_height(final_header.height as i64, &mut actions);
                     }
                 }
                 return actions;
@@ -1741,7 +1904,10 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         for (prev_idx, header) in headers[1..].iter().enumerate() {
             let prev_hash = &header_hashes[prev_idx];
             let prev_height = headers[prev_idx].height;
-            if header.prev_block != *prev_hash || header.height != prev_height + 1 {
+            // The height is the peer's and unvalidated here: Go's
+            // uint32 addition wraps, where a checked `+` would panic
+            // under the manager lock in builds with overflow checks.
+            if header.prev_block != *prev_hash || header.height != prev_height.wrapping_add(1) {
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.connected = false;
                 }
@@ -1761,7 +1927,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // Process all of the received headers.
         let mut processed_invs: Vec<InvVect> = Vec::with_capacity(headers.len());
         for (idx, header) in headers.iter().enumerate() {
-            if self.cfg.chain.process_block_header(header).is_err() {
+            if let Err(failure) = self.cfg.chain.process_block_header(header) {
                 // Update the sync height when the sync peer fails to
                 // process any headers since that chain is invalid from
                 // the local point of view and thus whatever the best
@@ -1782,6 +1948,39 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                         invs: processed_invs,
                     });
                 }
+
+                // A rule error means the header was simply rejected
+                // (dcrd logs that at the debug level, which is not
+                // ported); anything else really went wrong, so it is
+                // logged as an actual error.  There is no need to check
+                // for an orphan header here because they were already
+                // verified to connect above.
+                if !failure.is_rule_error {
+                    let peer_display = self
+                        .peers
+                        .get(&peer_id)
+                        .map_or_else(|| peer_id.to_string(), Peer::display);
+                    actions.push(Action::Log {
+                        level: LogLevel::Error,
+                        message: format!(
+                            "Failed to process block header {} from peer {peer_display}: {} \
+                             -- disconnecting",
+                            header_hashes[idx], failure.message
+                        ),
+                    });
+                }
+                // dcrd's header path spells this line `Criticial`
+                // (`manager.go:1647`), unlike the block path's.  It
+                // tests only `database.ErrCorruption`; header
+                // processing never reaches the UTXO backend, so the
+                // combined flag is the same test here.
+                if failure.is_corruption {
+                    actions.push(Action::Log {
+                        level: LogLevel::Error,
+                        message: format!("Criticial failure: {}", failure.message),
+                    });
+                }
+
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.connected = false;
                 }
@@ -1830,8 +2029,13 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         // needed.
         let final_header = &headers[headers.len() - 1];
         let final_received_hash = header_hashes[header_hashes.len() - 1];
-        self.maybe_resolve_orphan_block(peer_id);
-        self.maybe_update_best_announced_block(peer_id, &final_received_hash, final_header);
+        self.maybe_resolve_orphan_block(peer_id, &mut actions);
+        self.maybe_update_best_announced_block(
+            peer_id,
+            &final_received_hash,
+            final_header,
+            &mut actions,
+        );
 
         // Update the sync height if the new best known header height
         // exceeds it.
@@ -1988,6 +2192,107 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         }
     }
 
+    /// Undo the bookkeeping of a request the daemon could not hand to
+    /// the peer because its bounded outbound queue refused it, so the
+    /// data is never stranded on a peer that was not asked for it.
+    ///
+    /// dcrd has no counterpart: its `QueueMessage` cannot refuse, so a
+    /// recorded request is always sent, and a peer that never answers
+    /// is disconnected by its stall handler, whereupon
+    /// `OnPeerDisconnected` re-requests the data from another announcer.
+    /// A request the port's queue refused (PARITY *Per-peer outbound
+    /// queue*) is never written, so it arms no stall deadline; left
+    /// alone it would stay attributed to the peer until the peer left,
+    /// and every other announcement of the same item would be skipped
+    /// because a request is already pending.
+    ///
+    /// The refused inventory is therefore swept the way
+    /// [`Self::on_peer_disconnected`] sweeps a departing peer's
+    /// requests: each item still attributed to the peer is re-requested
+    /// from another peer known to hold it, or forgotten when there is
+    /// none, and a forgotten block makes the next fetch rebuild the list
+    /// of needed blocks so the block is requested again.  Peers in
+    /// `exclude` are never chosen; the daemon passes every peer that
+    /// refused during the same dispatch, which bounds the retries.  A
+    /// refused getheaders clears the peer's duplicate-request filter, so
+    /// the identical request is not suppressed the next time it is made.
+    pub fn on_request_not_sent(
+        &mut self,
+        peer_id: i32,
+        message: &Message,
+        exclude: &BTreeSet<i32>,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if self.shutdown {
+            return actions;
+        }
+
+        let inv_list = match message {
+            Message::GetData(get_data) => &get_data.inv_list,
+            Message::GetHeaders(_) => {
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.prev_get_hdrs_begin = None;
+                    peer.prev_get_hdrs_stop = None;
+                }
+                return actions;
+            }
+            _ => return actions,
+        };
+
+        let mut request_queues: BTreeMap<i32, Vec<InvVect>> = BTreeMap::new();
+        let mut forgot_block = false;
+        for inv in inv_list {
+            let requested = match inv.inv_type {
+                InvType::BLOCK => &mut self.requested_blocks,
+                InvType::TX => &mut self.requested_txns,
+                InvType::MIX => &mut self.requested_mix_msgs,
+                _ => continue,
+            };
+
+            // Only a request still attributed to the peer is its to give
+            // back; one reassigned since belongs to another peer.
+            if requested.get(&inv.hash) != Some(&peer_id) {
+                continue;
+            }
+
+            // The first other peer known to hold the data, in ascending
+            // id order as the disconnect sweep walks them.
+            let holder = self.peers.iter_mut().find_map(|(id, pp)| {
+                (*id != peer_id && !exclude.contains(id) && pp.is_known_inventory(inv))
+                    .then_some(*id)
+            });
+            match holder {
+                Some(id) => {
+                    requested.insert(inv.hash, id);
+                    request_queues.entry(id).or_default().push(*inv);
+                }
+                None => {
+                    requested.remove(&inv.hash);
+                    forgot_block |= inv.inv_type == InvType::BLOCK;
+                }
+            }
+        }
+
+        // The forgotten block was popped from the needed-blocks list
+        // when it was requested, so force the list to be rebuilt from
+        // the chain on the next fetch, which puts it back in order.
+        if forgot_block {
+            self.next_blocks_header = Hash([0u8; 32]);
+        }
+
+        for (pp, request_queue) in request_queues {
+            for chunk in request_queue.chunks(MAX_INV_PER_MSG as usize) {
+                actions.push(Action::QueueMessage {
+                    peer: pp,
+                    message: Message::GetData(MsgGetData {
+                        inv_list: chunk.to_vec(),
+                    }),
+                });
+            }
+        }
+        actions
+    }
+
     /// Whether the transaction needs to be downloaded (dcrd `needTx`).
     fn need_tx(&mut self, hash: &Hash) -> bool {
         // No need for transactions that have already been rejected.
@@ -2125,13 +2430,18 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
             // proof of work announced by the peer when it is already
             // known.
             if !self.cfg.chain.have_header(&last_block.hash) {
-                self.maybe_resolve_orphan_block(peer_id);
+                self.maybe_resolve_orphan_block(peer_id, &mut actions);
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     peer.announced_orphan_block = Some(last_block.hash);
                 }
             } else if let Some(header) = self.cfg.chain.header_by_hash(&last_block.hash) {
-                self.maybe_resolve_orphan_block(peer_id);
-                self.maybe_update_best_announced_block(peer_id, &last_block.hash, &header);
+                self.maybe_resolve_orphan_block(peer_id, &mut actions);
+                self.maybe_update_best_announced_block(
+                    peer_id,
+                    &last_block.hash,
+                    &header,
+                    &mut actions,
+                );
             }
         }
 
@@ -2334,36 +2644,112 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     }
 }
 
-/// Add to a request map bounded by a maximum limit, evicting an
-/// arbitrary entry when adding the new value would overflow it (dcrd
+/// A request map (dcrd's `map[chainhash.Hash]*Peer` request maps,
+/// holding peer ids) that can also name a uniformly random entry in
+/// constant time, which [`limit_add`]'s random eviction needs.
+///
+/// The entries live densely in a vector indexed by hash, so a removal
+/// swaps the last entry into the hole.  Iteration follows the vector,
+/// an order no caller depends on (dcrd's is random).
+#[derive(Default)]
+struct RequestMap {
+    index: HashMap<Hash, usize>,
+    entries: Vec<(Hash, i32)>,
+    /// The number of eviction victims drawn so far, the counter each
+    /// draw hashes.
+    draws: u64,
+}
+
+impl RequestMap {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn get(&self, hash: &Hash) -> Option<&i32> {
+        let idx = *self.index.get(hash)?;
+        self.entries.get(idx).map(|(_, peer)| peer)
+    }
+
+    fn contains_key(&self, hash: &Hash) -> bool {
+        self.index.contains_key(hash)
+    }
+
+    /// Map the hash to the peer, replacing (in place) any existing
+    /// mapping and returning the peer it held.
+    fn insert(&mut self, hash: Hash, peer: i32) -> Option<i32> {
+        if let Some(&idx) = self.index.get(&hash) {
+            return self
+                .entries
+                .get_mut(idx)
+                .map(|entry| std::mem::replace(&mut entry.1, peer));
+        }
+        self.index.insert(hash, self.entries.len());
+        self.entries.push((hash, peer));
+        None
+    }
+
+    /// Remove the hash, returning the peer it mapped to.
+    fn remove(&mut self, hash: &Hash) -> Option<i32> {
+        let idx = self.index.remove(hash)?;
+        let (_, peer) = self.entries.swap_remove(idx);
+        if let Some((moved, _)) = self.entries.get(idx) {
+            self.index.insert(*moved, idx);
+        }
+        Some(peer)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&Hash, &i32)> {
+        self.entries.iter().map(|(hash, peer)| (hash, peer))
+    }
+
+    fn values(&self) -> impl Iterator<Item = &i32> {
+        self.entries.iter().map(|(_, peer)| peer)
+    }
+
+    /// A uniformly random entry's hash, `None` when empty.
+    ///
+    /// The draw is the index's own SipHash, keyed per instance from
+    /// the OS by its `RandomState`, over a counter: a keyed function an
+    /// attacker can neither compute nor steer, as dcrd's comment on
+    /// `limitAdd` requires, and independent of where the entries sit.
+    fn random_key(&mut self) -> Option<Hash> {
+        use std::hash::BuildHasher;
+
+        if self.entries.is_empty() {
+            return None;
+        }
+        self.draws = self.draws.wrapping_add(1);
+        let draw = self.index.hasher().hash_one(self.draws);
+        // The modulo bias over a 64-bit draw is negligible at these
+        // sizes (at most `MAX_INV_PER_MSG` entries).
+        let idx = (draw % self.entries.len() as u64) as usize;
+        self.entries.get(idx).map(|(hash, _)| *hash)
+    }
+}
+
+/// Add to a request map bounded by a maximum limit, evicting a random
+/// entry when adding the new value would overflow it (dcrd
 /// `limitAdd`, which evicts a random entry via Go's map iteration
 /// order).
 ///
-/// The victim is the first key of a `std::collections::HashMap`, whose
-/// `RandomState` seeds SipHash per instance from the OS, so it is not
-/// something an attacker can compute or grind toward -- which is the
-/// property dcrd's comment relies on.  This is deliberately *not* the
-/// case the mempool's orphan eviction and rival-orphan ordering had to
-/// fix: those iterate a `BTreeMap` keyed by transaction hash, where the
-/// first entry is the numerically smallest and a nonce grind reaches it
-/// in a handful of tries.  An external review of `382864f5` filed this
-/// as the same hazard (RVW-018); it is not, and no draw is taken here.
-///
-/// One real difference remains, smaller than that one: Go re-randomizes
-/// on every `range`, while a `HashMap`'s order is fixed for the life of
-/// the instance once seeded.  An attacker who could observe many
-/// evictions might learn this instance's order where Go's stays
-/// unlearnable.  Reaching that requires seeing which entry died, which
-/// this map -- the node's own record of what it has requested -- does
-/// not report.
-fn limit_add(m: &mut HashMap<Hash, i32>, hash: Hash, peer: i32, limit: usize) {
+/// The victim is drawn uniformly ([`RequestMap::random_key`]).  Taking
+/// the first key of a `HashMap` instead, as the port once did, is not
+/// random in the sense that matters: hashbrown iterates from its lowest
+/// occupied bucket, so once the map has churned at capacity the
+/// survivors pack into the high buckets and nearly every new entry
+/// lands below them and is the next victim.  A peer holding the map
+/// full with announcements it never serves would then make the node
+/// forget each honest request as soon as the next one was recorded,
+/// and request the same data again from every announcer.  Under dcrd's
+/// random eviction an entry survives about `limit` adds.
+fn limit_add(m: &mut RequestMap, hash: Hash, peer: i32, limit: usize) {
     // Replace existing entries.
-    if let Some(entry) = m.get_mut(&hash) {
-        *entry = peer;
+    if m.contains_key(&hash) {
+        m.insert(hash, peer);
         return;
     }
     if m.len() + 1 > limit
-        && let Some(victim) = m.keys().next().copied()
+        && let Some(victim) = m.random_key()
     {
         m.remove(&victim);
     }
@@ -2372,7 +2758,76 @@ fn limit_add(m: &mut HashMap<Hash, i32>, hash: Hash, peer: i32, limit: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::go_interval_string;
+    use super::{Hash, RequestMap, go_interval_string, limit_add};
+
+    /// A distinct hash per counter value.
+    fn key(n: u64) -> Hash {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&n.to_le_bytes());
+        bytes[8..16].copy_from_slice(&n.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+        Hash(bytes)
+    }
+
+    /// A bounded request map that has churned at capacity still evicts
+    /// at random (dcrd `limitAdd`), so a new entry survives about
+    /// `limit` further adds.  Evicting the first key of a `HashMap`
+    /// instead evicted every one of these markers with the very next
+    /// add: hashbrown iterates from its lowest occupied bucket, and
+    /// churn packs the survivors above where new entries land.
+    #[test]
+    fn limit_add_evicts_at_random_after_churn() {
+        const LIMIT: usize = 1000;
+        let mut m = RequestMap::default();
+        let mut n = 0u64;
+        for _ in 0..LIMIT * 3 {
+            limit_add(&mut m, key(n), 1, LIMIT);
+            n += 1;
+        }
+        assert_eq!(m.len(), LIMIT);
+
+        let trials = 200;
+        let mut evicted_next = 0;
+        for _ in 0..trials {
+            let marker = key(n);
+            n += 1;
+            limit_add(&mut m, marker, 2, LIMIT);
+            limit_add(&mut m, key(n), 1, LIMIT);
+            n += 1;
+            if !m.contains_key(&marker) {
+                evicted_next += 1;
+            }
+        }
+        // Uniform eviction expects 200 / 1000 = 0.2 of them.
+        assert!(
+            evicted_next < 20,
+            "{evicted_next} of {trials} new entries were evicted by the next add"
+        );
+        assert_eq!(m.len(), LIMIT);
+    }
+
+    /// The request map keeps its index consistent across replacement,
+    /// removal from any position, and random eviction.
+    #[test]
+    fn request_map_index_stays_consistent() {
+        let mut m = RequestMap::default();
+        for i in 0..10 {
+            assert_eq!(m.insert(key(i), i as i32), None);
+        }
+        assert_eq!(m.insert(key(3), 33), Some(3), "replaced in place");
+        assert_eq!(m.len(), 10);
+        assert_eq!(m.remove(&key(0)), Some(0), "the last entry fills the hole");
+        assert_eq!(m.remove(&key(9)), Some(9));
+        assert_eq!(m.remove(&key(0)), None);
+        for _ in 0..3 {
+            let victim = m.random_key().expect("non-empty");
+            assert!(m.remove(&victim).is_some());
+        }
+        assert_eq!(m.len(), 5);
+        for (hash, peer) in m.iter() {
+            assert_eq!(m.get(hash), Some(peer));
+        }
+        assert_eq!(m.values().count(), 5);
+    }
 
     /// Whole-second intervals render exactly like Go's
     /// `time.Duration.String` (table generated from Go).

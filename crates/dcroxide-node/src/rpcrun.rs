@@ -53,7 +53,8 @@ use dcroxide_wire::{BlockHeader, MsgBlock};
 /// authenticated peer (dcrd `rpcReadLimitAuthenticated`).
 const RPC_READ_LIMIT_AUTHENTICATED: usize = 1 << 23;
 
-/// The interval the accept loop waits between polling for shutdown.
+/// The longest the accept loop waits for an arrival before checking the
+/// shutdown flag again (an arrival ends the wait at once).
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The absolute deadline covering a connection's initial handshake — the
@@ -76,19 +77,218 @@ const RPC_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The chain adapter answering the RPC handlers' queries over the
-/// shared chain (a growing slice of the `RpcChain` seam; handlers
-/// touching the rest answer with an internal error until their seams
-/// are wired).
+/// shared chain (dcrd's `rpcChain`, which embeds `*blockchain.BlockChain`
+/// and so answers every method of the `rpcserver.Chain` interface).
+///
+/// Every `RpcChain` method a handler reaches is overridden here: the
+/// trait's defaults exist for the handler test doubles, and a default
+/// reached from the daemon either fails the request with the unwired-seam
+/// error or, for the three whose signature cannot fail (`chain_tips`,
+/// `calc_want_height`, `tip_generation`), answers a neutral value that
+/// would be a wrong answer rather than an error.
 pub struct NodeRpcChain {
     chain: Arc<Mutex<Chain>>,
     params: dcroxide_chaincfg::Params,
+    /// The daemon's chain event handler, whose deferred work (mempool
+    /// maintenance, index and websocket notifications, announcements)
+    /// must drain after `invalidateblock` and `reconsiderblock` move the
+    /// tip, exactly as it drains after a processed block.  dcrd runs
+    /// that work from `handleBlockchainNotification` whichever caller
+    /// reorganized the chain; the daemon's callback runs under the chain
+    /// mutex and only queues, so the caller that released the mutex
+    /// drains.  `None` only where no handler is installed (tests).
+    ntfn_handler: Option<crate::chainntfns::ChainNtfnHandler>,
 }
 
 impl NodeRpcChain {
     /// Adapt the shared chain for the RPC handlers.
     pub fn new(chain: Arc<Mutex<Chain>>, params: dcroxide_chaincfg::Params) -> NodeRpcChain {
-        NodeRpcChain { chain, params }
+        NodeRpcChain {
+            chain,
+            params,
+            ntfn_handler: None,
+        }
     }
+
+    /// Attach the daemon's chain event handler so the manual
+    /// invalidate/reconsider reorganizations run the same deferred
+    /// maintenance a processed block does.
+    pub fn with_chain_ntfn_handler(
+        mut self,
+        handler: crate::chainntfns::ChainNtfnHandler,
+    ) -> NodeRpcChain {
+        self.ntfn_handler = Some(handler);
+        self
+    }
+
+    /// Run the chain handler's deferred work now that the chain mutex
+    /// is free (see [`NodeRpcChain::ntfn_handler`]).
+    fn drain_chain_events(&self) {
+        if let Some(handler) = &self.ntfn_handler {
+            handler.drain_pending(&self.chain, adjusted_time_unix());
+        }
+    }
+
+    /// Whether the chain's store has latched a fatal persistence fault,
+    /// which the chain renders as a `RuleError` so it can travel the
+    /// ordinary paths (see `sync::combine_process_block_result`).
+    fn storage_failed(chain: &Chain) -> bool {
+        chain
+            .db
+            .as_ref()
+            .is_some_and(dcroxide_database::Database::is_fatal)
+    }
+}
+
+/// The chain tips known to the block index, sorted by descending height
+/// (dcrd `BlockChain.ChainTips`, `chainquery.go:81`).
+///
+/// dcrd sorts with `sort.Reverse(nodeHeightSorter)`, whose `Less`
+/// (`chainquery.go:33`) breaks a height tie on the raw hash bytes, so
+/// tips of equal height -- the two sides of a block race -- come out in
+/// descending `bytes.Compare` order of the hash in its internal byte
+/// order, not in the order the index holds them.
+fn chain_tips(chain: &Chain) -> Vec<dcroxide_rpc::server::RpcChainTip> {
+    let mut tips: Vec<dcroxide_blockchain::blockindex::NodeId> = Vec::new();
+    let _ = chain
+        .index
+        .for_each_chain_tip(|tip| -> Result<(), core::convert::Infallible> {
+            tips.push(tip);
+            Ok(())
+        });
+    // Generate the results sorted by descending height, then by
+    // descending hash bytes (`Hash`'s `Ord` is `bytes.Compare` over the
+    // same internal order as Go's `hash[:]`).
+    tips.sort_by_key(|&tip| {
+        let node = chain.store.node(tip);
+        core::cmp::Reverse((node.height, node.hash))
+    });
+    let best_tip = chain.best_chain.tip();
+    tips.into_iter()
+        .map(|tip| {
+            let node = chain.store.node(tip);
+            let fork_height = chain
+                .best_chain
+                .find_fork(&chain.store, tip)
+                .map_or(0, |fork| chain.store.node(fork).height);
+            // Determine the status of the chain tip.
+            let tip_status = chain.index.node_status(&chain.store, tip);
+            let status = if Some(tip) == best_tip {
+                "active"
+            } else if tip_status.known_invalid() {
+                "invalid"
+            } else if !tip_status.have_data() {
+                "headers-only"
+            } else if tip_status.has_validated() {
+                "valid-fork"
+            } else {
+                "valid-headers"
+            };
+            dcroxide_rpc::server::RpcChainTip {
+                height: node.height,
+                hash: node.hash,
+                branch_len: node.height.saturating_sub(fork_height),
+                status: status.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// The treasury balance as of the given block (dcrd
+/// `BlockChain.TreasuryBalance`, `treasury.go:497`), read from the
+/// chain's in-memory mirror of the treasury bucket that dcrd's
+/// `dbFetchTreasuryBalance` reads.
+fn treasury_balance(
+    chain: &Chain,
+    hash: &Hash,
+    params: &dcroxide_chaincfg::Params,
+) -> Result<dcroxide_rpc::server::RpcTreasuryBalance, dcroxide_rpc::server::TreasuryBalanceFailure>
+{
+    use dcroxide_rpc::server::TreasuryBalanceFailure;
+    let failure = |is_unknown_block, is_no_treasury_balance, message| TreasuryBalanceFailure {
+        is_unknown_block,
+        is_no_treasury_balance,
+        message,
+    };
+    let Some(node) = chain
+        .index
+        .lookup_node(hash)
+        .filter(|&node| chain.index.can_validate(&chain.store, node))
+    else {
+        return Err(failure(true, false, format!("block {hash} is not known")));
+    };
+
+    // Treasury agenda is never active for the genesis block.
+    let Some(parent) = chain.store.node(node).parent else {
+        return Err(failure(
+            false,
+            true,
+            format!("treasury balance not available for block {hash}"),
+        ));
+    };
+
+    // Ensure the treasury agenda is active as of the requested block.
+    let parent_hash = chain.store.node(parent).hash;
+    let is_active = chain
+        .is_treasury_agenda_active(&parent_hash, params)
+        .map_err(|e| failure(false, false, e.description))?;
+    if !is_active {
+        return Err(failure(
+            false,
+            true,
+            format!("treasury balance not available for block {hash}"),
+        ));
+    }
+
+    // Load treasury balance information.
+    let node_hash = chain.store.node(node).hash;
+    let Some(ts) = chain.treasury_state.get(&node_hash.0) else {
+        return Err(failure(
+            false,
+            false,
+            format!("treasury db missing key: {node_hash}"),
+        ));
+    };
+    Ok(dcroxide_rpc::server::RpcTreasuryBalance {
+        block_height: chain.store.node(node).height,
+        // dcrd's `uint64(ts.balance)` conversion, wrapping included.
+        balance: ts.balance as u64,
+        updates: ts.values.iter().map(|value| value.amount).collect(),
+    })
+}
+
+/// The live tickets whose voting rights pay to the given stake address
+/// (dcrd `BlockChain.TicketsWithAddress`, `stakeext.go:80`).
+fn tickets_with_address(
+    chain: &Chain,
+    addr: &dcroxide_txscript::stdaddr::Address,
+) -> Result<Vec<Hash>, String> {
+    // The handler only passes addresses that have a voting rights
+    // script (dcrd's type assertion to `stdaddr.StakeAddress`).
+    let Some((voting_rights_script_ver, voting_rights_script)) = addr.voting_rights_script() else {
+        return Ok(Vec::new());
+    };
+    let mut tickets_with_addr = Vec::new();
+    for hash in chain.live_tickets() {
+        let outpoint = dcroxide_wire::OutPoint {
+            hash,
+            index: 0,
+            tree: dcroxide_wire::TX_TREE_STAKE,
+        };
+        // A live ticket always has its submission output, so a missing
+        // one can only be corruption.  dcrd would dereference the nil
+        // entry and panic the handler; the port fails the request
+        // instead, as its `ticket_pool_value` does for the same state.
+        let Some(utxo) = chain.fetch_utxo_entry(&outpoint) else {
+            return Err(format!("unable to find ticket {hash} in the utxo set"));
+        };
+        if utxo.script_version() == voting_rights_script_ver
+            && utxo.pk_script() == voting_rights_script.as_slice()
+        {
+            tickets_with_addr.push(hash);
+        }
+    }
+    Ok(tickets_with_addr)
 }
 
 impl RpcChain for NodeRpcChain {
@@ -115,19 +315,28 @@ impl RpcChain for NodeRpcChain {
     }
 
     fn block_by_hash(&self, hash: &Hash) -> Result<MsgBlock, String> {
-        self.chain
-            .lock()
-            .expect("chain mutex poisoned")
-            .block_by_hash(hash)
-            .ok_or_else(|| format!("block {hash} not found"))
+        // dcrd's `BlockByHash` takes no chain lock: the index lookup runs
+        // under it and the database read after it is released.
+        let located = {
+            let chain = self.chain.lock().expect("chain mutex poisoned");
+            crate::dispatch::BlockRead::locate(&chain, hash)
+        };
+        located
+            .and_then(|read| read.fetch(hash))
+            // dcrd `unknownBlockError`.
+            .ok_or_else(|| format!("block {hash} is not known"))
     }
 
     fn block_by_height(&self, height: i64) -> Result<MsgBlock, String> {
-        self.chain
-            .lock()
-            .expect("chain mutex poisoned")
-            .block_by_height(height)
-            .ok_or_else(|| format!("no block at height {height}"))
+        // dcrd's `BlockByHeight` takes no chain lock either.
+        let located = {
+            let chain = self.chain.lock().expect("chain mutex poisoned");
+            crate::dispatch::BlockRead::locate_main_chain(&chain, height)
+        };
+        located
+            .and_then(|(hash, read)| read.fetch(&hash))
+            // dcrd `errNotInMainChainByHeight`.
+            .ok_or_else(|| format!("no block at height {height} exists"))
     }
 
     fn tspend_count_votes(
@@ -135,18 +344,25 @@ impl RpcChain for NodeRpcChain {
         check_block: &Hash,
         tspend: &dcroxide_wire::MsgTx,
     ) -> Result<(u32, u32), dcroxide_rpc::server::TSpendCountVotesFailure> {
-        let chain = self.chain.lock().expect("chain mutex poisoned");
-        let Some(node) = chain.index.lookup_node(check_block) else {
-            // dcrd `TSpendCountVotes` classifies an unknown check
-            // block as `ErrUnknownBlock`.
-            return Err(dcroxide_rpc::server::TSpendCountVotesFailure {
-                is_unknown_block: true,
-                message: format!("block {check_block} is not known"),
-            });
+        // dcrd's `TSpendCountVotes` takes no `chainLock`
+        // (`treasury.go:1090-1102`): capture the voting window under
+        // the chain mutex, then read and tally its blocks with it
+        // released (see `TSpendVoteWindow`).
+        let window = {
+            let chain = self.chain.lock().expect("chain mutex poisoned");
+            let Some(node) = chain.index.lookup_node(check_block) else {
+                // dcrd `TSpendCountVotes` classifies an unknown check
+                // block as `ErrUnknownBlock`.
+                return Err(dcroxide_rpc::server::TSpendCountVotesFailure {
+                    is_unknown_block: true,
+                    message: format!("block {check_block} is not known"),
+                });
+            };
+            chain.tspend_vote_window(node, tspend, &self.params)
         };
-        let (_, _, yes, no) = chain
-            .tspend_count_votes(node, tspend, &self.params)
-            .map_err(|message| dcroxide_rpc::server::TSpendCountVotesFailure {
+        let tally = window.and_then(|window| window.count_votes());
+        let (_, _, yes, no) =
+            tally.map_err(|message| dcroxide_rpc::server::TSpendCountVotesFailure {
                 is_unknown_block: false,
                 message,
             })?;
@@ -158,7 +374,8 @@ impl RpcChain for NodeRpcChain {
             .lock()
             .expect("chain mutex poisoned")
             .block_hash_by_height(height)
-            .ok_or_else(|| format!("no block at height {height}"))
+            // dcrd `errNotInMainChainByHeight`.
+            .ok_or_else(|| format!("no block at height {height} exists"))
     }
 
     fn height_range(&self, start: i64, end: i64) -> Result<Vec<Hash>, String> {
@@ -173,7 +390,8 @@ impl RpcChain for NodeRpcChain {
             .lock()
             .expect("chain mutex poisoned")
             .block_height_by_hash(hash)
-            .ok_or_else(|| format!("block {hash} not found"))
+            // dcrd `errNotInMainChainByHash`.
+            .ok_or_else(|| format!("block {hash} is not in the main chain"))
     }
 
     fn chain_work(&self, hash: &Hash) -> Result<Uint256, String> {
@@ -181,7 +399,8 @@ impl RpcChain for NodeRpcChain {
             .lock()
             .expect("chain mutex poisoned")
             .chain_work(hash)
-            .ok_or_else(|| format!("no chain work for block {hash}"))
+            // dcrd `unknownBlockError`.
+            .ok_or_else(|| format!("block {hash} is not known"))
     }
 
     fn header_by_hash(&self, hash: &Hash) -> Result<BlockHeader, String> {
@@ -189,7 +408,8 @@ impl RpcChain for NodeRpcChain {
             .lock()
             .expect("chain mutex poisoned")
             .header_by_hash(hash)
-            .ok_or_else(|| format!("block {hash} not found"))
+            // dcrd `unknownBlockError`.
+            .ok_or_else(|| format!("block {hash} is not known"))
     }
 
     fn is_current(&self) -> bool {
@@ -218,7 +438,8 @@ impl RpcChain for NodeRpcChain {
             .lock()
             .expect("chain mutex poisoned")
             .median_time_by_hash(hash)
-            .ok_or_else(|| format!("block {hash} not found"))
+            // dcrd `unknownBlockError`.
+            .ok_or_else(|| format!("block {hash} is not known"))
     }
 
     fn check_live_ticket(&self, hash: &Hash) -> bool {
@@ -344,11 +565,15 @@ impl RpcChain for NodeRpcChain {
         // `Chain::flush_utxo_cache_for_stats` for the tip-publication
         // race that keeping it there closes.  It is bounded by the cache
         // size and is the same write the connect path already performs.
+        //
+        // Errors carry their Display text: dcrd's dispatch wraps the bare
+        // stats error as `rpcInternalErr(err, "")`, whose wire message is
+        // `err.Error()`.
         let db = {
             let mut chain = self.chain.lock().expect("chain mutex poisoned");
             chain
                 .flush_utxo_cache_for_stats()
-                .map_err(|e| format!("{e:?}"))?;
+                .map_err(|e| e.to_string())?;
             // Cloning the handle shares the open database, as copies of
             // dcrd's `database.DB` interface value do; the daemon
             // already hands the same one to the chain and the indexes.
@@ -356,7 +581,7 @@ impl RpcChain for NodeRpcChain {
         };
         let stats = match db {
             Some(db) => dcroxide_blockchain::process::Chain::utxo_stats_from_backend(&db)
-                .map_err(|e| format!("{e:?}"))?,
+                .map_err(|e| e.to_string())?,
             // A chain with no backing database keeps its set on the
             // chain itself, so that walk does need the lock back.  Only
             // the pure differential-test chains are built that way; the
@@ -366,7 +591,7 @@ impl RpcChain for NodeRpcChain {
                 .lock()
                 .expect("chain mutex poisoned")
                 .fetch_utxo_stats()
-                .map_err(|e| format!("{e:?}"))?,
+                .map_err(|e| e.to_string())?,
         };
         Ok(dcroxide_rpc::server::RpcUtxoStats {
             utxos: stats.utxos,
@@ -432,6 +657,211 @@ impl RpcChain for NodeRpcChain {
             .expect("chain mutex poisoned")
             .tip_generation()
     }
+
+    // The seams below were left at their trait defaults until the
+    // review of 2026-09-23, so on a live node getstakedifficulty,
+    // getblocksubsidy at or below the tip, estimatestakediff, ticketvwap,
+    // getstakeversions, getstakeversioninfo, getvoteinfo,
+    // gettreasurybalance, ticketsforaddress, invalidateblock and
+    // reconsiderblock always failed, a mined tspend read as unknown to
+    // gettreasuryspendvotes, getchaintips answered [] and ws
+    // rebroadcastwinners sent nothing.  Each forwards to the chain the
+    // way dcrd's `rpcChain` reaches `*blockchain.BlockChain`.
+
+    fn chain_tips(&self) -> Vec<dcroxide_rpc::server::RpcChainTip> {
+        chain_tips(&self.chain.lock().expect("chain mutex poisoned"))
+    }
+
+    fn header_by_height(&self, height: i64) -> Result<BlockHeader, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .header_by_height(height)
+            // dcrd `errNotInMainChainByHeight`.
+            .ok_or_else(|| format!("no block at height {height} exists"))
+    }
+
+    fn estimate_next_stake_difficulty(
+        &self,
+        hash: &Hash,
+        new_tickets: i64,
+        use_max_tickets: bool,
+    ) -> Result<i64, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .estimate_next_stake_difficulty(hash, new_tickets, use_max_tickets, &self.params)
+    }
+
+    /// dcrd `BlockChain.CalcWantHeight` over the network's stake
+    /// validation height; no chain state is consulted.
+    fn calc_want_height(&self, interval: i64, height: i64) -> i64 {
+        dcroxide_blockchain::stakever::calc_want_height(
+            self.params.stake_validation_height,
+            interval,
+            height,
+        )
+    }
+
+    fn get_stake_versions(
+        &self,
+        hash: &Hash,
+        count: i32,
+    ) -> Result<Vec<dcroxide_rpc::server::RpcStakeVersions>, String> {
+        let versions = self
+            .chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .get_stake_versions(hash, count)?;
+        Ok(versions
+            .into_iter()
+            .map(|sv| dcroxide_rpc::server::RpcStakeVersions {
+                hash: sv.hash,
+                height: sv.height,
+                block_version: sv.block_version,
+                stake_version: sv.stake_version,
+                votes: sv.votes,
+            })
+            .collect())
+    }
+
+    fn get_vote_info(
+        &self,
+        hash: &Hash,
+        version: u32,
+    ) -> Result<Vec<dcroxide_chaincfg::ConsensusDeployment>, dcroxide_rpc::server::VoteInfoFailure>
+    {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .get_vote_info(hash, version, &self.params)
+            .map(|info| info.agendas)
+            .map_err(|e| dcroxide_rpc::server::VoteInfoFailure {
+                is_unknown_deployment_version: e.kind == RuleErrorKind::UnknownDeploymentVersion,
+                message: e.description,
+            })
+    }
+
+    fn count_vote_version(&self, version: u32) -> Result<u32, String> {
+        Ok(self
+            .chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .count_vote_version(version, &self.params))
+    }
+
+    fn get_vote_counts(
+        &self,
+        version: u32,
+        deployment_id: &str,
+    ) -> Result<dcroxide_rpc::server::RpcVoteCounts, String> {
+        let counts = self
+            .chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .get_vote_counts(version, deployment_id, &self.params)
+            .map_err(|e| e.description)?;
+        Ok(dcroxide_rpc::server::RpcVoteCounts {
+            total: counts.total,
+            total_abstain: counts.total_abstain,
+            vote_choices: counts.vote_choices,
+        })
+    }
+
+    fn treasury_balance(
+        &self,
+        hash: &Hash,
+    ) -> Result<
+        dcroxide_rpc::server::RpcTreasuryBalance,
+        dcroxide_rpc::server::TreasuryBalanceFailure,
+    > {
+        treasury_balance(
+            &self.chain.lock().expect("chain mutex poisoned"),
+            hash,
+            &self.params,
+        )
+    }
+
+    fn tickets_with_address(
+        &self,
+        addr: &dcroxide_txscript::stdaddr::Address,
+    ) -> Result<Vec<Hash>, String> {
+        tickets_with_address(&self.chain.lock().expect("chain mutex poisoned"), addr)
+    }
+
+    /// dcrd `BlockChain.InvalidateBlock`, followed by the deferred
+    /// notification work its reorganization queued.
+    fn invalidate_block(
+        &self,
+        hash: &Hash,
+    ) -> Result<(), dcroxide_rpc::server::InvalidateBlockFailure> {
+        let errs = self
+            .chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .invalidate_block(hash, adjusted_time_unix(), &self.params);
+        self.drain_chain_events();
+        let Some(first) = errs.first() else {
+            return Ok(());
+        };
+        Err(dcroxide_rpc::server::InvalidateBlockFailure {
+            is_unknown_block: first.kind == RuleErrorKind::UnknownBlock,
+            is_invalidate_genesis: first.kind == RuleErrorKind::InvalidateGenesisBlock,
+            message: dcroxide_blockchain::render_multi_error(&errs),
+        })
+    }
+
+    /// dcrd `BlockChain.ReconsiderBlock`, followed by the deferred
+    /// notification work its reorganization queued.
+    fn reconsider_block(
+        &self,
+        hash: &Hash,
+    ) -> Result<(), dcroxide_rpc::server::ReconsiderBlockFailure> {
+        let (errs, storage_failed) = {
+            let mut chain = self.chain.lock().expect("chain mutex poisoned");
+            let errs = chain.reconsider_block(hash, adjusted_time_unix(), &self.params);
+            let storage_failed = Self::storage_failed(&chain);
+            (errs, storage_failed)
+        };
+        self.drain_chain_events();
+        let Some(first) = errs.first() else {
+            return Ok(());
+        };
+        Err(dcroxide_rpc::server::ReconsiderBlockFailure {
+            is_unknown_block: first.kind == RuleErrorKind::UnknownBlock,
+            // dcrd's handler asks whether every member of the (possible)
+            // multi error is a `blockchain.RuleError`.  The port folds
+            // context and assertion errors into its one error type, so
+            // the kind reconstructs that split, and a latched store
+            // fault is a disk failure wearing a rule error's clothes,
+            // exactly as the sync adapter treats it.
+            all_rule_errs: !storage_failed && errs.iter().all(|e| e.kind.is_rule_violation()),
+            message: dcroxide_blockchain::render_multi_error(&errs),
+        })
+    }
+
+    /// dcrd `BlockChain.FetchTSpend`: the database lookup errors on a
+    /// tspend that was never mined (`dbFetchTSpend`'s missing key).
+    fn fetch_tspend(&self, tspend: &Hash) -> Result<Vec<Hash>, String> {
+        let blocks = self
+            .chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .fetch_tspend(tspend);
+        if blocks.is_empty() {
+            return Err(format!("tspend db missing key: {tspend}"));
+        }
+        Ok(blocks)
+    }
+
+    fn lottery_data_for_block(&self, hash: &Hash) -> Result<Vec<Hash>, String> {
+        self.chain
+            .lock()
+            .expect("chain mutex poisoned")
+            .lottery_data_for_block(hash, &self.params)
+            .map(|(winners, _pool_size, _final_state)| winners)
+            .map_err(|e| e.description)
+    }
 }
 
 /// The mempool seam for a daemon that has no mempool yet: every
@@ -468,16 +898,16 @@ impl dcroxide_rpc::server::RpcClock for SystemClock {
     }
 }
 
-/// The median-adjusted time source for the RPC handlers.  dcrd feeds
-/// its median time source samples from each peer's version message;
-/// the daemon collects no samples yet, and a sample-less dcrd source
-/// reports a zero offset, so the zero here is dcrd-exact until the
-/// median-time port lands.
+/// The median-adjusted time source for the RPC handlers: the server's
+/// median time source, which each handshaken peer's version timestamp
+/// feeds (dcrd's `timeSource.Offset()`).
 pub struct SystemTimeSource;
 
 impl dcroxide_rpc::server::RpcTimeSource for SystemTimeSource {
     fn offset_nanos(&self) -> i64 {
-        0
+        crate::mediantime::server_time_source()
+            .offset_secs()
+            .saturating_mul(1_000_000_000)
     }
 }
 
@@ -497,22 +927,30 @@ impl NodeRpcFiltererV2 {
 
 impl RpcFiltererV2 for NodeRpcFiltererV2 {
     fn filter_by_block_hash(&self, hash: &Hash) -> Result<RpcFilterProof, FilterFailure> {
-        let fetched = {
+        // dcrd's `FilterByBlockHash` checks the index, then reads the
+        // filter and its commitments in a `db.View` outside the chain
+        // lock; the lookup here runs under the lock and the reads after
+        // it is released.
+        let located = {
             let chain = self.chain.lock().expect("chain mutex poisoned");
-            chain.filter_by_block_hash(hash)
+            crate::dispatch::FilterReads::locate_block(&chain, hash)
         };
-        match fetched {
-            Ok((filter, proof)) => Ok(RpcFilterProof {
-                filter_bytes: filter.bytes().to_vec(),
-                proof_index: proof.proof_index,
-                proof_hashes: proof.proof_hashes,
+        match located
+            .and_then(crate::dispatch::FilterReads::fetch)
+            .and_then(|mut filters| filters.pop())
+        {
+            Some(filter) => Ok(RpcFilterProof {
+                filter_bytes: filter.data,
+                proof_index: filter.proof_index,
+                proof_hashes: filter.proof_hashes,
             }),
             // A missing filter is dcrd's `blockchain.ErrNoFilter`, which
-            // the handler turns into the "Block not found" RPC error; any
-            // other failure surfaces as an internal error.
-            Err(err) => Err(FilterFailure {
-                is_no_filter: err.kind == RuleErrorKind::NoFilter,
-                message: err.to_string(),
+            // the handler turns into the "Block not found" RPC error.  As
+            // in `Chain::filter_by_block_hash`, a failed database read
+            // also answers as a missing filter.
+            None => Err(FilterFailure {
+                is_no_filter: true,
+                message: format!("no filter available for block {hash}"),
             }),
         }
     }
@@ -523,10 +961,8 @@ impl RpcFiltererV2 for NodeRpcFiltererV2 {
 /// which calls the package-level `blockchain.CheckBlockSanity(block,
 /// timeSource, chainParams)` — no chain lock, since the checks are
 /// context free and dcrd's median time source guards itself).  The port
-/// passes the daemon's wall clock as the adjusted time, matching how the
-/// sync manager's own `process_block` path calls `check_block_sanity`
-/// (no network time samples are collected yet, so the two are
-/// identical).
+/// passes the server's median-adjusted time, as the sync manager's own
+/// `process_block` path does.
 pub struct NodeRpcSanityChecker {
     params: dcroxide_chaincfg::Params,
 }
@@ -542,7 +978,7 @@ impl RpcSanityChecker for NodeRpcSanityChecker {
     fn check_block_sanity(&self, block: &MsgBlock) -> Result<(), String> {
         dcroxide_blockchain::validate::check_block_sanity(
             block,
-            crate::txmempool::now_unix(),
+            crate::mediantime::adjusted_time_unix(),
             false,
             &self.params,
         )
@@ -701,6 +1137,14 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
         self.sync_peers.connected_peer_infos()
     }
 
+    /// Queue the message to every connected peer (dcrd
+    /// `rpcConnManager.BroadcastMessage`), which is what the `ping` RPC
+    /// sends; each peer's output loop stamps the ping as it writes it,
+    /// so `getpeerinfo` shows the wait and then the round trip.
+    fn broadcast_message(&self, msg: &dcroxide_wire::Message) {
+        self.sync_peers.broadcast_message(msg);
+    }
+
     /// The persistent peers for `getaddednodeinfo` (dcrd
     /// `rpcConnManager.PersistentPeers`).
     fn persistent_peers(&self) -> Vec<dcroxide_rpc::server::RpcAddedNode> {
@@ -793,10 +1237,11 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
     }
 
     /// Resolve a host to its addresses for `getaddednodeinfo` with DNS
-    /// details (dcrd `rpcConnManager.Lookup` over the config's lookup
-    /// function; the system resolver here — a `.onion`/proxied host
-    /// resolves through it rather than dcrd's SOCKS lookup, a documented
-    /// divergence until the Tor path is wired).
+    /// details (dcrd `rpcConnManager.Lookup` over the config's
+    /// `dcrdLookup` routing: a Tor RESOLVE through the proxy under
+    /// `--proxy` without `--noonion`, the onion route for a `.onion`
+    /// host, and otherwise the system resolver, which like Go's sends no
+    /// query for a `.onion` name).
     fn lookup(&self, host: &str) -> Result<Vec<String>, String> {
         // dcrd `rpcConnManager.Lookup` runs the configured `dcrdLookup`,
         // so a proxied daemon resolves through Tor and a `.onion` host
@@ -859,6 +1304,36 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
         }
     }
 
+    /// Announce mixing messages submitted over RPC to the peers (dcrd
+    /// `rpcConnManager.RelayMixMessages` over `server.relayMixMessages`:
+    /// one mix inventory vector per message, not immediate, no required
+    /// services), then push them to the websocket clients subscribed to
+    /// mixing messages.  dcrd's `handleSendRawMixMessage` calls
+    /// `ntfnMgr.NotifyMixMessage(msg)` right after this relay; the seam's
+    /// sole caller is that handler, so bundling the notify here is
+    /// observably equivalent, as it is for `relay_transactions`.
+    fn relay_mix_messages(&self, msgs: &[dcroxide_wire::Message]) {
+        for msg in msgs {
+            let Some(hash) = crate::mixnode::wire_to_pool_message(msg.clone())
+                .and_then(|msg| msg.mix_hash().ok())
+            else {
+                continue;
+            };
+            self.sync_peers
+                .relay_inventory(&crate::server::RelayInvFacts {
+                    inv_type: dcroxide_wire::InvType::MIX,
+                    inv_hash: hash,
+                    req_services: dcroxide_wire::ServiceFlag(0),
+                    immediate: false,
+                    data_is_block_header: false,
+                    data_is_tx: false,
+                });
+        }
+        if let Some(relay) = &self.relay {
+            relay.ntfn.notify_mix_messages(msgs.to_vec());
+        }
+    }
+
     fn add_rebroadcast_inventory(&self, tx_hash: &Hash, tx: &dcroxide_wire::MsgTx) {
         // Track user-submitted transactions for periodic rebroadcast
         // until they make it into a block (dcrd rpcConnManager
@@ -888,6 +1363,19 @@ impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
 pub struct NodeRpcSyncManager {
     sync_manager: Arc<Mutex<crate::sync::NodeSyncManager>>,
     tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
+    /// The manager's sync-height atomic (dcrd's `syncHeight`, read with
+    /// a bare `Load` by `SyncManager.SyncHeight`), captured once so
+    /// `getblockchaininfo` never waits on the manager mutex -- which
+    /// the dispatcher holds across every intake, a block's whole
+    /// validation and connection included.
+    sync_height: Arc<std::sync::atomic::AtomicI64>,
+    /// The recently-confirmed filter (dcrd's `recentlyConfirmedTxns`,
+    /// which carries its own lock), captured once for the same reason.
+    recently_confirmed: Arc<Mutex<dcroxide_containers::apbf::Filter>>,
+    /// The shared mixing pool `sendrawmixmessage` submits to (dcrd's
+    /// rpcSyncMgr reaching `server.mixMsgPool`); absent only in tests
+    /// that build the adapter without one.
+    mix_pool: Option<Arc<Mutex<crate::mixnode::NodeMixPool>>>,
 }
 
 impl NodeRpcSyncManager {
@@ -898,21 +1386,44 @@ impl NodeRpcSyncManager {
         sync_manager: Arc<Mutex<crate::sync::NodeSyncManager>>,
         tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
     ) -> NodeRpcSyncManager {
+        // Both handles are fixed for the manager's lifetime, so taking
+        // them here is the one time these seams touch the manager lock.
+        let (sync_height, recently_confirmed) = {
+            let manager = sync_manager.lock().expect("sync manager poisoned");
+            (
+                manager.current_state_handles().1,
+                manager.recently_confirmed_txns(),
+            )
+        };
         NodeRpcSyncManager {
             sync_manager,
             tx_pool,
+            sync_height,
+            recently_confirmed,
+            mix_pool: None,
         }
+    }
+
+    /// Attach the shared mixing pool, so `sendrawmixmessage` reaches it
+    /// (dcrd's `AcceptMixMessage` adaptor over `server.mixMsgPool`).
+    pub fn with_mix_pool(
+        mut self,
+        mix_pool: Arc<Mutex<crate::mixnode::NodeMixPool>>,
+    ) -> NodeRpcSyncManager {
+        self.mix_pool = Some(mix_pool);
+        self
     }
 }
 
 impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
+    /// dcrd `SyncManager.SyncHeight`: an atomic load, no manager lock.
     fn sync_height(&self) -> i64 {
-        self.sync_manager
-            .lock()
-            .expect("sync manager poisoned")
-            .sync_height()
+        self.sync_height.load(Ordering::SeqCst)
     }
 
+    /// dcrd guards the sync peer with its own `syncPeerMtx`; the port
+    /// keeps it inside the manager, so this one still takes the manager
+    /// lock and can wait behind a block being processed.
     fn sync_peer_id(&self) -> i32 {
         self.sync_manager
             .lock()
@@ -946,14 +1457,11 @@ impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
     /// Whether the transaction confirmed in a recent block (dcrd
     /// `RecentlyConfirmedTxn` over the netsync APBF filter).
     fn recently_confirmed_txn(&self, hash: &Hash) -> bool {
-        // Take the shared filter handle so the check does not hold
-        // the sync manager across the read.
+        // The filter's own lock only, never the sync manager's.
         let filter = self
-            .sync_manager
+            .recently_confirmed
             .lock()
-            .expect("sync manager poisoned")
-            .recently_confirmed_txns();
-        let filter = filter.lock().expect("recently confirmed filter poisoned");
+            .expect("recently confirmed filter poisoned");
         filter.contains(&hash.0)
     }
 
@@ -997,16 +1505,94 @@ impl dcroxide_rpc::server::RpcSyncManager for NodeRpcSyncManager {
                 message: err.message,
             })
     }
+
+    /// Submit a mixing message to the shared mixing pool with the local
+    /// node as its source (dcrd rpcSyncMgr's `AcceptMixMessage`, which
+    /// calls `mixMsgPool.AcceptMessage(msg, mixpool.ZeroSource)`
+    /// directly rather than through the sync manager).  The pool adapter
+    /// asks the memory pool which claimed outputs it already spends
+    /// before taking the mixpool guard, the one lock order
+    /// [`crate::mixnode::NodeSyncMixPool`] documents.
+    fn accept_mix_message(&self, msg: &dcroxide_wire::Message) -> Result<(), String> {
+        use dcroxide_netsync::manager::SyncMixPool;
+
+        let Some(mix_pool) = &self.mix_pool else {
+            return Err("RPC server seam accept_mix_message is not wired in this build".into());
+        };
+        // The handler admits only the eight mixing commands.
+        let Some(msg) = crate::mixnode::wire_to_pool_message(msg.clone()) else {
+            return Err(format!("{} is not a mixing message", msg.command()));
+        };
+        // Hashed once, here, for the acceptance's signature check and
+        // bookkeeping (dcrd caches the hash on the message).
+        let msg = dcroxide_mixing::HashedMessage::new(msg);
+        crate::mixnode::NodeSyncMixPool::new(Arc::clone(mix_pool), Arc::clone(&self.tx_pool))
+            .accept_message(&msg, 0)
+            .map(|_accepted| ())
+            .map_err(|err| err.to_string())
+    }
 }
 
-/// A CPU miner that never runs, so the getwork handler's mining gate
-/// allows work polling and `getmininginfo`/`gethashespersec` answer the
-/// idle values dcrd reports when the miner is off (dcrd's CPU miner is
-/// off by default; the generating miner behind `generate`/`setgenerate`
-/// arrives with a later piece).
+/// The mixing pool as the RPC handlers read it (dcrd's
+/// `rpcserver.MixPooler`, which dcrd satisfies with the server's
+/// `mixMsgPool` itself): the pair requests `getmixpairrequests` lists
+/// and the message `getmixmessage` looks up.  Generic over the pool's
+/// chain view so it can be exercised over a stub chain; the daemon uses
+/// the default.
+pub struct NodeRpcMixPooler<C: dcroxide_mixing::MixBlockChain = crate::mixnode::NodeMixChain> {
+    pool: Arc<Mutex<dcroxide_mixing::Pool<C>>>,
+}
+
+impl<C: dcroxide_mixing::MixBlockChain> NodeRpcMixPooler<C> {
+    /// Adapt the shared mixing pool for the RPC handlers.
+    pub fn new(pool: Arc<Mutex<dcroxide_mixing::Pool<C>>>) -> NodeRpcMixPooler<C> {
+        NodeRpcMixPooler { pool }
+    }
+}
+
+impl<C: dcroxide_mixing::MixBlockChain> dcroxide_rpc::server::RpcMixPooler for NodeRpcMixPooler<C> {
+    /// dcrd `Pool.MixPRs`.
+    fn mix_prs(&self) -> Vec<dcroxide_wire::MsgMixPairReq> {
+        self.pool.lock().expect("mix pool mutex poisoned").mix_prs()
+    }
+
+    /// dcrd `Pool.Message`.
+    fn message(&self, query: &Hash) -> Result<dcroxide_wire::Message, String> {
+        self.pool
+            .lock()
+            .expect("mix pool mutex poisoned")
+            .message(query)
+            .map(crate::mixnode::pool_to_wire_message)
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// The CPU miner the daemon hands the RPC server when no mining
+/// addresses are configured, where dcrd builds no miner at all: it never
+/// runs, so the getwork handler's mining gate allows work polling and
+/// `getmininginfo`/`gethashespersec` answer the idle values dcrd reports
+/// when the miner is off.  With mining addresses the daemon hands over
+/// the real [`crate::cpuminer::NodeCpuMiner`] instead.
 pub struct IdleCpuMiner;
 
 impl dcroxide_rpc::server::RpcCpuMiner for IdleCpuMiner {
+    /// Refused with the text `generate` answers when no mining address
+    /// is configured.  The handler returns that error itself before it
+    /// asks the miner, and the daemon hands this miner over only in that
+    /// configuration, so this is not reached today; answering rather
+    /// than falling through to the trait's `unimplemented!` keeps it
+    /// that way should the two conditions ever part.
+    fn generate_n_blocks(
+        &self,
+        _n: u32,
+    ) -> Result<Vec<Hash>, dcroxide_rpc::server::GenerateFailure> {
+        Err(dcroxide_rpc::server::GenerateFailure {
+            is_ctx_err: false,
+            is_cancel_discrete: false,
+            message: "no payment addresses specified via --miningaddr".to_string(),
+        })
+    }
+
     fn is_mining(&self) -> bool {
         false
     }
@@ -1031,12 +1617,9 @@ impl dcroxide_rpc::server::RpcCpuMiner for IdleCpuMiner {
 }
 
 /// The current unix time for the chain's is-current resolution (dcrd's
-/// median-adjusted time source; the daemon has no samples yet).
+/// median-adjusted time source).
 fn adjusted_time_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    crate::mediantime::adjusted_time_unix()
 }
 
 /// The running RPC listener; [`RpcListener::shutdown`] stops the accept
@@ -1748,8 +2331,9 @@ pub fn tls_server_config(
 }
 
 /// The system environment for certificate generation: the clock, the
-/// OS random source, and the host identity (interface enumeration is
-/// not yet wired, matching the configuration pipeline's gap).
+/// OS random source, and the host identity -- the host name and the
+/// interface addresses dcrd's `certgen.NewTLSCertPair` reads from
+/// `os.Hostname` and `net.InterfaceAddrs`.
 struct SystemCertEnv;
 
 impl CertEnv for SystemCertEnv {
@@ -1783,6 +2367,18 @@ impl CertEnv for SystemCertEnv {
     }
 
     fn hostname(&mut self) -> Result<String, String> {
+        // Go's `os.Hostname` on Linux is uname(2)'s nodename, falling
+        // back to `/proc/sys/kernel/hostname`, which reports the same
+        // kernel value -- not `/etc/hostname`, which a container or a
+        // runtime `hostname` change leaves stale.
+        #[cfg(target_os = "linux")]
+        if let Some(name) = std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(name);
+        }
         Ok(std::fs::read_to_string("/etc/hostname")
             .ok()
             .map(|s| s.trim().to_string())
@@ -1792,7 +2388,346 @@ impl CertEnv for SystemCertEnv {
     }
 
     fn interface_addrs(&mut self) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
+        Ok(system_interface_addrs())
+    }
+}
+
+/// The addresses assigned to the host's interfaces, as the CIDR strings
+/// dcrd's certgen parses (Go `net.InterfaceAddrs`, whose every address
+/// becomes an IP subject alternative name of the generated
+/// certificate, so a client that pins `rpc.cert` can verify the server
+/// by any of its addresses).  The daemon reads the same list to
+/// advertise a peer-to-peer listener bound to the unspecified address
+/// (dcrd `addLocalAddress`, [`crate::listenaddrs`]).
+///
+/// On Linux they come from procfs, which needs neither a dependency nor
+/// unsafe code: the local IPv4 addresses are the `/32 host LOCAL`
+/// leaves of `/proc/net/fib_trie` (the kernel's local table, one entry
+/// per assigned address) and the IPv6 ones are `/proc/net/if_inet6`.
+/// An unreadable file contributes nothing, as the certificate still
+/// carries the loopback addresses.  Elsewhere there is no safe source
+/// in the current dependency set, so the list is empty and the
+/// certificate carries only the loopback addresses, the host name and
+/// `--altdnsnames` (recorded in PARITY).
+#[cfg(target_os = "linux")]
+pub fn system_interface_addrs() -> Vec<String> {
+    let mut addrs = Vec::new();
+    if let Ok(trie) = std::fs::read_to_string("/proc/net/fib_trie") {
+        addrs.extend(fib_trie_local_addrs(&trie));
+    }
+    if let Ok(inet6) = std::fs::read_to_string("/proc/net/if_inet6") {
+        addrs.extend(if_inet6_addrs(&inet6));
+    }
+    addrs
+}
+
+/// See the Linux variant: no safe interface enumeration is available.
+#[cfg(not(target_os = "linux"))]
+pub fn system_interface_addrs() -> Vec<String> {
+    Vec::new()
+}
+
+/// The local IPv4 addresses in a `/proc/net/fib_trie` dump, each as
+/// `a.b.c.d/32`, deduplicated in first-seen order: every leaf line
+/// (`|-- a.b.c.d`) whose prefix lines include `/32 host LOCAL`.
+#[cfg(any(target_os = "linux", test))]
+fn fib_trie_local_addrs(trie: &str) -> Vec<String> {
+    let mut addrs: Vec<String> = Vec::new();
+    let mut leaf: Option<std::net::Ipv4Addr> = None;
+    for line in trie.lines() {
+        let line = line.trim();
+        if let Some(ip) = line.strip_prefix("|-- ") {
+            leaf = ip.trim().parse().ok();
+            continue;
+        }
+        if !line.starts_with('/') {
+            leaf = None;
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let is_local_host = fields.next() == Some("/32")
+            && fields.next() == Some("host")
+            && fields.next() == Some("LOCAL");
+        if let Some(ip) = leaf.filter(|_| is_local_host) {
+            let cidr = format!("{ip}/32");
+            if !addrs.contains(&cidr) {
+                addrs.push(cidr);
+            }
+        }
+    }
+    addrs
+}
+
+/// The IPv6 addresses in a `/proc/net/if_inet6` table, each with its
+/// prefix length: the rows are the address as 32 hex digits, the
+/// interface index, the prefix length in hex, the scope, the flags and
+/// the interface name.
+#[cfg(any(target_os = "linux", test))]
+fn if_inet6_addrs(table: &str) -> Vec<String> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let hex = fields.next()?;
+            let prefix_len = u8::from_str_radix(fields.nth(1)?, 16).ok()?;
+            let bits = u128::from_str_radix(hex, 16)
+                .ok()
+                .filter(|_| hex.len() == 32)?;
+            Some(format!("{}/{prefix_len}", std::net::Ipv6Addr::from(bits)))
+        })
+        .collect()
+}
+
+/// The interface-name lookup behind `addnode` and `node` (Go's
+/// `net.InterfaceByName` and `Interface.Addrs` in dcrd's
+/// `normalizeAddress`): a host that names a local network interface is
+/// dialed at that interface's first address.
+///
+/// On Linux the kernel is asked over a route netlink socket, as Go's
+/// `interfaceTable` and `interfaceAddrTable` ask it
+/// (`net/interface_linux.go`): an `RTM_GETLINK` dump finds the interface
+/// by name, and an `RTM_GETADDR` dump of every family lists its
+/// addresses in the kernel's order, IPv4 ahead of IPv6.  socket2 opens
+/// the socket, sends the requests and reads the replies, so no `unsafe`
+/// is needed.  Elsewhere the dependency set has no safe source, so no
+/// host names an interface and each is dialed as a host name (recorded
+/// in PARITY).
+pub struct SystemInterfaces;
+
+impl dcroxide_rpc::helpers::InterfaceLookup for SystemInterfaces {
+    fn interface_addr(&self, name: &str) -> Option<(u32, String)> {
+        #[cfg(target_os = "linux")]
+        {
+            netlink::interface_addr(name)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = name;
+            None
+        }
+    }
+}
+
+/// Go's route netlink reads for [`SystemInterfaces`]
+/// (`syscall.NetlinkRIB`, `ParseNetlinkMessage`, `ParseNetlinkRouteAttr`
+/// and `net/interface_linux.go`).  Netlink structures are in host byte
+/// order.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Only tests use it.
+mod netlink {
+    /// `NLMSG_HDRLEN`: length, type, flags, sequence and port id.
+    pub(super) const NLMSG_HDRLEN: usize = 16;
+    pub(super) const NLMSG_ERROR: u16 = 2;
+    pub(super) const NLMSG_DONE: u16 = 3;
+    pub(super) const RTM_NEWLINK: u16 = 16;
+    pub(super) const RTM_NEWADDR: u16 = 20;
+    pub(super) const IFLA_IFNAME: u16 = 3;
+    pub(super) const IFA_ADDRESS: u16 = 1;
+    pub(super) const IFA_LOCAL: u16 = 2;
+    pub(super) const AF_INET: u8 = 2;
+    pub(super) const AF_INET6: u8 = 10;
+    /// `sizeof(struct ifinfomsg)` and `sizeof(struct ifaddrmsg)`.
+    pub(super) const IFINFOMSG_LEN: usize = 16;
+    pub(super) const IFADDRMSG_LEN: usize = 8;
+
+    /// Round up to netlink's four-byte alignment (`NLMSG_ALIGN`,
+    /// `RTA_ALIGN`).
+    fn align4(len: usize) -> usize {
+        len.saturating_add(3) & !3
+    }
+
+    fn ne_u16(bytes: &[u8], at: usize) -> Option<u16> {
+        Some(u16::from_ne_bytes(
+            bytes.get(at..at.checked_add(2)?)?.try_into().ok()?,
+        ))
+    }
+
+    fn ne_u32(bytes: &[u8], at: usize) -> Option<u32> {
+        Some(u32::from_ne_bytes(
+            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+    }
+
+    /// One netlink message: its type, sequence number and payload.
+    pub(super) struct Message<'a> {
+        pub(super) kind: u16,
+        pub(super) seq: u32,
+        pub(super) data: &'a [u8],
+    }
+
+    /// The messages in a buffer (Go `syscall.ParseNetlinkMessage`), or
+    /// `None` where Go returns `EINVAL`: a length shorter than the
+    /// header or running past the buffer.
+    pub(super) fn messages(mut buf: &[u8]) -> Option<Vec<Message<'_>>> {
+        let mut out = Vec::new();
+        while buf.len() >= NLMSG_HDRLEN {
+            let len = usize::try_from(ne_u32(buf, 0)?).ok()?;
+            let aligned = align4(len);
+            if len < NLMSG_HDRLEN || aligned > buf.len() {
+                return None;
+            }
+            out.push(Message {
+                kind: ne_u16(buf, 4)?,
+                seq: ne_u32(buf, 8)?,
+                data: buf.get(NLMSG_HDRLEN..len)?,
+            });
+            buf = buf.get(aligned..)?;
+        }
+        Some(out)
+    }
+
+    /// The route attributes after a message's fixed header, as (type,
+    /// value) (Go `syscall.ParseNetlinkRouteAttr`), or `None` where Go
+    /// returns `EINVAL`.
+    pub(super) fn route_attrs(data: &[u8], fixed: usize) -> Option<Vec<(u16, &[u8])>> {
+        let mut buf = data.get(fixed..)?;
+        let mut out = Vec::new();
+        while buf.len() >= 4 {
+            let len = usize::from(ne_u16(buf, 0)?);
+            if len < 4 || len > buf.len() {
+                return None;
+            }
+            out.push((ne_u16(buf, 2)?, buf.get(4..len)?));
+            buf = buf.get(align4(len).min(buf.len())..)?;
+        }
+        Some(out)
+    }
+
+    /// The index of the interface named `name` in an `RTM_GETLINK` dump
+    /// (Go `interfaceTable` and `InterfaceByName`'s name match, the name
+    /// being `IFLA_IFNAME` without its terminating NUL).
+    pub(super) fn link_index(tab: &[u8], name: &str) -> Option<u32> {
+        for m in messages(tab)? {
+            match m.kind {
+                NLMSG_DONE => break,
+                RTM_NEWLINK => {
+                    let index = ne_u32(m.data, 4)?;
+                    let attrs = route_attrs(m.data, IFINFOMSG_LEN)?;
+                    let named = attrs.iter().any(|(kind, value)| {
+                        *kind == IFLA_IFNAME
+                            && value.split_last().map(|(_, text)| text) == Some(name.as_bytes())
+                    });
+                    if named {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The first address of interface `index` in an `RTM_GETADDR` dump,
+    /// as `ip/prefix` (Go `addrTable` over `newAddr`).  Like Go, an
+    /// address message that carries `IFA_LOCAL` -- every IPv4 one --
+    /// skips `IFA_ADDRESS` (the peer on a point-to-point link) and takes
+    /// its first other attribute, and one without takes its first
+    /// attribute.  An IPv4-mapped IPv6 address renders as IPv4, as Go's
+    /// `IP.String` renders it.
+    pub(super) fn first_addr(tab: &[u8], index: u32) -> Option<String> {
+        for m in messages(tab)? {
+            match m.kind {
+                NLMSG_DONE => break,
+                RTM_NEWADDR if ne_u32(m.data, 4)? == index => {
+                    let family = *m.data.first()?;
+                    let prefix_len = *m.data.get(1)?;
+                    let attrs = route_attrs(m.data, IFADDRMSG_LEN)?;
+                    let point_to_point = attrs.iter().any(|(kind, _)| *kind == IFA_LOCAL);
+                    let value = attrs
+                        .iter()
+                        .find(|(kind, _)| !(point_to_point && *kind == IFA_ADDRESS))
+                        .map(|(_, value)| *value);
+                    let ip = match (family, value) {
+                        (AF_INET, Some(value)) => {
+                            let octets: [u8; 4] = value.get(..4)?.try_into().ok()?;
+                            std::net::Ipv4Addr::from(octets).to_string()
+                        }
+                        (AF_INET6, Some(value)) => {
+                            let octets: [u8; 16] = value.get(..16)?.try_into().ok()?;
+                            let ip = std::net::Ipv6Addr::from(octets);
+                            match ip.to_ipv4_mapped() {
+                                Some(v4) => v4.to_string(),
+                                None => ip.to_string(),
+                            }
+                        }
+                        _ => continue,
+                    };
+                    return Some(format!("{ip}/{prefix_len}"));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// One route netlink dump of every family (Go `syscall.NetlinkRIB`):
+    /// the request, sequence number 1, then every reply datagram through
+    /// `NLMSG_DONE`, concatenated.  An `NLMSG_ERROR` reply, a short one or
+    /// another sequence number fails it, as `EINVAL` fails Go's.
+    #[cfg(target_os = "linux")]
+    fn rib(proto: u16) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+
+        const NLM_F_REQUEST: u16 = 0x1;
+        const NLM_F_DUMP: u16 = 0x300;
+        let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidData);
+
+        let socket = socket2::Socket::new(
+            socket2::Domain::from(libc::AF_NETLINK),
+            socket2::Type::from(libc::SOCK_RAW),
+            Some(socket2::Protocol::from(libc::NETLINK_ROUTE)),
+        )?;
+        // The kernel always answers a dump; the bound only keeps an RPC
+        // handler from waiting on a socket that is somehow never served.
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        // Go's request: the header and a one-byte `rtgenmsg` naming
+        // AF_UNSPEC, 17 bytes in all.  Unbound and unconnected, the
+        // socket gets a port id from this first send, which goes to the
+        // kernel (port id 0).
+        let mut request = Vec::with_capacity(NLMSG_HDRLEN + 1);
+        request.extend_from_slice(&17u32.to_ne_bytes());
+        request.extend_from_slice(&proto.to_ne_bytes());
+        request.extend_from_slice(&(NLM_F_DUMP | NLM_F_REQUEST).to_ne_bytes());
+        request.extend_from_slice(&1u32.to_ne_bytes());
+        request.extend_from_slice(&0u32.to_ne_bytes());
+        request.push(0);
+        socket.send(&request)?;
+
+        let mut tab = Vec::new();
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            let n = (&socket).read(&mut buf)?;
+            let datagram = buf.get(..n).ok_or_else(invalid)?;
+            if n < NLMSG_HDRLEN {
+                return Err(invalid());
+            }
+            tab.extend_from_slice(datagram);
+            for m in messages(datagram).ok_or_else(invalid)? {
+                if m.seq != 1 || m.kind == NLMSG_ERROR {
+                    return Err(invalid());
+                }
+                if m.kind == NLMSG_DONE {
+                    return Ok(tab);
+                }
+            }
+        }
+    }
+
+    /// The index and first address of the interface named `name`, or
+    /// `None` when no interface has that name, it has no address or the
+    /// kernel cannot be asked -- every case in which dcrd's
+    /// `normalizeAddress` dials the name as a host.
+    #[cfg(target_os = "linux")]
+    pub(super) fn interface_addr(name: &str) -> Option<(u32, String)> {
+        // Go refuses the empty name before asking the kernel.
+        if name.is_empty() {
+            return None;
+        }
+        const RTM_GETLINK: u16 = 18;
+        const RTM_GETADDR: u16 = 22;
+        let index = link_index(&rib(RTM_GETLINK).ok()?, name)?;
+        let addr = first_addr(&rib(RTM_GETADDR).ok()?, index)?;
+        Some((index, addr))
     }
 }
 
@@ -1853,6 +2788,10 @@ pub fn load_or_generate_cert_pair(
         ));
     }
 
+    // dcrd `genCertPair` announces the generation and its completion,
+    // the only sign an operator gets that new files were written (and
+    // that clients pinning an old certificate will now fail).
+    crate::logging::info(RPC_LOG_SUBSYSTEM, "Generating TLS certificates...");
     let mut env = SystemCertEnv;
     let valid_until = env.now_unix().saturating_add(10 * 365 * 24 * 60 * 60);
     let pair = new_tls_cert_pair(
@@ -1886,12 +2825,24 @@ pub fn load_or_generate_cert_pair(
         let _ = std::fs::remove_file(cert_path);
         return Err(format!("unable to write the RPC key: {e}"));
     }
+    crate::logging::info(RPC_LOG_SUBSYSTEM, "Done generating TLS certificates");
     Ok((pair.cert, pair.key))
 }
 
 /// Bind the RPC listen addresses and serve JSON-RPC requests through
 /// the shared server over the selected transport (dcrd's RPC
 /// listeners).
+///
+/// The addresses go through dcrd's `parseListeners` first: an empty
+/// host (`rpclisten=` or `:9109`, "all interfaces") listens on both
+/// families, and a host that is not an IP literal is refused with
+/// dcrd's `'%s' is not a valid IP address`.  Each resulting address is
+/// bound like dcrd's `setupRPCListeners` binds it -- a `tcp6` wildcard
+/// IPv6-only, as Go's `net.Listen("tcp6", ...)` sets `IPV6_V6ONLY`, so
+/// it coexists with the `tcp4` one on the same port -- and one that
+/// cannot be bound is logged as dcrd's `Can't listen on %s: %v` warning
+/// and skipped.  Only when nothing bound does startup fail, with
+/// `newServer`'s `no usable rpc listen addresses`.
 pub fn start_rpc_listener(
     listeners: &[String],
     server: Arc<Server<NodeRpcChain>>,
@@ -1915,10 +2866,24 @@ pub fn start_rpc_listener(
     let mut threads = Vec::with_capacity(listeners.len());
     let mut bound = Vec::with_capacity(listeners.len());
 
-    for addr in listeners {
-        let listener = TcpListener::bind(addr)?;
-        listener.set_nonblocking(true)?;
-        bound.push(listener.local_addr()?);
+    let specs = crate::config::parse_listeners(listeners)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    for (net, addr) in &specs {
+        let bind = crate::runtime::bind_listener(net, addr).and_then(|listener| {
+            listener.set_nonblocking(true)?;
+            let local = listener.local_addr()?;
+            Ok((listener, local))
+        });
+        let listener = match bind {
+            Ok((listener, local)) => {
+                bound.push(local);
+                listener
+            }
+            Err(e) => {
+                crate::logging::warn(RPC_LOG_SUBSYSTEM, &format!("Can't listen on {addr}: {e}"));
+                continue;
+            }
+        };
 
         let shutdown = Arc::clone(&shutdown);
         let server = Arc::clone(&server);
@@ -1940,6 +2905,12 @@ pub fn start_rpc_listener(
                 &pre_auth,
             );
         }));
+    }
+
+    // Nothing was spawned when nothing bound, so there is no accept
+    // thread to stop before failing.
+    if bound.is_empty() {
+        return Err(std::io::Error::other("no usable rpc listen addresses"));
     }
 
     Ok(RpcListener {
@@ -2097,6 +3068,20 @@ struct PreAuthEntry {
     /// thread for nothing, and dcrd has no equivalent pre-auth pool to
     /// inherit a rule from.
     head_done: Arc<AtomicBool>,
+    /// Whether this connection has already been answered -- a 401, a
+    /// 503, a 417 or one of the mux's own answers -- and is only
+    /// discarding its declared body before closing.
+    ///
+    /// Set by the handler just before `drain_declared_body`, and read by
+    /// the eviction search, which takes such a connection before any
+    /// other: evicting it costs nothing, since its answer is already
+    /// written and the shut-down socket simply ends the drain, whereas
+    /// the drain itself can wait out the rest of the authentication
+    /// timeout on a body that never arrives.  Without this tier those
+    /// parked connections counted as "sent a head" and were protected,
+    /// so a slow flood of unauthenticated requests declaring a body made
+    /// a legitimate client still in its handshake the preferred victim.
+    answered: Arc<AtomicBool>,
 }
 
 /// The pre-authentication pool's contents, in arrival order.
@@ -2225,19 +3210,28 @@ impl PreAuthGate {
                 // At the nominal budget, disconnect the oldest connection
                 // that has not been evicted already.
                 if state.live.len() >= self.soft {
-                    // Oldest first, but skipping connections that have
-                    // already sent a request head: those are being
-                    // served, and killing one answers nothing while the
-                    // stalled arrival that provoked the pressure lives
-                    // on.  Only when every live connection has sent a
-                    // head does the search fall back to the oldest of
-                    // them, since the tier must still shed something to
-                    // stay under its ceiling.
+                    // Oldest first within three classes.  A connection
+                    // that has already been answered (401/503) and is
+                    // only draining its body goes before anything else:
+                    // closing it loses nothing.  Next come connections
+                    // that have not sent a request head.  Connections
+                    // that have sent one are being served, and killing
+                    // one answers nothing while the stalled arrival that
+                    // provoked the pressure lives on, so only when every
+                    // live connection is being served does the search
+                    // fall back to the oldest of them, since the tier
+                    // must still shed something to stay under its
+                    // ceiling.
                     let victim = state
                         .live
                         .iter()
                         .position(|entry| {
-                            entry.sock.is_some() && !entry.head_done.load(Ordering::Relaxed)
+                            entry.sock.is_some() && entry.answered.load(Ordering::Relaxed)
+                        })
+                        .or_else(|| {
+                            state.live.iter().position(|entry| {
+                                entry.sock.is_some() && !entry.head_done.load(Ordering::Relaxed)
+                            })
                         })
                         .or_else(|| state.live.iter().position(|entry| entry.sock.is_some()));
                     if let Some(index) = victim
@@ -2251,17 +3245,20 @@ impl PreAuthGate {
                 state.next_ticket = state.next_ticket.wrapping_add(1);
                 let ticket = state.next_ticket;
                 let head_done = Arc::new(AtomicBool::new(false));
+                let answered = Arc::new(AtomicBool::new(false));
                 // Registered under the lock, so no release can race
                 // ahead of the registration it belongs to.
                 state.live.push_back(PreAuthEntry {
                     ticket,
                     sock,
                     head_done: Arc::clone(&head_done),
+                    answered: Arc::clone(&answered),
                 });
                 Some(PreAuthSlot {
                     gate: Arc::clone(self),
                     ticket,
                     head_done,
+                    answered,
                 })
             }
         };
@@ -2307,6 +3304,7 @@ struct PreAuthSlot {
     gate: Arc<PreAuthGate>,
     ticket: u64,
     head_done: Arc<AtomicBool>,
+    answered: Arc<AtomicBool>,
 }
 
 impl PreAuthSlot {
@@ -2315,6 +3313,12 @@ impl PreAuthSlot {
     /// not remains.
     fn mark_head_done(&self) {
         self.head_done.store(true, Ordering::Relaxed);
+    }
+
+    /// Record that this connection has been answered and is only
+    /// draining its body, so the eviction search takes it first.
+    fn mark_answered(&self) {
+        self.answered.store(true, Ordering::Relaxed);
     }
 }
 
@@ -2344,6 +3348,12 @@ fn accept_loop(
                 if stream.set_nonblocking(false).is_err() {
                     continue;
                 }
+                enable_keepalive(&stream);
+                // Go sets TCP_NODELAY on every connection it accepts,
+                // ignoring a failure (`newTCPConn`, `net/tcpsock.go`), so
+                // no reply waits on Nagle's algorithm for the peer's
+                // delayed ACK.
+                let _ = stream.set_nodelay(true);
                 // Register in the pre-authentication pool before
                 // anything is spawned.  At the nominal budget this
                 // disconnects the oldest pre-authentication connection
@@ -2415,7 +3425,7 @@ fn accept_loop(
                             let Ok(session) = rustls::ServerConnection::new(config) else {
                                 return;
                             };
-                            let tls = rustls::StreamOwned::new(session, stream);
+                            let tls = TlsRpcStream(rustls::StreamOwned::new(session, stream));
                             serve_rpc_connection(
                                 tls,
                                 &server,
@@ -2432,9 +3442,168 @@ fn accept_loop(
                     }
                 }
             }
+            // Nothing pending: wait for the next arrival rather than
+            // sleeping past it.  dcrd's accept blocks on the netpoller and
+            // returns the moment a client connects; every JSON-RPC call
+            // over HTTP is a fresh connection (`Connection: close`), so a
+            // fixed sleep here charged each sequential call up to the
+            // whole interval.
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                wait_for_connection(listener);
+            }
+            // Any other failure (descriptor exhaustion, say) would poll
+            // readable again at once, so back off for the interval.
             Err(_) => thread::sleep(ACCEPT_POLL_INTERVAL),
         }
     }
+}
+
+/// How long closing a TLS connection may block sending its
+/// `close_notify`: the write deadline Go's `closeNotify` arms
+/// (`crypto/tls/conn.go:1474-1480`).
+const TLS_CLOSE_NOTIFY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// An RPC connection over TLS, closed the way Go's `tls.Conn.Close`
+/// closes one: a `close_notify` alert ahead of the FIN once the
+/// handshake has completed (`crypto/tls/conn.go:1422-1455`).
+///
+/// dcrd's every close of an RPC connection goes through `tls.Conn` --
+/// `conn.serve`'s own close, the hijacked JSON-RPC connection's `defer
+/// conn.Close()` (`rpcserver.go:5714`), and the websocket's -- while
+/// rustls's `StreamOwned` has no `Drop` and so ends every session in a
+/// bare FIN.  A client that frames a reply by the close (every answer
+/// Go's connection loop writes, and the hijacked JSON-RPC reply) then
+/// cannot tell the end of the body from a truncation: OpenSSL reports
+/// "unexpected eof while reading" and rustls `UnexpectedEof`.  The alert
+/// goes out from `drop`, so every return path of both the HTTP and the
+/// websocket handler sends it, as Go's deferred closes do.
+struct TlsRpcStream(rustls::StreamOwned<rustls::ServerConnection, TcpStream>);
+
+impl Read for TlsRpcStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for TlsRpcStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl SocketTimeout for TlsRpcStream {
+    fn set_socket_read_timeout(&self, timeout: Option<Duration>) {
+        self.0.set_socket_read_timeout(timeout);
+    }
+
+    fn set_socket_write_timeout(&self, timeout: Option<Duration>) {
+        self.0.set_socket_write_timeout(timeout);
+    }
+}
+
+impl Drop for TlsRpcStream {
+    fn drop(&mut self) {
+        // Go sends the alert only once `isHandshakeComplete`; a session
+        // that never finished its handshake is closed bare.
+        if self.0.conn.is_handshaking() {
+            return;
+        }
+        self.0.conn.send_close_notify();
+        // Bounded as Go bounds it, so a client that stopped reading
+        // cannot park the handler here.  Any failure -- the watchdog
+        // already shut the socket down, the peer reset -- simply ends
+        // the attempt; Go closes the connection either way.
+        let _ = self
+            .0
+            .sock
+            .set_write_timeout(Some(TLS_CLOSE_NOTIFY_TIMEOUT));
+        while self.0.conn.wants_write() {
+            match self.0.conn.write_tls(&mut self.0.sock) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+}
+
+/// Go's keepalive idle time for an accepted connection (`net/dial.go`
+/// `defaultTCPKeepAliveIdle`).
+const RPC_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+
+/// Go's keepalive probe interval for an accepted connection
+/// (`net/dial.go` `defaultTCPKeepAliveInterval`), on the platforms
+/// socket2 can set it on.
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "windows",
+))]
+const RPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Enable TCP keepalive on an accepted RPC connection with Go's
+/// defaults, as every connection Go's `TCPListener.Accept` returns has
+/// it (dcrd's RPC listeners are plain `net.Listen`/`tls.Listen`).
+///
+/// This is what reaps a client whose host vanished without a FIN or a
+/// RST: dcrd sets no read deadline on a websocket connection, and
+/// neither does the port, so without the probes a subscriber that went
+/// away held its `rpcmaxwebsockets` slot and its threads until a write
+/// failed -- forever, if it had subscribed to nothing.
+///
+/// Go also sets the probe count to 9; socket2 exposes that only behind
+/// its `all` feature, which this crate does not enable, so the count is
+/// the system's (9 by default on Linux, the same as Go's).  A failure
+/// is ignored, as Go ignores it.
+fn enable_keepalive(stream: &TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new().with_time(RPC_KEEPALIVE_IDLE);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "windows",
+    ))]
+    let keepalive = keepalive.with_interval(RPC_KEEPALIVE_INTERVAL);
+    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
+}
+
+/// Block until a connection is waiting on the listener or the accept
+/// poll interval passes, whichever comes first, so the accept loop wakes
+/// for an arrival immediately and still observes the shutdown flag every
+/// interval.  A failed poll falls back to sleeping the interval, which
+/// keeps the loop from spinning.
+#[cfg(any(unix, windows))]
+fn wait_for_connection(listener: &TcpListener) {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let mut fds = [PollFd::new(listener, PollFlags::IN)];
+    // The conversion cannot fail for the 50 ms interval; it goes through
+    // `TryFrom` because the nanosecond field's width is per-platform.
+    let polled = Timespec::try_from(ACCEPT_POLL_INTERVAL)
+        .ok()
+        .map(|timeout| poll(&mut fds, Some(&timeout)));
+    if !matches!(polled, Some(Ok(_))) {
+        thread::sleep(ACCEPT_POLL_INTERVAL);
+    }
+}
+
+/// The sleeping fallback where no safe readiness poll is available.
+#[cfg(not(any(unix, windows)))]
+fn wait_for_connection(_listener: &TcpListener) {
+    thread::sleep(ACCEPT_POLL_INTERVAL);
 }
 
 /// Bounds a connection's request-read phase with a wall-clock deadline
@@ -2615,133 +3784,560 @@ fn drain_body<S: Read + SocketTimeout>(stream: &mut S, mut remaining: usize, dea
 /// and like it governs both framings.
 const POST_RESPONSE_DRAIN_LIMIT: usize = 256 << 10;
 
-/// The longest accepted chunk-size line, extensions included (Go's
-/// `maxLineLength` in `internal/chunked`).
+/// Go's `bufio.Reader` default size.  The server reads every request
+/// through one, and its size is what bounds both a chunk-size line
+/// (`ReadSlice` gives up with `ErrBufferFull` once the buffer holds no
+/// newline, which `readChunkLine` reports as "header line too long")
+/// and the trailer section, whose blank line `seeUpcomingDoubleCRLF`
+/// must find within it (`net/http/transfer.go:906-919`).
+const CHUNK_BUFFER_SIZE: usize = 4096;
+
+/// `internal/chunked`'s `maxLineLength`, checked against a size line
+/// with its CRLF removed.
 const MAX_CHUNK_LINE: usize = 4096;
 
-/// A decoded chunked request body, or why it could not be read.
+/// How much non-data a chunked body may carry before Go refuses it:
+/// size lines, their extensions and the CRLFs, net of 16 bytes per
+/// chunk plus twice its data (`internal/chunked/chunked.go:46-86`).
+const MAX_CHUNK_EXCESS: i64 = 16 * 1024;
+
+/// Go 1.27's cap on how many header values a request head may carry,
+/// and separately its trailer: the server hands `readRequestLimit` its
+/// `maxHeaderValueCount`, the `DefaultMaxHeaderValueCount` of 500
+/// (`net/http/server.go:944`, `:953-958`, `:1054`), which passes the
+/// same count to `readMIMEHeader` for the head and to `readTransfer`
+/// for the trailer (`request.go:1152`, `:1181`).  One value more is
+/// textproto's "message too large".  The cap is new in Go 1.27
+/// (`api/go1.27.txt`, go.dev/issue/79936).
+const MAX_HEADER_VALUES: usize = 500;
+
+/// A chunked request body read to its end, or to where reading stops.
 enum ChunkedBody {
     /// The whole body, decoded.
     Body(Vec<u8>),
-    /// The decoded body exceeded the limit.
+    /// Collecting reached the limit: the first `limit` decoded bytes
+    /// (dcrd's `io.LimitReader`), and how many data bytes of the chunk
+    /// the limit fell in are still unread -- zero when it fell on the
+    /// chunk's end, whose CRLF is then the next thing on the wire.
+    Truncated(Vec<u8>, u64),
+    /// The discarded body exceeded the drain limit.
     TooLarge,
-    /// The chunk framing was malformed.
-    Malformed,
-    /// The stream failed or the deadline passed.
+}
+
+/// Why reading a chunked body stopped short.
+enum ChunkError {
+    /// The framing broke one of Go's rules.  The text is Go's own
+    /// error, which dcrd answers as `400 error reading JSON message:
+    /// <err>` (`rpcserver.go:5678-5686`).
+    Malformed(String),
+    /// The stream failed, closed, or ran out the deadline.
     Io,
 }
 
-/// Read one line under the deadline: terminated by LF with any
-/// trailing whitespace (the optional CR included) trimmed, exactly
-/// Go's `readChunkLine`, which tolerates bare-LF size and trailer
-/// lines while the after-data terminator stays strict CRLF.
-fn read_chunk_line<S: Read + SocketTimeout>(
-    stream: &mut S,
+/// A malformed-framing error carrying Go's text.
+fn chunk_malformed(text: &str) -> ChunkError {
+    ChunkError::Malformed(text.to_string())
+}
+
+/// Go's chunked reader over the connection's `bufio.Reader`
+/// (`internal/chunked.chunkedReader` plus the trailer read in
+/// `body.readTrailer`), sharing one buffer and one non-data count
+/// between the handler's read and the discard after it, as Go's single
+/// reader does.
+///
+/// The buffer is also what keeps reading cheap: the head is read one
+/// byte at a time, but a byte-at-a-time chunk line cost a
+/// `set_read_timeout` and a `recv` per byte, which an unauthenticated
+/// client could keep up for the whole handshake deadline through the
+/// 401 and 503 drains.  Here a receive fills the buffer, so the socket
+/// sees one pair per 4 KiB.
+struct ChunkedReader<'a, S> {
+    stream: &'a mut S,
     deadline: Instant,
-) -> Result<Vec<u8>, ChunkedBody> {
-    let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        if !read_exact_by_deadline(stream, &mut byte, deadline) {
-            return Err(ChunkedBody::Io);
+    buf: Vec<u8>,
+    /// The unread bytes are `buf[start..end]`.
+    start: usize,
+    end: usize,
+    /// Go's `excess`: the non-data overhead read so far, net of the
+    /// allowance the data earns.
+    excess: i64,
+}
+
+impl<'a, S: Read + SocketTimeout> ChunkedReader<'a, S> {
+    fn new(stream: &'a mut S, deadline: Instant) -> ChunkedReader<'a, S> {
+        ChunkedReader {
+            stream,
+            deadline,
+            buf: vec![0u8; CHUNK_BUFFER_SIZE],
+            start: 0,
+            end: 0,
+            excess: 0,
         }
-        if byte[0] == b'\n' {
-            while line.last().is_some_and(|b: &u8| b.is_ascii_whitespace()) {
-                line.pop();
+    }
+
+    /// The bytes received and not yet consumed.
+    fn buffered(&self) -> &[u8] {
+        self.buf.get(self.start..self.end).unwrap_or_default()
+    }
+
+    /// Consume `n` buffered bytes.
+    fn consume(&mut self, n: usize) {
+        self.start = self.start.saturating_add(n).min(self.end);
+    }
+
+    /// Slide what is unread to the front and receive once into the
+    /// space after it, as `bufio.Reader.fill` does.  The caller never
+    /// asks with the buffer full.  EOF, an error and the deadline all
+    /// end the read.
+    fn fill(&mut self) -> Result<(), ChunkError> {
+        if self.start > 0 {
+            self.buf.copy_within(self.start..self.end, 0);
+            self.end = self.end.saturating_sub(self.start);
+            self.start = 0;
+        }
+        loop {
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ChunkError::Io);
             }
-            return Ok(line);
+            self.stream
+                .set_socket_read_timeout(Some(remaining.min(RPC_READ_POLL_INTERVAL)));
+            let Some(free) = self.buf.get_mut(self.end..) else {
+                return Err(ChunkError::Io);
+            };
+            match self.stream.read(free) {
+                Ok(0) => return Err(ChunkError::Io),
+                Ok(n) => {
+                    self.end = self.end.saturating_add(n).min(self.buf.len());
+                    return Ok(());
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // A poll slice elapsed; the deadline check ends the read.
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(_) => return Err(ChunkError::Io),
+            }
         }
-        line.push(byte[0]);
-        if line.len() > MAX_CHUNK_LINE {
-            return Err(ChunkedBody::Malformed);
+    }
+
+    /// Go's `readChunkLine` (`internal/chunked/chunked.go:155-184`): a
+    /// size line must end in CRLF with no other CR in it -- RFC 9112
+    /// allows a bare LF in headers but not here, the CVE-2025-22871
+    /// fix -- and must fit the reader's buffer.
+    fn read_chunk_line(&mut self) -> Result<Vec<u8>, ChunkError> {
+        let mut scanned = 0usize;
+        loop {
+            let found = self
+                .buffered()
+                .get(scanned..)
+                .and_then(|tail| tail.iter().position(|b| *b == b'\n'));
+            if let Some(at) = found {
+                let len = scanned.saturating_add(at).saturating_add(1);
+                let mut line = self.buffered().get(..len).unwrap_or_default().to_vec();
+                self.consume(len);
+                match line.iter().position(|b| *b == b'\r') {
+                    None => return Err(chunk_malformed("chunked line ends with bare LF")),
+                    Some(cr) if cr != line.len().saturating_sub(2) => {
+                        return Err(chunk_malformed("invalid CR in chunked line"));
+                    }
+                    Some(_) => {}
+                }
+                line.truncate(line.len().saturating_sub(2));
+                if line.len() >= MAX_CHUNK_LINE {
+                    return Err(chunk_malformed("header line too long"));
+                }
+                return Ok(line);
+            }
+            scanned = self.buffered().len();
+            if scanned >= self.buf.len() {
+                return Err(chunk_malformed("header line too long"));
+            }
+            self.fill()?;
+        }
+    }
+
+    /// Go's `beginChunk` (`internal/chunked/chunked.go:46-86`): the
+    /// next chunk's size, with the line charged against the non-data
+    /// allowance.  The allowance arithmetic wraps as Go's `int64` does,
+    /// so a size past 2^62 counts as overhead there and here alike.
+    fn begin_chunk(&mut self) -> Result<u64, ChunkError> {
+        let line = self.read_chunk_line()?;
+        // The line, plus the CRLF that will follow the chunk's data.
+        self.excess = self
+            .excess
+            .wrapping_add(i64::try_from(line.len()).unwrap_or(i64::MAX))
+            .wrapping_add(2);
+        // `trimTrailingWhitespace` takes spaces and tabs only, and
+        // before the extension is cut, so `5 ;x` keeps its space.
+        let mut size = line.as_slice();
+        while let [rest @ .., b' ' | b'\t'] = size {
+            size = rest;
+        }
+        // `removeChunkExtension`: everything from the first semicolon.
+        let size = size.split(|b| *b == b';').next().unwrap_or_default();
+        let n = parse_chunk_size(size)?;
+        self.excess = self
+            .excess
+            .wrapping_sub(16i64.wrapping_add(2i64.wrapping_mul(n as i64)))
+            .max(0);
+        if self.excess > MAX_CHUNK_EXCESS {
+            return Err(chunk_malformed(
+                "chunked encoding contains too much non-data",
+            ));
+        }
+        Ok(n)
+    }
+
+    /// Fill `out` with body data: what is buffered first, then the
+    /// stream, straight into `out` once the remainder would not fit the
+    /// buffer anyway (`bufio.Reader.Read`'s large-read path).
+    fn read_data(&mut self, out: &mut [u8]) -> Result<(), ChunkError> {
+        let mut filled = 0usize;
+        while filled < out.len() {
+            let want = out.len().saturating_sub(filled);
+            if self.buffered().is_empty() {
+                if want >= self.buf.len() {
+                    let rest = out.get_mut(filled..).unwrap_or_default();
+                    return if read_exact_by_deadline(self.stream, rest, self.deadline) {
+                        Ok(())
+                    } else {
+                        Err(ChunkError::Io)
+                    };
+                }
+                self.fill()?;
+            }
+            let take = want.min(self.buffered().len());
+            let end = filled.saturating_add(take);
+            if let (Some(dst), Some(src)) = (out.get_mut(filled..end), self.buffered().get(..take))
+            {
+                dst.copy_from_slice(src);
+            }
+            self.consume(take);
+            filled = end;
+        }
+        Ok(())
+    }
+
+    /// Discard `n` bytes of body data.
+    fn skip_data(&mut self, mut n: u64) -> Result<(), ChunkError> {
+        while n > 0 {
+            if self.buffered().is_empty() {
+                self.fill()?;
+            }
+            let take = usize::try_from(n)
+                .unwrap_or(usize::MAX)
+                .min(self.buffered().len());
+            self.consume(take);
+            n = n.saturating_sub(take as u64);
+        }
+        Ok(())
+    }
+
+    /// The CRLF every chunk's data ends with (the `checkEnd` arm of
+    /// Go's `chunkedReader.Read`).
+    fn read_chunk_end(&mut self) -> Result<(), ChunkError> {
+        let mut crlf = [0u8; 2];
+        self.read_data(&mut crlf)?;
+        if &crlf != b"\r\n" {
+            return Err(chunk_malformed("malformed chunked encoding"));
+        }
+        Ok(())
+    }
+
+    /// The trailer after the last chunk, which Go reads with
+    /// `body.readTrailer` (`net/http/transfer.go:921-963`): a bare CRLF
+    /// is the common case; anything else must bring its terminating
+    /// `\r\n\r\n` within the reader's buffer -- the bound on an
+    /// unbounded trailer -- and then parse as MIME header fields.  The
+    /// fields themselves are discarded, as dcrd never consults
+    /// `Request.Trailer`.  Running out of input is one of Go's errors
+    /// here rather than a bare failure, because `Peek` reports the
+    /// short read as data, not as an error.
+    fn read_trailer(&mut self) -> Result<(), ChunkError> {
+        while self.buffered().len() < 2 {
+            if self.fill().is_err() {
+                return Err(chunk_malformed("http: unexpected EOF reading trailer"));
+            }
+        }
+        if self.buffered().starts_with(b"\r\n") {
+            self.consume(2);
+            return Ok(());
+        }
+        let mut scanned = 0usize;
+        loop {
+            let buffered = self.buffered();
+            if buffered
+                .get(scanned..)
+                .is_some_and(|tail| tail.windows(4).any(|w| w == b"\r\n\r\n"))
+            {
+                break;
+            }
+            scanned = buffered.len().saturating_sub(3);
+            if buffered.len() >= self.buf.len() || self.fill().is_err() {
+                return Err(chunk_malformed(
+                    "http: suspiciously long trailer after chunked body",
+                ));
+            }
+        }
+        let consumed = parse_trailer_fields(self.buffered())?;
+        self.consume(consumed);
+        Ok(())
+    }
+}
+
+/// Go's `parseHexUint` (`internal/chunked/chunked.go:278-300`): hex
+/// digits and nothing else -- no sign, no space -- and at most 16 of
+/// them, leading zeros included.
+fn parse_chunk_size(digits: &[u8]) -> Result<u64, ChunkError> {
+    if digits.is_empty() {
+        return Err(chunk_malformed("empty hex number for chunk length"));
+    }
+    let mut n = 0u64;
+    for (i, b) in digits.iter().enumerate() {
+        let Some(digit) = (*b as char).to_digit(16) else {
+            return Err(chunk_malformed("invalid byte in chunk length"));
+        };
+        if i == 16 {
+            return Err(chunk_malformed("http chunk length too large"));
+        }
+        n = n.wrapping_shl(4) | u64::from(digit);
+    }
+    Ok(n)
+}
+
+/// One line as `bufio.Reader.ReadLine` returns it: up to the newline,
+/// with the newline and one CR before it removed.  Returns the line and
+/// the bytes consumed, or `None` when no newline is left.
+fn next_trailer_line(section: &[u8]) -> Option<(&[u8], usize)> {
+    let at = section.iter().position(|b| *b == b'\n')?;
+    let line = section.get(..at).unwrap_or_default();
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    Some((line, at.saturating_add(1)))
+}
+
+/// Trim spaces and tabs from both ends, textproto's `trim`.
+fn trim_linear_space(mut s: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = s {
+        s = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = s {
+        s = rest;
+    }
+    s
+}
+
+/// The trailer fields as textproto's `readMIMEHeader` checks them
+/// (`net/textproto/reader.go:523-608`, with `readContinuedLineSlice`
+/// folding continuation lines), over a section already known to hold
+/// its blank line.  Returns the bytes consumed through that line.
+fn parse_trailer_fields(section: &[u8]) -> Result<usize, ChunkError> {
+    let mut at = 0usize;
+    let rest = |at: usize| section.get(at..).unwrap_or_default();
+    // The first line cannot start with a leading space; Go quotes at
+    // most 80 bytes of it.
+    if matches!(section.first(), Some(b' ' | b'\t')) {
+        let (line, _) = next_trailer_line(section).unwrap_or((section, section.len()));
+        if line.len() > 80 {
+            return Err(chunk_malformed("message too large"));
+        }
+        return Err(ChunkError::Malformed(format!(
+            "malformed MIME header initial line: {}",
+            go_quote_bytes(line)
+        )));
+    }
+    let mut values = 0usize;
+    loop {
+        let Some((line, used)) = next_trailer_line(rest(at)) else {
+            return Err(chunk_malformed("http: unexpected EOF reading trailer"));
+        };
+        at = at.saturating_add(used);
+        if line.is_empty() {
+            return Ok(at);
+        }
+        if !line.contains(&b':') {
+            return Err(ChunkError::Malformed(format!(
+                "malformed MIME header: missing colon: {}",
+                go_quote_bytes(line)
+            )));
+        }
+        let mut field = trim_linear_space(line).to_vec();
+        // Continuation lines: leading spaces and tabs skipped, then the
+        // rest of the line appended after a single space.
+        while matches!(rest(at).first(), Some(b' ' | b'\t')) {
+            while matches!(rest(at).first(), Some(b' ' | b'\t')) {
+                at = at.saturating_add(1);
+            }
+            field.push(b' ');
+            let Some((more, used)) = next_trailer_line(rest(at)) else {
+                break;
+            };
+            at = at.saturating_add(used);
+            field.extend_from_slice(trim_linear_space(more));
+        }
+        let colon = field.iter().position(|b| *b == b':').unwrap_or(field.len());
+        let (key, value) = field.split_at(colon);
+        let value = value.get(1..).unwrap_or_default();
+        // `canonicalMIMEHeaderKey`'s validity: a non-empty run of token
+        // bytes, a space being tolerated; `validHeaderValueByte` for the
+        // value: visible ASCII, space, tab and anything above 0x7f.
+        let key_ok = !key.is_empty() && key.iter().all(|b| is_token_octet(*b) || *b == b' ');
+        let value_ok = value
+            .iter()
+            .all(|b| matches!(b, b'\t' | b' '..=b'~' | 0x80..=0xff));
+        if !key_ok || !value_ok {
+            return Err(ChunkError::Malformed(format!(
+                "malformed MIME header line: {}",
+                go_quote_bytes(&field)
+            )));
+        }
+        values = values.saturating_add(1);
+        if values > MAX_HEADER_VALUES {
+            return Err(chunk_malformed("message too large"));
         }
     }
 }
 
-/// Decode a chunked transfer-encoded request body under the deadline
-/// (RFC 7230 section 4.1, the request-side subset of Go's
-/// `internal/chunked` reader the `net/http` server decodes with):
-/// hex-size lines with optional extensions, each chunk's data and its
-/// trailing CRLF, the zero-size last chunk, then any trailer lines up
-/// to the final blank line, which are discarded.  `collect` gathers the
-/// data up to `limit`; a drain passes `false` and the limit bounds the
-/// discarded bytes instead.
+/// Go's `%q` of a byte slice (`strconv.Quote` over its bytes): the
+/// escapes [`crate::gostd::go_quote`] gives valid text, and `\xHH` for
+/// each byte that is not UTF-8.
+fn go_quote_bytes(bytes: &[u8]) -> String {
+    let mut out = String::from("\"");
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let valid_len = match core::str::from_utf8(rest) {
+            Ok(_) => rest.len(),
+            Err(err) => err.valid_up_to(),
+        };
+        let (valid, tail) = rest.split_at(valid_len);
+        let quoted = crate::gostd::go_quote(core::str::from_utf8(valid).unwrap_or_default());
+        out.push_str(
+            quoted
+                .get(1..quoted.len().saturating_sub(1))
+                .unwrap_or_default(),
+        );
+        match tail.split_first() {
+            Some((byte, after)) => {
+                out.push_str(&format!("\\x{byte:02x}"));
+                rest = after;
+            }
+            None => rest = tail,
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Decode a chunked transfer-encoded request body (RFC 9112 section
+/// 7.1, the request-side subset of Go's `internal/chunked` reader and
+/// `body.readTrailer` that the `net/http` server decodes with).
+/// `collect` gathers the data up to `limit` and stops reading there, as
+/// dcrd's `io.LimitReader(r.Body, rpcReadLimitAuthenticated)` hands
+/// `io.ReadAll` the first `limit` decoded bytes and then stops asking
+/// the chunked reader for more -- also when the limit falls exactly on
+/// a chunk's end, before its CRLF and the next size line (Go's reader
+/// parses those in the same `Read` only when they already sit in its
+/// buffer).  What follows is then `discard_chunked_rest`'s.  A drain
+/// passes `false` and the limit bounds the discarded bytes instead.
 fn read_chunked_body<S: Read + SocketTimeout>(
-    stream: &mut S,
-    deadline: Instant,
+    reader: &mut ChunkedReader<'_, S>,
     limit: usize,
     collect: bool,
-) -> ChunkedBody {
+) -> Result<ChunkedBody, ChunkError> {
+    let limit = limit as u64;
     let mut body = Vec::new();
-    let mut total = 0usize;
+    let mut total = 0u64;
     loop {
-        let line = match read_chunk_line(stream, deadline) {
-            Ok(line) => line,
-            Err(err) => return err,
-        };
-        // The size is hex up to an optional extension delimiter (Go
-        // also stops at the first semicolon and ignores extensions).
-        let size_hex = line.split(|b| *b == b';').next().unwrap_or_default();
-        let size_hex = core::str::from_utf8(size_hex).unwrap_or("").trim();
-        let Ok(size) = usize::from_str_radix(size_hex, 16) else {
-            return ChunkedBody::Malformed;
-        };
+        let size = reader.begin_chunk()?;
         if size == 0 {
-            // Trailer section: lines until the blank one, discarded
-            // (Go parses them into Request.Trailer; the RPC server
-            // never consults them).
-            loop {
-                match read_chunk_line(stream, deadline) {
-                    Ok(line) if line.is_empty() => {
-                        return if collect {
-                            ChunkedBody::Body(body)
-                        } else {
-                            ChunkedBody::Body(Vec::new())
-                        };
-                    }
-                    Ok(_) => continue,
-                    Err(err) => return err,
-                }
-            }
+            // The trailer, whose fields Go parses into Request.Trailer
+            // and the RPC server never consults.
+            reader.read_trailer()?;
+            return Ok(ChunkedBody::Body(if collect { body } else { Vec::new() }));
+        }
+        let room = limit.saturating_sub(total);
+        if collect && size > room {
+            // The limit falls inside this chunk: take the part that fits
+            // and stop; the rest is `discard_chunked_rest`'s.
+            let start = body.len();
+            body.resize(
+                start.saturating_add(usize::try_from(room).unwrap_or(usize::MAX)),
+                0,
+            );
+            reader.read_data(body.get_mut(start..).unwrap_or_default())?;
+            return Ok(ChunkedBody::Truncated(body, size.saturating_sub(room)));
         }
         total = total.saturating_add(size);
         if total > limit {
-            return ChunkedBody::TooLarge;
+            return Ok(ChunkedBody::TooLarge);
         }
         if collect {
             let start = body.len();
-            body.resize(start.saturating_add(size), 0);
-            if !read_exact_by_deadline(stream, &mut body[start..], deadline) {
-                return ChunkedBody::Io;
+            body.resize(
+                start.saturating_add(usize::try_from(size).unwrap_or(usize::MAX)),
+                0,
+            );
+            reader.read_data(body.get_mut(start..).unwrap_or_default())?;
+            // The limit fell on this chunk's end: stop before its CRLF.
+            if total == limit {
+                return Ok(ChunkedBody::Truncated(body, 0));
             }
         } else {
-            let mut scratch = [0u8; 4096];
-            let mut remaining = size;
-            while remaining > 0 {
-                let want = remaining.min(scratch.len());
-                if !read_exact_by_deadline(stream, &mut scratch[..want], deadline) {
-                    return ChunkedBody::Io;
-                }
-                remaining = remaining.saturating_sub(want);
-            }
+            reader.skip_data(size)?;
         }
-        // Each chunk's data ends with its own CRLF.
-        let mut crlf = [0u8; 2];
-        if !read_exact_by_deadline(stream, &mut crlf, deadline) {
-            return ChunkedBody::Io;
+        reader.read_chunk_end()?;
+    }
+}
+
+/// Go's `r.Body.Close()` after dcrd's limited read stopped a chunked
+/// body at the limit (`net/http/transfer.go:983-1019`).  The server
+/// sets `doEarlyClose` on every request body, and a chunked one is not
+/// a `LimitedReader`, so `Close` reads on whatever the request's
+/// `Connection` header says: `io.CopyN(io.Discard, body,
+/// maxPostHandlerReadBytes+1)` takes the unread `left` data bytes of
+/// the current chunk, its CRLF, and the chunks after it through the
+/// last chunk and its trailer, or stops once that many decoded bytes
+/// are gone.  It continues the same reader the limited read used, so
+/// the non-data allowance carries over as Go's does.  Whatever ends it
+/// early -- a malformed line, the client closing, the deadline -- is
+/// dropped, as dcrd drops `Close`'s error, and the request is answered
+/// from the prefix all the same.
+fn discard_chunked_rest<S: Read + SocketTimeout>(reader: &mut ChunkedReader<'_, S>, mut left: u64) {
+    let mut budget = (POST_RESPONSE_DRAIN_LIMIT as u64).saturating_add(1);
+    loop {
+        let take = left.min(budget);
+        if reader.skip_data(take).is_err() {
+            return;
         }
-        if &crlf != b"\r\n" {
-            return ChunkedBody::Malformed;
+        // Either the budget ran out inside this chunk, or its data is
+        // all gone and the CRLF after it is next.
+        budget = budget.saturating_sub(take);
+        if budget == 0 {
+            return;
         }
+        if reader.read_chunk_end().is_err() {
+            return;
+        }
+        let Ok(size) = reader.begin_chunk() else {
+            return;
+        };
+        if size == 0 {
+            let _ = reader.read_trailer();
+            return;
+        }
+        left = size;
     }
 }
 
 /// Whether the request declares a chunked body, and whether its
-/// transfer encoding is one the server can read at all.  Go's server
-/// accepts exactly one `Transfer-Encoding` header whose value is
-/// `chunked`, and answers anything else with 501 Unsupported
+/// transfer encoding is one the server can read at all.  From HTTP/1.1
+/// on, Go's server accepts exactly one `Transfer-Encoding` header whose
+/// value is `chunked`, and answers anything else with 501 Unsupported
 /// Transfer-Encoding; per RFC 7230 a chunked message's Content-Length
-/// is ignored.
+/// is ignored.  Below HTTP/1.1 the header is ignored altogether.
 enum BodyFraming {
     /// No Transfer-Encoding: the Content-Length declares the body.
     Length,
@@ -2752,6 +4348,13 @@ enum BodyFraming {
 }
 
 fn body_framing(head: &HttpHead) -> BodyFraming {
+    // Go deletes the header unread for an HTTP/1.0 (or older) request
+    // -- "Issue 12785; ignore Transfer-Encoding on HTTP/1.0 requests"
+    // (`net/http/transfer.go:639-649`) -- so its body is framed by the
+    // Content-Length alone, whatever the header said.
+    if head.version < (1, 1) {
+        return BodyFraming::Length;
+    }
     // A repeat is `unsupportedTEError` in Go before the values are
     // even looked at (`transfer.go` `parseTransferEncoding`: `if
     // len(raw) != 1`), so two copies are 501 even when both say
@@ -2760,9 +4363,12 @@ fn body_framing(head: &HttpHead) -> BodyFraming {
     if head.transfer_encoding_repeated {
         return BodyFraming::Unsupported;
     }
+    // `ascii.EqualFold` over the value as stored, untrimmed
+    // (`transfer.go:658`): the trailing space a blank continuation line
+    // leaves, or a non-ASCII space, is not `chunked`.
     match head.transfer_encoding.as_deref() {
         None => BodyFraming::Length,
-        Some(value) if value.trim().eq_ignore_ascii_case("chunked") => BodyFraming::Chunked,
+        Some(value) if value.eq_ignore_ascii_case("chunked") => BodyFraming::Chunked,
         Some(_) => BodyFraming::Unsupported,
     }
 }
@@ -2802,7 +4408,8 @@ fn drain_declared_body<S: Read + SocketTimeout>(
 ) {
     match body_framing(head) {
         BodyFraming::Chunked => {
-            let _ = read_chunked_body(stream, deadline, POST_RESPONSE_DRAIN_LIMIT, false);
+            let mut reader = ChunkedReader::new(stream, deadline);
+            let _ = read_chunked_body(&mut reader, POST_RESPONSE_DRAIN_LIMIT, false);
         }
         _ => {
             if head.content_length > POST_RESPONSE_DRAIN_LIMIT {
@@ -2842,18 +4449,30 @@ pub struct HttpHead {
     /// The `Origin` request header, consulted by the websocket
     /// same-origin guard (dcrd's `CheckOrigin`).
     origin: Option<String>,
-    /// The `Host` request header, the request host the `Origin` is
-    /// compared against.
+    /// The `Host` request header: Go's `Request.Host`, and so the host
+    /// the `Origin` is compared against, unless the target names one
+    /// (see `url_host`).
     host: Option<String>,
+    /// Go's `Request.Close`: whether the request asks for the
+    /// connection to close after it (see `should_close`).  It decides
+    /// whether Go's `body.Close` reads on past a `Content-Length` body
+    /// cut at the authenticated read limit.
+    close: bool,
+    /// The request's protocol version, `(ProtoMajor, ProtoMinor)`.
+    version: (u32, u32),
+    /// The first `Expect` value, `Header.get("Expect")`, which decides
+    /// between a 417 and a `100 Continue` (see `serve_rpc_connection`).
+    expect: Option<String>,
+    /// The host an absolute-form target names, `URL.Host` unescaped --
+    /// bytes, since an escape may decode to anything above 0x7f.  Go
+    /// takes it as `Request.Host` over the `Host` header whenever it is
+    /// non-empty (`request.go:1165-1175`).
+    url_host: Vec<u8>,
 }
 
 /// The largest request head accepted, bounding an abusive client.
 const MAX_HEAD_SIZE: usize = 1 << 13;
 
-/// Read one HTTP/1.1 request head byte by byte up to the blank-line
-/// terminator, leaving the stream positioned exactly at the body (or
-/// at the first websocket frame), so the websocket path never
-/// over-reads into frame data.
 /// Why a request head could not be served, and therefore which answer
 /// Go's connection loop gives (`net/http/server.go:2062-2101`).
 enum HeadError {
@@ -2865,13 +4484,17 @@ enum HeadError {
     /// to the bare 400.  So only a connection that never sent a byte,
     /// or one that ran out the deadline, goes unanswered.
     Unanswerable,
-    /// The head outgrew its limit: Go's `errTooLarge` answers 431
-    /// (`server.go:2067-2076`).
+    /// The head outgrew a limit -- its size, Go 1.27's count of header
+    /// values ([`MAX_HEADER_VALUES`]), or the 80 bytes textproto reads of
+    /// a first field line it refuses -- which Go's `errTooLarge` answers
+    /// 431 (`server.go:2067-2076`, `request.go:1152-1157`).
     TooLarge,
     /// A transfer encoding the server will not read, answered 501
     /// (`server.go:2078-2088`).  Go decides this inside `readTransfer`,
-    /// before it looks at the protocol version, so a head that is both
-    /// mis-framed and mis-versioned is a 501 rather than a 505.
+    /// before the protocol version gate, but only for HTTP/1.1 and later:
+    /// below that the header is ignored (`transfer.go:646-649`).  So a
+    /// mis-framed HTTP/2.0 head is a 501 rather than a 505, while a
+    /// mis-framed HTTP/0.9 one is the 505.
     UnsupportedTransferEncoding,
     /// Go's `statusError`: the reason is rendered into the status line
     /// *and* repeated as the body (`server.go:2094-2096`).
@@ -2928,7 +4551,9 @@ enum Route {
     /// The `/` pattern, which catches every other rooted path.
     JsonRpc,
     /// Cleaning changed the path, so the mux answers a redirect itself
-    /// rather than running either handler.
+    /// rather than running either handler.  This is the URL
+    /// `http.Redirect` is handed, the cleaned path and the query, before
+    /// `hexEscapeNonASCII` makes a `Location` of it.
     Redirect(String),
     /// The asterisk target, answered before a pattern is consulted.
     Asterisk,
@@ -3139,7 +4764,7 @@ fn route(head: &HttpHead) -> Route {
                 }
                 _ => {}
             }
-            return Route::Redirect(hex_escape_non_ascii(&location));
+            return Route::Redirect(location);
         }
     }
     // Both patterns are rooted, so an empty path matches neither.
@@ -3152,55 +4777,460 @@ fn route(head: &HttpHead) -> Route {
     }
 }
 
-/// Split a request target into the escaped path the mux works on and
-/// the query, the way `url.ParseRequestURI` does for the forms a server
-/// sees.
+/// A request target as the server holds it after `url.ParseRequestURI`.
+struct RequestTarget {
+    /// The escaped path the mux works on (`URL.EscapedPath()`).
+    path: String,
+    /// Everything after the first `?`, verbatim, carried only so a
+    /// redirect can put it back.
+    query: Option<String>,
+    /// `URL.Host`, unescaped: the authority an absolute-form or CONNECT
+    /// target names, empty for an origin-form one.
+    host: Vec<u8>,
+}
+
+/// Parse a request target the way `readRequest` does
+/// (`net/http/request.go:1137-1149`): through `url.ParseRequestURI`,
+/// except that a CONNECT target not rooted at `/` is authority form,
+/// parsed as `http://` + target with the scheme dropped again.  So
+/// `CONNECT h:443` has an empty path, while `CONNECT h/ws` has `/ws`.
 ///
-/// Returns `None` for a target Go rejects outright with a 400: one that
-/// is empty, one in origin form that does not begin with a slash, or
-/// one whose path carries a malformed percent escape.
+/// Returns `None` for a target Go rejects outright with a 400.
 ///
 /// The fragment is deliberately not split off.  A request target has no
 /// fragment -- Go leaves a `#` in the path, so `/ws#f` matches neither
 /// pattern -- and treating one as a delimiter would route a target dcrd
 /// sends to the catch-all straight into the websocket handler.
-fn split_request_target(method: &str, target: &str) -> Option<(String, Option<String>)> {
-    if target.is_empty() {
-        return None;
-    }
+fn parse_request_target(method: &str, target: &str) -> Option<RequestTarget> {
     if target == "*" {
-        return Some((String::new(), None));
+        return Some(RequestTarget {
+            path: String::new(),
+            query: None,
+            host: Vec::new(),
+        });
     }
-    // Absolute form: drop scheme and authority, keeping the path that
-    // follows.  A URL with no path at all has an empty one, which
-    // cleans to "/" and therefore redirects.
-    let rest = if target.starts_with('/') {
-        // Origin form.  A target beginning with a slash is never read
-        // as absolute, so `/://ws` is a path that cleans to `/:/ws`
-        // rather than a URL with an empty authority.
-        target
-    } else if let Some((_scheme, after)) = target.split_once("://") {
-        // Absolute form: drop scheme and authority, keep the path.  A
-        // URL with no path has an empty one, which cleans to `/` and so
-        // redirects.
-        match after.find('/') {
-            Some(slash) => &after[slash..],
-            None => "",
-        }
-    } else if method == "CONNECT" {
-        // Authority form, legal only for CONNECT.  It leaves the path
-        // empty rather than failing the parse, and nothing rooted can
-        // match it.
-        return Some((String::new(), None));
+    let url = if method == "CONNECT" && !target.starts_with('/') {
+        go_url_parse(&format!("http://{target}"), true)?
     } else {
-        // Neither rooted nor absolute: not a request target at all.
+        go_url_parse(target, true)?
+    };
+    Some(RequestTarget {
+        path: escaped_path(&url.raw_path)?,
+        query: url.query,
+        host: url.host,
+    })
+}
+
+/// [`parse_request_target`]'s path and query, the shape the routing
+/// tests drive.
+#[cfg(test)]
+fn split_request_target(method: &str, target: &str) -> Option<(String, Option<String>)> {
+    parse_request_target(method, target).map(|target| (target.path, target.query))
+}
+
+/// The parts of a Go `url.URL` the RPC server consults.
+struct GoUrl {
+    /// `Scheme`, lower-cased; empty when there is none.
+    scheme: String,
+    /// `Host`, unescaped, port included.
+    host: Vec<u8>,
+    /// `Path`, unescaped.  Empty for an opaque URL.
+    path: Vec<u8>,
+    /// The escaped path as it arrived, `setPath`'s input.
+    raw_path: String,
+    /// `RawQuery`, `None` when there was no `?`.
+    query: Option<String>,
+}
+
+/// `net/url`'s `parse` (`url.go:432-510`, Go 1.27).  `via_request`
+/// is its `viaRequest`: `ParseRequestURI` allows only an absolute URL
+/// or a rooted path, `Parse` any reference.
+fn go_url_parse(raw: &str, via_request: bool) -> Option<GoUrl> {
+    // `stringContainsCTLByte`: any ASCII control byte, DEL included.
+    if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return None;
+    }
+    if raw.is_empty() && via_request {
+        return None;
+    }
+    if raw == "*" {
+        return Some(GoUrl {
+            scheme: String::new(),
+            host: Vec::new(),
+            path: b"*".to_vec(),
+            raw_path: "*".to_string(),
+            query: None,
+        });
+    }
+    let (scheme, rest) = go_url_scheme(raw)?;
+    let scheme = scheme.to_ascii_lowercase();
+    // A lone trailing `?` is `ForceQuery` with an empty query; otherwise
+    // the query starts at the first `?`.
+    let (rest, query) = if rest.ends_with('?') && rest.matches('?').count() == 1 {
+        (rest.strip_suffix('?').unwrap_or(rest), Some(String::new()))
+    } else {
+        match rest.split_once('?') {
+            Some((rest, query)) => (rest, Some(query.to_string())),
+            None => (rest, None),
+        }
     };
-    let (path, query) = match rest.split_once('?') {
-        Some((path, query)) => (path, Some(query.to_string())),
-        None => (rest, None),
+    if !rest.starts_with('/') {
+        if !scheme.is_empty() {
+            // A rootless path after a scheme is opaque: no host, and an
+            // empty `Path`, which the mux cleans to `/`.
+            return Some(GoUrl {
+                scheme,
+                host: Vec::new(),
+                path: Vec::new(),
+                raw_path: String::new(),
+                query,
+            });
+        }
+        if via_request {
+            return None;
+        }
+        // A relative path's first segment cannot hold a colon.
+        if rest.split('/').next().unwrap_or_default().contains(':') {
+            return None;
+        }
+    }
+    let mut host = Vec::new();
+    let mut rest = rest;
+    if (!scheme.is_empty() || !via_request && !rest.starts_with("///")) && rest.starts_with("//") {
+        let after = rest.get(2..).unwrap_or_default();
+        let (authority, path) = match after.find('/') {
+            Some(slash) => after.split_at(slash),
+            None => (after, ""),
+        };
+        host = go_parse_authority(&scheme, authority)?;
+        rest = path;
+    }
+    // `setPath`: the escapes must be well formed.
+    let path = go_unescape(rest, GoEscape::Path)?;
+    Some(GoUrl {
+        scheme,
+        host,
+        path,
+        raw_path: rest.to_string(),
+        query,
+    })
+}
+
+/// `url.Parse` (`url.go:399-414`): [`go_url_parse`] of everything
+/// before the first `#`, with the fragment's escapes checked too.
+fn go_url_parse_reference(raw: &str) -> Option<GoUrl> {
+    let (url, fragment) = raw.split_once('#').unwrap_or((raw, ""));
+    let parsed = go_url_parse(url, false)?;
+    if !fragment.is_empty() {
+        go_unescape(fragment, GoEscape::Fragment)?;
+    }
+    Some(parsed)
+}
+
+/// `getScheme` (`url.go:369-392`): a letter, then letters, digits, `+`,
+/// `-` or `.`, up to a colon.  Anything else before a colon means there
+/// is no scheme at all; a colon in first place is an error.
+fn go_url_scheme(raw: &str) -> Option<(&str, &str)> {
+    for (i, c) in raw.bytes().enumerate() {
+        if c.is_ascii_alphabetic() {
+            continue;
+        }
+        if c.is_ascii_digit() || matches!(c, b'+' | b'-' | b'.') {
+            if i == 0 {
+                return Some(("", raw));
+            }
+            continue;
+        }
+        if c == b':' {
+            if i == 0 {
+                return None;
+            }
+            return Some((raw.get(..i)?, raw.get(i.saturating_add(1)..)?));
+        }
+        return Some(("", raw));
+    }
+    Some(("", raw))
+}
+
+/// `parseAuthority` (`url.go:512-546`): the host after the last `@`,
+/// and a userinfo before it that must be well formed.
+fn go_parse_authority(scheme: &str, authority: &str) -> Option<Vec<u8>> {
+    let at = authority.rfind('@');
+    let host = go_parse_host(
+        scheme,
+        at.map_or(authority, |at| {
+            authority.get(at.saturating_add(1)..).unwrap_or_default()
+        }),
+    )?;
+    if let Some(at) = at {
+        let userinfo = authority.get(..at).unwrap_or_default();
+        if !go_valid_userinfo(userinfo) {
+            return None;
+        }
+        let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+        go_unescape(user, GoEscape::UserPassword)?;
+        go_unescape(password, GoEscape::UserPassword)?;
+    }
+    Some(host)
+}
+
+/// `parseHost` (`url.go:549-658`, Go 1.27): an IP literal in brackets
+/// must hold an IPv6 address, a port must be digits, and the escapes a
+/// host may use are only those of non-ASCII bytes (and `%25`).  With
+/// more than one colon outside brackets, http and https take the port
+/// from the first (the `urlstrictcolons` default) and every other
+/// scheme from the last.
+fn go_parse_host(scheme: &str, host: &str) -> Option<Vec<u8>> {
+    match host.rfind('[') {
+        Some(open) if open > 0 => None,
+        Some(_) => {
+            let close = host.rfind(']')?;
+            let colon_port = host.get(close.saturating_add(1)..)?;
+            if !go_valid_optional_port(colon_port) {
+                return None;
+            }
+            let colon_port = go_unescape(colon_port, GoEscape::Host)?;
+            let hostname = host.get(1..close)?;
+            let mut unescaped = match hostname.find("%25") {
+                Some(zone) => {
+                    let mut address = go_unescape(hostname.get(..zone)?, GoEscape::Host)?;
+                    address.extend(go_unescape(hostname.get(zone..)?, GoEscape::Zone)?);
+                    address
+                }
+                None => go_unescape(hostname, GoEscape::Host)?,
+            };
+            // `netip.ParseAddr`, which an IPv4 address fails here too:
+            // only IPv6 may sit in brackets.
+            if !go_parses_as_ipv6(&unescaped) {
+                return None;
+            }
+            let mut out = vec![b'['];
+            out.append(&mut unescaped);
+            out.push(b']');
+            out.extend(colon_port);
+            Some(out)
+        }
+        None => {
+            if let (Some(first), Some(last)) = (host.find(':'), host.rfind(':')) {
+                let port_at = if first != last && scheme != "http" && scheme != "https" {
+                    last
+                } else {
+                    first
+                };
+                if !go_valid_optional_port(host.get(port_at..)?) {
+                    return None;
+                }
+            }
+            go_unescape(host, GoEscape::Host)
+        }
+    }
+}
+
+/// `validOptionalPort` (`url.go:762-777`): empty, or a colon and
+/// digits.
+fn go_valid_optional_port(port: &str) -> bool {
+    port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `validUserinfo` (`url.go:1283-1315`): the unreserved and sub-delim
+/// characters, `:`, `%` and `@`, and nothing outside ASCII.
+fn go_valid_userinfo(userinfo: &str) -> bool {
+    userinfo.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '-' | '.'
+                    | '_'
+                    | ':'
+                    | '~'
+                    | '!'
+                    | '$'
+                    | '&'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '*'
+                    | '+'
+                    | ','
+                    | ';'
+                    | '='
+                    | '%'
+                    | '@'
+            )
+    })
+}
+
+/// Which part of a URL `go_unescape` is checking.
+#[derive(Clone, Copy, PartialEq)]
+enum GoEscape {
+    Path,
+    Host,
+    Zone,
+    UserPassword,
+    Fragment,
+}
+
+/// Whether a byte may appear raw in a host: `!shouldEscape(c,
+/// encodeHost)` (`net/url/gen_encoding_table.go`).
+fn go_host_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            b'!' | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'['
+                | b']'
+                | b'<'
+                | b'>'
+                | b'"'
+                | b'-'
+                | b'_'
+                | b'.'
+                | b'~'
+        )
+}
+
+/// `unescape` (`url.go:106-184`) for the modes a server parse reaches:
+/// every `%` must lead two hex digits, and in a host (or its zone) the
+/// raw bytes must be host bytes and an escape may encode only what the
+/// raw form could not carry.
+fn go_unescape(text: &str, mode: GoEscape) -> Option<Vec<u8>> {
+    let raw = text.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0usize;
+    while let Some(&byte) = raw.get(i) {
+        if byte == b'%' {
+            let high = (*raw.get(i.saturating_add(1))? as char).to_digit(16)?;
+            let low = (*raw.get(i.saturating_add(2))? as char).to_digit(16)?;
+            let decoded = u8::try_from(high.wrapping_shl(4) | low).ok()?;
+            let is_percent = decoded == b'%';
+            if mode == GoEscape::Host && high < 8 && !is_percent {
+                return None;
+            }
+            if mode == GoEscape::Zone && !is_percent && decoded != b' ' && !go_host_byte(decoded) {
+                return None;
+            }
+            out.push(decoded);
+            i = i.saturating_add(3);
+            continue;
+        }
+        if matches!(mode, GoEscape::Host | GoEscape::Zone) && byte < 0x80 && !go_host_byte(byte) {
+            return None;
+        }
+        out.push(byte);
+        i = i.saturating_add(1);
+    }
+    Some(out)
+}
+
+/// Whether `netip.ParseAddr` accepts an address and it is not IPv4
+/// (`net/netip/netip.go:114-128`): the first `.`, `:` or `%` decides
+/// the family, and only the IPv6 parse can succeed here.
+fn go_parses_as_ipv6(text: &[u8]) -> bool {
+    match text.iter().find(|b| matches!(b, b'.' | b':' | b'%')) {
+        Some(b':') => go_valid_ipv6(text),
+        _ => false,
+    }
+}
+
+/// `parseIPv6` (`net/netip/netip.go:205-343`), for validity alone: up
+/// to eight groups of at most four hex digits, one `::`, an IPv4 tail
+/// only where it fits, and a non-empty zone after `%`.
+fn go_valid_ipv6(text: &[u8]) -> bool {
+    let mut s = match text.iter().position(|b| *b == b'%') {
+        Some(at) if at.saturating_add(1) == text.len() => return false,
+        Some(at) => text.get(..at).unwrap_or_default(),
+        None => text,
     };
-    Some((escaped_path(path)?, query))
+    let mut ellipsis: Option<usize> = None;
+    if let Some(rest) = s.strip_prefix(b"::") {
+        ellipsis = Some(0);
+        s = rest;
+        if s.is_empty() {
+            return true;
+        }
+    }
+    let mut i = 0usize;
+    while i < 16 {
+        let digits = s.iter().take_while(|b| b.is_ascii_hexdigit()).count();
+        if digits == 0 || digits > 4 {
+            return false;
+        }
+        let tail = s.get(digits..).unwrap_or_default();
+        if tail.first() == Some(&b'.') {
+            if ellipsis.is_none() && i != 12 {
+                return false;
+            }
+            if i.saturating_add(4) > 16 || !go_valid_ipv4(s) {
+                return false;
+            }
+            i = i.saturating_add(4);
+            s = &[];
+            break;
+        }
+        i = i.saturating_add(2);
+        s = tail;
+        let Some((&first, after)) = s.split_first() else {
+            break;
+        };
+        if first != b':' || after.is_empty() {
+            return false;
+        }
+        s = after;
+        if let Some(after) = s.strip_prefix(b":") {
+            if ellipsis.is_some() {
+                return false;
+            }
+            ellipsis = Some(i);
+            s = after;
+            if s.is_empty() {
+                break;
+            }
+        }
+    }
+    if !s.is_empty() {
+        return false;
+    }
+    if i < 16 {
+        ellipsis.is_some()
+    } else {
+        ellipsis.is_none()
+    }
+}
+
+/// `parseIPv4Fields` (`net/netip/netip.go:154-192`), for validity
+/// alone: four dot-separated decimal octets, none above 255 and none
+/// with a leading zero.
+fn go_valid_ipv4(text: &[u8]) -> bool {
+    let mut octets = 0usize;
+    for (i, field) in text.split(|b| *b == b'.').enumerate() {
+        if i > 3 || field.is_empty() || !field.iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        if field.len() > 1 && field.first() == Some(&b'0') {
+            return false;
+        }
+        let value = field.iter().try_fold(0u32, |acc, b| {
+            acc.checked_mul(10)?.checked_add((*b as char).to_digit(10)?)
+        });
+        if value.is_none_or(|value| value > 255) {
+            return false;
+        }
+        octets = i.saturating_add(1);
+    }
+    octets == 4
 }
 
 /// Parse an HTTP version token exactly as Go's `ParseHTTPVersion` does
@@ -3220,6 +5250,10 @@ fn parse_http_version(text: &str) -> Option<(u32, u32)> {
     Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
+/// Read one HTTP/1.1 request head byte by byte up to the blank-line
+/// terminator, leaving the stream positioned exactly at the body (or
+/// at the first websocket frame), so the websocket path never
+/// over-reads into frame data.
 fn read_http_head<S: Read + SocketTimeout>(
     stream: &mut S,
     deadline: Instant,
@@ -3239,7 +5273,11 @@ fn read_http_head<S: Read + SocketTimeout>(
             ByteRead::Closed => return Err(HeadError::Malformed),
         }
         raw.push(byte[0]);
-        if raw.ends_with(b"\r\n\r\n") {
+        // Go reads the head a line at a time through `bufio.ReadLine`
+        // (`net/textproto/reader.go:60-81`), which ends a line at a
+        // newline whether or not a CR precedes it, so a bare LF ends a
+        // line and the blank line that ends the head as well as CRLF.
+        if raw.ends_with(b"\n\n") || raw.ends_with(b"\n\r\n") {
             break;
         }
         if raw.len() > MAX_HEAD_SIZE {
@@ -3247,7 +5285,12 @@ fn read_http_head<S: Read + SocketTimeout>(
         }
     }
     let text = core::str::from_utf8(&raw).map_err(|_| HeadError::Malformed)?;
-    let mut lines = text.split("\r\n");
+    // `ReadLine` strips the newline and one CR before it, and no more: a
+    // CR anywhere else stays in the line, where the request-line and
+    // field-value checks below refuse it as Go's do.
+    let mut lines = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line));
     let request_line = lines.next().unwrap_or("");
     // Go cuts the request line at exactly two spaces and hands the
     // whole remainder to `ParseHTTPVersion` (`request.go:1037-1044`), so
@@ -3268,10 +5311,10 @@ fn read_http_head<S: Read + SocketTimeout>(
     }
     // `url.ParseRequestURI` accepts an origin-form path, an
     // absolute-form URL, or the asterisk; anything else -- an empty
-    // target, or one that does not begin with a slash -- is a 400
-    // before routing, as is a malformed percent escape anywhere in the
-    // path.
-    let (path, query) = split_request_target(&method, &target).ok_or(HeadError::Malformed)?;
+    // target, a control byte, a scheme-less target that does not begin
+    // with a slash, a malformed authority or percent escape -- is a 400
+    // before routing.
+    let request_target = parse_request_target(&method, &target).ok_or(HeadError::Malformed)?;
     // Go parses the version while splitting the request line, and an
     // unparseable one is a plain 400 like any other malformed head.
     let Some(version) = parse_http_version(version_token) else {
@@ -3281,8 +5324,8 @@ fn read_http_head<S: Read + SocketTimeout>(
     let mut head = HttpHead {
         method,
         target,
-        path,
-        query,
+        path: request_target.path,
+        query: request_target.query,
         authorization: None,
         content_length: 0,
         transfer_encoding: None,
@@ -3293,6 +5336,10 @@ fn read_http_head<S: Read + SocketTimeout>(
         sec_websocket_version: Vec::new(),
         origin: None,
         host: None,
+        close: false,
+        version,
+        expect: None,
+        url_host: request_target.host,
     };
     // Go decides both framing headers over its whole header map after
     // reading, not header-by-header, and rejects a disagreement
@@ -3300,121 +5347,200 @@ fn read_http_head<S: Read + SocketTimeout>(
     // classic request-smuggling primitive.  `Content-Length` is
     // therefore held as the first spelling seen and compared against
     // every later copy (`net/http/transfer.go` `fixLength`).
-    let mut content_length: Option<&str> = None;
+    let mut content_length: Option<String> = None;
     let mut content_length_conflict = false;
-    for line in lines {
-        if line.is_empty() {
-            break;
+    // What Go checks only once the whole header map is read
+    // (`request.go:1161-1163`, `server.go:1070-1080`), recorded here and
+    // applied below in its order, so that a later field textproto
+    // refuses, or the value cap, outranks them.
+    let mut host_repeated = false;
+    let mut invalid_name = false;
+    // The `Trailer` values, which `fixTrailer` vets for a chunked body.
+    let mut trailer: Vec<String> = Vec::new();
+    // For `isH2Upgrade`: the values that survive `readTransfer`'s
+    // deletions whatever the framing, and whether a `Content-Length` or
+    // `Trailer` arrived, which it deletes only for a chunked body.
+    let mut kept_values = 0usize;
+    let mut chunked_only_values = false;
+    let mut values = 0usize;
+    // The field lines, up to the blank line that ends the head.
+    let mut lines = lines.take_while(|line| !line.is_empty()).peekable();
+    // `readMIMEHeader` refuses a first field line that begins with a
+    // space or tab before reading any field, and reads that line under
+    // an 80-byte limit so it can quote it: a longer one overruns the
+    // limit as textproto's "message too large", which `readRequestLimit`
+    // turns into the 431 (`net/textproto/reader.go:544-552`, `:60-81`;
+    // `net/http/request.go:1152-1157`).
+    if let Some(first) = lines.peek()
+        && first.starts_with([' ', '\t'])
+    {
+        return Err(if first.len() > 80 {
+            HeadError::TooLarge
+        } else {
+            HeadError::Malformed
+        });
+    }
+    while let Some(first) = lines.next() {
+        // `readContinuedLineSlice` with `mustHaveFieldNameColon`
+        // (`reader.go:136-188`, `:617-622`): the field's first line must
+        // hold the colon, and a line with none is refused whole rather
+        // than skipped.  Every later line that begins with a space or tab
+        // continues the field (obs-fold): each line is trimmed of spaces
+        // and tabs at both ends -- nothing else, so a stray CR or other
+        // control byte stays and is refused below -- and the lines are
+        // joined with one space.
+        if !first.contains(':') {
+            return Err(HeadError::Malformed);
         }
-        // A line with no colon is not a header, and Go refuses the
-        // whole request rather than skipping it.
-        let Some((name, value)) = line.split_once(':') else {
+        let mut field = first.trim_matches([' ', '\t']).to_string();
+        while let Some(more) = lines.next_if(|line| line.starts_with([' ', '\t'])) {
+            field.push(' ');
+            field.push_str(more.trim_matches([' ', '\t']));
+        }
+        let Some((name, value)) = field.split_once(':') else {
             return Err(HeadError::Malformed);
         };
-        {
-            let value = value.trim();
-            // The field name must be a token.  A space in it is the one
-            // byte that reaches Go's own check and answers with its
-            // reason; every other non-token byte is refused a step
-            // earlier, by the MIME reader, with a bare 400.  Both
-            // classes were enumerated byte by byte against a real
-            // server.
-            if !name.bytes().all(is_token_octet) {
-                if name.contains(' ') {
-                    return Err(HeadError::Status("400 Bad Request", "invalid header name"));
-                }
-                return Err(HeadError::Malformed);
+        // `canonicalMIMEHeaderKey` (`reader.go:755-775`): the name must
+        // be a non-empty run of token bytes, a space tolerated; any other
+        // byte is a bare 400.  `validHeaderValueByte`: no control byte in
+        // the value but the tab.  Both classes were enumerated byte by
+        // byte against a real server.
+        if name.is_empty() || !name.bytes().all(|b| is_token_octet(b) || b == b' ') {
+            return Err(HeadError::Malformed);
+        }
+        if value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+            return Err(HeadError::Malformed);
+        }
+        // Counted once the field is known good, as `readMIMEHeader`
+        // counts it (`reader.go:575-578`).
+        values = values.saturating_add(1);
+        if values > MAX_HEADER_VALUES {
+            return Err(HeadError::TooLarge);
+        }
+        // The value as Go stores it: its leading spaces and tabs
+        // skipped.  Its trailing ones went with each line's trim, save
+        // the space a blank continuation line leaves.
+        let value = value.trim_start_matches([' ', '\t']);
+        // A space in the name passes textproto, which stores the field
+        // uncanonicalized -- so it matches none of the names below --
+        // and is refused by the server once the map is read.
+        if name.contains(' ') {
+            invalid_name = true;
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            // Keeping the first copy mirrors Go's `raw[0]`; the
+            // repeat itself is what decides the request, in
+            // `body_framing`.
+            if head.transfer_encoding.is_some() {
+                head.transfer_encoding_repeated = true;
+            } else {
+                head.transfer_encoding = Some(value.to_string());
             }
-            // Field values carry no control bytes; a tab is the one
-            // exception, being ordinary linear whitespace.
-            if value.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f) {
-                return Err(HeadError::Malformed);
+            continue;
+        }
+        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("trailer") {
+            chunked_only_values = true;
+        } else {
+            kept_values = kept_values.saturating_add(1);
+        }
+        if name.eq_ignore_ascii_case("authorization") {
+            // Go's header map keeps every occurrence in arrival
+            // order and dcrd authenticates against `authhdr[0]`
+            // (`rpcserver.go:5525-5536`), so a duplicate header
+            // never displaces the first.  Overwriting here would
+            // hand the decision to whichever copy arrived last --
+            // behind a reverse proxy that injects its own
+            // Authorization header, the opposite of dcrd's answer.
+            if head.authorization.is_none() {
+                head.authorization = Some(value.to_string());
             }
-            if name.eq_ignore_ascii_case("authorization") {
-                // Go's header map keeps every occurrence in arrival
-                // order and dcrd authenticates against `authhdr[0]`
-                // (`rpcserver.go:5525-5536`), so a duplicate header
-                // never displaces the first.  Overwriting here would
-                // hand the decision to whichever copy arrived last --
-                // behind a reverse proxy that injects its own
-                // Authorization header, the opposite of dcrd's answer.
-                if head.authorization.is_none() {
-                    head.authorization = Some(value.to_string());
-                }
-            } else if name.eq_ignore_ascii_case("content-length") {
-                // `fixLength` compares the *trimmed strings*, so `5`
-                // and `05` conflict and answer 400 while two identical
-                // spellings are simply deduplicated.  Comparing parsed
-                // numbers instead would accept a pair dcrd rejects.
-                match content_length {
-                    None => content_length = Some(value),
-                    // Recorded rather than returned: `readTransfer`
-                    // parses the transfer encoding before it calls
-                    // `fixLength`, so a 501 outranks this 400.
-                    Some(first) if first != value => content_length_conflict = true,
-                    Some(_) => {}
-                }
-            } else if name.eq_ignore_ascii_case("transfer-encoding") {
-                // Keeping the first copy mirrors Go's `raw[0]`; the
-                // repeat itself is what decides the request, in
-                // `body_framing`.
-                if head.transfer_encoding.is_some() {
-                    head.transfer_encoding_repeated = true;
-                } else {
-                    head.transfer_encoding = Some(value.to_string());
-                }
-            } else if name.eq_ignore_ascii_case("upgrade") {
-                head.upgrade.push(value.to_string());
-            } else if name.eq_ignore_ascii_case("connection") {
-                head.connection.push(value.to_string());
-            } else if name.eq_ignore_ascii_case("sec-websocket-key") {
-                // `Header.Get` returns the first copy, and gorilla
-                // reads the key through it (`server.go:157`).
-                if head.sec_websocket_key.is_none() {
-                    head.sec_websocket_key = Some(value.to_string());
-                }
-            } else if name.eq_ignore_ascii_case("sec-websocket-version") {
-                head.sec_websocket_version.push(value.to_string());
-            } else if name.eq_ignore_ascii_case("origin") {
-                // dcrd's `CheckOrigin` reads `r.Header["Origin"][0]`
-                // (`rpcserver.go:5975-5982`), so a decoy first copy is
-                // the one that decides -- taking the last would let a
-                // cross-origin page slip a permitted value in behind
-                // it and open a websocket dcrd answers 403 to.
-                if head.origin.is_none() {
-                    head.origin = Some(value.to_string());
-                }
-            } else if name.eq_ignore_ascii_case("host") {
-                // Go refuses a second Host outright
-                // (`request.go:1160-1162`).
-                if head.host.is_some() {
-                    return Err(HeadError::Malformed);
-                }
-                // And it holds the host itself to a narrower set than a
-                // header value generally -- also enumerated by probe.
-                if !value.bytes().all(is_host_byte) {
-                    return Err(HeadError::Status(
-                        "400 Bad Request",
-                        "malformed Host header",
-                    ));
-                }
+        } else if name.eq_ignore_ascii_case("content-length") {
+            // `fixLength` compares the *trimmed strings*
+            // (`textproto.TrimString`), so `5` and `05` conflict and
+            // answer 400 while two identical spellings are simply
+            // deduplicated.  Comparing parsed numbers instead would
+            // accept a pair dcrd rejects.
+            let value = value.trim_matches([' ', '\t']);
+            match content_length.as_deref() {
+                None => content_length = Some(value.to_string()),
+                // Recorded rather than returned: `readTransfer`
+                // parses the transfer encoding before it calls
+                // `fixLength`, so a 501 outranks this 400.
+                Some(first) if first != value => content_length_conflict = true,
+                Some(_) => {}
+            }
+        } else if name.eq_ignore_ascii_case("trailer") {
+            trailer.push(value.to_string());
+        } else if name.eq_ignore_ascii_case("expect") {
+            // `Header.get` returns the first copy (`server.go:2106`,
+            // `:2113`).
+            if head.expect.is_none() {
+                head.expect = Some(value.to_string());
+            }
+        } else if name.eq_ignore_ascii_case("upgrade") {
+            head.upgrade.push(value.to_string());
+        } else if name.eq_ignore_ascii_case("connection") {
+            head.connection.push(value.to_string());
+        } else if name.eq_ignore_ascii_case("sec-websocket-key") {
+            // `Header.Get` returns the first copy, and gorilla
+            // reads the key through it (`server.go:157`).
+            if head.sec_websocket_key.is_none() {
+                head.sec_websocket_key = Some(value.to_string());
+            }
+        } else if name.eq_ignore_ascii_case("sec-websocket-version") {
+            head.sec_websocket_version.push(value.to_string());
+        } else if name.eq_ignore_ascii_case("origin") {
+            // dcrd's `CheckOrigin` reads `r.Header["Origin"][0]`
+            // (`rpcserver.go:5975-5982`), so a decoy first copy is
+            // the one that decides -- taking the last would let a
+            // cross-origin page slip a permitted value in behind
+            // it and open a websocket dcrd answers 403 to.
+            if head.origin.is_none() {
+                head.origin = Some(value.to_string());
+            }
+        } else if name.eq_ignore_ascii_case("host") {
+            if head.host.is_some() {
+                host_repeated = true;
+            } else {
                 head.host = Some(value.to_string());
             }
         }
     }
     // From here the order is Go's, and it is observable whenever a head
-    // is wrong in more than one way: `readRequest` runs `readTransfer`
-    // -- transfer encoding, then content length -- before the version
-    // gate at `server.go:1062`, and the Host checks after it at
-    // `:1069-1073`.
-    if matches!(body_framing(&head), BodyFraming::Unsupported) {
+    // is wrong in more than one way.  `readRequestLimit` refuses a
+    // second Host (`request.go:1161-1163`) and then runs `readTransfer`
+    // -- transfer encoding, content length, then the trailer keys
+    // (`transfer.go:534-557`) -- before `conn.readRequest`'s version
+    // gate (`server.go:1062`) and its Host and field-name checks
+    // (`:1070-1080`).
+    if host_repeated {
+        return Err(HeadError::Malformed);
+    }
+    let framing = body_framing(&head);
+    if matches!(framing, BodyFraming::Unsupported) {
         return Err(HeadError::UnsupportedTransferEncoding);
     }
     if content_length_conflict {
         return Err(HeadError::Malformed);
     }
     if let Some(value) = content_length {
-        head.content_length = parse_content_length(value).map_err(|_| HeadError::Malformed)?;
+        head.content_length = parse_content_length(&value).map_err(|_| HeadError::Malformed)?;
+    }
+    // `fixTrailer` (`transfer.go:775-814`) vets a chunked body's
+    // announced trailer: each comma-separated element, trimmed, must not
+    // name a framing field.  Without chunking the header is left alone.
+    let chunked = matches!(framing, BodyFraming::Chunked);
+    if chunked
+        && trailer.iter().any(|value| {
+            value.split(',').any(|key| {
+                let key = key.trim_matches([' ', '\t']);
+                ["transfer-encoding", "trailer", "content-length"]
+                    .iter()
+                    .any(|framing| key.eq_ignore_ascii_case(framing))
+            })
+        })
+    {
+        return Err(HeadError::Malformed);
     }
     // Every HTTP/1.x is served; the one exception past that is the
     // `PRI * HTTP/2.0` preface, which Go admits so a handler can run
@@ -3429,14 +5555,70 @@ fn read_http_head<S: Read + SocketTimeout>(
             ));
         }
     }
-    // HTTP/1.1 must name a host; HTTP/1.0 need not.
-    if version >= (1, 1) && head.host.is_none() && head.method != "CONNECT" {
+    // HTTP/1.1 must name a host; HTTP/1.0 need not, and neither does
+    // CONNECT or the bare HTTP/2 preface.  `isH2Upgrade`
+    // (`request.go:534-536`) asks for no header field at all once
+    // `readTransfer` has deleted `Transfer-Encoding` and, for a chunked
+    // body, `Content-Length` and `Trailer`.
+    let h2_upgrade = head.method == "PRI"
+        && head.target == "*"
+        && version == (2, 0)
+        && kept_values == 0
+        && (chunked || !chunked_only_values);
+    if version >= (1, 1) && head.host.is_none() && head.method != "CONNECT" && !h2_upgrade {
         return Err(HeadError::Status(
             "400 Bad Request",
             "missing required Host header",
         ));
     }
+    // Go holds the one Host to a narrower set than a header value
+    // generally (`httpguts.ValidHostHeader`), enumerated by probe.
+    if head
+        .host
+        .as_deref()
+        .is_some_and(|host| !host.bytes().all(is_host_byte))
+    {
+        return Err(HeadError::Status(
+            "400 Bad Request",
+            "malformed Host header",
+        ));
+    }
+    if invalid_name {
+        return Err(HeadError::Status("400 Bad Request", "invalid header name"));
+    }
+    head.close = should_close(version, &head.connection);
     Ok(head)
+}
+
+/// Go's `shouldClose` as `readRequest` applies it to set
+/// `Request.Close` (`net/http/transfer.go:756-772`,
+/// `request.go:1179`): below HTTP/1 always, HTTP/1.0 unless the
+/// `Connection` header lists `keep-alive`, and otherwise when it lists
+/// `close`.
+fn should_close(version: (u32, u32), connection: &[String]) -> bool {
+    if version.0 < 1 {
+        return true;
+    }
+    let has_close = header_values_contain_token(connection, "close");
+    if version == (1, 0) {
+        return has_close || !header_values_contain_token(connection, "keep-alive");
+    }
+    has_close
+}
+
+/// httpguts' `HeaderValuesContainsToken`, the list test `shouldClose`
+/// makes: each copy split at every comma, each element trimmed of
+/// spaces and tabs and compared ASCII case-insensitively.  Looser than
+/// gorilla's `tokenListContainsValue` (see `header_has_token`), so
+/// `keep-alive;q=1, close` does list `close` here.
+fn header_values_contain_token(values: &[String], token: &str) -> bool {
+    values.iter().any(|value| {
+        value.split(',').any(|element| {
+            element
+                .trim_matches([' ', '\t'])
+                .eq_ignore_ascii_case(token)
+        })
+    })
 }
 
 impl HttpHead {
@@ -3531,48 +5713,98 @@ fn is_token_octet(b: u8) -> bool {
         | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
 }
 
-/// Whether a websocket upgrade's `Origin` header is allowed, mirroring
-/// dcrd's `CheckOrigin` (rpcserver.go): a missing or empty `Origin` is
-/// allowed (non-browser clients such as dcrctl send none), a `null`
-/// origin or a `file://` scheme is allowed (sandboxed/local pages), and
-/// any other origin must match the request `Host` after stripping the
-/// port and folding ASCII case; a malformed origin is rejected.  This
-/// blocks a cross-origin web page (or a DNS-rebinding attack against a
-/// `--notls` localhost RPC) from opening a websocket.
+/// Whether a websocket upgrade's `Origin` header is allowed: dcrd's
+/// `CheckOrigin` (`rpcserver.go:5973-6007`), which parses the first
+/// `Origin` copy with `url.Parse`.
+///
+/// Only a *missing* header is allowed outright (dcrctl and other
+/// non-browser clients send none); an empty value parses to an empty
+/// URL whose host must then match.  A value `url.Parse` refuses -- a bad
+/// escape anywhere, the fragment included, or a malformed authority --
+/// is rejected.  A `file` scheme, or a URL whose unescaped path is
+/// `null` (so `null?x` too), is allowed.  Anything else must name the
+/// request's host, ports stripped when `net.SplitHostPort` can and
+/// ASCII case folded.  The request's host is Go's `Request.Host`: the
+/// absolute-form target's host when it names one, the `Host` header
+/// otherwise, and empty without either.
+///
+/// This refuses a cross-origin page running in a browser.  It does not
+/// stop DNS rebinding, in dcrd or here: a rebinding page's `Origin` and
+/// `Host` both carry the attacker's name, so they match, and only
+/// authentication stands in the way.
 pub(crate) fn check_origin(head: &HttpHead) -> bool {
     let Some(origin) = head.origin.as_deref() else {
         return true;
     };
-    if origin.is_empty() || origin == "null" {
-        return true;
-    }
-    let Some((scheme, authority_and_path)) = origin.split_once("://") else {
+    let Some(origin_url) = go_url_parse_reference(origin) else {
         return false;
     };
-    if scheme.eq_ignore_ascii_case("file") {
+    if origin_url.scheme == "file" || origin_url.path == b"null" {
         return true;
     }
-    // The authority is everything up to the first path/query/fragment
-    // delimiter; drop any `userinfo@` before the host, as `url.Parse` does.
-    let authority = authority_and_path
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("");
-    let origin_host_port = authority.rsplit('@').next().unwrap_or(authority);
-    let Some(request_host_port) = head.host.as_deref() else {
-        return false;
+    let request_host = if head.url_host.is_empty() {
+        head.host.as_deref().unwrap_or_default().as_bytes()
+    } else {
+        head.url_host.as_slice()
     };
-    strip_port(origin_host_port).eq_ignore_ascii_case(&strip_port(request_host_port))
+    equal_ascii_fold(
+        host_without_port(&origin_url.host),
+        host_without_port(request_host),
+    )
 }
 
-/// The host portion of a `host[:port]`, stripping the port when present
-/// and falling back to the whole value when it does not parse as a
-/// host-port pair (dcrd's `if host, _, err := net.SplitHostPort(...);
-/// err == nil` fallback).
-pub(crate) fn strip_port(host_port: &str) -> String {
-    crate::gostd::split_host_port(host_port)
-        .map(|(host, _)| host)
-        .unwrap_or_else(|_| host_port.to_string())
+/// The host of a `host:port` when `net.SplitHostPort` splits it, and
+/// the whole value when it does not (dcrd's `if host, _, err :=
+/// net.SplitHostPort(...); err == nil` fallback).  Over bytes, since a
+/// URL host is unescaped, and following Go's checks exactly
+/// (`net/ipsock.go` `SplitHostPort`): the port starts after the last
+/// colon, a bracketed host must close just before it, and no stray
+/// bracket may remain.
+fn host_without_port(host_port: &[u8]) -> &[u8] {
+    let Some(colon) = host_port.iter().rposition(|b| *b == b':') else {
+        return host_port;
+    };
+    let (host, skip_open, skip_close) = if host_port.first() == Some(&b'[') {
+        let Some(end) = host_port.iter().position(|b| *b == b']') else {
+            return host_port;
+        };
+        if end.saturating_add(1) != colon {
+            return host_port;
+        }
+        (
+            host_port.get(1..end).unwrap_or_default(),
+            1,
+            end.saturating_add(1),
+        )
+    } else {
+        let host = host_port.get(..colon).unwrap_or_default();
+        if host.contains(&b':') {
+            return host_port;
+        }
+        (host, 0, 0)
+    };
+    if host_port
+        .get(skip_open..)
+        .is_some_and(|rest| rest.contains(&b'['))
+        || host_port
+            .get(skip_close..)
+            .is_some_and(|rest| rest.contains(&b']'))
+    {
+        return host_port;
+    }
+    host
+}
+
+/// dcrd's `equalASCIIFold` (`rpcserver.go:5890-5913`): rune by rune as
+/// `utf8.DecodeRuneInString` decodes them -- each invalid byte its own
+/// U+FFFD, which [`dcroxide_dcrjson::gojson::coerce_utf8`] reproduces --
+/// equal when the runes match after folding ASCII upper case.
+fn equal_ascii_fold(a: &[u8], b: &[u8]) -> bool {
+    let a = dcroxide_dcrjson::gojson::coerce_utf8(a);
+    let b = dcroxide_dcrjson::gojson::coerce_utf8(b);
+    a.chars()
+        .map(|c| c.to_ascii_lowercase())
+        .eq(b.chars().map(|c| c.to_ascii_lowercase()))
 }
 
 /// Serve a single RPC connection: parse the request head, then either
@@ -3637,17 +5869,51 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
         }
     };
 
+    // Go's connection loop settles `Expect` before any handler or the
+    // mux sees the request (`server.go:2104-2116`): `100-continue`, as
+    // a token of the first copy, is honoured when the body is read
+    // (below), and any other non-empty expectation is refused with a
+    // 417 whatever the target.
+    let expects_continue = head
+        .expect
+        .as_deref()
+        .is_some_and(|expect| has_token(expect, "100-continue"));
+    if !expects_continue
+        && head
+            .expect
+            .as_deref()
+            .is_some_and(|expect| !expect.is_empty())
+    {
+        let _ = write_expectation_failed(&mut stream, &head.method, head.version);
+        // `sendExpectationFailed` ends in `finishRequest`, whose body
+        // close discards what was declared.
+        slot.mark_answered();
+        drain_declared_body(&mut stream, &head, deadline);
+        return;
+    }
+
     // dcrd's mux sends `/ws` to the websocket handler and everything
     // else to the JSON-RPC handler (`rpcserver.go:5936`, `:5961`), so
     // the path alone decides here too.  A `/ws` request that is not a
     // valid upgrade is gorilla's to refuse -- it must not fall through
     // to the RPC endpoint, which would answer a different status for
     // the same request dcrd hands to `Upgrade`.
+    //
+    // Every answer the mux gives itself is followed by the same discard
+    // of the declared body as the handlers' own error answers, since Go
+    // runs `finishRequest` after the mux's handlers exactly as after
+    // dcrd's; closing over an unread body instead resets the connection
+    // and can take the answer with it.  `OPTIONS *` is the one Go reads
+    // part of first: the global options handler takes up to 4 KiB before
+    // answering (`server.go:4164-4175`), which only moves the same
+    // discard ahead of the 200 and is not reproduced.
     let route = route(&head);
     match &route {
         // The mux answers these two itself, before either handler runs.
         Route::Redirect(location) => {
-            let _ = write_redirect(&mut stream, location);
+            let _ = write_redirect(&mut stream, &head.method, head.version, location);
+            slot.mark_answered();
+            drain_declared_body(&mut stream, &head, deadline);
             return;
         }
         Route::Asterisk => {
@@ -3657,16 +5923,26 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
             // "OPTIONS"` exactly, so a lower-case `options *` never
             // reaches it and falls through to the mux's own refusal.
             if head.method == "OPTIONS" {
-                let _ = write_empty_ok(&mut stream, "200 OK");
+                let _ = write_empty_ok(&mut stream, &head.method, head.version, "200 OK");
             } else {
                 // The mux's own refusal, which unlike the parser's
                 // carries no content type and no body.
-                let _ = write_empty_ok(&mut stream, "400 Bad Request");
+                let _ = write_empty_ok(&mut stream, &head.method, head.version, "400 Bad Request");
             }
+            slot.mark_answered();
+            drain_declared_body(&mut stream, &head, deadline);
             return;
         }
         Route::NotFound => {
-            let _ = write_handler_error(&mut stream, "404 Not Found", "404 page not found");
+            let _ = write_handler_error(
+                &mut stream,
+                &head.method,
+                head.version,
+                "404 Not Found",
+                "404 page not found",
+            );
+            slot.mark_answered();
+            drain_declared_body(&mut stream, &head, deadline);
             return;
         }
         Route::Websocket | Route::JsonRpc => {}
@@ -3680,7 +5956,9 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
         let (authed, is_admin) = match auth {
             Ok(auth) => auth,
             Err(_) => {
-                let _ = write_unauthorized(&mut stream);
+                let _ = write_unauthorized(&mut stream, &head.method, head.version);
+                slot.mark_answered();
+                drain_declared_body(&mut stream, &head, deadline);
                 return;
             }
         };
@@ -3725,9 +6003,14 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
         // `drain_declared_body`).
         let _ = write_handler_error(
             &mut stream,
+            &head.method,
+            head.version,
             "503 Service Unavailable",
             "503 Too busy.  Try again later.",
         );
+        // Answered: the pre-authentication tier may now close this
+        // connection before any other (see `PreAuthEntry::answered`).
+        slot.mark_answered();
         drain_declared_body(&mut stream, &head, deadline);
         return;
     }
@@ -3746,7 +6029,8 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
             // it does in Go: a client that declares a body and never
             // sends it is answered at once rather than waited out.
             drop(_client_guard);
-            let _ = write_unauthorized(&mut stream);
+            let _ = write_unauthorized(&mut stream, &head.method, head.version);
+            slot.mark_answered();
             drain_declared_body(&mut stream, &head, deadline);
             return;
         }
@@ -3758,27 +6042,53 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
     // handshake slot that arriving clients need.
     drop(slot);
 
-    // The read limit applies only after authentication (dcrd caps the body
-    // inside the authenticated `jsonRPCRead`), so an unauthenticated
-    // oversized request is answered 401 above, not 400.
+    // `jsonRPCRead`'s first body read is where Go's `expectContinueReader`
+    // writes the interim response (`server.go:994-1009`), and the reader
+    // is installed only for HTTP/1.1 and later with a body declared --
+    // a `Content-Length` other than zero, or chunked
+    // (`server.go:2106-2112`).  The 503 and 401 above never read, so
+    // they never send it.
+    if expects_continue && head.version >= (1, 1) && head.declares_body() {
+        let _ = stream
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .and_then(|()| stream.flush());
+    }
+
+    // The read limit applies only after authentication, inside the
+    // authenticated `jsonRPCRead`, and it is a truncation, not a
+    // rejection: dcrd reads the body through `io.LimitReader(r.Body,
+    // rpcReadLimitAuthenticated)` and never compares the declared length,
+    // so an oversized body is cut at the limit and the prefix is parsed
+    // like any other.  A valid request followed by padding is served; a
+    // document cut short is a JSON-RPC -32700 inside a 200.
+    //
+    // dcrd then calls `r.Body.Close()`, still under the server's read
+    // deadline and before it answers.  That reads on past the limit
+    // exactly when Go's `body.Close` does (`net/http/transfer.go:
+    // 993-1019`): a chunked body always, up to
+    // `maxPostHandlerReadBytes+1` more decoded bytes, and a
+    // `Content-Length` body only when the request did not ask to close
+    // and at most `maxPostHandlerReadBytes` of it remain; otherwise the
+    // remainder is left for the hijacked connection's close.  Any error
+    // there is dropped.  The watchdog stands down before that discard:
+    // when Go's read deadline ends it, the answer still goes out, where
+    // the watchdog would shut the socket both ways.  Each read of the
+    // discard still stops at the deadline; the one thing that can
+    // outlast it is a TLS record an authenticated client dribbles in,
+    // and such a client can hold the connection as long by never
+    // reading the answer.
     let body = match body_framing(&head) {
         BodyFraming::Length => {
-            if head.content_length > RPC_READ_LIMIT_AUTHENTICATED {
-                // Answer before discarding, for the same reason the
-                // pre-authentication paths do: a client that declares
-                // an oversized body and never sends it would otherwise
-                // be waited out and answered with nothing.  The declared
-                // length is above the authenticated limit and so above
-                // the discard cap, which leaves nothing to drain.
-                let _ = write_handler_error(&mut stream, "400 Bad Request", "request too large");
-                drain_declared_body(&mut stream, &head, deadline);
-                return;
-            }
             // Read the authenticated body under the same absolute
             // deadline.
-            let mut body = vec![0u8; head.content_length];
+            let mut body = vec![0u8; head.content_length.min(RPC_READ_LIMIT_AUTHENTICATED)];
             if !read_exact_by_deadline(&mut stream, &mut body, deadline) {
                 return;
+            }
+            let rest = head.content_length.saturating_sub(body.len());
+            if rest > 0 && !head.close && rest <= POST_RESPONSE_DRAIN_LIMIT {
+                watchdog.disarm();
+                drain_body(&mut stream, rest, deadline);
             }
             body
         }
@@ -3786,19 +6096,35 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
         // (Go's server decodes chunked transparently; per RFC 7230 the
         // Content-Length of a chunked message is ignored).
         BodyFraming::Chunked => {
-            match read_chunked_body(&mut stream, deadline, RPC_READ_LIMIT_AUTHENTICATED, true) {
-                ChunkedBody::Body(body) => body,
-                ChunkedBody::TooLarge => {
-                    let _ =
-                        write_handler_error(&mut stream, "400 Bad Request", "request too large");
+            let read = {
+                let mut reader = ChunkedReader::new(&mut stream, deadline);
+                match read_chunked_body(&mut reader, RPC_READ_LIMIT_AUTHENTICATED, true) {
+                    Ok(ChunkedBody::Body(body)) => Ok(body),
+                    Ok(ChunkedBody::Truncated(body, left)) => {
+                        watchdog.disarm();
+                        discard_chunked_rest(&mut reader, left);
+                        Ok(body)
+                    }
+                    // Collecting truncates at the limit instead.
+                    Ok(ChunkedBody::TooLarge) | Err(ChunkError::Io) => Err(None),
+                    Err(ChunkError::Malformed(err)) => Err(Some(err)),
+                }
+            };
+            match read {
+                Ok(body) => body,
+                // dcrd answers a body `io.ReadAll` could not read with the
+                // reader's own error (`rpcserver.go:5678-5686`).
+                Err(Some(err)) => {
+                    let _ = write_handler_error(
+                        &mut stream,
+                        &head.method,
+                        head.version,
+                        "400 Bad Request",
+                        &format!("400 error reading JSON message: {err}"),
+                    );
                     return;
                 }
-                ChunkedBody::Malformed => {
-                    let _ =
-                        write_handler_error(&mut stream, "400 Bad Request", "invalid chunked body");
-                    return;
-                }
-                ChunkedBody::Io => return,
+                Err(None) => return,
             }
         }
         // Rejected with 501 above.
@@ -3809,9 +6135,38 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
     // as dcrd's http.Server without a WriteTimeout does.
     watchdog.disarm();
 
-    let Ok(body) = String::from_utf8(body) else {
-        let _ = write_handler_error(&mut stream, "400 Bad Request", "invalid body");
-        return;
+    // dcrd hands the body to `json.Unmarshal` as it arrived
+    // (`rpcserver.go:5742`, `:5765`), so invalid UTF-8 inside a string is
+    // served, and a stray byte elsewhere is Go's syntax error, answered
+    // as either arm answers one: "1.0" for a single request, "2.0" for a
+    // body starting `[`.
+    let body = match String::from_utf8(body) {
+        Ok(body) => body,
+        Err(raw) => match dcroxide_dcrjson::gojson::unmarshal_input(raw.as_bytes()) {
+            Ok(text) => text.into_owned(),
+            Err(err) => {
+                let version = if raw.as_bytes().first() == Some(&b'[') {
+                    "2.0"
+                } else {
+                    "1.0"
+                };
+                let json_err = dcroxide_dcrjson::RPCError::new(
+                    dcroxide_dcrjson::err_rpc_parse().code,
+                    &format!("Failed to parse request: {}", err.go_message()),
+                );
+                let mut response = dcroxide_rpc::dispatch::create_marshalled_reply(
+                    version,
+                    &dcroxide_dcrjson::RpcId::Null,
+                    None,
+                    Some(&json_err),
+                )
+                .unwrap_or_default()
+                .into_bytes();
+                response.push(b'\n');
+                let _ = write_json_response(&mut stream, head.version, &response);
+                return;
+            }
+        },
     };
 
     // Arm the request's cancellation signal for the dispatch phase.
@@ -3840,7 +6195,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
     drop(cancel_scope);
     cancel_watch.disarm();
 
-    let _ = write_json_response(&mut stream, "200 OK", &response);
+    let _ = write_json_response(&mut stream, head.version, &response);
 }
 
 /// Watches for the two things that cancel an in-flight request — the
@@ -3923,10 +6278,14 @@ fn client_hung_up(sock: Option<&TcpStream>) -> bool {
 /// indifferent to what is queued ahead of it.
 ///
 /// dcrd gets this for free: it serves RPC over `tls.Listen`
-/// (`server.go:3868`), so Go's `http.Server` holds a `*tls.Conn` as its
-/// `rwc`, `connReader.backgroundRead` reads *through* TLS, a
-/// `close_notify` surfaces as `io.EOF`, and `handleReadErrorLocked`
-/// cancels the request context.
+/// (`server.go:3868`), and `jsonRPCRead` hijacks the connection -- which
+/// ends `net/http`'s own background read -- and watches it with a
+/// goroutine of its own that reads one byte *through* TLS
+/// (`rpcserver.go:5705-5727`), so a `close_notify` surfaces as `io.EOF`
+/// and cancels the request's context.  That goroutine returns without
+/// cancelling on the first byte it does read, so once a client has sent
+/// a byte past its request dcrd no longer notices it hang up; this probe
+/// keeps answering, and does.
 ///
 /// A zero timeout, so this never blocks the watchdog. `HUP` and `ERR`
 /// count too: the kernel reports them whether or not they were asked
@@ -4149,30 +6508,110 @@ impl RequestCancelWatch {
     }
 }
 
-/// Write the JSON-RPC reply, the one response that carries dcrd's
-/// `application/json` content type (set on every `/` reply at
-/// `rpcserver.go:5938`).  Error answers do not: `http.Error` resets the
-/// header to text/plain, and the connection loop never sets it at all,
-/// so they go through [`write_handler_error`] and
-/// [`write_protocol_error`] instead.
-fn write_json_response<S: Write>(stream: &mut S, status: &str, body: &[u8]) -> std::io::Result<()> {
-    let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nDate: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        http_date(),
-        body.len()
-    );
+/// Write the JSON-RPC reply the way dcrd writes it, by hand on the
+/// hijacked connection (`rpcserver.go:5858`): `httpStatusLine`'s status
+/// line, which mirrors the request's protocol so an HTTP/1.0 request is
+/// answered `HTTP/1.0 200 OK` (`:5316-5348`), then the handler's header
+/// map written by `Header.Write` -- the `Connection` and `Content-Type`
+/// the `/` handler set (`:5937-5938`), in its sorted order -- and the
+/// body.  Nothing else: no `Date` and no `Content-Length`, since no
+/// `ResponseWriter` is involved, so the body runs to the close.  It is
+/// the one response that carries dcrd's `application/json`; error
+/// answers go out through `http.Error`, which resets the type, so they
+/// use [`write_handler_error`] and [`write_protocol_error`] instead.
+fn write_json_response<S: Write>(
+    stream: &mut S,
+    version: (u32, u32),
+    body: &[u8],
+) -> std::io::Result<()> {
+    let proto = response_proto(version);
+    let header =
+        format!("{proto} 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n");
     stream.write_all(header.as_bytes())?;
     stream.write_all(body)?;
     stream.flush()
 }
 
+/// The protocol in the status line of an answer written through Go's
+/// `ResponseWriter`, which mirrors the request's: `HTTP/1.1` from 1.1
+/// on, `HTTP/1.0` below (`writeStatusLine(..., w.req.ProtoAtLeast(1,
+/// 1), ...)`, `server.go:1228`, `:1586-1600`).  The connection loop's
+/// own errors say `HTTP/1.1` whatever the request's protocol
+/// ([`write_protocol_error`]).
+fn response_proto(version: (u32, u32)) -> &'static str {
+    if version >= (1, 1) {
+        "HTTP/1.1"
+    } else {
+        "HTTP/1.0"
+    }
+}
+
+/// The `Content-Length` Go's `ResponseWriter` adds to an answer whose
+/// handler wrote no body (`chunkWriter.writeHeader`,
+/// `server.go:1382`): `0`, except on a HEAD, where no body written
+/// cannot be told from a body left out, so there is none.
+fn empty_body_length(method: &str) -> &'static str {
+    if method == "HEAD" {
+        ""
+    } else {
+        "Content-Length: 0\r\n"
+    }
+}
+
+/// Write Go's 417 for an expectation it cannot meet
+/// (`sendExpectationFailed`, `server.go:2260-2276`): through the
+/// `ResponseWriter`, so the status line follows the request's protocol
+/// and the empty body gets a `Content-Length` (but for a HEAD), with the
+/// `Connection: close` it sets first.
+fn write_expectation_failed<S: Write>(
+    stream: &mut S,
+    method: &str,
+    version: (u32, u32),
+) -> std::io::Result<()> {
+    let response = format!(
+        "{} 417 Expectation Failed\r\nConnection: close\r\nDate: {}\r\n{}\r\n",
+        response_proto(version),
+        http_date(),
+        empty_body_length(method)
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()
+}
+
+/// `net/http`'s `hasToken` (`header.go:240-274`), the test
+/// `expectsContinue` makes: the token anywhere in the value, ASCII case
+/// folded, bounded on each side by the value's end, a space, a comma or
+/// a tab.
+fn has_token(value: &str, token: &str) -> bool {
+    let value = value.as_bytes();
+    let token = token.as_bytes();
+    if token.is_empty() || token.len() > value.len() {
+        return false;
+    }
+    let boundary = |b: Option<&u8>| matches!(b, None | Some(b' ' | b',' | b'\t'));
+    (0..=value.len().saturating_sub(token.len())).any(|start| {
+        let end = start.saturating_add(token.len());
+        value
+            .get(start..end)
+            .is_some_and(|word| word.eq_ignore_ascii_case(token))
+            && (start == 0 || boundary(value.get(start.saturating_sub(1))))
+            && boundary(value.get(end))
+    })
+}
+
 /// Write dcrd's 401 with its authenticate realm (dcrd `jsonAuthFail`).
-fn write_unauthorized<S: Write>(stream: &mut S) -> std::io::Result<()> {
+fn write_unauthorized<S: Write>(
+    stream: &mut S,
+    method: &str,
+    version: (u32, u32),
+) -> std::io::Result<()> {
     // dcrd adds the challenge and then answers through `http.Error`
     // (`jsonAuthFail`, `rpcserver.go:5874-5877`), so the body, the
     // content type, and the sniffing opt-out are that helper's.
     write_handler_error_with(
         stream,
+        method,
+        version,
         "401 Unauthorized",
         "401 Unauthorized.",
         &[("WWW-Authenticate", "Basic realm=\"dcrd RPC\"")],
@@ -4195,21 +6634,45 @@ pub(crate) fn http_date() -> String {
 
 /// Write the redirect `ServeMux` sends when cleaning changed the path.
 ///
-/// `http.Redirect` with `StatusTemporaryRedirect` sets `Location`, and
-/// for a GET it also writes the little HTML body Go generates, with the
-/// target HTML-escaped inside the anchor.
-fn write_redirect<S: Write>(stream: &mut S, location: &str) -> std::io::Result<()> {
-    let escaped = location
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&#34;")
-        .replace('\'', "&#39;");
-    let body = format!("<a href=\"{escaped}\">Temporary Redirect</a>.\n\n");
+/// `http.Redirect` with `StatusTemporaryRedirect` (`server.go:2419-2471`)
+/// sets `Location` to `hexEscapeNonASCII(url)`.  Only a GET or HEAD
+/// also gets the HTML content type, and only a GET the little anchor
+/// body, built from the URL *before* hex escaping and HTML-escaped.  A
+/// HEAD therefore ends at the headers with no `Content-Length` -- Go
+/// adds one for an empty body on every method but HEAD -- and every
+/// other method gets `Content-Length: 0`.  The method is compared
+/// exactly, as Go compares it, and the status line mirrors the
+/// request's protocol.
+fn write_redirect<S: Write>(
+    stream: &mut S,
+    method: &str,
+    version: (u32, u32),
+    url: &str,
+) -> std::io::Result<()> {
+    let location = hex_escape_non_ascii(url);
+    let (content_type, body, length) = match method {
+        "GET" => {
+            let escaped = url
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&#34;")
+                .replace('\'', "&#39;");
+            let body = format!("<a href=\"{escaped}\">Temporary Redirect</a>.\n\n");
+            let length = format!("Content-Length: {}\r\n", body.len());
+            ("Content-Type: text/html; charset=utf-8\r\n", body, length)
+        }
+        "HEAD" => (
+            "Content-Type: text/html; charset=utf-8\r\n",
+            String::new(),
+            String::new(),
+        ),
+        _ => ("", String::new(), "Content-Length: 0\r\n".to_string()),
+    };
     let header = format!(
-        "HTTP/1.1 307 Temporary Redirect\r\nContent-Type: text/html; charset=utf-8\r\nLocation: {location}\r\nDate: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        http_date(),
-        body.len()
+        "{} 307 Temporary Redirect\r\n{content_type}Location: {location}\r\nDate: {}\r\n{length}Connection: close\r\n\r\n",
+        response_proto(version),
+        http_date()
     );
     stream.write_all(header.as_bytes())?;
     stream.write_all(body.as_bytes())?;
@@ -4218,11 +6681,20 @@ fn write_redirect<S: Write>(stream: &mut S, location: &str) -> std::io::Result<(
 
 /// Write a bodiless answer: the 200 Go gives `OPTIONS *` from its
 /// global options handler, and the 400 the mux gives every other
-/// asterisk request.  Neither carries a content type or a body.
-fn write_empty_ok<S: Write>(stream: &mut S, status: &str) -> std::io::Result<()> {
+/// asterisk request (`server.go:4164-4175`, `:2889-2896`).  Neither
+/// carries a content type or a body, and a `HEAD *` gets no
+/// `Content-Length` either.
+fn write_empty_ok<S: Write>(
+    stream: &mut S,
+    method: &str,
+    version: (u32, u32),
+    status: &str,
+) -> std::io::Result<()> {
     let response = format!(
-        "HTTP/1.1 {status}\r\nDate: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        http_date()
+        "{} {status}\r\nDate: {}\r\n{}Connection: close\r\n\r\n",
+        response_proto(version),
+        http_date(),
+        empty_body_length(method)
     );
     stream.write_all(response.as_bytes())?;
     stream.flush()
@@ -4250,21 +6722,32 @@ fn write_protocol_error<S: Write>(stream: &mut S, status: &str, body: &str) -> s
 /// by its `Fprintln`.  The `Content-Length` is there because the
 /// response writer buffers a body this small and fills it in, and
 /// `Connection: close` because dcrd's handlers set it on every reply
-/// (`rpcserver.go:5937`).
-fn write_handler_error<S: Write>(stream: &mut S, status: &str, body: &str) -> std::io::Result<()> {
-    write_handler_error_with(stream, status, body, &[])
+/// (`rpcserver.go:5937`).  The status line mirrors the request's
+/// protocol, and a HEAD gets the same `Content-Length` but no body: the
+/// writer measures what the handler wrote and then eats it
+/// (`server.go:377-384`, `:1382`).
+fn write_handler_error<S: Write>(
+    stream: &mut S,
+    method: &str,
+    version: (u32, u32),
+    status: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    write_handler_error_with(stream, method, version, status, body, &[])
 }
 
 /// As [`write_handler_error`], with headers a caller set on the
 /// response before calling `http.Error`.
 fn write_handler_error_with<S: Write>(
     stream: &mut S,
+    method: &str,
+    version: (u32, u32),
     status: &str,
     body: &str,
     extra: &[(&str, &str)],
 ) -> std::io::Result<()> {
     let body = format!("{body}\n");
-    let mut header = format!("HTTP/1.1 {status}\r\n");
+    let mut header = format!("{} {status}\r\n", response_proto(version));
     for (name, value) in extra {
         header.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -4274,25 +6757,20 @@ fn write_handler_error_with<S: Write>(
         body.len()
     ));
     stream.write_all(header.as_bytes())?;
-    stream.write_all(body.as_bytes())?;
+    if method != "HEAD" {
+        stream.write_all(body.as_bytes())?;
+    }
     stream.flush()
 }
 
-/// The daemon's logging subsystems, for `debuglevel`.
+/// The daemon's logging subsystems, for `debuglevel` (dcrd's
+/// `rpcLogManager`).
 ///
 /// `supported_subsystems` reached a trait default that called
 /// `unimplemented!()`, so `debuglevel show` -- an admin-credential method
 /// -- aborted the process under `panic = "abort"` (RVW-015). The list it
 /// needs has been in `logsubsys::SUBSYSTEM_IDS` all along; only the
 /// adapter was missing.
-///
-/// `parse_and_set_debug_levels` is deliberately NOT wired here. Setting
-/// levels at runtime needs mutable access to the process-wide levels, and
-/// `logging::LEVELS` is a `OnceLock` written once at startup
-/// (`logging.rs:18,23`) -- so wiring it means changing how the logger
-/// holds its state, not adding an adapter. Until that happens the trait
-/// default returns the unwired-seam error, which surfaces to the caller
-/// as an invalid-parameter response rather than stopping the node.
 pub struct NodeRpcLogManager;
 
 impl dcroxide_rpc::server::RpcLogManager for NodeRpcLogManager {
@@ -4303,6 +6781,12 @@ impl dcroxide_rpc::server::RpcLogManager for NodeRpcLogManager {
             .collect();
         ids.sort();
         ids
+    }
+
+    /// Change the running node's levels (dcrd `ParseAndSetDebugLevels`,
+    /// which is the `--debuglevel` parser applied to the live loggers).
+    fn parse_and_set_debug_levels(&self, level_spec: &str) -> Result<(), String> {
+        crate::logging::parse_and_set_debug_levels(level_spec)
     }
 }
 
@@ -4327,6 +6811,258 @@ mod tests {
         assert_send_sync::<Server<NodeRpcChain>>();
     }
 
+    /// The local IPv4 addresses are the `/32 host LOCAL` leaves of the
+    /// kernel's fib trie -- not the loopback network's `/8` entry, not a
+    /// broadcast or unicast route -- each once, however many tables list
+    /// it.
+    #[test]
+    fn fib_trie_yields_each_local_address_once() {
+        let trie = "\
+Main:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 0.0.0.0
+        /0 universe UNICAST
+     +-- 10.0.0.0/24 2 0 2
+        |-- 10.0.0.0
+           /24 link UNICAST
+        |-- 10.0.0.255
+           /32 link BROADCAST
+Local:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 10.0.0.95
+        /32 host LOCAL
+     |-- 100.79.193.115
+        /32 host LOCAL
+     +-- 127.0.0.0/8 2 0 2
+        +-- 127.0.0.0/31 1 0 0
+           |-- 127.0.0.0
+              /8 host LOCAL
+           |-- 127.0.0.1
+              /32 host LOCAL
+     |-- 10.0.0.95
+        /32 host LOCAL
+";
+        assert_eq!(
+            fib_trie_local_addrs(trie),
+            ["10.0.0.95/32", "100.79.193.115/32", "127.0.0.1/32"]
+        );
+    }
+
+    /// `/proc/net/if_inet6` rows become `address/prefix` strings the
+    /// certgen parser reads, and a malformed row is skipped.
+    #[test]
+    fn if_inet6_yields_each_address_with_its_prefix() {
+        let table = "\
+00000000000000000000000000000001 01 80 10 80       lo
+fe8000000000000072f2615749fcb7d6 03 40 20 80 wlp194s0
+26066d00001082ad029a08db65bff626 03 40 00 00 wlp194s0
+nothex 03 40 00 00 broken
+";
+        assert_eq!(
+            if_inet6_addrs(table),
+            [
+                "::1/128",
+                "fe80::72f2:6157:49fc:b7d6/64",
+                "2606:6d00:10:82ad:29a:8db:65bf:f626/64"
+            ]
+        );
+    }
+
+    /// One netlink message in host byte order: the header, the fixed
+    /// part and each attribute padded to four bytes.
+    fn netlink_msg(kind: u16, fixed: &[u8], attrs: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut body = fixed.to_vec();
+        for (attr, value) in attrs {
+            body.extend_from_slice(&(value.len().saturating_add(4) as u16).to_ne_bytes());
+            body.extend_from_slice(&attr.to_ne_bytes());
+            body.extend_from_slice(value);
+            body.resize(body.len().next_multiple_of(4), 0);
+        }
+        let mut msg = Vec::new();
+        msg.extend_from_slice(
+            &(netlink::NLMSG_HDRLEN.saturating_add(body.len()) as u32).to_ne_bytes(),
+        );
+        msg.extend_from_slice(&kind.to_ne_bytes());
+        msg.extend_from_slice(&0x2u16.to_ne_bytes());
+        msg.extend_from_slice(&1u32.to_ne_bytes());
+        msg.extend_from_slice(&4242u32.to_ne_bytes());
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    fn ifinfomsg(index: u32) -> Vec<u8> {
+        let mut fixed = vec![0u8; netlink::IFINFOMSG_LEN];
+        fixed[4..8].copy_from_slice(&index.to_ne_bytes());
+        fixed
+    }
+
+    fn ifaddrmsg(family: u8, prefix_len: u8, index: u32) -> Vec<u8> {
+        let mut fixed = vec![family, prefix_len, 0, 0];
+        fixed.extend_from_slice(&index.to_ne_bytes());
+        fixed
+    }
+
+    /// dcrd's `normalizeAddress` finds an interface by its `IFLA_IFNAME`
+    /// and dials its first address in the kernel's dump order: for an
+    /// IPv4 address the `IFA_LOCAL` value, never the point-to-point
+    /// peer in `IFA_ADDRESS`, and for IPv6 the first attribute.  A name
+    /// no link carries is not an interface.
+    #[test]
+    fn netlink_dumps_resolve_an_interface_as_go_does() {
+        let done = netlink_msg(netlink::NLMSG_DONE, &[0; 4], &[]);
+        let links = [
+            netlink_msg(
+                netlink::RTM_NEWLINK,
+                &ifinfomsg(1),
+                &[(netlink::IFLA_IFNAME, b"lo\0")],
+            ),
+            netlink_msg(
+                netlink::RTM_NEWLINK,
+                &ifinfomsg(7),
+                &[
+                    (netlink::IFLA_IFNAME, b"wg0\0"),
+                    (4, &1420u32.to_ne_bytes()),
+                ],
+            ),
+            done.clone(),
+        ]
+        .concat();
+        assert_eq!(netlink::link_index(&links, "wg0"), Some(7));
+        assert_eq!(netlink::link_index(&links, "lo"), Some(1));
+        assert_eq!(netlink::link_index(&links, "wg"), None);
+        assert_eq!(netlink::link_index(&links, "eth0"), None);
+
+        let link_local = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7];
+        let addrs = [
+            netlink_msg(
+                netlink::RTM_NEWADDR,
+                &ifaddrmsg(netlink::AF_INET, 8, 1),
+                &[
+                    (netlink::IFA_ADDRESS, &[127, 0, 0, 1]),
+                    (netlink::IFA_LOCAL, &[127, 0, 0, 1]),
+                ],
+            ),
+            netlink_msg(
+                netlink::RTM_NEWADDR,
+                &ifaddrmsg(netlink::AF_INET, 32, 7),
+                &[
+                    (netlink::IFA_ADDRESS, &[10, 0, 0, 2]),
+                    (netlink::IFA_LOCAL, &[10, 0, 0, 1]),
+                ],
+            ),
+            netlink_msg(
+                netlink::RTM_NEWADDR,
+                &ifaddrmsg(netlink::AF_INET6, 64, 9),
+                &[(netlink::IFA_ADDRESS, &link_local)],
+            ),
+            done,
+        ]
+        .concat();
+        assert_eq!(
+            netlink::first_addr(&addrs, 1).as_deref(),
+            Some("127.0.0.1/8")
+        );
+        assert_eq!(
+            netlink::first_addr(&addrs, 7).as_deref(),
+            Some("10.0.0.1/32")
+        );
+        assert_eq!(
+            netlink::first_addr(&addrs, 9).as_deref(),
+            Some("fe80::7/64")
+        );
+        assert_eq!(netlink::first_addr(&addrs, 3), None);
+
+        // The link-local address takes its zone from the index.
+        struct Fixed<'a>(&'a [u8], &'a [u8]);
+        impl dcroxide_rpc::helpers::InterfaceLookup for Fixed<'_> {
+            fn interface_addr(&self, name: &str) -> Option<(u32, String)> {
+                let index = netlink::link_index(self.0, name)?;
+                Some((index, netlink::first_addr(self.1, index)?))
+            }
+        }
+        let mut wg_links = links.clone();
+        wg_links.splice(
+            0..0,
+            netlink_msg(
+                netlink::RTM_NEWLINK,
+                &ifinfomsg(9),
+                &[(netlink::IFLA_IFNAME, b"wg1\0")],
+            ),
+        );
+        let lookup = Fixed(&wg_links, &addrs);
+        let normalize = |addr| dcroxide_rpc::helpers::normalize_address(&lookup, addr, "9108");
+        assert_eq!(normalize("wg0"), "10.0.0.1:9108");
+        assert_eq!(normalize("wg1:1234"), "[fe80::7%9]:1234");
+        assert_eq!(normalize("example.org"), "example.org:9108");
+
+        // A message whose length runs past the buffer is Go's EINVAL.
+        let mut truncated = links;
+        truncated.truncate(truncated.len() - 1);
+        assert_eq!(netlink::link_index(&truncated, "lo"), None);
+    }
+
+    /// The daemon's lookup asks the running kernel: the loopback
+    /// interface is dialed at its first address.  It used to be the
+    /// `NoInterfaces` stand-in, which dialed the name `lo` as a host.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_system_lookup_finds_the_loopback_interface() {
+        use dcroxide_rpc::helpers::InterfaceLookup;
+        let Some((index, addr)) = SystemInterfaces.interface_addr("lo") else {
+            panic!("the loopback interface was not found over netlink");
+        };
+        assert_eq!(
+            std::fs::read_to_string("/sys/class/net/lo/ifindex")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(index),
+            index
+        );
+        assert_eq!(addr, "127.0.0.1/8");
+        assert_eq!(
+            dcroxide_rpc::helpers::normalize_address(&SystemInterfaces, "lo", "9108"),
+            "127.0.0.1:9108"
+        );
+        assert_eq!(SystemInterfaces.interface_addr(""), None);
+        assert_eq!(SystemInterfaces.interface_addr("no-such-if0"), None);
+    }
+
+    /// The idle stand-in refuses `generate` with the handler's own
+    /// no-address text rather than reaching the trait's
+    /// `unimplemented!`, which aborts the node.
+    #[test]
+    fn the_idle_miner_refuses_to_generate() {
+        use dcroxide_rpc::server::RpcCpuMiner;
+        let failure = IdleCpuMiner
+            .generate_n_blocks(1)
+            .expect_err("the idle miner generates nothing");
+        assert!(!failure.is_ctx_err && !failure.is_cancel_discrete);
+        assert_eq!(
+            failure.message,
+            "no payment addresses specified via --miningaddr"
+        );
+    }
+
+    /// On Linux the generated certificate's host identity is the live
+    /// kernel's: the host name `/proc/sys/kernel/hostname` reports (Go's
+    /// `os.Hostname`) and, among the interface addresses, the loopback
+    /// address every host carries.  The interface list used to be empty.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_cert_env_reads_the_live_host_identity() {
+        let mut env = SystemCertEnv;
+        if let Ok(name) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+            assert_eq!(env.hostname().expect("hostname"), name.trim());
+        }
+        if std::fs::read_to_string("/proc/net/fib_trie").is_ok() {
+            let addrs = env.interface_addrs().expect("interface addresses");
+            assert!(
+                addrs.iter().any(|addr| addr == "127.0.0.1/32"),
+                "the loopback address is among the interface addresses: {addrs:?}"
+            );
+        }
+    }
+
     /// A minimal request head carrying only an `Origin` and `Host`, for
     /// exercising the websocket same-origin guard.
     fn origin_head(origin: Option<&str>, host: Option<&str>) -> HttpHead {
@@ -4345,6 +7081,10 @@ mod tests {
             sec_websocket_version: Vec::new(),
             origin: origin.map(str::to_string),
             host: host.map(str::to_string),
+            close: false,
+            version: (1, 1),
+            expect: None,
+            url_host: Vec::new(),
         }
     }
 
@@ -4469,7 +7209,7 @@ mod tests {
                 Route::Websocket => "ws".to_string(),
                 Route::JsonRpc => "rpc".to_string(),
                 Route::Asterisk => "asterisk".to_string(),
-                Route::Redirect(location) => format!("redirect:{location}"),
+                Route::Redirect(url) => format!("redirect:{}", hex_escape_non_ascii(&url)),
                 Route::NotFound => "notfound".to_string(),
             };
             assert_eq!(actual, *expected, "Go routes {target:?} to {expected:?}");
@@ -4512,7 +7252,7 @@ mod tests {
                         Route::JsonRpc => "rpc".to_string(),
                         Route::Asterisk => "asterisk".to_string(),
                         Route::NotFound => "notfound".to_string(),
-                        Route::Redirect(location) => format!("redirect:{location}"),
+                        Route::Redirect(url) => format!("redirect:{}", hex_escape_non_ascii(&url)),
                     }
                 }
             };
@@ -4523,21 +7263,27 @@ mod tests {
     }
 
     /// Methods are compared exactly, never folded.  A lower-case
-    /// `connect` is a method of its own, so its authority-form target is
-    /// not a target at all and its path is canonicalized like any
-    /// other's; a lower-case `options` never reaches the global options
-    /// handler.  All three answers were taken from a real server.
+    /// `connect` is a method of its own, so it gets no authority-form
+    /// parse: `evil.example:443` reads as scheme `evil.example` with an
+    /// opaque part, whose empty path cleans to a redirect to `/`, and
+    /// its path is canonicalized like any other's.  A lower-case
+    /// `options` never reaches the global options handler.  All three
+    /// answers were taken from a real server.
     #[test]
     fn the_method_is_matched_case_sensitively() {
-        // Authority form belongs to CONNECT alone.
+        // Authority form belongs to CONNECT alone.  Any other method
+        // reads the same text as a URL: `evil.example` is a valid scheme
+        // and `443` its opaque part, so the path is empty and cleans to
+        // a redirect to `/` (a real server's answer).
         assert_eq!(
             split_request_target("CONNECT", "evil.example:443"),
             Some((String::new(), None)),
             "CONNECT accepts an authority-form target"
         );
-        assert!(
-            split_request_target("connect", "evil.example:443").is_none(),
-            "a lower-case connect does not"
+        assert_eq!(
+            split_request_target("connect", "evil.example:443"),
+            Some((String::new(), None)),
+            "a lower-case connect parses it as an opaque URL"
         );
 
         // And only CONNECT skips canonicalization.
@@ -4555,7 +7301,7 @@ mod tests {
                 Route::JsonRpc => "rpc".to_string(),
                 Route::Asterisk => "asterisk".to_string(),
                 Route::NotFound => "notfound".to_string(),
-                Route::Redirect(location) => format!("redirect:{location}"),
+                Route::Redirect(url) => format!("redirect:{}", hex_escape_non_ascii(&url)),
             }
         };
         assert_eq!(
@@ -4568,6 +7314,7 @@ mod tests {
             "redirect:/ws",
             "a lower-case connect is"
         );
+        assert_eq!(routed("connect", "evil.example:443"), "redirect:/");
 
         // The global options handler is exact too, so `options *` falls
         // through to the mux, which refuses every asterisk it sees.
@@ -4632,6 +7379,39 @@ mod tests {
                 header_has_token(&owned, "upgrade"),
                 *expected,
                 "gorilla answers {expected} for {values:?}"
+            );
+        }
+    }
+
+    /// `Request.Close` is Go's `shouldClose` over the request version
+    /// and every `Connection` copy, with httpguts' comma-split list test
+    /// rather than gorilla's grammar: a parameter on an earlier element
+    /// does not hide `close`.
+    #[test]
+    fn request_close_is_gos_should_close() {
+        let cases: &[((u32, u32), &[&str], bool)] = &[
+            ((1, 1), &[], false),
+            ((1, 1), &["close"], true),
+            ((1, 1), &["Close"], true),
+            ((1, 1), &["keep-alive, close"], true),
+            ((1, 1), &["keep-alive;q=1, close"], true),
+            ((1, 1), &["keep-alive", " close\t"], true),
+            ((1, 1), &["closed"], false),
+            ((1, 1), &["keep-alive"], false),
+            ((1, 1), &["close;x"], false),
+            // HTTP/1.0 closes unless it asks to keep the connection.
+            ((1, 0), &[], true),
+            ((1, 0), &["Keep-Alive"], false),
+            ((1, 0), &["keep-alive, close"], true),
+            ((2, 0), &[], false),
+            ((0, 9), &["keep-alive"], true),
+        ];
+        for (version, values, expected) in cases {
+            let owned: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+            assert_eq!(
+                should_close(*version, &owned),
+                *expected,
+                "shouldClose({version:?}, {values:?})"
             );
         }
     }
@@ -4726,6 +7506,209 @@ mod tests {
         assert!(idle.connected_peers().is_empty());
     }
 
+    /// The `ping` RPC's broadcast reaches every registered peer's queue
+    /// (dcrd `BroadcastMessage`); the daemon used to inherit the trait's
+    /// empty default, so `ping` returned success and sent nothing.
+    #[test]
+    fn broadcast_message_queues_to_every_registered_peer() {
+        let sync_peers = crate::dispatch::SyncPeers::new();
+        let mut receivers = Vec::new();
+        for id in [1, 2] {
+            let (queue, rx) = crate::peerloop::OutboundQueue::channel();
+            receivers.push(rx);
+            sync_peers.register(
+                id,
+                queue,
+                None,
+                Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
+                    crate::server::RelayPeerFacts {
+                        connected: true,
+                        services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+                        wants_headers: false,
+                        disable_relay_tx: false,
+                        protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+                    },
+                ))),
+                Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
+                    dcroxide_peer::Config::default(),
+                ))),
+                None,
+                false,
+                None,
+                None,
+                None,
+            );
+        }
+        let manager = NodeRpcConnManager::new(
+            crate::runtime::ConnectedPeers::new(),
+            Arc::new(crate::transport::NetByteTotals::new()),
+        )
+        .with_peer_registry(sync_peers);
+
+        let ping = dcroxide_wire::Message::Ping(dcroxide_wire::MsgPing { nonce: 5 });
+        manager.broadcast_message(&ping);
+        for rx in &receivers {
+            assert_eq!(rx.try_recv().ok(), Some(ping.clone()));
+        }
+    }
+
+    /// `ping` reaches every registered peer through the connection
+    /// manager's broadcast (dcrd `BroadcastMessage` queueing to each
+    /// connected peer), and each queued ping stamps its nonce on the peer
+    /// the way dcrd's `outHandler` does, so the pong is timed: when the
+    /// peer's output loop writes it, as for the keepalive's own pings.
+    /// The seam was a no-op default before, so `ping` sent nothing.
+    #[test]
+    fn broadcast_message_queues_to_every_peer_and_stamps_pings() {
+        /// Takes every written message, as the peer's socket would.
+        #[derive(Default)]
+        struct Written(Vec<dcroxide_wire::Message>);
+        impl dcroxide_peer::MsgTransport for Written {
+            fn read_message(&mut self) -> Result<dcroxide_wire::Message, dcroxide_peer::ReadError> {
+                Err(dcroxide_peer::ReadError::io("write-only"))
+            }
+            fn write_message(&mut self, msg: &dcroxide_wire::Message) -> Result<(), String> {
+                self.0.push(msg.clone());
+                Ok(())
+            }
+        }
+
+        let sync_peers = crate::dispatch::SyncPeers::new();
+        let mut receivers = Vec::new();
+        let mut peers = Vec::new();
+        for id in [5, 6] {
+            let (queue, rx) = crate::peerloop::OutboundQueue::channel();
+            let peer = Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
+                dcroxide_peer::Config::default(),
+            )));
+            sync_peers.register(
+                id,
+                queue,
+                None,
+                Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
+                    crate::server::RelayPeerFacts {
+                        connected: true,
+                        services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+                        wants_headers: false,
+                        disable_relay_tx: false,
+                        protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+                    },
+                ))),
+                Arc::clone(&peer),
+                None,
+                false,
+                None,
+                None,
+                None,
+            );
+            receivers.push(rx);
+            peers.push(peer);
+        }
+        let manager = NodeRpcConnManager::new(
+            crate::runtime::ConnectedPeers::new(),
+            Arc::new(crate::transport::NetByteTotals::new()),
+        )
+        .with_peer_registry(sync_peers);
+
+        let nonce = 0x0123_4567_89ab_cdef;
+        manager.broadcast_message(&dcroxide_wire::Message::Ping(dcroxide_wire::MsgPing {
+            nonce,
+        }));
+        // The registry holds the queues' sending halves; with it gone
+        // each output loop below writes what was queued and finishes.
+        drop(manager);
+        for (rx, peer) in receivers.into_iter().zip(&peers) {
+            let mut written = Written::default();
+            crate::peerloop::run_peer_output(
+                peer,
+                &mut written,
+                &mut crate::peerconn::NodePeerEnv::new(),
+                rx,
+            );
+            assert!(
+                matches!(
+                    written.0.as_slice(),
+                    [dcroxide_wire::Message::Ping(ping)] if ping.nonce == nonce
+                ),
+                "the ping is queued to every peer: {:?}",
+                written.0
+            );
+            assert_eq!(
+                peer.lock().expect("peer").last_ping_nonce(),
+                nonce,
+                "the queued ping is the one the pong will be timed against"
+            );
+        }
+    }
+
+    /// `sendrawmixmessage`'s relay announces the message to the peers as
+    /// mix inventory (dcrd `RelayMixMessages` over `relayMixMessages`).
+    /// The seam was the trait's no-op default before, so a message
+    /// submitted over RPC never left the node.
+    #[test]
+    fn relay_mix_messages_announces_mix_inventory() {
+        let sync_peers = crate::dispatch::SyncPeers::new();
+        let (queue, rx) = crate::peerloop::OutboundQueue::channel();
+        sync_peers.register(
+            4,
+            queue,
+            None,
+            Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
+                crate::server::RelayPeerFacts {
+                    connected: true,
+                    services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+                    wants_headers: false,
+                    disable_relay_tx: false,
+                    protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+                },
+            ))),
+            Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
+                dcroxide_peer::Config::default(),
+            ))),
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        let manager = NodeRpcConnManager::new(
+            crate::runtime::ConnectedPeers::new(),
+            Arc::new(crate::transport::NetByteTotals::new()),
+        )
+        .with_peer_registry(sync_peers);
+
+        let pr = dcroxide_wire::MsgMixPairReq {
+            signature: [0u8; 64],
+            identity: [2u8; 33],
+            expiry: 10,
+            mix_amount: 10_000_000,
+            script_class: dcroxide_mixing::SCRIPT_CLASS_P2PKH_V0.to_string(),
+            tx_version: 1,
+            lock_time: 0,
+            message_count: 1,
+            input_value: 10_100_000,
+            utxos: Vec::new(),
+            change: None,
+            flags: 0,
+            pairing_flags: 0,
+        };
+        let hash = dcroxide_mixing::PoolMessage::PR(pr.clone())
+            .mix_hash()
+            .expect("hash");
+        manager.relay_mix_messages(&[dcroxide_wire::Message::MixPairReq(pr)]);
+
+        let sent = rx.try_recv().expect("the inventory is queued to the peer");
+        assert!(
+            matches!(
+                &sent,
+                dcroxide_wire::Message::Inv(inv)
+                    if inv.inv_list.len() == 1
+                        && inv.inv_list[0].inv_type == dcroxide_wire::InvType::MIX
+                        && inv.inv_list[0].hash == hash
+            ),
+            "{sent:?}"
+        );
+    }
     /// The connection manager answers the read/disconnect peer-control
     /// seams from the registry: `getaddednodeinfo` sees the permanent
     /// peer, `node disconnect` on it is "peer not found" (which the
@@ -4831,6 +7814,8 @@ mod tests {
             user_agent_version: "0.1.0".to_string(),
             idle_timeout: std::time::Duration::from_secs(3600),
             ping_interval: std::time::Duration::from_secs(3600),
+            disable_relay_tx: false,
+            proxy: String::new(),
             newest_block: None,
         }
     }
@@ -5046,7 +8031,12 @@ mod tests {
         let err = manager
             .connect(&dead_addr, false)
             .expect_err("temp dial to a dead port fails");
-        assert!(err.contains("dial failed"), "unexpected error: {err}");
+        if cfg!(unix) {
+            assert_eq!(
+                err,
+                format!("dial tcp {dead_addr}: connect: connection refused")
+            );
+        }
 
         manager.connect(&dead_addr, true).expect("connect");
         // Re-adding the same peer is refused while its entry lives on,
@@ -5215,6 +8205,61 @@ mod tests {
         assert!(
             serving.read(&mut buf).is_err(),
             "a connection that sent a request head must not be evicted while a stalled one lives"
+        );
+    }
+
+    /// A connection that has already been answered (the 401 or the 503)
+    /// and is only draining its declared body is evicted before a client
+    /// that is still in its handshake, even an older one.
+    ///
+    /// The parked connection has sent a head, so before the answered
+    /// tier existed it counted as "being served" and was protected, and
+    /// the handshaking client became the victim: a slow flood of
+    /// unauthenticated requests declaring a body they never send held
+    /// its slots for the whole authentication timeout while evicting
+    /// every legitimate arrival.  Closing the parked one loses nothing.
+    #[test]
+    fn eviction_takes_an_answered_connection_before_a_handshaking_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let gate = Arc::new(PreAuthGate::with_budget(2, 3));
+
+        let open = |gate: &Arc<PreAuthGate>| {
+            let client = TcpStream::connect(addr).expect("connect");
+            let (server, peer) = listener.accept().expect("accept");
+            let slot = gate.admit(server.try_clone().ok(), &peer);
+            (client, server, slot)
+        };
+
+        // The oldest: a legitimate client still in its handshake.
+        let (mut handshaking, _handshaking_server, _handshaking_slot) = open(&gate);
+        // A newer connection that sent its head, was answered 401, and is
+        // parked waiting for a body that never comes.
+        let (mut parked, _parked_server, parked_slot) = open(&gate);
+        let parked_slot = parked_slot.expect("admitted");
+        parked_slot.mark_head_done();
+        parked_slot.mark_answered();
+        assert_eq!(gate.live(), 2, "the nominal budget is full");
+
+        let (_third, _third_server, third_slot) = open(&gate);
+        assert!(third_slot.is_some(), "the arrival is admitted");
+
+        parked
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut buf = [0u8; 1];
+        assert!(
+            matches!(parked.read(&mut buf), Ok(0)),
+            "the answered connection is the one disconnected"
+        );
+
+        handshaking
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("read timeout");
+        let mut buf = [0u8; 1];
+        assert!(
+            handshaking.read(&mut buf).is_err(),
+            "a client still in its handshake must not be evicted while an answered one lives"
         );
     }
 
@@ -5488,8 +8533,7 @@ mod tests {
     /// there is no window to lose.
     ///
     /// Gated to every platform [`peer_half_closed`] claims to answer on
-    /// -- the `POLLRDHUP` set and the kqueue set. Windows is excluded
-    /// because it is still the open half of the PARITY entry.
+    /// -- the `POLLRDHUP` set, the kqueue set, and Windows.
     ///
     /// The kqueue half of this gate is doing real work rather than
     /// decorating: the development host is Linux, so the macOS arm
@@ -5577,9 +8621,9 @@ mod tests {
 
     /// And a live connection is not mistaken for a dead one, with and
     /// without unread data pending -- the pipelined-request case, which
-    /// dcrd deliberately does NOT treat as a hangup (`server.go:748-771`
-    /// in Go's net/http: a byte arriving is a pipelined request, and
-    /// only a read *error* cancels).
+    /// dcrd does NOT treat as a hangup: the goroutine watching its
+    /// hijacked connection cancels only when its one-byte read fails, and
+    /// a byte arriving ends the watch instead (`rpcserver.go:5722-5727`).
     #[test]
     #[cfg(any(unix, windows))]
     fn a_live_connection_is_not_reported_gone() {
@@ -5600,5 +8644,1397 @@ mod tests {
 
         // Keep the client alive to here, so nothing above raced a drop.
         drop(client);
+    }
+
+    /// `debuglevel <spec>` changes the running node's levels, and the
+    /// handler answers "Done." (dcrd `handleDebugLevel` over
+    /// `rpcLogManager.ParseAndSetDebugLevels`).  The adapter fell back to
+    /// the unwired-seam error, so every valid specification came back as
+    /// error -8 and the levels stayed as configured at startup.  A
+    /// specification that fails partway keeps the pairs ahead of the bad
+    /// one applied, as dcrd's `parseAndSetDebugLevels` does.  Only TRSY
+    /// is touched, since the levels are process-wide and other tests log.
+    #[test]
+    fn debuglevel_changes_the_running_levels() {
+        use crate::logging::subsystem_level;
+        use crate::logsubsys::LogLevel;
+        use dcroxide_rpc::server::RpcLogManager;
+
+        let manager = NodeRpcLogManager;
+        manager
+            .parse_and_set_debug_levels("TRSY=trace")
+            .expect("a valid specification applies");
+        assert_eq!(subsystem_level("TRSY"), LogLevel::Trace);
+
+        let err = manager
+            .parse_and_set_debug_levels("TRSY=debug,BOGUS=info")
+            .expect_err("an unknown subsystem fails");
+        assert!(
+            err.starts_with("the specified subsystem [BOGUS] is invalid -- supported subsystems"),
+            "{err}"
+        );
+        assert_eq!(
+            subsystem_level("TRSY"),
+            LogLevel::Debug,
+            "the pair ahead of the bad one stays applied"
+        );
+
+        let err = manager
+            .parse_and_set_debug_levels("TRSY=loud")
+            .expect_err("an unknown level fails");
+        assert_eq!(err, "the specified debug level [loud] is invalid");
+        assert_eq!(subsystem_level("TRSY"), LogLevel::Debug);
+
+        manager
+            .parse_and_set_debug_levels("TRSY=info")
+            .expect("restore the default");
+        assert_eq!(subsystem_level("TRSY"), LogLevel::Info);
+    }
+
+    /// A deadline far enough out that no test here reaches it.
+    fn test_deadline() -> Instant {
+        let now = Instant::now();
+        now.checked_add(Duration::from_secs(30)).unwrap_or(now)
+    }
+
+    /// Decode a chunked body from raw bytes the way the handler does:
+    /// the decoded body, or Go's error text.
+    fn decode_chunked(raw: &[u8]) -> Result<Vec<u8>, String> {
+        let mut stream = std::io::Cursor::new(raw.to_vec());
+        let mut reader = ChunkedReader::new(&mut stream, test_deadline());
+        match read_chunked_body(&mut reader, RPC_READ_LIMIT_AUTHENTICATED, true) {
+            Ok(ChunkedBody::Body(body)) | Ok(ChunkedBody::Truncated(body, _)) => Ok(body),
+            Ok(ChunkedBody::TooLarge) => Err("too large".to_string()),
+            Err(ChunkError::Malformed(err)) => Err(err),
+            Err(ChunkError::Io) => Err("io".to_string()),
+        }
+    }
+
+    /// The chunked decoder refuses what Go's refuses, with Go's text,
+    /// and accepts what it accepts.  Every row is a real server's
+    /// answer: Go 1.27's `net/http` behind dcrd's handler shape, which
+    /// answers a failed read `400 error reading JSON message: <err>`.
+    /// The decoder took a bare-LF size line, trimmed any whitespace, and
+    /// parsed the size with `from_str_radix`, which takes a `+`.
+    #[test]
+    fn chunked_framing_follows_gos_reader() {
+        let ok = |body: &[u8]| Ok(body.to_vec());
+        let err = |text: &str| Err(text.to_string());
+        type Decoded = Result<Vec<u8>, String>;
+        let cases: &[(&[u8], Decoded)] = &[
+            (
+                b"5\n{\"a\":\r\n0\r\n\r\n",
+                err("chunked line ends with bare LF"),
+            ),
+            (
+                b" +2 \r\n{}\r\n0\r\n\r\n",
+                err("invalid byte in chunk length"),
+            ),
+            (
+                b"+2\r\n{}\r\n0\r\n\r\n",
+                err("invalid byte in chunk length"),
+            ),
+            (b"2 \r\n{}\r\n0\r\n\r\n", ok(b"{}")),
+            (
+                b"2\t;ext\r\n{}\r\n0\r\n\r\n",
+                err("invalid byte in chunk length"),
+            ),
+            (
+                b"2 ;ext\r\n{}\r\n0\r\n\r\n",
+                err("invalid byte in chunk length"),
+            ),
+            (b"2;ext \r\n{}\r\n0\r\n\r\n", ok(b"{}")),
+            (b"2\r\r\n{}\r\n0\r\n\r\n", err("invalid CR in chunked line")),
+            (
+                b"\r\n{}\r\n0\r\n\r\n",
+                err("empty hex number for chunk length"),
+            ),
+            (
+                b";x\r\n{}\r\n0\r\n\r\n",
+                err("empty hex number for chunk length"),
+            ),
+            (
+                b"00000000000000002\r\n{}\r\n0\r\n\r\n",
+                err("http chunk length too large"),
+            ),
+            (b"0000000000000002\r\n{}\r\n0\r\n\r\n", ok(b"{}")),
+            (b"2\r\n{}XX0\r\n\r\n", err("malformed chunked encoding")),
+            (b"2\r\n{}\r\n0\n\r\n", err("chunked line ends with bare LF")),
+            (b"2\r\n{}\r\n0;x=\"y\"\r\n\r\n", ok(b"{}")),
+            // Go's non-data arithmetic wraps: this size is overhead.
+            (
+                b"7000000000000000\r\n{}\r\n0\r\n\r\n",
+                err("chunked encoding contains too much non-data"),
+            ),
+            // The trailer: a bare LF may end a field line but not the
+            // section, whose `\r\n\r\n` Go looks for before parsing.
+            (
+                b"2\r\n{}\r\n0\r\n",
+                err("http: unexpected EOF reading trailer"),
+            ),
+            (
+                b"2\r\n{}\r\n0\r\n\n",
+                err("http: unexpected EOF reading trailer"),
+            ),
+            (
+                b"2\r\n{}\r\n0\r\nA: b\n\n",
+                err("http: suspiciously long trailer after chunked body"),
+            ),
+            (b"2\r\n{}\r\n0\r\nA: b\r\n\r\n", ok(b"{}")),
+            (b"2\r\n{}\r\n0\r\nA: b\nC: d\r\n\r\n", ok(b"{}")),
+            (b"2\r\n{}\r\n0\r\nA: b\r\n c\r\n\r\n", ok(b"{}")),
+            (b"2\r\n{}\r\n0\r\nA B: b\r\n\r\n", ok(b"{}")),
+            (b"2\r\n{}\r\n0\r\n\r\nGARBAGE", ok(b"{}")),
+            (
+                b"2\r\n{}\r\n0\r\nAb\r\n\r\n",
+                err("malformed MIME header: missing colon: \"Ab\""),
+            ),
+            (
+                b"2\r\n{}\r\n0\r\n A: b\r\n\r\n",
+                err("malformed MIME header initial line: \" A: b\""),
+            ),
+            (
+                b"2\r\n{}\r\n0\r\n: b\r\n\r\n",
+                err("malformed MIME header line: \": b\""),
+            ),
+            (
+                b"2\r\n{}\r\n0\r\nA\tB: b\r\n\r\n",
+                err("malformed MIME header line: \"A\\tB: b\""),
+            ),
+            (
+                b"2\r\n{}\r\n0\r\nA: b\x01\xff\r\n\r\n",
+                err("malformed MIME header line: \"A: b\\x01\\xff\""),
+            ),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                decode_chunked(raw),
+                *expected,
+                "{:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+    }
+
+    /// The limits on what is not data, each at Go's exact boundary
+    /// (measured against a real server): 16 KiB of net overhead, a size
+    /// line of 4096 bytes with its CRLF, and a trailer section of 4096
+    /// bytes with its blank line.  The decoder bounded a line and
+    /// nothing else, so an endless run of extensions or trailer lines
+    /// held a handler -- the unauthenticated 401/503 drains included --
+    /// for the whole handshake deadline.
+    #[test]
+    fn chunked_overhead_is_bounded_where_go_bounds_it() {
+        let chunks = |count: usize| {
+            let mut raw = Vec::new();
+            for _ in 0..count {
+                raw.extend_from_slice(b"1;");
+                raw.extend(std::iter::repeat_n(b'x', 3000));
+                raw.extend_from_slice(b"\r\nA\r\n");
+            }
+            raw.extend_from_slice(b"0\r\n\r\n");
+            raw
+        };
+        assert_eq!(decode_chunked(&chunks(5)), Ok(b"AAAAA".to_vec()));
+        assert_eq!(
+            decode_chunked(&chunks(6)),
+            Err("chunked encoding contains too much non-data".to_string())
+        );
+
+        let line = |extension: usize| {
+            let mut raw = b"2;".to_vec();
+            raw.extend(std::iter::repeat_n(b'x', extension));
+            raw.extend_from_slice(b"\r\n{}\r\n0\r\n\r\n");
+            raw
+        };
+        assert_eq!(decode_chunked(&line(4092)), Ok(b"{}".to_vec()));
+        assert_eq!(
+            decode_chunked(&line(4093)),
+            Err("header line too long".to_string())
+        );
+
+        let trailer = |value: usize| {
+            let mut raw = b"2\r\n{}\r\n0\r\nA: ".to_vec();
+            raw.extend(std::iter::repeat_n(b'b', value));
+            raw.extend_from_slice(b"\r\n\r\n");
+            raw
+        };
+        assert_eq!(decode_chunked(&trailer(4089)), Ok(b"{}".to_vec()));
+        assert_eq!(
+            decode_chunked(&trailer(4090)),
+            Err("http: suspiciously long trailer after chunked body".to_string())
+        );
+    }
+
+    /// A stream that counts its receives and its timeout arms.
+    struct CountingStream {
+        inner: std::io::Cursor<Vec<u8>>,
+        reads: usize,
+        arms: std::cell::Cell<usize>,
+    }
+
+    impl Read for CountingStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads = self.reads.saturating_add(1);
+            self.inner.read(buf)
+        }
+    }
+
+    impl SocketTimeout for CountingStream {
+        fn set_socket_read_timeout(&self, _timeout: Option<Duration>) {
+            self.arms.set(self.arms.get().saturating_add(1));
+        }
+
+        fn set_socket_write_timeout(&self, _timeout: Option<Duration>) {}
+    }
+
+    /// Size and trailer lines are read a buffer at a time.  They were
+    /// read one byte per `set_read_timeout` and `recv`, so a 4 KiB
+    /// extension cost some 8,000 syscalls where Go's `bufio` costs one
+    /// read.
+    #[test]
+    fn chunk_lines_are_not_read_a_byte_at_a_time() {
+        let mut raw = b"1;".to_vec();
+        raw.extend(std::iter::repeat_n(b'x', 4000));
+        raw.extend_from_slice(b"\r\nA\r\n0\r\nT: ");
+        raw.extend(std::iter::repeat_n(b'y', 3000));
+        raw.extend_from_slice(b"\r\n\r\n");
+        let mut stream = CountingStream {
+            inner: std::io::Cursor::new(raw),
+            reads: 0,
+            arms: std::cell::Cell::new(0),
+        };
+        let mut reader = ChunkedReader::new(&mut stream, test_deadline());
+        let body = match read_chunked_body(&mut reader, RPC_READ_LIMIT_AUTHENTICATED, true) {
+            Ok(ChunkedBody::Body(body)) => body,
+            _ => panic!("the body decodes"),
+        };
+        assert_eq!(body, b"A");
+        assert!(stream.reads < 8, "{} receives", stream.reads);
+        assert!(stream.arms.get() < 8, "{} timeout arms", stream.arms.get());
+    }
+
+    /// Read a head from raw bytes.
+    fn head_of(raw: &str) -> Result<HttpHead, HeadError> {
+        let mut stream = std::io::Cursor::new(raw.as_bytes().to_vec());
+        read_http_head(&mut stream, test_deadline())
+    }
+
+    /// Below HTTP/1.1 Go deletes `Transfer-Encoding` unread, so the
+    /// `Content-Length` frames the body whatever the header said, and
+    /// a bad encoding on HTTP/0.9 falls through to the 505.  From 1.1 on
+    /// it is still the 501, HTTP/2.0 included.  Every row is a real
+    /// server's answer; the port applied the 1.1 rules to every version.
+    #[test]
+    fn transfer_encoding_is_ignored_below_http_1_1() {
+        for (raw, length) in [
+            (
+                "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n",
+                2,
+            ),
+            (
+                "POST / HTTP/1.0\r\nTransfer-Encoding: identity\r\nContent-Length: 2\r\n\r\n",
+                2,
+            ),
+            (
+                "POST / HTTP/1.0\r\nTransfer-Encoding: identity\r\nTransfer-Encoding: chunked\r\n\r\n",
+                0,
+            ),
+        ] {
+            let Ok(head) = head_of(raw) else {
+                panic!("{raw:?} is served");
+            };
+            assert!(
+                matches!(body_framing(&head), BodyFraming::Length),
+                "{raw:?} is framed by its length"
+            );
+            assert_eq!(head.content_length, length, "{raw:?}");
+        }
+        assert!(matches!(
+            head_of("POST / HTTP/0.9\r\nTransfer-Encoding: identity\r\n\r\n"),
+            Err(HeadError::Status("505 HTTP Version Not Supported", _))
+        ));
+        for raw in [
+            "POST / HTTP/2.0\r\nHost: x\r\nTransfer-Encoding: identity\r\n\r\n",
+            "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: identity\r\n\r\n",
+        ] {
+            assert!(
+                matches!(head_of(raw), Err(HeadError::UnsupportedTransferEncoding)),
+                "{raw:?} is a 501"
+            );
+        }
+    }
+
+    /// Go reads head lines with `bufio.ReadLine`, so a bare LF ends a
+    /// line and the head as well as CRLF does, while a CR anywhere but
+    /// before the newline stays in the line and is refused.  Every row
+    /// is a real server's answer.  The port waited for `\r\n\r\n`, so a
+    /// bare-LF head was never answered, and it trimmed a stray CR off a
+    /// field value and accepted it.
+    #[test]
+    fn head_lines_end_where_gos_end() {
+        for raw in [
+            "GET /ws HTTP/1.1\nHost: x\n\n",
+            "GET / HTTP/1.1\r\nHost: x\nFoo: y\r\n\r\n",
+            "GET / HTTP/1.1\nHost: x\n\r\n",
+            "GET / HTTP/1.1\r\nHost: x\r\n\n",
+        ] {
+            let Ok(head) = head_of(raw) else {
+                panic!("{raw:?} is served");
+            };
+            assert_eq!(head.host.as_deref(), Some("x"), "{raw:?}");
+        }
+        for raw in [
+            "GET / HTTP/1.1\r\nHost: x\r\nFoo: a\rb\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: x\r\nFoo: a\r\r\n\r\n",
+            "GET / HTTP/1.1\r\r\nHost: x\r\n\r\n",
+            "\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n",
+        ] {
+            assert!(
+                matches!(head_of(raw), Err(HeadError::Malformed)),
+                "{raw:?} is a bare 400"
+            );
+        }
+    }
+
+    /// How a head fails, as a short label for the tables below.
+    fn head_outcome(raw: &str) -> String {
+        match head_of(raw) {
+            Ok(_) => "ok".to_string(),
+            Err(HeadError::Unanswerable) => "silent".to_string(),
+            Err(HeadError::TooLarge) => "431".to_string(),
+            Err(HeadError::UnsupportedTransferEncoding) => "501".to_string(),
+            Err(HeadError::Status(status, reason)) => format!("{status}: {reason}"),
+            Err(HeadError::Malformed) => "400".to_string(),
+        }
+    }
+
+    /// Field lines as textproto reads them, every row a real server's
+    /// answer: the first may not begin with a space or tab (a bare 400,
+    /// or the 431 once it runs past the 80 bytes Go reads to quote it);
+    /// a later one that does continues the field before it, each line
+    /// trimmed and the lines joined with one space; the colon must be
+    /// on the field's first line; and the name must be non-empty.  The
+    /// port read a leading-space line as a name with a space in it, and
+    /// a continuation line as a field of its own -- a bare 400, or one
+    /// read under a name Go never sees -- and took an empty name.
+    #[test]
+    fn field_lines_fold_as_textproto_folds_them() {
+        let wide = |n: usize| format!("GET / HTTP/1.1\r\n {}\r\n\r\n", "x".repeat(n));
+        for (raw, outcome) in [
+            ("GET / HTTP/1.1\r\n Host: x\r\n\r\n".to_string(), "400"),
+            ("GET / HTTP/1.1\r\n\tHost: x\r\n\r\n".to_string(), "400"),
+            ("GET / HTTP/1.1\r\n \r\n\r\n".to_string(), "400"),
+            (wide(79), "400"),
+            (wide(80), "431"),
+            (
+                "GET / HTTP/1.1\r\nHost: x\r\n y\r\n\r\n".to_string(),
+                "400 Bad Request: malformed Host header",
+            ),
+            (
+                "GET / HTTP/1.1\r\nHost: x\r\n \r\n\r\n".to_string(),
+                "400 Bad Request: malformed Host header",
+            ),
+            (
+                "GET / HTTP/1.1\r\nHost: x\r\nFoo\r\n : y\r\n\r\n".to_string(),
+                "400",
+            ),
+            (
+                "GET / HTTP/1.1\r\nHost: x\r\nFoo : y\r\n z\r\n\r\n".to_string(),
+                "400 Bad Request: invalid header name",
+            ),
+            (
+                "GET / HTTP/1.1\r\nHost: x\r\nFoo: y\r\n \u{1}\r\n\r\n".to_string(),
+                "400",
+            ),
+            (
+                "GET / HTTP/1.1\r\nHost: x\r\nFoo: y\r\n z:w\r\n\r\n".to_string(),
+                "ok",
+            ),
+            (
+                "GET / HTTP/1.1\r\nHost: x\r\n: foo\r\n\r\n".to_string(),
+                "400",
+            ),
+            ("GET / HTTP/1.1\r\nHost: x\r\n:\r\n\r\n".to_string(), "400"),
+            (
+                "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n \r\n\r\n".to_string(),
+                "501",
+            ),
+            (
+                "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\u{a0}\r\n\r\n"
+                    .to_string(),
+                "501",
+            ),
+        ] {
+            assert_eq!(head_outcome(&raw), outcome, "{raw:?}");
+        }
+
+        // The values a fold produces, as the handlers read them.
+        let Ok(head) = head_of(
+            "GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic\r\n dXNlcjpwYXNz\r\nExpect: a \r\n\t b  \r\n  c\r\nOrigin: y\r\n \r\n\r\n",
+        ) else {
+            panic!("a folded head is served");
+        };
+        assert_eq!(head.authorization.as_deref(), Some("Basic dXNlcjpwYXNz"));
+        assert_eq!(head.expect.as_deref(), Some("a b c"));
+        // A blank continuation line leaves its joining space behind.
+        assert_eq!(head.origin.as_deref(), Some("y "));
+        let Ok(head) = head_of(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length:\r\n 2\r\nContent-Length: 2\r\n \r\n\r\n",
+        ) else {
+            panic!("a folded length is served");
+        };
+        assert_eq!(head.content_length, 2);
+        let Ok(head) = head_of("GET / HTTP/1.1\nHost: x\nExpect: y\n z\n\n") else {
+            panic!("a bare-LF fold is served");
+        };
+        assert_eq!(head.expect.as_deref(), Some("y z"));
+    }
+
+    /// Go 1.27 reads at most 500 header values into a request head and
+    /// answers the next with the 431, counting each field once textproto
+    /// has found it well formed: a field it refuses on the same line is
+    /// still the bare 400, while the checks Go makes only once the map is
+    /// read -- a second Host, a space in a name -- lose to the count.
+    /// Every row is a real server's answer.  The port had no count.
+    #[test]
+    fn the_head_carries_at_most_gos_value_count() {
+        let fields = |n: usize| "a:\r\n".repeat(n);
+        for (raw, outcome) in [
+            (
+                format!("GET / HTTP/1.1\r\nHost: x\r\n{}\r\n", fields(499)),
+                "ok",
+            ),
+            (
+                format!(
+                    "GET / HTTP/1.1\r\nHost: x\r\n{}\r\n",
+                    "a: b\r\n".repeat(499)
+                ),
+                "ok",
+            ),
+            (
+                format!("GET / HTTP/1.1\r\nHost: x\r\n{}\r\n", fields(500)),
+                "431",
+            ),
+            (format!("GET / HTTP/1.0\r\n{}\r\n", fields(500)), "ok"),
+            (format!("GET / HTTP/1.0\r\n{}\r\n", fields(501)), "431"),
+            (
+                format!(
+                    "GET / HTTP/1.1\r\nHost: x\r\n{}Foo: y\r\n z\r\n\r\n",
+                    fields(499)
+                ),
+                "431",
+            ),
+            (
+                format!("GET / HTTP/1.1\r\nHost: x\r\n{}b c: y\r\n\r\n", fields(499)),
+                "431",
+            ),
+            (
+                format!(
+                    "GET / HTTP/1.1\r\nHost: x\r\n{}b\u{1}: y\r\n\r\n",
+                    fields(499)
+                ),
+                "400",
+            ),
+            (
+                format!(
+                    "GET / HTTP/1.1\r\nHost: x\r\n{}b\u{1}: y\r\n\r\n",
+                    fields(500)
+                ),
+                "431",
+            ),
+            (
+                format!("GET / HTTP/1.1\r\nHost: x\r\nb c: y\r\n{}\r\n", fields(499)),
+                "431",
+            ),
+            (
+                format!(
+                    "GET / HTTP/1.1\r\nHost: x\r\nHost: y\r\n{}\r\n",
+                    fields(499)
+                ),
+                "431",
+            ),
+            (
+                format!("GET / HTTP/1.1\r\nHost: a b\r\n{}\r\n", fields(499)),
+                "400 Bad Request: malformed Host header",
+            ),
+        ] {
+            assert_eq!(head_outcome(&raw), outcome, "{} bytes", raw.len());
+        }
+    }
+
+    /// A head wrong in more than one way is answered for the check Go
+    /// makes first: a second Host, then the transfer encoding, the
+    /// content length and the announced trailer, then the version, and
+    /// only then the Host and field-name checks.  `fixTrailer` refuses a
+    /// chunked body that announces a framing field as a trailer, and the
+    /// bare HTTP/2 preface needs no Host.  Every row is a real server's
+    /// answer.  The port refused a bad Host or a spaced name at its line,
+    /// ahead of all of these, never vetted the trailer, and asked the
+    /// preface for a Host.
+    #[test]
+    fn head_errors_rank_as_gos_do() {
+        let authed = "Host: x\r\nTransfer-Encoding: chunked\r\n";
+        for (raw, outcome) in [
+            ("POST / HTTP/1.1\r\nHost: a b\r\nTransfer-Encoding: gzip\r\n\r\n".to_string(), "501"),
+            ("POST / HTTP/1.1\r\nHost: x\r\nHost: y\r\nTransfer-Encoding: gzip\r\n\r\n".to_string(), "400"),
+            ("POST / HTTP/1.1\r\nHost: x\r\nb c: y\r\nTransfer-Encoding: gzip\r\n\r\n".to_string(), "501"),
+            ("GET / HTTP/3.0\r\nHost: a b\r\n\r\n".to_string(), "505 HTTP Version Not Supported: unsupported protocol version"),
+            ("GET / HTTP/3.0\r\nb c: y\r\n\r\n".to_string(), "505 HTTP Version Not Supported: unsupported protocol version"),
+            ("GET / HTTP/3.0\r\nHost: x\r\nHost: y\r\n\r\n".to_string(), "400"),
+            ("GET / HTTP/1.1\r\nb c: y\r\n\r\n".to_string(), "400 Bad Request: missing required Host header"),
+            ("GET / HTTP/1.1\r\nb c: y\r\nHost: a b\r\n\r\n".to_string(), "400 Bad Request: malformed Host header"),
+            ("GET / HTTP/1.1\r\nHost: a b\r\nb c: y\r\n\r\n".to_string(), "400 Bad Request: malformed Host header"),
+            ("GET / HTTP/1.1\r\nHost: x\r\nHost: a b\r\n\r\n".to_string(), "400"),
+            ("POST / HTTP/1.1\r\nHost: a b\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n".to_string(), "400"),
+            ("POST / HTTP/1.1\r\nb c: y\r\nContent-Length: x\r\n\r\n".to_string(), "400"),
+            (format!("POST / HTTP/1.1\r\n{authed}Trailer: Content-Length\r\n\r\n"), "400"),
+            (format!("POST / HTTP/1.1\r\n{authed}Trailer: foo, transfer-encoding\r\n\r\n"), "400"),
+            (format!("POST / HTTP/1.1\r\n{authed}Trailer: foo\r\nTrailer: trailer\r\n\r\n"), "400"),
+            (format!("POST / HTTP/1.1\r\n{authed}Trailer:  content-length\t\r\n\r\n"), "400"),
+            (format!("POST / HTTP/1.1\r\n{authed}Trailer: ,, Foo ,\r\n\r\n"), "ok"),
+            (format!("POST / HTTP/1.1\r\n{authed}Trailer: Content Length\r\n\r\n"), "ok"),
+            ("POST / HTTP/1.1\r\nHost: x\r\nTrailer: Content-Length\r\nContent-Length: 0\r\n\r\n".to_string(), "ok"),
+            ("POST / HTTP/2.0\r\nHost: x\r\nTrailer: Content-Length\r\nTransfer-Encoding: chunked\r\n\r\n".to_string(), "400"),
+            (format!("POST / HTTP/1.1\r\n{authed}Trailer: Content-Length\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n"), "400"),
+            ("PRI * HTTP/2.0\r\n\r\n".to_string(), "ok"),
+            ("PRI * HTTP/2.0\r\nHost: x\r\n\r\n".to_string(), "ok"),
+            ("PRI / HTTP/2.0\r\n\r\n".to_string(), "505 HTTP Version Not Supported: unsupported protocol version"),
+            ("PRI * HTTP/2.0\r\nContent-Length: 2\r\n\r\n".to_string(), "400 Bad Request: missing required Host header"),
+        ] {
+            assert_eq!(head_outcome(&raw), outcome, "{raw:?}");
+        }
+        // The preface is then the mux's asterisk refusal.
+        let Ok(head) = head_of("PRI * HTTP/2.0\r\n\r\n") else {
+            panic!("the preface is served");
+        };
+        assert!(matches!(route(&head), Route::Asterisk));
+    }
+
+    /// Request targets through `url.ParseRequestURI` and the mux, and
+    /// the host an absolute-form or CONNECT target names, each row a
+    /// real server's answer (Go 1.27, dcrd's two patterns, the handler
+    /// echoing `URL.Host`).  The port had no control-byte check, found
+    /// a scheme by searching for `://` and never validated the
+    /// authority, and read every CONNECT target as a bare authority.
+    #[test]
+    fn request_targets_parse_as_gos_request_uri() {
+        let cases: &[(&str, &str, &str, &str)] = &[
+            ("GET", "/\x7f", "reject", ""),
+            ("GET", "/ws\x01", "reject", ""),
+            ("GET", "/\tws", "reject", ""),
+            ("POST", "/\x1f", "reject", ""),
+            ("GET", "/ws?\x7f", "reject", ""),
+            ("GET", "http:/ws", "ws", ""),
+            ("GET", "http:ws", "redirect:/", ""),
+            ("GET", "http:", "redirect:/", ""),
+            ("GET", "http:?x", "redirect:/?x", ""),
+            ("GET", "http:/", "rpc", ""),
+            ("GET", "http://", "redirect:/", ""),
+            ("GET", "http:///ws", "ws", ""),
+            ("GET", "http:////ws", "redirect:/ws", ""),
+            ("GET", "HTTP://h/ws", "ws", "68"),
+            ("GET", "mailto:x", "redirect:/", ""),
+            ("GET", "mailto:x?y=1", "redirect:/?y=1", ""),
+            ("GET", "1x://h/ws", "reject", ""),
+            ("GET", "h_t://h/ws", "reject", ""),
+            ("GET", "a+b://h/ws", "ws", "68"),
+            ("GET", "a.b-c://h/ws", "ws", "68"),
+            ("GET", "://h/ws", "reject", ""),
+            ("GET", ":x", "reject", ""),
+            ("GET", "http://h:x/ws", "reject", ""),
+            ("GET", "http://h:/ws", "ws", "683a"),
+            ("GET", "http://h:80/ws", "ws", "683a3830"),
+            ("GET", "http://h:8a/ws", "reject", ""),
+            ("GET", "http://[::1/ws", "reject", ""),
+            ("GET", "http://[::1]/ws", "ws", "5b3a3a315d"),
+            ("GET", "http://[::1]:80/ws", "ws", "5b3a3a315d3a3830"),
+            ("GET", "http://[::1]x/ws", "reject", ""),
+            ("GET", "http://[::1]:x/ws", "reject", ""),
+            ("GET", "http://x[::1]/ws", "reject", ""),
+            ("GET", "http://[1.2.3.4]/ws", "reject", ""),
+            (
+                "GET",
+                "http://[::ffff:1.2.3.4]/ws",
+                "ws",
+                "5b3a3a666666663a312e322e332e345d",
+            ),
+            (
+                "GET",
+                "http://[fe80::1%25en0]/ws",
+                "ws",
+                "5b666538303a3a3125656e305d",
+            ),
+            ("GET", "http://[fe80::1%25]/ws", "reject", ""),
+            ("GET", "http://[fe80::1%en0]/ws", "reject", ""),
+            ("GET", "http://[zz]/ws", "reject", ""),
+            ("GET", "http://h]/ws", "ws", "685d"),
+            ("GET", "http://h%zz/ws", "reject", ""),
+            ("GET", "http://h%41/ws", "reject", ""),
+            ("GET", "http://h%c3%a9/ws", "ws", "68c3a9"),
+            ("GET", "http://h%25/ws", "ws", "6825"),
+            ("GET", "http://a:1:2/ws", "reject", ""),
+            ("GET", "foo://a:1:2/ws", "ws", "613a313a32"),
+            ("GET", "foo://a:1:x/ws", "reject", ""),
+            ("GET", "http://user@h/ws", "ws", "68"),
+            ("GET", "http://u:p@h/ws", "ws", "68"),
+            ("GET", "http://u%zz@h/ws", "reject", ""),
+            ("GET", "http://u@p@h/ws", "ws", "68"),
+            ("GET", "http://u\"@h/ws", "reject", ""),
+            ("GET", "http://h#f/ws", "reject", ""),
+            ("GET", "http://h/ws?x", "ws", "68"),
+            ("GET", "http://h?x", "redirect:/?x", ""),
+            ("GET", "http://h/ws#f", "rpc", "68"),
+            ("GET", "http://h/%zz", "reject", ""),
+            ("GET", "http://h/w%73", "ws", "68"),
+            ("GET", "http://h//ws", "redirect:/ws", ""),
+            ("GET", "http://h", "redirect:/", ""),
+            ("GET", "http://h/", "rpc", "68"),
+            ("GET", "http://h/ws?", "ws", "68"),
+            ("GET", "http://h|x/ws", "reject", ""),
+            ("GET", "http://h{/ws", "reject", ""),
+            (
+                "GET",
+                "http://h!$&'()*+,;=/ws",
+                "ws",
+                "682124262728292a2b2c3b3d",
+            ),
+            ("GET", "http://h~_-./ws", "ws", "687e5f2d2e"),
+            ("GET", "http://h<>/ws", "ws", "683c3e"),
+            ("GET", "http://h^/ws", "reject", ""),
+            ("GET", "http://é/ws", "ws", "c3a9"),
+            ("GET", "x:/ws", "ws", ""),
+            ("GET", "x:", "redirect:/", ""),
+            ("GET", "?x", "reject", ""),
+            ("GET", "/?x", "rpc", ""),
+            ("GET", "*", "asterisk", ""),
+            ("GET", "*x", "reject", ""),
+            ("OPTIONS", "*", "options", ""),
+            ("CONNECT", "h:443", "notfound", ""),
+            ("CONNECT", "h/ws", "ws", "68"),
+            ("CONNECT", "h:443/ws", "ws", "683a343433"),
+            ("CONNECT", "h:443/x", "rpc", "683a343433"),
+            ("CONNECT", "h:x", "reject", ""),
+            ("CONNECT", "[::1]:443", "notfound", ""),
+            ("CONNECT", "[::1/x", "reject", ""),
+            ("CONNECT", "/ws", "ws", ""),
+            ("CONNECT", "//ws", "rpc", ""),
+            ("CONNECT", "h%zz", "reject", ""),
+            ("CONNECT", "*", "asterisk", ""),
+            ("CONNECT", "h?x", "notfound", ""),
+            ("CONNECT", "h:443?x", "notfound", ""),
+            ("CONNECT", "u@h:443/ws", "ws", "683a343433"),
+            ("CONNECT", "http://h/ws", "rpc", "687474703a"),
+            ("CONNECT", "h/ws#x", "rpc", "68"),
+            ("connect", "evil.example:443", "redirect:/", ""),
+            ("connect", "//ws", "redirect:/ws", ""),
+            ("GET", "evil.example:443", "redirect:/", ""),
+            ("GET", "evil_x:443", "reject", ""),
+            ("GET", "localhost:9109", "redirect:/", ""),
+            ("GET", "http://h\"/ws", "ws", "6822"),
+            (
+                "GET",
+                "http://[::1.2.3.4]/ws",
+                "ws",
+                "5b3a3a312e322e332e345d",
+            ),
+            ("GET", "http://[1::2::3]/ws", "reject", ""),
+            ("GET", "http://[::00001]/ws", "reject", ""),
+            ("GET", "http://[::ffff:01.2.3.4]/ws", "reject", ""),
+            (
+                "GET",
+                "http://[1:2:3:4:5:6:7:8]/ws",
+                "ws",
+                "5b313a323a333a343a353a363a373a385d",
+            ),
+            ("GET", "http://[1:2:3:4:5:6:7:8:9]/ws", "reject", ""),
+            ("GET", "http://[::1%25en0]/ws", "ws", "5b3a3a3125656e305d"),
+            ("GET", "http://[1.2.3.4%25x]/ws", "reject", ""),
+            (
+                "GET",
+                "http://[fe80::1%25%65n0]/ws",
+                "ws",
+                "5b666538303a3a3125656e305d",
+            ),
+            (
+                "GET",
+                "http://[fe80::1%25%41]/ws",
+                "ws",
+                "5b666538303a3a3125415d",
+            ),
+            (
+                "GET",
+                "http://[fe80::1%25%20]/ws",
+                "ws",
+                "5b666538303a3a3125205d",
+            ),
+            ("GET", "http://[fe80::1%25%0a]/ws", "reject", ""),
+            ("GET", "http://[fe80::1%25a%2fb]/ws", "reject", ""),
+            ("GET", "http://[fe80::1%25a|b]/ws", "reject", ""),
+            ("GET", "http://[::1]:/ws", "ws", "5b3a3a315d3a"),
+            ("GET", "http://[::1]]/ws", "reject", ""),
+            ("GET", "http://[[::1]/ws", "reject", ""),
+            ("GET", "https://a:1:2/ws", "reject", ""),
+            ("GET", "HTTP://a:1:2/ws", "reject", ""),
+            ("GET", "http://:80/ws", "ws", "3a3830"),
+            ("GET", "http://@/ws", "ws", ""),
+            ("GET", "http://%c3%a9/ws", "ws", "c3a9"),
+            ("GET", "http://h%c3/ws", "ws", "68c3"),
+            ("GET", "http://u%40@h/ws", "ws", "68"),
+            ("GET", "http://u:p:q@h/ws", "ws", "68"),
+            ("GET", "http://u/p@h/ws", "rpc", "75"),
+            (
+                "GET",
+                "http://[::FFFF:1.2.3.4]/ws",
+                "ws",
+                "5b3a3a464646463a312e322e332e345d",
+            ),
+            ("GET", "http://[::ffff:1.2.3]/ws", "reject", ""),
+            (
+                "GET",
+                "http://[0:0:0:0:0:ffff:1.2.3.4]/ws",
+                "ws",
+                "5b303a303a303a303a303a666666663a312e322e332e345d",
+            ),
+            (
+                "GET",
+                "http://[1:2:3:4:5:6:1.2.3.4]/ws",
+                "ws",
+                "5b313a323a333a343a353a363a312e322e332e345d",
+            ),
+            ("GET", "http://[1:2:3:4:5:6:7:1.2.3.4]/ws", "reject", ""),
+            ("GET", "http://[::]/ws", "ws", "5b3a3a5d"),
+            ("GET", "http://[:::]/ws", "reject", ""),
+            ("GET", "http://[1::]/ws", "ws", "5b313a3a5d"),
+            ("GET", "http://[:1]/ws", "reject", ""),
+            ("GET", "http://[1:]/ws", "reject", ""),
+            ("GET", "http://[12345::]/ws", "reject", ""),
+            ("GET", "http://[0x1::]/ws", "reject", ""),
+            ("GET", "http://[::1.2.3.04]/ws", "reject", ""),
+            ("GET", "http://[::256.2.3.4]/ws", "reject", ""),
+            ("GET", "http://[1.2.3.4::]/ws", "reject", ""),
+            ("GET", "http://[::1.2.3.4:1]/ws", "reject", ""),
+            (
+                "GET",
+                "http://[1:2:3:4:5:6:7::]/ws",
+                "ws",
+                "5b313a323a333a343a353a363a373a3a5d",
+            ),
+            ("GET", "http://[::1:2:3:4:5:6:7:8]/ws", "reject", ""),
+            ("GET", "http://[1::2:3:4:5:6:7:8]/ws", "reject", ""),
+            (
+                "GET",
+                "http://[1::1.2.3.4]/ws",
+                "ws",
+                "5b313a3a312e322e332e345d",
+            ),
+            ("GET", "http://[::1.2.3.4.5]/ws", "reject", ""),
+            (
+                "GET",
+                "http://[::ffff:1.2.3.4%25z]/ws",
+                "ws",
+                "5b3a3a666666663a312e322e332e34257a5d",
+            ),
+            ("GET", "http://[1:2:3:4:5:6:7:8::]/ws", "reject", ""),
+            (
+                "GET",
+                "http://[::0:1.2.3.4]/ws",
+                "ws",
+                "5b3a3a303a312e322e332e345d",
+            ),
+            (
+                "GET",
+                "http://[1:2:3:4:5::1.2.3.4]/ws",
+                "ws",
+                "5b313a323a333a343a353a3a312e322e332e345d",
+            ),
+            ("GET", "http://[1:2:3:4:5:6::1.2.3.4]/ws", "reject", ""),
+            (
+                "GET",
+                "http://[a::b%25x%25y]/ws",
+                "ws",
+                "5b613a3a62257825795d",
+            ),
+            ("GET", "http://[a::b%25x%y]/ws", "reject", ""),
+            ("GET", "http://[%61::1]/ws", "reject", ""),
+            ("GET", "http://[::1]%3a80/ws", "reject", ""),
+            ("GET", "http://h%3a80/ws", "reject", ""),
+            ("GET", "http://h:80%31/ws", "reject", ""),
+        ];
+        for (method, target, expected, host) in cases {
+            let parsed = parse_request_target(method, target);
+            let actual = match &parsed {
+                None => "reject".to_string(),
+                Some(parsed) => {
+                    let head = HttpHead {
+                        method: method.to_string(),
+                        target: target.to_string(),
+                        path: parsed.path.clone(),
+                        query: parsed.query.clone(),
+                        ..origin_head(None, Some("localhost"))
+                    };
+                    match route(&head) {
+                        Route::Websocket => "ws".to_string(),
+                        Route::JsonRpc => "rpc".to_string(),
+                        Route::Asterisk if head.method == "OPTIONS" => "options".to_string(),
+                        Route::Asterisk => "asterisk".to_string(),
+                        Route::NotFound => "notfound".to_string(),
+                        Route::Redirect(url) => format!("redirect:{}", hex_escape_non_ascii(&url)),
+                    }
+                }
+            };
+            assert_eq!(
+                actual, *expected,
+                "Go answers {method} {target:?} with {expected}"
+            );
+            if let (Some(parsed), "ws" | "rpc") = (&parsed, *expected) {
+                let hex: String = parsed.host.iter().map(|b| format!("{b:02x}")).collect();
+                assert_eq!(hex, *host, "URL.Host of {method} {target:?}");
+            }
+        }
+    }
+
+    /// dcrd's `CheckOrigin` over requests `net/http` parsed, every row
+    /// its real answer: `url.Parse` semantics for the origin, a missing
+    /// header the only unconditional pass, and `Request.Host` taken from
+    /// an absolute-form target over the `Host` header.  The port allowed
+    /// any empty value, required a literal `null` or a `://`, ignored
+    /// the path and fragment, and always compared against `Host`.
+    #[test]
+    fn check_origin_follows_dcrds_check_over_gos_parse() {
+        let cases: &[(&str, bool)] = &[
+            ("GET /ws HTTP/1.1\r\nHost: localhost\r\n\r\n", true),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin:\r\n\r\n",
+                false,
+            ),
+            ("GET /ws HTTP/1.1\r\nHost:\r\nOrigin:\r\n\r\n", true),
+            ("GET /ws HTTP/1.0\r\nOrigin:\r\n\r\n", true),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: null\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: null?x\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: null#y\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: NULL\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: nu%6cl\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: file:foo\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: FILE:foo\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: file://\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: file:///tmp/x.html\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: file://%zz\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://127.0.0.1/%zz\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://127.0.0.1/ok\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://127.0.0.1#%zz\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://127.0.0.1#ok\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://127.0.0.1?%zz\r\n\r\n",
+                true,
+            ),
+            (
+                "GET http://127.0.0.1/ws HTTP/1.1\r\nHost: evil.com\r\nOrigin: http://evil.com\r\n\r\n",
+                false,
+            ),
+            (
+                "GET http://127.0.0.1/ws HTTP/1.1\r\nHost: evil.com\r\nOrigin: http://127.0.0.1\r\n\r\n",
+                true,
+            ),
+            (
+                "GET http://@/ws HTTP/1.1\r\nHost: evil.com\r\nOrigin: http://evil.com\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: //localhost\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: //localhost:1\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: ///localhost\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: localhost\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http:/localhost\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http:localhost\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http://local host\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http://user@localhost\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http://us%zz@localhost\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http://LOCALHOST:8080/x\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost:x\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: [::1]:9109\r\nOrigin: http://[::1]:80\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: [::1]:9109\r\nOrigin: http://[::1\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http://%6cocalhost\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: 1http://localhost\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: ://localhost\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nOrigin: http://evil\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http://evil\r\nOrigin: http://localhost\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.0\r\nOrigin: http://localhost\r\n\r\n",
+                false,
+            ),
+            ("GET /ws HTTP/1.0\r\nOrigin: http:///x\r\n\r\n", true),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http://a:1:2\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: a\r\nOrigin: foo://a:1:2\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: foo://localhost:1\r\n\r\n",
+                true,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: file\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: /null\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: x:null\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: a:b/null\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: a/b:null\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: *\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: [a]:80]\r\nOrigin: http://a\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost:80:90\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: localhost\r\nOrigin: http://[fe80::1%25en0]:80\r\n\r\n",
+                false,
+            ),
+            (
+                "GET /ws HTTP/1.1\r\nHost: [fe80::1%en0]:80\r\nOrigin: http://[fe80::1%25en0]:80\r\n\r\n",
+                true,
+            ),
+        ];
+        for (raw, expected) in cases {
+            let Ok(head) = head_of(raw) else {
+                panic!("{raw:?} parses");
+            };
+            assert_eq!(
+                check_origin(&head),
+                *expected,
+                "dcrd answers {expected} for {raw:?}"
+            );
+        }
+    }
+
+    /// `http.Redirect`'s shape per method (a real server's answers,
+    /// `Date` aside): the HTML type for GET and HEAD only, the anchor for
+    /// GET only and built from the URL before its non-ASCII bytes are
+    /// escaped, `Content-Length: 0` for every method but HEAD.  The port
+    /// sent the type and the anchor to every method, and a HEAD answer
+    /// carried body bytes.
+    #[test]
+    fn redirects_are_shaped_per_method() {
+        let written = |method: &str, url: &str| {
+            let mut out = Vec::new();
+            write_redirect(&mut out, method, (1, 1), url).expect("write");
+            let text = String::from_utf8(out).expect("utf-8");
+            text.split("\r\n")
+                .filter(|line| !line.starts_with("Date: "))
+                .collect::<Vec<_>>()
+                .join("\r\n")
+        };
+        assert_eq!(
+            written("POST", "/"),
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: /\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(
+            written("PUT", "/?\u{e9}"),
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: /?%c3%a9\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(
+            written("HEAD", "/"),
+            "HTTP/1.1 307 Temporary Redirect\r\nContent-Type: text/html; charset=utf-8\r\nLocation: /\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(
+            written("GET", "/?\u{e9}&<a>"),
+            "HTTP/1.1 307 Temporary Redirect\r\nContent-Type: text/html; charset=utf-8\r\nLocation: /?%c3%a9&<a>\r\nContent-Length: 54\r\nConnection: close\r\n\r\n<a href=\"/?\u{e9}&amp;&lt;a&gt;\">Temporary Redirect</a>.\n\n"
+        );
+    }
+
+    /// Drop the `Date` line, the one part of an answer that varies.
+    fn undated(out: Vec<u8>) -> String {
+        let text = String::from_utf8(out).expect("utf-8");
+        text.split("\r\n")
+            .filter(|line| !line.starts_with("Date: "))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
+    /// The answers Go writes through its `ResponseWriter`, per method
+    /// and protocol, each a real server's (header order, `Date`, and the
+    /// `Connection: close` recorded in PARITY aside): the status line
+    /// mirrors an HTTP/1.0 request; a HEAD keeps `http.Error`'s
+    /// `Content-Length` but not its body; and a bodiless answer to a HEAD
+    /// carries no `Content-Length` at all.  The port wrote `HTTP/1.1` and
+    /// the body whatever the request, and a `Content-Length: 0` on the
+    /// 417 and the asterisk 400 to a HEAD.
+    #[test]
+    fn answers_follow_the_request_method_and_protocol() {
+        let unauthorized = |method: &str, version| {
+            let mut out = Vec::new();
+            write_unauthorized(&mut out, method, version).expect("write");
+            undated(out)
+        };
+        let challenge = "401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"dcrd RPC\"\r\nContent-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 18\r\nConnection: close\r\n\r\n";
+        assert_eq!(
+            unauthorized("GET", (1, 1)),
+            format!("HTTP/1.1 {challenge}401 Unauthorized.\n")
+        );
+        assert_eq!(
+            unauthorized("HEAD", (1, 1)),
+            format!("HTTP/1.1 {challenge}")
+        );
+        assert_eq!(
+            unauthorized("GET", (1, 0)),
+            format!("HTTP/1.0 {challenge}401 Unauthorized.\n")
+        );
+        assert_eq!(
+            unauthorized("HEAD", (1, 0)),
+            format!("HTTP/1.0 {challenge}")
+        );
+
+        let error = |method: &str, version, status: &str, body: &str| {
+            let mut out = Vec::new();
+            write_handler_error(&mut out, method, version, status, body).expect("write");
+            undated(out)
+        };
+        let plain = "Content-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff";
+        assert_eq!(
+            error(
+                "HEAD",
+                (1, 1),
+                "503 Service Unavailable",
+                "503 Too busy.  Try again later."
+            ),
+            format!(
+                "HTTP/1.1 503 Service Unavailable\r\n{plain}\r\nContent-Length: 32\r\nConnection: close\r\n\r\n"
+            )
+        );
+        assert_eq!(
+            error(
+                "GET",
+                (1, 0),
+                "503 Service Unavailable",
+                "503 Too busy.  Try again later."
+            ),
+            format!(
+                "HTTP/1.0 503 Service Unavailable\r\n{plain}\r\nContent-Length: 32\r\nConnection: close\r\n\r\n503 Too busy.  Try again later.\n"
+            )
+        );
+        assert_eq!(
+            error("CONNECT", (1, 0), "404 Not Found", "404 page not found"),
+            format!(
+                "HTTP/1.0 404 Not Found\r\n{plain}\r\nContent-Length: 19\r\nConnection: close\r\n\r\n404 page not found\n"
+            )
+        );
+        assert_eq!(
+            error(
+                "HEAD",
+                (1, 1),
+                "400 Bad Request",
+                "400 error reading JSON message: chunked line ends with bare LF"
+            ),
+            format!(
+                "HTTP/1.1 400 Bad Request\r\n{plain}\r\nContent-Length: 63\r\nConnection: close\r\n\r\n"
+            )
+        );
+
+        let expectation = |method: &str, version| {
+            let mut out = Vec::new();
+            write_expectation_failed(&mut out, method, version).expect("write");
+            undated(out)
+        };
+        assert_eq!(
+            expectation("POST", (1, 0)),
+            "HTTP/1.0 417 Expectation Failed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert_eq!(
+            expectation("HEAD", (1, 1)),
+            "HTTP/1.1 417 Expectation Failed\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(
+            expectation("HEAD", (1, 0)),
+            "HTTP/1.0 417 Expectation Failed\r\nConnection: close\r\n\r\n"
+        );
+
+        let empty = |method: &str, version, status: &str| {
+            let mut out = Vec::new();
+            write_empty_ok(&mut out, method, version, status).expect("write");
+            undated(out)
+        };
+        assert_eq!(
+            empty("HEAD", (1, 1), "400 Bad Request"),
+            "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(
+            empty("HEAD", (1, 0), "400 Bad Request"),
+            "HTTP/1.0 400 Bad Request\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(
+            empty("GET", (1, 0), "400 Bad Request"),
+            "HTTP/1.0 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(
+            empty("OPTIONS", (1, 0), "200 OK"),
+            "HTTP/1.0 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+
+        let redirect = |method: &str, version| {
+            let mut out = Vec::new();
+            write_redirect(&mut out, method, version, "/").expect("write");
+            undated(out)
+        };
+        assert_eq!(
+            redirect("GET", (1, 0)),
+            "HTTP/1.0 307 Temporary Redirect\r\nContent-Type: text/html; charset=utf-8\r\nLocation: /\r\nContent-Length: 37\r\nConnection: close\r\n\r\n<a href=\"/\">Temporary Redirect</a>.\n\n"
+        );
+        assert_eq!(
+            redirect("POST", (1, 0)),
+            "HTTP/1.0 307 Temporary Redirect\r\nLocation: /\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+    }
+
+    /// The JSON-RPC reply as dcrd's hijacked writer frames it: the
+    /// request's protocol in the status line, the handler's two headers
+    /// in `Header.Write`'s order, and nothing else -- no `Date`, no
+    /// `Content-Length`.
+    #[test]
+    fn the_json_reply_is_framed_as_dcrd_frames_it() {
+        let written = |version| {
+            let mut out = Vec::new();
+            write_json_response(&mut out, version, b"{}\n").expect("write");
+            String::from_utf8(out).expect("utf-8")
+        };
+        assert_eq!(
+            written((1, 1)),
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{}\n"
+        );
+        assert_eq!(
+            written((1, 0)),
+            "HTTP/1.0 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{}\n"
+        );
+    }
+
+    /// `hasToken`, as `expectsContinue` applies it.
+    #[test]
+    fn has_token_matches_gos() {
+        for (value, expected) in [
+            ("100-continue", true),
+            ("100-Continue", true),
+            ("100-continue, foo", true),
+            ("foo,100-continue", true),
+            ("foo\t100-continue", true),
+            (" 100-continue ", true),
+            ("100-continuex", false),
+            ("x100-continue", false),
+            ("100-continue;q=1", false),
+            ("", false),
+        ] {
+            assert_eq!(has_token(value, "100-continue"), expected, "{value:?}");
+        }
+    }
+
+    /// A TLS session ends in a `close_notify`, as Go's `tls.Conn.Close`
+    /// ends it, so a reply framed by the close reads as complete.  It
+    /// ended in a bare FIN, which rustls, like OpenSSL, reports as a
+    /// truncation.
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn a_tls_session_ends_with_close_notify() {
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+        #[derive(Debug)]
+        struct AnyCertificate;
+        impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (cert, key) = load_or_generate_cert_pair(
+            &dir.path().join("rpc.cert"),
+            &dir.path().join("rpc.key"),
+            &[],
+            Curve::P256,
+        )
+        .expect("a cert pair");
+        let server_config = tls_server_config(&cert, &key, None).expect("server config");
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyCertificate))
+        .with_no_client_auth();
+
+        let (server_sock, client_sock) = loopback_pair();
+        let serving = thread::spawn(move || {
+            let session = rustls::ServerConnection::new(server_config).expect("session");
+            let mut tls = TlsRpcStream(rustls::StreamOwned::new(session, server_sock));
+            let mut request = [0u8; 4];
+            tls.read_exact(&mut request).expect("read the request");
+            // A reply framed by the close, as the connection loop's
+            // errors and the hijacked JSON-RPC reply are.
+            tls.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nbody")
+                .expect("write the reply");
+            tls.flush().expect("flush");
+        });
+
+        let name = ServerName::try_from("localhost").expect("server name");
+        let session = rustls::ClientConnection::new(Arc::new(client_config), name).expect("client");
+        let mut client = rustls::StreamOwned::new(session, client_sock);
+        client.write_all(b"ping").expect("send");
+        let mut reply = Vec::new();
+        let ended = client.read_to_end(&mut reply);
+        serving.join().expect("the server side finishes");
+        assert!(ended.is_ok(), "the session ended cleanly: {ended:?}");
+        assert!(
+            reply.ends_with(b"body"),
+            "{:?}",
+            String::from_utf8_lossy(&reply)
+        );
     }
 }

@@ -9,6 +9,7 @@
 //! sinks the daemon installs; dcrd's locks are unnecessary under Rust
 //! ownership.
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
@@ -237,6 +238,29 @@ impl RemovalFrame {
             tree: tree_for_type(tx_type),
             num_outputs: tx.tx_out.len() as u32,
             next_output: 0,
+        }
+    }
+}
+
+/// One pending orphan in the iterative redeemer cascade of
+/// [`TxPool::remove_orphan`]: the output scan of a [`RemovalFrame`]
+/// plus the redeemers of the output scanned last that are still to be
+/// removed, which is the loop state a recursive call frame of dcrd's
+/// `removeOrphan` holds.
+struct OrphanRemovalFrame {
+    /// The orphan and how far the scan of its outputs has progressed.
+    scan: RemovalFrame,
+    /// The orphans redeeming the output scanned last, not yet removed,
+    /// in reverse visiting order.
+    redeemers: Vec<Hash>,
+}
+
+impl OrphanRemovalFrame {
+    /// A frame positioned at the first output of the orphan.
+    fn new(otx: &OrphanTx) -> OrphanRemovalFrame {
+        OrphanRemovalFrame {
+            scan: RemovalFrame::new(&otx.tx, &otx.tx_hash),
+            redeemers: Vec::new(),
         }
     }
 }
@@ -530,12 +554,71 @@ impl<C: PoolChain> TxPool<C> {
 
     /// Remove the orphan and, when requested, all orphans that redeem
     /// its outputs (dcrd `removeOrphan`).
+    ///
+    /// dcrd recurses into the redeemers, which is safe there because
+    /// Go grows goroutine stacks on demand.  Rust threads have a fixed
+    /// stack and overflowing it aborts the process, so the cascade runs
+    /// off an explicit worklist, as [`Self::remove_transaction`] does.
+    /// A chain of orphans costs a peer nothing to relay, its depth is
+    /// bounded only by `--maxorphantx`, and peer disconnects, the
+    /// expiry scan, the double-spend removal and rejected orphans all
+    /// drive this cascade.  Each orphan is unlinked from the previous
+    /// orphan index on the way down and dropped from the orphan pool
+    /// once all of its outputs have been scanned, exactly where the
+    /// recursive form did both, so the set removed is identical.
     fn remove_orphan(&mut self, tx_hash: &Hash, remove_redeemers: bool) {
         // Nothing to do if the passed tx does not exist in the orphan
         // pool.
-        let Some(otx) = self.orphans.get(&tx_hash.0).cloned() else {
+        let Some(otx) = self.unlink_orphan(tx_hash) else {
             return;
         };
+
+        if !remove_redeemers {
+            // Remove the transaction from the orphan pool.
+            self.orphans.remove(&tx_hash.0);
+            return;
+        }
+
+        // Remove any orphans that redeem outputs from this one, depth
+        // first.  The redeemers of an output are listed when the scan
+        // reaches it, as the recursive form listed them, and one that
+        // an earlier branch of the cascade already removed is skipped.
+        let mut frames = vec![OrphanRemovalFrame::new(&otx)];
+        while let Some(frame) = frames.last_mut() {
+            if let Some(orphan_hash) = frame.redeemers.pop() {
+                if let Some(redeemer) = self.unlink_orphan(&orphan_hash) {
+                    frames.push(OrphanRemovalFrame::new(&redeemer));
+                }
+                continue;
+            }
+
+            let scan = &mut frame.scan;
+            if scan.next_output < scan.num_outputs {
+                let key = (scan.tx_hash.0, scan.next_output, scan.tree);
+                scan.next_output += 1;
+                // Reversed so that popping visits them in the index's
+                // order.
+                frame.redeemers = self
+                    .orphans_by_prev
+                    .get(&key)
+                    .map(|m| m.keys().rev().map(|k| Hash(*k)).collect())
+                    .unwrap_or_default();
+                continue;
+            }
+
+            // Every output has been scanned: remove the transaction
+            // from the orphan pool.
+            let done = scan.tx_hash;
+            frames.pop();
+            self.orphans.remove(&done.0);
+        }
+    }
+
+    /// The head of dcrd `removeOrphan`: look the orphan up and remove
+    /// its references from the previous orphan index, leaving the
+    /// orphan pool itself untouched.  `None` when it is not an orphan.
+    fn unlink_orphan(&mut self, tx_hash: &Hash) -> Option<Arc<OrphanTx>> {
+        let otx = self.orphans.get(&tx_hash.0).cloned()?;
 
         // Remove the reference from the previous orphan index.
         for tx_in in &otx.tx.tx_in {
@@ -550,27 +633,7 @@ impl<C: PoolChain> TxPool<C> {
                 }
             }
         }
-
-        // Remove any orphans that redeem outputs from this one if
-        // requested.
-        if remove_redeemers {
-            let tx_type = dcroxide_stake::determine_tx_type(&otx.tx);
-            let tree = tree_for_type(tx_type);
-            for tx_out_idx in 0..otx.tx.tx_out.len() as u32 {
-                let key = (tx_hash.0, tx_out_idx, tree);
-                let redeemers: Vec<Hash> = self
-                    .orphans_by_prev
-                    .get(&key)
-                    .map(|m| m.keys().map(|k| Hash(*k)).collect())
-                    .unwrap_or_default();
-                for orphan_hash in redeemers {
-                    self.remove_orphan(&orphan_hash, true);
-                }
-            }
-        }
-
-        // Remove the transaction from the orphan pool.
-        self.orphans.remove(&tx_hash.0);
+        Some(otx)
     }
 
     /// Remove the passed orphan transaction from the orphan pool (dcrd
@@ -1119,6 +1182,13 @@ impl<C: PoolChain> TxPool<C> {
 
         // Attempt to populate any missing inputs from the transaction
         // pool.
+        //
+        // The parent's hash is the outpoint's hash, the key each map
+        // found it under.  It is passed along rather than recomputed
+        // per input: dcrd's `AddTxOut` reads the hash its `dcrutil.Tx`
+        // memoizes, and re-serializing the parent for every input that
+        // spends it would cost O(inputs x parent size) before any fee
+        // or script check rejects the candidate.
         for tx_in in &tx.tx_in {
             let prev_out = &tx_in.previous_out_point;
             if view.lookup_entry(prev_out).is_some_and(|e| !e.is_spent()) {
@@ -1126,8 +1196,9 @@ impl<C: PoolChain> TxPool<C> {
             }
 
             if let Some(pool_desc) = self.pool.get(&prev_out.hash.0) {
-                view.add_tx_out(
+                view.add_tx_out_with_hash(
                     &pool_desc.tx,
+                    &prev_out.hash,
                     prev_out.index,
                     UNMINED_HEIGHT,
                     NULL_BLOCK_INDEX,
@@ -1136,8 +1207,9 @@ impl<C: PoolChain> TxPool<C> {
             }
 
             if let Some(staged_desc) = self.staged.get(&prev_out.hash.0) {
-                view.add_tx_out(
+                view.add_tx_out_with_hash(
                     &staged_desc.tx,
+                    &prev_out.hash,
                     prev_out.index,
                     UNMINED_HEIGHT,
                     NULL_BLOCK_INDEX,
@@ -1146,8 +1218,9 @@ impl<C: PoolChain> TxPool<C> {
             }
 
             if let Some(transient_tx) = self.transient.get(&prev_out.hash.0) {
-                view.add_tx_out(
+                view.add_tx_out_with_hash(
                     transient_tx,
+                    &prev_out.hash,
                     prev_out.index,
                     UNMINED_HEIGHT,
                     NULL_BLOCK_INDEX,
@@ -1258,16 +1331,23 @@ impl<C: PoolChain> TxPool<C> {
     /// The internal acceptance gauntlet (dcrd
     /// `maybeAcceptTransaction`): returns the missing parents when the
     /// transaction is an orphan.
+    ///
+    /// `tx_hash` is the transaction's hash, which every caller already
+    /// holds, standing in for the hash dcrd's `dcrutil.Tx` memoizes.
+    /// The transaction is borrowed until the fraud proof data has to be
+    /// rewritten, where dcrd also switches to a copy
+    /// (`dcrutil.NewTxDeepTxIns`), so a duplicate or an early rejection
+    /// costs no copy and no rehash.
     fn maybe_accept_transaction(
         &mut self,
         tx: &MsgTx,
+        tx_hash: &Hash,
         is_new: bool,
         allow_high_fees: bool,
         reject_dup_orphans: bool,
         check_tx_flags: AgendaFlags,
     ) -> Result<Vec<OutPoint>, PoolError> {
-        let mut tx = tx.clone();
-        let tx_hash = tx.tx_hash();
+        let tx_hash = *tx_hash;
 
         // Don't accept the transaction if it already exists in the
         // pool.  This applies to orphan transactions as well when the
@@ -1282,7 +1362,7 @@ impl<C: PoolChain> TxPool<C> {
 
         // Perform preliminary validation checks on the transaction
         // using the invariant rules from the chain.
-        check_transaction(&tx, &self.params, check_tx_flags)
+        check_transaction(tx, &self.params, check_tx_flags)
             .map_err(|e| PoolError::Rule(chain_rule_error(e)))?;
 
         // Determine active agendas based on flags.
@@ -1302,7 +1382,7 @@ impl<C: PoolChain> TxPool<C> {
         };
 
         // Determine the type of transaction and its tree.
-        let tx_type = dcroxide_stake::determine_tx_type(&tx);
+        let tx_type = dcroxide_stake::determine_tx_type(tx);
         let tree = tree_for_type(tx_type);
 
         // A standalone transaction must not be a treasurybase
@@ -1313,7 +1393,7 @@ impl<C: PoolChain> TxPool<C> {
         }
 
         // A standalone transaction must not be a coinbase transaction.
-        if dcroxide_standalone::is_coin_base_tx(&tx, is_treasury_enabled) {
+        if dcroxide_standalone::is_coin_base_tx(tx, is_treasury_enabled) {
             let str = format!("transaction {tx_hash} is an individual coinbase");
             return Err(tx_rule_error(ErrorKind::Coinbase, str).into());
         }
@@ -1326,7 +1406,7 @@ impl<C: PoolChain> TxPool<C> {
 
         // Don't accept transactions that will be expired as of the
         // next block.
-        if is_expired_tx(&tx, next_block_height) {
+        if is_expired_tx(tx, next_block_height) {
             let str = format!("transaction {tx_hash} expired at height {}", tx.expiry);
             return Err(tx_rule_error(ErrorKind::Expired, str).into());
         }
@@ -1365,7 +1445,7 @@ impl<C: PoolChain> TxPool<C> {
         let median_time = self.chain.past_median_time();
         if !self.policy.accept_non_std
             && let Err(err) = check_transaction_standard(
-                &tx,
+                tx,
                 tx_type,
                 next_block_height,
                 median_time,
@@ -1399,7 +1479,7 @@ impl<C: PoolChain> TxPool<C> {
         // every transaction type, so it sits ahead of the vote/revocation
         // branch rather than inside it.
         if let Some(mix) = &self.mixpool_probe
-            && mix.non_mix_spends_pair_request(&tx)
+            && mix.non_mix_spends_pair_request(tx)
         {
             let str =
                 format!("non-mix transaction {tx_hash} spends current mixpool pair request UTXOs");
@@ -1410,11 +1490,11 @@ impl<C: PoolChain> TxPool<C> {
         // transaction may not use any of the same outputs as other
         // transactions already in the pool.
         if !is_vote && !is_revocation {
-            self.check_pool_double_spend(&tx, tx_type, is_treasury_enabled)?;
+            self.check_pool_double_spend(tx, tx_type, is_treasury_enabled)?;
         } else if is_vote {
             // Reject votes on blocks that already have a vote that
             // spends the same ticket available.
-            self.check_vote_double_spend(&tx, &tx_hash)?;
+            self.check_vote_double_spend(tx, &tx_hash)?;
 
             let mut vote_already_found = 0usize;
             for pool_desc in self.pool.values() {
@@ -1425,7 +1505,7 @@ impl<C: PoolChain> TxPool<C> {
                 }
                 if vote_already_found >= MAX_VOTE_DOUBLE_SPENDS {
                     let str = format!(
-                        "transaction {:?} in the pool with more than \
+                        "transaction {} in the pool with more than \
                          {MAX_VOTE_DOUBLE_SPENDS} votes",
                         tx.tx_in[1].previous_out_point
                     );
@@ -1438,7 +1518,7 @@ impl<C: PoolChain> TxPool<C> {
                     && pool_desc.tx.tx_in[0].previous_out_point == tx.tx_in[0].previous_out_point
                 {
                     let str = format!(
-                        "transaction {:?} in the pool as a revocation. Only one \
+                        "transaction {} in the pool as a revocation. Only one \
                          revocation is allowed.",
                         tx.tx_in[0].previous_out_point
                     );
@@ -1449,7 +1529,7 @@ impl<C: PoolChain> TxPool<C> {
 
         // Votes that are on too old of blocks are rejected.
         if is_vote {
-            let (_, vote_height) = dcroxide_stake::ssgen_block_voted_on(&tx);
+            let (_, vote_height) = dcroxide_stake::ssgen_block_voted_on(tx);
             if i64::from(vote_height) < next_block_height - i64::from(self.policy.max_vote_age)
                 && !self.policy.allow_old_votes
             {
@@ -1465,7 +1545,7 @@ impl<C: PoolChain> TxPool<C> {
         // Fetch all of the unspent transaction outputs referenced by
         // the inputs to this transaction along with the transaction
         // itself for duplicate detection.
-        let mut utxo_view = self.fetch_input_utxos(&tx, &tx_hash, tree, is_treasury_enabled)?;
+        let mut utxo_view = self.fetch_input_utxos(tx, &tx_hash, tree, is_treasury_enabled)?;
 
         // Don't allow the transaction if it exists in the main chain
         // and is not already fully spent.
@@ -1521,8 +1601,11 @@ impl<C: PoolChain> TxPool<C> {
 
         // Update the fraud proof data on the transaction inputs as
         // necessary so it is correct when relaying the transaction.
+        let mut tx = Cow::Borrowed(tx);
         if update_fraud_proof {
-            for (i, tx_in) in tx.tx_in.iter_mut().enumerate() {
+            // Copy the transaction so the caller's is left as it was
+            // (dcrd `dcrutil.NewTxDeepTxIns`).
+            for (i, tx_in) in tx.to_mut().tx_in.iter_mut().enumerate() {
                 // Skip stakebase inputs and treasury spends.
                 if (i == 0 && is_vote) || is_tspend {
                     continue;
@@ -1694,7 +1777,7 @@ impl<C: PoolChain> TxPool<C> {
         }
 
         let tx_desc = Arc::new(TxDesc {
-            tx: tx.clone(),
+            tx: tx.into_owned(),
             tx_hash,
             tree,
             tx_type,
@@ -1708,18 +1791,19 @@ impl<C: PoolChain> TxPool<C> {
         // Tickets cannot be included in a block until all inputs have
         // been approved by stakeholders, so tickets with mempool
         // inputs are placed in a separate stage pool.
-        if tx_type == TxType::SStx && self.has_mempool_input(&tx) {
+        if tx_type == TxType::SStx && self.has_mempool_input(&tx_desc.tx) {
             self.stage_transaction(tx_desc);
             return Ok(Vec::new());
         }
 
         // Add to transaction pool.
-        self.add_transaction(tx_desc);
+        self.add_transaction(tx_desc.clone());
+        let tx = &tx_desc.tx;
 
         // A regular transaction entering the mempool causes mempool
         // tickets that redeem it to move to the stage pool.
         if !is_new && tx_type == TxType::Regular {
-            for redeemer in Self::collect_redeemers(&self.outpoints, &tx, &tx_hash) {
+            for redeemer in Self::collect_redeemers(&self.outpoints, tx, &tx_hash) {
                 if redeemer.tx_type == TxType::SStx {
                     self.remove_transaction(&redeemer.tx, &redeemer.tx_hash, true);
                     self.stage_transaction(redeemer);
@@ -1729,7 +1813,7 @@ impl<C: PoolChain> TxPool<C> {
 
         // Keep track of votes separately.
         if is_vote {
-            self.insert_vote(&tx, &tx_hash);
+            self.insert_vote(tx, &tx_hash);
         }
 
         // Keep track of tspends separately.
@@ -1820,7 +1904,7 @@ impl<C: PoolChain> TxPool<C> {
         is_new: bool,
     ) -> Result<Vec<OutPoint>, PoolError> {
         let check_tx_flags = self.determine_check_tx_flags()?;
-        self.maybe_accept_transaction(tx, is_new, true, true, check_tx_flags)
+        self.maybe_accept_transaction(tx, &tx.tx_hash(), is_new, true, true, check_tx_flags)
     }
 
     /// Handle the insertion of a set of not new transactions that may
@@ -1840,7 +1924,9 @@ impl<C: PoolChain> TxPool<C> {
         let mut errors = Vec::new();
         for (tx, hash) in txns.iter().zip(&hashes).rev() {
             self.transient.remove(&hash.0);
-            if let Err(err) = self.maybe_accept_transaction(tx, false, true, true, check_tx_flags) {
+            if let Err(err) =
+                self.maybe_accept_transaction(tx, hash, false, true, true, check_tx_flags)
+            {
                 if !is_double_spend_or_duplicate_error(&err) {
                     self.remove_transaction(tx, hash, true);
                     continue;
@@ -1903,6 +1989,7 @@ impl<C: PoolChain> TxPool<C> {
                 for (orphan_hash, orphan_tx) in orphans {
                     match self.maybe_accept_transaction(
                         &orphan_tx,
+                        &orphan_hash,
                         true,
                         true,
                         false,
@@ -2010,8 +2097,14 @@ impl<C: PoolChain> TxPool<C> {
         let tx_hash = tx.tx_hash();
 
         // Potentially accept the transaction to the memory pool.
-        let missing_parents =
-            self.maybe_accept_transaction(tx, true, allow_high_fees, true, check_tx_flags)?;
+        let missing_parents = self.maybe_accept_transaction(
+            tx,
+            &tx_hash,
+            true,
+            allow_high_fees,
+            true,
+            check_tx_flags,
+        )?;
 
         if missing_parents.is_empty() {
             // Accept any orphan transactions that depend on this
@@ -2033,7 +2126,7 @@ impl<C: PoolChain> TxPool<C> {
             // Only use the first missing parent transaction in the
             // error message.
             let str = format!(
-                "orphan transaction {tx_hash} references output {:?} of unknown \
+                "orphan transaction {tx_hash} references output {} of unknown \
                  or fully-spent transaction",
                 missing_parents[0]
             );
@@ -2601,6 +2694,200 @@ mod removal_cascade_tests {
         assert!(!pool.is_transaction_in_pool(&hashes[1]));
         assert!(pool.is_transaction_in_pool(&hashes[2]));
     }
+
+    /// The tag every orphan of the orphan cascade tests is filed under,
+    /// standing in for the relaying peer.
+    const ORPHAN_TAG: Tag = 7;
+
+    /// Add a chain of `len` orphans to the orphan pool, the head
+    /// spending the missing seed output and each later link the single
+    /// output of the one before it, and return their hashes in chain
+    /// order.  None of them reaches the main pool: a peer relays such a
+    /// chain for the cost of reaching the missing-parents return.
+    fn fill_orphan_chain(pool: &mut TxPool<StubChain>, len: usize) -> Vec<Hash> {
+        pool.policy.max_orphan_txs = len as i64 + 1;
+        let mut hashes = Vec::with_capacity(len);
+        let mut prev = OutPoint {
+            hash: SEED_HASH,
+            index: 0,
+            tree: TX_TREE_REGULAR,
+        };
+        for _ in 0..len {
+            let tx = linked_tx(prev, 0);
+            let tx_hash = tx.tx_hash();
+            pool.add_orphan(&tx, &tx_hash, ORPHAN_TAG);
+            hashes.push(tx_hash);
+            prev = OutPoint {
+                hash: tx_hash,
+                index: 0,
+                tree: TX_TREE_REGULAR,
+            };
+        }
+        hashes
+    }
+
+    #[test]
+    fn a_long_orphan_chain_is_removed_without_consuming_the_stack() {
+        let state = on_a_small_stack(|| {
+            let mut pool = new_pool();
+            let hashes = fill_orphan_chain(&mut pool, DEEP_CHAIN_LEN);
+            assert_eq!(pool.orphans.len(), DEEP_CHAIN_LEN);
+
+            // Removing the head with its redeemers walks the whole
+            // chain, as a rejected orphan or the expiry scan does.
+            pool.remove_orphan(&hashes[0], true);
+            (pool.orphans.len(), pool.orphans_by_prev.len())
+        });
+
+        assert_eq!(state, (0, 0));
+    }
+
+    #[test]
+    fn a_disconnecting_peer_orphan_chain_is_removed_without_consuming_the_stack() {
+        let state = on_a_small_stack(|| {
+            let mut pool = new_pool();
+            fill_orphan_chain(&mut pool, DEEP_CHAIN_LEN);
+
+            // The peer-disconnect path, which reaches the chain at
+            // whichever link has the smallest hash.
+            pool.remove_orphans_by_tag(ORPHAN_TAG);
+            (pool.orphans.len(), pool.orphans_by_prev.len())
+        });
+
+        assert_eq!(state, (0, 0));
+    }
+
+    /// A deterministic xorshift draw for shaping the orphan graph.
+    fn next_draw(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The orphans that dcrd's recursive `removeOrphan(root, true)`
+    /// removes: the root and everything reachable from it through
+    /// orphans spending an output of an orphan already reached.
+    fn reachable_orphans(pool: &TxPool<StubChain>, root: &Hash) -> BTreeSet<[u8; 32]> {
+        let mut reached = BTreeSet::from([root.0]);
+        let mut pending = vec![root.0];
+        while let Some(parent) = pending.pop() {
+            for otx in pool.orphans.values() {
+                let spends_parent = otx
+                    .tx
+                    .tx_in
+                    .iter()
+                    .any(|tx_in| tx_in.previous_out_point.hash.0 == parent);
+                if spends_parent && reached.insert(otx.tx_hash.0) {
+                    pending.push(otx.tx_hash.0);
+                }
+            }
+        }
+        reached
+    }
+
+    /// The previous orphan index rebuilt from the orphans in the pool,
+    /// which the cascade must leave the index equal to.
+    fn rebuilt_orphan_index(pool: &TxPool<StubChain>) -> BTreeMap<OutKey, BTreeSet<[u8; 32]>> {
+        let mut index: BTreeMap<OutKey, BTreeSet<[u8; 32]>> = BTreeMap::new();
+        for otx in pool.orphans.values() {
+            for tx_in in &otx.tx.tx_in {
+                index
+                    .entry(out_key(&tx_in.previous_out_point))
+                    .or_default()
+                    .insert(otx.tx_hash.0);
+            }
+        }
+        index
+    }
+
+    /// The worklist removes exactly the orphans dcrd's recursion does
+    /// on a branching graph: orphans with several outputs, several
+    /// redeemers per output, and redeemers reachable along more than
+    /// one path, and it leaves the previous orphan index consistent.
+    #[test]
+    fn the_orphan_cascade_removes_what_the_recursion_removes() {
+        let mut draw_state = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..20 {
+            let mut pool = new_pool();
+            pool.policy.max_orphan_txs = 1_000;
+            let mut outputs: Vec<OutPoint> = Vec::new();
+            let mut hashes: Vec<Hash> = Vec::new();
+            for i in 0..60u32 {
+                // Each orphan spends one to three outputs of earlier
+                // orphans, or a missing parent when there are none yet
+                // or the draw says so.
+                let num_in = 1 + next_draw(&mut draw_state) % 3;
+                let mut tx_in = Vec::new();
+                for j in 0..num_in {
+                    let pick = next_draw(&mut draw_state);
+                    let prev = if outputs.is_empty() || pick.is_multiple_of(5) {
+                        OutPoint {
+                            hash: Hash([0xee; 32]),
+                            index: i * 4 + j as u32,
+                            tree: TX_TREE_REGULAR,
+                        }
+                    } else {
+                        outputs[(pick / 5) as usize % outputs.len()]
+                    };
+                    if tx_in.iter().any(|t: &TxIn| t.previous_out_point == prev) {
+                        continue;
+                    }
+                    tx_in.push(linked_tx(prev, 0).tx_in.remove(0));
+                }
+                let num_out = 1 + next_draw(&mut draw_state) % 3;
+                let template = linked_tx(outputs.first().copied().unwrap_or_default(), 0);
+                let tx = MsgTx {
+                    tx_in,
+                    tx_out: (0..num_out)
+                        .map(|k| TxOut {
+                            value: 1_000 + k as i64,
+                            ..template.tx_out[0].clone()
+                        })
+                        .collect(),
+                    ..template
+                };
+                assert_eq!(dcroxide_stake::determine_tx_type(&tx), TxType::Regular);
+                let tx_hash = tx.tx_hash();
+                pool.add_orphan(&tx, &tx_hash, ORPHAN_TAG);
+                for k in 0..num_out as u32 {
+                    outputs.push(OutPoint {
+                        hash: tx_hash,
+                        index: k,
+                        tree: TX_TREE_REGULAR,
+                    });
+                }
+                hashes.push(tx_hash);
+            }
+
+            let root = hashes[(next_draw(&mut draw_state) % 20) as usize];
+            let removed = reachable_orphans(&pool, &root);
+            let expected: BTreeSet<[u8; 32]> = pool
+                .orphans
+                .keys()
+                .filter(|hash| !removed.contains(*hash))
+                .copied()
+                .collect();
+
+            pool.remove_orphan(&root, true);
+
+            let left: BTreeSet<[u8; 32]> = pool.orphans.keys().copied().collect();
+            assert_eq!(left, expected, "round {round}: orphans left behind");
+            let index: BTreeMap<OutKey, BTreeSet<[u8; 32]>> = pool
+                .orphans_by_prev
+                .iter()
+                .map(|(key, orphans)| (*key, orphans.keys().copied().collect()))
+                .collect();
+            assert_eq!(index, rebuilt_orphan_index(&pool), "round {round}: index");
+
+            // Without redeemers only the orphan itself goes.
+            if let Some(&survivor) = left.iter().next() {
+                pool.remove_orphan(&Hash(survivor), false);
+                assert_eq!(pool.orphans.len(), left.len() - 1, "round {round}");
+                assert!(!pool.is_orphan_in_pool(&Hash(survivor)));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2888,6 +3175,212 @@ mod orphan_eviction_tests {
             assert!(
                 !pool.orphans.contains_key(&[expected; 32]),
                 "draw {draw} must evict the orphan at that index"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fetch_input_utxos_tests {
+    use super::*;
+
+    use dcroxide_wire::{TX_TREE_REGULAR, TxIn, TxOut};
+
+    /// A chain backend with no confirmed outputs, so every input of a
+    /// candidate falls through to the pool, staged and transient maps.
+    struct EmptyChain;
+
+    impl PoolChain for EmptyChain {
+        fn next_stake_difficulty(&self) -> Result<i64, String> {
+            unimplemented!()
+        }
+        fn fetch_utxo_view(
+            &self,
+            _tx: &MsgTx,
+            _tx_hash: &Hash,
+            _tree: i8,
+            _tree_valid: bool,
+        ) -> Result<UtxoView, String> {
+            Ok(UtxoView::new())
+        }
+        fn best_hash(&self) -> Hash {
+            Hash::ZERO
+        }
+        fn best_height(&self) -> i64 {
+            unimplemented!()
+        }
+        fn header_by_hash(&self, _hash: &Hash) -> Result<BlockHeader, String> {
+            unimplemented!()
+        }
+        fn past_median_time(&self) -> i64 {
+            unimplemented!()
+        }
+        fn calc_sequence_lock(
+            &self,
+            _tx: &MsgTx,
+            _tx_hash: &Hash,
+            _view: &UtxoView,
+        ) -> Result<SequenceLock, PoolError> {
+            unimplemented!()
+        }
+        fn is_treasury_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_auto_revocations_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_subsidy_split_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn is_subsidy_split_r2_agenda_active(&self) -> Result<bool, String> {
+            unimplemented!()
+        }
+        fn tspend_mined_on_ancestor(&self, _tspend: &Hash) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn standard_verify_flags(&self) -> Result<ScriptFlags, String> {
+            unimplemented!()
+        }
+        fn now_unix(&self) -> i64 {
+            1751800000
+        }
+        fn random_u64(&self) -> u64 {
+            0
+        }
+    }
+
+    fn new_pool() -> TxPool<EmptyChain> {
+        let params = dcroxide_chaincfg::mainnet_params();
+        let policy = Policy {
+            accept_non_std: false,
+            max_orphan_txs: 100,
+            max_orphan_tx_size: 5000,
+            max_sig_ops_per_tx: 1000,
+            min_relay_tx_fee: 10000,
+            allow_old_votes: false,
+            max_vote_age: params.coinbase_maturity,
+            enable_ancestor_tracking: true,
+        };
+        TxPool::new(EmptyChain, policy, &params)
+    }
+
+    /// An unconfirmed parent with two spendable outputs whose values
+    /// derive from `tag`, so each parent's entries are recognizable.
+    fn parent(tag: u8) -> MsgTx {
+        MsgTx {
+            tx_in: vec![TxIn {
+                previous_out_point: OutPoint {
+                    hash: Hash([tag; 32]),
+                    index: 0,
+                    tree: TX_TREE_REGULAR,
+                },
+                sequence: 0xffff_ffff,
+                value_in: 1_000_000,
+                block_height: 1,
+                block_index: 0,
+                signature_script: Vec::new(),
+            }],
+            tx_out: (0..2i64)
+                .map(|i| TxOut {
+                    value: i64::from(tag) * 1_000 + i,
+                    version: 0,
+                    pk_script: vec![0x51],
+                })
+                .collect(),
+            ..MsgTx::default()
+        }
+    }
+
+    fn desc(tx: MsgTx, tx_hash: Hash) -> Arc<TxDesc> {
+        Arc::new(TxDesc {
+            tx,
+            tx_hash,
+            tree: TX_TREE_REGULAR,
+            tx_type: TxType::Regular,
+            added_unix: 1751800000,
+            height: 1,
+            fee: 100_000,
+            total_sig_ops: 1,
+            tx_size: 200,
+        })
+    }
+
+    /// The pool's parents are added to the view under the outpoint's
+    /// hash, the key each map found them under, and are never
+    /// re-serialized and re-hashed per input (dcrd `fetchInputUtxos`
+    /// passes `AddTxOut` a `dcrutil.Tx` whose hash is memoized).
+    ///
+    /// Each parent here is filed under a key that is not its own hash,
+    /// which no real pool does, so the child's inputs only resolve if
+    /// the view entry is keyed by the outpoint hash.  Recomputing the
+    /// parent's hash per input keys the entry by the parent's real hash
+    /// instead, and every lookup below misses.
+    #[test]
+    fn fetch_input_utxos_takes_parent_hashes_from_the_map_keys() {
+        let mut pool = new_pool();
+        let pool_parent = parent(1);
+        let staged_parent = parent(2);
+        let transient_parent = parent(3);
+        let pool_key = Hash([0xa1; 32]);
+        let staged_key = Hash([0xa2; 32]);
+        let transient_key = Hash([0xa3; 32]);
+        pool.pool
+            .insert(pool_key.0, desc(pool_parent.clone(), pool_key));
+        pool.staged
+            .insert(staged_key.0, desc(staged_parent.clone(), staged_key));
+        pool.transient
+            .insert(transient_key.0, transient_parent.clone());
+
+        let spends = [
+            (pool_key, 1u32, &pool_parent),
+            (staged_key, 0, &staged_parent),
+            (transient_key, 1, &transient_parent),
+        ];
+        let child = MsgTx {
+            tx_in: spends
+                .iter()
+                .map(|&(hash, index, _)| TxIn {
+                    previous_out_point: OutPoint {
+                        hash,
+                        index,
+                        tree: TX_TREE_REGULAR,
+                    },
+                    sequence: 0xffff_ffff,
+                    value_in: 0,
+                    block_height: 0,
+                    block_index: 0,
+                    signature_script: Vec::new(),
+                })
+                .collect(),
+            tx_out: vec![TxOut {
+                value: 1,
+                version: 0,
+                pk_script: vec![0x51],
+            }],
+            ..MsgTx::default()
+        };
+
+        let view = pool
+            .fetch_input_utxos(&child, &child.tx_hash(), TX_TREE_REGULAR, false)
+            .expect("view");
+        for (hash, index, parent) in spends {
+            let outpoint = OutPoint {
+                hash,
+                index,
+                tree: TX_TREE_REGULAR,
+            };
+            let entry = view
+                .lookup_entry(&outpoint)
+                .unwrap_or_else(|| panic!("{outpoint} must be added under the map key"));
+            assert_eq!(entry.amount(), parent.tx_out[index as usize].value);
+            assert!(!entry.is_spent());
+            let rehashed = OutPoint {
+                hash: parent.tx_hash(),
+                ..outpoint
+            };
+            assert!(
+                view.lookup_entry(&rehashed).is_none(),
+                "{rehashed}: the parent must not be re-hashed"
             );
         }
     }

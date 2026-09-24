@@ -100,6 +100,8 @@ fn serves_an_inbound_peer_through_the_handler() {
         // Long enough that neither fires during the test.
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        disable_relay_tx: false,
+        proxy: String::new(),
         newest_block: None,
     };
 
@@ -177,6 +179,8 @@ fn disconnecting_all_peers_tears_down_a_served_connection() {
         user_agent_version: "0.1.0".to_string(),
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        disable_relay_tx: false,
+        proxy: String::new(),
         newest_block: None,
     };
 

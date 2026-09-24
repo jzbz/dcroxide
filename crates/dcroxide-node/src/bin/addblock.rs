@@ -38,7 +38,12 @@ fn load_block_db(cfg: &AddblockConfig, net: u32) -> Result<Database, String> {
         "Loading block database from '{}'",
         db_path.display()
     ));
-    let opts = Options::new(&db_path, net);
+    let mut opts = Options::new(&db_path, net);
+    // dcrd's addblock hands the database driver its BCDB logger
+    // (`database.UseLogger(backendLogger.Logger("BCDB"))`,
+    // `cmd/addblock/addblock.go:76`), so a repair or a corrupt store
+    // found at open is reported here as the daemon reports it.
+    opts.log = Some(dcroxide_node::logging::bcdb_log_sink());
     let db = match Database::open(&opts) {
         Ok(db) => db,
         Err(e) if e.kind == ErrorKind::DbDoesNotExist => {

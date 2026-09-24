@@ -256,10 +256,12 @@ pub fn check_transaction_standard(
     min_relay_tx_fee: i64,
 ) -> Result<(), RuleError> {
     // The transaction must be a currently supported serialize type.
+    // dcrd's `TxSerializeType` is a bare `uint16`, so its `%v` is the
+    // wire number.
     if tx.ser_type != TxSerializeType::Full {
         let str = format!(
-            "transaction is not serialized with all required data -- type {:?}",
-            tx.ser_type
+            "transaction is not serialized with all required data -- type {}",
+            tx.ser_type.to_u16()
         );
         return Err(tx_rule_error(ErrorKind::NonStandard, str));
     }

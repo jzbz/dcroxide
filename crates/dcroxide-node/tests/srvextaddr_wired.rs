@@ -19,7 +19,6 @@
 //! missing.
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -166,7 +165,6 @@ fn genesis_server(facts: ExternalAddrFacts) -> (tempfile::TempDir, Arc<ServerCon
             dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
-        next_peer_id: std::sync::atomic::AtomicI32::new(1),
         net_totals: Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
@@ -211,25 +209,24 @@ impl ServeHooks for ServerHooks {
 
     fn on_connected(
         &mut self,
-        peer: &mut Peer,
-        peer_handle: &Arc<Mutex<Peer>>,
+        peer: &Arc<Mutex<Peer>>,
         outbound: &OutboundQueue,
         remote_disable_relay_tx: bool,
     ) {
-        self.0
-            .on_connected(peer, peer_handle, outbound, remote_disable_relay_tx);
+        self.0.on_connected(peer, outbound, remote_disable_relay_tx);
     }
 
     fn on_message(
         &mut self,
-        peer: &mut Peer,
-        msg: &Message,
+        peer: &Mutex<Peer>,
+        msg: Message,
+        mix_hash: Option<dcroxide_chainhash::Hash>,
         outbound: &OutboundQueue,
     ) -> ServeSignal {
-        self.0.handle_message(peer, msg, outbound)
+        self.0.handle_message(peer, msg, mix_hash, outbound)
     }
 
-    fn on_disconnected(&mut self, peer: &mut Peer) {
+    fn on_disconnected(&mut self, peer: &Mutex<Peer>) {
         self.0.on_disconnected(peer);
     }
 }
@@ -247,16 +244,15 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 }
 
 /// Block until the dispatch's `on_connected` has run for the driven
-/// connection.  The peer id is allocated immediately after the
+/// connection.  The peer is registered immediately after the
 /// candidate consideration and nothing between the two can return
-/// early, so an advanced counter is proof the consideration already
+/// early, so a registered peer is proof the consideration already
 /// happened and the cache can be read without racing the serving
-/// thread.
+/// thread.  Every test drives one connection on a fresh context, so
+/// the registry is empty until then.
 fn wait_for_add_peer(ctx: &ServerContext) {
     assert!(
-        wait_until(Duration::from_secs(10), || {
-            ctx.next_peer_id.load(Ordering::SeqCst) > 1
-        }),
+        wait_until(Duration::from_secs(10), || !ctx.sync_peers.is_empty()),
         "the handshake must reach the dispatch's add-peer path",
     );
 }

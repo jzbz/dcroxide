@@ -112,7 +112,9 @@ fn flags_front_end_matches_dcrd() {
 
 /// The `-s/--service` option parses in both forms on Windows, where
 /// dcrd registers the service options group (the posix rejection is
-/// pinned by the vector scenarios).
+/// pinned by the vector scenarios), and the load hands the command back
+/// for the caller to run straight after the version check, as dcrd's
+/// `loadConfig` runs `runServiceCommand` and exits.
 #[cfg(windows)]
 #[test]
 fn the_service_command_option_parses() {
@@ -132,10 +134,19 @@ fn the_service_command_option_parses() {
             user_home: Box::new(|_| None),
             rand_bytes: Box::new(|b: &mut [u8]| b.fill(0x42)),
         };
-        let (cfg, _) = load_config_from_argv(&full_args, &env)
-            .unwrap_or_else(|e| panic!("args {args:?}: {e}"));
+        let err = match load_config_from_argv(&full_args, &env) {
+            Ok(_) => panic!("args {args:?}: the service command must end the load"),
+            Err(err) => err,
+        };
         let expected = if args[0] == "-s" { "install" } else { "stop" };
-        assert_eq!(cfg.service_command, expected, "args {args:?}");
+        assert_eq!(
+            err,
+            format!(
+                "{}{expected}",
+                dcroxide_node::config::ERR_SERVICE_COMMAND_PREFIX
+            ),
+            "args {args:?}"
+        );
     }
 }
 

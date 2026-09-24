@@ -584,6 +584,9 @@ pub fn handle_rescan<C: RpcChain>(
                 other => panic!("expected string element, got {other:?}"),
             })
             .collect(),
+        // An explicit JSON null leaves the slice nil, which dcrd's
+        // decodeHashes turns into an empty rescan.
+        GoValue::Null => Vec::new(),
         other => panic!("expected array field, got {other:?}"),
     };
     let block_hashes = crate::helpers::decode_hashes(&hash_strs)?;
@@ -809,7 +812,7 @@ pub fn subscribed_clients<C: RpcChain>(
     tree: i8,
     clients: &mut [&mut WsClient],
 ) -> Vec<bool> {
-    let params = server.cfg.chain_params.clone();
+    let params = &server.cfg.chain_params;
     let mut subscribed = vec![false; clients.len()];
 
     let mut is_ticket = false; // lazily set
@@ -827,7 +830,7 @@ pub fn subscribed_clients<C: RpcChain>(
         for (i, output) in tx.tx_out.iter().enumerate() {
             let mut watch_output = true;
             let (script_type, mut addrs) =
-                stdscript::extract_addrs(output.version, &output.pk_script, &params);
+                stdscript::extract_addrs(output.version, &output.pk_script, params);
             if script_type == stdscript::ScriptType::NonStandard {
                 // Clients are not able to subscribe to nonstandard or
                 // non-address outputs.
@@ -841,7 +844,7 @@ pub fn subscribed_clients<C: RpcChain>(
                 // OP_RETURN ticket commitments may contain relevant
                 // P2PKH or P2SH HASH160s.  These outputs cannot be
                 // spent and do not need to be watched.
-                match dcroxide_stake::addr_from_sstx_pk_scr_commitment(&output.pk_script, &params) {
+                match dcroxide_stake::addr_from_sstx_pk_scr_commitment(&output.pk_script, params) {
                     Ok(addr) => {
                         addrs = vec![addr];
                         watch_output = false;
@@ -881,12 +884,7 @@ pub fn notify_block_connected<C: RpcChain>(
     }
 
     // The common portion of the notification.
-    let header_hex: String = block
-        .header
-        .serialize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let header_hex = txresults::hex_str(&block.header.serialize());
 
     // Search for relevant transactions for each client.
     let mut subscribed_txs: Vec<Vec<String>> = vec![Vec::new(); clients.len()];
@@ -941,12 +939,7 @@ pub fn notify_block_disconnected<C: RpcChain>(
         return Vec::new();
     }
 
-    let header_hex: String = block
-        .header
-        .serialize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let header_hex = txresults::hex_str(&block.header.serialize());
     let Some(marshalled) = marshal_ntfn(
         server,
         dcroxide_rpctypes::chainsvrwsntfns::block_disconnected_ntfn(),
@@ -993,8 +986,8 @@ pub fn notify_work<C: RpcChain>(
         server,
         dcroxide_rpctypes::chainsvrwsntfns::work_ntfn(),
         vec![
-            GoValue::String(data.iter().map(|b| format!("{b:02x}")).collect()),
-            GoValue::String(target.iter().map(|b| format!("{b:02x}")).collect()),
+            GoValue::String(txresults::hex_str(&data)),
+            GoValue::String(txresults::hex_str(&target)),
             GoValue::String(update_reason_to_work_ntfn_string(reason).to_string()),
         ],
     ) else {
@@ -1230,7 +1223,7 @@ pub fn notify_relevant_tx_accepted<C: RpcChain>(
     tx: &MsgTx,
     tree: i8,
 ) -> Vec<(u64, String)> {
-    let params = server.cfg.chain_params.clone();
+    let params = &server.cfg.chain_params;
     let mut notify = vec![false; clients.len()];
 
     for (ci, client) in clients.iter_mut().enumerate() {
@@ -1246,7 +1239,7 @@ pub fn notify_relevant_tx_accepted<C: RpcChain>(
 
         for (i, output) in tx.tx_out.iter().enumerate() {
             let (script_type, addrs) =
-                stdscript::extract_addrs(output.version, &output.pk_script, &params);
+                stdscript::extract_addrs(output.version, &output.pk_script, params);
             if script_type == stdscript::ScriptType::NonStandard {
                 continue;
             }

@@ -3,7 +3,7 @@
 //! handshake the inbound peer queues its verack and runs the input loop
 //! over a shared peer, answering a ping with a pong through the output
 //! queue; the output handler drains the queue to the connection in
-//! order; and the ping timer queues and records keepalive pings — all
+//! order; and the ping timer queues keepalive pings — all
 //! over real loopback TCP connections.
 
 use std::net::{TcpListener, TcpStream};
@@ -213,24 +213,18 @@ fn queue_message_fails_once_the_output_loop_has_stopped() {
 }
 
 #[test]
-fn ping_timer_queues_and_records_pings_until_shutdown() {
-    let peer = Mutex::new(Peer::new_inbound(config("dcroxide")));
+fn ping_timer_queues_pings_until_shutdown() {
     let (queue, outbound) = OutboundQueue::channel();
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
 
     let timer = thread::spawn(move || {
         let mut env = NodePeerEnv::new();
-        run_ping_timer(
-            &peer,
-            &mut env,
-            &queue,
-            Duration::from_millis(20),
-            &shutdown_rx,
-        );
-        peer.lock().expect("peer mutex").last_ping_nonce()
+        run_ping_timer(&mut env, &queue, Duration::from_millis(20), &shutdown_rx);
     });
 
-    // The first tick queues a ping.
+    // The first tick queues a ping.  Recording it as the outstanding
+    // ping is the output loop's job, when it writes it, as dcrd's
+    // `outHandler` does for every ping whoever queued it.
     let queued = outbound
         .recv_timeout(Duration::from_secs(2))
         .expect("a ping should be queued");
@@ -239,11 +233,9 @@ fn ping_timer_queues_and_records_pings_until_shutdown() {
         other => panic!("expected a ping, got {other:?}"),
     }
 
-    // Stopping the timer lets it return the last recorded ping nonce,
-    // set whenever a ping is queued so the answering pong can be matched.
+    // Stopping the timer ends it.
     shutdown_tx.send(()).expect("signal shutdown");
-    let last_recorded = timer.join().expect("timer thread");
-    assert_ne!(last_recorded, 0, "a ping nonce should have been recorded");
+    timer.join().expect("timer thread");
 }
 
 #[test]
@@ -581,7 +573,6 @@ fn oversized_message_is_admitted_alone_then_the_budget_holds() {
 /// was reading again.
 #[test]
 fn ping_timer_survives_a_full_outbound_queue() {
-    let peer = Mutex::new(Peer::new_inbound(config("dcroxide")));
     let (queue, outbound) = OutboundQueue::channel();
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
 
@@ -595,13 +586,7 @@ fn ping_timer_survives_a_full_outbound_queue() {
 
     let timer = thread::spawn(move || {
         let mut env = NodePeerEnv::new();
-        run_ping_timer(
-            &peer,
-            &mut env,
-            &queue,
-            Duration::from_millis(20),
-            &shutdown_rx,
-        );
+        run_ping_timer(&mut env, &queue, Duration::from_millis(20), &shutdown_rx);
     });
 
     // Several ticks pass with no room in the queue.

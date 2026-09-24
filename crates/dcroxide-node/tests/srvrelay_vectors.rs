@@ -297,6 +297,7 @@ fn server_address_relay_matches_dcrd() {
                     &mut bs_state,
                     persistent,
                     0,
+                    name,
                     disable,
                     ban_threshold,
                     now_nanos / 1_000_000_000,

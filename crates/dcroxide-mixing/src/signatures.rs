@@ -38,7 +38,9 @@ pub trait MixMessage {
     /// The signed-data preimage (dcrd `WriteSignedData`).
     fn signed_data(&self) -> Result<Vec<u8>, WireError>;
     /// Hashes of all previous messages referenced (dcrd `PrevMsgs`;
-    /// the pair request and factored polynomial return none).
+    /// the pair request returns none, and the factored polynomial its
+    /// seen slot reservations, as dcrd's implementation does although
+    /// the interface comment in `mixing/message.go` says it returns nil).
     fn prev_msgs(&self) -> Vec<Hash>;
     /// The session ID (dcrd `Sid`; the pair request returns `None`).
     fn sid(&self) -> Option<[u8; 32]>;

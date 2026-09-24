@@ -247,10 +247,10 @@ pub enum NegotiateErrorKind {
     ProtocolVerTooOld,
     /// The message following the version message was not a verack.
     NotVerAckMessage,
-    /// The handshake did not complete in time.  The daemon's
-    /// negotiate read budget currently surfaces this as a transport
-    /// read error; the kind is reserved for dcrd's typed
-    /// `errHandshakeTimeout` mapping.
+    /// The handshake did not complete in time (dcrd's
+    /// `errHandshakeTimeout`).  The negotiation here has no clock of its
+    /// own: the daemon bounds the whole exchange by one deadline and
+    /// reports a handshake still unfinished at it with this kind.
     HandshakeTimeout,
 }
 
@@ -608,6 +608,12 @@ impl Peer {
     pub fn record_send(&mut self, bytes: u64, now_nanos: i64) {
         self.bytes_sent = self.bytes_sent.wrapping_add(bytes);
         self.last_send_nanos = now_nanos;
+    }
+
+    /// The total bytes sent to the peer (dcrd `BytesSent`), without
+    /// the copies a full [`Peer::stats_snapshot`] makes.
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent
     }
 
     /// Record bytes and time of a completed receive (dcrd's read path

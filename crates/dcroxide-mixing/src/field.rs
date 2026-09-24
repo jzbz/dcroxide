@@ -137,9 +137,9 @@ impl FieldInt {
     }
 }
 
-/// Whether x, given as its canonical residue and an in-range marker,
-/// is bounded by the field F (dcrd `InField`): the check over raw
-/// big-endian bytes, since dcrd applies it to arbitrary-precision
+/// Whether x, given as the big-endian bytes of a non-negative integer
+/// of any length, is bounded by the field F (dcrd `InField`): the check
+/// runs over the raw bytes, since dcrd applies it to arbitrary-precision
 /// wire values before reduction.
 pub fn in_field_be_bytes(bytes: &[u8]) -> bool {
     // Values with more than 16 significant bytes exceed 2**128 > F.

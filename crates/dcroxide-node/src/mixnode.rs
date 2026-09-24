@@ -7,16 +7,22 @@
 //! [`NodeSyncMixPool`] hands that shared pool to the sync manager as its
 //! `SyncMixPool`.
 //!
-//! The pool validates pair-request ownership against the live UTXO set,
-//! so a mix message that references a spent or unknown output is
-//! rejected exactly as dcrd's mixpool rejects it.
+//! The pool validates pair-request ownership against the live UTXO set.
+//! A mix message that references a spent output is rejected with dcrd's
+//! rule error (`output %v is not unspent`).  One that references an
+//! output the chain does not know is rejected too, but as the fetcher's
+//! `PoolError::UtxoFetch` rather than that rule error: dcrd's fetcher
+//! returns a nil entry, which its mixpool folds into the same rule
+//! error.
 
 use std::sync::{Arc, Mutex};
 
 use dcroxide_blockchain::process::Chain;
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
-use dcroxide_mixing::{MixBlockChain, MixUtxoEntry, MixUtxoFetcher, Pool, PoolError, PoolMessage};
+use dcroxide_mixing::{
+    HashedMessage, MixBlockChain, MixUtxoEntry, MixUtxoFetcher, Pool, PoolError, PoolMessage,
+};
 use dcroxide_netsync::manager::SyncMixPool;
 use dcroxide_wire::{Message, MsgTx, OutPoint};
 
@@ -149,7 +155,8 @@ impl dcroxide_mempool::MixpoolProbe for NodeMixpoolProbe {
 
 /// The mixing pool as the sync manager drives it (dcrd's mixpool behind
 /// the `netsync.Config`); shares the same pool the getdata serve path
-/// reads.
+/// reads.  Clones share the pool.
+#[derive(Clone)]
 pub struct NodeSyncMixPool {
     pool: Arc<Mutex<NodeMixPool>>,
     tx_pool: Arc<Mutex<crate::txmempool::NodeTxPool>>,
@@ -196,10 +203,14 @@ impl NodeSyncMixPool {
 }
 
 impl SyncMixPool for NodeSyncMixPool {
-    type Msg = PoolMessage;
+    // The message travels with the hash and signature verdict the
+    // intake path works out before taking the sync-manager lock (dcrd
+    // caches the hash on the message at decode), so neither this seam
+    // nor the pool re-serializes it under a lock.
+    type Msg = HashedMessage;
     type Err = PoolError;
 
-    fn mix_hash(&mut self, msg: &PoolMessage) -> Hash {
+    fn mix_hash(&mut self, msg: &HashedMessage) -> Hash {
         // A message that cannot be hashed is rejected downstream; a zero
         // hash is never a real message id, so the rejected-message
         // bookkeeping keyed on it is harmless.
@@ -209,31 +220,33 @@ impl SyncMixPool for NodeSyncMixPool {
         // the network has passed them.  The one shape that decodes but
         // does not re-encode, an empty `mixdcnet`, hashes in dcrd's
         // non-validating mode now (RVW-002) rather than landing here.
-        msg.mix_hash().unwrap_or(Hash([0u8; 32]))
+        msg.hash().unwrap_or(Hash([0u8; 32]))
     }
 
     fn accept_message(
         &mut self,
-        msg: &PoolMessage,
+        msg: &HashedMessage,
         source: u64,
-    ) -> Result<Vec<PoolMessage>, PoolError> {
-        // Answered before the mixpool guard is taken, and deliberately.
-        // dcrd asks this from inside its utxo fetcher, which runs under
-        // the mixpool's own mutex; doing the same here would take the
-        // tx-pool lock while holding the mixpool's, and the acceptance
-        // gauntlet's mixpool probe already takes them the other way
-        // round -- tx pool, then mixpool.  Asking first keeps the one
-        // order and closes no cycle.
+    ) -> Result<Vec<HashedMessage>, PoolError> {
+        // Answered before the mixpool guard is taken, as dcrd does too:
+        // its utxo fetcher asks inside `checkAcceptPR`, which
+        // `AcceptMessage` runs before taking the mixpool's mutex
+        // (`mixing/mixpool/mixpool.go:1206-1210`).  Here the whole
+        // acceptance runs under the guard, so asking from inside would
+        // take the tx-pool lock while holding the mixpool's, and the
+        // acceptance gauntlet's mixpool probe already takes them the
+        // other way round -- tx pool, then mixpool.  Asking first keeps
+        // the one order and closes no cycle.
         //
         // The snapshot covers only the outpoints this message names, so
         // it is bounded by the wire's 512-outpoint cap on a pair
         // request; every other message type names none.
-        let spent = self.mempool_spent_outpoints(msg);
+        let spent = self.mempool_spent_outpoints(msg.message());
         let spent_fn = |op: &OutPoint| spent.contains(&op_key(op));
         self.pool
             .lock()
             .expect("mix pool mutex poisoned")
-            .accept_message(msg, source, &spent_fn)
+            .accept_hashed(msg, source, &spent_fn)
     }
 
     fn recent_message(&mut self, hash: &Hash) -> bool {

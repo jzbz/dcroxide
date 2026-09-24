@@ -3,22 +3,28 @@
 //!
 //! The daemon has exactly one established order between these two
 //! mutexes: **mixpool then chain**.  Every peer's mix-message intake
-//! runs it — `dispatch` takes the sync-manager mutex, `NodeSyncMixPool::
-//! accept_message` takes the mixpool mutex, and the pool's own tip and
-//! UTXO lookups (`NodeMixChain::current_tip`,
-//! `NodeMixUtxoFetcher::fetch_utxo_entry`) then take the chain mutex
-//! while the pool guard is still held.
+//! runs it — `dispatch` calls `NodeSyncMixPool::accept_message` with no
+//! sync-manager lock held (the manager is taken only for the
+//! `begin_mix_msg`/`finish_mix_msg` bookkeeping on either side, as
+//! dcrd's `OnMixMsg` holds only `requestMtx` there), the pool takes the
+//! mixpool mutex, and the pool's own tip and UTXO lookups
+//! (`NodeMixChain::current_tip`, `NodeMixUtxoFetcher::fetch_utxo_entry`)
+//! then take the chain mutex while the pool guard is still held.  That
+//! order runs concurrently with everything else in the node, so no path
+//! may take the mixpool while holding the chain, whether or not it also
+//! holds the sync-manager mutex.
 //!
 //! `ChainNtfnHandler::drain_pending_winning_tickets` used to run the
 //! opposite order: it held the chain guard across
-//! `mix_pool.lock().misbehaving_block(..)`.  That is harmless only while
-//! the drain itself runs under the sync-manager mutex (the netsync
-//! adapter's `process_block` path), but the background template
+//! `mix_pool.lock().misbehaving_block(..)`.  The background template
 //! generator installs `drain_pending` as its drain hook and fires it
-//! from its own thread holding no locks whenever `--miningaddr` is set.
-//! Generator thread: holds chain, waits for mixpool.  Peer thread: holds
-//! mixpool, waits for chain.  AB-BA — the whole node wedges, remotely
-//! triggerable by any unauthenticated inbound mix message.
+//! from its own thread holding no locks whenever `--miningaddr` is set,
+//! and the netsync adapter's `process_block` path runs the same drain
+//! under the sync-manager mutex, which does not serialize it against
+//! peer mix intake either.  Drain thread: holds chain, waits for
+//! mixpool.  Peer thread: holds mixpool, waits for chain.  AB-BA — the
+//! whole node wedges, remotely triggerable by any unauthenticated
+//! inbound mix message.
 //!
 //! The test below pins the two threads into exactly that interleaving
 //! against a real `Chain`, a real `NodeMixPool`, and the real

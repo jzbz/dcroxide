@@ -55,14 +55,16 @@ fn config(user_agent_name: &str) -> Config {
 struct BanRecorder(Arc<Mutex<Vec<String>>>);
 
 impl ServeHooks for BanRecorder {
-    fn on_wire_violation(&mut self, err: &str) {
+    fn on_wire_violation(&mut self, err: &str) -> ServeSignal {
         self.0.lock().expect("recorder").push(err.to_string());
+        ServeSignal::Continue
     }
 
     fn on_message(
         &mut self,
-        _peer: &mut Peer,
-        _msg: &Message,
+        _peer: &Mutex<Peer>,
+        _msg: Message,
+        _mix_hash: Option<dcroxide_chainhash::Hash>,
         _outbound: &OutboundQueue,
     ) -> ServeSignal {
         // No handshake here completes, so nothing reaches this.

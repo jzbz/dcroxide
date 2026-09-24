@@ -353,7 +353,8 @@ fn fee_and_node_info_handler_slice_matches_dcrd() {
                         other => panic!("unknown tx type {other}"),
                     };
                     RpcMempoolTx {
-                        tx,
+                        serialize_size: tx.serialize_size(),
+                        tx_hash: tx.tx_hash(),
                         tx_type,
                         fee: parts[2].parse().unwrap(),
                     }

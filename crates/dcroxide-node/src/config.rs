@@ -934,11 +934,13 @@ pub fn clean_and_expand_path(
     // Expand initial ~ to the current user's home directory, or
     // ~otheruser to otheruser's home directory.  When no separator
     // follows, dcrd's index scan leaves the user name empty and the
-    // remainder joins onto the current user's home.
+    // remainder joins onto the current user's home.  On Windows, both
+    // forward and backward slashes end the user name (dcrd's
+    // `os.PathSeparator + "/"`); elsewhere the separator is '/' alone.
     let rest = &path[1..];
     let mut user_name = "";
     let mut p = rest;
-    if let Some(i) = rest.find('/') {
+    if let Some(i) = rest.find(['/', std::path::MAIN_SEPARATOR]) {
         user_name = &rest[..i];
         p = &rest[i..];
     }
@@ -1373,6 +1375,12 @@ pub const ERR_VERSION_REQUESTED: &str = "version requested";
 /// `--debuglevel=show` was requested (dcrd prints the supported
 /// subsystems and exits).
 pub const ERR_SHOW_SUBSYSTEMS: &str = "show subsystems requested";
+/// The prefix of the distinguished error [`load_config_from_argv`]
+/// returns, followed by the command, when the command line asked for a
+/// Windows service command (dcrd runs `runServiceCommand` and exits
+/// zero).  Only Windows registers the option, so nothing else returns
+/// it.
+pub const ERR_SERVICE_COMMAND_PREFIX: &str = "service command requested: ";
 
 /// Initialize and parse the config from already-split option
 /// assignments (dcrd `loadConfig` past the go-flags syntax layer);
@@ -1488,6 +1496,18 @@ fn load_config_impl(
     // (the caller handles the output).
     if pre_cfg.show_version {
         return Err(ERR_VERSION_REQUESTED.to_string());
+    }
+
+    // Perform the service command and exit if one was given (dcrd's
+    // `runServiceCommand` hook, nil except on Windows).  It acts on the
+    // pre-parse alone, before the home directory, the default config
+    // file, the config file and the validation below can run or fail;
+    // the caller performs it and exits zero.
+    if cfg!(windows) && !pre_cfg.service_command.is_empty() {
+        return Err(format!(
+            "{ERR_SERVICE_COMMAND_PREFIX}{}",
+            pre_cfg.service_command
+        ));
     }
 
     // Update the home directory for dcrd if specified.  Since the

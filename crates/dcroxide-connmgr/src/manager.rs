@@ -102,17 +102,36 @@ impl Default for ManagerConfig {
 
 /// A counting semaphore mirroring dcrd's channel-based `semaphore`:
 /// try-acquire never blocks, release silently tolerates
-/// over-release, and the blocking `Acquire` lives with the daemon
-/// (a condition variable over this state).
+/// over-release, and dcrd's blocking `Acquire` is modelled for its one
+/// caller that blocks, the automatic outbound fill
+/// (`targetOutboundHandler`), as a single parked waiter
+/// ([`SemCount::acquire_or_wait`]).
+///
+/// A release while the waiter is parked hands the freed permit
+/// straight to it: dcrd's `Release` is a channel receive, and the Go
+/// runtime completes a sender blocked on the full channel inside that
+/// same receive, so the permit never becomes free for a concurrent
+/// `TryAcquire` (an inbound connection or a manual `Connect`).  The
+/// waiter collects it with [`SemCount::take_grant`].
 #[derive(Debug, Clone, Copy)]
 pub struct SemCount {
     capacity: u32,
     used: u32,
+    /// Whether the waiter is parked on the semaphore.
+    waiting: bool,
+    /// A permit a release handed to the parked waiter that it has not
+    /// collected yet; it stays counted in `used`.
+    granted: bool,
 }
 
 impl SemCount {
     fn new(capacity: u32) -> SemCount {
-        SemCount { capacity, used: 0 }
+        SemCount {
+            capacity,
+            used: 0,
+            waiting: false,
+            granted: false,
+        }
     }
 
     /// Acquire without blocking; false when at capacity (dcrd
@@ -125,10 +144,40 @@ impl SemCount {
         true
     }
 
+    /// Acquire, or park the caller as the waiter when at capacity
+    /// (dcrd `semaphore.Acquire` blocking): false means parked, and the
+    /// next release hands the caller its permit instead of freeing it.
+    pub fn acquire_or_wait(&mut self) -> bool {
+        if self.try_acquire() {
+            return true;
+        }
+        self.waiting = true;
+        false
+    }
+
+    /// Whether the waiter is parked and has not been handed a permit.
+    pub fn is_waiting(&self) -> bool {
+        self.waiting
+    }
+
+    /// Collect the permit a release handed to the parked waiter, if
+    /// one did (dcrd's blocked `Acquire` returning).
+    pub fn take_grant(&mut self) -> bool {
+        std::mem::take(&mut self.granted)
+    }
+
     /// Release one permit; over-release is ignored like dcrd's
-    /// non-blocking channel receive.
-    pub fn release(&mut self) {
+    /// non-blocking channel receive.  With the waiter parked the permit
+    /// passes to it instead and stays counted as used; returns whether
+    /// it did, so the caller can wake the waiter.
+    pub fn release(&mut self) -> bool {
+        if self.waiting {
+            self.waiting = false;
+            self.granted = true;
+            return true;
+        }
         self.used = self.used.saturating_sub(1);
+        false
     }
 
     /// The permits currently held.
@@ -287,12 +336,20 @@ pub struct ConnManager {
     /// three maps; persistent entries own their address key (dcrd
     /// `connIDByAddr`).
     conn_id_by_addr: HashMap<String, u64>,
+    /// Called when a release hands the parked automatic outbound fill
+    /// its total-connections permit, so the daemon's driver resumes it
+    /// (dcrd's `targetOutboundHandler` wakes from `Acquire` by itself).
+    permit_waker: Option<Box<dyn Fn() + Send>>,
 }
 
 /// No suitable outbound address was found within the allowed
 /// attempts (dcrd `errNoSuitableAddr`, a plain error distinct from
 /// the typed kinds).
 pub const NO_SUITABLE_ADDR_MSG: &str = "no suitable outbound address";
+
+/// The number of addresses outbound selection requests before giving
+/// up for now (dcrd `pickOutboundAddr`'s `retries`).
+pub const PICK_OUTBOUND_RETRIES: u32 = 100;
 
 impl ConnManager {
     /// A new connection manager with defaults applied (dcrd `New`;
@@ -329,7 +386,26 @@ impl ConnManager {
             pending: HashMap::new(),
             active: HashMap::new(),
             conn_id_by_addr: HashMap::new(),
+            permit_waker: None,
             cfg,
+        }
+    }
+
+    /// Install the callback that wakes the automatic outbound fill when
+    /// a release hands it the total-connections permit it is parked on
+    /// ([`SemCount::acquire_or_wait`]).  It runs with the manager
+    /// borrowed, so it must only signal.
+    pub fn set_permit_waker(&mut self, waker: Box<dyn Fn() + Send>) {
+        self.permit_waker = Some(waker);
+    }
+
+    /// Release a total-connections permit, waking the parked outbound
+    /// fill when the permit passes to it.
+    fn release_total_permit(&mut self) {
+        if self.total_normal_conns_sem.release()
+            && let Some(waker) = &self.permit_waker
+        {
+            waker();
         }
     }
 
@@ -610,7 +686,7 @@ impl ConnManager {
             self.release_host_permit(&record.remote_addr);
         }
         if plan.release_total_sem {
-            self.total_normal_conns_sem.release();
+            self.release_total_permit();
         }
         if plan.release_outbound_sem {
             self.active_outbounds_sem.release();
@@ -674,7 +750,7 @@ impl ConnManager {
             self.release_host_permit(addr);
         }
         if plan.release_total_sem {
-            self.total_normal_conns_sem.release();
+            self.release_total_permit();
         }
         if plan.release_outbound_sem {
             self.active_outbounds_sem.release();
@@ -961,48 +1037,69 @@ impl ConnManager {
     // ==================== outbound address selection ====================
 
     /// An address suitable for a new automatic outbound connection
-    /// (dcrd `pickOutboundAddr`): calls the address source up to 100
-    /// times, skipping already-connected outbound groups, recently
-    /// attempted addresses for the first 30 tries, and non-default
-    /// ports for the first 50; the picked address is registered in
-    /// the outbound groups and the caller removes it when no longer
-    /// used.  The error string for exhaustion is
+    /// (dcrd `pickOutboundAddr`): calls the address source up to
+    /// [`PICK_OUTBOUND_RETRIES`] times, judging each candidate with
+    /// [`ConnManager::claim_outbound_candidate`]; the picked address is
+    /// registered in the outbound groups and the caller removes it when
+    /// no longer used.  The error string for exhaustion is
     /// [`NO_SUITABLE_ADDR_MSG`]; source errors pass through.  The
     /// source returns each candidate's last attempt time in
     /// nanoseconds (dcrd's `lastTry time.Time`).
+    ///
+    /// This runs the source with the manager borrowed.  The daemon's
+    /// driver instead draws each candidate before taking the manager's
+    /// lock and claims it under the lock, because its source takes the
+    /// address manager's lock and inbound admission must not wait on
+    /// that (dcrd holds only the outbound groups' own mutex here).
     pub fn pick_outbound_addr(
         &mut self,
         get_new_address: &mut dyn FnMut() -> Result<(NetAddress, i64), String>,
         now_nanos: i64,
     ) -> Result<NetAddress, String> {
-        const RETRIES: u32 = 100;
-        const SKIP_RECENTS_UNTIL: u32 = (RETRIES * 3) / 10;
-        const SKIP_DEFAULT_PORT_UNTIL: u32 = RETRIES / 2;
-        const TEN_MINUTES_NANOS: i64 = 10 * 60 * 1_000_000_000;
-
-        for tries in 0..RETRIES {
+        for tries in 0..PICK_OUTBOUND_RETRIES {
             let (addr, last_try_nanos) = get_new_address()?;
-
-            if self.outbound_groups.group_count(&addr) >= self.max_per_outbound_group {
-                continue;
+            if self.claim_outbound_candidate(tries, &addr, last_try_nanos, now_nanos) {
+                return Ok(addr);
             }
-
-            if tries < SKIP_RECENTS_UNTIL
-                && last_try_nanos.saturating_add(TEN_MINUTES_NANOS) > now_nanos
-            {
-                continue;
-            }
-
-            let default_port = self.cfg.default_port;
-            if default_port != 0 && tries < SKIP_DEFAULT_PORT_UNTIL && addr.port != default_port {
-                continue;
-            }
-
-            self.outbound_groups.add_addr(&addr);
-            return Ok(addr);
         }
 
         Err(NO_SUITABLE_ADDR_MSG.to_string())
+    }
+
+    /// One iteration of dcrd `pickOutboundAddr`'s loop: whether the
+    /// candidate the address source returned on try `tries` (counting
+    /// from 0) is suitable, registering it in the outbound groups when
+    /// it is.  Skipped are addresses whose outbound group is already
+    /// connected, recently attempted addresses for the first 30 tries,
+    /// and non-default ports for the first 50.
+    pub fn claim_outbound_candidate(
+        &mut self,
+        tries: u32,
+        addr: &NetAddress,
+        last_try_nanos: i64,
+        now_nanos: i64,
+    ) -> bool {
+        const SKIP_RECENTS_UNTIL: u32 = (PICK_OUTBOUND_RETRIES * 3) / 10;
+        const SKIP_DEFAULT_PORT_UNTIL: u32 = PICK_OUTBOUND_RETRIES / 2;
+        const TEN_MINUTES_NANOS: i64 = 10 * 60 * 1_000_000_000;
+
+        if self.outbound_groups.group_count(addr) >= self.max_per_outbound_group {
+            return false;
+        }
+
+        if tries < SKIP_RECENTS_UNTIL
+            && last_try_nanos.saturating_add(TEN_MINUTES_NANOS) > now_nanos
+        {
+            return false;
+        }
+
+        let default_port = self.cfg.default_port;
+        if default_port != 0 && tries < SKIP_DEFAULT_PORT_UNTIL && addr.port != default_port {
+            return false;
+        }
+
+        self.outbound_groups.add_addr(addr);
+        true
     }
 
     /// The active connection record for an ID.
@@ -1297,6 +1394,100 @@ mod tests {
             }
             other => panic!("unexpected decision {other:?}"),
         }
+    }
+
+    /// A total-connections permit freed while the automatic outbound
+    /// fill is parked on it goes straight to the fill, as dcrd's
+    /// blocked `totalNormalConnsSem.Acquire` receives it inside the
+    /// releasing channel receive: the waker fires, the permit stays
+    /// counted, and an inbound connection arriving before the fill runs
+    /// again is refused rather than taking the slot.  Without a waiter a
+    /// release frees the permit as before.
+    #[test]
+    fn a_freed_permit_goes_to_the_parked_outbound_fill() {
+        let mut m = mgr(ManagerConfig {
+            max_normal_conns: 2,
+            target_outbound: 1,
+            ..ManagerConfig::default()
+        });
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&wakes);
+        m.set_permit_waker(Box::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let now_unix = 1_700_000_000;
+        let now_nanos = 1_700_000_000_000_000_000;
+        let mut r = rng();
+
+        // Two inbound peers take every total permit.
+        let mut ids = Vec::new();
+        for last in [50, 51] {
+            let addr = v4(last, 9108);
+            match m.admit_inbound(&addr, now_unix, now_nanos, &mut r) {
+                InboundDecision::Admit {
+                    require_permit,
+                    host_permit_reserved,
+                } => ids.push(
+                    m.register_inbound(&addr, require_permit, host_permit_reserved)
+                        .id,
+                ),
+                other => panic!("unexpected decision {other:?}"),
+            }
+        }
+
+        // The fill takes its outbound permit and parks on the total.
+        assert!(m.active_outbounds_sem.try_acquire());
+        assert!(!m.total_normal_conns_sem.acquire_or_wait());
+        assert!(m.total_normal_conns_sem.is_waiting());
+
+        // An inbound close hands its permit to the fill.
+        m.conn_closed(ids[0]).expect("close");
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!m.total_normal_conns_sem.is_waiting());
+        assert_eq!(m.total_normal_conns_sem.used(), 2, "the permit stays held");
+
+        // A new inbound peer finds no free slot.
+        match m.admit_inbound(&v4(52, 9108), now_unix, now_nanos, &mut r) {
+            InboundDecision::Drop { reason } => {
+                assert_eq!(reason, "a maximum of 2 connections is allowed");
+            }
+            other => panic!("unexpected decision {other:?}"),
+        }
+
+        // The fill collects the permit exactly once.
+        assert!(m.total_normal_conns_sem.take_grant());
+        assert!(!m.total_normal_conns_sem.take_grant());
+
+        // With nothing parked, a close frees its permit without a wake.
+        m.conn_closed(ids[1]).expect("close");
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(m.total_normal_conns_sem.used(), 1);
+    }
+
+    /// A manual connection's unwind hands its permit over the same way.
+    #[test]
+    fn a_connect_unwind_hands_its_permit_to_the_parked_fill() {
+        let mut m = mgr(ManagerConfig {
+            max_normal_conns: 1,
+            target_outbound: 1,
+            ..ManagerConfig::default()
+        });
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&wakes);
+        m.set_permit_waker(Box::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        let addr = v4(60, 9108);
+        let plan = m.connect_begin(&addr).expect("connect_begin");
+        assert!(m.active_outbounds_sem.try_acquire());
+        assert!(!m.total_normal_conns_sem.acquire_or_wait());
+
+        m.connect_unwind(&addr, &plan);
+        assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(m.total_normal_conns_sem.used(), 1);
+        assert!(m.connect_begin(&v4(61, 9108)).is_err(), "no free slot");
+        assert!(m.total_normal_conns_sem.take_grant());
     }
 
     /// backoff_with_jitter: zero retries return zero, the exponential

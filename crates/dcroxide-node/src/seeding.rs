@@ -9,7 +9,6 @@
 //! every seeder fails and the manager still needs addresses, the round
 //! is retried with dcrd's one-to-ten-second backoff until shutdown.
 
-use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -323,7 +322,9 @@ impl Drop for SeederBoot {
 /// Query the network's seeders and feed the discovered addresses into
 /// the address manager (dcrd `querySeeders` launched from `Run` when
 /// seeding is enabled).  `transport_factory` builds the per-seeder
-/// transport, letting tests script the responses.
+/// transport, letting tests script the responses.  The seeder hosts
+/// resolve through the system resolver, the `dcrdLookup` of a daemon
+/// without `--proxy`; see [`start_seeding_with_lookup`].
 pub fn start_seeding<T, F>(
     seeders: Vec<String>,
     addr_manager: Arc<Mutex<AddrManager>>,
@@ -333,6 +334,31 @@ pub fn start_seeding<T, F>(
 where
     T: SeederTransport,
     F: Fn() -> T + Send + Sync + 'static,
+{
+    start_seeding_with_lookup(
+        seeders,
+        addr_manager,
+        required_services,
+        transport_factory,
+        |host: &str| crate::socks::NodeDialer::direct().lookup(host, Duration::ZERO),
+    )
+}
+
+/// [`start_seeding`] with the seeder host lookup the discovered
+/// addresses take their source from: dcrd's `dcrdLookup(seeder)`, so a
+/// proxied daemon resolves its seeders through Tor rather than sending
+/// their names to the system resolver.
+pub fn start_seeding_with_lookup<T, F, L>(
+    seeders: Vec<String>,
+    addr_manager: Arc<Mutex<AddrManager>>,
+    required_services: u64,
+    transport_factory: F,
+    lookup: L,
+) -> SeederBoot
+where
+    T: SeederTransport,
+    F: Fn() -> T + Send + Sync + 'static,
+    L: Fn(&str) -> Result<Vec<std::net::IpAddr>, String> + Send + 'static,
 {
     let (stop, stopped) = mpsc::channel::<()>();
     let thread = thread::spawn(move || {
@@ -378,7 +404,7 @@ where
                         if addrs.is_empty() {
                             continue;
                         }
-                        add_seeded(&addr_manager, &seeder, addrs);
+                        add_seeded(&addr_manager, &seeder, addrs, &lookup);
                     }
                     Ok(Err(_)) => {
                         outstanding = outstanding.saturating_sub(1);
@@ -421,19 +447,20 @@ where
 /// Add a seeder's discovered addresses with the seeder's resolved IP
 /// as their source, falling back to the first returned address when
 /// the lookup fails right after succeeding (dcrd `querySeeders`'s
-/// source selection).
+/// source selection over `dcrdLookup(seeder)`).
 fn add_seeded(
     addr_manager: &Arc<Mutex<AddrManager>>,
     seeder: &str,
     addrs: Vec<dcroxide_wire::NetAddress>,
+    lookup: &dyn Fn(&str) -> Result<Vec<std::net::IpAddr>, String>,
 ) {
     const HTTPS_PORT: u16 = 443;
     let addresses = crate::server::wire_to_addrmgr_net_addresses(&addrs);
-    let src = (seeder, HTTPS_PORT)
-        .to_socket_addrs()
+    let src = lookup(seeder)
         .ok()
-        .and_then(|mut ips| ips.next())
-        .and_then(|socket| {
+        .and_then(|ips| ips.first().copied())
+        .and_then(|ip| {
+            let socket = std::net::SocketAddr::new(ip, HTTPS_PORT);
             crate::peerconn::net_address_from_socket(socket, Default::default()).ok()
         })
         .map(|wire| crate::server::wire_to_addrmgr_net_address(&wire))

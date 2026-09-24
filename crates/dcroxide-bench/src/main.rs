@@ -598,13 +598,16 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
                     // A closed receiver means the writer is gone; a lost
                     // log line is not worth failing the replay over.
                     let _ = sink.send(FlushMsg::Record(format!(
-                        "{{\"flush\":{},\"dirty_entries\":{},\"dirty_bytes\":{},\"elapsed_ms\":{:.3},\"stats_ms\":{:.3},\"flush_ms\":{:.3},\"stats\":{}}}",
+                        "{{\"flush\":{},\"dirty_entries\":{},\"dirty_bytes\":{},\"elapsed_ms\":{:.3},\"stats_ms\":{:.3},\"flush_ms\":{:.3},\"sync\":{},\"insert\":{},\"commit\":{},\"stats\":{}}}",
                         obs.sequence,
                         obs.dirty_entries,
                         obs.dirty_bytes,
                         obs.elapsed.as_secs_f64() * 1000.0,
                         obs.stats_elapsed.as_secs_f64() * 1000.0,
                         obs.elapsed.saturating_sub(obs.stats_elapsed).as_secs_f64() * 1000.0,
+                        obs.block_sync.to_json(),
+                        obs.insert.to_json(),
+                        obs.commit.to_json(),
                         stats,
                     )));
                 },

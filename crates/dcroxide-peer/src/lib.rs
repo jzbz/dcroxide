@@ -23,7 +23,7 @@ pub use deadline::{
     check_deadlines, maybe_add_deadline, maybe_remove_deadline, settles,
 };
 pub use netaddress::{PeerAddr, new_net_address};
-pub use peer::{Config, NegotiateError, Peer, PeerEnv, PeerGlobals, StatsSnap};
+pub use peer::{Config, NegotiateError, NegotiateErrorKind, Peer, PeerEnv, PeerGlobals, StatsSnap};
 
 use dcroxide_wire::Message;
 

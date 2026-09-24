@@ -433,10 +433,12 @@ fn the_drain_hook_runs_after_each_processed_event() {
 #[test]
 fn a_reorg_clears_and_then_recovers_getwork() {
     // Drive the generator's no-rebuild publish path: a reorg-started
-    // event clears the current template without queuing a build, so the
-    // getwork mirror must follow (reporting no work) rather than keep
-    // serving the stale pre-reorg template, and a reorg-done event then
-    // rebuilds on the tip so getwork recovers.  A real
+    // event clears the current template without queuing a build, and
+    // template retrieval waits the reorganization out (dcrd's
+    // `CurrentTemplate` blocks on the stale-template wait group that
+    // `rtReorgStarted` raises and `rtReorgDone` releases) rather than
+    // serving the stale pre-reorg template; a reorg-done event then
+    // rebuilds on the tip and the waiting retrieval recovers.  A real
     // force_head_reorganization that leaves the new tip awaiting votes —
     // the window in which a mispublished mirror would serve an
     // orphan-parent template — needs a competing side chain at stake
@@ -484,29 +486,57 @@ fn a_reorg_clears_and_then_recovers_getwork() {
     let first = wait_for_template(&mut templater);
     assert_eq!(first.header.height, 3, "startup template height");
 
-    // A reorg starts: the generator clears the template and reports no
-    // work (dcrd's `CurrentTemplate` blocks on the stale-template wait
-    // group; the port returns `Ok(None)`).
+    // A reorg starts: the generator clears the template and holds
+    // template retrieval.  No build is in flight after startup, so the
+    // stale hold appears exactly when the reorg start is processed.
     generator.sink().chain_reorg_started();
+    let mirror = generator.current_handle();
     let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match templater.current_template() {
-            Ok(None) => break,
-            Ok(Some(_)) => {}
-            Err(err) => panic!("a reorg must not error the template: {err}"),
-        }
+    while !mirror.lock().expect("mirror").is_stale() {
         assert!(
             Instant::now() < deadline,
-            "a reorg must clear the getwork work signal"
+            "a reorg must hold template retrieval"
         );
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(10));
     }
+    let waiter = NodeRpcBlockTemplater::new(
+        generator.current_handle(),
+        generator.subscribers_handle(),
+        generator.sink(),
+        Arc::clone(&chain),
+        Arc::clone(&tx_pool),
+        params.clone(),
+        policy.clone(),
+        0,
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let _ = tx.send(waiter.current_template());
+    });
+    assert!(
+        matches!(
+            rx.recv_timeout(Duration::from_millis(300)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ),
+        "retrieval must wait out the reorganization"
+    );
 
-    // A reorg finishes: the generator rebuilds on the tip and getwork
-    // recovers a fresh template.
+    // A reorg finishes: the generator rebuilds on the tip and the
+    // waiting retrieval recovers a fresh template.
     generator.sink().chain_reorg_done();
-    let recovered = wait_for_template(&mut templater);
+    let recovered = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the reorg-done rebuild releases retrieval")
+        .expect("a reorg must not error the template")
+        .expect("a template after the reorganization");
+    reader.join().expect("reader thread");
     assert_eq!(recovered.header.height, 3, "recovered post-reorg template");
+    assert_ne!(
+        recovered.header.block_hash(),
+        first.header.block_hash(),
+        "the recovered template is the post-reorg rebuild"
+    );
+    assert!(templater.current_template().expect("no error").is_some());
 
     generator.shutdown();
 }

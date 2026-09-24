@@ -95,7 +95,6 @@ fn serve_genesis_chain() -> GenesisChainRig {
             dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
-        next_peer_id: std::sync::atomic::AtomicI32::new(1),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
@@ -117,6 +116,8 @@ fn serve_genesis_chain() -> GenesisChainRig {
         user_agent_version: "0.1.0".to_string(),
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        disable_relay_tx: false,
+        proxy: String::new(),
         newest_block: None,
     };
     let connected = ConnectedPeers::new();
@@ -767,7 +768,6 @@ fn initiates_header_sync_with_a_data_serving_peer() {
             dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
-        next_peer_id: std::sync::atomic::AtomicI32::new(1),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
@@ -788,6 +788,8 @@ fn initiates_header_sync_with_a_data_serving_peer() {
         user_agent_version: "0.1.0".to_string(),
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        disable_relay_tx: false,
+        proxy: String::new(),
         newest_block: None,
     };
     let connected = ConnectedPeers::new();
@@ -904,7 +906,6 @@ fn disconnects_a_stalled_header_sync_peer() {
         blocks_only: false,
         sync_manager,
         sync_peers,
-        next_peer_id: std::sync::atomic::AtomicI32::new(1),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
@@ -925,6 +926,8 @@ fn disconnects_a_stalled_header_sync_peer() {
         user_agent_version: "0.1.0".to_string(),
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        disable_relay_tx: false,
+        proxy: String::new(),
         newest_block: None,
     };
     let connected = ConnectedPeers::new();
@@ -1108,7 +1111,6 @@ fn announces_connected_blocks_to_served_peers() {
             dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
         ))),
         sync_peers: sync_peers.clone(),
-        next_peer_id: std::sync::atomic::AtomicI32::new(1),
         net_totals: std::sync::Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
@@ -1154,6 +1156,8 @@ fn announces_connected_blocks_to_served_peers() {
         user_agent_version: "0.1.0".to_string(),
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        disable_relay_tx: false,
+        proxy: String::new(),
         newest_block: None,
     };
     let connected = ConnectedPeers::new();

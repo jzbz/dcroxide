@@ -192,9 +192,10 @@ fn startup_serves_peer_connections_on_a_listener() {
     // is what keeps this off the network — an earlier version of this
     // comment claimed the flag below did that, and it never did.  The
     // helper panics with the captured daemon output if the announcement
-    // never arrives.
+    // never arrives.  The announcement is dcrd connmgr's, one line per
+    // listener under CMGR.
     wait_for_daemon_line("listen", &["--listen=127.0.0.1:0"], |line| {
-        line.contains("Serving peer-to-peer connections on 127.0.0.1:")
+        line.contains("[INF] CMGR: Server listening on 127.0.0.1:")
     });
 }
 

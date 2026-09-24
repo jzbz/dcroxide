@@ -223,15 +223,10 @@ fn add_peer_facts(
         // and successive peers land under the same peer state key.
         // That is why the map lengths in the rows never exceed one.
         id: 0,
-        addr: format!("{remote}:{PORT}"),
         inbound,
         persistent: false,
-        is_whitelisted: false,
         na: wire_addr(remote, PORT),
         peer_na: reported,
-        // dcrd 2.2 enforces the single-IP limit in the connection
-        // manager; `handleAddPeer` no longer reads it.
-        max_same_ip: 0,
         external,
     }
 }

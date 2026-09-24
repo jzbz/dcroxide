@@ -23,7 +23,10 @@ use dcroxide_standalone::{SubsidyCache, SubsidySplitVariant};
 use dcroxide_txscript::ScriptFlags;
 use dcroxide_wire::{BlockHeader, MsgBlock, MsgTx, OutPoint};
 
-use crate::txmempool::{NodeTxPool, chain_fetch_utxo_view, chain_standard_verify_flags, now_unix};
+use crate::mediantime::adjusted_time_unix;
+use crate::txmempool::{
+    DisapprovedViewCache, NodeTxPool, chain_fetch_utxo_view, chain_standard_verify_flags,
+};
 
 /// The chain backend for the template generator over the shared chain
 /// (dcrd `newServer` building its mining `Config` chain closures over
@@ -35,6 +38,10 @@ pub struct NodeTemplateChain {
     /// carries `s.subsidyCache`; the daemon seams each own one over
     /// the same params, which is result-identical).
     subsidy_cache: SubsidyCache<PoolSubsidyParams>,
+    /// The memoized disapproved-tip view this adapter's fetches share
+    /// (dcrd `disapprovedView`), so one template build disconnects the
+    /// tip's regular tree once rather than once per transaction.
+    disapproved_view: DisapprovedViewCache,
 }
 
 impl NodeTemplateChain {
@@ -45,6 +52,7 @@ impl NodeTemplateChain {
             chain,
             params,
             subsidy_cache,
+            disapproved_view: DisapprovedViewCache::default(),
         }
     }
 
@@ -92,7 +100,7 @@ impl TemplateChain for NodeTemplateChain {
 
     fn check_connect_block_template(&mut self, block: &MsgBlock) -> Result<(), String> {
         self.locked()
-            .check_connect_block_template(block, now_unix(), &self.params)
+            .check_connect_block_template(block, adjusted_time_unix(), &self.params)
             .map_err(|e| e.description)
     }
 
@@ -133,12 +141,19 @@ impl TemplateChain for NodeTemplateChain {
     }
 
     fn check_tspend_has_votes(&self, prev_hash: &Hash, tspend: &MsgTx) -> Result<(), String> {
-        let chain = self.locked();
-        let prev_node = chain
-            .index
-            .lookup_node(prev_hash)
-            .ok_or_else(|| format!("block {prev_hash} is not known"))?;
-        chain.check_tspend_has_votes(prev_node, tspend, &self.params)
+        // dcrd's `CheckTSpendHasVotes` takes no `chainLock`
+        // (`treasury.go:1155-1161`): capture the voting window under
+        // the chain mutex, then read and tally its blocks with it
+        // released (see `TSpendVoteWindow`).
+        let window = {
+            let chain = self.locked();
+            let prev_node = chain
+                .index
+                .lookup_node(prev_hash)
+                .ok_or_else(|| format!("block {prev_hash} is not known"))?;
+            chain.tspend_vote_window(prev_node, tspend, &self.params)?
+        };
+        window.check_has_votes(&self.params)
     }
 
     fn count_total_sig_ops(
@@ -177,6 +192,7 @@ impl TemplateChain for NodeTemplateChain {
         chain_fetch_utxo_view(
             &self.locked(),
             &self.params,
+            &self.disapproved_view,
             tx,
             tx_hash,
             tree,
@@ -197,7 +213,7 @@ impl TemplateChain for NodeTemplateChain {
         let errs = self.locked().force_head_reorganization(
             former_best,
             new_best,
-            now_unix(),
+            adjusted_time_unix(),
             &self.params,
         );
         match errs.into_iter().next() {
@@ -306,7 +322,7 @@ impl TemplateChain for NodeTemplateChain {
     }
 
     fn adjusted_time_unix(&self) -> i64 {
-        now_unix()
+        adjusted_time_unix()
     }
 }
 

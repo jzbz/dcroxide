@@ -25,8 +25,16 @@ pub fn to_coin(atoms: i64) -> f64 {
     atoms as f64 / 1e8
 }
 
-fn hex_str(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// Lowercase hex of the bytes (Go `hex.EncodeToString`), built in one
+/// allocation: getblock hex-encodes whole blocks through here.
+pub(crate) fn hex_str(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(DIGITS[usize::from(b >> 4)] as char);
+        out.push(DIGITS[usize::from(b & 0x0f)] as char);
+    }
+    out
 }
 
 fn s(v: String) -> GoValue {

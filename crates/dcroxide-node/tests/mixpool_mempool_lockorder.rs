@@ -10,10 +10,12 @@
 //! RVW-001 needs the traffic to flow the other way: pair-request
 //! acceptance has to know whether the memory pool already spends the
 //! outputs a request claims. dcrd asks that inside
-//! `mixpoolChain.FetchUtxoEntry`, which runs under the mixpool's own
-//! mutex — reproducing that structure here would take the tx-pool lock
-//! while holding the mixpool's, and close an AB-BA against the
-//! gauntlet.
+//! `mixpoolChain.FetchUtxoEntry`, from `checkAcceptPR`, which
+//! `AcceptMessage` runs before it takes the mixpool's mutex
+//! (`mixing/mixpool/mixpool.go:1206-1210`). The port's acceptance runs
+//! wholly under the mixpool guard, so asking from inside the fetcher
+//! would take the tx-pool lock while holding the mixpool's, and close an
+//! AB-BA against the gauntlet.
 //!
 //! So the answer is computed first, before the mixpool guard is taken,
 //! and passed in as a predicate. This pins that: the two orders run
@@ -35,7 +37,7 @@ use dcroxide_blockchain::process::Chain;
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{Database, Options};
 use dcroxide_dcrec::secp256k1::PrivateKey;
-use dcroxide_mixing::{PoolMessage, SCRIPT_CLASS_P2PKH_V0, sign_message};
+use dcroxide_mixing::{HashedMessage, PoolMessage, SCRIPT_CLASS_P2PKH_V0, sign_message};
 use dcroxide_netsync::manager::SyncMixPool;
 use dcroxide_wire::{MixPairReqUTXO, MsgMixPairReq, OutPoint};
 
@@ -143,7 +145,8 @@ fn pair_request_acceptance_never_holds_the_mixpool_across_the_tx_pool() {
             // Rejected — the fixture's outpoint is not in this chain —
             // but it travels the whole path first, which is what
             // matters here.
-            let _ = sync_pool.accept_message(&PoolMessage::PR(pair_request(0)), 1);
+            let msg = HashedMessage::new(PoolMessage::PR(pair_request(0)));
+            let _ = sync_pool.accept_message(&msg, 1);
             done_tx.send("peer").expect("peer reports");
         })
     };

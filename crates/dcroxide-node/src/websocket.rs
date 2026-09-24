@@ -401,6 +401,12 @@ impl NodeNtfnMgr {
     /// under the same lock, so concurrent connection threads cannot race
     /// past the cap.  `len() >= max` is `len()+1 > max` without the
     /// overflow-prone increment.
+    ///
+    /// A client counts against the cap from its upgrade, before it has
+    /// authenticated, and nothing makes it authenticate in time: dcrd
+    /// registers it the same way (`rpcwebsocket.go:108-127`) with no
+    /// read deadline, so silent unauthenticated connections can hold
+    /// every slot on either daemon (SECURITY.md).
     fn add_client(
         &self,
         session_id: u64,
@@ -417,8 +423,11 @@ impl NodeNtfnMgr {
 
     /// Drop a disconnected client: the registry entry and every
     /// subscription EXCEPT mix messages — dcrd's unregister-client
-    /// case skips the mix map (kept bug-for-bug; the stale entry is
-    /// harmless because delivery only reaches registered clients).
+    /// case skips the mix map (`rpcwebsocket.go:563-573`), kept
+    /// bug-for-bug and recorded in QUIRKS.md.  The stale entry is never
+    /// seen, since delivery only reaches registered clients, but the set
+    /// keeps one per session that ever subscribed, for the life of the
+    /// process, as dcrd's map keeps each such client.
     ///
     /// This runs from [`ClientRegistration`]'s `Drop`, so it is reached
     /// on an unwind out of the serving loop as well as on a clean
@@ -631,9 +640,11 @@ fn deliver_one(
         NtfnEvent::BlockDisconnected(block) => build(server, &targets, |srv, refs| {
             rpcws::notify_block_disconnected(srv, refs, block)
         }),
-        NtfnEvent::Work(template_block, reason) => build(server, &targets, |srv, refs| {
-            rpcws::notify_work(srv, refs, template_block, *reason)
-        }),
+        NtfnEvent::Work(template_block, reason) => {
+            build_from_snapshots(server, &targets, |srv, refs| {
+                rpcws::notify_work(srv, refs, template_block, *reason)
+            })
+        }
         NtfnEvent::TSpend(tspend) => build(server, &targets, |srv, refs| {
             rpcws::notify_tspend(srv, refs, tspend)
         }),
@@ -667,7 +678,7 @@ fn deliver_one(
             let mut out = if targets.is_empty() {
                 Vec::new()
             } else {
-                build(server, &targets, |srv, refs| {
+                build_from_snapshots(server, &targets, |srv, refs| {
                     rpcws::notify_for_new_tx(srv, refs, tx)
                 })
             };
@@ -696,9 +707,10 @@ fn deliver_one(
     }
 }
 
-/// Lock the given clients' shared state (with the server already
-/// locked, preserving the server-then-client order every path uses)
-/// and run a ported builder over them.
+/// Lock the given clients' shared state and run a ported builder over
+/// them, for the builders that update a client's transaction filter.
+/// Those touch nothing else that locks, so the client locks are held
+/// only while the filters are searched.
 fn build<F>(
     server: &Server<NodeRpcChain>,
     handles: &[(u64, ClientHandle)],
@@ -716,6 +728,42 @@ where
         })
         .collect();
     let mut refs: Vec<&mut WsClient> = guards.iter_mut().map(|g| &mut **g).collect();
+    builder(server, &mut refs)
+}
+
+/// Run a ported builder over snapshots of the given clients, for the
+/// builders that call into the chain or the work state and read nothing
+/// from a client but its session id and verbose flag.
+///
+/// dcrd's `notifyForNewTx` and `notifyWork` make those calls with no
+/// client locked, reading `verboseTxUpdates` unlocked
+/// (`rpcwebsocket.go:1093-1104`, `:865-907`).  [`build`] would hold every
+/// target's lock across them, and each target's reader takes that same
+/// lock for every request it serves -- so a block validation, a UTXO
+/// flush or a getwork submission holding the chain mutex or the work
+/// state stopped every subscriber from being served until it let go.
+/// Each client is locked here only long enough to copy the two fields.
+fn build_from_snapshots<F>(
+    server: &Server<NodeRpcChain>,
+    handles: &[(u64, ClientHandle)],
+    builder: F,
+) -> Vec<(u64, String)>
+where
+    F: FnOnce(&Server<NodeRpcChain>, &mut [&mut WsClient]) -> Vec<(u64, String)>,
+{
+    let mut snapshots: Vec<WsClient> = handles
+        .iter()
+        .map(|(_, h)| {
+            let wsc = h
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut snapshot = WsClient::new(wsc.session_id);
+            snapshot.verbose_tx_updates = wsc.verbose_tx_updates;
+            snapshot
+        })
+        .collect();
+    let mut refs: Vec<&mut WsClient> = snapshots.iter_mut().collect();
     builder(server, &mut refs)
 }
 
@@ -761,7 +809,10 @@ pub fn serve_websocket<S: Read + Write + Send>(
         let _ = write_handshake_error(&mut stream, "400 Bad Request", "Bad Request");
         return;
     }
-    if !head.method.eq_ignore_ascii_case("GET") {
+    // Compared exactly, as gorilla does (`r.Method != http.MethodGet`,
+    // `server.go:137`): Go never case-folds a request method, so a
+    // lowercase `get` is a method of its own and draws the 405.
+    if head.method != "GET" {
         let _ = write_handshake_error(&mut stream, "405 Method Not Allowed", "Method Not Allowed");
         return;
     }
@@ -901,6 +952,18 @@ fn serve_ws_reads<S: Read + Write>(
     server: &Arc<Server<NodeRpcChain>>,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) {
+    // The connection's read limit, gorilla's `readLimit`: set at the
+    // upgrade from whether the client arrived authenticated
+    // (`rpcserver.go:6036-6040`), and raised after that only by the
+    // single-request authenticate arm (`rpcwebsocket.go:1496-1497`).  It
+    // is not the authenticated flag -- dcrd's batch arm authenticates a
+    // client without raising it, so one that authenticated in a batch
+    // keeps the unauthenticated limit for good (QUIRKS.md).
+    let mut read_limit = if client_flags(state).0 {
+        READ_LIMIT_AUTHENTICATED
+    } else {
+        READ_LIMIT_UNAUTHENTICATED
+    };
     loop {
         // A server shutdown ends the connection like dcrd's
         // `close(s.quit)` unblocking every websocket loop; the poll
@@ -915,12 +978,6 @@ fn serve_ws_reads<S: Read + Write>(
             break;
         }
 
-        let authenticated = client_flags(state).0;
-        let read_limit = if authenticated {
-            READ_LIMIT_AUTHENTICATED
-        } else {
-            READ_LIMIT_UNAUTHENTICATED
-        };
         // One acquisition: write whatever is queued, then read. Draining
         // here is what makes the writer's fairness irrelevant -- a plain
         // mutex lets this thread barge, and it does, so it takes the
@@ -947,52 +1004,75 @@ fn serve_ws_reads<S: Read + Write>(
             // ends the connection.
             Ok(WsIn::Close) | Err(_) => break,
         };
-        // A non-UTF-8 (e.g. binary) frame cannot be JSON; dcrd feeds the
-        // raw bytes to json.Unmarshal, so an authenticated client gets a
-        // parse-error reply and an unauthenticated one is disconnected,
-        // rather than the frame being dropped silently.
-        let outcome = match String::from_utf8(message) {
-            Ok(body) => {
-                // dcrd services a websocket command with a context, the
-                // same one the standard HTTP handlers get: `serviceRequest`
-                // falls through to `standardCmdResult(ctx, r)` for any
-                // method not in its websocket-only table, and getwork is
-                // not in that table (`rpcwebsocket.go:1807-1819`).
-                //
-                // That context is the UPGRADE request's
-                // (`rpcserver.go:6041` passing `r.Context()`), which
-                // descends from the server's through `BaseContext`
-                // (`rpcserver.go:5921-5927`), so shutdown cancels it.
-                //
-                // dcrd also reaches it on a client hangup, but only where
-                // it dispatches concurrently: a non-batched command runs
-                // in a goroutine (`rpcwebsocket.go:1550`) that `Run`'s
-                // `wg.Add(3)` does not cover (`:1998-2011`), so it
-                // outlives the client teardown and is still selecting on
-                // the context when `conn.serve` fires `w.cancelCtx()`
-                // after `ServeHTTP` returns -- unconditionally, before
-                // the `c.hijacked()` check (`net/http/server.go:2137-2140`).
-                //
-                // This loop dispatches synchronously, so while a request
-                // runs nothing is reading and a hangup cannot be noticed
-                // at all.  That is dcrd's own behaviour on the two arms
-                // where it also stops reading: a batched request, which
-                // it services inline (`rpcwebsocket.go:1748`), and any
-                // request once `serviceRequestSem` is exhausted, since
-                // that is acquired before the spawn (`:1549`).  So the
-                // shutdown flag is the whole of what this token can
-                // carry here; see PARITY for what closing the rest would
-                // take.
-                let _cancel = dcroxide_rpc::worksem::scope_request_cancel(Arc::clone(shutdown));
-                handle_ws_request(server, state, &body)
-            }
-            Err(_) => parse_error_outcome(authenticated, "invalid UTF-8"),
+        // dcrd services a websocket command with a context, the same one
+        // the standard HTTP handlers get: `serviceRequest` falls through
+        // to `standardCmdResult(ctx, r)` for any method not in its
+        // websocket-only table, and getwork is not in that table
+        // (`rpcwebsocket.go:1807-1819`).
+        //
+        // That context is the UPGRADE request's (`rpcserver.go:6041`
+        // passing `r.Context()`), which descends from the server's
+        // through `BaseContext` (`rpcserver.go:5921-5927`), so shutdown
+        // cancels it.
+        //
+        // dcrd also reaches it on a client hangup, but only where it
+        // dispatches concurrently: a non-batched command runs in a
+        // goroutine (`rpcwebsocket.go:1550`) that `Run`'s `wg.Add(3)`
+        // does not cover (`:1998-2011`), so it outlives the client
+        // teardown and is still selecting on the context when
+        // `conn.serve` fires `w.cancelCtx()` after `ServeHTTP` returns --
+        // unconditionally, before the `c.hijacked()` check
+        // (`net/http/server.go:2137-2140`).
+        //
+        // This loop dispatches synchronously, so while a request runs
+        // nothing is reading and a hangup cannot be noticed at all.  That
+        // is dcrd's own behaviour on the two arms where it also stops
+        // reading: a batched request, which it services inline
+        // (`rpcwebsocket.go:1748`), and any request once
+        // `serviceRequestSem` is exhausted, since that is acquired before
+        // the spawn (`:1549`).  So the shutdown flag is the whole of what
+        // this token can carry here; see PARITY for what closing the rest
+        // would take.
+        let outcome = {
+            let _cancel = dcroxide_rpc::worksem::scope_request_cancel(Arc::clone(shutdown));
+            handle_ws_request(server, state, &message, &mut read_limit)
         };
         match outcome {
             WsOutcome::Reply(reply) => outbound.push_reply(reply),
             WsOutcome::Skip => {}
             WsOutcome::Disconnect => break,
+            // dcrd's bare `return` out of `inHandler` skips the trailing
+            // `c.Disconnect()` (`rpcwebsocket.go:1800`), so nothing reads
+            // the client again but nothing closes it either: `Run` still
+            // waits on `ctx.Done()` or `c.quit` (`:2019-2023`), and the
+            // writer keeps delivering notifications until a write fails
+            // or the server shuts down.
+            WsOutcome::StopReading => {
+                park_without_reading(write_failed, shutdown);
+                break;
+            }
         }
+    }
+}
+
+/// How often a client that is no longer read checks whether its
+/// connection has gone: the read poll's own interval (`rpcrun`'s
+/// `WS_POLL_INTERVAL`).
+const PARKED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Hold a client whose input is no longer read until a write to it
+/// fails or the server shuts down, the only two things that disconnect
+/// a dcrd client once its `inHandler` has returned without calling
+/// `Disconnect` (`outHandler`'s failed write at `rpcwebsocket.go:1903-1905`
+/// and `Run`'s `ctx.Done()` arm at `:2020-2021`).
+fn park_without_reading(
+    write_failed: &std::sync::atomic::AtomicBool,
+    shutdown: &std::sync::atomic::AtomicBool,
+) {
+    while !shutdown.load(std::sync::atomic::Ordering::SeqCst)
+        && !write_failed.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        std::thread::sleep(PARKED_POLL_INTERVAL);
     }
 }
 
@@ -1013,12 +1093,16 @@ enum WsOutcome {
     /// Drop the connection (dcrd's silent disconnect on malformed or
     /// unauthenticated traffic).
     Disconnect,
+    /// Abandon the message and never read the client again, but leave
+    /// it connected (dcrd's batch arm returning from `inHandler` when a
+    /// command's reply fails to marshal).
+    StopReading,
 }
 
 /// The outcome for a request that could not be parsed: dcrd disconnects
 /// an unauthenticated client on any parse failure and hands an
 /// authenticated one an RPC parse error (dcrd `inHandler`).  Shared by
-/// the JSON parse path and the non-UTF-8 frame path.
+/// the JSON parse path and the raw-frame syntax check.
 fn parse_error_outcome(authenticated: bool, err_text: &str) -> WsOutcome {
     if !authenticated {
         return WsOutcome::Disconnect;
@@ -1068,10 +1152,11 @@ fn panic_recovery_outcome() -> WsOutcome {
 fn handle_ws_request(
     server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
-    body: &str,
+    message: &[u8],
+    read_limit: &mut usize,
 ) -> WsOutcome {
     catch_unwind(AssertUnwindSafe(|| {
-        handle_ws_request_inner(server, state, body)
+        handle_ws_request_inner(server, state, message, read_limit)
     }))
     .unwrap_or_else(|_| panic_recovery_outcome())
 }
@@ -1090,15 +1175,34 @@ fn handle_ws_request(
 fn handle_ws_request_inner(
     server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
-    body: &str,
+    message: &[u8],
+    read_limit: &mut usize,
 ) -> WsOutcome {
     // dcrd tests the raw first byte (`bytes.HasPrefix(msg,
     // batchedRequestPrefix)`), so a leading space makes an array a
     // single request that then fails to unmarshal, not a batch.
-    if body.as_bytes().first() == Some(&b'[') {
-        return handle_ws_batch(server, state, body);
+    let batched = message.first() == Some(&b'[');
+
+    // dcrd hands the frame to `json.Unmarshal` as it arrived
+    // (`rpcwebsocket.go:1413`, `:1563`) -- gorilla checks UTF-8 only in a
+    // close frame's reason -- so invalid UTF-8 inside a string is served,
+    // decoded as U+FFFD, and a stray byte anywhere else is Go's syntax
+    // error, answered by whichever arm the first byte chose.
+    let body = match dcroxide_dcrjson::gojson::unmarshal_input(message) {
+        Ok(body) => body,
+        Err(err) => {
+            let authenticated = client_flags(state).0;
+            return if batched {
+                batch_parse_error_outcome(authenticated, &err)
+            } else {
+                parse_error_outcome(authenticated, &err.go_message())
+            };
+        }
+    };
+    if batched {
+        return handle_ws_batch(server, state, &body);
     }
-    handle_ws_single(server, state, body)
+    handle_ws_single(server, state, &body, read_limit)
 }
 
 /// One non-batched websocket request (dcrd `inHandler`'s
@@ -1107,6 +1211,7 @@ fn handle_ws_single(
     server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
     body: &str,
+    read_limit: &mut usize,
 ) -> WsOutcome {
     let (authenticated, is_admin) = client_flags(state);
     let req = match unmarshal_request(body) {
@@ -1165,7 +1270,15 @@ fn handle_ws_single(
         (true, true) => return WsOutcome::Disconnect,
         (false, false) => return WsOutcome::Disconnect,
         (false, true) => {
-            return authenticate(server, state, &req.jsonrpc, parsed.params.as_ref(), &req.id);
+            let outcome =
+                authenticate(server, state, &req.jsonrpc, parsed.params.as_ref(), &req.id);
+            // Only this arm raises the read limit, and it does so once
+            // the credentials check out, ahead of marshalling the reply
+            // (`rpcwebsocket.go:1496-1497`).
+            if !matches!(outcome, WsOutcome::Disconnect) {
+                *read_limit = READ_LIMIT_AUTHENTICATED;
+            }
+            return outcome;
         }
         (true, false) => {}
     }
@@ -1182,7 +1295,9 @@ fn handle_ws_single(
         return reply_or_skip(create_marshalled_reply("", &req.id, None, Some(&json_err)));
     }
 
-    dispatch_ws_command(server, state, &req, parsed.params)
+    // A reply that fails to marshal is logged and dropped
+    // (`serviceRequest`, `rpcwebsocket.go:1821-1826`).
+    dispatch_ws_command(server, state, &req, parsed.params, WsOutcome::Skip)
 }
 
 /// Dispatch one fully-gated command, under the panic guard.
@@ -1195,11 +1310,16 @@ fn handle_ws_single(
 /// field at a time, and holding it for the whole call meant a request
 /// that waits -- a rescan, a `generate`, a `getwork` template wait --
 /// stalled the delivery thread and so the fan-out to every other client.
+///
+/// `marshal_failure` is the outcome when the reply fails to marshal (a
+/// result Go's `json.Marshal` refuses, or an id of an invalid type),
+/// which the two arms of dcrd's `inHandler` treat differently.
 fn dispatch_ws_command(
     server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
     req: &dcroxide_rpc::http::RawRequest,
     params: Option<dcroxide_dcrjson::GoValue>,
+    marshal_failure: WsOutcome,
 ) -> WsOutcome {
     let jsonrpc = req.jsonrpc.clone();
     let id = req.id.clone();
@@ -1210,7 +1330,7 @@ fn dispatch_ws_command(
     }));
     match outcome {
         Ok(Some(reply)) => WsOutcome::Reply(reply),
-        Ok(None) => WsOutcome::Skip,
+        Ok(None) => marshal_failure,
         Err(_) => panic_recovery_outcome(),
     }
 }
@@ -1227,7 +1347,11 @@ fn dispatch_ws_command(
 ///
 /// A disconnect anywhere abandons the whole message, as dcrd's
 /// `break out` does: the replies already collected are dropped with the
-/// connection.
+/// connection.  So does a command whose reply fails to marshal, which
+/// dcrd answers with a bare `return` from `inHandler`
+/// (`rpcwebsocket.go:1753-1758`): the entries after it never run, and
+/// the client is never read again but stays connected.  Every other
+/// marshal failure in the arm drops only its own entry (`continue`).
 fn handle_ws_batch(
     server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
@@ -1238,18 +1362,7 @@ fn handle_ws_batch(
     let mut batch_size = 0usize;
 
     match dcroxide_dcrjson::gojson::validate(body) {
-        Err(err) => {
-            if !authenticated {
-                return WsOutcome::Disconnect;
-            }
-            let json_err = RPCError::new(
-                err_rpc_parse().code,
-                &format!("Failed to parse request: {}", err.go_message()),
-            );
-            if let Ok(reply) = create_marshalled_reply("2.0", &RpcId::Null, None, Some(&json_err)) {
-                results.push(reply);
-            }
-        }
+        Err(err) => return batch_parse_error_outcome(authenticated, &err),
         Ok(()) => {
             let entries = split_raw_array(body.trim_start_matches([' ', '\t', '\n', '\r']));
             if entries.is_empty() {
@@ -1272,6 +1385,7 @@ fn handle_ws_batch(
                         WsOutcome::Reply(reply) => results.push(reply),
                         WsOutcome::Skip => {}
                         WsOutcome::Disconnect => return WsOutcome::Disconnect,
+                        WsOutcome::StopReading => return WsOutcome::StopReading,
                     }
                 }
             }
@@ -1290,6 +1404,27 @@ fn handle_ws_batch(
         Some(first) => WsOutcome::Reply(first),
         None => WsOutcome::Reply(String::new()),
     }
+}
+
+/// The outcome for a batch whose message does not parse as JSON: a
+/// disconnect for an unauthenticated client, otherwise the parse error
+/// at version "2.0" as the whole reply -- or the empty payload dcrd
+/// sends when even that fails to marshal (`rpcwebsocket.go:1563-1583`,
+/// `:1767-1794`).
+fn batch_parse_error_outcome(
+    authenticated: bool,
+    err: &dcroxide_dcrjson::gojson::JsonError,
+) -> WsOutcome {
+    if !authenticated {
+        return WsOutcome::Disconnect;
+    }
+    let json_err = RPCError::new(
+        err_rpc_parse().code,
+        &format!("Failed to parse request: {}", err.go_message()),
+    );
+    WsOutcome::Reply(
+        create_marshalled_reply("2.0", &RpcId::Null, None, Some(&json_err)).unwrap_or_default(),
+    )
 }
 
 /// The batched response json: the entry replies joined in one array.
@@ -1400,7 +1535,9 @@ fn handle_ws_batch_entry(
         ));
     }
 
-    dispatch_ws_command(server, state, &req, parsed.params)
+    // Unlike every marshal failure above, this one is not a `continue`
+    // but a `return` out of `inHandler` (`rpcwebsocket.go:1753-1758`).
+    dispatch_ws_command(server, state, &req, parsed.params, WsOutcome::StopReading)
 }
 
 /// Handle the `authenticate` command: verify the credentials, mark the
@@ -1445,7 +1582,7 @@ fn struct_string(fields: &[dcroxide_dcrjson::GoValue], index: usize) -> String {
 
 /// Turn a marshalled reply into an outcome, dropping the reply when
 /// marshalling fails (dcrd logs and drops such failures).
-fn reply_or_skip(reply: Result<String, dcroxide_dcrjson::DcrjsonError>) -> WsOutcome {
+fn reply_or_skip(reply: Result<String, String>) -> WsOutcome {
     match reply {
         Ok(reply) => WsOutcome::Reply(reply),
         Err(_) => WsOutcome::Skip,

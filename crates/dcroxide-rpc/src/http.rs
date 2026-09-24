@@ -214,26 +214,10 @@ pub fn split_raw_array(data: &str) -> Vec<String> {
 }
 
 /// Whether a decoded JSON key names the given ASCII struct field, the
-/// way Go's `foldName` does.
-///
-/// Go folds with `unicode.SimpleFold`, and U+017F (LATIN SMALL LETTER
-/// LONG S) and U+212A (KELVIN SIGN) are the only runes whose fold cycle
-/// reaches ASCII -- they fold to `s` and `k`. Every field name here is
-/// ASCII, so mapping those two and comparing ASCII-insensitively is
-/// exactly Go's result, without carrying a fold table.
+/// way Go's `foldName` does: the shared matcher the struct decoder uses
+/// too ([`gojson::go_fold_eq`]).
 fn fold_eq(key: &str, field: &str) -> bool {
-    if key.is_ascii() {
-        return key.eq_ignore_ascii_case(field);
-    }
-    let folded: String = key
-        .chars()
-        .map(|c| match c {
-            '\u{017f}' => 's',
-            '\u{212a}' => 'k',
-            other => other,
-        })
-        .collect();
-    folded.eq_ignore_ascii_case(field)
+    gojson::go_fold_eq(key, field)
 }
 
 /// Split a JSON object into raw (key, value) text pairs.  The input

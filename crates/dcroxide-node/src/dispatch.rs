@@ -17,14 +17,18 @@
 //! input thread see the real pending-batch and pending-item counts,
 //! the chain lock is taken per item rather than per batch, and the
 //! send pipeline stays bounded by dcrd's `maxPendingSend` slots.
-//! The address/relay handlers (`OnAddr`, `OnGetAddr`, inventory relay),
-//! the sync-manager forwards (`OnInv`, `OnHeaders`, block/tx intake),
-//! and the mempool/mixpool-backed fetches arrive with later pieces;
-//! messages without a handler are ignored, matching a dcrd node whose
-//! subsystems simply have nothing to do.
+//!
+//! The rest of dcrd's listeners are here too: the address exchange
+//! (`OnGetAddr`, `OnAddr`, `OnAddrV2`), inventory relay and block
+//! announcements, the committed-filter and initial-state requests, the
+//! sync-manager forwards (`OnInv`, `OnHeaders`, `OnBlock`, `OnTx`,
+//! `OnNotFound`, the mix messages), and the mempool and mixpool-backed
+//! fetches.  Messages without a handler are ignored, matching a dcrd
+//! node whose subsystems simply have nothing to do.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,12 +36,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dcroxide_addrmgr::AddrManager;
 use dcroxide_blockchain::process::Chain;
 use dcroxide_chainhash::Hash;
-use dcroxide_netsync::manager::{Action, LogLevel as SyncLogLevel};
+use dcroxide_database::Database;
+use dcroxide_netsync::manager::{Action, LogLevel as SyncLogLevel, SyncMixPool, SyncTxPool};
 use dcroxide_peer::{Peer, PeerEnv};
 use dcroxide_uint256::Uint256;
 use dcroxide_wire::{
     INIT_STATE_HEAD_BLOCK_VOTES, INIT_STATE_HEAD_BLOCKS, INIT_STATE_TSPENDS, InvType, InvVect,
-    Message, MsgCFilterV2, MsgHeaders, MsgInitState, MsgInv, MsgNotFound,
+    Message, MsgBlock, MsgCFilterV2, MsgHeaders, MsgInitState, MsgInv, MsgNotFound,
 };
 
 use crate::peerconn::NodePeerEnv;
@@ -47,8 +52,9 @@ use crate::server::{
     MAX_CONCURRENT_GETDATA_REQS, MAX_PENDING_SEND, OnAddrFacts, OnAddrOutcome, OnGetDataOutcome,
     OnGetInitStateOutcome, OnGetMiningStateOutcome, OnInvOutcome, PushAddrOutcome, SendPipeline,
     ServeGetDataItemAction, ServerPeerAddrState, build_get_blocks_response,
-    build_get_headers_response, natf_supported, on_addr, on_get_addr, on_get_data,
-    on_get_init_state, on_get_mining_state, on_inv_classify, serve_get_data_item,
+    build_get_headers_response, get_init_state_gate, get_mining_state_gate, natf_supported,
+    on_addr, on_get_addr, on_get_data, on_get_init_state, on_get_mining_state, on_inv_classify,
+    serve_get_data_item,
 };
 use crate::sync::NodeSyncManager;
 
@@ -101,12 +107,9 @@ pub struct ServerContext {
     /// The sync manager tracking the header and block download state.
     pub sync_manager: Arc<Mutex<NodeSyncManager>>,
     /// The live peers' outbound queues and socket handles, keyed by
-    /// the sync-manager peer id, so the manager's actions can reach
-    /// any peer (dcrd resolves the same through its peer references).
+    /// the peer's id, so the manager's actions can reach any peer
+    /// (dcrd resolves the same through its peer references).
     pub sync_peers: SyncPeers,
-    /// The next sync-manager peer id (dcrd's peer package draws ids
-    /// from a package-global atomic counter).
-    pub next_peer_id: AtomicI32,
     /// Whether the daemon accepts incoming connections (`--nolisten`);
     /// gates the local-address advertisement to outbound peers.
     pub disable_listen: bool,
@@ -168,9 +171,6 @@ pub fn new_recently_advertised()
     ))
 }
 
-/// The registry resolving sync-manager peer ids to the handles the
-/// manager's actions need: the outbound queue for sends and the socket
-/// for disconnects.
 /// A registered peer's handles: the outbound queue for sends, the
 /// socket for disconnects, the relay state the inventory fan-out
 /// consults, the shared peer for live stat snapshots (`getpeerinfo`),
@@ -196,6 +196,16 @@ struct SyncPeerHandles {
     /// handlers so `getpeerinfo` reports the live decaying value (dcrd
     /// reading `sp.banScore.Int()` off the serverPeer).
     ban_score: Option<Arc<Mutex<dcroxide_connmgr::DynamicBanScore>>>,
+    /// The highest last known block height the sync manager has
+    /// learned for the peer since it registered
+    /// ([`Action::UpdateLastBlockHeight`]), `None` until the first
+    /// rise.  dcrd's netsync raises the embedded `peer.Peer`'s own
+    /// `lastBlock`; the port's action executor runs under the registry
+    /// lock, and no peer lock is taken under that lock (see
+    /// [`SyncPeers::connected_peer_infos`]), so the rise is kept here
+    /// and `getpeerinfo` folds it into the peer's version-message
+    /// height.
+    last_block: Option<i64>,
 }
 
 /// The per-peer relay state (dcrd's `serverPeer` fields the relay
@@ -248,6 +258,14 @@ impl SyncPeers {
         SyncPeers::default()
     }
 
+    /// Whether no peer is registered.
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("sync peers mutex poisoned")
+            .is_empty()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn register(
         &self,
@@ -281,6 +299,7 @@ impl SyncPeers {
                     permanent,
                     conn_req_id,
                     ban_score,
+                    last_block: None,
                 },
             );
     }
@@ -309,6 +328,26 @@ impl SyncPeers {
         (num_outbound, num_mix_capable)
     }
 
+    /// Queue the message to every registered peer (dcrd
+    /// `server.BroadcastMessage` driving `handleBroadcastMsg`, which
+    /// queues it to every connected peer; a registered peer is connected
+    /// by construction, and no caller excludes any).  The queues are
+    /// cloned out under the registry lock and fed after it is released.
+    /// A full queue drops this peer's copy and reports it, as every
+    /// producer that tolerates a drop does.  A ping is not stamped here:
+    /// the peer's output loop stamps every ping as it writes it, as
+    /// dcrd's `outHandler` does, so the `ping` RPC's pongs are timed like
+    /// the keepalive's.
+    pub(crate) fn broadcast_message(&self, msg: &Message) {
+        let queues: Vec<OutboundQueue> = {
+            let registry = self.inner.lock().expect("sync peers mutex poisoned");
+            registry.values().map(|h| h.outbound.clone()).collect()
+        };
+        for queue in queues {
+            queue.try_queue(msg.clone());
+        }
+    }
+
     /// Snapshot every registered peer as an RPC peer-info record (dcrd's
     /// `rpcConnManager.ConnectedPeers` over the server's `peerState`).
     /// The registry lock is released before any peer or relay lock is
@@ -325,6 +364,7 @@ impl SyncPeers {
             Arc<Mutex<RelayPeerState>>,
             Option<String>,
             Option<Arc<Mutex<dcroxide_connmgr::DynamicBanScore>>>,
+            Option<i64>,
         )> = {
             let registry = self.inner.lock().expect("sync peers mutex poisoned");
             registry
@@ -336,6 +376,7 @@ impl SyncPeers {
                         Arc::clone(&handles.relay),
                         handles.local_addr.clone(),
                         handles.ban_score.clone(),
+                        handles.last_block,
                     )
                 })
                 .collect()
@@ -344,62 +385,68 @@ impl SyncPeers {
         let now = now_unix();
         entries
             .into_iter()
-            .filter_map(|(id, peer, relay, local_addr, ban_score)| {
-                // Skip a peer whose mutex is poisoned — its input thread
-                // panicked, so it is effectively dead — rather than
-                // propagating the poison and making every `getpeerinfo`
-                // call panic (caught as an internal error) forever.
-                let peer = peer.lock().ok()?;
-                let snap = peer.stats_snapshot();
-                // dcrd's `getpeerinfo` reports the version the peer
-                // advertised, not the negotiated (capped) one.
-                let advertised_version = peer.advertised_proto_ver();
-                drop(peer);
-                let tx_relay_disabled = relay
-                    .lock()
-                    .map(|relay| relay.tx_relay_disabled())
-                    .unwrap_or(false);
-                Some(dcroxide_rpc::server::RpcPeerInfo {
-                    // The id is the registry key (the sync manager's peer
-                    // id, the space `sync_peer_id` returns), not the
-                    // snapshot's id which the peer never assigns.
-                    id,
-                    addr: snap.addr,
-                    local_addr,
-                    services: snap.services.0,
-                    tx_relay_disabled,
-                    // The peer tracks these as unix nanoseconds; the RPC
-                    // result reports unix seconds.  The serving loops feed
-                    // them (and the byte counters) per message, like dcrd
-                    // updating the peer's counters on every read and write.
-                    last_send_unix: snap.last_send_nanos / 1_000_000_000,
-                    last_recv_unix: snap.last_recv_nanos / 1_000_000_000,
-                    bytes_sent: snap.bytes_sent,
-                    bytes_recv: snap.bytes_recv,
-                    conn_time_unix: snap.connected_nanos / 1_000_000_000,
-                    time_offset: snap.time_offset,
-                    version: advertised_version,
-                    // `StatsSnap.version` is the user-agent string (dcrd's
-                    // `subver`).
-                    user_agent: snap.version,
-                    inbound: snap.inbound,
-                    starting_height: snap.starting_height,
-                    last_block: snap.last_block,
-                    // The live decaying score off the shared abuse-control
-                    // state (dcrd's `sp.banScore.Int()`), poison-tolerant
-                    // like the other per-peer locks; a peer registered
-                    // without one (tests) scores zero.
-                    ban_score: ban_score
-                        .and_then(|score| score.lock().ok().map(|score| score.int_at(now)))
-                        .unwrap_or(0),
-                    last_ping_nonce: snap.last_ping_nonce,
-                    // The handler feeds this straight to `clock.since_nanos`,
-                    // so it stays in nanoseconds.
-                    last_ping_time_unix_nanos: snap.last_ping_time_nanos,
-                    last_ping_micros: snap.last_ping_micros,
-                    connected: true,
-                })
-            })
+            .filter_map(
+                |(id, peer, relay, local_addr, ban_score, raised_last_block)| {
+                    // Skip a peer whose mutex is poisoned — its input thread
+                    // panicked, so it is effectively dead — rather than
+                    // propagating the poison and making every `getpeerinfo`
+                    // call panic (caught as an internal error) forever.
+                    let peer = peer.lock().ok()?;
+                    let snap = peer.stats_snapshot();
+                    // dcrd's `getpeerinfo` reports the version the peer
+                    // advertised, not the negotiated (capped) one.
+                    let advertised_version = peer.advertised_proto_ver();
+                    drop(peer);
+                    let tx_relay_disabled = relay
+                        .lock()
+                        .map(|relay| relay.tx_relay_disabled())
+                        .unwrap_or(false);
+                    Some(dcroxide_rpc::server::RpcPeerInfo {
+                        // The registry key, which is the peer's own id
+                        // (dcrd's `ID: statsSnap.ID`, `rpcserver.go:2826`).
+                        id,
+                        addr: snap.addr,
+                        local_addr,
+                        services: snap.services.0,
+                        tx_relay_disabled,
+                        // The peer tracks these as unix nanoseconds; the RPC
+                        // result reports unix seconds.  The serving loops feed
+                        // them (and the byte counters) per message, like dcrd
+                        // updating the peer's counters on every read and write.
+                        last_send_unix: snap.last_send_nanos / 1_000_000_000,
+                        last_recv_unix: snap.last_recv_nanos / 1_000_000_000,
+                        bytes_sent: snap.bytes_sent,
+                        bytes_recv: snap.bytes_recv,
+                        conn_time_unix: snap.connected_nanos / 1_000_000_000,
+                        time_offset: snap.time_offset,
+                        version: advertised_version,
+                        // `StatsSnap.version` is the user-agent string (dcrd's
+                        // `subver`).
+                        user_agent: snap.version,
+                        inbound: snap.inbound,
+                        starting_height: snap.starting_height,
+                        // dcrd's `CurrentHeight: statsSnap.LastBlock`, the
+                        // field netsync raises as the peer announces blocks;
+                        // the manager's rises only ever exceed the
+                        // version-message height the peer recorded.
+                        last_block: raised_last_block
+                            .map_or(snap.last_block, |height| height.max(snap.last_block)),
+                        // The live decaying score off the shared abuse-control
+                        // state (dcrd's `sp.banScore.Int()`), poison-tolerant
+                        // like the other per-peer locks; a peer registered
+                        // without one (tests) scores zero.
+                        ban_score: ban_score
+                            .and_then(|score| score.lock().ok().map(|score| score.int_at(now)))
+                            .unwrap_or(0),
+                        last_ping_nonce: snap.last_ping_nonce,
+                        // The handler feeds this straight to `clock.since_nanos`,
+                        // so it stays in nanoseconds.
+                        last_ping_time_unix_nanos: snap.last_ping_time_nanos,
+                        last_ping_micros: snap.last_ping_micros,
+                        connected: true,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -467,14 +514,21 @@ impl SyncPeers {
         }
     }
 
-    /// Whether the peer already knows this inventory (dcrd
-    /// `IsKnownInventory`), so a getblocks response can omit it.  An
-    /// unregistered peer knows nothing.
-    pub(crate) fn is_known_inventory(&self, id: i32, inv: &InvVect) -> bool {
+    /// The peer's relay state, whose known-inventory set a getblocks
+    /// response is filtered against (dcrd `IsKnownInventory`), cloned
+    /// out so the registry lock is released before the set is read.  An
+    /// unregistered peer has none, and knows nothing.
+    pub(crate) fn relay_state(&self, id: i32) -> Option<Arc<Mutex<RelayPeerState>>> {
         let registry = self.inner.lock().expect("sync peers mutex poisoned");
-        registry.get(&id).is_some_and(|handles| {
-            handles
-                .relay
+        registry.get(&id).map(|handles| Arc::clone(&handles.relay))
+    }
+
+    /// Whether the peer already knows this inventory (dcrd
+    /// `IsKnownInventory`).  An unregistered peer knows nothing.
+    #[cfg(test)]
+    pub(crate) fn is_known_inventory(&self, id: i32, inv: &InvVect) -> bool {
+        self.relay_state(id).is_some_and(|relay| {
+            relay
                 .lock()
                 .expect("relay state poisoned")
                 .known_inventory
@@ -487,12 +541,14 @@ impl SyncPeers {
     /// peer keeps the whole list.
     ///
     /// Marking is deliberately *not* done here: dcrd marks each vector as
-    /// it batches it into the inv message it is about to hand to a
-    /// channel that cannot fail, so marking always accompanies a send
-    /// (`queueHandler`'s trickle timer).  The port's queue can refuse a
-    /// message, so the caller marks with [`SyncPeers::mark_known`] only
-    /// after the enqueue succeeds — otherwise the peer is permanently
-    /// convinced it knows inventory it was never sent.
+    /// it batches it into the inv message it then queues, and the only
+    /// way that queueing fails is past the 40 MiB `maxQueuedOutputBytes`,
+    /// which disconnects the peer, so a surviving peer's marks always
+    /// accompany a send (`queueHandler`'s trickle timer).  The port's
+    /// queue refuses a message and keeps the peer, so the caller marks
+    /// with [`SyncPeers::mark_known`] only after the enqueue succeeds —
+    /// otherwise the peer is permanently convinced it knows inventory it
+    /// was never sent.
     pub(crate) fn filter_known(&self, id: i32, invs: Vec<InvVect>) -> Vec<InvVect> {
         let registry = self.inner.lock().expect("sync peers mutex poisoned");
         let Some(handles) = registry.get(&id) else {
@@ -597,8 +653,10 @@ impl SyncPeers {
                             // it would make the next announcement of
                             // this block look like a duplicate and get
                             // dropped as well.  dcrd cannot reach this
-                            // state — its enqueue blocks instead of
-                            // failing — so the marker is simply put
+                            // state with the peer still connected — its
+                            // enqueue fails only past the 40 MiB
+                            // `maxQueuedOutputBytes`, and then it
+                            // disconnects — so the marker is simply put
                             // back the way an unannounced block leaves
                             // it.
                             *announced_block = None;
@@ -616,9 +674,11 @@ impl SyncPeers {
                     }
                     // Record the item as known to the peer only once it
                     // is really on its way.  dcrd marks it as it batches
-                    // the inv into a message it then hands to a channel
-                    // that cannot fail, so marking and queueing are one
-                    // step there (`queueHandler`'s trickle timer calling
+                    // the inv into a message it then queues, and a
+                    // failed queueing there disconnects the peer (past
+                    // the 40 MiB `maxQueuedOutputBytes`), so for any
+                    // peer still connected marking and queueing are one
+                    // step (`queueHandler`'s trickle timer calling
                     // `AddKnownInventory` per vector).  Marking first
                     // here would permanently convince this peer it knows
                     // an item it was never told about, and the
@@ -632,7 +692,9 @@ impl SyncPeers {
                         // this path was missing: a block announcement
                         // that never went out must not leave the marker
                         // set, or the second announcement pass (every
-                        // block is offered twice, once per drain) reads
+                        // block is offered twice: once from the
+                        // NTNewTipBlockChecked callback, once from the
+                        // accepted-block drain) reads
                         // it as a duplicate and drops it too — so a peer
                         // that prefers inv over headers would never
                         // learn the block from us at all.
@@ -680,13 +742,15 @@ impl SyncPeers {
 
     /// Disconnect the non-permanent peer with the given id by shutting
     /// its socket and removing it from the registry, returning whether
-    /// such a peer was found (dcrd's `disconnectNode` by id, which scans
-    /// inbound and non-persistent outbound peers only).  A permanent
-    /// peer, an absent peer, or one without a socket handle is treated as
-    /// not found, so the handler emits dcrd's "use remove" hint; the
-    /// entry is deleted synchronously — like dcrd's `disconnectPeer`
-    /// `delete`ing before it returns — so a second `node disconnect` for
-    /// the same peer answers "peer not found".
+    /// such a peer was found (dcrd's `rpcConnManager.disconnectNode` by
+    /// id, which scans inbound and non-persistent outbound peers only).
+    /// A permanent peer, an absent peer, or one without a socket handle
+    /// is treated as not found, so the handler emits dcrd's "use remove"
+    /// hint.  The entry is deleted synchronously, as release-v2.1.5's
+    /// `disconnectPeer` did, so a second `node disconnect` for the same
+    /// peer answers "peer not found".  The pin's `disconnectNode` only
+    /// calls `Disconnect` and leaves the entry for `DonePeer`, so there a
+    /// repeat that arrives before the peer's teardown still succeeds.
     pub(crate) fn disconnect_by_id(&self, id: i32) -> bool {
         let mut registry = self.inner.lock().expect("sync peers mutex poisoned");
         let disconnectable = matches!(
@@ -737,9 +801,9 @@ impl SyncPeers {
     /// Remove the first persistent peer matching the predicate: shut
     /// its socket and delete the entry, returning its
     /// connection-request id so the caller can stop the redial (the
-    /// shared body of dcrd's `removeNode`, whose `disconnectPeer`
-    /// helper takes the same compare function and stops after the
-    /// first match).  Only permanent peers match — a temporary or
+    /// shared body of dcrd's `rpcConnManager.removeNode`, which scans
+    /// the persistent peers with the same compare function and stops at
+    /// the first match).  Only permanent peers match — a temporary or
     /// absent peer is `None` ("peer not found"), so the handler emits
     /// dcrd's "use disconnect" hint for a connected temporary peer.
     /// Unlike `node disconnect`, a peer without a socket handle is
@@ -747,7 +811,9 @@ impl SyncPeers {
     /// the entry deletion and redial stop matter even when the
     /// connection itself can only wind down on its own.  The
     /// outbound-group count releases when the serving thread unwinds
-    /// (its drop guard), like dcrd's `whenFound` decrement.
+    /// (its drop guard); release-v2.1.5 decremented it in the
+    /// `disconnectPeer` callback, and the pin's connection manager
+    /// releases it when `Remove` drops the persistent entry.
     fn remove_persistent_where(
         &self,
         matches: impl Fn(i32, &SyncPeerHandles) -> bool,
@@ -786,17 +852,54 @@ impl SyncPeers {
         }
     }
 
+    /// Execute the sync manager's actions, handing every request a full
+    /// outbound queue refused back to the manager
+    /// ([`dcroxide_netsync::SyncManager::on_request_not_sent`]) so it is
+    /// re-requested from another holder or forgotten instead of staying
+    /// recorded against a peer that was never asked.  The manager lock
+    /// is taken only once the registry lock is released, and every
+    /// peer that refuses is excluded from the retries that follow, so
+    /// the rounds end once no untried holder remains.
+    fn execute_sync(&self, manager: &Mutex<NodeSyncManager>, actions: Vec<Action>) {
+        let mut refused_by: BTreeSet<i32> = BTreeSet::new();
+        let mut pending = actions;
+        loop {
+            let refused = self.execute(pending);
+            if refused.is_empty() {
+                return;
+            }
+            refused_by.extend(refused.iter().map(|(peer, _)| *peer));
+            let mut manager = manager.lock().expect("sync manager poisoned");
+            pending = Vec::new();
+            for (peer, message) in &refused {
+                pending.extend(manager.on_request_not_sent(*peer, message, &refused_by));
+            }
+        }
+    }
+
     /// Execute the sync manager's actions: queue messages on the
     /// targeted peers' outbound queues and interrupt disconnected
     /// peers' reads by shutting their sockets down.  The stall-timer
     /// actions are handled by the header-sync timer piece.
-    fn execute(&self, actions: Vec<Action>) {
-        let registry = self.inner.lock().expect("sync peers mutex poisoned");
+    ///
+    /// Returns the getdata and getheaders requests a full queue refused,
+    /// with the peer each was meant for; [`Self::execute_sync`] hands
+    /// them back to the manager, whose request maps and duplicate
+    /// filter recorded them as sent.
+    fn execute(&self, actions: Vec<Action>) -> Vec<(i32, Message)> {
+        let mut refused = Vec::new();
+        let mut registry = self.inner.lock().expect("sync peers mutex poisoned");
         for action in actions {
             match action {
                 Action::QueueMessage { peer, message } => {
                     if let Some(handles) = registry.get(&peer) {
                         let command = message.command();
+                        // Only the two requests the manager records as
+                        // sent need handing back if refused, and both are
+                        // small, so the copy is cheap.
+                        let request =
+                            matches!(message, Message::GetData(_) | Message::GetHeaders(_))
+                                .then(|| message.clone());
                         match handles.outbound.queue_message(message) {
                             Ok(()) => {}
                             // The output loop already stopped, so the
@@ -805,48 +908,44 @@ impl SyncPeers {
                             // disconnect path.
                             Err(crate::peerloop::QueueError::Closed) => {}
                             Err(crate::peerloop::QueueError::Full) => {
-                                // Do NOT disconnect here.  dcrd never
-                                // does: its `queueHandler` appends to an
-                                // unbounded `pendingMsgs`, so a full
-                                // queue is not a signal about the peer
-                                // at all.  Severing the connection
-                                // instead punishes an honest peer for
-                                // transient congestion — post-sync,
-                                // relay emits one inv message per item
-                                // per peer, so a peer on a slow link can
-                                // accumulate the whole queue purely
-                                // while we are pushing it a block it
-                                // asked for, and the next sync request
-                                // would kill it.
-                                //
-                                // What makes dropping safe is that the
-                                // depth can only stay full for a bounded
-                                // time: the output loop's write budget
-                                // is an absolute per-message deadline
-                                // (`write_all_by_deadline`), so a peer
+                                // Do NOT disconnect here.  dcrd does, but
+                                // only once 40 MiB is queued for the peer
+                                // (`maxQueuedOutputBytes`, `queueOutMsg`);
+                                // this queue refuses at 4 MiB or 128
+                                // messages, far below that, and the
+                                // *Per-peer outbound queue* row of
+                                // PARITY.md keeps the drop deliberately.
+                                // Severing the connection at this depth
+                                // punishes an honest peer for transient
+                                // congestion — post-sync, relay emits one
+                                // inv message per item per peer, so a
+                                // peer on a slow link can accumulate the
+                                // whole queue purely while we are pushing
+                                // it a block it asked for, and the next
+                                // sync request would kill it.  A peer
                                 // whose socket never drains is torn down
-                                // by that deadline, and netsync's
-                                // ordinary disconnect handling then
-                                // re-requests elsewhere.  A peer that is
-                                // merely slow drains and keeps serving.
+                                // by the output loop's per-message write
+                                // deadline.
                                 //
-                                // Residual: the one refused request is
-                                // lost rather than re-queued, so that
-                                // peer's sync leg is idle until the
-                                // stall detector or the write deadline
-                                // acts.  Re-queueing needs a netsync
-                                // seam that does not exist yet; the
-                                // warning is the operator's signal.
+                                // The refused request was never written,
+                                // so it arms no stall deadline and the
+                                // peer can never answer it.  It goes
+                                // back to the manager, which re-requests
+                                // the data from another holder or forgets
+                                // the request so the next announcement or
+                                // fetch asks again.
                                 handles.outbound.report_full(command);
                                 crate::logging::warn(
                                     "SYNC",
                                     &format!(
                                         "Outbound queue for peer {} is full -- dropping the \
-                                         {command} request; the peer's write deadline bounds \
-                                         how long this can persist",
+                                         {command} request",
                                         handles.remote_addr.as_deref().unwrap_or("unknown")
                                     ),
                                 );
+                                if let Some(request) = request {
+                                    refused.push((peer, request));
+                                }
                             }
                         }
                     }
@@ -925,8 +1024,19 @@ impl SyncPeers {
                 }
                 Action::ResetHeaderSyncStallTimeout => self.send_stall(StallCommand::Reset),
                 Action::StopHeaderSyncStallTimeout => self.send_stall(StallCommand::Stop),
+                Action::UpdateLastBlockHeight { peer, height } => {
+                    // The registry lock is already held and the peer
+                    // lock must not be taken under it (see
+                    // `SyncPeerHandles::last_block`); dcrd's
+                    // `UpdateLastBlockHeight` ignores anything lower.
+                    if let Some(handles) = registry.get_mut(&peer) {
+                        handles.last_block =
+                            Some(handles.last_block.map_or(height, |h| h.max(height)));
+                    }
+                }
             }
         }
+        refused
     }
 }
 
@@ -1007,7 +1117,7 @@ pub fn start_stall_timer(
                             let mut manager = manager.lock().expect("sync manager poisoned");
                             manager.on_header_sync_stall_timeout()
                         };
-                        peers.execute(actions);
+                        peers.execute_sync(&manager, actions);
                     }
                 }
                 // All senders dropped: the daemon is shutting down.
@@ -1073,11 +1183,16 @@ pub struct ServerPeerHandler {
     /// `Peer.Addr()`, stored at peer creation), so the address-keyed
     /// control RPCs match even when the socket clone failed.
     remote_addr: String,
+    /// Whether the connection is inbound (dcrd `Peer.Inbound`), for the
+    /// direction the misbehavior log lines print.  Taken from the
+    /// connection manager's request id at construction (outbound peers
+    /// carry one) and confirmed from the peer at `on_version`.
+    inbound: bool,
     /// The shared peer handle, kept so the getdata serve worker can
     /// read the send accounting the output loop maintains and pace
-    /// its pipeline against it.  Set at `on_connected`; the input
-    /// thread holds the guard across the handlers, so it is only ever
-    /// cloned here, never locked.
+    /// its pipeline against it.  Set at `on_connected`.  The handlers
+    /// lock the peer they are handed, briefly, around the state they
+    /// read; the serve worker, on its own thread, locks this handle.
     peer_handle: Option<Arc<Mutex<Peer>>>,
     /// The peer's getdata serve queue and its pending-request
     /// counters, created on the first getdata (dcrd creates the
@@ -1085,25 +1200,10 @@ pub struct ServerPeerHandler {
     getdata_serve: Option<GetDataServe>,
 }
 
-/// How long the getdata serve worker waits for the peer's output loop
-/// to make progress before abandoning the rest of a batch.  A peer
-/// that stops reading its socket stalls the worker here instead of
-/// letting fetched data pile up; abandoning the batch leaves its
-/// remaining items counted as pending, so the peer's next getdata
-/// trips the pending-item limit and disconnects it — the same outcome
-/// dcrd reaches by blocking on its send semaphore until the peer is
-/// dropped.
-const GETDATA_SEND_STALL_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// How often the serve worker re-reads the peer's send accounting
-/// while its send pipeline is full.
+/// while its send pipeline is full or its outbound queue refuses a
+/// reply.
 const GETDATA_SEND_POLL: Duration = Duration::from_millis(2);
-
-/// The size charged to the send pipeline for a queued mix message,
-/// which has no cheap serialized-size query.  It is deliberately
-/// generous: over-charging only makes the pipeline hold the slot
-/// longer, which is the safe direction.
-const NOMINAL_MIX_MESSAGE_BYTES: u64 = 32_768;
 
 /// The per-peer getdata serve queue: dcrd's `serverPeer.getDataQueue`
 /// channel, its `numPendingGetDataItemReqs` counter, and the handle
@@ -1145,27 +1245,36 @@ struct GetDataWorker {
 
 impl GetDataWorker {
     /// Serve queued getdata batches until the peer goes away (dcrd
-    /// `serverPeer.serveGetData`).
+    /// `serverPeer.serveGetData`, whose loop ends only on `sp.quit`).
     fn run(self, batches: mpsc::Receiver<Vec<InvVect>>) {
         let mut pipeline = SendPipeline::new();
-        let mut last_sent = self.peer_bytes_sent();
+        let (sent, pver) = match &self.peer_handle {
+            Some(handle) => {
+                let peer = handle.lock().expect("peer mutex poisoned");
+                (peer.bytes_sent(), peer.protocol_version())
+            }
+            None => (0, dcroxide_wire::PROTOCOL_VERSION),
+        };
+        let mut last_sent = sent;
         while let Ok(batch) = batches.recv() {
             decrement_usize(&self.pending_batches, 1);
             if self.quit.load(Ordering::SeqCst) {
                 return;
             }
-            if !self.serve_batch(&batch, &mut pipeline, &mut last_sent) {
+            if !self.serve_batch(&batch, pver, &mut pipeline, &mut last_sent) {
                 return;
             }
         }
     }
 
     /// Serve one batch item by item (dcrd
-    /// `serverPeer.handleServeGetData`), returning false once the peer
-    /// is gone.
+    /// `serverPeer.handleServeGetData`), returning false only once the
+    /// peer is going away.  `pver` is the negotiated protocol version
+    /// the replies are framed at.
     fn serve_batch(
         &self,
         batch: &[InvVect],
+        pver: u32,
         pipeline: &mut SendPipeline,
         last_sent: &mut u64,
     ) -> bool {
@@ -1212,14 +1321,14 @@ impl GetDataWorker {
                 let queued = match action {
                     ServeGetDataItemAction::QueueData(_) => {
                         let msg = message.take().expect("a found item resolved to a message");
-                        let bytes = message_payload_bytes(&msg);
+                        let bytes = message_payload_bytes(&msg, pver);
                         self.queue_data(msg, bytes, pipeline, last_sent)
                     }
                     // The continuation inventory and the consolidated
                     // notfound are queued outside the send pipeline,
                     // exactly as dcrd passes them a nil done channel.
                     ServeGetDataItemAction::QueueContinueInv(best) => {
-                        self.outbound.try_queue(Message::Inv(MsgInv {
+                        self.queue_reply(Message::Inv(MsgInv {
                             inv_list: vec![InvVect {
                                 inv_type: InvType::BLOCK,
                                 hash: best,
@@ -1238,7 +1347,7 @@ impl GetDataWorker {
         }
 
         if !not_found.is_empty() {
-            return self.outbound.try_queue(Message::NotFound(MsgNotFound {
+            return self.queue_reply(Message::NotFound(MsgNotFound {
                 inv_list: not_found,
             }));
         }
@@ -1260,16 +1369,23 @@ impl GetDataWorker {
     fn resolve(&self, iv: InvVect, continue_hash: Option<Hash>) -> (Option<Message>, Hash) {
         match iv.inv_type {
             InvType::BLOCK => {
-                let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
-                let block = chain.block_by_hash(&iv.hash);
-                // dcrd reads `BestSnapshot()` at the moment it queues
-                // the continuation inventory; it is only needed then.
-                let best = if block.is_some() && continue_hash == Some(iv.hash) {
-                    chain.best_snapshot().hash
-                } else {
-                    Hash([0u8; 32])
+                // dcrd's `BlockByHash` takes no chain lock at all.  The
+                // index lookup and a recent-window copy need it here, but
+                // a database read and its deserialization happen after it
+                // is released ([`BlockRead`]).
+                let (read, best) = {
+                    let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
+                    let read = BlockRead::locate(&chain, &iv.hash);
+                    // dcrd reads `BestSnapshot()` at the moment it queues
+                    // the continuation inventory; it is only needed then.
+                    let best = if read.is_some() && continue_hash == Some(iv.hash) {
+                        chain.best_snapshot().hash
+                    } else {
+                        Hash([0u8; 32])
+                    };
+                    (read, best)
                 };
-                drop(chain);
+                let block = read.and_then(|read| read.fetch(&iv.hash));
                 (block.map(Message::Block), best)
             }
             InvType::TX => {
@@ -1312,8 +1428,13 @@ impl GetDataWorker {
 
     /// Queue one resolved data message behind the send pipeline (dcrd
     /// acquiring a `maxPendingSend` semaphore slot before
-    /// `QueueMessage`), returning false once the peer is gone or has
-    /// stalled its socket past the timeout.
+    /// `QueueMessage`), returning false once the peer is going away.
+    ///
+    /// Like dcrd's semaphore wait this has no timeout.  Every payload is
+    /// charged its real framed size, so the pipeline drains whenever the
+    /// peer reads; a peer that stops reading is torn down by the output
+    /// loop's write deadline, and the disconnect path raises the quit
+    /// flag this loop watches.
     fn queue_data(
         &self,
         msg: Message,
@@ -1321,7 +1442,6 @@ impl GetDataWorker {
         pipeline: &mut SendPipeline,
         last_sent: &mut u64,
     ) -> bool {
-        let deadline = Instant::now().checked_add(GETDATA_SEND_STALL_TIMEOUT);
         loop {
             self.record_send_progress(pipeline, last_sent);
             if pipeline.has_room(MAX_PENDING_SEND) {
@@ -1330,38 +1450,30 @@ impl GetDataWorker {
             if self.quit.load(Ordering::SeqCst) {
                 return false;
             }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return false;
-            }
             thread::sleep(GETDATA_SEND_POLL);
         }
-        // The pipeline above already bounds this path to
-        // `MAX_PENDING_SEND` unwritten items, so a full queue here means
-        // other producers filled it; either way the batch stops rather
-        // than pretending the data went out, and the drop is reported
-        // instead of vanishing.
-        if !self.outbound.try_queue(msg) {
+        if !self.queue_reply(msg) {
             return false;
         }
         pipeline.record_queued(bytes);
         true
     }
 
+    /// Queue a reply the peer asked for through [`queue_reply`].
+    fn queue_reply(&self, msg: Message) -> bool {
+        queue_reply(&self.outbound, &self.quit, self.peer_handle.as_ref(), msg)
+    }
+
     /// Fold the bytes the output loop has written since the last check
     /// into the send pipeline, retiring the sends they completed (dcrd
     /// draining `sendDoneChan` to release semaphore slots).
     fn record_send_progress(&self, pipeline: &mut SendPipeline, last_sent: &mut u64) {
-        let Some(handle) = &self.peer_handle else {
+        let Some(sent) = self.peer_bytes_sent() else {
             // A peer that never registered has no send accounting to
             // observe; the outbound queue's own depth stays the bound.
             pipeline.record_sent(u64::MAX);
             return;
         };
-        let sent = handle
-            .lock()
-            .expect("peer mutex poisoned")
-            .stats_snapshot()
-            .bytes_sent;
         let delta = sent.wrapping_sub(*last_sent);
         *last_sent = sent;
         if delta > 0 {
@@ -1369,27 +1481,325 @@ impl GetDataWorker {
         }
     }
 
-    /// The peer's cumulative sent bytes, or zero without a handle.
-    fn peer_bytes_sent(&self) -> u64 {
-        match &self.peer_handle {
-            Some(handle) => {
-                handle
-                    .lock()
-                    .expect("peer mutex poisoned")
-                    .stats_snapshot()
-                    .bytes_sent
-            }
-            None => 0,
-        }
+    /// The peer's cumulative sent bytes, or `None` without a handle.
+    fn peer_bytes_sent(&self) -> Option<u64> {
+        peer_bytes_sent(self.peer_handle.as_ref())
     }
 }
 
-/// The bytes charged to the send pipeline for a queued data message.
-fn message_payload_bytes(msg: &Message) -> u64 {
+/// Split a mempool reply into the inv messages dcrd's trickle queue
+/// would send: at most `maxInvTrickleSize` vectors each
+/// (`peer/peer.go:1684-1692`), not the wire's 50,000 per message.
+fn mem_pool_inv_batches(invs: &[InvVect]) -> std::slice::Chunks<'_, InvVect> {
+    invs.chunks(dcroxide_peer::MAX_INV_TRICKLE_SIZE)
+}
+
+/// The peer's cumulative sent bytes, or `None` without a handle.  One
+/// lock and a counter read, so the serve worker's 2 ms poll allocates
+/// nothing.
+fn peer_bytes_sent(peer_handle: Option<&Arc<Mutex<Peer>>>) -> Option<u64> {
+    peer_handle.map(|handle| handle.lock().expect("peer mutex poisoned").bytes_sent())
+}
+
+/// Queue a getdata reply the peer asked for, waiting out a full outbound
+/// queue rather than dropping it, and return false only once the peer is
+/// going away (`quit` raised or the output loop gone).
+///
+/// dcrd's `QueueMessage` never refuses, so everything its serve
+/// goroutine queues is eventually sent and its `serveGetData` loop runs
+/// until the peer quits.  The port's queue is bounded (PARITY *Per-peer
+/// outbound queue*) and relay traffic can fill it while a slow peer is
+/// being served; dropping the reply, or ending the worker over it, would
+/// leave the peer waiting on data it asked for and never gets.  The send
+/// pipeline already holds the data path to `MAX_PENDING_SEND` unwritten
+/// payloads, so a refusal means other producers filled the queue.  A
+/// refused reply is retried only after the output loop has written
+/// something since, so a congested peer costs one refused attempt per
+/// completed write, and a peer that stops reading is torn down by the
+/// write deadline, which ends the wait.
+fn queue_reply(
+    outbound: &OutboundQueue,
+    quit: &AtomicBool,
+    peer_handle: Option<&Arc<Mutex<Peer>>>,
+    msg: Message,
+) -> bool {
+    let mut refused_at: Option<Option<u64>> = None;
+    loop {
+        if quit.load(Ordering::SeqCst) {
+            return false;
+        }
+        let sent = peer_bytes_sent(peer_handle);
+        // Without a handle there is no progress to observe, so every
+        // poll retries.
+        let retry = match refused_at {
+            None => true,
+            Some(at) => sent.is_none() || at != sent,
+        };
+        if retry {
+            // The queue consumes what it refuses, so each attempt hands
+            // it a copy.
+            match outbound.queue_message(msg.clone()) {
+                Ok(()) => return true,
+                Err(crate::peerloop::QueueError::Closed) => return false,
+                Err(crate::peerloop::QueueError::Full) => {
+                    // The reply is delayed, not dropped, so it does not
+                    // go through the queue's "-- dropping" warning, whose
+                    // once-per-episode latch stays free for a producer
+                    // that really does drop.
+                    if refused_at.is_none() {
+                        crate::logging::debug(
+                            "PEER",
+                            &format!(
+                                "Outbound queue for peer {} is full -- waiting to send {}",
+                                outbound.peer_label(),
+                                msg.command()
+                            ),
+                        );
+                    }
+                    refused_at = Some(sent);
+                }
+            }
+        }
+        thread::sleep(GETDATA_SEND_POLL);
+    }
+}
+
+/// The payload bytes charged to the send pipeline for a queued data
+/// message: exactly what the output loop writes after the message
+/// header, so a mark retires once its own payload has been written.
+///
+/// Blocks and transactions take their exact serialized size.  A mix
+/// message is encoded once to measure it, as the outbound queue's own
+/// byte charge does; a flat nominal charge never reconciled with the
+/// real write, so small mix messages left marks the counter could only
+/// reach through other traffic, and the pipeline stalled.  A message
+/// the codec refuses is charged nothing, since the output loop's write
+/// fails on the same error and ends the connection.
+fn message_payload_bytes(msg: &Message, pver: u32) -> u64 {
     match msg {
         Message::Block(block) => block.serialize_size() as u64,
         Message::Tx(tx) => tx.serialize_size() as u64,
-        _ => NOMINAL_MIX_MESSAGE_BYTES,
+        _ => msg
+            .encode_payload(pver)
+            .map_or(0, |payload| payload.len() as u64),
+    }
+}
+
+/// A block resolved under the chain lock (the index half of dcrd
+/// `BlockChain.BlockByHash` and `BlockByHeight`), with any database read
+/// left for after the lock is released.  Getdata serving and the RPC
+/// block fetches (`rpcrun.rs` `NodeRpcChain`) both go through it.
+///
+/// The chain lock is the node-wide exclusive mutex that block
+/// processing, template generation, transaction intake and every chain
+/// RPC wait on, where dcrd's `BlockByHash` and `BlockByHeight` hold no
+/// chain lock at all.  Stored blocks are immutable per hash, so reading
+/// one after the lock is released returns what [`Chain::block_by_hash`]
+/// and [`Chain::block_by_height`] would have.
+pub(crate) enum BlockRead {
+    /// The block was in the chain's recent in-memory window, shared with
+    /// it rather than copied under the lock.
+    Cached(Arc<MsgBlock>),
+    /// The block has data, held only by the database.
+    Stored(Option<Database>),
+}
+
+impl BlockRead {
+    /// Look the block up under the chain lock: `None` when it is unknown
+    /// or its data is not available, as [`Chain::block_by_hash`] answers.
+    pub(crate) fn locate(chain: &Chain, hash: &Hash) -> Option<BlockRead> {
+        let node = chain.index.lookup_node(hash)?;
+        if !chain.index.node_status(&chain.store, node).have_data() {
+            return None;
+        }
+        Some(BlockRead::at(chain, hash))
+    }
+
+    /// Look up the main-chain block at a height under the chain lock,
+    /// with its hash: `None` when the main chain does not reach it, as
+    /// [`Chain::block_by_height`] answers.
+    pub(crate) fn locate_main_chain(chain: &Chain, height: i64) -> Option<(Hash, BlockRead)> {
+        let node = chain.best_chain.node_by_height(height)?;
+        let hash = chain.store.node(node).hash;
+        Some((hash, BlockRead::at(chain, &hash)))
+    }
+
+    /// The recent-window copy of a block, or the database to read it
+    /// from.
+    fn at(chain: &Chain, hash: &Hash) -> BlockRead {
+        match chain.blocks.get(&hash.0) {
+            Some(block) => BlockRead::Cached(Arc::clone(block)),
+            None => BlockRead::Stored(chain.db.clone()),
+        }
+    }
+
+    /// The block, reading the database with no chain lock held (dcrd
+    /// `fetchBlockByNode`'s `db.View`).
+    pub(crate) fn fetch(self, hash: &Hash) -> Option<MsgBlock> {
+        let db = match self {
+            BlockRead::Cached(block) => return Some(Arc::unwrap_or_clone(block)),
+            BlockRead::Stored(db) => db?,
+        };
+        let mut found = None;
+        let _ = db.view(|tx| {
+            if let Ok(raw) = tx.fetch_block(hash)
+                && let Ok((block, _)) = MsgBlock::from_bytes(&raw)
+            {
+                found = Some(block);
+            }
+            Ok(())
+        });
+        found
+    }
+}
+
+/// Committed filters resolved under the chain lock (the index half of
+/// dcrd `BlockChain.LocateCFiltersV2` and `FilterByBlockHash`), with the
+/// database reads left for after the lock is released.  The getcfilterv2
+/// and getcfsv2 handlers and the getcfilterv2 RPC (`rpcrun.rs`
+/// `NodeRpcFiltererV2`) go through it.
+///
+/// dcrd walks the index under `chainLock.RLock`, releases it, and only
+/// then reads the filters and header commitments in one `db.View`.  The
+/// port's chain lock is exclusive, so reading up to
+/// [`dcroxide_wire::MAX_CFILTERS_V2_PER_BATCH`] filters from the database
+/// under it would hold off block processing and every other chain user
+/// for an 88-byte request.  Filters and commitments are immutable per
+/// block hash once stored, so the reads after the lock is released return
+/// what [`Chain::locate_cfilters_v2`] and [`Chain::filter_by_block_hash`]
+/// would have.
+pub(crate) struct FilterReads {
+    db: Option<Database>,
+    /// The blocks, oldest first.
+    blocks: Vec<FilterRead>,
+}
+
+/// One block's committed filter data, as far as the chain's recent
+/// in-memory window held it.
+struct FilterRead {
+    hash: Hash,
+    /// The serialized filter, when the window held it.
+    filter: Option<Vec<u8>>,
+    /// The header commitment leaves, when the window held them.
+    leaves: Option<Vec<Hash>>,
+}
+
+impl FilterReads {
+    /// The recent-window copies for the given blocks, taken under the
+    /// chain lock.
+    fn from_window(chain: &Chain, hashes: impl IntoIterator<Item = Hash>) -> FilterReads {
+        let blocks = hashes
+            .into_iter()
+            .map(|hash| FilterRead {
+                hash,
+                filter: chain
+                    .filters
+                    .get(&hash.0)
+                    .map(|filter| filter.bytes().to_vec()),
+                leaves: chain.header_commitments.get(&hash.0).cloned(),
+            })
+            .collect();
+        FilterReads {
+            db: chain.db.clone(),
+            blocks,
+        }
+    }
+
+    /// The range of a getcfsv2 request, validated exactly as
+    /// [`Chain::locate_cfilters_v2`] does: `None` for any range it
+    /// refuses (an unknown block, a start that is not an ancestor of the
+    /// end, or more blocks than one batch carries).
+    fn locate_range(chain: &Chain, start_hash: &Hash, end_hash: &Hash) -> Option<FilterReads> {
+        let start_node = chain.index.lookup_node(start_hash)?;
+        let end_node = chain.index.lookup_node(end_hash)?;
+        if !chain.store.is_ancestor_of(start_node, end_node) {
+            return None;
+        }
+        let nb = chain
+            .store
+            .node(end_node)
+            .height
+            .saturating_sub(chain.store.node(start_node).height)
+            .saturating_add(1);
+        if nb > i64::try_from(dcroxide_wire::MAX_CFILTERS_V2_PER_BATCH).unwrap_or(i64::MAX) {
+            return None;
+        }
+
+        // Fetch the block hashes for the range by walking parents back
+        // from the end node.
+        let mut hashes = Vec::with_capacity(usize::try_from(nb).unwrap_or(0));
+        let mut node = Some(end_node);
+        for _ in 0..nb {
+            let id = node.expect("the range is bounded by the ancestor check");
+            hashes.push(chain.store.node(id).hash);
+            node = chain.store.node(id).parent;
+        }
+        hashes.reverse();
+        Some(FilterReads::from_window(chain, hashes))
+    }
+
+    /// The single block of a getcfilterv2 request: `None` when its data,
+    /// and so its filter, is not available, as
+    /// [`Chain::filter_by_block_hash`] answers.
+    pub(crate) fn locate_block(chain: &Chain, hash: &Hash) -> Option<FilterReads> {
+        let node = chain.index.lookup_node(hash)?;
+        if !chain.index.node_status(&chain.store, node).have_data() {
+            return None;
+        }
+        Some(FilterReads::from_window(chain, [*hash]))
+    }
+
+    /// The filters with their header commitment inclusion proofs, reading
+    /// what the window did not hold in one database view with no chain
+    /// lock held.  `None` when any filter is missing, as the chain
+    /// answers; missing commitments prove against no leaves, as the
+    /// chain's fallback does.
+    pub(crate) fn fetch(self) -> Option<Vec<MsgCFilterV2>> {
+        let FilterReads { db, mut blocks } = self;
+        if blocks
+            .iter()
+            .any(|read| read.filter.is_none() || read.leaves.is_none())
+            && let Some(db) = &db
+        {
+            let _ = db.view(|tx| {
+                for read in blocks.iter_mut() {
+                    if read.filter.is_none() {
+                        read.filter =
+                            dcroxide_blockchain::chaindb::db_fetch_gcs_filter(tx, &read.hash)
+                                .unwrap_or(None)
+                                .map(|filter| filter.bytes().to_vec());
+                    }
+                    if read.leaves.is_none() {
+                        read.leaves = Some(
+                            dcroxide_blockchain::chaindb::db_fetch_header_commitments(
+                                tx, &read.hash,
+                            )
+                            .unwrap_or_default(),
+                        );
+                    }
+                }
+                Ok(())
+            });
+        }
+
+        // Prepare the response.
+        let proof_index = dcroxide_blockchain::process::HEADER_CMT_FILTER_INDEX;
+        blocks
+            .into_iter()
+            .map(|read| {
+                let data = read.filter?;
+                let leaves = read.leaves.unwrap_or_default();
+                Some(MsgCFilterV2 {
+                    block_hash: read.hash,
+                    data,
+                    proof_index,
+                    proof_hashes: dcroxide_standalone::generate_inclusion_proof(
+                        &leaves,
+                        proof_index,
+                    ),
+                })
+            })
+            .collect()
     }
 }
 
@@ -1423,9 +1833,12 @@ impl ServerPeerHandler {
         conn_req_id: Option<u64>,
         remote_addr: String,
     ) -> ServerPeerHandler {
+        let inbound = conn_req_id.is_none();
+        let mut addr_state = ServerPeerAddrState::new(is_whitelisted);
+        addr_state.peer_label = peer_label(&remote_addr, inbound);
         ServerPeerHandler {
             ctx,
-            addr_state: ServerPeerAddrState::new(is_whitelisted),
+            addr_state,
             continue_hash: Arc::new(Mutex::new(None)),
             env: NodePeerEnv::new(),
             reported_local_addr: None,
@@ -1437,6 +1850,7 @@ impl ServerPeerHandler {
             permanent,
             conn_req_id,
             remote_addr,
+            inbound,
             peer_handle: None,
             getdata_serve: None,
         }
@@ -1489,34 +1903,51 @@ impl ServerPeerHandler {
         }
     }
 
-    /// Record a ban for this peer's host in the shared banned map
-    /// (dcrd `server.BanPeer` reached from the misbehavior handlers;
-    /// the disconnect itself rides the returned serve signal, and
-    /// whitelisted peers and disabled banning are no-ops inside
-    /// [`crate::server::ban_peer`]).
-    fn ban_peer_now(&mut self) -> crate::server::BanPeerOutcome {
-        let mut banned = self
-            .ctx
-            .banned_hosts
-            .lock()
-            .expect("banned-hosts mutex poisoned");
-        crate::server::ban_peer(
-            &mut banned,
+    /// Record a ban for this peer's host in the shared banned map and
+    /// log it with dcrd's lines (dcrd `server.BanPeer` reached from the
+    /// misbehavior handlers with `reason`; the disconnect itself rides
+    /// the returned serve signal, and whitelisted peers and disabled
+    /// banning are no-ops inside [`crate::server::ban_peer`]).
+    fn ban_peer_now(&mut self, reason: &str) -> crate::server::BanPeerOutcome {
+        let outcome = {
+            let mut banned = self
+                .ctx
+                .banned_hosts
+                .lock()
+                .expect("banned-hosts mutex poisoned");
+            crate::server::ban_peer(
+                &mut banned,
+                &self.remote_addr,
+                self.addr_state.is_whitelisted,
+                self.ctx.disable_banning,
+                self.ctx.ban_duration_nanos,
+                self.env.now_nanos(),
+            )
+        };
+        for (level, line) in ban_peer_log_lines(
+            &outcome,
+            &self.addr_state.peer_label,
             &self.remote_addr,
-            self.addr_state.is_whitelisted,
+            self.inbound,
             self.ctx.disable_banning,
             self.ctx.ban_duration_nanos,
-            self.env.now_nanos(),
-        )
+            reason,
+        ) {
+            crate::logging::log("SRVR", level, &line);
+        }
+        outcome
     }
 
     /// The peer sent bytes that failed wire decoding (dcrd `OnRead`
-    /// banning "sent malformed wire message: %s"): record the ban;
-    /// the reason is log-only and the read loop disconnects on its
-    /// own.  BanPeer's whitelist and disabled-banning no-ops live
-    /// inside [`crate::server::ban_peer`].
-    pub(crate) fn on_wire_violation(&mut self, _err: &str) {
-        let _ = self.ban_peer_now();
+    /// banning "sent malformed wire message: %s"): record and log the
+    /// ban, and report whether it disconnected the peer.  dcrd's
+    /// `BanPeer` calls `Disconnect` itself, inside `readMessage`, so
+    /// `inHandler` does not log the failed read after a ban; after a
+    /// whitelisted peer's or with banning disabled it does.  The read
+    /// loop ends either way.  BanPeer's whitelist and disabled-banning
+    /// no-ops live inside [`crate::server::ban_peer`].
+    pub(crate) fn on_wire_violation(&mut self, err: &str) -> ServeSignal {
+        self.ban_peer_or_continue(format!("sent malformed wire message: {err}").into())
     }
 
     /// Route a direct ban whose disconnect happens only inside dcrd
@@ -1524,7 +1955,7 @@ impl ServerPeerHandler {
     /// connection (dcrd's handlers just return), everything else
     /// drops it with the given reason.
     fn ban_peer_or_continue(&mut self, reason: std::borrow::Cow<'static, str>) -> ServeSignal {
-        match self.ban_peer_now() {
+        match self.ban_peer_now(&reason) {
             crate::server::BanPeerOutcome::Ignored => ServeSignal::Continue,
             crate::server::BanPeerOutcome::Banned { .. }
             | crate::server::BanPeerOutcome::DisconnectOnly => ServeSignal::Disconnect(reason),
@@ -1545,7 +1976,19 @@ impl ServerPeerHandler {
         // the handshake completes (dcrd `server.go:1038`).
         self.reported_local_addr = Some(msg.addr_you);
 
-        let (num_outbound, num_mix_capable_outbound) = self.ctx.sync_peers.outbound_mix_counts();
+        // The peer knows its own direction; the log label follows it.
+        self.inbound = peer.inbound();
+        self.addr_state.peer_label = peer_label(&self.remote_addr, self.inbound);
+
+        // Only an outbound peer below the mixing version consults the
+        // counts, and only then does dcrd walk its outbound peers
+        // (`server.go:1002`), so no other handshake waits on them.
+        let (num_outbound, num_mix_capable_outbound) =
+            if !peer.inbound() && msg.protocol_version < dcroxide_wire::MIX_VERSION as i32 {
+                self.ctx.sync_peers.outbound_mix_counts()
+            } else {
+                (0, 0)
+            };
         let facts = crate::server::OnVersionFacts {
             inbound: peer.inbound(),
             sim_or_reg_net: self.ctx.sim_or_reg_net,
@@ -1569,12 +2012,17 @@ impl ServerPeerHandler {
                 msg.disable_relay_tx,
             )
         };
-        match outcome.rejected {
-            Some(rejection) => Err(crate::server::version_rejection_text(
+        if let Some(rejection) = outcome.rejected {
+            return Err(crate::server::version_rejection_text(
                 &facts, msg, rejection,
-            )),
-            None => Ok(()),
+            ));
         }
+
+        // Add the remote peer time as a sample for creating an offset
+        // against the local clock to keep the network time in sync (dcrd
+        // `server.go:1043-1045`, after every rejection has passed).
+        crate::mediantime::server_time_source().add_time_sample(&self.remote_addr, msg.timestamp);
+        Ok(())
     }
 
     /// Register the handshaken peer with the sync manager and execute
@@ -1583,51 +2031,84 @@ impl ServerPeerHandler {
     /// signalling `OnPeerConnected`).
     pub fn on_connected(
         &mut self,
-        peer: &mut Peer,
-        peer_handle: &Arc<Mutex<Peer>>,
+        peer: &Arc<Mutex<Peer>>,
         outbound: &OutboundQueue,
         remote_disable_relay_tx: bool,
     ) {
+        // The handshake facts read below, taken under one short lock.
+        // The peer is not held across the rest, as dcrd's `AddPeer`
+        // holds no peer lock: its output loop is already running, the
+        // registration below makes it visible to `getpeerinfo` and to
+        // every outbound handshake's mixing count, and the sync manager
+        // wait at the end lasts as long as another peer's block
+        // validation or a chain flush.
+        let (id, inbound, na, pver, services, wants_headers, last_block, user_agent) = {
+            let peer = peer.lock().expect("peer mutex poisoned");
+            (
+                peer.id(),
+                peer.inbound(),
+                peer.na().clone(),
+                peer.protocol_version(),
+                peer.services(),
+                peer.wants_headers(),
+                peer.last_block(),
+                peer.user_agent().to_string(),
+            )
+        };
+
         // Update the address manager and request known addresses for
         // outbound connections, skipped on the simulation and
-        // regression test networks (dcrd `OnVersion`'s outbound
-        // branch).
-        if !self.ctx.sim_or_reg_net && !peer.inbound() {
-            let remote = crate::server::wire_v2_to_addrmgr_net_address(peer.na())
+        // regression test networks (dcrd `handleAddPeer`'s outbound
+        // branch, `server.go:2639-2666`).
+        if !self.ctx.sim_or_reg_net && !inbound {
+            let remote = crate::server::wire_v2_to_addrmgr_net_address(&na)
                 .expect("the peer net address is well formed");
+
+            // Advertise the local address when the server accepts
+            // incoming connections and believes itself to be close to
+            // the best known tip.  The sync state is read before the
+            // address manager is locked, with dcrd's short circuit: dcrd
+            // holds no address-manager lock across `IsCurrent`, whose
+            // manager and chain locks block for as long as a block is
+            // being processed, and every other peer's addr traffic and
+            // the dialer's address selection would wait behind them.
+            let advertise_local = !self.ctx.disable_listen
+                && self
+                    .ctx
+                    .sync_manager
+                    .lock()
+                    .expect("sync manager poisoned")
+                    .is_current();
             let mut mgr = self
                 .ctx
                 .addr_manager
                 .lock()
                 .expect("addrmgr mutex poisoned");
-
-            // Advertise the local address when the server accepts
-            // incoming connections and believes itself to be close to
-            // the best known tip.
-            let is_current = self
-                .ctx
-                .sync_manager
-                .lock()
-                .expect("sync manager poisoned")
-                .is_current();
-            if !self.ctx.disable_listen && is_current {
-                let peer_pver = peer.protocol_version();
-                let lna =
-                    mgr.get_best_local_address(&remote, natf_supported(peer.protocol_version()));
-                if lna.is_routable()
-                    && let PushAddrOutcome::Queued(msg) = crate::server::push_addr_msg(
+            if advertise_local {
+                let lna = mgr.get_best_local_address(&remote, natf_supported(pver));
+                if lna.is_routable() {
+                    // The push reads and fills the peer's known-address
+                    // filter, so the peer is locked for it alone.  Taking
+                    // it inside the address manager's lock cannot
+                    // deadlock: the only path that holds this peer while
+                    // waiting on the address manager is the addr handlers,
+                    // on this peer's own input thread, which is the thread
+                    // running this.
+                    let pushed = crate::server::push_addr_msg(
                         &mut self.addr_state,
-                        peer,
+                        &mut peer.lock().expect("peer mutex poisoned"),
                         &mut self.env,
-                        peer_pver,
+                        pver,
                         &[lna],
-                    )
-                {
-                    // A dropped local-address announcement costs the peer
-                    // one address it would have learned; the queue cannot
-                    // be full this early in a connection, and the drop is
-                    // reported if it ever is.
-                    outbound.try_queue(*msg);
+                    );
+                    if let PushAddrOutcome::Queued(msg) = pushed {
+                        // A dropped local-address announcement costs the
+                        // peer one address it would have learned; the
+                        // queue cannot be full this early in a
+                        // connection, and the drop is reported if it
+                        // ever is.
+                        outbound.try_queue(*msg);
+                    }
                 }
             }
 
@@ -1654,7 +2135,7 @@ impl ServerPeerHandler {
         // and held across `resolve_external_address`'s calls into it,
         // which is dcrd's order.
         if let Some(reported) = self.reported_local_addr {
-            let remote_na = crate::server::wire_v2_to_addrmgr_net_address(peer.na())
+            let remote_na = crate::server::wire_v2_to_addrmgr_net_address(&na)
                 .expect("the peer net address is well formed");
             let mut cache = self
                 .ctx
@@ -1670,7 +2151,7 @@ impl ServerPeerHandler {
                 &mut cache,
                 &mut mgr,
                 Some(&reported),
-                peer.inbound(),
+                inbound,
                 &remote_na,
                 &self.ctx.external_addr_facts,
                 &|host| (self.ctx.lookup)(host),
@@ -1678,7 +2159,11 @@ impl ServerPeerHandler {
             );
         }
 
-        let id = self.ctx.next_peer_id.fetch_add(1, Ordering::SeqCst);
+        // The peer's own id, assigned from the process-wide counter
+        // as its version message was read (dcrd `readRemoteVersionMsg`,
+        // `peer/peer.go:2037`), so a peer rejected after that read has
+        // still used one up.  It keys the registry, the sync manager
+        // and the orphan tags, as `sp.ID()` and `peer.ID()` do in dcrd.
         self.sync_peer_id = Some(id);
         // The relay facts snapshot the handshake (dcrd reads them off
         // the live serverPeer; the headers preference is refreshed if
@@ -1686,17 +2171,15 @@ impl ServerPeerHandler {
         let relay = Arc::new(Mutex::new(RelayPeerState::new(
             crate::server::RelayPeerFacts {
                 connected: true,
-                services: peer.services(),
-                wants_headers: peer.wants_headers(),
+                services,
+                wants_headers,
                 disable_relay_tx: remote_disable_relay_tx,
-                protocol_version: peer.protocol_version(),
+                protocol_version: pver,
             },
         )));
         // Capture the local connection address before the socket is
         // taken (getpeerinfo's `addrlocal`), and register the shared peer
-        // for live stat snapshots.  `peer_handle` is only cloned here,
-        // never locked: the caller already holds the peer guard across
-        // this call, so locking the same mutex would self-deadlock.
+        // for live stat snapshots.
         let local_addr = self
             .socket
             .as_ref()
@@ -1704,13 +2187,13 @@ impl ServerPeerHandler {
             .map(|addr| addr.to_string());
         // The getdata serve worker paces its send pipeline against the
         // byte accounting the output loop keeps on this same handle.
-        self.peer_handle = Some(Arc::clone(peer_handle));
+        self.peer_handle = Some(Arc::clone(peer));
         self.ctx.sync_peers.register(
             id,
             outbound.clone(),
             self.socket.take(),
             relay,
-            Arc::clone(peer_handle),
+            Arc::clone(peer),
             local_addr,
             self.permanent,
             self.conn_req_id,
@@ -1726,30 +2209,28 @@ impl ServerPeerHandler {
         // and I misdiagnosed exactly that.
         crate::logging::info(
             "SRVR",
-            &format!(
-                "New valid peer {} ({})",
-                self.remote_addr,
-                peer.user_agent()
-            ),
+            &format!("New valid peer {} ({user_agent})", self.remote_addr),
         );
         let actions = {
             let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
             manager.on_peer_connected(dcroxide_netsync::manager::Peer::new(
                 id,
                 self.remote_addr.clone(),
-                peer.inbound(),
-                peer.services(),
-                peer.protocol_version(),
-                peer.last_block(),
+                inbound,
+                services,
+                pver,
+                last_block,
             ))
         };
-        self.ctx.sync_peers.execute(actions);
+        self.ctx
+            .sync_peers
+            .execute_sync(&self.ctx.sync_manager, actions);
     }
 
     /// Deregister the departing peer from the sync manager, executing
     /// the re-request and sync-peer handoff actions it decides (dcrd
     /// `DonePeer` signalling `OnPeerDisconnected`).
-    pub fn on_disconnected(&mut self, _peer: &mut Peer) {
+    pub fn on_disconnected(&mut self, _peer: &Mutex<Peer>) {
         // dcrd `handleDonePeerMsg`: `srvrLog.Debugf("Removed peer %s",
         // sp)` — debug, not info, so a churning network does not flood
         // the log at the default level.
@@ -1768,7 +2249,9 @@ impl ServerPeerHandler {
             manager.on_peer_disconnected(id)
         };
         self.ctx.sync_peers.deregister(id);
-        self.ctx.sync_peers.execute(actions);
+        self.ctx
+            .sync_peers
+            .execute_sync(&self.ctx.sync_manager, actions);
 
         // Evict every orphan the departing peer contributed, freeing its
         // slots in the shared orphan pool immediately rather than leaving
@@ -1785,6 +2268,44 @@ impl ServerPeerHandler {
             .remove_orphans_by_tag(id as u64);
     }
 
+    /// Run netsync's transaction intake for this registered peer,
+    /// returning what the mempool accepted (dcrd `SyncManager.OnTx`).
+    ///
+    /// The sync-manager lock is held only for the bookkeeping on either
+    /// side of the mempool's validation, never across it: dcrd's `OnTx`
+    /// runs `ProcessTransaction` under the mempool's own mutex, with
+    /// `requestMtx` taken only for the request-map delete afterwards.
+    /// Holding the manager across the validation made every other
+    /// peer's block, header and inventory intake wait behind one
+    /// peer's script checks.
+    fn on_tx_intake(
+        &mut self,
+        tx: &dcroxide_wire::MsgTx,
+        tx_hash: &Hash,
+    ) -> Vec<(Hash, dcroxide_wire::MsgTx)> {
+        let Some(id) = self.sync_peer_id else {
+            return Vec::new();
+        };
+        let admitted = {
+            let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
+            manager
+                .begin_tx(id, tx_hash)
+                .map(|allow_orphans| (allow_orphans, manager.tx_mem_pool_handle()))
+        };
+        let Some((allow_orphans, mut pool)) = admitted else {
+            return Vec::new();
+        };
+        let result = pool.process_transaction_accepted(tx, allow_orphans, true, id as u64);
+        let (accepted, actions) = {
+            let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
+            manager.finish_tx(tx_hash, result)
+        };
+        self.ctx
+            .sync_peers
+            .execute_sync(&self.ctx.sync_manager, actions);
+        accepted
+    }
+
     /// Run a sync-manager intake for this registered peer and execute
     /// the actions it decides.
     fn drive_sync(&mut self, intake: impl FnOnce(&mut NodeSyncManager, i32) -> Vec<Action>) {
@@ -1795,19 +2316,31 @@ impl ServerPeerHandler {
             let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
             intake(&mut manager, id)
         };
-        self.ctx.sync_peers.execute(actions);
+        self.ctx
+            .sync_peers
+            .execute_sync(&self.ctx.sync_manager, actions);
     }
 
     /// Dispatch one incoming message to its server handler, queueing
     /// any responses to the peer (the `serverPeer` message listeners
-    /// dcrd registers on the peer).
+    /// dcrd registers on the peer).  `mix_hash` is the mixing identity
+    /// hash the input loop computed as it read a mix message (dcrd's
+    /// cached `Hash()`), or `None` when it has none to give.
+    ///
+    /// The peer arrives unlocked and is locked only around the state an
+    /// arm reads, as dcrd's listeners read it through the peer's short
+    /// `flagsMtx` sections: a block or transaction arm can wait out
+    /// another peer's validation, and nothing else may wait on this
+    /// peer meanwhile (see [`crate::peerloop::ServeHooks::on_message`]).
     pub fn handle_message(
         &mut self,
-        peer: &mut Peer,
-        msg: &Message,
+        peer: &Mutex<Peer>,
+        msg: Message,
+        mix_hash: Option<Hash>,
         outbound: &OutboundQueue,
     ) -> ServeSignal {
-        match msg {
+        let lock_peer = || peer.lock().expect("peer mutex poisoned");
+        match &msg {
             Message::GetHeaders(get_headers) => {
                 self.on_get_headers(&get_headers.0, outbound);
                 ServeSignal::Continue
@@ -1818,11 +2351,11 @@ impl ServerPeerHandler {
             }
             Message::GetData(get_data) => self.on_get_data(&get_data.inv_list, outbound),
             Message::GetAddr => {
-                self.on_get_addr(peer, outbound);
+                self.on_get_addr(&mut lock_peer(), outbound);
                 ServeSignal::Continue
             }
-            Message::Addr(addr) => self.on_addr(peer, &addr.addr_list),
-            Message::AddrV2(addr) => self.on_addr_v2(peer, &addr.addr_list),
+            Message::Addr(addr) => self.on_addr(&mut lock_peer(), &addr.addr_list),
+            Message::AddrV2(addr) => self.on_addr_v2(&mut lock_peer(), &addr.addr_list),
             Message::GetCFilterV2(get_cf) => {
                 self.on_get_cfilter_v2(get_cf.block_hash, outbound);
                 ServeSignal::Continue
@@ -1832,27 +2365,27 @@ impl ServerPeerHandler {
                 ServeSignal::Continue
             }
             Message::GetInitState(get_init) => self.on_get_init_state(&get_init.types, outbound),
-            Message::GetMiningState => self.on_get_mining_state(peer.protocol_version(), outbound),
+            Message::GetMiningState => {
+                let pver = lock_peer().protocol_version();
+                self.on_get_mining_state(pver, outbound)
+            }
             Message::MiningState(state) => {
                 // dcrd 2.2 bans peers sending the legacy state once the
                 // protocol version makes it a knowing violation, and
                 // peers repeating an initial state message.
-                let pver = peer.protocol_version();
+                let pver = lock_peer().protocol_version();
                 if pver >= dcroxide_wire::INIT_STATE_VERSION {
-                    let _ = self.ban_peer_now();
-                    return ServeSignal::Disconnect(
-                        format!(
-                            "sent miningstate with protocol version {pver} >= {}",
-                            dcroxide_wire::INIT_STATE_VERSION
-                        )
-                        .into(),
+                    let reason = format!(
+                        "sent miningstate with protocol version {pver} >= {}",
+                        dcroxide_wire::INIT_STATE_VERSION
                     );
+                    let _ = self.ban_peer_now(&reason);
+                    return ServeSignal::Disconnect(reason.into());
                 }
                 if self.init_state_received {
-                    let _ = self.ban_peer_now();
-                    return ServeSignal::Disconnect(
-                        "sent more than one initial state message (miningstate)".into(),
-                    );
+                    const REASON: &str = "sent more than one initial state message (miningstate)";
+                    let _ = self.ban_peer_now(REASON);
+                    return ServeSignal::Disconnect(REASON.into());
                 }
                 self.init_state_received = true;
 
@@ -1869,10 +2402,9 @@ impl ServerPeerHandler {
                 // message; the first one forwards its hashes to the
                 // sync manager (dcrd `OnInitState`).
                 if self.init_state_received {
-                    let _ = self.ban_peer_now();
-                    return ServeSignal::Disconnect(
-                        "sent more than one initial state message (initstate)".into(),
-                    );
+                    const REASON: &str = "sent more than one initial state message (initstate)";
+                    let _ = self.ban_peer_now(REASON);
+                    return ServeSignal::Disconnect(REASON.into());
                 }
                 self.init_state_received = true;
                 self.drive_sync(|manager, id| {
@@ -1886,7 +2418,8 @@ impl ServerPeerHandler {
                 ServeSignal::Continue
             }
             // The eight mixing messages all submit to the mixpool (dcrd's
-            // OnMix* handlers each forwarding to `onMixMessage`).
+            // OnMix* handlers each forwarding to `onMixMessage`); the
+            // message moves on rather than being copied.
             Message::MixPairReq(_)
             | Message::MixKeyExchange(_)
             | Message::MixCiphertexts(_)
@@ -1894,7 +2427,10 @@ impl ServerPeerHandler {
             | Message::MixDCNet(_)
             | Message::MixConfirm(_)
             | Message::MixFactoredPoly(_)
-            | Message::MixSecrets(_) => self.on_mix_message(msg.clone(), peer.services()),
+            | Message::MixSecrets(_) => {
+                let services = lock_peer().services();
+                self.on_mix_message(msg, mix_hash, services)
+            }
             Message::Inv(inv) => self.on_inv(inv),
             Message::Headers(headers) => {
                 self.drive_sync(|manager, id| manager.on_headers(id, headers));
@@ -1929,23 +2465,19 @@ impl ServerPeerHandler {
                 // with the delivered hash regardless of the acceptance
                 // outcome (dcrd `OnTx`'s `AddKnownInventory` before the
                 // sync-manager hand-off), mirroring the Block arm above.
+                let tx_hash = tx.tx_hash();
                 if let Some(id) = self.sync_peer_id {
                     self.ctx.sync_peers.mark_known_inventory(
                         id,
                         InvVect {
                             inv_type: InvType::TX,
-                            hash: tx.tx_hash(),
+                            hash: tx_hash,
                         },
                     );
                 }
-                let mut accepted = Vec::new();
-                self.drive_sync(|manager, id| {
-                    accepted = manager.on_tx(id, tx);
-                    Vec::new()
-                });
+                let accepted = self.on_tx_intake(tx, &tx_hash);
                 // dcrd's AnnounceNewTransactions: the websocket
-                // notification half; the peer inventory relay arrives
-                // with the relay fan-out piece.
+                // notification half; the peer inventory relay follows.
                 if !accepted.is_empty()
                     && let Some(ntfn) = &self.ctx.ntfn
                 {
@@ -2004,21 +2536,25 @@ impl ServerPeerHandler {
             }
             Message::MemPool => {
                 // Serve the pool's inventory (dcrd `OnMemPool`); the
-                // flood guard applies its decaying ban score.
-                let tx_hashes = {
-                    let pool = self.ctx.tx_pool.lock().expect("tx pool mutex poisoned");
-                    pool.tx_hashes()
-                };
+                // flood guard applies its decaying ban score before the
+                // pool is snapshotted, so a banned peer costs no pool
+                // enumeration.
                 match crate::server::on_mem_pool(
                     &mut self.addr_state,
-                    &tx_hashes,
+                    || {
+                        self.ctx
+                            .tx_pool
+                            .lock()
+                            .expect("tx pool mutex poisoned")
+                            .tx_hashes()
+                    },
                     self.ctx.disable_banning,
                     self.ctx.ban_threshold,
                     now_unix(),
                 ) {
                     crate::server::OnMemPoolOutcome::Banned => {
-                        let _ = self.ban_peer_now();
-                        ServeSignal::Disconnect("ban score exceeds threshold".into())
+                        let _ = self.ban_peer_now(BAN_SCORE_EXCEEDED);
+                        ServeSignal::Disconnect(BAN_SCORE_EXCEEDED.into())
                     }
                     crate::server::OnMemPoolOutcome::Inventory(invs) => {
                         // Drop inventory the peer already knows, matching
@@ -2030,10 +2566,13 @@ impl ServerPeerHandler {
                             Some(id) => self.ctx.sync_peers.filter_known(id, invs),
                             None => invs,
                         };
-                        // dcrd trickles through its inventory queue,
-                        // which splits at the wire limit; the plain
-                        // queue chunks the same way.
-                        for chunk in invs.chunks(dcroxide_wire::MAX_INV_PER_MSG as usize) {
+                        // dcrd queues each vector through its trickle
+                        // queue, which flushes an inv every
+                        // `maxInvTrickleSize` (1000) entries
+                        // (`peer/peer.go:1685`); the batches are queued
+                        // here at once rather than on the next trickle
+                        // tick.
+                        for chunk in mem_pool_inv_batches(&invs) {
                             if chunk.is_empty() {
                                 continue;
                             }
@@ -2073,13 +2612,14 @@ impl ServerPeerHandler {
                 // violation: dcrd 2.2 bans the peer directly when it
                 // negotiated NodeCFVersion and banning is enabled, and
                 // disconnects regardless (dcrd `enforceNodeCFFlag`).
+                let pver = lock_peer().protocol_version();
                 match crate::server::enforce_node_cf_flag(
-                    peer.protocol_version(),
+                    pver,
                     self.ctx.disable_banning,
                     msg.command(),
                 ) {
                     crate::server::CfFlagOutcome::BanAndDisconnect { reason } => {
-                        let _ = self.ban_peer_now();
+                        let _ = self.ban_peer_now(&reason);
                         ServeSignal::Disconnect(reason.into())
                     }
                     crate::server::CfFlagOutcome::DisconnectOnly => ServeSignal::Disconnect(
@@ -2101,8 +2641,8 @@ impl ServerPeerHandler {
                     now_unix(),
                 ) {
                     crate::server::OnNotFoundOutcome::Banned(_) => {
-                        let _ = self.ban_peer_now();
-                        ServeSignal::Disconnect("ban score exceeds threshold".into())
+                        let _ = self.ban_peer_now(BAN_SCORE_EXCEEDED);
+                        ServeSignal::Disconnect(BAN_SCORE_EXCEEDED.into())
                     }
                     crate::server::OnNotFoundOutcome::DisconnectInvalidType => {
                         ServeSignal::Disconnect("sent an invalid notfound inventory type".into())
@@ -2126,18 +2666,21 @@ impl ServerPeerHandler {
     /// cumulative work to be worth following (dcrd
     /// `serverPeer.OnGetHeaders`).
     fn on_get_headers(&self, locator: &dcroxide_wire::BlockLocator, outbound: &OutboundQueue) {
-        let (work, located) = {
+        // The header walk only runs once the low-work gate has passed,
+        // so a tip below the minimum known work (this node's own initial
+        // sync) answers without walking up to 2000 headers under the
+        // chain lock, as dcrd returns before `LocateHeaders`.
+        let response = {
             let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
             let best_hash = chain.best_snapshot().hash;
-            (
-                chain.chain_work(&best_hash),
-                chain.locate_headers(&locator.block_locator_hashes, &locator.hash_stop),
-            )
+            let work = chain.chain_work(&best_hash);
+            let min_known_work = self.ctx.min_known_work.unwrap_or_default();
+            let tip_work_below_min = work.map(|work| work < min_known_work).unwrap_or(false);
+            build_get_headers_response(work.is_none(), tip_work_below_min, || {
+                chain.locate_headers(&locator.block_locator_hashes, &locator.hash_stop)
+            })
         };
-        let min_known_work = self.ctx.min_known_work.unwrap_or_default();
-        let tip_work_below_min = work.map(|work| work < min_known_work).unwrap_or(false);
-        let headers = match build_get_headers_response(work.is_none(), tip_work_below_min, located)
-        {
+        let headers = match response {
             GetHeadersResponse::Empty => Vec::new(),
             GetHeadersResponse::Headers(headers) => headers,
         };
@@ -2172,11 +2715,21 @@ impl ServerPeerHandler {
         // Filter located blocks against the peer's known-inventory set
         // (dcrd `OnGetBlocks`'s `IsKnownInventory` check), the same
         // per-peer set intake and relay fan-out populate.  The chain lock
-        // is released above before this per-item registry lookup, so there
-        // is no lock-order cycle.
+        // is released above, so there is no lock-order cycle.  The
+        // peer's handle is resolved once, and each check takes only the
+        // set's own lock, as dcrd's per-item `IsKnownInventory` does; up
+        // to 500 registry lookups per request bought nothing.
+        let relay = self
+            .sync_peer_id
+            .and_then(|id| self.ctx.sync_peers.relay_state(id));
         let response = build_get_blocks_response(&located, |iv| {
-            self.sync_peer_id
-                .is_some_and(|id| self.ctx.sync_peers.is_known_inventory(id, iv))
+            relay.as_ref().is_some_and(|relay| {
+                relay
+                    .lock()
+                    .expect("relay state poisoned")
+                    .known_inventory
+                    .contains(iv)
+            })
         });
         if let Some(continue_hash) = response.continue_hash {
             *self.continue_hash.lock().expect("continue hash poisoned") = Some(continue_hash);
@@ -2229,8 +2782,8 @@ impl ServerPeerHandler {
                 return self.ban_peer_or_continue("sent an empty getdata request".into());
             }
             OnGetDataOutcome::BanScore => {
-                let _ = self.ban_peer_now();
-                return ServeSignal::Disconnect("ban score exceeds threshold".into());
+                let _ = self.ban_peer_now(BAN_SCORE_EXCEEDED);
+                return ServeSignal::Disconnect(BAN_SCORE_EXCEEDED.into());
             }
             OnGetDataOutcome::DisconnectConcurrent => {
                 return ServeSignal::Disconnect("too many concurrent getdata requests".into());
@@ -2396,8 +2949,7 @@ impl ServerPeerHandler {
     /// Gate an inventory announcement: ban empty announcements, and in
     /// blocks-only mode disconnect peers announcing transactions or
     /// mix messages (dcrd `serverPeer.OnInv`).  Announcements that
-    /// pass forward to the sync manager, whose driver arrives with the
-    /// netsync pieces.
+    /// pass forward to the sync manager.
     fn on_inv(&mut self, inv: &MsgInv) -> ServeSignal {
         match on_inv_classify(&inv.inv_list, self.ctx.blocks_only) {
             // The ban outcome records the host in the shared banned map
@@ -2441,37 +2993,43 @@ impl ServerPeerHandler {
     /// silently ignoring requests for unknown blocks or missing
     /// filters (dcrd `serverPeer.OnGetCFilterV2`).
     fn on_get_cfilter_v2(&self, block_hash: Hash, outbound: &OutboundQueue) {
-        let fetched = {
+        // The chain lock covers the index lookup only; the database
+        // reads run after it is released ([`FilterReads`]).
+        let located = {
             let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
-            chain.filter_by_block_hash(&block_hash)
+            FilterReads::locate_block(&chain, &block_hash)
         };
-        let Ok((filter, proof)) = fetched else {
+        let Some(filter) = located
+            .and_then(FilterReads::fetch)
+            .and_then(|mut filters| filters.pop())
+        else {
             return;
         };
         // A reply the peer is waiting on; a full queue drops it and
         // reports it rather than disconnecting (see `on_get_headers`).
-        outbound.try_queue(Message::CFilterV2(MsgCFilterV2 {
-            block_hash,
-            data: filter.bytes().to_vec(),
-            proof_index: proof.proof_index,
-            proof_hashes: proof.proof_hashes,
-        }));
+        outbound.try_queue(Message::CFilterV2(filter));
     }
 
     /// Serve the batched committed filters for an ancestry range,
     /// silently ignoring invalid ranges (dcrd
     /// `serverPeer.OnGetCFiltersV2`).
     fn on_get_cfilters_v2(&self, start_hash: Hash, end_hash: Hash, outbound: &OutboundQueue) {
+        // The chain lock covers the range walk only; the up to 100
+        // filter and commitment reads run after it is released, as
+        // dcrd's `LocateCFiltersV2` releases its `chainLock` before its
+        // `db.View` ([`FilterReads`]).
         let located = {
             let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
-            chain.locate_cfilters_v2(&start_hash, &end_hash)
+            FilterReads::locate_range(&chain, &start_hash, &end_hash)
         };
-        let Ok(filters) = located else {
+        let Some(cfilters) = located.and_then(FilterReads::fetch) else {
             return;
         };
         // A reply the peer is waiting on; a full queue drops it and
         // reports it rather than disconnecting (see `on_get_headers`).
-        outbound.try_queue(Message::CFiltersV2(filters));
+        outbound.try_queue(Message::CFiltersV2(dcroxide_wire::MsgCFiltersV2 {
+            cfilters,
+        }));
     }
 
     /// Answer a getinitstate request once per connection (dcrd
@@ -2485,47 +3043,64 @@ impl ServerPeerHandler {
             votes: types.iter().any(|t| t == INIT_STATE_HEAD_BLOCK_VOTES),
             tspends: types.iter().any(|t| t == INIT_STATE_TSPENDS),
         };
-        // The eligible head blocks are the tip generation sorted and
-        // filtered by their mempool votes (dcrd's
-        // `mining.SortParentsByVotes`); they key both the block list and
-        // the vote lookup, so fetch them when either is requested.  The
-        // chain lock is released before the mempool lookups (the sort's
-        // vote metadata included), so there is no lock-order cycle with
-        // tx intake's pool->chain order.
-        let (best_height, eligible_blocks) = if wants.blocks || wants.votes {
-            self.eligible_tip_blocks()
-        } else {
-            let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
-            (chain.best_snapshot().height, Vec::new())
-        };
-        let tspends = if wants.tspends {
-            self.ctx
-                .tx_pool
-                .lock()
-                .expect("tx pool mutex poisoned")
-                .tspend_hashes()
-        } else {
-            Vec::new()
-        };
-        let outcome = on_get_init_state(
+        // dcrd bans a repeated request before it reads the chain at
+        // all, and answers an early chain blank before it touches the
+        // tip generation or the mempool; only a request past both gates
+        // pays for the lookups below.
+        let gated = get_init_state_gate(
             self.init_state_sent,
-            best_height,
-            self.ctx.stake_validation_height,
-            wants,
-            &eligible_blocks,
-            |block_hash| {
-                self.ctx
-                    .tx_pool
-                    .lock()
-                    .expect("tx pool mutex poisoned")
-                    .vote_hashes_for_block(block_hash)
+            || {
+                let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
+                chain.best_snapshot().height
             },
-            &tspends,
+            self.ctx.stake_validation_height,
         );
+        let outcome = match gated {
+            ControlFlow::Break(outcome) => outcome,
+            ControlFlow::Continue(best_height) => {
+                // The eligible head blocks are the tip generation sorted
+                // and filtered by their mempool votes (dcrd's
+                // `mining.SortParentsByVotes`); they key both the block
+                // list and the vote lookup, so fetch them when either is
+                // requested.  The chain lock is released before the
+                // mempool lookups (the sort's vote metadata included), so
+                // there is no lock-order cycle with tx intake's
+                // pool->chain order.
+                let (best_height, eligible_blocks) = if wants.blocks || wants.votes {
+                    self.eligible_tip_blocks()
+                } else {
+                    (best_height, Vec::new())
+                };
+                let tspends = if wants.tspends {
+                    self.ctx
+                        .tx_pool
+                        .lock()
+                        .expect("tx pool mutex poisoned")
+                        .tspend_hashes()
+                } else {
+                    Vec::new()
+                };
+                on_get_init_state(
+                    self.init_state_sent,
+                    best_height,
+                    self.ctx.stake_validation_height,
+                    wants,
+                    &eligible_blocks,
+                    |block_hash| {
+                        self.ctx
+                            .tx_pool
+                            .lock()
+                            .expect("tx pool mutex poisoned")
+                            .vote_hashes_for_block(block_hash)
+                    },
+                    &tspends,
+                )
+            }
+        };
         if let OnGetInitStateOutcome::Ban(reason) = outcome {
             // dcrd 2.2 bans peers repeating the request and
             // disconnects explicitly regardless of the ban outcome.
-            let _ = self.ban_peer_now();
+            let _ = self.ban_peer_now(&reason);
             return ServeSignal::Disconnect(reason.into());
         }
         // dcrd marks the state sent right after the gate, before any
@@ -2587,25 +3162,44 @@ impl ServerPeerHandler {
         protocol_version: u32,
         outbound: &OutboundQueue,
     ) -> ServeSignal {
-        let (best_height, eligible_blocks) = self.eligible_tip_blocks();
-        let outcome = on_get_mining_state(
+        // dcrd bans the protocol-version violation (almost every modern
+        // peer that sends this) and a repeated request before it reads
+        // the chain at all, and sends nothing early in the chain before
+        // it touches the tip generation or the mempool; only a request
+        // past those gates pays for the vote sort.
+        let gated = get_mining_state_gate(
             protocol_version,
             self.mining_state_sent,
-            best_height,
-            self.ctx.stake_validation_height,
-            &eligible_blocks,
-            |block_hash| {
-                self.ctx
-                    .tx_pool
-                    .lock()
-                    .expect("tx pool mutex poisoned")
-                    .vote_hashes_for_block(block_hash)
+            || {
+                let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
+                chain.best_snapshot().height
             },
+            self.ctx.stake_validation_height,
         );
+        let outcome = match gated {
+            ControlFlow::Break(outcome) => outcome,
+            ControlFlow::Continue(_) => {
+                let (best_height, eligible_blocks) = self.eligible_tip_blocks();
+                on_get_mining_state(
+                    protocol_version,
+                    self.mining_state_sent,
+                    best_height,
+                    self.ctx.stake_validation_height,
+                    &eligible_blocks,
+                    |block_hash| {
+                        self.ctx
+                            .tx_pool
+                            .lock()
+                            .expect("tx pool mutex poisoned")
+                            .vote_hashes_for_block(block_hash)
+                    },
+                )
+            }
+        };
         if let OnGetMiningStateOutcome::Ban(reason) = outcome {
             // dcrd 2.2 bans protocol-version violations and repeats,
             // disconnecting explicitly regardless of the ban outcome.
-            let _ = self.ban_peer_now();
+            let _ = self.ban_peer_now(&reason);
             return ServeSignal::Disconnect(reason.into());
         }
         // dcrd marks the state sent right after the gate, before any
@@ -2638,9 +3232,12 @@ impl ServerPeerHandler {
     /// the peers, request the missing pair request when an orphan key
     /// exchange references an unknown one, and disconnect a peer whose
     /// message is a bannable protocol violation (dcrd `BanPeer`).
+    /// `mix_hash` is the identity hash the input loop already computed,
+    /// if any.
     fn on_mix_message(
         &mut self,
         msg: Message,
+        mix_hash: Option<Hash>,
         services: dcroxide_wire::ServiceFlag,
     ) -> ServeSignal {
         // dcrd `onMixMessage` ignores mix traffic entirely under
@@ -2656,10 +3253,28 @@ impl ServerPeerHandler {
             return ServeSignal::Continue;
         };
 
+        // Verify the signature once, here, before the sync-manager and
+        // mixpool locks, reusing the hash the input loop computed as it
+        // read the message: dcrd caches the hash on the message when it
+        // is read and verifies the signature before taking the mixpool's
+        // mutex (`mixpool.go:1198`), and a mix message can run to
+        // megabytes.  The sync manager, the pool and the relay below all
+        // read the cached results.  No peer lock is held here, as
+        // dcrd's `inHandler` holds none, so nothing else that locks this
+        // peer (its output loop and timers, `getpeerinfo`, another
+        // peer's count of mix-capable outbound peers) waits for the
+        // verification.  Without a hash from the loop (hashing failed
+        // there, or a caller that computes none), the message is hashed
+        // here.
+        let pool_msg = match mix_hash {
+            Some(hash) => dcroxide_mixing::HashedMessage::with_hash(pool_msg, hash),
+            None => dcroxide_mixing::HashedMessage::new(pool_msg),
+        };
+
         // Mark the message known to the sending peer before processing
         // (dcrd `sp.AddKnownInventory`), so the accept-time relay below
         // never echoes the inventory back to the peer that just sent it.
-        if let Ok(hash) = pool_msg.mix_hash() {
+        if let Ok(hash) = pool_msg.hash() {
             self.ctx.sync_peers.mark_known_inventory(
                 id,
                 InvVect {
@@ -2669,30 +3284,45 @@ impl ServerPeerHandler {
             );
         }
 
-        // Accept under the sync-manager lock (its rejected-message
-        // bookkeeping wraps the pool's acceptance); the missing-PR
-        // request is issued while still holding it, exactly as dcrd's
-        // OnMixMsg runs both against the sync manager.
+        // The sync manager's rejected-message and request bookkeeping
+        // wraps the pool's acceptance, but its lock is not held across
+        // the acceptance itself: dcrd's `OnMixMsg` runs `AcceptMessage`
+        // under the mixpool's own mutex, with `requestMtx` taken only
+        // for the request-map delete afterwards.  The missing-PR request
+        // is issued under the same lock as that bookkeeping, as dcrd's
+        // server runs both against the sync manager.
         enum MixOutcome {
-            Accepted(Vec<dcroxide_mixing::PoolMessage>),
-            Ban,
+            Accepted(Vec<dcroxide_mixing::HashedMessage>),
+            Ban(String),
             Nothing,
         }
+        let admitted = {
+            let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
+            manager
+                .begin_mix_msg(id, &pool_msg)
+                .map(|mix_hash| (mix_hash, manager.mix_pool_handle()))
+        };
+        let Some((mix_hash, mut pool)) = admitted else {
+            return ServeSignal::Continue;
+        };
+        let result = pool.accept_message(&pool_msg, id as u64);
         let outcome = {
             let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
-            match manager.on_mix_msg(id, &pool_msg) {
+            match manager.finish_mix_msg(&mix_hash, result) {
                 Ok(accepted) => MixOutcome::Accepted(accepted),
                 Err(dcroxide_mixing::PoolError::MissingOwnPR(missing)) => {
                     // Request the referenced pair request from the peer
                     // (dcrd `RequestMixMsgFromPeer`); a normal orphan.
                     let actions = manager.request_mix_msg_from_peer(id, &missing);
                     drop(manager);
-                    self.ctx.sync_peers.execute(actions);
+                    self.ctx
+                        .sync_peers
+                        .execute_sync(&self.ctx.sync_manager, actions);
                     MixOutcome::Nothing
                 }
                 Err(err) => {
                     if err.is_bannable(services) {
-                        MixOutcome::Ban
+                        MixOutcome::Ban(format!("sent malformed mix message: {err}"))
                     } else {
                         MixOutcome::Nothing
                     }
@@ -2708,7 +3338,7 @@ impl ServerPeerHandler {
                 // serve path.  The accepted slice carries the delivered
                 // message plus any orphan its acceptance un-orphaned.
                 for msg in &accepted {
-                    if let Ok(hash) = msg.mix_hash() {
+                    if let Ok(hash) = msg.hash() {
                         self.ctx
                             .sync_peers
                             .relay_inventory(&crate::server::RelayInvFacts {
@@ -2728,22 +3358,82 @@ impl ServerPeerHandler {
                 if let Some(ntfn) = &self.ctx.ntfn {
                     ntfn.notify_mix_messages(
                         accepted
-                            .iter()
-                            .cloned()
-                            .map(crate::mixnode::pool_to_wire_message)
+                            .into_iter()
+                            .map(|msg| crate::mixnode::pool_to_wire_message(msg.into_message()))
                             .collect(),
                     );
                 }
                 ServeSignal::Continue
             }
-            MixOutcome::Ban => {
+            MixOutcome::Ban(reason) => {
                 // dcrd bans "sent malformed mix message: %s" and only
                 // disconnects inside BanPeer.
-                self.ban_peer_or_continue("sent malformed mix message".into())
+                self.ban_peer_or_continue(reason.into())
             }
             MixOutcome::Nothing => ServeSignal::Continue,
         }
     }
+}
+
+/// The lines dcrd's `server.BanPeer` logs for a ban decision: nothing
+/// when banning is disabled, a debug line for a whitelisted peer, the
+/// split failure and a disconnect warning when the address has no port,
+/// and otherwise the ban warning naming the host, the direction and the
+/// ban duration.  `label` is the peer as dcrd's `Peer.String` prints it.
+fn ban_peer_log_lines(
+    outcome: &crate::server::BanPeerOutcome,
+    label: &str,
+    remote_addr: &str,
+    inbound: bool,
+    disable_banning: bool,
+    ban_duration_nanos: i64,
+    reason: &str,
+) -> Vec<(crate::logsubsys::LogLevel, String)> {
+    use crate::logsubsys::LogLevel;
+    match outcome {
+        // No warning is logged when banning is disabled.
+        crate::server::BanPeerOutcome::Ignored if disable_banning => Vec::new(),
+        crate::server::BanPeerOutcome::Ignored => vec![(
+            LogLevel::Debug,
+            format!("Misbehaving whitelisted peer {label}: {reason}"),
+        )],
+        crate::server::BanPeerOutcome::DisconnectOnly => {
+            let mut lines = Vec::with_capacity(2);
+            if let Err(err) = crate::gostd::split_host_port(remote_addr) {
+                lines.push((
+                    LogLevel::Debug,
+                    format!("can't split ban peer {label}: {err}"),
+                ));
+            }
+            lines.push((
+                LogLevel::Warn,
+                format!("Misbehaving peer {label}: {reason} -- disconnecting"),
+            ));
+            lines
+        }
+        crate::server::BanPeerOutcome::Banned { host, .. } => vec![(
+            LogLevel::Warn,
+            format!(
+                "Misbehaving peer {host} ({}): {reason} -- banned for {}",
+                crate::peerloop::direction_string(inbound),
+                crate::gostd::go_duration_string(ban_duration_nanos)
+            ),
+        )],
+    }
+}
+
+/// The reason dcrd's `addBanScore` hands `BanPeer` once the score
+/// crosses the threshold.
+const BAN_SCORE_EXCEEDED: &str = "ban score exceeds threshold";
+
+/// A peer as dcrd's `Peer.String` prints it: the remote address and the
+/// connection direction (the handler's counterpart of
+/// [`crate::peerloop::peer_log_label`], from the facts it keeps).
+fn peer_label(remote_addr: &str, inbound: bool) -> String {
+    format!(
+        "{remote_addr} ({})",
+        crate::peerloop::direction_string(inbound)
+    )
 }
 
 /// The current unix time in seconds for the decaying ban score (dcrd's
@@ -3040,8 +3730,8 @@ mod tests {
     }
 
     /// `connected_peer_infos` snapshots each registered peer for
-    /// `getpeerinfo`: the id is the registry key (not the snapshot's
-    /// always-zero id), the nanosecond stat times fold to unix seconds,
+    /// `getpeerinfo`: the id is the registry key (which the server sets
+    /// to the peer's own id), the nanosecond stat times fold to unix seconds,
     /// the byte counters pass through, the local address is carried, and
     /// tx-relay-disabled is read from the relay facts.
     #[test]
@@ -3065,8 +3755,9 @@ mod tests {
             .expect("ban score")
             .increase_at(50, 0, now_unix());
 
-        // Register under a non-1 id to prove the id comes from the key,
-        // not the snapshot (whose id the peer never assigns).
+        // Register under an id other than the snapshot's (this peer
+        // never read a version message, so its own id is zero) to prove
+        // the reported id is the registry key.
         peers.register(
             42,
             queue,
@@ -3135,6 +3826,56 @@ mod tests {
             peers.connected_peer_infos().is_empty(),
             "a departed peer vanishes from getpeerinfo"
         );
+    }
+
+    /// `getpeerinfo`'s `currentheight` follows the heights the sync
+    /// manager learns from the peer's announcements, while
+    /// `startingheight` keeps the version message's.  dcrd's netsync
+    /// raises the one `lastBlock` field `StatsSnapshot` reads; before
+    /// the manager's rises reached the daemon, `currentheight` stayed
+    /// at `startingheight` for the life of every connection.
+    #[test]
+    fn getpeerinfo_currentheight_follows_the_sync_manager() {
+        let peers = SyncPeers::new();
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        peers.register(
+            7,
+            queue,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+            test_peer_handle(),
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        let heights = |peers: &SyncPeers| {
+            let infos = peers.connected_peer_infos();
+            (infos[0].starting_height, infos[0].last_block)
+        };
+        assert_eq!(heights(&peers), (0, 0), "the version message's height");
+
+        peers.execute(vec![Action::UpdateLastBlockHeight {
+            peer: 7,
+            height: 10,
+        }]);
+        assert_eq!(
+            heights(&peers),
+            (0, 10),
+            "currentheight rises with the manager; startingheight does not"
+        );
+
+        // dcrd's `UpdateLastBlockHeight` ignores a lower height, and an
+        // action for a departed peer is dropped.
+        peers.execute(vec![
+            Action::UpdateLastBlockHeight { peer: 7, height: 4 },
+            Action::UpdateLastBlockHeight {
+                peer: 8,
+                height: 99,
+            },
+        ]);
+        assert_eq!(heights(&peers), (0, 10));
     }
 
     use std::io::Read as _;
@@ -3598,6 +4339,35 @@ mod tests {
         );
     }
 
+    /// A mempool reply goes out in dcrd's trickle batches of at most
+    /// `maxInvTrickleSize` (1000) vectors, in pool order: 2,500
+    /// transactions are three inv messages of 1000, 1000 and 500, where
+    /// the wire limit would have sent one of 2,500.
+    #[test]
+    fn mem_pool_replies_batch_at_the_trickle_size() {
+        let invs: Vec<InvVect> = (0..2500u32)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                hash[..4].copy_from_slice(&i.to_le_bytes());
+                InvVect {
+                    inv_type: InvType::TX,
+                    hash: Hash(hash),
+                }
+            })
+            .collect();
+        let batches: Vec<&[InvVect]> = mem_pool_inv_batches(&invs).collect();
+        assert_eq!(
+            batches.iter().map(|b| b.len()).collect::<Vec<_>>(),
+            vec![1000, 1000, 500]
+        );
+        assert_eq!(batches.concat(), invs, "every vector, once, in order");
+        assert_eq!(
+            mem_pool_inv_batches(&[]).count(),
+            0,
+            "an empty pool sends nothing"
+        );
+    }
+
     /// `filter_known` must not mark: the mempool inv fan-out filters
     /// first, then queues each batch, then marks only the batches the
     /// queue accepted.  If filtering marked as well, a batch refused by
@@ -3704,19 +4474,16 @@ mod tests {
     /// A sync request refused by a full queue is dropped, and the peer
     /// is left connected.
     ///
-    /// Disconnecting here looked like the recovery path — the request is
-    /// recorded in flight and nothing retries it — but it severs honest
-    /// peers. Post-sync, relay emits one inv message per item per peer,
-    /// so a peer on a slow link fills the queue purely while we are
+    /// Disconnecting here looked like the recovery path, but it severs
+    /// honest peers. Post-sync, relay emits one inv message per item per
+    /// peer, so a peer on a slow link fills the queue purely while we are
     /// pushing it a block it asked for, and the next sync request would
-    /// kill it. dcrd never disconnects here either: its `queueHandler`
-    /// appends to an unbounded `pendingMsgs`, so a full queue says
-    /// nothing about the peer.
+    /// kill it.
     ///
-    /// What makes dropping safe is the output loop's absolute
-    /// per-message write deadline: a socket that never drains ends the
-    /// connection on its own, and netsync's ordinary disconnect handling
-    /// re-requests elsewhere.
+    /// The refused request is handed back to the sync manager instead
+    /// (see `a_refused_sync_request_is_handed_back_for_the_manager`), and
+    /// a socket that never drains is ended by the output loop's absolute
+    /// per-message write deadline.
     #[test]
     fn a_full_queue_drops_the_sync_request_without_disconnecting_the_peer() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback socket");
@@ -3764,6 +4531,454 @@ mod tests {
             !matches!(read, Ok(0)),
             "a sync request refused by a full queue must not disconnect an \
              otherwise healthy peer, but the remote saw end of stream"
+        );
+    }
+
+    /// The getdata and getheaders requests a full queue refuses come back
+    /// out of `execute` with the peer they were meant for, so the manager
+    /// can release what it recorded as sent; other refused messages do
+    /// not, since the manager records nothing for them.
+    ///
+    /// Before this, a refused getdata left its blocks, transactions or
+    /// mix messages recorded against a peer that was never asked, so
+    /// every later announcement of the same item was skipped and nothing
+    /// ever re-requested it.
+    #[test]
+    fn a_refused_sync_request_is_handed_back_for_the_manager() {
+        let peers = SyncPeers::new();
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        fill_queue(&queue);
+        peers.register(
+            7,
+            queue,
+            None,
+            Arc::new(Mutex::new(RelayPeerState::new(relay_facts(false)))),
+            test_peer_handle(),
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+
+        let get_data = Message::GetData(dcroxide_wire::MsgGetData {
+            inv_list: vec![tx_inv(0x31)],
+        });
+        let get_headers =
+            Message::GetHeaders(dcroxide_wire::MsgGetHeaders(dcroxide_wire::BlockLocator {
+                protocol_version: 0,
+                block_locator_hashes: vec![Hash([0x32; 32])],
+                hash_stop: Hash::ZERO,
+            }));
+        let refused = peers.execute(vec![
+            Action::QueueMessage {
+                peer: 7,
+                message: get_data.clone(),
+            },
+            Action::QueueMessage {
+                peer: 7,
+                message: Message::GetAddr,
+            },
+            Action::QueueMessage {
+                peer: 7,
+                message: get_headers.clone(),
+            },
+        ]);
+        assert_eq!(refused, vec![(7, get_data), (7, get_headers)]);
+    }
+
+    /// A mix message shaped like a small secrets reveal.
+    fn small_mix_message() -> Message {
+        Message::MixSecrets(dcroxide_wire::MsgMixSecrets {
+            signature: [1; 64],
+            identity: [2; 33],
+            session_id: [3; 32],
+            run: 0,
+            seed: [4; 32],
+            slot_reserve_msgs: vec![vec![5; 20]],
+            dc_net_msgs: Vec::new(),
+            seen_secrets: Vec::new(),
+        })
+    }
+
+    /// Every served payload is charged exactly what the output loop
+    /// writes after the header, so the send pipeline's marks retire as
+    /// the payloads are written (dcrd releases the slot on the send-done
+    /// signal for that exact message).
+    ///
+    /// Mix messages used to be charged a flat 32 KiB.  The real
+    /// messages are a few hundred bytes to a few KiB, so every one served
+    /// left a gap only unrelated traffic could fill.
+    #[test]
+    fn served_payloads_are_charged_their_framed_size() {
+        let pver = dcroxide_wire::PROTOCOL_VERSION;
+        for msg in [
+            small_mix_message(),
+            Message::Tx(dcroxide_wire::MsgTx::default()),
+        ] {
+            let framed =
+                dcroxide_wire::write_message(&msg, pver, dcroxide_wire::CurrencyNet::MAIN_NET)
+                    .expect("the message frames")
+                    .len() as u64;
+            assert_eq!(
+                message_payload_bytes(&msg, pver) + crate::server::MESSAGE_HEADER_SIZE,
+                framed,
+                "{} charged differently from what is written",
+                msg.command()
+            );
+        }
+    }
+
+    /// Serving small mix messages to a peer on an otherwise quiet
+    /// connection never waits: each written frame retires its own mark.
+    ///
+    /// With the flat charge, three served messages left marks the peer's
+    /// sent-byte counter could not reach, and the fourth waited (then,
+    /// after a minute, the serve worker gave up for good).
+    #[test]
+    fn small_mix_replies_never_stall_the_send_pipeline() {
+        let pver = dcroxide_wire::PROTOCOL_VERSION;
+        let msg = small_mix_message();
+        let charge = message_payload_bytes(&msg, pver);
+        let framed = charge + crate::server::MESSAGE_HEADER_SIZE;
+        let mut pipeline = SendPipeline::new();
+        for served in 0..8 {
+            assert!(
+                pipeline.has_room(MAX_PENDING_SEND),
+                "reply {served} must not wait on bytes that will never be written"
+            );
+            pipeline.record_queued(charge);
+            // The output loop writes exactly that frame and nothing else.
+            pipeline.record_sent(framed);
+        }
+        assert_eq!(pipeline.pending(), 0);
+    }
+
+    /// Bytes other producers wrote while nothing of the pipeline's was
+    /// outstanding do not pre-pay payloads queued afterwards; banked
+    /// credit let a long-lived connection's relay traffic switch the
+    /// `maxPendingSend` bound off entirely.
+    #[test]
+    fn earlier_traffic_does_not_pre_pay_later_payloads() {
+        let mut pipeline = SendPipeline::new();
+        // Relay traffic written before the first getdata.
+        pipeline.record_sent(10 * 1024 * 1024);
+        for _ in 0..MAX_PENDING_SEND {
+            pipeline.record_queued(1_000);
+        }
+        // One small unrelated write lands.
+        pipeline.record_sent(1);
+        assert!(
+            !pipeline.has_room(MAX_PENDING_SEND),
+            "unwritten payloads must keep their slots"
+        );
+    }
+
+    /// A reply refused by a full outbound queue waits for the peer to
+    /// drain it and is then queued, rather than being dropped along with
+    /// the serve worker (dcrd's `QueueMessage` never refuses, and its
+    /// `serveGetData` loop ends only when the peer quits).
+    #[test]
+    fn a_refused_reply_waits_for_the_queue_to_drain() {
+        let (queue, rx) = crate::peerloop::OutboundQueue::channel();
+        fill_queue(&queue);
+        let quit = Arc::new(AtomicBool::new(false));
+        let reply = Message::NotFound(MsgNotFound {
+            inv_list: vec![tx_inv(0x41)],
+        });
+        let worker = {
+            let queue = queue.clone();
+            let quit = Arc::clone(&quit);
+            let reply = reply.clone();
+            thread::spawn(move || queue_reply(&queue, &quit, None, reply))
+        };
+
+        // The peer reads one message, making room.
+        thread::sleep(Duration::from_millis(20));
+        assert!(matches!(rx.try_recv(), Ok(Message::GetAddr)));
+        assert!(
+            worker.join().expect("the serve thread"),
+            "the reply is queued once there is room"
+        );
+        let mut last = None;
+        while let Ok(msg) = rx.try_recv() {
+            last = Some(msg);
+        }
+        assert_eq!(last, Some(reply), "the refused reply reaches the peer");
+    }
+
+    /// The wait for queue room ends only when the peer goes away.
+    #[test]
+    fn a_refused_reply_is_abandoned_only_when_the_peer_goes_away() {
+        let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+        fill_queue(&queue);
+        let quit = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let queue = queue.clone();
+            let quit = Arc::clone(&quit);
+            thread::spawn(move || {
+                queue_reply(
+                    &queue,
+                    &quit,
+                    None,
+                    Message::NotFound(MsgNotFound {
+                        inv_list: vec![tx_inv(0x42)],
+                    }),
+                )
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !worker.is_finished(),
+            "a full queue alone must not end the wait"
+        );
+        quit.store(true, Ordering::SeqCst);
+        assert!(!worker.join().expect("the serve thread"));
+    }
+
+    /// A genesis chain over a fresh database, with the recent in-memory
+    /// window emptied so every block and filter read has to come from
+    /// the database.
+    fn database_only_genesis_chain() -> (tempfile::TempDir, Arc<Mutex<Chain>>, Hash) {
+        let params = dcroxide_chaincfg::testnet3_params();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opts = dcroxide_database::Options::new(dir.path().join("blocks"), params.net.0);
+        let db = Database::create(&opts).expect("create database");
+        let mut chain =
+            Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain");
+        chain.blocks.clear();
+        chain.filters.clear();
+        chain.header_commitments.clear();
+        (dir, Arc::new(Mutex::new(chain)), params.genesis_hash)
+    }
+
+    /// Block and committed-filter serving read the database with the
+    /// chain lock released, answering exactly what the chain's own
+    /// lookups answer.  dcrd's `BlockByHash` and `BlockByHeight` take no
+    /// chain lock, and its `LocateCFiltersV2` releases the lock before its
+    /// `db.View`; the port held its exclusive chain mutex across up to 200
+    /// database reads per 88-byte getcfsv2, holding off block processing
+    /// and every other chain user.
+    #[test]
+    fn serving_reads_the_database_outside_the_chain_lock() {
+        let (_dir, chain, genesis) = database_only_genesis_chain();
+        let (want_block, want_height_block, (want_filter, want_proof), want_range) = {
+            let chain = chain.lock().expect("chain mutex");
+            (
+                chain
+                    .block_by_hash(&genesis)
+                    .expect("the genesis block from the database"),
+                chain
+                    .block_by_height(0)
+                    .expect("the main-chain block at height zero"),
+                chain
+                    .filter_by_block_hash(&genesis)
+                    .expect("the genesis filter from the database"),
+                chain
+                    .locate_cfilters_v2(&genesis, &genesis)
+                    .expect("the genesis range"),
+            )
+        };
+
+        // The index half runs under the chain lock and reads nothing.
+        let (block_read, (height_hash, height_read), filter_read, range_read) = {
+            let chain = chain.lock().expect("chain mutex");
+            assert!(matches!(
+                BlockRead::locate(&chain, &genesis),
+                Some(BlockRead::Stored(Some(_)))
+            ));
+            assert!(BlockRead::locate_main_chain(&chain, 1).is_none());
+            assert!(FilterReads::locate_range(&chain, &Hash([7; 32]), &genesis).is_none());
+            assert!(FilterReads::locate_block(&chain, &Hash([7; 32])).is_none());
+            (
+                BlockRead::locate(&chain, &genesis).expect("genesis has data"),
+                BlockRead::locate_main_chain(&chain, 0).expect("the main chain has height 0"),
+                FilterReads::locate_block(&chain, &genesis).expect("genesis has data"),
+                FilterReads::locate_range(&chain, &genesis, &genesis).expect("a valid range"),
+            )
+        };
+        assert_eq!(height_hash, genesis);
+
+        // The database half completes while something else, block
+        // processing say, holds the chain lock.
+        let held = chain.lock().expect("chain mutex");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send((
+                block_read.fetch(&genesis),
+                height_read.fetch(&height_hash),
+                filter_read.fetch(),
+                range_read.fetch(),
+            ));
+        });
+        let (block, height_block, filter, range) = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the database reads must not wait on the chain lock");
+        drop(held);
+
+        assert_eq!(block, Some(want_block));
+        assert_eq!(height_block, Some(want_height_block));
+        assert_eq!(
+            filter,
+            Some(vec![MsgCFilterV2 {
+                block_hash: genesis,
+                data: want_filter.bytes().to_vec(),
+                proof_index: want_proof.proof_index,
+                proof_hashes: want_proof.proof_hashes,
+            }])
+        );
+        assert_eq!(range, Some(want_range.cfilters));
+    }
+
+    /// The RPC block and filter fetches go through the same split, so
+    /// they answer what the chain's own lookups answer, misses included:
+    /// the block by hash and by height, and the filter with its proof.
+    #[test]
+    fn rpc_fetches_split_at_the_chain_lock_like_serving() {
+        use dcroxide_rpc::server::{RpcChain, RpcFiltererV2};
+
+        let (_dir, chain, genesis) = database_only_genesis_chain();
+        let params = dcroxide_chaincfg::testnet3_params();
+        let rpc_chain = crate::rpcrun::NodeRpcChain::new(Arc::clone(&chain), params);
+        let rpc_filters = crate::rpcrun::NodeRpcFiltererV2::new(Arc::clone(&chain));
+        let (want_block, (want_filter, want_proof)) = {
+            let chain = chain.lock().expect("chain mutex");
+            (
+                chain.block_by_hash(&genesis).expect("the genesis block"),
+                chain
+                    .filter_by_block_hash(&genesis)
+                    .expect("the genesis filter"),
+            )
+        };
+
+        assert_eq!(rpc_chain.block_by_hash(&genesis), Ok(want_block.clone()));
+        assert_eq!(rpc_chain.block_by_height(0), Ok(want_block));
+        let unknown = Hash([7; 32]);
+        // dcrd's `unknownBlockError` and `errNotInMainChainByHeight`.
+        assert_eq!(
+            rpc_chain.block_by_hash(&unknown),
+            Err(format!("block {unknown} is not known"))
+        );
+        assert_eq!(
+            rpc_chain.block_by_height(1),
+            Err("no block at height 1 exists".to_string())
+        );
+
+        let proof = rpc_filters
+            .filter_by_block_hash(&genesis)
+            .expect("the genesis filter");
+        assert_eq!(proof.filter_bytes, want_filter.bytes().to_vec());
+        assert_eq!(proof.proof_index, want_proof.proof_index);
+        assert_eq!(proof.proof_hashes, want_proof.proof_hashes);
+        let miss = rpc_filters
+            .filter_by_block_hash(&unknown)
+            .expect_err("no filter for an unknown block");
+        let want_miss = chain
+            .lock()
+            .expect("chain mutex")
+            .filter_by_block_hash(&unknown)
+            .expect_err("no filter for an unknown block");
+        assert!(miss.is_no_filter, "a missing filter is ErrNoFilter");
+        assert_eq!(miss.message, want_miss.to_string());
+    }
+
+    /// A ban logs dcrd's `BanPeer` lines, and a rising ban score logs
+    /// `addBanScore`'s warning; the port used to ban silently.
+    #[test]
+    fn bans_log_dcrds_lines() {
+        use crate::logsubsys::LogLevel;
+        use crate::server::BanPeerOutcome;
+
+        const DAY_NANOS: i64 = 24 * 60 * 60 * 1_000_000_000;
+        let addr = "52.91.30.7:9108";
+        let label = peer_label(addr, true);
+        assert_eq!(label, "52.91.30.7:9108 (inbound)");
+
+        let banned = BanPeerOutcome::Banned {
+            host: "52.91.30.7".to_string(),
+            until_nanos: 0,
+        };
+        assert_eq!(
+            ban_peer_log_lines(
+                &banned,
+                &label,
+                addr,
+                true,
+                false,
+                DAY_NANOS,
+                "sent empty inventory announcement"
+            ),
+            vec![(
+                LogLevel::Warn,
+                "Misbehaving peer 52.91.30.7 (inbound): sent empty inventory announcement -- \
+                 banned for 24h0m0s"
+                    .to_string()
+            )]
+        );
+        assert_eq!(
+            ban_peer_log_lines(
+                &BanPeerOutcome::Ignored,
+                &label,
+                addr,
+                true,
+                false,
+                DAY_NANOS,
+                "why"
+            ),
+            vec![(
+                LogLevel::Debug,
+                "Misbehaving whitelisted peer 52.91.30.7:9108 (inbound): why".to_string()
+            )]
+        );
+        assert!(
+            ban_peer_log_lines(
+                &BanPeerOutcome::Ignored,
+                &label,
+                addr,
+                true,
+                true,
+                DAY_NANOS,
+                "why"
+            )
+            .is_empty(),
+            "no warning is logged when banning is disabled"
+        );
+        let portless = peer_label("52.91.30.7", false);
+        assert_eq!(
+            ban_peer_log_lines(
+                &BanPeerOutcome::DisconnectOnly,
+                &portless,
+                "52.91.30.7",
+                false,
+                false,
+                DAY_NANOS,
+                "why"
+            ),
+            vec![
+                (
+                    LogLevel::Debug,
+                    "can't split ban peer 52.91.30.7 (outbound): address 52.91.30.7: missing \
+                     port in address"
+                        .to_string()
+                ),
+                (
+                    LogLevel::Warn,
+                    "Misbehaving peer 52.91.30.7 (outbound): why -- disconnecting".to_string()
+                ),
+            ]
+        );
+
+        let mut state = ServerPeerAddrState::new(false);
+        state.peer_label = label.clone();
+        assert_eq!(
+            crate::server::ban_score_warning(&state, "mempool", 66),
+            "Misbehaving peer 52.91.30.7:9108 (inbound): mempool -- ban score increased to 66"
+        );
+        state.is_whitelisted = true;
+        assert_eq!(
+            crate::server::ban_score_warning(&state, "getdata", 51),
+            "Misbehaving whitelisted peer 52.91.30.7:9108 (inbound): getdata -- ban score \
+             increased to 51"
         );
     }
 }

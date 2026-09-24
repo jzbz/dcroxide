@@ -416,13 +416,15 @@ fn the_chain_event_handler_feeds_websocket_subscribers() {
         "{frame}"
     );
 
-    // A new-tickets event follows the same path.
+    // A new-tickets event follows the same deferred path, queued behind
+    // the block events it follows in dcrd's notification order.
     handler.handle(&Notification::NewTickets(TicketNotificationsData {
         hash: genesis.header.block_hash(),
         height: 1,
         stake_difficulty: 20000,
         tickets_new: vec![Hash([0x11; 32])],
     }));
+    handler.drain_pending_block_events();
     let frame = read_server_frame(&mut ws);
     assert!(frame.contains("\"method\":\"newtickets\""), "{frame}");
 

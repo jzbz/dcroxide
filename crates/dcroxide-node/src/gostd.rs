@@ -80,41 +80,12 @@ fn fmt_frac(mut v: u64, prec: usize) -> (String, u64) {
     (frac, v)
 }
 
-/// Quote a string like Go's `strconv.Quote`: the quote and backslash
-/// escapes, the named control escapes, and `\xHH` for the remaining
-/// ASCII control bytes.  Non-ASCII characters follow Go's handling
-/// for control characters (`\uHHHH`/`\UHHHHHHHH`); Go's full
-/// `unicode.IsPrint` tables additionally escape exotic space and
-/// format characters, which is approximated here with the control
-/// and whitespace classes (format characters like the soft hyphen
-/// stay raw — unreachable through the config and version error paths
-/// this feeds).
+/// Quote a string like Go's `strconv.Quote` (the `%q` verb).  This is
+/// dcrjson's exact port, `gojson::go_quote`, with Go's `strconv.IsPrint`
+/// tables, so the config, version and `strconv` errors quote caller
+/// text exactly as the RPC server's errors do.
 pub(crate) fn go_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{07}' => out.push_str("\\a"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{0b}' => out.push_str("\\v"),
-            c if (c as u32) < 0x20 || c == '\u{7f}' => {
-                out.push_str(&format!("\\x{:02x}", c as u32));
-            }
-            c if c.is_ascii() || (!c.is_control() && !c.is_whitespace()) => out.push(c),
-            c if (c as u32) < 0x1_0000 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push_str(&format!("\\U{:08x}", c as u32)),
-        }
-    }
-    out.push('"');
-    out
+    dcroxide_dcrjson::gojson::go_quote(s)
 }
 
 /// Parse a duration like Go's `time.ParseDuration`, returning
@@ -761,7 +732,8 @@ mod tests {
     use super::go_quote;
 
     /// Go `strconv.Quote` outputs for the escape classes the config
-    /// error paths can carry.
+    /// error paths can carry, including the format, private-use and
+    /// unassigned runes only Go's `IsPrint` tables reject.
     #[test]
     fn go_quote_matches_strconv_quote() {
         let cases = [
@@ -774,6 +746,11 @@ mod tests {
             ("bell\u{07}", "\"bell\\a\""),
             ("h\u{e9}llo", "\"h\u{e9}llo\""),
             ("nb\u{a0}sp", "\"nb\\u00a0sp\""),
+            ("soft\u{ad}hyphen", "\"soft\\u00adhyphen\""),
+            ("zero\u{200b}width", "\"zero\\u200bwidth\""),
+            ("\u{378}", "\"\\u0378\""),
+            ("\u{e000}", "\"\\ue000\""),
+            ("\u{f0000}", "\"\\U000f0000\""),
             ("", "\"\""),
         ];
         for (input, want) in cases {

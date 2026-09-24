@@ -39,9 +39,11 @@ use std::path::Path;
 ///   and startup proceeds.
 /// * A pre-existing file that *is* reachable by other users is
 ///   restricted to `0600` **before** it is opened for truncation, so
-///   the fresh secret never lands in a file another user already has
-///   open or can still open.  dcrd instead rewrites the file through
-///   its existing loose mode.
+///   no other user can open it afresh to read the new secret.  A
+///   descriptor another user opened before the restriction survives it
+///   (`chmod` revokes no open descriptor), so this covers new opens
+///   only.  dcrd instead rewrites the file through its existing loose
+///   mode.
 /// * If that restriction fails (`EPERM` because the file belongs to
 ///   another user, `EOPNOTSUPP` on an exotic mount) the error is
 ///   returned with nothing written and nothing truncated: the old file

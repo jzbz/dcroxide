@@ -137,14 +137,17 @@ fn write_full(conn: &mut TcpStream, buf: &[u8], deadline: Deadline) -> Result<()
 /// Connect to a `host:port` proxy address like Go's `net.Dialer`:
 /// resolve the name (a hostname proxy such as Tor's default
 /// `localhost:9050` is common) and connect to the resolved addresses
-/// in order until one succeeds.
+/// in order until one succeeds.  When none does, the first address's
+/// error is the one reported, in Go's text (`dialSerial`: "The error
+/// from the first address is most relevant"), which go-socks and
+/// `TorLookupIP` return as it is.
 fn connect_proxy(addr: &str, deadline: Deadline) -> Result<TcpStream, String> {
     use std::net::ToSocketAddrs;
     let resolved: Vec<std::net::SocketAddr> = addr
         .to_socket_addrs()
         .map_err(|e| format!("invalid proxy address {addr}: {e}"))?
         .collect();
-    let mut last_err = format!("no addresses found for proxy {addr}");
+    let mut first_err = None;
     for socket in resolved {
         // Go's dialer draws each attempt's timeout from the same
         // deadline, so a name resolving to several addresses cannot
@@ -154,11 +157,19 @@ fn connect_proxy(addr: &str, deadline: Deadline) -> Result<TcpStream, String> {
             return Err("i/o timeout".to_string());
         }
         match TcpStream::connect_timeout(&socket, left) {
-            Ok(conn) => return Ok(conn),
-            Err(e) => last_err = e.to_string(),
+            Ok(conn) => {
+                // Go's dialer sets TCP_NODELAY on every connection it
+                // makes, ignoring a failure (`newTCPConn`,
+                // `net/tcpsock.go`).
+                let _ = conn.set_nodelay(true);
+                return Ok(conn);
+            }
+            Err(e) => {
+                first_err.get_or_insert_with(|| go_connect_error(&socket.to_string(), &e));
+            }
         }
     }
-    Err(last_err)
+    Err(first_err.unwrap_or_else(|| format!("no addresses found for proxy {addr}")))
 }
 
 impl Proxy {
@@ -371,6 +382,44 @@ pub fn tor_lookup_ip(
     }
 }
 
+/// Go's `avoidDNS` (`net/dnsclient_unix.go`): a `.onion` name, matched
+/// ASCII-case-insensitively after one trailing dot is dropped, is never
+/// sent to DNS.  Go's resolver still answers such a name from
+/// `/etc/hosts`, and still queries the `resolv.conf` search-list forms
+/// of an unrooted one (`<name>.onion.<suffix>.`), failing with `lookup
+/// <name> on <server>: no such host` when a search domain is set; the
+/// port skips the name altogether, which is Go's answer for a rooted
+/// name or a resolver without search domains.
+fn avoid_dns(name: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name).as_bytes();
+    name.len() >= 6 && name[name.len() - 6..].eq_ignore_ascii_case(b".onion")
+}
+
+/// A failed direct connect as Go's dialer reports it, the
+/// `*net.OpError` text `dial tcp <addr>: connect: <errno text>`.  On
+/// unix Go's errno texts are the C library's with the first letter
+/// lowered.  std's own timeout carries no OS error and keeps its text,
+/// which the outbound driver reads as the dial deadline running out, and
+/// other platforms keep std's rendering (Go's Windows text is
+/// `connectex: <message>`).
+fn go_connect_error(addr: &str, e: &std::io::Error) -> String {
+    match e.raw_os_error() {
+        Some(code) if cfg!(unix) => {
+            let text = e.to_string();
+            let text = text
+                .strip_suffix(&format!(" (os error {code})"))
+                .unwrap_or(&text);
+            let mut chars = text.chars();
+            let errno_text: String = match chars.next() {
+                Some(first) => first.to_lowercase().chain(chars).collect(),
+                None => String::new(),
+            };
+            format!("dial tcp {addr}: connect: {errno_text}")
+        }
+        _ => e.to_string(),
+    }
+}
+
 /// How onion addresses route (the concrete form of the config's
 /// `OnionSelection`).
 #[derive(Clone, Debug)]
@@ -466,7 +515,13 @@ impl NodeDialer {
                 let socket: std::net::SocketAddr = addr
                     .parse()
                     .map_err(|e| format!("invalid dial address {addr}: {e}"))?;
-                TcpStream::connect_timeout(&socket, timeout).map_err(|e| e.to_string())
+                let conn = TcpStream::connect_timeout(&socket, timeout)
+                    .map_err(|e| go_connect_error(addr, &e))?;
+                // Go's dialer sets TCP_NODELAY on every connection it
+                // makes, ignoring a failure (`newTCPConn`,
+                // `net/tcpsock.go`).
+                let _ = conn.set_nodelay(true);
+                Ok(conn)
             }
         }
     }
@@ -488,7 +543,13 @@ impl NodeDialer {
         match &self.lookup_proxy {
             Some(proxy) => tor_lookup_ip(host, proxy, timeout),
             None => {
-                // Go `net.LookupIP` via the system resolver.
+                // Go `net.LookupIP` via the system resolver.  Go's own
+                // resolver never asks DNS for a `.onion` name (RFC 7686),
+                // which comes back with no addresses; the system resolver
+                // would send the query, so the name never reaches it.
+                if avoid_dns(host) {
+                    return Ok(Vec::new());
+                }
                 use std::net::ToSocketAddrs;
                 Ok((host, 0u16)
                     .to_socket_addrs()

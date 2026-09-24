@@ -14,10 +14,12 @@
 //! that do run dcrd.
 //!
 //! The answer arrives as a predicate rather than a pool handle. dcrd
-//! answers it inside the fetcher, which runs under the mixpool's own
-//! mutex; doing that here would take the tx-pool lock while holding the
-//! mixpool's, against an acceptance gauntlet that already takes them the
-//! other way round.
+//! answers it inside the fetcher, from `checkAcceptPR`, which
+//! `AcceptMessage` runs before it takes the mixpool's mutex
+//! (`mixing/mixpool/mixpool.go:1206-1210`); the port's acceptance runs
+//! wholly under the mixpool guard, so asking from inside would take the
+//! tx-pool lock while holding the mixpool's, against an acceptance
+//! gauntlet that already takes them the other way round.
 
 use std::sync::Arc;
 

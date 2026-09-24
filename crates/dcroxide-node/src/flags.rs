@@ -1106,13 +1106,18 @@ pub static HELP_OPTION: OptSpec = OptSpec {
 };
 
 /// Registry lookup that also consults the built-in help option, on the
-/// one parse that registers it.
+/// one parse that registers it.  That parse is also the one without the
+/// Windows service group: dcrd builds it as `flags.NewParser(&cfg,
+/// helpOpts)` rather than through `newConfigParser`, so there
+/// `-s/--service` is an unknown option, skipped like any other, and only
+/// the config-file pre-parse sets the service command dcrd acts on.
 fn find_long_for(
     registry: &'static [OptSpec],
     mode: ScanMode,
     name: &str,
 ) -> Option<&'static OptSpec> {
-    find_long_in(registry, name).or(match mode {
+    let service_group = has_service_group(registry) && mode != ScanMode::IgnoreUnknown;
+    find_long_with(registry, name, service_group).or(match mode {
         ScanMode::IgnoreUnknown if name == "help" => Some(&HELP_OPTION),
         _ => None,
     })
@@ -1123,7 +1128,8 @@ fn find_short_for(
     mode: ScanMode,
     name: char,
 ) -> Option<&'static OptSpec> {
-    find_short_in(registry, name).or(match mode {
+    let service_group = has_service_group(registry) && mode != ScanMode::IgnoreUnknown;
+    find_short_with(registry, name, service_group).or(match mode {
         ScanMode::IgnoreUnknown if name == 'h' => Some(&HELP_OPTION),
         _ => None,
     })
@@ -1681,5 +1687,24 @@ mod tests {
         assert!(find_long_with(&OPTIONS, "service", false).is_none());
         assert!(find_short_with(&OPTIONS, 's', true).is_some());
         assert!(find_short_with(&OPTIONS, 's', false).is_none());
+    }
+
+    /// The help pre-parse never knows the service group, which dcrd's
+    /// `flags.NewParser(&cfg, helpOpts)` lacks on every platform; the
+    /// other two parses have it wherever dcrd registers it.  On Windows
+    /// the help pass used to take `--service` too, so `--bogus
+    /// --service=stop` ran the command dcrd's pre-parse never reached.
+    #[test]
+    fn the_help_pre_parse_has_no_service_group() {
+        assert!(find_long_for(&OPTIONS, ScanMode::IgnoreUnknown, "service").is_none());
+        assert!(find_short_for(&OPTIONS, ScanMode::IgnoreUnknown, 's').is_none());
+        for mode in [ScanMode::Plain, ScanMode::PassDoubleDash] {
+            assert_eq!(
+                find_long_for(&OPTIONS, mode, "service").is_some(),
+                cfg!(windows)
+            );
+            assert_eq!(find_short_for(&OPTIONS, mode, 's').is_some(), cfg!(windows));
+        }
+        assert!(find_long_for(&OPTIONS, ScanMode::IgnoreUnknown, "help").is_some());
     }
 }

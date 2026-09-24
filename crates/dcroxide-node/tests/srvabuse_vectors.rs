@@ -54,7 +54,7 @@ fn server_abuse_control_matches_dcrd() {
         let fields: Vec<&str> = line.split('|').collect();
         match (fields[0], fields[1]) {
             ("mp", n) => {
-                let out = on_mem_pool(&mut mp_state, &[], false, ban_threshold, now);
+                let out = on_mem_pool(&mut mp_state, Vec::new, false, ban_threshold, now);
                 let banned = out == OnMemPoolOutcome::Banned;
                 if banned {
                     ban_peer(

@@ -289,7 +289,8 @@ fn mempool_conn_handler_slice_matches_dcrd() {
             "desc" => {
                 let (tx, _) = MsgTx::from_bytes(&unhex(f[1])).unwrap();
                 descs.push(RpcMempoolTx {
-                    tx,
+                    serialize_size: tx.serialize_size(),
+                    tx_hash: tx.tx_hash(),
                     tx_type: tx_type_from_name(f[2]),
                     fee: f[5].parse().unwrap(),
                 });
@@ -325,12 +326,13 @@ fn mempool_conn_handler_slice_matches_dcrd() {
         .iter()
         .enumerate()
         .map(|(i, d)| RpcVerboseMempoolTx {
-            tx: d.tx.clone(),
+            serialize_size: d.serialize_size,
+            tx_hash: d.tx_hash,
             tx_type: d.tx_type,
             added_unix: desc_extras[i].0,
             height: desc_extras[i].1,
             fee: desc_extras[i].2,
-            depends: vdeps[i].iter().map(|&j| descs[j].tx.tx_hash()).collect(),
+            depends: vdeps[i].iter().map(|&j| descs[j].tx_hash).collect(),
         })
         .collect();
 

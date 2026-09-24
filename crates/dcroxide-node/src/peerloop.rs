@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: ISC
 //! The per-peer message loops — dcrd `peer.go`'s `inHandler`,
-//! `outHandler`, and `pingHandler`.
+//! `outHandler` (with the keepalive ticker it owns), and
+//! `stallHandler`.
 //!
 //! Once the version handshake completes the daemon reads messages in a
 //! loop, giving the protocol-level messages their fixed handling (a
@@ -10,33 +11,44 @@
 //! handlers.  The dispatch itself is a decision core over the ported
 //! [`Peer`] handlers ([`classify_incoming`]); [`run_peer_input`] is the
 //! read loop, [`run_peer_output`] the write loop draining the
-//! [`OutboundQueue`], and [`run_ping_timer`] the periodic keepalive.
+//! [`OutboundQueue`], [`run_ping_timer`] the periodic keepalive, and
+//! [`run_stall_detector`] the pending-response check.  A served
+//! connection runs the last two on one thread ([`run_peer_timers`]).
 //!
 //! dcrd runs these as separate goroutines sharing the peer under its
 //! mutexes, so the peer is passed as a `&Mutex<Peer>` and every write to
 //! the connection — including the input loop's protocol replies and the
 //! keepalive pings — goes through the outbound queue, keeping all writes
-//! on the single output loop.  The blocking read is taken without the
-//! peer lock held so the ping timer and the server make progress.  The
-//! stall detector and the inventory trickle queue arrive later.  The
-//! idle read deadline is applied through the transport's absolute
-//! per-message read budget (dcrd's
-//! `SetReadDeadline` before each read); a read timeout ends the loop exactly
-//! like dcrd's idle disconnect.
+//! on the single output loop.  The peer lock is held only for the
+//! bookkeeping itself, the way dcrd holds `statsMtx` and `flagsMtx`:
+//! never across the blocking read, and never across the server's hooks
+//! (the message handler, and the connection and disconnection hooks),
+//! which may wait out a block validation or a chain flush.  The output
+//! loop, the timers, the getdata server and
+//! `getpeerinfo` therefore keep going while a handler runs, as dcrd's
+//! `outHandler` keeps writing (pings included) while `inHandler`
+//! blocks.  dcrd's separate inventory trickle queue (`QueueInventory`)
+//! is not ported: each announcement is its own message.  The idle read
+//! deadline is applied through the transport's absolute per-message
+//! read budget (dcrd's `SetReadDeadline` before each read); a read
+//! timeout ends the loop exactly like dcrd's idle disconnect.
 
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dcroxide_peer::{
-    ArmOutcome, MAX_PROTOCOL_VERSION, MsgTransport, NEGOTIATE_TIMEOUT, Peer, PeerEnv, PeerGlobals,
-    STALL_RESPONSE_TIMEOUT, STALL_TICK_INTERVAL, StallDetector, StallReason,
+    ArmOutcome, MAX_PROTOCOL_VERSION, MsgTransport, NEGOTIATE_TIMEOUT, NegotiateError,
+    NegotiateErrorKind, Peer, PeerEnv, PeerGlobals, ReadError, STALL_RESPONSE_TIMEOUT,
+    STALL_TICK_INTERVAL, StallDetector, StallReason,
 };
 use dcroxide_wire::{
-    CurrencyNet, MESSAGE_HEADER_SIZE, Message, MsgPing, write_message as wire_write_message,
+    CurrencyNet, MESSAGE_HEADER_SIZE, Message, MsgPing, MsgVersion,
+    write_message as wire_write_message,
 };
 
 use crate::peerconn::NodePeerEnv;
+use crate::socktimeout::SocketTimeout;
 use crate::transport::{WireTransport, WriteStallPolicy};
 
 /// The protocol-level handling an incoming message calls for, before it
@@ -70,6 +82,21 @@ pub enum DisconnectReason {
     /// The outbound queue was closed, so the output loop finished (a
     /// locally initiated shutdown).
     LocalShutdown,
+    /// The OS refused a thread the connection needs, so it was dropped
+    /// before the server saw it.  dcrd has no counterpart: its loops
+    /// are goroutines, which cannot fail to start.
+    ThreadRefused(String),
+}
+
+/// dcrd `directionString`.
+pub(crate) fn direction_string(inbound: bool) -> &'static str {
+    if inbound { "inbound" } else { "outbound" }
+}
+
+/// How dcrd's peer logging names a peer (`Peer.String`: the remote
+/// address and its direction).
+pub(crate) fn peer_log_label(peer: &Peer) -> String {
+    format!("{} ({})", peer.addr(), direction_string(peer.inbound()))
 }
 
 /// Give an incoming message its protocol-level handling, updating the
@@ -129,19 +156,27 @@ pub enum ServeSignal {
 pub trait ServeHooks {
     /// The peer sent bytes that failed wire decoding (dcrd `OnRead`
     /// observing a `wire.ErrorCode`): the server bans the host with
-    /// dcrd's "sent malformed wire message" reason.  The read loop
-    /// disconnects regardless, so implementations only record the
-    /// ban.
-    fn on_wire_violation(&mut self, _err: &str) {}
-    /// The connection completed its handshake (dcrd `AddPeer`).  The
-    /// shared `peer_handle` is the same `Arc<Mutex<Peer>>` both loops
-    /// run behind, handed over so the server can register it for live
-    /// stat snapshots (`getpeerinfo`) without ever locking it here — the
-    /// caller already holds the guard across this call.
+    /// dcrd's "sent malformed wire message" reason.  The read loop ends
+    /// either way; the answer says whether the ban also disconnected
+    /// the peer (dcrd's `BanPeer` calling `Disconnect`), which is
+    /// [`ServeSignal::Continue`] when the server declined to ban
+    /// (banning disabled, a whitelisted peer) or has no ban to make.
+    fn on_wire_violation(&mut self, _err: &str) -> ServeSignal {
+        ServeSignal::Continue
+    }
+    /// The connection completed its handshake (dcrd `AddPeer`).  `peer`
+    /// is the same `Arc<Mutex<Peer>>` both loops run behind, handed over
+    /// so the server can register it for live stat snapshots
+    /// (`getpeerinfo`).
+    ///
+    /// The peer arrives unlocked, for the reason given at
+    /// [`on_message`](ServeHooks::on_message): registering the peer and
+    /// telling the sync manager about it can wait out a block
+    /// validation, and dcrd's `AddPeer` holds no peer lock.  The output
+    /// loop is already running.
     fn on_connected(
         &mut self,
-        _peer: &mut Peer,
-        _peer_handle: &std::sync::Arc<std::sync::Mutex<Peer>>,
+        _peer: &Arc<Mutex<Peer>>,
         _outbound: &OutboundQueue,
         _remote_disable_relay_tx: bool,
     ) {
@@ -156,28 +191,53 @@ pub trait ServeHooks {
     ) -> Result<(), String> {
         Ok(())
     }
-    /// A message arrived for the server handlers.
+    /// A message arrived for the server handlers.  It is handed over by
+    /// value, so a handler can keep it without copying it, together with
+    /// the mixing identity hash the input loop computed as it read the
+    /// message (dcrd's `readMessage` caching `WriteHash` on it); the hash
+    /// is `None` for every other message and when hashing failed.
+    ///
+    /// The peer arrives unlocked.  dcrd runs its message listeners with
+    /// no peer lock held, reading peer state through short `flagsMtx`
+    /// and `statsMtx` sections, and a handler may block for as long as
+    /// a block validation or a chain flush takes.  Holding the peer
+    /// across that would stall everything else that needs it: the
+    /// output loop's send accounting after every write, the ping stamp,
+    /// the getdata server's pacing, `getpeerinfo`, and every handshake's
+    /// outbound count.  Implementations lock only around the peer state
+    /// they actually read or change.
     fn on_message(
         &mut self,
-        peer: &mut Peer,
-        msg: &Message,
+        peer: &Mutex<Peer>,
+        msg: Message,
+        mix_hash: Option<dcroxide_chainhash::Hash>,
         outbound: &OutboundQueue,
     ) -> ServeSignal;
-    /// The connection is winding down (dcrd `DonePeer`).
-    fn on_disconnected(&mut self, _peer: &mut Peer) {}
+    /// The connection is winding down (dcrd `DonePeer`).  The peer
+    /// arrives unlocked, as at [`on_connected`](ServeHooks::on_connected):
+    /// it stays registered until the sync manager has let it go.
+    fn on_disconnected(&mut self, _peer: &Mutex<Peer>) {}
 }
 
+/// A plain message closure, run with the peer locked for the whole call
+/// — a convenience for tests exercising the plumbing, whose handlers
+/// never block.
 impl<F> ServeHooks for F
 where
     F: FnMut(&mut Peer, &Message, &OutboundQueue) -> ServeSignal,
 {
     fn on_message(
         &mut self,
-        peer: &mut Peer,
-        msg: &Message,
+        peer: &Mutex<Peer>,
+        msg: Message,
+        _mix_hash: Option<dcroxide_chainhash::Hash>,
         outbound: &OutboundQueue,
     ) -> ServeSignal {
-        self(peer, msg, outbound)
+        self(
+            &mut peer.lock().expect("peer mutex poisoned"),
+            &msg,
+            outbound,
+        )
     }
 }
 
@@ -234,8 +294,12 @@ where
     // (dcrd's `inHandler` draining `delayedHandshakeMsgs`); their
     // bytes were folded into the handshake accounting already.
     for msg in delayed {
-        let mut peer = peer.lock().expect("peer mutex poisoned");
-        match classify_incoming(&mut peer, &msg, env) {
+        // dcrd's `readMessage` hashed these too, during the handshake.
+        let mix_hash = mix_message_hash(&msg);
+        // Only the protocol-level bookkeeping runs under the peer lock;
+        // see the steady-state loop below.
+        let action = classify_incoming(&mut peer.lock().expect("peer mutex poisoned"), &msg, env);
+        match action {
             IncomingAction::Disconnect(reason) => return DisconnectReason::Protocol(reason.into()),
             IncomingAction::Process { reply } => {
                 if let Some(reply) = reply {
@@ -249,7 +313,8 @@ where
                         Err(QueueError::Closed) => return DisconnectReason::LocalShutdown,
                     }
                 }
-                if let ServeSignal::Disconnect(reason) = hooks.on_message(&mut peer, &msg, outbound)
+                if let ServeSignal::Disconnect(reason) =
+                    hooks.on_message(peer, msg, mix_hash, outbound)
                 {
                     return DisconnectReason::Protocol(reason);
                 }
@@ -271,8 +336,15 @@ where
                 // Ban peers sending messages that do not conform to
                 // the wire protocol (dcrd `OnRead` on a
                 // `wire.ErrorCode`); the read loop exits either way.
-                if e.wire_violation {
-                    hooks.on_wire_violation(&e.message);
+                // dcrd's `OnRead` runs inside `readMessage`, so a ban's
+                // `Disconnect` lands before `inHandler` looks at the
+                // error, and `shouldHandleReadError` then declines to
+                // log it.  A ban that disconnects therefore ends the
+                // connection as the ban, not as a read error.
+                if e.wire_violation
+                    && let ServeSignal::Disconnect(reason) = hooks.on_wire_violation(&e.message)
+                {
+                    return DisconnectReason::Protocol(reason);
                 }
                 return DisconnectReason::ReadError(e.message);
             }
@@ -280,28 +352,41 @@ where
         let read_delta = transport.total_bytes_read().wrapping_sub(read_total);
         read_total = transport.total_bytes_read();
 
+        // Hash a mixing message once, before taking any lock: dcrd does
+        // this in `readMessage` and caches the hash on the message, and
+        // the stall detector and the server handler both read this one.
+        let mix_hash = mix_message_hash(&msg);
+
         // Settle any deadline this message answers and open the
         // handler-active window before taking any lock, so every
         // moment between finishing the read and finishing the handling
         // is credited to the local node rather than blamed on the peer.
         if let Some(stall) = stall {
-            // Hash a mixing message before taking the lock: dcrd does
-            // this once in `readMessage`, and it must not happen with
-            // the stall mutex held.
-            let mix_hash = mix_message_hash(&msg);
             let mut stall = stall.lock().expect("stall mutex poisoned");
             stall.received_message(&msg, mix_hash);
             stall.handler_start();
         }
 
-        let mut peer = peer.lock().expect("peer mutex poisoned");
-        // Per-message receive accounting (dcrd stamping `lastRecv` in
-        // `inHandler` after each read); transports without byte
-        // tracking report zero deltas and skip it.
-        if read_delta > 0 {
-            peer.record_recv(read_delta, env.now_nanos());
-        }
-        match classify_incoming(&mut peer, &msg, env) {
+        // The peer lock covers the receive accounting and the
+        // protocol-level handling only, dcrd's short `statsMtx` and
+        // `flagsMtx` sections.  It is released before the server's
+        // handler runs: that handler can wait out another peer's block
+        // validation or a chain flush, and holding the peer across it
+        // stopped this connection's output loop after one write, held
+        // back its keepalive pings, and stalled `getpeerinfo` and every
+        // handshake behind it.  dcrd's `inHandler` holds no peer lock
+        // around `processInboundMessage`.
+        let action = {
+            let mut peer = peer.lock().expect("peer mutex poisoned");
+            // Per-message receive accounting (dcrd stamping `lastRecv`
+            // in `inHandler` after each read); transports without byte
+            // tracking report zero deltas and skip it.
+            if read_delta > 0 {
+                peer.record_recv(read_delta, env.now_nanos());
+            }
+            classify_incoming(&mut peer, &msg, env)
+        };
+        match action {
             IncomingAction::Disconnect(reason) => return DisconnectReason::Protocol(reason.into()),
             IncomingAction::Process { reply } => {
                 // Immediate replies go through the outbound queue so all
@@ -323,18 +408,18 @@ where
                         Err(QueueError::Closed) => return DisconnectReason::LocalShutdown,
                     }
                 }
-                if let ServeSignal::Disconnect(reason) = hooks.on_message(&mut peer, &msg, outbound)
+                if let ServeSignal::Disconnect(reason) =
+                    hooks.on_message(peer, msg, mix_hash, outbound)
                 {
                     return DisconnectReason::Protocol(reason);
                 }
             }
         }
 
-        // The message is handled: release the peer before closing the
-        // handler-active window, so this loop never holds the peer lock
+        // The message is handled.  The peer lock was released above, so
+        // closing the handler-active window never holds the peer lock
         // and the stall lock at once (the output loop takes them in the
         // opposite order).
-        drop(peer);
         if let Some(stall) = stall {
             stall.lock().expect("stall mutex poisoned").handler_done();
         }
@@ -346,24 +431,24 @@ where
 ///
 /// dcrd computes this once in `readMessage`, immediately after
 /// deserializing, and caches it on the wire message so
-/// `maybeRemoveDeadline` merely reads it back.  dcroxide keeps mix
-/// hashing in the mixing crate, so the input loop computes it once per
-/// received message and hands it to the stall detector — the same
-/// one-hash-per-message shape, with the cache in the caller.
+/// `maybeRemoveDeadline` and `onMixMessage` merely read it back.  The
+/// port's wire messages carry no cache, so the input loop computes it
+/// once per received message, by reference, and hands it to the stall
+/// detector and the server handler — the same one-hash-per-message
+/// shape, with the cache in the caller.
 fn mix_message_hash(msg: &Message) -> Option<dcroxide_chainhash::Hash> {
-    match msg {
-        Message::MixPairReq(_)
-        | Message::MixKeyExchange(_)
-        | Message::MixCiphertexts(_)
-        | Message::MixSlotReserve(_)
-        | Message::MixFactoredPoly(_)
-        | Message::MixDCNet(_)
-        | Message::MixConfirm(_)
-        | Message::MixSecrets(_) => {
-            crate::mixnode::wire_to_pool_message(msg.clone()).and_then(|pool| pool.mix_hash().ok())
-        }
-        _ => None,
-    }
+    let hash = match msg {
+        Message::MixPairReq(m) => m.mix_hash(),
+        Message::MixKeyExchange(m) => m.mix_hash(),
+        Message::MixCiphertexts(m) => m.mix_hash(),
+        Message::MixSlotReserve(m) => m.mix_hash(),
+        Message::MixFactoredPoly(m) => m.mix_hash(),
+        Message::MixDCNet(m) => m.mix_hash(),
+        Message::MixConfirm(m) => m.mix_hash(),
+        Message::MixSecrets(m) => m.mix_hash(),
+        _ => return None,
+    };
+    hash.ok()
 }
 
 /// A handle for originating messages to a peer (dcrd `QueueMessage`).
@@ -371,9 +456,10 @@ fn mix_message_hash(msg: &Message) -> Option<dcroxide_chainhash::Hash> {
 /// The server, the input pump's replies, and the ping timer send
 /// through clones of this handle; a single output loop drains the
 /// receiver and does the actual writing, so all writes to the
-/// connection are serialized on one thread.  dcrd's separate inventory
-/// trickle queue (`QueueInventory`) and the send semaphore are
-/// refinements that arrive later; this is the plain message queue.
+/// connection are serialized on one thread.  This is the plain message
+/// queue: dcrd's separate inventory trickle queue (`QueueInventory`) is
+/// not ported, and the getdata server's `maxPendingSend` pacing lives
+/// with that server in `dispatch`.
 #[derive(Clone)]
 pub struct OutboundQueue {
     sender: mpsc::SyncSender<QueuedMessage>,
@@ -473,32 +559,30 @@ impl std::fmt::Display for QueueError {
 /// The number of messages that may sit unsent in a peer's outbound
 /// queue.
 ///
-/// This is a deliberate hardening choice, not a port of a dcrd bound —
-/// dcrd has no bound here.  dcrd's `peer.go` sets `outputBufferSize =
-/// 5000` and builds `outputQueue: make(chan outMsg, 5000)` alongside
-/// `sendQueue: make(chan outMsg, 1)`; `queueHandler` then moves
-/// everything the writer has not taken yet into a plain
-/// `pendingMsgs []outMsg` slice that it grows with `append`.  So dcrd
-/// buffers 5000 messages in the channel and an unlimited number in the
-/// pending slice, and `QueueMessage` blocks only after the 5000-slot
-/// channel fills.  (The three-slot semaphore often cited as the bound
-/// is `maxPendingSend` in `server.go`, which limits concurrent *getdata
-/// serve* items only; nothing throttles relay, announcements, addr,
-/// cfilter or init-state traffic.)
+/// dcrd bounds this queue by bytes alone, not by count.  Its `peer.go`
+/// builds `outputQueue: make(chan outMsg, outputBufferSize)` (5000)
+/// alongside `sendQueue: make(chan outMsg, 1)`, and `queueHandler`
+/// moves everything the writer has not taken yet into a
+/// `pendingMsgs []outMsg` slice it grows with `append`, so the message
+/// count is unbounded.  What bounds it is `queueOutMsg` (since
+/// `589dd4c5`): every queued message is charged its `msgSize` against
+/// `maxQueuedOutputBytes` (40 MiB), and a peer whose charge would pass
+/// that is *disconnected* and the message dropped.  (The three-slot
+/// semaphore often cited as the bound is `maxPendingSend` in
+/// `server.go`, which limits concurrent *getdata serve* items only.)
 ///
-/// dcroxide's original port used `std::sync::mpsc::channel`, which is
-/// unbounded in the channel too, so a peer that stopped reading could
-/// pin unbounded heap.  128 slots caps that, and
-/// [`MAX_OUTBOUND_QUEUE_BYTES`] charges what the slots actually hold:
-/// against a byte budget the count alone is coarse, since the largest
-/// message this queue carries is a max-size `MsgHeaders` (2000 headers
-/// x 180 bytes ~ 360 KB) or a max-size `MsgBlock` (~393 KB), and 128 of
-/// those is ~46 MB per peer — ~5.7 GB at the default `maxpeers` of 125.
-/// The byte charge is the primary memory bound; the depth stays as the
-/// secondary guard against a flood of tiny messages, and the window is
-/// further bounded by the writer's per-message write deadline: once the
-/// peer stops reading, the first blocked write times out and the
-/// connection is torn down.
+/// This depth is the port's own secondary guard, with no dcrd
+/// counterpart, against a flood of tiny messages; the primary bound is
+/// the byte charge, [`MAX_OUTBOUND_QUEUE_BYTES`].  Against a byte
+/// budget the count alone would be coarse, since the largest message
+/// this queue carries is a max-size `MsgHeaders` (2000 headers x 180
+/// bytes ~ 360 KB) or a max-size `MsgBlock` (~393 KB), and 128 of those
+/// is ~46 MB per peer, ~5.7 GB at the default `maxpeers` of 125.  The
+/// window is further bounded by the writer's per-message write
+/// deadline: once the peer stops reading, the first blocked write times
+/// out and the connection is torn down.  How the two ceilings and the
+/// drop-not-disconnect policy differ from dcrd's 40 MiB disconnect is
+/// the *Per-peer outbound queue* row of `PARITY.md`.
 ///
 /// The depth is generous enough that ordinary bursts (a mempool inv
 /// fan-out, a headers response, the initial handshake traffic) never
@@ -510,9 +594,15 @@ pub const MAX_OUTBOUND_QUEUE_DEPTH: usize = 128;
 /// The bytes that may sit unsent in a peer's outbound queue, charged at
 /// each message's framed size (header plus encoded payload).
 ///
-/// Like the depth above this is a deliberate hardening choice with no
-/// dcrd counterpart — dcrd's `queueHandler` buffers without bound.  The
-/// charge is computed on enqueue and released when the output loop takes
+/// dcrd's counterpart is `maxQueuedOutputBytes`, 40 MiB charged per
+/// message in `queueOutMsg`, past which dcrd disconnects the peer.  The
+/// port deliberately differs in value and in action: 40 MiB across a
+/// full default peer set is the same order of memory this budget exists
+/// to rule out, and a refused message is dropped and reported rather
+/// than ending the connection, since a peer that has stopped reading
+/// altogether is already cut off by the write deadline (the *Per-peer
+/// outbound queue* row of `PARITY.md`).  The charge is computed on
+/// enqueue and released when the output loop takes
 /// the message: exact arithmetic for the two messages that dominate any
 /// real queue (`MsgBlock` and `MsgTx`, whose ported `serialize_size`
 /// methods are cheap), and one measuring serialization for everything
@@ -709,6 +799,13 @@ where
 /// completed write contributes its byte delta and timestamp to the
 /// peer's send accounting (dcrd's `writeMessage` bookkeeping).
 ///
+/// Every ping is stamped as the outstanding one immediately before it
+/// is written, whoever queued it — the keepalive timer or the `ping`
+/// RPC's broadcast — so the answering pong is matched and its round
+/// trip excludes the time the ping spent waiting in the queue (dcrd's
+/// `outHandler` setting `lastPingNonce`/`lastPingTime` for every
+/// `MsgPing` it takes off the send queue).
+///
 /// Every message is reported to the stall detector just before it goes
 /// out, arming a deadline for the response it expects (dcrd's
 /// `sccSendMessage`, signalled from `outHandler` at the same point).
@@ -725,6 +822,14 @@ where
 {
     let mut write_total = transport.total_bytes_written();
     while let Ok(msg) = outbound.recv() {
+        // Setup ping statistics, first and under the peer lock alone,
+        // exactly where dcrd's `outHandler` does it.  Stamped before the
+        // write, so the pong cannot be read before its nonce is known.
+        if let Message::Ping(ping) = &msg {
+            peer.lock()
+                .expect("peer mutex poisoned")
+                .record_sent_ping(env, ping);
+        }
         // Arm the deadline before the write, and hold only the stall
         // lock while doing so: the send accounting below takes the peer
         // lock, and the input loop takes them in the opposite order.
@@ -742,8 +847,10 @@ where
                 // teardown: ending this loop shuts the socket down, and
                 // the connection's reason comes from the input loop,
                 // which by then sees only the resulting end of stream.
-                let label = peer.lock().expect("peer mutex poisoned").addr().to_string();
-                crate::logging::info(
+                // dcrd's `maybeAddDeadline` logs this at debug
+                // (`peer/peer.go:1113`).
+                let label = peer_log_label(&peer.lock().expect("peer mutex poisoned"));
+                crate::logging::debug(
                     "PEER",
                     &format!(
                         "Peer {label} exceeded max pending inventory announcements \
@@ -770,8 +877,10 @@ where
 }
 
 /// Send a ping to the peer every `interval` until shutdown is signalled
-/// or the outbound queue closes (dcrd's `pingHandler`).  Each ping gets
-/// a fresh nonce recorded on the peer so the answering pong can be timed.
+/// or the outbound queue closes (the ping ticker dcrd's `outHandler`
+/// owns).  Each tick queues a ping with a fresh nonce and nothing more:
+/// the output loop stamps it as the outstanding ping when it writes it,
+/// as dcrd's `outHandler` does for every `MsgPing` whoever queued it.
 ///
 /// A full queue does **not** end the timer.  The keepalive is what keeps
 /// a live-but-quiet peer from tripping the idle read deadline, so
@@ -781,7 +890,6 @@ where
 /// one tries again; only a closed queue (the connection tearing down)
 /// stops the timer.
 pub fn run_ping_timer<E: PeerEnv>(
-    peer: &Mutex<Peer>,
     env: &mut E,
     outbound: &OutboundQueue,
     interval: Duration,
@@ -791,29 +899,30 @@ pub fn run_ping_timer<E: PeerEnv>(
         // Wait a full interval unless shutdown arrives first.
         match shutdown.recv_timeout(interval) {
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let ping = MsgPing {
-                    nonce: env.rand_u64(),
-                };
-                // Hold the peer lock across the enqueue so the nonce is
-                // recorded before the input loop can process the pong
-                // answering it, and record it only when the ping is
-                // really on its way — dcrd stamps `lastPingNonce` in
-                // `outHandler`, immediately before the write, so a ping
-                // that never leaves never becomes the pending nonce.
-                let mut peer = peer.lock().expect("peer mutex poisoned");
-                match outbound.queue_message(Message::Ping(ping)) {
-                    Ok(()) => peer.record_sent_ping(env, &ping),
-                    Err(QueueError::Full) => {
-                        // Report without the peer lock held.
-                        drop(peer);
-                        outbound.report_full("ping");
-                    }
-                    Err(QueueError::Closed) => return,
+                if !queue_keepalive(env, outbound) {
+                    return;
                 }
             }
             // Shutdown signalled, or the signalling half was dropped.
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+/// Queue one keepalive ping (a tick of dcrd's ping ticker, `QueueMessage(
+/// wire.NewMsgPing(rand.Uint64()))`), returning false once the queue is
+/// closed.  A full queue skips the tick and reports it.
+fn queue_keepalive<E: PeerEnv>(env: &mut E, outbound: &OutboundQueue) -> bool {
+    let ping = MsgPing {
+        nonce: env.rand_u64(),
+    };
+    match outbound.queue_message(Message::Ping(ping)) {
+        Ok(()) => true,
+        Err(QueueError::Full) => {
+            outbound.report_full("ping");
+            true
+        }
+        Err(QueueError::Closed) => false,
     }
 }
 
@@ -873,25 +982,7 @@ pub fn run_stall_detector(
         // Wait a full tick unless shutdown arrives first.
         match shutdown.recv_timeout(tick) {
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let stalled = stall.lock().expect("stall mutex poisoned").check();
-                if let Some(reason) = stalled {
-                    crate::logging::info(
-                        "PEER",
-                        &format!(
-                            "Peer {peer_label} appears to be stalled or misbehaving \
-                             (reason: {}) -- disconnecting",
-                            reason.exceeded_text()
-                        ),
-                    );
-                    // Both, and in this order.  The flag is what the
-                    // input loop actually watches — `shutdown` on this
-                    // cloned handle does not reliably abort a `recv`
-                    // already in flight on the loop's own handle under
-                    // Winsock — while the socket shutdown still delivers
-                    // the FIN the remote is owed.
-                    // Both halves, in this order; see
-                    // `Teardown::disconnect`.
-                    conn.disconnect();
+                if let Some(reason) = check_stall(stall, conn, peer_label) {
                     return Some(reason);
                 }
             }
@@ -901,13 +992,93 @@ pub fn run_stall_detector(
     }
 }
 
-/// The peer state dcrd keeps in package globals: the id counter and the
-/// nonces of version messages this node has sent.
+/// Run one stall check (a tick of dcrd's `stallHandler`), disconnecting
+/// the peer and returning the stalled command when a pending response
+/// is past its adjusted deadline.
+fn check_stall(
+    stall: &Mutex<StallDetector>,
+    conn: &crate::transport::Teardown,
+    peer_label: &str,
+) -> Option<StallReason> {
+    let reason = stall.lock().expect("stall mutex poisoned").check()?;
+    crate::logging::info(
+        "PEER",
+        &format!(
+            "Peer {peer_label} appears to be stalled or misbehaving \
+             (reason: {}) -- disconnecting",
+            reason.exceeded_text()
+        ),
+    );
+    // Both halves, in this order: the flag is what the input loop
+    // actually watches, while the socket shutdown still delivers the
+    // FIN the remote is owed; see `Teardown::disconnect`.
+    conn.disconnect();
+    Some(reason)
+}
+
+/// Run a served connection's two timers on one thread until shutdown is
+/// signalled: the keepalive ping every `ping_interval` (dcrd's
+/// `outHandler` ticker, see [`run_ping_timer`]) and the stall check
+/// every `stall_tick` (dcrd's `stallHandler`, see
+/// [`run_stall_detector`]).
 ///
-/// Process-wide for the same reason dcrd's are — self-connection
-/// detection compares a nonce arriving on one connection against the
-/// nonces sent on all the others, so a per-connection cache can never
-/// match.
+/// dcrd's timers are goroutines, which cost nothing; each OS thread
+/// here is a real task against the process's thread limit, and both of
+/// these do nothing but sleep, so one thread wakes for whichever is due
+/// next.  Each keeps its own schedule and behaves exactly as when it
+/// ran alone: a congested ping tick is skipped, a closed queue stops
+/// the pings but not the stall checks, and a stall disconnects the peer
+/// and returns the stalled command.
+#[allow(clippy::too_many_arguments)] // The two timers' inputs, side by side.
+pub fn run_peer_timers<E: PeerEnv>(
+    env: &mut E,
+    outbound: &OutboundQueue,
+    ping_interval: Duration,
+    stall: &Mutex<StallDetector>,
+    conn: &crate::transport::Teardown,
+    peer_label: &str,
+    stall_tick: Duration,
+    shutdown: &mpsc::Receiver<()>,
+) -> Option<StallReason> {
+    // `None` is "never": an interval too long to represent as an
+    // instant, or a ping timer whose queue has closed.
+    let start = Instant::now();
+    let mut next_ping = start.checked_add(ping_interval);
+    let mut next_stall = start.checked_add(stall_tick);
+    loop {
+        let next = match (next_ping, next_stall) {
+            (Some(ping), Some(stall)) => Some(ping.min(stall)),
+            (ping, stall) => ping.or(stall),
+        };
+        let signal = match next {
+            Some(at) => shutdown.recv_timeout(at.saturating_duration_since(Instant::now())),
+            None => shutdown
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+        match signal {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
+                if next_stall.is_some_and(|at| now >= at) {
+                    if let Some(reason) = check_stall(stall, conn, peer_label) {
+                        return Some(reason);
+                    }
+                    next_stall = now.checked_add(stall_tick);
+                }
+                if next_ping.is_some_and(|at| now >= at) {
+                    next_ping = if queue_keepalive(env, outbound) {
+                        now.checked_add(ping_interval)
+                    } else {
+                        None
+                    };
+                }
+            }
+            // Shutdown signalled, or the signalling half was dropped.
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
 /// Bypass self-connection detection for in-process harnesses.
 ///
 /// The check compares an arriving nonce against every nonce this
@@ -919,6 +1090,13 @@ pub fn allow_self_connections() {
     peer_globals().set_allow_self_conns(true);
 }
 
+/// The peer state dcrd keeps in package globals: the id counter and the
+/// nonces of version messages this node has sent.
+///
+/// Process-wide for the same reason dcrd's are — self-connection
+/// detection compares a nonce arriving on one connection against the
+/// nonces sent on all the others, so a per-connection cache can never
+/// match.
 fn peer_globals() -> &'static PeerGlobals {
     static GLOBALS: std::sync::LazyLock<PeerGlobals> = std::sync::LazyLock::new(PeerGlobals::new);
     &GLOBALS
@@ -952,20 +1130,203 @@ where
     )
 }
 
+/// dcrd's `errHandshakeTimeout` text.
+const HANDSHAKE_TIMEOUT_TEXT: &str = "protocol handshake timeout";
+
+/// The version handshake's view of the connection: every read and write
+/// is bounded by what remains of one absolute deadline.
+///
+/// dcrd's `Handshake` runs the whole exchange inside one `select` on
+/// `time.After(negotiateTimeout)` (`peer/peer.go:2341-2354`) and
+/// disconnects when it fires, so the
+/// 30 seconds cover the handshake, not each message of it.  A budget
+/// re-armed per read let a peer spend up to 30 seconds on each of the
+/// version and verack reads, and on each of the three extra reads a
+/// legacy (pre-addrv2) peer is allowed before its verack, holding an
+/// admitted connection two to four times as long as dcrd would.  Each
+/// read here gets the time remaining, or the idle timeout if shorter
+/// (dcrd's `readMessage` arms `SetReadDeadline(now + IdleTimeout)`
+/// inside that select too); each write gets dcrd's write-stall bound,
+/// cut short by the same deadline.
+struct HandshakeTransport<'t, S> {
+    inner: &'t mut WireTransport<S>,
+    deadline: Instant,
+    idle_timeout: Duration,
+}
+
+impl<S> HandshakeTransport<'_, S> {
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+}
+
+impl<S: Read + Write + SocketTimeout> MsgTransport for HandshakeTransport<'_, S> {
+    fn read_message(&mut self) -> Result<Message, ReadError> {
+        let budget = self.remaining().min(self.idle_timeout);
+        self.inner.set_read_budget(Some(budget));
+        self.inner.read_message()
+    }
+
+    fn write_message(&mut self, msg: &Message) -> Result<(), String> {
+        let policy = WriteStallPolicy::dcrd();
+        self.inner.set_write_stall_policy(Some(WriteStallPolicy {
+            base: policy.base.min(self.remaining()),
+            ..policy
+        }));
+        let result = self.inner.write_message(msg);
+        self.inner.set_write_stall_policy(None);
+        result
+    }
+
+    fn set_protocol_version(&mut self, pver: u32) {
+        WireTransport::set_protocol_version(self.inner, pver);
+    }
+
+    fn total_bytes_read(&self) -> u64 {
+        self.inner.total_bytes_read()
+    }
+
+    fn total_bytes_written(&self) -> u64 {
+        self.inner.total_bytes_written()
+    }
+}
+
+/// Run the version handshake (inbound or outbound per the peer) within
+/// `negotiate_timeout` as a whole, firing `on_version` from inside it
+/// exactly where dcrd 2.2's `onVersion` callback runs, and return the
+/// remote version plus the messages a legacy peer sent before its
+/// verack.
+///
+/// A handshake still unfinished at the deadline fails with dcrd's
+/// `errHandshakeTimeout` text rather than with the read or write it
+/// interrupted, as dcrd's `select` does.  A wire violation already read
+/// is still reported as one, so the caller bans on it.
+fn negotiate_within<S, E>(
+    peer: &mut Peer,
+    transport: &mut WireTransport<S>,
+    env: &mut E,
+    on_version: &mut dyn FnMut(&Peer, &MsgVersion) -> Result<(), String>,
+    negotiate_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<(Box<MsgVersion>, Vec<Message>), NegotiateError>
+where
+    S: Read + Write + SocketTimeout,
+    E: PeerEnv,
+{
+    let now = Instant::now();
+    let mut bounded = HandshakeTransport {
+        inner: transport,
+        deadline: now.checked_add(negotiate_timeout).unwrap_or(now),
+        idle_timeout,
+    };
+    // Shared by every connection, because that is the only way the check
+    // it feeds can fire.  dcrd keeps `sentNonces` and `nodeCount` in
+    // package globals (`peer/peer.go:100-106`); a fresh set per connection
+    // means the outbound half holds only its own nonce and the inbound
+    // half checks against an empty set, so a node that dials itself
+    // completes the handshake and peers with itself.
+    let globals = peer_globals();
+    let negotiated = if peer.inbound() {
+        peer.negotiate_inbound_protocol(&mut bounded, env, globals, Some(on_version))
+    } else {
+        peer.negotiate_outbound_protocol(&mut bounded, env, globals, Some(on_version))
+    };
+    match negotiated {
+        Ok(outcome) => Ok((outcome.remote_version, outcome.delayed)),
+        Err(e) if !e.wire_violation && bounded.remaining().is_zero() => Err(NegotiateError {
+            message: HANDSHAKE_TIMEOUT_TEXT.to_string(),
+            kind: Some(NegotiateErrorKind::HandshakeTimeout),
+            remote_version: e.remote_version,
+            wire_violation: false,
+        }),
+        Err(e) => Err(e),
+    }
+}
+
+/// The error text of the transport's absolute read deadline expiring
+/// (`read_exact_by_deadline` in `transport.rs`), which is dcrd's read
+/// deadline timeout.
+const READ_TIMED_OUT_TEXT: &str = "read timed out";
+
+/// The error text of a read that found the stream closed
+/// (`read_exact_by_deadline` in `transport.rs`, and `std`'s
+/// `read_exact`), which is dcrd's `io.EOF`.
+const READ_EOF_TEXT: &str = "failed to fill whole buffer";
+
+/// The read error dcrd's `inHandler` would log, at error, as "Can't
+/// read message from %s: %v" for the way a connection's input loop
+/// ended, if any (`peer/peer.go:1556-1561` over `shouldHandleReadError`,
+/// `:1054`).
+///
+/// At the pin dcrd logs only failures of the wire codec.  Every failure
+/// of the socket read itself is silent: since `04fef0bf`,
+/// `wire.ReadMessageN` turns any short read into `io.EOF`
+/// (`wire/message.go:375-377`, `:457-459`), whether the remote closed
+/// the stream, the socket failed or the read deadline expired, and
+/// `shouldHandleReadError` declines `io.EOF`.  The same rewrite makes
+/// the "Peer %s no answer for %s -- disconnecting" warning that follows
+/// (`peer/peer.go:1563-1566`) unreachable: its `net.Error` timeout test
+/// never matches `io.EOF`, so an idle peer is dropped without a word and
+/// the warning is not ported.  Nothing is logged either when the local
+/// side is already disconnecting (`p.disconnect`, here the connection's
+/// teardown flag), and a ban that disconnected the peer ends the loop
+/// as [`DisconnectReason::Protocol`], not as a read error.
+///
+/// The transport reports failures as text, so the socket failures are
+/// told apart by its own messages: its deadline and closed-stream
+/// texts, and `std`'s rendering of an OS error with its `(os error N)`
+/// suffix.  A payload that runs out inside the message's structure is
+/// not a socket failure but a decode one, which dcrd's `BtcDecode`
+/// returns raw: `io.EOF` (silent) when the payload ends on a field
+/// boundary and `io.ErrUnexpectedEOF` (logged) when it ends inside a
+/// field.  The wire crate reports both as one error, which is logged.
+fn read_error_to_log(reason: &DisconnectReason, cancelled: bool) -> Option<&str> {
+    let DisconnectReason::ReadError(message) = reason else {
+        return None;
+    };
+    if cancelled {
+        return None;
+    }
+    match message.as_str() {
+        READ_TIMED_OUT_TEXT | READ_EOF_TEXT => None,
+        socket if socket.contains("(os error ") => None,
+        codec => Some(codec),
+    }
+}
+
+/// Drop a connection whose thread the OS refused, before the server has
+/// heard of it.  `std::thread::spawn` would have panicked instead, and
+/// release builds abort on a panic, so one peer arriving under thread
+/// exhaustion took the whole node down; dcrd's goroutines cannot fail
+/// to start.
+fn refuse_connection(
+    transport: &WireTransport<crate::transport::Teardown>,
+    label: &str,
+    err: &std::io::Error,
+) -> DisconnectReason {
+    crate::logging::warn(
+        "PEER",
+        &format!("Unable to start a thread for peer {label}: {err} -- disconnecting"),
+    );
+    transport.get_ref().disconnect();
+    DisconnectReason::ThreadRefused(err.to_string())
+}
+
 /// Run a peer connection from the negotiated handshake through the
-/// steady-state message loops until it disconnects (dcrd `peer.go`'s
-/// `start` plus the per-peer goroutine set, as OS threads).
+/// steady-state message loops until it disconnects (dcrd's `Handshake`
+/// then `serverPeer.Run` over `Peer.Run`, the goroutines as OS threads).
 ///
 /// The socket is split into read and write halves; the version handshake
-/// runs (inbound or outbound per the peer) before the loops start; then
-/// the output loop and the ping timer run on their own threads while the
-/// input loop runs on this thread, with the stall detector ticking on a
-/// fourth.  When the input loop ends the ping timer and the stall
-/// detector are signalled and the outbound queue is closed so the other
-/// threads finish, and all three are joined before returning the reason
-/// the connection stopped.  `idle_timeout` bounds each read so a silent
-/// peer eventually disconnects (dcrd's idle timer); `ping_interval`
-/// should be shorter so a live peer answers before that fires.
+/// runs (inbound or outbound per the peer) before the loops start,
+/// bounded as a whole by dcrd's negotiate timeout; then the output loop
+/// runs on its own thread, the keepalive ping and the stall detector
+/// share a second ([`run_peer_timers`]), and the input loop runs on this
+/// thread.  When the input loop ends the timer thread is signalled and
+/// the outbound queue is closed so the other threads finish, and both
+/// are joined before returning the reason the connection stopped.
+/// `idle_timeout` bounds each read so a silent peer eventually
+/// disconnects (dcrd's idle timer); `ping_interval` should be shorter so
+/// a live peer answers before that fires.
 ///
 /// The idle timer alone is not enough: a peer that keeps answering the
 /// keepalive pings while never serving the data it was asked for looks
@@ -973,6 +1334,11 @@ where
 /// forever.  `stall` is what bounds that — the pending responses are
 /// checked every `stall.tick` and the peer is disconnected once one has
 /// not arrived by its deadline (dcrd's `stallHandler`).
+///
+/// Both threads start before the server hears of the peer, as dcrd's
+/// `serverPeer.Run` starts `Peer.Run` before `AddPeer`, so a thread the
+/// OS refuses drops the connection with nothing to unwind
+/// ([`DisconnectReason::ThreadRefused`]).
 #[allow(clippy::too_many_arguments)] // Mirrors dcrd's connection surface.
 pub fn run_peer_connection_with_stall<H>(
     conn: crate::transport::Teardown,
@@ -1019,13 +1385,18 @@ where
         pver
     };
     let mut read_transport = WireTransport::new(conn, handshake_pver, net);
-    // The negotiate deadline bounds the handshake message read
-    // absolutely, so a peer dribbling bytes cannot stretch the
-    // handshake past it; dcrd's negotiation reads also run under the
-    // per-message idle deadline inside its 30-second select, so a
-    // configured idle timeout below the negotiate window bounds the
-    // read tighter, exactly as dcrd's does.
-    read_transport.set_read_budget(Some(negotiate_timeout.min(idle_timeout)));
+    // The connection's teardown signal, installed before the handshake.
+    // The read budgets are seconds to minutes long, so without something
+    // the reader polls, a peer this node has decided to drop stays
+    // parked in its receive until that budget runs out — the socket
+    // shutdown the other loops perform cannot be relied on to cut it
+    // short across platforms.  The flag was minted with the socket, so
+    // raising it is the same act for the server's disconnect paths
+    // (shutdown's `disconnect_all` included, mid-handshake) as for this
+    // connection's own loops: dcrd's `Peer.Disconnect` reaches every
+    // teardown because the conn is the shared object, and here the
+    // `Teardown` is.
+    read_transport.set_cancel(cancel.clone());
     let mut write_transport = WireTransport::new(write_stream, handshake_pver, net);
     // Every send is bounded so a peer that stops reading its socket is
     // disconnected instead of parking the writer thread with the
@@ -1044,34 +1415,20 @@ where
     }
 
     // Run the handshake (version and verack exchange) before starting
-    // the loops, firing the server's version listener from inside it
-    // exactly where dcrd 2.2's `onVersion` callback runs.  The read
-    // transport is full duplex, so it also writes the local messages.
+    // the loops, firing the server's version listener from inside it.
+    // The read transport is full duplex, so it also writes the local
+    // messages.
     let mut env = NodePeerEnv::new();
-    // Shared by every connection, because that is the only way the check
-    // it feeds can fire.  dcrd keeps `sentNonces` and `nodeCount` in
-    // package globals (`peer/peer.go:100-106`); a fresh set per connection
-    // means the outbound half holds only its own nonce and the inbound
-    // half checks against an empty set, so a node that dials itself
-    // completes the handshake and peers with itself.
-    let globals = peer_globals();
-    let outcome = {
-        let mut on_version = |p: &Peer, msg: &dcroxide_wire::MsgVersion| hooks.on_version(p, msg);
-        let negotiated = if peer.inbound() {
-            peer.negotiate_inbound_protocol(
-                &mut read_transport,
-                &mut env,
-                globals,
-                Some(&mut on_version),
-            )
-        } else {
-            peer.negotiate_outbound_protocol(
-                &mut read_transport,
-                &mut env,
-                globals,
-                Some(&mut on_version),
-            )
-        };
+    let (remote_version, delayed) = {
+        let mut on_version = |p: &Peer, msg: &MsgVersion| hooks.on_version(p, msg);
+        let negotiated = negotiate_within(
+            &mut peer,
+            &mut read_transport,
+            &mut env,
+            &mut on_version,
+            negotiate_timeout,
+            idle_timeout,
+        );
         match negotiated {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -1082,15 +1439,16 @@ where
                 // `serverPeer.OnRead` bans on any `wire.ErrorCode` with
                 // no handshake-state guard (`server.go:1851-1857`).
                 // Without this a peer could violate the protocol
-                // indefinitely by never completing a handshake.
+                // indefinitely by never completing a handshake.  The
+                // failed handshake is reported the same way whether or
+                // not the ban disconnected (`server.go:2290-2293`).
                 if e.wire_violation {
-                    hooks.on_wire_violation(&e.message);
+                    let _ = hooks.on_wire_violation(&e.message);
                 }
                 return DisconnectReason::Negotiate(e.message);
             }
         }
     };
-    let remote_version = outcome.remote_version;
 
     // Frame the rest of the session at the negotiated version (dcrd
     // re-reads the peer's protocol version on every message).
@@ -1103,17 +1461,6 @@ where
     // absolute per-message bound (dcrd's readMessage arming
     // SetReadDeadline(now + IdleTimeout) before every read).
     read_transport.set_read_budget(Some(idle_timeout));
-
-    // The connection's teardown signal.  The idle budget above is
-    // minutes long, so without something the reader polls, a peer this
-    // node has decided to drop stays parked in its receive until that
-    // budget runs out — the socket shutdown the other loops perform
-    // cannot be relied on to cut it short across platforms.  The flag
-    // was minted with the socket, so raising it is the same act for the
-    // server's disconnect paths as for this connection's own loops:
-    // dcrd's `Peer.Disconnect` reaches every teardown because the conn
-    // is the shared object, and here the `Teardown` is.
-    read_transport.set_cancel(cancel.clone());
 
     // Fold the handshake's traffic into the peer's counters: dcrd's
     // negotiation reads and writes go through the same counted
@@ -1129,35 +1476,19 @@ where
         peer.record_send(handshake_written, handshake_now);
     }
 
-    // Share the peer across the loops and request all block
-    // announcements via full headers instead of the inv message (dcrd
-    // `serverPeer.Run` queueing `NewMsgSendHeaders` after the
-    // handshake).
+    // How dcrd's peer logging names this peer, for every line below.
+    let label = peer_log_label(&peer);
     let peer = Arc::new(Mutex::new(peer));
     let (outbound, receiver) = OutboundQueue::channel();
     // Name the queue so a congestion report identifies the peer, and
     // frame its byte charges at the negotiated version the write
     // transport uses.
-    outbound.set_peer_label(peer.lock().expect("peer mutex poisoned").addr().to_string());
+    outbound.set_peer_label(label.clone());
     outbound.set_wire_params(negotiated_pver, net);
-    // The queue is empty here, so this cannot fail with
-    // [`QueueError::Full`]; a failure is a closed queue.
-    if outbound.queue_message(Message::SendHeaders).is_err() {
-        return DisconnectReason::LocalShutdown;
-    }
-
-    // The handshake is complete: hand the peer to the server's
-    // lifecycle hook (dcrd `AddPeer` signalling the sync manager).
-    hooks.on_connected(
-        &mut peer.lock().expect("peer mutex poisoned"),
-        &peer,
-        &outbound,
-        remote_version.disable_relay_tx,
-    );
 
     // The stall state the three loops share: the output loop arms the
     // deadlines, the input loop settles them and brackets the
-    // callbacks, and the stall thread checks them (dcrd's stall control
+    // callbacks, and the timer thread checks them (dcrd's stall control
     // channel into `stallHandler`).
     let stall_state = Arc::new(Mutex::new(StallDetector::with_response_timeout(
         i64::try_from(stall.response_timeout.as_nanos()).unwrap_or(i64::MAX),
@@ -1165,7 +1496,7 @@ where
 
     let output_peer = Arc::clone(&peer);
     let output_stall = Arc::clone(&stall_state);
-    let output = thread::spawn(move || {
+    let output = crate::runtime::spawn_conn_thread("peer-output", move || {
         let mut output_env = NodePeerEnv::new();
         let reason = run_peer_output_with_stall(
             &output_peer,
@@ -1174,11 +1505,12 @@ where
             receiver,
             Some(&output_stall),
         );
-        // End the connection when the output loop ends (a write error or
-        // a closed queue): raise the flag the input loop polls, and shut
-        // the socket down so the remote gets its FIN.  The flag is the
-        // half that makes the input loop return promptly; see
-        // `run_stall_detector`.
+        // A failed write is not logged.  dcrd's `outHandler` has the
+        // line ("Failed to send message to %s", `peer/peer.go:1792`),
+        // but it calls `Disconnect` first (`:1790`), and
+        // `shouldLogWriteError` then always declines on the disconnect
+        // flag that just went up (`:1744`).
+        //
         // End the connection when the output loop ends (a write error
         // or a closed queue).  One call raises the flag the input loop
         // polls and shuts the socket so the remote gets its FIN; see
@@ -1186,66 +1518,90 @@ where
         write_transport.get_ref().disconnect();
         reason
     });
+    let output = match output {
+        Ok(output) => output,
+        Err(e) => return refuse_connection(&read_transport, &label, &e),
+    };
 
-    let (ping_shutdown, ping_shutdown_rx) = mpsc::channel();
-    let ping_peer = Arc::clone(&peer);
-    let ping_outbound = outbound.clone();
-    let ping = thread::spawn(move || {
-        let mut ping_env = NodePeerEnv::new();
-        run_ping_timer(
-            &ping_peer,
-            &mut ping_env,
-            &ping_outbound,
-            ping_interval,
-            &ping_shutdown_rx,
-        );
-    });
-
-    // Watch the pending responses on a fourth thread: a peer that keeps
-    // the connection alive while never serving what it was asked for is
-    // disconnected instead of pinning the request slots forever (dcrd's
-    // `stallHandler`).
-    let (stall_shutdown, stall_shutdown_rx) = mpsc::channel();
-    let stall_label = peer.lock().expect("peer mutex poisoned").addr().to_string();
+    // The keepalive ping and the stall detector share one thread: a peer
+    // that keeps the connection alive while never serving what it was
+    // asked for is disconnected instead of pinning the request slots
+    // forever (dcrd's `stallHandler`).
+    let (timer_shutdown, timer_shutdown_rx) = mpsc::channel();
+    let timer_outbound = outbound.clone();
+    let timer_stall = Arc::clone(&stall_state);
+    let timer_label = label.clone();
     let stall_tick = stall.tick;
-    let stall_thread_state = Arc::clone(&stall_state);
-    let stall_thread = thread::spawn(move || {
-        run_stall_detector(
-            &stall_thread_state,
+    let timers = crate::runtime::spawn_conn_thread("peer-timers", move || {
+        let mut timer_env = NodePeerEnv::new();
+        run_peer_timers(
+            &mut timer_env,
+            &timer_outbound,
+            ping_interval,
+            &timer_stall,
             &stall_stream,
-            &stall_label,
+            &timer_label,
             stall_tick,
-            &stall_shutdown_rx,
+            &timer_shutdown_rx,
         )
     });
+    let timers = match timers {
+        Ok(timers) => timers,
+        Err(e) => {
+            let reason = refuse_connection(&read_transport, &label, &e);
+            // Closing the queue ends the output loop; join it so no
+            // thread outlives the connection.
+            drop(outbound);
+            let _ = output.join();
+            return reason;
+        }
+    };
 
-    // Drive the input loop on this thread until the peer disconnects.
-    let reason = run_peer_input_with_stall(
-        &peer,
-        &mut read_transport,
-        &mut env,
-        &outbound,
-        &mut hooks,
-        outcome.delayed,
-        Some(&stall_state),
-    );
+    // Request all block announcements via full headers instead of the
+    // inv message (dcrd `serverPeer.Run` queueing `NewMsgSendHeaders`
+    // before `AddPeer`).  The queue is empty here, so this cannot fail
+    // with [`QueueError::Full`]; a failure is a closed queue.
+    let reason = if outbound.queue_message(Message::SendHeaders).is_err() {
+        DisconnectReason::LocalShutdown
+    } else {
+        // The handshake is complete: hand the peer to the server's
+        // lifecycle hook (dcrd `AddPeer` signalling the sync manager),
+        // unlocked (see [`ServeHooks::on_connected`]).
+        hooks.on_connected(&peer, &outbound, remote_version.disable_relay_tx);
 
-    // The connection is winding down (dcrd `DonePeer`).
-    hooks.on_disconnected(&mut peer.lock().expect("peer mutex poisoned"));
+        // Drive the input loop on this thread until the peer disconnects.
+        let reason = run_peer_input_with_stall(
+            &peer,
+            &mut read_transport,
+            &mut env,
+            &outbound,
+            &mut hooks,
+            delayed,
+            Some(&stall_state),
+        );
+        // dcrd's `inHandler` logs the failed read before it disconnects,
+        // so the flag still says whether something else ended the
+        // connection first.
+        if let Some(err) = read_error_to_log(&reason, cancel.is_cancelled()) {
+            crate::logging::error("PEER", &format!("Can't read message from {label}: {err}"));
+        }
+
+        // The connection is winding down (dcrd `DonePeer`).
+        hooks.on_disconnected(&peer);
+        reason
+    };
 
     // Tear down: shut the socket down so the output loop's blocking write
     // unblocks (a peer that stopped reading would otherwise wedge it),
-    // stop the ping timer and the stall detector, and close the outbound
-    // queue, then join the three threads.
+    // stop the timers, and close the outbound queue, then join both
+    // threads.
     read_transport.get_ref().disconnect();
-    let _ = ping_shutdown.send(());
-    let _ = stall_shutdown.send(());
+    let _ = timer_shutdown.send(());
     drop(outbound);
-    let _ = ping.join();
     let _ = output.join();
     // A stall is the real reason the connection ended; the input loop
     // only saw the socket the detector shut down under it.
-    match stall_thread.join() {
+    match timers.join() {
         Ok(Some(command)) => DisconnectReason::Protocol(
             format!("peer appears to be stalled or misbehaving, {command} timeout").into(),
         ),
@@ -1352,5 +1708,610 @@ mod tests {
             ip: [0u8; 16],
             port: 0,
         }
+    }
+
+    const NET: CurrencyNet = CurrencyNet::TEST_NET3;
+    const NEVER: Duration = Duration::from_secs(3600);
+
+    fn loopback_config(name: &str) -> Config {
+        Config {
+            net: NET,
+            services: dcroxide_wire::ServiceFlag(1),
+            user_agent_name: name.to_string(),
+            user_agent_version: "0.1.0".to_string(),
+            protocol_version: 0,
+            ..Config::default()
+        }
+    }
+
+    /// A connected loopback pair: the accepted (server) end as a
+    /// teardown handle with its remote address, and the dialing end.
+    fn loopback_pair() -> (
+        crate::transport::Teardown,
+        std::net::SocketAddr,
+        std::net::TcpStream,
+    ) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let client =
+            std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("dial");
+        let (server, remote) = listener.accept().expect("accept");
+        (crate::transport::Teardown::new(server), remote, client)
+    }
+
+    /// An inbound peer associated with the accepted address, the way
+    /// `serve_inbound_peer` builds one.
+    fn inbound_peer(remote: std::net::SocketAddr) -> Peer {
+        let mut peer = Peer::new_inbound(loopback_config("dcroxide-in"));
+        let na = crate::peerconn::net_address_v2_from_socket(remote, dcroxide_wire::ServiceFlag(0))
+            .expect("net address");
+        peer.associate(&remote.to_string(), na, 0);
+        peer
+    }
+
+    /// Complete the outbound half of the version handshake on the
+    /// dialing end, returning its framed transport.
+    fn client_handshake(client: std::net::TcpStream) -> WireTransport<std::net::TcpStream> {
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let addr = client.peer_addr().expect("peer addr").to_string();
+        let mut transport = WireTransport::new(client, MAX_PROTOCOL_VERSION, NET);
+        let mut peer =
+            Peer::new_outbound(loopback_config("dcroxide-out"), &addr).expect("outbound peer");
+        peer.negotiate_outbound_protocol(
+            &mut transport,
+            &mut NodePeerEnv::new(),
+            &PeerGlobals::new(),
+            None,
+        )
+        .expect("outbound negotiation");
+        transport
+    }
+
+    /// Serve hooks whose handler blocks on a ping with nonce 1, after
+    /// queueing two pongs, until the test releases it: a stand-in for
+    /// a block handler waiting out another peer's validation.  With
+    /// `block_connect`, the connection hook blocks the same way, after
+    /// queueing a pong with nonce 201: a stand-in for `AddPeer` waiting
+    /// on the sync manager.
+    struct BlockingHooks {
+        handle: Arc<Mutex<Option<Arc<Mutex<Peer>>>>>,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+        connected: Arc<std::sync::atomic::AtomicBool>,
+        block_connect: bool,
+    }
+
+    impl ServeHooks for BlockingHooks {
+        fn on_connected(
+            &mut self,
+            peer: &Arc<Mutex<Peer>>,
+            outbound: &OutboundQueue,
+            _remote_disable_relay_tx: bool,
+        ) {
+            self.connected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            *self.handle.lock().expect("handle slot") = Some(Arc::clone(peer));
+            if self.block_connect {
+                assert!(outbound.try_queue(Message::Pong(MsgPong { nonce: 201 })));
+                let _ = self.entered.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(20));
+            }
+        }
+
+        fn on_message(
+            &mut self,
+            _peer: &Mutex<Peer>,
+            msg: Message,
+            _mix_hash: Option<dcroxide_chainhash::Hash>,
+            outbound: &OutboundQueue,
+        ) -> ServeSignal {
+            if matches!(msg, Message::Ping(ping) if ping.nonce == 1) {
+                assert!(outbound.try_queue(Message::Pong(MsgPong { nonce: 101 })));
+                assert!(outbound.try_queue(Message::Pong(MsgPong { nonce: 102 })));
+                let _ = self.entered.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(20));
+            }
+            ServeSignal::Continue
+        }
+    }
+
+    /// A handler blocked in the server leaves the peer unlocked: the
+    /// output loop keeps writing and anything else can read the peer,
+    /// as dcrd's `outHandler` keeps writing while `inHandler` blocks.
+    /// Holding the peer across the handler stopped the output loop
+    /// after one write, so the second and third pongs never left.
+    #[test]
+    fn a_blocked_handler_does_not_hold_the_peer() {
+        let (conn, remote, client) = loopback_pair();
+        let handle = Arc::new(Mutex::new(None));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let hooks = BlockingHooks {
+            handle: Arc::clone(&handle),
+            entered: entered_tx,
+            release: release_rx,
+            connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            block_connect: false,
+        };
+        let server = std::thread::spawn(move || {
+            run_peer_connection(
+                conn,
+                inbound_peer(remote),
+                0,
+                NET,
+                NEVER,
+                NEVER,
+                None,
+                hooks,
+            )
+        });
+
+        let mut transport = client_handshake(client);
+        transport
+            .write_message(&Message::Ping(MsgPing { nonce: 1 }))
+            .expect("send ping");
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the handler runs");
+
+        // Every pong reaches the wire while the handler is still blocked.
+        let mut pongs = Vec::new();
+        while !pongs.contains(&102) {
+            match transport.read_message() {
+                Ok(Message::Pong(pong)) => pongs.push(pong.nonce),
+                Ok(_) => {}
+                Err(e) => panic!("the output loop stalled behind the handler: {e}"),
+            }
+        }
+        assert_eq!(pongs, vec![1, 101, 102]);
+
+        // And the peer can be locked from another thread meanwhile.
+        let peer = handle
+            .lock()
+            .expect("handle slot")
+            .clone()
+            .expect("the peer was registered");
+        let (locked_tx, locked_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = peer
+                .lock()
+                .map(|peer| locked_tx.send(peer.addr().to_string()));
+        });
+        assert_eq!(
+            locked_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(remote.to_string()),
+            "the peer must be lockable while the handler blocks"
+        );
+
+        release_tx.send(()).expect("release the handler");
+        drop(transport);
+        let reason = server.join().expect("server thread");
+        assert!(
+            matches!(reason, DisconnectReason::ReadError(_)),
+            "the client closing ends the connection: {reason:?}"
+        );
+    }
+
+    /// The connection hook runs with the peer unlocked too, as dcrd's
+    /// `AddPeer` holds no peer lock.  The server registers the peer and
+    /// then waits on the sync manager, which another peer's block
+    /// validation can hold for seconds; holding the peer across that
+    /// stalled `getpeerinfo` and outbound handshakes' mixing counts
+    /// behind the registered peer, and stopped the output loop after
+    /// its first write.
+    #[test]
+    fn a_blocked_connection_hook_does_not_hold_the_peer() {
+        let (conn, remote, client) = loopback_pair();
+        let handle = Arc::new(Mutex::new(None));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let hooks = BlockingHooks {
+            handle: Arc::clone(&handle),
+            entered: entered_tx,
+            release: release_rx,
+            connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            block_connect: true,
+        };
+        let server = std::thread::spawn(move || {
+            run_peer_connection(
+                conn,
+                inbound_peer(remote),
+                0,
+                NET,
+                NEVER,
+                NEVER,
+                None,
+                hooks,
+            )
+        });
+
+        let mut transport = client_handshake(client);
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the connection hook runs");
+
+        // The sendheaders queued before the hook and the pong queued
+        // inside it both reach the wire while the hook is blocked.
+        let mut seen = Vec::new();
+        loop {
+            match transport.read_message() {
+                Ok(Message::Pong(MsgPong { nonce: 201 })) => break,
+                Ok(msg) => seen.push(msg),
+                Err(e) => panic!("the output loop stalled behind the connection hook: {e}"),
+            }
+        }
+        assert!(seen.contains(&Message::SendHeaders), "{seen:?}");
+
+        // And the registered peer can be locked from another thread.
+        let peer = handle
+            .lock()
+            .expect("handle slot")
+            .clone()
+            .expect("the peer was registered");
+        let (locked_tx, locked_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = peer
+                .lock()
+                .map(|peer| locked_tx.send(peer.addr().to_string()));
+        });
+        assert_eq!(
+            locked_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(remote.to_string()),
+            "the peer must be lockable while the connection hook blocks"
+        );
+
+        release_tx.send(()).expect("release the hook");
+        drop(transport);
+        let reason = server.join().expect("server thread");
+        assert!(
+            matches!(reason, DisconnectReason::ReadError(_)),
+            "the client closing ends the connection: {reason:?}"
+        );
+    }
+
+    /// The output loop stamps every ping it writes as the outstanding
+    /// one, whoever queued it (dcrd's `outHandler`); a ping queued by
+    /// the `ping` RPC's broadcast rather than the keepalive timer used
+    /// to go out unrecorded, so its pong was ignored.
+    #[test]
+    fn a_ping_is_stamped_when_written_whoever_queued_it() {
+        let (conn, _remote, client) = loopback_pair();
+        let peer = Arc::new(Mutex::new(Peer::new_inbound(loopback_config("dcroxide"))));
+        let (queue, receiver) = OutboundQueue::channel();
+        queue
+            .queue_message(Message::Ping(MsgPing { nonce: 77 }))
+            .expect("queue the ping");
+        drop(queue);
+
+        let writer_peer = Arc::clone(&peer);
+        let writer = std::thread::spawn(move || {
+            let mut transport = WireTransport::new(conn, MAX_PROTOCOL_VERSION, NET);
+            run_peer_output(
+                &writer_peer,
+                &mut transport,
+                &mut NodePeerEnv::new(),
+                receiver,
+            )
+        });
+        let mut reader = WireTransport::new(client, MAX_PROTOCOL_VERSION, NET);
+        assert_eq!(
+            reader.read_message().expect("read the ping"),
+            Message::Ping(MsgPing { nonce: 77 })
+        );
+        let _ = writer.join().expect("writer thread");
+
+        let mut guard = peer.lock().expect("peer mutex");
+        assert_eq!(
+            guard.last_ping_nonce(),
+            77,
+            "the written ping is outstanding"
+        );
+        // Its pong is then matched and clears it.
+        guard.handle_pong_msg(&mut NodePeerEnv::new(), &MsgPong { nonce: 77 });
+        assert_eq!(guard.last_ping_nonce(), 0);
+    }
+
+    /// Writes each message only after a pause, so a handshake can be
+    /// made to straddle a deadline one message at a time.
+    struct SlowWrites<T> {
+        inner: T,
+        pause: Duration,
+    }
+
+    impl<T: MsgTransport> MsgTransport for SlowWrites<T> {
+        fn read_message(&mut self) -> Result<Message, ReadError> {
+            self.inner.read_message()
+        }
+
+        fn write_message(&mut self, msg: &Message) -> Result<(), String> {
+            std::thread::sleep(self.pause);
+            self.inner.write_message(msg)
+        }
+
+        fn set_protocol_version(&mut self, pver: u32) {
+            self.inner.set_protocol_version(pver);
+        }
+    }
+
+    /// The negotiate timeout bounds the whole handshake, as dcrd's
+    /// single `select` on `time.After(negotiateTimeout)` does, not each
+    /// read.  Each of the remote's two messages here arrives well within
+    /// the timeout of the read waiting for it, but the verack comes
+    /// after the handshake's deadline, so the handshake fails with
+    /// dcrd's `errHandshakeTimeout` text; a budget re-armed per read
+    /// accepted it.
+    #[test]
+    fn the_negotiate_timeout_bounds_the_whole_handshake() {
+        const NEGOTIATE: Duration = Duration::from_millis(600);
+        const PAUSE: Duration = Duration::from_millis(400);
+
+        let (conn, remote, client) = loopback_pair();
+        let dialer = std::thread::spawn(move || {
+            let addr = client.peer_addr().expect("peer addr").to_string();
+            let mut transport = SlowWrites {
+                inner: WireTransport::new(client, MAX_PROTOCOL_VERSION, NET),
+                pause: PAUSE,
+            };
+            let mut peer =
+                Peer::new_outbound(loopback_config("dcroxide-out"), &addr).expect("outbound");
+            // The server gives up first, so this side's outcome is moot.
+            let _ = peer.negotiate_outbound_protocol(
+                &mut transport,
+                &mut NodePeerEnv::new(),
+                &PeerGlobals::new(),
+                None,
+            );
+        });
+
+        let mut peer = inbound_peer(remote);
+        let mut transport = WireTransport::new(conn, MAX_PROTOCOL_VERSION, NET);
+        let started = Instant::now();
+        let outcome = negotiate_within(
+            &mut peer,
+            &mut transport,
+            &mut NodePeerEnv::new(),
+            &mut |_: &Peer, _: &MsgVersion| Ok(()),
+            NEGOTIATE,
+            NEVER,
+        );
+        let elapsed = started.elapsed();
+        match outcome {
+            Ok(_) => panic!("a handshake finishing after the deadline must fail"),
+            Err(e) => {
+                assert_eq!(e.message, "protocol handshake timeout");
+                assert_eq!(e.kind, Some(NegotiateErrorKind::HandshakeTimeout));
+                assert!(!e.wire_violation);
+            }
+        }
+        assert!(
+            elapsed < NEGOTIATE + PAUSE / 2,
+            "the handshake must end at its deadline, not a read budget later: {elapsed:?}"
+        );
+        drop(transport);
+        dialer.join().expect("dialer thread");
+    }
+
+    /// dcrd's `inHandler` logging decisions for the read that ended a
+    /// connection, over the texts the transport really produces.  At the
+    /// pin only a codec failure is logged: every socket failure, the
+    /// idle deadline included, reaches `inHandler` as `io.EOF`.
+    #[test]
+    fn read_failures_are_logged_as_dcrd_logs_them() {
+        use std::io::Write as _;
+
+        let read_error = |e: ReadError| DisconnectReason::ReadError(e.message);
+
+        // A real idle expiry, so the timeout text cannot drift from the
+        // transport's.  dcrd neither logs "Can't read message" nor its
+        // unreachable "no answer" warning for it.
+        let (conn, _remote, client) = loopback_pair();
+        let mut transport = WireTransport::new(conn, MAX_PROTOCOL_VERSION, NET);
+        transport.set_read_budget(Some(Duration::from_millis(50)));
+        let timed_out = read_error(transport.read_message().expect_err("nothing arrives"));
+        assert_eq!(read_error_to_log(&timed_out, false), None);
+
+        // The remote closing the stream is `io.EOF` too.
+        drop(client);
+        let closed = read_error(transport.read_message().expect_err("the stream is closed"));
+        assert_eq!(read_error_to_log(&closed, false), None);
+
+        // A frame the codec rejects is logged; with the local side
+        // already tearing down, nothing is.
+        let (conn, _remote, mut client) = loopback_pair();
+        let mut transport = WireTransport::new(conn, MAX_PROTOCOL_VERSION, NET);
+        transport.set_read_budget(Some(Duration::from_secs(5)));
+        client
+            .write_all(&[0u8; MESSAGE_HEADER_SIZE])
+            .expect("write junk");
+        let rejected = transport.read_message().expect_err("a bad header");
+        assert!(rejected.wire_violation, "{}", rejected.message);
+        let text = rejected.message.clone();
+        let rejected = read_error(rejected);
+        assert_eq!(read_error_to_log(&rejected, false), Some(text.as_str()));
+        assert_eq!(read_error_to_log(&rejected, true), None);
+
+        // A socket error from the OS.
+        let reset = DisconnectReason::ReadError(std::io::Error::from_raw_os_error(104).to_string());
+        assert_eq!(read_error_to_log(&reset, false), None);
+    }
+
+    /// Hooks whose server answers a wire violation with `answer`.
+    struct ViolationHooks {
+        answer: ServeSignal,
+        seen: usize,
+    }
+
+    impl ServeHooks for ViolationHooks {
+        fn on_wire_violation(&mut self, _err: &str) -> ServeSignal {
+            self.seen = self.seen.saturating_add(1);
+            self.answer.clone()
+        }
+
+        fn on_message(
+            &mut self,
+            _peer: &Mutex<Peer>,
+            _msg: Message,
+            _mix_hash: Option<dcroxide_chainhash::Hash>,
+            _outbound: &OutboundQueue,
+        ) -> ServeSignal {
+            ServeSignal::Continue
+        }
+    }
+
+    /// A wire violation whose ban disconnects the peer is not logged as
+    /// a failed read: dcrd's `OnRead` bans from inside `readMessage`, and
+    /// `BanPeer`'s `Disconnect` is in place before `inHandler` asks
+    /// `shouldHandleReadError`.  One the server declines to ban (banning
+    /// disabled, a whitelisted peer) disconnects nothing, so dcrd logs
+    /// it, and so does the port.
+    #[test]
+    fn a_banned_wire_violation_is_not_logged_as_a_failed_read() {
+        use std::io::Write as _;
+
+        let banned: std::borrow::Cow<'static, str> = "sent malformed wire message: x".into();
+        for (answer, logged) in [
+            (ServeSignal::Disconnect(banned.clone()), false),
+            (ServeSignal::Continue, true),
+        ] {
+            let (conn, _remote, mut client) = loopback_pair();
+            let mut transport = WireTransport::new(conn, MAX_PROTOCOL_VERSION, NET);
+            transport.set_read_budget(Some(Duration::from_secs(5)));
+            client
+                .write_all(&[0u8; MESSAGE_HEADER_SIZE])
+                .expect("write junk");
+            let mut hooks = ViolationHooks {
+                answer: answer.clone(),
+                seen: 0,
+            };
+            let (queue, _receiver) = OutboundQueue::channel();
+            let reason = run_peer_input(
+                &Mutex::new(test_peer()),
+                &mut transport,
+                &mut NodePeerEnv::new(),
+                &queue,
+                &mut hooks,
+                Vec::new(),
+            );
+            assert_eq!(hooks.seen, 1, "the violation reaches the server");
+            assert_eq!(
+                read_error_to_log(&reason, false).is_some(),
+                logged,
+                "{answer:?}: {reason:?}"
+            );
+            if !logged {
+                assert!(
+                    matches!(&reason, DisconnectReason::Protocol(r) if *r == banned),
+                    "the ban ends the connection: {reason:?}"
+                );
+            }
+        }
+    }
+
+    /// dcrd's `Peer.String`: the address and the direction.
+    #[test]
+    fn peers_are_labelled_with_their_direction() {
+        let (_conn, remote, _client) = loopback_pair();
+        assert_eq!(
+            peer_log_label(&inbound_peer(remote)),
+            format!("{remote} (inbound)")
+        );
+        let outbound = Peer::new_outbound(loopback_config("x"), "10.0.0.1:9108").expect("peer");
+        assert!(peer_log_label(&outbound).ends_with(" (outbound)"));
+    }
+
+    /// The keepalive ping and the stall check share one thread, each on
+    /// its own schedule: pings keep being queued, and a response past
+    /// its deadline ends the connection with the stalled command.
+    #[test]
+    fn one_timer_thread_pings_and_detects_stalls() {
+        let (conn, _remote, _client) = loopback_pair();
+        let flag = conn.cancel();
+        let (queue, receiver) = OutboundQueue::channel();
+        let stall = Mutex::new(StallDetector::with_response_timeout(
+            Duration::from_millis(300).as_nanos() as i64,
+        ));
+        let armed = stall
+            .lock()
+            .expect("stall mutex")
+            .sent_message(&Message::GetInitState(dcroxide_wire::MsgGetInitState {
+                types: Vec::new(),
+            }));
+        assert_eq!(armed, ArmOutcome::Armed);
+        let (_shutdown_tx, shutdown_rx) = mpsc::channel();
+
+        let started = Instant::now();
+        let reason = run_peer_timers(
+            &mut NodePeerEnv::new(),
+            &queue,
+            Duration::from_millis(40),
+            &stall,
+            &conn,
+            "test (inbound)",
+            Duration::from_millis(25),
+            &shutdown_rx,
+        );
+        assert!(
+            matches!(reason, Some(StallReason::Command(_))),
+            "the overdue response stalls: {reason:?}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(flag.is_cancelled(), "the stall tears the connection down");
+        let pings = std::iter::from_fn(|| receiver.try_recv().ok())
+            .filter(|msg| matches!(msg, Message::Ping(_)))
+            .count();
+        assert!(pings >= 3, "the pings kept coming meanwhile: {pings}");
+    }
+
+    /// A thread the OS refuses drops the connection before the server
+    /// hears of it, instead of panicking (which aborts a release build).
+    #[test]
+    fn a_refused_thread_drops_the_connection() {
+        use std::io::Read as _;
+
+        let (conn, remote, client) = loopback_pair();
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (entered_tx, _entered_rx) = mpsc::channel();
+        let (_release_tx, release_rx) = mpsc::channel();
+        let hooks = BlockingHooks {
+            handle: Arc::new(Mutex::new(None)),
+            entered: entered_tx,
+            release: release_rx,
+            connected: Arc::clone(&connected),
+            block_connect: false,
+        };
+        let server = std::thread::spawn(move || {
+            crate::runtime::REFUSE_CONN_THREADS.with(|refuse| refuse.set(true));
+            run_peer_connection(
+                conn,
+                inbound_peer(remote),
+                0,
+                NET,
+                NEVER,
+                NEVER,
+                None,
+                hooks,
+            )
+        });
+
+        let transport = client_handshake(client);
+        // The remote gets its FIN, not a session.
+        let mut stream = transport.into_inner();
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            stream.read(&mut buf).expect("read"),
+            0,
+            "the connection is dropped"
+        );
+        drop(stream);
+        let reason = server.join().expect("the server must not panic");
+        assert!(
+            matches!(reason, DisconnectReason::ThreadRefused(_)),
+            "{reason:?}"
+        );
+        assert!(
+            !connected.load(std::sync::atomic::Ordering::SeqCst),
+            "the server never hears of a peer it cannot serve"
+        );
     }
 }

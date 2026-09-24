@@ -24,6 +24,7 @@ use crate::rpcerrors::{
 };
 use crate::server::{RpcChain, Server};
 use crate::txresults;
+use crate::txresults::hex_str;
 
 /// Go `wire.MaxTxInSequenceNum`.
 const MAX_TX_IN_SEQUENCE_NUM: u32 = 0xffffffff;
@@ -74,9 +75,12 @@ fn array(v: &GoValue) -> &[GoValue] {
     }
 }
 
+/// The entries of a map field.  An explicit JSON `null` leaves a Go map
+/// nil (`GoValue::Null`), which Go ranges over and measures as empty.
 fn map(v: &GoValue) -> &[(String, GoValue)] {
     match v {
         GoValue::Map(entries) => entries,
+        GoValue::Null => &[],
         other => panic!("expected map field, got {other:?}"),
     }
 }
@@ -111,7 +115,10 @@ fn new_amount(f: f64) -> Result<i64, String> {
         return Err("invalid coin amount".to_string());
     }
     let scaled = f * 1e8;
-    // Go dcrutil round: add or subtract 0.5 and truncate.
+    // Go dcrutil round: add or subtract 0.5 and truncate.  An
+    // out-of-range result saturates here, where Go's conversion is
+    // platform-defined (`MinInt64` on amd64); PARITY.md's absurd
+    // amount conversion row lists the RPC sites this reaches.
     if scaled < 0.0 {
         Ok((scaled - 0.5) as i64)
     } else {
@@ -473,14 +480,10 @@ pub fn handle_decode_raw_transaction<C: RpcChain>(
         hex_str
     };
     let serialized_tx = go_decode_hex(hex_str).map_err(|_| rpc_decode_hex_error(hex_str))?;
-    let (mtx, consumed) = MsgTx::from_bytes(&serialized_tx).map_err(|e| {
-        // Go surfaces io.ErrUnexpectedEOF's text for truncation.
-        let text = match e {
-            dcroxide_wire::WireError::UnexpectedEof => "unexpected EOF".to_string(),
-            other => other.to_string(),
-        };
-        rpc_deserialization_error(&format!("Could not decode Tx: {text}"))
-    })?;
+    // The wire error renders Go's io error or dcrd's `MessageError`
+    // text, whichever dcrd's `Deserialize` returns.
+    let (mtx, consumed) = MsgTx::from_bytes(&serialized_tx)
+        .map_err(|e| rpc_deserialization_error(&format!("Could not decode Tx: {e}")))?;
     if consumed != serialized_tx.len() {
         // Go's Deserialize reads from a stream and ignores trailing
         // bytes only when the reader is exhausted by the message;
@@ -539,9 +542,9 @@ pub fn handle_decode_script<C: RpcChain>(
 
     // Attempt to extract known addresses associated with the script.
     // Pubkey addresses render as their pay-to-pubkey-hash form.
-    let params = server.cfg.chain_params.clone();
+    let params = &server.cfg.chain_params;
     let (script_type, addrs) =
-        dcroxide_txscript::stdscript::extract_addrs(script_version, &script, &params);
+        dcroxide_txscript::stdscript::extract_addrs(script_version, &script, params);
     let addresses: Vec<GoValue> = addrs
         .iter()
         .map(|addr| {
@@ -557,7 +560,7 @@ pub fn handle_decode_script<C: RpcChain>(
     // Convert the script itself to a pay-to-script-hash address; only
     // version 0 scripts are supported (dcrd `NewAddressScriptHash`).
     let p2sh = if script_version == 0 {
-        stdaddr::new_address_script_hash_v0(&script, &params)
+        stdaddr::new_address_script_hash_v0(&script, params)
             .map(|a| a.to_string())
             .map_err(|e| rpc_internal_err(&e.to_string()))?
     } else {
@@ -683,93 +686,108 @@ pub fn handle_validate_address<C: RpcChain>(
 /// Decode standard base64 with Go `encoding/base64` `StdEncoding`
 /// semantics: strict alphabet, mandatory padding, newlines ignored,
 /// and Go's corrupt-input error message with its exact byte offsets
-/// (the text surfaces in the verifymessage RPC error).  Truncated
-/// (unpadded) tails report the corruption at the end of the input;
-/// the dump pins the reachable shapes.
+/// (the text surfaces in the verifymessage RPC error).
+///
+/// This is Go's `Decode` loop over `decodeQuantum` (`base64.go`),
+/// input order and offsets included: the first problem met while
+/// walking quanta is the one reported.  Go's 8- and 4-symbol fast
+/// paths accept only runs of plain alphabet symbols and hand anything
+/// else to `decodeQuantum` at the same offset, so walking quanta alone
+/// yields the same bytes and the same errors.
 fn go_std_base64_decode(input: &str) -> Result<Vec<u8>, String> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const PAD: u8 = 64;
-    let mut rev = [255u8; 256];
+    const PAD: u8 = b'=';
+    let mut decode_map = [0xffu8; 256];
     for (i, &b) in ALPHABET.iter().enumerate() {
-        rev[b as usize] = i as u8;
+        decode_map[b as usize] = i as u8;
     }
-    rev[b'=' as usize] = PAD;
 
     let corrupt = |pos: usize| format!("illegal base64 data at input byte {pos}");
-
-    // Collect the symbols with their original byte offsets, skipping
-    // newlines like Go's decoder.
-    let bytes = input.as_bytes();
-    let mut syms: Vec<(u8, usize)> = Vec::with_capacity(bytes.len());
-    for (pos, &b) in bytes.iter().enumerate() {
-        if b == b'\r' || b == b'\n' {
-            continue;
+    let src = input.as_bytes();
+    let is_newline = |b: u8| b == b'\n' || b == b'\r';
+    let skip_newlines = |mut si: usize| {
+        while si < src.len() && is_newline(src[si]) {
+            si += 1;
         }
-        let v = rev[b as usize];
-        if v == 255 {
+        si
+    };
+
+    let mut out = Vec::with_capacity(src.len() / 4 * 3);
+    let mut si = 0usize;
+    while si < src.len() {
+        // Decode one quantum (Go `decodeQuantum`).
+        let mut dbuf = [0u8; 4];
+        let mut dlen = 4usize;
+        let mut trailing_garbage = None;
+        let mut j = 0usize;
+        while j < dbuf.len() {
+            if si == src.len() {
+                // Only newlines remained, or the input ends inside a
+                // quantum with no padding.
+                if j == 0 {
+                    return Ok(out);
+                }
+                return Err(corrupt(si - j));
+            }
+            let b = src[si];
+            si += 1;
+
+            let v = decode_map[b as usize];
+            if v != 0xff {
+                dbuf[j] = v;
+                j += 1;
+                continue;
+            }
+
+            if is_newline(b) {
+                continue;
+            }
+
+            if b != PAD {
+                return Err(corrupt(si - 1));
+            }
+
+            // We've reached the end and there's padding.
+            match j {
+                // Incorrect padding.
+                0 | 1 => return Err(corrupt(si - 1)),
+                2 => {
+                    // "==" is expected, the first "=" is already
+                    // consumed; skip over newlines.
+                    si = skip_newlines(si);
+                    if si == src.len() {
+                        // Not enough padding.
+                        return Err(corrupt(src.len()));
+                    }
+                    if src[si] != PAD {
+                        // Incorrect padding.
+                        return Err(corrupt(si - 1));
+                    }
+                    si += 1;
+                }
+                _ => {}
+            }
+
+            // Skip over newlines; anything after them is trailing
+            // garbage, reported once this quantum's bytes are out.
+            si = skip_newlines(si);
+            if si < src.len() {
+                trailing_garbage = Some(si);
+            }
+            dlen = j;
+            break;
+        }
+
+        // Convert 4x 6bit source bytes into 3 bytes.
+        let val = (u32::from(dbuf[0]) << 18)
+            | (u32::from(dbuf[1]) << 12)
+            | (u32::from(dbuf[2]) << 6)
+            | u32::from(dbuf[3]);
+        let bytes = [(val >> 16) as u8, (val >> 8) as u8, val as u8];
+        out.extend_from_slice(&bytes[..dlen - 1]);
+
+        if let Some(pos) = trailing_garbage {
             return Err(corrupt(pos));
-        }
-        syms.push((v, pos));
-    }
-
-    let mut out = Vec::with_capacity(syms.len() / 4 * 3);
-    let mut idx = 0usize;
-    while idx < syms.len() {
-        let quantum = &syms[idx..syms.len().min(idx + 4)];
-
-        // A full quantum of data symbols decodes to three bytes.
-        if quantum.len() == 4 && quantum.iter().all(|&(v, _)| v != PAD) {
-            let q: Vec<u8> = quantum.iter().map(|&(v, _)| v).collect();
-            out.push((q[0] << 2) | (q[1] >> 4));
-            out.push((q[1] << 4) | (q[2] >> 2));
-            out.push((q[2] << 6) | q[3]);
-            idx += 4;
-            continue;
-        }
-
-        // The final quantum: partial data plus mandatory padding.
-        let n_data = quantum.iter().take_while(|&&(v, _)| v != PAD).count();
-
-        // An unpadded incomplete tail reports the corruption at the
-        // first symbol of the incomplete quantum (Go reports si - j).
-        if n_data == quantum.len() && quantum.len() < 4 {
-            return Err(corrupt(quantum[0].1));
-        }
-        match n_data {
-            0 | 1 => {
-                // Padding in the first two symbols (or a bare short
-                // tail) is corrupt at the offending position.
-                let pos = quantum.get(n_data).map_or(input.len(), |&(_, pos)| pos);
-                return Err(corrupt(pos));
-            }
-            2 => {
-                // Two data symbols need two padding symbols.
-                if quantum.len() < 3 {
-                    return Err(corrupt(input.len()));
-                }
-                if quantum.len() < 4 {
-                    return Err(corrupt(input.len()));
-                }
-                if quantum[3].0 != PAD {
-                    return Err(corrupt(quantum[3].1));
-                }
-                out.push((quantum[0].0 << 2) | (quantum[1].0 >> 4));
-            }
-            3 => {
-                if quantum.len() < 4 {
-                    return Err(corrupt(input.len()));
-                }
-                out.push((quantum[0].0 << 2) | (quantum[1].0 >> 4));
-                out.push((quantum[1].0 << 4) | (quantum[2].0 >> 2));
-            }
-            _ => unreachable!(),
-        }
-        idx += 4;
-
-        // Anything after the padded final quantum is corrupt at its
-        // position.
-        if idx < syms.len() {
-            return Err(corrupt(syms[idx].1));
         }
     }
 
@@ -788,8 +806,8 @@ pub fn handle_verify_message<C: RpcChain>(
     // Decode the provided address.  This also ensures the network
     // encoded with the address matches the network the server is
     // currently on.
-    let params = server.cfg.chain_params.clone();
-    let addr = stdaddr::decode_address(address, &params)
+    let params = &server.cfg.chain_params;
+    let addr = stdaddr::decode_address(address, params)
         .map_err(|e| rpc_address_key_error(&format!("Could not decode address: {e}")))?;
 
     // Only version 0 P2PKH addresses are valid for signing.
@@ -827,7 +845,7 @@ pub fn handle_verify_message<C: RpcChain>(
     } else {
         stdaddr::hash160(&pk.serialize_uncompressed()).to_vec()
     };
-    let Ok(reconstructed) = stdaddr::new_address_pub_key_hash_ecdsa_secp256k1_v0(&pk_hash, &params)
+    let Ok(reconstructed) = stdaddr::new_address_pub_key_hash_ecdsa_secp256k1_v0(&pk_hash, params)
     else {
         // Treat error in reconstruction as an invalid signature.
         return Ok(GoValue::Bool(false));
@@ -1234,7 +1252,7 @@ pub fn handle_get_blockchain_info<C: RpcChain>(
     // Fetch the maximum allowed block size for all blocks other than
     // the genesis block.
     let zero_hash = Hash([0u8; 32]);
-    let params = server.cfg.chain_params.clone();
+    let params = &server.cfg.chain_params;
     let mut max_block_size = params.maximum_block_sizes[0] as i64;
     if best.prev_hash != zero_hash {
         max_block_size = server
@@ -1310,10 +1328,6 @@ fn opt_bool(v: &GoValue) -> Option<bool> {
     }
 }
 
-fn hex_str(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// A compacted set of bit flags from a slice of bools (Go
 /// `bitset.NewBytes` + `Set`, LSB first within each byte).
 fn bitset_bytes(flags: &[bool]) -> Vec<u8> {
@@ -1351,7 +1365,7 @@ pub fn handle_estimate_stake_diff<C: RpcChain>(
     // The expected stake difficulty.  Average the number of fresh
     // stake since the last retarget to get the number of tickets per
     // block, then use that to estimate the next stake difficulty.
-    let params = server.cfg.chain_params.clone();
+    let params = &server.cfg.chain_params;
     let best_height = best.height;
     let last_adjustment =
         (best_height / params.stake_diff_window_size) * params.stake_diff_window_size;
@@ -1607,7 +1621,7 @@ pub fn handle_get_vote_info<C: RpcChain>(
     let version = uint(&c[0]) as u32;
 
     // Shorter versions of some parameters for convenience.
-    let params = server.cfg.chain_params.clone();
+    let params = &server.cfg.chain_params;
     let interval = i64::from(params.rule_change_activation_interval);
     let quorum = params.rule_change_activation_quorum;
     let snapshot = server.cfg.chain.best_snapshot();
@@ -1829,15 +1843,28 @@ pub fn handle_add_node<C: RpcChain>(
         _ => return Err(rpc_invalid_error("Invalid subcommand for addnode")),
     };
 
-    // dcrd 2.2 maps failures through the connection context: parent
-    // cancellation, dial cancellation, and dial timeouts get their
-    // own errors, and everything else becomes an internal error whose
-    // wire message is the raw error (the "failed operation on" prefix
-    // is log-only).  The port's dial is synchronous with no context,
-    // so only the internal-error branch is representable.
-    result.map_err(|e| rpc_internal_err(&e))?;
+    result.map_err(|e| connect_error(sub_cmd, &addr, &e))?;
 
     Ok(GoValue::Null)
+}
+
+/// dcrd 2.2's mapping of a failed `addnode` or `node connect`
+/// operation (`handleAddNode`, `handleNode`): dial cancellation and
+/// dial timeouts get cancel errors naming the address, and everything
+/// else becomes an internal error whose wire message is the raw error
+/// (the "failed operation on" prefix is log-only).  dcrd's first arm,
+/// the request's own context ending (`rpcConnectionClosedError`), has
+/// no counterpart: the port's handlers run without a request context.
+fn connect_error(sub_cmd: &str, addr: &str, err: &str) -> RPCError {
+    match err {
+        crate::server::CONNECT_CANCELED => crate::rpcerrors::rpc_cancel_error(&format!(
+            "{sub_cmd}: connection attempt to {addr} canceled"
+        )),
+        crate::server::CONNECT_DEADLINE_EXCEEDED => {
+            crate::rpcerrors::rpc_cancel_error(&format!("{sub_cmd}: timeout connecting to {addr}"))
+        }
+        _ => rpc_internal_err(err),
+    }
 }
 
 /// Whether a peer with the given address or id is currently connected
@@ -1943,11 +1970,9 @@ pub fn handle_node<C: RpcChain>(server: &Server<C>, cmd: &GoValue) -> Result<GoV
         }
         // dcrd 2.2 splits the fallthroughs: disconnect and remove
         // stay invalid-parameter errors, while connect failures map
-        // through the connection context — only the internal-error
-        // branch (raw error text; the "failed operation on" prefix is
-        // log-only) is representable in the port's synchronous dial.
+        // through the connection context.
         if sub_cmd == "connect" {
-            return Err(rpc_internal_err(&err));
+            return Err(connect_error(&sub_cmd, &addr, &err));
         }
         return Err(rpc_invalid_error(&format!("{sub_cmd}: {err}")));
     }
@@ -1999,7 +2024,7 @@ pub fn handle_get_mempool_info<C: RpcChain>(
 
     let mut num_bytes: i64 = 0;
     for tx_d in &mempool_txns {
-        num_bytes += tx_d.tx.serialize_size() as i64;
+        num_bytes += tx_d.serialize_size as i64;
     }
 
     Ok(GoValue::Struct(vec![
@@ -2061,10 +2086,11 @@ pub fn handle_get_raw_mempool<C: RpcChain>(
                 .iter()
                 .map(|h| GoValue::String(h.to_string()))
                 .collect();
+            // The pool's cached hash, as dcrd reads `desc.Tx.Hash()`.
             result.push((
-                desc.tx.tx_hash().to_string(),
+                desc.tx_hash.to_string(),
                 GoValue::Struct(vec![
-                    GoValue::Int(desc.tx.serialize_size() as i64),
+                    GoValue::Int(desc.serialize_size as i64),
                     GoValue::Float64(txresults::to_coin(desc.fee)),
                     GoValue::Int(desc.added_unix),
                     GoValue::Int(desc.height),
@@ -2088,7 +2114,7 @@ pub fn handle_get_raw_mempool<C: RpcChain>(
         {
             continue;
         }
-        hash_strings.push(GoValue::String(desc.tx.tx_hash().to_string()));
+        hash_strings.push(GoValue::String(desc.tx_hash.to_string()));
     }
     Ok(GoValue::Array(hash_strings))
 }
@@ -2194,9 +2220,11 @@ pub fn handle_get_raw_transaction<C: RpcChain>(
                 .map_err(|e| rpc_internal_err(&e))?;
             blk_index = idx_entry.block_index;
 
-            // Deserialize the transaction.
+            // Deserialize the transaction.  The message is Go's
+            // `err.Error()`, which the wire error renders (io.ErrUnexpectedEOF's
+            // "unexpected EOF" for truncation).
             let (msg_tx, _) =
-                MsgTx::from_bytes(&tx_bytes).map_err(|e| rpc_internal_err(&format!("{e:?}")))?;
+                MsgTx::from_bytes(&tx_bytes).map_err(|e| rpc_internal_err(&e.to_string()))?;
             msg_tx
         }
         Ok((tx, _tree)) => {
@@ -2352,9 +2380,9 @@ pub fn handle_get_tx_out<C: RpcChain>(
     let (disbuf, _) = dcroxide_txscript::disasm_string(&pk_script);
 
     // Attempt to extract known addresses associated with the script.
-    let params = server.cfg.chain_params.clone();
+    let params = &server.cfg.chain_params;
     let (script_type, addrs) =
-        dcroxide_txscript::stdscript::extract_addrs(script_version, &pk_script, &params);
+        dcroxide_txscript::stdscript::extract_addrs(script_version, &pk_script, params);
     let addresses: Vec<GoValue> = addrs
         .iter()
         .map(|addr| GoValue::String(addr.to_string()))
@@ -2383,9 +2411,10 @@ pub fn handle_get_tx_out<C: RpcChain>(
 }
 
 /// handlegettxoutsetinfo (dcrd `handleGetTxOutSetInfo`); the result
-/// is a `GetTxOutSetInfoResult` value.  Note dcrd returns the bare
-/// stats error which its dispatch layer wraps; the wrapped internal
-/// error stands in until the dispatch layer is ported.
+/// is a `GetTxOutSetInfoResult` value.  dcrd returns the bare stats
+/// error and `createMarshalledReply` wraps it as `rpcInternalErr(err,
+/// "")`, whose wire message is `err.Error()`: the internal error built
+/// here from the seam's error text is that same reply.
 pub fn handle_get_tx_out_set_info<C: RpcChain>(
     server: &Server<C>,
     _cmd: &GoValue,
@@ -2731,6 +2760,13 @@ pub fn handle_send_raw_transaction<C: RpcChain>(
 ) -> Result<GoValue, RPCError> {
     let c = fields(cmd);
     let hex_tx = s(&c[0]);
+    // An explicit JSON null leaves `AllowHighFees` nil (defaults fill
+    // only absent trailing params), and dcrd's first statement,
+    // `allowHighFees := *c.AllowHighFees`, dereferences it: a panic that
+    // net/http recovers by dropping the connection and that kills dcrd
+    // outright on the websocket path.  The port reads nil as false and
+    // processes the transaction instead (PARITY.md, deliberate
+    // divergences).
     let allow_high_fees = opt_bool(&c[1]).unwrap_or(false);
 
     // Deserialize and send off to tx relay.
@@ -2742,13 +2778,8 @@ pub fn handle_send_raw_transaction<C: RpcChain>(
         hex_tx
     };
     let serialized_tx = go_decode_hex(hex_str).map_err(|_| rpc_decode_hex_error(hex_str))?;
-    let (msgtx, _) = MsgTx::from_bytes(&serialized_tx).map_err(|e| {
-        let text = match e {
-            dcroxide_wire::WireError::UnexpectedEof => "unexpected EOF".to_string(),
-            other => other.to_string(),
-        };
-        rpc_deserialization_error(&format!("Could not decode Tx: {text}"))
-    })?;
+    let (msgtx, _) = MsgTx::from_bytes(&serialized_tx)
+        .map_err(|e| rpc_deserialization_error(&format!("Could not decode Tx: {e}")))?;
 
     // Use 0 for the tag to represent the local node.
     let tx_hash = msgtx.tx_hash();
@@ -2824,15 +2855,15 @@ pub fn handle_submit_block<C: RpcChain>(
         hex_block
     };
     let serialized_block = go_decode_hex_msg(hex_str).map_err(|e| rpc_internal_err(&e))?;
+    // Bytes past the block are ignored.  dcrd's `NewBlockFromBytes`
+    // keeps the whole submission as the block's serialized bytes, so
+    // it stores them and getblock's raw hex echoes them back; the port
+    // keeps only the block, which it stores re-serialized (PARITY.md,
+    // deliberate divergences).  Peers see no difference: dcrd serves
+    // them a re-serialized `MsgBlock` too.
     let block = match MsgBlock::from_bytes(&serialized_block) {
         Ok((block, _)) => block,
-        Err(e) => {
-            let text = match e {
-                dcroxide_wire::WireError::UnexpectedEof => "unexpected EOF".to_string(),
-                other => other.to_string(),
-            };
-            return Err(rpc_internal_err(&text));
-        }
+        Err(e) => return Err(rpc_internal_err(&e.to_string())),
     };
 
     if let Err(failure) = server.cfg.sync_mgr.submit_block(&block) {
@@ -3020,17 +3051,21 @@ fn amounts_mean(s: &[i64]) -> i64 {
 
 /// The median amount: the middle element after sorting, or the
 /// integer mean of the two middle elements (dcrd rpcserver `median`).
-fn amounts_median(s: &[i64]) -> i64 {
+///
+/// Like dcrd's, this sorts the caller's slice in place
+/// (`sort.Sort(dcrutil.AmountSorter(s))`), and the fee statistics rely
+/// on it: the standard deviation computed after it sums over the
+/// sorted order, as dcrd's does.
+fn amounts_median(s: &mut [i64]) -> i64 {
     if s.is_empty() {
         return 0;
     }
-    let mut sorted = s.to_vec();
-    sorted.sort_unstable();
-    let middle = sorted.len() / 2;
-    if !sorted.len().is_multiple_of(2) {
-        sorted[middle]
+    s.sort_unstable();
+    let middle = s.len() / 2;
+    if !s.len().is_multiple_of(2) {
+        s[middle]
     } else {
-        (sorted[middle] + sorted[middle - 1]) / 2
+        (s[middle] + s[middle - 1]) / 2
     }
 }
 
@@ -3078,7 +3113,12 @@ struct FeeStats {
 
 impl FeeStats {
     /// The statistics over the given per-kilobyte fees.
-    fn over(fees: &[i64], number: u32) -> FeeStats {
+    ///
+    /// The fields are computed in dcrd's composite-literal order, which
+    /// Go evaluates left to right: `median` sorts `fees` in place before
+    /// `stdDev` sums the squared deviations, so the float total is
+    /// accumulated in ascending order exactly as dcrd accumulates it.
+    fn over(fees: &mut [i64], number: u32) -> FeeStats {
         FeeStats {
             number,
             min: txresults::to_coin(amounts_min(fees)),
@@ -3113,11 +3153,12 @@ fn fee_info_for_mempool<C: RpcChain>(
     let mut ticket_fees = Vec::with_capacity(tx_descs.len());
     for tx_desc in &tx_descs {
         if tx_desc.tx_type == tx_type {
-            let fee_per_kb = tx_desc.fee * 1000 / tx_desc.tx.serialize_size() as i64;
+            let fee_per_kb = tx_desc.fee * 1000 / tx_desc.serialize_size as i64;
             ticket_fees.push(fee_per_kb);
         }
     }
-    FeeStats::over(&ticket_fees, ticket_fees.len() as u32)
+    let number = ticket_fees.len() as u32;
+    FeeStats::over(&mut ticket_fees, number)
 }
 
 /// The fees of the transactions of the given type in the block, sized
@@ -3163,8 +3204,28 @@ fn ticket_fee_info_for_block<C: RpcChain>(
     tx_type: dcroxide_stake::TxType,
 ) -> Result<FeeStats, String> {
     let bl = server.cfg.chain.block_by_height(height)?;
-    let tx_fees = block_type_fees(&bl, tx_type);
-    Ok(FeeStats::over(&tx_fees, tx_fees.len() as u32))
+    let mut tx_fees = block_type_fees(&bl, tx_type);
+    let number = tx_fees.len() as u32;
+    Ok(FeeStats::over(&mut tx_fees, number))
+}
+
+/// The early answer for a per-block fee walk that would run past the
+/// genesis block: `ticketfeeinfo` and `txfeeinfo` take a client-chosen
+/// `u32` block count, and dcrd's loop over `(end, best]` then loads
+/// every main chain block before failing at height -1 with that
+/// lookup's error.  Performing the height -1 lookup first gives the
+/// same reply without loading the whole chain -- each load takes the
+/// chain mutex here, which dcrd's `BlockByHeight` does not -- or
+/// buffering an item per block only to discard them all.
+fn fee_info_blocks_past_genesis<C: RpcChain>(
+    server: &Server<C>,
+    end: i64,
+    tx_type: dcroxide_stake::TxType,
+) -> Result<(), RPCError> {
+    if end < -1 {
+        ticket_fee_info_for_block(server, -1, tx_type).map_err(|e| rpc_internal_err(&e))?;
+    }
+    Ok(())
 }
 
 /// The fee information for the given tx type over the height range
@@ -3196,7 +3257,8 @@ fn ticket_fee_info_for_range<C: RpcChain>(
             }
         }
     }
-    Ok(FeeStats::over(&tx_fees, tx_fees.len() as u32))
+    let number = tx_fees.len() as u32;
+    Ok(FeeStats::over(&mut tx_fees, number))
 }
 
 /// handleticketfeeinfo (dcrd `handleTicketFeeInfo`); the result is a
@@ -3219,6 +3281,7 @@ pub fn handle_ticket_fee_info<C: RpcChain>(
     if blocks > 0 {
         let start = best_height;
         let end = best_height - i64::from(blocks);
+        fee_info_blocks_past_genesis(server, end, dcroxide_stake::TxType::SStx)?;
         let mut items = Vec::new();
         let mut i = start;
         while i > end {
@@ -3359,6 +3422,7 @@ pub fn handle_tx_fee_info<C: RpcChain>(
     if blocks > 0 {
         let start = best_height;
         let end = best_height - i64::from(blocks);
+        fee_info_blocks_past_genesis(server, end, dcroxide_stake::TxType::Regular)?;
         let mut items = Vec::new();
         let mut i = start;
         while i > end {
@@ -4063,12 +4127,14 @@ pub fn handle_send_raw_mix_message<C: RpcChain>(
     let msg =
         dcroxide_wire::decode_message_payload_prefix(command, &payload, dcroxide_wire::MIX_VERSION)
             .map_err(|e| {
-                let text = match e {
-                    dcroxide_wire::WireError::UnexpectedEof => match &hex_err {
-                        Some(err) => err.clone(),
-                        None => "unexpected EOF".to_string(),
-                    },
-                    other => other.to_string(),
+                // A read past the decoded prefix gets the hex decoder's
+                // pending error in place of the reader's own EOF.
+                let text = match (e, &hex_err) {
+                    (
+                        dcroxide_wire::WireError::Eof | dcroxide_wire::WireError::UnexpectedEof,
+                        Some(err),
+                    ) => err.clone(),
+                    (other, _) => other.to_string(),
                 };
                 rpc_deserialization_error(&format!("Could not decode mix message: {text}"))
             })?;
@@ -4083,10 +4149,10 @@ pub fn handle_send_raw_mix_message<C: RpcChain>(
         )));
     }
 
+    // dcrd follows the relay with `s.ntfnMgr.NotifyMixMessage(msg)`; the
+    // daemon's connection manager seam performs that notify as part of
+    // the relay, as its `relay_transactions` does for new transactions.
     server.cfg.conn_mgr.relay_mix_messages(&[msg]);
-
-    // The websocket notification hook (`NotifyMixMessage`) arrives
-    // with the websocket layer.
 
     Ok(GoValue::Null)
 }
@@ -4566,13 +4632,8 @@ fn handle_get_work_request<C: RpcChain>(server: &Server<C>) -> Result<GoValue, R
     let target =
         crate::helpers::big_to_le_uint256(&dcroxide_standalone::compact_to_big(header_copy.bits));
     Ok(GoValue::Struct(vec![
-        GoValue::String(data.iter().map(|b| format!("{b:02x}")).collect::<String>()),
-        GoValue::String(
-            target
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>(),
-        ),
+        GoValue::String(hex_str(&data)),
+        GoValue::String(hex_str(&target)),
     ]))
 }
 
@@ -4648,15 +4709,24 @@ fn handle_get_work_submission<C: RpcChain>(
 
     // Look up the full block for the provided data based on the merkle
     // and stake roots.
+    // The lock guards only the lookup, as dcrd's does: it is released
+    // before the block is processed, so neither a websocket work
+    // notification nor anything else taking the work state waits on
+    // the whole block validation.
     let template_key = get_work_template_key(&submitted_header);
-    let work_state = server.work_state.lock().expect("work state poisoned");
-    let Some(template_block) = work_state.template_pool.get(&template_key) else {
+    let template_block = server
+        .work_state
+        .lock()
+        .expect("work state poisoned")
+        .template_pool
+        .get(&template_key)
+        .cloned();
+    let Some(mut msg_block) = template_block else {
         return Ok(GoValue::Bool(false));
     };
 
     // Reconstruct the block using the submitted header and the stored
     // block info.
-    let mut msg_block = template_block.clone();
     msg_block.header = submitted_header;
 
     // Process this block using the same rules as blocks coming from
@@ -4787,4 +4857,147 @@ pub fn handle_help<C: RpcChain>(server: &Server<C>, cmd: &GoValue) -> Result<GoV
         .rpc_method_help(&server.registry, command)
         .map_err(|e| rpc_internal_err(&e))?;
     Ok(GoValue::String(help))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Go 1.27 `base64.StdEncoding.DecodeString` over each input: the
+    /// decoded hex, or the error text.  The error offsets come from Go's
+    /// quantum-at-a-time walk (`decodeQuantum`), so a problem is reported
+    /// where the walk meets it -- not at the first non-alphabet byte, and
+    /// with `si - 1` / `si - j` offsets that count skipped newlines.
+    const GO_STD_BASE64_DECODES: &[(&str, &str)] = &[
+        ("", "OK:"),
+        ("\n", "OK:"),
+        ("\r\n", "OK:"),
+        ("A", "ERR:illegal base64 data at input byte 0"),
+        ("AB", "ERR:illegal base64 data at input byte 0"),
+        ("ABC", "ERR:illegal base64 data at input byte 0"),
+        ("ABCD", "OK:001083"),
+        ("AB==", "OK:00"),
+        ("ABC=", "OK:0010"),
+        ("A===", "ERR:illegal base64 data at input byte 1"),
+        ("====", "ERR:illegal base64 data at input byte 0"),
+        ("=", "ERR:illegal base64 data at input byte 0"),
+        ("==", "ERR:illegal base64 data at input byte 0"),
+        ("AB=C", "ERR:illegal base64 data at input byte 2"),
+        ("A=B!", "ERR:illegal base64 data at input byte 1"),
+        ("AB=C!!!!", "ERR:illegal base64 data at input byte 2"),
+        ("AAAAB\nC", "ERR:illegal base64 data at input byte 5"),
+        ("AAAA\nB", "ERR:illegal base64 data at input byte 5"),
+        ("AAAAB", "ERR:illegal base64 data at input byte 4"),
+        ("AAAABC", "ERR:illegal base64 data at input byte 4"),
+        ("AAAABCD", "ERR:illegal base64 data at input byte 4"),
+        ("AB=\n=", "OK:00"),
+        ("AB=\n", "ERR:illegal base64 data at input byte 4"),
+        ("AB=\nC", "ERR:illegal base64 data at input byte 3"),
+        ("AB==\n", "OK:00"),
+        ("AB==\nA", "ERR:illegal base64 data at input byte 5"),
+        ("AB== ", "ERR:illegal base64 data at input byte 4"),
+        ("ABC=\n\nX", "ERR:illegal base64 data at input byte 6"),
+        ("ABC=A", "ERR:illegal base64 data at input byte 4"),
+        ("AB=", "ERR:illegal base64 data at input byte 3"),
+        ("AB==AB==", "ERR:illegal base64 data at input byte 4"),
+        ("AAAAAAAA!", "ERR:illegal base64 data at input byte 8"),
+        ("AAAAAAA!", "ERR:illegal base64 data at input byte 7"),
+        ("!AAAAAAA", "ERR:illegal base64 data at input byte 0"),
+        ("AAAA!AAA", "ERR:illegal base64 data at input byte 4"),
+        ("AAAAAAAAAAA!", "ERR:illegal base64 data at input byte 11"),
+        ("AAAAAAAA\nAAAA", "OK:000000000000000000"),
+        ("AAAA\r\nAAAA\r\n", "OK:000000000000"),
+        ("A\nB\nC\nD", "OK:001083"),
+        ("A\nB\nC\n=", "OK:0010"),
+        ("A\nB\n=\n=", "OK:00"),
+        ("AAAA====", "ERR:illegal base64 data at input byte 4"),
+        ("AAAAAB==", "OK:00000000"),
+        ("AAAAABC=", "OK:0000000010"),
+        ("AAAAAAAAAB==", "OK:00000000000000"),
+        ("AAAAAAAAABC=", "OK:0000000000000010"),
+        ("AAAAAAAAAB=", "ERR:illegal base64 data at input byte 11"),
+        ("AAAAAAAAA=", "ERR:illegal base64 data at input byte 9"),
+        ("\nA", "ERR:illegal base64 data at input byte 1"),
+        ("\n\n=", "ERR:illegal base64 data at input byte 2"),
+        ("AB\n", "ERR:illegal base64 data at input byte 1"),
+        ("AB\n\n", "ERR:illegal base64 data at input byte 2"),
+        ("ABC\n", "ERR:illegal base64 data at input byte 1"),
+        ("é", "ERR:illegal base64 data at input byte 0"),
+        ("AAé", "ERR:illegal base64 data at input byte 2"),
+        ("AAAAé", "ERR:illegal base64 data at input byte 4"),
+        ("AAAAAAAAAAAAé", "ERR:illegal base64 data at input byte 12"),
+        ("AAAAAAAAAAA", "ERR:illegal base64 data at input byte 8"),
+        (
+            "AAAAAAAAAAAA\n=",
+            "ERR:illegal base64 data at input byte 13",
+        ),
+        ("AB=A=", "ERR:illegal base64 data at input byte 2"),
+        ("ABC==", "ERR:illegal base64 data at input byte 4"),
+        ("ABCD=", "ERR:illegal base64 data at input byte 4"),
+        ("ABCD\n=", "ERR:illegal base64 data at input byte 5"),
+        ("IFtb", "OK:205b5b"),
+        ("IFtb/+ab", "OK:205b5bffe69b"),
+        (
+            "H4sIAAAAAAAAA+3BAQ0AAADCoPdPbQ8HFAAAAAAAAADwbgA=",
+            "OK:1f8b0800000000000003edc1010d000000c2a0f74f6d0f071400000000000000f06e00",
+        ),
+    ];
+
+    #[test]
+    fn go_std_base64_decode_matches_go_decode_string() {
+        for (input, want) in GO_STD_BASE64_DECODES {
+            let got = match go_std_base64_decode(input) {
+                Ok(bytes) => format!("OK:{}", hex_str(&bytes)),
+                Err(e) => format!("ERR:{e}"),
+            };
+            assert_eq!(&got, want, "input {input:?}");
+        }
+    }
+
+    /// dcrd's `median` sorts the fee slice in place before `stdDev`
+    /// sums over it, so the squared deviations are added in ascending
+    /// order.  For these per-kilobyte fees the float total depends on
+    /// that order, and the reported standard deviation with it: the
+    /// expected values are dcrd's `feeInfoForMempool` fields over the
+    /// same fees in the same (unsorted) order, marshalled by Go 1.26.5
+    /// (`{"number":3,"min":2685.56698046,"max":8234.51139943,
+    /// "mean":5988.23271927,"median":7044.61977794,
+    /// "stddev":2921.41425588}`).  Summed in arrival order the total
+    /// rounds to 2921.41425589 instead.
+    #[test]
+    fn fee_stats_sum_the_deviations_in_dcrds_sorted_order() {
+        let mut fees = vec![268556698046, 823451139943, 704461977794];
+        let stats = FeeStats::over(&mut fees, 3);
+        let json: Vec<String> = [
+            stats.min,
+            stats.max,
+            stats.mean,
+            stats.median,
+            stats.std_dev,
+        ]
+        .into_iter()
+        .map(gojson::format_float_json)
+        .collect();
+        assert_eq!(
+            json,
+            [
+                "2685.56698046",
+                "8234.51139943",
+                "5988.23271927",
+                "7044.61977794",
+                "2921.41425588",
+            ]
+        );
+        // The slice is left sorted, as dcrd's is.
+        assert_eq!(fees, [268556698046, 704461977794, 823451139943]);
+    }
+
+    #[test]
+    fn hex_str_matches_go_hex_encode_to_string() {
+        assert_eq!(hex_str(&[]), "");
+        assert_eq!(hex_str(&[0x00, 0x0f, 0x10, 0xab, 0xff]), "000f10abff");
+        let all: Vec<u8> = (0..=255).collect();
+        let want: String = all.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex_str(&all), want);
+    }
 }

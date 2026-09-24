@@ -126,7 +126,7 @@ fn server_getheaders_matches_dcrd() {
         // The located headers are opaque to the wrapping decision; a
         // vector of the right length reproduces the observable count.
         let located: Vec<BlockHeader> = (0..located_count).map(|_| zero_header()).collect();
-        let out = build_get_headers_response(chain_work_errored, below_min, located);
+        let out = build_get_headers_response(chain_work_errored, below_min, || located);
 
         match out {
             GetHeadersResponse::Empty => {
@@ -479,7 +479,6 @@ fn serve_genesis_chain() -> (
             dcroxide_node::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
         ))),
         sync_peers: dcroxide_node::dispatch::SyncPeers::new(),
-        next_peer_id: std::sync::atomic::AtomicI32::new(1),
         net_totals: Arc::new(dcroxide_node::transport::NetByteTotals::new()),
         disable_listen: false,
         tx_pool: Arc::clone(&tx_pool),
@@ -500,6 +499,8 @@ fn serve_genesis_chain() -> (
         user_agent_version: "0.1.0".to_string(),
         idle_timeout: Duration::from_secs(3600),
         ping_interval: Duration::from_secs(3600),
+        disable_relay_tx: false,
+        proxy: String::new(),
         newest_block: None,
     };
     let connected = ConnectedPeers::new();
