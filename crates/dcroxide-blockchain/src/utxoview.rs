@@ -75,7 +75,10 @@ pub fn count_spent_stake_outputs(block: &MsgBlock) -> usize {
             num_spent += 1;
             continue;
         }
-        if dcroxide_standalone::is_treasury_base(stx) || dcroxide_stake::is_tspend(stx) {
+        // Exclude treasurybases and treasury spends since neither has
+        // any inputs.  dcrd uses the strict stake.IsTreasuryBase here
+        // (chain.go:978), not the minimal standalone check.
+        if dcroxide_stake::is_treasury_base(stx) || dcroxide_stake::is_tspend(stx) {
             continue;
         }
         num_spent += stx.tx_in.len();
@@ -106,20 +109,14 @@ pub fn entry_to_spent_tx_out(entry: &UtxoEntry) -> SpentTxOut {
         block_height: entry.block_height() as u32,
         block_index: entry.block_index(),
         script_version: entry.script_version(),
-        packed_flags: encode_utxo_flags(
-            entry.is_coin_base(),
-            entry.has_expiry(),
-            // The raw type bits survive like dcrd's unchecked cast.
-            match entry.transaction_type() {
-                0 => TxType::Regular,
-                1 => TxType::SStx,
-                2 => TxType::SSGen,
-                3 => TxType::SSRtx,
-                4 => TxType::TAdd,
-                5 => TxType::TSpend,
-                _ => TxType::TreasuryBase,
-            },
-        ),
+        // dcrd encodes `encodeFlags(IsCoinBase(), HasExpiry(),
+        // TransactionType())` (utxoviewpoint.go:246-247), and
+        // `TransactionType` is an unchecked cast of the raw type bits,
+        // so every value 0-15 survives into the journal.  The txout
+        // flags share the utxo flags' layout (bit 0 coinbase, bit 1
+        // expiry, bits 2-5 type), which makes that encoding exactly
+        // the entry's low six bits.
+        packed_flags: entry.packed_flags & 0x3f,
     }
 }
 
@@ -787,8 +784,11 @@ impl UtxoView {
         is_treasury_enabled: bool,
     ) {
         for (tx_idx, stx) in block.stransactions.iter().enumerate() {
+            // Treasurybases and treasury spends have no inputs.  dcrd
+            // uses the strict stake.IsTreasuryBase here
+            // (utxoviewpoint.go:904), not the minimal standalone check.
             let should_be_treasury_base = is_treasury_enabled && tx_idx == 0;
-            if should_be_treasury_base && dcroxide_standalone::is_treasury_base(stx) {
+            if should_be_treasury_base && dcroxide_stake::is_treasury_base(stx) {
                 continue;
             }
             if is_treasury_enabled && dcroxide_stake::is_tspend(stx) {
@@ -956,5 +956,173 @@ impl UtxoView {
         }
         self.set_best_hash(block.header.prev_block);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use core::cell::RefCell;
+    use dcroxide_wire::{BlockHeader, TxIn, TxOut};
+
+    /// A block with the given stake tree and an empty regular tree.
+    fn stake_block(stransactions: Vec<MsgTx>) -> MsgBlock {
+        let (header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
+        MsgBlock {
+            header,
+            transactions: Vec::new(),
+            stransactions,
+        }
+    }
+
+    /// The null outpoint a treasurybase spends.
+    fn null_outpoint() -> OutPoint {
+        OutPoint {
+            hash: Hash::ZERO,
+            index: u32::MAX,
+            tree: 0,
+        }
+    }
+
+    /// A treasurybase whose first output carries the given script
+    /// version.  Version 0 is a real treasurybase; any other version
+    /// still passes the minimal standalone check, which ignores script
+    /// versions, but fails dcrd's strict `stake.IsTreasuryBase`.
+    fn treasury_base(first_output_version: u16) -> MsgTx {
+        let mut op_return = alloc::vec![0x6a, 0x0c]; // OP_RETURN OP_DATA_12
+        op_return.extend_from_slice(&[0u8; 12]);
+        MsgTx {
+            version: dcroxide_stake::TX_VERSION_TREASURY,
+            tx_in: alloc::vec![TxIn {
+                previous_out_point: null_outpoint(),
+                sequence: u32::MAX,
+                value_in: 1_000,
+                block_height: 0,
+                block_index: u32::MAX,
+                signature_script: Vec::new(),
+            }],
+            tx_out: alloc::vec![
+                TxOut {
+                    value: 1_000,
+                    version: first_output_version,
+                    pk_script: alloc::vec![0xc1], // OP_TADD
+                },
+                TxOut {
+                    value: 0,
+                    version: 0,
+                    pk_script: op_return,
+                },
+            ],
+            ..MsgTx::default()
+        }
+    }
+
+    #[test]
+    fn malformed_treasury_base_fixture_splits_the_two_checks() {
+        let good = treasury_base(0);
+        assert!(dcroxide_standalone::is_treasury_base(&good));
+        assert!(dcroxide_stake::is_treasury_base(&good));
+        let bad = treasury_base(1);
+        assert!(dcroxide_standalone::is_treasury_base(&bad));
+        assert!(!dcroxide_stake::is_treasury_base(&bad));
+        assert!(!dcroxide_stake::is_ssgen(&bad) && !dcroxide_stake::is_tspend(&bad));
+        assert!(!dcroxide_stake::is_tadd(&bad));
+    }
+
+    /// dcrd `dbPutTreasuryBalance` records a treasurybase value only for
+    /// what the strict `stake.IsTreasuryBase` accepts (treasury.go:424),
+    /// so a stake transaction that merely passes the minimal check adds
+    /// nothing to the block's treasury state.
+    #[test]
+    fn treasury_state_uses_the_strict_treasury_base_check() {
+        use crate::treasurydb::{TreasuryValue, TreasuryValueType, treasury_state_for_block};
+
+        let good = treasury_state_for_block(&stake_block(alloc::vec![treasury_base(0)]), 0);
+        assert_eq!(
+            good.values,
+            alloc::vec![TreasuryValue {
+                typ: TreasuryValueType::TBase,
+                amount: 1_000,
+            }]
+        );
+        let bad = treasury_state_for_block(&stake_block(alloc::vec![treasury_base(1)]), 0);
+        assert!(bad.values.is_empty(), "{:?}", bad.values);
+    }
+
+    /// dcrd `countSpentStakeOutputs` skips only what the strict
+    /// `stake.IsTreasuryBase` accepts (chain.go:978), so a stake
+    /// transaction that merely passes the minimal check has its input
+    /// counted.
+    #[test]
+    fn count_spent_stake_outputs_uses_the_strict_treasury_base_check() {
+        assert_eq!(
+            count_spent_stake_outputs(&stake_block(alloc::vec![treasury_base(0)])),
+            0
+        );
+        assert_eq!(
+            count_spent_stake_outputs(&stake_block(alloc::vec![treasury_base(1)])),
+            1
+        );
+    }
+
+    /// dcrd `fetchInputUtxos` skips the stake-tree input set only for
+    /// what the strict `stake.IsTreasuryBase` accepts
+    /// (utxoviewpoint.go:904), so the input of a transaction that
+    /// merely passes the minimal check is requested from the backend.
+    #[test]
+    fn fetch_input_utxos_uses_the_strict_treasury_base_check() {
+        for (version, want) in [(0u16, Vec::new()), (1, alloc::vec![null_outpoint()])] {
+            let block = stake_block(alloc::vec![treasury_base(version)]);
+            let requested = RefCell::new(Vec::new());
+            let resolver = |op: &OutPoint| -> Option<UtxoEntry> {
+                requested.borrow_mut().push(*op);
+                None
+            };
+            let mut view = UtxoView::new();
+            view.fetch_input_utxos(&block, &[], &resolver, true);
+            assert_eq!(
+                requested.into_inner(),
+                want,
+                "output 0 script version {version}"
+            );
+        }
+    }
+
+    /// dcrd `utxoEntryToSpentTxOut` encodes `encodeFlags(IsCoinBase(),
+    /// HasExpiry(), TransactionType())` with `TransactionType` an
+    /// unchecked cast of the raw bits 2-5, so type values 7-15 reach
+    /// the journal unchanged and bits 6-7 are dropped.
+    #[test]
+    fn spent_tx_out_keeps_the_raw_transaction_type_bits() {
+        let mut entry = UtxoEntry::new(
+            1_000,
+            alloc::vec![0x51],
+            10,
+            1,
+            0,
+            false,
+            false,
+            TxType::Regular,
+            None,
+        );
+        for tx_type in 0u8..16 {
+            for (coin_base, has_expiry) in [(false, false), (true, false), (false, true)] {
+                let mut want = tx_type << 2;
+                if coin_base {
+                    want |= 1;
+                }
+                if has_expiry {
+                    want |= 2;
+                }
+                entry.set_packed_flags_bits(want | 0xc0);
+                let stxo = entry_to_spent_tx_out(&entry);
+                assert_eq!(
+                    stxo.packed_flags, want,
+                    "type {tx_type}, coinbase {coin_base}, expiry {has_expiry}"
+                );
+                assert_eq!(stxo.transaction_type(), tx_type);
+            }
+        }
     }
 }

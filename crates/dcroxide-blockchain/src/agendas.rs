@@ -159,12 +159,20 @@ impl<T: ChainView + VoteChainView> FullChainView for T {}
 
 /// The anchor block for BLAKE3 difficulty calculations: the final block
 /// of the interval just before the agenda activated (dcrd
-/// `blake3WorkDiffAnchor`, sans dcrd's cached-anchor fast path).
+/// `blake3WorkDiffAnchor`).  The anchor found is recorded as the
+/// view's confirmed anchor, which the positional difficulty check
+/// then enforces.
 fn blake3_work_diff_anchor(
     view: &impl FullChainView,
     prev_height: i64,
     params: &Params,
 ) -> Option<DiffNode> {
+    // Use the previously cached anchor when it exists and is actually
+    // an ancestor of the passed node.
+    if let Some(anchor_height) = view.blake3_anchor_cached(prev_height) {
+        return ChainView::node(view, anchor_height);
+    }
+
     let rcai = i64::from(params.rule_change_activation_interval);
     let svh = params.stake_validation_height;
 
@@ -187,6 +195,14 @@ fn blake3_work_diff_anchor(
             break;
         }
         candidate_height -= rcai;
+    }
+
+    // Update the cached anchor to the discovered one since it is
+    // highly likely the next call will involve a descendant of this
+    // anchor as opposed to some other anchor on an entirely unrelated
+    // side chain.
+    if let Some(anchor) = &anchor {
+        view.cache_blake3_anchor(anchor.height);
     }
     anchor
 }

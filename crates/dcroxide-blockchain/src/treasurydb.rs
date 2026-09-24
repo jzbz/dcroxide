@@ -271,7 +271,9 @@ pub fn treasury_state_for_block(block: &MsgBlock, balance: i64) -> TreasuryState
                 typ: TreasuryValueType::TAdd,
                 amount: stx.tx_out[0].value,
             });
-        } else if dcroxide_standalone::is_treasury_base(stx) {
+        } else if dcroxide_stake::is_treasury_base(stx) {
+            // dcrd uses the strict stake.IsTreasuryBase here
+            // (treasury.go:424), not the minimal standalone check.
             ts.values.push(TreasuryValue {
                 typ: TreasuryValueType::TBase,
                 amount: stx.tx_out[0].value,

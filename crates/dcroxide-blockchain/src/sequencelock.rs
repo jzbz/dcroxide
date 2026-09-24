@@ -49,6 +49,13 @@ impl<V: VoteChainView> VersionChainView for AsVersionView<'_, V> {
     fn node(&self, height: i64) -> Option<VersionNode> {
         self.0.vote_node(height).map(|n| n.node)
     }
+
+    // Forward the walk so a view that follows parent links keeps doing
+    // so through the adapter; the version data is a projection of the
+    // vote data, so both paths visit the same nodes.
+    fn walk_back(&self, height: i64, visit: &mut dyn FnMut(&VersionNode) -> bool) {
+        VersionChainView::walk_back(self.0, height, visit);
+    }
 }
 
 /// Compute the relative lock times for the passed transaction from the

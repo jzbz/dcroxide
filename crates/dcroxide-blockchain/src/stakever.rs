@@ -58,6 +58,24 @@ pub trait VersionChainView {
     /// the height is negative or unknown.
     fn node(&self, height: i64) -> Option<VersionNode>;
 
+    /// Visit the node at the given height and then each of its
+    /// ancestors in turn, newest first, until the visitor returns
+    /// false or the branch runs out: dcrd's `iterNode =
+    /// iterNode.parent` walks.  The default serves every step through
+    /// [`VersionChainView::node`]; a view over linked nodes overrides
+    /// it to resolve the start once and then follow parent links,
+    /// since a fresh height lookup per step makes a 1000-block walk
+    /// far costlier than dcrd's.
+    fn walk_back(&self, height: i64, visit: &mut dyn FnMut(&VersionNode) -> bool) {
+        let mut h = height;
+        while let Some(node) = self.node(h) {
+            if !visit(&node) || h == 0 {
+                break;
+            }
+            h -= 1;
+        }
+    }
+
     /// The hash identifying the node at the height along this branch,
     /// used as the memoization key exactly as dcrd keys its caches by
     /// block hash; `None` — the default — disables caching.
@@ -120,17 +138,10 @@ pub fn calc_want_height(stake_validation_height: i64, interval: i64, height: i64
 /// simple-middle-element behavior for even counts near genesis.
 pub fn calc_past_median_time(view: &impl VersionChainView, height: i64) -> i64 {
     let mut timestamps = Vec::with_capacity(MEDIAN_TIME_BLOCKS);
-    let mut h = height;
-    for _ in 0..MEDIAN_TIME_BLOCKS {
-        let Some(node) = view.node(h) else {
-            break;
-        };
+    view.walk_back(height, &mut |node| {
         timestamps.push(node.timestamp);
-        if h == 0 {
-            break;
-        }
-        h -= 1;
-    }
+        timestamps.len() < MEDIAN_TIME_BLOCKS
+    });
     timestamps.sort_unstable();
     timestamps[timestamps.len() / 2]
 }
@@ -326,21 +337,20 @@ pub fn is_majority_version(
     num_required: u64,
     params: &Params,
 ) -> bool {
+    let num_to_check = params.block_upgrade_num_to_check;
     let mut num_found: u64 = 0;
-    let mut height = start_height;
     let mut i: u64 = 0;
-    while i < params.block_upgrade_num_to_check && num_found < num_required {
-        let Some(h) = height else {
-            break;
-        };
-        let Some(node) = view.node(h) else {
-            break;
-        };
-        if node.block_version >= min_ver {
-            num_found += 1;
-        }
-        height = if h > 0 { Some(h - 1) } else { None };
-        i += 1;
+    if let Some(start_height) = start_height
+        && i < num_to_check
+        && num_found < num_required
+    {
+        view.walk_back(start_height, &mut |node| {
+            if node.block_version >= min_ver {
+                num_found += 1;
+            }
+            i += 1;
+            i < num_to_check && num_found < num_required
+        });
     }
     num_found >= num_required
 }

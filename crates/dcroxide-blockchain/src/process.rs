@@ -7,12 +7,13 @@
 //! rejection checkpoint tracking, and the full block processing path
 //! (`ProcessBlock` and the reorganization machinery it drives).
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use dcroxide_chaincfg::{ConsensusDeployment, Params};
 use dcroxide_chainhash::Hash;
@@ -59,16 +60,15 @@ pub struct UtxoStats {
     pub serialized_hash: Hash,
 }
 
-/// A stats fold row: the serialized outpoint key the fold orders by,
-/// the serialized entry, its amount, and its transaction hash.
-/// One utxo reduced to just what the set statistics need, in
-/// serialized-key order: the key it sorts by, the leaf hash of its
-/// serialized entry, that entry's length, its amount, and its
-/// transaction hash.
+/// One utxo of the in-memory backend reduced to just what the set
+/// statistics need, sorted into serialized-key order before the fold:
+/// the key it sorts by, the leaf hash of its serialized entry, that
+/// entry's length, its amount, and its transaction hash.
 ///
 /// The entry bytes themselves are hashed on sight and dropped rather
-/// than carried, so walking the set costs a fixed ~88 bytes per utxo
-/// instead of holding every serialized entry at once.
+/// than carried, so the sort holds a fixed ~88 bytes per utxo instead
+/// of every serialized entry at once.  The database walk needs no rows:
+/// it folds each entry as the bucket hands it over, already in order.
 type UtxoStatsRow = (Vec<u8>, Hash, i64, i64, [u8; 32]);
 
 fn rule_error(kind: RuleErrorKind, description: impl Into<String>) -> RuleError {
@@ -164,12 +164,8 @@ impl crate::utxoview::UtxoResolver for ChainUtxoResolver<'_> {
 /// with the chain state and configuration (the subset of dcrd's
 /// `BlockChain` struct this port reads).  dcrd's locks are not
 /// reproduced -- the daemon holds one mutex over the whole chain --
-/// but its database flush points are; see
-/// [`Chain::HEADER_FLUSH_THRESHOLD`].
+/// but its database flush points are.
 pub struct Chain {
-    /// Accepted headers that force a block index flush; see
-    /// [`Chain::HEADER_FLUSH_THRESHOLD`].
-    header_flush_threshold: usize,
     /// The block tree arena.
     pub store: NodeStore,
     /// The block index over the arena.
@@ -191,17 +187,26 @@ pub struct Chain {
 
     /// The view of the current best chain.
     pub best_chain: NodeChainView,
-    /// Full block data by block hash: the in-memory stand-in for
-    /// dcrd's database block storage and recent block cache until the
-    /// persistence wiring lands.
-    pub blocks: BTreeMap<[u8; 32], MsgBlock>,
-    /// Per-height ticket undo data for main chain blocks: the
-    /// in-memory stand-in for dcrd's ticket database undo rows
-    /// (written by `WriteConnectedBestNode`).
+    /// Full block data by block hash: a recent-window mirror of the
+    /// blocks stored in the database, standing in for dcrd's recent
+    /// block cache.  Every block is stored to the database when its
+    /// data is accepted; the mirror keeps only the recent ones (see
+    /// [`Chain::MIN_MEMORY_STAKE_NODES`]), and older ones are read back
+    /// from the database.  Without a database it is the only copy and is
+    /// never evicted.  The blocks are shared as `Arc`s so the connect
+    /// path hands the mirror's copy to the attach loop and to the
+    /// notifications instead of copying it, like dcrd sharing one
+    /// `*dcrutil.Block` from its cache.
+    pub blocks: BTreeMap<[u8; 32], Arc<MsgBlock>>,
+    /// Per-height ticket undo data for main chain blocks: a
+    /// recent-window mirror of dcrd's ticket database undo rows, which
+    /// `connect_block` writes through `WriteConnectedBestNode`; evicted
+    /// with the other mirrors and read back from the database past the
+    /// window.
     pub stake_undo: BTreeMap<i64, Vec<UndoTicketData>>,
     /// Per-height maturing ticket hashes for main chain blocks: the
-    /// in-memory stand-in for dcrd's ticket database new tickets
-    /// rows.
+    /// recent-window mirror of dcrd's ticket database new tickets rows,
+    /// kept like [`Chain::stake_undo`].
     pub stake_new_tickets: BTreeMap<i64, Vec<dcroxide_chainhash::Hash>>,
 
     /// The flushed UTXO set by outpoint for chains WITHOUT a backing
@@ -223,10 +228,12 @@ pub struct Chain {
     /// their misses like dcrd's mutex-guarded cache does.
     pub utxo_cache: RefCell<BTreeMap<OutPointKey, Option<UtxoEntry>>>,
     /// The transaction spend journal by block hash, in dcrd's
-    /// serialized journal format: the in-memory stand-in for dcrd's
-    /// spend journal bucket.  The serialization is deliberately round
-    /// tripped because dcrd reconstructs the spent entries' heights
-    /// and indexes from the spending inputs' fraud proofs on load.
+    /// serialized journal format: a recent-window mirror of dcrd's
+    /// spend journal bucket, which `connect_block` writes; evicted with
+    /// the other mirrors and read back from the database past the
+    /// window.  The serialization is deliberately round tripped because
+    /// dcrd reconstructs the spent entries' heights and indexes from the
+    /// spending inputs' fraud proofs on load.
     pub spend_journal: BTreeMap<[u8; 32], Vec<u8>>,
     /// The version 2 GCS filters by block hash; like dcrd, filters
     /// are intentionally not removed on disconnect.
@@ -278,8 +285,10 @@ pub struct Chain {
     pub min_known_work: Option<Uint256>,
     /// The backing database when the chain is persistent.
     pub db: Option<dcroxide_database::Database>,
-    /// The treasury state rows by block hash: the in-memory mirror of
-    /// dcrd's treasury bucket.
+    /// The treasury state rows by block hash: a recent-window mirror
+    /// of dcrd's treasury bucket, evicted with the other mirrors and
+    /// read through the database fallback beyond it (the whole bucket
+    /// for chains without a database).
     pub treasury_state: BTreeMap<[u8; 32], crate::treasurydb::TreasuryState>,
     /// The blocks each treasury spend was mined in: the in-memory
     /// mirror of dcrd's tspend bucket.
@@ -300,6 +309,76 @@ pub struct Chain {
     /// verifies every signature directly.  Shared behind an `Arc` so
     /// the daemon's mempool seams reuse the same cache.
     pub sig_cache: Option<Arc<dcroxide_txscript::SigCache>>,
+    /// The blocks that recently passed the contextual checks (dcrd
+    /// `recentContextChecks`).
+    recent_context_checks: RecentContextChecks,
+    /// The shutdown interrupt (dcrd `BlockChain.interrupt`, its
+    /// context's `Done` channel), set by [`Chain::open_with_interrupt`].
+    /// Only the startup UTXO catch-up checks it, as dcrd's
+    /// `UtxoCache.Initialize` does; the reorganization loops do not
+    /// (see [`Chain::reorganize_chain_internal`]).
+    interrupt: Option<Arc<AtomicBool>>,
+    /// The adjusted-clock unix time the cached chain tips were last
+    /// pruned (dcrd `blockIndex.cachedTipsLastPruned`, a wall-clock
+    /// time); zero until a connect first observes the clock.
+    cached_tips_last_pruned_unix: i64,
+}
+
+/// The time between prunes of the cached chain tips, in seconds (dcrd
+/// `cachedTipsPruneInterval`, `blockindex.go:50-52`).
+const CACHED_TIPS_PRUNE_INTERVAL_SECS: i64 = 5 * 60;
+
+/// The number of recent successful contextual block checks tracked
+/// (dcrd `contextCheckCacheSize`, `chain.go:50-52`).
+const CONTEXT_CHECK_CACHE_SIZE: usize = 25;
+
+/// The hashes of blocks that recently passed the contextual checks
+/// (dcrd's `recentContextChecks`, an `lru.Set` of
+/// [`CONTEXT_CHECK_CACHE_SIZE`] hashes, `chain.go:219-223`).
+///
+/// It is not only an optimization.  dcrd's `checkBlockContext` returns
+/// early on a hit (`validate.go:1937-1940`) whatever flags it is called
+/// with, and `maybeAcceptBlocks` records every block it checks, with
+/// the flags of the block being processed.  A block linked by a
+/// fast-added parent is therefore checked with `BFFastAdd` there and
+/// skips the full-flag context checks when it is attached, although it
+/// was never marked validated itself.
+#[derive(Default)]
+struct RecentContextChecks {
+    /// The hashes, least recently used first.
+    hashes: alloc::collections::VecDeque<[u8; 32]>,
+}
+
+impl RecentContextChecks {
+    /// Whether the hash is present, making it the most recently used
+    /// when it is (lru `Set.Contains`).
+    fn contains(&mut self, hash: &Hash) -> bool {
+        let Some(pos) = self.hashes.iter().position(|h| *h == hash.0) else {
+            return false;
+        };
+        if let Some(h) = self.hashes.remove(pos) {
+            self.hashes.push_back(h);
+        }
+        true
+    }
+
+    /// Add the hash, or refresh it, as the most recently used, evicting
+    /// the least recently used past the limit (lru `Set.Put`).
+    fn put(&mut self, hash: Hash) {
+        if let Some(pos) = self.hashes.iter().position(|h| *h == hash.0) {
+            self.hashes.remove(pos);
+        } else if self.hashes.len() >= CONTEXT_CHECK_CACHE_SIZE {
+            self.hashes.pop_front();
+        }
+        self.hashes.push_back(hash.0);
+    }
+
+    /// Remove the hash when present (lru `Set.Delete`).
+    fn delete(&mut self, hash: &Hash) {
+        if let Some(pos) = self.hashes.iter().position(|h| *h == hash.0) {
+            self.hashes.remove(pos);
+        }
+    }
 }
 
 /// Information about the current best chain block and related state
@@ -373,7 +452,7 @@ impl Chain {
         let mut blocks = BTreeMap::new();
         blocks.insert(
             params.genesis_block.header.block_hash().0,
-            params.genesis_block.clone(),
+            Arc::new(params.genesis_block.clone()),
         );
 
         // The initial best state uses the genesis block's own values
@@ -417,7 +496,6 @@ impl Chain {
         }
 
         Chain {
-            header_flush_threshold: Chain::HEADER_FLUSH_THRESHOLD,
             store,
             index,
             assume_valid: config_assume_valid,
@@ -458,6 +536,9 @@ impl Chain {
             sig_cache: Some(Arc::new(dcroxide_txscript::SigCache::new(
                 DEFAULT_SIG_CACHE_MAX_ENTRIES,
             ))),
+            recent_context_checks: RecentContextChecks::default(),
+            interrupt: None,
+            cached_tips_last_pruned_unix: 0,
         }
     }
 
@@ -519,6 +600,18 @@ impl Chain {
     /// otherwise (dcrd `createChainState`/`initChainState`; the
     /// legacy version migration and `upgradeDB` paths are not
     /// applicable to dcroxide's fresh-sync databases).
+    ///
+    /// Nor is `New`'s version 3 test network pass (`chain.go:2498-2528`),
+    /// which invalidates, with notifications suppressed, every chain
+    /// tip whose ancestor at `testNet3MaxDiffActivationHeight` is not
+    /// `block962928Hash`.  It cleans up databases that stored the
+    /// pre-reset branch before dcrd enforced that checkpoint.  No
+    /// dcroxide database can hold such a branch: the only runtime
+    /// insertion into the block index, in `maybe_accept_block_header`,
+    /// runs `check_block_header_positional` first, and that rejects
+    /// any other header at the height with `ErrBadMaxDiffCheckpoint`
+    /// whether or not the block is a fast add -- a check that predates
+    /// the port's first persisted chain state.
     pub fn open(
         db: dcroxide_database::Database,
         params: &Params,
@@ -526,9 +619,34 @@ impl Chain {
         config_allow_old_forks: bool,
         created_unix: u64,
     ) -> Result<Chain, crate::chaindb::ChainDbError> {
+        Self::open_with_interrupt(
+            db,
+            params,
+            config_assume_valid,
+            config_allow_old_forks,
+            created_unix,
+            None,
+        )
+    }
+
+    /// [`Chain::open`] with the shutdown interrupt, which dcrd's `New`
+    /// takes as its context and keeps as `interrupt: ctx.Done()`
+    /// (`chain.go:2457`).  Setting it stops the startup UTXO catch-up
+    /// replay at the next block with
+    /// [`crate::chaindb::ChainDbError::Interrupted`], as dcrd's
+    /// `UtxoCache.Initialize` returns `errInterruptRequested`.
+    pub fn open_with_interrupt(
+        db: dcroxide_database::Database,
+        params: &Params,
+        config_assume_valid: Hash,
+        config_allow_old_forks: bool,
+        created_unix: u64,
+        interrupt: Option<Arc<AtomicBool>>,
+    ) -> Result<Chain, crate::chaindb::ChainDbError> {
         use crate::chaindb;
 
         let mut chain = Chain::new(params, config_assume_valid, config_allow_old_forks);
+        chain.interrupt = interrupt;
 
         // Determine the state of the database.
         let mut db_info: Option<chaindb::DatabaseInfo> = None;
@@ -537,14 +655,35 @@ impl Chain {
             Ok(())
         })?;
 
-        if let Some(info) = &db_info
-            && info.version > chaindb::CURRENT_DATABASE_VERSION
-        {
-            return Err(chaindb::ChainDbError::Corrupt(format!(
-                "the database is no longer compatible ({} > {})",
-                info.version,
-                chaindb::CURRENT_DATABASE_VERSION
-            )));
+        // Don't allow downgrades of the database, its compression
+        // version, or its block index (dcrd `initChainState`,
+        // `chainio.go:1627-1650`, with its messages).  The spend
+        // journal version has no such check in dcrd either.
+        if let Some(info) = &db_info {
+            if info.version > chaindb::CURRENT_DATABASE_VERSION {
+                return Err(chaindb::ChainDbError::Corrupt(format!(
+                    "the current blockchain database is no longer compatible with this \
+                     version of the software ({} > {})",
+                    info.version,
+                    chaindb::CURRENT_DATABASE_VERSION
+                )));
+            }
+            if info.comp_ver > crate::CURRENT_COMPRESSION_VERSION {
+                return Err(chaindb::ChainDbError::Corrupt(format!(
+                    "the current database compression version is no longer compatible with \
+                     this version of the software ({} > {})",
+                    info.comp_ver,
+                    crate::CURRENT_COMPRESSION_VERSION
+                )));
+            }
+            if info.bidx_ver > chaindb::CURRENT_BLOCK_INDEX_VERSION {
+                return Err(chaindb::ChainDbError::Corrupt(format!(
+                    "the current database block index version is no longer compatible with \
+                     this version of the software ({} > {})",
+                    info.bidx_ver,
+                    chaindb::CURRENT_BLOCK_INDEX_VERSION
+                )));
+            }
         }
 
         if db_info.is_none() {
@@ -655,11 +794,14 @@ impl Chain {
         }
         chain.db = Some(db);
 
-        // The load's new-rules pass clears validation failures from
-        // blocks that failed under rules predating a newly detected
-        // agenda.  Those rows go down before the deployment version
-        // advances, so a crash between the two re-runs the pass rather
-        // than skipping it (dcrd `chainio.go:1776-1793`).
+        // dcrd flushes the block index here when new rules were
+        // detected, "since blocks may have been unmarked", before it
+        // advances the deployment version (`chainio.go:1776-1793`).
+        // The unmarking never marks those nodes modified, though, so
+        // that flush writes none of their rows (`blockindex.go:1411`
+        // returns on an empty modified set): the cleared statuses live
+        // in memory only.  The flush is kept for whatever else is
+        // queued, as dcrd has it.
         if new_rules_start_time != 0 {
             chain.flush_block_index(params)?;
         }
@@ -679,9 +821,9 @@ impl Chain {
     /// happened).
     ///
     /// Returns the start time of the newly detected deployments, which
-    /// the caller needs: a non-zero one means the load changed block
-    /// index rows, and dcrd flushes those before advancing the stored
-    /// deployment version (`chainio.go:1776-1793`).
+    /// the caller needs: a non-zero one is what makes dcrd flush the
+    /// block index before advancing the stored deployment version
+    /// (`chainio.go:1776-1793`).
     fn load_chain_state(
         &mut self,
         tx: &dcroxide_database::Transaction,
@@ -706,44 +848,70 @@ impl Chain {
             }
         }
 
-        // Load the block index in height order.
-        let entries = chaindb::db_load_block_index(tx)?;
+        // Load the block index in height order, building each node as
+        // its row is decoded rather than collecting the rows first, as
+        // dcrd's `loadBlockIndex` walks its cursor
+        // (`chainio.go:1416-1509`).  Only the first entry is hashed
+        // here, for the genesis check; `new_node` hashes every other
+        // header once, as dcrd's `initBlockNode` does.
         let genesis_hash = params.genesis_block.header.block_hash();
-        for (i, entry) in entries.iter().enumerate() {
-            let block_hash = entry.header.block_hash();
-            if i == 0 {
+        let mut first = true;
+        let mut last_node: Option<NodeId> = None;
+        chaindb::db_load_block_index(tx, |entry| {
+            if first {
                 // The first entry is the genesis block, which the
                 // constructor already created, so there is nothing to
                 // add -- only the shape to check.
-                if block_hash != genesis_hash {
+                first = false;
+                if entry.header.block_hash() != genesis_hash {
                     return Err(chaindb::ChainDbError::Corrupt(
                         "expected first block index entry to be the genesis block".into(),
                     ));
                 }
-                continue;
+                last_node = self.index.lookup_node(&genesis_hash);
+                return Ok(());
             }
-            let parent = self
-                .index
-                .lookup_node(&entry.header.prev_block)
-                .ok_or_else(|| {
-                    chaindb::ChainDbError::Corrupt(format!(
-                        "could not find parent for block {block_hash}"
-                    ))
-                })?;
+            // Rows arrive in height order, so the previous one is very
+            // likely the parent (dcrd's `lastNode` shortcut).
+            let parent = match last_node {
+                Some(last) if entry.header.prev_block == self.store.node(last).hash => last,
+                _ => self
+                    .index
+                    .lookup_node(&entry.header.prev_block)
+                    .ok_or_else(|| {
+                        chaindb::ChainDbError::Corrupt(format!(
+                            "could not find parent for block {}",
+                            entry.header.block_hash()
+                        ))
+                    })?,
+            };
             let node = self.store.new_node(&entry.header, Some(parent));
             {
+                // Only the votes come back from the row.  The voted and
+                // revoked tickets stay unpopulated, exactly as dcrd's
+                // `loadBlockIndex` leaves `ticketsVoted`/`ticketsRevoked`
+                // nil (`chainio.go:1488-1502`), so the first
+                // `maybe_fetch_ticket_info` re-reads them from the block
+                // (`stakenode.go:71-81`).  Marking them populated here
+                // handed `fetch_stake_node` empty lists, which recorded
+                // every voter as missed and dropped every revocation.
                 let n = self.store.node_mut(node);
                 n.status = crate::blockindex::BlockStatus(entry.status);
-                n.votes = entry.vote_info.clone();
-                n.ticket_info_populated = crate::blockindex::BlockStatus(entry.status).have_data();
+                n.votes = entry.vote_info;
             }
 
             // Unmark blocks that failed validation before newly
-            // detected consensus rules took effect.  This is the only
-            // place the load loop changes a row, so it is the only place
-            // that has to mark one: everything else here reconstructs
-            // exactly what came off disk.
-            let mut status_changed = false;
+            // detected consensus rules took effect.  The change is made
+            // in memory only, exactly as in dcrd: its `loadBlockIndex`
+            // clears the bits and then inserts the node with
+            // `addNodeFromDB`, which never marks it modified
+            // (`chainio.go:1494-1502`, `blockindex.go:733-751`).  So the
+            // row keeps its failure on disk until something else
+            // rewrites it -- a revalidation, or a ticket info reload
+            // (`maybe_fetch_ticket_info` marks like dcrd's
+            // `PopulateTicketInfo`) -- and a node restarted again
+            // before that reloads it as failed, even though the
+            // deployment version has moved on by then.
             if new_rules_start_time != 0 {
                 let status = self.store.node(node).status;
                 if status.known_validate_failed() || status.known_invalid_ancestor() {
@@ -755,7 +923,6 @@ impl Chain {
                                 & !(crate::blockindex::BlockStatus::VALIDATE_FAILED.0
                                     | crate::blockindex::BlockStatus::INVALID_ANCESTOR.0),
                         );
-                        status_changed = true;
                     }
                 }
             }
@@ -763,10 +930,9 @@ impl Chain {
             let parent_can_validate = self.index.can_validate(&self.store, parent);
             self.store.node_mut(node).is_fully_linked = parent_can_validate;
             self.index.add_node_from_db(&self.store, node);
-            if status_changed {
-                self.index.mark_modified(node);
-            }
-        }
+            last_node = Some(node);
+            Ok(())
+        })?;
         // Set the best chain to the stored state.
         let tip = self.index.lookup_node(&state.hash).ok_or_else(|| {
             crate::chaindb::ChainDbError::Corrupt(format!(
@@ -795,12 +961,12 @@ impl Chain {
         }
 
         // Warm the recent-window mirrors (blocks, spend journals,
-        // filters, commitments) only within `MIN_MEMORY_STAKE_NODES`
-        // of the tip; everything older is served from the database on
-        // demand through the fallbacks, so a restart at a large tip
-        // does not load the whole chain into memory.  The UTXO set and
-        // treasury account are loaded in full below since dcrd keeps
-        // those resident.
+        // filters, commitments, treasury state rows) only within
+        // `MIN_MEMORY_STAKE_NODES` of the tip; everything older is
+        // served from the database on demand through the fallbacks, so
+        // a restart at a large tip does not load the whole chain into
+        // memory.  dcrd keeps none of these resident; it reads its
+        // database, which the fallbacks do past the window.
         let keep_below = i64::from(state.height).saturating_sub(Self::MIN_MEMORY_STAKE_NODES);
         let node_ids: Vec<NodeId> = {
             let mut ids = Vec::new();
@@ -829,7 +995,7 @@ impl Chain {
             let (block, _) = dcroxide_wire::MsgBlock::from_bytes(&raw).map_err(|e| {
                 crate::chaindb::ChainDbError::Corrupt(format!("bad stored block: {e:?}"))
             })?;
-            self.blocks.insert(hash.0, block);
+            self.blocks.insert(hash.0, Arc::new(block));
 
             let meta = tx.metadata();
             if let Some(bucket) = meta.bucket(crate::chaindb::SPEND_JOURNAL_BUCKET_NAME)
@@ -844,6 +1010,9 @@ impl Chain {
             if !commitments.is_empty() {
                 self.header_commitments.insert(hash.0, commitments);
             }
+            if let Some(ts) = crate::treasurydb::db_fetch_treasury_balance(tx, &hash)? {
+                self.treasury_state.insert(hash.0, ts);
+            }
         }
 
         // The per-height ticket database rows are read from the
@@ -852,23 +1021,8 @@ impl Chain {
         // into memory here.
         let meta = tx.metadata();
 
-        // The treasury account and spend rows.
-        if let Some(bucket) = meta.bucket(crate::chaindb::TREASURY_BUCKET_NAME) {
-            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            bucket.for_each(|k, v| {
-                rows.push((k.to_vec(), v.to_vec()));
-                Ok(())
-            })?;
-            for (k, v) in rows {
-                if k.len() == 32 {
-                    let mut hash = [0u8; 32];
-                    hash.copy_from_slice(&k);
-                    let ts = crate::treasurydb::deserialize_treasury_state(&v)
-                        .map_err(crate::chaindb::ChainDbError::Corrupt)?;
-                    self.treasury_state.insert(hash, ts);
-                }
-            }
-        }
+        // The treasury spend rows, one per mined treasury spend, are
+        // loaded in full: `check_tspend_exists` reads only the mirror.
         if let Some(bucket) = meta.bucket(crate::chaindb::TREASURY_TSPEND_BUCKET_NAME) {
             let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             bucket.for_each(|k, v| {
@@ -976,16 +1130,16 @@ impl Chain {
         if self.db.is_none() {
             return Ok(());
         }
-        let rows = self.take_block_index_rows(params);
+        let rows = self.take_block_index_rows(params)?;
         let tip = self.best_chain.tip().expect("best chain tip");
         let (tip_hash, tip_height, work_sum) = {
             let n = self.store.node(tip);
             (n.hash, n.height, n.work_sum)
         };
         let eviction_height = self.utxo_calc_flush_eviction_height(tip_height as u32);
-        let db_updates = self.utxo_flush_collect();
         let snapshot = self.state_snapshot.clone();
         let db = self.db.as_ref().expect("checked above");
+        let cache = self.utxo_cache.borrow();
         // One transaction for the block index rows, the UTXO entries,
         // and both state markers: dcrd's backend `PutUtxos` couples the
         // entry writes with the utxo set state atomically, so a crash
@@ -996,10 +1150,8 @@ impl Chain {
                 crate::chaindb::db_put_block_index_entry(tx, hash, *height, entry)
                     .map_err(chain_db_to_db_error)?;
             }
-            for (outpoint, entry) in &db_updates {
-                crate::chaindb::db_put_utxo(tx, outpoint, entry.as_ref())
-                    .map_err(chain_db_to_db_error)?;
-            }
+            crate::chaindb::db_put_utxos(tx, utxo_flush_rows(&cache))
+                .map_err(chain_db_to_db_error)?;
             crate::chaindb::db_put_utxo_set_state(
                 tx,
                 &crate::utxoio::UtxoSetState {
@@ -1019,6 +1171,7 @@ impl Chain {
             .map_err(chain_db_to_db_error)?;
             Ok(())
         })?;
+        drop(cache);
         self.utxo_flush_finish(eviction_height, tip_hash);
         // Make everything durable: dcrd's UTXO cache flush makes the
         // block database durable on every flush (`flushBlockDB` at
@@ -1078,7 +1231,7 @@ impl Chain {
         if self.index.modified_len() == 0 {
             return Ok(());
         }
-        let rows = self.take_block_index_rows(params);
+        let rows = self.take_block_index_rows(params)?;
         let db = self.db.as_ref().expect("checked above");
         db.update(|tx| {
             for (hash, height, entry) in &rows {
@@ -1096,15 +1249,32 @@ impl Chain {
     fn take_block_index_rows(
         &mut self,
         params: &Params,
-    ) -> Vec<(Hash, u32, crate::chainio::BlockIndexEntry)> {
+    ) -> Result<Vec<(Hash, u32, crate::chainio::BlockIndexEntry)>, crate::chaindb::ChainDbError>
+    {
         let modified = self.index.take_modified();
-        // Populate prunable ticket info for nodes with data available.
+        // Reload any pruned ticket info for the modified nodes that can
+        // be validated (dcrd `flushBlockIndex`, `chain.go:1490-1503`).
+        // `can_validate` rather than `have_data` is dcrd's gate: it
+        // guarantees every ancestor has its data, which the maturing
+        // tickets lookup reads.
         for &id in &modified {
-            let n = self.store.node(id);
-            if n.status.have_data() && !n.ticket_info_populated {
-                self.maybe_fetch_ticket_info(id, params);
+            if !self.index.can_validate(&self.store, id) {
+                continue;
+            }
+            if let Err(err) = self.maybe_fetch_ticket_info(id, params) {
+                // dcrd returns before `blockIndex.Flush` clears its
+                // modified set, so the nodes stay queued.
+                for &id in &modified {
+                    self.index.mark_modified(id);
+                }
+                return Err(crate::chaindb::ChainDbError::Corrupt(err.description));
             }
         }
+        // The reload marks each node it populates, which dcrd does
+        // before `Flush` drains the set; every one of them is already
+        // in `modified`, so drain the marks again rather than rewrite
+        // those rows at the next flush.
+        let _ = self.index.take_modified();
         let mut rows = Vec::with_capacity(modified.len());
         for id in modified {
             let n = self.store.node(id);
@@ -1118,7 +1288,7 @@ impl Chain {
                 },
             ));
         }
-        rows
+        Ok(rows)
     }
 
     /// Apply the view's committed changes to the UTXO cache with dcrd
@@ -1136,29 +1306,36 @@ impl Chain {
 
     /// Add or update an unspent entry in the cache (dcrd
     /// `UtxoCache.addEntry`): new-to-cache entries are marked fresh
-    /// and updates preserve the existing freshness.
+    /// and updates take the existing entry's freshness, clearing any
+    /// fresh bit the incoming entry carries when the existing one is
+    /// not (`utxocache.go:305-309`) -- a fresh entry over a row the
+    /// backend holds would make a later spend drop the entry without
+    /// ever deleting that row.
     fn cache_add_entry(&mut self, key: OutPointKey, mut entry: UtxoEntry) {
         entry.set_state_bits(entry.state_bits() | crate::utxoentry::UTXO_STATE_MODIFIED);
-        let cache = self.utxo_cache.get_mut();
         let entry_size = utxo_entry_size(&entry);
         let mut total = self.utxo_total_entry_size.get();
-        match cache.get(&key) {
-            Some(Some(existing)) => {
+        // One descent of the map for the probe and the store alike.
+        let slot = self.utxo_cache.get_mut().entry(key).or_insert(None);
+        match slot {
+            Some(existing) => {
                 if existing.is_fresh() {
                     entry.set_state_bits(entry.state_bits() | crate::utxoentry::UTXO_STATE_FRESH);
+                } else {
+                    entry.set_state_bits(entry.state_bits() & !crate::utxoentry::UTXO_STATE_FRESH);
                 }
                 total = total.saturating_sub(utxo_entry_size(existing));
             }
             // Both a missing entry and an explicit spent marker mean
             // the backend has never seen this output (dcrd's map
             // lookup returns nil for both).
-            _ => {
+            None => {
                 entry.set_state_bits(entry.state_bits() | crate::utxoentry::UTXO_STATE_FRESH);
             }
         }
+        *slot = Some(entry);
         self.utxo_total_entry_size
             .set(total.saturating_add(entry_size));
-        cache.insert(key, Some(entry));
     }
 
     /// Spend an output in the cache (dcrd `UtxoCache.spendEntry`):
@@ -1175,28 +1352,32 @@ impl Chain {
             BackendLookup,
         }
         let action = match self.utxo_cache.get_mut().get_mut(&key) {
-            Some(None) => SpendAction::Done,
-            Some(Some(entry)) => {
-                assert!(!entry.is_spent(), "attempt to double spend in view commit");
-                if entry.is_fresh() {
-                    SpendAction::Tombstone(utxo_entry_size(entry))
-                } else {
-                    entry.set_state_bits(
-                        entry.state_bits()
-                            | crate::utxoentry::UTXO_STATE_SPENT
-                            | crate::utxoentry::UTXO_STATE_MODIFIED,
-                    );
-                    SpendAction::Done
+            Some(slot) => match slot {
+                None => SpendAction::Done,
+                Some(entry) => {
+                    assert!(!entry.is_spent(), "attempt to double spend in view commit");
+                    if entry.is_fresh() {
+                        // A fresh entry was never flushed: replace it
+                        // in place with an explicit spent marker so
+                        // later lookups still hit.
+                        let removed_size = utxo_entry_size(entry);
+                        *slot = None;
+                        SpendAction::Tombstone(removed_size)
+                    } else {
+                        entry.set_state_bits(
+                            entry.state_bits()
+                                | crate::utxoentry::UTXO_STATE_SPENT
+                                | crate::utxoentry::UTXO_STATE_MODIFIED,
+                        );
+                        SpendAction::Done
+                    }
                 }
-            }
+            },
             None => SpendAction::BackendLookup,
         };
         match action {
             SpendAction::Done => {}
-            // A fresh entry was never flushed: replace it with an
-            // explicit spent marker so later lookups still hit.
             SpendAction::Tombstone(removed_size) => {
-                self.utxo_cache.get_mut().insert(key, None);
                 self.utxo_total_entry_size.set(
                     self.utxo_total_entry_size
                         .get()
@@ -1236,16 +1417,15 @@ impl Chain {
     /// resolver seam has no error channel, so the class dcrd surfaces
     /// as backend errors aborts here (a documented divergence).
     ///
-    /// A redb *read* error never reaches this seam to be panicked on:
-    /// `Transaction::fetch_raw` has already turned it into `None`, so
-    /// for the rest of the current transaction a storage fault reads
-    /// as a missing output, and a valid block can be rejected with
-    /// `ErrMissingTxOut` on the strength of a failing disk.  That
-    /// window is one transaction wide — redb latches the failure, so
-    /// the next transaction cannot open the metadata table and this
-    /// function aborts instead.  dcrd does distinguish the two on this
-    /// path: `levelDbUtxoBackend.Get` separates `ErrNotFound` from a
-    /// real error and `dbFetchUtxoEntry` propagates it.
+    /// A redb *read* error aborts here too.  `db_fetch_utxo_entry`
+    /// reads with `Bucket::try_get`, which returns it rather than
+    /// reading it as a missing output, as `levelDbUtxoBackend.Get`
+    /// separates `ErrNotFound` from a real error and `dbFetchUtxoEntry`
+    /// propagates it.  Read as absence it would not stay within one
+    /// transaction: after an I/O error redb keeps serving cached pages
+    /// and fails only the uncached ones, so every later block needing
+    /// an uncached output would be rejected as `ErrMissingTxOut` until
+    /// restart.
     fn backend_fetch_entry(&self, key: &OutPointKey) -> Option<UtxoEntry> {
         let Some(db) = &self.db else {
             return self.utxo_backend.get(key).cloned();
@@ -1349,13 +1529,14 @@ impl Chain {
         last_flush_height: u32,
     ) -> Result<(), crate::chaindb::ChainDbError> {
         let eviction_height = self.utxo_calc_flush_eviction_height(last_flush_height);
-        let db_updates = self.utxo_flush_collect();
         if let Some(db) = &self.db {
+            // The rows are serialized straight out of the cache, which
+            // ignores the state bits, so nothing is cloned to clear
+            // them first.
+            let cache = self.utxo_cache.borrow();
             db.update(|tx| {
-                for (outpoint, entry) in &db_updates {
-                    crate::chaindb::db_put_utxo(tx, outpoint, entry.as_ref())
-                        .map_err(chain_db_to_db_error)?;
-                }
+                crate::chaindb::db_put_utxos(tx, utxo_flush_rows(&cache))
+                    .map_err(chain_db_to_db_error)?;
                 crate::chaindb::db_put_utxo_set_state(
                     tx,
                     &crate::utxoio::UtxoSetState {
@@ -1367,12 +1548,17 @@ impl Chain {
                 Ok(())
             })
             .map_err(crate::chaindb::ChainDbError::Db)?;
+        } else {
+            self.utxo_flush_to_memory_backend();
         }
+        // The eviction needs the rows only committed, not durable: an
+        // evicted entry is read back through the database cache's
+        // overlay until that reaches disk, and a crash before then loses
+        // the in-memory state along with it.
         self.utxo_flush_finish(eviction_height, last_flush_hash);
         // Bound the crash-loss window to the UTXO flush cadence like
         // dcrd, whose every UTXO cache flush makes the block database
-        // durable (`flushBlockDB`); the eviction that follows relies
-        // on these writes having reached disk.
+        // durable (`flushBlockDB`).
         if let Some(db) = self.db.as_ref()
             && let Err(e) = db.flush()
         {
@@ -1381,13 +1567,12 @@ impl Chain {
         Ok(())
     }
 
-    /// Collect the modified cache entries as backend writes and apply
-    /// them to the in-memory backend when there is no database (the
-    /// write half of dcrd `UtxoCache.flush`; dcrd's `dbPutUtxoEntry`
-    /// skips unmodified entries the same way).
-    fn utxo_flush_collect(&mut self) -> Vec<(OutPoint, Option<UtxoEntry>)> {
-        let has_db = self.db.is_some();
-        let mut db_updates: Vec<(OutPoint, Option<UtxoEntry>)> = Vec::new();
+    /// Apply the modified cache entries to the in-memory backend of a
+    /// chain without a database (the write half of dcrd
+    /// `UtxoCache.flush`; dcrd's `dbPutUtxoEntry` skips unmodified
+    /// entries the same way).  Database-backed chains write
+    /// [`utxo_flush_rows`] inside their flush transaction instead.
+    fn utxo_flush_to_memory_backend(&mut self) {
         let mut memory_writes: Vec<(OutPointKey, Option<UtxoEntry>)> = Vec::new();
         for (key, entry) in self.utxo_cache.get_mut().iter() {
             let Some(entry) = entry else {
@@ -1396,25 +1581,12 @@ impl Chain {
             if !entry.is_modified() {
                 continue;
             }
-            let outpoint = OutPoint {
-                hash: Hash(key.0),
-                index: key.1,
-                tree: key.2,
-            };
             if entry.is_spent() {
-                if has_db {
-                    db_updates.push((outpoint, None));
-                } else {
-                    memory_writes.push((*key, None));
-                }
+                memory_writes.push((*key, None));
             } else {
                 let mut cleaned = entry.clone();
                 cleaned.set_state_bits(0);
-                if has_db {
-                    db_updates.push((outpoint, Some(cleaned)));
-                } else {
-                    memory_writes.push((*key, Some(cleaned)));
-                }
+                memory_writes.push((*key, Some(cleaned)));
             }
         }
         for (key, write) in memory_writes {
@@ -1427,7 +1599,6 @@ impl Chain {
                 }
             }
         }
-        db_updates
     }
 
     /// Evict and clean the cache after a successful backend write
@@ -1585,23 +1756,32 @@ impl Chain {
         // the cache being flushed; in the typical catch-up the fork
         // IS the last flushed node and this loop is skipped.
         let mut n = Some(last_flushed);
-        let mut next_block_to_detach: Option<MsgBlock> = None;
+        let mut next_block_to_detach: Option<Arc<MsgBlock>> = None;
         while let Some(id) = n {
             if Some(id) == fork {
                 break;
             }
+            // Stop promptly on a shutdown request, before each block
+            // (dcrd `utxocache.go:884-889`).  The replay so far stays
+            // in the cache, unflushed, exactly as dcrd leaves it.
+            if self.interrupt_requested() {
+                return Err(crate::chaindb::ChainDbError::Interrupted);
+            }
             let block = match next_block_to_detach.take() {
                 Some(b) => b,
-                None => self.block_by_node(id),
+                None => self.block_arc(id)?,
             };
             assert_eq!(
                 self.store.node(id).hash,
                 block.header.block_hash(),
                 "detach block node hash does not match the block"
             );
+            // The parent is also the next block to detach, so it moves
+            // into `next_block_to_detach` once this block is done with
+            // it rather than being loaded again (dcrd
+            // `nextBlockToDetach`).
             let parent_id = self.store.node(id).parent.expect("detached block parent");
-            let parent = self.block_by_node(parent_id);
-            next_block_to_detach = Some(parent.clone());
+            let parent = self.block_arc(parent_id)?;
 
             let prev_height = Some(self.store.node(parent_id).height);
             let is_treasury_enabled = {
@@ -1633,6 +1813,7 @@ impl Chain {
                 (p.hash, p.height as u32)
             };
             self.maybe_flush_utxo_cache(parent_hash, parent_height, false)?;
+            next_block_to_detach = Some(parent);
             n = Some(parent_id);
         }
 
@@ -1648,10 +1829,22 @@ impl Chain {
             m = self.store.node(id).parent;
         }
         attach_nodes.reverse();
+        let mut prev_block_attached: Option<Arc<MsgBlock>> = None;
         for id in attach_nodes {
-            let block = self.block_by_node(id);
+            // dcrd checks for a shutdown request before each block here
+            // too (`utxocache.go:974-979`).
+            if self.interrupt_requested() {
+                return Err(crate::chaindb::ChainDbError::Interrupted);
+            }
+            // The parent is the block attached on the previous
+            // iteration; only the first node's parent is fetched (dcrd
+            // `prevBlockAttached`), so each block is loaded once.
+            let block = self.block_arc(id)?;
             let parent_id = self.store.node(id).parent.expect("attach parent");
-            let parent = self.block_by_node(parent_id);
+            let parent = match prev_block_attached.take() {
+                Some(p) => p,
+                None => self.block_arc(parent_id)?,
+            };
             assert_eq!(
                 self.store.node(parent_id).hash,
                 parent.header.block_hash(),
@@ -1685,10 +1878,20 @@ impl Chain {
                 (nd.hash, nd.height as u32)
             };
             self.maybe_flush_utxo_cache(node_hash, node_height, false)?;
+            prev_block_attached = Some(block);
         }
         // The unflushed tail stays in the cache for the normal flush
         // triggers, exactly like dcrd's initialization.
         Ok(())
+    }
+
+    /// Whether a shutdown has been requested through the interrupt the
+    /// chain was opened with (dcrd's non-blocking receive from
+    /// `b.interrupt`).
+    fn interrupt_requested(&self) -> bool {
+        self.interrupt
+            .as_ref()
+            .is_some_and(|interrupt| interrupt.load(Ordering::SeqCst))
     }
 
     /// Fetch an entry through the cache and backend (dcrd
@@ -1898,7 +2101,13 @@ impl Chain {
             total: 0,
             serialized_hash: Hash::ZERO,
         };
-        let mut transactions: BTreeSet<[u8; 32]> = BTreeSet::new();
+        // dcrd collects the distinct transaction hashes in a map, but the
+        // keys lead with the hash and the walk is in key order, so every
+        // output of a transaction is adjacent: counting the changes of
+        // hash gives the same count without holding a hash per
+        // transaction.
+        let mut transactions: i64 = 0;
+        let mut last_tx_hash: Option<[u8; 32]> = None;
         let mut leaves: Vec<Hash> = Vec::new();
         {
             let mut corrupt: Option<String> = None;
@@ -1908,7 +2117,13 @@ impl Chain {
                     corrupt = Some("missing utxo set bucket".into());
                     return Ok(());
                 };
-                bucket.for_each(|k, v| {
+                // `try_for_each`: dcrd's `FetchStats` checks the
+                // iterator's error after its walk, so a read fault fails
+                // the stats instead of truncating them.  The walk streams
+                // the bucket a window at a time rather than gathering
+                // every key of the set before the first row (dcrd's
+                // iterator holds one row).
+                bucket.try_for_each(|k, v| {
                     if corrupt.is_some() {
                         return Ok(());
                     }
@@ -1923,7 +2138,7 @@ impl Chain {
                             }
                             match crate::utxoio::deserialize_utxo_entry(v, outpoint.index) {
                                 Ok(entry) => {
-                                    // `for_each` walks the bucket in
+                                    // The walk visits the bucket in
                                     // serialized-key order, so the
                                     // running totals and leaf order are
                                     // already what the sorted pass
@@ -1932,17 +2147,31 @@ impl Chain {
                                     streamed.utxos += 1;
                                     streamed.size += v.len() as i64;
                                     streamed.total += entry.amount();
-                                    transactions.insert(outpoint.hash.0);
+                                    if last_tx_hash != Some(outpoint.hash.0) {
+                                        transactions += 1;
+                                        last_tx_hash = Some(outpoint.hash.0);
+                                    }
                                     leaves.push(dcroxide_chainhash::hash_h(v));
                                 }
-                                Err(e) => corrupt = Some(format!("corrupt utxo entry: {e:?}")),
+                                // dcrd's text, with the inner error's
+                                // bare description
+                                // (`utxobackend.go:563-566`).
+                                Err(e) => {
+                                    corrupt = Some(format!(
+                                        "corrupt utxo entry for {}:{}: {e}",
+                                        outpoint.hash, outpoint.index
+                                    ))
+                                }
                             }
                         }
-                        Err(e) => corrupt = Some(format!("corrupt outpoint key: {e:?}")),
+                        Err(e) => {
+                            // dcrd `utxobackend.go:539-542`.
+                            let key: String = k.iter().map(|b| format!("{b:02x}")).collect();
+                            corrupt = Some(format!("corrupt outpoint for key {key}: {e}"))
+                        }
                     }
                     Ok(())
-                })?;
-                Ok(())
+                })
             })
             .map_err(crate::chaindb::ChainDbError::Db)?;
             if let Some(desc) = corrupt {
@@ -1952,7 +2181,7 @@ impl Chain {
 
         let mut stats = streamed;
         stats.serialized_hash = dcroxide_standalone::calc_merkle_root_in_place(&mut leaves);
-        stats.transactions = transactions.len() as i64;
+        stats.transactions = transactions;
         Ok(stats)
     }
 
@@ -1971,7 +2200,10 @@ impl Chain {
             total: 0,
             serialized_hash: Hash::ZERO,
         };
-        let mut transactions: BTreeSet<[u8; 32]> = BTreeSet::new();
+        // Counted as the database walk counts them: the sorted rows keep
+        // each transaction's outputs adjacent.
+        let mut transactions: i64 = 0;
+        let mut last_tx_hash: Option<[u8; 32]> = None;
         let mut leaves: Vec<Hash> = Vec::new();
         {
             let mut rows: Vec<UtxoStatsRow> = Vec::with_capacity(self.utxo_backend.len());
@@ -1999,14 +2231,17 @@ impl Chain {
                 streamed.utxos += 1;
                 streamed.size += size;
                 streamed.total += amount;
-                transactions.insert(tx_hash);
+                if last_tx_hash != Some(tx_hash) {
+                    transactions += 1;
+                    last_tx_hash = Some(tx_hash);
+                }
                 leaves.push(leaf);
             }
         }
 
         let mut stats = streamed;
         stats.serialized_hash = dcroxide_standalone::calc_merkle_root_in_place(&mut leaves);
-        stats.transactions = transactions.len() as i64;
+        stats.transactions = transactions;
         Ok(stats)
     }
 
@@ -2018,23 +2253,27 @@ impl Chain {
         block: &MsgBlock,
         is_treasury_enabled: bool,
     ) -> Result<Vec<SpentTxOut>, RuleError> {
+        // A transaction that cannot be opened fails the operation, as
+        // dcrd's `db.View` around `dbFetchSpendJournalEntry` does.
         let serialized = self
             .spend_journal_row(&block.header.block_hash())
+            .map_err(db_read_rule_error)?
             .unwrap_or_default();
 
-        let mut block_txns: Vec<MsgTx> = Vec::new();
+        // The block's own transactions, lent rather than copied.
+        let mut block_txns: Vec<&MsgTx> = Vec::new();
         if !block.stransactions.is_empty() && is_treasury_enabled {
             // Skip the treasurybase and remove treasury spends.
             for stx in &block.stransactions[1..] {
                 if dcroxide_stake::is_tspend(stx) {
                     continue;
                 }
-                block_txns.push(stx.clone());
+                block_txns.push(stx);
             }
         } else {
-            block_txns.extend(block.stransactions.iter().cloned());
+            block_txns.extend(block.stransactions.iter());
         }
-        block_txns.extend(block.transactions.iter().skip(1).cloned());
+        block_txns.extend(block.transactions.iter().skip(1));
 
         // dcrd separates two failures here and the port had merged
         // them.  Journal data missing for a block that spends anything
@@ -2057,10 +2296,12 @@ impl Chain {
             // through a type the port has no counterpart for, and the
             // kind is what keeps `is_rule_violation` from blaming the
             // peer for local corruption.
+            // The inner error prints as dcrd's bare `errDeserialize`
+            // text (`chainio.go:790-792`).
             rule_error(
                 RuleErrorKind::UtxoBackendCorruption,
                 alloc::format!(
-                    "corrupt spend information for {}: {e:?}",
+                    "corrupt spend information for {}: {e}",
                     block.header.block_hash()
                 ),
             )
@@ -2076,27 +2317,56 @@ impl Chain {
             .expect("block data for node is stored")
     }
 
+    /// The block data for a node on the stake-node paths, or the error
+    /// dcrd's `fetchBlockByNode` returns there: the database's
+    /// `ErrBlockNotFound` with its "block %s does not exist" text
+    /// (`database/ffldb/db.go:1241`), or the failed read or decode.
+    /// The stake-node error type has no database kind, so it travels
+    /// as `ErrDatabaseCorrupt`; only the description is dcrd's.
+    fn stake_block_by_node(
+        &self,
+        node: NodeId,
+    ) -> Result<Arc<MsgBlock>, dcroxide_stake::RuleError> {
+        self.block_arc(node).map_err(|e| dcroxide_stake::RuleError {
+            kind: dcroxide_stake::ErrorKind::DatabaseCorrupt,
+            description: format!("{e}"),
+        })
+    }
+
     /// Load the list of newly maturing tickets for a node by looking
     /// back to the block containing the tickets to mature (dcrd
     /// `maybeFetchNewTickets`).  `None` means never looked up while
     /// an empty list means no tickets mature at this node.
-    pub fn maybe_fetch_new_tickets(&mut self, node: NodeId, params: &Params) {
+    pub fn maybe_fetch_new_tickets(
+        &mut self,
+        node: NodeId,
+        params: &Params,
+    ) -> Result<(), dcroxide_stake::RuleError> {
         if self.store.node(node).new_tickets.is_some() {
-            return;
+            return Ok(());
         }
 
         // No tickets in the live ticket pool are possible before
         // stake enabled height.
         if self.store.node(node).height < params.stake_enabled_height {
             self.store.node_mut(node).new_tickets = Some(Vec::new());
-            return;
+            return Ok(());
         }
 
-        let mature_node = self
+        let Some(mature_node) = self
             .store
             .relative_ancestor(node, i64::from(params.ticket_maturity))
-            .expect("ancestor at the ticket maturity distance");
-        let mature_block = self.block_by_node(mature_node);
+        else {
+            let n = self.store.node(node);
+            return Err(dcroxide_stake::RuleError {
+                kind: dcroxide_stake::ErrorKind::DatabaseCorrupt,
+                description: format!(
+                    "unable to obtain ancestor {} blocks prior to {} (height {})",
+                    params.ticket_maturity, n.hash, n.height
+                ),
+            });
+        };
+        let mature_block = self.stake_block_by_node(mature_node)?;
         let tickets: Vec<dcroxide_chainhash::Hash> = mature_block
             .stransactions
             .iter()
@@ -2104,30 +2374,41 @@ impl Chain {
             .map(|stx| stx.tx_hash())
             .collect();
         self.store.node_mut(node).new_tickets = Some(tickets);
+        Ok(())
     }
 
     /// Load and populate the prunable ticket information in the node
     /// if needed (dcrd `maybeFetchTicketInfo`).
-    pub fn maybe_fetch_ticket_info(&mut self, node: NodeId, params: &Params) {
-        self.maybe_fetch_new_tickets(node, params);
+    ///
+    /// The block comes through `block_data`, so a node whose body has
+    /// left the recent window is re-read from the database, and a
+    /// missing body is an error rather than a panic, as in dcrd.  The
+    /// node is marked modified like dcrd's `PopulateTicketInfo` marks
+    /// it (`blockindex.go:955-960`), so its row is rewritten at the
+    /// next flush with whatever status it holds in memory.
+    pub fn maybe_fetch_ticket_info(
+        &mut self,
+        node: NodeId,
+        params: &Params,
+    ) -> Result<(), dcroxide_stake::RuleError> {
+        self.maybe_fetch_new_tickets(node, params)?;
 
         if !self.store.node(node).ticket_info_populated {
-            let block = self
-                .blocks
-                .get(&self.store.node(node).hash.0)
-                .expect("block data for node is stored");
-            let info = dcroxide_stake::find_spent_tickets_in_block(block);
+            let block = self.stake_block_by_node(node)?;
+            let info = dcroxide_stake::find_spent_tickets_in_block(&block);
             let votes = info.votes.iter().map(|v| (v.version, v.bits)).collect();
             self.store
                 .populate_ticket_info(node, info.voted_tickets, info.revoked_tickets, votes);
+            self.index.mark_modified(node);
         }
+        Ok(())
     }
 
-    /// Record the in-memory ticket database rows for a main chain
-    /// node whose stake node is loaded: the undo data and maturing
-    /// tickets by height (the row content of dcrd
-    /// `stake.WriteConnectedBestNode`; the database-backed rows
-    /// arrive with the persistence wiring).
+    /// Record the recent-window mirror of the ticket database rows for
+    /// a main chain node whose stake node is loaded: the undo data and
+    /// maturing tickets by height (the row content of dcrd
+    /// `stake.WriteConnectedBestNode`, which `connect_block` also writes
+    /// to the database in its connect transaction).
     pub fn write_stake_db_rows(&mut self, node: NodeId) {
         let n = self.store.node(node);
         let stake_node = n.stake_node.as_ref().expect("stake node loaded");
@@ -2160,7 +2441,7 @@ impl Chain {
         if let Some(parent) = self.store.node(node).parent
             && self.store.node(parent).stake_node.is_some()
         {
-            self.maybe_fetch_ticket_info(node, params);
+            self.maybe_fetch_ticket_info(node, params)?;
             let n = self.store.node(node);
             let voted = n.tickets_voted.clone();
             let revoked = n.tickets_revoked.clone();
@@ -2191,11 +2472,10 @@ impl Chain {
                 // the child stake node and undoing the modifications
                 // caused by the stake details in the previous block,
                 // restoring the previous node's own bookkeeping from
-                // the ticket database rows like dcrd does.
+                // the ticket database rows like dcrd does.  A row that
+                // cannot be read fails the fetch, as it does in dcrd.
                 let prev_height = self.store.node(prev_id).height;
-                let (utds, tickets) = self
-                    .ticket_rows_by_height(prev_height)
-                    .expect("ticket rows for main chain height");
+                let (utds, tickets) = self.ticket_rows_by_height(prev_height)?;
                 let prev_iv = self.store.lottery_iv(prev_id);
                 let stake_node = self
                     .store
@@ -2235,7 +2515,7 @@ impl Chain {
             if self.store.node(id).stake_node.is_some() {
                 continue;
             }
-            self.maybe_fetch_ticket_info(id, params);
+            self.maybe_fetch_ticket_info(id, params)?;
             let nd = self.store.node(id);
             let voted = nd.tickets_voted.clone();
             let revoked = nd.tickets_revoked.clone();
@@ -2428,32 +2708,14 @@ impl Chain {
         Ok(new_node)
     }
 
-    /// The accepted-header count that forces a block index flush.
-    ///
-    /// dcrd flushes after every header (`process.go:267-271`), which it
-    /// can afford because ffldb batches. This port's writes are
-    /// `Durability::Immediate`, so per-header would be an fsync per
-    /// header -- about a million on a mainnet sync. One `headers`
-    /// message worth is the compromise: the same cadence the sync
-    /// manager already works in, ~525 flushes for mainnet, and a
-    /// bounded set to materialize when the first block connects.
-    pub const HEADER_FLUSH_THRESHOLD: usize = dcroxide_wire::MAX_BLOCK_HEADERS_PER_MSG as usize;
-
-    /// Lower the threshold, so the batching itself can be exercised.
-    ///
-    /// Reaching the default needs 2000 accepted headers, which is past
-    /// every network's stake validation height, so a headers-only
-    /// fixture cannot get there.
-    pub fn set_header_flush_threshold(&mut self, headers: usize) {
-        self.header_flush_threshold = headers;
-    }
-
     /// Insert a new block header into the chain using headers-first
     /// semantics (dcrd `ProcessBlockHeader`).
     ///
-    /// dcrd flushes the modified block index entries here, since a new
-    /// header always adds one. This flushes on the same event but not at
-    /// the same rate -- see [`Self::HEADER_FLUSH_THRESHOLD`].
+    /// The modified block index entries are flushed after every header,
+    /// since a new header always adds one (`process.go:267-271`).  Like
+    /// dcrd's, the flush is a metadata commit into the database's write
+    /// cache, which reaches disk only when the cache itself flushes, so
+    /// it costs an in-memory overlay commit per header and no sync.
     ///
     /// Without it nothing drained the set until a block connected, and
     /// sync is strictly headers-first: the whole header chain
@@ -2469,20 +2731,23 @@ impl Chain {
         params: &Params,
     ) -> Result<(), RuleError> {
         self.maybe_accept_block_header(header, true, adjusted_time_unix, params)?;
-        if self.index.modified_len() >= self.header_flush_threshold {
-            self.flush_block_index(params).map_err(persist_rule_error)?;
-        }
+        self.flush_block_index(params).map_err(persist_rule_error)?;
         Ok(())
     }
 
-    /// Connect the block to the end of the best chain: record the
-    /// spend journal, ticket database rows, filter, and header
-    /// commitment leaves, apply the view to the UTXO set, move the
-    /// best chain tip, and replace the best state snapshot (dcrd
-    /// `connectBlock`; the treasury balance and treasury spend rows
-    /// arrive with the treasury database, and the block index flush,
-    /// cache flush tuning, and the stake node memory prune
-    /// optimization are not reproduced).
+    /// Connect the block to the end of the best chain (dcrd
+    /// `connectBlock`): flush the block index, write the best state,
+    /// spend journal, ticket database rows, treasury balance and spend
+    /// rows, filter, and header commitment leaves in one database
+    /// transaction, commit the view to the UTXO cache and maybe flush
+    /// it, move the best chain tip and maybe prune the cached chain
+    /// tips, replace the best state snapshot, send the connected and
+    /// new-tickets notifications, and prune the parent's stake node
+    /// once it falls far enough behind the best header.
+    ///
+    /// Not reproduced: the difficulty retarget debug log lines, and
+    /// `addRecentBlock`, whose recent block cache the `blocks` mirror
+    /// stands in for (the block entered it when its data was accepted).
     #[allow(clippy::too_many_arguments)]
     pub fn connect_block(
         &mut self,
@@ -2658,6 +2923,7 @@ impl Chain {
 
         // This node is now the end of the best chain.
         self.best_chain.set_tip(&self.store, Some(node));
+        self.maybe_prune_cached_tips(node);
         self.state_snapshot = state;
 
         // The connected and new-tickets events (dcrd sends the former
@@ -2681,6 +2947,26 @@ impl Chain {
                     tickets_new,
                 }),
             );
+        }
+
+        // Optimization: immediately prune the parent's stake node when
+        // it is no longer needed due to being too far behind the best
+        // known header (dcrd `connectBlock`, `chain.go:795-808`).
+        // During initial sync that is every block, so memory stays flat
+        // however fast blocks connect, instead of growing until the
+        // next timed prune.  The parent's entries in the port's
+        // recent-window mirrors go with it when a database backs them:
+        // dcrd holds none of those in memory at all.
+        let best_header_height = self
+            .index
+            .best_header()
+            .map_or(0, |h| self.store.node(h).height);
+        let mut prune_height = 0;
+        if best_header_height > Self::MIN_MEMORY_STAKE_NODES {
+            prune_height = best_header_height - Self::MIN_MEMORY_STAKE_NODES;
+        }
+        if node_height < prune_height {
+            self.prune_node_memory(parent_id, self.db.is_some());
         }
         Ok(())
     }
@@ -2893,7 +3179,7 @@ impl Chain {
             }
             let block = match next_block_to_detach.take() {
                 Some(b) => b,
-                None => Arc::new(self.block_by_node(n)),
+                None => self.stored_block_arc(n)?,
             };
             assert_eq!(
                 self.store.node(n).hash,
@@ -2901,7 +3187,7 @@ impl Chain {
                 "detach block node hash does not match the block"
             );
             let parent_id = self.store.node(n).parent.expect("detached block parent");
-            let parent = Arc::new(self.block_by_node(parent_id));
+            let parent = self.stored_block_arc(parent_id)?;
             next_block_to_detach = Some(Arc::clone(&parent));
 
             let parent_view = NodeBranchView {
@@ -2942,15 +3228,28 @@ impl Chain {
         }
         attach_nodes.reverse();
 
+        // The parent of the first block attached is the fork block, which
+        // the detach loop already loaded when it ran (dcrd `forkBlock`);
+        // every later block's parent is the block attached before it
+        // (`prevBlockAttached`).  Only a fork block no detach loaded is
+        // fetched.  Every fetch shares the `blocks` mirror's `Arc`, so a
+        // block that extends the tip -- whose body and parent are both in
+        // the mirror -- is attached without copying either.
+        let mut fork_block = next_block_to_detach;
+        let mut prev_block_attached: Option<Arc<MsgBlock>> = None;
         for node in attach_nodes {
-            let block = Arc::new(self.block_by_node(node));
+            let block = self.stored_block_arc(node)?;
             let parent_id = self.store.node(node).parent.expect("attach parent");
-            let parent = Arc::new(self.block_by_node(parent_id));
+            let parent = match prev_block_attached.take().or_else(|| fork_block.take()) {
+                Some(parent) => parent,
+                None => self.stored_block_arc(parent_id)?,
+            };
             assert_eq!(
                 self.store.node(parent_id).hash,
                 parent.header.block_hash(),
                 "attach block node parent hash does not match the parent block"
             );
+            prev_block_attached = Some(Arc::clone(&block));
 
             let prev_height = Some(self.store.node(parent_id).height);
             let is_treasury_enabled = {
@@ -2980,24 +3279,32 @@ impl Chain {
             } else {
                 // The block must pass all of the validation rules
                 // which depend on having the full block data for all
-                // of its ancestors available.
-                let parent_stake_node = self
-                    .fetch_stake_node(parent_id, params)
-                    .map_err(stake_rule_error)?;
-                let context_result = check_block_context_for(
-                    &self.store,
-                    parent_id,
-                    &block,
-                    &parent_stake_node,
-                    false,
-                    params,
-                );
-                if let Err(err) = context_result {
-                    self.index
-                        .mark_block_failed_validation(&mut self.store, node);
-                    self.forget_rejected_block_body(node);
-                    return Err(err);
+                // of its ancestors available, unless it recently did
+                // (dcrd's `checkBlockContext` returns early on a
+                // `recentContextChecks` hit, `validate.go:1937-1940`,
+                // before it fetches the parent stake node).
+                let node_hash = self.store.node(node).hash;
+                if !self.recent_context_checks.contains(&node_hash) {
+                    let parent_stake_node = self
+                        .fetch_stake_node(parent_id, params)
+                        .map_err(stake_rule_error)?;
+                    let context_result = check_block_context_for(
+                        &self.store,
+                        parent_id,
+                        &block,
+                        &parent_stake_node,
+                        false,
+                        params,
+                    );
+                    if let Err(err) = context_result {
+                        self.mark_block_failed_on_rule_violation(node, &err);
+                        return Err(err);
+                    }
                 }
+
+                // Mark the block as recently checked to avoid checking
+                // it again when processing (dcrd `chain.go:1228-1230`).
+                self.recent_context_checks.put(node_hash);
 
                 let run_scripts = !self.bulk_import_mode && !self.is_assume_valid_ancestor(node);
                 let mut subsidy_cache =
@@ -3026,23 +3333,18 @@ impl Chain {
                         Some(&mut stxos),
                         run_scripts,
                         self.sig_cache.as_deref(),
-                        Some(&|blk: &MsgBlock| self.tspend_checks(parent_id, blk, params)),
+                        &|blk: &MsgBlock| self.tspend_checks(parent_id, blk, params),
                         params,
                     )
                 };
                 match connect_result {
-                    Ok(filter_hash) => {
-                        // The filter was computed inside the connect
-                        // checks; recreate it from the post-connect
-                        // view for storage (dcrd receives it through
-                        // the header commitment data out-param).
-                        filter = self.load_or_create_filter(&block, &view)?;
-                        assert_eq!(filter.hash(), filter_hash, "filter hash mismatch");
-                    }
+                    // The connect checks built the filter from the
+                    // post-connect view and checked the header commitment
+                    // against it; it is stored as is (dcrd receives it
+                    // through the header commitment data out-param).
+                    Ok(checked_filter) => filter = checked_filter,
                     Err(err) => {
-                        self.index
-                            .mark_block_failed_validation(&mut self.store, node);
-                        self.forget_rejected_block_body(node);
+                        self.mark_block_failed_on_rule_violation(node, &err);
                         return Err(err);
                     }
                 }
@@ -3063,7 +3365,9 @@ impl Chain {
     /// failed reorgs: when the target is or becomes invalid, fall
     /// back to the best valid chain candidate (dcrd
     /// `reorganizeChain`).  All accumulated reorg errors are returned
-    /// (dcrd wraps multiple in a `MultiError`).
+    /// (dcrd wraps multiple in a `MultiError`), unless the forced UTXO
+    /// cache flush on latching to current fails: that error is then
+    /// returned alone, as dcrd's `return err` does.
     pub fn reorganize_chain(
         &mut self,
         target: Option<NodeId>,
@@ -3129,8 +3433,10 @@ impl Chain {
                 if let Err(e) = self.flush_utxo_cache(new_hash, new_height as u32) {
                     // dcrd returns the flush error here, which skips
                     // the reorganization-outcome notification below
-                    // (its deferred completion event still fires).
-                    reorg_errs.push(persist_rule_error(e));
+                    // (its deferred completion event still fires), and
+                    // it is the whole result: the reorg errors gathered
+                    // above are dropped (`chain.go:1365-1371`).
+                    reorg_errs = alloc::vec![persist_rule_error(e)];
                     latch_flush_failed = true;
                 }
             }
@@ -3171,9 +3477,9 @@ impl Chain {
     /// Accept the data for the block, updating the block index state
     /// for the full data now being available, and return the
     /// descendant blocks now eligible for validation (dcrd
-    /// `maybeAcceptBlockData`; the stake node pruner and the block
-    /// database write are respectively a memory optimization and the
-    /// in-memory block map here).
+    /// `maybeAcceptBlockData`).  The block is stored to the database and
+    /// to the `blocks` mirror; the stake node pruner dcrd calls here
+    /// runs at the end of `process_block` instead.
     pub fn maybe_accept_block_data(
         &mut self,
         node: NodeId,
@@ -3213,8 +3519,13 @@ impl Chain {
         // without the stored bit, and the redelivered block must heal
         // that window rather than be rejected on the database's
         // block-exists error.
+        //
+        // This insert is the one copy of the block the chain makes: the
+        // caller keeps its own (`process_block` borrows it, where dcrd's
+        // `ProcessBlock` caches the caller's pointer, `process.go:562`),
+        // and every later step shares the mirror's `Arc`.
         self.blocks
-            .insert(block.header.block_hash().0, block.clone());
+            .insert(block.header.block_hash().0, Arc::new(block.clone()));
         if let Some(db) = &self.db {
             let stored = db.update(|tx| {
                 if tx.has_block(&block.header.block_hash())? {
@@ -3233,12 +3544,13 @@ impl Chain {
     }
 
     /// Tentatively accept fully linked blocks by running the
-    /// contextual checks over each, marking any failures, and return
-    /// those accepted along with the error for the first failure
-    /// (dcrd `maybeAcceptBlocks`; the recent block and context check
-    /// caches are not reproduced).  A checked block that directly
-    /// extends the current tip while the chain is current sends the
-    /// early new-tip event.
+    /// contextual checks over each, marking any rule violations, and
+    /// return those accepted along with the error for the first failure
+    /// (dcrd `maybeAcceptBlocks`; the `blocks` mirror stands in for its
+    /// recent block cache).  Each block that passes is recorded as recently
+    /// checked, so the connect does not check it again.  A checked
+    /// block that directly extends the current tip while the chain is
+    /// current sends the early new-tip event.
     pub fn maybe_accept_blocks(
         &mut self,
         nodes: Vec<NodeId>,
@@ -3249,25 +3561,47 @@ impl Chain {
         let cur_tip = self.best_chain.tip();
         let is_current = cur_tip.is_some_and(|t| self.is_current(t, adjusted_time_unix));
         for (i, &node) in nodes.iter().enumerate() {
-            let block = self.block_by_node(node);
             let parent_id = self.store.node(node).parent.expect("linked block parent");
-            let parent_stake_node = match self.fetch_stake_node(parent_id, params) {
-                Ok(sn) => sn,
-                Err(err) => return (nodes[..i].to_vec(), Some(stake_rule_error(err))),
+            let node_hash = self.store.node(node).hash;
+            // The block is shared from the `blocks` mirror, where
+            // `maybe_accept_block_data` put it, rather than copied out
+            // of it (dcrd's `fetchBlockByNode` hands back its recent
+            // block cache's pointer); only a block the mirror no longer
+            // holds is read back.  dcrd fetches it first and returns a
+            // failed read as `nodes[:i], err` (`process.go:370-373`).
+            let block = match self.stored_block_arc(node) {
+                Ok(block) => block,
+                Err(err) => return (nodes[..i].to_vec(), Some(err)),
             };
-            if let Err(err) = check_block_context_for(
-                &self.store,
-                parent_id,
-                &block,
-                &parent_stake_node,
-                fast_add,
-                params,
-            ) {
-                self.index
-                    .mark_block_failed_validation(&mut self.store, node);
-                self.forget_rejected_block_body(node);
+            // dcrd's `checkBlockContext` returns early on a
+            // `recentContextChecks` hit (`validate.go:1937-1940`).
+            let parent_stake_node = if self.recent_context_checks.contains(&node_hash) {
+                None
+            } else {
+                match self.fetch_stake_node(parent_id, params) {
+                    Ok(sn) => Some(sn),
+                    Err(err) => return (nodes[..i].to_vec(), Some(stake_rule_error(err))),
+                }
+            };
+            if let Some(parent_stake_node) = &parent_stake_node
+                && let Err(err) = check_block_context_for(
+                    &self.store,
+                    parent_id,
+                    &block,
+                    parent_stake_node,
+                    fast_add,
+                    params,
+                )
+            {
+                self.mark_block_failed_on_rule_violation(node, &err);
                 return (nodes[..i].to_vec(), Some(err));
             }
+
+            // Mark the block as recently checked to avoid checking it
+            // again when connecting it in the typical case (dcrd
+            // `process.go:385-396`).  The flags it was checked with are
+            // not recorded, exactly as in dcrd.
+            self.recent_context_checks.put(node_hash);
 
             // The block checked out and intends to directly extend
             // the tip as of processing entry: dcrd's early new-tip
@@ -3433,7 +3767,10 @@ impl Chain {
 
         // Prune old in-memory state on the pruning interval so a
         // sustained sync stays memory-bounded (dcrd
-        // `chainPruner.pruneChainIfNeeded` from `connectBestChain`).
+        // `chainPruner.pruneChainIfNeeded`, which `maybeAcceptBlockData`
+        // calls before storing the block, `process.go:320`; here it runs
+        // once the call's reorganization is done, which changes nothing
+        // but when the memory is released).
         self.prune_if_needed(adjusted_time_unix);
 
         (fork_len, final_errs)
@@ -3442,8 +3779,7 @@ impl Chain {
     /// Manually invalidate the block as if it had violated a
     /// consensus rule, mark its descendants as having an invalid
     /// ancestor, and reorganize to the best remaining valid chain
-    /// (dcrd `InvalidateBlock`; the context check cache is not
-    /// reproduced).
+    /// (dcrd `InvalidateBlock`).
     pub fn invalidate_block(
         &mut self,
         hash: &Hash,
@@ -3485,7 +3821,10 @@ impl Chain {
         }
 
         // Simply mark the block when it is not part of the current
-        // best chain.
+        // best chain.  Either way it must not pass the contextual
+        // checks on a cache hit again (dcrd `process.go:699`).
+        let node_hash = self.store.node(node).hash;
+        self.recent_context_checks.delete(&node_hash);
         if !self.best_chain.contains(&self.store, node) {
             self.index
                 .mark_block_failed_validation(&mut self.store, node);
@@ -3603,6 +3942,10 @@ impl Chain {
                     id,
                     BlockStatus(BlockStatus::VALIDATE_FAILED.0 | BlockStatus::INVALID_ANCESTOR.0),
                 );
+                // Ensure it undergoes full revalidation should that be
+                // necessary (dcrd `process.go:826`).
+                let hash = self.store.node(id).hash;
+                self.recent_context_checks.delete(&hash);
             }
 
             if self.index.can_validate(&self.store, id)
@@ -3656,6 +3999,8 @@ impl Chain {
                     m,
                     BlockStatus(BlockStatus::INVALID_ANCESTOR.0),
                 );
+                let hash = self.store.node(m).hash;
+                self.recent_context_checks.delete(&hash);
                 if self.index.can_validate(&self.store, m)
                     && self.store.node(m).work_sum >= cur_best_work
                 {
@@ -3696,7 +4041,31 @@ impl Chain {
         let errs = self.reorganize_chain(target, adjusted_time_unix, params);
         let best = self.best_chain.tip().expect("best chain tip");
         self.index.prune_cached_tips(&self.store, best);
+        // dcrd's `pruneCachedTips` stamps the time of the prune.
+        self.cached_tips_last_pruned_unix = self.utxo_clock_unix;
         errs
+    }
+
+    /// Prune the cached chain tips relative to the new best node at
+    /// most once per [`CACHED_TIPS_PRUNE_INTERVAL_SECS`] (dcrd
+    /// `blockIndex.MaybePruneCachedTips`, `blockindex.go:1045-1056`,
+    /// called by `connectBlock` right after the tip moves), timed on the
+    /// adjusted clock of the processing call in flight like the other
+    /// periodic work here.  dcrd's load path prunes and stamps the wall
+    /// clock (`chainio.go:1710`); the load here prunes without a clock,
+    /// so the first observed time stands in for that stamp and the first
+    /// timed prune comes one interval later, as it does in dcrd.
+    fn maybe_prune_cached_tips(&mut self, best_node: NodeId) {
+        let now = self.utxo_clock_unix;
+        if self.cached_tips_last_pruned_unix == 0 {
+            self.cached_tips_last_pruned_unix = now;
+            return;
+        }
+        if now.saturating_sub(self.cached_tips_last_pruned_unix) >= CACHED_TIPS_PRUNE_INTERVAL_SECS
+        {
+            self.index.prune_cached_tips(&self.store, best_node);
+            self.cached_tips_last_pruned_unix = now;
+        }
     }
 
     /// Force a reorganization to a sibling of the current best chain
@@ -3828,10 +4197,16 @@ impl Chain {
         }
 
         // The contextual checks, again skipping the proof of work.
-        let prev_stake_node = self
-            .fetch_stake_node(prev_node, params)
-            .map_err(stake_rule_error)?;
+        // dcrd's `checkBlockContext` skips them for a block that
+        // recently passed them (`validate.go:1937-1940`), which a
+        // caller handing over an already processed block can reach.
+        if !self
+            .recent_context_checks
+            .contains(&block.header.block_hash())
         {
+            let prev_stake_node = self
+                .fetch_stake_node(prev_node, params)
+                .map_err(stake_rule_error)?;
             let view = NodeBranchView {
                 store: &self.store,
                 tip: prev_node,
@@ -3874,7 +4249,13 @@ impl Chain {
 
         if prev_node == tip {
             // Use the chain state as is when extending the main chain.
-            let parent = self.block_by_node(tip);
+            // dcrd wraps a failed parent fetch here, and only here, as
+            // `ErrMissingParent` carrying the fetch error's text
+            // (`validate.go:4510-4513`); the tip-parent arm below
+            // returns the fetch error itself.
+            let parent = self
+                .block_arc(tip)
+                .map_err(|e| rule_error(RuleErrorKind::MissingParent, format!("{e}")))?;
             let branch_view = NodeBranchView {
                 store: &self.store,
                 tip: prev_node,
@@ -3894,7 +4275,7 @@ impl Chain {
                 None,
                 run_scripts,
                 self.sig_cache.as_deref(),
-                Some(&|blk: &MsgBlock| self.tspend_checks(prev_node, blk, params)),
+                &|blk: &MsgBlock| self.tspend_checks(prev_node, blk, params),
                 params,
             )
             .map(|_| ());
@@ -3902,8 +4283,8 @@ impl Chain {
 
         // The template builds on the parent of the current tip: undo
         // the tip block to reach the template's point of view.
-        let tip_block = self.block_by_node(tip);
-        let parent = self.block_by_node(prev_node);
+        let tip_block = self.stored_block_arc(tip)?;
+        let parent = self.stored_block_arc(prev_node)?;
         let stxos = self.fetch_spend_journal(&tip_block, is_treasury_enabled)?;
         view.disconnect_block(
             &tip_block,
@@ -3931,7 +4312,7 @@ impl Chain {
             None,
             run_scripts,
             self.sig_cache.as_deref(),
-            Some(&|blk: &MsgBlock| self.tspend_checks(prev_node, blk, params)),
+            &|blk: &MsgBlock| self.tspend_checks(prev_node, blk, params),
             params,
         )
         .map(|_| ())
@@ -3972,8 +4353,8 @@ impl Chain {
         // template.
         let mut view = UtxoView::new();
         view.set_best_hash(tip_hash);
-        let tip_block = self.block_by_node(tip);
-        let parent = self.block_by_node(tip_parent).clone();
+        let tip_block = self.block_arc(tip).map_err(|e| format!("{e}"))?;
+        let parent = self.block_arc(tip_parent).map_err(|e| format!("{e}"))?;
 
         // Determine if the treasury agenda is active.
         let is_treasury_enabled = self
@@ -4133,114 +4514,221 @@ impl Chain {
 
     /// Fetch a stored block from the database — the fallback once the
     /// recent in-memory window has been pruned (dcrd serves every
-    /// block from its database).
-    fn db_fetch_stored_block(&self, hash: &Hash) -> Option<MsgBlock> {
-        let db = self.db.as_ref()?;
-        let mut found: Option<MsgBlock> = None;
-        let _ = db.view(|tx| {
-            if let Ok(raw) = tx.fetch_block(hash)
-                && let Ok((block, _)) = dcroxide_wire::MsgBlock::from_bytes(&raw)
-            {
-                found = Some(block);
-            }
-            Ok(())
-        });
-        found
+    /// block from its database through `dbFetchBlockByNode`).  A failed
+    /// read, including the database's own `ErrBlockNotFound`, and a
+    /// body that does not decode come back as the error dcrd returns
+    /// there, never as a missing block.  A chain without a database
+    /// holds every block in the window, so a block missing from it is
+    /// reported with the database's "does not exist" text.
+    fn db_fetch_stored_block(&self, hash: &Hash) -> Result<MsgBlock, crate::chaindb::ChainDbError> {
+        fetch_stored_block(self.db.as_ref(), hash)
     }
 
     /// The block data for a node from the recent in-memory window or
-    /// the database (dcrd `fetchBlockByNode`).
-    fn block_data(&self, node: NodeId) -> Option<MsgBlock> {
+    /// the database (dcrd `fetchBlockByNode`).  A block in the window
+    /// comes back as the mirror's own `Arc`, not a copy, the way dcrd's
+    /// recent block cache hands back its pointer.
+    fn block_arc(&self, node: NodeId) -> Result<Arc<MsgBlock>, crate::chaindb::ChainDbError> {
         let hash = self.store.node(node).hash;
         if let Some(block) = self.blocks.get(&hash.0) {
-            return Some(block.clone());
+            return Ok(Arc::clone(block));
         }
-        self.db_fetch_stored_block(&hash)
+        self.db_fetch_stored_block(&hash).map(Arc::new)
+    }
+
+    /// [`Self::block_arc`] on the paths that return a rule error: the
+    /// reorganization loops, `maybe_accept_blocks` and the template
+    /// checks, where dcrd returns `fetchBlockByNode`'s error and the
+    /// operation fails with the node still running.  The database error
+    /// is carried as `ErrUtxoBackendCorruption` with its own text, the
+    /// kind the port gives the other local-corruption errors (see
+    /// `fetch_spend_journal`), so `is_rule_violation` neither brands the
+    /// block nor blames the peer for it.
+    fn stored_block_arc(&self, node: NodeId) -> Result<Arc<MsgBlock>, RuleError> {
+        self.block_arc(node).map_err(db_read_rule_error)
+    }
+
+    /// The block data for a node as an owned block, for the public
+    /// accessors that return one: a copy of a block in the window, or
+    /// the block read back from the database.
+    fn block_data(&self, node: NodeId) -> Option<MsgBlock> {
+        self.block_arc(node).ok().map(Arc::unwrap_or_clone)
     }
 
     /// A block's serialized spend journal row from the recent window
-    /// or the database.
-    fn spend_journal_row(&self, hash: &Hash) -> Option<Vec<u8>> {
+    /// or the database.  A transaction that cannot be opened is dcrd's
+    /// failed `db.View` and comes back as the error; a row the bucket
+    /// does not return is `None`, which is all dcrd's ffldb `Get` can
+    /// say even when the underlying read failed.
+    fn spend_journal_row(
+        &self,
+        hash: &Hash,
+    ) -> Result<Option<Vec<u8>>, crate::chaindb::ChainDbError> {
         if let Some(row) = self.spend_journal.get(&hash.0) {
-            return Some(row.clone());
+            return Ok(Some(row.clone()));
         }
-        let db = self.db.as_ref()?;
+        let Some(db) = self.db.as_ref() else {
+            return Ok(None);
+        };
         let mut found = None;
-        let _ = db.view(|tx| {
+        db.view(|tx| {
             let meta = tx.metadata();
             if let Some(bucket) = meta.bucket(crate::chaindb::SPEND_JOURNAL_BUCKET_NAME) {
                 found = bucket.get(&hash.0);
             }
             Ok(())
-        });
-        found
+        })?;
+        Ok(found)
     }
 
     /// A block's version 2 GCS filter from the recent window or the
-    /// database.
-    fn gcs_filter(&self, hash: &Hash) -> Option<FilterV2> {
+    /// database: `Ok(None)` when no filter is stored, and the error
+    /// dcrd's `dbFetchGCSFilter` returns for a failed read or a row
+    /// that does not decode.
+    fn gcs_filter(&self, hash: &Hash) -> Result<Option<FilterV2>, crate::chaindb::ChainDbError> {
         if let Some(filter) = self.filters.get(&hash.0) {
-            return Some(filter.clone());
+            return Ok(Some(filter.clone()));
         }
-        let db = self.db.as_ref()?;
-        let mut found = None;
-        let _ = db.view(|tx| {
-            found = crate::chaindb::db_fetch_gcs_filter(tx, hash).unwrap_or(None);
+        let Some(db) = self.db.as_ref() else {
+            return Ok(None);
+        };
+        let mut found = Ok(None);
+        db.view(|tx| {
+            found = crate::chaindb::db_fetch_gcs_filter(tx, hash);
             Ok(())
-        });
+        })?;
+        found
+    }
+
+    /// A block's serialized version 2 GCS filter from the recent window
+    /// or the database, without decoding it (dcrd
+    /// `dbFetchRawGCSFilter`, which `LocateCFiltersV2` serves from).
+    fn raw_gcs_filter(&self, hash: &Hash) -> Result<Option<Vec<u8>>, crate::chaindb::ChainDbError> {
+        if let Some(filter) = self.filters.get(&hash.0) {
+            return Ok(Some(filter.bytes().to_vec()));
+        }
+        let Some(db) = self.db.as_ref() else {
+            return Ok(None);
+        };
+        let mut found = Ok(None);
+        db.view(|tx| {
+            found = crate::chaindb::db_fetch_raw_gcs_filter(tx, hash);
+            Ok(())
+        })?;
         found
     }
 
     /// A block's header commitment leaves from the recent window or
-    /// the database.
-    fn commitments_by_block_hash(&self, hash: &Hash) -> Vec<Hash> {
+    /// the database, or the error dcrd's `dbFetchHeaderCommitments`
+    /// returns for a failed read or a row that does not decode.
+    fn commitments_by_block_hash(
+        &self,
+        hash: &Hash,
+    ) -> Result<Vec<Hash>, crate::chaindb::ChainDbError> {
         if let Some(leaves) = self.header_commitments.get(&hash.0) {
-            return leaves.clone();
+            return Ok(leaves.clone());
         }
         let Some(db) = self.db.as_ref() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        let mut found = Vec::new();
-        let _ = db.view(|tx| {
-            found = crate::chaindb::db_fetch_header_commitments(tx, hash).unwrap_or_default();
+        let mut found = Ok(Vec::new());
+        db.view(|tx| {
+            found = crate::chaindb::db_fetch_header_commitments(tx, hash);
             Ok(())
-        });
+        })?;
         found
     }
 
+    /// A block's treasury state row from the recent window or the
+    /// database (dcrd reads `dbFetchTreasuryBalance` on every lookup).
+    /// `Ok(None)` is dcrd's `errDbTreasury`, the missing key, which
+    /// `sumPastTreasuryChanges` reads as the end of the records.  A row
+    /// that does not decode (dcrd's `errDeserialize`) or a failed read
+    /// is `Err` with its text: `sumPastTreasuryChanges` returns those,
+    /// and only `calculateTreasuryBalance` reads every error as zero.
+    fn treasury_state_row(
+        &self,
+        hash: &Hash,
+    ) -> Result<Option<alloc::borrow::Cow<'_, crate::treasurydb::TreasuryState>>, String> {
+        if let Some(ts) = self.treasury_state.get(&hash.0) {
+            return Ok(Some(alloc::borrow::Cow::Borrowed(ts)));
+        }
+        let Some(db) = self.db.as_ref() else {
+            return Ok(None);
+        };
+        let mut found = Ok(None);
+        db.view(|tx| {
+            found = crate::treasurydb::db_fetch_treasury_balance(tx, hash);
+            Ok(())
+        })
+        .map_err(|e| format!("{e}"))?;
+        found
+            .map(|row| row.map(alloc::borrow::Cow::Owned))
+            .map_err(|e| format!("{e}"))
+    }
+
     /// A height's ticket database rows (undo data and new tickets)
-    /// from the recent window or the database.
-    fn ticket_rows_by_height(&self, height: i64) -> Option<(Vec<UndoTicketData>, Vec<Hash>)> {
+    /// from the recent window or the database, the fallback in dcrd's
+    /// `stake.Node.DisconnectNode` (`tickets.go:762-779`), which reads
+    /// both through `DbFetchBlockUndoData` and `DbFetchNewTickets`.
+    ///
+    /// A failed read, a missing row and a row that does not decode come
+    /// back as the error dcrd's fetchers return, which `fetchStakeNode`
+    /// passes up with the node still running.  The stake-node error
+    /// type has no database kind, so each travels as
+    /// `ErrDatabaseCorrupt` with the ticket database error's
+    /// description (as `stake_block_by_node` carries dcrd's
+    /// `ErrBlockNotFound`).
+    fn ticket_rows_by_height(
+        &self,
+        height: i64,
+    ) -> Result<(Vec<UndoTicketData>, Vec<Hash>), dcroxide_stake::RuleError> {
         if let (Some(utds), Some(ths)) = (
             self.stake_undo.get(&height),
             self.stake_new_tickets.get(&height),
         ) {
-            return Some((utds.clone(), ths.clone()));
+            return Ok((utds.clone(), ths.clone()));
         }
-        let db = self.db.as_ref()?;
-        let key = (height as u32).to_le_bytes();
-        let mut found = None;
-        let _ = db.view(|tx| {
-            let meta = tx.metadata();
-            let undo = meta
-                .bucket(dcroxide_stake::ticketdb::STAKE_BLOCK_UNDO_DATA_BUCKET_NAME)
-                .and_then(|b| b.get(&key));
-            let tickets = meta
-                .bucket(dcroxide_stake::ticketdb::TICKETS_IN_BLOCK_BUCKET_NAME)
-                .and_then(|b| b.get(&key));
-            if let (Some(undo), Some(tickets)) = (undo, tickets)
-                && let Ok(utds) = dcroxide_stake::ticketdb::deserialize_block_undo_data(&undo)
-                && let Ok(ths) = dcroxide_stake::ticketdb::deserialize_ticket_hashes(&tickets)
-            {
-                found = Some((utds, ths));
-            }
+        let corrupt = |description: String| dcroxide_stake::RuleError {
+            kind: dcroxide_stake::ErrorKind::DatabaseCorrupt,
+            description,
+        };
+        let stake_db_error = |err: dcroxide_stake::stakedb::StakeDbError| match err {
+            dcroxide_stake::stakedb::StakeDbError::Db(e) => corrupt(format!("{e}")),
+            dcroxide_stake::stakedb::StakeDbError::Ticket(e) => corrupt(e.description),
+            dcroxide_stake::stakedb::StakeDbError::Rule(e) => e,
+        };
+        // A chain without a database keeps every row in the mirrors, so
+        // a row missing there is the missing key.
+        let Some(db) = self.db.as_ref() else {
+            let what = if self.stake_undo.contains_key(&height) {
+                "new tickets"
+            } else {
+                "block undo data"
+            };
+            return Err(corrupt(format!("missing key for {what}")));
+        };
+        let mut found = Err(corrupt(String::new()));
+        db.view(|tx| {
+            found = dcroxide_stake::stakedb::db_fetch_block_undo_data(tx, height as u32)
+                .and_then(|utds| {
+                    dcroxide_stake::stakedb::db_fetch_new_tickets(tx, height as u32)
+                        .map(|ths| (utds, ths))
+                })
+                .map_err(stake_db_error);
             Ok(())
-        });
+        })
+        .map_err(|e| corrupt(format!("{e}")))?;
         found
     }
 
-    /// The number of blocks whose stake nodes and recent-window data
-    /// stay in memory below the best tip (dcrd `minMemoryStakeNodes`).
+    /// The depth of the recent window: how many blocks keep their stake
+    /// nodes and recent-window mirror entries in memory (dcrd
+    /// `minMemoryStakeNodes`).  The timed prune measures it below the
+    /// best chain tip, but the connect-time prune measures it below the
+    /// best known header (`chain.go:795-808`), so during initial sync,
+    /// with the header chain far ahead, each connected block's parent
+    /// leaves memory at once and next to nothing stays.
     pub const MIN_MEMORY_STAKE_NODES: i64 = 288;
 
     /// Set the maximum pending-UTXO-cache size before a connect flushes
@@ -4250,9 +4738,9 @@ impl Chain {
     }
 
     /// Prune old in-memory state on the pruning interval — the target
-    /// block time (dcrd's `chainPruner.pruneChainIfNeeded` called from
-    /// `ProcessBlock`).  A chain without a database never prunes: the
-    /// memory is its only store.
+    /// block time (dcrd's `chainPruner.pruneChainIfNeeded`, called from
+    /// `maybeAcceptBlockData`, `process.go:320`).  A chain without a
+    /// database never prunes: the memory is its only store.
     pub fn prune_if_needed(&mut self, now_unix: i64) {
         if self.db.is_none() {
             return;
@@ -4299,14 +4787,74 @@ impl Chain {
         }
     }
 
+    /// Mark a block whose contextual or connect checks failed as
+    /// having failed validation, and drop its body, only when the
+    /// failure is a consensus rule violation.
+    ///
+    /// dcrd marks on `errors.As(err, &RuleError)` alone
+    /// (`chain.go:1220-1243`, `process.go:377-381`).  Database
+    /// corruption, assertion and context errors fail the operation
+    /// without branding the block, so it stays a candidate and is
+    /// retried after a restart or repair.  The port carries those
+    /// failures as the kinds `RuleErrorKind::is_rule_violation`
+    /// excludes -- a corrupt parent spend journal row on the
+    /// disapproval path is `ErrUtxoBackendCorruption` -- so that is the
+    /// test here, as it already is for peer blame.
+    fn mark_block_failed_on_rule_violation(&mut self, node: NodeId, err: &RuleError) {
+        if err.kind.is_rule_violation() {
+            self.index
+                .mark_block_failed_validation(&mut self.store, node);
+            self.forget_rejected_block_body(node);
+        }
+    }
+
+    /// Drop one node's prunable in-memory state: the stake-related
+    /// fields dcrd's pruners nil (`stakeNode`, `newTickets`,
+    /// `ticketsVoted`, `ticketsRevoked`), and, when `evict_mirrors` is
+    /// set, the block's entries in the port's recent-window mirrors,
+    /// which the database fallbacks serve from then on.
+    fn prune_node_memory(&mut self, id: NodeId, evict_mirrors: bool) {
+        let (hash, height) = {
+            let node = self.store.node(id);
+            (node.hash, node.height)
+        };
+        {
+            // dcrd nils the ticket slices, which is what makes its
+            // `maybeFetchTicketInfo` re-read them; the flag is that
+            // nil-ness here, so it has to go with the lists.
+            let node = self.store.node_mut(id);
+            node.stake_node = None;
+            node.new_tickets = None;
+            node.tickets_voted = Vec::new();
+            node.tickets_revoked = Vec::new();
+            node.ticket_info_populated = false;
+        }
+        if !evict_mirrors {
+            return;
+        }
+        // The genesis block stays resident: chains are created
+        // around it and it has no journal or ticket rows.
+        if height > 0 {
+            self.blocks.remove(&hash.0);
+        }
+        self.spend_journal.remove(&hash.0);
+        self.filters.remove(&hash.0);
+        self.header_commitments.remove(&hash.0);
+        self.stake_undo.remove(&height);
+        self.stake_new_tickets.remove(&height);
+        self.treasury_state.remove(&hash.0);
+    }
+
     /// dcrd `pruneStakeNodes`, extended for the port's recent-window
     /// mirrors: clear the stake-related fields on block nodes deeper
-    /// than the keep depth below the tip, and evict those blocks'
-    /// bodies, spend journal rows, filters, commitment leaves, and
-    /// per-height ticket rows from memory — every one of them is
-    /// persisted per connect and read back through the database
-    /// fallbacks.  The walk stops at the first already-pruned node
-    /// exactly like dcrd's `stakeNode == nil` bound.
+    /// than the keep depth below the tip, and, when a database backs
+    /// the chain, evict those blocks' bodies, spend journal rows,
+    /// filters, commitment leaves, per-height ticket rows and treasury
+    /// state rows from memory — every one of them is persisted per
+    /// connect and read back through the database fallbacks.  Without
+    /// a database the mirrors are the only copy and stay.  The walk
+    /// stops at the first already-pruned node exactly like dcrd's
+    /// `stakeNode == nil` bound.
     pub fn prune_chain_memory(&mut self, keep_depth: i64) {
         let Some(tip) = self.best_chain.tip() else {
             return;
@@ -4322,11 +4870,19 @@ impl Chain {
             return;
         };
 
+        // Only a chain that has a database may drop the mirrors: without
+        // one they are the only copy, and an evicted treasury row would
+        // read as a zero balance instead of failing.  A resident body
+        // then no longer extends the walk either, since nothing below
+        // dcrd's bound is left to evict.
+        let evict_mirrors = self.db.is_some();
         let mut prune_nodes = Vec::new();
         let mut walk = Some(first);
         while let Some(id) = walk {
             let node = self.store.node(id);
-            if node.stake_node.is_none() && !self.blocks.contains_key(&node.hash.0) {
+            if node.stake_node.is_none()
+                && !(evict_mirrors && self.blocks.contains_key(&node.hash.0))
+            {
                 break;
             }
             prune_nodes.push(id);
@@ -4335,27 +4891,7 @@ impl Chain {
 
         // Oldest to newest, like dcrd.
         for id in prune_nodes.into_iter().rev() {
-            let (hash, height) = {
-                let node = self.store.node(id);
-                (node.hash, node.height)
-            };
-            {
-                let node = self.store.node_mut(id);
-                node.stake_node = None;
-                node.new_tickets = None;
-                node.tickets_voted = Vec::new();
-                node.tickets_revoked = Vec::new();
-            }
-            // The genesis block stays resident: chains are created
-            // around it and it has no journal or ticket rows.
-            if height > 0 {
-                self.blocks.remove(&hash.0);
-            }
-            self.spend_journal.remove(&hash.0);
-            self.filters.remove(&hash.0);
-            self.header_commitments.remove(&hash.0);
-            self.stake_undo.remove(&height);
-            self.stake_new_tickets.remove(&height);
+            self.prune_node_memory(id, evict_mirrors);
         }
 
         // The walk above follows `parent` from the best-chain tip, so it
@@ -4409,6 +4945,21 @@ impl Chain {
                 self.spend_journal.remove(&raw);
                 self.filters.remove(&raw);
                 self.header_commitments.remove(&raw);
+            }
+
+            // Treasury rows are written at connect, so a side-chain row
+            // can outlive its body in `blocks`; sweep them on their own.
+            let stale: Vec<[u8; 32]> = self
+                .treasury_state
+                .keys()
+                .copied()
+                .filter(|raw| match self.index.lookup_node(&Hash(*raw)) {
+                    Some(id) => self.store.node(id).height < keep_from,
+                    None => false,
+                })
+                .collect();
+            for raw in stale {
+                self.treasury_state.remove(&raw);
             }
         }
     }
@@ -4546,9 +5097,23 @@ impl Chain {
             .collect()
     }
 
-    /// The main chain block hashes in the given inclusive height
-    /// range (dcrd `HeightRange` semantics over the best chain).
-    pub fn height_range(&self, start_height: i64, end_height: i64) -> Vec<Hash> {
+    /// The main chain block hashes in the half-open height range
+    /// `[start_height, end_height)`, with the end limited to the best
+    /// chain height (dcrd `HeightRange`, `chain.go:1775-1823`).  A
+    /// negative start or an end below the start is dcrd's plain error,
+    /// with its text.
+    pub fn height_range(&self, start_height: i64, end_height: i64) -> Result<Vec<Hash>, String> {
+        if start_height < 0 {
+            return Err(format!(
+                "start height of fetch range must not be less than zero - got {start_height}"
+            ));
+        }
+        if end_height < start_height {
+            return Err(format!(
+                "end height of fetch range must not be less than the start height - got \
+                 start {start_height}, end {end_height}"
+            ));
+        }
         let mut out = Vec::new();
         let mut h = start_height;
         while h < end_height {
@@ -4558,7 +5123,7 @@ impl Chain {
             }
             h += 1;
         }
-        out
+        Ok(out)
     }
 
     /// Look up a block node that the chain can validate, the shared
@@ -4717,26 +5282,13 @@ impl Chain {
         prev_hash: &Hash,
         params: &Params,
     ) -> Result<bool, RuleError> {
-        // Agendas are never active for the genesis block (dcrd
-        // `isAgendaActiveByHash`'s zero-hash special case).
-        if *prev_hash == Hash::ZERO {
-            return Ok(false);
-        }
-        let node = self.lookup_validatable(prev_hash)?;
-        let view = NodeBranchView {
-            store: &self.store,
-            tip: node,
-        };
-        let height = self.store.node(node).height;
-        crate::agendas::is_treasury_agenda_active(&view, Some(height), params).map_err(|_| {
-            rule_error(
-                RuleErrorKind::UnknownDeploymentID,
-                format!(
-                    "deployment ID {} does not exist",
-                    crate::agendas::VOTE_ID_TREASURY
-                ),
-            )
-        })
+        self.is_agenda_active_by_hash_fn(
+            prev_hash,
+            crate::agendas::VOTE_ID_TREASURY,
+            |view, prev_height| {
+                crate::agendas::is_treasury_agenda_active(view, prev_height, params)
+            },
+        )
     }
 
     /// Whether the DCP0011 blake3 proof of work agenda is active for
@@ -4758,42 +5310,36 @@ impl Chain {
         prev_hash: &Hash,
         params: &Params,
     ) -> Result<bool, RuleError> {
-        // Agendas are never active for the genesis block (dcrd
-        // `isAgendaActiveByHash`'s zero-hash special case).
-        if *prev_hash == Hash::ZERO {
-            return Ok(false);
-        }
-        let node = self.lookup_validatable(prev_hash)?;
-        let view = NodeBranchView {
-            store: &self.store,
-            tip: node,
-        };
-        let height = self.store.node(node).height;
-        crate::agendas::is_agenda_active(
-            &view,
-            Some(height),
-            crate::agendas::VOTE_ID_AUTO_REVOCATIONS,
-            params,
-        )
-        .map_err(|_| {
-            rule_error(
-                RuleErrorKind::UnknownDeploymentID,
-                format!(
-                    "deployment ID {} does not exist",
-                    crate::agendas::VOTE_ID_AUTO_REVOCATIONS
-                ),
-            )
-        })
+        self.is_agenda_active_by_hash(prev_hash, crate::agendas::VOTE_ID_AUTO_REVOCATIONS, params)
     }
 
-    /// Whether the given agenda is active for the block AFTER the
-    /// given block (the shared body of the by-hash agenda queries,
-    /// dcrd `isAgendaActiveByHash`).
+    /// Whether the given single-choice agenda is active for the block
+    /// AFTER the given block, the by-hash query every agenda without a
+    /// special case of its own goes through.
     fn is_agenda_active_by_hash(
         &self,
         prev_hash: &Hash,
         vote_id: &'static str,
         params: &Params,
+    ) -> Result<bool, RuleError> {
+        self.is_agenda_active_by_hash_fn(prev_hash, vote_id, |view, prev_height| {
+            crate::agendas::is_agenda_active(view, prev_height, vote_id, params)
+        })
+    }
+
+    /// The shared body of the by-hash agenda queries (dcrd
+    /// `isAgendaActiveByHash`, `thresholdstate.go:539-554`): inactive
+    /// for the genesis block, the unknown-block error for a block the
+    /// chain cannot validate, and otherwise the agenda's own check
+    /// (dcrd's `isActiveFn`) from the point of view of that block.
+    fn is_agenda_active_by_hash_fn(
+        &self,
+        prev_hash: &Hash,
+        vote_id: &'static str,
+        is_active_fn: impl FnOnce(
+            &NodeBranchView<'_>,
+            Option<i64>,
+        ) -> Result<bool, crate::agendas::UnknownDeployment>,
     ) -> Result<bool, RuleError> {
         // Agendas are never active for the genesis block.
         if *prev_hash == Hash::ZERO {
@@ -4805,7 +5351,7 @@ impl Chain {
             tip: node,
         };
         let height = self.store.node(node).height;
-        crate::agendas::is_agenda_active(&view, Some(height), vote_id, params).map_err(|_| {
+        is_active_fn(&view, Some(height)).map_err(|_| {
             rule_error(
                 RuleErrorKind::UnknownDeploymentID,
                 format!("deployment ID {vote_id} does not exist"),
@@ -5206,16 +5752,26 @@ impl Chain {
     /// the amount of every live ticket's stake submission output (dcrd
     /// `BlockChain.TicketPoolValue`).  Returns `None` when a live
     /// ticket's utxo is unexpectedly missing, matching dcrd's error.
+    ///
+    /// dcrd fetches the entries one at a time through its cache
+    /// (`stakeext.go:146-154`); the port fetches them as one batch,
+    /// with the same per-entry cache semantics, so the cache misses of
+    /// a cold call -- the whole live pool, tens of thousands of entries
+    /// on mainnet -- share one read transaction instead of opening one
+    /// apiece.
     pub fn ticket_pool_value(&self) -> Option<i64> {
-        let mut amt: i64 = 0;
-        for hash in self.live_tickets() {
-            let op = OutPoint {
+        let outpoints: Vec<OutPoint> = self
+            .live_tickets()
+            .into_iter()
+            .map(|hash| OutPoint {
                 hash,
                 index: 0,
                 tree: dcroxide_wire::TX_TREE_STAKE,
-            };
-            let utxo = self.fetch_utxo_entry(&op)?;
-            amt += utxo.amount();
+            })
+            .collect();
+        let mut amt: i64 = 0;
+        for utxo in self.fetch_utxo_entries(&outpoints) {
+            amt += utxo?.amount();
         }
         Some(amt)
     }
@@ -5255,8 +5811,10 @@ impl Chain {
     /// block is part of the main chain (dcrd
     /// `BlockChain.FilterByBlockHash`).  A missing filter surfaces as
     /// the no-filter error kind; the filter and commitment leaves are
-    /// served from the in-memory caches the engine keeps in step with
-    /// the database.
+    /// served from the recent window or the database, and a failed read
+    /// or a row that does not decode is the database error dcrd
+    /// returns (`headercmt.go:167-183`), never a missing filter or a
+    /// proof over no leaves.
     pub fn filter_by_block_hash(&self, hash: &Hash) -> Result<(FilterV2, HeaderProof), RuleError> {
         // Avoid a lookup when there is no way the filter data for the
         // requested block is available.
@@ -5271,13 +5829,15 @@ impl Chain {
             ));
         }
 
-        let Some(filter) = self.gcs_filter(hash) else {
+        let Some(filter) = self.gcs_filter(hash).map_err(db_read_rule_error)? else {
             return Err(rule_error(
                 RuleErrorKind::NoFilter,
                 format!("no filter available for block {hash}"),
             ));
         };
-        let leaves = self.commitments_by_block_hash(hash);
+        let leaves = self
+            .commitments_by_block_hash(hash)
+            .map_err(db_read_rule_error)?;
 
         // Generate the header commitment inclusion proof for the
         // filter.
@@ -5348,19 +5908,24 @@ impl Chain {
         for hash in &hashes {
             // The recent window or the database, so a pruned range is
             // still served (dcrd reads every filter from its cfilter
-            // database).
-            let Some(filter) = self.gcs_filter(hash) else {
+            // database).  dcrd serves the stored bytes without decoding
+            // them (`dbFetchRawGCSFilter`), but returns a commitments
+            // row that fails to read or decode as the error
+            // (`headercmt.go:249-268`).
+            let Some(filter) = self.raw_gcs_filter(hash).map_err(db_read_rule_error)? else {
                 return Err(rule_error(
                     RuleErrorKind::NoFilter,
                     format!("no filter available for block {hash}"),
                 ));
             };
-            let leaves = self.commitments_by_block_hash(hash);
+            let leaves = self
+                .commitments_by_block_hash(hash)
+                .map_err(db_read_rule_error)?;
             let proof =
                 dcroxide_standalone::generate_inclusion_proof(&leaves, HEADER_CMT_FILTER_INDEX);
             cfilters.push(dcroxide_wire::MsgCFilterV2 {
                 block_hash: *hash,
-                data: filter.bytes().to_vec(),
+                data: filter,
                 proof_index: HEADER_CMT_FILTER_INDEX,
                 proof_hashes: proof,
             });
@@ -5405,10 +5970,12 @@ impl Chain {
         let Some(want_node) = self.store.relative_ancestor(prev_node, relative_maturity) else {
             return 0;
         };
-        let Some(ts) = self.treasury_state.get(&self.store.node(prev_node).hash.0) else {
+        // dcrd reads any error from either fetch as a zero balance, not
+        // only the missing key.
+        let Ok(Some(ts)) = self.treasury_state_row(&self.store.node(prev_node).hash) else {
             return 0;
         };
-        let Some(wts) = self.treasury_state.get(&self.store.node(want_node).hash.0) else {
+        let Ok(Some(wts)) = self.treasury_state_row(&self.store.node(want_node).hash) else {
             return 0;
         };
         let mut net_value = 0i64;
@@ -5551,15 +6118,18 @@ impl Chain {
         Ok(())
     }
 
-    /// Tally the treasury votes for a treasury spend up to the given
-    /// node (dcrd `tSpendCountVotes`).  Returns the window start and
-    /// end alongside the yes and no counts.
-    pub fn tspend_count_votes(
+    /// Capture a treasury spend's voting window up to the given node
+    /// for a tally taken later, possibly with the chain lock released
+    /// (the window checks and the node walk of dcrd `tSpendCountVotes`).
+    /// The window and inside-window checks run here, before any block
+    /// is read, in dcrd's order; see [`TSpendVoteWindow`] for why the
+    /// tally itself needs nothing from the chain.
+    pub fn tspend_vote_window(
         &self,
         prev_node: NodeId,
         tspend: &MsgTx,
         params: &Params,
-    ) -> Result<(u32, u32, u32, u32), String> {
+    ) -> Result<TSpendVoteWindow, String> {
         let expiry = tspend.expiry;
         let (start, end) = dcroxide_standalone::calc_tspend_window(
             expiry,
@@ -5582,59 +6152,40 @@ impl Chain {
             ));
         }
 
-        // Tally the total number of yes and no votes in the voting
-        // window.  dcrd 2.2 guards the tallies against overflow even
-        // though the voting window and per-block vote limits make it
-        // unreachable in practice.
-        let mut total_yes = 0u32;
-        let mut total_no = 0u32;
+        // The window's blocks from the node back to the window start,
+        // each with the recent window's copy of its body when it holds
+        // one (dcrd's `lookupRecentBlock` inside `fetchBlockByNode`).
+        let mut blocks = Vec::new();
         let mut node = Some(prev_node);
         while let Some(id) = node {
-            if self.store.node(id).height < i64::from(start) {
+            let n = self.store.node(id);
+            if n.height < i64::from(start) {
                 break;
             }
-            let block = self.block_by_node(id);
-            for stx in &block.stransactions {
-                let Ok(votes) = dcroxide_stake::check_ssgen_votes(stx) else {
-                    // Not a stake vote.
-                    continue;
-                };
-                for vote in &votes {
-                    if vote.hash != tspend_hash {
-                        continue;
-                    }
-                    match vote.vote {
-                        dcroxide_stake::TREASURY_VOTE_YES => {
-                            let (sum, ok) =
-                                crate::checkedmath::AddUnsigned::add_unsigned(total_yes, 1);
-                            total_yes = sum;
-                            if !ok {
-                                return Err(format!(
-                                    "yes vote for treasury spend {tspend_hash} at height {} \
-                                     causes yes count to overflow",
-                                    self.store.node(id).height
-                                ));
-                            }
-                        }
-                        dcroxide_stake::TREASURY_VOTE_NO => {
-                            let (sum, ok) =
-                                crate::checkedmath::AddUnsigned::add_unsigned(total_no, 1);
-                            total_no = sum;
-                            if !ok {
-                                return Err(format!(
-                                    "no vote for treasury spend {tspend_hash} at height {} \
-                                     causes no count to overflow",
-                                    self.store.node(id).height
-                                ));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            node = self.store.node(id).parent;
+            blocks.push((n.height, n.hash, self.blocks.get(&n.hash.0).map(Arc::clone)));
+            node = n.parent;
         }
-        Ok((start, end, total_yes, total_no))
+        Ok(TSpendVoteWindow {
+            start,
+            end,
+            next_height,
+            tspend_hash,
+            blocks,
+            db: self.db.clone(),
+        })
+    }
+
+    /// Tally the treasury votes for a treasury spend up to the given
+    /// node (dcrd `tSpendCountVotes`).  Returns the window start and
+    /// end alongside the yes and no counts.
+    pub fn tspend_count_votes(
+        &self,
+        prev_node: NodeId,
+        tspend: &MsgTx,
+        params: &Params,
+    ) -> Result<(u32, u32, u32, u32), String> {
+        self.tspend_vote_window(prev_node, tspend, params)?
+            .count_votes()
     }
 
     /// Verify the treasury spend has enough votes to be included in a
@@ -5645,50 +6196,27 @@ impl Chain {
         tspend: &MsgTx,
         params: &Params,
     ) -> Result<(), String> {
-        let (start, end, yes, no) = self.tspend_count_votes(prev_node, tspend, params)?;
-
-        // Passing criteria are the quorum and required percentages.
-        // dcrd computes maxVotes in wrapping u32 before widening.
-        let max_votes = u64::from(u32::from(params.tickets_per_block).wrapping_mul(end - start));
-        let quorum = max_votes * params.treasury_vote_quorum_multiplier
-            / params.treasury_vote_quorum_divisor;
-        // Go adds the u32 tallies before widening; mirror the wrapping
-        // semantics exactly.
-        let num_votes_cast = u64::from(yes.wrapping_add(no));
-        if num_votes_cast < quorum {
-            return Err(format!(
-                "quorum not met: yes {yes} no {no}  quorum {quorum} max {max_votes}"
-            ));
-        }
-
-        // Treat the maximum remaining votes as possible no votes,
-        // enabling early passage only when yes cannot drop below the
-        // threshold.
-        let cur_block_height = (self.store.node(prev_node).height + 1) as u32;
-        let remaining_blocks = end - cur_block_height;
-        let max_remaining_votes =
-            u64::from(remaining_blocks.wrapping_mul(u32::from(params.tickets_per_block)));
-        let required_votes = (num_votes_cast + max_remaining_votes)
-            * params.treasury_vote_required_multiplier
-            / params.treasury_vote_required_divisor;
-        if u64::from(yes) < required_votes {
-            return Err(format!(
-                "not enough yes votes: yes {yes} no {no} quorum {quorum} max {max_votes} \
-                 required {required_votes} maxRemainingVotes {max_remaining_votes}"
-            ));
-        }
-        Ok(())
+        self.tspend_vote_window(prev_node, tspend, params)?
+            .check_has_votes(params)
     }
 
     /// Sum the debits and credits over the given number of blocks
     /// ending at the node (dcrd `sumPastTreasuryChanges`).  Returns
     /// the spent and added totals along with the node before the
     /// window.
+    ///
+    /// Only a missing row ends the walk early, as dcrd's `errDbTreasury`
+    /// check does; a row that does not decode, or a failed read, is
+    /// returned as the error, which `tspend_checks` turns into
+    /// `ErrInvalidExpenditure` as dcrd's `tspendChecks` does.  It is
+    /// carried as `ErrUtxoBackendCorruption`, the kind the port gives
+    /// the other local-corruption errors dcrd returns as plain errors
+    /// (see `fetch_spend_journal`).
     fn sum_past_treasury_changes(
         &self,
         pre_tvi_node: NodeId,
         nb_blocks: u64,
-    ) -> (i64, i64, Option<NodeId>) {
+    ) -> Result<(i64, i64, Option<NodeId>), RuleError> {
         let mut node = Some(pre_tvi_node);
         let mut spent = 0i64;
         let mut added = 0i64;
@@ -5697,8 +6225,12 @@ impl Chain {
             if i >= nb_blocks {
                 break;
             }
-            let Some(ts) = self.treasury_state.get(&self.store.node(id).hash.0) else {
-                // The end of available treasury records.
+            let row = self
+                .treasury_state_row(&self.store.node(id).hash)
+                .map_err(|e| rule_error(RuleErrorKind::UtxoBackendCorruption, e))?;
+            let Some(ts) = row else {
+                // The record doesn't exist: the end of when treasury
+                // records are available.
                 node = None;
                 break;
             };
@@ -5712,18 +6244,22 @@ impl Chain {
             node = self.store.node(id).parent;
             i += 1;
         }
-        (spent, added, node)
+        Ok((spent, added, node))
     }
 
     /// The maximum treasury expenditure per the original DCP0006
     /// policy (dcrd `maxTreasuryExpenditureDCP0006`).
-    fn max_treasury_expenditure_dcp0006(&self, pre_tvi_node: NodeId, params: &Params) -> i64 {
+    fn max_treasury_expenditure_dcp0006(
+        &self,
+        pre_tvi_node: NodeId,
+        params: &Params,
+    ) -> Result<i64, RuleError> {
         let policy_window = params.treasury_vote_interval
             * params.treasury_vote_interval_multiplier
             * params.treasury_expenditure_window;
 
         let (spent_recent_window, _, mut node) =
-            self.sum_past_treasury_changes(pre_tvi_node, policy_window);
+            self.sum_past_treasury_changes(pre_tvi_node, policy_window)?;
 
         let mut spent_prior_windows = 0i64;
         let mut nb_non_empty_windows = 0i64;
@@ -5732,7 +6268,7 @@ impl Chain {
             let Some(id) = node else {
                 break;
             };
-            let (spent, _, next) = self.sum_past_treasury_changes(id, policy_window);
+            let (spent, _, next) = self.sum_past_treasury_changes(id, policy_window)?;
             if spent > 0 {
                 spent_prior_windows += spent;
                 nb_non_empty_windows += 1;
@@ -5748,35 +6284,43 @@ impl Chain {
         };
         let avg_plus_allowance = avg_spent_prior_windows + avg_spent_prior_windows / 2;
         if avg_plus_allowance > spent_recent_window {
-            avg_plus_allowance - spent_recent_window
+            Ok(avg_plus_allowance - spent_recent_window)
         } else {
-            0
+            Ok(0)
         }
     }
 
     /// The maximum treasury expenditure per the DCP0007 reverted
     /// policy (dcrd `maxTreasuryExpenditureDCP0007`).
-    fn max_treasury_expenditure_dcp0007(&self, pre_tvi_node: NodeId, params: &Params) -> i64 {
+    fn max_treasury_expenditure_dcp0007(
+        &self,
+        pre_tvi_node: NodeId,
+        params: &Params,
+    ) -> Result<i64, RuleError> {
         let policy_window = params.treasury_vote_interval
             * params.treasury_vote_interval_multiplier
             * params.treasury_expenditure_window;
         let (spent_recent, added_recent, _) =
-            self.sum_past_treasury_changes(pre_tvi_node, policy_window);
+            self.sum_past_treasury_changes(pre_tvi_node, policy_window)?;
         let added_plus_allowance = added_recent + added_recent / 2;
         if added_plus_allowance > spent_recent {
-            added_plus_allowance - spent_recent
+            Ok(added_plus_allowance - spent_recent)
         } else {
-            0
+            Ok(0)
         }
     }
 
     /// The maximum treasury expenditure per the DCP0013 policy (dcrd
     /// `maxTreasuryExpenditureDCP0013`).
-    fn max_treasury_expenditure_dcp0013(&self, pre_tvi_node: NodeId, params: &Params) -> i64 {
+    fn max_treasury_expenditure_dcp0013(
+        &self,
+        pre_tvi_node: NodeId,
+        params: &Params,
+    ) -> Result<i64, RuleError> {
         let policy_window = params.treasury_vote_interval
             * params.treasury_vote_interval_multiplier
             * params.treasury_expenditure_window;
-        let (spent_recent, _, _) = self.sum_past_treasury_changes(pre_tvi_node, policy_window);
+        let (spent_recent, _, _) = self.sum_past_treasury_changes(pre_tvi_node, policy_window)?;
         let treasury_balance = self.calculate_treasury_balance(pre_tvi_node, params);
 
         let mut max_spendable = (treasury_balance + spent_recent) * 4 / 100;
@@ -5790,7 +6334,7 @@ impl Chain {
         if allowed_to_spend > treasury_balance {
             allowed_to_spend = treasury_balance;
         }
-        allowed_to_spend
+        Ok(allowed_to_spend)
     }
 
     /// The maximum treasury expenditure at the block after the node,
@@ -5814,7 +6358,7 @@ impl Chain {
         )
         .map_err(|_| unknown_deployment_error())?;
         if dcp0013_active {
-            return Ok(self.max_treasury_expenditure_dcp0013(pre_tvi_node, params));
+            return self.max_treasury_expenditure_dcp0013(pre_tvi_node, params);
         }
         let revert_active = crate::agendas::is_agenda_active(
             &view,
@@ -5824,9 +6368,9 @@ impl Chain {
         )
         .map_err(|_| unknown_deployment_error())?;
         if revert_active {
-            return Ok(self.max_treasury_expenditure_dcp0007(pre_tvi_node, params));
+            return self.max_treasury_expenditure_dcp0007(pre_tvi_node, params);
         }
-        Ok(self.max_treasury_expenditure_dcp0006(pre_tvi_node, params))
+        self.max_treasury_expenditure_dcp0006(pre_tvi_node, params)
     }
 
     /// Verify the total treasury spend amount is within the allowed
@@ -6035,14 +6579,207 @@ impl Chain {
     }
 }
 
+/// The text [`persist_rule_error`] gives a database error, up to the
+/// error's kind: it renders the `ChainDbError` with `{:?}`, so a
+/// `dcroxide_database::Error` shows its kind first.
+const PERSISTED_DB_ERROR_PREFIX: &str = "chain database failure: Db(Error { kind: ";
+
 /// Convert a persistence failure into a rule error so it flows
 /// through the existing error paths (dcrd surfaces these as plain
-/// errors).
-fn persist_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
+/// errors).  Public so tests can check [`is_persisted_db_corruption`]
+/// against the text this produces.
+pub fn persist_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
     RuleError {
         kind: RuleErrorKind::UnknownBlock,
         description: format!("chain database failure: {err:?}"),
     }
+}
+
+/// Convert a failed chain database read -- a block body, filter or
+/// header commitments row that cannot be read or does not decode --
+/// into the error the rule-error paths return.  dcrd returns these as
+/// plain database errors, never rule violations, so they travel as
+/// `ErrUtxoBackendCorruption` with the database error's own text, the
+/// kind the port gives the other local-corruption errors (see
+/// `fetch_spend_journal`).
+fn db_read_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
+    rule_error(RuleErrorKind::UtxoBackendCorruption, format!("{err}"))
+}
+
+/// Read a stored block from the database (the database half of dcrd
+/// `fetchBlockByNode`, `dbFetchBlockByNode` inside a `View`), for
+/// [`Chain::db_fetch_stored_block`] and for a [`TSpendVoteWindow`]
+/// tallied after the chain lock is released.  With no database the
+/// block is reported with the database's "does not exist" text.
+fn fetch_stored_block(
+    db: Option<&dcroxide_database::Database>,
+    hash: &Hash,
+) -> Result<MsgBlock, crate::chaindb::ChainDbError> {
+    let Some(db) = db else {
+        return Err(crate::chaindb::ChainDbError::Db(dcroxide_database::Error {
+            kind: dcroxide_database::ErrorKind::BlockNotFound,
+            description: format!("block {hash} does not exist"),
+        }));
+    };
+    let mut raw = Vec::new();
+    db.view(|tx| {
+        raw = tx.fetch_block(hash)?;
+        Ok(())
+    })?;
+    let (block, _) = dcroxide_wire::MsgBlock::from_bytes(&raw)
+        .map_err(|e| crate::chaindb::ChainDbError::Corrupt(format!("{e}")))?;
+    Ok(block)
+}
+
+/// A treasury spend's voting window captured from the chain by
+/// [`Chain::tspend_vote_window`]: the window bounds, the window's
+/// blocks from the tallying node back to the window start with the
+/// recent window's copy of each body it holds, and the database the
+/// rest are read from.
+///
+/// dcrd's exported `TSpendCountVotes` and `CheckTSpendHasVotes` take no
+/// `chainLock` (`treasury.go:1090-1102`, `:1155-1161`):
+/// `tSpendCountVotes` reads each body through `fetchBlockByNode` under
+/// a database `View` only.  The daemon's RPC and mining seams therefore
+/// capture this under the chain mutex and read and tally the blocks
+/// after releasing it, as `fetch_utxo_stats` does for its backend walk,
+/// so a block waiting to connect does not wait for up to TVI x
+/// multiplier block reads per treasury spend.  Nothing the tally reads
+/// can change under it: block bodies are never rewritten or deleted,
+/// and `fetchBlockByNode` does not populate dcrd's recent block cache,
+/// so a read after the lock is released returns what one under it
+/// would.  The connect path (`tspend_checks`) tallies under the lock,
+/// where dcrd also holds `chainLock`.
+pub struct TSpendVoteWindow {
+    start: u32,
+    end: u32,
+    /// The height of the block the tally is for, one past the
+    /// tallying node.
+    next_height: i64,
+    tspend_hash: Hash,
+    /// Height, hash and the recent window's body, newest first.
+    blocks: Vec<(i64, Hash, Option<Arc<MsgBlock>>)>,
+    db: Option<dcroxide_database::Database>,
+}
+
+impl TSpendVoteWindow {
+    /// Tally the yes and no votes for the treasury spend over the
+    /// window (the tally loop of dcrd `tSpendCountVotes`).  Returns the
+    /// window start and end alongside the yes and no counts.
+    pub fn count_votes(&self) -> Result<(u32, u32, u32, u32), String> {
+        let tspend_hash = self.tspend_hash;
+
+        // Tally the total number of yes and no votes in the voting
+        // window.  dcrd 2.2 guards the tallies against overflow even
+        // though the voting window and per-block vote limits make it
+        // unreachable in practice.
+        let mut total_yes = 0u32;
+        let mut total_no = 0u32;
+        for (height, hash, recent) in &self.blocks {
+            // dcrd returns `fetchBlockByNode`'s error here ("Should not
+            // happen", `treasury.go:1026-1030`), and the RPC seam can
+            // hand over any indexed header, including one whose body
+            // was never stored, so a missing body must not panic.
+            let fetched;
+            let block = match recent {
+                Some(block) => block.as_ref(),
+                None => {
+                    fetched =
+                        fetch_stored_block(self.db.as_ref(), hash).map_err(|e| format!("{e}"))?;
+                    &fetched
+                }
+            };
+            for stx in &block.stransactions {
+                let Ok(votes) = dcroxide_stake::check_ssgen_votes(stx) else {
+                    // Not a stake vote.
+                    continue;
+                };
+                for vote in &votes {
+                    if vote.hash != tspend_hash {
+                        continue;
+                    }
+                    match vote.vote {
+                        dcroxide_stake::TREASURY_VOTE_YES => {
+                            let (sum, ok) =
+                                crate::checkedmath::AddUnsigned::add_unsigned(total_yes, 1);
+                            total_yes = sum;
+                            if !ok {
+                                return Err(format!(
+                                    "yes vote for treasury spend {tspend_hash} at height \
+                                     {height} causes yes count to overflow"
+                                ));
+                            }
+                        }
+                        dcroxide_stake::TREASURY_VOTE_NO => {
+                            let (sum, ok) =
+                                crate::checkedmath::AddUnsigned::add_unsigned(total_no, 1);
+                            total_no = sum;
+                            if !ok {
+                                return Err(format!(
+                                    "no vote for treasury spend {tspend_hash} at height \
+                                     {height} causes no count to overflow"
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok((self.start, self.end, total_yes, total_no))
+    }
+
+    /// Verify the treasury spend has enough votes to be included in the
+    /// block after the tallying node (dcrd `checkTSpendHasVotes`).
+    pub fn check_has_votes(&self, params: &Params) -> Result<(), String> {
+        let (start, end, yes, no) = self.count_votes()?;
+
+        // Passing criteria are the quorum and required percentages.
+        // dcrd computes maxVotes in wrapping u32 before widening.
+        let max_votes = u64::from(u32::from(params.tickets_per_block).wrapping_mul(end - start));
+        let quorum = max_votes * params.treasury_vote_quorum_multiplier
+            / params.treasury_vote_quorum_divisor;
+        // Go adds the u32 tallies before widening; mirror the wrapping
+        // semantics exactly.
+        let num_votes_cast = u64::from(yes.wrapping_add(no));
+        if num_votes_cast < quorum {
+            return Err(format!(
+                "quorum not met: yes {yes} no {no}  quorum {quorum} max {max_votes}"
+            ));
+        }
+
+        // Treat the maximum remaining votes as possible no votes,
+        // enabling early passage only when yes cannot drop below the
+        // threshold.
+        let cur_block_height = self.next_height as u32;
+        let remaining_blocks = end - cur_block_height;
+        let max_remaining_votes =
+            u64::from(remaining_blocks.wrapping_mul(u32::from(params.tickets_per_block)));
+        let required_votes = (num_votes_cast + max_remaining_votes)
+            * params.treasury_vote_required_multiplier
+            / params.treasury_vote_required_divisor;
+        if u64::from(yes) < required_votes {
+            return Err(format!(
+                "not enough yes votes: yes {yes} no {no} quorum {quorum} max {max_votes} \
+                 required {required_votes} maxRemainingVotes {max_remaining_votes}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Whether the rule error is a database corruption that
+/// [`persist_rule_error`] carried: a `dcroxide_database::Error` of kind
+/// `Corruption` (dcrd `database.ErrCorruption`), whose kind the rule
+/// error keeps only in its rendered text.  The daemon's sync adapter
+/// reads it for dcrd's corruption-only `Critical failure` line
+/// (netsync `manager.go:1265-1269`, `:1646-1648`).
+pub fn is_persisted_db_corruption(err: &RuleError) -> bool {
+    err.kind == RuleErrorKind::UnknownBlock
+        && err
+            .description
+            .strip_prefix(PERSISTED_DB_ERROR_PREFIX)
+            .is_some_and(|rest| rest.starts_with("Corruption,"))
 }
 
 /// Wrap a message as a driver-specific database error for use inside
@@ -6063,9 +6800,42 @@ fn chain_db_to_db_error(err: crate::chaindb::ChainDbError) -> dcroxide_database:
     }
 }
 
+/// The backend writes a UTXO cache flush makes, borrowed straight out
+/// of the cache (the write half of dcrd `UtxoCache.flush`): nothing
+/// for unmodified entries or absent markers, a delete for spent ones,
+/// and the entry itself otherwise, whose serialization ignores the
+/// cache state bits.
+fn utxo_flush_rows(
+    cache: &BTreeMap<OutPointKey, Option<UtxoEntry>>,
+) -> impl Iterator<Item = (OutPoint, Option<&UtxoEntry>)> {
+    cache.iter().filter_map(|(key, entry)| {
+        let entry = entry.as_ref()?;
+        if !entry.is_modified() {
+            return None;
+        }
+        let outpoint = OutPoint {
+            hash: Hash(key.0),
+            index: key.1,
+            tree: key.2,
+        };
+        Some((outpoint, (!entry.is_spent()).then_some(entry)))
+    })
+}
+
 /// Convert a stake rule error from the ticket state machine into a
 /// chain rule error like dcrd's error pass-through.
+///
+/// `ErrDatabaseCorrupt` is what the stake-node paths carry a database
+/// failure as (a ticket row or block body that cannot be read), which
+/// dcrd returns as a plain database error, never a rule violation.  It
+/// passes through with its own text as `ErrUtxoBackendCorruption`, the
+/// kind the port gives the other local-corruption errors (see
+/// `fetch_spend_journal`), so `is_rule_violation` does not blame a peer
+/// for it.
 fn stake_rule_error(err: dcroxide_stake::RuleError) -> RuleError {
+    if err.kind == dcroxide_stake::ErrorKind::DatabaseCorrupt {
+        return rule_error(RuleErrorKind::UtxoBackendCorruption, err.description);
+    }
     RuleError {
         kind: RuleErrorKind::TicketUnavailable,
         description: format!("stake node error: {err:?}"),
@@ -6133,4 +6903,323 @@ pub struct VoteInfo {
     /// The threshold state of each agenda, index-aligned with
     /// [`Self::agendas`].
     pub agenda_status: Vec<ThresholdStateTuple>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash_of(n: u8) -> Hash {
+        Hash([n; 32])
+    }
+
+    /// dcrd's `recentContextChecks` is an `lru.Set` of
+    /// `contextCheckCacheSize` hashes whose `Contains` refreshes a hit.
+    #[test]
+    fn recent_context_checks_is_a_bounded_lru_set() {
+        let mut cache = RecentContextChecks::default();
+        for n in 0..CONTEXT_CHECK_CACHE_SIZE as u8 {
+            cache.put(hash_of(n));
+        }
+        // A hit becomes the most recently used, so the next insertion
+        // evicts the second-oldest instead.
+        assert!(cache.contains(&hash_of(0)));
+        cache.put(hash_of(200));
+        assert_eq!(cache.hashes.len(), CONTEXT_CHECK_CACHE_SIZE);
+        assert!(cache.contains(&hash_of(0)));
+        assert!(!cache.contains(&hash_of(1)));
+        assert!(cache.contains(&hash_of(200)));
+
+        // Putting a present hash refreshes rather than duplicates it.
+        cache.put(hash_of(2));
+        assert_eq!(cache.hashes.len(), CONTEXT_CHECK_CACHE_SIZE);
+        assert_eq!(cache.hashes.back(), Some(&hash_of(2).0));
+
+        cache.delete(&hash_of(2));
+        assert!(!cache.contains(&hash_of(2)));
+        assert_eq!(cache.hashes.len(), CONTEXT_CHECK_CACHE_SIZE - 1);
+    }
+
+    /// Accepted blocks are recorded as context-checked (dcrd
+    /// `process.go:396`, `chain.go:1230`), and invalidating a block
+    /// forgets it (`process.go:699`), so it is fully checked again
+    /// should it need to be.
+    #[test]
+    fn accepted_blocks_are_recorded_and_invalidation_forgets_them() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let mut now = 0;
+        let mut accepted = 0;
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            match f[0] {
+                "now" => now = f[1].parse().expect("now"),
+                "accept" => {
+                    let raw = dcroxide_testutil::unhex(f[4]);
+                    let (block, _) = MsgBlock::from_bytes(&raw).expect("block");
+                    let (_, errs) = chain.process_block(&block, now, &params);
+                    assert!(errs.is_empty(), "{}: {errs:?}", f[1]);
+                    accepted += 1;
+                    if accepted == 30 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let tip = chain.best_chain.tip().expect("tip");
+        let tip_hash = chain.store.node(tip).hash;
+        assert!(
+            chain.recent_context_checks.hashes.contains(&tip_hash.0),
+            "the connected block was not recorded as context-checked"
+        );
+
+        let errs = chain.invalidate_block(&tip_hash, now, &params);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(
+            !chain.recent_context_checks.hashes.contains(&tip_hash.0),
+            "an invalidated block must not skip its context checks"
+        );
+
+        // Reconsidering reconnects it, running the checks again since
+        // the invalidation cleared its validated status.
+        let errs = chain.reconsider_block(&tip_hash, now, &params);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(chain.best_chain.tip(), Some(tip), "the block reconnects");
+        assert!(chain.recent_context_checks.hashes.contains(&tip_hash.0));
+    }
+
+    /// A database failure on the stake-node paths is local corruption,
+    /// which dcrd returns as the ticket database's own error, not a rule
+    /// violation a peer could be blamed for (review finding S1-p#2).
+    #[test]
+    fn stake_database_errors_are_not_rule_violations() {
+        let err = stake_rule_error(dcroxide_stake::RuleError {
+            kind: dcroxide_stake::ErrorKind::DatabaseCorrupt,
+            description: "missing key for block undo data".into(),
+        });
+        assert_eq!(err.kind, RuleErrorKind::UtxoBackendCorruption);
+        assert!(!err.kind.is_rule_violation());
+        assert_eq!(err.description, "missing key for block undo data");
+    }
+
+    /// Connecting blocks prunes the cached chain tips at most once per
+    /// `cachedTipsPruneInterval`, relative to the block just connected
+    /// (dcrd `connectBlock` calling `MaybePruneCachedTips`,
+    /// `chain.go:747`).  The port pruned only at load and on reconsider,
+    /// so the cached tips never moved past the startup height (review
+    /// finding B7-c#4).
+    #[test]
+    fn connecting_blocks_prunes_the_cached_tips_on_the_interval() {
+        use crate::blockindex::CACHED_TIPS_PRUNE_DEPTH;
+
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let mut now = 0;
+        let blocks: Vec<MsgBlock> = include_str!("../tests/data/fullblock_vectors.txt")
+            .lines()
+            .filter_map(|line| {
+                let f: Vec<&str> = line.split(' ').collect();
+                match f[0] {
+                    "now" => {
+                        now = f[1].parse().expect("now");
+                        None
+                    }
+                    "accept" => Some(
+                        MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4]))
+                            .expect("block")
+                            .0,
+                    ),
+                    _ => None,
+                }
+            })
+            .collect();
+        let mut blocks = blocks.iter();
+        // Process blocks at the clock until one moves the tip, returning
+        // the new tip's height.
+        let mut connect_one = |chain: &mut Chain, clock: i64| loop {
+            let before = chain.best_chain.tip();
+            let block = blocks.next().expect("the battery has blocks left");
+            let (_, errs) = chain.process_block(block, clock, &params);
+            let is_orphan = errs.len() == 1 && errs[0].kind == RuleErrorKind::MissingParent;
+            assert!(errs.is_empty() || is_orphan, "{errs:?}");
+            let tip = chain.best_chain.tip();
+            if tip != before {
+                return chain.store.node(tip.expect("tip")).height;
+            }
+        };
+
+        // The first connect only stamps the clock, and nothing prunes
+        // within the interval.
+        for _ in 0..40 {
+            connect_one(&mut chain, now);
+        }
+        assert_eq!(chain.index.cached_tips_start(), 0, "pruned too early");
+
+        // A connect one interval on prunes relative to its block.
+        let later = now + CACHED_TIPS_PRUNE_INTERVAL_SECS;
+        let height = connect_one(&mut chain, later);
+        assert!(height > CACHED_TIPS_PRUNE_DEPTH, "the chain is deep enough");
+        assert_eq!(
+            chain.index.cached_tips_start(),
+            height - CACHED_TIPS_PRUNE_DEPTH,
+            "the cached tips were not pruned after the interval"
+        );
+
+        // Not again until another interval has passed.
+        for _ in 0..3 {
+            connect_one(&mut chain, later + CACHED_TIPS_PRUNE_INTERVAL_SECS - 1);
+        }
+        assert_eq!(
+            chain.index.cached_tips_start(),
+            height - CACHED_TIPS_PRUNE_DEPTH,
+            "pruned again within the interval"
+        );
+        let height = connect_one(&mut chain, later + CACHED_TIPS_PRUNE_INTERVAL_SECS);
+        assert_eq!(
+            chain.index.cached_tips_start(),
+            height - CACHED_TIPS_PRUNE_DEPTH
+        );
+    }
+
+    /// A block that extends the tip is attached, and announced, as the
+    /// `blocks` mirror's own copy, together with its parent's, not as
+    /// fresh copies of either: dcrd shares one `*dcrutil.Block` from its
+    /// recent block cache and reuses the fork block as the first
+    /// parent (`chain.go:1146-1178`).  The port deep-copied both out of
+    /// the mirror for every connect (review finding B2-p#4).
+    #[test]
+    fn connecting_a_block_shares_the_mirrored_block_and_parent() {
+        type Connected = Vec<(Arc<MsgBlock>, Arc<MsgBlock>)>;
+
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let connected: Arc<std::sync::Mutex<Connected>> = Arc::default();
+        let sink = Arc::clone(&connected);
+        chain.set_notification_callback(Box::new(move |ntfn| {
+            if let Notification::BlockConnected(data) = ntfn {
+                sink.lock()
+                    .expect("sink")
+                    .push((Arc::clone(&data.block), Arc::clone(&data.parent_block)));
+            }
+        }));
+
+        let mut now = 0;
+        let mut checked = 0;
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            match f[0] {
+                "now" => now = f[1].parse().expect("now"),
+                "accept" => {
+                    let (block, _) =
+                        MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4])).expect("block");
+                    let before = chain.best_chain.tip();
+                    let (_, errs) = chain.process_block(&block, now, &params);
+                    assert!(errs.is_empty(), "{}: {errs:?}", f[1]);
+                    let last = core::mem::take(&mut *connected.lock().expect("connected")).pop();
+                    let tip = chain.best_chain.tip().expect("tip");
+                    if chain.store.node(tip).parent != before {
+                        continue;
+                    }
+                    let parent = before.expect("parent");
+                    let (block_arc, parent_arc) = last.expect("a connect notification");
+                    let mirrored = |id: NodeId| &chain.blocks[&chain.store.node(id).hash.0];
+                    assert!(
+                        Arc::ptr_eq(&block_arc, mirrored(tip)),
+                        "{}: the connected block is a copy of the mirror's",
+                        f[1]
+                    );
+                    assert!(
+                        Arc::ptr_eq(&parent_arc, mirrored(parent)),
+                        "{}: the connected block's parent is a copy of the mirror's",
+                        f[1]
+                    );
+                    checked += 1;
+                    if checked == 20 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(checked, 20, "the battery extends the tip often enough");
+    }
+
+    /// `prune_chain_memory` is `pub`, and on a chain without a database
+    /// the recent-window mirrors are the only copy of the bodies, spend
+    /// journal rows and ticket rows, so it leaves them and clears only
+    /// the stake fields.  A reorganization across the pruned blocks
+    /// then still finds all of them (review finding B2-c#6).
+    #[test]
+    fn pruning_a_memory_only_chain_keeps_what_a_reorg_needs() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let mut now = 0;
+        let mut bf4 = None;
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            match f[0] {
+                "now" => now = f[1].parse().expect("now"),
+                "accept" => {
+                    let (block, _) =
+                        MsgBlock::from_bytes(&dcroxide_testutil::unhex(f[4])).expect("block");
+                    if f[1] == "bf4" {
+                        bf4 = Some(block);
+                        break;
+                    }
+                    let (_, errs) = chain.process_block(&block, now, &params);
+                    assert!(errs.is_empty(), "{}: {errs:?}", f[1]);
+                }
+                _ => {}
+            }
+        }
+        let bf4 = bf4.expect("bf4 in the battery");
+
+        // Everything below the tip leaves memory on a chain with a
+        // database; here only the stake fields may go.
+        chain.prune_chain_memory(1);
+        let tip = chain.best_chain.tip().expect("tip");
+        let fork = chain.store.node(tip).parent.expect("fork");
+        assert!(chain.store.node(fork).stake_node.is_none());
+        let fork_hash = chain.store.node(fork).hash;
+        assert!(chain.blocks.contains_key(&fork_hash.0));
+        assert!(chain.spend_journal.contains_key(&fork_hash.0));
+
+        // `bf4` extends the side branch off the fork past the tip, so
+        // the tip is detached against the fork block.
+        let (_, errs) = chain.process_block(&bf4, now, &params);
+        assert!(errs.is_empty(), "{errs:?}");
+        let tip = chain.best_chain.tip().expect("tip");
+        assert_eq!(chain.store.node(tip).hash, bf4.header.block_hash());
+    }
+
+    /// `height_range` is dcrd's half-open `[start, end)` range capped at
+    /// the best chain height, and a negative start or an end below the
+    /// start is dcrd's plain error with its text rather than an empty
+    /// list (`chain.go:1782-1823`; review finding B3-p#8).
+    #[test]
+    fn height_range_is_half_open_and_rejects_dcrd_argument_errors() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let chain = Chain::new(&params, Hash::ZERO, false);
+        let genesis = chain.store.node(chain.best_chain.tip().expect("tip")).hash;
+
+        assert_eq!(
+            chain.height_range(-1, 0),
+            Err(String::from(
+                "start height of fetch range must not be less than zero - got -1"
+            ))
+        );
+        assert_eq!(
+            chain.height_range(2, 1),
+            Err(String::from(
+                "end height of fetch range must not be less than the start height - got start \
+                 2, end 1"
+            ))
+        );
+        assert_eq!(chain.height_range(0, 0), Ok(Vec::new()));
+        // Exclusive of the end, and capped at the tip.
+        assert_eq!(chain.height_range(0, 1), Ok(alloc::vec![genesis]));
+        assert_eq!(chain.height_range(0, 5), Ok(alloc::vec![genesis]));
+        assert_eq!(chain.height_range(1, 5), Ok(Vec::new()));
+    }
 }

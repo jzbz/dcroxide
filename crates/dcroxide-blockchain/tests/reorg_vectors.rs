@@ -93,7 +93,9 @@ fn reorg_vectors() {
                 }
                 chain.index.add_node(&chain.store, id);
                 chain.index.add_best_chain_candidate(id);
-                chain.blocks.insert(block.header.block_hash().0, block);
+                chain
+                    .blocks
+                    .insert(block.header.block_hash().0, std::sync::Arc::new(block));
                 counts[1] += 1;
             }
             "reorg" => {

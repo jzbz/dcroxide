@@ -12,7 +12,7 @@
 //! until the chain engine settles concurrency), the database flush
 //! machinery (`modified`/`Flush`, which arrive with engine
 //! persistence), or the wall-clock cached-tip prune timer (the prune
-//! itself is exposed directly).
+//! itself is exposed directly, and the engine's connect path times it).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
@@ -244,6 +244,15 @@ pub struct NodeStore {
     /// dcrd's `calcStakeVersionCache`, keyed by the block hash.
     pub(crate) stake_version_cache:
         core::cell::RefCell<alloc::collections::BTreeMap<[u8; 32], u32>>,
+    /// dcrd's `cachedBlake3WorkDiffAnchor`: the DCP0011 anchor the
+    /// contextual difficulty calculation last found.  Unlike the
+    /// caches above it holds one node, which views only honour when
+    /// it is an ancestor of the node they ask about, exactly as dcrd
+    /// checks `IsAncestorOf` on every load.
+    pub(crate) blake3_work_diff_anchor: core::cell::Cell<Option<NodeId>>,
+    /// dcrd's `cachedBlake3WorkDiffCandidateAnchor`: the candidate
+    /// anchor the positional difficulty check last matched.
+    pub(crate) blake3_work_diff_candidate_anchor: core::cell::Cell<Option<NodeId>>,
 }
 
 impl NodeStore {
@@ -696,8 +705,8 @@ impl BlockIndex {
     }
 
     /// Remove old cached chain tips relative to the passed best node
-    /// (dcrd `pruneCachedTips`, sans the wall-clock interval which the
-    /// engine drives).
+    /// (dcrd `pruneCachedTips`, sans the wall-clock interval, which the
+    /// engine's `Chain::maybe_prune_cached_tips` drives).
     pub fn prune_cached_tips(&mut self, store: &NodeStore, best_node: NodeId) {
         let height = store.node(best_node).height - CACHED_TIPS_PRUNE_DEPTH;
         if height <= 0 {
@@ -706,6 +715,13 @@ impl BlockIndex {
         self.cached_tips
             .retain(|_, &mut n| store.node(n).height >= height);
         self.cached_tips_start = height;
+    }
+
+    /// The height the cached chain tips start at, for the engine's
+    /// tests of the timed prune.
+    #[cfg(test)]
+    pub(crate) fn cached_tips_start(&self) -> i64 {
+        self.cached_tips_start
     }
 
     /// Clear the tracked best invalid block so it can be

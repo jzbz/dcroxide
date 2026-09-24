@@ -210,7 +210,9 @@ fn persistence_vectors() {
                     BlockStatus(BlockStatus::DATA_STORED.0 | BlockStatus::VALIDATED.0),
                 );
                 chain.index.add_best_chain_candidate(id);
-                chain.blocks.insert(hash.0, block.clone());
+                chain
+                    .blocks
+                    .insert(hash.0, std::sync::Arc::new(block.clone()));
                 chain
                     .db
                     .as_ref()

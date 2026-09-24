@@ -16,9 +16,12 @@
 //! host that could not afford the allocation re-downloaded every header
 //! and failed at the same place again.
 //!
-//! Not flushed per header, which dcrd can afford and this cannot: the
-//! database writes at `Durability::Immediate`, so per-header would be an
-//! fsync per header. One `headers` message worth is the threshold.
+//!
+//! The first fix flushed once per `headers` message worth (2000) on the
+//! belief that each flush was an fsync. It is not: a flush commits into
+//! the database's metadata write cache, which reaches disk only when the
+//! cache flushes, exactly as dcrd's ffldb cache does. So the port now
+//! flushes after every header, as dcrd does (review finding B1-p#4).
 
 // Test-harness arithmetic over bounded heights.
 #![allow(clippy::arithmetic_side_effects)]
@@ -92,17 +95,16 @@ fn counting_options(dir: &std::path::Path, net: u32) -> (Options, Arc<Mutex<usiz
     (opts, count)
 }
 
-/// Headers accepted without any block connecting are still durable.
+/// Headers accepted without any block connecting are still durable, every
+/// one of them, as each is accepted.
 ///
 /// The chain is dropped rather than closed, so only what the header path
 /// itself wrote survives. Pre-fix that is genesis alone, however many
-/// headers were accepted.
+/// headers were accepted; with the 2000-header batching it was nothing
+/// short of 2000 headers, which a headers-only fixture cannot reach
+/// (simnet's stake validation height is below it).
 #[test]
 fn accepted_headers_are_flushed_without_waiting_for_a_block() {
-    // Two full thresholds' worth, so the bound is crossed twice. The
-    // threshold is lowered because the real one, 2000, is past simnet's
-    // stake validation height and a headers-only fixture cannot reach it.
-    const THRESHOLD: usize = 8;
     const HEADERS: u32 = 20;
 
     let params = simnet_params();
@@ -115,33 +117,41 @@ fn accepted_headers_are_flushed_without_waiting_for_a_block() {
             Chain::open(db, &params, Hash::ZERO, false, 0).expect("open chain"),
         ));
         let mut guard = chain.lock().expect("chain");
-        guard.set_header_flush_threshold(THRESHOLD);
         let mut prev = params.genesis_block.header;
         let mut n = 0u32;
         for _ in 0..HEADERS {
+            let before = *written.lock().expect("counter");
             let h = header(&prev, &params);
             guard
                 .process_block_header(&h, 2_000_000_000, &params)
                 .unwrap_or_else(|e| panic!("header {} rejected: {e:?}", h.height));
+            // No block ever connects.  The cache flush is what pushes
+            // whatever was committed out to the engine, where the sink
+            // sees it; a header whose row was never committed pushes
+            // nothing.
+            guard
+                .db
+                .as_ref()
+                .expect("db-backed")
+                .flush()
+                .expect("flush");
+            let after = *written.lock().expect("counter");
+            assert!(
+                after > before,
+                "header {} was accepted but its block index row was not committed: dcrd \
+                 flushes the block index after every header (`process.go:267-271`)",
+                h.height,
+            );
             prev = h;
             n += 1;
         }
-        // No block ever connects.  The cache flush is what pushes
-        // whatever was committed out to the engine, where the sink sees
-        // it; pre-fix nothing was ever committed, so it pushes nothing.
-        guard
-            .db
-            .as_ref()
-            .expect("db-backed")
-            .flush()
-            .expect("flush");
         n
     };
     assert_eq!(accepted, HEADERS, "the fixture must accept every header");
 
     let rows = *written.lock().expect("counter");
     assert!(
-        rows >= THRESHOLD,
+        rows >= HEADERS as usize,
         "only {rows} block index rows were written after {HEADERS} accepted headers: \
          nothing flushes until a block connects, so a mainnet header sync accumulates \
          the whole chain in memory and loses all of it on restart",

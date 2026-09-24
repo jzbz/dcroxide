@@ -361,14 +361,16 @@ pub fn serialize_spend_journal_entry(stxos: &[SpentTxOut]) -> Option<Vec<u8>> {
 /// Decode a spend journal entry against the transactions it spends for
 /// (dcrd `deserializeSpendJournalEntry`): every input of every
 /// non-vote transaction gets an stxo; votes get exactly one (the
-/// ticket input; the stakebase carries no stxo).
-pub fn deserialize_spend_journal_entry(
+/// ticket input; the stakebase carries no stxo).  The transactions may
+/// be owned or borrowed, so a caller can lend a block's own.
+pub fn deserialize_spend_journal_entry<T: core::borrow::Borrow<MsgTx>>(
     serialized: &[u8],
-    txns: &[MsgTx],
+    txns: &[T],
 ) -> Result<Vec<SpentTxOut>, Error> {
     // Calculate the total number of stxos.
     let mut num_stxos = 0usize;
     for tx in txns {
+        let tx = tx.borrow();
         if dcroxide_stake::is_ssgen(tx) {
             num_stxos += 1;
             continue;
@@ -393,6 +395,7 @@ pub fn deserialize_spend_journal_entry(
     let mut stxo_idx = num_stxos as isize - 1;
     let mut offset = 0usize;
     for tx in txns.iter().rev() {
+        let tx = tx.borrow();
         let is_vote = dcroxide_stake::is_ssgen(tx);
         for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate().rev() {
             if tx_in_idx == 0 && is_vote {

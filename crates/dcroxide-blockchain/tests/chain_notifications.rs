@@ -250,7 +250,9 @@ fn reorg_vectors_emit_dcrds_notification_sequence() {
                 }
                 chain.index.add_node(&chain.store, id);
                 chain.index.add_best_chain_candidate(id);
-                chain.blocks.insert(block.header.block_hash().0, block);
+                chain
+                    .blocks
+                    .insert(block.header.block_hash().0, Arc::new(block));
             }
             "reorg" => {
                 let target = chain

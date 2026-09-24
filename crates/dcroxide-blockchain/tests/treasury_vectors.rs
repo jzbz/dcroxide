@@ -64,9 +64,10 @@ fn treasury_vectors() {
                     node.is_fully_linked = true;
                 }
                 chain.index.add_node(&chain.store, id);
-                chain
-                    .blocks
-                    .insert(block.header.block_hash().0, block.clone());
+                chain.blocks.insert(
+                    block.header.block_hash().0,
+                    std::sync::Arc::new(block.clone()),
+                );
                 chain
                     .fetch_stake_node(id, &params)
                     .unwrap_or_else(|e| panic!("{line}: stake node: {e:?}"));

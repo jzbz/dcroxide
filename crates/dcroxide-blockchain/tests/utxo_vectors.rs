@@ -242,7 +242,8 @@ fn corrupt_script_size_discriminants_wrap_negative() {
     // Script version 0 followed by the corrupt size discriminant.
     let err = compress::decode_compressed_tx_out(&[0x00, 10], false)
         .expect_err("a negative script size must be rejected");
-    assert_eq!(err.to_string(), "deserialize error: negative script size");
+    // dcrd's `errDeserialize` prints its bare description.
+    assert_eq!(err.to_string(), "negative script size");
 }
 
 #[test]

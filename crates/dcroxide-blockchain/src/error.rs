@@ -16,9 +16,12 @@ pub enum Error {
 }
 
 impl fmt::Display for Error {
+    /// The bare description, as dcrd's `errDeserialize.Error` returns
+    /// it (`chainio.go:138-141`), so nested decode errors read the way
+    /// dcrd's do.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Deserialize(s) => write!(f, "deserialize error: {s}"),
+            Error::Deserialize(s) => f.write_str(s),
         }
     }
 }

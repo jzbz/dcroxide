@@ -215,7 +215,8 @@ impl NodeChainView {
 /// `ChainView`/`VoteChainView` abstractions the validation functions
 /// walk.  dcrd's equivalents walk `blockNode` parent pointers
 /// directly; here the deterministic skip list serves each height
-/// lookup.
+/// lookup, and the descending version walks follow the parent links
+/// like dcrd once their start is resolved.
 pub struct NodeBranchView<'a> {
     /// The node store holding the branch.
     pub store: &'a crate::blockindex::NodeStore,
@@ -223,13 +224,39 @@ pub struct NodeBranchView<'a> {
     pub tip: crate::blockindex::NodeId,
 }
 
-impl crate::difficulty::ChainView for NodeBranchView<'_> {
-    fn node(&self, height: i64) -> Option<crate::difficulty::DiffNode> {
+impl NodeBranchView<'_> {
+    /// The node at the given height along this branch.
+    fn node_id(&self, height: i64) -> Option<NodeId> {
         if height < 0 || height > self.store.node(self.tip).height {
             return None;
         }
-        let id = self.store.ancestor(self.tip, height)?;
-        let n = self.store.node(id);
+        self.store.ancestor(self.tip, height)
+    }
+
+    /// The height of the given node when it is an ancestor of (or is)
+    /// the node at the given height along this branch (dcrd
+    /// `IsAncestorOf`).
+    fn ancestor_height(&self, id: NodeId, height: i64) -> Option<i64> {
+        self.node_id(height)?;
+        let id_height = self.store.node(id).height;
+        (id_height <= height && self.node_id(id_height) == Some(id)).then_some(id_height)
+    }
+}
+
+/// Fill the version data of the given block node into `out`, reusing
+/// its vote version buffer.
+fn fill_version_node(n: &crate::blockindex::BlockNode, out: &mut crate::stakever::VersionNode) {
+    out.height = n.height;
+    out.timestamp = n.timestamp;
+    out.block_version = n.block_version;
+    out.stake_version = n.stake_version;
+    out.vote_versions.clear();
+    out.vote_versions.extend(n.votes.iter().map(|v| v.0));
+}
+
+impl crate::difficulty::ChainView for NodeBranchView<'_> {
+    fn node(&self, height: i64) -> Option<crate::difficulty::DiffNode> {
+        let n = self.store.node(self.node_id(height)?);
         Some(crate::difficulty::DiffNode {
             height: n.height,
             timestamp: n.timestamp,
@@ -239,12 +266,50 @@ impl crate::difficulty::ChainView for NodeBranchView<'_> {
             fresh_stake: n.fresh_stake,
         })
     }
+
+    fn blake3_anchor_cached(&self, height: i64) -> Option<i64> {
+        self.ancestor_height(self.store.blake3_work_diff_anchor.get()?, height)
+    }
+
+    fn cache_blake3_anchor(&self, height: i64) {
+        if let Some(id) = self.node_id(height) {
+            self.store.blake3_work_diff_anchor.set(Some(id));
+        }
+    }
+
+    fn blake3_candidate_anchor_cached(&self, height: i64) -> Option<i64> {
+        self.ancestor_height(self.store.blake3_work_diff_candidate_anchor.get()?, height)
+    }
+
+    fn cache_blake3_candidate_anchor(&self, height: i64) {
+        if let Some(id) = self.node_id(height) {
+            self.store.blake3_work_diff_candidate_anchor.set(Some(id));
+        }
+    }
 }
 
 impl crate::stakever::VersionChainView for NodeBranchView<'_> {
     fn node(&self, height: i64) -> Option<crate::stakever::VersionNode> {
-        use crate::thresholdstate::VoteChainView;
-        self.vote_node(height).map(|n| n.node)
+        let mut node = crate::stakever::VersionNode::default();
+        fill_version_node(self.store.node(self.node_id(height)?), &mut node);
+        Some(node)
+    }
+
+    // Resolve the start once through the skip list and then follow
+    // parent links, one hop per step exactly like dcrd's walks, with
+    // one reused node rather than a fresh lookup and allocation per
+    // step.
+    fn walk_back(&self, height: i64, visit: &mut dyn FnMut(&crate::stakever::VersionNode) -> bool) {
+        let mut node = crate::stakever::VersionNode::default();
+        let mut id = self.node_id(height);
+        while let Some(cur) = id {
+            let n = self.store.node(cur);
+            fill_version_node(n, &mut node);
+            if !visit(&node) {
+                break;
+            }
+            id = n.parent;
+        }
     }
 
     fn cache_hash(&self, height: i64) -> Option<[u8; 32]> {

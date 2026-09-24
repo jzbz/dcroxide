@@ -44,10 +44,46 @@ pub struct DiffNode {
 
 /// A height-indexed view of the branch of block nodes ending at the
 /// block being extended, replacing dcrd's parent-pointer walks.
+///
+/// The `*blake3*anchor*` methods expose dcrd chain.go's two cached
+/// DCP0011 anchor nodes (`cachedBlake3WorkDiffAnchor` and
+/// `cachedBlake3WorkDiffCandidateAnchor`).  The defaults hold nothing,
+/// which is dcrd before its first contextual BLAKE3 difficulty
+/// calculation; the live chain's view overrides them.  Unlike the
+/// stake version memoization this is not result-invariant: once the
+/// confirmed anchor is set, dcrd's `checkDifficultyPositional` holds
+/// headers to the ASERT difficulty alone.
 pub trait ChainView {
     /// The node at the given height along this branch, or `None` when
     /// the height is negative or unknown.
     fn node(&self, height: i64) -> Option<DiffNode>;
+
+    /// The height of the cached confirmed BLAKE3 anchor when there is
+    /// one and it is an ancestor of (or is) the node at the given
+    /// height along this branch (dcrd
+    /// `cachedBlake3WorkDiffAnchor.Load()` plus `IsAncestorOf`).
+    fn blake3_anchor_cached(&self, _height: i64) -> Option<i64> {
+        None
+    }
+
+    /// Record the node at the given height along this branch as the
+    /// confirmed BLAKE3 anchor (dcrd
+    /// `cachedBlake3WorkDiffAnchor.Store`).
+    fn cache_blake3_anchor(&self, _height: i64) {}
+
+    /// The height of the cached candidate BLAKE3 anchor when there is
+    /// one and it is an ancestor of (or is) the node at the given
+    /// height along this branch (dcrd
+    /// `cachedBlake3WorkDiffCandidateAnchor.Load()` plus
+    /// `IsAncestorOf`).
+    fn blake3_candidate_anchor_cached(&self, _height: i64) -> Option<i64> {
+        None
+    }
+
+    /// Record the node at the given height along this branch as the
+    /// candidate BLAKE3 anchor (dcrd
+    /// `cachedBlake3WorkDiffCandidateAnchor.Store`).
+    fn cache_blake3_candidate_anchor(&self, _height: i64) {}
 }
 
 /// The magic value of test network version 3 (wire `TestNet3`).

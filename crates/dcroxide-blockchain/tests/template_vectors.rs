@@ -148,7 +148,8 @@ fn template_vectors() {
                 // range <start> <end> <csv>
                 let start: i64 = f[1].parse().expect("start");
                 let end: i64 = f[2].parse().expect("end");
-                assert_eq!(hash_csv(&chain.height_range(start, end)), f[3], "{line}");
+                let range = chain.height_range(start, end).expect("height range");
+                assert_eq!(hash_csv(&range), f[3], "{line}");
             }
             "xnode" => {
                 let (header, _) = BlockHeader::from_bytes(&unhex(f[1])).expect("header");

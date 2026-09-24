@@ -165,6 +165,7 @@ fn connectblock_vectors() {
                 let parent = parent.as_ref().expect("parent first");
                 let mut view = base_view.clone();
                 let mut stxos: Vec<SpentTxOut> = Vec::new();
+                let prev_height = block.header.height as i64 - 1;
                 let result = check_connect_block(
                     &chain,
                     &mut subsidy_cache,
@@ -180,12 +181,14 @@ fn connectblock_vectors() {
                     Some(&mut stxos),
                     false,
                     None,
-                    None,
+                    // Chainless: no prior block data for the full
+                    // battery, so name the stateless subset.
+                    &|blk: &MsgBlock| tspend_checks_stateless(prev_height, blk, &params),
                     &params,
                 );
                 assert_eq!(kind_of(&result), f[2], "{line}");
-                if let Ok(filter_hash) = result {
-                    assert_eq!(filter_hash, parse_hash(f[3]), "{line}: filter hash");
+                if let Ok(filter) = result {
+                    assert_eq!(filter.hash(), parse_hash(f[3]), "{line}: filter hash");
                     assert_eq!(view.best_hash(), block.header.block_hash(), "{line}");
                 }
                 assert_eq!(

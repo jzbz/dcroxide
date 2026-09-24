@@ -162,11 +162,10 @@ impl RpcChain for NodeRpcChain {
     }
 
     fn height_range(&self, start: i64, end: i64) -> Result<Vec<Hash>, String> {
-        Ok(self
-            .chain
+        self.chain
             .lock()
             .expect("chain mutex poisoned")
-            .height_range(start, end))
+            .height_range(start, end)
     }
 
     fn block_height_by_hash(&self, hash: &Hash) -> Result<i64, String> {

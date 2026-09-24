@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use dcroxide_chainhash::Hash;
-use dcroxide_database::Transaction;
+use dcroxide_database::{Bucket, Transaction};
 use dcroxide_gcs::FilterV2;
 use dcroxide_uint256::Uint256;
 use dcroxide_wire::OutPoint;
@@ -83,6 +83,10 @@ pub enum ChainDbError {
     Serial(crate::Error),
     /// A corruption or consistency failure.
     Corrupt(String),
+    /// A shutdown was requested through the chain's interrupt while a
+    /// long-running startup step was under way (dcrd
+    /// `errInterruptRequested`, `upgrade.go:34-36`).
+    Interrupted,
 }
 
 impl From<dcroxide_database::Error> for ChainDbError {
@@ -106,6 +110,7 @@ impl fmt::Display for ChainDbError {
             ChainDbError::Db(e) => write!(f, "{e}"),
             ChainDbError::Serial(e) => write!(f, "{e}"),
             ChainDbError::Corrupt(s) => f.write_str(s),
+            ChainDbError::Interrupted => f.write_str("interrupt requested"),
         }
     }
 }
@@ -246,24 +251,97 @@ pub fn db_put_block_index_entry(
     )?)
 }
 
-/// Load every block index entry in height order (the iteration dcrd
-/// `loadBlockIndex` performs; the key sorts by big-endian height).
-pub fn db_load_block_index(tx: &Transaction) -> Result<Vec<BlockIndexEntry>, ChainDbError> {
+/// The number of keys each [`for_each_windowed`] window returns.
+pub(crate) const FOR_EACH_WINDOW: usize = 4096;
+
+/// Invoke `fn_` with every key/value pair in the bucket, in key order
+/// and not including nested buckets, as
+/// [`dcroxide_database::Bucket::for_each`] does -- but walking
+/// [`dcroxide_database::Bucket::cursor_window`] windows of `window`
+/// keys rather than gathering every key of the bucket before the first
+/// callback.  The first error from `fn_` ends the walk.
+///
+/// dcrd walks a bucket with a cursor or iterator, a pair of lazy merged
+/// iterators that holds one row at a time; gathering the bucket's whole
+/// key set up front would be, for the block index (about 1.1M mainnet
+/// rows), a transient allocation dcrd never makes.  `Bucket::for_each`
+/// streams its own fixed windows too; this walk takes the window size
+/// as a parameter so the block index load's tests can make it cross
+/// window boundaries.  The bucket must not change during the walk.
+///
+/// The window bounds only the rows in the durable store.  Once a
+/// window's store range comes back short, `scan_prefix_keys_window`
+/// gathers every remaining key of the bucket from the database cache's
+/// overlay and this transaction's pending writes into that window and
+/// then keeps `window` of them, and the next window gathers the same
+/// tail again from where this one stopped.  N rows that sort past the
+/// store's last key therefore cost O(N^2 / `window`) time and hold all
+/// N keys at once, where `for_each` is linear.  Walk a bucket whose
+/// rows are in the store: the block index load runs in a view taken
+/// right after the database opens, with an empty overlay.
+pub(crate) fn for_each_windowed<E>(
+    bucket: &Bucket<'_>,
+    window: usize,
+    mut fn_: impl FnMut(&[u8], &[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    // An empty window would never come back short.
+    let window = window.max(1);
+    // Where the previous window stopped: `cursor_window` starts
+    // strictly after it.
+    let mut resume: Option<Vec<u8>> = None;
+    loop {
+        let mut cursor = bucket.cursor_window(resume.as_deref(), window);
+        let mut seen = 0usize;
+        let mut ok = cursor.first();
+        while ok {
+            // A nested bucket has a key but no value, and `for_each`
+            // leaves those out.
+            if let (Some(k), Some(v)) = (cursor.key(), cursor.value()) {
+                fn_(&k, &v)?;
+            }
+            resume = cursor.raw_key();
+            seen += 1;
+            ok = cursor.next();
+        }
+        // A short window is the end of the bucket.
+        if seen < window {
+            return Ok(());
+        }
+    }
+}
+
+/// Hand every block index entry to `fn_` in height order, decoding
+/// each row as it is reached (the cursor walk dcrd `loadBlockIndex`
+/// performs; the key sorts by big-endian height).  The first error,
+/// from a row that fails to decode or from `fn_`, ends the walk.
+///
+/// Collecting the rows and then the decoded entries, on top of the key
+/// set `for_each` gathers, held the whole index in memory three times
+/// over at startup; this holds one window of keys and one row, as it
+/// does whenever the rows are in the store, which at startup they all
+/// are (see `for_each_windowed`).
+pub fn db_load_block_index(
+    tx: &Transaction,
+    fn_: impl FnMut(BlockIndexEntry) -> Result<(), ChainDbError>,
+) -> Result<(), ChainDbError> {
+    db_load_block_index_windowed(tx, FOR_EACH_WINDOW, fn_)
+}
+
+/// [`db_load_block_index`] with the window size as a parameter, so the
+/// tests can make the walk cross window boundaries.
+fn db_load_block_index_windowed(
+    tx: &Transaction,
+    window: usize,
+    mut fn_: impl FnMut(BlockIndexEntry) -> Result<(), ChainDbError>,
+) -> Result<(), ChainDbError> {
     let meta = tx.metadata();
     let bucket = meta
         .bucket(BLOCK_INDEX_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing block index bucket".into()))?;
-    let mut rows: Vec<Vec<u8>> = Vec::new();
-    bucket.for_each(|_k, v| {
-        rows.push(v.to_vec());
-        Ok(())
-    })?;
-    let mut entries = Vec::with_capacity(rows.len());
-    for row in rows {
-        let (entry, _) = decode_block_index_entry(&row)?;
-        entries.push(entry);
-    }
-    Ok(entries)
+    for_each_windowed(&bucket, window, |_k, row| {
+        let (entry, _) = decode_block_index_entry(row)?;
+        fn_(entry)
+    })
 }
 
 /// Store the serialized spend journal entry for a block (dcrd
@@ -308,16 +386,13 @@ pub fn db_put_gcs_filter(
 }
 
 /// Fetch the version 2 GCS filter for a block, `None` when absent
-/// (dcrd `dbFetchGCSFilter`).
+/// (dcrd `dbFetchGCSFilter`).  A row that does not decode is dcrd's
+/// `database.ErrCorruption` with its "corrupt filter" text.
 pub fn db_fetch_gcs_filter(
     tx: &Transaction,
     block_hash: &Hash,
 ) -> Result<Option<FilterV2>, ChainDbError> {
-    let meta = tx.metadata();
-    let bucket = meta
-        .bucket(GCS_FILTER_BUCKET_NAME)
-        .ok_or_else(|| ChainDbError::Corrupt("missing gcs filter bucket".into()))?;
-    let Some(serialized) = bucket.get(&block_hash.0) else {
+    let Some(serialized) = db_fetch_raw_gcs_filter(tx, block_hash)? else {
         return Ok(None);
     };
     let filter = FilterV2::from_bytes(
@@ -325,8 +400,22 @@ pub fn db_fetch_gcs_filter(
         dcroxide_gcs::blockcf2::M,
         &serialized,
     )
-    .map_err(|e| ChainDbError::Corrupt(format!("bad gcs filter: {e:?}")))?;
+    .map_err(|e| ChainDbError::Corrupt(format!("corrupt filter for {block_hash}: {e}")))?;
     Ok(Some(filter))
+}
+
+/// Fetch the serialized version 2 GCS filter for a block without
+/// decoding it, `None` when absent (dcrd `dbFetchRawGCSFilter`, which
+/// `LocateCFiltersV2` serves peers from).
+pub fn db_fetch_raw_gcs_filter(
+    tx: &Transaction,
+    block_hash: &Hash,
+) -> Result<Option<Vec<u8>>, ChainDbError> {
+    let meta = tx.metadata();
+    let bucket = meta
+        .bucket(GCS_FILTER_BUCKET_NAME)
+        .ok_or_else(|| ChainDbError::Corrupt("missing gcs filter bucket".into()))?;
+    Ok(bucket.get(&block_hash.0))
 }
 
 /// Store the header commitment leaves for a block; nothing is
@@ -369,19 +458,37 @@ pub fn db_put_utxo(
     outpoint: &OutPoint,
     entry: Option<&UtxoEntry>,
 ) -> Result<(), ChainDbError> {
+    db_put_utxos(tx, core::iter::once((*outpoint, entry)))
+}
+
+/// Store or remove a batch of UTXO set rows within one transaction,
+/// with exactly [`db_put_utxo`]'s per-row semantics: `None` deletes
+/// the row and an entry writes its serialization, which ignores the
+/// entry's cache state bits.  The bucket resolves once for the whole
+/// batch, as [`db_fetch_utxo_entries`] does on the read side, instead
+/// of once per row -- a lookup that walks the transaction's growing
+/// pending writes every time.  (dcrd's cache flush writes each row
+/// straight into a leveldb batch, which has no bucket to resolve.)
+pub fn db_put_utxos<'a>(
+    tx: &Transaction,
+    rows: impl IntoIterator<Item = (OutPoint, Option<&'a UtxoEntry>)>,
+) -> Result<(), ChainDbError> {
     let meta = tx.metadata();
     let bucket = meta
         .bucket(UTXO_SET_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing utxo set bucket".into()))?;
-    let key = outpoint_key(outpoint);
-    match entry {
-        None => {
-            bucket.delete(&key)?;
-        }
-        Some(entry) => {
-            let serialized = serialize_utxo_entry(entry)
-                .ok_or_else(|| ChainDbError::Corrupt("serializing a spent utxo entry".into()))?;
-            bucket.put(&key, &serialized)?;
+    for (outpoint, entry) in rows {
+        let key = outpoint_key(&outpoint);
+        match entry {
+            None => {
+                bucket.delete(&key)?;
+            }
+            Some(entry) => {
+                let serialized = serialize_utxo_entry(entry).ok_or_else(|| {
+                    ChainDbError::Corrupt("serializing a spent utxo entry".into())
+                })?;
+                bucket.put(&key, &serialized)?;
+            }
         }
     }
     Ok(())
@@ -391,6 +498,9 @@ pub fn db_put_utxo(
 /// `levelDbUtxoBackend.dbFetchUtxoEntry`): a missing row returns
 /// `None`, an empty row is an entry for a spent output — which should
 /// never exist — and both it and an undecodable row are corruption.
+/// A store read error is returned, not read as a missing row: the row
+/// is read with `Bucket::try_get`, as dcrd's backend `Get` keeps
+/// `ErrNotFound` apart from a real error.
 pub fn db_fetch_utxo_entry(
     tx: &Transaction,
     outpoint: &OutPoint,
@@ -400,7 +510,7 @@ pub fn db_fetch_utxo_entry(
         .bucket(UTXO_SET_BUCKET_NAME)
         .ok_or_else(|| ChainDbError::Corrupt("missing utxo set bucket".into()))?;
     let key = outpoint_key(outpoint);
-    let Some(serialized) = bucket.get(&key) else {
+    let Some(serialized) = bucket.try_get(&key)? else {
         return Ok(None);
     };
     if serialized.is_empty() {
@@ -429,7 +539,7 @@ pub fn db_fetch_utxo_entries(
     let mut entries = Vec::with_capacity(outpoints.len());
     for outpoint in outpoints {
         let key = outpoint_key(outpoint);
-        let Some(serialized) = bucket.get(&key) else {
+        let Some(serialized) = bucket.try_get(&key)? else {
             entries.push(None);
             continue;
         };
@@ -475,8 +585,12 @@ pub fn db_put_utxo_set_state(tx: &Transaction, state: &UtxoSetState) -> Result<(
 /// a zero-length row (`serialize_utxo_set_state` is a VLQ height plus
 /// a 32-byte hash, 33 bytes minimum), so only corruption or an
 /// out-of-band writer produces one.
+///
+/// Read with `Bucket::try_get` for the same reason as
+/// [`db_fetch_utxo_entry`]: dcrd's `FetchState` reads through the
+/// backend `Get`, which propagates a read error.
 pub fn db_fetch_utxo_set_state(tx: &Transaction) -> Result<Option<UtxoSetState>, ChainDbError> {
-    match tx.metadata().get(UTXO_SET_STATE_KEY_NAME) {
+    match tx.metadata().try_get(UTXO_SET_STATE_KEY_NAME)? {
         None => Ok(None),
         Some(v) => Ok(Some(deserialize_utxo_set_state(&v)?)),
     }
@@ -504,4 +618,204 @@ pub(crate) fn decode_outpoint_key(key: &[u8]) -> Result<OutPoint, ChainDbError> 
         index: index as u32,
         tree: tree as i8,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dcroxide_database::{Database, Options};
+    use dcroxide_wire::BlockHeader;
+
+    /// simnet's network magic; the rows are not tied to it.
+    const NET: u32 = 0x12141c16;
+
+    /// A block index entry at `height` whose header links to `prev`;
+    /// `nonce` tells apart two blocks at one height.
+    fn entry(height: u32, prev: Hash, nonce: u32) -> BlockIndexEntry {
+        BlockIndexEntry {
+            header: BlockHeader {
+                version: 1,
+                prev_block: prev,
+                merkle_root: Hash::ZERO,
+                stake_root: Hash::ZERO,
+                vote_bits: 1,
+                final_state: [0; 6],
+                voters: 0,
+                fresh_stake: 0,
+                revocations: 0,
+                pool_size: 0,
+                bits: 0x207f_ffff,
+                sbits: 0,
+                height,
+                size: 0,
+                timestamp: height,
+                nonce,
+                extra_data: [0; 32],
+                stake_version: 0,
+            },
+            status: (height % 7) as u8,
+            vote_info: vec![(height, height as u16)],
+        }
+    }
+
+    /// Store a 12-block chain with a side block at every third height,
+    /// returning the entries in the order their keys sort.
+    fn put_rows(tx: &Transaction) -> Vec<BlockIndexEntry> {
+        tx.metadata()
+            .create_bucket(BLOCK_INDEX_BUCKET_NAME)
+            .expect("create block index bucket");
+        let mut rows = Vec::new();
+        let mut prev = Hash::ZERO;
+        for height in 0..12u32 {
+            let main = entry(height, prev, 0);
+            if height % 3 == 1 {
+                rows.push(entry(height, prev, 1));
+            }
+            prev = main.header.block_hash();
+            rows.push(main);
+        }
+        for row in &rows {
+            let hash = row.header.block_hash();
+            db_put_block_index_entry(tx, &hash, row.header.height, row).expect("put row");
+        }
+        rows.sort_by_key(|e| block_index_key(&e.header.block_hash(), e.header.height));
+        rows
+    }
+
+    /// The entries a walk in windows of `window` hands out.
+    fn load(tx: &Transaction, window: usize) -> Vec<BlockIndexEntry> {
+        let mut got = Vec::new();
+        db_load_block_index_windowed(tx, window, |e| {
+            got.push(e);
+            Ok(())
+        })
+        .expect("load block index");
+        got
+    }
+
+    /// The streaming walk hands out every row once, in key order,
+    /// whether the rows are this transaction's pending writes, the
+    /// cache overlay, or the store, and wherever the windows fall
+    /// (review finding B7-c#6).
+    #[test]
+    fn block_index_load_streams_every_row_across_windows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = Options::new(dir.path().join("db"), NET);
+        let db = Database::create(&opts).expect("create database");
+        let tx = db.begin(true).expect("begin");
+        let want = put_rows(&tx);
+        assert_eq!(want.len(), 16);
+        let windows = [1, 2, 3, 5, 15, 16, 17, FOR_EACH_WINDOW];
+        for window in windows {
+            assert_eq!(load(&tx, window), want, "pending writes, window {window}");
+        }
+        tx.commit().expect("commit");
+        drop(tx);
+
+        let tx = db.begin(false).expect("begin");
+        for window in windows {
+            assert_eq!(load(&tx, window), want, "cache overlay, window {window}");
+        }
+        // Every transaction holds the handle open, so the lock goes
+        // with the last of them.
+        drop(tx);
+        db.close().expect("close");
+        drop(db);
+
+        let db = Database::open(&opts).expect("reopen database");
+        let tx = db.begin(false).expect("begin");
+        for window in windows {
+            assert_eq!(load(&tx, window), want, "store, window {window}");
+        }
+        let mut all = Vec::new();
+        db_load_block_index(&tx, |e| {
+            all.push(e);
+            Ok(())
+        })
+        .expect("load block index");
+        assert_eq!(all, want);
+    }
+
+    /// The windowed walk yields exactly the pairs `Bucket::for_each`
+    /// does, in the same order and without the nested buckets, at every
+    /// window size -- from the transaction's pending writes, the cache
+    /// overlay, and the store.
+    #[test]
+    fn windowed_walk_matches_for_each() {
+        const WALKED: &[u8] = b"walked";
+        type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
+        fn check(tx: &Transaction, state: &str) {
+            let meta = tx.metadata();
+            let bucket = meta.bucket(WALKED).expect("bucket");
+            let mut want: Pairs = Vec::new();
+            bucket
+                .for_each(|k, v| {
+                    want.push((k.to_vec(), v.to_vec()));
+                    Ok(())
+                })
+                .expect("for_each");
+            assert_eq!(want.len(), 11, "{state}");
+            for window in 1..=13 {
+                let mut got: Pairs = Vec::new();
+                for_each_windowed(&bucket, window, |k, v| {
+                    got.push((k.to_vec(), v.to_vec()));
+                    Ok::<(), ChainDbError>(())
+                })
+                .expect("windowed walk");
+                assert_eq!(got, want, "{state}, window {window}");
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = Options::new(dir.path().join("db"), NET);
+        let db = Database::create(&opts).expect("create database");
+        let tx = db.begin(true).expect("begin");
+        {
+            let meta = tx.metadata();
+            let bucket = meta.create_bucket(WALKED).expect("create bucket");
+            // Nested buckets named to sort among the pairs' keys.
+            bucket.create_bucket(b"\x00").expect("nested bucket");
+            bucket.create_bucket(b"k05").expect("nested bucket");
+            bucket.create_bucket(b"\xff").expect("nested bucket");
+            for i in 0..11u8 {
+                bucket
+                    .put(format!("k{i:02}x").as_bytes(), &[i; 3])
+                    .expect("put");
+            }
+        }
+        check(&tx, "pending writes");
+        tx.commit().expect("commit");
+        drop(tx);
+
+        let tx = db.begin(false).expect("begin");
+        check(&tx, "cache overlay");
+        drop(tx);
+        db.close().expect("close");
+        drop(db);
+
+        let db = Database::open(&opts).expect("reopen database");
+        let tx = db.begin(false).expect("begin");
+        check(&tx, "store");
+    }
+
+    /// The first error from the callback ends the walk and comes back
+    /// to the caller.
+    #[test]
+    fn block_index_load_stops_at_the_first_callback_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = Options::new(dir.path().join("db"), NET);
+        let db = Database::create(&opts).expect("create database");
+        let tx = db.begin(true).expect("begin");
+        put_rows(&tx);
+        let mut calls = 0;
+        let res = db_load_block_index_windowed(&tx, 3, |_| {
+            calls += 1;
+            if calls == 5 {
+                return Err(ChainDbError::Corrupt("stop".into()));
+            }
+            Ok(())
+        });
+        assert!(matches!(res, Err(ChainDbError::Corrupt(ref s)) if s == "stop"));
+        assert_eq!(calls, 5);
+    }
 }

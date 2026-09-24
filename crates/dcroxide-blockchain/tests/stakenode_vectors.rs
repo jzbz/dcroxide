@@ -61,9 +61,10 @@ fn stakenode_vectors() {
                     .expect("previous node");
                 let id = chain.store.new_node(&block.header, Some(prev));
                 chain.index.add_node(&chain.store, id);
-                chain
-                    .blocks
-                    .insert(block.header.block_hash().0, block.clone());
+                chain.blocks.insert(
+                    block.header.block_hash().0,
+                    std::sync::Arc::new(block.clone()),
+                );
                 if main {
                     chain
                         .fetch_stake_node(id, &params)

@@ -27,10 +27,12 @@ pub const MIN_COINBASE_SCRIPT_LEN: usize = 2;
 /// be (dcrd `MaxCoinbaseScriptLen`).
 pub const MAX_COINBASE_SCRIPT_LEN: usize = 100;
 
-/// The chain-backed treasury spend battery `check_connect_block`
-/// runs after connecting the stake tree (dcrd `tspendChecks`);
-/// chainless callers pass `None` to fall back to the stateless
-/// window subset.
+/// The treasury spend battery `check_connect_block` runs after
+/// connecting the stake tree (dcrd `tspendChecks`).  It is required
+/// rather than optional: dcrd always runs its full battery, so a
+/// caller that wants less -- a chainless test -- has to pass
+/// [`tspend_checks_stateless`] by name, and a production caller cannot
+/// fall back to that weaker subset by omission.
 pub type FullTspendChecks<'a> = &'a dyn Fn(&MsgBlock) -> Result<(), RuleError>;
 
 /// Flags describing which agendas are treated as active during
@@ -501,7 +503,7 @@ pub fn check_block_header_sanity(
             RuleErrorKind::TimeTooNew,
             format!(
                 "block timestamp of {} is too far in the future",
-                header.timestamp
+                go_time_string(i64::from(header.timestamp))
             ),
         ));
     }
@@ -544,8 +546,10 @@ pub fn check_block_header_sanity(
                 RuleErrorKind::InvalidEarlyFinalState,
                 format!(
                     "block at height {} commits to invalid final state before stake \
-                     validation height {stake_validation_height}",
-                    header.height
+                     validation height {stake_validation_height} (expected {}, got {})",
+                    header.height,
+                    hex_string(&EARLY_FINAL_STATE),
+                    hex_string(&header.final_state)
                 ),
             ));
         }
@@ -992,11 +996,12 @@ fn min_blake3_block_version(params: &Params) -> u32 {
 /// determined in the general case here, so valid difficulty bits are
 /// allowed under both algorithms (rejecting blocks that satisfy
 /// neither) and the contextual checks that happen later pin the
-/// correct algorithm.  dcrd additionally consults two cached anchors:
-/// the confirmed anchor its contextual checks store (an engine fast
-/// path that arrives with the chain engine) and a candidate-anchor
-/// cache that only short-circuits the successful search below; neither
-/// is reproduced here.
+/// correct algorithm.  The exception, as in dcrd, is a confirmed
+/// anchor the contextual checks have cached (see
+/// [`crate::difficulty::ChainView::blake3_anchor_cached`]): once it is
+/// an ancestor of the previous node, the header must carry exactly the
+/// ASERT difficulty from it.  That makes a synced node stricter than a
+/// cold one, so it is a rule and not an optimization.
 pub fn check_difficulty_positional(
     view: &impl FullChainView,
     header: &dcroxide_wire::BlockHeader,
@@ -1021,14 +1026,39 @@ pub fn check_difficulty_positional(
         return Ok(());
     }
 
+    // A cached anchor point for the difficulty algorithm defined in
+    // DCP0011 is set when the contextual checks have determined that
+    // the agenda is actually active.  Contextual checks for previous
+    // blocks may or may not have been done yet, so it can't be relied
+    // on entirely, but once the chain is synced and the agenda is
+    // active the anchor is set and the header must match it.
+    if let Some(anchor_height) = view.blake3_anchor_cached(prev_node.height) {
+        let anchor =
+            crate::difficulty::ChainView::node(view, anchor_height).expect("cached anchor node");
+        let blake3_diff =
+            crate::difficulty::calc_next_blake3_diff_from_anchor(prev_node, &anchor, params);
+        if header.bits != blake3_diff {
+            return Err(rule_error(
+                RuleErrorKind::UnexpectedDifficulty,
+                format!(
+                    "block difficulty of {} is not the expected value of {blake3_diff} \
+                     (difficulty algorithm: ASERT)",
+                    header.bits
+                ),
+            ));
+        }
+        return Ok(());
+    }
+
     // Only the original difficulty algorithm needs to be checked when
     // it is impossible for the BLAKE3 proof of work agenda to be
     // active or the block is not solved for BLAKE3.  Since the always
     // active case is handled above, the only remaining way for the
     // agenda to be active is a vote, which requires the stake
     // validation height, one interval of voting, and one interval of
-    // being locked in.
-    let is_solved_blake3 = {
+    // being locked in.  Like dcrd's closure, the BLAKE3 hash is only
+    // computed when the agenda might be active.
+    let is_solved_blake3 = || {
         let pow_hash = header.pow_hash_v2();
         dcroxide_standalone::check_proof_of_work_hash(&pow_hash, header.bits).is_ok()
     };
@@ -1040,7 +1070,7 @@ pub fn check_difficulty_positional(
     // versions wrap to large values here.
     let is_blake3_possibly_active = header.version as u32 >= min_blake3_version
         && i64::from(header.height) >= first_possible_activation_height;
-    if !is_blake3_possibly_active || !is_solved_blake3 {
+    if !is_blake3_possibly_active || !is_solved_blake3() {
         let blake256_diff = crate::difficulty::calc_next_blake256_diff(
             view,
             prev_node,
@@ -1061,20 +1091,33 @@ pub fn check_difficulty_positional(
     }
 
     // The agenda might possibly be active and the block is solved with
-    // BLAKE3, so iterate backwards one rule change activation interval
-    // at a time through all possible candidate anchors (the final
-    // blocks of previous intervals with a sufficient block version)
-    // until one of them results in a matching required difficulty.
+    // BLAKE3.  A candidate anchor that produced a matching difficulty
+    // for an earlier header is cached and tried first, since it is very
+    // likely the correct one for descendant headers too.
+    if let Some(cached_height) = view.blake3_candidate_anchor_cached(prev_node.height) {
+        let cached =
+            crate::difficulty::ChainView::node(view, cached_height).expect("cached anchor node");
+        let blake3_diff =
+            crate::difficulty::calc_next_blake3_diff_from_anchor(prev_node, &cached, params);
+        if header.bits == blake3_diff {
+            return Ok(());
+        }
+    }
+
+    // Iterate backwards one rule change activation interval at a time
+    // through all possible candidate anchors (the final blocks of
+    // previous intervals with a sufficient block version) until one of
+    // them results in a matching required difficulty.
     let mut candidate_height =
         crate::stakever::calc_want_height(svh, rcai, i64::from(header.height));
     while candidate_height >= 0 && candidate_height <= prev_node.height {
-        let (Some(candidate), Some(candidate_vote)) = (
+        let (Some(candidate), Some(candidate_version)) = (
             crate::difficulty::ChainView::node(view, candidate_height),
-            view.vote_node(candidate_height),
+            crate::stakever::VersionChainView::node(view, candidate_height),
         ) else {
             break;
         };
-        if (candidate_vote.node.block_version as u32) < min_blake3_version
+        if (candidate_version.block_version as u32) < min_blake3_version
             || candidate.height < first_possible_activation_height - 1
         {
             break;
@@ -1082,6 +1125,7 @@ pub fn check_difficulty_positional(
         let blake3_diff =
             crate::difficulty::calc_next_blake3_diff_from_anchor(prev_node, &candidate, params);
         if header.bits == blake3_diff {
+            view.cache_blake3_candidate_anchor(candidate.height);
             return Ok(());
         }
         candidate_height -= rcai;
@@ -1154,8 +1198,9 @@ pub fn check_block_header_positional(
             return Err(rule_error(
                 RuleErrorKind::TimeTooOld,
                 format!(
-                    "block timestamp of {} is not after expected {median_time}",
-                    header.timestamp
+                    "block timestamp of {} is not after expected {}",
+                    go_time_string(i64::from(header.timestamp)),
+                    go_time_string(median_time)
                 ),
             ));
         }
@@ -1181,8 +1226,9 @@ pub fn check_block_header_positional(
                     return Err(rule_error(
                         RuleErrorKind::TimeTooOld,
                         format!(
-                            "testnet block timestamp of {} is before required {min_time}",
-                            header.timestamp
+                            "testnet block timestamp of {} is before required {}",
+                            go_time_string(i64::from(header.timestamp)),
+                            go_time_string(min_time)
                         ),
                     ));
                 }
@@ -1530,7 +1576,11 @@ pub fn check_ticket_redeemers(
             None => {
                 return Err(rule_error(
                     RuleErrorKind::TicketUnavailable,
-                    format!("block contains vote for ineligible ticket {vote_ticket_hash}"),
+                    format!(
+                        "block contains vote for ineligible ticket {vote_ticket_hash} \
+                         (eligible tickets: {})",
+                        go_hash_slice_string(winners)
+                    ),
                 ));
             }
             Some(has_vote) => *has_vote = true,
@@ -1630,8 +1680,9 @@ pub fn check_coinbase_unique_height(
         return Err(rule_error(
             RuleErrorKind::FirstTxNotCoinbase,
             format!(
-                "block is missing required coinbase outputs (num outputs: {}, min \
+                "block {} is missing required coinbase outputs (num outputs: {}, min \
                  required: {})",
+                block.block_hash(),
                 coinbase_tx.tx_out.len(),
                 null_data_out_idx + 1
             ),
@@ -1645,8 +1696,9 @@ pub fn check_coinbase_unique_height(
         return Err(rule_error(
             RuleErrorKind::FirstTxNotCoinbase,
             format!(
-                "coinbase output {null_data_out_idx} script version {} is not the \
-                 required version {SCRIPT_VERSION}",
+                "block {} coinbase output {null_data_out_idx} script version {} is \
+                 not the required version {SCRIPT_VERSION}",
+                block.block_hash(),
                 null_data_out.version
             ),
         ));
@@ -1674,8 +1726,9 @@ pub fn check_coinbase_unique_height(
         return Err(rule_error(
             RuleErrorKind::FirstTxNotCoinbase,
             format!(
-                "coinbase output {null_data_out_idx} pushes {} bytes which is more \
-                 than allowed value of {MAX_UNIQUE_COINBASE_NULL_DATA_SIZE}",
+                "block {} coinbase output {null_data_out_idx} pushes {} bytes which \
+                 is more than allowed value of {MAX_UNIQUE_COINBASE_NULL_DATA_SIZE}",
+                block.block_hash(),
                 null_data.len()
             ),
         ));
@@ -1684,8 +1737,9 @@ pub fn check_coinbase_unique_height(
         return Err(rule_error(
             RuleErrorKind::FirstTxNotCoinbase,
             format!(
-                "coinbase output {null_data_out_idx} pushes {} bytes which is too \
-                 short to encode height",
+                "block {} coinbase output {null_data_out_idx} pushes {} bytes which \
+                 is too short to encode height",
+                block.block_hash(),
                 null_data.len()
             ),
         ));
@@ -1697,9 +1751,13 @@ pub fn check_coinbase_unique_height(
         return Err(rule_error(
             RuleErrorKind::CoinbaseHeight,
             format!(
-                "coinbase output {null_data_out_idx} encodes height {cb_height} instead \
-                 of expected height {}",
-                block_height as u32
+                "block {} coinbase output {null_data_out_idx} encodes height \
+                 {cb_height} instead of expected height {} (prev block: {}, header \
+                 height {})",
+                block.block_hash(),
+                block_height as u32,
+                block.header.prev_block,
+                block.header.height
             ),
         ));
     }
@@ -1711,7 +1769,7 @@ pub fn check_coinbase_unique_height(
 /// height encoding to make treasurybase hash collisions impossible
 /// (dcrd `checkTreasurybaseUniqueHeight`).  The caller must have
 /// already verified the block has at least one stake transaction, as
-/// in dcrd (which returns an assertion error there).
+/// in dcrd.
 pub fn check_treasurybase_unique_height(
     block_height: i64,
     block: &MsgBlock,
@@ -1722,11 +1780,24 @@ pub fn check_treasurybase_unique_height(
         return Ok(());
     }
 
-    assert!(
-        !block.stransactions.is_empty(),
-        "checkTreasurybaseUniqueHeight must be called with a block that has already \
-         been verified to have at least one stake transaction"
-    );
+    // dcrd returns an `AssertError` here rather than panicking, and the
+    // block is peer input, so a caller that skipped the guard must get
+    // an error back, not a process abort under `panic = "abort"`.  The
+    // port has no separate assertion type: like
+    // `UtxoView::assert_missing` it carries `ErrUtxoBackendCorruption`,
+    // which `is_rule_violation` keeps out of the peer-blaming branch,
+    // with `AssertError`'s `assertion failed: ` text (error.go:17-25).
+    if block.stransactions.is_empty() {
+        return Err(rule_error(
+            RuleErrorKind::UtxoBackendCorruption,
+            format!(
+                "assertion failed: checkTreasurybaseUniqueHeight must be called with a \
+                 block that has already been verified to have at least one stake \
+                 transaction (block {})",
+                block.block_hash()
+            ),
+        ));
+    }
 
     // Treasurybase output 0 is the subsidy and output 1 encodes the
     // height.
@@ -1736,8 +1807,9 @@ pub fn check_treasurybase_unique_height(
         return Err(rule_error(
             RuleErrorKind::FirstTxNotTreasurybase,
             format!(
-                "block is missing required OP_RETURN output (num outputs: {}, min \
-                 required: {})",
+                "block {} is missing required OP_RETURN output (num outputs: {}, min \
+                 required: {}) ",
+                block.block_hash(),
                 trsybase_tx.tx_out.len(),
                 NULL_DATA_OUT_IDX + 1
             ),
@@ -1751,8 +1823,9 @@ pub fn check_treasurybase_unique_height(
         return Err(rule_error(
             RuleErrorKind::FirstTxNotTreasurybase,
             format!(
-                "treasurybase output {NULL_DATA_OUT_IDX} script version {} is not the \
-                 required version {SCRIPT_VERSION}",
+                "block {} treasurybase output {NULL_DATA_OUT_IDX} script version {} \
+                 is not the required version {SCRIPT_VERSION}",
+                block.block_hash(),
                 null_data_out.version
             ),
         ));
@@ -1773,7 +1846,10 @@ pub fn check_treasurybase_unique_height(
     if null_data.len() != 4 {
         return Err(rule_error(
             RuleErrorKind::TreasurybaseTxNotOpReturn,
-            format!("treasurybase output {NULL_DATA_OUT_IDX} is invalid"),
+            format!(
+                "block {} treasurybase output {NULL_DATA_OUT_IDX} is invalid",
+                block.block_hash()
+            ),
         ));
     }
 
@@ -1784,9 +1860,13 @@ pub fn check_treasurybase_unique_height(
         return Err(rule_error(
             RuleErrorKind::TreasurybaseHeight,
             format!(
-                "treasurybase output {NULL_DATA_OUT_IDX} encodes height {encoded_height} \
-                 instead of expected height {}",
-                block_height as u32
+                "block {} treasurybase output {NULL_DATA_OUT_IDX} encodes height \
+                 {encoded_height} instead of expected height {} (prev block: {}, \
+                 header height {})",
+                block.block_hash(),
+                block_height as u32,
+                block.header.prev_block,
+                block.header.height
             ),
         ));
     }
@@ -1963,8 +2043,11 @@ pub fn check_ticket_purchase_inputs<'a>(
     // well as the additional voting rights output.
     assert!(
         tx.tx_in.len() * 2 + 1 == tx.tx_out.len(),
-        "attempt to check ticket purchase inputs on tx which does not appear to be \
-         a ticket purchase"
+        "attempt to check ticket purchase inputs on tx {} which does not appear to \
+         be a ticket purchase ({} inputs, {} outputs)",
+        tx.tx_hash(),
+        tx.tx_in.len(),
+        tx.tx_out.len()
     );
 
     for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate() {
@@ -1992,8 +2075,9 @@ pub fn check_ticket_purchase_inputs<'a>(
             return Err(rule_error(
                 RuleErrorKind::TicketInputScript,
                 format!(
-                    "output script version {pk_script_ver} referenced by ticket \
+                    "output {} script version {pk_script_ver} referenced by ticket \
                      {}:{tx_in_idx} is not supported",
+                    tx_in.previous_out_point,
                     tx.tx_hash()
                 ),
             ));
@@ -2003,9 +2087,11 @@ pub fn check_ticket_purchase_inputs<'a>(
             return Err(rule_error(
                 RuleErrorKind::TicketInputScript,
                 format!(
-                    "output referenced from ticket {}:{tx_in_idx} is not \
-                     pay-to-pubkey-hash or pay-to-script-hash",
-                    tx.tx_hash()
+                    "output {} referenced from ticket {}:{tx_in_idx} is not \
+                     pay-to-pubkey-hash or pay-to-script-hash (script: {})",
+                    tx_in.previous_out_point,
+                    tx.tx_hash(),
+                    hex_string(pk_script)
                 ),
             ));
         }
@@ -2148,8 +2234,10 @@ pub fn check_ticket_submission_input(ticket_utxo: &crate::UtxoEntry) -> Result<(
     }
     let submission_script = ticket_utxo.pk_script();
     if !is_stake_submission(submission_script) {
-        let _ = submission_script;
-        return Err("not a supported stake submission script".into());
+        return Err(format!(
+            "not a supported stake submission script (script: {})",
+            hex_string(submission_script)
+        ));
     }
 
     // Ensure the referenced output is from a ticket, which also proves
@@ -2167,6 +2255,7 @@ pub fn check_ticket_submission_input(ticket_utxo: &crate::UtxoEntry) -> Result<(
 /// for revocations.
 #[allow(clippy::too_many_arguments)]
 pub fn check_ticket_redeemer_commitments(
+    ticket_hash: &Hash,
     ticket_outs: &[dcroxide_stake::MinimalOutput],
     tx: &MsgTx,
     is_vote: bool,
@@ -2251,7 +2340,7 @@ pub fn check_ticket_redeemer_commitments(
                     format!(
                         "output {}:{tx_out_idx} payment script type is not \
                          pay-to-script-hash as required by ticket output commitment \
-                         {commitment_out_idx}",
+                         {ticket_hash}:{commitment_out_idx}",
                         tx.tx_hash()
                     ),
                 )
@@ -2263,7 +2352,7 @@ pub fn check_ticket_redeemer_commitments(
                     format!(
                         "output {}:{tx_out_idx} payment script type is not \
                          pay-to-pubkey-hash as required by ticket output commitment \
-                         {commitment_out_idx}",
+                         {ticket_hash}:{commitment_out_idx}",
                         tx.tx_hash()
                     ),
                 )
@@ -2275,8 +2364,11 @@ pub fn check_ticket_redeemer_commitments(
                 RuleErrorKind::MismatchedPayeeHash,
                 format!(
                     "output {}:{tx_out_idx} does not pay to the hash specified by \
-                     ticket output commitment {commitment_out_idx}",
-                    tx.tx_hash()
+                     ticket output commitment {ticket_hash}:{commitment_out_idx} \
+                     (ticket commits to {}, output pays {})",
+                    tx.tx_hash(),
+                    hex_string(commitment_hash),
+                    hex_string(payment_hash)
                 ),
             ));
         }
@@ -2307,8 +2399,8 @@ pub fn check_ticket_redeemer_commitments(
                     RuleErrorKind::BadPayeeValue,
                     format!(
                         "output {}:{tx_out_idx} does not pay the expected amount per \
-                         ticket output commitment {commitment_out_idx} (expected \
-                         {expected_out_amt}, output pays {})",
+                         ticket output commitment {ticket_hash}:{commitment_out_idx} \
+                         (expected {expected_out_amt}, output pays {})",
                         tx.tx_hash(),
                         tx_out.value
                     ),
@@ -2331,9 +2423,11 @@ pub fn check_ticket_redeemer_commitments(
             if tx_out.value < amt_limit_low {
                 return Err(rule_error(
                     RuleErrorKind::BadPayeeValue,
+                    // dcrd's text doubles "expected".
                     format!(
-                        "output {}:{tx_out_idx} pays less than the expected amount per \
-                         ticket output commitment {commitment_out_idx} (lowest allowed \
+                        "output {}:{tx_out_idx} pays less than the expected expected \
+                         amount per ticket output commitment \
+                         {ticket_hash}:{commitment_out_idx} (lowest allowed \
                          {amt_limit_low}, output pays {})",
                         tx.tx_hash(),
                         tx_out.value
@@ -2347,8 +2441,8 @@ pub fn check_ticket_redeemer_commitments(
                     RuleErrorKind::BadPayeeValue,
                     format!(
                         "output {}:{tx_out_idx} pays more than the expected amount per \
-                         ticket output commitment {commitment_out_idx} (expected \
-                         {expected_out_amt}, output pays {})",
+                         ticket output commitment {ticket_hash}:{commitment_out_idx} \
+                         (expected {expected_out_amt}, output pays {})",
                         tx.tx_hash(),
                         tx_out.value
                     ),
@@ -2489,17 +2583,26 @@ pub fn check_vote_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
         return Err(rule_error(
             RuleErrorKind::ImmatureTicketSpend,
             format!(
-                "tried to spend ticket output from height {origin_height} at height \
-                 {tx_height} before required ticket maturity of {ticket_maturity}+1 \
-                 blocks"
+                "tried to spend ticket output from transaction {} from height \
+                 {origin_height} at height {tx_height} before required ticket \
+                 maturity of {ticket_maturity}+1 blocks",
+                ticket_in.previous_out_point.hash
             ),
         ));
     }
 
-    let ticket_outs_data = ticket_utxo
-        .ticket_minimal_outputs_data()
-        .expect("missing extra stake data for ticket -- probable database corruption");
-    let (ticket_outs, _) = crate::chainio::deserialize_to_minimal_outputs(ticket_outs_data);
+    // dcrd panics when the decoded minimal outputs are empty, which
+    // covers both a missing blob and one decoding to no outputs.
+    let ticket_hash = &ticket_in.previous_out_point.hash;
+    let ticket_outs = ticket_utxo
+        .ticket_minimal_outputs()
+        .filter(|outs| !outs.is_empty())
+        .unwrap_or_else(|| {
+            panic!(
+                "missing extra stake data for ticket {ticket_hash} -- probable \
+                 database corruption"
+            )
+        });
 
     // Ensure the number of payment outputs matches the number of
     // commitments made by the associated ticket: the vote outputs are
@@ -2530,14 +2633,15 @@ pub fn check_vote_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
         return Err(rule_error(
             RuleErrorKind::BadNumPayees,
             format!(
-                "vote {vote_hash} makes {num_vote_payments} payments when the input \
-                 ticket has {num_commitments} commitments"
+                "vote {vote_hash} makes {num_vote_payments} payments when input \
+                 ticket {ticket_hash} has {num_commitments} commitments"
             ),
         ));
     }
 
     // Ensure the outputs adhere to the ticket commitments.
     check_ticket_redeemer_commitments(
+        ticket_hash,
         &ticket_outs,
         tx,
         true,
@@ -2619,17 +2723,26 @@ pub fn check_revocation_inputs<'a>(
         return Err(rule_error(
             RuleErrorKind::ImmatureTicketSpend,
             format!(
-                "tried to spend ticket output from height {origin_height} at height \
-                 {tx_height} before required ticket maturity of \
-                 {ticket_maturity}+{revocation_additional_maturity} blocks"
+                "tried to spend ticket output from transaction {} from height \
+                 {origin_height} at height {tx_height} before required ticket \
+                 maturity of {ticket_maturity}+{revocation_additional_maturity} blocks",
+                ticket_in.previous_out_point.hash
             ),
         ));
     }
 
-    let ticket_outs_data = ticket_utxo
-        .ticket_minimal_outputs_data()
-        .expect("missing extra stake data for ticket -- probable database corruption");
-    let (ticket_outs, _) = crate::chainio::deserialize_to_minimal_outputs(ticket_outs_data);
+    // dcrd panics when the decoded minimal outputs are empty, which
+    // covers both a missing blob and one decoding to no outputs.
+    let ticket_hash = &ticket_in.previous_out_point.hash;
+    let ticket_outs = ticket_utxo
+        .ticket_minimal_outputs()
+        .filter(|outs| !outs.is_empty())
+        .unwrap_or_else(|| {
+            panic!(
+                "missing extra stake data for ticket {ticket_hash} -- probable \
+                 database corruption"
+            )
+        });
 
     // The revocation outputs must consist of one output per ticket
     // commitment.
@@ -2640,7 +2753,7 @@ pub fn check_revocation_inputs<'a>(
             RuleErrorKind::BadNumPayees,
             format!(
                 "revocation {revoke_hash} makes {num_revocation_payments} payments \
-                 when the input ticket has {} commitments",
+                 when input ticket {ticket_hash} has {} commitments",
                 ticket_outs.len() - 1
             ),
         ));
@@ -2648,6 +2761,7 @@ pub fn check_revocation_inputs<'a>(
 
     // Zero vote subsidy since revocations do not produce any subsidy.
     check_ticket_redeemer_commitments(
+        ticket_hash,
         &ticket_outs,
         tx,
         false,
@@ -2667,13 +2781,19 @@ pub fn verify_tspend_signature(tx: &MsgTx, signature: &[u8], pub_key: &[u8]) -> 
     // script, SigHashAll, and input zero.
     let sig_hash =
         dcroxide_txscript::calc_signature_hash_checked(&[], dcroxide_txscript::SIG_HASH_ALL, tx, 0)
-            .map_err(|e| format!("CalcSignatureHash: {e:?}"))?;
+            .map_err(|e| format!("CalcSignatureHash: {e}"))?;
 
-    // Lift the signature and public PI key from bytes.
-    let sig = dcroxide_dcrec::secp256k1::schnorr::parse_signature(signature)
-        .map_err(|e| format!("ParseSignature: {e:?}"))?;
+    // Lift the signature and public PI key from bytes.  Every caller
+    // checks the key against the sanctioned pi keys first and those all
+    // parse, so the ParsePubKey text is unreachable.
+    let sig = dcroxide_dcrec::secp256k1::schnorr::parse_signature(signature).map_err(|e| {
+        format!(
+            "ParseSignature: {}",
+            schnorr_parse_signature_text(e, signature.len())
+        )
+    })?;
     let pk = dcroxide_dcrec::secp256k1::schnorr::parse_pub_key(pub_key)
-        .map_err(|e| format!("ParsePubKey: {e:?}"))?;
+        .map_err(|e| format!("ParsePubKey: {e}"))?;
 
     // Verify the transaction was properly signed.
     if !sig.verify(&sig_hash, &pk) {
@@ -2681,6 +2801,28 @@ pub fn verify_tspend_signature(tx: &MsgTx, signature: &[u8], pub_key: &[u8]) -> 
     }
 
     Ok(())
+}
+
+/// The description dcrd's `schnorr.ParseSignature` gives its error
+/// (dcrec/secp256k1/schnorr/signature.go), which `verifyTSpendSignature`
+/// wraps with `%w`.  A dcrd `schnorr.Error` prints that description, where
+/// this port's `schnorr::Error` displays the kind name its differential
+/// tests compare.
+fn schnorr_parse_signature_text(
+    err: dcroxide_dcrec::secp256k1::schnorr::Error,
+    sig_len: usize,
+) -> String {
+    use dcroxide_dcrec::secp256k1::schnorr::{Error, SIGNATURE_SIZE};
+    match err {
+        Error::SigTooShort => {
+            format!("malformed signature: too short: {sig_len} < {SIGNATURE_SIZE}")
+        }
+        Error::SigTooLong => format!("malformed signature: too long: {sig_len} > {SIGNATURE_SIZE}"),
+        Error::SigRTooBig => "invalid signature: r >= field prime".into(),
+        Error::SigSTooBig => "invalid signature: s >= group order".into(),
+        // parse_signature returns no other kind.
+        other => format!("{other}"),
+    }
 }
 
 /// The amount committed by a treasury spend's first output OP_RETURN
@@ -2762,6 +2904,45 @@ fn hex_string(bytes: &[u8]) -> String {
     for b in bytes {
         out.push_str(&format!("{b:02x}"));
     }
+    out
+}
+
+/// Render a unix timestamp the way Go's `%v` prints a whole-second
+/// `time.Time` (`2006-01-02 15:04:05 +0000 UTC`), which is how dcrd's
+/// rule errors print header timestamps and median times.  dcrd's
+/// values come from `time.Unix` and so print in the host's local
+/// zone; the port pins UTC, as its block import progress log does,
+/// so the text does not depend on the host zone database.
+fn go_time_string(unix: i64) -> String {
+    // Civil-from-unix over the proleptic Gregorian calendar, per Howard
+    // Hinnant's algorithm (the same math Go's time package performs).
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02} +0000 UTC")
+}
+
+/// Render hashes the way Go's `%s` prints a `[]chainhash.Hash`:
+/// space-separated inside brackets.
+fn go_hash_slice_string(hashes: &[Hash]) -> String {
+    let mut out = String::from("[");
+    for (i, hash) in hashes.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(&format!("{hash}"));
+    }
+    out.push(']');
     out
 }
 
@@ -3542,9 +3723,9 @@ pub fn determine_check_tx_flags(
 /// Perform the validation checks on the block which depend on having
 /// the full block data for all of its ancestors available (dcrd
 /// `checkBlockContext`).  The parent stake node is required once the
-/// stake validation height is reached unless `fast_add` is set; dcrd's
-/// recent-context-checks cache is a pure optimization and is not
-/// reproduced.
+/// stake validation height is reached unless `fast_add` is set.  dcrd's
+/// recent-context-checks short circuit lives with its callers in
+/// `process.rs` (`Chain::recent_context_checks`).
 #[allow(clippy::too_many_arguments)]
 pub fn check_block_context(
     view: &impl FullChainView,
@@ -4342,7 +4523,11 @@ pub fn coinbase_pays_treasury_address<SP: dcroxide_standalone::SubsidyParams>(
     if treasury_output.pk_script != params.organization_pk_script {
         return Err(rule_error(
             RuleErrorKind::NoTreasury,
-            "treasury output script does not pay the organization address",
+            format!(
+                "treasury output script is {} instead of {}",
+                hex_string(&treasury_output.pk_script),
+                hex_string(&params.organization_pk_script)
+            ),
         ));
     }
     let org_subsidy = subsidy_cache.calc_treasury_subsidy(height, voters, false);
@@ -4461,24 +4646,39 @@ pub fn block_one_coinbase_pays_tokens(tx: &MsgTx, params: &Params) -> Result<(),
             ),
         ));
     }
+    // dcrd prints its consensus script version (0) as the expected
+    // version rather than the ledger entry's.
+    const CONSENSUS_SCRIPT_VERSION: u16 = 0;
     for (i, tx_out) in tx.tx_out.iter().enumerate() {
         let ledger_entry = &ledger[i];
         if tx_out.version != ledger_entry.script_version {
             return Err(rule_error(
                 RuleErrorKind::BlockOneOutputs,
-                format!("block one output {i} script version is wrong"),
+                format!(
+                    "block one output {i} script version {} is not \
+                     {CONSENSUS_SCRIPT_VERSION}",
+                    tx_out.version
+                ),
             ));
         }
         if tx_out.pk_script != ledger_entry.script {
             return Err(rule_error(
                 RuleErrorKind::BlockOneOutputs,
-                format!("block one output {i} script is wrong"),
+                format!(
+                    "block one output {i} script {} is not {}",
+                    hex_string(&tx_out.pk_script),
+                    hex_string(&ledger_entry.script)
+                ),
             ));
         }
         if tx_out.value != ledger_entry.amount {
             return Err(rule_error(
                 RuleErrorKind::BlockOneOutputs,
-                format!("block one output {i} amount is wrong"),
+                format!(
+                    "block one output {i} generates {} instead of required {}",
+                    amount_string(tx_out.value),
+                    amount_string(ledger_entry.amount)
+                ),
             ));
         }
     }
@@ -4487,16 +4687,17 @@ pub fn block_one_coinbase_pays_tokens(tx: &MsgTx, params: &Params) -> Result<(),
 
 /// The total subsidy added by the block: the parent's coinbase input
 /// when approved, plus the treasurybase and stakebase inputs (dcrd
-/// `calculateAddedSubsidy`).
+/// `calculateAddedSubsidy`).  The treasurybase is recognised with the
+/// full structural check (`stake.IsTreasuryBase`), as dcrd does here,
+/// not the lighter `standalone.IsTreasuryBase`, which accepts outputs
+/// with a non-zero script version.
 pub fn calculate_added_subsidy(block: &MsgBlock, parent: &MsgBlock) -> i64 {
     let mut subsidy: i64 = 0;
     if header_approves_parent(&block.header) {
         subsidy += parent.transactions[0].tx_in[0].value_in;
     }
     for (tx_idx, stx) in block.stransactions.iter().enumerate() {
-        if (tx_idx == 0 && dcroxide_standalone::is_treasury_base(stx))
-            || dcroxide_stake::is_ssgen(stx)
-        {
+        if (tx_idx == 0 && dcroxide_stake::is_treasury_base(stx)) || dcroxide_stake::is_ssgen(stx) {
             subsidy += stx.tx_in[0].value_in;
         }
     }
@@ -4510,11 +4711,12 @@ pub fn calc_commitment_root_v1(filter_hash: Hash) -> Hash {
 }
 
 /// The stateless treasury spend expiry-window check for blocks on a
-/// treasury vote interval — the chainless-test fallback for dcrd's
-/// `tspendChecks` when no engine battery is supplied to
-/// [`check_connect_block`] (the duplicate-spend lookup, vote tallies,
-/// and expenditure bound require prior block data; dcrd 2.2 moved the
-/// value-in commitment check into `checkTreasurySpendInputs`).
+/// treasury vote interval — the subset of dcrd's `tspendChecks` that
+/// chainless tests hand [`check_connect_block`] in place of the
+/// engine battery (the duplicate-spend lookup, vote tallies, and
+/// expenditure bound require prior block data; dcrd 2.2 moved the
+/// value-in commitment check into `checkTreasurySpendInputs`).  It is
+/// not a consensus-complete substitute for `tspendChecks`.
 pub fn tspend_checks_stateless(
     prev_height: i64,
     block: &MsgBlock,
@@ -4558,6 +4760,28 @@ struct ValidateItem<'a> {
     script_version: u16,
 }
 
+/// The description of a script that failed to parse or execute, in
+/// the layout of dcrd's shared `validateHandler` (scriptval.go:84-98):
+/// the input, the output it references, the script error's text, and
+/// both scripts in hex.
+fn script_failure_description(
+    verb: &str,
+    tx: &MsgTx,
+    tx_in_idx: usize,
+    pk_script: &[u8],
+    err: &dcroxide_txscript::ScriptError,
+) -> String {
+    let tx_in = &tx.tx_in[tx_in_idx];
+    format!(
+        "failed to {verb} input {}:{tx_in_idx} which references output {} - {err} \
+         (input script bytes {}, prev output script bytes {})",
+        tx.tx_hash(),
+        tx_in.previous_out_point,
+        hex_string(&tx_in.signature_script),
+        hex_string(pk_script)
+    )
+}
+
 /// Validate one item (the body of dcrd's `validateHandler` loop).
 fn validate_item(
     item: &ValidateItem<'_>,
@@ -4583,10 +4807,7 @@ fn validate_item(
         // P2SH signature script.
         rule_error(
             RuleErrorKind::ScriptMalformed,
-            format!(
-                "failed to parse input {}:{tx_in_idx} - {e:?}",
-                item.tx.tx_hash()
-            ),
+            script_failure_description("parse", item.tx, tx_in_idx, item.pk_script, &e),
         )
     })?;
     if let Some(sig_cache) = sig_cache {
@@ -4595,10 +4816,7 @@ fn validate_item(
     engine.execute().map_err(|e| {
         rule_error(
             RuleErrorKind::ScriptValidation,
-            format!(
-                "failed to validate input {}:{tx_in_idx}: {e:?}",
-                item.tx.tx_hash()
-            ),
+            script_failure_description("validate", item.tx, tx_in_idx, item.pk_script, &e),
         )
     })
 }
@@ -4632,6 +4850,14 @@ fn validate_item(
 /// sufficient — workers pull from a shared index rather than owning a
 /// fixed slice, so an uneven batch still balances without oversubscribing.
 ///
+/// **Open arm: a persistent pool.** Every call at or above the parallel
+/// threshold still creates and joins its workers through
+/// `std::thread::scope`, so the adopted arm above creates 17-19
+/// thousand threads per ten seconds. All three measured arms were scope
+/// threads; a long-lived pool of `cores` workers (what ADR-0005
+/// proposed) would keep the full width without the per-call spawns, and
+/// has not been measured.
+///
 /// Small batches still run inline. Which failure surfaces when several
 /// items are invalid remains scheduling-dependent, exactly like dcrd's
 /// first-off-the-channel error. Threads need the standard library:
@@ -4644,11 +4870,24 @@ fn validate_items(
     sig_cache: Option<&dcroxide_txscript::SigCache>,
 ) -> Result<(), RuleError> {
     const MIN_PARALLEL_ITEMS: usize = 16;
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    if items.len() < MIN_PARALLEL_ITEMS {
+        for item in items {
+            validate_item(item, script_flags, sig_cache)?;
+        }
+        return Ok(());
+    }
+
+    // The core count is probed once per process: on Linux
+    // `available_parallelism` re-reads the cgroup quota files on every
+    // call, and the machine does not change between blocks.
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cores = *CORES.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    });
     let workers = cores.min(items.len());
-    if items.len() < MIN_PARALLEL_ITEMS || workers <= 1 {
+    if workers <= 1 {
         for item in items {
             validate_item(item, script_flags, sig_cache)?;
         }
@@ -4659,33 +4898,65 @@ fn validate_items(
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let failure: std::sync::Mutex<Option<RuleError>> = std::sync::Mutex::new(None);
-    std::thread::scope(|s| {
-        for _ in 0..workers {
-            s.spawn(|| {
-                loop {
-                    if failed.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = items.get(i) else {
-                        return;
-                    };
-                    if let Err(e) = validate_item(item, script_flags, sig_cache) {
-                        failed.store(true, Ordering::Relaxed);
-                        let mut slot = failure.lock().expect("failure slot poisoned");
-                        if slot.is_none() {
-                            *slot = Some(e);
-                        }
-                        return;
-                    }
+    let work = || {
+        loop {
+            if failed.load(Ordering::Relaxed) {
+                return;
+            }
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(item) = items.get(i) else {
+                return;
+            };
+            if let Err(e) = validate_item(item, script_flags, sig_cache) {
+                failed.store(true, Ordering::Relaxed);
+                let mut slot = failure.lock().expect("failure slot poisoned");
+                if slot.is_none() {
+                    *slot = Some(e);
                 }
-            });
+                return;
+            }
+        }
+    };
+    std::thread::scope(|s| {
+        // The OS can refuse a thread (a process or cgroup task limit),
+        // which a goroutine in dcrd cannot.  Stop spawning then and
+        // have the calling thread drain the shared index itself: the
+        // work-stealing loop makes any number of workers, including
+        // none, cover every item.
+        let mut spawn_failed = false;
+        for _ in 0..workers {
+            if !spawn_validate_worker(s, work) {
+                spawn_failed = true;
+                break;
+            }
+        }
+        if spawn_failed {
+            work();
         }
     });
     match failure.into_inner().expect("failure slot poisoned") {
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Spawn one scoped script validation worker, reporting whether the
+/// OS created its thread; `Scope::spawn` would panic instead.
+#[cfg(any(test, feature = "std"))]
+fn spawn_validate_worker<'scope>(
+    s: &'scope std::thread::Scope<'scope, '_>,
+    work: impl FnOnce() + Send + 'scope,
+) -> bool {
+    // Tests stand in for an exhausted task limit with a per-thread
+    // budget of spawns the "OS" still grants.
+    #[cfg(test)]
+    if let Some(budget) = tests::WORKER_SPAWN_BUDGET.get() {
+        if budget == 0 {
+            return false;
+        }
+        tests::WORKER_SPAWN_BUDGET.set(Some(budget - 1));
+    }
+    std::thread::Builder::new().spawn_scoped(s, work).is_ok()
 }
 
 /// The `no_std` fallback: every item validates inline on the calling
@@ -4766,20 +5037,32 @@ pub fn check_block_scripts(
 /// The caller supplies the disapproved-parent spend journal lazily
 /// (dcrd fetches it from the database only when it disapproves its
 /// parent), whether scripts should run (dcrd derives this from bulk
-/// import mode and the assumed-valid ancestor), the optional shared
-/// signature verification cache for the script checks (dcrd's
-/// `b.sigCache`), and the parent's past median time when the LN
-/// features agenda is active.  The treasury
-/// spend checks from dcrd's `tspendChecks` require prior block data,
-/// so the chain engine supplies them through `full_tspend_checks`;
-/// chainless callers pass `None` to fall back to the stateless window
-/// subset.
+/// import mode and the assumed-valid ancestor), and the optional
+/// shared signature verification cache for the script checks (dcrd's
+/// `b.sigCache`).  The parent's past median time the LN features
+/// sequence locks need is computed here from `view_chain` at the
+/// parent, as dcrd does with `node.parent.CalcPastMedianTime()`.  The
+/// treasury spend checks from dcrd's `tspendChecks` require prior
+/// block data, so the caller supplies them through
+/// `full_tspend_checks`: the chain engine passes its full battery, and
+/// chainless callers must name the stateless window subset
+/// ([`tspend_checks_stateless`]) explicitly.
+///
+/// On success the version 2 committed filter built for the header
+/// commitment check is returned, so the caller can store it without
+/// building it a second time (dcrd hands it back through the
+/// `hdrCommitments` out-param for the same reason).
 ///
 /// `parent_stxos` is only invoked when the block disapproves its
 /// parent, so callers must not pay to decode it on the approve path —
 /// and decoding it there with this block's treasury flag would be
 /// wrong at the treasury activation boundary, where the parent's flag
 /// differs from the child's.
+///
+/// Returns the version 2 filter it built, the one the header
+/// commitment was checked against, so the caller stores it rather than
+/// building it again (dcrd hands it back in the `hdrCommitments`
+/// out-param).
 #[allow(clippy::too_many_arguments)]
 pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     view_chain: &impl FullChainView,
@@ -4796,9 +5079,9 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     mut stxos: Option<&mut Vec<crate::chainio::SpentTxOut>>,
     run_scripts: bool,
     sig_cache: Option<&dcroxide_txscript::SigCache>,
-    full_tspend_checks: Option<FullTspendChecks<'_>>,
+    full_tspend_checks: FullTspendChecks<'_>,
     params: &Params,
-) -> Result<Hash, RuleError> {
+) -> Result<dcroxide_gcs::FilterV2, RuleError> {
     let prev_height = node_height - 1;
     // The view must be from the point of view of the parent.
     assert_eq!(
@@ -4878,8 +5161,9 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     // are no longer valid and would therefore cause the block to be
     // incorrectly rejected during an initial sync (dcrd `a38c0195`).
     for (idx, tx) in block.transactions.iter().enumerate() {
-        if is_sbss_spend_violation(params, node_height, &regular_tx_hashes[idx]) {
-            view.add_tx_out(tx, 0, node_height, idx as u32, is_treasury_enabled);
+        let tx_hash = &regular_tx_hashes[idx];
+        if is_sbss_spend_violation(params, node_height, tx_hash) {
+            view.add_tx_out_with_hash(tx, tx_hash, 0, node_height, idx as u32, is_treasury_enabled);
         }
     }
 
@@ -4933,10 +5217,7 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     // been validated and the view is coherent (dcrd 2.2 moved this
     // after the stake tree connect).
     if is_treasury_enabled {
-        match full_tspend_checks {
-            Some(tspend_checks) => tspend_checks(block)?,
-            None => tspend_checks_stateless(prev_height, block, params)?,
-        }
+        full_tspend_checks(block)?;
     }
 
     // Enforce sequence locks once the LN features agenda is active.
@@ -5021,7 +5302,11 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     }
 
     // Build the version 2 committed filter and validate the header
-    // commitment to it once the agenda is active.
+    // commitment to it once the agenda is active.  The filter needs
+    // the post-connect view (some referenced scripts are outputs of
+    // earlier transactions in this block), so it is built here once
+    // and returned for the caller to store rather than rebuilt there
+    // (dcrd sets it into the caller's `hdrCommitments`).
     struct ViewScripts<'a>(&'a crate::utxoview::UtxoView);
     impl dcroxide_gcs::blockcf2::PrevScripter for ViewScripts<'_> {
         fn prev_script(&self, out: &dcroxide_wire::OutPoint) -> Option<(u16, &[u8])> {
@@ -5029,8 +5314,18 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
             Some((entry.script_version(), entry.pk_script()))
         }
     }
-    let filter = dcroxide_gcs::blockcf2::regular(block, &ViewScripts(view))
-        .map_err(|e| rule_error(RuleErrorKind::MissingTxOut, format!("{e:?}")))?;
+    // dcrd returns `err.Error()`: for a missing script that is
+    // blockcf2's `PrevScriptError` text, which prints the tree too.
+    let filter = dcroxide_gcs::blockcf2::regular(block, &ViewScripts(view)).map_err(|e| {
+        let description = match e {
+            dcroxide_gcs::blockcf2::RegularError::PrevScript(e) => format!(
+                "unable to find output script {}:{} referenced by {}:{}",
+                e.prev_out, e.prev_out.tree, e.tx_hash, e.tx_in_idx
+            ),
+            dcroxide_gcs::blockcf2::RegularError::Gcs(e) => format!("{e}"),
+        };
+        rule_error(RuleErrorKind::MissingTxOut, description)
+    })?;
     let filter_hash = filter.hash();
 
     let hdr_commitments_active =
@@ -5067,16 +5362,21 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     }
 
     view.set_best_hash(node_hash);
-    Ok(filter_hash)
+    Ok(filter)
 }
 
 /// Validate the scripts for all of a transaction's inputs against the
-/// referenced output scripts (dcrd `ValidateTransactionScripts`; its
-/// parallel validator is result-invariant concurrency machinery and
-/// is not reproduced, while the signature cache threads through
-/// `sig_cache` exactly as dcrd wires its `sigCache`).  Entries that
-/// are missing or spent yield `ErrMissingTxOut` per the
-/// `PrevScripter` contract over a utxo viewpoint.
+/// referenced output scripts (dcrd `ValidateTransactionScripts`).
+///
+/// The inputs collect into the same items the block path builds and
+/// run through the same worker pool and engine setup
+/// (`validate_items`), with the signature cache threaded through
+/// `sig_cache` exactly as dcrd wires its `sigCache` -- dcrd hands both
+/// entry points one `txValidator`, so the port shares one too.  An
+/// entry is missing only when the lookup returns none: dcrd's
+/// `UtxoViewpoint.PrevScript` checks `entry == nil` and nothing else
+/// (utxoviewpoint.go:211-220), so a spent entry still supplies its
+/// script, as it does in [`check_block_scripts`].
 pub fn validate_transaction_scripts<'a>(
     tx: &MsgTx,
     lookup_entry: impl Fn(&OutPoint) -> Option<&'a crate::UtxoEntry>,
@@ -5096,6 +5396,11 @@ pub fn validate_transaction_scripts<'a>(
         return Ok(());
     }
 
+    // Collect all of the transaction inputs and required information
+    // for validation.  The referenced output script is borrowed
+    // straight from the looked-up entry -- no copy (dcrd hands the
+    // engine the view entry's script slice).
+    let mut items = Vec::with_capacity(tx.tx_in.len());
     for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate() {
         // Skip coinbases.
         if tx_in.previous_out_point.index == u32::MAX {
@@ -5104,8 +5409,7 @@ pub fn validate_transaction_scripts<'a>(
 
         // Ensure the referenced input utxo is available.
         let prev_out = &tx_in.previous_out_point;
-        let entry = lookup_entry(prev_out).filter(|e| !e.is_spent());
-        let Some(entry) = entry else {
+        let Some(entry) = lookup_entry(prev_out) else {
             return Err(rule_error(
                 RuleErrorKind::MissingTxOut,
                 format!(
@@ -5115,39 +5419,638 @@ pub fn validate_transaction_scripts<'a>(
                 ),
             ));
         };
-
-        // Create a new script engine for the script pair and execute
-        // it.  The referenced output script is borrowed straight from
-        // the looked-up entry — no copy (dcrd hands the engine the
-        // view entry's script slice).
-        let pk_script = entry.pk_script();
-        let script_version = entry.script_version();
-        let mut engine =
-            dcroxide_txscript::Engine::new(pk_script, tx, tx_in_idx, script_flags, script_version)
-                .map_err(|e| {
-                    rule_error(
-                        RuleErrorKind::ScriptMalformed,
-                        format!(
-                            "failed to parse input {}:{tx_in_idx} which references output \
-                     {prev_out} - {e:?}",
-                            tx.tx_hash()
-                        ),
-                    )
-                })?;
-        if let Some(sig_cache) = sig_cache {
-            engine.set_sig_cache(sig_cache);
-        }
-        engine.execute().map_err(|e| {
-            rule_error(
-                RuleErrorKind::ScriptValidation,
-                format!(
-                    "failed to validate input {}:{tx_in_idx} which references \
-                     output {prev_out} - {e:?}",
-                    tx.tx_hash()
-                ),
-            )
-        })?;
+        items.push(ValidateItem {
+            tx,
+            tx_in_idx,
+            pk_script: entry.pk_script(),
+            script_version: entry.script_version(),
+        });
     }
 
-    Ok(())
+    // Validate all of the inputs.
+    validate_items(&items, script_flags, sig_cache)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use dcroxide_chaincfg::mainnet_params;
+    use dcroxide_stake::TxType;
+    use dcroxide_wire::{BlockHeader, TxOut};
+
+    std::thread_local! {
+        /// How many more script validation workers the calling thread
+        /// may spawn before spawning "fails"; `None` leaves spawning
+        /// to the OS.
+        pub(super) static WORKER_SPAWN_BUDGET: core::cell::Cell<Option<usize>> =
+            const { core::cell::Cell::new(None) };
+    }
+
+    fn zero_header() -> BlockHeader {
+        BlockHeader::from_bytes(&[0u8; 180]).expect("zero header").0
+    }
+
+    fn outpoint(fill: u8, index: u32) -> OutPoint {
+        OutPoint {
+            hash: Hash([fill; 32]),
+            index,
+            tree: 0,
+        }
+    }
+
+    /// A transaction spending `n` distinct outputs with empty signature
+    /// scripts.
+    fn spender(n: usize) -> MsgTx {
+        MsgTx {
+            tx_in: (0..n)
+                .map(|i| TxIn {
+                    previous_out_point: outpoint(0x11, i as u32),
+                    sequence: u32::MAX,
+                    ..TxIn::default()
+                })
+                .collect(),
+            tx_out: vec![TxOut {
+                value: 1,
+                version: 0,
+                pk_script: vec![dcroxide_txscript::OP_TRUE],
+            }],
+            ..MsgTx::default()
+        }
+    }
+
+    fn entry(pk_script: Vec<u8>, tx_type: TxType, ticket_min_outs: Option<Vec<u8>>) -> UtxoEntry {
+        UtxoEntry::new(
+            100_000_000,
+            pk_script,
+            100,
+            0,
+            0,
+            false,
+            false,
+            tx_type,
+            ticket_min_outs,
+        )
+    }
+
+    use crate::UtxoEntry;
+
+    #[test]
+    fn go_time_string_matches_go_time_format() {
+        assert_eq!(go_time_string(0), "1970-01-01 00:00:00 +0000 UTC");
+        assert_eq!(go_time_string(1790172001), "2026-09-23 14:00:01 +0000 UTC");
+        assert_eq!(go_time_string(1454954400), "2016-02-08 18:00:00 +0000 UTC");
+        assert_eq!(
+            go_time_string(i64::from(u32::MAX)),
+            "2106-02-07 06:28:15 +0000 UTC"
+        );
+    }
+
+    #[test]
+    fn go_hash_slice_string_matches_go_slice_format() {
+        assert_eq!(go_hash_slice_string(&[]), "[]");
+        let a = Hash([1; 32]);
+        let b = Hash([2; 32]);
+        assert_eq!(go_hash_slice_string(&[a, b]), format!("[{a} {b}]"));
+    }
+
+    /// dcrd's shared `validateHandler` text (scriptval.go:84-98) on
+    /// both the mempool and the block paths: the error's own text, the
+    /// referenced output, and both scripts in hex.
+    #[test]
+    fn script_failure_text_matches_dcrd() {
+        let tx = spender(1);
+        let prev_out = tx.tx_in[0].previous_out_point;
+        let run = |pk_script: Vec<u8>| {
+            let entry = entry(pk_script, TxType::Regular, None);
+            let mempool = validate_transaction_scripts(
+                &tx,
+                |_| Some(&entry),
+                dcroxide_txscript::ScriptFlags(0),
+                None,
+                false,
+            )
+            .expect_err("script fails");
+            let items = [ValidateItem {
+                tx: &tx,
+                tx_in_idx: 0,
+                pk_script: entry.pk_script(),
+                script_version: 0,
+            }];
+            let block = validate_items(&items, dcroxide_txscript::ScriptFlags(0), None)
+                .expect_err("script fails");
+            assert_eq!(mempool.kind, block.kind);
+            assert_eq!(mempool.description, block.description);
+            mempool
+        };
+
+        // OP_0 leaves a false stack entry.
+        let err = run(vec![dcroxide_txscript::OP_0]);
+        assert_eq!(err.kind, RuleErrorKind::ScriptValidation);
+        assert_eq!(
+            err.description,
+            format!(
+                "failed to validate input {}:0 which references output {prev_out} - false \
+                 stack entry at end of script execution (input script bytes , prev output \
+                 script bytes 00)",
+                tx.tx_hash()
+            )
+        );
+
+        // NewEngine refuses two empty scripts outright.
+        let err = run(Vec::new());
+        assert_eq!(err.kind, RuleErrorKind::ScriptMalformed);
+        assert_eq!(
+            err.description,
+            format!(
+                "failed to parse input {}:0 which references output {prev_out} - false \
+                 stack entry at end of script execution (input script bytes , prev output \
+                 script bytes )",
+                tx.tx_hash()
+            )
+        );
+    }
+
+    /// dcrd `verifyTSpendSignature` wraps the `schnorr.ParseSignature`
+    /// error with `%w`, which prints the error's description rather than
+    /// its kind (schnorr/signature.go `ParseSignature`).
+    #[test]
+    fn tspend_parse_signature_text_matches_dcrd() {
+        let tx = spender(1);
+        let sig = |r: u8, s: u8, len: usize| -> Vec<u8> {
+            let mut sig = vec![r; 32];
+            sig.extend(core::iter::repeat_n(s, 32));
+            sig.resize(len, 0);
+            sig
+        };
+        let text = |signature: &[u8]| {
+            verify_tspend_signature(&tx, signature, &[]).expect_err("parse fails")
+        };
+
+        assert_eq!(
+            text(&sig(0xff, 0, 64)),
+            "ParseSignature: invalid signature: r >= field prime"
+        );
+        assert_eq!(
+            text(&sig(0, 0xff, 64)),
+            "ParseSignature: invalid signature: s >= group order"
+        );
+        assert_eq!(
+            text(&sig(0, 0, 63)),
+            "ParseSignature: malformed signature: too short: 63 < 64"
+        );
+        assert_eq!(
+            text(&sig(0, 0, 65)),
+            "ParseSignature: malformed signature: too long: 65 > 64"
+        );
+    }
+
+    /// A refused thread no longer aborts the node: the calling thread
+    /// drains whatever the workers that did start leave behind.
+    #[test]
+    fn validate_items_survives_refused_worker_threads() {
+        let tx = spender(40);
+        let good = entry(vec![dcroxide_txscript::OP_TRUE], TxType::Regular, None);
+        let bad = entry(vec![dcroxide_txscript::OP_0], TxType::Regular, None);
+        let items_with = |bad_idx: Option<usize>| -> Vec<ValidateItem<'_>> {
+            (0..tx.tx_in.len())
+                .map(|i| ValidateItem {
+                    tx: &tx,
+                    tx_in_idx: i,
+                    pk_script: if Some(i) == bad_idx {
+                        bad.pk_script()
+                    } else {
+                        good.pk_script()
+                    },
+                    script_version: 0,
+                })
+                .collect()
+        };
+        for budget in [0usize, 1, 3] {
+            WORKER_SPAWN_BUDGET.set(Some(budget));
+            let ok = validate_items(&items_with(None), dcroxide_txscript::ScriptFlags(0), None);
+            WORKER_SPAWN_BUDGET.set(Some(budget));
+            let err = validate_items(
+                &items_with(Some(39)),
+                dcroxide_txscript::ScriptFlags(0),
+                None,
+            );
+            WORKER_SPAWN_BUDGET.set(None);
+            assert_eq!(ok, Ok(()), "budget {budget}");
+            let err = err.expect_err("the last item fails");
+            assert_eq!(err.kind, RuleErrorKind::ScriptValidation, "budget {budget}");
+            assert!(
+                err.description
+                    .starts_with(&format!("failed to validate input {}:39 ", tx.tx_hash())),
+                "budget {budget}: {}",
+                err.description
+            );
+        }
+    }
+
+    /// A revocation of a ticket whose stored minimal outputs decode to
+    /// nothing: dcrd panics (validate.go:3083-3087) where the port used
+    /// to underflow `len() - 1` into a rule error in release builds.
+    #[test]
+    #[should_panic(expected = "missing extra stake data for ticket")]
+    fn revocation_of_ticket_without_minimal_outputs_panics_like_dcrd() {
+        let params = mainnet_params();
+        let mut submission = vec![dcroxide_txscript::OP_SSTX, 0x76, 0xa9, 0x14];
+        submission.extend_from_slice(&[0x22; 20]);
+        submission.extend_from_slice(&[0x88, 0xac]);
+        let ticket = entry(submission, TxType::SStx, Some(vec![0x00]));
+        let mut revocation = spender(1);
+        revocation.tx_in[0].previous_out_point = outpoint(0x33, 0);
+        let tx_height = 100 + i64::from(params.ticket_maturity) + 2;
+        let _ = check_revocation_inputs(
+            &revocation,
+            tx_height,
+            |_| Some(&ticket),
+            &params,
+            &zero_header(),
+            false,
+            false,
+        );
+    }
+
+    /// The same for a vote, where the port's signed arithmetic used to
+    /// turn the empty outputs into a BadNumPayees rule error.
+    #[test]
+    #[should_panic(expected = "missing extra stake data for ticket")]
+    fn vote_on_ticket_without_minimal_outputs_panics_like_dcrd() {
+        let params = mainnet_params();
+        let mut submission = vec![dcroxide_txscript::OP_SSTX, 0x76, 0xa9, 0x14];
+        submission.extend_from_slice(&[0x22; 20]);
+        submission.extend_from_slice(&[0x88, 0xac]);
+        let ticket = entry(submission, TxType::SStx, Some(vec![0x00]));
+        let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(ChainSubsidyParams(&params));
+        let variant = dcroxide_standalone::SubsidySplitVariant::Dcp0012;
+        let voted_height: u32 = 5000;
+        let mut vote = spender(2);
+        vote.tx_in[0].value_in =
+            subsidy_cache.calc_stake_vote_subsidy_v3(i64::from(voted_height), variant);
+        vote.tx_in[1].previous_out_point = outpoint(0x33, 0);
+        let mut block_ref = vec![dcroxide_txscript::OP_RETURN, 36];
+        block_ref.extend_from_slice(&[0x44; 32]);
+        block_ref.extend_from_slice(&voted_height.to_le_bytes());
+        vote.tx_out = vec![
+            TxOut {
+                value: 0,
+                version: 0,
+                pk_script: block_ref,
+            },
+            TxOut {
+                value: 0,
+                version: 0,
+                pk_script: vec![dcroxide_txscript::OP_RETURN, 2, 1, 0],
+            },
+        ];
+        let tx_height = 100 + i64::from(params.ticket_maturity) + 1;
+        let _ = check_vote_inputs(
+            &mut subsidy_cache,
+            &vote,
+            tx_height,
+            |_| Some(&ticket),
+            &params,
+            &zero_header(),
+            false,
+            false,
+            variant,
+        );
+    }
+
+    #[test]
+    fn header_sanity_texts_match_dcrd() {
+        let params = mainnet_params();
+        let mut header = zero_header();
+        header.bits = params.pow_limit_bits;
+        header.vote_bits = EARLY_VOTE_BITS_VALUE;
+        header.height = 1;
+
+        // dcrd prints the header time with %v.
+        header.timestamp = 1790172001;
+        let err = check_block_header_sanity(&header, 0, true, &params).expect_err("too new");
+        assert_eq!(err.kind, RuleErrorKind::TimeTooNew);
+        assert_eq!(
+            err.description,
+            "block timestamp of 2026-09-23 14:00:01 +0000 UTC is too far in the future"
+        );
+
+        // dcrd names both final states.
+        header.final_state = [1, 2, 3, 4, 5, 6];
+        let err = check_block_header_sanity(&header, 1790172001, true, &params)
+            .expect_err("early final state");
+        assert_eq!(err.kind, RuleErrorKind::InvalidEarlyFinalState);
+        assert_eq!(
+            err.description,
+            "block at height 1 commits to invalid final state before stake validation \
+             height 4096 (expected 000000000000, got 010203040506)"
+        );
+    }
+
+    #[test]
+    fn ticket_unavailable_text_lists_eligible_tickets() {
+        let vote = Hash([9; 32]);
+        let winners = [Hash([1; 32]), Hash([2; 32])];
+        let err = check_ticket_redeemers(&[vote], &[], &winners, &[], |_| false, false)
+            .expect_err("ineligible");
+        assert_eq!(err.kind, RuleErrorKind::TicketUnavailable);
+        assert_eq!(
+            err.description,
+            format!(
+                "block contains vote for ineligible ticket {vote} (eligible tickets: [{} {}])",
+                winners[0], winners[1]
+            )
+        );
+    }
+
+    #[test]
+    fn coinbase_height_text_names_block_and_parent() {
+        let mut block = MsgBlock {
+            header: zero_header(),
+            transactions: vec![spender(1)],
+            stransactions: Vec::new(),
+        };
+        block.header.height = 5;
+        block.header.prev_block = Hash([7; 32]);
+        block.transactions[0].tx_out = vec![
+            TxOut::default(),
+            TxOut {
+                value: 0,
+                version: 0,
+                pk_script: vec![dcroxide_txscript::OP_RETURN, 4, 6, 0, 0, 0],
+            },
+        ];
+        let err = check_coinbase_unique_height(5, &block, false).expect_err("wrong height");
+        assert_eq!(err.kind, RuleErrorKind::CoinbaseHeight);
+        assert_eq!(
+            err.description,
+            format!(
+                "block {} coinbase output 1 encodes height 6 instead of expected height 5 \
+                 (prev block: {}, header height 5)",
+                block.block_hash(),
+                Hash([7; 32])
+            )
+        );
+    }
+
+    #[test]
+    fn subsidy_output_texts_match_dcrd() {
+        let params = mainnet_params();
+
+        // coinbasePaysTreasuryAddress prints both scripts.
+        let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(ChainSubsidyParams(&params));
+        let mut coinbase = spender(1);
+        coinbase.tx_out[0].version = params.organization_pk_script_version;
+        coinbase.tx_out[0].pk_script = vec![dcroxide_txscript::OP_TRUE];
+        let err = coinbase_pays_treasury_address(&mut subsidy_cache, &coinbase, 2, 5, &params)
+            .expect_err("wrong script");
+        assert_eq!(err.kind, RuleErrorKind::NoTreasury);
+        assert_eq!(
+            err.description,
+            format!(
+                "treasury output script is 51 instead of {}",
+                hex_string(&params.organization_pk_script)
+            )
+        );
+
+        // blockOneCoinbasePaysTokens prints consensusScriptVersion as the
+        // expected version, both scripts, and dcrutil.Amount values.
+        let ledger = &params.block_one_ledger;
+        let mut block_one = spender(1);
+        block_one.tx_out = ledger
+            .iter()
+            .map(|p| TxOut {
+                value: p.amount,
+                version: p.script_version,
+                pk_script: p.script.clone(),
+            })
+            .collect();
+        assert_eq!(block_one_coinbase_pays_tokens(&block_one, &params), Ok(()));
+
+        let mut bad = block_one.clone();
+        bad.tx_out[0].version = 1;
+        let err = block_one_coinbase_pays_tokens(&bad, &params).expect_err("version");
+        assert_eq!(
+            err.description,
+            "block one output 0 script version 1 is not 0"
+        );
+
+        let mut bad = block_one.clone();
+        bad.tx_out[0].pk_script = vec![dcroxide_txscript::OP_TRUE];
+        let err = block_one_coinbase_pays_tokens(&bad, &params).expect_err("script");
+        assert_eq!(
+            err.description,
+            format!(
+                "block one output 0 script 51 is not {}",
+                hex_string(&ledger[0].script)
+            )
+        );
+
+        let mut bad = block_one;
+        bad.tx_out[0].value = 150_000_000;
+        let err = block_one_coinbase_pays_tokens(&bad, &params).expect_err("amount");
+        assert_eq!(
+            err.description,
+            format!(
+                "block one output 0 generates 1.5 DCR instead of required {}",
+                amount_string(ledger[0].amount)
+            )
+        );
+    }
+
+    #[test]
+    fn submission_input_text_includes_script() {
+        let not_submission = entry(vec![dcroxide_txscript::OP_TRUE], TxType::SStx, None);
+        assert_eq!(
+            check_ticket_submission_input(&not_submission),
+            Err("not a supported stake submission script (script: 51)".into())
+        );
+    }
+
+    /// dcrd returns `AssertError` when the treasurybase height check
+    /// is handed a block with no stake transactions
+    /// (validate.go:1666-1670); the port used to `assert!`, which kills
+    /// the node under `panic = "abort"` for a peer-supplied block.
+    #[test]
+    fn treasurybase_height_check_without_stake_txs_is_an_assert_error() {
+        let block = MsgBlock {
+            header: zero_header(),
+            transactions: vec![spender(1)],
+            stransactions: Vec::new(),
+        };
+        let err = check_treasurybase_unique_height(2, &block).expect_err("no stake txs");
+        assert_eq!(err.kind, RuleErrorKind::UtxoBackendCorruption);
+        assert!(
+            !err.kind.is_rule_violation(),
+            "an assertion is not the peer's fault"
+        );
+        assert_eq!(
+            err.description,
+            format!(
+                "assertion failed: checkTreasurybaseUniqueHeight must be called with a block \
+                 that has already been verified to have at least one stake transaction \
+                 (block {})",
+                block.block_hash()
+            )
+        );
+
+        // Blocks 0 and 1 skip the check before the assertion, as in dcrd.
+        assert_eq!(check_treasurybase_unique_height(1, &block), Ok(()));
+    }
+
+    /// dcrd's `calculateAddedSubsidy` recognises the treasurybase with
+    /// `stake.IsTreasuryBase` (subsidy.go:179), which also requires
+    /// version 0 output scripts; `standalone.IsTreasuryBase` does not.
+    #[test]
+    fn added_subsidy_recognises_the_treasurybase_like_stake_is_treasury_base() {
+        let treasurybase = |out0_version: u16| {
+            let mut null_data = vec![dcroxide_txscript::OP_RETURN, dcroxide_txscript::OP_DATA_12];
+            null_data.extend_from_slice(&[0u8; 12]);
+            MsgTx {
+                version: dcroxide_stake::TX_VERSION_TREASURY,
+                tx_in: vec![TxIn {
+                    previous_out_point: OutPoint {
+                        hash: Hash::ZERO,
+                        index: u32::MAX,
+                        tree: 0,
+                    },
+                    value_in: 700,
+                    sequence: u32::MAX,
+                    ..TxIn::default()
+                }],
+                tx_out: vec![
+                    TxOut {
+                        value: 700,
+                        version: out0_version,
+                        pk_script: vec![dcroxide_txscript::OP_TADD],
+                    },
+                    TxOut {
+                        value: 0,
+                        version: 0,
+                        pk_script: null_data,
+                    },
+                ],
+                ..MsgTx::default()
+            }
+        };
+        // The zero header disapproves its parent, so only the stake
+        // tree contributes.
+        let parent = MsgBlock {
+            header: zero_header(),
+            transactions: vec![spender(1)],
+            stransactions: Vec::new(),
+        };
+        let block_with = |tb: MsgTx| MsgBlock {
+            header: zero_header(),
+            transactions: vec![spender(1)],
+            stransactions: vec![tb],
+        };
+
+        assert_eq!(
+            calculate_added_subsidy(&block_with(treasurybase(0)), &parent),
+            700
+        );
+
+        // Output 0 at script version 1 passes the standalone predicate
+        // but not the stake one dcrd uses here.
+        let odd = treasurybase(1);
+        assert!(dcroxide_standalone::is_treasury_base(&odd));
+        assert!(!dcroxide_stake::is_treasury_base(&odd));
+        assert_eq!(calculate_added_subsidy(&block_with(odd), &parent), 0);
+    }
+
+    /// dcrd's `UtxoViewpoint.PrevScript` reports a script as found for
+    /// any entry the view holds, spent or not (utxoviewpoint.go:211-220),
+    /// so `ValidateTransactionScripts` runs the script of a spent entry
+    /// rather than failing with `ErrMissingTxOut`.  Only a missing entry
+    /// is missing.
+    #[test]
+    fn transaction_scripts_run_spent_entries_like_prev_script() {
+        let tx = spender(1);
+        let mut spent = entry(vec![dcroxide_txscript::OP_TRUE], TxType::Regular, None);
+        spent.spend();
+        assert!(spent.is_spent());
+        assert_eq!(
+            validate_transaction_scripts(
+                &tx,
+                |_| Some(&spent),
+                dcroxide_txscript::ScriptFlags(0),
+                None,
+                false,
+            ),
+            Ok(())
+        );
+
+        let err = validate_transaction_scripts(
+            &tx,
+            |_| None,
+            dcroxide_txscript::ScriptFlags(0),
+            None,
+            false,
+        )
+        .expect_err("missing entry");
+        assert_eq!(err.kind, RuleErrorKind::MissingTxOut);
+        assert_eq!(
+            err.description,
+            format!(
+                "unable to find unspent output {} referenced from transaction {}:0",
+                tx.tx_in[0].previous_out_point,
+                tx.tx_hash()
+            )
+        );
+    }
+
+    /// dcrd validates a transaction's inputs with the same parallel
+    /// `txValidator` as a block's (scriptval.go:216-221); the port's
+    /// single-transaction path used to run every input serially on the
+    /// calling thread instead of through `validate_items`.
+    #[test]
+    fn transaction_scripts_fan_out_across_the_block_worker_pool() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let tx = spender(40);
+        let good = entry(vec![dcroxide_txscript::OP_TRUE], TxType::Regular, None);
+        let bad = entry(vec![dcroxide_txscript::OP_0], TxType::Regular, None);
+        let bad_op = tx.tx_in[39].previous_out_point;
+        let lookup = |op: &OutPoint| Some(if *op == bad_op { &bad } else { &good });
+
+        // Spawned workers draw on the test budget; an inline run leaves
+        // it untouched.
+        const BUDGET: usize = 3;
+        WORKER_SPAWN_BUDGET.set(Some(BUDGET));
+        let ok = validate_transaction_scripts(
+            &tx,
+            |_| Some(&good),
+            dcroxide_txscript::ScriptFlags(0),
+            None,
+            false,
+        );
+        let left = WORKER_SPAWN_BUDGET.get();
+        WORKER_SPAWN_BUDGET.set(Some(0));
+        let err = validate_transaction_scripts(
+            &tx,
+            lookup,
+            dcroxide_txscript::ScriptFlags(0),
+            None,
+            false,
+        );
+        WORKER_SPAWN_BUDGET.set(None);
+
+        assert_eq!(ok, Ok(()));
+        if cores > 1 {
+            assert_eq!(
+                left,
+                Some(BUDGET - BUDGET.min(cores)),
+                "workers were spawned"
+            );
+        }
+        let err = err.expect_err("the last input fails");
+        assert_eq!(err.kind, RuleErrorKind::ScriptValidation);
+        assert!(
+            err.description
+                .starts_with(&format!("failed to validate input {}:39 ", tx.tx_hash())),
+            "{}",
+            err.description
+        );
+    }
 }

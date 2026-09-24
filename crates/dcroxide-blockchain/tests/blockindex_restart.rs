@@ -62,7 +62,7 @@ fn seed(opts: &Options, params: &Params) -> Vec<Hash> {
         }
         chain
             .blocks
-            .insert(block.header.block_hash().0, block.clone());
+            .insert(block.header.block_hash().0, Arc::new(block.clone()));
         chain.index.add_node(&chain.store, node);
         // The reopen's warm-up fetches the block for every node that
         // claims stored data, so the bytes have to be there.
@@ -192,15 +192,19 @@ fn the_first_flush_after_a_restart_rewrites_no_block_index_rows() {
     );
 }
 
-/// The one thing the un-marking split must not break: a row the load
-/// loop *changes* still reaches disk.
+/// The load loop's one change to a row stays in memory, as in dcrd.
 ///
 /// The new-rules pass clears `VALIDATE_FAILED`/`INVALID_ANCESTOR` from
 /// blocks that failed under rules predating a newly detected agenda.
-/// Startup flushes those rows and then advances the stored deployment
-/// version, so the pass does not run again -- which means an unmarked
-/// row would keep its failure forever, and the block would be rejected
-/// on every subsequent start.
+/// dcrd makes that change on the in-memory node only: `loadBlockIndex`
+/// inserts it with `addNodeFromDB`, which never marks it modified, so
+/// the flush `initChainState` runs "since blocks may have been
+/// unmarked" finds an empty modified set and writes nothing
+/// (`chainio.go:1494-1502`, `:1776-1786`; `blockindex.go:1411`).  The
+/// stored deployment version then advances, the pass does not run
+/// again, and a second restart reloads the block as failed.  The port
+/// used to mark the node and persist the cleared status (review finding
+/// B7-c#2); this pins dcrd's behaviour instead.
 ///
 /// Arming it takes two adjustments.  The stored deployment version is
 /// pushed back to 0 so the binary's version leads it.  And simnet's next
@@ -208,7 +212,7 @@ fn the_first_flush_after_a_restart_rewrites_no_block_index_rows() {
 /// (`new_rules_start_time != 0`), so that start time is moved to 1 --
 /// below every corpus timestamp, so the median-time gate opens.
 #[test]
-fn the_new_rules_unmark_persists_the_node_it_changed() {
+fn the_new_rules_unmark_stays_in_memory_as_in_dcrd() {
     let mut params = simnet_params();
     {
         let next = params
@@ -258,8 +262,8 @@ fn the_new_rules_unmark_persists_the_node_it_changed() {
         db.close().expect("close");
     }
 
-    // The open that runs the pass: it clears the flag, flushes the row,
-    // and advances the stored version.
+    // The open that runs the pass: it clears the flag in memory and
+    // advances the stored version, writing nothing for the row.
     {
         let db = Database::open(&opts).expect("reopen database");
         let chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("reopen chain");
@@ -280,8 +284,8 @@ fn the_new_rules_unmark_persists_the_node_it_changed() {
     }
 
     // The open that proves it: the version has advanced, so the pass
-    // cannot run again, and the flag must be clear because it was
-    // written rather than merely cleared in memory.
+    // does not run again, and the row still carries the failure it had
+    // before the pass, exactly what dcrd reloads.
     let db = Database::open(&opts).expect("reopen database");
     let chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("reopen chain");
 
@@ -307,8 +311,7 @@ fn the_new_rules_unmark_persists_the_node_it_changed() {
         .lookup_node(&failed_hash)
         .expect("the failed block is in the index");
     assert!(
-        !chain.store.node(node).status.known_validate_failed(),
-        "the cleared status never reached disk: the pass will not run again, so the block \
-         stays failed for the life of this data directory",
+        chain.store.node(node).status.known_validate_failed(),
+        "the cleared status reached disk, but dcrd's post-load flush writes no unmarked row",
     );
 }
