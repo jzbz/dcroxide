@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use dcroxide_chainhash::Hash;
 
 use crate::cursor::Cursor;
-use crate::error::WireError;
+use crate::error::{MessageText, WireError};
 use crate::netaddress::{MAX_NET_ADDRESS_PAYLOAD, NetAddress};
 use crate::protocol::{FEE_FILTER_VERSION, REMOVE_REJECT_VERSION, ServiceFlag, is_strict_ascii};
 use crate::varint::{read_var_int, read_var_string_bytes, var_int_serialize_size, write_var_int};
@@ -52,6 +52,12 @@ pub struct MsgVersion {
     pub disable_relay_tx: bool,
 }
 
+/// dcrd `validateUserAgent`'s strict-ASCII error.
+const USER_AGENT_NOT_ASCII: MessageText = MessageText::new(
+    "MsgVersion.validateUserAgent",
+    "user agent is not strict ASCII",
+);
+
 /// Validate a user agent per dcrd `validateUserAgent`.
 fn validate_user_agent(user_agent: &str) -> Result<(), WireError> {
     if user_agent.len() > MAX_USER_AGENT_LEN {
@@ -61,7 +67,7 @@ fn validate_user_agent(user_agent: &str) -> Result<(), WireError> {
         });
     }
     if !is_strict_ascii(user_agent.as_bytes()) {
-        return Err(WireError::MalformedStrictString);
+        return Err(WireError::MalformedStrictString(USER_AGENT_NOT_ASCII));
     }
     Ok(())
 }
@@ -101,7 +107,7 @@ impl MsgVersion {
                 });
             }
             if !is_strict_ascii(&bytes) {
-                return Err(WireError::MalformedStrictString);
+                return Err(WireError::MalformedStrictString(USER_AGENT_NOT_ASCII));
             }
             msg.user_agent = String::from_utf8(bytes).expect("strict ASCII is UTF-8");
         }
@@ -348,12 +354,25 @@ pub struct MsgReject {
     pub hash: Hash,
 }
 
+/// dcrd `validateRejectCommand`'s strict-ASCII error.
+const REJECT_COMMAND_NOT_ASCII: MessageText = MessageText::new(
+    "MsgReject.validateRejectCommand",
+    "reject command is not strict ASCII",
+);
+
+/// dcrd `validateRejectReason`'s strict-ASCII error.
+const REJECT_REASON_NOT_ASCII: MessageText = MessageText::new(
+    "MsgReject.validateRejectReason",
+    "reject reason is not strict ASCII",
+);
+
 /// Read a strict-ASCII var string for reject fields, mapping non-ASCII to
-/// `ErrMalformedStrictString` like dcrd's validate helpers.
-fn read_reject_string(r: &mut Cursor<'_>) -> Result<String, WireError> {
+/// `ErrMalformedStrictString` with the text of dcrd's validate helper for
+/// the field.
+fn read_reject_string(r: &mut Cursor<'_>, not_ascii: MessageText) -> Result<String, WireError> {
     let bytes = read_var_string_bytes(r)?;
     if !is_strict_ascii(&bytes) {
-        return Err(WireError::MalformedStrictString);
+        return Err(WireError::MalformedStrictString(not_ascii));
     }
     Ok(String::from_utf8(bytes).expect("strict ASCII is UTF-8"))
 }
@@ -368,9 +387,9 @@ impl MsgReject {
         if pver >= REMOVE_REJECT_VERSION {
             return Err(WireError::MsgInvalidForPVer);
         }
-        let cmd = read_reject_string(r)?;
+        let cmd = read_reject_string(r, REJECT_COMMAND_NOT_ASCII)?;
         let code = r.read_u8()?;
-        let reason = read_reject_string(r)?;
+        let reason = read_reject_string(r, REJECT_REASON_NOT_ASCII)?;
         let mut hash = Hash::ZERO;
         if cmd == "block" || cmd == "tx" {
             hash = Hash(r.take_array()?);
@@ -387,8 +406,11 @@ impl MsgReject {
         if pver >= REMOVE_REJECT_VERSION {
             return Err(WireError::MsgInvalidForPVer);
         }
-        if !is_strict_ascii(self.cmd.as_bytes()) || !is_strict_ascii(self.reason.as_bytes()) {
-            return Err(WireError::MalformedStrictString);
+        if !is_strict_ascii(self.cmd.as_bytes()) {
+            return Err(WireError::MalformedStrictString(REJECT_COMMAND_NOT_ASCII));
+        }
+        if !is_strict_ascii(self.reason.as_bytes()) {
+            return Err(WireError::MalformedStrictString(REJECT_REASON_NOT_ASCII));
         }
         write_var_int(w, self.cmd.len() as u64);
         w.extend_from_slice(self.cmd.as_bytes());

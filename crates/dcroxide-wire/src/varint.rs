@@ -5,7 +5,7 @@
 use alloc::vec::Vec;
 
 use crate::cursor::Cursor;
-use crate::error::WireError;
+use crate::error::{MessageText, WireError};
 
 /// Read a variable-length integer, rejecting non-canonical encodings exactly
 /// like dcrd's `ReadVarInt`.
@@ -71,15 +71,34 @@ pub fn var_int_serialize_size(val: u64) -> usize {
     }
 }
 
-/// Read a variable-length byte array bounded by `max_allowed`, mirroring
-/// dcrd's `readScript`/`ReadVarBytes` limit behavior.
-pub(crate) fn read_var_bytes(r: &mut Cursor<'_>, max_allowed: u64) -> Result<Vec<u8>, WireError> {
+/// Read a variable-length byte array bounded by `max_allowed` (dcrd
+/// `ReadVarBytes`); `field_name` names the array in the limit error.
+pub(crate) fn read_var_bytes(
+    r: &mut Cursor<'_>,
+    max_allowed: u64,
+    field_name: &'static str,
+) -> Result<Vec<u8>, WireError> {
+    read_var_bytes_as(r, max_allowed, "ReadVarBytes", field_name)
+}
+
+/// The body dcrd's `ReadVarBytes` and `readScript` share: they differ
+/// only in the function their limit error names, `op`.
+pub(crate) fn read_var_bytes_as(
+    r: &mut Cursor<'_>,
+    max_allowed: u64,
+    op: &'static str,
+    field_name: &'static str,
+) -> Result<Vec<u8>, WireError> {
     let count = read_var_int(r)?;
     if count > max_allowed {
-        return Err(WireError::VarBytesTooLong {
-            count,
-            max: max_allowed,
-        });
+        return Err(WireError::VarBytesTooLong(
+            MessageText::new(
+                op,
+                "%s is larger than the max allowed size [count %d, max %d]",
+            )
+            .with_field(field_name)
+            .with_args(count, max_allowed),
+        ));
     }
     Ok(r.take(count as usize)?.to_vec())
 }
@@ -96,10 +115,13 @@ pub(crate) fn write_var_bytes(w: &mut Vec<u8>, bytes: &[u8]) {
 pub(crate) fn read_var_string_bytes(r: &mut Cursor<'_>) -> Result<Vec<u8>, WireError> {
     let count = read_var_int(r)?;
     if count > crate::MAX_MESSAGE_PAYLOAD {
-        return Err(WireError::VarStringTooLong {
-            count,
-            max: crate::MAX_MESSAGE_PAYLOAD,
-        });
+        return Err(WireError::VarStringTooLong(
+            MessageText::new(
+                "ReadVarString",
+                "variable length string is too long [count %d, max %d]",
+            )
+            .with_args(count, crate::MAX_MESSAGE_PAYLOAD),
+        ));
     }
     Ok(r.take(count as usize)?.to_vec())
 }
@@ -110,14 +132,21 @@ pub(crate) fn read_ascii_var_string(
     r: &mut Cursor<'_>,
     max_allowed: u64,
 ) -> Result<alloc::string::String, WireError> {
+    const OP: &str = "ReadAsciiVarString";
     let count = read_var_int(r)?;
     let max = max_allowed.min(crate::MAX_MESSAGE_PAYLOAD);
     if count > max {
-        return Err(WireError::VarStringTooLong { count, max });
+        return Err(WireError::VarStringTooLong(
+            MessageText::new(OP, "variable length string is too long [count %d, max %d]")
+                .with_args(count, max),
+        ));
     }
     let bytes = r.take(count as usize)?;
     if !crate::protocol::is_strict_ascii(bytes) {
-        return Err(WireError::MalformedStrictString);
+        return Err(WireError::MalformedStrictString(MessageText::new(
+            OP,
+            "string is not strict ASCII",
+        )));
     }
     Ok(alloc::string::String::from_utf8(bytes.to_vec()).expect("strict ASCII is UTF-8"))
 }
@@ -182,9 +211,16 @@ mod tests {
 
     #[test]
     fn truncated_is_eof() {
-        for bytes in [&[0xfd, 0x01][..], &[0xfe, 0x01, 0x02][..], &[0xff][..]] {
+        // Go's io.EOF when a read finds nothing left, io.ErrUnexpectedEOF
+        // when it finds part of what it needs.
+        for (bytes, want) in [
+            (&[][..], WireError::Eof),
+            (&[0xff][..], WireError::Eof),
+            (&[0xfd, 0x01][..], WireError::UnexpectedEof),
+            (&[0xfe, 0x01, 0x02][..], WireError::UnexpectedEof),
+        ] {
             let mut r = Cursor::new(bytes);
-            assert_eq!(read_var_int(&mut r), Err(WireError::UnexpectedEof));
+            assert_eq!(read_var_int(&mut r), Err(want), "{bytes:x?}");
         }
     }
 }

@@ -19,7 +19,7 @@ use dcroxide_wire::{
     MsgMixFactoredPoly, MsgMixKeyExchange, MsgMixPairReq, MsgMixSecrets, MsgMixSlotReserve,
     MsgNotFound, MsgPing, MsgPong, MsgReject, MsgTx, MsgVersion, NetAddress, NetAddressType,
     NetAddressV2, OutPoint, PROTOCOL_VERSION, REMOVE_REJECT_VERSION, ServiceFlag, TxIn, TxOut,
-    TxSerializeType, read_message, write_message,
+    TxSerializeType, WireError, read_message, write_message,
 };
 
 /// The protocol version the differential drives: the oracle links
@@ -622,7 +622,7 @@ fn corrupted_frames_match_dcrd_verdicts() {
             (Err(err), Some(_)) => {
                 let oracle_kind = resp.get("kind").and_then(|k| k.as_str()).unwrap_or("");
                 // dcrd surfaces raw io errors (empty kind) for short reads;
-                // our UnexpectedEof maps to the same empty kind.
+                // our Eof and UnexpectedEof map to the same empty kind.
                 assert_eq!(
                     err.kind_name(),
                     oracle_kind,
@@ -667,4 +667,140 @@ fn reject_frames_are_unknown_to_readers() {
         Some("ErrUnknownCmd"),
         "oracle: {resp}"
     );
+}
+
+/// Every message type's payload, cut short inside a correctly framed
+/// message: where dcrd's decoder fails with a Go io error, the port's
+/// fails with the same one, `io.EOF` for a cut at a field boundary and
+/// `io.ErrUnexpectedEOF` for a cut inside a field.  Their texts reach
+/// `sendrawmixmessage` clients for the mixing messages, and the kinds
+/// alone, which the other tests compare, cannot tell them apart.
+#[test]
+fn truncated_payload_io_errors_match_dcrd_text() {
+    let Some(mut oracle) = oracle_or_skip() else {
+        return;
+    };
+    let mut rng = SplitMix64::from_entropy("wire payload truncation text differential");
+    let net = CurrencyNet::MAIN_NET;
+
+    let mut compared = 0;
+    for _ in 0..3 {
+        for (msg, pver) in structured_messages(&mut rng) {
+            let frame = write_message(&msg, pver, net).expect("encode");
+            let payload = &frame[24..];
+            // Every cut of a short payload, and a sample of a long one.
+            let cuts: Vec<usize> = if payload.len() <= 300 {
+                (0..payload.len()).collect()
+            } else {
+                (0..300)
+                    .map(|_| rng.below(payload.len() as u64) as usize)
+                    .collect()
+            };
+            for cut in cuts {
+                let truncated = &payload[..cut];
+                let mut cut_frame = frame[..16].to_vec();
+                cut_frame.extend_from_slice(&(cut as u32).to_le_bytes());
+                cut_frame.extend_from_slice(&dcroxide_chainhash::hash_b(truncated)[..4]);
+                cut_frame.extend_from_slice(truncated);
+
+                let ours = read_message(&cut_frame, pver, net);
+                let resp = oracle_frame(&mut oracle, pver, net, &cut_frame);
+                let theirs_kind = resp.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                let (Err(ours), Some(theirs)) = (&ours, resp.get("error").and_then(|e| e.as_str()))
+                else {
+                    continue;
+                };
+                if !ours.kind_name().is_empty() || !theirs_kind.is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    ours.to_string(),
+                    theirs,
+                    "{} cut at {cut} of {}",
+                    msg.command(),
+                    payload.len()
+                );
+                compared += 1;
+            }
+        }
+    }
+    assert!(compared > 1_000, "only {compared} io errors compared");
+}
+
+/// Mixing message payloads with a few bytes overwritten, reframed with a
+/// valid checksum so both decoders see them: where dcrd rejects, the port
+/// rejects with the same text, which `sendrawmixmessage` returns for a
+/// decode error, and where dcrd accepts, both write the message back out
+/// alike (or fail to, with the same text).  The one exception is
+/// `ReadMessage`'s own trailing-bytes check, a framing error no RPC
+/// makes, which is compared by kind.
+#[test]
+fn mutated_mix_payloads_match_dcrd_text() {
+    let Some(mut oracle) = oracle_or_skip() else {
+        return;
+    };
+    let mut rng = SplitMix64::from_entropy("mixing payload mutation text differential");
+    let net = CurrencyNet::MAIN_NET;
+
+    // About one mutation in thirty lands on a checked field, so this
+    // compares some two hundred coded errors.
+    let mut coded = 0;
+    for i in 0..6_000 {
+        let msgs = mix_messages(&mut rng);
+        let (msg, pver) = &msgs[rng.below(msgs.len() as u64) as usize];
+        let frame = write_message(msg, *pver, net).expect("encode");
+        let mut payload = frame[24..].to_vec();
+        // The counts sit after the fixed-size fields, so bias half of
+        // the writes toward the variable-length tail.
+        for _ in 0..1 + rng.below(3) {
+            let len = payload.len() as u64;
+            let pos = if rng.below(2) == 0 {
+                rng.below(len)
+            } else {
+                len - 1 - rng.below(len.min(80))
+            } as usize;
+            payload[pos] = match rng.below(5) {
+                0 => 0x00,
+                1 => 0xff,
+                2 => 0xfd,
+                3 => 0x80,
+                _ => rng.next_u64() as u8,
+            };
+        }
+        let mut mutated = frame[..16].to_vec();
+        mutated.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        mutated.extend_from_slice(&dcroxide_chainhash::hash_b(&payload)[..4]);
+        mutated.extend_from_slice(&payload);
+
+        let ours = read_message(&mutated, *pver, net)
+            .and_then(|(decoded, _)| write_message(&decoded, *pver, net));
+        let resp = oracle_frame(&mut oracle, *pver, net, &mutated);
+        match (ours, resp.get("error").and_then(|e| e.as_str())) {
+            (Ok(ours), None) => {
+                let theirs = unhex(resp["result"].as_str().expect("result"));
+                assert_eq!(ours, theirs, "case {i}: {} re-encoding", msg.command());
+            }
+            (Err(ours), Some(theirs)) => {
+                if ours == WireError::TrailingBytes {
+                    let kind = resp.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                    assert_eq!(kind, "ErrTrailingBytes", "case {i}: {theirs}");
+                    continue;
+                }
+                assert_eq!(
+                    ours.to_string(),
+                    theirs,
+                    "case {i}: {} payload {}",
+                    msg.command(),
+                    hex(&payload)
+                );
+                coded += usize::from(!ours.kind_name().is_empty());
+            }
+            (ours, theirs) => panic!(
+                "case {i}: verdict mismatch: ours {ours:?}, oracle {theirs:?} for {} {}",
+                msg.command(),
+                hex(&payload)
+            ),
+        }
+    }
+    assert!(coded > 100, "only {coded} coded errors compared");
 }

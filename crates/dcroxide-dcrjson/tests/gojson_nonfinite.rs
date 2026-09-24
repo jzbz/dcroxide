@@ -41,7 +41,9 @@ fn format_float_g_matches_go_for_non_finite_values() {
 /// aborts the marshal with `json: unsupported value`.  The Rust
 /// formatter cannot report failure through its signature, so it emits
 /// the JSON `null` literal — still a parseable document, and never a
-/// panic or a bare `+Inf` that no JSON reader would accept.
+/// panic or a bare `+Inf` that no JSON reader would accept.  (The
+/// reply path marshals through `try_encode`, which fails as Go does;
+/// `review_try_encode.rs` pins that.)
 #[test]
 fn format_float_json_emits_null_for_non_finite_values() {
     assert_eq!(format_float_json(f64::INFINITY), "null");
@@ -52,8 +54,7 @@ fn format_float_json_emits_null_for_non_finite_values() {
     assert_eq!(format_float_json32(f32::NEG_INFINITY), "null");
     assert_eq!(format_float_json32(f32::NAN), "null");
 
-    // The same holds through the encoder, the path a marshalled reply
-    // takes.
+    // The same holds through the infallible encoder.
     assert_eq!(
         gojson::encode(&GoType::Float64, &GoValue::Float64(f64::INFINITY)),
         "null"

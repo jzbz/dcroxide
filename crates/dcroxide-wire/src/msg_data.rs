@@ -12,7 +12,7 @@ use dcroxide_chainhash::{HASH_SIZE, Hash};
 
 use crate::blockheader::{BlockHeader, MAX_BLOCK_HEADER_PAYLOAD};
 use crate::cursor::Cursor;
-use crate::error::WireError;
+use crate::error::{MessageText, WireError};
 use crate::invvect::{INV_VECT_PAYLOAD, InvVect, MAX_INV_PER_MSG, read_inv_list, write_inv_list};
 use crate::msgtx::{MIN_TX_PAYLOAD, MsgTx};
 use crate::protocol::{INIT_STATE_VERSION, is_strict_ascii};
@@ -268,6 +268,8 @@ impl MsgBlock {
             return Err(WireError::TooManyTxs {
                 count: tx_count,
                 max: max_per_tree,
+                op: "MsgBlock.BtcDecode",
+                what: "transactions to fit into a block",
             });
         }
         // The count was just bounded above, so this pre-size is capped the
@@ -282,6 +284,8 @@ impl MsgBlock {
             return Err(WireError::TooManyTxs {
                 count: stake_tx_count,
                 max: max_per_tree,
+                op: "MsgBlock.BtcDecode",
+                what: "stransactions to fit into a block",
             });
         }
         // Bounded above, mirroring dcrd's `make([]*MsgTx, 0, stakeTxCount)`.
@@ -503,7 +507,10 @@ impl MsgGetInitState {
                 });
             }
             if !is_strict_ascii(typ.as_bytes()) {
-                return Err(WireError::MalformedStrictString);
+                return Err(WireError::MalformedStrictString(MessageText::new(
+                    "MsgGetInitState.BtcEncode",
+                    "individual initial state type is not strict ASCII",
+                )));
             }
             write_var_int(w, typ.len() as u64);
             w.extend_from_slice(typ.as_bytes());

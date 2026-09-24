@@ -28,8 +28,16 @@ impl<'a> Cursor<'a> {
     }
 
     /// Take `n` bytes as a slice.
+    ///
+    /// A short read fails the way dcrd's reads over a byte reader do:
+    /// with Go's `io.EOF` when no bytes are left at all, and
+    /// `io.ErrUnexpectedEOF` when only some are (`shortRead`,
+    /// `io.ReadFull`).
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
         if self.remaining() < n {
+            if self.remaining() == 0 {
+                return Err(WireError::Eof);
+            }
             return Err(WireError::UnexpectedEof);
         }
         let s = &self.buf[self.pos..self.pos + n];

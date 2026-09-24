@@ -13,8 +13,8 @@ use alloc::vec::Vec;
 use dcroxide_chainhash::Hash;
 
 use crate::cursor::Cursor;
-use crate::error::WireError;
-use crate::msgtx::{MsgTx, OutPoint, TxOut};
+use crate::error::{MessageText, WireError};
+use crate::msgtx::{MsgTx, OutPoint, TxOut, read_script};
 use crate::protocol::{MIX_VERSION, is_strict_ascii};
 use crate::varint::{
     read_ascii_var_string, read_var_bytes, read_var_int, var_int_serialize_size, write_var_bytes,
@@ -111,15 +111,24 @@ fn decode_sig_ident(r: &mut Cursor<'_>, pver: u32) -> Result<([u8; 64], [u8; 33]
     Ok((r.take_array()?, r.take_array()?))
 }
 
+/// dcrd's `ErrTooManyPrevMixMsgs` for `count` referenced messages, as
+/// the function `op` words it.
+fn too_many_prev_mix_msgs(op: &'static str, count: u64) -> WireError {
+    WireError::TooManyPrevMixMsgs(
+        MessageText::new(
+            op,
+            "too many previous referenced messages [count %v, max %v]",
+        )
+        .with_args(count, MAX_MIX_PEERS),
+    )
+}
+
 /// Decode a varint-counted hash list bounded by [`MAX_MIX_PEERS`] with
-/// dcrd's `ErrTooManyPrevMixMsgs`.
-fn read_seen_hashes(r: &mut Cursor<'_>) -> Result<Vec<Hash>, WireError> {
+/// dcrd's `ErrTooManyPrevMixMsgs`, raised by the decoder `op`.
+fn read_seen_hashes(r: &mut Cursor<'_>, op: &'static str) -> Result<Vec<Hash>, WireError> {
     let count = read_var_int(r)?;
     if count > MAX_MIX_PEERS {
-        return Err(WireError::TooManyPrevMixMsgs {
-            count,
-            max: MAX_MIX_PEERS,
-        });
+        return Err(too_many_prev_mix_msgs(op, count));
     }
     let mut seen = Vec::new();
     for _ in 0..count {
@@ -137,12 +146,11 @@ fn write_seen_hashes_unchecked(w: &mut Vec<u8>, seen: &[Hash]) {
     }
 }
 
-fn write_seen_hashes(w: &mut Vec<u8>, seen: &[Hash]) -> Result<(), WireError> {
+/// The seen-hash list with dcrd's count check, raised by the encoder
+/// `op`.
+fn write_seen_hashes(w: &mut Vec<u8>, seen: &[Hash], op: &'static str) -> Result<(), WireError> {
     if seen.len() as u64 > MAX_MIX_PEERS {
-        return Err(WireError::TooManyPrevMixMsgs {
-            count: seen.len() as u64,
-            max: MAX_MIX_PEERS,
-        });
+        return Err(too_many_prev_mix_msgs(op, seen.len() as u64));
     }
     write_var_int(w, seen.len() as u64);
     for hash in seen {
@@ -153,11 +161,15 @@ fn write_seen_hashes(w: &mut Vec<u8>, seen: &[Hash]) -> Result<(), WireError> {
 
 impl MsgMixPairReq {
     pub(crate) fn decode(r: &mut Cursor<'_>, pver: u32) -> Result<Self, WireError> {
+        const OP: &str = "MsgMixPairReq.BtcDecode";
         let (signature, identity) = decode_sig_ident(r, pver)?;
         let expiry = r.read_u32()?;
         let mix_amount = r.read_u64()? as i64;
         if mix_amount < 0 {
-            return Err(WireError::InvalidMsg);
+            return Err(WireError::InvalidMsg(MessageText::new(
+                OP,
+                "mixing pair request contains negative mixed amount",
+            )));
         }
         let script_class = read_ascii_var_string(r, MAX_MIX_PAIR_REQ_SCRIPT_CLASS_LEN)?;
         let tx_version = r.read_u16()?;
@@ -165,15 +177,18 @@ impl MsgMixPairReq {
         let message_count = r.read_u32()?;
         let input_value = r.read_u64()? as i64;
         if input_value < 0 {
-            return Err(WireError::InvalidMsg);
+            return Err(WireError::InvalidMsg(MessageText::new(
+                OP,
+                "mixing pair request contains negative input value",
+            )));
         }
 
         let count = read_var_int(r)?;
         if count > MAX_MIX_PAIR_REQ_UTXOS {
-            return Err(WireError::TooManyMixPairReqUTXOs {
-                count,
-                max: MAX_MIX_PAIR_REQ_UTXOS,
-            });
+            return Err(WireError::TooManyMixPairReqUTXOs(
+                MessageText::new(OP, "too many UTXOs in message [count %v, max %v]")
+                    .with_args(count, MAX_MIX_PAIR_REQ_UTXOS),
+            ));
         }
         let mut utxos = Vec::new();
         for _ in 0..count {
@@ -182,9 +197,18 @@ impl MsgMixPairReq {
                 index: r.read_u32()?,
                 tree: r.read_u8()? as i8,
             };
-            let script = read_var_bytes(r, MAX_MIX_PAIR_REQ_UTXO_SCRIPT_LEN)?;
-            let pub_key = read_var_bytes(r, MAX_MIX_PAIR_REQ_UTXO_PUB_KEY_LEN)?;
-            let signature = read_var_bytes(r, MAX_MIX_PAIR_REQ_UTXO_SIGNATURE_LEN)?;
+            let script =
+                read_var_bytes(r, MAX_MIX_PAIR_REQ_UTXO_SCRIPT_LEN, "MixPairReqUTXO.Script")?;
+            let pub_key = read_var_bytes(
+                r,
+                MAX_MIX_PAIR_REQ_UTXO_PUB_KEY_LEN,
+                "MixPairReqUTXO.PubKey",
+            )?;
+            let signature = read_var_bytes(
+                r,
+                MAX_MIX_PAIR_REQ_UTXO_SIGNATURE_LEN,
+                "MixPairReqUTXO.Signature",
+            )?;
             let opcode = r.read_u8()?;
             utxos.push(MixPairReqUTXO {
                 out_point,
@@ -195,14 +219,20 @@ impl MsgMixPairReq {
             });
         }
 
+        // The change output is read by dcrd `readTxOut`.
         let change = match r.read_u8()? {
             0 => None,
             1 => Some(TxOut {
                 value: r.read_u64()? as i64,
                 version: r.read_u16()?,
-                pk_script: read_var_bytes(r, crate::MAX_MESSAGE_PAYLOAD)?,
+                pk_script: read_script(r, "transaction output public key script")?,
             }),
-            _ => return Err(WireError::InvalidMsg),
+            _ => {
+                return Err(WireError::InvalidMsg(MessageText::new(
+                    OP,
+                    "invalid change TxOut encoding",
+                )));
+            }
         };
 
         let flags = r.read_u8()?;
@@ -225,23 +255,29 @@ impl MsgMixPairReq {
     }
 
     pub(crate) fn encode(&self, w: &mut Vec<u8>, pver: u32) -> Result<(), WireError> {
+        const OP: &str = "MsgMixPairReq.BtcEncode";
         if pver < MIX_VERSION {
             return Err(WireError::MsgInvalidForPVer);
         }
         if self.script_class.len() as u64 > MAX_MIX_PAIR_REQ_SCRIPT_CLASS_LEN {
-            return Err(WireError::MixPairReqScriptClassTooLong {
-                len: self.script_class.len() as u64,
-                max: MAX_MIX_PAIR_REQ_SCRIPT_CLASS_LEN,
-            });
+            return Err(WireError::MixPairReqScriptClassTooLong(
+                MessageText::new(OP, "script class length is too long [len %d, max %d]").with_args(
+                    self.script_class.len() as u64,
+                    MAX_MIX_PAIR_REQ_SCRIPT_CLASS_LEN,
+                ),
+            ));
         }
         if !is_strict_ascii(self.script_class.as_bytes()) {
-            return Err(WireError::MalformedStrictString);
+            return Err(WireError::MalformedStrictString(MessageText::new(
+                OP,
+                "script class string is not strict ASCII",
+            )));
         }
         if self.utxos.len() as u64 > MAX_MIX_PAIR_REQ_UTXOS {
-            return Err(WireError::TooManyMixPairReqUTXOs {
-                count: self.utxos.len() as u64,
-                max: MAX_MIX_PAIR_REQ_UTXOS,
-            });
+            return Err(WireError::TooManyMixPairReqUTXOs(
+                MessageText::new(OP, "too many UTXOs in message [%v]")
+                    .with_arg(self.utxos.len() as u64),
+            ));
         }
 
         w.extend_from_slice(&self.signature);
@@ -257,22 +293,24 @@ impl MsgMixPairReq {
         write_var_int(w, self.utxos.len() as u64);
         for utxo in &self.utxos {
             if utxo.script.len() as u64 > MAX_MIX_PAIR_REQ_UTXO_SCRIPT_LEN {
-                return Err(WireError::VarBytesTooLong {
-                    count: utxo.script.len() as u64,
-                    max: MAX_MIX_PAIR_REQ_UTXO_SCRIPT_LEN,
-                });
+                return Err(WireError::VarBytesTooLong(
+                    MessageText::new(OP, "UTXO script is too long [len %v, max %v]")
+                        .with_args(utxo.script.len() as u64, MAX_MIX_PAIR_REQ_UTXO_SCRIPT_LEN),
+                ));
             }
             if utxo.pub_key.len() as u64 > MAX_MIX_PAIR_REQ_UTXO_PUB_KEY_LEN {
-                return Err(WireError::VarBytesTooLong {
-                    count: utxo.pub_key.len() as u64,
-                    max: MAX_MIX_PAIR_REQ_UTXO_PUB_KEY_LEN,
-                });
+                return Err(WireError::VarBytesTooLong(
+                    MessageText::new(OP, "UTXO public key is too long [len %v, max %v]")
+                        .with_args(utxo.pub_key.len() as u64, MAX_MIX_PAIR_REQ_UTXO_PUB_KEY_LEN),
+                ));
             }
             if utxo.signature.len() as u64 > MAX_MIX_PAIR_REQ_UTXO_SIGNATURE_LEN {
-                return Err(WireError::VarBytesTooLong {
-                    count: utxo.signature.len() as u64,
-                    max: MAX_MIX_PAIR_REQ_UTXO_SIGNATURE_LEN,
-                });
+                return Err(WireError::VarBytesTooLong(
+                    MessageText::new(OP, "UTXO signature is too long [len %v, max %v]").with_args(
+                        utxo.signature.len() as u64,
+                        MAX_MIX_PAIR_REQ_UTXO_SIGNATURE_LEN,
+                    ),
+                ));
             }
             w.extend_from_slice(utxo.out_point.hash.as_bytes());
             w.extend_from_slice(&utxo.out_point.index.to_le_bytes());
@@ -362,7 +400,7 @@ impl MsgMixKeyExchange {
         let ecdh = r.take_array()?;
         let pqpk = r.take_array()?;
         let commitment = r.take_array()?;
-        let seen_prs = read_seen_hashes(r)?;
+        let seen_prs = read_seen_hashes(r, "MsgMixKeyExchange.BtcDecode")?;
         Ok(MsgMixKeyExchange {
             signature,
             identity,
@@ -390,7 +428,7 @@ impl MsgMixKeyExchange {
         w.extend_from_slice(&self.ecdh);
         w.extend_from_slice(&self.pqpk);
         w.extend_from_slice(&self.commitment);
-        write_seen_hashes(w, &self.seen_prs)
+        write_seen_hashes(w, &self.seen_prs, "MsgMixKeyExchange.BtcEncode")
     }
 
     pub(crate) fn max_payload_length(pver: u32) -> u32 {
@@ -424,10 +462,7 @@ impl MsgMixCiphertexts {
         let run = r.read_u32()?;
         let count = read_var_int(r)?;
         if count > MAX_MIX_PEERS {
-            return Err(WireError::TooManyPrevMixMsgs {
-                count,
-                max: MAX_MIX_PEERS,
-            });
+            return Err(too_many_prev_mix_msgs("MsgMixCiphertexts.BtcDecode", count));
         }
         let mut ciphertexts = Vec::new();
         for _ in 0..count {
@@ -448,17 +483,24 @@ impl MsgMixCiphertexts {
     }
 
     pub(crate) fn encode(&self, w: &mut Vec<u8>, pver: u32) -> Result<(), WireError> {
+        const OP: &str = "MsgMixCiphertexts.BtcEncode";
         if pver < MIX_VERSION {
             return Err(WireError::MsgInvalidForPVer);
         }
         if self.ciphertexts.len() != self.seen_key_exchanges.len() {
-            return Err(WireError::InvalidMsg);
+            return Err(WireError::InvalidMsg(
+                MessageText::new(
+                    OP,
+                    "differing counts of ciphertexts (%d) and seen key exchange messages (%d)",
+                )
+                .with_args(
+                    self.ciphertexts.len() as u64,
+                    self.seen_key_exchanges.len() as u64,
+                ),
+            ));
         }
         if self.ciphertexts.len() as u64 > MAX_MIX_PEERS {
-            return Err(WireError::TooManyPrevMixMsgs {
-                count: self.ciphertexts.len() as u64,
-                max: MAX_MIX_PEERS,
-            });
+            return Err(too_many_prev_mix_msgs(OP, self.ciphertexts.len() as u64));
         }
         w.extend_from_slice(&self.signature);
         w.extend_from_slice(&self.identity);
@@ -499,27 +541,47 @@ pub struct MsgMixSlotReserve {
 
 impl MsgMixSlotReserve {
     pub(crate) fn decode(r: &mut Cursor<'_>, pver: u32) -> Result<Self, WireError> {
+        const OP: &str = "MsgMixSlotReserve.BtcDecode";
         let (signature, identity) = decode_sig_ident(r, pver)?;
         let session_id = r.take_array()?;
         let run = r.read_u32()?;
 
         let mcount = read_var_int(r)?;
-        if mcount == 0 || mcount > MAX_MIX_MCOUNT {
-            return Err(WireError::InvalidMsg);
+        if mcount == 0 {
+            return Err(WireError::InvalidMsg(
+                MessageText::new(OP, "too few mixed messages [%v]").with_arg(mcount),
+            ));
+        }
+        if mcount > MAX_MIX_MCOUNT {
+            return Err(WireError::InvalidMsg(
+                MessageText::new(OP, "too many total mixed messages [%v]").with_arg(mcount),
+            ));
         }
         let kpcount = read_var_int(r)?;
-        if kpcount == 0 || kpcount > MAX_MIX_PEERS {
-            return Err(WireError::InvalidMsg);
+        if kpcount == 0 {
+            return Err(WireError::InvalidMsg(
+                MessageText::new(OP, "too few mixing peers [%v]").with_arg(kpcount),
+            ));
+        }
+        if kpcount > MAX_MIX_PEERS {
+            return Err(WireError::InvalidMsg(
+                MessageText::new(OP, "too many mixing peers [count %v, max %v]")
+                    .with_args(kpcount, MAX_MIX_PEERS),
+            ));
         }
         let mut dc_mix = Vec::new();
         for _ in 0..mcount {
             let mut row = Vec::new();
             for _ in 0..kpcount {
-                row.push(read_var_bytes(r, MAX_MIX_FIELD_VAL_LEN)?);
+                row.push(read_var_bytes(
+                    r,
+                    MAX_MIX_FIELD_VAL_LEN,
+                    "slot reservation field value",
+                )?);
             }
             dc_mix.push(row);
         }
-        let seen_ciphertexts = read_seen_hashes(r)?;
+        let seen_ciphertexts = read_seen_hashes(r, OP)?;
         Ok(MsgMixSlotReserve {
             signature,
             identity,
@@ -531,16 +593,31 @@ impl MsgMixSlotReserve {
     }
 
     pub(crate) fn encode(&self, w: &mut Vec<u8>, pver: u32) -> Result<(), WireError> {
+        const OP: &str = "MsgMixSlotReserve.BtcEncode";
         if pver < MIX_VERSION {
             return Err(WireError::MsgInvalidForPVer);
         }
         let mcount = self.dc_mix.len() as u64;
-        if mcount == 0 || mcount > MAX_MIX_MCOUNT {
-            return Err(WireError::InvalidMsg);
+        if mcount == 0 {
+            return Err(WireError::InvalidMsg(
+                MessageText::new(OP, "too few mixed messages [%v]").with_arg(mcount),
+            ));
+        }
+        if mcount > MAX_MIX_MCOUNT {
+            return Err(WireError::InvalidMsg(
+                MessageText::new(OP, "too many total mixed messages [%v]").with_arg(mcount),
+            ));
         }
         let kpcount = self.dc_mix[0].len() as u64;
-        if kpcount == 0 || kpcount > MAX_MIX_PEERS {
-            return Err(WireError::InvalidMsg);
+        if kpcount == 0 {
+            return Err(WireError::InvalidMsg(
+                MessageText::new(OP, "too few mixing peers [%v]").with_arg(kpcount),
+            ));
+        }
+        if kpcount > MAX_MIX_PEERS {
+            return Err(WireError::InvalidMsg(
+                MessageText::new(OP, "too many mixing peers [%v]").with_arg(kpcount),
+            ));
         }
 
         w.extend_from_slice(&self.signature);
@@ -551,16 +628,22 @@ impl MsgMixSlotReserve {
         write_var_int(w, kpcount);
         for row in &self.dc_mix {
             if row.len() as u64 != kpcount {
-                return Err(WireError::InvalidMsg);
+                return Err(WireError::InvalidMsg(MessageText::new(
+                    OP,
+                    "invalid matrix dimensions",
+                )));
             }
             for value in row {
                 if value.len() as u64 > MAX_MIX_FIELD_VAL_LEN {
-                    return Err(WireError::InvalidMsg);
+                    return Err(WireError::InvalidMsg(MessageText::new(
+                        OP,
+                        "value exceeds bytes necessary to represent number in field",
+                    )));
                 }
                 write_var_bytes(w, value);
             }
         }
-        write_seen_hashes(w, &self.seen_ciphertexts)
+        write_seen_hashes(w, &self.seen_ciphertexts, OP)
     }
 
     pub(crate) fn max_payload_length(pver: u32) -> u32 {
@@ -587,18 +670,26 @@ pub struct MsgMixFactoredPoly {
 
 impl MsgMixFactoredPoly {
     pub(crate) fn decode(r: &mut Cursor<'_>, pver: u32) -> Result<Self, WireError> {
+        const OP: &str = "MsgMixFactoredPoly.BtcDecode";
         let (signature, identity) = decode_sig_ident(r, pver)?;
         let session_id = r.take_array()?;
         let run = r.read_u32()?;
         let count = read_var_int(r)?;
         if count > MAX_MIX_MCOUNT {
-            return Err(WireError::InvalidMsg);
+            return Err(WireError::InvalidMsg(
+                MessageText::new(OP, "too many roots in message [count %v, max %v]")
+                    .with_args(count, MAX_MIX_MCOUNT),
+            ));
         }
         let mut roots = Vec::new();
         for _ in 0..count {
-            roots.push(read_var_bytes(r, MAX_MIX_FIELD_VAL_LEN)?);
+            roots.push(read_var_bytes(
+                r,
+                MAX_MIX_FIELD_VAL_LEN,
+                "MixFactoredPoly.Roots",
+            )?);
         }
-        let seen_slot_reserves = read_seen_hashes(r)?;
+        let seen_slot_reserves = read_seen_hashes(r, OP)?;
         Ok(MsgMixFactoredPoly {
             signature,
             identity,
@@ -610,15 +701,25 @@ impl MsgMixFactoredPoly {
     }
 
     pub(crate) fn encode(&self, w: &mut Vec<u8>, pver: u32) -> Result<(), WireError> {
+        const OP: &str = "MsgMixFactoredPoly.BtcEncode";
         if pver < MIX_VERSION {
             return Err(WireError::MsgInvalidForPVer);
         }
         if self.roots.len() as u64 > MAX_MIX_MCOUNT {
-            return Err(WireError::InvalidMsg);
+            return Err(WireError::InvalidMsg(
+                MessageText::new(
+                    OP,
+                    "too many solutions to factored polynomial [count %v, max %v]",
+                )
+                .with_args(self.roots.len() as u64, MAX_MIX_MCOUNT),
+            ));
         }
         for root in &self.roots {
             if root.len() as u64 > MAX_MIX_FIELD_VAL_LEN {
-                return Err(WireError::InvalidMsg);
+                return Err(WireError::InvalidMsg(MessageText::new(
+                    OP,
+                    "root exceeds bytes necessary to represent number in field",
+                )));
             }
         }
         w.extend_from_slice(&self.signature);
@@ -629,7 +730,7 @@ impl MsgMixFactoredPoly {
         for root in &self.roots {
             write_var_bytes(w, root);
         }
-        write_seen_hashes(w, &self.seen_slot_reserves)
+        write_seen_hashes(w, &self.seen_slot_reserves, OP)
     }
 
     pub(crate) fn max_payload_length(pver: u32) -> u32 {
@@ -637,8 +738,27 @@ impl MsgMixFactoredPoly {
     }
 }
 
-/// Decode the x/y/msize-prefixed DC-net matrix (dcrd `readMixVects`).
-fn read_mix_vects(r: &mut Cursor<'_>) -> Result<Vec<MixVect>, WireError> {
+/// dcrd's `ErrInvalidMsg` for a DC-net vector dimension over
+/// [`MAX_MIX_MCOUNT`] (`readMixVects`, `readMixVect`, `writeMixVect`).
+fn mix_vect_too_large(op: &'static str) -> WireError {
+    WireError::InvalidMsg(MessageText::new(
+        op,
+        "DC-net mix vector dimensions are too large for maximum message count",
+    ))
+}
+
+/// dcrd's `ErrInvalidMsg` for a DC-net message size other than
+/// [`MIX_MSG_SIZE`] (`readMixVects`, `readMixVect`).
+fn mix_msg_size_mismatch(op: &'static str, msize: u64) -> WireError {
+    WireError::InvalidMsg(
+        MessageText::new(op, "mixed message length must be %d [got: %d]")
+            .with_args(MIX_MSG_SIZE as u64, msize),
+    )
+}
+
+/// Decode the x/y/msize-prefixed DC-net matrix (dcrd `readMixVects`),
+/// for the decoder `op`.
+fn read_mix_vects(r: &mut Cursor<'_>, op: &'static str) -> Result<Vec<MixVect>, WireError> {
     let x = read_var_int(r)?;
     if x == 0 {
         return Ok(Vec::new());
@@ -646,10 +766,10 @@ fn read_mix_vects(r: &mut Cursor<'_>) -> Result<Vec<MixVect>, WireError> {
     let y = read_var_int(r)?;
     let msize = read_var_int(r)?;
     if x > MAX_MIX_MCOUNT || y > MAX_MIX_MCOUNT {
-        return Err(WireError::InvalidMsg);
+        return Err(mix_vect_too_large(op));
     }
     if msize != MIX_MSG_SIZE as u64 {
-        return Err(WireError::InvalidMsg);
+        return Err(mix_msg_size_mismatch(op, msize));
     }
     let mut vecs = Vec::new();
     for _ in 0..x {
@@ -696,11 +816,12 @@ pub struct MsgMixDCNet {
 
 impl MsgMixDCNet {
     pub(crate) fn decode(r: &mut Cursor<'_>, pver: u32) -> Result<Self, WireError> {
+        const OP: &str = "MsgMixDCNet.BtcDecode";
         let (signature, identity) = decode_sig_ident(r, pver)?;
         let session_id = r.take_array()?;
         let run = r.read_u32()?;
-        let dc_net = read_mix_vects(r)?;
-        let seen_slot_reserves = read_seen_hashes(r)?;
+        let dc_net = read_mix_vects(r, OP)?;
+        let seen_slot_reserves = read_seen_hashes(r, OP)?;
         Ok(MsgMixDCNet {
             signature,
             identity,
@@ -733,12 +854,20 @@ impl MsgMixDCNet {
         pver: u32,
         hashing: bool,
     ) -> Result<(), WireError> {
+        const OP: &str = "MsgMixDCNet.BtcEncode";
         if pver < MIX_VERSION {
             return Err(WireError::MsgInvalidForPVer);
         }
         let mcount = self.dc_net.len() as u64;
-        if !hashing && (mcount == 0 || mcount > MAX_MIX_MCOUNT) {
-            return Err(WireError::InvalidMsg);
+        if !hashing && mcount == 0 {
+            return Err(WireError::InvalidMsg(
+                MessageText::new(OP, "too few mixed messages [%v]").with_arg(mcount),
+            ));
+        }
+        if !hashing && mcount > MAX_MIX_MCOUNT {
+            return Err(WireError::InvalidMsg(
+                MessageText::new(OP, "too many total mixed messages [%v]").with_arg(mcount),
+            ));
         }
         w.extend_from_slice(&self.signature);
         w.extend_from_slice(&self.identity);
@@ -749,7 +878,7 @@ impl MsgMixDCNet {
             write_seen_hashes_unchecked(w, &self.seen_slot_reserves);
             return Ok(());
         }
-        write_seen_hashes(w, &self.seen_slot_reserves)
+        write_seen_hashes(w, &self.seen_slot_reserves, OP)
     }
 
     pub(crate) fn max_payload_length(pver: u32) -> u32 {
@@ -781,7 +910,7 @@ impl MsgMixConfirm {
         let session_id = r.take_array()?;
         let run = r.read_u32()?;
         let mix = MsgTx::decode(r)?;
-        let seen_dc_nets = read_seen_hashes(r)?;
+        let seen_dc_nets = read_seen_hashes(r, "MsgMixConfirm.BtcDecode")?;
         Ok(MsgMixConfirm {
             signature,
             identity,
@@ -801,7 +930,7 @@ impl MsgMixConfirm {
         w.extend_from_slice(&self.session_id);
         w.extend_from_slice(&self.run.to_le_bytes());
         self.mix.encode_into(w);
-        write_seen_hashes(w, &self.seen_dc_nets)
+        write_seen_hashes(w, &self.seen_dc_nets, "MsgMixConfirm.BtcEncode")
     }
 
     pub(crate) fn max_payload_length(pver: u32) -> u32 {
@@ -833,6 +962,7 @@ pub struct MsgMixSecrets {
 
 impl MsgMixSecrets {
     pub(crate) fn decode(r: &mut Cursor<'_>, pver: u32) -> Result<Self, WireError> {
+        const OP: &str = "MsgMixSecrets.BtcDecode";
         let (signature, identity) = decode_sig_ident(r, pver)?;
         let session_id = r.take_array()?;
         let run = r.read_u32()?;
@@ -840,11 +970,18 @@ impl MsgMixSecrets {
 
         let num_srs = read_var_int(r)?;
         if num_srs > MAX_MIX_MCOUNT {
-            return Err(WireError::InvalidMsg);
+            return Err(WireError::InvalidMsg(
+                MessageText::new(OP, "too many total mixed messages [count %v, max %v]")
+                    .with_args(num_srs, MAX_MIX_MCOUNT),
+            ));
         }
         let mut slot_reserve_msgs = Vec::new();
         for _ in 0..num_srs {
-            slot_reserve_msgs.push(read_var_bytes(r, MAX_MIX_FIELD_VAL_LEN)?);
+            slot_reserve_msgs.push(read_var_bytes(
+                r,
+                MAX_MIX_FIELD_VAL_LEN,
+                "slot reservation mixed message",
+            )?);
         }
 
         // Single MixVect (dcrd readMixVect): count, then message size when
@@ -854,17 +991,17 @@ impl MsgMixSecrets {
         if n > 0 {
             let msize = read_var_int(r)?;
             if n > MAX_MIX_MCOUNT {
-                return Err(WireError::InvalidMsg);
+                return Err(mix_vect_too_large(OP));
             }
             if msize != MIX_MSG_SIZE as u64 {
-                return Err(WireError::InvalidMsg);
+                return Err(mix_msg_size_mismatch(OP, msize));
             }
             for _ in 0..n {
                 dc_net_msgs.push(r.take_array()?);
             }
         }
 
-        let seen_secrets = read_seen_hashes(r)?;
+        let seen_secrets = read_seen_hashes(r, OP)?;
         Ok(MsgMixSecrets {
             signature,
             identity,
@@ -878,15 +1015,21 @@ impl MsgMixSecrets {
     }
 
     pub(crate) fn encode(&self, w: &mut Vec<u8>, pver: u32) -> Result<(), WireError> {
+        const OP: &str = "MsgMixSecrets.BtcEncode";
         if pver < MIX_VERSION {
             return Err(WireError::MsgInvalidForPVer);
+        }
+        // dcrd checks the seen count before writing anything, so it
+        // wins over the DC-net vector's limit.
+        if self.seen_secrets.len() as u64 > MAX_MIX_PEERS {
+            return Err(too_many_prev_mix_msgs(OP, self.seen_secrets.len() as u64));
         }
         // Note: like dcrd, the slot reserve list is *not* count-checked on
         // encode (an oversized list only fails at the framing layer via the
         // max payload); only the DC-net vector carries an encode-side limit
         // (dcrd `writeMixVect`).
         if self.dc_net_msgs.len() as u64 > MAX_MIX_MCOUNT {
-            return Err(WireError::InvalidMsg);
+            return Err(mix_vect_too_large(OP));
         }
         w.extend_from_slice(&self.signature);
         w.extend_from_slice(&self.identity);
@@ -904,7 +1047,7 @@ impl MsgMixSecrets {
                 w.extend_from_slice(msg);
             }
         }
-        write_seen_hashes(w, &self.seen_secrets)
+        write_seen_hashes(w, &self.seen_secrets, OP)
     }
 
     pub(crate) fn max_payload_length(pver: u32) -> u32 {

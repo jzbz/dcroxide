@@ -4,10 +4,18 @@
 //! decoding edges) are exactly where Ed25519 reimplementations fork chains
 //! (project brief risk R4), so inputs are biased hard toward those edges:
 //! non-canonical y encodings, x = 0 sign-bit cases, S at and around the
-//! group order, and the raw verify layer that bypasses parse validation.
+//! group order, public keys carrying a small-order torsion component, and
+//! the raw verify layer that bypasses parse validation.
 
+// Scalar and group arithmetic in the torsion rows is modular.
+#![allow(clippy::arithmetic_side_effects)]
+
+use curve25519_dalek::constants::EIGHT_TORSION;
+use curve25519_dalek::edwards::EdwardsPoint;
+use curve25519_dalek::scalar::Scalar;
 use dcroxide_dcrec::edwards::{SecretKey, parse_pub_key, parse_signature, sign, verify_raw};
 use dcroxide_testutil::{SplitMix64, hex, oracle_or_skip};
+use sha2::{Digest, Sha512};
 
 /// The Ed25519 group order L as 32 little-endian bytes.
 const ELL_LE: [u8; 32] = [
@@ -242,4 +250,218 @@ fn ed25519_verify_matches_dcrd_oracle() {
             assert_eq!(ours, theirs, "case {i} ({name}): verify verdict");
         }
     }
+}
+
+/// A uniformly drawn scalar.
+fn random_scalar(rng: &mut SplitMix64) -> Scalar {
+    let mut wide = [0u8; 64];
+    rng.fill(&mut wide);
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+/// The Ed25519 challenge `k = SHA-512(R || A || m) mod L` over the
+/// encodings as given.
+fn challenge(r: &[u8; 32], a: &[u8; 32], msg: &[u8]) -> Scalar {
+    let mut h = Sha512::new();
+    h.update(r);
+    h.update(a);
+    h.update(msg);
+    Scalar::from_bytes_mod_order_wide(&h.finalize().into())
+}
+
+/// `k mod 8`, which fixes `k*T` for a point `T` of order dividing 8.
+fn challenge_mod_8(k: &Scalar) -> u8 {
+    k.as_bytes()[0] & 7
+}
+
+/// A signature by the key with secret scalar `a` and public point `A`,
+/// over a message ground until the challenge is `want` modulo 8, so
+/// that `k*T` for the torsion component `T` of `A` is chosen.  Returns
+/// the message, the signature and the challenge.
+fn ground_signature(
+    rng: &mut SplitMix64,
+    a: &Scalar,
+    pub_bytes: &[u8; 32],
+    want: u8,
+) -> (Vec<u8>, [u8; 64], Scalar) {
+    let r = random_scalar(rng);
+    let r_bytes = EdwardsPoint::mul_base(&r).compress().to_bytes();
+    loop {
+        let mut msg = vec![0u8; 32];
+        rng.fill(&mut msg);
+        let k = challenge(&r_bytes, pub_bytes, &msg);
+        if challenge_mod_8(&k) != want {
+            continue;
+        }
+        let s = r + k * a;
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&r_bytes);
+        sig[32..].copy_from_slice(s.as_bytes());
+        return (msg, sig, k);
+    }
+}
+
+/// The verification equation with the negation on the scalar,
+/// `R' = s*B + (L-k)*A`: the form `verify_raw` must not use, since it
+/// agrees with agl's `s*B + k*(-A)` only on the prime-order subgroup.
+fn scalar_negation_verifies(pub_point: &EdwardsPoint, sig: &[u8; 64], k: &Scalar) -> bool {
+    let s_bytes: [u8; 32] = sig[32..].try_into().expect("32 bytes");
+    let s = Scalar::from_bytes_mod_order(s_bytes);
+    let r_prime = EdwardsPoint::vartime_double_scalar_mul_basepoint(&(-k), pub_point, &s);
+    r_prime.compress().as_bytes() == &sig[..32]
+}
+
+/// The torsion guard for `verify_raw` (the RVW-004 fix): a pubkey
+/// `A = a*B + T` with `T` of order 8 verifies exactly when `k*T` is
+/// the identity, i.e. `k = 0 mod 8`, because agl negates the point
+/// (`ed25519.go:106-107`) and computes `s*B - k*A`.  Negating the
+/// scalar instead leaves `(L-k)*T`, and `L = 5 mod 8`, so that form
+/// accepts at `k = 5 mod 8` and rejects at `k = 0 mod 8`.  Both
+/// witnesses are built here and checked against both forms, so a
+/// return to the scalar form fails this test without the oracle.
+#[test]
+fn ed25519_torsion_key_verifies_as_agl_does() {
+    let mut rng = SplitMix64(0x7045_1054);
+    // T has order exactly 8: 8*T is the identity and 4*T is not.
+    let torsion = EIGHT_TORSION[1];
+    assert!(torsion.is_small_order());
+    assert_ne!(
+        Scalar::from(4u8) * torsion,
+        EdwardsPoint::default(),
+        "the generator of the 8-torsion"
+    );
+    for _ in 0..8 {
+        let a = random_scalar(&mut rng);
+        let pub_point = EdwardsPoint::mul_base(&a) + torsion;
+        let pub_bytes = pub_point.compress().to_bytes();
+        let pub_key = parse_pub_key(&pub_bytes).expect("torsion-carrying keys parse");
+
+        // k = 0 mod 8: agl accepts, the scalar form rejects.
+        let (msg, sig, k) = ground_signature(&mut rng, &a, &pub_bytes, 0);
+        assert!(verify_raw(&pub_key, &msg, &sig), "k = 0 mod 8 must verify");
+        assert!(!scalar_negation_verifies(&pub_point, &sig, &k));
+
+        // k = 5 mod 8: agl rejects, the scalar form accepts.
+        let (msg, sig, k) = ground_signature(&mut rng, &a, &pub_bytes, 5);
+        assert!(
+            !verify_raw(&pub_key, &msg, &sig),
+            "k = 5 mod 8 must not verify"
+        );
+        assert!(scalar_negation_verifies(&pub_point, &sig, &k));
+    }
+}
+
+/// Torsion-carrying pubkeys through the dcrd oracle: the eight
+/// small-order points themselves (whose discrete log is zero, so any
+/// `R = r*B, S = r` signs for them when `k*T` vanishes) and composites
+/// `a*B + T` for each of them, with challenges ground to every residue
+/// modulo 8.
+#[test]
+fn ed25519_verify_torsion_keys_match_dcrd_oracle() {
+    let Some(mut oracle) = oracle_or_skip() else {
+        return;
+    };
+    let mut rng = SplitMix64::from_entropy("ed25519 torsion verify differential");
+
+    let mut accepted = 0;
+    for (i, torsion) in EIGHT_TORSION.iter().enumerate() {
+        for composite in [false, true] {
+            let a = if composite {
+                random_scalar(&mut rng)
+            } else {
+                Scalar::ZERO
+            };
+            let pub_point = EdwardsPoint::mul_base(&a) + torsion;
+            let pub_bytes = pub_point.compress().to_bytes();
+            for want in 0..8u8 {
+                let (msg, sig, _) = ground_signature(&mut rng, &a, &pub_bytes, want);
+                let name = format!("T{i} composite={composite} k={want} mod 8");
+
+                let mut req = Vec::with_capacity(96 + msg.len());
+                req.extend_from_slice(&pub_bytes);
+                req.extend_from_slice(&sig);
+                req.extend_from_slice(&msg);
+                let resp = oracle.call("ed25519_verify", &req);
+                let ours = parse_pub_key(&pub_bytes).map(|pk| verify_raw(&pk, &msg, &sig));
+                match (ours, resp.get("error")) {
+                    (Ok(ours), None) => {
+                        let theirs = resp["result"].as_str().expect("result") == "true";
+                        assert_eq!(ours, theirs, "{name}: verify verdict");
+                        accepted += usize::from(ours);
+                    }
+                    (Err(_), Some(_)) => {}
+                    (ours, err) => {
+                        panic!("{name}: parse verdict mismatch: ours {ours:?}, oracle {err:?}")
+                    }
+                }
+            }
+        }
+    }
+    // Every key accepts at k = 0 mod 8, so the rows are not vacuous.
+    assert!(accepted >= 16, "only {accepted} torsion rows verified");
+}
+
+/// A sweep over random torsion-carrying keys, the key class
+/// `fuzz/fuzz_targets/dcrec_ed25519.rs` cannot build (that crate has no
+/// group arithmetic to add a torsion point with).  For a key
+/// `A = a*B + T`, any of the eight small-order `T` and random `a`, zero
+/// included, an honest signature `(r*B, r + k*a)` over a random message
+/// satisfies agl's `s*B - k*A = R - k*T`, so `verify_raw` must accept it
+/// exactly when `k*T` is the identity; the scalar-negation form instead
+/// accepts exactly when `(L-k)*T` is, and the two verdicts must be seen
+/// to differ.
+#[test]
+fn ed25519_random_torsion_keys_verify_as_agl_does() {
+    let mut rng = SplitMix64::from_entropy("ed25519 torsion key sweep");
+    let identity = EdwardsPoint::default();
+
+    let (mut accepted, mut rejected, mut forms_differ) = (0, 0, 0);
+    // About 31% of the cases accept (all of the identity's, half of the
+    // order-2 point's, a quarter of the order-4 points' and an eighth of
+    // the order-8 points'), and the forms differ on about 37%.
+    for i in 0..400 {
+        let torsion = EIGHT_TORSION[rng.below(8) as usize];
+        let a = if rng.below(8) == 0 {
+            Scalar::ZERO
+        } else {
+            random_scalar(&mut rng)
+        };
+        let pub_point = EdwardsPoint::mul_base(&a) + torsion;
+        let pub_bytes = pub_point.compress().to_bytes();
+        let Ok(pub_key) = parse_pub_key(&pub_bytes) else {
+            continue;
+        };
+
+        let r = random_scalar(&mut rng);
+        let r_bytes = EdwardsPoint::mul_base(&r).compress().to_bytes();
+        let mut msg = vec![0u8; rng.below(64) as usize];
+        rng.fill(&mut msg);
+        let k = challenge(&r_bytes, &pub_bytes, &msg);
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&r_bytes);
+        sig[32..].copy_from_slice((r + k * a).as_bytes());
+
+        // `8*T` is the identity, so `k*T` is `T` added `k mod 8` times.
+        let k_torsion = (0..challenge_mod_8(&k)).fold(identity, |acc, _| acc + torsion);
+        let agl = k_torsion == identity;
+        assert_eq!(
+            verify_raw(&pub_key, &msg, &sig),
+            agl,
+            "case {i}: key {}, message {}, signature {}",
+            hex(&pub_bytes),
+            hex(&msg),
+            hex(&sig)
+        );
+        let scalar_form = scalar_negation_verifies(&pub_point, &sig, &k);
+        if agl {
+            accepted += 1;
+        } else {
+            rejected += 1;
+        }
+        forms_differ += usize::from(agl != scalar_form);
+    }
+    assert!(
+        accepted > 40 && rejected > 40 && forms_differ > 40,
+        "accepted {accepted}, rejected {rejected}, forms differ {forms_differ}"
+    );
 }

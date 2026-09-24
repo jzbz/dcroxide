@@ -148,7 +148,7 @@ fn addrv2_vectors() {
                     Err(e) => {
                         // dcrd reports short reads as plain io errors.
                         let got = match e {
-                            WireError::UnexpectedEof => "io",
+                            WireError::Eof | WireError::UnexpectedEof => "io",
                             ref other => err_name(other),
                         };
                         assert_eq!(got, want_err, "decode {name}: error kind");

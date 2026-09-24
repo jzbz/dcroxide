@@ -201,10 +201,19 @@ mod tests {
     #[test]
     fn truncated_is_eof() {
         let bytes = sample_header().serialize();
-        for len in [0, 1, 90, 179] {
+        // dcrd reads the header field by field, so a cut at a field
+        // boundary reads nothing (io.EOF) and one inside a field reads
+        // part of it (io.ErrUnexpectedEOF).
+        for (len, want) in [
+            (0, WireError::Eof),
+            (1, WireError::UnexpectedEof),
+            (36, WireError::Eof),
+            (90, WireError::UnexpectedEof),
+            (179, WireError::UnexpectedEof),
+        ] {
             assert_eq!(
                 BlockHeader::from_bytes(&bytes[..len]),
-                Err(WireError::UnexpectedEof),
+                Err(want),
                 "len {len}"
             );
         }

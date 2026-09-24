@@ -20,10 +20,13 @@
 // caller observes them, matching assignField's err != nil checks.
 #![allow(clippy::result_unit_err)]
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
 use crate::gotype::{GoType, GoValue, Kind, resolve};
+
+mod isprint;
 
 // ---------------------------------------------------------------------
 // Float formatting.
@@ -56,7 +59,7 @@ fn nonfinite_text(v: f64) -> Option<&'static str> {
 /// the non-finite floats as `inf`/`NaN`, which have no `e`) decomposes
 /// to a plain zero rather than panicking.  Callers guard those values
 /// with [`nonfinite_text`] and never observe the fallback.
-fn shortest_digits(repr: String) -> (bool, String, i32) {
+fn split_shortest(repr: String) -> (bool, String, i32) {
     // `format!("{:e}")` yields `d.ddd...e<exp>` (shortest digits).
     let neg = repr.starts_with('-');
     let s = repr.trim_start_matches('-');
@@ -68,6 +71,104 @@ fn shortest_digits(repr: String) -> (bool, String, i32) {
     // Strip trailing zeros; the mantissa of a shortest form has none,
     // except the plain "0".
     (neg, digits, exp + 1)
+}
+
+/// The shortest round-trip digits of a `float64` as Go's `strconv`
+/// picks them ([`split_shortest`]'s decomposition).
+fn shortest_digits(v: f64) -> (bool, String, i32) {
+    let (neg, digits, dp) = split_shortest(format!("{v:e}"));
+    even_on_tie(v, neg, digits, dp, |text| {
+        text.parse::<f64>().is_ok_and(|p| p == v.abs())
+    })
+}
+
+/// The shortest round-trip digits of a `float32` as Go's `strconv`
+/// picks them with `bitSize` 32.
+fn shortest_digits32(v: f32) -> (bool, String, i32) {
+    let (neg, digits, dp) = split_shortest(format!("{v:e}"));
+    even_on_tie(f64::from(v), neg, digits, dp, |text| {
+        text.parse::<f32>().is_ok_and(|p| p == v.abs())
+    })
+}
+
+/// Resolve an exact tie between two shortest candidates the way Go
+/// does.
+///
+/// When a value lies exactly halfway between two decimals of the
+/// shortest length that both parse back to it, Go's shortest formatter
+/// keeps the one whose final digit is even (Go 1.26.5's Dragonbox,
+/// `internal/strconv/ftoadbox.go`: "round to nearest, tie to even"),
+/// and Rust's `{:e}` takes the one away from zero.  Only an odd final
+/// digit can therefore be Go's wrong choice; the halfway test is exact.
+/// `v` is the value (a `float32` widened exactly), `digits`/`dp` Rust's
+/// choice, and `round_trips` whether a candidate `<digits>e<exp>`
+/// parses back to `|v|` at the value's own precision: Go chooses only
+/// among candidates that do.
+fn even_on_tie(
+    v: f64,
+    neg: bool,
+    digits: String,
+    dp: i32,
+    round_trips: impl Fn(&str) -> bool,
+) -> (bool, String, i32) {
+    if !digits.ends_with(['1', '3', '5', '7', '9']) {
+        return (neg, digits, dp);
+    }
+    // Shortest digits never exceed seventeen, so this cannot fail.
+    let Ok(d) = digits.parse::<u64>() else {
+        return (neg, digits, dp);
+    };
+    let n = digits.len() as i32;
+    // |v| = d * 10^q with the digits Rust chose.
+    let q = dp - n;
+
+    // |v| = m * 2^e with m odd; zero has no odd final digit.
+    let bits = v.abs().to_bits();
+    let biased = (bits >> 52) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (m, e) = if biased == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1u64 << 52), biased - 1075)
+    };
+    let tz = m.trailing_zeros();
+    let (m, e) = (m >> tz, e + tz as i32);
+
+    // Halfway iff m * 2^e == twice * 5^q * 2^(q-1), with twice = 2d -+ 1
+    // odd: the powers of two and the odd parts must both agree.  Any
+    // overflow means the odd parts differ, since each is below 2^58.
+    if e != q - 1 {
+        return (neg, digits, dp);
+    }
+    for (neighbour, twice) in [(d - 1, 2 * d - 1), (d + 1, 2 * d + 1)] {
+        let odd_parts_match = if q >= 0 {
+            5u128
+                .checked_pow(q.unsigned_abs())
+                .and_then(|p| p.checked_mul(u128::from(twice)))
+                == Some(u128::from(m))
+        } else {
+            5u128
+                .checked_pow(q.unsigned_abs())
+                .and_then(|p| p.checked_mul(u128::from(m)))
+                == Some(u128::from(twice))
+        };
+        if !odd_parts_match {
+            continue;
+        }
+        // The even neighbour, trailing zeros trimmed; a carry into a
+        // new leading digit moves the decimal point.
+        let text = neighbour.to_string();
+        let even_dp = dp + (text.len() as i32 - n);
+        let even = text.trim_end_matches('0');
+        if even.is_empty() {
+            continue;
+        }
+        let candidate = format!("{even}e{}", even_dp - even.len() as i32);
+        if round_trips(&candidate) {
+            return (neg, even.to_string(), even_dp);
+        }
+    }
+    (neg, digits, dp)
 }
 
 /// Render the `%f`-style form from digits and decimal point position
@@ -149,19 +250,22 @@ fn format_float_json_parts(neg: bool, digits: String, dp: i32, use_e: bool) -> S
 /// Format a `float64` exactly as Go's `encoding/json` does.
 ///
 /// Go's encoder has no rendering for `NaN` and `±Inf`: it aborts the
-/// whole marshal with `json: unsupported value`.  This signature
-/// cannot fail and the decoder never produces a non-finite `float64`
-/// (`decode_number` rejects one), so such a value — only reachable from
-/// a hand-built [`GoValue`] — is emitted as the JSON `null` literal,
-/// which keeps the document parseable instead of panicking or writing
-/// a bare `+Inf` that no JSON reader accepts.
+/// whole marshal with `json: unsupported value`.  The decoder never
+/// produces a non-finite `float64` (`decode_number` rejects one), but a
+/// handler can compute one -- getvoteinfo's choice progress is `0/0`
+/// when no vote of the version has been cast yet -- so the failure is
+/// real: [`try_encode`] reports it, and a reply marshalled through it is
+/// dropped as dcrd drops one.  This signature cannot fail, so for the
+/// infallible [`encode`] such a value is emitted as the JSON `null`
+/// literal, which keeps the document parseable instead of panicking or
+/// writing a bare `+Inf` that no JSON reader accepts.
 pub fn format_float_json(v: f64) -> String {
     if !v.is_finite() {
         return "null".to_string();
     }
     let abs = v.abs();
     let use_e = abs != 0.0 && (abs < 1e-6 || abs >= 1e21);
-    let (neg, digits, dp) = shortest_digits(format!("{v:e}"));
+    let (neg, digits, dp) = shortest_digits(v);
     format_float_json_parts(neg, digits, dp, use_e)
 }
 
@@ -173,7 +277,7 @@ pub fn format_float_json32(v: f32) -> String {
     }
     let abs = v.abs();
     let use_e = abs != 0.0 && (abs < 1e-6 || abs >= 1e21);
-    let (neg, digits, dp) = shortest_digits(format!("{v:e}"));
+    let (neg, digits, dp) = shortest_digits32(v);
     format_float_json_parts(neg, digits, dp, use_e)
 }
 
@@ -184,7 +288,7 @@ pub fn format_float_f(v: f64) -> String {
     if let Some(text) = nonfinite_text(v) {
         return text.to_string();
     }
-    let (neg, digits, dp) = shortest_digits(format!("{v:e}"));
+    let (neg, digits, dp) = shortest_digits(v);
     fmt_f(neg, &digits, dp)
 }
 
@@ -193,7 +297,7 @@ pub fn format_float_g(v: f64) -> String {
     if let Some(text) = nonfinite_text(v) {
         return text.to_string();
     }
-    let (neg, digits, dp) = shortest_digits(format!("{v:e}"));
+    let (neg, digits, dp) = shortest_digits(v);
     let exp = dp - 1;
     if exp < -4 || exp >= 6 {
         fmt_e(neg, &digits, dp)
@@ -207,7 +311,7 @@ pub fn format_float_g32(v: f32) -> String {
     if let Some(text) = nonfinite_text(v as f64) {
         return text.to_string();
     }
-    let (neg, digits, dp) = shortest_digits(format!("{v:e}"));
+    let (neg, digits, dp) = shortest_digits32(v);
     let exp = dp - 1;
     if exp < -4 || exp >= 6 {
         fmt_e(neg, &digits, dp)
@@ -222,13 +326,19 @@ pub fn format_float_g32(v: f32) -> String {
 
 /// Append a JSON string with Go `encoding/json` escaping (HTML-unsafe
 /// characters and U+2028/U+2029 escaped; other valid UTF-8 emitted
-/// verbatim).
+/// verbatim).  The control characters follow `appendString`'s switch
+/// (`encoding/json/encode.go`): `\b`, `\f`, `\n`, `\r` and `\t` by
+/// name and the rest as `\u00XX`.  Go has named `\b` and `\f` since
+/// 1.22, older than any toolchain dcrd's `go.mod` (`go 1.25.0`) builds
+/// with.
 pub fn append_json_string(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -246,8 +356,16 @@ pub fn append_json_string(out: &mut String, s: &str) {
     out.push('"');
 }
 
-/// Quote a string like Go's `strconv.Quote` (the `%q` verb) for the
-/// ASCII shapes that appear in dcrjson messages and usage text.
+/// Quote a string exactly like Go's `strconv.Quote` (the `%q` verb):
+/// `appendQuotedWith` over `appendEscapedRune` (`strconv/quote.go`).
+///
+/// A double quote and a backslash are backslashed, and every rune
+/// `strconv.IsPrint` accepts is kept.  Otherwise the seven C escapes
+/// are named (`\a \b \f \n \r \t \v`), the other ASCII controls and DEL
+/// are `\xNN`, and every other rune is `\uNNNN` or `\UNNNNNNNN` -- a
+/// no-break space, a soft hyphen, a zero-width space, a private-use or
+/// an unassigned rune among them.  A `&str` is well-formed UTF-8, so
+/// Go's `\xNN` for a byte that begins no valid encoding never arises.
 pub fn go_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -255,28 +373,47 @@ pub fn go_quote(s: &str) -> String {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
+            c if isprint::is_print(c) => out.push(c),
+            '\u{07}' => out.push_str("\\a"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
-            c => out.push(c),
+            '\u{0b}' => out.push_str("\\v"),
+            c if c < ' ' || c == '\u{7f}' => out.push_str(&format!("\\x{:02x}", u32::from(c))),
+            c if u32::from(c) < 0x1_0000 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push_str(&format!("\\U{:08x}", u32::from(c))),
         }
     }
     out.push('"');
     out
 }
 
-/// Quote a character like Go's json scanner `quoteChar` helper.
+/// Quote a byte like Go's json scanner `quoteChar` helper
+/// (`encoding/json/scanner.go`): `strconv.Quote(string(c))` with the
+/// quote characters swapped.
+///
+/// `string(c)` converts the byte as an integer, so it quotes the rune
+/// U+0000..U+00FF, not the byte: 0xff is `'ÿ'` and 0x80 is `'\u0080'`,
+/// whatever the byte meant in the input.  `strconv.Quote` keeps what
+/// `strconv.IsPrint` calls printable -- printable ASCII and U+00A1..U+00FF
+/// but the soft hyphen -- names the seven C escapes, spells the other
+/// ASCII controls `\xNN` and every other rune `\uNNNN`, and backslashes
+/// a backslash.  This is Go 1.26's `encoding/json`, the toolchain dcrd's
+/// release image builds with (`contrib/docker/Dockerfile`); a toolchain
+/// that builds the package on its v2 implementation spells a high byte
+/// `'\xff'` instead.
 fn quote_char(c: u8) -> String {
+    // The quote characters are the special cases, different from
+    // quoted strings.
     match c {
         b'\'' => "'\\''".to_string(),
         b'"' => "'\"'".to_string(),
-        c if (0x20..0x7f).contains(&c) => format!("'{}'", c as char),
         c => {
-            // Go quotes the rune and swaps the quote characters.
-            let q = format!("{:?}", c as char); // e.g. '\u{1}'
-            let _ = q;
-            format!("'\\x{c:02x}'")
+            // The quoted string, with different quotation marks.
+            let s = go_quote(char::from(c).encode_utf8(&mut [0; 4]));
+            format!("'{}'", &s[1..s.len() - 1])
         }
     }
 }
@@ -341,8 +478,14 @@ pub fn go_parse_int(s: &str) -> Result<i64, ()> {
     if s.is_empty() {
         return Err(());
     }
-    let neg = s.starts_with('-');
-    let mag = go_parse_uint_mag(s.trim_start_matches(['+', '-']), s)?;
+    // Pick off exactly one leading sign; a second one reaches the
+    // unsigned parse and fails there, as in Go's ParseInt.
+    let (neg, unsigned) = match s.as_bytes()[0] {
+        b'+' => (false, &s[1..]),
+        b'-' => (true, &s[1..]),
+        _ => (false, s),
+    };
+    let mag = go_parse_uint_mag(unsigned, s)?;
     if neg {
         if mag > (i64::MAX as u64) + 1 {
             return Err(());
@@ -413,8 +556,13 @@ pub fn go_parse_float(s: &str) -> Result<f64, ()> {
         return Err(());
     }
     let lower = s.to_ascii_lowercase();
-    let body = lower.trim_start_matches(['+', '-']);
-    let neg = lower.starts_with('-');
+    // Go's `special` takes at most one sign before the name, so "+-inf"
+    // names no special value and fails the numeric parse below.
+    let (neg, body) = match lower.as_bytes()[0] {
+        b'+' => (false, &lower[1..]),
+        b'-' => (true, &lower[1..]),
+        _ => (false, lower.as_str()),
+    };
     if body == "inf" || body == "infinity" {
         return Ok(if neg {
             f64::NEG_INFINITY
@@ -423,7 +571,7 @@ pub fn go_parse_float(s: &str) -> Result<f64, ()> {
         });
     }
     if body == "nan" {
-        if lower.starts_with(['+', '-']) {
+        if body.len() != lower.len() {
             return Err(());
         }
         return Ok(f64::NAN);
@@ -446,51 +594,237 @@ pub fn go_parse_float(s: &str) -> Result<f64, ()> {
     Ok(v)
 }
 
-/// Parse a hexadecimal float literal (Go `0x1.8p3` forms).
+/// Parse a hexadecimal float literal (Go `0x1.8p3` forms) exactly as
+/// Go's `ParseFloat` does: the hex branch of `readFloat`, which keeps
+/// the first sixteen significant digits in a `uint64` and records
+/// whether any later digit was non-zero, then `atofHex`, which rounds
+/// that mantissa once to 53 bits -- to nearest, ties to even, through
+/// the subnormal range -- rather than accumulating it in a float
+/// (`internal/strconv/atof.go`).  The underscores are already checked
+/// and removed.
 fn go_parse_hex_float(s: &str) -> Result<f64, ()> {
-    let neg = s.starts_with('-');
-    let body = s.trim_start_matches(['+', '-']);
-    let lower = body.to_ascii_lowercase();
-    let rest = lower.strip_prefix("0x").ok_or(())?;
-    let (mant, exp) = match rest.split_once('p') {
-        Some((m, e)) => (m, e.parse::<i32>().map_err(|_| ())?),
-        None => return Err(()), // Go requires a 'p' exponent.
-    };
-    let (int_part, frac_part) = match mant.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (mant, ""),
-    };
-    if int_part.is_empty() && frac_part.is_empty() {
+    let b = s.as_bytes();
+    let mut i = 0;
+
+    // Optional sign.
+    let mut neg = false;
+    match b.first() {
+        Some(b'+') => i += 1,
+        Some(b'-') => {
+            i += 1;
+            neg = true;
+        }
+        _ => {}
+    }
+
+    // The base prefix, with something after it.
+    if !(i + 2 < b.len() && b[i] == b'0' && b[i + 1].eq_ignore_ascii_case(&b'x')) {
         return Err(());
     }
-    let mut value: f64 = 0.0;
-    for c in int_part.chars() {
-        value = value * 16.0 + c.to_digit(16).ok_or(())? as f64;
+    i += 2;
+
+    // Digits.
+    const MAX_MANT_DIGITS: i64 = 16; // 16^16 fits in uint64
+    let mut mantissa: u64 = 0;
+    let mut trunc = false;
+    let mut sawdot = false;
+    let mut sawdigits = false;
+    let mut nd: i64 = 0;
+    let mut nd_mant: i64 = 0;
+    let mut dp: i64 = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'.' {
+            if sawdot {
+                break;
+            }
+            sawdot = true;
+            dp = nd;
+            i += 1;
+            continue;
+        }
+        let Some(d) = char::from(c).to_digit(16) else {
+            break;
+        };
+        sawdigits = true;
+        i += 1;
+        if c == b'0' && nd == 0 {
+            // Ignore leading zeros.
+            dp -= 1;
+            continue;
+        }
+        nd += 1;
+        if nd_mant < MAX_MANT_DIGITS {
+            mantissa = mantissa * 16 + u64::from(d);
+            nd_mant += 1;
+        } else if c != b'0' {
+            trunc = true;
+        }
     }
-    let mut scale = 1.0f64 / 16.0;
-    for c in frac_part.chars() {
-        value += c.to_digit(16).ok_or(())? as f64 * scale;
-        scale /= 16.0;
-    }
-    let v = value * 2f64.powi(exp) * if neg { -1.0 } else { 1.0 };
-    if v.is_infinite() {
+    if !sawdigits {
         return Err(());
     }
-    Ok(v)
+    if !sawdot {
+        dp = nd;
+    }
+    dp *= 4;
+    nd_mant *= 4;
+
+    // The exponent, which a hex literal must have.
+    if i >= b.len() || !b[i].eq_ignore_ascii_case(&b'p') {
+        return Err(());
+    }
+    i += 1;
+    let mut esign = 1;
+    match b.get(i) {
+        Some(b'+') => i += 1,
+        Some(b'-') => {
+            i += 1;
+            esign = -1;
+        }
+        _ => {}
+    }
+    if i >= b.len() || !b[i].is_ascii_digit() {
+        return Err(());
+    }
+    let mut e: i64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        if e < 10000 {
+            e = e * 10 + i64::from(b[i] - b'0');
+        }
+        i += 1;
+    }
+    dp += e * esign;
+    // ParseFloat refuses anything left over.
+    if i != b.len() {
+        return Err(());
+    }
+    let mut exp = 0;
+    if mantissa != 0 {
+        exp = dp - nd_mant;
+    }
+
+    // atofHex over float64info.
+    const MANTBITS: u32 = 52;
+    const EXPBITS: u32 = 11;
+    const BIAS: i64 = -1023;
+    let max_exp = (1 << EXPBITS) + BIAS - 2;
+    let min_exp = BIAS + 1;
+    exp += i64::from(MANTBITS); // mantissa now implicitly divided by 2^mantbits.
+
+    // Bring the mantissa to a leading 1-bit, MANTBITS more bits and two
+    // rounding bits, the bottom one sticky.
+    while mantissa != 0 && mantissa >> (MANTBITS + 2) == 0 {
+        mantissa <<= 1;
+        exp -= 1;
+    }
+    if trunc {
+        mantissa |= 1;
+    }
+    while mantissa >> (1 + MANTBITS + 2) != 0 {
+        mantissa = mantissa >> 1 | mantissa & 1;
+        exp += 1;
+    }
+
+    // If the exponent is too negative, denormalize in hopes of making
+    // it representable (the -2 is for the rounding bits).
+    while mantissa > 1 && exp < min_exp - 2 {
+        mantissa = mantissa >> 1 | mantissa & 1;
+        exp += 1;
+    }
+
+    // Round using the two bottom bits, to even.
+    let mut round = mantissa & 3;
+    mantissa >>= 2;
+    round |= mantissa & 1;
+    exp += 2;
+    if round == 3 {
+        mantissa += 1;
+        if mantissa == 1 << (1 + MANTBITS) {
+            mantissa >>= 1;
+            exp += 1;
+        }
+    }
+
+    if mantissa >> MANTBITS == 0 {
+        // Denormal or zero.
+        exp = BIAS;
+    }
+    if exp > max_exp {
+        // Infinity: Go returns ErrRange.
+        return Err(());
+    }
+
+    let mut bits = mantissa & ((1 << MANTBITS) - 1);
+    bits |= (((exp - BIAS) & ((1 << EXPBITS) - 1)) as u64) << MANTBITS;
+    if neg {
+        bits |= 1 << MANTBITS << EXPBITS;
+    }
+    Ok(f64::from_bits(bits))
 }
 
 // ---------------------------------------------------------------------
 // Encoding.
 // ---------------------------------------------------------------------
 
-/// Encode a typed value to JSON exactly as Go's `json.Marshal` does.
+/// Encode a typed value to JSON exactly as Go's `json.Marshal` does,
+/// except that a non-finite float, which Go refuses, renders as `null`
+/// (see [`format_float_json`]; [`try_encode`] fails instead).
 pub fn encode(typ: &GoType, val: &GoValue) -> String {
     let mut out = String::new();
-    encode_into(typ, val, &mut out);
+    encode_into(typ, val, &mut out, &mut None);
     out
 }
 
-fn encode_into(typ: &GoType, val: &GoValue, out: &mut String) {
+/// Go `json.UnsupportedValueError`: the marshal failure Go's encoder
+/// raises for a float it cannot represent (`floatEncoder.encode` in
+/// `encoding/json/encode.go`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsupportedValueError {
+    /// The value as Go spells it (`strconv.FormatFloat(f, 'g', -1,
+    /// bits)`): `NaN`, `+Inf` or `-Inf`.
+    pub str: String,
+}
+
+impl std::fmt::Display for UnsupportedValueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "json: unsupported value: {}", self.str)
+    }
+}
+
+impl std::error::Error for UnsupportedValueError {}
+
+/// Encode a typed value to JSON exactly as Go's `json.Marshal` does,
+/// failure included: the first non-finite float the encoder reaches
+/// aborts the marshal with Go's `UnsupportedValueError`.
+pub fn try_encode(typ: &GoType, val: &GoValue) -> Result<String, UnsupportedValueError> {
+    let mut out = String::new();
+    let mut unsupported = None;
+    encode_into(typ, val, &mut out, &mut unsupported);
+    match unsupported {
+        Some(err) => Err(err),
+        None => Ok(out),
+    }
+}
+
+/// Record the first non-finite float the encoder reaches, the value
+/// Go's `floatEncoder` would abort the marshal on.
+fn note_unsupported(v: f64, unsupported: &mut Option<UnsupportedValueError>) {
+    if unsupported.is_none()
+        && let Some(text) = nonfinite_text(v)
+    {
+        *unsupported = Some(UnsupportedValueError {
+            str: text.to_string(),
+        });
+    }
+}
+
+fn encode_into(
+    typ: &GoType,
+    val: &GoValue,
+    out: &mut String,
+    unsupported: &mut Option<UnsupportedValueError>,
+) {
     // A raw value stands in for a custom json.Marshaler and is
     // embedded verbatim regardless of the declared type.
     if let GoValue::Raw(raw) = val {
@@ -501,7 +835,7 @@ fn encode_into(typ: &GoType, val: &GoValue, out: &mut String) {
     match rt {
         GoType::Ptr(elem) => match val {
             GoValue::Null => out.push_str("null"),
-            v => encode_into(elem, v, out),
+            v => encode_into(elem, v, out, unsupported),
         },
         GoType::Bool => match val {
             GoValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -518,11 +852,17 @@ fn encode_into(typ: &GoType, val: &GoValue, out: &mut String) {
             }
         }
         GoType::Float32 => match val {
-            GoValue::Float32(f) => out.push_str(&format_float_json32(*f)),
+            GoValue::Float32(f) => {
+                note_unsupported(f64::from(*f), unsupported);
+                out.push_str(&format_float_json32(*f));
+            }
             _ => out.push('0'),
         },
         GoType::Float64 => match val {
-            GoValue::Float64(f) => out.push_str(&format_float_json(*f)),
+            GoValue::Float64(f) => {
+                note_unsupported(*f, unsupported);
+                out.push_str(&format_float_json(*f));
+            }
             _ => out.push('0'),
         },
         GoType::String => match val {
@@ -544,12 +884,12 @@ fn encode_into(typ: &GoType, val: &GoValue, out: &mut String) {
                     append_json_string(out, &base64_std(&bytes));
                     return;
                 }
-                encode_seq(elem, items, out);
+                encode_seq(elem, items, out, unsupported);
             }
             _ => out.push_str("null"),
         },
         GoType::Array(_, elem) => match val {
-            GoValue::Array(items) => encode_seq(elem, items, out),
+            GoValue::Array(items) => encode_seq(elem, items, out, unsupported),
             _ => out.push_str("[]"),
         },
         GoType::Map(_, velem) => match val {
@@ -564,7 +904,7 @@ fn encode_into(typ: &GoType, val: &GoValue, out: &mut String) {
                     }
                     append_json_string(out, k);
                     out.push(':');
-                    encode_into(velem, v, out);
+                    encode_into(velem, v, out, unsupported);
                 }
                 out.push('}');
             }
@@ -589,7 +929,7 @@ fn encode_into(typ: &GoType, val: &GoValue, out: &mut String) {
                     first = false;
                     append_json_string(out, name);
                     out.push(':');
-                    encode_into(&f.typ, v, out);
+                    encode_into(&f.typ, v, out, unsupported);
                 }
                 out.push('}');
             }
@@ -599,13 +939,18 @@ fn encode_into(typ: &GoType, val: &GoValue, out: &mut String) {
     }
 }
 
-fn encode_seq(elem: &GoType, items: &[GoValue], out: &mut String) {
+fn encode_seq(
+    elem: &GoType,
+    items: &[GoValue],
+    out: &mut String,
+    unsupported: &mut Option<UnsupportedValueError>,
+) {
     out.push('[');
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        encode_into(elem, item, out);
+        encode_into(elem, item, out, unsupported);
     }
     out.push(']');
 }
@@ -771,6 +1116,18 @@ impl<'a> Scanner<'a> {
         JsonError::Syntax(msg)
     }
 
+    /// The error for input that ends partway through a token.  Go's
+    /// `scanner.eof` steps the state machine once more with a synthetic
+    /// space and reports "unexpected end of JSON input" only when that
+    /// step records no error; inside a number (after `-`, `.`, `e` or the
+    /// exponent sign), a literal, a string escape or a `\u` escape the
+    /// space is itself invalid, so that state's own message is the one
+    /// `checkValid` returns.  `context` is that message's tail, e.g.
+    /// `in numeric literal`.
+    fn eof_in(context: &str) -> JsonError {
+        Self::syntax(format!("invalid character {} {context}", quote_char(b' ')))
+    }
+
     /// Validate one JSON value starting at the current position,
     /// producing Go scanner messages on malformed input.
     ///
@@ -917,17 +1274,16 @@ impl<'a> Scanner<'a> {
 
     fn check_literal(&mut self, lit: &str) -> Result<(), JsonError> {
         for (i, want) in lit.bytes().enumerate() {
-            match self.data.get(self.pos + i) {
-                None => return Err(Self::syntax(UNEXPECTED_END.to_string())),
-                Some(&got) if got != want => {
-                    return Err(Self::syntax(format!(
-                        "invalid character {} in literal {} (expecting {})",
-                        quote_char(got),
-                        lit,
-                        quote_char(want),
-                    )));
-                }
-                _ => {}
+            // At end of input Go's eof() steps a space into the literal
+            // state (stateTr and its siblings), which rejects it.
+            let got = self.data.get(self.pos + i).copied().unwrap_or(b' ');
+            if got != want {
+                return Err(Self::syntax(format!(
+                    "invalid character {} in literal {} (expecting {})",
+                    quote_char(got),
+                    lit,
+                    quote_char(want),
+                )));
             }
         }
         self.pos += lit.len();
@@ -945,7 +1301,7 @@ impl<'a> Scanner<'a> {
                 b'"' => return Ok(()),
                 b'\\' => {
                     let Some(esc) = self.peek() else {
-                        return Err(Self::syntax(UNEXPECTED_END.to_string()));
+                        return Err(Self::eof_in("in string escape code"));
                     };
                     self.pos += 1;
                     match esc {
@@ -953,7 +1309,9 @@ impl<'a> Scanner<'a> {
                         b'u' => {
                             for _ in 0..4 {
                                 let Some(h) = self.peek() else {
-                                    return Err(Self::syntax(UNEXPECTED_END.to_string()));
+                                    return Err(Self::eof_in(
+                                        "in \\u hexadecimal character escape",
+                                    ));
                                 };
                                 if !h.is_ascii_hexdigit() {
                                     return Err(Self::syntax(format!(
@@ -996,7 +1354,7 @@ impl<'a> Scanner<'a> {
                         quote_char(c)
                     )));
                 }
-                None => return Err(Self::syntax(UNEXPECTED_END.to_string())),
+                None => return Err(Self::eof_in("in numeric literal")),
             }
         }
         if self.peek() == Some(b'0') {
@@ -1020,7 +1378,7 @@ impl<'a> Scanner<'a> {
                         quote_char(c)
                     )));
                 }
-                None => return Err(Self::syntax(UNEXPECTED_END.to_string())),
+                None => return Err(Self::eof_in("after decimal point in numeric literal")),
             }
         }
         if matches!(self.peek(), Some(b'e' | b'E')) {
@@ -1040,7 +1398,7 @@ impl<'a> Scanner<'a> {
                         quote_char(c)
                     )));
                 }
-                None => return Err(Self::syntax(UNEXPECTED_END.to_string())),
+                None => return Err(Self::eof_in("in exponent of numeric literal")),
             }
         }
         Ok(())
@@ -1050,7 +1408,14 @@ impl<'a> Scanner<'a> {
 /// Validate an entire JSON document like Go's `json.Unmarshal` does
 /// before decoding (`checkValid`).
 pub fn validate(data: &str) -> Result<(), JsonError> {
-    let mut sc = Scanner::new(data.as_bytes());
+    validate_bytes(data.as_bytes())
+}
+
+/// [`validate`] over raw bytes, which need not be UTF-8: Go's scanner
+/// takes any byte from 0x20 up inside a string literal, and names a
+/// stray byte elsewhere by its own value.
+pub fn validate_bytes(data: &[u8]) -> Result<(), JsonError> {
+    let mut sc = Scanner::new(data);
     sc.check_value()?;
     sc.skip_ws();
     if let Some(c) = sc.peek() {
@@ -1060,6 +1425,60 @@ pub fn validate(data: &str) -> Result<(), JsonError> {
         )));
     }
     Ok(())
+}
+
+/// Go's coercion of a string's bytes to well-formed UTF-8 when it is
+/// unquoted (`unquoteBytes`, `encoding/json/decode.go`): every byte that
+/// does not begin a valid encoding becomes one U+FFFD.  That is
+/// `utf8.DecodeRune`, which reports an invalid sequence one byte at a
+/// time, and not `String::from_utf8_lossy`, which replaces a maximal
+/// invalid subpart with a single U+FFFD -- `"\xe2\x82"` is two
+/// replacement characters in Go and one in Rust.
+pub fn coerce_utf8(data: &[u8]) -> Cow<'_, str> {
+    let mut valid_up_to = match std::str::from_utf8(data) {
+        Ok(text) => return Cow::Borrowed(text),
+        Err(e) => e.valid_up_to(),
+    };
+    let mut out = String::with_capacity(data.len() + 2);
+    let mut rest = data;
+    loop {
+        let (valid, after) = rest.split_at(valid_up_to);
+        // The prefix `from_utf8` vouched for, so this never defaults.
+        out.push_str(std::str::from_utf8(valid).unwrap_or_default());
+        // The byte that begins no valid encoding, one U+FFFD for it.
+        let Some((_, after)) = after.split_first() else {
+            break;
+        };
+        out.push('\u{FFFD}');
+        rest = after;
+        valid_up_to = match std::str::from_utf8(rest) {
+            Ok(_) => rest.len(),
+            Err(e) => e.valid_up_to(),
+        };
+    }
+    Cow::Owned(out)
+}
+
+/// The text `json.Unmarshal` decodes from a request's raw bytes.
+///
+/// dcrd hands a request body or websocket frame to `json.Unmarshal` as
+/// it arrived, never checking it is UTF-8.  Go's scanner validates the
+/// raw bytes, accepting anything from 0x20 up inside a string literal,
+/// and invalid UTF-8 there only becomes U+FFFD when the string is
+/// unquoted.  So a document that is valid UTF-8 is handed back as it
+/// is, for the caller's own decoding to validate; one that is not is
+/// validated here, because only the raw bytes give Go's message for a
+/// stray byte outside a string (`invalid character 'ÿ' ...`), and on
+/// success coerced by [`coerce_utf8`].  Every invalid byte then lies
+/// inside a string literal, and dcrd unquotes every string it decodes
+/// from a request, so the coerced text decodes to the values Go's
+/// decoder produces.
+pub fn unmarshal_input(data: &[u8]) -> Result<Cow<'_, str>, JsonError> {
+    if let Ok(text) = std::str::from_utf8(data) {
+        return Ok(Cow::Borrowed(text));
+    }
+    validate_bytes(data)?;
+    Ok(coerce_utf8(data))
 }
 
 /// A raw JSON token produced by the reader used during decoding.
@@ -1673,12 +2092,38 @@ fn field_index(fields: &[crate::gotype::StructField], key: &str) -> Option<usize
     }
     for (i, f) in fields.iter().enumerate() {
         if let Some(name) = effective(f)
-            && name.eq_ignore_ascii_case(key)
+            && go_fold_eq(key, &name)
         {
             return Some(i);
         }
     }
     None
+}
+
+/// Whether a decoded JSON object key names the given ASCII struct field
+/// under Go's case-insensitive fallback, `fields.byFoldedName[
+/// foldName(key)]` (`encoding/json/decode.go`, `fold.go`).
+///
+/// `foldName` upper-cases ASCII and sends every other rune through
+/// `foldRune`, the smallest rune of its `unicode.SimpleFold` orbit.
+/// U+017F (LATIN SMALL LETTER LONG S) and U+212A (KELVIN SIGN) are the
+/// only runes whose orbit reaches ASCII -- they fold to `S` and `K` --
+/// so for an ASCII field name, which every registered type's is,
+/// mapping those two and comparing ASCII-insensitively is exactly Go's
+/// result without carrying a fold table.
+pub fn go_fold_eq(key: &str, field: &str) -> bool {
+    if key.is_ascii() {
+        return key.eq_ignore_ascii_case(field);
+    }
+    let folded: String = key
+        .chars()
+        .map(|c| match c {
+            '\u{017f}' => 's',
+            '\u{212a}' => 'k',
+            other => other,
+        })
+        .collect();
+    folded.eq_ignore_ascii_case(field)
 }
 
 /// Decode standard base64 (with padding), as Go's `encoding/json`

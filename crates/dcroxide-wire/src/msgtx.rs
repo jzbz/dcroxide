@@ -11,7 +11,7 @@ use crate::MAX_MESSAGE_PAYLOAD;
 use crate::cursor::Cursor;
 use crate::error::WireError;
 use crate::varint::{
-    read_var_bytes, read_var_int, var_int_serialize_size, write_var_bytes, write_var_int,
+    read_var_bytes_as, read_var_int, var_int_serialize_size, write_var_bytes, write_var_int,
 };
 
 /// The initial transaction version (dcrd `TxVersion`).
@@ -223,6 +223,16 @@ impl Default for MsgTx {
     }
 }
 
+/// Read a transaction script bounded by the maximum message payload
+/// (dcrd `readScript`): the var-bytes read, with the limit error naming
+/// the script as dcrd's description does.
+pub(crate) fn read_script(
+    r: &mut Cursor<'_>,
+    field_name: &'static str,
+) -> Result<Vec<u8>, WireError> {
+    read_var_bytes_as(r, MAX_MESSAGE_PAYLOAD, "readScript", field_name)
+}
+
 impl MsgTx {
     /// Decode a transaction from the cursor (dcrd `MsgTx.BtcDecode` /
     /// `Deserialize`). Trailing bytes are not an error; the cursor position
@@ -276,6 +286,8 @@ impl MsgTx {
             return Err(WireError::TooManyTxs {
                 count,
                 max: MAX_TX_IN_PER_MESSAGE,
+                op: "MsgTx.decodePrefix",
+                what: "input transactions to fit into max message size",
             });
         }
 
@@ -299,6 +311,8 @@ impl MsgTx {
             return Err(WireError::TooManyTxs {
                 count,
                 max: MAX_TX_OUT_PER_MESSAGE,
+                op: "MsgTx.decodePrefix",
+                what: "output transactions to fit into max message size",
             });
         }
 
@@ -307,7 +321,7 @@ impl MsgTx {
         for _ in 0..count {
             let value = r.read_u64()? as i64;
             let version = r.read_u16()?;
-            let pk_script = read_var_bytes(r, MAX_MESSAGE_PAYLOAD)?;
+            let pk_script = read_script(r, "transaction output public key script")?;
             self.tx_out.push(TxOut {
                 value,
                 version,
@@ -339,6 +353,8 @@ impl MsgTx {
             return Err(WireError::TooManyTxs {
                 count,
                 max: MAX_TX_IN_PER_MESSAGE,
+                op: "MsgTx.decodeWitness",
+                what: "input transactions to fit into max message size",
             });
         }
 
@@ -352,7 +368,7 @@ impl MsgTx {
             let value_in = r.read_u64()? as i64;
             let block_height = r.read_u32()?;
             let block_index = r.read_u32()?;
-            let signature_script = read_var_bytes(r, MAX_MESSAGE_PAYLOAD)?;
+            let signature_script = read_script(r, "transaction input signature script")?;
             if is_full {
                 let ti = &mut self.tx_in[i];
                 ti.value_in = value_in;

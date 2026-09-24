@@ -107,7 +107,7 @@ fn qk_0010_empty_mixdcnet_decodes_but_does_not_reencode() {
     let err = write_message(&msg, PROTOCOL_VERSION, net)
         .expect_err("dcrd's writeMessageNoSignature rejects mcount == 0");
     assert!(
-        matches!(err, dcroxide_wire::WireError::InvalidMsg),
+        matches!(err, dcroxide_wire::WireError::InvalidMsg(_)),
         "expected dcrd's ErrInvalidMsg identity, got {err:?}"
     );
 }

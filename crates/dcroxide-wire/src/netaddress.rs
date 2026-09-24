@@ -5,7 +5,7 @@
 use alloc::vec::Vec;
 
 use crate::cursor::Cursor;
-use crate::error::WireError;
+use crate::error::{MessageText, WireError};
 use crate::protocol::ServiceFlag;
 
 /// The maximum encoded size of a [`NetAddress`]: timestamp 4 + services 8 +
@@ -186,16 +186,21 @@ impl NetAddressV2 {
         w.extend_from_slice(&self.timestamp.to_le_bytes());
         w.extend_from_slice(&self.services.0.to_le_bytes());
         w.push(self.addr_type.0);
-        let want_len = match self.addr_type {
-            NetAddressType::IPV4 => 4,
-            NetAddressType::IPV6 => 16,
-            NetAddressType::TOR_V3 => 32,
+        let (want_len, desc) = match self.addr_type {
+            NetAddressType::IPV4 => (4, "invalid IPv4 address length: %d"),
+            NetAddressType::IPV6 => (16, "invalid IPv6 address length: %d"),
+            NetAddressType::TOR_V3 => (32, "invalid TorV3 address length: %d"),
             other => {
                 return Err(WireError::UnknownNetAddrType { addr_type: other.0 });
             }
         };
         if self.encoded_addr.len() != want_len {
-            return Err(WireError::InvalidMsg);
+            // Its one caller is `MsgAddrV2.BtcEncode`, whose `op` dcrd
+            // passes in.
+            return Err(WireError::InvalidMsg(
+                MessageText::new("MsgAddrV2.BtcEncode", desc)
+                    .with_arg(self.encoded_addr.len() as u64),
+            ));
         }
         w.extend_from_slice(&self.encoded_addr);
         w.extend_from_slice(&self.port.to_le_bytes());

@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use crate::MAX_MESSAGE_PAYLOAD;
 use crate::cursor::Cursor;
-use crate::error::WireError;
+use crate::error::{MessageText, WireError};
 use crate::msg_cf::*;
 use crate::msg_control::*;
 use crate::msg_data::*;
@@ -240,9 +240,10 @@ pub fn decode_message_payload(
     pver: u32,
 ) -> Result<Message, WireError> {
     let mut r = Cursor::new(payload);
-    let msg = decode_payload(command, &mut r, pver).ok_or(WireError::InvalidMsg)??;
+    let msg =
+        decode_payload(command, &mut r, pver).ok_or(WireError::InvalidMsg(MessageText::NONE))??;
     if r.remaining() != 0 {
-        return Err(WireError::InvalidMsg);
+        return Err(WireError::InvalidMsg(MessageText::NONE));
     }
     Ok(msg)
 }
@@ -257,7 +258,7 @@ pub fn decode_message_payload_prefix(
     pver: u32,
 ) -> Result<Message, WireError> {
     let mut r = Cursor::new(payload);
-    decode_payload(command, &mut r, pver).ok_or(WireError::InvalidMsg)?
+    decode_payload(command, &mut r, pver).ok_or(WireError::InvalidMsg(MessageText::NONE))?
 }
 
 /// Decode a payload for a known command (mirrors `makeEmptyMessage` +

@@ -153,7 +153,7 @@ impl MsgCFilter {
         }
         let block_hash = Hash(r.take_array()?);
         let filter_type = r.read_u8()?;
-        let data = read_var_bytes(r, MAX_CFILTER_DATA_SIZE)?;
+        let data = read_var_bytes(r, MAX_CFILTER_DATA_SIZE, "cfilter data")?;
         Ok(MsgCFilter {
             block_hash,
             filter_type,
@@ -353,7 +353,7 @@ impl MsgCFilterV2 {
             return Err(WireError::MsgInvalidForPVer);
         }
         let block_hash = Hash(r.take_array()?);
-        let data = read_var_bytes(r, MAX_CFILTER_DATA_SIZE)?;
+        let data = read_var_bytes(r, MAX_CFILTER_DATA_SIZE, "cfilterv2 data")?;
         let proof_index = r.read_u32()?;
         let count = read_var_int(r)?;
         if count > MAX_HEADER_PROOF_HASHES {

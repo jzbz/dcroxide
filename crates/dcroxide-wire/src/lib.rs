@@ -64,7 +64,7 @@ mod varint;
 
 pub use blockheader::{BlockHeader, MAX_BLOCK_HEADER_PAYLOAD};
 pub use cursor::Cursor;
-pub use error::WireError;
+pub use error::{MessageText, WireError};
 pub use invvect::{InvType, InvVect, MAX_INV_PER_MSG};
 pub use message::{
     COMMAND_SIZE, MESSAGE_HEADER_SIZE, Message, MessageHeader, decode_message_payload,
