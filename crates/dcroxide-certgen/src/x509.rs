@@ -6,9 +6,8 @@
 // Bounded assembly arithmetic over small buffers.
 #![allow(clippy::arithmetic_side_effects)]
 
-use sha1::{Digest, Sha1};
-
 use crate::der;
+use sha2::{Digest, Sha256};
 
 /// The signature and public key algorithm of a certificate.
 pub enum SigAlg {
@@ -79,7 +78,9 @@ pub struct Template {
 }
 
 /// The subject/issuer RDN sequence: Organization then CommonName,
-/// exactly as Go marshals a pkix.Name with those fields.
+/// exactly as Go marshals a pkix.Name with those fields.  Go's
+/// `ToRDNSequence` leaves the CommonName out when it is empty (an empty
+/// hostname here), where the Organization is written even when empty.
 fn name(template: &Template) -> Vec<u8> {
     let org_atv = der::sequence(
         &[
@@ -88,14 +89,36 @@ fn name(template: &Template) -> Vec<u8> {
         ]
         .concat(),
     );
-    let cn_atv = der::sequence(
-        &[
-            der::oid(&[2, 5, 4, 3]),
-            der::directory_string(&template.common_name),
-        ]
-        .concat(),
-    );
-    der::sequence(&[der::set(&org_atv), der::set(&cn_atv)].concat())
+    let mut rdns = der::set(&org_atv);
+    if !template.common_name.is_empty() {
+        let cn_atv = der::sequence(
+            &[
+                der::oid(&[2, 5, 4, 3]),
+                der::directory_string(&template.common_name),
+            ]
+            .concat(),
+        );
+        rdns.extend_from_slice(&der::set(&cn_atv));
+    }
+    der::sequence(&rdns)
+}
+
+/// The SubjectKeyIdentifier Go's `x509.CreateCertificate` computes for a
+/// CA template that sets none: the leftmost 160 bits of SHA-256 over the
+/// public key bytes (RFC 7093 section 2, method 1).
+///
+/// Go 1.25 made this the default in place of SHA-1 (GODEBUG
+/// `x509sha256skid`, which follows the main module's `go` line).  dcrd's
+/// root module says `go 1.25.0` and holds both the daemon and
+/// `cmd/gencerts`, and the daemon also sets `//go:debug default=go1.26`,
+/// so a dcrd built at the parity pin writes this form.  The SHA-1 form
+/// the frozen vectors used to carry came from dumping inside the certgen
+/// module, whose own `go 1.18` line keeps the old default.
+pub(crate) fn subject_key_id(public_key_bytes: &[u8]) -> [u8; 20] {
+    let digest = Sha256::digest(public_key_bytes);
+    let mut skid = [0u8; 20];
+    skid.copy_from_slice(&digest[..20]);
+    skid
 }
 
 /// The IPv4 form of a 16-byte address when it is IPv4-mapped (Go
@@ -142,9 +165,9 @@ fn extensions(template: &Template, public_key_bytes: &[u8]) -> Result<Vec<u8>, S
     );
     exts.extend_from_slice(&basic);
 
-    // SubjectKeyIdentifier: Go computes SHA-1 over the public key
-    // bytes for CA certificates when the template leaves it unset.
-    let skid = Sha1::digest(public_key_bytes);
+    // SubjectKeyIdentifier: Go computes it for CA certificates when the
+    // template leaves it unset.
+    let skid = subject_key_id(public_key_bytes);
     let skid_ext = der::sequence(
         &[
             der::oid(&[2, 5, 29, 14]),

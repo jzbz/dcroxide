@@ -81,6 +81,27 @@ jobs:
       # `std` keeps one per thread, so both configurations need running.
       - run: cargo test -p dcroxide-dcrec --no-default-features
 
+  test-wrapping:
+    name: test (overflow checks off, as release ships)
+    runs-on: ubuntu-latest
+    # Every other test run keeps the dev profile's overflow checks, so an
+    # overflowing path panics there and no test sees what the shipped
+    # binary computes: [profile.release] wraps (`overflow-checks = false`,
+    # pinned in Cargo.toml). This runs the suites again with the checks
+    # off and debug assertions still on, so the differential and vector
+    # suites pass against the arithmetic that actually ships.
+    env:
+      CARGO_PROFILE_DEV_OVERFLOW_CHECKS: "false"
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.24"
+          cache-dependency-path: tools/oracle/go.sum
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
   dcrd-interop:
     name: dcrd interop (live socket)
     runs-on: ubuntu-latest
@@ -95,7 +116,10 @@ jobs:
       # dcrd at the parity pin requires Go 1.25; the oracle job pins 1.24.
       # These are separate toolchains on purpose — the oracle's version is
       # chosen for the module graph it links, not for building the daemon.
-      DCRD_COMMIT: 29f17894e586d65b34db6c6116a63ce47b8874d9
+      # The same commit as DCRD_PARITY_COMMIT in dcroxide-testutil, which
+      # refuses any other stamped revision; its unit tests fail when the
+      # two drift apart.
+      DCRD_COMMIT: b9634e01770b9035c4f22e0b314e85aada3828cf
       # A missing binary must fail this job rather than skip its tests.
       DCROXIDE_REQUIRE_DCRD: "1"
     steps:
@@ -214,7 +238,19 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - name: Run every fuzz target briefly
         run: |
-          for t in $(cargo fuzz list); do
+          # The list is taken by a plain assignment so a failing `cargo
+          # fuzz list` fails the step. Inside the for-loop word list its
+          # exit status is lost, the loop runs zero times, and the job
+          # goes green having fuzzed nothing. The count check catches a
+          # list that succeeds but comes back short of fuzz/Cargo.toml.
+          targets=$(cargo fuzz list)
+          declared=$(grep -c '^\[\[bin\]\]' fuzz/Cargo.toml)
+          listed=$(wc -w <<<"$targets")
+          if [ "$listed" -eq 0 ] || [ "$listed" -ne "$declared" ]; then
+            echo "cargo fuzz list gave $listed targets; fuzz/Cargo.toml declares $declared" >&2
+            exit 1
+          fi
+          for t in $targets; do
             cargo fuzz run "$t" -- -max_total_time=60
           done
       # Without this a crash is only ever a red X: the input that caused
@@ -241,7 +277,15 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - name: Run every fuzz target for 10 minutes
         run: |
-          for t in $(cargo fuzz list); do
+          # See the smoke job: an empty or short list must fail the step.
+          targets=$(cargo fuzz list)
+          declared=$(grep -c '^\[\[bin\]\]' fuzz/Cargo.toml)
+          listed=$(wc -w <<<"$targets")
+          if [ "$listed" -eq 0 ] || [ "$listed" -ne "$declared" ]; then
+            echo "cargo fuzz list gave $listed targets; fuzz/Cargo.toml declares $declared" >&2
+            exit 1
+          fi
+          for t in $targets; do
             cargo fuzz run "$t" -- -max_total_time=600
           done
       # See the smoke job: a nightly crash is the one most likely to be

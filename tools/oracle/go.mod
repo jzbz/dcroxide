@@ -5,8 +5,11 @@ go 1.24.0
 // Pinned to the parity target, dcrd master commit b9634e01: every module
 // dcrd's go.mod replaces with an in-tree dir whose source differs from its
 // published release uses the pseudo-version at that commit (stake, standalone,
-// edwards, secp256k1, gcs, txscript, wire, and now chaincfg and blake256), so
-// the oracle links the same code the dcrd binary at b9634e01 does.  The
+// secp256k1, gcs, txscript, wire, and now chaincfg and blake256), so the
+// oracle links the same code the dcrd binary at b9634e01 does.  edwards is
+// pinned to the target pseudo-version too, although dcrd's go.mod does not
+// replace it and dcrd links the v2.0.4 release: the in-tree non-test sources
+// at b9634e01 are byte-identical to v2.0.4's, so both link the same code.  The
 // remaining in-tree pins (chainhash, dcrutil, uint256, ripemd160, dcrec) are
 // byte-identical to the in-tree sources at that commit.  base58 is not an
 // in-tree module: dcrd's own go.mod requires github.com/decred/base58 v1.0.6

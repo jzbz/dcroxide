@@ -18,6 +18,7 @@ mod certgen;
 mod der;
 pub mod gentool;
 mod pem;
+mod punycode;
 mod x509;
 
 pub use certgen::{CertEnv, CertPair, Curve, new_ed25519_tls_cert_pair, new_tls_cert_pair};

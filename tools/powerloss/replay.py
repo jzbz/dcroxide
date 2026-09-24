@@ -2,17 +2,24 @@
 # SPDX-License-Identifier: ISC
 """Apply a power-loss undo log: rewind the tree to its last successful sync.
 
-Reads the log the shim wrote while the target ran, and undoes every write
-that was never followed by an fsync/fdatasync of its file. What remains on
-disk is then exactly what a power cut at kill time would have left.
+Reads the log the shim wrote while the target ran, and undoes every write,
+truncate and file creation that was never followed by an fsync/fdatasync
+of its file. What remains on disk is what a power cut at kill time would
+have left, as far as the shim models one: the list headed "What that does
+NOT model" in shim.c (directory durability, torn or reordered writes,
+descriptors the shim never saw opened) is not reproduced here either.
 
 Record layout, as emitted by shim.c:
     [type u8][pathlen u16][path][off u64][len u32][prevlen u64][data]
 
-    W  a write: `data` is what it overwrote, `prevlen` the file's length
-       before it. Undone by restoring the bytes and the length.
-    T  an ftruncate: `prevlen` is the length before it.
-    C  a file that did not exist. Undone by deleting it.
+    W  a write, or an fallocate: `data` is what it overwrote at `off`,
+       `prevlen` the file's length before it. A range longer than one
+       record is split into several, each with the same `prevlen`.
+       Undone by restoring the bytes and then the length.
+    T  an ftruncate: `prevlen` is the length before it and, for a shrink,
+       `data` the bytes it cut off at `off`, split like a W. Undone the
+       same way, so a shrink gets its bytes back rather than zeros.
+    C  a file that did not exist before its open. Undone by deleting it.
     S  a successful sync: everything pending for that file is now durable
        and must NOT be undone.
 """

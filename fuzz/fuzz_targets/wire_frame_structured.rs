@@ -21,6 +21,14 @@
 //! checks, and deliberately not a strict round-trip against the input:
 //! optional trailing fields (`MsgVersion`) and non-canonical but accepted
 //! encodings both make that false, matching dcrd.
+//!
+//! The frame is decoded at a protocol version the input picks, from the
+//! oldest a peer can still negotiate (`REMOVE_REJECT_VERSION`, the floor
+//! `server.rs` enforces) to the current one.  Several decoders gate on it
+//! -- the mix messages below `MIX_VERSION`, `getcfsv2` below
+//! `BATCHED_CFILTERS_V2_VERSION`, `addrv2` below `ADDR_V2_VERSION`, and
+//! the per-version payload limits -- and a peer that negotiates 9, 10 or
+//! 11 is decoded on those paths for the whole connection.
 
 #![no_main]
 
@@ -28,7 +36,8 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
 use dcroxide_wire::{
-    COMMAND_SIZE, CurrencyNet, MAX_MESSAGE_PAYLOAD, PROTOCOL_VERSION, read_message, write_message,
+    COMMAND_SIZE, CurrencyNet, MAX_MESSAGE_PAYLOAD, PROTOCOL_VERSION, REMOVE_REJECT_VERSION,
+    read_message, write_message,
 };
 
 /// Every command the port frames, so the fuzzer picks a real decoder
@@ -83,11 +92,16 @@ const COMMANDS: [&str; 41] = [
 struct StructuredFrame {
     /// Reduced modulo the table above, so every draw names a command.
     command_index: u8,
+    /// Picks a protocol version from `REMOVE_REJECT_VERSION` up to
+    /// `PROTOCOL_VERSION`: every version a peer can negotiate.
+    version_index: u8,
     payload: Vec<u8>,
 }
 
 fuzz_target!(|input: StructuredFrame| {
     let command = COMMANDS[usize::from(input.command_index) % COMMANDS.len()];
+    let pver = REMOVE_REJECT_VERSION
+        + u32::from(input.version_index) % (PROTOCOL_VERSION - REMOVE_REJECT_VERSION + 1);
     if input.payload.len() as u64 > MAX_MESSAGE_PAYLOAD {
         return;
     }
@@ -103,15 +117,15 @@ fuzz_target!(|input: StructuredFrame| {
     frame.extend_from_slice(&checksum[..4]);
     frame.extend_from_slice(&input.payload);
 
-    if let Ok((msg, _consumed)) = read_message(&frame, PROTOCOL_VERSION, net) {
+    if let Ok((msg, _consumed)) = read_message(&frame, pver, net) {
         // A decoded message need not be encodable -- see QK-0010.  This
         // target found that asymmetry within seconds of first running,
         // on a `mixdcnet` frame declaring zero mix vectors.
-        let Ok(reencoded) = write_message(&msg, PROTOCOL_VERSION, net) else {
+        let Ok(reencoded) = write_message(&msg, pver, net) else {
             return;
         };
         let (roundtripped, consumed_again) =
-            read_message(&reencoded, PROTOCOL_VERSION, net).expect("re-encoded message decodes");
+            read_message(&reencoded, pver, net).expect("re-encoded message decodes");
         assert_eq!(roundtripped, msg, "re-encoding changed the message");
         assert_eq!(
             consumed_again,

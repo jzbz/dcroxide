@@ -8,7 +8,7 @@
 use p256::ecdsa::signature::Signer;
 
 use crate::x509::{SigAlg, Template};
-use crate::{der, pem, x509};
+use crate::{der, pem, punycode, x509};
 
 /// End of ASN.1 UTCTime: 2049-12-31 23:59:59 UTC (Go `endOfTime`).
 const END_OF_TIME_UNIX: i64 = 2_524_607_999;
@@ -87,21 +87,28 @@ fn parse_cidr_ip(s: &str) -> Option<[u8; 16]> {
     Some(ip)
 }
 
-/// Split host and port like Go's `net.SplitHostPort` for the shapes
-/// extra hosts take; any error simply keeps the original string.
+/// The host part of Go's `net.SplitHostPort`, or `None` where Go returns
+/// an error (the caller then keeps the original string, as dcrd does).
 fn split_host(host_str: &str) -> Option<String> {
-    if let Some(stripped) = host_str.strip_prefix('[') {
-        let end = stripped.find(']')?;
-        let rest = &stripped[end + 1..];
-        let port = rest.strip_prefix(':')?;
-        if port.contains(':') {
+    // The port starts after the last colon.
+    let i = host_str.rfind(':')?;
+    let (host, j, k) = if host_str.starts_with('[') {
+        // Expect the first ']' just before the last ':'.
+        let end = host_str.find(']')?;
+        if end + 1 != i {
+            // No port after the ']', or not only one colon before it.
             return None;
         }
-        return Some(stripped[..end].to_string());
-    }
-    let colon = host_str.rfind(':')?;
-    let host = &host_str[..colon];
-    if host.contains(':') || host.contains('[') || host.contains(']') {
+        (&host_str[1..end], 1, end + 1)
+    } else {
+        let host = &host_str[..i];
+        if host.contains(':') {
+            return None;
+        }
+        (host, 0, 0)
+    };
+    // A stray bracket anywhere else, the port included.
+    if host_str[j..].contains('[') || host_str[k..].contains(']') {
         return None;
     }
     Some(host.to_string())
@@ -109,7 +116,8 @@ fn split_host(host_str: &str) -> Option<String> {
 
 /// The shared host and address gathering both generators perform.
 /// `use_idna` selects the ECDSA variant's behavior, which converts
-/// non-ASCII names with IDNA; the Ed25519 variant uses names as-is.
+/// non-ASCII names with Go's `idna.ToASCII` (see [`punycode`]); the
+/// Ed25519 variant uses names as-is.
 type GatheredHosts = (String, Vec<String>, Vec<[u8; 16]>);
 
 fn gather_hosts<E: CertEnv>(
@@ -119,7 +127,7 @@ fn gather_hosts<E: CertEnv>(
 ) -> Result<GatheredHosts, String> {
     let mut host = env.hostname()?;
     if use_idna && !is_ascii_str(&host) {
-        host = idna::domain_to_ascii(&host).map_err(|e| e.to_string())?;
+        host = punycode::to_ascii(&host)?;
     }
 
     let mut ip_addresses: Vec<[u8; 16]> = vec![
@@ -147,7 +155,7 @@ fn gather_hosts<E: CertEnv>(
         }
         let mut host = host.to_string();
         if use_idna && !is_ascii_str(&host) {
-            match idna::domain_to_ascii(&host) {
+            match punycode::to_ascii(&host) {
                 Ok(converted) => host = converted,
                 Err(_) => return,
             }
@@ -363,4 +371,35 @@ fn pkcs8_ed25519_key(seed: &[u8; 32]) -> Vec<u8> {
         ]
         .concat(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_host;
+
+    /// Go `net.SplitHostPort`'s host, or `None` where it errors.
+    #[test]
+    fn split_host_matches_go() {
+        for (input, want) in [
+            ("example.org:9108", Some("example.org")),
+            ("[2001:db8::5]:9108", Some("2001:db8::5")),
+            ("[::1]:", Some("::1")),
+            (":9108", Some("")),
+            ("example.org", None),
+            ("::1", None),
+            ("[::1]", None),
+            ("[::1]80", None),
+            ("[::1]:80:81", None),
+            ("[::1:80", None),
+            // Stray brackets: Go refuses these ("unexpected '['" and
+            // "unexpected ']'"), where the host used to be cut out anyway.
+            ("[::1]:80]", None),
+            ("[[::1]:80", None),
+            ("a:8[0", None),
+            ("a:8]0", None),
+            ("a]:80", None),
+        ] {
+            assert_eq!(split_host(input).as_deref(), want, "{input}");
+        }
+    }
 }

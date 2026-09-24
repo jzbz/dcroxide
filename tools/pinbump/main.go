@@ -22,6 +22,9 @@
 // the delta touched a package it ports; whether anything must change is the
 // reviewer's call. Unmapped packages are reported separately and matter
 // most: they are either genuinely not ported or a gap in PARITY.md.
+// Upstream `_test.go` changes get a section of their own: they change no
+// behaviour, but a new vector or a corrected expectation in one is exactly
+// what a copied expectation in this port goes stale on.
 //
 // Usage:
 //
@@ -154,8 +157,13 @@ var pkgAliases = map[string]string{
 }
 
 // changedFiles lists the files touched between two commits in a repo.
+//
+// Rename detection is off: with it, git prints only a moved file's
+// destination, and a file leaving a ported package would be attributed
+// solely to wherever it landed. Without it a move is a deletion plus an
+// addition, and both packages are listed.
 func changedFiles(repo, from, to string) ([]string, error) {
-	cmd := exec.Command("git", "-C", repo, "diff", "--name-only", from+".."+to)
+	cmd := exec.Command("git", "-C", repo, "diff", "--name-only", "--no-renames", from+".."+to)
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -193,6 +201,54 @@ func resolve(m mapping, file string) (string, []string, bool) {
 	return "", nil, false
 }
 
+// review is the resolved delta: per crate, the upstream source files and
+// the upstream test files that touch a package it ports, and per directory
+// the files no package row claims.
+type review struct {
+	code     map[string][]string
+	tests    map[string][]string
+	unmapped map[string][]string
+}
+
+// classify resolves every changed file. Test files are kept apart rather
+// than dropped: the port's own differential vectors carry most of its
+// testing, but some expectations were copied from dcrd's tables, and those
+// only stay current if a changed table reaches the review list.
+func classify(m mapping, files []string) review {
+	r := review{
+		code:     map[string][]string{},
+		tests:    map[string][]string{},
+		unmapped: map[string][]string{},
+	}
+	for _, f := range files {
+		_, crates, ok := resolve(m, f)
+		if !ok {
+			r.unmapped[path.Dir(f)] = append(r.unmapped[path.Dir(f)], f)
+			continue
+		}
+		dst := r.code
+		if strings.HasSuffix(f, "_test.go") {
+			dst = r.tests
+		}
+		for _, c := range crates {
+			dst[c] = append(dst[c], f)
+		}
+	}
+	return r
+}
+
+// printCrates prints one crate-to-files section.
+func printCrates(crateFiles map[string][]string) {
+	for _, c := range sortedKeys(crateFiles) {
+		fs := dedupe(crateFiles[c])
+		fmt.Printf("  %-24s %d file(s)\n", c, len(fs))
+		for _, f := range fs {
+			fmt.Printf("      %s\n", f)
+		}
+	}
+	fmt.Println()
+}
+
 func main() {
 	repo := flag.String("dcrd", "", "path to a dcrd checkout (required)")
 	from := flag.String("from", "", "the current parity pin (required)")
@@ -221,46 +277,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	crateFiles := map[string][]string{}
-	unmapped := map[string][]string{}
-	for _, f := range files {
-		// Upstream test files do not constrain this port; its own
-		// differential vectors do.
-		if strings.HasSuffix(f, "_test.go") {
-			continue
-		}
-		pkg, crates, ok := resolve(m, f)
-		if !ok {
-			unmapped[path.Dir(f)] = append(unmapped[path.Dir(f)], f)
-			continue
-		}
-		_ = pkg
-		for _, c := range crates {
-			crateFiles[c] = append(crateFiles[c], f)
-		}
-	}
+	r := classify(m, files)
 
 	fmt.Printf("dcrd %s..%s: %d files changed\n\n", *from, *to, len(files))
 
-	if len(crateFiles) > 0 {
+	if len(r.code) > 0 {
 		fmt.Println("Crates to re-review:")
-		for _, c := range sortedKeys(crateFiles) {
-			fs := dedupe(crateFiles[c])
-			fmt.Printf("  %-24s %d file(s)\n", c, len(fs))
-			for _, f := range fs {
-				fmt.Printf("      %s\n", f)
-			}
-		}
-		fmt.Println()
+		printCrates(r.code)
 	} else {
-		fmt.Println("No changed file resolves to a ported package.")
+		fmt.Println("No changed source file resolves to a ported package.")
 		fmt.Println()
 	}
 
-	if len(unmapped) > 0 {
+	if len(r.tests) > 0 {
+		fmt.Println("Upstream test files changed -- port or regenerate any vectors copied from them:")
+		printCrates(r.tests)
+	}
+
+	if len(r.unmapped) > 0 {
 		fmt.Println("Unmapped upstream paths -- either not ported, or missing from PARITY.md:")
-		for _, d := range sortedKeys(unmapped) {
-			fmt.Printf("  %-40s %d file(s)\n", d, len(unmapped[d]))
+		for _, d := range sortedKeys(r.unmapped) {
+			fmt.Printf("  %-40s %d file(s)\n", d, len(r.unmapped[d]))
 		}
 	}
 }

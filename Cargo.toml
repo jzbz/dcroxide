@@ -77,6 +77,18 @@ debug = "line-tables-only"
 # websocket.rs are inert in release builds and only meaningful under
 # `cargo test`.
 panic = "abort"
+# Integer overflow wraps, as Go's does, rather than panicking.
+#
+# This is release's default, pinned so nobody turns it on as hardening:
+# with `panic = "abort"` above, every overflowing `+`, `*` or `<<` would
+# become a process abort, some of them on values a peer supplies, where
+# dcrd wraps.  The consensus crates switch `arithmetic_side_effects` off
+# crate-wide, so no lint points at those sites.  Wrapping at the Rust
+# type's width matches Go only where the port uses Go's width; that is
+# each site's job, not this setting's.  Dev and test builds keep the
+# checks on, so CI's `test-wrapping` job runs the suites again with them
+# off, computing the way the shipped binary does.
+overflow-checks = false
 
 # The profile release artifacts are cut from.
 #

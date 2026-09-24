@@ -12,9 +12,7 @@
 //! Documented divergences: dcrd's `RSA4096` algorithm is not offered
 //! — the `rsa` crate carries the unfixed Marvin-attack advisory
 //! (RUSTSEC-2023-0071) and no dcrd daemon component uses RSA, so
-//! gencerts here supports P-256/P-384/P-521/Ed25519 only; the IDNA
-//! conversion is UTS-46 where Go's `idna.ToASCII` is the bare
-//! Punycode profile (case-preserving, no validation); the CA key
+//! gencerts here supports P-256/P-384/P-521/Ed25519 only; the CA key
 //! loader accepts the forms the Decred tools emit rather than every
 //! ` PRIVATE KEY` suffix Go probes; the elapsed-validity error
 //! renders the date as whole-second UTC where Go renders the local
@@ -284,7 +282,7 @@ fn new_template<E: GenEnv>(
     for h in hosts {
         let mut h = h.clone();
         if !is_ascii_str(&h) {
-            h = idna::domain_to_ascii(&h).map_err(|e| e.to_string())?;
+            h = crate::punycode::to_ascii(&h)?;
         }
         match parse_ip(&h) {
             Some(ip) => ip_addresses.push(ip),
@@ -292,7 +290,7 @@ fn new_template<E: GenEnv>(
         }
     }
     if !is_ascii_str(&cn) {
-        cn = idna::domain_to_ascii(&cn).map_err(|e| e.to_string())?;
+        cn = crate::punycode::to_ascii(&cn)?;
     }
 
     Ok(GenTemplate {
@@ -316,11 +314,16 @@ fn valid_until(now_unix: i64, years: i64) -> i64 {
 }
 
 /// The subject/issuer RDN sequence Go marshals for a `pkix.Name` with
-/// CommonName and Organization.
+/// CommonName and Organization; `ToRDNSequence` leaves an empty
+/// CommonName out (`gencerts -o ''` with no host).
 fn name(org: &str, cn: &str) -> Vec<u8> {
     let org_atv = der::sequence(&[der::oid(&[2, 5, 4, 10]), der::directory_string(org)].concat());
-    let cn_atv = der::sequence(&[der::oid(&[2, 5, 4, 3]), der::directory_string(cn)].concat());
-    der::sequence(&[der::set(&org_atv), der::set(&cn_atv)].concat())
+    let mut rdns = der::set(&org_atv);
+    if !cn.is_empty() {
+        let cn_atv = der::sequence(&[der::oid(&[2, 5, 4, 3]), der::directory_string(cn)].concat());
+        rdns.extend_from_slice(&der::set(&cn_atv));
+    }
+    der::sequence(&rdns)
 }
 
 /// The IPv4 form of a 16-byte address when it is IPv4-mapped.
@@ -335,10 +338,11 @@ fn to4(ip: &[u8; 16]) -> Option<[u8; 4]> {
 
 /// The gencerts extension block in Go's emission order: KeyUsage
 /// (critical), BasicConstraints (critical; the CA boolean only for an
-/// authority), the SHA-1 SubjectKeyIdentifier Go auto-computes for CA
-/// certificates, the AuthorityKeyIdentifier copied from the parent
-/// for issued certificates, and the SubjectAlternativeName only when
-/// hosts were given.
+/// authority), the SubjectKeyIdentifier Go auto-computes for CA
+/// certificates ([`crate::x509::subject_key_id`]), the
+/// AuthorityKeyIdentifier copied from the parent for issued
+/// certificates, and the SubjectAlternativeName only when hosts were
+/// given.
 fn extensions(
     template: &GenTemplate,
     signs: bool,
@@ -382,8 +386,7 @@ fn extensions(
 
     // SubjectKeyIdentifier: Go computes it for CA certificates only.
     if is_ca {
-        use sha1::{Digest, Sha1};
-        let skid = Sha1::digest(public_key_bytes);
+        let skid = crate::x509::subject_key_id(public_key_bytes);
         exts.extend_from_slice(&der::sequence(
             &[
                 der::oid(&[2, 5, 29, 14]),

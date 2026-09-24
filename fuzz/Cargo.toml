@@ -11,9 +11,20 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
+dcroxide-base58 = { path = "../crates/dcroxide-base58" }
+dcroxide-blockchain = { path = "../crates/dcroxide-blockchain" }
+dcroxide-chaincfg = { path = "../crates/dcroxide-chaincfg" }
 dcroxide-chainhash = { path = "../crates/dcroxide-chainhash" }
 dcroxide-crypto = { path = "../crates/dcroxide-crypto" }
 dcroxide-dcrec = { path = "../crates/dcroxide-dcrec" }
+dcroxide-dcrjson = { path = "../crates/dcroxide-dcrjson" }
+# For http_head_parse and ws_frame_read.  It brings the node's whole tree
+# (rustls, ring, ureq) into the fuzz build, every crate of it pinned in
+# the workspace lockfile at the same version.
+dcroxide-node = { path = "../crates/dcroxide-node" }
+dcroxide-rpc = { path = "../crates/dcroxide-rpc" }
+dcroxide-rpctypes = { path = "../crates/dcroxide-rpctypes" }
+dcroxide-stake = { path = "../crates/dcroxide-stake" }
 dcroxide-txscript = { path = "../crates/dcroxide-txscript" }
 dcroxide-uint256 = { path = "../crates/dcroxide-uint256" }
 dcroxide-wire = { path = "../crates/dcroxide-wire" }
@@ -100,6 +111,41 @@ bench = false
 [[bin]]
 name = "txscript_engine"
 path = "fuzz_targets/txscript_engine.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_request_parse"
+path = "fuzz_targets/rpc_request_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "address_decode"
+path = "fuzz_targets/address_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "db_record_decode"
+path = "fuzz_targets/db_record_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ws_frame_read"
+path = "fuzz_targets/ws_frame_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_head_parse"
+path = "fuzz_targets/http_head_parse.rs"
 test = false
 doc = false
 bench = false

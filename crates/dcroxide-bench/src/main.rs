@@ -11,6 +11,7 @@
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -178,8 +179,10 @@ Usage:
       spreads that drift across all arms instead of loading it onto the
       last one, and repetition makes it visible.
 
-      --warmup <n> discards the first n runs from the summary (default
-      1).  They are still recorded, flagged, so the cost is visible.
+      --warmup <n> runs n extra runs before the first repetition,
+      rotating through the arms, and leaves them out of the summary
+      (default 1).  They are still recorded, flagged, so the cost is
+      visible, and every arm keeps all <reps> of its measured runs.
       This is not fussiness: the first full-chain run of a sweep took
       6,440 s against 3,866-3,888 s for the same configuration later,
       a 66% cold-start penalty that the drift check then misreported as
@@ -1091,6 +1094,49 @@ fn parse_arms(path: &Path) -> Result<Vec<SweepArm>, String> {
     Ok(arms)
 }
 
+/// One planned sweep run: the arm, the repetition it belongs to (0 for a
+/// warm-up), and whether it is a warm-up left out of the summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SweepRun {
+    arm: usize,
+    rep: usize,
+    warmup: bool,
+}
+
+/// The order a sweep runs in: `warmup` extra runs rotating through the
+/// arms, then `reps` repetitions of every arm, the order rotated each
+/// repetition so no arm keeps a fixed position.
+///
+/// The warm-ups are extra runs, not the first runs of the measured ones.
+/// Taking them out of the measured runs took them from arm 0, the
+/// baseline, because repetition 1 always starts there: the baseline was
+/// summarised from one run fewer than every other arm, which narrowed the
+/// very range the overlap verdict compares against, and with `--reps 1` it
+/// had no runs at all.
+fn sweep_schedule(arms: usize, reps: usize, warmup: usize) -> Vec<SweepRun> {
+    let mut runs = Vec::with_capacity(warmup.saturating_add(reps.saturating_mul(arms)));
+    if arms == 0 {
+        return runs;
+    }
+    for w in 0..warmup {
+        runs.push(SweepRun {
+            arm: w.checked_rem(arms).unwrap_or(0),
+            rep: 0,
+            warmup: true,
+        });
+    }
+    for rep in 0..reps {
+        for offset in 0..arms {
+            runs.push(SweepRun {
+                arm: offset.saturating_add(rep).checked_rem(arms).unwrap_or(0),
+                rep: rep.saturating_add(1),
+                warmup: false,
+            });
+        }
+    }
+    runs
+}
+
 /// The median of a slice, by value.
 fn median(values: &mut [f64]) -> f64 {
     if values.is_empty() {
@@ -1136,82 +1182,85 @@ fn cmd_sweep(args: &Args) -> Result<(), String> {
     // (arm index, seconds), in execution order, so drift can be read off
     // the sequence rather than assumed absent.
     let mut results: Vec<(usize, f64)> = Vec::new();
-    let total = reps.saturating_mul(arms.len());
+    // Rotated each repetition: an arm that always ran last would absorb
+    // whatever the sweep accumulates.
+    let schedule = sweep_schedule(arms.len(), reps, warmup);
+    let total = schedule.len();
     let mut run_no = 0usize;
 
-    for rep in 0..reps {
-        // Rotate the order each repetition: an arm that always ran last
-        // would absorb whatever the sweep accumulates.
-        for offset in 0..arms.len() {
-            let idx = offset
-                .saturating_add(rep)
-                .checked_rem(arms.len())
-                .unwrap_or(0);
-            let arm = &arms[idx];
-            run_no = run_no.saturating_add(1);
-            let wd = workdir_root.join(format!("sweep-{}-r{}", arm.name, rep.saturating_add(1)));
-            let _ = std::fs::remove_dir_all(&wd);
+    for run in &schedule {
+        let (idx, rep, warming) = (run.arm, run.rep, run.warmup);
+        let arm = &arms[idx];
+        run_no = run_no.saturating_add(1);
+        let wd = if warming {
+            workdir_root.join(format!("sweep-{}-w{run_no}", arm.name))
+        } else {
+            workdir_root.join(format!("sweep-{}-r{rep}", arm.name))
+        };
+        let _ = std::fs::remove_dir_all(&wd);
 
-            let env = RunEnv::capture(&workdir_root);
-            eprintln!(
-                "[{run_no}/{total}] rep {} arm {} (load {}, {} MiB free RAM, {} GiB free disk)",
-                rep.saturating_add(1),
-                arm.name,
-                env.load1,
-                env.mem_available_kb / 1024,
-                env.disk_avail_kb / (1024 * 1024),
-            );
-
-            let mut cmd = Command::new(&exe);
-            cmd.arg("replay")
-                .arg("--in")
-                .arg(&corpus)
-                .arg("--workdir")
-                .arg(&wd)
-                .arg("--net")
-                .arg(&net)
-                .arg("--report")
-                .arg("1000000");
-            if let Some(max) = args.get("max") {
-                cmd.arg("--max").arg(max);
-            }
-            for f in &arm.flags {
-                cmd.arg(f);
-            }
-
-            let started = Instant::now();
-            let status = cmd
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .status()
-                .map_err(|e| format!("spawning replay: {e}"))?;
-            let seconds = started.elapsed().as_secs_f64();
-            if !status.success() {
-                return Err(format!("arm {} failed: {status}", arm.name));
-            }
-            let _ = std::fs::remove_dir_all(&wd);
-
-            let warming = run_no <= warmup;
-            writeln!(
-                out,
-                "{{\"run\":{},\"rep\":{},\"arm\":\"{}\",\"seconds\":{:.2},\"warmup\":{},\"load1\":\"{}\",\"mem_avail_kb\":{},\"disk_avail_kb\":{},\"cpu_mhz\":\"{}\"}}",
-                run_no,
-                rep.saturating_add(1),
-                arm.name,
-                seconds,
-                warming,
-                env.load1,
-                env.mem_available_kb,
-                env.disk_avail_kb,
-                env.cpu_mhz,
-            )
-            .map_err(|e| format!("writing results: {e}"))?;
-            out.flush().map_err(|e| format!("writing results: {e}"))?;
+        let env = RunEnv::capture(&workdir_root);
+        eprintln!(
+            "[{run_no}/{total}] {} arm {} (load {}, {} MiB free RAM, {} GiB free disk)",
             if warming {
-                eprintln!("      (warm-up, excluded from the summary)");
+                String::from("warm-up")
             } else {
-                results.push((idx, seconds));
-            }
+                format!("rep {rep}")
+            },
+            arm.name,
+            env.load1,
+            env.mem_available_kb / 1024,
+            env.disk_avail_kb / (1024 * 1024),
+        );
+
+        let mut cmd = Command::new(&exe);
+        cmd.arg("replay")
+            .arg("--in")
+            .arg(&corpus)
+            .arg("--workdir")
+            .arg(&wd)
+            .arg("--net")
+            .arg(&net)
+            .arg("--report")
+            .arg("1000000");
+        if let Some(max) = args.get("max") {
+            cmd.arg("--max").arg(max);
+        }
+        for f in &arm.flags {
+            cmd.arg(f);
+        }
+
+        let started = Instant::now();
+        let status = cmd
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| format!("spawning replay: {e}"))?;
+        let seconds = started.elapsed().as_secs_f64();
+        if !status.success() {
+            return Err(format!("arm {} failed: {status}", arm.name));
+        }
+        let _ = std::fs::remove_dir_all(&wd);
+
+        writeln!(
+            out,
+            "{{\"run\":{},\"rep\":{},\"arm\":\"{}\",\"seconds\":{:.2},\"warmup\":{},\"load1\":\"{}\",\"mem_avail_kb\":{},\"disk_avail_kb\":{},\"cpu_mhz\":\"{}\"}}",
+            run_no,
+            rep,
+            arm.name,
+            seconds,
+            warming,
+            env.load1,
+            env.mem_available_kb,
+            env.disk_avail_kb,
+            env.cpu_mhz,
+        )
+        .map_err(|e| format!("writing results: {e}"))?;
+        out.flush().map_err(|e| format!("writing results: {e}"))?;
+        if warming {
+            eprintln!("      (warm-up, excluded from the summary)");
+        } else {
+            results.push((idx, seconds));
         }
     }
 
@@ -1238,6 +1287,9 @@ fn cmd_sweep(args: &Args) -> Result<(), String> {
         }
     }
     println!();
+    // The baseline is the first arm in the arms file, always: an arm with
+    // no measured runs is reported as such rather than handing the label,
+    // and every ratio, to whichever arm comes next.
     let mut baseline: Option<f64> = None;
     let mut base_range: Option<(f64, f64)> = None;
     for (i, arm) in arms.iter().enumerate() {
@@ -1247,29 +1299,31 @@ fn cmd_sweep(args: &Args) -> Result<(), String> {
             .map(|(_, s)| *s)
             .collect();
         if times.is_empty() {
+            println!("{:<16} no measured runs", arm.name);
             continue;
         }
         let lo = times.iter().cloned().fold(f64::INFINITY, f64::min);
         let hi = times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let med = median(&mut times);
         let rel = match baseline {
-            None => {
+            _ if i == 0 => {
                 baseline = Some(med);
                 String::from("(baseline)")
             }
             Some(b) if b > 0.0 => format!("{:.2}x baseline", med / b),
-            Some(_) => String::new(),
+            _ => String::new(),
         };
         // Prefer this to the medians: disjoint ranges are a claim about
         // every observation, where a median difference smaller than the
         // drift is a claim about nothing.
         let overlap = match base_range {
-            None => {
+            _ if i == 0 => {
                 base_range = Some((lo, hi));
                 String::new()
             }
             Some((blo, bhi)) if hi < blo || lo > bhi => String::from("   disjoint from baseline"),
             Some(_) => String::from("   OVERLAPS baseline"),
+            None => String::new(),
         };
         println!(
             "{:<16} median {med:>8.1}s   min {lo:>8.1}s   max {hi:>8.1}s   spread {:>5.1}%   {rel}{overlap}",
@@ -1398,18 +1452,72 @@ fn cmd_pinprobe(args: &Args) -> Result<(), String> {
         return Err("--commits must be at least 1".to_string());
     }
 
-    // Observations are appended from the flushing thread and drained here.
-    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&log);
     let db_path = data_dir.join("blocks_ffldb");
     let mut opts = Options::new(&db_path, params.net.0);
-    opts.flush_stats_every = 1;
     // A small ceiling on purpose: the probe has to reach flushes, and at
     // the 100 MiB production default a run short enough to iterate on
     // would never trigger one.
     opts.cache_max_size = cache_mib.saturating_mul(1024 * 1024);
+    eprintln!(
+        "pinprobe: {writes} writes over {commits} commits, hold={}",
+        match hold {
+            Hold::None => "none",
+            Hold::All => "all",
+            Hold::Two => "two",
+        }
+    );
+    let run = run_pinprobe(opts, false, writes, commits, hold)?;
+    if hold == Hold::Two {
+        match run.released_after {
+            Some(n) => eprintln!("pinprobe: reader released after flush {n}"),
+            None => eprintln!(
+                "pinprobe: WARNING only {} flush(es) completed, so the reader was held \
+                 for the whole run and this is an `all` arm; raise --writes or lower \
+                 --cachemib",
+                run.flushes
+            ),
+        }
+    }
+
+    for line in &run.lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// What one probe run produced.
+struct PinprobeRun {
+    /// One JSON object per flush, in order.
+    lines: Vec<String>,
+    /// Flushes completed during the write loop.
+    flushes: u64,
+    /// For the `two` arm, the flush count when the reader was released,
+    /// or `None` when fewer than two flushes happened and it never was.
+    released_after: Option<u64>,
+}
+
+/// The probe itself: open (or, for tests, create) the store under `opts`,
+/// apply the writes, and hold what `hold` says across the flushes.
+fn run_pinprobe(
+    mut opts: Options,
+    create: bool,
+    writes: u64,
+    commits: u64,
+    hold: Hold,
+) -> Result<PinprobeRun, String> {
+    // Observations are appended from the flushing thread and drained here.
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&log);
+    // Flushes are counted, not inferred from commits: a flush fires on
+    // the overlay's size or age, independent of the commit count, so
+    // releasing the `two` reader after its second COMMIT released it
+    // before any flush at all -- the arm was a second `none` control.
+    let flushes = Arc::new(AtomicU64::new(0));
+    let seen = Arc::clone(&flushes);
+    opts.flush_stats_every = 1;
     opts.flush_observer = Some(Arc::new(
         move |obs: &dcroxide_database::FlushObservation| {
+            seen.fetch_add(1, Ordering::SeqCst);
             let stats = obs
                 .stats
                 .map(|s| s.to_json())
@@ -1425,15 +1533,14 @@ fn cmd_pinprobe(args: &Args) -> Result<(), String> {
         },
     ));
 
-    let db = Database::open(&opts).map_err(|e| e.to_string())?;
-    eprintln!(
-        "pinprobe: {writes} writes over {commits} commits, hold={}",
-        match hold {
-            Hold::None => "none",
-            Hold::All => "all",
-            Hold::Two => "two",
-        }
-    );
+    let db = if create {
+        std::fs::create_dir_all(&opts.path)
+            .map_err(|e| format!("unable to create database directory: {e}"))?;
+        Database::create(&opts)
+    } else {
+        Database::open(&opts)
+    }
+    .map_err(|e| e.to_string())?;
 
     // Held for the whole run in the `all` arm; dropped after two flushes
     // in the `two` arm.
@@ -1441,10 +1548,11 @@ fn cmd_pinprobe(args: &Args) -> Result<(), String> {
         Hold::None => None,
         _ => Some(db.begin(false).map_err(|e| e.to_string())?),
     };
+    let mut released_after = None;
 
     let per_commit = writes.div_ceil(commits);
     let mut written = 0u64;
-    for commit in 0..commits {
+    for _ in 0..commits {
         let tx = db.begin(true).map_err(|e| e.to_string())?;
         {
             let meta = tx.metadata();
@@ -1465,16 +1573,22 @@ fn cmd_pinprobe(args: &Args) -> Result<(), String> {
         }
         tx.commit().map_err(|e| e.to_string())?;
 
-        if hold == Hold::Two && commit == 1 {
+        // A flush the commit triggers runs inside `commit` and reports to
+        // the observer before it returns, so the count is current here.
+        let done = flushes.load(Ordering::SeqCst);
+        if hold == Hold::Two && held.is_some() && done >= 2 {
             held = None;
+            released_after = Some(done);
         }
     }
     drop(held);
 
-    for line in log.lock().expect("log poisoned").iter() {
-        println!("{line}");
-    }
-    Ok(())
+    let lines = log.lock().expect("log poisoned").clone();
+    Ok(PinprobeRun {
+        lines,
+        flushes: flushes.load(Ordering::SeqCst),
+        released_after,
+    })
 }
 
 fn main() -> std::process::ExitCode {
@@ -1547,5 +1661,70 @@ fn main() -> std::process::ExitCode {
             eprint!("{HELP}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every arm keeps all of its repetitions, and the warm-ups are extra
+    /// runs ahead of them: taking the warm-up out of the measured runs took
+    /// it from arm 0, the baseline, and with one repetition left the
+    /// baseline with no runs at all.
+    #[test]
+    fn warm_ups_do_not_come_out_of_the_baseline() {
+        for (arms, reps, warmup) in [(2, 1, 1), (3, 3, 1), (4, 3, 2), (2, 2, 5), (3, 2, 0)] {
+            let runs = sweep_schedule(arms, reps, warmup);
+            assert_eq!(runs.len(), warmup + arms * reps);
+            assert!(
+                runs[..warmup].iter().all(|r| r.warmup && r.rep == 0),
+                "the warm-ups come first"
+            );
+            for arm in 0..arms {
+                let measured = runs.iter().filter(|r| !r.warmup && r.arm == arm).count();
+                assert_eq!(
+                    measured, reps,
+                    "arm {arm} of {arms} with --reps {reps} --warmup {warmup}"
+                );
+            }
+            // Each repetition still runs every arm once, rotated.
+            for rep in 1..=reps {
+                let order: Vec<usize> = runs
+                    .iter()
+                    .filter(|r| r.rep == rep)
+                    .map(|r| r.arm)
+                    .collect();
+                let expected: Vec<usize> = (0..arms).map(|o| (o + rep - 1) % arms).collect();
+                assert_eq!(order, expected, "repetition {rep}");
+            }
+        }
+    }
+
+    /// The `two` arm holds its reader across exactly two flushes. It used
+    /// to drop it after the second commit, which with any realistic
+    /// parameters came before the first flush.
+    #[test]
+    fn the_two_arm_reader_spans_two_flushes() {
+        let dir = std::env::temp_dir().join(format!(
+            "dcroxide-bench-pinprobe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut opts = Options::new(dir.join("blocks_ffldb"), mainnet_params().net.0);
+        opts.cache_max_size = 256 * 1024;
+        let run = run_pinprobe(opts, true, 20_000, 40, Hold::Two);
+        let _ = std::fs::remove_dir_all(&dir);
+        let run = run.expect("probe runs");
+        assert!(
+            run.flushes >= 3,
+            "the fixture must flush past the release to test it (got {})",
+            run.flushes
+        );
+        assert_eq!(run.released_after, Some(2));
+        assert_eq!(run.lines.len() as u64, run.flushes);
     }
 }

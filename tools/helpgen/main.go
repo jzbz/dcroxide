@@ -3,20 +3,34 @@
 // must reproduce, through the exact path dcrd's loadConfig takes — a
 // parser over the config struct (extracted verbatim from dcrd
 // v1.10.7 config.go; the service group is NOT added, matching dcrd's
-// dedicated help pre-parse) with the HelpFlag error written out.
+// dedicated help pre-parse), filled with loadConfig's defaults first so
+// go-flags prints their "(default: X)" notes, with the HelpFlag error
+// written out.
 //
-// Regenerate the vector with:
+// go-flags wraps the help to the width of the terminal on stdin and
+// falls back to 80 columns without one, so the width is part of the
+// vector.  Regenerate the 80-column vector with no terminal on stdin:
 //
-//	cd tools/helpgen && go run . > ../../crates/dcroxide-node/tests/data/help_vector.txt
+//	cd tools/helpgen && go run . < /dev/null > ../../crates/dcroxide-node/tests/data/help_vector.txt
+//
+// and the wide one from a terminal exactly 140 columns wide:
+//
+//	cd tools/helpgen && go run . > ../../crates/dcroxide-node/tests/data/help_vector_140.txt
 package main
 
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	flags "github.com/jessevdk/go-flags"
 )
+
+// helpHome stands in for dcrd's defaultHomeDir (dcrutil.AppDataDir, here
+// for the dcroxide application name), which depends on the machine; the
+// parity test renders over the same path.
+const helpHome = "/home/user/.dcroxide"
 
 type config struct {
 	// General application behavior.
@@ -131,7 +145,57 @@ type config struct {
 }
 
 func main() {
-	var cfg config
+	// The defaults literal at the top of dcrd's loadConfig (config.go),
+	// with dcroxide's config file name.  go-flags' ParseArgs records
+	// each value as the option's default before parsing, and the help
+	// shows the ones that are not zero.
+	cfg := config{
+		// General application behavior.
+		HomeDir:          helpHome,
+		ConfigFile:       filepath.Join(helpHome, "dcroxide.conf"),
+		DataDir:          filepath.Join(helpHome, "data"),
+		LogDir:           filepath.Join(helpHome, "logs"),
+		LogSize:          "10M",
+		DbType:           "ffldb",
+		DebugLevel:       "info",
+		SigCacheMaxSize:  100000,
+		UtxoCacheMaxSize: 150,
+
+		// RPC server options and policy.
+		RPCCert:              filepath.Join(helpHome, "rpc.cert"),
+		RPCKey:               filepath.Join(helpHome, "rpc.key"),
+		RPCAuthType:          "basic",
+		RPCClientCAs:         filepath.Join(helpHome, "clients.pem"),
+		TLSCurve:             "P-256",
+		RPCMaxClients:        10,
+		RPCMaxWebsockets:     25,
+		RPCMaxConcurrentReqs: 20,
+
+		// P2P network options.
+		MaxSameIP:       5,
+		MaxPeers:        125,
+		DialTimeout:     time.Second * 30,
+		PeerIdleTimeout: time.Second * 120,
+
+		// Banning options.
+		BanDuration:  time.Hour * 24,
+		BanThreshold: 100,
+
+		// Relay and mempool policy (mempool.DefaultMinRelayTxFee.ToCoin()).
+		MinRelayTxFee: float64(1e4) / 1e8,
+		MaxOrphanTxs:  100,
+		AllowOldVotes: false,
+
+		// Mining options and policy.
+		Generate:            false,
+		BlockMaxSize:        375000,
+		NoMiningStateSync:   false,
+		AllowUnsyncedMining: false,
+
+		// Indexing options.
+		TxIndex:           false,
+		NoExistsAddrIndex: false,
+	}
 	parser := flags.NewParser(&cfg, flags.HelpFlag)
 	// dcroxide's binary name, so the usage line matches what its own
 	// -h must print (dcrd renders its argv[0] the same way).
@@ -152,5 +216,3 @@ func asFlagsErr(err error, target **flags.Error) bool {
 	}
 	return ok
 }
-
-var _ = time.Duration(0)

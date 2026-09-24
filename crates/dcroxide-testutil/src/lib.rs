@@ -2,9 +2,9 @@
 //! Internal test utilities for dcroxide differential tests.
 //!
 //! Provides the harness for `tools/oracle` (the Go shim linking dcrd's own
-//! packages at the master `452c1a6c` module versions) plus a deterministic PRNG
-//! and hex helpers, so every crate's differential tests share one
-//! implementation.
+//! packages at the parity target, master `b9634e01`; its `go.mod` records how
+//! each module is pinned) plus a deterministic PRNG and hex helpers, so every
+//! crate's differential tests share one implementation.
 //!
 //! This crate is a dev-dependency only and is never published.
 
@@ -16,6 +16,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Encode bytes as lowercase hex.
@@ -131,23 +133,36 @@ fn oracle_dir() -> PathBuf {
     dir.join("oracle")
 }
 
+/// How many times this process has run `go build` for the oracle.
+static ORACLE_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+/// The oracle binary path, built on the first call in this process.
+///
+/// Go's build cache spares the recompile but not the link: every `go build
+/// -o` relinks a binary that pulls in most of dcrd's modules, which is
+/// seconds each, and every [`Oracle::spawn`] used to pay it. Once per test
+/// process is enough, since the source cannot change under a running test.
+/// Concurrent first callers wait for the one build rather than each running
+/// their own.
+fn build_oracle() -> PathBuf {
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT.get_or_init(build_oracle_uncached).clone()
+}
+
 /// Build the oracle into [`oracle_dir`] and return the binary path.
 ///
-/// Multiple test binaries run concurrently and all build the oracle, so the
-/// build goes to a process-unique path first and is then atomically renamed
-/// into place — spawning processes always see a complete binary (Go's build
-/// cache makes the duplicate builds cheap).
-fn build_oracle() -> PathBuf {
+/// Multiple test binaries run concurrently and each builds the oracle once,
+/// so the build goes to a process-unique path first and is then atomically
+/// renamed into place — spawning processes always see a complete binary.
+fn build_oracle_uncached() -> PathBuf {
+    ORACLE_BUILDS.fetch_add(1, Ordering::Relaxed);
     let root = repo_root();
     let out_dir = oracle_dir();
     std::fs::create_dir_all(&out_dir).expect("create the oracle build directory");
     let suffix = if cfg!(windows) { ".exe" } else { "" };
     let bin = out_dir.join(format!("dcrd-oracle{suffix}"));
-    // Unique per process *and* per calling thread: tests within one binary
-    // run concurrently and share a pid.
-    static BUILD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = out_dir.join(format!("dcrd-oracle-{}-{seq}{suffix}", std::process::id()));
+    // Unique per process: `build_oracle` runs this at most once in each.
+    let tmp = out_dir.join(format!("dcrd-oracle-{}{suffix}", std::process::id()));
 
     let output = Command::new("go")
         .args(["build", "-o"])
@@ -234,7 +249,12 @@ impl Drop for Oracle {
 /// The dcrd commit this port is a parity port of.  A dcrd binary built from
 /// anything else is a different specification, so the interop harness below
 /// refuses to run against one.
-pub const DCRD_PARITY_COMMIT: &str = "29f17894";
+///
+/// At most nine characters: dcrd stamps `revision[:9]` into its version
+/// string (`internal/version/version.go`), and a longer prefix could never
+/// match it.  CI's `DCRD_COMMIT` and the pin in `tools/oracle/go.mod` must
+/// name the same commit; a unit test below holds all three together.
+pub const DCRD_PARITY_COMMIT: &str = "b9634e01";
 
 /// A dcrd process running on simnet, for interop tests over a real socket.
 ///
@@ -251,6 +271,8 @@ pub struct DcrdNode {
     child: Child,
     /// The P2P address to dial.
     pub p2p_addr: String,
+    /// dcrd's stdout and stderr, inside the data directory.
+    log: PathBuf,
     _datadir: TempDir,
 }
 
@@ -295,11 +317,9 @@ impl DcrdNode {
         if let Some(addr) = connect {
             cmd.arg(format!("--connect={addr}"));
         }
-        let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawning {bin}: {e}"));
+        let log = datadir.path().join("dcrd.log");
+        let mut child =
+            spawn_logged(&mut cmd, &log).unwrap_or_else(|e| panic!("spawning {bin}: {e}"));
 
         // Wait for the socket rather than for a log line: the log format is
         // not a stable interface and a bound port is the thing under test.
@@ -315,10 +335,14 @@ impl DcrdNode {
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
-                panic!("dcrd did not listen on {p2p_addr} within 30s");
+                let _ = child.wait();
+                panic!(
+                    "dcrd did not listen on {p2p_addr} within 30s\n{}",
+                    log_tail(&log)
+                );
             }
             if let Ok(Some(status)) = child.try_wait() {
-                panic!("dcrd exited before listening: {status}");
+                panic!("dcrd exited before listening: {status}\n{}", log_tail(&log));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -326,6 +350,7 @@ impl DcrdNode {
         DcrdNode {
             child,
             p2p_addr,
+            log,
             _datadir: datadir,
         }
     }
@@ -335,6 +360,42 @@ impl Drop for DcrdNode {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // A failing interop test is the one time dcrd's side of the story
+        // matters, and the data directory is about to be removed.
+        if std::thread::panicking() {
+            eprintln!("{}", log_tail(&self.log));
+        }
+    }
+}
+
+/// Spawn `cmd` with its stdout and stderr both written to the file `log`.
+///
+/// Neither may be a pipe that nobody reads.  dcrd writes every log line
+/// synchronously to stdout (`log.go`, `logWriter.Write`), so once a pipe's
+/// buffer fills (64 KiB on Linux) every goroutine that logs blocks in
+/// write(2) and the node stops answering its peers, which a test would
+/// report as an interop timeout.  A file never fills, and it keeps the
+/// output for [`log_tail`].
+fn spawn_logged(cmd: &mut Command, log: &Path) -> std::io::Result<Child> {
+    let out = std::fs::File::create(log)?;
+    let err = out.try_clone()?;
+    cmd.stdout(out).stderr(err).spawn()
+}
+
+/// The last 64 KiB of dcrd's output, headed with where it came from.
+fn log_tail(log: &Path) -> String {
+    const TAIL: usize = 64 * 1024;
+    match std::fs::read(log) {
+        Ok(bytes) => {
+            let start = bytes.len().saturating_sub(TAIL);
+            format!(
+                "--- dcrd output ({}, last {} bytes) ---\n{}",
+                log.display(),
+                bytes.len() - start,
+                String::from_utf8_lossy(&bytes[start..])
+            )
+        }
+        Err(e) => format!("--- dcrd output unavailable ({}): {e} ---", log.display()),
     }
 }
 
@@ -454,4 +515,98 @@ pub fn dcrd_available() -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pin the interop harness enforces is the commit CI builds dcrd
+    /// from and the commit the oracle links: the harness once required
+    /// `29f17894` while everything else had moved to `b9634e01`, so a dcrd
+    /// built at the real pin was refused as "a different specification".
+    #[test]
+    fn the_dcrd_pin_matches_ci_and_the_oracle() {
+        assert!(
+            DCRD_PARITY_COMMIT.len() <= 9,
+            "dcrd stamps a 9-character revision; a longer pin never matches it"
+        );
+
+        let ci_path = repo_root().join(".github").join("workflows").join("ci.yml");
+        let ci = std::fs::read_to_string(&ci_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", ci_path.display()));
+        let ci_commit = ci
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("DCRD_COMMIT:"))
+            .expect("ci.yml sets DCRD_COMMIT")
+            .trim();
+        assert!(
+            ci_commit.starts_with(DCRD_PARITY_COMMIT),
+            "CI builds dcrd at {ci_commit}, but the harness requires {DCRD_PARITY_COMMIT}"
+        );
+
+        let gomod_path = repo_root().join("tools").join("oracle").join("go.mod");
+        let gomod = std::fs::read_to_string(&gomod_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", gomod_path.display()));
+        let oracle_pin: String = gomod
+            .split("dcrd master commit ")
+            .nth(1)
+            .expect("tools/oracle/go.mod names the parity commit")
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect();
+        assert_eq!(
+            oracle_pin, DCRD_PARITY_COMMIT,
+            "the oracle links dcrd at {oracle_pin}, but the harness requires {DCRD_PARITY_COMMIT}"
+        );
+    }
+
+    /// A child that writes far more than a pipe buffer holds, on both
+    /// streams, still runs to completion: dcrd blocks in write(2) on a full
+    /// pipe that nobody drains.
+    #[cfg(unix)]
+    #[test]
+    fn a_chatty_child_does_not_block_on_its_output() {
+        const EACH: u64 = 1024 * 1024;
+        let dir = TempDir::new("spawn-logged");
+        let log = dir.path().join("out.log");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "head -c {EACH} /dev/zero; head -c {EACH} /dev/zero >&2"
+        ));
+        let mut child = spawn_logged(&mut cmd, &log).expect("spawn sh");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll the child") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the child blocked writing its output");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "sh failed: {status}");
+        let written = std::fs::metadata(&log).expect("log exists").len();
+        assert_eq!(written, 2 * EACH, "both streams land in the log");
+        assert!(log_tail(&log).contains("last 65536 bytes"));
+    }
+
+    /// Spawning the oracle repeatedly builds it once per process.
+    #[test]
+    fn the_oracle_is_built_once_per_process() {
+        let Some(first) = oracle_or_skip() else {
+            return;
+        };
+        let second = Oracle::spawn();
+        drop((first, second));
+        assert_eq!(build_oracle(), build_oracle());
+        assert_eq!(
+            ORACLE_BUILDS.load(Ordering::Relaxed),
+            1,
+            "every spawn after the first must reuse the built binary"
+        );
+    }
 }
