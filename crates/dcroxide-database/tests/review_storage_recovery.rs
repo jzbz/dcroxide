@@ -390,6 +390,9 @@ fn missing_block_data_at_open_is_corruption_with_dcrds_warning() {
 /// records the allocator state that makes a repair unnecessary only
 /// from its own drop, or on a quick-repair commit, which `close` now
 /// makes.
+// Copies the files of a store that is still open, which Windows refuses:
+// redb holds a byte-range lock on its file while the database is open.
+#[cfg(not(windows))]
 #[test]
 fn a_clean_close_needs_no_repair_even_if_the_handle_lives_on() {
     let dir = TempDir::new().expect("tempdir");
@@ -429,6 +432,9 @@ fn a_clean_close_needs_no_repair_even_if_the_handle_lives_on() {
 /// The other side: a store that stopped without a close is repaired by
 /// redb on the next open, and the repair is logged rather than being a
 /// silent stall.
+// Copies the files of a store that is still open, which Windows refuses:
+// redb holds a byte-range lock on its file while the database is open.
+#[cfg(not(windows))]
 #[test]
 fn an_unclean_stop_logs_the_metadata_store_repair() {
     let dir = TempDir::new().expect("tempdir");

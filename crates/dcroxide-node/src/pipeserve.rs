@@ -19,7 +19,7 @@
 //! the process duplicates it from itself instead (`pidfd_getfd`), which
 //! serves every kind of descriptor; elsewhere on unix, and on Linux
 //! kernels without that call, it is re-opened through the file system
-//! (see [`open_inherited_fd`]).  Windows pipe handles cannot be taken
+//! (see `open_inherited_fd`).  Windows pipe handles cannot be taken
 //! at all without `unsafe`, so there `--piperx` only logs that it is
 //! unsupported and `--pipetx` sends nothing.
 
