@@ -2,8 +2,12 @@
 //! The protocol decision core of dcrd's `peer` package: version
 //! negotiation, local version construction, the push message
 //! builders with their duplicate-request filters, ping/pong state,
-//! known-inventory tracking, the stall deadline table, and the
-//! configuration surface.
+//! the stall deadline table, and the configuration surface.
+//!
+//! dcrd's per-peer known-inventory cache is not here: netsync's
+//! per-peer state (`dcroxide-netsync` `manager.rs`) and the relay's
+//! `RelayPeerState` (`dcroxide-node` `dispatch.rs`) keep it, sized by
+//! [`MAX_KNOWN_INVENTORY`] and [`MAX_KNOWN_INVENTORY_TTL`].
 //!
 //! dcrd wraps this core in goroutine pumps — the input, output,
 //! queue, and stall handlers plus connection association — which are
@@ -36,11 +40,15 @@ pub const MAX_PROTOCOL_VERSION: u32 = dcroxide_wire::ADDR_V2_VERSION;
 pub const MAX_INV_TRICKLE_SIZE: usize = 1000;
 
 /// The maximum number of known-inventory cache items (dcrd
-/// `maxKnownInventory`).
+/// `maxKnownInventory`).  This crate keeps no such cache; the constant
+/// stays here, beside dcrd's other peer constants, for the two owners
+/// of that cache: netsync's per-peer state and the relay's
+/// `RelayPeerState`.
 pub const MAX_KNOWN_INVENTORY: u32 = 1000;
 
 /// The known-inventory expiry, in nanoseconds (dcrd
-/// `maxKnownInventoryTTL`).
+/// `maxKnownInventoryTTL`), for the same two owners as
+/// [`MAX_KNOWN_INVENTORY`].
 pub const MAX_KNOWN_INVENTORY_TTL: i64 = 15 * 60 * 1_000_000_000;
 
 /// The lower bound of the random inventory trickle delay, in

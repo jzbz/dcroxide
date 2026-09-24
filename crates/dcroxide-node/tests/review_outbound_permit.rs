@@ -64,6 +64,7 @@ fn a_freed_permit_wakes_the_parked_outbound_fill() {
             &inbound,
             1_700_000_000,
             1_700_000_000_000_000_000,
+            0,
             &mut csprng,
         ) {
             InboundDecision::Admit {
@@ -140,6 +141,7 @@ fn a_freed_permit_wakes_the_parked_outbound_fill() {
             &other,
             1_700_000_000,
             1_700_000_000_000_000_000,
+            0,
             &mut csprng,
         ) {
             InboundDecision::Drop { reason } => {
@@ -223,6 +225,7 @@ fn the_address_source_runs_without_the_connmgr_lock() {
                 &inbound,
                 1_700_000_000,
                 1_700_000_000_000_000_000,
+                0,
                 &mut csprng,
             ),
             InboundDecision::Admit { .. }

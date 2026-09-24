@@ -242,7 +242,9 @@ pub fn rpc_result_types(method: &str) -> Option<Vec<Option<GoType>>> {
 ///
 /// The usage cache holds a single string regardless of the websocket
 /// flag, exactly like dcrd: whichever variant is requested first is
-/// returned for both (QK-0005).
+/// returned for both (QK-0005).  Its lock is held across generation,
+/// as dcrd's is, so "first" means first to take the lock even when
+/// callers race a cold cache.
 pub struct HelpCacher {
     descs: HashMap<String, String>,
     usage: std::sync::Mutex<String>,
@@ -305,12 +307,14 @@ impl HelpCacher {
         registry: &Registry,
         include_websockets: bool,
     ) -> Result<String, String> {
-        // Return the cached usage if it is available.
-        {
-            let cached = self.usage.lock().expect("help usage cache poisoned");
-            if !cached.is_empty() {
-                return Ok(cached.clone());
-            }
+        // Return the cached usage if it is available.  The lock is held
+        // through generation, as dcrd holds its mutex across the whole
+        // of `RPCUsage`: the text depends on the websocket flag, so a
+        // caller racing a cold cache must wait for, and return, the
+        // variant the first caller caches rather than build its own.
+        let mut usage = self.usage.lock().expect("help usage cache poisoned");
+        if !usage.is_empty() {
+            return Ok(usage.clone());
         }
 
         // Generate a list of one-line usage for every command.
@@ -333,7 +337,6 @@ impl HelpCacher {
         }
 
         usage_texts.sort();
-        let mut usage = self.usage.lock().expect("help usage cache poisoned");
         *usage = usage_texts.join("\n");
         Ok(usage.clone())
     }

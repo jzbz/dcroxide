@@ -132,7 +132,7 @@ pub fn seeder_url(seeder: &str, filters: &HttpsSeederFilters) -> String {
 /// and end offsets, or `None` when only whitespace remains, and `Err`
 /// when the value is truncated.  This mirrors the framing behavior of
 /// Go's `json.Decoder` over a byte-limited stream.
-fn next_value_extent(data: &[u8], pos: usize) -> Result<Option<(usize, usize)>, String> {
+pub(crate) fn next_value_extent(data: &[u8], pos: usize) -> Result<Option<(usize, usize)>, String> {
     let mut pos = pos;
     while pos < data.len() && matches!(data[pos], b' ' | b'\t' | b'\n' | b'\r') {
         pos += 1;
@@ -196,40 +196,60 @@ fn next_value_extent(data: &[u8], pos: usize) -> Result<Option<(usize, usize)>, 
 /// Split host and port like Go's `net.SplitHostPort`, returning the
 /// host and port strings.
 pub(crate) fn split_host_port(hostport: &str) -> Result<(String, String), String> {
-    let missing_port = || format!("address {hostport}: missing port in address");
-    let too_many_colons = || format!("address {hostport}: too many colons in address");
-    let bytes = hostport.as_bytes();
-    if let Some(stripped) = hostport.strip_prefix('[') {
-        // IPv6 literal in brackets.
-        let Some(end) = stripped.find(']') else {
-            return Err(format!("address {hostport}: missing ']' in address"));
-        };
-        let host = &stripped[..end];
-        let rest = &stripped[end + 1..];
-        let Some(port) = rest.strip_prefix(':') else {
-            // Go's net.SplitHostPort reports a missing port whether the
-            // ']' ends the string or is followed by a non-colon byte; it
-            // never indexes the trailing character, so a multibyte one
-            // must not be byte-sliced.
-            return Err(missing_port());
-        };
-        if port.contains(':') {
-            return Err(too_many_colons());
+    const MISSING_PORT: &str = "missing port in address";
+    const TOO_MANY_COLONS: &str = "too many colons in address";
+    // `AddrError.Error` prefixes the address unless it is empty.
+    let addr_err = |why: &str| -> Result<(String, String), String> {
+        if hostport.is_empty() {
+            Err(why.to_string())
+        } else {
+            Err(format!("address {hostport}: {why}"))
         }
-        return Ok((host.to_string(), port.to_string()));
-    }
-    let Some(colon) = hostport.rfind(':') else {
-        return Err(missing_port());
     };
-    let host = &hostport[..colon];
-    let port = &hostport[colon + 1..];
-    if host.contains(':') {
-        return Err(too_many_colons());
+    let b = hostport.as_bytes();
+    let (mut j, mut k) = (0, 0);
+
+    // The port starts after the last colon.
+    let Some(i) = hostport.rfind(':') else {
+        return addr_err(MISSING_PORT);
+    };
+
+    let host;
+    if b[0] == b'[' {
+        // Expect the first ']' just before the last ':'.
+        let Some(end) = hostport.find(']') else {
+            return addr_err("missing ']' in address");
+        };
+        match end.saturating_add(1) {
+            // There can't be a ':' behind the ']' now.
+            n if n == b.len() => return addr_err(MISSING_PORT),
+            // The expected result.
+            n if n == i => {}
+            // Either ']' isn't followed by a colon, or it is followed
+            // by a colon that is not the last one.
+            n if b[n] == b':' => return addr_err(TOO_MANY_COLONS),
+            _ => return addr_err(MISSING_PORT),
+        }
+        host = &hostport[1..end];
+        // There can't be a '[' resp. ']' before these positions.
+        (j, k) = (1, end.saturating_add(1));
+    } else {
+        host = &hostport[..i];
+        if host.contains(':') {
+            return addr_err(TOO_MANY_COLONS);
+        }
     }
-    if bytes.contains(&b'[') || bytes.contains(&b']') {
-        return Err(format!("address {hostport}: unexpected '[' in address"));
+    if hostport[j..].contains('[') {
+        return addr_err("unexpected '[' in address");
     }
-    Ok((host.to_string(), port.to_string()))
+    if hostport[k..].contains(']') {
+        return addr_err("unexpected ']' in address");
+    }
+
+    Ok((
+        host.to_string(),
+        hostport[i.saturating_add(1)..].to_string(),
+    ))
 }
 
 /// Parse an IP like Go's `net.ParseIP`, returning the 16-byte form.
@@ -409,6 +429,28 @@ mod tests {
         assert_eq!(
             split_host_port("[::1]::80").unwrap_err(),
             "address [::1]::80: too many colons in address"
+        );
+    }
+
+    /// The bracket checks run over the whole address, as Go's
+    /// `SplitHostPort` does after its bracket switch, and each stray
+    /// bracket and the empty address get Go's own text.
+    #[test]
+    fn split_host_port_rejects_stray_brackets() {
+        for (input, want) in [
+            ("[a[b]:80", "address [a[b]:80: unexpected '[' in address"),
+            ("[::1]:80]", "address [::1]:80]: unexpected ']' in address"),
+            ("[abc", "address [abc: missing port in address"),
+            ("a]:80", "address a]:80: unexpected ']' in address"),
+            ("a[b:80", "address a[b:80: unexpected '[' in address"),
+            ("[a]b]:80", "address [a]b]:80: missing port in address"),
+            ("", "missing port in address"),
+        ] {
+            assert_eq!(split_host_port(input).unwrap_err(), want, "{input}");
+        }
+        assert_eq!(
+            split_host_port("[]:80").unwrap(),
+            (String::new(), "80".to_string())
         );
     }
 }

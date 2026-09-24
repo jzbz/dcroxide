@@ -2,8 +2,10 @@
 //! The RPC server scaffold (dcrd internal/rpcserver `Server`/`Config`),
 //! carrying the configuration surface the ported command handlers
 //! consume.  The chain sits behind the [`RpcChain`] trait standing in
-//! for the used subset of dcrd's `Chain` interface; the remaining
-//! interfaces arrive with their handler slices.
+//! for the used subset of dcrd's `Chain` interface, and the other
+//! `Config` interfaces the handlers reach (the sync manager, connection
+//! manager, mempool, block templater, indexers, and the rest) each have
+//! a trait here, implemented by the daemon.
 
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;

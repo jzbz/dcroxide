@@ -961,9 +961,12 @@ pub fn handle_get_headers<C: RpcChain>(
     let block_locators = crate::helpers::decode_hashes(&locator_strs)?;
     let mut hash_stop = Hash([0u8; 32]);
     if !hash_stop_str.is_empty() {
-        hash_stop = hash_stop_str
-            .parse()
-            .map_err(|e| rpc_invalid_error(&format!("Failed to decode hashstop: {e}")))?;
+        hash_stop = hash_stop_str.parse().map_err(|e| {
+            rpc_invalid_error(&format!(
+                "Failed to decode hashstop: {}",
+                crate::helpers::go_hash_decode_error(e)
+            ))
+        })?;
     }
 
     let headers = server.cfg.chain.locate_headers(&block_locators, &hash_stop);
@@ -1178,8 +1181,6 @@ pub fn handle_get_block<C: RpcChain>(
                     i64::from(header.height),
                     common.confirmations,
                     is_treasury_enabled,
-                    server.cfg.max_protocol_version,
-                    server.cfg.chain_params.net,
                 )?);
             }
             Ok(GoValue::Array(raw))
@@ -2280,8 +2281,6 @@ pub fn handle_get_raw_transaction<C: RpcChain>(
         blk_height,
         confirmations,
         is_treasury_enabled,
-        server.cfg.max_protocol_version,
-        server.cfg.chain_params.net,
     )
 }
 
@@ -2739,10 +2738,7 @@ fn go_decode_hex_msg(s: &str) -> Result<Vec<u8>, String> {
     for pair in bytes.chunks(2) {
         for &b in pair {
             if !(b as char).is_ascii_hexdigit() {
-                return Err(format!(
-                    "encoding/hex: invalid byte: U+{:04X} {:?}",
-                    b, b as char
-                ));
+                return Err(crate::helpers::go_hex_invalid_byte_error(b));
             }
         }
         let hi = (pair[0] as char).to_digit(16).expect("checked");
@@ -4066,13 +4062,7 @@ fn lazy_hex_decode(s: &str) -> (Vec<u8>, Option<String>) {
         let pair = [bytes[i], bytes[i + 1]];
         for &b in &pair {
             if !(b as char).is_ascii_hexdigit() {
-                return (
-                    out,
-                    Some(format!(
-                        "encoding/hex: invalid byte: U+{:04X} {:?}",
-                        b, b as char
-                    )),
-                );
+                return (out, Some(crate::helpers::go_hex_invalid_byte_error(b)));
             }
         }
         let hi = (pair[0] as char).to_digit(16).expect("checked");
@@ -4085,13 +4075,7 @@ fn lazy_hex_decode(s: &str) -> (Vec<u8>, Option<String>) {
         // invalid-byte error, a valid one as an unexpected EOF.
         let b = bytes[i];
         if !(b as char).is_ascii_hexdigit() {
-            return (
-                out,
-                Some(format!(
-                    "encoding/hex: invalid byte: U+{:04X} {:?}",
-                    b, b as char
-                )),
-            );
+            return (out, Some(crate::helpers::go_hex_invalid_byte_error(b)));
         }
         return (out, Some("unexpected EOF".to_string()));
     }
@@ -4427,67 +4411,6 @@ pub fn handle_get_treasury_spend_votes<C: RpcChain>(
     ]))
 }
 
-/// The length of the getwork data field when providing work for
-/// blake256 (dcrd `getworkDataLenBlake256`): the serialized header
-/// plus the internal blake256 padding.
-const GETWORK_DATA_LEN_BLAKE256: usize =
-    (1 + ((dcroxide_wire::MAX_BLOCK_HEADER_PAYLOAD * 8 + 65) / (64 * 8))) * 64;
-
-/// The length of the getwork data field when providing work for
-/// blake3 (dcrd `getworkDataLenBlake3`): the serialized header padded
-/// to a multiple of the blake3 block size.
-#[allow(clippy::manual_div_ceil)] // Mirrors dcrd's constant expression.
-const GETWORK_DATA_LEN_BLAKE3: usize = ((dcroxide_wire::MAX_BLOCK_HEADER_PAYLOAD + 63) / 64) * 64;
-
-/// The number of blocks below the current best height to begin
-/// pruning old block work from the template pool (dcrd
-/// `getworkExpirationDiff`).
-const GETWORK_EXPIRATION_DIFF: i64 = 3;
-
-/// The extra blake256 internal padding for the getwork data (dcrd
-/// `blake256Pad`, computed in its init routine).
-fn blake256_pad() -> Vec<u8> {
-    let mut pad = vec![0u8; GETWORK_DATA_LEN_BLAKE256 - dcroxide_wire::MAX_BLOCK_HEADER_PAYLOAD];
-    pad[0] = 0x80;
-    let n = pad.len();
-    pad[n - 9] |= 0x01;
-    pad[n - 8..]
-        .copy_from_slice(&((dcroxide_wire::MAX_BLOCK_HEADER_PAYLOAD as u64) * 8).to_be_bytes());
-    pad
-}
-
-/// The key for the template pool: the merkle root and stake root pair
-/// (dcrd `getWorkTemplateKey`).
-pub(crate) fn get_work_template_key(header: &dcroxide_wire::BlockHeader) -> [u8; 64] {
-    let mut key = [0u8; 64];
-    key[..32].copy_from_slice(&header.merkle_root.0);
-    key[32..].copy_from_slice(&header.stake_root.0);
-    key
-}
-
-/// Serialized data representing work to be solved: the header plus
-/// the internal padding for the active hash function (dcrd
-/// `serializeGetWorkData`; the serialization error path is
-/// unreachable here).
-pub(crate) fn serialize_get_work_data(
-    header: &dcroxide_wire::BlockHeader,
-    is_blake3_pow_active: bool,
-) -> Vec<u8> {
-    let (getwork_data_len, pad) = if is_blake3_pow_active {
-        (
-            GETWORK_DATA_LEN_BLAKE3,
-            vec![0u8; GETWORK_DATA_LEN_BLAKE3 - dcroxide_wire::MAX_BLOCK_HEADER_PAYLOAD],
-        )
-    } else {
-        (GETWORK_DATA_LEN_BLAKE256, blake256_pad())
-    };
-
-    let mut data = Vec::with_capacity(getwork_data_len);
-    data.extend_from_slice(&header.serialize());
-    data.extend_from_slice(&pad);
-    data
-}
-
 /// Generate and return work to the caller (dcrd
 /// `handleGetWorkRequest`).
 fn handle_get_work_request<C: RpcChain>(server: &Server<C>) -> Result<GoValue, RPCError> {
@@ -4520,10 +4443,7 @@ fn handle_get_work_request<C: RpcChain>(server: &Server<C>) -> Result<GoValue, R
         let mut state = server.work_state.lock().expect("work state poisoned");
         let tip_changed = state.prev_best_hash != Some(best.hash);
         if tip_changed {
-            let prune_height = best.height - GETWORK_EXPIRATION_DIFF;
-            state
-                .template_pool
-                .retain(|_, block| i64::from(block.header.height) >= prune_height);
+            state.prune_old_block_templates(best.height);
             state.prev_best_hash = Some(best.hash);
             state.wait_for_updated_template = true;
         }
@@ -4548,7 +4468,9 @@ fn handle_get_work_request<C: RpcChain>(server: &Server<C>) -> Result<GoValue, R
                 panic!("unbounded template wait cannot time out")
             }
         }
-        let template_key = get_work_template_key(&template.as_ref().expect("just received").header);
+        let template_key = crate::helpers::get_work_template_key(
+            &template.as_ref().expect("just received").header,
+        );
         let template_known = server
             .work_state
             .lock()
@@ -4612,13 +4534,13 @@ fn handle_get_work_request<C: RpcChain>(server: &Server<C>) -> Result<GoValue, R
 
     // Serialize the data that represents work to be solved.
     let is_blake3_pow_active = server.is_blake3_pow_agenda_active(&header_copy.prev_block)?;
-    let data = serialize_get_work_data(&header_copy, is_blake3_pow_active);
+    let data = crate::helpers::serialize_get_work_data(&header_copy, is_blake3_pow_active)?;
 
     // Add the template to the template pool.  Since the key is a
     // combination of the merkle and stake root fields, this will not
     // add duplicate entries for templates with modified timestamps
     // and/or difficulty bits.
-    let template_key = get_work_template_key(&header_copy);
+    let template_key = crate::helpers::get_work_template_key(&header_copy);
     server
         .work_state
         .lock()
@@ -4645,8 +4567,10 @@ fn handle_get_work_submission<C: RpcChain>(
 ) -> Result<GoValue, RPCError> {
     // Ensure the provided data is sane.  Both data lengths coincide at
     // the pinned tag, so the single-length error message applies.
-    let min_data_len = GETWORK_DATA_LEN_BLAKE256.min(GETWORK_DATA_LEN_BLAKE3);
-    let max_data_len = GETWORK_DATA_LEN_BLAKE256.max(GETWORK_DATA_LEN_BLAKE3);
+    let min_data_len =
+        crate::helpers::GETWORK_DATA_LEN_BLAKE256.min(crate::helpers::GETWORK_DATA_LEN_BLAKE3);
+    let max_data_len =
+        crate::helpers::GETWORK_DATA_LEN_BLAKE256.max(crate::helpers::GETWORK_DATA_LEN_BLAKE3);
     let padded_hex_data_len = hex_data.len() + hex_data.len() % 2;
     if padded_hex_data_len < min_data_len * 2 || padded_hex_data_len > max_data_len * 2 {
         if min_data_len == max_data_len {
@@ -4713,7 +4637,7 @@ fn handle_get_work_submission<C: RpcChain>(
     // before the block is processed, so neither a websocket work
     // notification nor anything else taking the work state waits on
     // the whole block validation.
-    let template_key = get_work_template_key(&submitted_header);
+    let template_key = crate::helpers::get_work_template_key(&submitted_header);
     let template_block = server
         .work_state
         .lock()

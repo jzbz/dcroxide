@@ -16,8 +16,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use dcroxide_dcrjson::{GoType, GoValue, StructField, gojson};
 use dcroxide_wire::ServiceFlag;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::netaddress::{NetAddress, encode_host, new_net_address_from_params};
 use crate::network::{
@@ -51,12 +52,12 @@ const TRIED_BUCKETS_PER_GROUP: u64 = 8;
 const NEW_BUCKETS_PER_GROUP: u64 = 64;
 const NEW_BUCKETS_PER_ADDRESS: i32 = 8;
 const NUM_MISSING_DAYS: i64 = 30;
-const NUM_RETRIES: i32 = 3;
-const MAX_FAILURES: i32 = 5;
+const NUM_RETRIES: i64 = 3;
+const MAX_FAILURES: i64 = 5;
 const MIN_BAD_DAYS: i64 = 7;
 const GET_KNOWN_ADDRESS_LIMIT: usize = 2500;
 const GET_KNOWN_ADDRESS_PERCENTAGE: usize = 23;
-const SERIALIZATION_VERSION: i32 = 1;
+const SERIALIZATION_VERSION: i64 = 1;
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 const MINUTE_NANOS: i64 = 60 * NANOS_PER_SEC;
@@ -176,7 +177,9 @@ impl AddrRng for SystemRng {
 pub struct KnownAddress {
     pub(crate) na: NetAddress,
     pub(crate) src_addr: NetAddress,
-    pub(crate) attempts: i32,
+    // A Go `int` in dcrd, which is 64 bits wide on every platform it
+    // ships for and is what `peers.json` round-trips.
+    pub(crate) attempts: i64,
     // Unix nanoseconds; `None` is Go's zero time.
     pub(crate) lastattempt: Option<i64>,
     pub(crate) lastsuccess: Option<i64>,
@@ -208,14 +211,17 @@ impl KnownAddress {
         match self.lastattempt {
             None => return MIN_CHANCE,
             Some(lastattempt) => {
-                if now - lastattempt < 10 * MINUTE_NANOS {
+                // `time.Since` saturates at Go's maximum duration, which a
+                // far-past `LastAttempt` off disk reaches; an unguarded
+                // subtraction wraps negative there and reads as recent.
+                if now.saturating_sub(lastattempt) < 10 * MINUTE_NANOS {
                     return MIN_CHANCE;
                 }
             }
         }
 
-        // Failed attempts deprioritise.
-        let c = 1.0 / 1.5f64.powf(f64::from(self.attempts));
+        // Failed attempts deprioritise (`float64(ka.attempts)`).
+        let c = 1.0 / 1.5f64.powf(self.attempts as f64);
         c.max(MIN_CHANCE)
     }
 
@@ -316,15 +322,16 @@ pub enum NetAddressReach {
 
 /// The serializable state of a known address (dcrd
 /// `serializedKnownAddress`); the JSON field names match dcrd's Go
-/// struct fields.
-#[derive(Serialize, Deserialize)]
+/// struct fields.  Loading decodes through [`serialized_addr_manager_type`]
+/// instead, with Go's `encoding/json` semantics.
+#[derive(Serialize)]
 struct SerializedKnownAddress {
     #[serde(rename = "Addr")]
     addr: String,
     #[serde(rename = "Src")]
     src: String,
     #[serde(rename = "Attempts")]
-    attempts: i32,
+    attempts: i64,
     #[serde(rename = "TimeStamp")]
     time_stamp: i64,
     #[serde(rename = "LastAttempt")]
@@ -335,19 +342,40 @@ struct SerializedKnownAddress {
 
 /// The serializable state of an address manager (dcrd
 /// `serializedAddrManager`); the JSON field names match dcrd's Go
-/// struct fields.
-#[derive(Serialize, Deserialize)]
+/// struct fields.  A decoded file's `Addresses` entries are `None` where
+/// the JSON held `null`: dcrd's `[]*serializedKnownAddress` decodes that
+/// to a nil pointer.
+#[derive(Serialize)]
 struct SerializedAddrManager {
     #[serde(rename = "Version")]
-    version: i32,
+    version: i64,
     #[serde(rename = "Key")]
     key: [u8; 32],
     #[serde(rename = "Addresses")]
-    addresses: Vec<SerializedKnownAddress>,
+    addresses: Vec<Option<SerializedKnownAddress>>,
     #[serde(rename = "NewBuckets")]
     new_buckets: Vec<Vec<String>>,
     #[serde(rename = "TriedBuckets")]
     tried_buckets: Vec<Vec<String>>,
+}
+
+/// What [`AddrManager::load_peers`] did, carrying what dcrd's
+/// `loadPeers` logs about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeersLoad {
+    /// The file loaded, or there was none: dcrd logs `Loaded %d
+    /// addresses from file '%s'` with the manager's address count
+    /// (`numAddresses`).
+    Loaded(usize),
+    /// The file failed to load and the manager was reset: dcrd logs
+    /// `Failed to parse file %s: %v` with the error, then `Failed to
+    /// remove corrupt peers file %s: %v` when removing it failed too.
+    Failed {
+        /// The load error (dcrd `deserializePeers`'s).
+        err: String,
+        /// Why the corrupt file could not be removed, if it could not.
+        remove_err: Option<String>,
+    },
 }
 
 /// The wanted network address types for an address lookup (dcrd
@@ -597,6 +625,12 @@ impl AddrManager {
 
     /// Reset the manager: reinitialise the random key and allocate
     /// fresh empty bucket storage (dcrd `reset`).
+    ///
+    /// Like dcrd's, this leaves `n_new` and `n_tried` alone.  They are
+    /// zero when `new_with_hooks` calls it, but on `load_peers`' failure
+    /// path they keep whatever `deserialize_peers` counted before it
+    /// failed, over an empty index -- which `need_more_addresses`, and so
+    /// dcrd's getaddr and seeder decisions, then see (QUIRKS.md).
     fn reset(&mut self) {
         self.addr_index = HashMap::new();
         self.rng
@@ -607,8 +641,6 @@ impl AddrManager {
         self.addr_tried = (0..TRIED_BUCKET_COUNT).map(|_| Vec::new()).collect();
         self.addr_new_stats = vec![BucketStats::default(); NEW_BUCKET_COUNT];
         self.addr_tried_stats = vec![BucketStats::default(); TRIED_BUCKET_COUNT];
-        self.n_new = 0;
-        self.n_tried = 0;
         self.addr_changed = true;
     }
 
@@ -999,7 +1031,9 @@ impl AddrManager {
         })?;
 
         let mut ka = ka.lock().expect("addrmgr lock poisoned");
-        ka.attempts += 1;
+        // A Go `int` increment, which wraps; a loaded `Attempts` can sit
+        // at the top of the range.
+        ka.attempts = ka.attempts.wrapping_add(1);
         ka.lastattempt = Some((self.now_fn)());
         Ok(())
     }
@@ -1329,14 +1363,14 @@ impl AddrManager {
         };
         for (k, v) in &self.addr_index {
             let v = v.lock().expect("addrmgr lock poisoned");
-            sam.addresses.push(SerializedKnownAddress {
+            sam.addresses.push(Some(SerializedKnownAddress {
                 addr: k.clone(),
                 src: v.src_addr.key(),
                 attempts: v.attempts,
                 time_stamp: v.na.timestamp.div_euclid(NANOS_PER_SEC),
                 last_attempt: go_unix(v.lastattempt),
                 last_success: go_unix(v.lastsuccess),
-            });
+            }));
         }
         for bucket in &self.addr_new {
             sam.new_buckets.push(bucket.keys().cloned().collect());
@@ -1360,29 +1394,59 @@ impl AddrManager {
         Ok(())
     }
 
+    /// The path of the peers file (dcrd `peersFile`).
+    pub fn peers_file(&self) -> &std::path::Path {
+        &self.peers_file
+    }
+
     /// Load known addresses from the peers file; an empty, missing,
     /// or malformed file leaves the manager reset (dcrd `loadPeers`).
-    pub fn load_peers(&mut self) {
-        if let Err(_err) = self.deserialize_peers_path() {
-            let _ = std::fs::remove_file(&self.peers_file);
+    /// The outcome carries what dcrd logs: the loaded count, or the
+    /// parse error and any failure to remove the corrupt file.
+    pub fn load_peers(&mut self) -> PeersLoad {
+        if let Err(err) = self.deserialize_peers_path() {
+            // If it is invalid, nuke the old one unconditionally.
+            let remove_err = go_remove(&self.peers_file).err();
             self.reset();
+            return PeersLoad::Failed { err, remove_err };
         }
+        PeersLoad::Loaded(self.num_addresses())
     }
 
     fn deserialize_peers_path(&mut self) -> Result<(), String> {
+        use std::io::Read as _;
+
         let path = self.peers_file.clone();
-        if !path.exists() {
+        // dcrd `os.Stat` + `os.IsNotExist`: only a missing file counts
+        // as no file; any other stat failure goes on to the open.
+        if let Err(err) = std::fs::metadata(&path)
+            && err.kind() == std::io::ErrorKind::NotFound
+        {
             return Ok(());
         }
-        let contents = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
-        self.deserialize_peers(&contents)
+        let mut file = std::fs::File::open(&path).map_err(|err| {
+            let err = go_path_error("open", &path, &err);
+            format!("{} error opening file: {err}", path.display())
+        })?;
+        // A failed read -- a directory opens but does not read -- is
+        // the decoder's error, wrapped as dcrd wraps it.
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).map_err(|err| {
+            let err = go_path_error("read", &path, &err);
+            format!("error reading {}: {err}", path.display())
+        })?;
+        self.deserialize_peers_bytes(&contents)
     }
 
     /// Load the manager state from serialized JSON contents (dcrd
     /// `deserializePeers`).
     pub fn deserialize_peers(&mut self, contents: &str) -> Result<(), String> {
-        let sam: SerializedAddrManager =
-            serde_json::from_str(contents).map_err(|err| format!("error reading: {err}"))?;
+        self.deserialize_peers_bytes(contents.as_bytes())
+    }
+
+    fn deserialize_peers_bytes(&mut self, contents: &[u8]) -> Result<(), String> {
+        let sam = decode_serialized_addr_manager(contents)
+            .map_err(|err| format!("error reading {}: {err}", self.peers_file.display()))?;
 
         if sam.version != SERIALIZATION_VERSION {
             return Err(format!(
@@ -1392,7 +1456,15 @@ impl AddrManager {
         }
         self.key = sam.key;
 
-        for v in &sam.addresses {
+        for (i, v) in sam.addresses.iter().enumerate() {
+            // dcrd ranges over `[]*serializedKnownAddress` and reads
+            // `v.Addr` unchecked, so a `null` entry is a nil pointer
+            // dereference that panics dcrd at startup, every startup,
+            // since the file is never removed.  Rejecting the file
+            // instead is the one departure (PARITY.md).
+            let Some(v) = v else {
+                return Err(format!("address entry {i} after serialisation is null"));
+            };
             // NOTE: dcrd never restores the serialized TimeStamp; a
             // loaded address keeps the load-time stamp assigned by
             // the address parser.  Ported bug for bug.  Go's zero
@@ -1496,7 +1568,7 @@ impl AddrManager {
     pub fn state_snapshot(
         &self,
     ) -> (
-        Vec<(String, String, i32, bool, i32, Vec<usize>, Option<usize>)>,
+        Vec<(String, String, i64, bool, i32, Vec<usize>, Option<usize>)>,
         usize,
         usize,
         [u8; 32],
@@ -1565,6 +1637,223 @@ impl AddrManager {
             nonzero(&self.addr_tried_stats),
         )
     }
+}
+
+/// dcrd's `serializedAddrManager` as a Go type, so the peers file
+/// decodes with `encoding/json`'s semantics: field names match
+/// case-insensitively, the last duplicate key wins, `null` and missing
+/// fields keep their zero values, `Version` and `Attempts` are 64-bit Go
+/// `int`s, and the fixed-size `Key` and bucket arrays are zero-filled or
+/// truncated to their declared lengths.
+fn serialized_addr_manager_type() -> GoType {
+    let known_address = GoType::strukt(
+        "addrmgr",
+        "serializedKnownAddress",
+        vec![
+            StructField::new("Addr", GoType::String),
+            StructField::new("Src", GoType::String),
+            StructField::new("Attempts", GoType::Int),
+            StructField::new("TimeStamp", GoType::Int64),
+            StructField::new("LastAttempt", GoType::Int64),
+            StructField::new("LastSuccess", GoType::Int64),
+        ],
+    );
+    let buckets = |n| GoType::Array(n, Box::new(GoType::String.slice()));
+    GoType::strukt(
+        "addrmgr",
+        "serializedAddrManager",
+        vec![
+            StructField::new("Version", GoType::Int),
+            StructField::new("Key", GoType::Array(32, Box::new(GoType::Uint8))),
+            StructField::new("Addresses", known_address.ptr().slice()),
+            StructField::new("NewBuckets", buckets(NEW_BUCKET_COUNT)),
+            StructField::new("TriedBuckets", buckets(TRIED_BUCKET_COUNT)),
+        ],
+    )
+}
+
+/// Decode the peers file the way dcrd's `json.NewDecoder(r).Decode(&sam)`
+/// does: only the first JSON value is read ([`first_json_value`]) and
+/// invalid UTF-8 inside a string becomes U+FFFD.
+fn decode_serialized_addr_manager(contents: &[u8]) -> Result<SerializedAddrManager, String> {
+    let value = first_json_value(contents)?;
+    let text = gojson::unmarshal_input(value).map_err(|err| err.go_message())?;
+    let fields = match gojson::decode(&serialized_addr_manager_type(), &text) {
+        Ok(GoValue::Struct(fields)) => fields,
+        Ok(_) => unreachable!("a struct type decodes to a struct"),
+        Err(err) => return Err(err.go_message()),
+    };
+
+    let int = |v: &GoValue| match v {
+        GoValue::Int(n) => *n,
+        _ => 0,
+    };
+    let string = |v: &GoValue| match v {
+        GoValue::String(s) => s.clone(),
+        _ => String::new(),
+    };
+    // A nil `[]string` bucket ranges over nothing.
+    let buckets = |v: &GoValue| -> Vec<Vec<String>> {
+        match v {
+            GoValue::Array(buckets) => buckets
+                .iter()
+                .map(|bucket| match bucket {
+                    GoValue::Array(keys) => keys.iter().map(string).collect(),
+                    _ => Vec::new(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let mut key = [0u8; 32];
+    if let GoValue::Array(bytes) = &fields[1] {
+        for (k, b) in key.iter_mut().zip(bytes) {
+            if let GoValue::Uint(b) = b {
+                *k = u8::try_from(*b).unwrap_or_default();
+            }
+        }
+    }
+    let addresses = match &fields[2] {
+        GoValue::Array(entries) => entries
+            .iter()
+            .map(|entry| match entry {
+                GoValue::Struct(f) => Some(SerializedKnownAddress {
+                    addr: string(&f[0]),
+                    src: string(&f[1]),
+                    attempts: int(&f[2]),
+                    time_stamp: int(&f[3]),
+                    last_attempt: int(&f[4]),
+                    last_success: int(&f[5]),
+                }),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(SerializedAddrManager {
+        version: int(&fields[0]),
+        key,
+        addresses,
+        new_buckets: buckets(&fields[3]),
+        tried_buckets: buckets(&fields[4]),
+    })
+}
+
+/// The first JSON value in the file, framed as Go's `Decoder.readValue`
+/// frames it over a reader that ends where the file does.  Leading
+/// whitespace is skipped and a file holding nothing else is `EOF`.  The
+/// scanner's first syntax error inside the value is the error, found as
+/// the scanner meets it and not only once brackets fail to balance.  A
+/// value the file ends partway through is `unexpected EOF`, whatever
+/// the scanner was in the middle of.  A value that completes is decoded
+/// without whatever follows it, which Go never looks at.
+fn first_json_value(contents: &[u8]) -> Result<&[u8], String> {
+    let Some(start) = contents
+        .iter()
+        .position(|c| !matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
+    else {
+        return Err("EOF".to_string());
+    };
+    let rest = &contents[start..];
+    let err = match gojson::validate_bytes(rest) {
+        // One value, then only whitespace.
+        Ok(()) => return Ok(rest),
+        Err(err) => err.go_message(),
+    };
+    // The scanner stops at the first byte it rejects, so an error that
+    // an appended byte changes is one the end of the input raised (0x01
+    // is rejected in every state, and names itself when it is).
+    let mut extended = rest.to_vec();
+    extended.push(0x01);
+    if gojson::validate_bytes(&extended).map_err(|err| err.go_message()) != Err(err.clone()) {
+        return Err("unexpected EOF".to_string());
+    }
+    if !err.ends_with("after top-level value") {
+        return Err(err);
+    }
+    Ok(&rest[..complete_value_len(rest)])
+}
+
+/// The length of the complete JSON value that starts `rest` and that
+/// something other than whitespace follows.  Go's scanner ends a number
+/// or a literal at the first byte that cannot continue it, so `123-4`
+/// and `nullx` are the values `123` and `null`.
+fn complete_value_len(rest: &[u8]) -> usize {
+    match rest[0] {
+        b'{' | b'[' | b'"' => match crate::seed::next_value_extent(rest, 0) {
+            Ok(Some((_, end))) => end,
+            _ => rest.len(),
+        },
+        b't' | b'n' => 4,
+        b'f' => 5,
+        _ => {
+            // -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?, which the
+            // scanner has already accepted.
+            let digits = |mut i: usize| {
+                while rest.get(i).is_some_and(u8::is_ascii_digit) {
+                    i += 1;
+                }
+                i
+            };
+            let mut i = usize::from(rest[0] == b'-');
+            i = if rest.get(i) == Some(&b'0') {
+                i + 1
+            } else {
+                digits(i)
+            };
+            if rest.get(i) == Some(&b'.') {
+                i = digits(i + 1);
+            }
+            if matches!(rest.get(i), Some(b'e' | b'E')) {
+                i += 1;
+                if matches!(rest.get(i), Some(b'+' | b'-')) {
+                    i += 1;
+                }
+                i = digits(i);
+            }
+            i
+        }
+    }
+}
+
+/// A Go `*os.PathError`'s text, `op path: err`.  An OS error reads as
+/// Go's `syscall.Errno` spells it, without Rust's "(os error N)" suffix:
+/// on Unix the C library's text with a lowercase first letter (as
+/// `dcroxide-node`'s `limits.rs` renders one), elsewhere the system's
+/// message as it stands.
+fn go_path_error(op: &str, path: &std::path::Path, err: &std::io::Error) -> String {
+    let text = err.to_string();
+    let err = match err.raw_os_error() {
+        Some(_) => {
+            let text = text.split(" (os error ").next().unwrap_or_default();
+            let mut chars = text.chars();
+            match chars.next() {
+                Some(first) if cfg!(unix) => first.to_lowercase().chain(chars).collect(),
+                _ => text.to_string(),
+            }
+        }
+        None => text,
+    };
+    format!("{op} {}: {err}", path.display())
+}
+
+/// Go's `os.Remove`, which dcrd uses on a corrupt peers file: unlink,
+/// then rmdir, so an empty directory goes too.  When both fail, rmdir's
+/// error is the one reported unless it is ENOTDIR, which only says the
+/// path is not a directory.
+fn go_remove(path: &std::path::Path) -> Result<(), String> {
+    let Err(unlink) = std::fs::remove_file(path) else {
+        return Ok(());
+    };
+    let Err(rmdir) = std::fs::remove_dir(path) else {
+        return Ok(());
+    };
+    let err = if rmdir.kind() == std::io::ErrorKind::NotADirectory {
+        unlink
+    } else {
+        rmdir
+    };
+    Err(go_path_error("remove", path, &err))
 }
 
 /// Go's `Unix()` value for an optional nanosecond timestamp, using

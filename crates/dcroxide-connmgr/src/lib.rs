@@ -33,7 +33,7 @@ pub use manager::{
 pub use ratelimiter::{
     DROP_LOG_BURST_LIMIT, DROP_LOG_RATE_LIMIT, FLOOD_HIGH_FACTOR, FLOOD_LOW, FLOOD_MAX_DROP_PROB,
     FLOOD_MIN_DROP_PROB, FLOOD_RAMP, GROUP_BURST_LIMIT, GROUP_RATE_LIMIT, InboundGroupKey,
-    InboundRateLimiter, LogDropsOutcome, MAX_GROUP_LIMITERS, MAX_PER_GROUP_TTL,
+    InboundRateLimiter, LogDropsOutcome, MAX_GROUP_LIMITERS, MAX_PER_GROUP_TTL, monotonic_nanos,
 };
 pub use target_outbound::{AutoBegin, AutoPermits};
 

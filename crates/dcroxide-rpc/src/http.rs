@@ -4,8 +4,8 @@
 //! and the request-body processing inside `jsonRPCRead`): Basic auth
 //! decisions over the HMAC'd credential strings, Go-faithful request
 //! unmarshalling, and the single/batched response assembly.  The live
-//! HTTP shell (listener setup, connection hijacking, and header
-//! writing) arrives with the daemon.
+//! HTTP shell (listener setup, the authenticated read limit, and header
+//! writing) is the daemon's, in dcroxide-node `rpcrun.rs`.
 
 // Scanner index arithmetic and base64 packing mirror Go.
 #![allow(clippy::arithmetic_side_effects)]
@@ -134,7 +134,7 @@ pub struct RawRequest {
     ///
     /// Go's `Params []json.RawMessage` is nil when the key is absent or
     /// null and a non-nil empty slice for `[]`, and dcrd's websocket
-    /// batch arm tests that difference (`rpcwebsocket.go:1633`).
+    /// batch arm tests that difference (`rpcwebsocket.go:1635`).
     /// `params` alone cannot express it, since both cases leave it
     /// empty.
     pub params_present: bool,
@@ -328,9 +328,14 @@ pub fn unmarshal_request(body: &str) -> Result<RawRequest, String> {
     for (key, raw) in split_raw_object(trimmed) {
         // Go matches JSON keys to struct fields case-insensitively.
         if fold_eq(&key, "jsonrpc") || fold_eq(&key, "method") {
+            if raw == "null" {
+                // Go ignores null for a string field (`literalStore`),
+                // so an earlier duplicate key's value survives.
+                continue;
+            }
             let value = match gojson::decode(&dcroxide_dcrjson::GoType::String, &raw) {
                 Ok(dcroxide_dcrjson::GoValue::String(s)) => s,
-                Ok(_) => String::new(), // null leaves the field zeroed
+                Ok(_) => String::new(),
                 Err(_) => {
                     let field = if fold_eq(&key, "jsonrpc") {
                         "jsonrpc"
@@ -355,7 +360,12 @@ pub fn unmarshal_request(body: &str) -> Result<RawRequest, String> {
                     req.params = split_raw_array(&raw);
                     req.params_present = true;
                 }
-                Some(b'n') => req.params = Vec::new(),
+                Some(b'n') => {
+                    // null sets the slice back to nil, even after an
+                    // earlier duplicate key's array.
+                    req.params = Vec::new();
+                    req.params_present = false;
+                }
                 _ => {
                     return Err(format!(
                         "json: cannot unmarshal {} into Go struct field Request.params of type \
@@ -367,7 +377,20 @@ pub fn unmarshal_request(body: &str) -> Result<RawRequest, String> {
         } else if fold_eq(&key, "id") {
             // Go unmarshals into interface{}: numbers become float64,
             // strings and null map directly, and every other kind is
-            // rejected later by the response id validity check.
+            // rejected later by the response id validity check.  An
+            // array or object is decoded into `[]interface{}` or
+            // `map[string]interface{}` first, and each number nested in
+            // it goes through the same `convertNumber` range check as a
+            // scalar id, whose failure is saved against the id field
+            // and fails the whole unmarshal.
+            if matches!(raw.as_bytes().first(), Some(b'[') | Some(b'{'))
+                && let Some(literal) = first_out_of_range_number(&raw)
+            {
+                return Err(format!(
+                    "json: cannot unmarshal number {literal} into Go struct field Request.id of \
+                     type float64"
+                ));
+            }
             req.id = match raw.as_bytes().first() {
                 Some(b'"') => match gojson::decode(&dcroxide_dcrjson::GoType::String, &raw) {
                     Ok(dcroxide_dcrjson::GoValue::String(s)) => RpcId::Str(s),
@@ -402,10 +425,51 @@ pub fn unmarshal_request(body: &str) -> Result<RawRequest, String> {
     Ok(req)
 }
 
+/// The first number literal in a composite JSON value, in document
+/// order, that Go's `strconv.ParseFloat` rejects as out of range for
+/// float64 (`convertNumber`).  The value has already passed
+/// validation, so every number outside a string is a well-formed
+/// literal; underflow rounds to zero in both languages and is not an
+/// error.
+fn first_out_of_range_number(raw: &str) -> Option<&str> {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                // Skip the string, honouring escapes.
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len()
+                    && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+                {
+                    i += 1;
+                }
+                let literal = &raw[start..i];
+                let value: f64 = literal.parse().unwrap_or(0.0);
+                if !value.is_finite() {
+                    return Some(literal);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Process a JSON-RPC request body and return the full response body
 /// including the Bitcoin Core compatibility newline (the request
-/// handling inside dcrd `jsonRPCRead`; the connection hijacking and
-/// read-limit plumbing arrive with the daemon).
+/// handling inside dcrd `jsonRPCRead`; the connection handling and
+/// read-limit plumbing are the daemon's, in dcroxide-node `rpcrun.rs`).
 pub fn process_body<C: RpcChain>(server: &Server<C>, body: &str, is_admin: bool) -> Vec<u8> {
     let mut results: Vec<String> = Vec::new();
     let mut batch_size = 0usize;
@@ -597,5 +661,88 @@ mod tests {
             err,
             "json: cannot unmarshal number into Go struct field Request.method of type string"
         );
+    }
+
+    /// Go ignores a null for a string field (`decode.go:907`, "ignore
+    /// null for primitives/string"), so an earlier duplicate key's value
+    /// survives.  The port overwrote it with the empty string, turning a
+    /// runnable request into "Invalid request: malformed".  Outputs from
+    /// Go 1.26 `json.Unmarshal` into `dcrjson.Request`.
+    #[test]
+    fn a_null_string_field_keeps_the_earlier_duplicate() {
+        let req = unmarshal_request(r#"{"method":"getblockcount","id":1,"method":null}"#)
+            .expect("valid request");
+        assert_eq!(req.method, "getblockcount");
+        let req = unmarshal_request(r#"{"jsonrpc":"2.0","jsonrpc":null,"method":"x"}"#)
+            .expect("valid request");
+        assert_eq!(req.jsonrpc, "2.0");
+        let req = unmarshal_request(r#"{"method":null}"#).expect("valid request");
+        assert_eq!(req.method, "");
+    }
+
+    /// A later `"params": null` sets Go's slice back to nil, which the
+    /// websocket batch arm tests as `req.Params == nil`; the port kept
+    /// `params_present` from the earlier array.
+    #[test]
+    fn a_later_null_params_clears_the_earlier_array() {
+        let req = unmarshal_request(r#"{"method":"x","params":[1],"params":null}"#).expect("valid");
+        assert!(req.params.is_empty());
+        assert!(!req.params_present, "Go leaves Params nil");
+
+        let req = unmarshal_request(r#"{"method":"x","params":null,"params":[1]}"#).expect("valid");
+        assert_eq!(req.params, vec!["1".to_string()]);
+        assert!(req.params_present);
+    }
+
+    /// Go decodes an array or object id into `[]interface{}` or
+    /// `map[string]interface{}`, running every nested number through
+    /// `convertNumber`, so an out-of-range one fails the whole unmarshal
+    /// with the id field's context -- the command never runs.  The port
+    /// mapped any composite id straight to an invalid id and executed
+    /// the command.
+    #[test]
+    fn an_out_of_range_number_nested_in_the_id_fails_the_unmarshal() {
+        for (body, want) in [
+            (
+                r#"{"method":"stop","id":[1e999]}"#,
+                "json: cannot unmarshal number 1e999 into Go struct field Request.id of type \
+                 float64",
+            ),
+            (
+                r#"{"method":"stop","id":{"a":[2,{"b":-1e400}]}}"#,
+                "json: cannot unmarshal number -1e400 into Go struct field Request.id of type \
+                 float64",
+            ),
+            (
+                r#"{"method":"stop","id":[1e999],"params":5}"#,
+                "json: cannot unmarshal number 1e999 into Go struct field Request.id of type \
+                 float64",
+            ),
+            (
+                r#"{"method":"stop","id":[1e999],"id":1}"#,
+                "json: cannot unmarshal number 1e999 into Go struct field Request.id of type \
+                 float64",
+            ),
+            // The first error in document order still wins.
+            (
+                r#"{"method":5,"id":[1e999]}"#,
+                "json: cannot unmarshal number into Go struct field Request.method of type string",
+            ),
+        ] {
+            assert_eq!(unmarshal_request(body).expect_err(body), want, "{body}");
+        }
+
+        // In-range and non-numeric members, including a number inside a
+        // string and an underflow, leave the id merely invalid.
+        for (body, kind) in [
+            (
+                r#"{"id":[1,"1e999","\"1e999",true,null,{"x":1e-999}]}"#,
+                "[]interface {}",
+            ),
+            (r#"{"id":{"1e999":-2.5}}"#, "map[string]interface {}"),
+        ] {
+            let req = unmarshal_request(body).expect(body);
+            assert_eq!(req.id, RpcId::Invalid(kind.to_string()), "{body}");
+        }
     }
 }

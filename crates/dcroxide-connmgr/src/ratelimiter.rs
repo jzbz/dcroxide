@@ -11,8 +11,8 @@
 //! S-curve probabilistic drop under active flooding, and rate-limited
 //! logging of dropped connections.
 //!
-//! Divergences per the port's conventions: the wall clock is an
-//! explicit argument (dcrd reads `time.Now`), dcrd's mutexes are
+//! Divergences per the port's conventions: the clocks are explicit
+//! arguments (dcrd reads `time.Now`), dcrd's mutexes are
 //! omitted (the manager serializes access), the `time.AfterFunc`
 //! scheduling the suppression summary becomes a timer request the
 //! daemon drives ([`LogDropsOutcome::SuppressionStarted`] →
@@ -253,10 +253,21 @@ impl InboundRateLimiter {
 
     /// Whether an inbound connection from the address is permitted at
     /// the current time, updating the per-group limiter and the flood
-    /// state (dcrd `inboundRateLimiter.Allow`).  `now_unix` is the
-    /// wall clock in seconds and `now_nanos` the same instant in
-    /// nanoseconds (dcrd reads `time.Now` for both).
-    pub fn allow(&mut self, addr: &NetAddress, now_unix: i64, now_nanos: i64) -> bool {
+    /// state (dcrd `inboundRateLimiter.Allow`).  dcrd reads `time.Now`
+    /// for all three clocks this takes, and each use keeps its own half
+    /// of it: `now_unix` is the wall clock in seconds for the flood
+    /// window (`now.Unix()`), `now_nanos` the same instant in wall-clock
+    /// nanoseconds for the limiter cache's TTL (`container/lru` stores
+    /// and compares `UnixNano()`), and `mono_nanos` a monotonic
+    /// nanosecond reading ([`monotonic_nanos`]) for the group limiter,
+    /// whose `Time.Sub` of two `time.Now` values is monotonic.
+    pub fn allow(
+        &mut self,
+        addr: &NetAddress,
+        now_unix: i64,
+        now_nanos: i64,
+        mono_nanos: i64,
+    ) -> bool {
         self.lru_clock.store(now_nanos, Ordering::Relaxed);
 
         // Either get an existing rate limiter or create a new one,
@@ -268,7 +279,7 @@ impl InboundRateLimiter {
             Some(limiter) => limiter,
             None => Limiter::new(GROUP_RATE_LIMIT, self.burst_limit),
         };
-        let allowed = limiter.allow(now_nanos);
+        let allowed = limiter.allow(mono_nanos);
         self.group_limiters.put(group_key, limiter);
 
         // Tally attempts that were not rate limited and periodically
@@ -309,12 +320,14 @@ impl InboundRateLimiter {
 
     /// Record a dropped connection for logging with throttling (dcrd
     /// `LogDrops`): the caller logs per the returned outcome and arms
-    /// the suppression-reset timer when one starts.
-    pub fn log_drops(&mut self, now_nanos: i64) -> LogDropsOutcome {
-        if !self.log_limiter.allow(now_nanos) {
+    /// the suppression-reset timer when one starts.  `mono_nanos` is a
+    /// monotonic reading ([`monotonic_nanos`]), as dcrd's limiter
+    /// subtracts `time.Now` values.
+    pub fn log_drops(&mut self, mono_nanos: i64) -> LogDropsOutcome {
+        if !self.log_limiter.allow(mono_nanos) {
             let outcome = if self.dropped_logs == 0 {
                 LogDropsOutcome::SuppressionStarted {
-                    reset_after_nanos: self.log_limiter.until_next_allowed(now_nanos),
+                    reset_after_nanos: self.log_limiter.until_next_allowed(mono_nanos),
                 }
             } else {
                 LogDropsOutcome::Suppressed
@@ -400,6 +413,20 @@ impl InboundRateLimiter {
     }
 }
 
+/// Nanoseconds on the process's monotonic clock, for the token-bucket
+/// limiters' `now_nanos` arguments.
+///
+/// dcrd's limiters subtract `time.Now` values, and Go's `Time.Sub` uses
+/// the monotonic reading `time.Now` carries whenever both operands have
+/// one, so a wall-clock step neither freezes nor refills a bucket.  The
+/// origin is this function's first call: only differences between its
+/// values mean anything, and they never mix with wall-clock nanoseconds.
+pub fn monotonic_nanos() -> i64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let origin = *ORIGIN.get_or_init(std::time::Instant::now);
+    i64::try_from(origin.elapsed().as_nanos()).unwrap_or(i64::MAX)
+}
+
 /// Zero every bit past the leading `bits` in place (the masking Go
 /// performs via `netip.Addr.Prefix`).
 // `partial` is in [1, 7] where used, so the shift and the +1 offset
@@ -467,6 +494,72 @@ mod tests {
         assert!(!l.flooding, "at the threshold is not flooding");
         l.record_attempt(false, 1_700_000_000);
         assert!(l.flooding, "one past the threshold floods");
+    }
+
+    /// A backward wall-clock step leaves the group limiters refilling:
+    /// dcrd's limiter measures time between two `time.Now` values, which
+    /// Go subtracts on their monotonic readings.  Fed the wall clock, a
+    /// drained bucket stayed frozen -- `tokens_at` clamps `updated` to
+    /// the earlier time -- until the wall clock passed the old stamp,
+    /// refusing the address as rate limited for as long as the step.
+    #[test]
+    fn a_backward_wall_clock_step_does_not_freeze_a_group() {
+        let mut l = InboundRateLimiter::with_key_and_capacity([1, 2], 16);
+        let addr = dcroxide_addrmgr::new_net_address_from_params(
+            NetAddressType::IPv4,
+            &[203, 0, 113, 7],
+            9108,
+            0,
+            dcroxide_wire::ServiceFlag(0),
+        )
+        .expect("address");
+        let wall = 1_700_000_000_000_000_000i64;
+        let mono = 5_000_000_000i64;
+
+        // Drain the burst.
+        for _ in 0..GROUP_BURST_LIMIT {
+            assert!(l.allow(&addr, wall / 1_000_000_000, wall, mono));
+        }
+        assert!(!l.allow(&addr, wall / 1_000_000_000, wall, mono));
+
+        // The wall clock steps back ten minutes while five seconds pass:
+        // one token (0.2/s) has refilled.
+        let wall = wall - 600 * 1_000_000_000;
+        let mono = mono + 5_000_000_000;
+        assert!(
+            l.allow(&addr, wall / 1_000_000_000, wall, mono),
+            "five monotonic seconds refill a token whatever the wall clock did"
+        );
+        assert!(!l.allow(&addr, wall / 1_000_000_000, wall, mono));
+    }
+
+    /// The drop-log throttle's burst and suppression window on the clock
+    /// it is handed: four logged drops, then a minute to the next token.
+    /// That the daemon hands it `monotonic_nanos` is pinned where the
+    /// clock is read, in the node's `runtime.rs` tests.
+    #[test]
+    fn drop_log_throttling_follows_the_clock_it_is_handed() {
+        let mut l = InboundRateLimiter::with_key_and_capacity([1, 2], 16);
+        let mono = 1_000_000_000i64;
+        for _ in 0..DROP_LOG_BURST_LIMIT {
+            assert_eq!(l.log_drops(mono), LogDropsOutcome::Logged);
+        }
+        assert_eq!(
+            l.log_drops(mono),
+            LogDropsOutcome::SuppressionStarted {
+                reset_after_nanos: 60_000_000_000
+            }
+        );
+        assert_eq!(l.finish_suppression(), None);
+        assert_eq!(l.log_drops(mono + 60_000_000_000), LogDropsOutcome::Logged);
+    }
+
+    /// The monotonic clock never runs backwards.
+    #[test]
+    fn monotonic_nanos_is_nondecreasing() {
+        let a = monotonic_nanos();
+        let b = monotonic_nanos();
+        assert!(a >= 0 && b >= a);
     }
 
     /// The S-curve factor literal is the f64 nearest Go's exact

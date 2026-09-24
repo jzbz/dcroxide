@@ -19,7 +19,7 @@ use dcroxide_rpc::helpers;
 use dcroxide_rpc::rpcerrors;
 use dcroxide_rpc::txresults;
 use dcroxide_rpctypes::chainsvrresults as results;
-use dcroxide_wire::{BlockHeader, CurrencyNet, MsgTx, PROTOCOL_VERSION};
+use dcroxide_wire::{BlockHeader, MsgTx};
 use num_bigint::BigInt;
 
 const VECTORS: &str = include_str!("data/rpchelpers_vectors.txt");
@@ -83,8 +83,6 @@ fn txraw_rows_match_dcrd() {
             height,
             confs,
             treasury,
-            PROTOCOL_VERSION,
-            CurrencyNet::MAIN_NET,
         )
         .unwrap_or_else(|e| panic!("txraw {label}: {e:?}"));
         let got = gojson::encode(&results::tx_raw_result(), &result);
@@ -111,20 +109,9 @@ fn txraw_hash_mismatch_matches_dcrd() {
                     .find(|l| l.starts_with("txrawerr|"))
                     .map(|l| String::from_utf8(unhex(l.split('|').nth(2).unwrap())).unwrap())
                     .unwrap();
-                let err = txresults::create_tx_raw_result(
-                    &params,
-                    &mtx,
-                    "00",
-                    0,
-                    None,
-                    "",
-                    0,
-                    0,
-                    true,
-                    PROTOCOL_VERSION,
-                    CurrencyNet::MAIN_NET,
-                )
-                .unwrap_err();
+                let err =
+                    txresults::create_tx_raw_result(&params, &mtx, "00", 0, None, "", 0, 0, true)
+                        .unwrap_err();
                 // Go's RPCError.Error() renders "{code}: {message}".
                 assert_eq!(format!("{}: {}", err.code, err.message), want);
                 checked = true;

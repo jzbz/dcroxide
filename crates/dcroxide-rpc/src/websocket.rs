@@ -47,7 +47,8 @@ pub static WS_HANDLER_METHODS: &[&str] = &[
 
 /// The notification manager operations the websocket handlers perform
 /// (the registration surface of dcrd's `wsNotificationManager`; the
-/// manager itself arrives with the notification fan-out).
+/// manager itself is the daemon's `NodeNtfnMgr` in dcroxide-node
+/// `websocket.rs`).
 pub trait RpcNtfnManager {
     /// dcrd `RegisterBlockUpdates`.
     fn register_block_updates(&self, _session_id: u64) {
@@ -226,11 +227,10 @@ impl WsClientFilter {
     }
 }
 
-/// The serialized transaction hex (dcrd `txHexString`; transaction
-/// serialization does not vary with the protocol version).
+/// The serialized transaction hex (dcrd `txHexString`, whose ignored
+/// `Serialize` error cannot occur writing to memory).
 fn tx_hex_string(tx: &MsgTx) -> String {
-    txresults::message_to_hex(&Message::Tx(tx.clone()), dcroxide_wire::PROTOCOL_VERSION)
-        .expect("transaction encoding cannot fail")
+    txresults::hex_str(&tx.serialize())
 }
 
 /// Rescan a block for any relevant transactions for the passed filter
@@ -453,17 +453,12 @@ pub fn handle_load_tx_filter<C: RpcChain>(
         };
         // The error text is Go's raw error: the chainhash size error
         // or encoding/hex's invalid-byte error.
-        let hash: Hash = hash_str
-            .parse()
-            .map_err(|e: dcroxide_chainhash::HashError| {
-                let text = match e {
-                    dcroxide_chainhash::HashError::InvalidHexByte(b) => {
-                        format!("encoding/hex: invalid byte: U+{:04X} {:?}", b, b as char)
-                    }
-                    other => other.to_string(),
-                };
-                RPCError::new(codes::INVALID_PARAMETER, &text)
-            })?;
+        let hash: Hash = hash_str.parse().map_err(|e| {
+            RPCError::new(
+                codes::INVALID_PARAMETER,
+                &crate::helpers::go_hash_decode_error(e),
+            )
+        })?;
         let tree = match &f[1] {
             GoValue::Int(n) => *n as i8,
             other => panic!("expected int field, got {other:?}"),
@@ -967,7 +962,7 @@ pub fn notify_work<C: RpcChain>(
     }
 
     // Serialize the data that represents work to be solved; the
-    // agenda failure is log-only.
+    // agenda and serialization failures are log-only.
     let header = template_block.header;
     let Ok(is_blake3_pow_active) = server
         .cfg
@@ -976,7 +971,9 @@ pub fn notify_work<C: RpcChain>(
     else {
         return Vec::new();
     };
-    let data = crate::handlers::serialize_get_work_data(&header, is_blake3_pow_active);
+    let Ok(data) = crate::helpers::serialize_get_work_data(&header, is_blake3_pow_active) else {
+        return Vec::new();
+    };
 
     // The byte-swapped legacy target.
     let target =
@@ -995,24 +992,23 @@ pub fn notify_work<C: RpcChain>(
     };
 
     // Prune old templates when the best block changed and add the
-    // template to the pool.
-    let template_key = crate::handlers::get_work_template_key(&header);
-    if reason == TemplateUpdateReason::NewParent {
-        let best_height = server.cfg.chain.best_snapshot().height;
-        let prune_height = best_height - 3;
-        server
-            .work_state
-            .lock()
-            .expect("work state poisoned")
-            .template_pool
-            .retain(|_, block| i64::from(block.header.height) >= prune_height);
+    // template to the pool, both under one hold of the work state as in
+    // dcrd, so a getwork call never sees the pool pruned without the
+    // new template.  dcrd reads the best snapshot inside that hold; the
+    // port's snapshot takes the chain mutex, which block processing
+    // holds, so it is read first to keep the work state from waiting
+    // on a block validation.
+    let template_key = crate::helpers::get_work_template_key(&header);
+    let best_height = (reason == TemplateUpdateReason::NewParent)
+        .then(|| server.cfg.chain.best_snapshot().height);
+    let template_block = template_block.clone();
+    {
+        let mut state = server.work_state.lock().expect("work state poisoned");
+        if let Some(best_height) = best_height {
+            state.prune_old_block_templates(best_height);
+        }
+        state.template_pool.insert(template_key, template_block);
     }
-    server
-        .work_state
-        .lock()
-        .expect("work state poisoned")
-        .template_pool
-        .insert(template_key, template_block.clone());
 
     clients
         .iter()
@@ -1192,8 +1188,6 @@ pub fn notify_for_new_tx<C: RpcChain>(
                 0,
                 0,
                 is_treasury_enabled,
-                server.cfg.max_protocol_version,
-                server.cfg.chain_params.net,
             ) else {
                 // dcrd returns silently, skipping remaining clients.
                 return out;

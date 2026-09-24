@@ -764,19 +764,25 @@ impl ConnManager {
     /// probabilistic flood drops (skipped for whitelisted and
     /// loopback addresses), duplicate rejection, the per-host
     /// permit, and the total-connections permit (required unless
-    /// whitelisted).
+    /// whitelisted).  The clocks are
+    /// [`InboundRateLimiter::allow`]'s: wall-clock seconds and
+    /// nanoseconds, and a monotonic nanosecond reading.
     pub fn admit_inbound(
         &mut self,
         addr: &NetAddress,
         now_unix: i64,
         now_nanos: i64,
+        mono_nanos: i64,
         csprng: &mut dyn Csprng,
     ) -> InboundDecision {
         let is_whitelisted = self.is_whitelisted(addr);
         let is_loopback = is_loopback(&addr.ip);
 
         if !is_whitelisted && !is_loopback {
-            if !self.inbound_limiter.allow(addr, now_unix, now_nanos) {
+            if !self
+                .inbound_limiter
+                .allow(addr, now_unix, now_nanos, mono_nanos)
+            {
                 return InboundDecision::Drop {
                     reason: "rate limited".to_string(),
                 };
@@ -1361,7 +1367,13 @@ mod tests {
         )
         .expect("loopback");
 
-        match m.admit_inbound(&loopback, 1_700_000_000, 1_700_000_000_000_000_000, &mut r) {
+        match m.admit_inbound(
+            &loopback,
+            1_700_000_000,
+            1_700_000_000_000_000_000,
+            0,
+            &mut r,
+        ) {
             InboundDecision::Admit {
                 require_permit,
                 host_permit_reserved,
@@ -1376,7 +1388,7 @@ mod tests {
 
         // The single permit is used; the next inbound drops.
         let addr = v4(40, 5001);
-        match m.admit_inbound(&addr, 1_700_000_000, 1_700_000_000_000_000_000, &mut r) {
+        match m.admit_inbound(&addr, 1_700_000_000, 1_700_000_000_000_000_000, 0, &mut r) {
             InboundDecision::Drop { reason } => {
                 assert_eq!(reason, "a maximum of 1 connection is allowed");
             }
@@ -1385,7 +1397,13 @@ mod tests {
 
         // A duplicate of the registered address drops with the
         // established message.
-        match m.admit_inbound(&loopback, 1_700_000_000, 1_700_000_000_000_000_000, &mut r) {
+        match m.admit_inbound(
+            &loopback,
+            1_700_000_000,
+            1_700_000_000_000_000_000,
+            0,
+            &mut r,
+        ) {
             InboundDecision::Drop { reason } => {
                 assert_eq!(
                     reason,
@@ -1394,6 +1412,46 @@ mod tests {
             }
             other => panic!("unexpected decision {other:?}"),
         }
+    }
+
+    /// `admit_inbound` hands the group limiter its monotonic reading and
+    /// keeps the wall clock for the flood window and the cache TTL, as
+    /// dcrd's limiter subtracts `time.Now` values monotonically: a group
+    /// drained just before the wall clock steps back ten minutes is let
+    /// in again five monotonic seconds later.  The drop-log throttle
+    /// likewise gets its token back a minute later on that clock.
+    #[test]
+    fn a_backward_wall_clock_step_does_not_freeze_inbound_admission() {
+        let mut m = mgr(ManagerConfig::default());
+        let mut r = rng();
+        let addr = v4(60, 9108);
+        let rate_limited = |decision: &InboundDecision| match decision {
+            InboundDecision::Drop { reason } => reason == "rate limited",
+            _ => false,
+        };
+        let wall = 1_700_000_000_000_000_000i64;
+        let mono = 5_000_000_000i64;
+        for _ in 0..crate::GROUP_BURST_LIMIT {
+            let decision = m.admit_inbound(&addr, wall / 1_000_000_000, wall, mono, &mut r);
+            assert!(!rate_limited(&decision), "{decision:?}");
+        }
+        let decision = m.admit_inbound(&addr, wall / 1_000_000_000, wall, mono, &mut r);
+        assert!(rate_limited(&decision), "the burst is spent: {decision:?}");
+        for _ in 0..crate::DROP_LOG_BURST_LIMIT {
+            assert_eq!(
+                m.inbound_limiter.log_drops(mono),
+                crate::LogDropsOutcome::Logged
+            );
+        }
+
+        let wall = wall - 600 * 1_000_000_000;
+        let mono = mono + 5_000_000_000;
+        let decision = m.admit_inbound(&addr, wall / 1_000_000_000, wall, mono, &mut r);
+        assert!(!rate_limited(&decision), "a token is back: {decision:?}");
+        assert_eq!(
+            m.inbound_limiter.log_drops(mono + 55_000_000_000),
+            crate::LogDropsOutcome::Logged
+        );
     }
 
     /// A total-connections permit freed while the automatic outbound
@@ -1423,7 +1481,7 @@ mod tests {
         let mut ids = Vec::new();
         for last in [50, 51] {
             let addr = v4(last, 9108);
-            match m.admit_inbound(&addr, now_unix, now_nanos, &mut r) {
+            match m.admit_inbound(&addr, now_unix, now_nanos, 0, &mut r) {
                 InboundDecision::Admit {
                     require_permit,
                     host_permit_reserved,
@@ -1447,7 +1505,7 @@ mod tests {
         assert_eq!(m.total_normal_conns_sem.used(), 2, "the permit stays held");
 
         // A new inbound peer finds no free slot.
-        match m.admit_inbound(&v4(52, 9108), now_unix, now_nanos, &mut r) {
+        match m.admit_inbound(&v4(52, 9108), now_unix, now_nanos, 0, &mut r) {
             InboundDecision::Drop { reason } => {
                 assert_eq!(reason, "a maximum of 2 connections is allowed");
             }

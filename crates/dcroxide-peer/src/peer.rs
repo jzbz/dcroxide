@@ -4,12 +4,13 @@
 use dcroxide_chainhash::Hash;
 use dcroxide_containers::lru;
 use dcroxide_wire::{
-    CurrencyNet, InvVect, Message, MsgAddr, MsgGetBlocks, MsgGetHeaders, MsgPing, MsgPong,
-    MsgVersion, NetAddress, NetAddressV2, ServiceFlag,
+    CurrencyNet, Message, MsgAddr, MsgGetBlocks, MsgGetHeaders, MsgPing, MsgPong, MsgVersion,
+    NetAddress, NetAddressV2, ServiceFlag,
 };
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use crate::{MAX_KNOWN_INVENTORY, MAX_KNOWN_INVENTORY_TTL, MAX_PROTOCOL_VERSION, MsgTransport};
+use crate::{MAX_PROTOCOL_VERSION, MsgTransport};
 
 /// The default user agent of dcrd's wire module, which local version
 /// messages start from (Go `wire.DefaultUserAgent`).
@@ -26,6 +27,17 @@ const MAX_ADDR_PER_MSG: usize = 1000;
 pub trait PeerEnv {
     /// The current time in unix nanoseconds.
     fn now_nanos(&mut self) -> i64;
+    /// The monotonic reading Go's `time.Now` carries beside the wall
+    /// time.  `Sub` and `Since` between two such readings use it, so the
+    /// ping round trip dcrd measures (`nowFn().Sub(lastPingTime)`) and
+    /// getpeerinfo's pingwait are immune to wall-clock steps.  An
+    /// environment over the real clock returns `Some(Instant::now())`.
+    /// The default is `None`, for a scripted clock: intervals then fall
+    /// back to [`now_nanos`](PeerEnv::now_nanos), as Go's do for a
+    /// `time.Time` without a monotonic reading (one from `time.Unix`).
+    fn now_instant(&mut self) -> Option<Instant> {
+        None
+    }
     /// A fresh nonce for the local version message.
     fn rand_u64(&mut self) -> u64;
     /// Shuffle addresses for an over-full addr message (dcrd
@@ -205,14 +217,39 @@ pub struct StatsSnap {
     pub last_ping_micros: i64,
     /// The unix nanosecond time of the last ping.
     pub last_ping_time_nanos: i64,
+    /// The monotonic reading of the last ping, when the environment had
+    /// one (the monotonic half of dcrd's `LastPingTime`).
+    pub last_ping_instant: Option<Instant>,
     /// The negotiated protocol version.
     pub protocol_version: u32,
 }
 
+impl StatsSnap {
+    /// The time of the last ping as unix nanoseconds against `env`'s
+    /// wall clock: its current wall time less the monotonic time since
+    /// the ping, the two read here back to back, when both the ping and
+    /// `env` have monotonic readings; else the wall stamp taken with
+    /// the ping.  Subtracting this from the wall clock straight away
+    /// then measures the wait on the monotonic clock, as dcrd's
+    /// `Clock.Since(statsSnap.LastPingTime)` for pingwait does, rather
+    /// than absorbing a clock step taken while the ping was outstanding.
+    pub fn last_ping_time_on_wall_clock<E: PeerEnv>(&self, env: &mut E) -> i64 {
+        match (self.last_ping_instant, env.now_instant()) {
+            (Some(sent), Some(now)) => env
+                .now_nanos()
+                .saturating_sub(duration_nanos(now.saturating_duration_since(sent))),
+            _ => self.last_ping_time_nanos,
+        }
+    }
+}
+
+/// A duration as whole nanoseconds, saturating like Go's `Duration`.
+fn duration_nanos(d: Duration) -> i64 {
+    i64::try_from(d.as_nanos()).unwrap_or(i64::MAX)
+}
+
 /// An error from version negotiation (dcrd returns these from the
-/// negotiate functions).  When the remote's version message was read
-/// before the failure, it is carried here so the daemon can fire its
-/// version listener first, matching dcrd's callback ordering.
+/// negotiate functions).
 #[derive(Debug)]
 pub struct NegotiateError {
     /// The error text, matching dcrd's.
@@ -220,7 +257,10 @@ pub struct NegotiateError {
     /// The typed kind for errors dcrd 2.2's `peer/error.go` names;
     /// `None` for transport-level failures dcrd surfaces untyped.
     pub kind: Option<NegotiateErrorKind>,
-    /// The remote version message, when one was read.
+    /// The remote version message, for a rejection of it as too old.
+    /// The version listener has already run by then (it fires before
+    /// the check, as dcrd's `onVersion` does), so this is only a record
+    /// of what was rejected; nothing depends on it.
     pub remote_version: Option<Box<MsgVersion>>,
     /// Whether the failure was a wire-protocol violation (dcrd's
     /// `wire.ErrorCode`) rather than an IO, timeout, or negotiation
@@ -317,6 +357,14 @@ pub struct HandshakeOutcome {
 
 /// The synchronous peer core (dcrd `Peer` minus its handler
 /// goroutines and connection plumbing).
+///
+/// Some of dcrd's per-peer state lives in the daemon instead, and this
+/// type does not carry it: the known-inventory cache is netsync's
+/// per-peer state (`dcroxide-netsync` `manager.rs`) and the relay's
+/// `RelayPeerState` (`dcroxide-node` `dispatch.rs`), and the height
+/// netsync raises as blocks are announced is netsync's too.  The
+/// `getheaders` duplicate filter and `update_last_block_height` below
+/// mirror dcrd's API for its vectors, but the live copies are netsync's.
 pub struct Peer {
     cfg: Config,
     inbound: bool,
@@ -333,7 +381,6 @@ pub struct Peer {
     verack_received: bool,
     handshake_done: bool,
 
-    known_inventory: lru::Set<InvVect>,
     /// The begin and stop hashes of the last getblocks sent, for
     /// duplicate filtering.  The begin half is optional because dcrd
     /// records it even for a locator that had none (`prevGetBlocksBegin`
@@ -347,9 +394,9 @@ pub struct Peer {
     time_connected_nanos: i64,
     starting_height: i64,
     last_block: i64,
-    last_announced_block: Option<Hash>,
     last_ping_nonce: u64,
     last_ping_time_nanos: i64,
+    last_ping_instant: Option<Instant>,
     last_ping_micros: i64,
 
     bytes_received: u64,
@@ -416,19 +463,15 @@ impl Peer {
             send_headers_preferred: false,
             verack_received: false,
             handshake_done: false,
-            known_inventory: lru::Set::new_with_default_ttl(
-                MAX_KNOWN_INVENTORY,
-                MAX_KNOWN_INVENTORY_TTL,
-            ),
             prev_get_blocks: None,
             prev_get_hdrs: None,
             time_offset: 0,
             time_connected_nanos: 0,
             starting_height: 0,
             last_block: 0,
-            last_announced_block: None,
             last_ping_nonce: 0,
             last_ping_time_nanos: 0,
+            last_ping_instant: None,
             last_ping_micros: 0,
             bytes_received: 0,
             bytes_sent: 0,
@@ -581,12 +624,6 @@ impl Peer {
         self.send_headers_preferred
     }
 
-    /// Update the last announced block (dcrd
-    /// `UpdateLastAnnouncedBlock`).
-    pub fn update_last_announced_block(&mut self, hash: Hash) {
-        self.last_announced_block = Some(hash);
-    }
-
     /// Update the last known block height (dcrd
     /// `UpdateLastBlockHeight`).
     pub fn update_last_block_height(&mut self, new_height: i64) {
@@ -642,22 +679,9 @@ impl Peer {
             last_ping_nonce: self.last_ping_nonce,
             last_ping_micros: self.last_ping_micros,
             last_ping_time_nanos: self.last_ping_time_nanos,
+            last_ping_instant: self.last_ping_instant,
             protocol_version: self.protocol_version,
         }
-    }
-
-    // -- Known inventory --
-
-    /// Add the passed inventory to the known-inventory cache (dcrd
-    /// `AddKnownInventory`).
-    pub fn add_known_inventory(&mut self, inv_vect: InvVect) {
-        self.known_inventory.put(inv_vect);
-    }
-
-    /// Whether the peer is known to have the passed inventory (dcrd
-    /// `IsKnownInventory`).
-    pub fn is_known_inventory(&mut self, inv_vect: &InvVect) -> bool {
-        self.known_inventory.contains(inv_vect)
     }
 
     // -- Push builders --
@@ -725,6 +749,10 @@ impl Peer {
     /// stop hash, ignoring back-to-back duplicate requests (dcrd
     /// `PushGetBlocksMsg`).  Returns the message to queue, or `None`
     /// when the request duplicates the previous one.
+    ///
+    /// dcrd at the parity pin no longer has this method; it stays for
+    /// the dumped peer vectors that exercise it, and nothing in the
+    /// daemon calls it.
     pub fn push_get_blocks_msg(&mut self, locator: &[Hash], stop_hash: &Hash) -> Option<Message> {
         // Extract the begin hash from the block locator, if one was
         // specified, to use for filtering duplicate requests.
@@ -791,17 +819,26 @@ impl Peer {
     }
 
     /// Record a ping the daemon queued for sending (dcrd's output
-    /// handler bookkeeping for `MsgPing`).
+    /// handler bookkeeping for `MsgPing`), with both halves of dcrd's
+    /// `time.Now()`: the wall time and the monotonic reading.
     pub fn record_sent_ping<E: PeerEnv>(&mut self, env: &mut E, msg: &MsgPing) {
         self.last_ping_nonce = msg.nonce;
         self.last_ping_time_nanos = env.now_nanos();
+        self.last_ping_instant = env.now_instant();
     }
 
     /// Handle a pong message, updating the ping statistics when it
     /// answers the last outstanding ping (dcrd `handlePongMsg`).
     pub fn handle_pong_msg<E: PeerEnv>(&mut self, env: &mut E, msg: &MsgPong) {
         if self.last_ping_nonce != 0 && msg.nonce == self.last_ping_nonce {
-            let elapsed = env.now_nanos().saturating_sub(self.last_ping_time_nanos);
+            // dcrd's `nowFn().Sub(lastPingTime)` measures on the
+            // monotonic readings when both times carry one, so a
+            // wall-clock step while the ping was outstanding cannot make
+            // the round trip negative or inflate it.
+            let elapsed = match (self.last_ping_instant, env.now_instant()) {
+                (Some(sent), Some(now)) => duration_nanos(now.saturating_duration_since(sent)),
+                _ => env.now_nanos().saturating_sub(self.last_ping_time_nanos),
+            };
             self.last_ping_micros = elapsed.wrapping_div(1000);
             self.last_ping_nonce = 0;
         }

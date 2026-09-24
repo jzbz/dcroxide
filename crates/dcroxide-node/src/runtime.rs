@@ -313,13 +313,11 @@ pub fn inbound_peer_handler(
                 dcroxide_wire::ServiceFlag(0),
                 now_unix_nanos(),
             );
-            let now_nanos = now_unix_nanos();
-            let now_unix = now_nanos / 1_000_000_000;
             let mut rng = csprng.lock().expect("csprng mutex poisoned");
             let mut mgr = manager.lock().expect("connmgr mutex poisoned");
-            match mgr.admit_inbound(&remote_na, now_unix, now_nanos, &mut *rng) {
+            match admit_inbound_now(&mut mgr, &remote_na, &mut *rng) {
                 dcroxide_connmgr::InboundDecision::Drop { reason } => {
-                    log_inbound_drop(&mut mgr, manager, &addr, &reason, now_nanos);
+                    log_inbound_drop(&mut mgr, manager, &addr, &reason);
                     drop(mgr);
                     let _ = stream.shutdown(Shutdown::Both);
                     return;
@@ -379,17 +377,36 @@ fn now_unix_nanos() -> i64 {
         .unwrap_or(0)
 }
 
+/// dcrd `listenHandler`'s admission of an inbound connection, on the
+/// clocks `inboundRateLimiter.Allow` takes from its one `time.Now`: the
+/// wall clock for the flood window and the limiter cache's TTL, and a
+/// monotonic reading for the group token buckets, as Go's `Time.Sub` of
+/// two `time.Now` values is monotonic.
+fn admit_inbound_now(
+    mgr: &mut dcroxide_connmgr::ConnManager,
+    remote_na: &NetAddress,
+    csprng: &mut dyn dcroxide_connmgr::Csprng,
+) -> dcroxide_connmgr::InboundDecision {
+    let now_nanos = now_unix_nanos();
+    let now_unix = now_nanos / 1_000_000_000;
+    let mono_nanos = dcroxide_connmgr::monotonic_nanos();
+    mgr.admit_inbound(remote_na, now_unix, now_nanos, mono_nanos, csprng)
+}
+
 /// Route a dropped inbound connection through the drop-log throttle
 /// (dcrd `inboundRateLimiter.LogDrops`), arming the suppression-reset
-/// timer when one starts.
+/// timer when one starts.  Like dcrd's, it reads its own clock, the
+/// monotonic one its token bucket measures time on.
 fn log_inbound_drop(
     mgr: &mut dcroxide_connmgr::ConnManager,
     manager: &crate::outbound::SharedConnManager,
     addr: &SocketAddr,
     reason: &str,
-    now_nanos: i64,
 ) {
-    match mgr.inbound_limiter.log_drops(now_nanos) {
+    match mgr
+        .inbound_limiter
+        .log_drops(dcroxide_connmgr::monotonic_nanos())
+    {
         dcroxide_connmgr::LogDropsOutcome::Logged => {
             crate::logging::debug("CMGR", &format!("Dropped connection from {addr}: {reason}"));
         }
@@ -1393,5 +1410,68 @@ mod tests {
         ] {
             assert_eq!(accept_error_log(&io::Error::from(quiet), false), None);
         }
+    }
+
+    /// The admission path's group token buckets run on
+    /// `monotonic_nanos`, as dcrd's `Time.Sub` of two `time.Now` values
+    /// is monotonic: a bucket it drained is refilled five seconds later
+    /// on that clock.  Handed the wall clock, the bucket's stamp sat
+    /// some 1.7e18ns past every monotonic reading, which is how a
+    /// backward wall-clock step froze a drained group.
+    #[test]
+    fn inbound_admission_times_its_buckets_on_the_monotonic_clock() {
+        use dcroxide_connmgr::InboundDecision;
+
+        let mut csprng = dcroxide_connmgr::SystemCsprng::default();
+        let mut mgr = dcroxide_connmgr::ConnManager::new(Default::default(), &mut csprng);
+        let remote = dcroxide_addrmgr::new_net_address_from_ip_port(
+            &[203, 0, 113, 7],
+            9108,
+            ServiceFlag(0),
+            now_unix_nanos(),
+        );
+        let rate_limited = |decision: &InboundDecision| match decision {
+            InboundDecision::Drop { reason } => reason == "rate limited",
+            _ => false,
+        };
+        for _ in 0..dcroxide_connmgr::GROUP_BURST_LIMIT {
+            let decision = admit_inbound_now(&mut mgr, &remote, &mut csprng);
+            assert!(!rate_limited(&decision), "{decision:?}");
+        }
+        let decision = admit_inbound_now(&mut mgr, &remote, &mut csprng);
+        assert!(rate_limited(&decision), "the burst is spent: {decision:?}");
+
+        // One token (0.2/s) is back five monotonic seconds later.
+        let now_nanos = now_unix_nanos();
+        let later = dcroxide_connmgr::monotonic_nanos() + 5_000_000_000;
+        let decision = mgr.admit_inbound(
+            &remote,
+            now_nanos / 1_000_000_000,
+            now_nanos,
+            later,
+            &mut csprng,
+        );
+        assert!(!rate_limited(&decision), "{decision:?}");
+    }
+
+    /// The drop-log throttle runs on `monotonic_nanos` too: the burst it
+    /// spent regains a token a minute later on that clock.
+    #[test]
+    fn inbound_drop_logging_times_its_bucket_on_the_monotonic_clock() {
+        let mut csprng = dcroxide_connmgr::SystemCsprng::default();
+        let manager = Arc::new(Mutex::new(dcroxide_connmgr::ConnManager::new(
+            Default::default(),
+            &mut csprng,
+        )));
+        let addr: SocketAddr = "203.0.113.7:9108".parse().expect("addr");
+        let mut mgr = manager.lock().expect("connmgr mutex");
+        for _ in 0..dcroxide_connmgr::DROP_LOG_BURST_LIMIT {
+            log_inbound_drop(&mut mgr, &manager, &addr, "rate limited");
+        }
+        let later = dcroxide_connmgr::monotonic_nanos() + 61_000_000_000;
+        assert_eq!(
+            mgr.inbound_limiter.log_drops(later),
+            dcroxide_connmgr::LogDropsOutcome::Logged
+        );
     }
 }

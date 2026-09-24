@@ -16,7 +16,7 @@ use dcroxide_chaincfg::Params;
 use dcroxide_dcrjson::{GoValue, RPCError};
 use dcroxide_rpctypes::chainsvrresults as results;
 use dcroxide_wire::Message;
-use dcroxide_wire::{BlockHeader, CurrencyNet, MsgTx};
+use dcroxide_wire::{BlockHeader, MsgTx};
 
 use crate::rpcerrors::{rpc_internal_err, rpc_invalid_error};
 
@@ -42,13 +42,14 @@ fn s(v: String) -> GoValue {
 }
 
 /// Serialize a message to its wire protocol hex encoding (dcrd
-/// `messageToHex`; the payload only, without framing).
+/// `messageToHex`; the payload only, without framing).  An encode
+/// failure is `rpcInternalErr(err, "Failed to encode msg of type %T")`,
+/// whose message is the error text alone; the context only feeds
+/// dcrd's log.
 pub fn message_to_hex(msg: &Message, pver: u32) -> Result<String, RPCError> {
     match msg.encode_payload(pver) {
         Ok(payload) => Ok(hex_str(&payload)),
-        Err(e) => Err(rpc_internal_err(&format!(
-            "Failed to encode msg of type {msg:?}: {e:?}"
-        ))),
+        Err(e) => Err(rpc_internal_err(&e.to_string())),
     }
 }
 
@@ -112,31 +113,30 @@ pub fn create_vin_list(mtx: &MsgTx, is_treasury_enabled: bool) -> Vec<GoValue> {
         )
     };
 
+    // dcrd pre-sizes the list to the input count and fills entry zero
+    // on the three single-input shapes below.  Each classifier requires
+    // exactly one input (`IsTreasuryBase`, `IsCoinBaseTx` and
+    // `IsTSpend` all reject any other count), so that list is always
+    // the one entry built here.
+
     // Treasurybase transactions only have a single txin by definition.
     // NOTE: this check MUST come before the coinbase check because a
     // treasurybase is identified as a coinbase as well.
     if is_treasury_enabled && dcroxide_standalone::is_treasury_base(mtx) {
-        let txin = &mtx.tx_in[0];
-        let mut list = vec![GoValue::Null; mtx.tx_in.len()];
-        list[0] = simple(2, &[], txin);
-        return fill_zero_vins(list, mtx);
+        return vec![simple(2, &[], &mtx.tx_in[0])];
     }
 
     // Coinbase transactions only have a single txin by definition.
     if dcroxide_standalone::is_coin_base_tx(mtx, is_treasury_enabled) {
         let txin = &mtx.tx_in[0];
-        let mut list = vec![GoValue::Null; mtx.tx_in.len()];
-        list[0] = simple(0, &txin.signature_script, txin);
-        return fill_zero_vins(list, mtx);
+        return vec![simple(0, &txin.signature_script, txin)];
     }
 
     // Treasury spend transactions only have a single txin by
     // definition.
     if is_treasury_enabled && dcroxide_stake::treasury::is_tspend(mtx) {
         let txin = &mtx.tx_in[0];
-        let mut list = vec![GoValue::Null; mtx.tx_in.len()];
-        list[0] = simple(3, &txin.signature_script, txin);
-        return fill_zero_vins(list, mtx);
+        return vec![simple(3, &txin.signature_script, txin)];
     }
 
     // Stakebase transactions (votes) have two inputs: a null stake
@@ -172,31 +172,6 @@ pub fn create_vin_list(mtx: &MsgTx, is_treasury_enabled: bool) -> Vec<GoValue> {
     }
 
     vin_list
-}
-
-/// dcrd pre-sizes the vin list, so extra inputs on the single-input
-/// shapes stay as zero-valued entries.
-fn fill_zero_vins(mut list: Vec<GoValue>, mtx: &MsgTx) -> Vec<GoValue> {
-    for (i, slot) in list.iter_mut().enumerate() {
-        if matches!(slot, GoValue::Null) {
-            let _ = &mtx.tx_in[i];
-            *slot = vin_value(
-                String::new(),
-                String::new(),
-                false,
-                String::new(),
-                String::new(),
-                0,
-                0,
-                0,
-                0.0,
-                0,
-                0,
-                GoValue::Null,
-            );
-        }
-    }
-    list
 }
 
 /// A slice of JSON objects for the outputs of the passed transaction
@@ -294,10 +269,11 @@ pub fn create_tx_raw_result(
     blk_height: i64,
     confirmations: i64,
     is_treasury_enabled: bool,
-    pver: u32,
-    _net: CurrencyNet,
 ) -> Result<GoValue, RPCError> {
-    let mtx_hex = message_to_hex(&Message::Tx(mtx.clone()), pver)?;
+    // dcrd `messageToHex(mtx)`.  A transaction's encoding does not vary
+    // with the protocol version and cannot fail, so it is serialized in
+    // place rather than cloned into a `Message` for `message_to_hex`.
+    let mtx_hex = hex_str(&mtx.serialize());
 
     if tx_hash != mtx.tx_hash().to_string() {
         return Err(rpc_invalid_error(&format!(
@@ -338,4 +314,25 @@ pub fn create_tx_raw_result(
         GoValue::Int(time),
         GoValue::Int(blocktime),
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An encode failure answers with the error text alone, as dcrd's
+    /// `rpcInternalErr` does: `messageToHex`'s `Failed to encode msg of
+    /// type %T` context only feeds the log.  The port put that context
+    /// and a `Debug` dump of the whole message into the reply.  No
+    /// caller's message fails to encode today; a getcftypes message
+    /// below the protocol version that introduced it is one that does.
+    #[test]
+    fn message_to_hex_reports_the_encode_error_alone() {
+        let err = message_to_hex(&Message::GetCFTypes, 0).expect_err("invalid for pver 0");
+        assert_eq!(err.code, dcroxide_dcrjson::err_rpc_internal().code);
+        assert_eq!(
+            err.message,
+            dcroxide_wire::WireError::MsgInvalidForPVer.to_string()
+        );
+    }
 }

@@ -25,7 +25,7 @@ mod tordns;
 
 pub use manager::{
     AddrManager, AddrRng, AddressPriority, Clock, KnownAddress, KnownAddressRef, LocalAddr,
-    NEW_BUCKET_COUNT, NetAddressReach, PEERS_FILENAME, SystemRng, TRIED_BUCKET_COUNT,
+    NEW_BUCKET_COUNT, NetAddressReach, PEERS_FILENAME, PeersLoad, SystemRng, TRIED_BUCKET_COUNT,
 };
 pub use netaddress::{
     NetAddress, encode_host, new_net_address_from_ip_port, new_net_address_from_params,
