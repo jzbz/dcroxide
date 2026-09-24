@@ -369,11 +369,16 @@ impl<S> WireTransport<S> {
 /// receive that returned nothing, where now only the whole-message
 /// budget can end it, which is what dcrd's per-message
 /// `SetReadDeadline` actually means.
+///
+/// `got` is advanced by every byte received, so a caller learns what a
+/// failed read took off the wire as well as a whole one (dcrd's
+/// `ReadMessageN` returns its `totalBytes` on every path).
 fn read_exact_by_deadline<S: Read + SocketTimeout>(
     stream: &mut S,
     buf: &mut [u8],
     deadline: Option<Instant>,
     cancel: Option<&Cancel>,
+    got: &mut usize,
 ) -> std::io::Result<()> {
     let cancelled = || {
         std::io::Error::new(
@@ -381,17 +386,35 @@ fn read_exact_by_deadline<S: Read + SocketTimeout>(
             "the connection was torn down locally",
         )
     };
+    let unexpected_eof = || {
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        )
+    };
+    let mut filled = 0usize;
     let Some(deadline) = deadline else {
         // With no budget there is nothing to slice against, so the
         // flag can only be checked before parking in the read.  The
         // peer loop always sets a budget; this is the in-memory test
-        // path and the pre-handshake path.
+        // path and the pre-handshake path.  The loop is `read_exact`'s,
+        // counting as it goes.
         if cancel.is_some_and(Cancel::is_cancelled) {
             return Err(cancelled());
         }
-        return stream.read_exact(buf);
+        while filled < buf.len() {
+            match stream.read(&mut buf[filled..]) {
+                Ok(0) => return Err(unexpected_eof()),
+                Ok(n) => {
+                    filled = filled.saturating_add(n);
+                    *got = got.saturating_add(n);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        return Ok(());
     };
-    let mut filled = 0usize;
     while filled < buf.len() {
         if cancel.is_some_and(Cancel::is_cancelled) {
             return Err(cancelled());
@@ -405,13 +428,11 @@ fn read_exact_by_deadline<S: Read + SocketTimeout>(
         }
         stream.set_socket_read_timeout(Some(remaining.min(READ_POLL_INTERVAL)));
         match stream.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "failed to fill whole buffer",
-                ));
+            Ok(0) => return Err(unexpected_eof()),
+            Ok(n) => {
+                filled = filled.saturating_add(n);
+                *got = got.saturating_add(n);
             }
-            Ok(n) => filled = filled.saturating_add(n),
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // A poll slice elapsed with nothing to read.  Only the
             // deadline check above may end this read; loop back to it.
@@ -439,16 +460,38 @@ fn read_exact_by_deadline<S: Read + SocketTimeout>(
 /// indefinitely.  Computing the deadline once and charging the elapsed
 /// time against it makes the budget cover the whole message, exactly as
 /// [`read_exact_by_deadline`] does for the read side.
+///
+/// `sent` is advanced by every byte the stream accepts, so a caller
+/// learns what a failed write put on the wire (dcrd's `WriteMessageN`
+/// returns the partial count `Write` reports alongside its error).
 fn write_all_by_deadline<S: Write + SocketTimeout>(
     stream: &mut S,
     buf: &[u8],
     deadline: Option<Instant>,
+    sent: &mut usize,
 ) -> std::io::Result<()> {
-    let Some(deadline) = deadline else {
-        stream.write_all(buf)?;
-        return stream.flush();
+    let write_zero = || {
+        std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "failed to write whole buffer",
+        )
     };
     let mut written = 0usize;
+    let Some(deadline) = deadline else {
+        // `write_all`'s loop, counting as it goes.
+        while written < buf.len() {
+            match stream.write(&buf[written..]) {
+                Ok(0) => return Err(write_zero()),
+                Ok(n) => {
+                    written = written.saturating_add(n);
+                    *sent = sent.saturating_add(n);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        return stream.flush();
+    };
     while written < buf.len() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -459,13 +502,11 @@ fn write_all_by_deadline<S: Write + SocketTimeout>(
         }
         stream.set_socket_write_timeout(Some(remaining));
         match stream.write(&buf[written..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write whole buffer",
-                ));
+            Ok(0) => return Err(write_zero()),
+            Ok(n) => {
+                written = written.saturating_add(n);
+                *sent = sent.saturating_add(n);
             }
-            Ok(n) => written = written.saturating_add(n),
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
@@ -483,12 +524,12 @@ fn write_all_by_deadline<S: Write + SocketTimeout>(
     stream.flush()
 }
 
-impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
-    fn set_protocol_version(&mut self, pver: u32) {
-        WireTransport::set_protocol_version(self, pver);
-    }
-
-    fn read_message(&mut self) -> Result<Message, dcroxide_peer::ReadError> {
+impl<S: Read + Write + SocketTimeout> WireTransport<S> {
+    /// Read and decode the next message, advancing `got` by every byte
+    /// taken off the stream on the way, whether or not a message results
+    /// (dcrd `wire.ReadMessageN` and the `totalBytes` it returns on every
+    /// path).
+    fn read_framed(&mut self, got: &mut usize) -> Result<Message, dcroxide_peer::ReadError> {
         // One absolute deadline covers the whole message — header and
         // payload (dcrd's single `SetReadDeadline` before
         // `ReadMessageN`).
@@ -498,8 +539,14 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
         // known before any payload allocation (dcrd `readMessageHeader`
         // then the payload read).
         let mut buf = vec![0u8; MESSAGE_HEADER_SIZE];
-        read_exact_by_deadline(&mut self.stream, &mut buf, deadline, self.cancel.as_ref())
-            .map_err(|e| dcroxide_peer::ReadError::io(e.to_string()))?;
+        read_exact_by_deadline(
+            &mut self.stream,
+            &mut buf,
+            deadline,
+            self.cancel.as_ref(),
+            got,
+        )
+        .map_err(|e| dcroxide_peer::ReadError::io(e.to_string()))?;
 
         // Validate the header before reserving anything for the
         // payload.  dcrd's `readMessageN` checks the global cap, the
@@ -520,6 +567,7 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
                 &mut buf[MESSAGE_HEADER_SIZE..],
                 deadline,
                 self.cancel.as_ref(),
+                got,
             )
             .map_err(|e| dcroxide_peer::ReadError::io(e.to_string()))?;
         }
@@ -538,20 +586,38 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
         // errors.  Over-banning here would cost an honest peer 24 hours
         // over a decoder parity gap, and the handshake reads below are
         // unauthenticated.
-        let (msg, consumed) = wire_read_message(&buf, self.pver, self.net).map_err(|e| {
+        let (msg, _) = wire_read_message(&buf, self.pver, self.net).map_err(|e| {
             if e.kind_name().is_empty() {
                 dcroxide_peer::ReadError::io(e.to_string())
             } else {
                 dcroxide_peer::ReadError::wire(e.to_string())
             }
         })?;
-        self.bytes_read = self.bytes_read.saturating_add(consumed as u64);
+        Ok(msg)
+    }
+}
+
+impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
+    fn set_protocol_version(&mut self, pver: u32) {
+        WireTransport::set_protocol_version(self, pver);
+    }
+
+    fn read_message(&mut self) -> Result<Message, dcroxide_peer::ReadError> {
+        // Every byte taken off the wire counts, including those of a
+        // read that fails: a bad checksum, an unknown command, a payload
+        // cut short.  dcrd's `readMessage` adds `ReadMessageN`'s `n` to
+        // `bytesReceived`, and its `OnRead` adds it to the server's
+        // total, before either looks at the error (`peer/peer.go`,
+        // `server.go` `serverPeer.OnRead`).
+        let mut got = 0usize;
+        let result = self.read_framed(&mut got);
+        self.bytes_read = self.bytes_read.saturating_add(got as u64);
         if let Some(totals) = &self.net_totals {
             totals
                 .bytes_received
-                .fetch_add(consumed as u64, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(got as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        Ok(msg)
+        result
     }
 
     fn write_message(&mut self, msg: &Message) -> Result<(), String> {
@@ -571,18 +637,23 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
         let deadline = self
             .write_stall
             .map(|p| now.checked_add(p.deadline_for(bytes.len())).unwrap_or(now));
-        let result = write_all_by_deadline(&mut self.stream, &bytes, deadline);
+        let mut sent = 0usize;
+        let result = write_all_by_deadline(&mut self.stream, &bytes, deadline, &mut sent);
         if self.write_stall.is_some() {
             self.stream.set_socket_write_timeout(None);
         }
-        result.map_err(|e| e.to_string())?;
-        self.bytes_written = self.bytes_written.saturating_add(bytes.len() as u64);
+        // What reached the stream counts even when the write then fails
+        // (dcrd's `writeMessage` adds `WriteMessageN`'s partial `n` to
+        // `bytesSent`, and its `OnWrite` to the server's total, whatever
+        // the error).  An encoding failure above wrote nothing, as
+        // `WriteMessageN` returns zero for it.
+        self.bytes_written = self.bytes_written.saturating_add(sent as u64);
         if let Some(totals) = &self.net_totals {
             totals
                 .bytes_sent
-                .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(sent as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        Ok(())
+        result.map_err(|e| e.to_string())
     }
 
     fn total_bytes_read(&self) -> u64 {
@@ -950,6 +1021,7 @@ mod tests {
             transport.get_mut(),
             &vec![0xa5u8; PAYLOAD],
             Some(started.checked_add(BUDGET).expect("deadline")),
+            &mut 0,
         );
         let elapsed = started.elapsed();
 
@@ -979,8 +1051,81 @@ mod tests {
     #[test]
     fn no_write_budget_leaves_the_write_unbounded() {
         let mut sink = Cursor::new(Vec::new());
-        write_all_by_deadline(&mut sink, b"hello", None).expect("unbounded write");
+        write_all_by_deadline(&mut sink, b"hello", None, &mut 0).expect("unbounded write");
         assert_eq!(sink.into_inner(), b"hello");
+    }
+
+    /// The bytes a failed read took off the wire still count, for the
+    /// peer and server-wide.  dcrd's `readMessage` adds
+    /// `ReadMessageN`'s `n` to `bytesReceived`, and `serverPeer.OnRead`
+    /// adds it to the getnettotals total, before either looks at the
+    /// error; `ReadMessageN` returns what it read on every path.
+    #[test]
+    fn a_failed_read_counts_the_bytes_it_consumed() {
+        let msg = Message::Ping(MsgPing { nonce: 7 });
+        let framed = wire_write_message(&msg, MAX_PROTOCOL_VERSION, NET).expect("frame");
+
+        // A whole message with a bad checksum: read in full, then refused.
+        let mut bad_checksum = framed.clone();
+        bad_checksum[PAYLOAD_LEN_OFFSET + 4] ^= 0xff;
+        // Another network's magic: refused from the header alone, so the
+        // payload behind it is never read.
+        let mut wrong_net = framed.clone();
+        wrong_net[0] ^= 0xff;
+        // A stream that ends three bytes into the payload.
+        let truncated = framed[..MESSAGE_HEADER_SIZE + 3].to_vec();
+        let cases = [
+            (bad_checksum, framed.len()),
+            (wrong_net, MESSAGE_HEADER_SIZE),
+            (truncated, MESSAGE_HEADER_SIZE + 3),
+        ];
+
+        // Both the budgeted read the peer loop uses and the unbudgeted one.
+        for budget in [None, Some(Duration::from_secs(5))] {
+            for (stream, want) in cases.clone() {
+                let totals = std::sync::Arc::new(NetByteTotals::new());
+                let mut transport =
+                    WireTransport::new(Cursor::new(stream), MAX_PROTOCOL_VERSION, NET);
+                transport.set_net_totals(std::sync::Arc::clone(&totals));
+                transport.set_read_budget(budget);
+                transport.read_message().expect_err("the read fails");
+                assert_eq!(transport.bytes_read(), want as u64, "{budget:?}");
+                assert_eq!(
+                    totals
+                        .bytes_received
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    want as u64,
+                    "{budget:?}"
+                );
+            }
+        }
+    }
+
+    /// The bytes a failed write put on the wire still count (dcrd's
+    /// `writeMessage` adds `WriteMessageN`'s partial `n` to `bytesSent`,
+    /// and `serverPeer.OnWrite` to the server's total, whatever the
+    /// error).
+    #[test]
+    fn a_failed_write_counts_the_bytes_it_sent() {
+        let msg = Message::Ping(MsgPing { nonce: 7 });
+        for policy in [None, Some(WriteStallPolicy::dcrd())] {
+            // Room for ten of the message's thirty-two bytes.
+            let mut room = [0u8; 10];
+            let totals = std::sync::Arc::new(NetByteTotals::new());
+            let mut transport =
+                WireTransport::new(Cursor::new(&mut room[..]), MAX_PROTOCOL_VERSION, NET);
+            transport.set_net_totals(std::sync::Arc::clone(&totals));
+            transport.set_write_stall_policy(policy);
+            transport
+                .write_message(&msg)
+                .expect_err("the stream fills after ten bytes");
+            assert_eq!(transport.bytes_written(), 10, "{policy:?}");
+            assert_eq!(
+                totals.bytes_sent.load(std::sync::atomic::Ordering::Relaxed),
+                10,
+                "{policy:?}"
+            );
+        }
     }
 
     /// A read must give up when the connection's [`Cancel`] flag goes up,

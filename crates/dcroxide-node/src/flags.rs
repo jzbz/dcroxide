@@ -961,12 +961,29 @@ pub const HELP_DESCRIPTIONS: [(&str, &str, Option<&str>); 86] = [
 /// the option registry, byte-for-byte): the usage line over the app
 /// name, the Application Options section with the option column
 /// padded two spaces past the longest entry, descriptions (with their
-/// `[$ENV]` annotations) wrapped at eighty columns onto
-/// continuation lines aligned to the description column, and the Help
-/// Options tail.  dcrd's dedicated help pre-parse never adds the
-/// Windows service group, so neither does this.
-pub fn render_help(app_name: &str) -> String {
-    render_help_with(app_name, &HELP_DESCRIPTIONS)
+/// `(default: X)` notes and `[$ENV]` annotations) wrapped to the
+/// terminal width onto continuation lines aligned to the description
+/// column, and the Help Options tail.  dcrd's dedicated help pre-parse
+/// never adds the Windows service group, so neither does this.
+///
+/// `default_home_dir` is the application data directory the defaults
+/// derive from (dcrd's `defaultHomeDir`), as the load was given it in
+/// [`crate::config::ConfigEnv::default_home_dir`].  `terminal_columns`
+/// is go-flags' `getTerminalColumns` result, which the daemon takes
+/// from [`terminal_columns`]; zero means eighty, as in
+/// `getAlignmentInfo`.
+///
+/// The text comes back as bytes because go-flags wraps by bytes: a
+/// hyphenating split of a long default path can fall inside a
+/// multibyte character, and dcrd writes those partial bytes as they
+/// are.
+pub fn render_help(app_name: &str, default_home_dir: &str, terminal_columns: usize) -> Vec<u8> {
+    render_help_with(
+        app_name,
+        &HELP_DESCRIPTIONS,
+        default_home_dir,
+        terminal_columns,
+    )
 }
 
 /// [`render_help`] over an explicit description table.
@@ -976,7 +993,27 @@ pub fn render_help(app_name: &str) -> String {
 /// wrapping — so substituting it is how the parity test renders with
 /// dcrd's variable names and keeps comparing byte for byte against dcrd's
 /// dumped help.  Production always passes [`HELP_DESCRIPTIONS`].
-pub fn render_help_with(app_name: &str, descriptions: &[(&str, &str, Option<&str>)]) -> String {
+pub fn render_help_with(
+    app_name: &str,
+    descriptions: &[(&str, &str, Option<&str>)],
+    default_home_dir: &str,
+    terminal_columns: usize,
+) -> Vec<u8> {
+    // go-flags `getAlignmentInfo`: a width that is not positive, as a
+    // terminal reporting no size gives, is eighty columns.
+    let terminal_columns = if terminal_columns == 0 {
+        80
+    } else {
+        terminal_columns
+    };
+
+    // dcrd runs its help pre-parse over the config it has just filled
+    // with its defaults, and go-flags' `ParseArgs` records each option's
+    // value as its default literal before it parses anything
+    // (`updateDefaultLiteral`), so the help shows the defaults whatever
+    // the command line says.
+    let defaults = Config::defaults(default_home_dir);
+
     // The alignment column counts "  " + the short slot + "--long"
     // WITHOUT the value marker: go-flags appends the "=" after
     // computing the alignment, so the marker eats into the padding
@@ -1005,71 +1042,279 @@ pub fn render_help_with(app_name: &str, descriptions: &[(&str, &str, Option<&str
         .unwrap_or(0)
         .saturating_add(2);
 
-    let mut out = String::new();
-    out.push_str("Usage:\n");
-    out.push_str(&format!("  {app_name} [OPTIONS]\n"));
-    out.push_str("\nApplication Options:\n");
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(b"Usage:\n");
+    out.extend_from_slice(format!("  {app_name} [OPTIONS]\n").as_bytes());
+    out.extend_from_slice(b"\nApplication Options:\n");
     for spec in OPTIONS.iter() {
         let (_, desc, env) = descriptions
             .iter()
             .find(|(long, _, _)| *long == spec.long)
             .copied()
             .unwrap_or((spec.long, "", None));
-        let mut text = desc.to_string();
+        let def = default_literal(&defaults, spec);
+        let mut text = if def.is_empty() {
+            desc.to_string()
+        } else {
+            format!("{desc} (default: {def})")
+        };
         if let Some(env) = env {
             text.push_str(&format!(" [${env}]"));
         }
-        push_entry(&mut out, &prefix(spec), &text, column);
+        push_entry(&mut out, &prefix(spec), &text, column, terminal_columns);
     }
-    out.push_str("\nHelp Options:\n");
-    push_entry(&mut out, &help_prefix, "Show this help message", column);
+    out.extend_from_slice(b"\nHelp Options:\n");
+    push_entry(
+        &mut out,
+        &help_prefix,
+        "Show this help message",
+        column,
+        terminal_columns,
+    );
     // dcrd prints the help error through Println, appending a final
     // blank line.
-    out.push('\n');
+    out.push(b'\n');
     out
 }
 
-/// One help entry: the option column padded to the description start
-/// (a value marker may squeeze the padding down to one space), then
-/// the description through go-flags' `wrapText` — while the remaining
-/// text is LONGER than the width, split at the last space within the
-/// first width bytes (hyphenating when there is none), keeping an
-/// exactly-width remainder whole — with continuation lines aligned
-/// under the description column.  Descriptions are ASCII, matching
-/// go-flags' byte indexing.
-fn push_entry(out: &mut String, prefix: &str, description: &str, column: usize) {
-    let width = 80usize.saturating_sub(column);
-    out.push_str(prefix);
+/// go-flags' `getTerminalColumns` (`termsize.go`): the column count of
+/// the terminal on standard input, read with `TIOCGWINSZ` on descriptor
+/// 0, or eighty when that fails -- so a help that is piped or
+/// redirected still follows the terminal it was typed in, and one run
+/// with no terminal on stdin wraps at eighty.  A terminal reporting
+/// zero columns gives zero, which [`render_help`] treats as eighty.
+///
+/// The workspace forbids unsafe code, so the ioctl runs through
+/// `stty size` over this process's own stdin (the stand-in
+/// `promptsecret` uses for its termios calls): it prints the rows and
+/// columns `TIOCGWINSZ` reports and fails on a descriptor that is not
+/// a terminal.  A missing `stty` falls back to eighty as well.
+#[cfg(all(unix, not(target_os = "aix")))]
+pub fn terminal_columns() -> usize {
+    std::process::Command::new("stty")
+        .arg("size")
+        .stdin(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| stty_size_columns(&out.stdout))
+        .unwrap_or(80)
+}
+
+/// go-flags' `getTerminalColumns` where it asks no terminal: eighty
+/// columns on AIX (`termsize_nosysioctl.go`), and on Windows, where
+/// go-flags reads `MaximumWindowSize.X` of the console behind standard
+/// output (`termsize_windows.go`) through a console call that needs
+/// unsafe code, which the workspace forbids -- so the port keeps the
+/// eighty go-flags falls back to when stdout is not a console.
+#[cfg(not(all(unix, not(target_os = "aix"))))]
+pub fn terminal_columns() -> usize {
+    80
+}
+
+/// The column count out of `stty size` output (`rows cols`, the
+/// `ws_row` and `ws_col` of `TIOCGWINSZ`), as the `uint16` go-flags
+/// widens to an `int`.
+#[cfg(all(unix, not(target_os = "aix")))]
+fn stty_size_columns(out: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(out).ok()?;
+    let mut fields = text.split_ascii_whitespace();
+    let _rows: u16 = fields.next()?.parse().ok()?;
+    let cols: u16 = fields.next()?.parse().ok()?;
+    fields.next().is_none().then_some(usize::from(cols))
+}
+
+/// The default go-flags prints for an option: `updateDefaultLiteral`
+/// over dcrd's defaulted config, rendered by `convertToString` -- the
+/// string itself, `[a, b]` for a slice, decimal integers, `FormatFloat`
+/// with `'g'` and the shortest precision, and `Duration.String`.  An
+/// option that takes no argument (a bool), a zero value, and the four
+/// passwords with `default-mask:"-"` show none.
+fn default_literal(cfg: &Config, spec: &OptSpec) -> String {
+    let string = |v: &str| v.to_string();
+    let slice = |v: &[String]| {
+        if v.is_empty() {
+            String::new()
+        } else {
+            format!("[{}]", v.join(", "))
+        }
+    };
+    let int = |v: i64| if v == 0 { String::new() } else { v.to_string() };
+    let uint = |v: u64| if v == 0 { String::new() } else { v.to_string() };
+    let float = |v: f64| {
+        // `reflect.DeepEqual` against the zero value compares with
+        // `==`, so a negative zero shows no default and a NaN does.
+        if v == 0.0 {
+            String::new()
+        } else {
+            dcroxide_dcrjson::gojson::format_float_g(v)
+        }
+    };
+    let duration = |nanos: i64| {
+        if nanos == 0 {
+            String::new()
+        } else {
+            crate::gostd::go_duration_string(nanos)
+        }
+    };
+    match spec.long {
+        "appdata" => string(&cfg.home_dir),
+        "configfile" => string(&cfg.config_file),
+        "datadir" => string(&cfg.data_dir),
+        "logdir" => string(&cfg.log_dir),
+        "logsize" => string(&cfg.log_size),
+        "dbtype" => string(&cfg.db_type),
+        "profile" => string(&cfg.profile),
+        "cpuprofile" => string(&cfg.cpu_profile),
+        "memprofile" => string(&cfg.mem_profile),
+        "debuglevel" => string(&cfg.debug_level),
+        "sigcachemaxsize" => uint(cfg.sig_cache_max_size),
+        "utxocachemaxsize" => uint(cfg.utxo_cache_max_size),
+        "rpclisten" => slice(&cfg.rpc_listeners),
+        "rpcuser" => string(&cfg.rpc_user),
+        "authtype" => string(&cfg.rpc_auth_type),
+        "clientcafile" => string(&cfg.rpc_client_cas),
+        "rpclimituser" => string(&cfg.rpc_limit_user),
+        "rpccert" => string(&cfg.rpc_cert),
+        "rpckey" => string(&cfg.rpc_key),
+        "tlscurve" => string(&cfg.tls_curve),
+        "altdnsnames" => slice(&cfg.alt_dns_names),
+        "rpcmaxclients" => int(cfg.rpc_max_clients),
+        "rpcmaxwebsockets" => int(cfg.rpc_max_websockets),
+        "rpcmaxconcurrentreqs" => int(cfg.rpc_max_concurrent_reqs),
+        "proxy" => string(&cfg.proxy),
+        "proxyuser" => string(&cfg.proxy_user),
+        "onion" => string(&cfg.onion_proxy),
+        "onionuser" => string(&cfg.onion_proxy_user),
+        "addpeer" => slice(&cfg.add_peers),
+        "connect" => slice(&cfg.connect_peers),
+        "listen" => slice(&cfg.listeners),
+        "maxsameip" => int(cfg.max_same_ip),
+        "maxpeers" => int(cfg.max_peers),
+        "dialtimeout" => duration(cfg.dial_timeout_nanos),
+        "peeridletimeout" => duration(cfg.peer_idle_timeout_nanos),
+        "externalip" => slice(&cfg.external_ips),
+        "banduration" => duration(cfg.ban_duration_nanos),
+        "banthreshold" => uint(u64::from(cfg.ban_threshold)),
+        "whitelist" => slice(&cfg.whitelists_raw),
+        "dumpblockchain" => string(&cfg.dump_blockchain),
+        "assumevalid" => string(&cfg.assume_valid),
+        "minrelaytxfee" => float(cfg.min_relay_tx_fee),
+        "limitfreerelay" => float(cfg.free_tx_relay_limit),
+        "maxorphantx" => int(cfg.max_orphan_txs),
+        "miningaddr" => slice(&cfg.mining_addrs_raw),
+        "blockminsize" => uint(u64::from(cfg.block_min_size)),
+        "blockmaxsize" => uint(u64::from(cfg.block_max_size)),
+        "blockprioritysize" => uint(u64::from(cfg.block_priority_size)),
+        "miningtimeoffset" => int(cfg.mining_time_offset),
+        "piperx" => uint(cfg.pipe_rx),
+        "pipetx" => uint(cfg.pipe_tx),
+        // The bools, which take no argument, and the passwords
+        // (`rpcpass`, `rpclimitpass`, `proxypass`, `onionpass`), whose
+        // `default-mask:"-"` hides any default.
+        _ => String::new(),
+    }
+}
+
+/// One help entry (go-flags `writeHelpOption`): the option column
+/// padded to the description start (a value marker may squeeze the
+/// padding down to one space), then the description through
+/// [`wrap_text`] over the columns the terminal leaves past the
+/// description start, with continuation lines aligned under the
+/// description column.
+fn push_entry(
+    out: &mut Vec<u8>,
+    prefix: &str,
+    description: &str,
+    column: usize,
+    terminal_columns: usize,
+) {
+    // `info.terminalColumns-descstart`; a negative width is below
+    // `wrapText`'s floor of ten either way.
+    let width = terminal_columns.saturating_sub(column);
+    out.extend_from_slice(prefix.as_bytes());
     let pad = column.saturating_sub(prefix.chars().count()).max(1);
-    for _ in 0..pad {
-        out.push(' ');
-    }
-    let indent = " ".repeat(column);
-    let mut line = description.trim();
-    let mut first = true;
-    while line.len() > width {
-        let (segment, rest) = match line[..width].rfind(' ') {
-            Some(pos) => (line[..pos].trim_end().to_string(), line[pos..].trim_start()),
-            None => {
-                let cut = width.saturating_sub(1);
-                (format!("{}-", &line[..cut]), &line[cut..])
+    out.resize(out.len() + pad, b' ');
+    let indent = vec![b' '; column];
+    out.extend_from_slice(&wrap_text(description.as_bytes(), width, &indent));
+    out.push(b'\n');
+}
+
+/// go-flags' `wrapText`, over bytes as Go indexes strings: for each
+/// `\n`-separated line, trimmed, while the rest is LONGER than the
+/// width, split at the last space within the first width bytes --
+/// keeping an exactly-width remainder whole -- or, with no space,
+/// after width-1 bytes with a `-` and a newline, which the next
+/// segment's own newline and prefix then follow (so a hyphenated split
+/// leaves a blank line); continuation lines start with `prefix`.
+fn wrap_text(s: &[u8], width: usize, prefix: &[u8]) -> Vec<u8> {
+    let l = width.max(10);
+    let mut ret: Vec<u8> = Vec::new();
+    for raw in s.split(|&b| b == b'\n') {
+        let mut retline: Vec<u8> = Vec::new();
+        let mut line = go_trim_space(raw);
+        while line.len() > l {
+            // Try to split on space.
+            let (pos, suffix): (usize, &[u8]) = match line[..l].iter().rposition(|&b| b == b' ') {
+                Some(pos) => (pos, b""),
+                None => (l - 1, b"-\n"),
+            };
+            if !retline.is_empty() {
+                retline.push(b'\n');
+                retline.extend_from_slice(prefix);
             }
-        };
-        if !first {
-            out.push_str(&indent);
+            retline.extend_from_slice(go_trim_space(&line[..pos]));
+            retline.extend_from_slice(suffix);
+            line = go_trim_space(&line[pos..]);
         }
-        out.push_str(&segment);
-        out.push('\n');
-        first = false;
-        line = rest;
-    }
-    if !line.is_empty() {
-        if !first {
-            out.push_str(&indent);
+        if !line.is_empty() {
+            if !retline.is_empty() {
+                retline.push(b'\n');
+                retline.extend_from_slice(prefix);
+            }
+            retline.extend_from_slice(line);
         }
-        out.push_str(line);
+        if !ret.is_empty() {
+            ret.push(b'\n');
+            if !retline.is_empty() {
+                ret.extend_from_slice(prefix);
+            }
+        }
+        ret.extend_from_slice(&retline);
     }
-    out.push('\n');
+    ret
+}
+
+/// Go's `strings.TrimSpace` over bytes that may end in part of a UTF-8
+/// sequence (a split of [`wrap_text`]): leading and trailing Unicode
+/// white space is removed, and an incomplete sequence, which Go decodes
+/// as `RuneError`, stops the trim.
+fn go_trim_space(mut b: &[u8]) -> &[u8] {
+    let edge_char = |bytes: &[u8], front: bool| -> Option<char> {
+        (1..=bytes.len().min(4)).find_map(|n| {
+            let part = if front {
+                &bytes[..n]
+            } else {
+                &bytes[bytes.len() - n..]
+            };
+            let text = std::str::from_utf8(part).ok()?;
+            let mut chars = text.chars();
+            let c = if front {
+                chars.next()
+            } else {
+                chars.next_back()
+            }?;
+            chars.next().is_none().then_some(c)
+        })
+    };
+    while let Some(c) = edge_char(b, true).filter(|c| c.is_whitespace()) {
+        b = &b[c.len_utf8()..];
+    }
+    while let Some(c) = edge_char(b, false).filter(|c| c.is_whitespace()) {
+        b = &b[..b.len() - c.len_utf8()];
+    }
+    b
 }
 
 /// Find an option by its long name.
@@ -1191,10 +1436,19 @@ fn find_short_with(
         .find(|o| o.short == Some(name))
 }
 
-/// Find an option the way go-flags' INI parser matches names:
-/// the exact Go field name wins over the exact long name, which
-/// wins over the exact short name.
+/// Find an option the way go-flags' INI parser matches names
+/// (`Group.optionByName`): the `ini-name` matcher first, then the exact
+/// Go field name, then the exact long name, then the exact short name.
 fn find_ini_name(name: &str) -> Option<&'static OptSpec> {
+    // The matcher compares the lowercased `ini-name` tag with the
+    // lowercased key.  No dcrd option carries the tag, so every option
+    // matches the empty key, and the first one walked -- `ShowVersion`,
+    // the first field of the config struct -- takes it: a stray `=` or
+    // `=1` line sets the version flag of the final config, which dcrd
+    // never reads, and `=foo` fails its `ParseBool`.
+    if name.is_empty() {
+        return OPTIONS.first();
+    }
     OPTIONS
         .iter()
         .find(|o| o.field == name)
@@ -1402,21 +1656,26 @@ pub(crate) fn scan_args<'a>(
     help: &mut bool,
 ) -> (ScanState<'a>, Option<ScanError>) {
     let mut pass = ParsePass::default();
-    scan_args_in(
+    let (state, err) = scan_args_in(
         &OPTIONS,
         &mut |spec, value| {
             // The injected help spec has no `Config` field; it is the
-            // parse's own result, like go-flags' `ErrHelp`.
+            // parse's own result, like go-flags' `ErrHelp`, and like it
+            // ends the scan where it stands: the help option's handler
+            // returns `ErrHelp`, so go-flags never reaches the arguments
+            // after it, nor an error one of them would raise.
             if core::ptr::eq(spec, &HELP_OPTION) {
                 *help = true;
-                Ok(())
+                Err(String::new())
             } else {
                 set_option(cfg, &mut pass, spec, value)
             }
         },
         args,
         mode,
-    )
+    );
+    // The stop above is the help result, not an error of the parse.
+    if *help { (state, None) } else { (state, err) }
 }
 
 /// Scan and apply a command line like go-flags `ParseArgs` over any
@@ -1576,15 +1835,41 @@ pub(crate) struct IniAssignment {
     pub line: usize,
 }
 
-/// Parse the INI config file like go-flags' `IniParser`, returning
-/// the assignments to apply or the error text `loadConfig` would
-/// see.  Application errors are reported by the caller with the
-/// file/line context from the assignment.
-pub(crate) fn parse_ini(content: &str, filename: &str) -> Result<Vec<IniAssignment>, String> {
-    let ini_error = |line: usize, message: &str| format!("{filename}:{line}: {message}");
-    let mut out = Vec::new();
-    let mut section_ok = true;
+/// One step of go-flags' INI apply pass (`IniParser.parse`), in its
+/// order.
+pub(crate) enum IniStep {
+    /// A value to convert and store; a conversion error stops the pass
+    /// here, reported with the file/line context by the caller.
+    Set(IniAssignment),
+    /// The error the apply pass stops with on reaching this point (an
+    /// unknown option group or option name), in `loadConfig`'s text.
+    Fail(String),
+}
 
+/// One `key=value` line as go-flags' `readIni` keeps it: the name, the
+/// (unquoted) value, and the 1-based line number.
+type IniValue<'a> = (&'a str, String, usize);
+
+/// Parse the INI config file like go-flags' `IniParser`, in its two
+/// passes.  `readIni` reads the whole file first and fails only on
+/// syntax -- a malformed section header, an empty section name, a line
+/// without `=`, a quoted value `strconv.Unquote` refuses -- which is
+/// returned as the error.  `parse` then walks each section's values in
+/// file order, looking up and converting each: the steps returned are
+/// that walk, ending at the first unknown group or option, and the
+/// caller converts the values in order, so the first bad line of the
+/// walk is the one reported, whatever made it bad.
+///
+/// Go walks the sections map in random order; the port takes them in
+/// order of first appearance (the global section first, as the file
+/// must have it), one of the orders dcrd can take.
+pub(crate) fn parse_ini(content: &str, filename: &str) -> Result<Vec<IniStep>, String> {
+    let ini_error = |line: usize, message: &str| format!("{filename}:{line}: {message}");
+
+    // readIni.  The empty global section always exists; a section named
+    // again continues its earlier values.
+    let mut sections: Vec<(&str, Vec<IniValue<'_>>)> = vec![("", Vec::new())];
+    let mut current = 0;
     for (idx, raw) in content.lines().enumerate() {
         let lineno = idx + 1;
         let line = raw.trim();
@@ -1602,17 +1887,13 @@ pub(crate) fn parse_ini(content: &str, filename: &str) -> Result<Vec<IniAssignme
             if name.is_empty() {
                 return Err(ini_error(lineno, "empty section name"));
             }
-            // The parser has a single group; section names resolve
-            // case-insensitively against its description, and the
-            // global (empty) section always matches.
-            section_ok = name.to_lowercase() == "application options";
-            if !section_ok {
-                // go-flags reports unknown groups when their values
-                // are reached (the sections map is keyed by name, so
-                // the error fires during the apply walk); with a
-                // single unknown section this is equivalent.
-                return Err(format!("could not find option group `{name}'"));
-            }
+            current = match sections.iter().position(|(n, _)| *n == name) {
+                Some(i) => i,
+                None => {
+                    sections.push((name, Vec::new()));
+                    sections.len() - 1
+                }
+            };
             continue;
         }
 
@@ -1627,29 +1908,43 @@ pub(crate) fn parse_ini(content: &str, filename: &str) -> Result<Vec<IniAssignme
             value = go_unquote(&value).map_err(|e| ini_error(lineno, &e))?;
         }
 
-        if !section_ok {
-            continue;
-        }
-
-        let Some(spec) = find_ini_name(name) else {
-            return Err(ini_error(lineno, &format!("unknown option: {name}")));
-        };
-
-        // A bool option with an empty value is the bare-flag form.
-        let value = if spec.kind == OptKind::Bool && value.is_empty() {
-            None
-        } else {
-            Some(value)
-        };
-
-        out.push(IniAssignment {
-            spec,
-            value,
-            line: lineno,
-        });
+        sections[current].1.push((name, value, lineno));
     }
 
-    Ok(out)
+    // parse.
+    let mut steps = Vec::new();
+    for (section, values) in sections {
+        // The parser has a single group; section names resolve
+        // case-insensitively against its description, and the global
+        // (empty) section always matches.
+        if !section.is_empty() && section.to_lowercase() != "application options" {
+            steps.push(IniStep::Fail(format!(
+                "could not find option group `{section}'"
+            )));
+            return Ok(steps);
+        }
+
+        for (name, value, line) in values {
+            let Some(spec) = find_ini_name(name) else {
+                steps.push(IniStep::Fail(ini_error(
+                    line,
+                    &format!("unknown option: {name}"),
+                )));
+                return Ok(steps);
+            };
+
+            // A bool option with an empty value is the bare-flag form.
+            let value = if spec.kind == OptKind::Bool && value.is_empty() {
+                None
+            } else {
+                Some(value)
+            };
+
+            steps.push(IniStep::Set(IniAssignment { spec, value, line }));
+        }
+    }
+
+    Ok(steps)
 }
 
 /// The process arguments after the program name, as UTF-8 strings.
@@ -1671,6 +1966,38 @@ pub fn args_after_program() -> Result<Vec<String>, std::ffi::OsString> {
         .skip(1)
         .map(std::ffi::OsString::into_string)
         .collect()
+}
+
+/// An environment variable of the process, for the configuration's
+/// lookups ([`crate::config::ConfigEnv::getenv`] and
+/// [`crate::config::app_data_dir`]).
+///
+/// Go's `os.Getenv` returns a variable's raw bytes (on Windows, its
+/// UTF-16 decoded as WTF-8), so dcrd takes a `DCRD_APPDATA`, a `HOME` or
+/// a `$VAR` in `--datadir` that is not UTF-8 as the bytes it holds.
+/// `std::env::var(..).ok()` read such a value as unset, and the port
+/// then ran on the default home -- for `HOME`, on the current
+/// directory -- with nothing said.  A `String` cannot hold it, so it is
+/// refused instead, as argv is ([`args_after_program`]): the first such
+/// value is recorded in `refused` as the error to fail with, and the
+/// lookup returns `None`.  The port looks a variable up only where dcrd
+/// does, so only one dcrd would have read is refused, and the load fails
+/// with it before acting on what it read
+/// ([`crate::config::load_config_from_argv_with_notices`]).
+pub fn getenv_utf8(name: &str, refused: &std::cell::RefCell<Option<String>>) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            refused.borrow_mut().get_or_insert_with(|| {
+                format!(
+                    "invalid UTF-8 in environment variable {name}: {}",
+                    raw.to_string_lossy()
+                )
+            });
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1706,5 +2033,82 @@ mod tests {
             assert_eq!(find_short_for(&OPTIONS, mode, 's').is_some(), cfg!(windows));
         }
         assert!(find_long_for(&OPTIONS, ScanMode::IgnoreUnknown, "help").is_some());
+    }
+
+    /// go-flags wraps the help by bytes, so a hyphenating split of a
+    /// long non-ASCII default path cuts a character in two and dcrd
+    /// writes the halves as they are.  The expected `--configfile`
+    /// entry is `tools/helpgen`'s output with its home set to `/home/`
+    /// and forty `é`; the render used to go through `from_utf8_lossy`,
+    /// which turned each half into U+FFFD.
+    #[test]
+    fn help_keeps_the_bytes_of_a_split_character() {
+        let home = format!("/home/{}", "é".repeat(40));
+        let help = render_help("dcroxide", &home, 80);
+        let e = "é".as_bytes();
+        let pad = [b' '; 30];
+        let mut expected =
+            b"  -C, --configfile=           Path to configuration file (default:\n".to_vec();
+        expected.extend_from_slice(&pad);
+        expected.extend_from_slice(b"/home/");
+        expected.extend_from_slice(&e.repeat(21));
+        expected.extend_from_slice(b"\xc3-\n\n");
+        expected.extend_from_slice(&pad);
+        expected.extend_from_slice(b"\xa9");
+        expected.extend_from_slice(&e.repeat(18));
+        expected.extend_from_slice(b"/dcroxide.co-\n\n");
+        expected.extend_from_slice(&pad);
+        expected.extend_from_slice(b"nf)\n");
+        assert!(
+            help.windows(expected.len())
+                .any(|w| w == expected.as_slice()),
+            "the split character must keep its raw bytes"
+        );
+        assert!(!help.windows(3).any(|w| w == "\u{fffd}".as_bytes()));
+    }
+
+    /// `stty size` prints `rows cols`; anything else, as from a
+    /// descriptor that is not a terminal, leaves go-flags' eighty to the
+    /// caller.  Zero columns come through as zero for `render_help`'s
+    /// `getAlignmentInfo` rule.
+    #[cfg(all(unix, not(target_os = "aix")))]
+    #[test]
+    fn stty_size_output_gives_the_columns() {
+        assert_eq!(stty_size_columns(b"50 140\n"), Some(140));
+        assert_eq!(stty_size_columns(b"0 0\n"), Some(0));
+        assert_eq!(stty_size_columns(b""), None);
+        assert_eq!(stty_size_columns(b"50\n"), None);
+        assert_eq!(stty_size_columns(b"rows 50; columns 140;\n"), None);
+        assert_eq!(stty_size_columns(b"50 70000\n"), None);
+    }
+
+    /// With no terminal on stdin -- the `TIOCGWINSZ` failure go-flags
+    /// answers with eighty -- the probe gives eighty.
+    #[cfg(all(unix, not(target_os = "aix")))]
+    #[test]
+    fn no_terminal_on_stdin_is_eighty_columns() {
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "flags::tests::terminal_columns_child",
+                "--nocapture",
+            ])
+            .env("DCROXIDE_TERMINAL_COLUMNS_CHILD", "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the child test");
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("columns=80;"), "{stdout}");
+    }
+
+    /// The child half of `no_terminal_on_stdin_is_eighty_columns`: it
+    /// reports the probe over the stdin its parent gave it.
+    #[cfg(all(unix, not(target_os = "aix")))]
+    #[test]
+    fn terminal_columns_child() {
+        if std::env::var_os("DCROXIDE_TERMINAL_COLUMNS_CHILD").is_some() {
+            println!("columns={};", terminal_columns());
+        }
     }
 }

@@ -42,10 +42,7 @@ use dcroxide_peer::{
     NegotiateErrorKind, Peer, PeerEnv, PeerGlobals, ReadError, STALL_RESPONSE_TIMEOUT,
     STALL_TICK_INTERVAL, StallDetector, StallReason,
 };
-use dcroxide_wire::{
-    CurrencyNet, MESSAGE_HEADER_SIZE, Message, MsgPing, MsgVersion,
-    write_message as wire_write_message,
-};
+use dcroxide_wire::{CurrencyNet, MESSAGE_HEADER_SIZE, Message, MsgPing, MsgVersion};
 
 use crate::peerconn::NodePeerEnv;
 use crate::socktimeout::SocketTimeout;
@@ -514,12 +511,6 @@ struct OutboundQueueState {
     /// the connection assembly and left at its placeholder in the unit
     /// tests, which have no socket.
     label: std::sync::OnceLock<String>,
-    /// The framing parameters the byte charge is computed under, set
-    /// once by the connection assembly after the handshake (the queue
-    /// only ever carries session traffic, framed at the negotiated
-    /// version).  The unit tests leave the default, the local maximum
-    /// over mainnet.
-    wire: std::sync::OnceLock<(u32, CurrencyNet)>,
     /// Bytes charged for the queued-but-unsent messages, against
     /// [`MAX_OUTBOUND_QUEUE_BYTES`].
     bytes: std::sync::atomic::AtomicUsize,
@@ -603,11 +594,8 @@ pub const MAX_OUTBOUND_QUEUE_DEPTH: usize = 128;
 /// altogether is already cut off by the write deadline (the *Per-peer
 /// outbound queue* row of `PARITY.md`).  The charge is computed on
 /// enqueue and released when the output loop takes
-/// the message: exact arithmetic for the two messages that dominate any
-/// real queue (`MsgBlock` and `MsgTx`, whose ported `serialize_size`
-/// methods are cheap), and one measuring serialization for everything
-/// else, whose sizes are control-plane small (the extra encode never
-/// touches the block-serving hot path).
+/// the message, and it is dcrd's own `msgSize` arithmetic: the header
+/// plus [`Message::serialize_size`], with nothing encoded to measure it.
 ///
 /// 4 MiB caps the pipelining worst case near ~500 MiB across a full
 /// default peer set — down from ~5.7 GB under the count bound alone —
@@ -615,26 +603,21 @@ pub const MAX_OUTBOUND_QUEUE_DEPTH: usize = 128;
 /// queue is well under 100 KB (a relay inv is ~40 bytes, a block
 /// announcement ~180), and the serve path holds at most dcrd's
 /// `maxPendingSend` (3) getdata items at a time, ~1.2 MB of blocks.  A
-/// message larger than the whole budget — none exists today — is
-/// admitted into an empty queue rather than wedging the connection.
+/// message larger than the whole budget — only the protocol maxima of
+/// `cfiltersv2` and the largest mix messages are, far above anything
+/// real — is admitted into an empty queue rather than wedging the
+/// connection.
 pub const MAX_OUTBOUND_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 
-/// The byte charge for a message: its framed wire size under the
-/// queue's negotiated parameters.  `MsgBlock` and `MsgTx` take the
-/// arithmetic path (their `serialize_size` is a ported dcrd
-/// `SerializeSize`, exact by upstream's own tests); every other message
-/// is measured by framing it once, which is exact and cheap at
-/// control-plane sizes.  A message the codec refuses to frame is
-/// charged the header alone — the output loop's write will surface the
-/// same error and tear the connection down.
-fn message_charge(msg: &Message, pver: u32, net: CurrencyNet) -> usize {
-    match msg {
-        Message::Block(block) => MESSAGE_HEADER_SIZE.saturating_add(block.serialize_size()),
-        Message::Tx(tx) => MESSAGE_HEADER_SIZE.saturating_add(tx.serialize_size()),
-        _ => wire_write_message(msg, pver, net)
-            .map(|frame| frame.len())
-            .unwrap_or(MESSAGE_HEADER_SIZE),
-    }
+/// The byte charge for a message: its framed wire size (dcrd `msgSize`,
+/// the header plus the message's `SerializeSize`).  The size is
+/// arithmetic over the fields and exact for every message that frames;
+/// measuring it by framing the message doubled the encode and checksum
+/// work for every reply.  A message the codec refuses to frame is still
+/// charged its fields' size, as dcrd charges it — the output loop's
+/// write will surface the error and tear the connection down.
+fn message_charge(msg: &Message) -> usize {
+    MESSAGE_HEADER_SIZE.saturating_add(msg.serialize_size())
 }
 
 impl OutboundQueue {
@@ -643,7 +626,6 @@ impl OutboundQueue {
         let (sender, receiver) = mpsc::sync_channel(MAX_OUTBOUND_QUEUE_DEPTH);
         let state = Arc::new(OutboundQueueState {
             label: std::sync::OnceLock::new(),
-            wire: std::sync::OnceLock::new(),
             bytes: std::sync::atomic::AtomicUsize::new(0),
             reported_full: std::sync::atomic::AtomicBool::new(false),
         });
@@ -658,14 +640,6 @@ impl OutboundQueue {
                 state,
             },
         )
-    }
-
-    /// Set the framing parameters the byte charge is computed under —
-    /// the negotiated protocol version and the network — so the charge
-    /// matches what the write transport will actually frame.  The first
-    /// call wins.
-    pub fn set_wire_params(&self, pver: u32, net: CurrencyNet) {
-        let _ = self.state.wire.set((pver, net));
     }
 
     /// Name the peer this queue feeds, so a congestion report identifies
@@ -690,13 +664,7 @@ impl OutboundQueue {
     /// the message as sent.  [`QueueError::Closed`] means the output
     /// loop already stopped, which is the ordinary teardown path.
     pub fn queue_message(&self, msg: Message) -> Result<(), QueueError> {
-        let (pver, net) = self
-            .state
-            .wire
-            .get()
-            .copied()
-            .unwrap_or((MAX_PROTOCOL_VERSION, CurrencyNet::MAIN_NET));
-        let charge = message_charge(&msg, pver, net);
+        let charge = message_charge(&msg);
         // Charge first, then admit: concurrent producers may briefly
         // over-count, which errs on the refusing side.  An empty queue
         // admits any single message so an oversized one cannot wedge
@@ -1480,11 +1448,8 @@ where
     let label = peer_log_label(&peer);
     let peer = Arc::new(Mutex::new(peer));
     let (outbound, receiver) = OutboundQueue::channel();
-    // Name the queue so a congestion report identifies the peer, and
-    // frame its byte charges at the negotiated version the write
-    // transport uses.
+    // Name the queue so a congestion report identifies the peer.
     outbound.set_peer_label(label.clone());
-    outbound.set_wire_params(negotiated_pver, net);
 
     // The stall state the three loops share: the output loop arms the
     // deadlines, the input loop settles them and brackets the

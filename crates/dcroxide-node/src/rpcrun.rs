@@ -5590,6 +5590,41 @@ fn read_http_head<S: Read + SocketTimeout>(
     Ok(head)
 }
 
+/// Run `raw` through what the server does with a request before it
+/// authenticates, as though it arrived on a connection: the head parser
+/// ([`read_http_head`]), the `Expect` test, the mux ([`route`], and the
+/// `Location` a redirect is given), the websocket handshake's header and
+/// origin checks, and the discard of a declared body that follows every
+/// refusal (chunked decoding included).  Returns the head's length when
+/// it parses, so the caller can check the reader stopped at its end.
+///
+/// For the `http_head_parse` fuzz target only; not part of the API.
+#[doc(hidden)]
+pub fn fuzz_pre_auth_request(raw: &[u8]) -> Option<usize> {
+    let mut stream = std::io::Cursor::new(raw);
+    let now = Instant::now();
+    let deadline = now.checked_add(RPC_AUTH_TIMEOUT).unwrap_or(now);
+    let head = read_http_head(&mut stream, deadline).ok()?;
+    let head_len = usize::try_from(stream.position()).unwrap_or(usize::MAX);
+    let _ = head
+        .expect
+        .as_deref()
+        .is_some_and(|expect| has_token(expect, "100-continue"));
+    if let Route::Redirect(location) = route(&head) {
+        let _ = write_redirect(&mut std::io::sink(), &head.method, head.version, &location);
+    }
+    for (values, token) in [
+        (&head.connection, "upgrade"),
+        (&head.upgrade, "websocket"),
+        (&head.sec_websocket_version, "13"),
+    ] {
+        let _ = header_has_token(values, token);
+    }
+    let _ = check_origin(&head);
+    drain_declared_body(&mut stream, &head, deadline);
+    Some(head_len)
+}
+
 /// Go's `shouldClose` as `readRequest` applies it to set
 /// `Request.Close` (`net/http/transfer.go:756-772`,
 /// `request.go:1179`): below HTTP/1 always, HTTP/1.0 unless the

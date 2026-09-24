@@ -469,6 +469,7 @@ impl Wake {
 struct PersistState {
     addr: NetAddress,
     retry_count: u32,
+    /// A [`dcroxide_connmgr::monotonic_nanos`] reading.
     last_attempt_nanos: Option<i64>,
 }
 
@@ -877,7 +878,9 @@ fn dial_persistent(state: &mut LoopState, id: u64) {
     let Some(entry) = state.persistent.get_mut(&id) else {
         return;
     };
-    entry.last_attempt_nanos = Some(now_nanos());
+    // dcrd stamps `lastAttempt = time.Now()` and tests `time.Since`,
+    // which is monotonic: a wall-clock step must not force a backoff.
+    entry.last_attempt_nanos = Some(dcroxide_connmgr::monotonic_nanos());
     let addr = entry.addr.clone();
 
     let dial_id = {
@@ -932,7 +935,10 @@ fn handle_persistent_drop(state: &mut LoopState, id: u64) {
     };
     let (should_backoff, delay) = {
         let manager = state.manager.lock().expect("connmgr mutex poisoned");
-        let should = manager.persistent_should_backoff(entry.last_attempt_nanos, now_nanos());
+        let should = manager.persistent_should_backoff(
+            entry.last_attempt_nanos,
+            dcroxide_connmgr::monotonic_nanos(),
+        );
         if should {
             entry.retry_count = entry.retry_count.saturating_add(1);
             (
@@ -1853,5 +1859,62 @@ mod tests {
         );
         let manager = state.manager.lock().expect("connmgr");
         assert_eq!(manager.total_normal_conns_sem.used(), 0);
+    }
+
+    /// dcrd's `runPersistent` stamps `lastAttempt = time.Now()` as it
+    /// dials and, when the connection drops, backs off while
+    /// `time.Since(lastAttempt)` is under the retry duration: a
+    /// monotonic difference.  Both ends are `monotonic_nanos` readings
+    /// here, so the stamp lies between the readings around the dial and
+    /// a drop straight after it backs off.  A stamp or a test on the wall
+    /// clock put the two some 1.7e18ns apart and redialed at once, which
+    /// a backward wall-clock step also did to a pair both on the wall
+    /// clock.
+    #[test]
+    fn a_persistent_entry_times_its_backoff_on_the_monotonic_clock() {
+        let (mut state, receiver) = loop_state();
+        let addr = socket_addr_to_net_address(&"192.0.2.1:9108".parse().expect("addr"));
+        let id = state
+            .manager
+            .lock()
+            .expect("connmgr")
+            .add_persistent(&addr)
+            .expect("persistent");
+        state.persistent.insert(
+            id,
+            PersistState {
+                addr,
+                retry_count: 0,
+                last_attempt_nanos: None,
+            },
+        );
+
+        // No dialer thread starts; the dial reports itself failed.
+        crate::runtime::REFUSE_CONN_THREADS.with(|refuse| refuse.set(true));
+        let before = dcroxide_connmgr::monotonic_nanos();
+        dial_persistent(&mut state, id);
+        let after = dcroxide_connmgr::monotonic_nanos();
+        let stamp = state.persistent[&id]
+            .last_attempt_nanos
+            .expect("the dial stamps its attempt");
+        assert!(
+            (before..=after).contains(&stamp),
+            "the attempt stamp {stamp} is no monotonic reading ({before}..={after})"
+        );
+        let Ok(Command::DialDone(dial_id, kind @ DialKind::Persistent { .. }, Err(e))) =
+            receiver.try_recv()
+        else {
+            panic!("the refused dial must report its failure");
+        };
+
+        // The attempt failed at once: back off instead of redialing.
+        handle_dial_done(&mut state, dial_id, kind, Err(e));
+        crate::runtime::REFUSE_CONN_THREADS.with(|refuse| refuse.set(false));
+        assert_eq!(state.persistent[&id].retry_count, 1);
+        assert!(
+            matches!(state.timers.as_slice(), [(_, Wake::Retry(w))] if *w == id),
+            "a retry wake is armed"
+        );
+        assert!(receiver.try_recv().is_err(), "and nothing redialed");
     }
 }

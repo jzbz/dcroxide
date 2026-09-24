@@ -32,6 +32,11 @@ impl UreqTransport {
             .timeout_global(Some(Duration::from_secs(60)))
             // The seeder logic inspects the status itself.
             .http_status_as_error(false)
+            // dcrd's seeder client is a bare `http.Transport{DialContext:
+            // dialFn}` (`addrmgr/seed.go`), whose nil `Proxy` never reads
+            // the environment; ureq's default config would route through
+            // `ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY` instead.
+            .proxy(None)
             .build();
         UreqTransport {
             agent: config.new_agent(),
@@ -160,6 +165,53 @@ fn seeder_tls_config() -> Arc<rustls::ClientConfig> {
         .clone()
 }
 
+/// A connection whose every read and write is bounded by the time left
+/// before one absolute deadline, the way dcrd's per-seeder
+/// `context.WithTimeout(ctx, time.Minute)` (`server.go`
+/// `querySeeders`) cancels the TLS handshake and the body read together.
+/// Each blocking call gets the remaining time as its socket timeout, so
+/// a peer trickling one byte at a time cannot stretch the request past
+/// the deadline, and once it has passed every call fails at once.
+struct DeadlineStream {
+    stream: std::net::TcpStream,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    /// The time left before the deadline, or a timeout error once it
+    /// has passed (a zero socket timeout would mean no timeout at all).
+    fn remaining(&self) -> std::io::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "seeder request deadline exceeded",
+            ));
+        }
+        Ok(left)
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.remaining()?;
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let left = self.remaining()?;
+        self.stream.set_write_timeout(Some(left))?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 /// Read the HTTP response off a stream: the status line's code and the
 /// body after the header block, capped at the connmgr's limit and
 /// bounded by an absolute deadline.
@@ -167,8 +219,8 @@ fn read_http_response(mut read: impl Read, deadline: Instant) -> Result<(u32, Ve
     // Cap the whole response (header + body) at the connmgr limit plus
     // a small header allowance, so an untrusted seeder cannot force an
     // unbounded read, and stop at the deadline so a slow-trickle seeder
-    // cannot pin the seeding round (a true absolute bound, not just a
-    // per-read idle timeout).
+    // cannot pin the seeding round.  The check here runs between reads;
+    // the transport's [`DeadlineStream`] bounds each read itself.
     let cap = (MAX_RESP_SIZE as u64).saturating_add(8192) as usize;
     let mut raw = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -218,8 +270,9 @@ impl SeederTransport for ProxySeederTransport {
         let stream = self
             .dialer
             .dial(&format!("{}:{}", parsed.host, parsed.port), self.timeout)?;
-        let _ = stream.set_read_timeout(Some(self.timeout));
-        let _ = stream.set_write_timeout(Some(self.timeout));
+        // The dial, the TLS handshake, the request and the response
+        // share the one deadline, as they share dcrd's request context.
+        let stream = DeadlineStream { stream, deadline };
 
         // The Host header carries the port unless it is the scheme
         // default (Go's http.Client and RFC 7230 both do this).
@@ -571,5 +624,96 @@ mod tests {
 
         // A response with no header terminator is an error, not a panic.
         assert!(read_http_response(&b"garbage"[..], far_deadline()).is_err());
+    }
+
+    /// The direct seeder transport never takes a proxy from the process
+    /// environment: dcrd's seeder client is a bare `http.Transport` whose
+    /// nil `Proxy` never reads it.  The environment is per process and
+    /// the workspace forbids the `unsafe` `set_var`, so the check runs in
+    /// a child copy of this test binary started with the variables set.
+    #[test]
+    fn ureq_transport_ignores_the_proxy_environment() {
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "seeding::tests::ureq_transport_proxy_child",
+                "--nocapture",
+            ])
+            .env("DCROXIDE_SEEDER_PROXY_CHILD", "1")
+            .env("ALL_PROXY", "http://127.0.0.1:9")
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .output()
+            .expect("run the child test");
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("seeder-proxy=none;"), "{stdout}");
+    }
+
+    /// The child half of `ureq_transport_ignores_the_proxy_environment`.
+    #[test]
+    fn ureq_transport_proxy_child() {
+        if std::env::var_os("DCROXIDE_SEEDER_PROXY_CHILD").is_none() {
+            return;
+        }
+        assert!(
+            ureq::Proxy::try_from_env().is_some(),
+            "the child's environment names a proxy ureq would pick up"
+        );
+        let transport = UreqTransport::new();
+        assert!(
+            transport.agent.config().proxy().is_none(),
+            "the seeder transport must dial directly, as dcrd's does"
+        );
+        println!("seeder-proxy=none;");
+    }
+
+    /// A proxied seeder request is bounded as a whole by its deadline,
+    /// as dcrd's per-seeder `context.WithTimeout` bounds it.  The server
+    /// here trickles its TLS handshake a byte every 50 ms, well inside
+    /// any per-read socket timeout; the request must still fail at the
+    /// deadline rather than hold the seeder thread, and with it the
+    /// seeding round's retry, for as long as the trickle lasts.
+    #[test]
+    fn proxied_tls_handshake_is_bounded_by_the_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        thread::spawn(move || {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
+            let mut hello = [0u8; 1024];
+            let _ = conn.read(&mut hello);
+            // A handshake record header announcing a 4 KiB body, which
+            // then arrives one byte at a time.
+            if conn.write_all(&[0x16, 0x03, 0x03, 0x10, 0x00]).is_err() {
+                return;
+            }
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(30) {
+                thread::sleep(Duration::from_millis(50));
+                if conn.write_all(&[0x00]).is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            let mut transport = ProxySeederTransport {
+                dialer: crate::socks::NodeDialer::direct(),
+                timeout: Duration::from_millis(800),
+            };
+            let started = Instant::now();
+            let result = transport.get(&format!("https://127.0.0.1:{port}/api/addrs"));
+            let _ = done.send((result, started.elapsed()));
+        });
+        let (result, elapsed) = finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the request must end at its deadline, not ride the trickle");
+        assert!(result.is_err(), "{result:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     }
 }

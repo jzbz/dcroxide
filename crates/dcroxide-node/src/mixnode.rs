@@ -9,11 +9,11 @@
 //!
 //! The pool validates pair-request ownership against the live UTXO set.
 //! A mix message that references a spent output is rejected with dcrd's
-//! rule error (`output %v is not unspent`).  One that references an
-//! output the chain does not know is rejected too, but as the fetcher's
-//! `PoolError::UtxoFetch` rather than that rule error: dcrd's fetcher
-//! returns a nil entry, which its mixpool folds into the same rule
-//! error.
+//! rule error (`output %v is not unspent`), and so is one that references
+//! an output the chain does not know: dcrd's fetcher returns a nil entry
+//! for it, which its mixpool folds into the same rule error, and the
+//! fetcher here answers with an entry that reads as spent to the same
+//! effect.
 
 use std::sync::{Arc, Mutex};
 
@@ -61,10 +61,45 @@ impl MixUtxoFetcher for NodeMixUtxoFetcher {
             .lock()
             .expect("chain mutex poisoned")
             .fetch_utxo_entry(op);
+        // dcrd's `mixpoolChain.FetchUtxoEntry` returns `nil, nil` for an
+        // output the chain does not hold (`server.go:3761-3763`), and
+        // `checkAcceptPR` rejects `entry == nil || entry.IsSpent()` with
+        // one rule error (`mixpool.go:1448-1451`).  The port's fetcher
+        // interface has no nil entry, so a missing output answers with
+        // one that reads as spent: the pool then rejects it with that
+        // same rule error rather than as a fetch failure.
         match entry {
             Some(entry) => Ok(Box::new(NodeMixUtxo(entry))),
-            None => Err(format!("no utxo entry for {}:{}", op.hash, op.index)),
+            None => Ok(Box::new(MissingMixUtxo)),
         }
+    }
+}
+
+/// dcrd's nil entry for an output the chain does not hold, as the
+/// mixing pool reads it.  It reports itself spent, which the pool's
+/// pair-request check tests before anything else, so the remaining
+/// fields are never read.
+struct MissingMixUtxo;
+
+impl MixUtxoEntry for MissingMixUtxo {
+    fn is_spent(&self) -> bool {
+        true
+    }
+
+    fn pk_script(&self) -> &[u8] {
+        &[]
+    }
+
+    fn script_version(&self) -> u16 {
+        0
+    }
+
+    fn block_height(&self) -> i64 {
+        0
+    }
+
+    fn amount(&self) -> i64 {
+        0
     }
 }
 

@@ -6,13 +6,14 @@
 //! [`NodeSyncChain`] adapts the shared chain behind its mutex to the
 //! manager's [`SyncChain`] trait, injecting the server's median-adjusted
 //! time ([`crate::mediantime`]) where dcrd's blockchain reads its
-//! median-time source.  The mempool
-//! and mixpool are not wired yet, so [`NullTxPool`] and [`NullMixPool`]
-//! answer like empty pools that reject everything; the real pools
-//! replace them with later pieces.  The manager itself is constructed
-//! here ([`new_sync_manager`]) but not yet driven — the peer
-//! registration, the action executor, and the stall timer arrive with
-//! the following pieces.
+//! median-time source.  [`new_sync_manager`] builds the daemon's manager
+//! over it, the shared mempool ([`crate::txmempool::NodeSyncTxPool`]),
+//! and the shared mixing pool ([`crate::mixnode::NodeSyncMixPool`]);
+//! the daemon drives that manager from the peer dispatch path
+//! ([`crate::dispatch`]).  [`SyncGate`] exposes the manager's is-current
+//! state (dcrd `SyncManager.IsCurrent`) to the gates that cannot take
+//! the manager lock.  [`NullTxPool`] and [`NullMixPool`] are empty-pool
+//! test doubles for exercising the chain adapter on its own.
 
 use std::sync::{Arc, Mutex};
 
@@ -262,7 +263,8 @@ fn is_corruption(err: &RuleError) -> bool {
 }
 
 /// A transaction pool that behaves like an empty pool rejecting
-/// everything, standing in until the mempool is wired.
+/// everything: a test double, since the daemon's manager runs over
+/// [`crate::txmempool::NodeSyncTxPool`].
 #[derive(Default)]
 pub struct NullTxPool;
 
@@ -274,7 +276,7 @@ impl SyncTxPool for NullTxPool {
         _allow_high_fees: bool,
         _tag: u64,
     ) -> Result<Vec<Hash>, String> {
-        Err("the transaction mempool is not yet wired".to_string())
+        Err("the null transaction pool accepts nothing".to_string())
     }
 
     fn process_transaction_accepted(
@@ -288,7 +290,7 @@ impl SyncTxPool for NullTxPool {
         // internal failure to log.
         Err(ProcessTxFailure {
             is_rule_error: true,
-            message: "the transaction mempool is not yet wired".to_string(),
+            message: "the null transaction pool accepts nothing".to_string(),
         })
     }
 
@@ -301,8 +303,9 @@ impl SyncTxPool for NullTxPool {
     fn prune_expired_tx(&mut self, _height: i64) {}
 }
 
-/// A mixing pool that behaves like an empty pool rejecting everything,
-/// standing in until the mixpool is wired.
+/// A mixing pool that behaves like an empty pool rejecting everything:
+/// a test double, since the daemon's manager runs over
+/// [`crate::mixnode::NodeSyncMixPool`].
 #[derive(Default)]
 pub struct NullMixPool;
 
@@ -315,7 +318,7 @@ impl SyncMixPool for NullMixPool {
     }
 
     fn accept_message(&mut self, _msg: &Self::Msg, _source: u64) -> Result<Vec<Self::Msg>, String> {
-        Err("the mixing pool is not yet wired".to_string())
+        Err("the null mixing pool accepts nothing".to_string())
     }
 
     fn recent_message(&mut self, _hash: &Hash) -> bool {

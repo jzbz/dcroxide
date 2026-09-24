@@ -25,12 +25,12 @@
 //! Divergences from dcrd, all documented at the call sites: the
 //! `queryHashesPerSec` rendezvous becomes a `mpsc` request/reply; the
 //! `updateNumWorkers` signal becomes a poke with the count carried on an
-//! atomic; and dcrd's `notifyBlocks`/`BlockConnected` feed is not ported
+//! atomic; and dcrd's `notifyBlocks`/`BlockConnected` feed becomes a
+//! watch thread that polls the chain tip (see `DiscreteWatch`),
 //! because `std::sync::mpsc` cannot select the template subscription
-//! against a block-notification source and the discrete loop's
-//! `best_height` checks already cover dcrd's own "be safe" fallback, so a
-//! peer block arriving mid-discrete-run terminates on the bounded
-//! template poll rather than instantly.
+//! against a block-notification source, so a discrete run ends within a
+//! poll interval of the block that reaches its target, from any source,
+//! rather than on the connect itself.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -208,6 +208,73 @@ impl Drop for DiscreteMiningGuard {
         // Dropping the handle is what stops a later `generate 0` from
         // cancelling a call that has already returned.
         mode.generate_cancel = None;
+    }
+}
+
+/// How often a [`DiscreteWatch`] looks at the chain tip and the stop
+/// flags.
+const DISCRETE_WATCH_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Wakes a discrete run's template wait on the other arms of dcrd's
+/// `GenerateNBlocks` select: a connected block at or past the target
+/// height (`case block := <-m.notifyBlocks`, which the server fills from
+/// every `BlockConnected`, whatever the block's source), the `generate
+/// 0` cancellation (`<-genCtx.Done()`), and the miner's quit
+/// (`<-m.quit`).
+///
+/// The template subscription is an `mpsc` receiver that cannot select
+/// against another source, so a thread polls those instead and raises
+/// the flag the wait already honours.  Without it the wait left only on
+/// the next template, which past stake validation height waits for the
+/// votes on the new block, or on the 5.5 s template timeout: every
+/// `generate` returned seconds after its last block had connected.  The
+/// chain lock is only tried, so a block being connected never keeps the
+/// watch from seeing a cancellation.
+struct DiscreteWatch {
+    done: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl DiscreteWatch {
+    /// Start watching; `wake` is raised, once, when the run should stop
+    /// waiting for templates.
+    fn start(
+        chain: Arc<Mutex<Chain>>,
+        target_height: i64,
+        generate_cancel: Arc<AtomicBool>,
+        quit: Arc<AtomicBool>,
+        wake: Arc<AtomicBool>,
+    ) -> DiscreteWatch {
+        let done = Arc::new(AtomicBool::new(false));
+        let watching = Arc::clone(&done);
+        let thread = thread::spawn(move || {
+            while !watching.load(Ordering::Acquire) {
+                let reached = chain
+                    .try_lock()
+                    .is_ok_and(|chain| chain.best_snapshot().height >= target_height);
+                if reached
+                    || generate_cancel.load(Ordering::Acquire)
+                    || quit.load(Ordering::Acquire)
+                {
+                    wake.store(true, Ordering::Release);
+                    return;
+                }
+                thread::sleep(DISCRETE_WATCH_INTERVAL);
+            }
+        });
+        DiscreteWatch {
+            done,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for DiscreteWatch {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -900,7 +967,10 @@ fn continuous_solve(job: ContinuousSolve) {
         }
 
         // Avoid submitting a stale solution found after a stop signal.
-        if cancel.load(Ordering::Acquire) || shared.quit.load(Ordering::Acquire) {
+        // dcrd checks the solver context, which derives from the
+        // worker's, so a worker cancelled by `SetNumWorkers` is covered
+        // as well as a superseded template and shutdown.
+        if stop(&shared) {
             return;
         }
         let accepted = shared
@@ -1086,11 +1156,23 @@ impl RpcCpuMiner for NodeCpuMiner {
         let subscription = self.subscribe();
         let mut solve: Option<(JoinHandle<()>, Arc<AtomicBool>)> = None;
 
+        // The template wait also ends on a connected block reaching the
+        // target height, a `generate 0` and the miner's quit (dcrd's
+        // `notifyBlocks`, `genCtx.Done()` and `m.quit` arms).
+        let wake = Arc::new(AtomicBool::new(false));
+        let watch = DiscreteWatch::start(
+            Arc::clone(&self.chain),
+            target_height,
+            Arc::clone(&generate_cancel),
+            Arc::clone(&self.quit),
+            Arc::clone(&wake),
+        );
+
         loop {
             if self.quit.load(Ordering::Acquire) {
                 break;
             }
-            match subscription.recv_with_timeout_until(&generate_cancel) {
+            match subscription.recv_with_timeout_until(&wake) {
                 TemplateRecv::Template(block) => {
                     // Stop once the chain reaches the target height.
                     if self.best_height() >= target_height {
@@ -1157,9 +1239,10 @@ impl RpcCpuMiner for NodeCpuMiner {
             }
         }
 
-        // Stop the outstanding solve worker and drop the subscription.
-        // The discrete-mining flag is cleared by `_discrete_guard` on
-        // return.
+        // Stop the watch and the outstanding solve worker and drop the
+        // subscription.  The discrete-mining flag is cleared by
+        // `_discrete_guard` on return.
+        drop(watch);
         if let Some((handle, cancel)) = solve.take() {
             cancel.store(true, Ordering::Release);
             let _ = handle.join();
@@ -1179,9 +1262,10 @@ impl RpcCpuMiner for NodeCpuMiner {
         // }
         // ```
         //
-        // `TemplateRecv::Canceled` conflates two of dcrd's arms -- its
-        // `<-genCtx.Done()`, which is an error, and its `<-m.quit`,
-        // which is not -- so the break alone cannot say which happened.
+        // `TemplateRecv::Canceled` conflates three of dcrd's arms -- its
+        // `<-genCtx.Done()`, which is an error, and its `<-m.quit` and
+        // `<-m.notifyBlocks` at the target height, which are not -- so
+        // the break alone cannot say which happened.
         // Asking the flag afterwards separates them exactly as dcrd's
         // post-loop `genCtx.Err()` does: a request that went away is a
         // failure, a generator that shut down still reports the blocks
@@ -1529,5 +1613,140 @@ mod tests {
         assert_send::<NodeCpuMiner>();
         assert_send::<MinerRuntime>();
         assert_send::<SolveShared>();
+    }
+
+    /// dcrd derives each continuous solver's context from its worker's
+    /// (`solverCtx, solverCancel = context.WithCancel(ctx)`), so the
+    /// `ctx.Err()` check after a solve also refuses to submit once
+    /// `SetNumWorkers` has cancelled the worker.  The solver here is held
+    /// on the per-parent map -- past its top-of-loop check, before it
+    /// solves -- while its worker is cancelled, which leaves the
+    /// post-solve check as the only one between the solution and the
+    /// submission: a regnet target solves in a few hashes, long before
+    /// the solve loop's own cancellation check.
+    #[test]
+    fn a_worker_cancelled_mid_solve_submits_nothing() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dcroxide_database::Database::create(&dcroxide_database::Options::new(
+            dir.path().join("blocks"),
+            params.net.0,
+        ))
+        .expect("create database");
+        let chain = Arc::new(Mutex::new(
+            Chain::open(db, &params, params.assume_valid, false, 0).expect("open chain"),
+        ));
+        let tx_pool = crate::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            false,
+            100,
+            10000,
+            false,
+            false,
+        );
+        let sync_manager = Arc::new(Mutex::new(crate::sync::new_sync_manager(
+            Arc::clone(&chain),
+            &params,
+            false,
+            8,
+            1000,
+            Arc::clone(&tx_pool),
+            crate::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
+        )));
+        let policy = MiningPolicy {
+            block_max_size: params.maximum_block_sizes[0] as u32,
+            tx_min_free_fee: 10000,
+            aggressive_mining: true,
+        };
+        let generator = crate::bgtemplate::start_generator(
+            Arc::clone(&chain),
+            Arc::clone(&tx_pool),
+            params.clone(),
+            Vec::new(),
+            policy.clone(),
+            0,
+            true,
+            crate::sync::SyncGate::always_current(),
+            None,
+            None,
+        );
+        let miner = NodeCpuMiner::new(
+            generator.current_handle(),
+            generator.subscribers_handle(),
+            generator.sink(),
+            Arc::clone(&chain),
+            sync_manager,
+            tx_pool,
+            params.clone(),
+            policy,
+            0,
+            ConnectedPeers::new(),
+            true,
+        );
+        let shared = miner.solve_shared();
+        let mined_on_parents = Arc::clone(&shared.mined_on_parents);
+
+        // A block on the genesis block at the easiest target.  It holds
+        // no transactions, so the chain refuses it if it is ever
+        // submitted, and the refusal is counted against its parent.
+        let genesis = params.genesis_hash;
+        let template = MsgBlock {
+            header: BlockHeader {
+                version: 1,
+                prev_block: genesis,
+                merkle_root: Hash::ZERO,
+                stake_root: Hash::ZERO,
+                vote_bits: 0,
+                final_state: [0u8; 6],
+                voters: 0,
+                fresh_stake: 0,
+                revocations: 0,
+                pool_size: 0,
+                bits: params.pow_limit_bits,
+                sbits: 0,
+                height: 1,
+                size: 0,
+                timestamp: 0,
+                nonce: 0,
+                extra_data: [0u8; 32],
+                stake_version: 0,
+            },
+            transactions: Vec::new(),
+            stransactions: Vec::new(),
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::new(AtomicBool::new(false));
+        let held = mined_on_parents.lock().expect("mined-on-parents");
+        let solver = {
+            let job = ContinuousSolve {
+                template,
+                stats: Arc::new(SpeedStats::default()),
+                is_blake3_pow_active: false,
+                cancel: Arc::clone(&cancel),
+                worker_cancel: Arc::clone(&worker_cancel),
+                shared,
+            };
+            thread::spawn(move || continuous_solve(job))
+        };
+        // Let the solver pass its top-of-loop check and block on the map.
+        thread::sleep(Duration::from_millis(300));
+        worker_cancel.store(true, Ordering::Release);
+        drop(held);
+        solver.join().expect("the solver did not panic");
+
+        assert_eq!(
+            mined_on_parents
+                .lock()
+                .expect("mined-on-parents")
+                .get(&genesis)
+                .copied(),
+            None,
+            "a solver whose worker was cancelled must not submit its solution"
+        );
+        assert!(!cancel.load(Ordering::Acquire));
+        drop(miner);
+        generator.shutdown();
     }
 }

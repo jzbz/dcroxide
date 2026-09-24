@@ -23,7 +23,7 @@ use dcroxide_blockchain::process::Chain;
 use dcroxide_blockchain::{RuleErrorKind, render_multi_error};
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
-use dcroxide_wire::{MAX_BLOCK_PAYLOAD, MsgBlock};
+use dcroxide_wire::MsgBlock;
 
 use crate::flags::{OptKind, OptSpec, ScanMode};
 
@@ -354,77 +354,11 @@ fn go_time_utc_string(unix: i64) -> String {
 
 /// Read one block record from the bootstrap stream (dcrd `readBlock`):
 /// `Ok(None)` is a clean end of file at the network field, and every
-/// other truncation or mismatch is an error with dcrd's text.  Go's
-/// `binary.Read` surfaces `io.EOF` only when no bytes were read at
-/// all; a partial field is `unexpected EOF`.
+/// other truncation or mismatch is an error with dcrd's text.  The
+/// reader is the database crate's, the one port of `readBlock`, so the
+/// importer and the bench cannot drift apart.
 fn read_block_record(r: &mut dyn Read, network: u32) -> Result<Option<Vec<u8>>, String> {
-    // The network field: a clean EOF here means no more blocks.
-    let mut net_bytes = [0u8; 4];
-    match read_full(r, &mut net_bytes) {
-        ReadFull::Eof => return Ok(None),
-        ReadFull::Err(e) => return Err(e),
-        ReadFull::Short => return Err("unexpected EOF".to_string()),
-        ReadFull::Ok => {}
-    }
-    let net = u32::from_le_bytes(net_bytes);
-    if net != network {
-        return Err(format!("network mismatch -- got {net:x}, want {network:x}"));
-    }
-
-    // The block length, capped at the wire maximum.
-    let mut len_bytes = [0u8; 4];
-    match read_full(r, &mut len_bytes) {
-        ReadFull::Eof => return Err("EOF".to_string()),
-        ReadFull::Err(e) => return Err(e),
-        ReadFull::Short => return Err("unexpected EOF".to_string()),
-        ReadFull::Ok => {}
-    }
-    let block_len = u32::from_le_bytes(len_bytes);
-    if block_len > MAX_BLOCK_PAYLOAD {
-        return Err(format!(
-            "block payload of {block_len} bytes is larger than the max allowed {MAX_BLOCK_PAYLOAD} bytes"
-        ));
-    }
-
-    let mut serialized = vec![0u8; block_len as usize];
-    match read_full(r, &mut serialized) {
-        ReadFull::Eof => Err("EOF".to_string()),
-        ReadFull::Err(e) => Err(e),
-        ReadFull::Short => Err("unexpected EOF".to_string()),
-        ReadFull::Ok => Ok(Some(serialized)),
-    }
-}
-
-/// How a full read of a buffer ended (Go `io.ReadFull`'s outcomes:
-/// filled, `io.EOF` on zero bytes, `io.ErrUnexpectedEOF` on a partial
-/// fill, or an underlying error).
-enum ReadFull {
-    Ok,
-    Eof,
-    Short,
-    Err(String),
-}
-
-fn read_full(r: &mut dyn Read, buf: &mut [u8]) -> ReadFull {
-    if buf.is_empty() {
-        return ReadFull::Ok;
-    }
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        match r.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return if filled == 0 {
-                    ReadFull::Eof
-                } else {
-                    ReadFull::Short
-                };
-            }
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return ReadFull::Err(e.to_string()),
-        }
-    }
-    ReadFull::Ok
+    dcroxide_database::bootstrap::read_block(&mut &mut *r, network).map_err(|e| e.description)
 }
 
 /// Process one serialized block (dcrd `blockImporter.processBlock`):
@@ -546,6 +480,7 @@ pub fn run_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dcroxide_wire::MAX_BLOCK_PAYLOAD;
 
     fn strs(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()

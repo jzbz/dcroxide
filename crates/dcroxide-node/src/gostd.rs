@@ -2,11 +2,14 @@
 //! Faithful ports of the Go standard library behaviors the config
 //! pipeline observes: `time.Duration` parsing and formatting,
 //! `path/filepath.Clean`/`Join`, `os.Expand`, `net.JoinHostPort` /
-//! `net.SplitHostPort`, and `strconv` conversions.
+//! `net.SplitHostPort`, `strconv` conversions, and `os.MkdirAll` with
+//! the `*os.PathError` texts its callers print.
 
 // The ports mirror Go's fixed-width arithmetic with explicit
 // overflow checks.
 #![allow(clippy::arithmetic_side_effects)]
+
+use dcroxide_dcrjson::gojson::GoNumError;
 
 /// Format a nanosecond count like Go's `time.Duration.String`.
 pub fn go_duration_string(nanos: i64) -> String {
@@ -88,10 +91,38 @@ pub(crate) fn go_quote(s: &str) -> String {
     dcroxide_dcrjson::gojson::go_quote(s)
 }
 
+/// Quote a string like the time package's private `quote`
+/// (`time/format.go`), which `ParseDuration`'s errors use rather than
+/// `strconv.Quote`: every byte of a non-ASCII rune and every control
+/// character becomes `\xHH` (there are no `\t` or `\n` forms), only
+/// `"` and `\` are backslash-escaped, and DEL stays raw.
+fn time_quote(s: &str) -> String {
+    let mut buf = String::with_capacity(s.len() + 2);
+    buf.push('"');
+    for c in s.chars() {
+        if c as u32 >= 0x80 || c < ' ' {
+            // Unprintable or non-ASCII characters.  A `&str` holds no
+            // invalid byte, so a `RuneError` here is a literal U+FFFD
+            // and takes its three bytes, as in Go.
+            let mut utf8 = [0u8; 4];
+            for b in c.encode_utf8(&mut utf8).bytes() {
+                buf.push_str(&format!("\\x{b:02x}"));
+            }
+        } else {
+            if c == '"' || c == '\\' {
+                buf.push('\\');
+            }
+            buf.push(c);
+        }
+    }
+    buf.push('"');
+    buf
+}
+
 /// Parse a duration like Go's `time.ParseDuration`, returning
 /// nanoseconds.
 pub fn parse_go_duration(orig: &str) -> Result<i64, String> {
-    let invalid = || format!("time: invalid duration {}", go_quote(orig));
+    let invalid = || format!("time: invalid duration {}", time_quote(orig));
     let mut s = orig;
     let mut d: u64 = 0;
     let mut neg = false;
@@ -150,7 +181,10 @@ pub fn parse_go_duration(orig: &str) -> Result<i64, String> {
             i = idx + c.len_utf8();
         }
         if i == 0 {
-            return Err(format!("time: missing unit in duration {}", go_quote(orig)));
+            return Err(format!(
+                "time: missing unit in duration {}",
+                time_quote(orig)
+            ));
         }
         let u = &s[..i];
         s = &s[i..];
@@ -164,8 +198,8 @@ pub fn parse_go_duration(orig: &str) -> Result<i64, String> {
             _ => {
                 return Err(format!(
                     "time: unknown unit {} in duration {}",
-                    go_quote(u),
-                    go_quote(orig)
+                    time_quote(u),
+                    time_quote(orig)
                 ));
             }
         };
@@ -182,7 +216,10 @@ pub fn parse_go_duration(orig: &str) -> Result<i64, String> {
                 return Err(invalid());
             }
         }
-        d += v;
+        // Go's `d += v` is uint64 arithmetic: two terms of exactly
+        // 2^63 wrap to zero, which passes the check below, and Go
+        // accepts the zero duration.
+        d = d.wrapping_add(v);
         if d > 1 << 63 {
             return Err(invalid());
         }
@@ -439,50 +476,69 @@ pub(crate) fn expand_env(s: &str, getenv: &dyn Fn(&str) -> Option<String>) -> St
 
 /// Combine host and port like Go's `net.JoinHostPort`.
 pub(crate) fn join_host_port(host: &str, port: &str) -> String {
-    // Add brackets when the host contains a colon or a percent sign.
-    if host.contains(':') || host.contains('%') {
+    // We assume that host is a literal IPv6 address if host has
+    // colons.  (Only a colon: the Go releases dcrd builds with do not
+    // bracket a host for a `%` alone.)
+    if host.contains(':') {
         return format!("[{host}]:{port}");
     }
     format!("{host}:{port}")
 }
 
-/// Split host and port like Go's `net.SplitHostPort`, with Go's
-/// exact error texts.
+/// Split host and port like Go's `net.SplitHostPort` (`net/ipsock.go`),
+/// with its exact `*AddrError` texts.
 pub(crate) fn split_host_port(hostport: &str) -> Result<(String, String), String> {
-    let missing_port = || format!("address {hostport}: missing port in address");
-    let too_many_colons = || format!("address {hostport}: too many colons in address");
-    let bytes = hostport.as_bytes();
-    if let Some(stripped) = hostport.strip_prefix('[') {
-        // IPv6 literal in brackets.
-        let Some(end) = stripped.find(']') else {
-            return Err(format!("address {hostport}: missing ']' in address"));
-        };
-        let host = &stripped[..end];
-        let rest = &stripped[end + 1..];
-        let Some(port) = rest.strip_prefix(':') else {
-            // Go's net.SplitHostPort reports a missing port whether the
-            // ']' ends the string or is followed by a non-colon byte; it
-            // never indexes the trailing character, so a multibyte one
-            // must not be byte-sliced.
-            return Err(missing_port());
-        };
-        if port.contains(':') {
-            return Err(too_many_colons());
+    const MISSING_PORT: &str = "missing port in address";
+    const TOO_MANY_COLONS: &str = "too many colons in address";
+    // `AddrError.Error` prefixes the address unless it is empty.
+    let addr_err = |why: &str| -> Result<(String, String), String> {
+        if hostport.is_empty() {
+            Err(why.to_string())
+        } else {
+            Err(format!("address {hostport}: {why}"))
         }
-        return Ok((host.to_string(), port.to_string()));
-    }
-    let Some(colon) = hostport.rfind(':') else {
-        return Err(missing_port());
     };
-    let host = &hostport[..colon];
-    let port = &hostport[colon + 1..];
-    if host.contains(':') {
-        return Err(too_many_colons());
+    let b = hostport.as_bytes();
+    let (mut j, mut k) = (0, 0);
+
+    // The port starts after the last colon.
+    let Some(i) = hostport.rfind(':') else {
+        return addr_err(MISSING_PORT);
+    };
+
+    let host;
+    if b[0] == b'[' {
+        // Expect the first ']' just before the last ':'.
+        let Some(end) = hostport.find(']') else {
+            return addr_err("missing ']' in address");
+        };
+        match end + 1 {
+            // There can't be a ':' behind the ']' now.
+            n if n == b.len() => return addr_err(MISSING_PORT),
+            // The expected result.
+            n if n == i => {}
+            // Either ']' isn't followed by a colon, or it is followed
+            // by a colon that is not the last one.
+            n if b[n] == b':' => return addr_err(TOO_MANY_COLONS),
+            _ => return addr_err(MISSING_PORT),
+        }
+        host = &hostport[1..end];
+        // There can't be a '[' resp. ']' before these positions.
+        (j, k) = (1, end + 1);
+    } else {
+        host = &hostport[..i];
+        if host.contains(':') {
+            return addr_err(TOO_MANY_COLONS);
+        }
     }
-    if bytes.contains(&b'[') || bytes.contains(&b']') {
-        return Err(format!("address {hostport}: unexpected '[' in address"));
+    if hostport[j..].contains('[') {
+        return addr_err("unexpected '[' in address");
     }
-    Ok((host.to_string(), port.to_string()))
+    if hostport[k..].contains(']') {
+        return addr_err("unexpected ']' in address");
+    }
+
+    Ok((host.to_string(), hostport[i + 1..].to_string()))
 }
 
 /// Whether the string parses as an integer like Go's
@@ -511,220 +567,371 @@ pub(crate) fn go_parse_bool_err(s: &str) -> Result<bool, String> {
     go_parse_bool(s).map_err(|()| num_error("ParseBool", s, "invalid syntax"))
 }
 
-/// Split the sign and base prefix like Go's `strconv.ParseInt` with
-/// base 0, returning (negative, digits, base) or a syntax error.
-/// Underscores are validated and stripped (base 0 allows them
-/// between digits and after the base prefix).
-fn split_int_prefix(s: &str, allow_sign: bool) -> Result<(bool, String, u32), ()> {
-    let mut rest = s;
-    let mut neg = false;
-    if allow_sign
-        && let Some(first) = rest.bytes().next()
-        && (first == b'+' || first == b'-')
-    {
-        neg = first == b'-';
-        rest = &rest[1..];
+/// Go's `strconv.ParseUint(s, 0, bit_size)` (`strconv/atoi.go`): the
+/// value, or the error with the value Go returns beside it (`maxVal`
+/// for `ErrRange`).  The order is Go's: the digits are checked and
+/// accumulated left to right, so the first digit that overflows
+/// `bit_size` is a range error even when an invalid byte or a
+/// misplaced underscore follows it, and the underscores are validated
+/// only after the loop.
+fn parse_uint_base0(s: &str, bit_size: u32) -> Result<u64, (u64, GoNumError)> {
+    if s.is_empty() {
+        return Err((0, GoNumError::Syntax));
     }
-    // Base detection (Go base 0 semantics).
-    let bytes = rest.as_bytes();
-    let (base, digits): (u32, &str) = if bytes.len() >= 2 && bytes[0] == b'0' {
-        match bytes[1] {
-            b'b' | b'B' => (2, &rest[2..]),
-            b'o' | b'O' => (8, &rest[2..]),
-            b'x' | b'X' => (16, &rest[2..]),
-            _ => (8, &rest[1..]),
+    let s0 = s;
+    let b = s.as_bytes();
+    // Look for octal, hex prefix (`lower(c)` is `c | 0x20`).
+    let (base, digits): (u64, &[u8]) = if b[0] == b'0' {
+        match b.get(1).map(|c| c | 0x20) {
+            Some(b'b') if b.len() >= 3 => (2, &b[2..]),
+            Some(b'o') if b.len() >= 3 => (8, &b[2..]),
+            Some(b'x') if b.len() >= 3 => (16, &b[2..]),
+            _ => (8, &b[1..]),
         }
     } else {
-        (10, rest)
+        (10, b)
     };
-    if digits.is_empty() && !(base == 8 && rest == "0") {
-        // A bare base prefix (or empty digits) is a syntax error;
-        // plain "0" is fine.
-        if rest == "0" {
-            return Ok((neg, "0".to_string(), 10));
-        }
-        return Err(());
-    }
-    if rest == "0" {
-        return Ok((neg, "0".to_string(), 10));
-    }
-    // Underscore validation like Go's underscoreOK: underscores may
-    // appear only between digits or between the prefix and a digit,
-    // and never leading/trailing/doubled.
-    let db = digits.as_bytes();
-    let mut cleaned = String::with_capacity(digits.len());
-    let is_digit = |c: u8| -> bool {
-        match base {
-            2 => matches!(c, b'0'..=b'1'),
-            8 => matches!(c, b'0'..=b'7'),
-            16 => c.is_ascii_hexdigit(),
-            _ => c.is_ascii_digit(),
-        }
+
+    // Cutoff is the smallest number such that cutoff*base > maxUint64.
+    let cutoff = u64::MAX / base + 1;
+    let max_val = if bit_size >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bit_size) - 1
     };
-    let prefixed = base != 10 || (bytes.len() >= 2 && bytes[0] == b'0');
-    for (i, c) in db.iter().enumerate() {
-        if *c == b'_' {
-            // Underscores are only permitted in base-prefixed or
-            // plain decimal runs sandwiched by digits (or the
-            // prefix on the left).
-            let left_ok = if i == 0 {
-                prefixed
-            } else {
-                is_digit(db[i - 1])
-            };
-            let right_ok = i + 1 < db.len() && is_digit(db[i + 1]);
-            if !left_ok || !right_ok {
-                return Err(());
+
+    let mut underscores = false;
+    let mut n: u64 = 0;
+    for &c in digits {
+        let d = match c {
+            b'_' => {
+                underscores = true;
+                continue;
             }
-            continue;
+            b'0'..=b'9' => u64::from(c - b'0'),
+            _ if (c | 0x20).is_ascii_lowercase() => u64::from((c | 0x20) - b'a' + 10),
+            _ => return Err((0, GoNumError::Syntax)),
+        };
+        if d >= base {
+            return Err((0, GoNumError::Syntax));
         }
-        if !is_digit(*c) {
-            return Err(());
+        if n >= cutoff {
+            // n*base overflows
+            return Err((max_val, GoNumError::Range));
         }
-        cleaned.push(*c as char);
+        n *= base;
+        let n1 = n.wrapping_add(d);
+        if n1 < n || n1 > max_val {
+            // n+d overflows
+            return Err((max_val, GoNumError::Range));
+        }
+        n = n1;
     }
-    if cleaned.is_empty() {
-        return Err(());
+
+    if underscores && !dcroxide_dcrjson::gojson::underscore_ok(s0) {
+        return Err((0, GoNumError::Syntax));
     }
-    Ok((neg, cleaned, base))
+    Ok(n)
+}
+
+/// The text of a `strconv` error (`strconv.ErrSyntax`, `ErrRange`).
+fn num_error_text(e: GoNumError) -> &'static str {
+    match e {
+        GoNumError::Syntax => "invalid syntax",
+        GoNumError::Range => "value out of range",
+    }
 }
 
 /// Parse a signed integer like Go's `strconv.ParseInt(s, 0, bits)`,
 /// with the `NumError` texts.
 pub fn go_parse_int(s: &str, bits: u32) -> Result<i64, String> {
-    let syntax = || num_error("ParseInt", s, "invalid syntax");
-    let range = || num_error("ParseInt", s, "value out of range");
+    let fail = |e| num_error("ParseInt", s, num_error_text(e));
     if s.is_empty() {
-        return Err(syntax());
+        return Err(fail(GoNumError::Syntax));
     }
-    let (neg, digits, base) = split_int_prefix(s, true).map_err(|()| syntax())?;
-    let mag = u64::from_str_radix(&digits, base).map_err(|_| range())?;
-    let max = if bits == 64 {
-        1u64 << 63
-    } else {
-        1u64 << (bits - 1)
+
+    // Pick off leading sign.
+    let (neg, rest) = match s.as_bytes()[0] {
+        b'+' => (false, &s[1..]),
+        b'-' => (true, &s[1..]),
+        _ => (false, s),
     };
-    if neg {
-        if mag > max {
-            return Err(range());
-        }
-        Ok((mag as i64).wrapping_neg())
-    } else {
-        if mag >= max {
-            return Err(range());
-        }
-        Ok(mag as i64)
+
+    // Convert unsigned and check range.
+    let un = match parse_uint_base0(rest, bits) {
+        Ok(un) => un,
+        Err((max_val, GoNumError::Range)) => max_val,
+        Err((_, e)) => return Err(fail(e)),
+    };
+    let cutoff = 1u64 << (bits.clamp(1, 64) - 1);
+    if !neg && un >= cutoff {
+        return Err(fail(GoNumError::Range));
     }
+    if neg && un > cutoff {
+        return Err(fail(GoNumError::Range));
+    }
+    let n = un as i64;
+    Ok(if neg { n.wrapping_neg() } else { n })
 }
 
 /// Parse an unsigned integer like Go's `strconv.ParseUint(s, 0,
 /// bits)`, with the `NumError` texts.
 pub(crate) fn go_parse_uint(s: &str, bits: u32) -> Result<u64, String> {
-    let syntax = || num_error("ParseUint", s, "invalid syntax");
-    let range = || num_error("ParseUint", s, "value out of range");
-    if s.is_empty() {
-        return Err(syntax());
-    }
-    let (_, digits, base) = split_int_prefix(s, false).map_err(|()| syntax())?;
-    let mag = u64::from_str_radix(&digits, base).map_err(|_| range())?;
-    if bits < 64 && mag >= (1u64 << bits) {
-        return Err(range());
-    }
-    Ok(mag)
+    parse_uint_base0(s, bits).map_err(|(_, e)| num_error("ParseUint", s, num_error_text(e)))
 }
 
 /// Parse a float like Go's `strconv.ParseFloat(s, 64)`, with the
-/// `NumError` text (Rust's parser matches Go's acceptance for the
-/// decimal, exponent, and inf/nan forms the options carry).
+/// `NumError` text: dcrjson's port, which takes Go's underscores, hex
+/// floats and special names (no sign before `NaN`) and refuses an
+/// overflowing literal with `ErrRange` where Rust's parser returns
+/// infinity.
 pub(crate) fn go_parse_float(s: &str) -> Result<f64, String> {
-    s.parse::<f64>()
-        .map_err(|_| num_error("ParseFloat", s, "invalid syntax"))
+    dcroxide_dcrjson::gojson::go_parse_float_checked(s)
+        .map_err(|e| num_error("ParseFloat", s, num_error_text(e)))
 }
 
-/// Unquote a Go double-quoted string like `strconv.Unquote` for the
-/// escape forms configuration values can carry; the error is Go's
-/// `ErrSyntax` text.
+/// Go's `unhex` (`strconv/quote.go`): only `0-9`, `a-f` and `A-F` are
+/// hex digits (no sign, unlike `from_str_radix`).
+fn unhex(b: u8) -> Option<u32> {
+    match b {
+        b'0'..=b'9' => Some(u32::from(b - b'0')),
+        b'a'..=b'f' => Some(u32::from(b - b'a' + 10)),
+        b'A'..=b'F' => Some(u32::from(b - b'A' + 10)),
+        _ => None,
+    }
+}
+
+/// Unquote a Go double-quoted string like `strconv.Unquote` (the only
+/// quote form go-flags hands it: a value starting with `"`), with
+/// `UnquoteChar`'s escapes -- `\x`, `\u`, `\U` and octal -- and Go's
+/// `ErrSyntax` text.  A `\x` or octal escape is a raw byte, so escapes
+/// that spell UTF-8 (`\xc3\xa9`) build the character as in Go; a result
+/// that is not UTF-8 at all is a Go string a `String` cannot hold, and
+/// is refused rather than altered.
 pub(crate) fn go_unquote(s: &str) -> Result<String, String> {
     let syntax = || "invalid syntax".to_string();
-    let b = s.as_bytes();
-    if b.len() < 2 || b[0] != b'"' || b[b.len() - 1] != b'"' {
+    if s.len() < 2 || !s.starts_with('"') {
         return Err(syntax());
     }
-    let inner = &s[1..s.len() - 1];
-    if inner.contains('\n') {
-        return Err(syntax());
-    }
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c == '"' {
-            // An unescaped quote means the quoted string ended
-            // before the end of the input.
-            return Err(syntax());
-        }
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        let Some(esc) = chars.next() else {
+    let mut buf: Vec<u8> = Vec::with_capacity(s.len());
+    let mut rest = &s[1..];
+    loop {
+        let Some(c) = rest.chars().next() else {
+            // No terminating quote.
             return Err(syntax());
         };
+        if c == '"' {
+            break;
+        }
+        // Process the next character, rejecting any unescaped newline
+        // characters which are invalid.
+        if c == '\n' {
+            return Err(syntax());
+        }
+        rest = &rest[c.len_utf8()..];
+        if c != '\\' {
+            let mut utf8 = [0u8; 4];
+            buf.extend_from_slice(c.encode_utf8(&mut utf8).as_bytes());
+            continue;
+        }
+
+        // Hard case: c is backslash.  The escape is one byte; a
+        // non-ASCII one names no escape.
+        let Some(&esc) = rest.as_bytes().first() else {
+            return Err(syntax());
+        };
+        if !esc.is_ascii() {
+            return Err(syntax());
+        }
+        rest = &rest[1..];
         match esc {
-            'a' => out.push('\u{7}'),
-            'b' => out.push('\u{8}'),
-            'f' => out.push('\u{c}'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            't' => out.push('\t'),
-            'v' => out.push('\u{b}'),
-            '\\' => out.push('\\'),
-            '\'' => return Err(syntax()), // \' only valid in char literals
-            '"' => out.push('"'),
-            'x' => {
-                let h: String = chars.by_ref().take(2).collect();
-                if h.len() != 2 {
+            b'a' => buf.push(0x07),
+            b'b' => buf.push(0x08),
+            b'f' => buf.push(0x0c),
+            b'n' => buf.push(b'\n'),
+            b'r' => buf.push(b'\r'),
+            b't' => buf.push(b'\t'),
+            b'v' => buf.push(0x0b),
+            b'x' | b'u' | b'U' => {
+                let n = match esc {
+                    b'x' => 2,
+                    b'u' => 4,
+                    _ => 8,
+                };
+                let digits = rest.as_bytes();
+                if digits.len() < n {
                     return Err(syntax());
                 }
-                let v = u8::from_str_radix(&h, 16).map_err(|_| syntax())?;
-                if v > 0x7f {
-                    // Non-UTF-8 byte escapes are not representable
-                    // in a Rust string; the config values never
-                    // carry them.
-                    return Err(syntax());
+                let mut v: u32 = 0;
+                for &d in &digits[..n] {
+                    v = v << 4 | unhex(d).ok_or_else(syntax)?;
                 }
-                out.push(v as char);
+                rest = &rest[n..];
+                if esc == b'x' {
+                    // Single-byte string, possibly not UTF-8.
+                    buf.push(v as u8);
+                    continue;
+                }
+                // `utf8.ValidRune`: no surrogate, nothing past U+10FFFF.
+                let r = char::from_u32(v).ok_or_else(syntax)?;
+                let mut utf8 = [0u8; 4];
+                buf.extend_from_slice(r.encode_utf8(&mut utf8).as_bytes());
             }
-            'u' => {
-                let h: String = chars.by_ref().take(4).collect();
-                if h.len() != 4 {
+            b'0'..=b'7' => {
+                let mut v = u32::from(esc - b'0');
+                let digits = rest.as_bytes();
+                if digits.len() < 2 {
                     return Err(syntax());
                 }
-                let v = u32::from_str_radix(&h, 16).map_err(|_| syntax())?;
-                out.push(char::from_u32(v).ok_or_else(syntax)?);
-            }
-            '0'..='7' => {
-                let mut v = esc as u32 - '0' as u32;
-                for _ in 0..2 {
-                    let Some(d) = chars.next() else {
-                        return Err(syntax());
-                    };
-                    if !('0'..='7').contains(&d) {
+                // One digit already; two more.
+                for &d in &digits[..2] {
+                    if !(b'0'..=b'7').contains(&d) {
                         return Err(syntax());
                     }
-                    v = v * 8 + (d as u32 - '0' as u32);
+                    v = (v << 3) | u32::from(d - b'0');
                 }
+                rest = &rest[2..];
                 if v > 255 {
                     return Err(syntax());
                 }
-                if v > 0x7f {
-                    return Err(syntax());
-                }
-                out.push(char::from_u32(v).ok_or_else(syntax)?);
+                buf.push(v as u8);
             }
+            b'\\' => buf.push(b'\\'),
+            // Only the double quote may be escaped in a double-quoted
+            // string.
+            b'"' => buf.push(b'"'),
             _ => return Err(syntax()),
         }
     }
-    Ok(out)
+    // The terminating quote must end the input.
+    if rest.len() != 1 {
+        return Err(syntax());
+    }
+    String::from_utf8(buf).map_err(|_| "the unquoted value is not valid UTF-8".to_string())
+}
+
+/// An OS error as Go's `syscall.Errno` renders it.  On Unix that is
+/// the C library's text with a lowercase first letter, and on Windows
+/// the system message as `FormatMessage` gives it; neither carries
+/// Rust's " (os error N)" suffix.  An error with no OS code keeps
+/// Rust's rendering.
+pub(crate) fn go_errno_string(e: &std::io::Error) -> String {
+    let Some(code) = e.raw_os_error() else {
+        return e.to_string();
+    };
+    let text = std::io::Error::from_raw_os_error(code).to_string();
+    let text = text.split(" (os error ").next().unwrap_or_default();
+    if cfg!(windows) {
+        return text.to_string();
+    }
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => format!("errno {code}"),
+    }
+}
+
+/// A Go `*os.PathError`: the operation, the path it failed on, and
+/// the OS error.
+#[derive(Debug)]
+pub(crate) struct GoPathError {
+    /// The operation, as Go names it (`open`, `read`, `mkdir`).
+    pub op: &'static str,
+    /// The path the operation failed on.
+    pub path: String,
+    /// The underlying OS error.
+    pub err: std::io::Error,
+}
+
+impl std::fmt::Display for GoPathError {
+    /// Go's `PathError.Error`: `e.Op + " " + e.Path + ": " +
+    /// e.Err.Error()`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {}: {}",
+            self.op,
+            self.path,
+            go_errno_string(&self.err)
+        )
+    }
+}
+
+/// Go's `os.MkdirAll(path, 0700)` (`os/path.go`), with its error: the
+/// `*PathError` names the component that failed, the fast path's
+/// `ENOTDIR` when the path exists as a file, and the empty path fails
+/// with `mkdir : no such file or directory` where Rust's
+/// `create_dir_all` returns success.  Directories it creates are
+/// owner-only; existing ones keep their mode.
+#[cfg(unix)]
+pub(crate) fn go_mkdir_all_owner_only(path: &str) -> Result<(), GoPathError> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    // Fast path: if we can tell whether path is a directory or file,
+    // stop with success or error.
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.is_dir() {
+            return Ok(());
+        }
+        return Err(GoPathError {
+            op: "mkdir",
+            path: path.to_string(),
+            err: std::io::Error::from_raw_os_error(libc::ENOTDIR),
+        });
+    }
+
+    // Slow path: make sure parent exists and then call Mkdir for path.
+    // Extract the parent folder by first removing any trailing path
+    // separator and then scanning backward until finding a path
+    // separator or reaching the beginning of the string.
+    let b = path.as_bytes();
+    let mut i = b.len();
+    while i > 0 && b[i - 1] == b'/' {
+        i -= 1;
+    }
+    while i > 0 && b[i - 1] != b'/' {
+        i -= 1;
+    }
+    // Go's index stops on the separator itself, so the parent leaves it
+    // out; the volume name is empty on Unix.
+    let parent = &path[..i.saturating_sub(1)];
+    if !parent.is_empty() {
+        go_mkdir_all_owner_only(parent)?;
+    }
+
+    // Parent now exists; invoke Mkdir and use its result.
+    if let Err(err) = std::fs::DirBuilder::new().mode(0o700).create(path) {
+        // Handle arguments like "foo/." by double-checking that the
+        // directory doesn't exist.
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+            return Ok(());
+        }
+        return Err(GoPathError {
+            op: "mkdir",
+            path: path.to_string(),
+            err,
+        });
+    }
+    Ok(())
+}
+
+/// Off Unix the volume-name rules of Go's `MkdirAll` are not ported:
+/// the standard library creates the tree and a failure is reported
+/// against the whole path.  The empty path still fails, as Go's
+/// `Mkdir("")` does, rather than succeeding as `create_dir_all("")`
+/// would.
+#[cfg(not(unix))]
+pub(crate) fn go_mkdir_all_owner_only(path: &str) -> Result<(), GoPathError> {
+    let result = if path.is_empty() {
+        std::fs::create_dir(path)
+    } else {
+        std::fs::create_dir_all(path)
+    };
+    result.map_err(|err| GoPathError {
+        op: "mkdir",
+        path: path.to_string(),
+        err,
+    })
 }
 
 #[cfg(test)]
@@ -862,5 +1069,226 @@ mod tests {
         ] {
             assert_eq!(expand_env(input, &getenv), want, "{input}");
         }
+    }
+
+    /// `ParseDuration` quotes its errors with the time package's own
+    /// `quote`, not `strconv.Quote`, and wraps its uint64 sum as Go does
+    /// (outputs from a Go 1.27 run).
+    #[test]
+    fn duration_errors_and_wrap_match_go() {
+        for (input, want) in [
+            (
+                "1\u{b5}",
+                r#"time: unknown unit "\xc2\xb5" in duration "1\xc2\xb5""#,
+            ),
+            ("5\tm", r#"time: unknown unit "\x09m" in duration "5\x09m""#),
+            (
+                "5x\u{7f}",
+                "time: unknown unit \"x\u{7f}\" in duration \"5x\u{7f}\"",
+            ),
+            (
+                "5\"q\\",
+                r#"time: unknown unit "\"q\\" in duration "5\"q\\""#,
+            ),
+            (
+                "1\u{fffd}s",
+                r#"time: unknown unit "\xef\xbf\xbds" in duration "1\xef\xbf\xbds""#,
+            ),
+            ("\u{1}", r#"time: invalid duration "\x01""#),
+        ] {
+            assert_eq!(parse_go_duration(input).unwrap_err(), want, "{input:?}");
+        }
+        assert_eq!(
+            parse_go_duration("9223372036854775808ns9223372036854775808ns"),
+            Ok(0)
+        );
+    }
+
+    /// `net.JoinHostPort` brackets for a colon only, and
+    /// `net.SplitHostPort` scans the whole address for stray brackets
+    /// after its bracket switch, with Go's text for each (outputs from a
+    /// Go 1.27 run).
+    #[test]
+    fn host_port_edges_match_go() {
+        assert_eq!(join_host_port("host%zone", "9108"), "host%zone:9108");
+        assert_eq!(join_host_port("::1%eth0", "1"), "[::1%eth0]:1");
+
+        for (input, want) in [
+            ("[a[b]:80", "address [a[b]:80: unexpected '[' in address"),
+            ("[::1]:80]", "address [::1]:80]: unexpected ']' in address"),
+            ("[abc", "address [abc: missing port in address"),
+            ("[x", "address [x: missing port in address"),
+            ("a]:80", "address a]:80: unexpected ']' in address"),
+            ("a[b:80", "address a[b:80: unexpected '[' in address"),
+            ("[a]b]:80", "address [a]b]:80: missing port in address"),
+            ("[::1]]:80", "address [::1]]:80: missing port in address"),
+            ("[::1]x:1", "address [::1]x:1: missing port in address"),
+            ("[::1]:x:1", "address [::1]:x:1: too many colons in address"),
+            ("a:b:c", "address a:b:c: too many colons in address"),
+            ("", "missing port in address"),
+        ] {
+            assert_eq!(split_host_port(input).unwrap_err(), want, "{input}");
+        }
+        for (input, host, port) in [(":80", "", "80"), ("[]:80", "", "80")] {
+            assert_eq!(
+                split_host_port(input).unwrap(),
+                (host.to_string(), port.to_string()),
+                "{input}"
+            );
+        }
+    }
+
+    /// `strconv.ParseInt` and `ParseUint` in Go's order: the first digit
+    /// that overflows is a range error even when an invalid byte or a
+    /// misplaced underscore follows, and the underscores are checked
+    /// last (outputs from a Go 1.27 run).
+    #[test]
+    fn integer_parsing_matches_go() {
+        let int_cases: [(&str, Result<i64, &str>); 18] = [
+            ("99999999999999999999x", Err("value out of range")),
+            ("9999999999999999999x", Err("invalid syntax")),
+            ("-99999999999999999999_", Err("value out of range")),
+            ("99999999999999999999_", Err("value out of range")),
+            ("0xFFFFFFFFFFFFFFFFF", Err("value out of range")),
+            ("0x8000000000000000", Err("value out of range")),
+            ("-0x8000000000000000", Ok(i64::MIN)),
+            ("1_000", Ok(1000)),
+            ("0x_1F", Ok(31)),
+            ("0_1", Ok(1)),
+            ("0o17", Ok(15)),
+            ("0x", Err("invalid syntax")),
+            ("0b", Err("invalid syntax")),
+            ("08", Err("invalid syntax")),
+            ("1__0", Err("invalid syntax")),
+            ("_1", Err("invalid syntax")),
+            ("+", Err("invalid syntax")),
+            ("0b102", Err("invalid syntax")),
+        ];
+        for (input, want) in int_cases {
+            let want =
+                want.map_err(|e| format!("strconv.ParseInt: parsing {}: {e}", go_quote(input)));
+            assert_eq!(go_parse_int(input, 64), want, "{input}");
+        }
+        let uint32_cases: [(&str, Result<u64, &str>); 5] = [
+            ("4294967296x", Err("value out of range")),
+            ("42949672960_", Err("value out of range")),
+            ("0x1_0000_0000", Err("value out of range")),
+            ("4294967295", Ok(4_294_967_295)),
+            ("+1", Err("invalid syntax")),
+        ];
+        for (input, want) in uint32_cases {
+            let want =
+                want.map_err(|e| format!("strconv.ParseUint: parsing {}: {e}", go_quote(input)));
+            assert_eq!(go_parse_uint(input, 32), want, "{input}");
+        }
+    }
+
+    /// `strconv.ParseFloat`: underscores, hex floats and `ErrRange` on
+    /// overflow, and no sign before `NaN` (outputs from a Go 1.27 run).
+    #[test]
+    fn float_parsing_matches_go() {
+        let cases: [(&str, Result<f64, &str>); 12] = [
+            ("0.000_1", Ok(0.0001)),
+            ("0x1p-14", Ok(6.103515625e-05)),
+            ("0x1.8p1", Ok(3.0)),
+            ("0x_1p0", Ok(1.0)),
+            ("1e-400", Ok(0.0)),
+            ("1e400", Err("value out of range")),
+            ("-1e400", Err("value out of range")),
+            ("0x1p1024", Err("value out of range")),
+            ("-0x1p99999", Err("value out of range")),
+            ("+nan", Err("invalid syntax")),
+            ("1e_5", Err("invalid syntax")),
+            ("1e400x", Err("invalid syntax")),
+        ];
+        for (input, want) in cases {
+            let want =
+                want.map_err(|e| format!("strconv.ParseFloat: parsing {}: {e}", go_quote(input)));
+            assert_eq!(go_parse_float(input), want, "{input}");
+        }
+        assert!(go_parse_float("NaN").unwrap().is_nan());
+        assert_eq!(go_parse_float("-Inf"), Ok(f64::NEG_INFINITY));
+    }
+
+    /// `strconv.Unquote` of a double-quoted value: `\U`, byte escapes
+    /// that spell UTF-8, and hex digits that are only hex digits
+    /// (outputs from a Go 1.27 run).
+    #[test]
+    fn unquote_matches_go() {
+        for (input, want) in [
+            (r#""\U0001F600""#, "\u{1f600}"),
+            (r#""\xc3\xa9""#, "\u{e9}"),
+            (r#""\303\251""#, "\u{e9}"),
+            (r#""\x41B""#, "AB"),
+            ("\"\u{e9}x\"", "\u{e9}x"),
+            (r#""a\"b""#, "a\"b"),
+        ] {
+            assert_eq!(go_unquote(input).as_deref(), Ok(want), "{input}");
+        }
+        for input in [
+            r#""\x+1""#,
+            r#""\u+12f""#,
+            r#""\U00110000""#,
+            r#""\ud800""#,
+            r#""a\'b""#,
+            r#""a"b""#,
+            r#""a"#,
+            r#""\x4""#,
+            r#""\1""#,
+            r#""\400""#,
+            r#""a"""#,
+            "\"a\nb\"",
+        ] {
+            assert_eq!(
+                go_unquote(input),
+                Err("invalid syntax".to_string()),
+                "{input}"
+            );
+        }
+        // Go takes the raw byte; a `String` cannot hold it.
+        assert_eq!(
+            go_unquote(r#""\xff""#),
+            Err("the unquoted value is not valid UTF-8".to_string())
+        );
+    }
+
+    /// Go's `os.MkdirAll`: the empty path fails where `create_dir_all`
+    /// succeeds, the error names the component that failed as a
+    /// `*PathError`, a trailing `.` is double-checked, and what it
+    /// creates is owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn mkdir_all_matches_go() {
+        use super::go_mkdir_all_owner_only;
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            go_mkdir_all_owner_only("").unwrap_err().to_string(),
+            "mkdir : no such file or directory"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let nested = format!("{root}/a/b/");
+        go_mkdir_all_owner_only(&nested).unwrap();
+        for created in [format!("{root}/a"), format!("{root}/a/b")] {
+            let mode = std::fs::metadata(&created).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{created}");
+        }
+        go_mkdir_all_owner_only(&nested).unwrap();
+        go_mkdir_all_owner_only(&format!("{root}/c/.")).unwrap();
+
+        let file = format!("{root}/file");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(
+            go_mkdir_all_owner_only(&file).unwrap_err().to_string(),
+            format!("mkdir {file}: not a directory")
+        );
+        assert_eq!(
+            go_mkdir_all_owner_only(&format!("{file}/x/y"))
+                .unwrap_err()
+                .to_string(),
+            format!("mkdir {file}: not a directory")
+        );
     }
 }

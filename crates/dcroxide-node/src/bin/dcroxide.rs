@@ -24,7 +24,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dcroxide_addrmgr::{AddrManager, NetAddressType};
+use dcroxide_addrmgr::{AddrManager, PeersLoad};
 use dcroxide_blockchain::process::Chain;
 use dcroxide_chainhash::Hash;
 use dcroxide_connmgr::DEFAULT_RETRY_DURATION;
@@ -34,7 +34,7 @@ use dcroxide_node::outbound::{OutboundConfig, start_outbound};
 use dcroxide_node::runtime::{ConnectedPeers, ListenerRuntime, PeerTemplate, inbound_peer_handler};
 use dcroxide_node::{
     Config, ConfigEnv, ERR_HELP_REQUESTED, ERR_SHOW_SUBSYSTEMS, ERR_VERSION_REQUESTED,
-    app_data_dir, load_config_from_argv, logo, parse_listeners, supported_subsystems, version,
+    app_data_dir, logo, parse_listeners, supported_subsystems, version,
 };
 use dcroxide_rpc::server::RpcCpuMiner;
 use dcroxide_wire::ServiceFlag;
@@ -128,7 +128,12 @@ fn real_main() -> ExitCode {
         "macos" => "darwin",
         other => other,
     };
-    let home = app_data_dir(goos, "dcroxide", false, &|name| std::env::var(name).ok());
+    // A variable the configuration reads that a `String` cannot hold is
+    // refused, as argv is, rather than read as unset; the load fails
+    // with it before acting on it (`flags::getenv_utf8`).
+    let env_refused = std::cell::RefCell::new(None);
+    let getenv = |name: &str| dcroxide_node::flags::getenv_utf8(name, &env_refused);
+    let home = app_data_dir(goos, "dcroxide", false, &getenv);
 
     let env = ConfigEnv {
         default_home_dir: home,
@@ -143,7 +148,7 @@ fn real_main() -> ExitCode {
         // interface-name listeners do not expand; IP listeners are
         // unaffected.
         interface_by_name: Box::new(|_name| None),
-        getenv: Box::new(|name| std::env::var(name).ok()),
+        getenv: Box::new(getenv),
         user_home: Box::new(|name| {
             if name.is_empty() {
                 current_user_home()
@@ -167,17 +172,18 @@ fn real_main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match load_config_from_argv(&args, &env) {
-        Ok((cfg, _remaining_args)) => {
-            // dcrd writes these to stderr as it parses
-            // (`config.go:818-824` and the Tor-isolation notices); the
-            // port collected them and printed none, so a deprecated
-            // option or an overridden proxy credential passed silently.
-            for warning in &cfg.warnings {
-                eprintln!("{warning}");
-            }
-            run(cfg)
-        }
+    // dcrd writes its parse-time notices to stderr as it reaches them
+    // (the help pre-parse's go-flags error echo, a failed default
+    // config creation, the deprecation and Tor-isolation notices), so
+    // they print even when the load fails later.
+    let mut notice = |line: &str| eprintln!("{line}");
+    match dcroxide_node::config::load_config_from_argv_with_notices(
+        &args,
+        &env,
+        &mut notice,
+        &env_refused,
+    ) {
+        Ok((cfg, _remaining_args)) => run(cfg),
         // Perform a requested service command and exit (dcrd's
         // loadConfig hook, run straight after the version check on the
         // command-line pre-parse alone, so no config file or validation
@@ -194,8 +200,14 @@ fn real_main() -> ExitCode {
         Err(msg) => match msg.as_str() {
             ERR_HELP_REQUESTED => {
                 // dcrd's help pre-parse prints the go-flags help to
-                // stdout and exits zero.
-                print!("{}", dcroxide_node::flags::render_help(APP_NAME));
+                // stdout and exits zero.  The text is written as the
+                // bytes go-flags wraps it into, at the width it reads
+                // from the terminal on stdin.
+                dcroxide_node::logging::write_stdout(&dcroxide_node::flags::render_help(
+                    APP_NAME,
+                    &env.default_home_dir,
+                    dcroxide_node::flags::terminal_columns(),
+                ));
                 ExitCode::SUCCESS
             }
             ERR_VERSION_REQUESTED => {
@@ -208,7 +220,11 @@ fn real_main() -> ExitCode {
             }
             other => {
                 eprintln!("{other}");
-                eprintln!("Use {APP_NAME} -h to show usage");
+                // dcrd leaves the usage line off the one error it wraps
+                // in `errSuppressUsage` (`dcrd.go:44-50`).
+                if dcroxide_node::config::error_shows_usage(other) {
+                    eprintln!("Use {APP_NAME} -h to show usage");
+                }
                 ExitCode::FAILURE
             }
         },
@@ -230,8 +246,12 @@ fn current_user_home() -> Option<String> {
         .ok()
         .and_then(|passwd| passwd_home(&passwd, &uid))
         .or_else(|| {
-            let non_empty = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
-            non_empty("USER").and(non_empty("HOME"))
+            // Go wants only a non-empty `$USER`, whatever its bytes.  A
+            // `$HOME` that is not UTF-8 never gets here: `app_data_dir`
+            // read it first, and the load refused it.
+            let user = std::env::var_os("USER").is_some_and(|user| !user.is_empty());
+            let home = std::env::var("HOME").ok().filter(|home| !home.is_empty());
+            home.filter(|_| user)
         })
 }
 
@@ -352,10 +372,12 @@ fn run_node(cfg: Config) -> ExitCode {
     dcroxide_node::logging::write_stdout(
         logo::startup_banner(version::version_string()).as_bytes(),
     );
-    // Logged rather than printed, and only here: dcrd defers it until
-    // the rest of the configuration succeeds, then logs it through
-    // `dcrdLog`, so under DCRD (`config.go:1348-1352`).
-    if let Some(warning) = &cfg.config_file_warning {
+    // Logged rather than printed, and only here: dcrd logs these from
+    // `loadConfig` through `dcrdLog`, so under DCRD -- the
+    // previous-testnet directories found, then the missing config file
+    // it defers until the rest of the configuration succeeds
+    // (`config.go:1328-1352`).
+    for warning in &cfg.log_warnings {
         log_warn(warning);
     }
     dcroxide_node::logging::write_stdout(b"\n");
@@ -619,12 +641,26 @@ fn run_node(cfg: Config) -> ExitCode {
     // Create the address manager and load any persisted peers (dcrd
     // `newServer`'s `addrmgr.New(cfg.DataDir)`).
     let mut addr_manager = AddrManager::new(Path::new(&cfg.data_dir));
-    addr_manager.load_peers();
-    let known_addrs = addr_manager.address_cache(|_: NetAddressType| true).len();
-    dcroxide_node::logging::info(
-        "AMGR",
-        &format!("Address manager loaded {known_addrs} known address(es)"),
-    );
+    // dcrd `loadPeers`'s three log lines.
+    let peers_file = addr_manager.peers_file().display().to_string();
+    match addr_manager.load_peers() {
+        PeersLoad::Loaded(count) => dcroxide_node::logging::info(
+            "AMGR",
+            &format!("Loaded {count} addresses from file '{peers_file}'"),
+        ),
+        PeersLoad::Failed { err, remove_err } => {
+            dcroxide_node::logging::error(
+                "AMGR",
+                &format!("Failed to parse file {peers_file}: {err}"),
+            );
+            if let Some(remove_err) = remove_err {
+                dcroxide_node::logging::warn(
+                    "AMGR",
+                    &format!("Failed to remove corrupt peers file {peers_file}: {remove_err}"),
+                );
+            }
+        }
+    }
     // Share the manager with the served peers' addr exchange.
     let addr_manager = Arc::new(Mutex::new(addr_manager));
     // Dump the address book periodically for crash resilience (the

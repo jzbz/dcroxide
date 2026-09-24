@@ -60,7 +60,7 @@ use dcroxide_mining::bg_generator::{
     BgGenerator, BgRegenEvent, BgTemplateState, BgTemplateUpdateReason, GenRequest,
     MAX_VOTE_TIMEOUT_MILLIS, MIN_VOTES_TIMEOUT_MILLIS, handle_failed_gen_retry_timeout,
     handle_max_votes_timeout, handle_regen_event, handle_regen_timer_expired,
-    handle_track_side_chains_timeout,
+    handle_track_side_chains_timeout, set_failed_template,
 };
 use dcroxide_mining::{BlkTmplGenerator, ExtraNonces, MiningPolicy, TemplateChain};
 use dcroxide_rpc::server::{RpcBlockTemplater, RpcTemplateSubscription, TemplateRecv};
@@ -331,13 +331,18 @@ impl SubscriberRegistry {
 struct TimerDeadlines {
     /// The periodic regeneration timer (dcrd `regenTimer`).
     regen: Option<Instant>,
-    /// The millisecond duration the regen deadline was computed from,
-    /// so a reset to a different duration recomputes it.
-    regen_millis: u64,
+    /// The state machine's regen arm generation the deadline was
+    /// computed for, so every reset recomputes it.
+    regen_gen: u64,
     /// The max-votes propagation timeout (dcrd `maxVotesTimeout`).
     max_votes: Option<Instant>,
+    /// The max-votes arm generation the deadline was computed for.
+    max_votes_gen: u64,
     /// The side chain tracking timeout (dcrd `trackSideChainsTimeout`).
     track_side_chains: Option<Instant>,
+    /// The side chain tracking arm generation the deadline was computed
+    /// for.
+    track_side_chains_gen: u64,
     /// The failed-generation retry timeout (dcrd
     /// `failedGenRetryTimeout`).
     failed_gen_retry: Option<Instant>,
@@ -359,46 +364,40 @@ fn deadline_from_now(millis: u64) -> Instant {
         .expect("timer deadline")
 }
 
-/// Reconcile the timer deadlines from the state machine's armed flags
-/// after a mutation: newly-armed flags record a fresh deadline (the
-/// regen timer additionally recomputes when its duration changed, per
-/// dcrd's `regenTimer.Reset`), and disarmed flags clear theirs.
-///
-/// `rearmed_fixed` handles dcrd's fresh `time.After` on each arm of the
-/// fixed-duration max-votes and side-chain timeouts.  The state machine
-/// arms both only inside `handleBlockConnected` (the side-chain timeout
-/// is cleared then possibly re-armed there; the max-votes timeout can
-/// be re-armed while still armed from a prior tip within the window),
-/// so a block-connected event resets both deadlines when they end
-/// armed.  It is deliberately not set for vote events: a vote arms the
-/// max-votes timeout only from the disarmed min-votes-reached path
-/// (handled by the newly-armed case), while the common vote-collection
-/// path leaves it armed without re-arming — resetting there would defer
-/// the propagation timeout indefinitely.  The failed-generation retry
-/// is never re-armed while armed (dcrd guards it with a nil check), so
-/// the newly-armed case suffices for it.
-fn reconcile_timers(deadlines: &mut TimerDeadlines, state: &BgTemplateState, rearmed_fixed: bool) {
+/// Reconcile the timer deadlines from the state machine after a
+/// mutation.  An armed timer whose arm generation differs from the one
+/// its deadline was computed for gets a fresh deadline: every dcrd arm —
+/// a `time.After` assigned to the max-votes or side-chain timeout, or
+/// `resetRegenTimer` — restarts the countdown, whether or not the timer
+/// was already running, and nothing else touches a running one.  A
+/// disarmed timer clears its deadline.  The failed-generation retry is
+/// only ever armed from disarmed (dcrd guards it with a nil check), so a
+/// missing deadline is its only signal.
+fn reconcile_timers(deadlines: &mut TimerDeadlines, state: &BgTemplateState) {
     if state.regen_timer_armed {
-        if deadlines.regen.is_none() || deadlines.regen_millis != state.regen_timer_millis {
+        if deadlines.regen.is_none() || deadlines.regen_gen != state.regen_timer_gen {
             deadlines.regen = Some(deadline_from_now(state.regen_timer_millis));
-            deadlines.regen_millis = state.regen_timer_millis;
+            deadlines.regen_gen = state.regen_timer_gen;
         }
     } else {
         deadlines.regen = None;
-        deadlines.regen_millis = 0;
     }
 
     if state.max_votes_timeout_armed {
-        if deadlines.max_votes.is_none() || rearmed_fixed {
+        if deadlines.max_votes.is_none() || deadlines.max_votes_gen != state.max_votes_timeout_gen {
             deadlines.max_votes = Some(deadline_from_now(MAX_VOTE_TIMEOUT_MILLIS));
+            deadlines.max_votes_gen = state.max_votes_timeout_gen;
         }
     } else {
         deadlines.max_votes = None;
     }
 
     if state.track_side_chains_timeout_armed {
-        if deadlines.track_side_chains.is_none() || rearmed_fixed {
+        if deadlines.track_side_chains.is_none()
+            || deadlines.track_side_chains_gen != state.track_side_chains_timeout_gen
+        {
             deadlines.track_side_chains = Some(deadline_from_now(MIN_VOTES_TIMEOUT_MILLIS));
+            deadlines.track_side_chains_gen = state.track_side_chains_timeout_gen;
         }
     } else {
         deadlines.track_side_chains = None;
@@ -667,10 +666,7 @@ fn drain_and_build(
                 now,
             );
         }
-        // The template-update feed re-arms only the variable regen
-        // timer, never the fixed-duration timeouts, so no fixed re-arm
-        // applies.
-        reconcile_timers(deadlines, state, false);
+        reconcile_timers(deadlines, state);
 
         // Publish the current template for the getwork RPC.
         publish_current_template(&ctx.current, g, state);
@@ -751,10 +747,7 @@ fn step_event(
         };
         handle_regen_event(g, state, &mut chain, &tx_source, borrowed, is_current, now);
     }
-    // A block-connected event re-arms the fixed-duration timeouts with
-    // a fresh countdown (dcrd's `time.After` in `handleBlockConnected`).
-    let rearmed_fixed = matches!(event, OwnedRegenEvent::BlockConnected(_));
-    reconcile_timers(deadlines, state, rearmed_fixed);
+    reconcile_timers(deadlines, state);
 }
 
 /// Feed one regen event through the state machine and rebuild
@@ -800,8 +793,7 @@ fn step_force_regen(
             now,
         );
     }
-    // A forced regeneration never arms the fixed-duration timeouts.
-    reconcile_timers(deadlines, state, false);
+    reconcile_timers(deadlines, state);
 }
 
 /// Feed a force-regeneration request through the state machine and
@@ -829,7 +821,6 @@ fn step_timer(
     match fired {
         FiredTimer::Regen => {
             deadlines.regen = None;
-            deadlines.regen_millis = 0;
             let last_updated = ctx
                 .pool
                 .lock()
@@ -854,8 +845,7 @@ fn step_timer(
             handle_failed_gen_retry_timeout(g, state);
         }
     }
-    // No timer-fire handler re-arms a fixed-duration timeout.
-    reconcile_timers(deadlines, state, false);
+    reconcile_timers(deadlines, state);
 }
 
 /// Run the fired timer's handler and rebuild.  Returns `false` when
@@ -1030,11 +1020,25 @@ pub fn start_generator(
         // Treat the current tip as just connected (dcrd's startup
         // `rtBlockConnected` inject).
         {
-            let tip_chain = NodeTemplateChain::new(Arc::clone(&ctx.chain), ctx.params.clone());
+            let mut tip_chain = NodeTemplateChain::new(Arc::clone(&ctx.chain), ctx.params.clone());
             let best = tip_chain.best_snapshot();
             match tip_chain.block_by_hash(&best.hash) {
                 Err(err) => {
-                    g.set_current_template(None, BgTemplateUpdateReason::Unknown, Some(err));
+                    // dcrd's `setCurrentTemplate(nil, turUnknown, err)`
+                    // and the template-update event it queues, which
+                    // arms the failed-generation retry.
+                    let tx_source = NodeTemplateTxSource::new(Arc::clone(&ctx.pool));
+                    let is_current = ctx.allow_unsynced_mining || ctx.sync_is_current();
+                    set_failed_template(
+                        &mut g,
+                        &mut state,
+                        &mut tip_chain,
+                        &tx_source,
+                        err,
+                        is_current,
+                        now_unix(),
+                    );
+                    reconcile_timers(&mut deadlines, &state);
                     publish_current_template(&ctx.current, &g, &state);
                 }
                 Ok(tip_block) => {
@@ -1054,7 +1058,7 @@ pub fn start_generator(
         run_drain(&ctx.drain_hook);
         // A settling pass over the deadlines; the tip inject above
         // already reconciled, so nothing is re-armed here.
-        reconcile_timers(&mut deadlines, &state, false);
+        reconcile_timers(&mut deadlines, &state);
 
         loop {
             let wait = match nearest_deadline(&deadlines) {
@@ -1455,27 +1459,30 @@ mod tests {
         );
     }
 
-    /// The deadlines reconcile from the state machine's armed flags:
-    /// arming records a deadline, a regen reset to a new duration
-    /// recomputes it, and disarming clears it.
+    /// The deadlines reconcile from the state machine's armed flags and
+    /// arm generations: arming records a deadline, every re-arm (a new
+    /// generation) restarts it even while it is still pending, a
+    /// reconcile with no new arm keeps it, and disarming clears it.
     #[test]
     fn timers_reconcile_from_armed_flags() {
         let mut state = BgTemplateState::new();
         let mut deadlines = TimerDeadlines::default();
 
         // Nothing armed: no deadlines.
-        reconcile_timers(&mut deadlines, &state, false);
+        reconcile_timers(&mut deadlines, &state);
         assert!(nearest_deadline(&deadlines).is_none());
 
         // Arm the regen timer at 30 seconds and each fixed timeout.
         state.regen_timer_armed = true;
         state.regen_timer_millis = 30_000;
+        state.regen_timer_gen += 1;
         state.max_votes_timeout_armed = true;
+        state.max_votes_timeout_gen += 1;
         state.track_side_chains_timeout_armed = true;
+        state.track_side_chains_timeout_gen += 1;
         state.failed_gen_retry_timeout_armed = true;
-        reconcile_timers(&mut deadlines, &state, false);
+        reconcile_timers(&mut deadlines, &state);
         assert!(deadlines.regen.is_some());
-        assert_eq!(deadlines.regen_millis, 30_000);
         assert!(deadlines.max_votes.is_some());
         assert!(deadlines.track_side_chains.is_some());
         assert!(deadlines.failed_gen_retry.is_some());
@@ -1489,36 +1496,37 @@ mod tests {
         // its deadline.
         let before = deadlines.regen.expect("regen armed");
         state.regen_timer_millis = 1_000;
-        reconcile_timers(&mut deadlines, &state, false);
-        assert_eq!(deadlines.regen_millis, 1_000);
+        state.regen_timer_gen += 1;
+        reconcile_timers(&mut deadlines, &state);
         assert!(deadlines.regen.expect("regen armed") < before);
 
-        // A fixed-timer re-arm (a block-connected event) resets the
-        // max-votes and side-chain deadlines to a fresh countdown even
-        // though they were already armed, while a plain reconcile keeps
-        // them.
+        // A reconcile with no new arm keeps every running deadline, and
+        // a re-arm of an armed timer restarts it: dcrd's `time.After`
+        // and `resetRegenTimer` replace a pending countdown, including a
+        // regen reset to the duration it already had.
+        let regen_before = deadlines.regen.expect("regen armed");
         let max_votes_before = deadlines.max_votes.expect("max votes armed");
+        let side_before = deadlines.track_side_chains.expect("side chains armed");
         std::thread::sleep(std::time::Duration::from_millis(2));
-        reconcile_timers(&mut deadlines, &state, false);
-        assert_eq!(
-            deadlines.max_votes.expect("max votes armed"),
-            max_votes_before,
-            "a non-rearming reconcile keeps the max-votes deadline"
-        );
-        reconcile_timers(&mut deadlines, &state, true);
-        assert!(
-            deadlines.max_votes.expect("max votes armed") > max_votes_before,
-            "a fixed re-arm resets the max-votes deadline forward"
-        );
+        reconcile_timers(&mut deadlines, &state);
+        assert_eq!(deadlines.regen, Some(regen_before));
+        assert_eq!(deadlines.max_votes, Some(max_votes_before));
+        assert_eq!(deadlines.track_side_chains, Some(side_before));
+        state.regen_timer_gen += 1;
+        state.max_votes_timeout_gen += 1;
+        state.track_side_chains_timeout_gen += 1;
+        reconcile_timers(&mut deadlines, &state);
+        assert!(deadlines.regen.expect("regen armed") > regen_before);
+        assert!(deadlines.max_votes.expect("max votes armed") > max_votes_before);
+        assert!(deadlines.track_side_chains.expect("side chains armed") > side_before);
 
         // Disarming clears the deadlines.
         state.regen_timer_armed = false;
         state.max_votes_timeout_armed = false;
         state.track_side_chains_timeout_armed = false;
         state.failed_gen_retry_timeout_armed = false;
-        reconcile_timers(&mut deadlines, &state, false);
+        reconcile_timers(&mut deadlines, &state);
         assert!(nearest_deadline(&deadlines).is_none());
-        assert_eq!(deadlines.regen_millis, 0);
     }
 
     /// A subscriber that stops draining must bound its backlog and stay

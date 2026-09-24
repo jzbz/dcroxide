@@ -6,9 +6,11 @@
 //! shared mempool as the generator's transaction source (dcrd hands
 //! the pool in as the config's `TxSource` directly).
 //!
-//! The background template generator thread and the
-//! `getblocktemplate` serving arrive with later pieces; these
-//! adapters give `BlkTmplGenerator` a real chain to build over.
+//! These adapters give `BlkTmplGenerator` a real chain to build over.
+//! The background template generator thread that builds with them,
+//! and serves the getwork RPC and the `notifywork` websocket feed,
+//! lives in [`crate::bgtemplate`]; the CPU miner behind `generate`
+//! and `setgenerate` builds with them too ([`crate::cpuminer`]).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -301,13 +303,17 @@ impl TemplateChain for NodeTemplateChain {
     ) -> Result<(), String> {
         // Thread the chain's signature cache through so template
         // assembly reuses the mempool's successful verifications
-        // (dcrd wires `s.sigCache` into the template generator).
-        let chain = self.locked();
+        // (dcrd wires `s.sigCache` into the template generator).  Only
+        // the cache handle is taken under the chain lock: dcrd's closure
+        // runs `blockchain.ValidateTransactionScripts` without
+        // `chainLock`, so the script run must not stall block
+        // processing and the other chain-lock users.
+        let sig_cache = self.locked().sig_cache.clone();
         dcroxide_blockchain::validate::validate_transaction_scripts(
             tx,
             |op| view.lookup_entry(op),
             flags,
-            chain.sig_cache.as_deref(),
+            sig_cache.as_deref(),
             is_auto_revocations_enabled,
         )
         .map_err(|e| e.description)

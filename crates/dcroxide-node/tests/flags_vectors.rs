@@ -150,21 +150,22 @@ fn the_service_command_option_parses() {
     }
 }
 
-/// The rendered help matches go-flags' output for dcrd's option
-/// registry byte for byte (`tools/helpgen` regenerates the vector).
-///
-/// Rendered with dcrd's environment-variable names, because that is what
-/// the vector is a dump of.  The port reads `DCROXIDE_APPDATA` and
-/// `DCROXIDE_ALT_DNSNAMES` instead (see `ENV_DEFAULTS`), and those are
-/// four characters longer, which changes where go-flags wraps the
-/// `[$VAR]` annotation.  Feeding the vector's own names keeps this test
-/// measuring what it exists to measure — the column layout, the wrapping,
-/// the option ordering — instead of failing over an input the port
-/// deliberately changed.  The production rendering is pinned by
+/// The application data directory `tools/helpgen` fills dcrd's
+/// defaults in over (its `helpHome`), standing in for the machine's own:
+/// the help shows the defaults, so the vector depends on it.
+const HELP_VECTOR_HOME: &str = "/home/user/.dcroxide";
+
+/// The help rendered with dcrd's environment-variable names, because
+/// that is what the vectors are dumps of.  The port reads
+/// `DCROXIDE_APPDATA` and `DCROXIDE_ALT_DNSNAMES` instead (see
+/// `ENV_DEFAULTS`), and those are four characters longer, which changes
+/// where go-flags wraps the `[$VAR]` annotation.  Feeding the vectors'
+/// own names keeps the parity tests measuring what they exist to
+/// measure — the column layout, the wrapping, the option ordering —
+/// instead of failing over an input the port deliberately changed.  The
+/// production rendering is pinned by
 /// `the_env_annotations_name_the_variables_actually_read`.
-#[test]
-fn help_text_matches_the_go_flags_vector() {
-    let expected = include_str!("data/help_vector.txt");
+fn render_as_dcrd(terminal_columns: usize) -> String {
     let as_dcrd: Vec<(&str, &str, Option<&str>)> = dcroxide_node::flags::HELP_DESCRIPTIONS
         .iter()
         .map(|&(long, desc, env)| {
@@ -176,8 +177,48 @@ fn help_text_matches_the_go_flags_vector() {
             (long, desc, env)
         })
         .collect();
-    let rendered = dcroxide_node::flags::render_help_with("dcroxide", &as_dcrd);
-    assert_eq!(rendered, expected, "help text must match go-flags");
+    let rendered = dcroxide_node::flags::render_help_with(
+        "dcroxide",
+        &as_dcrd,
+        HELP_VECTOR_HOME,
+        terminal_columns,
+    );
+    String::from_utf8(rendered).expect("the vector home renders as UTF-8")
+}
+
+/// The rendered help matches go-flags' output for dcrd's option
+/// registry byte for byte (`tools/helpgen` regenerates the vector with
+/// no terminal on stdin, where go-flags wraps at eighty columns), with
+/// the `(default: X)` note go-flags adds for every option dcrd's
+/// defaulted config gives a non-zero value.  A terminal reporting zero
+/// columns wraps at eighty too (`getAlignmentInfo`).
+#[test]
+fn help_text_matches_the_go_flags_vector() {
+    let expected = include_str!("data/help_vector.txt");
+    assert_eq!(
+        render_as_dcrd(80),
+        expected,
+        "help text must match go-flags"
+    );
+    assert_eq!(
+        render_as_dcrd(0),
+        expected,
+        "a zero-column terminal wraps at eighty"
+    );
+}
+
+/// go-flags wraps the help to the width of the terminal on stdin, not
+/// a fixed eighty columns: `help_vector_140.txt` is `tools/helpgen` run
+/// in a 140-column terminal, where dcrd's `--maxpeers` entry and its
+/// `(default: 125)` fit on one line.
+#[test]
+fn help_text_follows_the_terminal_width() {
+    let expected = include_str!("data/help_vector_140.txt");
+    assert_eq!(
+        render_as_dcrd(140),
+        expected,
+        "help text must match go-flags at 140 columns"
+    );
 }
 
 /// The help must advertise the variables the daemon actually reads.
@@ -189,7 +230,12 @@ fn help_text_matches_the_go_flags_vector() {
 /// no effect.
 #[test]
 fn the_env_annotations_name_the_variables_actually_read() {
-    let rendered = dcroxide_node::flags::render_help("dcroxide");
+    let rendered = String::from_utf8(dcroxide_node::flags::render_help(
+        "dcroxide",
+        HELP_VECTOR_HOME,
+        80,
+    ))
+    .expect("the vector home renders as UTF-8");
     for (_, var, _) in dcroxide_node::flags::ENV_DEFAULTS {
         assert!(
             rendered.contains(&format!("[${var}]")),

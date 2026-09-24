@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use dcroxide_blockchain::process::Chain;
+use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{Database, ErrorKind, Options};
 use dcroxide_node::addblock::{
@@ -70,7 +71,13 @@ fn real_main() -> Result<(), ()> {
         "macos" => "darwin",
         other => other,
     };
-    let home = app_data_dir(goos, "dcroxide", false, &|name| std::env::var(name).ok());
+    // A `$HOME` a `String` cannot hold is refused, as argv is, rather
+    // than read as unset, which put the default data directory in the
+    // current directory (`flags::getenv_utf8`).
+    let env_refused = std::cell::RefCell::new(None);
+    let home = app_data_dir(goos, "dcroxide", false, &|name| {
+        dcroxide_node::flags::getenv_utf8(name, &env_refused)
+    });
     let default_data_dir = Path::new(&home).join("data").to_string_lossy().into_owned();
 
     let args: Vec<String> = match dcroxide_node::flags::args_after_program() {
@@ -95,15 +102,49 @@ fn real_main() -> Result<(), ()> {
             return Err(());
         }
     };
+    // Refused only now, so the help and configuration exits stay dcrd's,
+    // and before the import opens anything under the default data
+    // directory.
+    if let Some(err) = env_refused.take() {
+        log_error(&err);
+        return Err(());
+    }
 
+    import_main(&cfg, &params)
+}
+
+/// Closes the block database however [`import_main`] returns once it
+/// has opened it (dcrd's deferred `db.Close()` straight after
+/// `loadBlockDB`, `cmd/addblock/addblock.go:86`).  The close flushes
+/// the database write cache, so an import that stops on a bad block or
+/// a short read keeps every block processed before the error, as
+/// dcrd's does.  Held from right after the open, it drops after
+/// everything built later.
+struct BlockDbCloser(Database);
+
+impl Drop for BlockDbCloser {
+    fn drop(&mut self) {
+        if let Err(e) = self.0.close() {
+            // dcrd discards the deferred close's error; it is logged
+            // here, as the daemon logs its own, so a close whose flush
+            // failed does not pass silently.
+            log_error(&format!("Unable to close the block database: {e}"));
+        }
+    }
+}
+
+/// The part of `realMain` after the configuration is loaded: load the
+/// database, open the input file, build the importer and run it.
+fn import_main(cfg: &AddblockConfig, params: &Params) -> Result<(), ()> {
     // Load the block database (dcrd's `loadBlockDB`).
-    let db = match load_block_db(&cfg, params.net.0) {
+    let db = match load_block_db(cfg, params.net.0) {
         Ok(db) => db,
         Err(e) => {
             log_error(&format!("Failed to load database: {e}"));
             return Err(());
         }
     };
+    let _db_closer = BlockDbCloser(db.clone());
 
     // Open the input file before any chain or index work (dcrd's
     // `realMain` opens it between `loadBlockDB` and
@@ -130,7 +171,7 @@ fn real_main() -> Result<(), ()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let chain = match Chain::open(db.clone(), &params, Hash([0u8; 32]), false, created_unix) {
+    let chain = match Chain::open(db.clone(), params, Hash([0u8; 32]), false, created_unix) {
         Ok(chain) => chain,
         Err(e) => {
             log_error(&format!("Failed create block importer: {e:?}"));
@@ -168,7 +209,7 @@ fn real_main() -> Result<(), ()> {
 
     log_info("Starting import");
     let mut log = |msg: String| log_info(&msg);
-    let (stats, err) = run_import(&chain, &params, &mut infile, cfg.progress, &mut log);
+    let (stats, err) = run_import(&chain, params, &mut infile, cfg.progress, &mut log);
     if let Some(err) = err {
         log_error(&err);
         return Err(());
@@ -176,7 +217,7 @@ fn real_main() -> Result<(), ()> {
 
     // Make the import durable (dcrd's deferred `db.Close()` flushes
     // the database write cache).
-    if let Err(e) = chain.lock().expect("chain mutex poisoned").flush(&params) {
+    if let Err(e) = chain.lock().expect("chain mutex poisoned").flush(params) {
         log_error(&format!("Failed to flush the block database: {e:?}"));
         return Err(());
     }
@@ -240,5 +281,84 @@ mod tests {
             0o700,
             "the data directory addblock creates must be owner-only"
         );
+    }
+
+    /// The leading consecutive main-chain prefix of accepted blocks
+    /// from dcrd's `fullblocktests.Generate` battery, as raw block
+    /// bytes (regnet).
+    fn accepted_prefix_raw(limit: usize) -> Vec<Vec<u8>> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../dcroxide-blockchain/tests/data/fullblock_vectors.txt"
+        );
+        let data = std::fs::read_to_string(path).expect("fullblock vectors");
+        let mut tip = dcroxide_chaincfg::regnet_params().genesis_hash;
+        let mut blocks = Vec::new();
+        for line in data.lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            if f[0] != "accept" {
+                continue;
+            }
+            let raw = dcroxide_testutil::unhex(f[4]);
+            let (block, _) = dcroxide_wire::MsgBlock::from_bytes(&raw).expect("block");
+            if f[2] != "true" || block.header.prev_block != tip {
+                continue;
+            }
+            tip = block.header.block_hash();
+            blocks.push(raw);
+            if blocks.len() == limit {
+                break;
+            }
+        }
+        assert_eq!(blocks.len(), limit, "battery must provide the prefix");
+        blocks
+    }
+
+    /// dcrd defers `db.Close()` straight after `loadBlockDB`, and the
+    /// close flushes the database write cache, so an import that stops
+    /// on a block that does not link keeps every block processed
+    /// before the error.  Without the close the blocks sit in the
+    /// metadata overlay and are lost when the tool exits.
+    #[test]
+    fn a_failed_import_keeps_the_blocks_processed_before_the_error() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+
+        // Blocks one and three: the second record does not link.
+        let blocks = accepted_prefix_raw(3);
+        let mut stream = Vec::new();
+        for raw in [&blocks[0], &blocks[2]] {
+            dcroxide_database::bootstrap::write_block(&mut stream, params.net.0, raw)
+                .expect("write record");
+        }
+        let in_file = tmp.path().join("bootstrap.dat");
+        std::fs::write(&in_file, &stream).unwrap();
+
+        let cfg = AddblockConfig {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            db_type: "ffldb".to_string(),
+            test_net: false,
+            sim_net: false,
+            in_file: in_file.to_string_lossy().into_owned(),
+            no_exists_addr_index: false,
+            tx_index: false,
+            progress: 10,
+        };
+        assert_eq!(import_main(&cfg, &params), Err(()), "the gap must fail");
+
+        // The next open finds the first block on the main chain.
+        let db = Database::open(&Options::new(data_dir.join("blocks_ffldb"), params.net.0))
+            .expect("reopen the database");
+        let chain = Chain::open(db.clone(), &params, Hash([0u8; 32]), false, 0).expect("chain");
+        let (first, _) = dcroxide_wire::MsgBlock::from_bytes(&blocks[0]).expect("block");
+        let best = chain.best_snapshot();
+        assert_eq!(
+            (best.height, best.hash),
+            (1, first.header.block_hash()),
+            "the block imported before the error must persist"
+        );
+        drop(chain);
+        db.close().unwrap();
     }
 }

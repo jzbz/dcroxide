@@ -29,8 +29,13 @@ pub fn new_shared_estimator(min_relay_tx_fee: i64) -> Result<Arc<Mutex<Estimator
     let cfg = dcroxide_fees::EstimatorConfig {
         max_confirms: dcroxide_fees::DEFAULT_MAX_CONFIRMATIONS,
         min_bucket_fee: min_relay_tx_fee,
+        // dcrd multiplies two `dcrutil.Amount`s, an int64 product that
+        // wraps (`server.go:3960-3961`), so an absurd relay fee past
+        // `i64::MAX / 100` atoms reaches `NewEstimator`'s sanity check
+        // as the wrapped value: a negative one fails it and stops the
+        // start, a positive one lays out a shorter bucket ladder.
         max_bucket_fee: min_relay_tx_fee
-            .saturating_mul(dcroxide_fees::DEFAULT_MAX_BUCKET_FEE_MULTIPLIER),
+            .wrapping_mul(dcroxide_fees::DEFAULT_MAX_BUCKET_FEE_MULTIPLIER),
         extra_bucket_fee: EXTRA_BUCKET_FEE,
         fee_rate_step: dcroxide_fees::DEFAULT_FEE_RATE_STEP,
     };
@@ -181,6 +186,38 @@ mod tests {
             mem_pool_tracked(&estimator),
             0.0,
             "the remove hook cleared it"
+        );
+    }
+
+    /// dcrd sizes the top bucket as `dcrutil.Amount(100) *
+    /// cfg.minRelayTxFee`, an int64 product Go wraps
+    /// (`server.go:3960-3961`), and `NewEstimator` then checks the
+    /// wrapped value.  A saturating multiply clamped it to `i64::MAX`
+    /// instead, so a relay fee dcrd refuses to start with came up with a
+    /// full bucket ladder.
+    #[test]
+    fn the_max_bucket_fee_wraps_as_the_go_product_does() {
+        // 1e9 DCR/kB: 100 * 1e17 atoms wraps negative, below the minimum.
+        match new_shared_estimator(100_000_000_000_000_000) {
+            Ok(_) => panic!("dcrd's NewEstimator refuses the wrapped maximum"),
+            Err(e) => assert_eq!(
+                e,
+                "maximum bucket fee should not be lower than minimum bucket fee"
+            ),
+        }
+
+        // 2e9 DCR/kB: the product wraps to a smaller positive bound, and
+        // the ladder stops below it rather than running on to i64::MAX.
+        let min_relay_tx_fee: i64 = 200_000_000_000_000_000;
+        let wrapped = min_relay_tx_fee.wrapping_mul(100);
+        assert_eq!(wrapped, 1_553_255_926_290_448_384);
+        let estimator = new_shared_estimator(min_relay_tx_fee).expect("estimator");
+        let estimator = estimator.lock().expect("est");
+        let bounds = &estimator.bucket_fee_bounds;
+        let top_finite = bounds[bounds.len() - 2];
+        assert!(
+            top_finite < wrapped as f64,
+            "the last finite bucket {top_finite} must sit below dcrd's wrapped maximum"
         );
     }
 

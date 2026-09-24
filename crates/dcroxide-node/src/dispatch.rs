@@ -393,6 +393,11 @@ impl SyncPeers {
                     // call panic (caught as an internal error) forever.
                     let peer = peer.lock().ok()?;
                     let snap = peer.stats_snapshot();
+                    // Read the wall and monotonic clocks together here,
+                    // per peer, so the restated time carries no gap spent
+                    // reaching this peer in the loop.
+                    let last_ping_time_unix_nanos =
+                        snap.last_ping_time_on_wall_clock(&mut NodePeerEnv::new());
                     // dcrd's `getpeerinfo` reports the version the peer
                     // advertised, not the negotiated (capped) one.
                     let advertised_version = peer.advertised_proto_ver();
@@ -440,8 +445,10 @@ impl SyncPeers {
                             .unwrap_or(0),
                         last_ping_nonce: snap.last_ping_nonce,
                         // The handler feeds this straight to `clock.since_nanos`,
-                        // so it stays in nanoseconds.
-                        last_ping_time_unix_nanos: snap.last_ping_time_nanos,
+                        // so it stays in nanoseconds, restated from the ping's
+                        // monotonic reading so pingwait is measured on the
+                        // monotonic clock, as dcrd's `Clock.Since` measures it.
+                        last_ping_time_unix_nanos,
                         last_ping_micros: snap.last_ping_micros,
                         connected: true,
                     })
@@ -1248,20 +1255,13 @@ impl GetDataWorker {
     /// `serverPeer.serveGetData`, whose loop ends only on `sp.quit`).
     fn run(self, batches: mpsc::Receiver<Vec<InvVect>>) {
         let mut pipeline = SendPipeline::new();
-        let (sent, pver) = match &self.peer_handle {
-            Some(handle) => {
-                let peer = handle.lock().expect("peer mutex poisoned");
-                (peer.bytes_sent(), peer.protocol_version())
-            }
-            None => (0, dcroxide_wire::PROTOCOL_VERSION),
-        };
-        let mut last_sent = sent;
+        let mut last_sent = self.peer_bytes_sent().unwrap_or(0);
         while let Ok(batch) = batches.recv() {
             decrement_usize(&self.pending_batches, 1);
             if self.quit.load(Ordering::SeqCst) {
                 return;
             }
-            if !self.serve_batch(&batch, pver, &mut pipeline, &mut last_sent) {
+            if !self.serve_batch(&batch, &mut pipeline, &mut last_sent) {
                 return;
             }
         }
@@ -1269,12 +1269,10 @@ impl GetDataWorker {
 
     /// Serve one batch item by item (dcrd
     /// `serverPeer.handleServeGetData`), returning false only once the
-    /// peer is going away.  `pver` is the negotiated protocol version
-    /// the replies are framed at.
+    /// peer is going away.
     fn serve_batch(
         &self,
         batch: &[InvVect],
-        pver: u32,
         pipeline: &mut SendPipeline,
         last_sent: &mut u64,
     ) -> bool {
@@ -1321,7 +1319,7 @@ impl GetDataWorker {
                 let queued = match action {
                     ServeGetDataItemAction::QueueData(_) => {
                         let msg = message.take().expect("a found item resolved to a message");
-                        let bytes = message_payload_bytes(&msg, pver);
+                        let bytes = message_payload_bytes(&msg);
                         self.queue_data(msg, bytes, pipeline, last_sent)
                     }
                     // The continuation inventory and the consolidated
@@ -1568,21 +1566,17 @@ fn queue_reply(
 /// message: exactly what the output loop writes after the message
 /// header, so a mark retires once its own payload has been written.
 ///
-/// Blocks and transactions take their exact serialized size.  A mix
-/// message is encoded once to measure it, as the outbound queue's own
-/// byte charge does; a flat nominal charge never reconciled with the
-/// real write, so small mix messages left marks the counter could only
-/// reach through other traffic, and the pipeline stalled.  A message
-/// the codec refuses is charged nothing, since the output loop's write
-/// fails on the same error and ends the connection.
-fn message_payload_bytes(msg: &Message, pver: u32) -> u64 {
-    match msg {
-        Message::Block(block) => block.serialize_size() as u64,
-        Message::Tx(tx) => tx.serialize_size() as u64,
-        _ => msg
-            .encode_payload(pver)
-            .map_or(0, |payload| payload.len() as u64),
-    }
+/// Every message takes its serialized size (dcrd's `SerializeSize`),
+/// worked out from its fields without encoding it, so a served mix
+/// message is serialized once, by the output loop.  A flat nominal
+/// charge for mix messages never reconciled with the real write, so
+/// small mix messages left marks the counter could only reach through
+/// other traffic, and the pipeline stalled.  A message the codec refuses
+/// is charged its fields' size all the same, which is moot: the output
+/// loop's write fails on the same error and ends the connection, and
+/// the disconnect raises the quit flag that ends any wait on the mark.
+fn message_payload_bytes(msg: &Message) -> u64 {
+    msg.serialize_size() as u64
 }
 
 /// A block resolved under the chain lock (the index half of dcrd
@@ -4621,7 +4615,7 @@ mod tests {
                     .expect("the message frames")
                     .len() as u64;
             assert_eq!(
-                message_payload_bytes(&msg, pver) + crate::server::MESSAGE_HEADER_SIZE,
+                message_payload_bytes(&msg) + crate::server::MESSAGE_HEADER_SIZE,
                 framed,
                 "{} charged differently from what is written",
                 msg.command()
@@ -4637,9 +4631,8 @@ mod tests {
     /// after a minute, the serve worker gave up for good).
     #[test]
     fn small_mix_replies_never_stall_the_send_pipeline() {
-        let pver = dcroxide_wire::PROTOCOL_VERSION;
         let msg = small_mix_message();
-        let charge = message_payload_bytes(&msg, pver);
+        let charge = message_payload_bytes(&msg);
         let framed = charge + crate::server::MESSAGE_HEADER_SIZE;
         let mut pipeline = SendPipeline::new();
         for served in 0..8 {

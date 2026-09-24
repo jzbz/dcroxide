@@ -21,7 +21,9 @@ use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{BlockRegion, Database};
 use dcroxide_indexers::{
-    ChainQueryer, ExistsAddrIndex, IdxError, IndexSubscriber, Indexer, Interrupt, TxIndex,
+    ChainQueryer, EXISTS_ADDRESS_INDEX_NAME, ExistsAddrIndex, ExistsAddrQuery,
+    ExistsAddrUnconfirmed, IdxError, IndexSubscriber, Interrupt, TX_INDEX_NAME, TxIndex,
+    TxIndexQuery,
 };
 use dcroxide_rpc::server::{RpcDb, RpcExistsAddresser, RpcTxIndexEntry, RpcTxIndexer};
 use dcroxide_txscript::stdaddr::Address;
@@ -161,31 +163,28 @@ pub fn start_indexes(
 }
 
 /// Whether the index tip matches the chain tip (dcrd
-/// `maybeNotifySubscribers`' condition).  The locks are taken one at
-/// a time so the RPC thread never nests them.
-fn index_synced<I: Indexer>(
-    index: &Arc<Mutex<I>>,
+/// `maybeNotifySubscribers`' condition).  The index tip is read through
+/// a query handle, never the index mutex, and the chain lock is taken
+/// on its own, so the RPC thread never nests them.
+fn index_synced(
+    tip: &dyn Fn() -> Result<(i64, Hash), IdxError>,
     queryer: &NodeChainQueryer,
 ) -> Result<bool, String> {
-    let (tip_height, tip_hash) = index
-        .lock()
-        .expect("index mutex poisoned")
-        .tip()
-        .map_err(|e| e.to_string())?;
+    let (tip_height, tip_hash) = tip().map_err(|e| e.to_string())?;
     let (best_height, best_hash) = queryer.best();
     Ok(tip_height == best_height && tip_hash == best_hash)
 }
 
 /// The sync wait with an injectable deadline for the tests; dcrd
 /// races the subscriber's sync signal against `syncWait`.
-fn wait_for_index_sync<I: Indexer>(
-    index: &Arc<Mutex<I>>,
+fn wait_for_index_sync(
+    tip: &dyn Fn() -> Result<(i64, Hash), IdxError>,
     queryer: &NodeChainQueryer,
     deadline: Duration,
 ) -> bool {
     let start = Instant::now();
     loop {
-        if index_synced(index, queryer).unwrap_or(false) {
+        if index_synced(tip, queryer).unwrap_or(false) {
             return true;
         }
         if start.elapsed() >= deadline {
@@ -198,42 +197,35 @@ fn wait_for_index_sync<I: Indexer>(
 /// The RPC transaction-index seam over the live index (dcrd assigns
 /// the concrete `*indexers.TxIndex` to the rpcserver config's
 /// `TxIndexer` interface directly).
+///
+/// dcrd's `Name`, `Tip` and `Entry` take no index-wide lock.  The seam
+/// reads through a [`TxIndexQuery`] taken once at construction, so a
+/// `getrawtransaction` never waits on the index writer, which holds the
+/// index mutex through its database-writer wait and a block's work.
 pub struct NodeRpcTxIndexer {
-    index: Arc<Mutex<TxIndex>>,
+    query: TxIndexQuery,
     queryer: Arc<NodeChainQueryer>,
 }
 
 impl NodeRpcTxIndexer {
     /// A seam over the daemon's live transaction index.
     pub fn new(index: Arc<Mutex<TxIndex>>, queryer: Arc<NodeChainQueryer>) -> NodeRpcTxIndexer {
-        NodeRpcTxIndexer { index, queryer }
+        let query = index.lock().expect("tx index mutex poisoned").query();
+        NodeRpcTxIndexer { query, queryer }
     }
 }
 
 impl RpcTxIndexer for NodeRpcTxIndexer {
     fn name(&self) -> String {
-        self.index
-            .lock()
-            .expect("tx index mutex poisoned")
-            .name()
-            .to_string()
+        TX_INDEX_NAME.to_string()
     }
 
     fn tip(&self) -> Result<(i64, Hash), String> {
-        self.index
-            .lock()
-            .expect("tx index mutex poisoned")
-            .tip()
-            .map_err(|e| e.to_string())
+        self.query.tip().map_err(|e| e.to_string())
     }
 
     fn entry(&self, tx_hash: &Hash) -> Result<Option<RpcTxIndexEntry>, String> {
-        let entry = self
-            .index
-            .lock()
-            .expect("tx index mutex poisoned")
-            .entry(tx_hash)
-            .map_err(|e| e.to_string())?;
+        let entry = self.query.entry(tx_hash).map_err(|e| e.to_string())?;
         Ok(entry.map(|e| RpcTxIndexEntry {
             block_hash: e.block_region.hash,
             offset: e.block_region.offset,
@@ -243,7 +235,7 @@ impl RpcTxIndexer for NodeRpcTxIndexer {
     }
 
     fn wait_for_sync(&self) -> bool {
-        wait_for_index_sync(&self.index, &self.queryer, SYNC_WAIT)
+        wait_for_index_sync(&|| self.query.tip(), &self.queryer, SYNC_WAIT)
     }
 }
 
@@ -251,62 +243,54 @@ impl RpcTxIndexer for NodeRpcTxIndexer {
 /// assigns the concrete `*indexers.ExistsAddrIndex` to the rpcserver
 /// config's `ExistsAddresser` interface directly).
 pub struct NodeRpcExistsAddresser {
-    index: Arc<Mutex<ExistsAddrIndex>>,
+    query: ExistsAddrQuery,
     queryer: Arc<NodeChainQueryer>,
 }
 
 impl NodeRpcExistsAddresser {
-    /// A seam over the daemon's live exists address index.
+    /// A seam over the daemon's live exists address index.  The lookup
+    /// handle is taken once, here, and the index mutex is never touched
+    /// again.
     pub fn new(
         index: Arc<Mutex<ExistsAddrIndex>>,
         queryer: Arc<NodeChainQueryer>,
     ) -> NodeRpcExistsAddresser {
-        NodeRpcExistsAddresser { index, queryer }
+        let query = index
+            .lock()
+            .expect("exists addr index mutex poisoned")
+            .query();
+        NodeRpcExistsAddresser { query, queryer }
     }
 
-    /// Take a lookup handle and release the index mutex immediately.
+    /// The lookup handle, detached from the index mutex.
     ///
     /// The address lookups below are caller-sized — `existsaddresses`
     /// accepts as many addresses as fit the request body — and the index
-    /// writer takes this mutex *before* it opens its write transaction
-    /// (`dcroxide_indexers::subscriber`, pinned by `b6_indexlock`), so
-    /// the writer's semaphore is claimed last and never held while it
-    /// waits here.  Holding the mutex across the database reads
-    /// therefore stalls the indexer, but not every other commit in the
-    /// process, which is the whole point of that ordering.  Releasing
-    /// the guard before the reads keeps even the indexer moving.  dcrd
-    /// has no equivalent stall: its
-    /// `ExistsAddresses` takes no index-wide lock at all
-    /// (`existsaddrindex.go` 331-364).
+    /// writer holds the index mutex through its wait for the database
+    /// writer and a whole block's index work.  Reading through the mutex
+    /// would stall the indexer for a large lookup, and a lookup behind
+    /// the writer for as long as it waits.  dcrd has neither stall: its
+    /// `ExistsAddress(es)`, `Tip` and `Name` take no index-wide lock at
+    /// all (`existsaddrindex.go` 331-364).
     ///
-    /// Pinned by `tests/b6_indexlock.rs`.
-    fn query(&self) -> dcroxide_indexers::ExistsAddrQuery {
-        self.index
-            .lock()
-            .expect("exists addr index mutex poisoned")
-            .query()
+    /// Pinned by `tests/b6_indexlock.rs` and
+    /// `tests/review_index_locks.rs`.
+    fn query(&self) -> &ExistsAddrQuery {
+        &self.query
     }
 }
 
 impl RpcExistsAddresser for NodeRpcExistsAddresser {
     fn name(&self) -> String {
-        self.index
-            .lock()
-            .expect("exists addr index mutex poisoned")
-            .name()
-            .to_string()
+        EXISTS_ADDRESS_INDEX_NAME.to_string()
     }
 
     fn tip(&self) -> Result<(i64, Hash), String> {
-        self.index
-            .lock()
-            .expect("exists addr index mutex poisoned")
-            .tip()
-            .map_err(|e| e.to_string())
+        self.query().tip().map_err(|e| e.to_string())
     }
 
     fn wait_for_sync(&self) -> bool {
-        wait_for_index_sync(&self.index, &self.queryer, SYNC_WAIT)
+        wait_for_index_sync(&|| self.query().tip(), &self.queryer, SYNC_WAIT)
     }
 
     fn exists_address(&self, addr: &Address) -> Result<bool, String> {
@@ -323,24 +307,30 @@ impl RpcExistsAddresser for NodeRpcExistsAddresser {
 /// The mempool's unconfirmed-transaction hook over the live exists
 /// address index (dcrd's mempool config carrying the concrete
 /// `*indexers.ExistsAddrIndex`; `AddUnconfirmedTx` records the
-/// transaction's addresses in the memory-only overlay).
+/// transaction's addresses in the memory-only overlay under
+/// `unconfirmedLock` alone).
+///
+/// The hook runs inside `TxPool::add_transaction` with the pool mutex
+/// held, so it holds an [`ExistsAddrUnconfirmed`] handle rather than
+/// the index mutex: admission never waits on the index writer.
 pub struct NodeUnconfirmedAddrIndexer {
-    index: Arc<Mutex<ExistsAddrIndex>>,
+    unconfirmed: ExistsAddrUnconfirmed,
 }
 
 impl NodeUnconfirmedAddrIndexer {
     /// A hook over the daemon's live exists address index.
     pub fn new(index: Arc<Mutex<ExistsAddrIndex>>) -> NodeUnconfirmedAddrIndexer {
-        NodeUnconfirmedAddrIndexer { index }
+        let unconfirmed = index
+            .lock()
+            .expect("exists addr index mutex poisoned")
+            .unconfirmed();
+        NodeUnconfirmedAddrIndexer { unconfirmed }
     }
 }
 
 impl dcroxide_mempool::UnconfirmedAddrIndexer for NodeUnconfirmedAddrIndexer {
     fn add_unconfirmed_tx(&mut self, tx: &dcroxide_wire::MsgTx) {
-        self.index
-            .lock()
-            .expect("exists addr index mutex poisoned")
-            .add_unconfirmed_tx(tx);
+        self.unconfirmed.add_unconfirmed_tx(tx);
     }
 }
 
@@ -501,8 +491,9 @@ mod tests {
         let testnet = dcroxide_chaincfg::testnet3_params();
         let (_dir2, _db2, chain2) = open_genesis_chain(&testnet);
         let other = Arc::new(NodeChainQueryer::new(chain2, testnet));
+        let query = tx_index.lock().expect("tx index").query();
         assert!(!wait_for_index_sync(
-            tx_index,
+            &|| query.tip(),
             &other,
             Duration::from_millis(200)
         ));

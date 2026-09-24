@@ -23,6 +23,7 @@
 // values.
 #![allow(clippy::arithmetic_side_effects)]
 
+use std::cell::RefCell;
 use std::fmt;
 use std::fs;
 
@@ -597,16 +598,18 @@ pub struct Config {
     pub lookup: LookupSelection,
     /// The onion dial and lookup selection.
     pub onion: OnionSelection,
-    /// Warnings dcrd prints to stderr or the daemon log (deprecated
-    /// options, missing config file); informational only.
     /// Warnings dcrd writes to stderr as it parses (its
     /// `fmt.Fprintln(os.Stderr, ...)` deprecation and Tor-isolation
-    /// notices).
+    /// notices), collected by [`load_config`] and
+    /// [`load_config_from_argv`]; empty after
+    /// [`load_config_from_argv_with_notices`], which streams them.
     pub warnings: Vec<String>,
-    /// The missing-config-file notice, which dcrd logs rather than
-    /// printing (`config.go:1348-1352`, `dcrdLog.Warnf`), and only
-    /// after the rest of the configuration succeeds.
-    pub config_file_warning: Option<String>,
+    /// The warnings dcrd logs rather than prints (`dcrdLog.Warnf`), in
+    /// its order: the previous-testnet data directories found
+    /// (`config.go:1328-1335`), then the missing-config-file notice,
+    /// which it logs only after the rest of the configuration succeeds
+    /// (`config.go:1348-1352`).
+    pub log_warnings: Vec<String>,
 }
 
 fn empty_net_info(name: &str) -> RpcNetworkInfo {
@@ -724,7 +727,7 @@ impl Config {
             lookup: LookupSelection::System,
             onion: OnionSelection::SameAsMain,
             warnings: Vec::new(),
-            config_file_warning: None,
+            log_warnings: Vec::new(),
         }
     }
 }
@@ -1190,7 +1193,10 @@ pub fn app_data_dir(
     let app_name_upper = format!("{}{rest}", first.to_uppercase());
     let app_name_lower = format!("{}{rest}", first.to_lowercase());
 
-    let home_dir = getenv("HOME").unwrap_or_default();
+    // Read where a branch uses it: the Windows branch never does, and
+    // there Go's `os.UserHomeDir` reads `%USERPROFILE%` rather than
+    // `$HOME`, so a `$HOME` it cannot hold is none of dcrd's business.
+    let home_dir = || getenv("HOME").unwrap_or_default();
 
     match goos {
         "windows" => {
@@ -1203,6 +1209,7 @@ pub fn app_data_dir(
             }
         }
         "darwin" => {
+            let home_dir = home_dir();
             if !home_dir.is_empty() {
                 return filepath_join(&[
                     &home_dir,
@@ -1213,11 +1220,13 @@ pub fn app_data_dir(
             }
         }
         "plan9" => {
+            let home_dir = home_dir();
             if !home_dir.is_empty() {
                 return filepath_join(&[&home_dir, &app_name_lower]);
             }
         }
         _ => {
+            let home_dir = home_dir();
             if !home_dir.is_empty() {
                 return filepath_join(&[&home_dir, &format!(".{app_name_lower}")]);
             }
@@ -1278,10 +1287,12 @@ pub fn create_default_config_file(
     rand_bytes: &dyn Fn(&mut [u8]),
 ) -> Result<(), String> {
     // Create the destination directory if it does not exist.  dcrd
-    // uses `os.MkdirAll(dir, 0700)` here because the file about to be
-    // written carries the generated RPC password.
+    // uses `os.MkdirAll(filepath.Dir(destPath), 0700)` here because the
+    // file about to be written carries the generated RPC password; a
+    // bare file name's directory is `.`, as `filepath.Dir` has it.
     if let Some(parent) = std::path::Path::new(dest_path).parent() {
-        crate::secretfile::create_dir_all_owner_only(parent).map_err(|e| e.to_string())?;
+        let parent = parent.to_str().filter(|p| !p.is_empty()).unwrap_or(".");
+        crate::gostd::go_mkdir_all_owner_only(parent).map_err(|e| e.to_string())?;
     }
 
     let mut cfg = sample_dcroxide_conf().to_string();
@@ -1314,8 +1325,22 @@ pub fn create_default_config_file(
     // generated `rpcpass`, so it must never be readable by other local
     // users, including for the instant a write-then-chmod would leave
     // it exposed.
-    crate::secretfile::write_owner_only(std::path::Path::new(dest_path), cfg.as_bytes())
-        .map_err(|e| e.to_string())
+    //
+    // An OS error renders as the `*PathError` of dcrd's `os.OpenFile`
+    // (`open <path>: permission denied`).  The helper does not say
+    // which step failed, so a failure in the write itself, which Go
+    // would report as `write <path>: ...`, carries the open prefix too.
+    crate::secretfile::write_owner_only(std::path::Path::new(dest_path), cfg.as_bytes()).map_err(
+        |err| match err.raw_os_error() {
+            Some(_) => crate::gostd::GoPathError {
+                op: "open",
+                path: dest_path.to_string(),
+                err,
+            }
+            .to_string(),
+            None => err.to_string(),
+        },
+    )
 }
 
 /// Convert a floating point DCR amount to atoms (dcrd
@@ -1346,6 +1371,25 @@ pub fn file_exists(name: &str) -> bool {
         Ok(_) => true,
         Err(e) => e.kind() != std::io::ErrorKind::NotFound,
     }
+}
+
+/// Read the config file the way go-flags' `readIniFromFile` does
+/// (`os.Open`, then reads through the handle), keeping Go's
+/// `*PathError` for a failure: `open <path>: no such file or
+/// directory` for a missing file, `read <path>: is a directory` when
+/// the path names a directory.
+fn read_config_file(path: &str) -> Result<Vec<u8>, crate::gostd::GoPathError> {
+    use std::io::Read;
+    let path_error = |op, err| crate::gostd::GoPathError {
+        op,
+        path: path.to_string(),
+        err,
+    };
+    let mut file = fs::File::open(path).map_err(|err| path_error("open", err))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|err| path_error("read", err))?;
+    Ok(bytes)
 }
 
 /// The command line input for [`load_config`]: pre-tokenized
@@ -1390,24 +1434,91 @@ pub fn load_config(
     positional: &[String],
     env: &ConfigEnv<'_>,
 ) -> Result<(Config, Vec<String>), String> {
-    load_config_impl(
-        &CliSource::Assignments {
-            opts: cli,
-            positional,
-        },
-        env,
-    )
+    collect_notices(|notices| {
+        load_config_impl(
+            &CliSource::Assignments {
+                opts: cli,
+                positional,
+            },
+            env,
+            notices,
+            &RefCell::new(None),
+        )
+    })
 }
 
 /// Initialize and parse the config from the raw command line
 /// arguments (without the program name), replicating go-flags'
 /// syntax exactly (dcrd `loadConfig`); returns the config and the
-/// remaining positional arguments.
+/// remaining positional arguments.  The stderr notices are collected
+/// into [`Config::warnings`], so a failed load drops them; the daemon
+/// uses [`load_config_from_argv_with_notices`] instead.
 pub fn load_config_from_argv(
     args: &[String],
     env: &ConfigEnv<'_>,
 ) -> Result<(Config, Vec<String>), String> {
-    load_config_impl(&CliSource::Argv(args), env)
+    collect_notices(|notices| {
+        load_config_impl(&CliSource::Argv(args), env, notices, &RefCell::new(None))
+    })
+}
+
+/// [`load_config_from_argv`], handing each line dcrd writes to stderr
+/// while it loads (go-flags' `PrintErrors` echo of a help pre-parse
+/// error, the default config creation failure, and the deprecation and
+/// Tor-isolation notices) to `notices` at the point dcrd writes it.  A
+/// load that fails later has still emitted the lines before the
+/// failure, as dcrd has printed them by then; [`Config::warnings`]
+/// stays empty.
+///
+/// `env_refused` is where the environment lookups (`env.getenv`, and
+/// the [`app_data_dir`] that produced `env.default_home_dir`) record a
+/// value they could not hold ([`crate::flags::getenv_utf8`]).  The load
+/// fails with it after each step that reads the environment, before
+/// acting on what that step read: after the pre-parses and their
+/// version and service-command exits (which use none of it), so before
+/// the home directory and the default config file; after the final
+/// parse; and after each `$VAR` expansion of a path.  A variable dcrd
+/// would not have read, such as `DCROXIDE_APPDATA` beside `--appdata`,
+/// is never looked up, and so never refused.
+pub fn load_config_from_argv_with_notices(
+    args: &[String],
+    env: &ConfigEnv<'_>,
+    notices: &mut dyn FnMut(&str),
+    env_refused: &RefCell<Option<String>>,
+) -> Result<(Config, Vec<String>), String> {
+    load_config_impl(&CliSource::Argv(args), env, notices, env_refused)
+}
+
+/// Fail with the environment value a lookup refused, if one did
+/// ([`load_config_from_argv_with_notices`]).
+fn check_env_refused(env_refused: &RefCell<Option<String>>) -> Result<(), String> {
+    env_refused.borrow().clone().map_or(Ok(()), Err)
+}
+
+/// Run a load, collecting its stderr notices into
+/// [`Config::warnings`] when it succeeds.
+fn collect_notices(
+    load: impl FnOnce(&mut dyn FnMut(&str)) -> Result<(Config, Vec<String>), String>,
+) -> Result<(Config, Vec<String>), String> {
+    let mut collected: Vec<String> = Vec::new();
+    let result = load(&mut |line: &str| collected.push(line.to_string()));
+    result.map(|(mut cfg, remaining)| {
+        cfg.warnings = collected;
+        (cfg, remaining)
+    })
+}
+
+/// The start of the one `loadConfig` error dcrd wraps in
+/// `errSuppressUsage` (`config.go:769-786`): the home directory could
+/// not be created.
+const HOME_DIR_ERROR_PREFIX: &str = "loadConfig: failed to create home directory: ";
+
+/// Whether dcrd follows this `loadConfig` error with its
+/// "Use dcrd -h to show usage" line: every error but the home
+/// directory failure, which it wraps in `errSuppressUsage`
+/// (`dcrd.go:44-50`).
+pub fn error_shows_usage(err: &str) -> bool {
+    !err.starts_with(HOME_DIR_ERROR_PREFIX)
 }
 
 /// Apply a pre-pass over assignments (continuing past errors) and
@@ -1430,6 +1541,8 @@ fn assignments_pre_pass(cfg: &mut Config, opts: &[Assignment], env: &ConfigEnv<'
 fn load_config_impl(
     cli: &CliSource<'_>,
     env: &ConfigEnv<'_>,
+    notices: &mut dyn FnMut(&str),
+    env_refused: &RefCell<Option<String>>,
 ) -> Result<(Config, Vec<String>), String> {
     let func_name = "loadConfig";
     let default_home = env.default_home_dir.clone();
@@ -1447,8 +1560,8 @@ fn load_config_impl(
 
     // The help pre-parse applies the command line into cfg (with
     // unknown options ignored and any other error aborting that
-    // parse silently); environment defaults apply when the parse
-    // succeeds.
+    // parse, echoed to stderr by go-flags' `PrintErrors`); environment
+    // defaults apply when the parse succeeds.
     match cli {
         CliSource::Assignments { opts, .. } => assignments_pre_pass(&mut cfg, opts, env),
         CliSource::Argv(args) => {
@@ -1467,8 +1580,15 @@ fn load_config_impl(
             if help && err.is_none() {
                 return Err(ERR_HELP_REQUESTED.to_string());
             }
-            if err.is_none() {
-                crate::flags::apply_env_defaults(&mut cfg, &state.set_names, &env.getenv);
+            match err {
+                None => crate::flags::apply_env_defaults(&mut cfg, &state.set_names, &env.getenv),
+                // dcrd builds this parser with `flags.PrintErrors`, so
+                // go-flags writes the error to stderr itself
+                // (`parser.go` `printError`) before dcrd goes on; the
+                // final parse reports it again when it fails there
+                // too, and a `--` that shields it from the final parse
+                // leaves this echo as its only trace.
+                Some(err) => notices(&err.message()),
             }
         }
     }
@@ -1509,6 +1629,10 @@ fn load_config_impl(
             pre_cfg.service_command
         ));
     }
+
+    // Nothing has used the environment yet; the home directory and the
+    // default config file below would (`$HOME`, `DCROXIDE_APPDATA`).
+    check_env_refused(env_refused)?;
 
     // Update the home directory for dcrd if specified.  Since the
     // home directory is updated, other variables need to be updated
@@ -1558,11 +1682,13 @@ fn load_config_impl(
     {
         // Errors creating the default config are printed and
         // otherwise ignored.
-        let _ = create_default_config_file(
+        if let Err(e) = create_default_config_file(
             &pre_cfg.config_file,
             &pre_cfg.rpc_auth_type,
             &env.rand_bytes,
-        );
+        ) {
+            notices(&format!("Error creating a default config file: {e}"));
+        }
     }
 
     // Load additional config from file.  The final parser is shared
@@ -1578,13 +1704,37 @@ fn load_config_impl(
         // case is not `rpcuser`, which fails closed, but `testnet=1`: an
         // operator who believes they are on testnet comes up on mainnet
         // with nothing said.
-        match fs::read(&pre_cfg.config_file) {
+        match read_config_file(&pre_cfg.config_file) {
             Ok(bytes) => {
+                // The lossy decode only ever alters lines dcrd skips or
+                // rejects anyway (comments, and a section or option name
+                // it cannot match).  A value it would take is a Go
+                // string of raw bytes, which a `String` field cannot
+                // hold: rather than store a replacement character in its
+                // place (a different `rpcpass`, a different `datadir`),
+                // such a value is refused below, as argv is
+                // (`flags::args_after_program`).
                 let content = String::from_utf8_lossy(&bytes);
-                let assignments = crate::flags::parse_ini(&content, &pre_cfg.config_file)
+                let raw_lines: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
+                let steps = crate::flags::parse_ini(&content, &pre_cfg.config_file)
                     .map_err(|e| format!("Error parsing config file: {e}"))?;
                 let mut pass = ParsePass::default();
-                for a in assignments {
+                // go-flags' apply walk: the first step that fails, by
+                // lookup or by conversion, is the error.
+                for step in steps {
+                    let a = match step {
+                        crate::flags::IniStep::Set(a) => a,
+                        crate::flags::IniStep::Fail(e) => {
+                            return Err(format!("Error parsing config file: {e}"));
+                        }
+                    };
+                    let raw_line = raw_lines.get(a.line - 1).copied().unwrap_or_default();
+                    if std::str::from_utf8(raw_line).is_err() {
+                        return Err(format!(
+                            "Error parsing config file: {}:{}: the value of option {} is not valid UTF-8",
+                            pre_cfg.config_file, a.line, a.spec.long
+                        ));
+                    }
                     if let Err(e) =
                         crate::flags::set_option(&mut cfg, &mut pass, a.spec, a.value.as_deref())
                     {
@@ -1601,7 +1751,7 @@ fn load_config_impl(
             Err(e) => {
                 // Path errors are deferred to a warning after the
                 // rest of the configuration succeeds.
-                config_file_error = Some(format!("open {}: {e}", pre_cfg.config_file));
+                config_file_error = Some(e.to_string());
             }
         }
     }
@@ -1644,20 +1794,30 @@ fn load_config_impl(
             state.retargs
         }
     };
+    check_env_refused(env_refused)?;
 
     // Create the home directory if it doesn't already exist.  dcrd
     // uses `os.MkdirAll(cfg.HomeDir, 0700)`: the tree holds the RPC
-    // key, the config file and the address manager state.
-    if let Err(e) =
-        crate::secretfile::create_dir_all_owner_only(std::path::Path::new(&cfg.home_dir))
-    {
-        return Err(format!("{func_name}: failed to create home directory: {e}"));
+    // key, the config file and the address manager state.  Go's
+    // `MkdirAll` fails on the empty path an empty `--appdata` leaves,
+    // where `create_dir_all` would succeed and quietly run on the
+    // default paths.
+    if let Err(e) = crate::gostd::go_mkdir_all_owner_only(&cfg.home_dir) {
+        // Show a nicer error message if it's because a symlink is
+        // linked to a directory that does not exist (probably because
+        // it's not mounted).
+        let mut msg = e.to_string();
+        if e.err.kind() == std::io::ErrorKind::AlreadyExists
+            && let Ok(link) = fs::read_link(&e.path)
+        {
+            msg = format!("is symlink {} -> {} mounted?", e.path, link.display());
+        }
+        return Err(format!("{HOME_DIR_ERROR_PREFIX}{msg}"));
     }
 
     if cfg.disable_dns_seed {
         cfg.disable_seeders = true;
-        cfg.warnings
-            .push("The --nodnsseed option is deprecated: use --noseeders".to_string());
+        notices("The --nodnsseed option is deprecated: use --noseeders");
     }
 
     // Multiple networks can't be selected simultaneously.
@@ -1684,13 +1844,13 @@ fn load_config_impl(
 
     // Warn on the deprecated rate-limiting options.
     if cfg.free_tx_relay_limit != 0.0 {
-        cfg.warnings.push(
-            "The --limitfreerelay option is deprecated and will be removed in a future version of the software: please remove it from your config".to_string(),
+        notices(
+            "The --limitfreerelay option is deprecated and will be removed in a future version of the software: please remove it from your config",
         );
     }
     if cfg.no_relay_priority {
-        cfg.warnings.push(
-            "The --norelaypriority option is deprecated and will be removed in a future version of the software: please remove it from your config".to_string(),
+        notices(
+            "The --norelaypriority option is deprecated and will be removed in a future version of the software: please remove it from your config",
         );
     }
 
@@ -1710,13 +1870,22 @@ fn load_config_impl(
 
     // Append the network type to the data directory so it is
     // "namespaced" per network.
+    //
+    // Make list of old versions of testnet directories here since the
+    // network specific DataDir will be used after this.
     cfg.data_dir = clean_and_expand_path(&cfg.data_dir, &env.getenv, &env.user_home);
+    check_env_refused(env_refused)?;
+    let old_test_nets = [
+        filepath_join(&[&cfg.data_dir, "testnet"]),
+        filepath_join(&[&cfg.data_dir, "testnet2"]),
+    ];
     cfg.data_dir = filepath_join(&[&cfg.data_dir, cfg.params.params.name]);
 
     if !cfg.no_file_logging {
         // Append the network type to the log directory in the same
         // fashion.
         cfg.log_dir = clean_and_expand_path(&cfg.log_dir, &env.getenv, &env.user_home);
+        check_env_refused(env_refused)?;
         cfg.log_dir = filepath_join(&[&cfg.log_dir, cfg.params.params.name]);
 
         let mut units = 0usize;
@@ -1889,11 +2058,20 @@ fn load_config_impl(
     }
 
     // Client certificate authentication is meaningless without the
-    // certificate authorities used to verify the client chain, and
-    // dcrd fails startup when the file is missing or holds no
-    // certificate.  Reject the empty path here so the endpoint can
-    // never come up unauthenticated.
-    if cfg.rpc_auth_type == AUTH_TYPE_CLIENT_CERT && cfg.rpc_client_cas.is_empty() {
+    // certificate authorities used to verify the client chain.  dcrd
+    // fails startup when a named file is missing or holds no
+    // certificate, but it has no rule for the empty path: its
+    // `newTLSConfig` then skips client verification entirely
+    // (`server.go:3689`), and the RPC server grants admin to every
+    // clientcert session, so the endpoint would serve unauthenticated
+    // admin RPC.  Reject the empty path here -- a deliberate divergence
+    // recorded in PARITY.md -- but only when the RPC server will run:
+    // with it disabled there is no endpoint to protect, and dcrd's
+    // start is kept.
+    if !cfg.disable_rpc
+        && cfg.rpc_auth_type == AUTH_TYPE_CLIENT_CERT
+        && cfg.rpc_client_cas.is_empty()
+    {
         return Err(format!(
             "{func_name}: --authtype=clientcert requires --clientcafile"
         ));
@@ -1925,13 +2103,13 @@ fn load_config_impl(
 
     // Warn on the deprecated block sizing options.
     if cfg.block_min_size != 0 {
-        cfg.warnings.push(
-            "The --blockminsize option is deprecated and will be removed in a future version of the software: please remove it from your config".to_string(),
+        notices(
+            "The --blockminsize option is deprecated and will be removed in a future version of the software: please remove it from your config",
         );
     }
     if cfg.block_priority_size != 0 {
-        cfg.warnings.push(
-            "The --blockprioritysize option is deprecated and will be removed in a future version of the software: please remove it from your config".to_string(),
+        notices(
+            "The --blockprioritysize option is deprecated and will be removed in a future version of the software: please remove it from your config",
         );
     }
 
@@ -2100,9 +2278,7 @@ fn load_config_impl(
         .clone();
 
         if cfg.tor_isolation && (!cfg.proxy_user.is_empty() || !cfg.proxy_pass.is_empty()) {
-            cfg.warnings.push(
-                "Tor isolation set -- overriding specified proxy user credentials".to_string(),
-            );
+            notices("Tor isolation set -- overriding specified proxy user credentials");
         }
 
         cfg.dial = DialSelection::SocksProxy;
@@ -2134,10 +2310,7 @@ fn load_config_impl(
         if cfg.tor_isolation
             && (!cfg.onion_proxy_user.is_empty() || !cfg.onion_proxy_pass.is_empty())
         {
-            cfg.warnings.push(
-                "Tor isolation set -- overriding specified onionproxy user credentials "
-                    .to_string(),
-            );
+            notices("Tor isolation set -- overriding specified onionproxy user credentials ");
         }
 
         cfg.onion = OnionSelection::OnionProxy;
@@ -2151,8 +2324,16 @@ fn load_config_impl(
         cfg.onion = OnionSelection::Disabled;
     }
 
-    // The old-testnet-directory warning is a log-only concern
-    // handled by the daemon.
+    // Warn if old testnet directory is present.  dcrd logs this
+    // through `dcrdLog` (`config.go:1328-1335`), so it is queued for the
+    // daemon's log rather than printed.
+    for old_dir in &old_test_nets {
+        if file_exists(old_dir) {
+            cfg.log_warnings.push(format!(
+                "Block chain data from previous testnet found ({old_dir}) and can probably be removed."
+            ));
+        }
+    }
 
     // Parse information regarding the state of the supported
     // network interfaces.
@@ -2164,7 +2345,7 @@ fn load_config_impl(
     // Warn about a missing config file only after all other
     // configuration is done.
     if let Some(err) = config_file_error {
-        cfg.config_file_warning = Some(err);
+        cfg.log_warnings.push(err);
     }
 
     Ok((cfg, remaining_args))

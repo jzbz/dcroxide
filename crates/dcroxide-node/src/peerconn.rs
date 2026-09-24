@@ -18,14 +18,15 @@
 //! loop piece.
 
 use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dcroxide_peer::{PeerAddr, PeerEnv, new_net_address};
 use dcroxide_wire::{NetAddress, ServiceFlag};
 
-/// The daemon's [`PeerEnv`]: the wall clock, and the randomness dcrd's
-/// peer package takes from the `crypto/rand` package global, standing
-/// in for `time.Now`, `rand.Uint64` and `rand.ShuffleSlice`.
+/// The daemon's [`PeerEnv`]: the wall clock with its monotonic reading,
+/// and the randomness dcrd's peer package takes from the `crypto/rand`
+/// package global, standing in for `time.Now`, `rand.Uint64` and
+/// `rand.ShuffleSlice`.
 ///
 /// A unit struct, and deliberately so.  dcrd's peer module holds no
 /// generator either -- it imports `crypto/rand` and calls the package
@@ -50,6 +51,12 @@ impl PeerEnv for NodePeerEnv {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0)
+    }
+
+    fn now_instant(&mut self) -> Option<Instant> {
+        // The monotonic half of Go's `time.Now`, which dcrd's ping
+        // round trip and getpeerinfo's pingwait are measured on.
+        Some(Instant::now())
     }
 
     fn rand_u64(&mut self) -> u64 {
@@ -127,6 +134,18 @@ mod tests {
         let now = env.now_nanos();
         // Comfortably after the year 2020 (in unix nanoseconds).
         assert!(now > 1_577_836_800_000_000_000, "now_nanos: {now}");
+    }
+
+    /// The daemon's clock carries a monotonic reading, as Go's
+    /// `time.Now` does; the trait's default (`None`) is the scripted
+    /// clock's wall-only fallback, which would put the ping round trip
+    /// and pingwait back on the wall clock.
+    #[test]
+    fn now_instant_is_a_monotonic_reading() {
+        let mut env = NodePeerEnv::new();
+        let before = Instant::now();
+        let reading = env.now_instant().expect("the real clock is monotonic");
+        assert!(reading >= before);
     }
 
     #[test]
