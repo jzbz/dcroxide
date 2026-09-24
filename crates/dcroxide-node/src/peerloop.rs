@@ -2225,11 +2225,14 @@ mod tests {
     /// its deadline ends the connection with the stalled command.
     #[test]
     fn one_timer_thread_pings_and_detects_stalls() {
+        // The stall window is long next to the 40ms ping interval so the
+        // ping count holds on runners whose sleeps overshoot (macOS CI
+        // oversleeps 25ms ticks severalfold).
         let (conn, _remote, _client) = loopback_pair();
         let flag = conn.cancel();
         let (queue, receiver) = OutboundQueue::channel();
         let stall = Mutex::new(StallDetector::with_response_timeout(
-            Duration::from_millis(300).as_nanos() as i64,
+            Duration::from_millis(1000).as_nanos() as i64,
         ));
         let armed = stall
             .lock()
@@ -2255,7 +2258,7 @@ mod tests {
             matches!(reason, Some(StallReason::Command(_))),
             "the overdue response stalls: {reason:?}"
         );
-        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(started.elapsed() >= Duration::from_millis(1000));
         assert!(flag.is_cancelled(), "the stall tears the connection down");
         let pings = std::iter::from_fn(|| receiver.try_recv().ok())
             .filter(|msg| matches!(msg, Message::Ping(_)))
