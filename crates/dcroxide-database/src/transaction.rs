@@ -86,6 +86,48 @@ fn bucketized_key(bucket_id: [u8; 4], key: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Rows per window of a [`Bucket::for_each`] walk.  Small enough that a
+/// walk over the UTXO set holds a few hundred kilobytes instead of every
+/// key of the bucket, large enough that the per-window B-tree descent is
+/// noise beside the rows it returns.
+const WALK_WINDOW: usize = 4096;
+
+/// One window of a prefix scan (see `Transaction::scan_prefix_window`).
+#[derive(Default)]
+struct ScanWindow {
+    /// The live rows in raw key order: the raw key and its value, the
+    /// value left empty when the scan was not asked for values.
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The read error that ended the store's side of the scan early.
+    store_error: Option<Error>,
+}
+
+/// A store row as a scan holds it until the merge consumes it.
+type StoreRow = (
+    redb::AccessGuard<'static, &'static [u8]>,
+    redb::AccessGuard<'static, &'static [u8]>,
+);
+
+/// Pull the store's next row, ending the stream -- and recording why --
+/// at its first read error (see `Transaction::scan_prefix_window`).
+fn next_store_row(
+    store: &mut Option<redb::Range<'static, &'static [u8], &'static [u8]>>,
+    error: &mut Option<Error>,
+) -> Option<StoreRow> {
+    match store.as_mut()?.next() {
+        Some(Ok(row)) => Some(row),
+        Some(Err(e)) => {
+            *error = Some(crate::storage_error(e));
+            *store = None;
+            None
+        }
+        None => {
+            *store = None;
+            None
+        }
+    }
+}
+
 /// The underlying redb transaction, either read-only or read-write.
 // One value exists per transaction, so the size difference between the
 // redb read and write transaction types is irrelevant.
@@ -114,14 +156,16 @@ struct TxState {
     /// and on every step of a `for_each` or prefix scan.  The read
     /// transaction is a snapshot, so which table it resolves cannot
     /// change while it lives; opening once is the same answer for less
-    /// work.  `None` when the table is absent, which preserves the
-    /// previous "missing table reads as empty" behaviour -- but also
-    /// when `open_table` fails with `TableError::Storage`, and then
-    /// every key in the transaction reads as missing rather than just
-    /// the ones a caller asks for.  redb latches the underlying I/O
-    /// failure, so the next transaction cannot open the table either
-    /// and the resolver seam aborts; the empty view is bounded to this
-    /// transaction rather than silently permanent.
+    /// work.  `None` only when the table does not exist, which keeps
+    /// "missing table reads as empty".  Any other `open_table` failure
+    /// fails the `begin` instead (see [`Transaction::new`]): mapping it
+    /// to `None` made every key of the transaction read as missing, and
+    /// redb does not stop that at one transaction.  `begin_read` takes
+    /// its snapshot from memory and a read-cache hit skips redb's
+    /// failure check (redb-4.3.0 `page_manager.rs:1379-1382`,
+    /// `cached_file.rs:651-659`), so after an I/O error the master
+    /// table root keeps opening from cache while every uncached page
+    /// returns `PreviousIo`, for the rest of the process.
     table: Option<redb::ReadOnlyTable<&'static [u8], &'static [u8]>>,
     /// Blocks buffered by `store_block` to be written on commit, plus
     /// an index over them by hash (dcrd `pendingBlocks` /
@@ -152,26 +196,34 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// Wrap the seed `begin_seed` acquired, opening the metadata table
+    /// once for the transaction's life.
+    ///
+    /// Fails when the table cannot be opened for any reason but its
+    /// absence, the way ffldb's `begin` fails when its cache cannot take
+    /// a leveldb snapshot (`ffldb/db.go` `begin`, `dbcache.go`
+    /// `Snapshot`).  The writer semaphore a writable seed carries is
+    /// released first, as `begin` unlocks its write lock.
     pub(crate) fn new(
         db: Arc<DbInner>,
         kv: KvTxSeed,
         cache_snap: Arc<crate::dbcache::CacheSnapshot>,
         managed: bool,
-    ) -> Transaction {
+    ) -> Result<Transaction, Error> {
         let (kv, writable) = match kv {
             KvTxSeed::Read(t) => (KvTx::Read(t), false),
             KvTxSeed::Write(t) => (KvTx::Write(t), true),
         };
         // Both variants hold a redb read transaction, so this is the
         // owned `ReadOnlyTable` and can outlive the call.
-        let table = match &kv {
-            KvTx::Read(t) | KvTx::Write(t) => t.open_table(METADATA_TABLE).ok(),
+        let opened = match &kv {
+            KvTx::Read(t) | KvTx::Write(t) => t.open_table(METADATA_TABLE),
         };
-        Transaction {
+        let tx = Transaction {
             db,
             state: RefCell::new(TxState {
                 kv: Some(kv),
-                table,
+                table: None,
                 pending_blocks: Vec::new(),
                 pending_index: HashMap::new(),
                 pending_keys: std::collections::BTreeMap::new(),
@@ -180,7 +232,16 @@ impl Transaction {
             }),
             writable,
             managed,
+        };
+        match opened {
+            Ok(table) => tx.state.borrow_mut().table = Some(table),
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => {
+                tx.close();
+                return Err(crate::storage_error(e));
+            }
         }
+        Ok(tx)
     }
 
     /// Error when the transaction has already been closed (dcrd
@@ -205,52 +266,103 @@ impl Transaction {
     // Raw keyspace helpers (dcrd transaction fetchKey/putKey/deleteKey).
     // ------------------------------------------------------------------
 
+    /// The layered view of one raw key, answering `None` for a store
+    /// read error as well as for absence -- exactly what ffldb's
+    /// `dbCacheSnapshot.Get` does with a leveldb error
+    /// (`ffldb/dbcache.go`), so every ffldb-layout read keeps dcrd's
+    /// answer.  Reads that port a backend which does keep the two apart
+    /// use [`Self::try_fetch_raw`].
     pub(crate) fn fetch_raw(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.try_fetch_raw(key).unwrap_or(None)
+    }
+
+    /// [`Self::fetch_raw`] with a store read error returned rather than
+    /// read as absence.
+    pub(crate) fn try_fetch_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let state = self.state.borrow();
         // The layered view (dcrd `fetchKey`): this transaction's
         // pending changes, then the cache snapshot, then the store.
         if state.pending_removes.contains(key) {
-            return None;
+            return Ok(None);
         }
         if let Some(v) = state.pending_keys.get(key) {
-            return Some(v.clone());
+            return Ok(Some(v.clone()));
         }
+        Self::fetch_committed(&state, key)
+    }
+
+    /// The key's value beneath this transaction's pending changes: the
+    /// cache snapshot, then the store.
+    fn fetch_committed(state: &TxState, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         // A cached entry answers the lookup whether it holds a value or
         // a pending deletion (`None`); only a key no layer knows falls
         // through to the store.
         if let Some(entry) = state.cache_snap.get(key) {
-            return entry.clone();
+            return Ok(entry.clone());
         }
         // `kv` is still consulted so a closed transaction reads as
         // empty, exactly as before; the table itself is the one opened
         // when the transaction began.
-        state.kv.as_ref()?;
-        let table = state.table.as_ref()?;
-        table.get(key).ok()?.map(|g| g.value().to_vec())
+        if state.kv.is_none() {
+            return Ok(None);
+        }
+        let Some(table) = state.table.as_ref() else {
+            return Ok(None);
+        };
+        Ok(table
+            .get(key)
+            .map_err(crate::storage_error)?
+            .map(|g| g.value().to_vec()))
     }
 
     fn has_raw(&self, key: &[u8]) -> bool {
         self.fetch_raw(key).is_some()
     }
 
-    pub(crate) fn put_raw(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
+    /// Stage a put.  The key is taken owned, as every caller has just
+    /// built it, so it reaches the pending set -- and from there the
+    /// cache overlay -- without another copy.
+    pub(crate) fn put_raw(&self, key: Vec<u8>, value: &[u8]) -> Result<(), Error> {
         let mut state = self.state.borrow_mut();
         if state.kv.is_none() || !self.writable {
             return Err(db_error(ErrorKind::TxNotWritable, "tx not writable"));
         }
-        state.pending_removes.remove(key);
-        state.pending_keys.insert(key.to_vec(), value.to_vec());
+        state.pending_removes.remove(&key);
+        state.pending_keys.insert(key, value.to_vec());
         Ok(())
     }
 
-    pub(crate) fn delete_raw(&self, key: &[u8]) -> Result<(), Error> {
+    /// Stage a delete, taking the key owned as [`Self::put_raw`] does.
+    pub(crate) fn delete_raw(&self, key: Vec<u8>) -> Result<(), Error> {
         let mut state = self.state.borrow_mut();
         if state.kv.is_none() || !self.writable {
             return Err(db_error(ErrorKind::TxNotWritable, "tx not writable"));
         }
-        state.pending_keys.remove(key);
-        state.pending_removes.insert(key.to_vec());
+        state.pending_keys.remove(&key);
+        state.pending_removes.insert(key);
         Ok(())
+    }
+
+    /// [`Self::delete_raw`], also reporting what the key read as just
+    /// before the delete whenever this transaction's pending changes
+    /// alone answer that: `Some(value)`, or `Some(None)` for a key they
+    /// had already deleted.  `None` means the answer lies beneath them,
+    /// in the cache snapshot or the store, neither of which the delete
+    /// changes -- so it can still be read there later, and only if
+    /// someone asks.
+    fn delete_raw_reporting(&self, key: &[u8]) -> Result<Option<Option<Vec<u8>>>, Error> {
+        let mut state = self.state.borrow_mut();
+        if state.kv.is_none() || !self.writable {
+            return Err(db_error(ErrorKind::TxNotWritable, "tx not writable"));
+        }
+        // `put_raw` and `delete_raw` keep the two pending sets disjoint.
+        let prior = match state.pending_keys.remove(key) {
+            Some(value) => Some(Some(value)),
+            None if state.pending_removes.contains(key) => Some(None),
+            None => None,
+        };
+        state.pending_removes.insert(key.to_vec());
+        Ok(prior)
     }
 
     /// The exclusive upper bound of a prefix scan: the prefix with its
@@ -279,153 +391,170 @@ impl Transaction {
 
     /// [`Self::scan_prefix_keys`] bounded to at most `limit` keys
     /// starting strictly after `after`.
-    ///
-    /// The whole-prefix form materializes every key of the prefix at
-    /// once, which is what made dcrd's 2,000,000-key incremental drop
-    /// quadratic here: dcrd's cursor is a pair of lazy merged
-    /// iterators, so its batching bounds memory, while rebuilding this
-    /// one per batch re-read the entire bucket every time --
-    /// 66,494,886 rows for mainnet's `existsaddridx`.
-    ///
-    /// The bound has two cases, and conflating them loses keys.  When
-    /// the store range yields a full `limit`, the window is
-    /// store-bounded: the overlay may only contribute inside the span
-    /// the store covered, because overlay keys past its last key belong
-    /// to the next window.  When the store range yields fewer -- the
-    /// store portion of the prefix is exhausted -- there is no next
-    /// window to leave them to, so the rest of the overlay is merged
-    /// unbounded.  Bounding that case by the last store key would drop
-    /// every live key that exists only in the cache and sorts after it,
-    /// and the caller, seeing a short batch, would stop.
-    ///
-    /// Memory is O(`limit`) in the first case.  In the second it is
-    /// bounded by the cache ceiling rather than by `limit`, which is
-    /// finite but not the same claim.
     fn scan_prefix_keys_window(
         &self,
         prefix: &[u8],
         after: Option<&[u8]>,
         limit: Option<usize>,
     ) -> Vec<Vec<u8>> {
-        let end = Self::prefix_upper_bound(prefix);
-        let bounded = end.is_some();
-        let end = end.unwrap_or_default();
-        // A resume key from below the prefix would start the overlay
-        // merge outside it, where the first key ends the walk -- so the
-        // window would return a neighbouring bucket's rows and none of
-        // its own.  The whole-prefix range this replaced supplied that
-        // bound implicitly.
-        let after = after.filter(|a| *a >= prefix);
+        self.scan_prefix_window(prefix, after, limit, false, true)
+            .rows
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    }
 
-        // Collect straight into the set the layered merge below needs.
-        // The set itself is load-bearing — it dedups the stored keys
-        // against the cache snapshot and this transaction's pending
-        // writes, and keeps them in the byte order ffldb's cursor
-        // promises — but the intermediate `Vec` it used to be built
-        // from was not, and cost one extra allocation per scan.
+    /// The live rows beginning with the prefix, at most `limit` of them
+    /// and strictly after `after`, in raw byte order -- with their
+    /// values when `values` is set and with empty ones otherwise.
+    ///
+    /// A merge join over the sources a key can come from, which is what
+    /// ffldb's cursor is: the store's range, the cache snapshot's merged
+    /// layers (dcrd's cached treaps), and this transaction's pending
+    /// puts, with its pending deletions as a mask.  A newer source
+    /// shadows an older one for the same key, and a pending or cached
+    /// deletion hides it.  Each source is an ordered stream pulled only
+    /// as far as the window reaches, so a window costs O(`limit`)
+    /// however much of the prefix lies past it and however its keys are
+    /// split between the store and the overlay.
+    ///
+    /// Two costs this replaced are worth knowing.  Materializing a whole
+    /// prefix per batch made dcrd's 2,000,000-key incremental drop
+    /// quadratic -- 66,494,886 rows for mainnet's `existsaddridx` --
+    /// because dcrd's cursor is lazy and restarting it is free.  And the
+    /// store scan kept only keys, so every walk then looked each value
+    /// up a second time, through the pending sets, the overlay and a
+    /// fresh B-tree descent, where ffldb's `ForEach` reads it from the
+    /// iterator.
+    ///
+    /// The store stream ends at its first read error, which comes back
+    /// in [`ScanWindow::store_error`] while the overlay and pending
+    /// streams carry on: a goleveldb iterator goes invalid on an error
+    /// and ffldb's merged cursor treats that as exhausted, never
+    /// checking `Error()`.  redb's range iterator instead repeats
+    /// `PreviousIo` forever once it has failed (redb-4.3.0
+    /// `btree_cursor_range.rs:208-216`), so a scan that skipped errors
+    /// -- as a `flatten()` here once did -- spun forever.
+    ///
+    /// `read_store` false leaves the store out entirely, for a walk
+    /// whose store stream already ended in an earlier window.
+    fn scan_prefix_window(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: Option<usize>,
+        values: bool,
+        read_store: bool,
+    ) -> ScanWindow {
+        use std::ops::Bound;
+
+        let end = Self::prefix_upper_bound(prefix);
+        // A resume key from below the prefix would start the walk
+        // outside it, where the first key ends it -- so the window would
+        // return a neighbouring bucket's rows and none of its own.
+        let after = after.filter(|a| *a >= prefix);
         let want = limit.unwrap_or(usize::MAX);
+        let mut out = ScanWindow::default();
+        // Nothing of the prefix sorts after a resume key at or past its
+        // end (a nested-bucket row handed back to the key-row scan), and
+        // the inverted range would panic in the `BTreeMap` streams.
+        if want == 0 || matches!((after, end.as_deref()), (Some(a), Some(e)) if a >= e) {
+            return out;
+        }
         let state = self.state.borrow();
         if state.kv.is_none() {
-            return Vec::new();
+            return out;
         }
 
-        let mut out: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
-        let mut cursor_after: Option<Vec<u8>> = after.map(<[u8]>::to_vec);
+        let lower = match after {
+            Some(a) => Bound::Excluded(a),
+            None => Bound::Included(prefix),
+        };
+        let upper = match end.as_deref() {
+            Some(e) => Bound::Excluded(e),
+            None => Bound::Unbounded,
+        };
 
-        loop {
-            let remaining = want.saturating_sub(out.len());
-            if remaining == 0 {
+        let mut store = match (read_store, state.table.as_ref()) {
+            (true, Some(table)) => match table.range::<&[u8]>((lower, upper)) {
+                Ok(range) => Some(range),
+                Err(e) => {
+                    out.store_error = Some(crate::storage_error(e));
+                    None
+                }
+            },
+            _ => None,
+        };
+        let mut store_head = next_store_row(&mut store, &mut out.store_error);
+        let mut overlay = state
+            .cache_snap
+            .merged_from(after.unwrap_or(prefix))
+            .skip_while(|&(key, _)| after.is_some_and(|a| key <= a))
+            .take_while(|&(key, _)| key.starts_with(prefix))
+            .peekable();
+        let mut pending = state
+            .pending_keys
+            .range::<[u8], _>((lower, upper))
+            .peekable();
+        let mut removed = state
+            .pending_removes
+            .range::<[u8], _>((lower, upper))
+            .peekable();
+        let keep = |v: &[u8]| if values { v.to_vec() } else { Vec::new() };
+
+        while out.rows.len() < want {
+            let store_key = store_head.as_ref().map(|(key, _)| key.value());
+            let overlay_key = overlay.peek().map(|&(key, _)| key);
+            let pending_key = pending.peek().map(|&(key, _)| key.as_slice());
+            let Some(key) = [store_key, overlay_key, pending_key]
+                .into_iter()
+                .flatten()
+                .min()
+                .map(<[u8]>::to_vec)
+            else {
                 break;
-            }
-
-            // `after` is exclusive, so a resumed window never re-reads
-            // its own last key.
-            let lower: std::ops::Bound<&[u8]> = match cursor_after.as_deref() {
-                Some(a) => std::ops::Bound::Excluded(a),
-                None => std::ops::Bound::Included(prefix),
             };
-            let upper: std::ops::Bound<&[u8]> = if bounded {
-                std::ops::Bound::Excluded(end.as_slice())
+            let in_store = store_key == Some(key.as_slice());
+            let in_overlay = overlay_key == Some(key.as_slice());
+            let in_pending = pending_key == Some(key.as_slice());
+
+            let from_pending = if in_pending {
+                pending.next().map(|(_, v)| v)
             } else {
-                std::ops::Bound::Unbounded
-            };
-            // Collect straight into the set the layered merge needs.
-            // The set is load-bearing — it dedups the stored keys
-            // against the cache snapshot and this transaction's pending
-            // writes, and keeps them in the byte order ffldb's cursor
-            // promises.
-            let mut window: std::collections::BTreeSet<Vec<u8>> = state
-                .table
-                .as_ref()
-                .and_then(|table| {
-                    table.range::<&[u8]>((lower, upper)).ok().map(|iter| {
-                        iter.flatten()
-                            .map(|(k, _)| k.value().to_vec())
-                            .take(remaining)
-                            .collect()
-                    })
-                })
-                .unwrap_or_default();
-
-            // A full store range means more store keys may follow, so
-            // the overlay contributes only within the span just
-            // covered.  A short one means the store is exhausted for
-            // this prefix, and the remaining overlay belongs to this
-            // window entirely.
-            let store_exhausted = window.len() < remaining;
-            let span_end = if store_exhausted {
                 None
+            };
+            let from_overlay = if in_overlay {
+                overlay.next().map(|(_, entry)| entry)
             } else {
-                window.last().cloned()
+                None
             };
-
-            state.cache_snap.merge_prefix_keys_window(
-                prefix,
-                cursor_after.as_deref(),
-                span_end.as_deref(),
-                &mut window,
-            );
-
-            let in_window = |key: &[u8]| {
-                key.starts_with(prefix)
-                    && cursor_after.as_deref().is_none_or(|a| key > a)
-                    && span_end.as_deref().is_none_or(|u| key <= u)
+            let from_store = if in_store {
+                let row = store_head.take();
+                store_head = next_store_row(&mut store, &mut out.store_error);
+                row
+            } else {
+                None
             };
-            let from = cursor_after.clone().unwrap_or_else(|| prefix.to_vec());
-            for key in state.pending_removes.range(from.clone()..) {
-                if !key.starts_with(prefix) {
-                    break;
-                }
-                if in_window(key) {
-                    window.remove(key);
-                }
-            }
-            for key in state
-                .pending_keys
-                .range::<Vec<u8>, _>(from..)
-                .map(|(k, _)| k)
-            {
-                if !key.starts_with(prefix) {
-                    break;
-                }
-                if in_window(key) {
-                    window.insert(key.clone());
-                }
-            }
+            while removed.next_if(|k| k.as_slice() < key.as_slice()).is_some() {}
+            let masked = removed.peek().is_some_and(|k| k.as_slice() == key);
 
-            out.append(&mut window);
-
-            // Masking can leave a store-bounded window short of the
-            // limit.  Advancing past the span and pulling again is what
-            // keeps a batch full: returning short would tell the caller
-            // the prefix is finished when it is not.
-            match span_end {
-                Some(next) if !store_exhausted => cursor_after = Some(next),
-                _ => break,
+            // Newest first: this transaction's puts, then its deletions,
+            // then the overlay (a cached deletion included), then the
+            // store.
+            let value = if let Some(v) = from_pending {
+                Some(keep(v))
+            } else if masked {
+                None
+            } else if let Some(entry) = from_overlay {
+                entry.as_deref().map(keep)
+            } else {
+                from_store.map(|(_, v)| keep(v.value()))
+            };
+            if let Some(value) = value {
+                out.rows.push((key, value));
             }
         }
-
-        out.into_iter().take(want).collect()
+        out
     }
 
     /// Allocate the next bucket ID (dcrd `nextBucketID`).
@@ -442,7 +571,7 @@ impl Transaction {
             .checked_add(1)
             .ok_or_else(|| db_error(ErrorKind::DriverSpecific, "bucket IDs exhausted"))?;
         let next_bytes = next.to_be_bytes();
-        self.put_raw(CUR_BUCKET_ID_KEY, &next_bytes)?;
+        self.put_raw(CUR_BUCKET_ID_KEY.to_vec(), &next_bytes)?;
         Ok(next_bytes)
     }
 
@@ -473,12 +602,54 @@ impl Transaction {
     /// Store the provided block (dcrd `StoreBlock`).  The block is
     /// buffered and written to the flat files on commit.
     pub fn store_block(&self, block: &dcroxide_wire::MsgBlock) -> Result<(), Error> {
-        self.store_block_raw(&block.header.block_hash(), &block.serialize())
+        // A serialization is a whole header by construction and the hash
+        // is that header's, so nothing needs checking; the bytes are
+        // moved into the pending set rather than copied a second time.
+        self.store_block_with(&block.header.block_hash(), || Ok(block.serialize()))
     }
 
     /// Store a block given its hash and raw serialized bytes; the raw
     /// entry point used by bulk import.
-    pub fn store_block_raw(&self, hash: &Hash, raw: &[u8]) -> Result<(), Error> {
+    ///
+    /// dcrd's `StoreBlock` takes a block and asks it for both, so it
+    /// cannot be handed a mismatched pair; this can.  The bytes must
+    /// hold at least a whole header, because commit and
+    /// `fetch_block_header` slice one out of them, and the hash must be
+    /// that header's, because it keys the block index row.  Either
+    /// mistake fails with [`ErrorKind::DriverSpecific`] -- the kind
+    /// `StoreBlock` gives a block whose bytes it cannot get -- rather
+    /// than panicking at commit or filing the block under another hash.
+    pub fn store_block_raw(&self, hash: &Hash, raw: Vec<u8>) -> Result<(), Error> {
+        self.store_block_with(hash, || {
+            if raw.len() < BLOCK_HDR_SIZE {
+                return Err(db_error(
+                    ErrorKind::DriverSpecific,
+                    format!(
+                        "block {hash} is {} bytes, shorter than its {BLOCK_HDR_SIZE}-byte header",
+                        raw.len()
+                    ),
+                ));
+            }
+            let header_hash = dcroxide_chainhash::hash_h(&raw[..BLOCK_HDR_SIZE]);
+            if header_hash != *hash {
+                return Err(db_error(
+                    ErrorKind::DriverSpecific,
+                    format!("block {hash} was given bytes whose header hashes to {header_hash}"),
+                ));
+            }
+            Ok(raw)
+        })
+    }
+
+    /// The body of [`Self::store_block`] and [`Self::store_block_raw`],
+    /// in dcrd `StoreBlock`'s order: the transaction checks and the
+    /// existence check, and only then the block's bytes (dcrd
+    /// `block.Bytes()`, whose failure is `ErrDriverSpecific`).
+    fn store_block_with(
+        &self,
+        hash: &Hash,
+        bytes: impl FnOnce() -> Result<Vec<u8>, Error>,
+    ) -> Result<(), Error> {
         self.check_closed()?;
         if !self.writable {
             return Err(db_error(
@@ -494,10 +665,11 @@ impl Transaction {
                 format!("block {hash} already exists"),
             ));
         }
+        let raw = bytes()?;
 
         let mut state = self.state.borrow_mut();
         let idx = state.pending_blocks.len();
-        state.pending_blocks.push((*hash, raw.to_vec()));
+        state.pending_blocks.push((*hash, raw));
         state.pending_index.insert(hash.0, idx);
         Ok(())
     }
@@ -561,11 +733,16 @@ impl Transaction {
         }
         let row = self.fetch_block_row(hash)?;
         let loc = BlockLocation::deserialize(&row[..BLOCK_LOC_SIZE]);
-        self.db
+        // Only the handle is taken under the store lock; the read runs
+        // after it is released, as dcrd's `ReadAt` runs under the file's
+        // read lock alone.
+        let reader = self
+            .db
             .block_store
             .lock()
             .expect("store lock")
-            .read_block(loc)
+            .reader(loc.block_file_num)?;
+        reader.read_block(loc)
     }
 
     /// The raw serialized bytes for the blocks with the given hashes
@@ -625,11 +802,13 @@ impl Transaction {
             }
         }
 
-        self.db
+        let reader = self
+            .db
             .block_store
             .lock()
             .expect("store lock")
-            .read_block_region(loc, region.offset, region.len)
+            .reader(loc.block_file_num)?;
+        reader.read_block_region(loc, region.offset, region.len)
     }
 
     /// The raw bytes of the given block regions (dcrd
@@ -687,6 +866,16 @@ impl Transaction {
             ));
         }
 
+        // Nothing is written on a latched store -- not the block files,
+        // not a flush.  `begin` re-checks the latch once it holds the
+        // writer semaphore and only a semaphore holder can set it, so
+        // this cannot fire today; it is here so the latch does not rest
+        // on that ordering alone.
+        if let Err(e) = self.db.check_writable() {
+            self.close();
+            return Err(e);
+        }
+
         // Write the pending blocks to the flat files first, recording
         // their locations, then stage the block index rows and the
         // updated write cursor into the metadata transaction, and only
@@ -716,19 +905,23 @@ impl Transaction {
                     let mut row = Vec::with_capacity(BLOCK_LOC_SIZE + BLOCK_HDR_SIZE);
                     row.extend_from_slice(&loc.serialize());
                     row.extend_from_slice(&bytes[..BLOCK_HDR_SIZE]);
-                    self.put_raw(&bucketized_key(BLOCK_IDX_BUCKET_ID, &hash.0), &row)?;
+                    self.put_raw(bucketized_key(BLOCK_IDX_BUCKET_ID, &hash.0), &row)?;
                 }
 
                 // Stage the new write cursor position.
                 let row = serialize_write_row(store.write_file_num, store.write_offset);
-                self.put_raw(&bucketized_key(METADATA_BUCKET_ID, WRITE_LOC_KEY), &row)?;
+                self.put_raw(bucketized_key(METADATA_BUCKET_ID, WRITE_LOC_KEY), &row)?;
             }
 
             Ok(())
         })();
 
         if result.is_err() {
-            // Roll the flat files back to their pre-transaction state.
+            // Roll the flat files back to their pre-transaction state
+            // (dcrd's `rollback` closure over `handleRollback`).  Its
+            // result is only for tests: like `handleRollback` it logs
+            // each failure as a `ROLLBACK:` warning and puts the write
+            // cursor back whatever fails.
             let _ = self
                 .db
                 .block_store
@@ -743,40 +936,21 @@ impl Transaction {
         // flush the accumulated window FIRST — a flush failure fails
         // the commit with this transaction unapplied (the files roll
         // back below) — and only then publish this transaction's
-        // changes to the cache.
-        // The capture and the retirement take the cache lock; the commit
-        // between them does not, so readers are not held for its fsync.
-        // This transaction holds the writer semaphore throughout, which
-        // is what keeps two flushes from overlapping.
-        let flush_result = {
-            let batch = {
-                let mut cache = self.db.cache.lock().expect("cache lock poisoned");
-                cache.needs_flush().then(|| cache.begin_flush())
-            };
-            match batch {
-                None => Ok(()),
-                Some(batch) => {
-                    let (outcome, failure) = match crate::dbcache::DbCache::run_flush(
-                        &batch,
-                        &self.db.kv,
-                        &self.db.block_store,
-                    ) {
-                        Ok(outcome) => (Some(outcome), None),
-                        Err(e) => (None, Some(e)),
-                    };
-                    self.db
-                        .cache
-                        .lock()
-                        .expect("cache lock poisoned")
-                        .finish_flush(batch, outcome);
-                    match failure {
-                        Some(e) => Err(e),
-                        None => Ok(()),
-                    }
-                }
-            }
-        };
-        if let Err(e) = flush_result {
+        // changes to the cache.  The flush is `Database::flush`'s own
+        // helper, so the capture, the unlocked commit and the
+        // retirement cannot drift between the two; this transaction
+        // holds the writer semaphore throughout, which is what keeps two
+        // flushes from overlapping.
+        if let Err(e) = crate::flush_locked(&self.db, true) {
+            // Already latched by `flush_locked`: the dirty set is still
+            // in the cache, so without the latch the next commit retries
+            // it and can report success after this failure (see
+            // DbInner::mark_fatal).  It has to be latched BEFORE `close`
+            // releases the writer semaphore, which wakes the next queued
+            // writer: latching after it let that writer in unlatched, to
+            // re-run this flush -- and a block file fsync that failed
+            // once can succeed on the retry without the bytes having
+            // reached disk.
             let _ = self
                 .db
                 .block_store
@@ -784,10 +958,7 @@ impl Transaction {
                 .expect("store lock")
                 .rollback_to(rollback_pos.0, rollback_pos.1);
             self.close();
-            // Latch the store: the dirty set is still in the cache, so
-            // without this the next commit retries it and can report
-            // success after this failure. See DbInner::mark_fatal.
-            return Err(self.db.mark_fatal(e));
+            return Err(e);
         }
 
         let (puts, removes) = {
@@ -902,7 +1073,7 @@ impl<'tx> Bucket<'tx> {
         };
 
         // Add the new bucket to the bucket index.
-        self.tx.put_raw(&bidx_key, &child_id)?;
+        self.tx.put_raw(bidx_key, &child_id)?;
         Ok(Bucket {
             tx: self.tx,
             id: child_id,
@@ -950,39 +1121,97 @@ impl<'tx> Bucket<'tx> {
         while let Some(child_id) = child_ids.pop() {
             // Delete all keys in the nested bucket.
             for raw_key in self.tx.scan_prefix_keys(&child_id) {
-                self.tx.delete_raw(&raw_key)?;
+                self.tx.delete_raw(raw_key)?;
             }
 
             // Iterate through all nested buckets, pushing their IDs
-            // for the next iteration and removing their index rows.
+            // for the next iteration and removing their index rows.  The
+            // ID is the row's value, taken from the scan as dcrd takes
+            // it from its cursor (`rawValue`).
             let mut prefix = Vec::with_capacity(BUCKET_INDEX_PREFIX.len() + 4);
             prefix.extend_from_slice(BUCKET_INDEX_PREFIX);
             prefix.extend_from_slice(&child_id);
-            for raw_key in self.tx.scan_prefix_keys(&prefix) {
-                if let Some(grandchild) = self.tx.fetch_raw(&raw_key) {
-                    child_ids.push(grandchild);
-                }
-                self.tx.delete_raw(&raw_key)?;
+            let rows = self
+                .tx
+                .scan_prefix_window(&prefix, None, None, true, true)
+                .rows;
+            for (raw_key, grandchild) in rows {
+                child_ids.push(grandchild);
+                self.tx.delete_raw(raw_key)?;
             }
         }
 
         // Remove the nested bucket from the bucket index.
-        self.tx.delete_raw(&bidx_key)
+        self.tx.delete_raw(bidx_key)
     }
 
     /// Invoke the function with every key/value pair in the bucket, not
     /// including nested buckets; the first error from the callback is
     /// returned (dcrd `ForEach`).
+    ///
+    /// A store read error ends the walk where it happened, as a
+    /// goleveldb iterator error ends ffldb's cursor, which `ForEach`
+    /// never asks about; see [`Self::try_for_each`] for the walk that
+    /// reports it.
     pub fn for_each(
         &self,
+        fn_: impl FnMut(&[u8], &[u8]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.walk(false, fn_)
+    }
+
+    /// [`Self::for_each`], but a store read error fails the walk instead
+    /// of ending it, the way dcrd's UTXO backend checks `iter.Error()`
+    /// after its walk (`levelDbUtxoBackend.FetchStats`,
+    /// `internal/blockchain/utxobackend.go:577-579`).
+    pub fn try_for_each(
+        &self,
+        fn_: impl FnMut(&[u8], &[u8]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        self.walk(true, fn_)
+    }
+
+    /// The body of [`Self::for_each`] and [`Self::try_for_each`].
+    ///
+    /// Streamed in windows of [`WALK_WINDOW`] rows: each window is read
+    /// with its values in one pass and handed out before the next is
+    /// read, so the walk holds one window rather than every key of the
+    /// bucket, and reads each value once rather than scanning keys and
+    /// then looking every value up again.  No borrow of the transaction
+    /// is held while `fn_` runs.
+    fn walk(
+        &self,
+        strict: bool,
         mut fn_: impl FnMut(&[u8], &[u8]) -> Result<(), Error>,
     ) -> Result<(), Error> {
         self.tx.check_closed()?;
-        for raw_key in self.tx.scan_prefix_keys(&self.id) {
-            let value = self.tx.fetch_raw(&raw_key).unwrap_or_default();
-            fn_(&raw_key[4..], &value)?;
+        let mut after: Option<Vec<u8>> = None;
+        let mut read_store = true;
+        loop {
+            let window = self.tx.scan_prefix_window(
+                &self.id,
+                after.as_deref(),
+                Some(WALK_WINDOW),
+                true,
+                read_store,
+            );
+            if let Some(e) = window.store_error {
+                if strict {
+                    return Err(e);
+                }
+                // The store stream stays ended for the rest of the walk,
+                // as the invalidated iterator does; the overlay goes on.
+                read_store = false;
+            }
+            let full = window.rows.len() == WALK_WINDOW;
+            for (raw_key, value) in &window.rows {
+                fn_(&raw_key[4..], value)?;
+            }
+            if !full {
+                return Ok(());
+            }
+            after = window.rows.into_iter().next_back().map(|(key, _)| key);
         }
-        Ok(())
     }
 
     /// Invoke the function with the key of every nested bucket in the
@@ -1110,17 +1339,39 @@ impl<'tx> Bucket<'tx> {
         if key.is_empty() {
             return Err(db_error(ErrorKind::KeyRequired, "put requires a key"));
         }
-        self.tx.put_raw(&bucketized_key(self.id, key), value)
+        self.tx.put_raw(bucketized_key(self.id, key), value)
     }
 
     /// The value for the given key, or `None` if it does not exist;
     /// keys that exist with no value return an empty vector (dcrd
     /// `Get`).
+    ///
+    /// A store read error also returns `None`, as ffldb's does
+    /// (`dbCacheSnapshot.Get` discards the leveldb error); see
+    /// [`Self::try_get`] for the read that reports it.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         if self.tx.check_closed().is_err() || key.is_empty() {
             return None;
         }
         self.tx.fetch_raw(&bucketized_key(self.id, key))
+    }
+
+    /// [`Self::get`], but a store read error is returned rather than
+    /// read as a missing key.
+    ///
+    /// For the rows dcrd keeps in its UTXO backend, whose `Get` returns
+    /// `nil` only for `leveldb.ErrNotFound` and propagates every other
+    /// error (`internal/blockchain/utxobackend.go:392-401`).  This port
+    /// stores those rows in the ffldb-layout store, where [`Self::get`]
+    /// keeps ffldb's error-as-absence answer -- which, on the UTXO set,
+    /// turns a failing disk into a missing output and a valid block into
+    /// `ErrMissingTxOut`.
+    pub fn try_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        self.tx.check_closed()?;
+        if key.is_empty() {
+            return Ok(None);
+        }
+        self.tx.try_fetch_raw(&bucketized_key(self.id, key))
     }
 
     /// Remove the specified key from the bucket; deleting a key that
@@ -1139,7 +1390,7 @@ impl<'tx> Bucket<'tx> {
         if key.is_empty() {
             return Ok(());
         }
-        self.tx.delete_raw(&bucketized_key(self.id, key))
+        self.tx.delete_raw(bucketized_key(self.id, key))
     }
 }
 
@@ -1168,7 +1419,21 @@ pub struct Cursor<'tx> {
     /// The key/value pair parked by `delete` until the next movement
     /// (dcrd's cursor keeps returning the deleted pair from its
     /// parked iterators until it is repositioned).
-    parked: Option<(Vec<u8>, Option<Vec<u8>>)>,
+    parked: Option<(Vec<u8>, ParkedValue)>,
+}
+
+/// The value half of a pair [`Cursor::delete`] parked.
+enum ParkedValue {
+    /// What the transaction's pending changes held for the key: its
+    /// pending value, or `None` when they had already deleted it.
+    Pending(Option<Vec<u8>>),
+    /// The pending changes did not hold the key, so its value is the
+    /// one beneath them -- in the cache snapshot or the store, which the
+    /// delete leaves alone -- and is read from there only if
+    /// [`Cursor::value`] asks.  dcrd's `Cursor.Delete` reads nothing;
+    /// reading the value eagerly here cost a B-tree lookup per deleted
+    /// row, 66,494,886 of them for a drop of mainnet's `existsaddridx`.
+    Committed,
 }
 
 impl Cursor<'_> {
@@ -1247,8 +1512,12 @@ impl Cursor<'_> {
         let raw = raw.to_vec();
         // Park the deleted pair: dcrd's cursor keeps returning it
         // from its iterators until the cursor moves.
-        self.parked = Some((raw.clone(), self.tx.fetch_raw(&raw)));
-        self.tx.delete_raw(&raw)
+        let parked = match self.tx.delete_raw_reporting(&raw)? {
+            Some(pending) => ParkedValue::Pending(pending),
+            None => ParkedValue::Committed,
+        };
+        self.parked = Some((raw, parked));
+        Ok(())
     }
 
     /// Position at the first entry; returns whether it exists (dcrd
@@ -1394,7 +1663,12 @@ impl Cursor<'_> {
             if k.starts_with(BUCKET_INDEX_PREFIX) {
                 return None;
             }
-            return v.clone();
+            return match v {
+                ParkedValue::Pending(v) => v.clone(),
+                ParkedValue::Committed => {
+                    Transaction::fetch_committed(&self.tx.state.borrow(), k).unwrap_or(None)
+                }
+            };
         }
         let raw = self.current_raw()?;
         if raw.starts_with(BUCKET_INDEX_PREFIX) {

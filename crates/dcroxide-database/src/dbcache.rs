@@ -36,7 +36,7 @@
 //! iteration merges the layers with [`LayerMerge`], where a newer
 //! layer's entry shadows every older one for the same key.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,26 @@ pub(crate) const DEFAULT_FLUSH_SECS: u64 = 300;
 /// `None` for a pending deletion of a stored key.
 pub(crate) type CacheLayer = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
+/// The bytes each overlay entry is counted at beyond its key and value
+/// (dcrd treap `nodeFieldsSize`, `internal/treap/common.go:22`), for
+/// live values and pending deletions alike: dcrd's `nodeSize` is this
+/// plus the key and value lengths, and `needsFlush` gates on the sum.
+///
+/// dcrd sizes it from a treap node's fields, but it also fits this
+/// port's own per-entry cost: 200,000 random-keyed `CacheLayer`
+/// entries hold about 74 bytes each beyond their keys and values
+/// (bytes requested from the allocator, before its own overhead), for
+/// live values and deletions alike.  Counting key and value bytes alone
+/// put the figure 2-4x under the memory held for the small rows that
+/// dominate this store: an `existsaddridx` row is a 25-byte key and an
+/// empty value.
+const NODE_FIELDS_SIZE: u64 = 72;
+
+/// The size one entry is counted at (dcrd treap `nodeSize`).
+fn node_size(key_len: usize, value: Option<&[u8]>) -> u64 {
+    NODE_FIELDS_SIZE + key_len as u64 + value.map_or(0, |v| v.len() as u64)
+}
+
 /// An overlay capture handed to [`DbCache::run_flush`], which persists it
 /// with no lock held.
 ///
@@ -69,6 +89,9 @@ pub(crate) struct FlushBatch {
     bytes: u64,
     write_log: Option<crate::WriteLogSink>,
     take_stats: bool,
+    /// Whether an observer will see this flush, which is what the I/O
+    /// counters of [`crate::FlushPhase`] are read for.
+    observed: bool,
     started: Instant,
 }
 
@@ -77,6 +100,9 @@ pub(crate) struct FlushOutcome {
     dirty_entries: usize,
     stats_elapsed: Duration,
     sampled: Option<crate::RawStats>,
+    block_sync: crate::FlushPhase,
+    insert: crate::FlushPhase,
+    commit: crate::FlushPhase,
 }
 
 impl FlushOutcome {
@@ -88,6 +114,64 @@ impl FlushOutcome {
             dirty_entries: 0,
             stats_elapsed: Duration::ZERO,
             sampled: None,
+            block_sync: crate::FlushPhase::default(),
+            insert: crate::FlushPhase::default(),
+            commit: crate::FlushPhase::default(),
+        }
+    }
+}
+
+/// The calling thread's storage I/O so far, `(read_bytes, write_bytes)`
+/// from Linux's `/proc/thread-self/io`; `None` elsewhere, or where the
+/// kernel keeps no task I/O accounting.
+///
+/// Per thread rather than `/proc/self/io`, because block serving and RPC
+/// run beside a flush and their reads would land in its figures.  redb
+/// does its I/O on the thread that calls it, which is the flushing one.
+fn thread_io() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let io = std::fs::read_to_string("/proc/thread-self/io").ok()?;
+        let (mut read, mut write) = (None, None);
+        for line in io.lines() {
+            if let Some(v) = line.strip_prefix("read_bytes:") {
+                read = v.trim().parse().ok();
+            } else if let Some(v) = line.strip_prefix("write_bytes:") {
+                write = v.trim().parse().ok();
+            }
+        }
+        Some((read?, write?))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Times one phase of a flush, reading the thread's I/O counters at
+/// either end when an observer will see the result.
+struct PhaseTimer {
+    started: Instant,
+    io: Option<(u64, u64)>,
+}
+
+impl PhaseTimer {
+    fn start(observed: bool) -> PhaseTimer {
+        PhaseTimer {
+            io: if observed { thread_io() } else { None },
+            started: Instant::now(),
+        }
+    }
+
+    fn finish(self) -> crate::FlushPhase {
+        let elapsed = self.started.elapsed();
+        let delta = self.io.and_then(|(read, write)| {
+            thread_io().map(|(r, w)| (r.saturating_sub(read), w.saturating_sub(write)))
+        });
+        crate::FlushPhase {
+            elapsed,
+            read_bytes: delta.map(|(read, _)| read),
+            write_bytes: delta.map(|(_, write)| write),
         }
     }
 }
@@ -147,53 +231,20 @@ impl CacheSnapshot {
         LayerMerge::new(&self.layers, None)
     }
 
-    /// Fold the overlay's entries for the prefix into a set of keys
-    /// gathered from the durable store: a live entry adds its key and a
-    /// pending deletion masks it, with newer layers shadowing older
-    /// ones (dcrd's snapshot iterator merged over the store iterator).
-    ///
-    /// `after` skips keys an earlier window already returned, and
-    /// `upto` is the inclusive last key of the span the store scan
-    /// covered.  Both `None` folds the whole prefix.
-    ///
-    /// Overlay keys beyond `upto` are left for the next window rather
-    /// than dropped.  `None` for `upto` means the store scan reached the
-    /// end of the prefix, so there is no next window and the whole
-    /// remaining overlay belongs to this one.
-    pub(crate) fn merge_prefix_keys_window(
-        &self,
-        prefix: &[u8],
-        after: Option<&[u8]>,
-        upto: Option<&[u8]>,
-        merged: &mut BTreeSet<Vec<u8>>,
-    ) {
-        let from = after.unwrap_or(prefix);
-        for (key, entry) in LayerMerge::new(&self.layers, Some(from)) {
-            if !key.starts_with(prefix) {
-                break;
-            }
-            if after.is_some_and(|a| key <= a) {
-                continue;
-            }
-            if upto.is_some_and(|u| key > u) {
-                break;
-            }
-            match entry {
-                Some(_) => {
-                    merged.insert(key.to_vec());
-                }
-                None => {
-                    merged.remove(key);
-                }
-            }
-        }
+    /// The merged view from `from` onward, ascending by key: each key
+    /// once, with the entry from the newest layer holding it, a pending
+    /// deletion included as `None` (dcrd's cache snapshot iterator over
+    /// its treaps).  A prefix scan merges this with the durable store's
+    /// range, the overlay shadowing the store.
+    pub(crate) fn merged_from(&self, from: &[u8]) -> LayerMerge<'_> {
+        LayerMerge::new(&self.layers, Some(from))
     }
 }
 
 /// A merging iterator over a snapshot's layers: ascending by key, each
 /// key yielded exactly once with the entry from the newest layer that
 /// holds it (a pending deletion included, as `None`).
-struct LayerMerge<'a> {
+pub(crate) struct LayerMerge<'a> {
     /// One peekable range per layer, newest first.
     iters: Vec<LayerRange<'a>>,
 }
@@ -281,14 +332,23 @@ fn merge_newest_pair(layers: &mut Vec<Arc<CacheLayer>>) -> u64 {
         Err(shared) => (*shared).clone(),
     };
     let mut reclaimed = 0u64;
-    for (key, entry) in newer.iter() {
-        if let Some(shadowed) = merged.insert(key.clone(), entry.clone()) {
-            // The older copy of this key is gone: its key bytes and,
-            // when it held one, its value bytes are no longer retained.
-            reclaimed = reclaimed
-                .saturating_add(key.len() as u64)
-                .saturating_add(shadowed.map_or(0, |v| v.len() as u64));
+    let mut absorb = |key: Vec<u8>, entry: Option<Vec<u8>>| {
+        let key_len = key.len();
+        if let Some(shadowed) = merged.insert(key, entry) {
+            // The older copy of this key is gone: its entry, its key
+            // bytes and, when it held one, its value bytes are no longer
+            // retained.
+            reclaimed = reclaimed.saturating_add(node_size(key_len, shadowed.as_deref()));
         }
+    };
+    // The newer layer is moved rather than copied when nothing else
+    // names it, which inside `compact` is always: it was just built by
+    // `commit_pending` or by the previous merge.
+    match Arc::try_unwrap(newer) {
+        Ok(map) => map.into_iter().for_each(|(key, entry)| absorb(key, entry)),
+        Err(shared) => shared
+            .iter()
+            .for_each(|(key, entry)| absorb(key.clone(), entry.clone())),
     }
     layers.insert(0, Arc::new(merged));
     reclaimed
@@ -353,9 +413,12 @@ pub(crate) struct DbCache {
     /// transactions snapshot it by cloning the `Arc`, which is O(1) and
     /// never copies a layer.
     pub(crate) cached: Arc<CacheSnapshot>,
-    /// The approximate byte size of the keys and values the overlay
-    /// RETAINS (dcrd tracks its treap sizes, which for a single treap is
-    /// the same figure).
+    /// The approximate byte size of the entries the overlay RETAINS,
+    /// each counted as dcrd's treap counts a node: [`NODE_FIELDS_SIZE`]
+    /// plus its key and value bytes, for a pending deletion as for a
+    /// live value.  For a single layer this is the figure dcrd's
+    /// `needsFlush` sums over its two treaps (`pendingKeys.Size() +
+    /// pendingRemove.Size()`, a key being in at most one of them).
     ///
     /// Not the logical size of the overlay's contents: sealed layers are
     /// immutable, so a key rewritten across several of them is held once
@@ -504,8 +567,14 @@ impl DbCache {
         // overlay memory by up to ~5x, letting the cache hold several
         // times `max_size`.  The double-counting is settled later, by
         // `compact`, which reports what its merges reclaim.
+        //
+        // A fresh entry is counted as dcrd's treap counts a new node,
+        // [`NODE_FIELDS_SIZE`] plus its key and value; a write onto an
+        // entry already in `top` swaps only the value bytes, as dcrd's
+        // `Put` onto an existing node does (`treap/immutable.go:164`).
         for key in removes {
-            match top.insert(key.clone(), None) {
+            let key_len = key.len();
+            match top.insert(key, None) {
                 // Replaced an entry in the mutable layer: the key stays,
                 // any value it held is freed.
                 Some(displaced) => {
@@ -514,15 +583,16 @@ impl DbCache {
                         .saturating_sub(displaced.map_or(0, |v| v.len() as u64));
                 }
                 // A fresh tombstone, whether or not an older layer has
-                // this key: it occupies its own key bytes.
+                // this key: it occupies its own entry and key bytes.
                 None => {
-                    self.total_size = self.total_size.saturating_add(key.len() as u64);
+                    self.total_size = self.total_size.saturating_add(node_size(key_len, None));
                 }
             }
         }
         for (key, value) in puts {
+            let key_len = key.len();
             let added = value.len() as u64;
-            match top.insert(key.clone(), Some(value)) {
+            match top.insert(key, Some(value)) {
                 Some(displaced) => {
                     self.total_size = self
                         .total_size
@@ -532,7 +602,7 @@ impl DbCache {
                 None => {
                     self.total_size = self
                         .total_size
-                        .saturating_add(key.len() as u64)
+                        .saturating_add(NODE_FIELDS_SIZE + key_len as u64)
                         .saturating_add(added);
                 }
             }
@@ -566,7 +636,8 @@ impl DbCache {
 
     /// Capture the overlay for a flush, under the cache lock.
     ///
-    /// Returns `None` when there is nothing to write. The captured
+    /// Always returns a batch, an empty one when there is nothing to
+    /// write: `run_flush` still syncs the block files for it. The captured
     /// layers STAY PUBLISHED: the durable store does not hold them yet,
     /// so a reader must still be able to find them, and they are retired
     /// only once the commit that persisted them succeeds. That is what
@@ -604,6 +675,7 @@ impl DbCache {
             bytes,
             write_log: self.write_log.clone(),
             take_stats: take_stats && self.observer.is_some(),
+            observed: self.observer.is_some(),
             started: Instant::now(),
         }
     }
@@ -617,10 +689,24 @@ impl DbCache {
     ) -> Result<FlushOutcome, Error> {
         // Block files before metadata, so the metadata never describes
         // bytes that could vanish in a crash.
+        //
+        // The store lock is held to capture what is owed and again to
+        // discharge it, not across the fsyncs: block reads go on while
+        // they run, as dcrd's do beside `syncBlocks`, which takes read
+        // locks alone (`blockio.go:603-625`).  The writer semaphore the
+        // caller holds keeps every block write out until the discharge.
+        let timer = PhaseTimer::start(batch.observed);
+        let plan = block_store
+            .lock()
+            .expect("block store lock poisoned")
+            .sync_plan();
+        let (synced, sync_result) = plan.run();
         block_store
             .lock()
             .expect("block store lock poisoned")
-            .sync()?;
+            .finish_sync(&synced);
+        sync_result?;
+        let block_sync = timer.finish();
 
         let view = CacheSnapshot {
             layers: batch.layers.clone(),
@@ -633,12 +719,17 @@ impl DbCache {
                 dirty_entries: 0,
                 stats_elapsed: Duration::ZERO,
                 sampled: None,
+                block_sync,
+                insert: crate::FlushPhase::default(),
+                commit: crate::FlushPhase::default(),
             });
         }
 
         let mut dirty_entries = 0usize;
         let mut sampled = None;
         let mut stats_elapsed = Duration::ZERO;
+        let timer = PhaseTimer::start(batch.observed);
+        let insert;
         let tx = crate::begin_durable_write(kv)?;
         {
             let mut table = tx
@@ -660,6 +751,7 @@ impl DbCache {
                     }
                 }
             }
+            insert = timer.finish();
             if batch.take_stats {
                 let stats_started = Instant::now();
                 let db_stats = tx.stats().map_err(crate::storage_error)?;
@@ -679,11 +771,16 @@ impl DbCache {
                 stats_elapsed = stats_started.elapsed();
             }
         }
+        let timer = PhaseTimer::start(batch.observed);
         tx.commit().map_err(crate::storage_error)?;
+        let commit = timer.finish();
         Ok(FlushOutcome {
             dirty_entries,
             stats_elapsed,
             sampled,
+            block_sync,
+            insert,
+            commit,
         })
     }
 
@@ -727,6 +824,9 @@ impl DbCache {
                 dirty_bytes: batch.bytes,
                 elapsed: batch.started.elapsed(),
                 stats_elapsed: outcome.stats_elapsed,
+                block_sync: outcome.block_sync,
+                insert: outcome.insert,
+                commit: outcome.commit,
                 stats: outcome.sampled,
             });
         }
@@ -741,7 +841,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{DbCache, MAX_LAYERS};
+    use super::{DEFAULT_FLUSH_SECS, DbCache, MAX_LAYERS, NODE_FIELDS_SIZE, node_size};
     use crate::{Database, Options};
 
     /// simnet magic, matching the interface battery.
@@ -858,7 +958,7 @@ mod tests {
         // more than one sealed layer, which is real memory.
         let logical: u64 = expected
             .iter()
-            .map(|(k, v)| (k.len() + v.as_ref().map_or(0, Vec::len)) as u64)
+            .map(|(k, v)| node_size(k.len(), v.as_deref()))
             .sum();
         assert!(
             cache.total_size >= logical,
@@ -1052,25 +1152,26 @@ mod tests {
     }
 
     /// The bytes actually held across every layer, computed the slow,
-    /// obvious way so a test can check the running total against it.
+    /// obvious way so a test can check the running total against it:
+    /// every entry of every layer at dcrd's node size.
     fn retained_bytes(cache: &DbCache) -> u64 {
         cache
             .cached
             .layers
             .iter()
             .flat_map(|layer| layer.iter())
-            .map(|(k, v)| k.len() as u64 + v.as_ref().map_or(0, |b| b.len() as u64))
+            .map(|(k, v)| node_size(k.len(), v.as_deref()))
             .sum()
     }
 
-    /// The overlay's logical size: every key once, plus its live value.
-    /// This is what a single flat map would have held, and the floor the
-    /// retained figure may never fall below.
+    /// The overlay's logical size: every key once, at dcrd's node size
+    /// with its live value.  This is what a single flat map would have
+    /// held, and the floor the retained figure may never fall below.
     fn logical_bytes(cache: &DbCache) -> u64 {
         cache
             .cached
             .merged()
-            .map(|(k, v)| k.len() as u64 + v.as_ref().map_or(0, |b| b.len() as u64))
+            .map(|(k, v)| node_size(k.len(), v.as_deref()))
             .sum()
     }
 
@@ -1149,14 +1250,14 @@ mod tests {
         );
 
         // And exactly which copies those are: `key` is stored in all three
-        // layers where the merged view shows it once, so two extra copies
-        // of its key and value are held; `gone` is stored in the oldest
-        // layer and tombstoned in the newest, so its value plus one extra
-        // copy of its key is held beyond the tombstone the merged view
+        // layers where the merged view shows it once, so two extra entries
+        // with its key and value are held; `gone` is stored in the oldest
+        // layer and tombstoned in the newest, so one extra entry with its
+        // key and value is held beyond the tombstone the merged view
         // shows.  Both terms vanish under an accounting that subtracts on
         // every overwrite, which is what makes this the regression guard.
-        let expected_excess =
-            2 * (key.len() + VALUE_LEN) as u64 + (gone.len() + b"present".len()) as u64;
+        let expected_excess = 2 * node_size(key.len(), Some(&[0u8; VALUE_LEN]))
+            + node_size(gone.len(), Some(b"present"));
         assert_eq!(
             cache.total_size - logical_bytes(&cache),
             expected_excess,
@@ -1188,6 +1289,177 @@ mod tests {
              have fallen from {before}, got {}",
             cache.total_size
         );
+    }
+
+    /// Every entry is counted as dcrd's treap counts a node:
+    /// `nodeFieldsSize` plus its key and value, for a pending deletion as
+    /// for a live value (dcrd `treap/common.go:43-45`), so the size
+    /// trigger fires at the entry count dcrd's `needsFlush` does.
+    ///
+    /// Counting the key and value alone put an `existsaddridx`-shaped
+    /// overlay (a 25-byte key, an empty value) at about a quarter of
+    /// dcrd's figure and a UTXO-shaped one at about half, and the overlay
+    /// flushed only after 2-4x as many entries as dcrd's would.
+    #[test]
+    fn entries_are_sized_as_dcrds_treap_nodes() {
+        const ROWS: u64 = 100;
+        let addr_key = |i: u64| {
+            let mut key = vec![0u8; 25];
+            key[..8].copy_from_slice(&i.to_be_bytes());
+            key
+        };
+
+        // dcrd flushes once 1.5 times the treap size exceeds the ceiling.
+        // Put the ceiling exactly where ROWS existsaddridx rows land, so
+        // they do not trip it and one more row does.
+        let mut cache = DbCache::new();
+        cache.set_limits(ROWS * (NODE_FIELDS_SIZE + 25) * 3 / 2, DEFAULT_FLUSH_SECS);
+        let puts: BTreeMap<Vec<u8>, Vec<u8>> =
+            (0..ROWS).map(|i| (addr_key(i), Vec::new())).collect();
+        cache.commit_pending(puts, std::iter::empty());
+        assert_eq!(
+            cache.total_size,
+            ROWS * 97,
+            "97 bytes a row, as dcrd counts it"
+        );
+        assert!(
+            !cache.needs_flush(),
+            "exactly at the ceiling is not over it"
+        );
+        let mut puts = BTreeMap::new();
+        puts.insert(addr_key(ROWS), Vec::new());
+        cache.commit_pending(puts, std::iter::empty());
+        assert!(
+            cache.needs_flush(),
+            "one row past the ceiling dcrd would flush at"
+        );
+
+        // A UTXO-shaped put and its deletion, each a fresh entry: 145 and
+        // 110 bytes, dcrd's figures for the same rows.
+        let mut cache = DbCache::new();
+        let utxo_key = vec![7u8; 38];
+        let mut puts = BTreeMap::new();
+        puts.insert(utxo_key.clone(), vec![1u8; 35]);
+        cache.commit_pending(puts, std::iter::empty());
+        assert_eq!(cache.total_size, 145);
+        cache.commit_pending(BTreeMap::new(), std::iter::once(vec![8u8; 38]));
+        assert_eq!(cache.total_size, 145 + 110);
+        // Deleting the key the mutable layer holds frees only its value,
+        // as moving a node between dcrd's two treaps does.
+        cache.commit_pending(BTreeMap::new(), std::iter::once(utxo_key));
+        assert_eq!(cache.total_size, 110 + 110);
+        assert_eq!(cache.total_size, retained_bytes(&cache));
+    }
+
+    /// A flush's block-file fsync and every block read run with the block
+    /// store's lock released, as dcrd's `syncBlocks` and `readBlock` take
+    /// only read locks (`blockio.go:514-625`).  Holding it across the
+    /// fsync made every block read -- P2P getdata, RPC getblock -- wait
+    /// out the flush's fsync, and holding it across a read queued the
+    /// reads behind one another.
+    ///
+    /// Checked from inside the I/O, through the block store's test hook:
+    /// a lock held across it shows as a failed `try_lock`.
+    #[test]
+    fn block_reads_and_the_block_file_fsync_run_without_the_store_lock() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let (_dir, db) = new_db();
+        let raw = vec![0x5au8; 300];
+        // The hash is that of the 180-byte header the bytes start with.
+        let hash = dcroxide_chainhash::hash_h(&raw[..180]);
+        {
+            let tx = db.begin(true).expect("begin write");
+            tx.store_block_raw(&hash, raw.clone()).expect("store block");
+            tx.commit().expect("commit");
+        }
+
+        let seen: Rc<RefCell<Vec<(&'static str, bool)>>> = Rc::default();
+        let log = Rc::clone(&seen);
+        let inner = Arc::clone(&db.inner);
+        crate::blockfile::IO_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |what| {
+                let unlocked = inner.block_store.try_lock().is_ok();
+                log.borrow_mut().push((what, unlocked));
+            }));
+        });
+
+        // The commit wrote the block to its file; the flush syncs it.
+        db.flush().expect("flush");
+        {
+            let tx = db.begin(false).expect("begin read");
+            assert_eq!(tx.fetch_block(&hash).expect("fetch block"), raw);
+            let region = crate::BlockRegion {
+                hash,
+                offset: 4,
+                len: 8,
+            };
+            assert_eq!(
+                tx.fetch_block_region(&region).expect("fetch region"),
+                raw[4..12].to_vec()
+            );
+        }
+        crate::blockfile::IO_HOOK.with(|hook| *hook.borrow_mut() = None);
+
+        let seen = seen.borrow();
+        let count = |what: &str| seen.iter().filter(|(w, _)| *w == what).count();
+        assert_eq!(
+            count("fsync"),
+            1,
+            "the flush synced the block file: {seen:?}"
+        );
+        assert_eq!(count("read"), 2, "both fetches read the file: {seen:?}");
+        assert!(
+            seen.iter().all(|&(_, unlocked)| unlocked),
+            "block I/O ran with the block store locked: {seen:?}"
+        );
+    }
+
+    /// The observer is told how a flush's time divides between its three
+    /// phases -- the block-file fsync, the insert loop and the commit --
+    /// and, on Linux, the storage I/O the flushing thread did in each.
+    /// A single `elapsed` over all three cannot say which phase a stall
+    /// inside a flush window was in.
+    #[test]
+    fn a_flush_observation_splits_the_flush_into_its_phases() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut opts = Options::new(dir.path().join("db"), NET);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        opts.flush_observer = Some(Arc::new(move |obs: &crate::FlushObservation| {
+            sink.lock().expect("observations").push(*obs);
+        }));
+        let db = Database::create(&opts).expect("create");
+        {
+            let tx = db.begin(true).expect("begin write");
+            let bucket = tx.metadata().create_bucket(b"cache").expect("create");
+            for i in 0..100u32 {
+                bucket.put(&i.to_be_bytes(), b"value").expect("put");
+            }
+            tx.commit().expect("commit");
+        }
+        db.flush().expect("flush");
+
+        let seen = seen.lock().expect("observations");
+        let obs = seen.last().expect("the flush was observed");
+        let phases =
+            obs.block_sync.elapsed + obs.insert.elapsed + obs.commit.elapsed + obs.stats_elapsed;
+        assert!(
+            phases <= obs.elapsed,
+            "the phases ({phases:?}) are parts of the flush ({:?})",
+            obs.elapsed
+        );
+        #[cfg(target_os = "linux")]
+        if std::path::Path::new("/proc/thread-self/io").exists() {
+            for phase in [obs.block_sync, obs.insert, obs.commit] {
+                assert!(
+                    phase.read_bytes.is_some() && phase.write_bytes.is_some(),
+                    "an observed flush reads the thread's I/O counters: {phase:?}"
+                );
+            }
+        }
+        assert!(obs.commit.to_json().starts_with("{\"ms\":"));
     }
 
     /// The flush writes from the merged view, so it has to be exercised

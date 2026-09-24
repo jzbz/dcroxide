@@ -64,6 +64,10 @@ pub(crate) const METADATA_TABLE: redb::TableDefinition<'static, &'static [u8], &
 /// The name of the metadata store file within the database directory.
 const METADATA_FILE: &str = "metadata.redb";
 
+/// The name of dcrd ffldb's goleveldb metadata directory within the same
+/// database directory (`metadataDbName`, `ffldb/db.go:34`).
+const DCRD_METADATA_DIR: &str = "metadata";
+
 /// The database driver type identifier (dcrd `DB.Type`).
 pub const DB_TYPE: &str = "redb";
 
@@ -161,6 +165,52 @@ impl DbInner {
         self.fatal.store(true, Ordering::SeqCst);
         e
     }
+
+    /// Refuse a write once a durable write has failed.
+    ///
+    /// Deliberately **not** applied to reads. Data that reached disk is
+    /// still valid, and refusing to serve it would turn a write fault into
+    /// a total outage — the RPC surface and every query would fail — for
+    /// no gain in integrity. Only the paths that could produce a *new*
+    /// commit are latched, because a new commit is the thing that must
+    /// not report success after a failure.
+    ///
+    /// A path that waits for the writer semaphore checks again once it
+    /// holds it. The latch is only ever set by the semaphore's holder, so
+    /// a check made before the wait can pass while the writer being
+    /// waited on is the one whose durable write fails, and a caller
+    /// admitted past that would re-run the failed flush.
+    pub(crate) fn check_writable(&self) -> Result<(), Error> {
+        if self.fatal.load(Ordering::SeqCst) {
+            return Err(db_error(
+                ErrorKind::Fatal,
+                "a durable write to the metadata store failed; this handle refuses \
+                 further writes -- stop the node, investigate the storage, and \
+                 restart",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The shared state over an opened metadata store and block store,
+    /// with the overlay configured from the options -- one constructor
+    /// for `create` and `open`, so an option wired into one cannot be
+    /// forgotten in the other.
+    fn new(kv: redb::Database, block_store: BlockStore, opts: &Options) -> DbInner {
+        let mut cache = crate::dbcache::DbCache::new();
+        cache.set_observer(opts.flush_observer.clone(), opts.flush_stats_every);
+        cache.set_write_log(opts.write_log.clone());
+        cache.set_limits(opts.cache_max_size, opts.cache_flush_interval_secs);
+        DbInner {
+            kv,
+            block_store: Mutex::new(block_store),
+            closed: AtomicBool::new(false),
+            fatal: AtomicBool::new(false),
+            cache: Mutex::new(cache),
+            writer_cv: Condvar::new(),
+            writer_busy: Mutex::new(false),
+        }
+    }
 }
 
 impl Drop for WriterGuard<'_> {
@@ -212,10 +262,24 @@ pub struct FlushObservation {
     /// itself. The distinction is not cosmetic: the walk is proportional
     /// to the tree, so on a chain-sized store it is minutes and would
     /// otherwise be indistinguishable from the commit cost being measured.
+    ///
+    /// The three phases below and the stats walk account for all of it
+    /// but the capture and the handoffs between them.
     pub elapsed: std::time::Duration,
     /// Of `elapsed`, the part spent walking the tree for
     /// [`Self::stats`]. Zero on unsampled flushes.
     pub stats_elapsed: std::time::Duration,
+    /// Of `elapsed`, the fsync of the block files written since the last
+    /// flush, which runs first (dcrd `syncBlocks`).
+    pub block_sync: FlushPhase,
+    /// Of `elapsed`, handing the overlay's entries to redb: opening the
+    /// write transaction and every insert and remove, the stats walk
+    /// excluded.  redb copies each leaf it changes, so a leaf it does
+    /// not have cached is read here first.
+    pub insert: FlushPhase,
+    /// Of `elapsed`, redb's commit: writing the dirty pages and syncing
+    /// them.
+    pub commit: FlushPhase,
     /// Footprint after this flush's writes and before its commit, present
     /// only on sampled flushes.
     ///
@@ -224,6 +288,52 @@ pub struct FlushObservation {
     /// tree — collecting it per flush would dominate the very timings the
     /// observer exists to measure.
     pub stats: Option<RawStats>,
+}
+
+/// One phase of a metadata flush, in a [`FlushObservation`].
+///
+/// A flush window holds three phases in a row, and a stall inside it
+/// points at a different cause in each: the block-file fsync, the insert
+/// loop (reads of leaves redb has not cached, at a queue depth of one),
+/// and the commit (page writes and their fsync).  Wall time alone cannot
+/// say which one a thread blocked in page I/O was waiting in, and a
+/// wait-channel sampler cannot either: reads and writeback wait in the
+/// same kernel function.  The per-phase time and `read_bytes` can: a
+/// slow phase with large `read_bytes` was waiting on reads.  Writeback
+/// shows only as a phase's time, because `write_bytes` cannot see it
+/// (see its note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FlushPhase {
+    /// Wall time the phase took.
+    pub elapsed: std::time::Duration,
+    /// Bytes the flushing thread caused to be read from storage in the
+    /// phase: `read_bytes` in Linux's `/proc/thread-self/io`, which counts
+    /// only reads that reached the block layer, so page-cache hits cost
+    /// nothing here.  `None` off Linux, on a kernel without task I/O
+    /// accounting, and when no observer is attached (the counters are
+    /// read only for one).
+    pub read_bytes: Option<u64>,
+    /// Likewise `write_bytes`: bytes the thread caused to be written to
+    /// storage, counted when it dirtied the page rather than when the
+    /// page was written back, so time spent waiting on writeback shows
+    /// in `elapsed` and not here.  The block-file sync phase therefore
+    /// reads about 0 however much it flushes: its pages were dirtied when
+    /// the blocks were written, before the flush began.  The commit's
+    /// figure is what redb's page writes dirtied, not what reached disk.
+    pub write_bytes: Option<u64>,
+}
+
+impl FlushPhase {
+    /// Render as one JSON object, `null` for a missing counter.
+    pub fn to_json(&self) -> String {
+        let count = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |v| v.to_string());
+        format!(
+            "{{\"ms\":{:.3},\"read_bytes\":{},\"write_bytes\":{}}}",
+            self.elapsed.as_secs_f64() * 1000.0,
+            count(self.read_bytes),
+            count(self.write_bytes),
+        )
+    }
 }
 
 /// A callback invoked after each metadata flush.
@@ -235,13 +345,41 @@ pub type FlushObserver = Arc<dyn Fn(&FlushObservation) + Send + Sync>;
 /// A callback invoked once per key/value the engine is handed, in the
 /// order it is handed them, with `None` for a delete.
 ///
-/// Called inside the flush transaction with the cache lock held, so it
-/// must not block or re-enter the database. It exists to capture the
-/// engine-level write sequence for ADR-0009's candidate engine benchmark:
-/// the order the storage engine actually sees is neither block order nor
-/// the sorted contents of the finished store, and picking either would
-/// decide that benchmark by itself.
+/// Called inside the flush's redb write transaction, on the flushing
+/// thread, WITHOUT the cache lock (`DbCache::run_flush` runs unlocked so
+/// readers are not held for the commit) but with the writer semaphore
+/// held, so it must not block or re-enter the database. It exists to
+/// capture the engine-level write sequence for ADR-0009's candidate
+/// engine benchmark: the order the storage engine actually sees is
+/// neither block order nor the sorted contents of the finished store,
+/// and picking either would decide that benchmark by itself.
 pub type WriteLogSink = Arc<dyn Fn(&[u8], Option<&[u8]>) + Send + Sync>;
+
+/// The level of a line handed to a [`LogSink`] (the `slog` levels
+/// dcrd's ffldb driver logs at).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    /// dcrd `log.Tracef`.
+    Trace,
+    /// dcrd `log.Debugf`.
+    Debug,
+    /// dcrd `log.Infof`.
+    Info,
+    /// dcrd `log.Warnf`.
+    Warn,
+    /// dcrd `log.Errorf`.
+    Error,
+}
+
+/// The driver's package log sink (dcrd ffldb's package-level `log`,
+/// which the daemon points at its `BCDB` logger through
+/// `database.UseLogger`, dcrd `log.go`).
+///
+/// `None` in [`Options::log`] is ffldb's disabled default: nothing is
+/// logged.  Called on whichever thread is opening, committing or
+/// rolling back, sometimes with the block-store lock held, so it must
+/// not block or re-enter the database.
+pub type LogSink = Arc<dyn Fn(LogLevel, &str) + Send + Sync>;
 
 /// Options controlling database creation and opening.
 pub struct Options {
@@ -322,12 +460,21 @@ pub struct Options {
     /// and the reason this hook exists before that work rather than
     /// after it.
     pub backend: Option<SharedBackend>,
+    /// Where the driver's log lines go, when set (see [`LogSink`]): the
+    /// unclean-shutdown repair on open, the `ROLLBACK` warnings, and the
+    /// progress of a redb repair of the metadata store.
+    pub log: Option<LogSink>,
 }
 
 /// Storage shared between the caller and redb, so a test can keep a
 /// handle on the backend it installed (to fail it, or to drop its
 /// unsynced writes) while redb owns its own.
 pub type SharedBackend = Arc<dyn redb::StorageBackend>;
+
+/// The trait a [`SharedBackend`] implements, re-exported so a crate that
+/// installs one -- a test in a crate above this one, failing reads under
+/// the chain -- does not need a `redb` dependency of its own.
+pub use redb::StorageBackend;
 
 /// Adapts a [`SharedBackend`] to the by-value `impl StorageBackend` that
 /// `redb::Builder::create_with_backend` takes.  Every method on the
@@ -397,9 +544,23 @@ pub const DEFAULT_DB_CACHE_BYTES: usize = 1024 * 1024 * 1024;
 /// Synchronous to durability: it returns only once the data is on disk,
 /// because `Database::flush` and `Database::close` are the chain's
 /// durability barrier and the daemon's shutdown path.
-fn flush_locked(inner: &DbInner) -> Result<(), Error> {
+///
+/// `only_if_needed` is the commit path's flush (dcrd `commitTx`, which
+/// flushes only when `needsFlush` says so): the thresholds are checked
+/// under the same lock hold as the capture.  `Database::flush` and
+/// `Database::close` flush unconditionally.
+///
+/// A failure latches the store here, while the caller still holds the
+/// writer semaphore: releasing it first wakes the next queued writer
+/// unlatched, to re-run the failed flush (see [`DbInner::mark_fatal`]).
+/// Every flush goes through this one helper so that ordering cannot
+/// drift between copies.
+pub(crate) fn flush_locked(inner: &DbInner, only_if_needed: bool) -> Result<(), Error> {
     let batch = {
         let mut cache = inner.cache.lock().expect("cache lock poisoned");
+        if only_if_needed && !cache.needs_flush() {
+            return Ok(());
+        }
         cache.begin_flush()
     };
     let (outcome, failure) =
@@ -415,9 +576,28 @@ fn flush_locked(inner: &DbInner) -> Result<(), Error> {
         cache.finish_flush(batch, outcome);
     }
     match failure {
-        Some(e) => Err(e),
+        Some(e) => Err(inner.mark_fatal(e)),
         None => Ok(()),
     }
+}
+
+/// Make one empty quick-repair commit, so the metadata store records its
+/// allocator state and the next open loads it instead of repairing.
+///
+/// Every flush commits one-phase with no allocator state, so an open
+/// after anything but redb's own `Database::drop` runs a full repair --
+/// "3 full scans" of the file (redb-4.3.0 `db.rs:1473`) -- because only
+/// that drop records the state.  `Database::close` makes it itself,
+/// so a clean close leaves a store that opens without a repair however
+/// long the handle's clones outlive it (redb's own version of this
+/// commit is `ensure_allocator_state_table_and_trim`, `db.rs:1922-1955`,
+/// run from `close_database`, `db.rs:1963`).  Per-commit quick-repair
+/// would cover unclean stops too, at a second fsync on every flush; that
+/// is unmeasured and not done here.
+fn record_allocator_state(kv: &redb::Database) -> Result<(), Error> {
+    let mut tx = begin_durable_write(kv)?;
+    tx.set_quick_repair(true);
+    tx.commit().map_err(storage_error)
 }
 
 impl Options {
@@ -435,7 +615,15 @@ impl Options {
             cache_max_size: crate::dbcache::DEFAULT_CACHE_SIZE,
             cache_flush_interval_secs: crate::dbcache::DEFAULT_FLUSH_SECS,
             backend: None,
+            log: None,
         }
+    }
+}
+
+/// Hand a line to the sink, if there is one.
+pub(crate) fn log_line(sink: Option<&LogSink>, level: LogLevel, msg: &str) {
+    if let Some(sink) = sink {
+        sink(level, msg);
     }
 }
 
@@ -445,20 +633,52 @@ impl Options {
 /// `create_with_backend` is redb's only backend entry point and carries
 /// its create-or-open semantics, so both call sites route through here
 /// rather than one of them quietly ignoring the hook.
-fn open_metadata(opts: &Options, meta_path: &Path) -> Result<redb::Database, redb::DatabaseError> {
+///
+/// `report_repair` logs redb's repair of a store that was not shut down
+/// cleanly; see [`redb_builder`].
+fn open_metadata(
+    opts: &Options,
+    meta_path: &Path,
+    report_repair: bool,
+) -> Result<redb::Database, redb::DatabaseError> {
     match &opts.backend {
-        Some(shared) => {
-            redb_builder(opts).create_with_backend(SharedBackendHandle(Arc::clone(shared)))
-        }
-        None => redb_builder(opts).create(meta_path),
+        Some(shared) => redb_builder(opts, report_repair)
+            .create_with_backend(SharedBackendHandle(Arc::clone(shared))),
+        None => redb_builder(opts, report_repair).create(meta_path),
     }
 }
 
 /// The redb builder both open paths use, so the cache setting cannot be
 /// applied on one and forgotten on the other.
-fn redb_builder(opts: &Options) -> redb::Builder {
+///
+/// With `report_repair` and a log sink, redb's repair of a store that
+/// was not shut down cleanly is logged as it runs.  That repair reads
+/// the whole metadata file up to three times (redb-4.3.0 `db.rs:1473`)
+/// and would otherwise be a silent stall after "Loading block database
+/// from disk...".  redb calls back at the start and at each scan
+/// boundary (`db.rs:1474`, `:1492`, `:1539`, `:1653`), so this is a
+/// handful of lines.  `create` leaves it off: redb repairs every new
+/// file once, because a fresh header records no allocator state, and
+/// that is not an unclean shutdown.  dcrd has no line for this --
+/// goleveldb replays its journal instead -- so the text is the port's,
+/// worded after dcrd's reconcile line ("Detected unclean shutdown -
+/// Repairing...") and followed by "Metadata store repair N% complete"
+/// at each scan boundary.  The operator docs quote both.
+fn redb_builder(opts: &Options, report_repair: bool) -> redb::Builder {
     let mut builder = redb::Builder::new();
     builder.set_cache_size(opts.db_cache_bytes);
+    if let (true, Some(sink)) = (report_repair, &opts.log) {
+        let sink = Arc::clone(sink);
+        builder.set_repair_callback(move |session| {
+            let progress = session.progress();
+            let msg = if progress <= 0.0 {
+                "Detected unclean shutdown of the metadata store - Repairing...".to_string()
+            } else {
+                format!("Metadata store repair {:.0}% complete", progress * 100.0)
+            };
+            sink(LogLevel::Info, &msg);
+        });
+    }
     builder
 }
 
@@ -674,7 +894,10 @@ impl RawStats {
 /// recovery half-done.
 ///
 /// Nothing outside this crate branches on the kind today; the value is
-/// that `PARITY.md`'s claim about `convertErr` is true.
+/// that the kind an operator is shown is the one dcrd's `convertErr`
+/// would give.  Open failures come through here too, by way of
+/// [`open_error`]'s fallback: header validation and the repair path are
+/// where corruption is most often found.
 ///
 /// This is narrower than it looks, and deliberately so.  Not every
 /// damaged metadata page reaches here.  Since 4.2.0 redb reports as
@@ -749,8 +972,90 @@ fn open_error(e: redb::DatabaseError) -> Error {
                  docs/operating.md). The chain is not damaged."
             ),
         ),
-        other => db_error(ErrorKind::DriverSpecific, other.to_string()),
+        // Everything else is classified as any other redb error, the
+        // way dcrd hands a failed `leveldb.OpenFile` to `convertErr`
+        // (`ffldb/db.go:2098-2101`): a header that fails validation or a
+        // repair that finds every root corrupted is
+        // `Storage(Corrupted)`, an aborted repair is `RepairAborted`,
+        // and both are corruption, not a driver-specific failure.
+        other => storage_error(other),
     }
+}
+
+/// Reconcile the metadata's block-file write cursor with the block files
+/// on disk (dcrd `reconcileDB`, `ffldb/reconcile.go:53-118`), for
+/// `create` and `open` alike as dcrd runs it for both.
+///
+/// Block data past the stored cursor is an unclean shutdown between the
+/// file writes and the metadata commit, and is rolled back.  A rollback
+/// step that fails is logged by the block store and the open carries on
+/// with the cursor repositioned regardless, as dcrd's void
+/// `handleRollback` does: whatever it could not undo lies past the
+/// cursor, where the next write overwrites it.  Block data short of the
+/// stored cursor means missing, deleted or truncated files, and is
+/// `ErrCorruption`.  The log lines are dcrd's, at dcrd's levels.
+fn reconcile_db(
+    kv: &redb::Database,
+    block_store: &mut BlockStore,
+    log: Option<&LogSink>,
+) -> Result<(), Error> {
+    // Load the current write cursor position from the metadata.  A store
+    // with no metadata table -- a crash between redb initializing the
+    // file and `create`'s first commit -- holds no cursor either.
+    let (cur_file, cur_offset) = {
+        let missing = || db_error(ErrorKind::Corruption, "write cursor does not exist");
+        let rtx = kv.begin_read().map_err(storage_error)?;
+        let table = match rtx.open_table(METADATA_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Err(missing()),
+            Err(e) => return Err(storage_error(e)),
+        };
+        let mut key = METADATA_BUCKET_ID.to_vec();
+        key.extend_from_slice(WRITE_LOC_KEY);
+        let row = table
+            .get(key.as_slice())
+            .map_err(storage_error)?
+            .ok_or_else(missing)?;
+        deserialize_write_row(row.value())?
+    };
+
+    let stored = (cur_file, cur_offset);
+    let scanned = (block_store.write_file_num, block_store.write_offset);
+    if scanned > stored {
+        log_line(
+            log,
+            LogLevel::Info,
+            "Detected unclean shutdown - Repairing...",
+        );
+        log_line(
+            log,
+            LogLevel::Debug,
+            &format!(
+                "Metadata claims file {cur_file}, offset {cur_offset}. Block data is at \
+                 file {}, offset {}",
+                scanned.0, scanned.1
+            ),
+        );
+        // Logged inside, and the cursor is repositioned either way.
+        let _ = block_store.rollback_to(cur_file, cur_offset);
+        log_line(log, LogLevel::Info, "Database sync complete");
+    }
+
+    let scanned = (block_store.write_file_num, block_store.write_offset);
+    if scanned < stored {
+        let str = format!(
+            "metadata claims file {cur_file}, offset {cur_offset}, but block data is at \
+             file {}, offset {}",
+            scanned.0, scanned.1
+        );
+        log_line(
+            log,
+            LogLevel::Warn,
+            &format!("***Database corruption detected***: {str}"),
+        );
+        return Err(db_error(ErrorKind::Corruption, str));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -774,6 +1079,14 @@ impl Database {
     /// Create a new database at the directory in the options; errors
     /// with `ErrDbExists` when one is already there (dcrd
     /// `database.Create`).
+    ///
+    /// Like dcrd's `openDB(create=true)`, this ends in the same
+    /// reconciliation as [`Self::open`] (`reconcileDB(pdb, create)`,
+    /// `ffldb/db.go:2114`): block files already in the directory lie past
+    /// the new store's (0, 0) write cursor, so they are rolled back --
+    /// every file after the first deleted and the first truncated --
+    /// before anything is written, rather than adopted with the durable
+    /// cursor and the live one disagreeing until the first flush.
     pub fn create(opts: &Options) -> Result<Database, Error> {
         let meta_path = opts.path.join(METADATA_FILE);
         // The guard protects against clobbering a store that lives at
@@ -787,6 +1100,26 @@ impl Database {
                 "database already exists at the provided path",
             ));
         }
+        // dcrd's own metadata store at this path is a database that
+        // already exists too: dcrd's create refuses it (`ErrorIfExist:
+        // create`, `ffldb/db.go:2090-2097`), and this one must.  The
+        // daemon's directory is `blocks_ffldb`, dcrd's name, and this
+        // store's metadata file is not dcrd's, so without the check a
+        // dcroxide pointed at a dcrd data directory would reach the
+        // reconciliation below with dcrd's block files -- and delete
+        // them.
+        let dcrd_meta = opts.path.join(DCRD_METADATA_DIR);
+        if dcrd_meta.exists() {
+            return Err(db_error(
+                ErrorKind::DbExists,
+                format!(
+                    "database already exists at the provided path: {} is a dcrd metadata \
+                     store, and dcroxide cannot use a dcrd data directory -- give it a \
+                     data directory of its own (see docs/operating.md)",
+                    dcrd_meta.display()
+                ),
+            ));
+        }
         // dcrd's ffldb only creates the tree when the database does not
         // exist (the guard above), and creates it 0700.
         // Not a redb error: `storage_error` would relabel it "I/O
@@ -794,7 +1127,7 @@ impl Database {
         create_dir_all_owner_only(&opts.path)
             .map_err(|e| db_error(ErrorKind::DriverSpecific, e.to_string()))?;
 
-        let kv = open_metadata(opts, &meta_path).map_err(open_error)?;
+        let kv = open_metadata(opts, &meta_path, false).map_err(open_error)?;
 
         // Initialize the ffldb-layout bookkeeping rows: the bucket
         // index entry and fixed ID for the internal block index, the
@@ -827,23 +1160,15 @@ impl Database {
             wtx.commit().map_err(storage_error)?;
         }
 
-        let block_store = BlockStore::open(&opts.path, opts.network, opts.max_block_file_size)?;
+        let mut block_store = BlockStore::open(
+            &opts.path,
+            opts.network,
+            opts.max_block_file_size,
+            opts.log.clone(),
+        )?;
+        reconcile_db(&kv, &mut block_store, opts.log.as_ref())?;
         Ok(Database {
-            inner: Arc::new(DbInner {
-                kv,
-                block_store: Mutex::new(block_store),
-                closed: AtomicBool::new(false),
-                fatal: AtomicBool::new(false),
-                cache: Mutex::new({
-                    let mut cache = crate::dbcache::DbCache::new();
-                    cache.set_observer(opts.flush_observer.clone(), opts.flush_stats_every);
-                    cache.set_write_log(opts.write_log.clone());
-                    cache.set_limits(opts.cache_max_size, opts.cache_flush_interval_secs);
-                    cache
-                }),
-                writer_cv: Condvar::new(),
-                writer_busy: Mutex::new(false),
-            }),
+            inner: Arc::new(DbInner::new(kv, block_store, opts)),
         })
     }
 
@@ -867,58 +1192,16 @@ impl Database {
         // create-or-open distinction is not what enforces "must already
         // exist" here and routing through the backend hook cannot
         // weaken it.
-        let kv = open_metadata(opts, &meta_path).map_err(open_error)?;
-        let mut block_store = BlockStore::open(&opts.path, opts.network, opts.max_block_file_size)?;
-
-        // Fetch the stored write cursor position.
-        let (stored_file, stored_offset) = {
-            let rtx = kv.begin_read().map_err(storage_error)?;
-            let table = rtx.open_table(METADATA_TABLE).map_err(storage_error)?;
-            let mut key = METADATA_BUCKET_ID.to_vec();
-            key.extend_from_slice(WRITE_LOC_KEY);
-            let row = table
-                .get(key.as_slice())
-                .map_err(storage_error)?
-                .ok_or_else(|| {
-                    db_error(ErrorKind::Corruption, "missing block-file write cursor row")
-                })?;
-            deserialize_write_row(row.value())?
-        };
-
-        let scanned = (block_store.write_file_num, block_store.write_offset);
-        let stored = (stored_file, stored_offset);
-        if stored > scanned {
-            return Err(db_error(
-                ErrorKind::Corruption,
-                format!(
-                    "metadata claims file {stored_file}, offset {stored_offset}, but block \
-                     data is only at file {}, offset {}",
-                    scanned.0, scanned.1
-                ),
-            ));
-        }
-        if stored < scanned {
-            // Unclean shutdown after block file writes but before the
-            // metadata commit: roll the files back.
-            block_store.rollback_to(stored_file, stored_offset)?;
-        }
-
+        let kv = open_metadata(opts, &meta_path, true).map_err(open_error)?;
+        let mut block_store = BlockStore::open(
+            &opts.path,
+            opts.network,
+            opts.max_block_file_size,
+            opts.log.clone(),
+        )?;
+        reconcile_db(&kv, &mut block_store, opts.log.as_ref())?;
         Ok(Database {
-            inner: Arc::new(DbInner {
-                kv,
-                block_store: Mutex::new(block_store),
-                closed: AtomicBool::new(false),
-                fatal: AtomicBool::new(false),
-                cache: Mutex::new({
-                    let mut cache = crate::dbcache::DbCache::new();
-                    cache.set_observer(opts.flush_observer.clone(), opts.flush_stats_every);
-                    cache.set_write_log(opts.write_log.clone());
-                    cache.set_limits(opts.cache_max_size, opts.cache_flush_interval_secs);
-                    cache
-                }),
-                writer_cv: Condvar::new(),
-                writer_busy: Mutex::new(false),
-            }),
+            inner: Arc::new(DbInner::new(kv, block_store, opts)),
         })
     }
 
@@ -1084,31 +1367,6 @@ impl Database {
         self.inner.fatal.load(Ordering::SeqCst)
     }
 
-    /// Refuse a write once a durable write has failed.
-    ///
-    /// Deliberately **not** applied to reads. Data that reached disk is
-    /// still valid, and refusing to serve it would turn a write fault into
-    /// a total outage — the RPC surface and every query would fail — for
-    /// no gain in integrity. Only the paths that could produce a *new*
-    /// commit are latched, because a new commit is the thing that must
-    /// not report success after a failure.
-    fn check_writable(&self) -> Result<(), Error> {
-        if self.inner.fatal.load(Ordering::SeqCst) {
-            return Err(db_error(
-                ErrorKind::Fatal,
-                "a durable write to the metadata store failed; this handle refuses \
-                 further writes -- stop the node, investigate the storage, and \
-                 restart",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Start a transaction, read-only or read-write per the flag (dcrd
-    /// `Begin`).  Multiple read-only transactions may run concurrently;
-    /// starting a read-write transaction blocks until any current one
-    /// finishes.  The transaction must be finalized with
-    /// [`Transaction::commit`] or [`Transaction::rollback`].
     /// Acquire everything a new transaction needs, in the safe order:
     /// the writer semaphore (writable only, dcrd's `writeLock`), the
     /// cache overlay snapshot, and only then the redb read snapshot.
@@ -1140,25 +1398,42 @@ impl Database {
                 release(&self.inner);
                 return Err(db_error(ErrorKind::DbNotOpen, "database is not open"));
             }
+            // So may the store have latched: the writer this one queued
+            // behind can be the one whose durable write failed.
+            if let Err(e) = self.inner.check_writable() {
+                release(&self.inner);
+                return Err(e);
+            }
         }
         // The overlay snapshot and the store snapshot are taken under
         // one hold of the cache lock, because a transaction's view is
         // the overlay shadowing the store: `fetch_raw` answers from
-        // `cache_snap` before consulting the table.  Taking them
-        // separately lets flushes land in between, and while one
-        // intervening flush is harmless — the same batch is then seen
-        // in both layers, with identical values — two are not.  Each
-        // flush empties the overlay, so after two the pinned layer is
-        // strictly older than the store for any key they share, and a
-        // key the second flush deleted is resurrected by the stale
-        // overlay.  The reader would then see a state that never
-        // existed at any commit point.
+        // `cache_snap` before consulting the table.  A flush commit that
+        // lands between the two snapshots is harmless as long as its
+        // layers are still in the overlay snapshot -- the same batch is
+        // then seen in both, with identical values, and the overlay
+        // wins.  What must not happen is a snapshot pair in which the
+        // store has a flush whose layers the overlay snapshot does not
+        // hold, while the overlay snapshot still holds an OLDER layer
+        // for a key that flush deleted: the stale overlay would
+        // resurrect it, a state that never existed at any commit point.
         //
-        // `Database::flush` holds this same lock across redb's commit
-        // and the overlay clear (see `DbCache::flush`), so holding it
-        // here means a reader observes a flush either wholly or not at
-        // all.  The order is writer flag, then cache, then redb on both
-        // paths, so the two cannot deadlock against each other.
+        // What rules that out is not this lock being held across the
+        // commit -- it is not: `flush_locked` releases it for the redb
+        // commit so readers are not held for its fsync.  It is three
+        // things together.  A flush's captured layers stay published
+        // until `DbCache::finish_flush` retires them, after its commit
+        // is visible, and that retirement takes the cache lock, so it
+        // cannot happen inside this hold.  `DbCache::begin_flush` takes
+        // the lock too, so no new flush can be captured inside it.  And
+        // flushes are serialized by the writer semaphore, so at most one
+        // is in flight -- captured before this hold, retired after it --
+        // and its commit is the only one that can land between the two
+        // snapshots, with its layers still in the overlay snapshot.  A
+        // flush that ran without the writer semaphore would break the
+        // last of these and with it this view.  The order is writer
+        // flag, then cache, then redb on both paths, so the two cannot
+        // deadlock against each other.
         let cache = self.inner.cache.lock().expect("cache lock poisoned");
         let cache_snap = std::sync::Arc::clone(&cache.cached);
         let kv = match self.inner.kv.begin_read() {
@@ -1181,8 +1456,15 @@ impl Database {
     }
 
     /// Hold the writer semaphore for the guard's lifetime, waiting out
-    /// any committing transaction (dcrd holds its close/write locks in
-    /// `Flush` and `Close`).
+    /// any writable transaction (dcrd's `Flush` and `Close` exclude its
+    /// writer too).
+    ///
+    /// Narrower than dcrd, which takes `closeLock` exclusively there and
+    /// so also waits for every open read-only transaction
+    /// (`ffldb/db.go:1969-1971`, `:2010-2012`).  A reader here holds its
+    /// own overlay layers and redb snapshot, which a flush neither
+    /// changes nor frees, so nothing it sees depends on the wait; a
+    /// long-lived reader just does not hold up a flush or a close.
     fn exclusive_writer(&self) -> WriterGuard<'_> {
         let mut busy = self.inner.writer_busy.lock().expect("writer flag poisoned");
         while *busy {
@@ -1196,35 +1478,28 @@ impl Database {
         WriterGuard { db: &self.inner }
     }
 
-    /// Start a transaction (dcrd `Begin`): multiple read-only
-    /// transactions may run concurrently; writable transactions
-    /// serialize on the writer semaphore.
+    /// Start a transaction, read-only or read-write per the flag (dcrd
+    /// `Begin`).  Multiple read-only transactions may run concurrently;
+    /// starting a read-write transaction blocks until any current one
+    /// finishes, on the writer semaphore.  The transaction must be
+    /// finalized with [`Transaction::commit`] or
+    /// [`Transaction::rollback`].
     pub fn begin(&self, writable: bool) -> Result<Transaction, Error> {
         self.check_open()?;
         if writable {
-            self.check_writable()?;
+            self.inner.check_writable()?;
         }
         let (seed, cache_snap) = self.begin_seed(writable)?;
-        Ok(Transaction::new(
-            Arc::clone(&self.inner),
-            seed,
-            cache_snap,
-            false,
-        ))
+        Transaction::new(Arc::clone(&self.inner), seed, cache_snap, false)
     }
 
     fn begin_managed(&self, writable: bool) -> Result<Transaction, Error> {
         self.check_open()?;
         if writable {
-            self.check_writable()?;
+            self.inner.check_writable()?;
         }
         let (seed, cache_snap) = self.begin_seed(writable)?;
-        Ok(Transaction::new(
-            Arc::clone(&self.inner),
-            seed,
-            cache_snap,
-            true,
-        ))
+        Transaction::new(Arc::clone(&self.inner), seed, cache_snap, true)
     }
 
     /// Invoke the function in a managed read-only transaction (dcrd
@@ -1265,12 +1540,20 @@ impl Database {
         // likely to be believed.  The handle is still marked closed
         // first, matching dcrd's `Close`, which marks it closed even
         // when the cache close fails (`ffldb/db.go:1978-1989`).
-        self.check_writable()?;
+        self.inner.check_writable()?;
         // Flush the metadata write cache so a clean shutdown persists
         // everything (dcrd `Close` flushes the cache), waiting out any
-        // committing transaction first (dcrd's close/write locks).
+        // committing transaction first (dcrd's close/write locks) --
+        // which can be the one that latches, so look again once it is
+        // out of the way.
         let _writer = self.exclusive_writer();
-        flush_locked(&self.inner).map_err(|e| self.inner.mark_fatal(e))?;
+        self.inner.check_writable()?;
+        flush_locked(&self.inner, false)?;
+        // Then record the allocator state, which redb otherwise does
+        // only when its handle drops -- and this handle's clones can
+        // outlive the close by as long as the threads holding them do.
+        // Without it the next open repairs the whole file.
+        record_allocator_state(&self.inner.kv).map_err(|e| self.inner.mark_fatal(e))?;
         Ok(())
     }
 
@@ -1279,10 +1562,12 @@ impl Database {
     /// write cache.
     pub fn flush(&self) -> Result<(), Error> {
         self.check_open()?;
-        self.check_writable()?;
+        self.inner.check_writable()?;
         let _writer = self.exclusive_writer();
-        flush_locked(&self.inner).map_err(|e| self.inner.mark_fatal(e))?;
-        Ok(())
+        // Again with the writer held: the transaction waited out may be
+        // the one whose flush failed and latched the store.
+        self.inner.check_writable()?;
+        flush_locked(&self.inner, false)
     }
 }
 
@@ -1781,9 +2066,11 @@ mod storage_error_tests {
         }
 
         // An aborted repair only exists as a `DatabaseError`, and means
-        // the recovery stopped half-done.
+        // the recovery stopped half-done.  It only ever arrives through
+        // an open, so it is checked through `open_error`, the classifier
+        // the open paths actually call.
         assert_eq!(
-            storage_error(redb::DatabaseError::RepairAborted).kind,
+            open_error(redb::DatabaseError::RepairAborted).kind,
             ErrorKind::Corruption,
         );
 
@@ -1792,5 +2079,91 @@ mod storage_error_tests {
             storage_error(redb::StorageError::Corrupted("bad checksum".to_string())).description,
             "DB corrupted: bad checksum",
         );
+    }
+
+    /// Corruption is most often found at open -- header validation and
+    /// the repair path -- so the open classifier must give it dcrd's
+    /// kind too (`leveldb.OpenFile` failures go through `convertErr`,
+    /// `ffldb/db.go:2098-2101`), keeping only its own two special cases.
+    #[test]
+    fn open_errors_carry_dcrds_kinds() {
+        let cases: Vec<(redb::DatabaseError, ErrorKind)> = vec![
+            (
+                redb::DatabaseError::Storage(redb::StorageError::Corrupted(
+                    "Invalid magic number".to_string(),
+                )),
+                ErrorKind::Corruption,
+            ),
+            (redb::DatabaseError::RepairAborted, ErrorKind::Corruption),
+            (
+                redb::DatabaseError::Storage(redb::StorageError::PreviousIo),
+                ErrorKind::Corruption,
+            ),
+            (
+                redb::DatabaseError::Storage(redb::StorageError::Io(std::io::Error::from(
+                    std::io::ErrorKind::PermissionDenied,
+                ))),
+                ErrorKind::DriverSpecific,
+            ),
+            (
+                redb::DatabaseError::DatabaseAlreadyOpen,
+                ErrorKind::DbAlreadyOpen,
+            ),
+            (redb::DatabaseError::UpgradeRequired(2), ErrorKind::Invalid),
+        ];
+        for (raw, want) in cases {
+            let text = raw.to_string();
+            assert_eq!(open_error(raw).kind, want, "{text}");
+        }
+    }
+
+    /// A metadata file whose header redb refuses as damaged opens as
+    /// `ErrCorruption`, not as a driver-specific failure.
+    ///
+    /// Only the header past redb's nine-byte magic number is damaged: a
+    /// file without the magic is "not a redb database", which redb
+    /// reports as an I/O error and which stays driver-specific.
+    #[test]
+    fn a_damaged_metadata_header_opens_as_corruption() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("blocks_redb");
+        let opts = Options::new(&path, 0x0709_1101);
+        let db = Database::create(&opts).expect("create");
+        db.close().expect("close");
+        drop(db);
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path.join(METADATA_FILE))
+            .expect("open metadata file");
+        file.seek(SeekFrom::Start(9)).expect("seek past the magic");
+        file.write_all(&[0xa5u8; 503]).expect("damage the header");
+        drop(file);
+
+        let err = match Database::open(&opts) {
+            Err(e) => e,
+            Ok(_) => panic!("a store with a damaged header must not open"),
+        };
+        assert_eq!(err.kind, ErrorKind::Corruption, "{err}");
+    }
+
+    /// A store whose metadata table was never created -- power lost
+    /// between redb initializing the file and `create`'s first commit --
+    /// has no write cursor, and dcrd's reconcile reports exactly that as
+    /// `ErrCorruption` (`ffldb/reconcile.go:65-69`).
+    #[test]
+    fn a_store_without_its_metadata_table_reports_a_missing_write_cursor() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("blocks_redb");
+        std::fs::create_dir_all(&path).expect("mkdir");
+        drop(redb::Database::create(path.join(METADATA_FILE)).expect("bare redb file"));
+        let err = match Database::open(&Options::new(&path, 0x0709_1101)) {
+            Err(e) => e,
+            Ok(_) => panic!("a store with no write cursor must not open"),
+        };
+        assert_eq!(err.kind, ErrorKind::Corruption, "{err}");
+        assert_eq!(err.description, "write cursor does not exist");
     }
 }

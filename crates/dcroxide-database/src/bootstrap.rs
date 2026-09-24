@@ -141,17 +141,16 @@ impl Database {
                 return Ok(());
             }
             self.update(|tx| {
-                for (hash, raw) in batch.iter() {
-                    if tx.has_block(hash)? {
+                for (hash, raw) in batch.drain(..) {
+                    if tx.has_block(&hash)? {
                         stats.skipped += 1;
                         continue;
                     }
-                    tx.store_block_raw(hash, raw)?;
+                    tx.store_block_raw(&hash, raw)?;
                     stats.imported += 1;
                 }
                 Ok(())
             })?;
-            batch.clear();
             Ok(())
         };
 

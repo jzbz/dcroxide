@@ -14,10 +14,12 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::{Error, ErrorKind, db_error};
+use crate::{LogLevel, LogSink, log_line};
 
 /// CRC-32 with the Castagnoli polynomial (dcrd's `castagnoli` table).
 const CASTAGNOLI: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
@@ -112,6 +114,15 @@ fn block_file_path(db_path: &Path, file_num: u32) -> PathBuf {
 /// cache: read handles are simply kept open per file (block file counts
 /// stay small at Decred's chain size; revisit if profiling ever says
 /// otherwise).
+///
+/// The store sits behind one mutex, where dcrd has a lock per file and
+/// one on the write cursor.  What keeps that from serializing block
+/// reads is that neither a read nor the flush's fsync does its I/O under
+/// the mutex: a read takes a shared handle ([`Self::reader`]) and reads
+/// positionally after releasing it, as dcrd's `ReadAt` under a per-file
+/// read lock does, and a sync captures what it owes ([`Self::sync_plan`])
+/// and fsyncs without it, as dcrd's `syncBlocks` does under read locks
+/// alone.
 pub(crate) struct BlockStore {
     db_path: PathBuf,
     network: u32,
@@ -119,12 +130,16 @@ pub(crate) struct BlockStore {
     /// Current write position.
     pub(crate) write_file_num: u32,
     pub(crate) write_offset: u32,
-    /// Open read handles keyed by file number.
-    open_files: HashMap<u32, File>,
-    /// The current write handle.
-    write_file: Option<File>,
+    /// Open read handles keyed by file number, shared with the readers
+    /// using them.
+    open_files: HashMap<u32, Arc<File>>,
+    /// The current write handle, shared with a sync in progress.
+    write_file: Option<Arc<File>>,
     /// Files written to since the last sync, for commit-time fsync.
     dirty_files: Vec<u32>,
+    /// The driver's log sink (see [`crate::LogSink`]), for the
+    /// `ROLLBACK:` lines dcrd's `handleRollback` logs.
+    log: Option<LogSink>,
 }
 
 fn io_err(err: &std::io::Error, what: &str) -> Error {
@@ -139,6 +154,7 @@ impl BlockStore {
         db_path: &Path,
         network: u32,
         max_block_file_size: u32,
+        log: Option<LogSink>,
     ) -> Result<BlockStore, Error> {
         let mut write_file_num = 0u32;
         let mut write_offset = 0u32;
@@ -164,7 +180,54 @@ impl BlockStore {
             open_files: HashMap::new(),
             write_file: None,
             dirty_files: Vec::new(),
+            log,
         })
+    }
+
+    /// Write the data at the write cursor and advance the cursor by the
+    /// bytes actually written -- also when the write fails part way
+    /// (dcrd `writeData`, `blockio.go:373-396`).  The field name is only
+    /// for the error.
+    ///
+    /// Advancing on failure is what lets a rollback find a torn record.
+    /// A cursor left on the rollback point makes the rollback a no-op,
+    /// and the partial bytes stay in the file past it; one that moved
+    /// sends the rollback to truncate them.
+    fn write_data(&mut self, data: &[u8], field_name: &str) -> Result<(), Error> {
+        let mut file: &File = self.write_file.as_deref().expect("write file open");
+        // `write` until done, counting what lands, as Go's `WriteAt`
+        // does; `write_all` would hide how much of a failed write did.
+        let mut written = 0usize;
+        let mut failure = None;
+        while written < data.len() {
+            match file.write(&data[written..]) {
+                Ok(0) => {
+                    failure = Some(std::io::Error::from(std::io::ErrorKind::WriteZero));
+                    break;
+                }
+                Ok(n) => written += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        // At most one record, which `write_block` has checked fits the
+        // u32 cursor.
+        let written = written as u32;
+        self.write_offset += written;
+        match failure {
+            None => Ok(()),
+            Some(e) => Err(db_error(
+                ErrorKind::DriverSpecific,
+                format!(
+                    "failed to write {field_name} to file {} at offset {}: {e}",
+                    self.write_file_num,
+                    self.write_offset - written
+                ),
+            )),
+        }
     }
 
     /// Append the raw block to the store per dcrd `writeBlock`,
@@ -191,92 +254,290 @@ impl BlockStore {
                 .write(true)
                 .open(&path)
                 .map_err(|e| io_err(&e, "failed to open write file"))?;
-            self.write_file = Some(file);
+            self.write_file = Some(Arc::new(file));
         }
-        let file = self.write_file.as_mut().expect("write file open");
+        let mut file: &File = self.write_file.as_deref().expect("write file open");
         file.seek(SeekFrom::Start(u64::from(self.write_offset)))
             .map_err(|e| io_err(&e, "failed to seek write file"))?;
 
-        // Record: network || length || block || checksum-of-preceding.
+        // Record: network || length || block || checksum-of-preceding,
+        // each advancing the cursor by what it wrote, as dcrd's do.
+        let orig_offset = self.write_offset;
         let mut digest = CASTAGNOLI.digest();
         let net = self.network.to_le_bytes();
-        file.write_all(&net)
-            .map_err(|e| io_err(&e, "failed to write network"))?;
+        self.write_data(&net, "network")?;
         digest.update(&net);
         let len_bytes = block_len.to_le_bytes();
-        file.write_all(&len_bytes)
-            .map_err(|e| io_err(&e, "failed to write block length"))?;
+        self.write_data(&len_bytes, "block length")?;
         digest.update(&len_bytes);
-        file.write_all(raw_block)
-            .map_err(|e| io_err(&e, "failed to write block"))?;
+        self.write_data(raw_block, "block")?;
         digest.update(raw_block);
-        file.write_all(&digest.finalize().to_be_bytes())
-            .map_err(|e| io_err(&e, "failed to write checksum"))?;
+        self.write_data(&digest.finalize().to_be_bytes(), "checksum")?;
 
         let loc = BlockLocation {
             block_file_num: self.write_file_num,
-            file_offset: self.write_offset,
+            file_offset: orig_offset,
             block_len: full_len,
         };
-        self.write_offset += full_len;
         if !self.dirty_files.contains(&self.write_file_num) {
             self.dirty_files.push(self.write_file_num);
         }
         Ok(loc)
     }
 
-    /// Sync all files written to since the last sync.
+    /// Sync all files written to since the last sync, with the store
+    /// held throughout.  [`crate::dbcache::DbCache::run_flush`] splits
+    /// this into its three steps so the fsyncs run without the store
+    /// lock.
+    #[cfg(test)]
     pub(crate) fn sync(&mut self) -> Result<(), Error> {
-        // Entries leave the dirty list only after their fsync succeeds
-        // so a transient failure keeps the files-before-metadata
-        // invariant armed for the next attempt.
-        while let Some(&num) = self.dirty_files.first() {
-            let via_write_handle = num == self.write_file_num && self.write_file.is_some();
-            if via_write_handle {
-                let f = self.write_file.as_ref().expect("checked above");
-                f.sync_all()
-                    .map_err(|e| io_err(&e, "failed to sync file"))?;
-            } else {
-                let path = block_file_path(&self.db_path, num);
-                // Opened for WRITING even though nothing is written here.
-                // `fsync(2)` is happy with a read-only descriptor, but
-                // Windows' `FlushFileBuffers` — which is what `sync_all`
-                // becomes there — requires write access on the handle and
-                // fails the whole flush with `ERROR_ACCESS_DENIED` (os
-                // error 5) without it.  `create` is deliberately absent:
-                // a dirty file that has gone missing must surface as an
-                // error, not be conjured up empty and reported synced.
-                let f = OpenOptions::new()
-                    .write(true)
-                    .open(&path)
-                    .map_err(|e| io_err(&e, "failed to open file to sync"))?;
-                f.sync_all()
-                    .map_err(|e| io_err(&e, "failed to sync file"))?;
+        let plan = self.sync_plan();
+        let (synced, result) = plan.run();
+        self.finish_sync(&synced);
+        result
+    }
+
+    /// What a sync owes: every file written to since the last sync, in
+    /// the order written, with the write handle for the current one.
+    /// Taken under the store lock; [`SyncPlan::run`] then does the
+    /// fsyncs without it, and [`Self::finish_sync`] discharges them.
+    ///
+    /// Nothing may write between the plan and its discharge, or a file
+    /// dirtied again after its fsync would be discharged with the new
+    /// bytes unsynced.  Every sync runs inside a flush, and every flush
+    /// holds the writer semaphore, which is what excludes the writes.
+    pub(crate) fn sync_plan(&self) -> SyncPlan {
+        let files = self
+            .dirty_files
+            .iter()
+            .map(|&num| {
+                let handle = if num == self.write_file_num {
+                    self.write_file.clone()
+                } else {
+                    None
+                };
+                (num, block_file_path(&self.db_path, num), handle)
+            })
+            .collect();
+        SyncPlan { files }
+    }
+
+    /// Discharge the files a [`SyncPlan::run`] synced.  Entries leave the
+    /// dirty list only after their fsync succeeds, so a transient failure
+    /// keeps the files-before-metadata invariant armed for the next
+    /// attempt.
+    pub(crate) fn finish_sync(&mut self, synced: &[u32]) {
+        self.dirty_files.retain(|num| !synced.contains(num));
+    }
+
+    /// A shared handle for reading the given file, opened on first use
+    /// (dcrd `blockFile`).  The store lock is needed only for this; the
+    /// read itself runs on the returned [`BlockReader`] after the lock is
+    /// released, so block reads neither wait on each other nor on a
+    /// flush's fsync, as dcrd's do not.
+    pub(crate) fn reader(&mut self, file_num: u32) -> Result<BlockReader, Error> {
+        let file = match self.open_files.get(&file_num) {
+            Some(file) => Arc::clone(file),
+            None => {
+                let path = block_file_path(&self.db_path, file_num);
+                let file = Arc::new(
+                    File::open(&path).map_err(|e| io_err(&e, "failed to open block file"))?,
+                );
+                self.open_files.insert(file_num, Arc::clone(&file));
+                file
             }
-            self.dirty_files.remove(0);
+        };
+        Ok(BlockReader {
+            file,
+            network: self.network,
+        })
+    }
+
+    /// Roll the store back to the given write position, removing any
+    /// later files and truncating the target file (dcrd
+    /// `handleRollback`).  Used both for commit failures and for
+    /// reconciliation after an unclean shutdown.
+    ///
+    /// As in dcrd, the write cursor is repositioned to the target
+    /// whatever fails (`blockio.go:662-667`), and the first failure ends
+    /// the rollback with a `ROLLBACK:` warning (`:683-718`).  Leaving the
+    /// cursor where it was is not an option: after a failed rotation it
+    /// names a file that was never created, every later commit stages
+    /// it as the durable write cursor, and the next open refuses the
+    /// store as corrupt.  Whatever could not be undone lies past the
+    /// repositioned cursor, where the next write overwrites it or the
+    /// next open's reconciliation truncates it.  The failure is also
+    /// returned, though dcrd's returns nothing; callers log nothing more.
+    pub(crate) fn rollback_to(&mut self, file_num: u32, offset: u32) -> Result<(), Error> {
+        if self.write_file_num == file_num && self.write_offset == offset {
+            return Ok(());
+        }
+
+        log_line(
+            self.log.as_ref(),
+            LogLevel::Debug,
+            &format!("ROLLBACK: Rolling back to file {file_num}, offset {offset}"),
+        );
+        let result = self.undo_writes(file_num, offset);
+        // Regardless of any failure above, reposition the write cursor to
+        // the old block file and offset.
+        self.write_file_num = file_num;
+        self.write_offset = offset;
+        if let Err(e) = &result {
+            log_line(self.log.as_ref(), LogLevel::Warn, &format!("ROLLBACK: {e}"));
+        }
+        result
+    }
+
+    /// The file work of [`Self::rollback_to`], stopping at the first
+    /// failure.  Each error's text is what dcrd's warning says after
+    /// `ROLLBACK: ` for the same step.
+    fn undo_writes(&mut self, file_num: u32, offset: u32) -> Result<(), Error> {
+        self.write_file = None;
+        self.open_files.clear();
+        // Only the files this rollback discards leave the dirty list:
+        // everything *above* `file_num` is deleted below.  Files below
+        // it keep bytes that survive the rollback, so dropping them here
+        // would lose the pending fsync and let the metadata that
+        // describes them be committed first — the exact ordering the
+        // dirty list exists to prevent.
+        //
+        // `file_num` itself stays until its truncation has been synced.
+        // The truncate is what discharges its fsync, so dropping it up
+        // front would leave an unsynced prefix owed to nobody on every
+        // path where the truncate does not happen: an unwritable file,
+        // a full disk, an `EIO` out of `sync_all`.  Each returns an
+        // error, and the store keeps running — the next `sync` has to
+        // still know about it.
+        self.dirty_files.retain(|&num| num <= file_num);
+
+        // Remove any files that are entirely after the target.  A file
+        // that cannot be removed ends the rollback, as in dcrd -- a
+        // rotation whose new file was never created included.
+        let mut num = self.write_file_num;
+        while num > file_num {
+            let path = block_file_path(&self.db_path, num);
+            if let Err(e) = fs::remove_file(&path) {
+                return Err(db_error(
+                    ErrorKind::DriverSpecific,
+                    format!(
+                        "Failed to delete block file number {num}: failed to delete file {path:?}: {e}"
+                    ),
+                ));
+            }
+            num -= 1;
+        }
+
+        // Truncate the target file to the target offset.
+        let path = block_file_path(&self.db_path, file_num);
+        if offset == 0 && !path.exists() {
+            // Rolling back to the very start of a file that was never
+            // created: there are no bytes to truncate and none to sync.
+            self.dirty_files.retain(|&num| num != file_num);
+            return Ok(());
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| {
+                db_error(
+                    ErrorKind::DriverSpecific,
+                    format!("failed to open file {path:?}: {e}"),
+                )
+            })?;
+        file.set_len(u64::from(offset)).map_err(|e| {
+            db_error(
+                ErrorKind::DriverSpecific,
+                format!("Failed to truncate file {file_num}: {e}"),
+            )
+        })?;
+        file.sync_all().map_err(|e| {
+            db_error(
+                ErrorKind::DriverSpecific,
+                format!("Failed to sync file {file_num}: {e}"),
+            )
+        })?;
+        // The truncation is on the platter, so the target file owes
+        // nothing further.
+        self.dirty_files.retain(|&num| num != file_num);
+        Ok(())
+    }
+}
+
+/// A test's probe into block I/O, called with `"read"` or `"fsync"`.
+#[cfg(test)]
+pub(crate) type IoHook = Box<dyn Fn(&'static str)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Run on the calling thread just before each block read and each
+    /// fsync, so a test can see what is locked while the I/O runs.
+    pub(crate) static IO_HOOK: std::cell::RefCell<Option<IoHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run [`IO_HOOK`], if a test set one.
+#[cfg(test)]
+fn io_hook(what: &'static str) {
+    IO_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(what);
+        }
+    });
+}
+
+/// Fill `buf` from the file at `offset` without moving the handle's
+/// cursor (Go's `ReadAt`), so reads through one shared handle cannot
+/// disturb each other.
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(test)]
+    io_hook("read");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        // `seek_read` may return short, as `read` may.
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match std::os::windows::fs::FileExt::seek_read(
+                file,
+                &mut buf[filled..],
+                offset + filled as u64,
+            ) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "failed to fill whole buffer",
+                    ));
+                }
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
+}
 
-    fn read_handle(&mut self, file_num: u32) -> Result<&mut File, Error> {
-        if !self.open_files.contains_key(&file_num) {
-            let path = block_file_path(&self.db_path, file_num);
-            let file = File::open(&path).map_err(|e| io_err(&e, "failed to open block file"))?;
-            self.open_files.insert(file_num, file);
-        }
-        Ok(self.open_files.get_mut(&file_num).expect("just inserted"))
-    }
+/// A read handle on one block file, taken from [`BlockStore::reader`]
+/// under the store lock and used after it is released (dcrd reads with
+/// `ReadAt` under the file's read lock, `blockio.go:514-596`).
+pub(crate) struct BlockReader {
+    file: Arc<File>,
+    network: u32,
+}
 
+impl BlockReader {
     /// Read the block record at the location per dcrd `readBlock`:
     /// verifies the checksum (`ErrCorruption` on mismatch) and the
     /// network, returning the raw serialized block.
-    pub(crate) fn read_block(&mut self, loc: BlockLocation) -> Result<Vec<u8>, Error> {
+    pub(crate) fn read_block(&self, loc: BlockLocation) -> Result<Vec<u8>, Error> {
         let network = self.network;
-        let file = self.read_handle(loc.block_file_num)?;
         let mut data = vec![0u8; loc.block_len as usize];
-        file.seek(SeekFrom::Start(u64::from(loc.file_offset)))
-            .map_err(|e| io_err(&e, "failed to seek block file"))?;
-        file.read_exact(&mut data).map_err(|e| {
+        read_exact_at(&self.file, &mut data, u64::from(loc.file_offset)).map_err(|e| {
             io_err(
                 &e,
                 &format!(
@@ -320,86 +581,63 @@ impl BlockStore {
     /// checking against the block length; region reads skip the
     /// checksum for performance, exactly like dcrd.
     pub(crate) fn read_block_region(
-        &mut self,
+        &self,
         loc: BlockLocation,
         offset: u32,
         len: u32,
     ) -> Result<Vec<u8>, Error> {
-        let file = self.read_handle(loc.block_file_num)?;
         // Regions are offsets into the raw block, so skip the network
         // and length bytes of the record.
         let read_offset = u64::from(loc.file_offset) + 8 + u64::from(offset);
         let mut data = vec![0u8; len as usize];
-        file.seek(SeekFrom::Start(read_offset))
-            .map_err(|e| io_err(&e, "failed to seek block file"))?;
-        file.read_exact(&mut data)
+        read_exact_at(&self.file, &mut data, read_offset)
             .map_err(|e| io_err(&e, "failed to read block region"))?;
         Ok(data)
     }
+}
 
-    /// Roll the store back to the given write position, removing any
-    /// later files and truncating the target file (dcrd
-    /// `handleRollback`).  Used both for commit failures and for
-    /// reconciliation after an unclean shutdown.
-    pub(crate) fn rollback_to(&mut self, file_num: u32, offset: u32) -> Result<(), Error> {
-        if self.write_file_num == file_num && self.write_offset == offset {
-            return Ok(());
-        }
+/// The fsyncs a sync owes, captured by [`BlockStore::sync_plan`] under
+/// the store lock and run without it.
+pub(crate) struct SyncPlan {
+    /// File number, path, and the write handle when the file is the
+    /// current write file, in the order the files were written.
+    files: Vec<(u32, PathBuf, Option<Arc<File>>)>,
+}
 
-        self.write_file = None;
-        self.open_files.clear();
-        // Only the files this rollback discards leave the dirty list:
-        // everything *above* `file_num` is deleted below.  Files below
-        // it keep bytes that survive the rollback, so dropping them here
-        // would lose the pending fsync and let the metadata that
-        // describes them be committed first — the exact ordering the
-        // dirty list exists to prevent.
-        //
-        // `file_num` itself stays until its truncation has been synced.
-        // The truncate is what discharges its fsync, so dropping it up
-        // front would leave an unsynced prefix owed to nobody on every
-        // path where the truncate does not happen: an unwritable file,
-        // a full disk, an `EIO` out of `sync_all`.  Each returns an
-        // error, and the store keeps running — the next `sync` has to
-        // still know about it.
-        self.dirty_files.retain(|&num| num <= file_num);
-
-        // Remove any files that are entirely after the target.
-        let mut num = self.write_file_num;
-        while num > file_num {
-            let path = block_file_path(&self.db_path, num);
-            if let Err(e) = fs::remove_file(&path) {
-                return Err(io_err(&e, "failed to remove block file"));
+impl SyncPlan {
+    /// Fsync each owed file in order, stopping at the first failure.
+    /// Returns the files synced, for [`BlockStore::finish_sync`], and the
+    /// failure if there was one.
+    pub(crate) fn run(&self) -> (Vec<u32>, Result<(), Error>) {
+        let mut synced = Vec::with_capacity(self.files.len());
+        for (num, path, handle) in &self.files {
+            #[cfg(test)]
+            io_hook("fsync");
+            let result = match handle {
+                Some(f) => f.sync_all().map_err(|e| io_err(&e, "failed to sync file")),
+                None => {
+                    // Opened for WRITING even though nothing is written
+                    // here.  `fsync(2)` is happy with a read-only
+                    // descriptor, but Windows' `FlushFileBuffers` — which
+                    // is what `sync_all` becomes there — requires write
+                    // access on the handle and fails the whole flush with
+                    // `ERROR_ACCESS_DENIED` (os error 5) without it.
+                    // `create` is deliberately absent: a dirty file that
+                    // has gone missing must surface as an error, not be
+                    // conjured up empty and reported synced.
+                    OpenOptions::new()
+                        .write(true)
+                        .open(path)
+                        .map_err(|e| io_err(&e, "failed to open file to sync"))
+                        .and_then(|f| f.sync_all().map_err(|e| io_err(&e, "failed to sync file")))
+                }
+            };
+            if let Err(e) = result {
+                return (synced, Err(e));
             }
-            num -= 1;
+            synced.push(*num);
         }
-
-        // Truncate the target file to the target offset.
-        let path = block_file_path(&self.db_path, file_num);
-        if offset == 0 && !path.exists() {
-            // Rolling back to the very start of a file that was never
-            // created: there are no bytes to truncate and none to sync.
-            self.dirty_files.retain(|&num| num != file_num);
-            self.write_file_num = file_num;
-            self.write_offset = 0;
-            return Ok(());
-        }
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|e| io_err(&e, "failed to open block file for truncation"))?;
-        file.set_len(u64::from(offset))
-            .map_err(|e| io_err(&e, "failed to truncate block file"))?;
-        file.sync_all()
-            .map_err(|e| io_err(&e, "failed to sync truncated block file"))?;
-        // The truncation is on the platter, so the target file owes
-        // nothing further.
-        self.dirty_files.retain(|&num| num != file_num);
-
-        self.write_file_num = file_num;
-        self.write_offset = offset;
-        Ok(())
+        (synced, Ok(()))
     }
 }
 
@@ -411,7 +649,8 @@ mod tests {
     /// can spread writes across several block files.
     fn small_store(dir: &Path) -> BlockStore {
         // Two records of eight payload bytes each fit in one file.
-        BlockStore::open(dir, 0x1234_5678, 2 * (8 + BLOCK_RECORD_OVERHEAD)).expect("open store")
+        BlockStore::open(dir, 0x1234_5678, 2 * (8 + BLOCK_RECORD_OVERHEAD), None)
+            .expect("open store")
     }
 
     /// Rolling back must not discard the pending fsync for files that
@@ -485,7 +724,7 @@ mod tests {
             .rollback_to(0, 8 + BLOCK_RECORD_OVERHEAD)
             .expect_err("the truncation cannot open a read-only file");
         assert!(
-            format!("{err}").contains("truncation"),
+            format!("{err}").contains("failed to open file"),
             "the failure is the truncating open: {err}"
         );
         assert_eq!(
@@ -565,6 +804,43 @@ mod tests {
             .expect("restore the mode");
         store.sync().expect("sync");
         assert!(store.dirty_files.is_empty());
+    }
+
+    /// A rollback that fails still puts the write cursor back, as dcrd's
+    /// `handleRollback` does in a deferred reposition.
+    ///
+    /// The case that matters is a rotation whose new file was never
+    /// created: removing it fails, and a cursor left on it is staged by
+    /// every later commit as the durable write cursor, which the next
+    /// open then refuses as corrupt.
+    #[test]
+    fn a_failed_rollback_still_repositions_the_write_cursor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = small_store(dir.path());
+        for i in 0..2u8 {
+            store.write_block(&[i; 8]).expect("write block");
+        }
+        let good = (store.write_file_num, store.write_offset);
+        // Where `write_block` leaves the cursor when it has rotated but
+        // could not create the next file.
+        store.write_file = None;
+        store.write_file_num = 1;
+        store.write_offset = 0;
+        assert!(!block_file_path(dir.path(), 1).exists());
+
+        let err = store
+            .rollback_to(good.0, good.1)
+            .expect_err("the never-created file cannot be removed");
+        assert!(
+            err.to_string()
+                .starts_with("Failed to delete block file number 1"),
+            "dcrd's ROLLBACK text: {err}"
+        );
+        assert_eq!(
+            (store.write_file_num, store.write_offset),
+            good,
+            "the cursor goes back whatever failed"
+        );
     }
 
     /// The files a rollback does discard leave the list: they are either

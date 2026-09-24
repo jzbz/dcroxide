@@ -4,7 +4,7 @@
 //! The latch itself is pinned by unit tests that set it directly, which
 //! prove the consequence — once latched, writes refuse — on every
 //! platform. What they cannot prove is the cause: that a genuine device
-//! failure produces an `Err` out of `DbCache::flush` rather than a panic,
+//! failure produces an `Err` out of `DbCache::run_flush` rather than a panic,
 //! a partial apply, or a silently swallowed error. That wiring is three
 //! `map_err` calls, and "three call sites a reader can check" is exactly
 //! the kind of assurance this project has been wrong about before.
@@ -32,6 +32,8 @@
 //! reports success.
 
 #![cfg(target_os = "linux")]
+// Test-harness arithmetic over bounded generation counts.
+#![allow(clippy::arithmetic_side_effects)]
 
 use std::path::Path;
 use std::process::Command;
@@ -141,10 +143,9 @@ fn a_real_enospc_reaches_the_fatal_latch() {
          have passed having checked nothing.\n--- stdout ---\n{stdout}\n\
          --- stderr ---\n{stderr}"
     );
-    for line in stdout
-        .lines()
-        .filter(|l| l.starts_with("first failure") || l.starts_with("ENOSPC"))
-    {
+    for line in stdout.lines().filter(|l| {
+        l.starts_with("first failure") || l.starts_with("store probes") || l.starts_with("ENOSPC")
+    }) {
         println!("  {line}");
     }
 }
@@ -172,7 +173,8 @@ fn inside_the_namespace() {
     let db = Database::create(&opts).expect("create on the small filesystem");
 
     // Write until the filesystem gives out. Each generation is a paired
-    // write of the shape Chain::flush uses.
+    // write of the shape Chain::flush uses, plus one metadata row that
+    // only that generation writes, for the read probes below.
     let mut fatal_err = None;
     for generation in 0u32..4096 {
         let result = db.update(|tx| {
@@ -184,19 +186,20 @@ fn inside_the_namespace() {
                 key[4..].copy_from_slice(&i.to_be_bytes());
                 b.put(&key, &[0xab; 512])?;
             }
+            meta.put(&generation_key(generation), &generation.to_be_bytes())?;
             meta.put(b"utxosetstate", &generation.to_be_bytes())
         });
         if let Err(e) = result {
-            fatal_err = Some(e);
+            fatal_err = Some((generation, e));
             break;
         }
     }
 
-    let first = fatal_err.expect(
+    let (failed_generation, first) = fatal_err.expect(
         "the filesystem never filled -- the injector is not injecting, and this test \
          would have passed having proved nothing",
     );
-    println!("first failure: {first}");
+    println!("first failure: generation {failed_generation}: {first}");
 
     // The failure must arrive as an error, not a panic: reaching this
     // line at all is half the result.
@@ -215,11 +218,64 @@ fn inside_the_namespace() {
     );
 
     // And reads still work, which is the deliberate half of the policy.
+    //
+    // Which layer answers matters. Every commit after the first flushes
+    // the window before it (dcrd's `commitTx` order), and a flush that
+    // succeeds retires what it wrote from the cache overlay, so once
+    // generation g+1 has committed, generation g's rows live in the
+    // store alone. The failing commit was flushing generation
+    // `failed_generation - 1`, whose layer a failed flush leaves
+    // published. Generations up to `failed_generation - 2` are therefore
+    // answered by redb and by nothing else, which needs the failure to
+    // have come at generation 2 or later.
+    assert!(
+        failed_generation >= 2,
+        "the filesystem filled at generation {failed_generation}, before any \
+         generation was flushed and retired to the store, so no probe below \
+         would reach redb"
+    );
+    let newest = failed_generation - 1;
+    let (mut served, mut failed) = (0u32, 0u32);
     db.view(|tx| {
-        let _ = tx.metadata().bucket(b"blockidxv3");
+        let meta = tx.metadata();
+        // Store-resident rows. A page redb can no longer read may fail
+        // (redb keeps failing uncached reads after an I/O error), and
+        // `try_get` must then say so; a row that was written must never
+        // read back as absent.
+        for generation in 0..newest {
+            match meta.try_get(&generation_key(generation)) {
+                Ok(Some(v)) => {
+                    assert_eq!(v, generation.to_be_bytes(), "generation {generation}");
+                    served += 1;
+                }
+                Ok(None) => panic!(
+                    "generation {generation}'s row, flushed to the store before the \
+                     fault, read back as absent"
+                ),
+                Err(e) => {
+                    println!("store read of generation {generation} failed: {e}");
+                    failed += 1;
+                }
+            }
+        }
+        // The newest committed state is still in the overlay, which the
+        // failed flush kept published although the store never took it.
+        assert_eq!(
+            meta.try_get(b"utxosetstate"),
+            Ok(Some(newest.to_be_bytes().to_vec())),
+            "the failed flush's window must stay readable from the overlay"
+        );
         Ok(())
     })
     .expect("reads must stay available after a write fault");
+    println!("store probes after the fault: {served} served, {failed} failed, none absent");
 
     println!("ENOSPC reached the latch; writes refused, reads still served");
+}
+
+/// A metadata key that only one generation writes.
+fn generation_key(generation: u32) -> Vec<u8> {
+    let mut key = b"generation".to_vec();
+    key.extend_from_slice(&generation.to_be_bytes());
+    key
 }
