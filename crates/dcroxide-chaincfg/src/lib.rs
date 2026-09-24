@@ -29,6 +29,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
@@ -204,7 +205,11 @@ pub struct Params {
     pub stake_majority_divisor: i32,
     pub organization_pk_script: Vec<u8>,
     pub organization_pk_script_version: u16,
-    pub block_one_ledger: Vec<TokenPayout>,
+    /// Shared rather than owned: dcrd passes `*Params` everywhere, while
+    /// the port clones `Params` into long-lived owners and per-event
+    /// paths, and mainnet's ledger alone is 3,146 payouts, each with its
+    /// own script allocation.  Nothing mutates it after construction.
+    pub block_one_ledger: Arc<[TokenPayout]>,
     pub pi_keys: Vec<Vec<u8>>,
     pub treasury_vote_interval: u64,
     pub treasury_vote_interval_multiplier: u64,
@@ -488,7 +493,7 @@ impl Params {
     /// amount as u64 LE), used to compare the full ledger compactly.
     pub fn block_one_ledger_hash(&self) -> [u8; 32] {
         let mut buf = Vec::new();
-        for payout in &self.block_one_ledger {
+        for payout in self.block_one_ledger.iter() {
             buf.extend_from_slice(&payout.script_version.to_le_bytes());
             buf.extend_from_slice(&(payout.script.len() as u32).to_le_bytes());
             buf.extend_from_slice(&payout.script);
@@ -510,7 +515,7 @@ pub(crate) fn hex_decode(s: &str) -> Vec<u8> {
 
 /// Build a block-one ledger from the generated concatenated-script data
 /// (dcrd `tokenPayouts` in subsidy.go).
-pub(crate) fn token_payouts(scripts_hex: &str, payouts: &[(usize, i64)]) -> Vec<TokenPayout> {
+pub(crate) fn token_payouts(scripts_hex: &str, payouts: &[(usize, i64)]) -> Arc<[TokenPayout]> {
     let scripts = hex_decode(scripts_hex);
     let mut ledger = Vec::with_capacity(payouts.len());
     let mut offset = 0;
@@ -522,5 +527,34 @@ pub(crate) fn token_payouts(scripts_hex: &str, payouts: &[(usize, i64)]) -> Vec<
         });
         offset = end;
     }
-    ledger
+    ledger.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cloning `Params` shares the block-one ledger instead of copying
+    /// every payout script: dcrd passes `*Params` by pointer, and the
+    /// port clones it on per-event notification, RPC and template
+    /// paths, where copying mainnet's 3,146 scripts cost tens of
+    /// microseconds per clone.
+    #[test]
+    fn params_clone_shares_block_one_ledger() {
+        for params in [
+            mainnet_params(),
+            testnet3_params(),
+            simnet_params(),
+            regnet_params(),
+        ] {
+            let clone = params.clone();
+            assert!(
+                Arc::ptr_eq(&params.block_one_ledger, &clone.block_one_ledger),
+                "{}: the clone copied the block-one ledger",
+                params.name
+            );
+            assert_eq!(clone, params);
+        }
+        assert_eq!(mainnet_params().block_one_ledger.len(), 3146);
+    }
 }

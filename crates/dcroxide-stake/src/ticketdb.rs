@@ -4,9 +4,9 @@
 //! database info row, the best chain state, per-block undo data,
 //! ticket hash lists, and individual ticket rows, all little-endian.
 //!
-//! The `database.Tx`-coupled put/fetch/create wrappers arrive with the
-//! chain engine persistence wiring; the bucket names and version
-//! constants they use are exposed here.  In the deserializers Go
+//! The `database.Tx`-coupled put/fetch/create wrappers live in
+//! `stakedb`; the bucket names and version constants they use are
+//! exposed here.  In the deserializers Go
 //! distinguishes nil from empty slices (nil undo/hash data falls
 //! through to a short-read error while an empty non-nil slice decodes
 //! to an empty list); the callers only reach these with non-nil data,

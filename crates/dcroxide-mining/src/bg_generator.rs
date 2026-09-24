@@ -4,8 +4,9 @@
 //! concurrency shell — the regen queue, the subscriber fan-out
 //! goroutine, the async generation goroutines, and the real timers —
 //! has no synchronous counterpart: timers appear here as armed flags
-//! with recorded durations for the daemon to drive, and template
-//! generation requests are recorded as actions the daemon executes.
+//! with recorded durations and arm generations for the daemon to
+//! drive, and template generation requests are recorded as actions the
+//! daemon executes.
 
 use alloc::collections::BTreeSet;
 use alloc::string::String;
@@ -71,6 +72,11 @@ pub struct BgTemplateState {
     /// The duration the regen timer was last armed with, in
     /// milliseconds.
     pub regen_timer_millis: u64,
+    /// Bumped on every regen timer reset (dcrd `resetRegenTimer`), which
+    /// restarts the countdown even when the timer was already armed with
+    /// the same duration; the daemon recomputes the deadline whenever
+    /// this changes.
+    pub regen_timer_gen: u64,
     /// The timestamp the current template was generated (dcrd
     /// `lastGeneratedTime`).
     pub last_generated_time: i64,
@@ -80,12 +86,20 @@ pub struct BgTemplateState {
     /// Whether the max-votes propagation timeout is armed (dcrd
     /// `maxVotesTimeout`).
     pub max_votes_timeout_armed: bool,
+    /// Bumped on every arm of the max-votes timeout.  Each dcrd arm is a
+    /// fresh `time.After` that replaces any pending one, including one
+    /// still armed for a previous tip; the daemon recomputes the
+    /// deadline whenever this changes and otherwise leaves it alone.
+    pub max_votes_timeout_gen: u64,
     /// The side chain blocks being monitored for votes (dcrd
     /// `awaitingSideChainMinVotes`).
     pub awaiting_side_chain_min_votes: BTreeSet<Hash>,
     /// Whether the side chain tracking timeout is armed (dcrd
     /// `trackSideChainsTimeout`).
     pub track_side_chains_timeout_armed: bool,
+    /// Bumped on every arm of the side chain tracking timeout (a fresh
+    /// dcrd `time.After`), as for [`Self::max_votes_timeout_gen`].
+    pub track_side_chains_timeout_gen: u64,
     /// Whether the failed-generation retry timeout is armed (dcrd
     /// `failedGenRetryTimeout`).
     pub failed_gen_retry_timeout_armed: bool,
@@ -104,11 +118,14 @@ impl BgTemplateState {
             is_reorganizing: false,
             regen_timer_armed: false,
             regen_timer_millis: 0,
+            regen_timer_gen: 0,
             last_generated_time: 0,
             awaiting_min_votes_hash: None,
             max_votes_timeout_armed: false,
+            max_votes_timeout_gen: 0,
             awaiting_side_chain_min_votes: BTreeSet::new(),
             track_side_chains_timeout_armed: false,
+            track_side_chains_timeout_gen: 0,
             failed_gen_retry_timeout_armed: false,
             base_block_hash: Hash([0u8; 32]),
             base_block_height: 0,
@@ -125,6 +142,21 @@ impl BgTemplateState {
     fn reset_regen_timer(&mut self, millis: u64) {
         self.regen_timer_armed = true;
         self.regen_timer_millis = millis;
+        self.regen_timer_gen = self.regen_timer_gen.wrapping_add(1);
+    }
+
+    /// Arm the max-votes timeout with a fresh countdown (dcrd
+    /// `state.maxVotesTimeout = time.After(maxVoteTimeoutDuration)`).
+    fn arm_max_votes_timeout(&mut self) {
+        self.max_votes_timeout_armed = true;
+        self.max_votes_timeout_gen = self.max_votes_timeout_gen.wrapping_add(1);
+    }
+
+    /// Arm the side chain tracking timeout with a fresh countdown (dcrd
+    /// `state.trackSideChainsTimeout = time.After(minVotesTimeoutDuration)`).
+    fn arm_track_side_chains_timeout(&mut self) {
+        self.track_side_chains_timeout_armed = true;
+        self.track_side_chains_timeout_gen = self.track_side_chains_timeout_gen.wrapping_add(1);
     }
 
     /// Clear all side chain vote tracking (dcrd
@@ -213,9 +245,14 @@ impl BgGenerator {
         });
     }
 
-    /// Set the current template state (dcrd `setCurrentTemplate`; the
-    /// daemon additionally queues the corresponding template-update
-    /// regen event).
+    /// Set the current template state (dcrd `setCurrentTemplate`).
+    /// dcrd's call also queues an `rtTemplateUpdated` regen event for
+    /// the result; here the caller runs it: the daemon feeds
+    /// [`BgRegenEvent::TemplateUpdated`] after a build, and a failed tip
+    /// lookup goes through [`set_failed_template`].  The event for the
+    /// cleared template a reorg start installs is dcrd's no-op
+    /// (`handleTemplateUpdate` with neither a template nor an error), so
+    /// nothing runs it.
     pub fn set_current_template(
         &mut self,
         template: Option<BlockTemplate>,
@@ -225,6 +262,20 @@ impl BgGenerator {
         self.template = template;
         self.template_reason = reason;
         self.template_err = err;
+    }
+
+    /// Whether the parent is among the recently notified parents, making
+    /// it the most recently used entry when it is (dcrd
+    /// `lru.Set.Contains`, which refreshes a hit's priority: the next
+    /// new parent then evicts a different entry than a plain membership
+    /// test would).
+    fn notified_parents_contains(&mut self, parent: &Hash) -> bool {
+        let Some(i) = self.notified_parents.iter().position(|h| h == parent) else {
+            return false;
+        };
+        let hit = self.notified_parents.remove(i);
+        self.notified_parents.insert(0, hit);
+        true
     }
 
     /// Whether the current template is valid, builds on the provided
@@ -274,12 +325,12 @@ impl BgGenerator {
         // first notification sent for a new parent has that reason.
         let prev_block = template.block.header.prev_block;
         if reason == BgTemplateUpdateReason::NewVotes
-            && !self.notified_parents.contains(&prev_block)
+            && !self.notified_parents_contains(&prev_block)
         {
             reason = BgTemplateUpdateReason::NewParent;
         }
         if reason == BgTemplateUpdateReason::NewParent {
-            // An LRU of size 3.
+            // An LRU of size 3 (dcrd `lru.Set.Put`).
             self.notified_parents.retain(|h| *h != prev_block);
             self.notified_parents.insert(0, prev_block);
             self.notified_parents.truncate(3);
@@ -347,7 +398,7 @@ pub fn handle_block_connected(
         state.failed_gen_retry_timeout_armed = false;
         state.base_block_hash = block_hash;
         state.base_block_height = block_height;
-        state.max_votes_timeout_armed = true;
+        state.arm_max_votes_timeout();
         return;
     }
 
@@ -356,7 +407,7 @@ pub fn handle_block_connected(
     // the same parent, preventing vote-withholding advantages.
     state.stop_regen_timer();
     state.awaiting_min_votes_hash = Some(block_hash);
-    state.track_side_chains_timeout_armed = true;
+    state.arm_track_side_chains_timeout();
 }
 
 /// Handle a disconnected block (dcrd `handleBlockDisconnected`).
@@ -470,7 +521,9 @@ pub fn handle_vote(
             }
 
             // Give the remaining votes an opportunity to propagate.
-            state.max_votes_timeout_armed = true;
+            // The timer is a fresh one even when the previous tip's is
+            // still pending (dcrd assigns a new `time.After`).
+            state.arm_max_votes_timeout();
         }
         return;
     }
@@ -628,7 +681,7 @@ pub fn handle_regen_event(
             let chain_tip = chain.best_snapshot();
             match chain.block_by_hash(&chain_tip.hash) {
                 Err(err) => {
-                    g.set_current_template(None, BgTemplateUpdateReason::Unknown, Some(err));
+                    set_failed_template(g, state, chain, tx_source, err, is_current, now_unix);
                 }
                 Ok(tip_block) => {
                     handle_block_connected(g, state, tx_source, &tip_block, &chain_tip);
@@ -674,6 +727,38 @@ pub fn handle_regen_event(
         }
         BgRegenEvent::ReorgStarted | BgRegenEvent::ReorgDone => unreachable!("handled above"),
     }
+}
+
+/// Record a failed tip block lookup — at startup or when a reorg
+/// finishes, a failure dcrd calls impossible — as the current template
+/// error (dcrd `setCurrentTemplate(nil, turUnknown, err)`), and run the
+/// `rtTemplateUpdated` event that call queues.  The event goes through
+/// [`handle_regen_event`]'s gates like any other; past them,
+/// `handleTemplateUpdate` arms the one-second failed-generation retry,
+/// so the generator recovers instead of serving the error until an
+/// unrelated event arrives.
+///
+/// dcrd queues the event behind whatever regen events are already
+/// waiting; the state machine has no queue, so it runs here at once.
+pub fn set_failed_template(
+    g: &mut BgGenerator,
+    state: &mut BgTemplateState,
+    chain: &mut dyn TemplateChain,
+    tx_source: &dyn TemplateTxSource,
+    err: String,
+    is_current: bool,
+    now_unix: i64,
+) {
+    g.set_current_template(None, BgTemplateUpdateReason::Unknown, Some(err));
+    handle_regen_event(
+        g,
+        state,
+        chain,
+        tx_source,
+        BgRegenEvent::TemplateUpdated(None, true),
+        is_current,
+        now_unix,
+    );
 }
 
 /// The tip siblings sorted by their number of votes in descending

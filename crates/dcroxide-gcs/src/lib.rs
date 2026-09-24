@@ -113,6 +113,46 @@ fn reduce(version: u16, x: u64, n: u64) -> u64 {
     }
 }
 
+/// The filter's hashed entries reduced to `[0, N*M)` and sorted, with
+/// the modulus `N*M` they were reduced over (the value pipeline of dcrd
+/// `newFilter`).  Version 2 skips empty entries and removes duplicate
+/// hashes, so `N` counts the distinct hashes.
+///
+/// dcrd deduplicates through a map, reduces, then sorts.  Version 2
+/// here sorts the raw hashes, drops adjacent duplicates and reduces in
+/// place instead: `fast_reduce` is monotone non-decreasing in its
+/// input, so the reduced values come out already sorted and equal to
+/// dcrd's, with no set and no second sort on the per-block filter
+/// build.  Version 1 keeps every entry and its modulo reduction is not
+/// monotone, so it reduces and then sorts as dcrd does.
+fn sorted_values(version: u16, m: u64, k0: u64, k1: u64, data: &[&[u8]]) -> (u64, Vec<u64>) {
+    let mut values: Vec<u64> = Vec::with_capacity(data.len());
+    if version == 1 {
+        for d in data {
+            values.push(siphash(k0, k1, d));
+        }
+    } else {
+        for d in data {
+            if d.is_empty() {
+                continue;
+            }
+            values.push(siphash(k0, k1, d));
+        }
+        values.sort_unstable();
+        values.dedup();
+    }
+
+    // The modulus wraps on overflow exactly like Go's uint64 multiply.
+    let modulus_nm = (values.len() as u64).wrapping_mul(m);
+    for v in values.iter_mut() {
+        *v = reduce(version, *v, modulus_nm);
+    }
+    if version == 1 {
+        values.sort_unstable();
+    }
+    (modulus_nm, values)
+}
+
 /// The shared filter core (dcrd's unexported `filter`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Filter {
@@ -157,47 +197,20 @@ impl Filter {
         let k0 = u64::from_le_bytes(key[0..8].try_into().expect("8 bytes"));
         let k1 = u64::from_le_bytes(key[8..16].try_into().expect("8 bytes"));
 
-        // Hash the entries; version 2 skips empty entries and
-        // deduplicates.
-        let mut values: Vec<u64> = Vec::with_capacity(data.len());
-        if version == 1 {
-            for d in data {
-                values.push(siphash(k0, k1, d));
-            }
-        } else {
-            let mut seen: alloc::collections::BTreeSet<u64> = alloc::collections::BTreeSet::new();
-            for d in data {
-                if d.is_empty() {
-                    continue;
-                }
-                let v = siphash(k0, k1, d);
-                if seen.insert(v) {
-                    values.push(v);
-                }
-            }
-        }
-
+        let (modulus_nm, values) = sorted_values(version, m, k0, k1, data);
         let num_entries = values.len() as u64;
         let mod_b_mask = (1u64 << b) - 1;
         let mut f = Filter {
             version,
             n: num_entries as u32,
             b,
-            // The modulus wraps on overflow exactly like Go's uint64
-            // multiply.
-            modulus_nm: num_entries.wrapping_mul(m),
+            modulus_nm,
             filter_n_data: Vec::new(),
             data_offset: 0,
         };
         if values.is_empty() {
             return Ok(f);
         }
-
-        // Reduce the hashes to the multiple of the modulus and sort.
-        for v in values.iter_mut() {
-            *v = reduce(version, *v, f.modulus_nm);
-        }
-        values.sort_unstable();
 
         // Golomb/Rice-code the sorted deltas.
         let mut w = BitWriter::default();
@@ -459,7 +472,7 @@ impl FilterV2 {
             n = read_var_int(&mut r).map_err(|e| {
                 gcs_error(
                     ErrorKind::Misserialized,
-                    alloc::format!("failed to read number of filter items: {e:?}"),
+                    alloc::format!("failed to read number of filter items: {e}"),
                 )
             })?;
             data_offset = var_int_serialize_size(n);
@@ -536,4 +549,72 @@ pub fn max_filter_v2_size(b: u8, m: u64, n: u32) -> u64 {
         .wrapping_add(n.wrapping_mul(u64::from(b)))
         .wrapping_add(max_quo_bits);
     max_bits.wrapping_add(7) / 8 + n_ser_size
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dcroxide_testutil::SplitMix64;
+
+    /// dcrd `newFilter`'s value pipeline as written there: dedupe the
+    /// hashes through a set (version 2), reduce every value, then sort.
+    fn dcrd_values(version: u16, m: u64, k0: u64, k1: u64, data: &[&[u8]]) -> (u64, Vec<u64>) {
+        let mut values = Vec::new();
+        let mut seen = alloc::collections::BTreeSet::new();
+        for d in data {
+            if version == 2 && d.is_empty() {
+                continue;
+            }
+            let v = siphash(k0, k1, d);
+            if version == 1 || seen.insert(v) {
+                values.push(v);
+            }
+        }
+        let modulus_nm = (values.len() as u64).wrapping_mul(m);
+        for v in values.iter_mut() {
+            *v = reduce(version, *v, modulus_nm);
+        }
+        values.sort_unstable();
+        (modulus_nm, values)
+    }
+
+    /// Sorting and deduplicating the raw version 2 hashes before the
+    /// monotone reduction yields exactly dcrd's reduce-then-sort values,
+    /// including when distinct hashes reduce to the same value (a tiny
+    /// `M`) and when the modulus wraps (a huge `M`).
+    #[test]
+    fn sorted_values_match_dcrds_pipeline() {
+        let mut rng = SplitMix64::from_entropy("gcs-sorted-values");
+        for round in 0..2000 {
+            let version = 1 + (round % 2) as u16;
+            let m = match rng.below(4) {
+                0 => 1,
+                1 => rng.below(8) + 1,
+                2 => blockcf2::M,
+                _ => u64::MAX - rng.below(1 << 20),
+            };
+            let (k0, k1) = (rng.next_u64(), rng.next_u64());
+            let n = rng.below(64) as usize;
+            let mut entries: Vec<Vec<u8>> = Vec::with_capacity(n);
+            for _ in 0..n {
+                match rng.below(6) {
+                    0 => entries.push(Vec::new()),
+                    1 if !entries.is_empty() => {
+                        let i = rng.below(entries.len() as u64) as usize;
+                        entries.push(entries[i].clone());
+                    }
+                    _ => {
+                        let len = rng.below(8) as usize + 1;
+                        entries.push(rng.bytes(len));
+                    }
+                }
+            }
+            let refs: Vec<&[u8]> = entries.iter().map(Vec::as_slice).collect();
+            assert_eq!(
+                sorted_values(version, m, k0, k1, &refs),
+                dcrd_values(version, m, k0, k1, &refs),
+                "round {round}: version {version}, m {m}"
+            );
+        }
+    }
 }

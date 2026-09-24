@@ -150,7 +150,7 @@ fn block_one_ledgers_have_expected_totals() {
     for (params, (name, count, total)) in all_networks().iter().zip(want) {
         assert_eq!(params.block_one_ledger.len(), count, "{name}: ledger count");
         assert_eq!(params.block_one_subsidy(), total, "{name}: ledger total");
-        for payout in &params.block_one_ledger {
+        for payout in params.block_one_ledger.iter() {
             assert_eq!(payout.script_version, 0, "{name}: ledger script version");
             assert!(payout.amount > 0, "{name}: non-positive ledger amount");
             assert!(!payout.script.is_empty(), "{name}: empty ledger script");

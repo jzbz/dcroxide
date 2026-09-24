@@ -330,6 +330,36 @@ fn bucket_missing(name: &[u8]) -> IdxError {
     )
 }
 
+/// The transaction index's lookups, detached from the index mutex
+/// (dcrd's `TxIndex.Entry` and `Tip`, which read the database with no
+/// index-wide lock held).
+///
+/// The daemon shares `TxIndex` behind a mutex that the index writer
+/// holds through its wait for the database writer and a whole block's
+/// index work.  `getrawtransaction` needs none of that, so it reads
+/// through this handle, taken once, and never waits on the writer.
+#[derive(Clone)]
+pub struct TxIndexQuery {
+    db: Arc<Database>,
+}
+
+impl TxIndexQuery {
+    /// The current index tip (dcrd `TxIndex.Tip`).
+    pub fn tip(&self) -> Result<(i64, Hash), IdxError> {
+        tip(&self.db, TX_INDEX_KEY)
+    }
+
+    /// Details for the provided transaction hash from the transaction
+    /// index (dcrd `TxIndex.Entry`).  When there is no entry for the
+    /// provided hash, `None` is returned.
+    pub fn entry(&self, hash: &Hash) -> Result<Option<TxIndexEntry>, IdxError> {
+        let db_tx = self.db.begin(false)?;
+        let res = db_fetch_tx_index_entry(&db_tx, hash);
+        db_tx.rollback()?;
+        res
+    }
+}
+
 /// The transaction by hash index (dcrd `TxIndex`).
 pub struct TxIndex {
     cur_block_id: u32,
@@ -484,10 +514,15 @@ impl TxIndex {
     /// index (dcrd `TxIndex.Entry`).  When there is no entry for the
     /// provided hash, `None` is returned.
     pub fn entry(&self, hash: &Hash) -> Result<Option<TxIndexEntry>, IdxError> {
-        let db_tx = self.db.begin(false)?;
-        let res = db_fetch_tx_index_entry(&db_tx, hash);
-        db_tx.rollback()?;
-        res
+        self.query().entry(hash)
+    }
+
+    /// A lookup handle that does not borrow the index; see
+    /// [`TxIndexQuery`].
+    pub fn query(&self) -> TxIndexQuery {
+        TxIndexQuery {
+            db: Arc::clone(&self.db),
+        }
     }
 }
 
@@ -569,6 +604,16 @@ impl Indexer for TxIndex {
 }
 
 /// Drop the internal block id index (dcrd `dropBlockIDIndex`).
+///
+/// A bucket that is already gone is an error, as it is in dcrd (ffldb's
+/// `ErrBucketNotFound`), and this is a reproduced dcrd bug.
+/// [`drop_tx_index`] commits the block-ID deletion and the metadata
+/// removal separately, so a crash between the two leaves the drop
+/// marker behind with these buckets already gone; every later resumed
+/// drop, on a `--txindex` start or a `--droptxindex`, then fails here
+/// and the index can neither be dropped nor rebuilt without editing the
+/// database by hand.  Recorded in QUIRKS.md; pinned by
+/// `a_drop_resumed_after_the_block_id_buckets_went_fails_as_in_dcrd`.
 fn drop_block_id_index(db: &Database) -> Result<(), IdxError> {
     let db_tx = db.begin(true)?;
     let res: Result<(), dcroxide_database::Error> = (|| {
@@ -611,4 +656,64 @@ pub fn drop_tx_index(interrupt: &Interrupt, db: &Database) -> Result<(), IdxErro
     // Remove the index tip, version, bucket, and in-progress drop
     // flag now that all index entries have been removed.
     drop_index_metadata(db, TX_INDEX_KEY)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{
+        INDEX_TIPS_BUCKET_NAME, db_put_indexer_version, index_drop_key, mark_index_deletion,
+    };
+    use dcroxide_database::Options;
+
+    /// A crash after `drop_block_id_index` commits and before
+    /// `drop_index_metadata` does leaves the tip, version and drop marker
+    /// with the block-ID buckets gone.  dcrd's `DropTxIndex` then fails at
+    /// `dropBlockIDIndex` on every resume, and so does the port: the
+    /// reproduced bug is kept, not repaired (QUIRKS.md).
+    #[test]
+    fn a_drop_resumed_after_the_block_id_buckets_went_fails_as_in_dcrd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = Options::new(dir.path().join("db"), 0x12141c16);
+        let db = Database::create(&opts).expect("create");
+
+        // The state the crash leaves: the index tip, version and drop
+        // marker, and the (already emptied) index bucket, with the
+        // block-ID buckets deleted.
+        let db_tx = db.begin(true).expect("begin");
+        db_tx
+            .metadata()
+            .create_bucket(INDEX_TIPS_BUCKET_NAME)
+            .expect("tips bucket");
+        db_put_indexer_tip(&db_tx, TX_INDEX_KEY, &Hash::ZERO, 0).expect("tip");
+        db_put_indexer_version(&db_tx, TX_INDEX_KEY, TX_INDEX_VERSION).expect("version");
+        db_tx
+            .metadata()
+            .create_bucket(TX_INDEX_KEY)
+            .expect("index bucket");
+        db_tx.commit().expect("commit");
+        mark_index_deletion(&db, TX_INDEX_KEY).expect("mark");
+
+        let interrupt: Interrupt = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        for attempt in 0..2 {
+            match drop_tx_index(&interrupt, &db) {
+                Err(IdxError::Db(err)) => assert_eq!(
+                    err.kind,
+                    dcroxide_database::ErrorKind::BucketNotFound,
+                    "attempt {attempt}: {err}"
+                ),
+                other => panic!("attempt {attempt}: dcrd fails the resumed drop, got {other:?}"),
+            }
+
+            // The marker survives, so the next start resumes the same
+            // failing drop.
+            let db_tx = db.begin(false).expect("begin");
+            let marked = db_tx
+                .metadata()
+                .bucket(INDEX_TIPS_BUCKET_NAME)
+                .is_some_and(|b| b.get(&index_drop_key(TX_INDEX_KEY)).is_some());
+            db_tx.rollback().expect("rollback");
+            assert!(marked, "attempt {attempt}: the drop marker survives");
+        }
+    }
 }

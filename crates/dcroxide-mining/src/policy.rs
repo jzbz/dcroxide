@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: ISC
 
-//! The mining priority calculation from dcrd's `policy.go` (the
-//! template policy struct itself arrives with the block template
-//! generation).
+//! The mining priority calculation from dcrd's `policy.go`
+//! (`calcInputValueAge` and `CalcPriority`).  dcrd's `Policy` struct
+//! from the same file is [`MiningPolicy`](crate::MiningPolicy) in
+//! `generator.rs`, with its `StandardVerifyFlags` closure on the
+//! [`TemplateChain`](crate::TemplateChain) trait.
 
 use dcroxide_wire::{MsgTx, OutPoint};
 
@@ -33,8 +35,11 @@ pub fn calc_input_value_age(
                 next_block_height - origin_height
             };
 
-            // Sum the input value times age.
-            total_input_age += (input_value * input_age) as f64;
+            // Sum the input value times age.  Go multiplies in int64,
+            // which wraps: an old enough large output contributes a
+            // negative age, and a plain `*` would panic instead in an
+            // overflow-checked build.
+            total_input_age += input_value.wrapping_mul(input_age) as f64;
         }
     }
     total_input_age
@@ -67,4 +72,59 @@ pub fn calc_priority(
 
     let input_value_age = calc_input_value_age(tx, priority_input, next_block_height);
     input_value_age / (serialized_tx_size - overhead) as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use alloc::vec;
+    use dcroxide_chainhash::Hash;
+    use dcroxide_wire::{TX_TREE_REGULAR, TxIn, TxOut};
+
+    /// A one-input transaction spending an output worth 1e13 atoms
+    /// (100k DCR) confirmed at height 100, evaluated for a block at
+    /// height 1,050,000.
+    fn old_large_spend() -> (MsgTx, OutPoint) {
+        let prev_out = OutPoint {
+            hash: Hash([7u8; 32]),
+            index: 0,
+            tree: TX_TREE_REGULAR,
+        };
+        let mut tx = MsgTx::default();
+        tx.tx_in.push(TxIn {
+            previous_out_point: prev_out,
+            sequence: 0xffff_ffff,
+            value_in: 10_000_000_000_000,
+            block_height: 100,
+            block_index: 0,
+            signature_script: vec![],
+        });
+        tx.tx_out.push(TxOut {
+            value: 9_999_999_990_000,
+            version: 0,
+            pk_script: vec![0x51],
+        });
+        (tx, prev_out)
+    }
+
+    /// dcrd computes `float64(inputValue * inputAge)` in int64: 1e13
+    /// atoms aged 1,049,900 blocks is 1.0499e19, past `i64::MAX`, and
+    /// wraps to -7,947,744,073,709,551,616.  The port used a plain `*`,
+    /// which panics in this (overflow-checked) test build.
+    #[test]
+    fn the_input_age_product_wraps_like_go() {
+        let (tx, prev_out) = old_large_spend();
+        let lookup = |op: &OutPoint| (*op == prev_out).then_some((100i64, 10_000_000_000_000i64));
+
+        let age = calc_input_value_age(&tx, lookup, 1_050_000);
+        assert_eq!(age, -7_947_744_073_709_551_616i64 as f64);
+
+        // The wrapped, negative age carries through to the priority.
+        let size = tx.serialize_size();
+        let overhead = 58;
+        let priority = calc_priority(&tx, lookup, 1_050_000);
+        assert_eq!(priority, age / (size - overhead) as f64);
+        assert!(priority < 0.0);
+    }
 }

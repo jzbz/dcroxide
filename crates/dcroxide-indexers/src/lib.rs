@@ -24,7 +24,7 @@ pub use common::{ChainQueryer, Indexer, Interrupt, SyncWaiter};
 pub use error::{ErrorKind, IdxError, IndexerError};
 pub use existsaddrindex::{
     ADDR_KEY_SIZE, EXISTS_ADDR_INDEX_KEY, EXISTS_ADDRESS_INDEX_NAME, ExistsAddrIndex,
-    ExistsAddrQuery, addr_to_key, drop_exists_addr_index,
+    ExistsAddrQuery, ExistsAddrUnconfirmed, addr_to_key, drop_exists_addr_index,
 };
 pub use legacydrops::{ADDR_INDEX_KEY, CF_INDEX_PARENT_BUCKET_KEY, drop_addr_index, drop_cf_index};
 pub use subscriber::{
@@ -33,5 +33,5 @@ pub use subscriber::{
 };
 pub use txindex::{
     HASH_BY_ID_INDEX_BUCKET_NAME, ID_BY_HASH_INDEX_BUCKET_NAME, TX_INDEX_KEY, TX_INDEX_NAME,
-    TxIndex, TxIndexEntry, drop_tx_index,
+    TxIndex, TxIndexEntry, TxIndexQuery, drop_tx_index,
 };

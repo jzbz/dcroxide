@@ -9,6 +9,7 @@
 //! ticket database serialization vectors.
 
 use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -64,7 +65,7 @@ pub fn db_put_database_info(tx: &Transaction, dbi: &DatabaseInfo) -> Result<(), 
     let meta = tx.metadata();
     let bucket = meta
         .bucket(STAKE_DB_INFO_BUCKET_NAME)
-        .ok_or_else(missing_bucket)?;
+        .ok_or_else(|| missing_bucket(STAKE_DB_INFO_BUCKET_NAME))?;
     Ok(bucket.put(STAKE_DB_INFO_BUCKET_NAME, &serialize_database_info(dbi))?)
 }
 
@@ -110,7 +111,7 @@ pub fn db_fetch_block_undo_data(
     let meta = tx.metadata();
     let bucket = meta
         .bucket(STAKE_BLOCK_UNDO_DATA_BUCKET_NAME)
-        .ok_or_else(missing_bucket)?;
+        .ok_or_else(|| missing_bucket(STAKE_BLOCK_UNDO_DATA_BUCKET_NAME))?;
     let v = bucket.get(&height.to_le_bytes()).ok_or_else(|| {
         ticket_db_error(
             TicketDbErrorKind::MissingKey,
@@ -130,7 +131,7 @@ pub fn db_put_block_undo_data(
     let meta = tx.metadata();
     let bucket = meta
         .bucket(STAKE_BLOCK_UNDO_DATA_BUCKET_NAME)
-        .ok_or_else(missing_bucket)?;
+        .ok_or_else(|| missing_bucket(STAKE_BLOCK_UNDO_DATA_BUCKET_NAME))?;
     Ok(bucket.put(&height.to_le_bytes(), &serialize_block_undo_data(utds))?)
 }
 
@@ -140,7 +141,7 @@ pub fn db_drop_block_undo_data(tx: &Transaction, height: u32) -> Result<(), Stak
     let meta = tx.metadata();
     let bucket = meta
         .bucket(STAKE_BLOCK_UNDO_DATA_BUCKET_NAME)
-        .ok_or_else(missing_bucket)?;
+        .ok_or_else(|| missing_bucket(STAKE_BLOCK_UNDO_DATA_BUCKET_NAME))?;
     Ok(bucket.delete(&height.to_le_bytes())?)
 }
 
@@ -150,7 +151,7 @@ pub fn db_fetch_new_tickets(tx: &Transaction, height: u32) -> Result<Vec<Hash>, 
     let meta = tx.metadata();
     let bucket = meta
         .bucket(TICKETS_IN_BLOCK_BUCKET_NAME)
-        .ok_or_else(missing_bucket)?;
+        .ok_or_else(|| missing_bucket(TICKETS_IN_BLOCK_BUCKET_NAME))?;
     let v = bucket.get(&height.to_le_bytes()).ok_or_else(|| {
         ticket_db_error(TicketDbErrorKind::MissingKey, "missing key for new tickets")
     })?;
@@ -163,7 +164,7 @@ pub fn db_put_new_tickets(tx: &Transaction, height: u32, ths: &[Hash]) -> Result
     let meta = tx.metadata();
     let bucket = meta
         .bucket(TICKETS_IN_BLOCK_BUCKET_NAME)
-        .ok_or_else(missing_bucket)?;
+        .ok_or_else(|| missing_bucket(TICKETS_IN_BLOCK_BUCKET_NAME))?;
     Ok(bucket.put(&height.to_le_bytes(), &serialize_ticket_hashes(ths))?)
 }
 
@@ -173,19 +174,33 @@ pub fn db_drop_new_tickets(tx: &Transaction, height: u32) -> Result<(), StakeDbE
     let meta = tx.metadata();
     let bucket = meta
         .bucket(TICKETS_IN_BLOCK_BUCKET_NAME)
-        .ok_or_else(missing_bucket)?;
+        .ok_or_else(|| missing_bucket(TICKETS_IN_BLOCK_BUCKET_NAME))?;
     Ok(bucket.delete(&height.to_le_bytes())?)
 }
 
 /// Remove a ticket row from the given ticket bucket (dcrd
-/// `DbDeleteTicket`).
+/// `DbDeleteTicket`).  Unlike a plain bucket delete, which succeeds on a
+/// missing key, this fails with `ErrMissingKey` when the row is absent,
+/// so a bucket move over on-disk ticket state that has drifted from the
+/// stake node aborts the block's update rather than committing it.
 pub fn db_delete_ticket(
     tx: &Transaction,
     ticket_bucket: &[u8],
     hash: &Hash,
 ) -> Result<(), StakeDbError> {
     let meta = tx.metadata();
-    let bucket = meta.bucket(ticket_bucket).ok_or_else(missing_bucket)?;
+    let bucket = meta
+        .bucket(ticket_bucket)
+        .ok_or_else(|| missing_bucket(ticket_bucket))?;
+
+    // Check to see if the value exists before we delete it.
+    if bucket.get(&hash.0).is_none() {
+        return Err(ticket_db_error(
+            TicketDbErrorKind::MissingKey,
+            &format!("missing key {hash} to delete"),
+        )
+        .into());
+    }
     Ok(bucket.delete(&hash.0)?)
 }
 
@@ -203,7 +218,9 @@ pub fn db_put_ticket(
     expired: bool,
 ) -> Result<(), StakeDbError> {
     let meta = tx.metadata();
-    let bucket = meta.bucket(ticket_bucket).ok_or_else(missing_bucket)?;
+    let bucket = meta
+        .bucket(ticket_bucket)
+        .ok_or_else(|| missing_bucket(ticket_bucket))?;
     Ok(bucket.put(
         &hash.0,
         &serialize_ticket_value(height, missed, revoked, spent, expired),
@@ -217,7 +234,9 @@ pub fn db_load_all_tickets(
     ticket_bucket: &[u8],
 ) -> Result<Immutable, StakeDbError> {
     let meta = tx.metadata();
-    let bucket = meta.bucket(ticket_bucket).ok_or_else(missing_bucket)?;
+    let bucket = meta
+        .bucket(ticket_bucket)
+        .ok_or_else(|| missing_bucket(ticket_bucket))?;
     let mut treap = Immutable::new();
     let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     bucket.for_each(|k: &[u8], v: &[u8]| {
@@ -562,9 +581,15 @@ pub fn write_disconnected_best_node(
     Ok(())
 }
 
-fn missing_bucket() -> StakeDbError {
+/// A required ticket database bucket is absent.  dcrd has no error for
+/// this -- it dereferences the nil bucket -- so the port reports its
+/// otherwise unused `ErrUninitializedBucket` kind and names the bucket.
+fn missing_bucket(name: &[u8]) -> StakeDbError {
     StakeDbError::Ticket(ticket_db_error(
-        TicketDbErrorKind::UndoDataCorrupt,
-        "required ticket database bucket is missing",
+        TicketDbErrorKind::UninitializedBucket,
+        &format!(
+            "required ticket database bucket {} is missing",
+            String::from_utf8_lossy(name)
+        ),
     ))
 }

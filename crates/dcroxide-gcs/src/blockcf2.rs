@@ -34,28 +34,45 @@ pub struct PrevScriptError {
     pub tx_in_idx: usize,
 }
 
-/// The entries a filter is built from (dcrd `Entries`).
-#[derive(Default)]
-pub struct Entries(pub Vec<Vec<u8>>);
+impl core::fmt::Display for PrevScriptError {
+    /// dcrd `PrevScriptError.Error`: the outpoint in `OutPoint.String`'s
+    /// `hash:index` form, then its tree, then the referencing input.
+    /// dcrd uses this text as the description of the `ErrMissingTxOut`
+    /// rule error a filter build returns and inside the mining
+    /// template's commitment-root error.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "unable to find output script {}:{} referenced by {}:{}",
+            self.prev_out, self.prev_out.tree, self.tx_hash, self.tx_in_idx
+        )
+    }
+}
 
-impl Entries {
+/// The entries a filter is built from (dcrd `Entries`): subslices of
+/// the scripts they commit to, as dcrd appends the script slices
+/// themselves rather than copies.
+#[derive(Default)]
+pub struct Entries<'a>(pub Vec<&'a [u8]>);
+
+impl<'a> Entries<'a> {
     /// Add a regular transaction output script (dcrd
     /// `AddRegularPkScript`); empty scripts are not committed.
-    pub fn add_regular_pk_script(&mut self, script: &[u8]) {
+    pub fn add_regular_pk_script(&mut self, script: &'a [u8]) {
         if script.is_empty() {
             return;
         }
-        self.0.push(script.to_vec());
+        self.0.push(script);
     }
 
     /// Add a stake transaction output script, stripping the stake
     /// opcode tag (dcrd `AddStakePkScript`); empty scripts are not
     /// committed.
-    pub fn add_stake_pk_script(&mut self, script: &[u8]) {
+    pub fn add_stake_pk_script(&mut self, script: &'a [u8]) {
         if script.is_empty() {
             return;
         }
-        self.0.push(script[1..].to_vec());
+        self.0.push(&script[1..]);
     }
 }
 
@@ -89,32 +106,67 @@ fn is_ticket_commit_p2sh(script: &[u8]) -> bool {
     script[COMMIT_AMOUNT_END_IDX - 1] & 0x80 != 0
 }
 
-/// Convert a ticket output commitment script into the P2PKH or P2SH
-/// payment script it commits to (dcrd `commitmentConverter`).
-fn payment_script(commitment_script: &[u8]) -> Vec<u8> {
-    const OP_DUP: u8 = 0x76;
-    const OP_HASH160: u8 = 0xa9;
-    const OP_DATA_20: u8 = 0x14;
-    const OP_EQUAL: u8 = 0x87;
-    const OP_EQUALVERIFY: u8 = 0x88;
-    const OP_CHECKSIG: u8 = 0xac;
+/// Converts ticket output commitment scripts into the P2PKH or P2SH
+/// payment scripts they commit to, into one backing array (dcrd
+/// `commitmentConverter`).
+///
+/// dcrd hands out subslices of that array as it goes, which Go's
+/// garbage collector keeps alive across the array's regrowth.  Here the
+/// converter records each script's range and the slices are taken once
+/// every conversion is done ([`CommitmentConverter::scripts`]), so the
+/// converted scripts join the entries after the others rather than in
+/// block order.  The filter does not depend on entry order: its values
+/// are hashed, deduplicated and sorted.
+struct CommitmentConverter {
+    all_scripts: Vec<u8>,
+    ranges: Vec<core::ops::Range<usize>>,
+}
 
-    let commitment_hash = extract_ticket_commit_hash(commitment_script);
-    let mut script = Vec::with_capacity(25);
-    if is_ticket_commit_p2sh(commitment_script) {
-        script.push(OP_HASH160);
-        script.push(OP_DATA_20);
-        script.extend_from_slice(commitment_hash);
-        script.push(OP_EQUAL);
-    } else {
-        script.push(OP_DUP);
-        script.push(OP_HASH160);
-        script.push(OP_DATA_20);
-        script.extend_from_slice(commitment_hash);
-        script.push(OP_EQUALVERIFY);
-        script.push(OP_CHECKSIG);
+impl CommitmentConverter {
+    /// A converter with room for the typical commitments of the
+    /// block's tickets (dcrd `makeCommitmentConverter`: two P2PKH
+    /// conversions per ticket).
+    fn new(num_tickets: u8) -> CommitmentConverter {
+        const P2PKH_SCRIPT_LEN: usize = 25;
+        CommitmentConverter {
+            all_scripts: Vec::with_capacity(usize::from(num_tickets) * P2PKH_SCRIPT_LEN * 2),
+            ranges: Vec::new(),
+        }
     }
-    script
+
+    /// Convert a commitment output script of a ticket purchase to the
+    /// payment script it commits to (dcrd `paymentScript`).
+    fn add_payment_script(&mut self, commitment_script: &[u8]) {
+        const OP_DUP: u8 = 0x76;
+        const OP_HASH160: u8 = 0xa9;
+        const OP_DATA_20: u8 = 0x14;
+        const OP_EQUAL: u8 = 0x87;
+        const OP_EQUALVERIFY: u8 = 0x88;
+        const OP_CHECKSIG: u8 = 0xac;
+
+        let commitment_hash = extract_ticket_commit_hash(commitment_script);
+        let start = self.all_scripts.len();
+        if is_ticket_commit_p2sh(commitment_script) {
+            // OP_HASH160 <20-byte hash> OP_EQUAL
+            self.all_scripts
+                .extend_from_slice(&[OP_HASH160, OP_DATA_20]);
+            self.all_scripts.extend_from_slice(commitment_hash);
+            self.all_scripts.push(OP_EQUAL);
+        } else {
+            // OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG
+            self.all_scripts
+                .extend_from_slice(&[OP_DUP, OP_HASH160, OP_DATA_20]);
+            self.all_scripts.extend_from_slice(commitment_hash);
+            self.all_scripts
+                .extend_from_slice(&[OP_EQUALVERIFY, OP_CHECKSIG]);
+        }
+        self.ranges.push(start..self.all_scripts.len());
+    }
+
+    /// The converted payment scripts.
+    fn scripts(&self) -> impl Iterator<Item = &[u8]> {
+        self.ranges.iter().map(|r| &self.all_scripts[r.clone()])
+    }
 }
 
 /// Whether the script is excluded from the filter entirely (dcrd
@@ -138,7 +190,13 @@ pub fn regular(
     block: &MsgBlock,
     prev_scripts: &impl PrevScripter,
 ) -> Result<FilterV2, RegularError> {
-    let mut data = Entries::default();
+    // Room for at least one output and one input per regular
+    // transaction and two entries per stake transaction on average
+    // (dcrd's `numEntriesHint`).
+    let mut data = Entries(Vec::with_capacity(
+        block.transactions.len() * 2 + block.stransactions.len(),
+    ));
+    let mut commitments = CommitmentConverter::new(block.header.fresh_stake);
 
     // Regular tree: all output scripts, plus the previous output
     // scripts spent by every non-coinbase transaction.
@@ -222,8 +280,7 @@ pub fn regular(
                     if tx_out.pk_script.is_empty() {
                         continue;
                     }
-                    let script = payment_script(&tx_out.pk_script);
-                    data.add_regular_pk_script(&script);
+                    commitments.add_payment_script(&tx_out.pk_script);
                 }
             }
             stake::TxType::SSGen => {
@@ -272,9 +329,13 @@ pub fn regular(
         }
     }
 
+    // The converted commitment scripts are committed as regular
+    // scripts; they are never empty.
+    let mut entries = data.0;
+    entries.extend(commitments.scripts());
+
     let key = key(&block.header.merkle_root);
-    let refs: Vec<&[u8]> = data.0.iter().map(Vec::as_slice).collect();
-    FilterV2::new(B, M, key, &refs).map_err(RegularError::Gcs)
+    FilterV2::new(B, M, key, &entries).map_err(RegularError::Gcs)
 }
 
 /// An error from [`regular`]: either a missing previous script or a
@@ -286,4 +347,15 @@ pub enum RegularError {
     PrevScript(PrevScriptError),
     /// The filter could not be constructed.
     Gcs(Error),
+}
+
+impl core::fmt::Display for RegularError {
+    /// The wrapped error's own text: dcrd's `Regular` returns either
+    /// error unwrapped, and its callers print `err.Error()`.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            RegularError::PrevScript(e) => core::fmt::Display::fmt(e, f),
+            RegularError::Gcs(e) => core::fmt::Display::fmt(e, f),
+        }
+    }
 }

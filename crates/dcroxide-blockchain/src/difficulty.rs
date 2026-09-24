@@ -7,10 +7,13 @@
 //!
 //! dcrd computes these by walking `blockNode` parent pointers; this
 //! port abstracts the walk behind [`ChainView`], a height-indexed view
-//! of the branch ending at the node being extended.  The agenda-driven
-//! selectors (which algorithm applies at a given block) live with the
-//! threshold-state machinery in the chain engine; the RPC-only
-//! `EstimateNextStakeDifficulty` variants are deferred with it.
+//! of the branch ending at the node being extended.  The RPC-only
+//! `EstimateNextStakeDifficulty` variants live here too
+//! ([`estimate_next_stake_difficulty_v1`] and
+//! [`estimate_next_stake_difficulty_v2`]); the agenda-driven selectors
+//! (which algorithm applies at a given block) and the BLAKE3 anchor
+//! search live with the threshold-state helpers in
+//! [`crate::agendas`].
 
 use alloc::format;
 use alloc::string::String;
@@ -86,11 +89,10 @@ pub trait ChainView {
     fn cache_blake3_candidate_anchor(&self, _height: i64) {}
 }
 
-/// The magic value of test network version 3 (wire `TestNet3`).
-pub(crate) const TESTNET3_NET: u32 = 0xb194aa75;
-
+/// Whether the parameters are test network version 3's (dcrd
+/// `isTestNet3`).
 pub(crate) fn is_testnet3(params: &Params) -> bool {
-    params.net.0 == TESTNET3_NET
+    params.net == dcroxide_wire::CurrencyNet::TEST_NET3
 }
 
 /// The maximum-difficulty target imposed on testnet (dcrd's
@@ -307,9 +309,10 @@ pub fn calc_next_blake256_diff(
 
 /// Calculate the required BLAKE3 (DCP0011) difficulty for the block
 /// after the given previous node using the given anchor node (dcrd
-/// `calcNextBlake3DiffFromAnchor`).  The anchor is the first block for
-/// which the agenda is always active; locating it requires the
-/// threshold-state machinery and lives with the chain engine.
+/// `calcNextBlake3DiffFromAnchor`).  The anchor is the final block of
+/// the rule change interval before the agenda activated (block one on
+/// networks where the agenda is forced active); locating it requires
+/// the threshold-state machinery and lives in [`crate::agendas`].
 pub fn calc_next_blake3_diff_from_anchor(
     prev_node: &DiffNode,
     anchor: &DiffNode,

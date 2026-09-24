@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: ISC
-//! Errors for the chain-engine components; currently just the
-//! deserialization error the UTXO serialization layer surfaces (dcrd
-//! internal/blockchain `errDeserialize`).
+//! The deserialization error the chain engine's storage decoders
+//! surface (dcrd internal/blockchain `errDeserialize`); consensus rule
+//! violations are [`crate::RuleError`]s.
 
 use alloc::string::String;
 use core::fmt;

@@ -59,7 +59,8 @@ pub fn put_vlq(target: &mut [u8], mut n: u64) -> usize {
 }
 
 /// Deserialize a VLQ, returning the value and the number of bytes read
-/// (zero when the input is empty) (dcrd `deserializeVLQ`).
+/// (zero when the input is empty) (dcrd `deserializeVLQ`).  An overlong
+/// VLQ wraps like Go's uint64 arithmetic.
 pub fn deserialize_vlq(serialized: &[u8]) -> (u64, usize) {
     let mut n: u64 = 0;
     let mut size = 0;
@@ -69,7 +70,7 @@ pub fn deserialize_vlq(serialized: &[u8]) -> (u64, usize) {
         if val & 0x80 != 0x80 {
             break;
         }
-        n += 1;
+        n = n.wrapping_add(1);
     }
     (n, size)
 }
@@ -267,10 +268,24 @@ pub fn put_compressed_script(target: &mut [u8], _script_version: u16, pk_script:
 /// (dcrd `decompressScript`); an empty input or an uncompressed-pubkey
 /// form whose key fails to parse yields an empty script (dcrd returns
 /// nil for both).
+///
+/// An encoding whose payload runs past the end of the input also yields
+/// an empty script.  Only corrupt data can do that (an overlong size
+/// VLQ that wraps to a special discriminant, or to a general size
+/// shorter than the VLQ itself); dcrd slices there up to the backing
+/// array's capacity, so it either reads bytes beyond the script or
+/// panics.  [`decode_compressed_tx_out`] reports it as a deserialize
+/// error instead.
 pub fn decompress_script(compressed_pk_script: &[u8]) -> Vec<u8> {
+    try_decompress_script(compressed_pk_script).unwrap_or_default()
+}
+
+/// [`decompress_script`], returning `None` when the encoding reads past
+/// the end of the input.
+fn try_decompress_script(compressed_pk_script: &[u8]) -> Option<Vec<u8>> {
     // Empty scripts, specified by 0x00, are considered nil.
     if compressed_pk_script.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     let (encoded_script_size, bytes_read) = deserialize_vlq(compressed_pk_script);
@@ -281,10 +296,10 @@ pub fn decompress_script(compressed_pk_script: &[u8]) -> Vec<u8> {
             pk_script[0] = OP_DUP;
             pk_script[1] = OP_HASH160;
             pk_script[2] = OP_DATA_20;
-            pk_script[3..23].copy_from_slice(&compressed_pk_script[bytes_read..bytes_read + 20]);
+            pk_script[3..23].copy_from_slice(payload(compressed_pk_script, bytes_read, 20)?);
             pk_script[23] = OP_EQUALVERIFY;
             pk_script[24] = OP_CHECKSIG;
-            pk_script
+            Some(pk_script)
         }
 
         // Pay-to-script-hash script.
@@ -292,9 +307,9 @@ pub fn decompress_script(compressed_pk_script: &[u8]) -> Vec<u8> {
             let mut pk_script = vec![0u8; 23];
             pk_script[0] = OP_HASH160;
             pk_script[1] = OP_DATA_20;
-            pk_script[2..22].copy_from_slice(&compressed_pk_script[bytes_read..bytes_read + 20]);
+            pk_script[2..22].copy_from_slice(payload(compressed_pk_script, bytes_read, 20)?);
             pk_script[22] = OP_EQUAL;
-            pk_script
+            Some(pk_script)
         }
 
         // Pay-to-compressed-pubkey script.
@@ -306,9 +321,9 @@ pub fn decompress_script(compressed_pk_script: &[u8]) -> Vec<u8> {
             } else {
                 0x02
             };
-            pk_script[2..34].copy_from_slice(&compressed_pk_script[bytes_read..bytes_read + 32]);
+            pk_script[2..34].copy_from_slice(payload(compressed_pk_script, bytes_read, 32)?);
             pk_script[34] = OP_CHECKSIG;
-            pk_script
+            Some(pk_script)
         }
 
         // Pay-to-uncompressed-pubkey script.
@@ -323,25 +338,39 @@ pub fn decompress_script(compressed_pk_script: &[u8]) -> Vec<u8> {
             } else {
                 0x02
             };
-            compressed_key[1..].copy_from_slice(&compressed_pk_script[1..33]);
+            // dcrd copies whatever follows the first byte, up to the
+            // key's 32 bytes (Go `copy` semantics), whatever the size
+            // VLQ's length.
+            let tail = &compressed_pk_script[1..];
+            let n = tail.len().min(32);
+            compressed_key[1..1 + n].copy_from_slice(&tail[..n]);
             let Ok(key) = PublicKey::parse(&compressed_key) else {
-                return Vec::new();
+                return Some(Vec::new());
             };
 
             let mut pk_script = vec![0u8; 67];
             pk_script[0] = OP_DATA_65;
             pk_script[1..66].copy_from_slice(&key.serialize_uncompressed());
             pk_script[66] = OP_CHECKSIG;
-            pk_script
+            Some(pk_script)
         }
 
         // When none of the special cases apply, the script was encoded
         // using the general format: return the unmodified script.
         _ => {
-            let script_size = (encoded_script_size - NUM_SPECIAL_SCRIPTS) as usize;
-            compressed_pk_script[bytes_read..bytes_read + script_size].to_vec()
+            // Go's unsigned subtraction: a corrupt discriminant below
+            // `NUM_SPECIAL_SCRIPTS` wraps to a size no input can hold.
+            let script_size =
+                usize::try_from(encoded_script_size.wrapping_sub(NUM_SPECIAL_SCRIPTS)).ok()?;
+            Some(payload(compressed_pk_script, bytes_read, script_size)?.to_vec())
         }
     }
+}
+
+/// The `len` payload bytes at `start` of a compressed script, or `None`
+/// when they run past its end.
+fn payload(compressed_pk_script: &[u8], start: usize, len: usize) -> Option<&[u8]> {
+    compressed_pk_script.get(start..start.checked_add(len)?)
 }
 
 // -----------------------------------------------------------------------
@@ -403,9 +432,10 @@ pub fn decompress_tx_out_amount(mut amount: u64) -> u64 {
         n = amount + 1;
     }
 
-    // Apply the exponent.
+    // Apply the exponent (wrapping like Go's uint64 multiply, which
+    // only a corrupt compressed amount reaches).
     for _ in 0..exponent {
-        n *= 10;
+        n = n.wrapping_mul(10);
     }
 
     n
@@ -503,8 +533,14 @@ pub fn decode_compressed_tx_out(
         )));
     }
 
-    // Decompress the script.
-    let script = decompress_script(&serialized[offset..offset + script_size]);
+    // Decompress the script.  An overlong size VLQ can wrap to a size
+    // whose payload does not fit the bytes the size claims; dcrd reads
+    // past them or panics, while this reports the corrupt row.
+    let Some(script) = try_decompress_script(&serialized[offset..offset + script_size]) else {
+        return Err(deserialize_error(
+            "unexpected end of data during decoding (compressed script)",
+        ));
+    };
     Ok((amount, script_version as u16, script, offset + script_size))
 }
 
@@ -543,4 +579,74 @@ pub fn decode_flags(flags: u8) -> (bool, bool, u8) {
     let has_expiry = flags & TX_OUT_FLAG_HAS_EXPIRY == TX_OUT_FLAG_HAS_EXPIRY;
     let tx_type = (flags & TX_OUT_FLAG_TX_TYPE_BITMASK) >> TX_OUT_FLAG_TX_TYPE_SHIFT;
     (is_coin_base, has_expiry, tx_type)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row whose script size VLQ is overlong: `80 fe .. ff 00` wraps to
+    /// the pay-to-pubkey-hash discriminant after ten bytes, so the size
+    /// check passes with 21 bytes while the hash would be read from bytes
+    /// 10 through 29.
+    #[test]
+    fn overlong_special_script_vlq_is_a_decode_error() {
+        let vlq = [0x80, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xff, 0x00];
+        assert_eq!(deserialize_vlq(&vlq), (0, 10));
+        let mut row = vec![0x00, 0x00];
+        row.extend_from_slice(&vlq);
+        row.extend_from_slice(&[0x11; 11]);
+        assert_eq!(decode_compressed_script_size(&row[2..]), 21);
+        assert!(decode_compressed_tx_out(&row, true).is_err());
+        assert!(decompress_script(&row[2..23]).is_empty());
+    }
+
+    /// A general-format size shorter than the VLQ that encodes it: the
+    /// ten-byte VLQ decodes to 55, so the claimed script size is
+    /// 55 - 64 + 10 = 1 byte, which then re-reads as a
+    /// pay-to-script-hash discriminant with no hash after it.  A general
+    /// discriminant below 64 also no longer underflows the size.
+    #[test]
+    fn short_general_script_size_is_a_decode_error() {
+        let vlq = [0x80, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xff, 0x37];
+        assert_eq!(deserialize_vlq(&vlq), (55, 10));
+        let mut row = vec![0x00];
+        row.extend_from_slice(&vlq);
+        assert_eq!(decode_compressed_script_size(&row[1..]), 1);
+        assert!(decode_compressed_tx_out(&row, false).is_err());
+
+        let vlq = [0x80, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xff, 0x3c];
+        assert_eq!(deserialize_vlq(&vlq), (60, 10));
+        assert!(decompress_script(&vlq).is_empty());
+    }
+
+    /// No byte string panics the compressed txout decoder or the script
+    /// decompressor; corrupt rows surface as errors.
+    #[test]
+    fn corrupt_compressed_txouts_never_panic() {
+        const ALPHABET: [u8; 8] = [0x00, 0x01, 0x05, 0x06, 0x7f, 0x80, 0xfe, 0xff];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..200_000 {
+            let len = (next() % 48) as usize;
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    let r = next();
+                    if r & 1 == 0 {
+                        ALPHABET[((r >> 1) % 8) as usize]
+                    } else {
+                        (r >> 8) as u8
+                    }
+                })
+                .collect();
+            let _ = decode_compressed_tx_out(&data, true);
+            let _ = decode_compressed_tx_out(&data, false);
+            let _ = decompress_script(&data);
+        }
+    }
 }

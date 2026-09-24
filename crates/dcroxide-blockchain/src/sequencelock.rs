@@ -119,8 +119,10 @@ pub fn calc_sequence_lock<V: VoteChainView>(
         let Some(input_height) = lookup_block_height(&tx_in.previous_out_point) else {
             return Err(rule_error(
                 RuleErrorKind::MissingTxOut,
+                // dcrd formats the outpoint with `%v`, i.e. its
+                // `hash:index` String form.
                 format!(
-                    "output {:?} referenced from transaction {}:{tx_in_index} either does \
+                    "output {} referenced from transaction {}:{tx_in_index} either does \
                      not exist or has already been spent",
                     tx_in.previous_out_point,
                     tx.tx_hash()
@@ -198,4 +200,79 @@ pub fn lock_time_to_sequence(
     }
 
     Ok(SEQUENCE_LOCK_TIME_IS_SECONDS | (lock_time >> SEQUENCE_LOCK_TIME_GRANULARITY))
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    use dcroxide_chainhash::Hash;
+    use dcroxide_wire::{TxIn, TxOut};
+
+    use super::*;
+    use crate::thresholdstate::VoteNode;
+
+    struct VecChain(Vec<VoteNode>);
+
+    impl VersionChainView for VecChain {
+        fn node(&self, height: i64) -> Option<VersionNode> {
+            self.vote_node(height).map(|n| n.node)
+        }
+    }
+
+    impl VoteChainView for VecChain {
+        fn vote_node(&self, height: i64) -> Option<VoteNode> {
+            self.0.get(usize::try_from(height).ok()?).cloned()
+        }
+    }
+
+    /// A missing referenced output is reported with dcrd's `%v`
+    /// rendering of the outpoint, `hash:index`, not the derived Debug
+    /// form.
+    #[test]
+    fn missing_output_message_renders_outpoint_like_dcrd() {
+        let params = dcroxide_chaincfg::mainnet_params();
+        let chain = VecChain(
+            (0..3)
+                .map(|height| VoteNode {
+                    node: VersionNode {
+                        height,
+                        timestamp: 1_454_954_400 + height * 300,
+                        ..VersionNode::default()
+                    },
+                    votes: Vec::new(),
+                })
+                .collect(),
+        );
+
+        let mut prev_hash = [0u8; 32];
+        prev_hash[0] = 0xab;
+        let mut tx = MsgTx {
+            version: 2,
+            ..MsgTx::default()
+        };
+        tx.tx_in.push(TxIn {
+            previous_out_point: OutPoint {
+                hash: Hash(prev_hash),
+                index: 7,
+                tree: 0,
+            },
+            sequence: 5,
+            ..TxIn::default()
+        });
+        tx.tx_out.push(TxOut::default());
+
+        let err = calc_sequence_lock(&chain, 2, &tx, |_| None, true, &params)
+            .expect_err("the referenced output is missing");
+        assert_eq!(err.kind, RuleErrorKind::MissingTxOut);
+        let mut want = String::from("output ");
+        want.push_str(&"0".repeat(62));
+        want.push_str(&format!(
+            "ab:7 referenced from transaction {}:0 either does not exist or has \
+             already been spent",
+            tx.tx_hash()
+        ));
+        assert_eq!(err.description, want);
+    }
 }

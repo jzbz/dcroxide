@@ -5,9 +5,12 @@
 //! The chain walk is abstracted behind [`VoteChainView`]; the stake
 //! version and median time prerequisites come from [`crate::stakever`].
 //! dcrd memoizes interval-boundary states in a per-deployment cache
-//! keyed by block hash; on a single-branch view the boundary heights
-//! are unique, so this port recomputes from the deployment start each
-//! call, which is result-identical.
+//! keyed by block hash, and so does this port through the view's
+//! `threshold_state_*` hooks: the walk stops at the first cached
+//! boundary, and every boundary it computes (including the defined
+//! state where the begin time is not yet reached) is recorded.  A view
+//! that leaves the hooks at their defaults recomputes from the
+//! deployment start on every call, which is result-identical.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -166,10 +169,13 @@ pub fn next_threshold_state(
     let mut walk_height = Some(want_height);
     let mut seed_state: Option<ThresholdStateTuple> = None;
     while let Some(h) = walk_height {
-        if view.vote_node(h).is_none() {
+        // A view only hands out a cache key for a node on its branch,
+        // so the node probe is needed only when caching is disabled.
+        let hash = view.cache_hash(h);
+        if hash.is_none() && view.vote_node(h).is_none() {
             break;
         }
-        if let Some(hash) = view.cache_hash(h)
+        if let Some(hash) = hash
             && let Some(cached) = view.threshold_state_cached(deployment_version, vote_id, hash)
         {
             seed_state = Some(cached);
@@ -177,9 +183,19 @@ pub fn next_threshold_state(
         }
         let median_time = calc_past_median_time(view, h);
         if (median_time as u64) < begin_time {
+            // The state is simply defined if the start time hasn't been
+            // reached yet, and dcrd caches it as such.
+            if let Some(hash) = hash {
+                view.cache_threshold_state(
+                    deployment_version,
+                    vote_id,
+                    hash,
+                    tuple(ThresholdState::Defined, None),
+                );
+            }
             break;
         }
-        needed_heights.push(h);
+        needed_heights.push((h, hash));
         let next = h - confirmation_window;
         walk_height = if next >= 0 { Some(next) } else { None };
     }
@@ -192,16 +208,13 @@ pub fn next_threshold_state(
     // Replay the state transitions forward through the collected
     // boundary nodes.
     let end_time = deployment.expire_time;
-    for &h in needed_heights.iter().rev() {
+    for &(h, hash) in needed_heights.iter().rev() {
         match state.state {
+            // Ensure we are at the minimal require height (Go's `break`
+            // here exits the switch arm, not the loop, so the state is
+            // left defined and still cached below).
+            ThresholdState::Defined if h < svh => {}
             ThresholdState::Defined => {
-                // Ensure we are at the minimal require height (Go's
-                // `break` here exits the switch arm, not the loop, so
-                // the walk continues with the state left defined).
-                if h < svh {
-                    continue;
-                }
-
                 // The deployment expired.
                 let median_time = calc_past_median_time(view, h) as u64;
                 if median_time >= end_time {
@@ -287,7 +300,7 @@ pub fn next_threshold_state(
 
         // Record the boundary's state (dcrd updates the deployment
         // cache as it ascends).
-        if let Some(hash) = view.cache_hash(h) {
+        if let Some(hash) = hash {
             view.cache_threshold_state(deployment_version, vote_id, hash, state.clone());
         }
     }

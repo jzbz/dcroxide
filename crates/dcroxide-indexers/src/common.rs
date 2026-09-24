@@ -492,16 +492,19 @@ pub(crate) fn upgrade_index(
 }
 
 /// Update subscribers that the index is synced when its tip is
-/// identical to the chain tip (dcrd `maybeNotifySubscribers`).
+/// identical to the chain tip (dcrd `maybeNotifySubscribers`).  The
+/// caller passes the chain tip (dcrd's `indexer.Queryer().Best()`),
+/// read before it took the indexer's lock: the queryer locks the chain,
+/// and the index lock must not be held while that waits.
 pub(crate) fn maybe_notify_subscribers(
     interrupt: &Interrupt,
     indexer: &mut dyn Indexer,
+    (best_height, best_hash): (i64, Hash),
 ) -> Result<(), IdxError> {
     if interrupt_requested(interrupt) {
         return Err(indexer_error(ErrorKind::InterruptRequested, INTERRUPT_MSG));
     }
 
-    let (best_height, best_hash) = indexer.queryer().best();
     let (tip_height, tip_hash) = indexer.tip().map_err(|err| {
         IdxError::Other(format!(
             "{}: unable to fetch index tip: {err}",

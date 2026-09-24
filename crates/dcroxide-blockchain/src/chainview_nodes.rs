@@ -405,11 +405,8 @@ impl crate::thresholdstate::VoteChainView for NodeBranchView<'_> {
         self.store
             .threshold_state_cache
             .borrow()
-            .get(&(
-                deployment_version,
-                alloc::string::String::from(vote_id),
-                hash,
-            ))
+            .get(vote_id)?
+            .get(&(deployment_version, hash))
             .cloned()
     }
 
@@ -420,13 +417,11 @@ impl crate::thresholdstate::VoteChainView for NodeBranchView<'_> {
         hash: [u8; 32],
         state: crate::thresholdstate::ThresholdStateTuple,
     ) {
-        self.store.threshold_state_cache.borrow_mut().insert(
-            (
-                deployment_version,
-                alloc::string::String::from(vote_id),
-                hash,
-            ),
-            state,
-        );
+        self.store
+            .threshold_state_cache
+            .borrow_mut()
+            .entry(alloc::string::String::from(vote_id))
+            .or_default()
+            .insert((deployment_version, hash), state);
     }
 }

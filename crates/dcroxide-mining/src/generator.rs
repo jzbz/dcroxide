@@ -669,6 +669,15 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         nonces: &ExtraNonces,
     ) -> Result<Option<BlockTemplate>, String> {
         let script_flags = self.chain.standard_verify_flags()?;
+        // Taken once and deliberately never refreshed, as in dcrd
+        // (`mining.go:1200`): after the eligible-parents loop below
+        // reorganizes to a sibling tip only `prev_hash` moves, and the
+        // vote eligibility, ticket price, final state, and pool size
+        // all keep reading the old tip's snapshot.  The sibling's votes
+        // then fail the winning-ticket check, so such a build falls
+        // through to `handle_too_few_voters`, which takes a fresh
+        // snapshot.  Refreshing here would change which templates the
+        // node produces.
         let best = self.chain.best_snapshot();
         let mut prev_hash = best.hash;
         let next_block_height = best.height + 1;
@@ -813,11 +822,16 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             }
 
             // Calculate the final transaction priority and fee rate.
+            // The lookup is dcrd's `UtxoViewpoint.PriorityInput`, which
+            // reports spent entries as missing: a view fetched without
+            // a disapproved tip's regular tree holds its outputs spent,
+            // and they contribute no input age.
             let priority = crate::policy::calc_priority(
                 tx,
                 |op| {
                     utxos
                         .lookup_entry(op)
+                        .filter(|e| !e.is_spent())
                         .map(|e| (e.block_height(), e.amount()))
                 },
                 next_block_height,
@@ -985,6 +999,15 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 let old_fee = prio_item.fee_per_kb;
                 let mut prio_item = prio_item;
                 prio_item.fee_per_kb = calc_fee_per_kb(&tx_desc, &ancestor_stats);
+                // dcrd's queue and `prioItemMap` share one `*txPrioItem`,
+                // so this refresh also lands in the map, and a child
+                // skipped below is re-promoted at the refreshed rate
+                // once its last parent is mined (`mining.go:1666`,
+                // `:1832-1834`).  The map holds copies here, so write
+                // the rate back.
+                if let Some(mapped) = prio_item_map.get_mut(&tx_hash.0) {
+                    mapped.fee_per_kb = prio_item.fee_per_kb;
+                }
                 let fee_decreased = old_fee > prio_item.fee_per_kb;
                 if fee_decreased && ancestor_stats.num_ancestors == 0 {
                     priority_queue.push(prio_item);

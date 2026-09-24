@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: ISC
-//! Decred chain-engine components ported from dcrd's
-//! `internal/blockchain` at master `452c1a6c` (the dcrd 2.2 campaign
-//! parity target).  This crate currently
-//! contains the UTXO serialization layer — variable-length quantities,
-//! the domain-specific script and amount compression, UTXO entries and
-//! their storage format, outpoint keys, and the UTXO set state — and
-//! grows into the full chain engine in the blockchain phase.
+//! The Decred chain engine, ported from dcrd's `internal/blockchain`
+//! at the parity pin recorded in README.md and PARITY.md: the UTXO
+//! serialization layer (variable-length quantities, the
+//! domain-specific script and amount compression, UTXO entries and
+//! their storage format, outpoint keys, and the UTXO set state), the
+//! block index and chain views, the difficulty, stake version and
+//! agenda threshold-state calculations, sequence locks, block and
+//! transaction validation, the treasury and chain state databases, and
+//! block processing with its reorganization machinery and
+//! notifications.
 //!
 //! dcrd keeps these in an internal package the test oracle cannot
 //! import, so parity is pinned by dcrd's own table-driven test vectors
-//! extracted mechanically from the Go test sources, plus round-trip
-//! property tests.
+//! extracted mechanically from the Go test sources, vectors generated
+//! inside dcrd's package, plus round-trip property tests.
 
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![forbid(unsafe_code)]

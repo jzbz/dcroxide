@@ -47,12 +47,13 @@ pub struct VersionNode {
 /// interval walks make every deep-chain contextual check re-tally
 /// hundreds of thousands of ancestors.
 ///
-/// The keys deliberately use the hash of each function's ARGUMENT
-/// node where dcrd keys some caches by the derived prior-interval
-/// node; every function is a pure function of its argument node's
-/// ancestry, so the results are identical — only the cache contents
-/// and hit patterns differ, which an adversarial differential
-/// harness verified across forked branches.
+/// The keys are dcrd's: the voter-version interval cache is keyed by
+/// the interval-final node the function is called with, and the other
+/// three by the interval-final node the calculation derives from its
+/// argument (the prior interval's final node, or for
+/// `calc_stake_version` the node `calc_voter_version` settles on), so
+/// every block of an interval shares one entry and the interval walks
+/// run once per interval.
 pub trait VersionChainView {
     /// The node at the given height along this branch, or `None` when
     /// the height is negative or unknown.
@@ -78,7 +79,10 @@ pub trait VersionChainView {
 
     /// The hash identifying the node at the height along this branch,
     /// used as the memoization key exactly as dcrd keys its caches by
-    /// block hash; `None` — the default — disables caching.
+    /// block hash.  `None` when the branch has no node at the height;
+    /// the default returns `None` for every height, which disables
+    /// caching.  A `Some` therefore also vouches that the node exists,
+    /// which the threshold-state walk relies on.
     fn cache_hash(&self, _height: i64) -> Option<[u8; 32]> {
         None
     }
@@ -171,8 +175,8 @@ pub fn is_stake_majority_version(
     };
 
     // dcrd's isStakeMajorityVersionCache, keyed by the minimum
-    // version and the node's hash.
-    let cache_key = view.cache_hash(prev_height);
+    // version and the prior interval's final node.
+    let cache_key = view.cache_hash(start);
     if let Some(hash) = cache_key
         && let Some(majority) = view.stake_majority_cached(min_ver, hash)
     {
@@ -215,8 +219,9 @@ pub fn calc_prior_stake_version(
         return Some(0);
     };
 
-    // dcrd's calcPriorStakeVersionCache, keyed by the node's hash.
-    let cache_key = view.cache_hash(prev_height);
+    // dcrd's calcPriorStakeVersionCache, keyed by the prior
+    // interval's final node.
+    let cache_key = view.cache_hash(start);
     if let Some(hash) = cache_key
         && let Some(version) = view.prior_stake_version_cached(hash)
     {
@@ -358,22 +363,22 @@ pub fn is_majority_version(
 /// The expected stake version for the block after the given node (dcrd
 /// `calcStakeVersion`).
 pub fn calc_stake_version(view: &impl VersionChainView, prev_height: i64, params: &Params) -> u32 {
-    // dcrd's calcStakeVersionCache, keyed by the node's hash.
-    let cache_key = view.cache_hash(prev_height);
+    let (mut version, node_height) = calc_voter_version(view, prev_height, params);
+    let Some(node_height) = node_height else {
+        return 0;
+    };
+    if version == 0 {
+        return 0;
+    }
+
+    // dcrd's calcStakeVersionCache, keyed by the voter version node,
+    // which every block of the interval shares.
+    let cache_key = view.cache_hash(node_height);
     if let Some(hash) = cache_key
         && let Some(version) = view.stake_version_cached(hash)
     {
         return version;
     }
-
-    let (mut version, node_height) = calc_voter_version(view, prev_height, params);
-    if version == 0 || node_height.is_none() {
-        if let Some(hash) = cache_key {
-            view.cache_stake_version(hash, 0);
-        }
-        return 0;
-    }
-    let node_height = node_height.expect("checked above");
 
     // Note that dcrd's nil-ancestor branch here records a zero in its
     // cache without returning; the subsequent majority check over the

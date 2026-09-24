@@ -128,7 +128,13 @@ pub fn deserialize_treasury_state(data: &[u8]) -> Result<TreasuryState, String> 
     }
     offset += bytes_read;
 
-    let mut values = Vec::with_capacity(num_values as usize);
+    // dcrd sizes the slice from the count outright; the reservation here
+    // is bounded by the bytes left (each value takes at least a flag
+    // and an amount byte), so a corrupt count reaches the end-of-data
+    // error below rather than aborting on the allocation.
+    let max_values = (data.len() - offset) / 2;
+    let mut values =
+        Vec::with_capacity(usize::try_from(num_values).map_or(max_values, |n| n.min(max_values)));
     for i in 0..num_values {
         let (flag, bytes_read) = deserialize_vlq(&data[offset..]);
         offset += bytes_read;
@@ -148,7 +154,8 @@ pub fn deserialize_treasury_state(data: &[u8]) -> Result<TreasuryState, String> 
             .ok_or_else(|| format!("unknown treasury value type flag {flag}"))?;
         let mut amount = value as i64;
         if typ.is_debit() {
-            amount = -amount;
+            // Go's int64 negation wraps; only a corrupt amount reaches it.
+            amount = amount.wrapping_neg();
         }
         values.push(TreasuryValue { typ, amount });
     }
@@ -178,7 +185,17 @@ pub fn deserialize_tspend(data: &[u8]) -> Result<Vec<Hash>, String> {
     let count = i64::from_le_bytes([
         data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
     ]);
-    let mut hashes = Vec::with_capacity(count as usize);
+    // dcrd's `make` panics on a negative count; report the corrupt row
+    // instead.
+    if count < 0 {
+        return Err(format!("negative count {count}"));
+    }
+    // Bound the reservation by the hashes the row can hold, so a
+    // corrupt count reaches the per-index error below rather than
+    // aborting on the allocation.
+    let max_hashes = (data.len() - 8) / 32;
+    let mut hashes =
+        Vec::with_capacity(usize::try_from(count).map_or(max_hashes, |n| n.min(max_hashes)));
     let mut offset = 8usize;
     for i in 0..count {
         if offset + 32 > data.len() {
@@ -297,4 +314,59 @@ pub fn treasury_state_for_block(block: &MsgBlock, balance: i64) -> TreasuryState
         }
     }
     ts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A corrupt treasury state row whose value count far exceeds its
+    /// bytes is reported as corrupt rather than aborting on the
+    /// reservation.
+    #[test]
+    fn huge_treasury_value_count_is_a_decode_error() {
+        let num_values = 1u64 << 60;
+        let mut row = alloc::vec![0u8; 1 + serialize_size_vlq(num_values)];
+        let offset = put_vlq(&mut row, 0);
+        put_vlq(&mut row[offset..], num_values);
+        assert_eq!(
+            deserialize_treasury_state(&row),
+            Err("unexpected end of data while reading value flag #0".into())
+        );
+
+        // A well-formed row still decodes.
+        let ts = TreasuryState {
+            balance: 5,
+            values: alloc::vec![
+                TreasuryValue {
+                    typ: TreasuryValueType::TAdd,
+                    amount: 7,
+                },
+                TreasuryValue {
+                    typ: TreasuryValueType::TSpend,
+                    amount: -3,
+                },
+            ],
+        };
+        let row = serialize_treasury_state(&ts).expect("serializes");
+        assert_eq!(deserialize_treasury_state(&row), Ok(ts));
+    }
+
+    /// Corrupt treasury spend rows with a negative or oversized count
+    /// are reported rather than aborting on the reservation.
+    #[test]
+    fn corrupt_tspend_count_is_a_decode_error() {
+        let row = (-1i64).to_le_bytes();
+        assert!(deserialize_tspend(&row).is_err());
+
+        let mut row = i64::MAX.to_le_bytes().to_vec();
+        row.extend_from_slice(&[0x22; 32]);
+        assert_eq!(deserialize_tspend(&row), Err("failed to read idx 1".into()));
+
+        let hashes = [Hash([1; 32]), Hash([2; 32])];
+        assert_eq!(
+            deserialize_tspend(&serialize_tspend(&hashes)),
+            Ok(hashes.to_vec())
+        );
+    }
 }

@@ -78,9 +78,18 @@ impl BlockStatus {
 /// chain tips (dcrd `cachedTipsPruneDepth`).
 pub const CACHED_TIPS_PRUNE_DEPTH: i64 = 12;
 
-/// A handle to a block node within a [`NodeStore`].
+/// A handle to a block node within a [`NodeStore`]: its arena index
+/// plus one, so the parent and skip-list links (`Option<NodeId>`) take
+/// four bytes each across the million-odd resident nodes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, core::hash::Hash)]
-pub struct NodeId(usize);
+pub struct NodeId(core::num::NonZeroU32);
+
+impl NodeId {
+    /// The arena index the handle refers to.
+    fn index(self) -> usize {
+        (self.0.get() - 1) as usize
+    }
+}
 
 /// A block within the block tree (dcrd `blockNode`), holding the
 /// header fields needed for chain selection and header
@@ -152,8 +161,10 @@ pub struct BlockNode {
 
     /// The immutable ticket pool state as of this block, when loaded
     /// (dcrd `stakeNode`; pruned nodes drop it and it is regenerated
-    /// on demand).
-    pub stake_node: Option<dcroxide_stake::ticketnode::Node>,
+    /// on demand).  Boxed like dcrd's pointer: only the few hundred
+    /// most recent nodes hold one, so the rest pay for a pointer
+    /// rather than the inline node.
+    pub stake_node: Option<alloc::boxed::Box<dcroxide_stake::ticketnode::Node>>,
     /// The tickets maturing in this block, when loaded (dcrd
     /// `newTickets`; `None` means never looked up while an empty list
     /// means no tickets mature here).
@@ -205,12 +216,13 @@ pub fn compare_hashes_as_uint256_le(a: &Hash, b: &Hash) -> i32 {
     0
 }
 
-/// The threshold-state cache rows: the deployment version, its vote
-/// id, and the interval-boundary block hash mapping to the computed
-/// state.
+/// The threshold-state cache rows: per deployment vote id (the outer
+/// key, so a lookup borrows the id instead of allocating a key), the
+/// deployment version and the interval-boundary block hash mapping to
+/// the computed state.
 type ThresholdStateCacheMap = alloc::collections::BTreeMap<
-    (u32, alloc::string::String, [u8; 32]),
-    crate::thresholdstate::ThresholdStateTuple,
+    alloc::string::String,
+    alloc::collections::BTreeMap<(u32, [u8; 32]), crate::thresholdstate::ThresholdStateTuple>,
 >;
 
 /// The arena owning every block node, providing the node-level
@@ -227,8 +239,8 @@ type ThresholdStateCacheMap = alloc::collections::BTreeMap<
 pub struct NodeStore {
     nodes: Vec<BlockNode>,
     /// dcrd's per-deployment `thresholdStateCache`, keyed by the
-    /// deployment version, its vote id, and the interval-boundary
-    /// block hash.
+    /// deployment's vote id and then its version and the
+    /// interval-boundary block hash.
     pub(crate) threshold_state_cache: core::cell::RefCell<ThresholdStateCacheMap>,
     /// dcrd's `calcVoterVersionIntervalCache`, keyed by the
     /// interval-final block hash.
@@ -263,12 +275,12 @@ impl NodeStore {
 
     /// The node for the given id.
     pub fn node(&self, id: NodeId) -> &BlockNode {
-        &self.nodes[id.0]
+        &self.nodes[id.index()]
     }
 
     /// Mutable access to the node for the given id.
     pub fn node_mut(&mut self, id: NodeId) -> &mut BlockNode {
-        &mut self.nodes[id.0]
+        &mut self.nodes[id.index()]
     }
 
     /// Create a block node for the given header and parent (dcrd
@@ -313,7 +325,11 @@ impl NodeStore {
             let parent_work = self.node(parent_id).work_sum;
             node.work_sum.add(&parent_work);
         }
-        let id = NodeId(self.nodes.len());
+        let id = u32::try_from(self.nodes.len() + 1)
+            .ok()
+            .and_then(core::num::NonZeroU32::new)
+            .map(NodeId)
+            .expect("the block index holds fewer than u32::MAX nodes");
         self.nodes.push(node);
         id
     }
@@ -966,5 +982,44 @@ impl BlockIndex {
     /// The number of best chain candidates currently tracked.
     pub fn num_best_chain_candidates(&self) -> usize {
         self.best_chain_candidates.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The per-node footprint stays close to dcrd's `blockNode`: the
+    /// stake node is a pointer rather than ~180 inline bytes, and the
+    /// two node links are four bytes each.  A mainnet index keeps about
+    /// a million of these resident.
+    #[test]
+    fn block_node_layout_stays_compact() {
+        assert_eq!(core::mem::size_of::<Option<NodeId>>(), 4);
+        assert_eq!(
+            core::mem::size_of::<Option<alloc::boxed::Box<dcroxide_stake::ticketnode::Node>>>(),
+            core::mem::size_of::<usize>()
+        );
+        assert!(
+            core::mem::size_of::<BlockNode>() <= 360,
+            "BlockNode grew to {} bytes",
+            core::mem::size_of::<BlockNode>()
+        );
+    }
+
+    /// Handles still address the arena in insertion order.
+    #[test]
+    fn node_ids_address_the_arena() {
+        let mut store = NodeStore::new();
+        let mut header = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header").0;
+        let genesis = store.new_node(&header, None);
+        header.height = 1;
+        header.nonce = 1;
+        let child = store.new_node(&header, Some(genesis));
+        assert!(genesis < child);
+        assert_eq!(store.node(genesis).height, 0);
+        assert_eq!(store.node(child).height, 1);
+        assert_eq!(store.node(child).parent, Some(genesis));
+        assert_eq!(store.ancestor(child, 0), Some(genesis));
     }
 }

@@ -129,7 +129,8 @@ impl Immutable {
     /// it because the out-of-range index still panicked -- just from the
     /// runtime walking off the end rather than from this check, so the
     /// test's "did it panic" assertion was satisfied by the wrong panic.
-    /// The port inherited both the bug and that blind spot.
+    /// The port inherited both the bug and that blind spot until
+    /// `eebcea3` carried the fix over.
     pub fn get_by_index(&self, idx: usize) -> (Key, Value) {
         let root = self.root.as_deref().expect("getByIndex on empty treap");
         assert!(idx < root.size as usize, "getByIndex index out of bounds");

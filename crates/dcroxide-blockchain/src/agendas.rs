@@ -16,26 +16,14 @@ use crate::difficulty::{
 use crate::stakever::calc_want_height;
 use crate::thresholdstate::{ThresholdState, VoteChainView, deployment_state};
 
-/// The vote ID for the DCP0001 stake difficulty algorithm change.
-pub const VOTE_ID_SDIFF_ALGORITHM: &str = "sdiffalgorithm";
-/// The vote ID for the DCP0002/DCP0003 LN features agenda.
-pub const VOTE_ID_LN_FEATURES: &str = "lnfeatures";
-/// The vote ID for the DCP0005 header commitments agenda.
-pub const VOTE_ID_HEADER_COMMITMENTS: &str = "headercommitments";
-/// The vote ID for the DCP0006 decentralized treasury agenda.
-pub const VOTE_ID_TREASURY: &str = "treasury";
-/// The vote ID for the DCP0007 revert treasury policy agenda.
-pub const VOTE_ID_REVERT_TREASURY_POLICY: &str = "reverttreasurypolicy";
-/// The vote ID for the DCP0008 explicit version upgrades agenda.
-pub const VOTE_ID_EXPLICIT_VERSION_UPGRADES: &str = "explicitverupgrades";
-/// The vote ID for the DCP0009 automatic ticket revocations agenda.
-pub const VOTE_ID_AUTO_REVOCATIONS: &str = "autorevocations";
-/// The vote ID for the DCP0010 subsidy split change agenda.
-pub const VOTE_ID_CHANGE_SUBSIDY_SPLIT: &str = "changesubsidysplit";
-/// The vote ID for the DCP0011 BLAKE3 proof of work agenda.
-pub const VOTE_ID_BLAKE3_POW: &str = "blake3pow";
-/// The vote ID for the DCP0012 subsidy split change agenda.
-pub const VOTE_ID_CHANGE_SUBSIDY_SPLIT_R2: &str = "changesubsidysplitr2";
+// The agenda vote IDs come from chaincfg's canonical definitions (dcrd's
+// blockchain uses `chaincfg.VoteID*` the same way); they are re-exported
+// here so the consensus lookups and `find_deployment` share one copy.
+pub use dcroxide_chaincfg::{
+    VOTE_ID_AUTO_REVOCATIONS, VOTE_ID_BLAKE3_POW, VOTE_ID_CHANGE_SUBSIDY_SPLIT,
+    VOTE_ID_CHANGE_SUBSIDY_SPLIT_R2, VOTE_ID_EXPLICIT_VERSION_UPGRADES, VOTE_ID_HEADER_COMMITMENTS,
+    VOTE_ID_LN_FEATURES, VOTE_ID_REVERT_TREASURY_POLICY, VOTE_ID_SDIFF_ALGORITHM, VOTE_ID_TREASURY,
+};
 
 /// Locate the deployment with the given vote ID along with its version
 /// (the lookup dcrd performs once in `extractDeployments`).
@@ -104,8 +92,9 @@ pub fn is_ln_features_agenda_active(
 /// (dcrd `maxBlockSize`).
 pub fn max_block_size(view: &impl VoteChainView, prev_height: Option<i64>, params: &Params) -> i64 {
     // Networks without the deployment always use the first size.
-    const VOTE_ID_MAX_BLOCK_SIZE: &str = "maxblocksize";
-    let Some((version, deployment)) = find_deployment(params, VOTE_ID_MAX_BLOCK_SIZE) else {
+    let Some((version, deployment)) =
+        find_deployment(params, dcroxide_chaincfg::VOTE_ID_MAX_BLOCK_SIZE)
+    else {
         return params.maximum_block_sizes[0] as i64;
     };
     let state =

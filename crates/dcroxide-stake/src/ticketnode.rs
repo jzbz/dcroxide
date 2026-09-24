@@ -5,10 +5,14 @@
 //! the connect/disconnect transitions with their undo data.
 //!
 //! The database-coupled entry points (`InitDatabaseState`,
-//! `LoadBestNode`, `WriteConnectedBestNode`, `ResetDatabase`) arrive
-//! with the chain engine persistence wiring; disconnecting therefore
-//! always takes the parent undo data and ticket list directly, making
-//! dcrd's `ErrMissingDatabaseTx` fallback unrepresentable here.
+//! `LoadBestNode`, `WriteConnectedBestNode`, `WriteDisconnectedBestNode`)
+//! live in `stakedb`; `ResetDatabase` and the `DbRemoveAllBuckets` it
+//! calls are not ported, since dcrd calls them only from tests.
+//! Disconnecting always takes the parent undo data and ticket list
+//! directly -- the chain fetches the rows itself when the parent node
+//! holds none, where dcrd's `disconnectNode` reads them through its
+//! `dbTx` -- so dcrd's `ErrMissingDatabaseTx` fallback is
+//! unrepresentable here.
 
 use alloc::format;
 use alloc::vec::Vec;
@@ -233,7 +237,8 @@ impl Node {
         tickets
     }
 
-    /// Whether the ticket is missed and expired (dcrd
+    /// Whether the ticket ever expired from the perspective of this node:
+    /// it is missed or revoked with its expired flag set (dcrd
     /// `ExistsExpiredTicket`).
     pub fn exists_expired_ticket(&self, ticket: &Hash) -> bool {
         if let Some(v) = self.missed_tickets.value(&ticket.0)

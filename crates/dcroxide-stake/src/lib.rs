@@ -1,18 +1,29 @@
 // SPDX-License-Identifier: ISC
-//! Decred stake transaction primitives, mirroring dcrd's
-//! `blockchain/stake` package at master `452c1a6c` (the dcrd 2.2
-//! campaign parity target): stake transaction classification and format rule
-//! checks (tickets, votes, revocations, and the treasury transactions),
+//! Decred stake transaction primitives and ticket state, mirroring dcrd's
+//! `blockchain/stake` package at the parity pin, master `b9634e01`: stake
+//! transaction classification and format rule checks (tickets, votes,
+//! revocations, and the treasury transactions),
 //! commitment/vote-bits/block-reference extraction, reward calculation,
-//! and the deterministic ticket lottery PRNG.
+//! and the deterministic ticket lottery PRNG.  The package's two changes
+//! since the 2.2 campaign target `452c1a6c` are carried: `036b7090`
+//! (`tickettreap`'s `getByIndex` bound) and `5dd4ca59` (the revocation
+//! helper accepting zero-valued outputs).
 //!
-//! The live-ticket state machinery (`tickets.go`, the ticket treap, and
-//! the database serialization) is a separate upcoming piece; see
+//! The live-ticket state machinery lives in the submodules: the ticket
+//! treap (`tickettreap`, dcrd `internal/tickettreap`), the ticket
+//! database row formats (`ticketdb`, dcrd `internal/ticketdb`), the
+//! per-block stake node (`ticketnode`, dcrd `tickets.go`), and the
+//! database-coupled `Db*` functions and entry points (`stakedb`); see
 //! PARITY.md.
 //!
 //! Extraction helpers documented by dcrd as only safe on transactions
 //! that already passed the corresponding `Is*` check keep dcrd's exact
 //! panic-on-malformed-input behavior rather than adding new error paths.
+//!
+//! The `no_std` attribute below covers this crate's own code only:
+//! `stakedb` reaches the std-only `dcroxide-database`, so the crate as a
+//! whole builds only with std, which is why the CI no_std job does not
+//! list it.
 
 #![cfg_attr(not(test), no_std)]
 // This crate holds no hashed containers: every map and set in it is
@@ -457,10 +468,11 @@ pub fn sstx_null_output_amounts(
         ));
     }
 
+    // The subtraction and the sum wrap like dcrd's int64 arithmetic.
     let mut contrib_amounts = Vec::with_capacity(amounts.len());
     let mut sum: i64 = 0;
     for i in 0..amounts.len() {
-        let contrib = amounts[i] - change_amounts[i];
+        let contrib = amounts[i].wrapping_sub(change_amounts[i]);
         if contrib < 0 {
             return Err(stake_rule_error(
                 ErrorKind::SStxBadChangeAmts,
@@ -470,40 +482,69 @@ pub fn sstx_null_output_amounts(
                 ),
             ));
         }
-        sum += contrib;
+        sum = sum.wrapping_add(contrib);
         contrib_amounts.push(contrib);
     }
 
-    Ok((sum - amount_ticket, contrib_amounts))
+    Ok((sum.wrapping_sub(amount_ticket), contrib_amounts))
 }
 
 /// The 64.32 fixed point proportional return calculation shared by votes
-/// and revocations (dcrd `calculateTicketReturnAmounts`), using 256-bit
-/// intermediate math exactly like dcrd's `big.Int` path. Inputs are
-/// expected to be non-negative (they are decoded 63-bit amounts in all
-/// consensus paths).
+/// and revocations (dcrd `calculateTicketReturnAmounts`).
+///
+/// dcrd sums the contributions and the output amount in wrapping int64
+/// and does the rest in signed `big.Int`: `Div` is Euclidean and `Rsh`
+/// floors.  Consensus callers only pass decoded 63-bit commitments that
+/// sum below `MaxAmount`, where none of that matters, but the function is
+/// public, so the sign handling is reproduced over 256-bit magnitudes
+/// (the numerator stays under 2^158) rather than assumed away.  A zero
+/// contribution sum panics on the division, as it does in Go.
 fn calculate_ticket_return_amounts(
     contrib_amounts: &[i64],
     ticket_purchase_amount: i64,
     vote_subsidy: i64,
 ) -> Vec<i64> {
-    let total_contrib: i64 = contrib_amounts.iter().sum();
-    let total_contrib_256 = Uint256::from_u64(total_contrib as u64);
+    let total_contrib = contrib_amounts
+        .iter()
+        .fold(0i64, |sum, &amount| sum.wrapping_add(amount));
+    let total_contrib_256 = Uint256::from_u64(total_contrib.unsigned_abs());
 
-    let total_output_amt = ticket_purchase_amount + vote_subsidy;
-    let total_output_256 = Uint256::from_u64(total_output_amt as u64);
+    let total_output_amt = ticket_purchase_amount.wrapping_add(vote_subsidy);
+    let total_output_256 = Uint256::from_u64(total_output_amt.unsigned_abs());
 
     let mut return_amounts = Vec::with_capacity(contrib_amounts.len());
     for &contrib_amount in contrib_amounts {
         // return = (total output * contribution) << 32 / total contribs >> 32
-        let mut v = Uint256::from_u64(contrib_amount as u64);
-        v.mul(&total_output_256)
-            .lsh(32)
-            .div(&total_contrib_256)
-            .rsh(32);
-        // Like Go's big.Int Int64, take the low 64 bits.
-        let le = v.to_le_bytes();
-        return_amounts.push(i64::from_le_bytes(le[..8].try_into().expect("8 bytes")));
+        let mut num = Uint256::from_u64(contrib_amount.unsigned_abs());
+        num.mul(&total_output_256).lsh(32);
+        let num_neg = !num.is_zero() && ((contrib_amount < 0) != (total_output_amt < 0));
+
+        // Euclidean division keeps the remainder non-negative, so a
+        // negative numerator that does not divide evenly rounds its
+        // quotient's magnitude up.
+        let mut quo = num;
+        quo.div(&total_contrib_256);
+        if num_neg {
+            let mut product = quo;
+            product.mul(&total_contrib_256);
+            if product != num {
+                quo.add_u64(1);
+            }
+        }
+        let quo_neg = !quo.is_zero() && (num_neg != (total_contrib < 0));
+
+        // An arithmetic right shift floors, so a negative value with any
+        // of the shifted-out bits set rounds its magnitude up.
+        let shifted_out = quo.as_u32() != 0;
+        quo.rsh(32);
+        if quo_neg && shifted_out {
+            quo.add_u64(1);
+        }
+
+        // Like Go's big.Int Int64: the low 64 bits of the magnitude,
+        // negated when the value is negative.
+        let low = quo.as_u64() as i64;
+        return_amounts.push(if quo_neg { low.wrapping_neg() } else { low });
     }
 
     return_amounts
@@ -534,14 +575,16 @@ pub fn calculate_revocation_rewards(
         return return_amounts;
     }
 
-    let total_return_amount: i64 = return_amounts.iter().sum();
+    let total_return_amount = return_amounts
+        .iter()
+        .fold(0i64, |sum, &amount| sum.wrapping_add(amount));
     if total_return_amount < ticket_purchase_amount {
         let num_return_amounts = return_amounts.len() as u32;
-        let remainder = ticket_purchase_amount - total_return_amount;
+        let remainder = ticket_purchase_amount.wrapping_sub(total_return_amount);
         let mut prng = Hash256Prng::new(prev_header_bytes);
         for _ in 0..remainder {
             let return_index = prng.uniform_random(num_return_amounts) as usize;
-            return_amounts[return_index] += 1;
+            return_amounts[return_index] = return_amounts[return_index].wrapping_add(1);
         }
     }
 
@@ -1108,7 +1151,10 @@ pub fn check_ssrtx(tx: &MsgTx) -> Result<(), RuleError> {
         }
 
         // The fee must be zero.
-        let output_amt: i64 = tx.tx_out.iter().map(|o| o.value).sum();
+        let output_amt = tx
+            .tx_out
+            .iter()
+            .fold(0i64, |sum, o| sum.wrapping_add(o.value));
         let input_amt = tx.tx_in[0].value_in;
         if output_amt < input_amt {
             return Err(stake_rule_error(
@@ -1328,7 +1374,7 @@ pub fn create_revocation_from_ticket(
         // Apply the fee to the first output that can absorb it.
         let mut amt = revocation_output_amounts[i];
         if !fee_applied && revocation_tx_fee < amt {
-            amt -= revocation_tx_fee;
+            amt = amt.wrapping_sub(revocation_tx_fee);
             fee_applied = true;
         }
 

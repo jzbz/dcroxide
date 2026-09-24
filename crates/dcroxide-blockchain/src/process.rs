@@ -7,6 +7,7 @@
 //! rejection checkpoint tracking, and the full block processing path
 //! (`ProcessBlock` and the reorganization machinery it drives).
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -445,7 +446,8 @@ impl Chain {
         store.node_mut(genesis).status =
             BlockStatus(BlockStatus::DATA_STORED.0 | BlockStatus::VALIDATED.0);
         store.node_mut(genesis).is_fully_linked = true;
-        store.node_mut(genesis).stake_node = Some(StakeNode::genesis(stake_node_params(params)));
+        store.node_mut(genesis).stake_node =
+            Some(Box::new(StakeNode::genesis(stake_node_params(params))));
         index.add_node(&store, genesis);
         let best_chain = NodeChainView::new(&store, Some(genesis));
 
@@ -957,7 +959,7 @@ impl Chain {
         {
             let n = self.store.node_mut(tip);
             n.new_tickets = Some(stake_node.new_tickets().to_vec());
-            n.stake_node = Some(stake_node.clone());
+            n.stake_node = Some(Box::new(stake_node.clone()));
         }
 
         // Warm the recent-window mirrors (blocks, spend journals,
@@ -2433,7 +2435,7 @@ impl Chain {
         // Return the cached immutable stake node when it is already
         // loaded.
         if let Some(stake_node) = &self.store.node(node).stake_node {
-            return Ok(stake_node.clone());
+            return Ok(StakeNode::clone(stake_node));
         }
 
         // Create the requested stake node from the parent stake node
@@ -2449,7 +2451,7 @@ impl Chain {
             let iv = self.store.lottery_iv(node);
             let parent_stake_node = self.store.node(parent).stake_node.as_ref().expect("loaded");
             let stake_node = parent_stake_node.connect(iv, &voted, &revoked, &new_tickets)?;
-            self.store.node_mut(node).stake_node = Some(stake_node.clone());
+            self.store.node_mut(node).stake_node = Some(Box::new(stake_node.clone()));
             return Ok(stake_node);
         }
 
@@ -2484,7 +2486,7 @@ impl Chain {
                     .as_ref()
                     .expect("stake node along the walk is loaded")
                     .disconnect(prev_iv, &utds, &tickets)?;
-                self.store.node_mut(prev_id).stake_node = Some(stake_node);
+                self.store.node_mut(prev_id).stake_node = Some(Box::new(stake_node));
             }
             cur = prev;
         }
@@ -2496,7 +2498,8 @@ impl Chain {
                 .store
                 .node(node)
                 .stake_node
-                .clone()
+                .as_deref()
+                .cloned()
                 .expect("fork stake node loaded"));
         }
 
@@ -2529,14 +2532,15 @@ impl Chain {
                 .as_ref()
                 .expect("parent stake node loaded along the attach path");
             let stake_node = parent_stake_node.connect(iv, &voted, &revoked, &new_tickets)?;
-            self.store.node_mut(id).stake_node = Some(stake_node);
+            self.store.node_mut(id).stake_node = Some(Box::new(stake_node));
         }
 
         Ok(self
             .store
             .node(node)
             .stake_node
-            .clone()
+            .as_deref()
+            .cloned()
             .expect("requested stake node loaded"))
     }
 
@@ -3147,9 +3151,10 @@ impl Chain {
                 Some((entry.script_version(), entry.pk_script()))
             }
         }
+        // dcrd `ruleError(ErrMissingTxOut, err.Error())`.
         dcroxide_gcs::blockcf2::regular(block, &ViewScripts(view)).map_err(|e| RuleError {
             kind: RuleErrorKind::MissingTxOut,
-            description: format!("{e:?}"),
+            description: format!("{e}"),
         })
     }
 
@@ -5721,7 +5726,7 @@ impl Chain {
     /// The stake node at the tip of the best chain, if loaded.
     fn tip_stake_node(&self) -> Option<&StakeNode> {
         let tip = self.best_chain.tip()?;
-        self.store.node(tip).stake_node.as_ref()
+        self.store.node(tip).stake_node.as_deref()
     }
 
     /// Whether the ticket exists in the live ticket treap of the best

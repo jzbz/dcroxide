@@ -263,9 +263,17 @@ impl IndexSubscriber {
 
             self.notify_dependent(chain, ntfn)?;
 
+            // Read the chain tip before taking the indexer lock again:
+            // the queryer locks the chain, and holding the index mutex
+            // while that waits would stall every reader of the index
+            // (dcrd's readers take no index-wide lock at all) for as
+            // long as a block validation holds the chain.
+            let queryer = idx.lock().expect("indexer lock poisoned").queryer();
+            let best = queryer.best();
             maybe_notify_subscribers(
                 &self.interrupt,
                 &mut *idx.lock().expect("indexer lock poisoned"),
+                best,
             )?;
         }
 
@@ -497,5 +505,178 @@ impl IndexSubscriber {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{OnceLock, Weak};
+
+    use dcroxide_chaincfg::Params;
+    use dcroxide_chainhash::Hash;
+    use dcroxide_database::{Database, Options, Transaction};
+    use dcroxide_wire::{BlockHeader, MsgBlock};
+
+    use crate::common::{SyncWaiter, notify_sync_subscribers};
+
+    /// A queryer that records whether the index mutex was held each time
+    /// the chain tip was asked for.  The daemon's queryer locks the chain
+    /// there, so a held index mutex is one held across a chain wait.
+    struct ProbeQueryer {
+        params: Params,
+        best: (i64, Hash),
+        index: OnceLock<Weak<Mutex<dyn Indexer>>>,
+        best_calls: AtomicUsize,
+        under_index_lock: AtomicUsize,
+    }
+
+    impl ChainQueryer for ProbeQueryer {
+        fn main_chain_has_block(&self, _: &Hash) -> bool {
+            true
+        }
+        fn chain_params(&self) -> &Params {
+            &self.params
+        }
+        fn best(&self) -> (i64, Hash) {
+            self.best_calls.fetch_add(1, Ordering::SeqCst);
+            let index = self.index.get().and_then(Weak::upgrade).expect("index");
+            if index.try_lock().is_err() {
+                self.under_index_lock.fetch_add(1, Ordering::SeqCst);
+            }
+            self.best
+        }
+        fn block_header_by_hash(&self, _: &Hash) -> Result<dcroxide_wire::BlockHeader, String> {
+            unreachable!("not asked by an update")
+        }
+        fn block_hash_by_height(&self, _: i64) -> Result<Hash, String> {
+            unreachable!("not asked by an update")
+        }
+        fn block_height_by_hash(&self, _: &Hash) -> Result<i64, String> {
+            unreachable!("not asked by an update")
+        }
+        fn block_by_hash(&self, _: &Hash) -> Result<Arc<MsgBlock>, String> {
+            unreachable!("not asked by an update")
+        }
+        fn is_treasury_agenda_active(&self, _: &Hash) -> Result<bool, String> {
+            unreachable!("not asked by an update")
+        }
+    }
+
+    /// An index that only tracks its tip.
+    struct TipIndex {
+        db: Arc<Database>,
+        chain: Arc<dyn ChainQueryer>,
+        tip: (i64, Hash),
+        subscribers: Vec<SyncWaiter>,
+    }
+
+    impl Indexer for TipIndex {
+        fn key(&self) -> &'static [u8] {
+            b"tipidx"
+        }
+        fn name(&self) -> &'static str {
+            "tip index"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn db(&self) -> Arc<Database> {
+            Arc::clone(&self.db)
+        }
+        fn queryer(&self) -> Arc<dyn ChainQueryer> {
+            Arc::clone(&self.chain)
+        }
+        fn tip(&self) -> Result<(i64, Hash), IdxError> {
+            Ok(self.tip)
+        }
+        fn create(&self, _: &Transaction) -> Result<(), IdxError> {
+            Ok(())
+        }
+        fn process_notification(
+            &mut self,
+            _: &Transaction,
+            ntfn: &IndexNtfn,
+        ) -> Result<(), IdxError> {
+            self.tip = (block_height(&ntfn.block), ntfn.block.header.block_hash());
+            Ok(())
+        }
+        fn wait_for_sync(&mut self) -> SyncWaiter {
+            let waiter: SyncWaiter = Arc::new(core::sync::atomic::AtomicBool::new(false));
+            self.subscribers.push(Arc::clone(&waiter));
+            waiter
+        }
+        fn notify_sync_subscribers(&mut self) {
+            notify_sync_subscribers(&mut self.subscribers);
+        }
+        fn drop_index(&self, _: &Interrupt, _: &Database) -> Result<(), IdxError> {
+            Ok(())
+        }
+    }
+
+    /// The sync check after an update reads the chain tip with the index
+    /// mutex released.  dcrd's readers take no index-wide lock, so the
+    /// index lock must not be held while the queryer waits on the chain:
+    /// every reader of the index would wait behind a block validation.
+    #[test]
+    fn the_sync_check_reads_the_chain_tip_without_the_index_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let params = dcroxide_chaincfg::simnet_params();
+        let opts = Options::new(dir.path().join("db"), params.net.0);
+        let db = Arc::new(Database::create(&opts).expect("create"));
+
+        let (mut header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("header");
+        header.height = 1;
+        let block = Arc::new(MsgBlock {
+            header,
+            transactions: Vec::new(),
+            stransactions: Vec::new(),
+        });
+
+        let queryer = Arc::new(ProbeQueryer {
+            params,
+            best: (1, block.header.block_hash()),
+            index: OnceLock::new(),
+            best_calls: AtomicUsize::new(0),
+            under_index_lock: AtomicUsize::new(0),
+        });
+        let index = Arc::new(Mutex::new(TipIndex {
+            db,
+            chain: Arc::clone(&queryer) as Arc<dyn ChainQueryer>,
+            tip: (0, Hash::ZERO),
+            subscribers: Vec::new(),
+        }));
+        let handle: IndexerHandle = index.clone();
+        queryer
+            .index
+            .set(Arc::downgrade(&handle))
+            .unwrap_or_else(|_| unreachable!("set once"));
+
+        let mut subscriber = IndexSubscriber::new(Interrupt::default());
+        subscriber
+            .subscribe("tip index", handle, NO_PREREQS)
+            .expect("subscribe");
+        let synced = index.lock().expect("index").wait_for_sync();
+
+        subscriber
+            .notify(&IndexNtfn {
+                ntfn_type: CONNECT_NTFN,
+                block: Arc::clone(&block),
+                parent: block,
+                is_treasury_enabled: false,
+            })
+            .expect("update");
+
+        assert!(
+            synced.load(Ordering::SeqCst),
+            "the index reached the chain tip, so its sync subscribers are told"
+        );
+        assert!(queryer.best_calls.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            queryer.under_index_lock.load(Ordering::SeqCst),
+            0,
+            "the chain tip was read while the index mutex was held"
+        );
     }
 }

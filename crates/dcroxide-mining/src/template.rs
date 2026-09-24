@@ -4,7 +4,7 @@
 //! parent vote sorting, the coinbase and treasurybase construction,
 //! the template merkle and commitment roots, and the fee rate
 //! calculation.  The template assembly itself (`NewBlockTemplate`)
-//! arrives with the following piece.
+//! is `BlkTmplGenerator::new_block_template` in `generator.rs`.
 
 use alloc::vec::Vec;
 
@@ -174,8 +174,8 @@ pub fn calc_block_commitment_root_v1(
     block: &MsgBlock,
     prev_scripts: &impl dcroxide_gcs::blockcf2::PrevScripter,
 ) -> Result<Hash, String> {
-    let filter = dcroxide_gcs::blockcf2::regular(block, prev_scripts)
-        .map_err(|e| alloc::format!("{e:?}"))?;
+    let filter =
+        dcroxide_gcs::blockcf2::regular(block, prev_scripts).map_err(|e| alloc::format!("{e}"))?;
     Ok(dcroxide_blockchain::validate::calc_commitment_root_v1(
         filter.hash(),
     ))
@@ -218,7 +218,7 @@ pub fn create_coinbase_tx<SP: SubsidyParams>(
         tx.version = 1;
         tx.tx_in.push(coinbase_input);
         tx.tx_in[0].value_in = params.block_one_subsidy();
-        for payout in &params.block_one_ledger {
+        for payout in params.block_one_ledger.iter() {
             tx.tx_out.push(TxOut {
                 value: payout.amount,
                 version: payout.script_version,

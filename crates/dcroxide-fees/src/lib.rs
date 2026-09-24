@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: ISC
-//! Smart fee estimation, ported from dcrd's `internal/fees` package
+//! Smart fee estimation, ported from dcrd's `internal/fees` package:
 //! the exponentially-bucketed confirmation
 //! tracking estimator behind the `estimatesmartfee` RPC, including
 //! its exact floating point accounting and the database row codec.
-//! The leveldb-backed persistence plumbing arrives with the daemon
-//! wiring; the row serialization format is pinned here.
+//!
+//! The leveldb-backed persistence is not ported: dcrd saves the bucket
+//! statistics to `<datadir>/feesdb` and reloads them in `NewEstimator`
+//! (`loadFromDatabase`), while the daemon's estimator here starts empty
+//! every run (`dcroxide-node`'s `fees` module), so after a restart
+//! `estimatesmartfee` errors until it has seen enough mined
+//! transactions where dcrd answers from its saved history.  Only the
+//! row serialization format is pinned here; see PARITY.md.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]

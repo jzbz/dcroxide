@@ -125,7 +125,11 @@ pub struct ExistsAddrIndex {
 /// transaction (`subscriber.rs`, pinned by `b6_indexlock`): the writer's
 /// semaphore is claimed last and never held while it waits here, so a
 /// query that held the mutex across its database reads would stall the
-/// indexer without stalling every other commit in the process.
+/// indexer without stalling every other commit in the process.  The
+/// other direction matters as much: the writer holds the mutex through
+/// its wait for the database writer and a block's index work, so the
+/// daemon's RPC seam takes one of these once, at startup, and never
+/// waits on the writer to answer a lookup or report the tip.
 #[derive(Clone)]
 pub struct ExistsAddrQuery {
     db: Arc<Database>,
@@ -133,6 +137,12 @@ pub struct ExistsAddrQuery {
 }
 
 impl ExistsAddrQuery {
+    /// The current index tip (dcrd `ExistsAddrIndex.Tip`, which reads
+    /// the tips bucket with no index-wide lock held).
+    pub fn tip(&self) -> Result<(i64, Hash), IdxError> {
+        tip(&self.db, EXISTS_ADDR_INDEX_KEY)
+    }
+
     /// Whether the key is in the unconfirmed overlay (dcrd's read under
     /// `unconfirmedLock.RLock`).
     fn unconfirmed_contains(&self, k: &[u8; ADDR_KEY_SIZE]) -> bool {
@@ -196,6 +206,88 @@ impl ExistsAddrQuery {
         }
 
         Ok(exists)
+    }
+}
+
+/// The mempool's hook into the unconfirmed overlay, detached from the
+/// index mutex (dcrd `ExistsAddrIndex.AddUnconfirmedTx`, which takes
+/// `unconfirmedLock` and nothing else).
+///
+/// The mempool records every accepted transaction here while it holds
+/// its own pool mutex.  Reached through `Arc<Mutex<ExistsAddrIndex>>`,
+/// that record would wait for as long as the index writer holds the
+/// index mutex — through its wait for the database writer and a whole
+/// block's index work — and every caller queued on the pool mutex would
+/// wait with it.  The overlay has its own lock, so the hook takes a
+/// handle once and never touches the index mutex.
+#[derive(Clone)]
+pub struct ExistsAddrUnconfirmed {
+    chain: Arc<dyn ChainQueryer>,
+    mp_exists_addr: Unconfirmed,
+}
+
+impl ExistsAddrUnconfirmed {
+    /// Add all addresses related to the transaction to the
+    /// unconfirmed (memory-only) exists address index (dcrd
+    /// `AddUnconfirmedTx`).
+    pub fn add_unconfirmed_tx(&self, tx: &MsgTx) {
+        let params = self.chain.chain_params();
+        let is_sstx = dcroxide_stake::is_sstx(tx);
+        let mut keys: Vec<[u8; ADDR_KEY_SIZE]> = Vec::new();
+        for tx_in in &tx.tx_in {
+            // Note that the functions used here require v0 scripts.
+            if !stdscript::is_multi_sig_sig_script_v0(&tx_in.signature_script) {
+                continue;
+            }
+            let Some(rs) =
+                stdscript::multi_sig_redeem_script_from_script_sig_v0(&tx_in.signature_script)
+            else {
+                continue;
+            };
+            let (script_type, addrs) = stdscript::extract_addrs_v0(rs, params);
+            if script_type != stdscript::ScriptType::MultiSig {
+                // This should never happen, but be paranoid.
+                continue;
+            }
+            for addr in &addrs {
+                if let Ok(k) = addr_to_key(addr) {
+                    keys.push(k);
+                }
+            }
+        }
+
+        for tx_out in &tx.tx_out {
+            let (script_type, mut addrs) =
+                stdscript::extract_addrs(tx_out.version, &tx_out.pk_script, params);
+            if script_type == stdscript::ScriptType::NonStandard {
+                // Non-standard outputs are skipped.
+                continue;
+            }
+
+            if is_sstx
+                && script_type == stdscript::ScriptType::NullData
+                && let Ok(addr) =
+                    dcroxide_stake::addr_from_sstx_pk_scr_commitment(&tx_out.pk_script, params)
+            {
+                addrs.push(addr);
+            }
+            // Unsupported address types are ignored.
+
+            for addr in &addrs {
+                // Ignore unsupported address types.
+                if let Ok(k) = addr_to_key(addr) {
+                    keys.push(k);
+                }
+            }
+        }
+
+        let mut overlay = self
+            .mp_exists_addr
+            .write()
+            .expect("unconfirmed overlay lock poisoned");
+        for k in keys {
+            overlay.insert(k);
+        }
     }
 }
 
@@ -297,6 +389,16 @@ impl ExistsAddrIndex {
         }
     }
 
+    /// The mempool's handle on the unconfirmed overlay, which does not
+    /// borrow the index (dcrd's `AddUnconfirmedTx` takes no index-wide
+    /// lock); see [`ExistsAddrUnconfirmed`].
+    pub fn unconfirmed(&self) -> ExistsAddrUnconfirmed {
+        ExistsAddrUnconfirmed {
+            chain: Arc::clone(&self.chain),
+            mp_exists_addr: Arc::clone(&self.mp_exists_addr),
+        }
+    }
+
     /// Whether or not an address has been seen before (dcrd
     /// `ExistsAddress`).
     pub fn exists_address(&self, addr: &Address) -> Result<bool, IdxError> {
@@ -335,7 +437,7 @@ impl ExistsAddrIndex {
                 else {
                     continue;
                 };
-                let (typ, addrs) = stdscript::extract_addrs_v0(&rs, params);
+                let (typ, addrs) = stdscript::extract_addrs_v0(rs, params);
                 if typ != stdscript::ScriptType::MultiSig {
                     // This should never happen, but be paranoid.
                     continue;
@@ -434,67 +536,8 @@ impl ExistsAddrIndex {
     /// Add all addresses related to the transaction to the
     /// unconfirmed (memory-only) exists address index (dcrd
     /// `AddUnconfirmedTx`).
-    pub fn add_unconfirmed_tx(&mut self, tx: &MsgTx) {
-        let params_addrs = {
-            let params = self.chain.chain_params();
-            let is_sstx = dcroxide_stake::is_sstx(tx);
-            let mut keys: Vec<[u8; ADDR_KEY_SIZE]> = Vec::new();
-            for tx_in in &tx.tx_in {
-                // Note that the functions used here require v0
-                // scripts.
-                if !stdscript::is_multi_sig_sig_script_v0(&tx_in.signature_script) {
-                    continue;
-                }
-                let Some(rs) =
-                    stdscript::multi_sig_redeem_script_from_script_sig_v0(&tx_in.signature_script)
-                else {
-                    continue;
-                };
-                let (script_type, addrs) = stdscript::extract_addrs_v0(&rs, params);
-                if script_type != stdscript::ScriptType::MultiSig {
-                    // This should never happen, but be paranoid.
-                    continue;
-                }
-                for addr in &addrs {
-                    if let Ok(k) = addr_to_key(addr) {
-                        keys.push(k);
-                    }
-                }
-            }
-
-            for tx_out in &tx.tx_out {
-                let (script_type, mut addrs) =
-                    stdscript::extract_addrs(tx_out.version, &tx_out.pk_script, params);
-                if script_type == stdscript::ScriptType::NonStandard {
-                    // Non-standard outputs are skipped.
-                    continue;
-                }
-
-                if is_sstx
-                    && script_type == stdscript::ScriptType::NullData
-                    && let Ok(addr) =
-                        dcroxide_stake::addr_from_sstx_pk_scr_commitment(&tx_out.pk_script, params)
-                {
-                    addrs.push(addr);
-                }
-                // Unsupported address types are ignored.
-
-                for addr in &addrs {
-                    // Ignore unsupported address types.
-                    if let Ok(k) = addr_to_key(addr) {
-                        keys.push(k);
-                    }
-                }
-            }
-            keys
-        };
-        let mut overlay = self
-            .mp_exists_addr
-            .write()
-            .expect("unconfirmed overlay lock poisoned");
-        for k in params_addrs {
-            overlay.insert(k);
-        }
+    pub fn add_unconfirmed_tx(&self, tx: &MsgTx) {
+        self.unconfirmed().add_unconfirmed_tx(tx);
     }
 }
 
