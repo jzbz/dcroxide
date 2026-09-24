@@ -121,25 +121,30 @@ pub fn make_script_num(v: &[u8], script_num_len: usize) -> Result<ScriptNum, Scr
 
     // Decode from little endian.
     //
-    // Go defines a shift at or past the operand width as producing
-    // zero, while Rust masks the shift count modulo the width, so a
-    // byte at index eight or beyond would fold back into the low
-    // positions here instead of vanishing.  `checked_shl` reproduces
-    // Go's rule.  A caller cannot reach that today -- the length check
-    // above rejects anything longer than `script_num_len`, and every
-    // consensus caller passes four or five -- but this is a public
-    // function and the length is its caller's to choose.
-    let shift_to_zero = |value: i64, places: u32| value.checked_shl(places).unwrap_or(0);
+    // dcrd shifts by `uint8(8*i)`: the conversion wraps the count modulo
+    // 256, and Go then defines a shift at or past the operand width as
+    // producing zero.  So bytes at index 8..=31 vanish while those at
+    // index 32..=39 (and every further run of eight in 32) fold back
+    // into the low positions.  Rust masks the count modulo the width
+    // instead, so `go_shl` truncates to `u8` first and then uses
+    // `checked_shl` for Go's zero.  A caller cannot reach any of this
+    // today -- the length check above rejects anything longer than
+    // `script_num_len`, and every consensus caller passes one, four or
+    // five -- but this is a public function and the length is its
+    // caller's to choose.
+    let go_shl =
+        |value: i64, places: usize| value.checked_shl(u32::from(places as u8)).unwrap_or(0);
     let mut result: i64 = 0;
     for (i, val) in v.iter().enumerate() {
-        result |= shift_to_zero(i64::from(*val), 8 * i as u32);
+        result |= go_shl(i64::from(*val), 8 * i);
     }
 
     // When the most significant byte of the input has the sign bit set,
-    // remove it from the result and negate.
+    // remove it from the result and negate.  Go's negation wraps, so a
+    // nine-byte input that decodes to `i64::MIN` stays there.
     if v[v.len() - 1] & 0x80 != 0 {
-        result &= !shift_to_zero(0x80i64, 8 * (v.len() - 1) as u32);
-        return Ok(ScriptNum(-result));
+        result &= !go_shl(0x80i64, 8 * (v.len() - 1));
+        return Ok(ScriptNum(result.wrapping_neg()));
     }
 
     Ok(ScriptNum(result))

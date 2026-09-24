@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: ISC
 //! Decred P2P wire protocol types and codecs, mirroring dcrd's `wire`
-//! package at master `452c1a6c` (the dcrd 2.2 campaign parity
-//! target; wire protocol 12).
+//! package at master `b9634e01` (the parity pin; wire protocol 12).
+//! Its only code change since the earlier `452c1a6c` target is
+//! `SerializeSize` on every message, ported as
+//! [`Message::serialize_size`].
 //!
 //! Implemented: variable-length integers, transactions ([`MsgTx`])
 //! with all three serialization types and their BLAKE-256 hashes, the
@@ -43,7 +45,9 @@
 #![deny(clippy::iter_over_hash_type)]
 // Wire arithmetic is cursor positions and serialize-size sums, all bounded by
 // slice lengths / in-memory object sizes (dcrd likewise uses plain int math
-// here). The workspace lint stays on for the consensus-math crates.
+// here). Like every consensus crate's, this allow is crate-wide, so the
+// workspace lint checks nothing here; release builds wrap on overflow
+// (`overflow-checks = false`) where dev and test builds panic.
 #![allow(clippy::arithmetic_side_effects)]
 
 extern crate alloc;

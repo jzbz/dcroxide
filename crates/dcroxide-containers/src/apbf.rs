@@ -57,9 +57,15 @@ fn calc_fp_rate_internal(
     }
 
     // Calculate the fill ratio for the slice.
+    //
+    // dcrd computes `float64(2*k)` with `k` a uint8 (`filter.go:61`), so
+    // the doubling happens in eight bits and wraps for k >= 128: k == 128
+    // divides by zero (an infinite ratio, then a NaN rate) and k == 200
+    // divides by 144 rather than 400.  Widening before the multiply
+    // silently disagrees there, as it would in `capacity`.
     let mut fill_ratio = 0.5f64;
     if i < u16::from(k) {
-        fill_ratio = f64::from(i + 1) / f64::from(2 * u16::from(k));
+        fill_ratio = f64::from(i + 1) / f64::from(k.wrapping_mul(2));
     }
 
     let first_term = fill_ratio * calc_fp_rate_internal(results, k, l, a + 1, i + 1);

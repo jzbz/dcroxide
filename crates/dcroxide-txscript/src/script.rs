@@ -2,6 +2,7 @@
 //! Script analysis utilities (dcrd `script.go`), all version-0 semantics
 //! with dcrd's exact consensus warnings preserved in behavior.
 
+use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -158,13 +159,15 @@ pub(crate) fn is_canonical_push(opcode: u8, data: &[u8]) -> bool {
 }
 
 /// The script minus any opcodes that perform a canonical push of data that
-/// contains the passed data to remove (dcrd `removeOpcodeByData`).
+/// contains the passed data to remove (dcrd `removeOpcodeByData`).  Like
+/// dcrd, which returns the input slice itself, it only allocates when a
+/// push is actually removed.
 ///
 /// Only valid for version 0 scripts.
-pub(crate) fn remove_opcode_by_data(script: &[u8], data_to_remove: &[u8]) -> Vec<u8> {
+pub(crate) fn remove_opcode_by_data<'s>(script: &'s [u8], data_to_remove: &[u8]) -> Cow<'s, [u8]> {
     // Avoid work when possible.
     if script.is_empty() || data_to_remove.is_empty() {
-        return script.to_vec();
+        return Cow::Borrowed(script);
     }
 
     // Parse through the script looking for a canonical data push that
@@ -172,13 +175,11 @@ pub(crate) fn remove_opcode_by_data(script: &[u8], data_to_remove: &[u8]) -> Vec
     const SCRIPT_VERSION: u16 = 0;
     let mut result: Option<Vec<u8>> = None;
     let mut prev_offset = 0usize;
+    let mut search = Substring::new(data_to_remove);
     let mut tokenizer = ScriptTokenizer::new(SCRIPT_VERSION, script);
     while tokenizer.next() {
         let (op, data) = (tokenizer.opcode(), tokenizer.data());
-        let contains = data
-            .windows(data_to_remove.len())
-            .any(|w| w == data_to_remove);
-        if is_canonical_push(op, data) && contains {
+        if is_canonical_push(op, data) && search.is_in(data) {
             if result.is_none() {
                 let full_push_len = tokenizer.byte_index() - prev_offset;
                 let mut r = Vec::with_capacity(script.len() - full_push_len);
@@ -191,7 +192,69 @@ pub(crate) fn remove_opcode_by_data(script: &[u8], data_to_remove: &[u8]) -> Vec
 
         prev_offset = tokenizer.byte_index();
     }
-    result.unwrap_or_else(|| script.to_vec())
+    match result {
+        Some(result) => Cow::Owned(result),
+        None => Cow::Borrowed(script),
+    }
+}
+
+/// A search for one non-empty needle across several haystacks, standing in
+/// for Go's `bytes.Contains` in [`remove_opcode_by_data`].  Go's search
+/// stays near-linear on adversarial input (it falls back to Rabin-Karp
+/// after repeated false starts), where a naive scan of every window costs
+/// the product of the lengths, so this is Knuth-Morris-Pratt: linear in
+/// the haystack after a table linear in the needle, built only once a
+/// haystack longer than the needle turns up.  The answer is the same
+/// either way; only the cost differs.
+struct Substring<'n> {
+    needle: &'n [u8],
+    /// For each needle prefix `needle[..=i]`, the length of its longest
+    /// proper prefix that is also its suffix; empty until first needed.
+    fallback: Vec<usize>,
+}
+
+impl<'n> Substring<'n> {
+    /// A search for `needle`, which must not be empty.
+    fn new(needle: &'n [u8]) -> Substring<'n> {
+        Substring {
+            needle,
+            fallback: Vec::new(),
+        }
+    }
+
+    /// Whether the needle occurs in `haystack`.
+    fn is_in(&mut self, haystack: &[u8]) -> bool {
+        let needle = self.needle;
+        if haystack.len() <= needle.len() {
+            return haystack == needle;
+        }
+        if self.fallback.is_empty() {
+            self.fallback = alloc::vec![0; needle.len()];
+            let mut k = 0;
+            for i in 1..needle.len() {
+                while k > 0 && needle[i] != needle[k] {
+                    k = self.fallback[k - 1];
+                }
+                if needle[i] == needle[k] {
+                    k += 1;
+                }
+                self.fallback[i] = k;
+            }
+        }
+        let mut k = 0;
+        for &b in haystack {
+            while k > 0 && b != needle[k] {
+                k = self.fallback[k - 1];
+            }
+            if b == needle[k] {
+                k += 1;
+                if k == needle.len() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 /// The passed small-integer opcode as an integer (dcrd `AsSmallInt`); the
@@ -359,4 +422,84 @@ pub fn generate_ssgen_votes(votebits: u16) -> Result<Vec<u8>, crate::builder::No
         .add_op(OP_RETURN)
         .add_data(&votebits.to_le_bytes())
         .script()
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::borrow::Cow;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::{Substring, remove_opcode_by_data};
+
+    /// The KMP search answers exactly what the naive scan of every window
+    /// does, including on the periodic near-misses that make the naive
+    /// scan quadratic, and for haystacks shorter than, equal to and
+    /// longer than the needle.
+    #[test]
+    fn substring_search_matches_the_naive_scan() {
+        let naive = |haystack: &[u8], needle: &[u8]| {
+            haystack.len() >= needle.len() && haystack.windows(needle.len()).any(|w| w == needle)
+        };
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize
+        };
+        for _ in 0..4000 {
+            // A two-letter alphabet makes partial matches, and so the
+            // fallback table, do real work.
+            let needle: Vec<u8> = (0..1 + next() % 9).map(|_| (next() % 2) as u8).collect();
+            let haystack: Vec<u8> = (0..next() % 40).map(|_| (next() % 2) as u8).collect();
+            let mut search = Substring::new(&needle);
+            assert_eq!(
+                search.is_in(&haystack),
+                naive(&haystack, &needle),
+                "needle {needle:?} haystack {haystack:?}"
+            );
+            // The table built for one haystack serves the next.
+            let other: Vec<u8> = (0..next() % 40).map(|_| (next() % 2) as u8).collect();
+            assert_eq!(search.is_in(&other), naive(&other, &needle));
+        }
+
+        // The quadratic case for a naive scan: zeros against zeros ending
+        // in a one.
+        let mut needle = vec![0u8; 1024];
+        needle[1023] = 1;
+        let mut search = Substring::new(&needle);
+        let mut haystack = vec![0u8; 2048];
+        assert!(!search.is_in(&haystack));
+        haystack[2047] = 1;
+        assert!(search.is_in(&haystack));
+    }
+
+    /// Like dcrd, which returns its input slice, nothing is copied unless
+    /// a push is removed; a matching canonical push is dropped whole and a
+    /// non-canonical one is kept.
+    #[test]
+    fn remove_opcode_by_data_borrows_unless_it_removes() {
+        // OP_DATA_3 01 02 03, OP_DUP.
+        let script = [0x03, 0x01, 0x02, 0x03, 0x76];
+        assert!(matches!(
+            remove_opcode_by_data(&script, &[0x09]),
+            Cow::Borrowed(s) if s == script
+        ));
+        assert!(matches!(
+            remove_opcode_by_data(&script, &[]),
+            Cow::Borrowed(s) if s == script
+        ));
+        assert!(matches!(
+            remove_opcode_by_data(&script, &[0x02, 0x03]),
+            Cow::Owned(s) if s == [0x76]
+        ));
+
+        // OP_PUSHDATA1 of three bytes is not canonical, so it stays.
+        let non_canonical = [0x4c, 0x03, 0x01, 0x02, 0x03, 0x76];
+        assert!(matches!(
+            remove_opcode_by_data(&non_canonical, &[0x02]),
+            Cow::Borrowed(s) if s == non_canonical
+        ));
+    }
 }

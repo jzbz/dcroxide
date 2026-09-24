@@ -264,11 +264,17 @@ pub fn calc_asert_diff(
     shifts -= 16;
 
     // Shift counts beyond these bounds are mathematically guaranteed to
-    // clamp below (nextDiff is at least 2^16 before shifting and the
-    // limit is under 2^256), so take the clamp directly rather than
-    // materializing an enormous intermediate value like Go does.
+    // clamp below, so take the clamp directly rather than materializing
+    // an enormous intermediate value like Go does.  Before shifting,
+    // nextDiff is at least 2^16 (startDiff >= 1, fracFactor >= 2^16)
+    // and under 2^2056 (a compact value is under 2^2039, fracFactor
+    // under 2^17).  A right shift of 8192 or more therefore always
+    // leaves 0, which clamps to 1.  A left shift of 8192 or more leaves
+    // at least 2^8208, which exceeds the limit only while the limit has
+    // at most 8208 bits -- every network's is under 2^256 -- so a larger
+    // limit takes dcrd's path and shifts.
     const MAX_MATERIALIZED_SHIFT: i64 = 8192;
-    if shifts >= MAX_MATERIALIZED_SHIFT {
+    if shifts >= MAX_MATERIALIZED_SHIFT && pow_limit.bits() <= 16 + MAX_MATERIALIZED_SHIFT as u64 {
         return big_to_compact(pow_limit);
     }
     if shifts <= -MAX_MATERIALIZED_SHIFT {

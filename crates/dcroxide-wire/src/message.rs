@@ -13,15 +13,21 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use dcroxide_chainhash::HASH_SIZE;
+
 use crate::MAX_MESSAGE_PAYLOAD;
+use crate::blockheader::MAX_BLOCK_HEADER_PAYLOAD;
 use crate::cursor::Cursor;
 use crate::error::{MessageText, WireError};
+use crate::invvect::INV_VECT_PAYLOAD;
 use crate::msg_cf::*;
 use crate::msg_control::*;
 use crate::msg_data::*;
 use crate::msg_mix::*;
-use crate::msgtx::MsgTx;
+use crate::msgtx::{MsgTx, TxOut};
+use crate::netaddress::MAX_NET_ADDRESS_PAYLOAD;
 use crate::protocol::{CurrencyNet, SEND_HEADERS_VERSION, is_strict_ascii};
+use crate::varint::var_int_serialize_size;
 
 /// The number of bytes in a message header (dcrd `MessageHeaderSize`).
 pub const MESSAGE_HEADER_SIZE: usize = 24;
@@ -137,11 +143,242 @@ impl Message {
         }
     }
 
+    /// The number of bytes the payload encodes to (dcrd `SerializeSize`,
+    /// which every message has carried since `e51406d1`), computed from
+    /// the fields without encoding anything.
+    ///
+    /// Each arm is the formula of that message's dcrd `SerializeSize`.
+    /// Like dcrd's, it takes no protocol version: a message's encoding
+    /// has one size at every version where it encodes at all, and a
+    /// message the encoder refuses still reports the size of its fields.
+    /// For every message that encodes, it equals the encoded length.
+    pub fn serialize_size(&self) -> usize {
+        // Signature 64 + identity 33 + session id 32 + run 4, the prefix
+        // every mix message after the pair request carries.
+        const MIX_FIXED: usize = 64 + 33 + 32 + 4;
+        match self {
+            // dcrd `MsgVersion.SerializeSize`: the two addresses go out
+            // without their timestamps.
+            Message::Version(m) => {
+                4 + 8
+                    + 8
+                    + 2 * net_address_size(false)
+                    + 8
+                    + var_bytes_size(m.user_agent.len())
+                    + 4
+                    + 1
+            }
+            Message::VerAck
+            | Message::GetAddr
+            | Message::MemPool
+            | Message::GetMiningState
+            | Message::SendHeaders
+            | Message::GetCFTypes => 0,
+            // dcrd `MsgAddr.SerializeSize`.
+            Message::Addr(m) => {
+                var_int_size(m.addr_list.len()) + m.addr_list.len() * net_address_size(true)
+            }
+            // dcrd `MsgAddrV2.SerializeSize` over `NetAddressV2.SerializeSize`:
+            // timestamp 8 + services 8 + type 1 + address + port 2.
+            Message::AddrV2(m) => {
+                var_int_size(m.addr_list.len())
+                    + m.addr_list
+                        .iter()
+                        .map(|na| 8 + 8 + 1 + na.encoded_addr.len() + 2)
+                        .sum::<usize>()
+            }
+            // dcrd `MsgGetBlocks`/`MsgGetHeaders.SerializeSize`.
+            Message::GetBlocks(MsgGetBlocks(l)) | Message::GetHeaders(MsgGetHeaders(l)) => {
+                4 + hash_list_size(l.block_locator_hashes.len()) + HASH_SIZE
+            }
+            // dcrd `MsgInv`/`MsgGetData`/`MsgNotFound.SerializeSize`.
+            Message::Inv(MsgInv { inv_list })
+            | Message::GetData(MsgGetData { inv_list })
+            | Message::NotFound(MsgNotFound { inv_list }) => {
+                var_int_size(inv_list.len()) + inv_list.len() * INV_VECT_PAYLOAD as usize
+            }
+            Message::Block(m) => m.serialize_size(),
+            Message::Tx(m) => m.serialize_size(),
+            // dcrd `MsgHeaders.SerializeSize`: each header is followed by
+            // a one-byte zero transaction count.
+            Message::Headers(m) => {
+                var_int_size(m.headers.len()) + m.headers.len() * (MAX_BLOCK_HEADER_PAYLOAD + 1)
+            }
+            Message::Ping(_) | Message::Pong(_) | Message::FeeFilter(_) => 8,
+            // dcrd `MsgMiningState.SerializeSize`.
+            Message::MiningState(m) => {
+                4 + 4 + hash_list_size(m.block_hashes.len()) + hash_list_size(m.vote_hashes.len())
+            }
+            // dcrd `MsgReject.SerializeSize`: block and tx rejects carry
+            // the hash of what was rejected.
+            Message::Reject(m) => {
+                let hash = if m.cmd == "block" || m.cmd == "tx" {
+                    HASH_SIZE
+                } else {
+                    0
+                };
+                var_bytes_size(m.cmd.len()) + 1 + var_bytes_size(m.reason.len()) + hash
+            }
+            Message::GetCFilter(_) => HASH_SIZE + 1,
+            // dcrd `MsgGetCFHeaders.SerializeSize`.
+            Message::GetCFHeaders(m) => {
+                hash_list_size(m.block_locator_hashes.len()) + HASH_SIZE + 1
+            }
+            // dcrd `MsgCFilter.SerializeSize`.
+            Message::CFilter(m) => HASH_SIZE + 1 + var_bytes_size(m.data.len()),
+            // dcrd `MsgCFHeaders.SerializeSize`.
+            Message::CFHeaders(m) => HASH_SIZE + 1 + hash_list_size(m.header_hashes.len()),
+            // dcrd `MsgCFTypes.SerializeSize`: one byte per filter type.
+            Message::CFTypes(m) => {
+                var_int_size(m.supported_filters.len()) + m.supported_filters.len()
+            }
+            Message::GetCFilterV2(_) => HASH_SIZE,
+            Message::CFilterV2(m) => cfilter_v2_size(m),
+            // dcrd `MsgGetInitState.SerializeSize`.
+            Message::GetInitState(m) => {
+                var_int_size(m.types.len())
+                    + m.types
+                        .iter()
+                        .map(|t| var_bytes_size(t.len()))
+                        .sum::<usize>()
+            }
+            // dcrd `MsgInitState.SerializeSize`.
+            Message::InitState(m) => {
+                hash_list_size(m.block_hashes.len())
+                    + hash_list_size(m.vote_hashes.len())
+                    + hash_list_size(m.tspend_hashes.len())
+            }
+            Message::GetCFsV2(_) => HASH_SIZE * 2,
+            // dcrd `MsgCFiltersV2.SerializeSize`.
+            Message::CFiltersV2(m) => {
+                var_int_size(m.cfilters.len())
+                    + m.cfilters.iter().map(cfilter_v2_size).sum::<usize>()
+            }
+            // dcrd `MsgMixPairReq.SerializeSize`.
+            Message::MixPairReq(m) => {
+                // Signature 64 + identity 33 + expiry 4 + mix amount 8,
+                // then the script class, then tx version 2 + lock time 4
+                // + message count 4 + input value 8.
+                64 + 33
+                    + 4
+                    + 8
+                    + var_bytes_size(m.script_class.len())
+                    + 2
+                    + 4
+                    + 4
+                    + 8
+                    + var_int_size(m.utxos.len())
+                    + m.utxos
+                        .iter()
+                        .map(|u| {
+                            // Outpoint 37, three var-byte fields, opcode 1.
+                            37 + var_bytes_size(u.script.len())
+                                + var_bytes_size(u.pub_key.len())
+                                + var_bytes_size(u.signature.len())
+                                + 1
+                        })
+                        .sum::<usize>()
+                    // The has-change flag, then the change output.
+                    + 1
+                    + m.change.as_ref().map_or(0, TxOut::serialize_size)
+                    // Flags 1 + pairing flags 1.
+                    + 2
+            }
+            // dcrd `MsgMixKeyExchange.SerializeSize`: epoch 8, run 4, pos
+            // 4, ECDH key 33, PQ key 1218 and commitment 32 on top of the
+            // signature, identity and session id.
+            Message::MixKeyExchange(m) => {
+                64 + 33 + 32 + 8 + 4 + 4 + 33 + 1218 + 32 + hash_list_size(m.seen_prs.len())
+            }
+            // dcrd `MsgMixCiphertexts.SerializeSize`: one count covers the
+            // ciphertexts and the seen key exchanges.
+            Message::MixCiphertexts(m) => {
+                MIX_FIXED
+                    + var_int_size(m.ciphertexts.len())
+                    + m.ciphertexts.len() * 1047
+                    + m.seen_key_exchanges.len() * HASH_SIZE
+            }
+            // dcrd `MsgMixSlotReserve.SerializeSize`.
+            Message::MixSlotReserve(m) => {
+                let kpcount = m.dc_mix.first().map_or(0, Vec::len);
+                MIX_FIXED
+                    + var_int_size(m.dc_mix.len())
+                    + var_int_size(kpcount)
+                    + m.dc_mix
+                        .iter()
+                        .flatten()
+                        .map(|v| var_bytes_size(v.len()))
+                        .sum::<usize>()
+                    + hash_list_size(m.seen_ciphertexts.len())
+            }
+            // dcrd `MsgMixFactoredPoly.SerializeSize`.
+            Message::MixFactoredPoly(m) => {
+                MIX_FIXED
+                    + var_int_size(m.roots.len())
+                    + m.roots
+                        .iter()
+                        .map(|r| var_bytes_size(r.len()))
+                        .sum::<usize>()
+                    + hash_list_size(m.seen_slot_reserves.len())
+            }
+            // dcrd `MsgMixDCNet.SerializeSize`: the vector count, and when
+            // there are vectors, their length and the message size.
+            Message::MixDCNet(m) => {
+                let vects = match m.dc_net.first() {
+                    None => 0,
+                    Some(first) => {
+                        var_int_size(first.len())
+                            + var_int_size(MIX_MSG_SIZE)
+                            + m.dc_net
+                                .iter()
+                                .map(|v| v.len() * MIX_MSG_SIZE)
+                                .sum::<usize>()
+                    }
+                };
+                MIX_FIXED
+                    + var_int_size(m.dc_net.len())
+                    + vects
+                    + hash_list_size(m.seen_slot_reserves.len())
+            }
+            // dcrd `MsgMixConfirm.SerializeSize`.
+            Message::MixConfirm(m) => {
+                MIX_FIXED + m.mix.serialize_size() + hash_list_size(m.seen_dc_nets.len())
+            }
+            // dcrd `MsgMixSecrets.SerializeSize`: the seed 32 after the
+            // fixed prefix, and the message size only when there are
+            // DC-net messages.
+            Message::MixSecrets(m) => {
+                let dc_net = if m.dc_net_msgs.is_empty() {
+                    0
+                } else {
+                    var_int_size(MIX_MSG_SIZE) + m.dc_net_msgs.len() * MIX_MSG_SIZE
+                };
+                MIX_FIXED
+                    + 32
+                    + var_int_size(m.slot_reserve_msgs.len())
+                    + m.slot_reserve_msgs
+                        .iter()
+                        .map(|sr| var_bytes_size(sr.len()))
+                        .sum::<usize>()
+                    + var_int_size(m.dc_net_msgs.len())
+                    + dc_net
+                    + hash_list_size(m.seen_secrets.len())
+            }
+        }
+    }
+
     /// Encode the payload (dcrd `BtcEncode`).
     pub fn encode_payload(&self, pver: u32) -> Result<Vec<u8>, WireError> {
-        let mut w = Vec::new();
+        let mut w = Vec::with_capacity(self.serialize_size());
+        self.encode_payload_into(&mut w, pver)?;
+        Ok(w)
+    }
+
+    /// Append the payload encoding to `w` (dcrd `BtcEncode` into the
+    /// caller's buffer).  On error, `w` may hold a partial encoding.
+    fn encode_payload_into(&self, w: &mut Vec<u8>, pver: u32) -> Result<(), WireError> {
         match self {
-            Message::Version(m) => m.encode(&mut w)?,
+            Message::Version(m) => m.encode(w)?,
             Message::VerAck | Message::GetAddr | Message::MemPool | Message::GetMiningState => {}
             Message::GetCFTypes => {
                 if pver < crate::protocol::NODE_CF_VERSION {
@@ -153,43 +390,71 @@ impl Message {
                     return Err(WireError::MsgInvalidForPVer);
                 }
             }
-            Message::Addr(m) => m.encode(&mut w, pver)?,
-            Message::AddrV2(m) => m.encode(&mut w, pver)?,
-            Message::GetBlocks(m) => m.encode(&mut w)?,
-            Message::Inv(m) => encode_inv_message(&mut w, &m.inv_list)?,
-            Message::GetData(m) => encode_inv_message(&mut w, &m.inv_list)?,
-            Message::NotFound(m) => encode_inv_message(&mut w, &m.inv_list)?,
-            Message::Block(m) => m.encode(&mut w),
-            Message::Tx(m) => m.encode_into(&mut w),
-            Message::GetHeaders(m) => m.encode(&mut w)?,
-            Message::Headers(m) => m.encode(&mut w)?,
+            Message::Addr(m) => m.encode(w, pver)?,
+            Message::AddrV2(m) => m.encode(w, pver)?,
+            Message::GetBlocks(m) => m.encode(w)?,
+            Message::Inv(m) => encode_inv_message(w, &m.inv_list)?,
+            Message::GetData(m) => encode_inv_message(w, &m.inv_list)?,
+            Message::NotFound(m) => encode_inv_message(w, &m.inv_list)?,
+            Message::Block(m) => m.encode(w),
+            Message::Tx(m) => m.encode_into(w),
+            Message::GetHeaders(m) => m.encode(w)?,
+            Message::Headers(m) => m.encode(w)?,
             Message::Ping(m) => w.extend_from_slice(&m.nonce.to_le_bytes()),
             Message::Pong(m) => w.extend_from_slice(&m.nonce.to_le_bytes()),
-            Message::MiningState(m) => m.encode(&mut w)?,
-            Message::Reject(m) => m.encode(&mut w, pver)?,
-            Message::FeeFilter(m) => m.encode(&mut w, pver)?,
-            Message::GetCFilter(m) => m.encode(&mut w, pver)?,
-            Message::GetCFHeaders(m) => m.encode(&mut w, pver)?,
-            Message::CFilter(m) => m.encode(&mut w, pver)?,
-            Message::CFHeaders(m) => m.encode(&mut w, pver)?,
-            Message::CFTypes(m) => m.encode(&mut w, pver)?,
-            Message::GetCFilterV2(m) => m.encode(&mut w, pver)?,
-            Message::CFilterV2(m) => m.encode(&mut w, pver)?,
-            Message::GetInitState(m) => m.encode(&mut w, pver)?,
-            Message::InitState(m) => m.encode(&mut w, pver)?,
-            Message::GetCFsV2(m) => m.encode(&mut w, pver)?,
-            Message::CFiltersV2(m) => m.encode(&mut w, pver)?,
-            Message::MixPairReq(m) => m.encode(&mut w, pver)?,
-            Message::MixKeyExchange(m) => m.encode(&mut w, pver)?,
-            Message::MixCiphertexts(m) => m.encode(&mut w, pver)?,
-            Message::MixSlotReserve(m) => m.encode(&mut w, pver)?,
-            Message::MixFactoredPoly(m) => m.encode(&mut w, pver)?,
-            Message::MixDCNet(m) => m.encode(&mut w, pver)?,
-            Message::MixConfirm(m) => m.encode(&mut w, pver)?,
-            Message::MixSecrets(m) => m.encode(&mut w, pver)?,
+            Message::MiningState(m) => m.encode(w)?,
+            Message::Reject(m) => m.encode(w, pver)?,
+            Message::FeeFilter(m) => m.encode(w, pver)?,
+            Message::GetCFilter(m) => m.encode(w, pver)?,
+            Message::GetCFHeaders(m) => m.encode(w, pver)?,
+            Message::CFilter(m) => m.encode(w, pver)?,
+            Message::CFHeaders(m) => m.encode(w, pver)?,
+            Message::CFTypes(m) => m.encode(w, pver)?,
+            Message::GetCFilterV2(m) => m.encode(w, pver)?,
+            Message::CFilterV2(m) => m.encode(w, pver)?,
+            Message::GetInitState(m) => m.encode(w, pver)?,
+            Message::InitState(m) => m.encode(w, pver)?,
+            Message::GetCFsV2(m) => m.encode(w, pver)?,
+            Message::CFiltersV2(m) => m.encode(w, pver)?,
+            Message::MixPairReq(m) => m.encode(w, pver)?,
+            Message::MixKeyExchange(m) => m.encode(w, pver)?,
+            Message::MixCiphertexts(m) => m.encode(w, pver)?,
+            Message::MixSlotReserve(m) => m.encode(w, pver)?,
+            Message::MixFactoredPoly(m) => m.encode(w, pver)?,
+            Message::MixDCNet(m) => m.encode(w, pver)?,
+            Message::MixConfirm(m) => m.encode(w, pver)?,
+            Message::MixSecrets(m) => m.encode(w, pver)?,
         }
-        Ok(w)
+        Ok(())
     }
+}
+
+/// The size of a count's varint (dcrd `VarIntSerializeSize`).
+fn var_int_size(n: usize) -> usize {
+    var_int_serialize_size(n as u64)
+}
+
+/// The size of a varint-prefixed byte string of `len` bytes.
+fn var_bytes_size(len: usize) -> usize {
+    var_int_size(len) + len
+}
+
+/// The size of a varint-counted list of `n` hashes.
+fn hash_list_size(n: usize) -> usize {
+    var_int_size(n) + n * HASH_SIZE
+}
+
+/// dcrd `NetAddress.SerializeSize`: services 8 + IP 16 + port 2, plus
+/// the 4-byte timestamp where the context carries one.
+fn net_address_size(with_timestamp: bool) -> usize {
+    let full = MAX_NET_ADDRESS_PAYLOAD as usize;
+    if with_timestamp { full } else { full - 4 }
+}
+
+/// dcrd `MsgCFilterV2.SerializeSize`: block hash, filter data, proof
+/// index 4 and the proof hashes.
+fn cfilter_v2_size(m: &MsgCFilterV2) -> usize {
+    HASH_SIZE + var_bytes_size(m.data.len()) + 4 + hash_list_size(m.proof_hashes.len())
 }
 
 /// The per-type maximum payload for a command, or `None` for unknown
@@ -332,6 +597,11 @@ fn decode_payload(
 
 /// Frame and encode a message for the given protocol version and network
 /// (dcrd `WriteMessage`).
+///
+/// Like dcrd's `WriteMessageN`, the frame is one buffer sized by
+/// [`Message::serialize_size`]: a zeroed header, the payload encoded
+/// straight after it, and the header filled in once the payload's
+/// length and checksum are known.
 pub fn write_message(msg: &Message, pver: u32, net: CurrencyNet) -> Result<Vec<u8>, WireError> {
     let command = msg.command();
     // Commands are static strings that always fit, but keep the dcrd check.
@@ -339,30 +609,31 @@ pub fn write_message(msg: &Message, pver: u32, net: CurrencyNet) -> Result<Vec<u
         return Err(WireError::CmdTooLong);
     }
 
-    let payload = msg.encode_payload(pver)?;
-    if payload.len() as u64 > MAX_MESSAGE_PAYLOAD {
+    let mut out = Vec::with_capacity(MESSAGE_HEADER_SIZE + msg.serialize_size());
+    out.resize(MESSAGE_HEADER_SIZE, 0);
+    msg.encode_payload_into(&mut out, pver)?;
+    let payload_len = out.len() - MESSAGE_HEADER_SIZE;
+    if payload_len as u64 > MAX_MESSAGE_PAYLOAD {
         return Err(WireError::PayloadTooLarge {
-            len: payload.len() as u64,
+            len: payload_len as u64,
             max: MAX_MESSAGE_PAYLOAD,
         });
     }
     let mpl = msg.max_payload_length(pver);
-    if payload.len() as u64 > u64::from(mpl) {
+    if payload_len as u64 > u64::from(mpl) {
         return Err(WireError::PayloadTooLarge {
-            len: payload.len() as u64,
+            len: payload_len as u64,
             max: u64::from(mpl),
         });
     }
 
-    let checksum = dcroxide_chainhash::hash_b(&payload);
-    let mut out = Vec::with_capacity(MESSAGE_HEADER_SIZE + payload.len());
-    out.extend_from_slice(&net.0.to_le_bytes());
-    let mut cmd_field = [0u8; COMMAND_SIZE];
-    cmd_field[..command.len()].copy_from_slice(command.as_bytes());
-    out.extend_from_slice(&cmd_field);
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(&checksum[..4]);
-    out.extend_from_slice(&payload);
+    let checksum = dcroxide_chainhash::hash_b(&out[MESSAGE_HEADER_SIZE..]);
+    let (header, _) = out.split_at_mut(MESSAGE_HEADER_SIZE);
+    header[..4].copy_from_slice(&net.0.to_le_bytes());
+    // The command field is already zeroed, which is its NUL padding.
+    header[4..4 + command.len()].copy_from_slice(command.as_bytes());
+    header[4 + COMMAND_SIZE..8 + COMMAND_SIZE].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    header[8 + COMMAND_SIZE..].copy_from_slice(&checksum[..4]);
     Ok(out)
 }
 
@@ -465,11 +736,487 @@ pub fn read_message(
         return Err(WireError::PayloadChecksum);
     }
 
+    // `read_message_header` accepted the command from the payload-limit
+    // table, and the decode table is a separate match.  Were the two
+    // ever to disagree, the frame fails as dcrd's unknown command would
+    // rather than panicking on a peer's bytes.
     let mut pr = Cursor::new(payload);
-    let msg = decode_payload(&command, &mut pr, pver).expect("command known per max payload")?;
+    let msg = decode_payload(&command, &mut pr, pver).ok_or(WireError::UnknownCmd)??;
     if pr.remaining() > 0 {
         return Err(WireError::TrailingBytes);
     }
 
     Ok((msg, r.position()))
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::boxed::Box;
+    use alloc::collections::BTreeSet;
+    use alloc::vec;
+
+    use dcroxide_chainhash::Hash;
+
+    use super::*;
+    use crate::blockheader::BlockHeader;
+    use crate::invvect::{InvType, InvVect};
+    use crate::msgtx::{OutPoint, TxIn, TxSerializeType};
+    use crate::netaddress::{NetAddress, NetAddressType, NetAddressV2};
+    use crate::protocol::{ADDR_V2_VERSION, PROTOCOL_VERSION, REMOVE_REJECT_VERSION};
+
+    /// The number of `Message` variants, one per dcrd command.
+    const VARIANTS: usize = 41;
+
+    /// A dense index per variant.  The match is exhaustive on purpose: a
+    /// new variant does not compile until it is numbered here, and then
+    /// [`samples`] fails the coverage check until it has a sample.
+    fn variant(m: &Message) -> usize {
+        match m {
+            Message::Version(_) => 0,
+            Message::VerAck => 1,
+            Message::GetAddr => 2,
+            Message::Addr(_) => 3,
+            Message::AddrV2(_) => 4,
+            Message::GetBlocks(_) => 5,
+            Message::Inv(_) => 6,
+            Message::GetData(_) => 7,
+            Message::NotFound(_) => 8,
+            Message::Block(_) => 9,
+            Message::Tx(_) => 10,
+            Message::GetHeaders(_) => 11,
+            Message::Headers(_) => 12,
+            Message::Ping(_) => 13,
+            Message::Pong(_) => 14,
+            Message::MemPool => 15,
+            Message::MiningState(_) => 16,
+            Message::GetMiningState => 17,
+            Message::Reject(_) => 18,
+            Message::SendHeaders => 19,
+            Message::FeeFilter(_) => 20,
+            Message::GetCFilter(_) => 21,
+            Message::GetCFHeaders(_) => 22,
+            Message::GetCFTypes => 23,
+            Message::CFilter(_) => 24,
+            Message::CFHeaders(_) => 25,
+            Message::CFTypes(_) => 26,
+            Message::GetCFilterV2(_) => 27,
+            Message::CFilterV2(_) => 28,
+            Message::GetInitState(_) => 29,
+            Message::InitState(_) => 30,
+            Message::GetCFsV2(_) => 31,
+            Message::CFiltersV2(_) => 32,
+            Message::MixPairReq(_) => 33,
+            Message::MixKeyExchange(_) => 34,
+            Message::MixCiphertexts(_) => 35,
+            Message::MixSlotReserve(_) => 36,
+            Message::MixFactoredPoly(_) => 37,
+            Message::MixDCNet(_) => 38,
+            Message::MixConfirm(_) => 39,
+            Message::MixSecrets(_) => 40,
+        }
+    }
+
+    /// The protocol version a sample encodes at: the legacy `addr` and
+    /// `reject` stop encoding at `addrv2` and at reject removal.
+    fn encode_pver(m: &Message) -> u32 {
+        match m {
+            Message::Addr(_) => ADDR_V2_VERSION - 1,
+            Message::Reject(_) => REMOVE_REJECT_VERSION - 1,
+            _ => PROTOCOL_VERSION,
+        }
+    }
+
+    fn hashes(n: usize) -> Vec<Hash> {
+        (0..n).map(|i| Hash([i as u8; 32])).collect()
+    }
+
+    fn header() -> BlockHeader {
+        BlockHeader::decode(&mut Cursor::new(&[7u8; MAX_BLOCK_HEADER_PAYLOAD])).expect("header")
+    }
+
+    fn tx(ins: usize, outs: usize) -> MsgTx {
+        MsgTx {
+            ser_type: TxSerializeType::Full,
+            version: 3,
+            tx_in: (0..ins)
+                .map(|i| TxIn {
+                    previous_out_point: OutPoint {
+                        hash: Hash([i as u8; 32]),
+                        index: i as u32,
+                        tree: 1,
+                    },
+                    sequence: 9,
+                    value_in: 10,
+                    block_height: 11,
+                    block_index: 12,
+                    signature_script: vec![0x51; 3 + i],
+                })
+                .collect(),
+            tx_out: (0..outs)
+                .map(|i| TxOut {
+                    value: 5,
+                    version: 0,
+                    pk_script: vec![0x6a; 25 + i],
+                })
+                .collect(),
+            lock_time: 13,
+            expiry: 14,
+        }
+    }
+
+    fn cfilter_v2(data: usize, proofs: usize) -> MsgCFilterV2 {
+        MsgCFilterV2 {
+            block_hash: Hash([1; 32]),
+            data: vec![0xab; data],
+            proof_index: 3,
+            proof_hashes: hashes(proofs),
+        }
+    }
+
+    fn inv(n: usize) -> Vec<InvVect> {
+        (0..n)
+            .map(|i| InvVect {
+                inv_type: InvType::TX,
+                hash: Hash([i as u8; 32]),
+            })
+            .collect()
+    }
+
+    /// At least one sample of every variant, with the variable-length
+    /// parts at 0, 1 and a few entries, and at 253 where a varint then
+    /// takes three bytes.
+    fn samples() -> Vec<Message> {
+        let mut out = vec![
+            Message::Version(MsgVersion {
+                protocol_version: 12,
+                user_agent: "/dcroxide:0.1.0/".into(),
+                ..MsgVersion::default()
+            }),
+            Message::Version(MsgVersion {
+                user_agent: "a".repeat(253),
+                ..MsgVersion::default()
+            }),
+            Message::VerAck,
+            Message::GetAddr,
+            Message::Addr(MsgAddr {
+                addr_list: vec![NetAddress::default(); 3],
+            }),
+            Message::Addr(MsgAddr {
+                addr_list: vec![NetAddress::default(); 253],
+            }),
+            Message::AddrV2(MsgAddrV2 {
+                addr_list: vec![
+                    NetAddressV2 {
+                        addr_type: NetAddressType::IPV4,
+                        encoded_addr: vec![127, 0, 0, 1],
+                        port: 9108,
+                        ..NetAddressV2::default()
+                    },
+                    NetAddressV2 {
+                        addr_type: NetAddressType::IPV6,
+                        encoded_addr: vec![0xfd; 16],
+                        port: 9108,
+                        ..NetAddressV2::default()
+                    },
+                ],
+            }),
+            Message::GetBlocks(MsgGetBlocks(BlockLocator {
+                protocol_version: 12,
+                block_locator_hashes: hashes(3),
+                hash_stop: Hash([9; 32]),
+            })),
+            Message::GetHeaders(MsgGetHeaders(BlockLocator {
+                protocol_version: 12,
+                block_locator_hashes: hashes(253),
+                hash_stop: Hash::ZERO,
+            })),
+            Message::Inv(MsgInv { inv_list: inv(0) }),
+            Message::Inv(MsgInv { inv_list: inv(253) }),
+            Message::GetData(MsgGetData { inv_list: inv(2) }),
+            Message::NotFound(MsgNotFound { inv_list: inv(1) }),
+            Message::Block(MsgBlock {
+                header: header(),
+                transactions: vec![tx(1, 2), tx(2, 1)],
+                stransactions: vec![tx(0, 0)],
+            }),
+            Message::Tx(tx(2, 3)),
+            Message::Tx(MsgTx {
+                ser_type: TxSerializeType::NoWitness,
+                ..tx(1, 253)
+            }),
+            Message::Tx(MsgTx {
+                ser_type: TxSerializeType::OnlyWitness,
+                tx_out: Vec::new(),
+                ..tx(253, 0)
+            }),
+            Message::Headers(MsgHeaders {
+                headers: vec![header(); 2],
+            }),
+            Message::Headers(MsgHeaders {
+                headers: vec![header(); 253],
+            }),
+            Message::Ping(MsgPing { nonce: 1 }),
+            Message::Pong(MsgPong { nonce: 2 }),
+            Message::MemPool,
+            Message::MiningState(MsgMiningState {
+                version: 1,
+                height: 2,
+                block_hashes: hashes(2),
+                vote_hashes: hashes(5),
+            }),
+            Message::GetMiningState,
+            Message::Reject(MsgReject {
+                cmd: "block".into(),
+                code: 0x10,
+                reason: "bad".into(),
+                hash: Hash([4; 32]),
+            }),
+            Message::Reject(MsgReject {
+                cmd: "tx".into(),
+                code: 0x10,
+                reason: String::new(),
+                hash: Hash([4; 32]),
+            }),
+            Message::Reject(MsgReject {
+                cmd: "ping".into(),
+                code: 0x01,
+                reason: "r".repeat(253),
+                hash: Hash::ZERO,
+            }),
+            Message::SendHeaders,
+            Message::FeeFilter(MsgFeeFilter { min_fee: 10_000 }),
+            Message::GetCFilter(MsgGetCFilter {
+                block_hash: Hash([2; 32]),
+                filter_type: 1,
+            }),
+            Message::GetCFHeaders(MsgGetCFHeaders {
+                block_locator_hashes: hashes(4),
+                hash_stop: Hash([3; 32]),
+                filter_type: 0,
+            }),
+            Message::GetCFTypes,
+            Message::CFilter(MsgCFilter {
+                block_hash: Hash([5; 32]),
+                filter_type: 0,
+                data: vec![0xcd; 253],
+            }),
+            Message::CFHeaders(MsgCFHeaders {
+                stop_hash: Hash([6; 32]),
+                filter_type: 1,
+                header_hashes: hashes(253),
+            }),
+            Message::CFTypes(MsgCFTypes {
+                supported_filters: vec![0, 1],
+            }),
+            Message::CFTypes(MsgCFTypes {
+                supported_filters: vec![0; 253],
+            }),
+            Message::GetCFilterV2(MsgGetCFilterV2 {
+                block_hash: Hash([7; 32]),
+            }),
+            Message::CFilterV2(cfilter_v2(0, 0)),
+            Message::CFilterV2(cfilter_v2(300, 5)),
+            Message::GetInitState(MsgGetInitState {
+                types: vec!["headblocks".into(), "headblockvotes".into(), String::new()],
+            }),
+            Message::InitState(MsgInitState {
+                block_hashes: hashes(1),
+                vote_hashes: hashes(5),
+                tspend_hashes: hashes(0),
+            }),
+            Message::GetCFsV2(MsgGetCFsV2 {
+                start_hash: Hash([8; 32]),
+                end_hash: Hash([9; 32]),
+            }),
+            Message::CFiltersV2(MsgCFiltersV2 {
+                cfilters: vec![cfilter_v2(10, 1), cfilter_v2(253, 0), cfilter_v2(0, 32)],
+            }),
+        ];
+
+        let pair_req = |change: Option<TxOut>, utxos: Vec<MixPairReqUTXO>| MsgMixPairReq {
+            signature: [1; 64],
+            identity: [2; 33],
+            expiry: 100,
+            mix_amount: 1_000,
+            script_class: "P2PKH-secp256k1-v0".into(),
+            tx_version: 1,
+            lock_time: 0,
+            message_count: 2,
+            input_value: 5_000,
+            utxos,
+            change,
+            flags: 1,
+            pairing_flags: 0,
+        };
+        out.push(Message::MixPairReq(pair_req(None, Vec::new())));
+        out.push(Message::MixPairReq(pair_req(
+            Some(TxOut {
+                value: 7,
+                version: 0,
+                pk_script: vec![0x76; 25],
+            }),
+            vec![
+                MixPairReqUTXO {
+                    script: vec![0x51; 253],
+                    pub_key: vec![0x02; 33],
+                    signature: vec![0x30; 64],
+                    opcode: 0xac,
+                    ..MixPairReqUTXO::default()
+                },
+                MixPairReqUTXO::default(),
+            ],
+        )));
+        out.push(Message::MixKeyExchange(Box::new(MsgMixKeyExchange {
+            signature: [1; 64],
+            identity: [2; 33],
+            session_id: [3; 32],
+            epoch: 4,
+            run: 5,
+            pos: 6,
+            ecdh: [7; 33],
+            pqpk: [8; 1218],
+            commitment: [9; 32],
+            seen_prs: hashes(3),
+        })));
+        out.push(Message::MixCiphertexts(MsgMixCiphertexts {
+            signature: [1; 64],
+            identity: [2; 33],
+            session_id: [3; 32],
+            run: 0,
+            ciphertexts: vec![[0xee; 1047]; 2],
+            seen_key_exchanges: hashes(2),
+        }));
+        out.push(Message::MixSlotReserve(MsgMixSlotReserve {
+            signature: [1; 64],
+            identity: [2; 33],
+            session_id: [3; 32],
+            run: 0,
+            dc_mix: vec![vec![vec![0x11; 32], vec![0x22; 20], Vec::new()]; 2],
+            seen_ciphertexts: hashes(3),
+        }));
+        out.push(Message::MixFactoredPoly(MsgMixFactoredPoly {
+            signature: [1; 64],
+            identity: [2; 33],
+            session_id: [3; 32],
+            run: 0,
+            roots: vec![vec![0x33; 32], vec![0x44; 1]],
+            seen_slot_reserves: hashes(2),
+        }));
+        out.push(Message::MixDCNet(MsgMixDCNet {
+            signature: [1; 64],
+            identity: [2; 33],
+            session_id: [3; 32],
+            run: 0,
+            dc_net: vec![vec![[0x55; MIX_MSG_SIZE]; 3]; 2],
+            seen_slot_reserves: hashes(2),
+        }));
+        out.push(Message::MixConfirm(MsgMixConfirm {
+            signature: [1; 64],
+            identity: [2; 33],
+            session_id: [3; 32],
+            run: 0,
+            mix: tx(3, 4),
+            seen_dc_nets: hashes(3),
+        }));
+        for dc_net_msgs in [Vec::new(), vec![[0x66; MIX_MSG_SIZE]; 253]] {
+            out.push(Message::MixSecrets(MsgMixSecrets {
+                signature: [1; 64],
+                identity: [2; 33],
+                session_id: [3; 32],
+                run: 0,
+                seed: [4; 32],
+                slot_reserve_msgs: vec![vec![0x77; 32], Vec::new()],
+                dc_net_msgs,
+                seen_secrets: hashes(2),
+            }));
+        }
+        out
+    }
+
+    #[test]
+    fn samples_cover_every_variant() {
+        let covered: BTreeSet<usize> = samples().iter().map(variant).collect();
+        assert_eq!(covered, (0..VARIANTS).collect::<BTreeSet<_>>());
+    }
+
+    /// `serialize_size` is the exact encoded length for every message,
+    /// and `write_message` frames it in one allocation of exactly that
+    /// size plus the header: a size off in either direction would leave
+    /// the frame's capacity larger than its length.
+    #[test]
+    fn serialize_size_is_the_encoded_length() {
+        for msg in samples() {
+            let pver = encode_pver(&msg);
+            let payload = msg.encode_payload(pver).unwrap_or_else(|e| {
+                panic!("{} encodes at {pver}: {e}", msg.command());
+            });
+            assert_eq!(msg.serialize_size(), payload.len(), "{}", msg.command());
+
+            let frame = write_message(&msg, pver, CurrencyNet::MAIN_NET).expect("frames");
+            assert_eq!(frame.len(), MESSAGE_HEADER_SIZE + payload.len());
+            assert_eq!(frame.capacity(), frame.len(), "{} regrew", msg.command());
+            assert_eq!(frame[MESSAGE_HEADER_SIZE..], payload[..]);
+        }
+    }
+
+    /// The in-place framing writes the header dcrd's `WriteMessageN`
+    /// does: magic, NUL-padded command, payload length, checksum.
+    #[test]
+    fn write_message_header_fields() {
+        let msg = Message::Ping(MsgPing {
+            nonce: 0x0102_0304_0506_0708,
+        });
+        let frame = write_message(&msg, PROTOCOL_VERSION, CurrencyNet::TEST_NET3).expect("frames");
+        let payload = 0x0102_0304_0506_0708u64.to_le_bytes();
+        let mut want = Vec::new();
+        want.extend_from_slice(&CurrencyNet::TEST_NET3.0.to_le_bytes());
+        want.extend_from_slice(b"ping\0\0\0\0\0\0\0\0");
+        want.extend_from_slice(&8u32.to_le_bytes());
+        want.extend_from_slice(&dcroxide_chainhash::hash_b(&payload)[..4]);
+        want.extend_from_slice(&payload);
+        assert_eq!(frame, want);
+        let (back, used) =
+            read_message(&frame, PROTOCOL_VERSION, CurrencyNet::TEST_NET3).expect("reads");
+        assert_eq!((back, used), (msg, frame.len()));
+    }
+
+    /// A refused encode still fails the frame, with the encoder's error.
+    #[test]
+    fn write_message_surfaces_encode_errors() {
+        let addr = Message::Addr(MsgAddr::default());
+        assert_eq!(
+            write_message(&addr, ADDR_V2_VERSION, CurrencyNet::MAIN_NET),
+            Err(WireError::MsgInvalidForPVer)
+        );
+    }
+
+    /// The header check (`max_payload_for_command`) and the decoder
+    /// (`decode_payload`) are separate matches, so nothing but this test
+    /// holds them together: every command the header accepts must have
+    /// a decoder, at every protocol version, and `reject` (QK-0001) and
+    /// unknown commands must be in neither.
+    #[test]
+    fn payload_limit_and_decode_tables_agree() {
+        let empty: &[u8] = &[];
+        let mut commands: BTreeSet<&str> = samples().iter().map(Message::command).collect();
+        assert!(commands.remove("reject"));
+        for pver in 0..=PROTOCOL_VERSION + 1 {
+            for &cmd in &commands {
+                assert!(
+                    max_payload_for_command(cmd, pver).is_some(),
+                    "{cmd} has no payload limit at {pver}"
+                );
+                assert!(
+                    decode_payload(cmd, &mut Cursor::new(empty), pver).is_some(),
+                    "{cmd} has no decoder at {pver}"
+                );
+            }
+            for cmd in ["reject", "", "unknown", "Version"] {
+                assert!(max_payload_for_command(cmd, pver).is_none(), "{cmd}");
+                assert!(decode_payload(cmd, &mut Cursor::new(empty), pver).is_none());
+            }
+        }
+        assert_eq!(commands.len(), VARIANTS - 1);
+        assert!(commands.iter().all(|c| c.len() <= COMMAND_SIZE));
+    }
 }

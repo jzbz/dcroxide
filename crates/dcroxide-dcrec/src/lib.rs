@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: ISC
-//! Decred signature types, mirroring dcrd's `dcrec` packages at the pinned
-//! module `dcrec/secp256k1/v4` v4.4.0.
+//! Decred signature types, mirroring dcrd's `dcrec` packages as the parity
+//! pin, dcrd master b9634e01, links them: `dcrec/secp256k1/v4` is dcrd's
+//! in-tree source, which its `go.mod` substitutes for the published module
+//! (the oracle pins it as v4.4.2-0.20260905015707-b9634e01770b), and
+//! `dcrec/edwards/v2` is the v2.0.4 release dcrd requires.
 //!
 //! Decred scripts use three signature types; this crate implements all
 //! three: **type 0 (ECDSA-secp256k1)**, **type 1 (Ed25519)**, and **type 2

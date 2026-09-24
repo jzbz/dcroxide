@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: ISC
 //! Standalone Decred consensus functions, ported from dcrd's
-//! `blockchain/standalone/v2` package at master `452c1a6c` (the dcrd
-//! 2.2 campaign parity target): merkle root calculations (regular, stake,
+//! `blockchain/standalone/v2` package at the parity pin, master
+//! `b9634e01` (the package's one change since the 2.2 campaign target
+//! `452c1a6c`, `ae4c5818`, is not observable through the port's
+//! subsidy cache; see PARITY.md): merkle root calculations (regular, stake,
 //! and DCP0005 combined), merkle tree
 //! inclusion proofs, proof-of-work checks and compact-bits conversions,
 //! the DCP0011 ASERT difficulty algorithm, the full subsidy schedule
@@ -15,7 +17,8 @@
 //! `num-bigint` for those semantics.
 //!
 //! dcrd's legacy EMA difficulty retarget lives in `internal/blockchain`,
-//! not in this package, and will be ported with the chain engine.
+//! not in this package; its port is `calc_next_blake256_diff` in the
+//! `dcroxide-blockchain` crate.
 
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]

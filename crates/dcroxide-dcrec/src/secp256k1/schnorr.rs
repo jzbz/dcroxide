@@ -19,6 +19,7 @@ use core::fmt;
 
 use k256::elliptic_curve::PrimeField;
 use k256::elliptic_curve::group::Group;
+use k256::elliptic_curve::ops::MulByGeneratorVartime;
 use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::{ProjectivePoint, Scalar};
 
@@ -145,10 +146,15 @@ impl Signature {
         // Step 5-6: e = BLAKE-256(r || m), rejected if >= n.
         let e = challenge(&self.r, hash).ok_or(Error::SchnorrHashValue)?;
 
-        // Step 7: R = s*G + e*Q.
+        // Step 7: R = s*G + e*Q.  Every input is public, so like dcrd
+        // (`ScalarBaseMultNonConst`, `ScalarMultNonConst`, `AddNonConst`)
+        // this runs in variable time: one combined GLV/wNAF pass instead
+        // of two constant-time multiplications and an addition.  Signing
+        // keeps the constant-time `GENERATOR * k`, since its nonce is
+        // secret.
         let s = Scalar::from_repr(self.s.into()).expect("s < n by construction");
         let q = pub_key.as_k256_point();
-        let big_r = ProjectivePoint::GENERATOR * s + q * e;
+        let big_r = ProjectivePoint::mul_by_generator_and_mul_add_vartime(&s, &e, &q);
 
         // Step 8: fail if R is the point at infinity.
         if bool::from(big_r.is_identity()) {
@@ -500,6 +506,113 @@ mod tests {
         assert_eq!(
             sig.verify_detailed(&hash[..31], &pub_key),
             Err(Error::InvalidHashLen)
+        );
+    }
+
+    /// Ported from dcrd's TestVerifyErrors (schnorr/signature_test.go):
+    /// each verification failure path, with the signature otherwise valid
+    /// where that is possible.  The pubkey-not-on-curve row is a parse
+    /// failure here, since `PublicKey` cannot hold an off-curve point.
+    #[test]
+    fn verify_error_vectors() {
+        let g = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let pub_key = PublicKey::parse(&unhex(g)).expect("generator");
+        // (name, r, s, hash, want)
+        let cases = [
+            (
+                "hash too long",
+                "4c68976afe187ff0167919ad181cb30f187e2af1c8233b2cbebbbe0fc97fff61",
+                "e77c69035738000caed6ab0ce1eabe5f7e105498f84d0e8982e87ee4da21948e",
+                "c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b700",
+                Error::InvalidHashLen,
+            ),
+            (
+                "hash too short",
+                "938de23d0785c7d4775f47bbcadaa2a56447dd98029c8196f2bbed0ab4b8457f",
+                "7de65bf205e14f81e5f75ad2fd80ea715a391f7b51e10fa43f0a1961039b1a6c",
+                "0e0f08e2ee912478b77004ec62845b5e01418f03837b76cbdc8b1fb0480322",
+                Error::InvalidHashLen,
+            ),
+            (
+                "r == field prime",
+                "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+                "e9ae2d0e306497236d4e328dc1a34244045745e87da69d806859348bc2a74525",
+                "c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b7",
+                Error::SigRTooBig,
+            ),
+            (
+                "r > field prime (prime + 1)",
+                "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30",
+                "e9ae2d0e306497236d4e328dc1a34244045745e87da69d806859348bc2a74525",
+                "c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b7",
+                Error::SigRTooBig,
+            ),
+            (
+                "s == group order",
+                "4c68976afe187ff0167919ad181cb30f187e2af1c8233b2cbebbbe0fc97fff61",
+                "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+                "c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b7",
+                Error::SigSTooBig,
+            ),
+            (
+                "s > group order and still 32 bytes (order + 1)",
+                "4c68976afe187ff0167919ad181cb30f187e2af1c8233b2cbebbbe0fc97fff61",
+                "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364142",
+                "c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b7",
+                Error::SigSTooBig,
+            ),
+            (
+                "calculated R point at infinity",
+                "4c68976afe187ff0167919ad181cb30f187e2af1c8233b2cbebbbe0fc97fff61",
+                "14cc9e0544dd8fe6baa7c20fd2a141d0ee60114c419377efc850a49bd5c1ed36",
+                "c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b7",
+                Error::SigRNotOnCurve,
+            ),
+            (
+                "odd R",
+                "2c2c71f7bf3e183238b1f20d856e068dc6d37805c8b2d872d0f23d906bc95789",
+                "eb7670ca6ff95c1d5c6785bc72e0781f27c9778758317d82d3053fdbcc9c17b0",
+                "ccf8c53a7631aad469d412963d495c729ff219dd2ae9a0c4de4bd1b4c777d49c",
+                Error::SigRYIsOdd,
+            ),
+            (
+                "mismatched R",
+                "4c68976afe187ff0167919ad181cb30f187e2af1c8233b2cbebbbe0fc97fff61",
+                "e9ae2d0e306497236d4e328dc1a34244045745e87da69d806859348bc2a74525",
+                "d4f9aea8c329f57a81397f0418269a8bd495957ea56ae0af0dfa886fb5977046",
+                Error::UnequalRValues,
+            ),
+        ];
+        for (name, r, s, hash, want) in cases {
+            let mut blob = unhex(r);
+            blob.extend(unhex(s));
+            let got =
+                parse_signature(&blob).and_then(|sig| sig.verify_detailed(&unhex(hash), &pub_key));
+            assert_eq!(got, Err(want), "{name}");
+        }
+
+        // The secp256r1 generator is not a secp256k1 point.
+        let p256_g = "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
+        assert_eq!(
+            PublicKey::parse(&unhex(p256_g)).map_err(super::super::Error::kind_name),
+            Err("ErrPubKeyNotOnCurve")
+        );
+    }
+
+    /// A zero s parses (as in dcrd) and verification rejects it: with s = 0
+    /// the combined multiplication is e*Q alone, never the signer's R.
+    #[test]
+    fn zero_s_parses_and_fails_verification() {
+        let priv_key = key("0000000000000000000000000000000000000000000000000000000000000001");
+        let hash = arr32("c301ba9de5d6053caad9f5eb46523f007702add2c62fa39de03146a36b8026b7");
+        let sig = sign(&priv_key, &hash).expect("sign");
+        let mut blob = sig.serialize();
+        blob[32..].fill(0);
+        let zero_s = parse_signature(&blob).expect("zero s parses");
+        assert!(
+            zero_s
+                .verify_detailed(&hash, &priv_key.public_key())
+                .is_err()
         );
     }
 

@@ -434,20 +434,21 @@ pub fn is_multi_sig_script_v0(script: &[u8]) -> bool {
 
 /// The data associated with the final opcode, or `None` for parse failures
 /// or when the final opcode carries no data (dcrd `finalOpcodeDataV0`,
-/// whose nil result covers both).
-fn final_opcode_data_v0(script: &[u8]) -> Option<Vec<u8>> {
+/// whose nil result covers both).  Like dcrd's, the data is a subslice of
+/// the script, not a copy.
+fn final_opcode_data_v0(script: &[u8]) -> Option<&[u8]> {
     if script.is_empty() {
         return None;
     }
 
-    let mut data: Option<Vec<u8>> = None;
+    let mut data: Option<&[u8]> = None;
     const SCRIPT_VERSION: u16 = 0;
     let mut tokenizer = ScriptTokenizer::new(SCRIPT_VERSION, script);
     while tokenizer.next() {
         // Mirror Go's nil-vs-data distinction: only data-carrying opcodes
         // (OP_DATA_1..OP_PUSHDATA4) produce a non-nil buffer.
         data = if (0x01..=0x4e).contains(&tokenizer.opcode()) {
-            Some(tokenizer.data().to_vec())
+            Some(tokenizer.data())
         } else {
             None
         };
@@ -472,13 +473,14 @@ pub fn is_multi_sig_sig_script_v0(script: &[u8]) -> bool {
         return false;
     };
 
-    is_multi_sig_script_v0(&possible_redeem_script)
+    is_multi_sig_script_v0(possible_redeem_script)
 }
 
 /// Extract a multisig redeem script from a version 0 P2SH-redeeming input
 /// (dcrd `MultiSigRedeemScriptFromScriptSigV0`); results are undefined for
-/// other script types.
-pub fn multi_sig_redeem_script_from_script_sig_v0(script: &[u8]) -> Option<Vec<u8>> {
+/// other script types.  The redeem script is a subslice of `script`, as
+/// dcrd's is.
+pub fn multi_sig_redeem_script_from_script_sig_v0(script: &[u8]) -> Option<&[u8]> {
     // The redeem script is always the last item on the sig script's stack.
     final_opcode_data_v0(script)
 }

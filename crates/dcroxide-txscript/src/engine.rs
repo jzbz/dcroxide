@@ -9,6 +9,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use dcroxide_wire::MsgTx;
@@ -69,6 +70,32 @@ impl core::ops::BitOr for ScriptFlags {
 /// current execution state (dcrd `noCondDisableDepth`).
 pub(crate) const NO_COND_DISABLE_DEPTH: i32 = -1;
 
+/// One of the scripts an engine executes.  dcrd's engine holds Go slices
+/// that alias the caller's signature and public key scripts; the port
+/// borrows them for the engine's lifetime the same way rather than
+/// copying both for every input.  Only the P2SH redeem script, popped off
+/// the saved first stack, is owned, and it sits behind an `Arc` so `step`
+/// can hold the executing script while an opcode borrows the engine
+/// mutably.
+#[derive(Clone)]
+pub(crate) enum ExecScript<'a> {
+    /// The signature or public key script, borrowed from the caller.
+    Borrowed(&'a [u8]),
+    /// The P2SH redeem script.
+    Redeem(Arc<[u8]>),
+}
+
+impl core::ops::Deref for ExecScript<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            ExecScript::Borrowed(script) => script,
+            ExecScript::Redeem(script) => script,
+        }
+    }
+}
+
 /// The virtual machine that executes scripts (dcrd `Engine`).
 pub struct Engine<'a> {
     // Set at creation and unchanged afterwards.
@@ -87,7 +114,7 @@ pub struct Engine<'a> {
     pub(crate) sig_cache: Option<&'a crate::SigCache>,
 
     // Current execution state.
-    pub(crate) scripts: Vec<Vec<u8>>,
+    pub(crate) scripts: Vec<ExecScript<'a>>,
     pub(crate) script_idx: usize,
     pub(crate) opcode_idx: usize,
     pub(crate) last_code_sep: usize,
@@ -234,6 +261,16 @@ impl<'a> Engine<'a> {
     pub fn disasm_pc(&self) -> Result<String, ScriptError> {
         self.check_valid_pc()?;
 
+        // dcrd peeks with a copy of the engine's tokenizer, which carries
+        // the unsupported-version error of a non-zero script version (see
+        // `step`).
+        if self.version != 0 {
+            return Err(script_error(
+                ErrorKind::UnsupportedScriptVersion,
+                format!("script version {} is not supported", self.version),
+            ));
+        }
+
         let script = &self.scripts[self.script_idx];
         match parse_opcode(script, self.tokenizer_offset) {
             Ok(Some(parsed)) => {
@@ -346,21 +383,21 @@ impl<'a> Engine<'a> {
             ));
         }
 
-        // Attempt to parse the next opcode from the current script.
-        let script = &self.scripts[self.script_idx];
-        let (op_value, data, next_offset) = match parse_opcode(script, self.tokenizer_offset) {
-            Ok(Some(parsed)) => (
-                parsed.op,
-                script[parsed.data.clone()].to_vec(),
-                parsed.next_offset,
-            ),
+        // Attempt to parse the next opcode from the current script.  The
+        // handle is cheap to clone (a borrowed slice, or an `Arc` for the
+        // redeem script), and the opcode's data borrows from the clone, as
+        // dcrd's is a subslice of the script, instead of being copied out
+        // to free the borrow on `self`.
+        let script = self.scripts[self.script_idx].clone();
+        let (op_value, data, next_offset) = match parse_opcode(&script, self.tokenizer_offset) {
+            Ok(Some(parsed)) => (parsed.op, &script[parsed.data.clone()], parsed.next_offset),
             Ok(None) => {
                 return Err(script_error(
                     ErrorKind::InvalidProgramCounter,
                     format!(
                         "attempt to step beyond script index {} (bytes {})",
                         self.script_idx,
-                        hex(script)
+                        hex(&script)
                     ),
                 ));
             }
@@ -375,7 +412,7 @@ impl<'a> Engine<'a> {
 
         // Execute the opcode.
         let op = &OPCODE_ARRAY[op_value as usize];
-        self.execute_opcode(op, &data)?;
+        self.execute_opcode(op, data)?;
 
         // The combined data and alt stacks must not exceed the maximum.
         let combined_stack_size = self.dstack.depth() + self.astack.depth();
@@ -419,15 +456,23 @@ impl<'a> Engine<'a> {
                 self.check_error_condition(false)?;
 
                 // Obtain the redeem script from the first stack and ensure
-                // it parses.
-                let script = self.saved_first_stack[self.saved_first_stack.len() - 1].clone();
-                check_script_parses(self.version, &script)?;
-                self.scripts.push(script);
+                // it parses.  Nothing reads the saved stack after this, so
+                // it is taken apart rather than copied, as dcrd reslices
+                // it: the top is the redeem script and the rest becomes
+                // the stack.  It is never empty here -- the public key
+                // script hashes a pushed item -- and dcrd would index out
+                // of range if it were.
+                let mut saved_first_stack = core::mem::take(&mut self.saved_first_stack);
+                let redeem_script = saved_first_stack
+                    .pop()
+                    .expect("the P2SH saved stack holds the redeem script");
+                check_script_parses(self.version, &redeem_script)?;
+                self.scripts
+                    .push(ExecScript::Redeem(Arc::from(redeem_script)));
 
                 // Set the stack to the first script's stack minus the
                 // redeem script itself.
-                let stack = self.saved_first_stack[..self.saved_first_stack.len() - 1].to_vec();
-                self.set_stack(stack);
+                self.set_stack(saved_first_stack);
             } else {
                 self.script_idx += 1;
             }
@@ -495,7 +540,7 @@ impl<'a> Engine<'a> {
     /// P2SH detection, stake-opcode redeem script checks, script size, and
     /// version-0 parse checks.
     pub fn new(
-        script_pub_key: &[u8],
+        script_pub_key: &'a [u8],
         tx: &'a MsgTx,
         tx_idx: usize,
         flags: ScriptFlags,
@@ -512,7 +557,7 @@ impl<'a> Engine<'a> {
                 ),
             ));
         }
-        let script_sig: &[u8] = &tx.tx_in[tx_idx].signature_script;
+        let script_sig: &'a [u8] = &tx.tx_in[tx_idx].signature_script;
 
         // When both the signature script and public key script are empty
         // the result is necessarily an error since the stack would end up
@@ -579,7 +624,10 @@ impl<'a> Engine<'a> {
 
         // The engine stores the scripts in a vector so multiple scripts can
         // execute in sequence (a third for the P2SH redeem script).
-        let scripts = alloc::vec![script_sig.to_vec(), script_pub_key.to_vec()];
+        let scripts = alloc::vec![
+            ExecScript::Borrowed(script_sig),
+            ExecScript::Borrowed(script_pub_key),
+        ];
         for scr in &scripts {
             if scr.len() > MAX_SCRIPT_SIZE {
                 return Err(script_error(

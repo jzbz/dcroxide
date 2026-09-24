@@ -116,11 +116,24 @@ impl AsRef<[u8]> for Hash {
 impl fmt::Display for Hash {
     /// The hexadecimal string of the byte-reversed hash, like dcrd's
     /// `Hash.String`.
+    ///
+    /// The digits are encoded from a table into one stack buffer and
+    /// written once, rather than formatting 32 bytes through `write!`
+    /// one at a time: RPC and websocket replies render every hash they
+    /// list through here.  The buffer goes out through `pad`, so width
+    /// and precision apply to the whole string the way Go's `%s` and
+    /// `%v` apply them to a `Stringer`'s result.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for b in self.0.iter().rev() {
-            write!(f, "{b:02x}")?;
+        const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut buf = [0u8; MAX_HASH_STRING_SIZE];
+        let (pairs, _) = buf.as_chunks_mut::<2>();
+        for (out, b) in pairs.iter_mut().zip(self.0.iter().rev()) {
+            *out = [
+                HEX_DIGITS[usize::from(b >> 4)],
+                HEX_DIGITS[usize::from(b & 0x0f)],
+            ];
         }
-        Ok(())
+        f.pad(core::str::from_utf8(&buf).expect("hex digits are ASCII"))
     }
 }
 
@@ -286,6 +299,39 @@ mod tests {
         for (i, (input, want)) in cases.iter().enumerate() {
             assert_eq!(&input.parse::<Hash>(), want, "case {i}: {input:?}");
         }
+    }
+
+    /// The table encoder renders exactly what formatting each byte with
+    /// `{:02x}` in reverse order renders, over hashes that cover every
+    /// byte value in both nibble positions.
+    #[test]
+    fn display_matches_per_byte_hex() {
+        let mut hashes = vec![Hash::ZERO, Hash([0xff; HASH_SIZE])];
+        for seed in 0u8..=7 {
+            let mut h = [0u8; HASH_SIZE];
+            for (i, b) in h.iter_mut().enumerate() {
+                *b = seed.wrapping_mul(32).wrapping_add(i as u8);
+            }
+            hashes.push(Hash(h));
+        }
+        hashes.push(hash_h(b"display"));
+        for h in hashes {
+            let want: String = h.0.iter().rev().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(h.to_string(), want);
+        }
+    }
+
+    /// Width and precision apply to the rendered string, as Go's `%s`
+    /// and `%v` apply them to `Hash.String`; the per-byte `write!` loop
+    /// ignored both.
+    #[test]
+    fn display_honors_width_and_precision() {
+        let h = hash_h(b"padding");
+        let hex = h.to_string();
+        assert_eq!(format!("{h:>70}"), format!("      {hex}"));
+        assert_eq!(format!("{h:<66}|"), format!("{hex}  |"));
+        assert_eq!(format!("{h:.8}"), hex[..8]);
+        assert_eq!(format!("{h:10}"), hex);
     }
 
     #[test]

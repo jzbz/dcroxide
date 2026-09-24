@@ -8,6 +8,7 @@ use dcroxide_chainhash::Hash;
 
 use crate::cursor::Cursor;
 use crate::error::WireError;
+use crate::msgtx::capped_capacity;
 use crate::varint::{read_var_int, write_var_int};
 
 /// The maximum number of inventory vectors per message (dcrd
@@ -82,7 +83,13 @@ pub(crate) fn read_inv_list(r: &mut Cursor<'_>) -> Result<Vec<InvVect>, WireErro
             max: MAX_INV_PER_MSG,
         });
     }
-    let mut list = Vec::new();
+    // dcrd's `make([]*InvVect, 0, count)` (`msginv.go`, `msggetdata.go`,
+    // `msgnotfound.go`), capped by the bytes left.
+    let mut list = Vec::with_capacity(capped_capacity(
+        count,
+        r.remaining(),
+        INV_VECT_PAYLOAD as usize,
+    ));
     for _ in 0..count {
         list.push(InvVect::decode(r)?);
     }

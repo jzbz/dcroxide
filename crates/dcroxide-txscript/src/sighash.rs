@@ -111,19 +111,16 @@ fn sig_hash_witness_serialize_size(num_tx_ins: usize, sign_script: &[u8]) -> usi
     // 2) number of inputs varint
     // 3) per input: the signing script for the input being signed and a
     //    nil script (a single 0x00 varint byte) for the numTxIns-1 others.
-    // The saturation is load-bearing only for `num_tx_ins == 0`, which
-    // no transaction has: with `wrapping_sub` the count would go to
-    // `usize::MAX` and the sum would wrap back onto dcrd's answer
-    // anyway, but only because release builds have overflow checks off.
-    // Under `cargo test` -- where they are on -- `wrapping_sub` is fine
-    // and a plain `- 1` panics, so a "simplification" here is caught
-    // only if a zero-input case is exercised.  dcrd computes the same
-    // count in `int` arithmetic that cannot trap
-    // (`sighash.go:sigHashWitnessSerializeSize`).
-    4 + var_int_serialize_size(num_tx_ins as u64)
-        + num_tx_ins.saturating_sub(1)
+    // dcrd adds `numTxIns - 1` in `int` arithmetic, which is -1 for a
+    // transaction with no inputs, and the size is load-bearing there:
+    // `calc_signature_hash` hashes the whole zero-padded buffer, as dcrd
+    // does.  Subtracting the one last gives dcrd's exact sum without
+    // underflowing, since the other terms total at least five.
+    (4 + var_int_serialize_size(num_tx_ins as u64)
+        + num_tx_ins
         + var_int_serialize_size(sign_script.len() as u64)
-        + sign_script.len()
+        + sign_script.len())
+        - 1
 }
 
 /// Compute the signature hash for the specified input (dcrd
@@ -222,6 +219,13 @@ pub(crate) fn calc_signature_hash(
     // 1) txversion|(SigHashSerializeWitness<<16) (LE u32)
     // 2) number of inputs (varint), then per input the signing script for
     //    the input being signed and a nil script for all others.
+    //
+    // dcrd allocates the buffer at its computed size and hashes all of
+    // it.  The size assumes the signing script is written, so when no
+    // input sits at the signed index -- a transaction with no inputs, or
+    // an index past the last one -- the unwritten tail stays zero and is
+    // hashed too.  Consensus never gets there (the engine requires a
+    // valid input index), but the public wrappers do.
     let witness_size = sig_hash_witness_serialize_size(tx_ins.len(), sign_script);
     let mut witness_buf = Vec::with_capacity(witness_size);
     let version = u32::from(tx.version) | (SIG_HASH_SERIALIZE_WITNESS << 16);
@@ -237,6 +241,8 @@ pub(crate) fn calc_signature_hash(
         put_var_int(&mut witness_buf, commit_script.len() as u64);
         witness_buf.extend_from_slice(commit_script);
     }
+    debug_assert!(witness_buf.len() <= witness_size);
+    witness_buf.resize(witness_size, 0);
     let witness_hash = hash_h(&witness_buf);
 
     // The final signature hash is blake256 over the hash type (LE u32),
@@ -251,8 +257,11 @@ pub(crate) fn calc_signature_hash(
 /// Compute the signature hash for the specified input of the target
 /// transaction (dcrd `CalcSignatureHash`).
 ///
-/// Like dcrd, `idx` must be a valid input index for the transaction (dcrd
-/// panics otherwise; this port panics on the same out-of-range slicing).
+/// Like dcrd, `idx` must be a valid input index for the transaction under
+/// `SigHashAnyOneCanPay` (dcrd panics otherwise; this port panics on the
+/// same out-of-range slicing).  Without that flag an index past the last
+/// input commits the script nowhere, and the hash covers the zero-padded
+/// witness buffer exactly as dcrd's does.
 ///
 /// NOTE: This function is only valid for version 0 scripts.
 pub fn calc_signature_hash_checked(

@@ -77,51 +77,90 @@ pub const PUB_KEY_FORMAT_HYBRID_EVEN: u8 = 0x06;
 /// Prefix byte for an odd-Y hybrid public key (parsed, never produced).
 pub const PUB_KEY_FORMAT_HYBRID_ODD: u8 = 0x07;
 
-/// Public key parsing errors, 1:1 with dcrd `secp256k1.ErrorKind`.
+/// Public key parsing errors, 1:1 with dcrd `secp256k1.ErrorKind`.  Each
+/// variant carries the values dcrd formats into its description, so the
+/// `Display` text is dcrd's `Error()` string exactly (dcrd's callers wrap
+/// it with `%v`, e.g. stdaddr's `failed to parse public key: %v`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// Wrong overall length (`ErrPubKeyInvalidLen`).
-    PubKeyInvalidLen,
-    /// Unsupported format byte for the given length (`ErrPubKeyInvalidFormat`).
-    PubKeyInvalidFormat,
+    /// Wrong overall length (`ErrPubKeyInvalidLen`), with the length.
+    PubKeyInvalidLen(usize),
+    /// Unsupported format byte for the given length
+    /// (`ErrPubKeyInvalidFormat`), with the format byte.
+    PubKeyInvalidFormat(u8),
     /// X coordinate >= field prime (`ErrPubKeyXTooBig`).
     PubKeyXTooBig,
     /// Y coordinate >= field prime (`ErrPubKeyYTooBig`).
     PubKeyYTooBig,
-    /// Point is not on the secp256k1 curve (`ErrPubKeyNotOnCurve`).
-    PubKeyNotOnCurve,
+    /// Point is not on the secp256k1 curve (`ErrPubKeyNotOnCurve`), with
+    /// the x coordinate and, for the uncompressed and hybrid formats,
+    /// the y coordinate: dcrd words the two cases differently.
+    PubKeyNotOnCurve {
+        /// The x coordinate, big-endian (below the field prime).
+        x: [u8; 32],
+        /// The y coordinate for a 65-byte key; `None` for a compressed
+        /// key, whose y could not be computed.
+        y: Option<[u8; 32]>,
+    },
     /// Hybrid key Y oddness does not match its format byte
-    /// (`ErrPubKeyMismatchedOddness`).
-    PubKeyMismatchedOddness,
+    /// (`ErrPubKeyMismatchedOddness`), with the oddness the format byte
+    /// asked for.
+    PubKeyMismatchedOddness(bool),
 }
 
 impl Error {
     /// The dcrd error kind name, used for differential comparison.
     pub fn kind_name(self) -> &'static str {
         match self {
-            Error::PubKeyInvalidLen => "ErrPubKeyInvalidLen",
-            Error::PubKeyInvalidFormat => "ErrPubKeyInvalidFormat",
+            Error::PubKeyInvalidLen(_) => "ErrPubKeyInvalidLen",
+            Error::PubKeyInvalidFormat(_) => "ErrPubKeyInvalidFormat",
             Error::PubKeyXTooBig => "ErrPubKeyXTooBig",
             Error::PubKeyYTooBig => "ErrPubKeyYTooBig",
-            Error::PubKeyNotOnCurve => "ErrPubKeyNotOnCurve",
-            Error::PubKeyMismatchedOddness => "ErrPubKeyMismatchedOddness",
+            Error::PubKeyNotOnCurve { .. } => "ErrPubKeyNotOnCurve",
+            Error::PubKeyMismatchedOddness(_) => "ErrPubKeyMismatchedOddness",
         }
     }
 }
 
+/// Lower-case hex of a field element, as dcrd's `FieldVal.String` renders
+/// a normalized value (every coordinate here is below the field prime).
+fn write_field_hex(f: &mut fmt::Formatter<'_>, v: &[u8; 32]) -> fmt::Result {
+    for b in v {
+        write!(f, "{b:02x}")?;
+    }
+    Ok(())
+}
+
 impl fmt::Display for Error {
+    /// dcrd's descriptions (dcrec/secp256k1 `pubkey.go` `parse`).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            Error::PubKeyInvalidLen => "malformed public key: invalid length",
-            Error::PubKeyInvalidFormat => "invalid public key: unsupported format",
-            Error::PubKeyXTooBig => "invalid public key: x >= field prime",
-            Error::PubKeyYTooBig => "invalid public key: y >= field prime",
-            Error::PubKeyNotOnCurve => "invalid public key: not on secp256k1 curve",
-            Error::PubKeyMismatchedOddness => {
-                "invalid public key: y oddness does not match specified value"
+        match self {
+            Error::PubKeyInvalidLen(len) => {
+                write!(f, "malformed public key: invalid length: {len}")
             }
-        };
-        f.write_str(s)
+            // Go's `%x` of a byte: lower-case, unpadded.
+            Error::PubKeyInvalidFormat(format) => {
+                write!(f, "invalid public key: unsupported format: {format:x}")
+            }
+            Error::PubKeyXTooBig => f.write_str("invalid public key: x >= field prime"),
+            Error::PubKeyYTooBig => f.write_str("invalid public key: y >= field prime"),
+            Error::PubKeyNotOnCurve { x, y: Some(y) } => {
+                f.write_str("invalid public key: [")?;
+                write_field_hex(f, x)?;
+                f.write_str(",")?;
+                write_field_hex(f, y)?;
+                f.write_str("] not on secp256k1 curve")
+            }
+            Error::PubKeyNotOnCurve { x, y: None } => {
+                f.write_str("invalid public key: x coordinate ")?;
+                write_field_hex(f, x)?;
+                f.write_str(" is not on the secp256k1 curve")
+            }
+            Error::PubKeyMismatchedOddness(want_odd_y) => write!(
+                f,
+                "invalid public key: y oddness does not match specified value of {want_odd_y}"
+            ),
+        }
     }
 }
 
@@ -147,7 +186,7 @@ impl PublicKey {
                     PUB_KEY_FORMAT_UNCOMPRESSED
                     | PUB_KEY_FORMAT_HYBRID_EVEN
                     | PUB_KEY_FORMAT_HYBRID_ODD => {}
-                    _ => return Err(Error::PubKeyInvalidFormat),
+                    _ => return Err(Error::PubKeyInvalidFormat(format)),
                 }
 
                 // Coordinates must be in range (dcrd rejects values that
@@ -166,14 +205,14 @@ impl PublicKey {
                 if format == PUB_KEY_FORMAT_HYBRID_EVEN || format == PUB_KEY_FORMAT_HYBRID_ODD {
                     let want_odd_y = format == PUB_KEY_FORMAT_HYBRID_ODD;
                     if (y[31] & 1 == 1) != want_odd_y {
-                        return Err(Error::PubKeyMismatchedOddness);
+                        return Err(Error::PubKeyMismatchedOddness(want_odd_y));
                     }
                 }
 
                 // Remaining failure mode is an off-curve point; libsecp256k1
                 // validates that (it accepts all three formats).
                 let inner = libsecp256k1::PublicKey::from_slice(serialized)
-                    .map_err(|_| Error::PubKeyNotOnCurve)?;
+                    .map_err(|_| Error::PubKeyNotOnCurve { x: *x, y: Some(*y) })?;
                 Ok(PublicKey { inner })
             }
             PUB_KEY_BYTES_LEN_COMPRESSED => {
@@ -181,7 +220,7 @@ impl PublicKey {
                 if format != PUB_KEY_FORMAT_COMPRESSED_EVEN
                     && format != PUB_KEY_FORMAT_COMPRESSED_ODD
                 {
-                    return Err(Error::PubKeyInvalidFormat);
+                    return Err(Error::PubKeyInvalidFormat(format));
                 }
                 let x: &[u8; 32] = serialized[1..33].try_into().expect("32 bytes");
                 if *x >= FIELD_PRIME_BYTES {
@@ -191,10 +230,10 @@ impl PublicKey {
                 // Decompression fails iff there is no curve point with this
                 // X coordinate.
                 let inner = libsecp256k1::PublicKey::from_slice(serialized)
-                    .map_err(|_| Error::PubKeyNotOnCurve)?;
+                    .map_err(|_| Error::PubKeyNotOnCurve { x: *x, y: None })?;
                 Ok(PublicKey { inner })
             }
-            _ => Err(Error::PubKeyInvalidLen),
+            _ => Err(Error::PubKeyInvalidLen(serialized.len())),
         }
     }
 
@@ -219,10 +258,12 @@ impl PublicKey {
     }
 
     /// The key as a k256 projective point (for the Schnorr-DCRv0 math,
-    /// which needs raw group operations per ADR-0006).
+    /// which needs raw group operations per ADR-0006).  Handed over
+    /// uncompressed, so k256 checks the point is on the curve rather than
+    /// recomputing y with a square root the key already paid for.
     pub(crate) fn as_k256_point(&self) -> k256::ProjectivePoint {
-        let compressed = self.inner.serialize();
-        k256::PublicKey::from_sec1_bytes(&compressed)
+        let uncompressed = self.inner.serialize_uncompressed();
+        k256::PublicKey::from_sec1_bytes(&uncompressed)
             .expect("PublicKey is always a valid curve point")
             .to_projective()
     }
@@ -269,7 +310,7 @@ mod tests {
         struct Case {
             name: &'static str,
             key: &'static str,
-            want: Result<(), Error>,
+            want: Result<(), &'static str>,
         }
         let cases = [
             Case {
@@ -280,17 +321,17 @@ mod tests {
             Case {
                 name: "uncompressed x changed (not on curve)",
                 key: "0415db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3",
-                want: Err(Error::PubKeyNotOnCurve),
+                want: Err("ErrPubKeyNotOnCurve"),
             },
             Case {
                 name: "uncompressed y changed (not on curve)",
                 key: "0411db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a4",
-                want: Err(Error::PubKeyNotOnCurve),
+                want: Err("ErrPubKeyNotOnCurve"),
             },
             Case {
                 name: "uncompressed claims compressed",
                 key: "0311db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3",
-                want: Err(Error::PubKeyInvalidFormat),
+                want: Err("ErrPubKeyInvalidFormat"),
             },
             Case {
                 name: "uncompressed as hybrid ok (ybit = 0)",
@@ -305,7 +346,7 @@ mod tests {
             Case {
                 name: "uncompressed as hybrid wrong oddness",
                 key: "0611db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3",
-                want: Err(Error::PubKeyMismatchedOddness),
+                want: Err("ErrPubKeyMismatchedOddness"),
             },
             Case {
                 name: "compressed ok (ybit = 0)",
@@ -320,108 +361,156 @@ mod tests {
             Case {
                 name: "compressed claims uncompressed (ybit = 0)",
                 key: "04ce0b14fb842b1ba549fdd675c98075f12e9c510f8ef52bd021a9a1f4809d3b4d",
-                want: Err(Error::PubKeyInvalidFormat),
+                want: Err("ErrPubKeyInvalidFormat"),
             },
             Case {
                 name: "compressed claims uncompressed (ybit = 1)",
                 key: "042689c7c2dab13309fb143e0e8fe396342521887e976690b6b47f5b2a4b7d448e",
-                want: Err(Error::PubKeyInvalidFormat),
+                want: Err("ErrPubKeyInvalidFormat"),
             },
             Case {
                 name: "compressed claims hybrid (ybit = 0)",
                 key: "06ce0b14fb842b1ba549fdd675c98075f12e9c510f8ef52bd021a9a1f4809d3b4d",
-                want: Err(Error::PubKeyInvalidFormat),
+                want: Err("ErrPubKeyInvalidFormat"),
             },
             Case {
                 name: "compressed claims hybrid (ybit = 1)",
                 key: "072689c7c2dab13309fb143e0e8fe396342521887e976690b6b47f5b2a4b7d448e",
-                want: Err(Error::PubKeyInvalidFormat),
+                want: Err("ErrPubKeyInvalidFormat"),
             },
             Case {
                 name: "compressed with invalid x coord (ybit = 0)",
                 key: "03ce0b14fb842b1ba549fdd675c98075f12e9c510f8ef52bd021a9a1f4809d3b4c",
-                want: Err(Error::PubKeyNotOnCurve),
+                want: Err("ErrPubKeyNotOnCurve"),
             },
             Case {
                 name: "compressed with invalid x coord (ybit = 1)",
                 key: "032689c7c2dab13309fb143e0e8fe396342521887e976690b6b47f5b2a4b7d448d",
-                want: Err(Error::PubKeyNotOnCurve),
+                want: Err("ErrPubKeyNotOnCurve"),
             },
             Case {
                 name: "empty",
                 key: "",
-                want: Err(Error::PubKeyInvalidLen),
+                want: Err("ErrPubKeyInvalidLen"),
             },
             Case {
                 name: "wrong length",
                 key: "05",
-                want: Err(Error::PubKeyInvalidLen),
+                want: Err("ErrPubKeyInvalidLen"),
             },
             Case {
                 name: "uncompressed x == p",
                 key: "04fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2fb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3",
-                want: Err(Error::PubKeyXTooBig),
+                want: Err("ErrPubKeyXTooBig"),
             },
             Case {
                 name: "uncompressed x > p (p + 1 -- aka 1)",
                 key: "04fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30bde70df51939b94c9c24979fa7dd04ebd9b3572da7802290438af2a681895441",
-                want: Err(Error::PubKeyXTooBig),
+                want: Err("ErrPubKeyXTooBig"),
             },
             Case {
                 name: "uncompressed y == p",
                 key: "0411db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
-                want: Err(Error::PubKeyYTooBig),
+                want: Err("ErrPubKeyYTooBig"),
             },
             Case {
                 name: "uncompressed y > p (p + 1 -- aka 1)",
                 key: "041fe1e5ef3fceb5c135ab7741333ce5a6e80d68167653f6b2b24bcbcfaaaff507fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30",
-                want: Err(Error::PubKeyYTooBig),
+                want: Err("ErrPubKeyYTooBig"),
             },
             Case {
                 name: "compressed x == p (ybit = 0)",
                 key: "02fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
-                want: Err(Error::PubKeyXTooBig),
+                want: Err("ErrPubKeyXTooBig"),
             },
             Case {
                 name: "compressed x == p (ybit = 1)",
                 key: "03fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
-                want: Err(Error::PubKeyXTooBig),
+                want: Err("ErrPubKeyXTooBig"),
             },
             Case {
                 name: "compressed x > p (p + 2 -- aka 2) (ybit = 0)",
                 key: "02fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc31",
-                want: Err(Error::PubKeyXTooBig),
+                want: Err("ErrPubKeyXTooBig"),
             },
             Case {
                 name: "compressed x > p (p + 1 -- aka 1) (ybit = 1)",
                 key: "03fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30",
-                want: Err(Error::PubKeyXTooBig),
+                want: Err("ErrPubKeyXTooBig"),
             },
             Case {
                 name: "hybrid x == p (ybit = 1)",
                 key: "07fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2fb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3",
-                want: Err(Error::PubKeyXTooBig),
+                want: Err("ErrPubKeyXTooBig"),
             },
             Case {
                 name: "hybrid x > p (p + 1 -- aka 1) (ybit = 0)",
                 key: "06fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30bde70df51939b94c9c24979fa7dd04ebd9b3572da7802290438af2a681895441",
-                want: Err(Error::PubKeyXTooBig),
+                want: Err("ErrPubKeyXTooBig"),
             },
             Case {
                 name: "hybrid y == p (ybit = 0 when mod p)",
                 key: "0611db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
-                want: Err(Error::PubKeyYTooBig),
+                want: Err("ErrPubKeyYTooBig"),
             },
             Case {
                 name: "hybrid y > p (p + 1 -- aka 1) (ybit = 1 when mod p)",
                 key: "071fe1e5ef3fceb5c135ab7741333ce5a6e80d68167653f6b2b24bcbcfaaaff507fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc30",
-                want: Err(Error::PubKeyYTooBig),
+                want: Err("ErrPubKeyYTooBig"),
             },
         ];
 
         for case in &cases {
             let got = PublicKey::parse(&unhex(case.key)).map(|_| ());
-            assert_eq!(got, case.want, "{}", case.name);
+            assert_eq!(got.map_err(Error::kind_name), case.want, "{}", case.name);
+        }
+    }
+
+    /// The error text is dcrd's `Error()` string, dynamic parts and all
+    /// (dcrec/secp256k1 `pubkey.go`): stdaddr's P2PK constructors wrap it
+    /// with `failed to parse public key: %v`, which RPC address decoding
+    /// hands to clients.
+    #[test]
+    fn parse_error_text_matches_dcrd() {
+        let cases = [
+            ("", "malformed public key: invalid length: 0"),
+            ("05", "malformed public key: invalid length: 1"),
+            (
+                "0311db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3",
+                "invalid public key: unsupported format: 3",
+            ),
+            (
+                "1d2689c7c2dab13309fb143e0e8fe396342521887e976690b6b47f5b2a4b7d448e",
+                "invalid public key: unsupported format: 1d",
+            ),
+            (
+                "02fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+                "invalid public key: x >= field prime",
+            ),
+            (
+                "0411db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f",
+                "invalid public key: y >= field prime",
+            ),
+            (
+                "0611db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3",
+                "invalid public key: y oddness does not match specified value of false",
+            ),
+            (
+                "0415db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3",
+                "invalid public key: [15db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5c,\
+                 b2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3] not on \
+                 secp256k1 curve",
+            ),
+            (
+                "03ce0b14fb842b1ba549fdd675c98075f12e9c510f8ef52bd021a9a1f4809d3b4c",
+                "invalid public key: x coordinate \
+                 ce0b14fb842b1ba549fdd675c98075f12e9c510f8ef52bd021a9a1f4809d3b4c is not on the \
+                 secp256k1 curve",
+            ),
+        ];
+        for (key, want) in cases {
+            let err = PublicKey::parse(&unhex(key)).expect_err(key);
+            assert_eq!(err.to_string(), want, "{key}");
         }
     }
 

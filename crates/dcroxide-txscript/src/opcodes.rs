@@ -8,6 +8,7 @@
 //! pre-bounds-check empty-string returns in OP_SUBSTR/LEFT/RIGHT and the
 //! 4-byte ScriptNum limits on rotation/shift counts).
 
+use alloc::borrow::Cow;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -122,7 +123,13 @@ pub(crate) fn disasm_opcode(buf: &mut String, op: u8, data: &[u8], compact: bool
         _ => {}
     }
 
-    buf.push_str(&format!(" 0x{}", hex(data)));
+    // Go's `%02x` pads a byte slice to a width of two, which shows only
+    // for an empty one: a zero-length OP_PUSHDATA# prints ` 0x00`.
+    if data.is_empty() {
+        buf.push_str(" 0x00");
+    } else {
+        buf.push_str(&format!(" 0x{}", hex(data)));
+    }
 }
 
 // *******************************************
@@ -1481,12 +1488,10 @@ pub(crate) fn opcode_check_sig(
     check_signature_encoding(sig_bytes)?;
     check_pub_key_encoding(&pk_bytes)?;
 
-    // Get script starting from the most recent OP_CODESEPARATOR.
-    let sub_script = vm.sub_script().to_vec();
-
-    // Remove the signature since there is no way for a signature to sign
+    // Get script starting from the most recent OP_CODESEPARATOR and
+    // remove the signature since there is no way for a signature to sign
     // itself.
-    let sub_script = remove_opcode_by_data(&sub_script, &full_sig_bytes);
+    let sub_script = remove_opcode_by_data(vm.sub_script(), &full_sig_bytes);
 
     // Generate the signature hash based on the signature hash type.
     let hash = match calc_signature_hash(&sub_script, hash_type, vm.tx, vm.tx_idx) {
@@ -1497,28 +1502,26 @@ pub(crate) fn opcode_check_sig(
         }
     };
 
-    let pub_key = match dcroxide_dcrec::secp256k1::PublicKey::parse(&pk_bytes) {
-        Ok(key) => key,
-        Err(_) => {
-            vm.dstack.push_bool(false);
-            return Ok(());
-        }
-    };
-
-    let signature = match dcroxide_dcrec::secp256k1::ecdsa::parse_der_signature(sig_bytes) {
-        Ok(sig) => sig,
-        Err(_) => {
-            vm.dstack.push_bool(false);
-            return Ok(());
-        }
-    };
-
+    // Parse the key and signature only on a signature cache miss.  dcrd
+    // parses first because its cache compares parsed values; the port's
+    // compares the raw bytes, and holds an entry only for bytes that
+    // parsed and verified before, so a hit implies both parses succeed.
+    // A parse failure pushes false either way.
     let valid = vm.verify_sig_with_cache(
         crate::SigCacheSuite::EcdsaSecp256k1,
         &hash,
         sig_bytes,
         &pk_bytes,
-        || signature.verify(&hash, &pub_key),
+        || {
+            let Ok(pub_key) = dcroxide_dcrec::secp256k1::PublicKey::parse(&pk_bytes) else {
+                return false;
+            };
+            let Ok(signature) = dcroxide_dcrec::secp256k1::ecdsa::parse_der_signature(sig_bytes)
+            else {
+                return false;
+            };
+            signature.verify(&hash, &pub_key)
+        },
     );
     vm.dstack.push_bool(valid);
     Ok(())
@@ -1604,9 +1607,11 @@ pub(crate) fn opcode_check_multi_sig(
     // Get script starting from the most recent OP_CODESEPARATOR and remove
     // any of the signatures since there is no way for a signature to sign
     // itself.
-    let mut script = vm.sub_script().to_vec();
+    let mut script = Cow::Borrowed(vm.sub_script());
     for sig_info in &signatures {
-        script = remove_opcode_by_data(&script, &sig_info.signature);
+        if let Cow::Owned(stripped) = remove_opcode_by_data(&script, &sig_info.signature) {
+            script = Cow::Owned(stripped);
+        }
     }
 
     let mut success = true;
@@ -1624,11 +1629,12 @@ pub(crate) fn opcode_check_multi_sig(
             break;
         }
 
-        let pub_key = pub_keys[pub_key_idx as usize].clone();
+        let pub_key = &pub_keys[pub_key_idx as usize];
 
         // The order of the signature and public key evaluation is important
         // here since it can be distinguished by an OP_CHECKMULTISIG NOT.
-        let raw_sig = signatures[signature_idx].signature.clone();
+        let sig_info = &mut signatures[signature_idx];
+        let raw_sig = &sig_info.signature;
         if raw_sig.is_empty() {
             // Skip to the next pubkey if signature is empty.
             continue;
@@ -1640,32 +1646,32 @@ pub(crate) fn opcode_check_multi_sig(
 
         // Only parse and check the signature encoding once.
         let parsed_sig;
-        if !signatures[signature_idx].parsed {
+        if !sig_info.parsed {
             check_hash_type_encoding(hash_type)?;
             check_signature_encoding(signature)?;
 
             // Parse the signature.
             let parse_result = dcroxide_dcrec::secp256k1::ecdsa::parse_der_signature(signature);
-            signatures[signature_idx].parsed = true;
+            sig_info.parsed = true;
             match parse_result {
                 Ok(sig) => {
-                    signatures[signature_idx].parsed_signature = Some(sig);
+                    sig_info.parsed_signature = Some(sig);
                     parsed_sig = sig;
                 }
                 Err(_) => continue,
             }
         } else {
             // Skip to the next pubkey if the signature is invalid.
-            match &signatures[signature_idx].parsed_signature {
+            match &sig_info.parsed_signature {
                 Some(sig) => parsed_sig = *sig,
                 None => continue,
             }
         }
 
-        check_pub_key_encoding(&pub_key)?;
+        check_pub_key_encoding(pub_key)?;
 
         // Parse the pubkey.
-        let parsed_pub_key = match dcroxide_dcrec::secp256k1::PublicKey::parse(&pub_key) {
+        let parsed_pub_key = match dcroxide_dcrec::secp256k1::PublicKey::parse(pub_key) {
             Ok(key) => key,
             Err(_) => continue,
         };
@@ -1677,7 +1683,7 @@ pub(crate) fn opcode_check_multi_sig(
             crate::SigCacheSuite::EcdsaSecp256k1,
             &hash,
             signature,
-            &pub_key,
+            pub_key,
             || parsed_sig.verify(&hash, &parsed_pub_key),
         );
         if valid {
@@ -1765,8 +1771,7 @@ pub(crate) fn opcode_check_sig_alt(
 
     // Get the subscript and remove the signature since there is no way for
     // a signature to sign itself.
-    let sub_script = vm.sub_script().to_vec();
-    let sub_script = remove_opcode_by_data(&sub_script, &full_sig_bytes);
+    let sub_script = remove_opcode_by_data(vm.sub_script(), &full_sig_bytes);
 
     // Generate the signature hash based on the signature hash type.
     let hash = match calc_signature_hash(&sub_script, hash_type, vm.tx, vm.tx_idx) {
@@ -1777,53 +1782,46 @@ pub(crate) fn opcode_check_sig_alt(
         }
     };
 
+    // As in OP_CHECKSIG, the key and signature are parsed only on a
+    // signature cache miss: a hit implies both parses succeed, and a parse
+    // failure pushes false either way.
     match sig_type.0 {
         ST_ED25519 => {
-            let pub_key = match dcroxide_dcrec::edwards::parse_pub_key(&pk_bytes) {
-                Ok(key) => key,
-                Err(_) => {
-                    vm.dstack.push_bool(false);
-                    return Ok(());
-                }
-            };
-            let sig = match dcroxide_dcrec::edwards::parse_signature(sig_bytes) {
-                Ok(sig) => sig,
-                Err(_) => {
-                    vm.dstack.push_bool(false);
-                    return Ok(());
-                }
-            };
             let ok = vm.verify_sig_with_cache(
                 crate::SigCacheSuite::Ed25519,
                 &hash,
                 sig_bytes,
                 &pk_bytes,
-                || sig.verify(&hash, &pub_key),
+                || {
+                    let Ok(pub_key) = dcroxide_dcrec::edwards::parse_pub_key(&pk_bytes) else {
+                        return false;
+                    };
+                    let Ok(sig) = dcroxide_dcrec::edwards::parse_signature(sig_bytes) else {
+                        return false;
+                    };
+                    sig.verify(&hash, &pub_key)
+                },
             );
             vm.dstack.push_bool(ok);
             Ok(())
         }
         ST_SCHNORR_SECP256K1 => {
-            let pub_key = match dcroxide_dcrec::secp256k1::schnorr::parse_pub_key(&pk_bytes) {
-                Ok(key) => key,
-                Err(_) => {
-                    vm.dstack.push_bool(false);
-                    return Ok(());
-                }
-            };
-            let sig = match dcroxide_dcrec::secp256k1::schnorr::parse_signature(sig_bytes) {
-                Ok(sig) => sig,
-                Err(_) => {
-                    vm.dstack.push_bool(false);
-                    return Ok(());
-                }
-            };
             let ok = vm.verify_sig_with_cache(
                 crate::SigCacheSuite::SchnorrSecp256k1,
                 &hash,
                 sig_bytes,
                 &pk_bytes,
-                || sig.verify(&hash, &pub_key),
+                || {
+                    let Ok(pub_key) = dcroxide_dcrec::secp256k1::schnorr::parse_pub_key(&pk_bytes)
+                    else {
+                        return false;
+                    };
+                    let Ok(sig) = dcroxide_dcrec::secp256k1::schnorr::parse_signature(sig_bytes)
+                    else {
+                        return false;
+                    };
+                    sig.verify(&hash, &pub_key)
+                },
             );
             vm.dstack.push_bool(ok);
             Ok(())
@@ -1915,6 +1913,141 @@ pub fn opcode_by_name(name: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use sha1::Digest as _;
+
+    use crate::engine::{Engine, ScriptFlags};
+    use crate::error::ErrorKind;
+    use crate::opcode_table::{OP_1, OP_2, OP_CHECKSIG, OP_CHECKSIGALT};
+    use crate::sighash::{SigHashType, calc_signature_hash};
+    use crate::{ScriptBuilder, SigCache, SigCacheSuite};
+    use dcroxide_wire::{MsgTx, OutPoint, TxIn, TxOut, TxSerializeType};
+
+    /// A secp256k1 x coordinate with no point on the curve.
+    const OFF_CURVE_X: [u8; 32] = [
+        0xce, 0x0b, 0x14, 0xfb, 0x84, 0x2b, 0x1b, 0xa5, 0x49, 0xfd, 0xd6, 0x75, 0xc9, 0x80, 0x75,
+        0xf1, 0x2e, 0x9c, 0x51, 0x0f, 0x8e, 0xf5, 0x2b, 0xd0, 0x21, 0xa9, 0xa1, 0xf4, 0x80, 0x9d,
+        0x3b, 0x4c,
+    ];
+
+    fn spend(sig_script: Vec<u8>) -> MsgTx {
+        MsgTx {
+            ser_type: TxSerializeType::Full,
+            version: 1,
+            tx_in: vec![TxIn {
+                previous_out_point: OutPoint {
+                    hash: dcroxide_chainhash::Hash([7u8; 32]),
+                    index: 0,
+                    tree: 0,
+                },
+                sequence: !0u32,
+                value_in: 0,
+                block_height: 0,
+                block_index: !0u32,
+                signature_script: sig_script,
+            }],
+            tx_out: vec![TxOut {
+                value: 0,
+                version: 0,
+                pk_script: Vec::new(),
+            }],
+            lock_time: 0,
+            expiry: 0,
+        }
+    }
+
+    fn run(pk_script: &[u8], tx: &MsgTx, cache: Option<&SigCache>) -> Result<(), ErrorKind> {
+        let mut vm =
+            Engine::new(pk_script, tx, 0, ScriptFlags::default(), 0).map_err(|e| e.kind)?;
+        if let Some(cache) = cache {
+            vm.set_sig_cache(cache);
+        }
+        vm.execute().map_err(|e| e.kind)
+    }
+
+    /// OP_CHECKSIG and OP_CHECKSIGALT consult the signature cache before
+    /// parsing the key and signature, so a hit skips the parse (the point
+    /// decompression) entirely.  An entry only ever exists for bytes that
+    /// parsed and verified, so the verdict is unchanged; seeding one for a
+    /// key that cannot parse is the only way to observe the order, and
+    /// without the entry the same spend fails because the parse pushes
+    /// false.
+    #[test]
+    fn signature_checks_consult_the_cache_before_parsing() {
+        // A strictly encoded compressed key whose x is off the curve.
+        let mut secp_key = vec![0x02];
+        secp_key.extend_from_slice(&OFF_CURVE_X);
+        assert!(dcroxide_dcrec::secp256k1::PublicKey::parse(&secp_key).is_err());
+        // An Ed25519 key that does not decompress.
+        let ed_key = (0u8..=255)
+            .map(|b| [b; 32])
+            .find(|k| dcroxide_dcrec::edwards::parse_pub_key(k).is_err())
+            .expect("some y is off the curve")
+            .to_vec();
+
+        // A strictly encoded DER signature, and a 64-byte one for the alt
+        // suites, each with SigHashAll appended.
+        let mut der_sig = vec![0x30, 0x44, 0x02, 0x20];
+        der_sig.extend_from_slice(&[0x01; 32]);
+        der_sig.extend_from_slice(&[0x02, 0x20]);
+        der_sig.extend_from_slice(&[0x01; 32]);
+        let alt_sig = vec![0x01; 64];
+
+        let cases = [
+            (
+                SigCacheSuite::EcdsaSecp256k1,
+                &secp_key,
+                &der_sig,
+                ScriptBuilder::new().add_data(&secp_key).add_op(OP_CHECKSIG),
+            ),
+            (
+                SigCacheSuite::Ed25519,
+                &ed_key,
+                &alt_sig,
+                ScriptBuilder::new()
+                    .add_data(&ed_key)
+                    .add_op(OP_1)
+                    .add_op(OP_CHECKSIGALT),
+            ),
+            (
+                SigCacheSuite::SchnorrSecp256k1,
+                &secp_key,
+                &alt_sig,
+                ScriptBuilder::new()
+                    .add_data(&secp_key)
+                    .add_op(OP_2)
+                    .add_op(OP_CHECKSIGALT),
+            ),
+        ];
+        for (suite, key, sig, builder) in cases {
+            let pk_script = builder.script().expect("builds");
+            let mut full_sig = sig.clone();
+            full_sig.push(0x01);
+            let sig_script = ScriptBuilder::new()
+                .add_data(&full_sig)
+                .script()
+                .expect("builds");
+            let tx = spend(sig_script);
+
+            let cache = SigCache::new(10);
+            assert_eq!(
+                run(&pk_script, &tx, Some(&cache)),
+                Err(ErrorKind::EvalFalse),
+                "{suite:?}: an unparseable key fails cold"
+            );
+            assert_eq!(
+                run(&pk_script, &tx, None),
+                Err(ErrorKind::EvalFalse),
+                "{suite:?}"
+            );
+
+            let hash = calc_signature_hash(&pk_script, SigHashType(0x01), &tx, 0).expect("hash");
+            cache.add(&hash, suite, sig, key);
+            assert_eq!(
+                run(&pk_script, &tx, Some(&cache)),
+                Ok(()),
+                "{suite:?}: a cache hit answers before the parse"
+            );
+        }
+    }
 
     /// OP_SHA1 and OP_SHA256 hash through `sha1` and `sha2`, and from 0.11
     /// both pick a hardware backend at runtime on aarch64 as well as x86

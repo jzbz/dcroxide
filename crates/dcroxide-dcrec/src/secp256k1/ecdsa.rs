@@ -8,6 +8,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+use super::nonce::nonce_rfc6979;
 use super::{GROUP_ORDER_BYTES, HALF_GROUP_ORDER, PrivateKey, PublicKey, is_zero, negate_mod_n};
 
 /// The ASN.1 identifier for a sequence.
@@ -363,7 +364,17 @@ pub fn recover_compact(signature: &[u8], hash: &[u8; 32]) -> Result<(PublicKey, 
 
 /// Produce a deterministic (RFC6979) low-S signature for the 32-byte hash,
 /// matching dcrd `ecdsa.Sign` byte-for-byte (verified differentially).
+///
+/// libsecp256k1 reduces the hash mod N before it derives the RFC6979
+/// nonce, where dcrd's `NonceRFC6979` takes the hash as it is.  The two
+/// agree for every hash below N, which libsecp256k1 signs; a hash at or
+/// above N (odds of about 2^-128 for a real digest) goes through dcrd's
+/// own `signRFC6979` instead, so the nonce -- and the signature -- are
+/// dcrd's.
 pub fn sign(priv_key: &PrivateKey, hash: &[u8; 32]) -> Signature {
+    if *hash >= GROUP_ORDER_BYTES {
+        return sign_rfc6979_unreduced_hash(priv_key, hash);
+    }
     let msg = libsecp256k1::Message::from_digest(*hash);
     let sig = libsecp256k1::ecdsa::sign(msg, priv_key.inner());
     let compact = sig.serialize_compact();
@@ -372,6 +383,57 @@ pub fn sign(priv_key: &PrivateKey, hash: &[u8; 32]) -> Signature {
     r.copy_from_slice(&compact[..32]);
     s.copy_from_slice(&compact[32..]);
     Signature { r, s }
+}
+
+/// dcrd's `signRFC6979` and `sign` (ecdsa/signature.go) for a hash at or
+/// above the group order: the RFC6979 nonce is derived from the raw hash,
+/// `r = (kG).x mod N` and `s = k^-1(e + d*r) mod N` with `e` the hash mod
+/// N, retrying with the next nonce when either is zero, and `s` negated
+/// when above half the order.
+// The flagged operators are k256 scalar arithmetic, modular by definition.
+#[allow(clippy::arithmetic_side_effects)]
+fn sign_rfc6979_unreduced_hash(priv_key: &PrivateKey, hash: &[u8; 32]) -> Signature {
+    use k256::elliptic_curve::PrimeField;
+    use k256::elliptic_curve::ops::Reduce;
+    use k256::elliptic_curve::point::AffineCoordinates;
+    use k256::elliptic_curve::scalar::IsHigh;
+    use k256::{FieldBytes, ProjectivePoint, Scalar};
+
+    let priv_bytes = priv_key.inner().to_secret_bytes();
+    let d = Scalar::from_repr(priv_bytes.into()).expect("private key is a valid scalar");
+
+    // Step 4: e = H(m) mod N (dcrd `e.SetByteSlice(hash)`).
+    let e = <Scalar as Reduce<FieldBytes>>::reduce(&(*hash).into());
+
+    let mut iteration = 0u32;
+    loop {
+        // Step 1: the deterministic nonce in [1, N-1].
+        let nonce = nonce_rfc6979(&priv_bytes, hash, None, None, iteration);
+        iteration = iteration.wrapping_add(1);
+        let k = Scalar::from_repr(nonce.into()).expect("the nonce is a valid scalar");
+
+        // Steps 2-3: r = kG.x mod N, retrying when zero.
+        let kg = (ProjectivePoint::GENERATOR * k).to_affine();
+        let r = <Scalar as Reduce<FieldBytes>>::reduce(&kg.x());
+        if bool::from(r.is_zero()) {
+            continue;
+        }
+
+        // Step 5: s = k^-1(e + dr) mod N, retrying when zero, then the
+        // low-S negation.
+        let k_inv = Option::<Scalar>::from(k.invert()).expect("the nonce is nonzero");
+        let mut s = (d * r + e) * k_inv;
+        if bool::from(s.is_zero()) {
+            continue;
+        }
+        if bool::from(s.is_high()) {
+            s = -s;
+        }
+        return Signature {
+            r: r.to_repr().into(),
+            s: s.to_repr().into(),
+        };
+    }
 }
 
 #[cfg(test)]

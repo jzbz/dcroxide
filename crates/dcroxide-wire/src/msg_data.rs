@@ -14,7 +14,7 @@ use crate::blockheader::{BlockHeader, MAX_BLOCK_HEADER_PAYLOAD};
 use crate::cursor::Cursor;
 use crate::error::{MessageText, WireError};
 use crate::invvect::{INV_VECT_PAYLOAD, InvVect, MAX_INV_PER_MSG, read_inv_list, write_inv_list};
-use crate::msgtx::{MIN_TX_PAYLOAD, MsgTx};
+use crate::msgtx::{MIN_TX_PAYLOAD, MIN_TX_SIZE, MsgTx, capped_capacity};
 use crate::protocol::{INIT_STATE_VERSION, is_strict_ascii};
 use crate::varint::{read_ascii_var_string, read_var_int, var_int_serialize_size, write_var_int};
 
@@ -213,7 +213,13 @@ impl MsgHeaders {
                 max: MAX_BLOCK_HEADERS_PER_MSG,
             });
         }
-        let mut headers = Vec::new();
+        // dcrd's `make([]*BlockHeader, 0, count)`, capped by the bytes
+        // left: each header takes its 180 bytes and a transaction count.
+        let mut headers = Vec::with_capacity(capped_capacity(
+            count,
+            r.remaining(),
+            MAX_BLOCK_HEADER_PAYLOAD + 1,
+        ));
         for _ in 0..count {
             let header = BlockHeader::decode(r)?;
             let tx_count = read_var_int(r)?;
@@ -272,9 +278,9 @@ impl MsgBlock {
                 what: "transactions to fit into a block",
             });
         }
-        // The count was just bounded above, so this pre-size is capped the
-        // same way dcrd's `make([]*MsgTx, 0, txCount)` is.
-        let mut transactions = Vec::with_capacity(tx_count as usize);
+        // dcrd's `make([]*MsgTx, 0, txCount)`, capped by the bytes left.
+        let mut transactions =
+            Vec::with_capacity(capped_capacity(tx_count, r.remaining(), MIN_TX_SIZE));
         for _ in 0..tx_count {
             transactions.push(MsgTx::decode(r)?);
         }
@@ -288,8 +294,9 @@ impl MsgBlock {
                 what: "stransactions to fit into a block",
             });
         }
-        // Bounded above, mirroring dcrd's `make([]*MsgTx, 0, stakeTxCount)`.
-        let mut stransactions = Vec::with_capacity(stake_tx_count as usize);
+        // dcrd's `make([]*MsgTx, 0, stakeTxCount)`, capped the same way.
+        let mut stransactions =
+            Vec::with_capacity(capped_capacity(stake_tx_count, r.remaining(), MIN_TX_SIZE));
         for _ in 0..stake_tx_count {
             stransactions.push(MsgTx::decode(r)?);
         }
@@ -383,7 +390,9 @@ fn read_hash_list(
     if count > max {
         return Err(err(count, max));
     }
-    let mut list = Vec::new();
+    // dcrd sizes each of these lists from the count (`msgminingstate.go`,
+    // `msginitstate.go`); capped here by the bytes left.
+    let mut list = Vec::with_capacity(capped_capacity(count, r.remaining(), HASH_SIZE));
     for _ in 0..count {
         list.push(Hash(r.take_array()?));
     }

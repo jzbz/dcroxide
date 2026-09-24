@@ -433,7 +433,7 @@ pub fn go_parse_bool(s: &str) -> Result<bool, ()> {
 
 /// Whether the underscores in a Go numeric literal are syntactically
 /// valid (Go `strconv` `underscoreOK`).
-fn underscore_ok(s: &str) -> bool {
+pub fn underscore_ok(s: &str) -> bool {
     let mut saw = '^';
     let mut b = s.as_bytes();
     if !b.is_empty() && (b[0] == b'-' || b[0] == b'+') {
@@ -552,8 +552,26 @@ fn go_parse_uint_mag(s: &str, full: &str) -> Result<u64, ()> {
 /// Parse a float like Go's `strconv.ParseFloat(s, 64)`, including the
 /// special names, underscores, and range errors.
 pub fn go_parse_float(s: &str) -> Result<f64, ()> {
+    go_parse_float_checked(s).map_err(|_| ())
+}
+
+/// The `strconv` error a Go numeric parse fails with, for callers that
+/// print Go's `*NumError` text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoNumError {
+    /// `strconv.ErrSyntax` ("invalid syntax").
+    Syntax,
+    /// `strconv.ErrRange` ("value out of range").
+    Range,
+}
+
+/// [`go_parse_float`] with the error Go's `ParseFloat` returns: a
+/// literal that is well formed but overflows `float64` (decimal or hex)
+/// is `ErrRange`, anything else that fails is `ErrSyntax`.
+pub fn go_parse_float_checked(s: &str) -> Result<f64, GoNumError> {
+    use GoNumError::{Range, Syntax};
     if s.is_empty() {
-        return Err(());
+        return Err(Syntax);
     }
     let lower = s.to_ascii_lowercase();
     // Go's `special` takes at most one sign before the name, so "+-inf"
@@ -572,24 +590,25 @@ pub fn go_parse_float(s: &str) -> Result<f64, ()> {
     }
     if body == "nan" {
         if body.len() != lower.len() {
-            return Err(());
+            return Err(Syntax);
         }
         return Ok(f64::NAN);
     }
     if s.contains('_') && !underscore_ok(s) {
-        return Err(());
+        return Err(Syntax);
     }
     let cleaned: String = s.chars().filter(|c| *c != '_').collect();
-    if cleaned.to_ascii_lowercase().contains("0x") {
-        return go_parse_hex_float(&cleaned);
-    }
-    // Reject shapes Rust accepts but Go does not, and vice versa: Go
-    // requires digits around the exponent and accepts a trailing or
-    // leading dot ("1." and ".5" are valid Go floats, as in Rust).
-    let v: f64 = cleaned.parse().map_err(|_| ())?;
+    let v = if cleaned.to_ascii_lowercase().contains("0x") {
+        go_parse_hex_float(&cleaned).map_err(|()| Syntax)?
+    } else {
+        // Reject shapes Rust accepts but Go does not, and vice versa: Go
+        // requires digits around the exponent and accepts a trailing or
+        // leading dot ("1." and ".5" are valid Go floats, as in Rust).
+        cleaned.parse::<f64>().map_err(|_| Syntax)?
+    };
     if v.is_infinite() {
         // Finite literal overflowed: Go returns ErrRange.
-        return Err(());
+        return Err(Range);
     }
     Ok(v)
 }
@@ -601,7 +620,9 @@ pub fn go_parse_float(s: &str) -> Result<f64, ()> {
 /// that mantissa once to 53 bits -- to nearest, ties to even, through
 /// the subnormal range -- rather than accumulating it in a float
 /// (`internal/strconv/atof.go`).  The underscores are already checked
-/// and removed.
+/// and removed.  An overflow yields the signed infinity `atofHex`
+/// returns beside `ErrRange`, so an `Err` here is always a syntax
+/// failure.
 fn go_parse_hex_float(s: &str) -> Result<f64, ()> {
     let b = s.as_bytes();
     let mut i = 0;
@@ -751,8 +772,10 @@ fn go_parse_hex_float(s: &str) -> Result<f64, ()> {
         exp = BIAS;
     }
     if exp > max_exp {
-        // Infinity: Go returns ErrRange.
-        return Err(());
+        // Infinity and range error: Go returns the signed infinity with
+        // ErrRange, which the caller reports for an infinite result.
+        mantissa = 1 << MANTBITS;
+        exp = max_exp + 1;
     }
 
     let mut bits = mantissa & ((1 << MANTBITS) - 1);

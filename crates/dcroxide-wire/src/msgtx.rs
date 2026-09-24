@@ -84,6 +84,37 @@ pub(crate) const MIN_TX_PAYLOAD: u64 = 4 + 1 + 1 + 1 + 4 + 4;
 /// max-size message (dcrd `maxTxOutPerMessage`).
 pub const MAX_TX_OUT_PER_MESSAGE: u64 = MAX_MESSAGE_PAYLOAD / MIN_TX_OUT_PAYLOAD + 1;
 
+/// The encoded size of a prefix input: outpoint hash 32, index 4 and
+/// tree 1, then sequence 4.
+const PREFIX_TX_IN_SIZE: usize = 41;
+
+/// The fewest bytes an output can encode to: value 8 and script version
+/// 2, then an empty script's one-byte length.
+const MIN_TX_OUT_SIZE: usize = 11;
+
+/// The fewest bytes a witness input can encode to: value 8, block height
+/// 4 and block index 4, then an empty script's one-byte length.
+const MIN_TX_IN_WITNESS_SIZE: usize = 17;
+
+/// The fewest bytes any transaction can encode to: version 4, then the
+/// one-byte zero input count of a witness-only serialization.
+pub(crate) const MIN_TX_SIZE: usize = 5;
+
+/// The capacity to reserve for `count` decoded elements of at least
+/// `min_size` bytes each, when `remaining` bytes are left to decode.
+///
+/// dcrd sizes these slices from the declared count alone, bounded only
+/// by limits derived from payload caps (for a transaction's inputs and
+/// outputs, the 32 MiB global one), so a ten-byte `tx` payload declaring
+/// 3,728,271 outputs reserves ~149 MB before failing on the first one.
+/// The error is the same either way.  Capping by what the bytes could
+/// hold keeps the reservation to the payload's own scale, and with
+/// `min_size` the true minimum it never under-reserves input that
+/// decodes.
+pub(crate) fn capped_capacity(count: u64, remaining: usize, min_size: usize) -> usize {
+    (count as usize).min(remaining / min_size)
+}
+
 /// The serialization type of a transaction, encoded in the upper 16 bits of
 /// the on-wire version field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -291,9 +322,8 @@ impl MsgTx {
             });
         }
 
-        // The count was just bounded above, so this pre-size is capped the
-        // same way dcrd's `make([]TxIn, count)` is.
-        self.tx_in = Vec::with_capacity(count as usize);
+        // dcrd's `make([]TxIn, count)`, capped by the bytes left.
+        self.tx_in = Vec::with_capacity(capped_capacity(count, r.remaining(), PREFIX_TX_IN_SIZE));
         for _ in 0..count {
             let hash = Hash(r.take_array()?);
             let index = r.read_u32()?;
@@ -316,8 +346,8 @@ impl MsgTx {
             });
         }
 
-        // Bounded above, mirroring dcrd's `make([]*TxOut, count)`.
-        self.tx_out = Vec::with_capacity(count as usize);
+        // dcrd's `make([]TxOut, count)`, capped by the bytes left.
+        self.tx_out = Vec::with_capacity(capped_capacity(count, r.remaining(), MIN_TX_OUT_SIZE));
         for _ in 0..count {
             let value = r.read_u64()? as i64;
             let version = r.read_u16()?;
@@ -359,9 +389,14 @@ impl MsgTx {
         }
 
         if !is_full {
-            // Bounded above, mirroring dcrd's `make([]*TxIn, count)` in the
-            // witness-only decode path (outputs stay empty, as in dcrd).
-            self.tx_in = Vec::with_capacity(count as usize);
+            // dcrd's `make([]TxIn, count)` in the witness-only decode
+            // path, capped by the bytes left (outputs stay empty, as in
+            // dcrd).
+            self.tx_in = Vec::with_capacity(capped_capacity(
+                count,
+                r.remaining(),
+                MIN_TX_IN_WITNESS_SIZE,
+            ));
             self.tx_out = Vec::new();
         }
         for i in 0..count as usize {
@@ -664,6 +699,60 @@ mod tests {
         };
 
         assert_eq!(tx.tx_hash(), want);
+    }
+
+    /// A payload that declares the most inputs or outputs dcrd's limits
+    /// allow, then runs out, reserves no more than its bytes could hold
+    /// and fails exactly as before.  The declared counts used to be
+    /// reserved whole: ~149 MB of outputs for a ten-byte `tx` payload.
+    #[test]
+    fn declared_counts_reserve_only_what_the_bytes_can_hold() {
+        // No inputs, the maximum output count, and no outputs.
+        let mut bytes = alloc::vec![0x00];
+        write_var_int(&mut bytes, MAX_TX_OUT_PER_MESSAGE);
+        let mut tx = MsgTx::default();
+        assert_eq!(
+            tx.decode_prefix(&mut Cursor::new(&bytes)),
+            Err(WireError::Eof)
+        );
+        assert_eq!(tx.tx_out.capacity(), 0);
+
+        // The maximum input count with room for two inputs and a half.
+        let mut bytes = Vec::new();
+        write_var_int(&mut bytes, MAX_TX_IN_PER_MESSAGE);
+        bytes.extend_from_slice(&[0u8; 100]);
+        let mut tx = MsgTx::default();
+        assert_eq!(
+            tx.decode_prefix(&mut Cursor::new(&bytes)),
+            Err(WireError::UnexpectedEof)
+        );
+        assert_eq!(tx.tx_in.len(), 2);
+        assert!(tx.tx_in.capacity() <= 100 / PREFIX_TX_IN_SIZE);
+
+        // The witness-only form reserves its inputs the same way.
+        let mut bytes = Vec::new();
+        write_var_int(&mut bytes, MAX_TX_IN_PER_MESSAGE);
+        let mut tx = MsgTx::default();
+        assert_eq!(
+            tx.decode_witness(&mut Cursor::new(&bytes), false),
+            Err(WireError::Eof)
+        );
+        assert_eq!(tx.tx_in.capacity(), 0);
+    }
+
+    /// The cap never under-reserves a transaction that decodes: each
+    /// list is sized once, to its length.
+    #[test]
+    fn decoded_lists_are_reserved_exactly() {
+        let bytes = multi_tx_encoded();
+        let (tx, _) = MsgTx::from_bytes(&bytes).expect("decode multiTx");
+        assert_eq!(tx.tx_in.capacity(), tx.tx_in.len());
+        assert_eq!(tx.tx_out.capacity(), tx.tx_out.len());
+
+        let mut witness_only = multi_tx();
+        witness_only.ser_type = TxSerializeType::OnlyWitness;
+        let (tx, _) = MsgTx::from_bytes(&witness_only.serialize()).expect("decode");
+        assert_eq!(tx.tx_in.capacity(), tx.tx_in.len());
     }
 
     #[test]
