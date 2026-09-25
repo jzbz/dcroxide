@@ -107,8 +107,8 @@ fn assert_sizes(m: &ConnManager, want: &str, tag: &str) {
         act,
         byaddr,
         perhost,
-        m.total_normal_conns_sem.used(),
-        m.active_outbounds_sem.used(),
+        m.total_normal_conns_sem().used(),
+        m.active_outbounds_sem().used(),
     );
     assert_eq!(got, want, "{tag}: state sizes");
 }

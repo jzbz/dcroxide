@@ -975,10 +975,10 @@ fn fill_outbound(state: &mut LoopState) {
             // (`Command::PermitGranted`).  Nothing to do while parked;
             // once granted, the fill resumes where dcrd's handler
             // returns from the acquire, past the failed-attempt pause.
-            if manager.total_normal_conns_sem.is_waiting() {
+            if manager.auto_outbound_parked() {
                 return;
             }
-            let granted = manager.total_normal_conns_sem.take_grant();
+            let granted = manager.auto_outbound_take_grant();
 
             // Pause automatic dialing after too many failed attempts,
             // then fall through to one more attempt per pause cycle
@@ -1858,7 +1858,7 @@ mod tests {
             ))
         );
         let manager = state.manager.lock().expect("connmgr");
-        assert_eq!(manager.total_normal_conns_sem.used(), 0);
+        assert_eq!(manager.total_normal_conns_sem().used(), 0);
     }
 
     /// dcrd's `runPersistent` stamps `lastAttempt = time.Now()` as it

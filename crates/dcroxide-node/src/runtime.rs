@@ -1112,12 +1112,13 @@ mod tests {
         handler(server, addr);
         REFUSE_CONN_THREADS.with(|refuse| refuse.set(false));
 
-        assert!(
+        assert_eq!(
             manager
                 .lock()
                 .expect("connmgr mutex")
-                .total_normal_conns_sem
-                .try_acquire(),
+                .total_normal_conns_sem()
+                .used(),
+            0,
             "the admission's connection permit must be released"
         );
         client
@@ -1145,7 +1146,7 @@ mod tests {
         // Fill the registry to a limit of one.
         let connected = ConnectedPeers::new();
         let _held_client = TcpStream::connect(bound).expect("connect held");
-        let (held_server, _) = listener.accept().expect("accept held");
+        let (held_server, held_addr) = listener.accept().expect("accept held");
         connected.register(crate::transport::Teardown::new(held_server));
         assert_eq!(connected.len(), 1);
 
@@ -1169,12 +1170,23 @@ mod tests {
             },
             &mut csprng,
         )));
-        // The single permit is held by a registered connection, so the
-        // accepted socket is shed by the admission (dcrd's
-        // listenHandler over the total-connections semaphore).
+        // The single permit is held by the registered connection, admitted
+        // as the accept path admits it, so the next accepted socket is
+        // shed by the admission (dcrd's listenHandler over the
+        // total-connections semaphore).
         {
             let mut mgr = manager.lock().expect("connmgr mutex");
-            assert!(mgr.total_normal_conns_sem.try_acquire());
+            let held = crate::outbound::socket_addr_to_net_address(&held_addr);
+            match admit_inbound_now(&mut mgr, &held, &mut csprng) {
+                dcroxide_connmgr::InboundDecision::Admit {
+                    require_permit,
+                    host_permit_reserved,
+                } => {
+                    mgr.register_inbound(&held, require_permit, host_permit_reserved);
+                }
+                other => panic!("the held connection is admitted: {other:?}"),
+            }
+            assert_eq!(mgr.total_normal_conns_sem().used(), 1);
         }
         let handler = inbound_peer_handler(template, connected.clone(), None, Some(manager));
 

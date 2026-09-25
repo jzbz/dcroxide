@@ -25,7 +25,8 @@ pub enum AutoPermits {
     /// second acquire still holding the first
     /// ([`crate::SemCount::acquire_or_wait`]).  The release that frees a
     /// total permit hands it to the attempt, which collects it with
-    /// [`crate::SemCount::take_grant`] and goes on as [`AutoPermits::Held`].
+    /// [`ConnManager::auto_outbound_take_grant`] and goes on as
+    /// [`AutoPermits::Held`].
     Parked,
 }
 
@@ -82,6 +83,24 @@ impl ConnManager {
             return AutoPermits::Parked;
         }
         AutoPermits::Held
+    }
+
+    /// Whether an automatic attempt is parked on the total-connections
+    /// semaphore ([`AutoPermits::Parked`]), holding its active-outbounds
+    /// permit as dcrd's handler does while blocked in
+    /// `totalNormalConnsSem.Acquire`
+    /// (`internal/connmgr/connmanager.go:2163`).  It has nothing to do
+    /// until a release hands it the permit.
+    pub fn auto_outbound_parked(&self) -> bool {
+        self.total_normal_conns_sem.is_waiting()
+    }
+
+    /// Collect the total-connections permit a release handed the parked
+    /// attempt, if one did: dcrd's blocked `Acquire` returning.  The
+    /// attempt then holds both permits, as after [`AutoPermits::Held`],
+    /// and goes on to pick an address.
+    pub fn auto_outbound_take_grant(&mut self) -> bool {
+        self.total_normal_conns_sem.take_grant()
     }
 
     /// Finish an automatic attempt whose two permits are held, given what

@@ -322,14 +322,14 @@ pub struct ConnManager {
     max_per_outbound_group: u32,
     /// The total normal connections permit counter (dcrd
     /// `totalNormalConnsSem`).
-    pub total_normal_conns_sem: SemCount,
+    pub(crate) total_normal_conns_sem: SemCount,
     /// The active automatic outbound permit counter (dcrd
     /// `activeOutboundsSem`).
-    pub active_outbounds_sem: SemCount,
+    pub(crate) active_outbounds_sem: SemCount,
     /// Per-host connection counts (dcrd `perHostCounts`).
     per_host_counts: HashMap<String, u32>,
     /// Outbound address group tracking (dcrd `outboundGroups`).
-    pub outbound_groups: OutboundGroupInfo,
+    pub(crate) outbound_groups: OutboundGroupInfo,
     /// Inbound rate limiting and flood detection (dcrd
     /// `inboundLimiter`).
     pub inbound_limiter: InboundRateLimiter,
@@ -429,6 +429,27 @@ impl ConnManager {
     /// The configured maximum of normal connections.
     pub fn max_normal_conns(&self) -> u32 {
         self.cfg.max_normal_conns
+    }
+
+    /// The total normal connections semaphore (dcrd
+    /// `totalNormalConnsSem`), for reading.  Its permits are taken and
+    /// given back only through the manager's own gates, close plans and
+    /// automatic outbound sequence; nothing outside the crate takes or
+    /// releases one directly.
+    pub fn total_normal_conns_sem(&self) -> &SemCount {
+        &self.total_normal_conns_sem
+    }
+
+    /// The active automatic outbound semaphore (dcrd
+    /// `activeOutboundsSem`), for reading.
+    pub fn active_outbounds_sem(&self) -> &SemCount {
+        &self.active_outbounds_sem
+    }
+
+    /// The outbound address group tracking (dcrd `outboundGroups`), for
+    /// reading.
+    pub fn outbound_groups(&self) -> &OutboundGroupInfo {
+        &self.outbound_groups
     }
 
     /// Begin shutdown: further operations return

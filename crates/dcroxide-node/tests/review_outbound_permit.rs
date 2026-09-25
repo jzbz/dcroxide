@@ -117,11 +117,7 @@ fn a_freed_permit_wakes_the_parked_outbound_fill() {
     // The fill takes its outbound permit and parks on the total one.
     assert!(
         wait_until(Duration::from_secs(5), || {
-            manager
-                .lock()
-                .expect("connmgr")
-                .total_normal_conns_sem
-                .is_waiting()
+            manager.lock().expect("connmgr").auto_outbound_parked()
         }),
         "the fill parks on the exhausted total permit"
     );

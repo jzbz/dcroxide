@@ -3,7 +3,10 @@
 //! `targetOutboundHandler`) as a core method.  It used to be written out
 //! in the daemon's fill loop, with a hand-built unwind in each failure
 //! branch, where one missed release would shrink outbound capacity for
-//! good and no test in this crate could see it.
+//! good and no test in this crate could see it.  The semaphores and the
+//! outbound groups cannot be written directly outside the core now, so
+//! these tests reserve permits through the manager's own gates as the
+//! daemon must.
 
 use dcroxide_addrmgr::{NetAddress, NetAddressType, new_net_address_from_params};
 use dcroxide_connmgr::manager::{ClosePlan, ConnManager, ConnRecord, ManagerConfig};
@@ -33,17 +36,17 @@ fn offering(addr: &NetAddress) -> impl FnMut() -> Result<(NetAddress, i64), Stri
 /// dial and no host permit.
 fn assert_nothing_held(manager: &ConnManager, addr: &NetAddress, tag: &str) {
     assert_eq!(
-        manager.active_outbounds_sem.used(),
+        manager.active_outbounds_sem().used(),
         0,
         "{tag}: outbound permit"
     );
     assert_eq!(
-        manager.total_normal_conns_sem.used(),
+        manager.total_normal_conns_sem().used(),
         0,
         "{tag}: total permit"
     );
     assert_eq!(
-        manager.outbound_groups.group_count(addr),
+        manager.outbound_groups().group_count(addr),
         0,
         "{tag}: group entry"
     );
@@ -52,39 +55,45 @@ fn assert_nothing_held(manager: &ConnManager, addr: &NetAddress, tag: &str) {
     assert_eq!(per_host, 0, "{tag}: host permit");
 }
 
-/// A pass that finds no free permit holds nothing afterwards, whichever
-/// of the two semaphores was full.
+/// A pass that finds no free permit takes nothing, whichever of the two
+/// semaphores was full.
 #[test]
 fn an_attempt_without_a_free_permit_holds_nothing() {
     let addr = v4(192, 0, 2, 1);
 
-    // The active-outbounds permit is taken.
+    // Another automatic attempt holds the only active-outbounds permit
+    // (and a total one).
     let mut full_outbound = manager(ManagerConfig {
         target_outbound: 1,
         ..ManagerConfig::default()
     });
-    assert!(full_outbound.active_outbounds_sem.try_acquire());
+    assert_eq!(full_outbound.auto_outbound_acquire(), AutoPermits::Held);
     assert_eq!(
         full_outbound.auto_outbound_begin(&mut offering(&addr), NOW),
         AutoBegin::PermitsExhausted
     );
-    assert_eq!(full_outbound.active_outbounds_sem.used(), 1);
-    assert_eq!(full_outbound.total_normal_conns_sem.used(), 0);
+    assert_eq!(full_outbound.active_outbounds_sem().used(), 1);
+    assert_eq!(full_outbound.total_normal_conns_sem().used(), 1);
+    assert_eq!(full_outbound.outbound_groups().group_count(&addr), 0);
 
-    // The total-connections permit is taken: the outbound permit the
-    // pass drew first goes back.
+    // A manual connection to a loopback address, whose outbound group
+    // (`local`) is not the documentation address's (`unroutable`), holds
+    // the only total-connections permit: the outbound permit the pass
+    // drew first goes back.
     let mut full_total = manager(ManagerConfig {
         max_normal_conns: 1,
         ..ManagerConfig::default()
     });
-    assert!(full_total.total_normal_conns_sem.try_acquire());
+    full_total
+        .connect_begin(&v4(127, 0, 0, 1))
+        .expect("the only total permit");
     assert_eq!(
         full_total.auto_outbound_begin(&mut offering(&addr), NOW),
         AutoBegin::PermitsExhausted
     );
-    assert_eq!(full_total.active_outbounds_sem.used(), 0);
-    assert_eq!(full_total.total_normal_conns_sem.used(), 1);
-    assert_eq!(full_total.outbound_groups.group_count(&addr), 0);
+    assert_eq!(full_total.active_outbounds_sem().used(), 0);
+    assert_eq!(full_total.total_normal_conns_sem().used(), 1);
+    assert_eq!(full_total.outbound_groups().group_count(&addr), 0);
 }
 
 /// Every way an attempt can fail after taking its permits gives back
@@ -153,9 +162,9 @@ fn a_registered_automatic_dial_releases_through_its_close_plan() {
     };
     assert_eq!(dialed, addr);
     assert!(host_permit_reserved);
-    assert_eq!(manager.active_outbounds_sem.used(), 1);
-    assert_eq!(manager.total_normal_conns_sem.used(), 1);
-    assert_eq!(manager.outbound_groups.group_count(&addr), 1);
+    assert_eq!(manager.active_outbounds_sem().used(), 1);
+    assert_eq!(manager.total_normal_conns_sem().used(), 1);
+    assert_eq!(manager.outbound_groups().group_count(&addr), 1);
     assert_eq!(manager.map_sizes().4, 1, "the host permit is held");
     manager.dial_failed(id);
     manager.run_close_plan(&ConnRecord {
@@ -191,7 +200,9 @@ fn a_registered_automatic_dial_releases_through_its_close_plan() {
 /// candidates with its lock on the manager released: the permits
 /// through `auto_outbound_acquire`, which parks on a full
 /// total-connections semaphore still holding the outbound permit (dcrd's
-/// handler blocking in its second acquire), and the rest through
+/// handler blocking in its second acquire; `auto_outbound_parked`
+/// reports the wait and `auto_outbound_take_grant` collects the permit a
+/// release hands over), and the rest through
 /// `auto_outbound_reserve`, which unwinds a failure as
 /// `auto_outbound_begin` does and registers the dial under the same
 /// close plan.
@@ -204,22 +215,35 @@ fn a_parked_attempt_resumes_and_reserves_through_the_core() {
     });
     let addr = v4(203, 0, 113, 1);
 
-    // Another connection holds the only total permit: the attempt parks
-    // with its outbound permit, and the release hands it the total one.
-    assert!(manager.total_normal_conns_sem.try_acquire());
+    // A manual connection holds the only total permit: the attempt parks
+    // with its outbound permit, and the manual dial's unwind hands it the
+    // total one, which it collects exactly once.
+    let manual = v4(198, 51, 100, 1);
+    let plan = manager
+        .connect_begin(&manual)
+        .expect("the only total permit");
+    assert!(!manager.auto_outbound_parked());
     assert_eq!(manager.auto_outbound_acquire(), AutoPermits::Parked);
+    assert!(manager.auto_outbound_parked());
     assert_eq!(
-        manager.active_outbounds_sem.used(),
+        manager.active_outbounds_sem().used(),
         1,
         "outbound permit kept"
     );
-    assert!(manager.total_normal_conns_sem.is_waiting());
     assert!(
-        manager.total_normal_conns_sem.release(),
+        !manager.auto_outbound_take_grant(),
+        "nothing handed over yet"
+    );
+    manager.connect_unwind(&manual, &plan);
+    assert!(!manager.auto_outbound_parked());
+    assert_eq!(
+        manager.total_normal_conns_sem().used(),
+        1,
         "the release goes to the parked attempt"
     );
-    assert!(manager.total_normal_conns_sem.take_grant());
-    assert_eq!(manager.total_normal_conns_sem.used(), 1);
+    assert!(manager.auto_outbound_take_grant());
+    assert!(!manager.auto_outbound_take_grant());
+    assert_eq!(manager.total_normal_conns_sem().used(), 1);
 
     // A failed pick gives both permits back.
     assert_eq!(
