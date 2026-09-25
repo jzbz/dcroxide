@@ -14,14 +14,15 @@
 //! descriptor is treated the same way, exactly as dcrd's failed reads
 //! are.
 //!
-//! The workspace forbids `unsafe`, so an inherited descriptor cannot be
+//! This crate forbids `unsafe`, so an inherited descriptor cannot be
 //! adopted with `from_raw_fd` the way `os.NewFile` adopts it.  On Linux
 //! the process duplicates it from itself instead (`pidfd_getfd`), which
 //! serves every kind of descriptor; elsewhere on unix, and on Linux
 //! kernels without that call, it is re-opened through the file system
-//! (see `open_inherited_fd`).  Windows pipe handles cannot be taken
-//! at all without `unsafe`, so there `--piperx` only logs that it is
-//! unsupported and `--pipetx` sends nothing.
+//! (see `open_inherited_fd`).  On Windows the inherited pipe handle is
+//! duplicated within the process by `dcroxide-winsvc`, the workspace's
+//! one audited exception to the no-`unsafe` rule
+//! (`adopt_inherited_handle`).
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -142,6 +143,39 @@ impl PipeNotifier {
     }
 }
 
+/// Go's `os.ErrInvalid`, what every read or write on the nil file
+/// `os.NewFile` returns for a number it rejects fails with.
+#[cfg(unix)]
+fn go_err_invalid() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid argument")
+}
+
+/// Whether the error is the nil file's `os.ErrInvalid` (see
+/// `go_err_invalid` and `dcroxide_winsvc::adopt_inherited_handle`)
+/// rather than an OS error, which always carries its code.
+fn is_go_err_invalid(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::InvalidInput && err.raw_os_error().is_none()
+}
+
+/// The error dcrd logs for a failed read or write on a pipe (`Failed to
+/// read from pipe: %v`, `Failed to write to pipe: %v`).  dcrd names the
+/// file `|fd` (`os.NewFile(fd, fmt.Sprintf("|%v", fd))`), and
+/// `os.File`'s reads and writes wrap what fails in a `*PathError` over
+/// that name, the OS error spelled as `syscall.Errno` spells it (`read
+/// |5: bad file descriptor`, on Windows `read |5: The handle is
+/// invalid.`).  The nil file returns `os.ErrInvalid` bare.
+fn go_pipe_error(op: &'static str, fd: u64, err: std::io::Error) -> String {
+    if is_go_err_invalid(&err) {
+        return err.to_string();
+    }
+    crate::gostd::GoPathError {
+        op,
+        path: format!("|{fd}"),
+        err,
+    }
+    .to_string()
+}
+
 /// Take a descriptor the parent left open, the `unsafe`-free stand-in
 /// for `os.NewFile(fd)`.
 ///
@@ -155,9 +189,15 @@ impl PipeNotifier {
 /// call is missing (kernels before 5.6) or filtered by a sandbox, and on
 /// the other unixes, the descriptor is re-opened by path instead; the
 /// other unixes' `/dev/fd` open duplicates it, while Linux's
-/// `/proc/self/fd` open serves pipes and files but not sockets.
+/// `/proc/self/fd` open serves pipes and files but not sockets.  A
+/// number that is negative as Go's `int` gets the nil file from
+/// `os.NewFile`, so it fails with `os.ErrInvalid`.
 #[cfg(unix)]
 fn open_inherited_fd(fd: u64, write: bool) -> std::io::Result<File> {
+    if i64::try_from(fd).is_err() {
+        return Err(go_err_invalid());
+    }
+
     #[cfg(target_os = "linux")]
     match duplicate_own_fd(fd) {
         Ok(file) => return Ok(file),
@@ -199,9 +239,22 @@ fn duplicate_own_fd(fd: u64) -> std::io::Result<File> {
     )?))
 }
 
-/// Windows pipe handles cannot be taken without `unsafe`
-/// (`OwnedHandle::from_raw_handle`), which the workspace forbids.
-#[cfg(not(unix))]
+/// Take a pipe handle the parent left inheritable (dcrd's
+/// `os.NewFile(fd)` on Windows): `dcroxide-winsvc` duplicates it within
+/// the process, which shares the pipe as adopting it does, and hands
+/// back the duplicate as a file the daemon owns.  `INVALID_HANDLE_VALUE`
+/// fails with Go's `invalid argument`, the error every read or write on
+/// `os.NewFile`'s nil file returns, and a number that names no open
+/// handle with `ERROR_INVALID_HANDLE`, as dcrd's first read or write on
+/// it does; both take the broken-descriptor path.  The duplicate keeps
+/// the handle's access, so `write` has nothing to choose.
+#[cfg(windows)]
+fn open_inherited_fd(fd: u64, _write: bool) -> std::io::Result<File> {
+    dcroxide_winsvc::adopt_inherited_handle(fd)
+}
+
+/// Only unix descriptors and Windows handles are taken.
+#[cfg(not(any(unix, windows)))]
 fn open_inherited_fd(_fd: u64, _write: bool) -> std::io::Result<File> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -226,7 +279,10 @@ fn wait_ready(pipe: &File, write: bool) -> std::io::Result<()> {
     }
 }
 
-/// Nothing is ever taken off unix, so nothing waits.
+/// Off unix nothing is left to wait for: std's reads and writes on a
+/// Windows handle wait for the transfer themselves, even on a handle
+/// opened for overlapped I/O, so they never report `WouldBlock` for a
+/// pipe, and elsewhere nothing is taken.
 #[cfg(not(unix))]
 fn wait_ready(_pipe: &File, _write: bool) -> std::io::Result<()> {
     Ok(())
@@ -236,11 +292,16 @@ fn wait_ready(_pipe: &File, _write: bool) -> std::io::Result<()> {
 /// left non-blocking (see [`wait_ready`]) the way Go's `poll.FD.Write`
 /// does, where `write_all` would fail with `WouldBlock` and end the
 /// writer.  A write that takes nothing is an error, as it is to Go
-/// (`io.ErrUnexpectedEOF`).
+/// (`io.ErrUnexpectedEOF`, with its text).
 fn write_all_waiting(mut pipe: &File, mut bytes: &[u8]) -> std::io::Result<()> {
     while !bytes.is_empty() {
         match pipe.write(bytes) {
-            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "unexpected EOF",
+                ));
+            }
             Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => wait_ready(pipe, true)?,
@@ -270,7 +331,10 @@ pub fn new_pipe_notifier(pipe_tx: u64, lifetime_events: bool) -> PipeNotifier {
                                     // going.
                                     crate::logging::error(
                                         "DCRD",
-                                        &format!("Failed to write to pipe: {e}"),
+                                        &format!(
+                                            "Failed to write to pipe: {}",
+                                            go_pipe_error("write", pipe_tx, e)
+                                        ),
                                     );
                                     break;
                                 }
@@ -321,12 +385,16 @@ pub fn start_pipe_rx(pipe_rx: u64, request_shutdown: Box<dyn FnOnce() + Send>) {
             Err(e) => {
                 // dcrd's reads over a descriptor that is not open fail
                 // at once and request the shutdown, and taking one fails
-                // here the same way (`EBADF`).  A re-open by path that
-                // fails on an open descriptor -- a socket on a kernel
-                // without `pidfd_getfd` -- has no dcrd counterpart; it
-                // shuts down the same way rather than leave the daemon
+                // here the same way, logged as dcrd's first read fails
+                // (`read |N: bad file descriptor`; on Windows `read |N:
+                // The handle is invalid.`, or for `INVALID_HANDLE_VALUE`
+                // the bare `invalid argument` of `os.NewFile`'s nil
+                // file).  A re-open by path that fails on an open
+                // descriptor -- a socket on a kernel without
+                // `pidfd_getfd` -- has no dcrd counterpart; it shuts
+                // down the same way rather than leave the daemon
                 // running where its parent cannot stop it.
-                crate::logging::error("DCRD", &format!("Failed to read from pipe: {e}"));
+                crate::logging::error("DCRD", &read_failure(pipe_rx, e));
                 request_shutdown();
                 return;
             }
@@ -341,20 +409,114 @@ pub fn start_pipe_rx(pipe_rx: u64, request_shutdown: Box<dyn FnOnce() + Send>) {
                     match wait_ready(&pipe, false) {
                         Ok(()) => continue,
                         Err(e) => {
-                            crate::logging::error(
-                                "DCRD",
-                                &format!("Failed to read from pipe: {e}"),
-                            );
+                            crate::logging::error("DCRD", &read_failure(pipe_rx, e));
                             break;
                         }
                     }
                 }
                 Err(e) => {
-                    crate::logging::error("DCRD", &format!("Failed to read from pipe: {e}"));
+                    crate::logging::error("DCRD", &read_failure(pipe_rx, e));
                     break;
                 }
             }
         }
         request_shutdown();
     });
+}
+
+/// dcrd's `Failed to read from pipe: %v` line for the `--piperx`
+/// descriptor `fd` (see [`go_pipe_error`]).
+fn read_failure(fd: u64, err: std::io::Error) -> String {
+    format!(
+        "Failed to read from pipe: {}",
+        go_pipe_error("read", fd, err)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A read or write that fails is logged as Go's `*PathError` over
+    /// the file dcrd names `|fd`, with the OS error spelled as
+    /// `syscall.Errno` spells it, not as Rust's `(os error N)` form.
+    #[test]
+    fn a_failed_read_or_write_is_logged_as_dcrd_logs_it() {
+        #[cfg(unix)]
+        let (bad, text) = (
+            rustix::io::Errno::BADF.raw_os_error(),
+            "bad file descriptor",
+        );
+        // ERROR_INVALID_HANDLE, as Go asks for it in US English.
+        #[cfg(windows)]
+        let (bad, text) = (6, "The handle is invalid.");
+        #[cfg(any(unix, windows))]
+        {
+            let err = std::io::Error::from_raw_os_error(bad);
+            assert_eq!(
+                read_failure(5, err),
+                format!("Failed to read from pipe: read |5: {text}")
+            );
+            let err = std::io::Error::from_raw_os_error(bad);
+            assert_eq!(go_pipe_error("write", 7, err), format!("write |7: {text}"));
+        }
+
+        // A write that takes nothing is Go's `io.ErrUnexpectedEOF`.
+        let err = std::io::Error::new(std::io::ErrorKind::WriteZero, "unexpected EOF");
+        assert_eq!(go_pipe_error("write", 7, err), "write |7: unexpected EOF");
+    }
+
+    /// The nil file `os.NewFile` returns for a number that is negative
+    /// as Go's `int` (on Windows, `INVALID_HANDLE_VALUE`) fails with
+    /// `os.ErrInvalid` itself, which dcrd logs unwrapped.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_rejected_number_is_logged_as_go_s_nil_file() {
+        #[cfg(unix)]
+        let rejected = [u64::MAX, 1 << 63];
+        #[cfg(windows)]
+        let rejected = [u64::MAX];
+        for fd in rejected {
+            let err = open_inherited_fd(fd, false).expect_err("nil file");
+            assert_eq!(
+                read_failure(fd, err),
+                "Failed to read from pipe: invalid argument"
+            );
+        }
+    }
+
+    /// A descriptor that is not open is logged as dcrd's first read on
+    /// it fails.  The fallback re-open by path, used where `pidfd_getfd`
+    /// is unavailable, fails differently and is not checked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_descriptor_that_is_not_open_is_logged_as_dcrd_logs_it() {
+        // Descriptors are allocated lowest first, so this one is free.
+        let fd: u64 = 1 << 30;
+        match duplicate_own_fd(fd) {
+            Err(e) if e.raw_os_error() == Some(rustix::io::Errno::BADF.raw_os_error()) => {}
+            other => {
+                eprintln!("skipped: pidfd_getfd unavailable ({:?})", other.err());
+                return;
+            }
+        }
+        let err = open_inherited_fd(fd, false).expect_err("not open");
+        assert_eq!(
+            read_failure(fd, err),
+            "Failed to read from pipe: read |1073741824: bad file descriptor"
+        );
+    }
+
+    /// A handle number that names no open handle is logged as dcrd's
+    /// first read on it fails.  Handle values are multiples of four
+    /// below 2^26, so this one can name nothing.
+    #[cfg(windows)]
+    #[test]
+    fn a_handle_that_is_not_open_is_logged_as_dcrd_logs_it() {
+        let err = open_inherited_fd(0x0fff_fff0, false).expect_err("not open");
+        assert_eq!(
+            read_failure(0x0fff_fff0, err),
+            "Failed to read from pipe: read |268435440: The handle is invalid."
+        );
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "dcroxide-winsvc"
-description = "dcrd's Windows service wrapper (service_windows.go) over the windows-service crate"
+description = "dcrd's Windows service wrapper (service_windows.go) over the windows-service crate, plus the Windows console control handler and inherited pipe handles"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -8,13 +8,32 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# windows-sys is taken directly, at the 0.61.2 the lockfile already
+# carries through windows-service, ctrlc, rustix and socket2, for the
+# three calls std has no safe wrapper for: `SetConsoleCtrlHandler`
+# (the console close, logoff and shutdown handler in `console.rs`) and
+# `GetCurrentProcess` with `DuplicateHandle` (adopting an inherited
+# `--piperx`/`--pipetx` handle in `pipe.rs`).  The features name only
+# the modules those calls and their constants live in.
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
 
 # The workspace lints are inherited except that this crate cannot
-# forbid unsafe code: the windows-service crate's service-entry macro
-# expands an FFI shim containing an unsafe block into the consuming
-# crate.  No unsafe is written here directly.
+# forbid unsafe code, for two reasons.  The windows-service crate's
+# service-entry macro expands an FFI shim containing an unsafe block
+# into the consuming crate.  And this crate is the workspace's one
+# audited exception to the no-unsafe rule: the console control handler
+# and the inherited-handle adoption are Windows FFI that std does not
+# wrap.  `deny` keeps every other unsafe block an error, so each one
+# here carries its own `#[allow(unsafe_code)]` at the narrowest scope
+# and a `// SAFETY:` comment stating the invariants it relies on (see
+# the crate documentation).  No other crate in the workspace writes
+# unsafe code.
 [lints.rust]
 unsafe_code = "deny"
 missing_docs = "deny"

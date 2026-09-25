@@ -77,7 +77,51 @@ fn request_process_shutdown(interrupt: &dcroxide_indexers::Interrupt, shutdown: 
     let _ = shutdown.send(());
 }
 
+/// A termination signal, as dcrd's `shutdownListener` takes one from
+/// its signal channel: the first cancels the daemon context and logs
+/// `Received signal (<name>).  Shutting down...`, and every later one,
+/// or one after a shutdown request, logs the `Already shutting down...`
+/// form (`signal.go:34`, `:47-49`).  Only the Windows console close,
+/// logoff and shutdown events arrive here, as `terminated`, the SIGTERM
+/// Go's runtime turns them into (`runtime/os_windows.go`
+/// `ctrlHandler`); ctrlc does not say which signal it caught, so the
+/// others still cancel without a line.
+#[cfg_attr(not(windows), allow(dead_code))] // Only the console handler calls it.
+fn signal_process_shutdown(
+    signal: &str,
+    interrupt: &dcroxide_indexers::Interrupt,
+    shutdown: &mpsc::Sender<()>,
+) {
+    let repeat = interrupt.swap(true, core::sync::atomic::Ordering::SeqCst);
+    log_info(&signal_line(signal, repeat));
+    let _ = shutdown.send(());
+}
+
+/// dcrd's `shutdownListener` line for a signal, the first or a repeat.
+#[cfg_attr(not(windows), allow(dead_code))] // Only the console handler calls it.
+fn signal_line(signal: &str, repeat: bool) -> String {
+    if repeat {
+        format!("Received signal ({signal}).  Already shutting down...")
+    } else {
+        format!("Received signal ({signal}).  Shutting down...")
+    }
+}
+
 fn main() -> ExitCode {
+    let code = process_main();
+    // The daemon has shut down, the block database closed and the
+    // service, if it ran as one, reported stopped: release a console
+    // close, logoff or shutdown the console handler is holding (see
+    // `run_node`).  Go's handler holds dcrd's until its `main` exits the
+    // process.
+    #[cfg(windows)]
+    dcroxide_winsvc::shutdown_complete();
+    code
+}
+
+/// dcrd's `main`: the process setup, then the daemon, under the service
+/// control manager or interactively.
+fn process_main() -> ExitCode {
     // Lift the soft descriptor limit to just below the hard one, which
     // the Go runtime's `syscall` package init does for dcrd before any
     // of its code runs (`syscall/rlimit.go`).  Without it the daemon
@@ -444,6 +488,25 @@ fn run_node(cfg: Config) -> ExitCode {
             signal_interrupt.store(true, core::sync::atomic::Ordering::SeqCst);
             let _ = signal_shutdown.send(());
         }) {
+            log_error(&format!("unable to install signal handler: {e}"));
+            return ExitCode::FAILURE;
+        }
+    }
+    // On Windows a console close, logoff or shutdown ends the process as
+    // soon as a console handler returns, and ctrlc's returns at once.
+    // Go's runtime turns the three into SIGTERM and holds the event
+    // while dcrd shuts down, so this handler requests the same shutdown
+    // and holds the event until `main` reports the daemon has shut down
+    // (`dcroxide_winsvc::install_console_handler`).  Registered after
+    // ctrlc's, it is asked first, and passes Ctrl-C and Ctrl-Break on to
+    // ctrlc.
+    #[cfg(windows)]
+    {
+        let term_interrupt = Arc::clone(&interrupt);
+        let term_shutdown = shutdown_tx.clone();
+        if let Err(e) = dcroxide_winsvc::install_console_handler(Box::new(move || {
+            signal_process_shutdown("terminated", &term_interrupt, &term_shutdown);
+        })) {
             log_error(&format!("unable to install signal handler: {e}"));
             return ExitCode::FAILURE;
         }
@@ -2151,8 +2214,23 @@ fn log_error(msg: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{passwd_home, stop_block_processing};
+    use super::{passwd_home, signal_line, stop_block_processing};
     use std::sync::{Arc, Mutex};
+
+    /// A Windows console close, logoff or shutdown is logged as dcrd's
+    /// `shutdownListener` logs the SIGTERM Go's runtime makes of it
+    /// (`signal.go:34`, `:47-49`), first and repeat.
+    #[test]
+    fn a_termination_signal_is_logged_as_dcrd_logs_it() {
+        assert_eq!(
+            signal_line("terminated", false),
+            "Received signal (terminated).  Shutting down..."
+        );
+        assert_eq!(
+            signal_line("terminated", true),
+            "Received signal (terminated).  Already shutting down..."
+        );
+    }
 
     /// `~` resolves through the account's password-file entry, parsed
     /// with Go's cgo-free rules: the old lookup read `$HOME` alone, so a

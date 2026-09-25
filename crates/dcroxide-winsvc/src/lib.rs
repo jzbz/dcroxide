@@ -18,10 +18,48 @@
 //! handles, where std discards every write, so until the rotating log
 //! file is wired a daemon run as a service keeps no log at all.
 //!
+//! It also carries the two Windows pieces of dcrd's process plumbing
+//! that Go's runtime and `os` package give dcrd for free and std does
+//! not: the console control handler that holds a console close, logoff
+//! or shutdown until the daemon has shut down ([`install_console_handler`],
+//! [`shutdown_complete`]), and the adoption of an inherited
+//! `--piperx`/`--pipetx` pipe handle ([`adopt_inherited_handle`], dcrd's
+//! `os.NewFile`).
+//!
 //! On other platforms every entry point is a stub: dcrd's
 //! `runServiceCommand` hook is nil off Windows, so the `--service`
 //! flag parses but does nothing, and the service detection reports
-//! interactive mode.
+//! interactive mode; there are no console control events to handle,
+//! and no handles to adopt.
+//!
+//! # Unsafe code
+//!
+//! The workspace forbids `unsafe_code`; this crate only denies it, and
+//! is the one audited exception.  The `windows-service` entry macro
+//! expands an FFI shim with an unsafe block into the crate, and the
+//! console handler and the handle adoption call Windows directly
+//! through `windows-sys`, since std wraps neither.  Every unsafe block
+//! written here is Windows-only, sits under its own
+//! `#[allow(unsafe_code)]` at the narrowest scope, and carries a
+//! `// SAFETY:` comment stating the invariants it relies on:
+//!
+//! - registering the console handler (`SetConsoleCtrlHandler`), in
+//!   `console.rs`;
+//! - duplicating the inherited handle (`GetCurrentProcess`,
+//!   `DuplicateHandle`), and taking ownership of the duplicate
+//!   (`OwnedHandle::from_raw_handle`), in `pipe.rs`.
+//!
+//! Anything else that needs unsafe code fails the `deny` until it is
+//! reviewed and allowed the same way.  No other crate in the workspace
+//! writes unsafe code.
+
+// Off Windows nothing reaches the console event handling but its tests.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod console;
+mod pipe;
+
+pub use console::{SHUTDOWN_WAIT, Terminate, install_console_handler, shutdown_complete};
+pub use pipe::adopt_inherited_handle;
 
 /// The name of the dcrd service (dcrd `svcName`), the "real" name used
 /// to control the service.

@@ -342,7 +342,10 @@ work). Currently implemented:
   `windows-service` crate: SCM detection and the service body with
   dcrd's status transitions, and the `--service`
   install/remove/start/stop commands (the option registered only on
-  Windows, exactly like dcrd)
+  Windows, exactly like dcrd); plus the console control handler that
+  holds a console close, logoff or shutdown until the daemon has shut
+  down, as Go's runtime does, and the adoption of inherited
+  `--piperx`/`--pipetx` pipe handles (dcrd's `os.NewFile`)
 - `dcroxide-testutil` — the differential-test harness every crate
   shares (no dcrd counterpart): the line-delimited JSON transport to
   `tools/oracle`, the toolchain gate (a missing Go toolchain skips the
@@ -542,9 +545,13 @@ cargo build --profile dist      # release artifacts
 `panic = "abort"`; dev and test builds keep unwinding.
 
 The workspace forbids `unsafe_code` and denies `missing_docs`
-everywhere (the one exception: `dcroxide-winsvc` denies rather than
-forbids unsafe because the service-entry macro expands an FFI shim,
-while writing none itself).
+everywhere, with one audited exception: `dcroxide-winsvc` denies rather
+than forbids unsafe code. The `windows-service` entry macro expands an
+FFI shim into it, and it calls Windows directly for the console control
+handler and for adopting inherited `--piperx`/`--pipetx` handles, which
+std does not wrap. Each of those unsafe blocks is Windows-only, allowed
+individually, and carries a `SAFETY` comment; the crate documentation
+lists them.
 
 ## License
 

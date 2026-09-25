@@ -184,3 +184,31 @@ argument against adopting that lint as a proxy for attention.
   addition must be mirrored there. Its `all = "warn"` also lacks
   `priority = -1`, which any specific clippy lint added alongside will
   require.
+
+## Addendum, 2026-09-25 — `dcroxide-winsvc` writes unsafe code of its own
+
+The consequence above said `dcroxide-winsvc` denies rather than forbids
+`unsafe_code` only because the `windows-service` entry macro expands an
+unsafe block into it. It now also writes three unsafe blocks itself, the
+workspace's one audited exception to the no-unsafe rule. Two Windows
+behaviours dcrd gets from Go's runtime and `os` package have no safe std
+equivalent. The first is a console control handler that holds a console
+close, logoff or shutdown until the daemon has shut down
+(`SetConsoleCtrlHandler`, in `console.rs`); Go's handler blocks the same
+way. The second is adopting the inherited `--piperx`/`--pipetx` pipe handles
+that `os.NewFile` adopts (`GetCurrentProcess` with `DuplicateHandle`, then
+`OwnedHandle::from_raw_handle` on the duplicate, in `pipe.rs`). Both call
+Windows through a direct `windows-sys` 0.61.2 dependency, the version the
+lockfile already carried, which
+[docs/dependency-ledger.md](../dependency-ledger.md) records.
+
+The lint level stays `deny`, not `allow`. Each block carries its own
+`#[allow(unsafe_code)]` on the one statement that needs it, with a
+`// SAFETY:` comment stating the invariants, and the crate documentation
+lists all three. Any further unsafe code in the crate fails the build until
+it is reviewed and allowed the same way. Every block is Windows-only, so the
+Linux lint job never compiles them. `cargo clippy --target
+x86_64-pc-windows-msvc -p dcroxide-winsvc --all-targets -- -D warnings`
+checks them from Linux, and CI's Windows test job builds and runs them. No
+other crate gains unsafe code: `dcroxide-node` still forbids it, and calls
+the two pieces through safe functions.

@@ -171,6 +171,22 @@ evaluating this code.
   the only sanitized build in CI, since `cargo fuzz` defaults to
   AddressSanitizer; neither the test suite nor a running node is run
   under a sanitizer.
+- **The Windows build runs unsafe code of the project's own.** Every
+  workspace crate forbids `unsafe_code` except `dcroxide-winsvc`, which
+  denies it and holds the one audited exception: three Windows-only unsafe
+  blocks, each allowed individually and carrying a `SAFETY` comment. One
+  registers the console control handler that holds a console close, logoff
+  or shutdown until the daemon has shut down. The other two duplicate an
+  inherited `--piperx` or `--pipetx` pipe handle and take ownership of the
+  duplicate. The handle is duplicated rather than adopted because the number
+  comes from the command line: a number that names no open handle, or one
+  another part of the process owns, then fails or yields a handle of the
+  daemon's own instead of a double close. Non-Windows builds compile none of
+  it. CI's Windows job runs the handle adoption and the handler's
+  registration. Nothing automated raises a real console close, logoff or
+  shutdown event, which needs an interactive Windows console, so the path
+  Windows takes through the handler is exercised only by unit tests of its
+  logic.
 - **Nobody has read the dependencies.** `cargo-deny` does run on every
   push to `master` and every pull request against `deny.toml`, gating
   the RustSec advisory database, a licence allow-list, yanked crates,
