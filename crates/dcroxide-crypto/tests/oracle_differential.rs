@@ -2,8 +2,9 @@
 //! Differential test: our BLAKE-256 vs. dcrd's `crypto/blake256`, live.
 //!
 //! This is the Phase 0 "demo differential test" from the project brief: it
-//! drives `tools/oracle` (a Go shim linking the exact dcrd module versions
-//! pinned by release-v2.1.5) and byte-compares digests. See
+//! drives `tools/oracle` (a Go shim linking dcrd's own packages at the
+//! parity pin, master `b9634e01`, built once per test process into
+//! `<target-dir>/<profile>/oracle/`) and byte-compares digests. See
 //! `dcroxide-testutil` for the harness and skip/require policy.
 
 use dcroxide_crypto::blake256;

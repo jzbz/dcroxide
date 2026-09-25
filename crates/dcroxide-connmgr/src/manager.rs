@@ -9,11 +9,18 @@
 //! sockets themselves.  Per the port's conventions those are
 //! daemon-phase concurrency: this core keeps dcrd's exact state —
 //! the pending/active/persistent maps with their shared
-//! address-index ownership rules, the semaphore counters, per-host
+//! address-index ownership rules, the semaphore counters (with the
+//! automatic outbound fill's blocking acquire as a parked waiter a
+//! release wakes through [`ConnManager::set_permit_waker`]), per-host
 //! permits, outbound group tracking, and the inbound rate limiter —
-//! and makes dcrd's exact decisions in dcrd's order, while the
-//! daemon supplies the clock, randomness, and sockets and executes
-//! the returned actions (dial, close, cancel, arm timer).  Close-time
+//! and makes dcrd's exact decisions in dcrd's order, the automatic
+//! outbound attempt's reservations included
+//! ([`ConnManager::auto_outbound_begin`]).  The daemon passes in the
+//! clock readings (wall-clock time, and [`crate::monotonic_nanos`]
+//! where dcrd subtracts two `time.Now` values, as for the inbound
+//! token buckets), the randomness, and the address source, owns the
+//! sockets, and executes the returned actions (dial, close, cancel,
+//! and a timer armed for each returned delay).  Close-time
 //! cleanup dcrd composes as nested `onClose` closures is recorded
 //! per connection as an explicit [`ClosePlan`] executed by
 //! [`ConnManager::conn_closed`].

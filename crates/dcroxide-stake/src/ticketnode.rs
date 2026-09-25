@@ -7,7 +7,8 @@
 //! The database-coupled entry points (`InitDatabaseState`,
 //! `LoadBestNode`, `WriteConnectedBestNode`, `WriteDisconnectedBestNode`)
 //! live in `stakedb`; `ResetDatabase` and the `DbRemoveAllBuckets` it
-//! calls are not ported, since dcrd calls them only from tests.
+//! calls are not ported, since nothing in dcrd calls `ResetDatabase`,
+//! not even its tests, and it is `DbRemoveAllBuckets`'s only caller.
 //! Disconnecting always takes the parent undo data and ticket list
 //! directly -- the chain fetches the rows itself when the parent node
 //! holds none, where dcrd's `disconnectNode` reads them through its

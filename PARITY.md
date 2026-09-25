@@ -1301,24 +1301,6 @@ closing it would cost.
   `CheckTSpendHasVotes`, which take no `chainLock` (`treasury.go:1090`,
   `:1155`).
 
-- **A payload that ends on a field boundary is logged as a failed read, where
-  dcrd stays silent.** A payload that runs out inside its message's structure
-  fails dcrd's `BtcDecode` with the raw reader error: `io.EOF` when it ends on
-  a field boundary, which `shouldHandleReadError` declines to log
-  (`peer/peer.go:1063-1065`), and `io.ErrUnexpectedEOF` when it ends inside a
-  field, logged as `Can't read message from %s: unexpected EOF` (`:1558-1560`).
-  The wire crate reports the two apart (`WireError::Eof` renders `EOF`,
-  `WireError::UnexpectedEof` renders `unexpected EOF`), so the inside-a-field
-  line matches dcrd's. The boundary case does not: `peerloop.rs`
-  `read_error_to_log` declines only the transport's own timeout and
-  end-of-stream texts and OS socket errors, so it logs
-  `Can't read message from %s: EOF`, and its doc comment still describes the
-  wire crate as reporting both cases as one error. Neither implementation bans
-  for either case, and only malformed messages reach them. Closing it means
-  declining the codec's `EOF` text there, as `shouldHandleReadError`'s
-  `errors.Is(err, io.EOF)` does, with a test over a payload cut at a field
-  boundary.
-
 - **An unclean stop costs a full redb repair of the metadata store at the next
   open.** goleveldb recovers by replaying its journal. redb, finding no saved
   allocator state, verifies and rebuilds from the whole file, up to three full

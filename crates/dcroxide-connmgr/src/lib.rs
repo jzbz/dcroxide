@@ -8,8 +8,17 @@
 //!
 //! dcrd's goroutines, channels, and timers are daemon-phase
 //! concurrency; the ports are synchronous with identical state
-//! transitions, network transports are injectable traits, and timer
-//! arms are returned as events for the daemon to drive.
+//! transitions.  The core holds no sockets, dialer, or listener: the
+//! daemon dials and accepts, reports each outcome back, passes in
+//! the clock readings (wall-clock time, and [`monotonic_nanos`] where
+//! dcrd subtracts two `time.Now` values) and the randomness
+//! ([`Csprng`]), and arms the timers the core hands back as delays.
+//! The automatic outbound attempt's reservation sequence runs in the
+//! core ([`manager::ConnManager::auto_outbound_begin`], split as
+//! `auto_outbound_acquire` and `auto_outbound_reserve` for a daemon
+//! that picks the address with the manager unlocked), with dcrd's
+//! blocking semaphore acquire modelled as a parked waiter
+//! ([`SemCount::acquire_or_wait`]).
 
 mod banscore;
 mod conntype;

@@ -4170,10 +4170,12 @@ impl Chain {
         crate::validate::check_block_sanity(block, adjusted_time_unix, true, params)?;
 
         // The positional checks over the parent branch.  dcrd's
-        // `checkBlockPositional` is a method on the chain and reads the
-        // fork rejection checkpoint from its own index, so the check is
-        // live on this path (`validate.go:1372-1393`, whose sole caller
-        // is `CheckConnectBlockTemplate` at `:4432`).  Supplying `None`
+        // `checkBlockPositional` is a method on the chain, and the
+        // `checkBlockHeaderPositional` it calls reads the chain's own
+        // fork rejection checkpoint and block index, so the check is
+        // live on this path (`validate.go:1302-1316`, reached through
+        // `checkBlockPositional` at `:1393-1414`, whose sole caller is
+        // `CheckConnectBlockTemplate` at `:4491`).  Supplying `None`
         // here made `ErrForkTooOld` structurally unreachable for the
         // one consumer dcrd has.
         //

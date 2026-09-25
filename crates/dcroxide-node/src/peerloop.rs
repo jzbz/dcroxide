@@ -71,8 +71,9 @@ pub enum DisconnectReason {
     Negotiate(String),
     /// A protocol violation with dcrd's reason string.
     Protocol(std::borrow::Cow<'static, str>),
-    /// Reading the next message failed (a closed connection or an idle
-    /// read timeout).
+    /// Reading the next message failed: a closed connection, an idle
+    /// read timeout, or a payload that ran out inside its message's
+    /// structure (a decode failure that is not a wire violation).
     ReadError(String),
     /// Writing a message failed.
     WriteError(String),
@@ -1221,6 +1222,10 @@ const READ_TIMED_OUT_TEXT: &str = "read timed out";
 /// `read_exact`), which is dcrd's `io.EOF`.
 const READ_EOF_TEXT: &str = "failed to fill whole buffer";
 
+/// The wire codec's text for Go's `io.EOF`: a payload that ends on a
+/// field boundary (`WireError::Eof`).
+const CODEC_EOF_TEXT: &str = "EOF";
+
 /// The read error dcrd's `inHandler` would log, at error, as "Can't
 /// read message from %s: %v" for the way a connection's input loop
 /// ended, if any (`peer/peer.go:1556-1561` over `shouldHandleReadError`,
@@ -1245,9 +1250,15 @@ const READ_EOF_TEXT: &str = "failed to fill whole buffer";
 /// texts, and `std`'s rendering of an OS error with its `(os error N)`
 /// suffix.  A payload that runs out inside the message's structure is
 /// not a socket failure but a decode one, which dcrd's `BtcDecode`
-/// returns raw: `io.EOF` (silent) when the payload ends on a field
-/// boundary and `io.ErrUnexpectedEOF` (logged) when it ends inside a
-/// field.  The wire crate reports both as one error, which is logged.
+/// returns raw (`wire/message.go:482-485`): `io.EOF` (silent) when the
+/// payload ends on a field boundary and `io.ErrUnexpectedEOF` (logged)
+/// when it ends inside a field (`shortRead` at `wire/common.go:131-137`,
+/// and `io.ReadFull` alike).  The wire crate tells the two apart
+/// (`WireError::Eof` renders `EOF`, `WireError::UnexpectedEof` renders
+/// `unexpected EOF`), and the transport passes either on as a read
+/// error that is not a wire violation, so neither is banned.  This
+/// function logs `unexpected EOF` as dcrd does and declines `EOF`, as
+/// dcrd's `errors.Is(err, io.EOF)` does (`peer/peer.go:1063-1065`).
 fn read_error_to_log(reason: &DisconnectReason, cancelled: bool) -> Option<&str> {
     let DisconnectReason::ReadError(message) = reason else {
         return None;
@@ -1256,7 +1267,7 @@ fn read_error_to_log(reason: &DisconnectReason, cancelled: bool) -> Option<&str>
         return None;
     }
     match message.as_str() {
-        READ_TIMED_OUT_TEXT | READ_EOF_TEXT => None,
+        READ_TIMED_OUT_TEXT | READ_EOF_TEXT | CODEC_EOF_TEXT => None,
         socket if socket.contains("(os error ") => None,
         codec => Some(codec),
     }
@@ -2099,6 +2110,48 @@ mod tests {
         // A socket error from the OS.
         let reset = DisconnectReason::ReadError(std::io::Error::from_raw_os_error(104).to_string());
         assert_eq!(read_error_to_log(&reset, false), None);
+    }
+
+    /// A payload that runs out inside its message's structure is not a
+    /// wire violation, and whether dcrd logs it depends on where it
+    /// runs out.  dcrd's `BtcDecode` returns the raw reader error: a cut
+    /// on a field boundary is `io.EOF`, which `shouldHandleReadError`
+    /// declines (`peer/peer.go:1063-1065`), and a cut inside a field is
+    /// `io.ErrUnexpectedEOF`, logged as `Can't read message from %s:
+    /// unexpected EOF`.  A `ping` framed with a short payload hits each.
+    #[test]
+    fn a_payload_cut_on_a_field_boundary_is_not_logged() {
+        use std::io::Write as _;
+
+        let ping_frame = |payload: &[u8]| {
+            let mut frame = Vec::with_capacity(MESSAGE_HEADER_SIZE + payload.len());
+            frame.extend_from_slice(&NET.0.to_le_bytes());
+            let mut command = [0u8; 12];
+            command[..4].copy_from_slice(b"ping");
+            frame.extend_from_slice(&command);
+            frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            frame.extend_from_slice(&dcroxide_chainhash::hash_b(payload)[..4]);
+            frame.extend_from_slice(payload);
+            frame
+        };
+        for (payload, text, logged) in [
+            (&[][..], "EOF", false),
+            (&[1u8, 2, 3, 4][..], "unexpected EOF", true),
+        ] {
+            let (conn, _remote, mut client) = loopback_pair();
+            let mut transport = WireTransport::new(conn, MAX_PROTOCOL_VERSION, NET);
+            transport.set_read_budget(Some(Duration::from_secs(5)));
+            client.write_all(&ping_frame(payload)).expect("write frame");
+            let err = transport.read_message().expect_err("the nonce is short");
+            assert!(!err.wire_violation, "{}", err.message);
+            assert_eq!(err.message, text);
+            let reason = DisconnectReason::ReadError(err.message);
+            assert_eq!(
+                read_error_to_log(&reason, false).is_some(),
+                logged,
+                "{text}"
+            );
+        }
     }
 
     /// Hooks whose server answers a wire violation with `answer`.
