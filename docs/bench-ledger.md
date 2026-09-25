@@ -31,6 +31,14 @@ attributed to m1 as the only bench host to date, with specs read on
 Mainnet genesis to tip over loopback, one machine, fresh datadir per
 run, both nodes `--norpc`.
 
+These are loopback figures and do not describe operator IBD over a WAN.
+There, dcrd's 16-block in-flight window (`internal/netsync/manager.go:32-38`,
+`:1368`, ported exactly) is predicted to cap throughput near 9-16 blocks per
+round trip once RTT exceeds about 9 x the per-block processing time: ~34 ms
+for dcroxide at 3.8 ms/block (265 blk/s), ~26 ms for dcrd at 2.9 ms/block
+(342 blk/s). No netem-delay arm (e.g. 50 and 100 ms added on the loopback
+path) has been measured yet, so this crossover is unconfirmed.
+
 | date | machine | dcroxide commit | vs dcrd | corpus | result | source |
 |---|---|---|---|---|---|---|
 | 2026-07 | m1 | unrecorded (2.2.0-pre, at the ADR-0004 amendment) | 2.2.0-pre+452c1a6c3 (go1.26.5) | mainnet, ~1,100,400 blocks | syncer dcroxide: 2.47 h — 124 blk/s (from dcroxide), 2.51 h — 122 blk/s (from dcrd); syncer dcrd: 1.11 h — 276 blk/s, 1.02 h — 299 blk/s | ADR-0004 amendment |
@@ -117,10 +125,11 @@ each measurement on a fresh clone.
 ## Preserved baselines
 
 The datadir every figure above was read from, kept because opening a redb
-database is not a read-only act (quick-repair on open, and `Database::open`
-rolls the block files back when the metadata trails them). Probes open a
-fresh reflink clone of the snapshot; neither the original nor the snapshot
-is opened directly.
+database is not a read-only act (after an unclean stop redb runs a full
+repair on open -- quick-repair is not enabled on flush commits, only on the
+commit `Database::close` ends with -- and `Database::open` rolls the block
+files back when the metadata trails them). Probes open a fresh reflink clone
+of the snapshot; neither the original nor the snapshot is opened directly.
 
 | date | machine | what | export | notes |
 |---|---|---|---|---|
@@ -145,6 +154,14 @@ in what is held open across the flushes.
 | date | machine | dcroxide commit | workload | arms | result |
 |---|---|---|---|---|---|
 | 2026-08-07 | m1 | `6a2951b` | 400k scattered writes, 8 commits, 8 MiB overlay, mainnet clone | none / all / two | Free-page curves identical. Flushes 1-2 byte-for-byte across all arms; flush 3 differs by 41,782 B (0.0008%) between `all` and `none`, in the direction opposite to pinning. Free pages fell 48.5 MiB while payload grew 20.4 MiB and the file did not grow. ADR-0004 lever (a) closed. |
+
+> **Correction (2026-09-23): the `two` arm was not measured.** This file is
+> append-only, so the row stands as written. `pinprobe` dropped the `two`
+> arm's reader after its second commit, not its second flush, and at these
+> parameters no flush had run by then, so the reader spanned no flush and
+> the arm was a second `none` control. The conclusion rests on `all` against
+> `none`. `pinprobe` now counts flushes, releases the reader after flush 2
+> and warns when fewer than two ran (`the_two_arm_reader_spans_two_flushes`).
 
 Each sampled flush costs about 206 s here, roughly half of it the
 `stats()` tree walk, so a three-arm run is around an hour.
@@ -185,6 +202,15 @@ durable metadata commit regardless.
 | 2026-08-11 | m1 | `49a53ef` | `sweep`: 5 arms x 3 reps, full mainnet, `--addrindex`, isolating the two operator-reachable knobs | **drift 1.00x.** `--utxocachemaxsize` alone carries the gain: utxo1200 **5490-6049 s, 0.88x — 12% faster**, utxo600 5608-6079 s, 0.93x, both **disjoint** from baseline 6332-6501 s. The page cache is correctly sized: db256 (1.01x) and db512 (1.00x) both **overlap** baseline, and 8192 was already 50% slower — so do not raise it, and nothing is gained by lowering it. |
 
 Raw records: `s2-*.jsonl` and `lever-sweep2.log`.
+
+> **Note (2026-09-23): the 2026-08-10 baseline rests on two runs.** The
+> warm-up discard was taken from the baseline arm, because repetition 1
+> always started there, so the baseline range 3866-3888 s comes from 2 runs
+> against 3 for every other arm. The 2026-08-11 sweep ran the same schedule
+> with a default of one warm-up; the row does not record whether it was
+> overridden, so its baseline range 6332-6501 s may rest on 2 runs as well.
+> `sweep` now runs warm-ups as extra runs before the first repetition
+> (`sweep_schedule`), so every arm keeps all its repetitions.
 
 **Absolute seconds are not comparable across sweeps.** The identical
 baseline configuration measured 3866-3888 s in the 2026-08-10 lever sweep
@@ -435,6 +461,15 @@ Two earlier churn figures in this file are superseded by these: a ">=276
 threads/second" measurement taken early in the chain, where blocks are too
 sparse to reach the 16-item parallel threshold, understated the steady-state
 rate by roughly an order of magnitude.
+
+**Open arm, unmeasured: a persistent pool.** All three arms above are
+`std::thread::scope` workers, created and joined on every `validate_items`
+call, so the adopted arm still creates 17,396–18,637 threads per 10 s. A
+long-lived pool of `cores` workers, which ADR-0005 originally proposed, would
+keep the full width without the per-call spawns, each batch reaching it
+through the same shared index and first-failure slot. This arm has not been
+measured; record it here whether or not it ships. `validate_items` carries
+the same note.
 
 ## IBD profiling attempt (2026-08-14) — and why replay cannot proxy for it
 
@@ -828,9 +863,11 @@ dcroxide also reads **99x** more during ingest (42.48 GiB against 0.43) — the
 B-tree fetching pages in order to copy them.
 
 **The wait channels name the mechanism.** dcroxide's blocked threads park in
-`folio_wait_bit_common` (729 samples, page writeback), `handle_reserve_ticket`
-(113, btrfs metadata reservation), `wait_for_commit` (101, transaction commit)
-and `btrfs_btree_wait_writeback_range` (27). dcrd's park in
+`folio_wait_bit_common` (729 samples, page I/O wait: a read waiting on
+PG_locked or writeback waiting on PG_writeback, which wchan cannot
+distinguish), `handle_reserve_ticket` (113, btrfs metadata reservation),
+`wait_for_commit` (101, transaction commit) and
+`btrfs_btree_wait_writeback_range` (27). dcrd's park in
 `folio_wait_bit_common` (159) and `barrier_all_devices` (95).
 
 So ADR-0004's hypothesis — "goleveldb's LSM commit is O(dirty) with background
@@ -1298,8 +1335,12 @@ IO layer, and asking a candidate engine the durability question needed a
 syscall-level shim that did not exist. **It exists now, and fjall passes.**
 
 [`tools/powerloss/`](../tools/powerloss/) — an `LD_PRELOAD` shim intercepting
+`open`/`open64`/`openat`, `write`, `writev`, `pwrite`/`pwrite64`, the `pwritev`
+family, `ftruncate`/`ftruncate64`, `fallocate`/`fallocate64`, `fsync` and
+`fdatasync`, plus a replay tool. (Until 2026-09-23 it intercepted only
 `open`/`openat`, `write`, `pwrite`/`pwrite64`, `ftruncate`, `fsync` and
-`fdatasync`, plus a replay tool. Every write to a file under
+`fdatasync`; every round in this ledger ran on that version. See the note at
+the end of the next entry.) Every write to a file under
 `$POWERLOSS_DIR` is preceded by a record of what it destroys (the overwritten
 bytes and the file's prior length); a successful sync of that file clears its
 pending records, because those bytes can no longer be taken by a power cut.
@@ -1391,6 +1432,29 @@ described as testing: they demonstrate that the ordering keeps block bytes
 durable ahead of the metadata that names them, which is the invariant's whole
 purpose. The per-path counts are what made the difference between inferring
 that and knowing it.
+
+**What these rounds did and did not show (2026-09-23).** The shim they ran
+on had gaps. It did not interpose `ftruncate64`, the symbol Rust's
+`File::set_len` calls, so neither redb's file growth nor `reconcileDB`'s
+truncation of block files was ever recorded. It did not interpose `writev`,
+`pwritev` or `fallocate` either. It silently dropped any overwrite of 64 KiB
+or more (a record within 12 bytes of that size overran its buffer
+instead), so a large redb page write was never undone. It put zeros back
+where a shrink had cut bytes off. And it never recorded a file as created,
+because it checked for the file after the `O_CREAT` open, so a never-synced
+new `.fdb` survived replay empty instead of vanishing. All five are fixed,
+and `dcroxide-testutil`'s `review_powerloss_shim` pins them end to end
+(`writev` through `write_vectored`; the `pwritev` family and `fallocate` have
+no case there). The shim still does not model directory durability (a
+missing parent-directory fsync after a create, unlink or rename; unlink and
+rename are not interposed at all), torn or reordered persistence within a
+file's unsynced writes, or writes through descriptors it never saw opened.
+So "three clean reopens, zero corruption" means the reopen raised no
+`ErrCorruption` against a tree the instrument had partly rewound. It did not
+compare the recovered UTXO set or the index tips against a reference node,
+and no round killed the node during a reorg or disconnect, the shutdown
+flush, the catch-up replay or an index drop. The rounds, and the fjall rounds above, need
+re-running with the fixed shim before they support more than that.
 
 ### fjall #308 and #311, exercised (2026-08-17)
 
@@ -1582,3 +1646,12 @@ measure ~12% and both act on the same durable commit through independent
 triggers. They may stack toward ~25%, or both may be approaching the same
 ceiling and together give ~12%. One more A/B answers it, and it is the obvious
 next experiment on this thread.
+
+> **Note (2026-09-23): the overlay is now counted as dcrd counts it.** Every
+> arm above ran with entries counted at key and value bytes only, which put
+> the figure 2-4x under the memory held for the small rows that dominate
+> this store. Each entry now also counts dcrd's 72-byte `nodeFieldsSize`
+> (`NODE_FIELDS_SIZE` in `dbcache.rs`), so both the default and the 800 MiB
+> setting now flush a smaller overlay than the one measured here. The +12.7%
+> and the 130 → 119 flush counts describe the old accounting; re-measure
+> before quoting them for current master.

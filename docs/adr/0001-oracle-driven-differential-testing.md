@@ -74,3 +74,21 @@ Nothing about the mechanism changed: one Go binary, line-delimited JSON on
 stdin/stdout, built on demand into the cargo target directory, with
 `DCROXIDE_REQUIRE_ORACLE=1` set in CI so a missing toolchain fails instead of
 skipping. The dcrd source tree is still not vendored as a submodule.
+
+## Addendum, 2026-09-23 — target and oracle pin both at `b9634e01`
+
+The addendum above is history: the parity target has since moved to
+`036b7090` and then to dcrd master `b9634e01` (still 2.2.0-pre), the pin
+`README.md`, `PARITY.md` and `DCRD_PARITY_COMMIT` now name, and
+`tools/oracle/go.mod` moved with it both times. Every module whose in-tree
+source at the target differs from its published tag is on the `b9634e01`
+pseudo-version (`chaincfg` and `blake256` joined that set after `452c1a6c`),
+and the `go.mod` comment records how the split was re-derived at the new
+commit rather than carried forward. So the exception the 2026-08-20 addendum
+describes is closed, and versions again move when the parity target moves.
+The interop harness had lagged instead: `DCRD_PARITY_COMMIT` and the dcrd
+commit CI builds for it both still named `29f17894` until 2026-09-23, so CI
+ran the interop tests against a daemon two pins behind and a dcrd built at
+the real pin was refused. `the_dcrd_pin_matches_ci_and_the_oracle`
+(`crates/dcroxide-testutil/src/lib.rs`) now fails if the harness pin, CI's
+`DCRD_COMMIT` and the commit `tools/oracle/go.mod` names disagree.

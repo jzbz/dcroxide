@@ -16,14 +16,25 @@ never actually requires pull-based streaming.
 `dcroxide-wire` decodes from byte slices via a `Cursor` (position-tracking
 view). `from_bytes` constructors return `(value, consumed)`; like dcrd's
 `Deserialize`/`FromBytes`, trailing bytes are not an error — framing is the
-caller's job. Both `io.EOF` and `io.ErrUnexpectedEOF` collapse into a single
-`WireError::UnexpectedEof` (dcrd distinguishes them internally but the
-distinction is not part of any compatibility surface; revisit if peer-facing
-error handling proves otherwise).
+caller's job. `Cursor::take` distinguishes Go's two short-read errors the way
+dcrd's readers over a byte reader do: `WireError::Eof` when a read finds no
+bytes left (`io.EOF`, `shortRead`'s `n == 0` case) and
+`WireError::UnexpectedEof` when it finds only part (`io.ErrUnexpectedEOF`).
+Both have an empty kind name, so P2P ban decisions treat them alike.
 
 Error variants map 1:1 to the dcrd `wire.ErrorCode` kinds reachable from each
-codec; message *text* parity is not chased unless it leaks into observable
-behavior (tracked in `PARITY.md`).
+codec. Their text is observable through `decoderawtransaction`,
+`sendrawtransaction`, `getrawtransaction`, `submitblock` and
+`sendrawmixmessage`, so every error the transaction, block header, block and
+mixing message decoders return renders dcrd's text exactly. That covers the
+io errors, and dcrd's `MessageError` `Func: Description` for coded errors
+(`wire/error.go:266-270`), including the shared `ReadVarInt`,
+`ReadVarBytes`, `readScript`, `ReadVarString` and `ReadAsciiVarString`
+readers. Kinds whose description varies by check carry a `MessageText`
+holding dcrd's `op` and format string verbatim. Kinds only the other P2P
+codecs raise, the `ErrMsgInvalidForPVer` gate and `ReadMessage`'s framing
+errors reach only logs, and print their kind name (`ErrWrongNetwork` aside,
+which renders dcrd's text).
 
 Two invariants follow from dcrd's canonical-varint enforcement and are locked
 in by fuzz targets and property tests for every codec:
@@ -61,5 +72,6 @@ cap alone for a while, and `read_message` now delegates to
 divergence table records the correction.
 
 The rest of the model held as written. `from_bytes` still returns
-`(value, consumed)`, `WireError::UnexpectedEof` still collapses Go's two EOF
-errors, and `dcroxide-wire` is still `no_std` outside of tests.
+`(value, consumed)`, Go's two EOF errors became distinct variants in the
+2026-09 review, because RPC clients see their text, and `dcroxide-wire` is
+still `no_std` outside of tests.

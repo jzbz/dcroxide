@@ -116,7 +116,14 @@ sweep with an eightfold page cache and an eightfold flush cadence, fill
 spanned 0.6450 to 0.6462, a spread of 0.0011. Lever (c) does raise free
 pages as predicted (8.40 GiB against 6.17), which is a cost rather than a
 gain. Their *throughput* claims remain unproven: that half of the sweep was
-voided by a 1.64x drift between two runs of the identical baseline. (d)
+voided by a 1.64x drift between two runs of the identical baseline. *Open,
+unmeasured, beside (b):* prefetching the leaves a flush's insert loop will
+copy. Run K read transactions in parallel over contiguous slices of the
+batch's sorted keys before `begin_durable_write`, so the reads are issued at
+queue depth K instead of 1. This is distinct from (b): it warms one flush's
+working set and does not enlarge the cache. It is worth building, behind a
+toggle for A/B syncs, only if the flush log's per-phase split shows the
+insert phase's time dominating with large `read_bytes`. (d)
 *shrink the dominant buckets* — **measured per bucket, and it is one bucket**:
 `spendjournalv3` carries 1.536 GiB of slack, 44% of the store's, measured on
 the per-table statistic. `existsaddridx` remains capped near 0.75 GiB and
@@ -429,12 +436,13 @@ number nobody can interpret. Neither is adjustable today in any case:
 the 1 GiB default.
 
 **Preserving the baseline.** Every figure in the amendment comes from one
-datadir, and opening it is not read-only — redb can quick-repair on open,
-and `Database::open` rolls the block files back when the metadata trails
-them (`lib.rs:882-884`). It has been reflink-cloned to
-`baseline-2026-07-25/` (btrfs, 22 s, no
-additional space); the clone is what probes open, and the original is not
-to be touched.
+datadir, and opening it is not read-only — redb runs a full repair on open
+after any unclean stop (corrected 2026-09-23: flush commits do not enable
+quick-repair; only the commit `Database::close` ends with does), and
+`Database::open` rolls the block files back when the metadata trails them
+(`reconcile_db` in `crates/dcroxide-database/src/lib.rs`). It has been
+reflink-cloned to `baseline-2026-07-25/` (btrfs, 22 s, no additional space);
+the clone is what probes open, and the original is not to be touched.
 
 ## Addendum, 2026-08-07 (second) — the reader hypothesis is measured dead
 
@@ -1327,8 +1335,11 @@ during ingest (42.48 GiB against 0.43): the B-tree fetching pages to copy
 them, a cost this ADR had not accounted for at all.
 
 **The wait channels name it.** dcroxide's blocked threads park in
-`folio_wait_bit_common` (page writeback), `handle_reserve_ticket` (btrfs
-metadata reservation), `wait_for_commit` (transaction commit) and
+`folio_wait_bit_common` (page I/O wait, read or writeback. The wait channel
+cannot tell them apart. The flush observer's per-phase time and thread
+`read_bytes`, added 2026-09-23, can: its `write_bytes` counts pages when they
+are dirtied, so writeback shows only as phase time), `handle_reserve_ticket`
+(btrfs metadata reservation), `wait_for_commit` (transaction commit) and
 `btrfs_btree_wait_writeback_range`. dcrd's park in `folio_wait_bit_common` and
 `barrier_all_devices`.
 

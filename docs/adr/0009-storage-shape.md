@@ -304,6 +304,11 @@ written wider than a kill test, and the wider half fails:
 > **10 rounds under real power loss, 10 consistent**, with a control
 > committing rows and markers separately caught in 4 of 8. fjall's durability
 > half now has the same standing as its size and write-shape halves.
+> *(2026-09-23: that shim missed `ftruncate64` (Rust's `set_len`),
+> `writev`/`pwritev`/`fallocate`, overwrites of 64 KiB or more and file
+> creation, and put zeros back where a shrink had cut bytes off; all are
+> fixed, but the fjall and dcroxide rounds cited here ran before the fix and
+> have not been re-run. See [bench-ledger.md](../bench-ledger.md).)*
 >
 > **Both blockers exercised 2026-08-17, and they diverge.** #308 **does not
 > reproduce**: with a transient journal write failure (1–3 writes failed, then
@@ -601,6 +606,30 @@ sold on IBD.
 > daemon**. It establishes the mechanism and its size, not an IBD prediction —
 > the same distinction that invalidated the 18% figure. So it is evidence for
 > the engine decision and not a throughput promise.
+>
+> **Key order is an unmeasured part of that cost** (2026-09-23). Seven
+> per-block buckets are keyed in an order that does not follow height.
+> `spendjournalv3`, `gcsfilters`, `hdrcmts`, `treasury` and
+> `ffldb-blockidx` are keyed by block hash. `stakeblockundo` and
+> `ticketsinblock` are keyed by little-endian height (dcrd's
+> `dbnamespace.ByteOrder`), which scatters consecutive heights just as a hash
+> does. Only `blockidxv3` starts with a big-endian height. A flush of B
+> consecutive blocks therefore reads, often cold, and rewrites about B
+> distinct leaves in each of these buckets; height-ordered keys would append
+> at the right edge with no reads. Together they hold 4.01 GB of the 6.07 GB
+> payload. That is a model, not a measurement. ADR-0004's lever (d)
+> re-keying kept the pseudo-random order and scored fill only, so it does
+> not settle this. The test: replay the captured `replay --writelog` journal
+> through engbench `writeshape` twice, once as captured and once with these
+> buckets re-keyed (big-endian height for the two stake buckets, big-endian
+> height || hash for the hash-keyed ones, with heights from the journal's
+> own `blockidxv3` keys). Compare write syscalls, bytes written, blocked
+> fraction and live-tree size, then run an alternating A/B daemon sync. One
+> cost is known in advance: redb's `insert` splits a leaf at its byte
+> midpoint (redb-4.3.0 `btree_base.rs:912`), so appended leaves settle near
+> 50% fill, against 0.61 under random keys. Acting on it is a deliberate
+> on-disk key-layout divergence from dcrd, invisible to peers, and needs a
+> database version bump with a migration or a resync.
 
 1. **Lever (d) on `spendjournalv3`.** ~~Prerequisite~~ **Measured**, by
    `redbstat --buckets`: the bucket holds a 2402-byte mean row against a

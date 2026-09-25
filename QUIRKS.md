@@ -1,6 +1,6 @@
 # Quirks ledger
 
-dcrd's behavior at the pinned upstream (master `036b7090`, version `2.2.0-pre`)
+dcrd's behavior at the pinned upstream (master `b9634e01`, version `2.2.0-pre`)
 is the specification — including where it deviates from written documentation
 (DCPs, `docs/`). Every intentional reproduction of such a deviation is recorded
 here, with a test pinning it so it cannot silently regress; where that test has
@@ -110,7 +110,12 @@ Entry format:
   match dcrd's under the same request ordering.
 - **Pinned by:** `rpchelp_vectors` (the `usage poisoned` row shows a
   websocket-flag request returning the previously cached
-  non-websocket text, which differs from the true websocket form)
+  non-websocket text, which differs from the true websocket form);
+  `racing_callers_on_a_cold_cache_agree_on_one_usage_text` in
+  `crates/dcroxide-rpc/tests/review_help_usage_race.rs` (an HTTP-flag
+  and a websocket-flag caller racing a cold cache both receive the
+  variant the first to take the lock generated, as dcrd's mutex held
+  across `RPCUsage` guarantees)
 
 ## QK-0006 — dcrd's ban score decay is platform-dependent
 
@@ -156,7 +161,8 @@ Entry format:
 - **Where:** dcrd `certgen` `NewEd25519TLSCertPair` / dcroxide-certgen
   `certgen.rs` `new_ed25519_tls_cert_pair`
 - **What:** the ECDSA generator converts a non-ASCII machine hostname
-  (and non-ASCII extra hosts) to ASCII with IDNA before placing them
+  (and non-ASCII extra hosts) to ASCII with Go's `idna.ToASCII` (the
+  bare Punycode profile, which keeps ASCII case) before placing them
   in the certificate, but the Ed25519 generator was written without
   that handling, so the raw hostname flows into the subject
   alternative name and Go's certificate marshaling rejects it: on a
@@ -168,7 +174,10 @@ Entry format:
   machine.
 - **Pinned by:** `certgen_vectors` (the `ed non-ascii-host` row pins
   the exact error text while the `ec idna` row pins the converted
-  names in the certificate bytes)
+  names in the certificate bytes; the `ec idna-case`, `ec idna-bidi`
+  and `ec idna-badpuny` rows pin the Punycode profile: ASCII case
+  kept, names UTS-46 refuses converted, and an invalid `xn--` label
+  as an error)
 
 ## QK-0008 — an invalid configured user agent is silently discarded
 
@@ -425,3 +434,324 @@ Entry format:
   others differed. The channel allocation turned up only on a sweep for
   consumers nobody had accounted for, and inverted the reading: the arithmetic
   the audit set out to fix is arithmetic dcrd never executes.
+
+## QK-0015 — a block linked by a fast-added parent skips the full context checks
+
+- **Where:** dcrd `internal/blockchain/process.go:366-396`
+  (`maybeAcceptBlocks`), `validate.go:1937-1940` (`checkBlockContext`'s
+  cache short circuit) and `chain.go:1219-1230` (the reorganization attach
+  loop) / dcroxide-blockchain `process.rs` `maybe_accept_blocks`,
+  `reorganize_chain_internal`, `RecentContextChecks`
+- **What:** `ProcessBlock` sets `BFFastAdd` when the processed block is an
+  assumed-valid ancestor or arrives in bulk import mode
+  (`process.go:518-522`), and passes the same flags to `maybeAcceptBlocks`
+  for every block the new data links, including stored descendants that
+  are not assumed-valid ancestors themselves. Each of them is
+  context-checked with `BFFastAdd`, which skips transaction finality, vote
+  and revocation eligibility, and the treasury spend interval and expiry
+  checks, and its hash goes into `recentContextChecks`. The descendant is
+  never marked validated, so the attach loop calls `checkBlockContext` with
+  `BFNone` for it, but that call returns early on the cache hit. The
+  full-flag context checks therefore never run for such a block;
+  `checkConnectBlock` still does.
+- **Why reproduced:** consensus verdict parity. Without the cache the port
+  ran the full-flag checks on attach and could reject a block dcrd
+  accepts: a block right after the assume-valid block, stored before that
+  block arrived.
+- **Pinned by:** `process::tests::recent_context_checks_is_a_bounded_lru_set`
+  and `process::tests::accepted_blocks_are_recorded_and_invalidation_forgets_them`
+  in `crates/dcroxide-blockchain/src/process.rs`, which pin the cache and
+  its wiring. The fast-add interaction itself has no crafted-block test.
+
+## QK-0016 — the new-rules unmarking of failed blocks never reaches disk
+
+- **Where:** dcrd `internal/blockchain/chainio.go:1494-1502`
+  (`loadBlockIndex`) and `:1776-1793` (`initChainState`),
+  `blockindex.go:733-751` (`addNodeFromDB`) and `:1411` (`Flush`) /
+  dcroxide-blockchain `process.rs` `load_chain_state`,
+  `Chain::open_with_interrupt`
+- **What:** when new consensus rules are detected, `loadBlockIndex` clears
+  `statusValidateFailed`/`statusInvalidAncestor` on blocks whose median
+  time is at or after the new rules' start time. `initChainState` then
+  flushes the block index "since blocks may have been unmarked" before it
+  advances the deployment version. The nodes go in through
+  `addNodeFromDB`, which never marks them modified, so that flush finds an
+  empty modified set and writes nothing: the cleared statuses live in
+  memory only, although dcrd's comment says the flush saves them. After
+  the version advances, a second restart reloads the block as failed,
+  unless it was revalidated or had its ticket info reloaded (which marks
+  it modified) in the meantime.
+- **Why reproduced:** consensus and RPC parity. After the second restart
+  the block's stored status bytes, its `getchaintips` status, the
+  `ErrKnownInvalidBlock`/`ErrInvalidAncestorBlock` verdicts and its
+  eligibility for chain selection all follow the on-disk status, so
+  persisting the unmark would make the port accept and select blocks a
+  restarted dcrd refuses.
+- **Pinned by:** `the_new_rules_unmark_stays_in_memory_as_in_dcrd` in
+  `crates/dcroxide-blockchain/tests/blockindex_restart.rs`, which fails a
+  block, rewinds the stored deployment version, and checks that the open
+  running the pass clears the flag in memory while the next open reloads
+  it as failed.
+
+## QK-0017 — a tx-index drop interrupted between its last two commits can never finish
+
+- **Where:** dcrd `internal/blockchain/indexers/txindex.go:616-679`
+  (`dropBlockIDIndex`, `DropTxIndex`) / dcroxide-indexers `txindex.rs`
+  `drop_tx_index`, `drop_block_id_index`
+- **What:** the drop runs three write transactions: the batched flat drop
+  of `txbyhashidx`, then `dropBlockIDIndex`, which deletes `idbyhashidx`
+  and `hashbyididx`, then `dropIndexMetadata` (tip, version, drop marker).
+  `dropBlockIDIndex` fails with ffldb's `ErrBucketNotFound` when either
+  bucket is already gone, while `dropIndexMetadata` tolerates a missing
+  main bucket (`common.go:278-279`). A crash after the block-ID deletion
+  is durable and before the metadata removal is leaves the drop marker
+  behind, and every later resumed drop (`finishDrop` on a `--txindex`
+  start, or `--droptxindex`) then fails at `dropBlockIDIndex`. The
+  transaction index can then be neither dropped nor rebuilt without
+  editing the database by hand. The window is real: the block-ID deletion
+  removes two rows per indexed block (one in each bucket, about 2.2M on
+  mainnet) in one commit, which is likely to trip a cache flush, while the
+  small metadata commit right after it may not.
+- **Why reproduced:** tolerating the missing buckets would change only how
+  an otherwise permanent local failure resolves, and nothing a peer or RPC
+  client sees. It is still a change to dcrd's drop state machine, so it is
+  left as an explicit decision rather than taken silently.
+- **Pinned by:** `a_drop_resumed_after_the_block_id_buckets_went_fails_as_in_dcrd`
+  in `crates/dcroxide-indexers/src/txindex.rs` (two resumed drops both fail
+  with `BucketNotFound`, and the drop marker survives each).
+
+## QK-0018 — a template build keeps the pre-reorganization best snapshot
+
+- **Where:** dcrd `internal/mining/mining.go` `NewBlockTemplate`
+  (`best := g.cfg.BestSnapshot()` at `:1200`; the eligible-parents loop at
+  `:1265-1290`, which calls `ForceHeadReorganization` at `:1271` and then
+  sets only `prevHash = *newHead` at `:1288`) / dcroxide-mining
+  `generator.rs` `BlkTmplGenerator::new_block_template`
+- **What:** the best chain snapshot is taken once, before the
+  eligible-parents loop that may reorganize to a sibling tip with more
+  votes. After the reorganization only `prevHash` changes; vote
+  eligibility (`best.NextWinningTickets`, `:1723`), the ticket price filter
+  (`best.NextStakeDiff`, `:1629`) and the header's `FinalState`,
+  `PoolSize` and `SBits` (`:2274-2280`) all keep reading the old tip's
+  snapshot. The sibling's lottery winners differ from the old tip's, so
+  every vote on the new head fails the eligibility check, the build ends
+  with too few voters, and `handleTooFewVoters` (`:2178`) recycles the new
+  tip from a fresh snapshot.
+- **Why reproduced:** refreshing the snapshot after the reorganization
+  would accept the sibling's votes and build on it at the next height,
+  changing which templates the node produces in exactly the case dcrd
+  recycles.
+- **Pinned by:** `a_reorganized_build_keeps_the_old_snapshot_and_recycles_the_new_tip`
+  in `crates/dcroxide-mining/tests/review_template_queue.rs`, which fails
+  with a height-5001 template if `best` is re-read after the loop.
+
+## QK-0019 — the network time offset stops moving once 200 peers have reported
+
+- **Where:** dcrd `internal/blockchain/mediantime.go:141-155`
+  (`AddTimeSample`) / dcroxide-node `mediantime.rs`
+  `MedianTime::add_time_sample`
+- **What:** the median offset is recomputed only when the sample count is
+  odd and at least five, but the cap is 200, an even number. Once the cap
+  is reached, each new sample evicts the oldest and leaves the count at
+  200, so the offset never changes again for the life of the process. Each
+  source address (port included) contributes at most once. dcrd's own
+  comment calls this the buggy behaviour of Bitcoin Core, kept on purpose.
+- **Why reproduced:** the adjusted time feeds consensus (the +2 h
+  `ErrTimeTooNew` header limit) and the is-current latch. A node deriving
+  the offset differently would accept or reject near-future headers at a
+  different moment than its dcrd peers.
+- **Pinned by:** `median_time_matches_dcrd` in
+  `crates/dcroxide-node/src/mediantime.rs` (dcrd's `TestMedianTime` table,
+  including its capped-at-ten rows).
+
+## QK-0020 — dcrd never logs a failed peer write
+
+- **Where:** dcrd `peer` `outHandler` (`peer/peer.go:1786-1797`) and
+  `shouldLogWriteError` (`:1742-1758`) / dcroxide-node `peerloop.rs`
+  `run_peer_connection_with_stall` (the output thread)
+- **What:** on a failed write, `outHandler` calls `p.Disconnect()` and only
+  then asks `p.shouldLogWriteError(err)`. `shouldLogWriteError` returns
+  false whenever the disconnect flag is set, so "Failed to send message to
+  %s: %v" is dead code: no write failure is ever logged, including one
+  from the write deadline `writeMessage` sets (`:1037`). The code reads as
+  though temporary, non-EOF errors were meant to be logged.
+- **Why reproduced:** operator-visible log parity. A port that added the
+  line would log where dcrd is silent.
+- **Pinned by:** nothing. The absence of a log line is not observable to
+  the test suite, which has no log capture seam. The reasoning is recorded
+  in a comment at the output thread.
+
+## QK-0021 — dcrd never logs a failed socket read, and its idle-peer warning is dead
+
+- **Where:** dcrd `wire.ReadMessageN` (`wire/message.go:375-377`,
+  `:457-459`), `peer` `inHandler` (`peer/peer.go:1556-1567`) and
+  `shouldHandleReadError` (`:1054`) / dcroxide-node `peerloop.rs`
+  `read_error_to_log`
+- **What:** since `04fef0bf` ("wire: Optimize message reads"),
+  `ReadMessageN` reads the header and the payload through an
+  `io.LimitedReader` and replaces the error with `io.EOF` whenever the read
+  came up short (`if lr.N > 0 { err = io.EOF }`). A read deadline
+  expiring, a reset, a local close and a remote close mid-message all
+  reach `inHandler` as `io.EOF`. `shouldHandleReadError` declines
+  `io.EOF`, so "Can't read message from %s: %v" is never logged for a
+  socket failure. The "Peer %s no answer for %s -- disconnecting" warning,
+  which tests the error for a `net.Error` timeout, can never fire, so an
+  idle peer is dropped without a word. The `inHandler` code reads as though
+  timeouts and non-EOF socket errors were meant to be reported. "Can't read
+  message" remains only for codec failures, and not even for those when the
+  server's `OnRead` ban has already disconnected the peer (`BanPeer` calls
+  `Disconnect` inside `readMessage`), or when a payload ends on a field
+  boundary, since `BtcDecode` then returns `io.EOF` itself (the port still
+  logs that case; see PARITY.md's open gaps).
+- **Why reproduced:** operator-visible log parity. Porting the warning
+  would log a line on every idle disconnect, where dcrd is silent.
+- **Pinned by:** `read_failures_are_logged_as_dcrd_logs_them` (a real
+  transport timeout, a closed stream and an OS socket error log nothing; a
+  codec failure logs unless the teardown flag is up) and
+  `a_banned_wire_violation_is_not_logged_as_a_failed_read`, both in
+  `crates/dcroxide-node/src/peerloop.rs`.
+
+## QK-0022 — a banned onion peer is never refused before its handshake
+
+- **Where:** dcrd `server.go:2187-2205` (`handleBannedConn`) and
+  `:2752-2765` (`BanPeer`) / dcroxide-node `runtime.rs` `banned_conn_host`
+  (the outbound pre-handshake ban check in `serve_outbound_peer`)
+- **What:** dcrd keys the pre-handshake ban check on
+  `net.IP(remoteAddr.IP).String()`. For a Tor v3 address the IP field is
+  the 32-byte public key, which is neither IP length, and Go renders it as
+  `?` followed by its hex. `BanPeer` records the ban under the host of the
+  peer's `Addr()`, which is the `.onion` name. The two keys never match, so
+  a banned onion peer is dialed, handshaken and served again.
+- **Why reproduced:** P2P parity: dcroxide refuses and serves onion peers
+  exactly when dcrd does.
+- **Pinned by:** `an_onion_peer_gets_dcrds_address_forms` in
+  `crates/dcroxide-node/src/runtime.rs`.
+
+## QK-0023 — a failed `peers.json` load keeps the address counts it had reached
+
+- **Where:** dcrd `addrmgr/addrmanager.go:805-829` (`reset`) on
+  `loadPeers`' failure path (`:577-587`), with the counters raised in
+  `deserializePeers` (`:647` `a.nNew++`, `:663` `a.nTried++`) /
+  dcroxide-addrmgr `manager.rs` `AddrManager::reset`, `load_peers`
+- **What:** `reset` rebuilds the address index, the bucket maps and their
+  per-type statistics, and re-keys the manager, but it never touches `nNew`
+  or `nTried`. `deserializePeers` raises both while it walks the bucket
+  lists, and it can still fail afterwards: on a later bucket entry naming
+  an unknown address (`:642`, `:658`), or at the sanity checks for an
+  address with no references or one in both a new and a tried bucket
+  (`:669-680`). `loadPeers` then removes the file and calls `reset`, so the
+  process runs on the counts of a file it threw away, over an empty index.
+  `numAddresses()` (`nTried + nNew`) is the value `NeedMoreAddresses`
+  compares against 1000. That comparison gates dcrd's getaddr on every
+  outbound handshake (`server.go:2657`) and its seeder retry loop
+  (`server.go:3405`). `GetAddress` is unaffected because the bucket
+  statistics are reset.
+- **Why reproduced:** the counts decide whether dcrd asks peers and seeders
+  for addresses for the rest of the run, which peers can observe. With
+  1000 or more addresses counted before the failure, dcrd stops asking
+  entirely. The port zeroed both counters in `reset` and kept asking.
+  QK-0012 already reproduces this path's key derivation bit for bit.
+- **Pinned by:** `a_failed_load_keeps_the_counts_dcrd_keeps` in
+  `crates/dcroxide-addrmgr/tests/review_peers_load.rs`. The file has 1000
+  new addresses, one of them also tried. The load fails, the index is
+  empty, `n_new`/`n_tried` stay at 1000/1, and `need_more_addresses` is
+  false.
+- **How found:** the 2026-09-23 review.
+
+## QK-0024 — a batch reply that fails to marshal stops dcrd reading the websocket client, which stays connected
+
+- **Where:** dcrd `internal/rpcserver` `wsClient.inHandler` batch arm
+  (`rpcwebsocket.go:1753-1758`) / dcroxide-node `websocket.rs`
+  `handle_ws_batch_entry`, `handle_ws_batch`, `serve_ws_reads`
+  (`WsOutcome::StopReading`) and `park_without_reading`
+- **What:** every other marshal failure in `inHandler` logs and
+  `continue`s, but the one after a batch entry's command has run is a bare
+  `return` out of `inHandler` itself. The replies already collected for the
+  batch are never sent and the entries after it never run. Nothing reads
+  the client again, and because the `return` skips the trailing
+  `c.Disconnect()` (`:1800`), the connection stays open and registered: its
+  subscriptions stay in place, `outHandler` keeps delivering
+  notifications, and it keeps its `rpcmaxwebsockets` slot until a write
+  fails or the server shuts down (`Run`'s select, `:2019-2023`). The
+  single-request arm's `serviceRequest` only logs and drops such a reply
+  (`:1821-1826`). Two things make `MarshalResponse` fail there: an id of
+  `true`, `[]` or `{}`, which `dcrjson.Request` accepts into its
+  `interface{}` ID and `NewResponse` refuses (`IsValidIDType`), open to any
+  authenticated client; and a result `json.Marshal` refuses, such as
+  getvoteinfo's `0/0` choice progress.
+- **Why reproduced:** RPC wire parity. A client that batches requests must
+  see the same thing from both daemons: no reply to the batch and none to
+  anything sent after it, while notifications keep arriving; replying to
+  the other entries would be a visible divergence. The cost is dcrd's own
+  and no more than an idle client's: dcrd sets no read deadline on
+  websocket connections, so an authenticated client can hold one open
+  indefinitely anyway, and a parked client holds the same websocket slot
+  and the same two threads an idle one does.
+- **Pinned by:** `a_batch_reply_that_fails_to_marshal_stops_reading_the_client`
+  and `a_single_reply_that_fails_to_marshal_is_only_dropped` in
+  `crates/dcroxide-node/tests/review_ws_batch_marshal.rs`.
+
+## QK-0025 — a websocket client that authenticates in a batch keeps the 4 KiB read limit
+
+- **Where:** dcrd `internal/rpcserver` `wsClient.inHandler`
+  (`rpcwebsocket.go:1488-1497` single arm, `:1698-1716` batch arm) /
+  dcroxide-node `websocket.rs` `serve_ws_reads`, `handle_ws_single`
+- **What:** dcrd raises the gorilla read limit from
+  `websocketReadLimitUnauthenticated` (4 KiB) to
+  `websocketReadLimitAuthenticated` (16 MiB) only in the single-request
+  `authenticate` arm. The batch arm checks the same credentials and sets
+  `authenticated`/`isAdmin`, but never calls `SetReadLimit`. A client that
+  authenticates inside a batch therefore keeps the 4 KiB limit for the
+  rest of the connection: its first message over 4 KiB draws a 1009 close
+  and a disconnect. The code's own comment ("Increase the read limits for
+  authenticated connections") states the intent the batch arm misses.
+- **Why reproduced:** RPC wire parity. Which messages a batch-authenticated
+  client may send before being dropped is observable. Standard clients
+  authenticate with a Basic header or the single-request form and never
+  meet it.
+- **Pinned by:** `a_batch_authenticate_keeps_the_unauthenticated_read_limit`
+  in `crates/dcroxide-node/tests/review_ws_conn.rs`.
+
+## QK-0026 — a disconnected websocket client stays in the mix-message subscriptions
+
+- **Where:** dcrd `internal/rpcserver`
+  `wsNotificationManager.notificationHandler`, `notificationUnregisterClient`
+  case (`rpcwebsocket.go:563-573`) / dcroxide-node `websocket.rs`
+  `NodeNtfnMgr::remove_client`
+- **What:** when a client disconnects, dcrd deletes it from the block,
+  work, tspend, tx, winning-ticket and new-ticket maps and from `clients`,
+  but not from `mixNotifications`, which is cleared only by an explicit
+  `stopnotifymixmessages` (`:514-516`). Each client that ever ran
+  `notifymixmessages` therefore stays in that map for the life of the
+  process, and every mix message iterates it. dcrd's `QueueNotification`
+  refuses a disconnected client, so the stale entry is never observable.
+- **Why reproduced:** nothing observable changes either way, and the port
+  keeps dcrd's map shape rather than carry a divergence of its own, however
+  harmless. The port's stale entry is a `u64` session id; dcrd's keeps the
+  whole `*wsClient` alive.
+- **Pinned by:** `removing_a_client_clears_every_subscription_except_mix`
+  in `crates/dcroxide-node/src/websocket.rs`.
+
+## QK-0027 — an Ed25519 public key address has two string forms
+
+- **Where:** dcrd `txscript/stdaddr` `DecodeAddressV0`
+  (`addressv0.go:1165`) and `AddressPubKeyEd25519V0.String` /
+  dcroxide-txscript `stdaddr.rs` `decode_address_v0`
+- **What:** a version 0 public key address starts with an identifier byte
+  whose low bits name the signature type and whose high bit is the
+  secp256k1 Y-oddness flag. `DecodeAddressV0` masks the flag off before
+  testing the type (`sigType := decoded[0] & ^sigTypeSecp256k1PubKeyCompOddFlag`),
+  so an Ed25519 key, which has no oddness, is accepted with identifier
+  `0x81` as well as `0x01`, while `String` always writes `0x01`. Two
+  strings decode to one address, and the `0x81` form does not round-trip.
+  The secp256k1 forms (ECDSA and Schnorr) write the flag back, so each of
+  those has one string.
+- **Why reproduced:** `validateaddress` and every other RPC or option that
+  takes an address must accept exactly the strings dcrd accepts and print
+  the same canonical form.
+- **Pinned by:** `ed25519_pubkey_address_ignores_the_odd_flag` in
+  `crates/dcroxide-txscript/tests/review_ed25519_addr_odd_flag.rs`, whose
+  strings come from dcrd's `stdaddr` at the pin. The `address_decode` fuzz
+  target's round-trip assertion allows exactly this case.
+- **How found:** the `address_decode` fuzz target, within seconds of its
+  mode that builds well-formed base58check strings being added.

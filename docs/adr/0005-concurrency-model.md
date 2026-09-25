@@ -51,7 +51,15 @@ items, rather than rayon. Its width is **one worker per core**
 `runtime.NumCPU()*3` (`internal/blockchain/scriptval.go` 120): the port
 copied that count until 2026-08-14, when spawning OS threads at three per
 core measured slower than one per core — the measurement is recorded on
-`validate_items` itself.
+`validate_items` itself. The core count is probed once per process, in a
+`OnceLock`, because on Linux `available_parallelism` re-reads the cgroup quota
+files on every call; the probe runs after the inline return for batches of
+fewer than 16 items. A thread the OS refuses no longer aborts the node:
+workers start through `Builder::spawn_scoped`, spawning stops at the first
+refusal, and the calling thread drains what is left through the same
+work-stealing index (`validate_items_survives_refused_worker_threads`). dcrd's
+goroutines cannot fail to start, so this keeps dcrd's outcome rather than
+changing it.
 
 Two clauses of the proposal did hold and are load-bearing: no consensus crate
 is async, and chain state sits behind a single writer. One did not — the

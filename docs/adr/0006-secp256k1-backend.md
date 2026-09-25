@@ -43,11 +43,17 @@ risk R4.
 ## Addendum, 2026-07-26 — the split held
 
 The three backends named above are the ones the finished port uses.
-`crates/dcroxide-dcrec/Cargo.toml` depends on `secp256k1` 0.29 (imported
-under the alias `libsecp256k1`), `k256` 0.13, and `curve25519-dalek` 4, with
-dcrd's acceptance rules implemented in front of each rather than delegated to
-them. The escape hatch was never needed: the Schnorr path still runs on
-`k256`.
+At the time of this addendum, `crates/dcroxide-dcrec/Cargo.toml` depended on
+`secp256k1` 0.29 (imported under the alias `libsecp256k1`), `k256` 0.13 and
+`curve25519-dalek` 4, with dcrd's acceptance rules implemented in front of
+each rather than delegated to them. (2026-09-23: these have since moved to
+`secp256k1` 0.33.1, `k256` 0.14.0 and `curve25519-dalek` 5.0.0 per
+`Cargo.lock`, and [dependency-ledger.md](../dependency-ledger.md) tracks the
+current versions. Schnorr verification now computes `s*G + e*Q` with k256
+0.14's `MulByGeneratorVartime::mul_by_generator_and_mul_add_vartime`, one
+variable-time GLV/wNAF pass where dcrd runs `ScalarBaseMultNonConst`,
+`ScalarMultNonConst` and `AddNonConst`.) The escape hatch was never needed:
+the Schnorr path still runs on `k256`.
 
 The coverage the ratification gate asked for is only partly in place. All
 three verify paths are compared against dcrd live: `oracle_differential.rs`,
@@ -56,11 +62,22 @@ three verify paths are compared against dcrd live: `oracle_differential.rs`,
 `ed25519_*` commands over randomized keys, hashes, tampered scalars and
 malformed encodings, comparing verdicts, produced signatures and — where dcrd
 exposes them rather than returning a plain error — error kinds.
-The four fuzz targets under `fuzz/fuzz_targets/` — `dcrec_parse_der`,
+The four dcrec fuzz targets under `fuzz/fuzz_targets/` — `dcrec_parse_der`,
 `dcrec_pubkey_parse`, `dcrec_schnorr`, `dcrec_ed25519` — are property fuzzers,
 not differential ones: they call no oracle and assert only that parsing and
 signing never panic and that signatures round-trip. So the differential
 coverage is a fixed-iteration test battery and the fuzzing is single-sided;
 the extended differential-*fuzz* soak the gate names has not been run (CI
-gives each target 60 s, the nightly job 10 minutes). Ratifying D3 remains the
-project owner's call.
+gives each target 60 s, the nightly job 10 minutes). `dcrec_ed25519` signs
+only with `SecretKey::from_seed` keys, which are torsion-free, so it cannot
+reach the torsion divergence between agl's point negation and a
+scalar-negation verify that `verify_raw` guards against: building
+`a*B + T` keys and ground signatures needs `curve25519-dalek` and `sha2`,
+which the fuzz crate does not depend on directly. That key class is covered in
+`crates/dcroxide-dcrec/tests/edwards_differential.rs` instead, by a
+fixed-seed pair of witnesses (k = 0 and k = 5 mod 8) checked against both
+verification forms, oracle rows for all eight small-order points and their
+`a*B + T` composites at every residue of k mod 8, and a randomized sweep
+(`ed25519_random_torsion_keys_verify_as_agl_does`). Extending the fuzz target
+waits on a decision to add those two dependencies to `fuzz/Cargo.toml`.
+Ratifying D3 remains the project owner's call.

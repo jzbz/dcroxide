@@ -111,19 +111,62 @@ evaluating this code.
   client — is fixed: the server-wide lock is gone, and the per-client
   lock is now taken a field at a time where it is used, as dcrd takes
   its own, rather than across the whole request.
-- **Fuzzing reaches the leaf codecs and nothing else.** Twelve
-  `cargo-fuzz` targets run for 60 seconds apiece on every push to
-  `master` and every pull request, and for ten minutes apiece nightly:
-  wire framing, the `tx` and `blockheader` decoders, the script engine,
-  `chainhash` parsing, DER signature parsing, public-key parsing, the
-  Schnorr and Ed25519 suites, `uint256`, and BLAKE-256. That is six of
-  the thirty-two crates, and all six are stateless — decoders,
-  cryptographic arithmetic, and a script interpreter that is a pure
-  function of its inputs. The stateful surfaces are unfuzzed — the
-  JSON-RPC and websocket dispatch, the peer and sync state machines,
-  the mempool, the database — and those are where a reachable panic or
-  an unbounded allocation is most likely to survive review. No corpus
-  is committed (`fuzz/corpus` is ignored), so every run starts cold and
+- **Unauthenticated websocket clients can hold every websocket slot.**
+  The `/ws` upgrade needs no credentials: a client may authenticate
+  in-band later, and nothing makes it do so in time. From its upgrade it
+  counts against `rpcmaxwebsockets` (25 by default), and it has no read
+  deadline. So that many silent connections from any host that can reach
+  the RPC port lock every later websocket client out, dcrwallet included,
+  until they close. dcrd behaves identically: `WebsocketHandler` clears
+  the read deadline and counts the client before it authenticates
+  (`rpcwebsocket.go:109-130`). The port reproduces it rather than add an
+  authentication deadline dcrd does not have. The pre-authentication
+  admission pool bounds only the HTTP handshake; it releases the
+  connection once the upgrade completes. Bind the RPC listeners to
+  trusted interfaces, or firewall them, and raise `rpcmaxwebsockets` if
+  untrusted hosts can reach them.
+- **Descriptor use is several times dcrd's.** The daemon spends several
+  descriptors per peer and RPC connection where dcrd spends one, and
+  keeps a read handle open for every block file it has touched where
+  dcrd caps open block files at 25. It raises its soft `RLIMIT_NOFILE`
+  as dcrd does, so this matters only where an operator has set the hard
+  limit low, to a few thousand. There, a peer and RPC flood can exhaust
+  descriptors sooner than it would against dcrd. A block-file reopen
+  failing then latches the database fatal: the node keeps running and
+  answering RPC, but stops connecting blocks until it is restarted.
+  Details are in PARITY.md's open gaps.
+- **Fuzzing reaches the stateless parsers, not the state machines.**
+  Seventeen `cargo-fuzz` targets run for 60 seconds apiece on every push
+  to `master` and every pull request, and for ten minutes apiece
+  nightly: wire framing, decoded at every protocol version a peer can
+  negotiate (9 through 12); the `tx` and `blockheader` decoders, with
+  stake classification (`DetermineTxType` and the `Check*`/`Is*`
+  family) run over every decoded transaction; the script engine;
+  everything the RPC server does with a request before it
+  authenticates (the HTTP head parser, the mux's routing and redirect,
+  the websocket handshake's header and origin checks, and the discard
+  of a refused request's body, chunked decoding included); the
+  websocket frame reader; the JSON-RPC request path (Go-JSON
+  validation, batch splitting, request unmarshalling, the reply
+  envelope, and parameter decoding against each registered method's Go
+  types, which a mode that writes the envelope around the fuzzer's
+  `params` reaches); base58, base58check and address decoding (a mode
+  that check-encodes a chosen address ID and payload gets past the
+  checksum to the address dispatch); the chain database's stored-row
+  decoders; `chainhash` parsing; DER signature parsing; public-key
+  parsing; the Schnorr and Ed25519 suites; `uint256`; and BLAKE-256.
+  Stateless parsers still unfuzzed: the config-file and command-line
+  parser, which takes the operator's input rather than a peer's, GCS
+  filter decoding, and the ticket, index and address-manager stores.
+  The stateful surfaces are unfuzzed too — the JSON-RPC and websocket
+  dispatch, the peer and sync state machines, the mempool, the
+  database — and those are where a reachable panic or an unbounded
+  allocation is most likely to survive review. The targets build with
+  overflow checks on, `cargo fuzz`'s default, so a site where Go wraps
+  and the port writes a plain operator fails them even though the
+  release build wraps; that is the point, since such a site makes
+  debug and test builds disagree with the shipped binary. No corpus is
+  committed (`fuzz/corpus` is ignored), so every run starts cold and
   has to rediscover structure inside its budget. Those jobs are also
   the only sanitized build in CI, since `cargo fuzz` defaults to
   AddressSanitizer; neither the test suite nor a running node is run
@@ -153,8 +196,13 @@ evaluating this code.
   redb 4.2.0 shipped a fix for three of them, each with a regression
   test that names the issue: #1331, an unvalidated 5-bit page order
   that aborted the process, and #1332, a cyclic branch pointer reached
-  from ordinary reads, are now reported as corruption, and #1333, a
-  repair-path panic that left a file permanently unopenable, now
+  from ordinary reads, are now reported as corruption — as an error on a
+  point read of a UTXO row and on the UTXO stats walk; as absence on
+  other point reads, as ffldb's `Get` discards a store error; and on
+  other bucket walks by ending the store's side of the walk, as ffldb's
+  cursor treats an iterator error (before 2026-09-23 such a walk skipped
+  the error and spun forever on redb's repeated `PreviousIo`) — and
+  #1333, a repair-path panic that left a file permanently unopenable, now
   returns an error for the corrupt freed-page entry that caused it.
   Read-path checksum verification is not in 4.3.0: reads do not compare
   page checksums, which redb checks only when `check_integrity` or
@@ -184,7 +232,7 @@ of separately re-deriving what happens to an honest peer under load,
 which is now a standing question in the review rather than an
 afterthought. In the same campaign, five comments were found asserting
 the opposite of what the code beneath them did — and a later sweep
-retired twelve more — — including one that
+retired twelve more — including one that
 justified a coarse server-wide lock as dcrd's own per-request locking,
 where dcrd takes no server-wide lock at all. Comments in this
 repository are claims, not evidence. (That lock has since been removed:

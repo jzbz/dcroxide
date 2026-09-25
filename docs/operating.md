@@ -43,11 +43,15 @@ whose failure may have left the store in a state that a restart silently
 rolls back, which is worse for a consensus daemon than stopping. Two things
 follow for an operator. A node that has stopped making progress with
 `ErrFatal` in its log has a storage problem, not a network one. And **a
-non-zero exit after "Flushing the block database to disk..." means the
-shutdown flush failed** — the on-disk chain state is behind what the node
-was running with, and the next start may refuse to make progress, so
-investigate the storage before restarting rather than restarting into the
-same fault.
+non-zero exit with `Unable to flush the block database` in the log means
+the shutdown flush failed.** The on-disk chain state is the last flush that
+completed: an older, consistent state that the next start replays forward
+from, so no chain data is lost. What failed is the storage, so investigate
+it before restarting rather than restarting into the same fault. (The
+`Flushing the block database to disk...` line is gone; dcrd logs nothing at
+INF there. The shutdown now reads `Server shutting down`, `Server shutdown
+complete`, `Gracefully shutting down the block database...`, `Shutdown
+complete`.)
 
 Pair it with a memory limit. A websocket client that subscribes and then
 stops reading grows node memory without bound; the notification queues
@@ -57,13 +61,29 @@ credentials, but a `MemoryMax=` (or the container equivalent) plus the
 restart policy above bounds the damage from a subscriber you do not
 control.
 
+After an unclean stop (abort, SIGKILL, OOM kill, power loss), the next start
+repairs the metadata store before the chain loads. It logs this under BCDB
+as "Detected unclean shutdown of the metadata store - Repairing..." followed
+by "Metadata store repair N% complete" lines. The repair reads the whole
+metadata file up to three times, so on a mainnet-sized store expect a
+noticeably slower start (not yet measured). A clean shutdown does not need
+it: the node closes its database at exit.
+
 ## Fresh sync only — a dcrd data directory will not work
 
 dcroxide does not read dcrd's on-disk format. There is no migration from
 an existing dcrd data directory, and pointing it at one is not a
-supported configuration. Syncing from genesis is the accepted default
-(ADR-0004's C6 stance); `addblock`-format import is the bulk path when
-you already have the blocks.
+supported configuration. It is refused rather than adopted. A block
+directory (`blocks_ffldb`, dcrd's name) that holds dcrd's `metadata/` store
+stops the node at startup with "database already exists at the provided
+path: <block directory>/metadata is a dcrd metadata store, and dcroxide
+cannot use a dcrd data directory -- give it a data directory of its own
+(see docs/operating.md)", pointing here, before any of dcrd's block files
+are touched. Block files left with no metadata store at all are rolled back
+on the first start, as dcrd itself would: every file after the first is
+deleted and the first is truncated. Syncing from genesis is the accepted
+default (ADR-0004's C6 stance); `addblock`-format import is the bulk path
+when you already have the blocks.
 
 The same holds if a future release changes the metadata store's on-disk
 format. There is no in-place upgrade. An old directory is *refused*, not
@@ -89,6 +109,17 @@ once each. What is not in doubt is the direction — the port has roughly
 halved its distance to dcrd since 2026-07 — and that it does the work at
 about half dcrd's CPU, 0.76 cores against 1.50. If your host is busy
 with other work, expect the sync to stretch more than dcrd's would.
+Both figures come from syncing over loopback from a local dcrd server, and
+neither has been measured over the internet. There, both daemons request
+blocks the same way: through dcrd's window of at most 16 blocks in flight,
+refilled once fewer than 10 remain, from the sync peer only. By that window
+arithmetic (a prediction, not a measurement), once the round trip to the
+sync peer exceeds about nine blocks' processing time, roughly 34 ms for
+dcroxide and 26 ms for dcrd on the bench-ledger machine, the sync should
+wait on the network at about 9-16 blocks per round trip, and the gap between
+the two should narrow toward 1x as latency grows. Budget from your link's
+latency as well as from these figures; the missing WAN measurement is
+recorded in [bench-ledger.md](bench-ledger.md).
 See [ADR-0004](adr/0004-storage-backend.md).
 
 The two have different explanations, and only one of them is settled. The
@@ -101,18 +132,23 @@ difference is commit shape, and as of 2026-08-15 that is measured rather
 than attributed: the node is fully stalled on storage — nothing runnable at
 all — for **48% of block-sync wall time**, against dcrd's 0.9%. A
 2026-08-16 run with the flush observer enabled puts **90–98% of that inside
-a metadata-flush window**, so it is the commit specifically rather than
-storage in general. (An earlier figure of 34.6% for the same runs was
+a metadata-flush window**, so it is the metadata flush specifically rather
+than storage in general. The flush window holds three phases: the
+block-file fsync, the insert loop, which reads leaves redb has not cached,
+and the redb commit. The flush log records each phase's time and the bytes
+the flushing thread read in it, which separates read waits from writeback
+waits. No mainnet run has been recorded with that split yet, so which phase
+stalls is still open. (An earlier figure of 34.6% for the same runs was
 count-weighted; the sampler is starved during the stalls it measures, and
 weighting by represented time raises it to 48–51%.) How much of it is
 *recoverable* was settled on 2026-08-16: moving the metadata commit off
 the block-connection thread was built, measured at 9.5% slower (232.1 to
 210.0 blk/s, with the stalled share rising from 48.1% to 53.7%), and
-reverted. The stall is real and it is the commit, but it is not
+reverted. The stall is real and it is the flush, but it is not
 recoverable by rescheduling *when* the commit runs — the remaining lever
-is what a commit costs. The earlier 18%
-figure came from a replay, which validates every block where a syncing
-daemon skips ~93% under assume-valid, so it understated the daemon's share.
+is what a flush costs. The earlier 18% figure came from a replay, which
+validates every block where a syncing daemon skips ~93% under assume-valid,
+so it understated the daemon's share.
 
 ## Storage tuning: two knobs help, one hurts, one is untested
 
@@ -160,8 +196,15 @@ cache fills or the metadata overlay does — and until now only the first was
 reachable. The overlay has its own ceiling, 100 MiB, and its own interval,
 300 seconds; both were fixed at compile time, so half the cadence lever could
 not be pulled. `DCROXIDE_DB_OVERLAY` sets the ceiling in MiB and
-`DCROXIDE_DB_FLUSH_SECS` the interval in seconds. Unset, both keep the
-compiled defaults, so an untouched node behaves exactly as before.
+`DCROXIDE_DB_FLUSH_SECS` the interval in seconds. The ceiling counts each
+overlay entry as dcrd does, at 72 bytes plus its key and value, so the
+configured MiB tracks the overlay's resident memory to within allocator
+overhead. Before 2026-09-23 entries were counted at key and value bytes
+only, which let the overlay hold 2–4× the configured figure. The 12.7%
+measurement for `DCROXIDE_DB_OVERLAY=800` below was taken under that older
+accounting, so the same setting now flushes a smaller overlay. Re-measure
+before relying on the figure or on the 130→119 flush count. Unset, both
+keep the compiled defaults, so an untouched node behaves exactly as before.
 
 **`DCROXIDE_DB_OVERLAY=800` measured 12.7% faster**, which makes it the
 second knob worth raising. Four alternating full-mainnet syncs, 256.1 and
@@ -222,7 +265,7 @@ configuration, every name changes.
 The chain itself lives under the home directory, not at it: `--datadir`
 defaults to `<home>/data` with the network appended, so on Linux the
 blocks are in `~/.dcroxide/data/mainnet` while `dcroxide.conf`,
-`rpc.cert`, `rpc.key` and `logs/` sit in `~/.dcroxide` itself.
+`rpc.cert` and `rpc.key` sit in `~/.dcroxide` itself.
 
 Those six are the only `DCROXIDE_*` variables read; only the first
 two have dcrd counterparts, since the page cache, the overlay and the
@@ -231,15 +274,28 @@ storage variables, `DCROXIDE_DB_CACHE` is the one to leave unset, the
 next two are untuned instruments — see the storage tuning above — and
 `DCROXIDE_DB_FLUSHLOG` is diagnostic: it appends one JSON object per
 metadata flush (sequence, end instant, duration, entries, bytes), which
-is how the 90–98% attribution above was measured. Leave it unset in
-normal operation; it writes a line inside each flush. A malformed or
-zero value in any of the tuning variables warns and falls back to the
-default rather than refusing to start, since they are hints. Everything
-else is a command-line flag or a `dcroxide.conf` entry, and the flag set
-is a verbatim port of dcrd's — same names, same semantics, and the same
-help text apart from the two environment annotations, which name
-`DCROXIDE_APPDATA` and `DCROXIDE_ALT_DNSNAMES` where dcrd's name
+is how the 90–98% attribution above was measured, and now also, for each of
+the flush's three phases (block-file sync, insert loop, commit), its time
+and, on Linux, the bytes the flushing thread read from storage and the bytes
+it dirtied in that phase. `write_bytes` counts pages when they are dirtied,
+not when they are written back, so writeback time shows in a phase's `ms`
+and not in its `write_bytes`, and the block-file sync always reads about 0
+there. Leave it unset in normal operation; it writes a line inside each
+flush. A malformed or zero value in any of the tuning variables warns and
+falls back to the default rather than refusing to start, since they are
+hints. Everything else is a command-line flag or a `dcroxide.conf` entry,
+and the flag set is a verbatim port of dcrd's — same names, same semantics,
+and the same help text apart from the two environment annotations, which
+name `DCROXIDE_APPDATA` and `DCROXIDE_ALT_DNSNAMES` where dcrd's name
 `DCRD_APPDATA` and `DCRD_ALT_DNSNAMES`.
+
+There is no log file yet. `--logdir` (default `<home>/logs`), `--logsize`
+and `--nofilelogging` are parsed and validated as dcrd's are, but the
+rotating log file is not wired: standard output is the only sink, so
+capture it — journald under systemd, or a redirect or service wrapper
+elsewhere. Under the Windows service control manager the process has no
+standard handles and every write is discarded, so a daemon run as a
+service keeps no log at all until the log file is wired.
 
 The daemon generates `rpc.cert` and `rpc.key` in the application home
 directory — alongside `dcroxide.conf`, not under `data/` — on first

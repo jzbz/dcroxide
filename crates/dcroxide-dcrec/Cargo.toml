@@ -17,13 +17,14 @@ default = ["std"]
 # identity, and byte encoding is identical either way, which the crate's own
 # vectors run in both configurations.
 #
-# k256's `std` and `precomputed-tables` are deliberately left off.  The
-# Schnorr code multiplies with `ProjectivePoint::GENERATOR * s`, which goes
-# through `lincomb` and never reads the basepoint table -- only
-# `mul_by_generator` reads it, joined in 0.14 by `mul_by_generator_vartime`,
-# and the Schnorr code calls neither -- so the tables bought
-# nothing, and from 0.14 `k256/std` also pulls an OS RNG (getrandom) into a
-# crate that never draws randomness.
+# k256's `std` and `precomputed-tables` are deliberately left off.  Schnorr
+# signing multiplies with `ProjectivePoint::GENERATOR * k`, which goes
+# through `lincomb`.  Verification uses `mul_by_generator_and_mul_add_vartime`,
+# a GLV/wNAF pass over the generator and the key.  Neither reads the
+# basepoint table -- only `mul_by_generator` and `mul_by_generator_vartime`
+# do, and the Schnorr code calls neither -- so the tables bought nothing,
+# and from 0.14 `k256/std` also pulls an OS RNG (getrandom) into a crate
+# that never draws randomness.
 std = ["libsecp256k1/std"]
 
 [dependencies]

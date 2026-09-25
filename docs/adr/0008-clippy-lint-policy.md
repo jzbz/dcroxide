@@ -7,11 +7,25 @@
 
 The workspace forbids `unsafe_code`, denies `missing_docs`, and warns
 `clippy::all` plus `clippy::arithmetic_side_effects`; CI escalates warnings
-to errors. CI escalates warnings
 to errors. That is clippy's default groups and two additions. Cuprate — the
 from-scratch Rust Monero node — instead curates roughly 280 lints at deny,
 adopted through a documented cold/warm/hot process, and keeps the lints it
 rejected as comments beside the ones it took so the reasoning survives.
+
+`arithmetic_side_effects` reaches none of the consensus crates. `blockchain`,
+`wire`, `txscript`, `stake`, `standalone`, `mempool`, `mining`, `uint256`,
+`chainhash`, `chaincfg`, `database`, `gcs`, `fees` and `base58` (and
+`testutil`) allow it crate-wide, so plain operators there are never linted.
+Release builds wrap on overflow (`overflow-checks = false`, pinned in
+`[profile.release]` and asserted for `release` and `dist` by
+`dcroxide-node/tests/panic_policy.rs`). Dev and test builds panic, so CI's
+`test-wrapping` job runs the whole suite a second time with
+`CARGO_PROFILE_DEV_OVERFLOW_CHECKS=false`. Open, and deferred: replacing the
+crate-level allows with per-site suppressions that carry a reason, and
+writing Go-wrapping arithmetic as explicit `wrapping_*` at Go's width, is a
+refactor across all of these crates and needs its own decision and
+sequencing (for example one crate at a time, turning the lint on as each is
+cleaned).
 
 The interesting question for a **port** is narrower than "which lints are
 good": which lints catch the mistakes that Go-to-Rust transcription
@@ -88,23 +102,30 @@ being unpredictable. Against an ordered map it is not: grinding a large
 hash is milliseconds, so an attacker's orphans were never evicted. Fixed by
 drawing the index from a CSPRNG.
 
-`SigCache` does the same thing correctly: it evicts
-`valid_sigs.keys().next()` from a **`HashMap`**, where `RandomState` is
-seeded per map, so the victim is arbitrary and untargetable — exactly
-dcrd's property, and documented as such at the call site.
+`SigCache` had the same bug in a hashed container. It evicted
+`valid_sigs.keys().next()` from a **`HashMap`**, on the assumption that
+`RandomState` made the victim arbitrary. `RandomState` only randomizes which
+key lands in which bucket; hashbrown iteration always starts at bucket zero.
+The victim was therefore always the lowest occupied bucket, the front of the
+table drained, and each new entry was evicted by the next add. It now draws
+a uniform index into a key vector with a keyed hash
+(`crates/dcroxide-txscript/src/sigcache.rs`). The rule: neither an ordered
+nor a hashed container's iteration order is an adversary-proof arbitrary
+pick. Draw one.
 
-Converting that `HashMap` to a `BTreeMap` in the name of determinism would
-manufacture the orphan bug. Ordered containers are the right default for
-anything whose iteration is observable; they are the *wrong* choice where
-the code needs an adversary-proof arbitrary pick. The distinction is the
-rule, not the container.
+Converting a `HashMap` to a `BTreeMap` in the name of determinism does not
+supply that draw; it only trades one predictable victim for another, and
+the orphan pool shows how cheaply a sorted one is ground. Ordered containers
+are the right default for anything whose iteration is observable; neither
+kind is a substitute where the code needs an adversary-proof arbitrary
+pick. The distinction is the rule, not the container.
 
 ### Adopted, sequenced
 
 - **`iter_over_hash_type`** — cheap ratchet, not a bug-finder, and worth
   saying why. The consensus crates hold no hash containers at all:
   `dcroxide-blockchain` is 69 ordered containers to 0 hashed,
-  `dcroxide-mining` 66 to 0, `dcroxide-mempool` 26 to 0, `dcroxide-mining` 66 to 0, `dcroxide-mempool` 26 to 0; `stake`,
+  `dcroxide-mining` 66 to 0, `dcroxide-mempool` 26 to 0; `stake`,
   `chaincfg`, `chainhash`, `wire`, `uint256`, `dcrec` and `crypto` hold
   neither kind, and `standalone`, `gcs` and `fees` hold only ordered ones. All 33 source hits are in
   P2P, RPC, mixing and node code — 18 in `dcroxide-mixing/src/mixpool.rs`,
@@ -114,8 +135,8 @@ rule, not the container.
   escapes — `addrmgr` writes `peers.json` entry order, and picks which
   `StallReason` is reported) or `#[expect]` with a stated reason (where it
   provably cannot). Note the blind spot: it fires only on `for` loops, so
-  the `keys().next()` calls discussed above are invisible to it in both
-  the correct and the incorrect case.
+  the `.next()` picks discussed above were invisible to it, the
+  `HashMap` one included.
 - **`allow_attributes`** — 104 sites, all outer attributes, dominated by
   `too_many_arguments` (49), `arithmetic_side_effects` (14) and
   `missing_docs` (11). Migrating them to `#[expect]` makes a suppression
