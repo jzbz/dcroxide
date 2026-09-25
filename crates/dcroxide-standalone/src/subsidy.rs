@@ -34,6 +34,43 @@ pub trait SubsidyParams {
     fn votes_per_block(&self) -> u16;
 }
 
+/// A borrowed parameter source answers exactly as the source it
+/// borrows, so a cache can be built over a reference
+/// (`SubsidyCache<&Params>`) the way dcrd builds one over a
+/// `*chaincfg.Params` pointer.
+impl<T: SubsidyParams + ?Sized> SubsidyParams for &T {
+    fn block_one_subsidy(&self) -> i64 {
+        (**self).block_one_subsidy()
+    }
+    fn base_subsidy_value(&self) -> i64 {
+        (**self).base_subsidy_value()
+    }
+    fn subsidy_reduction_multiplier(&self) -> i64 {
+        (**self).subsidy_reduction_multiplier()
+    }
+    fn subsidy_reduction_divisor(&self) -> i64 {
+        (**self).subsidy_reduction_divisor()
+    }
+    fn subsidy_reduction_interval_blocks(&self) -> i64 {
+        (**self).subsidy_reduction_interval_blocks()
+    }
+    fn work_subsidy_proportion(&self) -> u16 {
+        (**self).work_subsidy_proportion()
+    }
+    fn stake_subsidy_proportion(&self) -> u16 {
+        (**self).stake_subsidy_proportion()
+    }
+    fn treasury_subsidy_proportion(&self) -> u16 {
+        (**self).treasury_subsidy_proportion()
+    }
+    fn stake_validation_begin_height(&self) -> i64 {
+        (**self).stake_validation_begin_height()
+    }
+    fn votes_per_block(&self) -> u16 {
+        (**self).votes_per_block()
+    }
+}
+
 /// The available variants for subsidy split calculations (dcrd
 /// `SubsidySplitVariant`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

@@ -89,6 +89,7 @@ fn txindex_tip(db: Database, chain: &Arc<Mutex<Chain>>) -> (i64, dcroxide_chainh
         params,
         true,
         false,
+        &dcroxide_node::indexes::IndexLogs::default(),
     )
     .expect("start indexes");
     indexes

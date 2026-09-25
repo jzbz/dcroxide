@@ -117,7 +117,7 @@ fn a_large_exists_addresses_never_holds_the_index_mutex() {
     ));
     let queryer = Arc::new(NodeChainQueryer::new(Arc::clone(&chain), params.clone()));
 
-    let mut subscriber = IndexSubscriber::new(Interrupt::default());
+    let mut subscriber = IndexSubscriber::new(Interrupt::default(), None);
     let index = ExistsAddrIndex::new(
         &mut subscriber,
         Arc::new(db),

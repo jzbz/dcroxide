@@ -376,6 +376,7 @@ version = "0.1.0"
 dependencies = [
  "dcroxide-chainhash",
  "dcroxide-crypto",
+ "dcroxide-standalone",
  "dcroxide-testutil",
  "dcroxide-uint256",
  "dcroxide-wire",

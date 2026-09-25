@@ -20,7 +20,7 @@ use std::sync::Arc;
 use dcroxide_blockchain::UtxoEntry;
 use dcroxide_blockchain::utxoview::UtxoView;
 use dcroxide_blockchain::validate::{
-    ChainSubsidyParams, check_transaction_inputs, count_total_sig_ops, is_finalized_transaction,
+    check_transaction_inputs, count_total_sig_ops, is_finalized_transaction,
     validate_transaction_scripts,
 };
 use dcroxide_chaincfg::mainnet_params;
@@ -74,7 +74,7 @@ struct FakeChain {
     treasury_agenda_err: bool,
     // The wall clock recovered from dcrd's emitted template.
     adjusted_time: i64,
-    subsidy_cache: RefCell<SubsidyCache<ChainSubsidyParams<'static>>>,
+    subsidy_cache: RefCell<SubsidyCache<&'static dcroxide_chaincfg::Params>>,
     script_flags: ScriptFlags,
 }
 
@@ -370,7 +370,7 @@ fn newtemplate_vectors() {
         connect_err: false,
         treasury_agenda_err: false,
         adjusted_time: 0,
-        subsidy_cache: RefCell::new(SubsidyCache::new(ChainSubsidyParams(params))),
+        subsidy_cache: RefCell::new(SubsidyCache::new(params)),
         script_flags: harness_flags,
     };
     let policy = MiningPolicy {
@@ -622,7 +622,7 @@ fn empty_generator(
         connect_err: false,
         treasury_agenda_err: false,
         adjusted_time: 1,
-        subsidy_cache: RefCell::new(SubsidyCache::new(ChainSubsidyParams(params))),
+        subsidy_cache: RefCell::new(SubsidyCache::new(params)),
         script_flags: ScriptFlags(ScriptFlags::VERIFY_CLEAN_STACK.0),
     };
     let policy = MiningPolicy {

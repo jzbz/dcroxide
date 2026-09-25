@@ -655,7 +655,7 @@ fn open_metadata(
 /// was not shut down cleanly is logged as it runs.  That repair reads
 /// the whole metadata file up to three times (redb-4.3.0 `db.rs:1473`)
 /// and would otherwise be a silent stall after "Loading block database
-/// from disk...".  redb calls back at the start and at each scan
+/// from '...'".  redb calls back at the start and at each scan
 /// boundary (`db.rs:1474`, `:1492`, `:1539`, `:1653`), so this is a
 /// handful of lines.  `create` leaves it off: redb repairs every new
 /// file once, because a fresh header records no allocator state, and

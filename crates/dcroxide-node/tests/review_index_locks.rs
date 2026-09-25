@@ -57,6 +57,7 @@ fn start() -> (tempfile::TempDir, NodeIndexes) {
         params,
         true,
         true,
+        &dcroxide_node::indexes::IndexLogs::default(),
     )
     .expect("start indexes");
     (dir, indexes)

@@ -22,8 +22,8 @@ use dcroxide_dcrjson::{GoValue, Registry, parse_params};
 use dcroxide_rpc::handlers;
 use dcroxide_rpc::helpers::NoInterfaces;
 use dcroxide_rpc::server::{
-    Config, RpcBestState, RpcChain, RpcConnManager, RpcCpuMiner, RpcSubsidyParams, RpcSyncManager,
-    Server, SubmitBlockFailure,
+    Config, RpcBestState, RpcChain, RpcConnManager, RpcCpuMiner, RpcSyncManager, Server,
+    SubmitBlockFailure,
 };
 use dcroxide_rpc::websocket::{TemplateUpdateReason, WsClient, notify_work};
 use dcroxide_rpctypes::{method, register_all};
@@ -155,7 +155,7 @@ fn getwork_submission_releases_the_work_state_before_submitting() {
             header: block.header,
         },
         chain_params: params.clone(),
-        subsidy_cache: Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
+        subsidy_cache: Mutex::new(SubsidyCache::new(params.clone())),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(ProbingSyncMgr {

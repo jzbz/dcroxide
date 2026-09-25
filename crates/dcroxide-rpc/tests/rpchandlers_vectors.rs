@@ -16,9 +16,7 @@ use dcroxide_chaincfg::mainnet_params;
 use dcroxide_chainhash::Hash;
 use dcroxide_dcrjson::{GoType, GoValue, RPCError, Registry, gojson, parse_params};
 use dcroxide_rpc::handlers;
-use dcroxide_rpc::server::{
-    Config, RpcBestState, RpcChain, RpcChainTip, RpcSubsidyParams, RpcSyncManager, Server,
-};
+use dcroxide_rpc::server::{Config, RpcBestState, RpcChain, RpcChainTip, RpcSyncManager, Server};
 use dcroxide_rpctypes::chainsvrresults as results;
 use dcroxide_rpctypes::{method, register_all};
 use dcroxide_standalone::SubsidyCache;
@@ -365,9 +363,7 @@ fn handler_slice_matches_dcrd() {
         let server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
-                params.clone(),
-            ))),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params.clone())),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(StubSyncManager),

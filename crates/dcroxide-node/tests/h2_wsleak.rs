@@ -31,7 +31,7 @@ use dcroxide_node::rpcrun::{
 use dcroxide_node::runtime::ConnectedPeers;
 use dcroxide_node::websocket::NodeNtfnMgr;
 use dcroxide_rpc::helpers::NoInterfaces;
-use dcroxide_rpc::server::{Config, RpcSubsidyParams, Server};
+use dcroxide_rpc::server::{Config, Server};
 use dcroxide_standalone::SubsidyCache;
 use dcroxide_wire::PROTOCOL_VERSION;
 
@@ -83,7 +83,7 @@ fn serve_ws(max_websockets: usize) -> (tempfile::TempDir, RpcListener, u16, Node
     let mut server = Server::new(Config {
         chain: NodeRpcChain::new(chain, params.clone()),
         chain_params: params.clone(),
-        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params.clone())),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool))),

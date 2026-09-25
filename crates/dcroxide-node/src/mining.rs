@@ -19,7 +19,6 @@ use dcroxide_blockchain::process::Chain;
 use dcroxide_blockchain::utxoview::UtxoView;
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
-use dcroxide_mempool::PoolSubsidyParams;
 use dcroxide_mining::{TemplateBest, TemplateChain, TemplateTxSource, TxMiningView, VoteDesc};
 use dcroxide_standalone::{SubsidyCache, SubsidySplitVariant};
 use dcroxide_txscript::ScriptFlags;
@@ -39,7 +38,7 @@ pub struct NodeTemplateChain {
     /// The subsidy cache the input checks consume (dcrd's config
     /// carries `s.subsidyCache`; the daemon seams each own one over
     /// the same params, which is result-identical).
-    subsidy_cache: SubsidyCache<PoolSubsidyParams>,
+    subsidy_cache: SubsidyCache<Params>,
     /// The memoized disapproved-tip view this adapter's fetches share
     /// (dcrd `disapprovedView`), so one template build disconnects the
     /// tip's regular tree once rather than once per transaction.
@@ -49,7 +48,7 @@ pub struct NodeTemplateChain {
 impl NodeTemplateChain {
     /// Adapt the shared chain for the template generator.
     pub fn new(chain: Arc<Mutex<Chain>>, params: Params) -> NodeTemplateChain {
-        let subsidy_cache = SubsidyCache::new(PoolSubsidyParams(params.clone()));
+        let subsidy_cache = SubsidyCache::new(params.clone());
         NodeTemplateChain {
             chain,
             params,

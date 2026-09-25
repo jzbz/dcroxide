@@ -19,7 +19,7 @@
 use dcroxide_blockchain::UtxoEntry;
 use dcroxide_blockchain::chainio::SpentTxOut;
 use dcroxide_blockchain::utxoview::{UtxoView, collect_tx_hashes};
-use dcroxide_blockchain::validate::{ChainSubsidyParams, check_transactions_and_connect};
+use dcroxide_blockchain::validate::check_transactions_and_connect;
 use dcroxide_blockchain::{RuleError, RuleErrorKind};
 use dcroxide_chaincfg::simnet_params;
 use dcroxide_chainhash::Hash;
@@ -86,7 +86,7 @@ fn tx(inputs: Vec<TxIn>, outputs: usize) -> MsgTx {
 /// voters, treasury agenda inactive).
 fn subsidy(height: u32) -> i64 {
     let params = simnet_params();
-    let mut cache = SubsidyCache::new(ChainSubsidyParams(&params));
+    let mut cache = SubsidyCache::new(&params);
     let height = i64::from(height);
     cache.calc_work_subsidy_v3(height, 0, SubsidySplitVariant::Original)
         + cache.calc_treasury_subsidy(height, 0, false)
@@ -144,7 +144,7 @@ fn connect(
     resolver: &impl Fn(&OutPoint) -> Option<UtxoEntry>,
 ) -> Result<i64, RuleError> {
     let params = simnet_params();
-    let mut subsidy_cache = SubsidyCache::new(ChainSubsidyParams(&params));
+    let mut subsidy_cache = SubsidyCache::new(&params);
     let (mut prev_header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
     prev_header.height = block.header.height - 1;
     let hashes = collect_tx_hashes(&block.transactions);

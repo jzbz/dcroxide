@@ -14,9 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use dcroxide_blockchain::validate::{
-    ChainSubsidyParams, check_transaction_inputs, verify_tspend_signature,
-};
+use dcroxide_blockchain::validate::{check_transaction_inputs, verify_tspend_signature};
 use dcroxide_blockchain::{RuleError, UtxoEntry};
 use dcroxide_chaincfg::simnet_params;
 use dcroxide_stake::TxType;
@@ -53,7 +51,7 @@ fn kind_of(result: &Result<i64, RuleError>) -> String {
 #[test]
 fn txinputs_vectors() {
     let params = simnet_params();
-    let mut subsidy_cache = SubsidyCache::new(ChainSubsidyParams(&params));
+    let mut subsidy_cache = SubsidyCache::new(&params);
     // The dump uses a fixed header with only the height set.
     let (mut prev_header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");
     prev_header.height = 5000;

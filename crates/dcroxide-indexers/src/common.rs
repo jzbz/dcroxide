@@ -12,6 +12,7 @@ use dcroxide_database::{Database, Transaction};
 use dcroxide_wire::{BlockHeader, MsgBlock};
 
 use crate::error::{ErrorKind, IdxError, indexer_error};
+use crate::log::{LogLevel, LogSink, log_line};
 use crate::subscriber::IndexNtfn;
 
 /// The name of the db bucket used to house the current tip of each
@@ -119,8 +120,14 @@ pub trait Indexer: Send {
     /// be called when the index is synced.
     fn notify_sync_subscribers(&mut self);
 
-    /// Remove the index from the database (dcrd `IndexDropper`).
-    fn drop_index(&self, interrupt: &Interrupt, db: &Database) -> Result<(), IdxError>;
+    /// Remove the index from the database (dcrd `IndexDropper`),
+    /// logging the drop to `log` as dcrd logs it to the package logger.
+    fn drop_index(
+        &self,
+        interrupt: &Interrupt,
+        db: &Database,
+        log: Option<&LogSink>,
+    ) -> Result<(), IdxError>;
 }
 
 /// Construct a database error (dcrd `makeDbErr`).
@@ -249,7 +256,8 @@ pub(crate) fn exists_index(db: &Database, idx_key: &[u8]) -> Result<bool, IdxErr
 pub(crate) const MAX_DELETIONS_PER_BATCH: u64 = 2_000_000;
 
 /// Remove key/value pairs from a flat index over multiple database
-/// updates (dcrd `incrementalFlatDrop`).
+/// updates (dcrd `incrementalFlatDrop`), logging each batch that
+/// deleted anything as "Deleted N keys (M total) from <index>".
 ///
 /// `max_deletions` is dcrd's fixed 2,000,000 in every caller; it is a
 /// parameter so the batching itself can be exercised, which needs a cap
@@ -258,8 +266,11 @@ pub(crate) fn incremental_flat_drop(
     interrupt: &Interrupt,
     db: &Database,
     idx_key: &[u8],
+    idx_name: &str,
     max_deletions: u64,
+    log: Option<&LogSink>,
 ) -> Result<(), IdxError> {
+    let mut total_deleted: u64 = 0;
     let mut num_deleted = max_deletions;
     // Where the previous batch stopped.  dcrd's cursor is a pair of lazy
     // merged iterators, so it can restart from the beginning each batch
@@ -298,6 +309,15 @@ pub(crate) fn incremental_flat_drop(
                 let _ = db_tx.rollback();
                 return Err(IdxError::Db(err));
             }
+        }
+
+        if num_deleted > 0 {
+            total_deleted = total_deleted.saturating_add(num_deleted);
+            log_line(
+                log,
+                LogLevel::Info,
+                &format!("Deleted {num_deleted} keys ({total_deleted} total) from {idx_name}"),
+            );
         }
 
         if interrupt_requested(interrupt) {
@@ -361,20 +381,45 @@ pub(crate) fn drop_flat_index(
     interrupt: &Interrupt,
     db: &Database,
     idx_key: &[u8],
+    idx_name: &str,
+    log: Option<&LogSink>,
 ) -> Result<(), IdxError> {
     // Nothing to do if the index doesn't already exist.
     if !exists_index(db, idx_key)? {
+        log_line(
+            log,
+            LogLevel::Info,
+            &format!("Not dropping {idx_name} because it does not exist"),
+        );
         return Ok(());
     }
+
+    log_line(
+        log,
+        LogLevel::Info,
+        &format!("Dropping all {idx_name} entries.  This might take a while..."),
+    );
 
     // Mark that the index is in the process of being dropped so that
     // it can be resumed on the next start if interrupted before the
     // process is complete.
     mark_index_deletion(db, idx_key)?;
 
-    incremental_flat_drop(interrupt, db, idx_key, MAX_DELETIONS_PER_BATCH)?;
+    incremental_flat_drop(
+        interrupt,
+        db,
+        idx_key,
+        idx_name,
+        MAX_DELETIONS_PER_BATCH,
+        log,
+    )?;
 
-    drop_index_metadata(db, idx_key)
+    // Remove the index tip, version, bucket, and in-progress drop flag
+    // now that all index entries have been removed.
+    drop_index_metadata(db, idx_key)?;
+
+    log_line(log, LogLevel::Info, &format!("Dropped {idx_name}"));
+    Ok(())
 }
 
 /// Mark the index identified by `idx_key` for deletion (dcrd
@@ -419,7 +464,11 @@ pub(crate) fn tip(db: &Database, key: &[u8]) -> Result<(i64, Hash), IdxError> {
 
 /// Determine if the provided index is in the middle of being dropped
 /// and finish dropping it when it is (dcrd `finishDrop`).
-pub(crate) fn finish_drop(interrupt: &Interrupt, indexer: &dyn Indexer) -> Result<(), IdxError> {
+pub(crate) fn finish_drop(
+    interrupt: &Interrupt,
+    indexer: &dyn Indexer,
+    log: Option<&LogSink>,
+) -> Result<(), IdxError> {
     let db = indexer.db();
     let db_tx = db.begin(false)?;
     let drop = db_tx
@@ -437,7 +486,13 @@ pub(crate) fn finish_drop(interrupt: &Interrupt, indexer: &dyn Indexer) -> Resul
         return Err(indexer_error(ErrorKind::InterruptRequested, INTERRUPT_MSG));
     }
 
-    indexer.drop_index(interrupt, &db)
+    log_line(
+        log,
+        LogLevel::Info,
+        &format!("Resuming {} drop", indexer.name()),
+    );
+
+    indexer.drop_index(interrupt, &db, log)
 }
 
 /// Determine if the provided index has already been created and
@@ -486,8 +541,9 @@ pub(crate) fn upgrade_index(
     interrupt: &Interrupt,
     indexer: &dyn Indexer,
     genesis_hash: &Hash,
+    log: Option<&LogSink>,
 ) -> Result<(), IdxError> {
-    finish_drop(interrupt, indexer)?;
+    finish_drop(interrupt, indexer, log)?;
     create_index(indexer, genesis_hash)
 }
 
@@ -570,7 +626,8 @@ mod tests {
         tx.commit().expect("commit");
 
         let interrupt: Interrupt = Arc::new(core::sync::atomic::AtomicBool::new(false));
-        incremental_flat_drop(&interrupt, &db, idx_key, 7).expect("incremental drop");
+        incremental_flat_drop(&interrupt, &db, idx_key, "flat index", 7, None)
+            .expect("incremental drop");
 
         // The bucket itself is untouched by the walk; what must be gone
         // is every key in it.
@@ -588,5 +645,44 @@ mod tests {
         };
         tx.rollback().expect("rollback");
         assert_eq!(left, 0, "{left} of {KEYS} keys survived the batched walk");
+    }
+
+    /// Each batch that deleted anything logs its count and the running
+    /// total, and the final empty batch that ends a walk over an exact
+    /// multiple of the cap logs nothing (dcrd's `numDeleted > 0` guard).
+    #[test]
+    fn each_batch_logs_its_count_and_the_running_total() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = Options::new(dir.path().join("db"), 0x12141c16);
+        let db = Database::create(&opts).expect("create");
+        let idx_key: &[u8] = b"flatidx";
+
+        let tx = db.begin(true).expect("begin");
+        {
+            let bucket = tx.metadata().create_bucket(idx_key).expect("create bucket");
+            for i in 0u32..21 {
+                bucket.put(&i.to_be_bytes(), b"v").expect("put");
+            }
+        }
+        tx.commit().expect("commit");
+
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_lines = Arc::clone(&lines);
+        let sink: LogSink = Arc::new(move |level, msg: &str| {
+            sink_lines
+                .lock()
+                .expect("lines")
+                .push((level, msg.to_string()));
+        });
+        let interrupt: Interrupt = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        incremental_flat_drop(&interrupt, &db, idx_key, "flat index", 7, Some(&sink))
+            .expect("incremental drop");
+
+        let want: Vec<(LogLevel, String)> =
+            ["7 keys (7 total)", "7 keys (14 total)", "7 keys (21 total)"]
+                .iter()
+                .map(|counts| (LogLevel::Info, format!("Deleted {counts} from flat index")))
+                .collect();
+        assert_eq!(*lines.lock().expect("lines"), want);
     }
 }

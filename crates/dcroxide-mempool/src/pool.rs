@@ -274,44 +274,6 @@ fn tree_for_type(tx_type: TxType) -> i8 {
     }
 }
 
-/// An owned subsidy parameter source over the chain parameters (the
-/// borrowing `ChainSubsidyParams` shape, owned so the pool can move
-/// across threads).
-pub struct PoolSubsidyParams(pub Params);
-
-impl dcroxide_standalone::SubsidyParams for PoolSubsidyParams {
-    fn block_one_subsidy(&self) -> i64 {
-        self.0.block_one_subsidy()
-    }
-    fn base_subsidy_value(&self) -> i64 {
-        self.0.base_subsidy
-    }
-    fn subsidy_reduction_multiplier(&self) -> i64 {
-        self.0.mul_subsidy
-    }
-    fn subsidy_reduction_divisor(&self) -> i64 {
-        self.0.div_subsidy
-    }
-    fn subsidy_reduction_interval_blocks(&self) -> i64 {
-        self.0.subsidy_reduction_interval
-    }
-    fn work_subsidy_proportion(&self) -> u16 {
-        self.0.work_reward_proportion
-    }
-    fn stake_subsidy_proportion(&self) -> u16 {
-        self.0.stake_reward_proportion
-    }
-    fn treasury_subsidy_proportion(&self) -> u16 {
-        self.0.block_tax_proportion
-    }
-    fn stake_validation_begin_height(&self) -> i64 {
-        self.0.stake_validation_height
-    }
-    fn votes_per_block(&self) -> u16 {
-        self.0.tickets_per_block
-    }
-}
-
 /// The optional fee-estimator hook (dcrd mempool `Config`'s
 /// `AddTxToFeeEstimation`/`RemoveTxFromFeeEstimation` closures): the
 /// pool notifies the estimator as transactions enter and leave the
@@ -403,7 +365,7 @@ pub struct TxPool<C: PoolChain> {
     /// The pool policy.
     pub policy: Policy,
     params: Params,
-    subsidy_cache: SubsidyCache<PoolSubsidyParams>,
+    subsidy_cache: SubsidyCache<Params>,
     last_updated_unix: i64,
 
     pool: BTreeMap<[u8; 32], Arc<TxDesc>>,
@@ -434,7 +396,7 @@ impl<C: PoolChain> TxPool<C> {
             chain,
             policy,
             params: params.clone(),
-            subsidy_cache: SubsidyCache::new(PoolSubsidyParams(params.clone())),
+            subsidy_cache: SubsidyCache::new(params.clone()),
             last_updated_unix: 0,
             pool: BTreeMap::new(),
             orphans: BTreeMap::new(),

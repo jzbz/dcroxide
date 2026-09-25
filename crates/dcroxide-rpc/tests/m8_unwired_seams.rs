@@ -22,7 +22,7 @@ use dcroxide_chainhash::Hash;
 use dcroxide_dcrjson::RpcId;
 use dcroxide_rpc::dispatch::{RPC_LIMITED, process_request};
 use dcroxide_rpc::helpers::NoInterfaces;
-use dcroxide_rpc::server::{Config, RpcBestState, RpcChain, RpcSubsidyParams, Server};
+use dcroxide_rpc::server::{Config, RpcBestState, RpcChain, Server};
 use dcroxide_standalone::SubsidyCache;
 use dcroxide_wire::PROTOCOL_VERSION;
 
@@ -58,7 +58,7 @@ fn unwired_server() -> Server<UnwiredChain> {
     Server::new(Config {
         chain: UnwiredChain,
         chain_params: params.clone(),
-        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params))),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params)),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(()),

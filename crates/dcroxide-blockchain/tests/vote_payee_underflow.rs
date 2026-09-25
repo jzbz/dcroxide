@@ -29,7 +29,7 @@
 use std::collections::BTreeMap;
 
 use dcroxide_blockchain::UtxoEntry;
-use dcroxide_blockchain::validate::{ChainSubsidyParams, check_vote_inputs};
+use dcroxide_blockchain::validate::check_vote_inputs;
 use dcroxide_chaincfg::mainnet_params;
 use dcroxide_stake::TxType;
 use dcroxide_standalone::{SubsidyCache, SubsidySplitVariant};
@@ -74,7 +74,7 @@ fn treasury_vote_bits_script() -> Vec<u8> {
 #[test]
 fn a_two_output_vote_with_a_treasury_payload_is_rejected_not_panicked() {
     let params = mainnet_params();
-    let mut subsidy_cache = SubsidyCache::new(ChainSubsidyParams(&params));
+    let mut subsidy_cache = SubsidyCache::new(&params);
     let data = include_str!("data/stakeinputs_vectors.txt");
 
     // The vectors' own utxo set, so the ticket the vote spends is the

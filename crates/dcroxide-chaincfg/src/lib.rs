@@ -14,7 +14,12 @@
 //! runs in its Go package init (ported as data sanity tests instead), the
 //! deprecated `Checkpoints` field no network sets, and the trivial getter
 //! methods dcrd needs to satisfy external interfaces (our fields are
-//! public).
+//! public).  The accessors that rename fields to satisfy an interface
+//! are the exception, each ported once as a trait impl for [`Params`]:
+//! the subsidy accessors behind `standalone.SubsidyParams` here, as the
+//! [`dcroxide_standalone::SubsidyParams`] impl, and the address-prefix
+//! accessors behind `stdaddr.AddressParamsV0` in `dcroxide-txscript`
+//! (which depends on this crate), as its `AddressParamsV0` impl.
 
 #![cfg_attr(not(test), no_std)]
 // This crate holds no hashed containers: every map and set in it is
@@ -502,6 +507,57 @@ impl Params {
             buf.extend_from_slice(&(payout.amount as u64).to_le_bytes());
         }
         dcroxide_crypto::blake256::sum256(&buf)
+    }
+}
+
+/// The chain parameters are the subsidy parameters, as dcrd's
+/// `*Params` satisfies `standalone.SubsidyParams` through its accessor
+/// methods (`params.go:678-750`, `BlockOneSubsidy` at `:809`).  This is
+/// the one mapping from parameter fields to subsidy inputs: block
+/// validation, the mempool, template generation, and the RPC server all
+/// build their subsidy caches over `Params` or `&Params`.
+impl dcroxide_standalone::SubsidyParams for Params {
+    /// dcrd `BlockOneSubsidy`.
+    fn block_one_subsidy(&self) -> i64 {
+        Params::block_one_subsidy(self)
+    }
+    /// dcrd `BaseSubsidyValue`.
+    fn base_subsidy_value(&self) -> i64 {
+        self.base_subsidy
+    }
+    /// dcrd `SubsidyReductionMultiplier`.
+    fn subsidy_reduction_multiplier(&self) -> i64 {
+        self.mul_subsidy
+    }
+    /// dcrd `SubsidyReductionDivisor`.
+    fn subsidy_reduction_divisor(&self) -> i64 {
+        self.div_subsidy
+    }
+    /// dcrd `SubsidyReductionIntervalBlocks`.
+    fn subsidy_reduction_interval_blocks(&self) -> i64 {
+        self.subsidy_reduction_interval
+    }
+    /// dcrd `WorkSubsidyProportion`: the pre-DCP0010 proportion, not
+    /// `work_reward_proportion_v2`.
+    fn work_subsidy_proportion(&self) -> u16 {
+        self.work_reward_proportion
+    }
+    /// dcrd `StakeSubsidyProportion`: the pre-DCP0010 proportion, not
+    /// `stake_reward_proportion_v2`.
+    fn stake_subsidy_proportion(&self) -> u16 {
+        self.stake_reward_proportion
+    }
+    /// dcrd `TreasurySubsidyProportion`.
+    fn treasury_subsidy_proportion(&self) -> u16 {
+        self.block_tax_proportion
+    }
+    /// dcrd `StakeValidationBeginHeight`.
+    fn stake_validation_begin_height(&self) -> i64 {
+        self.stake_validation_height
+    }
+    /// dcrd `VotesPerBlock`.
+    fn votes_per_block(&self) -> u16 {
+        self.tickets_per_block
     }
 }
 

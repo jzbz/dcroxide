@@ -16,43 +16,6 @@ use dcroxide_wire::{BlockHeader, Message, MsgBlock, MsgMixPairReq, MsgTx};
 
 use crate::rpcerrors::rpc_internal_err;
 
-/// The subsidy parameters adapter over owned chain parameters (the
-/// owned variant of the blockchain crate's `ChainSubsidyParams`).
-pub struct RpcSubsidyParams(pub Params);
-
-impl dcroxide_standalone::SubsidyParams for RpcSubsidyParams {
-    fn block_one_subsidy(&self) -> i64 {
-        self.0.block_one_subsidy()
-    }
-    fn base_subsidy_value(&self) -> i64 {
-        self.0.base_subsidy
-    }
-    fn subsidy_reduction_multiplier(&self) -> i64 {
-        self.0.mul_subsidy
-    }
-    fn subsidy_reduction_divisor(&self) -> i64 {
-        self.0.div_subsidy
-    }
-    fn subsidy_reduction_interval_blocks(&self) -> i64 {
-        self.0.subsidy_reduction_interval
-    }
-    fn work_subsidy_proportion(&self) -> u16 {
-        self.0.work_reward_proportion
-    }
-    fn stake_subsidy_proportion(&self) -> u16 {
-        self.0.stake_reward_proportion
-    }
-    fn treasury_subsidy_proportion(&self) -> u16 {
-        self.0.block_tax_proportion
-    }
-    fn stake_validation_begin_height(&self) -> i64 {
-        self.0.stake_validation_height
-    }
-    fn votes_per_block(&self) -> u16 {
-        self.0.tickets_per_block
-    }
-}
-
 /// The error text a server seam's trait default reports when the
 /// daemon has not wired that seam up.
 ///
@@ -494,7 +457,7 @@ pub struct Config<C> {
     /// The network parameters.
     pub chain_params: Params,
     /// The subsidy cache over the same parameters.
-    pub subsidy_cache: std::sync::Mutex<SubsidyCache<RpcSubsidyParams>>,
+    pub subsidy_cache: std::sync::Mutex<SubsidyCache<Params>>,
     /// The minimum relay fee in atoms (dcrd `MinRelayTxFee`).
     pub min_relay_tx_fee: i64,
     /// The maximum protocol version the server supports (drives

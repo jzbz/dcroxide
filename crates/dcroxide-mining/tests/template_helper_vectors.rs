@@ -14,7 +14,6 @@
 
 use std::collections::HashMap;
 
-use dcroxide_blockchain::validate::ChainSubsidyParams;
 use dcroxide_chaincfg::{Params, mainnet_params, simnet_params};
 use dcroxide_chainhash::Hash;
 use dcroxide_gcs::blockcf2::PrevScripter;
@@ -112,7 +111,7 @@ fn template_helper_vectors() {
                 } else {
                     None
                 };
-                let mut cache = SubsidyCache::new(ChainSubsidyParams(params));
+                let mut cache = SubsidyCache::new(params);
                 let tx = create_coinbase_tx(
                     &mut cache,
                     &[0x00, 0x00],
@@ -134,7 +133,7 @@ fn template_helper_vectors() {
                 let voters: u16 = f[3].parse().expect("voters");
                 let (want_tx, _) = MsgTx::from_bytes(&unhex(f[4])).expect("tx");
                 let nonce = extract_nonce(&want_tx.tx_out[1].pk_script);
-                let mut cache = SubsidyCache::new(ChainSubsidyParams(params));
+                let mut cache = SubsidyCache::new(params);
                 let tx = create_treasury_base_tx(&mut cache, height, voters, nonce)
                     .expect("treasurybase");
                 assert_eq!(raw_hex(&tx.serialize()), f[4], "{line}");

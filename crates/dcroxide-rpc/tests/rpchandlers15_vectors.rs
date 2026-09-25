@@ -17,7 +17,7 @@
 use dcroxide_chaincfg::mainnet_params;
 use dcroxide_chainhash::Hash;
 use dcroxide_rpc::helpers::NoInterfaces;
-use dcroxide_rpc::server::{Config, RpcBestState, RpcChain, RpcSubsidyParams, Server};
+use dcroxide_rpc::server::{Config, RpcBestState, RpcChain, Server};
 use dcroxide_rpc::websocket::{
     TemplateUpdateReason, WsClient, WsClientFilter, notify_block_connected,
     notify_block_disconnected, notify_for_new_tx, notify_mix_message, notify_new_tickets,
@@ -174,9 +174,7 @@ fn websocket_notifications_match_dcrd() {
         let server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
-                params.clone(),
-            ))),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params.clone())),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(()),

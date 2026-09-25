@@ -20,7 +20,6 @@ use alloc::vec::Vec;
 
 use dcroxide_blockchain::UtxoEntry;
 use dcroxide_blockchain::utxoview::UtxoView;
-use dcroxide_blockchain::validate::ChainSubsidyParams;
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_standalone::{SubsidyCache, SubsidySplitVariant};
@@ -309,7 +308,7 @@ pub struct BlkTmplGenerator<'p, C: TemplateChain, S: TemplateTxSource> {
     /// The chain parameters.
     pub params: &'p Params,
     /// The subsidy cache for coinbase and treasurybase construction.
-    pub subsidy_cache: SubsidyCache<ChainSubsidyParams<'p>>,
+    pub subsidy_cache: SubsidyCache<&'p Params>,
     /// The chain backend.
     pub chain: C,
     /// The transaction source.
@@ -332,7 +331,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         BlkTmplGenerator {
             policy,
             params,
-            subsidy_cache: SubsidyCache::new(ChainSubsidyParams(params)),
+            subsidy_cache: SubsidyCache::new(params),
             chain,
             tx_source,
             mining_time_offset,

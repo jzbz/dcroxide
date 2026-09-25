@@ -22,8 +22,8 @@ use dcroxide_dcrjson::{GoType, GoValue, RPCError, Registry, gojson, parse_params
 use dcroxide_rpc::handlers;
 use dcroxide_rpc::helpers::NoInterfaces;
 use dcroxide_rpc::server::{
-    Config, RpcChain, RpcConnManager, RpcMempoolTx, RpcSanityChecker, RpcSubsidyParams,
-    RpcTimeSource, RpcTxMempooler, RpcUtxoEntry, Server,
+    Config, RpcChain, RpcConnManager, RpcMempoolTx, RpcSanityChecker, RpcTimeSource,
+    RpcTxMempooler, RpcUtxoEntry, Server,
 };
 use dcroxide_rpctypes::chainsvrresults as results;
 use dcroxide_rpctypes::{method, register_all};
@@ -380,9 +380,7 @@ fn fee_and_node_info_handler_slice_matches_dcrd() {
         let server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
-                params.clone(),
-            ))),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params.clone())),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(()),

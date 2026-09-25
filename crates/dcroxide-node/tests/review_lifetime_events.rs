@@ -272,7 +272,7 @@ fn assume_valid_logs_dcrds_lines() {
         assert_eq!(status.code(), Some(1), "{text}");
         let at = position(&text, &line);
         assert!(
-            at < position(&text, "Block database loaded with best block height"),
+            at < position(&text, "[INF] CHAN: Loading block index..."),
             "{text}"
         );
         if old_forks {

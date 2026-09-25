@@ -27,9 +27,9 @@ use dcroxide_rpc::dispatch::process_request;
 use dcroxide_rpc::helpers::NoInterfaces;
 use dcroxide_rpc::helpers::threshold::State;
 use dcroxide_rpc::server::{
-    Config, RpcBestState, RpcChain, RpcConnManager, RpcDb, RpcMempoolTx, RpcSubsidyParams,
-    RpcSyncManager, RpcTxIndexEntry, RpcTxIndexer, RpcTxMempooler, RpcVerboseMempoolTx,
-    RpcVoteCounts, SendTxFailure, Server, SubmitBlockFailure, VoteInfoFailure,
+    Config, RpcBestState, RpcChain, RpcConnManager, RpcDb, RpcMempoolTx, RpcSyncManager,
+    RpcTxIndexEntry, RpcTxIndexer, RpcTxMempooler, RpcVerboseMempoolTx, RpcVoteCounts,
+    SendTxFailure, Server, SubmitBlockFailure, VoteInfoFailure,
 };
 use dcroxide_rpc::websocket::{WsClient, WsClientFilter, handle_rescan, lock_client};
 use dcroxide_rpctypes::{method, register_all};
@@ -267,7 +267,7 @@ fn server_with(sync: &'static MockSync) -> Server<MockChain> {
     Server::new(Config {
         chain: MockChain::default(),
         chain_params: params.clone(),
-        subsidy_cache: Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
+        subsidy_cache: Mutex::new(SubsidyCache::new(params.clone())),
         min_relay_tx_fee: 10000,
         max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
         sync_mgr: Box::new(sync),

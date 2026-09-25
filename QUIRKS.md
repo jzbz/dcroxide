@@ -469,7 +469,7 @@ Entry format:
   (`loadBlockIndex`) and `:1776-1793` (`initChainState`),
   `blockindex.go:733-751` (`addNodeFromDB`) and `:1411` (`Flush`) /
   dcroxide-blockchain `process.rs` `load_chain_state`,
-  `Chain::open_with_interrupt`
+  `Chain::open_with_config`
 - **What:** when new consensus rules are detected, `loadBlockIndex` clears
   `statusValidateFailed`/`statusInvalidAncestor` on blocks whose median
   time is at or after the new rules' start time. `initChainState` then

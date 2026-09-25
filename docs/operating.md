@@ -69,6 +69,21 @@ metadata file up to three times, so on a mainnet-sized store expect a
 noticeably slower start (not yet measured). A clean shutdown does not need
 it: the node closes its database at exit.
 
+The chain then replays the blocks the UTXO set had not yet flushed. As in
+dcrd, that replay runs between the CHAN lines "UTXO cache initializing (max
+size: N MiB)..." and "UTXO cache initialization completed", at the
+configured `--utxocachemaxsize`. A start that sits between those two lines
+is catching up, not hung.
+
+The enabled indexes then catch up to the chain tip, as in dcrd, between the
+INDX lines "Catching up from height X to Y" and "Caught up to height Y",
+with an "Indexed N blocks in the last ..." line every ten seconds, so a
+long catch-up shows its progress. `--droptxindex` and
+`--dropexistsaddrindex` log "Dropping all <index> entries.  This might take
+a while...", then "Deleted N keys (M total) from <index>" after each batch
+of up to 2,000,000 deletions, then "Dropped <index>". When the index is not
+there they log "Not dropping <index> because it does not exist" instead.
+
 ## Fresh sync only — a dcrd data directory will not work
 
 dcroxide does not read dcrd's on-disk format. There is no migration from

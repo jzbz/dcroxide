@@ -18,6 +18,7 @@ use crate::common::{
     notify_sync_subscribers, tip,
 };
 use crate::error::{ErrorKind, IdxError, indexer_error};
+use crate::log::LogSink;
 use crate::subscriber::{
     CONNECT_NTFN, DISCONNECT_NTFN, IndexNtfn, IndexSubscriber, IndexerHandle, NO_PREREQS,
     block_height,
@@ -329,6 +330,8 @@ impl ExistsAddrIndex {
 
         // Init.
         let interrupt = subscriber.interrupt();
+        let log = subscriber.log().cloned();
+        let log = log.as_ref();
         if crate::common::interrupt_requested(&interrupt) {
             return Err(indexer_error(
                 ErrorKind::InterruptRequested,
@@ -343,11 +346,11 @@ impl ExistsAddrIndex {
             };
             let borrowed = idx.lock().expect("indexer lock poisoned");
             // Finish any drops that were previously interrupted.
-            crate::common::finish_drop(&interrupt, &*borrowed)?;
+            crate::common::finish_drop(&interrupt, &*borrowed, log)?;
             // Create the initial state for the index as needed.
             crate::common::create_index(&*borrowed, &genesis_hash)?;
             // Upgrade the index as needed.
-            crate::common::upgrade_index(&interrupt, &*borrowed, &genesis_hash)?;
+            crate::common::upgrade_index(&interrupt, &*borrowed, &genesis_hash, log)?;
         }
 
         // Recover the exists address index and its dependents to the
@@ -610,13 +613,29 @@ impl Indexer for ExistsAddrIndex {
         notify_sync_subscribers(&mut self.subscribers);
     }
 
-    fn drop_index(&self, interrupt: &Interrupt, db: &Database) -> Result<(), IdxError> {
-        drop_exists_addr_index(interrupt, db)
+    fn drop_index(
+        &self,
+        interrupt: &Interrupt,
+        db: &Database,
+        log: Option<&LogSink>,
+    ) -> Result<(), IdxError> {
+        drop_exists_addr_index(interrupt, db, log)
     }
 }
 
 /// Drop the exists address index from the provided database if it
-/// exists (dcrd `DropExistsAddrIndex`).
-pub fn drop_exists_addr_index(interrupt: &Interrupt, db: &Database) -> Result<(), IdxError> {
-    drop_flat_index(interrupt, db, EXISTS_ADDR_INDEX_KEY)
+/// exists (dcrd `DropExistsAddrIndex`), logging its progress to `log`
+/// as dcrd logs it to the package logger (see [`LogSink`]).
+pub fn drop_exists_addr_index(
+    interrupt: &Interrupt,
+    db: &Database,
+    log: Option<&LogSink>,
+) -> Result<(), IdxError> {
+    drop_flat_index(
+        interrupt,
+        db,
+        EXISTS_ADDR_INDEX_KEY,
+        EXISTS_ADDRESS_INDEX_NAME,
+        log,
+    )
 }

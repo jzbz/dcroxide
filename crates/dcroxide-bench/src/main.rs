@@ -647,7 +647,7 @@ fn cmd_replay(args: &Args) -> Result<(), String> {
         params: params.clone(),
     });
     let interrupt: Interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut subscriber = IndexSubscriber::new(Arc::clone(&interrupt));
+    let mut subscriber = IndexSubscriber::new(Arc::clone(&interrupt), None);
     if want_tx_index {
         TxIndex::new(
             &mut subscriber,
@@ -870,7 +870,7 @@ fn cmd_indexcatchup(args: &Args) -> Result<(), String> {
     });
 
     let interrupt: Interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut subscriber = IndexSubscriber::new(Arc::clone(&interrupt));
+    let mut subscriber = IndexSubscriber::new(Arc::clone(&interrupt), None);
     let want_tx_index = args.get("txindex").is_some();
     let want_addr_index = args.get("addrindex").is_some();
     if !want_tx_index && !want_addr_index {

@@ -21,7 +21,7 @@ use dcroxide_chainhash::Hash;
 use dcroxide_dcrjson::{GoValue, RPCError, Registry, parse_params};
 use dcroxide_rpc::handlers;
 use dcroxide_rpc::server::{
-    Config, RpcBestState, RpcChain, RpcDb, RpcSubsidyParams, RpcTxIndexEntry, RpcTxIndexer, Server,
+    Config, RpcBestState, RpcChain, RpcDb, RpcTxIndexEntry, RpcTxIndexer, Server,
 };
 use dcroxide_rpctypes::{method, register_all};
 use dcroxide_standalone::SubsidyCache;
@@ -100,7 +100,7 @@ fn server<C: RpcChain>(
     Server::new(Config {
         chain,
         chain_params: params.clone(),
-        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params))),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params)),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(()),

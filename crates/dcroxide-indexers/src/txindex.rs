@@ -17,6 +17,7 @@ use crate::common::{
     notify_sync_subscribers, tip, upgrade_index,
 };
 use crate::error::{ErrorKind, IdxError, indexer_error};
+use crate::log::{LogLevel, LogSink, log_line};
 use crate::subscriber::{
     CONNECT_NTFN, DISCONNECT_NTFN, IndexNtfn, IndexSubscriber, IndexerHandle, NO_PREREQS,
     block_height,
@@ -392,6 +393,8 @@ impl TxIndex {
 
         // Init.
         let interrupt = subscriber.interrupt();
+        let log = subscriber.log().cloned();
+        let log = log.as_ref();
         if interrupt_requested(&interrupt) {
             return Err(indexer_error(ErrorKind::InterruptRequested, INTERRUPT_MSG));
         }
@@ -403,11 +406,11 @@ impl TxIndex {
             };
             let borrowed = idx.lock().expect("indexer lock poisoned");
             // Finish any drops that were previously interrupted.
-            finish_drop(&interrupt, &*borrowed)?;
+            finish_drop(&interrupt, &*borrowed, log)?;
             // Create the initial state for the index as needed.
             create_index(&*borrowed, &genesis_hash)?;
             // Upgrade the index as needed.
-            upgrade_index(&interrupt, &*borrowed, &genesis_hash)?;
+            upgrade_index(&interrupt, &*borrowed, &genesis_hash, log)?;
         }
 
         // Recover the tx index and its dependents to the main chain
@@ -434,6 +437,13 @@ impl TxIndex {
                 highest_known = test_block_id;
                 test_block_id = test_block_id.saturating_add(INCREMENT);
             }
+            log_line(
+                log,
+                LogLevel::Trace,
+                &format!(
+                    "Forward scan (highest known {highest_known}, next unknown {next_unknown})"
+                ),
+            );
 
             let found = if next_unknown == 1 {
                 // No used block IDs due to new database.
@@ -448,6 +458,14 @@ impl TxIndex {
                     } else {
                         next_unknown = test_block_id;
                     }
+                    log_line(
+                        log,
+                        LogLevel::Trace,
+                        &format!(
+                            "Binary scan (highest known {highest_known}, next unknown \
+                             {next_unknown})"
+                        ),
+                    );
                     if highest_known.saturating_add(1) == next_unknown {
                         break;
                     }
@@ -459,6 +477,11 @@ impl TxIndex {
         };
         idx.lock().expect("indexer lock poisoned").cur_block_id = cur_block_id;
 
+        log_line(
+            log,
+            LogLevel::Debug,
+            &format!("Current internal block ID: {cur_block_id}"),
+        );
         Ok(idx)
     }
 
@@ -598,8 +621,13 @@ impl Indexer for TxIndex {
         notify_sync_subscribers(&mut self.subscribers);
     }
 
-    fn drop_index(&self, interrupt: &Interrupt, db: &Database) -> Result<(), IdxError> {
-        drop_tx_index(interrupt, db)
+    fn drop_index(
+        &self,
+        interrupt: &Interrupt,
+        db: &Database,
+        log: Option<&LogSink>,
+    ) -> Result<(), IdxError> {
+        drop_tx_index(interrupt, db, log)
     }
 }
 
@@ -635,10 +663,23 @@ fn drop_block_id_index(db: &Database) -> Result<(), IdxError> {
 }
 
 /// Drop the transaction index from the provided database if it
-/// exists (dcrd `DropTxIndex`).
-pub fn drop_tx_index(interrupt: &Interrupt, db: &Database) -> Result<(), IdxError> {
+/// exists (dcrd `DropTxIndex`), logging its progress to `log` as dcrd
+/// logs it to the package logger (see [`LogSink`]).
+///
+/// Unlike the exists address index's drop, dcrd marks the drop in
+/// progress before announcing it, and the order is kept.
+pub fn drop_tx_index(
+    interrupt: &Interrupt,
+    db: &Database,
+    log: Option<&LogSink>,
+) -> Result<(), IdxError> {
     // Nothing to do if the index doesn't already exist.
     if !exists_index(db, TX_INDEX_KEY)? {
+        log_line(
+            log,
+            LogLevel::Info,
+            &format!("Not dropping {TX_INDEX_NAME} because it does not exist"),
+        );
         return Ok(());
     }
 
@@ -647,7 +688,20 @@ pub fn drop_tx_index(interrupt: &Interrupt, db: &Database) -> Result<(), IdxErro
     // process is complete.
     mark_index_deletion(db, TX_INDEX_KEY)?;
 
-    incremental_flat_drop(interrupt, db, TX_INDEX_KEY, MAX_DELETIONS_PER_BATCH)?;
+    log_line(
+        log,
+        LogLevel::Info,
+        &format!("Dropping all {TX_INDEX_NAME} entries.  This might take a while..."),
+    );
+
+    incremental_flat_drop(
+        interrupt,
+        db,
+        TX_INDEX_KEY,
+        TX_INDEX_NAME,
+        MAX_DELETIONS_PER_BATCH,
+        log,
+    )?;
 
     // Call extra index specific deinitialization for the transaction
     // index.
@@ -655,7 +709,10 @@ pub fn drop_tx_index(interrupt: &Interrupt, db: &Database) -> Result<(), IdxErro
 
     // Remove the index tip, version, bucket, and in-progress drop
     // flag now that all index entries have been removed.
-    drop_index_metadata(db, TX_INDEX_KEY)
+    drop_index_metadata(db, TX_INDEX_KEY)?;
+
+    log_line(log, LogLevel::Info, &format!("Dropped {TX_INDEX_NAME}"));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -696,7 +753,7 @@ mod tests {
 
         let interrupt: Interrupt = Arc::new(core::sync::atomic::AtomicBool::new(false));
         for attempt in 0..2 {
-            match drop_tx_index(&interrupt, &db) {
+            match drop_tx_index(&interrupt, &db, None) {
                 Err(IdxError::Db(err)) => assert_eq!(
                     err.kind,
                     dcroxide_database::ErrorKind::BucketNotFound,

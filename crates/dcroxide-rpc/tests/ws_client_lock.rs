@@ -25,7 +25,7 @@ use dcroxide_chaincfg::mainnet_params;
 use dcroxide_chainhash::Hash;
 use dcroxide_dcrjson::GoValue;
 use dcroxide_rpc::helpers::NoInterfaces;
-use dcroxide_rpc::server::{Config, RpcBestState, RpcChain, RpcSubsidyParams, Server};
+use dcroxide_rpc::server::{Config, RpcBestState, RpcChain, Server};
 use dcroxide_rpc::websocket::{WsClient, WsClientFilter, handle_rescan, lock_client};
 use dcroxide_standalone::SubsidyCache;
 use dcroxide_wire::{BlockHeader, MsgBlock};
@@ -112,7 +112,7 @@ fn server_with(chain: ParkingChain) -> Server<ParkingChain> {
     Server::new(Config {
         chain,
         chain_params: params.clone(),
-        subsidy_cache: Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
+        subsidy_cache: Mutex::new(SubsidyCache::new(params.clone())),
         min_relay_tx_fee: 10000,
         max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
         sync_mgr: Box::new(()),

@@ -174,12 +174,14 @@ fn wait_for_daemon_line(tag: &str, args: &[&str], wanted: impl Fn(&str) -> bool)
 #[test]
 fn startup_opens_block_database_and_loads_genesis() {
     // --nolisten because this test is about the database, not the network.
+    // The chain reports the tip it loaded in dcrd's closing CHAN line of
+    // the chain open (`chain.go:2534-2536`).
     let loaded = wait_for_daemon_line("db", &["--nolisten"], |line| {
-        line.contains("Block database loaded")
+        line.contains("[INF] CHAN: Chain state: ")
     });
     // A fresh database starts at the genesis block (height 0).
     assert!(
-        loaded.contains("best block height 0"),
+        loaded.contains("Chain state: height 0, hash "),
         "startup line: {loaded}"
     );
 }

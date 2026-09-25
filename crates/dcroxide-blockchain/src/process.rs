@@ -30,6 +30,7 @@ use crate::RuleError;
 use crate::blockindex::{BlockIndex, BlockStatus, NodeId, NodeStore};
 use crate::chainio::SpentTxOut;
 use crate::chainview_nodes::{NodeBranchView, NodeChainView};
+use crate::gotime::Stopwatch;
 use crate::notifications::{
     BlockAcceptedNtfnsData, BlockConnectedNtfnsData, BlockDisconnectedNtfnsData, LogCallback,
     LogLevel, Notification, NotificationCallback, ReorganizationNtfnsData, TicketNotificationsData,
@@ -41,9 +42,7 @@ use crate::thresholdstate::{
 };
 use crate::utxoentry::UtxoEntry;
 use crate::utxoview::{OutPointKey, UtxoView, count_spent_outputs};
-use crate::validate::{
-    ChainSubsidyParams, ForkRejection, check_block_header_positional, check_block_header_sanity,
-};
+use crate::validate::{ForkRejection, check_block_header_positional, check_block_header_sanity};
 
 /// Statistics on the current UTXO set (dcrd `UtxoStats`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -314,10 +313,10 @@ pub struct Chain {
     /// `recentContextChecks`).
     recent_context_checks: RecentContextChecks,
     /// The shutdown interrupt (dcrd `BlockChain.interrupt`, its
-    /// context's `Done` channel), set by [`Chain::open_with_interrupt`].
-    /// Only the startup UTXO catch-up checks it, as dcrd's
-    /// `UtxoCache.Initialize` does; the reorganization loops do not
-    /// (see [`Chain::reorganize_chain_internal`]).
+    /// context's `Done` channel), set at open from
+    /// [`OpenConfig::interrupt`].  Only the startup UTXO catch-up checks
+    /// it, as dcrd's `UtxoCache.Initialize` does; the reorganization
+    /// loops do not (see [`Chain::reorganize_chain_internal`]).
     interrupt: Option<Arc<AtomicBool>>,
     /// The adjusted-clock unix time the cached chain tips were last
     /// pruned (dcrd `blockIndex.cachedTipsLastPruned`, a wall-clock
@@ -425,6 +424,52 @@ pub fn stake_node_params(params: &Params) -> StakeNodeParams {
         stake_validation_begin_height: params.stake_validation_height,
         stake_enable_height: params.stake_enabled_height,
         ticket_expiry_blocks: params.ticket_expiry,
+    }
+}
+
+/// What [`Chain::open_with_config`] builds the chain from besides the
+/// database and the network: the parts of dcrd's `blockchain.Config`
+/// and `UtxoCacheConfig` that `New` reads before it returns.
+///
+/// The log sink and the UTXO cache size are here rather than set on the
+/// opened chain because dcrd has both in place before `New` runs: the
+/// package logger is installed at init (`log.go:85`) and the cache is
+/// built with its `MaxSize` ahead of `blockchain.New` (`server.go:4005`).
+/// So the open's own lines -- the block index load, the UTXO cache
+/// initialization and its catch-up replay, the chain state -- reach the
+/// sink, and the catch-up flushes at the configured size.
+pub struct OpenConfig {
+    /// The assumed valid block (dcrd `Config.AssumeValid`); the zero
+    /// hash disables it.
+    pub assume_valid: Hash,
+    /// Whether old fork rejection is disabled (dcrd
+    /// `Config.AllowOldForks`).
+    pub allow_old_forks: bool,
+    /// The creation time a fresh database records, as unix seconds.
+    pub created_unix: u64,
+    /// The shutdown interrupt (dcrd's `New` context; see
+    /// [`Chain::open_with_interrupt`]).
+    pub interrupt: Option<Arc<AtomicBool>>,
+    /// The package log sink (see [`Chain::set_log_callback`]); `None`
+    /// logs nothing, dcrd's `slog.Disabled` default.
+    pub log: Option<LogCallback>,
+    /// The maximum UTXO cache size in bytes (dcrd
+    /// `UtxoCacheConfig.MaxSize`).
+    pub utxo_cache_max_bytes: u64,
+}
+
+impl OpenConfig {
+    /// The configuration [`Chain::open`] uses: no interrupt, no log
+    /// sink, and dcrd's default 150 MiB UTXO cache.
+    pub fn new(assume_valid: Hash, allow_old_forks: bool, created_unix: u64) -> OpenConfig {
+        OpenConfig {
+            assume_valid,
+            allow_old_forks,
+            created_unix,
+            interrupt: None,
+            log: None,
+            utxo_cache_max_bytes: DEFAULT_UTXO_CACHE_MAX_BYTES,
+        }
     }
 }
 
@@ -577,6 +622,10 @@ impl Chain {
     /// which dcrd's `log.go:85` calls at init with the `CHAN` logger).
     /// Until one is installed the chain logs nothing, exactly as dcrd's
     /// `slog.Disabled` package default does.
+    ///
+    /// Installed here, after the chain is open, it misses the open's own
+    /// lines; [`OpenConfig::log`] installs it before them, which is when
+    /// dcrd's init has installed its logger.
     pub fn set_log_callback(&mut self, callback: LogCallback) {
         self.log_sink = Some(callback);
     }
@@ -645,10 +694,39 @@ impl Chain {
         created_unix: u64,
         interrupt: Option<Arc<AtomicBool>>,
     ) -> Result<Chain, crate::chaindb::ChainDbError> {
+        let mut config = OpenConfig::new(config_assume_valid, config_allow_old_forks, created_unix);
+        config.interrupt = interrupt;
+        Self::open_with_config(db, params, config)
+    }
+
+    /// [`Chain::open`] with the whole [`OpenConfig`]: the log sink and
+    /// the UTXO cache size are in force from the start, as dcrd's are
+    /// when `New` runs.
+    ///
+    /// The open logs dcrd's CHAN startup lines, at dcrd's levels and in
+    /// its order: "Loading block index..." and the debug "Block index
+    /// loaded in ..." around the index load (`chainio.go:1691`,
+    /// `:1716`), the debug fork rejection checkpoint and assumed valid
+    /// node lines (`process.go:86`, `chainio.go:1758`), "Deployment
+    /// version N loaded" (`:1570`), "UTXO cache initializing (max size: N
+    /// MiB)..." and "UTXO cache initialization completed" around the
+    /// catch-up replay (`utxocache.go:816`, `:854`, `:1039`), and the
+    /// version, best header and chain state lines that end
+    /// `blockchain.New` (`chain.go:2486-2537`).  A fresh database logs
+    /// them too, as dcrd's `initChainState` loads the state
+    /// `createChainState` has just written.
+    pub fn open_with_config(
+        db: dcroxide_database::Database,
+        params: &Params,
+        config: OpenConfig,
+    ) -> Result<Chain, crate::chaindb::ChainDbError> {
         use crate::chaindb;
 
-        let mut chain = Chain::new(params, config_assume_valid, config_allow_old_forks);
-        chain.interrupt = interrupt;
+        let mut chain = Chain::new(params, config.assume_valid, config.allow_old_forks);
+        chain.interrupt = config.interrupt;
+        chain.log_sink = config.log;
+        chain.utxo_cache_max_bytes = config.utxo_cache_max_bytes;
+        let created_unix = config.created_unix;
 
         // Determine the state of the database.
         let mut db_info: Option<chaindb::DatabaseInfo> = None;
@@ -688,26 +766,23 @@ impl Chain {
             }
         }
 
-        if db_info.is_none() {
+        let Some(db_info) = db_info else {
             // Create the initial chain state (dcrd `createChainState`).
             let genesis_block = params.genesis_block.clone();
             let genesis_hash = genesis_block.header.block_hash();
             let genesis = chain.best_chain.tip().expect("genesis node");
             let stake_params = stake_node_params(params);
+            let created = chaindb::DatabaseInfo {
+                version: chaindb::CURRENT_DATABASE_VERSION,
+                comp_ver: crate::CURRENT_COMPRESSION_VERSION,
+                bidx_ver: chaindb::CURRENT_BLOCK_INDEX_VERSION,
+                created_unix,
+                stxo_ver: chaindb::CURRENT_SPEND_JOURNAL_VERSION,
+            };
             db.update(|tx| {
                 let meta = tx.metadata();
                 meta.create_bucket(chaindb::BCDB_INFO_BUCKET_NAME)?;
-                chaindb::db_put_database_info(
-                    tx,
-                    &chaindb::DatabaseInfo {
-                        version: chaindb::CURRENT_DATABASE_VERSION,
-                        comp_ver: crate::CURRENT_COMPRESSION_VERSION,
-                        bidx_ver: chaindb::CURRENT_BLOCK_INDEX_VERSION,
-                        created_unix,
-                        stxo_ver: chaindb::CURRENT_SPEND_JOURNAL_VERSION,
-                    },
-                )
-                .map_err(chain_db_to_db_error)?;
+                chaindb::db_put_database_info(tx, &created).map_err(chain_db_to_db_error)?;
                 meta.create_bucket(chaindb::BLOCK_INDEX_BUCKET_NAME)?;
                 meta.create_bucket(chaindb::SPEND_JOURNAL_BUCKET_NAME)?;
 
@@ -775,11 +850,26 @@ impl Chain {
                     .expect("genesis filter")
             });
             chain.db = Some(db);
+            // dcrd's `initChainState` goes on to load the state
+            // `createChainState` has just written, so a fresh start logs
+            // the index load and the deployment version like any other
+            // and looks for the fork rejection checkpoint and the
+            // assumed valid node in the one-node index
+            // (`chainio.go:1691-1761`, `:1570`).  The index here already
+            // holds the genesis node `Chain::new` built, so there is
+            // nothing to read back, and the deployment version row
+            // written above leaves the update nothing to write.
+            chain.log(LogLevel::Info, "Loading block index...");
+            chain.log_block_index_loaded(&Stopwatch::start());
+            chain.maybe_set_fork_rejection_checkpoint(params);
+            chain.load_assume_valid_node();
+            chain.update_deployment_version(params)?;
             // Record the fresh utxo set state at the genesis tip
             // (dcrd initializes the utxo cache during `New`).
             chain.initialize_utxo_state(params)?;
+            chain.log_chain_opened(&created);
             return Ok(chain);
-        }
+        };
 
         // Load the chain state (dcrd `initChainState`).
         let mut load_err: Option<chaindb::ChainDbError> = None;
@@ -814,7 +904,109 @@ impl Chain {
         // leaves the on-disk set behind the chain (dcrd initializes
         // the utxo cache during `New`).
         chain.initialize_utxo_state(params)?;
+        chain.log_chain_opened(&db_info);
         Ok(chain)
+    }
+
+    /// Find the assumed valid node once the block index is loaded, when
+    /// its header is known, and log it at debug (dcrd's lookup near the
+    /// end of the `initChainState` load, `chainio.go:1755-1761`).
+    fn load_assume_valid_node(&mut self) {
+        if self.assume_valid == Hash::ZERO {
+            return;
+        }
+        self.assume_valid_node = self.index.lookup_node(&self.assume_valid);
+        if let Some(node) = self.assume_valid_node {
+            let (hash, height) = (self.store.node(node).hash, self.store.node(node).height);
+            self.log(
+                LogLevel::Debug,
+                &format!("Assumed valid node is {hash} (height {height})"),
+            );
+        }
+    }
+
+    /// Log how long the block index took to load (dcrd's debug line
+    /// after `loadBlockIndex`, `chainio.go:1716`).  Left out without a
+    /// clock to time it (see [`Stopwatch`]).
+    fn log_block_index_loaded(&mut self, started: &Stopwatch) {
+        if let Some(nanos) = started.elapsed_nanos() {
+            self.log(
+                LogLevel::Debug,
+                &format!(
+                    "Block index loaded in {}",
+                    crate::gotime::go_duration_string(nanos)
+                ),
+            );
+        }
+    }
+
+    /// Log the lines that end dcrd's `blockchain.New` once the UTXO
+    /// cache is initialized (`chain.go:2486-2537`): the block and UTXO
+    /// database versions, the best known header, and the chain state.
+    ///
+    /// The UTXO database line carries the versions the port's UTXO rows
+    /// are in, not a stored record: the set lives in the block database
+    /// with no backend info of its own (see
+    /// [`crate::chaindb::CURRENT_UTXO_DATABASE_VERSION`]).  Those are the
+    /// values a fresh dcrd `utxodb` records -- database version 3,
+    /// compression version 1, and the utxo set key set version the
+    /// outpoint key prefix carries.
+    ///
+    /// dcrd's version 3 test network invalidation pass sits between the
+    /// version lines and the best header in `New`; it has no port (see
+    /// [`Chain::open`]).
+    fn log_chain_opened(&mut self, db_info: &crate::chaindb::DatabaseInfo) {
+        self.log(
+            LogLevel::Info,
+            &format!(
+                "Blockchain database version info: chain: {}, compression: {}, block index: \
+                 {}, spend journal: {}",
+                db_info.version, db_info.comp_ver, db_info.bidx_ver, db_info.stxo_ver
+            ),
+        );
+        self.log(
+            LogLevel::Info,
+            &format!(
+                "UTXO database version info: version: {}, compression: {}, utxo set: {}",
+                crate::chaindb::CURRENT_UTXO_DATABASE_VERSION,
+                crate::CURRENT_COMPRESSION_VERSION,
+                crate::utxoio::UTXO_PREFIX_UTXO_SET[1]
+            ),
+        );
+
+        let (best_header_hash, best_header_height) = self.best_header();
+        self.log(
+            LogLevel::Info,
+            &format!("Best known header: height {best_header_height}, hash {best_header_hash}"),
+        );
+
+        let tip = self.best_chain.tip().expect("best chain tip");
+        let (tip_height, tip_hash, work_sum) = {
+            let n = self.store.node(tip);
+            (n.height, n.hash, n.work_sum)
+        };
+        let total_txns = self.state_snapshot.total_txns;
+        let progress = self.verify_progress();
+        self.log(
+            LogLevel::Info,
+            &format!(
+                "Chain state: height {tip_height}, hash {tip_hash}, total transactions \
+                 {total_txns}, work {work_sum}, progress {progress:.2}%"
+            ),
+        );
+    }
+
+    /// A guess of the progress of the chain verification process: the
+    /// best chain tip's height over the best known header's, as a
+    /// percentage (dcrd `VerifyProgress`, `chainquery.go:244-252`).
+    fn verify_progress(&self) -> f64 {
+        let (_, best_header_height) = self.best_header();
+        if best_header_height == 0 {
+            return 0.0;
+        }
+        let tip = self.best_chain.tip().expect("best chain tip");
+        let tip_height = self.store.node(tip).height;
+        (tip_height as f64 / best_header_height as f64).min(1.0) * 100.0
     }
 
     /// Load the block index, best chain state, stake node, and chain
@@ -834,6 +1026,12 @@ impl Chain {
         use crate::chaindb;
 
         let state = chaindb::db_fetch_best_state(tx)?;
+
+        // dcrd announces the load once the best state is read, and
+        // times it from here, the deployment start time lookup
+        // included (`chainio.go:1691-1716`).
+        self.log(LogLevel::Info, "Loading block index...");
+        let bidx_start = Stopwatch::start();
 
         // Determine the earliest start time of newly detected
         // deployment versions and update the stored version.
@@ -945,6 +1143,7 @@ impl Chain {
         self.best_chain.set_tip(&self.store, Some(tip));
         self.index.prune_cached_tips(&self.store, tip);
         self.index.add_best_chain_candidate(tip);
+        self.log_block_index_loaded(&bidx_start);
 
         // Load the stake node for the tip.
         let tip_header = self.store.header(tip);
@@ -1068,9 +1267,7 @@ impl Chain {
             crate::agendas::calc_next_required_stake_difficulty(&view, node_diff.as_ref(), params)
         };
         self.maybe_set_fork_rejection_checkpoint(params);
-        if self.assume_valid != Hash::ZERO {
-            self.assume_valid_node = self.index.lookup_node(&self.assume_valid);
-        }
+        self.load_assume_valid_node();
         let tip_node = self.store.node(tip);
         self.state_snapshot = BestState {
             hash: tip_node.hash,
@@ -1103,7 +1300,7 @@ impl Chain {
     /// new-rules pass still has work: writing it before those rows are
     /// durable would let a crash in between skip the pass forever.
     fn update_deployment_version(
-        &self,
+        &mut self,
         params: &Params,
     ) -> Result<(), crate::chaindb::ChainDbError> {
         let cur_version = crate::thresholdstate::current_deployment_version(params);
@@ -1115,10 +1312,20 @@ impl Chain {
         let Some(db) = &self.db else {
             return Ok(());
         };
+        let log_sink = &mut self.log_sink;
         db.update(|tx| {
             if crate::chaindb::db_fetch_deployment_ver(tx) != cur_version {
                 crate::chaindb::db_put_deployment_ver(tx, cur_version)
                     .map_err(chain_db_to_db_error)?;
+            }
+            // dcrd logs this inside the transaction (`chainio.go:1570`),
+            // so the line is out before the commit, and a commit that
+            // then fails `New` follows it rather than suppressing it.
+            if let Some(sink) = log_sink {
+                sink(
+                    LogLevel::Info,
+                    &format!("Deployment version {cur_version} loaded"),
+                );
             }
             Ok(())
         })
@@ -1646,6 +1853,15 @@ impl Chain {
     /// back to the fork point using their spend journals and replayed
     /// forward through the cache until the set matches the tip.  On a
     /// fresh backend the state is simply recorded at the tip.
+    ///
+    /// It opens and closes with dcrd's two Info lines, "UTXO cache
+    /// initializing (max size: N MiB)..." and "UTXO cache initialization
+    /// completed" (`utxocache.go:816`, `:854`, `:1039`), so a catch-up
+    /// after a crash is visible between them.  The size is the cache's
+    /// maximum at the time, which is why the daemon sets it before the
+    /// open ([`OpenConfig::utxo_cache_max_bytes`]).  A failed or
+    /// interrupted catch-up returns without the second line, as dcrd's
+    /// does.
     pub fn initialize_utxo_state(
         &mut self,
         params: &Params,
@@ -1653,6 +1869,13 @@ impl Chain {
         if self.db.is_none() {
             return Ok(());
         }
+        self.log(
+            LogLevel::Info,
+            &format!(
+                "UTXO cache initializing (max size: {} MiB)...",
+                self.utxo_cache_max_bytes / 1024 / 1024
+            ),
+        );
 
         // The recorded utxo set state.
         let mut state: Option<crate::utxoio::UtxoSetState> = None;
@@ -1705,6 +1928,7 @@ impl Chain {
 
         // Already caught up to the tip.
         if state.last_flush_hash == tip_hash {
+            self.log(LogLevel::Info, "UTXO cache initialization completed");
             return Ok(());
         }
 
@@ -1884,6 +2108,7 @@ impl Chain {
         }
         // The unflushed tail stays in the cache for the normal flush
         // triggers, exactly like dcrd's initialization.
+        self.log(LogLevel::Info, "UTXO cache initialization completed");
         Ok(())
     }
 
@@ -2573,7 +2798,8 @@ impl Chain {
     /// Attempt to discover and set the old fork rejection checkpoint
     /// node: two weeks worth of blocks behind the hard-coded assumed
     /// valid block once its header is known (dcrd
-    /// `maybeSetForkRejectionCheckpoint`).
+    /// `maybeSetForkRejectionCheckpoint`), logging the checkpoint at
+    /// debug as dcrd does (`process.go:86`).
     pub fn maybe_set_fork_rejection_checkpoint(&mut self, params: &Params) {
         if self.reject_forks_checkpoint.is_some() || self.allow_old_forks {
             return;
@@ -2587,6 +2813,13 @@ impl Chain {
             checkpoint_height = 0;
         }
         self.reject_forks_checkpoint = self.store.ancestor(hard_coded, checkpoint_height);
+        if let Some(node) = self.reject_forks_checkpoint {
+            let (hash, height) = (self.store.node(node).hash, self.store.node(node).height);
+            self.log(
+                LogLevel::Debug,
+                &format!("Fork rejection checkpoint set to {hash} (height {height})"),
+            );
+        }
     }
 
     /// Update the assumed valid node when the provided node matches
@@ -3312,8 +3545,7 @@ impl Chain {
                 self.recent_context_checks.put(node_hash);
 
                 let run_scripts = !self.bulk_import_mode && !self.is_assume_valid_ancestor(node);
-                let mut subsidy_cache =
-                    dcroxide_standalone::SubsidyCache::new(ChainSubsidyParams(params));
+                let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(params);
                 let node_info = {
                     let nd = self.store.node(node);
                     (nd.height, nd.hash, nd.voters, nd.vote_bits)
@@ -4252,7 +4484,7 @@ impl Chain {
             block.header.voters,
             block.header.vote_bits,
         );
-        let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(ChainSubsidyParams(params));
+        let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(params);
 
         if prev_node == tip {
             // Use the chain state as is when extending the main chain.
@@ -4740,6 +4972,12 @@ impl Chain {
 
     /// Set the maximum pending-UTXO-cache size before a connect flushes
     /// it (dcrd's `--utxocachemaxsize`, in bytes).
+    ///
+    /// This sizes an already open chain, whose startup catch-up replay
+    /// has run at the size it was opened with.  dcrd fixes the size
+    /// before `New` (`UtxoCacheConfig.MaxSize`), so a node that follows
+    /// it passes the size through [`OpenConfig::utxo_cache_max_bytes`]
+    /// instead.
     pub fn set_utxo_cache_max_bytes(&mut self, bytes: u64) {
         self.utxo_cache_max_bytes = bytes;
     }

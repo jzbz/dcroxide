@@ -5,6 +5,7 @@
 //!   (`chaincfg/*params_test.go` at release-v2.1.5), plus the genesis
 //!   hashes as emitted by dcrd itself;
 //! - the block-one (premine) ledger counts and totals;
+//! - the `SubsidyParams` accessors dcrd's `Params` methods provide;
 //! - the deployment-definition validation dcrd performs at package init
 //!   (`chaincfg/init.go`), ported here as data sanity tests since we have
 //!   no Go-style init-time registry.
@@ -16,6 +17,7 @@ use dcroxide_chaincfg::{
     Choice, ConsensusDeployment, Params, mainnet_params, regnet_params, simnet_params,
     testnet3_params,
 };
+use dcroxide_standalone::SubsidyParams;
 use dcroxide_testutil::unhex;
 use dcroxide_wire::MsgBlock;
 
@@ -168,6 +170,66 @@ fn subsidy_proportions_sum_to_ten() {
             + params.block_tax_proportion;
         assert_eq!(v2_sum, 10, "{}: v2 proportions", params.name);
     }
+}
+
+/// `Params` answers `SubsidyParams` with the fields dcrd's accessor
+/// methods return (`params.go:678-750`, `BlockOneSubsidy` at `:809`),
+/// both owned and through a borrow, the two forms the subsidy caches
+/// hold.  The deprecated split accessors answer the pre-DCP0010
+/// proportions, not the `_v2` fields: the cache hard-codes the DCP0010
+/// and DCP0012 splits (`subsidy.go:333`, `:382`, `:394`).
+#[test]
+fn subsidy_params_follow_dcrd_accessors() {
+    fn answers<P: SubsidyParams>(p: &P) -> [i64; 10] {
+        [
+            p.block_one_subsidy(),
+            p.base_subsidy_value(),
+            p.subsidy_reduction_multiplier(),
+            p.subsidy_reduction_divisor(),
+            p.subsidy_reduction_interval_blocks(),
+            i64::from(p.work_subsidy_proportion()),
+            i64::from(p.stake_subsidy_proportion()),
+            i64::from(p.treasury_subsidy_proportion()),
+            p.stake_validation_begin_height(),
+            i64::from(p.votes_per_block()),
+        ]
+    }
+
+    for params in all_networks() {
+        let fields = [
+            params.block_one_ledger.iter().map(|p| p.amount).sum(),
+            params.base_subsidy,
+            params.mul_subsidy,
+            params.div_subsidy,
+            params.subsidy_reduction_interval,
+            i64::from(params.work_reward_proportion),
+            i64::from(params.stake_reward_proportion),
+            i64::from(params.block_tax_proportion),
+            params.stake_validation_height,
+            i64::from(params.tickets_per_block),
+        ];
+        assert_eq!(answers(&params), fields, "{}: owned", params.name);
+        assert_eq!(answers(&&params), fields, "{}: borrowed", params.name);
+    }
+
+    // Mainnet's values as dcrd's accessors return them
+    // (`mainnetparams.go:119-127`, `:552`, `:564`), which also tells the
+    // pre-DCP0010 proportions (6/3/1) from the `_v2` ones (1/8/1).
+    assert_eq!(
+        answers(&mainnet_params()),
+        [
+            168_000_000_000_000,
+            3_119_582_664,
+            100,
+            101,
+            6144,
+            6,
+            3,
+            1,
+            4096,
+            5,
+        ]
+    );
 }
 
 #[test]

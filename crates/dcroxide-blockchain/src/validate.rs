@@ -2454,44 +2454,6 @@ pub fn check_ticket_redeemer_commitments(
     Ok(())
 }
 
-/// Adapter exposing the chain parameters as the subsidy parameters
-/// the standalone subsidy cache expects (dcrd wires this up through
-/// its `chaincfg.Params` methods directly).
-pub struct ChainSubsidyParams<'a>(pub &'a Params);
-
-impl dcroxide_standalone::SubsidyParams for ChainSubsidyParams<'_> {
-    fn block_one_subsidy(&self) -> i64 {
-        self.0.block_one_subsidy()
-    }
-    fn base_subsidy_value(&self) -> i64 {
-        self.0.base_subsidy
-    }
-    fn subsidy_reduction_multiplier(&self) -> i64 {
-        self.0.mul_subsidy
-    }
-    fn subsidy_reduction_divisor(&self) -> i64 {
-        self.0.div_subsidy
-    }
-    fn subsidy_reduction_interval_blocks(&self) -> i64 {
-        self.0.subsidy_reduction_interval
-    }
-    fn work_subsidy_proportion(&self) -> u16 {
-        self.0.work_reward_proportion
-    }
-    fn stake_subsidy_proportion(&self) -> u16 {
-        self.0.stake_reward_proportion
-    }
-    fn treasury_subsidy_proportion(&self) -> u16 {
-        self.0.block_tax_proportion
-    }
-    fn stake_validation_begin_height(&self) -> i64 {
-        self.0.stake_validation_height
-    }
-    fn votes_per_block(&self) -> u16 {
-        self.0.tickets_per_block
-    }
-}
-
 /// Perform a series of checks on the inputs to a vote transaction
 /// (dcrd `checkVoteInputs`).  The caller MUST have already determined
 /// the transaction is a vote.
@@ -5687,7 +5649,7 @@ mod tests {
         submission.extend_from_slice(&[0x22; 20]);
         submission.extend_from_slice(&[0x88, 0xac]);
         let ticket = entry(submission, TxType::SStx, Some(vec![0x00]));
-        let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(ChainSubsidyParams(&params));
+        let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(&params);
         let variant = dcroxide_standalone::SubsidySplitVariant::Dcp0012;
         let voted_height: u32 = 5000;
         let mut vote = spender(2);
@@ -5803,7 +5765,7 @@ mod tests {
         let params = mainnet_params();
 
         // coinbasePaysTreasuryAddress prints both scripts.
-        let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(ChainSubsidyParams(&params));
+        let mut subsidy_cache = dcroxide_standalone::SubsidyCache::new(&params);
         let mut coinbase = spender(1);
         coinbase.tx_out[0].version = params.organization_pk_script_version;
         coinbase.tx_out[0].pk_script = vec![dcroxide_txscript::OP_TRUE];

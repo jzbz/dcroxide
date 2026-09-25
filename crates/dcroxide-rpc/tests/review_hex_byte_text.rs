@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use dcroxide_chaincfg::mainnet_params;
 use dcroxide_dcrjson::{GoValue, RPCError, Registry, parse_params};
 use dcroxide_rpc::handlers;
-use dcroxide_rpc::server::{Config, RpcChain, RpcSubsidyParams, Server};
+use dcroxide_rpc::server::{Config, RpcChain, Server};
 use dcroxide_rpc::websocket::{WsClient, handle_load_tx_filter};
 use dcroxide_rpctypes::{method, register_all};
 use dcroxide_standalone::SubsidyCache;
@@ -38,7 +38,7 @@ fn server() -> Server<NoChain> {
     Server::new(Config {
         chain: NoChain,
         chain_params: params.clone(),
-        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params))),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params)),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(()),

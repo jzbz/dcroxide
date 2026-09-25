@@ -19,8 +19,8 @@ use dcroxide_dcrjson::{GoType, GoValue, RPCError, Registry, gojson, parse_params
 use dcroxide_rpc::handlers;
 use dcroxide_rpc::helpers::threshold::State;
 use dcroxide_rpc::server::{
-    Config, RpcBestState, RpcChain, RpcStakeVersions, RpcSubsidyParams, RpcSyncManager,
-    RpcTreasuryBalance, RpcVoteCounts, Server, TreasuryBalanceFailure, VoteInfoFailure,
+    Config, RpcBestState, RpcChain, RpcStakeVersions, RpcSyncManager, RpcTreasuryBalance,
+    RpcVoteCounts, Server, TreasuryBalanceFailure, VoteInfoFailure,
 };
 use dcroxide_rpctypes::chainsvrresults as results;
 use dcroxide_rpctypes::{method, register_all};
@@ -504,9 +504,7 @@ fn stake_query_handler_slice_matches_dcrd() {
         let server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
-                params.clone(),
-            ))),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params.clone())),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(StubSyncManager),

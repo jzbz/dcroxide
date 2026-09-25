@@ -24,9 +24,8 @@ use dcroxide_dcrjson::{GoType, GoValue, Registry, gojson, parse_params};
 use dcroxide_rpc::handlers;
 use dcroxide_rpc::helpers::NoInterfaces;
 use dcroxide_rpc::server::{
-    Config, RpcBestState, RpcBlockTemplater, RpcChain, RpcConnManager, RpcCpuMiner,
-    RpcSubsidyParams, RpcSyncManager, RpcTemplateSubscription, Server, SubmitBlockFailure,
-    TemplateRecv,
+    Config, RpcBestState, RpcBlockTemplater, RpcChain, RpcConnManager, RpcCpuMiner, RpcSyncManager,
+    RpcTemplateSubscription, Server, SubmitBlockFailure, TemplateRecv,
 };
 use dcroxide_rpctypes::chainsvrresults as results;
 use dcroxide_rpctypes::{method, register_all};
@@ -321,9 +320,7 @@ fn getwork_handler_matches_dcrd() {
         let mut server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
-                params.clone(),
-            ))),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params.clone())),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(MockSyncMgr11 {
@@ -522,7 +519,7 @@ fn a_cancelled_getwork_gives_up_its_place() {
             blake3: false,
         },
         chain_params: params.clone(),
-        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params.clone())),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(MockSyncMgr11 { submit: Ok(()) }),
@@ -621,7 +618,7 @@ fn getwork_invocations_serialize() {
             blake3: false,
         },
         chain_params: params.clone(),
-        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params.clone())),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(MockSyncMgr11 { submit: Ok(()) }),

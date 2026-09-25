@@ -11,6 +11,12 @@ repository.workspace = true
 [dependencies]
 dcroxide-chainhash = { path = "../dcroxide-chainhash" }
 dcroxide-crypto = { path = "../dcroxide-crypto" }
+# For the `SubsidyParams` impl on `Params` (dcrd's `*chaincfg.Params`
+# satisfies `standalone.SubsidyParams` through its accessor methods).
+# This direction keeps standalone free of the chain parameters, as
+# dcrd's `blockchain/standalone` module is (its go.mod requires only
+# chainhash and wire).
+dcroxide-standalone = { path = "../dcroxide-standalone" }
 dcroxide-uint256 = { path = "../dcroxide-uint256" }
 dcroxide-wire = { path = "../dcroxide-wire" }
 

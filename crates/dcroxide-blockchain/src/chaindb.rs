@@ -39,6 +39,15 @@ pub const CURRENT_BLOCK_INDEX_VERSION: u32 = 3;
 /// The current spend journal version (dcrd
 /// `currentSpendJournalVersion`).
 pub const CURRENT_SPEND_JOURNAL_VERSION: u32 = 3;
+/// The UTXO database version (dcrd `currentUtxoDatabaseVersion`,
+/// `utxobackend.go:28`).
+///
+/// dcrd records it in the separate UTXO database's backend info and
+/// logs it at startup.  The port keeps the UTXO set in the block
+/// database with no backend info record of its own, so the chain open
+/// logs this constant: the layout its UTXO rows are in, and the value a
+/// fresh dcrd `utxodb` records.
+pub const CURRENT_UTXO_DATABASE_VERSION: u32 = 3;
 
 /// The database info bucket (dcrd `bcdbInfoBucketName`).
 pub const BCDB_INFO_BUCKET_NAME: &[u8] = b"dbinfo";

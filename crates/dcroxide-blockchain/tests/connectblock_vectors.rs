@@ -20,9 +20,8 @@ use dcroxide_blockchain::stakever::VersionNode;
 use dcroxide_blockchain::thresholdstate::{VoteChainView, VoteNode};
 use dcroxide_blockchain::utxoview::UtxoView;
 use dcroxide_blockchain::validate::{
-    ChainSubsidyParams, block_one_coinbase_pays_tokens, calculate_added_subsidy,
-    check_block_scripts, check_connect_block, coinbase_pays_treasury_address,
-    tspend_checks_stateless,
+    block_one_coinbase_pays_tokens, calculate_added_subsidy, check_block_scripts,
+    check_connect_block, coinbase_pays_treasury_address, tspend_checks_stateless,
 };
 use dcroxide_chaincfg::simnet_params;
 use dcroxide_chainhash::Hash;
@@ -110,7 +109,7 @@ fn parse_entry(f: &[&str]) -> (OutPoint, UtxoEntry) {
 #[test]
 fn connectblock_vectors() {
     let params = simnet_params();
-    let mut subsidy_cache = SubsidyCache::new(ChainSubsidyParams(&params));
+    let mut subsidy_cache = SubsidyCache::new(&params);
     let data = include_str!("data/connectblock_vectors.txt");
 
     let mut chain = VecChain(Vec::new());

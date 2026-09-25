@@ -13,7 +13,7 @@ use dcroxide_blockchain::RuleError;
 use dcroxide_blockchain::UtxoEntry;
 use dcroxide_blockchain::chainio::SpentTxOut;
 use dcroxide_blockchain::utxoview::UtxoView;
-use dcroxide_blockchain::validate::{ChainSubsidyParams, check_transactions_and_connect};
+use dcroxide_blockchain::validate::check_transactions_and_connect;
 use dcroxide_chaincfg::simnet_params;
 use dcroxide_chainhash::Hash;
 use dcroxide_stake::TxType;
@@ -38,7 +38,7 @@ fn kind_of<T>(result: &Result<T, RuleError>) -> String {
 #[test]
 fn ctac_vectors() {
     let params = simnet_params();
-    let mut subsidy_cache = SubsidyCache::new(ChainSubsidyParams(&params));
+    let mut subsidy_cache = SubsidyCache::new(&params);
     // The dump uses a zero header with only the height set as the
     // previous header.
     let (mut prev_header, _) = BlockHeader::from_bytes(&[0u8; 180]).expect("zero header");

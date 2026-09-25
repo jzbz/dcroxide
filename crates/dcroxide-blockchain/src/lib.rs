@@ -39,6 +39,7 @@ mod checkedmath;
 pub mod compress;
 pub mod difficulty;
 mod error;
+mod gotime;
 pub mod notifications;
 pub mod process;
 mod ruleerror;

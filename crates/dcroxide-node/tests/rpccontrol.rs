@@ -25,7 +25,7 @@ use dcroxide_node::rpcrun::{
 };
 use dcroxide_node::runtime::ConnectedPeers;
 use dcroxide_rpc::helpers::NoInterfaces;
-use dcroxide_rpc::server::{Config, RpcNetworkInfo, RpcSanityChecker, RpcSubsidyParams, Server};
+use dcroxide_rpc::server::{Config, RpcNetworkInfo, RpcSanityChecker, Server};
 use dcroxide_standalone::SubsidyCache;
 use dcroxide_testutil::unhex;
 use dcroxide_wire::{MsgBlock, PROTOCOL_VERSION, ServiceFlag};
@@ -203,7 +203,7 @@ fn control_and_chain_query_seams_over_http() {
     let server = Arc::new(Server::new(Config {
         chain: NodeRpcChain::new(Arc::clone(&chain), params.clone()),
         chain_params: params.clone(),
-        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(params.clone()))),
+        subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params.clone())),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(NodeRpcSyncManager::new(sync_manager, Arc::clone(&tx_pool))),

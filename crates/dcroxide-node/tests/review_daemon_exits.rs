@@ -102,6 +102,7 @@ fn droptxindex_persists_the_drop() {
             params.clone(),
             true,
             false,
+            &dcroxide_node::indexes::IndexLogs::default(),
         )
         .expect("start the tx index");
         drop(indexes);

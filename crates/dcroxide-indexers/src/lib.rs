@@ -8,6 +8,11 @@
 //! transaction index, the version 2 exists address index, and the
 //! legacy index drop helpers.
 //!
+//! The package's log lines -- the catch-up and recovery with their
+//! periodic progress lines, and every drop -- go to the [`LogSink`] the
+//! caller passes in, where dcrd writes them to the package logger its
+//! callers bind to the `INDX` subsystem.
+//!
 //! dcrd delivers index notifications over a buffered channel
 //! serviced by goroutines and checks sync subscribers on a periodic
 //! ticker; this port delivers synchronously with identical state
@@ -17,6 +22,8 @@ mod common;
 mod error;
 mod existsaddrindex;
 mod legacydrops;
+mod log;
+mod progresslog;
 mod subscriber;
 mod txindex;
 
@@ -27,6 +34,7 @@ pub use existsaddrindex::{
     ExistsAddrQuery, ExistsAddrUnconfirmed, addr_to_key, drop_exists_addr_index,
 };
 pub use legacydrops::{ADDR_INDEX_KEY, CF_INDEX_PARENT_BUCKET_KEY, drop_addr_index, drop_cf_index};
+pub use log::{LogLevel, LogSink};
 pub use subscriber::{
     CONNECT_NTFN, DISCONNECT_NTFN, IndexNtfn, IndexNtfnType, IndexSubscriber, IndexerHandle,
     NO_PREREQS,

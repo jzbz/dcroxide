@@ -1436,7 +1436,7 @@ mod tests {
             Arc::clone(&chain),
             params.clone(),
         ));
-        let mut subscriber = IndexSubscriber::new(dcroxide_indexers::Interrupt::default());
+        let mut subscriber = IndexSubscriber::new(dcroxide_indexers::Interrupt::default(), None);
         let index = ExistsAddrIndex::new(
             &mut subscriber,
             Arc::new(db),

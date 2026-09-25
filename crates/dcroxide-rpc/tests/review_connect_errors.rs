@@ -20,7 +20,7 @@ use dcroxide_rpc::handlers::{handle_add_node, handle_node};
 use dcroxide_rpc::helpers::NoInterfaces;
 use dcroxide_rpc::server::{
     CONNECT_CANCELED, CONNECT_DEADLINE_EXCEEDED, Config, RpcBestState, RpcChain, RpcConnManager,
-    RpcPeerInfo, RpcSubsidyParams, Server,
+    RpcPeerInfo, Server,
 };
 use dcroxide_standalone::SubsidyCache;
 use dcroxide_wire::PROTOCOL_VERSION;
@@ -63,7 +63,7 @@ fn server(error: &'static str) -> Server<StubChain> {
     Server::new(Config {
         chain: StubChain,
         chain_params: params.clone(),
-        subsidy_cache: Mutex::new(SubsidyCache::new(RpcSubsidyParams(params))),
+        subsidy_cache: Mutex::new(SubsidyCache::new(params)),
         min_relay_tx_fee: 10000,
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(()),

@@ -22,8 +22,8 @@ use dcroxide_chainhash::Hash;
 use dcroxide_database::{BlockRegion, Database};
 use dcroxide_indexers::{
     ChainQueryer, EXISTS_ADDRESS_INDEX_NAME, ExistsAddrIndex, ExistsAddrQuery,
-    ExistsAddrUnconfirmed, IdxError, IndexSubscriber, Interrupt, TX_INDEX_NAME, TxIndex,
-    TxIndexQuery,
+    ExistsAddrUnconfirmed, IdxError, IndexSubscriber, Interrupt, LogLevel, LogSink, TX_INDEX_NAME,
+    TxIndex, TxIndexQuery,
 };
 use dcroxide_rpc::server::{RpcDb, RpcExistsAddresser, RpcTxIndexEntry, RpcTxIndexer};
 use dcroxide_txscript::stdaddr::Address;
@@ -119,12 +119,40 @@ pub struct NodeIndexes {
     pub queryer: Arc<NodeChainQueryer>,
 }
 
+/// Where the index startup logs.  The default logs nothing.
+#[derive(Clone, Default)]
+pub struct IndexLogs {
+    /// The indexers' package logger (dcrd `indexers.UseLogger`), which
+    /// both dcrd callers bind to `INDX` (`log.go:90`;
+    /// `cmd/addblock/addblock.go:78`): a resumed drop, the recovery and
+    /// the catch-up.
+    pub indexers: Option<LogSink>,
+    /// The caller's own logger for the "Transaction index is enabled"
+    /// and "Exists address index is enabled" lines: `INDX` in the daemon
+    /// (`indxLog.Info`, `server.go:4030`, `:4037`) and `MAIN` in addblock
+    /// (`log.Info`, `cmd/addblock/import.go:344`, `:352`).
+    pub announce: Option<LogSink>,
+}
+
+impl IndexLogs {
+    /// Announce an enabled index, ahead of creating it.
+    fn announce(&self, msg: &str) {
+        if let Some(sink) = &self.announce {
+            sink(LogLevel::Info, msg);
+        }
+    }
+}
+
 /// Create the enabled indexes and catch them up to the main chain
 /// (dcrd `newServer`'s index block: `indexers.NewTxIndex` when
 /// `cfg.TxIndex` is set, `indexers.NewExistsAddrIndex` when the
 /// exists address index is not disabled, then one `CatchUp` over the
 /// shared subscriber).  Creation recovers a tip that is no longer on
 /// the main chain by rolling the index back first.
+///
+/// Each index is announced just ahead of its creation, as dcrd's callers
+/// do, so the lines its creation logs -- a resumed drop, a recovery --
+/// follow its own announcement and precede the next index's.
 pub fn start_indexes(
     interrupt: Interrupt,
     db: Arc<Database>,
@@ -132,10 +160,12 @@ pub fn start_indexes(
     params: Params,
     tx_index: bool,
     exists_addr_index: bool,
+    logs: &IndexLogs,
 ) -> Result<NodeIndexes, IdxError> {
     let queryer = Arc::new(NodeChainQueryer::new(chain, params));
-    let mut subscriber = IndexSubscriber::new(interrupt);
+    let mut subscriber = IndexSubscriber::new(interrupt, logs.indexers.clone());
     let tx_index = if tx_index {
+        logs.announce("Transaction index is enabled");
         Some(TxIndex::new(
             &mut subscriber,
             Arc::clone(&db),
@@ -145,6 +175,7 @@ pub fn start_indexes(
         None
     };
     let exists_addr_index = if exists_addr_index {
+        logs.announce("Exists address index is enabled");
         Some(ExistsAddrIndex::new(
             &mut subscriber,
             db,
@@ -451,8 +482,16 @@ mod tests {
         let genesis_hash = params.genesis_hash;
         let (_dir, db, chain) = open_genesis_chain(&params);
         let interrupt: Interrupt = Arc::new(core::sync::atomic::AtomicBool::new(false));
-        let indexes =
-            start_indexes(interrupt, Arc::new(db), chain, params, true, true).expect("start");
+        let indexes = start_indexes(
+            interrupt,
+            Arc::new(db),
+            chain,
+            params,
+            true,
+            true,
+            &IndexLogs::default(),
+        )
+        .expect("start");
         let tx_index = indexes.tx_index.as_ref().expect("tx index enabled");
 
         let seam = NodeRpcTxIndexer::new(Arc::clone(tx_index), Arc::clone(&indexes.queryer));
@@ -481,8 +520,16 @@ mod tests {
         let simnet = dcroxide_chaincfg::simnet_params();
         let (_dir1, db1, chain1) = open_genesis_chain(&simnet);
         let interrupt: Interrupt = Arc::new(core::sync::atomic::AtomicBool::new(false));
-        let indexes =
-            start_indexes(interrupt, Arc::new(db1), chain1, simnet, true, false).expect("start");
+        let indexes = start_indexes(
+            interrupt,
+            Arc::new(db1),
+            chain1,
+            simnet,
+            true,
+            false,
+            &IndexLogs::default(),
+        )
+        .expect("start");
         let tx_index = indexes.tx_index.as_ref().expect("tx index enabled");
         assert!(indexes.exists_addr_index.is_none());
 

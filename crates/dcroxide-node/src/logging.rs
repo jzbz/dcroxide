@@ -229,14 +229,12 @@ pub fn error(subsys: &str, msg: &str) {
     log(subsys, LogLevel::Error, msg);
 }
 
-/// The block database's package log sink, rendered under `BCDB`: the
-/// unclean-shutdown repair, the corruption warning and the ROLLBACK
-/// lines.  The daemon installs it as dcrd's `log.go:88` does
-/// (`database.UseLogger(bcdbLog)`) and addblock as dcrd's
-/// `cmd/addblock/addblock.go:76` does, so both print what their dcrd
-/// counterparts print.
-pub fn bcdb_log_sink() -> dcroxide_database::LogSink {
-    std::sync::Arc::new(|level: dcroxide_database::LogLevel, msg: &str| {
+/// A package log sink (the `dcroxide_database::LogSink` shape the
+/// database and the indexers take) rendered under the subsystem tag
+/// and gated by its configured level, as a dcrd subsystem logger
+/// handed to a package's `UseLogger` is.
+pub fn subsystem_log_sink(subsys: &'static str) -> dcroxide_database::LogSink {
+    std::sync::Arc::new(move |level: dcroxide_database::LogLevel, msg: &str| {
         use dcroxide_database::LogLevel as DbLevel;
         let level = match level {
             DbLevel::Trace => LogLevel::Trace,
@@ -245,8 +243,27 @@ pub fn bcdb_log_sink() -> dcroxide_database::LogSink {
             DbLevel::Warn => LogLevel::Warn,
             DbLevel::Error => LogLevel::Error,
         };
-        log("BCDB", level, msg);
+        log(subsys, level, msg);
     })
+}
+
+/// The block database's package log sink, rendered under `BCDB`: the
+/// unclean-shutdown repair, the corruption warning and the ROLLBACK
+/// lines.  The daemon installs it as dcrd's `log.go:88` does
+/// (`database.UseLogger(bcdbLog)`) and addblock as dcrd's
+/// `cmd/addblock/addblock.go:76` does, so both print what their dcrd
+/// counterparts print.
+pub fn bcdb_log_sink() -> dcroxide_database::LogSink {
+    subsystem_log_sink("BCDB")
+}
+
+/// The indexers' package log sink, rendered under `INDX`: the index
+/// catch-up and recovery with their progress lines, and the index
+/// drops.  The daemon passes it where dcrd's `log.go:90` installs
+/// `indexers.UseLogger(indxLog)`, and addblock where dcrd's
+/// `cmd/addblock/addblock.go:78` does.
+pub fn indx_log_sink() -> dcroxide_database::LogSink {
+    subsystem_log_sink("INDX")
 }
 
 #[cfg(test)]

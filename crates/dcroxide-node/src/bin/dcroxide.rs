@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dcroxide_addrmgr::{AddrManager, PeersLoad};
-use dcroxide_blockchain::process::Chain;
+use dcroxide_blockchain::process::{Chain, OpenConfig};
 use dcroxide_chainhash::Hash;
 use dcroxide_connmgr::DEFAULT_RETRY_DURATION;
 use dcroxide_database::{Database, ErrorKind, Options};
@@ -473,10 +473,10 @@ fn run_node(cfg: Config) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Load the block database and initialize the chain state, creating
-    // the genesis state when the database is fresh.
+    // Load the block database (dcrd `loadBlockDB`, which reports the
+    // load itself); the chain state is initialized over it later, as
+    // part of creating the server.
     pipe_notifier.notify_startup_event(dcroxide_node::ipc::LifetimeAction::DbOpen);
-    log_info("Loading block database from disk...");
     let db = match open_block_db(&cfg) {
         Ok(db) => db,
         Err(e) => {
@@ -496,30 +496,36 @@ fn run_node(cfg: Config) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // The indexers' package logger, which dcrd binds to INDX at init
+    // (`log.go:90`, `indexers.UseLogger(indxLog)`): the drops below and
+    // the index startup log through it.
+    let indx_log = dcroxide_node::logging::indx_log_sink();
+
     // Always drop the legacy address index, drop any other indexes
     // and exit if requested, then drop the legacy v1 committed filter
     // index (dcrd `dcrdMain` between `loadBlockDB` and `newServer`;
     // the order matters because dropping the tx index also drops the
     // address index since it relied on it).
-    if let Err(e) = dcroxide_indexers::drop_addr_index(&interrupt, &db) {
+    if let Err(e) = dcroxide_indexers::drop_addr_index(&interrupt, &db, Some(&indx_log)) {
         log_error(&format!("{e}"));
         return ExitCode::FAILURE;
     }
     if cfg.drop_tx_index {
-        if let Err(e) = dcroxide_indexers::drop_tx_index(&interrupt, &db) {
+        if let Err(e) = dcroxide_indexers::drop_tx_index(&interrupt, &db, Some(&indx_log)) {
             log_error(&format!("{e}"));
             return ExitCode::FAILURE;
         }
         return ExitCode::SUCCESS;
     }
     if cfg.drop_exists_addr_index {
-        if let Err(e) = dcroxide_indexers::drop_exists_addr_index(&interrupt, &db) {
+        if let Err(e) = dcroxide_indexers::drop_exists_addr_index(&interrupt, &db, Some(&indx_log))
+        {
             log_error(&format!("{e}"));
             return ExitCode::FAILURE;
         }
         return ExitCode::SUCCESS;
     }
-    if let Err(e) = dcroxide_indexers::drop_cf_index(&db) {
+    if let Err(e) = dcroxide_indexers::drop_cf_index(&db, Some(&indx_log)) {
         log_error(&format!("{e}"));
         return ExitCode::FAILURE;
     }
@@ -553,7 +559,9 @@ fn run_node(cfg: Config) -> ExitCode {
 
     // The chain is built inside dcrd's `newServer`, so a failure logs
     // as that one's does (`dcrd.go:243`): an interrupted startup catch-up
-    // reads "Unable to start server: interrupt requested".
+    // reads "Unable to start server: interrupt requested".  The loaded
+    // tip is reported by the chain itself, in CHAN's closing "Chain
+    // state: ..." line; dcrd logs nothing of its own after it.
     let chain = match open_chain(&cfg, db.clone(), &interrupt) {
         Ok(chain) => chain,
         Err(e) => {
@@ -561,11 +569,6 @@ fn run_node(cfg: Config) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let best = chain.best_snapshot();
-    log_info(&format!(
-        "Block database loaded with best block height {} hash {}",
-        best.height, best.hash
-    ));
     // Share the chain with the served peers' message handlers (dcrd's
     // server holding the chain the serverPeer callbacks consult).
     let chain = Arc::new(Mutex::new(chain));
@@ -573,14 +576,13 @@ fn run_node(cfg: Config) -> ExitCode {
     // Create the enabled indexes and catch them up to the main chain
     // (dcrd `newServer`'s index block: the transaction index under
     // --txindex, the exists address index unless disabled, one
-    // catch-up over the shared subscriber).
+    // catch-up over the shared subscriber).  dcrd announces each index
+    // under INDX just ahead of creating it.
     let indexes = if cfg.tx_index || !cfg.no_exists_addr_index {
-        if cfg.tx_index {
-            dcroxide_node::logging::info("INDX", "Transaction index is enabled");
-        }
-        if !cfg.no_exists_addr_index {
-            dcroxide_node::logging::info("INDX", "Exists address index is enabled");
-        }
+        let logs = dcroxide_node::indexes::IndexLogs {
+            indexers: Some(Arc::clone(&indx_log)),
+            announce: Some(indx_log),
+        };
         match dcroxide_node::indexes::start_indexes(
             Arc::clone(&interrupt),
             Arc::new(db.clone()),
@@ -588,6 +590,7 @@ fn run_node(cfg: Config) -> ExitCode {
             cfg.params.params.clone(),
             cfg.tx_index,
             !cfg.no_exists_addr_index,
+            &logs,
         ) {
             Ok(indexes) => Some(indexes),
             Err(e) => {
@@ -1875,9 +1878,18 @@ fn flush_log_observer() -> Option<dcroxide_database::FlushObserver> {
 /// `loadBlockDB`).  The block database lives at
 /// `<datadir>/blocks_<dbtype>`; the same handle backs the chain and
 /// the enabled indexes.
+///
+/// It logs dcrd's two lines around the open (`blockdb.go:139`, `:185`),
+/// so "Block database loaded" precedes everything the chain logs while
+/// it opens, as it does upstream, where the chain is only built later,
+/// in `newServer`.
 fn open_block_db(cfg: &Config) -> Result<Database, String> {
     let params = &cfg.params.params;
     let db_path = Path::new(&cfg.data_dir).join(format!("blocks_{}", cfg.db_type));
+    log_info(&format!(
+        "Loading block database from '{}'",
+        db_path.display()
+    ));
     let mut opts = Options::new(&db_path, params.net.0);
     opts.db_cache_bytes = db_cache_bytes();
     apply_overlay_tuning(&mut opts);
@@ -1889,8 +1901,8 @@ fn open_block_db(cfg: &Config) -> Result<Database, String> {
 
     // Open the existing database, creating it when it does not yet
     // exist (dcrd's `database.Open` then `database.Create` fallback).
-    match Database::open(&opts) {
-        Ok(db) => Ok(db),
+    let db = match Database::open(&opts) {
+        Ok(db) => db,
         Err(e) if e.kind == ErrorKind::DbDoesNotExist => {
             // 0700, matching dcrd's `os.MkdirAll(cfg.DataDir, 0700)`
             // in blockdb.go.  Creating it 0755 here would also make
@@ -1899,10 +1911,12 @@ fn open_block_db(cfg: &Config) -> Result<Database, String> {
             // alone.
             dcroxide_database::create_dir_all_owner_only(&db_path)
                 .map_err(|e| format!("unable to create database directory: {e}"))?;
-            Database::create(&opts).map_err(|e| format!("unable to create database: {e}"))
+            Database::create(&opts).map_err(|e| format!("unable to create database: {e}"))?
         }
-        Err(e) => Err(format!("unable to open database: {e}")),
-    }
+        Err(e) => return Err(format!("unable to open database: {e}")),
+    };
+    log_info("Block database loaded");
+    Ok(db)
 }
 
 /// Initialize the chain state over the open block database (the chain
@@ -1944,36 +1958,40 @@ fn open_chain(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let mut chain = Chain::open_with_interrupt(
+    let mut chain = Chain::open_with_config(
         db,
         params,
-        assume_valid,
-        cfg.allow_old_forks,
-        created_unix,
-        Some(Arc::clone(interrupt)),
+        OpenConfig {
+            assume_valid,
+            allow_old_forks: cfg.allow_old_forks,
+            created_unix,
+            interrupt: Some(Arc::clone(interrupt)),
+            // dcrd's `log.go` init hands `internal/blockchain` the CHAN
+            // logger (`blockchain.UseLogger(chanLog)`, `log.go:85`), so
+            // it is in place before `blockchain.New` runs and the open's
+            // own lines -- the block index load, the UTXO cache
+            // initialization and catch-up, the chain state -- reach it.
+            // The per-subsystem levels are already resolved by the time
+            // this runs (`logging::set_levels` in `run`), so
+            // `--debuglevel CHAN=` governs these lines as it does
+            // upstream.
+            log: Some(dcroxide_node::chainntfns::chain_log_sink()),
+            // dcrd's --utxocachemaxsize (megabytes) bounds the UTXO cache
+            // before a flush evicts it down.  dcrd builds the cache with
+            // it ahead of `blockchain.New` (`server.go:4005-4009`), so
+            // the open-time catch-up replay already flushes at the
+            // configured size and logs it.
+            utxo_cache_max_bytes: cfg.utxo_cache_max_size.saturating_mul(1024 * 1024),
+        },
     )
     // `newServer` returns `blockchain.New`'s error as is, which `%v`
     // renders as its bare description.
     .map_err(|e| e.to_string())?;
-    // dcrd's --utxocachemaxsize (megabytes) bounds the UTXO cache
-    // before a flush evicts it down.  The open-time catch-up replay
-    // above ran at the default size; the configured value governs
-    // everything after (a documented divergence — dcrd sizes the
-    // cache before initializing it).
-    chain.set_utxo_cache_max_bytes(cfg.utxo_cache_max_size.saturating_mul(1024 * 1024));
     // dcrd's --sigcachemaxsize bounds the signature verification
     // cache by ENTRY COUNT (server.go passes it to
     // `txscript.NewSigCache`).  The open-time catch-up replay above
     // runs no scripts, so sizing after open is equivalent.
     chain.set_sig_cache_max_entries(usize::try_from(cfg.sig_cache_max_size).unwrap_or(usize::MAX));
-    // dcrd's `log.go` init hands `internal/blockchain` the CHAN logger
-    // (`blockchain.UseLogger(chanLog)`, `log.go:85`).  The per-subsystem
-    // levels are already resolved by the time this runs
-    // (`logging::set_levels` in `run`), so `--debuglevel CHAN=` governs
-    // these lines as it does upstream.  Note this cannot carry any line
-    // from chain construction itself: `Chain::open` above has already
-    // run.
-    chain.set_log_callback(dcroxide_node::chainntfns::chain_log_sink());
     Ok(chain)
 }
 
@@ -2017,9 +2035,7 @@ fn rpc_config(
         chain: dcroxide_node::rpcrun::NodeRpcChain::new(chain, params.clone())
             .with_chain_ntfn_handler(ntfn_handler),
         chain_params: params.clone(),
-        subsidy_cache: std::sync::Mutex::new(dcroxide_standalone::SubsidyCache::new(
-            dcroxide_rpc::server::RpcSubsidyParams(params),
-        )),
+        subsidy_cache: std::sync::Mutex::new(dcroxide_standalone::SubsidyCache::new(params)),
         min_relay_tx_fee: cfg.min_relay_tx_fee_atoms,
         max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
         // The mixing pool behind sendrawmixmessage (dcrd's

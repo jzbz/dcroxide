@@ -20,7 +20,7 @@ use dcroxide_chaincfg::mainnet_params;
 use dcroxide_chainhash::Hash;
 use dcroxide_dcrjson::{GoValue, Registry, gojson, parse_params};
 use dcroxide_rpc::helpers::NoInterfaces;
-use dcroxide_rpc::server::{Config, RpcBestState, RpcChain, RpcSubsidyParams, Server};
+use dcroxide_rpc::server::{Config, RpcBestState, RpcChain, Server};
 use dcroxide_rpc::websocket::{RpcNtfnManager, WsClient, ws_cmd_result};
 use dcroxide_rpctypes::{method, register_all};
 use dcroxide_standalone::SubsidyCache;
@@ -203,9 +203,7 @@ fn websocket_client_core_matches_dcrd() {
         let mut server = Server::new(Config {
             chain,
             chain_params: params.clone(),
-            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(RpcSubsidyParams(
-                params.clone(),
-            ))),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params.clone())),
             min_relay_tx_fee: 10000,
             max_protocol_version: PROTOCOL_VERSION,
             sync_mgr: Box::new(()),

@@ -33,6 +33,6 @@ pub use policy::{
 };
 pub use pool::{
     FeeEstimatorSink, MEMPOOL_MAX_CONCURRENT_TSPENDS, MixpoolProbe, Policy, PoolChain,
-    PoolSubsidyParams, TSpendReceiver, Tag, TxDesc, TxPool, UNMINED_HEIGHT, UnconfirmedAddrIndexer,
-    VoteDesc, VoteReceiver,
+    TSpendReceiver, Tag, TxDesc, TxPool, UNMINED_HEIGHT, UnconfirmedAddrIndexer, VoteDesc,
+    VoteReceiver,
 };

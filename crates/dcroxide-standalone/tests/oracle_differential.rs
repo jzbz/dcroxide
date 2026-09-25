@@ -366,44 +366,6 @@ fn asert_differential() {
     }
 }
 
-/// Adapter exposing dcroxide-chaincfg parameters through the
-/// SubsidyParams trait, mirroring how dcrd's chaincfg.Params satisfies
-/// the Go interface.
-struct ChainSubsidyParams(Params);
-
-impl SubsidyParams for ChainSubsidyParams {
-    fn block_one_subsidy(&self) -> i64 {
-        self.0.block_one_subsidy()
-    }
-    fn base_subsidy_value(&self) -> i64 {
-        self.0.base_subsidy
-    }
-    fn subsidy_reduction_multiplier(&self) -> i64 {
-        self.0.mul_subsidy
-    }
-    fn subsidy_reduction_divisor(&self) -> i64 {
-        self.0.div_subsidy
-    }
-    fn subsidy_reduction_interval_blocks(&self) -> i64 {
-        self.0.subsidy_reduction_interval
-    }
-    fn work_subsidy_proportion(&self) -> u16 {
-        self.0.work_reward_proportion
-    }
-    fn stake_subsidy_proportion(&self) -> u16 {
-        self.0.stake_reward_proportion
-    }
-    fn treasury_subsidy_proportion(&self) -> u16 {
-        self.0.block_tax_proportion
-    }
-    fn stake_validation_begin_height(&self) -> i64 {
-        self.0.stake_validation_height
-    }
-    fn votes_per_block(&self) -> u16 {
-        self.0.tickets_per_block
-    }
-}
-
 #[test]
 fn subsidy_differential() {
     let Some(mut oracle) = oracle_or_skip() else {
@@ -412,11 +374,15 @@ fn subsidy_differential() {
     let mut rng = SplitMix64::from_entropy("standalone-subsidy-differential");
 
     let nets = ["mainnet", "testnet3", "simnet", "regnet"];
-    let mut caches: Vec<SubsidyCache<ChainSubsidyParams>> = vec![
-        SubsidyCache::new(ChainSubsidyParams(mainnet_params())),
-        SubsidyCache::new(ChainSubsidyParams(testnet3_params())),
-        SubsidyCache::new(ChainSubsidyParams(simnet_params())),
-        SubsidyCache::new(ChainSubsidyParams(regnet_params())),
+    // The caches are built over the chain parameters themselves, whose
+    // `SubsidyParams` impl lives in dcroxide-chaincfg, as dcrd's oracle
+    // side builds over `*chaincfg.Params`: the differential pins that
+    // mapping as well as the cache.
+    let mut caches: Vec<SubsidyCache<Params>> = vec![
+        SubsidyCache::new(mainnet_params()),
+        SubsidyCache::new(testnet3_params()),
+        SubsidyCache::new(simnet_params()),
+        SubsidyCache::new(regnet_params()),
     ];
 
     const ROUNDS: usize = 300;

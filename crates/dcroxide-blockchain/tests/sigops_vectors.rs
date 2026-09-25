@@ -12,8 +12,8 @@
 use std::collections::BTreeMap;
 
 use dcroxide_blockchain::validate::{
-    ChainSubsidyParams, check_stake_base_amounts, count_p2sh_sig_ops, count_sig_ops,
-    count_total_sig_ops, get_stake_base_amounts,
+    check_stake_base_amounts, count_p2sh_sig_ops, count_sig_ops, count_total_sig_ops,
+    get_stake_base_amounts,
 };
 use dcroxide_blockchain::{RuleError, UtxoEntry};
 use dcroxide_chaincfg::simnet_params;
@@ -53,7 +53,7 @@ fn parse_txs(s: &str) -> Vec<MsgTx> {
 #[test]
 fn sigops_vectors() {
     let params = simnet_params();
-    let mut subsidy_cache = SubsidyCache::new(ChainSubsidyParams(&params));
+    let mut subsidy_cache = SubsidyCache::new(&params);
     let data = include_str!("data/sigops_vectors.txt");
 
     let mut utxos: BTreeMap<UtxoKey, UtxoEntry> = BTreeMap::new();

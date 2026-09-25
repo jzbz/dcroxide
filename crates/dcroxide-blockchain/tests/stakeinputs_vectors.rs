@@ -16,9 +16,8 @@ use std::collections::BTreeMap;
 
 use dcroxide_blockchain::chainio::deserialize_to_minimal_outputs;
 use dcroxide_blockchain::validate::{
-    ChainSubsidyParams, calc_ticket_return_amounts, check_revocation_inputs,
-    check_ticket_purchase_inputs, check_vote_inputs, is_allowed_ticket_input_script_form,
-    is_stake_submission,
+    calc_ticket_return_amounts, check_revocation_inputs, check_ticket_purchase_inputs,
+    check_vote_inputs, is_allowed_ticket_input_script_form, is_stake_submission,
 };
 use dcroxide_blockchain::{RuleError, UtxoEntry};
 use dcroxide_chaincfg::mainnet_params;
@@ -56,7 +55,7 @@ fn kind_of(result: Result<(), RuleError>) -> String {
 #[test]
 fn stakeinputs_vectors() {
     let params = mainnet_params();
-    let mut subsidy_cache = SubsidyCache::new(ChainSubsidyParams(&params));
+    let mut subsidy_cache = SubsidyCache::new(&params);
     let data = include_str!("data/stakeinputs_vectors.txt");
 
     let mut utxos: BTreeMap<UtxoKey, UtxoEntry> = BTreeMap::new();

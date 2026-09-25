@@ -18,6 +18,8 @@ use crate::common::{
     ChainQueryer, INTERRUPT_MSG, Indexer, Interrupt, interrupt_requested, maybe_notify_subscribers,
 };
 use crate::error::{ErrorKind, IdxError, indexer_error};
+use crate::log::{LogLevel, LogSink, log_line};
+use crate::progresslog::BlockProgressLogger;
 
 /// An index notification type (dcrd `IndexNtfnType`).  dcrd models
 /// this as a plain integer and the update path reports unknown
@@ -71,6 +73,7 @@ struct SubEntry {
 /// `IndexSubscriber`).
 pub struct IndexSubscriber {
     interrupt: Interrupt,
+    log: Option<LogSink>,
     subscriptions: BTreeMap<String, SubEntry>,
     subscribers: u32,
     cancelled: bool,
@@ -78,9 +81,16 @@ pub struct IndexSubscriber {
 
 impl IndexSubscriber {
     /// Create a new index subscriber (dcrd `NewIndexSubscriber`).
-    pub fn new(interrupt: Interrupt) -> IndexSubscriber {
+    ///
+    /// `log` stands in for the package logger dcrd installs with
+    /// `indexers.UseLogger` (see [`LogSink`]): the subscriber's
+    /// catch-up, recovery and relay lines go to it, and so do those of
+    /// the indexes created over it, including an interrupted drop they
+    /// resume.  `None` logs nothing, as dcrd's disabled default does.
+    pub fn new(interrupt: Interrupt, log: Option<LogSink>) -> IndexSubscriber {
         IndexSubscriber {
             interrupt,
+            log,
             subscriptions: BTreeMap::new(),
             subscribers: 0,
             cancelled: false,
@@ -90,6 +100,11 @@ impl IndexSubscriber {
     /// The shared interrupt flag.
     pub fn interrupt(&self) -> Interrupt {
         self.interrupt.clone()
+    }
+
+    /// The sink the subscriber and its indexes log to.
+    pub(crate) fn log(&self) -> Option<&LogSink> {
+        self.log.as_ref()
     }
 
     /// Whether a notification error has cancelled the subscriber
@@ -223,6 +238,11 @@ impl IndexSubscriber {
             // possible for a dependent to have a lower tip height
             // than its prerequisite.  dcrd discards the relay error
             // on this path.
+            log_line(
+                self.log.as_ref(),
+                LogLevel::Trace,
+                &format!("{name}: relaying notification for height {ntfn_height} to dependent"),
+            );
             let _ = self.notify_dependent(chain, ntfn);
         } else if ntfn_height > expected_height {
             // Receiving a notification with a height higher than the
@@ -377,6 +397,17 @@ impl IndexSubscriber {
             return Ok(());
         }
 
+        // Create a progress logger for the indexing process below.
+        let mut progress_logger = BlockProgressLogger::new("Indexed", self.log.as_ref());
+
+        // At least one index needs to be caught up, so log the details
+        // and loop through each block that needs to be indexed.
+        log_line(
+            self.log.as_ref(),
+            LogLevel::Info,
+            &format!("Catching up from height {lowest_height} to {best_height}"),
+        );
+
         let mut cached_parent: Option<Arc<MsgBlock>> = None;
         let mut height = lowest_height.saturating_add(1);
         while height <= best_height {
@@ -433,9 +464,16 @@ impl IndexSubscriber {
                 }
             }
 
+            progress_logger.log_block_height(&child);
             cached_parent = Some(child);
             height = height.saturating_add(1);
         }
+
+        log_line(
+            self.log.as_ref(),
+            LogLevel::Info,
+            &format!("Caught up to height {best_height}"),
+        );
 
         Ok(())
     }
@@ -452,6 +490,7 @@ impl IndexSubscriber {
             )
         })?;
         let idx = chain[0].1.clone();
+        let name = idx.lock().expect("indexer lock poisoned").name();
 
         // Fetch the current tip for the index.
         let (mut height, mut hash) = idx.lock().expect("indexer lock poisoned").tip()?;
@@ -467,6 +506,15 @@ impl IndexSubscriber {
         if queryer.main_chain_has_block(&hash) {
             return Ok(());
         }
+
+        log_line(
+            self.log.as_ref(),
+            LogLevel::Info,
+            &format!("{name}: recovering from tip {height} ({hash})"),
+        );
+
+        // Create a progress logger for the recovery process below.
+        let mut progress_logger = BlockProgressLogger::new("Recovered", self.log.as_ref());
 
         let mut cached_block: Option<Arc<MsgBlock>> = None;
         while !queryer.main_chain_has_block(&hash) {
@@ -502,7 +550,15 @@ impl IndexSubscriber {
             // Update the tip to the previous block.
             hash = block.header.prev_block;
             height = height.saturating_sub(1);
+
+            progress_logger.log_block_height(&block);
         }
+
+        log_line(
+            self.log.as_ref(),
+            LogLevel::Info,
+            &format!("{name}: index recovered to tip {height} ({hash})"),
+        );
 
         Ok(())
     }
@@ -610,7 +666,12 @@ mod tests {
         fn notify_sync_subscribers(&mut self) {
             notify_sync_subscribers(&mut self.subscribers);
         }
-        fn drop_index(&self, _: &Interrupt, _: &Database) -> Result<(), IdxError> {
+        fn drop_index(
+            &self,
+            _: &Interrupt,
+            _: &Database,
+            _: Option<&crate::LogSink>,
+        ) -> Result<(), IdxError> {
             Ok(())
         }
     }
@@ -653,7 +714,7 @@ mod tests {
             .set(Arc::downgrade(&handle))
             .unwrap_or_else(|_| unreachable!("set once"));
 
-        let mut subscriber = IndexSubscriber::new(Interrupt::default());
+        let mut subscriber = IndexSubscriber::new(Interrupt::default(), None);
         subscriber
             .subscribe("tip index", handle, NO_PREREQS)
             .expect("subscribe");

@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use dcroxide_blockchain::process::Chain;
+use dcroxide_blockchain::process::{Chain, OpenConfig};
 use dcroxide_chaincfg::Params;
 use dcroxide_chainhash::Hash;
 use dcroxide_database::{Database, ErrorKind, Options};
@@ -19,6 +19,11 @@ use dcroxide_node::addblock::{
 };
 use dcroxide_node::config::app_data_dir;
 use dcroxide_node::go_duration_string;
+
+/// The UTXO cache size dcrd's addblock imports with, in bytes (a fixed
+/// `100 * 1024 * 1024` in `newBlockImporter`,
+/// `cmd/addblock/import.go:318`; the tool has no flag for it).
+const ADDBLOCK_UTXO_CACHE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 /// dcrd's addblock logs through slog subsystem loggers on stdout; the
 /// port keeps the daemon's minimal level+tag line style.
@@ -171,7 +176,18 @@ fn import_main(cfg: &AddblockConfig, params: &Params) -> Result<(), ()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let chain = match Chain::open(db.clone(), params, Hash([0u8; 32]), false, created_unix) {
+    let mut config = OpenConfig::new(Hash([0u8; 32]), false, created_unix);
+    // dcrd's addblock hands the chain its CHAN logger
+    // (`blockchain.UseLogger(backendLogger.Logger("CHAN"))`,
+    // `cmd/addblock/addblock.go:77`) before the chain is built, so the
+    // open's startup lines, and whatever the chain logs during the
+    // import, print as they do there.
+    config.log = Some(dcroxide_node::chainntfns::chain_log_sink());
+    // dcrd's addblock builds its UTXO cache at a fixed 100 MiB, not the
+    // daemon's 150 MiB default (`cmd/addblock/import.go:315-319`), and
+    // ahead of `blockchain.New`.
+    config.utxo_cache_max_bytes = ADDBLOCK_UTXO_CACHE_MAX_BYTES;
+    let chain = match Chain::open_with_config(db.clone(), params, config) {
         Ok(chain) => chain,
         Err(e) => {
             log_error(&format!("Failed create block importer: {e:?}"));
@@ -184,12 +200,15 @@ fn import_main(cfg: &AddblockConfig, params: &Params) -> Result<(), ()> {
     // skipped when importing blocks (dcrd `chain.EnableBulkImportMode`).
     chain.lock().expect("chain mutex poisoned").bulk_import_mode = true;
 
-    if cfg.tx_index {
-        log_info("Transaction index is enabled");
-    }
-    if !cfg.no_exists_addr_index {
-        log_info("Exists address index is enabled");
-    }
+    // dcrd's addblock binds the indexers' package logger to INDX
+    // (`indexers.UseLogger(backendLogger.Logger("INDX"))`,
+    // `cmd/addblock/addblock.go:78`) and announces each enabled index
+    // under its own MAIN logger just ahead of creating it
+    // (`cmd/addblock/import.go:344`, `:352`).
+    let logs = dcroxide_node::indexes::IndexLogs {
+        indexers: Some(dcroxide_node::logging::indx_log_sink()),
+        announce: Some(dcroxide_node::logging::subsystem_log_sink("MAIN")),
+    };
     let interrupt: dcroxide_indexers::Interrupt =
         Arc::new(core::sync::atomic::AtomicBool::new(false));
     let _indexes = match dcroxide_node::indexes::start_indexes(
@@ -199,6 +218,7 @@ fn import_main(cfg: &AddblockConfig, params: &Params) -> Result<(), ()> {
         params.clone(),
         cfg.tx_index,
         !cfg.no_exists_addr_index,
+        &logs,
     ) {
         Ok(indexes) => indexes,
         Err(e) => {

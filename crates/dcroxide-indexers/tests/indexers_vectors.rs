@@ -22,7 +22,8 @@ use dcroxide_database::{Database, Options};
 use dcroxide_indexers::{
     CONNECT_NTFN, ChainQueryer, DISCONNECT_NTFN, EXISTS_ADDR_INDEX_KEY, EXISTS_ADDRESS_INDEX_NAME,
     ExistsAddrIndex, HASH_BY_ID_INDEX_BUCKET_NAME, ID_BY_HASH_INDEX_BUCKET_NAME, IndexNtfn,
-    IndexNtfnType, IndexSubscriber, Indexer, TX_INDEX_KEY, TX_INDEX_NAME, TxIndex,
+    IndexNtfnType, IndexSubscriber, Indexer, LogLevel, LogSink, TX_INDEX_KEY, TX_INDEX_NAME,
+    TxIndex,
 };
 use dcroxide_testutil::unhex;
 use dcroxide_txscript::stdaddr::{Address, decode_address};
@@ -173,7 +174,10 @@ impl Scenario {
             _dir: dir,
             db,
             chain: Arc::new(TestChain::new(params)),
-            subber: IndexSubscriber::new(Arc::new(core::sync::atomic::AtomicBool::new(false))),
+            subber: IndexSubscriber::new(
+                Arc::new(core::sync::atomic::AtomicBool::new(false)),
+                None,
+            ),
             tx_idx: None,
             ex_idx: None,
         }
@@ -428,7 +432,7 @@ fn indexers_vectors() {
                 let idx = sc.tx_idx.as_ref().expect("tx index");
                 idx.lock()
                     .expect("indexer lock poisoned")
-                    .drop_index(&interrupt, &sc.db)
+                    .drop_index(&interrupt, &sc.db, None)
                     .expect("drop");
                 compare_state(&mut lines, sc, line);
             }
@@ -438,7 +442,7 @@ fn indexers_vectors() {
                 let idx = sc.ex_idx.as_ref().expect("exists index");
                 idx.lock()
                     .expect("indexer lock poisoned")
-                    .drop_index(&interrupt, &sc.db)
+                    .drop_index(&interrupt, &sc.db, None)
                     .expect("drop");
                 compare_state(&mut lines, sc, line);
             }
@@ -539,7 +543,8 @@ fn sync_waiters_and_legacy_drops() {
     let opts = Options::new(dir.path().join("db"), params.net.0);
     let db = Arc::new(Database::create(&opts).expect("db"));
     let chain = Arc::new(TestChain::new(params));
-    let mut subber = IndexSubscriber::new(Arc::new(core::sync::atomic::AtomicBool::new(false)));
+    let mut subber =
+        IndexSubscriber::new(Arc::new(core::sync::atomic::AtomicBool::new(false)), None);
 
     let idx = TxIndex::new(
         &mut subber,
@@ -578,8 +583,8 @@ fn sync_waiters_and_legacy_drops() {
     // The legacy drop helpers are no-ops without the tips entry and
     // remove the bucket, tip, version, and drop marker with it.
     let interrupt = subber.interrupt();
-    dcroxide_indexers::drop_addr_index(&interrupt, &db).expect("noop addr drop");
-    dcroxide_indexers::drop_cf_index(&db).expect("noop cf drop");
+    dcroxide_indexers::drop_addr_index(&interrupt, &db, None).expect("noop addr drop");
+    dcroxide_indexers::drop_cf_index(&db, None).expect("noop cf drop");
 
     for legacy in [
         dcroxide_indexers::ADDR_INDEX_KEY,
@@ -594,8 +599,8 @@ fn sync_waiters_and_legacy_drops() {
         tips.put(legacy, &[7u8; 36]).expect("tip");
         db_tx.commit().expect("commit");
     }
-    dcroxide_indexers::drop_addr_index(&interrupt, &db).expect("addr drop");
-    dcroxide_indexers::drop_cf_index(&db).expect("cf drop");
+    dcroxide_indexers::drop_addr_index(&interrupt, &db, None).expect("addr drop");
+    dcroxide_indexers::drop_cf_index(&db, None).expect("cf drop");
 
     let db_tx = db.begin(false).expect("begin");
     let meta = db_tx.metadata();
@@ -632,7 +637,8 @@ fn a_short_block_id_index_row_is_a_corruption_error_not_a_panic() {
     let opts = Options::new(dir.path().join("db"), params.net.0);
     let db = Arc::new(Database::create(&opts).expect("db"));
     let chain = Arc::new(TestChain::new(params));
-    let mut subber = IndexSubscriber::new(Arc::new(core::sync::atomic::AtomicBool::new(false)));
+    let mut subber =
+        IndexSubscriber::new(Arc::new(core::sync::atomic::AtomicBool::new(false)), None);
     let idx = TxIndex::new(
         &mut subber,
         db.clone(),
@@ -694,7 +700,7 @@ fn a_short_block_id_index_row_is_a_corruption_error_not_a_panic() {
     // aborting the process, and instead of reading the corrupt row as an
     // unused id and handing block ID 1 out a second time.
     let mut fresh_subber =
-        IndexSubscriber::new(Arc::new(core::sync::atomic::AtomicBool::new(false)));
+        IndexSubscriber::new(Arc::new(core::sync::atomic::AtomicBool::new(false)), None);
     let err = TxIndex::new(
         &mut fresh_subber,
         db.clone(),
@@ -725,4 +731,304 @@ fn indexer_state_is_send() {
     assert_send_sync::<Arc<Mutex<dyn Indexer>>>();
     assert_send_sync::<dcroxide_indexers::Interrupt>();
     assert_send_sync::<dcroxide_indexers::SyncWaiter>();
+}
+
+/// Lines captured from a [`LogSink`], with their levels.
+type Captured = Arc<Mutex<Vec<(LogLevel, String)>>>;
+
+/// A sink that records every line, and the buffer it records into.
+fn capturing_sink() -> (LogSink, Captured) {
+    let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+    let lines = Arc::clone(&captured);
+    let sink: LogSink = Arc::new(move |level, msg: &str| {
+        lines.lock().expect("lines").push((level, msg.to_string()));
+    });
+    (sink, captured)
+}
+
+/// Drain the captured lines at `level`, discarding the rest.
+fn take_at(captured: &Captured, level: LogLevel) -> Vec<String> {
+    std::mem::take(&mut *captured.lock().expect("lines"))
+        .into_iter()
+        .filter(|(l, _)| *l == level)
+        .map(|(_, msg)| msg)
+        .collect()
+}
+
+/// A block of the dump's first scenario by name.
+fn vector_block(name: &str) -> Arc<MsgBlock> {
+    let prefix = format!("block {name} ");
+    let hex = include_str!("data/indexers_vectors.txt")
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .expect("block hex");
+    parse_block(hex)
+}
+
+/// The rows in an index bucket.
+fn bucket_rows(db: &Database, key: &[u8]) -> usize {
+    let db_tx = db.begin(false).expect("begin");
+    let rows = db_tx.metadata().bucket(key).map_or(0, |bucket| {
+        let mut cursor = bucket.cursor();
+        let mut n = 0;
+        let mut ok = cursor.first();
+        while ok {
+            n += 1;
+            ok = cursor.next();
+        }
+        n
+    });
+    db_tx.rollback().expect("rollback");
+    rows
+}
+
+/// The indexers log dcrd's package lines, at dcrd's levels, through the
+/// sink the caller passes in: the catch-up, the recovery of a tip that
+/// left the main chain, the relay of a notification below the tip, the
+/// block ID scan of the transaction index, every drop with its
+/// per-batch deletions, a drop of an index that is not there, the
+/// resumption of an interrupted drop, and the legacy index drops.
+///
+/// The texts are dcrd's (`indexsubscriber.go:264`, `:331`;
+/// `common.go:247`, `:305`, `:309`, `:337`, `:431`, `:486`, `:528`,
+/// `:671`; `txindex.go:385`, `:403`, `:417`, `:639`, `:651`, `:677`;
+/// `dropaddrindex.go:37`, `:56`; `dropcfindex.go:36`, `:46`).  The
+/// periodic "Indexed"/"Recovered" progress lines need ten seconds of
+/// work and are pinned by the progress logger's own tests.
+#[test]
+fn the_indexers_log_dcrd_lines_to_the_sink() {
+    let params = leaked_params();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let opts = Options::new(dir.path().join("db"), params.net.0);
+    let db = Arc::new(Database::create(&opts).expect("db"));
+    let chain = Arc::new(TestChain::new(params));
+    let (sink, captured) = capturing_sink();
+    let new_subber = || {
+        IndexSubscriber::new(
+            Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            Some(sink.clone()),
+        )
+    };
+    for name in ["bk1", "bk2", "bk3"] {
+        chain.add_block(vector_block(name));
+    }
+
+    // A new index scans for its highest block ID and finds none.
+    let mut subber = new_subber();
+    let tx_idx = TxIndex::new(
+        &mut subber,
+        db.clone(),
+        chain.clone() as Arc<dyn ChainQueryer>,
+    )
+    .expect("tx index");
+    assert_eq!(
+        *captured.lock().expect("lines"),
+        [
+            (
+                LogLevel::Trace,
+                "Forward scan (highest known 0, next unknown 1)".to_string()
+            ),
+            (LogLevel::Debug, "Current internal block ID: 0".to_string()),
+        ]
+    );
+    captured.lock().expect("lines").clear();
+
+    // The catch-up brackets its work.
+    subber.catch_up(&*chain).expect("catch up");
+    assert_eq!(
+        take_at(&captured, LogLevel::Info),
+        ["Catching up from height 0 to 3", "Caught up to height 3"]
+    );
+
+    // A notification below the index tip is relayed to the dependent.
+    let ntfn = IndexNtfn {
+        ntfn_type: CONNECT_NTFN,
+        block: vector_block("bk1"),
+        parent: Arc::new(params.genesis_block.clone()),
+        is_treasury_enabled: false,
+    };
+    subber.update_index(TX_INDEX_NAME, &ntfn).expect("relay");
+    assert_eq!(
+        take_at(&captured, LogLevel::Trace),
+        ["transaction index: relaying notification for height 1 to dependent"]
+    );
+
+    // The index follows the chain to bk5, which is then reorganized
+    // out for bk5a; the next start recovers the index to bk4 and
+    // catches it up again.
+    for (name, parent) in [("bk4", "bk3"), ("bk5", "bk4")] {
+        let block = vector_block(name);
+        chain.add_block(block.clone());
+        subber
+            .notify(&IndexNtfn {
+                ntfn_type: CONNECT_NTFN,
+                block,
+                parent: vector_block(parent),
+                is_treasury_enabled: false,
+            })
+            .expect("connect");
+    }
+    assert!(
+        captured.lock().expect("lines").is_empty(),
+        "connects log nothing"
+    );
+    drop(tx_idx);
+    subber.stop(TX_INDEX_NAME).expect("stop");
+    let (bk4, bk5) = (vector_block("bk4"), vector_block("bk5"));
+    chain.remove_block(&bk5);
+    chain.add_block(vector_block("bk5a"));
+
+    let mut subber = new_subber();
+    TxIndex::new(
+        &mut subber,
+        db.clone(),
+        chain.clone() as Arc<dyn ChainQueryer>,
+    )
+    .expect("recovered tx index");
+    let lines = std::mem::take(&mut *captured.lock().expect("lines"));
+    let at = |level: LogLevel| -> Vec<&str> {
+        lines
+            .iter()
+            .filter(|(l, _)| *l == level)
+            .map(|(_, msg)| msg.as_str())
+            .collect()
+    };
+    assert_eq!(
+        at(LogLevel::Info),
+        [
+            format!(
+                "transaction index: recovering from tip 5 ({})",
+                bk5.header.block_hash()
+            ),
+            format!(
+                "transaction index: index recovered to tip 4 ({})",
+                bk4.header.block_hash()
+            ),
+        ]
+    );
+    let scans = at(LogLevel::Trace);
+    assert_eq!(
+        scans.first().copied(),
+        Some("Forward scan (highest known 1, next unknown 100001)")
+    );
+    assert_eq!(
+        scans.last().copied(),
+        Some("Binary scan (highest known 4, next unknown 5)")
+    );
+    assert!(
+        scans[1..].iter().all(|l| l.starts_with("Binary scan (")),
+        "{scans:?}"
+    );
+    assert_eq!(at(LogLevel::Debug), ["Current internal block ID: 4"]);
+    subber.catch_up(&*chain).expect("catch up");
+    assert_eq!(
+        take_at(&captured, LogLevel::Info),
+        ["Catching up from height 4 to 5", "Caught up to height 5"]
+    );
+
+    // The drop announces itself, reports each batch, and finishes; a
+    // second drop finds nothing to do.
+    let rows = bucket_rows(&db, TX_INDEX_KEY);
+    assert!(rows > 0, "the index holds entries");
+    let interrupt = subber.interrupt();
+    dcroxide_indexers::drop_tx_index(&interrupt, &db, Some(&sink)).expect("drop");
+    dcroxide_indexers::drop_tx_index(&interrupt, &db, Some(&sink)).expect("second drop");
+    assert_eq!(
+        take_at(&captured, LogLevel::Info),
+        [
+            "Dropping all transaction index entries.  This might take a while...".to_string(),
+            format!("Deleted {rows} keys ({rows} total) from transaction index"),
+            "Dropped transaction index".to_string(),
+            "Not dropping transaction index because it does not exist".to_string(),
+        ]
+    );
+
+    // An interrupted drop leaves its marker, and the next start resumes
+    // it before creating the index afresh; the entries are already
+    // gone, so the resumed drop deletes none and says nothing of it.
+    let mut subber = new_subber();
+    TxIndex::new(
+        &mut subber,
+        db.clone(),
+        chain.clone() as Arc<dyn ChainQueryer>,
+    )
+    .expect("tx index");
+    subber.catch_up(&*chain).expect("catch up");
+    let rows = bucket_rows(&db, TX_INDEX_KEY);
+    captured.lock().expect("lines").clear();
+    let interrupted = Arc::new(core::sync::atomic::AtomicBool::new(true));
+    let err = dcroxide_indexers::drop_tx_index(&interrupted, &db, Some(&sink))
+        .expect_err("the drop stops at the interrupt");
+    assert_eq!(err.kind_name(), Some("ErrInterruptRequested"), "{err}");
+    let mut subber = new_subber();
+    TxIndex::new(
+        &mut subber,
+        db.clone(),
+        chain.clone() as Arc<dyn ChainQueryer>,
+    )
+    .expect("tx index over a resumed drop");
+    assert_eq!(
+        take_at(&captured, LogLevel::Info),
+        [
+            "Dropping all transaction index entries.  This might take a while...".to_string(),
+            format!("Deleted {rows} keys ({rows} total) from transaction index"),
+            "Resuming transaction index drop".to_string(),
+            "Dropping all transaction index entries.  This might take a while...".to_string(),
+            "Dropped transaction index".to_string(),
+        ]
+    );
+
+    // The exists address index drops the same way.
+    ExistsAddrIndex::new(
+        &mut subber,
+        db.clone(),
+        chain.clone() as Arc<dyn ChainQueryer>,
+    )
+    .expect("exists index");
+    subber.catch_up(&*chain).expect("catch up");
+    captured.lock().expect("lines").clear();
+    let rows = bucket_rows(&db, EXISTS_ADDR_INDEX_KEY);
+    assert!(rows > 0, "the index holds entries");
+    dcroxide_indexers::drop_exists_addr_index(&interrupt, &db, Some(&sink)).expect("drop");
+    dcroxide_indexers::drop_exists_addr_index(&interrupt, &db, Some(&sink)).expect("second drop");
+    assert_eq!(
+        take_at(&captured, LogLevel::Info),
+        [
+            "Dropping all exists address index entries.  This might take a while...".to_string(),
+            format!("Deleted {rows} keys ({rows} total) from exists address index"),
+            "Dropped exists address index".to_string(),
+            "Not dropping exists address index because it does not exist".to_string(),
+        ]
+    );
+
+    // The legacy drops are silent when there is nothing to drop and
+    // name the legacy index when there is.
+    dcroxide_indexers::drop_addr_index(&interrupt, &db, Some(&sink)).expect("noop addr drop");
+    dcroxide_indexers::drop_cf_index(&db, Some(&sink)).expect("noop cf drop");
+    assert!(captured.lock().expect("lines").is_empty());
+    for legacy in [
+        dcroxide_indexers::ADDR_INDEX_KEY,
+        dcroxide_indexers::CF_INDEX_PARENT_BUCKET_KEY,
+    ] {
+        let db_tx = db.begin(true).expect("begin");
+        let meta = db_tx.metadata();
+        let bucket = meta.create_bucket(legacy).expect("legacy bucket");
+        bucket.put(b"k1", b"v1").expect("put");
+        bucket.put(b"k2", b"v2").expect("put");
+        let tips = meta.bucket(b"idxtips").expect("tips bucket");
+        tips.put(legacy, &[7u8; 36]).expect("tip");
+        db_tx.commit().expect("commit");
+    }
+    dcroxide_indexers::drop_addr_index(&interrupt, &db, Some(&sink)).expect("addr drop");
+    dcroxide_indexers::drop_cf_index(&db, Some(&sink)).expect("cf drop");
+    assert_eq!(
+        take_at(&captured, LogLevel::Info),
+        [
+            "Dropping all legacy address index entries.  This might take a while...",
+            "Deleted 2 keys (2 total) from address index",
+            "Dropped address index",
+            "Dropping all legacy committed filter index entries.  This might take a while...",
+            "Dropped committed filter index",
+        ]
+    );
 }
