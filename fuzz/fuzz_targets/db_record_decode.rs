@@ -19,6 +19,11 @@
 //! dcrd's treasury state and tspend readers do the same, but the port
 //! bounds those two reservations by the bytes the row has left and
 //! reports a negative tspend count, so every count reaches them here.
+//! Also left out: a minimal-outputs count of 2^63 or more.  dcrd's
+//! `readDeserializeSizeOfMinimalOutputs` loops `i < int(numOutputs)`, so
+//! it reads such a count as no outputs and passes the row, and
+//! `deserializeToMinimalOutputs` then dies in `make` on it; the port
+//! reproduces both.
 
 #![no_main]
 
@@ -87,6 +92,12 @@ fuzz_target!(|data: &[u8]| {
         10 => {
             // The reader dcrd guards the decoder with; the decoder itself
             // assumes a well-formed run, so only a validated one reaches it.
+            // A count Go's int() makes negative passes the reader as no
+            // outputs and aborts the decoder's `make`, in dcrd and here.
+            let (count, _) = compress::deserialize_vlq(rest);
+            if count >= 1 << 63 {
+                return;
+            }
             if let Ok(size) = dcroxide_blockchain::read_deserialize_size_of_minimal_outputs(rest) {
                 let (_, consumed) = chainio::deserialize_to_minimal_outputs(&rest[..size]);
                 assert_eq!(consumed, size, "minimal outputs size disagrees with decode");
