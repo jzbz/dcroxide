@@ -30,12 +30,10 @@ pub enum AutoPermits {
     Parked,
 }
 
-/// What one pass of the automatic reservation sequence came to.
+/// What finishing an automatic attempt whose permits are held came to
+/// ([`ConnManager::auto_outbound_reserve`]).
 #[derive(Debug, PartialEq, Eq)]
 pub enum AutoBegin {
-    /// No active-outbound or total-connection permit is free.  dcrd
-    /// blocks in the acquire; the daemon waits and tries again.
-    PermitsExhausted,
     /// The attempt failed after its permits were taken, and everything
     /// it had reserved is released again (a failed attempt for dcrd's
     /// `failedAttempts`).
@@ -110,13 +108,16 @@ impl ConnManager {
     /// address; any later failure releases everything through
     /// [`ConnManager::connect_unwind`] over [`ClosePlan::auto_outbound`],
     /// the plan the dial's failure and close run too, so no failure
-    /// branch can leak a permit or a group entry on its own.  Never
-    /// [`AutoBegin::PermitsExhausted`].
+    /// branch can leak a permit or a group entry on its own.
     ///
     /// Split from the permits and the pick so a daemon can draw the
     /// candidates between the two with its lock on the manager released
     /// (the address source takes the address manager's lock, and dcrd's
-    /// pick holds only the outbound groups' mutex).
+    /// pick holds only the outbound groups' mutex).  One pass of dcrd's
+    /// sequence is [`ConnManager::auto_outbound_acquire`], then
+    /// `pickOutboundAddr` ([`ConnManager::pick_outbound_addr`], or the
+    /// daemon's own loop over
+    /// [`ConnManager::claim_outbound_candidate`]), then this.
     pub fn auto_outbound_reserve(&mut self, picked: Result<NetAddress, String>) -> AutoBegin {
         let addr = match picked {
             Ok(addr) => addr,
@@ -143,34 +144,5 @@ impl ConnManager {
                 AutoBegin::Failed
             }
         }
-    }
-
-    /// One pass of dcrd `targetOutboundHandler`'s reservation sequence,
-    /// in its order: the active-outbounds permit, the total-connections
-    /// permit, `pickOutboundAddr` (which registers the address's group),
-    /// the per-host permit, and the dial registration (the prologue of
-    /// dcrd's `dial`).  dcrd blocks in the two acquires; here a permit
-    /// that is not free ends the pass with
-    /// [`AutoBegin::PermitsExhausted`], holding nothing (the daemon's
-    /// fill instead parks on the total permit through
-    /// [`ConnManager::auto_outbound_acquire`]).  Once the permits are
-    /// held the pass finishes as [`ConnManager::auto_outbound_reserve`]
-    /// does.  The source returns each candidate with its last attempt
-    /// time in nanoseconds, as [`ConnManager::pick_outbound_addr`] takes
-    /// it, and runs with the manager borrowed.
-    pub fn auto_outbound_begin(
-        &mut self,
-        get_new_address: &mut dyn FnMut() -> Result<(NetAddress, i64), String>,
-        now_nanos: i64,
-    ) -> AutoBegin {
-        if !self.active_outbounds_sem.try_acquire() {
-            return AutoBegin::PermitsExhausted;
-        }
-        if !self.total_normal_conns_sem.try_acquire() {
-            self.active_outbounds_sem.release();
-            return AutoBegin::PermitsExhausted;
-        }
-        let picked = self.pick_outbound_addr(get_new_address, now_nanos);
-        self.auto_outbound_reserve(picked)
     }
 }

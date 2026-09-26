@@ -14,7 +14,7 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use dcroxide_addrmgr::{AddrManager, AddrRng, PeersLoad};
+use dcroxide_addrmgr::{AddrManager, AddrRng, GoTime, PeersLoad};
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 const NOW_UNIX: i64 = 1_700_000_000;
@@ -80,7 +80,7 @@ fn a_far_past_last_attempt_is_not_recent() {
         let ka = am.known_address("1.2.3.4:9108").expect("loaded");
         let ka = ka.lock().expect("lock");
         assert_eq!(
-            ka.chance(NOW_UNIX * NANOS_PER_SEC).to_bits(),
+            ka.chance(GoTime::wall(NOW_UNIX * NANOS_PER_SEC)).to_bits(),
             f64::to_bits(want),
             "LastAttempt {last_attempt}, Attempts {attempts}"
         );
@@ -350,6 +350,49 @@ fn files_go_rejects_are_rejected() {
              into Go struct field "
         )),
         "{err}"
+    );
+
+    // dcrd's `newNetAddressFromString` returns `net.SplitHostPort`'s and
+    // `strconv.ParseUint`'s errors unchanged, and names the address
+    // only for a host of unknown type; `deserializePeers` wraps each.
+    // The port reported every one as an unknown address.
+    for (addr, want) in [
+        ("1.2.3.4", "address 1.2.3.4: missing port in address"),
+        ("::1:9108", "address ::1:9108: too many colons in address"),
+        (
+            "1.2.3.4:99999x",
+            r#"strconv.ParseUint: parsing "99999x": value out of range"#,
+        ),
+        (
+            "1.2.3.4:+9108",
+            r#"strconv.ParseUint: parsing "+9108": invalid syntax"#,
+        ),
+        (
+            "not-an-ip:9108",
+            "failed to deserialize address not-an-ip:9108",
+        ),
+    ] {
+        let file = format!(
+            r#"{{"Version":1,"Key":[{}],"Addresses":[{}],"NewBuckets":[],"TriedBuckets":[]}}"#,
+            key_json(),
+            address_json(addr, "0", NOW_UNIX),
+        );
+        let mut am = manager(&dir);
+        assert_eq!(
+            am.deserialize_peers(&file),
+            Err(format!("failed to deserialize netaddress {addr}: {want}")),
+            "{addr}"
+        );
+    }
+    // The source address is parsed the same way.
+    let file = one_address("0", NOW_UNIX).replace(r#""Src":"1.2.3.4:9108""#, r#""Src":"5.6.7.8""#);
+    let mut am = manager(&dir);
+    assert_eq!(
+        am.deserialize_peers(&file),
+        Err(
+            "failed to deserialize netaddress 5.6.7.8: address 5.6.7.8: missing port in address"
+                .to_string()
+        )
     );
 
     // dcrd dereferences a null `Addresses` entry and panics at startup;

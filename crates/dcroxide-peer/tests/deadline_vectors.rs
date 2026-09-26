@@ -150,6 +150,95 @@ fn get_data(invs: &[InvVect]) -> Message {
     })
 }
 
+/// The mixing message a `clearmix` row delivered, by label.  Only the
+/// command matters to the settlement, so every field is zero.
+fn mix_message(label: &str) -> Message {
+    use dcroxide_wire::{
+        MsgMixCiphertexts, MsgMixConfirm, MsgMixDCNet, MsgMixFactoredPoly, MsgMixKeyExchange,
+        MsgMixPairReq, MsgMixSecrets, MsgMixSlotReserve,
+    };
+    match label {
+        "mixpairreq" => Message::MixPairReq(MsgMixPairReq {
+            signature: [0; 64],
+            identity: [0; 33],
+            expiry: 0,
+            mix_amount: 0,
+            script_class: String::new(),
+            tx_version: 0,
+            lock_time: 0,
+            message_count: 0,
+            input_value: 0,
+            utxos: Vec::new(),
+            change: None,
+            flags: 0,
+            pairing_flags: 0,
+        }),
+        "mixkeyxchg" => Message::MixKeyExchange(Box::new(MsgMixKeyExchange {
+            signature: [0; 64],
+            identity: [0; 33],
+            session_id: [0; 32],
+            epoch: 0,
+            run: 0,
+            pos: 0,
+            ecdh: [0; 33],
+            pqpk: [0; 1218],
+            commitment: [0; 32],
+            seen_prs: Vec::new(),
+        })),
+        "mixcphrtxt" => Message::MixCiphertexts(MsgMixCiphertexts {
+            signature: [0; 64],
+            identity: [0; 33],
+            session_id: [0; 32],
+            run: 0,
+            ciphertexts: Vec::new(),
+            seen_key_exchanges: Vec::new(),
+        }),
+        "mixslotres" => Message::MixSlotReserve(MsgMixSlotReserve {
+            signature: [0; 64],
+            identity: [0; 33],
+            session_id: [0; 32],
+            run: 0,
+            dc_mix: Vec::new(),
+            seen_ciphertexts: Vec::new(),
+        }),
+        "mixfactpoly" => Message::MixFactoredPoly(MsgMixFactoredPoly {
+            signature: [0; 64],
+            identity: [0; 33],
+            session_id: [0; 32],
+            run: 0,
+            roots: Vec::new(),
+            seen_slot_reserves: Vec::new(),
+        }),
+        "mixdcnet" => Message::MixDCNet(MsgMixDCNet {
+            signature: [0; 64],
+            identity: [0; 33],
+            session_id: [0; 32],
+            run: 0,
+            dc_net: Vec::new(),
+            seen_slot_reserves: Vec::new(),
+        }),
+        "mixconfirm" => Message::MixConfirm(MsgMixConfirm {
+            signature: [0; 64],
+            identity: [0; 33],
+            session_id: [0; 32],
+            run: 0,
+            mix: dump_tx(),
+            seen_dc_nets: Vec::new(),
+        }),
+        "mixsecrets" => Message::MixSecrets(MsgMixSecrets {
+            signature: [0; 64],
+            identity: [0; 33],
+            session_id: [0; 32],
+            run: 0,
+            seed: [0; 32],
+            slot_reserve_msgs: Vec::new(),
+            dc_net_msgs: Vec::new(),
+            seen_secrets: Vec::new(),
+        }),
+        other => panic!("unknown clearmix label {other}"),
+    }
+}
+
 /// The `clear` rows: what to arm, then what arrives.
 fn clear_case(label: &str) -> (Vec<InvVect>, Message, Option<Hash>) {
     let block = dump_block();
@@ -286,7 +375,9 @@ fn deadline_tables_match_dcrd_master() {
             }
 
             // Each mixing message settles its own InvTypeMix entry,
-            // keyed by the hash the reader computed for it.
+            // keyed by the hash the reader computed for it.  The dump's
+            // column is the hash dcrd cached on the message it delivered,
+            // so it stands in for the reader's here.
             "clearmix" => {
                 let mix_hash = f[3].parse::<Hash>().expect("mix hash");
                 let armed = InvVect {
@@ -299,9 +390,9 @@ fn deadline_tables_match_dcrd_master() {
                     &get_data(&[armed, inv(InvType::BLOCK, 9)]),
                     STALL_RESPONSE_TIMEOUT,
                 );
-                // Every mixing command settles the same way; the label
-                // is the command the dump delivered.
-                maybe_remove_deadline(&mut pending, &dcroxide_peer::Settles::Inventory(armed));
+                let received = mix_message(f[1]);
+                assert_eq!(received.command(), f[2], "{line}: command");
+                maybe_remove_deadline(&mut pending, &settles(&received, Some(mix_hash)));
                 let (data, cmds) = summarize(&pending);
                 assert_eq!(data, f[4], "{line}: pendingData");
                 assert_eq!(cmds, f[5], "{line}: pendingCmds");

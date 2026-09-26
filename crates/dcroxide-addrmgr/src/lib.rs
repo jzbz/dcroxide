@@ -17,12 +17,14 @@
 
 use core::fmt;
 
+mod gotime;
 mod manager;
 mod netaddress;
 mod network;
 mod seed;
 mod tordns;
 
+pub use gotime::{GoTime, monotonic_nanos};
 pub use manager::{
     AddrManager, AddrRng, AddressPriority, Clock, KnownAddress, KnownAddressRef, LocalAddr,
     NEW_BUCKET_COUNT, NetAddressReach, PEERS_FILENAME, PeersLoad, SystemRng, TRIED_BUCKET_COUNT,

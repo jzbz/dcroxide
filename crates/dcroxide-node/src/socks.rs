@@ -5,7 +5,7 @@
 //! RFC 1929 username/password authentication, the TCP CONNECT
 //! command over a domain address, the reply status table, and Tor
 //! isolation drawing random credentials per connection) and of dcrd
-//! `connmgr.TorLookupIP` (Tor's SOCKS RESOLVE extension with its own
+//! `addrmgr.TorLookupIP` (Tor's SOCKS RESOLVE extension with its own
 //! error table).
 //!
 //! go-socks wraps the stream in a `proxiedConn` that reports the
@@ -134,29 +134,107 @@ fn write_full(conn: &mut TcpStream, buf: &[u8], deadline: Deadline) -> Result<()
     Ok(())
 }
 
-/// Connect to a `host:port` proxy address like Go's `net.Dialer`:
-/// resolve the name (a hostname proxy such as Tor's default
-/// `localhost:9050` is common) and connect to the resolved addresses
-/// in order until one succeeds.  When none does, the first address's
-/// error is the one reported, in Go's text (`dialSerial`: "The error
-/// from the first address is most relevant"), which go-socks and
-/// `TorLookupIP` return as it is.
+/// std's text for a TCP connect that ran out its timeout
+/// (`TcpStream::connect_timeout`'s `TimedOut`), and the text the proxy
+/// connect reports when the dial's deadline passes before an address's
+/// turn: in both cases Go's dialer fails with an error that `errors.Is`
+/// `context.DeadlineExceeded`, which the outbound driver turns into the
+/// connect handlers' timeout.
+pub(crate) const CONNECT_TIMED_OUT: &str = "connection timed out";
+
+/// Go's head start for the first address family (`net/dial.go`
+/// `fallbackDelay`, the zero `net.Dialer`'s 300 ms).
+const FALLBACK_DELAY: Duration = Duration::from_millis(300);
+
+/// Connect to a `host:port` proxy address like the zero `net.Dialer`
+/// go-socks and `TorLookupIP` dial with: resolve the name (a hostname
+/// proxy such as Tor's default `localhost:9050` is common), split the
+/// addresses by the family of the first as `Dialer.DialContext` does for
+/// a dual-stack dialer, and race the two families ([`dial_parallel`]).
+/// The error reported is Go's, which go-socks and `TorLookupIP` return
+/// as it is.
+///
+/// Go splits the time among the addresses only when the context has a
+/// deadline ([`dial_serial`]).  go-socks's does: connmgr's dial timeout,
+/// or the seeder's minute.  dcrd runs `TorLookupIP` under
+/// `context.Background()` (`config.go:1270`, `:1310`), so there each
+/// address's connect runs until the kernel gives up, and no deadline
+/// error exists.  For a Tor lookup, `deadline` is the port's own bound
+/// (see [`tor_lookup_ip`]), and it is split the same way.
 fn connect_proxy(addr: &str, deadline: Deadline) -> Result<TcpStream, String> {
     use std::net::ToSocketAddrs;
     let resolved: Vec<std::net::SocketAddr> = addr
         .to_socket_addrs()
         .map_err(|e| format!("invalid proxy address {addr}: {e}"))?
         .collect();
+    if resolved.is_empty() {
+        return Err(format!("no addresses found for proxy {addr}"));
+    }
+    let (primaries, fallbacks) = partition_by_family(resolved);
+    dial_parallel(primaries, fallbacks, deadline, TcpStream::connect_timeout)
+}
+
+/// Go's `addrList.partition(isIPv4)`: the addresses of the first
+/// address's family, then the rest, each in order.  An IPv4-mapped IPv6
+/// address counts as IPv4, as `IP.To4` has it.
+fn partition_by_family(
+    addrs: Vec<std::net::SocketAddr>,
+) -> (Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>) {
+    let is_ipv4 = |addr: &std::net::SocketAddr| match addr.ip() {
+        std::net::IpAddr::V4(_) => true,
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some(),
+    };
+    let Some(primary_label) = addrs.first().map(is_ipv4) else {
+        return (Vec::new(), Vec::new());
+    };
+    addrs
+        .into_iter()
+        .partition(|addr| is_ipv4(addr) == primary_label)
+}
+
+/// Go's `partialDeadline` (`net/dial.go`): how long the next of
+/// `addrs_remaining` addresses may take out of the `left` before the
+/// deadline — an equal share, at least two seconds, or all of `left`
+/// when less than that remains.  `None` once the deadline has passed.
+fn partial_timeout(left: Duration, addrs_remaining: usize) -> Option<Duration> {
+    const SANE_MINIMUM: Duration = Duration::from_secs(2);
+    if left.is_zero() {
+        return None;
+    }
+    let share = left / u32::try_from(addrs_remaining.max(1)).unwrap_or(u32::MAX);
+    Some(if share < SANE_MINIMUM {
+        left.min(SANE_MINIMUM)
+    } else {
+        share
+    })
+}
+
+/// Go's `dialSerial` (`net/dial.go`): the addresses in turn, each given
+/// its [`partial_timeout`] share of the time left, until one connects.
+/// The first address's error is the one reported ("The error from the
+/// first address is most relevant"), except that once the deadline has
+/// passed before an address's turn Go's context is done and the dial
+/// fails with its deadline error instead ([`CONNECT_TIMED_OUT`]).  Go
+/// computes the shares only under a context with a deadline, as
+/// go-socks's dial has.  Under `TorLookupIP`'s background context each
+/// address takes as long as the kernel's connect does, so for a Tor
+/// lookup both the shares and the timeout error come from the port's
+/// own bound.
+fn dial_serial<C>(
+    ras: &[std::net::SocketAddr],
+    deadline: Deadline,
+    connect: &C,
+) -> Result<TcpStream, String>
+where
+    C: Fn(&std::net::SocketAddr, Duration) -> std::io::Result<TcpStream>,
+{
     let mut first_err = None;
-    for socket in resolved {
-        // Go's dialer draws each attempt's timeout from the same
-        // deadline, so a name resolving to several addresses cannot
-        // spend the budget more than once.
+    for (i, ra) in ras.iter().enumerate() {
         let left = deadline.0.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err("i/o timeout".to_string());
-        }
-        match TcpStream::connect_timeout(&socket, left) {
+        let Some(timeout) = partial_timeout(left, ras.len() - i) else {
+            return Err(CONNECT_TIMED_OUT.to_string());
+        };
+        match connect(ra, timeout) {
             Ok(conn) => {
                 // Go's dialer sets TCP_NODELAY on every connection it
                 // makes, ignoring a failure (`newTCPConn`,
@@ -165,11 +243,99 @@ fn connect_proxy(addr: &str, deadline: Deadline) -> Result<TcpStream, String> {
                 return Ok(conn);
             }
             Err(e) => {
-                first_err.get_or_insert_with(|| go_connect_error(&socket.to_string(), &e));
+                first_err.get_or_insert_with(|| go_connect_error(&ra.to_string(), &e));
             }
         }
     }
-    Err(first_err.unwrap_or_else(|| format!("no addresses found for proxy {addr}")))
+    // Go's `errMissingAddress`, for an empty list.
+    Err(first_err.unwrap_or_else(|| "dial tcp: missing address".to_string()))
+}
+
+/// Go's `dialParallel` (`net/dial.go`): with no fallback family, the
+/// primaries in turn.  Otherwise the primary family dials at once and the
+/// fallback family after [`FALLBACK_DELAY`], or as soon as the primary
+/// family has failed, and the first connection wins; when both fail the
+/// primary family's error is reported.  Each family races on its own
+/// thread.  Go cancels the loser; here a loser still connecting runs out
+/// its share of the deadline and its connection, if it makes one, is
+/// dropped.
+fn dial_parallel<C>(
+    primaries: Vec<std::net::SocketAddr>,
+    fallbacks: Vec<std::net::SocketAddr>,
+    deadline: Deadline,
+    connect: C,
+) -> Result<TcpStream, String>
+where
+    C: Fn(&std::net::SocketAddr, Duration) -> std::io::Result<TcpStream> + Clone + Send + 'static,
+{
+    if fallbacks.is_empty() {
+        return dial_serial(&primaries, deadline, &connect);
+    }
+
+    let (results, raced) = std::sync::mpsc::channel();
+    // Start one family's `dialSerial`.  Refused a thread, the family
+    // dials in line instead, which only costs the race its overlap.
+    let start_racer = |primary: bool, ras: Vec<std::net::SocketAddr>| {
+        let (inline_ras, inline_connect, inline_results) =
+            (ras.clone(), connect.clone(), results.clone());
+        let (connect, results) = (connect.clone(), results.clone());
+        let spawned = crate::runtime::spawn_conn_thread("proxy-dial", move || {
+            let _ = results.send((primary, dial_serial(&ras, deadline, &connect)));
+        });
+        if spawned.is_err() {
+            let _ =
+                inline_results.send((primary, dial_serial(&inline_ras, deadline, &inline_connect)));
+        }
+    };
+
+    start_racer(true, primaries);
+    let fallback_at = Instant::now() + FALLBACK_DELAY;
+    let mut fallbacks = Some(fallbacks);
+    let mut primary_err: Option<String> = None;
+    let mut fallback_failed = false;
+    loop {
+        // `results` stays alive here, so the channel never disconnects
+        // while a racer owes its outcome.
+        let outcome = if fallbacks.is_some() {
+            match raced.recv_timeout(fallback_at.saturating_duration_since(Instant::now())) {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    // The head start ran out.
+                    if let Some(ras) = fallbacks.take() {
+                        start_racer(false, ras);
+                    }
+                    continue;
+                }
+            }
+        } else {
+            match raced.recv() {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return Err(primary_err.unwrap_or_else(|| CONNECT_TIMED_OUT.to_string()));
+                }
+            }
+        };
+        match outcome {
+            (_, Ok(conn)) => return Ok(conn),
+            (true, Err(e)) => {
+                if fallback_failed {
+                    return Err(e);
+                }
+                primary_err = Some(e);
+                // Go resets the fallback timer to zero when the primary
+                // fails inside its head start.
+                if let Some(ras) = fallbacks.take() {
+                    start_racer(false, ras);
+                }
+            }
+            (false, Err(_)) => {
+                if let Some(e) = primary_err.take() {
+                    return Err(e);
+                }
+                fallback_failed = true;
+            }
+        }
+    }
 }
 
 impl Proxy {
@@ -298,7 +464,19 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Resolve a hostname through Tor's SOCKS RESOLVE extension (dcrd
-/// `connmgr.TorLookupIP`), with dcrd's error texts.
+/// `addrmgr.TorLookupIP`, `addrmgr/tordns.go`), with dcrd's error texts.
+///
+/// `timeout` is the port's own bound.  dcrd calls `TorLookupIP` with
+/// `context.Background()` (`config.go:1270`, `:1310`), so neither its
+/// proxy connect nor its exchange has a deadline, and a proxy that stops
+/// answering holds the lookup indefinitely.  The port's callers pass a
+/// bound instead: a minute for connect targets and seeder sources, or
+/// the dial timeout when marking a dial attempt, for example.  The
+/// connect splits that bound among the proxy's addresses as Go's
+/// `dialSerial` would under a deadline, and the exchange uses what is
+/// left.  When it
+/// runs out, the lookup fails with the dial timeout text or Go's `i/o
+/// timeout`, which dcrd, having no deadline here, never reports.
 pub fn tor_lookup_ip(
     host: &str,
     proxy: &str,
@@ -512,6 +690,19 @@ impl NodeDialer {
         match &self.main_proxy {
             Some(proxy) => proxy.dial(addr, timeout),
             None => {
+                // A Tor v3 key under the default onion routing is the one
+                // host that reaches here unresolved.  Go's dialer resolves
+                // it first, and its resolver answers a `.onion` name with
+                // no addresses without asking DNS (see `avoid_dns`), which
+                // the dial reports as `filterAddrList`'s error inside its
+                // `OpError` (`net/ipsock.go`, `net/dial.go`).
+                if let Ok((host, _)) = crate::gostd::split_host_port(addr)
+                    && avoid_dns(&host)
+                {
+                    return Err(format!(
+                        "dial tcp: address {host}: no suitable address found"
+                    ));
+                }
                 let socket: std::net::SocketAddr = addr
                     .parse()
                     .map_err(|e| format!("invalid dial address {addr}: {e}"))?;
@@ -558,5 +749,211 @@ impl NodeDialer {
                     .collect())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    /// A stand-in connect that fails at once with a text naming the
+    /// address, recording each attempt's address and timeout.
+    fn refusing(
+        attempts: &Arc<Mutex<Vec<(SocketAddr, Duration)>>>,
+    ) -> impl Fn(&SocketAddr, Duration) -> std::io::Result<TcpStream> + Clone + Send + 'static {
+        let attempts = Arc::clone(attempts);
+        move |addr: &SocketAddr, timeout: Duration| {
+            attempts.lock().expect("attempts").push((*addr, timeout));
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!("refused {addr}"),
+            ))
+        }
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("socket address")
+    }
+
+    /// Go's `partialDeadline`: equal shares with a two-second floor, all
+    /// of what is left below that, and nothing once it is spent.
+    #[test]
+    fn partial_timeout_matches_gos_partial_deadline() {
+        let secs = Duration::from_secs;
+        assert_eq!(partial_timeout(secs(30), 1), Some(secs(30)));
+        assert_eq!(partial_timeout(secs(30), 2), Some(secs(15)));
+        assert_eq!(partial_timeout(secs(30), 3), Some(secs(10)));
+        assert_eq!(partial_timeout(secs(3), 2), Some(secs(2)));
+        assert_eq!(
+            partial_timeout(Duration::from_millis(1500), 3),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(partial_timeout(Duration::ZERO, 1), None);
+    }
+
+    /// Go's dialer splits the addresses by the first one's family.
+    #[test]
+    fn the_first_address_picks_the_primary_family() {
+        let (v6a, v4a, v6b, mapped) = (
+            addr("[2001:db8::1]:9050"),
+            addr("192.0.2.1:9050"),
+            addr("[2001:db8::2]:9050"),
+            addr("[::ffff:192.0.2.2]:9050"),
+        );
+        assert_eq!(
+            partition_by_family(vec![v6a, v4a, v6b, mapped]),
+            (vec![v6a, v6b], vec![v4a, mapped])
+        );
+        assert_eq!(
+            partition_by_family(vec![mapped, v6a, v4a]),
+            (vec![mapped, v4a], vec![v6a])
+        );
+    }
+
+    /// Go's `dialSerial` gives each address its `partialDeadline` share
+    /// of the time left and reports the first address's error.  The
+    /// port gave every address all of the time left, so a first address
+    /// that black-holes spent the whole dial timeout and the next never
+    /// had a turn.
+    #[test]
+    fn each_address_gets_its_share_of_the_deadline() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let ras = [
+            addr("192.0.2.1:9050"),
+            addr("192.0.2.2:9050"),
+            addr("192.0.2.3:9050"),
+        ];
+        let result = dial_serial(
+            &ras,
+            Deadline::after(Duration::from_secs(30)),
+            &refusing(&attempts),
+        );
+        assert_eq!(
+            result.map(|_| ()),
+            Err("refused 192.0.2.1:9050".to_string())
+        );
+        let attempts = attempts.lock().expect("attempts").clone();
+        let near = |got: Duration, want: u64| {
+            let want = Duration::from_secs(want);
+            got <= want && got + Duration::from_secs(1) > want
+        };
+        assert_eq!(attempts.len(), 3);
+        assert!(near(attempts[0].1, 10), "{attempts:?}");
+        assert!(near(attempts[1].1, 15), "{attempts:?}");
+        assert!(near(attempts[2].1, 30), "{attempts:?}");
+    }
+
+    /// Once the deadline has passed before an address's turn, Go's
+    /// `dialSerial` returns its done context's deadline error, whatever
+    /// the earlier addresses failed with; the driver maps that text to
+    /// the connect handlers' timeout.  The port returned a bare "i/o
+    /// timeout", which no caller recognised as the deadline.
+    #[test]
+    fn a_spent_deadline_fails_as_the_dial_timeout() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&attempts);
+        // The first address uses up all it is given (under the two-second
+        // floor, the whole budget), then fails.
+        let slow = move |addr: &SocketAddr, timeout: Duration| {
+            recorded.lock().expect("attempts").push((*addr, timeout));
+            std::thread::sleep(timeout);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                format!("refused {addr}"),
+            ))
+        };
+        let result = dial_serial(
+            &[addr("192.0.2.1:9050"), addr("192.0.2.2:9050")],
+            Deadline::after(Duration::from_millis(200)),
+            &slow,
+        );
+        assert_eq!(result.map(|_| ()), Err(CONNECT_TIMED_OUT.to_string()));
+        assert_eq!(
+            attempts.lock().expect("attempts").len(),
+            1,
+            "no attempt starts past the deadline"
+        );
+    }
+
+    /// The zero `net.Dialer` that go-socks and `TorLookupIP` dial with is
+    /// dual-stack: the second family starts 300 ms after the first unless
+    /// the first has connected, and the first connection wins.  The port
+    /// tried the addresses in order with the whole budget each, so a
+    /// proxy name whose first address black-holes (`localhost` resolving
+    /// to `::1` first on a host that drops it) spent the dial timeout
+    /// there and never reached `127.0.0.1`.
+    #[test]
+    fn a_black_holed_family_falls_back_after_the_head_start() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let live = listener.local_addr().expect("listener address");
+        let started = Instant::now();
+        let v4_started = Arc::new(Mutex::new(None));
+        let v4_mark = Arc::clone(&v4_started);
+        let connect = move |addr: &SocketAddr, timeout: Duration| {
+            if addr.is_ipv6() {
+                // Black-holed: nothing answers until the attempt's time
+                // is up.
+                std::thread::sleep(timeout);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    CONNECT_TIMED_OUT,
+                ));
+            }
+            *v4_mark.lock().expect("mark") = Some(started.elapsed());
+            TcpStream::connect_timeout(&live, timeout)
+        };
+        let conn = dial_parallel(
+            vec![addr("[2001:db8::1]:9050")],
+            vec![live],
+            Deadline::after(Duration::from_secs(20)),
+            connect,
+        )
+        .expect("the fallback family connects");
+        assert_eq!(conn.peer_addr().expect("peer"), live);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the black-holed family must not hold the dial: {:?}",
+            started.elapsed()
+        );
+        let v4_at = v4_started
+            .lock()
+            .expect("mark")
+            .expect("the fallback family was dialed");
+        assert!(v4_at >= FALLBACK_DELAY, "the head start is kept: {v4_at:?}");
+    }
+
+    /// When both families fail, Go reports the primary family's first
+    /// error, and a primary that fails inside its head start starts the
+    /// fallback at once.
+    #[test]
+    fn both_families_failing_report_the_primarys_error() {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let result = dial_parallel(
+            vec![addr("[2001:db8::1]:9050"), addr("[2001:db8::2]:9050")],
+            vec![addr("192.0.2.1:9050")],
+            Deadline::after(Duration::from_secs(30)),
+            refusing(&attempts),
+        );
+        assert_eq!(
+            result.map(|_| ()),
+            Err("refused [2001:db8::1]:9050".to_string())
+        );
+        let mut tried: Vec<SocketAddr> = attempts
+            .lock()
+            .expect("attempts")
+            .iter()
+            .map(|(addr, _)| *addr)
+            .collect();
+        tried.sort();
+        assert_eq!(
+            tried,
+            vec![
+                addr("192.0.2.1:9050"),
+                addr("[2001:db8::1]:9050"),
+                addr("[2001:db8::2]:9050"),
+            ]
+        );
     }
 }

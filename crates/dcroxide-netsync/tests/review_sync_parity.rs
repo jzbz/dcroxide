@@ -103,15 +103,6 @@ struct FailingTxPool {
 }
 
 impl SyncTxPool for FailingTxPool {
-    fn process_transaction(
-        &mut self,
-        _tx: &MsgTx,
-        _allow_orphan: bool,
-        _allow_high_fees: bool,
-        _tag: u64,
-    ) -> Result<Vec<Hash>, String> {
-        Err(self.failure.message.clone())
-    }
     fn process_transaction_accepted(
         &mut self,
         _tx: &MsgTx,

@@ -278,7 +278,9 @@ fn a_spend_journal_read_that_cannot_start_is_an_error() {
     let err = chain
         .fetch_spend_journal(parent, true)
         .expect_err("a read that cannot start must fail");
-    assert_eq!(err.kind, RuleErrorKind::UtxoBackendCorruption);
+    // Not corruption: dcrd's `ErrDbNotOpen` matches neither of its
+    // sync manager's `Critical failure` checks.
+    assert_eq!(err.kind, RuleErrorKind::UtxoBackend);
     assert!(
         err.description.contains("database is not open"),
         "the database's own error: {err:?}"

@@ -173,18 +173,6 @@ fn wire_ip_string(ip: &[u8; 16]) -> String {
     crate::config::go_ip_string(ip)
 }
 
-/// Parse a listener port exactly like Go's `strconv.ParseUint(portStr,
-/// 10, 16)`: decimal digits only, no sign, no base prefix, no
-/// underscores.  Rust's `str::parse::<u16>` accepts a leading `+`,
-/// which Go rejects, and `gostd::go_parse_uint` implements Go's
-/// base-0 form, which accepts `0x10` and rejects `08`.
-fn go_parse_port(s: &str) -> Option<u16> {
-    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    s.parse::<u16>().ok()
-}
-
 /// An external address candidate (dcrd `externalAddrCandidate`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAddrCandidate {
@@ -376,7 +364,7 @@ pub fn resolve_external_address(
             continue;
         };
 
-        let Some(port) = go_parse_port(&port_str) else {
+        let Ok(port) = crate::outbound::go_parse_uint16(&port_str) else {
             // dcrd logs "unable to parse port: %v" and CONTINUES.
             continue;
         };
@@ -627,11 +615,14 @@ pub fn host_to_net_address(
     resolver: &ResolveIpFn<'_>,
     now_unix: i64,
 ) -> Result<NetAddress, String> {
+    // Both branches stamp `time.Now()` to the second: dcrd's literal
+    // `time.Unix(time.Now().Unix(), 0)` here and the same expression
+    // inside `NewNetAddressFromIPPort` below.
+    let now_nanos = now_unix * 1_000_000_000;
     let (addr_type, addr_bytes) = encode_host(host);
     if addr_type != NetAddressType::Unknown {
         // Since the host type has been successfully recognized and
         // encoded, there is no need to perform a DNS lookup.
-        let now_nanos = now_unix * 1_000_000_000;
         return new_net_address_from_params(addr_type, &addr_bytes, port, now_nanos, services)
             .map_err(|e| e.description);
     }
@@ -644,7 +635,9 @@ pub fn host_to_net_address(
         std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
         std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
     };
-    Ok(new_net_address_from_ip_port(&ip_bytes, port, services, 0))
+    Ok(new_net_address_from_ip_port(
+        &ip_bytes, port, services, now_nanos,
+    ))
 }
 
 /// Convert a wire v2 network address type to an address manager type
@@ -1002,14 +995,26 @@ pub enum BanPeerOutcome {
     Banned {
         /// The banned host.
         host: String,
-        /// The Unix nanosecond time the ban lifts.
+        /// The time the ban lifts, on the caller's clock (the daemon's
+        /// is [`ban_clock_nanos`]).
         until_nanos: i64,
     },
 }
 
+/// The clock the daemon stamps and checks its bans on: the process's
+/// monotonic clock ([`dcroxide_connmgr::monotonic_nanos`]).  dcrd stores
+/// `time.Now().Add(cfg.BanDuration)` and tests `time.Now().Before(banEnd)`
+/// (`server.go:2763`, `:2193`); both carry a monotonic reading, so a
+/// wall-clock step neither lifts nor stretches a ban.  The banned map
+/// lives in memory only, so nothing needs the wall time.
+pub fn ban_clock_nanos() -> i64 {
+    dcroxide_connmgr::monotonic_nanos()
+}
+
 /// Ban the peer at the given address (dcrd `server.BanPeer`); the
 /// caller owns the banned-host map (the daemon's is
-/// `ServerContext::banned_hosts`).
+/// `ServerContext::banned_hosts`) and its clock (the daemon's is
+/// [`ban_clock_nanos`]).
 pub fn ban_peer(
     banned: &mut std::collections::BTreeMap<String, i64>,
     addr: &str,
@@ -1034,9 +1039,10 @@ pub fn ban_peer(
     // dcrd's `time.Now().Add(cfg.BanDuration)` cannot wrap: Go's
     // `Time.Add` carries whole seconds in a 64-bit count from year 1 and
     // saturates there, so even the largest duration `--banduration`
-    // accepts (about 292 years) lands in the future.  Unix nanoseconds
-    // top out in 2262 instead, so the sum saturates rather than wrapping
-    // to a past time that would lift the ban at once.
+    // accepts (about 292 years) lands in the future.  An i64 nanosecond
+    // clock tops out about 292 years from its origin instead, so the sum
+    // saturates rather than wrapping to a past time that would lift the
+    // ban at once.
     let until_nanos = now_nanos.saturating_add(ban_duration_nanos);
     banned.insert(host.clone(), until_nanos);
     BanPeerOutcome::Banned { host, until_nanos }
@@ -1602,7 +1608,8 @@ pub struct PeerState {
     pub outbound_peers: BTreeMap<i32, PeerStateEntry>,
     /// The persistent outbound peers by peer ID.
     pub persistent_peers: BTreeMap<i32, PeerStateEntry>,
-    /// The banned hosts and the Unix nanosecond times the bans lift.
+    /// The banned hosts and the times the bans lift, on the caller's
+    /// clock.
     pub banned: BTreeMap<String, i64>,
 }
 
@@ -1651,7 +1658,8 @@ pub struct BannedConnOutcome {
 /// Reject a connection from a banned host before the handshake (dcrd
 /// 2.2 `handleBannedConn`); an expired ban is lifted.  The host key
 /// is the bare IP rendering (dcrd `net.IP(remoteAddr.IP).String()`),
-/// not the host:port form.
+/// not the host:port form, and `now_nanos` is on the clock the bans
+/// were stamped on (the daemon's is [`ban_clock_nanos`]).
 pub fn handle_banned_conn(
     banned: &mut std::collections::BTreeMap<String, i64>,
     host: &str,

@@ -11,9 +11,10 @@
 //! handlers.  The dispatch itself is a decision core over the ported
 //! [`Peer`] handlers ([`classify_incoming`]); [`run_peer_input`] is the
 //! read loop, [`run_peer_output`] the write loop draining the
-//! [`OutboundQueue`], [`run_ping_timer`] the periodic keepalive, and
-//! [`run_stall_detector`] the pending-response check.  A served
-//! connection runs the last two on one thread ([`run_peer_timers`]).
+//! [`OutboundQueue`], and [`run_peer_timers`] the one timer thread a
+//! served connection runs for the periodic keepalive and the
+//! pending-response check.  [`run_ping_timer`] is that same scheduler
+//! with the stall check left out.
 //!
 //! dcrd runs these as separate goroutines sharing the peer under its
 //! mutexes, so the peer is passed as a `&Mutex<Peer>` and every write to
@@ -97,9 +98,20 @@ pub(crate) fn peer_log_label(peer: &Peer) -> String {
     format!("{} ({})", peer.addr(), direction_string(peer.inbound()))
 }
 
+/// The debug line dcrd's `processInboundMessage` logs before it
+/// disconnects a peer for a second `version` or `verack`
+/// (`peer/peer.go:1319-1327`).
+fn already_received_log_line(command: &str, peer: &Peer) -> String {
+    format!(
+        "Already received '{command}' from peer {} -- disconnecting",
+        peer_log_label(peer)
+    )
+}
+
 /// Give an incoming message its protocol-level handling, updating the
 /// peer state and returning the action the loop should take (dcrd
-/// `inHandler`'s message switch).
+/// `inHandler`'s message switch, `processInboundMessage`), logging at
+/// debug the disconnects it decides, as dcrd does.
 pub fn classify_incoming<E: PeerEnv>(
     peer: &mut Peer,
     msg: &Message,
@@ -107,10 +119,14 @@ pub fn classify_incoming<E: PeerEnv>(
 ) -> IncomingAction {
     match msg {
         // Only one version message is allowed per peer.
-        Message::Version(_) => IncomingAction::Disconnect("duplicate version message"),
+        Message::Version(_) => {
+            crate::logging::debug("PEER", &already_received_log_line("version", peer));
+            IncomingAction::Disconnect("duplicate version message")
+        }
 
         Message::VerAck => {
             if peer.verack_received() {
+                crate::logging::debug("PEER", &already_received_log_line("verack", peer));
                 IncomingAction::Disconnect("duplicate verack message")
             } else {
                 peer.handle_verack_msg();
@@ -213,7 +229,10 @@ pub trait ServeHooks {
     ) -> ServeSignal;
     /// The connection is winding down (dcrd `DonePeer`).  The peer
     /// arrives unlocked, as at [`on_connected`](ServeHooks::on_connected):
-    /// it stays registered until the sync manager has let it go.
+    /// it stays registered until the sync manager has let it go.  The
+    /// socket is already shut down and the timers stopped, as dcrd's
+    /// `DonePeer` runs only after `Peer.Run` has returned, so nothing
+    /// queued to the peer from here on reaches it.
     fn on_disconnected(&mut self, _peer: &Mutex<Peer>) {}
 }
 
@@ -359,9 +378,14 @@ where
         // handler-active window before taking any lock, so every
         // moment between finishing the read and finishing the handling
         // is credited to the local node rather than blamed on the peer.
+        // What the message settles is worked out before the stall lock
+        // is taken: it hashes a transaction or block header (and names
+        // a `notfound`'s list in place), and this peer's output loop
+        // takes the same lock to arm every request it sends.
         if let Some(stall) = stall {
+            let settled = dcroxide_peer::settles(&msg, mix_hash);
             let mut stall = stall.lock().expect("stall mutex poisoned");
-            stall.received_message(&msg, mix_hash);
+            stall.received_settles(&settled);
             stall.handler_start();
         }
 
@@ -434,19 +458,13 @@ where
 /// once per received message, by reference, and hands it to the stall
 /// detector and the server handler — the same one-hash-per-message
 /// shape, with the cache in the caller.
+///
+/// Which messages are hashed is the wire's one list
+/// ([`Message::mix_hash`]), which the stall detector's settlement reads
+/// too ([`Message::is_mix`]), so every mixing message it expects a hash
+/// for is hashed here.
 fn mix_message_hash(msg: &Message) -> Option<dcroxide_chainhash::Hash> {
-    let hash = match msg {
-        Message::MixPairReq(m) => m.mix_hash(),
-        Message::MixKeyExchange(m) => m.mix_hash(),
-        Message::MixCiphertexts(m) => m.mix_hash(),
-        Message::MixSlotReserve(m) => m.mix_hash(),
-        Message::MixFactoredPoly(m) => m.mix_hash(),
-        Message::MixDCNet(m) => m.mix_hash(),
-        Message::MixConfirm(m) => m.mix_hash(),
-        Message::MixSecrets(m) => m.mix_hash(),
-        _ => return None,
-    };
-    hash.ok()
+    msg.mix_hash().and_then(Result::ok)
 }
 
 /// A handle for originating messages to a peer (dcrd `QueueMessage`).
@@ -665,6 +683,17 @@ impl OutboundQueue {
     /// the message as sent.  [`QueueError::Closed`] means the output
     /// loop already stopped, which is the ordinary teardown path.
     pub fn queue_message(&self, msg: Message) -> Result<(), QueueError> {
+        self.queue_message_or_return(msg).map_err(|(err, _)| err)
+    }
+
+    /// [`Self::queue_message`], handing a refused message back with the
+    /// reason instead of dropping it, so a caller that retries it or
+    /// passes it on never has to copy it first.  A reply copied for
+    /// every attempt cost a full deep copy of a block per refusal, which
+    /// a peer holding its own queue full could repeat every serve poll.
+    /// The message comes back boxed, which moves its few hundred bytes of
+    /// fields and none of the data they own.
+    pub fn queue_message_or_return(&self, msg: Message) -> Result<(), (QueueError, Box<Message>)> {
         let charge = message_charge(&msg);
         // Charge first, then admit: concurrent producers may briefly
         // over-count, which errs on the refusing side.  An empty queue
@@ -678,7 +707,7 @@ impl OutboundQueue {
             self.state
                 .bytes
                 .fetch_sub(charge, std::sync::atomic::Ordering::Relaxed);
-            return Err(QueueError::Full);
+            return Err((QueueError::Full, Box::new(msg)));
         }
         match self.sender.try_send(QueuedMessage { msg, charge }) {
             Ok(()) => {
@@ -689,17 +718,17 @@ impl OutboundQueue {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
-            Err(mpsc::TrySendError::Full(_)) => {
+            Err(mpsc::TrySendError::Full(queued)) => {
                 self.state
                     .bytes
                     .fetch_sub(charge, std::sync::atomic::Ordering::Relaxed);
-                Err(QueueError::Full)
+                Err((QueueError::Full, Box::new(queued.msg)))
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err(mpsc::TrySendError::Disconnected(queued)) => {
                 self.state
                     .bytes
                     .fetch_sub(charge, std::sync::atomic::Ordering::Relaxed);
-                Err(QueueError::Closed)
+                Err((QueueError::Closed, Box::new(queued.msg)))
             }
         }
     }
@@ -858,24 +887,17 @@ where
 /// reading again by then.  The tick is skipped, reported, and the next
 /// one tries again; only a closed queue (the connection tearing down)
 /// stops the timer.
+///
+/// This is the scheduler a served connection runs ([`run_peer_timers`])
+/// with the stall check left out, so what holds here holds for the
+/// keepalive the daemon actually runs.
 pub fn run_ping_timer<E: PeerEnv>(
     env: &mut E,
     outbound: &OutboundQueue,
     interval: Duration,
     shutdown: &mpsc::Receiver<()>,
 ) {
-    loop {
-        // Wait a full interval unless shutdown arrives first.
-        match shutdown.recv_timeout(interval) {
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if !queue_keepalive(env, outbound) {
-                    return;
-                }
-            }
-            // Shutdown signalled, or the signalling half was dropped.
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-        }
-    }
+    let _ = run_timers(env, outbound, interval, None, shutdown);
 }
 
 /// Queue one keepalive ping (a tick of dcrd's ping ticker, `QueueMessage(
@@ -918,9 +940,9 @@ impl Default for StallConfig {
     }
 }
 
-/// Check the peer's pending responses every `tick` until shutdown is
-/// signalled, disconnecting it when one has not arrived by its adjusted
-/// deadline (dcrd's `stallHandler`).
+/// Run one stall check (a tick of dcrd's `stallHandler`), disconnecting
+/// the peer and returning the stalled command when a pending response
+/// is past its adjusted deadline.
 ///
 /// dcrd funnels the stall events through a `stallControl` channel into a
 /// dedicated goroutine because that is Go's idiom for owning mutable
@@ -940,30 +962,6 @@ impl Default for StallConfig {
 /// report why the connection ended.
 ///
 /// [`Teardown`]: crate::transport::Teardown
-pub fn run_stall_detector(
-    stall: &Mutex<StallDetector>,
-    conn: &crate::transport::Teardown,
-    peer_label: &str,
-    tick: Duration,
-    shutdown: &mpsc::Receiver<()>,
-) -> Option<StallReason> {
-    loop {
-        // Wait a full tick unless shutdown arrives first.
-        match shutdown.recv_timeout(tick) {
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(reason) = check_stall(stall, conn, peer_label) {
-                    return Some(reason);
-                }
-            }
-            // Shutdown signalled, or the signalling half was dropped.
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return None,
-        }
-    }
-}
-
-/// Run one stall check (a tick of dcrd's `stallHandler`), disconnecting
-/// the peer and returning the stalled command when a pending response
-/// is past its adjusted deadline.
 fn check_stall(
     stall: &Mutex<StallDetector>,
     conn: &crate::transport::Teardown,
@@ -988,16 +986,14 @@ fn check_stall(
 /// Run a served connection's two timers on one thread until shutdown is
 /// signalled: the keepalive ping every `ping_interval` (dcrd's
 /// `outHandler` ticker, see [`run_ping_timer`]) and the stall check
-/// every `stall_tick` (dcrd's `stallHandler`, see
-/// [`run_stall_detector`]).
+/// every `stall_tick` (dcrd's `stallHandler`, see `check_stall`).
 ///
 /// dcrd's timers are goroutines, which cost nothing; each OS thread
 /// here is a real task against the process's thread limit, and both of
 /// these do nothing but sleep, so one thread wakes for whichever is due
-/// next.  Each keeps its own schedule and behaves exactly as when it
-/// ran alone: a congested ping tick is skipped, a closed queue stops
-/// the pings but not the stall checks, and a stall disconnects the peer
-/// and returns the stalled command.
+/// next.  Each keeps its own schedule: a congested ping tick is
+/// skipped, a closed queue stops the pings but not the stall checks,
+/// and a stall disconnects the peer and returns the stalled command.
 #[allow(clippy::too_many_arguments)] // The two timers' inputs, side by side.
 pub fn run_peer_timers<E: PeerEnv>(
     env: &mut E,
@@ -1009,11 +1005,41 @@ pub fn run_peer_timers<E: PeerEnv>(
     stall_tick: Duration,
     shutdown: &mpsc::Receiver<()>,
 ) -> Option<StallReason> {
+    let stall = StallCheck {
+        stall,
+        conn,
+        peer_label,
+        tick: stall_tick,
+    };
+    run_timers(env, outbound, ping_interval, Some(&stall), shutdown)
+}
+
+/// The stall half of [`run_peer_timers`]: the shared detector state, the
+/// teardown handle a stall ends the connection through, the peer's log
+/// label, and the check interval.
+struct StallCheck<'a> {
+    stall: &'a Mutex<StallDetector>,
+    conn: &'a crate::transport::Teardown,
+    peer_label: &'a str,
+    tick: Duration,
+}
+
+/// The one timer scheduler: the keepalive every `ping_interval` and,
+/// when `stall` is given, the stall check on its own tick, until
+/// shutdown is signalled.  Without a stall check a closed queue ends it,
+/// since nothing is left to schedule.
+fn run_timers<E: PeerEnv>(
+    env: &mut E,
+    outbound: &OutboundQueue,
+    ping_interval: Duration,
+    stall: Option<&StallCheck<'_>>,
+    shutdown: &mpsc::Receiver<()>,
+) -> Option<StallReason> {
     // `None` is "never": an interval too long to represent as an
     // instant, or a ping timer whose queue has closed.
     let start = Instant::now();
     let mut next_ping = start.checked_add(ping_interval);
-    let mut next_stall = start.checked_add(stall_tick);
+    let mut next_stall = stall.and_then(|check| start.checked_add(check.tick));
     loop {
         let next = match (next_ping, next_stall) {
             (Some(ping), Some(stall)) => Some(ping.min(stall)),
@@ -1028,18 +1054,22 @@ pub fn run_peer_timers<E: PeerEnv>(
         match signal {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let now = Instant::now();
-                if next_stall.is_some_and(|at| now >= at) {
-                    if let Some(reason) = check_stall(stall, conn, peer_label) {
+                if let Some(check) = stall
+                    && next_stall.is_some_and(|at| now >= at)
+                {
+                    if let Some(reason) = check_stall(check.stall, check.conn, check.peer_label) {
                         return Some(reason);
                     }
-                    next_stall = now.checked_add(stall_tick);
+                    next_stall = now.checked_add(check.tick);
                 }
                 if next_ping.is_some_and(|at| now >= at) {
-                    next_ping = if queue_keepalive(env, outbound) {
-                        now.checked_add(ping_interval)
+                    if queue_keepalive(env, outbound) {
+                        next_ping = now.checked_add(ping_interval);
+                    } else if stall.is_none() {
+                        return None;
                     } else {
-                        None
-                    };
+                        next_ping = None;
+                    }
                 }
             }
             // Shutdown signalled, or the signalling half was dropped.
@@ -1053,7 +1083,7 @@ pub fn run_peer_timers<E: PeerEnv>(
 /// The check compares an arriving nonce against every nonce this
 /// *process* has sent, so two nodes stood up in one test process look
 /// exactly like a node dialling itself.  dcrd carries the same escape
-/// for the same reason (`peer.go:90-93`, set at `peer_test.go:916`).
+/// for the same reason (`peer.go:108-111`, set at `peer_test.go:1089`).
 #[doc(hidden)]
 pub fn allow_self_connections() {
     peer_globals().set_allow_self_conns(true);
@@ -1133,7 +1163,16 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for HandshakeTransport<'_, S>
     fn read_message(&mut self) -> Result<Message, ReadError> {
         let budget = self.remaining().min(self.idle_timeout);
         self.inner.set_read_budget(Some(budget));
-        self.inner.read_message()
+        // dcrd's `ReadMessageN` reports every short read as `io.EOF`,
+        // and its `Handshake` returns that error as it is, so a remote
+        // that closes, resets or goes quiet mid-handshake is logged as
+        // `Failed handshake for %s peer %s: EOF` (`server.go:2291`, `:2324`).
+        self.inner.read_message().map_err(|mut e| {
+            if !e.wire_violation && is_short_read(&e.message) {
+                e.message = CODEC_EOF_TEXT.to_string();
+            }
+            e
+        })
     }
 
     fn write_message(&mut self, msg: &Message) -> Result<(), String> {
@@ -1168,8 +1207,13 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for HandshakeTransport<'_, S>
 ///
 /// A handshake still unfinished at the deadline fails with dcrd's
 /// `errHandshakeTimeout` text rather than with the read or write it
-/// interrupted, as dcrd's `select` does.  A wire violation already read
-/// is still reported as one, so the caller bans on it.
+/// interrupted, as dcrd's `select` does, and so does one the node's
+/// shutdown cut short (the connection's flag raised by
+/// `Teardown::disconnect_for_shutdown`), as dcrd's `ctx.Done` arm does
+/// (`peer/peer.go:2352-2353`).  A read that fails at the socket
+/// otherwise fails with dcrd's `EOF` ([`is_short_read`]), a conn closed
+/// under it by the connection manager included.  A wire violation
+/// already read is still reported as one, so the caller bans on it.
 fn negotiate_within<S, E>(
     peer: &mut Peer,
     transport: &mut WireTransport<S>,
@@ -1200,14 +1244,20 @@ where
     } else {
         peer.negotiate_outbound_protocol(&mut bounded, env, globals, Some(on_version))
     };
+    let shutting_down = bounded
+        .inner
+        .cancel_flag()
+        .is_some_and(crate::transport::Cancel::is_shutdown);
     match negotiated {
         Ok(outcome) => Ok((outcome.remote_version, outcome.delayed)),
-        Err(e) if !e.wire_violation && bounded.remaining().is_zero() => Err(NegotiateError {
-            message: HANDSHAKE_TIMEOUT_TEXT.to_string(),
-            kind: Some(NegotiateErrorKind::HandshakeTimeout),
-            remote_version: e.remote_version,
-            wire_violation: false,
-        }),
+        Err(e) if !e.wire_violation && (bounded.remaining().is_zero() || shutting_down) => {
+            Err(NegotiateError {
+                message: HANDSHAKE_TIMEOUT_TEXT.to_string(),
+                kind: Some(NegotiateErrorKind::HandshakeTimeout),
+                remote_version: e.remote_version,
+                wire_violation: false,
+            })
+        }
         Err(e) => Err(e),
     }
 }
@@ -1218,13 +1268,35 @@ where
 const READ_TIMED_OUT_TEXT: &str = "read timed out";
 
 /// The error text of a read that found the stream closed
-/// (`read_exact_by_deadline` in `transport.rs`, and `std`'s
-/// `read_exact`), which is dcrd's `io.EOF`.
+/// (`read_exact_by_deadline` in `transport.rs`, which words it as `std`'s
+/// `read_exact` does), which is dcrd's `io.EOF`.
 const READ_EOF_TEXT: &str = "failed to fill whole buffer";
+
+/// The error text of a read the connection's own teardown cut short
+/// (`read_exact_by_deadline` in `transport.rs`): dcrd's read of a conn
+/// closed under it.
+const READ_TORN_DOWN_TEXT: &str = "the connection was torn down locally";
 
 /// The wire codec's text for Go's `io.EOF`: a payload that ends on a
 /// field boundary (`WireError::Eof`).
 const CODEC_EOF_TEXT: &str = "EOF";
+
+/// Whether a failed read is a failure of the socket read itself rather
+/// than of the wire codec, which dcrd sees as `io.EOF`: since
+/// `04fef0bf`, `wire.ReadMessageN` turns any short read into `io.EOF`
+/// (`wire/message.go:375-377`, `:457-459`), whether the remote closed
+/// the stream, the socket failed, the read deadline expired or the
+/// local side closed the conn.
+///
+/// The transport reports failures as text, so they are told apart by
+/// its own messages: its deadline, closed-stream and teardown texts,
+/// and `std`'s rendering of an OS error with its `(os error N)` suffix.
+fn is_short_read(message: &str) -> bool {
+    matches!(
+        message,
+        READ_TIMED_OUT_TEXT | READ_EOF_TEXT | READ_TORN_DOWN_TEXT
+    ) || message.contains("(os error ")
+}
 
 /// The read error dcrd's `inHandler` would log, at error, as "Can't
 /// read message from %s: %v" for the way a connection's input loop
@@ -1232,12 +1304,10 @@ const CODEC_EOF_TEXT: &str = "EOF";
 /// `:1054`).
 ///
 /// At the pin dcrd logs only failures of the wire codec.  Every failure
-/// of the socket read itself is silent: since `04fef0bf`,
-/// `wire.ReadMessageN` turns any short read into `io.EOF`
-/// (`wire/message.go:375-377`, `:457-459`), whether the remote closed
-/// the stream, the socket failed or the read deadline expired, and
-/// `shouldHandleReadError` declines `io.EOF`.  The same rewrite makes
-/// the "Peer %s no answer for %s -- disconnecting" warning that follows
+/// of the socket read itself is silent: `wire.ReadMessageN` turns it
+/// into `io.EOF` ([`is_short_read`]), and `shouldHandleReadError`
+/// declines `io.EOF`.  The same rewrite makes the "Peer %s no answer
+/// for %s -- disconnecting" warning that follows
 /// (`peer/peer.go:1563-1566`) unreachable: its `net.Error` timeout test
 /// never matches `io.EOF`, so an idle peer is dropped without a word and
 /// the warning is not ported.  Nothing is logged either when the local
@@ -1245,11 +1315,8 @@ const CODEC_EOF_TEXT: &str = "EOF";
 /// teardown flag), and a ban that disconnected the peer ends the loop
 /// as [`DisconnectReason::Protocol`], not as a read error.
 ///
-/// The transport reports failures as text, so the socket failures are
-/// told apart by its own messages: its deadline and closed-stream
-/// texts, and `std`'s rendering of an OS error with its `(os error N)`
-/// suffix.  A payload that runs out inside the message's structure is
-/// not a socket failure but a decode one, which dcrd's `BtcDecode`
+/// A payload that runs out inside the message's structure is not a
+/// socket failure but a decode one, which dcrd's `BtcDecode`
 /// returns raw (`wire/message.go:482-485`): `io.EOF` (silent) when the
 /// payload ends on a field boundary and `io.ErrUnexpectedEOF` (logged)
 /// when it ends inside a field (`shortRead` at `wire/common.go:131-137`,
@@ -1267,8 +1334,8 @@ fn read_error_to_log(reason: &DisconnectReason, cancelled: bool) -> Option<&str>
         return None;
     }
     match message.as_str() {
-        READ_TIMED_OUT_TEXT | READ_EOF_TEXT | CODEC_EOF_TEXT => None,
-        socket if socket.contains("(os error ") => None,
+        CODEC_EOF_TEXT => None,
+        socket if is_short_read(socket) => None,
         codec => Some(codec),
     }
 }
@@ -1300,9 +1367,11 @@ fn refuse_connection(
 /// bounded as a whole by dcrd's negotiate timeout; then the output loop
 /// runs on its own thread, the keepalive ping and the stall detector
 /// share a second ([`run_peer_timers`]), and the input loop runs on this
-/// thread.  When the input loop ends the timer thread is signalled and
-/// the outbound queue is closed so the other threads finish, and both
-/// are joined before returning the reason the connection stopped.
+/// thread.  When the input loop ends the socket is shut down and the
+/// timer thread signalled before the server's disconnection hook runs
+/// (dcrd's `Disconnect` before `DonePeer`); then the outbound queue is
+/// closed so the output loop finishes, and both threads are joined
+/// before returning the reason the connection stopped.
 /// `idle_timeout` bounds each read so a silent peer eventually
 /// disconnects (dcrd's idle timer); `ping_interval` should be shorter so
 /// a live peer answers before that fires.
@@ -1537,7 +1606,8 @@ where
     // inv message (dcrd `serverPeer.Run` queueing `NewMsgSendHeaders`
     // before `AddPeer`).  The queue is empty here, so this cannot fail
     // with [`QueueError::Full`]; a failure is a closed queue.
-    let reason = if outbound.queue_message(Message::SendHeaders).is_err() {
+    let connected = outbound.queue_message(Message::SendHeaders).is_ok();
+    let reason = if !connected {
         DisconnectReason::LocalShutdown
     } else {
         // The handshake is complete: hand the peer to the server's
@@ -1561,18 +1631,33 @@ where
         if let Some(err) = read_error_to_log(&reason, cancel.is_cancelled()) {
             crate::logging::error("PEER", &format!("Can't read message from {label}: {err}"));
         }
-
-        // The connection is winding down (dcrd `DonePeer`).
-        hooks.on_disconnected(&peer);
         reason
     };
 
-    // Tear down: shut the socket down so the output loop's blocking write
-    // unblocks (a peer that stopped reading would otherwise wedge it),
-    // stop the timers, and close the outbound queue, then join both
-    // threads.
+    // Tear down before the server lets the peer go, in dcrd's order:
+    // `inHandler` ends with `p.Disconnect()` (`peer/peer.go:1593-1594`),
+    // and `DonePeer` runs only once `Peer.Run` has returned
+    // (`server.go:725-727`).  Shutting the socket down gives the remote
+    // its FIN now and fails any write the output loop still attempts
+    // (dcrd's `writeMessage` sends nothing once disconnecting), which
+    // also unblocks a write a peer that stopped reading would otherwise
+    // wedge; stopping the timers ends the pings and the stall checks
+    // (dcrd's `stallHandler` exits on `quit`).  The server's hook can
+    // then wait out another peer's block validation on the sync manager
+    // without this peer seeing any of it: before, the socket stayed open
+    // for that wait, relay traffic and pings kept being written to a
+    // peer already dropped, and a deadline expiring meanwhile logged a
+    // stall for a peer that was already gone.
     read_transport.get_ref().disconnect();
     let _ = timer_shutdown.send(());
+    if connected {
+        // The connection is winding down (dcrd `DonePeer`).
+        hooks.on_disconnected(&peer);
+    }
+
+    // Close the outbound queue and join both threads.  The output loop
+    // ends once every sender is gone, and the server's clones (its relay
+    // registry and getdata worker) are released by `on_disconnected`.
     drop(outbound);
     let _ = output.join();
     // A stall is the real reason the connection ended; the input loop
@@ -2017,10 +2102,16 @@ mod tests {
     /// after the handshake's deadline, so the handshake fails with
     /// dcrd's `errHandshakeTimeout` text; a budget re-armed per read
     /// accepted it.
+    ///
+    /// The verack lands `2 * PAUSE - NEGOTIATE` after the deadline, and
+    /// the elapsed bound allows `PAUSE / 2` past it: half a second each,
+    /// so a runner whose socket receive timeouts fire late (macOS CI
+    /// oversleeps severalfold) does not deliver the verack in time or
+    /// overrun the bound.
     #[test]
     fn the_negotiate_timeout_bounds_the_whole_handshake() {
-        const NEGOTIATE: Duration = Duration::from_millis(600);
-        const PAUSE: Duration = Duration::from_millis(400);
+        const NEGOTIATE: Duration = Duration::from_millis(1500);
+        const PAUSE: Duration = Duration::from_millis(1000);
 
         let (conn, remote, client) = loopback_pair();
         let dialer = std::thread::spawn(move || {
@@ -2334,5 +2425,431 @@ mod tests {
             !connected.load(std::sync::atomic::Ordering::SeqCst),
             "the server never hears of a peer it cannot serve"
         );
+    }
+
+    /// Every refusal hands the message back intact -- by depth, by bytes,
+    /// and once the output loop is gone -- so a caller retrying a reply
+    /// or passing a request on never copies it up front, and the queue
+    /// charges nothing for what it refused.
+    #[test]
+    fn a_refused_message_is_handed_back_intact() {
+        use dcroxide_wire::{InvType, InvVect, MsgNotFound};
+
+        // About 1.8 MB: two fit the 4 MiB budget, a third does not.
+        let bulky = |seed: u8| {
+            Message::NotFound(MsgNotFound {
+                inv_list: vec![
+                    InvVect {
+                        inv_type: InvType::TX,
+                        hash: dcroxide_chainhash::Hash([seed; 32]),
+                    };
+                    dcroxide_wire::MAX_INV_PER_MSG as usize
+                ],
+            })
+        };
+
+        let (queue, receiver) = OutboundQueue::channel();
+        queue
+            .queue_message(bulky(1))
+            .expect("an empty queue admits");
+        queue
+            .queue_message(bulky(2))
+            .expect("the budget admits a second");
+        let charged = queue.state.bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let (err, back) = queue
+            .queue_message_or_return(bulky(3))
+            .expect_err("the byte budget refuses a third");
+        assert_eq!(err, QueueError::Full);
+        assert_eq!(*back, bulky(3));
+        assert_eq!(
+            queue.state.bytes.load(std::sync::atomic::Ordering::Relaxed),
+            charged,
+            "a refused message holds no charge"
+        );
+
+        // Drain, then fill by depth with small messages.
+        while receiver.try_recv().is_ok() {}
+        for nonce in 0..MAX_OUTBOUND_QUEUE_DEPTH as u64 {
+            queue
+                .queue_message(Message::Ping(MsgPing { nonce }))
+                .expect("room below the depth");
+        }
+        let ping = Message::Ping(MsgPing { nonce: u64::MAX });
+        assert_eq!(
+            queue.queue_message_or_return(ping.clone()),
+            Err((QueueError::Full, Box::new(ping.clone())))
+        );
+
+        drop(receiver);
+        assert_eq!(
+            queue.queue_message_or_return(ping.clone()),
+            Err((QueueError::Closed, Box::new(ping)))
+        );
+    }
+
+    /// Serve hooks that drop the peer when it pings with nonce 2, and
+    /// whose disconnection hook -- a stand-in for `DonePeer` waiting on
+    /// the sync manager while another peer's block validates -- queues a
+    /// pong with nonce 301 to the still-registered peer, as relay traffic
+    /// would be, and then blocks until the test releases it.
+    struct DropThenBlockHooks {
+        queue: Option<OutboundQueue>,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl ServeHooks for DropThenBlockHooks {
+        fn on_connected(
+            &mut self,
+            _peer: &Arc<Mutex<Peer>>,
+            outbound: &OutboundQueue,
+            _remote_disable_relay_tx: bool,
+        ) {
+            self.queue = Some(outbound.clone());
+        }
+
+        fn on_message(
+            &mut self,
+            _peer: &Mutex<Peer>,
+            msg: Message,
+            _mix_hash: Option<dcroxide_chainhash::Hash>,
+            _outbound: &OutboundQueue,
+        ) -> ServeSignal {
+            if matches!(msg, Message::Ping(ping) if ping.nonce == 2) {
+                return ServeSignal::Disconnect("dropped by the handler".into());
+            }
+            ServeSignal::Continue
+        }
+
+        fn on_disconnected(&mut self, _peer: &Mutex<Peer>) {
+            if let Some(queue) = self.queue.take() {
+                let _ = queue.queue_message(Message::Pong(MsgPong { nonce: 301 }));
+            }
+            let _ = self.entered.send(());
+            let _ = self.release.recv_timeout(Duration::from_secs(20));
+        }
+    }
+
+    /// A peer the node drops is disconnected before the server lets it
+    /// go, as dcrd's `inHandler` calls `Disconnect` before `DonePeer`
+    /// runs: the remote reads the end of the stream while the
+    /// disconnection hook is still waiting, and nothing queued to the
+    /// peer after the drop reaches it.  The hook used to run first, so
+    /// the socket stayed open for as long as it waited on the sync
+    /// manager, and relay traffic and pings kept being written to the
+    /// dropped peer meanwhile.
+    #[test]
+    fn a_dropped_peer_is_disconnected_before_the_server_lets_it_go() {
+        use std::io::Read as _;
+
+        let (conn, remote, client) = loopback_pair();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let hooks = DropThenBlockHooks {
+            queue: None,
+            entered: entered_tx,
+            release: release_rx,
+        };
+        let server = std::thread::spawn(move || {
+            run_peer_connection(
+                conn,
+                inbound_peer(remote),
+                0,
+                NET,
+                NEVER,
+                NEVER,
+                None,
+                hooks,
+            )
+        });
+
+        let mut transport = client_handshake(client);
+        transport
+            .write_message(&Message::Ping(MsgPing { nonce: 2 }))
+            .expect("send ping");
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the disconnection hook runs");
+
+        // The hook is still blocked.  The client's five-second read
+        // timeout is what ends this read if the socket is still open.
+        let mut stream = transport.into_inner();
+        let mut bytes = Vec::new();
+        let end = stream.read_to_end(&mut bytes);
+        assert!(
+            end.is_ok(),
+            "the remote must see the end of the stream before the server lets the peer go: {end:?}"
+        );
+        let mut seen = Vec::new();
+        let mut rest = &bytes[..];
+        while !rest.is_empty() {
+            let (msg, used) = dcroxide_wire::read_message(rest, MAX_PROTOCOL_VERSION, NET)
+                .expect("whole messages up to the end of the stream");
+            seen.push(msg);
+            rest = &rest[used..];
+        }
+        assert!(
+            !seen.contains(&Message::Pong(MsgPong { nonce: 301 })),
+            "nothing queued after the drop may reach the peer: {seen:?}"
+        );
+
+        release_tx.send(()).expect("release the hook");
+        let reason = server.join().expect("server thread");
+        assert!(
+            matches!(&reason, DisconnectReason::Protocol(r) if r == "dropped by the handler"),
+            "the handler's drop is the reason: {reason:?}"
+        );
+    }
+
+    /// dcrd's `processInboundMessage` logs a second version or verack at
+    /// debug, naming the peer, before it disconnects
+    /// (`peer/peer.go:1319-1327`).
+    #[test]
+    fn a_second_version_or_verack_is_logged_as_dcrd_logs_it() {
+        let (_conn, remote, _client) = loopback_pair();
+        let peer = inbound_peer(remote);
+        assert_eq!(
+            already_received_log_line("version", &peer),
+            format!("Already received 'version' from peer {remote} (inbound) -- disconnecting")
+        );
+        assert_eq!(
+            already_received_log_line("verack", &peer),
+            format!("Already received 'verack' from peer {remote} (inbound) -- disconnecting")
+        );
+    }
+
+    /// A handshake read that fails at the socket fails the handshake with
+    /// dcrd's `EOF`: `wire.ReadMessageN` turns every short read into
+    /// `io.EOF`, which `Handshake` returns and `inboundPeerConnected`
+    /// logs as `Failed handshake for inbound peer %s: EOF`
+    /// (`server.go:2291`).  The transport's own texts reached that line.
+    #[test]
+    fn a_handshake_read_failing_at_the_socket_is_eof() {
+        let fail =
+            |conn: crate::transport::Teardown, remote: std::net::SocketAddr, idle: Duration| {
+                let mut peer = inbound_peer(remote);
+                let mut transport = WireTransport::new(conn, MAX_PROTOCOL_VERSION, NET);
+                negotiate_within(
+                    &mut peer,
+                    &mut transport,
+                    &mut NodePeerEnv::new(),
+                    &mut |_: &Peer, _: &MsgVersion| Ok(()),
+                    NEVER,
+                    idle,
+                )
+                .map(|_| ())
+                .expect_err("the handshake cannot complete")
+            };
+
+        // The remote closes before its version.
+        let (conn, remote, client) = loopback_pair();
+        drop(client);
+        let err = fail(conn, remote, NEVER);
+        assert_eq!(err.message, "EOF");
+        assert_eq!(err.kind, None);
+        assert!(!err.wire_violation);
+
+        // The idle read deadline expires with the handshake's own time
+        // far from spent.
+        let (conn, remote, _client) = loopback_pair();
+        let err = fail(conn, remote, Duration::from_millis(50));
+        assert_eq!(err.message, "EOF");
+        assert_eq!(err.kind, None);
+
+        // The local side closes the conn under the read, as the
+        // connection manager's `Disconnect` or `Remove` closes an active
+        // conn: dcrd's handshake read fails with `EOF`.
+        let err = torn_down_handshake(crate::transport::Teardown::disconnect);
+        assert_eq!(err.message, "EOF");
+        assert_eq!(err.kind, None);
+    }
+
+    /// A handshake the node's shutdown cuts short fails with dcrd's
+    /// `errHandshakeTimeout`: the shutdown cancels the server context
+    /// before it disconnects anything, and `Handshake` returns that
+    /// error from its `ctx.Done` arm (`peer/peer.go:2352-2353`,
+    /// `server.go:2357-2363`).  It was `EOF`, the text of the read it
+    /// interrupted.
+    #[test]
+    fn a_handshake_the_shutdown_cuts_short_is_a_handshake_timeout() {
+        let err = torn_down_handshake(crate::transport::Teardown::disconnect_for_shutdown);
+        assert_eq!(err.message, HANDSHAKE_TIMEOUT_TEXT);
+        assert_eq!(err.kind, Some(NegotiateErrorKind::HandshakeTimeout));
+        assert!(!err.wire_violation);
+    }
+
+    /// Run an inbound handshake whose connection `teardown` ends before
+    /// the remote sends anything, returning how it failed.
+    fn torn_down_handshake(teardown: fn(&crate::transport::Teardown)) -> NegotiateError {
+        let (conn, remote, _client) = loopback_pair();
+        let handle = conn.try_clone().expect("clone the teardown");
+        let mut peer = inbound_peer(remote);
+        let mut transport = WireTransport::new(conn, MAX_PROTOCOL_VERSION, NET);
+        transport.set_cancel(handle.cancel());
+        teardown(&handle);
+        negotiate_within(
+            &mut peer,
+            &mut transport,
+            &mut NodePeerEnv::new(),
+            &mut |_: &Peer, _: &MsgVersion| Ok(()),
+            NEVER,
+            NEVER,
+        )
+        .map(|_| ())
+        .expect_err("the handshake cannot complete")
+    }
+
+    /// Without a stall check the scheduler is the lone keepalive, which
+    /// stops once its queue has closed, as it always has: nothing is
+    /// left to schedule.
+    #[test]
+    fn a_lone_ping_timer_stops_with_its_queue() {
+        let (queue, receiver) = OutboundQueue::channel();
+        drop(receiver);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (_shutdown_tx, shutdown_rx) = mpsc::channel();
+            run_ping_timer(
+                &mut NodePeerEnv::new(),
+                &queue,
+                Duration::from_millis(10),
+                &shutdown_rx,
+            );
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the timer stops with its queue");
+    }
+
+    /// One of each of the eight mixing messages, each one that hashes.
+    fn mix_messages() -> Vec<Message> {
+        use dcroxide_wire::{
+            MsgMixCiphertexts, MsgMixConfirm, MsgMixDCNet, MsgMixFactoredPoly, MsgMixKeyExchange,
+            MsgMixPairReq, MsgMixSecrets, MsgMixSlotReserve, MsgTx,
+        };
+        vec![
+            Message::MixPairReq(MsgMixPairReq {
+                signature: [0; 64],
+                identity: [0; 33],
+                expiry: 0,
+                mix_amount: 0,
+                script_class: String::new(),
+                tx_version: 0,
+                lock_time: 0,
+                message_count: 0,
+                input_value: 0,
+                utxos: Vec::new(),
+                change: None,
+                flags: 0,
+                pairing_flags: 0,
+            }),
+            Message::MixKeyExchange(Box::new(MsgMixKeyExchange {
+                signature: [0; 64],
+                identity: [0; 33],
+                session_id: [0; 32],
+                epoch: 0,
+                run: 0,
+                pos: 0,
+                ecdh: [0; 33],
+                pqpk: [0; 1218],
+                commitment: [0; 32],
+                seen_prs: Vec::new(),
+            })),
+            Message::MixCiphertexts(MsgMixCiphertexts {
+                signature: [0; 64],
+                identity: [0; 33],
+                session_id: [0; 32],
+                run: 0,
+                ciphertexts: Vec::new(),
+                seen_key_exchanges: Vec::new(),
+            }),
+            // The one type whose encoding, and so its hash, needs a
+            // non-empty matrix.
+            Message::MixSlotReserve(MsgMixSlotReserve {
+                signature: [0; 64],
+                identity: [0; 33],
+                session_id: [0; 32],
+                run: 0,
+                dc_mix: vec![vec![vec![1; 32]]],
+                seen_ciphertexts: Vec::new(),
+            }),
+            Message::MixFactoredPoly(MsgMixFactoredPoly {
+                signature: [0; 64],
+                identity: [0; 33],
+                session_id: [0; 32],
+                run: 0,
+                roots: Vec::new(),
+                seen_slot_reserves: Vec::new(),
+            }),
+            Message::MixDCNet(MsgMixDCNet {
+                signature: [0; 64],
+                identity: [0; 33],
+                session_id: [0; 32],
+                run: 0,
+                dc_net: Vec::new(),
+                seen_slot_reserves: Vec::new(),
+            }),
+            Message::MixConfirm(MsgMixConfirm {
+                signature: [0; 64],
+                identity: [0; 33],
+                session_id: [0; 32],
+                run: 0,
+                mix: MsgTx::default(),
+                seen_dc_nets: Vec::new(),
+            }),
+            Message::MixSecrets(MsgMixSecrets {
+                signature: [0; 64],
+                identity: [0; 33],
+                session_id: [0; 32],
+                run: 0,
+                seed: [0; 32],
+                slot_reserve_msgs: Vec::new(),
+                dc_net_msgs: Vec::new(),
+                seen_secrets: Vec::new(),
+            }),
+        ]
+    }
+
+    /// A mixing message the input loop does not hash leaves its deadline
+    /// armed, so the stall detector drops honest mixing peers.  The
+    /// input loop's hashing and the stall detector's settlement both read
+    /// the wire's one exhaustive list of mixing messages, so they cannot
+    /// drift apart; this pins that each of the eight is hashed and
+    /// settles its own mix inventory with that hash, and that other
+    /// messages are not hashed.
+    #[test]
+    fn every_mixing_message_is_hashed_for_the_deadline_it_settles() {
+        use dcroxide_wire::{InvType, InvVect};
+
+        let messages = mix_messages();
+        let mut commands: Vec<&str> = messages.iter().map(Message::command).collect();
+        commands.sort_unstable();
+        commands.dedup();
+        assert_eq!(
+            commands.len(),
+            8,
+            "one of each mixing command: {commands:?}"
+        );
+        for msg in &messages {
+            let hash = mix_message_hash(msg)
+                .unwrap_or_else(|| panic!("{} is not hashed by the input loop", msg.command()));
+            assert_eq!(
+                dcroxide_peer::settles(msg, Some(hash)),
+                dcroxide_peer::Settles::Inventory(InvVect {
+                    inv_type: InvType::MIX,
+                    hash,
+                }),
+                "{}",
+                msg.command()
+            );
+        }
+        for msg in [
+            Message::Ping(MsgPing { nonce: 1 }),
+            Message::GetAddr,
+            Message::Tx(dcroxide_wire::MsgTx::default()),
+        ] {
+            assert_eq!(mix_message_hash(&msg), None, "{}", msg.command());
+        }
     }
 }

@@ -246,8 +246,14 @@ fn combine_process_block_result(
 ///
 /// - The UTXO backend and spend journal corruption the chain detects
 ///   carry dcrd's `ErrUtxoBackendCorruption` kind, and dcrd reports
-///   the spend journal case as `database.ErrCorruption`.  The same kind
-///   also stands in for dcrd's missing-input `AssertError`
+///   the spend journal case as `database.ErrCorruption`.  So does a
+///   chain database read that fails as corruption (a block whose
+///   checksum does not match, a filter or commitments row that does not
+///   decode); a read that fails any other way (an I/O error, a missing
+///   block, a closed store) carries `ErrUtxoBackend` instead, as dcrd's
+///   plain database error matches neither check
+///   (`process::db_read_rule_error`).  The corruption kind also stands
+///   in for dcrd's missing-input `AssertError`
 ///   (`UtxoView::assert_missing`), which dcrd's check does not match;
 ///   it renders with `AssertError`'s `assertion failed: ` prefix.
 /// - A database corruption the store reports travels through
@@ -269,16 +275,6 @@ fn is_corruption(err: &RuleError) -> bool {
 pub struct NullTxPool;
 
 impl SyncTxPool for NullTxPool {
-    fn process_transaction(
-        &mut self,
-        _tx: &MsgTx,
-        _allow_orphan: bool,
-        _allow_high_fees: bool,
-        _tag: u64,
-    ) -> Result<Vec<Hash>, String> {
-        Err("the null transaction pool accepts nothing".to_string())
-    }
-
     fn process_transaction_accepted(
         &mut self,
         _tx: &MsgTx,
@@ -686,6 +682,43 @@ mod tests {
         ));
         assert!(!classify(
             vec![rule_err(RuleErrorKind::BadMerkleRoot, "bad merkle root")],
+            false,
+        ));
+
+        // A chain database read that fails: only the database's own
+        // `ErrCorruption` (dcrd's checksum mismatch) counts, never an
+        // I/O error, a missing block or a closed store, which dcrd
+        // returns as plain database errors.
+        let read_error = |kind| {
+            dcroxide_blockchain::process::db_read_rule_error(
+                dcroxide_blockchain::chaindb::ChainDbError::Db(dcroxide_database::Error {
+                    kind,
+                    description: "read failed".to_string(),
+                }),
+            )
+        };
+        assert!(classify(
+            vec![read_error(dcroxide_database::ErrorKind::Corruption)],
+            false,
+        ));
+        for kind in [
+            dcroxide_database::ErrorKind::DriverSpecific,
+            dcroxide_database::ErrorKind::BlockNotFound,
+            dcroxide_database::ErrorKind::DbNotOpen,
+            dcroxide_database::ErrorKind::Fatal,
+        ] {
+            let failure =
+                combine_process_block_result(0, vec![read_error(kind)], false).unwrap_err();
+            assert!(!failure.is_corruption, "{kind:?}");
+            assert!(!failure.is_rule_error, "{kind:?}");
+        }
+        // A stored row that does not decode is dcrd's `ErrCorruption`.
+        assert!(classify(
+            vec![dcroxide_blockchain::process::db_read_rule_error(
+                dcroxide_blockchain::chaindb::ChainDbError::Corrupt(
+                    "corrupt filter for 00ab: bad".to_string()
+                ),
+            )],
             false,
         ));
 

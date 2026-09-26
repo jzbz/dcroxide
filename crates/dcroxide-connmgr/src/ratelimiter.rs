@@ -421,10 +421,11 @@ impl InboundRateLimiter {
 /// one, so a wall-clock step neither freezes nor refills a bucket.  The
 /// origin is this function's first call: only differences between its
 /// values mean anything, and they never mix with wall-clock nanoseconds.
+/// It is the address manager's clock ([`dcroxide_addrmgr::monotonic_nanos`],
+/// the reading its [`dcroxide_addrmgr::GoTime`] carries), so the two
+/// crates share one origin.
 pub fn monotonic_nanos() -> i64 {
-    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let origin = *ORIGIN.get_or_init(std::time::Instant::now);
-    i64::try_from(origin.elapsed().as_nanos()).unwrap_or(i64::MAX)
+    dcroxide_addrmgr::monotonic_nanos()
 }
 
 /// Zero every bit past the leading `bits` in place (the masking Go

@@ -95,14 +95,16 @@ impl core::fmt::Display for StallReason {
 /// What a received message settles in the pending tables — the message
 /// arms of dcrd's `maybeRemoveDeadline`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Settles {
+pub enum Settles<'m> {
     /// The message answers nothing that could have been pending.
     Nothing,
     /// One requested inventory item.
     Inventory(InvVect),
     /// Every item a `notfound` lists, each settled the same way a
-    /// delivery would settle it.
-    Inventories(Vec<InvVect>),
+    /// delivery would settle it.  Borrowed from the message, as dcrd's
+    /// loop ranges over `msg.InvList`: a `notfound` may list 50,000
+    /// items.
+    Inventories(&'m [InvVect]),
     /// A command-keyed response.
     Command(&'static str),
 }
@@ -118,9 +120,15 @@ pub enum Settles {
 /// here, which is the same single-hash-per-message shape.
 ///
 /// Passing `None` for a mixing message settles nothing, leaving its
-/// deadline armed; callers serving mix traffic must supply the hash or
-/// honest mixing peers will eventually be disconnected.
-pub fn settles(msg: &Message, mix_hash: Option<Hash>) -> Settles {
+/// deadline armed; callers serving mix traffic must supply the hash
+/// ([`Message::mix_hash`]) or honest mixing peers will eventually be
+/// disconnected.
+///
+/// A block or transaction is hashed here, as dcrd's
+/// `maybeRemoveDeadline` hashes it.  A caller sharing the detector
+/// classifies the message before taking the detector's lock, and holds
+/// that lock only for [`StallDetector::received_settles`].
+pub fn settles(msg: &Message, mix_hash: Option<Hash>) -> Settles<'_> {
     match msg {
         Message::Block(block) => Settles::Inventory(InvVect {
             inv_type: InvType::BLOCK,
@@ -130,21 +138,18 @@ pub fn settles(msg: &Message, mix_hash: Option<Hash>) -> Settles {
             inv_type: InvType::TX,
             hash: tx.tx_hash(),
         }),
-        Message::MixPairReq(_)
-        | Message::MixKeyExchange(_)
-        | Message::MixCiphertexts(_)
-        | Message::MixSlotReserve(_)
-        | Message::MixFactoredPoly(_)
-        | Message::MixDCNet(_)
-        | Message::MixConfirm(_)
-        | Message::MixSecrets(_) => match mix_hash {
+        // dcrd's case over the eight mixing messages.  They are the
+        // wire's one list (`Message::is_mix`), the same one the reader's
+        // `Message::mix_hash` hashes by, so a mixing message cannot be
+        // settled here without being hashed there.
+        mix if mix.is_mix() => match mix_hash {
             Some(hash) => Settles::Inventory(InvVect {
                 inv_type: InvType::MIX,
                 hash,
             }),
             None => Settles::Nothing,
         },
-        Message::NotFound(not_found) => Settles::Inventories(not_found.inv_list.clone()),
+        Message::NotFound(not_found) => Settles::Inventories(&not_found.inv_list),
         Message::InitState(_) => Settles::Command(CMD_INIT_STATE),
         _ => Settles::Nothing,
     }
@@ -256,14 +261,14 @@ pub fn maybe_add_deadline(
 /// Clear whatever a received message settles (dcrd
 /// `maybeRemoveDeadline`).  Items that were never requested, and
 /// messages that answer nothing, are a no-op.
-pub fn maybe_remove_deadline(pending: &mut PendingDeadlines, settles: &Settles) {
+pub fn maybe_remove_deadline(pending: &mut PendingDeadlines, settles: &Settles<'_>) {
     match settles {
         Settles::Nothing => {}
         Settles::Inventory(iv) => {
             pending.data.remove(iv);
         }
         Settles::Inventories(ivs) => {
-            for iv in ivs {
+            for iv in *ivs {
                 pending.data.remove(iv);
             }
         }
@@ -378,8 +383,16 @@ impl StallDetector {
     /// `mix_hash` carries the mixing-message identity hash; see
     /// [`settles`] for why the caller computes it.
     pub fn received_message(&mut self, msg: &Message, mix_hash: Option<Hash>) {
-        let settled = settles(msg, mix_hash);
-        maybe_remove_deadline(&mut self.pending, &settled);
+        self.received_settles(&settles(msg, mix_hash));
+    }
+
+    /// Clear what a received message settles, already classified by
+    /// [`settles`] (dcrd's `sccReceiveMessage`).  The same as
+    /// [`StallDetector::received_message`] without the hashing, so a
+    /// shared detector's lock is not held while a transaction or block
+    /// header is hashed.
+    pub fn received_settles(&mut self, settled: &Settles<'_>) {
+        maybe_remove_deadline(&mut self.pending, settled);
     }
 
     /// Report that a message callback is about to run (dcrd's
@@ -515,6 +528,36 @@ mod tests {
         maybe_remove_deadline(&mut pending, &settles(&not_found, None));
         assert_eq!(pending.pending_inv_count(), 1);
         assert_eq!(pending.inv_deadline(&wanted[2]), Some(100));
+    }
+
+    /// A `notfound` settles from its own list, not a copy of it (up to
+    /// 50,000 entries), and a detector handed the classification clears
+    /// what one handed the message does.
+    #[test]
+    fn a_notfound_settles_from_its_own_list() {
+        let wanted = [inv(InvType::BLOCK, 1), inv(InvType::TX, 2)];
+        let not_found = Message::NotFound(MsgNotFound {
+            inv_list: vec![wanted[0]],
+        });
+        let Message::NotFound(MsgNotFound { inv_list }) = &not_found else {
+            unreachable!("built as a notfound")
+        };
+        let settled = settles(&not_found, None);
+        assert!(
+            matches!(settled, Settles::Inventories(ivs) if std::ptr::eq(ivs, inv_list.as_slice())),
+            "{settled:?}"
+        );
+
+        let mut by_message = StallDetector::new();
+        let mut by_settles = StallDetector::new();
+        let _ = by_message.sent_message(&get_data(&wanted));
+        let _ = by_settles.sent_message(&get_data(&wanted));
+        by_message.received_message(&not_found, None);
+        by_settles.received_settles(&settled);
+        for detector in [&by_message, &by_settles] {
+            assert_eq!(detector.pending.inv_deadline(&wanted[0]), None);
+            assert!(detector.pending.inv_deadline(&wanted[1]).is_some());
+        }
     }
 
     /// A getdata that would push the pending count past the burst

@@ -935,22 +935,30 @@ impl RpcFiltererV2 for NodeRpcFiltererV2 {
             let chain = self.chain.lock().expect("chain mutex poisoned");
             crate::dispatch::FilterReads::locate_block(&chain, hash)
         };
-        match located
+        // A missing filter, the unknown or data-less block included, is
+        // dcrd's `blockchain.ErrNoFilter`, which the handler turns into
+        // the "Block not found" RPC error.  As in
+        // `Chain::filter_by_block_hash`, a failed read or a row that does
+        // not decode is the database error, which the handler returns as
+        // an internal error.
+        let no_filter = || {
+            crate::dispatch::FilterFetchError::NoFilter(format!(
+                "no filter available for block {hash}"
+            ))
+        };
+        let fetched = located
+            .ok_or_else(no_filter)
             .and_then(crate::dispatch::FilterReads::fetch)
-            .and_then(|mut filters| filters.pop())
-        {
-            Some(filter) => Ok(RpcFilterProof {
+            .and_then(|mut filters| filters.pop().ok_or_else(no_filter));
+        match fetched {
+            Ok(filter) => Ok(RpcFilterProof {
                 filter_bytes: filter.data,
                 proof_index: filter.proof_index,
                 proof_hashes: filter.proof_hashes,
             }),
-            // A missing filter is dcrd's `blockchain.ErrNoFilter`, which
-            // the handler turns into the "Block not found" RPC error.  As
-            // in `Chain::filter_by_block_hash`, a failed database read
-            // also answers as a missing filter.
-            None => Err(FilterFailure {
-                is_no_filter: true,
-                message: format!("no filter available for block {hash}"),
+            Err(err) => Err(FilterFailure {
+                is_no_filter: matches!(err, crate::dispatch::FilterFetchError::NoFilter(_)),
+                message: err.to_string(),
             }),
         }
     }

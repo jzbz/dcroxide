@@ -31,9 +31,10 @@ use dcroxide_wire::{NetAddress, ServiceFlag};
 /// A unit struct, and deliberately so.  dcrd's peer module holds no
 /// generator either -- it imports `crypto/rand` and calls the package
 /// functions (`peer/peer.go:1813`, `:2186`, `:842`, `:873`) -- and a
-/// zero-sized environment is what keeps `NodePeerEnv::new()` free at
-/// `runtime.rs:350`, `:363`, `:396` and `:413`, which build one only to
-/// read the clock and drop it.  Pinned by
+/// zero-sized environment is what keeps `NodePeerEnv::new()` free in
+/// `runtime.rs`'s `serve_inbound_peer` and `serve_outbound_peer`, whose
+/// ban checks and `associate` calls build one only to read the clock
+/// and drop it.  Pinned by
 /// `tests/peerenv_rand.rs::the_environment_carries_no_generator`.
 #[derive(Debug, Default)]
 pub struct NodePeerEnv;

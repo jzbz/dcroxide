@@ -15,7 +15,8 @@
 //! permits, outbound group tracking, and the inbound rate limiter —
 //! and makes dcrd's exact decisions in dcrd's order, the automatic
 //! outbound attempt's reservations included
-//! ([`ConnManager::auto_outbound_begin`]).  The daemon passes in the
+//! ([`ConnManager::auto_outbound_acquire`] and
+//! [`ConnManager::auto_outbound_reserve`]).  The daemon passes in the
 //! clock readings (wall-clock time, and [`crate::monotonic_nanos`]
 //! where dcrd subtracts two `time.Now` values, as for the inbound
 //! token buckets), the randomness, and the address source, owns the
@@ -27,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use dcroxide_addrmgr::NetAddress;
+use dcroxide_addrmgr::{GoTime, NetAddress};
 
 use crate::conntype::ConnectionType;
 use crate::csprng::Csprng;
@@ -659,8 +660,12 @@ impl ConnManager {
     /// Record a failed dial: drops the pending entry when still
     /// present (dcrd `dial`'s deferred pending removal; the flavor
     /// cleanup runs via the caller-held [`ClosePlan`] equivalent).
-    pub fn dial_failed(&mut self, conn_id: u64) {
+    /// Returns whether it was: `false` when the attempt was canceled
+    /// while it dialed, where dcrd's dial fails with `context.Canceled`.
+    pub fn dial_failed(&mut self, conn_id: u64) -> bool {
+        let pending = self.pending.contains_key(&conn_id);
         self.remove_pending_info(conn_id);
+        pending
     }
 
     /// Record a successful dial: when the pending entry was already
@@ -1077,8 +1082,9 @@ impl ConnManager {
     /// registered in the outbound groups and the caller removes it when
     /// no longer used.  The error string for exhaustion is
     /// [`NO_SUITABLE_ADDR_MSG`]; source errors pass through.  The
-    /// source returns each candidate's last attempt time in
-    /// nanoseconds (dcrd's `lastTry time.Time`).
+    /// source returns each candidate's last attempt time (dcrd's
+    /// `lastTry time.Time`, the zero [`GoTime`] when it was never
+    /// attempted), and `now` is dcrd's `time.Now()`.
     ///
     /// This runs the source with the manager borrowed.  The daemon's
     /// driver instead draws each candidate before taking the manager's
@@ -1087,12 +1093,12 @@ impl ConnManager {
     /// that (dcrd holds only the outbound groups' own mutex here).
     pub fn pick_outbound_addr(
         &mut self,
-        get_new_address: &mut dyn FnMut() -> Result<(NetAddress, i64), String>,
-        now_nanos: i64,
+        get_new_address: &mut dyn FnMut() -> Result<(NetAddress, GoTime), String>,
+        now: GoTime,
     ) -> Result<NetAddress, String> {
         for tries in 0..PICK_OUTBOUND_RETRIES {
-            let (addr, last_try_nanos) = get_new_address()?;
-            if self.claim_outbound_candidate(tries, &addr, last_try_nanos, now_nanos) {
+            let (addr, last_try) = get_new_address()?;
+            if self.claim_outbound_candidate(tries, &addr, last_try, now) {
                 return Ok(addr);
             }
         }
@@ -1105,13 +1111,17 @@ impl ConnManager {
     /// from 0) is suitable, registering it in the outbound groups when
     /// it is.  Skipped are addresses whose outbound group is already
     /// connected, recently attempted addresses for the first 30 tries,
-    /// and non-default ports for the first 50.
+    /// and non-default ports for the first 50.  "Recently" is Go's
+    /// `lastTry.Add(10*time.Minute).After(now)`: running time for an
+    /// address attempted in this process, whose attempt time carries a
+    /// monotonic reading, and wall-clock time for one loaded from
+    /// `peers.json`.
     pub fn claim_outbound_candidate(
         &mut self,
         tries: u32,
         addr: &NetAddress,
-        last_try_nanos: i64,
-        now_nanos: i64,
+        last_try: GoTime,
+        now: GoTime,
     ) -> bool {
         const SKIP_RECENTS_UNTIL: u32 = (PICK_OUTBOUND_RETRIES * 3) / 10;
         const SKIP_DEFAULT_PORT_UNTIL: u32 = PICK_OUTBOUND_RETRIES / 2;
@@ -1121,9 +1131,7 @@ impl ConnManager {
             return false;
         }
 
-        if tries < SKIP_RECENTS_UNTIL
-            && last_try_nanos.saturating_add(TEN_MINUTES_NANOS) > now_nanos
-        {
+        if tries < SKIP_RECENTS_UNTIL && last_try.add_nanos(TEN_MINUTES_NANOS).after(now) {
             return false;
         }
 
@@ -1613,7 +1621,7 @@ mod tests {
             default_port: 9108,
             ..ManagerConfig::default()
         });
-        let now_nanos = 1_700_000_000_000_000_000i64;
+        let now_nanos = GoTime::wall(1_700_000_000_000_000_000i64);
         let now_secs = 1_700_000_000i64;
 
         // A fresh non-default-port address is skipped for 50 tries
@@ -1624,7 +1632,7 @@ mod tests {
             .pick_outbound_addr(
                 &mut || {
                     calls += 1;
-                    Ok((addr.clone(), 0))
+                    Ok((addr.clone(), GoTime::default()))
                 },
                 now_nanos,
             )
@@ -1636,7 +1644,10 @@ mod tests {
         // exhaust all 100 tries.
         let same_group = v4(51, 9108);
         let err = m
-            .pick_outbound_addr(&mut || Ok((same_group.clone(), 0)), now_nanos)
+            .pick_outbound_addr(
+                &mut || Ok((same_group.clone(), GoTime::default())),
+                now_nanos,
+            )
             .expect_err("group filled");
         assert_eq!(err, NO_SUITABLE_ADDR_MSG);
 
@@ -1652,7 +1663,10 @@ mod tests {
             .pick_outbound_addr(
                 &mut || {
                     calls += 1;
-                    Ok((recent.clone(), (now_secs - 60) * 1_000_000_000))
+                    Ok((
+                        recent.clone(),
+                        GoTime::wall((now_secs - 60) * 1_000_000_000),
+                    ))
                 },
                 now_nanos,
             )
@@ -1669,7 +1683,10 @@ mod tests {
         m.pick_outbound_addr(
             &mut || {
                 calls += 1;
-                Ok((boundary.clone(), (now_secs - 600) * 1_000_000_000))
+                Ok((
+                    boundary.clone(),
+                    GoTime::wall((now_secs - 600) * 1_000_000_000),
+                ))
             },
             now_nanos,
         )

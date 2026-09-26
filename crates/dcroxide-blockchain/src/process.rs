@@ -4827,10 +4827,9 @@ impl Chain {
     /// reorganization loops, `maybe_accept_blocks` and the template
     /// checks, where dcrd returns `fetchBlockByNode`'s error and the
     /// operation fails with the node still running.  The database error
-    /// is carried as `ErrUtxoBackendCorruption` with its own text, the
-    /// kind the port gives the other local-corruption errors (see
-    /// `fetch_spend_journal`), so `is_rule_violation` neither brands the
-    /// block nor blames the peer for it.
+    /// is carried with its own text under a kind `is_rule_violation`
+    /// excludes ([`db_read_rule_error`]), so it neither brands the block
+    /// nor blames the peer for it.
     fn stored_block_arc(&self, node: NodeId) -> Result<Arc<MsgBlock>, RuleError> {
         self.block_arc(node).map_err(db_read_rule_error)
     }
@@ -6941,14 +6940,36 @@ pub fn persist_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
 }
 
 /// Convert a failed chain database read -- a block body, filter or
-/// header commitments row that cannot be read or does not decode --
-/// into the error the rule-error paths return.  dcrd returns these as
-/// plain database errors, never rule violations, so they travel as
-/// `ErrUtxoBackendCorruption` with the database error's own text, the
-/// kind the port gives the other local-corruption errors (see
-/// `fetch_spend_journal`).
-fn db_read_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
-    rule_error(RuleErrorKind::UtxoBackendCorruption, format!("{err}"))
+/// header commitments row that cannot be read or does not decode, or a
+/// read transaction that cannot be opened -- into the error the
+/// rule-error paths return.  dcrd returns these as plain database
+/// errors, never rule violations, so they travel with the database
+/// error's own text under a kind `is_rule_violation` excludes.
+///
+/// The kind keeps the split dcrd's sync manager makes with its
+/// `Critical failure` line, which it prints only for
+/// `database.ErrCorruption` and `ErrUtxoBackendCorruption`
+/// (`internal/netsync/manager.go:1265-1269`).  A read that fails as
+/// corruption -- the database's own `ErrCorruption` (a block whose
+/// checksum does not match), or a stored row that does not decode,
+/// which dcrd also returns as `ErrCorruption` (`chainio.go:858-859`,
+/// `:950-961`) -- is `ErrUtxoBackendCorruption`, the kind the port
+/// gives the other local corruption (see `fetch_spend_journal`).  Any
+/// other database failure (an I/O error, a missing block, a closed or
+/// failed store) is `ErrUtxoBackend`, which, like dcrd's plain
+/// database error, matches neither.  Public so the daemon's tests can
+/// check that split against what this produces.
+pub fn db_read_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
+    let kind = match &err {
+        crate::chaindb::ChainDbError::Db(e)
+            if e.kind != dcroxide_database::ErrorKind::Corruption =>
+        {
+            RuleErrorKind::UtxoBackend
+        }
+        crate::chaindb::ChainDbError::Interrupted => RuleErrorKind::UtxoBackend,
+        _ => RuleErrorKind::UtxoBackendCorruption,
+    };
+    rule_error(kind, format!("{err}"))
 }
 
 /// Read a stored block from the database (the database half of dcrd

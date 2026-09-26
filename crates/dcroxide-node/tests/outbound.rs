@@ -383,7 +383,7 @@ fn outbound_selection_spreads_across_groups() {
         let candidate = candidate.lock().expect("known address");
         Ok((
             candidate.net_address().clone(),
-            candidate.last_attempt().unwrap_or(0),
+            candidate.last_attempt().unwrap_or_default(),
         ))
     };
 
@@ -395,7 +395,7 @@ fn outbound_selection_spreads_across_groups() {
         },
         &mut csprng,
     );
-    let now_nanos = 1_700_000_000_000_000_000i64;
+    let now_nanos = dcroxide_addrmgr::GoTime::wall(1_700_000_000_000_000_000i64);
 
     // A candidate is available while the group is unoccupied, and the
     // pick registers the group.

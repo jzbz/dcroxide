@@ -1354,7 +1354,7 @@ fn run_node(cfg: Config) -> ExitCode {
             let candidate = candidate.lock().expect("known address poisoned");
             Ok((
                 candidate.net_address().clone(),
-                candidate.last_attempt().unwrap_or(0),
+                candidate.last_attempt().unwrap_or_default(),
             ))
         }) as dcroxide_node::outbound::AddressSource)
     } else {
@@ -1378,14 +1378,12 @@ fn run_node(cfg: Config) -> ExitCode {
     let mut persistent = Vec::with_capacity(persistent_targets.len());
     let target_dialer = dcroxide_node::socks::NodeDialer::from_config(&cfg);
     for addr in persistent_targets {
-        let added = dcroxide_node::outbound::addr_string_to_net_address(addr, &target_dialer)
-            .and_then(|net_addr| {
-                let mut manager = conn_manager.lock().expect("connmgr mutex poisoned");
-                manager
-                    .persistent_capacity_check()
-                    .and_then(|()| manager.add_persistent(&net_addr))
-                    .map_err(|e| e.description)
-                    .map(|id| (id, net_addr))
+        let added = dcroxide_node::outbound::addr_string_to_connect_target(addr, &target_dialer)
+            .and_then(|target| {
+                dcroxide_node::outbound::add_persistent_target(
+                    &mut conn_manager.lock().expect("connmgr mutex poisoned"),
+                    target,
+                )
             });
         match added {
             Ok(entry) => persistent.push(entry),

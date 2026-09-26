@@ -293,8 +293,10 @@ impl fmt::Display for WireError {
     /// Go's io error texts for the short reads, and dcrd's
     /// `MessageError.Error()` text, `Func: Description`
     /// (`wire/error.go:266-270`), for every error the transaction,
-    /// block and mixing message decoders return.  The remaining kinds,
-    /// which only the other P2P codecs produce, print their kind name.
+    /// block and mixing message decoders return, and for `ReadMessage`'s
+    /// wrong-network check.  The remaining kinds, which only the other
+    /// P2P codecs and the rest of the framing produce, print their kind
+    /// name.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(text) = self.message_text() {
             if text.desc.is_empty() {
@@ -325,9 +327,13 @@ impl fmt::Display for WireError {
                 op,
                 what,
             } => write!(f, "{op}: too many {what} [count {count}, max {max}]"),
-            WireError::WrongNetwork(magic) => {
-                write!(f, "message from other network [{magic:#x}]")
-            }
+            // dcrd `ReadMessageN` (`wire/message.go:418-421`): its `%v`
+            // prints the magic through `CurrencyNet.String`.
+            WireError::WrongNetwork(magic) => write!(
+                f,
+                "ReadMessage: message from other network [{}]",
+                crate::protocol::CurrencyNet(*magic)
+            ),
             WireError::MismatchedWitnessCount { witness, prefix } => write!(
                 f,
                 "MsgTx.decodeWitness: non equal witness and prefix txin \
@@ -373,5 +379,25 @@ mod tests {
             WireError::InvalidMsg(MessageText::NONE).to_string(),
             "ErrInvalidMsg"
         );
+    }
+
+    /// A header from another network prints dcrd's `ReadMessage` text,
+    /// the magic named as `CurrencyNet.String` names it: the network, or
+    /// its decimal value when it is none of the four.  The peer loop
+    /// logs it after "Can't read message from <peer>: ".
+    #[test]
+    fn wrong_network_renders_dcrds_read_message_text() {
+        for (magic, want) in [
+            (0xd9b4_00f9, "MainNet"),
+            (0xb194_aa75, "TestNet3"),
+            (0xdab5_00fa, "RegNet"),
+            (0x1214_1c16, "SimNet"),
+            (0xdead_beef, "Unknown CurrencyNet (3735928559)"),
+        ] {
+            assert_eq!(
+                WireError::WrongNetwork(magic).to_string(),
+                alloc::format!("ReadMessage: message from other network [{want}]")
+            );
+        }
     }
 }

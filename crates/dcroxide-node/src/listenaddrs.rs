@@ -17,7 +17,8 @@ use std::sync::Mutex;
 use dcroxide_addrmgr::{AddrManager, AddressPriority, new_net_address_from_ip_port};
 use dcroxide_wire::ServiceFlag;
 
-use crate::gostd::{go_quote, split_host_port};
+use crate::gostd::split_host_port;
+use crate::outbound::go_parse_uint16;
 use crate::server::{ResolveIpFn, host_to_net_address};
 
 /// Render a bound TCP address the way Go's `net.TCPAddr.String` does
@@ -33,22 +34,6 @@ pub fn go_tcp_addr_string(addr: &SocketAddr) -> String {
         },
         other => other.to_string(),
     }
-}
-
-/// Go's `strconv.ParseUint(s, 10, 16)`, with the `NumError` texts.
-fn parse_port(s: &str) -> Result<u16, String> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!(
-            "strconv.ParseUint: parsing {}: invalid syntax",
-            go_quote(s)
-        ));
-    }
-    s.parse::<u16>().map_err(|_| {
-        format!(
-            "strconv.ParseUint: parsing {}: value out of range",
-            go_quote(s)
-        )
-    })
 }
 
 /// Whether Go's `IP.To4` is non-nil: an IPv4 address or the
@@ -89,7 +74,7 @@ fn add_local_address(
     now_unix: i64,
 ) -> Result<(), String> {
     let (host, port_str) = split_host_port(addr)?;
-    let port = parse_port(&port_str)?;
+    let port = go_parse_uint16(&port_str)?;
 
     if let Some(ip) = host.parse::<IpAddr>().ok().filter(IpAddr::is_unspecified) {
         // If bound to unspecified address, advertise all local interfaces.
@@ -111,8 +96,14 @@ fn add_local_address(
                 continue;
             }
 
-            let net_addr =
-                new_net_address_from_ip_port(&ip_bytes(&iface_ip), port, services, now_unix);
+            // dcrd's `NewNetAddressFromIPPort` stamps `time.Now()` to the
+            // second; the address manager keeps Unix nanoseconds.
+            let net_addr = new_net_address_from_ip_port(
+                &ip_bytes(&iface_ip),
+                port,
+                services,
+                now_unix.saturating_mul(1_000_000_000),
+            );
             let _ = lock(amgr).add_local_address(&net_addr, AddressPriority::Bound);
         }
     } else {
@@ -145,7 +136,7 @@ pub fn add_listener_local_addresses(
     now_unix: i64,
 ) -> Result<(), String> {
     if !external_ips.is_empty() {
-        let default_port = parse_port(default_port).map_err(|e| {
+        let default_port = go_parse_uint16(default_port).map_err(|e| {
             crate::logging::error(
                 "SRVR",
                 &format!("Can not parse default port {default_port} for active chain: {e}"),
@@ -158,7 +149,7 @@ pub fn add_listener_local_addresses(
             let host = match split_host_port(sip) {
                 // No port, use default.
                 Err(_) => sip.clone(),
-                Ok((host, port_str)) => match parse_port(&port_str) {
+                Ok((host, port_str)) => match go_parse_uint16(&port_str) {
                     Ok(port) => {
                         eport = port;
                         host
@@ -203,6 +194,7 @@ pub fn add_listener_local_addresses(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dcroxide_addrmgr::NetAddress;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV6};
 
     fn manager() -> (tempfile::TempDir, Mutex<AddrManager>) {
@@ -327,15 +319,90 @@ mod tests {
         assert_eq!(locals(&amgr), vec!["2001:4860::1:9108".to_string()]);
     }
 
+    /// The address the handshake would advertise to an IPv4 peer, as
+    /// stored and as its wire `addr` and `addrv2` timestamps.
+    fn advertised(amgr: &Mutex<AddrManager>) -> (NetAddress, u32, u64) {
+        let remote =
+            new_net_address_from_ip_port(&[8, 8, 8, 8], 9108, ServiceFlag::NODE_NETWORK, 0);
+        let best = lock(amgr).get_best_local_address(&remote, |_| true);
+        let v1 = crate::server::addrmgr_to_wire_net_address(&best).timestamp;
+        let v2 = crate::server::addrmgr_to_wire_net_address_v2(&best).timestamp;
+        (best, v1, v2)
+    }
+
+    /// Every registered address carries the startup time, as dcrd's
+    /// `NewNetAddressFromIPPort` and `hostToNetAddress` stamp
+    /// `time.Now()`: an interface address an unspecified bind expands
+    /// to, and an `--externalip` host name the resolver answers.  A
+    /// 1970 stamp would make every receiving node treat the
+    /// advertisement as over a month old.
+    #[test]
+    fn registered_addresses_carry_the_clock() {
+        const NOW_UNIX: i64 = 1_758_800_000;
+
+        let (_dir, amgr) = manager();
+        add_listener_local_addresses(
+            &amgr,
+            &[],
+            "9108",
+            &["0.0.0.0:9108".to_string()],
+            ServiceFlag::NODE_NETWORK,
+            &no_lookup,
+            &|| Ok(vec!["11.22.33.44/32".to_string()]),
+            NOW_UNIX,
+        )
+        .expect("register");
+        let (best, v1, v2) = advertised(&amgr);
+        assert_eq!(best.key(), "11.22.33.44:9108");
+        assert_eq!(best.timestamp, NOW_UNIX * 1_000_000_000);
+        assert_eq!(i64::from(v1), NOW_UNIX);
+        assert_eq!(v2, NOW_UNIX as u64);
+
+        let (_dir, amgr) = manager();
+        let resolver = |host: &str| -> Result<Vec<IpAddr>, String> {
+            match host {
+                "node.example.com" => Ok(vec!["5.6.7.8".parse().expect("literal IP")]),
+                _ => no_lookup(host),
+            }
+        };
+        add_listener_local_addresses(
+            &amgr,
+            &["node.example.com".to_string()],
+            "9108",
+            &[],
+            ServiceFlag::NODE_NETWORK,
+            &resolver,
+            &|| Ok(Vec::new()),
+            NOW_UNIX,
+        )
+        .expect("register");
+        let (best, v1, v2) = advertised(&amgr);
+        assert_eq!(best.key(), "5.6.7.8:9108");
+        assert_eq!(best.timestamp, NOW_UNIX * 1_000_000_000);
+        assert_eq!(i64::from(v1), NOW_UNIX);
+        assert_eq!(v2, NOW_UNIX as u64);
+    }
+
+    /// The `--externalip` port warning carries Go's `NumError` text,
+    /// and Go's `ParseUint` scans left to right: a port that overflows
+    /// before a stray byte is out of range, not invalid syntax.
     #[test]
     fn ports_parse_as_go_base_ten() {
-        assert_eq!(parse_port("9108"), Ok(9108));
+        assert_eq!(go_parse_uint16("9108"), Ok(9108));
         assert_eq!(
-            parse_port("0x10"),
+            go_parse_uint16("99999x"),
+            Err(r#"strconv.ParseUint: parsing "99999x": value out of range"#.to_string())
+        );
+        assert_eq!(
+            go_parse_uint16("+9108"),
+            Err(r#"strconv.ParseUint: parsing "+9108": invalid syntax"#.to_string())
+        );
+        assert_eq!(
+            go_parse_uint16("0x10"),
             Err(r#"strconv.ParseUint: parsing "0x10": invalid syntax"#.to_string())
         );
         assert_eq!(
-            parse_port("65536"),
+            go_parse_uint16("65536"),
             Err(r#"strconv.ParseUint: parsing "65536": value out of range"#.to_string())
         );
     }

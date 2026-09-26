@@ -13,7 +13,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use dcroxide_chainhash::HASH_SIZE;
+use dcroxide_chainhash::{HASH_SIZE, Hash};
 
 use crate::MAX_MESSAGE_PAYLOAD;
 use crate::blockheader::MAX_BLOCK_HEADER_PAYLOAD;
@@ -34,6 +34,34 @@ pub const MESSAGE_HEADER_SIZE: usize = 24;
 
 /// The fixed size of the command field (dcrd `CommandSize`).
 pub const COMMAND_SIZE: usize = 12;
+
+/// A message hashed as it is read (dcrd's `hashable` interface in
+/// `peer/peer.go`): the eight mixing messages, through their `mix_hash`.
+trait MixHashable {
+    /// The message's mixing identity hash.
+    fn identity_hash(&self) -> Result<Hash, WireError>;
+}
+
+macro_rules! mix_hashable {
+    ($($msg:ty),* $(,)?) => {
+        $(impl MixHashable for $msg {
+            fn identity_hash(&self) -> Result<Hash, WireError> {
+                self.mix_hash()
+            }
+        })*
+    };
+}
+
+mix_hashable!(
+    MsgMixPairReq,
+    MsgMixKeyExchange,
+    MsgMixCiphertexts,
+    MsgMixSlotReserve,
+    MsgMixFactoredPoly,
+    MsgMixDCNet,
+    MsgMixConfirm,
+    MsgMixSecrets,
+);
 
 /// A Decred P2P message (dcrd's `Message` interface, as a closed enum).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +157,75 @@ impl Message {
             Message::MixDCNet(_) => "mixdcnet",
             Message::MixConfirm(_) => "mixconfirm",
             Message::MixSecrets(_) => "mixsecrets",
+        }
+    }
+
+    /// The mixing-message identity hash of one of the eight mixing
+    /// messages, and `None` for every other message: dcrd's `hashable`
+    /// type assertion (`peer/peer.go:956-959`), by which `readMessage`
+    /// hashes a mixing message as it is read (`:975-977`) and
+    /// `maybeRemoveDeadline` settles the request it answers
+    /// (`:1156-1160`).  The inner error is the message's own `mix_hash`
+    /// failure (see [`MsgMixPairReq::mix_hash`]).
+    pub fn mix_hash(&self) -> Option<Result<Hash, WireError>> {
+        self.as_mix().map(MixHashable::identity_hash)
+    }
+
+    /// Whether this is one of the eight mixing messages, the ones
+    /// [`Message::mix_hash`] hashes, without hashing it.
+    pub fn is_mix(&self) -> bool {
+        self.as_mix().is_some()
+    }
+
+    /// The one list of mixing messages behind [`Message::mix_hash`] and
+    /// [`Message::is_mix`], so the reader that hashes a mixing message
+    /// and the deadline table that settles it by that hash cannot
+    /// disagree about which messages those are.  It names every variant
+    /// rather than ending in a wildcard, so a message type added later
+    /// does not compile until it says whether it is one.
+    fn as_mix(&self) -> Option<&dyn MixHashable> {
+        match self {
+            Message::MixPairReq(m) => Some(m),
+            Message::MixKeyExchange(m) => Some(&**m),
+            Message::MixCiphertexts(m) => Some(m),
+            Message::MixSlotReserve(m) => Some(m),
+            Message::MixFactoredPoly(m) => Some(m),
+            Message::MixDCNet(m) => Some(m),
+            Message::MixConfirm(m) => Some(m),
+            Message::MixSecrets(m) => Some(m),
+            Message::Version(_)
+            | Message::VerAck
+            | Message::GetAddr
+            | Message::Addr(_)
+            | Message::AddrV2(_)
+            | Message::GetBlocks(_)
+            | Message::Inv(_)
+            | Message::GetData(_)
+            | Message::NotFound(_)
+            | Message::Block(_)
+            | Message::Tx(_)
+            | Message::GetHeaders(_)
+            | Message::Headers(_)
+            | Message::Ping(_)
+            | Message::Pong(_)
+            | Message::MemPool
+            | Message::MiningState(_)
+            | Message::GetMiningState
+            | Message::Reject(_)
+            | Message::SendHeaders
+            | Message::FeeFilter(_)
+            | Message::GetCFilter(_)
+            | Message::GetCFHeaders(_)
+            | Message::GetCFTypes
+            | Message::CFilter(_)
+            | Message::CFHeaders(_)
+            | Message::CFTypes(_)
+            | Message::GetCFilterV2(_)
+            | Message::CFilterV2(_)
+            | Message::GetInitState(_)
+            | Message::InitState(_)
+            | Message::GetCFsV2(_)
+            | Message::CFiltersV2(_) => None,
         }
     }
 
@@ -1137,6 +1234,46 @@ mod tests {
     fn samples_cover_every_variant() {
         let covered: BTreeSet<usize> = samples().iter().map(variant).collect();
         assert_eq!(covered, (0..VARIANTS).collect::<BTreeSet<_>>());
+    }
+
+    /// `mix_hash` hashes exactly dcrd's `hashable` messages, the eight
+    /// mixing commands, each with its own type's hash, and `is_mix`
+    /// agrees with it on every message.
+    #[test]
+    fn mix_hash_covers_exactly_the_mixing_messages() {
+        let mut hashed = BTreeSet::new();
+        for msg in samples() {
+            let got = msg.mix_hash();
+            assert_eq!(msg.is_mix(), got.is_some(), "{}", msg.command());
+            let want = match &msg {
+                Message::MixPairReq(m) => Some(m.mix_hash()),
+                Message::MixKeyExchange(m) => Some(m.mix_hash()),
+                Message::MixCiphertexts(m) => Some(m.mix_hash()),
+                Message::MixSlotReserve(m) => Some(m.mix_hash()),
+                Message::MixFactoredPoly(m) => Some(m.mix_hash()),
+                Message::MixDCNet(m) => Some(m.mix_hash()),
+                Message::MixConfirm(m) => Some(m.mix_hash()),
+                Message::MixSecrets(m) => Some(m.mix_hash()),
+                _ => None,
+            };
+            assert_eq!(got, want, "{}", msg.command());
+            if got.is_some() {
+                hashed.insert(msg.command());
+            }
+        }
+        let mixing: BTreeSet<&str> = [
+            "mixpairreq",
+            "mixkeyxchg",
+            "mixcphrtxt",
+            "mixslotres",
+            "mixfactpoly",
+            "mixdcnet",
+            "mixconfirm",
+            "mixsecrets",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(hashed, mixing);
     }
 
     /// `serialize_size` is the exact encoded length for every message,

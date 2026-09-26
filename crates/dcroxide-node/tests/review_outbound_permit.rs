@@ -107,7 +107,7 @@ fn a_freed_permit_wakes_the_parked_outbound_fill() {
             persistent: Vec::new(),
             get_new_address: Some(Box::new(move || {
                 counter.fetch_add(1, Ordering::SeqCst);
-                Ok((dead_addr.clone(), 0))
+                Ok((dead_addr.clone(), Default::default()))
             })),
             addr_manager: None,
         },

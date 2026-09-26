@@ -86,16 +86,7 @@ pub fn new_net_address(addr: &PeerAddr, services: ServiceFlag) -> Result<NetAddr
         }
         PeerAddr::Other { addr } => {
             let (host, port_str) = split_host_port(addr)?;
-            let port: u16 = if port_str.is_empty() || !port_str.bytes().all(|c| c.is_ascii_digit())
-            {
-                return Err(format!(
-                    "strconv.ParseUint: parsing \"{port_str}\": invalid syntax"
-                ));
-            } else {
-                port_str.parse().map_err(|_| {
-                    format!("strconv.ParseUint: parsing \"{port_str}\": value out of range")
-                })?
-            };
+            let port = parse_port(&port_str)?;
             // A nil parsed IP stays the zero address.
             let ip = parse_ip(&host).unwrap_or([0u8; 16]);
             Ok(NetAddress {
@@ -106,6 +97,82 @@ pub fn new_net_address(addr: &PeerAddr, services: ServiceFlag) -> Result<NetAddr
             })
         }
     }
+}
+
+/// Parse a port like Go's `strconv.ParseUint(s, 10, 16)`, with its
+/// error text.
+///
+/// Go checks the bytes as it accumulates them, left to right, so the
+/// first digit that takes the value past 65535 is a range error even
+/// when an invalid byte follows it: `"99999x"` is out of range, where
+/// `"6553x"` is invalid syntax.  Checking every byte for syntax first
+/// got the former wrong.  The input is quoted as Go's `NumError` quotes
+/// it ([`go_quote`]).
+pub(crate) fn parse_port(s: &str) -> Result<u16, String> {
+    let err = |why: &str| format!("strconv.ParseUint: parsing {}: {why}", go_quote(s));
+    if s.is_empty() {
+        return Err(err("invalid syntax"));
+    }
+    let mut n: u32 = 0;
+    for c in s.bytes() {
+        if !c.is_ascii_digit() {
+            return Err(err("invalid syntax"));
+        }
+        // `c` is a digit and `n` at most 65535 here, so nothing wraps or
+        // saturates.
+        n = n
+            .saturating_mul(10)
+            .saturating_add(u32::from(c.wrapping_sub(b'0')));
+        if n > u32::from(u16::MAX) {
+            return Err(err("value out of range"));
+        }
+    }
+    u16::try_from(n).map_err(|_| err("value out of range"))
+}
+
+/// Go's `strconv.Quote` for a valid UTF-8 string, as `NumError.Error`
+/// renders the text it failed to parse.
+///
+/// Exact below U+0100, where Go's `IsPrint` is a range check: printable
+/// ASCII and U+00A1..=U+00FF but the soft hyphen are kept, `"` and `\`
+/// are backslashed, the seven C escapes are named, the other ASCII
+/// controls and DEL are `\xNN`, and the rest are `\u00NN`.  Beyond it Go
+/// keeps a rune only when its Unicode tables call it printable; this
+/// escapes the control and space characters and keeps the rest, so a
+/// format, private-use or unassigned rune is kept where Go writes a
+/// `\u` escape.  Only a caller's own address string reaches this, never
+/// the daemon's.
+fn go_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().saturating_add(2));
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            ' '..='~' | '\u{a1}'..='\u{ac}' | '\u{ae}'..='\u{ff}' => out.push(c),
+            '\u{7}' => out.push_str("\\a"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{b}' => out.push_str("\\v"),
+            '\0'..='\u{1f}' | '\u{7f}' => out.push_str(&format!("\\x{:02x}", u32::from(c))),
+            '\u{80}'..='\u{a0}' | '\u{ad}' => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            _ if c.is_control() || c.is_whitespace() => {
+                if u32::from(c) < 0x1_0000 {
+                    out.push_str(&format!("\\u{:04x}", u32::from(c)));
+                } else {
+                    out.push_str(&format!("\\U{:08x}", u32::from(c)));
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Split host and port like Go's `net.SplitHostPort`, with dcrd's
@@ -170,6 +237,64 @@ pub(crate) fn split_host_port(hostport: &str) -> Result<(String, String), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Go's `strconv.ParseUint(s, 10, 16)`, over the order of its checks:
+    /// a digit that overflows is reported before a bad byte after it.
+    #[test]
+    fn parse_port_matches_go_parse_uint() {
+        for (input, want) in [
+            ("0", Ok(0)),
+            ("8333", Ok(8333)),
+            ("065535", Ok(65535)),
+            ("65535", Ok(65535)),
+            ("65536", Err("value out of range")),
+            ("99999x", Err("value out of range")),
+            ("65536a", Err("value out of range")),
+            ("6553x", Err("invalid syntax")),
+            ("x", Err("invalid syntax")),
+            ("+1", Err("invalid syntax")),
+            ("1_0", Err("invalid syntax")),
+            ("", Err("invalid syntax")),
+        ] {
+            let want = want.map_err(|why| format!("strconv.ParseUint: parsing \"{input}\": {why}"));
+            assert_eq!(parse_port(input), want, "{input}");
+        }
+        // `NumError` quotes the input with `strconv.Quote`.
+        for (input, quoted) in [
+            ("8\"3", r#""8\"3""#),
+            ("8\\3", r#""8\\3""#),
+            ("8\t3", r#""8\t3""#),
+            ("8\u{1}3", r#""8\x013""#),
+            ("8\u{7f}3", r#""8\x7f3""#),
+            ("8\u{85}3", r#""8\u00853""#),
+            ("8\u{a0}3", "\"8\\u00a03\""),
+            ("8\u{ad}3", "\"8\\u00ad3\""),
+            ("8\u{e9}3", "\"8\u{e9}3\""),
+            ("8\u{3000}3", "\"8\\u30003\""),
+            ("8\u{4e2d}3", "\"8\u{4e2d}3\""),
+        ] {
+            assert_eq!(
+                parse_port(input),
+                Err(format!(
+                    "strconv.ParseUint: parsing {quoted}: invalid syntax"
+                )),
+                "{input:?}"
+            );
+        }
+        assert_eq!(
+            new_net_address(
+                &PeerAddr::Other {
+                    addr: "1.2.3.4:99999x".to_string()
+                },
+                ServiceFlag(0)
+            ),
+            Err("strconv.ParseUint: parsing \"99999x\": value out of range".to_string())
+        );
+        assert_eq!(
+            crate::Peer::new_outbound(crate::Config::default(), "1.2.3.4:99999x").err(),
+            Some("strconv.ParseUint: parsing \"99999x\": value out of range".to_string())
+        );
+    }
 
     /// `split_host_port` matches Go's `net.SplitHostPort`, reporting a
     /// missing port (never panicking) when a bracketed host is followed

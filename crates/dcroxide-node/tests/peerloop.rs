@@ -533,9 +533,10 @@ fn outbound_queue_is_byte_capped_before_the_depth_cap() {
 /// A message larger than the whole byte budget is admitted into an
 /// empty queue instead of being refused forever: refusing it every time
 /// would wedge the connection on a message the write path is perfectly
-/// able to send (bounded by the write deadline).  No current message
-/// type can exceed the budget — this pins the behavior for any future
-/// one.  While the oversized message is queued the budget still holds:
+/// able to send (bounded by the write deadline).  Only the protocol
+/// maxima of `cfiltersv2` and the largest mix messages exceed the
+/// budget, far above anything real; this pins the behavior for them.
+/// While the oversized message is queued the budget still holds:
 /// everything else is refused until it drains.
 #[test]
 fn oversized_message_is_admitted_alone_then_the_budget_holds() {

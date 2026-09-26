@@ -13,10 +13,11 @@
 //! the clock readings (wall-clock time, and [`monotonic_nanos`] where
 //! dcrd subtracts two `time.Now` values) and the randomness
 //! ([`Csprng`]), and arms the timers the core hands back as delays.
-//! The automatic outbound attempt's reservation sequence runs in the
-//! core ([`manager::ConnManager::auto_outbound_begin`], split as
-//! `auto_outbound_acquire` and `auto_outbound_reserve` for a daemon
-//! that picks the address with the manager unlocked), with dcrd's
+//! The automatic outbound attempt's reservations are taken and given
+//! back in the core, in two phases around the address pick so a daemon
+//! can draw candidates with the manager unlocked
+//! ([`manager::ConnManager::auto_outbound_acquire`] and
+//! [`manager::ConnManager::auto_outbound_reserve`]), with dcrd's
 //! blocking semaphore acquire modelled as a parked waiter
 //! ([`SemCount::acquire_or_wait`]).
 

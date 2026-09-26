@@ -128,35 +128,92 @@ pub fn seeder_url(seeder: &str, filters: &HttpsSeederFilters) -> String {
     url
 }
 
-/// Scan one JSON value starting at `pos`, returning the value's start
-/// and end offsets, or `None` when only whitespace remains, and `Err`
-/// when the value is truncated.  This mirrors the framing behavior of
-/// Go's `json.Decoder` over a byte-limited stream.
-pub(crate) fn next_value_extent(data: &[u8], pos: usize) -> Result<Option<(usize, usize)>, String> {
-    let mut pos = pos;
-    while pos < data.len() && matches!(data[pos], b' ' | b'\t' | b'\n' | b'\r') {
-        pos += 1;
+/// Whether Go's JSON scanner treats the byte as whitespace (`isSpace`).
+pub(crate) fn is_json_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Frame the JSON value `rest` begins with, at a byte that is not
+/// whitespace, as Go's `Decoder.readValue` frames it over a reader that
+/// ends where `rest` does, returning the value's length.  The scanner's
+/// first syntax error inside the value is the error, found as the
+/// scanner meets it and not only once brackets fail to balance.  A value
+/// the input ends partway through is `unexpected EOF`, whatever the
+/// scanner was in the middle of.  A value that completes ends where the
+/// scanner ends it, and what follows is left for the next read, which
+/// Go does not look at before then.  Bytes inside a string need not be
+/// UTF-8: the scanner takes anything from 0x20 up there.
+///
+/// This is the crate's one model of Go's `json.Decoder`: the peers file
+/// reads its first value through it and a seeder response its stream of
+/// values.
+pub(crate) fn read_value(rest: &[u8]) -> Result<usize, String> {
+    let err = match gojson::validate_bytes(rest) {
+        // One value, then only whitespace.
+        Ok(()) => return Ok(rest.len()),
+        Err(err) => err.go_message(),
+    };
+    // The scanner stops at the first byte it rejects, so an error that
+    // an appended byte changes is one the end of the input raised (0x01
+    // is rejected in every state, and names itself when it is).
+    let mut extended = rest.to_vec();
+    extended.push(0x01);
+    if gojson::validate_bytes(&extended).map_err(|err| err.go_message()) != Err(err.clone()) {
+        return Err("unexpected EOF".to_string());
     }
-    if pos >= data.len() {
-        return Ok(None);
+    if !err.ends_with("after top-level value") {
+        return Err(err);
     }
-    // A closing bracket at the top level ends the stream rather than
-    // starting a value.  Go's `Decoder.More` reports no further element
-    // and the caller keeps what it already decoded; treating it as a
-    // malformed value failed the whole `seed_addrs` call and discarded
-    // every address parsed before it -- which the seeder retry path then
-    // repeats under a capped backoff.
-    if matches!(data[pos], b']' | b'}') {
-        return Ok(None);
+    Ok(complete_value_len(rest))
+}
+
+/// The length of the complete JSON value that starts `rest` and that
+/// something other than whitespace follows.  Go's scanner ends a number
+/// or a literal at the first byte that cannot continue it, so `123-4`
+/// and `nullx` are the values `123` and `null`.
+fn complete_value_len(rest: &[u8]) -> usize {
+    match rest[0] {
+        b'{' | b'[' | b'"' => bracketed_value_len(rest),
+        b't' | b'n' => 4,
+        b'f' => 5,
+        _ => {
+            // -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?, which the
+            // scanner has already accepted.
+            let digits = |mut i: usize| {
+                while rest.get(i).is_some_and(u8::is_ascii_digit) {
+                    i += 1;
+                }
+                i
+            };
+            let mut i = usize::from(rest[0] == b'-');
+            i = if rest.get(i) == Some(&b'0') {
+                i + 1
+            } else {
+                digits(i)
+            };
+            if rest.get(i) == Some(&b'.') {
+                i = digits(i + 1);
+            }
+            if matches!(rest.get(i), Some(b'e' | b'E')) {
+                i += 1;
+                if matches!(rest.get(i), Some(b'+' | b'-')) {
+                    i += 1;
+                }
+                i = digits(i);
+            }
+            i
+        }
     }
-    let start = pos;
+}
+
+/// The length of the object, array or string that starts `rest`.  The
+/// scanner has already accepted it, so its brackets balance and its
+/// strings close, and counting brackets outside strings finds its end.
+fn bracketed_value_len(rest: &[u8]) -> usize {
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
-    let compound = matches!(data[start], b'{' | b'[');
-    while pos < data.len() {
-        let c = data[pos];
-        pos += 1;
+    for (i, &c) in rest.iter().enumerate() {
         if in_string {
             if escaped {
                 escaped = false;
@@ -164,8 +221,8 @@ pub(crate) fn next_value_extent(data: &[u8], pos: usize) -> Result<Option<(usize
                 escaped = true;
             } else if c == b'"' {
                 in_string = false;
-                if !compound && depth == 0 {
-                    return Ok(Some((start, pos)));
+                if depth == 0 {
+                    return i + 1;
                 }
             }
             continue;
@@ -175,22 +232,14 @@ pub(crate) fn next_value_extent(data: &[u8], pos: usize) -> Result<Option<(usize
             b'{' | b'[' => depth += 1,
             b'}' | b']' => {
                 depth = depth.saturating_sub(1);
-                if compound && depth == 0 {
-                    return Ok(Some((start, pos)));
+                if depth == 0 {
+                    return i + 1;
                 }
-            }
-            b',' | b' ' | b'\t' | b'\n' | b'\r' if !compound && depth == 0 => {
-                return Ok(Some((start, pos - 1)));
             }
             _ => {}
         }
     }
-    if !compound && !in_string {
-        // A primitive terminated by the end of input is complete.
-        return Ok(Some((start, pos)));
-    }
-    // A truncated value: Go's decoder reports unexpected EOF.
-    Err("unexpected EOF".to_string())
+    rest.len()
 }
 
 /// Split host and port like Go's `net.SplitHostPort`, returning the
@@ -297,13 +346,22 @@ pub fn seed_addrs<T: SeederTransport, E: SeedEnv>(
     let ntype = node_type();
     let mut nodes: Vec<(String, u64, u32)> = Vec::new();
     let mut pos = 0usize;
-    loop {
-        let extent =
-            next_value_extent(body, pos).map_err(|e| format!("unable to parse response: {e}"))?;
-        let Some((start, end)) = extent else { break };
-        let chunk = core::str::from_utf8(&body[start..end])
-            .map_err(|_| "unable to parse response: invalid UTF-8".to_string())?;
-        let value = gojson::decode(&ntype, chunk)
+    // `dec.More()`: skip whitespace; the end of the input or a closing
+    // bracket ends the stream, and the nodes decoded so far are kept.
+    while let Some(start) = body[pos..]
+        .iter()
+        .position(|&c| !is_json_space(c))
+        .map(|skipped| pos + skipped)
+    {
+        if matches!(body[start], b']' | b'}') {
+            break;
+        }
+        // `dec.Decode(&node)`: frame the value, then unmarshal it, a
+        // byte that is not UTF-8 inside a string becoming U+FFFD.
+        let end = start
+            + read_value(&body[start..]).map_err(|e| format!("unable to parse response: {e}"))?;
+        let value = gojson::unmarshal_input(&body[start..end])
+            .and_then(|text| gojson::decode(&ntype, &text))
             .map_err(|e| format!("unable to parse response: {}", e.go_message()))?;
         let fields = match value {
             GoValue::Struct(fields) => fields,
@@ -381,12 +439,31 @@ pub fn seed_addrs<T: SeederTransport, E: SeedEnv>(
     Ok(addrs)
 }
 
-/// Parse a port like Go's `strconv.ParseUint(portStr, 10, 16)`.
-pub(crate) fn go_parse_port(s: &str) -> Result<u16, ()> {
-    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
-        return Err(());
+/// Parse a port like Go's `strconv.ParseUint(portStr, 10, 16)`, with
+/// its `NumError` texts: decimal digits only, no sign, and the digits
+/// accumulate left to right, so an overflow is reported before a later
+/// non-digit, as in Go.
+pub(crate) fn go_parse_port(s: &str) -> Result<u16, String> {
+    let error = |reason: &str| {
+        format!(
+            "strconv.ParseUint: parsing {}: {reason}",
+            gojson::go_quote(s)
+        )
+    };
+    if s.is_empty() {
+        return Err(error("invalid syntax"));
     }
-    s.parse::<u16>().map_err(|_| ())
+    let mut n: u16 = 0;
+    for c in s.bytes() {
+        if !c.is_ascii_digit() {
+            return Err(error("invalid syntax"));
+        }
+        n = n
+            .checked_mul(10)
+            .and_then(|n| n.checked_add(u16::from(c - b'0')))
+            .ok_or_else(|| error("value out of range"))?;
+    }
+    Ok(n)
 }
 
 /// The status text Go's `http.StatusText` returns for the codes a
@@ -452,5 +529,44 @@ mod tests {
             split_host_port("[]:80").unwrap(),
             (String::new(), "80".to_string())
         );
+    }
+
+    /// `go_parse_port` is Go's `strconv.ParseUint(s, 10, 16)`: the same
+    /// accepted set and the same `NumError` texts, the overflow reported
+    /// at the digit that overflows, before a later bad byte.
+    #[test]
+    fn go_parse_port_matches_go() {
+        assert_eq!(go_parse_port("9108"), Ok(9108));
+        assert_eq!(go_parse_port("65535"), Ok(65535));
+        assert_eq!(go_parse_port("009108"), Ok(9108));
+        for (input, want) in [
+            ("", r#"strconv.ParseUint: parsing "": invalid syntax"#),
+            (
+                "+9108",
+                r#"strconv.ParseUint: parsing "+9108": invalid syntax"#,
+            ),
+            (
+                "0x10",
+                r#"strconv.ParseUint: parsing "0x10": invalid syntax"#,
+            ),
+            (
+                "9_108",
+                r#"strconv.ParseUint: parsing "9_108": invalid syntax"#,
+            ),
+            (
+                "65536",
+                r#"strconv.ParseUint: parsing "65536": value out of range"#,
+            ),
+            (
+                "99999x",
+                r#"strconv.ParseUint: parsing "99999x": value out of range"#,
+            ),
+            (
+                "x99999",
+                r#"strconv.ParseUint: parsing "x99999": invalid syntax"#,
+            ),
+        ] {
+            assert_eq!(go_parse_port(input), Err(want.to_string()), "{input}");
+        }
     }
 }

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dcroxide_addrmgr::{
-    AddrManager, AddrRng, AddressPriority, NetAddress, NetAddressType, encode_host,
+    AddrManager, AddrRng, AddressPriority, GoTime, NetAddress, NetAddressType, encode_host,
     new_net_address_from_params,
 };
 use dcroxide_testutil::unhex;
@@ -293,6 +293,9 @@ fn addrmgr_vectors() {
                 let ka = amc.known_address("1.2.3.4:9108").expect("crafted address");
                 let ka = ka.lock().expect("addr lock poisoned");
                 let now = clock_cell.load(Ordering::Relaxed);
+                // Loaded from peers.json, the times have no monotonic
+                // reading, so the wall clock decides.
+                let now = GoTime::wall(now);
                 assert_eq!(ka.chance(now).to_bits(), want_chance, "{name}: chance bits");
                 assert_eq!(ka.is_bad(now), want_bad, "{name}: isBad");
                 counts[6] += 1;

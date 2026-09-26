@@ -75,7 +75,7 @@ fn adapts_a_genesis_chain_for_the_sync_manager() {
     assert!(!txpool.have_transaction(&genesis_hash));
     assert!(
         txpool
-            .process_transaction(&genesis_block.transactions[0], true, false, 0)
+            .process_transaction_accepted(&genesis_block.transactions[0], true, false, 0)
             .is_err()
     );
     let mut mixpool = NullMixPool;

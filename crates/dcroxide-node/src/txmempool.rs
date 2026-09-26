@@ -470,18 +470,6 @@ impl NodeSyncTxPool {
 }
 
 impl SyncTxPool for NodeSyncTxPool {
-    fn process_transaction(
-        &mut self,
-        tx: &MsgTx,
-        allow_orphan: bool,
-        allow_high_fees: bool,
-        tag: u64,
-    ) -> Result<Vec<Hash>, String> {
-        self.locked()
-            .process_transaction(tx, allow_orphan, allow_high_fees, tag)
-            .map_err(|e| pool_error_text(&e))
-    }
-
     fn process_transaction_accepted(
         &mut self,
         tx: &MsgTx,

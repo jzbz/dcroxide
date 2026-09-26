@@ -79,9 +79,10 @@ pub struct ServerContext {
     /// The parsed whitelisted networks (`--whitelist`); peers matching
     /// one are exempt from banning.
     pub whitelists: Vec<crate::config::IpPrefix>,
-    /// The banned hosts and the Unix nanosecond times the bans lift
-    /// (dcrd `peerState.banned`), fed by the misbehavior handlers and
-    /// consulted by the pre-handshake inbound admission.
+    /// The banned hosts and the times the bans lift on
+    /// [`crate::server::ban_clock_nanos`] (dcrd `peerState.banned`), fed
+    /// by the misbehavior handlers and consulted by the pre-handshake
+    /// inbound admission.
     pub banned_hosts: Mutex<std::collections::BTreeMap<String, i64>>,
     /// How long misbehaving peers stay banned, in nanoseconds
     /// (`--banduration`).
@@ -889,10 +890,11 @@ impl SyncPeers {
     /// peers' reads by shutting their sockets down.  The stall-timer
     /// actions are handled by the header-sync timer piece.
     ///
-    /// Returns the getdata and getheaders requests a full queue refused,
-    /// with the peer each was meant for; [`Self::execute_sync`] hands
-    /// them back to the manager, whose request maps and duplicate
-    /// filter recorded them as sent.
+    /// Returns the requests a full queue refused that the manager
+    /// recorded as sent -- getdata and getheaders, whose request maps and
+    /// duplicate filter track them, and the once-per-peer initial state
+    /// request -- with the peer each was meant for; [`Self::execute_sync`]
+    /// hands them back to the manager.
     fn execute(&self, actions: Vec<Action>) -> Vec<(i32, Message)> {
         let mut refused = Vec::new();
         let mut registry = self.inner.lock().expect("sync peers mutex poisoned");
@@ -901,20 +903,18 @@ impl SyncPeers {
                 Action::QueueMessage { peer, message } => {
                     if let Some(handles) = registry.get(&peer) {
                         let command = message.command();
-                        // Only the two requests the manager records as
-                        // sent need handing back if refused, and both are
-                        // small, so the copy is cheap.
-                        let request =
-                            matches!(message, Message::GetData(_) | Message::GetHeaders(_))
-                                .then(|| message.clone());
-                        match handles.outbound.queue_message(message) {
+                        // The queue hands a refused message back, so a
+                        // request is never copied in case it is refused;
+                        // a transaction getdata carries up to 50,000
+                        // items, about 1.8 MB.
+                        match handles.outbound.queue_message_or_return(message) {
                             Ok(()) => {}
                             // The output loop already stopped, so the
                             // connection is tearing down and the sync
                             // manager will be told through the ordinary
                             // disconnect path.
-                            Err(crate::peerloop::QueueError::Closed) => {}
-                            Err(crate::peerloop::QueueError::Full) => {
+                            Err((crate::peerloop::QueueError::Closed, _)) => {}
+                            Err((crate::peerloop::QueueError::Full, message)) => {
                                 // Do NOT disconnect here.  dcrd does, but
                                 // only once 40 MiB is queued for the peer
                                 // (`maxQueuedOutputBytes`, `queueOutMsg`);
@@ -941,8 +941,15 @@ impl SyncPeers {
                                 // the data from another holder or forgets
                                 // the request so the next announcement or
                                 // fetch asks again.
+                                //
+                                // The queue's own warning is latched to one
+                                // line per congestion episode; this one is
+                                // per request, so it stays at debug, or a
+                                // peer holding its queue full would turn
+                                // every inv it sends into a warning.  dcrd
+                                // queues the request and logs nothing.
                                 handles.outbound.report_full(command);
-                                crate::logging::warn(
+                                crate::logging::debug(
                                     "SYNC",
                                     &format!(
                                         "Outbound queue for peer {} is full -- dropping the \
@@ -950,8 +957,14 @@ impl SyncPeers {
                                         handles.remote_addr.as_deref().unwrap_or("unknown")
                                     ),
                                 );
-                                if let Some(request) = request {
-                                    refused.push((peer, request));
+                                if matches!(
+                                    *message,
+                                    Message::GetData(_)
+                                        | Message::GetHeaders(_)
+                                        | Message::GetInitState(_)
+                                        | Message::GetMiningState
+                                ) {
+                                    refused.push((peer, *message));
                                 }
                             }
                         }
@@ -1514,12 +1527,13 @@ fn peer_bytes_sent(peer_handle: Option<&Arc<Mutex<Peer>>>) -> Option<u64> {
 /// refused reply is retried only after the output loop has written
 /// something since, so a congested peer costs one refused attempt per
 /// completed write, and a peer that stops reading is torn down by the
-/// write deadline, which ends the wait.
+/// write deadline, which ends the wait.  The queue hands a refused reply
+/// back, so no attempt copies it.
 fn queue_reply(
     outbound: &OutboundQueue,
     quit: &AtomicBool,
     peer_handle: Option<&Arc<Mutex<Peer>>>,
-    msg: Message,
+    mut msg: Message,
 ) -> bool {
     let mut refused_at: Option<Option<u64>> = None;
     loop {
@@ -1534,12 +1548,11 @@ fn queue_reply(
             Some(at) => sent.is_none() || at != sent,
         };
         if retry {
-            // The queue consumes what it refuses, so each attempt hands
-            // it a copy.
-            match outbound.queue_message(msg.clone()) {
+            match outbound.queue_message_or_return(msg) {
                 Ok(()) => return true,
-                Err(crate::peerloop::QueueError::Closed) => return false,
-                Err(crate::peerloop::QueueError::Full) => {
+                Err((crate::peerloop::QueueError::Closed, _)) => return false,
+                Err((crate::peerloop::QueueError::Full, refused)) => {
+                    msg = *refused;
                     // The reply is delayed, not dropped, so it does not
                     // go through the queue's "-- dropping" warning, whose
                     // once-per-episode latch stays free for a producer
@@ -1661,11 +1674,39 @@ impl BlockRead {
 /// for an 88-byte request.  Filters and commitments are immutable per
 /// block hash once stored, so the reads after the lock is released return
 /// what [`Chain::locate_cfilters_v2`] and [`Chain::filter_by_block_hash`]
-/// would have.
+/// would have, their errors included: a failed read, or a filter or
+/// commitments row that does not decode, is the database error dcrd
+/// returns, never a missing filter or a proof over no leaves.
 pub(crate) struct FilterReads {
     db: Option<Database>,
+    /// Whether the stored filters are served as stored, without being
+    /// decoded: a getcfsv2 range, which dcrd's `LocateCFiltersV2` reads
+    /// with `dbFetchRawGCSFilter`, where `FilterByBlockHash` decodes its
+    /// one filter with `dbFetchGCSFilter`.
+    raw: bool,
     /// The blocks, oldest first.
     blocks: Vec<FilterRead>,
+}
+
+/// Why [`FilterReads::fetch`] served nothing: what dcrd's
+/// `FilterByBlockHash` and `LocateCFiltersV2` return from their
+/// `db.View`, with the texts [`Chain::filter_by_block_hash`] and
+/// [`Chain::locate_cfilters_v2`] carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilterFetchError {
+    /// A block's filter is not stored (dcrd `ErrNoFilter`).
+    NoFilter(String),
+    /// A failed read, or a filter or commitments row that does not
+    /// decode: the database error dcrd returns as is.
+    Db(String),
+}
+
+impl std::fmt::Display for FilterFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FilterFetchError::NoFilter(text) | FilterFetchError::Db(text) => f.write_str(text),
+        }
+    }
 }
 
 /// One block's committed filter data, as far as the chain's recent
@@ -1678,10 +1719,53 @@ struct FilterRead {
     leaves: Option<Vec<Hash>>,
 }
 
+impl FilterRead {
+    /// Read what the window did not hold, in dcrd's order: the filter,
+    /// then its commitments.
+    fn read(
+        &mut self,
+        tx: &dcroxide_database::Transaction,
+        raw: bool,
+    ) -> Result<(), FilterFetchError> {
+        use dcroxide_blockchain::chaindb::{
+            db_fetch_gcs_filter, db_fetch_header_commitments, db_fetch_raw_gcs_filter,
+        };
+        let db_error = |err: dcroxide_blockchain::chaindb::ChainDbError| {
+            FilterFetchError::Db(format!("{err}"))
+        };
+        if self.filter.is_none() {
+            let filter = if raw {
+                db_fetch_raw_gcs_filter(tx, &self.hash).map_err(db_error)?
+            } else {
+                db_fetch_gcs_filter(tx, &self.hash)
+                    .map_err(db_error)?
+                    .map(|filter| filter.bytes().to_vec())
+            };
+            let Some(filter) = filter else {
+                return Err(no_filter(&self.hash));
+            };
+            self.filter = Some(filter);
+        }
+        if self.leaves.is_none() {
+            self.leaves = Some(db_fetch_header_commitments(tx, &self.hash).map_err(db_error)?);
+        }
+        Ok(())
+    }
+}
+
+/// dcrd's `ErrNoFilter` for a block, with its text.
+fn no_filter(hash: &Hash) -> FilterFetchError {
+    FilterFetchError::NoFilter(format!("no filter available for block {hash}"))
+}
+
 impl FilterReads {
     /// The recent-window copies for the given blocks, taken under the
     /// chain lock.
-    fn from_window(chain: &Chain, hashes: impl IntoIterator<Item = Hash>) -> FilterReads {
+    fn from_window(
+        chain: &Chain,
+        hashes: impl IntoIterator<Item = Hash>,
+        raw: bool,
+    ) -> FilterReads {
         let blocks = hashes
             .into_iter()
             .map(|hash| FilterRead {
@@ -1695,6 +1779,7 @@ impl FilterReads {
             .collect();
         FilterReads {
             db: chain.db.clone(),
+            raw,
             blocks,
         }
     }
@@ -1729,7 +1814,7 @@ impl FilterReads {
             node = chain.store.node(id).parent;
         }
         hashes.reverse();
-        Some(FilterReads::from_window(chain, hashes))
+        Some(FilterReads::from_window(chain, hashes, true))
     }
 
     /// The single block of a getcfilterv2 request: `None` when its data,
@@ -1740,40 +1825,35 @@ impl FilterReads {
         if !chain.index.node_status(&chain.store, node).have_data() {
             return None;
         }
-        Some(FilterReads::from_window(chain, [*hash]))
+        Some(FilterReads::from_window(chain, [*hash], false))
     }
 
     /// The filters with their header commitment inclusion proofs, reading
     /// what the window did not hold in one database view with no chain
-    /// lock held.  `None` when any filter is missing, as the chain
-    /// answers; missing commitments prove against no leaves, as the
-    /// chain's fallback does.
-    pub(crate) fn fetch(self) -> Option<Vec<MsgCFilterV2>> {
-        let FilterReads { db, mut blocks } = self;
+    /// lock held, block by block in order as dcrd's `db.View` does: the
+    /// first missing filter is [`FilterFetchError::NoFilter`], and the
+    /// first failed read or undecodable row is [`FilterFetchError::Db`].
+    /// Without a database, a filter the window did not hold is missing
+    /// and absent commitments prove against no leaves, as the chain's
+    /// own lookups answer.
+    pub(crate) fn fetch(self) -> Result<Vec<MsgCFilterV2>, FilterFetchError> {
+        let FilterReads {
+            db,
+            raw,
+            mut blocks,
+        } = self;
         if blocks
             .iter()
             .any(|read| read.filter.is_none() || read.leaves.is_none())
             && let Some(db) = &db
         {
-            let _ = db.view(|tx| {
-                for read in blocks.iter_mut() {
-                    if read.filter.is_none() {
-                        read.filter =
-                            dcroxide_blockchain::chaindb::db_fetch_gcs_filter(tx, &read.hash)
-                                .unwrap_or(None)
-                                .map(|filter| filter.bytes().to_vec());
-                    }
-                    if read.leaves.is_none() {
-                        read.leaves = Some(
-                            dcroxide_blockchain::chaindb::db_fetch_header_commitments(
-                                tx, &read.hash,
-                            )
-                            .unwrap_or_default(),
-                        );
-                    }
-                }
+            let mut read = Ok(());
+            db.view(|tx| {
+                read = blocks.iter_mut().try_for_each(|block| block.read(tx, raw));
                 Ok(())
-            });
+            })
+            .map_err(|err| FilterFetchError::Db(format!("{err}")))?;
+            read?;
         }
 
         // Prepare the response.
@@ -1781,9 +1861,9 @@ impl FilterReads {
         blocks
             .into_iter()
             .map(|read| {
-                let data = read.filter?;
+                let data = read.filter.ok_or_else(|| no_filter(&read.hash))?;
                 let leaves = read.leaves.unwrap_or_default();
-                Some(MsgCFilterV2 {
+                Ok(MsgCFilterV2 {
                     block_hash: read.hash,
                     data,
                     proof_index,
@@ -1915,7 +1995,7 @@ impl ServerPeerHandler {
                 self.addr_state.is_whitelisted,
                 self.ctx.disable_banning,
                 self.ctx.ban_duration_nanos,
-                self.env.now_nanos(),
+                crate::server::ban_clock_nanos(),
             )
         };
         for (level, line) in ban_peer_log_lines(
@@ -2103,6 +2183,16 @@ impl ServerPeerHandler {
                         // ever is.
                         outbound.try_queue(*msg);
                     }
+                } else {
+                    crate::logging::debug(
+                        "SRVR",
+                        &format!(
+                            "Local address {} is not routable and will not be \
+                             broadcast to outbound peer {}",
+                            lna.key(),
+                            self.remote_addr
+                        ),
+                    );
                 }
             }
 
@@ -2113,8 +2203,12 @@ impl ServerPeerHandler {
                 outbound.try_queue(Message::GetAddr);
             }
 
-            // Mark the address as a known good address.
-            let _ = mgr.good(&remote);
+            // Mark the address as a known good address.  An address the
+            // manager does not know, a --connect or --addpeer target say,
+            // fails, and dcrd logs that at error level.
+            if let Err(err) = mgr.good(&remote) {
+                crate::logging::error("SRVR", &format!("Marking address as good failed: {err}"));
+            }
         }
 
         // Consider the address the remote reported for this connection
@@ -2194,16 +2288,17 @@ impl ServerPeerHandler {
             Some(self.remote_addr.clone()),
             Some(Arc::clone(&self.addr_state.ban_score)),
         );
-        // dcrd `handleAddPeerMsg`: `srvrLog.Infof("New valid peer %s
-        // (%s)", sp, sp.UserAgent())`, immediately before signalling the
-        // sync manager.  The port had no peer-lifecycle logging at all, so
-        // a twenty-hour mainnet run produced zero lines about which peers
-        // it was talking to — when a sync stalled there was no way to tell
-        // from the log whether peers had been lost or were merely quiet,
-        // and I misdiagnosed exactly that.
+        // dcrd `AddPeer`: `srvrLog.Infof("New valid peer %s (%s)", sp,
+        // sp.UserAgent())`, immediately before signalling the sync manager,
+        // with the peer printed by `Peer.String` (the address and the
+        // direction).  Without peer-lifecycle lines a stalled sync gives no
+        // way to tell from the log whether peers were lost or merely quiet.
         crate::logging::info(
             "SRVR",
-            &format!("New valid peer {} ({user_agent})", self.remote_addr),
+            &format!(
+                "New valid peer {} ({user_agent})",
+                self.addr_state.peer_label
+            ),
         );
         let actions = {
             let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
@@ -2225,11 +2320,6 @@ impl ServerPeerHandler {
     /// the re-request and sync-peer handoff actions it decides (dcrd
     /// `DonePeer` signalling `OnPeerDisconnected`).
     pub fn on_disconnected(&mut self, _peer: &Mutex<Peer>) {
-        // dcrd `handleDonePeerMsg`: `srvrLog.Debugf("Removed peer %s",
-        // sp)` — debug, not info, so a churning network does not flood
-        // the log at the default level.
-        crate::logging::debug("SRVR", &format!("Removed peer {}", self.remote_addr));
-
         // Stop the serve worker before anything else: the caller joins
         // the peer's output loop right after this returns and the
         // worker holds one of that queue's senders.
@@ -2238,6 +2328,15 @@ impl ServerPeerHandler {
         let Some(id) = self.sync_peer_id.take() else {
             return;
         };
+
+        // dcrd `DonePeer`: `srvrLog.Debugf("Removed peer %s", sp)`, for a
+        // peer `AddPeer` accepted, printed by `Peer.String` -- debug, not
+        // info, so a churning network does not flood the log at the
+        // default level.
+        crate::logging::debug(
+            "SRVR",
+            &format!("Removed peer {}", self.addr_state.peer_label),
+        );
         let actions = {
             let mut manager = self.ctx.sync_manager.lock().expect("sync manager poisoned");
             manager.on_peer_disconnected(id)
@@ -2254,12 +2353,15 @@ impl ServerPeerHandler {
         // `DonePeer`).  The tag matches the one netsync tx intake records
         // (`peer_id as u64`); reaching here means the peer was registered,
         // which mirrors dcrd's `VersionKnown` gate on the same call.
-        let _num_evicted = self
+        let num_evicted = self
             .ctx
             .tx_pool
             .lock()
             .expect("tx pool mutex poisoned")
             .remove_orphans_by_tag(id as u64);
+        if let Some(line) = evicted_orphans_log_line(num_evicted, &self.addr_state.peer_label, id) {
+            crate::logging::debug("SRVR", &line);
+        }
     }
 
     /// Run netsync's transaction intake for this registered peer,
@@ -2993,8 +3095,10 @@ impl ServerPeerHandler {
             let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
             FilterReads::locate_block(&chain, &block_hash)
         };
+        // Any failure, a read error included, sends nothing, as dcrd's
+        // handler returns on every `FilterByBlockHash` error.
         let Some(filter) = located
-            .and_then(FilterReads::fetch)
+            .and_then(|located| located.fetch().ok())
             .and_then(|mut filters| filters.pop())
         else {
             return;
@@ -3016,7 +3120,8 @@ impl ServerPeerHandler {
             let chain = self.ctx.chain.lock().expect("chain mutex poisoned");
             FilterReads::locate_range(&chain, &start_hash, &end_hash)
         };
-        let Some(cfilters) = located.and_then(FilterReads::fetch) else {
+        // As dcrd's handler returns on every `LocateCFiltersV2` error.
+        let Some(cfilters) = located.and_then(|located| located.fetch().ok()) else {
             return;
         };
         // A reply the peer is waiting on; a full queue drops it and
@@ -3414,6 +3519,18 @@ fn ban_peer_log_lines(
             ),
         )],
     }
+}
+
+/// The line dcrd's `serverPeer.Run` logs at debug after evicting a
+/// departing peer's mempool orphans, or `None` when there were none to
+/// evict.  `label` is the peer as dcrd's `Peer.String` prints it.
+fn evicted_orphans_log_line(num_evicted: u64, label: &str, id: i32) -> Option<String> {
+    (num_evicted > 0).then(|| {
+        format!(
+            "Evicted {num_evicted} mempool {} from peer {label} (id {id})",
+            crate::server::pick_noun(num_evicted, "orphan", "orphans")
+        )
+    })
 }
 
 /// The reason dcrd's `addBanScore` hands `BanPeer` once the score
@@ -4564,6 +4681,11 @@ mod tests {
                 block_locator_hashes: vec![Hash([0x32; 32])],
                 hash_stop: Hash::ZERO,
             }));
+        // The manager records its once-per-peer initial state request as
+        // made, so a refused one goes back too.
+        let get_init_state = Message::GetInitState(dcroxide_wire::MsgGetInitState {
+            types: vec!["tspends".to_string()],
+        });
         let refused = peers.execute(vec![
             Action::QueueMessage {
                 peer: 7,
@@ -4577,8 +4699,24 @@ mod tests {
                 peer: 7,
                 message: get_headers.clone(),
             },
+            Action::QueueMessage {
+                peer: 7,
+                message: get_init_state.clone(),
+            },
+            Action::QueueMessage {
+                peer: 7,
+                message: Message::GetMiningState,
+            },
         ]);
-        assert_eq!(refused, vec![(7, get_data), (7, get_headers)]);
+        assert_eq!(
+            refused,
+            vec![
+                (7, get_data),
+                (7, get_headers),
+                (7, get_init_state),
+                (7, Message::GetMiningState)
+            ]
+        );
     }
 
     /// A mix message shaped like a small secrets reveal.
@@ -4813,14 +4951,14 @@ mod tests {
         assert_eq!(height_block, Some(want_height_block));
         assert_eq!(
             filter,
-            Some(vec![MsgCFilterV2 {
+            Ok(vec![MsgCFilterV2 {
                 block_hash: genesis,
                 data: want_filter.bytes().to_vec(),
                 proof_index: want_proof.proof_index,
                 proof_hashes: want_proof.proof_hashes,
             }])
         );
-        assert_eq!(range, Some(want_range.cfilters));
+        assert_eq!(range, Ok(want_range.cfilters));
     }
 
     /// The RPC block and filter fetches go through the same split, so
@@ -4873,6 +5011,148 @@ mod tests {
             .expect_err("no filter for an unknown block");
         assert!(miss.is_no_filter, "a missing filter is ErrNoFilter");
         assert_eq!(miss.message, want_miss.to_string());
+    }
+
+    /// Overwrite a block's row in a chain database bucket, as a disk
+    /// fault or an unclean shutdown might leave it.
+    fn set_chain_row(chain: &Mutex<Chain>, bucket: &[u8], hash: &Hash, row: &[u8]) {
+        chain
+            .lock()
+            .expect("chain mutex")
+            .db
+            .as_ref()
+            .expect("a database")
+            .update(|tx| {
+                let meta = tx.metadata();
+                meta.bucket(bucket).expect("bucket").put(&hash.0, row)
+            })
+            .expect("rewrite the row");
+    }
+
+    /// The single-block and range fetches, located under the chain lock.
+    fn fetch_genesis_filters(
+        chain: &Mutex<Chain>,
+        genesis: &Hash,
+    ) -> (
+        Result<Vec<MsgCFilterV2>, FilterFetchError>,
+        Result<Vec<MsgCFilterV2>, FilterFetchError>,
+    ) {
+        let (block, range) = {
+            let chain = chain.lock().expect("chain mutex");
+            (
+                FilterReads::locate_block(&chain, genesis).expect("genesis has data"),
+                FilterReads::locate_range(&chain, genesis, genesis).expect("a valid range"),
+            )
+        };
+        (block.fetch(), range.fetch())
+    }
+
+    /// A filter row that does not decode fails getcfilterv2, peer and
+    /// RPC alike, with the database error the chain's own lookup returns
+    /// (dcrd `dbFetchGCSFilter`), not as a missing filter, while a
+    /// getcfsv2 range serves the stored bytes undecoded, as dcrd's
+    /// `LocateCFiltersV2` does with `dbFetchRawGCSFilter`.  The serving
+    /// copy used to read the row as no filter, dropping the range reply
+    /// and answering the RPC with "Block not found".
+    #[test]
+    fn a_corrupt_filter_row_is_served_as_the_chain_answers() {
+        use dcroxide_rpc::server::RpcFiltererV2;
+
+        let (_dir, chain, genesis) = database_only_genesis_chain();
+        // An entry count whose varint needs eight more bytes.
+        set_chain_row(
+            &chain,
+            dcroxide_blockchain::chaindb::GCS_FILTER_BUCKET_NAME,
+            &genesis,
+            &[0xff],
+        );
+        let (want_block, want_range) = {
+            let chain = chain.lock().expect("chain mutex");
+            (
+                chain
+                    .filter_by_block_hash(&genesis)
+                    .expect_err("a corrupt filter row fails the chain lookup"),
+                chain
+                    .locate_cfilters_v2(&genesis, &genesis)
+                    .expect("the raw filter bytes are served"),
+            )
+        };
+        assert!(
+            want_block
+                .description
+                .starts_with(&format!("corrupt filter for {genesis}: ")),
+            "{want_block:?}"
+        );
+
+        let (block, range) = fetch_genesis_filters(&chain, &genesis);
+        assert_eq!(
+            block,
+            Err(FilterFetchError::Db(want_block.description.clone()))
+        );
+        let range = range.expect("the raw filter bytes are served");
+        assert_eq!(range, want_range.cfilters);
+        assert_eq!(range[0].data, vec![0xff]);
+
+        let failure = crate::rpcrun::NodeRpcFiltererV2::new(Arc::clone(&chain))
+            .filter_by_block_hash(&genesis)
+            .expect_err("a corrupt filter row fails the RPC");
+        assert!(!failure.is_no_filter, "an internal error, not ErrNoFilter");
+        assert_eq!(failure.message, want_block.to_string());
+    }
+
+    /// A header commitments row that does not decode fails every filter
+    /// path with the database error (dcrd `dbFetchHeaderCommitments`),
+    /// where the serving copy had proved the filter over no leaves.
+    #[test]
+    fn a_corrupt_commitments_row_fails_every_filter_path() {
+        use dcroxide_rpc::server::RpcFiltererV2;
+
+        let (_dir, chain, genesis) = database_only_genesis_chain();
+        // Five commitments promised, none present.
+        set_chain_row(
+            &chain,
+            dcroxide_blockchain::chaindb::HEADER_CMTS_BUCKET_NAME,
+            &genesis,
+            &[0x05],
+        );
+        let (want_block, want_range) = {
+            let chain = chain.lock().expect("chain mutex");
+            (
+                chain
+                    .filter_by_block_hash(&genesis)
+                    .expect_err("a corrupt commitments row fails the chain lookup"),
+                chain
+                    .locate_cfilters_v2(&genesis, &genesis)
+                    .expect_err("a corrupt commitments row fails the chain batch"),
+            )
+        };
+
+        let (block, range) = fetch_genesis_filters(&chain, &genesis);
+        assert_eq!(block, Err(FilterFetchError::Db(want_block.description)));
+        assert_eq!(range, Err(FilterFetchError::Db(want_range.description)));
+
+        let failure = crate::rpcrun::NodeRpcFiltererV2::new(Arc::clone(&chain))
+            .filter_by_block_hash(&genesis)
+            .expect_err("a corrupt commitments row fails the RPC");
+        assert!(!failure.is_no_filter, "an internal error, not ErrNoFilter");
+    }
+
+    /// A departing peer's orphan eviction logs dcrd's `serverPeer.Run`
+    /// line, with `pickNoun`'s singular or plural and the peer as
+    /// `Peer.String` prints it, and nothing when there was nothing to
+    /// evict; the port used to drop the count.
+    #[test]
+    fn orphan_eviction_logs_dcrds_line() {
+        let label = peer_label("10.0.0.1:9108", false);
+        assert_eq!(evicted_orphans_log_line(0, &label, 3), None);
+        assert_eq!(
+            evicted_orphans_log_line(1, &label, 3).as_deref(),
+            Some("Evicted 1 mempool orphan from peer 10.0.0.1:9108 (outbound) (id 3)")
+        );
+        assert_eq!(
+            evicted_orphans_log_line(2, &label, 3).as_deref(),
+            Some("Evicted 2 mempool orphans from peer 10.0.0.1:9108 (outbound) (id 3)")
+        );
     }
 
     /// A ban logs dcrd's `BanPeer` lines, and a rising ban score logs

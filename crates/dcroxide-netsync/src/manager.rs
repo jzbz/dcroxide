@@ -287,17 +287,8 @@ pub trait SyncChain {
 /// surface of dcrd's `*mempool.TxPool` config field).
 pub trait SyncTxPool {
     /// Validate and potentially accept the transaction along with any
-    /// orphans it redeems, returning the accepted transaction hashes
-    /// (dcrd `ProcessTransaction`; the error text only feeds logs and
-    /// the rejected filter decision).
-    fn process_transaction(
-        &mut self,
-        tx: &MsgTx,
-        allow_orphan: bool,
-        allow_high_fees: bool,
-        tag: u64,
-    ) -> Result<Vec<Hash>, String>;
-    /// The same, keeping each accepted transaction alongside its hash.
+    /// orphans it redeems, returning each accepted transaction alongside
+    /// its hash (dcrd `ProcessTransaction`).
     ///
     /// dcrd's announce path works from the `*dcrutil.Tx` values its
     /// process result carries, so a transaction that leaves the pool
@@ -394,6 +385,10 @@ pub struct Peer {
     /// `servesData`); set at creation from the services.
     serves_data: bool,
     request_initial_state_done: bool,
+    /// Whether the peer's outbound queue refused the initial state
+    /// request, which is then made again with the peer's next inventory
+    /// or headers message ([`SyncManager::on_request_not_sent`]).
+    request_initial_state_refused: bool,
     num_consecutive_orphan_headers: i64,
     announced_orphan_block: Option<Hash>,
     best_announced_block: Option<Hash>,
@@ -423,6 +418,7 @@ impl Peer {
             last_block,
             serves_data,
             request_initial_state_done: false,
+            request_initial_state_refused: false,
             num_consecutive_orphan_headers: 0,
             announced_orphan_block: None,
             best_announced_block: None,
@@ -580,6 +576,13 @@ impl Peer {
         }
         Some(Message::GetInitState(MsgGetInitState { types }))
     }
+}
+
+/// Whether the peer is a sync peer candidate: it must serve data and its
+/// latest known block height must be at least as high as the best known
+/// header height (dcrd `isSyncPeerCandidate`).
+fn is_sync_peer_candidate(peer: &Peer, best_height: i64) -> bool {
+    peer.serves_data && peer.last_block >= best_height
 }
 
 /// The configuration options for the sync manager (dcrd `Config`;
@@ -924,11 +927,8 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                 num_outbound += 1;
             }
 
-            // Skip peers that are not sync candidates: the peer must
-            // serve data and its latest known block height must be at
-            // least as high as the best known header height (dcrd
-            // `isSyncPeerCandidate`).
-            if !(peer.serves_data && peer.last_block >= best_header_height) {
+            // Skip peers that are not sync candidates.
+            if !is_sync_peer_candidate(peer, best_header_height) {
                 continue;
             }
 
@@ -1799,6 +1799,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         if self.shutdown {
             return actions;
         }
+        self.retry_refused_initial_state(peer_id, &mut actions);
 
         // Nothing to do for an empty headers message as it means the
         // sending peer does not have any additional headers for the
@@ -2199,12 +2200,13 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// dcrd has no counterpart: its `QueueMessage` cannot refuse, so a
     /// recorded request is always sent, and a peer that never answers
     /// is disconnected by its stall handler, whereupon
-    /// `OnPeerDisconnected` re-requests the data from another announcer.
-    /// A request the port's queue refused (PARITY *Per-peer outbound
-    /// queue*) is never written, so it arms no stall deadline; left
-    /// alone it would stay attributed to the peer until the peer left,
-    /// and every other announcement of the same item would be skipped
-    /// because a request is already pending.
+    /// `OnPeerDisconnected` re-requests the data from another announcer
+    /// and, for the sync peer, starts the chain sync with the next
+    /// candidate.  A request the port's queue refused (PARITY *Per-peer
+    /// outbound queue*) is never written, so it arms no stall deadline;
+    /// left alone it would stay attributed to the peer until the peer
+    /// left, and every other announcement of the same item would be
+    /// skipped because a request is already pending.
     ///
     /// The refused inventory is therefore swept the way
     /// [`Self::on_peer_disconnected`] sweeps a departing peer's
@@ -2214,8 +2216,15 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
     /// of needed blocks so the block is requested again.  Peers in
     /// `exclude` are never chosen; the daemon passes every peer that
     /// refused during the same dispatch, which bounds the retries.  A
-    /// refused getheaders clears the peer's duplicate-request filter, so
-    /// the identical request is not suppressed the next time it is made.
+    /// sync peer that gave back a block request, re-requested elsewhere
+    /// or forgotten, and has no blocks left in flight hands the chain
+    /// sync to the best candidate that has not refused, as
+    /// `startChainSync` would pick with the refusing peers gone, without
+    /// disconnecting it.
+    /// A refused getheaders clears the peer's duplicate-request filter,
+    /// so the identical request is not suppressed the next time it is
+    /// made, and a refused initial state request is made again with the
+    /// peer's next inventory or headers message.
     pub fn on_request_not_sent(
         &mut self,
         peer_id: i32,
@@ -2236,10 +2245,47 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                 }
                 return actions;
             }
+            // The flag that makes the request once per peer was set when
+            // it was queued, but the request was never sent.
+            Message::GetInitState(_) | Message::GetMiningState => {
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.request_initial_state_done = false;
+                    peer.request_initial_state_refused = true;
+                }
+                return actions;
+            }
             _ => return actions,
         };
 
+        // The first other peer known to hold each item, in ascending id
+        // order as the disconnect sweep walks them.  Probing every peer's
+        // known inventory for every item costs items x peers lookups
+        // under the manager lock, and a transaction getdata carries up to
+        // 50,000 items nobody else may hold.  Past the size of one known
+        // inventory cache, walking each candidate's cache once is cheaper
+        // and finds the same first holders; the chosen holder is still
+        // probed, which marks the item recently used there as the probe
+        // does, and should the entry have expired in between the item
+        // falls back to the probe.
+        let walked: Option<HashMap<InvVect, i32>> = (inv_list.len() > MAX_KNOWN_INVENTORY as usize)
+            .then(|| {
+                let refused: std::collections::HashSet<&InvVect> = inv_list.iter().collect();
+                let mut first_holders = HashMap::new();
+                for (id, pp) in &self.peers {
+                    if *id == peer_id || exclude.contains(id) {
+                        continue;
+                    }
+                    for inv in pp.known_inventory.items() {
+                        if refused.contains(&inv) {
+                            first_holders.entry(inv).or_insert(*id);
+                        }
+                    }
+                }
+                first_holders
+            });
+
         let mut request_queues: BTreeMap<i32, Vec<InvVect>> = BTreeMap::new();
+        let mut gave_back_block = false;
         let mut forgot_block = false;
         for inv in inv_list {
             let requested = match inv.inv_type {
@@ -2254,13 +2300,24 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
             if requested.get(&inv.hash) != Some(&peer_id) {
                 continue;
             }
+            gave_back_block |= inv.inv_type == InvType::BLOCK;
 
-            // The first other peer known to hold the data, in ascending
-            // id order as the disconnect sweep walks them.
-            let holder = self.peers.iter_mut().find_map(|(id, pp)| {
-                (*id != peer_id && !exclude.contains(id) && pp.is_known_inventory(inv))
-                    .then_some(*id)
-            });
+            let holder = match walked.as_ref().map(|first| first.get(inv).copied()) {
+                // No candidate's cache holds it.
+                Some(None) => None,
+                Some(Some(id))
+                    if self
+                        .peers
+                        .get_mut(&id)
+                        .is_some_and(|pp| pp.is_known_inventory(inv)) =>
+                {
+                    Some(id)
+                }
+                _ => self.peers.iter_mut().find_map(|(id, pp)| {
+                    (*id != peer_id && !exclude.contains(id) && pp.is_known_inventory(inv))
+                        .then_some(*id)
+                }),
+            };
             match holder {
                 Some(id) => {
                     requested.insert(inv.hash, id);
@@ -2290,7 +2347,69 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
                 });
             }
         }
+
+        // A sync peer with no blocks left in flight has stalled the
+        // chain sync: until the chain is current, blocks are fetched from
+        // the sync peer alone, and only a block it delivers asks for
+        // more, so a block re-requested from another holder does not
+        // either.  dcrd's stall handler disconnects a sync peer that
+        // never delivers, and `OnPeerDisconnected` then runs
+        // `startChainSync` whether its blocks were re-requested or
+        // forgotten, which picks the next candidate and fetches from it.
+        // The refusing peer stays connected here, so the chain sync moves
+        // to the best candidate among the peers that have not refused;
+        // with none, the sync peer is kept and the next fetch asks it
+        // again.
+        if gave_back_block
+            && self.headers_synced
+            && self.sync_peer == Some(peer_id)
+            && !self.requested_blocks.values().any(|&from| from == peer_id)
+            && let Some(next) = self.next_sync_candidate(peer_id, exclude)
+        {
+            self.sync_peer = Some(next);
+            self.fetch_next_blocks(next, &mut actions);
+        }
         actions
+    }
+
+    /// The sync peer candidate with the highest known block height other
+    /// than the given peer and the excluded ones, chosen as dcrd's
+    /// `updateSyncPeerState` chooses among the peers that remain.
+    fn next_sync_candidate(&mut self, peer_id: i32, exclude: &BTreeSet<i32>) -> Option<i32> {
+        let (_, best_header_height) = self.cfg.chain.best_header();
+        let mut best_peer: Option<(i32, i64)> = None;
+        for (id, peer) in &self.peers {
+            if *id == peer_id
+                || exclude.contains(id)
+                || !is_sync_peer_candidate(peer, best_header_height)
+            {
+                continue;
+            }
+            // The best sync candidate is the most updated peer.
+            match best_peer {
+                Some((_, best_last)) if best_last >= peer.last_block => {}
+                _ => best_peer = Some((*id, peer.last_block)),
+            }
+        }
+        best_peer.map(|(id, _)| id)
+    }
+
+    /// Make again an initial state request the peer's outbound queue
+    /// refused ([`Self::on_request_not_sent`]).  dcrd's `QueueMessage`
+    /// cannot refuse, so its once-per-peer request is always sent; the
+    /// port sends it once the peer is heard from again, when its queue
+    /// has had the chance to drain.
+    fn retry_refused_initial_state(&mut self, peer_id: i32, actions: &mut Vec<Action>) {
+        let include_mining_state = !self.cfg.no_mining_state_sync;
+        if let Some(peer) = self.peers.get_mut(&peer_id)
+            && std::mem::take(&mut peer.request_initial_state_refused)
+            && let Some(msg) = peer.maybe_request_initial_state(include_mining_state)
+        {
+            actions.push(Action::QueueMessage {
+                peer: peer_id,
+                message: msg,
+            });
+        }
     }
 
     /// Whether the transaction needs to be downloaded (dcrd `needTx`).
@@ -2343,6 +2462,7 @@ impl<C: SyncChain, T: SyncTxPool, M: SyncMixPool> SyncManager<C, T, M> {
         if self.shutdown {
             return actions;
         }
+        self.retry_refused_initial_state(peer_id, &mut actions);
 
         let is_current = self.is_current();
 

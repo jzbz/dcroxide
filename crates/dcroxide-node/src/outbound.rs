@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use dcroxide_addrmgr::{AddrManager, NetAddress, new_net_address_from_ip_port};
+use dcroxide_addrmgr::{AddrManager, GoTime, NetAddress, new_net_address_from_ip_port};
 use dcroxide_connmgr::manager::{
     ClosePlan, ConnManager, DisconnectAction, MAX_FAILED_ATTEMPTS, NO_SUITABLE_ADDR_MSG,
     PICK_OUTBOUND_RETRIES,
@@ -42,6 +42,7 @@ use dcroxide_connmgr::{AutoBegin, AutoPermits, ConnectionType, SystemCsprng};
 
 use crate::dispatch::ServerContext;
 use crate::runtime::{ConnectedPeers, PeerTemplate, serve_outbound_peer};
+use crate::socks::CONNECT_TIMED_OUT;
 
 /// The shared connection manager decision core (dcrd's `ConnManager`
 /// reached from the server, the listener runtime, and this driver).
@@ -49,15 +50,18 @@ pub type SharedConnManager = Arc<Mutex<ConnManager>>;
 
 /// The address source the automatic dialer draws from: dcrd
 /// `Config.GetNewAddress`, returning the candidate and its last
-/// attempt time in unix nanoseconds, 0 when it was never attempted
+/// attempt time, the zero [`GoTime`] when it was never attempted
 /// (dcrd's `lastTry time.Time`, which
-/// [`ConnManager::pick_outbound_addr`] compares against its ten-minute
-/// recent-attempt window in nanoseconds).
-pub type AddressSource = Box<dyn FnMut() -> Result<(NetAddress, i64), String> + Send>;
+/// [`ConnManager::claim_outbound_candidate`] tests against its
+/// ten-minute recent-attempt window, on the monotonic clock for an
+/// attempt made in this process).
+pub type AddressSource = Box<dyn FnMut() -> Result<(NetAddress, GoTime), String> + Send>;
 
 /// A dialed connection handle: the established connection for the serve
 /// thread, and a teardown clone so `Disconnect`/`Remove` can end it
-/// (dcrd closing the `net.Conn`).
+/// (dcrd closing the `net.Conn`).  The dial outcome moves it to the
+/// event thread, which hands `stream` to the serve thread and keeps
+/// `shutdown` in [`LoopState::sockets`].
 ///
 /// Both halves are `Teardown`s sharing one flag, so ending the
 /// connection from the driver raises the same flag the serve thread's
@@ -66,7 +70,7 @@ pub type AddressSource = Box<dyn FnMut() -> Result<(NetAddress, i64), String> + 
 /// module's transport documentation says cannot be relied on to abort
 /// an in-flight `recv` under Winsock.
 struct DialedConn {
-    stream: Arc<Mutex<Option<crate::transport::Teardown>>>,
+    stream: crate::transport::Teardown,
     shutdown: crate::transport::Teardown,
 }
 
@@ -141,16 +145,28 @@ enum DialKind {
     },
 }
 
+impl DialKind {
+    /// The connection type the dial registers (dcrd's `connType`
+    /// argument to `dial`).
+    fn conn_type(&self) -> ConnectionType {
+        match self {
+            DialKind::Auto { .. } => ConnectionType::Outbound,
+            DialKind::Manual { .. } | DialKind::Persistent { .. } => ConnectionType::Manual,
+        }
+    }
+}
+
 /// A command the driver's event loop processes.
 enum Command {
     /// A served outbound peer's connection ended.
     PeerDone(u64),
-    /// A persistent entry's backoff timer fired (a [`Wake::Retry`]
-    /// coming due).
+    /// A persistent entry's backoff elapsed (a [`Wake::Retry`] coming
+    /// due, its only source).
     RetryFire(u64),
-    /// The failed-attempt pause (or an external nudge) elapsed;
-    /// resume filling the outbound target (a [`Wake::NewConn`] coming
-    /// due).
+    /// The failed-attempt pause or the permit poll elapsed; resume
+    /// filling the outbound target (a [`Wake::NewConn`] coming due, the
+    /// only source: nothing sends it on the channel, so it always
+    /// clears the `pause_armed` its wake set).
     NewConnFire,
     /// A release handed the parked fill the total-connections permit
     /// it was waiting on (dcrd's blocked `Acquire` returning); resume
@@ -162,7 +178,7 @@ enum Command {
     /// gated and dialed here; the reply carries the connection
     /// manager's raw error description.
     RpcConnect {
-        resolved: Result<NetAddress, String>,
+        resolved: Result<ConnectTarget, String>,
         permanent: bool,
         reply: mpsc::Sender<Result<(), String>>,
     },
@@ -213,7 +229,7 @@ impl OutboundControl {
         let (reply, result) = mpsc::channel();
         self.commands
             .send(Command::RpcConnect {
-                resolved: addr_string_to_net_address(addr, &self.dialer),
+                resolved: addr_string_to_connect_target(addr, &self.dialer),
                 permanent,
                 reply,
             })
@@ -340,40 +356,71 @@ pub fn start_outbound(cfg: OutboundConfig, channel: OutboundChannel) -> Outbound
 /// (`rpcrun.rs`).  The system resolver ignores it.
 const TARGET_LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Resolve an address string to the connection manager's address form
-/// (dcrd `addrStringToNetAddr`, and then `stdlibNetAddrToAddrMgrNetAddr`,
-/// which `Connect` and `AddPersistent` run over its result), in dcrd's
-/// order.  The host and port split with Go's `net.SplitHostPort`
-/// semantics.  A Tor v3 host stays unresolved (dcrd's `simpleAddr`) and
-/// takes the onion route when it is dialed.  Any other host, IP
-/// literals included, resolves through `dialer`'s `dcrdLookup` routing
-/// and the first answer is used: through Tor when `--proxy` is set
-/// without `--noonion`, a `.onion` name through the onion route, and
-/// otherwise through the system resolver, which answers a literal
-/// itself.  The port number parses last, so a bad host surfaces its
-/// lookup error before a bad port, as in dcrd.
-pub fn addr_string_to_net_address(
-    addr: &str,
-    dialer: &crate::socks::NodeDialer,
-) -> Result<NetAddress, String> {
-    let (host, port) = crate::gostd::split_host_port(addr)?;
+/// A connect target as dcrd's `addrStringToNetAddr` returns it, before
+/// the connection manager converts it to its address form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectTarget {
+    /// A resolved host (dcrd's `*net.TCPAddr`), whose conversion cannot
+    /// fail.
+    Resolved(SocketAddr),
+    /// A Tor v3 host kept unresolved (dcrd's `simpleAddr` over the raw
+    /// `host:port` string).  Its port is checked only when the target is
+    /// converted, which dcrd's `AddPersistent` does after its capacity
+    /// gate.
+    Unresolved(String),
+}
 
-    // Determine the network that the address belongs to and return
-    // early if a DNS lookup should not be performed for the address.
-    let (addr_type, addr_bytes) = dcroxide_addrmgr::encode_host(&host);
-    if addr_type == dcroxide_addrmgr::NetAddressType::TorV3 {
-        // `stdlibNetAddrToAddrMgrNetAddr`'s string path over the
-        // unresolved address.
-        let port = go_parse_uint16(&port)
-            .map_err(|_| format!("invalid port for address {}", crate::gostd::go_quote(addr)))?;
-        return dcroxide_addrmgr::new_net_address_from_params(
+impl ConnectTarget {
+    /// dcrd `stdlibNetAddrToAddrMgrNetAddr`
+    /// (`internal/connmgr/connmanager.go:650-681`), which `Connect` runs
+    /// first and `AddPersistent` runs after its capacity gate, with its
+    /// error texts.
+    pub fn into_net_address(self) -> Result<NetAddress, String> {
+        let addr = match self {
+            ConnectTarget::Resolved(socket) => return Ok(socket_addr_to_net_address(&socket)),
+            ConnectTarget::Unresolved(addr) => addr,
+        };
+        let quoted = crate::gostd::go_quote(&addr);
+        let (host, port) = crate::gostd::split_host_port(&addr)
+            .map_err(|_| format!("unable to split address {quoted}"))?;
+        let port =
+            go_parse_uint16(&port).map_err(|_| format!("invalid port for address {quoted}"))?;
+        let (addr_type, addr_bytes) = dcroxide_addrmgr::encode_host(&host);
+        if addr_type == dcroxide_addrmgr::NetAddressType::Unknown {
+            return Err(format!("unable to determine address type for {quoted}"));
+        }
+        dcroxide_addrmgr::new_net_address_from_params(
             addr_type,
             &addr_bytes,
             port,
             now_unix().saturating_mul(1_000_000_000),
             dcroxide_wire::ServiceFlag(0),
         )
-        .map_err(|e| e.description);
+        .map_err(|e| e.description)
+    }
+}
+
+/// Resolve an address string to a connect target (dcrd
+/// `addrStringToNetAddr`).  The host and port split with Go's
+/// `net.SplitHostPort` semantics.  A Tor v3 host stays unresolved and
+/// unconverted, its port unparsed, and takes the onion route when it is
+/// dialed.  Any other host, IP literals included, resolves through
+/// `dialer`'s `dcrdLookup` routing and the first answer is used: through
+/// Tor when `--proxy` is set without `--noonion`, a `.onion` name through
+/// the onion route, and otherwise through the system resolver, which
+/// answers a literal itself.  The port number parses last, so a bad host
+/// surfaces its lookup error before a bad port, as in dcrd.
+pub fn addr_string_to_connect_target(
+    addr: &str,
+    dialer: &crate::socks::NodeDialer,
+) -> Result<ConnectTarget, String> {
+    let (host, port) = crate::gostd::split_host_port(addr)?;
+
+    // Determine the network that the address belongs to and return
+    // early if a DNS lookup should not be performed for the address.
+    let (addr_type, _) = dcroxide_addrmgr::encode_host(&host);
+    if addr_type == dcroxide_addrmgr::NetAddressType::TorV3 {
+        return Ok(ConnectTarget::Unresolved(addr.to_string()));
     }
 
     // The lookup runs over Tor when the configuration says so (dcrd:
@@ -384,13 +431,45 @@ pub fn addr_string_to_net_address(
         return Err(format!("no addresses found for {host}"));
     };
     let port = go_parse_uint16(&port)?;
-    Ok(socket_addr_to_net_address(&SocketAddr::new(*ip, port)))
+    Ok(ConnectTarget::Resolved(SocketAddr::new(*ip, port)))
+}
+
+/// Resolve an address string to the connection manager's address form
+/// (dcrd `addrStringToNetAddr`, and then `stdlibNetAddrToAddrMgrNetAddr`,
+/// which `Connect` and `AddPersistent` run over its result), in dcrd's
+/// order; see [`addr_string_to_connect_target`].
+pub fn addr_string_to_net_address(
+    addr: &str,
+    dialer: &crate::socks::NodeDialer,
+) -> Result<NetAddress, String> {
+    addr_string_to_connect_target(addr, dialer)?.into_net_address()
+}
+
+/// dcrd `AddPersistent` over a connect target: the capacity gate, then
+/// the conversion (a Tor v3 target's port check included), then the
+/// duplicate and per-host gates and the registration.  A full persistent
+/// table therefore beats a malformed target, exactly as upstream.  The
+/// caller starts the runner for the returned entry.
+pub fn add_persistent_target(
+    manager: &mut ConnManager,
+    target: ConnectTarget,
+) -> Result<(u64, NetAddress), String> {
+    manager
+        .persistent_capacity_check()
+        .map_err(|e| e.description)?;
+    let addr = target.into_net_address()?;
+    let id = manager.add_persistent(&addr).map_err(|e| e.description)?;
+    Ok((id, addr))
 }
 
 /// Go's `strconv.ParseUint(s, 10, 16)`, with its `NumError` texts: the
 /// digits accumulate left to right, so an overflow is reported before a
-/// later non-digit, as in Go.
-fn go_parse_uint16(s: &str) -> Result<u16, String> {
+/// later non-digit, as in Go.  Decimal digits only: no sign (Rust's
+/// `str::parse::<u16>` accepts a leading `+`), no base prefix, no
+/// underscores (`gostd::go_parse_uint` is Go's base-0 form).  The node
+/// crate's one port parser; every `ParseUint(port, 10, 16)` dcrd's
+/// server runs goes through it.
+pub(crate) fn go_parse_uint16(s: &str) -> Result<u16, String> {
     let error = |reason: &str| {
         format!(
             "strconv.ParseUint: parsing {}: {reason}",
@@ -436,15 +515,6 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// The current unix time in nanoseconds (the recent-attempt and
-/// backoff clock).
-fn now_nanos() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
-}
-
 /// A wake the event loop owes itself once its deadline passes (dcrd
 /// arms a `time.Timer`, or sleeps in line, for the same schedule).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -486,15 +556,20 @@ struct LoopState {
     /// pause, or the poll while every outbound permit is held), so
     /// timers are not stacked.
     pause_armed: bool,
+    /// Whether the current failed-attempt pause has logged dcrd's
+    /// `Max failed connection attempts reached` line.  Kept apart from
+    /// `pause_armed`, which the permit poll also sets, so the line
+    /// prints as the pause begins whichever wake is armed.
+    pause_logged: bool,
     /// The pause elapsed: the next fill iteration attempts once even
     /// though the failure count is at the threshold (dcrd's loop
     /// sleeps and then falls through to one more attempt).
     resume_after_pause: bool,
     /// The persistent runner states by entry ID.
     persistent: HashMap<u64, PersistState>,
-    /// The sockets of established managed connections, for the
-    /// force-close paths of `Disconnect`/`Remove`.
-    sockets: HashMap<u64, DialedConn>,
+    /// The teardown handles of established managed connections, for
+    /// the force-close paths of `Disconnect`/`Remove`.
+    sockets: HashMap<u64, crate::transport::Teardown>,
     /// The armed wakes and when each comes due, in arming order.
     timers: Vec<(Instant, Wake)>,
 }
@@ -507,6 +582,13 @@ struct LoopState {
 /// through the ordinary outcome path, releasing its reservations; see
 /// [`crate::runtime::spawn_conn_thread`].
 fn spawn_dial(state: &LoopState, id: u64, addr: NetAddress, kind: DialKind) {
+    crate::logging::debug(
+        "CMGR",
+        &format!(
+            "Attempting to connect to {addr} (id: {id}, type: {})",
+            kind.conn_type()
+        ),
+    );
     let serve = Arc::clone(&state.serve);
     let commands = state.commands.clone();
     let (handoff, pending) = mpsc::sync_channel::<DialKind>(1);
@@ -553,17 +635,8 @@ fn dial(
     let shutdown = stream
         .try_clone()
         .map_err(|e| format!("dial clone failed: {e}"))?;
-    Ok(DialedConn {
-        stream: Arc::new(Mutex::new(Some(stream))),
-        shutdown,
-    })
+    Ok(DialedConn { stream, shutdown })
 }
-
-/// std's text for a TCP connect that ran out its timeout
-/// (`TcpStream::connect_timeout`'s `TimedOut`), which is what the dialer
-/// reports for a direct dial or a connect to the SOCKS proxy that the
-/// dial timeout cut short.
-const CONNECT_TIMED_OUT: &str = "connection timed out";
 
 /// The outcome text of a failed dial.  dcrd dials under
 /// `context.WithTimeout(ctx, DialTimeout)`
@@ -609,6 +682,7 @@ fn run_event_loop(
         get_new_address: cfg.get_new_address,
         failed_attempts: 0,
         pause_armed: false,
+        pause_logged: false,
         resume_after_pause: false,
         persistent: HashMap::new(),
         sockets: HashMap::new(),
@@ -685,6 +759,9 @@ fn run_event_loop(
                     .lock()
                     .expect("connmgr mutex poisoned")
                     .conn_closed(id);
+                if let Some(record) = &record {
+                    log_disconnected(record);
+                }
                 if let Some(record) = record
                     && record.close_plan.signal_persistent.is_some()
                 {
@@ -694,11 +771,7 @@ fn run_event_loop(
                 }
             }
             Command::RetryFire(id) => dial_persistent(&mut state, id),
-            Command::NewConnFire => {
-                state.pause_armed = false;
-                state.resume_after_pause = true;
-                fill_outbound(&mut state);
-            }
+            Command::NewConnFire => fill_wake_fired(&mut state),
             Command::PermitGranted => fill_outbound(&mut state),
             Command::DialDone(id, kind, outcome) => {
                 handle_dial_done(&mut state, id, kind, outcome);
@@ -764,24 +837,21 @@ fn take_due_wake(state: &mut LoopState) -> Option<Wake> {
 /// surfacing the connection manager's raw gate errors.
 fn rpc_connect(
     state: &mut LoopState,
-    resolved: Result<NetAddress, String>,
+    resolved: Result<ConnectTarget, String>,
     permanent: bool,
     reply: mpsc::Sender<Result<(), String>>,
 ) -> Option<Result<(), String>> {
-    let addr = match resolved {
-        Ok(addr) => addr,
+    let target = match resolved {
+        Ok(target) => target,
         Err(e) => return Some(Err(e)),
     };
     if permanent {
-        let added = {
-            let mut manager = state.manager.lock().expect("connmgr mutex poisoned");
-            manager
-                .persistent_capacity_check()
-                .and_then(|()| manager.add_persistent(&addr))
-                .map_err(|e| e.description)
-        };
-        let id = match added {
-            Ok(id) => id,
+        let added = add_persistent_target(
+            &mut state.manager.lock().expect("connmgr mutex poisoned"),
+            target,
+        );
+        let (id, addr) = match added {
+            Ok(entry) => entry,
             Err(e) => return Some(Err(e)),
         };
         state.persistent.insert(
@@ -796,8 +866,13 @@ fn rpc_connect(
         return Some(Ok(()));
     }
 
-    // dcrd `Connect`: host permit, total permit, group registration,
-    // then the dial; the reply resolves with the dial outcome.
+    // dcrd `Connect`: the conversion, host permit, total permit, group
+    // registration, then the dial; the reply resolves with the dial
+    // outcome.
+    let addr = match target.into_net_address() {
+        Ok(addr) => addr,
+        Err(e) => return Some(Err(e)),
+    };
     let gated = {
         let mut manager = state.manager.lock().expect("connmgr mutex poisoned");
         match manager.connect_begin(&addr) {
@@ -839,13 +914,15 @@ fn apply_remove(state: &mut LoopState, id: u64) {
         DisconnectAction::CloseRemoved(record)
         | DisconnectAction::CancelPersistentAndClose(record) => {
             if let Some(socket) = state.sockets.remove(&id) {
-                socket.close();
+                socket.disconnect();
             }
             state
                 .manager
                 .lock()
                 .expect("connmgr mutex poisoned")
                 .run_close_plan(&record);
+            // dcrd's close callback logs once the plan has run.
+            log_disconnected(&record);
             state.persistent.remove(&id);
             // The serve thread ends on the closed socket and reports
             // PeerDone, whose conn_closed finds nothing — the plan
@@ -951,6 +1028,16 @@ fn handle_persistent_drop(state: &mut LoopState, id: u64) {
         }
     };
     if should_backoff {
+        // dcrd prints the wait truncated to microseconds.
+        crate::logging::debug(
+            "CMGR",
+            &format!(
+                "Retrying connection to {} in {} (retries {})",
+                entry.addr,
+                crate::gostd::go_duration_string(delay.saturating_sub(delay.wrapping_rem(1_000))),
+                entry.retry_count
+            ),
+        );
         arm_wake(state, delay, Wake::Retry(id));
     } else {
         dial_persistent(state, id);
@@ -986,6 +1073,13 @@ fn fill_outbound(state: &mut LoopState) {
             // continuing).
             if !granted && state.failed_attempts >= MAX_FAILED_ATTEMPTS && !state.resume_after_pause
             {
+                // Once per pause, as dcrd's handler logs before each
+                // sleep, and at once: the permit poll may already have
+                // armed the wake the pause shares.
+                if !state.pause_logged {
+                    state.pause_logged = true;
+                    log_pause(manager.retry_duration_nanos());
+                }
                 drop(manager);
                 arm_fill_wake(state);
                 return;
@@ -1017,6 +1111,12 @@ fn fill_outbound(state: &mut LoopState) {
         // the dial registration that follow take it again, and unwind
         // their own failures in the core.
         let pick = pick_outbound_addr(state);
+        if let Err(e) = &pick {
+            crate::logging::debug(
+                "CMGR",
+                &format!("Failed to get address for outbound connection: {e}"),
+            );
+        }
         let begun = state
             .manager
             .lock()
@@ -1024,12 +1124,6 @@ fn fill_outbound(state: &mut LoopState) {
             .auto_outbound_reserve(pick);
 
         match begun {
-            // Not an outcome of the reservation phase; handled as the
-            // permit poll would be.
-            AutoBegin::PermitsExhausted => {
-                arm_fill_wake(state);
-                return;
-            }
             AutoBegin::Failed => {
                 state.failed_attempts = state.failed_attempts.saturating_add(1);
             }
@@ -1071,17 +1165,49 @@ fn pick_outbound_addr(state: &mut LoopState) -> Result<NetAddress, String> {
         .as_mut()
         .ok_or_else(|| NO_SUITABLE_ADDR_MSG.to_string())?;
     for tries in 0..PICK_OUTBOUND_RETRIES {
-        let (addr, last_try_nanos) = source()?;
+        let (addr, last_try) = source()?;
         let claimed = state
             .manager
             .lock()
             .expect("connmgr mutex poisoned")
-            .claim_outbound_candidate(tries, &addr, last_try_nanos, now_nanos());
+            .claim_outbound_candidate(tries, &addr, last_try, GoTime::now());
         if claimed {
             return Ok(addr);
         }
     }
     Err(NO_SUITABLE_ADDR_MSG.to_string())
+}
+
+/// dcrd `targetOutboundHandler`'s line as it begins a failed-attempt
+/// pause (`internal/connmgr/connmanager.go:2141-2143`).
+fn log_pause(retry_nanos: i64) {
+    let line = format!(
+        "Max failed connection attempts reached [{MAX_FAILED_ATTEMPTS}] -- \
+         pausing connections for {}",
+        crate::gostd::go_duration_string(retry_nanos)
+    );
+    #[cfg(test)]
+    PAUSE_LINES.with(|lines| lines.borrow_mut().push(line.clone()));
+    crate::logging::debug("CMGR", &line);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The [`log_pause`] lines this thread printed, which the tests
+    /// count: the log writes straight to stdout.
+    static PAUSE_LINES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The fill's wake came due (dcrd's handler returning from its
+/// failed-attempt sleep, or the permit poll): the fill attempts once
+/// more whatever the failure count, and a pause after that is a new one
+/// with its own line.
+fn fill_wake_fired(state: &mut LoopState) {
+    state.pause_armed = false;
+    state.pause_logged = false;
+    state.resume_after_pause = true;
+    fill_outbound(state);
 }
 
 /// Arm a single wake timer for the fill loop (the failed-attempt
@@ -1144,7 +1270,23 @@ fn handle_dial_done(
     match outcome {
         Err(e) => {
             let mut manager = state.manager.lock().expect("connmgr mutex poisoned");
-            manager.dial_failed(id);
+            let pending = manager.dial_failed(id);
+            // dcrd's dial logs the failure with two errors reworded: its
+            // deadline, and a cancel (a `Remove` while it dialed, which
+            // here only shows once the dial returns).
+            let reason = if !pending {
+                "attempt manually canceled".to_string()
+            } else if e == dcroxide_rpc::server::CONNECT_DEADLINE_EXCEEDED {
+                format!(
+                    "no response for {}",
+                    crate::gostd::go_duration_string(
+                        i64::try_from(state.serve.dial_timeout.as_nanos()).unwrap_or(i64::MAX)
+                    )
+                )
+            } else {
+                e.clone()
+            };
+            let failed = format!("Failed to connect to {addr}: {reason}");
             // Run the reservations' unwind (dcrd's deferred onClose on
             // the failure path).
             let record = dcroxide_connmgr::manager::ConnRecord {
@@ -1155,6 +1297,7 @@ fn handle_dial_done(
             };
             manager.run_close_plan(&record);
             drop(manager);
+            crate::logging::debug("CMGR", &failed);
             if let Some(reply) = reply {
                 let _ = reply.send(Err(e));
             }
@@ -1177,6 +1320,10 @@ fn handle_dial_done(
                 // before setting skipOnClose, so the deferred onClose
                 // releases everything the dial had reserved.
                 conn.close();
+                crate::logging::debug(
+                    "CMGR",
+                    &format!("Ignoring canceled connection {addr} (id: {id}, type: {conn_type})"),
+                );
                 {
                     let mut manager = state.manager.lock().expect("connmgr mutex poisoned");
                     let record = dcroxide_connmgr::manager::ConnRecord {
@@ -1200,69 +1347,56 @@ fn handle_dial_done(
                 }
                 return;
             };
+            crate::logging::debug(
+                "CMGR",
+                &format!("Connected to {addr} (id: {id}, type: {conn_type})"),
+            );
             if is_auto {
+                // The count starts over, so the next pause is a new
+                // one and logs its line.
                 state.failed_attempts = 0;
+                state.pause_logged = false;
             }
             if let Some(reply) = reply {
                 let _ = reply.send(Ok(()));
             }
-            let stream = conn.stream.lock().expect("dial stream poisoned").take();
-            match stream {
-                Some(stream) => {
-                    state.sockets.insert(id, conn);
-                    let serve = Arc::clone(&state.serve);
-                    let commands = state.commands.clone();
-                    let permanent = persistent_id.is_some();
-                    // Any address the manager dialed is served, a Tor
-                    // onion key included (dcrd `outboundPeerConnected`
-                    // takes the connection's `*addrmgr.NetAddress`).
-                    let remote_addr = record.remote_addr.clone();
-                    let spawned = crate::runtime::spawn_conn_thread("peer-outbound", move || {
-                        serve_outbound_peer(
-                            stream,
-                            &remote_addr,
-                            &serve.template,
-                            &serve.connected,
-                            serve.server.clone(),
-                            permanent,
-                            Some(id),
-                        );
-                        let _ = commands.send(Command::PeerDone(id));
-                    });
-                    if let Err(e) = spawned {
-                        // A connection that ends at once: close the
-                        // socket, and let the ordinary peer-done path
-                        // run its close plan and redial.
-                        crate::logging::warn(
-                            "CMGR",
-                            &format!(
-                                "Unable to start a thread for outbound peer {}: \
-                                 {e} -- disconnecting",
-                                record.remote_addr.key()
-                            ),
-                        );
-                        if let Some(conn) = state.sockets.get(&id) {
-                            conn.close();
-                        }
-                        let _ = state.commands.send(Command::PeerDone(id));
-                    }
+            let DialedConn { stream, shutdown } = conn;
+            state.sockets.insert(id, shutdown);
+            let serve = Arc::clone(&state.serve);
+            let commands = state.commands.clone();
+            let permanent = persistent_id.is_some();
+            // Any address the manager dialed is served, a Tor onion key
+            // included (dcrd `outboundPeerConnected` takes the
+            // connection's `*addrmgr.NetAddress`).
+            let remote_addr = record.remote_addr.clone();
+            let spawned = crate::runtime::spawn_conn_thread("peer-outbound", move || {
+                serve_outbound_peer(
+                    stream,
+                    &remote_addr,
+                    &serve.template,
+                    &serve.connected,
+                    serve.server.clone(),
+                    permanent,
+                    Some(id),
+                );
+                let _ = commands.send(Command::PeerDone(id));
+            });
+            if let Err(e) = spawned {
+                // A connection that ends at once: close the socket, and
+                // let the ordinary peer-done path run its close plan and
+                // redial.
+                crate::logging::warn(
+                    "CMGR",
+                    &format!(
+                        "Unable to start a thread for outbound peer {}: \
+                         {e} -- disconnecting",
+                        record.remote_addr.key()
+                    ),
+                );
+                if let Some(socket) = state.sockets.get(&id) {
+                    socket.disconnect();
                 }
-                None => {
-                    // The dialed stream was already handed off, which a
-                    // fresh dial never is; tear the connection down
-                    // instead of holding its permits forever.
-                    conn.close();
-                    state
-                        .manager
-                        .lock()
-                        .expect("connmgr mutex poisoned")
-                        .conn_closed(id);
-                    if let Some(pid) = persistent_id {
-                        handle_persistent_drop(state, pid);
-                    } else if is_auto {
-                        state.failed_attempts = state.failed_attempts.saturating_add(1);
-                    }
-                }
+                let _ = state.commands.send(Command::PeerDone(id));
             }
             if is_auto {
                 fill_outbound(state);
@@ -1281,9 +1415,7 @@ fn mark_dial_attempt(
     timeout: Duration,
 ) -> Result<(), String> {
     let (host, port_str) = crate::gostd::split_host_port(addr)?;
-    let port: u16 = port_str
-        .parse()
-        .map_err(|e| format!("strconv.ParseUint: parsing \"{port_str}\": {e}"))?;
+    let port = go_parse_uint16(&port_str)?;
     let now_unix = now_unix();
     let na = crate::server::host_to_net_address(
         &host,
@@ -1292,10 +1424,30 @@ fn mark_dial_attempt(
         &|h| dialer.lookup(h, timeout),
         now_unix,
     )?;
-    let mut mgr = addr_manager.lock().expect("addr manager mutex poisoned");
-    mgr.add_addresses(core::slice::from_ref(&na), &na);
-    let _ = mgr.attempt(&na);
+    let attempted = {
+        let mut mgr = addr_manager.lock().expect("addr manager mutex poisoned");
+        // Be sure the address exists in the address manager; one it
+        // will not hold (not routable) cannot be marked, which dcrd
+        // logs on every dial.
+        mgr.add_addresses(core::slice::from_ref(&na), &na);
+        mgr.attempt(&na)
+    };
+    if let Err(e) = attempted {
+        crate::logging::error("SRVR", &format!("Marking address as attempted failed: {e}"));
+    }
     Ok(())
+}
+
+/// dcrd's connection close callback line, which the dial's and the
+/// listener's callbacks both log once the connection's cleanup has run.
+fn log_disconnected(record: &dcroxide_connmgr::manager::ConnRecord) {
+    crate::logging::debug(
+        "CMGR",
+        &format!(
+            "Disconnected from {} (id: {}, type: {})",
+            record.remote_addr, record.id, record.conn_type
+        ),
+    );
 }
 
 /// Owe the event loop `wake` once `delay_nanos` has passed (dcrd arms a
@@ -1348,6 +1500,7 @@ mod tests {
             get_new_address: None,
             failed_attempts: 0,
             pause_armed: false,
+            pause_logged: false,
             resume_after_pause: false,
             persistent: HashMap::new(),
             sockets: HashMap::new(),
@@ -1360,7 +1513,8 @@ mod tests {
     /// thread: with every outbound slot held it re-arms each retry
     /// interval for as long as the node runs, which used to start and
     /// retire a sleeping OS thread every five seconds.  It is armed
-    /// once, and comes due as the `NewConnFire` the timer thread sent.
+    /// once, and comes due as the `NewConnFire` the event loop derives
+    /// from the due wake.
     #[test]
     fn the_fill_wake_is_a_deadline_the_event_loop_keeps() {
         let (mut state, _receiver) = loop_state();
@@ -1374,7 +1528,8 @@ mod tests {
         assert_eq!(take_due_wake(&mut state), None);
         assert_eq!(state.timers.len(), 1);
 
-        // Due: it fires once, as the command the timer thread sent.
+        // Due: it fires once, as the command the event loop derives
+        // from it.
         state.timers[0].0 = Instant::now();
         let wake = take_due_wake(&mut state);
         assert_eq!(wake, Some(Wake::NewConn));
@@ -1383,6 +1538,76 @@ mod tests {
             Some(Command::NewConnFire)
         ));
         assert!(state.timers.is_empty());
+    }
+
+    /// dcrd's handler logs `Max failed connection attempts reached` as it
+    /// begins each pause (`internal/connmgr/connmanager.go:2141-2143`).
+    /// The driver printed the line only when the fill's wake was not yet
+    /// armed, and the permit poll arms that wake whenever dials in flight
+    /// hold every outbound permit, which is what an outage looks like:
+    /// the first pause went unlogged and the next line came a retry
+    /// interval late.
+    #[test]
+    fn a_pause_logs_as_it_begins_while_the_permit_poll_is_armed() {
+        let (mut state, receiver) = loop_state();
+        let mut csprng = SystemCsprng::default();
+        state.manager = Arc::new(Mutex::new(ConnManager::new(
+            dcroxide_connmgr::ManagerConfig {
+                max_normal_conns: 125,
+                target_outbound: 8,
+                retry_duration_nanos: 5_000_000_000,
+                ..Default::default()
+            },
+            &mut csprng,
+        )));
+        // Each draw a fresh address in a group of its own, never tried.
+        let mut next = 0u8;
+        state.get_new_address = Some(Box::new(move || {
+            next = next.wrapping_add(1);
+            let addr = SocketAddr::from(([11, next, 0, 1], 9108));
+            Ok((socket_addr_to_net_address(&addr), GoTime::default()))
+        }));
+        let pause_lines = || PAUSE_LINES.with(|lines| lines.borrow().len());
+        PAUSE_LINES.with(|lines| lines.borrow_mut().clear());
+        // Every dial fails, its outcome queued for the test to deliver.
+        crate::runtime::REFUSE_CONN_THREADS.with(|refuse| refuse.set(true));
+        let deliver = |state: &mut LoopState| match receiver.try_recv() {
+            Ok(Command::DialDone(id, kind, outcome)) => {
+                handle_dial_done(state, id, kind, outcome);
+                true
+            }
+            Ok(_) => panic!("expected a dial outcome"),
+            Err(_) => false,
+        };
+
+        // Eight dials in flight hold every outbound permit, and the fill
+        // arms the permit poll.
+        fill_outbound(&mut state);
+        assert!(state.pause_armed, "the permit poll is armed");
+
+        // Their failures, each followed by a redial, reach the limit.
+        while state.failed_attempts < MAX_FAILED_ATTEMPTS {
+            assert_eq!(pause_lines(), 0, "no pause below the limit");
+            assert!(deliver(&mut state), "a dial is in flight");
+        }
+        assert_eq!(
+            pause_lines(),
+            1,
+            "the pause logs as it begins, though the poll armed the wake"
+        );
+
+        // The dials still in flight fail during the same pause.
+        while deliver(&mut state) {}
+        assert!(state.failed_attempts > MAX_FAILED_ATTEMPTS);
+        assert_eq!(pause_lines(), 1, "one line per pause");
+
+        // The wake ends the pause: one more attempt, then a new pause
+        // with its own line, as dcrd's handler loops back to its sleep.
+        fill_wake_fired(&mut state);
+        assert_eq!(pause_lines(), 2, "the next pause logs its line");
+        assert!(deliver(&mut state), "the attempt after the pause");
+        assert_eq!(pause_lines(), 2);
+        crate::runtime::REFUSE_CONN_THREADS.with(|refuse| refuse.set(false));
     }
 
     /// A persistent entry's backoff is a wake too, due after the delay.
@@ -1429,7 +1654,7 @@ mod tests {
     }
 
     /// Closing a dialed entry raises the flag the serve thread will
-    /// poll, across the take-once handoff.
+    /// poll, across the handoff that splits it between the two.
     ///
     /// The handoff is the only place the driver's control handle and
     /// the serve thread's connection could have drifted apart, which is
@@ -1449,25 +1674,23 @@ mod tests {
         let dialed = crate::transport::Teardown::new(server);
         let shutdown = dialed.try_clone().expect("clone");
         let conn = DialedConn {
-            stream: Arc::new(Mutex::new(Some(dialed))),
+            stream: dialed,
             shutdown,
         };
 
-        // The handle the serve thread receives, taken as
-        // `handle_dial_done` takes it.
-        let handed = conn
-            .stream
-            .lock()
-            .expect("dialed stream mutex poisoned")
-            .take()
-            .expect("the dialed stream is taken once");
+        // The handle the serve thread receives and the one the driver
+        // keeps, split as `handle_dial_done` splits them.
+        let DialedConn {
+            stream: handed,
+            shutdown: kept,
+        } = conn;
         let flag = handed.cancel();
         assert!(
             !flag.is_cancelled(),
             "neither construction nor the handoff may raise it"
         );
 
-        conn.close();
+        kept.disconnect();
 
         assert!(
             flag.is_cancelled(),
@@ -1515,6 +1738,16 @@ mod tests {
         assert!(
             mark_dial_attempt(&mgr, &dialer, "no-port", Duration::from_secs(1)).is_err(),
             "a missing port must fail the dial"
+        );
+        // dcrd's `strconv.ParseUint(portStr, 10, 16)` takes no sign,
+        // where Rust's `str::parse::<u16>` accepts a leading `+`.
+        assert_eq!(
+            mark_dial_attempt(&mgr, &dialer, "8.8.8.8:+9108", Duration::from_secs(1)),
+            Err("strconv.ParseUint: parsing \"+9108\": invalid syntax".to_string())
+        );
+        assert_eq!(
+            mark_dial_attempt(&mgr, &dialer, "8.8.8.8:99999x", Duration::from_secs(1)),
+            Err("strconv.ParseUint: parsing \"99999x\": value out of range".to_string())
         );
     }
 
@@ -1605,7 +1838,9 @@ mod tests {
             }) => {
                 assert!(permanent);
                 assert_eq!(
-                    resolved.map(|addr| addr.key()),
+                    resolved
+                        .and_then(ConnectTarget::into_net_address)
+                        .map(|addr| addr.key()),
                     Ok("192.0.2.8:9108".to_string())
                 );
                 let _ = reply.send(Ok(()));
@@ -1658,6 +1893,61 @@ mod tests {
                 &crate::socks::NodeDialer::from_config(&cfg)
             ),
             Err("tor has been disabled".to_string())
+        );
+    }
+
+    /// dcrd's `AddPersistent` checks its capacity before it converts the
+    /// address (`internal/connmgr/connmanager.go:1826-1835`), and
+    /// `addrStringToNetAddr` hands it a Tor v3 target unconverted, port
+    /// unparsed (`server.go:4481-4485`), so with the persistent table
+    /// full a v3 target with a bad port gets the capacity error.  The
+    /// port parsed a v3 target's port while resolving it on the RPC
+    /// thread and answered "invalid port for address" before the gate.
+    /// dcrd's one-try `Connect` converts first, so there the port error
+    /// stands.
+    #[test]
+    fn a_full_persistent_table_beats_a_v3_targets_bad_port() {
+        let (mut state, _receiver) = loop_state();
+        {
+            let mut manager = state.manager.lock().expect("connmgr");
+            for i in 0..dcroxide_connmgr::manager::MAX_PERSISTENT {
+                let last = u8::try_from(i).expect("small").wrapping_add(1);
+                let addr = socket_addr_to_net_address(&SocketAddr::from(([192, 0, 2, last], 9108)));
+                manager.add_persistent(&addr).expect("room in the table");
+            }
+        }
+
+        // `addnode <v3>.onion:99999 add` and `... onetry`, through the
+        // control handle as the RPC server reaches it.  Every lookup
+        // through this routing fails, so the target must stay unresolved.
+        let target = format!("{ONION}:99999");
+        let mut connect = |permanent: bool| {
+            let channel = outbound_channel_with_dialer(tor_dialer("127.0.0.1:1"));
+            let control = channel.control();
+            let caller = {
+                let target = target.clone();
+                thread::spawn(move || control.connect(&target, permanent))
+            };
+            let Ok(Command::RpcConnect {
+                resolved,
+                permanent,
+                reply,
+            }) = channel.receiver.recv_timeout(Duration::from_secs(5))
+            else {
+                panic!("expected the connect command");
+            };
+            let result = rpc_connect(&mut state, resolved, permanent, reply.clone())
+                .expect("a gate or conversion failure replies at once");
+            let _ = reply.send(result);
+            caller.join().expect("the caller")
+        };
+        assert_eq!(
+            connect(true),
+            Err("a maximum of 8 persistent connections is allowed".to_string())
+        );
+        assert_eq!(
+            connect(false),
+            Err(format!("invalid port for address \"{target}\""))
         );
     }
 
@@ -1751,6 +2041,20 @@ mod tests {
             ),
             "tor has been disabled"
         );
+
+        // With no proxy at all an onion target takes the plain dialer,
+        // which dcrd's `oniondial` then is (`config.go`): Go resolves the
+        // host, its resolver never asks DNS for a `.onion` name, and the
+        // empty answer fails the dial.  The port reported Rust's socket
+        // address parse error, "invalid dial address ...: invalid socket
+        // address syntax".
+        assert_eq!(
+            failure(
+                &format!("{ONION}:9108"),
+                &crate::socks::NodeDialer::direct()
+            ),
+            format!("dial tcp: address {ONION}: no suitable address found")
+        );
     }
 
     /// A dialed onion peer is served like any other.  The driver parsed
@@ -1784,7 +2088,7 @@ mod tests {
         let dialed = crate::transport::Teardown::new(dialed);
         let shutdown = dialed.try_clone().expect("clone");
         let conn = DialedConn {
-            stream: Arc::new(Mutex::new(Some(dialed))),
+            stream: dialed,
             shutdown,
         };
 

@@ -20,6 +20,7 @@ use dcroxide_dcrjson::{GoType, GoValue, StructField, gojson};
 use dcroxide_wire::ServiceFlag;
 use serde::Serialize;
 
+use crate::gotime::{GoTime, monotonic_nanos};
 use crate::netaddress::{NetAddress, encode_host, new_net_address_from_params};
 use crate::network::{
     NetAddressType, NetAddressTypeFilter, is_local, is_rfc3964, is_rfc4380, is_rfc6052, is_rfc6145,
@@ -180,9 +181,12 @@ pub struct KnownAddress {
     // A Go `int` in dcrd, which is 64 bits wide on every platform it
     // ships for and is what `peers.json` round-trips.
     pub(crate) attempts: i64,
-    // Unix nanoseconds; `None` is Go's zero time.
-    pub(crate) lastattempt: Option<i64>,
-    pub(crate) lastsuccess: Option<i64>,
+    // `None` is Go's zero time.  A time stamped in this process carries
+    // the monotonic reading Go's `time.Now` does, and one loaded from
+    // `peers.json` does not, so the recency tests below measure running
+    // time for the one and wall time for the other, as dcrd's do.
+    pub(crate) lastattempt: Option<GoTime>,
+    pub(crate) lastsuccess: Option<GoTime>,
     pub(crate) tried: bool,
     pub(crate) refs: i32,
 }
@@ -196,16 +200,18 @@ impl KnownAddress {
         &self.na
     }
 
-    /// The last time the address was attempted, in Unix nanoseconds
-    /// (dcrd `LastAttempt`; `None` is Go's zero time).
-    pub fn last_attempt(&self) -> Option<i64> {
+    /// The last time the address was attempted (dcrd `LastAttempt`;
+    /// `None` is Go's zero time), with its monotonic reading when it was
+    /// attempted in this process.
+    pub fn last_attempt(&self) -> Option<GoTime> {
         self.lastattempt
     }
 
-    /// The selection probability for the address (dcrd `chance`): the
-    /// priority depends on how recently it was attempted and how
-    /// often attempts have failed.
-    pub fn chance(&self, now: i64) -> f64 {
+    /// The selection probability for the address at `now` (dcrd
+    /// `chance`, which reads `time.Now()` itself): the priority depends
+    /// on how recently it was attempted and how often attempts have
+    /// failed.
+    pub fn chance(&self, now: GoTime) -> f64 {
         // Very recent attempts are less likely to be retried.
         const MIN_CHANCE: f64 = 0.01;
         match self.lastattempt {
@@ -214,7 +220,7 @@ impl KnownAddress {
                 // `time.Since` saturates at Go's maximum duration, which a
                 // far-past `LastAttempt` off disk reaches; an unguarded
                 // subtraction wraps negative there and reads as recent.
-                if now.saturating_sub(lastattempt) < 10 * MINUTE_NANOS {
+                if now.duration_since(lastattempt) < 10 * MINUTE_NANOS {
                     return MIN_CHANCE;
                 }
             }
@@ -225,25 +231,31 @@ impl KnownAddress {
         c.max(MIN_CHANCE)
     }
 
-    /// Whether the address is assumed worthless (dcrd `isBad`): not
-    /// tried in the last minute and from the future, unseen for a
-    /// month, thrice-failed without success, or five-times failed in
-    /// the last week.
-    pub fn is_bad(&self, now: i64) -> bool {
+    /// Whether the address is assumed worthless at `now` (dcrd `isBad`,
+    /// which reads `time.Now()` itself): not tried in the last minute
+    /// and from the future, unseen for a month, thrice-failed without
+    /// success, or five-times failed in the last week.
+    pub fn is_bad(&self, now: GoTime) -> bool {
         // Wait a minute after the last check.
         if let Some(lastattempt) = self.lastattempt
-            && lastattempt > now - MINUTE_NANOS
+            && lastattempt.after(now.add_nanos(-MINUTE_NANOS))
         {
             return false;
         }
 
+        // The address's own timestamp is Unix nanoseconds only, so these
+        // two compare on the wall clock.  dcrd's `Connected` stamps it
+        // with `time.Now()`, whose monotonic reading they would use for
+        // an address connected in this process (PARITY.md).
+        let now_wall = now.wall;
+
         // From the future?
-        if self.na.timestamp > now + 10 * MINUTE_NANOS {
+        if self.na.timestamp > now_wall + 10 * MINUTE_NANOS {
             return true;
         }
 
         // Over a month old?
-        if self.na.timestamp < now - NUM_MISSING_DAYS * DAY_NANOS {
+        if self.na.timestamp < now_wall - NUM_MISSING_DAYS * DAY_NANOS {
             return true;
         }
 
@@ -253,9 +265,9 @@ impl KnownAddress {
         }
 
         // Hasn't succeeded in too long?
-        let success_cutoff = now - MIN_BAD_DAYS * DAY_NANOS;
+        let success_cutoff = now.add_nanos(-MIN_BAD_DAYS * DAY_NANOS);
         let succeeded_recently = match self.lastsuccess {
-            Some(lastsuccess) => lastsuccess > success_cutoff,
+            Some(lastsuccess) => lastsuccess.after(success_cutoff),
             None => false,
         };
         if !succeeded_recently && self.attempts >= MAX_FAILURES {
@@ -475,6 +487,9 @@ pub struct AddrManager {
     tried_bucket_size: usize,
 
     now_fn: Clock,
+    /// The monotonic reading `time.Now` attaches, for the attempt and
+    /// success times ([`GoTime`]).
+    mono_fn: Clock,
     rng: Arc<Mutex<dyn AddrRng + Send>>,
 }
 
@@ -583,24 +598,35 @@ impl AddrManager {
     /// Construct a new address manager instance storing its peers
     /// file under the given data directory (dcrd `New`).
     pub fn new(data_dir: &std::path::Path) -> AddrManager {
-        AddrManager::new_with_hooks(
+        AddrManager::new_with_clocks(
             data_dir,
-            Arc::new(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or_default()
-            }),
+            Arc::new(|| GoTime::now().wall),
+            Arc::new(monotonic_nanos),
             Arc::new(Mutex::new(SystemRng::default())),
         )
     }
 
     /// [`new`](AddrManager::new) with an injectable clock and random
-    /// source; exposed so tests are deterministic.
+    /// source; exposed so tests are deterministic.  The one clock gives
+    /// both of `time.Now`'s readings, a wall clock that runs only
+    /// forward with the time the test lets pass.
     #[doc(hidden)]
     pub fn new_with_hooks(
         data_dir: &std::path::Path,
         now_fn: Clock,
+        rng: Arc<Mutex<dyn AddrRng + Send>>,
+    ) -> AddrManager {
+        AddrManager::new_with_clocks(data_dir, now_fn.clone(), now_fn, rng)
+    }
+
+    /// [`new`](AddrManager::new) with the wall clock (Unix nanoseconds)
+    /// and the monotonic clock injected apart, so a test can step the
+    /// one without the other; exposed for tests.
+    #[doc(hidden)]
+    pub fn new_with_clocks(
+        data_dir: &std::path::Path,
+        now_fn: Clock,
+        mono_fn: Clock,
         rng: Arc<Mutex<dyn AddrRng + Send>>,
     ) -> AddrManager {
         let mut am = AddrManager {
@@ -617,6 +643,7 @@ impl AddrManager {
             local_addresses: HashMap::new(),
             tried_bucket_size: DEFAULT_TRIED_BUCKET_SIZE,
             now_fn,
+            mono_fn,
             rng,
         };
         am.reset();
@@ -765,7 +792,7 @@ impl AddrManager {
     /// entries, or the oldest entry when no bad ones exist (dcrd
     /// `expireNew`).
     fn expire_new(&mut self, bucket: usize) {
-        let now = (self.now_fn)();
+        let now = self.go_now();
         let mut oldest: Option<(String, KnownAddressRef)> = None;
         let entries: Vec<(String, KnownAddressRef)> = self.addr_new[bucket]
             .iter()
@@ -859,7 +886,7 @@ impl AddrManager {
             return Vec::new();
         }
 
-        let now = (self.now_fn)();
+        let now = self.go_now();
         let mut all_addr: Vec<NetAddress> = Vec::with_capacity(self.addr_index.len());
         for ka in self.addr_index.values() {
             let ka = ka.lock().expect("addrmgr lock poisoned");
@@ -931,7 +958,7 @@ impl AddrManager {
 
         // Use a 50% chance for choosing between tried and new table
         // entries.
-        let now = (self.now_fn)();
+        let now = self.go_now();
         let large = 1usize << 30;
         let mut factor = 1.0f64;
         let mut rng = self.rng.lock().expect("addrmgr lock poisoned");
@@ -1014,6 +1041,15 @@ impl AddrManager {
         self.addr_index.get(&addr.key()).cloned()
     }
 
+    /// The current time as dcrd's `time.Now()` gives it, with both
+    /// readings.
+    fn go_now(&self) -> GoTime {
+        GoTime {
+            wall: (self.now_fn)(),
+            mono: Some((self.mono_fn)()),
+        }
+    }
+
     /// Look up a known address by its key; exposed for tests.
     #[doc(hidden)]
     pub fn known_address(&self, key: &str) -> Option<KnownAddressRef> {
@@ -1034,7 +1070,7 @@ impl AddrManager {
         // A Go `int` increment, which wraps; a loaded `Attempts` can sit
         // at the top of the range.
         ka.attempts = ka.attempts.wrapping_add(1);
-        ka.lastattempt = Some((self.now_fn)());
+        ka.lastattempt = Some(self.go_now());
         Ok(())
     }
 
@@ -1070,7 +1106,7 @@ impl AddrManager {
             )
         })?;
 
-        let now = (self.now_fn)();
+        let now = self.go_now();
         {
             let mut ka_mut = ka.lock().expect("addrmgr lock poisoned");
             // The timestamp is not updated here to avoid leaking
@@ -1312,31 +1348,23 @@ impl AddrManager {
     }
 
     /// Create a network address from a "host:port" string, stamping
-    /// it with the current time (dcrd `newNetAddressFromString`).
-    fn new_net_address_from_string(&self, addr: &str) -> Result<NetAddress, AddrError> {
+    /// it with the current time (dcrd `newNetAddressFromString`).  The
+    /// error is the text dcrd's would print: `net.SplitHostPort`'s and
+    /// `strconv.ParseUint`'s own, returned unchanged, or the address
+    /// manager's for an unknown host type.
+    fn new_net_address_from_string(&self, addr: &str) -> Result<NetAddress, String> {
         // The crate carried a second, hand-rolled splitter here that
         // disagreed with the Go-faithful one in `seed`: it accepted an
         // unbracketed multi-colon host like `::1:9108`, and `"+9108"`
         // parses as a `u16` where Go's `ParseUint` rejects the sign.
         // One implementation now, so they cannot drift again.
-        let (host, port_str) = crate::seed::split_host_port(addr).map_err(|_| {
-            make_error(
-                ErrorKind::UnknownAddressType,
-                format!("failed to deserialize address {addr}"),
-            )
-        })?;
-        let port = crate::seed::go_parse_port(&port_str).map_err(|()| {
-            make_error(
-                ErrorKind::UnknownAddressType,
-                format!("failed to deserialize address {addr}"),
-            )
-        })?;
+        let (host, port_str) = crate::seed::split_host_port(addr)?;
+        let port = crate::seed::go_parse_port(&port_str)?;
         let (addr_type, addr_bytes) = encode_host(&host);
         if addr_type == NetAddressType::Unknown {
-            return Err(make_error(
-                ErrorKind::UnknownAddressType,
-                format!("failed to deserialize address {addr}"),
-            ));
+            // dcrd's `makeError(ErrUnknownAddressType, str)`, whose
+            // `Error` is the description.
+            return Err(format!("failed to deserialize address {addr}"));
         }
         let timestamp = (self.now_fn)() / NANOS_PER_SEC * NANOS_PER_SEC;
         new_net_address_from_params(
@@ -1346,6 +1374,7 @@ impl AddrManager {
             timestamp,
             ServiceFlag::NODE_NETWORK,
         )
+        .map_err(|err| err.description)
     }
 
     /// Save all known addresses to the peers file (dcrd `savePeers`).
@@ -1368,8 +1397,8 @@ impl AddrManager {
                 src: v.src_addr.key(),
                 attempts: v.attempts,
                 time_stamp: v.na.timestamp.div_euclid(NANOS_PER_SEC),
-                last_attempt: go_unix(v.lastattempt),
-                last_success: go_unix(v.lastsuccess),
+                last_attempt: go_unix(v.lastattempt.map(|t| t.wall)),
+                last_success: go_unix(v.lastsuccess.map(|t| t.wall)),
             }));
         }
         for bucket in &self.addr_new {
@@ -1491,8 +1520,9 @@ impl AddrManager {
                 na: net_addr,
                 src_addr,
                 attempts: v.attempts,
-                lastattempt: from_go_unix(v.last_attempt),
-                lastsuccess: from_go_unix(v.last_success),
+                // `time.Unix`: no monotonic reading.
+                lastattempt: from_go_unix(v.last_attempt).map(GoTime::wall),
+                lastsuccess: from_go_unix(v.last_success).map(GoTime::wall),
                 tried: false,
                 refs: 0,
             }));
@@ -1740,80 +1770,18 @@ fn decode_serialized_addr_manager(contents: &[u8]) -> Result<SerializedAddrManag
 }
 
 /// The first JSON value in the file, framed as Go's `Decoder.readValue`
-/// frames it over a reader that ends where the file does.  Leading
-/// whitespace is skipped and a file holding nothing else is `EOF`.  The
-/// scanner's first syntax error inside the value is the error, found as
-/// the scanner meets it and not only once brackets fail to balance.  A
-/// value the file ends partway through is `unexpected EOF`, whatever
-/// the scanner was in the middle of.  A value that completes is decoded
-/// without whatever follows it, which Go never looks at.
+/// frames it over a reader that ends where the file does
+/// ([`crate::seed::read_value`]).  Leading whitespace is skipped and a
+/// file holding nothing else is `EOF`.
 fn first_json_value(contents: &[u8]) -> Result<&[u8], String> {
     let Some(start) = contents
         .iter()
-        .position(|c| !matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
+        .position(|&c| !crate::seed::is_json_space(c))
     else {
         return Err("EOF".to_string());
     };
     let rest = &contents[start..];
-    let err = match gojson::validate_bytes(rest) {
-        // One value, then only whitespace.
-        Ok(()) => return Ok(rest),
-        Err(err) => err.go_message(),
-    };
-    // The scanner stops at the first byte it rejects, so an error that
-    // an appended byte changes is one the end of the input raised (0x01
-    // is rejected in every state, and names itself when it is).
-    let mut extended = rest.to_vec();
-    extended.push(0x01);
-    if gojson::validate_bytes(&extended).map_err(|err| err.go_message()) != Err(err.clone()) {
-        return Err("unexpected EOF".to_string());
-    }
-    if !err.ends_with("after top-level value") {
-        return Err(err);
-    }
-    Ok(&rest[..complete_value_len(rest)])
-}
-
-/// The length of the complete JSON value that starts `rest` and that
-/// something other than whitespace follows.  Go's scanner ends a number
-/// or a literal at the first byte that cannot continue it, so `123-4`
-/// and `nullx` are the values `123` and `null`.
-fn complete_value_len(rest: &[u8]) -> usize {
-    match rest[0] {
-        b'{' | b'[' | b'"' => match crate::seed::next_value_extent(rest, 0) {
-            Ok(Some((_, end))) => end,
-            _ => rest.len(),
-        },
-        b't' | b'n' => 4,
-        b'f' => 5,
-        _ => {
-            // -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?, which the
-            // scanner has already accepted.
-            let digits = |mut i: usize| {
-                while rest.get(i).is_some_and(u8::is_ascii_digit) {
-                    i += 1;
-                }
-                i
-            };
-            let mut i = usize::from(rest[0] == b'-');
-            i = if rest.get(i) == Some(&b'0') {
-                i + 1
-            } else {
-                digits(i)
-            };
-            if rest.get(i) == Some(&b'.') {
-                i = digits(i + 1);
-            }
-            if matches!(rest.get(i), Some(b'e' | b'E')) {
-                i += 1;
-                if matches!(rest.get(i), Some(b'+' | b'-')) {
-                    i += 1;
-                }
-                i = digits(i);
-            }
-            i
-        }
-    }
+    Ok(&rest[..crate::seed::read_value(rest)?])
 }
 
 /// A Go `*os.PathError`'s text, `op path: err`.  An OS error reads as

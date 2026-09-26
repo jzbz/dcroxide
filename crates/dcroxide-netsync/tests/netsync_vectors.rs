@@ -158,42 +158,28 @@ struct ScriptedTxPool {
 }
 
 impl SyncTxPool for ScriptedTxPool {
-    fn process_transaction(
+    fn process_transaction_accepted(
         &mut self,
         tx: &MsgTx,
         _allow_orphan: bool,
         _allow_high_fees: bool,
         _tag: u64,
-    ) -> Result<Vec<Hash>, String> {
+    ) -> Result<Vec<(Hash, MsgTx)>, ProcessTxFailure> {
+        // The scripted pool never accepts anything: the orphan is
+        // tracked with an empty accepted list and the bad transaction is
+        // rejected.
         let hash = tx.tx_hash();
         if hash == self.orphan_hash {
             self.have.insert(hash);
             return Ok(Vec::new());
         }
         if hash == self.bad_hash {
-            return Err("rejected by scripted pool".to_string());
+            return Err(ProcessTxFailure {
+                is_rule_error: true,
+                message: "rejected by scripted pool".to_string(),
+            });
         }
         panic!("unexpected transaction {hash}");
-    }
-
-    fn process_transaction_accepted(
-        &mut self,
-        tx: &MsgTx,
-        allow_orphan: bool,
-        allow_high_fees: bool,
-        tag: u64,
-    ) -> Result<Vec<(Hash, MsgTx)>, ProcessTxFailure> {
-        // The scripted pool never accepts anything, so pairing the
-        // hashes back up with the delivered transaction is enough.
-        Ok(self
-            .process_transaction(tx, allow_orphan, allow_high_fees, tag)
-            .map_err(|message| ProcessTxFailure {
-                is_rule_error: true,
-                message,
-            })?
-            .into_iter()
-            .map(|hash| (hash, tx.clone()))
-            .collect())
     }
 
     fn have_transaction(&mut self, hash: &Hash) -> bool {

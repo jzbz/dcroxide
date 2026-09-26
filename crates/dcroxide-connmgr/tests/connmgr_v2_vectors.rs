@@ -20,7 +20,7 @@
 //! `conn_closed`), which is the same decision sequence dcrd runs
 //! inside `Connect`/`dial` with the socket work removed.
 
-use dcroxide_addrmgr::{NetAddress, NetAddressType, new_net_address_from_params};
+use dcroxide_addrmgr::{GoTime, NetAddress, NetAddressType, new_net_address_from_params};
 use dcroxide_connmgr::manager::{
     ClosePlan, ConnManager, DisconnectAction, ManagerConfig, NO_SUITABLE_ADDR_MSG,
 };
@@ -400,10 +400,10 @@ fn dcrd_connmgr_v2_vectors() {
             }
             "pick" => {
                 let tag = f[1];
-                let now_nanos = 1_700_000_000_000_000_000i64;
+                let now_nanos = GoTime::wall(1_700_000_000_000_000_000i64);
                 let now_secs = 1_700_000_000i64;
-                let old = (now_secs - 660) * 1_000_000_000;
-                let recent = (now_secs - 60) * 1_000_000_000;
+                let old = GoTime::wall((now_secs - 660) * 1_000_000_000);
+                let recent = GoTime::wall((now_secs - 60) * 1_000_000_000);
                 match tag {
                     "E1" => {
                         let mut rng = ScriptedRng {

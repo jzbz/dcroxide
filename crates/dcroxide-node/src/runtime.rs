@@ -137,11 +137,13 @@ impl ConnectedPeers {
     /// Through each connection's teardown handle, so the flag its reader
     /// polls goes up with the socket shutdown rather than leaving the
     /// reader parked until its idle budget runs out; see
-    /// `transport::Teardown::disconnect`.
+    /// `transport::Teardown::disconnect`.  The flag is marked as the
+    /// shutdown's, so a handshake cut short reports dcrd's
+    /// `errHandshakeTimeout` (`Teardown::disconnect_for_shutdown`).
     pub fn disconnect_all(&self) {
         let inner = self.locked();
         for conn in inner.peers.values() {
-            conn.disconnect();
+            conn.disconnect_for_shutdown();
         }
     }
 }
@@ -490,7 +492,7 @@ fn serve_inbound_peer(
             .lock()
             .expect("banned-hosts mutex poisoned");
         let outcome =
-            crate::server::handle_banned_conn(&mut banned, &host, NodePeerEnv::new().now_nanos());
+            crate::server::handle_banned_conn(&mut banned, &host, crate::server::ban_clock_nanos());
         if outcome.banned {
             return;
         }
@@ -551,7 +553,7 @@ pub(crate) fn serve_outbound_peer(
             .lock()
             .expect("banned-hosts mutex poisoned");
         let outcome =
-            crate::server::handle_banned_conn(&mut banned, &host, NodePeerEnv::new().now_nanos());
+            crate::server::handle_banned_conn(&mut banned, &host, crate::server::ban_clock_nanos());
         if outcome.banned {
             return;
         }
@@ -997,6 +999,10 @@ mod tests {
 
         for (n, (f, c)) in flags.iter().zip(clients.iter()).enumerate() {
             assert!(f.is_cancelled(), "connection {n}'s flag must be raised");
+            assert!(
+                f.is_shutdown(),
+                "connection {n}'s flag must be the shutdown's"
+            );
             let mut buf = [0u8; 1];
             assert_eq!(
                 (&*c).read(&mut buf).expect("read"),

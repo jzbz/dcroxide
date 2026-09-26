@@ -13,9 +13,9 @@
 //! The idle read deadline dcrd sets before each read
 //! (`SetReadDeadline(now + IdleTimeout)` in `readMessage`) is an
 //! absolute bound over the whole message; the transport reproduces it
-//! by arming the stream's read timeout with the remaining budget
-//! before every receive, so a byte-dribbling peer cannot extend one
-//! message read past the budget the peer loop configures.
+//! by running every receive under a read timeout of the remaining
+//! budget, so a byte-dribbling peer cannot extend one message read past
+//! the budget the peer loop configures.
 //!
 //! That budget is minutes long, so the read is additionally chopped
 //! into [`READ_POLL_INTERVAL`] slices and a [`Cancel`] flag is checked
@@ -58,8 +58,21 @@ pub const READ_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// detector, the output loop, the server's shutdown — raises this, and
 /// the reader notices within [`READ_POLL_INTERVAL`] rather than
 /// whenever its idle budget happens to run out.
+///
+/// The flag also records whether the node's own shutdown raised it
+/// ([`Cancel::cancel_for_shutdown`]): dcrd's shutdown cancels the server
+/// context rather than only closing the conn, and a handshake reports
+/// that differently (`Handshake`'s `ctx.Done` arm,
+/// `peer/peer.go:2352-2353`).
 #[derive(Clone, Default)]
-pub struct Cancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+pub struct Cancel(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+/// [`Cancel`]'s raised state.
+const CANCEL_RAISED: u8 = 1;
+
+/// [`Cancel`]'s raised state when the node's shutdown raised it.  It is
+/// above [`CANCEL_RAISED`], so a plain raise never clears it.
+const CANCEL_SHUTDOWN: u8 = 2;
 
 impl Cancel {
     /// A flag that has not been raised.
@@ -69,12 +82,25 @@ impl Cancel {
 
     /// Raise the flag.  Idempotent, and safe to call from any thread.
     pub fn cancel(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .fetch_max(CANCEL_RAISED, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Raise the flag because the node is shutting down.  Idempotent,
+    /// and safe to call from any thread.
+    pub fn cancel_for_shutdown(&self) {
+        self.0
+            .fetch_max(CANCEL_SHUTDOWN, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the flag has been raised.
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        self.0.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+
+    /// Whether the node's shutdown raised the flag.
+    pub fn is_shutdown(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed) == CANCEL_SHUTDOWN
     }
 }
 
@@ -149,11 +175,21 @@ impl Teardown {
     /// it from.  dcrd does the same: `disconnectNode` calls
     /// `Disconnect()` under `peerState.Lock()`.
     ///
-    /// The flag goes up first, the order `run_stall_detector` already
-    /// used, so there is never a moment when the socket is dead and the
-    /// flag is still down.
+    /// The flag goes up first, so there is never a moment when the
+    /// socket is dead and the flag is still down.
     pub fn disconnect(&self) {
         self.cancel.cancel();
+        let _ = self.conn.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// End the connection because the node is shutting down: the same
+    /// teardown as [`Teardown::disconnect`], with the flag marked as the
+    /// shutdown's ([`Cancel::cancel_for_shutdown`]).  dcrd's shutdown
+    /// cancels the server context that each `Handshake` selects on, so a
+    /// handshake it cuts short fails with `errHandshakeTimeout` from that
+    /// arm (`peer/peer.go:2352-2353`), not with the read it interrupted.
+    pub fn disconnect_for_shutdown(&self) {
+        self.cancel.cancel_for_shutdown();
         let _ = self.conn.shutdown(std::net::Shutdown::Both);
     }
 }
@@ -276,6 +312,20 @@ pub struct WireTransport<S> {
     /// Raised when some other loop has decided the connection is over,
     /// so a read in progress gives up instead of waiting out its budget.
     cancel: Option<Cancel>,
+    /// The receive timeout this transport last armed on the stream, so
+    /// a budgeted receive re-arms only when the slice it needs differs.
+    /// That slice is [`READ_POLL_INTERVAL`] for every receive but those
+    /// in a budget's final second, and each arming is a `setsockopt`
+    /// where Go's `SetReadDeadline` is a runtime timer.  `None` until
+    /// the first budgeted receive: the stream arrives with whatever
+    /// timeout it had.  Only a connection's read transport receives, so
+    /// nothing else re-arms the timeout behind this record.
+    read_timeout_armed: Option<Duration>,
+    /// Whether a bounded write left the stream's send timeout armed.
+    /// It stays armed between messages, because the next bounded write
+    /// re-arms it before every send anyway; an unbounded write clears
+    /// it first, so it still runs with no timeout at all.
+    write_timeout_armed: bool,
 }
 
 impl<S> WireTransport<S> {
@@ -292,6 +342,8 @@ impl<S> WireTransport<S> {
             write_stall: None,
             net_totals: None,
             cancel: None,
+            read_timeout_armed: None,
+            write_timeout_armed: false,
         }
     }
 
@@ -300,6 +352,11 @@ impl<S> WireTransport<S> {
     /// down instead of waiting out the idle budget.
     pub fn set_cancel(&mut self, cancel: Cancel) {
         self.cancel = Some(cancel);
+    }
+
+    /// The cancellation flag shared with this transport, if any.
+    pub fn cancel_flag(&self) -> Option<&Cancel> {
+        self.cancel.as_ref()
     }
 
     /// Contribute this transport's reads and writes to the server-wide
@@ -373,12 +430,18 @@ impl<S> WireTransport<S> {
 /// `got` is advanced by every byte received, so a caller learns what a
 /// failed read took off the wire as well as a whole one (dcrd's
 /// `ReadMessageN` returns its `totalBytes` on every path).
+///
+/// `armed` is the receive timeout last armed on the stream (see
+/// `WireTransport::read_timeout_armed`).  Each receive runs under
+/// `remaining.min(READ_POLL_INTERVAL)`; the timeout is set only when
+/// that differs from the one already armed.
 fn read_exact_by_deadline<S: Read + SocketTimeout>(
     stream: &mut S,
     buf: &mut [u8],
     deadline: Option<Instant>,
     cancel: Option<&Cancel>,
     got: &mut usize,
+    armed: &mut Option<Duration>,
 ) -> std::io::Result<()> {
     let cancelled = || {
         std::io::Error::new(
@@ -426,7 +489,13 @@ fn read_exact_by_deadline<S: Read + SocketTimeout>(
                 "read timed out",
             ));
         }
-        stream.set_socket_read_timeout(Some(remaining.min(READ_POLL_INTERVAL)));
+        // Compared by value, not by "shorter than": a slice clamped in
+        // one budget's final second must be raised again for the next.
+        let slice = remaining.min(READ_POLL_INTERVAL);
+        if *armed != Some(slice) {
+            stream.set_socket_read_timeout(Some(slice));
+            *armed = Some(slice);
+        }
         match stream.read(&mut buf[filled..]) {
             Ok(0) => return Err(unexpected_eof()),
             Ok(n) => {
@@ -545,6 +614,7 @@ impl<S: Read + Write + SocketTimeout> WireTransport<S> {
             deadline,
             self.cancel.as_ref(),
             got,
+            &mut self.read_timeout_armed,
         )
         .map_err(|e| dcroxide_peer::ReadError::io(e.to_string()))?;
 
@@ -568,6 +638,7 @@ impl<S: Read + Write + SocketTimeout> WireTransport<S> {
                 deadline,
                 self.cancel.as_ref(),
                 got,
+                &mut self.read_timeout_armed,
             )
             .map_err(|e| dcroxide_peer::ReadError::io(e.to_string()))?;
         }
@@ -637,10 +708,19 @@ impl<S: Read + Write + SocketTimeout> MsgTransport for WireTransport<S> {
         let deadline = self
             .write_stall
             .map(|p| now.checked_add(p.deadline_for(bytes.len())).unwrap_or(now));
+        // A bounded write arms the send timeout before every send, so
+        // what an earlier one left armed never governs it, and it leaves
+        // the timeout armed rather than spend a `setsockopt` clearing it
+        // after every message.  An unbounded write clears it first, so
+        // it still runs with no timeout at all.
+        if deadline.is_none() && self.write_timeout_armed {
+            self.stream.set_socket_write_timeout(None);
+            self.write_timeout_armed = false;
+        }
         let mut sent = 0usize;
         let result = write_all_by_deadline(&mut self.stream, &bytes, deadline, &mut sent);
-        if self.write_stall.is_some() {
-            self.stream.set_socket_write_timeout(None);
+        if deadline.is_some() {
+            self.write_timeout_armed = true;
         }
         // What reached the stream counts even when the write then fails
         // (dcrd's `writeMessage` adds `WriteMessageN`'s partial `n` to
@@ -1099,6 +1179,165 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A stream that records each socket timeout armed on it and the
+    /// timeout in force at each receive and send, handing out its input
+    /// a few bytes per receive so one message takes several.
+    struct TimeoutProbe {
+        input: Cursor<Vec<u8>>,
+        chunk: usize,
+        read_timeout: std::cell::Cell<Option<Duration>>,
+        write_timeout: std::cell::Cell<Option<Duration>>,
+        read_arms: std::cell::Cell<usize>,
+        write_arms: std::cell::Cell<usize>,
+        reads_under: Vec<Option<Duration>>,
+        writes_under: Vec<Option<Duration>>,
+    }
+
+    impl TimeoutProbe {
+        fn new(input: Vec<u8>, chunk: usize) -> TimeoutProbe {
+            TimeoutProbe {
+                input: Cursor::new(input),
+                chunk,
+                read_timeout: std::cell::Cell::new(None),
+                write_timeout: std::cell::Cell::new(None),
+                read_arms: std::cell::Cell::new(0),
+                write_arms: std::cell::Cell::new(0),
+                reads_under: Vec::new(),
+                writes_under: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for TimeoutProbe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads_under.push(self.read_timeout.get());
+            let n = buf.len().min(self.chunk);
+            self.input.read(&mut buf[..n])
+        }
+    }
+
+    impl Write for TimeoutProbe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes_under.push(self.write_timeout.get());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SocketTimeout for TimeoutProbe {
+        fn set_socket_read_timeout(&self, timeout: Option<Duration>) {
+            self.read_arms.set(self.read_arms.get().saturating_add(1));
+            self.read_timeout.set(timeout);
+        }
+
+        fn set_socket_write_timeout(&self, timeout: Option<Duration>) {
+            self.write_arms.set(self.write_arms.get().saturating_add(1));
+            self.write_timeout.set(timeout);
+        }
+    }
+
+    /// Every budgeted receive runs under the remaining budget,
+    /// capped at [`READ_POLL_INTERVAL`], but the timeout is armed only
+    /// when that slice changes rather than before every receive: the
+    /// slice is the same second for every receive outside a budget's
+    /// final second, and each arming is a `setsockopt`.  A slice clamped
+    /// in one budget's final second is raised again for the next.
+    #[test]
+    fn a_budgeted_read_arms_the_receive_timeout_only_when_it_changes() {
+        let msg = Message::Ping(MsgPing { nonce: 9 });
+        let framed = wire_write_message(&msg, MAX_PROTOCOL_VERSION, NET).expect("frame");
+        let input: Vec<u8> = std::iter::repeat_n(framed.as_slice(), 5)
+            .flatten()
+            .copied()
+            .collect();
+        // Five bytes a receive: seven receives for each 32-byte ping.
+        let mut transport =
+            WireTransport::new(TimeoutProbe::new(input, 5), MAX_PROTOCOL_VERSION, NET);
+
+        // A budget far longer than the test: every slice is the poll
+        // interval, armed once for all three messages.
+        transport.set_read_budget(Some(Duration::from_secs(600)));
+        for _ in 0..3 {
+            assert_eq!(transport.read_message().expect("read"), msg);
+        }
+        let probe = transport.get_ref();
+        assert_eq!(probe.reads_under.len(), 21, "seven receives a message");
+        assert!(
+            probe
+                .reads_under
+                .iter()
+                .all(|t| *t == Some(READ_POLL_INTERVAL)),
+            "{:?}",
+            probe.reads_under
+        );
+        assert_eq!(probe.read_arms.get(), 1, "armed once, not per receive");
+
+        // Inside its final second a budget clamps the slice, which is
+        // then re-armed at every receive as the clock runs down.
+        let short = Duration::from_millis(500);
+        transport.set_read_budget(Some(short));
+        assert_eq!(transport.read_message().expect("read"), msg);
+        let clamped = &transport.get_ref().reads_under[21..];
+        assert_eq!(clamped.len(), 7);
+        assert!(
+            clamped
+                .iter()
+                .all(|t| t.is_some_and(|t| !t.is_zero() && t <= short)),
+            "{clamped:?}"
+        );
+
+        // The next long budget raises the slice back to the interval.
+        transport.set_read_budget(Some(Duration::from_secs(600)));
+        assert_eq!(transport.read_message().expect("read"), msg);
+        let raised = &transport.get_ref().reads_under[28..];
+        assert!(
+            raised.iter().all(|t| *t == Some(READ_POLL_INTERVAL)),
+            "{raised:?}"
+        );
+    }
+
+    /// Every bounded write still sends under an armed timeout and every
+    /// unbounded one under none, but a bounded write no longer clears
+    /// the timeout after itself: it arms once for its send and once for
+    /// its flush, where it used to spend a third `setsockopt` resetting
+    /// the timeout that the next write re-arms anyway.
+    #[test]
+    fn a_bounded_write_leaves_its_send_timeout_armed() {
+        let msg = Message::Ping(MsgPing { nonce: 9 });
+        let mut transport =
+            WireTransport::new(TimeoutProbe::new(Vec::new(), 0), MAX_PROTOCOL_VERSION, NET);
+
+        transport.set_write_stall_policy(Some(WriteStallPolicy::dcrd()));
+        for _ in 0..3 {
+            transport.write_message(&msg).expect("write");
+        }
+        let probe = transport.get_ref();
+        let base = WriteStallPolicy::dcrd().base;
+        assert_eq!(probe.writes_under.len(), 3);
+        assert!(
+            probe
+                .writes_under
+                .iter()
+                .all(|t| t.is_some_and(|t| !t.is_zero() && t <= base)),
+            "{:?}",
+            probe.writes_under
+        );
+        assert_eq!(probe.write_arms.get(), 6, "a send and a flush each");
+
+        // Unbounded writes run with no timeout: the first clears what
+        // the bounded ones left armed, and the rest find it cleared.
+        transport.set_write_stall_policy(None);
+        for _ in 0..2 {
+            transport.write_message(&msg).expect("write");
+        }
+        let probe = transport.get_ref();
+        assert_eq!(&probe.writes_under[3..], &[None, None]);
+        assert_eq!(probe.write_arms.get(), 7, "cleared once");
     }
 
     /// The bytes a failed write put on the wire still count (dcrd's

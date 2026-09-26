@@ -84,14 +84,14 @@ impl PeerGlobals {
     }
 
     fn next_id(&self) -> i32 {
-        // dcrd's `atomic.AddInt32(&nodeCount, 1)` (`peer.go:1043`).
+        // dcrd's `atomic.AddInt32(&nodeCount, 1)` (`peer.go:2037`).
         self.node_count
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
             .wrapping_add(1)
     }
 
     /// Bypass the self-connection check (dcrd's `allowSelfConns = true`
-    /// in `peer_test.go:916`).  Tests only.
+    /// in `peer_test.go:1089`).  Tests only.
     #[doc(hidden)]
     pub fn set_allow_self_conns(&self, allow: bool) {
         self.allow_self_conns
@@ -137,7 +137,9 @@ pub struct Config {
     /// Returns the newest block details (dcrd `NewestBlock`).
     pub newest_block: Option<NewestBlockFn>,
     /// Converts a host to a network address (dcrd
-    /// `HostToNetAddress`).
+    /// `HostToNetAddress`).  Consulted only by [`Peer::new_outbound`];
+    /// dcrd consults it in `localVersionMsg` for an outbound peer, and
+    /// the daemon sets none, building the dialed address itself.
     pub host_to_net_address: Option<HostToNetAddressFn>,
     /// The proxy address in host:port form, used to hide the remote
     /// address in the local version message when the connection comes
@@ -158,8 +160,14 @@ pub struct Config {
     pub protocol_version: u32,
     /// Whether to advertise that transactions should not be relayed.
     pub disable_relay_tx: bool,
-    /// The idle timeout in nanoseconds (0 means the default);
-    /// enforced by the daemon's read loop.
+    /// The idle timeout in nanoseconds (dcrd `IdleTimeout`; 0 means
+    /// dcrd's 120-second default, which the constructors apply as
+    /// `newPeerBase` does, `peer.go:2429-2431`).  Nothing reads it back:
+    /// dcrd's `readMessage` arms its read deadline from it
+    /// (`peer.go:964`), but the port's read loop is the daemon's, which
+    /// is handed the same configured value directly
+    /// (`run_peer_connection`'s `idle_timeout`, from its
+    /// `PeerTemplate`), so setting it here alone bounds no read.
     pub idle_timeout_nanos: i64,
 }
 
@@ -487,21 +495,22 @@ impl Peer {
         Peer::new_base(cfg, true)
     }
 
-    /// A new outbound peer (dcrd `NewOutboundPeer`).
+    /// A new outbound peer (dcrd `NewOutboundPeer`), in the shape dcrd
+    /// 2.1's took: a `host:port` string, split, parsed and resolved here
+    /// (through [`Config::host_to_net_address`] when set) into the
+    /// peer's network address, failing with Go's error text.
+    ///
+    /// At the pin dcrd's constructor takes the dialed `net.Addr` and
+    /// cannot fail, and the resolution moved into `localVersionMsg`.
+    /// The daemon's dial path overwrites the address this computes with
+    /// the one it built for the dial, through
+    /// [`associate`](Peer::associate).
     pub fn new_outbound(cfg: Config, addr: &str) -> Result<Peer, String> {
         let mut p = Peer::new_base(cfg, false);
         p.addr = addr.to_string();
 
         let (host, port_str) = crate::netaddress::split_host_port(addr)?;
-        let port: u16 = if port_str.bytes().all(|c| c.is_ascii_digit()) && !port_str.is_empty() {
-            port_str.parse().map_err(|_| {
-                format!("strconv.ParseUint: parsing \"{port_str}\": value out of range")
-            })?
-        } else {
-            return Err(format!(
-                "strconv.ParseUint: parsing \"{port_str}\": invalid syntax"
-            ));
-        };
+        let port = crate::netaddress::parse_port(&port_str)?;
 
         if let Some(resolve) = p.cfg.host_to_net_address.as_mut() {
             p.na = resolve(&host, port, ServiceFlag(0))?;
@@ -818,9 +827,10 @@ impl Peer {
         Message::Pong(MsgPong { nonce: msg.nonce })
     }
 
-    /// Record a ping the daemon queued for sending (dcrd's output
-    /// handler bookkeeping for `MsgPing`), with both halves of dcrd's
-    /// `time.Now()`: the wall time and the monotonic reading.
+    /// Record a ping as the outstanding one as it is written, whoever
+    /// queued it (dcrd's `outHandler` bookkeeping for every `MsgPing` it
+    /// takes off the send queue, `peer.go:1776-1777`), with both halves
+    /// of dcrd's `time.Now()`: the wall time and the monotonic reading.
     pub fn record_sent_ping<E: PeerEnv>(&mut self, env: &mut E, msg: &MsgPing) {
         self.last_ping_nonce = msg.nonce;
         self.last_ping_time_nanos = env.now_nanos();

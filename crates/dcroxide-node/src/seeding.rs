@@ -9,6 +9,7 @@
 //! every seeder fails and the manager still needs addresses, the round
 //! is retried with dcrd's one-to-ten-second backoff until shutdown.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -352,7 +353,8 @@ pub struct SeederBoot {
 impl SeederBoot {
     /// Stop the bootstrap; an in-flight seeder round is abandoned
     /// rather than waited out (its request threads end at the
-    /// transport timeout at most).
+    /// transport timeout at most, and a seeder host lookup runs on its
+    /// seeder's thread, never on the one this joins).
     pub fn shutdown(mut self) {
         self.stop_thread();
     }
@@ -411,35 +413,50 @@ pub fn start_seeding_with_lookup<T, F, L>(
 where
     T: SeederTransport,
     F: Fn() -> T + Send + Sync + 'static,
-    L: Fn(&str) -> Result<Vec<std::net::IpAddr>, String> + Send + 'static,
+    L: Fn(&str) -> Result<Vec<std::net::IpAddr>, String> + Send + Sync + 'static,
 {
     let (stop, stopped) = mpsc::channel::<()>();
     let thread = thread::spawn(move || {
         let filters = HttpsSeederFilters::default().services(required_services);
         let factory = Arc::new(transport_factory);
+        let lookup = Arc::new(lookup);
+        // Raised as the loop abandons a round on a stop, so a seeder that
+        // answers afterwards adds nothing: dcrd's canceled daemon context
+        // fails its request instead.
+        let abandoned = Arc::new(AtomicBool::new(false));
         // dcrd retries the whole round with a growing backoff while
         // every seeder fails and the manager still needs addresses.
         let mut backoff = Duration::from_secs(1);
         loop {
-            // Each seeder reports its result over a channel rather than
-            // being joined, so a shutdown does not wait out an in-flight
-            // request (dcrd cancels the requests through the daemon
-            // context; the port cannot abort its transports, so the
-            // round threads are abandoned instead — their requests run
-            // to the transport timeout at most and die with the
-            // process).
+            // Each seeder runs dcrd's whole `seed` goroutine on its own
+            // thread, the source lookup and the addition included, and
+            // reports its outcome over a channel rather than being
+            // joined, so a shutdown waits out neither an in-flight
+            // request nor a lookup (dcrd cancels the requests through
+            // the daemon context and never waits for `querySeeders`; the
+            // port cannot abort its transports, so the round threads are
+            // abandoned instead — their requests run to the transport
+            // timeout at most and die with the process).
             let mut err_count = 0usize;
-            let (results, resulted) = mpsc::channel();
+            let (results, resulted) = mpsc::channel::<Result<(), ()>>();
             for seeder in &seeders {
                 let seeder = seeder.clone();
                 let filters = filters.clone();
                 let factory = Arc::clone(&factory);
                 let results = results.clone();
+                let addr_manager = Arc::clone(&addr_manager);
+                let lookup = Arc::clone(&lookup);
+                let abandoned = Arc::clone(&abandoned);
                 thread::spawn(move || {
                     let mut transport = factory();
-                    let mut env = SystemSeedEnv;
-                    let outcome = seed_addrs(&seeder, &mut transport, &mut env, &filters)
-                        .map(|addrs| (seeder, addrs));
+                    let outcome = seed(
+                        &seeder,
+                        &mut transport,
+                        &filters,
+                        &addr_manager,
+                        &*lookup,
+                        &abandoned,
+                    );
                     let _ = results.send(outcome);
                 });
             }
@@ -449,17 +466,14 @@ where
                 // A stop request or a dropped stop sender abandons the
                 // round immediately.
                 if let Ok(()) | Err(mpsc::TryRecvError::Disconnected) = stopped.try_recv() {
+                    abandoned.store(true, Ordering::SeqCst);
                     return;
                 }
                 match resulted.recv_timeout(Duration::from_millis(200)) {
-                    Ok(Ok((seeder, addrs))) => {
+                    Ok(Ok(())) => {
                         outstanding = outstanding.saturating_sub(1);
-                        if addrs.is_empty() {
-                            continue;
-                        }
-                        add_seeded(&addr_manager, &seeder, addrs, &lookup);
                     }
-                    Ok(Err(_)) => {
+                    Ok(Err(())) => {
                         outstanding = outstanding.saturating_sub(1);
                         err_count = err_count.saturating_add(1);
                     }
@@ -496,6 +510,57 @@ where
         thread: Some(thread),
     }
 }
+
+/// One seeder's query, on that seeder's own thread (dcrd
+/// `querySeeders`'s `seed` goroutine): the request, dcrd's line for a
+/// failure, and, when the seeder returned addresses, the source lookup
+/// and the addition.  The lookup is a Tor RESOLVE of up to a minute
+/// under `--proxy`, so it stays off the retry loop, which answers a
+/// stop at once.  The outcome counts toward the round's failures.
+fn seed<T: SeederTransport>(
+    seeder: &str,
+    transport: &mut T,
+    filters: &HttpsSeederFilters,
+    addr_manager: &Arc<Mutex<AddrManager>>,
+    lookup: &dyn Fn(&str) -> Result<Vec<std::net::IpAddr>, String>,
+    abandoned: &AtomicBool,
+) -> Result<(), ()> {
+    let addrs = match seed_addrs(seeder, transport, &mut SystemSeedEnv, filters) {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            log_seeder_error(seeder, &e);
+            return Err(());
+        }
+    };
+
+    // Nothing to do if the seeder didn't return any addresses, or once
+    // the round has been abandoned.
+    if addrs.is_empty() || abandoned.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    add_seeded(addr_manager, seeder, addrs, lookup);
+    Ok(())
+}
+
+/// dcrd `querySeeders`'s line for a seeder whose query failed
+/// (`server.go:3368`), at info level under SRVR.  `seed_addrs` has
+/// `SeedAddrs`'s own texts for a bad status and an unparsable body; a
+/// transport failure carries the port's HTTP client's text where dcrd's
+/// carries Go's `http.Client`'s.
+fn log_seeder_error(seeder: &str, err: &str) {
+    let line = format!("seeder '{seeder}' error: {err}");
+    #[cfg(test)]
+    SEEDER_ERROR_LINES
+        .lock()
+        .expect("seeder error lines poisoned")
+        .push(line.clone());
+    crate::logging::info("SRVR", &line);
+}
+
+/// The [`log_seeder_error`] lines, which the tests read: the log writes
+/// straight to stdout, and the seeder threads are the test's own.
+#[cfg(test)]
+static SEEDER_ERROR_LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Add a seeder's discovered addresses with the seeder's resolved IP
 /// as their source, falling back to the first returned address when
@@ -668,6 +733,116 @@ mod tests {
             "the seeder transport must dial directly, as dcrd's does"
         );
         println!("seeder-proxy=none;");
+    }
+
+    /// A transport answering every request with the scripted status and
+    /// body.
+    struct Scripted {
+        status: u32,
+        body: Vec<u8>,
+    }
+
+    impl SeederTransport for Scripted {
+        fn get(&mut self, _url: &str) -> Result<(u32, Vec<u8>), String> {
+            Ok((self.status, self.body.clone()))
+        }
+    }
+
+    /// dcrd's `querySeeders` logs every failed seeder at info level
+    /// under SRVR, naming it and the error (`server.go:3366-3370`).  The
+    /// port counted the failure and printed nothing, so a node that could
+    /// not reach its seeders retried in silence.
+    #[test]
+    fn a_failed_seeder_logs_dcrds_line() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let addr_manager = Arc::new(Mutex::new(AddrManager::new(dir.path())));
+        let seeder = "seed-503.dcroxide.invalid";
+        let boot = start_seeding_with_lookup(
+            vec![seeder.to_string()],
+            addr_manager,
+            1,
+            || Scripted {
+                status: 503,
+                body: Vec::new(),
+            },
+            |_: &str| Err("no lookup in tests".to_string()),
+        );
+        let want = format!(
+            "seeder '{seeder}' error: seeder {seeder} returned invalid status code '503': \
+             Service Unavailable"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let logged = loop {
+            let logged = SEEDER_ERROR_LINES
+                .lock()
+                .expect("seeder error lines")
+                .contains(&want);
+            if logged || Instant::now() >= deadline {
+                break logged;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        boot.shutdown();
+        assert!(logged, "missing {want:?}");
+    }
+
+    /// dcrd resolves a seeder's host for the source address inside that
+    /// seeder's goroutine (`server.go:3381-3386`) and never waits for
+    /// `querySeeders`.  The port ran the lookup on the retry loop's own
+    /// thread, which the shutdown joins, so under `--proxy` a stalled Tor
+    /// RESOLVE held the daemon's shutdown for up to a minute per seeder.
+    #[test]
+    fn a_stalled_seeder_lookup_does_not_hold_the_shutdown() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let addr_manager = Arc::new(Mutex::new(AddrManager::new(dir.path())));
+        let body = br#"{"host":"8.8.8.5:19108","services":1,"pver":6}"#.to_vec();
+        let (asked, asked_rx) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let boot = start_seeding_with_lookup(
+            vec!["seed-stall.dcroxide.invalid".to_string()],
+            Arc::clone(&addr_manager),
+            1,
+            move || Scripted {
+                status: 200,
+                body: body.clone(),
+            },
+            move |_: &str| {
+                let _ = asked.send(());
+                let _ = released
+                    .lock()
+                    .expect("release")
+                    .recv_timeout(Duration::from_secs(10));
+                Ok(vec!["192.0.2.44".parse().expect("ip")])
+            },
+        );
+        asked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the seeder's lookup starts");
+
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            let started = Instant::now();
+            boot.shutdown();
+            let _ = done.send(started.elapsed());
+        });
+        let elapsed = finished.recv_timeout(Duration::from_secs(3));
+        let _ = release.send(());
+        let elapsed = elapsed.expect("the shutdown must not wait on the seeder's lookup");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+
+        // The seeder's thread still finishes its work once the lookup
+        // answers, as dcrd's goroutine does.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while addr_manager
+            .lock()
+            .expect("addrmgr")
+            .known_address("8.8.8.5:19108")
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "the seeded address never landed");
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// A proxied seeder request is bounded as a whole by its deadline,
