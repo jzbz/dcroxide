@@ -17,6 +17,7 @@ use dcroxide_wire::{MsgBlock, MsgTx, OutPoint, TxIn};
 
 use crate::agendas::FullChainView;
 use crate::checkedmath::{AddSigned, AddUnsigned};
+use crate::gotime::go_time_utc_string;
 use crate::ruleerror::{RuleError, RuleErrorKind, rule_error};
 
 /// The minimum length a coinbase (and stakebase) signature script may
@@ -503,7 +504,7 @@ pub fn check_block_header_sanity(
             RuleErrorKind::TimeTooNew,
             format!(
                 "block timestamp of {} is too far in the future",
-                go_time_string(i64::from(header.timestamp))
+                go_time_utc_string(i64::from(header.timestamp))
             ),
         ));
     }
@@ -1199,8 +1200,8 @@ pub fn check_block_header_positional(
                 RuleErrorKind::TimeTooOld,
                 format!(
                     "block timestamp of {} is not after expected {}",
-                    go_time_string(i64::from(header.timestamp)),
-                    go_time_string(median_time)
+                    go_time_utc_string(i64::from(header.timestamp)),
+                    go_time_utc_string(median_time)
                 ),
             ));
         }
@@ -1227,8 +1228,8 @@ pub fn check_block_header_positional(
                         RuleErrorKind::TimeTooOld,
                         format!(
                             "testnet block timestamp of {} is before required {}",
-                            go_time_string(i64::from(header.timestamp)),
-                            go_time_string(min_time)
+                            go_time_utc_string(i64::from(header.timestamp)),
+                            go_time_utc_string(min_time)
                         ),
                     ));
                 }
@@ -2186,7 +2187,12 @@ pub fn calc_ticket_return_amounts(
         let mut return_amt_big = BigInt::from(extract_ticket_commit_amount(&ticket_out.pk_script));
         return_amt_big *= &total_output_amt_big;
         return_amt_big <<= 32u32;
-        return_amt_big /= &contribution_sum_big;
+        // Go's `Div` is Euclidean, not num-bigint's truncating `/`, and
+        // `>>` floors like Go's `Rsh`.  Chain-valid tickets keep both
+        // operands non-negative, where the two division rules agree,
+        // but the function is public, so signed operands follow dcrd
+        // too, as the stake crate's copy of this formula does.
+        return_amt_big = crate::difficulty::go_big_div(&return_amt_big, &contribution_sum_big);
         return_amt_big >>= 32u32;
         *amount = crate::difficulty::lossy_i64(&return_amt_big);
         total_return_amount = total_return_amount.wrapping_add(*amount);
@@ -2202,11 +2208,13 @@ pub fn calc_ticket_return_amounts(
     // select a uniformly pseudorandom output index to receive each
     // remaining atom.
     if is_auto_revocations_enabled && total_return_amount < total_output_amt {
-        let remainder = total_output_amt - total_return_amount;
+        // Go's int64 arithmetic wraps; a wrapped (negative) remainder
+        // distributes nothing, as dcrd's loop does.
+        let remainder = total_output_amt.wrapping_sub(total_return_amount);
         let mut prng = dcroxide_stake::Hash256Prng::new(prev_header_bytes);
         for _ in 0..remainder {
-            let return_index = prng.uniform_random(num_return_amounts as u32);
-            return_amounts[return_index as usize] += 1;
+            let return_index = prng.uniform_random(num_return_amounts as u32) as usize;
+            return_amounts[return_index] = return_amounts[return_index].wrapping_add(1);
         }
     }
 
@@ -2867,31 +2875,6 @@ fn hex_string(bytes: &[u8]) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
-}
-
-/// Render a unix timestamp the way Go's `%v` prints a whole-second
-/// `time.Time` (`2006-01-02 15:04:05 +0000 UTC`), which is how dcrd's
-/// rule errors print header timestamps and median times.  dcrd's
-/// values come from `time.Unix` and so print in the host's local
-/// zone; the port pins UTC, as its block import progress log does,
-/// so the text does not depend on the host zone database.
-fn go_time_string(unix: i64) -> String {
-    // Civil-from-unix over the proleptic Gregorian calendar, per Howard
-    // Hinnant's algorithm (the same math Go's time package performs).
-    let days = unix.div_euclid(86_400);
-    let secs = unix.rem_euclid(86_400);
-    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02} +0000 UTC")
 }
 
 /// Render hashes the way Go's `%s` prints a `[]chainhash.Hash`:
@@ -4820,7 +4803,11 @@ fn validate_item(
 /// thousand threads per ten seconds. All three measured arms were scope
 /// threads; a long-lived pool of `cores` workers (what ADR-0005
 /// proposed) would keep the full width without the per-call spawns, and
-/// has not been measured.
+/// has not been measured.  The spawns also land on the relay path
+/// through [`validate_transaction_scripts`], which checks a
+/// transaction's first input inline before calling here, so a garbage
+/// first signature is rejected without them; a transaction whose first
+/// input is valid still pays them until the pool lands.
 ///
 /// Small batches still run inline. Which failure surfaces when several
 /// items are invalid remains scheduling-dependent, exactly like dcrd's
@@ -4994,6 +4981,19 @@ pub fn check_block_scripts(
     validate_items(&items, script_flags, sig_cache)
 }
 
+/// A UTXO view as the previous-script source a version 2 filter build
+/// reads (dcrd hands its `UtxoViewpoint` to `blockcf2.Regular`, which
+/// looks each script up with `LookupEntry`), for `check_connect_block`
+/// and the chain's `load_or_create_filter`.
+pub(crate) struct ViewScripts<'a>(pub(crate) &'a crate::utxoview::UtxoView);
+
+impl dcroxide_gcs::blockcf2::PrevScripter for ViewScripts<'_> {
+    fn prev_script(&self, out: &OutPoint) -> Option<(u16, &[u8])> {
+        let entry = self.0.lookup_entry(out)?;
+        Some((entry.script_version(), entry.pk_script()))
+    }
+}
+
 /// Perform the final battery of checks needed to connect the block to
 /// the main chain, connecting the view and producing the spend
 /// journal and header commitment filter (dcrd `checkConnectBlock`).
@@ -5022,11 +5022,6 @@ pub fn check_block_scripts(
 /// and decoding it there with this block's treasury flag would be
 /// wrong at the treasury activation boundary, where the parent's flag
 /// differs from the child's.
-///
-/// Returns the version 2 filter it built, the one the header
-/// commitment was checked against, so the caller stores it rather than
-/// building it again (dcrd hands it back in the `hdrCommitments`
-/// out-param).
 #[allow(clippy::too_many_arguments)]
 pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     view_chain: &impl FullChainView,
@@ -5249,6 +5244,9 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     )?;
 
     if ln_features_active {
+        // Every input is spent in the view by now; the lookup still
+        // reports its height, as dcrd's `utxo == nil` check does (see
+        // `calc_sequence_lock`).
         for tx in &block.transactions[1..] {
             let lock = crate::sequencelock::calc_sequence_lock(
                 view_chain,
@@ -5273,25 +5271,11 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     // earlier transactions in this block), so it is built here once
     // and returned for the caller to store rather than rebuilt there
     // (dcrd sets it into the caller's `hdrCommitments`).
-    struct ViewScripts<'a>(&'a crate::utxoview::UtxoView);
-    impl dcroxide_gcs::blockcf2::PrevScripter for ViewScripts<'_> {
-        fn prev_script(&self, out: &dcroxide_wire::OutPoint) -> Option<(u16, &[u8])> {
-            let entry = self.0.lookup_entry(out)?;
-            Some((entry.script_version(), entry.pk_script()))
-        }
-    }
-    // dcrd returns `err.Error()`: for a missing script that is
+    // dcrd returns `ruleError(ErrMissingTxOut, err.Error())`
+    // (`validate.go:4390-4393`): for a missing script that is
     // blockcf2's `PrevScriptError` text, which prints the tree too.
-    let filter = dcroxide_gcs::blockcf2::regular(block, &ViewScripts(view)).map_err(|e| {
-        let description = match e {
-            dcroxide_gcs::blockcf2::RegularError::PrevScript(e) => format!(
-                "unable to find output script {}:{} referenced by {}:{}",
-                e.prev_out, e.prev_out.tree, e.tx_hash, e.tx_in_idx
-            ),
-            dcroxide_gcs::blockcf2::RegularError::Gcs(e) => format!("{e}"),
-        };
-        rule_error(RuleErrorKind::MissingTxOut, description)
-    })?;
+    let filter = dcroxide_gcs::blockcf2::regular(block, &ViewScripts(view))
+        .map_err(|e| rule_error(RuleErrorKind::MissingTxOut, format!("{e}")))?;
     let filter_hash = filter.hash();
 
     let hdr_commitments_active =
@@ -5393,8 +5377,21 @@ pub fn validate_transaction_scripts<'a>(
         });
     }
 
-    // Validate all of the inputs.
-    validate_items(&items, script_flags, sig_cache)
+    // Validate all of the inputs.  The first runs on the calling thread
+    // before any worker is spawned: `validate_items` still creates its
+    // workers per call (the persistent pool is the open arm in its
+    // doc), and on the relay path that would let a transaction whose
+    // first signature is garbage buy up to one thread per core before
+    // it is rejected.  The verdict is unchanged: dcrd's `txValidator`
+    // returns whichever failing input comes off its result channel
+    // first (scriptval.go:141-163), so a failing first input is an
+    // answer dcrd can give, and every input is still verified exactly
+    // once.  The block path keeps its measured fan-out.
+    let Some((first, rest)) = items.split_first() else {
+        return Ok(());
+    };
+    validate_item(first, script_flags, sig_cache)?;
+    validate_items(rest, script_flags, sig_cache)
 }
 
 #[cfg(test)]
@@ -5460,17 +5457,6 @@ mod tests {
     }
 
     use crate::UtxoEntry;
-
-    #[test]
-    fn go_time_string_matches_go_time_format() {
-        assert_eq!(go_time_string(0), "1970-01-01 00:00:00 +0000 UTC");
-        assert_eq!(go_time_string(1790172001), "2026-09-23 14:00:01 +0000 UTC");
-        assert_eq!(go_time_string(1454954400), "2016-02-08 18:00:00 +0000 UTC");
-        assert_eq!(
-            go_time_string(i64::from(u32::MAX)),
-            "2106-02-07 06:28:15 +0000 UTC"
-        );
-    }
 
     #[test]
     fn go_hash_slice_string_matches_go_slice_format() {
@@ -6017,6 +6003,97 @@ mod tests {
                 .starts_with(&format!("failed to validate input {}:39 ", tx.tx_hash())),
             "{}",
             err.description
+        );
+    }
+
+    /// A relayed transaction whose first input fails is rejected on the
+    /// calling thread, before `validate_items` spawns a worker per core
+    /// for the rest (review finding RG02#2); the error is the first
+    /// input's, one dcrd's `txValidator` can return too.
+    #[test]
+    fn a_failing_first_input_is_rejected_before_any_worker_spawns() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let tx = spender(40);
+        let good = entry(vec![dcroxide_txscript::OP_TRUE], TxType::Regular, None);
+        let bad = entry(vec![dcroxide_txscript::OP_0], TxType::Regular, None);
+        let bad_op = tx.tx_in[0].previous_out_point;
+        let lookup = |op: &OutPoint| Some(if *op == bad_op { &bad } else { &good });
+
+        const BUDGET: usize = 3;
+        WORKER_SPAWN_BUDGET.set(Some(BUDGET));
+        let err = validate_transaction_scripts(
+            &tx,
+            lookup,
+            dcroxide_txscript::ScriptFlags(0),
+            None,
+            false,
+        );
+        let left = WORKER_SPAWN_BUDGET.get();
+        WORKER_SPAWN_BUDGET.set(None);
+
+        let err = err.expect_err("the first input fails");
+        assert_eq!(err.kind, RuleErrorKind::ScriptValidation);
+        assert!(
+            err.description
+                .starts_with(&format!("failed to validate input {}:0 ", tx.tx_hash())),
+            "{}",
+            err.description
+        );
+        if cores > 1 {
+            assert_eq!(left, Some(BUDGET), "no worker was spawned");
+        }
+    }
+
+    /// Ticket outputs for `calc_ticket_return_amounts`: a submission
+    /// placeholder, then a commitment (with a change placeholder after
+    /// it) per contribution.
+    fn ticket_outs(contribs: &[u64]) -> Vec<dcroxide_stake::MinimalOutput> {
+        let out = |pk_script| dcroxide_stake::MinimalOutput {
+            pk_script,
+            value: 0,
+            version: 0,
+        };
+        let mut outs = vec![out(Vec::new())];
+        for &amount in contribs {
+            let mut commit = vec![dcroxide_txscript::OP_RETURN, 0x1e];
+            commit.extend_from_slice(&[0u8; 20]);
+            commit.extend_from_slice(&amount.to_le_bytes());
+            commit.extend_from_slice(&[0u8; 2]);
+            outs.push(out(commit));
+            outs.push(out(Vec::new()));
+        }
+        outs
+    }
+
+    /// dcrd's `calcTicketReturnAmounts` divides with Go's Euclidean
+    /// `big.Int.Div` and wraps its int64 remainder (review finding
+    /// RG03#3).  The expected amounts are what Go's `math/big` computes
+    /// for the same operands; they match the stake crate's copy.
+    #[test]
+    fn ticket_return_amounts_follow_go_signed_arithmetic() {
+        // A negative total whose first quotient truncates to exactly
+        // -2^32: Euclidean division steps it to -2^32 - 1, which the
+        // flooring shift turns into -2 where truncation gives -1.
+        let price = -((1i64 << 32) + 2);
+        let outs = ticket_outs(&[1, 1 << 32]);
+        let want = [-2, -4_294_967_297];
+        assert_eq!(
+            calc_ticket_return_amounts(&outs, price, 0, &[], true, false),
+            want
+        );
+        assert_eq!(
+            dcroxide_stake::calculate_rewards(&[1, 1 << 32], price, 0),
+            want
+        );
+
+        // The contribution sum wraps to i64::MIN and so does the
+        // returns' total; dcrd's remainder `MaxInt64 - MinInt64` wraps to
+        // -1, so its loop hands out nothing (the port's plain
+        // subtraction overflowed).
+        let outs = ticket_outs(&[1 << 62, 1 << 62]);
+        assert_eq!(
+            calc_ticket_return_amounts(&outs, i64::MAX, 0, &[0u8; 180], false, true),
+            [-(1i64 << 62), -(1i64 << 62)]
         );
     }
 }

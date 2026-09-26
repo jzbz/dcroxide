@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: ISC
 //! Differential tests: our `Hash` string parsing/formatting vs. dcrd's
 //! `chaincfg/chainhash`, live — including the short-string zero-padding
-//! quirk and error classification.
+//! quirk and the error texts.
 
-use dcroxide_chainhash::{Hash, HashError};
+use dcroxide_chainhash::Hash;
 use dcroxide_testutil::{SplitMix64, hex, oracle_or_skip};
 
 /// Assert that our parse verdict matches the oracle's for one input string.
@@ -16,15 +16,13 @@ fn check_parse(oracle: &mut dcroxide_testutil::Oracle, input: &str) {
             assert_eq!(hex(hash.as_bytes()), want, "hash bytes for input {input:?}");
         }
         (Err(err), Some(oracle_err)) => {
-            // Error *classification* must agree (exact message text is not
-            // chased; dcrd's texts come from Go's errors).
-            let want_marker = match err {
-                HashError::StrSize => "max hash string length",
-                HashError::InvalidHexByte(_) => "invalid byte",
-            };
-            assert!(
-                oracle_err.contains(want_marker),
-                "error kind mismatch for {input:?}: ours {err:?}, oracle {oracle_err:?}"
+            // The whole text must agree: it is what the `--assumevalid`
+            // startup error prints, and for an invalid byte it also pins
+            // which byte Go's `hex.Decode` reports first.
+            assert_eq!(
+                err.to_string(),
+                oracle_err,
+                "error mismatch for {input:?}: ours {err:?}"
             );
         }
         (ours, oracle_err) => {
@@ -57,6 +55,13 @@ fn hash_from_str_matches_dcrd_oracle() {
         "g",
         "0g",
         "g0",
+        "xyz",
+        "'",
+        "0\\",
+        "\u{1}0",
+        "12\u{7f}",
+        "\u{e9}",
+        "0 ",
     ] {
         check_parse(&mut oracle, input);
     }

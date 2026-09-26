@@ -319,37 +319,16 @@ impl ProgressLog {
             self.received_log_tx,
             tx_str,
             self.last_height,
-            go_time_utc_string(self.last_block_time_unix),
+            // dcrd renders the block time in the machine's local zone
+            // (the wire decoder builds `time.Unix` values); the port
+            // pins UTC, as the chain's rule errors do.
+            dcroxide_blockchain::gotime::go_time_utc_string(self.last_block_time_unix),
         ));
 
         self.received_log_blocks = 0;
         self.received_log_tx = 0;
         self.last_log_time = now;
     }
-}
-
-/// Render a unix timestamp the way Go's default `time.Time` format
-/// does for a whole-second time (`2006-01-02 15:04:05 +0000 UTC`).
-/// dcrd renders the block time in the machine's local zone (the wire
-/// decoder builds `time.Unix` values); the port pins UTC so the
-/// output does not depend on the host zone database.
-fn go_time_utc_string(unix: i64) -> String {
-    // Civil-from-unix over the proleptic Gregorian calendar, per Howard
-    // Hinnant's algorithm (the same math Go's time package performs).
-    let days = unix.div_euclid(86_400);
-    let secs = unix.rem_euclid(86_400);
-    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02} +0000 UTC")
 }
 
 /// Read one block record from the bootstrap stream (dcrd `readBlock`):
@@ -643,21 +622,6 @@ mod tests {
         assert_eq!(
             read_block_record(&mut whole.as_slice(), net),
             Ok(Some(vec![9, 8, 7]))
-        );
-    }
-
-    /// The Go default time rendering for whole-second UTC times.
-    #[test]
-    fn go_time_rendering() {
-        assert_eq!(go_time_utc_string(0), "1970-01-01 00:00:00 +0000 UTC");
-        // dcrd's mainnet genesis timestamp.
-        assert_eq!(
-            go_time_utc_string(1_454_954_400),
-            "2016-02-08 18:00:00 +0000 UTC"
-        );
-        assert_eq!(
-            go_time_utc_string(1_231_006_505),
-            "2009-01-03 18:15:05 +0000 UTC"
         );
     }
 }

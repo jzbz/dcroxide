@@ -50,13 +50,26 @@ pub enum HashError {
 }
 
 impl fmt::Display for HashError {
+    /// dcrd's texts: `ErrHashStrSize`, and Go's `hex.InvalidByteError`
+    /// (`encoding/hex: invalid byte: %#U`), which `chainhash.Decode`
+    /// returns unwrapped.  The `%#U` verb writes `U+%04X` and then the
+    /// character between single quotes, raw and unescaped, only when
+    /// `strconv.IsPrint` accepts it; over the Latin-1 range a byte
+    /// covers, that is space through `~` and U+00A1 through U+00FF
+    /// except the soft hyphen U+00AD.  Rust's char `Debug` is no
+    /// stand-in: it escapes `'` and `\` and quotes the control
+    /// characters Go leaves bare.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HashError::StrSize => {
                 write!(f, "max hash string length is {MAX_HASH_STRING_SIZE} bytes")
             }
             HashError::InvalidHexByte(b) => {
-                write!(f, "invalid byte: {:#04x} {:?}", b, *b as char)
+                write!(f, "encoding/hex: invalid byte: U+{b:04X}")?;
+                if (0x20..=0x7e).contains(b) || (*b >= 0xa1 && *b != 0xad) {
+                    write!(f, " '{}'", char::from(*b))?;
+                }
+                Ok(())
             }
         }
     }
@@ -299,6 +312,39 @@ mod tests {
         for (i, (input, want)) in cases.iter().enumerate() {
             assert_eq!(&input.parse::<Hash>(), want, "case {i}: {input:?}");
         }
+    }
+
+    /// The error texts are dcrd's (review finding C2-p#2): the
+    /// `--assumevalid` startup error prints them as they are.  The
+    /// expected strings are Go's `hex.InvalidByteError(b).Error()`.
+    #[test]
+    fn hash_error_text_is_gos() {
+        assert_eq!(
+            HashError::StrSize.to_string(),
+            "max hash string length is 64 bytes"
+        );
+        for (b, want) in [
+            (b'x', "encoding/hex: invalid byte: U+0078 'x'"),
+            (b' ', "encoding/hex: invalid byte: U+0020 ' '"),
+            (b'\'', "encoding/hex: invalid byte: U+0027 '''"),
+            (b'\\', "encoding/hex: invalid byte: U+005C '\\'"),
+            (b'~', "encoding/hex: invalid byte: U+007E '~'"),
+            (0x00, "encoding/hex: invalid byte: U+0000"),
+            (0x1f, "encoding/hex: invalid byte: U+001F"),
+            (0x7f, "encoding/hex: invalid byte: U+007F"),
+            (0x80, "encoding/hex: invalid byte: U+0080"),
+            (0xa0, "encoding/hex: invalid byte: U+00A0"),
+            (0xa1, "encoding/hex: invalid byte: U+00A1 '\u{a1}'"),
+            (0xad, "encoding/hex: invalid byte: U+00AD"),
+            (0xc3, "encoding/hex: invalid byte: U+00C3 '\u{c3}'"),
+            (0xff, "encoding/hex: invalid byte: U+00FF '\u{ff}'"),
+        ] {
+            assert_eq!(HashError::InvalidHexByte(b).to_string(), want, "{b:#04x}");
+        }
+        assert_eq!(
+            "xyz".parse::<Hash>().unwrap_err().to_string(),
+            "encoding/hex: invalid byte: U+0078 'x'"
+        );
     }
 
     /// The table encoder renders exactly what formatting each byte with

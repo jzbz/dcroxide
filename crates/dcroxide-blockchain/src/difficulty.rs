@@ -1198,6 +1198,7 @@ pub fn estimate_next_stake_difficulty_v2(
 /// non-negative.  `merge_difficulty` divides shifted positive
 /// difficulties, the stake algorithms clamp their pool-size skew to at
 /// least 1 before dividing, and the stake EMA sums those clamped terms.
+/// `validate::calc_ticket_return_amounts` divides with this too.
 pub(crate) fn go_big_div(x: &BigInt, y: &BigInt) -> BigInt {
     let q = x / y;
     let r = x % y;

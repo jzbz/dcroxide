@@ -503,14 +503,27 @@ impl Estimator {
     /// and the hashes of both transaction trees (dcrd `ProcessBlock`,
     /// which only consumes the height and transaction hashes of the
     /// passed block).
-    pub fn process_block(&mut self, block_height: i64, tx_hashes: &[Hash], stx_hashes: &[Hash]) {
+    ///
+    /// A block at or below the best height already processed is skipped
+    /// and returned as a [`StaleBlock`]: dcrd logs its warning there
+    /// (`estimator.go:883-889`), and this crate has no logger, so the
+    /// caller logs it under `FEES`.
+    pub fn process_block(
+        &mut self,
+        block_height: i64,
+        tx_hashes: &[Hash],
+        stx_hashes: &[Hash],
+    ) -> Option<StaleBlock> {
         if self.best_height < 0 {
-            return;
+            return None;
         }
 
         if block_height <= self.best_height {
             // Reorgs are not explicitly tracked right now.
-            return;
+            return Some(StaleBlock {
+                height: block_height,
+                best_height: self.best_height,
+            });
         }
 
         self.update_moving_averages(block_height);
@@ -521,6 +534,29 @@ impl Estimator {
         for stx_hash in stx_hashes {
             self.process_mined_transaction(block_height, stx_hash);
         }
+        None
+    }
+}
+
+/// A block [`Estimator::process_block`] skipped because it is not above
+/// the best height the estimator has processed, as the first new-chain
+/// blocks of a reorg are.  `Display` renders the warning dcrd's
+/// `ProcessBlock` logs for it (`estimator.go:885-887`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaleBlock {
+    /// The skipped block's height.
+    pub height: i64,
+    /// The estimator's best height when the block arrived.
+    pub best_height: i64,
+}
+
+impl core::fmt::Display for StaleBlock {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "Trying to process mined transactions at block {} when previous best block was at height {}",
+            self.height, self.best_height
+        )
     }
 }
 

@@ -5,7 +5,6 @@
 use alloc::vec::Vec;
 
 /// Writes bits MSB-first into a growing byte vector (dcrd `bitWriter`).
-#[derive(Default)]
 pub(crate) struct BitWriter {
     pub(crate) bytes: Vec<u8>,
     /// Mask of the next bit to write in the final byte; zero when a new
@@ -14,6 +13,14 @@ pub(crate) struct BitWriter {
 }
 
 impl BitWriter {
+    /// A writer that appends its bitstream after `bytes`, which it never
+    /// modifies: the first bit written starts a new byte.  The filter
+    /// build passes its entry count serialization, sized for the whole
+    /// filter, so the bitstream needs no second buffer.
+    pub(crate) fn after(bytes: Vec<u8>) -> BitWriter {
+        BitWriter { bytes, next: 0 }
+    }
+
     /// Append a one bit (dcrd `writeOne`).
     pub(crate) fn write_one(&mut self) {
         if self.next == 0 {

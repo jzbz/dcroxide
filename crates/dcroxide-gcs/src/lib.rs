@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: ISC
-//! Golomb-coded set (GCS) filters, ported from dcrd's `gcs/v4` at
-//! master `452c1a6c` (the dcrd 2.2 campaign parity target): the version 1 and
-//! version 2 filter formats, matching, serialization, and the DCP0005
-//! version 2 block committed filters in [`blockcf2`].
+//! Golomb-coded set (GCS) filters, ported from dcrd's `gcs/v4` at the
+//! parity pin, master `b9634e01` (the package is unchanged since the
+//! port's original target, `452c1a6c`): the version 1 and version 2
+//! filter formats, matching, serialization, and the DCP0005 version 2
+//! block committed filters in [`blockcf2`].
 //!
 //! SipHash-2-4 comes from the `siphasher` crate, matching the
 //! dchest/siphash implementation dcrd links.
@@ -212,8 +213,28 @@ impl Filter {
             return Ok(f);
         }
 
+        // The entry count goes ahead of the bitstream: big-endian uint32
+        // for version 1, varint for version 2.  dcrd codes the deltas
+        // into a buffer sized by its hint and then copies them behind
+        // the count; the port writes the count first and codes straight
+        // after it, into one buffer with room for both.  dcrd's hint:
+        // every entry takes B remainder bits and a unary quotient that
+        // is 1 on average (2 bits) and 2 (3 bits) next most often, so
+        // (NB + 2N/2 + 3N/2) / 8 bytes, with Go's `3*numEntries>>1`
+        // parsing as `(3*numEntries)>>1`.
+        let size_hint = (num_entries * u64::from(b) + num_entries + ((3 * num_entries) >> 1)) >> 3;
+        let n_size = match version {
+            1 => 4,
+            _ => var_int_serialize_size(u64::from(f.n)),
+        };
+        let mut ndata = Vec::with_capacity(n_size + size_hint as usize);
+        match version {
+            1 => ndata.extend_from_slice(&f.n.to_be_bytes()),
+            _ => write_var_int(&mut ndata, u64::from(f.n)),
+        }
+
         // Golomb/Rice-code the sorted deltas.
-        let mut w = BitWriter::default();
+        let mut w = BitWriter::after(ndata);
         for (i, v) in values.iter().enumerate() {
             let prev = if i == 0 { 0 } else { values[i - 1] };
             let delta = v - prev;
@@ -227,25 +248,8 @@ impl Filter {
             w.write_n_bits(remainder, u32::from(f.b));
         }
 
-        // Serialize the entry count ahead of the bitstream: big-endian
-        // uint32 for version 1, varint for version 2.
-        match version {
-            1 => {
-                let mut ndata = Vec::with_capacity(4 + w.bytes.len());
-                ndata.extend_from_slice(&f.n.to_be_bytes());
-                ndata.extend_from_slice(&w.bytes);
-                f.filter_n_data = ndata;
-                f.data_offset = 4;
-            }
-            _ => {
-                let mut ndata = Vec::new();
-                write_var_int(&mut ndata, u64::from(f.n));
-                let n_size = ndata.len();
-                ndata.extend_from_slice(&w.bytes);
-                f.filter_n_data = ndata;
-                f.data_offset = n_size;
-            }
-        }
+        f.filter_n_data = w.bytes;
+        f.data_offset = n_size;
         Ok(f)
     }
 

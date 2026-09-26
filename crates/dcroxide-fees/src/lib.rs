@@ -31,6 +31,6 @@ mod estimator;
 
 pub use estimator::{
     DEFAULT_FEE_RATE_STEP, DEFAULT_MAX_BUCKET_FEE_MULTIPLIER, DEFAULT_MAX_CONFIRMATIONS,
-    EstimateFeeError, Estimator, EstimatorConfig, TxConfirmStatBucket, deserialize_bucket,
-    serialize_bucket,
+    EstimateFeeError, Estimator, EstimatorConfig, StaleBlock, TxConfirmStatBucket,
+    deserialize_bucket, serialize_bucket,
 };

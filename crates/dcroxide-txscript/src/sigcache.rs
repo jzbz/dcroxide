@@ -44,6 +44,20 @@
 //!   server goroutine) is not ported: it needs a SipHash dependency
 //!   and the server notification loop, and only affects which entries
 //!   random eviction later removes — never results.
+//! - dcrd exports `Exists` and `Add`; the port keeps both
+//!   crate-private.  dcrd's `Add` takes a parsed signature and key and
+//!   its engine parses before it looks up, so nothing in its cache can
+//!   fail to parse.  The port's entries are raw bytes and
+//!   `opcode_check_sig` and `opcode_check_sig_alt` look up before they
+//!   parse, which is sound only while the engine's own parse and
+//!   verify is the sole source of entries.  Other crates create and
+//!   share a cache but can neither fill nor query it:
+//!
+//! ```compile_fail
+//! let cache = dcroxide_txscript::SigCache::new(1);
+//! let suite = dcroxide_txscript::SigCacheSuite::EcdsaSecp256k1;
+//! cache.add(&[0; 32], suite, &[0x30], &[0x02]);
+//! ```
 //!
 //! Without the `std` feature (and outside tests) this crate is
 //! `no_std`, and [`SigCache`] compiles as an inert stub whose lookups
@@ -138,7 +152,7 @@ impl SigCache {
     /// Whether a successful verification of `signature` over
     /// `sig_hash` under `pub_key` in the given suite is cached (dcrd
     /// `SigCache.Exists`).
-    pub fn exists(
+    pub(crate) fn exists(
         &self,
         sig_hash: &[u8; 32],
         suite: SigCacheSuite,
@@ -156,7 +170,18 @@ impl SigCache {
     /// must never add failed verifications.  When the cache is full
     /// a randomly chosen existing entry is evicted first (see the
     /// module notes on how the random choice is made).
-    pub fn add(&self, sig_hash: &[u8; 32], suite: SigCacheSuite, signature: &[u8], pub_key: &[u8]) {
+    ///
+    /// Crate-private where dcrd exports `Add`: the engine consults the
+    /// cache before it parses the key and signature, which is sound only
+    /// while every entry comes from its own parse and verify
+    /// (`Engine::verify_sig_with_cache`), so no other crate may add one.
+    pub(crate) fn add(
+        &self,
+        sig_hash: &[u8; 32],
+        suite: SigCacheSuite,
+        signature: &[u8],
+        pub_key: &[u8],
+    ) {
         let mut guard = self.valid_sigs.write().expect("sigcache lock poisoned");
         let valid_sigs = &mut *guard;
 
@@ -234,7 +259,7 @@ impl SigCache {
     }
 
     /// Always a miss: the inert cache stores nothing.
-    pub fn exists(
+    pub(crate) fn exists(
         &self,
         _sig_hash: &[u8; 32],
         _suite: SigCacheSuite,
@@ -245,7 +270,7 @@ impl SigCache {
     }
 
     /// Dropped: the inert cache stores nothing.
-    pub fn add(
+    pub(crate) fn add(
         &self,
         _sig_hash: &[u8; 32],
         _suite: SigCacheSuite,

@@ -59,10 +59,15 @@ pub fn process_connected_block(
     regular_tx_hashes: &[Hash],
     stake_tx_hashes: &[Hash],
 ) {
-    estimator
+    let stale = estimator
         .lock()
         .expect("fee estimator mutex poisoned")
         .process_block(height, regular_tx_hashes, stake_tx_hashes);
+    // A block at or below the estimator's best height (a reorg's first
+    // new-chain blocks) is skipped with dcrd's warning.
+    if let Some(stale) = stale {
+        crate::logging::warn("FEES", &stale.to_string());
+    }
 }
 
 /// Enable the estimator at the accepted block's height once the chain

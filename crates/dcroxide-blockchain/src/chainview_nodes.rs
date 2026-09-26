@@ -215,8 +215,12 @@ impl NodeChainView {
 /// `ChainView`/`VoteChainView` abstractions the validation functions
 /// walk.  dcrd's equivalents walk `blockNode` parent pointers
 /// directly; here the deterministic skip list serves each height
-/// lookup, and the descending version walks follow the parent links
-/// like dcrd once their start is resolved.
+/// lookup, resuming from the node the view served last (the store's
+/// branch cursor) when that node is at or above the height, so a
+/// descending walk -- the difficulty windows, the ticket purchase sums,
+/// the vote tally -- takes one parent hop per step as dcrd's does.  The
+/// descending version walks follow the parent links directly once their
+/// start is resolved.
 pub struct NodeBranchView<'a> {
     /// The node store holding the branch.
     pub store: &'a crate::blockindex::NodeStore,
@@ -230,7 +234,16 @@ impl NodeBranchView<'_> {
         if height < 0 || height > self.store.node(self.tip).height {
             return None;
         }
-        self.store.ancestor(self.tip, height)
+        // Resume from the node this branch served last when it is at or
+        // above the height; any ancestor of the tip leads to the same
+        // node, and the step below the last one is its parent.
+        let from = match self.store.branch_cursor.get() {
+            Some((tip, last)) if tip == self.tip && self.store.node(last).height >= height => last,
+            _ => self.tip,
+        };
+        let id = self.store.ancestor(from, height)?;
+        self.store.branch_cursor.set(Some((self.tip, id)));
+        Some(id)
     }
 
     /// The height of the given node when it is an ancestor of (or is)
@@ -313,11 +326,7 @@ impl crate::stakever::VersionChainView for NodeBranchView<'_> {
     }
 
     fn cache_hash(&self, height: i64) -> Option<[u8; 32]> {
-        if height < 0 || height > self.store.node(self.tip).height {
-            return None;
-        }
-        let id = self.store.ancestor(self.tip, height)?;
-        Some(self.store.node(id).hash.0)
+        Some(self.store.node(self.node_id(height)?).hash.0)
     }
 
     fn voter_version_interval_cached(&self, hash: [u8; 32]) -> Option<Option<u32>> {
@@ -379,11 +388,7 @@ impl crate::stakever::VersionChainView for NodeBranchView<'_> {
 
 impl crate::thresholdstate::VoteChainView for NodeBranchView<'_> {
     fn vote_node(&self, height: i64) -> Option<crate::thresholdstate::VoteNode> {
-        if height < 0 || height > self.store.node(self.tip).height {
-            return None;
-        }
-        let id = self.store.ancestor(self.tip, height)?;
-        let n = self.store.node(id);
+        let n = self.store.node(self.node_id(height)?);
         Some(crate::thresholdstate::VoteNode {
             node: crate::stakever::VersionNode {
                 height: n.height,
@@ -394,6 +399,19 @@ impl crate::thresholdstate::VoteChainView for NodeBranchView<'_> {
             },
             votes: n.votes.clone(),
         })
+    }
+
+    // Lend the node's own votes rather than build a node per step.
+    fn visit_votes(
+        &self,
+        height: i64,
+        visit: &mut dyn FnMut(&crate::thresholdstate::BlockVotes),
+    ) -> bool {
+        let Some(id) = self.node_id(height) else {
+            return false;
+        };
+        visit(&self.store.node(id).votes);
+        true
     }
 
     fn threshold_state_cached(

@@ -16,8 +16,8 @@
 //! - dcrd's `optimizeSigVerification` prefix-hash cache is permanently
 //!   disabled dead code at the parity tag and is not reproduced.
 //!
-//! The `stdaddr` and `stdscript` subpackages live in the modules of the
-//! same names; `sign` is a later piece.
+//! The `stdaddr`, `stdscript` and `sign` subpackages live in the modules
+//! of the same names.
 
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 // The engine's arithmetic mirrors dcrd's Go semantics, with wrapping or

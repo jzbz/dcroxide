@@ -16,7 +16,10 @@
 //! dcrd delivers index notifications over a buffered channel
 //! serviced by goroutines and checks sync subscribers on a periodic
 //! ticker; this port delivers synchronously with identical state
-//! transitions, leaving that concurrency to the daemon phase.
+//! transitions, and the daemon calls it on the block-processing
+//! thread.  Moving the updates to a dedicated thread is an open,
+//! unmeasured decision (the `internal/blockchain/indexers` row of
+//! PARITY.md).
 
 mod common;
 mod error;

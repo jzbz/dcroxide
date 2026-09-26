@@ -67,7 +67,8 @@ pub fn go_hex_invalid_byte_error(b: u8) -> String {
 /// The error text of dcrd's `chainhash.Decode` (and so of
 /// `NewHashFromStr`): `ErrHashStrSize` for an overlong string, or Go's
 /// `hex.InvalidByteError` for the first byte that is not a hex digit.
-/// The chainhash crate's own `Display` for the latter is not Go's text.
+/// The chainhash crate's `Display` renders the same texts, which the
+/// node's `--assumevalid` error prints directly.
 pub fn go_hash_decode_error(e: HashError) -> String {
     match e {
         HashError::InvalidHexByte(b) => go_hex_invalid_byte_error(b),
@@ -422,8 +423,7 @@ mod tests {
     }
 
     /// A hash string fails with dcrd's `chainhash.Decode` text: Go's
-    /// invalid-byte error rather than the chainhash crate's `Display`,
-    /// and `ErrHashStrSize` for an overlong string.
+    /// invalid-byte error, and `ErrHashStrSize` for an overlong string.
     #[test]
     fn hash_decode_error_text_matches_go() {
         let text = |s: &str| go_hash_decode_error(s.parse::<Hash>().expect_err("must fail"));

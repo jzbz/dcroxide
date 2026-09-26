@@ -21,6 +21,42 @@ fn from_u128(v: u128) -> Uint256 {
     Uint256::from_be_bytes(&be)
 }
 
+/// A reference shift that moves one bit at a time through the
+/// little-endian bytes, so it shares no code with the word-level shifts
+/// under test: bit `i` of the result is bit `i - k` (left) or `i + k`
+/// (right) of `a`, and zero where that falls outside 0..256.
+fn ref_shift(a: Uint256, k: u32, left: bool) -> Uint256 {
+    let src = a.to_le_bytes();
+    let mut out = [0u8; 32];
+    for i in 0..256u32 {
+        let from = if left {
+            i.checked_sub(k)
+        } else {
+            i.checked_add(k).filter(|&j| j < 256)
+        };
+        if let Some(j) = from
+            && (src[(j / 8) as usize] >> (j % 8)) & 1 == 1
+        {
+            out[(i / 8) as usize] |= 1 << (i % 8);
+        }
+    }
+    Uint256::from_le_bytes(&out)
+}
+
+/// `a` with every bit at or above `width` cleared, built bytewise.
+fn low_bits(a: Uint256, width: u32) -> Uint256 {
+    let mut le = a.to_le_bytes();
+    for (i, b) in le.iter_mut().enumerate() {
+        let lo = i as u32 * 8;
+        if lo >= width {
+            *b = 0;
+        } else if width - lo < 8 {
+            *b &= (1u8 << (width - lo)) - 1;
+        }
+    }
+    Uint256::from_le_bytes(&le)
+}
+
 proptest! {
     #[test]
     fn add_sub_round_trip(a in arb_uint256(), b in arb_uint256()) {
@@ -85,27 +121,37 @@ proptest! {
     }
 
     #[test]
-    fn shift_round_trip(a in arb_uint256(), k in 0u32..=256) {
-        // (a << k) >> k preserves the low 256-k bits.
+    fn shift_round_trip(a in arb_uint256(), k in 0u32..=260) {
+        // Both shifts, in place and into another value, agree with the
+        // bitwise reference, including every word offset and the carries
+        // across words; past 255 bits the result is zero.
+        let mut shl = a;
+        shl.lsh(k);
+        prop_assert_eq!(shl, ref_shift(a, k, true));
+        let mut shr = a;
+        shr.rsh(k);
+        prop_assert_eq!(shr, ref_shift(a, k, false));
+        let mut shl_val = Uint256::MAX;
+        shl_val.lsh_val(&a, k);
+        prop_assert_eq!(shl_val, shl);
+        let mut shr_val = Uint256::MAX;
+        shr_val.rsh_val(&a, k);
+        prop_assert_eq!(shr_val, shr);
+
+        // (a << k) >> k preserves the low 256-k bits and clears the rest.
         let mut v = a;
         v.lsh(k);
         v.rsh(k);
-        let mut masked = a;
-        if k > 0 {
-            masked.lsh(k.min(256));
-            let mut m2 = masked;
-            m2.rsh(k.min(256));
-            prop_assert_eq!(v, m2);
-        } else {
-            prop_assert_eq!(v, a);
-        }
-        // Shifting left by k is multiplication by 2^k when k < 64.
+        prop_assert_eq!(v, low_bits(a, 256u32.saturating_sub(k)));
+
+        // Below one word, shifting is multiplication and division by 2^k.
         if k < 64 {
-            let mut shifted = a;
-            shifted.lsh(k);
             let mut mult = a;
             mult.mul_u64(1u64 << k);
-            prop_assert_eq!(shifted, mult);
+            prop_assert_eq!(shl, mult);
+            let mut quo = a;
+            quo.div_u64(1u64 << k);
+            prop_assert_eq!(shr, quo);
         }
     }
 

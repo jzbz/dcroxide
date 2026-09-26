@@ -120,6 +120,12 @@ pub trait Indexer: Send {
     /// be called when the index is synced.
     fn notify_sync_subscribers(&mut self);
 
+    /// Whether any client is waiting for the next sync update.  Without
+    /// one, signalling is a no-op, so the update path skips the reads
+    /// dcrd's `maybeNotifySubscribers` makes to decide whether to
+    /// signal.
+    fn has_sync_subscribers(&self) -> bool;
+
     /// Remove the index from the database (dcrd `IndexDropper`),
     /// logging the drop to `log` as dcrd logs it to the package logger.
     fn drop_index(
@@ -251,8 +257,8 @@ pub(crate) fn exists_index(db: &Database, idx_key: &[u8]) -> Result<bool, IdxErr
     Ok(exists)
 }
 
-/// Deletions per database update, matching dcrd's `incrementalFlatDrop`
-/// (`indexers.go`'s `maxDeletions`).
+/// Deletions per database update, matching the `maxDeletions` constant
+/// in dcrd's `incrementalFlatDrop` (`common.go:224`).
 pub(crate) const MAX_DELETIONS_PER_BATCH: u64 = 2_000_000;
 
 /// Remove key/value pairs from a flat index over multiple database

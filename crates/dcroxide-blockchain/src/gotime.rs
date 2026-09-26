@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: ISC
 //! Go's `time.Duration.String` and a monotonic stopwatch, for the chain
 //! log lines that report an elapsed time (dcrd formats a `time.Since`
-//! with `%v`, as in `chainio.go:1716`'s "Block index loaded in %v").
+//! with `%v`, as in `chainio.go:1716`'s "Block index loaded in %v"),
+//! the monotonic clock the chain's periodic jobs are timed on, and
+//! Go's `time.Time` rendering of a whole-second unix time, which the
+//! chain's rule errors and the daemon's block import progress line
+//! share.
 
 use alloc::format;
 use alloc::string::String;
@@ -68,6 +72,33 @@ fn fmt_frac(mut v: u64, prec: usize) -> (String, u64) {
     (frac, v)
 }
 
+/// Render a unix timestamp the way Go's `%v` prints a whole-second
+/// `time.Time` (`2006-01-02 15:04:05 +0000 UTC`).
+///
+/// dcrd's times come from `time.Unix` and so print in the host's local
+/// zone; the port pins UTC so the text does not depend on the host
+/// zone database.  The one rendering serves the chain's rule errors
+/// (header timestamps and median times) and the daemon's block import
+/// progress line, so the two cannot drift apart.
+pub fn go_time_utc_string(unix: i64) -> String {
+    // Civil-from-unix over the proleptic Gregorian calendar, per Howard
+    // Hinnant's algorithm (the same math Go's time package performs).
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02} +0000 UTC")
+}
+
 /// A monotonic stopwatch standing in for dcrd's `time.Now()` and
 /// `time.Since` pairs.
 ///
@@ -103,6 +134,28 @@ impl Stopwatch {
     }
 }
 
+/// Nanoseconds on the process's monotonic clock, standing in for the
+/// `time.Now()` readings dcrd subtracts to time the chain's periodic
+/// jobs.  Go's `Time.Sub` and `time.Since` use the monotonic reading
+/// `time.Now` carries, so a step of the wall clock neither stalls nor
+/// hastens them.  The origin is the first call: only differences
+/// between its values mean anything.
+///
+/// Only a build with `std` has a clock to read, as for [`Stopwatch`];
+/// without one this is `None`.
+#[cfg(any(test, feature = "std"))]
+pub(crate) fn monotonic_nanos() -> Option<i64> {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let origin = *ORIGIN.get_or_init(std::time::Instant::now);
+    Some(i64::try_from(origin.elapsed().as_nanos()).unwrap_or(i64::MAX))
+}
+
+/// Nanoseconds on the process's monotonic clock, when there is one.
+#[cfg(not(any(test, feature = "std")))]
+pub(crate) fn monotonic_nanos() -> Option<i64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,8 +185,39 @@ mod tests {
         }
     }
 
+    /// Whole-second times render as Go's default `time.Time` format
+    /// in UTC.
+    #[test]
+    fn times_render_like_go_in_utc() {
+        assert_eq!(go_time_utc_string(0), "1970-01-01 00:00:00 +0000 UTC");
+        assert_eq!(
+            go_time_utc_string(1_790_172_001),
+            "2026-09-23 14:00:01 +0000 UTC"
+        );
+        // dcrd's mainnet genesis timestamp.
+        assert_eq!(
+            go_time_utc_string(1_454_954_400),
+            "2016-02-08 18:00:00 +0000 UTC"
+        );
+        assert_eq!(
+            go_time_utc_string(1_231_006_505),
+            "2009-01-03 18:15:05 +0000 UTC"
+        );
+        assert_eq!(
+            go_time_utc_string(i64::from(u32::MAX)),
+            "2106-02-07 06:28:15 +0000 UTC"
+        );
+    }
+
     #[test]
     fn a_std_stopwatch_reads_a_clock() {
         assert!(Stopwatch::start().elapsed_nanos().is_some());
+    }
+
+    #[test]
+    fn the_std_monotonic_clock_never_goes_back() {
+        let first = monotonic_nanos().expect("a clock");
+        assert!(first >= 0);
+        assert!(monotonic_nanos().expect("a clock") >= first);
     }
 }

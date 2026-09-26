@@ -613,6 +613,10 @@ impl Indexer for ExistsAddrIndex {
         notify_sync_subscribers(&mut self.subscribers);
     }
 
+    fn has_sync_subscribers(&self) -> bool {
+        !self.subscribers.is_empty()
+    }
+
     fn drop_index(
         &self,
         interrupt: &Interrupt,

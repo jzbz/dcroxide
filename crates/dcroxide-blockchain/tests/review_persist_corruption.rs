@@ -42,3 +42,25 @@ fn only_a_persisted_database_corruption_is_recognised() {
         description: "unknown block".to_string(),
     }));
 }
+
+/// Every other persistence failure renders as its own text, as dcrd's
+/// plain error does under `%v` (`database/error.go:150-152`), rather
+/// than as a debug dump of the port's error types (review finding
+/// RG03#2).  Only the corruption keeps the form its reader needs.
+#[test]
+fn other_persistence_failures_render_as_their_own_text() {
+    for kind in [ErrorKind::Fatal, ErrorKind::DriverSpecific] {
+        let err = persisted(kind);
+        assert_eq!(err.kind, RuleErrorKind::UnknownBlock);
+        assert_eq!(err.description, "checksum mismatch");
+    }
+    assert_eq!(
+        persist_rule_error(ChainDbError::Corrupt("missing utxo set bucket".to_string()))
+            .description,
+        "missing utxo set bucket"
+    );
+    assert_eq!(
+        persisted(ErrorKind::Corruption).description,
+        "chain database failure: Db(Error { kind: Corruption, description: \"checksum mismatch\" })"
+    );
+}

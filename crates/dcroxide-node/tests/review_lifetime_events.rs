@@ -221,11 +221,12 @@ fn a_failed_server_build_follows_dcrds_events_and_text() {
         ],
         "{text}"
     );
+    // The whole line: server.go's wrap around hex.InvalidByteError's text.
     position(
         &text,
-        "[ERR] DCRD: Unable to start server: invalid hex for --assumevalid: ",
+        "[ERR] DCRD: Unable to start server: invalid hex for --assumevalid: \
+         encoding/hex: invalid byte: U+0078 'x'\n",
     );
-    assert!(!text.contains("InvalidHexByte"), "{text}");
     // The missing configuration file is dcrdLog's warning.
     position(
         &text,

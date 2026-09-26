@@ -75,6 +75,10 @@ pub struct VoteNode {
     pub votes: Vec<(u32, u16)>,
 }
 
+/// A block's (vote version, vote bits) pairs, as [`VoteNode::votes`]
+/// holds them.
+pub type BlockVotes = [(u32, u16)];
+
 /// A height-indexed view of the branch providing full vote data.  A
 /// vote view is also a [`VersionChainView`] — the version data is a
 /// projection of the vote data — which lets the stake version
@@ -87,6 +91,21 @@ pub struct VoteNode {
 pub trait VoteChainView: VersionChainView {
     /// The node at the given height along this branch.
     fn vote_node(&self, height: i64) -> Option<VoteNode>;
+
+    /// Hand the votes of the node at the given height along this branch
+    /// to `visit`; false, without a call, when there is no such node.
+    /// The vote tally reads only the votes (dcrd's `countNode.votes`),
+    /// so a view that holds them can lend them instead of building a
+    /// whole [`VoteNode`] per step.
+    fn visit_votes(&self, height: i64, visit: &mut dyn FnMut(&BlockVotes)) -> bool {
+        match self.vote_node(height) {
+            Some(node) => {
+                visit(&node.votes);
+                true
+            }
+            None => false,
+        }
+    }
 
     /// A cached threshold state for the deployment at the
     /// interval-boundary node with the hash.
@@ -248,21 +267,24 @@ pub fn next_threshold_state(
                     let mut choice_counts = vec![0u32; vote.choices.len()];
                     let mut count_height = h;
                     for _ in 0..confirmation_window {
-                        let Some(count_node) = view.vote_node(count_height) else {
+                        let found = view.visit_votes(count_height, &mut |votes| {
+                            for (version, bits) in votes {
+                                if *version != deployment_version {
+                                    continue;
+                                }
+                                let choice_idx =
+                                    usize::from((bits & vote.mask) >> choice_idx_shift);
+                                if choice_idx > vote.choices.len() - 1 {
+                                    continue;
+                                }
+                                choice_counts[choice_idx] += 1;
+                                if !vote.choices[choice_idx].is_abstain {
+                                    total_non_abstain_votes += 1;
+                                }
+                            }
+                        });
+                        if !found {
                             break;
-                        };
-                        for (version, bits) in &count_node.votes {
-                            if *version != deployment_version {
-                                continue;
-                            }
-                            let choice_idx = usize::from((bits & vote.mask) >> choice_idx_shift);
-                            if choice_idx > vote.choices.len() - 1 {
-                                continue;
-                            }
-                            choice_counts[choice_idx] += 1;
-                            if !vote.choices[choice_idx].is_abstain {
-                                total_non_abstain_votes += 1;
-                            }
                         }
                         if count_height == 0 {
                             break;

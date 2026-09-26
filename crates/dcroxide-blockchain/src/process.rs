@@ -245,9 +245,11 @@ pub struct Chain {
     /// Whether several validation checks are skipped for bulk imports
     /// (dcrd `bulkImportMode`).
     pub bulk_import_mode: bool,
-    /// The unix time the in-memory state was last pruned (dcrd
-    /// `chainPruner.lastPruneTime`).
-    last_prune_unix: i64,
+    /// The periodic clock reading of the last prune of the in-memory
+    /// state (dcrd `chainPruner.lastPruneTime`); see
+    /// [`Chain::periodic_clock`].  `None` only before a chain with no
+    /// monotonic clock first observes the adjusted time.
+    last_prune_nanos: Option<i64>,
     /// The pruning interval in seconds — the target block time (dcrd
     /// `chainPruner.pruningInterval`).
     prune_interval_secs: i64,
@@ -267,18 +269,22 @@ pub struct Chain {
     /// `lastFlushHash`), compared against the backend's recorded utxo
     /// set state on startup.
     utxo_last_flush_hash: Hash,
-    /// The adjusted-clock unix time of the last utxo cache flush
-    /// (dcrd `lastFlushTime`, which uses the wall clock; the port
-    /// drives the periodic flush interval from the same adjusted
-    /// clock the pruner uses so the decision core stays
-    /// deterministic).
-    utxo_last_flush_unix: i64,
+    /// The periodic clock reading of the last utxo cache flush (dcrd
+    /// `lastFlushTime`); see [`Chain::periodic_clock`].  `None` only
+    /// before a chain with no monotonic clock first observes the
+    /// adjusted time.
+    utxo_last_flush_nanos: Option<i64>,
     /// The block height of the last cache eviction (dcrd
     /// `lastEvictionHeight`).
     utxo_last_eviction_height: u32,
-    /// The adjusted unix time of the processing call in flight,
-    /// feeding the periodic flush check.
+    /// The adjusted unix time of the processing call in flight, for the
+    /// is-current check (and the periodic jobs' clock when there is no
+    /// monotonic one).
     utxo_clock_unix: i64,
+    /// Whether a processing call has handed in the adjusted time yet.
+    /// Until one has, a chain with no monotonic clock has no periodic
+    /// clock to read (see [`Chain::periodic_now`]).
+    adjusted_time_observed: bool,
     /// Whether the chain has latched to believing it is current.
     pub is_current_latch: bool,
     /// The minimum known cumulative chain work from the parameters.
@@ -314,15 +320,32 @@ pub struct Chain {
     recent_context_checks: RecentContextChecks,
     /// The shutdown interrupt (dcrd `BlockChain.interrupt`, its
     /// context's `Done` channel), set at open from
-    /// [`OpenConfig::interrupt`].  Only the startup UTXO catch-up checks
-    /// it, as dcrd's `UtxoCache.Initialize` does; the reorganization
-    /// loops do not (see [`Chain::reorganize_chain_internal`]).
+    /// [`OpenConfig::interrupt`].  The startup UTXO catch-up checks it,
+    /// as dcrd's `UtxoCache.Initialize` does, and so do the
+    /// reorganization loops, as dcrd's `reorganizeChain` and
+    /// `reorganizeChainInternal` do.
     interrupt: Option<Arc<AtomicBool>>,
-    /// The adjusted-clock unix time the cached chain tips were last
-    /// pruned (dcrd `blockIndex.cachedTipsLastPruned`, a wall-clock
-    /// time); zero until a connect first observes the clock.
-    cached_tips_last_pruned_unix: i64,
+    /// The periodic clock reading of the last prune of the cached
+    /// chain tips (dcrd `blockIndex.cachedTipsLastPruned`); see
+    /// [`Chain::periodic_clock`].  `None` only before a chain with no
+    /// monotonic clock first observes the adjusted time.
+    cached_tips_last_pruned_nanos: Option<i64>,
+    /// The clock the three periodic jobs are timed on: the chain
+    /// pruner, the utxo cache's periodic flush and the cached-tip
+    /// prune.  dcrd times each with `time.Now()` differences
+    /// (`prune.go:82-84`, `utxocache.go:669`, `blockindex.go:1052`),
+    /// which Go takes from the monotonic clock, so a step of the wall
+    /// clock or of the median time offset neither stalls nor hastens
+    /// them; this defaults to [`crate::gotime::monotonic_nanos`].  A
+    /// build without `std` has no clock, and there the adjusted time of
+    /// the processing call in flight stands in (see
+    /// [`Chain::periodic_now`]).  Tests swap in a clock they
+    /// drive, as dcrd's `UtxoCache.timeNow` lets its tests do.
+    periodic_clock: fn() -> Option<i64>,
 }
+
+/// Nanoseconds per second, for the periodic intervals.
+const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 /// The time between prunes of the cached chain tips, in seconds (dcrd
 /// `cachedTipsPruneInterval`, `blockindex.go:50-52`).
@@ -561,16 +584,19 @@ impl Chain {
             header_commitments: BTreeMap::new(),
             state_snapshot,
             bulk_import_mode: false,
-            last_prune_unix: 0,
+            // dcrd stamps the pruner and the cache at construction
+            // (`prune.go:71`, `utxocache.go:236`).
+            last_prune_nanos: crate::gotime::monotonic_nanos(),
             prune_interval_secs: params.target_time_per_block_secs,
             utxo_cache_max_bytes: DEFAULT_UTXO_CACHE_MAX_BYTES,
             utxo_total_entry_size: Cell::new(0),
             utxo_cache_hits: Cell::new(0),
             utxo_cache_misses: Cell::new(0),
             utxo_last_flush_hash: Hash::ZERO,
-            utxo_last_flush_unix: 0,
+            utxo_last_flush_nanos: crate::gotime::monotonic_nanos(),
             utxo_last_eviction_height: 0,
             utxo_clock_unix: 0,
+            adjusted_time_observed: false,
             is_current_latch: false,
             min_known_work: params.min_known_chain_work,
             db: None,
@@ -585,7 +611,8 @@ impl Chain {
             ))),
             recent_context_checks: RecentContextChecks::default(),
             interrupt: None,
-            cached_tips_last_pruned_unix: 0,
+            cached_tips_last_pruned_nanos: crate::gotime::monotonic_nanos(),
+            periodic_clock: crate::gotime::monotonic_nanos,
         }
     }
 
@@ -685,7 +712,9 @@ impl Chain {
     /// (`chain.go:2457`).  Setting it stops the startup UTXO catch-up
     /// replay at the next block with
     /// [`crate::chaindb::ChainDbError::Interrupted`], as dcrd's
-    /// `UtxoCache.Initialize` returns `errInterruptRequested`.
+    /// `UtxoCache.Initialize` returns `errInterruptRequested`, and any
+    /// later reorganization before its next block (see
+    /// [`Chain::reorganize_chain`]).
     pub fn open_with_interrupt(
         db: dcroxide_database::Database,
         params: &Params,
@@ -811,7 +840,7 @@ impl Chain {
                     &genesis_hash,
                     created_unix as u32,
                 )
-                .map_err(|e| db_driver_error(format!("stake db: {e:?}")))?;
+                .map_err(stake_db_to_db_error)?;
                 tx.store_block(&genesis_block)?;
 
                 // The remaining buckets and the empty genesis filter.
@@ -1142,6 +1171,10 @@ impl Chain {
         })?;
         self.best_chain.set_tip(&self.store, Some(tip));
         self.index.prune_cached_tips(&self.store, tip);
+        // dcrd's `pruneCachedTips` stamps the time of the prune
+        // (`blockindex.go:1032`, `:1042`); with no monotonic clock the
+        // first connect's adjusted time stands in.
+        self.cached_tips_last_pruned_nanos = (self.periodic_clock)();
         self.index.add_best_chain_candidate(tip);
         self.log_block_index_loaded(&bidx_start);
 
@@ -1154,7 +1187,7 @@ impl Chain {
             &tip_header.serialize(),
             stake_node_params(params),
         )
-        .map_err(|e| crate::chaindb::ChainDbError::Corrupt(format!("stake node: {e:?}")))?;
+        .map_err(|e| crate::chaindb::ChainDbError::Db(stake_db_to_db_error(e)))?;
         {
             let n = self.store.node_mut(tip);
             n.new_tickets = Some(stake_node.new_tickets().to_vec());
@@ -1295,10 +1328,13 @@ impl Chain {
     /// Advance the stored deployment version to the binary's (dcrd
     /// `updateDeploymentVersion`, `chainio.go:1547-1572`).
     ///
-    /// Its own transaction, after the block index flush, because the
-    /// stored version is what tells the next startup whether the
-    /// new-rules pass still has work: writing it before those rows are
-    /// durable would let a crash in between skip the pass forever.
+    /// Its own transaction, after the block index flush, in the order
+    /// dcrd's `initChainState` uses (`chainio.go:1776-1793`).  dcrd
+    /// orders it so the unmarked rows are durable before the version
+    /// moves, but the new-rules pass clears those statuses in memory
+    /// only (the flush writes none of their rows, QK-0016), so
+    /// advancing the stored version is what ends the pass on every
+    /// later start, whether or not a crash comes in between.
     fn update_deployment_version(
         &mut self,
         params: &Params,
@@ -1703,9 +1739,10 @@ impl Chain {
         if self.utxo_cache_total_size() >= self.utxo_cache_max_bytes {
             return true;
         }
-        self.utxo_clock_unix
-            .saturating_sub(self.utxo_last_flush_unix)
-            >= UTXO_PERIODIC_FLUSH_SECS
+        let (Some(now), Some(last)) = (self.periodic_now(), self.utxo_last_flush_nanos) else {
+            return false;
+        };
+        now.saturating_sub(last) >= UTXO_PERIODIC_FLUSH_SECS.saturating_mul(NANOS_PER_SEC)
     }
 
     /// Conditionally flush the cache to the backend (dcrd
@@ -1838,7 +1875,14 @@ impl Chain {
         });
         self.utxo_total_entry_size.set(total);
         self.utxo_last_flush_hash = last_flush_hash;
-        self.utxo_last_flush_unix = self.utxo_clock_unix;
+        // dcrd `c.lastFlushTime = c.timeNow()` (`utxocache.go:760`).
+        // With no monotonic clock, a flush before the first processing
+        // call (a size-limit flush in the open's catch-up, or
+        // gettxoutsetinfo's) has no time to stamp, and leaves the stamp
+        // for that call's adjusted time to seed.
+        if let Some(now) = self.periodic_now() {
+            self.utxo_last_flush_nanos = Some(now);
+        }
         if eviction_height != 0 {
             self.utxo_last_eviction_height = eviction_height;
         }
@@ -2354,7 +2398,10 @@ impl Chain {
                     if corrupt.is_some() {
                         return Ok(());
                     }
-                    match crate::chaindb::decode_outpoint_key(k) {
+                    // The same decoder dcrd's vectors pin (dcrd
+                    // `decodeOutpointKey`), so a corrupt key reports
+                    // dcrd's text after the colon below.
+                    match crate::utxoio::decode_outpoint_key(k) {
                         Ok(outpoint) => {
                             if v.is_empty() {
                                 corrupt = Some(format!(
@@ -2533,15 +2580,6 @@ impl Chain {
                 ),
             )
         })
-    }
-
-    /// The full block data for a node.  The data must have been
-    /// stored previously; callers only request blocks whose data
-    /// availability is tracked by the block index (dcrd
-    /// `fetchBlockByNode` over its database and recent block cache).
-    pub fn block_by_node(&self, node: NodeId) -> MsgBlock {
-        self.block_data(node)
-            .expect("block data for node is stored")
     }
 
     /// The block data for a node on the stake-node paths, or the error
@@ -3127,7 +3165,7 @@ impl Chain {
                 crate::chaindb::db_put_spend_journal_entry(tx, &node_hash, &serialized_journal)
                     .map_err(chain_db_to_db_error)?;
                 dcroxide_stake::stakedb::write_connected_best_node(tx, &stake_node, &node_hash)
-                    .map_err(|e| db_driver_error(format!("stake db: {e:?}")))?;
+                    .map_err(stake_db_to_db_error)?;
                 if let Some((block_hash, ts, tspend_updates)) = &treasury_records {
                     Self::db_write_treasury_records(tx, block_hash, ts, tspend_updates)?;
                 }
@@ -3309,7 +3347,7 @@ impl Chain {
                     &parent_hash,
                     &child_undo,
                 )
-                .map_err(|e| db_driver_error(format!("stake db: {e:?}")))?;
+                .map_err(stake_db_to_db_error)?;
                 Ok(())
             })
             .map_err(|e| persist_rule_error(crate::chaindb::ChainDbError::Db(e)))?;
@@ -3377,26 +3415,22 @@ impl Chain {
         if let Some(filter) = self.filters.get(&block.header.block_hash().0) {
             return Ok(filter.clone());
         }
-        struct ViewScripts<'a>(&'a UtxoView);
-        impl dcroxide_gcs::blockcf2::PrevScripter for ViewScripts<'_> {
-            fn prev_script(&self, out: &OutPoint) -> Option<(u16, &[u8])> {
-                let entry = self.0.lookup_entry(out)?;
-                Some((entry.script_version(), entry.pk_script()))
-            }
-        }
         // dcrd `ruleError(ErrMissingTxOut, err.Error())`.
-        dcroxide_gcs::blockcf2::regular(block, &ViewScripts(view)).map_err(|e| RuleError {
-            kind: RuleErrorKind::MissingTxOut,
-            description: format!("{e}"),
-        })
+        dcroxide_gcs::blockcf2::regular(block, &crate::validate::ViewScripts(view))
+            .map_err(|e| rule_error(RuleErrorKind::MissingTxOut, format!("{e}")))
     }
 
     /// Reorganize the chain to the given target without attempting to
     /// undo failed reorgs: disconnect blocks back to the fork point
     /// and connect the blocks of the new branch, fully validating any
     /// that have not been validated before (dcrd
-    /// `reorganizeChainInternal`; the shutdown interrupt checks are
-    /// not reproduced).
+    /// `reorganizeChainInternal`).
+    ///
+    /// A shutdown requested through the chain's interrupt stops the
+    /// reorganization before the next block either loop would detach or
+    /// attach, with dcrd's `errInterruptRequested`
+    /// (`chain.go:1065-1069`, `:1160-1164`); the blocks already moved
+    /// stay moved, as in dcrd.
     pub fn reorganize_chain_internal(
         &mut self,
         target: NodeId,
@@ -3414,6 +3448,9 @@ impl Chain {
         while let Some(n) = tip {
             if Some(n) == fork {
                 break;
+            }
+            if self.interrupt_requested() {
+                return Err(interrupt_rule_error());
             }
             let block = match next_block_to_detach.take() {
                 Some(b) => b,
@@ -3476,6 +3513,9 @@ impl Chain {
         let mut fork_block = next_block_to_detach;
         let mut prev_block_attached: Option<Arc<MsgBlock>> = None;
         for node in attach_nodes {
+            if self.interrupt_requested() {
+                return Err(interrupt_rule_error());
+            }
             let block = self.stored_block_arc(node)?;
             let parent_id = self.store.node(node).parent.expect("attach parent");
             let parent = match prev_block_attached.take().or_else(|| fork_block.take()) {
@@ -3605,6 +3645,14 @@ impl Chain {
     /// (dcrd wraps multiple in a `MultiError`), unless the forced UTXO
     /// cache flush on latching to current fails: that error is then
     /// returned alone, as dcrd's `return err` does.
+    ///
+    /// A shutdown requested through the chain's interrupt is checked
+    /// before every attempt and ends the call at once with dcrd's
+    /// `errInterruptRequested` alone, whether it is seen here or by
+    /// [`Self::reorganize_chain_internal`], without trying another
+    /// candidate (`chain.go:1293-1297`, `:1328-1331`): the current
+    /// latch update, its flush and the reorganization notification are
+    /// skipped, and only the completion event dcrd defers still fires.
     pub fn reorganize_chain(
         &mut self,
         target: Option<NodeId>,
@@ -3625,6 +3673,9 @@ impl Chain {
             if cur_tip == Some(t) {
                 break;
             }
+            if self.interrupt_requested() {
+                return self.reorganize_interrupted(sent_reorging_ntfn);
+            }
 
             // Notify a reorganization to a competing branch is under
             // way; a plain tip extension sends nothing (dcrd sends
@@ -3637,6 +3688,10 @@ impl Chain {
             }
 
             if let Err(err) = self.reorganize_chain_internal(t, params) {
+                // Shutting down.
+                if is_interrupt_rule_error(&err) {
+                    return self.reorganize_interrupted(sent_reorging_ntfn);
+                }
                 reorg_errs.push(err);
 
                 // Determine a new best candidate since the reorg
@@ -3709,6 +3764,17 @@ impl Chain {
             Self::send_ntfn(&mut self.notifications, &Notification::ChainReorgDone);
         }
         reorg_errs
+    }
+
+    /// The result of a [`Self::reorganize_chain`] a shutdown request
+    /// stopped: dcrd's `errInterruptRequested` alone, after the
+    /// completion event its deferred send fires when the start event
+    /// went out.
+    fn reorganize_interrupted(&mut self, sent_reorging_ntfn: bool) -> Vec<RuleError> {
+        if sent_reorging_ntfn {
+            Self::send_ntfn(&mut self.notifications, &Notification::ChainReorgDone);
+        }
+        alloc::vec![interrupt_rule_error()]
     }
 
     /// Accept the data for the block, updating the block index state
@@ -3867,17 +3933,7 @@ impl Chain {
         adjusted_time_unix: i64,
         params: &Params,
     ) -> (i64, Vec<RuleError>) {
-        // The adjusted clock drives the periodic UTXO cache flush
-        // interval for the connects this call performs (dcrd's cache
-        // reads the wall clock; the port pins it to the same adjusted
-        // time the pruner uses so decisions stay deterministic).  The
-        // first observed clock also seeds the flush baseline so no
-        // periodic flush fires within the interval of startup, like
-        // dcrd's `lastFlushTime: time.Now()` at cache construction.
-        self.utxo_clock_unix = adjusted_time_unix;
-        if self.utxo_last_flush_unix == 0 {
-            self.utxo_last_flush_unix = adjusted_time_unix;
-        }
+        self.observe_adjusted_time(adjusted_time_unix);
 
         // The block must not already exist in the main chain or side
         // chains.
@@ -4023,14 +4079,9 @@ impl Chain {
         adjusted_time_unix: i64,
         params: &Params,
     ) -> Vec<RuleError> {
-        // The reorganization below flushes the utxo cache; keep the
-        // periodic-flush clock on the caller's adjusted time (and
-        // seed the flush baseline on first observation, like
-        // `process_block`).
-        self.utxo_clock_unix = adjusted_time_unix;
-        if self.utxo_last_flush_unix == 0 {
-            self.utxo_last_flush_unix = adjusted_time_unix;
-        }
+        // The reorganization below checks whether the chain is current
+        // and may flush the utxo cache.
+        self.observe_adjusted_time(adjusted_time_unix);
         let Some(node) = self.index.lookup_node(hash) else {
             return alloc::vec![rule_error(
                 RuleErrorKind::UnknownBlock,
@@ -4142,14 +4193,9 @@ impl Chain {
         adjusted_time_unix: i64,
         params: &Params,
     ) -> Vec<RuleError> {
-        // The reorganization below flushes the utxo cache; keep the
-        // periodic-flush clock on the caller's adjusted time (and
-        // seed the flush baseline on first observation, like
-        // `process_block`).
-        self.utxo_clock_unix = adjusted_time_unix;
-        if self.utxo_last_flush_unix == 0 {
-            self.utxo_last_flush_unix = adjusted_time_unix;
-        }
+        // The reorganization below checks whether the chain is current
+        // and may flush the utxo cache.
+        self.observe_adjusted_time(adjusted_time_unix);
         let Some(node) = self.index.lookup_node(hash) else {
             return alloc::vec![rule_error(
                 RuleErrorKind::UnknownBlock,
@@ -4279,29 +4325,36 @@ impl Chain {
         let best = self.best_chain.tip().expect("best chain tip");
         self.index.prune_cached_tips(&self.store, best);
         // dcrd's `pruneCachedTips` stamps the time of the prune.
-        self.cached_tips_last_pruned_unix = self.utxo_clock_unix;
+        if let Some(now) = self.periodic_now() {
+            self.cached_tips_last_pruned_nanos = Some(now);
+        }
         errs
     }
 
     /// Prune the cached chain tips relative to the new best node at
     /// most once per [`CACHED_TIPS_PRUNE_INTERVAL_SECS`] (dcrd
     /// `blockIndex.MaybePruneCachedTips`, `blockindex.go:1045-1056`,
-    /// called by `connectBlock` right after the tip moves), timed on the
-    /// adjusted clock of the processing call in flight like the other
-    /// periodic work here.  dcrd's load path prunes and stamps the wall
-    /// clock (`chainio.go:1710`); the load here prunes without a clock,
-    /// so the first observed time stands in for that stamp and the first
-    /// timed prune comes one interval later, as it does in dcrd.
+    /// called by `connectBlock` right after the tip moves), timed on
+    /// the periodic clock like the other periodic work here.  dcrd's
+    /// load path prunes and stamps the time (`chainio.go:1710`), as the
+    /// load here does; with no monotonic clock the load has no time to
+    /// stamp, so the adjusted time of the first connect made by a
+    /// processing call stands in and the first timed prune comes one
+    /// interval later, as it does in dcrd.  A connect made before any
+    /// processing call has no time to read and neither prunes nor
+    /// stamps.
     fn maybe_prune_cached_tips(&mut self, best_node: NodeId) {
-        let now = self.utxo_clock_unix;
-        if self.cached_tips_last_pruned_unix == 0 {
-            self.cached_tips_last_pruned_unix = now;
+        let Some(now) = self.periodic_now() else {
             return;
-        }
-        if now.saturating_sub(self.cached_tips_last_pruned_unix) >= CACHED_TIPS_PRUNE_INTERVAL_SECS
+        };
+        let Some(last) = self.cached_tips_last_pruned_nanos else {
+            self.cached_tips_last_pruned_nanos = Some(now);
+            return;
+        };
+        if now.saturating_sub(last) >= CACHED_TIPS_PRUNE_INTERVAL_SECS.saturating_mul(NANOS_PER_SEC)
         {
             self.index.prune_cached_tips(&self.store, best_node);
-            self.cached_tips_last_pruned_unix = now;
+            self.cached_tips_last_pruned_nanos = Some(now);
         }
     }
 
@@ -4314,14 +4367,9 @@ impl Chain {
         adjusted_time_unix: i64,
         params: &Params,
     ) -> Vec<RuleError> {
-        // The reorganization below flushes the utxo cache; keep the
-        // periodic-flush clock on the caller's adjusted time (and
-        // seed the flush baseline on first observation, like
-        // `process_block`).
-        self.utxo_clock_unix = adjusted_time_unix;
-        if self.utxo_last_flush_unix == 0 {
-            self.utxo_last_flush_unix = adjusted_time_unix;
-        }
+        // The reorganization below checks whether the chain is current
+        // and may flush the utxo cache.
+        self.observe_adjusted_time(adjusted_time_unix);
         if former_best == new_best {
             return alloc::vec![rule_error(
                 RuleErrorKind::ForceReorgSameBlock,
@@ -4984,24 +5032,58 @@ impl Chain {
 
     /// Prune old in-memory state on the pruning interval — the target
     /// block time (dcrd's `chainPruner.pruneChainIfNeeded`, called from
-    /// `maybeAcceptBlockData`, `process.go:320`).  A chain without a
-    /// database never prunes: the memory is its only store.
-    pub fn prune_if_needed(&mut self, now_unix: i64) {
+    /// `maybeAcceptBlockData`, `process.go:320`), timed on the monotonic
+    /// clock dcrd's `time.Now()` differences read; `adjusted_time_unix`
+    /// stands in only in a build without `std`, which has no such clock.
+    /// A chain without a database never prunes: the memory is its only
+    /// store.
+    pub fn prune_if_needed(&mut self, adjusted_time_unix: i64) {
         if self.db.is_none() {
             return;
         }
-        // The first observation seeds the interval clock without
-        // pruning (dcrd's `chainPruner.lastPruneTime = time.Now()`), so
-        // the first prune fires one interval later, not immediately.
-        if self.last_prune_unix == 0 {
-            self.last_prune_unix = now_unix;
+        let now = (self.periodic_clock)()
+            .unwrap_or_else(|| adjusted_time_unix.saturating_mul(NANOS_PER_SEC));
+        // Without a monotonic clock, the first observation seeds the
+        // stamp dcrd takes at construction (`lastPruneTime:
+        // time.Now()`), so the first prune fires one interval later,
+        // not immediately.
+        let Some(last) = self.last_prune_nanos else {
+            self.last_prune_nanos = Some(now);
+            return;
+        };
+        if now.saturating_sub(last) < self.prune_interval_secs.saturating_mul(NANOS_PER_SEC) {
             return;
         }
-        if now_unix.saturating_sub(self.last_prune_unix) < self.prune_interval_secs {
-            return;
-        }
-        self.last_prune_unix = now_unix;
+        self.last_prune_nanos = Some(now);
         self.prune_chain_memory(Self::MIN_MEMORY_STAKE_NODES);
+    }
+
+    /// A reading of the clock the periodic jobs are timed on, in
+    /// nanoseconds: [`Chain::periodic_clock`], or, in a build with no
+    /// monotonic clock, the adjusted time of the processing call in
+    /// flight, which is `None` until a processing call first hands one
+    /// in.  That stand-in stops the jobs for as long as a backward step
+    /// of the adjusted clock takes to make up, which dcrd's monotonic
+    /// readings never do.
+    fn periodic_now(&self) -> Option<i64> {
+        (self.periodic_clock)().or_else(|| {
+            self.adjusted_time_observed
+                .then(|| self.utxo_clock_unix.saturating_mul(NANOS_PER_SEC))
+        })
+    }
+
+    /// Record the adjusted time of the processing call in flight, which
+    /// the is-current check reads.  With no monotonic clock it is also
+    /// the periodic clock, and its first observation seeds the flush
+    /// stamp, which nothing before it could set, so no periodic flush
+    /// fires within the interval of startup, as dcrd's `lastFlushTime:
+    /// time.Now()` at cache construction ensures.
+    fn observe_adjusted_time(&mut self, adjusted_time_unix: i64) {
+        self.utxo_clock_unix = adjusted_time_unix;
+        self.adjusted_time_observed = true;
+        if self.utxo_last_flush_nanos.is_none() {
+            self.utxo_last_flush_nanos = self.periodic_now();
+        }
     }
 
     /// Drop a rejected block's body from the in-memory mirror.
@@ -6824,19 +6906,37 @@ impl Chain {
     }
 }
 
-/// The text [`persist_rule_error`] gives a database error, up to the
-/// error's kind: it renders the `ChainDbError` with `{:?}`, so a
+/// The text [`persist_rule_error`] gives a database corruption, up to
+/// the error's kind: it renders the `ChainDbError` with `{:?}`, so a
 /// `dcroxide_database::Error` shows its kind first.
 const PERSISTED_DB_ERROR_PREFIX: &str = "chain database failure: Db(Error { kind: ";
 
 /// Convert a persistence failure into a rule error so it flows
-/// through the existing error paths (dcrd surfaces these as plain
-/// errors).  Public so tests can check [`is_persisted_db_corruption`]
-/// against the text this produces.
+/// through the existing error paths.  dcrd returns these as plain
+/// errors, unchanged out of its database updates (`chain.go:687-690`,
+/// `:878-881`), and Go's `%v` renders a `database.Error` as its bare
+/// description (`database/error.go:150-152`), so the description here
+/// is the error's own text, the text dcrd's `submitblock` reply and
+/// sync manager log carry.
+///
+/// A database `ErrCorruption` is the exception.  The rule error keeps
+/// its kind only in the text, which [`is_persisted_db_corruption`]
+/// reads back for dcrd's corruption-only `Critical failure` line, so
+/// that one error renders as `chain database failure: ` over the
+/// `ChainDbError`'s debug form.  Public so tests can check
+/// [`is_persisted_db_corruption`] against the text this produces.
 pub fn persist_rule_error(err: crate::chaindb::ChainDbError) -> RuleError {
+    let description = match &err {
+        crate::chaindb::ChainDbError::Db(e)
+            if e.kind == dcroxide_database::ErrorKind::Corruption =>
+        {
+            format!("chain database failure: {err:?}")
+        }
+        _ => format!("{err}"),
+    };
     RuleError {
         kind: RuleErrorKind::UnknownBlock,
-        description: format!("chain database failure: {err:?}"),
+        description,
     }
 }
 
@@ -7036,12 +7136,32 @@ fn db_driver_error(description: String) -> dcroxide_database::Error {
     }
 }
 
+/// Convert a ticket database error into a database error for use
+/// inside database transaction closures.  dcrd returns the error of
+/// its `stake` database entry points unchanged (`chainio.go:1360-1363`
+/// and `:1721-1725`, `chain.go:687-690` and `:878-881`), so a database
+/// error keeps its kind here (a `database.ErrCorruption` read from the
+/// ticket rows is still one), and a ticket database `DBError` or a
+/// stake `RuleError` carries its bare description, which is all Go's
+/// `Error()` renders for either (`stake/internal/ticketdb/error.go:64-66`,
+/// `stake/error.go:323-325`).
+fn stake_db_to_db_error(err: dcroxide_stake::stakedb::StakeDbError) -> dcroxide_database::Error {
+    match err {
+        dcroxide_stake::stakedb::StakeDbError::Db(e) => e,
+        dcroxide_stake::stakedb::StakeDbError::Ticket(e) => db_driver_error(e.description),
+        dcroxide_stake::stakedb::StakeDbError::Rule(e) => db_driver_error(e.description),
+    }
+}
+
 /// Convert a chain database error into a database error for use
-/// inside database transaction closures.
+/// inside database transaction closures.  A database error passes
+/// through unchanged, and any other failure carries its own text, as
+/// [`persist_rule_error`] renders it, rather than a debug dump of the
+/// port's error type.
 fn chain_db_to_db_error(err: crate::chaindb::ChainDbError) -> dcroxide_database::Error {
     match err {
         crate::chaindb::ChainDbError::Db(err) => err,
-        other => db_driver_error(format!("{other:?}")),
+        other => db_driver_error(format!("{other}")),
     }
 }
 
@@ -7085,6 +7205,28 @@ fn stake_rule_error(err: dcroxide_stake::RuleError) -> RuleError {
         kind: RuleErrorKind::TicketUnavailable,
         description: format!("stake node error: {err:?}"),
     }
+}
+
+/// dcrd's `errInterruptRequested` ("interrupt requested",
+/// `upgrade.go:34-36`) as the error the reorganization paths return.
+///
+/// dcrd's is a plain error, not a `RuleError`; the port's one error
+/// type needs a kind, and `ErrUtxoBackend` is one that
+/// [`RuleErrorKind::is_rule_violation`] leaves out and that no caller
+/// singles out, so the error takes dcrd's non-rule-error branches (the
+/// sync manager's "Failed to process block" line, the RPC server's
+/// internal error) with dcrd's text.
+fn interrupt_rule_error() -> RuleError {
+    rule_error(
+        RuleErrorKind::UtxoBackend,
+        format!("{}", crate::chaindb::ChainDbError::Interrupted),
+    )
+}
+
+/// Whether the error is [`interrupt_rule_error`]'s (dcrd's
+/// `errors.Is(err, errInterruptRequested)`).
+fn is_interrupt_rule_error(err: &RuleError) -> bool {
+    *err == interrupt_rule_error()
 }
 
 fn unknown_deployment_error() -> RuleError {
@@ -7156,6 +7298,54 @@ mod tests {
 
     fn hash_of(n: u8) -> Hash {
         Hash([n; 32])
+    }
+
+    thread_local! {
+        /// The periodic clock a test drives, in nanoseconds; each test
+        /// runs on its own thread.
+        static TEST_CLOCK: Cell<i64> = const { Cell::new(0) };
+    }
+
+    fn test_clock() -> Option<i64> {
+        Some(TEST_CLOCK.with(Cell::get))
+    }
+
+    fn set_test_clock(secs: i64) {
+        TEST_CLOCK.with(|clock| clock.set(secs * NANOS_PER_SEC));
+    }
+
+    /// Time the chain's periodic jobs on the test clock, stamped as
+    /// dcrd stamps them when the chain is built.
+    fn use_test_clock(chain: &mut Chain) {
+        chain.periodic_clock = test_clock;
+        chain.last_prune_nanos = test_clock();
+        chain.utxo_last_flush_nanos = test_clock();
+        chain.cached_tips_last_pruned_nanos = test_clock();
+    }
+
+    /// The battery's main chain blocks in order, with its clock.
+    fn battery_main_chain() -> (Vec<MsgBlock>, i64) {
+        let mut now = 0;
+        let mut blocks: Vec<MsgBlock> = Vec::new();
+        for line in include_str!("../tests/data/fullblock_vectors.txt").lines() {
+            let f: Vec<&str> = line.split(' ').collect();
+            match f[0] {
+                "now" => now = f[1].parse().expect("now"),
+                "accept" if f[2] == "true" => {
+                    let raw = dcroxide_testutil::unhex(f[4]);
+                    let (block, _) = MsgBlock::from_bytes(&raw).expect("block");
+                    if blocks
+                        .last()
+                        .is_some_and(|prev| block.header.prev_block != prev.header.block_hash())
+                    {
+                        break;
+                    }
+                    blocks.push(block);
+                }
+                _ => {}
+            }
+        }
+        (blocks, now)
     }
 
     /// dcrd's `recentContextChecks` is an `lru.Set` of
@@ -7260,6 +7450,8 @@ mod tests {
 
         let params = dcroxide_chaincfg::regnet_params();
         let mut chain = Chain::new(&params, Hash::ZERO, false);
+        set_test_clock(0);
+        use_test_clock(&mut chain);
         let mut now = 0;
         let blocks: Vec<MsgBlock> = include_str!("../tests/data/fullblock_vectors.txt")
             .lines()
@@ -7280,12 +7472,14 @@ mod tests {
             })
             .collect();
         let mut blocks = blocks.iter();
-        // Process blocks at the clock until one moves the tip, returning
-        // the new tip's height.
+        // Process blocks with the periodic clock at `clock` seconds until
+        // one moves the tip, returning the new tip's height.  The
+        // adjusted time stays the battery's.
         let mut connect_one = |chain: &mut Chain, clock: i64| loop {
+            set_test_clock(clock);
             let before = chain.best_chain.tip();
             let block = blocks.next().expect("the battery has blocks left");
-            let (_, errs) = chain.process_block(block, clock, &params);
+            let (_, errs) = chain.process_block(block, now, &params);
             let is_orphan = errs.len() == 1 && errs[0].kind == RuleErrorKind::MissingParent;
             assert!(errs.is_empty() || is_orphan, "{errs:?}");
             let tip = chain.best_chain.tip();
@@ -7294,15 +7488,14 @@ mod tests {
             }
         };
 
-        // The first connect only stamps the clock, and nothing prunes
-        // within the interval.
+        // Nothing prunes within the interval of the chain's stamp.
         for _ in 0..40 {
-            connect_one(&mut chain, now);
+            connect_one(&mut chain, CACHED_TIPS_PRUNE_INTERVAL_SECS - 1);
         }
         assert_eq!(chain.index.cached_tips_start(), 0, "pruned too early");
 
         // A connect one interval on prunes relative to its block.
-        let later = now + CACHED_TIPS_PRUNE_INTERVAL_SECS;
+        let later = CACHED_TIPS_PRUNE_INTERVAL_SECS;
         let height = connect_one(&mut chain, later);
         assert!(height > CACHED_TIPS_PRUNE_DEPTH, "the chain is deep enough");
         assert_eq!(
@@ -7325,6 +7518,133 @@ mod tests {
             chain.index.cached_tips_start(),
             height - CACHED_TIPS_PRUNE_DEPTH
         );
+    }
+
+    /// The chain pruner, the utxo cache's periodic flush and the
+    /// cached-tip prune are timed on the monotonic clock, as dcrd times
+    /// them with `time.Now()` differences (`prune.go:82-84`,
+    /// `utxocache.go:669`, `blockindex.go:1052`): a step of the adjusted
+    /// clock neither hastens them nor, stepping back, stops them until
+    /// it has made the step up.  The port timed all three on the
+    /// adjusted clock, so correcting a clock that ran eight hours fast
+    /// left a current node unpruned for eight hours (review finding
+    /// GAP07#1).
+    #[test]
+    fn the_periodic_jobs_run_on_the_monotonic_clock() {
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = dcroxide_database::Options::new(dir.path().join("chain"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create database");
+        let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("open chain");
+        set_test_clock(0);
+        use_test_clock(&mut chain);
+        let (blocks, now) = battery_main_chain();
+        assert!(blocks.len() > 41, "the battery has a long main chain");
+        let connect = |chain: &mut Chain, block: &MsgBlock, adjusted: i64| {
+            let (_, errs) = chain.process_block(block, adjusted, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+            assert_eq!(
+                chain.store.node(chain.best_chain.tip().expect("tip")).hash,
+                block.header.block_hash()
+            );
+        };
+        // Two days on, every block looks old, so the chain never
+        // latches to current and forces a flush of its own.
+        const HOUR: i64 = 60 * 60;
+        let fast = now + 48 * HOUR;
+        let stamps = |chain: &Chain| {
+            (
+                chain.last_prune_nanos,
+                chain.utxo_last_flush_nanos,
+                chain.cached_tips_last_pruned_nanos,
+            )
+        };
+
+        // The adjusted clock jumps eight hours ahead while the
+        // monotonic clock stands still: nothing is due.
+        for block in &blocks[..20] {
+            connect(&mut chain, block, fast - 8 * HOUR);
+        }
+        for block in &blocks[20..40] {
+            connect(&mut chain, block, fast);
+        }
+        assert_eq!(stamps(&chain), (Some(0), Some(0), Some(0)));
+
+        // The adjusted clock is corrected eight hours back while ten
+        // minutes pass: every job is past its interval and runs.
+        set_test_clock(10 * 60);
+        connect(&mut chain, &blocks[40], fast - 8 * HOUR);
+        let ten_minutes = Some(10 * 60 * NANOS_PER_SEC);
+        assert_eq!(stamps(&chain), (ten_minutes, ten_minutes, ten_minutes));
+        let tip = chain.best_chain.tip().expect("tip");
+        assert_eq!(chain.utxo_last_flush_hash, chain.store.node(tip).hash);
+    }
+
+    /// With no monotonic clock (a build without `std`), a flush made
+    /// before the first processing call hands in the adjusted time
+    /// leaves the flush stamp for that call to seed, so no periodic
+    /// flush fires within the interval of startup, as dcrd's
+    /// `lastFlushTime: time.Now()` at cache construction ensures.  The
+    /// GAP07#1 fix stamped such a flush at adjusted time zero, which
+    /// blocked the seeding and made the first block after gettxoutsetinfo
+    /// (or after a size-limit flush in the open's catch-up) flush at
+    /// once.
+    #[test]
+    fn without_a_monotonic_clock_an_early_flush_leaves_the_stamp_to_seed() {
+        fn no_clock() -> Option<i64> {
+            None
+        }
+        let params = dcroxide_chaincfg::regnet_params();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opts = dcroxide_database::Options::new(dir.path().join("chain"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create database");
+        let mut chain = Chain::open(db, &params, Hash::ZERO, false, 0).expect("open chain");
+        // What a build without `std` holds once the chain is open: no
+        // clock, and no stamp that could be read from one.
+        chain.periodic_clock = no_clock;
+        chain.last_prune_nanos = None;
+        chain.utxo_last_flush_nanos = None;
+        chain.cached_tips_last_pruned_nanos = None;
+        let genesis = chain.store.node(chain.best_chain.tip().expect("tip")).hash;
+        let (blocks, now) = battery_main_chain();
+        assert!(blocks.len() > 21, "the battery has a long main chain");
+        let connect = |chain: &mut Chain, block: &MsgBlock, adjusted: i64| {
+            let (_, errs) = chain.process_block(block, adjusted, &params);
+            assert!(errs.is_empty(), "{errs:?}");
+        };
+        // Two days on, every block looks old, so the chain never
+        // latches to current and forces a flush of its own.
+        let fast = now + 48 * 60 * 60;
+
+        // gettxoutsetinfo before the first block: there is no time to
+        // stamp the flush with.
+        chain.flush_utxo_cache_for_stats().expect("stats flush");
+        assert_eq!(chain.utxo_last_flush_nanos, None);
+
+        // The first processing call seeds every stamp with its adjusted
+        // time, and nothing is due within the interval.
+        for block in &blocks[..20] {
+            connect(&mut chain, block, fast);
+        }
+        let seeded = Some(fast * NANOS_PER_SEC);
+        assert_eq!(
+            (
+                chain.last_prune_nanos,
+                chain.utxo_last_flush_nanos,
+                chain.cached_tips_last_pruned_nanos
+            ),
+            (seeded, seeded, seeded)
+        );
+        assert_eq!(
+            chain.utxo_last_flush_hash, genesis,
+            "flushed within the interval"
+        );
+
+        // One flush interval on, the periodic flush runs.
+        let later = fast + UTXO_PERIODIC_FLUSH_SECS;
+        connect(&mut chain, &blocks[20], later);
+        assert_eq!(chain.utxo_last_flush_nanos, Some(later * NANOS_PER_SEC));
+        assert_eq!(chain.utxo_last_flush_hash, blocks[20].header.block_hash());
     }
 
     /// A block that extends the tip is attached, and announced, as the
@@ -7466,5 +7786,58 @@ mod tests {
         assert_eq!(chain.height_range(0, 1), Ok(alloc::vec![genesis]));
         assert_eq!(chain.height_range(0, 5), Ok(alloc::vec![genesis]));
         assert_eq!(chain.height_range(1, 5), Ok(Vec::new()));
+    }
+
+    /// The ticket database layer's errors reach the chain as dcrd's:
+    /// a database error unchanged, so a `database.ErrCorruption` read
+    /// from the ticket rows still takes the sync manager's corruption
+    /// branch, and a ticket database or stake rule error as its bare
+    /// description (review finding RG03#2).  The port rewrapped every
+    /// one as a driver-specific error over its debug rendering.
+    #[test]
+    fn ticket_database_errors_keep_dcrds_kind_and_text() {
+        use dcroxide_stake::stakedb::StakeDbError;
+
+        let corruption = stake_db_to_db_error(StakeDbError::Db(dcroxide_database::Error {
+            kind: dcroxide_database::ErrorKind::Corruption,
+            description: String::from("checksum mismatch"),
+        }));
+        assert_eq!(corruption.kind, dcroxide_database::ErrorKind::Corruption);
+        assert_eq!(corruption.description, "checksum mismatch");
+        assert!(is_persisted_db_corruption(&persist_rule_error(
+            crate::chaindb::ChainDbError::Db(corruption)
+        )));
+
+        let missing = stake_db_to_db_error(StakeDbError::Ticket(
+            dcroxide_stake::ticketdb::TicketDbError {
+                kind: dcroxide_stake::ticketdb::TicketDbErrorKind::MissingKey,
+                description: String::from("missing key 00 to delete"),
+            },
+        ));
+        assert_eq!(missing.kind, dcroxide_database::ErrorKind::DriverSpecific);
+        assert_eq!(missing.description, "missing key 00 to delete");
+
+        let rule = stake_db_to_db_error(StakeDbError::Rule(dcroxide_stake::RuleError {
+            kind: dcroxide_stake::ErrorKind::DatabaseCorrupt,
+            description: String::from("best state corruption"),
+        }));
+        assert_eq!(rule.description, "best state corruption");
+    }
+
+    /// A chain database failure raised inside a database update that is
+    /// not itself a database error (a missing bucket, a row that will
+    /// not serialize) reaches the caller as its own text, not a debug
+    /// dump of `ChainDbError` (review finding RG03#2).
+    #[test]
+    fn chain_database_failures_keep_their_own_text() {
+        let err = chain_db_to_db_error(crate::chaindb::ChainDbError::Corrupt(String::from(
+            "missing utxo set bucket",
+        )));
+        assert_eq!(err.kind, dcroxide_database::ErrorKind::DriverSpecific);
+        assert_eq!(err.description, "missing utxo set bucket");
+        assert_eq!(
+            persist_rule_error(crate::chaindb::ChainDbError::Db(err)).description,
+            "missing utxo set bucket"
+        );
     }
 }

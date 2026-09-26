@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use dcroxide_chainhash::{HASH_SIZE, Hash};
-use dcroxide_database::{BlockRegion, Database, Transaction};
+use dcroxide_database::{BlockRegion, Bucket, Database, Transaction};
 use dcroxide_wire::{MsgBlock, var_int_serialize_size};
 
 use crate::common::{
@@ -198,16 +198,17 @@ fn put_tx_index_entry(target: &mut [u8], block_id: u32, tx_loc: TxLoc, block_ind
 }
 
 /// Store a serialized transaction index entry (dcrd
-/// `dbPutTxIndexEntry`).
+/// `dbPutTxIndexEntry`) in the index bucket, `None` when it is missing.
+/// dcrd resolves the bucket inside the helper, once per transaction;
+/// the callers here resolve it once per block and pass it in, which is
+/// the same bucket, since nothing the index writes touches the bucket
+/// index.  A missing bucket still fails at the first use.
 fn db_put_tx_index_entry(
-    db_tx: &Transaction,
+    tx_index: Option<&Bucket<'_>>,
     tx_hash: &Hash,
     serialized_data: &[u8],
 ) -> Result<(), IdxError> {
-    let meta = db_tx.metadata();
-    let tx_index = meta
-        .bucket(TX_INDEX_KEY)
-        .ok_or_else(|| bucket_missing(TX_INDEX_KEY))?;
+    let tx_index = tx_index.ok_or_else(|| bucket_missing(TX_INDEX_KEY))?;
     tx_index.put(&tx_hash.0, serialized_data)?;
     Ok(())
 }
@@ -278,12 +279,13 @@ fn db_add_tx_index_entries(
     // serialized block.
     let (tx_locs, stake_tx_locs) = tx_loc(block);
 
+    let tx_index = db_tx.metadata().bucket(TX_INDEX_KEY);
     let add_entries =
         |txns: &[dcroxide_wire::MsgTx], tx_locs: &[(u32, u32)]| -> Result<(), IdxError> {
             let mut serialized = [0u8; TX_ENTRY_SIZE];
             for (i, tx) in txns.iter().enumerate() {
                 put_tx_index_entry(&mut serialized, block_id, tx_locs[i], i as u32);
-                db_put_tx_index_entry(db_tx, &tx.tx_hash(), &serialized)?;
+                db_put_tx_index_entry(tx_index.as_ref(), &tx.tx_hash(), &serialized)?;
             }
             Ok(())
         };
@@ -296,12 +298,11 @@ fn db_add_tx_index_entries(
 }
 
 /// Remove the most recent transaction index entry for the given hash
-/// (dcrd `dbRemoveTxIndexEntry`).
-fn db_remove_tx_index_entry(db_tx: &Transaction, tx_hash: &Hash) -> Result<(), IdxError> {
-    let meta = db_tx.metadata();
-    let tx_index = meta
-        .bucket(TX_INDEX_KEY)
-        .ok_or_else(|| bucket_missing(TX_INDEX_KEY))?;
+/// (dcrd `dbRemoveTxIndexEntry`) from the index bucket, `None` when it
+/// is missing; the caller resolves it once per block, as for
+/// [`db_put_tx_index_entry`].
+fn db_remove_tx_index_entry(tx_index: Option<&Bucket<'_>>, tx_hash: &Hash) -> Result<(), IdxError> {
+    let tx_index = tx_index.ok_or_else(|| bucket_missing(TX_INDEX_KEY))?;
     if tx_index.get(&tx_hash.0).is_none() {
         return Err(IdxError::Other(format!(
             "can't remove non-existent transaction {tx_hash} from the transaction index"
@@ -314,11 +315,12 @@ fn db_remove_tx_index_entry(db_tx: &Transaction, tx_hash: &Hash) -> Result<(), I
 /// Remove the latest transaction entry for every transaction in both
 /// trees of the passed block (dcrd `dbRemoveTxIndexEntries`).
 fn db_remove_tx_index_entries(db_tx: &Transaction, block: &MsgBlock) -> Result<(), IdxError> {
+    let tx_index = db_tx.metadata().bucket(TX_INDEX_KEY);
     for tx in &block.transactions {
-        db_remove_tx_index_entry(db_tx, &tx.tx_hash())?;
+        db_remove_tx_index_entry(tx_index.as_ref(), &tx.tx_hash())?;
     }
     for tx in &block.stransactions {
-        db_remove_tx_index_entry(db_tx, &tx.tx_hash())?;
+        db_remove_tx_index_entry(tx_index.as_ref(), &tx.tx_hash())?;
     }
     Ok(())
 }
@@ -619,6 +621,10 @@ impl Indexer for TxIndex {
 
     fn notify_sync_subscribers(&mut self) {
         notify_sync_subscribers(&mut self.subscribers);
+    }
+
+    fn has_sync_subscribers(&self) -> bool {
+        !self.subscribers.is_empty()
     }
 
     fn drop_index(

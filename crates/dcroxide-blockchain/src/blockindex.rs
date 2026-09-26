@@ -8,11 +8,19 @@
 //! ([`NodeStore`]) with index-based links, which both the block index
 //! and the chain view borrow.  dcrd's short-key/collision map pair is
 //! a pure memory optimization over a hash-keyed map and is not
-//! reproduced; neither are the mutex wrappers (single-threaded here
-//! until the chain engine settles concurrency), the database flush
-//! machinery (`modified`/`Flush`, which arrive with engine
-//! persistence), or the wall-clock cached-tip prune timer (the prune
-//! itself is exposed directly, and the engine's connect path times it).
+//! reproduced, and neither are its mutex wrappers: the index lives in
+//! the chain engine, which the daemon shares behind one lock.
+//!
+//! dcrd's set of modified nodes is ported
+//! ([`BlockIndex::mark_modified`], [`BlockIndex::take_modified`]), and
+//! the engine writes it to the database (`Chain::flush_block_index`,
+//! dcrd's `flushBlockIndex` over `blockIndex.Flush`) after every
+//! accepted header, connect and disconnect.  The engine takes the rows
+//! out of the set before the write, where dcrd clears the set only once
+//! the write succeeds; PARITY.md records that divergence.  The periodic
+//! cached-tip prune is timed by the engine's connect path
+//! (`Chain::maybe_prune_cached_tips`, on the monotonic clock dcrd's
+//! `time.Since` reads); the prune itself is exposed directly.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
@@ -191,17 +199,61 @@ pub fn calc_skip_list_height(height: i64) -> i64 {
     clear_lowest_one_bit(clear_lowest_one_bit(height))
 }
 
+/// Decode compact difficulty bits into an unsigned 256-bit integer,
+/// with flags for a set sign bit and for a value too large for 256
+/// bits (dcrd `primitives.DiffBitsToUint256`,
+/// `internal/staging/primitives/pow.go:45-88`).
+fn diff_bits_to_uint256(bits: u32) -> (Uint256, bool, bool) {
+    // Extract the mantissa, sign bit, and exponent.
+    let mantissa = bits & 0x007f_ffff;
+    let is_sign_bit_set = bits & 0x0080_0000 != 0;
+    let exponent = bits >> 24;
+
+    // Nothing to do when the mantissa is zero as any multiple of it
+    // will necessarily also be 0 and therefore it can never be negative
+    // or overflow.
+    if mantissa == 0 {
+        return (Uint256::ZERO, false, false);
+    }
+
+    // N = mantissa * 256^(exponent-3).
+    if exponent <= 3 {
+        let n = Uint256::from_u64(u64::from(mantissa >> (8 * (3 - exponent))));
+        return (n, is_sign_bit_set, false);
+    }
+
+    // Any encoded exponent of 35 or more overflows, as do the larger
+    // mantissas at exponents 33 and 34.
+    let overflows = exponent >= 35
+        || (exponent >= 34 && mantissa > 0xff)
+        || (exponent >= 33 && mantissa > 0xffff);
+    if overflows {
+        return (Uint256::ZERO, is_sign_bit_set, true);
+    }
+    let mut n = Uint256::from_u64(u64::from(mantissa));
+    n.lsh(8 * (exponent - 3));
+    (n, is_sign_bit_set, false)
+}
+
 /// The proof of work as a 256-bit integer for the given difficulty
-/// bits (dcrd `primitives.CalcWork` semantics via the standalone
-/// big-integer implementation, which is zero for invalid or negative
-/// targets).
+/// bits, zero for a negative, overflowing or zero target (dcrd
+/// `primitives.CalcWork`, `internal/staging/primitives/pow.go:162-196`,
+/// which `initBlockNode` uses for the work sum).
+///
+/// dcrd computes 2^256 / (diff+1) on fixed-precision integers as
+/// (^diff / (diff+1)) + 1, which cannot divide by zero because a target
+/// of 2^256-1 cannot be encoded in the difficulty bits.  The result
+/// equals the standalone big-integer `calc_work` for every input; the
+/// fixed-width form allocates nothing, and it runs for every node the
+/// index loads or creates.
 fn calc_work_uint256(bits: u32) -> Uint256 {
-    let work = dcroxide_standalone::calc_work(bits);
-    let (_, bytes) = work.to_bytes_be();
-    let mut be = [0u8; 32];
-    let n = bytes.len().min(32);
-    be[32 - n..].copy_from_slice(&bytes[bytes.len() - n..]);
-    Uint256::from_be_bytes(&be)
+    let (mut diff, is_negative, overflows) = diff_bits_to_uint256(bits);
+    if is_negative || overflows || diff.is_zero() {
+        return Uint256::ZERO;
+    }
+    let mut divisor = Uint256::from_u64(1);
+    divisor.add(&diff);
+    *diff.not().div(&divisor).add_u64(1)
 }
 
 /// Compare two hashes as little-endian uint256s (dcrd
@@ -265,6 +317,13 @@ pub struct NodeStore {
     /// dcrd's `cachedBlake3WorkDiffCandidateAnchor`: the candidate
     /// anchor the positional difficulty check last matched.
     pub(crate) blake3_work_diff_candidate_anchor: core::cell::Cell<Option<NodeId>>,
+    /// The node a branch view last served, with that branch's tip.  It
+    /// is not a dcrd cache: dcrd's walks step `node.parent`, and a
+    /// height-indexed view that resumes from this node does the same
+    /// (one hop per step) instead of descending the skip list from the
+    /// tip at every step.  Node links never change once a node exists,
+    /// so the node stays an ancestor of that tip for good.
+    pub(crate) branch_cursor: core::cell::Cell<Option<(NodeId, NodeId)>>,
 }
 
 impl NodeStore {
@@ -721,8 +780,9 @@ impl BlockIndex {
     }
 
     /// Remove old cached chain tips relative to the passed best node
-    /// (dcrd `pruneCachedTips`, sans the wall-clock interval, which the
-    /// engine's `Chain::maybe_prune_cached_tips` drives).
+    /// (dcrd `pruneCachedTips`, sans the time stamp and the interval,
+    /// which the engine keeps and `Chain::maybe_prune_cached_tips`
+    /// checks).
     pub fn prune_cached_tips(&mut self, store: &NodeStore, best_node: NodeId) {
         let height = store.node(best_node).height - CACHED_TIPS_PRUNE_DEPTH;
         if height <= 0 {
@@ -803,9 +863,10 @@ impl BlockIndex {
 
     /// How many nodes carry unflushed changes.
     ///
-    /// The headers-first sync path consults this to bound the set: every
-    /// accepted header marks a node, and nothing drains the set until a
-    /// *block* connects.
+    /// The engine's block index flush reads this to skip the database
+    /// write entirely when nothing is modified, as dcrd's
+    /// `blockIndex.Flush` returns early on an empty set
+    /// (`blockindex.go:1409-1414`).
     pub fn modified_len(&self) -> usize {
         self.modified.len()
     }
@@ -1021,5 +1082,80 @@ mod tests {
         assert_eq!(store.node(child).height, 1);
         assert_eq!(store.node(child).parent, Some(genesis));
         assert_eq!(store.ancestor(child, 0), Some(genesis));
+    }
+
+    /// The standalone big-integer work, as the 256-bit value the index
+    /// computed before the fixed-precision port.
+    fn big_work(bits: u32) -> Uint256 {
+        let (_, bytes) = dcroxide_standalone::calc_work(bits).to_bytes_be();
+        let mut be = [0u8; 32];
+        be[32 - bytes.len()..].copy_from_slice(&bytes);
+        Uint256::from_be_bytes(&be)
+    }
+
+    /// The fixed-precision work matches dcrd's `primitives.TestCalcWork`
+    /// table and the big-integer `calc_work` (itself pinned by dcrd's
+    /// standalone vectors and the oracle) over every exponent and sign
+    /// with boundary and random mantissas (review finding C2-p#4).
+    #[test]
+    fn fixed_precision_work_matches_dcrd_and_the_big_integer_form() {
+        // dcrd internal/staging/primitives/pow_test.go TestCalcWork.
+        for (name, bits, want) in [
+            (
+                "mainnet block 1",
+                0x1b01ffffu32,
+                "0000000000000000000000000000000000000000000000000000800040002000",
+            ),
+            (
+                "mainnet block 288",
+                0x1b01330e,
+                "0000000000000000000000000000000000000000000000000000d56f2dcbe105",
+            ),
+            (
+                "higher diff (exponent 24)",
+                0x185fb28a,
+                "000000000000000000000000000000000000000000000002acd33ddd458512da",
+            ),
+            (
+                "zero",
+                0,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            (
+                "max uint256",
+                0x2100ffff,
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            ),
+            (
+                "negative target difficulty",
+                0x1810000,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ] {
+            let want: [u8; 32] = dcroxide_testutil::unhex(want).try_into().expect("32 bytes");
+            assert_eq!(
+                calc_work_uint256(bits),
+                Uint256::from_be_bytes(&want),
+                "{name}"
+            );
+        }
+
+        let mut rng = dcroxide_testutil::SplitMix64::from_entropy("calc work uint256");
+        let mantissas = [0u32, 1, 0xff, 0x100, 0xffff, 0x1_0000, 0x7f_ffff];
+        for exponent in 0u32..=255 {
+            for sign in [0u32, 0x0080_0000] {
+                for mantissa in mantissas
+                    .into_iter()
+                    .chain((0..8).map(|_| rng.below(0x80_0000) as u32))
+                {
+                    let bits = exponent << 24 | sign | mantissa;
+                    assert_eq!(calc_work_uint256(bits), big_work(bits), "bits {bits:#010x}");
+                }
+            }
+        }
+        for _ in 0..100_000 {
+            let bits = rng.next_u64() as u32;
+            assert_eq!(calc_work_uint256(bits), big_work(bits), "bits {bits:#010x}");
+        }
     }
 }

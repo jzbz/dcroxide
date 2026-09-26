@@ -6,7 +6,9 @@
 //! recovery.  dcrd delivers notifications through a buffered channel
 //! serviced by goroutines and checks sync subscribers on a periodic
 //! ticker; this port delivers synchronously with identical state
-//! transitions, leaving the concurrency to the daemon phase.
+//! transitions, on the daemon's block-processing thread.  A dedicated
+//! index thread is an open, unmeasured decision (the
+//! `internal/blockchain/indexers` row of PARITY.md).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -283,12 +285,31 @@ impl IndexSubscriber {
 
             self.notify_dependent(chain, ntfn)?;
 
+            // dcrd's `maybeNotifySubscribers` reads the chain tip and the
+            // index tip only to decide whether to signal the index's sync
+            // waiters, and signalling none is a no-op.  The daemon
+            // registers none (its RPC seams poll the index tip instead),
+            // so without a waiter only the interrupt check runs, sparing
+            // every update a read transaction and the chain lock.  The
+            // tip read's error, which dcrd could return here, would need
+            // the database to fail right after this update committed; the
+            // next update reads the tip first and reports it then.
+            let queryer = {
+                let guard = idx.lock().expect("indexer lock poisoned");
+                guard.has_sync_subscribers().then(|| guard.queryer())
+            };
+            let Some(queryer) = queryer else {
+                if interrupt_requested(&self.interrupt) {
+                    return Err(indexer_error(ErrorKind::InterruptRequested, INTERRUPT_MSG));
+                }
+                return Ok(());
+            };
+
             // Read the chain tip before taking the indexer lock again:
             // the queryer locks the chain, and holding the index mutex
             // while that waits would stall every reader of the index
             // (dcrd's readers take no index-wide lock at all) for as
             // long as a block validation holds the chain.
-            let queryer = idx.lock().expect("indexer lock poisoned").queryer();
             let best = queryer.best();
             maybe_notify_subscribers(
                 &self.interrupt,
@@ -620,11 +641,12 @@ mod tests {
         }
     }
 
-    /// An index that only tracks its tip.
+    /// An index that only tracks its tip, counting the reads of it.
     struct TipIndex {
         db: Arc<Database>,
         chain: Arc<dyn ChainQueryer>,
         tip: (i64, Hash),
+        tip_calls: AtomicUsize,
         subscribers: Vec<SyncWaiter>,
     }
 
@@ -645,6 +667,7 @@ mod tests {
             Arc::clone(&self.chain)
         }
         fn tip(&self) -> Result<(i64, Hash), IdxError> {
+            self.tip_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.tip)
         }
         fn create(&self, _: &Transaction) -> Result<(), IdxError> {
@@ -666,6 +689,9 @@ mod tests {
         fn notify_sync_subscribers(&mut self) {
             notify_sync_subscribers(&mut self.subscribers);
         }
+        fn has_sync_subscribers(&self) -> bool {
+            !self.subscribers.is_empty()
+        }
         fn drop_index(
             &self,
             _: &Interrupt,
@@ -676,12 +702,18 @@ mod tests {
         }
     }
 
-    /// The sync check after an update reads the chain tip with the index
-    /// mutex released.  dcrd's readers take no index-wide lock, so the
-    /// index lock must not be held while the queryer waits on the chain:
-    /// every reader of the index would wait behind a block validation.
-    #[test]
-    fn the_sync_check_reads_the_chain_tip_without_the_index_lock() {
+    /// A tip index at height 0 subscribed to a fresh subscriber, a
+    /// probing queryer whose chain tip is height 1, and the connect
+    /// notification for that block.
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        queryer: Arc<ProbeQueryer>,
+        index: Arc<Mutex<TipIndex>>,
+        subscriber: IndexSubscriber,
+        ntfn: IndexNtfn,
+    }
+
+    fn fixture() -> Fixture {
         let dir = tempfile::tempdir().expect("tempdir");
         let params = dcroxide_chaincfg::simnet_params();
         let opts = Options::new(dir.path().join("db"), params.net.0);
@@ -706,6 +738,7 @@ mod tests {
             db,
             chain: Arc::clone(&queryer) as Arc<dyn ChainQueryer>,
             tip: (0, Hash::ZERO),
+            tip_calls: AtomicUsize::new(0),
             subscribers: Vec::new(),
         }));
         let handle: IndexerHandle = index.clone();
@@ -718,26 +751,56 @@ mod tests {
         subscriber
             .subscribe("tip index", handle, NO_PREREQS)
             .expect("subscribe");
-        let synced = index.lock().expect("index").wait_for_sync();
-
-        subscriber
-            .notify(&IndexNtfn {
+        Fixture {
+            _dir: dir,
+            queryer,
+            index,
+            subscriber,
+            ntfn: IndexNtfn {
                 ntfn_type: CONNECT_NTFN,
                 block: Arc::clone(&block),
                 parent: block,
                 is_treasury_enabled: false,
-            })
-            .expect("update");
+            },
+        }
+    }
+
+    /// The sync check after an update reads the chain tip with the index
+    /// mutex released.  dcrd's readers take no index-wide lock, so the
+    /// index lock must not be held while the queryer waits on the chain:
+    /// every reader of the index would wait behind a block validation.
+    #[test]
+    fn the_sync_check_reads_the_chain_tip_without_the_index_lock() {
+        let mut f = fixture();
+        let synced = f.index.lock().expect("index").wait_for_sync();
+
+        f.subscriber.notify(&f.ntfn).expect("update");
 
         assert!(
             synced.load(Ordering::SeqCst),
             "the index reached the chain tip, so its sync subscribers are told"
         );
-        assert!(queryer.best_calls.load(Ordering::SeqCst) > 0);
+        assert!(f.queryer.best_calls.load(Ordering::SeqCst) > 0);
         assert_eq!(
-            queryer.under_index_lock.load(Ordering::SeqCst),
+            f.queryer.under_index_lock.load(Ordering::SeqCst),
             0,
             "the chain tip was read while the index mutex was held"
         );
+    }
+
+    /// With no sync waiter registered, as in the daemon, an update reads
+    /// its index tip once, for the expected height, and never the chain
+    /// tip: dcrd's `maybeNotifySubscribers` reads both only to signal
+    /// waiters (review finding C4-p#2).
+    #[test]
+    fn an_update_without_sync_waiters_skips_the_sync_check_reads() {
+        let mut f = fixture();
+
+        f.subscriber.notify(&f.ntfn).expect("update");
+
+        let index = f.index.lock().expect("index");
+        assert_eq!(index.tip, (1, f.ntfn.block.header.block_hash()));
+        assert_eq!(index.tip_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.queryer.best_calls.load(Ordering::SeqCst), 0);
     }
 }

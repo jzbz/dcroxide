@@ -1505,8 +1505,9 @@ pub(crate) fn opcode_check_sig(
     // Parse the key and signature only on a signature cache miss.  dcrd
     // parses first because its cache compares parsed values; the port's
     // compares the raw bytes, and holds an entry only for bytes that
-    // parsed and verified before, so a hit implies both parses succeed.
-    // A parse failure pushes false either way.
+    // parsed and verified before (`SigCache::add` is crate-private, and
+    // `verify_sig_with_cache` is its one caller), so a hit implies both
+    // parses succeed.  A parse failure pushes false either way.
     let valid = vm.verify_sig_with_cache(
         crate::SigCacheSuite::EcdsaSecp256k1,
         &hash,

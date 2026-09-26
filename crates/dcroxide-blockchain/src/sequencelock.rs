@@ -64,8 +64,15 @@ impl<V: VoteChainView> VersionChainView for AsVersionView<'_, V> {
 ///
 /// `lookup_block_height` stands in for dcrd's
 /// `UtxoViewpoint.LookupEntry`: it returns the confirmation height of
-/// the referenced unspent output ([`MEMPOOL_HEIGHT`] while unmined),
-/// or `None` when the output does not exist or has already been spent.
+/// the referenced output's view entry ([`MEMPOOL_HEIGHT`] while
+/// unmined), or `None` only when the view holds no entry for it.  An
+/// entry already marked spent still reports its height, because dcrd
+/// checks only `utxo == nil` (`sequencelock.go:72-73`; "has already
+/// been spent" is in its error text alone), and the block path relies
+/// on that: `check_connect_block` computes each tree's locks after
+/// that tree has been connected, when every input it looks up is
+/// already spent in the view (`validate.go:4282` before `:4313`, and
+/// `:4348` before `:4362`).
 ///
 /// This calculates the sequence lock regardless of the state of the
 /// agenda which conditionally activates it — `is_active` conveys that
