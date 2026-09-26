@@ -12,20 +12,64 @@ from-scratch Rust Monero node — instead curates roughly 280 lints at deny,
 adopted through a documented cold/warm/hot process, and keeps the lints it
 rejected as comments beside the ones it took so the reasoning survives.
 
-`arithmetic_side_effects` reaches none of the consensus crates. `blockchain`,
-`wire`, `txscript`, `stake`, `standalone`, `mempool`, `mining`, `uint256`,
-`chainhash`, `chaincfg`, `database`, `gcs`, `fees` and `base58` (and
-`testutil`) allow it crate-wide, so plain operators there are never linted.
+Since 2026-09-26 no crate allows `arithmetic_side_effects` crate-wide.
+Until then `blockchain`, `wire`, `txscript`, `stake`, `standalone`,
+`mempool`, `mining`, `uint256`, `chainhash`, `chaincfg`, `database`, `gcs`,
+`fees` and `base58` (and `testutil`, and `dcroxide-node`'s `addblock` and
+`promptsecret` binaries) did, so plain operators there were never linted.
+Every operator those allows hid is now explicit in one of two ways. Where
+dcrd's Go arithmetic wraps, the port calls `wrapping_*` at the width dcrd
+computes in, so a `uint32` sum wraps at `u32` even where the port holds it
+in an `i64`. Everywhere else the operator stays, under
+`#[allow(clippy::arithmetic_side_effects, reason = "...")]` on the smallest
+item that can carry it (a statement, block, match arm, loop or short
+function), and the reason states the bound that keeps each site it covers
+in range: a parameter's value on every network, a length checked above, a
+loop's own limit. A bound on a value read from a header has to hold for
+values no check has vetted, because fast-add skips some header checks for
+assumed-valid ancestors.
+
+Division, remainder and shifts have rules of their own, because turning
+overflow checks off does not make them behave as Go's do. Rust's `/` and
+`%` panic on `MIN / -1` and `MIN % -1` in every profile, release included,
+where Go yields `MIN` and `0`. A signed `/` or `%` keeps its operator only
+when its reason shows the divisor cannot be `-1` or the dividend cannot be
+`MIN`; otherwise it is `wrapping_div` or `wrapping_rem`, which match Go
+exactly. A zero divisor panics in both languages, and the lint also flags
+`wrapping_div` by a divisor that is not a constant, so that allow says why
+the divisor is nonzero or that dcrd panics the same way. Big-integer
+division differs in rounding instead: `num-bigint`'s `/` truncates, dcrd's
+`big.Int.Div` is Euclidean, and the two disagree for a negative dividend,
+so a port of `Div` computes Euclidean division unless its reason shows
+the dividend is non-negative: through `go_big_div`
+(`dcroxide-blockchain/src/difficulty.rs`) inside `dcroxide-blockchain`,
+where it is crate-private, and elsewhere through an equivalent correction,
+as `dcroxide-stake`'s `calculate_ticket_return_amounts` makes over
+`Uint256`. The lint does not flag shifts on primitive integers, so each
+was checked by hand. Rust's `<<` and `>>` panic in dev builds on a count
+at or past the operand's width and mask the count in release, as
+`wrapping_shl` and `wrapping_shr` always do; Go yields zero, or the sign
+fill for a signed `>>`. A shift keeps its operator when its count is
+provably below the width, and computes Go's result explicitly where it is
+not, as `checked_shl(..).unwrap_or(0)` does in `txscript`'s
+`make_script_num`.
+
 Release builds wrap on overflow (`overflow-checks = false`, pinned in
 `[profile.release]` and asserted for `release` and `dist` by
 `dcroxide-node/tests/panic_policy.rs`). Dev and test builds panic, so CI's
 `test-wrapping` job runs the whole suite a second time with
-`CARGO_PROFILE_DEV_OVERFLOW_CHECKS=false`. Open, and deferred: replacing the
-crate-level allows with per-site suppressions that carry a reason, and
-writing Go-wrapping arithmetic as explicit `wrapping_*` at Go's width, is a
-refactor across all of these crates and needs its own decision and
-sequencing (for example one crate at a time, turning the lint on as each is
-cleaned).
+`CARGO_PROFILE_DEV_OVERFLOW_CHECKS=false`.
+
+Making every site explicit surfaced eleven places where the port's
+arithmetic was not dcrd's. All eleven are fixed and pinned by tests, and
+none changes what the node does with honest data on the built-in networks:
+each needs corrupt stored rows, custom network parameters, a stake
+difficulty fast-add never checked, a sum the mempool's own limits rule
+out, a direct call into a public function, or a mining time offset beyond
+292 years. Five other differences it found stay open, and PARITY.md
+records them. Module-level allows remain in 38 modules this work did not
+take up, and `tests/*.rs` keep their file-level allows. The 2026-09-26
+addendum lists all of these.
 
 The interesting question for a **port** is narrower than "which lints are
 good": which lints catch the mistakes that Go-to-Rust transcription
@@ -212,3 +256,98 @@ x86_64-pc-windows-msvc -p dcroxide-winsvc --all-targets -- -D warnings`
 checks them from Linux, and CI's Windows test job builds and runs them. No
 other crate gains unsafe code: `dcroxide-node` still forbids it, and calls
 the two pieces through safe functions.
+
+## Addendum, 2026-09-26 — the crate-level `arithmetic_side_effects` allows are gone
+
+The refactor the Context once called open and deferred is done, and the
+Context now states the policy it left. It went crate by crate, and through
+`dcroxide-blockchain` and `txscript` module by module behind temporary
+module allows marked `arith-lint: pending`, none of which remains. A grep of
+`crates/*/src` counts what it added: 650 outer
+`#[allow(clippy::arithmetic_side_effects, reason = "...")]` attributes (271
+in `dcroxide-blockchain`, 80 in `txscript`, 62 in `wire`, 49 in `mining`,
+and 35 or fewer in each other crate) and 141 `wrapping_*` calls (78 in
+`dcroxide-blockchain`, 27 in `mining`, 10 in `standalone`, 9 in `stake`, 6
+each in `database` and `fees`, 3 in `txscript` and 2 in `gcs`). `base58`,
+`chainhash`, `chaincfg`, `mempool`, `testutil`, `uint256` and `wire` needed
+no new `wrapping_*`: none of their operators reaches an edge where dcrd's
+would wrap, and `uint256`'s modular limb arithmetic was already written
+with `wrapping_*` and `overflowing_*`. The wrapping sites are the ones dcrd
+computes at a fixed width over values a block, a stored row or a parameter
+can drive: fee, subsidy, treasury and UTXO-set sums, vote and stake-version
+tallies, `uint32` heights and counters, the block files' `uint32` write
+offset, record length and file number (as in dcrd's ffldb), GCS filter
+deltas, the script engine's byte-width small-integer and shift-count
+arithmetic, and ASERT's shift count.
+
+Where an allow can sit is narrower than the policy suggests. rustc rejects
+a lint attribute on an assignment, a compound assignment or a block's tail
+expression (E0658: attributes on expressions are unstable), and ignores one
+on a `debug_assert!` statement, so those sites take the allow on a bare
+block (`#[allow(...)] { x += 1; }`), a `let`, a loop, a match arm or the
+enclosing function. An operator in an `if` condition puts the allow on the
+whole `if`, whose reason must then bound every site inside it. Six
+`#[cfg(test)]` modules carry one allow each for test arithmetic, and
+`tests/*.rs` keep the file-level allows they had. CI's lint job runs on
+Linux only and never compiles `cfg(windows)` arithmetic: the two sites in
+`dcroxide-database`'s Windows `read_exact_at` loop show up only under
+`cargo clippy --target x86_64-pc-windows-msvc`, and a change to
+Windows-only arithmetic needs that run too.
+
+The eleven divergences it fixed (the first bullet covers two), each pinned
+by a test:
+
+- `merge_difficulty` (three divisions) and `calc_next_stake_diff_v2` (two)
+  divided big integers with truncation where dcrd's `big.Int.Div` is
+  Euclidean. The results differ only for a negative dividend, which takes
+  a negative stake difficulty or a candidate that wrapped past 2^63.
+- `calc_ticket_return_amounts` subtracted 1 from an empty length in
+  `usize` and panicked, where Go's `int` arithmetic gives an empty result.
+- `calculate_treasury_balance` widened the coinbase maturity before
+  subtracting 1. dcrd subtracts at `uint16`, so a maturity of zero looks
+  65535 blocks back, where the port found no ancestor and read a zero
+  balance.
+- `deserialize_best_chain_state` checked and sliced the work sum in
+  `usize` where dcrd uses `uint32`, which matters for records of 4 GiB or
+  more.
+- `read_deserialize_size_of_minimal_outputs` looped over a `u64` output
+  count, where dcrd's `int(numOutputs)` turns negative at 2^63 and reads no
+  outputs.
+- The block-region read summed its file offset in `u64` where dcrd's
+  ffldb wraps at `uint32`.
+- The fee estimator's `fee / size * 1000` aborted on `i64::MIN / -1`, where
+  Go wraps and leaves the transaction untracked.
+- The stake node's height gates compared the `int64` parameters whole,
+  where dcrd truncates them to `uint32` first.
+- `median_adjusted_time` subtracted the mining time offset in seconds,
+  where dcrd negates and scales it in `int64` nanoseconds, which wrap.
+- The mining view summed ancestor signature operations in `i64`, where
+  dcrd's sums are `uint32`.
+
+Five differences it found stay open, and none is reachable with honest
+data on the built-in networks. `gettxout` decodes a ticket's minimal
+outputs, which dcrd's never touches; the treasury loader rejects
+value-type flags that dcrd keeps; `GetStakeVersions` clamps its count in
+`i64` where dcrd truncates to `int32`; the script tokenizer keeps `usize`
+offsets where dcrd's are `int32`; and `is_treasury_vote_interval` returns
+false for an interval of zero, where dcrd divides by it and panics.
+PARITY.md records them: four under "Open: the port does not match dcrd
+here", and the treasury value-type flags in the `internal/blockchain`
+row's treasury-state clause.
+
+Two kinds of allow are left. Module-level `#![allow]`s remain in 38
+modules this work did not take up: eight in `dcroxide-node` (`addblock`,
+`blockdb`, `config`, `flags`, `gostd`, `ipc`, `server`, `socks`), the rest
+in `rpc`, `addrmgr`, `connmgr`, `netsync`, `mixing`, `certgen`, `dcrjson`,
+`containers` and `indexers`, and three crypto modules: `crypto`'s
+`blake256`, and `dcrec`'s `edwards` and secp256k1 `schnorr`. And 21 older
+outer allows carry no reason, in `connmgr`, `dcrec` and `dcroxide-node`'s
+`rpcrun.rs`. They are the next candidates, under the same rules.
+
+The measured fallout above predates this and has not been re-measured. The
+`clippy::allow_attributes` row (104, 93 in `src/`) and the bullet's
+`arithmetic_side_effects` count (14) cover outer attributes only, so the
+crate-level `#![allow]`s this removed never figured in them, while every
+per-site attribute it added does. By the grep's count that row is now some
+650 higher, and the `#[expect]` migration the bullet adopts, which would
+catch an allow that outlives its site, covers that many more.
