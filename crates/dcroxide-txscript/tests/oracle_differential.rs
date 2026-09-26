@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: ISC
 //! Differential tests: our script engine vs. dcrd's txscript, live through
-//! the oracle, comparing verdict *and* error kind over structured random
-//! scripts × random flag combinations, plus signature hash byte-equality
+//! the oracle, comparing verdict, error kind *and* error text over
+//! structured random scripts × random flag combinations and over scripts
+//! built at the engine's size limits, plus signature hash byte-equality
 //! over random transactions. This is the in-tree slice of the brief's
 //! always-on differential script fuzzer.
+//!
+//! The text is compared because it is observable: dcrd's script validator
+//! formats it into the rule error (`internal/blockchain/scriptval.go`), and
+//! `sendrawtransaction` hands that to the client as
+//! "rejected transaction <hash>: <err>".
 
 // Test-harness arithmetic over bounded indices and lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -13,15 +19,18 @@ use common::create_spending_tx;
 use dcroxide_chainhash::Hash;
 use dcroxide_testutil::{Oracle, SplitMix64, oracle_or_skip};
 use dcroxide_txscript::{
-    Engine, OP_16, OP_CHECKMULTISIG, OP_CHECKSIG, OP_CHECKSIGALT, OP_DATA_1, OP_DUP, OP_ELSE,
-    OP_ENDIF, OP_EQUAL, OP_HASH160, OP_IF, OP_NOTIF, OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4,
-    OP_RETURN, OP_SSTX, ScriptFlags, SigHashType, calc_signature_hash_checked,
+    Engine, MAX_OPS_PER_SCRIPT, MAX_SCRIPT_ELEMENT_SIZE, MAX_SCRIPT_SIZE, MAX_STACK_SIZE, OP_1,
+    OP_2DUP, OP_3DUP, OP_16, OP_CAT, OP_CHECKMULTISIG, OP_CHECKSIG, OP_CHECKSIGALT, OP_DATA_1,
+    OP_DEPTH, OP_DROP, OP_DUP, OP_ELSE, OP_ENDIF, OP_EQUAL, OP_HASH160, OP_IF, OP_NOP, OP_NOTIF,
+    OP_PUSHDATA1, OP_PUSHDATA2, OP_PUSHDATA4, OP_RETURN, OP_SSTX, OP_TOALTSTACK, ScriptFlags,
+    SigHashType, calc_signature_hash_checked,
 };
 use dcroxide_wire::{MsgTx, OutPoint, TxIn, TxOut, TxSerializeType};
 
 /// A structured random script: biased toward interesting shapes rather
 /// than pure noise so deep engine paths (conditionals, sig checks, pushes,
-/// stake tagging, limits) are exercised.
+/// stake tagging) are exercised.  Its lengths stay far below the engine's
+/// limits; [`limit_scripts`] builds those.
 fn random_script(rng: &mut SplitMix64, max_len: usize) -> Vec<u8> {
     let mut script = Vec::new();
     let target = rng.below(max_len as u64 + 1) as usize;
@@ -119,16 +128,17 @@ fn random_flags(rng: &mut SplitMix64) -> ScriptFlags {
 }
 
 /// Run one script pair through our engine, returning "ok" or the kind
-/// name.
+/// name and the error text.
 fn ours_exec(pk_script: &[u8], tx: &MsgTx, flags: ScriptFlags, version: u16) -> String {
     let result = Engine::new(pk_script, tx, 0, flags, version).and_then(|mut vm| vm.execute());
     match result {
         Ok(()) => "ok".to_string(),
-        Err(err) => err.kind.kind_name().to_string(),
+        Err(err) => format!("{}: {err}", err.kind.kind_name()),
     }
 }
 
-/// Run the same pair through dcrd, returning "ok" or the kind name.
+/// Run the same pair through dcrd, returning "ok" or the kind name and
+/// dcrd's `err.Error()`.
 fn theirs_exec(
     oracle: &mut Oracle,
     pk_script: &[u8],
@@ -146,8 +156,8 @@ fn theirs_exec(
     let resp = oracle.call("script_exec", &req);
     if resp["result"] == "ok" {
         "ok".to_string()
-    } else if let Some(kind) = resp["kind"].as_str() {
-        kind.to_string()
+    } else if let (Some(kind), Some(text)) = (resp["kind"].as_str(), resp["error"].as_str()) {
+        format!("{kind}: {text}")
     } else {
         panic!("oracle script_exec unexpected response: {resp}");
     }
@@ -341,6 +351,162 @@ fn engine_differential_p2sh_and_locktime() {
     }
 }
 
+/// Append an `OP_PUSHDATA2` push of `len` random nonzero bytes: the
+/// minimal encoding for every length used here (256 to 65535 bytes), and
+/// nonzero so a push left on top of the stack reads as true.
+fn push_data2(rng: &mut SplitMix64, script: &mut Vec<u8>, len: usize) {
+    assert!(
+        (256..=0xffff).contains(&len),
+        "OP_PUSHDATA2 is minimal only for 256..=65535"
+    );
+    script.push(OP_PUSHDATA2);
+    script.extend_from_slice(&(len as u16).to_le_bytes());
+    script.extend((0..len).map(|_| rng.below(255) as u8 + 1));
+}
+
+/// A script of exactly `len` bytes made of large pushes: each dropped
+/// again and a final `OP_1` when `drop` is set (a public key script), all
+/// left on the stack when it is not (a push-only signature script).
+fn sized_script(rng: &mut SplitMix64, len: usize, drop: bool) -> Vec<u8> {
+    let (per_push, tail) = if drop { (4, 1) } else { (3, 0) };
+    let mut script = Vec::with_capacity(len);
+    let mut left = len - tail;
+    while left > 0 {
+        // 2000-byte pushes until what remains fits one more push that is
+        // still at least 256 bytes long.
+        let n = if left >= 2 * per_push + 2000 + 256 {
+            2000
+        } else {
+            left - per_push
+        };
+        push_data2(rng, &mut script, n);
+        if drop {
+            script.push(OP_DROP);
+        }
+        left -= per_push + n;
+    }
+    if drop {
+        script.push(OP_1);
+    }
+    assert_eq!(script.len(), len);
+    script
+}
+
+/// A (signature script, public key script) pair on one side or the other
+/// of one of the engine's limits: `MAX_OPS_PER_SCRIPT` counted opcodes,
+/// `MAX_STACK_SIZE` items across both stacks, `MAX_SCRIPT_ELEMENT_SIZE`
+/// bytes in a push or an `OP_CAT` result, and `MAX_SCRIPT_SIZE` bytes in
+/// either script.
+fn limit_scripts(rng: &mut SplitMix64) -> (Vec<u8>, Vec<u8>) {
+    match rng.below(4) {
+        // Counted opcodes around 255 after a true push: OP_NOPs, with an
+        // occasional OP_DUP/OP_DROP pair.
+        0 => {
+            let target = MAX_OPS_PER_SCRIPT as usize - 3 + rng.below(7) as usize;
+            let mut pk = vec![OP_1];
+            let mut ops = 0;
+            while ops < target {
+                if ops + 2 <= target && rng.below(8) == 0 {
+                    pk.extend_from_slice(&[OP_DUP, OP_DROP]);
+                    ops += 2;
+                } else {
+                    pk.push(OP_NOP);
+                    ops += 1;
+                }
+            }
+            (Vec::new(), pk)
+        }
+        // Stack items around 1024: true pushes, from either script, then a
+        // few ops that grow the stack or move items to the alt stack.
+        1 => {
+            let pushes = MAX_STACK_SIZE as usize - 8 + rng.below(12) as usize;
+            let grow: Vec<u8> = (0..rng.below(5))
+                .map(|_| match rng.below(5) {
+                    0 => OP_DUP,
+                    1 => OP_2DUP,
+                    2 => OP_3DUP,
+                    3 => OP_TOALTSTACK,
+                    _ => OP_DEPTH,
+                })
+                .collect();
+            if rng.below(2) == 0 {
+                let pk = if grow.is_empty() { vec![OP_NOP] } else { grow };
+                (vec![OP_1; pushes], pk)
+            } else {
+                let mut pk = vec![OP_1; pushes];
+                pk.extend(grow);
+                (Vec::new(), pk)
+            }
+        }
+        // A push, or two pushes joined by OP_CAT, around 2048 bytes.
+        2 => {
+            let mut pk = Vec::new();
+            if rng.below(2) == 0 {
+                let len = MAX_SCRIPT_ELEMENT_SIZE - 2 + rng.below(5) as usize;
+                push_data2(rng, &mut pk, len);
+            } else {
+                let half = MAX_SCRIPT_ELEMENT_SIZE / 2;
+                let a = half - 2 + rng.below(5) as usize;
+                let b = half - 2 + rng.below(5) as usize;
+                push_data2(rng, &mut pk, a);
+                push_data2(rng, &mut pk, b);
+                pk.push(OP_CAT);
+            }
+            (Vec::new(), pk)
+        }
+        // A script around 16384 bytes, either one.
+        _ => {
+            let len = MAX_SCRIPT_SIZE - 2 + rng.below(5) as usize;
+            if rng.below(2) == 0 {
+                (Vec::new(), sized_script(rng, len, true))
+            } else {
+                (sized_script(rng, len, false), vec![OP_NOP])
+            }
+        }
+    }
+}
+
+/// Targeted differential at the engine's limits, which the random
+/// generators above never come near: each is straddled, and verdict, kind
+/// and text must agree on both sides of it.
+#[test]
+fn engine_differential_limits() {
+    let Some(mut oracle) = oracle_or_skip() else {
+        return;
+    };
+    let mut rng = SplitMix64::from_entropy("txscript-limits-differential");
+
+    const ROUNDS: usize = 400;
+    let mut seen = std::collections::BTreeSet::new();
+    for round in 0..ROUNDS {
+        let (sig_script, pk_script) = limit_scripts(&mut rng);
+        let flags = random_flags(&mut rng);
+        let tx = create_spending_tx(&sig_script, &pk_script);
+
+        let ours = ours_exec(&pk_script, &tx, flags, 0);
+        let theirs = theirs_exec(&mut oracle, &pk_script, &tx, flags, 0);
+        assert_eq!(
+            ours,
+            theirs,
+            "limit divergence at round {round}: sig={} pk={} flags={:#x}",
+            hex(&sig_script),
+            hex(&pk_script),
+            flags.0,
+        );
+        seen.insert(theirs.split(':').next().unwrap_or_default().to_string());
+    }
+    // Not vacuous: every limit was crossed, and some scripts ran clean.
+    for kind in [
+        "ok",
+        "ErrTooManyOperations",
+        "ErrStackOverflow",
+        "ErrElementTooBig",
+        "ErrScriptTooBig",
+    ] {
+        assert!(seen.contains(kind), "no round produced {kind}: {seen:?}");
+    }
+}
+
 /// A random transaction for sighash coverage.
 fn random_tx(rng: &mut SplitMix64) -> MsgTx {
     let num_in = rng.below(3) as usize + 1;
@@ -403,7 +569,7 @@ fn sighash_differential() {
 
         let ours = match calc_signature_hash_checked(&script, hash_type, &tx, idx) {
             Ok(hash) => hex(&hash),
-            Err(err) => err.kind.kind_name().to_string(),
+            Err(err) => format!("{}: {err}", err.kind.kind_name()),
         };
 
         let mut req = Vec::new();
@@ -413,13 +579,14 @@ fn sighash_differential() {
         req.extend_from_slice(&script);
         req.extend_from_slice(&tx.serialize());
         let resp = oracle.call("calc_sighash", &req);
-        let theirs = if let Some(kind) = resp["kind"].as_str() {
-            kind.to_string()
-        } else if let Some(result) = resp["result"].as_str() {
-            result.to_string()
-        } else {
-            panic!("oracle calc_sighash unexpected response: {resp}");
-        };
+        let theirs =
+            if let (Some(kind), Some(text)) = (resp["kind"].as_str(), resp["error"].as_str()) {
+                format!("{kind}: {text}")
+            } else if let Some(result) = resp["result"].as_str() {
+                result.to_string()
+            } else {
+                panic!("oracle calc_sighash unexpected response: {resp}");
+            };
 
         assert_eq!(
             ours,

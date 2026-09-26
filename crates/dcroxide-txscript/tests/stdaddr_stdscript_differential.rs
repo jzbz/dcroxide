@@ -3,12 +3,19 @@
 //! through the oracle: every address kind is generated, dumped across its
 //! full observable surface (string encoding, payment and stake scripts,
 //! hashes), and compared byte-for-byte; decode error kinds are compared
-//! over corrupted and random strings; and script classification/address
-//! extraction verdicts are compared over standard templates, mutations,
-//! and structured random scripts across all four networks.
+//! over corrupted and random strings, over every address decoded on the
+//! other networks, and over valid-checksum payloads of assorted lengths
+//! under each address ID; and script classification/address extraction
+//! verdicts are compared over every standard template (each constructor
+//! over each address kind), mutations, and structured random scripts across
+//! all four networks.  Both halves check they were not vacuous: the decode
+//! comparisons must reach each rejection behind the checksum, and the
+//! templates must be classified as all 21 script types.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
+
+use std::collections::BTreeSet;
 
 use dcroxide_chaincfg::{Params, mainnet_params, regnet_params, simnet_params, testnet3_params};
 use dcroxide_testutil::{Oracle, SplitMix64, hex, oracle_or_skip, unhex};
@@ -84,6 +91,71 @@ fn oracle_decode(
     }
 }
 
+/// Decode `s` on both sides: `ok:<encoding>` or the error kind name.
+fn decode_both(oracle: &mut Oracle, net: &str, params: &Params, s: &str) -> (String, String) {
+    let ours = match stdaddr::decode_address(s, params) {
+        Ok(addr) => format!("ok:{}", addr.encode()),
+        Err(AddrError { kind, .. }) => kind.kind_name().to_string(),
+    };
+    let theirs = match oracle_decode(oracle, net, s, 0, 0, 0) {
+        Ok(dump) => {
+            let string_line = dump
+                .lines()
+                .find_map(|l| l.strip_prefix("string="))
+                .expect("dump has string line");
+            format!("ok:{string_line}")
+        }
+        Err(kind) => kind,
+    };
+    (ours, theirs)
+}
+
+/// The five version-0 address IDs a network defines.
+fn addr_ids(params: &Params) -> [[u8; 2]; 5] {
+    [
+        params.pub_key_addr_id,
+        params.pub_key_hash_addr_id,
+        params.pkh_edwards_addr_id,
+        params.pkh_schnorr_addr_id,
+        params.script_hash_addr_id,
+    ]
+}
+
+/// One payload with a valid checksum under each of the network's address
+/// IDs.  The length is usually 20 or 33 bytes, whose encodings can have the
+/// 35 or 53 characters `DecodeAddress` hands on to `DecodeAddressV0` (its
+/// shape check rejects any other length as unsupported), so a hash-length
+/// or pubkey-length mismatch reaches the constructor: a 33-byte hash, or a
+/// 20-byte pubkey (which only mainnet's pubkey prefix encodes in 35
+/// characters).  Otherwise it is any length up to 40 bytes.  Under the
+/// pubkey ID the first byte is usually a signature type, known (0 to 2) or
+/// not (3), with or without the odd-Y flag, and the 32 random bytes after
+/// it are a valid key about half the time.
+fn checked_payloads(rng: &mut SplitMix64, params: &Params) -> Vec<String> {
+    addr_ids(params)
+        .into_iter()
+        .map(|id| {
+            let len = match rng.below(8) {
+                0..=2 => 20,
+                3..=5 => 33,
+                _ => rng.below(41) as usize,
+            };
+            let mut payload = vec![0u8; len];
+            rng.fill(&mut payload);
+            if id == params.pub_key_addr_id && !payload.is_empty() && rng.below(4) != 0 {
+                payload[0] = rng.below(4) as u8 | if rng.below(2) == 0 { 0x80 } else { 0 };
+            }
+            dcroxide_base58::check_encode(&payload, id)
+        })
+        .collect()
+}
+
+/// The kind name in a [`decode_both`] verdict, with every accepted string
+/// collapsed to `ok`.
+fn verdict_kind(verdict: &str) -> String {
+    verdict.split(':').next().unwrap_or_default().to_string()
+}
+
 /// A boundary-biased fee limit for the log2-based commitment encoding.
 fn edgy_fee_limit(rng: &mut SplitMix64) -> i64 {
     match rng.below(6) {
@@ -143,6 +215,9 @@ fn stdaddr_differential() {
     let mut rng = SplitMix64::from_entropy("stdaddr-differential");
 
     const ROUNDS: usize = 150;
+    let mut kinds = BTreeSet::new();
+    // Built once: a network's parameters are expensive to construct.
+    let foreign = networks();
     for round in 0..ROUNDS {
         for (net, params) in networks() {
             let amount = rng.below(1 << 62) as i64;
@@ -177,24 +252,37 @@ fn stdaddr_differential() {
                 let orig = corrupted[idx];
                 corrupted[idx] = if orig == b'4' { b'5' } else { b'4' };
                 let corrupted = String::from_utf8(corrupted).expect("ascii");
-                let ours = match stdaddr::decode_address(&corrupted, &params) {
-                    Ok(addr) => format!("ok:{}", addr.encode()),
-                    Err(AddrError { kind, .. }) => kind.kind_name().to_string(),
-                };
-                let theirs = match oracle_decode(&mut oracle, net, &corrupted, amount, 0, 0) {
-                    Ok(dump) => {
-                        let string_line = dump
-                            .lines()
-                            .find_map(|l| l.strip_prefix("string="))
-                            .expect("dump has string line");
-                        format!("ok:{string_line}")
-                    }
-                    Err(kind) => kind,
-                };
+                let (ours, theirs) = decode_both(&mut oracle, net, &params, &corrupted);
                 assert_eq!(
                     ours, theirs,
                     "{net}: corrupted decode divergence for {corrupted} at round {round}"
                 );
+                kinds.insert(verdict_kind(&theirs));
+
+                // The intact address on another network: a valid checksum
+                // under a prefix this network does not define.
+                let (other, other_params) = foreign
+                    .iter()
+                    .filter(|(other, _)| *other != net)
+                    .nth(rng.below(3) as usize)
+                    .expect("three other networks");
+                let (ours, theirs) = decode_both(&mut oracle, other, other_params, &encoded);
+                assert_eq!(
+                    ours, theirs,
+                    "{other}: foreign {net} address divergence for {encoded} at round {round}"
+                );
+                kinds.insert(verdict_kind(&theirs));
+            }
+
+            // Valid-checksum payloads of assorted lengths under this
+            // network's own IDs, reaching the checks behind the checksum.
+            for s in checked_payloads(&mut rng, &params) {
+                let (ours, theirs) = decode_both(&mut oracle, net, &params, &s);
+                assert_eq!(
+                    ours, theirs,
+                    "{net}: checked payload divergence for {s} at round {round}"
+                );
+                kinds.insert(verdict_kind(&theirs));
             }
 
             // Random strings in the version-0 shape and out of it.
@@ -204,22 +292,24 @@ fn stdaddr_differential() {
                 let alphabet = dcroxide_base58::ALPHABET;
                 s.push(alphabet[rng.below(58) as usize] as char);
             }
-            let ours = match stdaddr::decode_address(&s, &params) {
-                Ok(addr) => format!("ok:{}", addr.encode()),
-                Err(AddrError { kind, .. }) => kind.kind_name().to_string(),
-            };
-            let theirs = match oracle_decode(&mut oracle, net, &s, 0, 0, 0) {
-                Ok(dump) => {
-                    let string_line = dump
-                        .lines()
-                        .find_map(|l| l.strip_prefix("string="))
-                        .expect("dump has string line");
-                    format!("ok:{string_line}")
-                }
-                Err(kind) => kind,
-            };
+            let (ours, theirs) = decode_both(&mut oracle, net, &params, &s);
             assert_eq!(ours, theirs, "{net}: random string divergence for {s}");
+            kinds.insert(verdict_kind(&theirs));
         }
+    }
+
+    // Not vacuous: the comparisons reached the rejections behind the
+    // checksum, not only the checksum failure a corrupted string hits.
+    // (`ErrMalformedAddress` needs a string `DecodeAddress`'s 35-or-53
+    // shape check never passes on; `review_addr_quote.rs` pins it.)
+    for kind in [
+        "ErrBadAddressChecksum",
+        "ErrUnsupportedAddress",
+        "ErrMalformedAddressData",
+        "ErrInvalidHashLen",
+        "ErrInvalidPubKey",
+    ] {
+        assert!(kinds.contains(kind), "no decode reached {kind}: {kinds:?}");
     }
 }
 
@@ -264,6 +354,45 @@ fn analyze_theirs(oracle: &mut Oracle, net: &str, version: u16, script: &[u8]) -
     String::from_utf8(unhex(&result)).expect("dump is UTF-8")
 }
 
+/// The script from one of an address's six stake and treasury
+/// constructors (`which` modulo 6: OP_SSTX, OP_SSTXCHANGE, OP_SSGEN,
+/// OP_SSRTX and OP_TGEN tagged, then the reward commitment), or its
+/// payment script for a kind that has none.
+fn stake_script(rng: &mut SplitMix64, addr: &Address, which: u64) -> Vec<u8> {
+    let tagged = match which % 6 {
+        0 => addr.voting_rights_script(),
+        1 => addr.stake_change_script(),
+        2 => addr.pay_vote_commitment_script(),
+        3 => addr.pay_revoke_commitment_script(),
+        4 => addr.pay_from_treasury_script(),
+        _ => addr.reward_commitment_script(
+            rng.below(1 << 62) as i64,
+            edgy_fee_limit(rng),
+            edgy_fee_limit(rng),
+        ),
+    };
+    tagged.map_or_else(|| addr.payment_script().1, |(_, script)| script)
+}
+
+/// Every standard template for a network: each address kind's payment
+/// script and each stake constructor over it, a multisig, a null data
+/// script, a bare treasury add, and a nonstandard script.
+fn standard_templates(rng: &mut SplitMix64, params: &Params) -> Vec<Vec<u8>> {
+    let mut scripts = Vec::new();
+    for addr in generate_addresses(rng, params) {
+        scripts.push(addr.payment_script().1);
+        for which in 0..6 {
+            scripts.push(stake_script(rng, &addr, which));
+        }
+    }
+    let key = random_secp_pub_key(rng);
+    scripts.push(stdscript::multi_sig_script_v0(1, &[key.as_slice()]).expect("1-of-1"));
+    scripts.push(stdscript::provably_pruneable_script_v0(&rng.bytes(40)).expect("40 bytes"));
+    scripts.push(vec![0xc1]); // OP_TADD
+    scripts.push(vec![0x00, 0x87]); // OP_0 OP_EQUAL
+    scripts
+}
+
 /// A structured random script biased toward near-standard shapes.
 fn near_standard_script(rng: &mut SplitMix64, params: &Params) -> Vec<u8> {
     let addr_pool = generate_addresses(rng, params);
@@ -274,13 +403,17 @@ fn near_standard_script(rng: &mut SplitMix64, params: &Params) -> Vec<u8> {
                 .payment_script()
                 .1
         }
-        // A stake-tagged script.
+        // A script from any of the stake and treasury constructors, mostly
+        // over the two kinds that have them (P2PKH-ecdsa-secp256k1 at index
+        // 3, P2SH at 6).
         2 => {
-            let addr = &addr_pool[3 + rng.below(4) as usize % 4];
-            match addr.voting_rights_script() {
-                Some((_, s)) => s,
-                None => addr.payment_script().1,
-            }
+            let idx = match rng.below(3) {
+                0 => 3,
+                1 => 6,
+                _ => rng.below(addr_pool.len() as u64) as usize,
+            };
+            let which = rng.below(6);
+            stake_script(rng, &addr_pool[idx], which)
         }
         // A multisig script from 1-4 keys with a random threshold.
         3 => {
@@ -351,6 +484,56 @@ fn stdscript_differential() {
         return;
     };
     let mut rng = SplitMix64::from_entropy("stdscript-differential");
+
+    // Every standard template, once per network, before the random rounds.
+    let mut types = BTreeSet::new();
+    for (net, params) in networks() {
+        for script in standard_templates(&mut rng, &params) {
+            let ours = analyze_ours(0, &script, &params);
+            let theirs = analyze_theirs(&mut oracle, net, 0, &script);
+            assert_eq!(
+                ours,
+                theirs,
+                "{net}: stdscript divergence on template {}",
+                hex(&script)
+            );
+            types.extend(
+                theirs
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("type="))
+                    .map(str::to_owned),
+            );
+        }
+    }
+    // Not vacuous: every script type dcrd defines was classified.
+    for name in [
+        "nonstandard",
+        "pubkey",
+        "pubkey-ed25519",
+        "pubkey-schnorr-secp256k1",
+        "pubkeyhash",
+        "pubkeyhash-ed25519",
+        "pubkeyhash-schnorr-secp256k1",
+        "scripthash",
+        "multisig",
+        "nulldata",
+        "stakesubmission-pubkeyhash",
+        "stakesubmission-scripthash",
+        "stakegen-pubkeyhash",
+        "stakegen-scripthash",
+        "stakerevoke-pubkeyhash",
+        "stakerevoke-scripthash",
+        "stakechange-pubkeyhash",
+        "stakechange-scripthash",
+        "treasuryadd",
+        "treasurygen-pubkeyhash",
+        "treasurygen-scripthash",
+    ] {
+        assert!(
+            types.contains(name),
+            "no template classified as {name}: {types:?}"
+        );
+    }
 
     const ROUNDS: usize = 400;
     for round in 0..ROUNDS {

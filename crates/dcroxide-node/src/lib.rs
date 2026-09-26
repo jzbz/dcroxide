@@ -1,12 +1,28 @@
 // SPDX-License-Identifier: ISC
-//! Daemon assembly, ported from dcrd's package main at
-//! the network parameter groupings with their RPC
-//! ports and the configuration pipeline (`config.go`) — defaults,
-//! config file and command line precedence, and the full validation
-//! and derivation gauntlet with dcrd's exact error strings.  The
-//! command line and INI syntax layer replicating go-flags arrives
-//! with a later piece; the pipeline consumes already-split option
-//! assignments.
+//! Daemon assembly, ported from dcrd's package main and the internal
+//! packages it wires together, at the parity pin, master `b9634e01`:
+//!
+//! - configuration: the network parameter groupings with their RPC
+//!   ports (`params`), the go-flags v1.6.1 command line and INI
+//!   front-end (`flags`), and the `config.go` pipeline behind it
+//!   (`config`) — defaults, config file and command line precedence,
+//!   and the full validation and derivation gauntlet with dcrd's exact
+//!   error strings — plus the logging subsystems and log line format;
+//! - the peer-to-peer server: `server.go`'s decision core (`server`),
+//!   the threaded runtime over its `Run` and `peerHandler` goroutines
+//!   (`runtime`), the per-peer message loops and served-peer dispatch,
+//!   the outbound connection driver, seeding, SOCKS dialing, and the
+//!   netsync, mempool, mixing pool and chain notification seams;
+//! - the RPC server's HTTP and websocket serving (`rpcrun`,
+//!   `websocket`, `wsframe`), the CPU miner and block template glue,
+//!   and the optional indexes;
+//! - process plumbing: the pipe IPC protocol and runtime (`ipc`,
+//!   `pipeserve`), process limits (`limits`), the median-adjusted
+//!   network time (`mediantime`), and the `addblock` tool's core.
+//!
+//! The `dcroxide` binary (`src/bin/dcroxide.rs`) is dcrd's `dcrdMain`
+//! and `newServer` over these pieces; `addblock`, `gencerts` and
+//! `promptsecret` port dcrd's `cmd/` tools.
 
 #![forbid(unsafe_code)]
 

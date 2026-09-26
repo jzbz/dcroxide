@@ -17,7 +17,7 @@ use dcroxide_database::{Database, ErrorKind, Options};
 use dcroxide_node::addblock::{
     ADDBLOCK_HELP, AddblockConfig, AddblockConfigError, load_addblock_config, run_import,
 };
-use dcroxide_node::config::app_data_dir;
+use dcroxide_node::config::{REFUSED_DEFAULT_HOME, app_data_dir};
 use dcroxide_node::go_duration_string;
 
 /// The UTXO cache size dcrd's addblock imports with, in bytes (a fixed
@@ -83,6 +83,14 @@ fn real_main() -> Result<(), ()> {
     let home = app_data_dir(goos, "dcroxide", false, &|name| {
         dcroxide_node::flags::getenv_utf8(name, &env_refused)
     });
+    // With that lookup refused, dcrd's default holds bytes no `--datadir`
+    // can spell, so the "." it fell back to must not stand in for it: a
+    // `--datadir=./data` is not the default.
+    let home = if env_refused.borrow().is_some() {
+        String::from(REFUSED_DEFAULT_HOME)
+    } else {
+        home
+    };
     let default_data_dir = Path::new(&home).join("data").to_string_lossy().into_owned();
 
     let args: Vec<String> = match dcroxide_node::flags::args_after_program() {
@@ -109,8 +117,16 @@ fn real_main() -> Result<(), ()> {
     };
     // Refused only now, so the help and configuration exits stay dcrd's,
     // and before the import opens anything under the default data
-    // directory.
-    if let Some(err) = env_refused.take() {
+    // directory.  A `--datadir` naming another leaves the default, and the
+    // `$HOME` dcrd reads for it at package init, unused, so dcrd's import
+    // runs: refused only when the data directory is the default one.
+    let default_net_dir = Path::new(&default_data_dir)
+        .join(params.name)
+        .to_string_lossy()
+        .into_owned();
+    if cfg.data_dir == default_net_dir
+        && let Some(err) = env_refused.take()
+    {
         log_error(&err);
         return Err(());
     }

@@ -289,36 +289,14 @@ fn build_treasury(rng: &mut SplitMix64, params: &dcroxide_chaincfg::Params) -> M
                 tx.tx_out.push(out(rng.below(1 << 30) as i64, change));
             }
         }
-        // TSpend.
+        // TSpend, now and then with a public key prefix other than the
+        // strict compressed 0x02/0x03.
         1 => {
-            let mut sig_script = Vec::with_capacity(100);
-            sig_script.push(0x40); // OP_DATA_64
-            sig_script.extend(core::iter::repeat_n(0x11u8, 64));
-            sig_script.push(0x21); // OP_DATA_33
-            sig_script.push(if rng.below(2) == 0 { 0x02 } else { 0x03 });
-            sig_script.extend(core::iter::repeat_n(0x22u8, 32));
-            sig_script.push(0xc2); // OP_TSPEND
-            tx.tx_in.push(TxIn {
-                previous_out_point: OutPoint {
-                    hash: Hash::ZERO,
-                    index: u32::MAX,
-                    tree: 0,
-                },
-                sequence: 0xffff_ffff,
-                value_in: rng.below(1 << 40) as i64,
-                block_height: 0,
-                block_index: 0xffff_ffff,
-                signature_script: sig_script,
-            });
-            // OP_RETURN <32-byte random>.
-            let mut opret = vec![0x6a, 0x20];
-            opret.extend_from_slice(&random_hash(rng).0);
-            tx.tx_out.push(out(0, opret));
-            for _ in 0..(rng.below(2) + 1) {
-                let addr = random_stake_addr(rng, params);
-                let (_, payout) = addr.pay_from_treasury_script().expect("stake address");
-                tx.tx_out.push(out(rng.below(1 << 39) as i64, payout));
-            }
+            let prefix = match rng.below(4) {
+                0 => rng.next_u64() as u8,
+                _ => 0x02 | rng.below(2) as u8,
+            };
+            tx = build_tspend(rng, params, prefix);
         }
         // Treasury base.
         _ => {
@@ -333,9 +311,53 @@ fn build_treasury(rng: &mut SplitMix64, params: &dcroxide_chaincfg::Params) -> M
     tx
 }
 
-/// Mutate a transaction to probe classification boundaries.
+/// A treasury spend whose signature script carries a public key with
+/// the given prefix byte: `OP_DATA_64 <sig> OP_DATA_33 <prefix ‖ 32
+/// bytes> OP_TSPEND`, the 100-byte shape `CheckTSpend` requires.
+fn build_tspend(
+    rng: &mut SplitMix64,
+    params: &dcroxide_chaincfg::Params,
+    pub_key_prefix: u8,
+) -> MsgTx {
+    let mut tx = base_tx(3);
+    let mut sig_script = Vec::with_capacity(100);
+    sig_script.push(0x40); // OP_DATA_64
+    sig_script.extend(core::iter::repeat_n(0x11u8, 64));
+    sig_script.push(0x21); // OP_DATA_33
+    sig_script.push(pub_key_prefix);
+    sig_script.extend(core::iter::repeat_n(0x22u8, 32));
+    sig_script.push(0xc2); // OP_TSPEND
+    tx.tx_in.push(TxIn {
+        previous_out_point: OutPoint {
+            hash: Hash::ZERO,
+            index: u32::MAX,
+            tree: 0,
+        },
+        sequence: 0xffff_ffff,
+        value_in: rng.below(1 << 40) as i64,
+        block_height: 0,
+        block_index: 0xffff_ffff,
+        signature_script: sig_script,
+    });
+    // OP_RETURN <32-byte random>.
+    let mut opret = vec![0x6a, 0x20];
+    opret.extend_from_slice(&random_hash(rng).0);
+    tx.tx_out.push(out(0, opret));
+    for _ in 0..(rng.below(2) + 1) {
+        let addr = random_stake_addr(rng, params);
+        let (_, payout) = addr.pay_from_treasury_script().expect("stake address");
+        tx.tx_out.push(out(rng.below(1 << 39) as i64, payout));
+    }
+    tx
+}
+
+/// Mutate a transaction to probe classification boundaries.  The input
+/// arms reach the checks that read signature scripts and input values:
+/// the TSpend script shape and its strict compressed public key, the
+/// empty signature script of automatic revocations and treasury bases,
+/// and the revocation's zero-fee rule.
 fn mutate(rng: &mut SplitMix64, tx: &mut MsgTx) {
-    match rng.below(8) {
+    match rng.below(11) {
         0 => tx.version = rng.below(5) as u16,
         1 => {
             if !tx.tx_out.is_empty() {
@@ -377,6 +399,54 @@ fn mutate(rng: &mut SplitMix64, tx: &mut MsgTx) {
                 tx.tx_in[i].previous_out_point.index = rng.below(4) as u32;
             }
         }
+        // Replace a signature script byte, biased toward the bytes the
+        // TSpend shape pins: the two push opcodes, the public key's
+        // prefix, and the trailing OP_TSPEND.
+        7 => {
+            if !tx.tx_in.is_empty() {
+                let i = rng.below(tx.tx_in.len() as u64) as usize;
+                let script = &mut tx.tx_in[i].signature_script;
+                if !script.is_empty() {
+                    let j = if script.len() == 100 && rng.below(2) == 0 {
+                        [0, 65, 66, 99][rng.below(4) as usize]
+                    } else {
+                        rng.below(script.len() as u64) as usize
+                    };
+                    script[j] = rng.next_u64() as u8;
+                }
+            }
+        }
+        // Shorten or lengthen a signature script by one byte.
+        8 => {
+            if !tx.tx_in.is_empty() {
+                let i = rng.below(tx.tx_in.len() as u64) as usize;
+                let script = &mut tx.tx_in[i].signature_script;
+                if rng.below(2) == 0 {
+                    script.pop();
+                } else {
+                    script.push(rng.next_u64() as u8);
+                }
+            }
+        }
+        // Rewrite an input value, biased toward the revocation's zero-fee
+        // boundary: the output total and one either side of it.
+        9 => {
+            if !tx.tx_in.is_empty() {
+                let i = rng.below(tx.tx_in.len() as u64) as usize;
+                let total = tx
+                    .tx_out
+                    .iter()
+                    .fold(0i64, |sum, o| sum.wrapping_add(o.value));
+                tx.tx_in[i].value_in = match rng.below(6) {
+                    0 => total,
+                    1 => total.wrapping_add(1),
+                    2 => total.wrapping_sub(1),
+                    3 => 0,
+                    4 => -1,
+                    _ => rng.below(1 << 44) as i64,
+                };
+            }
+        }
         _ => {
             if !tx.tx_out.is_empty() {
                 let i = rng.below(tx.tx_out.len() as u64) as usize;
@@ -394,6 +464,30 @@ fn stake_classification_differential() {
     };
     let mut rng = SplitMix64::from_entropy("stake-classify-differential");
     let params = mainnet_params();
+
+    // Every public key prefix byte on an otherwise valid TSpend, so the
+    // strict compressed encoding rule (`ErrTSpendInvalidPubkey`) is
+    // compared whatever the random rounds below reach.
+    for prefix in 0..=u8::MAX {
+        let tx = build_tspend(&mut rng, &params, prefix);
+        let ours = analyze_ours(&tx);
+        let expected_tspend = if prefix == 0x02 || prefix == 0x03 {
+            "checktspend=ok\n"
+        } else {
+            "checktspend=ErrTSpendInvalidPubkey\n"
+        };
+        assert!(
+            ours.contains(expected_tspend),
+            "prefix {prefix:#04x}: {ours}"
+        );
+        let theirs = analyze_theirs(&mut oracle, &tx);
+        assert_eq!(
+            ours,
+            theirs,
+            "stake analyze divergence at TSpend pubkey prefix {prefix:#04x}: tx={}",
+            hex(&tx.serialize())
+        );
+    }
 
     const ROUNDS: usize = 600;
     for round in 0..ROUNDS {

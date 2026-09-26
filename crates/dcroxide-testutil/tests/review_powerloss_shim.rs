@@ -28,7 +28,11 @@
 //! out right regardless, so `edge.bin` passes against it too; the overrun
 //! itself shows only under a sanitizer.
 //!
-//! Linux only, and skipped where `cc` or `python3` is missing.
+//! Linux only, and skipped where `cc` or `python3` is missing, unless
+//! `DCROXIDE_REQUIRE_FAULT_INJECTION` is set (CI sets it): this is the only
+//! automated check of the shim, and like the ENOSPC test in
+//! `dcroxide-database` it must fail rather than go green having checked
+//! nothing.
 
 // Test-harness arithmetic over small, fixed sizes.
 #![allow(clippy::arithmetic_side_effects)]
@@ -42,6 +46,9 @@ use std::process::Command;
 
 /// Set by the parent on the copy of this test it runs under the shim.
 const DRIVER: &str = "DCROXIDE_POWERLOSS_DRIVER";
+
+/// Turns a skip into a failure, as for `dcroxide-database`'s ENOSPC test.
+const REQUIRE: &str = "DCROXIDE_REQUIRE_FAULT_INJECTION";
 
 /// The shim's record buffer and fixed header (`REC_MAX`, `REC_HDR`).
 const REC_MAX: usize = 1 << 16;
@@ -119,6 +126,14 @@ fn available(tool: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// Skip loudly, or fail if the environment says this must run.
+fn skip(why: &str) {
+    if std::env::var_os(REQUIRE).is_some() {
+        panic!("{REQUIRE} is set but the powerloss shim test cannot run: {why}");
+    }
+    eprintln!("SKIP: the powerloss shim test {why} (set {REQUIRE} to make this a failure)");
+}
+
 #[test]
 fn powerloss_replay_restores_each_file_to_its_last_sync() {
     if let Some(store) = std::env::var_os(DRIVER) {
@@ -126,7 +141,7 @@ fn powerloss_replay_restores_each_file_to_its_last_sync() {
         return;
     }
     if !available("cc") || !available("python3") {
-        eprintln!("SKIP: the powerloss shim test needs cc and python3");
+        skip("needs cc and python3");
         return;
     }
 
@@ -232,4 +247,60 @@ fn powerloss_replay_restores_each_file_to_its_last_sync() {
         String::from_utf8_lossy(&replay.stdout)
     );
     let _ = fs::remove_dir_all(&work);
+}
+
+/// Without `cc` and `python3` the shim test skips only where fault
+/// injection is optional: with `DCROXIDE_REQUIRE_FAULT_INJECTION` set, as
+/// CI sets it, the same run fails instead of passing having checked
+/// nothing.
+#[test]
+fn a_missing_toolchain_fails_when_fault_injection_is_required() {
+    if std::env::var_os(DRIVER).is_some() {
+        return;
+    }
+    // A PATH naming only an empty directory finds neither tool.
+    let empty = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "review_powerloss_shim-nopath-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&empty).expect("empty PATH directory");
+    let exe = std::env::current_exe().expect("test binary path");
+    let run = |require: bool| {
+        let mut cmd = Command::new(&exe);
+        cmd.args([
+            "--exact",
+            "powerloss_replay_restores_each_file_to_its_last_sync",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("PATH", &empty)
+        .env_remove(DRIVER);
+        if require {
+            cmd.env(REQUIRE, "1");
+        } else {
+            cmd.env_remove(REQUIRE);
+        }
+        let out = cmd.output().expect("run the shim test without its tools");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), text)
+    };
+
+    let (passed, text) = run(false);
+    assert!(passed, "an optional run skips: {text}");
+    assert!(text.contains("SKIP: the powerloss shim test"), "{text}");
+
+    let (passed, text) = run(true);
+    assert!(
+        !passed,
+        "a required run must fail without its tools: {text}"
+    );
+    assert!(
+        text.contains("DCROXIDE_REQUIRE_FAULT_INJECTION is set"),
+        "{text}"
+    );
+    let _ = fs::remove_dir(&empty);
 }

@@ -19,8 +19,10 @@
 // Test-harness arithmetic over a fixed deadline and small counts.
 #![allow(clippy::arithmetic_side_effects)]
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,36 +34,144 @@ use dcroxide_database::{Database, Options};
 use dcroxide_indexers::{EXISTS_ADDR_INDEX_KEY, LogLevel, LogSink, TX_INDEX_KEY};
 use dcroxide_node::indexes::{IndexLogs, start_indexes};
 use dcroxide_testutil::unhex;
-use dcroxide_wire::MsgBlock;
 
-/// The leading consecutive main-chain prefix of accepted blocks from
-/// dcrd's `fullblocktests.Generate` battery, as raw regnet block bytes.
-fn accepted_prefix_raw(limit: usize) -> Vec<Vec<u8>> {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../dcroxide-blockchain/tests/data/fullblock_vectors.txt"
-    );
-    let data = std::fs::read_to_string(path).expect("fullblock vectors");
-    let mut tip = dcroxide_chaincfg::regnet_params().genesis_hash;
-    let mut blocks = Vec::new();
-    for line in data.lines() {
-        let f: Vec<&str> = line.split(' ').collect();
-        if f[0] != "accept" {
-            continue;
+/// Blocks one to `count` of a simnet chain the daemon mines over RPC,
+/// as raw block bytes.  Simnet, not the regnet `fullblocktests` battery
+/// the test once imported: a regnet start removes the block database the
+/// test builds, as dcrd's `loadBlockDB` does.  None of the simnet corpora
+/// dumped from dcrd imports into a fresh chain (their blocks are
+/// unsolved, skeletons, or spend seeded outputs), so the daemon mines
+/// them: `generate`, then each block's raw bytes from `getblock`.
+fn mined_simnet_blocks(count: usize) -> Vec<Vec<u8>> {
+    let params = dcroxide_chaincfg::simnet_params();
+    let mining_addr = dcroxide_txscript::stdaddr::new_address_pub_key_hash_ecdsa_secp256k1_v0(
+        &[0x5a; 20],
+        &params,
+    )
+    .expect("mining address");
+    let appdata = tempfile::tempdir().expect("appdata");
+    let mut child = daemon(
+        appdata.path(),
+        &[
+            "--noseeders",
+            "--nolisten",
+            "--noexistsaddrindex",
+            "--rpclisten=127.0.0.1:0",
+            "--notls",
+            "--rpcuser=user",
+            "--rpcpass=pass",
+            // The bound RPC address arrives over the pipe.
+            "--pipetx=2",
+            "--boundaddrevents",
+        ],
+    )
+    .arg(format!("--miningaddr={}", mining_addr.encode()))
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("spawn dcroxide");
+    let mut pipe = child.stderr.take().expect("stderr pipe");
+    let mut miner = KillOnDrop(child);
+    let collected = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = Arc::clone(&collected);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = pipe.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            sink.lock().expect("sink").extend_from_slice(&buf[..n]);
         }
-        let raw = unhex(f[4]);
-        let (block, _) = MsgBlock::from_bytes(&raw).expect("block");
-        if f[2] != "true" || block.header.prev_block != tip {
-            continue;
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let addr = loop {
+        if let Some(addr) = rpc_listen_addr(&collected.lock().expect("sink")) {
+            break addr;
         }
-        tip = block.header.block_hash();
-        blocks.push(raw);
-        if blocks.len() == limit {
-            break;
-        }
+        assert!(
+            Instant::now() < deadline,
+            "the RPC listener never announced its address"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let mined = rpc_call(&addr, "generate", &format!("[{count}]"));
+    assert!(mined.contains(r#""error":null"#), "{mined}");
+    let blocks = (1..=count)
+        .map(|height| {
+            let hash = string_result(&rpc_call(&addr, "getblockhash", &format!("[{height}]")));
+            unhex(&string_result(&rpc_call(
+                &addr,
+                "getblock",
+                &format!(r#"["{hash}",false]"#),
+            )))
+        })
+        .collect();
+
+    let _ = rpc_call(&addr, "stop", "[]");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while miner.0.try_wait().expect("wait").is_none() {
+        assert!(Instant::now() < deadline, "the mining daemon never stopped");
+        std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(blocks.len(), limit, "battery must provide the prefix");
     blocks
+}
+
+/// Kills a daemon however the test ends.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The payload of the first `rpclistenaddr` pipe message in the stream
+/// (dcrd `ipc.go` framing).
+fn rpc_listen_addr(bytes: &[u8]) -> Option<String> {
+    const KIND: &[u8] = b"rpclistenaddr";
+    let at = bytes
+        .windows(2 + KIND.len())
+        .position(|w| w[0] == 1 && w[1] as usize == KIND.len() && &w[2..] == KIND)?;
+    let len_at = at + 2 + KIND.len();
+    let len = u32::from_le_bytes(bytes.get(len_at..len_at + 4)?.try_into().ok()?) as usize;
+    let payload = bytes.get(len_at + 4..len_at + 4 + len)?;
+    Some(String::from_utf8_lossy(payload).into_owned())
+}
+
+/// One JSON-RPC request over plain HTTP with the `user`/`pass`
+/// credentials; the response body.
+fn rpc_call(addr: &str, method: &str, params: &str) -> String {
+    let body = format!(r#"{{"jsonrpc":"1.0","id":1,"method":"{method}","params":{params}}}"#);
+    let mut stream = TcpStream::connect(addr).expect("connect to the RPC server");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("timeout");
+    write!(
+        stream,
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Basic dXNlcjpwYXNz\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("send the request");
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response).into_owned();
+    match response.split_once("\r\n\r\n") {
+        Some((_, body)) => body.to_string(),
+        None => response,
+    }
+}
+
+/// The string result of a JSON-RPC response.
+fn string_result(response: &str) -> String {
+    let rest = response
+        .split_once(r#""result":""#)
+        .unwrap_or_else(|| panic!("no string result: {response}"))
+        .1;
+    rest[..rest.find('"').expect("closing quote")].to_string()
 }
 
 /// A capturing sink tagging each line with the subsystem it stands for
@@ -127,11 +237,11 @@ fn run_bounded(mut command: Command) -> (Option<i32>, Vec<String>, String) {
     (out.status.code(), lines, stdout)
 }
 
-/// The daemon over a regnet application data directory.
+/// The daemon over a simnet application data directory.
 fn daemon(appdata: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dcroxide"));
     command
-        .arg("--regnet")
+        .arg("--simnet")
         .arg(format!("--appdata={}", appdata.display()))
         .args(args)
         .env_remove("DCRD_APPDATA");
@@ -147,13 +257,13 @@ fn indx(lines: &[String]) -> Vec<&str> {
         .collect()
 }
 
-/// A regnet chain four blocks high with both indexes built, and the
+/// A simnet chain four blocks high with both indexes built, and the
 /// transaction index then dropped part way (interrupted after its first
 /// batch), as a node stopped during a `--droptxindex` leaves it.  The
 /// index startup is checked on the way: each index is announced just
 /// ahead of its creation, and the catch-up logs through the indexers'
 /// sink.
-fn build_regnet_datadir(db_path: &Path, params: &Params) {
+fn build_datadir(db_path: &Path, params: &Params) {
     dcroxide_database::create_dir_all_owner_only(db_path).expect("db dir");
     let db = Database::create(&Options::new(db_path, params.net.0)).expect("create database");
     let chain = Arc::new(Mutex::new(
@@ -161,7 +271,7 @@ fn build_regnet_datadir(db_path: &Path, params: &Params) {
     ));
     chain.lock().expect("chain").bulk_import_mode = true;
     let mut stream = Vec::new();
-    for raw in accepted_prefix_raw(4) {
+    for raw in mined_simnet_blocks(4) {
         dcroxide_database::bootstrap::write_block(&mut stream, params.net.0, &raw)
             .expect("write record");
     }
@@ -219,14 +329,14 @@ fn build_regnet_datadir(db_path: &Path, params: &Params) {
 /// `--dropexistsaddrindex` drops the other index the same way.
 #[test]
 fn the_daemon_logs_the_index_startup_and_drops_under_indx() {
-    let params = dcroxide_chaincfg::regnet_params();
+    let params = dcroxide_chaincfg::simnet_params();
     let appdata = tempfile::tempdir().expect("appdata");
     let db_path: PathBuf = appdata
         .path()
         .join("data")
-        .join("regnet")
+        .join("simnet")
         .join("blocks_ffldb");
-    build_regnet_datadir(&db_path, &params);
+    build_datadir(&db_path, &params);
 
     // `--dumpblockchain` stops the daemon straight after the index
     // catch-up (dcrd's `newServer`).

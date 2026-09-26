@@ -85,6 +85,21 @@ fn random_tx(rng: &mut SplitMix64) -> MsgTx {
             }
             _ => rng.bytes(sig_len + 1),
         };
+        // Fraud-proof input values biased around dcrd 2.2's per-input
+        // sanity range: the NullValueIn sentinel is the one negative
+        // allowed, and anything above maxAtoms fails.
+        const MAX_ATOMS: i64 = 21_000_000 * 100_000_000;
+        let value_in = match rng.below(16) {
+            0 => dcroxide_wire::NULL_VALUE_IN,
+            1 => -2,
+            2 => i64::MIN,
+            3 => -(rng.below(1 << 40) as i64) - 1,
+            4 => MAX_ATOMS,
+            5 => MAX_ATOMS + 1,
+            6 => i64::MAX,
+            7 => MAX_ATOMS - 1000 + rng.below(2001) as i64,
+            _ => rng.below(1 << 40) as i64,
+        };
         tx.tx_in.push(TxIn {
             previous_out_point: OutPoint {
                 hash,
@@ -92,7 +107,7 @@ fn random_tx(rng: &mut SplitMix64) -> MsgTx {
                 tree: (rng.below(3) as i8) - 1,
             },
             sequence: 0xffff_ffff,
-            value_in: rng.below(1 << 40) as i64,
+            value_in,
             block_height: 0,
             block_index: 0,
             signature_script: sig_script,
@@ -502,6 +517,9 @@ fn tx_checks_differential() {
     let mut rng = SplitMix64::from_entropy("standalone-tx-differential");
 
     const ROUNDS: usize = 400;
+    // Rounds that reached the fraud-proof input range check and failed
+    // it, so the comparison is known to cover that rule.
+    let mut fraud_amount_in = 0;
     for round in 0..ROUNDS {
         let tx = random_tx(&mut rng);
         let ser = tx.serialize();
@@ -511,12 +529,14 @@ fn tx_checks_differential() {
             _ => 393_216,
         };
 
+        let sanity = ok_or_kind(standalone::check_transaction_sanity(&tx, max_tx_size));
+        fraud_amount_in += usize::from(sanity == "ErrFraudAmountIn");
         let ours = format!(
             "coinbasepre={}\ncoinbasepost={}\ntreasurybase={}\nsanity={}\n",
             standalone::is_coin_base_tx(&tx, false),
             standalone::is_coin_base_tx(&tx, true),
             standalone::is_treasury_base(&tx),
-            ok_or_kind(standalone::check_transaction_sanity(&tx, max_tx_size)),
+            sanity,
         );
 
         let mut req = Vec::new();
@@ -531,6 +551,10 @@ fn tx_checks_differential() {
             hex(&ser)
         );
     }
+    assert!(
+        fraud_amount_in > 0,
+        "no round reached the fraud-proof input value range check"
+    );
 }
 
 #[test]

@@ -38,14 +38,32 @@ pub fn unhex(s: &str) -> Vec<u8> {
 /// without pulling a rand dependency into the workspace.
 pub struct SplitMix64(pub u64);
 
+/// Replays a printed seed: set to the `0x…` value a failed run printed, it
+/// seeds every [`SplitMix64::from_entropy`] in the process in place of the
+/// clock.  Each test seeds once, so run the failing test alone by name.
+pub const SEED_VAR: &str = "DCROXIDE_TEST_SEED";
+
 impl SplitMix64 {
-    /// Seed from the wall clock and print the seed for reproduction.
+    /// Seed from the wall clock, or from [`SEED_VAR`] when it is set, and
+    /// print the seed for reproduction.
     pub fn from_entropy(label: &str) -> Self {
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos() as u64;
-        println!("{label}: seed {seed:#018x}");
+        let (seed, source) = match env::var_os(SEED_VAR) {
+            Some(value) => {
+                let value = value.to_string_lossy();
+                let seed = parse_seed(&value).unwrap_or_else(|| {
+                    panic!("{SEED_VAR}={value:?} is not a hex seed like the ones printed here")
+                });
+                (seed, " (from DCROXIDE_TEST_SEED)")
+            }
+            None => {
+                let seed = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock after epoch")
+                    .as_nanos() as u64;
+                (seed, "")
+            }
+        };
+        println!("{label}: seed {seed:#018x}{source}");
         SplitMix64(seed)
     }
 
@@ -78,6 +96,20 @@ impl SplitMix64 {
         self.fill(&mut v);
         v
     }
+}
+
+/// Parse a seed as [`SplitMix64::from_entropy`] prints it: hex, with or
+/// without the `0x` prefix.
+fn parse_seed(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
 }
 
 /// Returns whether a Go toolchain is available.
@@ -252,8 +284,9 @@ impl Drop for Oracle {
 ///
 /// At most nine characters: dcrd stamps `revision[:9]` into its version
 /// string (`internal/version/version.go`), and a longer prefix could never
-/// match it.  CI's `DCRD_COMMIT` and the pin in `tools/oracle/go.mod` must
-/// name the same commit; a unit test below holds all three together.
+/// match it.  CI's `DCRD_COMMIT` and the pseudo-versions in
+/// `tools/oracle/go.mod` must name the same commit; a unit test below holds
+/// all three together.
 pub const DCRD_PARITY_COMMIT: &str = "b9634e01";
 
 /// A dcrd process running on simnet, for interop tests over a real socket.
@@ -521,6 +554,148 @@ pub fn dcrd_available() -> bool {
 mod tests {
     use super::*;
 
+    /// The dcrd modules a `go.mod` pins by pseudo-version, each with the
+    /// 12-hex commit its version names.  A pseudo-version ends
+    /// `<14-digit timestamp>-<12-hex commit>`, the timestamp following a
+    /// `-` (`v0.0.0-…`) or a `.` (`v1.2.4-0.…`, `v1.2.3-pre.0.…`).
+    fn dcrd_pseudo_pins(gomod: &str) -> Vec<(&str, &str)> {
+        gomod
+            .lines()
+            .filter_map(|line| {
+                let code = line.split("//").next()?.trim();
+                let code = code.strip_prefix("require ").unwrap_or(code);
+                let mut fields = code.split_whitespace();
+                let (module, version) = (fields.next()?, fields.next()?);
+                if module != "github.com/decred/dcrd"
+                    && !module.starts_with("github.com/decred/dcrd/")
+                {
+                    return None;
+                }
+                let (rest, commit) = version.rsplit_once('-')?;
+                let (sep, stamp) = rest.get(rest.len().checked_sub(15)?..)?.split_at(1);
+                let pseudo = commit.len() == 12
+                    && commit.bytes().all(|b| b.is_ascii_hexdigit())
+                    && (sep == "-" || sep == ".")
+                    && stamp.bytes().all(|b| b.is_ascii_digit());
+                pseudo.then_some((module, commit))
+            })
+            .collect()
+    }
+
+    /// Whether the oracle links dcrd at `pin`, judged by what the `go.mod`
+    /// `require`s rather than what its comments say: every dcrd module
+    /// pinned by pseudo-version names that commit, at least one is (so a
+    /// reformat cannot turn this into a check of nothing), and no
+    /// `replace` points a dcrd module somewhere else.  The tag-pinned
+    /// modules are the ones the header records as byte-identical to their
+    /// tag at the pin, which only a diff against the checkout can confirm.
+    /// Returns the number of pseudo-pinned modules.
+    fn check_oracle_links(gomod: &str, pin: &str) -> Result<usize, String> {
+        if let Some(line) = gomod.lines().find(|l| {
+            l.split("//")
+                .next()
+                .and_then(|code| code.split_once("=>"))
+                .is_some_and(|(lhs, _)| lhs.contains("github.com/decred/dcrd"))
+        }) {
+            return Err(format!("`{}` replaces a dcrd module", line.trim()));
+        }
+        let pins = dcrd_pseudo_pins(gomod);
+        if pins.is_empty() {
+            return Err("no dcrd module is pinned by pseudo-version".to_string());
+        }
+        let stale: Vec<String> = pins
+            .iter()
+            .filter(|(_, commit)| !commit.starts_with(pin))
+            .map(|(module, commit)| format!("{module} at {commit}"))
+            .collect();
+        if !stale.is_empty() {
+            return Err(format!(
+                "the oracle links {}, but the harness requires {pin}",
+                stale.join(", ")
+            ));
+        }
+        Ok(pins.len())
+    }
+
+    /// The oracle check reads the `require` lines, not the header comment:
+    /// a bump that moved the comment but left a module at the old commit,
+    /// one that pins no module by commit, and a `replace` are all caught.
+    #[test]
+    fn the_oracle_pin_check_reads_the_linked_versions() {
+        let good = "// Pinned to the parity target, dcrd master commit b9634e01: ...\n\
+                    require (\n\
+                    \tgithub.com/decred/base58 v1.0.6\n\
+                    \tgithub.com/decred/dcrd/chaincfg/chainhash v1.0.5\n\
+                    \tgithub.com/decred/dcrd/wire v1.7.6-0.20260905015707-b9634e01770b\n\
+                    )\n\
+                    require github.com/decred/dcrd/crypto/rand \
+                    v1.0.2-0.20260905015707-b9634e01770b // indirect\n";
+        assert_eq!(check_oracle_links(good, "b9634e01"), Ok(2));
+
+        let stale = good.replacen("b9634e01770b", "29f178940e5b", 1);
+        let err = check_oracle_links(&stale, "b9634e01").expect_err("wire left behind");
+        assert!(
+            err.contains("github.com/decred/dcrd/wire at 29f178940e5b"),
+            "{err}"
+        );
+
+        let none = "// dcrd master commit b9634e01\nrequire github.com/decred/dcrd/wire v1.7.5\n";
+        assert!(check_oracle_links(none, "b9634e01").is_err());
+
+        let replaced = format!("{good}replace github.com/decred/dcrd/wire => ../wire\n");
+        assert!(check_oracle_links(&replaced, "b9634e01").is_err());
+
+        let forms = "\tgithub.com/decred/dcrd/a v0.0.0-20260905015707-b9634e01770b\n\
+                     \tgithub.com/decred/dcrd/b/v2 v2.0.0-pre.0.20260905015707-b9634e01770b\n\
+                     \tgithub.com/decred/dcrd/c v1.0.0-rc1\n";
+        assert_eq!(dcrd_pseudo_pins(forms).len(), 2);
+    }
+
+    /// A printed seed replays: with `DCROXIDE_TEST_SEED` set,
+    /// `from_entropy` starts from it instead of the clock, and a value that
+    /// is not a seed fails rather than being ignored.
+    #[test]
+    fn a_printed_seed_replays() {
+        const CHILD: &str = "DCROXIDE_TESTUTIL_SEED_CHILD";
+        if env::var_os(CHILD).is_some() {
+            let rng = SplitMix64::from_entropy("replay");
+            assert_eq!(rng.0, 0x0123_4567_89ab_cdef);
+            return;
+        }
+
+        assert_eq!(
+            parse_seed("0x0123456789abcdef"),
+            Some(0x0123_4567_89ab_cdef)
+        );
+        assert_eq!(parse_seed("0X00000000000000FF"), Some(0xff));
+        assert_eq!(parse_seed("ff"), Some(0xff));
+        assert_eq!(parse_seed("0x"), None);
+        assert_eq!(parse_seed("+ff"), None);
+        assert_eq!(parse_seed("0x1ffffffffffffffff"), None);
+
+        let exe = env::current_exe().expect("test binary path");
+        let run = |seed: &str| {
+            Command::new(&exe)
+                .args(["--exact", "tests::a_printed_seed_replays", "--nocapture"])
+                .env(CHILD, "1")
+                .env(SEED_VAR, seed)
+                .output()
+                .expect("run the child")
+        };
+        let replay = run("0x0123456789abcdef");
+        let stdout = String::from_utf8_lossy(&replay.stdout);
+        assert!(
+            replay.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        assert!(
+            stdout.contains("replay: seed 0x0123456789abcdef (from DCROXIDE_TEST_SEED)"),
+            "{stdout}"
+        );
+        assert!(!run("not-a-seed").status.success());
+    }
+
     /// The pin the interop harness enforces is the commit CI builds dcrd
     /// from and the commit the oracle links: the harness once required
     /// `29f17894` while everything else had moved to `b9634e01`, so a dcrd
@@ -548,7 +723,7 @@ mod tests {
         let gomod_path = repo_root().join("tools").join("oracle").join("go.mod");
         let gomod = std::fs::read_to_string(&gomod_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", gomod_path.display()));
-        let oracle_pin: String = gomod
+        let header_pin: String = gomod
             .split("dcrd master commit ")
             .nth(1)
             .expect("tools/oracle/go.mod names the parity commit")
@@ -556,9 +731,13 @@ mod tests {
             .take_while(char::is_ascii_hexdigit)
             .collect();
         assert_eq!(
-            oracle_pin, DCRD_PARITY_COMMIT,
-            "the oracle links dcrd at {oracle_pin}, but the harness requires {DCRD_PARITY_COMMIT}"
+            header_pin, DCRD_PARITY_COMMIT,
+            "tools/oracle/go.mod's header names {header_pin}, but the harness requires \
+             {DCRD_PARITY_COMMIT}"
         );
+        if let Err(why) = check_oracle_links(&gomod, DCRD_PARITY_COMMIT) {
+            panic!("tools/oracle/go.mod: {why}");
+        }
     }
 
     /// A child that writes far more than a pipe buffer holds, on both

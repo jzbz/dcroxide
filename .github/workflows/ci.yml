@@ -15,10 +15,11 @@ env:
   DCROXIDE_REQUIRE_ORACLE: "1"
   # Same rule for fault injection: the ENOSPC test mounts a size-limited
   # tmpfs in a user namespace to prove a real storage failure reaches the
-  # fatal latch, and a fault-injection test that skips quietly is worse
-  # than none — the suite goes green having checked nothing. The test is
-  # Linux-only (`cfg(target_os = "linux")`), so this has no effect on the
-  # macOS and Windows matrix entries.
+  # fatal latch, the powerloss shim test builds tools/powerloss with cc and
+  # replays its undo log with python3, and a fault-injection test that
+  # skips quietly is worse than none — the suite goes green having checked
+  # nothing. Both tests are Linux-only (`cfg(target_os = "linux")`), so
+  # this has no effect on the macOS and Windows matrix entries.
   DCROXIDE_REQUIRE_FAULT_INJECTION: "1"
 
 jobs:
@@ -151,6 +152,28 @@ jobs:
         run: |
           export DCROXIDE_DCRD_BIN="$HOME/dcrd-bin/dcrd"
           cargo test -p dcroxide-node --test dcrd_interop -- --test-threads=1
+
+  go-tools:
+    name: go vet + go test (tools/)
+    runs-on: ubuntu-latest
+    # Each tool under tools/ is its own Go module, and no cargo command
+    # vets or tests one: the Rust suites only build the oracle. So
+    # tools/pinbump's main_test.go, which pins the bump review list
+    # keeping upstream `_test.go` changes and both sides of a move, ran
+    # only when someone ran it by hand, and a stale tool surfaced only
+    # at the next manual regeneration. fullblockgen is left out: its
+    # go.mod asks for a newer Go than the oracle's toolchain here.
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.24"
+          cache-dependency-path: tools/oracle/go.sum
+      - name: Vet and test the tool modules
+        run: |
+          for m in pinbump helpgen oracle dcrdstat; do
+            (cd "tools/$m" && go vet ./... && go test ./...)
+          done
 
   deny:
     name: cargo-deny (licenses, advisories, sources, bans)

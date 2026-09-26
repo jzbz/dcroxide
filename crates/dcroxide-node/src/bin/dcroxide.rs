@@ -31,7 +31,7 @@ use dcroxide_connmgr::DEFAULT_RETRY_DURATION;
 use dcroxide_database::{Database, ErrorKind, Options};
 use dcroxide_node::dispatch::ServerContext;
 use dcroxide_node::outbound::{OutboundConfig, start_outbound};
-use dcroxide_node::runtime::{ConnectedPeers, ListenerRuntime, PeerTemplate, inbound_peer_handler};
+use dcroxide_node::runtime::{BoundListeners, ConnectedPeers, PeerTemplate, inbound_peer_handler};
 use dcroxide_node::{
     Config, ConfigEnv, ERR_HELP_REQUESTED, ERR_SHOW_SUBSYSTEMS, ERR_VERSION_REQUESTED,
     app_data_dir, logo, parse_listeners, supported_subsystems, version,
@@ -174,10 +174,16 @@ fn real_main() -> ExitCode {
     };
     // A variable the configuration reads that a `String` cannot hold is
     // refused, as argv is, rather than read as unset; the load fails
-    // with it before acting on it (`flags::getenv_utf8`).
+    // with it before acting on it (`flags::getenv_utf8`).  The default
+    // home's lookups keep their own record, which counts only when no
+    // `--appdata` or `DCROXIDE_APPDATA` replaces that home
+    // (`config::load_config_from_argv_with_home_refusal`).
     let env_refused = std::cell::RefCell::new(None);
+    let home_refused = std::cell::RefCell::new(None);
     let getenv = |name: &str| dcroxide_node::flags::getenv_utf8(name, &env_refused);
-    let home = app_data_dir(goos, "dcroxide", false, &getenv);
+    let home = app_data_dir(goos, "dcroxide", false, &|name| {
+        dcroxide_node::flags::getenv_utf8(name, &home_refused)
+    });
 
     let env = ConfigEnv {
         default_home_dir: home,
@@ -195,7 +201,7 @@ fn real_main() -> ExitCode {
         getenv: Box::new(getenv),
         user_home: Box::new(|name| {
             if name.is_empty() {
-                current_user_home()
+                current_user_home(&env_refused)
             } else {
                 // Resolving other users' home directories is not yet
                 // wired.
@@ -221,11 +227,12 @@ fn real_main() -> ExitCode {
     // config creation, the deprecation and Tor-isolation notices), so
     // they print even when the load fails later.
     let mut notice = |line: &str| eprintln!("{line}");
-    match dcroxide_node::config::load_config_from_argv_with_notices(
+    match dcroxide_node::config::load_config_from_argv_with_home_refusal(
         &args,
         &env,
         &mut notice,
         &env_refused,
+        &home_refused,
     ) {
         Ok((cfg, _remaining_args)) => run(cfg),
         // Perform a requested service command and exit (dcrd's
@@ -282,20 +289,24 @@ fn real_main() -> ExitCode {
 /// password file: the entry for the real user id (`os/user`'s
 /// `lookupUserId`), and only when the account has none does it fall
 /// back to `$HOME`, which it then takes only alongside a non-empty
-/// `$USER` (`lookup_stubs.go` `current`).
+/// `$USER` (`lookup_stubs.go` `current`).  A `$HOME` it would take that
+/// is not UTF-8 is recorded in `env_refused` (`flags::getenv_utf8`),
+/// which the load checks straight after the path expansion.  It can get
+/// here only beside `--appdata` or `DCROXIDE_APPDATA`: with the default
+/// home, the load refused it before any expansion.
 #[cfg(all(unix, not(target_vendor = "apple")))]
-fn current_user_home() -> Option<String> {
+fn current_user_home(env_refused: &std::cell::RefCell<Option<String>>) -> Option<String> {
     let uid = rustix::process::getuid().as_raw().to_string();
     std::fs::read_to_string("/etc/passwd")
         .ok()
         .and_then(|passwd| passwd_home(&passwd, &uid))
         .or_else(|| {
-            // Go wants only a non-empty `$USER`, whatever its bytes.  A
-            // `$HOME` that is not UTF-8 never gets here: `app_data_dir`
-            // read it first, and the load refused it.
+            // Go wants only a non-empty `$USER`, whatever its bytes.
             let user = std::env::var_os("USER").is_some_and(|user| !user.is_empty());
-            let home = std::env::var("HOME").ok().filter(|home| !home.is_empty());
-            home.filter(|_| user)
+            if !user {
+                return None;
+            }
+            dcroxide_node::flags::getenv_utf8("HOME", env_refused).filter(|home| !home.is_empty())
         })
 }
 
@@ -307,9 +318,19 @@ fn current_user_home() -> Option<String> {
 /// directory (`GetUserProfileDirectory`, `lookup_windows.go` `current`)
 /// and nothing else, where std takes a non-empty `%USERPROFILE%` first.
 /// The two differ only when that variable points away from the
-/// account's own directory.
+/// account's own directory.  A value there that is not UTF-8 is
+/// recorded in `env_refused` (`flags::getenv_utf8`), as on the other
+/// unixes, rather than read as no home and the `~` taken for the current
+/// directory; the load checks it straight after the path expansion.
 #[cfg(not(all(unix, not(target_vendor = "apple"))))]
-fn current_user_home() -> Option<String> {
+fn current_user_home(env_refused: &std::cell::RefCell<Option<String>>) -> Option<String> {
+    // The variable std's `home_dir` takes when it is set and not empty.
+    let first = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    if std::env::var_os(first).is_some_and(|value| !value.is_empty())
+        && dcroxide_node::flags::getenv_utf8(first, env_refused).is_none()
+    {
+        return None;
+    }
     std::env::home_dir().and_then(|home| home.into_os_string().into_string().ok())
 }
 
@@ -404,9 +425,10 @@ fn run(cfg: Config) -> ExitCode {
 
 /// Bring the daemon up and idle until a shutdown signal.  This is the
 /// portion of `dcrdMain` after a successful configuration load: it opens
-/// the block database and chain, creates the address manager, binds the
-/// peer listeners, starts outbound dialing, seeding, and the RPC server,
-/// then idles on the shutdown listener before tearing everything down.
+/// the block database, creates the address manager and binds the peer
+/// listeners, loads the chain, starts the RPC server, outbound dialing
+/// and seeding, then idles on the shutdown listener before tearing
+/// everything down.
 fn run_node(cfg: Config) -> ExitCode {
     // Install the per-subsystem log levels the configuration parsed
     // (dcrd's loadConfig calling parseAndSetDebugLevels).
@@ -598,11 +620,68 @@ fn run_node(cfg: Config) -> ExitCode {
 
     // Create the server: dcrd sends this event just ahead of
     // `newServer`, and everything from here to the startup-complete
-    // event is `newServer`'s work -- the fee estimator, the chain load
-    // with its UTXO catch-up replay, the index catch-up, the address
-    // manager, the mempool and the listeners -- so a parent sees those
-    // phases as the P2P server starting.
+    // event is `newServer`'s work -- the address manager and the
+    // peer-to-peer listeners, the fee estimator, the chain load with its
+    // UTXO catch-up replay, the index catch-up, the mempool and the RPC
+    // listeners -- so a parent sees those phases as the P2P server
+    // starting.
     pipe_notifier.notify_startup_event(dcroxide_node::ipc::LifetimeAction::P2pServer);
+
+    // Create the address manager, `newServer`'s first act
+    // (`addrmgr.New(cfg.DataDir)`); the peers it persisted load later,
+    // where dcrd's server starts it.
+    let addr_manager = Arc::new(Mutex::new(AddrManager::new(Path::new(&cfg.data_dir))));
+
+    // Bind the peer-to-peer listeners and register the node's own
+    // addresses unless listening is disabled (dcrd's `initListeners`,
+    // next in `newServer` and ahead of the chain), so a listener that
+    // does not parse, or nothing binding, fails the start before any
+    // chain work or RPC bind.  They accept nothing until the server
+    // runs, below.
+    let p2p_listeners = if cfg.disable_listen {
+        dcroxide_node::logging::info("SRVR", "Listening for peer-to-peer connections is disabled");
+        None
+    } else {
+        match bind_p2p_listeners(&cfg, &addr_manager, &pipe_notifier) {
+            Ok(listeners) => Some(listeners),
+            // dcrd's `newServer` failure as `dcrdMain` reports it:
+            // nothing bound ("no valid listen address"), a listener
+            // that does not parse, or an unparsable default port.
+            Err(e) => {
+                log_error(&format!("Unable to start server: {e}"));
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    // dcrd cannot start at all with a negative --maxpeers: `newServer`
+    // builds its relay queues as `make(chan relayMsg, cfg.MaxPeers)`
+    // (`server.go:3931-3932`) and Go panics on a negative capacity, with
+    // nothing to recover it.  Refuse here rather than boot with no peer
+    // limit, which is what the faithful `uint32` casts below would
+    // otherwise produce.  See QK-0014.
+    //
+    // It sits where dcrd's panic does, in the server literal just after
+    // `initListeners`: the peer-to-peer listeners are bound, and nothing
+    // of the chain, the indexes or the RPC server has been touched.
+    if !dcroxide_node::max_peers_is_startable(cfg.max_peers) {
+        // Upstream dies the same way at both ends of the range -- one
+        // `panic: makechan: size out of range` -- but which end it was
+        // is worth telling apart for whoever reads the log.
+        let bound = if cfg.max_peers < 0 {
+            String::from("may not be less than 0")
+        } else {
+            format!(
+                "may not be {} or greater, the capacity dcrd's relay queue is refused at",
+                dcroxide_node::MAX_PEERS_MAKECHAN_LIMIT
+            )
+        };
+        log_error(&format!(
+            "The maxpeers option {bound} -- parsed [{}]",
+            cfg.max_peers
+        ));
+        return ExitCode::FAILURE;
+    }
 
     // The shared fee estimator dcrd always builds in `newServer` and
     // hands to both the mempool (fed as transactions enter and leave)
@@ -707,12 +786,17 @@ fn run_node(cfg: Config) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Create the address manager and load any persisted peers (dcrd
-    // `newServer`'s `addrmgr.New(cfg.DataDir)`).
-    let mut addr_manager = AddrManager::new(Path::new(&cfg.data_dir));
-    // dcrd `loadPeers`'s three log lines.
-    let peers_file = addr_manager.peers_file().display().to_string();
-    match addr_manager.load_peers() {
+    // Load the peers the address manager persisted (dcrd's server
+    // starting it from `Run`, whose `Start` calls `loadPeers`), with
+    // `loadPeers`'s three log lines.
+    let (peers_file, peers_load) = {
+        let mut manager = addr_manager.lock().expect("addr manager mutex poisoned");
+        (
+            manager.peers_file().display().to_string(),
+            manager.load_peers(),
+        )
+    };
+    match peers_load {
         PeersLoad::Loaded(count) => dcroxide_node::logging::info(
             "AMGR",
             &format!("Loaded {count} addresses from file '{peers_file}'"),
@@ -730,8 +814,6 @@ fn run_node(cfg: Config) -> ExitCode {
             }
         }
     }
-    // Share the manager with the served peers' addr exchange.
-    let addr_manager = Arc::new(Mutex::new(addr_manager));
     // Dump the address book periodically for crash resilience (the
     // ticker half of dcrd addrmgr's addressHandler; the final save
     // still runs at shutdown).
@@ -986,12 +1068,74 @@ fn run_node(cfg: Config) -> ExitCode {
         dcroxide_node::socks::NodeDialer::from_config(&cfg),
     );
 
+    // The connection manager decision core (dcrd 2.2's connmgr.New in
+    // newServer): the policy limits, the CIDR whitelist matcher, and
+    // the network default port for address selection.
+    let default_port: u16 = cfg.params.params.default_port.parse().unwrap_or(0);
+    let whitelists = cfg.whitelists.clone();
+    let conn_manager: dcroxide_node::outbound::SharedConnManager = {
+        let mut csprng = dcroxide_connmgr::SystemCsprng::default();
+        Arc::new(std::sync::Mutex::new(dcroxide_connmgr::ConnManager::new(
+            dcroxide_connmgr::ManagerConfig {
+                default_port,
+                // dcrd casts both straight to uint32 (`server.go:4283-4284`:
+                // `MaxNormalConns: uint32(cfg.MaxPeers)`,
+                // `MaxConnsPerHost: uint32(cfg.MaxSameIP)`), which truncates
+                // rather than clamping.  Neither dcrd nor this port validates
+                // the two flags, so a negative reaches here and must read as
+                // the huge positive dcrd sees, not as zero.
+                max_normal_conns: cfg.max_peers as u32,
+                max_conns_per_host: cfg.max_same_ip as u32,
+                target_outbound: dcroxide_node::server_target_outbound(cfg.max_peers),
+                retry_duration_nanos: DEFAULT_RETRY_DURATION,
+                is_whitelisted: Box::new(move |addr| {
+                    whitelists.iter().any(|net| net.contains(&addr.ip))
+                }),
+            },
+            &mut csprng,
+        )))
+    };
+
+    // Register the persistent peers (dcrd newServer: ConnectPeers,
+    // else AddPeers, each resolved through addrStringToNetAddr and
+    // added via AddPersistent — any failure fails the start).  dcrd
+    // does this ahead of `setupRPCListeners`, so a failure here comes
+    // before any RPC certificate work or bind.
+    let persistent_targets = if !cfg.connect_peers.is_empty() {
+        &cfg.connect_peers
+    } else {
+        &cfg.add_peers
+    };
+    let mut persistent = Vec::with_capacity(persistent_targets.len());
+    let target_dialer = dcroxide_node::socks::NodeDialer::from_config(&cfg);
+    for addr in persistent_targets {
+        let added = dcroxide_node::outbound::addr_string_to_connect_target(addr, &target_dialer)
+            .and_then(|target| {
+                dcroxide_node::outbound::add_persistent_target(
+                    &mut conn_manager.lock().expect("connmgr mutex poisoned"),
+                    target,
+                )
+            });
+        match added {
+            Ok(entry) => persistent.push(entry),
+            // dcrd's `newServer` returns the resolution or
+            // `AddPersistent` error as it is, and `dcrdMain` reports it
+            // as every server construction failure.
+            Err(e) => {
+                log_error(&format!("Unable to start server: {e}"));
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     // Serve the JSON-RPC endpoint (dcrd's RPC server): TLS over the
     // generated certificate pair by default, plain HTTP under the
-    // localhost-validated --notls.  This runs before the peer-to-peer
-    // listeners come up, like dcrd's rpc server existing before
-    // `server.Run` starts any peer activity (the chain notification
-    // callback installs even earlier, above, with the handler).
+    // localhost-validated --notls.  dcrd sets its RPC listeners up last
+    // in `newServer` (`setupRPCListeners`), after the peer-to-peer
+    // listeners are bound and the persistent peers added, as they are
+    // here, and serves both from `Run`; the port binds and serves the
+    // RPC listeners in one step, and the peer listeners start accepting
+    // just after it.
     // The bound RPC addresses are kept for the --boundaddrevents pipe
     // messages, which follow the peer-to-peer ones below.
     let mut rpc_bound_addrs: Vec<std::net::SocketAddr> = Vec::new();
@@ -1066,7 +1210,10 @@ fn run_node(cfg: Config) -> ExitCode {
             match config {
                 Ok(config) => dcroxide_node::rpcrun::RpcTransport::Tls(config),
                 Err(e) => {
-                    log_error(&format!("Unable to set up RPC TLS: {e}"));
+                    // dcrd's `setupRPCListeners` returns a certificate
+                    // or TLS configuration error from `newServer`, and
+                    // `dcrdMain` reports it as every other.
+                    log_error(&format!("Unable to start server: {e}"));
                     return ExitCode::FAILURE;
                 }
             }
@@ -1205,118 +1352,18 @@ fn run_node(cfg: Config) -> ExitCode {
         }
     };
 
-    // dcrd cannot start at all with a negative --maxpeers: `newServer`
-    // builds its relay queues as `make(chan relayMsg, cfg.MaxPeers)`
-    // (`server.go:3931-3932`) and Go panics on a negative capacity, with
-    // nothing to recover it.  Refuse here rather than boot with no peer
-    // limit, which is what the faithful `uint32` casts below would
-    // otherwise produce.  See QK-0014.
-    //
-    // dcrd reaches its panic just after `initListeners`, so it binds the
-    // peer-to-peer listeners and then dies; refusing before binding them
-    // is the one ordering difference, and it is not observable beyond a
-    // socket that upstream holds for a few microseconds.
-    if !dcroxide_node::max_peers_is_startable(cfg.max_peers) {
-        // Upstream dies the same way at both ends of the range -- one
-        // `panic: makechan: size out of range` -- but which end it was
-        // is worth telling apart for whoever reads the log.
-        let bound = if cfg.max_peers < 0 {
-            String::from("may not be less than 0")
-        } else {
-            format!(
-                "may not be {} or greater, the capacity dcrd's relay queue is refused at",
-                dcroxide_node::MAX_PEERS_MAKECHAN_LIMIT
-            )
-        };
-        log_error(&format!(
-            "The maxpeers option {bound} -- parsed [{}]",
-            cfg.max_peers
-        ));
-        return ExitCode::FAILURE;
-    }
-
-    // The connection manager decision core (dcrd 2.2's connmgr.New in
-    // newServer): the policy limits, the CIDR whitelist matcher, and
-    // the network default port for address selection.
-    let default_port: u16 = cfg.params.params.default_port.parse().unwrap_or(0);
-    let whitelists = cfg.whitelists.clone();
-    let conn_manager: dcroxide_node::outbound::SharedConnManager = {
-        let mut csprng = dcroxide_connmgr::SystemCsprng::default();
-        Arc::new(std::sync::Mutex::new(dcroxide_connmgr::ConnManager::new(
-            dcroxide_connmgr::ManagerConfig {
-                default_port,
-                // dcrd casts both straight to uint32 (`server.go:4283-4284`:
-                // `MaxNormalConns: uint32(cfg.MaxPeers)`,
-                // `MaxConnsPerHost: uint32(cfg.MaxSameIP)`), which truncates
-                // rather than clamping.  Neither dcrd nor this port validates
-                // the two flags, so a negative reaches here and must read as
-                // the huge positive dcrd sees, not as zero.
-                max_normal_conns: cfg.max_peers as u32,
-                max_conns_per_host: cfg.max_same_ip as u32,
-                target_outbound: dcroxide_node::server_target_outbound(cfg.max_peers),
-                retry_duration_nanos: DEFAULT_RETRY_DURATION,
-                is_whitelisted: Box::new(move |addr| {
-                    whitelists.iter().any(|net| net.contains(&addr.ip))
-                }),
-            },
-            &mut csprng,
-        )))
-    };
-
-    // Bind the peer-to-peer listeners and start serving inbound peers
-    // unless listening is disabled (dcrd's server listeners).
-    let runtime = if cfg.disable_listen {
-        dcroxide_node::logging::info("SRVR", "Listening for peer-to-peer connections is disabled");
-        None
-    } else {
-        match start_listeners(
-            &cfg,
-            &template,
+    // Start accepting inbound peers on the listeners bound earlier
+    // (dcrd's connection manager starting a `listenHandler` per listener
+    // from `Run`).  Each announces itself as dcrd's `listenHandler` does,
+    // "Server listening on <addr>".
+    let runtime = p2p_listeners.map(|listeners| {
+        listeners.serve(inbound_peer_handler(
+            template.clone(),
             connected.clone(),
-            Arc::clone(&server),
-            Arc::clone(&conn_manager),
-        ) {
-            // Each listener announces itself as dcrd connmgr's
-            // `listenHandler` does, "Server listening on <addr>".
-            Ok(runtime) => {
-                // The rest of dcrd's `initListeners`: each bound listener
-                // is announced to the parent process under
-                // --boundaddrevents, then the node's own addresses are
-                // registered so the handshake can advertise one and
-                // getnetworkinfo can list them -- every --externalip,
-                // or else every bound listener.
-                let bound: Vec<String> = runtime
-                    .bound_addrs()
-                    .iter()
-                    .map(dcroxide_node::listenaddrs::go_tcp_addr_string)
-                    .collect();
-                for addr in &bound {
-                    pipe_notifier.notify_p2p_address(addr);
-                }
-                if let Err(e) = dcroxide_node::listenaddrs::add_listener_local_addresses(
-                    &addr_manager,
-                    &cfg.external_ips,
-                    cfg.params.params.default_port,
-                    &bound,
-                    ServiceFlag::NODE_NETWORK,
-                    &*server.lookup,
-                    &|| Ok(dcroxide_node::rpcrun::system_interface_addrs()),
-                    wall_clock_unix(),
-                ) {
-                    log_error(&format!("Unable to start server: {e}"));
-                    return ExitCode::FAILURE;
-                }
-                Some(runtime)
-            }
-            // dcrd's `newServer` failure as `dcrdMain` reports it:
-            // nothing bound ("no valid listen address") or a listener
-            // that does not parse.
-            Err(e) => {
-                log_error(&format!("Unable to start server: {e}"));
-                return ExitCode::FAILURE;
-            }
-        }
-    };
+            Some(Arc::clone(&server)),
+            Some(Arc::clone(&conn_manager)),
+        ))
+    });
     // dcrd's `setupRPCListeners` announces each bound RPC listener too,
     // later in `newServer` than `initListeners`, so these follow the
     // peer-to-peer addresses.
@@ -1370,35 +1417,6 @@ fn run_node(cfg: Config) -> ExitCode {
         );
         None
     };
-    // Register the persistent peers (dcrd newServer: ConnectPeers,
-    // else AddPeers, each resolved through addrStringToNetAddr and
-    // added via AddPersistent — any failure fails the start).
-    let persistent_targets = if !cfg.connect_peers.is_empty() {
-        &cfg.connect_peers
-    } else {
-        &cfg.add_peers
-    };
-    let mut persistent = Vec::with_capacity(persistent_targets.len());
-    let target_dialer = dcroxide_node::socks::NodeDialer::from_config(&cfg);
-    for addr in persistent_targets {
-        let added = dcroxide_node::outbound::addr_string_to_connect_target(addr, &target_dialer)
-            .and_then(|target| {
-                dcroxide_node::outbound::add_persistent_target(
-                    &mut conn_manager.lock().expect("connmgr mutex poisoned"),
-                    target,
-                )
-            });
-        match added {
-            Ok(entry) => persistent.push(entry),
-            Err(e) => {
-                dcroxide_node::logging::error(
-                    "SRVR",
-                    &format!("Unable to add persistent peer {addr}: {e}"),
-                );
-                return ExitCode::FAILURE;
-            }
-        }
-    }
     let connector = start_outbound(
         OutboundConfig {
             template: template.clone(),
@@ -1729,21 +1747,44 @@ fn build_server(
     (server, ConnectedPeers::new(), template, stall_timer)
 }
 
-/// Bind the configured peer-to-peer listeners and start serving inbound
-/// peers (dcrd `newServer`'s listener setup plus `inboundPeerConnected`).
-fn start_listeners(
+/// Bind the configured peer-to-peer listeners and register the node's
+/// own addresses (dcrd `newServer`'s `initListeners`): each bound
+/// listener is announced to the parent process under --boundaddrevents,
+/// then every --externalip, or else every bound listener, is registered
+/// with the address manager so the handshake can advertise one and
+/// getnetworkinfo can list them.  Nothing is accepted until
+/// [`BoundListeners::serve`].
+fn bind_p2p_listeners(
     cfg: &Config,
-    template: &PeerTemplate,
-    connected: ConnectedPeers,
-    server: Arc<ServerContext>,
-    manager: dcroxide_node::outbound::SharedConnManager,
-) -> Result<ListenerRuntime, String> {
+    addr_manager: &Mutex<AddrManager>,
+    pipe_notifier: &dcroxide_node::pipeserve::PipeNotifier,
+) -> Result<BoundListeners, String> {
     let specs = parse_listeners(&cfg.listeners)?;
-    ListenerRuntime::start(
-        &specs,
-        inbound_peer_handler(template.clone(), connected, Some(server), Some(manager)),
-    )
-    .map_err(|e| e.to_string())
+    let listeners = BoundListeners::bind(&specs).map_err(|e| e.to_string())?;
+    let bound: Vec<String> = listeners
+        .bound_addrs()
+        .iter()
+        .map(dcroxide_node::listenaddrs::go_tcp_addr_string)
+        .collect();
+    for addr in &bound {
+        pipe_notifier.notify_p2p_address(addr);
+    }
+    // An --externalip host name resolves through dcrd's `dcrdLookup`,
+    // over the proxy when one is configured, as the server's own lookup
+    // does.
+    let dialer = dcroxide_node::socks::NodeDialer::from_config(cfg);
+    let lookup = move |host: &str| dialer.lookup(host, Duration::from_secs(30));
+    dcroxide_node::listenaddrs::add_listener_local_addresses(
+        addr_manager,
+        &cfg.external_ips,
+        cfg.params.params.default_port,
+        &bound,
+        ServiceFlag::NODE_NETWORK,
+        &lookup,
+        &|| Ok(dcroxide_node::rpcrun::system_interface_addrs()),
+        wall_clock_unix(),
+    )?;
+    Ok(listeners)
 }
 
 /// How many bytes redb may cache, from `DCROXIDE_DB_CACHE` (MiB).
@@ -1950,6 +1991,14 @@ fn flush_log_observer() -> Option<dcroxide_database::FlushObserver> {
 fn open_block_db(cfg: &Config) -> Result<Database, String> {
     let params = &cfg.params.params;
     let db_path = Path::new(&cfg.data_dir).join(format!("blocks_{}", cfg.db_type));
+    // The regression test network needs a clean database for each run,
+    // so remove it now if it already exists; dcrd discards the result
+    // (`blockdb.go:121-123`).  The port keeps the UTXO set in this same
+    // store, so the one removal also does the work of the second one
+    // dcrd's `blockchain.LoadUtxoDB` makes of `<datadir>/utxodb`.
+    if cfg.reg_net {
+        let _ = remove_regression_db(&db_path);
+    }
     log_info(&format!(
         "Loading block database from '{}'",
         db_path.display()
@@ -1981,6 +2030,27 @@ fn open_block_db(cfg: &Config) -> Result<Database, String> {
     };
     log_info("Block database loaded");
     Ok(db)
+}
+
+/// Remove an existing regression test block database (dcrd
+/// `removeRegressionDB` with `removeDB`, `blockdb.go:29-52`): a
+/// directory with everything in it, or a lone file, logged first.  The
+/// caller checks for regnet.  `fs::metadata` follows a link as `os.Stat`
+/// does, and the removals, like `os.RemoveAll` and `os.Remove`, take a
+/// link itself rather than what it points to.
+fn remove_regression_db(db_path: &Path) -> std::io::Result<()> {
+    let Ok(fi) = std::fs::metadata(db_path) else {
+        return Ok(());
+    };
+    log_info(&format!(
+        "Removing regression test database from '{}'",
+        db_path.display()
+    ));
+    if fi.is_dir() {
+        std::fs::remove_dir_all(db_path)
+    } else {
+        std::fs::remove_file(db_path)
+    }
 }
 
 /// Initialize the chain state over the open block database (the chain
@@ -2148,6 +2218,10 @@ fn rpc_config(
         time_source: Box::new(dcroxide_node::rpcrun::SystemTimeSource),
         proxy: cfg.proxy.clone(),
         test_net: cfg.test_net,
+        // dcrd's `handleVersion` reports Go's `runtime.Version()` as the
+        // build metadata; the port has no Go runtime, so a live node
+        // reports it empty -- an open divergence, recorded in PARITY.md's
+        // `internal/rpcserver` row.
         runtime_version: String::new(),
         // The CPU miner built above whenever mining addresses are
         // configured, behind generate, setgenerate, getgenerate,

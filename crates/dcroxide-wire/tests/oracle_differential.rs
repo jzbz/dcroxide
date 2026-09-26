@@ -114,8 +114,8 @@ fn check_tx_bytes(oracle: &mut Oracle, bytes: &[u8], ctx: &str) {
                 "{ctx}: full hash"
             );
         }
-        (Err(_), Some(_)) => {} // both reject: verdict parity (error-kind
-        // text mapping is tracked as a later ratchet in PARITY.md)
+        (Err(_), Some(_)) => {} // both reject: verdict parity (the error
+        // text is pinned against the oracle in review_decode_error_text.rs)
         (ours, oracle_err) => panic!(
             "{ctx}: verdict mismatch: ours {ours:?}, oracle error {oracle_err:?}, input {}",
             hex(bytes)

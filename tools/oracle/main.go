@@ -6,9 +6,17 @@
 // line-delimited JSON protocol on stdin/stdout, for dcroxide's vector
 // generation and differential tests.
 //
-// Every dcrd module dependency in go.mod is pinned to the exact version
-// required by dcrd master 452c1a6c — the project's parity target. Do not bump
-// them independently of a parity-target change.
+// Every dcrd module dependency in go.mod is pinned to the project's parity
+// target, dcrd master b9634e01, so the oracle links the code the dcrd binary
+// at that commit links: each module sits either at the target's
+// pseudo-version or at a published tag whose source is byte-identical to the
+// target's. The pseudo-versions are not what dcrd's own go.mod requires: it
+// requires published releases and builds most of them from the in-tree
+// source through replace directives. The tag pins, by contrast, are the very
+// releases it requires at b9634e01. go.mod's header records the rule and how
+// each module was placed; dcroxide-testutil's
+// the_dcrd_pin_matches_ci_and_the_oracle checks the pseudo-versions against
+// the harness pin. Do not bump them independently of a parity-target change.
 //
 // Protocol: one JSON object per line in, one per line out. Every command
 // takes a single "data" argument holding hex-encoded bytes; responses carry
@@ -703,9 +711,11 @@ func handle(req request) response {
 		// data: net_len(1) || net || hash_type(1) || treasury(1) ||
 		//       idx(4 BE) || pk_len(4 BE) || pkscript || prev_len(4 BE) ||
 		//       prevscript || nkeys(1) || per key: addr_len(1) || addr ||
-		//       sigtype(1) || compressed(1) || key(32) || nscripts(1) ||
-		//       per script: addr_len(1) || addr || slen(2 BE) || script ||
-		//       serialized tx
+		//       sigtype(1) || compressed(1) || key_len(1) || key ||
+		//       nscripts(1) || per script: addr_len(1) || addr ||
+		//       slen(2 BE) || script || serialized tx
+		//       (key_len lets Ed25519 keys travel in their 64-byte
+		//       seed || pubkey form)
 		if len(data) < 1 {
 			return errResp("sign_tx_output: empty request")
 		}

@@ -34,6 +34,9 @@ criticial = "criticial"
 # errors for input cut off inside `true` and `false`.
 tru = "tru"
 fals = "fals"
+# A test-case name ported verbatim from dcrd's treasury_test.go:630, so
+# the case can be found on both sides.
+outupt = "outupt"
 # Decred domain terms and dcrd identifiers.
 asert = "asert" # the ASERT difficulty algorithm (DCP-0011)
 indx = "indx" # dcrd's INDX log subsystem tag

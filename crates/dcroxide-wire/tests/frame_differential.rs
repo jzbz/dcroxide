@@ -670,11 +670,14 @@ fn reject_frames_are_unknown_to_readers() {
 }
 
 /// Every message type's payload, cut short inside a correctly framed
-/// message: where dcrd's decoder fails with a Go io error, the port's
+/// message: the port reaches dcrd's verdict on every cut -- a version cut
+/// after its receiving address is accepted by both, since dcrd reads the
+/// optional tail only while bytes remain -- with the same error kind when
+/// both reject.  Where dcrd's decoder fails with a Go io error, the port's
 /// fails with the same one, `io.EOF` for a cut at a field boundary and
 /// `io.ErrUnexpectedEOF` for a cut inside a field.  Their texts reach
 /// `sendrawmixmessage` clients for the mixing messages, and the kinds
-/// alone, which the other tests compare, cannot tell them apart.
+/// alone cannot tell them apart.
 #[test]
 fn truncated_payload_io_errors_match_dcrd_text() {
     let Some(mut oracle) = oracle_or_skip() else {
@@ -703,28 +706,285 @@ fn truncated_payload_io_errors_match_dcrd_text() {
                 cut_frame.extend_from_slice(&dcroxide_chainhash::hash_b(truncated)[..4]);
                 cut_frame.extend_from_slice(truncated);
 
-                let ours = read_message(&cut_frame, pver, net);
+                // Decoded and written back out, as the oracle does, so a
+                // mutual accept compares the messages both decoded.
+                let ours = read_message(&cut_frame, pver, net)
+                    .and_then(|(decoded, _)| write_message(&decoded, pver, net));
                 let resp = oracle_frame(&mut oracle, pver, net, &cut_frame);
                 let theirs_kind = resp.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                let (Err(ours), Some(theirs)) = (&ours, resp.get("error").and_then(|e| e.as_str()))
-                else {
-                    continue;
-                };
-                if !ours.kind_name().is_empty() || !theirs_kind.is_empty() {
-                    continue;
+                match (ours, resp.get("error").and_then(|e| e.as_str())) {
+                    (Ok(ours), None) => {
+                        let theirs = unhex(resp["result"].as_str().expect("result"));
+                        assert_eq!(
+                            ours,
+                            theirs,
+                            "{} cut at {cut} of {}: re-encoding",
+                            msg.command(),
+                            payload.len()
+                        );
+                    }
+                    (Err(ours), Some(theirs)) => {
+                        assert_eq!(
+                            ours.kind_name(),
+                            theirs_kind,
+                            "{} cut at {cut} of {}: error kind (ours {ours:?}, dcrd {theirs})",
+                            msg.command(),
+                            payload.len()
+                        );
+                        if !theirs_kind.is_empty() {
+                            continue;
+                        }
+                        assert_eq!(
+                            ours.to_string(),
+                            theirs,
+                            "{} cut at {cut} of {}",
+                            msg.command(),
+                            payload.len()
+                        );
+                        compared += 1;
+                    }
+                    (ours, theirs) => panic!(
+                        "{} cut at {cut} of {}: verdict mismatch: ours {ours:?}, dcrd {theirs:?}",
+                        msg.command(),
+                        payload.len()
+                    ),
                 }
-                assert_eq!(
-                    ours.to_string(),
-                    theirs,
-                    "{} cut at {cut} of {}",
-                    msg.command(),
-                    payload.len()
-                );
-                compared += 1;
             }
         }
     }
     assert!(compared > 1_000, "only {compared} io errors compared");
+}
+
+/// Counts a payload mutation writes over a var-int: every per-message
+/// limit in dcrd's wire package sits among these or one past them (8
+/// mining-state blocks, 40 votes, 7 treasury spends, 32 init-state types
+/// of 32 bytes, 100 filters per batch, 256 filter types and user-agent
+/// bytes, 500 locators, 1000 addresses, 2000 headers, 50000 inventory
+/// vectors), and the rest cross the var-int's width boundaries.
+const BOUNDARY_COUNTS: &[u64] = &[
+    0,
+    1,
+    7,
+    8,
+    9,
+    32,
+    33,
+    40,
+    41,
+    100,
+    101,
+    0xfc,
+    0xfd,
+    256,
+    257,
+    500,
+    501,
+    1000,
+    1001,
+    2000,
+    2001,
+    50_000,
+    50_001,
+    0xffff,
+    0x1_0000,
+    0xffff_ffff,
+    0x1_0000_0000,
+    u64::MAX,
+];
+
+/// The canonical var-int encoding of `n` (dcrd `WriteVarInt`).
+fn var_int(n: u64) -> Vec<u8> {
+    if n < 0xfd {
+        vec![n as u8]
+    } else if n <= 0xffff {
+        let mut b = vec![0xfd];
+        b.extend_from_slice(&(n as u16).to_le_bytes());
+        b
+    } else if n <= 0xffff_ffff {
+        let mut b = vec![0xfe];
+        b.extend_from_slice(&(n as u32).to_le_bytes());
+        b
+    } else {
+        let mut b = vec![0xff];
+        b.extend_from_slice(&n.to_le_bytes());
+        b
+    }
+}
+
+/// Every message type's payload with a few bytes overwritten, reframed
+/// with the right length and checksum so both decoders see it.
+/// `corrupted_frames_match_dcrd_verdicts` leaves the checksum alone, so
+/// its payload flips stop at `ErrPayloadChecksum` before any decoder runs;
+/// this is what holds each payload decoder's count limits, optional
+/// fields and string checks to dcrd's.  The writes favour the var-ints:
+/// the prefix bytes that widen one (0xfd, 0xfe, 0xff), whole counts at
+/// and one past the per-message limits, and the positions where the
+/// counts sit -- up front for the lists, behind the fixed-size fields
+/// for the rest.  Both sides must reach the same verdict, with the same
+/// error kind when they reject and the same bytes written back when they
+/// accept.  The mixing messages' error texts are compared separately, in
+/// `mutated_mix_payloads_match_dcrd_text`.
+#[test]
+fn mutated_payloads_match_dcrd_verdicts() {
+    let Some(mut oracle) = oracle_or_skip() else {
+        return;
+    };
+    let mut rng = SplitMix64::from_entropy("wire payload mutation verdict differential");
+    let net = CurrencyNet::MAIN_NET;
+
+    let mut coded = 0;
+    let mut accepted = 0;
+    for i in 0..8_000 {
+        let msgs = structured_messages(&mut rng);
+        let (msg, pver) = &msgs[rng.below(msgs.len() as u64) as usize];
+        let frame = write_message(msg, *pver, net).expect("encode");
+        let mut payload = frame[24..].to_vec();
+        for _ in 0..1 + rng.below(2) {
+            let len = payload.len() as u64;
+            // Up front, near the end, or anywhere.
+            let pos = match rng.below(3) {
+                _ if len == 0 => 0,
+                0 => rng.below(len.min(40)),
+                1 => len - 1 - rng.below(len.min(80)),
+                _ => rng.below(len),
+            } as usize;
+            let bytes = match rng.below(4) {
+                0 => {
+                    let n = BOUNDARY_COUNTS[rng.below(BOUNDARY_COUNTS.len() as u64) as usize];
+                    var_int(n)
+                }
+                1 => vec![[0xfd, 0xfe, 0xff][rng.below(3) as usize]],
+                2 => vec![[0x00, 0x01, 0x80, 0xfc][rng.below(4) as usize]],
+                _ => vec![rng.next_u64() as u8],
+            };
+            // Overwrite in place, growing the payload when the write
+            // runs past its end.
+            for (k, b) in bytes.into_iter().enumerate() {
+                match payload.get_mut(pos + k) {
+                    Some(slot) => *slot = b,
+                    None => payload.push(b),
+                }
+            }
+        }
+        let mut mutated = frame[..16].to_vec();
+        mutated.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        mutated.extend_from_slice(&dcroxide_chainhash::hash_b(&payload)[..4]);
+        mutated.extend_from_slice(&payload);
+
+        let ours = read_message(&mutated, *pver, net)
+            .and_then(|(decoded, _)| write_message(&decoded, *pver, net));
+        let resp = oracle_frame(&mut oracle, *pver, net, &mutated);
+        match (ours, resp.get("error").and_then(|e| e.as_str())) {
+            (Ok(ours), None) => {
+                let theirs = unhex(resp["result"].as_str().expect("result"));
+                assert_eq!(ours, theirs, "case {i}: {} re-encoding", msg.command());
+                accepted += 1;
+            }
+            (Err(ours), Some(theirs)) => {
+                let kind = resp.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                assert_eq!(
+                    ours.kind_name(),
+                    kind,
+                    "case {i}: {} error kind (ours {ours:?}, dcrd {theirs}) for payload {}",
+                    msg.command(),
+                    hex(&payload)
+                );
+                coded += usize::from(!kind.is_empty());
+            }
+            (ours, theirs) => panic!(
+                "case {i}: verdict mismatch: ours {ours:?}, dcrd {theirs:?} for {} {}",
+                msg.command(),
+                hex(&payload)
+            ),
+        }
+    }
+    assert!(coded > 500, "only {coded} coded errors compared");
+    assert!(accepted > 500, "only {accepted} mutual accepts compared");
+}
+
+/// One past each of dcrd's per-message limits (see [`BOUNDARY_COUNTS`]),
+/// and one past the 256 KiB filter data limit.
+const OVER_LIMIT_COUNTS: &[u64] = &[8, 9, 33, 41, 101, 257, 501, 1001, 2001, 50_001, 262_145];
+
+/// Every message type's payload with a count one past each per-message
+/// limit written at every position of its first 300 bytes, reframed with
+/// a valid checksum.  The random writes in
+/// `mutated_payloads_match_dcrd_verdicts` land on a given count field only
+/// a handful of times a run; this sweep lands on each one every run, so a
+/// decoder that stopped enforcing a limit dcrd enforces, or started
+/// enforcing one dcrd does not, fails here.  Verdicts, error kinds and
+/// re-encodings are compared as there.
+#[test]
+fn over_limit_counts_match_dcrd_verdicts() {
+    let Some(mut oracle) = oracle_or_skip() else {
+        return;
+    };
+    let mut rng = SplitMix64::from_entropy("wire over-limit count sweep differential");
+    let net = CurrencyNet::MAIN_NET;
+
+    let mut limits = std::collections::BTreeSet::new();
+    for (msg, pver) in structured_messages(&mut rng) {
+        let frame = write_message(&msg, pver, net).expect("encode");
+        let payload = &frame[24..];
+        for pos in 0..payload.len().min(300) {
+            for &count in OVER_LIMIT_COUNTS {
+                let mut mutated_payload = payload.to_vec();
+                for (k, b) in var_int(count).into_iter().enumerate() {
+                    match mutated_payload.get_mut(pos + k) {
+                        Some(slot) => *slot = b,
+                        None => mutated_payload.push(b),
+                    }
+                }
+                let mut mutated = frame[..16].to_vec();
+                mutated.extend_from_slice(&(mutated_payload.len() as u32).to_le_bytes());
+                mutated.extend_from_slice(&dcroxide_chainhash::hash_b(&mutated_payload)[..4]);
+                mutated.extend_from_slice(&mutated_payload);
+
+                let ours = read_message(&mutated, pver, net)
+                    .and_then(|(decoded, _)| write_message(&decoded, pver, net));
+                let resp = oracle_frame(&mut oracle, pver, net, &mutated);
+                match (ours, resp.get("error").and_then(|e| e.as_str())) {
+                    (Ok(ours), None) => {
+                        let theirs = unhex(resp["result"].as_str().expect("result"));
+                        assert_eq!(
+                            ours,
+                            theirs,
+                            "{} count {count} at {pos}: re-encoding",
+                            msg.command()
+                        );
+                    }
+                    (Err(ours), Some(theirs)) => {
+                        let kind = resp.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                        assert_eq!(
+                            ours.kind_name(),
+                            kind,
+                            "{} count {count} at {pos}: error kind (ours {ours:?}, dcrd {theirs})",
+                            msg.command()
+                        );
+                        if kind.starts_with("ErrTooMany") || kind.ends_with("TooLong") {
+                            limits.insert((msg.command().to_string(), kind.to_string()));
+                        }
+                    }
+                    (ours, theirs) => panic!(
+                        "{} count {count} at {pos}: verdict mismatch: ours {ours:?}, dcrd \
+                         {theirs:?} for {}",
+                        msg.command(),
+                        hex(&mutated_payload)
+                    ),
+                }
+            }
+        }
+    }
+    // Every limit check the battery can reach from the front of a
+    // payload, by message; a message whose generated lists come out
+    // long enough to push a later count past the sweep can drop one of
+    // its later limits in a given run, so the floor sits below the full
+    // count.
+    assert!(
+        limits.len() > 28,
+        "only {} limits reached: {limits:?}",
+        limits.len()
+    );
 }
 
 /// Mixing message payloads with a few bytes overwritten, reframed with a

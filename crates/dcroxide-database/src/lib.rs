@@ -1564,6 +1564,16 @@ impl Database {
         self.check_open()?;
         self.inner.check_writable()?;
         let _writer = self.exclusive_writer();
+        // No second `closed` check once the writer is held, unlike
+        // `begin_seed`.  dcrd's `Flush` queues on `closeLock` itself,
+        // and Go's `RWMutex.Lock` takes the writer mutex before it waits
+        // out readers (`sync/rwmutex.go:150`), so a `Close` called after
+        // a queued `Flush` waits for it (`ffldb/db.go:1972`, `:2013`)
+        // and the flush returns nil.  A flush that passed the check
+        // above comes before the close in the same way.  Should the
+        // close wake first here, it has already flushed and no writer
+        // can begin after it, so the flush below is empty and commits
+        // nothing (`DbCache::run_flush`): still dcrd's `Ok`.
         // Again with the writer held: the transaction waited out may be
         // the one whose flush failed and latched the store.
         self.inner.check_writable()?;
@@ -1905,10 +1915,12 @@ mod fatal_latch_tests {
     /// consequence — latched means closed to writes — deterministically,
     /// on every platform. It does *not* induce a real `ENOSPC` or `EIO`,
     /// so it does not prove that a genuine device failure reaches the
-    /// latch. That wiring is three `map_err(|e| self.inner.mark_fatal(e))`
-    /// calls, one per path that hands a durable commit to the engine
+    /// latch. That wiring is two sites: every durable flush
     /// (`Database::flush`, `Database::close`, and the flush inside
-    /// `Transaction::commit_internal`). `tests/enospc.rs` closes that
+    /// `Transaction::commit_internal`) goes through `flush_locked`,
+    /// which latches a failure before the writer semaphore is released,
+    /// and `Database::close` latches a failure of its allocator-state
+    /// commit (`record_allocator_state`). `tests/enospc.rs` closes that
     /// gap: it fills a 2 MiB filesystem under a live database and asserts
     /// that the resulting `ENOSPC` arrives as an error, latches the
     /// store, and leaves reads working. It is Linux-only and skips
@@ -2026,6 +2038,71 @@ mod fatal_latch_tests {
             ErrorKind::DbNotOpen,
             "the handle is closed even though the flush was refused"
         );
+    }
+}
+
+/// A flush that passed its `closed` check and then lost the writer to a
+/// close (see the comment in `Database::flush`).  The semaphore on Linux
+/// wakes its waiters in order, so `tests/review_close_race.rs` meets
+/// only the flush-first order; this runs the flush's locked half by hand
+/// after the close instead.
+// Copies the files of a store that is still open, which Windows refuses:
+// redb holds a byte-range lock on its file while the database is open.
+#[cfg(all(test, not(windows)))]
+mod late_flush_tests {
+    use super::*;
+
+    #[test]
+    fn a_flush_that_runs_after_close_commits_nothing() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let path = tmp.path().join("db");
+        let db = Database::create(&Options::new(&path, 0x12141c16)).expect("create");
+        let raw = vec![7u8; 256];
+        let hash = dcroxide_chainhash::hash_h(&raw[..180]);
+        db.update(|tx| {
+            tx.store_block_raw(&hash, raw.clone())?;
+            tx.metadata().put(b"k", b"v")
+        })
+        .expect("write");
+        db.close().expect("close");
+
+        // What `flush` runs once it holds the writer.
+        {
+            let _writer = db.exclusive_writer();
+            db.inner.check_writable().expect("not latched");
+            flush_locked(&db.inner, false).expect("the late flush succeeds, as dcrd's does");
+        }
+
+        // It committed nothing, so the allocator state `close` recorded
+        // still stands: a copy of the store opens without redb's repair.
+        let copy = tmp.path().join("copy");
+        std::fs::create_dir_all(&copy).expect("mkdir copy");
+        for entry in std::fs::read_dir(&path).expect("read db dir") {
+            let entry = entry.expect("dir entry");
+            std::fs::copy(entry.path(), copy.join(entry.file_name())).expect("copy");
+        }
+        let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+        let keep = Arc::clone(&lines);
+        let mut opts = Options::new(&copy, 0x12141c16);
+        opts.log = Some(Arc::new(move |_, msg: &str| {
+            keep.lock().expect("log lock").push(msg.to_string());
+        }));
+        let reopened = Database::open(&opts).expect("open the copy");
+        let lines = lines.lock().expect("log lock");
+        assert!(
+            !lines
+                .iter()
+                .any(|msg| msg.to_lowercase().contains("metadata store")),
+            "a flush after the close must leave no repair to do: {lines:?}"
+        );
+        reopened
+            .view(|tx| {
+                assert_eq!(tx.metadata().get(b"k").as_deref(), Some(b"v".as_slice()));
+                assert!(tx.has_block(&hash)?);
+                Ok(())
+            })
+            .expect("view");
+        drop(db);
     }
 }
 

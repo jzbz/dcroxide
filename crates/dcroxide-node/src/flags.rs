@@ -1411,16 +1411,6 @@ fn find_long_with(
         .find(|o| !o.long.is_empty() && o.long == name)
 }
 
-/// Find an option by its short name.
-fn find_short(name: char) -> Option<&'static OptSpec> {
-    find_short_in(&OPTIONS, name)
-}
-
-/// Find an option by its short name in the given registry.
-fn find_short_in(registry: &'static [OptSpec], name: char) -> Option<&'static OptSpec> {
-    find_short_with(registry, name, has_service_group(registry))
-}
-
 fn find_short_with(
     registry: &'static [OptSpec],
     name: char,
@@ -1437,9 +1427,12 @@ fn find_short_with(
 }
 
 /// Find an option the way go-flags' INI parser matches names
-/// (`Group.optionByName`): the `ini-name` matcher first, then the exact
-/// Go field name, then the exact long name, then the exact short name.
-fn find_ini_name(name: &str) -> Option<&'static OptSpec> {
+/// (`Group.optionByName`, `group.go:147-176`) over the option groups a
+/// section matches, walked in order: the `ini-name` matcher first, then
+/// the exact Go field name, then the exact long name, then the exact
+/// short name, each across every group before the next.
+fn find_ini_name(name: &str, groups: &[&'static [OptSpec]]) -> Option<&'static OptSpec> {
+    let walk = || groups.iter().flat_map(|group| group.iter());
     // The matcher compares the lowercased `ini-name` tag with the
     // lowercased key.  No dcrd option carries the tag, so every option
     // matches the empty key, and the first one walked -- `ShowVersion`,
@@ -1447,16 +1440,15 @@ fn find_ini_name(name: &str) -> Option<&'static OptSpec> {
     // `=1` line sets the version flag of the final config, which dcrd
     // never reads, and `=foo` fails its `ParseBool`.
     if name.is_empty() {
-        return OPTIONS.first();
+        return walk().next();
     }
-    OPTIONS
-        .iter()
+    walk()
         .find(|o| o.field == name)
-        .or_else(|| OPTIONS.iter().find(|o| o.long == name))
+        .or_else(|| walk().find(|o| o.long == name))
         .or_else(|| {
             let mut chars = name.chars();
             match (chars.next(), chars.next()) {
-                (Some(c), None) => find_short(c),
+                (Some(c), None) => walk().find(|o| o.short == Some(c)),
                 _ => None,
             }
         })
@@ -1864,6 +1856,16 @@ type IniValue<'a> = (&'a str, String, usize);
 /// order of first appearance (the global section first, as the file
 /// must have it), one of the orders dcrd can take.
 pub(crate) fn parse_ini(content: &str, filename: &str) -> Result<Vec<IniStep>, String> {
+    parse_ini_with(content, filename, has_service_group(&OPTIONS))
+}
+
+/// [`parse_ini`] over dcrd's parser with the Windows service options
+/// group (`service_group`) or without it.
+fn parse_ini_with(
+    content: &str,
+    filename: &str,
+    service_group: bool,
+) -> Result<Vec<IniStep>, String> {
     let ini_error = |line: usize, message: &str| format!("{filename}:{line}: {message}");
 
     // readIni.  The empty global section always exists; a section named
@@ -1914,18 +1916,28 @@ pub(crate) fn parse_ini(content: &str, filename: &str) -> Result<Vec<IniStep>, S
     // parse.
     let mut steps = Vec::new();
     for (section, values) in sections {
-        // The parser has a single group; section names resolve
-        // case-insensitively against its description, and the global
-        // (empty) section always matches.
-        if !section.is_empty() && section.to_lowercase() != "application options" {
-            steps.push(IniStep::Fail(format!(
-                "could not find option group `{section}'"
-            )));
-            return Ok(steps);
-        }
+        // go-flags' `matchingGroups` (`ini.go:479-497`): the global
+        // (empty) section searches every group of the parser, and a
+        // named one only the group whose description it names, compared
+        // case-insensitively (`Group.Find`).  dcrd's parser has the
+        // Application Options group and, on Windows only, the Service
+        // Options group `newConfigParser` adds, so there `service=` and
+        // a `[Service Options]` section are taken (and the value never
+        // read: dcrd acts on the pre-parse's service command alone).
+        let groups: &[&'static [OptSpec]] = match section.to_lowercase().as_str() {
+            "" if service_group => &[&OPTIONS, &SERVICE_OPTIONS],
+            "" | "application options" => &[&OPTIONS],
+            "service options" if service_group => &[&SERVICE_OPTIONS],
+            _ => {
+                steps.push(IniStep::Fail(format!(
+                    "could not find option group `{section}'"
+                )));
+                return Ok(steps);
+            }
+        };
 
         for (name, value, line) in values {
-            let Some(spec) = find_ini_name(name) else {
+            let Some(spec) = find_ini_name(name, groups) else {
                 steps.push(IniStep::Fail(ini_error(
                     line,
                     &format!("unknown option: {name}"),
@@ -2014,6 +2026,68 @@ mod tests {
         assert!(find_long_with(&OPTIONS, "service", false).is_none());
         assert!(find_short_with(&OPTIONS, 's', true).is_some());
         assert!(find_short_with(&OPTIONS, 's', false).is_none());
+    }
+
+    /// The config file on Windows, where dcrd's parser has the Service
+    /// Options group: the global section finds `service` by its long,
+    /// field and short names, a `[Service Options]` section is that
+    /// group alone, and `[Application Options]` never reaches it.  The
+    /// port looked the global names up in the application options only
+    /// and knew no section but `application options`, so a dcrd.conf
+    /// dcrd starts with failed the start.  Without the group (every
+    /// other platform) both are refused as dcrd refuses them.
+    #[test]
+    fn the_ini_service_group_matches_as_go_flags_does() {
+        let resolved = |content: &str, service_group: bool| -> Vec<String> {
+            parse_ini_with(content, "f.conf", service_group)
+                .expect("the file reads")
+                .into_iter()
+                .map(|step| match step {
+                    IniStep::Set(a) => {
+                        format!("{}={}", a.spec.long, a.value.unwrap_or_default())
+                    }
+                    IniStep::Fail(e) => format!("fail: {e}"),
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            resolved(
+                "service=install\nServiceCommand=stop\ns=start\nrpcuser=u\n",
+                true
+            ),
+            [
+                "service=install",
+                "service=stop",
+                "service=start",
+                "rpcuser=u"
+            ]
+        );
+        assert_eq!(
+            resolved("[Service Options]\nservice=remove\n", true),
+            ["service=remove"]
+        );
+        assert_eq!(
+            resolved("[service options]\nrpcuser=u\n", true),
+            ["fail: f.conf:2: unknown option: rpcuser"]
+        );
+        assert_eq!(
+            resolved("[Application Options]\nservice=install\n", true),
+            ["fail: f.conf:2: unknown option: service"]
+        );
+        assert_eq!(
+            resolved("[Application Options]\ns=install\n", true),
+            ["fail: f.conf:2: unknown option: s"]
+        );
+
+        assert_eq!(
+            resolved("service=install\n", false),
+            ["fail: f.conf:1: unknown option: service"]
+        );
+        assert_eq!(
+            resolved("[Service Options]\nservice=install\n", false),
+            ["fail: could not find option group `Service Options'"]
+        );
     }
 
     /// The help pre-parse never knows the service group, which dcrd's

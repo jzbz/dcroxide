@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: ISC
 // The dcrd -h vector generator: renders the help text dcroxide's -h
 // must reproduce, through the exact path dcrd's loadConfig takes — a
-// parser over the config struct (extracted verbatim from dcrd
-// v1.10.7 config.go; the service group is NOT added, matching dcrd's
-// dedicated help pre-parse), filled with loadConfig's defaults first so
-// go-flags prints their "(default: X)" notes, with the HelpFlag error
-// written out.
+// parser over the config struct (extracted verbatim from dcrd's
+// config.go at the parity target, master b9634e01; the service group is
+// NOT added, matching dcrd's dedicated help pre-parse), filled with
+// loadConfig's defaults first so go-flags prints their "(default: X)"
+// notes, with the HelpFlag error written out.
+//
+// Both the struct and the defaults literal in main are copies of that
+// commit's config.go, so re-extract them and regenerate the vectors
+// whenever a parity-target move changes config.go (tools/pinbump reports
+// it under the unmapped top-level path "."); the vectors are only as
+// current as the copy.
 //
 // go-flags wraps the help to the width of the terminal on stdin and
 // falls back to 80 columns without one, so the width is part of the

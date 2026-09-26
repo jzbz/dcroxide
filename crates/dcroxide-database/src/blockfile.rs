@@ -231,8 +231,10 @@ impl BlockStore {
     }
 
     /// Append the raw block to the store per dcrd `writeBlock`,
-    /// returning its location.  Data is not synced until
-    /// [`Self::sync`].
+    /// returning its location.  Data is not synced until the next flush:
+    /// [`crate::dbcache::DbCache::run_flush`] takes a [`Self::sync_plan`],
+    /// runs it ([`SyncPlan::run`]) and discharges it with
+    /// [`Self::finish_sync`].
     pub(crate) fn write_block(&mut self, raw_block: &[u8]) -> Result<BlockLocation, Error> {
         let block_len = raw_block.len() as u32;
         let full_len = block_len + BLOCK_RECORD_OVERHEAD;

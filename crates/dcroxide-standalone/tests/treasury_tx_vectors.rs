@@ -323,6 +323,34 @@ fn check_transaction_sanity_vectors() {
         ErrorKind::BadTxOutValue
     );
 
+    // transaction with input value == wire.NullValueIn (ok)
+    let mut tx = base_tx.clone();
+    tx.tx_in[0].value_in = dcroxide_wire::NULL_VALUE_IN;
+    assert_eq!(
+        standalone::check_transaction_sanity(&tx, MAX_TX_SIZE),
+        Ok(())
+    );
+
+    // transaction with negative input value
+    let mut tx = base_tx.clone();
+    tx.tx_in[0].value_in = -2;
+    assert_eq!(
+        standalone::check_transaction_sanity(&tx, MAX_TX_SIZE)
+            .unwrap_err()
+            .kind,
+        ErrorKind::FraudAmountIn
+    );
+
+    // transaction with single input value > max per tx
+    let mut tx = base_tx.clone();
+    tx.tx_in[0].value_in = MAX_ATOMS + 1;
+    assert_eq!(
+        standalone::check_transaction_sanity(&tx, MAX_TX_SIZE)
+            .unwrap_err()
+            .kind,
+        ErrorKind::FraudAmountIn
+    );
+
     // transaction spending duplicate input
     let mut tx = base_tx.clone();
     tx.tx_in[1].previous_out_point = tx.tx_in[0].previous_out_point;

@@ -57,9 +57,10 @@ pub(crate) const DEFAULT_FLUSH_SECS: u64 = 300;
 pub(crate) type CacheLayer = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 
 /// The bytes each overlay entry is counted at beyond its key and value
-/// (dcrd treap `nodeFieldsSize`, `internal/treap/common.go:22`), for
-/// live values and pending deletions alike: dcrd's `nodeSize` is this
-/// plus the key and value lengths, and `needsFlush` gates on the sum.
+/// (dcrd treap `nodeFieldsSize`,
+/// `database/internal/treap/common.go:22`), for live values and pending
+/// deletions alike: dcrd's `nodeSize` is this plus the key and value
+/// lengths, and `needsFlush` gates on the sum.
 ///
 /// dcrd sizes it from a treap node's fields, but it also fits this
 /// port's own per-entry cost: 200,000 random-keyed `CacheLayer`
@@ -571,7 +572,8 @@ impl DbCache {
         // A fresh entry is counted as dcrd's treap counts a new node,
         // [`NODE_FIELDS_SIZE`] plus its key and value; a write onto an
         // entry already in `top` swaps only the value bytes, as dcrd's
-        // `Put` onto an existing node does (`treap/immutable.go:164`).
+        // `Put` onto an existing node does
+        // (`database/internal/treap/immutable.go:164`).
         for key in removes {
             let key_len = key.len();
             match top.insert(key, None) {
@@ -1293,8 +1295,9 @@ mod tests {
 
     /// Every entry is counted as dcrd's treap counts a node:
     /// `nodeFieldsSize` plus its key and value, for a pending deletion as
-    /// for a live value (dcrd `treap/common.go:43-45`), so the size
-    /// trigger fires at the entry count dcrd's `needsFlush` does.
+    /// for a live value (dcrd `database/internal/treap/common.go:43-45`),
+    /// so the size trigger fires at the entry count dcrd's `needsFlush`
+    /// does.
     ///
     /// Counting the key and value alone put an `existsaddridx`-shaped
     /// overlay (a 25-byte key, an empty value) at about a quarter of

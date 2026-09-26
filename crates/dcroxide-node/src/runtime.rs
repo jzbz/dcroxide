@@ -319,7 +319,7 @@ pub fn inbound_peer_handler(
             let mut mgr = manager.lock().expect("connmgr mutex poisoned");
             match admit_inbound_now(&mut mgr, &remote_na, &mut *rng) {
                 dcroxide_connmgr::InboundDecision::Drop { reason } => {
-                    log_inbound_drop(&mut mgr, manager, &addr, &reason);
+                    log_inbound_drop(&mut mgr, manager, &remote_na, &reason);
                     drop(mgr);
                     let _ = stream.shutdown(Shutdown::Both);
                     return;
@@ -398,11 +398,13 @@ fn admit_inbound_now(
 /// Route a dropped inbound connection through the drop-log throttle
 /// (dcrd `inboundRateLimiter.LogDrops`), arming the suppression-reset
 /// timer when one starts.  Like dcrd's, it reads its own clock, the
-/// monotonic one its token bucket measures time on.
+/// monotonic one its token bucket measures time on.  The address is
+/// rendered as dcrd's `%v` renders the addrmgr `NetAddress` it is
+/// handed, by its zone-free `Key`.
 fn log_inbound_drop(
     mgr: &mut dcroxide_connmgr::ConnManager,
     manager: &crate::outbound::SharedConnManager,
-    addr: &SocketAddr,
+    addr: &NetAddress,
     reason: &str,
 ) {
     match mgr
@@ -498,14 +500,11 @@ fn serve_inbound_peer(
         }
     }
 
-    let na = match net_address_v2_from_socket(addr, template.services) {
-        Ok(na) => na,
-        // An address the manager cannot represent is dropped, matching
-        // dcrd refusing to serve an unroutable peer.
-        Err(_) => return,
+    // An address the manager cannot represent is dropped, matching
+    // dcrd refusing to serve an unroutable peer.
+    let Some((peer, remote_addr)) = associate_inbound_peer(addr, template) else {
+        return;
     };
-    let mut peer = Peer::new_inbound(template.config());
-    peer.associate(&addr.to_string(), na, NodePeerEnv::new().now_nanos());
     // An inbound peer is never a persistent (added) node and has no
     // connection request.
     // The connection's teardown handle is minted here, where the socket
@@ -514,13 +513,33 @@ fn serve_inbound_peer(
     serve_connection(
         crate::transport::Teardown::new(stream),
         peer,
-        &addr.to_string(),
+        &remote_addr,
         template,
         connected,
         server,
         false,
         None,
     );
+}
+
+/// Build the inbound peer for a connection accepted from `addr`,
+/// associated with dcrd's form of that address, which is returned too
+/// for the server handlers and the log lines; `None` for an address the
+/// wire network address cannot carry.
+///
+/// dcrd's connection manager hands `inboundPeerConnected` the accepted
+/// `net.TCPAddr` as an addrmgr `NetAddress`
+/// (`inboundStdlibNetAddrToAddrMgrAddr`,
+/// `internal/connmgr/connmanager.go:1267-1279`), which has no IPv6
+/// zone, and the peer's `Addr()` renders it by its `Key`
+/// (`addrmgr/netaddress.go:73-76`): `[fe80::1]:9108` for a link-local
+/// peer that `SocketAddr` renders as `[fe80::1%2]:9108`.
+fn associate_inbound_peer(addr: SocketAddr, template: &PeerTemplate) -> Option<(Peer, String)> {
+    let na = net_address_v2_from_socket(addr, template.services).ok()?;
+    let remote_addr = crate::outbound::socket_addr_to_net_address(&addr).key();
+    let mut peer = Peer::new_inbound(template.config());
+    peer.associate(&remote_addr, na, NodePeerEnv::new().now_nanos());
+    Some((peer, remote_addr))
 }
 
 /// Build, associate, and run a single outbound peer to completion,
@@ -813,30 +832,27 @@ pub(crate) fn bind_listener(net: &str, addr: &str) -> io::Result<TcpListener> {
     TcpListener::bind(bind_addr)
 }
 
-/// Binds the parsed peer-to-peer listeners and accepts inbound
-/// connections until shutdown.
-pub struct ListenerRuntime {
-    shutdown: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<()>>,
+/// The parsed peer-to-peer listeners, bound but not yet accepting.  dcrd
+/// binds them in `newServer`'s `initListeners`, ahead of the chain and
+/// everything else the server is built from, and its connection
+/// manager's `listenHandler`s only start accepting once `Run` starts the
+/// server; until then a connecting peer waits in the listen backlog.
+pub struct BoundListeners {
+    listeners: Vec<(TcpListener, SocketAddr)>,
     bound: Vec<SocketAddr>,
 }
 
-impl ListenerRuntime {
+impl BoundListeners {
     /// Bind each `(network, address)` listener spec (as produced by
-    /// `parse_listeners`) and start accepting inbound connections,
-    /// invoking `on_inbound` for each accepted connection.
+    /// `parse_listeners`).
     ///
     /// A spec that cannot be bound is logged and skipped, as dcrd's
     /// `initListeners` does, so a host where only one half of the
     /// default `tcp4`/`tcp6` pair binds (IPv6 disabled, say) serves on
-    /// the other.  Startup fails only when nothing binds, with
+    /// the other.  Binding fails only when nothing binds, with
     /// `newServer`'s "no valid listen address".
-    pub fn start(
-        specs: &[(&str, String)],
-        on_inbound: InboundHandler,
-    ) -> io::Result<ListenerRuntime> {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let mut threads = Vec::with_capacity(specs.len());
+    pub fn bind(specs: &[(&str, String)]) -> io::Result<BoundListeners> {
+        let mut listeners = Vec::with_capacity(specs.len());
         let mut bound = Vec::with_capacity(specs.len());
 
         for (net, addr) in specs {
@@ -857,22 +873,63 @@ impl ListenerRuntime {
                 }
             };
             bound.push(local);
-
-            let shutdown = Arc::clone(&shutdown);
-            let handler = Arc::clone(&on_inbound);
-            threads.push(std::thread::spawn(move || {
-                accept_loop(&listener, local, &shutdown, &handler);
-            }));
+            listeners.push((listener, local));
         }
 
         if bound.is_empty() {
             return Err(io::Error::other("no valid listen address"));
         }
-        Ok(ListenerRuntime {
+        Ok(BoundListeners { listeners, bound })
+    }
+
+    /// The addresses bound (resolved from the requested specs, so an
+    /// ephemeral `:0` port is reported as the assigned port).
+    pub fn bound_addrs(&self) -> &[SocketAddr] {
+        &self.bound
+    }
+
+    /// Start accepting inbound connections on every bound listener,
+    /// invoking `on_inbound` for each accepted connection (dcrd's
+    /// connection manager starting a `listenHandler` per listener).
+    pub fn serve(self, on_inbound: InboundHandler) -> ListenerRuntime {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let threads = self
+            .listeners
+            .into_iter()
+            .map(|(listener, local)| {
+                let shutdown = Arc::clone(&shutdown);
+                let handler = Arc::clone(&on_inbound);
+                std::thread::spawn(move || {
+                    accept_loop(&listener, local, &shutdown, &handler);
+                })
+            })
+            .collect();
+        ListenerRuntime {
             shutdown,
             threads,
-            bound,
-        })
+            bound: self.bound,
+        }
+    }
+}
+
+/// Binds the parsed peer-to-peer listeners and accepts inbound
+/// connections until shutdown.
+pub struct ListenerRuntime {
+    shutdown: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+    bound: Vec<SocketAddr>,
+}
+
+impl ListenerRuntime {
+    /// Bind each `(network, address)` listener spec (as produced by
+    /// `parse_listeners`) and start accepting inbound connections,
+    /// invoking `on_inbound` for each accepted connection: a
+    /// [`BoundListeners::bind`] straight into [`BoundListeners::serve`].
+    pub fn start(
+        specs: &[(&str, String)],
+        on_inbound: InboundHandler,
+    ) -> io::Result<ListenerRuntime> {
+        Ok(BoundListeners::bind(specs)?.serve(on_inbound))
     }
 
     /// The addresses the runtime is actually listening on (resolved from
@@ -1259,6 +1316,43 @@ mod tests {
         );
     }
 
+    /// An inbound peer on the local link is known by dcrd's zone-free
+    /// form of its address, the addrmgr `NetAddress` key: that is the
+    /// peer's address getpeerinfo reports and `node disconnect` matches,
+    /// and the address the server handlers and log lines use.  The port
+    /// used `SocketAddr`'s rendering, which keeps the `%scope`.
+    #[test]
+    fn a_link_local_inbound_peer_has_no_zone_in_its_address() {
+        let template = PeerTemplate {
+            net: CurrencyNet::TEST_NET3,
+            protocol_version: 0,
+            services: ServiceFlag(1),
+            user_agent_name: "dcroxide".to_string(),
+            user_agent_version: "0.1.0".to_string(),
+            idle_timeout: Duration::from_secs(3600),
+            ping_interval: Duration::from_secs(3600),
+            disable_relay_tx: false,
+            proxy: String::new(),
+            newest_block: None,
+        };
+        let link_local = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().expect("ip"),
+            9108,
+            0,
+            2,
+        ));
+        assert_eq!(link_local.to_string(), "[fe80::1%2]:9108");
+        let (peer, remote_addr) =
+            associate_inbound_peer(link_local, &template).expect("a servable address");
+        assert_eq!(remote_addr, "[fe80::1]:9108");
+        assert_eq!(peer.addr(), "[fe80::1]:9108");
+
+        let v4: SocketAddr = "192.0.2.1:9108".parse().expect("addr");
+        let (peer, remote_addr) = associate_inbound_peer(v4, &template).expect("servable");
+        assert_eq!(remote_addr, "192.0.2.1:9108");
+        assert_eq!(peer.addr(), "192.0.2.1:9108");
+    }
+
     /// Serve one inbound peer from `template` and return the `version`
     /// message it sends a client connecting from loopback.
     fn served_version(template: PeerTemplate) -> dcroxide_wire::MsgVersion {
@@ -1481,7 +1575,8 @@ mod tests {
             Default::default(),
             &mut csprng,
         )));
-        let addr: SocketAddr = "203.0.113.7:9108".parse().expect("addr");
+        let addr =
+            crate::outbound::socket_addr_to_net_address(&"203.0.113.7:9108".parse().expect("addr"));
         let mut mgr = manager.lock().expect("connmgr mutex");
         for _ in 0..dcroxide_connmgr::DROP_LOG_BURST_LIMIT {
             log_inbound_drop(&mut mgr, &manager, &addr, "rate limited");

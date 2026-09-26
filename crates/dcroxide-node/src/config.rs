@@ -1443,6 +1443,7 @@ pub fn load_config(
             env,
             notices,
             &RefCell::new(None),
+            None,
         )
     })
 }
@@ -1458,7 +1459,13 @@ pub fn load_config_from_argv(
     env: &ConfigEnv<'_>,
 ) -> Result<(Config, Vec<String>), String> {
     collect_notices(|notices| {
-        load_config_impl(&CliSource::Argv(args), env, notices, &RefCell::new(None))
+        load_config_impl(
+            &CliSource::Argv(args),
+            env,
+            notices,
+            &RefCell::new(None),
+            None,
+        )
     })
 }
 
@@ -1471,23 +1478,57 @@ pub fn load_config_from_argv(
 /// stays empty.
 ///
 /// `env_refused` is where the environment lookups (`env.getenv`, and
-/// the [`app_data_dir`] that produced `env.default_home_dir`) record a
-/// value they could not hold ([`crate::flags::getenv_utf8`]).  The load
-/// fails with it after each step that reads the environment, before
-/// acting on what that step read: after the pre-parses and their
-/// version and service-command exits (which use none of it), so before
-/// the home directory and the default config file; after the final
-/// parse; and after each `$VAR` expansion of a path.  A variable dcrd
-/// would not have read, such as `DCROXIDE_APPDATA` beside `--appdata`,
-/// is never looked up, and so never refused.
+/// any that produced `env.default_home_dir`) record a value they could
+/// not hold ([`crate::flags::getenv_utf8`]).  The load fails with it
+/// after each step that reads the environment, before acting on what
+/// that step read: after the pre-parses and their version and
+/// service-command exits (which use none of it), so before the home
+/// directory and the default config file; after the final parse; and
+/// after each `$VAR` expansion of a path.  A variable dcrd would not
+/// have read, such as `DCROXIDE_APPDATA` beside `--appdata`, is never
+/// looked up, and so never refused.
 pub fn load_config_from_argv_with_notices(
     args: &[String],
     env: &ConfigEnv<'_>,
     notices: &mut dyn FnMut(&str),
     env_refused: &RefCell<Option<String>>,
 ) -> Result<(Config, Vec<String>), String> {
-    load_config_impl(&CliSource::Argv(args), env, notices, env_refused)
+    load_config_impl(&CliSource::Argv(args), env, notices, env_refused, None)
 }
+
+/// [`load_config_from_argv_with_notices`] where the [`app_data_dir`]
+/// lookups that produced `env.default_home_dir` recorded their refusals
+/// in `home_refused` rather than `env_refused`.  dcrd reads `$HOME` (on
+/// Windows `%LOCALAPPDATA%`) for its default home at package init, but
+/// what it read matters only when the pre-parse names no other home:
+/// with `--appdata` or `DCRD_APPDATA` set, `loadConfig` replaces every
+/// default derived from it (`config.go:692-727`).  So the load fails
+/// with `home_refused` only when it goes on with the default home, at
+/// the first `env_refused` check.  A non-UTF-8 `$HOME` beside
+/// `--appdata` starts the node, as dcrd's does, and no path given beside
+/// it is taken for one of the defaults the refused home would have
+/// produced ([`REFUSED_DEFAULT_HOME`]).
+pub fn load_config_from_argv_with_home_refusal(
+    args: &[String],
+    env: &ConfigEnv<'_>,
+    notices: &mut dyn FnMut(&str),
+    env_refused: &RefCell<Option<String>>,
+    home_refused: &RefCell<Option<String>>,
+) -> Result<(Config, Vec<String>), String> {
+    load_config_impl(
+        &CliSource::Argv(args),
+        env,
+        notices,
+        env_refused,
+        Some(home_refused),
+    )
+}
+
+/// The default home to compare against when the lookup that produced it
+/// was refused ([`crate::flags::getenv_utf8`]): a path no argument or
+/// environment value can equal, as none the port takes can equal the
+/// raw-bytes home dcrd derives from that variable.
+pub const REFUSED_DEFAULT_HOME: &str = "\0";
 
 /// Fail with the environment value a lookup refused, if one did
 /// ([`load_config_from_argv_with_notices`]).
@@ -1543,9 +1584,25 @@ fn load_config_impl(
     env: &ConfigEnv<'_>,
     notices: &mut dyn FnMut(&str),
     env_refused: &RefCell<Option<String>>,
+    home_refused: Option<&RefCell<Option<String>>>,
 ) -> Result<(Config, Vec<String>), String> {
     let func_name = "loadConfig";
-    let default_home = env.default_home_dir.clone();
+    // When the default home's lookup was refused
+    // ([`load_config_from_argv_with_home_refusal`]), dcrd's default home
+    // holds the raw bytes of that variable, which no option value the
+    // port takes can spell: none of the comparisons with the defaults
+    // below matches a value given on the command line.  The "." the
+    // lookup fell back to would match `--appdata=.`, or a
+    // `--datadir=data` or `--configfile=dcroxide.conf` beside another
+    // home, so a NUL stands in for it, which neither an argument nor an
+    // environment value can hold.  The load goes on only when the
+    // pre-parse names another home, and that replaces each default
+    // derived from this one.
+    let default_home = if home_refused.is_some_and(|refused| refused.borrow().is_some()) {
+        String::from(REFUSED_DEFAULT_HOME)
+    } else {
+        env.default_home_dir.clone()
+    };
     let default_data_dir = filepath_join(&[&default_home, DEFAULT_DATA_DIRNAME]);
     let default_log_dir = filepath_join(&[&default_home, DEFAULT_LOG_DIRNAME]);
     let default_rpc_key_file = filepath_join(&[&default_home, "rpc.key"]);
@@ -1633,6 +1690,17 @@ fn load_config_impl(
     // Nothing has used the environment yet; the home directory and the
     // default config file below would (`$HOME`, `DCROXIDE_APPDATA`).
     check_env_refused(env_refused)?;
+    // The default home's own lookups count only when it is the home:
+    // another home the pre-parse names replaces the defaults derived
+    // from it below ([`load_config_from_argv_with_home_refusal`]).  An
+    // empty one leaves the defaults as they are, as dcrd's
+    // `preCfg.HomeDir != ""` test does.  With the lookup refused, the
+    // home equals the default only when nothing named one.
+    if (pre_cfg.home_dir.is_empty() || pre_cfg.home_dir == default_home)
+        && let Some(home_refused) = home_refused
+    {
+        check_env_refused(home_refused)?;
+    }
 
     // Update the home directory for dcrd if specified.  Since the
     // home directory is updated, other variables need to be updated

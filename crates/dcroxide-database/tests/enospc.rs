@@ -5,9 +5,12 @@
 //! prove the consequence — once latched, writes refuse — on every
 //! platform. What they cannot prove is the cause: that a genuine device
 //! failure produces an `Err` out of `DbCache::run_flush` rather than a panic,
-//! a partial apply, or a silently swallowed error. That wiring is three
-//! `map_err` calls, and "three call sites a reader can check" is exactly
-//! the kind of assurance this project has been wrong about before.
+//! a partial apply, or a silently swallowed error. That wiring is two
+//! sites: `flush_locked`, which every durable flush goes through and
+//! which latches before the writer semaphore is released, and the latch
+//! on `close`'s allocator-state commit. "Two call sites a reader can
+//! check" is exactly the kind of assurance this project has been wrong
+//! about before.
 //!
 //! So this fills a two-megabyte filesystem underneath a live database and
 //! checks what comes back.
