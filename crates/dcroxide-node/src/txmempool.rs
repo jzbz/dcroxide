@@ -40,14 +40,25 @@ const DEFAULT_MAXIMUM_VOTE_AGE: u16 = 1440;
 /// The daemon's concrete pool over the live chain.
 pub type NodeTxPool = TxPool<NodePoolChain>;
 
-/// The current unix time (dcrd's direct `time.Now()` calls; also the
-/// wall clock standing in for dcrd's median-adjusted time source
-/// until network time samples are collected).
+/// The current unix time from the wall clock (dcrd's direct
+/// `time.Now()` calls whose result is kept or reported as a Unix time;
+/// the median-adjusted time source is [`crate::mediantime`], and the
+/// pool's orphan expiration runs on the monotonic
+/// `PoolChain::now_mono_nanos`).
 pub(crate) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// The monotonic clock in nanoseconds from a process-wide origin (the
+/// monotonic reading Go's `time.Now()` carries; see
+/// `PoolChain::now_mono_nanos`).
+fn now_mono_nanos() -> i64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let origin = ORIGIN.get_or_init(std::time::Instant::now);
+    i64::try_from(origin.elapsed().as_nanos()).unwrap_or(i64::MAX)
 }
 
 /// The memoized view of the tip with its regular tree disconnected
@@ -353,6 +364,10 @@ impl PoolChain for NodePoolChain {
 
     fn now_unix(&self) -> i64 {
         now_unix()
+    }
+
+    fn now_mono_nanos(&self) -> i64 {
+        now_mono_nanos()
     }
 
     /// Drawn from the ChaCha20 keystream seeded at construction.  This

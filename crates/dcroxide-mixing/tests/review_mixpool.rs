@@ -4,7 +4,9 @@
 //! one-message-per-type rule holds for un-orphaned messages), Go's
 //! wrapping arithmetic on negative mix amounts, Go's time arithmetic for
 //! key exchange epochs, orphan age on the monotonic clock, and the
-//! pre-hashed intake path keeping dcrd's check order.
+//! pre-hashed intake path keeping dcrd's check order.  From the
+//! 2026-09-25 review: the recently-removed cache's presence probe and
+//! wall-clock TTL, and signatures verified only where dcrd verifies.
 
 // Test-harness arithmetic over bounded values.
 #![allow(clippy::arithmetic_side_effects)]
@@ -437,11 +439,11 @@ fn orphan_age_follows_the_monotonic_clock() {
     );
 }
 
-/// X1-c#5: the daemon's intake path hashes and verifies a message once,
-/// before the sync-manager and mixpool locks, and the pool consults the
-/// cached verdict only where dcrd verifies: a rerun is refused as a rerun
-/// (not bannable) whatever its signature, an already-accepted message is
-/// a silent duplicate, and only then does a bad signature count.
+/// X1-c#5: the daemon's intake path hashes a message once, before the
+/// sync-manager and mixpool locks, and the signature counts only where
+/// dcrd verifies it: a rerun is refused as a rerun (not bannable)
+/// whatever its signature, an already-accepted message is a silent
+/// duplicate, and only then does a bad signature count.
 #[test]
 fn hashed_acceptance_keeps_dcrd_check_order() {
     let (mut pool, _clocks) = new_pool();
@@ -526,4 +528,136 @@ fn precomputed_hash_must_match_the_message() {
     let (priv_key, id) = identity(10);
     let pr = pair_request(&priv_key, id, 10);
     let _ = HashedMessage::with_hash(PoolMessage::PR(pr), Hash([7u8; 32]));
+}
+
+/// X1-p#1: netsync's `needMixMsg` asks only whether dcrd's
+/// `RecentMessage` finds a message.  The presence probe answers exactly
+/// what `recent_message` finds -- a pooled pair request, a pooled entry,
+/// a removed message still in the recently-removed cache -- without
+/// copying the message out.
+#[test]
+fn recent_presence_probe_finds_what_recent_message_finds() {
+    let (mut pool, _clocks) = new_pool();
+    let (priv_key, id) = identity(11);
+    let pr = pair_request(&priv_key, id, 11);
+    let unknown = unknown_pair_request(16);
+    let ke = key_exchange(&priv_key, id, [&pr, &unknown], &pr, NOW_SECS as u64);
+    accept(&mut pool, PoolMessage::PR(pr.clone())).expect("pair request is accepted");
+    accept(&mut pool, PoolMessage::KE(Box::new(ke.clone()))).expect("key exchange is accepted");
+    let pr_hash = pr.mix_hash().expect("hash");
+    let ke_hash = ke.mix_hash().expect("hash");
+    let never = unknown.mix_hash().expect("hash");
+
+    for hash in [pr_hash, ke_hash] {
+        assert!(pool.have_message(&hash));
+        assert!(pool.have_recent_message(&hash), "pooled");
+        assert_eq!(
+            pool.recent_message(&hash)
+                .map(|m| m.mix_hash().expect("hash")),
+            Some(hash)
+        );
+    }
+    assert!(!pool.have_recent_message(&never));
+    assert!(pool.recent_message(&never).is_none());
+
+    // The pair request expires, taking the key exchange with it: both
+    // leave the pool for the recently-removed cache.
+    pool.expire_messages(110);
+    for hash in [pr_hash, ke_hash] {
+        assert!(!pool.have_message(&hash), "removed from the pool");
+        assert!(pool.have_recent_message(&hash), "recently removed");
+        assert_eq!(
+            pool.recent_message(&hash)
+                .map(|m| m.mix_hash().expect("hash")),
+            Some(hash)
+        );
+    }
+    assert!(!pool.have_recent_message(&never));
+}
+
+/// C2-p#1: dcrd's `container/lru` stores an item's expiry as
+/// `now.Add(ttl).UnixNano()` and compares `now.UnixNano()`, so the
+/// recently-removed cache's one-minute TTL runs on the wall clock, not
+/// the monotonic one the orphan age uses.
+#[test]
+fn recent_cache_expires_on_the_wall_clock() {
+    let (mut pool, clocks) = new_pool();
+    let (priv_key, id) = identity(12);
+    let pr = pair_request(&priv_key, id, 12);
+    let pr_hash = pr.mix_hash().expect("hash");
+    accept(&mut pool, PoolMessage::PR(pr)).expect("pair request is accepted");
+    pool.expire_messages(110);
+    assert!(pool.have_recent_message(&pr_hash));
+
+    // Two monotonic minutes with the wall clock stood still: still
+    // recent.
+    clocks.advance_mono(2 * 60 * NANOS);
+    assert!(
+        pool.have_recent_message(&pr_hash),
+        "the wall says no time passed"
+    );
+
+    // The wall clock steps past the TTL: gone, however little time
+    // really passed.
+    clocks.advance_wall(61 * NANOS);
+    assert!(
+        !pool.have_recent_message(&pr_hash),
+        "expired on the wall clock"
+    );
+    assert!(pool.recent_message(&pr_hash).is_none());
+}
+
+/// X1-p#2: dcrd verifies a mix message's signature only after the
+/// rerun check and the already-accepted check (`AcceptMessage`,
+/// `mixpool.go:1172-1198`; netsync's rejected filter runs before that),
+/// so a replay of a pooled message, or a rerun, costs no Schnorr verify.
+/// Hashing a message no longer verifies it; the pool says when dcrd
+/// would, and verifies under its guard only if the caller did not.
+#[test]
+fn replays_and_reruns_are_never_verified() {
+    let (mut pool, _clocks) = new_pool();
+    let (priv_key, id) = identity(13);
+    let pr = pair_request(&priv_key, id, 13);
+
+    let msg = HashedMessage::new(PoolMessage::PR(pr.clone()));
+    assert!(!msg.signature_checked(), "hashing does not verify");
+    assert!(pool.needs_signature_check(&msg));
+    assert!(msg.verify());
+    assert_eq!(
+        pool.accept_hashed(&msg, 1, &no_mempool_spent)
+            .expect("accepted")
+            .len(),
+        1
+    );
+
+    // A replay of the pooled message is a silent duplicate, unverified.
+    let replay = HashedMessage::new(PoolMessage::PR(pr.clone()));
+    assert!(!pool.needs_signature_check(&replay));
+    assert!(
+        pool.accept_hashed(&replay, 1, &no_mempool_spent)
+            .expect("duplicate")
+            .is_empty()
+    );
+    assert!(!replay.signature_checked(), "a replay is never verified");
+
+    // A rerun is refused before any verification.
+    let unknown = unknown_pair_request(17);
+    let mut rerun = key_exchange(&priv_key, id, [&pr, &unknown], &pr, NOW_SECS as u64);
+    rerun.run = 1;
+    let rerun = HashedMessage::new(PoolMessage::KE(Box::new(rerun)));
+    assert!(!pool.needs_signature_check(&rerun));
+    rejected(pool.accept_hashed(&rerun, 1, &no_mempool_spent), "rerun");
+    assert!(!rerun.signature_checked(), "a rerun is never verified");
+
+    // A new message the caller did not verify is verified under the
+    // guard, where dcrd would verify it.
+    let mut forged = pr;
+    forged.lock_time = 1;
+    let forged = HashedMessage::new(PoolMessage::PR(forged));
+    assert!(pool.needs_signature_check(&forged));
+    assert_eq!(
+        pool.accept_hashed(&forged, 1, &no_mempool_spent).err(),
+        Some(PoolError::Rule(RuleKind::InvalidSignature))
+    );
+    assert!(forged.signature_checked());
 }

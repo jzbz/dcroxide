@@ -11,7 +11,7 @@
 
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -56,13 +56,13 @@ const HEIGHT_DIFF_TO_PRUNE_TICKET: i64 = 288;
 const HEIGHT_DIFF_TO_PRUNE_VOTES: i64 = 10;
 
 /// The maximum amount of time an orphan is allowed to stay in the
-/// orphan pool before it expires, in seconds (dcrd `orphanTTL`).
-const ORPHAN_TTL_SECS: i64 = 15 * 60;
+/// orphan pool before it expires, in nanoseconds (dcrd `orphanTTL`).
+const ORPHAN_TTL_NANOS: i64 = 15 * 60 * 1_000_000_000;
 
 /// The minimum amount of time between scans of the orphan pool to
-/// evict expired transactions, in seconds (dcrd
+/// evict expired transactions, in nanoseconds (dcrd
 /// `orphanExpireScanInterval`).
-const ORPHAN_EXPIRE_SCAN_INTERVAL_SECS: i64 = 5 * 60;
+const ORPHAN_EXPIRE_SCAN_INTERVAL_NANOS: i64 = 5 * 60 * 1_000_000_000;
 
 /// The maximum number of concurrent treasury spends allowed in the
 /// mempool (dcrd `MempoolMaxConcurrentTSpends`).
@@ -131,8 +131,17 @@ pub trait PoolChain {
     /// best block (dcrd `Policy.StandardVerifyFlags`).
     fn standard_verify_flags(&self) -> Result<ScriptFlags, String>;
     /// The current wall clock as unix seconds (dcrd's direct
-    /// `time.Now()` calls, injected for determinism).
+    /// `time.Now()` calls where the result is kept or reported as a
+    /// Unix time, injected for determinism).
     fn now_unix(&self) -> i64;
+    /// A monotonic clock reading in nanoseconds from an arbitrary
+    /// origin: the monotonic half of dcrd's `time.Now()`, which the
+    /// orphan expiration compares (`expiration: time.Now().Add(orphanTTL)`
+    /// and `now.After(otx.expiration)` over two `time.Now()` readings,
+    /// `internal/mempool/mempool.go:463-475, :521`), so a wall-clock
+    /// step moves neither the orphan TTL nor the expiry-scan interval.
+    /// Injected for determinism, like [`PoolChain::now_unix`].
+    fn now_mono_nanos(&self) -> i64;
     /// A random draw, standing in for the per-process randomness of
     /// Go's map iteration order.
     ///
@@ -199,11 +208,17 @@ pub struct Policy {
 
 /// An orphan transaction with its eviction metadata (dcrd
 /// `orphanTx`).
+#[derive(Clone)]
 struct OrphanTx {
     tx: Arc<MsgTx>,
     tx_hash: Hash,
     tag: Tag,
-    expiration_unix: i64,
+    /// The monotonic reading after which the orphan expires
+    /// ([`PoolChain::now_mono_nanos`]).
+    expiration_mono: i64,
+    /// The orphan's position in the pool's eviction slots, which the
+    /// random eviction draws from ([`TxPool::limit_num_orphans`]).
+    slot: usize,
 }
 
 /// A map key for outpoints.
@@ -369,7 +384,12 @@ pub struct TxPool<C: PoolChain> {
     last_updated_unix: i64,
 
     pool: BTreeMap<[u8; 32], Arc<TxDesc>>,
-    orphans: BTreeMap<[u8; 32], Arc<OrphanTx>>,
+    orphans: BTreeMap<[u8; 32], OrphanTx>,
+    /// The hashes of the orphans in `orphans`, one slot each, so the
+    /// random eviction picks its victim by index in constant time where
+    /// walking the ordered map to an index is linear (dcrd takes the
+    /// first entry of a Go map `range`, also constant time).
+    orphan_slots: Vec<[u8; 32]>,
     orphans_by_prev: BTreeMap<OutKey, BTreeMap<[u8; 32], Arc<MsgTx>>>,
     outpoints: BTreeMap<OutKey, Arc<TxDesc>>,
     staged: BTreeMap<[u8; 32], Arc<TxDesc>>,
@@ -378,19 +398,25 @@ pub struct TxPool<C: PoolChain> {
     mining_view: TxMiningView,
     votes: BTreeMap<[u8; 32], Vec<VoteDesc>>,
     tspends: BTreeSet<[u8; 32]>,
-    next_expire_scan_unix: i64,
+    /// The monotonic reading after which the next orphan expiry scan may
+    /// run ([`PoolChain::now_mono_nanos`]).
+    next_expire_scan_mono: i64,
     exists_addr_index: Option<Box<dyn UnconfirmedAddrIndexer>>,
     vote_receiver: Option<Box<dyn VoteReceiver>>,
     tspend_receiver: Option<Box<dyn TSpendReceiver>>,
     fee_estimator: Option<Box<dyn FeeEstimatorSink>>,
     mixpool_probe: Option<Box<dyn MixpoolProbe>>,
+    /// The height a block event's maintenance stamps on the descriptors
+    /// it creates, in place of the chain's best height (see
+    /// [`TxPool::with_event_height`]).
+    event_height: Option<i64>,
 }
 
 impl<C: PoolChain> TxPool<C> {
     /// A new memory pool for validating and storing standalone
     /// transactions until they are mined into a block (dcrd `New`).
     pub fn new(chain: C, policy: Policy, params: &Params) -> TxPool<C> {
-        let next_expire_scan_unix = chain.now_unix() + ORPHAN_EXPIRE_SCAN_INTERVAL_SECS;
+        let next_expire_scan_mono = chain.now_mono_nanos() + ORPHAN_EXPIRE_SCAN_INTERVAL_NANOS;
         let mining_view = TxMiningView::new(policy.enable_ancestor_tracking);
         TxPool {
             chain,
@@ -400,6 +426,7 @@ impl<C: PoolChain> TxPool<C> {
             last_updated_unix: 0,
             pool: BTreeMap::new(),
             orphans: BTreeMap::new(),
+            orphan_slots: Vec::new(),
             orphans_by_prev: BTreeMap::new(),
             outpoints: BTreeMap::new(),
             staged: BTreeMap::new(),
@@ -408,13 +435,68 @@ impl<C: PoolChain> TxPool<C> {
             mining_view,
             votes: BTreeMap::new(),
             tspends: BTreeSet::new(),
-            next_expire_scan_unix,
+            next_expire_scan_mono,
             exists_addr_index: None,
             vote_receiver: None,
             tspend_receiver: None,
             fee_estimator: None,
             mixpool_probe: None,
+            event_height: None,
         }
+    }
+
+    /// Run `f` with the descriptors of the transactions the pool accepts
+    /// recording `height` rather than the chain's current best height.
+    ///
+    /// dcrd runs its block-notification handlers with the chain tip at
+    /// the block the event produced -- the block itself for a connect,
+    /// its parent for a disconnect (`internal/blockchain/chain.go:746,
+    /// :775` and `:929, :944`) -- so a transaction a handler admits
+    /// records that height (`mp.newTxDesc(tx, txType, bestHeight, ...)`,
+    /// `internal/mempool/mempool.go:1747`).  The daemon runs those
+    /// handlers after the whole processing call, with the tip already
+    /// final, and passes each event's height here, so the recorded
+    /// height, which `getrawmempool` reports and the stake prunes key on,
+    /// is the one dcrd records.  Every check still reads the chain as it
+    /// now is.
+    pub fn with_event_height<R>(&mut self, height: i64, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = self.event_height.replace(height);
+        let result = f(self);
+        self.event_height = outer;
+        result
+    }
+
+    /// Run `f` with `txns` in the transient map, where
+    /// [`maybe_accept_transactions`](TxPool::maybe_accept_transactions)
+    /// keeps the not-yet-readmitted transactions of its own batch, and
+    /// hand the map back afterwards.
+    ///
+    /// dcrd readmits a disconnected block's transactions with the chain
+    /// tip at that block's parent (`internal/blockchain/chain.go:929,
+    /// :943-949`), so the outputs of the blocks the same reorganization
+    /// disconnects next, and of the fork block's regular tree when the
+    /// first new block disapproves it, are still chain outputs when it
+    /// does.  The daemon readmits after the whole processing call, with
+    /// those blocks already gone from the chain and that tree already
+    /// disapproved, and passes their transactions here, so a transaction
+    /// spending one of them finds its parent, as in dcrd, instead of
+    /// being dropped as an orphan no pool keeps.  They enter the view as
+    /// unmined outputs, where dcrd's are chain outputs with their block
+    /// height and index.  The map is empty outside such a call, so no
+    /// other caller sees these entries.
+    pub fn with_transient<R>(
+        &mut self,
+        txns: &mut BTreeMap<[u8; 32], MsgTx>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        debug_assert!(
+            self.transient.is_empty(),
+            "the transient map is only filled inside a readmission"
+        );
+        core::mem::swap(&mut self.transient, txns);
+        let result = f(self);
+        core::mem::swap(&mut self.transient, txns);
+        result
     }
 
     /// Install the optional exists-address index the pool notifies of
@@ -537,7 +619,7 @@ impl<C: PoolChain> TxPool<C> {
 
         if !remove_redeemers {
             // Remove the transaction from the orphan pool.
-            self.orphans.remove(&tx_hash.0);
+            self.drop_orphan_entry(tx_hash);
             return;
         }
 
@@ -572,14 +654,39 @@ impl<C: PoolChain> TxPool<C> {
             // from the orphan pool.
             let done = scan.tx_hash;
             frames.pop();
-            self.orphans.remove(&done.0);
+            self.drop_orphan_entry(&done);
         }
+    }
+
+    /// Drop the orphan from the orphan pool and its eviction slot,
+    /// moving the last slot's orphan into the freed one.
+    fn drop_orphan_entry(&mut self, tx_hash: &Hash) {
+        let Some(otx) = self.orphans.remove(&tx_hash.0) else {
+            return;
+        };
+        self.orphan_slots.swap_remove(otx.slot);
+        if let Some(moved) = self.orphan_slots.get(otx.slot)
+            && let Some(moved) = self.orphans.get_mut(moved)
+        {
+            moved.slot = otx.slot;
+        }
+    }
+
+    /// Whether the eviction slots name every orphan exactly once, each
+    /// at the slot its entry records.
+    #[cfg(test)]
+    fn orphan_slots_consistent(&self) -> bool {
+        self.orphan_slots.len() == self.orphans.len()
+            && self
+                .orphans
+                .iter()
+                .all(|(hash, otx)| self.orphan_slots.get(otx.slot) == Some(hash))
     }
 
     /// The head of dcrd `removeOrphan`: look the orphan up and remove
     /// its references from the previous orphan index, leaving the
     /// orphan pool itself untouched.  `None` when it is not an orphan.
-    fn unlink_orphan(&mut self, tx_hash: &Hash) -> Option<Arc<OrphanTx>> {
+    fn unlink_orphan(&mut self, tx_hash: &Hash) -> Option<OrphanTx> {
         let otx = self.orphans.get(&tx_hash.0).cloned()?;
 
         // Remove the reference from the previous orphan index.
@@ -668,13 +775,14 @@ impl<C: PoolChain> TxPool<C> {
     /// the test doubles answer with a constant.
     fn limit_num_orphans(&mut self) {
         // Scan through the orphan pool and remove any expired orphans
-        // when it's time.
-        let now = self.chain.now_unix();
-        if now > self.next_expire_scan_unix {
+        // when it's time.  dcrd compares `time.Now()` readings here, so
+        // on Go's monotonic clock.
+        let now = self.chain.now_mono_nanos();
+        if now > self.next_expire_scan_mono {
             let expired: Vec<Hash> = self
                 .orphans
                 .values()
-                .filter(|otx| now > otx.expiration_unix)
+                .filter(|otx| now > otx.expiration_mono)
                 .map(|otx| otx.tx_hash)
                 .collect();
             for hash in expired {
@@ -685,7 +793,7 @@ impl<C: PoolChain> TxPool<C> {
 
             // Set next expiration scan to occur after the scan
             // interval.
-            self.next_expire_scan_unix = now + ORPHAN_EXPIRE_SCAN_INTERVAL_SECS;
+            self.next_expire_scan_mono = now + ORPHAN_EXPIRE_SCAN_INTERVAL_NANOS;
         }
 
         // Nothing to do if adding another orphan will not cause the
@@ -697,8 +805,9 @@ impl<C: PoolChain> TxPool<C> {
 
         // Evict a uniformly chosen orphan.  Don't remove redeemers in
         // the case of a random eviction since it is quite possible it
-        // might be needed again shortly.
-        let len = self.orphans.len();
+        // might be needed again shortly.  The draw indexes the eviction
+        // slots, which hold every orphan once.
+        let len = self.orphan_slots.len();
         if len > 0 {
             // Modulo rather than `crypto/rand`'s multiply-shift: there
             // is no upstream reduction to match (dcrd draws nothing
@@ -708,8 +817,8 @@ impl<C: PoolChain> TxPool<C> {
             // See this function's doc comment and PARITY.md's orphan
             // eviction row.
             let index = (self.chain.random_u64() % len as u64) as usize;
-            if let Some(hash) = self.orphans.values().nth(index).map(|otx| otx.tx_hash) {
-                self.remove_orphan(&hash, false);
+            if let Some(&hash) = self.orphan_slots.get(index) {
+                self.remove_orphan(&Hash(hash), false);
             }
         }
     }
@@ -727,14 +836,22 @@ impl<C: PoolChain> TxPool<C> {
         self.limit_num_orphans();
 
         let tx = Arc::new(tx.clone());
+        let slot = match self.orphans.get(&tx_hash.0) {
+            Some(existing) => existing.slot,
+            None => {
+                self.orphan_slots.push(tx_hash.0);
+                self.orphan_slots.len() - 1
+            }
+        };
         self.orphans.insert(
             tx_hash.0,
-            Arc::new(OrphanTx {
+            OrphanTx {
                 tx: tx.clone(),
                 tx_hash: *tx_hash,
                 tag,
-                expiration_unix: self.chain.now_unix() + ORPHAN_TTL_SECS,
-            }),
+                expiration_mono: self.chain.now_mono_nanos() + ORPHAN_TTL_NANOS,
+                slot,
+            },
         );
         for tx_in in &tx.tx_in {
             self.orphans_by_prev
@@ -1744,7 +1861,7 @@ impl<C: PoolChain> TxPool<C> {
             tree,
             tx_type,
             added_unix: self.chain.now_unix(),
-            height: best_height,
+            height: self.event_height.unwrap_or(best_height),
             fee: tx_fee,
             total_sig_ops: i64::from(total_sig_ops),
             tx_size: serialized_size,
@@ -1899,24 +2016,70 @@ impl<C: PoolChain> TxPool<C> {
         errors
     }
 
+    /// Whether dcrd, with its tip still at the block whose maintenance
+    /// is running, finds every input of `tx`, an orphan a later block of
+    /// the batch mined (dcrd `fetchInputUtxos`,
+    /// `internal/mempool/mempool.go:1048-1088`).  An input whose
+    /// transaction was mined no later than this block is a chain output
+    /// there, since nothing before the later block spends it.  One whose
+    /// transaction a later block mined is there only when the pool or
+    /// stage pool holds that transaction, or it is one of the orphans
+    /// `mined_here` taken as accepted at this block.
+    fn inputs_held_before(
+        &self,
+        tx: &MsgTx,
+        mined_here: &[Hash],
+        mined_later: &dyn Fn(&Hash) -> bool,
+    ) -> bool {
+        tx.tx_in.iter().all(|tx_in| {
+            let parent = &tx_in.previous_out_point.hash;
+            !mined_later(parent)
+                || self.pool.contains_key(&parent.0)
+                || self.staged.contains_key(&parent.0)
+                || mined_here.contains(parent)
+        })
+    }
+
     /// Accept orphans that depended on the passed transaction,
     /// repeating for newly accepted transactions (dcrd
-    /// `processOrphans`).
+    /// `processOrphans`).  `mined_later` names the transactions a later
+    /// block of the same drained batch mined (see
+    /// [`process_orphans_accepted_in_batch`](TxPool::process_orphans_accepted_in_batch));
+    /// every other caller names none.
     fn process_orphans_internal(
         &mut self,
         accepted_tx: &MsgTx,
         accepted_hash: &Hash,
         check_tx_flags: AgendaFlags,
+        mined_later: &dyn Fn(&Hash) -> bool,
     ) -> Vec<(Hash, MsgTx)> {
+        // With no orphans there is nothing to redeem the passed
+        // transaction's outputs or to double spend its inputs, so dcrd's
+        // loop below would find nothing and remove nothing.  Return
+        // before the work it does per output: the connected-block
+        // maintenance runs this for every transaction of every block.
+        if self.orphans.is_empty() {
+            return Vec::new();
+        }
+
         let mut accepted_txns: Vec<(Hash, MsgTx)> = Vec::new();
-        let mut accepted_msgs: Vec<MsgTx> = Vec::new();
+        // Every orphan taken as accepted, shared with the orphan pool's
+        // copies, for the double-spend removal below.
+        let mut accepted_msgs: Vec<Arc<MsgTx>> = Vec::new();
+        // The orphans a later block of the batch mined that are taken as
+        // accepted here, as dcrd's pool holds them at this block.
+        let mut mined_here: Vec<Hash> = Vec::new();
 
-        // Start with processing at least the passed transaction.
-        let mut process_list: Vec<(MsgTx, Hash)> = vec![(accepted_tx.clone(), *accepted_hash)];
-        while let Some((process_item, process_hash)) = process_list.first().cloned() {
-            process_list.remove(0);
+        // Start with processing at least the passed transaction, which
+        // the list borrows (`None`); the orphans queued after it are
+        // shared with the orphan pool's copies rather than cloned, as
+        // dcrd's list holds `*dcrutil.Tx` pointers.
+        let mut process_list: VecDeque<(Option<Arc<MsgTx>>, Hash)> =
+            VecDeque::from([(None, *accepted_hash)]);
+        while let Some((process_orphan, process_hash)) = process_list.pop_front() {
+            let process_item: &MsgTx = process_orphan.as_deref().unwrap_or(accepted_tx);
 
-            let tx_type = dcroxide_stake::determine_tx_type(&process_item);
+            let tx_type = dcroxide_stake::determine_tx_type(process_item);
             let tree = tree_for_type(tx_type);
 
             for tx_out_idx in 0..process_item.tx_out.len() as u32 {
@@ -1949,14 +2112,42 @@ impl<C: PoolChain> TxPool<C> {
 
                 // Potentially accept an orphan into the tx pool.
                 for (orphan_hash, orphan_tx) in orphans {
-                    match self.maybe_accept_transaction(
+                    let result = self.maybe_accept_transaction(
                         &orphan_tx,
                         &orphan_hash,
                         true,
                         true,
                         false,
                         check_tx_flags,
-                    ) {
+                    );
+
+                    // An orphan a later block of the batch mined is a
+                    // duplicate of a chain transaction here or, when
+                    // the batch spent all its outputs too, an orphan of
+                    // its own spent inputs.  dcrd, whose tip is still
+                    // this block, sees neither: it accepts the orphan
+                    // when its chain or pool holds every input at this
+                    // block, and the later block then removes it alone
+                    // (`RemoveTransaction(tx, false)`).  Take it as
+                    // accepted without pooling it, so its redeemers are
+                    // processed here as in dcrd, or else leave it an
+                    // orphan, as dcrd does.
+                    let mined = match &result {
+                        Err(err) => is_already_exists_error(err),
+                        Ok(missing) => !missing.is_empty(),
+                    } && mined_later(&orphan_hash);
+                    if mined {
+                        if !self.inputs_held_before(&orphan_tx, &mined_here, mined_later) {
+                            continue;
+                        }
+                        accepted_msgs.push(orphan_tx.clone());
+                        mined_here.push(orphan_hash);
+                        self.remove_orphan(&orphan_hash, false);
+                        process_list.push_back((Some(orphan_tx), orphan_hash));
+                        break;
+                    }
+
+                    match result {
                         Err(_) => {
                             // The orphan is now invalid, so there is no
                             // way any other orphans which redeem any of
@@ -1978,9 +2169,9 @@ impl<C: PoolChain> TxPool<C> {
                             // too.  Only one transaction for this
                             // outpoint can be accepted.
                             accepted_txns.push((orphan_hash, (*orphan_tx).clone()));
-                            accepted_msgs.push((*orphan_tx).clone());
+                            accepted_msgs.push(orphan_tx.clone());
                             self.remove_orphan(&orphan_hash, false);
-                            process_list.push(((*orphan_tx).clone(), orphan_hash));
+                            process_list.push_back((Some(orphan_tx), orphan_hash));
                             break;
                         }
                     }
@@ -2000,13 +2191,15 @@ impl<C: PoolChain> TxPool<C> {
     }
 
     /// The public orphan processing entry point (dcrd
-    /// `ProcessOrphans`).
+    /// `ProcessOrphans`).  `accepted_hash` is the hash of `accepted_tx`,
+    /// which dcrd's `*dcrutil.Tx` carries cached.
     pub fn process_orphans(
         &mut self,
         accepted_tx: &MsgTx,
+        accepted_hash: &Hash,
         check_tx_flags: AgendaFlags,
     ) -> Vec<Hash> {
-        self.process_orphans_accepted(accepted_tx, check_tx_flags)
+        self.process_orphans_accepted(accepted_tx, accepted_hash, check_tx_flags)
             .into_iter()
             .map(|(hash, _)| hash)
             .collect()
@@ -2021,10 +2214,40 @@ impl<C: PoolChain> TxPool<C> {
     pub fn process_orphans_accepted(
         &mut self,
         accepted_tx: &MsgTx,
+        accepted_hash: &Hash,
         check_tx_flags: AgendaFlags,
     ) -> Vec<(Hash, MsgTx)> {
-        let hash = accepted_tx.tx_hash();
-        self.process_orphans_internal(accepted_tx, &hash, check_tx_flags)
+        self.process_orphans_internal(accepted_tx, accepted_hash, check_tx_flags, &|_| false)
+    }
+
+    /// [`process_orphans_accepted`](TxPool::process_orphans_accepted) for
+    /// a connected block whose maintenance runs in a batch after later
+    /// blocks connected too; `mined_later` names the transactions those
+    /// later blocks mined.
+    ///
+    /// dcrd processes a connected block's orphans with the chain tip at
+    /// that block (`server.go:3046-3053`), so an orphan a later block
+    /// mines is not in the chain yet: it is accepted, and the orphans
+    /// redeeming it with it, and the later block then removes it alone
+    /// (`RemoveTransaction(tx, false)`).  Processed with the tip already
+    /// at the later block, that orphan exists in the chain and fails as
+    /// a duplicate, or as an orphan of its own spent inputs when the
+    /// batch spent all its outputs too, and discarding it as an invalid
+    /// orphan would discard every orphan redeeming it.  When its inputs
+    /// are ones dcrd's chain or pool holds at this block, it is taken as
+    /// accepted instead: dropped alone from the orphan pool, not pooled
+    /// or returned, since it is mined, and processed for its redeemers,
+    /// which are accepted and returned here, as dcrd accepts and
+    /// announces them at this block.  An orphan whose inputs dcrd would
+    /// still miss stays an orphan, as in dcrd.
+    pub fn process_orphans_accepted_in_batch(
+        &mut self,
+        accepted_tx: &MsgTx,
+        accepted_hash: &Hash,
+        check_tx_flags: AgendaFlags,
+        mined_later: &dyn Fn(&Hash) -> bool,
+    ) -> Vec<(Hash, MsgTx)> {
+        self.process_orphans_internal(accepted_tx, accepted_hash, check_tx_flags, mined_later)
     }
 
     /// The main workhorse for handling insertion of new free-standing
@@ -2072,7 +2295,7 @@ impl<C: PoolChain> TxPool<C> {
             // Accept any orphan transactions that depend on this
             // transaction and repeat for those accepted transactions
             // until there are no more.
-            let new_txs = self.process_orphans_internal(tx, &tx_hash, check_tx_flags);
+            let new_txs = self.process_orphans_internal(tx, &tx_hash, check_tx_flags, &|_| false);
             let mut accepted = Vec::with_capacity(new_txs.len() + 1);
 
             // Add the parent transaction first so remote nodes do not
@@ -2250,6 +2473,18 @@ fn is_double_spend_or_duplicate_error(err: &PoolError) -> bool {
     }
 }
 
+/// Whether the error is the rejection of a transaction whose outputs
+/// already exist unspent in the chain (dcrd `ErrAlreadyExists`).
+fn is_already_exists_error(err: &PoolError) -> bool {
+    matches!(
+        err,
+        PoolError::Rule(RuleError {
+            err: crate::RuleErrorSource::Mempool(ErrorKind::AlreadyExists),
+            ..
+        })
+    )
+}
+
 fn hex_string(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -2347,6 +2582,9 @@ mod send_tests {
             fn now_unix(&self) -> i64 {
                 unimplemented!()
             }
+            fn now_mono_nanos(&self) -> i64 {
+                unimplemented!()
+            }
             fn random_u64(&self) -> u64 {
                 unimplemented!()
             }
@@ -2436,6 +2674,9 @@ mod removal_cascade_tests {
         }
         fn now_unix(&self) -> i64 {
             1751800000
+        }
+        fn now_mono_nanos(&self) -> i64 {
+            0
         }
         /// Fixed so eviction is reproducible in these tests; the
         /// eviction-uniformity property is pinned separately, by a
@@ -2835,6 +3076,10 @@ mod removal_cascade_tests {
 
             let left: BTreeSet<[u8; 32]> = pool.orphans.keys().copied().collect();
             assert_eq!(left, expected, "round {round}: orphans left behind");
+            assert!(
+                pool.orphan_slots_consistent(),
+                "round {round}: eviction slots"
+            );
             let index: BTreeMap<OutKey, BTreeSet<[u8; 32]>> = pool
                 .orphans_by_prev
                 .iter()
@@ -2847,6 +3092,10 @@ mod removal_cascade_tests {
                 pool.remove_orphan(&Hash(survivor), false);
                 assert_eq!(pool.orphans.len(), left.len() - 1, "round {round}");
                 assert!(!pool.is_orphan_in_pool(&Hash(survivor)));
+                assert!(
+                    pool.orphan_slots_consistent(),
+                    "round {round}: eviction slots"
+                );
             }
         }
     }
@@ -2859,11 +3108,13 @@ mod orphan_eviction_tests {
     use core::cell::Cell;
     use dcroxide_wire::{TX_TREE_REGULAR, TxIn, TxOut};
 
-    /// A chain backend answering only the two injected questions the
-    /// orphan limiter asks, with the random draw under the test's
-    /// control.
+    /// A chain backend answering only the injected questions the orphan
+    /// limiter asks, with the random draw and both clocks under the
+    /// test's control.
     struct DrawChain {
         draw: Cell<u64>,
+        wall: Cell<i64>,
+        mono: Cell<i64>,
     }
 
     impl PoolChain for DrawChain {
@@ -2918,7 +3169,10 @@ mod orphan_eviction_tests {
             unimplemented!()
         }
         fn now_unix(&self) -> i64 {
-            1751800000
+            self.wall.get()
+        }
+        fn now_mono_nanos(&self) -> i64 {
+            self.mono.get()
         }
         fn random_u64(&self) -> u64 {
             self.draw.get()
@@ -2968,10 +3222,41 @@ mod orphan_eviction_tests {
         TxPool::new(
             DrawChain {
                 draw: Cell::new(draw),
+                wall: Cell::new(1751800000),
+                mono: Cell::new(0),
             },
             policy,
             &params,
         )
+    }
+
+    /// GAP07#3: dcrd stamps an orphan's expiration and schedules the
+    /// expiry scan with `time.Now()` and compares them with `now.After`,
+    /// all monotonic readings, so a wall-clock step moves neither.  A
+    /// forward step used to expire every orphan at the next admission,
+    /// and a backward one to keep them past their TTL.
+    #[test]
+    fn orphan_expiry_follows_the_monotonic_clock() {
+        const SECOND: i64 = 1_000_000_000;
+        let mut pool = pool_capped_at(10, 0);
+        let first = orphan_with_hash(&mut pool, 1);
+
+        // The wall clock jumps forward 20 minutes while a second passes:
+        // the next admission runs no scan and the first orphan stays.
+        pool.chain.wall.set(pool.chain.wall.get() + 20 * 60);
+        pool.chain.mono.set(SECOND);
+        let second = orphan_with_hash(&mut pool, 2);
+        assert!(pool.orphans.contains_key(&first.0), "one second old");
+        assert!(pool.orphans.contains_key(&second.0));
+
+        // The wall clock steps back an hour while 16 minutes pass: both
+        // orphans are past their 15-minute TTL and the scan is due.
+        pool.chain.wall.set(pool.chain.wall.get() - 60 * 60);
+        pool.chain.mono.set(16 * 60 * SECOND + SECOND);
+        let third = orphan_with_hash(&mut pool, 3);
+        assert!(!pool.orphans.contains_key(&first.0), "16 minutes old");
+        assert!(!pool.orphans.contains_key(&second.0), "16 minutes old");
+        assert!(pool.orphans.contains_key(&third.0));
     }
 
     /// Eviction stays reachable at a pool size the reduction does not
@@ -3124,6 +3409,36 @@ mod orphan_eviction_tests {
         }
     }
 
+    /// M1-p#3: the eviction draw indexes a slot vector rather than
+    /// walking the ordered map to the drawn index, so a removal must
+    /// hand its slot to the orphan moved into it.  Removing the first
+    /// of three orphans moves the third into slot 0; after two more
+    /// admissions the draw's slot 1 still names the second orphan, and
+    /// every orphan remains named by exactly one slot throughout.
+    #[test]
+    fn eviction_slots_follow_removals() {
+        let mut pool = pool_capped_at(4, 1);
+        for byte in 1..=3u8 {
+            orphan_with_hash(&mut pool, byte);
+        }
+        pool.remove_orphan(&Hash([1; 32]), false);
+        assert!(pool.orphan_slots_consistent(), "after the removal");
+        assert_eq!(pool.orphan_slots, [[3; 32], [2; 32]]);
+
+        orphan_with_hash(&mut pool, 4);
+        orphan_with_hash(&mut pool, 5);
+        assert_eq!(pool.orphans.len(), 4);
+        assert!(pool.orphan_slots_consistent(), "after refilling");
+
+        orphan_with_hash(&mut pool, 6);
+        assert_eq!(pool.orphans.len(), 4, "the cap still holds");
+        assert!(
+            !pool.orphans.contains_key(&[2; 32]),
+            "the draw names slot 1, which the second orphan holds"
+        );
+        assert!(pool.orphan_slots_consistent(), "after the eviction");
+    }
+
     /// Every index the draw can name is reachable, so no orphan is
     /// structurally immune to eviction.
     #[test]
@@ -3205,6 +3520,9 @@ mod fetch_input_utxos_tests {
         }
         fn now_unix(&self) -> i64 {
             1751800000
+        }
+        fn now_mono_nanos(&self) -> i64 {
+            0
         }
         fn random_u64(&self) -> u64 {
             0

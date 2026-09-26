@@ -70,6 +70,12 @@ pub struct FakeChain {
     pub median_time: i64,
     pub tspend_mined: HashSet<[u8; 32]>,
     pub treasury_active: bool,
+    /// dcrd's harness `autoRevocationsActive`, `subsidySplitActive` and
+    /// `subsidySplitR2Active` toggles, which answer the pool's agenda
+    /// queries (`newPoolHarness`, `mempool_test.go:857-865`).
+    pub auto_revocations_active: bool,
+    pub subsidy_split_active: bool,
+    pub subsidy_split_r2_active: bool,
     pub script_flags: ScriptFlags,
 }
 
@@ -200,15 +206,15 @@ impl PoolChain for FakeChain {
     }
 
     fn is_auto_revocations_agenda_active(&self) -> Result<bool, String> {
-        Ok(false)
+        Ok(self.auto_revocations_active)
     }
 
     fn is_subsidy_split_agenda_active(&self) -> Result<bool, String> {
-        Ok(false)
+        Ok(self.subsidy_split_active)
     }
 
     fn is_subsidy_split_r2_agenda_active(&self) -> Result<bool, String> {
-        Ok(false)
+        Ok(self.subsidy_split_r2_active)
     }
 
     fn tspend_mined_on_ancestor(&self, tspend: &Hash) -> Result<(), String> {
@@ -224,9 +230,14 @@ impl PoolChain for FakeChain {
 
     fn now_unix(&self) -> i64 {
         // Frozen; the dump scenarios never rely on wall clock
-        // progression (the orphan expiration machinery is
-        // time-driven and deliberately untriggered).
+        // progression.
         1751800000
+    }
+
+    fn now_mono_nanos(&self) -> i64 {
+        // Frozen too: the orphan expiration machinery runs on this
+        // clock and is deliberately untriggered by the dump scenarios.
+        0
     }
 
     fn random_u64(&self) -> u64 {
@@ -271,6 +282,9 @@ pub fn chain_from_init(f: &[&str]) -> FakeChain {
         median_time: f[1].parse().expect("median time"),
         tspend_mined: HashSet::new(),
         treasury_active: false,
+        auto_revocations_active: false,
+        subsidy_split_active: false,
+        subsidy_split_r2_active: false,
         script_flags: BASE_STANDARD_VERIFY_FLAGS,
     };
     let (best_header, _) = BlockHeader::from_bytes(&unhex(f[4])).expect("header");

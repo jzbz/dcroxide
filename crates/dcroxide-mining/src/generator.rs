@@ -235,6 +235,11 @@ pub trait TemplateChain {
     /// The current adjusted time as unix seconds (dcrd
     /// `TimeSource.AdjustedTime`).
     fn adjusted_time_unix(&self) -> i64;
+    /// Log a warning where dcrd's mining package calls `log.Warnf`,
+    /// which the daemon routes to the `MINR` subsystem (dcrd `log.go`,
+    /// `mining.UseLogger(minrLog)`).  The generation has no logger of
+    /// its own; the default discards the message.
+    fn log_warn(&self, _msg: &str) {}
 }
 
 /// The transaction source surface the template generation consumes
@@ -282,9 +287,12 @@ pub fn merge_utxo_view(view_a: &mut UtxoView, view_b: &UtxoView) {
 
 /// Mark the inputs to the transaction as spent in the view and add
 /// its outputs as available utxos (dcrd `spendTransaction`).
+/// `tx_hash` is the transaction's hash, which dcrd's `*dcrutil.Tx`
+/// carries cached.
 pub fn spend_transaction(
     utxo_view: &mut UtxoView,
     tx: &MsgTx,
+    tx_hash: &Hash,
     height: i64,
     is_treasury_enabled: bool,
 ) {
@@ -293,8 +301,9 @@ pub fn spend_transaction(
             entry.spend();
         }
     }
-    utxo_view.add_tx_outs(
+    utxo_view.add_tx_outs_with_hash(
         tx,
+        tx_hash,
         height,
         dcroxide_wire::NULL_BLOCK_INDEX,
         is_treasury_enabled,
@@ -368,8 +377,14 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         tree_valid: bool,
         is_treasury_enabled: bool,
     ) -> bool {
-        let Ok(view) = self.chain.fetch_utxo_view(stx, stx_hash, tree, tree_valid) else {
-            return false;
+        let view = match self.chain.fetch_utxo_view(stx, stx_hash, tree, tree_valid) {
+            Ok(view) => view,
+            Err(e) => {
+                self.chain.log_warn(&format!(
+                    "Unable to fetch transaction store for stx {stx_hash}: {e}"
+                ));
+                return false;
+            }
         };
         let is_ssgen = dcroxide_stake::is_ssgen(stx);
         let mut is_tspend = false;
@@ -477,7 +492,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             // Set a fresh timestamp and recalculate the size.
             let ts = self.median_adjusted_time();
             block.header.timestamp = ts as u32;
-            block.header.size = block.serialize().len() as u32;
+            block.header.size = block.serialize_size() as u32;
 
             // Calculate the merkle root depending on the result of
             // the header commitments agenda vote.
@@ -486,22 +501,31 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             block.header.merkle_root =
                 calc_block_merkle_root(&block.transactions, &block.stransactions, hdr_cmt_active);
 
-            // Calculate the required difficulty for the block.
-            let req_difficulty = self
-                .chain
-                .calc_next_required_difficulty(&prev_hash, ts)
-                .map_err(|e| format!("ErrGettingDifficulty: {e}"))?;
+            // Calculate the required difficulty for the block.  dcrd's
+            // mining errors (`makeError`) read as their description
+            // alone (`internal/mining/error.go:75-77`), the kind never
+            // appearing in the text, and getwork reports that text
+            // (`rpcserver.go:3884-3885`).
+            let req_difficulty = self.chain.calc_next_required_difficulty(&prev_hash, ts)?;
             block.header.bits = req_difficulty;
 
             // Calculate the stake root or commitment root depending
             // on the result of the header commitments agenda vote.
             let cmt_root = if hdr_cmt_active {
-                let block_utxos = self
-                    .chain
-                    .fetch_utxo_view_parent_template(&block)
-                    .map_err(|e| format!("ErrFetchTxStore: {e}"))?;
-                calc_block_commitment_root_v1(&block, &ViewPrevScripter(&block_utxos))
-                    .map_err(|e| format!("ErrCalcCommitmentRoot: {e}"))?
+                let block_utxos =
+                    self.chain
+                        .fetch_utxo_view_parent_template(&block)
+                        .map_err(|e| {
+                            format!("failed to fetch inputs when making new block template: {e}")
+                        })?;
+                calc_block_commitment_root_v1(&block, &ViewPrevScripter(&block_utxos)).map_err(
+                    |e| {
+                        format!(
+                            "failed to calculate commitment root for block when making new \
+                             block template: {e}"
+                        )
+                    },
+                )?
             } else {
                 dcroxide_standalone::calc_tx_tree_merkle_root(&block.stransactions)
             };
@@ -510,7 +534,9 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             // Make sure the block validates.
             self.chain
                 .check_connect_block_template(&block)
-                .map_err(|e| format!("ErrCheckConnectBlock: {e}"))?;
+                .map_err(|e| {
+                    format!("failed to check template: {e} while constructing a new parent")
+                })?;
 
             return Ok(Some(BlockTemplate {
                 block,
@@ -540,16 +566,11 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             index: 0,
             tree: dcroxide_wire::TX_TREE_STAKE,
         };
-        let ticket_utxo = self
-            .chain
-            .fetch_utxo_entry(&ticket_submission)
-            .map_err(|e| format!("ErrGetTicketInfo: {e}"))?;
+        let ticket_utxo = self.chain.fetch_utxo_entry(&ticket_submission)?;
         let ticket_utxo = match ticket_utxo {
             Some(entry) if !entry.is_spent() => entry,
             _ => {
-                return Err(format!(
-                    "ErrGetTicketInfo: ticket {ticket_hash} does not exist or is spent"
-                ));
+                return Err(format!("ticket {ticket_hash} does not exist or is spent"));
             }
         };
 
@@ -559,9 +580,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
 
         // Get the minimal outputs for the ticket.
         let Some(min_outs_data) = ticket_utxo.ticket_minimal_outputs_data() else {
-            return Err(format!(
-                "ErrGetTicketInfo: ticket {ticket_hash} missing minimal outputs"
-            ));
+            return Err(format!("ticket {ticket_hash} missing minimal outputs"));
         };
         let (ticket_min_outs, _) =
             dcroxide_blockchain::chainio::deserialize_to_minimal_outputs(min_outs_data);
@@ -576,7 +595,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             prev_header_bytes,
             true,
         )
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| format!("{e}"))?;
         let tx_hash = revocation_tx.tx_hash();
         let total_sig_ops = i64::from(self.chain.count_total_sig_ops(
             &revocation_tx,
@@ -798,12 +817,18 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 is_treasury_enabled && tx_desc.tx_type == dcroxide_stake::TxType::TSpend;
 
             // Fetch all of the utxos referenced by this transaction.
-            let Ok(utxos) =
-                self.chain
+            let utxos =
+                match self
+                    .chain
                     .fetch_utxo_view(tx, &tx_hash, tx_desc.tree, !known_disapproved)
-            else {
-                continue;
-            };
+                {
+                    Ok(utxos) => utxos,
+                    Err(e) => {
+                        self.chain
+                            .log_warn(&format!("Unable to fetch utxo view for tx {tx_hash}: {e}"));
+                        continue;
+                    }
+                };
 
             // Skip transactions with missing inputs that are also not
             // available from the source.
@@ -849,8 +874,9 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             if !has_parents || has_stats {
                 priority_queue.push(prio_item);
                 prioritized_txns.insert(tx_hash.0);
-                block_utxos.add_tx_outs(
+                block_utxos.add_tx_outs_with_hash(
                     tx,
+                    &tx_hash,
                     next_block_height,
                     dcroxide_wire::NULL_BLOCK_INDEX,
                     is_treasury_enabled,
@@ -881,12 +907,10 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         let mut template_txn_map: BTreeSet<[u8; 32]> = BTreeSet::new();
         let mut added_auto_revocations = false;
 
-        let best_header = self.chain.header_by_hash(&best.hash).map_err(|_| {
-            format!(
-                "ErrGetTopBlock: unable to get tip block header {}",
-                best.hash
-            )
-        })?;
+        let best_header = self
+            .chain
+            .header_by_hash(&best.hash)
+            .map_err(|_| format!("unable to get tip block header {}", best.hash))?;
         let best_header_bytes = best_header.serialize();
 
         // The queue loop; the outer loop realizes dcrd's goto used to
@@ -1104,6 +1128,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                     spend_transaction(
                         &mut block_utxos,
                         &bundled_tx_desc.tx,
+                        &bundled_tx_hash,
                         next_block_height,
                         is_treasury_enabled,
                     );
@@ -1174,6 +1199,9 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         // when the treasury is active), then tickets, revocations,
         // and treasury transactions.
         let mut block_txns_stake: Vec<MsgTx> = Vec::with_capacity(block_txns.len());
+        // The hashes of `block_txns_stake`, in step, from the source's
+        // descriptors: filling fraud proofs leaves the hash unchanged.
+        let mut block_txns_stake_hashes: Vec<Hash> = Vec::with_capacity(block_txns.len());
         let mut coinbase_script = alloc::vec![0u8; 2];
         coinbase_script.extend_from_slice(COINBASE_FLAGS);
         let op_return_pk_script =
@@ -1183,6 +1211,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         let mut vote_bits_voters: Vec<u16> =
             Vec::with_capacity(usize::from(self.params.tickets_per_block));
         let mut votes: Vec<MsgTx> = Vec::new();
+        let mut vote_hashes: Vec<Hash> = Vec::new();
         if next_block_height >= stake_validation_height {
             for tx_desc in &block_txns {
                 if dcroxide_stake::is_ssgen(&tx_desc.tx) {
@@ -1197,6 +1226,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                         let vb = dcroxide_stake::ssgen_vote_bits(&tx_copy);
                         vote_bits_voters.push(vb);
                         votes.push(tx_copy);
+                        vote_hashes.push(tx_desc.tx_hash);
                         voters += 1;
                     }
                 }
@@ -1206,7 +1236,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             }
         }
 
-        let mut treasury_base: Option<MsgTx> = None;
+        let mut treasury_base_hash: Option<Hash> = None;
         if is_treasury_enabled {
             let tb = create_treasury_base_tx(
                 &mut self.subsidy_cache,
@@ -1214,10 +1244,13 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 voters as u16,
                 nonces.treasury,
             )?;
-            treasury_base = Some(tb.clone());
+            let tb_hash = tb.tx_hash();
+            treasury_base_hash = Some(tb_hash);
             block_txns_stake.push(tb);
+            block_txns_stake_hashes.push(tb_hash);
         }
         block_txns_stake.extend(votes);
+        block_txns_stake_hashes.extend(vote_hashes);
 
         // Determine the vote bits for the header.
         let votebits: u16 = if next_block_height < stake_validation_height {
@@ -1261,6 +1294,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                         is_treasury_enabled,
                     ) {
                         block_txns_stake.push(tx_copy);
+                        block_txns_stake_hashes.push(tx_desc.tx_hash);
                         fresh_stake += 1;
                     }
                 }
@@ -1271,8 +1305,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         }
 
         self.chain
-            .check_ticket_exhaustion(&best.hash, fresh_stake as u8)
-            .map_err(|e| format!("ErrTicketExhaustion: {e}"))?;
+            .check_ticket_exhaustion(&best.hash, fresh_stake as u8)?;
 
         // Revocations.
         let mut revocations = 0usize;
@@ -1291,6 +1324,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                     is_treasury_enabled,
                 ) {
                     block_txns_stake.push(tx_copy);
+                    block_txns_stake_hashes.push(tx_desc.tx_hash);
                     revocations += 1;
                 }
             }
@@ -1315,6 +1349,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                         is_treasury_enabled,
                     ) {
                         block_txns_stake.push(tx_copy);
+                        block_txns_stake_hashes.push(tx_desc.tx_hash);
                     }
                 }
             }
@@ -1346,8 +1381,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         let _ = block_sig_ops;
         tx_fees_map.insert(coinbase_hash.0, 0);
         tx_sig_op_counts_map.insert(coinbase_hash.0, num_coinbase_sig_ops);
-        if let Some(tb) = &treasury_base {
-            let tb_hash = tb.tx_hash();
+        if let Some(tb_hash) = treasury_base_hash {
             tx_fees_map.insert(tb_hash.0, 0);
             tx_sig_op_counts_map.insert(tb_hash.0, 0);
         }
@@ -1375,8 +1409,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 .ok_or_else(|| format!("couldn't find sig ops count for tx {tx_hash}"))?;
             tx_sig_op_counts.push(tsos);
         }
-        for tx in &block_txns_stake {
-            let tx_hash = tx.tx_hash();
+        for tx_hash in &block_txns_stake_hashes {
             let fee = *tx_fees_map
                 .get(&tx_hash.0)
                 .ok_or_else(|| format!("couldn't find fee for stx {tx_hash}"))?;
@@ -1413,14 +1446,15 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         let _ = block_size;
 
         let ts = self.median_adjusted_time();
-        let req_difficulty = self
-            .chain
-            .calc_next_required_difficulty(&prev_hash, ts)
-            .map_err(|e| format!("ErrGettingDifficulty: {e}"))?;
+        let req_difficulty = self.chain.calc_next_required_difficulty(&prev_hash, ts)?;
 
         // Return to the parent when there are too few voters.
         let minimum_votes_required = usize::from(self.params.tickets_per_block / 2 + 1);
         if next_block_height >= stake_validation_height && voters < minimum_votes_required {
+            self.chain.log_warn(
+                "incongruent number of voters in mempool vs mempool.voters; not enough voters \
+                 found",
+            );
             return self.handle_too_few_voters(
                 next_block_height,
                 pay_to_address,
@@ -1435,17 +1469,16 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         // pass.
         if next_block_height != 1 {
             for i in 1..block_txns_regular.len() {
-                let tx = block_txns_regular[i].clone();
                 let tx_hash = block_txns_regular_hashes[i];
                 let view = self
                     .chain
                     .fetch_utxo_view(
-                        &tx,
+                        &block_txns_regular[i],
                         &tx_hash,
                         dcroxide_wire::TX_TREE_REGULAR,
                         !known_disapproved,
                     )
-                    .map_err(|e| format!("ErrFetchTxStore: {e}"))?;
+                    .map_err(|e| format!("failed to fetch utxo view for tx {tx_hash}: {e}"))?;
                 let tx_copy = &mut block_txns_regular[i];
                 for tx_in in &mut tx_copy.tx_in {
                     match view.lookup_entry(&tx_in.previous_out_point) {
@@ -1485,8 +1518,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                         &block_txns_regular_hashes,
                     ) else {
                         return Err(format!(
-                            "ErrFraudProofIndex: failed find hash in tx list for fraud \
-                             proof; tx in hash {}",
+                            "failed find hash in tx list for fraud proof; tx in hash {}",
                             tx_in.previous_out_point.hash
                         ));
                     };
@@ -1541,17 +1573,28 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             hdr_cmt_active,
         );
         let cmt_root = if hdr_cmt_active {
-            calc_block_commitment_root_v1(&msg_block, &ViewPrevScripter(&block_utxos))
-                .map_err(|e| format!("ErrCalcCommitmentRoot: {e}"))?
+            calc_block_commitment_root_v1(&msg_block, &ViewPrevScripter(&block_utxos)).map_err(
+                |e| {
+                    format!(
+                        "failed to calculate commitment root for block when making new block \
+                         template: {e}"
+                    )
+                },
+            )?
         } else {
             dcroxide_standalone::calc_tx_tree_merkle_root(&msg_block.stransactions)
         };
         msg_block.header.stake_root = cmt_root;
-        msg_block.header.size = msg_block.serialize().len() as u32;
+        msg_block.header.size = msg_block.serialize_size() as u32;
 
         self.chain
             .check_connect_block_template(&msg_block)
-            .map_err(|e| format!("ErrCheckConnectBlock: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "failed to do final check for check connect block when making new block \
+                     template: {e}"
+                )
+            })?;
 
         Ok(Some(BlockTemplate {
             block: msg_block,

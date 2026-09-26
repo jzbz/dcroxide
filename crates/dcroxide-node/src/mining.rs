@@ -329,6 +329,12 @@ impl TemplateChain for NodeTemplateChain {
     fn adjusted_time_unix(&self) -> i64 {
         adjusted_time_unix()
     }
+
+    /// The generator's warnings go to `MINR`, the logger dcrd hands its
+    /// mining package (`log.go`, `mining.UseLogger(minrLog)`).
+    fn log_warn(&self, msg: &str) {
+        crate::logging::warn("MINR", msg);
+    }
 }
 
 /// The transaction source for the template generator over the shared

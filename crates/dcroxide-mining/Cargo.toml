@@ -1,6 +1,6 @@
 [package]
 name = "dcroxide-mining"
-description = "Block template mining support mirroring dcrd's internal/mining package, starting with the mining view and priority layers"
+description = "Block template mining support mirroring dcrd's internal/mining package: the mining view and priority queue, block template generation, background template regeneration, and the CPU miner's solve core"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

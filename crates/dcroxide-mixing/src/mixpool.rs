@@ -293,46 +293,48 @@ impl PoolMessage {
 /// message was read, or [`HashedMessage::new`] otherwise.  Serializing
 /// and hashing a message is proportional to its size (a DC-net may be
 /// megabytes), and without the cache the sync manager and the pool each
-/// re-derived both under their own mutexes.  The verdict is only
-/// consulted where dcrd verifies, after the rerun check and the
-/// already-accepted check, so which error a message earns is unchanged.
+/// re-derived the hash under their own mutexes.
+///
+/// The signature is verified lazily, once, where dcrd verifies it: after
+/// netsync's rejected-message filter, the rerun check and the pool's
+/// already-accepted check, so a replay of a rejected or pooled message
+/// costs dcrd's lookups and no Schnorr verify.  The daemon verifies with
+/// [`HashedMessage::verify`] outside the pool's guard once
+/// [`Pool::needs_signature_check`] says dcrd would, as dcrd verifies
+/// between its read-locked already-accepted check and taking the write
+/// lock; a caller that does not is verified under the guard instead.
 #[derive(Clone)]
 pub struct HashedMessage {
     msg: PoolMessage,
     hash: Result<Hash, PoolError>,
-    sig_valid: bool,
+    sig_valid: std::sync::OnceLock<bool>,
 }
 
 impl HashedMessage {
-    /// Hash the message and verify its signature.
+    /// Hash the message; its signature is verified later, on demand.
     pub fn new(msg: PoolMessage) -> HashedMessage {
         let hash = msg.mix_hash();
-        HashedMessage::verified(msg, hash)
+        HashedMessage {
+            msg,
+            hash,
+            sig_valid: std::sync::OnceLock::new(),
+        }
     }
 
-    /// Verify the signature of a message whose identity hash the caller
-    /// already computed from this same message, as dcrd's
-    /// `peer.readMessage` does once, right after decoding, with
-    /// `WriteHash`.  `hash` must be what [`PoolMessage::mix_hash`] returns
-    /// for `msg`: the pool keys the message by it.  Debug builds check
-    /// that.
+    /// Carry a message whose identity hash the caller already computed
+    /// from this same message, as dcrd's `peer.readMessage` does once,
+    /// right after decoding, with `WriteHash`.  `hash` must be what
+    /// [`PoolMessage::mix_hash`] returns for `msg`: the pool keys the
+    /// message by it.  Debug builds check that.
     pub fn with_hash(msg: PoolMessage, hash: Hash) -> HashedMessage {
         debug_assert!(
             msg.mix_hash() == Ok(hash),
             "precomputed mix hash does not match the message"
         );
-        HashedMessage::verified(msg, Ok(hash))
-    }
-
-    fn verified(msg: PoolMessage, hash: Result<Hash, PoolError>) -> HashedMessage {
-        // A rerun, or a message that cannot be hashed, is refused before
-        // dcrd verifies anything, so its verdict is never read.
-        let sig_valid =
-            msg.run() == 0 && hash.is_ok() && verify_signed_message(msg.as_mix_message());
         HashedMessage {
             msg,
-            hash,
-            sig_valid,
+            hash: Ok(hash),
+            sig_valid: std::sync::OnceLock::new(),
         }
     }
 
@@ -342,8 +344,23 @@ impl HashedMessage {
         HashedMessage {
             msg,
             hash: Ok(hash),
-            sig_valid: true,
+            sig_valid: std::sync::OnceLock::from(true),
         }
+    }
+
+    /// Whether the message is signed by its presented identity (dcrd
+    /// `mixing.VerifySignedMessage`), verified on the first call and
+    /// cached for every later one.
+    pub fn verify(&self) -> bool {
+        *self
+            .sig_valid
+            .get_or_init(|| verify_signed_message(self.msg.as_mix_message()))
+    }
+
+    /// Whether the signature has been verified yet; exposed for tests.
+    #[doc(hidden)]
+    pub fn signature_checked(&self) -> bool {
+        self.sig_valid.get().is_some()
     }
 
     /// The message.
@@ -590,7 +607,9 @@ pub struct Pool<B: MixBlockChain> {
     epoch_secs: i64,
     expire_height: u32,
 
-    recent_mix_msgs: lru::Map<[u8; 32], PoolMessage>,
+    // Shared pointers, as dcrd's cache holds `mixing.Message` interface
+    // values: a presence probe or a hit then copies no message.
+    recent_mix_msgs: lru::Map<[u8; 32], Arc<PoolMessage>>,
 
     blockchain: B,
     utxo_fetcher: Option<Arc<dyn MixUtxoFetcher + Send + Sync>>,
@@ -601,12 +620,13 @@ pub struct Pool<B: MixBlockChain> {
 
     /// The wall clock, in Unix nanoseconds: the key exchange epoch
     /// comparisons, which dcrd makes against `time.Unix` values that
-    /// carry no monotonic reading.
+    /// carry no monotonic reading, and the recently-removed cache's TTL,
+    /// which dcrd's `container/lru` stores and compares as `UnixNano()`
+    /// (`container/lru/map.go:175, :228`).
     now_fn: lru::Clock,
     /// The monotonic clock, in nanoseconds from an arbitrary origin: the
-    /// orphan age and the recently-removed cache's TTL, which dcrd
-    /// measures between two `time.Now()` readings and so on Go's
-    /// monotonic clock.
+    /// orphan age, which dcrd measures with `time.Since` over a
+    /// `time.Now()` reading and so on Go's monotonic clock.
     mono_fn: lru::Clock,
 }
 
@@ -640,9 +660,8 @@ impl<B: MixBlockChain> Pool<B> {
         utxo_fetcher: Option<Arc<dyn MixUtxoFetcher + Send + Sync>>,
     ) -> Pool<B> {
         // Go's time.Now() carries a monotonic reading that time.Since
-        // and the LRU's Before/After comparisons use; Instant is its
-        // counterpart.  The origin is arbitrary: only differences are
-        // taken.
+        // uses; Instant is its counterpart.  The origin is arbitrary:
+        // only differences are taken.
         let origin = std::time::Instant::now();
         Pool::new_with_clocks(
             blockchain,
@@ -699,10 +718,16 @@ impl<B: MixBlockChain> Pool<B> {
             sessions_by_tx_hash: HashMap::new(),
             epoch_secs,
             expire_height: 0,
+            // dcrd's lru expires items on the wall clock: it stores
+            // `now.Add(ttl).UnixNano()` and compares `now.UnixNano()`,
+            // which drops the monotonic reading.  (Only its lazy
+            // expiry-scan schedule compares monotonic readings; this
+            // port's lru runs that on the same clock, which moves when the
+            // expired items are reclaimed, never whether they are found.)
             recent_mix_msgs: lru::Map::new_with_default_ttl_and_clock(
                 MAX_RECENTLY_REMOVED_MIX_MSGS,
                 MAX_RECENT_MIX_MSGS_TTL_NANOS,
-                mono_fn.clone(),
+                now_fn.clone(),
             ),
             blockchain,
             utxo_fetcher,
@@ -746,7 +771,21 @@ impl<B: MixBlockChain> Pool<B> {
         if let Some(e) = self.pool.get(&query.0) {
             return Some(e.msg.clone());
         }
-        self.recent_mix_msgs.get(&query.0)
+        self.recent_mix_msgs
+            .get(&query.0)
+            .map(|msg| PoolMessage::clone(&msg))
+    }
+
+    /// Whether [`recent_message`](Pool::recent_message) finds the message,
+    /// without copying it out: the presence test netsync's `needMixMsg`
+    /// makes of dcrd's `RecentMessage`, which returns a pointer.  The
+    /// recently-removed cache is consulted with `Get`, as there, so a hit
+    /// still refreshes the entry's recency and counts toward the hit
+    /// ratio; the cache holds shared pointers, so that costs no copy.
+    pub fn have_recent_message(&mut self, query: &Hash) -> bool {
+        self.prs.contains_key(&query.0)
+            || self.pool.contains_key(&query.0)
+            || self.recent_mix_msgs.get(&query.0).is_some()
     }
 
     /// All pair request messages, excluding any expired PRs that are
@@ -919,7 +958,7 @@ impl<B: MixBlockChain> Pool<B> {
     /// (dcrd `removeMessage`).
     fn remove_message_by_hash(&mut self, hash: &[u8; 32]) {
         if let Some(e) = self.pool.remove(hash) {
-            self.recent_mix_msgs.put(*hash, e.msg);
+            self.recent_mix_msgs.put(*hash, Arc::new(e.msg));
         }
     }
 
@@ -1053,15 +1092,27 @@ impl<B: MixBlockChain> Pool<B> {
 
     /// Remove all pair requests that are spent by any transaction
     /// input (dcrd `RemoveSpentPRs`).
+    ///
+    /// dcrd hashes every transaction up front.  Here a transaction is
+    /// hashed only when a session could match it and its inputs are
+    /// scanned only when a pair request could match them, which finds
+    /// the same sessions and pair requests: netsync calls this for both
+    /// trees of every main-chain block, and throughout initial sync the
+    /// pool is empty.
     pub fn remove_spent_prs(&mut self, txs: &[MsgTx]) {
         for tx in txs {
-            let tx_hash = tx.tx_hash();
-            if let Some(sid) = self.sessions_by_tx_hash.get(&tx_hash.0).copied() {
-                self.remove_strikes_for_mix(tx);
-                self.remove_session_internal(sid, Some(tx_hash), true);
-                continue;
+            if !self.sessions_by_tx_hash.is_empty() {
+                let tx_hash = tx.tx_hash();
+                if let Some(sid) = self.sessions_by_tx_hash.get(&tx_hash.0).copied() {
+                    self.remove_strikes_for_mix(tx);
+                    self.remove_session_internal(sid, Some(tx_hash), true);
+                    continue;
+                }
             }
 
+            if self.out_points.is_empty() {
+                continue;
+            }
             for tx_in in &tx.tx_in {
                 let Some(pr_hash) = self.out_points.get(&op_key(&tx_in.previous_out_point)) else {
                     continue;
@@ -1076,15 +1127,16 @@ impl<B: MixBlockChain> Pool<B> {
     /// Whether a transaction that is not known to be the mix tx for
     /// any confirmed session spends a current pair request UTXO (dcrd
     /// `NonMixSpendsPR`).
+    ///
+    /// The inputs are scanned before the transaction is hashed, the
+    /// reverse of dcrd's order: the answer is the same, and the hash is
+    /// only needed for the rare transaction that spends one.
     pub fn non_mix_spends_pr(&self, tx: &MsgTx) -> bool {
-        if self.sessions_by_tx_hash.contains_key(&tx.tx_hash().0) {
-            return false;
-        }
-
-        tx.tx_in.iter().any(|tx_in| {
+        let spends_pr = tx.tx_in.iter().any(|tx_in| {
             self.out_points
                 .contains_key(&op_key(&tx_in.previous_out_point))
-        })
+        });
+        spends_pr && !self.sessions_by_tx_hash.contains_key(&tx.tx_hash().0)
     }
 
     /// The most recently received run-0 KE messages by a peer that
@@ -1264,30 +1316,45 @@ impl<B: MixBlockChain> Pool<B> {
     }
 
     /// [`accept_message`](Pool::accept_message) for a message whose hash
-    /// and signature verdict were worked out before the pool's guard was
-    /// taken, returning the accepted messages with their hashes.  This is
-    /// the daemon's intake path: nothing here re-serializes the message.
+    /// was worked out before the pool's guard was taken, returning the
+    /// accepted messages with their hashes.  This is the daemon's intake
+    /// path: nothing here re-serializes the message, and a signature the
+    /// caller already verified (see [`Pool::needs_signature_check`]) is
+    /// not verified again.
     pub fn accept_hashed(
         &mut self,
         msg: &HashedMessage,
         src: u64,
         mempool_spent: MempoolSpent<'_>,
     ) -> Result<Vec<HashedMessage>, PoolError> {
-        self.accept_inner(
-            &msg.msg,
-            Some((&msg.hash, msg.sig_valid)),
-            src,
-            mempool_spent,
-        )
+        self.accept_inner(&msg.msg, Some(msg), src, mempool_spent)
     }
 
-    /// dcrd `AcceptMessage`.  `pre` carries the hash and signature
-    /// verdict when the caller already has them; otherwise both are
-    /// derived here, at the points where dcrd derives them.
+    /// Whether dcrd's `AcceptMessage` would go on to verify the message's
+    /// signature: it is a run-0 message with a hash, and the pool has not
+    /// already accepted it (`mixing/mixpool/mixpool.go:1172-1198`, whose
+    /// already-accepted check runs under the read lock and returns before
+    /// `VerifySignedMessage`).  The daemon asks this under a brief guard
+    /// and verifies with the guard released, as dcrd does between its
+    /// read and write locks; [`accept_hashed`](Pool::accept_hashed)
+    /// repeats the checks under the guard, so a message another thread
+    /// pooled in between costs only the one verify.
+    pub fn needs_signature_check(&self, msg: &HashedMessage) -> bool {
+        msg.msg.run() == 0
+            && match &msg.hash {
+                Ok(hash) => !self.have_message(hash),
+                Err(_) => false,
+            }
+    }
+
+    /// dcrd `AcceptMessage`.  `pre` carries the hash and the lazily
+    /// verified signature when the caller already has the message
+    /// hashed; otherwise both are derived here, at the points where dcrd
+    /// derives them.
     fn accept_inner(
         &mut self,
         msg: &PoolMessage,
-        pre: Option<(&Result<Hash, PoolError>, bool)>,
+        pre: Option<&HashedMessage>,
         src: u64,
         mempool_spent: MempoolSpent<'_>,
     ) -> Result<Vec<HashedMessage>, PoolError> {
@@ -1296,7 +1363,7 @@ impl<B: MixBlockChain> Pool<B> {
         }
 
         let hash = match pre {
-            Some((hash, _)) => hash.clone()?,
+            Some(pre) => pre.hash.clone()?,
             None => msg.mix_hash()?,
         };
 
@@ -1307,7 +1374,7 @@ impl<B: MixBlockChain> Pool<B> {
 
         // Require message to be signed by the presented identity.
         let sig_valid = match pre {
-            Some((_, sig_valid)) => sig_valid,
+            Some(pre) => pre.verify(),
             None => verify_signed_message(msg.as_mix_message()),
         };
         if !sig_valid {
@@ -1414,7 +1481,7 @@ impl<B: MixBlockChain> Pool<B> {
 
         self.prs.remove(&pr_hash.0);
         self.recent_mix_msgs
-            .put(pr_hash.0, PoolMessage::PR(pr.clone()));
+            .put(pr_hash.0, Arc::new(PoolMessage::PR(pr.clone())));
 
         let hashes = self
             .messages_by_identity
@@ -2325,21 +2392,18 @@ impl<B: MixBlockChain> Pool<B> {
         self.misbehaving_tx_internal(tx)
     }
 
+    /// dcrd `misbehavingTx`, with the inputs scanned before the
+    /// transaction is hashed: the answer is the same, and the hash is
+    /// only needed for a transaction spending a flagged output.
     fn misbehaving_tx_internal(&self, tx: &MsgTx) -> bool {
-        let tx_hash = tx.tx_hash();
-        if self.sessions_by_tx_hash.contains_key(&tx_hash.0) {
-            return false;
-        }
-
-        for tx_in in &tx.tx_in {
-            let Some(s) = self.strikes.get(&op_key(&tx_in.previous_out_point)) else {
-                continue;
-            };
-            if s.lock().expect("strike set poisoned").strikes.len() >= STRIKE_LIMIT {
-                return true;
-            }
-        }
-        false
+        let flagged = tx.tx_in.iter().any(|tx_in| {
+            self.strikes
+                .get(&op_key(&tx_in.previous_out_point))
+                .is_some_and(|s| {
+                    s.lock().expect("strike set poisoned").strikes.len() >= STRIKE_LIMIT
+                })
+        });
+        flagged && !self.sessions_by_tx_hash.contains_key(&tx.tx_hash().0)
     }
 
     /// A slice of pair request messages excluding any which spend

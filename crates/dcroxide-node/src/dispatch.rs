@@ -3382,19 +3382,17 @@ impl ServerPeerHandler {
             return ServeSignal::Continue;
         };
 
-        // Verify the signature once, here, before the sync-manager and
-        // mixpool locks, reusing the hash the input loop computed as it
-        // read the message: dcrd caches the hash on the message when it
-        // is read and verifies the signature before taking the mixpool's
-        // mutex (`mixpool.go:1198`), and a mix message can run to
-        // megabytes.  The sync manager, the pool and the relay below all
-        // read the cached results.  No peer lock is held here, as
-        // dcrd's `inHandler` holds none, so nothing else that locks this
-        // peer (its output loop and timers, `getpeerinfo`, another
-        // peer's count of mix-capable outbound peers) waits for the
-        // verification.  Without a hash from the loop (hashing failed
-        // there, or a caller that computes none), the message is hashed
-        // here.
+        // Carry the hash the input loop computed as it read the message,
+        // as dcrd caches the hash on the message when it is read: the
+        // sync manager, the pool and the relay below all read it, and a
+        // mix message can run to megabytes.  The signature is verified
+        // later, only once the rejected-message filter and the pool's
+        // already-accepted check have passed it, and with no lock held
+        // (`NodeSyncMixPool::accept_message`), as dcrd verifies inside
+        // `AcceptMessage` (`mixpool.go:1189-1198`).  No peer lock is held
+        // here either, as dcrd's `inHandler` holds none.  Without a hash
+        // from the loop (hashing failed there, or a caller that computes
+        // none), the message is hashed here.
         let pool_msg = match mix_hash {
             Some(hash) => dcroxide_mixing::HashedMessage::with_hash(pool_msg, hash),
             None => dcroxide_mixing::HashedMessage::new(pool_msg),

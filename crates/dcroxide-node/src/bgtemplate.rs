@@ -733,6 +733,7 @@ fn step_event(
     deadlines: &mut TimerDeadlines,
     event: &OwnedRegenEvent,
 ) {
+    finish_chain_maintenance(ctx, event);
     let now = now_unix();
     let is_current = ctx.allow_unsynced_mining || ctx.sync_is_current();
     {
@@ -919,13 +920,45 @@ fn run_drain(drain_hook: &Option<Box<dyn Fn() + Send>>) {
     }
 }
 
+/// Finish the chain handler's deferred mempool maintenance before the
+/// state machine handles a connected or disconnected block or the end
+/// of a reorganization.  dcrd's handler updates the pool for a block
+/// before it hands the block to the generator (`s.bg.BlockConnected`
+/// and `s.bg.BlockDisconnected` follow the pool updates in `server.go`'s
+/// NTBlockConnected and NTBlockDisconnected cases), and the chain sends
+/// NTChainReorgDone only after the handler has run for every block of
+/// the reorganization, so the votes the generator counts and the pool a
+/// build reads already reflect it.  The chain callback feeds this thread
+/// ahead of that maintenance, which the post-process drain runs once
+/// the chain mutex is free.  Taking the chain mutex waits out the
+/// processing call that sent the event, so everything that call queued
+/// is queued (the callback sends the event before it queues the block's
+/// maintenance, and the drain itself waits on the chain only when it
+/// finds something queued), and the drain lock then waits for a drain
+/// already under way or runs it here.
+fn finish_chain_maintenance(ctx: &BuildCtx, event: &OwnedRegenEvent) {
+    let after_maintenance = matches!(
+        event,
+        OwnedRegenEvent::BlockConnected(_)
+            | OwnedRegenEvent::BlockDisconnected(_)
+            | OwnedRegenEvent::ReorgDone
+    );
+    if !after_maintenance || ctx.drain_hook.is_none() {
+        return;
+    }
+    drop(ctx.chain.lock().expect("chain mutex poisoned"));
+    run_drain(&ctx.drain_hook);
+}
+
 /// Start the background template generator thread over the daemon's
 /// live chain and mempool (dcrd `newServer` constructing the
 /// `BgBlkTmplGenerator` and `server.Run` launching its handlers).
 ///
 /// `drain_hook` runs the chain notification handler's deferred
-/// maintenance after every processed event and timer, and after each
-/// template build before the events it queued are serviced.  A reorg the
+/// maintenance after every processed event and timer, after each
+/// template build before the events it queued are serviced, and before
+/// a connected or disconnected block or the end of a reorganization is
+/// handled (see `finish_chain_maintenance`).  A reorg the
 /// generator itself starts (`force_head_reorganization` from a vote or
 /// the side-chain timeout) fires the chain callback synchronously on
 /// this thread, which only queues; the sync adapter's post-process

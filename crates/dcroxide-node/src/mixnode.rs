@@ -238,10 +238,11 @@ impl NodeSyncMixPool {
 }
 
 impl SyncMixPool for NodeSyncMixPool {
-    // The message travels with the hash and signature verdict the
-    // intake path works out before taking the sync-manager lock (dcrd
-    // caches the hash on the message at decode), so neither this seam
-    // nor the pool re-serializes it under a lock.
+    // The message travels with the hash the intake path works out before
+    // taking the sync-manager lock (dcrd caches the hash on the message
+    // at decode), and its signature is verified in `accept_message` with
+    // no lock held, so neither this seam nor the pool re-serializes it
+    // under a lock.
     type Msg = HashedMessage;
     type Err = PoolError;
 
@@ -263,6 +264,22 @@ impl SyncMixPool for NodeSyncMixPool {
         msg: &HashedMessage,
         source: u64,
     ) -> Result<Vec<HashedMessage>, PoolError> {
+        // dcrd's `AcceptMessage` returns for an already-accepted message
+        // under the pool's read lock and only then verifies the
+        // signature, with no lock held (`mixing/mixpool/mixpool.go:
+        // 1189-1198`), so a replay costs a lookup, not a Schnorr verify.
+        // The same here: a brief guard for the check, the verify with it
+        // released, and `accept_hashed` repeating the checks under the
+        // guard as dcrd does under its write lock.
+        let check = self
+            .pool
+            .lock()
+            .expect("mix pool mutex poisoned")
+            .needs_signature_check(msg);
+        if check {
+            msg.verify();
+        }
+
         // Answered before the mixpool guard is taken, as dcrd does too:
         // its utxo fetcher asks inside `checkAcceptPR`, which
         // `AcceptMessage` runs before taking the mixpool's mutex
@@ -285,11 +302,13 @@ impl SyncMixPool for NodeSyncMixPool {
     }
 
     fn recent_message(&mut self, hash: &Hash) -> bool {
+        // A presence probe: dcrd's `RecentMessage` hands back a pointer,
+        // and copying the message out only to drop it would cost every
+        // inv vector a deep clone under the sync-manager lock.
         self.pool
             .lock()
             .expect("mix pool mutex poisoned")
-            .recent_message(hash)
-            .is_some()
+            .have_recent_message(hash)
     }
 
     fn remove_spent_prs(&mut self, txs: &[MsgTx]) {

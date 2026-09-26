@@ -9,6 +9,20 @@
 //! participation-scaled fees, and the too-few-voters parent recycle.
 //! dcrd's wall clock timestamp and random extra nonces are recovered
 //! from its own emitted templates.
+//!
+//! The `autorev*` scenarios (M2-p#1) are dcrd's
+//! `TestNewBlockTemplateAutoRevocations` and
+//! `TestNewBlockTemplateAutoRevocationsVotesOnly`
+//! (`internal/mining/mining_test.go:194`, `:401`) run through the same
+//! harness with the automatic ticket revocations agenda active, as it
+//! is on mainnet: revocations built for the winning tickets whose votes
+//! are missing or fail validation and for the expiring tickets, the
+//! source's revocations of previously missed tickets mined, the one of
+//! an ineligible ticket skipped, and the requeue after a votes-only
+//! queue drains.  The votes-only template is also built under each
+//! subsidy split agenda (DCP0010, DCP0012), whose votes and coinbase
+//! pay the matching split.  The harness's own pay address stands in
+//! for the tests' fixed one.
 
 // Test-harness arithmetic over bounded lengths.
 #![allow(clippy::arithmetic_side_effects)]
@@ -72,6 +86,9 @@ struct FakeChain {
     stake_version_err: bool,
     connect_err: bool,
     treasury_agenda_err: bool,
+    fetch_view_err: bool,
+    // The warnings the generator logged (dcrd's MINR `log.Warnf`).
+    warnings: RefCell<Vec<String>>,
     // The wall clock recovered from dcrd's emitted template.
     adjusted_time: i64,
     subsidy_cache: RefCell<SubsidyCache<&'static dcroxide_chaincfg::Params>>,
@@ -166,6 +183,9 @@ impl TemplateChain for FakeChain {
         tree: i8,
         _include_regular: bool,
     ) -> Result<UtxoView, String> {
+        if self.fetch_view_err {
+            return Err("view err".into());
+        }
         let mut view = UtxoView::new();
         for idx in 0..tx.tx_out.len() as u32 {
             let op = OutPoint {
@@ -238,6 +258,9 @@ impl TemplateChain for FakeChain {
     }
     fn adjusted_time_unix(&self) -> i64 {
         self.adjusted_time
+    }
+    fn log_warn(&self, msg: &str) {
+        self.warnings.borrow_mut().push(msg.to_string());
     }
 }
 
@@ -369,6 +392,8 @@ fn newtemplate_vectors() {
         stake_version_err: false,
         connect_err: false,
         treasury_agenda_err: false,
+        fetch_view_err: false,
+        warnings: RefCell::new(Vec::new()),
         adjusted_time: 0,
         subsidy_cache: RefCell::new(SubsidyCache::new(params)),
         script_flags: harness_flags,
@@ -562,7 +587,7 @@ fn newtemplate_vectors() {
             other => panic!("unknown row tag {other}"),
         }
     }
-    assert_eq!(counts, [9, 5], "row counts");
+    assert_eq!(counts, [13, 9], "row counts");
 }
 
 /// A chain fixture with nothing in it, for the height-1 checks below.
@@ -621,6 +646,8 @@ fn empty_generator(
         stake_version_err: false,
         connect_err: false,
         treasury_agenda_err: false,
+        fetch_view_err: false,
+        warnings: RefCell::new(Vec::new()),
         adjusted_time: 1,
         subsidy_cache: RefCell::new(SubsidyCache::new(params)),
         script_flags: ScriptFlags(ScriptFlags::VERIFY_CLEAN_STACK.0),
@@ -821,5 +848,152 @@ fn the_pair_still_resolves_above_height_one() {
         block.transactions[idx].tx_in[0].block_index,
         dcroxide_wire::NULL_BLOCK_INDEX,
         "the fraud proof must be resolved above height 1 too",
+    );
+}
+
+/// M2-p#2: a template error reads as dcrd's `makeError` description,
+/// which is all its `Error()` returns (`internal/mining/error.go:75-77`):
+/// the wrapped error's text where dcrd passes `err.Error()`, dcrd's own
+/// sentence where it has one, and never the kind.  getwork hands this
+/// text to the miner as "no work is available: ..."
+/// (`rpcserver.go:3884-3885`).  The port used to prefix `ErrXxx: `.
+#[test]
+fn template_errors_read_as_dcrds_descriptions() {
+    let params = leaked_params();
+    let nonces = ExtraNonces::default();
+
+    // `NewBlockTemplate`'s own difficulty and final connect checks
+    // (`mining.go:2166`, `:2340-2342`).
+    let mut g = empty_generator(params, 100);
+    g.chain.difficulty_err = true;
+    let err = g.new_block_template(None, &nonces).expect_err("difficulty");
+    assert_eq!(err, "diff err");
+    g.chain.difficulty_err = false;
+    g.chain.connect_err = true;
+    let err = g.new_block_template(None, &nonces).expect_err("connect");
+    assert_eq!(
+        err,
+        "failed to do final check for check connect block when making new block \
+         template: cbt err"
+    );
+
+    // The too-few-voters recycle at stake validation height, with no
+    // votes for any parent (`mining.go:903`, `:935-937`).
+    let mut g = empty_generator(params, params.stake_validation_height - 1);
+    g.chain.difficulty_err = true;
+    let err = g.new_block_template(None, &nonces).expect_err("difficulty");
+    assert_eq!(err, "diff err");
+    g.chain.difficulty_err = false;
+    g.chain.connect_err = true;
+    let err = g.new_block_template(None, &nonces).expect_err("connect");
+    assert_eq!(
+        err,
+        "failed to check template: cbt err while constructing a new parent"
+    );
+}
+
+/// A vote on `block_hash` at `height` spending `ticket`, shaped enough
+/// for the generator's vote handling (block reference and vote bits
+/// outputs) but with a ticket the chain does not hold.
+fn vote_on(block_hash: Hash, height: u32, ticket: Hash) -> Arc<TxDesc> {
+    let mut block_ref = vec![0x6a, 0x24];
+    block_ref.extend_from_slice(&block_hash.0);
+    block_ref.extend_from_slice(&height.to_le_bytes());
+    let input = |hash: Hash, index: u32, tree: i8| dcroxide_wire::TxIn {
+        previous_out_point: OutPoint { hash, index, tree },
+        sequence: 0xffff_ffff,
+        value_in: 0,
+        block_height: 0,
+        block_index: 0,
+        signature_script: Vec::new(),
+    };
+    let tx = MsgTx {
+        tx_in: vec![
+            input(Hash::ZERO, u32::MAX, TX_TREE_REGULAR),
+            input(ticket, 0, TX_TREE_STAKE),
+        ],
+        tx_out: vec![
+            dcroxide_wire::TxOut {
+                value: 0,
+                version: 0,
+                pk_script: block_ref,
+            },
+            dcroxide_wire::TxOut {
+                value: 0,
+                version: 0,
+                pk_script: vec![0x6a, 0x02, 0x01, 0x00],
+            },
+        ],
+        ..MsgTx::default()
+    };
+    let tx_hash = tx.tx_hash();
+    let tx_size = tx.serialize_size() as i64;
+    Arc::new(TxDesc {
+        tx,
+        tx_hash,
+        tree: TX_TREE_STAKE,
+        tx_type: TxType::SSGen,
+        added_unix: 0,
+        height: i64::from(height),
+        fee: 0,
+        total_sig_ops: 0,
+        tx_size,
+    })
+}
+
+/// M2-p#3: the generator logs dcrd's mining warnings, which the daemon
+/// routes to `MINR`.  A source transaction whose utxo view cannot be
+/// fetched is skipped with dcrd's warning (`mining.go:1374-1379`).
+#[test]
+fn a_utxo_view_failure_is_logged_as_dcrd_warns() {
+    let params = leaked_params();
+    let mut g = empty_generator(params, 100);
+    let fund = funding();
+    g.chain.utxos.add_tx_outs(&fund, 1, 0, false);
+    let tx = payer(&fund, 4_000_000);
+    let tx_hash = tx.tx_hash();
+    g.tx_source.add(source_desc(tx, 100));
+    g.chain.fetch_view_err = true;
+
+    let template = g
+        .new_block_template(None, &ExtraNonces::default())
+        .expect("a template")
+        .expect("not none");
+    assert_eq!(
+        template.block.transactions.len(),
+        1,
+        "the transaction is skipped"
+    );
+    assert_eq!(
+        *g.chain.warnings.borrow(),
+        [format!(
+            "Unable to fetch utxo view for tx {tx_hash}: view err"
+        )]
+    );
+}
+
+/// M2-p#3: a build whose parent has enough votes in the source but ends
+/// with too few in the block warns as dcrd does before recycling the
+/// parent (`mining.go:2174-2179`).  The votes here spend tickets the
+/// chain does not hold, so the scan skips every one.
+#[test]
+fn too_few_voters_after_assembly_is_logged_as_dcrd_warns() {
+    let params = leaked_params();
+    let tip_height = params.stake_validation_height - 1;
+    let mut g = empty_generator(params, tip_height);
+    g.chain.tip_generation = vec![Hash::ZERO];
+    for ticket in 1..=3u8 {
+        g.tx_source
+            .add(vote_on(Hash::ZERO, tip_height as u32, Hash([ticket; 32])));
+    }
+
+    let template = g
+        .new_block_template(None, &ExtraNonces::default())
+        .expect("the parent recycle")
+        .expect("aggressive mining builds on the parent");
+    assert_eq!(template.height, tip_height, "built on the tip's parent");
+    assert_eq!(
+        *g.chain.warnings.borrow(),
+        ["incongruent number of voters in mempool vs mempool.voters; not enough voters found"]
     );
 }

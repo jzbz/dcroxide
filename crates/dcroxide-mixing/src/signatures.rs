@@ -122,22 +122,50 @@ impl_mix_message!(MsgMixSecrets, "mixsecrets",
 
 /// The hash that is Schnorr-signed: the signature tag, command,
 /// session, run, and signed-data digest joined by commas (dcrd
-/// `schnorrHash`).
+/// `schnorrHash`).  Like dcrd, the preimage streams into the hasher
+/// through one reused stack buffer (`hex.AppendEncode(buf[:0], ...)`,
+/// `strconv.AppendUint(buf[:0], ...)`), so a signature check allocates
+/// nothing for it.
 fn schnorr_hash(command: &str, sid: &[u8], run: u32, sig_hash: &[u8]) -> [u8; 32] {
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let mut buf = [0u8; 64];
+    let mut h = blake256::Blake256::new();
+    h.update(TAG);
+    h.update(b",");
+    h.update(command.as_bytes());
+    h.update(b",");
+    write_hex(&mut h, &mut buf, sid);
+    h.update(b",");
+    h.update(append_decimal(&mut buf, run));
+    h.update(b",");
+    write_hex(&mut h, &mut buf, sig_hash);
+    h.finalize()
+}
+
+/// Write the lowercase hex encoding of `bytes` to the hasher (Go's
+/// `hex.AppendEncode`), half a buffer of input at a time, so an input
+/// longer than the 32-byte session ID or digest still encodes whole.
+fn write_hex(h: &mut blake256::Blake256, buf: &mut [u8; 64], bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for chunk in bytes.chunks(buf.len() / 2) {
+        for (pair, b) in buf.as_chunks_mut::<2>().0.iter_mut().zip(chunk) {
+            *pair = [DIGITS[usize::from(b >> 4)], DIGITS[usize::from(b & 0x0f)]];
+        }
+        h.update(&buf[..chunk.len() * 2]);
     }
-    let mut preimage = Vec::new();
-    preimage.extend_from_slice(TAG);
-    preimage.push(b',');
-    preimage.extend_from_slice(command.as_bytes());
-    preimage.push(b',');
-    preimage.extend_from_slice(hex(sid).as_bytes());
-    preimage.push(b',');
-    preimage.extend_from_slice(run.to_string().as_bytes());
-    preimage.push(b',');
-    preimage.extend_from_slice(hex(sig_hash).as_bytes());
-    blake256::sum256(&preimage)
+}
+
+/// The base-10 digits of `n` (Go's `strconv.AppendUint(buf[:0], n,
+/// 10)`), written into the end of `buf`.
+fn append_decimal(buf: &mut [u8; 64], mut n: u32) -> &[u8] {
+    let mut start = buf.len();
+    loop {
+        start -= 1;
+        buf[start] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            return &buf[start..];
+        }
+    }
 }
 
 const ZERO_SID: [u8; 32] = [0u8; 32];
@@ -205,4 +233,45 @@ fn verify(pk: &[u8], sig: &[u8], sig_hash: &[u8], command: &str, sid: &[u8], run
 
     let hash = schnorr_hash(command, sid, run, sig_hash);
     sig_parsed.verify(&hash, &pk_parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// X1-p#4: the streamed preimage hashes to what the joined string
+    /// did (the tag, command, hex session ID, decimal run and hex digest
+    /// separated by commas), for the 32-byte session IDs and digests the
+    /// messages carry and for the other lengths `verify_signature`
+    /// accepts, across the run's digit counts.
+    #[test]
+    fn the_streamed_schnorr_preimage_hashes_like_the_joined_one() {
+        fn joined(command: &str, sid: &[u8], run: u32, sig_hash: &[u8]) -> [u8; 32] {
+            let hex =
+                |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+            let preimage = format!(
+                "decred-mix-signature,{command},{},{run},{}",
+                hex(sid),
+                hex(sig_hash)
+            );
+            blake256::sum256(preimage.as_bytes())
+        }
+
+        let bytes = |len: usize, seed: u8| -> Vec<u8> {
+            (0..len)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed))
+                .collect()
+        };
+        for (sid_len, hash_len) in [(32, 32), (0, 0), (1, 31), (33, 64), (65, 100)] {
+            for run in [0, 1, 9, 10, 4_294_967, u32::MAX] {
+                let sid = bytes(sid_len, 0xa5);
+                let sig_hash = bytes(hash_len, 0x0f);
+                assert_eq!(
+                    schnorr_hash("mixkeyxchg", &sid, run, &sig_hash),
+                    joined("mixkeyxchg", &sid, run, &sig_hash),
+                    "sid {sid_len} bytes, digest {hash_len} bytes, run {run}"
+                );
+            }
+        }
+    }
 }

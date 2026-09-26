@@ -389,6 +389,7 @@ impl NodeCpuMiner {
     /// [`Self::start`] with an injectable speed-monitor interval for
     /// tests.
     fn start_with_hps_interval(&mut self, interval: Duration) -> MinerRuntime {
+        crate::logging::trace("MINR", "Starting CPU miner in idle state");
         let monitor_rx = self
             .monitor_rx
             .lock()
@@ -532,11 +533,17 @@ impl MinerRuntime {
         self.quit.store(true, Ordering::Release);
         let _ = self.controller_tx.send(ControllerCmd::Stop);
         let _ = self.monitor_tx.send(MonitorCmd::Stop);
+        // `shutdown` stops and then drops, so only the call that joins
+        // the threads logs dcrd's closing trace line.
+        let was_running = self.controller_thread.is_some() || self.speed_thread.is_some();
         if let Some(thread) = self.controller_thread.take() {
             let _ = thread.join();
         }
         if let Some(thread) = self.speed_thread.take() {
             let _ = thread.join();
+        }
+        if was_running {
+            crate::logging::trace("MINR", "CPU miner stopped");
         }
     }
 }
@@ -638,6 +645,7 @@ fn run_speed_monitor(
     speed_stats: Arc<Mutex<HashMap<u64, Arc<SpeedStats>>>>,
     interval: Duration,
 ) {
+    crate::logging::trace("MINR", "CPU miner speed monitor started");
     let mut hashes_per_sec = 0.0f64;
     let mut deadline = Instant::now()
         .checked_add(interval)
@@ -651,9 +659,15 @@ fn run_speed_monitor(
                 // (dcrd's independent `ticker.C` arm).
                 let _ = reply.send(hashes_per_sec);
             }
-            Ok(MonitorCmd::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Ok(MonitorCmd::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                crate::logging::trace("MINR", "CPU miner speed monitor done");
+                return;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 hashes_per_sec = recompute_hashes_per_sec(&speed_stats);
+                if let Some(line) = hash_speed_line(hashes_per_sec) {
+                    crate::logging::debug("MINR", &line);
+                }
                 deadline = Instant::now()
                     .checked_add(interval)
                     .expect("speed monitor deadline");
@@ -677,6 +691,36 @@ fn recompute_hashes_per_sec(speed_stats: &Arc<Mutex<HashMap<u64, Arc<SpeedStats>
     }
     hashes_per_sec
 }
+
+/// dcrd's speed-monitor line for a recomputed rate, or `None` for the
+/// zero or NaN rate it does not log (`speedMonitor`,
+/// `internal/mining/cpuminer/cpuminer.go:198-200`).  Rust's `{:6.0}`
+/// pads and rounds a finite rate as Go's `%6.0f` does.
+fn hash_speed_line(hashes_per_sec: f64) -> Option<String> {
+    if hashes_per_sec == 0.0 || hashes_per_sec.is_nan() {
+        return None;
+    }
+    Some(format!(
+        "Hash speed: {:6.0} kilohashes/s",
+        hashes_per_sec / 1000.0
+    ))
+}
+
+/// dcrd's worker-controller line after launching or stopping workers,
+/// which names the new target as the total running
+/// (`miningWorkerController`, `cpuminer.go:600-615`).
+fn worker_change_line(verb: &str, changed: usize, target: usize) -> String {
+    format!(
+        "{verb} {changed} {} ({target} total running)",
+        crate::server::pick_noun(changed as u64, "worker", "workers")
+    )
+}
+
+/// dcrd's info line when a connectionless solver stops on a parent that
+/// has had `maxSimnetToMine` solutions fail to submit (`solver`,
+/// `cpuminer.go:412-420`).
+const TOO_MANY_ON_PARENT: &str = "too many blocks mined on parent, stopping until there are \
+                                  enough votes on these to make a new block";
 
 /// A running continuous worker: its cancellation flag and join handle.
 struct WorkerHandle {
@@ -704,9 +748,11 @@ fn run_controller(rx: mpsc::Receiver<ControllerCmd>, shared: SolveShared) {
                 retired.retain(|handle| !handle.is_finished());
                 running.retain(|handle| !handle.join.is_finished());
 
+                // No change logs nothing, as dcrd's `continue` does.
                 let target = shared.num_workers.load(Ordering::Acquire) as usize;
                 if target > running.len() {
-                    for _ in 0..target.saturating_sub(running.len()) {
+                    let num_to_launch = target.saturating_sub(running.len());
+                    for _ in 0..num_to_launch {
                         let cancel = Arc::new(AtomicBool::new(false));
                         let worker_shared = shared.clone();
                         let worker_cancel = Arc::clone(&cancel);
@@ -717,15 +763,24 @@ fn run_controller(rx: mpsc::Receiver<ControllerCmd>, shared: SolveShared) {
                         });
                         running.push(WorkerHandle { cancel, join });
                     }
-                } else {
+                    crate::logging::debug(
+                        "MINR",
+                        &worker_change_line("Launched", num_to_launch, target),
+                    );
+                } else if target < running.len() {
                     // Signal the most recently created workers to exit
                     // and retire their handles for later joining.
-                    for _ in 0..running.len().saturating_sub(target) {
+                    let num_to_stop = running.len().saturating_sub(target);
+                    for _ in 0..num_to_stop {
                         if let Some(handle) = running.pop() {
                             handle.cancel.store(true, Ordering::Release);
                             retired.push(handle.join);
                         }
                     }
+                    crate::logging::debug(
+                        "MINR",
+                        &worker_change_line("Stopped", num_to_stop, target),
+                    );
                 }
             }
             Ok(ControllerCmd::Stop) | Err(_) => {
@@ -765,6 +820,7 @@ impl Drop for SpeedStatsGuard {
 /// each on a solver thread, switching to new templates as they arrive
 /// (dcrd `generateBlocks`).
 fn generate_blocks(id: u64, cancel: Arc<AtomicBool>, shared: SolveShared) {
+    crate::logging::trace("MINR", "Starting generate blocks worker");
     let stats = Arc::new(SpeedStats::default());
     shared
         .speed_stats
@@ -867,6 +923,7 @@ fn generate_blocks(id: u64, cancel: Arc<AtomicBool>, shared: SolveShared) {
         let _ = handle.join();
     }
     subscription.stop();
+    crate::logging::trace("MINR", "Generate blocks worker done");
 }
 
 /// The state one continuous solver thread owns for its template.
@@ -935,6 +992,7 @@ fn continuous_solve(job: ContinuousSolve) {
                 .unwrap_or(0)
                 >= MAX_SIMNET_TO_MINE;
             if maxed {
+                crate::logging::info("MINR", TOO_MANY_ON_PARENT);
                 return;
             }
         }
@@ -977,13 +1035,7 @@ fn continuous_solve(job: ContinuousSolve) {
         if stop(&shared) {
             return;
         }
-        let accepted = shared
-            .sync_manager
-            .lock()
-            .expect("sync manager mutex poisoned")
-            .process_block(&block)
-            .is_ok();
-        if accepted {
+        if submit_block(&shared.sync_manager, &block, is_blake3_pow_active) {
             return;
         }
         // The solution failed to submit; count it against this parent and
@@ -1092,17 +1144,98 @@ fn solve_and_submit(mut job: SolveJob) {
     // Submit through the same path a network block takes; on acceptance
     // record the template so the subscription's re-delivery of it is
     // skipped (dcrd `submitBlock` + `discretePrevTemplate.Store`).
-    let accepted = job
-        .sync_manager
-        .lock()
-        .expect("sync manager mutex poisoned")
-        .process_block(&job.block)
-        .is_ok();
+    let accepted = submit_block(&job.sync_manager, &job.block, job.is_blake3_pow_active);
     if accepted {
         *job.discrete_prev_template
             .lock()
             .expect("prev template poisoned") = Some(job.template_hash);
     }
+}
+
+/// Submit a solved block through the same path a network block takes and
+/// log the outcome under `MINR`, the logger dcrd hands its CPU miner
+/// (`log.go`, `cpuminer.UseLogger(minrLog)`), returning whether it was
+/// accepted (dcrd `submitBlock`,
+/// `internal/mining/cpuminer/cpuminer.go:218-256`).
+fn submit_block(
+    sync_manager: &Mutex<NodeSyncManager>,
+    block: &MsgBlock,
+    is_blake3_pow_active: bool,
+) -> bool {
+    let result = sync_manager
+        .lock()
+        .expect("sync manager mutex poisoned")
+        .process_block(block);
+    match submit_log_line(&result, &block.header, is_blake3_pow_active) {
+        (true, line) => crate::logging::info("MINR", &line),
+        (false, line) => crate::logging::error("MINR", &line),
+    }
+    result.is_ok()
+}
+
+/// The line dcrd's `submitBlock` logs for a submission's outcome, with
+/// whether it is the info-level acceptance (the rest log at error level).
+fn submit_log_line(
+    result: &Result<(), dcroxide_netsync::ProcessBlockFailure>,
+    header: &BlockHeader,
+    is_blake3_pow_active: bool,
+) -> (bool, String) {
+    let failure = match result {
+        Ok(()) => {
+            // The proof-of-work hash is named when it differs from the
+            // block hash, which is always under BLAKE3 (DCP0011).
+            let block_hash = header.block_hash();
+            let pow_hash = if is_blake3_pow_active {
+                header.pow_hash_v2()
+            } else {
+                header.pow_hash_v1()
+            };
+            let pow_hash_str = if pow_hash == block_hash {
+                String::new()
+            } else {
+                format!(", pow hash {pow_hash}")
+            };
+            let height = header.height;
+            return (
+                true,
+                format!(
+                    "Block submitted via CPU miner accepted (hash {block_hash}, height \
+                     {height}{pow_hash_str})"
+                ),
+            );
+        }
+        Err(failure) => failure,
+    };
+
+    // dcrd tests `errors.Is(err, blockchain.ErrMissingParent)` first.  The
+    // failure carries no kind, but the chain's missing-parent error text
+    // names this block's parent (`previous block %s is not known`), which
+    // no other rejection of it does.
+    let prev = header.prev_block;
+    if failure.message == format!("previous block {prev} is not known") {
+        return (
+            false,
+            format!("Block submitted via CPU miner is an orphan building on parent {prev}"),
+        );
+    }
+
+    // Anything other than a rule violation is an unexpected error.
+    if !failure.is_rule_error {
+        return (
+            false,
+            format!(
+                "Unexpected error while processing block submitted via CPU miner: {}",
+                failure.message
+            ),
+        );
+    }
+    (
+        false,
+        format!(
+            "Block submitted via CPU miner rejected: {}",
+            failure.message
+        ),
+    )
 }
 
 /// A fresh random 64-bit extra-nonce offset (dcrd `rand.Uint64()` in
@@ -1154,6 +1287,7 @@ impl RpcCpuMiner for NodeCpuMiner {
         // does, so a panic can never latch it and reject all later
         // `generate` calls.
         let _discrete_guard = DiscreteMiningGuard(Arc::clone(&self.mining_mode));
+        crate::logging::trace("MINR", &format!("Extending the main chain {n} blocks"));
         let orig_height = self.best_height();
         let target_height = orig_height.saturating_add(i64::from(n));
 
@@ -1252,6 +1386,11 @@ impl RpcCpuMiner for NodeCpuMiner {
             let _ = handle.join();
         }
         subscription.stop();
+        let num_extended = self.best_height().wrapping_sub(orig_height);
+        crate::logging::trace(
+            "MINR",
+            &format!("Extended the main chain {num_extended} blocks"),
+        );
 
         // Return the hashes that ultimately extended the main chain,
         // regardless of their origin (dcrd's `BlockHashByHeight` sweep;
@@ -1720,37 +1859,170 @@ mod tests {
             stransactions: Vec::new(),
         };
 
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::new(AtomicBool::new(false));
-        let held = mined_on_parents.lock().expect("mined-on-parents");
-        let solver = {
-            let job = ContinuousSolve {
-                template,
-                stats: Arc::new(SpeedStats::default()),
-                is_blake3_pow_active: false,
-                cancel: Arc::clone(&cancel),
-                worker_cancel: Arc::clone(&worker_cancel),
-                shared,
+        // Nothing outside the solver shows when it has passed its
+        // top-of-loop check, and one that starts late sees the
+        // cancellation there and returns without solving, which passes
+        // with or without the post-solve check (RG10#1).  A solve shows in
+        // the speed stats, which `solve_block` folds before it returns a
+        // solution, so an attempt that hashed nothing proves nothing and
+        // runs again with a longer wait.
+        let mut solved = false;
+        for attempt in 0..5u32 {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let worker_cancel = Arc::new(AtomicBool::new(false));
+            let stats = Arc::new(SpeedStats::default());
+            let held = mined_on_parents.lock().expect("mined-on-parents");
+            let solver = {
+                let job = ContinuousSolve {
+                    template: template.clone(),
+                    stats: Arc::clone(&stats),
+                    is_blake3_pow_active: false,
+                    cancel: Arc::clone(&cancel),
+                    worker_cancel: Arc::clone(&worker_cancel),
+                    shared: shared.clone(),
+                };
+                thread::spawn(move || continuous_solve(job))
             };
-            thread::spawn(move || continuous_solve(job))
-        };
-        // Let the solver pass its top-of-loop check and block on the map.
-        thread::sleep(Duration::from_millis(300));
-        worker_cancel.store(true, Ordering::Release);
-        drop(held);
-        solver.join().expect("the solver did not panic");
+            // Let the solver pass its top-of-loop check and block on the
+            // map.
+            thread::sleep(Duration::from_millis(300u64 << attempt));
+            worker_cancel.store(true, Ordering::Release);
+            drop(held);
+            solver.join().expect("the solver did not panic");
 
-        assert_eq!(
-            mined_on_parents
-                .lock()
-                .expect("mined-on-parents")
-                .get(&genesis)
-                .copied(),
-            None,
-            "a solver whose worker was cancelled must not submit its solution"
+            assert_eq!(
+                mined_on_parents
+                    .lock()
+                    .expect("mined-on-parents")
+                    .get(&genesis)
+                    .copied(),
+                None,
+                "a solver whose worker was cancelled must not submit its solution"
+            );
+            assert!(!cancel.load(Ordering::Acquire));
+            if stats.total_hashes.load(Ordering::Relaxed) > 0 {
+                solved = true;
+                break;
+            }
+        }
+        assert!(
+            solved,
+            "the solver never reached the map before its worker was cancelled, so no \
+             attempt exercised the post-solve check"
         );
-        assert!(!cancel.load(Ordering::Acquire));
         drop(miner);
         generator.shutdown();
+    }
+
+    /// M2-p#3: a CPU-mined submission logs dcrd's `submitBlock` lines
+    /// under `MINR` (`internal/mining/cpuminer/cpuminer.go:222-255`):
+    /// the acceptance at info, naming the proof-of-work hash when it is
+    /// not the block hash, and each failure class at error.
+    #[test]
+    fn submission_outcomes_log_dcrds_lines() {
+        use dcroxide_netsync::ProcessBlockFailure;
+
+        let header = BlockHeader {
+            prev_block: Hash([7; 32]),
+            height: 42,
+            ..BlockHeader::from_bytes(&[0u8; 180]).expect("zero header").0
+        };
+        let hash = header.block_hash();
+        let failure = |is_rule_error: bool, message: String| {
+            Err(ProcessBlockFailure {
+                is_duplicate_block: false,
+                is_rule_error,
+                is_corruption: false,
+                message,
+            })
+        };
+
+        assert_eq!(
+            submit_log_line(&Ok(()), &header, false),
+            (
+                true,
+                format!("Block submitted via CPU miner accepted (hash {hash}, height 42)")
+            )
+        );
+        assert_eq!(
+            submit_log_line(&Ok(()), &header, true),
+            (
+                true,
+                format!(
+                    "Block submitted via CPU miner accepted (hash {hash}, height 42, pow hash {})",
+                    header.pow_hash_v2()
+                )
+            )
+        );
+        let prev = header.prev_block;
+        assert_eq!(
+            submit_log_line(
+                &failure(true, format!("previous block {prev} is not known")),
+                &header,
+                true
+            ),
+            (
+                false,
+                format!("Block submitted via CPU miner is an orphan building on parent {prev}")
+            )
+        );
+        assert_eq!(
+            submit_log_line(&failure(false, "disk gone".into()), &header, true),
+            (
+                false,
+                "Unexpected error while processing block submitted via CPU miner: disk gone"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            submit_log_line(&failure(true, "bad block".into()), &header, true),
+            (
+                false,
+                "Block submitted via CPU miner rejected: bad block".to_string()
+            )
+        );
+    }
+
+    /// M2-p#3: the continuous miner's other `MINR` lines read as dcrd's
+    /// (`internal/mining/cpuminer/cpuminer.go`): the speed monitor's rate
+    /// in Go's `%6.0f` (width six, halves to even) and silent for a zero
+    /// or NaN rate (:198-200), the worker controller's launch and stop
+    /// counts (:600-615), and the solver's stop on a maxed parent
+    /// (:417-418).
+    #[test]
+    fn continuous_miner_lines_read_as_dcrds() {
+        assert_eq!(hash_speed_line(0.0), None);
+        assert_eq!(hash_speed_line(f64::NAN), None);
+        assert_eq!(
+            hash_speed_line(1_234_567.0).as_deref(),
+            Some("Hash speed:   1235 kilohashes/s")
+        );
+        assert_eq!(
+            hash_speed_line(500.0).as_deref(),
+            Some("Hash speed:      0 kilohashes/s")
+        );
+        assert_eq!(
+            hash_speed_line(2_500.0).as_deref(),
+            Some("Hash speed:      2 kilohashes/s")
+        );
+        assert_eq!(
+            hash_speed_line(12_345_678_900.0).as_deref(),
+            Some("Hash speed: 12345679 kilohashes/s")
+        );
+
+        assert_eq!(
+            worker_change_line("Launched", 1, 1),
+            "Launched 1 worker (1 total running)"
+        );
+        assert_eq!(
+            worker_change_line("Stopped", 3, 0),
+            "Stopped 3 workers (0 total running)"
+        );
+
+        assert_eq!(
+            TOO_MANY_ON_PARENT,
+            "too many blocks mined on parent, stopping until there are enough votes on these \
+             to make a new block"
+        );
     }
 }
