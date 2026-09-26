@@ -57,6 +57,10 @@ fn fmt_frac(mut v: u64, prec: usize) -> (String, u64) {
     for _ in 0..prec {
         let digit = v % 10;
         print = print || digit != 0;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "digit = v % 10 < 10, so b'0' + digit <= b'9'"
+        )]
         if print {
             digits.push(b'0' + digit as u8);
         }
@@ -80,6 +84,10 @@ fn fmt_frac(mut v: u64, prec: usize) -> (String, u64) {
 /// zone database.  The one rendering serves the chain's rule errors
 /// (header timestamps and median times) and the daemon's block import
 /// progress line, so the two cannot drift apart.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "exact for every i64: |days| <= i64::MAX / 86_400 < 1.1e14, so z and era * 400 (< 3e11) fit, and doe < 146_097, yoe < 400, doy < 366, mp < 12"
+)]
 pub fn go_time_utc_string(unix: i64) -> String {
     // Civil-from-unix over the proleptic Gregorian calendar, per Howard
     // Hinnant's algorithm (the same math Go's time package performs).

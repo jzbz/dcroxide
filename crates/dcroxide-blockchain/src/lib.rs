@@ -24,9 +24,10 @@
 // because the P2P, RPC and mixing crates legitimately hash (see
 // ADR-0008); note the lint fires only on `for` loops.
 #![deny(clippy::iter_over_hash_type)]
-// The consensus serialization formats ported here rely on Go's
-// fixed-width integer semantics over bounded inputs.
-#![allow(clippy::arithmetic_side_effects)]
+// `clippy::arithmetic_side_effects` (a workspace warning, an error in
+// CI) applies here in full: arithmetic that wraps in dcrd is written as
+// explicit `wrapping_*` at Go's width, and every other operator carries
+// an allow that states the bound it relies on (see ADR-0008).
 
 extern crate alloc;
 

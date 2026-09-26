@@ -28,6 +28,10 @@ pub const CURRENT_COMPRESSION_VERSION: u32 = 1;
 
 /// The number of bytes serializing `n` as a VLQ takes (dcrd
 /// `serializeSizeVLQ`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the loop runs only while n > 0x7f, so (n >> 7) - 1 cannot underflow; a u64 takes at most 10 VLQ bytes, so size <= 10"
+)]
 pub fn serialize_size_vlq(mut n: u64) -> usize {
     let mut size = 1;
     while n > 0x7f {
@@ -40,6 +44,10 @@ pub fn serialize_size_vlq(mut n: u64) -> usize {
 /// Serialize `n` as a VLQ into the target, which must be large enough
 /// per [`serialize_size_vlq`]; returns the bytes written (dcrd
 /// `putVLQ`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the loop continues only while n > 0x7f, so (n >> 7) - 1 cannot underflow; a u64 takes at most 10 VLQ bytes, so offset + 1 <= 10"
+)]
 pub fn put_vlq(target: &mut [u8], mut n: u64) -> usize {
     let mut offset = 0;
     loop {
@@ -64,6 +72,10 @@ pub fn put_vlq(target: &mut [u8], mut n: u64) -> usize {
 pub fn deserialize_vlq(serialized: &[u8]) -> (u64, usize) {
     let mut n: u64 = 0;
     let mut size = 0;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "size counts the bytes of serialized, so size <= serialized.len()"
+    )]
     for &val in serialized {
         size += 1;
         n = (n << 7) | u64::from(val & 0x7f);
@@ -168,6 +180,10 @@ fn is_pub_key(script: &[u8]) -> Option<&[u8]> {
 
 /// The number of bytes the script would take when compressed (dcrd
 /// `compressedScriptSize`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "pk_script.len() <= isize::MAX, so adding NUM_SPECIAL_SCRIPTS (64) or a VLQ size of at most 10 cannot overflow u64 or usize"
+)]
 pub fn compressed_script_size(_script_version: u16, pk_script: &[u8]) -> usize {
     if extract_pub_key_hash(pk_script).is_some() || extract_script_hash(pk_script).is_some() {
         return 21;
@@ -216,6 +232,10 @@ pub fn decode_compressed_script_size(serialized: &[u8]) -> i64 {
 /// empty slice); callers always size the target from
 /// `compressedScriptSize`, which is at least one byte, so the branch is
 /// unreachable and deliberately not reproduced.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "pk_script.len() <= isize::MAX, so adding NUM_SPECIAL_SCRIPTS (64) or a VLQ length of at most 10 cannot overflow u64 or usize"
+)]
 pub fn put_compressed_script(target: &mut [u8], _script_version: u16, pk_script: &[u8]) -> usize {
     // Pay-to-pubkey-hash script.
     if let Some(hash) = extract_pub_key_hash(pk_script) {
@@ -343,6 +363,7 @@ fn try_decompress_script(compressed_pk_script: &[u8]) -> Option<Vec<u8>> {
             // VLQ's length.
             let tail = &compressed_pk_script[1..];
             let n = tail.len().min(32);
+            #[allow(clippy::arithmetic_side_effects, reason = "n <= 32")]
             compressed_key[1..1 + n].copy_from_slice(&tail[..n]);
             let Ok(key) = PublicKey::parse(&compressed_key) else {
                 return Some(Vec::new());
@@ -378,6 +399,10 @@ fn payload(compressed_pk_script: &[u8], start: usize, len: usize) -> Option<&[u8
 // -----------------------------------------------------------------------
 
 /// Compress a transaction output amount (dcrd `compressTxOutAmount`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "exponent < 9 before each increment, and the exponent-9 branch has 1 <= amount <= u64::MAX / 10^9, so 10 + 10 * (amount - 1) cannot overflow"
+)]
 pub fn compress_tx_out_amount(mut amount: u64) -> u64 {
     // No need to do any work if it's zero.
     if amount == 0 {
@@ -397,7 +422,15 @@ pub fn compress_tx_out_amount(mut amount: u64) -> u64 {
     if exponent < 9 {
         let last_digit = amount % 10;
         amount /= 10;
-        return 1 + 10 * (9 * amount + last_digit - 1) + exponent;
+        return 1u64
+            .wrapping_add(
+                10u64.wrapping_mul(
+                    9u64.wrapping_mul(amount)
+                        .wrapping_add(last_digit)
+                        .wrapping_sub(1),
+                ),
+            )
+            .wrapping_add(exponent);
     }
 
     // The compressed result for an exponent of 9 is: 10 + 10*(n-1)
@@ -406,6 +439,10 @@ pub fn compress_tx_out_amount(mut amount: u64) -> u64 {
 
 /// Decompress a compressed transaction output amount (dcrd
 /// `decompressTxOutAmount`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "amount >= 1 before the decrement; after the division by 10 it is at most u64::MAX / 10, so amount + 1 fits, and after the division by 9 at most u64::MAX / 90, so amount * 10 + last_digit (last_digit <= 9) fits"
+)]
 pub fn decompress_tx_out_amount(mut amount: u64) -> u64 {
     // No need to do any work if it's zero.
     if amount == 0 {
@@ -447,6 +484,10 @@ pub fn decompress_tx_out_amount(mut amount: u64) -> u64 {
 
 /// The number of bytes the passed transaction output fields would take
 /// when compressed (dcrd `compressedTxOutSize`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "each VLQ size is at most 10 and compressed_script_size is at most isize::MAX + 10, so the sum fits usize"
+)]
 pub fn compressed_tx_out_size(
     amount: u64,
     script_version: u16,
@@ -466,6 +507,10 @@ pub fn compressed_tx_out_size(
 /// Compress the transaction output fields into the target, which must
 /// be large enough per [`compressed_tx_out_size`]; returns the bytes
 /// written (dcrd `putCompressedTxOut`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offset counts bytes written into target, so offset <= target.len()"
+)]
 pub fn put_compressed_tx_out(
     target: &mut [u8],
     amount: u64,
@@ -488,6 +533,10 @@ pub fn put_compressed_tx_out(
 /// Decode a compressed transaction output from the front of the
 /// serialized bytes, returning the amount, script version, script, and
 /// the number of bytes consumed (dcrd `decodeCompressedTxOut`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offset counts bytes read from serialized, so offset <= serialized.len(), and offset + script_size <= serialized.len() by the length check"
+)]
 pub fn decode_compressed_tx_out(
     serialized: &[u8],
     has_amount: bool,

@@ -88,6 +88,10 @@ pub fn calc_sequence_lock<V: VoteChainView>(
 ) -> Result<SequenceLock, RuleError> {
     // dcrd derives the flag from the node's parent; a genesis tip
     // nil-derefs there and is unreachable in practice.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "node_height is a block height (a u32 header height widened to i64)"
+    )]
     let is_treasury_enabled = is_treasury_agenda_active(view, Some(node_height - 1), params)
         .map_err(|_| {
             rule_error(
@@ -139,6 +143,10 @@ pub fn calc_sequence_lock<V: VoteChainView>(
 
         // Calculate the sequence locks from the point of view of the
         // next block for inputs that are in the mempool.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "node_height is a block height (a u32 header height widened to i64)"
+        )]
         let input_height = if input_height == MEMPOOL_HEIGHT {
             node_height + 1
         } else {
@@ -154,6 +162,10 @@ pub fn calc_sequence_lock<V: VoteChainView>(
             // Time based relative locks are calculated relative to the
             // past median time of the block prior to the one in which
             // the referenced output was included.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "input_height is a u32 utxo entry height or node_height + 1"
+            )]
             let prev_input_height = (input_height - 1).max(0);
             let median_time = calc_past_median_time(&AsVersionView(view), prev_input_height);
 
@@ -161,6 +173,11 @@ pub fn calc_sequence_lock<V: VoteChainView>(
             // seconds, and subtract one to maintain the original lock
             // time semantics.
             let relative_secs = relative_lock << SEQUENCE_LOCK_TIME_GRANULARITY;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "median_time is a u32 header timestamp widened to i64, and \
+                          relative_secs <= 0xffff << 9"
+            )]
             let min_time = median_time + relative_secs - 1;
             if min_time > sequence_lock.min_time {
                 sequence_lock.min_time = min_time;
@@ -169,6 +186,11 @@ pub fn calc_sequence_lock<V: VoteChainView>(
             // Block based relative locks are the sum of the input
             // height and the required relative number of blocks, minus
             // one to maintain the original lock time semantics.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "input_height is a u32 utxo entry height or node_height + 1, and \
+                          relative_lock <= 0xffff"
+            )]
             let min_height = input_height + relative_lock - 1;
             if min_height > sequence_lock.min_height {
                 sequence_lock.min_height = min_height;

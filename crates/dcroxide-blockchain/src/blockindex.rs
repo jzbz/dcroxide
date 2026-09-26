@@ -186,6 +186,10 @@ pub struct BlockNode {
 
 /// Clear the lowest set bit in the passed value (dcrd
 /// `clearLowestOneBit`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "only calc_skip_list_height calls this, with n >= 0 (a negative height returns early, and clearing a bit of a non-negative value stays non-negative), so n - 1 >= -1"
+)]
 fn clear_lowest_one_bit(n: i64) -> i64 {
     n & (n - 1)
 }
@@ -218,6 +222,10 @@ fn diff_bits_to_uint256(bits: u32) -> (Uint256, bool, bool) {
 
     // N = mantissa * 256^(exponent-3).
     if exponent <= 3 {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "exponent <= 3 here, so the shift is 8 * (3 - exponent) <= 24, below u32's width"
+        )]
         let n = Uint256::from_u64(u64::from(mantissa >> (8 * (3 - exponent))));
         return (n, is_sign_bit_set, false);
     }
@@ -231,6 +239,10 @@ fn diff_bits_to_uint256(bits: u32) -> (Uint256, bool, bool) {
         return (Uint256::ZERO, is_sign_bit_set, true);
     }
     let mut n = Uint256::from_u64(u64::from(mantissa));
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "exponent is in 4..=34 here (3 or less returned above, 35 or more overflows), so 8 * (exponent - 3) is in 8..=248"
+    )]
     n.lsh(8 * (exponent - 3));
     (n, is_sign_bit_set, false)
 }
@@ -384,6 +396,10 @@ impl NodeStore {
             let parent_work = self.node(parent_id).work_sum;
             node.work_sum.add(&parent_work);
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "a Vec's len is at most isize::MAX, so len + 1 fits usize"
+        )]
         let id = u32::try_from(self.nodes.len() + 1)
             .ok()
             .and_then(core::num::NonZeroU32::new)
@@ -473,7 +489,7 @@ impl NodeStore {
     /// The ancestor a relative distance of blocks before this node
     /// (dcrd `RelativeAncestor`).
     pub fn relative_ancestor(&self, id: NodeId, distance: i64) -> Option<NodeId> {
-        let height = self.node(id).height - distance;
+        let height = self.node(id).height.wrapping_sub(distance);
         self.ancestor(id, height)
     }
 
@@ -657,6 +673,10 @@ impl BlockIndex {
         }
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "total_tips counts the tips in chain_tips, at most one per node, and the node arena holds fewer than u32::MAX nodes"
+    )]
     fn add_chain_tip(&mut self, tip: NodeId, height: i64, hash: Hash) {
         self.total_tips += 1;
         self.cached_tips.insert(hash.0, tip);
@@ -669,6 +689,10 @@ impl BlockIndex {
         entry.other_tips.push(tip);
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "total_tips is decremented only for a tip found in chain_tips, which add_chain_tip counted, so total_tips >= 1"
+    )]
     fn remove_chain_tip(&mut self, tip: NodeId, height: i64, hash: Hash) {
         self.cached_tips.remove(&hash.0);
 
@@ -719,6 +743,10 @@ impl BlockIndex {
         mut f: impl FnMut(NodeId) -> Result<(), E>,
     ) -> Result<(), E> {
         let filter_height = store.node(filter).height;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "cached_tips_start is 0 or a positive height set by prune_cached_tips, so cached_tips_start - 1 >= -1"
+        )]
         if filter_height >= self.cached_tips_start - 1 {
             for &tip in self.cached_tips.values() {
                 if store.node(tip).height <= filter_height {
@@ -784,6 +812,10 @@ impl BlockIndex {
     /// which the engine keeps and `Chain::maybe_prune_cached_tips`
     /// checks).
     pub fn prune_cached_tips(&mut self, store: &NodeStore, best_node: NodeId) {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "node heights come from the u32 header height (new_node is the only constructor), so height - 12 >= -12"
+        )]
         let height = store.node(best_node).height - CACHED_TIPS_PRUNE_DEPTH;
         if height <= 0 {
             return;
@@ -977,6 +1009,10 @@ impl BlockIndex {
         let tip_work = store.node(tip).work_sum;
         let mut linked_nodes = vec![node];
         let mut node_index = 0;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "node_index < linked_nodes.len() by the loop condition, so node_index + 1 fits usize"
+        )]
         while node_index < linked_nodes.len() {
             let linked_node = linked_nodes[node_index];
             {
@@ -985,7 +1021,7 @@ impl BlockIndex {
                 n.is_fully_linked = true;
                 n.received_order_id = order_id;
             }
-            self.next_received_order_id += 1;
+            self.next_received_order_id = self.next_received_order_id.wrapping_add(1);
 
             if store.node(linked_node).work_sum >= tip_work {
                 self.add_best_chain_candidate(linked_node);
@@ -1089,6 +1125,10 @@ mod tests {
     fn big_work(bits: u32) -> Uint256 {
         let (_, bytes) = dcroxide_standalone::calc_work(bits).to_bytes_be();
         let mut be = [0u8; 32];
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "calc_work is 0 or 2^256 / (target + 1) with target >= 1, at most 2^255, so bytes.len() <= 32"
+        )]
         be[32 - bytes.len()..].copy_from_slice(&bytes);
         Uint256::from_be_bytes(&be)
     }

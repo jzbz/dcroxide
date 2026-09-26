@@ -166,9 +166,18 @@ fn blake3_work_diff_anchor(
     let svh = params.stake_validation_height;
 
     // Determine the final node of the previous rule change interval.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "prev_height is a block height (a u32 header height widened to i64)"
+    )]
     let final_node_height = calc_want_height(svh, rcai, prev_height + 1);
     let mut candidate_height = final_node_height;
     let mut anchor = None;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "candidate.height >= 1 since height 0 breaks above, and candidate_height >= 0 \
+                  by the loop condition, less the u32 rcai"
+    )]
     while candidate_height >= 0 {
         let Some(candidate) = ChainView::node(view, candidate_height) else {
             break;

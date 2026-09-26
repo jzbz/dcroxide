@@ -97,6 +97,10 @@ pub(crate) fn is_testnet3(params: &Params) -> bool {
 
 /// The maximum-difficulty target imposed on testnet (dcrd's
 /// `minTestNetTarget`, powLimit >> 6), or `None` off testnet3.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "BigInt shift by the constant 6 (Go big.Int.Rsh): arbitrary precision cannot overflow"
+)]
 fn min_testnet_target(params: &Params) -> Option<BigInt> {
     if !is_testnet3(params) {
         return None;
@@ -123,9 +127,17 @@ pub fn find_prev_testnet_difficulty(
     start_height: i64,
     params: &Params,
 ) -> u32 {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "chain parameters: 144 * 20 = 2880 on mainnet and testnet3, 8 * 4 on simnet and regnet"
+    )]
     let blocks_per_retarget = params.work_diff_window_size * params.work_diff_windows;
 
     let mut iter = view.node(start_height);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "blocks_per_retarget is 2880 or 32, a product of positive chain parameters, never 0 or -1; node.height >= 1 at the decrement: view.node yields no negative height and 0 takes the other arm"
+    )]
     while let Some(node) = iter {
         if node.height % blocks_per_retarget == 0 || node.bits != params.pow_limit_bits {
             break;
@@ -157,7 +169,11 @@ pub fn calc_next_blake256_diff(
     let old_diff_big = compact_to_big(prev_node.bits);
 
     // The next difficulty only changes on window boundaries.
-    let next_height = prev_node.height + 1;
+    let next_height = prev_node.height.wrapping_add(1);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "work_diff_window_size is a positive chain parameter (144 or 8), never 0 or -1"
+    )]
     if next_height % params.work_diff_window_size != 0 {
         // For networks that support it, allow special reduction of the
         // required difficulty once too much time has elapsed without
@@ -166,7 +182,7 @@ pub fn calc_next_blake256_diff(
             && (!is_testnet3(params) || next_height < TESTNET3_MAX_DIFF_ACTIVATION_HEIGHT)
         {
             let reduction_time = params.min_diff_reduction_time_secs;
-            let allow_min_time = prev_node.timestamp + reduction_time;
+            let allow_min_time = prev_node.timestamp.wrapping_add(reduction_time);
             if new_block_time_unix > allow_min_time {
                 return params.pow_limit_bits;
             }
@@ -187,11 +203,19 @@ pub fn calc_next_blake256_diff(
     // the two rules cannot differ here; routed through the shared helper
     // anyway rather than leaving one of the three on a different rule.
     let next_diff_big_min = go_big_div(&compact_to_big(prev_node.bits), &raf_big);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt product (Go big.Int.Mul): arbitrary precision cannot overflow"
+    )]
     let next_diff_big_max = compact_to_big(prev_node.bits) * &raf_big;
 
     let alpha = params.work_diff_alpha;
 
     // Number of nodes to traverse while calculating difficulty.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "chain parameters: 144 * 20 = 2880 on mainnet and testnet3, 8 * 4 on simnet and regnet"
+    )]
     let nodes_to_traverse = params.work_diff_window_size * params.work_diff_windows;
 
     // Initialize bigInt slice for the percentage changes for each
@@ -210,9 +234,13 @@ pub fn calc_next_blake256_diff(
     loop {
         // Store and reset after reaching the end of every window
         // period.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "window bookkeeping bounded by the chain parameters: work_diff_window_size is positive (144 or 8), never 0 or -1; window_period < work_diff_windows, so each shift is at most work_diff_windows * work_diff_alpha = 20 * 1 = 20 < 64, weights sums at most 20 distinct powers of two (below 2^21) and window_period ends at most 20; the BigInt shifts cannot overflow"
+        )]
         if i % params.work_diff_window_size == 0 && i != 0 {
             older_time = old_node.timestamp;
-            let mut time_difference = recent_time - older_time;
+            let mut time_difference = recent_time.wrapping_sub(older_time);
 
             // Just assume we're at the target (no change) if we've
             // gone all the way back to the genesis block.
@@ -249,16 +277,30 @@ pub fn calc_next_blake256_diff(
 
         // Get the previous node while staying at the genesis block as
         // needed.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "old_node.height > 0 is checked first"
+        )]
         if old_node.height > 0
             && let Some(parent) = view.node(old_node.height - 1)
         {
             old_node = parent;
         }
-        i += 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i < nodes_to_traverse (at most 144 * 20 = 2880): the loop breaks at equality above"
+        )]
+        {
+            i += 1;
+        }
     }
 
     // Sum up the weighted window periods.
     let mut weighted_sum = BigInt::from(0);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt sum (Go big.Int.Add): arbitrary precision cannot overflow"
+    )]
     for change in &window_changes {
         weighted_sum += change;
     }
@@ -270,8 +312,18 @@ pub fn calc_next_blake256_diff(
     let weighted_sum_div = go_big_div(&weighted_sum, &weights_big);
 
     // Multiply by the old difficulty to get the new difficulty.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt product (Go big.Int.Mul): arbitrary precision cannot overflow"
+    )]
     let mut next_diff_big = weighted_sum_div * &old_diff_big;
-    next_diff_big >>= 32u32; // Remove padding
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt shift by the constant 32 (Go big.Int.Rsh, which also rounds toward negative infinity): arbitrary precision cannot overflow"
+    )]
+    {
+        next_diff_big >>= 32u32; // Remove padding
+    }
 
     // Check to see if we're over the limits for the maximum allowable
     // retarget; if we are, return the maximum or minimum except in the
@@ -320,8 +372,8 @@ pub fn calc_next_blake3_diff_from_anchor(
 ) -> u32 {
     // Calculate the time and height deltas as the difference between
     // the provided block and the anchor.
-    let time_delta = prev_node.timestamp - anchor.timestamp;
-    let height_delta = prev_node.height - anchor.height;
+    let time_delta = prev_node.timestamp.wrapping_sub(anchor.timestamp);
+    let height_delta = prev_node.height.wrapping_sub(anchor.height);
 
     let pow_limit = BigInt::from_bytes_be(Sign::Plus, &params.pow_limit.to_be_bytes());
     let mut next_diff = calc_asert_diff(
@@ -345,6 +397,10 @@ pub fn calc_next_blake3_diff_from_anchor(
 
 /// Combine the two adjustment factors into one difficulty per dcrd's
 /// 64.32 fixed point arithmetic (dcrd `mergeDifficulty`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "BigInt shifts by the constant 32 and a BigInt product (Go math/big): arbitrary precision cannot overflow"
+)]
 pub fn merge_difficulty(old_diff: i64, new_diff1: i64, new_diff2: i64) -> i64 {
     let new_diff1_big = BigInt::from(new_diff1);
     let mut new_diff2_big = BigInt::from(new_diff2);
@@ -355,14 +411,14 @@ pub fn merge_difficulty(old_diff: i64, new_diff1: i64, new_diff2: i64) -> i64 {
 
     // Divide the two changes; the result, in fixed point form, is in
     // the divisor.
-    let new_diff1_big = old_diff_big_lsh / new_diff1_big;
-    let new_diff2_big = new_diff2_big / &old_diff_big;
+    let new_diff1_big = go_big_div(&old_diff_big_lsh, &new_diff1_big);
+    let new_diff2_big = go_big_div(&new_diff2_big, &old_diff_big);
 
     // Precision multiply, then divide, then multiply by the original
     // difficulty and shed the padding.
     let mut summed_change = new_diff2_big;
     summed_change <<= 32u32;
-    summed_change /= new_diff1_big;
+    summed_change = go_big_div(&summed_change, &new_diff1_big);
     summed_change *= &old_diff_big;
     summed_change >>= 32u32;
 
@@ -371,11 +427,15 @@ pub fn merge_difficulty(old_diff: i64, new_diff1: i64, new_diff2: i64) -> i64 {
 
 /// Clamp a candidate next stake difficulty to the maximum retarget per
 /// dcrd's repeated pattern in `calcNextRequiredStakeDifficultyV1`.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "max_retarget is the chain parameter retarget_adjustment_factor (4 on every network, so max_retarget - 1 = 3 and old_diff / max_retarget divides by a positive constant); old_diff is nonzero because both callers return first when it is 0, and candidate is nonzero past the first arm; neither candidate / old_diff nor old_diff / candidate can be i64::MIN / -1: old_diff is at least minimum_stake_diff on any branch whose headers all passed the stake-difficulty check, and for an unchecked sbits (fast_add skips that check for assumed-valid ancestors) the callers derive every candidate as (W * old_diff) >> 32 with 0 < W < 2^58, or as merge_difficulty of two such clamped values, so old_diff = -1 gives |candidate| < 2^26 and old_diff = i64::MIN gives a multiple of 2^31, never -1"
+)]
 fn clamp_v1_retarget(old_diff: i64, candidate: i64, max_retarget: i64) -> i64 {
     if candidate == 0 {
         old_diff / max_retarget
     } else if candidate / old_diff > (max_retarget - 1) {
-        old_diff * max_retarget
+        old_diff.wrapping_mul(max_retarget)
     } else if old_diff / candidate > (max_retarget - 1) {
         old_diff / max_retarget
     } else {
@@ -392,9 +452,17 @@ pub fn calc_next_required_stake_difficulty_v1(
     params: &Params,
 ) -> i64 {
     let alpha = params.stake_diff_alpha;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "coinbase_maturity is a u16, so this is at most 65536"
+    )]
     let stake_diff_start_height = i64::from(params.coinbase_maturity) + 1;
     let max_retarget = params.retarget_adjustment_factor;
     let ticket_pool_weight = i64::from(params.ticket_pool_size_weight);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "chain parameters: 144 * 20 = 2880 on mainnet and testnet3, 8 * 8 on simnet and regnet"
+    )]
     let nodes_to_traverse = params.stake_diff_window_size * params.stake_diff_windows;
 
     // Number of nodes to traverse while calculating difficulty.
@@ -408,11 +476,19 @@ pub fn calc_next_required_stake_difficulty_v1(
     // Get the old difficulty; if we aren't at a block height where it
     // changes, just return this.
     let old_diff = cur_node.sbits;
-    if (cur_node.height + 1) % params.stake_diff_window_size != 0 {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "stake_diff_window_size is a positive chain parameter (144 or 8), never 0 or -1"
+    )]
+    if cur_node.height.wrapping_add(1) % params.stake_diff_window_size != 0 {
         return old_diff;
     }
 
     // The target size of the ticketPool in live tickets.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "product of two u16 chain parameters, below 2^32"
+    )]
     let target_for_ticket_pool =
         i64::from(params.tickets_per_block) * i64::from(params.ticket_pool_size);
 
@@ -429,6 +505,10 @@ pub fn calc_next_required_stake_difficulty_v1(
     loop {
         // Store and reset after reaching the end of every window
         // period.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "window bookkeeping bounded by the chain parameters: i + 1 <= nodes_to_traverse (at most 144 * 20 = 2880) over a positive stake_diff_window_size (144 or 8), never 0 or -1; pool_size_skew is below 2^49 (a u32 pool size less a target below 2^32, times the u16 weight, plus the target); the BigInt division has a numerator of at least 1 << 32, so truncation equals Go's Euclidean big.Int.Div, over the positive tickets_per_block * ticket_pool_size; window_period < stake_diff_windows, so each shift is at most 20 * 1 = 20 < 64, weights stays below 2^21 and window_period ends at most 20; the BigInt shifts cannot overflow"
+        )]
         if (i + 1) % params.stake_diff_window_size == 0 {
             let mut pool_size_skew = (i64::from(old_node.pool_size) - target_for_ticket_pool)
                 * ticket_pool_weight
@@ -456,22 +536,40 @@ pub fn calc_next_required_stake_difficulty_v1(
             window_period += 1;
         }
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i < nodes_to_traverse (at most 144 * 20 = 2880) until this breaks"
+        )]
         if (i + 1) == nodes_to_traverse {
             break; // Exit for loop when we hit the end.
         }
 
         // Get the previous node while staying at the genesis block as
         // needed.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "old_node.height > 0 is checked first"
+        )]
         if old_node.height > 0
             && let Some(parent) = view.node(old_node.height - 1)
         {
             old_node = parent;
         }
-        i += 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i < nodes_to_traverse (at most 144 * 20 = 2880): the loop breaks at equality above"
+        )]
+        {
+            i += 1;
+        }
     }
 
     // Sum up the weighted window periods.
     let mut weighted_sum = BigInt::from(0);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt sum (Go big.Int.Add): arbitrary precision cannot overflow"
+    )]
     for change in &window_changes {
         weighted_sum += change;
     }
@@ -479,9 +577,23 @@ pub fn calc_next_required_stake_difficulty_v1(
     // Divide by the sum of all weights, multiply by the old stake
     // difficulty, and shed the padding.
     let weights_big = BigInt::from(weights as i64);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt division: weighted_sum sums non-negative window changes, so truncating / equals Go's Euclidean big.Int.Div, and weights is a nonzero sum of powers of two"
+    )]
     let weighted_sum_div = weighted_sum / weights_big;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt product (Go big.Int.Mul): arbitrary precision cannot overflow"
+    )]
     let mut next_diff_big = weighted_sum_div * BigInt::from(old_diff);
-    next_diff_big >>= 32u32;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt shift by the constant 32 (Go big.Int.Rsh): arbitrary precision cannot overflow"
+    )]
+    {
+        next_diff_big >>= 32u32;
+    }
     let next_diff_ticket_pool = lossy_i64(&next_diff_big);
 
     // Check to see if we're over the limits for the maximum allowable
@@ -494,6 +606,10 @@ pub fn calc_next_required_stake_difficulty_v1(
 
     // The target number of new SStx per block for any given window
     // period.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "chain parameters: 144 * 5 = 720 on mainnet and testnet3, 8 * 5 on simnet and regnet"
+    )]
     let target_for_window = params.stake_diff_window_size * i64::from(params.tickets_per_block);
 
     // Regress through all of the previous blocks and store the percent
@@ -505,10 +621,20 @@ pub fn calc_next_required_stake_difficulty_v1(
     let mut i: i64 = 0;
     loop {
         // Add the fresh stake into the store for this window period.
-        window_fresh_stake += i64::from(old_node.fresh_stake);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "reset every window, so at most stake_diff_window_size * u8::MAX = 144 * 255 before the reset"
+        )]
+        {
+            window_fresh_stake += i64::from(old_node.fresh_stake);
+        }
 
         // Store and reset after reaching the end of every window
         // period.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "window bookkeeping bounded by the chain parameters: i + 1 <= nodes_to_traverse (at most 144 * 20 = 2880) over a positive stake_diff_window_size (144 or 8), never 0 or -1; the BigInt division has a numerator of at least 1 << 32, so truncation equals Go's Euclidean big.Int.Div, over the positive stake_diff_window_size * tickets_per_block; window_period < stake_diff_windows, so each shift is at most 20 * 1 = 20 < 64, weights stays below 2^21 and window_period ends at most 20; the BigInt shifts cannot overflow"
+        )]
         if (i + 1) % params.stake_diff_window_size == 0 {
             // Watch for divide by zero.
             if window_fresh_stake <= 0 {
@@ -533,22 +659,40 @@ pub fn calc_next_required_stake_difficulty_v1(
             window_period += 1;
         }
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i < nodes_to_traverse (at most 144 * 20 = 2880) until this breaks"
+        )]
         if (i + 1) == nodes_to_traverse {
             break; // Exit for loop when we hit the end.
         }
 
         // Get the previous node while staying at the genesis block as
         // needed.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "old_node.height > 0 is checked first"
+        )]
         if old_node.height > 0
             && let Some(parent) = view.node(old_node.height - 1)
         {
             old_node = parent;
         }
-        i += 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i < nodes_to_traverse (at most 144 * 20 = 2880): the loop breaks at equality above"
+        )]
+        {
+            i += 1;
+        }
     }
 
     // Sum up the weighted window periods.
     let mut weighted_sum = BigInt::from(0);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt sum (Go big.Int.Add): arbitrary precision cannot overflow"
+    )]
     for change in &window_changes {
         weighted_sum += change;
     }
@@ -556,9 +700,23 @@ pub fn calc_next_required_stake_difficulty_v1(
     // Divide by the sum of all weights, multiply by the old stake
     // difficulty, and shed the padding.
     let weights_big = BigInt::from(weights as i64);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt division: weighted_sum sums non-negative window changes, so truncating / equals Go's Euclidean big.Int.Div, and weights is a nonzero sum of powers of two"
+    )]
     let weighted_sum_div = weighted_sum / weights_big;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt product (Go big.Int.Mul): arbitrary precision cannot overflow"
+    )]
     let mut next_diff_big = weighted_sum_div * BigInt::from(old_diff);
-    next_diff_big >>= 32u32;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt shift by the constant 32 (Go big.Int.Rsh): arbitrary precision cannot overflow"
+    )]
+    {
+        next_diff_big >>= 32u32;
+    }
     let next_diff_fresh_stake = lossy_i64(&next_diff_big);
 
     // Check to see if we're over the limits for the maximum allowable
@@ -582,6 +740,10 @@ pub fn calc_next_required_stake_difficulty_v1(
 
 /// A close estimate of the coin supply at the given height (dcrd
 /// `estimateSupply`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "subsidy_reduction_interval and div_subsidy are positive chain parameters, and subsidy only shrinks from base_subsidy (x100/101 per interval), so each term is at most subsidy_reduction_interval * base_subsidy < 2^45, subsidy * mul_subsidy < 2^43, and supply stays below block_one_subsidy + interval * base_subsidy * 101 < 2^52 on every network"
+)]
 pub fn estimate_supply(params: &Params, height: i64) -> i64 {
     if height <= 0 {
         return 0;
@@ -622,11 +784,15 @@ pub fn sum_purchased_tickets(
     };
     let mut num_purchased: i64 = 0;
     let mut num_traversed: i64 = 0;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "height >= 1 at the decrement (view.node yields no negative height and 0 breaks first) and num_traversed < num_to_sum by the loop condition"
+    )]
     while num_traversed < num_to_sum {
         let Some(node) = view.node(height) else {
             break;
         };
-        num_purchased += i64::from(node.fresh_stake);
+        num_purchased = num_purchased.wrapping_add(i64::from(node.fresh_stake));
         if height == 0 {
             break;
         }
@@ -654,19 +820,33 @@ pub fn calc_next_stake_diff_v2(
     // with two ratios that represent a force to counteract the relative
     // change in the pool size (Fc) and a restorative force to push the
     // pool size towards the target value (Fr).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "u16 chain parameters: at most 65535 * (65535 + 65535) < 2^33"
+    )]
     let target_pool_size_all = votes_per_block * (ticket_pool_size + ticket_maturity);
     let cur_pool_size_all_big = BigInt::from(cur_pool_size_all);
     let mut next_diff_big = BigInt::from(cur_diff);
-    next_diff_big *= &cur_pool_size_all_big;
-    next_diff_big *= &cur_pool_size_all_big;
-    next_diff_big /= BigInt::from(prev_pool_size_all);
-    next_diff_big /= BigInt::from(target_pool_size_all);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt products (Go big.Int.Mul): arbitrary precision cannot overflow"
+    )]
+    {
+        next_diff_big *= &cur_pool_size_all_big;
+        next_diff_big *= &cur_pool_size_all_big;
+    }
+    next_diff_big = go_big_div(&next_diff_big, &BigInt::from(prev_pool_size_all));
+    next_diff_big = go_big_div(&next_diff_big, &BigInt::from(target_pool_size_all));
 
     // Limit the new stake difficulty between the minimum allowed stake
     // difficulty and a maximum value that is relative to the total
     // supply.
     let mut next_diff = lossy_i64(&next_diff_big);
     let estimated_supply = estimate_supply(params, next_height);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "ticket_pool_size is a positive u16 chain parameter (8192, 1024 or 64), never 0 or -1"
+    )]
     let maximum_stake_diff = estimated_supply / ticket_pool_size;
     if next_diff > maximum_stake_diff {
         next_diff = maximum_stake_diff;
@@ -688,9 +868,13 @@ pub fn calc_next_required_stake_difficulty_v2(
     // Stake difficulty before any tickets could possibly be purchased
     // is the minimum value.
     let next_height = match cur_node {
-        Some(node) => node.height + 1,
+        Some(node) => node.height.wrapping_add(1),
         None => 0,
     };
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "coinbase_maturity is a u16, so this is at most 65536"
+    )]
     let stake_diff_start_height = i64::from(params.coinbase_maturity) + 1;
     if next_height < stake_diff_start_height {
         return params.minimum_stake_diff;
@@ -701,6 +885,10 @@ pub fn calc_next_required_stake_difficulty_v2(
     // block is not at a difficulty retarget interval.
     let interval_size = params.stake_diff_window_size;
     let cur_diff = cur_node.sbits;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "stake_diff_window_size is a positive chain parameter (144 or 8), never 0 or -1"
+    )]
     if next_height % interval_size != 0 {
         return cur_diff;
     }
@@ -708,6 +896,10 @@ pub fn calc_next_required_stake_difficulty_v2(
     // Get the pool size and number of tickets that were immature at the
     // previous retarget interval.
     let mut prev_pool_size: i64 = 0;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "next_height >= stake_diff_start_height >= 1 past the return above and interval_size is 144 or 8, so this is at least -interval_size"
+    )]
     let prev_retarget_height = next_height - interval_size - 1;
     let prev_retarget_node = if prev_retarget_height >= 0 {
         view.node(prev_retarget_height)
@@ -723,6 +915,10 @@ pub fn calc_next_required_stake_difficulty_v2(
 
     // Return the existing ticket price for the first few intervals to
     // avoid division by zero and encourage initial pool population.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a u32 pool size plus the u8 fresh stake of at most ticket_maturity (a u16) blocks, below 2^33"
+    )]
     let prev_pool_size_all = prev_pool_size + prev_immature_tickets;
     if prev_pool_size_all == 0 {
         return cur_diff;
@@ -732,6 +928,10 @@ pub fn calc_next_required_stake_difficulty_v2(
     let immature_tickets = sum_purchased_tickets(view, Some(cur_node.height), ticket_maturity);
 
     // Calculate and return the final next required difficulty.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a u32 pool size plus the u8 fresh stake of at most ticket_maturity (a u16) blocks, below 2^33"
+    )]
     let cur_pool_size_all = i64::from(cur_node.pool_size) + immature_tickets;
     calc_next_stake_diff_v2(
         params,
@@ -754,6 +954,10 @@ struct OverlayView<'a, V: ChainView> {
 impl<V: ChainView> ChainView for OverlayView<'_, V> {
     fn node(&self, height: i64) -> Option<DiffNode> {
         if height > self.base_height {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "height > base_height >= stake_diff_start_height >= 1 (its one constructor runs past that check), so the difference is in 1..=i64::MAX and the decrement stays non-negative"
+            )]
             let idx = usize::try_from(height - self.base_height - 1).ok()?;
             return self.overlay.get(idx).copied();
         }
@@ -773,11 +977,19 @@ pub fn estimate_next_stake_difficulty_v1(
     params: &Params,
 ) -> Result<i64, String> {
     let alpha = params.stake_diff_alpha;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "coinbase_maturity is a u16, so this is at most 65536"
+    )]
     let stake_diff_start_height = i64::from(params.coinbase_maturity) + 1;
     let max_retarget = params.retarget_adjustment_factor;
     let ticket_pool_weight = i64::from(params.ticket_pool_size_weight);
 
     // Number of nodes to traverse while calculating difficulty.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "chain parameters: 144 * 20 = 2880 on mainnet and testnet3, 8 * 8 on simnet and regnet"
+    )]
     let nodes_to_traverse = params.stake_diff_window_size * params.stake_diff_windows;
 
     // Genesis block. Block at height 1 has these parameters.
@@ -794,7 +1006,11 @@ pub fn estimate_next_stake_difficulty_v1(
     let old_diff = cur_node.sbits;
     let mut tickets_in_window = tickets_in_window;
     let mut fakes: Vec<DiffNode> = Vec::new();
-    if (cur_node.height + 1) % params.stake_diff_window_size != 0 {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "stake_diff_window_size is a positive chain parameter (144 or 8), never 0 or -1; cur_node.height is in stake_diff_start_height..=u32::MAX (a u32 header field), so next_adj_height is at most u32::MAX + 144, next_adj_height - cur_node.height is in 1..=144 and max_tickets is at most 144 * u8::MAX; the height range starts at most at u32::MAX + 1; the subtraction arm runs only when tickets_to_insert >= max_fresh_stake_per_block >= 0"
+    )]
+    if cur_node.height.wrapping_add(1) % params.stake_diff_window_size != 0 {
         let next_adj_height =
             (cur_node.height / params.stake_diff_window_size + 1) * params.stake_diff_window_size;
         let max_tickets =
@@ -849,6 +1065,10 @@ pub fn estimate_next_stake_difficulty_v1(
     };
 
     // The target size of the ticketPool in live tickets.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "product of two u16 chain parameters, below 2^32"
+    )]
     let target_for_ticket_pool =
         i64::from(params.tickets_per_block) * i64::from(params.ticket_pool_size);
 
@@ -865,6 +1085,10 @@ pub fn estimate_next_stake_difficulty_v1(
     loop {
         // Store and reset after reaching the end of every window
         // period.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "window bookkeeping bounded by the chain parameters: i + 1 <= nodes_to_traverse (at most 144 * 20 = 2880) over a positive stake_diff_window_size (144 or 8), never 0 or -1; pool_size_skew is below 2^49 (a u32 pool size less a target below 2^32, times the u16 weight, plus the target); the BigInt division has a numerator of at least 1 << 32, so truncation equals Go's Euclidean big.Int.Div, over the positive tickets_per_block * ticket_pool_size; window_period < stake_diff_windows, so each shift is at most 20 * 1 = 20 < 64, weights stays below 2^21 and window_period ends at most 20; the BigInt shifts cannot overflow"
+        )]
         if (i + 1) % params.stake_diff_window_size == 0 {
             let mut pool_size_skew = (i64::from(old_node.pool_size) - target_for_ticket_pool)
                 * ticket_pool_weight
@@ -892,22 +1116,40 @@ pub fn estimate_next_stake_difficulty_v1(
             window_period += 1;
         }
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i < nodes_to_traverse (at most 144 * 20 = 2880) until this breaks"
+        )]
         if (i + 1) == nodes_to_traverse {
             break; // Exit for loop when we hit the end.
         }
 
         // Get the previous node while staying at the genesis block as
         // needed.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "old_node.height > 0 is checked first"
+        )]
         if old_node.height > 0
             && let Some(parent) = est_view.node(old_node.height - 1)
         {
             old_node = parent;
         }
-        i += 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i < nodes_to_traverse (at most 144 * 20 = 2880): the loop breaks at equality above"
+        )]
+        {
+            i += 1;
+        }
     }
 
     // Sum up the weighted window periods.
     let mut weighted_sum = BigInt::from(0);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt sum (Go big.Int.Add): arbitrary precision cannot overflow"
+    )]
     for change in &window_changes {
         weighted_sum += change;
     }
@@ -915,9 +1157,23 @@ pub fn estimate_next_stake_difficulty_v1(
     // Divide by the sum of all weights, multiply by the old stake
     // difficulty, and shed the padding.
     let weights_big = BigInt::from(weights as i64);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt division: weighted_sum sums non-negative window changes, so truncating / equals Go's Euclidean big.Int.Div, and weights is a nonzero sum of powers of two"
+    )]
     let weighted_sum_div = weighted_sum / weights_big;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt product (Go big.Int.Mul): arbitrary precision cannot overflow"
+    )]
     let mut next_diff_big = weighted_sum_div * BigInt::from(old_diff);
-    next_diff_big >>= 32u32;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt shift by the constant 32 (Go big.Int.Rsh): arbitrary precision cannot overflow"
+    )]
+    {
+        next_diff_big >>= 32u32;
+    }
     let next_diff_ticket_pool = lossy_i64(&next_diff_big);
 
     // Check to see if we're over the limits for the maximum allowable
@@ -930,6 +1186,10 @@ pub fn estimate_next_stake_difficulty_v1(
 
     // The target number of new SStx per block for any given window
     // period.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "chain parameters: 144 * 5 = 720 on mainnet and testnet3, 8 * 5 on simnet and regnet"
+    )]
     let target_for_window = params.stake_diff_window_size * i64::from(params.tickets_per_block);
 
     // Regress through all of the previous blocks and store the percent
@@ -941,10 +1201,20 @@ pub fn estimate_next_stake_difficulty_v1(
     let mut i: i64 = 0;
     loop {
         // Add the fresh stake into the store for this window period.
-        window_fresh_stake += i64::from(old_node.fresh_stake);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "reset every window, so at most stake_diff_window_size * u8::MAX = 144 * 255 before the reset"
+        )]
+        {
+            window_fresh_stake += i64::from(old_node.fresh_stake);
+        }
 
         // Store and reset after reaching the end of every window
         // period.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "window bookkeeping bounded by the chain parameters: i + 1 <= nodes_to_traverse (at most 144 * 20 = 2880) over a positive stake_diff_window_size (144 or 8), never 0 or -1; the BigInt division has a numerator of at least 1 << 32, so truncation equals Go's Euclidean big.Int.Div, over the positive stake_diff_window_size * tickets_per_block; window_period < stake_diff_windows, so each shift is at most 20 * 1 = 20 < 64, weights stays below 2^21 and window_period ends at most 20; the BigInt shifts cannot overflow"
+        )]
         if (i + 1) % params.stake_diff_window_size == 0 {
             // Watch for divide by zero.
             if window_fresh_stake <= 0 {
@@ -969,22 +1239,40 @@ pub fn estimate_next_stake_difficulty_v1(
             window_period += 1;
         }
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i < nodes_to_traverse (at most 144 * 20 = 2880) until this breaks"
+        )]
         if (i + 1) == nodes_to_traverse {
             break; // Exit for loop when we hit the end.
         }
 
         // Get the previous node while staying at the genesis block as
         // needed.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "old_node.height > 0 is checked first"
+        )]
         if old_node.height > 0
             && let Some(parent) = est_view.node(old_node.height - 1)
         {
             old_node = parent;
         }
-        i += 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i < nodes_to_traverse (at most 144 * 20 = 2880): the loop breaks at equality above"
+        )]
+        {
+            i += 1;
+        }
     }
 
     // Sum up the weighted window periods.
     let mut weighted_sum = BigInt::from(0);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt sum (Go big.Int.Add): arbitrary precision cannot overflow"
+    )]
     for change in &window_changes {
         weighted_sum += change;
     }
@@ -992,9 +1280,23 @@ pub fn estimate_next_stake_difficulty_v1(
     // Divide by the sum of all weights, multiply by the old stake
     // difficulty, and shed the padding.
     let weights_big = BigInt::from(weights as i64);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt division: weighted_sum sums non-negative window changes, so truncating / equals Go's Euclidean big.Int.Div, and weights is a nonzero sum of powers of two"
+    )]
     let weighted_sum_div = weighted_sum / weights_big;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt product (Go big.Int.Mul): arbitrary precision cannot overflow"
+    )]
     let mut next_diff_big = weighted_sum_div * BigInt::from(old_diff);
-    next_diff_big >>= 32u32;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt shift by the constant 32 (Go big.Int.Rsh): arbitrary precision cannot overflow"
+    )]
+    {
+        next_diff_big >>= 32u32;
+    }
     let next_diff_fresh_stake = lossy_i64(&next_diff_big);
 
     // Check to see if we're over the limits for the maximum allowable
@@ -1031,7 +1333,15 @@ pub fn estimate_next_stake_difficulty_v2(
     let cur_height = cur_node.map_or(0, |n| n.height);
     let ticket_maturity = i64::from(params.ticket_maturity);
     let interval_size = params.stake_diff_window_size;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "interval_size is a positive chain parameter (144 or 8), never 0 or -1, and cur_height is 0 or a node height, so the remainder is in 0..interval_size and this is in 1..=interval_size"
+    )]
     let blocks_until_retarget = interval_size - cur_height % interval_size;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "cur_height is 0 or a node height, at most u32::MAX (a u32 header field), and blocks_until_retarget is at most 144"
+    )]
     let next_retarget_height = cur_height + blocks_until_retarget;
 
     // Calculate the maximum possible number of tickets that could be
@@ -1039,6 +1349,10 @@ pub fn estimate_next_stake_difficulty_v2(
     // the number of new tickets to include in the estimate per the
     // user-specified flag.
     let max_tickets_per_block = i64::from(params.max_fresh_stake_per_block);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "blocks_until_retarget is in 1..=interval_size, so at most 143 * u8::MAX"
+    )]
     let max_remaining_tickets = (blocks_until_retarget - 1) * max_tickets_per_block;
     let mut new_tickets = new_tickets;
     if use_max_tickets {
@@ -1056,6 +1370,10 @@ pub fn estimate_next_stake_difficulty_v2(
 
     // Stake difficulty before any tickets could possibly be purchased
     // is the minimum value.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "coinbase_maturity is a u16, so this is at most 65536"
+    )]
     let stake_diff_start_height = i64::from(params.coinbase_maturity) + 1;
     if next_retarget_height < stake_diff_start_height {
         return Ok(params.minimum_stake_diff);
@@ -1071,6 +1389,10 @@ pub fn estimate_next_stake_difficulty_v2(
     // interval must be retrieved relative to the block just before it
     // to coincide with how it was originally calculated.
     let mut prev_pool_size: i64 = 0;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "next_retarget_height is in 1..=u32::MAX + 144 and interval_size is 144 or 8"
+    )]
     let prev_retarget_height = next_retarget_height - interval_size - 1;
     let prev_retarget_node = view.node(prev_retarget_height);
     if let Some(node) = &prev_retarget_node {
@@ -1082,6 +1404,10 @@ pub fn estimate_next_stake_difficulty_v2(
     // Return the existing ticket price for the first few intervals to
     // avoid division by zero and encourage initial pool population.
     let cur_diff = cur_node.sbits;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a u32 pool size plus the u8 fresh stake of at most ticket_maturity (a u16) blocks, below 2^33"
+    )]
     let prev_pool_size_all = prev_pool_size + prev_immature_tickets;
     if prev_pool_size_all == 0 {
         return Ok(cur_diff);
@@ -1097,7 +1423,15 @@ pub fn estimate_next_stake_difficulty_v2(
     // tickets from the blocks that are not being estimated in that
     // case.
     let mut remaining_immature_tickets: i64 = 0;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "next_retarget_height is in 1..=u32::MAX + 144 and ticket_maturity is a u16"
+    )]
     let next_maturity_floor = next_retarget_height - ticket_maturity - 1;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "cur_height > next_maturity_floor = cur_height + blocks_until_retarget - ticket_maturity - 1, so the difference is in 1..=ticket_maturity"
+    )]
     if cur_height > next_maturity_floor {
         remaining_immature_tickets = sum_purchased_tickets(
             view,
@@ -1108,11 +1442,21 @@ pub fn estimate_next_stake_difficulty_v2(
 
     // Add the number of tickets that will still be immature at the
     // next retarget based on the estimated data.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "u16 * u8 chain parameters, below 2^24"
+    )]
     let max_immature_tickets = ticket_maturity * max_tickets_per_block;
     if new_tickets > max_immature_tickets {
-        remaining_immature_tickets += max_immature_tickets;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the fresh stake of at most ticket_maturity blocks (below 2^24) plus max_immature_tickets (below 2^24)"
+        )]
+        {
+            remaining_immature_tickets += max_immature_tickets;
+        }
     } else {
-        remaining_immature_tickets += new_tickets;
+        remaining_immature_tickets = remaining_immature_tickets.wrapping_add(new_tickets);
     }
 
     // Calculate the number of tickets that will mature in the
@@ -1123,12 +1467,24 @@ pub fn estimate_next_stake_difficulty_v2(
     // tickets maturing at the height in which they mature since they
     // are not eligible for selection until the next block, so exclude
     // them by starting one block before the next maturity floor.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "next_maturity_floor >= 1 - 65535 - 1 (next_retarget_height >= 1, ticket_maturity a u16)"
+    )]
     let mut final_maturing_height = next_maturity_floor - 1;
     if final_maturing_height > cur_height {
         final_maturing_height = cur_height;
     }
     let final_maturing_node = view.node(final_maturing_height);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "cur_height >= 0 and ticket_maturity is a u16"
+    )]
     let first_maturing_height = cur_height - ticket_maturity;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "final_maturing_height is min(next_maturity_floor - 1, cur_height) and next_maturity_floor - 1 >= cur_height - ticket_maturity - 1, so it is in first_maturing_height - 1..=first_maturing_height + ticket_maturity and this is in 0..=ticket_maturity + 1"
+    )]
     let mut maturing_tickets = sum_purchased_tickets(
         view,
         final_maturing_node.map(|n| n.height),
@@ -1143,18 +1499,30 @@ pub fn estimate_next_stake_difficulty_v2(
     // maturity floor.  There are therefore no possible maturing
     // estimated tickets in that case.
     if cur_height < next_maturity_floor {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "cur_height < next_maturity_floor <= cur_height + interval_size - 1, so this is in 0..interval_size"
+        )]
         let maturing_estimate_nodes = next_maturity_floor - cur_height - 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "maturing_estimate_nodes is in 0..interval_size, so at most 143 * u8::MAX"
+        )]
         let mut maturing_estimated_tickets = max_tickets_per_block * maturing_estimate_nodes;
         if maturing_estimated_tickets > new_tickets {
             maturing_estimated_tickets = new_tickets;
         }
-        maturing_tickets += maturing_estimated_tickets;
+        maturing_tickets = maturing_tickets.wrapping_add(maturing_estimated_tickets);
     }
 
     // Calculate the number of votes that will occur during the
     // remainder of the interval.
     let stake_validation_height = params.stake_validation_height;
     let mut pending_votes: i64 = 0;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "blocks_until_retarget is in 1..=interval_size, and next_retarget_height > stake_validation_height > cur_height puts their difference in 1..blocks_until_retarget, so pending_votes is at most 144 * 65535"
+    )]
     if next_retarget_height > stake_validation_height {
         let mut voting_blocks = blocks_until_retarget - 1;
         if cur_height < stake_validation_height {
@@ -1166,8 +1534,10 @@ pub fn estimate_next_stake_difficulty_v2(
 
     // Calculate what the pool size would be as of the next interval.
     let cur_pool_size = i64::from(cur_node.pool_size);
-    let estimated_pool_size = cur_pool_size + maturing_tickets - pending_votes;
-    let estimated_pool_size_all = estimated_pool_size + remaining_immature_tickets;
+    let estimated_pool_size = cur_pool_size
+        .wrapping_add(maturing_tickets)
+        .wrapping_sub(pending_votes);
+    let estimated_pool_size_all = estimated_pool_size.wrapping_add(remaining_immature_tickets);
 
     // Calculate and return the final estimated difficulty.
     Ok(calc_next_stake_diff_v2(
@@ -1195,10 +1565,14 @@ pub fn estimate_next_stake_difficulty_v2(
 /// both rules appear in the same codebase, each where it is meant.
 ///
 /// The file's other divisions keep `/`: their numerators are provably
-/// non-negative.  `merge_difficulty` divides shifted positive
-/// difficulties, the stake algorithms clamp their pool-size skew to at
+/// non-negative.  The stake algorithms clamp their pool-size skew to at
 /// least 1 before dividing, and the stake EMA sums those clamped terms.
-/// `validate::calc_ticket_return_amounts` divides with this too.
+/// `merge_difficulty`, `calc_next_stake_diff_v2` and
+/// `validate::calc_ticket_return_amounts` divide with this too.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "BigInt quotient, remainder and unit step (Go math/big): arbitrary precision cannot overflow, and a zero divisor panics here as it does in Go's big.Int.Div"
+)]
 pub(crate) fn go_big_div(x: &BigInt, y: &BigInt) -> BigInt {
     let q = x / y;
     let r = x % y;
@@ -1248,5 +1622,57 @@ mod tests {
         // The retarget's own shape: a padded negative window time over
         // mainnet's target timespan.
         assert_eq!(d(-1i64 << 32, 43200), -99421, "truncation gives -99420");
+    }
+
+    /// dcrd's `mergeDifficulty` divides with `big.Int.Div` (Euclidean)
+    /// at all three of its divisions.  The expected values are dcrd's
+    /// own function run on these inputs; truncating `/` gives the
+    /// values in the messages.  A negative fresh-stake change reaches
+    /// the second division with a negative numerator, a negative old
+    /// difficulty reaches the first, and the third inherits either.
+    /// Positive inputs, the common case, agree under both rules, so the
+    /// last case pins that nothing moved there.
+    #[test]
+    fn merge_difficulty_divides_as_go() {
+        assert_eq!(
+            merge_difficulty(300000000, 1200000000, -75000001),
+            -300000005,
+            "truncation gives -300000004"
+        );
+        assert_eq!(
+            merge_difficulty(517465105, 1719199658, -464532170),
+            -1543337978,
+            "truncation gives -1543337977"
+        );
+        assert_eq!(
+            merge_difficulty(-95323850, 2210689492, 1018408203),
+            -23618268784,
+            "truncation gives -23618268911"
+        );
+        assert_eq!(merge_difficulty(200000000, 800000000, 50000000), 200000000);
+    }
+
+    /// dcrd's `calcNextStakeDiffV2` divides with `big.Int.Div`
+    /// (Euclidean) at both of its divisions.  The numerator carries the
+    /// sign of the current difficulty, so the rules part only for a
+    /// negative one (an sbits no stake-difficulty check vetted), and
+    /// the result shows it once `Int64` keeps the low 64 bits of a
+    /// quotient past 2^63, which lands this one inside the clamp range.
+    /// The expected values are dcrd's own function run on these inputs
+    /// with the mainnet parameters; truncating `/` gives the value in
+    /// the message.  The last case pins a positive difficulty, where
+    /// the two rules agree.
+    #[test]
+    fn calc_next_stake_diff_v2_divides_as_go() {
+        let params = dcroxide_chaincfg::mainnet_params();
+        assert_eq!(
+            calc_next_stake_diff_v2(&params, 1000000, -3546182403, 40960, 3000000000),
+            6257380983,
+            "truncation gives 6257380984"
+        );
+        assert_eq!(
+            calc_next_stake_diff_v2(&params, 1000000, 10000000000, 40960, 41500),
+            9954336917
+        );
     }
 }

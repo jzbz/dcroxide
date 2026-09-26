@@ -40,6 +40,10 @@ pub const UTXO_PREFIX_DB_INFO: [u8; 2] = [1, 0];
 
 /// The key for an outpoint in the UTXO set (dcrd `outpointKey`):
 /// prefix || hash || VLQ(tree) || VLQ(index).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the key is at most 2 + 32 + 10 + 10 bytes and offset stays within it"
+)]
 pub fn outpoint_key(outpoint: &OutPoint) -> Vec<u8> {
     let tree = outpoint.tree as u64;
     let idx = u64::from(outpoint.index);
@@ -61,6 +65,10 @@ pub fn outpoint_key(outpoint: &OutPoint) -> Vec<u8> {
 
 /// Decode an outpoint key back into an outpoint (dcrd
 /// `decodeOutpointKey`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offset is the 2-byte prefix and 32-byte hash, checked against serialized.len() above, plus bytes read from serialized, so offset <= serialized.len()"
+)]
 pub fn decode_outpoint_key(serialized: &[u8]) -> Result<OutPoint, Error> {
     if UTXO_PREFIX_UTXO_SET.len() + HASH_SIZE >= serialized.len() {
         return Err(deserialize_error(
@@ -93,6 +101,10 @@ pub fn decode_outpoint_key(serialized: &[u8]) -> Result<OutPoint, Error> {
 
 /// Serialize a UTXO entry for storage; a spent entry serializes to
 /// `None` (dcrd `serializeUtxoEntry`, which returns nil).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "size is at most 5 + 5 + 2 VLQ bytes plus compressed_tx_out_size (at most pk_script.len() + 23) plus the ticket outputs length, all lengths of live buffers; offset counts bytes written into serialized, so offset <= serialized.len()"
+)]
 pub fn serialize_utxo_entry(entry: &UtxoEntry) -> Option<Vec<u8>> {
     // Spent outputs have no serialization.
     if entry.is_spent() {
@@ -154,7 +166,11 @@ pub fn read_deserialize_size_of_minimal_outputs(serialized: &[u8]) -> Result<usi
         ));
     }
 
-    for _ in 0..num_outputs {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "offset <= serialized.len(): each step adds bytes read from serialized[offset..] or a script size checked against its length"
+    )]
+    for _ in 0..num_outputs as i64 {
         // Amount.
         let (_, bytes_read) = deserialize_vlq(&serialized[offset..]);
         if bytes_read == 0 {
@@ -195,6 +211,10 @@ pub fn read_deserialize_size_of_minimal_outputs(serialized: &[u8]) -> Result<usi
 /// Decode a UTXO entry from its serialized form; the output index of
 /// the outpoint the entry belongs to determines whether a ticket
 /// minimal outputs tail is expected (dcrd `deserializeUtxoEntry`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offset counts bytes read from serialized, so offset <= serialized.len(), and sz is at most serialized[offset..].len()"
+)]
 pub fn deserialize_utxo_entry(serialized: &[u8], tx_out_index: u32) -> Result<UtxoEntry, Error> {
     // Deserialize the block height.
     let (block_height, bytes_read) = deserialize_vlq(serialized);
@@ -271,6 +291,10 @@ pub struct UtxoSetState {
 /// Serialize the UTXO set state (dcrd `serializeUtxoSetState`):
 /// VLQ(height) || hash.
 pub fn serialize_utxo_set_state(state: &UtxoSetState) -> Vec<u8> {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a u32 VLQ is at most 5 bytes, plus the 32-byte hash"
+    )]
     let size = serialize_size_vlq(u64::from(state.last_flush_height)) + HASH_SIZE;
     let mut serialized = vec![0u8; size];
     let offset = put_vlq(&mut serialized, u64::from(state.last_flush_height));
@@ -292,10 +316,41 @@ pub fn deserialize_utxo_set_state(serialized: &[u8]) -> Result<UtxoSetState, Err
         return Err(deserialize_error("unexpected length for serialized hash"));
     }
     let mut hash = [0u8; HASH_SIZE];
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "serialized[offset..].len() == HASH_SIZE was checked above, so offset + HASH_SIZE == serialized.len()"
+    )]
     hash.copy_from_slice(&serialized[offset..offset + HASH_SIZE]);
 
     Ok(UtxoSetState {
         last_flush_height: block_height as u32,
         last_flush_hash: Hash(hash),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// dcrd loops `i < int(numOutputs)`, so a stored output count of 2^63
+    /// or more converts to a negative `int` and no outputs are read: the
+    /// size is just the count's VLQ, and the entry keeps that tail.
+    #[test]
+    fn minimal_outputs_count_above_i64_max_reads_no_outputs() {
+        for count in [1u64 << 63, u64::MAX] {
+            let mut tail = vec![0u8; serialize_size_vlq(count)];
+            let n = put_vlq(&mut tail, count);
+            assert_eq!(read_deserialize_size_of_minimal_outputs(&tail), Ok(n));
+
+            // Height 0, index 0, ticket purchase flags, a zero amount,
+            // script version 0 and an empty general-format script.
+            let mut row = vec![0x00, 0x00, 0x04, 0x00, 0x00, 0x40];
+            row.extend_from_slice(&tail);
+            let entry = deserialize_utxo_entry(&row, 0).expect("decodes like dcrd");
+            assert_eq!(entry.ticket_min_outs, Some(tail));
+        }
+
+        // A count below 2^63 still reads its outputs.
+        assert!(read_deserialize_size_of_minimal_outputs(&[0x01]).is_err());
+    }
 }

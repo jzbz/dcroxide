@@ -82,6 +82,10 @@ fn abs_i64(v: i64) -> u64 {
 }
 
 /// Serialize a treasury state row (dcrd `serializeTreasuryState`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "size is at most 20 + 11 bytes per value, and a Vec of 16-byte TreasuryValue holds at most isize::MAX / 16 of them; offset counts bytes written into serialized, so offset <= serialized.len()"
+)]
 pub fn serialize_treasury_state(ts: &TreasuryState) -> Result<Vec<u8>, String> {
     if ts.balance < 0 {
         return Err(format!("invalid treasury balance: {}", ts.balance));
@@ -117,6 +121,10 @@ pub fn serialize_treasury_state(ts: &TreasuryState) -> Result<Vec<u8>, String> {
 
 /// Deserialize a treasury state row (dcrd
 /// `deserializeTreasuryState`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offset counts bytes read from data, so offset <= data.len()"
+)]
 pub fn deserialize_treasury_state(data: &[u8]) -> Result<TreasuryState, String> {
     let (balance, mut offset) = deserialize_vlq(data);
     if offset == 0 {
@@ -168,6 +176,10 @@ pub fn deserialize_treasury_state(data: &[u8]) -> Result<TreasuryState, String> 
 /// Serialize a treasury spend blocks row (dcrd `serializeTSpend`):
 /// a little-endian count followed by the block hashes.
 pub fn serialize_tspend(blocks: &[Hash]) -> Vec<u8> {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a slice of 32-byte hashes spans at most isize::MAX bytes, so 8 + blocks.len() * 32 fits usize"
+    )]
     let mut out = Vec::with_capacity(8 + blocks.len() * 32);
     out.extend_from_slice(&(blocks.len() as i64).to_le_bytes());
     for hash in blocks {
@@ -193,10 +205,18 @@ pub fn deserialize_tspend(data: &[u8]) -> Result<Vec<Hash>, String> {
     // Bound the reservation by the hashes the row can hold, so a
     // corrupt count reaches the per-index error below rather than
     // aborting on the allocation.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "data.len() >= 8 was checked above"
+    )]
     let max_hashes = (data.len() - 8) / 32;
     let mut hashes =
         Vec::with_capacity(usize::try_from(count).map_or(max_hashes, |n| n.min(max_hashes)));
     let mut offset = 8usize;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "offset starts at 8 <= data.len() and advances by 32 only after offset + 32 <= data.len(), so offset + 32 cannot overflow"
+    )]
     for i in 0..count {
         if offset + 32 > data.len() {
             return Err(format!("failed to read idx {i}"));
@@ -301,15 +321,15 @@ pub fn treasury_state_for_block(block: &MsgBlock, balance: i64) -> TreasuryState
             for out in &stx.tx_out[1..] {
                 ts.values.push(TreasuryValue {
                     typ: TreasuryValueType::TSpend,
-                    amount: -out.value,
+                    amount: out.value.wrapping_neg(),
                 });
-                total_out += out.value;
+                total_out = total_out.wrapping_add(out.value);
             }
             // Fees are stored as negative amounts, so calculate
             // backwards from the usual in minus out.
             ts.values.push(TreasuryValue {
                 typ: TreasuryValueType::Fee,
-                amount: total_out - stx.tx_in[0].value_in,
+                amount: total_out.wrapping_sub(stx.tx_in[0].value_in),
             });
         }
     }

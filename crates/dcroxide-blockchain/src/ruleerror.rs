@@ -462,6 +462,10 @@ pub fn render_multi_error(errs: &[RuleError]) -> String {
         out.push_str(&err.description);
         out.push('\n');
     }
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "errs.len() > MAX_ERRS is checked, so errs.len() - MAX_ERRS >= 1"
+    )]
     if errs.len() > MAX_ERRS {
         out.push_str(" - ... ");
         out.push_str(&(errs.len() - MAX_ERRS).to_string());

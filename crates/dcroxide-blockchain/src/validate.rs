@@ -498,6 +498,11 @@ pub fn check_block_header_sanity(
     check_proof_of_work_sanity(header, &pow_limit, skip_pow_check)?;
 
     // Ensure the block time is not too far in the future.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "adjusted_time_unix is the local clock plus a median offset of at most 70 \
+                  minutes, far below i64::MAX - 7200"
+    )]
     let max_timestamp = adjusted_time_unix + MAX_TIME_OFFSET_SECONDS;
     if i64::from(header.timestamp) > max_timestamp {
         return Err(rule_error(
@@ -559,6 +564,10 @@ pub fn check_block_header_sanity(
     // A block must not contain fewer votes than the minimum required
     // to reach majority once stake validation height has been reached.
     if header.height >= stake_validation_height {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "tickets_per_block / 2 <= 32767, so + 1 fits in u16"
+        )]
         let majority = (params.tickets_per_block / 2) + 1;
         if header.voters < majority {
             return Err(rule_error(
@@ -655,6 +664,10 @@ pub fn check_block_sanity(
     for stx in &block.stransactions {
         dcroxide_standalone::check_transaction_sanity(stx, max_tx_size)
             .map_err(standalone_to_chain_rule_error)?;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "total_tickets counts at most block.stransactions.len()"
+        )]
         if dcroxide_stake::is_sstx(stx) {
             total_tickets += 1;
         }
@@ -951,6 +964,7 @@ pub fn is_old_block_version_by_majority(
     // The latest block version for all networks other than the main
     // network is one higher.
     let mut latest_block_version: i32 = 11;
+    #[allow(clippy::arithmetic_side_effects, reason = "11 + 1")]
     if params.net != dcroxide_wire::CurrencyNet::MAIN_NET {
         latest_block_version += 1;
     }
@@ -969,6 +983,10 @@ pub fn is_old_block_version_by_majority(
 
     // The block version is considered old once the majority of the
     // network has upgraded to a more recent version.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "header.version < latest_block_version <= 12 after the early return above"
+    )]
     let next_version = header.version + 1;
     crate::stakever::is_majority_version(
         &crate::sequencelock::AsVersionView(view),
@@ -1065,6 +1083,11 @@ pub fn check_difficulty_positional(
     };
     let rcai = i64::from(params.rule_change_activation_interval);
     let svh = params.stake_validation_height;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "network parameters: rcai <= u32::MAX so rcai * 2 < 2^33, plus a small stake \
+                  validation height"
+    )]
     let first_possible_activation_height = svh + rcai * 2;
     let min_blake3_version = min_blake3_block_version(params);
     // Note dcrd converts the signed header version, so negative
@@ -1111,6 +1134,11 @@ pub fn check_difficulty_positional(
     // them results in a matching required difficulty.
     let mut candidate_height =
         crate::stakever::calc_want_height(svh, rcai, i64::from(header.height));
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "candidate_height >= 0 by the loop condition and rcai <= u32::MAX; \
+                  first_possible_activation_height is a small sum of network parameters"
+    )]
     while candidate_height >= 0 && candidate_height <= prev_node.height {
         let (Some(candidate), Some(candidate_version)) = (
             crate::difficulty::ChainView::node(view, candidate_height),
@@ -1212,8 +1240,16 @@ pub fn check_block_header_positional(
         // active on the version 3 test network once the max diff
         // activation height has been reached (dcrd only computes the
         // minimum target there as well).
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "prev_node.height is a u32 header height widened to i64, so + 1 fits"
+        )]
         let block_height = prev_node.height + 1;
         if crate::difficulty::is_testnet3(params) {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "a BigInt right shift by the constant 6 cannot overflow"
+            )]
             let min_testnet_target = BigInt::from_bytes_be(
                 dcroxide_standalone::Sign::Plus,
                 &params.pow_limit.to_be_bytes(),
@@ -1222,6 +1258,10 @@ pub fn check_block_header_positional(
             if header.bits <= min_testnet_diff_bits
                 && block_height >= crate::difficulty::TESTNET3_MAX_DIFF_ACTIVATION_HEIGHT
             {
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "prev_node.timestamp is a u32 header timestamp widened to i64"
+                )]
                 let min_time = prev_node.timestamp + 60;
                 if i64::from(header.timestamp) < min_time {
                     return Err(rule_error(
@@ -1243,6 +1283,10 @@ pub fn check_block_header_positional(
 
     // The height of this block is one more than the referenced
     // previous block, and the header must commit to it.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "prev_node.height is a u32 header height widened to i64, so + 1 cannot overflow"
+    )]
     let block_height = prev_node.height + 1;
     if i64::from(header.height) != block_height {
         return Err(rule_error(
@@ -1317,6 +1361,10 @@ pub fn check_block_data_positional(
 
     if !fast_add {
         // Ensure all transactions in the block are not expired.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "prev_height is a u32 header height widened to i64, so + 1 cannot overflow"
+        )]
         let block_height = prev_height + 1;
         for tx in &block.transactions {
             if is_expired_tx(tx, block_height) {
@@ -1677,6 +1725,10 @@ pub fn check_coinbase_unique_height(
     // There must be at least enough outputs to contain the one that
     // encodes the height.
     let coinbase_tx = &block.transactions[0];
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "null_data_out_idx is 0 or 1"
+    )]
     if coinbase_tx.tx_out.len() < null_data_out_idx + 1 {
         return Err(rule_error(
             RuleErrorKind::FirstTxNotCoinbase,
@@ -2036,6 +2088,11 @@ pub fn extract_ticket_commit_amount(script: &[u8]) -> i64 {
 /// transaction (dcrd `checkTicketPurchaseInputs`).  The caller MUST
 /// have already determined the transaction is a ticket purchase.
 /// `lookup_entry` stands in for dcrd's `UtxoViewpoint.LookupEntry`.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "indexes derive from tx_in_idx < tx.tx_in.len(), a Vec length below \
+              isize::MAX / size_of::<TxIn>(), so len * 2 + 2 fits in usize"
+)]
 pub fn check_ticket_purchase_inputs<'a>(
     tx: &MsgTx,
     lookup_entry: impl Fn(&OutPoint) -> Option<&'a crate::UtxoEntry>,
@@ -2166,6 +2223,10 @@ pub fn calc_ticket_return_amounts(
     // arbitrary-precision integers mirror dcrd's use of big.Int.
     let mut contribution_sum: i64 = 0;
     let mut i = 1;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "i < ticket_outs.len() <= isize::MAX, so i + 2 fits in usize"
+    )]
     while i < ticket_outs.len() {
         contribution_sum =
             contribution_sum.wrapping_add(extract_ticket_commit_amount(&ticket_outs[i].pk_script));
@@ -2173,7 +2234,9 @@ pub fn calc_ticket_return_amounts(
     }
     let contribution_sum_big = BigInt::from(contribution_sum);
 
-    let num_return_amounts = (ticket_outs.len() - 1) / 2;
+    // Go's `(len(ticketOuts) - 1) / 2` truncates -1 / 2 to 0 for no
+    // outputs rather than wrapping to a huge allocation.
+    let num_return_amounts = ticket_outs.len().saturating_sub(1) / 2;
     let mut return_amounts = vec![0i64; num_return_amounts];
 
     // 64.32 fixed point:
@@ -2182,6 +2245,11 @@ pub fn calc_ticket_return_amounts(
     let total_output_amt = ticket_purchase_amount.wrapping_add(vote_subsidy);
     let total_output_amt_big = BigInt::from(total_output_amt);
     let mut total_return_amount: i64 = 0;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt arithmetic cannot overflow, and i < num_return_amounts = (len - 1) / 2 \
+                  keeps i * 2 + 1 < ticket_outs.len()"
+    )]
     for (i, amount) in return_amounts.iter_mut().enumerate() {
         let ticket_out = &ticket_outs[i * 2 + 1];
         let mut return_amt_big = BigInt::from(extract_ticket_commit_amount(&ticket_out.pk_script));
@@ -2323,6 +2391,12 @@ pub fn check_ticket_redeemer_commitments(
         }
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "extra is 1 only once check_ssgen_votes accepted two or more outputs; \
+                  tx_out_idx >= start_idx by the range and is below a Vec length, so \
+                  (tx_out_idx - start_idx) * 2 + 1 fits; 0 < fee_limit < expected_out_amt"
+    )]
     for tx_out_idx in start_idx..tx.tx_out.len() - extra {
         // Ensure the output is paying to the address and type
         // specified by the original commitment in the ticket and is a
@@ -2548,7 +2622,16 @@ pub fn check_vote_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
     // A ticket stake submission can only be spent in the block AFTER
     // the entire ticket maturity has passed, hence the +1.
     let origin_height = ticket_utxo.block_height();
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "tx_height is a chain height and origin_height a u32 entry height, so the \
+                  difference cannot overflow i64"
+    )]
     let blocks_since_prev = tx_height - origin_height;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "ticket_maturity is a u16 network parameter"
+    )]
     if blocks_since_prev < ticket_maturity + 1 {
         return Err(rule_error(
             RuleErrorKind::ImmatureTicketSpend,
@@ -2596,8 +2679,21 @@ pub fn check_vote_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
     // treasury-vote payload reaches here with extra == 1, which panics
     // any overflow-checked build and only reaches dcrd's verdict in
     // release by wrapping far enough to fail the comparison anyway.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a Vec length as i64 is >= 0, so subtracting at most 3 cannot overflow"
+    )]
     let num_vote_payments = tx.tx_out.len() as i64 - 2 - extra;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a Vec length as i64 is >= 0, so - 1 cannot overflow"
+    )]
     let num_commitments = ticket_outs.len() as i64 - 1;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "num_vote_payments < tx.tx_out.len(), a Vec length far below 2^62, so doubling \
+                  fits in i64"
+    )]
     if num_vote_payments * 2 != num_commitments {
         let vote_hash = tx.tx_hash();
         return Err(rule_error(
@@ -2687,8 +2783,17 @@ pub fn check_revocation_inputs<'a>(
     // (+2), or in the same block it is missed or expired under the
     // automatic ticket revocations agenda (+1).
     let origin_height = ticket_utxo.block_height();
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "tx_height is a chain height and origin_height a u32 entry height, so the \
+                  difference cannot overflow i64"
+    )]
     let blocks_since_prev = tx_height - origin_height;
     let revocation_additional_maturity: i64 = if is_auto_revocations_enabled { 1 } else { 2 };
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a u16 network parameter plus at most 2"
+    )]
     if blocks_since_prev < ticket_maturity + revocation_additional_maturity {
         return Err(rule_error(
             RuleErrorKind::ImmatureTicketSpend,
@@ -2717,6 +2822,11 @@ pub fn check_revocation_inputs<'a>(
     // The revocation outputs must consist of one output per ticket
     // commitment.
     let num_revocation_payments = tx.tx_out.len();
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "ticket_outs is non-empty after the filter above, and a Vec length below \
+                  isize::MAX doubles within usize"
+    )]
     if num_revocation_payments * 2 != ticket_outs.len() - 1 {
         let revoke_hash = tx.tx_hash();
         return Err(rule_error(
@@ -2870,6 +2980,10 @@ pub fn check_treasury_spend_inputs(msg_tx: &MsgTx) -> Result<(), RuleError> {
 
 /// Render bytes as the concatenated lowercase hex of Go's `%x` verb.
 fn hex_string(bytes: &[u8]) -> String {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a byte slice is at most isize::MAX long, so doubling fits in usize"
+    )]
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         out.push_str(&format!("{b:02x}"));
@@ -3125,6 +3239,11 @@ pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
         // yet reached the required coinbase maturity.
         if utxo_entry.is_coin_base() {
             let origin_height = utxo_entry.block_height();
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "tx_height is a chain height and origin_height a u32 entry height, so \
+                          the difference cannot overflow i64"
+            )]
             let blocks_since_prev = tx_height - origin_height;
             if blocks_since_prev < coinbase_maturity {
                 return Err(rule_error(
@@ -3142,6 +3261,11 @@ pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
         // spent after coinbase maturity many blocks.
         if utxo_entry.has_expiry() {
             let origin_height = utxo_entry.block_height();
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "tx_height is a chain height and origin_height a u32 entry height, so \
+                          the difference cannot overflow i64"
+            )]
             let blocks_since_prev = tx_height - origin_height;
             if blocks_since_prev < coinbase_maturity {
                 return Err(rule_error(
@@ -3161,6 +3285,11 @@ pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
         let pk_script = utxo_entry.pk_script();
         if is_treasury_enabled && dcroxide_stake::is_treasury_gen_script(script_ver, pk_script) {
             let origin_height = utxo_entry.block_height();
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "tx_height is a chain height and origin_height a u32 entry height, so \
+                          the difference cannot overflow i64"
+            )]
             let blocks_since_prev = tx_height - origin_height;
             if blocks_since_prev < coinbase_maturity {
                 return Err(rule_error(
@@ -3205,6 +3334,11 @@ pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
             || dcroxide_stake::is_vote_script(script_ver, pk_script)
         {
             let origin_height = utxo_entry.block_height();
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "tx_height is a chain height and origin_height a u32 entry height, so \
+                          the difference cannot overflow i64"
+            )]
             let blocks_since_prev = tx_height - origin_height;
             if blocks_since_prev < req_stake_out_maturity {
                 return Err(rule_error(
@@ -3222,6 +3356,11 @@ pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
         // maturity many blocks.
         if dcroxide_stake::is_stake_change_script(script_ver, pk_script) {
             let origin_height = utxo_entry.block_height();
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "tx_height is a chain height and origin_height a u32 entry height, so \
+                          the difference cannot overflow i64"
+            )]
             let blocks_since_prev = tx_height - origin_height;
             if blocks_since_prev < i64::from(params.sstx_change_maturity) {
                 return Err(rule_error(
@@ -3278,7 +3417,7 @@ pub fn check_transaction_inputs<'a, SP: dcroxide_standalone::SubsidyParams>(
         ));
     }
 
-    Ok(total_atom_in - total_atom_out)
+    Ok(total_atom_in.wrapping_sub(total_atom_out))
 }
 
 /// The maximum number of signature operations per block (dcrd
@@ -3320,6 +3459,11 @@ pub fn count_sig_ops(
         let ok;
         (total_sig_ops, ok) = total_sig_ops.add_unsigned(num_sig_ops);
         if !ok {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "tx_ins is tx.tx_in minus at most its first element, so index + \
+                          tx_in_start_idx < tx.tx_in.len()"
+            )]
             return Err(rule_error(
                 RuleErrorKind::TooManySigOps,
                 format!(
@@ -3391,6 +3535,11 @@ pub fn count_p2sh_sig_ops<'a>(
         let utxo_entry = match lookup_entry(tx_in_outpoint) {
             Some(e) if !e.is_spent() => e,
             _ => {
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "tx_ins is tx.tx_in minus at most its first element, so index + \
+                              tx_in_start_idx < tx.tx_in.len()"
+                )]
                 return Err(rule_error(
                     RuleErrorKind::MissingTxOut,
                     format!(
@@ -3499,6 +3648,10 @@ pub fn check_stake_base_amounts<'a, SP: dcroxide_standalone::SubsidyParams>(
 
         // Subsidy aligns with the height being voted on, not with the
         // height of the current block.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "height is a u32 header height widened to i64, so - 1 cannot overflow"
+        )]
         let calc_subsidy =
             subsidy_cache.calc_stake_vote_subsidy_v3(height - 1, subsidy_split_variant);
         if difference > calc_subsidy {
@@ -3717,6 +3870,10 @@ pub fn check_block_context(
 
     // The coinbase (and the treasurybase under the treasury agenda)
     // must commit to the block height.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "prev_height is a u32 header height widened to i64, so + 1 cannot overflow"
+    )]
     let block_height = prev_height + 1;
     check_coinbase_unique_height(block_height, block, is_treasury_enabled)?;
     if is_treasury_enabled {
@@ -3775,6 +3932,11 @@ pub fn check_block_context(
     let mut total_treasurybase: i64 = 0;
     let mut total_yes_votes: i64 = 0;
     let mut treasury_spend_txns: Vec<&MsgTx> = Vec::new();
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "each tally counts at most one per stake transaction, so at most \
+                  block.stransactions.len()"
+    )]
     for (tx_idx, stx) in block.stransactions.iter().enumerate() {
         let tx_type = dcroxide_stake::determine_tx_type(stx);
         if tx_type == dcroxide_stake::TxType::Regular {
@@ -3792,7 +3954,9 @@ pub fn check_block_context(
                 total_votes += 1;
                 if header.height >= stake_validation_height {
                     let (voted_hash, voted_height) = dcroxide_stake::ssgen_block_voted_on(stx);
-                    if voted_hash != header.prev_block || voted_height != header.height - 1 {
+                    if voted_hash != header.prev_block
+                        || voted_height != header.height.wrapping_sub(1)
+                    {
                         return Err(rule_error(
                             RuleErrorKind::VotesOnWrongBlock,
                             format!(
@@ -3801,7 +3965,7 @@ pub fn check_block_context(
                                  parent block {} (height {})",
                                 stx.tx_hash(),
                                 header.prev_block,
-                                header.height - 1
+                                header.height.wrapping_sub(1)
                             ),
                         ));
                     }
@@ -3839,6 +4003,10 @@ pub fn check_block_context(
 
     // Every stake transaction must be accounted for by the tallies.
     let num_stake_tx = block.stransactions.len() as i64;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the six tallies together count at most block.stransactions.len()"
+    )]
     let expected_num_stake_tx = total_tickets
         + total_votes
         + total_revocations
@@ -3868,6 +4036,10 @@ pub fn check_block_context(
         ));
     }
     if header.height >= stake_validation_height {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "0 <= total_yes_votes <= total_votes"
+        )]
         let total_no_votes = total_votes - total_yes_votes;
         let header_approves = header_approves_parent(header);
         let votes_approve = total_yes_votes > total_no_votes;
@@ -3885,6 +4057,10 @@ pub fn check_block_context(
     // Only tickets, treasury adds, and treasurybases are allowed
     // before stake validation begins.
     if header.height < stake_validation_height {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the tallies together count at most block.stransactions.len()"
+        )]
         let num_expected = total_tickets + total_treasury_add + total_treasurybase;
         if num_stake_tx != num_expected {
             return Err(rule_error(
@@ -4046,6 +4222,11 @@ pub fn check_block_context(
             if !is_tvi && !treasury_spend_txns.is_empty() {
                 let tx = treasury_spend_txns[0];
                 let cur_height = block_height as u64;
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "tvi is a nonzero network parameter, cur_height % tvi < tvi, and a \
+                              u32 block height plus tvi fits in u64"
+                )]
                 let next_tvi = cur_height + (tvi - (cur_height % tvi));
                 return Err(rule_error(
                     RuleErrorKind::NotTVI,
@@ -4057,6 +4238,10 @@ pub fn check_block_context(
                 ));
             }
             if is_tvi {
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "2 plus fixed network parameters (4096 + 288 * 12 on mainnet)"
+                )]
                 let min_required_expiry = 2
                     + u64::from(stake_validation_height)
                     + tvi * params.treasury_vote_interval_multiplier;
@@ -4243,8 +4428,13 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
     if !stake_tree {
         // Apply the penalty for the regular tree fees based on the
         // number of votes once stake validation begins.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the divisor is tickets_per_block, a nonzero u16 network parameter, so \
+                      never 0 or -1"
+        )]
         if node_height >= params.stake_validation_height {
-            total_fees *= i64::from(node_voters);
+            total_fees = total_fees.wrapping_mul(i64::from(node_voters));
             total_fees /= i64::from(params.tickets_per_block);
         }
 
@@ -4262,13 +4452,15 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
             let subsidy_treasury =
                 subsidy_cache.calc_treasury_subsidy(node_height, node_voters, is_treasury_enabled);
             if is_treasury_enabled {
-                subsidy_work + total_fees
+                subsidy_work.wrapping_add(total_fees)
             } else {
-                subsidy_work + subsidy_treasury + total_fees
+                subsidy_work
+                    .wrapping_add(subsidy_treasury)
+                    .wrapping_add(total_fees)
             }
         };
         let coinbase_in = &txs[0].tx_in[0];
-        let subsidy_without_fees = exp_atom_out - total_fees;
+        let subsidy_without_fees = exp_atom_out.wrapping_sub(total_fees);
         if coinbase_in.value_in != subsidy_without_fees && node_height > 0 {
             return Err(rule_error(
                 RuleErrorKind::BadCoinbaseAmountIn,
@@ -4339,9 +4531,14 @@ pub fn check_transactions_and_connect<SP: dcroxide_standalone::SubsidyParams>(
         // fees; before that height the expected output is simply zero.
         let mut exp_atom_out: i64 = 0;
         if node_height >= params.stake_validation_height {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "node_height is a u32 header height widened to i64, so - 1 cannot \
+                          overflow"
+            )]
             let vote_subsidy =
                 subsidy_cache.calc_stake_vote_subsidy_v3(node_height - 1, subsidy_split_variant);
-            exp_atom_out = vote_subsidy * i64::from(node_voters);
+            exp_atom_out = vote_subsidy.wrapping_mul(i64::from(node_voters));
         }
         if total_atom_out_stake > exp_atom_out {
             return Err(rule_error(
@@ -4369,6 +4566,10 @@ fn halfway_tie(coins: f64, digits: &[u8], frac_len: usize) -> Option<bool> {
     let bits = coins.abs().to_bits();
     let biased = (bits >> 52) as i64;
     let mask52 = (1u64 << 52) - 1;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "biased is the 11-bit exponent field of a sign-cleared f64, at most 2047"
+    )]
     let (mant, exp) = if biased == 0 {
         (bits & mask52, -1074i64)
     } else {
@@ -4381,19 +4582,39 @@ fn halfway_tie(coins: f64, digits: &[u8], frac_len: usize) -> Option<bool> {
     // The printed digits as an integer n, so |value| = n * 10^-frac_len.
     let mut n: u128 = 0;
     for &b in digits {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "b is an ASCII digit, so b - b'0' <= 9"
+        )]
         if b.is_ascii_digit() {
             n = n.checked_mul(10)?.checked_add(u128::from(b - b'0'))?;
         }
     }
 
     // Halfway iff mant * 2^exp * 10^(frac_len+1) == 10*n -+ 5.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "frac_len is below a String length, itself at most isize::MAX"
+    )]
     let scale = frac_len as i64 + 1;
     let mut lhs = u128::from(mant).checked_mul(5u128.checked_pow(u32::try_from(scale).ok()?)?)?;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "exp is in [-1074, 972] and scale <= 55 once 5^scale fit in u128 above"
+    )]
     let shift = exp + scale;
     if shift >= 0 {
         lhs = lhs.checked_mul(1u128.checked_shl(u32::try_from(shift).ok()?)?)?;
     } else {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "shift < 0 and >= -1074 here, so negating it cannot overflow"
+        )]
         let down = u32::try_from(-shift).ok()?;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "down < 128 by the first operand, so 1u128 << down >= 1"
+        )]
         if down >= 128 || lhs & ((1u128 << down) - 1) != 0 {
             return None;
         }
@@ -4420,6 +4641,11 @@ fn halfway_tie(coins: f64, digits: &[u8], frac_len: usize) -> Option<bool> {
 fn amount_string(atoms: i64) -> String {
     let coins = atoms as f64 / 1e8;
     let mut digits = format!("{coins}").into_bytes();
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "dot < digits.len(), and a float's Display ends in an ASCII digit after a '.', \
+                  so the digit arithmetic stays within '0'..=':'"
+    )]
     if let Some(dot) = digits.iter().position(|&b| b == b'.') {
         let frac_len = digits.len() - dot - 1;
         let last_idx = digits.len() - 1;
@@ -4641,11 +4867,11 @@ pub fn block_one_coinbase_pays_tokens(tx: &MsgTx, params: &Params) -> Result<(),
 pub fn calculate_added_subsidy(block: &MsgBlock, parent: &MsgBlock) -> i64 {
     let mut subsidy: i64 = 0;
     if header_approves_parent(&block.header) {
-        subsidy += parent.transactions[0].tx_in[0].value_in;
+        subsidy = subsidy.wrapping_add(parent.transactions[0].tx_in[0].value_in);
     }
     for (tx_idx, stx) in block.stransactions.iter().enumerate() {
         if (tx_idx == 0 && dcroxide_stake::is_treasury_base(stx)) || dcroxide_stake::is_ssgen(stx) {
-            subsidy += stx.tx_in[0].value_in;
+            subsidy = subsidy.wrapping_add(stx.tx_in[0].value_in);
         }
     }
     subsidy
@@ -4669,6 +4895,10 @@ pub fn tspend_checks_stateless(
     block: &MsgBlock,
     params: &Params,
 ) -> Result<(), RuleError> {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "prev_height is a u32 header height widened to i64, so + 1 cannot overflow"
+    )]
     let block_height = prev_height + 1;
     let tvi = params.treasury_vote_interval;
     if !dcroxide_standalone::is_treasury_vote_interval(block_height as u64, tvi) {
@@ -4901,6 +5131,10 @@ fn spawn_validate_worker<'scope>(
     // Tests stand in for an exhausted task limit with a per-thread
     // budget of spawns the "OS" still grants.
     #[cfg(test)]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "budget > 0 after the zero check"
+    )]
     if let Some(budget) = tests::WORKER_SPAWN_BUDGET.get() {
         if budget == 0 {
             return false;
@@ -5041,6 +5275,10 @@ pub fn check_connect_block<SP: dcroxide_standalone::SubsidyParams>(
     full_tspend_checks: FullTspendChecks<'_>,
     params: &Params,
 ) -> Result<dcroxide_gcs::FilterV2, RuleError> {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "node_height is a u32 header height widened to i64, so - 1 cannot overflow"
+    )]
     let prev_height = node_height - 1;
     // The view must be from the point of view of the parent.
     assert_eq!(
@@ -6095,5 +6333,16 @@ mod tests {
             calc_ticket_return_amounts(&outs, i64::MAX, 0, &[0u8; 180], false, true),
             [-(1i64 << 62), -(1i64 << 62)]
         );
+    }
+
+    /// dcrd's `(len(ticketOuts) - 1) / 2` is Go int arithmetic, so no
+    /// ticket outputs truncate -1 / 2 to zero return amounts.  The
+    /// port's usize subtraction wrapped to a `usize::MAX / 2` element
+    /// allocation instead: a capacity overflow abort in release and an
+    /// overflow panic in overflow-checked builds.
+    #[test]
+    fn ticket_return_amounts_of_no_outputs_are_empty() {
+        assert!(calc_ticket_return_amounts(&[], 0, 0, &[], true, false).is_empty());
+        assert!(calc_ticket_return_amounts(&[], 0, 0, &[0u8; 180], false, true).is_empty());
     }
 }

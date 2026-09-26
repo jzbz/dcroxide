@@ -69,6 +69,11 @@ pub trait VersionChainView {
     /// far costlier than dcrd's.
     fn walk_back(&self, height: i64, visit: &mut dyn FnMut(&VersionNode) -> bool) {
         let mut h = height;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "h >= 1 at the decrement: the loop stops at height 0 and a view has no \
+                      node at a negative height"
+        )]
         while let Some(node) = self.node(h) {
             if !visit(&node) || h == 0 {
                 break;
@@ -131,6 +136,12 @@ pub trait VersionChainView {
 /// The height of the final block in the interval that occurred before
 /// the provided height (dcrd `calcWantHeight`); the first interval
 /// after the stake validation height is one block shorter.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "interval is a positive network parameter (never 0 or -1), so interval_offset is \
+              in [0, interval); height is a block height (a u32 header height, or one past \
+              it), so no step comes near i64's range"
+)]
 pub fn calc_want_height(stake_validation_height: i64, interval: i64, height: i64) -> i64 {
     let interval_offset = stake_validation_height % interval;
     let adjusted_height = height - interval_offset - 1;
@@ -155,7 +166,15 @@ pub fn calc_past_median_time(view: &impl VersionChainView, height: i64) -> i64 {
 fn find_stake_version_prior_height(prev_height: i64, params: &Params) -> Option<i64> {
     let svh = params.stake_validation_height;
     let svi = params.stake_version_interval;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "prev_height is a block height (a u32 header height widened to i64)"
+    )]
     let next_height = prev_height + 1;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "svh + svi is a sum of two small network parameters"
+    )]
     if next_height < svh + svi {
         return None;
     }
@@ -185,6 +204,12 @@ pub fn is_stake_majority_version(
 
     let mut version_count: i32 = 0;
     let mut h = start;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "version_count counts at most stake_version_interval (<= 2016) nodes; h >= 1 \
+                  at the decrement: the loop stops at height 0 and a view has no node at a \
+                  negative height"
+    )]
     for _ in 0..params.stake_version_interval {
         let Some(node) = view.node(h) else {
             break;
@@ -198,6 +223,12 @@ pub fn is_stake_majority_version(
         h -= 1;
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "network parameters: stake_version_interval (<= 2016) * \
+                  stake_majority_multiplier (3) fits in i32, and stake_majority_divisor (4) \
+                  is neither 0 nor -1"
+    )]
     let num_required = params.stake_version_interval as i32 * params.stake_majority_multiplier
         / params.stake_majority_divisor;
     let majority = version_count >= num_required;
@@ -230,6 +261,12 @@ pub fn calc_prior_stake_version(
 
     let mut versions: BTreeMap<u32, i32> = BTreeMap::new();
     let mut h = start;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "each count is at most stake_version_interval (<= 2016) nodes; h >= 1 at the \
+                  decrement: the loop stops at height 0 and a view has no node at a negative \
+                  height"
+    )]
     for _ in 0..params.stake_version_interval {
         let Some(node) = view.node(h) else {
             break;
@@ -243,6 +280,12 @@ pub fn calc_prior_stake_version(
 
     // At most one version can reach the supermajority, so dcrd's
     // random map iteration order is immaterial.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "network parameters: stake_version_interval (<= 2016) * \
+                  stake_majority_multiplier (3) fits in i32, and stake_majority_divisor (4) \
+                  is neither 0 nor -1"
+    )]
     let num_required = params.stake_version_interval as i32 * params.stake_majority_multiplier
         / params.stake_majority_divisor;
     let version = versions
@@ -266,6 +309,10 @@ pub fn calc_voter_version_interval(
 ) -> Option<u32> {
     let svh = params.stake_validation_height;
     let svi = params.stake_version_interval;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "interval_end_height is a block height (a u32 header height widened to i64)"
+    )]
     let expected = calc_want_height(svh, svi, interval_end_height + 1);
     assert!(
         interval_end_height == expected && expected >= svh,
@@ -285,13 +332,19 @@ pub fn calc_voter_version_interval(
     let mut versions: BTreeMap<u32, i32> = BTreeMap::new();
     let mut total_votes_found: i32 = 0;
     let mut h = interval_end_height;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "h >= 1 at the decrement: the loop stops at height 0 and a view has no node \
+                  at a negative height"
+    )]
     for _ in 0..svi {
         let Some(node) = view.node(h) else {
             break;
         };
-        total_votes_found += node.vote_versions.len() as i32;
+        total_votes_found = total_votes_found.wrapping_add(node.vote_versions.len() as i32);
         for v in &node.vote_versions {
-            *versions.entry(*v).or_insert(0) += 1;
+            let count = versions.entry(*v).or_insert(0);
+            *count = count.wrapping_add(1);
         }
         if h == 0 {
             break;
@@ -299,8 +352,12 @@ pub fn calc_voter_version_interval(
         h -= 1;
     }
 
-    let num_required =
-        total_votes_found * params.stake_majority_multiplier / params.stake_majority_divisor;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "stake_majority_divisor is a positive network parameter (4), never 0 or -1"
+    )]
+    let num_required = total_votes_found.wrapping_mul(params.stake_majority_multiplier)
+        / params.stake_majority_divisor;
     let version = versions
         .into_iter()
         .find(|(_, count)| *count >= num_required)
@@ -327,6 +384,11 @@ pub fn calc_voter_version(
         if let Some(version) = calc_voter_version_interval(view, h, params) {
             return (version, Some(h));
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "h >= stake_validation_height >= 0 by the check above, less a positive \
+                      network parameter"
+        )]
         let next = h - params.stake_version_interval;
         node_height = if next >= 0 { Some(next) } else { None };
     }
@@ -345,6 +407,11 @@ pub fn is_majority_version(
     let num_to_check = params.block_upgrade_num_to_check;
     let mut num_found: u64 = 0;
     let mut i: u64 = 0;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "each visit follows a check that i < num_to_check, so i + 1 fits in u64, and \
+                  num_found <= i"
+    )]
     if let Some(start_height) = start_height
         && i < num_to_check
         && num_found < num_required
@@ -384,6 +451,10 @@ pub fn calc_stake_version(view: &impl VersionChainView, prev_height: i64, params
     // cache without returning; the subsequent majority check over the
     // missing node then yields false anyway, which this preserves by
     // simply passing the missing start along.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "calc_want_height returns a height below node_height, a block height"
+    )]
     let start_interval_height = calc_want_height(
         params.stake_validation_height,
         params.stake_version_interval,

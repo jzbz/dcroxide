@@ -504,6 +504,11 @@ impl Chain {
     /// valid hash).
     pub fn new(params: &Params, config_assume_valid: Hash, config_allow_old_forks: bool) -> Chain {
         const TIME_IN_TWO_WEEKS_SECS: i64 = 14 * 24 * 60 * 60;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "target_time_per_block_secs is a positive network constant (300, 120 or 1), \
+                      so the divisor is neither zero nor -1"
+        )]
         let expected_blocks_in_two_weeks =
             TIME_IN_TWO_WEEKS_SECS / params.target_time_per_block_secs;
         let allow_old_forks = config_allow_old_forks || params.assume_valid == Hash::ZERO;
@@ -602,6 +607,11 @@ impl Chain {
             db: None,
             treasury_state: BTreeMap::new(),
             tspend_blocks: BTreeMap::new(),
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "network constants: at most (base subsidy / 10) * vote interval * \
+                          multiplier = 311958266 * 3456, about 1.1e12, on the built-in networks"
+            )]
             treasury_spend_limit_floor: (params.base_subsidy / 10)
                 * (params.treasury_vote_interval * params.treasury_vote_interval_multiplier) as i64,
             notifications: None,
@@ -1709,6 +1719,10 @@ impl Chain {
         if best_height < self.utxo_last_eviction_height {
             return best_height;
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "best_height >= utxo_last_eviction_height by the early return above"
+        )]
         let last_eviction_depth = best_height - self.utxo_last_eviction_height;
         let num_blocks_to_evict =
             (f64::from(last_eviction_depth) * UTXO_CACHE_EVICTION_PERCENTAGE).ceil() as u32;
@@ -2418,9 +2432,14 @@ impl Chain {
                                     // already what the sorted pass
                                     // below would produce — nothing
                                     // needs collecting.
-                                    streamed.utxos += 1;
-                                    streamed.size += v.len() as i64;
-                                    streamed.total += entry.amount();
+                                    streamed.utxos = streamed.utxos.wrapping_add(1);
+                                    streamed.size = streamed.size.wrapping_add(v.len() as i64);
+                                    streamed.total = streamed.total.wrapping_add(entry.amount());
+                                    #[allow(
+                                        clippy::arithmetic_side_effects,
+                                        reason = "one per distinct transaction hash walked, so \
+                                                  at most the row count, far below i64::MAX"
+                                    )]
                                     if last_tx_hash != Some(outpoint.hash.0) {
                                         transactions += 1;
                                         last_tx_hash = Some(outpoint.hash.0);
@@ -2502,9 +2521,14 @@ impl Chain {
             rows.sort_by(|a, b| a.0.cmp(&b.0));
             leaves.reserve(rows.len());
             for (_, leaf, size, amount, tx_hash) in rows {
-                streamed.utxos += 1;
-                streamed.size += size;
-                streamed.total += amount;
+                streamed.utxos = streamed.utxos.wrapping_add(1);
+                streamed.size = streamed.size.wrapping_add(size);
+                streamed.total = streamed.total.wrapping_add(amount);
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "one per distinct transaction hash walked, so at most the row \
+                              count, far below i64::MAX"
+                )]
                 if last_tx_hash != Some(tx_hash) {
                     transactions += 1;
                     last_tx_hash = Some(tx_hash);
@@ -2845,6 +2869,12 @@ impl Chain {
         let Some(hard_coded) = self.index.lookup_node(&params.assume_valid) else {
             return;
         };
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "node heights come from the u32 header height and \
+                      expected_blocks_in_two_weeks is a positive network-derived count of at \
+                      most 1209600, so the difference stays inside i64"
+        )]
         let mut checkpoint_height =
             self.store.node(hard_coded).height - self.expected_blocks_in_two_weeks;
         if checkpoint_height < 0 {
@@ -2888,6 +2918,10 @@ impl Chain {
         if best_height < self.expected_blocks_in_two_weeks {
             return false;
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "best_height >= expected_blocks_in_two_weeks by the early return above"
+        )]
         let clamp_to_height = best_height - self.expected_blocks_in_two_weeks;
         if self.store.node(assume_valid_node).height > clamp_to_height {
             assume_valid_node = self
@@ -3102,6 +3136,10 @@ impl Chain {
 
         // Generate the new best state snapshot.
         let subsidy = crate::validate::calculate_added_subsidy(block, parent);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the lengths of two in-memory Vecs of one block cannot overflow usize"
+        )]
         let num_txns = (block.transactions.len() + block.stransactions.len()) as u64;
         let n = self.store.node(node);
         let node_hash = n.hash;
@@ -3115,9 +3153,9 @@ impl Chain {
             next_stake_diff,
             block_size: u64::from(block.header.size),
             num_txns,
-            total_txns: self.state_snapshot.total_txns + num_txns,
+            total_txns: self.state_snapshot.total_txns.wrapping_add(num_txns),
             median_time: self.store.calc_past_median_time(node),
-            total_subsidy: self.state_snapshot.total_subsidy + subsidy,
+            total_subsidy: self.state_snapshot.total_subsidy.wrapping_add(subsidy),
             next_expiring_tickets: stake_node.expiring_next_block(),
             next_winning_tickets: stake_node.winners().to_vec(),
             missed_tickets: stake_node.missed_tickets(),
@@ -3237,6 +3275,10 @@ impl Chain {
             .best_header()
             .map_or(0, |h| self.store.node(h).height);
         let mut prune_height = 0;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "best_header_height > MIN_MEMORY_STAKE_NODES by the condition"
+        )]
         if best_header_height > Self::MIN_MEMORY_STAKE_NODES {
             prune_height = best_header_height - Self::MIN_MEMORY_STAKE_NODES;
         }
@@ -3286,7 +3328,15 @@ impl Chain {
         // Generate the new best state snapshot for the parent.  The
         // next stake difficulty comes from the disconnected block's
         // own header commitment like dcrd.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the lengths of two in-memory Vecs of one block cannot overflow usize"
+        )]
         let num_parent_txns = (parent.transactions.len() + parent.stransactions.len()) as u64;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the lengths of two in-memory Vecs of one block cannot overflow usize"
+        )]
         let num_block_txns = (block.transactions.len() + block.stransactions.len()) as u64;
         let subsidy = crate::validate::calculate_added_subsidy(block, parent);
         let pn = self.store.node(parent_id);
@@ -3302,9 +3352,9 @@ impl Chain {
             next_stake_diff: self.store.node(node).sbits,
             block_size: u64::from(parent.header.size),
             num_txns: num_parent_txns,
-            total_txns: self.state_snapshot.total_txns - num_block_txns,
+            total_txns: self.state_snapshot.total_txns.wrapping_sub(num_block_txns),
             median_time: self.store.calc_past_median_time(parent_id),
-            total_subsidy: self.state_snapshot.total_subsidy - subsidy,
+            total_subsidy: self.state_snapshot.total_subsidy.wrapping_sub(subsidy),
             next_expiring_tickets: parent_stake_node.expiring_next_block(),
             next_winning_tickets: parent_stake_node.winners().to_vec(),
             missed_tickets: parent_stake_node.missed_tickets(),
@@ -4037,6 +4087,10 @@ impl Chain {
                 continue;
             }
             let mut accepted_fork_len = 0;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "both heights come from u32 header fields, so the difference fits in i64"
+            )]
             if let Some(fork) = self.best_chain.find_fork(&self.store, accepted_node) {
                 accepted_fork_len =
                     self.store.node(accepted_node).height - self.store.node(fork).height;
@@ -4052,6 +4106,10 @@ impl Chain {
         }
 
         let mut fork_len = 0;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "both heights come from u32 header fields, so the difference fits in i64"
+        )]
         if final_errs.is_empty()
             && let Some(fork) = self.best_chain.find_fork(&self.store, node)
         {
@@ -4526,6 +4584,10 @@ impl Chain {
 
         let mut view = UtxoView::new();
         view.set_best_hash(tip_hash);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "prev_height is a node height from a u32 header field, so + 1 fits in i64"
+        )]
         let template_info = (
             prev_height + 1,
             block.header.block_hash(),
@@ -4692,6 +4754,13 @@ impl Chain {
     /// specified number of ticket purchases cannot make the chain
     /// unrecoverable through ticket exhaustion (dcrd
     /// `checkTicketExhaustion`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "heights and the pool size come from u32 header fields, purchases from u8 \
+                  counts over at most ticket_maturity + 1 (a u16) blocks, and the maturity, \
+                  votes per block and stake validation height are small network constants, \
+                  so every sum, difference and product here stays far inside i64"
+    )]
     pub fn check_ticket_exhaustion(
         &self,
         prev_node: NodeId,
@@ -5366,7 +5435,16 @@ impl Chain {
             // the number of descendants to consider to the window size.
             let mut end_node = best_header;
             let fork_height = self.store.node(fork_node).height;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "both heights come from u32 header fields, so the difference fits in i64"
+            )]
             let num_blocks_to_consider = self.store.node(end_node).height - fork_height;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "fork_height comes from a u32 header field, so + WINDOW_SIZE (32) fits \
+                          in i64"
+            )]
             if num_blocks_to_consider > WINDOW_SIZE {
                 end_node = self
                     .store
@@ -5384,6 +5462,12 @@ impl Chain {
                 if n == fork_node {
                     break;
                 }
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "end_node is at most WINDOW_SIZE blocks above its ancestor \
+                              fork_node, so the walk decrements window_idx (from WINDOW_SIZE) \
+                              at most WINDOW_SIZE times"
+                )]
                 if !self.index.node_status(&self.store, n).have_data() {
                     window_idx -= 1;
                     window[window_idx] = self.store.node(n).hash;
@@ -5442,6 +5526,10 @@ impl Chain {
         }
         let mut out = Vec::new();
         let mut h = start_height;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "h < end_height in the body, so h + 1 <= end_height"
+        )]
         while h < end_height {
             match self.best_chain.node_by_height(h) {
                 Some(n) => out.push(self.store.node(n).hash),
@@ -5491,6 +5579,10 @@ impl Chain {
         // requested block.
         let mut count = i64::from(count);
         let start_height = self.store.node(start_node).height;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "start_height is a node height from a u32 header field, so + 1 fits in i64"
+        )]
         if count > start_height + 1 {
             count = start_height + 1;
         }
@@ -5498,6 +5590,10 @@ impl Chain {
         let mut result = Vec::with_capacity(count as usize);
         let mut prev_node = Some(start_node);
         let mut i = 0i64;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i < count past the break, so i + 1 <= count"
+        )]
         while let Some(id) = prev_node {
             if i >= count {
                 break;
@@ -5813,18 +5909,18 @@ impl Chain {
                 }
 
                 // Increase total votes.
-                result.total += 1;
+                result.total = result.total.wrapping_add(1);
 
                 match deployment.vote.vote_index(vote.1) {
                     None => {
                         // Invalid votes are treated as abstain.
-                        result.total_abstain += 1;
+                        result.total_abstain = result.total_abstain.wrapping_add(1);
                     }
                     Some(index) => {
                         if deployment.vote.choices[index].is_abstain {
-                            result.total_abstain += 1;
+                            result.total_abstain = result.total_abstain.wrapping_add(1);
                         }
-                        result.vote_choices[index] += 1;
+                        result.vote_choices[index] = result.vote_choices[index].wrapping_add(1);
                     }
                 }
             }
@@ -5888,7 +5984,7 @@ impl Chain {
                 }
 
                 // Increase total votes.
-                total += 1;
+                total = total.wrapping_add(1);
             }
             count_node = self
                 .store
@@ -5977,7 +6073,17 @@ impl Chain {
         // Calculate how many entries are needed.
         let tip = self.best_chain.tip().expect("best chain tip");
         let start_height = self.store.node(start_node).height;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "both heights come from u32 header fields, so the difference plus one fits \
+                      in i64"
+        )]
         let mut total = (self.store.node(tip).height - start_height + 1) as u32;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "both heights come from u32 header fields, so the difference plus one fits \
+                      in i64"
+        )]
         if let Some(stop) = stop_node
             && self.best_chain.contains(&self.store, stop)
             && self.store.node(stop).height >= start_height
@@ -6097,7 +6203,7 @@ impl Chain {
             .collect();
         let mut amt: i64 = 0;
         for utxo in self.fetch_utxo_entries(&outpoints) {
-            amt += utxo?.amount();
+            amt = amt.wrapping_add(utxo?.amount());
         }
         Some(amt)
     }
@@ -6206,6 +6312,11 @@ impl Chain {
             ));
         }
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "both heights come from u32 header fields, so the difference plus one fits \
+                      in i64"
+        )]
         let nb = self.store.node(end_node).height - self.store.node(start_node).height + 1;
         if nb > dcroxide_wire::MAX_CFILTERS_V2_PER_BATCH as i64 {
             return Err(rule_error(
@@ -6292,7 +6403,7 @@ impl Chain {
     /// the node's stored balance plus the maturing values from the
     /// coinbase-maturity ancestor (dcrd `calculateTreasuryBalance`).
     pub fn calculate_treasury_balance(&self, prev_node: NodeId, params: &Params) -> i64 {
-        let relative_maturity = i64::from(params.coinbase_maturity) - 1;
+        let relative_maturity = i64::from(params.coinbase_maturity.wrapping_sub(1));
         let Some(want_node) = self.store.relative_ancestor(prev_node, relative_maturity) else {
             return 0;
         };
@@ -6306,9 +6417,9 @@ impl Chain {
         };
         let mut net_value = 0i64;
         for v in &wts.values {
-            net_value += v.amount;
+            net_value = net_value.wrapping_add(v.amount);
         }
-        ts.balance + net_value
+        ts.balance.wrapping_add(net_value)
     }
 
     /// The treasury state and spend rows a connected block produces
@@ -6465,6 +6576,10 @@ impl Chain {
         .map_err(|e| format!("{e}"))?;
 
         let tspend_hash = tspend.tx_hash();
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "a node height comes from a u32 header field, so + 1 fits in i64"
+        )]
         let next_height = self.store.node(prev_node).height + 1;
         if !dcroxide_standalone::inside_tspend_window(
             next_height,
@@ -6547,6 +6662,10 @@ impl Chain {
         let mut spent = 0i64;
         let mut added = 0i64;
         let mut i = 0u64;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i < nb_blocks past the break, so i + 1 <= nb_blocks"
+        )]
         while let Some(id) = node {
             if i >= nb_blocks {
                 break;
@@ -6562,9 +6681,9 @@ impl Chain {
             };
             for v in &ts.values {
                 if v.typ.is_debit() {
-                    spent += -v.amount;
+                    spent = spent.wrapping_add(v.amount.wrapping_neg());
                 } else {
-                    added += v.amount;
+                    added = added.wrapping_add(v.amount);
                 }
             }
             node = self.store.node(id).parent;
@@ -6580,6 +6699,10 @@ impl Chain {
         pre_tvi_node: NodeId,
         params: &Params,
     ) -> Result<i64, RuleError> {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "network constants: at most 288 * 12 * 2 = 6912 on the built-in networks"
+        )]
         let policy_window = params.treasury_vote_interval
             * params.treasury_vote_interval_multiplier
             * params.treasury_expenditure_window;
@@ -6590,27 +6713,37 @@ impl Chain {
         let mut spent_prior_windows = 0i64;
         let mut nb_non_empty_windows = 0i64;
         let mut i = 0u64;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i < treasury_expenditure_policy in the body and nb_non_empty_windows <= i, \
+                      so both stay below that small network constant"
+        )]
         while i < params.treasury_expenditure_policy {
             let Some(id) = node else {
                 break;
             };
             let (spent, _, next) = self.sum_past_treasury_changes(id, policy_window)?;
             if spent > 0 {
-                spent_prior_windows += spent;
+                spent_prior_windows = spent_prior_windows.wrapping_add(spent);
                 nb_non_empty_windows += 1;
             }
             node = next;
             i += 1;
         }
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "nb_non_empty_windows > 0 in this branch, so the divisor is neither zero \
+                      nor -1"
+        )]
         let avg_spent_prior_windows = if nb_non_empty_windows > 0 {
             spent_prior_windows / nb_non_empty_windows
         } else {
             params.treasury_expenditure_bootstrap as i64
         };
-        let avg_plus_allowance = avg_spent_prior_windows + avg_spent_prior_windows / 2;
+        let avg_plus_allowance = avg_spent_prior_windows.wrapping_add(avg_spent_prior_windows / 2);
         if avg_plus_allowance > spent_recent_window {
-            Ok(avg_plus_allowance - spent_recent_window)
+            Ok(avg_plus_allowance.wrapping_sub(spent_recent_window))
         } else {
             Ok(0)
         }
@@ -6623,14 +6756,18 @@ impl Chain {
         pre_tvi_node: NodeId,
         params: &Params,
     ) -> Result<i64, RuleError> {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "network constants: at most 288 * 12 * 2 = 6912 on the built-in networks"
+        )]
         let policy_window = params.treasury_vote_interval
             * params.treasury_vote_interval_multiplier
             * params.treasury_expenditure_window;
         let (spent_recent, added_recent, _) =
             self.sum_past_treasury_changes(pre_tvi_node, policy_window)?;
-        let added_plus_allowance = added_recent + added_recent / 2;
+        let added_plus_allowance = added_recent.wrapping_add(added_recent / 2);
         if added_plus_allowance > spent_recent {
-            Ok(added_plus_allowance - spent_recent)
+            Ok(added_plus_allowance.wrapping_sub(spent_recent))
         } else {
             Ok(0)
         }
@@ -6643,19 +6780,23 @@ impl Chain {
         pre_tvi_node: NodeId,
         params: &Params,
     ) -> Result<i64, RuleError> {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "network constants: at most 288 * 12 * 2 = 6912 on the built-in networks"
+        )]
         let policy_window = params.treasury_vote_interval
             * params.treasury_vote_interval_multiplier
             * params.treasury_expenditure_window;
         let (spent_recent, _, _) = self.sum_past_treasury_changes(pre_tvi_node, policy_window)?;
         let treasury_balance = self.calculate_treasury_balance(pre_tvi_node, params);
 
-        let mut max_spendable = (treasury_balance + spent_recent) * 4 / 100;
+        let mut max_spendable = treasury_balance.wrapping_add(spent_recent).wrapping_mul(4) / 100;
         if max_spendable < self.treasury_spend_limit_floor {
             max_spendable = self.treasury_spend_limit_floor;
         }
         let mut allowed_to_spend = 0i64;
         if max_spendable > spent_recent {
-            allowed_to_spend = max_spendable - spent_recent;
+            allowed_to_spend = max_spendable.wrapping_sub(spent_recent);
         }
         if allowed_to_spend > treasury_balance {
             allowed_to_spend = treasury_balance;
@@ -6718,7 +6859,7 @@ impl Chain {
             ));
         }
         let treasury_balance = self.calculate_treasury_balance(pre_tvi_node, params);
-        if treasury_balance - total_tspend_amount < 0 {
+        if treasury_balance.wrapping_sub(total_tspend_amount) < 0 {
             return Err(format!(
                 "treasury balance may not become negative: balance {treasury_balance} spend \
                  {total_tspend_amount}"
@@ -6745,6 +6886,10 @@ impl Chain {
         block: &MsgBlock,
         params: &Params,
     ) -> Result<(), RuleError> {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "a node height comes from a u32 header field, so + 1 fits in i64"
+        )]
         let block_height = self.store.node(prev_node).height + 1;
         let tvi = params.treasury_vote_interval;
         if !dcroxide_standalone::is_treasury_vote_interval(block_height as u64, tvi) {
@@ -6831,6 +6976,11 @@ impl Chain {
 
     /// Whether the node's timestamp is more than 24 hours old
     /// relative to the adjusted time (dcrd `isOldTimestamp`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "adjusted_time_unix is the local clock plus the median peer offset (dcrd's \
+                  AdjustedTime), nowhere near i64::MIN + 86400"
+    )]
     fn is_old_timestamp(&self, node: NodeId, adjusted_time_unix: i64) -> bool {
         const DAY_SECS: i64 = 24 * 60 * 60;
         self.store.node(node).timestamp < adjusted_time_unix - DAY_SECS
@@ -7102,7 +7252,14 @@ impl TSpendVoteWindow {
 
         // Passing criteria are the quorum and required percentages.
         // dcrd computes maxVotes in wrapping u32 before widening.
-        let max_votes = u64::from(u32::from(params.tickets_per_block).wrapping_mul(end - start));
+        let max_votes =
+            u64::from(u32::from(params.tickets_per_block).wrapping_mul(end.wrapping_sub(start)));
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "max_votes <= u32::MAX and the quorum multiplier is 1 on every built-in \
+                      network, so the product fits in u64; the divisor is the nonzero network \
+                      constant 5"
+        )]
         let quorum = max_votes * params.treasury_vote_quorum_multiplier
             / params.treasury_vote_quorum_divisor;
         // Go adds the u32 tallies before widening; mirror the wrapping
@@ -7118,9 +7275,15 @@ impl TSpendVoteWindow {
         // enabling early passage only when yes cannot drop below the
         // threshold.
         let cur_block_height = self.next_height as u32;
-        let remaining_blocks = end - cur_block_height;
+        let remaining_blocks = end.wrapping_sub(cur_block_height);
         let max_remaining_votes =
             u64::from(remaining_blocks.wrapping_mul(u32::from(params.tickets_per_block)));
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "both addends are at most u32::MAX, so the sum is below 2^33 and its product \
+                      with the required multiplier (3 on every built-in network) fits in u64; \
+                      the divisor is the nonzero network constant 5"
+        )]
         let required_votes = (num_votes_cast + max_remaining_votes)
             * params.treasury_vote_required_multiplier
             / params.treasury_vote_required_divisor;
@@ -7314,6 +7477,10 @@ pub struct VoteInfo {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over small fixed values"
+)]
 mod tests {
     use super::*;
 
@@ -7860,5 +8027,47 @@ mod tests {
             persist_rule_error(crate::chaindb::ChainDbError::Db(err)).description,
             "missing utxo set bucket"
         );
+    }
+
+    /// dcrd's `calculateTreasuryBalance` takes the relative maturity as
+    /// `int64(CoinbaseMaturity - 1)`, subtracting at `uint16`, so a zero
+    /// coinbase maturity wraps to a distance of 65535 blocks.  Widening
+    /// first made it -1, an ancestor above the node that never exists,
+    /// so the maturing values were dropped and the balance read as zero.
+    #[test]
+    fn treasury_balance_maturity_subtracts_at_u16_like_dcrd() {
+        let mut params = dcroxide_chaincfg::regnet_params();
+        params.coinbase_maturity = 0;
+        let mut chain = Chain::new(&params, Hash::ZERO, false);
+        let genesis = chain.best_chain.genesis().expect("genesis");
+        let genesis_hash = chain.store.node(genesis).hash;
+
+        // A node 65535 blocks above genesis, so dcrd's wrapped distance
+        // lands exactly on the genesis block.
+        let mut header = params.genesis_block.header;
+        header.prev_block = genesis_hash;
+        header.height = 65535;
+        let prev = chain.store.new_node(&header, Some(genesis));
+        let prev_hash = chain.store.node(prev).hash;
+
+        chain.treasury_state.insert(
+            prev_hash.0,
+            crate::treasurydb::TreasuryState {
+                balance: 100,
+                values: Vec::new(),
+            },
+        );
+        chain.treasury_state.insert(
+            genesis_hash.0,
+            crate::treasurydb::TreasuryState {
+                balance: 0,
+                values: alloc::vec![crate::treasurydb::TreasuryValue {
+                    typ: crate::treasurydb::TreasuryValueType::TAdd,
+                    amount: 7,
+                }],
+            },
+        );
+
+        assert_eq!(chain.calculate_treasury_balance(prev, &params), 107);
     }
 }

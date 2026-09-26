@@ -170,12 +170,21 @@ pub fn next_threshold_state(
     let Some(prev_height) = prev_height else {
         return tuple(ThresholdState::Defined, None);
     };
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "prev_height is a block height (a u32 header height widened to i64), and svh \
+                  plus the u32 confirmation_window is a sum of network parameters"
+    )]
     if prev_height + 1 < svh + confirmation_window {
         return tuple(ThresholdState::Defined, None);
     }
 
     // Get the ancestor that is the last block of the previous
     // confirmation window.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "prev_height is a block height (a u32 header height widened to i64)"
+    )]
     let want_height = calc_want_height(svh, rule_change_interval, prev_height + 1);
 
     // Collect the confirmation-window boundary nodes back to the
@@ -215,6 +224,10 @@ pub fn next_threshold_state(
             break;
         }
         needed_heights.push((h, hash));
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "h >= 0 since the view has a node there, less the u32 confirmation_window"
+        )]
         let next = h - confirmation_window;
         walk_height = if next >= 0 { Some(next) } else { None };
     }
@@ -266,6 +279,13 @@ pub fn next_threshold_state(
                     let mut total_non_abstain_votes: u32 = 0;
                     let mut choice_counts = vec![0u32; vote.choices.len()];
                     let mut count_height = h;
+                    #[allow(
+                        clippy::arithmetic_side_effects,
+                        reason = "every deployment defines at least one vote choice, so \
+                                  choices.len() - 1 cannot underflow; count_height >= 1 at the \
+                                  decrement: the loop stops at height 0 and a view has no node \
+                                  at a negative height"
+                    )]
                     for _ in 0..confirmation_window {
                         let found = view.visit_votes(count_height, &mut |votes| {
                             for (version, bits) in votes {
@@ -277,9 +297,11 @@ pub fn next_threshold_state(
                                 if choice_idx > vote.choices.len() - 1 {
                                     continue;
                                 }
-                                choice_counts[choice_idx] += 1;
+                                choice_counts[choice_idx] =
+                                    choice_counts[choice_idx].wrapping_add(1);
                                 if !vote.choices[choice_idx].is_abstain {
-                                    total_non_abstain_votes += 1;
+                                    total_non_abstain_votes =
+                                        total_non_abstain_votes.wrapping_add(1);
                                 }
                             }
                         });
@@ -293,8 +315,13 @@ pub fn next_threshold_state(
                     }
 
                     if total_non_abstain_votes >= params.rule_change_activation_quorum {
+                        #[allow(
+                            clippy::arithmetic_side_effects,
+                            reason = "rule_change_activation_divisor is a positive network \
+                                      parameter (4), never 0"
+                        )]
                         let threshold = total_non_abstain_votes
-                            * params.rule_change_activation_multiplier
+                            .wrapping_mul(params.rule_change_activation_multiplier)
                             / params.rule_change_activation_divisor;
                         for (choice_idx, choice) in vote.choices.iter().enumerate() {
                             if choice.is_abstain || choice_counts[choice_idx] < threshold {
@@ -390,6 +417,10 @@ pub fn state_last_changed(
     // validation height and had a full interval to change.
     let confirmation_interval = i64::from(params.rule_change_activation_interval);
     let svh = params.stake_validation_height;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "svh plus the u32 confirmation_interval is a sum of network parameters"
+    )]
     if node_height < svh + confirmation_interval {
         return None;
     }
@@ -397,6 +428,10 @@ pub fn state_last_changed(
     // Determine the current state.  Notice that nextThresholdState
     // always calculates the state for the block after the provided
     // one, so use the parent to get the state for the requested block.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "node_height >= svh + confirmation_interval >= 1 after the early return"
+    )]
     let cur_state = next_threshold_state(
         view,
         Some(node_height - 1),
@@ -411,8 +446,17 @@ pub fn state_last_changed(
     // boundary, loop backwards one interval at a time to determine
     // when (and if) the state changed.
     let final_node_height = calc_want_height(svh, confirmation_interval, node_height);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "calc_want_height returns a height below node_height, a block height"
+    )]
     let mut walk_height = final_node_height + 1;
     let mut prior_state_change_height = walk_height;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "walk_height >= 1 by the loop condition, less 1 or the u32 \
+                  confirmation_interval"
+    )]
     while walk_height >= 1 {
         // As previously mentioned, nextThresholdState always
         // calculates the state for the block after the provided one,

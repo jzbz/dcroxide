@@ -31,6 +31,11 @@ const BLOCK_HDR_SIZE: usize = MAX_BLOCK_HEADER_PAYLOAD;
 
 /// The number of bytes the transaction's outputs take when serialized
 /// as minimal outputs (dcrd `serializeSizeForMinimalOutputs`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "each output adds at most 30 VLQ bytes, less than its own in-memory size, plus \
+              its script's allocated length, so the sum stays far below usize::MAX"
+)]
 pub fn serialize_size_for_minimal_outputs(tx: &MsgTx) -> usize {
     let mut sz = serialize_size_vlq(tx.tx_out.len() as u64);
     for out in &tx.tx_out {
@@ -46,6 +51,12 @@ pub fn serialize_size_for_minimal_outputs(tx: &MsgTx) -> usize {
 /// target, which must be large enough per
 /// [`serialize_size_for_minimal_outputs`]; returns the bytes written
 /// (dcrd `putTxToMinimalOutputs`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offset <= target.len() after every step, since each put_vlq and copy writes \
+              inside target[offset..], and adding an in-memory script length to it cannot \
+              overflow usize"
+)]
 pub fn put_tx_to_minimal_outputs(target: &mut [u8], tx: &MsgTx) -> usize {
     let mut offset = put_vlq(target, tx.tx_out.len() as u64);
     for out in &tx.tx_out {
@@ -64,8 +75,19 @@ pub fn put_tx_to_minimal_outputs(target: &mut [u8], tx: &MsgTx) -> usize {
 /// Deserialize minimal outputs from the front of the data, returning
 /// them along with the bytes consumed (dcrd
 /// `deserializeToMinimalOutputs`).  Like dcrd, the input must be well
-/// formed (validate with
-/// [`read_deserialize_size_of_minimal_outputs`] first when it is not).
+/// formed.  Validating it first with
+/// [`read_deserialize_size_of_minimal_outputs`] does not make every
+/// input safe: that check, like dcrd's
+/// `readDeserializeSizeOfMinimalOutputs`, reads an output count of 2^63
+/// or more as no outputs, so such a count passes it and this function
+/// then panics allocating the vector (capacity overflow).  dcrd panics
+/// at the same point, in `make` with a negative length, so the panic is
+/// kept for parity.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offset <= serialized.len(): it grows only by the bytes just consumed from \
+              serialized[offset..]"
+)]
 pub fn deserialize_to_minimal_outputs(serialized: &[u8]) -> (Vec<MinimalOutput>, usize) {
     let (num_outputs, mut offset) = deserialize_vlq(serialized);
     let mut min_outs = Vec::with_capacity(num_outputs as usize);
@@ -77,7 +99,7 @@ pub fn deserialize_to_minimal_outputs(serialized: &[u8]) -> (Vec<MinimalOutput>,
         offset += bytes_read;
         let (script_size, bytes_read) = deserialize_vlq(&serialized[offset..]);
         offset += bytes_read;
-        let pk_script = serialized[offset..offset + script_size as usize].to_vec();
+        let pk_script = serialized[offset..offset.wrapping_add(script_size as usize)].to_vec();
         offset += script_size as usize;
         min_outs.push(MinimalOutput {
             value: amount as i64,
@@ -117,6 +139,12 @@ pub fn block_index_key(block_hash: &Hash, block_height: u32) -> Vec<u8> {
 
 /// The serialized size of the block index entry (dcrd
 /// `blockIndexEntrySerializeSize`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "each (u32, u16) vote adds at most 5 + 3 VLQ bytes, no more than the 8 bytes it \
+              occupies in memory, and the rest is BLOCK_HDR_SIZE + 1 + a VLQ of at most 10 \
+              bytes, so the sum stays far below usize::MAX"
+)]
 pub fn block_index_entry_serialize_size(entry: &BlockIndexEntry) -> usize {
     let mut vote_info_size = 0;
     for (version, bits) in &entry.vote_info {
@@ -128,6 +156,11 @@ pub fn block_index_entry_serialize_size(entry: &BlockIndexEntry) -> usize {
 
 /// Serialize the block index entry (dcrd `serializeBlockIndexEntry`):
 /// header || status || VLQ vote count || VLQ (version, bits) pairs.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offset <= serialized.len(): it starts at BLOCK_HDR_SIZE and grows only by the \
+              status byte and the bytes each put_vlq writes inside serialized[offset..]"
+)]
 pub fn serialize_block_index_entry(entry: &BlockIndexEntry) -> Vec<u8> {
     let mut serialized = vec![0u8; block_index_entry_serialize_size(entry)];
     serialized[..BLOCK_HDR_SIZE].copy_from_slice(&entry.header.serialize());
@@ -145,6 +178,11 @@ pub fn serialize_block_index_entry(entry: &BlockIndexEntry) -> Vec<u8> {
 
 /// Decode a block index entry, returning it and the bytes consumed
 /// (dcrd `decodeBlockIndexEntry`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offset <= serialized.len(): it starts at BLOCK_HDR_SIZE, checked against the \
+              length above, and grows only by the bytes consumed from serialized[offset..]"
+)]
 pub fn decode_block_index_entry(serialized: &[u8]) -> Result<(BlockIndexEntry, usize), Error> {
     if serialized.len() < BLOCK_HDR_SIZE {
         return Err(deserialize_error(
@@ -259,6 +297,12 @@ fn encoded_flags(stxo: &SpentTxOut) -> u8 {
 
 /// The serialized size of the spent output (dcrd
 /// `spentTxOutSerializeSize`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "a one-byte flags VLQ, a compressed txout of at most 13 bytes plus the in-memory \
+              script length, and the in-memory min_outs length, so the sum stays far below \
+              usize::MAX"
+)]
 pub fn spent_tx_out_serialize_size(stxo: &SpentTxOut) -> usize {
     let flags = encoded_flags(stxo);
     let mut size = serialize_size_vlq(u64::from(flags));
@@ -277,6 +321,11 @@ pub fn spent_tx_out_serialize_size(stxo: &SpentTxOut) -> usize {
 
 /// Serialize the spent output into the target (dcrd `putSpentTxOut`);
 /// returns the bytes written.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offset <= target.len(): each put writes inside target[offset..], and adding the \
+              in-memory min_outs length to it cannot overflow usize"
+)]
 pub fn put_spent_tx_out(target: &mut [u8], stxo: &SpentTxOut) -> usize {
     let flags = encoded_flags(stxo);
     let mut offset = put_vlq(target, u64::from(flags));
@@ -298,6 +347,12 @@ pub fn put_spent_tx_out(target: &mut [u8], stxo: &SpentTxOut) -> usize {
 /// Decode a spent output from the front of the serialized data (dcrd
 /// `decodeSpentTxOut`); the amount, height, index, and spent output
 /// index come from the spending input, exactly as dcrd populates them.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offset <= serialized.len(): it grows only by the bytes decode_compressed_tx_out \
+              and read_deserialize_size_of_minimal_outputs report consuming from \
+              serialized[offset..]"
+)]
 pub fn decode_spent_tx_out(
     serialized: &[u8],
     amount: i64,
@@ -351,6 +406,10 @@ pub fn serialize_spend_journal_entry(stxos: &[SpentTxOut]) -> Option<Vec<u8>> {
     let size: usize = stxos.iter().map(spent_tx_out_serialize_size).sum();
     let mut serialized = vec![0u8; size];
     let mut offset = 0;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "offset <= size: each put_spent_tx_out writes inside serialized[offset..]"
+    )]
     for stxo in stxos.iter().rev() {
         offset += put_spent_tx_out(&mut serialized[offset..], stxo);
     }
@@ -369,6 +428,11 @@ pub fn deserialize_spend_journal_entry<T: core::borrow::Borrow<MsgTx>>(
 ) -> Result<Vec<SpentTxOut>, Error> {
     // Calculate the total number of stxos.
     let mut num_stxos = 0usize;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "one per input (or per vote) of the passed in-memory transactions, so at most \
+                  the sum of their tx_in lengths, far below usize::MAX"
+    )]
     for tx in txns {
         let tx = tx.borrow();
         if dcroxide_stake::is_ssgen(tx) {
@@ -392,11 +456,22 @@ pub fn deserialize_spend_journal_entry<T: core::borrow::Borrow<MsgTx>>(
     // Loop backwards through all transactions so everything is read in
     // reverse order to match the serialization order.
     let mut stxos: Vec<SpentTxOut> = vec![SpentTxOut::default(); num_stxos];
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "vec! just allocated num_stxos elements, so 0 <= num_stxos <= isize::MAX and \
+                  the difference is at least -1"
+    )]
     let mut stxo_idx = num_stxos as isize - 1;
     let mut offset = 0usize;
     for tx in txns.iter().rev() {
         let tx = tx.borrow();
         let is_vote = dcroxide_stake::is_ssgen(tx);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the stxos index just before the decrement succeeded, so stxo_idx >= 0 \
+                      there; offset <= serialized.len() since n is the bytes \
+                      decode_spent_tx_out consumed from serialized[offset..]"
+        )]
         for (tx_in_idx, tx_in) in tx.tx_in.iter().enumerate().rev() {
             if tx_in_idx == 0 && is_vote {
                 continue;
@@ -428,6 +503,12 @@ pub fn deserialize_spend_journal_entry<T: core::borrow::Borrow<MsgTx>>(
 
 /// Serialize the header commitment hashes (dcrd
 /// `serializeHeaderCommitments`); an empty list serializes to nothing.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "commitments is an in-memory slice of HASH_SIZE-byte hashes, so len * HASH_SIZE \
+              <= isize::MAX leaves room for the VLQ, and offset walks one hash per commitment \
+              up to exactly serialized_len"
+)]
 pub fn serialize_header_commitments(commitments: &[Hash]) -> Vec<u8> {
     if commitments.is_empty() {
         return Vec::new();
@@ -471,6 +552,12 @@ pub fn deserialize_header_commitments(serialized: &[u8]) -> Result<Vec<Hash>, Er
     }
     let mut commitments = Vec::with_capacity(num_commitments as usize);
     let mut offset = offset;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "Vec::with_capacity above rejects any count whose byte size overflows isize, so \
+                  the length check compared the exact num_commitments * HASH_SIZE and offset + \
+                  HASH_SIZE <= serialized.len() on every pass"
+    )]
     for _ in 0..num_commitments {
         let mut hash = [0u8; HASH_SIZE];
         hash.copy_from_slice(&serialized[offset..offset + HASH_SIZE]);
@@ -517,6 +604,10 @@ pub fn serialize_best_chain_state(state: &BestChainState) -> Vec<u8> {
     }
     let work_sum_bytes = &work_sum_bytes_array[first_nonzero..];
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "HASH_SIZE + 24 fixed bytes plus at most the 32 work sum bytes"
+    )]
     let mut serialized = Vec::with_capacity(HASH_SIZE + 4 + 8 + 8 + 4 + work_sum_bytes.len());
     serialized.extend_from_slice(&state.hash.0);
     serialized.extend_from_slice(&state.height.to_le_bytes());
@@ -529,6 +620,11 @@ pub fn serialize_best_chain_state(state: &BestChainState) -> Vec<u8> {
 
 /// Deserialize the best chain state (dcrd
 /// `deserializeBestChainState`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "offset only walks the fixed-width fields, up to HASH_SIZE + 24 = \
+              expected_min_len, which the length check bounds by serialized.len()"
+)]
 pub fn deserialize_best_chain_state(serialized: &[u8]) -> Result<BestChainState, Error> {
     let expected_min_len = HASH_SIZE + 4 + 8 + 8 + 4;
     if serialized.len() < expected_min_len {
@@ -549,17 +645,20 @@ pub fn deserialize_best_chain_state(serialized: &[u8]) -> Result<BestChainState,
         u64::from_le_bytes(serialized[offset..offset + 8].try_into().expect("8")) as i64;
     offset += 8;
     let work_sum_bytes_len =
-        u32::from_le_bytes(serialized[offset..offset + 4].try_into().expect("4")) as usize;
+        u32::from_le_bytes(serialized[offset..offset + 4].try_into().expect("4"));
     offset += 4;
-    if serialized[offset..].len() < work_sum_bytes_len {
+    // dcrd's offset and lengths here are uint32: it compares the
+    // remaining length truncated to uint32 and ends the work slice at
+    // the wrapping uint32 sum (chainio.go:1220,1235-1240).
+    let remaining = serialized[offset..].len() as u32;
+    if remaining < work_sum_bytes_len {
         return Err(deserialize_error(format!(
-            "corrupt work sum size; want {work_sum_bytes_len} got {}",
-            serialized[offset..].len()
+            "corrupt work sum size; want {work_sum_bytes_len} got {remaining}"
         )));
     }
     // dcrd loads the work bytes with SetByteSlice, which truncates to
     // the trailing 32 bytes (modulo 2^256).
-    let work_bytes = &serialized[offset..offset + work_sum_bytes_len];
+    let work_bytes = &serialized[offset..(offset as u32).wrapping_add(work_sum_bytes_len) as usize];
 
     Ok(BestChainState {
         hash: Hash(hash),
@@ -568,4 +667,43 @@ pub fn deserialize_best_chain_state(serialized: &[u8]) -> Result<BestChainState,
         total_subsidy,
         work_sum: Uint256::from_be_slice(work_bytes),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// dcrd measures the bytes left for the work sum as a uint32
+    /// (`chainio.go:1235`), so a record with exactly 2^32 bytes after
+    /// the fixed fields reads as 0 remaining and is rejected as
+    /// corrupt, where a usize comparison would accept it and load the
+    /// work sum.  The buffer comes from a zeroed allocation, so only
+    /// the pages written or read are ever touched.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn best_chain_state_work_sum_length_check_is_uint32() {
+        const FIXED_LEN: usize = HASH_SIZE + 4 + 8 + 8 + 4;
+        let mut serialized = vec![0u8; FIXED_LEN + (1 << 32)];
+        serialized[FIXED_LEN - 4..FIXED_LEN].copy_from_slice(&32u32.to_le_bytes());
+        let err = deserialize_best_chain_state(&serialized).unwrap_err();
+        assert_eq!(err.to_string(), "corrupt work sum size; want 32 got 0");
+    }
+
+    /// dcrd ends the work sum slice at the uint32 sum `offset +
+    /// workSumBytesLen` (`chainio.go:1240`), which wraps: with 2^32 - 1
+    /// bytes after the 56 fixed bytes and a work sum length of
+    /// u32::MAX, the length check passes and the end wraps to 55, so
+    /// `serializedData[56:55]` panics.  A usize end would reach exactly
+    /// the buffer length and load the work sum instead.  The buffer
+    /// comes from a zeroed allocation, and the work sum load reads only
+    /// the trailing 32 bytes.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[should_panic(expected = "slice index starts at 56 but ends at 55")]
+    fn best_chain_state_work_sum_slice_end_is_uint32() {
+        const FIXED_LEN: usize = HASH_SIZE + 4 + 8 + 8 + 4;
+        let mut serialized = vec![0u8; FIXED_LEN + (1 << 32) - 1];
+        serialized[FIXED_LEN - 4..FIXED_LEN].copy_from_slice(&u32::MAX.to_le_bytes());
+        let _ = deserialize_best_chain_state(&serialized);
+    }
 }

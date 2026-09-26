@@ -33,6 +33,10 @@ pub fn fast_log2_floor(mut n: u32) -> u8 {
     let mut rv: u8 = 0;
     let mut exponent: u8 = 16;
     for mask in LOG2_FLOOR_MASKS {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "rv sums distinct exponents from 16, 8, 4, 2, 1, so rv <= 31"
+        )]
         if n & mask != 0 {
             rv += exponent;
             n >>= exponent;
@@ -79,7 +83,15 @@ impl NodeChainView {
         // Resize to exactly the number of nodes the new tip implies,
         // clearing any newly exposed slots so the ancestry walk below
         // fills them.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "node heights come from the u32 header height, so height + 1 <= 2^32"
+        )]
         let needed = (store.node(tip).height + 1) as usize;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "needed <= 2^32, and self.nodes.len() <= capacity < needed, so the reservation neither overflows nor underflows"
+        )]
         if self.nodes.capacity() < needed {
             self.nodes
                 .reserve(needed + APPROX_NODES_PER_WEEK - self.nodes.len());
@@ -100,6 +112,10 @@ impl NodeChainView {
     }
 
     /// The height of the tip; -1 when empty (dcrd `Height`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a Vec's len is at most isize::MAX, so len as i64 - 1 >= -1"
+    )]
     pub fn height(&self) -> i64 {
         self.nodes.len() as i64 - 1
     }
@@ -126,6 +142,10 @@ impl NodeChainView {
 
     /// The successor of the given node in the view, if the node is in
     /// the view and a successor exists (dcrd `Next`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "node heights come from the u32 header height, so height + 1 <= 2^32"
+    )]
     pub fn next(&self, store: &NodeStore, node: NodeId) -> Option<NodeId> {
         if !self.contains(store, node) {
             return None;
@@ -164,6 +184,10 @@ impl NodeChainView {
         };
 
         let node_height = store.node(node).height;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "node_height is in 0..=12 in the first arm and in 13..=u32::MAX (a u32 header height) in the second, and fast_log2_floor returns at most 31"
+        )]
         let max_entries = if node_height <= 12 {
             node_height as usize + 1
         } else {
@@ -185,6 +209,10 @@ impl NodeChainView {
 
             // The height of the previous node to include, ensuring the
             // final node is the genesis block.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "height is a u32 header height and step <= 2^33 (see the doubling below), so height - step >= -2^33"
+            )]
             let prev_height = (height - step).max(0);
 
             // O(1) lookup when the node is in the view; otherwise walk
@@ -201,6 +229,10 @@ impl NodeChainView {
 
             // Once 11 entries are included, start doubling the
             // distance between included hashes.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "every entry is lower than the last, and once step exceeds the u32 height the next entry is genesis, which ends the walk, so step <= 2^33"
+            )]
             if locator.len() > 10 {
                 step *= 2;
             }

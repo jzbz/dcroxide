@@ -67,6 +67,10 @@ pub fn count_spent_regular_outputs(block: &MsgBlock) -> usize {
 
 /// The number of utxos the stake transactions in the block spend
 /// (dcrd `countSpentStakeOutputs`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "counts the block's in-memory stake transactions and their inputs, each at least one byte, so the sum fits usize"
+)]
 pub fn count_spent_stake_outputs(block: &MsgBlock) -> usize {
     let mut num_spent = 0;
     for stx in &block.stransactions {
@@ -88,6 +92,10 @@ pub fn count_spent_stake_outputs(block: &MsgBlock) -> usize {
 
 /// The number of utxos the passed block spends (dcrd
 /// `countSpentOutputs`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "both counts are of the block's in-memory transactions and inputs, each at least one byte, so the sum fits usize"
+)]
 pub fn count_spent_outputs(block: &MsgBlock) -> usize {
     count_spent_regular_outputs(block) + count_spent_stake_outputs(block)
 }
@@ -331,6 +339,10 @@ impl UtxoView {
         if tx_out_idx >= tx.tx_out.len() as u32 {
             return;
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "tx_out_idx < tx.tx_out.len() as u32 <= u32::MAX was checked above, so tx_out_idx + 1 fits u32"
+        )]
         self.add_tx_outs_internal(
             tx,
             tx_hash,
@@ -565,6 +577,10 @@ impl UtxoView {
         is_treasury_enabled: bool,
     ) -> Result<(), RuleError> {
         let num_spent_regular = count_spent_regular_outputs(block);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "stxos.len() and num_spent_regular count in-memory items, at most isize::MAX each, so the differences minus 1 fit i64"
+        )]
         let (mut stxo_idx, transactions) = if stake_tree {
             (
                 stxos.len() as i64 - num_spent_regular as i64 - 1,
@@ -647,6 +663,10 @@ impl UtxoView {
             }
 
             // Restore the inputs from the journal in reverse order.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "stxo_idx indexes stxos just before each decrement, so it is >= 0 there and stxo_idx - 1 >= -1"
+            )]
             for tx_in_idx in (0..tx.tx_in.len()).rev() {
                 if is_vote && tx_in_idx == 0 {
                     continue;
