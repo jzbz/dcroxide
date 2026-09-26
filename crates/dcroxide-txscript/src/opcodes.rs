@@ -206,6 +206,11 @@ pub(crate) fn opcode_1negate(
 }
 
 /// Push the small integer 1-16 the opcode represents (dcrd `opcodeN`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "opcode_n is dispatched only for OP_1..=OP_16 (opcode table), so \
+              op.value - (OP_1 - 1) is 1..=16"
+)]
 pub(crate) fn opcode_n(op: &OpcodeInfo, _data: &[u8], vm: &mut Engine) -> Result<(), ScriptError> {
     // The opcodes are all defined consecutively, so the numeric value is
     // the difference.
@@ -236,6 +241,11 @@ pub(crate) fn opcode_nop(
 
 /// OP_IF (dcrd `opcodeIf`); executed even on non-executing branches so
 /// nesting is maintained.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "each OP_IF/OP_NOTIF counts toward MAX_OPS_PER_SCRIPT = 255 before it runs and a \
+              script must end with no open conditional, so cond_nest_depth + 1 <= 255"
+)]
 pub(crate) fn opcode_if(
     _op: &OpcodeInfo,
     _data: &[u8],
@@ -255,6 +265,11 @@ pub(crate) fn opcode_if(
 }
 
 /// OP_NOTIF (dcrd `opcodeNotIf`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "each OP_IF/OP_NOTIF counts toward MAX_OPS_PER_SCRIPT = 255 before it runs and a \
+              script must end with no open conditional, so cond_nest_depth + 1 <= 255"
+)]
 pub(crate) fn opcode_notif(
     _op: &OpcodeInfo,
     _data: &[u8],
@@ -286,6 +301,11 @@ pub(crate) fn opcode_else(
         ));
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "cond_nest_depth starts at 0 and only OP_ENDIF lowers it, when nonzero, so \
+                  it is >= 1 past the check above"
+    )]
     let conditional_depth = vm.cond_nest_depth - 1;
     if vm.is_branch_executing() {
         // Branch execution is being disabled when it was not previously,
@@ -301,6 +321,11 @@ pub(crate) fn opcode_else(
 }
 
 /// OP_ENDIF (dcrd `opcodeEndif`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "cond_nest_depth starts at 0 and is lowered only here, when nonzero, so it is \
+              >= 1 past the check below"
+)]
 pub(crate) fn opcode_endif(
     op: &OpcodeInfo,
     _data: &[u8],
@@ -709,6 +734,10 @@ pub(crate) fn opcode_cat(
     }
 
     // Ensure the result does not overflow the maximum stack item size.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "each length is at most isize::MAX (a Vec's limit), so the sum fits in usize"
+    )]
     let combined_len = a.len() + b.len();
     if combined_len > MAX_SCRIPT_ELEMENT_SIZE {
         return Err(script_error(
@@ -1000,6 +1029,11 @@ pub(crate) fn opcode_rotl(
 }
 
 /// OP_1ADD (dcrd `opcode1Add`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "pop_int with MATH_OP_CODE_MAX_SCRIPT_NUM_LEN = 4 bounds each operand to \
+              |v| <= 2^31 - 1, so the i64 result is within 2^32 of zero"
+)]
 pub(crate) fn opcode_1add(
     _op: &OpcodeInfo,
     _data: &[u8],
@@ -1011,6 +1045,11 @@ pub(crate) fn opcode_1add(
 }
 
 /// OP_1SUB (dcrd `opcode1Sub`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "pop_int with MATH_OP_CODE_MAX_SCRIPT_NUM_LEN = 4 bounds each operand to \
+              |v| <= 2^31 - 1, so the i64 result is within 2^32 of zero"
+)]
 pub(crate) fn opcode_1sub(
     _op: &OpcodeInfo,
     _data: &[u8],
@@ -1022,6 +1061,11 @@ pub(crate) fn opcode_1sub(
 }
 
 /// OP_NEGATE (dcrd `opcodeNegate`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "pop_int with MATH_OP_CODE_MAX_SCRIPT_NUM_LEN = 4 bounds each operand to \
+              |v| <= 2^31 - 1, so the i64 result is within 2^32 of zero"
+)]
 pub(crate) fn opcode_negate(
     _op: &OpcodeInfo,
     _data: &[u8],
@@ -1067,6 +1111,11 @@ pub(crate) fn opcode_0notequal(
 }
 
 /// OP_ADD (dcrd `opcodeAdd`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "pop_int with MATH_OP_CODE_MAX_SCRIPT_NUM_LEN = 4 bounds each operand to \
+              |v| <= 2^31 - 1, so the i64 result is within 2^32 of zero"
+)]
 pub(crate) fn opcode_add(
     _op: &OpcodeInfo,
     _data: &[u8],
@@ -1079,6 +1128,11 @@ pub(crate) fn opcode_add(
 }
 
 /// OP_SUB (dcrd `opcodeSub`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "pop_int with MATH_OP_CODE_MAX_SCRIPT_NUM_LEN = 4 bounds each operand to \
+              |v| <= 2^31 - 1, so the i64 result is within 2^32 of zero"
+)]
 pub(crate) fn opcode_sub(
     _op: &OpcodeInfo,
     _data: &[u8],
@@ -1106,6 +1160,11 @@ pub(crate) fn opcode_mul(
 
 /// OP_DIV (dcrd `opcodeDiv`); Go's i32::MIN / -1 == i32::MIN wrap-around is
 /// preserved via wrapping division.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "divisor != 0 is checked before the division, and wrapping_div yields Go's \
+              i32::MIN for i32::MIN / -1"
+)]
 pub(crate) fn opcode_div(
     _op: &OpcodeInfo,
     _data: &[u8],
@@ -1127,6 +1186,11 @@ pub(crate) fn opcode_div(
 }
 
 /// OP_MOD (dcrd `opcodeMod`); truncated division semantics.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "divisor != 0 is checked before the division, and wrapping_rem yields Go's 0 \
+              for i32::MIN % -1"
+)]
 pub(crate) fn opcode_mod(
     _op: &OpcodeInfo,
     _data: &[u8],
@@ -1482,7 +1546,15 @@ pub(crate) fn opcode_check_sig(
     // signature or public encoding to result in an immediate script error
     // (no result bool is pushed to the data stack), unlike the parse
     // failures below which push false.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "full_sig_bytes is non-empty (checked above), so len() - 1 >= 0"
+    )]
     let hash_type = SigHashType(full_sig_bytes[full_sig_bytes.len() - 1]);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "full_sig_bytes is non-empty (checked above), so len() - 1 >= 0"
+    )]
     let sig_bytes = &full_sig_bytes[..full_sig_bytes.len() - 1];
     check_hash_type_encoding(hash_type)?;
     check_signature_encoding(sig_bytes)?;
@@ -1566,7 +1638,14 @@ pub(crate) fn opcode_check_multi_sig(
             format!("too many pubkeys: {num_pub_keys} > {MAX_PUB_KEYS_PER_MULTI_SIG}"),
         ));
     }
-    vm.num_ops += num_pub_keys as i32;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "num_pub_keys <= MAX_PUB_KEYS_PER_MULTI_SIG = 20 (checked above) and num_ops \
+                  <= MAX_OPS_PER_SCRIPT = 255 after this opcode's own count, so at most 275"
+    )]
+    {
+        vm.num_ops += num_pub_keys as i32;
+    }
     if vm.num_ops > MAX_OPS_PER_SCRIPT {
         return Err(script_error(
             ErrorKind::TooManyOperations,
@@ -1616,15 +1695,30 @@ pub(crate) fn opcode_check_multi_sig(
     }
 
     let mut success = true;
-    num_pub_keys += 1;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "num_pub_keys <= MAX_PUB_KEYS_PER_MULTI_SIG = 20 (checked above)"
+    )]
+    {
+        num_pub_keys += 1;
+    }
     let mut pub_key_idx: isize = -1;
     let mut signature_idx = 0usize;
     while num_signatures > 0 {
         // When there are more signatures than public keys remaining, there
         // is no way to succeed since too many signatures are invalid, so
         // exit early.
-        pub_key_idx += 1;
-        num_pub_keys -= 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the loop runs while num_signatures >= 1 and the check below left \
+                      num_signatures <= num_pub_keys (initially num_pub_keys was raised to one \
+                      more than the key count), so num_pub_keys >= 1 here, and pub_key_idx, \
+                      one step per pass, stays below the key count"
+        )]
+        {
+            pub_key_idx += 1;
+            num_pub_keys -= 1;
+        }
         if num_signatures > num_pub_keys {
             success = false;
             break;
@@ -1642,7 +1736,15 @@ pub(crate) fn opcode_check_multi_sig(
         }
 
         // Split the signature into hash type and signature components.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "raw_sig is non-empty (checked above), so len() - 1 >= 0"
+        )]
         let hash_type = SigHashType(raw_sig[raw_sig.len() - 1]);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "raw_sig is non-empty (checked above), so len() - 1 >= 0"
+        )]
         let signature = &raw_sig[..raw_sig.len() - 1];
 
         // Only parse and check the signature encoding once.
@@ -1687,6 +1789,11 @@ pub(crate) fn opcode_check_multi_sig(
             pub_key,
             || parsed_sig.verify(&hash, &parsed_pub_key),
         );
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "num_signatures >= 1 inside the loop, and signature_idx + num_signatures \
+                      stays equal to the signature count, so signature_idx + 1 <= it"
+        )]
         if valid {
             // PubKey verified, move on to the next signature.
             signature_idx += 1;
@@ -1766,7 +1873,15 @@ pub(crate) fn opcode_check_sig_alt(
     // Trim off hashtype from the signature string; the hash type check
     // results in an immediate script error, unlike the parse failures
     // below which push false.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "full_sig_bytes.len() == 65 (checked above), so len() - 1 = 64"
+    )]
     let hash_type = SigHashType(full_sig_bytes[full_sig_bytes.len() - 1]);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "full_sig_bytes.len() == 65 (checked above), so len() - 1 = 64"
+    )]
     let sig_bytes = &full_sig_bytes[..full_sig_bytes.len() - 1];
     check_hash_type_encoding(hash_type)?;
 

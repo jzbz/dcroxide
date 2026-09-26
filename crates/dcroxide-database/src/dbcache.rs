@@ -73,6 +73,11 @@ pub(crate) type CacheLayer = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 const NODE_FIELDS_SIZE: u64 = 72;
 
 /// The size one entry is counted at (dcrd treap `nodeSize`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "72 plus the lengths of a key and value held in memory at once, so the sum is far \
+              below u64::MAX"
+)]
 fn node_size(key_len: usize, value: Option<&[u8]>) -> u64 {
     NODE_FIELDS_SIZE + key_len as u64 + value.map_or(0, |v| v.len() as u64)
 }
@@ -601,6 +606,10 @@ impl DbCache {
                         .saturating_sub(displaced.map_or(0, |v| v.len() as u64))
                         .saturating_add(added);
                 }
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "72 plus a key's length, at most isize::MAX"
+                )]
                 None => {
                     self.total_size = self
                         .total_size
@@ -788,6 +797,11 @@ impl DbCache {
 
     /// Retire a batch under the cache lock once its commit has landed,
     /// or put its bytes back when it failed.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the only site is the debug_assert's layers.len() - pinned, which its && \
+                  evaluates only once layers.len() >= pinned"
+    )]
     pub(crate) fn finish_flush(&mut self, batch: FlushBatch, outcome: Option<FlushOutcome>) {
         let pinned = self.in_flight_layers;
         self.in_flight_layers = 0;

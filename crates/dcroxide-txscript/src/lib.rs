@@ -20,13 +20,6 @@
 //! of the same names.
 
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
-// The engine's arithmetic mirrors dcrd's Go semantics, with wrapping or
-// checked forms where an operation is known to wrap, and index arithmetic
-// bounds-checked by construction.  A plain operator that overflows panics
-// only in dev and test builds: release builds wrap at the Rust type's width
-// (`overflow-checks = false`), so a missed site is silent there unless CI's
-// `test-wrapping` job exercises it.
-#![allow(clippy::arithmetic_side_effects)]
 
 extern crate alloc;
 

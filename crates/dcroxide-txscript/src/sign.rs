@@ -240,7 +240,14 @@ fn sign_multi_sig(
         };
 
         builder = builder.add_data(&sig);
-        signed += 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "one increment per address, and a standard multisig script names at most \
+                      16 keys (a small-int count), so signed <= 16"
+        )]
+        {
+            signed += 1;
+        }
         if signed == n_required {
             break;
         }
@@ -430,7 +437,15 @@ fn merge_multi_sig(
         if sig.is_empty() {
             continue;
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "sig is non-empty (checked above), so sig.len() - 1 >= 0"
+        )]
         let t_sig = &sig[..sig.len() - 1];
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "sig is non-empty (checked above), so sig.len() - 1 >= 0"
+        )]
         let hash_type = SigHashType(sig[sig.len() - 1]);
 
         let Ok(p_sig) = dcroxide_dcrec::secp256k1::ecdsa::parse_der_signature(t_sig) else {
@@ -471,7 +486,14 @@ fn merge_multi_sig(
             continue;
         };
         builder = builder.add_data(sig);
-        done_sigs += 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "one increment per address, and a standard multisig script names at most \
+                      16 keys (a small-int count), so done_sigs <= 16"
+        )]
+        {
+            done_sigs += 1;
+        }
         if done_sigs == n_required {
             break;
         }

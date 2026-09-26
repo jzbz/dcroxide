@@ -28,6 +28,11 @@ const ORDER: [u8; 32] = [
 fn cmp_be(bytes: &[u8], constant: &[u8; 32]) -> core::cmp::Ordering {
     debug_assert!(bytes.len() <= 32);
     let mut padded = [0u8; 32];
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "check_signature_encoding returns before both calls when s_bytes.len() > 32 \
+                  (asserted above), so 32 - bytes.len() >= 0"
+    )]
     padded[32 - bytes.len()..].copy_from_slice(bytes);
     padded.cmp(constant)
 }
@@ -72,6 +77,10 @@ pub fn check_signature_encoding(sig: &[u8]) -> Result<(), ScriptError> {
         ));
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "sig_len >= MIN_SIG_LEN = 8 is checked above, so sig_len - 2 >= 6"
+    )]
     if usize::from(sig[DATA_LEN_OFFSET]) != sig_len - 2 {
         return Err(script_error(
             ErrorKind::SigInvalidDataLen,
@@ -87,6 +96,11 @@ pub fn check_signature_encoding(sig: &[u8]) -> Result<(), ScriptError> {
     // inside the signature.
     let r_len = usize::from(sig[R_LEN_OFFSET]);
     let s_type_offset = R_OFFSET + r_len;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "r_len is a byte value <= 255, so s_type_offset = R_OFFSET + r_len <= 259 \
+                  and s_type_offset + 1 <= 260"
+    )]
     let s_len_offset = s_type_offset + 1;
     if s_type_offset >= sig_len {
         return Err(script_error(
@@ -103,8 +117,16 @@ pub fn check_signature_encoding(sig: &[u8]) -> Result<(), ScriptError> {
 
     // The lengths of R and S must match the overall length of the
     // signature.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "s_len_offset < sig_len <= MAX_SIG_LEN = 72 is checked above, so s_offset <= 72"
+    )]
     let s_offset = s_len_offset + 1;
     let s_len = usize::from(sig[s_len_offset]);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "s_offset <= 72 and s_len is a byte value <= 255, so the sum is at most 327"
+    )]
     if s_offset + s_len != sig_len {
         return Err(script_error(
             ErrorKind::SigInvalidSLen,
@@ -177,6 +199,11 @@ pub fn check_signature_encoding(sig: &[u8]) -> Result<(), ScriptError> {
 
     // Null bytes at the start of S are not allowed, unless S would
     // otherwise be interpreted as a negative number.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "s_offset + s_len == sig_len <= 72 is checked above and s_len > 1 here, so \
+                  s_offset + 1 < sig_len"
+    )]
     if s_len > 1 && sig[s_offset] == 0x00 && sig[s_offset + 1] & 0x80 == 0 {
         return Err(script_error(
             ErrorKind::SigTooMuchSPadding,
@@ -185,6 +212,10 @@ pub fn check_signature_encoding(sig: &[u8]) -> Result<(), ScriptError> {
     }
 
     // Strip leading zeroes from S.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "s_offset + s_len == sig_len <= 72 is checked above"
+    )]
     let mut s_bytes = &sig[s_offset..s_offset + s_len];
     while !s_bytes.is_empty() && s_bytes[0] == 0x00 {
         s_bytes = &s_bytes[1..];

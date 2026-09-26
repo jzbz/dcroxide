@@ -44,6 +44,10 @@ impl BitWriter {
 
     /// Append the n least significant bits of the data, most
     /// significant bit first (dcrd `writeNBits`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "n is in 1..=64 at the shift (asserted, zero returned early), and each decrement is guarded by its loop condition (n > 0 or n >= 8)"
+    )]
     pub(crate) fn write_n_bits(&mut self, mut data: u64, mut n: u32) {
         assert!(n <= 64, "gcs: cannot write more than 64 bits of a uint64");
         // Writing zero bits is a no-op (Go's shift by 64 zeroes the
@@ -118,6 +122,10 @@ impl<'a> BitReader<'a> {
             if self.bytes.is_empty() {
                 return Err(());
             }
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "value counts one bits of an in-memory byte slice: reaching u64::MAX would take 2^61 bytes (2 EiB), beyond any address space"
+            )]
             while self.next != 0 {
                 let bit = self.bytes[0] & self.next;
                 self.next >>= 1;
@@ -133,6 +141,10 @@ impl<'a> BitReader<'a> {
 
     /// Read n bits as an unsigned integer, most significant bit first
     /// (dcrd `readNBits`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "each decrement of n is guarded by its loop condition (n > 0 or n >= 8)"
+    )]
     pub(crate) fn read_n_bits(&mut self, n: u32) -> Result<u64, ()> {
         assert!(n <= 64, "gcs: cannot read more than 64 bits as a uint64");
         if n == 0 {

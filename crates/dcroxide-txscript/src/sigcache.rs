@@ -229,6 +229,11 @@ impl SigCache {
 
         // The modulo bias is below one part in 2^40 for any cache
         // that fits in memory.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "len != 0 is checked above and both operands are unsigned, so the \
+                      remainder cannot panic"
+        )]
         let slot = (draw % len as u64) as usize;
         let victim = valid_sigs.keys.swap_remove(slot);
         valid_sigs.entries.remove(&victim);
@@ -281,6 +286,10 @@ impl SigCache {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over small fixed values"
+)]
 mod tests {
     use super::{SigCache, SigCacheSuite};
     use crate::sign::SignatureType;

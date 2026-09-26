@@ -226,6 +226,10 @@ pub fn check_tspend(mtx: &MsgTx) -> Result<(Vec<u8>, Vec<u8>), RuleError> {
 
     // All outputs after the first one must have OP_TGEN tagged p2pkh
     // or p2sh scripts.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "tx_out_idx enumerates tx_out[1..], so tx_out_idx + 1 <= tx_out.len()"
+    )]
     for (tx_out_idx, tx_out) in mtx.tx_out[1..].iter().enumerate() {
         let script: &[u8] = &tx_out.pk_script;
         if script[0] != OP_TGEN {
@@ -374,6 +378,10 @@ pub fn is_treasury_base(tx: &MsgTx) -> bool {
 /// Lowercase hex of a byte slice (Go's `%x` of a `[]byte`).
 fn hex_lower(bytes: &[u8]) -> alloc::string::String {
     use core::fmt::Write;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a slice length is at most isize::MAX, so doubling it fits in usize"
+    )]
     let mut out = alloc::string::String::with_capacity(bytes.len() * 2);
     for b in bytes {
         let _ = write!(out, "{b:02x}");

@@ -19,10 +19,6 @@
 // because the P2P, RPC and mixing crates legitimately hash (see
 // ADR-0008); note the lint fires only on `for` loops.
 #![deny(clippy::iter_over_hash_type)]
-// All arithmetic here is hex-digit math and cursor positions bounded by the
-// fixed 32-byte/64-char sizes. The workspace lint stays on for consensus-math
-// crates (amounts, difficulty, subsidies).
-#![allow(clippy::arithmetic_side_effects)]
 
 use core::fmt;
 use core::str::FromStr;
@@ -151,6 +147,11 @@ impl fmt::Display for Hash {
 }
 
 /// Value of a hex digit, or an error carrying the offending byte.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "each arm's range pattern puts b at or above the value subtracted, so b - b'0' \
+              <= 9 and b - b'a' + 10, b - b'A' + 10 <= 15"
+)]
 fn hex_digit(b: u8) -> Result<u8, HashError> {
     match b {
         b'0'..=b'9' => Ok(b - b'0'),
@@ -181,10 +182,22 @@ impl FromStr for Hash {
         // (reversed) byte order, implicitly left-padding short strings.
         let src = s.as_bytes();
         let mut reversed = [0u8; HASH_SIZE];
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "src.len() <= MAX_HASH_STRING_SIZE = 64 is checked above, so the sum is <= 64"
+        )]
         let padded_len = src.len() + (src.len() % 2);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "padded_len <= 64 (even, and src.len() <= 64), so padded_len / 2 <= HASH_SIZE"
+        )]
         let mut out = HASH_SIZE - padded_len / 2;
 
         let mut iter = src.iter().copied();
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the store to reversed[out] is bounds-checked, so out < HASH_SIZE"
+        )]
         if !src.len().is_multiple_of(2) {
             // Odd length: dcrd prepends '0', so the first digit is a full
             // byte's low nibble. Go's hex.Decode checks the high nibble ('0',
@@ -193,6 +206,10 @@ impl FromStr for Hash {
             reversed[out] = lo;
             out += 1;
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the store to reversed[out] is bounds-checked, so out < HASH_SIZE"
+        )]
         while let Some(hi) = iter.next() {
             let hi = hex_digit(hi)?;
             let lo = hex_digit(iter.next().expect("even remainder"))?;

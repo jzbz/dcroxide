@@ -357,7 +357,14 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         if new_timestamp < min_timestamp {
             new_timestamp = min_timestamp;
         }
-        new_timestamp - self.mining_time_offset
+        // dcrd adds `time.Duration(-MiningTimeOffset) * time.Second`:
+        // the negation and the nanosecond product wrap in int64, and
+        // `time.Add` floors the wrapped duration to whole seconds.
+        let offset_nanos = self
+            .mining_time_offset
+            .wrapping_neg()
+            .wrapping_mul(1_000_000_000);
+        new_timestamp.wrapping_add(offset_nanos.div_euclid(1_000_000_000))
     }
 
     /// Update the header timestamp to the current median adjusted
@@ -449,6 +456,10 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             };
 
             // Create and populate a new coinbase.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "COINBASE_FLAGS is a 6-byte constant"
+            )]
             let mut coinbase_script = alloc::vec![0u8; COINBASE_FLAGS.len() + 2];
             coinbase_script[2..].copy_from_slice(COINBASE_FLAGS);
             let op_return_pk_script =
@@ -637,12 +648,20 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         let best = self.chain.best_snapshot();
         let missed_count = best.next_winning_tickets.len().saturating_sub(num_ssgen);
         let expired_count = best.next_expiring_tickets.len();
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the sum of two in-memory vector lengths, far below usize::MAX"
+        )]
         if missed_count + expired_count == 0 {
             return Ok(());
         }
 
         // Tickets that must be revoked due to becoming missed or
         // expired this block.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the sum of two in-memory vector lengths, far below usize::MAX"
+        )]
         let mut revoke_tickets: Vec<Hash> = Vec::with_capacity(missed_count + expired_count);
         for (ticket_hash, has_vote) in winning_tickets {
             if !has_vote {
@@ -698,6 +717,10 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         // node produces.
         let best = self.chain.best_snapshot();
         let mut prev_hash = best.hash;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "best.height is a chain height from a u32 header field, so at most u32::MAX"
+        )]
         let next_block_height = best.height + 1;
         let stake_validation_height = self.params.stake_validation_height;
 
@@ -809,6 +832,10 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             let is_ssgen = tx_desc.tx_type == dcroxide_stake::TxType::SSGen;
             if is_ssgen {
                 let (block_hash, block_height) = dcroxide_stake::ssgen_block_voted_on(tx);
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "next_block_height is best.height + 1 >= 1"
+                )]
                 if !(block_hash == prev_hash && i64::from(block_height) == next_block_height - 1) {
                     continue;
                 }
@@ -865,7 +892,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 tx_desc: tx_desc.clone(),
                 tx_type: tx_desc.tx_type,
                 auto_revocation: false,
-                fee: tx_desc.fee + ancestor_stats.fees,
+                fee: tx_desc.fee.wrapping_add(ancestor_stats.fees),
                 priority,
                 fee_per_kb: calc_fee_per_kb(tx_desc, &ancestor_stats),
             };
@@ -976,10 +1003,10 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                         continue;
                     }
                     let tspend_amount = tx.tx_in[0].value_in;
-                    if max_treasury_spend - tspend_amount < 0 {
+                    if max_treasury_spend.wrapping_sub(tspend_amount) < 0 {
                         continue;
                     }
-                    max_treasury_spend -= tspend_amount;
+                    max_treasury_spend = max_treasury_spend.wrapping_sub(tspend_amount);
                 }
 
                 // Enforce the per-block treasury add and ticket
@@ -1056,7 +1083,16 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 // Enforce the maximum signature operations per block,
                 // with overflow check.
                 let num_sig_ops = tx_desc.total_sig_ops;
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "both hold uint32 sigop counts, so the sum is below 2^33"
+                )]
                 let num_sig_ops_bundle = num_sig_ops + ancestor_stats.total_sig_ops;
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "block_sig_ops sums the uint32 sigop counts of this template's \
+                              transactions, far below i64::MAX, as dcrd's uint64 sum is"
+                )]
                 if block_sig_ops + num_sig_ops_bundle < block_sig_ops
                     || block_sig_ops + num_sig_ops_bundle > MAX_SIG_OPS_PER_BLOCK
                 {
@@ -1134,18 +1170,41 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                     );
 
                     block_txns.push(bundled_tx_desc.clone());
-                    block_size += bundled_tx_desc.tx.serialize_size() as u32;
+                    block_size =
+                        block_size.wrapping_add(bundled_tx_desc.tx.serialize_size() as u32);
                     let bundled_tx_sig_ops = bundled_tx_desc.total_sig_ops;
-                    block_sig_ops += bundled_tx_sig_ops;
+                    #[allow(
+                        clippy::arithmetic_side_effects,
+                        reason = "block_sig_ops sums the uint32 sigop counts of this template's \
+                                  transactions, far below i64::MAX, as dcrd's uint64 sum is"
+                    )]
+                    {
+                        block_sig_ops += bundled_tx_sig_ops;
+                    }
 
+                    #[allow(
+                        clippy::arithmetic_side_effects,
+                        reason = "counts transactions added to this template, at most \
+                                  block_txns.len()"
+                    )]
                     if bundled_tx_desc.tx_type == dcroxide_stake::TxType::SStx {
                         num_sstx += 1;
                     }
+                    #[allow(
+                        clippy::arithmetic_side_effects,
+                        reason = "counts transactions added to this template, at most \
+                                  block_txns.len()"
+                    )]
                     if bundled_tx_desc.tx_type == dcroxide_stake::TxType::SSGen {
                         let ticket = bundled_tx_desc.tx.tx_in[1].previous_out_point.hash;
                         found_winning_tickets.insert(ticket.0, true);
                         num_ssgen += 1;
                     }
+                    #[allow(
+                        clippy::arithmetic_side_effects,
+                        reason = "counts transactions added to this template, at most \
+                                  block_txns.len()"
+                    )]
                     if is_treasury_enabled
                         && bundled_tx_desc.tx_type == dcroxide_stake::TxType::TAdd
                     {
@@ -1227,7 +1286,13 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                         vote_bits_voters.push(vb);
                         votes.push(tx_copy);
                         vote_hashes.push(tx_desc.tx_hash);
-                        voters += 1;
+                        #[allow(
+                            clippy::arithmetic_side_effects,
+                            reason = "the loop breaks once voters reaches u16::MAX"
+                        )]
+                        {
+                            voters += 1;
+                        }
                     }
                 }
                 if voters >= u16::MAX as usize {
@@ -1258,12 +1323,20 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         } else {
             let mut vote_yea = 0usize;
             let mut total_votes = 0usize;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "both count vote_bits_voters, which holds at most u16::MAX entries"
+            )]
             for vb in &vote_bits_voters {
                 if vb & 0x0001 != 0 {
                     vote_yea += 1;
                 }
                 total_votes += 1;
             }
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "vote_yea != 0 in this branch"
+            )]
             if vote_yea == 0 {
                 0x0000
             } else if total_votes / vote_yea <= 1 {
@@ -1295,7 +1368,14 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                     ) {
                         block_txns_stake.push(tx_copy);
                         block_txns_stake_hashes.push(tx_desc.tx_hash);
-                        fresh_stake += 1;
+                        #[allow(
+                            clippy::arithmetic_side_effects,
+                            reason = "the loop breaks once fresh_stake reaches the u8 \
+                                      max_fresh_stake_per_block"
+                        )]
+                        {
+                            fresh_stake += 1;
+                        }
                     }
                 }
             }
@@ -1325,7 +1405,13 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
                 ) {
                     block_txns_stake.push(tx_copy);
                     block_txns_stake_hashes.push(tx_desc.tx_hash);
-                    revocations += 1;
+                    #[allow(
+                        clippy::arithmetic_side_effects,
+                        reason = "the loop breaks once revocations reaches u8::MAX"
+                    )]
+                    {
+                        revocations += 1;
+                    }
                 }
             }
             if revocations >= u8::MAX as usize {
@@ -1375,9 +1461,16 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             &block_utxos,
             is_treasury_enabled,
         )?);
-        block_size += coinbase_tx.serialize_size() as u32;
+        block_size = block_size.wrapping_add(coinbase_tx.serialize_size() as u32);
         // Only consumed by dcrd's final debug log.
-        block_sig_ops += num_coinbase_sig_ops;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "block_sig_ops sums the uint32 sigop counts of this template's \
+                      transactions, far below i64::MAX, as dcrd's uint64 sum is"
+        )]
+        {
+            block_sig_ops += num_coinbase_sig_ops;
+        }
         let _ = block_sig_ops;
         tx_fees_map.insert(coinbase_hash.0, 0);
         tx_sig_op_counts_map.insert(coinbase_hash.0, num_coinbase_sig_ops);
@@ -1387,7 +1480,15 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         }
 
         // Assemble the regular tree.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "an in-memory vector length plus one"
+        )]
         let mut block_txns_regular: Vec<MsgTx> = Vec::with_capacity(block_txns.len() + 1);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "an in-memory vector length plus one"
+        )]
         let mut block_txns_regular_hashes: Vec<Hash> = Vec::with_capacity(block_txns.len() + 1);
         block_txns_regular.push(coinbase_tx.clone());
         block_txns_regular_hashes.push(coinbase_hash);
@@ -1402,7 +1503,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             let fee = *tx_fees_map
                 .get(&tx_hash.0)
                 .ok_or_else(|| format!("couldn't find fee for tx {tx_hash}"))?;
-            total_fees += fee;
+            total_fees = total_fees.wrapping_add(fee);
             tx_fees.push(fee);
             let tsos = *tx_sig_op_counts_map
                 .get(&tx_hash.0)
@@ -1413,7 +1514,7 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
             let fee = *tx_fees_map
                 .get(&tx_hash.0)
                 .ok_or_else(|| format!("couldn't find fee for stx {tx_hash}"))?;
-            total_fees += fee;
+            total_fees = total_fees.wrapping_add(fee);
             tx_fees.push(fee);
             let tsos = *tx_sig_op_counts_map
                 .get(&tx_hash.0)
@@ -1423,25 +1524,43 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
 
         // Scale the fees by the voter participation.
         if next_block_height >= stake_validation_height {
-            total_fees *= voters as i64;
-            total_fees /= i64::from(self.params.tickets_per_block);
+            total_fees = total_fees.wrapping_mul(voters as i64);
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "tickets_per_block is a positive network parameter, so the divisor is \
+                          neither zero nor -1"
+            )]
+            {
+                total_fees /= i64::from(self.params.tickets_per_block);
+            }
         }
 
         // dcrd appends the coinbase sigop count a second time here.
         tx_sig_op_counts.push(num_coinbase_sig_ops);
 
         if next_block_height > 1 {
-            block_size -= MAX_VAR_INT_PAYLOAD
-                - dcroxide_wire::var_int_serialize_size(
-                    (block_txns_regular.len() + block_txns_stake.len()) as u64,
-                ) as u32;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "a varint serializes in at most MAX_VAR_INT_PAYLOAD bytes, and the \
+                          transaction counts are in-memory vector lengths"
+            )]
+            {
+                block_size = block_size.wrapping_sub(
+                    MAX_VAR_INT_PAYLOAD
+                        - dcroxide_wire::var_int_serialize_size(
+                            (block_txns_regular.len() + block_txns_stake.len()) as u64,
+                        ) as u32,
+                );
+            }
 
             // Add the fees to the miner payout.
             let pow_output_idx = if is_treasury_enabled { 1 } else { 2 };
-            coinbase_tx.tx_out[pow_output_idx].value += total_fees;
+            coinbase_tx.tx_out[pow_output_idx].value = coinbase_tx.tx_out[pow_output_idx]
+                .value
+                .wrapping_add(total_fees);
             block_txns_regular[0] = coinbase_tx.clone();
             block_txns_regular_hashes[0] = coinbase_tx.tx_hash();
-            tx_fees[0] = -total_fees;
+            tx_fees[0] = total_fees.wrapping_neg();
         }
         let _ = block_size;
 
@@ -1449,6 +1568,10 @@ impl<'p, C: TemplateChain, S: TemplateTxSource> BlkTmplGenerator<'p, C, S> {
         let req_difficulty = self.chain.calc_next_required_difficulty(&prev_hash, ts)?;
 
         // Return to the parent when there are too few voters.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "tickets_per_block / 2 + 1 is at most 32768 for a u16"
+        )]
         let minimum_votes_required = usize::from(self.params.tickets_per_block / 2 + 1);
         if next_block_height >= stake_validation_height && voters < minimum_votes_required {
             self.chain.log_warn(

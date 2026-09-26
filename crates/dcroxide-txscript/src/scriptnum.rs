@@ -41,6 +41,11 @@ pub(crate) fn check_minimal_data_encoding(v: &[u8]) -> Result<(), ScriptError> {
     // encoding is not minimal, except when the sign bit would otherwise
     // conflict with the second-most-significant byte (e.g. +-255 encode to
     // 0xff00/0xff80).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "v is non-empty (checked above), so v.len() - 1 >= 0; v.len() - 2 is evaluated \
+                  only when v.len() != 1, so v.len() >= 2"
+    )]
     if v[v.len() - 1] & 0x7f == 0 && (v.len() == 1 || v[v.len() - 2] & 0x80 == 0) {
         let hex: alloc::string::String = v.iter().map(|b| format!("{b:02x}")).collect();
         return Err(script_error(
@@ -73,6 +78,10 @@ impl ScriptNum {
         // When the most significant byte already has the high bit set, an
         // additional high byte is required to hold the sign; otherwise the
         // high bit of the most significant byte denotes the sign directly.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "n != 0 (returned above), so the loop pushed at least one byte"
+        )]
         let last = result.len() - 1;
         if result[last] & 0x80 != 0 {
             result.push(if is_negative { 0x80 } else { 0x00 });
@@ -136,14 +145,18 @@ pub fn make_script_num(v: &[u8], script_num_len: usize) -> Result<ScriptNum, Scr
         |value: i64, places: usize| value.checked_shl(u32::from(places as u8)).unwrap_or(0);
     let mut result: i64 = 0;
     for (i, val) in v.iter().enumerate() {
-        result |= go_shl(i64::from(*val), 8 * i);
+        result |= go_shl(i64::from(*val), 8_usize.wrapping_mul(i));
     }
 
     // When the most significant byte of the input has the sign bit set,
     // remove it from the result and negate.  Go's negation wraps, so a
     // nine-byte input that decodes to `i64::MIN` stays there.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "v is non-empty (checked above), so v.len() - 1 >= 0"
+    )]
     if v[v.len() - 1] & 0x80 != 0 {
-        result &= !go_shl(0x80i64, 8 * (v.len() - 1));
+        result &= !go_shl(0x80i64, 8_usize.wrapping_mul(v.len() - 1));
         return Ok(ScriptNum(result.wrapping_neg()));
     }
 

@@ -223,6 +223,10 @@ pub fn check_pk_script_standard(
 /// the given minimum transaction relay fee in atoms per 1000 bytes:
 /// dust is an output whose cost to the network to spend exceeds one
 /// third of the minimum relay fee (dcrd `isDust`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "total_size is at least 176 and at most a live pk_script's length plus 184, far below i64::MAX / 3, so 3 * total_size is a positive divisor, never 0 or -1"
+)]
 pub fn is_dust(tx_out: &TxOut, min_relay_tx_fee: i64) -> bool {
     // Unspendable outputs are considered dust.
     if is_unspendable(tx_out.value, &tx_out.pk_script) {
@@ -330,6 +334,10 @@ pub fn check_transaction_standard(
         // Accumulate the number of outputs which only carry data.  For
         // all other script types, ensure the output value is not
         // "dust".
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "counts outputs of tx.tx_out, so at most tx.tx_out.len()"
+        )]
         if script_type == ScriptType::NullData {
             num_null_data_outputs += 1;
         } else if tx_type == TxType::Regular && is_dust(tx_out, min_relay_tx_fee) {

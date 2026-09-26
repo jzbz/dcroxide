@@ -29,10 +29,6 @@
 // because the P2P, RPC and mixing crates legitimately hash (see
 // ADR-0008); note the lint fires only on `for` loops.
 #![deny(clippy::iter_over_hash_type)]
-// The consensus algorithms ported here rely on Go's fixed-width integer
-// semantics; explicitly wrapping operations are used wherever dcrd's
-// arithmetic can overflow.
-#![allow(clippy::arithmetic_side_effects)]
 
 extern crate alloc;
 

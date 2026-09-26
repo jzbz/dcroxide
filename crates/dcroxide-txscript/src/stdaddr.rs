@@ -907,6 +907,10 @@ mod goquote {
     /// `\xNN` too: Go decodes it as a width-one `RuneError`, and each
     /// byte of an invalid sequence does the same in turn.
     pub(super) fn go_quote(s: &[u8]) -> String {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "s is a slice, so s.len() <= isize::MAX and s.len() + 2 fits in usize"
+        )]
         let mut out = String::with_capacity(s.len() + 2);
         out.push('"');
         for chunk in s.utf8_chunks() {
@@ -991,6 +995,10 @@ mod goquote {
         }
         // The 32-bit exception list stores each rune less 0x10000, which
         // fits 16 bits below 0x20000 (Go's `uint16(r)`).
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "r > u16::MAX here (the u16 branch above returned), so r - 0x10000 >= 0"
+        )]
         let rr = (r - 0x10000) as u16;
         IS_NOT_PRINT32.binary_search(&rr).is_err()
     }

@@ -33,9 +33,6 @@
 // because the P2P, RPC and mixing crates legitimately hash (see
 // ADR-0008); note the lint fires only on `for` loops.
 #![deny(clippy::iter_over_hash_type)]
-// Rule-check arithmetic mirrors dcrd's Go semantics: indexing is bounded
-// by prior checks and amount math uses explicit wrapping/big-int forms.
-#![allow(clippy::arithmetic_side_effects)]
 
 extern crate alloc;
 
@@ -365,6 +362,10 @@ pub fn sstx_stake_output_info(outs: &[MinimalOutput]) -> SStxOutputInfo {
         }
 
         // Even indexes (after 0) are the change outputs.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "idx > 0 and even here, so idx / 2 >= 1"
+        )]
         if idx > 0 && idx % 2 == 0 {
             info.change_amounts[(idx / 2) - 1] = out.value;
         }
@@ -722,6 +723,10 @@ pub fn check_sstx(tx: &MsgTx) -> Result<(), RuleError> {
     }
 
     // The number of outputs must equal the number of inputs * 2 + 1.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "tx_in.len() <= MAX_INPUTS_PER_SSTX (64), checked above, so at most 129"
+    )]
     if tx.tx_in.len() * 2 + 1 != tx.tx_out.len() {
         return Err(stake_rule_error(
             ErrorKind::SStxInOutProportions,
@@ -773,6 +778,10 @@ pub fn check_sstx(tx: &MsgTx) -> Result<(), RuleError> {
 
         // The prefix must be OP_RETURN plus a valid push length.
         let min_push = VALID_SSTX_ADDRESS_OUT_MIN_PREFIX[1];
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "constants: OP_DATA_30 + (75 - OP_DATA_30) = 75"
+        )]
         let max_push =
             VALID_SSTX_ADDRESS_OUT_MIN_PREFIX[1] + (MAX_SINGLE_BYTE_PUSH_LENGTH - min_push);
         let push_len = raw_script[1];
@@ -834,6 +843,7 @@ pub fn get_ssgen_treasury_votes(pk_script: &[u8]) -> Result<Vec<TreasuryVoteTupl
     // push opcode.
     let start: usize = if pk_script[1] == OP_PUSHDATA1 { 3 } else { 2 };
 
+    #[allow(clippy::arithmetic_side_effects, reason = "start is 2 or 3")]
     if start + 2 > pk_script.len() {
         return Err(stake_rule_error(
             ErrorKind::SSGenInvalidNullScript,
@@ -842,6 +852,7 @@ pub fn get_ssgen_treasury_votes(pk_script: &[u8]) -> Result<Vec<TreasuryVoteTupl
     }
 
     // The discriminator must be 'T','V'.
+    #[allow(clippy::arithmetic_side_effects, reason = "start is 2 or 3")]
     if &pk_script[start..start + 2] != b"TV" {
         return Err(stake_rule_error(
             ErrorKind::SSGenUnknownDiscriminator,
@@ -855,6 +866,7 @@ pub fn get_ssgen_treasury_votes(pk_script: &[u8]) -> Result<Vec<TreasuryVoteTupl
 
     // Expect N hashes with their vote bits.
     const SIZE: usize = 32 + 1;
+    #[allow(clippy::arithmetic_side_effects, reason = "start is 2 or 3")]
     let votes_bytes = &pk_script[start + 2..];
     if votes_bytes.len() < SIZE || !votes_bytes.len().is_multiple_of(SIZE) {
         return Err(stake_rule_error(
@@ -865,7 +877,14 @@ pub fn get_ssgen_treasury_votes(pk_script: &[u8]) -> Result<Vec<TreasuryVoteTupl
 
     let mut votes = Vec::with_capacity(7);
     let mut seen: Vec<Hash> = Vec::with_capacity(7);
+    #[allow(clippy::arithmetic_side_effects, reason = "start is 2 or 3")]
     let mut i = start + 2;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "i starts at start + 2 <= pk_script.len() and advances by SIZE only after \
+                  pk_script.len() - i >= SIZE, so i <= pk_script.len() and i + 32 < \
+                  pk_script.len() inside the loop"
+    )]
     loop {
         if pk_script.len() - i < SIZE {
             break;
@@ -1019,6 +1038,10 @@ pub fn check_ssgen_votes(tx: &MsgTx) -> Result<Vec<TreasuryVoteTuple>, RuleError
 
     // The vote prefix must conform to the standard.
     let min_push = VALID_SSGEN_VOTE_OUT_MIN_PREFIX[1];
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constants: OP_DATA_2 + (75 - OP_DATA_2) = 75"
+    )]
     let max_push = VALID_SSGEN_VOTE_OUT_MIN_PREFIX[1] + (MAX_SINGLE_BYTE_PUSH_LENGTH - min_push);
     let push_len = first_output_script[1];
     let push_length_valid = push_len >= min_push && push_len <= max_push;
@@ -1032,8 +1055,16 @@ pub fn check_ssgen_votes(tx: &MsgTx) -> Result<Vec<TreasuryVoteTuple>, RuleError
     // When the last output is a null data script it must carry treasury
     // votes, in which case the tx version must be the treasury version.
     let mut tx_out_len = tx.tx_out.len();
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "tx_out.len() >= 2, checked above"
+    )]
     let last_tx_out = &tx.tx_out[tx.tx_out.len() - 1];
     let mut votes = Vec::new();
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "tx_out_len = tx_out.len() >= 2, checked above"
+    )]
     if is_null_data_script(last_tx_out.version, &last_tx_out.pk_script) {
         tx_out_len -= 1;
 

@@ -54,6 +54,10 @@ pub fn is_coin_base_tx(tx: &MsgTx, is_treasury_enabled: bool) -> bool {
     // purposes of differentiating it from a coinbase (dcrd's inner
     // `isTreasurySpendLike`).  Relies on the checks above to avoid
     // panics.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "l != 0 is checked before signature_script[l - 1]"
+    )]
     let is_treasury_spend_like = |tx: &MsgTx| -> bool {
         // Treasury spends have at least two outputs.
         if tx.tx_out.len() < 2 {

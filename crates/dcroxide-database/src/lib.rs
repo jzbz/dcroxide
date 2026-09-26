@@ -28,8 +28,6 @@
 //! [ADR-0004]: ../../../docs/adr/0004-storage-backend.md
 
 #![forbid(unsafe_code)]
-// Bounded arithmetic on file offsets and key lengths.
-#![allow(clippy::arithmetic_side_effects)]
 
 mod blockfile;
 pub mod bootstrap;
@@ -1136,6 +1134,10 @@ impl Database {
             let wtx = begin_durable_write(&kv)?;
             {
                 let mut table = wtx.open_table(METADATA_TABLE).map_err(storage_error)?;
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "constant lengths: 4 + 4 + 14 = 22"
+                )]
                 let mut bidx_key =
                     Vec::with_capacity(BUCKET_INDEX_PREFIX.len() + 4 + BLOCK_IDX_BUCKET_NAME.len());
                 bidx_key.extend_from_slice(BUCKET_INDEX_PREFIX);
@@ -1264,6 +1266,10 @@ impl Database {
                     continue;
                 }
                 // `bidx` + parent id (4) + name; the value is the child id.
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "constant lengths: 4 + 4 = 8"
+                )]
                 if val.len() == 4 && key.len() > BUCKET_INDEX_PREFIX.len() + 4 {
                     let mut id = [0u8; 4];
                     id.copy_from_slice(val);

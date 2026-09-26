@@ -14,6 +14,10 @@ pub(crate) fn as_bool(t: &[u8]) -> bool {
     for (i, b) in t.iter().enumerate() {
         if *b != 0 {
             // Negative 0 is also considered false.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "t is non-empty inside the loop over its bytes, so t.len() - 1 >= 0"
+            )]
             if i == t.len() - 1 && *b == 0x80 {
                 return false;
             }
@@ -83,6 +87,10 @@ impl Stack {
                 format!("index {idx} is invalid for stack size {sz}"),
             ));
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "0 <= idx < sz is checked above, so 0 <= sz - idx - 1 < sz"
+        )]
         Ok(&self.stk[(sz - idx - 1) as usize])
     }
 
@@ -93,6 +101,11 @@ impl Stack {
     }
 
     /// Remove the Nth item on the stack and return it (dcrd `nipN`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "sz is a length, so sz - 1 >= -1; the removal index is reached only when \
+                  0 <= idx <= sz - 1, so 0 <= sz - idx - 1 < sz"
+    )]
     fn nip_n_internal(&mut self, idx: i32) -> Result<Vec<u8>, ScriptError> {
         let sz = self.stk.len() as i32;
         if idx < 0 || idx > sz - 1 {
@@ -121,6 +134,10 @@ impl Stack {
     }
 
     /// Remove the top N items (dcrd `DropN`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "n -= 1 runs only while n > 0, so n - 1 >= 0"
+    )]
     pub fn drop_n(&mut self, n: i32) -> Result<(), ScriptError> {
         let mut n = n;
         while n > 0 {
@@ -139,6 +156,10 @@ impl Stack {
             ));
         }
         for _ in 0..n {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "n >= 1 is checked above, so n - 1 >= 0"
+            )]
             let so = self.peek_byte_array(n - 1)?.to_vec();
             self.push_byte_array(so);
         }
@@ -153,6 +174,11 @@ impl Stack {
                 format!("attempt to rotate {n} stack items"),
             ));
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "n >= 1 is checked above and every caller passes 1 or 2 (OP_ROT, OP_2ROT), \
+                      so 3 * n - 1 <= 5"
+        )]
         let entry = 3 * n - 1;
         for _ in 0..n {
             let so = self.nip_n_internal(entry)?;
@@ -169,6 +195,11 @@ impl Stack {
                 format!("attempt to swap {n} stack items"),
             ));
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "n >= 1 is checked above and every caller passes 1 or 2 (OP_SWAP, \
+                      OP_2SWAP), so 2 * n - 1 <= 3"
+        )]
         let entry = 2 * n - 1;
         for _ in 0..n {
             let so = self.nip_n_internal(entry)?;
@@ -178,6 +209,11 @@ impl Stack {
     }
 
     /// Copy N items N items back to the top (dcrd `OverN`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "n >= 1 is checked above and every caller passes 1 or 2 (OP_OVER, OP_2OVER), \
+                  so 2 * n - 1 <= 3; n -= 1 runs only while n > 0, so n - 1 >= 0"
+    )]
     pub fn over_n(&mut self, n: i32) -> Result<(), ScriptError> {
         if n < 1 {
             return Err(script_error(

@@ -8,9 +8,6 @@
 //! characters map to leading zero bytes and vice versa.
 
 #![cfg_attr(not(test), no_std)]
-// Big-integer base conversion ported from decred/base58; all index
-// arithmetic is bounded by the computed output sizes exactly as upstream.
-#![allow(clippy::arithmetic_side_effects)]
 
 extern crate alloc;
 
@@ -46,12 +43,22 @@ pub fn decode(input: &str) -> Vec<u8> {
 
     // Count leading zeros ('1' characters).
     let mut nlz = 0usize;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "nlz < input.len() is the loop condition, so nlz + 1 <= input.len()"
+    )]
     while nlz < input.len() && input[nlz] == ALPHABET_IDX0 {
         nlz += 1;
     }
 
     // Max output size: nlz + ceil(rest * log_256(58)) with the same 47/64
     // approximation upstream uses, rounded up to a multiple of 4.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "nlz <= input.len() from the loop above; the product overflows only for a str \
+                  longer than usize::MAX / 47 bytes (about 3.9e17 on 64-bit), which cannot be \
+                  held in memory, and the quotient / 64 + 1 cannot overflow"
+    )]
     let max_output_size_no_lz = (input.len() - nlz) * 47 / 64 + 1;
     let max_out32_size = max_output_size_no_lz.div_ceil(4);
     let mut out32 = vec![0u32; max_out32_size];
@@ -66,11 +73,20 @@ pub fn decode(input: &str) -> Vec<u8> {
         }
 
         let mut val = u64::from(digit);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "val < 2^32 on entry (a digit < 58, or the carry left by val >>= 32) and \
+                      *ui32 * 58 <= 58 * (2^32 - 1), so the sum stays below 59 * 2^32"
+        )]
         for ui32 in out32[..out32_idx].iter_mut() {
             val += u64::from(*ui32) * 58;
             *ui32 = val as u32;
             val >>= 32;
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the store to out32[out32_idx] is bounds-checked, so out32_idx < out32.len()"
+        )]
         if val > 0 {
             out32[out32_idx] = val as u32;
             out32_idx += 1;
@@ -78,6 +94,12 @@ pub fn decode(input: &str) -> Vec<u8> {
     }
 
     // Convert u32 words to little-endian bytes.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "out32_idx <= out32.len() = ceil(max_output_size_no_lz / 4), so out32_idx * 4 \
+                  <= max_output_size_no_lz + 3 <= input.len() - nlz + 4, and adding nlz gives \
+                  at most input.len() + 4"
+    )]
     let mut output = Vec::with_capacity(out32_idx * 4 + nlz);
     for &ui32 in &out32[..out32_idx] {
         output.extend_from_slice(&ui32.to_le_bytes());
@@ -86,6 +108,11 @@ pub fn decode(input: &str) -> Vec<u8> {
     // Trim to the most significant byte and account for leading zeros
     // (they come last since decoding happened in reverse order).
     let mut index = output.len();
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "out32_idx > 0 is checked, so out32_idx - 1 >= 0; index = out32_idx * 4 >= 4 \
+                  and leading_zeros() / 8 <= 4, so index stays >= 0"
+    )]
     if out32_idx > 0 {
         index -= (out32[out32_idx - 1].leading_zeros() / 8) as usize;
     }
@@ -100,17 +127,33 @@ pub fn decode(input: &str) -> Vec<u8> {
 /// Encode a byte slice to a modified base58 string (decred/base58
 /// `Encode`).
 pub fn encode(input: &[u8]) -> String {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the product overflows only for a slice longer than usize::MAX / 137 bytes \
+                  (about 1.3e17 on 64-bit), which cannot be held in memory, and the quotient \
+                  / 100 + 1 cannot overflow"
+    )]
     let mut output = vec![0u8; input.len() * 137 / 100 + 1];
 
     // Encode to base58 in reverse order.
     let mut index = 0usize;
     for &r in input {
         let mut val = u32::from(r);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "*b is a remainder % 58 < 58, and val <= 255 on entry (the input byte, or \
+                      the carry val / 58 of a value <= 255 + 57 * 256), so the sum is at most \
+                      255 + 57 * 256 = 14847"
+        )]
         for b in output[..index].iter_mut() {
             val += u32::from(*b) << 8;
             *b = (val % 58) as u8;
             val /= 58;
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the store to output[index] is bounds-checked, so index < output.len()"
+        )]
         while val > 0 {
             output[index] = (val % 58) as u8;
             index += 1;
@@ -124,6 +167,10 @@ pub fn encode(input: &[u8]) -> String {
     }
 
     // Account for leading zero bytes in the input.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the store to output[index] is bounds-checked, so index < output.len()"
+    )]
     for &r in input {
         if r != 0 {
             break;
@@ -171,6 +218,10 @@ fn checksum(input: &[u8]) -> [u8; 4] {
 /// Prepend two version bytes and append a four byte checksum, then base58
 /// encode (decred/base58 `CheckEncode`).
 pub fn check_encode(input: &[u8], version: [u8; 2]) -> String {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "input.len() <= isize::MAX for a slice, so 2 + input.len() + 4 fits usize"
+    )]
     let mut b = Vec::with_capacity(2 + input.len() + 4);
     b.extend_from_slice(&version);
     b.extend_from_slice(input);
@@ -187,6 +238,10 @@ pub fn check_decode(input: &str) -> Result<(Vec<u8>, [u8; 2]), CheckError> {
         return Err(CheckError::InvalidFormat);
     }
     let version = [decoded[0], decoded[1]];
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "decoded.len() >= 6 is checked above"
+    )]
     let data_len = decoded.len() - 4;
     let decoded_checksum = &decoded[data_len..];
     let calculated = checksum(&decoded[..data_len]);

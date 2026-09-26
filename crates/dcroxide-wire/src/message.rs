@@ -256,6 +256,10 @@ impl Message {
         match self {
             // dcrd `MsgVersion.SerializeSize`: the two addresses go out
             // without their timestamps.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "constants 4 + 8 + 8 + 2 * 26 + 8 + 4 + 1 = 85 plus var_bytes_size of the in-memory user agent, at most 9 + its length"
+            )]
             Message::Version(m) => {
                 4 + 8
                     + 8
@@ -272,11 +276,19 @@ impl Message {
             | Message::SendHeaders
             | Message::GetCFTypes => 0,
             // dcrd `MsgAddr.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "var_int_size <= 9 plus addr_list.len() * 30, and a NetAddress is 32 bytes in memory, so the product is below the list's allocation"
+            )]
             Message::Addr(m) => {
                 var_int_size(m.addr_list.len()) + m.addr_list.len() * net_address_size(true)
             }
             // dcrd `MsgAddrV2.SerializeSize` over `NetAddressV2.SerializeSize`:
             // timestamp 8 + services 8 + type 1 + address + port 2.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "var_int_size <= 9 plus 19 + encoded_addr.len() per address, and a NetAddressV2 is 48 bytes in memory plus its encoded_addr bytes, so the sum is below the list's allocations"
+            )]
             Message::AddrV2(m) => {
                 var_int_size(m.addr_list.len())
                     + m.addr_list
@@ -285,10 +297,18 @@ impl Message {
                         .sum::<usize>()
             }
             // dcrd `MsgGetBlocks`/`MsgGetHeaders.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "constants 4 + 32 plus hash_list_size of an in-memory Vec<Hash>, at most 9 + its byte size"
+            )]
             Message::GetBlocks(MsgGetBlocks(l)) | Message::GetHeaders(MsgGetHeaders(l)) => {
                 4 + hash_list_size(l.block_locator_hashes.len()) + HASH_SIZE
             }
             // dcrd `MsgInv`/`MsgGetData`/`MsgNotFound.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "var_int_size <= 9 plus inv_list.len() * 36, and an InvVect is 36 bytes in memory, so the product is the list's allocation"
+            )]
             Message::Inv(MsgInv { inv_list })
             | Message::GetData(MsgGetData { inv_list })
             | Message::NotFound(MsgNotFound { inv_list }) => {
@@ -298,16 +318,28 @@ impl Message {
             Message::Tx(m) => m.serialize_size(),
             // dcrd `MsgHeaders.SerializeSize`: each header is followed by
             // a one-byte zero transaction count.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "var_int_size <= 9 plus headers.len() * 181, and a BlockHeader is 184 bytes in memory, so the product is below the list's allocation"
+            )]
             Message::Headers(m) => {
                 var_int_size(m.headers.len()) + m.headers.len() * (MAX_BLOCK_HEADER_PAYLOAD + 1)
             }
             Message::Ping(_) | Message::Pong(_) | Message::FeeFilter(_) => 8,
             // dcrd `MsgMiningState.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "constants 4 + 4 plus two hash_list_size terms, each at most 9 + the byte size of an in-memory Vec<Hash>"
+            )]
             Message::MiningState(m) => {
                 4 + 4 + hash_list_size(m.block_hashes.len()) + hash_list_size(m.vote_hashes.len())
             }
             // dcrd `MsgReject.SerializeSize`: block and tx rejects carry
             // the hash of what was rejected.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "at most (9 + cmd.len()) + 1 + (9 + reason.len()) + 32, over the lengths of two in-memory Strings"
+            )]
             Message::Reject(m) => {
                 let hash = if m.cmd == "block" || m.cmd == "tx" {
                     HASH_SIZE
@@ -318,20 +350,40 @@ impl Message {
             }
             Message::GetCFilter(_) => HASH_SIZE + 1,
             // dcrd `MsgGetCFHeaders.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "hash_list_size of an in-memory Vec<Hash>, at most 9 + its byte size, plus constants 32 + 1"
+            )]
             Message::GetCFHeaders(m) => {
                 hash_list_size(m.block_locator_hashes.len()) + HASH_SIZE + 1
             }
             // dcrd `MsgCFilter.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "constants 32 + 1 plus var_bytes_size of an in-memory Vec<u8>, at most 9 + its length"
+            )]
             Message::CFilter(m) => HASH_SIZE + 1 + var_bytes_size(m.data.len()),
             // dcrd `MsgCFHeaders.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "constants 32 + 1 plus hash_list_size of an in-memory Vec<Hash>, at most 9 + its byte size"
+            )]
             Message::CFHeaders(m) => HASH_SIZE + 1 + hash_list_size(m.header_hashes.len()),
             // dcrd `MsgCFTypes.SerializeSize`: one byte per filter type.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "var_int_size <= 9 plus supported_filters.len(), the length of an in-memory Vec<u8>"
+            )]
             Message::CFTypes(m) => {
                 var_int_size(m.supported_filters.len()) + m.supported_filters.len()
             }
             Message::GetCFilterV2(_) => HASH_SIZE,
             Message::CFilterV2(m) => cfilter_v2_size(m),
             // dcrd `MsgGetInitState.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "var_int_size <= 9 plus 9 + t.len() per type, and a String is 24 bytes in memory plus its bytes, so the sum is below the list's allocations"
+            )]
             Message::GetInitState(m) => {
                 var_int_size(m.types.len())
                     + m.types
@@ -340,6 +392,10 @@ impl Message {
                         .sum::<usize>()
             }
             // dcrd `MsgInitState.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "three hash_list_size terms, each at most 9 + the byte size of an in-memory Vec<Hash>"
+            )]
             Message::InitState(m) => {
                 hash_list_size(m.block_hashes.len())
                     + hash_list_size(m.vote_hashes.len())
@@ -347,11 +403,19 @@ impl Message {
             }
             Message::GetCFsV2(_) => HASH_SIZE * 2,
             // dcrd `MsgCFiltersV2.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "var_int_size <= 9 plus cfilter_v2_size per filter, at most 54 + its data and proof-hash bytes, and a MsgCFilterV2 is 88 bytes in memory plus those bytes"
+            )]
             Message::CFiltersV2(m) => {
                 var_int_size(m.cfilters.len())
                     + m.cfilters.iter().map(cfilter_v2_size).sum::<usize>()
             }
             // dcrd `MsgMixPairReq.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "constants 64 + 33 + 4 + 8 + 2 + 4 + 4 + 8 + 1 + 2 = 130, varint sizes <= 9, at most 65 + three byte lengths per UTXO while a MixPairReqUTXO is 120 bytes in memory plus those bytes, and the change TxOut's own serialize_size"
+            )]
             Message::MixPairReq(m) => {
                 // Signature 64 + identity 33 + expiry 4 + mix amount 8,
                 // then the script class, then tx version 2 + lock time 4
@@ -384,11 +448,19 @@ impl Message {
             // dcrd `MsgMixKeyExchange.SerializeSize`: epoch 8, run 4, pos
             // 4, ECDH key 33, PQ key 1218 and commitment 32 on top of the
             // signature, identity and session id.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "constants 64 + 33 + 32 + 8 + 4 + 4 + 33 + 1218 + 32 = 1428 plus hash_list_size of an in-memory Vec<Hash>, at most 9 + its byte size"
+            )]
             Message::MixKeyExchange(m) => {
                 64 + 33 + 32 + 8 + 4 + 4 + 33 + 1218 + 32 + hash_list_size(m.seen_prs.len())
             }
             // dcrd `MsgMixCiphertexts.SerializeSize`: one count covers the
             // ciphertexts and the seen key exchanges.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "MIX_FIXED 133 and var_int_size <= 9 plus ciphertexts.len() * 1047 and seen_key_exchanges.len() * 32, the byte sizes of an in-memory Vec<[u8; 1047]> and Vec<Hash>"
+            )]
             Message::MixCiphertexts(m) => {
                 MIX_FIXED
                     + var_int_size(m.ciphertexts.len())
@@ -396,6 +468,10 @@ impl Message {
                     + m.seen_key_exchanges.len() * HASH_SIZE
             }
             // dcrd `MsgMixSlotReserve.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "MIX_FIXED 133, two varint sizes <= 9, 9 + v.len() per inner Vec<u8> (24 bytes in memory plus its bytes) and hash_list_size of an in-memory Vec<Hash>"
+            )]
             Message::MixSlotReserve(m) => {
                 let kpcount = m.dc_mix.first().map_or(0, Vec::len);
                 MIX_FIXED
@@ -409,6 +485,10 @@ impl Message {
                     + hash_list_size(m.seen_ciphertexts.len())
             }
             // dcrd `MsgMixFactoredPoly.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "MIX_FIXED 133, var_int_size <= 9, 9 + r.len() per root Vec<u8> (24 bytes in memory plus its bytes) and hash_list_size of an in-memory Vec<Hash>"
+            )]
             Message::MixFactoredPoly(m) => {
                 MIX_FIXED
                     + var_int_size(m.roots.len())
@@ -420,6 +500,10 @@ impl Message {
             }
             // dcrd `MsgMixDCNet.SerializeSize`: the vector count, and when
             // there are vectors, their length and the message size.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "MIX_FIXED 133, varint sizes <= 9, v.len() * 20 per MixVect (the byte size of its in-memory [u8; 20] elements) and hash_list_size of an in-memory Vec<Hash>"
+            )]
             Message::MixDCNet(m) => {
                 let vects = match m.dc_net.first() {
                     None => 0,
@@ -438,12 +522,20 @@ impl Message {
                     + hash_list_size(m.seen_slot_reserves.len())
             }
             // dcrd `MsgMixConfirm.SerializeSize`.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "MIX_FIXED 133 plus the mix MsgTx's own serialize_size and hash_list_size of an in-memory Vec<Hash>"
+            )]
             Message::MixConfirm(m) => {
                 MIX_FIXED + m.mix.serialize_size() + hash_list_size(m.seen_dc_nets.len())
             }
             // dcrd `MsgMixSecrets.SerializeSize`: the seed 32 after the
             // fixed prefix, and the message size only when there are
             // DC-net messages.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "MIX_FIXED 133 + seed 32, varint sizes <= 9, 9 + sr.len() per Vec<u8> (24 bytes in memory plus its bytes), dc_net_msgs.len() * 20 (the byte size of its in-memory [u8; 20] elements) and hash_list_size of an in-memory Vec<Hash>"
+            )]
             Message::MixSecrets(m) => {
                 let dc_net = if m.dc_net_msgs.is_empty() {
                     0
@@ -532,17 +624,29 @@ fn var_int_size(n: usize) -> usize {
 }
 
 /// The size of a varint-prefixed byte string of `len` bytes.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "len is an in-memory byte length (<= isize::MAX) and a varint size is at most 9"
+)]
 fn var_bytes_size(len: usize) -> usize {
     var_int_size(len) + len
 }
 
 /// The size of a varint-counted list of `n` hashes.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "n is the length of an in-memory Vec<Hash>, so n * 32 <= isize::MAX, and a varint size is at most 9"
+)]
 fn hash_list_size(n: usize) -> usize {
     var_int_size(n) + n * HASH_SIZE
 }
 
 /// dcrd `NetAddress.SerializeSize`: services 8 + IP 16 + port 2, plus
 /// the 4-byte timestamp where the context carries one.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "full is MAX_NET_ADDRESS_PAYLOAD = 30"
+)]
 fn net_address_size(with_timestamp: bool) -> usize {
     let full = MAX_NET_ADDRESS_PAYLOAD as usize;
     if with_timestamp { full } else { full - 4 }
@@ -550,6 +654,10 @@ fn net_address_size(with_timestamp: bool) -> usize {
 
 /// dcrd `MsgCFilterV2.SerializeSize`: block hash, filter data, proof
 /// index 4 and the proof hashes.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "constants 32 + 4 plus the sizes of the filter's in-memory data and proof-hash list, bounded by its allocation"
+)]
 fn cfilter_v2_size(m: &MsgCFilterV2) -> usize {
     HASH_SIZE + var_bytes_size(m.data.len()) + 4 + hash_list_size(m.proof_hashes.len())
 }
@@ -570,6 +678,10 @@ fn max_payload_for_command(command: &str, pver: u32) -> Option<u32> {
         "ping" | "pong" => 8,
         "miningstate" => MsgMiningState::max_payload_length(pver),
         "feefilter" => 8,
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "constant: HASH_SIZE + 1 = 33"
+        )]
         "getcfilter" => dcroxide_chainhash::HASH_SIZE as u32 + 1,
         "getcfheaders" => MsgGetCFHeaders::max_payload_length(pver),
         "cfilter" => MsgCFilter::max_payload_length(pver),
@@ -579,6 +691,10 @@ fn max_payload_for_command(command: &str, pver: u32) -> Option<u32> {
         "cfilterv2" => MsgCFilterV2::max_payload_length(pver),
         "getinitstate" => MsgGetInitState::max_payload_length(pver),
         "initstate" => MsgInitState::max_payload_length(pver),
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "constant: HASH_SIZE * 2 = 64"
+        )]
         "getcfsv2" => dcroxide_chainhash::HASH_SIZE as u32 * 2,
         "cfiltersv2" => MsgCFiltersV2::max_payload_length(pver),
         "mixpairreq" => MsgMixPairReq::max_payload_length(pver),
@@ -706,9 +822,17 @@ pub fn write_message(msg: &Message, pver: u32, net: CurrencyNet) -> Result<Vec<u
         return Err(WireError::CmdTooLong);
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "serialize_size is bounded by the message's in-memory size, far below usize::MAX - 24"
+    )]
     let mut out = Vec::with_capacity(MESSAGE_HEADER_SIZE + msg.serialize_size());
     out.resize(MESSAGE_HEADER_SIZE, 0);
     msg.encode_payload_into(&mut out, pver)?;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "out.len() >= MESSAGE_HEADER_SIZE: out was resized to it and encoding only appends"
+    )]
     let payload_len = out.len() - MESSAGE_HEADER_SIZE;
     if payload_len as u64 > MAX_MESSAGE_PAYLOAD {
         return Err(WireError::PayloadTooLarge {
@@ -728,6 +852,10 @@ pub fn write_message(msg: &Message, pver: u32, net: CurrencyNet) -> Result<Vec<u
     let (header, _) = out.split_at_mut(MESSAGE_HEADER_SIZE);
     header[..4].copy_from_slice(&net.0.to_le_bytes());
     // The command field is already zeroed, which is its NUL padding.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "command.len() <= COMMAND_SIZE (12), checked above"
+    )]
     header[4..4 + command.len()].copy_from_slice(command.as_bytes());
     header[4 + COMMAND_SIZE..8 + COMMAND_SIZE].copy_from_slice(&(payload_len as u32).to_le_bytes());
     header[8 + COMMAND_SIZE..].copy_from_slice(&checksum[..4]);
@@ -782,6 +910,10 @@ pub fn read_message_header(
     }
 
     // Trim trailing NULs, then require strict ASCII.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "p < COMMAND_SIZE (12): it is an index into command_field"
+    )]
     let trimmed_len = command_field
         .iter()
         .rposition(|&b| b != 0)
@@ -847,6 +979,10 @@ pub fn read_message(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over small fixed values"
+)]
 mod tests {
     use alloc::boxed::Box;
     use alloc::collections::BTreeSet;

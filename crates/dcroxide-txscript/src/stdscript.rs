@@ -188,6 +188,10 @@ pub fn extract_pub_key_alt_details_v0(script: &[u8]) -> Option<(&[u8], u8)> {
     // PUBKEY SIGTYPE OP_CHECKSIGALT with either:
     //  OP_DATA_32 <32-byte pubkey> <ed25519 sigtype> OP_CHECKSIGALT
     //  OP_DATA_33 <33-byte pubkey> <schnorr+secp sigtype> OP_CHECKSIGALT
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "script.len() - 1 is evaluated only when script.len() >= 3"
+    )]
     if script.len() < 3 || script[script.len() - 1] != OP_CHECKSIGALT {
         return None;
     }
@@ -359,6 +363,10 @@ pub fn extract_multi_sig_script_details_v0(
     extract_pub_keys: bool,
 ) -> MultiSigDetailsV0 {
     // REQ_SIGS PUBKEY PUBKEY PUBKEY ... NUM_PUBKEYS OP_CHECKMULTISIG
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "script.len() - 1 is evaluated only when script.len() >= 3"
+    )]
     if script.len() < 3 || script[script.len() - 1] != OP_CHECKMULTISIG {
         return MultiSigDetailsV0::default();
     }
@@ -391,7 +399,14 @@ pub fn extract_multi_sig_script_details_v0(
         if !is_strict_compressed_pub_key_encoding(data) {
             break;
         }
-        num_pub_keys += 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "each increment consumes a 34-byte compressed pubkey push from script, so \
+                      num_pub_keys <= script.len() / 34"
+        )]
+        {
+            num_pub_keys += 1;
+        }
         if extract_pub_keys {
             pub_keys.push(data.to_vec());
         }
@@ -414,6 +429,10 @@ pub fn extract_multi_sig_script_details_v0(
 
     // There must only be a single opcode left unparsed, which will be
     // OP_CHECKMULTISIG per the check above.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the tokenizer's byte_index only grows up to script.len()"
+    )]
     if script.len() - tokenizer.byte_index() != 1 {
         return MultiSigDetailsV0::default();
     }
@@ -465,6 +484,10 @@ fn final_opcode_data_v0(script: &[u8]) -> Option<&[u8]> {
 pub fn is_multi_sig_sig_script_v0(script: &[u8]) -> bool {
     // Must end with OP_CHECKMULTISIG (inside the pushed redeem script) and
     // have room for at least a push before it.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "script.len() - 1 is evaluated only when script.len() >= 4"
+    )]
     if script.len() < 4 || script[script.len() - 1] != OP_CHECKMULTISIG {
         return false;
     }
@@ -979,7 +1002,14 @@ pub fn extract_atomic_swap_data_pushes_v0(redeem_script: &[u8]) -> Option<Atomic
             }
         }
 
-        template_offset += 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "template_offset < template.len() = 20 is checked at the top of the loop, \
+                      so template_offset + 1 <= 20"
+        )]
+        {
+            template_offset += 1;
+        }
     }
     if tokenizer.err().is_some() {
         return None;

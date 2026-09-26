@@ -17,9 +17,6 @@
 // because the P2P, RPC and mixing crates legitimately hash (see
 // ADR-0008); note the lint fires only on `for` loops.
 #![deny(clippy::iter_over_hash_type)]
-// The coding arithmetic relies on Go's fixed-width semantics over
-// values bounded by the filter parameters.
-#![allow(clippy::arithmetic_side_effects)]
 
 extern crate alloc;
 
@@ -97,11 +94,19 @@ fn siphash(k0: u64, k1: u64, data: &[u8]) -> u64 {
 }
 
 /// The version 1 reduction: plain modulo (dcrd `modReduceV1`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "unsigned, so never MIN % -1; n is N*M, nonzero for every built filter with entries (N <= i32::MAX, M = 2^P <= 2^32), and zero only for a deserialized v1 filter claiming 0 entries over data, where dcrd's x % N panics the same way"
+)]
 fn mod_reduce_v1(x: u64, n: u64) -> u64 {
     x % n
 }
 
 /// The version 2 reduction: multiply-shift (dcrd `fastReduce`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the product of two u64 values fits in u128: (2^64 - 1)^2 < 2^128"
+)]
 fn fast_reduce(x: u64, n: u64) -> u64 {
     ((u128::from(x) * u128::from(n)) >> 64) as u64
 }
@@ -200,6 +205,10 @@ impl Filter {
 
         let (modulus_nm, values) = sorted_values(version, m, k0, k1, data);
         let num_entries = values.len() as u64;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "b <= 32 is asserted above, so 1 << b >= 1"
+        )]
         let mod_b_mask = (1u64 << b) - 1;
         let mut f = Filter {
             version,
@@ -222,11 +231,19 @@ impl Filter {
         // is 1 on average (2 bits) and 2 (3 bits) next most often, so
         // (NB + 2N/2 + 3N/2) / 8 bytes, with Go's `3*numEntries>>1`
         // parsing as `(3*numEntries)>>1`.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "num_entries <= i32::MAX (checked above) and b <= 32, so the sum is below 2^37"
+        )]
         let size_hint = (num_entries * u64::from(b) + num_entries + ((3 * num_entries) >> 1)) >> 3;
         let n_size = match version {
             1 => 4,
             _ => var_int_serialize_size(u64::from(f.n)),
         };
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "n_size <= 9 and size_hint < 2^34, a capacity hint"
+        )]
         let mut ndata = Vec::with_capacity(n_size + size_hint as usize);
         match version {
             1 => ndata.extend_from_slice(&f.n.to_be_bytes()),
@@ -236,10 +253,23 @@ impl Filter {
         // Golomb/Rice-code the sorted deltas.
         let mut w = BitWriter::after(ndata);
         for (i, v) in values.iter().enumerate() {
+            #[allow(clippy::arithmetic_side_effects, reason = "i > 0 in the else arm")]
             let prev = if i == 0 { 0 } else { values[i - 1] };
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "values is sorted ascending, so v >= prev"
+            )]
             let delta = v - prev;
             let remainder = delta & mod_b_mask;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "remainder = delta & mod_b_mask <= delta"
+            )]
             let mut quotient = (delta - remainder) >> f.b;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "quotient > 0 by the loop condition"
+            )]
             while quotient > 0 {
                 w.write_one();
                 quotient -= 1;
@@ -284,7 +314,7 @@ impl Filter {
             let Ok(value) = self.read_full_u64(&mut r) else {
                 return false;
             };
-            let value = value + last_value;
+            let value = value.wrapping_add(last_value);
             if value == term {
                 return true;
             }
@@ -331,7 +361,11 @@ impl Filter {
             let Ok(delta) = self.read_full_u64(&mut r) else {
                 return false;
             };
-            filter_val += delta;
+            filter_val = filter_val.wrapping_add(delta);
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "search_idx < values.len() by the loop condition"
+            )]
             while search_idx < values.len() {
                 let search_val = values[search_idx];
                 if search_val == filter_val {
@@ -402,6 +436,10 @@ impl FilterV1 {
                 version: 1,
                 n,
                 b: p,
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "n <= u32::MAX and 1 << p <= 2^32 (p <= 32 checked above), so the product is below 2^64"
+                )]
                 modulus_nm: u64::from(n) * (1u64 << p),
                 filter_n_data: d.to_vec(),
                 data_offset,
@@ -543,6 +581,10 @@ pub fn make_header_for_filter(filter: &FilterV1, prev_header: &Hash) -> Hash {
 /// entries the largest difference wraps around to `u64::MAX`, a shift
 /// count of 64 or more yields zero, and the final byte rounding wraps
 /// rather than saturating.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "only the final sum: the quotient is at most u64::MAX / 8 and n_ser_size <= 9"
+)]
 pub fn max_filter_v2_size(b: u8, m: u64, n: u32) -> u64 {
     let n = u64::from(n);
     let b = u32::from(b);

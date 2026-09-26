@@ -79,6 +79,10 @@ impl MsgVersion {
         let ts = r.read_u64()?;
         // Reject timestamps that would overflow Go's usable time range
         // (dcrd int64Time semantics).
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "constant: i64::MAX - 62_135_596_800 does not underflow"
+        )]
         if ts > i64::MAX as u64 - UNIX_TO_INTERNAL {
             return Err(WireError::InvalidTimestamp);
         }
@@ -125,6 +129,10 @@ impl MsgVersion {
         validate_user_agent(&self.user_agent)?;
         w.extend_from_slice(&(self.protocol_version as u32).to_le_bytes());
         w.extend_from_slice(&self.services.0.to_le_bytes());
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "constant: i64::MAX - 62_135_596_800 does not underflow"
+        )]
         if (self.timestamp as u64) > i64::MAX as u64 - UNIX_TO_INTERNAL {
             return Err(WireError::InvalidTimestamp);
         }
@@ -139,6 +147,10 @@ impl MsgVersion {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constant: 33 + 30 * 2 + 9 + 256 = 358"
+    )]
     pub(crate) fn max_payload_length(_pver: u32) -> u32 {
         33 + (MAX_NET_ADDRESS_PAYLOAD * 2) + 9 + MAX_USER_AGENT_LEN as u32
     }
@@ -234,6 +246,10 @@ impl MsgAddr {
 
     /// The maximum payload for the version (dcrd
     /// `MsgAddr.MaxPayloadLength`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constant: 3 + 1000 * 30 = 30003"
+    )]
     pub fn max_payload_length(pver: u32) -> u32 {
         // Zero once the message is invalid for the version (at
         // `AddrV2Version`).
@@ -306,6 +322,10 @@ impl MsgAddrV2 {
 
     /// The maximum payload for the version (dcrd
     /// `MsgAddrV2.MaxPayloadLength`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constant: 3 + 1000 * 51 = 51003"
+    )]
     pub fn max_payload_length(pver: u32) -> u32 {
         // Zero before the message exists for the version.
         if pver < crate::protocol::ADDR_V2_VERSION {

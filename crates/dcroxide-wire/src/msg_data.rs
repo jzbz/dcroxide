@@ -35,6 +35,10 @@ pub const MAX_BLOCK_PAYLOAD: u32 = 1_310_720;
 
 /// The maximum number of transactions per transaction tree (dcrd
 /// `MaxTxPerTxTree`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "constants: the divisors MIN_TX_PAYLOAD = 15 and 2 are nonzero and unsigned; the results are 33334 and 43691"
+)]
 pub fn max_tx_per_tx_tree(pver: u32) -> u64 {
     if pver <= 3 {
         (u64::from(MAX_BLOCK_PAYLOAD_V3) / MIN_TX_PAYLOAD) / 2 + 1
@@ -110,6 +114,10 @@ pub(crate) fn encode_inv_message(w: &mut Vec<u8>, list: &[InvVect]) -> Result<()
     write_inv_list(w, list)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "constant: 3 + 50000 * 36 = 1800003"
+)]
 pub(crate) fn inv_message_max_payload(_pver: u32) -> u32 {
     var_int_serialize_size(MAX_INV_PER_MSG) as u32 + MAX_INV_PER_MSG as u32 * INV_VECT_PAYLOAD
 }
@@ -163,6 +171,10 @@ impl BlockLocator {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constant: 4 + 3 + 500 * 32 + 32 = 16039"
+    )]
     pub(crate) fn max_payload_length(_pver: u32) -> u32 {
         4 + var_int_serialize_size(MAX_BLOCK_LOCATORS_PER_MSG) as u32
             + (MAX_BLOCK_LOCATORS_PER_MSG as u32 * HASH_SIZE as u32)
@@ -246,6 +258,10 @@ impl MsgHeaders {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constant: 3 + (180 + 1) * 2000 = 362003"
+    )]
     pub(crate) fn max_payload_length(_pver: u32) -> u32 {
         var_int_serialize_size(MAX_BLOCK_HEADERS_PER_MSG) as u32
             + ((MAX_BLOCK_HEADER_PAYLOAD as u32 + 1) * MAX_BLOCK_HEADERS_PER_MSG as u32)
@@ -337,6 +353,10 @@ impl MsgBlock {
     }
 
     /// The serialized size in bytes (dcrd `MsgBlock.SerializeSize`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the header's 180 bytes, two varint sizes (at most 9) and the in-memory transactions' sizes, bounded by the block's allocation"
+    )]
     pub fn serialize_size(&self) -> usize {
         MAX_BLOCK_HEADER_PAYLOAD
             + var_int_serialize_size(self.transactions.len() as u64)
@@ -460,6 +480,10 @@ impl MsgMiningState {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constant: 4 + 4 + 1 + 8 * 32 + 1 + 40 * 32 = 1546"
+    )]
     pub(crate) fn max_payload_length(_pver: u32) -> u32 {
         4 + 4
             + var_int_serialize_size(MAX_MS_BLOCKS_AT_HEAD_PER_MSG) as u32
@@ -527,6 +551,10 @@ impl MsgGetInitState {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constant: 1 + 32 * (1 + 32) = 1057"
+    )]
     pub(crate) fn max_payload_length(pver: u32) -> u32 {
         if pver < INIT_STATE_VERSION {
             return 0;
@@ -590,6 +618,10 @@ impl MsgInitState {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constant: 1 + 8 * 32 + 1 + 40 * 32 + 1 + 7 * 32 = 1763"
+    )]
     pub(crate) fn max_payload_length(pver: u32) -> u32 {
         if pver < INIT_STATE_VERSION {
             return 0;

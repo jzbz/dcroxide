@@ -23,10 +23,6 @@
 // because the P2P, RPC and mixing crates legitimately hash (see
 // ADR-0008); note the lint fires only on `for` loops.
 #![deny(clippy::iter_over_hash_type)]
-// This crate is 2^256 modular arithmetic: wrapping is the specified
-// semantics, carried out through explicit carry/borrow helpers, and all
-// indexing is over fixed 4/5-word arrays with statically bounded loops.
-#![allow(clippy::arithmetic_side_effects)]
 
 extern crate alloc;
 
@@ -37,6 +33,10 @@ use core::fmt;
 
 /// `a + b + carry`, returning the sum and new carry (Go `bits.Add64`).
 #[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "c1 and c2 are each 0 or 1, so the carry sum is at most 2"
+)]
 fn add64(a: u64, b: u64, carry: u64) -> (u64, u64) {
     let (d1, c1) = a.overflowing_add(b);
     let (d2, c2) = d1.overflowing_add(carry);
@@ -54,6 +54,10 @@ fn sub64(a: u64, b: u64, borrow: u64) -> (u64, u64) {
 
 /// The 128-bit product of `a * b` as (hi, lo) (Go `bits.Mul64`).
 #[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "(2^64 - 1)^2 < 2^128, so the widened product cannot overflow u128"
+)]
 fn mul64(a: u64, b: u64) -> (u64, u64) {
     let t = u128::from(a) * u128::from(b);
     ((t >> 64) as u64, t as u64)
@@ -62,6 +66,11 @@ fn mul64(a: u64, b: u64) -> (u64, u64) {
 /// `(hi‖lo) / y` returning (quotient, remainder); requires `hi < y` so the
 /// quotient fits in 64 bits (Go `bits.Div64` under the same precondition).
 #[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "y > hi >= 0 by the precondition, so y != 0; every caller passes a checked nonzero \
+              divisor or the normalized leading divisor digit"
+)]
 fn div64(hi: u64, lo: u64, y: u64) -> (u64, u64) {
     debug_assert!(hi < y);
     let dividend = (u128::from(hi) << 64) | u128::from(lo);
@@ -71,6 +80,10 @@ fn div64(hi: u64, lo: u64, y: u64) -> (u64, u64) {
 
 /// `digit1*digit2 + m` as (hi, lo) (dcrd `mulAdd64`).
 #[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "at most (2^64 - 1)^2 + (2^64 - 1) = 2^128 - 2^64 < 2^128, as dcrd's mulAdd64 notes"
+)]
 fn mul_add64(digit1: u64, digit2: u64, m: u64) -> (u64, u64) {
     let t = u128::from(digit1) * u128::from(digit2) + u128::from(m);
     ((t >> 64) as u64, t as u64)
@@ -78,6 +91,10 @@ fn mul_add64(digit1: u64, digit2: u64, m: u64) -> (u64, u64) {
 
 /// `digit1*digit2 + m + c` as (hi, lo) (dcrd `mulAdd64Carry`).
 #[inline]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "at most (2^64 - 1)^2 + 2 * (2^64 - 1) = 2^128 - 1, as dcrd's mulAdd64Carry notes"
+)]
 fn mul_add64_carry(digit1: u64, digit2: u64, m: u64, c: u64) -> (u64, u64) {
     let t = u128::from(digit1) * u128::from(digit2) + u128::from(m) + u128::from(c);
     ((t >> 64) as u64, t as u64)
@@ -121,6 +138,10 @@ impl Uint256 {
 
     /// A uint256 from a 256-bit big-endian byte array (dcrd `SetBytes`).
     pub fn from_be_bytes(b: &[u8; 32]) -> Uint256 {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i is one of the offsets 0, 8, 16, 24 below, so i + 8 <= 32"
+        )]
         let w = |i: usize| u64::from_be_bytes(b[i..i + 8].try_into().expect("8 bytes"));
         Uint256 {
             n: [w(24), w(16), w(8), w(0)],
@@ -130,6 +151,10 @@ impl Uint256 {
     /// A uint256 from a 256-bit little-endian byte array (dcrd
     /// `SetBytesLE`).
     pub fn from_le_bytes(b: &[u8; 32]) -> Uint256 {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "i is one of the offsets 0, 8, 16, 24 below, so i + 8 <= 32"
+        )]
         let w = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().expect("8 bytes"));
         Uint256 {
             n: [w(0), w(8), w(16), w(24)],
@@ -138,6 +163,10 @@ impl Uint256 {
 
     /// A uint256 from a big-endian byte slice, truncated to the final 32
     /// bytes so the result is modulo 2^256 (dcrd `SetByteSlice`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "take = min(b.len(), 32), so b.len() - take and 32 - take cannot underflow"
+    )]
     pub fn from_be_slice(b: &[u8]) -> Uint256 {
         let mut b32 = [0u8; 32];
         let take = b.len().min(32);
@@ -388,6 +417,10 @@ impl Uint256 {
 
     /// The number of base-2^64 digits required to represent the value; 0
     /// for zero (dcrd `numDigits`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "i < 4 from the loop range, so i + 1 <= 4"
+    )]
     fn num_digits(&self) -> usize {
         for i in (0..4).rev() {
             if self.n[i] != 0 {
@@ -414,6 +447,11 @@ impl Uint256 {
             return self.set_u64(1);
         }
         if dividend.is_u64() {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "divisor is nonzero (asserted above) and <= dividend, which fits a u64, \
+                          so divisor.n[0] != 0"
+            )]
             return self.set_u64(dividend.n[0] / divisor.n[0]);
         }
 
@@ -435,9 +473,19 @@ impl Uint256 {
         // Normalize both operands so the divisor's leading digit is >= 2^63.
         let num_divisor_digits = divisor.num_digits();
         let num_dividend_digits = dividend.num_digits();
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "divisor does not fit a u64 here, so num_divisor_digits >= 2"
+        )]
         let sf = divisor.n[num_divisor_digits - 1].leading_zeros();
         let mut divisor_n = [0u64; 4];
         let mut dividend_n = [0u64; 5];
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "sf is 1..=63 here (the leading-zero count of a nonzero word), so 64 - sf is \
+                      1..=63; i >= 1 in both loops; num_dividend_digits >= 2 because the \
+                      dividend does not fit a u64"
+        )]
         if sf > 0 {
             for i in (1..num_divisor_digits).rev() {
                 divisor_n[i] = divisor.n[i] << sf | divisor.n[i - 1] >> (64 - sf);
@@ -460,6 +508,14 @@ impl Uint256 {
         let mut p = [0u64; 5];
         let (mut qhat, mut c, mut borrow): (u64, u64, u64);
         self.zero();
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "2 <= num_divisor_digits <= num_dividend_digits <= 4 (divisor <= dividend, \
+                      neither fits a u64), so d + num_divisor_digits <= 4 indexes the 5-word \
+                      dividend_n and d + 2 <= d + num_divisor_digits; qhat >= 1 whenever the \
+                      correction loop runs, because qhat == 0 makes p zero and no prefix is below \
+                      zero"
+        )]
         for d in (0..=num_dividend_digits - num_divisor_digits).rev() {
             // Estimate from the top two remainder digits over the leading
             // divisor digit; saturate on the equal-leading-digit overflow
@@ -547,6 +603,12 @@ impl Uint256 {
     }
 
     /// self = n2 << bits (dcrd `LshVal`). Shifts > 255 produce zero.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bits is 1..=255 past the early returns; each branch subtracts the bound it just \
+                  checked (192, 128 or 64) and returns on zero, so every 64 - bits sees bits in \
+                  1..=63"
+    )]
     pub fn lsh_val(&mut self, n2: &Uint256, bits: u32) -> &mut Uint256 {
         if bits > 255 {
             return self.zero();
@@ -604,6 +666,12 @@ impl Uint256 {
     }
 
     /// self = n2 >> bits (dcrd `RshVal`). Shifts > 255 produce zero.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bits is 1..=255 past the early returns; each branch subtracts the bound it just \
+                  checked (192, 128 or 64) and returns on zero, so every 64 - bits sees bits in \
+                  1..=63"
+    )]
     pub fn rsh_val(&mut self, n2: &Uint256, bits: u32) -> &mut Uint256 {
         if bits > 255 {
             return self.zero();
@@ -697,6 +765,11 @@ impl Uint256 {
     pub fn bit_len(&self) -> u16 {
         for i in (0..4).rev() {
             if self.n[i] != 0 {
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "n[i] != 0 so leading_zeros() <= 63, and i < 4, so the sum is at \
+                              most 64 + 192 = 256"
+                )]
                 return (64 - self.n[i].leading_zeros() + 64 * i as u32) as u16;
             }
         }
@@ -722,6 +795,10 @@ impl Uint256 {
             return String::from("0");
         }
         const ALPHABET: &[u8; 16] = b"0123456789abcdef";
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "shift is 1, 3 or 4, so 1 << shift >= 2"
+        )]
         let mask = (1u64 << shift) - 1;
         let bit_len = u32::from(self.bit_len());
         let max_out_digits = bit_len.div_ceil(shift);
@@ -729,6 +806,12 @@ impl Uint256 {
 
         let mut out_idx = max_out_digits as usize;
         let mut bit = 0u32;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "bit < bit_len <= 256 and shift <= 4, so bit + shift <= 259; bit_in_word < 64 \
+                      and word_idx < 4; the loop runs exactly max_out_digits = \
+                      ceil(bit_len / shift) times, so out_idx >= 1 before each decrement"
+        )]
         while bit < bit_len {
             // Assemble the digit from up to two adjacent words.
             let word_idx = (bit / 64) as usize;
@@ -760,6 +843,10 @@ impl Uint256 {
         // bit_len / log2(10) + 1 digits suffice (see dcrd's derivation;
         // dcrd's literal is the same f64 value as the stdlib constant, and
         // this only sizes an over-allocated buffer that gets trimmed).
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "bit_len <= 256, so the quotient is at most 77 and the sum at most 78"
+        )]
         let max_out_digits =
             (f64::from(u32::from(self.bit_len())) / core::f64::consts::LOG2_10) as u32 + 1;
         let mut result = vec![b'0'; max_out_digits as usize];
@@ -767,6 +854,13 @@ impl Uint256 {
         let mut out_idx = max_out_digits as usize;
         let mut remaining_digits_per_div = 0u32;
         let mut quo = self;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "out_idx starts at max_out_digits, at least the value's decimal digit count, \
+                      and drops by one per digit written; r = input_word % 10 < 10; \
+                      input_word < 10^19 has at most 19 digits, so remaining_digits_per_div \
+                      (reset to 19) stays >= 0"
+        )]
         while !quo.is_zero() {
             for _ in 0..remaining_digits_per_div {
                 out_idx -= 1;
@@ -871,6 +965,10 @@ impl fmt::UpperHex for Uint256 {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over small fixed values"
+)]
 mod tests {
     use super::*;
 

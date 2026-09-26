@@ -111,6 +111,10 @@ pub(crate) const MIN_TX_SIZE: usize = 5;
 /// hold keeps the reservation to the payload's own scale, and with
 /// `min_size` the true minimum it never under-reserves input that
 /// decodes.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "min_size is a positive constant at every call site and the division is unsigned"
+)]
 pub(crate) fn capped_capacity(count: u64, remaining: usize, min_size: usize) -> usize {
     (count as usize).min(remaining / min_size)
 }
@@ -196,6 +200,10 @@ impl TxIn {
     }
 
     /// Serialized size of the witness portion (dcrd `SerializeSizeWitness`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constants 16 and a varint size (at most 9) plus an in-memory script length"
+    )]
     pub fn serialize_size_witness(&self) -> usize {
         8 + 4
             + 4
@@ -217,6 +225,10 @@ pub struct TxOut {
 
 impl TxOut {
     /// Serialized size (dcrd `TxOut.SerializeSize`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constants 10 and a varint size (at most 9) plus an in-memory script length"
+    )]
     pub fn serialize_size(&self) -> usize {
         8 + 2 + var_int_serialize_size(self.pk_script.len() as u64) + self.pk_script.len()
     }
@@ -489,6 +501,10 @@ impl MsgTx {
     /// The serialized size in bytes for an explicit serialization type
     /// (dcrd computes this by shallow-copying the transaction with the
     /// desired `SerType` and calling `SerializeSize`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constants, varint sizes (at most 9) and sums of in-memory input and output sizes, bounded by the transaction's allocation"
+    )]
     fn serialize_size_with_type(&self, ser_type: TxSerializeType) -> usize {
         let prefix = || {
             12 + var_int_serialize_size(self.tx_in.len() as u64)

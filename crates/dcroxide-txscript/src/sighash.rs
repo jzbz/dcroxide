@@ -69,6 +69,12 @@ fn var_int_serialize_size(val: u64) -> usize {
 
 /// The number of bytes the prefix hash portion of the signature hash
 /// occupies when serialized (dcrd `sigHashPrefixSerializeSize`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "every term is bounded by tx's in-memory size: a TxIn occupies more than the 41 \
+              bytes counted for it, a TxOut more than the 10 + 9 counted for it besides its \
+              script, and each pk_script's bytes are held in memory, so the sum fits in usize"
+)]
 fn sig_hash_prefix_serialize_size(
     hash_type: SigHashType,
     tx_ins: &[dcroxide_wire::TxIn],
@@ -106,6 +112,12 @@ fn sig_hash_prefix_serialize_size(
 
 /// The number of bytes the witness hash portion of the signature hash
 /// occupies when serialized (dcrd `sigHashWitnessSerializeSize`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "num_tx_ins counts TxIns held in memory and sign_script is a slice, so their sum \
+              plus at most 22 varint and version bytes fits in usize; the sum is at least \
+              4 + 1 + 1 = 6, so subtracting 1 cannot underflow"
+)]
 fn sig_hash_witness_serialize_size(num_tx_ins: usize, sign_script: &[u8]) -> usize {
     // 1) 4 bytes version/serialization type
     // 2) number of inputs varint
@@ -149,6 +161,13 @@ pub(crate) fn calc_signature_hash(
     // Choose the inputs that will be committed to based on the signature
     // hash type. SigHashAnyOneCanPay commits only to the input being
     // signed; otherwise all inputs are committed to.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "idx < tx.tx_in.len() is the documented precondition under \
+                  SigHashAnyOneCanPay (the engine passes its own input index), so \
+                  idx + 1 <= tx.tx_in.len(); an out-of-range idx panics on the slice as dcrd's \
+                  tx.TxIn[idx : idx+1] does"
+    )]
     let (tx_ins, sign_tx_in_idx) = if hash_type.0 & SIG_HASH_ANY_ONE_CAN_PAY.0 != 0 {
         (&tx.tx_in[idx..idx + 1], 0usize)
     } else {
@@ -159,6 +178,11 @@ pub(crate) fn calc_signature_hash(
     // SigHashNone commits to none, SigHashSingle to the outputs up to and
     // including the corresponding one (with prior outputs cleared), and
     // everything else (including undefined hash types) to all outputs.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "idx < tx.tx_out.len() is checked above for SigHashSingle, so \
+                  idx + 1 <= tx.tx_out.len()"
+    )]
     let tx_outs: &[dcroxide_wire::TxOut] = match hash_type.0 & SIG_HASH_MASK {
         x if x == SIG_HASH_NONE.0 => &[],
         x if x == SIG_HASH_SINGLE.0 => &tx.tx_out[..idx + 1],

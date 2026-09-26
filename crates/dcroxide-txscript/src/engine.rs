@@ -208,6 +208,12 @@ impl<'a> Engine<'a> {
 
         // Note that this includes OP_RESERVED which counts as a push
         // operation.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "num_ops counts the non-push opcodes of the current script, is reset when \
+                      each script ends, and the first one past MAX_OPS_PER_SCRIPT = 255 fails \
+                      execution, so it stays far below i32::MAX"
+        )]
         if op.value > OP_16 {
             self.num_ops += 1;
             if self.num_ops > MAX_OPS_PER_SCRIPT {
@@ -312,6 +318,12 @@ impl<'a> Engine<'a> {
         let script = &self.scripts[idx];
         let mut tokenizer = crate::tokenizer::ScriptTokenizer::new(self.version, script);
         let mut opcode_idx = 0;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "one increment per opcode parsed, so opcode_idx <= script.len(), and the \
+                      engine's scripts are at most MAX_SCRIPT_SIZE = 16384 bytes (checked in \
+                      new) or a redeem script pushed as one stack element"
+        )]
         while tokenizer.next() {
             disbuf.push_str(&format!("{idx:02x}:{opcode_idx:04x}: "));
             disasm_opcode(&mut disbuf, tokenizer.opcode(), tokenizer.data(), false);
@@ -415,6 +427,11 @@ impl<'a> Engine<'a> {
         self.execute_opcode(op, data)?;
 
         // The combined data and alt stacks must not exceed the maximum.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "execution fails once the combined depth passes MAX_STACK_SIZE = 1024, and \
+                      one opcode pushes at most 3 items, so each depth is far below i32::MAX / 2"
+        )]
         let combined_stack_size = self.dstack.depth() + self.astack.depth();
         if combined_stack_size > MAX_STACK_SIZE {
             return Err(script_error(
@@ -424,7 +441,14 @@ impl<'a> Engine<'a> {
         }
 
         // Prepare for next instruction.
-        self.opcode_idx += 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "opcode_idx counts the opcodes parsed from the current script and is reset \
+                      when it ends, so it is at most the script's length"
+        )]
+        {
+            self.opcode_idx += 1;
+        }
         if self.tokenizer_offset >= self.scripts[self.script_idx].len() {
             // Illegal to have a conditional that straddles two scripts.
             if self.cond_nest_depth != 0 {
@@ -445,6 +469,11 @@ impl<'a> Engine<'a> {
             self.opcode_idx = 0;
 
             // Advance to the next script as needed.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "check_valid_pc above holds script_idx < scripts.len() <= 3, so \
+                          script_idx + 1 <= 3"
+            )]
             if self.script_idx == 0 && self.is_p2sh {
                 self.script_idx += 1;
                 self.saved_first_stack = self.get_stack();
@@ -478,6 +507,10 @@ impl<'a> Engine<'a> {
             }
 
             // Skip empty scripts.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "script_idx < scripts.len() <= 3 is checked here, so script_idx + 1 <= 3"
+            )]
             if self.script_idx < self.scripts.len() && self.scripts[self.script_idx].is_empty() {
                 self.script_idx += 1;
             }
@@ -649,6 +682,10 @@ impl<'a> Engine<'a> {
 
         // Advance the program counter to the public key script when the
         // signature script is empty.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "script_idx is 0 in the engine just built, so it becomes 1"
+        )]
         if script_sig.is_empty() {
             vm.script_idx += 1;
         }
@@ -689,6 +726,10 @@ fn check_minimal_data_push(op: &OpcodeInfo, data: &[u8]) -> Result<(), ScriptErr
             ),
         ));
     } else if data_len == 1 && data[0] >= 1 && data[0] <= 16 {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "data[0] is 1..=16 (checked above), so OP_1 + data[0] - 1 is at most OP_16"
+        )]
         if opcode != OP_1 + data[0] - 1 {
             // Should have used OP_1 .. OP_16.
             return Err(script_error(

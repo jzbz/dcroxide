@@ -23,6 +23,10 @@ impl<'a> Cursor<'a> {
     }
 
     /// Bytes remaining.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "pos <= buf.len(): pos only advances in take, by n <= remaining()"
+    )]
     pub fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
@@ -33,6 +37,10 @@ impl<'a> Cursor<'a> {
     /// with Go's `io.EOF` when no bytes are left at all, and
     /// `io.ErrUnexpectedEOF` when only some are (`shortRead`,
     /// `io.ReadFull`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "pos + n <= buf.len(): take returns early unless remaining() >= n"
+    )]
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
         if self.remaining() < n {
             if self.remaining() == 0 {

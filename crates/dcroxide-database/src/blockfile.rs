@@ -162,6 +162,10 @@ impl BlockStore {
         loop {
             let path = block_file_path(db_path, num);
             match fs::metadata(&path) {
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "num counts contiguous block files that exist on disk, far below u32::MAX"
+                )]
                 Ok(md) => {
                     write_file_num = num;
                     write_offset = md.len() as u32;
@@ -205,6 +209,10 @@ impl BlockStore {
                     failure = Some(std::io::Error::from(std::io::ErrorKind::WriteZero));
                     break;
                 }
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "written + n <= data.len(): write returns at most the remaining buffer's length"
+                )]
                 Ok(n) => written += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
@@ -216,7 +224,7 @@ impl BlockStore {
         // At most one record, which `write_block` has checked fits the
         // u32 cursor.
         let written = written as u32;
-        self.write_offset += written;
+        self.write_offset = self.write_offset.wrapping_add(written);
         match failure {
             None => Ok(()),
             Some(e) => Err(db_error(
@@ -224,7 +232,7 @@ impl BlockStore {
                 format!(
                     "failed to write {field_name} to file {} at offset {}: {e}",
                     self.write_file_num,
-                    self.write_offset - written
+                    self.write_offset.wrapping_sub(written)
                 ),
             )),
         }
@@ -237,14 +245,14 @@ impl BlockStore {
     /// [`Self::finish_sync`].
     pub(crate) fn write_block(&mut self, raw_block: &[u8]) -> Result<BlockLocation, Error> {
         let block_len = raw_block.len() as u32;
-        let full_len = block_len + BLOCK_RECORD_OVERHEAD;
+        let full_len = block_len.wrapping_add(BLOCK_RECORD_OVERHEAD);
 
         // Move to the next block file if adding the new block would
         // exceed the max allowed size for the current block file.
         let final_offset = self.write_offset.checked_add(full_len);
         if final_offset.is_none() || final_offset.expect("checked") > self.max_block_file_size {
             self.write_file = None;
-            self.write_file_num += 1;
+            self.write_file_num = self.write_file_num.wrapping_add(1);
             self.write_offset = 0;
         }
 
@@ -417,6 +425,10 @@ impl BlockStore {
         // that cannot be removed ends the rollback, as in dcrd -- a
         // rotation whose new file was never created included.
         let mut num = self.write_file_num;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "num > file_num by the loop condition, so num >= 1"
+        )]
         while num > file_num {
             let path = block_file_path(&self.db_path, num);
             if let Err(e) = fs::remove_file(&path) {
@@ -500,6 +512,11 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()
         std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
     }
     #[cfg(windows)]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "offset is a u32 file offset and filled < buf.len() <= u32::MAX, so \
+                  offset + filled < 2^33; seek_read returns n <= buf.len() - filled"
+    )]
     {
         // `seek_read` may return short, as `read` may.
         let mut filled = 0usize;
@@ -536,6 +553,11 @@ impl BlockReader {
     /// Read the block record at the location per dcrd `readBlock`:
     /// verifies the checksum (`ErrCorruption` on mismatch) and the
     /// network, returning the raw serialized block.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "n = block_len >= 12 for every record write_block stores; a corrupt shorter \
+                  length panics in the slicing, as dcrd's readBlock slice expressions do"
+    )]
     pub(crate) fn read_block(&self, loc: BlockLocation) -> Result<Vec<u8>, Error> {
         let network = self.network;
         let mut data = vec![0u8; loc.block_len as usize];
@@ -590,7 +612,7 @@ impl BlockReader {
     ) -> Result<Vec<u8>, Error> {
         // Regions are offsets into the raw block, so skip the network
         // and length bytes of the record.
-        let read_offset = u64::from(loc.file_offset) + 8 + u64::from(offset);
+        let read_offset = u64::from(loc.file_offset.wrapping_add(8).wrapping_add(offset));
         let mut data = vec![0u8; len as usize];
         read_exact_at(&self.file, &mut data, read_offset)
             .map_err(|e| io_err(&e, "failed to read block region"))?;
@@ -843,6 +865,40 @@ mod tests {
             good,
             "the cursor goes back whatever failed"
         );
+    }
+
+    /// A region read computes its file offset at u32, as dcrd's
+    /// `readBlockRegion` does (`loc.fileOffset + 8 + offset`,
+    /// `blockio.go:582`), so an offset past `u32::MAX` wraps to the
+    /// start of the file instead of reading past 4 GiB.
+    ///
+    /// Computed in u64, the read lands at 2^32 and fails with an EOF
+    /// where dcrd returns the bytes at the wrapped offset.
+    #[test]
+    fn a_region_read_offset_wraps_at_u32_as_dcrd_computes_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut store = small_store(dir.path());
+        store.write_block(&[7; 8]).expect("write block");
+        let reader = store.reader(0).expect("reader");
+
+        // file_offset + 8 wraps to 0: the region is the record's first
+        // bytes, the network in little-endian order.
+        let loc = BlockLocation {
+            block_file_num: 0,
+            file_offset: u32::MAX - 7,
+            block_len: 8 + BLOCK_RECORD_OVERHEAD,
+        };
+        let region = reader
+            .read_block_region(loc, 0, 4)
+            .expect("the wrapped offset reads from the start of the file");
+        assert_eq!(region, 0x1234_5678u32.to_le_bytes());
+
+        // And the region offset wraps with it: 2^32 - 8 + 8 + 8 is 8,
+        // the first byte of the block.
+        let region = reader
+            .read_block_region(loc, 8, 8)
+            .expect("the wrapped offset reads the block");
+        assert_eq!(region, [7u8; 8]);
     }
 
     /// The files a rollback does discard leave the list: they are either

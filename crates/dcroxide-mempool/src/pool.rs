@@ -366,6 +366,10 @@ pub trait VoteReceiver: Send {
 /// (`crypto/rand/uniform.go:102-148`) -- never rejects, so a constant
 /// draw source terminates here.  Every `PoolChain` double in this
 /// repository is such a source.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "i < items.len() <= isize::MAX, so i as u64 + 1 neither overflows nor is zero"
+)]
 fn shuffle_trial_order<T>(items: &mut [T], mut draw: impl FnMut() -> u64) {
     for i in (1..items.len()).rev() {
         let j = (draw() % (i as u64 + 1)) as usize;
@@ -416,6 +420,10 @@ impl<C: PoolChain> TxPool<C> {
     /// A new memory pool for validating and storing standalone
     /// transactions until they are mined into a block (dcrd `New`).
     pub fn new(chain: C, policy: Policy, params: &Params) -> TxPool<C> {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "now_mono_nanos counts nanoseconds from a process-wide origin, so it stays below i64::MAX - ORPHAN_EXPIRE_SCAN_INTERVAL_NANOS for about 292 years of uptime"
+        )]
         let next_expire_scan_mono = chain.now_mono_nanos() + ORPHAN_EXPIRE_SCAN_INTERVAL_NANOS;
         let mining_view = TxMiningView::new(policy.enable_ancestor_tracking);
         TxPool {
@@ -637,6 +645,10 @@ impl<C: PoolChain> TxPool<C> {
             }
 
             let scan = &mut frame.scan;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "next_output < num_outputs <= u32::MAX is the condition"
+            )]
             if scan.next_output < scan.num_outputs {
                 let key = (scan.tx_hash.0, scan.next_output, scan.tree);
                 scan.next_output += 1;
@@ -721,6 +733,10 @@ impl<C: PoolChain> TxPool<C> {
             .filter(|otx| otx.tag == tag)
             .map(|otx| otx.tx_hash)
             .collect();
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "counts the entries of tagged, so at most tagged.len()"
+        )]
         for hash in tagged {
             self.remove_orphan(&hash, true);
             num_evicted += 1;
@@ -778,6 +794,10 @@ impl<C: PoolChain> TxPool<C> {
         // when it's time.  dcrd compares `time.Now()` readings here, so
         // on Go's monotonic clock.
         let now = self.chain.now_mono_nanos();
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "now_mono_nanos counts nanoseconds from a process-wide origin, so it stays below i64::MAX - ORPHAN_EXPIRE_SCAN_INTERVAL_NANOS for about 292 years of uptime"
+        )]
         if now > self.next_expire_scan_mono {
             let expired: Vec<Hash> = self
                 .orphans
@@ -799,6 +819,10 @@ impl<C: PoolChain> TxPool<C> {
         // Nothing to do if adding another orphan will not cause the
         // pool to exceed the limit (dcrd's len+1 <= max shape).
         #[allow(clippy::int_plus_one)]
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "self.orphans.len() counts live orphans, far below i64::MAX"
+        )]
         if (self.orphans.len() as i64) + 1 <= self.policy.max_orphan_txs {
             return;
         }
@@ -816,6 +840,10 @@ impl<C: PoolChain> TxPool<C> {
             // this crate tests through into non-terminating sources.
             // See this function's doc comment and PARITY.md's orphan
             // eviction row.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "len > 0 was checked above, and u64 % len cannot overflow"
+            )]
             let index = (self.chain.random_u64() % len as u64) as usize;
             if let Some(&hash) = self.orphan_slots.get(index) {
                 self.remove_orphan(&Hash(hash), false);
@@ -836,6 +864,10 @@ impl<C: PoolChain> TxPool<C> {
         self.limit_num_orphans();
 
         let tx = Arc::new(tx.clone());
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "orphan_slots was just pushed to, so its len() >= 1"
+        )]
         let slot = match self.orphans.get(&tx_hash.0) {
             Some(existing) => existing.slot,
             None => {
@@ -843,6 +875,10 @@ impl<C: PoolChain> TxPool<C> {
                 self.orphan_slots.len() - 1
             }
         };
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "now_mono_nanos counts nanoseconds from a process-wide origin, so it stays below i64::MAX - ORPHAN_TTL_NANOS for about 292 years of uptime"
+        )]
         self.orphans.insert(
             tx_hash.0,
             OrphanTx {
@@ -1233,6 +1269,10 @@ impl<C: PoolChain> TxPool<C> {
         // not.
         let mut yes = 0usize;
         let mut no = 0usize;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "yes and no count the entries of vts, so each is at most vts.len()"
+        )]
         for vote in vts {
             if vote.approves_parent {
                 yes += 1;
@@ -1481,6 +1521,10 @@ impl<C: PoolChain> TxPool<C> {
         // at best, so its height is at least one more than the current
         // height.
         let best_height = self.chain.best_height();
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "best_height is the chain tip's height, a u32 header field widened to i64"
+        )]
         let next_block_height = best_height + 1;
 
         // Don't accept transactions that will be expired as of the
@@ -1510,6 +1554,10 @@ impl<C: PoolChain> TxPool<C> {
 
         // Reject revocations before they can possibly be valid.
         let is_revocation = tx_type == TxType::SSRtx;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "stake_validation_height is a network parameter (4096 on mainnet), far below i64::MAX"
+        )]
         if is_revocation && next_block_height < stake_validation_height + 1 {
             let str = format!(
                 "revocations are not valid until block height {} (next block \
@@ -1576,6 +1624,10 @@ impl<C: PoolChain> TxPool<C> {
             self.check_vote_double_spend(tx, &tx_hash)?;
 
             let mut vote_already_found = 0usize;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "the loop returns once vote_already_found reaches MAX_VOTE_DOUBLE_SPENDS"
+            )]
             for pool_desc in self.pool.values() {
                 if pool_desc.tx_type == TxType::SSGen
                     && pool_desc.tx.tx_in[1].previous_out_point == tx.tx_in[1].previous_out_point
@@ -1609,6 +1661,10 @@ impl<C: PoolChain> TxPool<C> {
         // Votes that are on too old of blocks are rejected.
         if is_vote {
             let (_, vote_height) = dcroxide_stake::ssgen_block_voted_on(tx);
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "next_block_height is a chain height within u32 range plus one and max_vote_age is a u16, so the difference cannot overflow i64"
+            )]
             if i64::from(vote_height) < next_block_height - i64::from(self.policy.max_vote_age)
                 && !self.policy.allow_old_votes
             {
@@ -1925,7 +1981,15 @@ impl<C: PoolChain> TxPool<C> {
                 return Err(tx_rule_error(ErrorKind::TSpendInvalidExpiry, str).into());
             }
         };
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "tvi and mul are network parameters (288 and 12 on mainnet), so 2 * tvi * mul is small"
+        )]
         let vote_start_thresh = (2 * tvi * mul) as i64;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "vote_start is a u32 and next_block_height a chain height within u32 range plus one, so the difference cannot overflow i64"
+        )]
         let blocks_to_vote_start = i64::from(vote_start) - next_block_height;
         let vote_start_distant_future =
             i64::from(vote_start) > next_block_height && blocks_to_vote_start >= vote_start_thresh;
@@ -2296,6 +2360,10 @@ impl<C: PoolChain> TxPool<C> {
             // transaction and repeat for those accepted transactions
             // until there are no more.
             let new_txs = self.process_orphans_internal(tx, &tx_hash, check_tx_flags, &|_| false);
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "new_txs.len() counts live transactions, far below usize::MAX"
+            )]
             let mut accepted = Vec::with_capacity(new_txs.len() + 1);
 
             // Add the parent transaction first so remote nodes do not
@@ -2325,6 +2393,10 @@ impl<C: PoolChain> TxPool<C> {
 
     /// Prune tickets, votes, and revocations that can no longer be
     /// mined (dcrd `pruneStakeTx`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "tx_desc.height is a chain height within u32 range and the prune distances are at most 288, so the sums cannot overflow i64"
+    )]
     fn prune_stake_tx_internal(
         &mut self,
         required_stake_difficulty: i64,
@@ -2391,6 +2463,10 @@ impl<C: PoolChain> TxPool<C> {
     /// `PruneExpiredTx`); the height is the current best chain tip
     /// height.
     pub fn prune_expired_tx(&mut self, height: i64) {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "height is the chain tip's height, a u32 header field widened to i64"
+        )]
         let next_block_height = height + 1;
 
         let pool_descs: Vec<Arc<TxDesc>> = self.pool.values().cloned().collect();
@@ -2486,6 +2562,10 @@ fn is_already_exists_error(err: &PoolError) -> bool {
 }
 
 fn hex_string(bytes: &[u8]) -> String {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bytes.len() <= isize::MAX, so bytes.len() * 2 <= usize::MAX - 1"
+    )]
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         out.push_str(&format!("{b:02x}"));
@@ -2595,6 +2675,10 @@ mod send_tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over small fixed values"
+)]
 mod removal_cascade_tests {
     use super::*;
 
@@ -3458,6 +3542,10 @@ mod orphan_eviction_tests {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test arithmetic over small fixed values"
+)]
 mod fetch_input_utxos_tests {
     use super::*;
 

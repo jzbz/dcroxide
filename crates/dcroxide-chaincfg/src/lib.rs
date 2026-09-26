@@ -29,9 +29,6 @@
 // because the P2P, RPC and mixing crates legitimately hash (see
 // ADR-0008); note the lint fires only on `for` loops.
 #![deny(clippy::iter_over_hash_type)]
-// Parameter data and dump formatting; arithmetic is over fixed parameter
-// values (ledger sums use checked semantics via i64 wrapping like dcrd).
-#![allow(clippy::arithmetic_side_effects)]
 
 extern crate alloc;
 
@@ -238,6 +235,10 @@ impl Params {
 
     /// The sum of the pre-DCP0010 subsidy proportions (dcrd
     /// `TotalSubsidyProportions`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "fixed network parameters: 6 + 3 + 1 = 10 on every network, far below u16::MAX"
+    )]
     pub fn total_subsidy_proportions(&self) -> u16 {
         self.work_reward_proportion + self.stake_reward_proportion + self.block_tax_proportion
     }
@@ -563,6 +564,10 @@ impl dcroxide_standalone::SubsidyParams for Params {
 
 /// Decode a hex string with panicking semantics for the hard-coded
 /// parameter constants (dcrd `hexDecode`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "i < s.len() and both are even (asserted), so i + 2 <= s.len()"
+)]
 pub(crate) fn hex_decode(s: &str) -> Vec<u8> {
     assert!(s.len().is_multiple_of(2), "hex constants have even length");
     (0..s.len())

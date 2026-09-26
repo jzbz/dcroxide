@@ -32,7 +32,7 @@ pub fn calc_input_value_age(
             let input_age = if origin_height == UNMINED_HEIGHT {
                 0
             } else {
-                next_block_height - origin_height
+                next_block_height.wrapping_sub(origin_height)
             };
 
             // Sum the input value times age.  Go multiplies in int64,
@@ -48,6 +48,11 @@ pub fn calc_input_value_age(
 /// The transaction priority: the sum of each input value multiplied
 /// by its age, divided by the adjusted transaction size (dcrd
 /// `CalcPriority`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "overhead adds at most 168 per input of an in-memory transaction, and the \
+              subtraction follows the overhead < serialized_tx_size check"
+)]
 pub fn calc_priority(
     tx: &MsgTx,
     priority_input: impl Fn(&OutPoint) -> Option<(i64, i64)>,

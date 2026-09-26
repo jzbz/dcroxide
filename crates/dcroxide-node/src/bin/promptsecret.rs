@@ -15,9 +15,6 @@
 //! codes and error texts are kept: parse errors print the message
 //! and usage and exit 2, `-h` prints the usage and exits 0.
 
-// The argument walk mirrors Go's arithmetic over bounded indexes.
-#![allow(clippy::arithmetic_side_effects)]
-
 use std::io::{Read, Write};
 
 /// Go `flag` package usage text for the one option.
@@ -37,6 +34,10 @@ enum ParsedArgs {
 fn parse_args(args: &[String]) -> ParsedArgs {
     let mut n: i64 = 1;
     let mut i = 0;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "i < args.len() <= isize::MAX at each increment (the loop condition, or args.get(i) found a value), so i + 1 fits usize"
+    )]
     while i < args.len() {
         let arg = &args[i];
         // Go flag: a non-flag argument, a bare "-", or "--" terminates
@@ -156,6 +157,10 @@ fn underscore_ok(s: &str) -> bool {
         hex = bytes[1].eq_ignore_ascii_case(&b'x');
         i = 2;
     }
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "i < bytes.len() <= isize::MAX by the loop condition, so i + 1 fits usize"
+    )]
     while i < bytes.len() {
         let c = bytes[i];
         let digit = c.is_ascii_digit() || (hex && c.to_ascii_lowercase().is_ascii_hexdigit());

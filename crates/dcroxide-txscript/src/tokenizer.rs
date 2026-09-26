@@ -31,6 +31,10 @@ pub(crate) fn parse_opcode(
     match length {
         // No additional data. Note that some opcodes, notably OP_1NEGATE,
         // OP_0, and OP_[1-16], represent the data themselves.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "offset < script.len() is checked above, so offset + 1 <= script.len()"
+        )]
         1 => Ok(Some(ParsedOpcode {
             op,
             data: 0..0,
@@ -38,6 +42,11 @@ pub(crate) fn parse_opcode(
         })),
 
         // Data pushes of specific lengths -- OP_DATA_[1-75].
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "offset < script.len() is checked above and l <= script.len() - offset \
+                      is checked before use, so every sum is <= script.len()"
+        )]
         l if l > 1 => {
             let l = l as usize;
             let remaining = script.len() - offset;
@@ -60,6 +69,12 @@ pub(crate) fn parse_opcode(
         }
 
         // Data pushes with parsed lengths -- OP_PUSHDATA{1,2,4}.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "l is -1, -2 or -4 from the opcode table; offset < script.len() is checked \
+                      above, and len_bytes and data_len are each checked against the bytes \
+                      remaining before they are added, so every sum is <= script.len()"
+        )]
         l => {
             let len_bytes = (-l) as usize;
             let script_after = &script[offset + 1..];

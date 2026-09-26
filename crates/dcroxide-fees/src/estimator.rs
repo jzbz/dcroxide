@@ -226,7 +226,12 @@ impl Estimator {
     /// The confirmation range index for the given number of blocks to
     /// confirm (dcrd `confirmRange`).
     fn confirm_range(&self, blocks_to_confirm: i32) -> i32 {
-        let idx = blocks_to_confirm - 1;
+        let idx = blocks_to_confirm.wrapping_sub(1);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "max_confirms is set only by new() from cfg.max_confirms <= 788, so \
+                      max_confirms - 1 >= -1"
+        )]
         if idx >= self.max_confirms {
             return self.max_confirms - 1;
         }
@@ -251,6 +256,12 @@ impl Estimator {
         // For unconfirmed (mempool) transactions, every transaction
         // will now take at least one additional block to confirm, so
         // move the stats up one confirmation range.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "confirmed.len() is max_confirms (32 in the daemon): with two or more ranges \
+                      c - 1 >= 0 and the shift loop's c is in 1..len - 1; with fewer, dcrd's int \
+                      len - 1 or c - 1 is -1 and its index panics, as this underflow does"
+        )]
         for bucket in &mut self.mem_pool {
             // The last confirmation range represents all txs confirmed
             // at >= the initial max confirms, so the second to last
@@ -303,7 +314,7 @@ impl Estimator {
     /// accounting error dcrd merely logs).
     fn remove_from_mem_pool(&mut self, blocks_in_mem_pool: i32, rate: f64) {
         let bucket_idx = self.lower_bucket(rate);
-        let confirm_idx = self.confirm_range(blocks_in_mem_pool + 1);
+        let confirm_idx = self.confirm_range(blocks_in_mem_pool.wrapping_add(1));
         let conf = &mut self.mem_pool[bucket_idx as usize].confirmed[confirm_idx as usize];
         conf.fee_sum -= rate;
         conf.tx_count -= 1.0;
@@ -326,6 +337,10 @@ impl Estimator {
 
         // dcrd's comparison shape.
         #[allow(clippy::int_plus_one)]
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "target_confs > 0 past the check above, so target_confs - 1 >= 0"
+        )]
         if target_confs - 1 >= self.max_confirms {
             return Err(EstimateFeeError::TargetConfTooLarge {
                 max_confirms: self.max_confirms,
@@ -333,6 +348,11 @@ impl Estimator {
             });
         }
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "new() always ends bucket_fee_bounds with the +inf bound and sizes buckets \
+                      to match, so buckets.len() >= 1"
+        )]
         let start_idx = self.buckets.len() - 1;
         let confirm_range_idx = self.confirm_range(target_confs) as usize;
 
@@ -343,6 +363,10 @@ impl Estimator {
         let mut cur_buckets_end = start_idx as i64;
 
         let mut b = start_idx as i64;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "b >= 0 inside the loop, so b - 1 >= -1"
+        )]
         while b >= 0 {
             let bucket = &self.buckets[b as usize];
             total_txs += bucket.confirm_count;
@@ -448,7 +472,12 @@ impl Estimator {
         // Note the integer division before the multiplication: dcrd
         // deliberately downsamples rates below 0.001 DCR/KB towards
         // the minimum this way.
-        let rate = (fee / size * 1000) as f64;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "wrapping_div returns Go's MIN for MIN / -1; size is the mempool entry's \
+                      serialized size, so nonzero, and dcrd's int64 division panics on zero too"
+        )]
+        let rate = fee.wrapping_div(size).wrapping_mul(1000) as f64;
 
         if rate < self.bucket_fee_bounds[0] {
             // Transactions paying less than the current relaying fee
@@ -473,7 +502,10 @@ impl Estimator {
         let Some(desc) = self.mem_pool_txs.remove(&tx_hash.0) else {
             return;
         };
-        self.remove_from_mem_pool((self.best_height - desc.added_height) as i32, desc.fees);
+        self.remove_from_mem_pool(
+            self.best_height.wrapping_sub(desc.added_height) as i32,
+            desc.fees,
+        );
     }
 
     /// Move a tracked mempool transaction into a mined state (dcrd
@@ -486,7 +518,10 @@ impl Estimator {
             return;
         };
 
-        self.remove_from_mem_pool((block_height - desc.added_height) as i32, desc.fees);
+        self.remove_from_mem_pool(
+            block_height.wrapping_sub(desc.added_height) as i32,
+            desc.fees,
+        );
 
         if block_height <= desc.added_height {
             // This shouldn't usually happen but non positive
@@ -495,6 +530,12 @@ impl Estimator {
             return;
         }
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "block_height > desc.added_height (checked above) and added_height >= 0 \
+                      (entries are recorded only at best_height >= 0), so the difference is in \
+                      1..=i64::MAX"
+        )]
         let mine_delay = (block_height - desc.added_height) as i32;
         self.new_mined_tx(mine_delay, desc.fees);
     }
@@ -564,6 +605,11 @@ impl core::fmt::Display for StaleBlock {
 /// count, the fee sum, then the per-range count and fee sum, all as
 /// big-endian float bits (the encoding inside dcrd `updateDatabase`).
 pub fn serialize_bucket(bucket: &TxConfirmStatBucket) -> Vec<u8> {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "confirmed holds 16-byte values, so len * 16 <= isize::MAX and adding 16 stays \
+                  below usize::MAX"
+    )]
     let mut out = Vec::with_capacity(16 + bucket.confirmed.len() * 16);
     out.extend_from_slice(&bucket.confirm_count.to_bits().to_be_bytes());
     out.extend_from_slice(&bucket.fee_sum.to_bits().to_be_bytes());
@@ -578,11 +624,20 @@ pub fn serialize_bucket(bucket: &TxConfirmStatBucket) -> Vec<u8> {
 /// confirmation range count (the decoding inside dcrd
 /// `loadFromDatabase`).
 pub fn deserialize_bucket(data: &[u8], max_confirms: u32) -> Result<TxConfirmStatBucket, String> {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "max_confirms is a u32, so 16 + max_confirms * 16 < 2^37 fits the 64-bit usize"
+    )]
     if data.len() != 16 + max_confirms as usize * 16 {
         return Err("wrong size of data in bucket read from db".into());
     }
     let readf = |idx: usize| -> f64 {
         let mut bytes = [0u8; 8];
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "idx <= 2 * max_confirms + 1 at every call below and data.len() == 16 + \
+                      max_confirms * 16 was checked above, so idx * 8 + 8 <= data.len()"
+        )]
         bytes.copy_from_slice(&data[idx * 8..idx * 8 + 8]);
         f64::from_bits(u64::from_be_bytes(bytes))
     };
@@ -591,6 +646,11 @@ pub fn deserialize_bucket(data: &[u8], max_confirms: u32) -> Result<TxConfirmSta
         fee_sum: readf(1),
         confirmed: Vec::with_capacity(max_confirms as usize),
     };
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "i < max_confirms, so 3 + i * 2 <= 2 * max_confirms + 1, below data.len() / 8 \
+                  = 2 + 2 * max_confirms"
+    )]
     for i in 0..max_confirms as usize {
         bucket.confirmed.push(TxConfirmStatBucketCount {
             tx_count: readf(2 + i * 2),

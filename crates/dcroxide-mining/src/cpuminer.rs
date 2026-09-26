@@ -110,6 +110,10 @@ pub fn solve_block(
     }
     let mut target_be = [0u8; 32];
     let (_, magnitude) = target.to_bytes_be();
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "target.bits() <= 256 was checked above, so magnitude.len() <= 32"
+    )]
     if target.sign() != Sign::NoSign {
         target_be[32 - magnitude.len()..].copy_from_slice(&magnitude);
     }
@@ -165,7 +169,13 @@ pub fn solve_block(
             // compute the header's proof-of-work hash.
             hdr_bytes[NONCE_SER_OFFSET..NONCE_SER_OFFSET + 4].copy_from_slice(&nonce.to_le_bytes());
             let hash = pow_hash(&hdr_bytes);
-            hashes_completed += 1;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "reset by accumulate at least every HASH_UPDATE_INTERVAL nonces"
+            )]
+            {
+                hashes_completed += 1;
+            }
 
             // Solved when the hash is at or below the target: update the
             // nonce and extra nonce fields in the header to the solution.
@@ -180,7 +190,13 @@ pub fn solve_block(
                 accumulate(stats, &mut hashes_completed, &mut start, now_micros());
                 break;
             }
-            nonce += 1;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "nonce < MAX_NONCE, since the loop breaks at MAX_NONCE above"
+            )]
+            {
+                nonce += 1;
+            }
         }
         extra_nonce = extra_nonce.wrapping_add(1);
     }

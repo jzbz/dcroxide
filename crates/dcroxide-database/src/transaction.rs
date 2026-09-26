@@ -69,6 +69,10 @@ pub struct BlockRegion {
 
 /// The key for storing and retrieving a child bucket in the bucket
 /// index (dcrd `bucketIndexKey`): `bidx<parent ID><name>`.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "4 + 4 plus a slice length, which is at most isize::MAX"
+)]
 fn bucket_index_key(parent_id: [u8; 4], key: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(BUCKET_INDEX_PREFIX.len() + 4 + key.len());
     out.extend_from_slice(BUCKET_INDEX_PREFIX);
@@ -79,6 +83,10 @@ fn bucket_index_key(parent_id: [u8; 4], key: &[u8]) -> Vec<u8> {
 
 /// The actual key for a key within a bucket (dcrd `bucketizedKey`):
 /// `<bucket ID><key>`.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "4 plus a slice length, which is at most isize::MAX"
+)]
 fn bucketized_key(bucket_id: [u8; 4], key: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + key.len());
     out.extend_from_slice(&bucket_id);
@@ -372,6 +380,10 @@ impl Transaction {
     ///
     /// Shared by the whole-prefix and windowed scans so the two cannot
     /// drift apart.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "end[i] != 0xff is checked before the increment, and i < end.len()"
+    )]
     fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
         let mut end = prefix.to_vec();
         for i in (0..end.len()).rev() {
@@ -760,6 +772,10 @@ impl Transaction {
         if let Some(bytes) = self.pending_block_bytes(&region.hash) {
             let end = region.offset.checked_add(region.len);
             match end {
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "region.offset + region.len is end, which checked_add returned"
+                )]
                 Some(end) if (end as usize) <= bytes.len() => {
                     return Ok(bytes
                         [region.offset as usize..(region.offset + region.len) as usize]
@@ -1128,6 +1144,10 @@ impl<'tx> Bucket<'tx> {
             // for the next iteration and removing their index rows.  The
             // ID is the row's value, taken from the scan as dcrd takes
             // it from its cursor (`rawValue`).
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "constant lengths: 4 + 4 = 8"
+            )]
             let mut prefix = Vec::with_capacity(BUCKET_INDEX_PREFIX.len() + 4);
             prefix.extend_from_slice(BUCKET_INDEX_PREFIX);
             prefix.extend_from_slice(&child_id);
@@ -1222,6 +1242,10 @@ impl<'tx> Bucket<'tx> {
         mut fn_: impl FnMut(&[u8]) -> Result<(), Error>,
     ) -> Result<(), Error> {
         self.tx.check_closed()?;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "constant lengths: 4 + 4 = 8"
+        )]
         let mut prefix = Vec::with_capacity(BUCKET_INDEX_PREFIX.len() + 4);
         prefix.extend_from_slice(BUCKET_INDEX_PREFIX);
         prefix.extend_from_slice(&self.id);
@@ -1250,6 +1274,10 @@ impl<'tx> Bucket<'tx> {
         // matching ffldb's merged iterators (the cursor contract makes
         // the view a snapshot: later bucket changes invalidate it).
         let mut keys = self.tx.scan_prefix_keys(&self.id);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "constant lengths: 4 + 4 = 8"
+        )]
         let mut prefix = Vec::with_capacity(BUCKET_INDEX_PREFIX.len() + 4);
         prefix.extend_from_slice(BUCKET_INDEX_PREFIX);
         prefix.extend_from_slice(&self.id);
@@ -1296,6 +1324,10 @@ impl<'tx> Bucket<'tx> {
             .tx
             .scan_prefix_keys_window(&self.id, after, Some(limit));
         if keys.len() < limit {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "constant lengths: 4 + 4 = 8"
+            )]
             let mut prefix = Vec::with_capacity(BUCKET_INDEX_PREFIX.len() + 4);
             prefix.extend_from_slice(BUCKET_INDEX_PREFIX);
             prefix.extend_from_slice(&self.id);
@@ -1451,6 +1483,11 @@ impl Cursor<'_> {
     }
 
     /// Move forward from a removed key to the next live one.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "i < self.keys.len() before each increment: callers pass a cursor position \
+                  and the loop returns once i reaches the length"
+    )]
     fn skip_forward(&mut self, mut i: usize) -> bool {
         loop {
             i += 1;
@@ -1466,6 +1503,10 @@ impl Cursor<'_> {
     }
 
     /// Move backward from a removed key to the previous live one.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "i > 0: the loop returns at i == 0 before decrementing"
+    )]
     fn skip_backward(&mut self, mut i: usize) -> bool {
         loop {
             if i == 0 {
@@ -1543,6 +1584,10 @@ impl Cursor<'_> {
             self.pos = CursorPos::Exhausted;
             return false;
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "keys is non-empty, checked above"
+        )]
         let last = self.keys.len() - 1;
         self.pos = CursorPos::At(last);
         if self.removed(last) {
@@ -1561,6 +1606,10 @@ impl Cursor<'_> {
         }
         self.parked = None;
         match self.pos {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "i is a cursor position, i < self.keys.len(), so i + 1 <= len"
+            )]
             CursorPos::At(i) if i + 1 < self.keys.len() => {
                 self.pos = CursorPos::At(i + 1);
                 if self.removed(i + 1) {
@@ -1584,6 +1633,7 @@ impl Cursor<'_> {
         }
         self.parked = None;
         match self.pos {
+            #[allow(clippy::arithmetic_side_effects, reason = "i > 0 by the match guard")]
             CursorPos::At(i) if i > 0 => {
                 self.pos = CursorPos::At(i - 1);
                 if self.removed(i - 1) {
@@ -1632,6 +1682,10 @@ impl Cursor<'_> {
             Some((k, _)) => k.as_slice(),
             None => self.current_raw()?,
         };
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "constant lengths: 4 + 4 = 8"
+        )]
         if raw.starts_with(BUCKET_INDEX_PREFIX) {
             return Some(raw[BUCKET_INDEX_PREFIX.len() + 4..].to_vec());
         }

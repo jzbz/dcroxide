@@ -209,6 +209,10 @@ pub struct BgGenerator {
 impl BgGenerator {
     /// A new generator over the given chain parameters facts (dcrd
     /// `NewBgBlkTmplGenerator`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "(tickets_per_block / 2) + 1 is at most 32768 for a u16"
+    )]
     pub fn new(
         tickets_per_block: u16,
         stake_validation_height: i64,
@@ -236,6 +240,10 @@ impl BgGenerator {
             reason,
             BgTemplateUpdateReason::NewParent | BgTemplateUpdateReason::NewVotes
         );
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "counts outstanding generations and reorgs, far below i64::MAX"
+        )]
         if block_retrieval {
             self.stale_template_count += 1;
         }
@@ -307,6 +315,10 @@ impl BgGenerator {
         err: Option<String>,
         block_retrieval: bool,
     ) -> Option<(BlockTemplate, BgTemplateUpdateReason)> {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "releases the count its gen_template_async added, far from i64::MIN"
+        )]
         if block_retrieval {
             self.stale_template_count -= 1;
         }
@@ -368,7 +380,7 @@ pub fn handle_block_connected(
 
     // Generate a new template immediately when it will be prior to
     // stake validation height which means no votes are required.
-    let new_template_height = block_height + 1;
+    let new_template_height = block_height.wrapping_add(1);
     if i64::from(new_template_height) < g.stake_validation_height {
         state.stop_regen_timer();
         state.failed_gen_retry_timeout_armed = false;
@@ -454,7 +466,7 @@ pub fn handle_block_accepted(
     // Ignore side chain blocks when building on it would produce a
     // block prior to stake validation height.
     let block_height = block.header.height;
-    let new_template_height = block_height + 1;
+    let new_template_height = block_height.wrapping_add(1);
     if i64::from(new_template_height) < g.stake_validation_height {
         return;
     }
@@ -658,7 +670,13 @@ pub fn handle_regen_event(
     match &event {
         BgRegenEvent::ReorgStarted => {
             // Block template retrieval until the post-reorg template.
-            g.stale_template_count += 1;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "counts outstanding generations and reorgs, far below i64::MAX"
+            )]
+            {
+                g.stale_template_count += 1;
+            }
             state.is_reorganizing = true;
 
             // Stop all timeouts and clear all vote tracking.
@@ -688,7 +706,13 @@ pub fn handle_regen_event(
                 }
             }
 
-            g.stale_template_count -= 1;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "releases the count ReorgStarted added, far from i64::MIN"
+            )]
+            {
+                g.stale_template_count -= 1;
+            }
             return;
         }
         _ => {}
@@ -835,7 +859,7 @@ pub fn handle_track_side_chains_timeout(
         let chain_tip = chain.best_snapshot();
         state.failed_gen_retry_timeout_armed = false;
         state.base_block_hash = chain_tip.prev_hash;
-        state.base_block_height = (chain_tip.height - 1) as u32;
+        state.base_block_height = chain_tip.height.wrapping_sub(1) as u32;
         g.gen_template_async(BgTemplateUpdateReason::NewParent);
         return;
     }

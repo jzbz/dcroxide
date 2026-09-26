@@ -162,6 +162,10 @@ impl Database {
         let mut stats = ImportStats::default();
         let mut batch: Vec<(dcroxide_chainhash::Hash, Vec<u8>)> = Vec::new();
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "one increment per block in the batch: a u64 count of blocks read cannot overflow"
+        )]
         let flush = |batch: &mut Vec<(dcroxide_chainhash::Hash, Vec<u8>)>,
                      stats: &mut ImportStats|
          -> Result<(), Error> {
@@ -182,6 +186,10 @@ impl Database {
             Ok(())
         };
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "one increment per block read: a u64 count of blocks cannot overflow"
+        )]
         while let Some(raw) = read_block(r, network)? {
             stats.read += 1;
 
@@ -206,6 +214,10 @@ impl Database {
     /// Export the blocks with the given hashes, in order, to a
     /// bootstrap-format stream readable by [`read_block`] (and so by the
     /// daemon's `addblock`) and by dcrd's `addblock`.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "one increment per hash in a slice: at most hashes.len()"
+    )]
     pub fn export_blocks(
         &self,
         w: &mut impl Write,

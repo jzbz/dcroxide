@@ -116,10 +116,15 @@ impl<P: SubsidyParams> SubsidyCache<P> {
         cache.insert(0, params.base_subsidy_value());
 
         SubsidyCache {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "votes_per_block() / 2 <= 32767, so adding 1 cannot overflow u16"
+            )]
             min_votes_required: (params.votes_per_block() / 2) + 1,
-            total_proportions: params.work_subsidy_proportion()
-                + params.stake_subsidy_proportion()
-                + params.treasury_subsidy_proportion(),
+            total_proportions: params
+                .work_subsidy_proportion()
+                .wrapping_add(params.stake_subsidy_proportion())
+                .wrapping_add(params.treasury_subsidy_proportion()),
             cache,
             params,
         }
@@ -155,6 +160,12 @@ impl<P: SubsidyParams> SubsidyCache<P> {
 
         // Calculate the reduction interval associated with the requested
         // height and attempt to look it up in cache.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "height > 1 here, so the quotient cannot overflow even for a divisor of -1; \
+                      the divisor is the network's nonzero reduction interval, which dcrd \
+                      divides by unchecked as well"
+        )]
         let req_interval = (height / self.params.subsidy_reduction_interval_blocks()) as u64;
         if let Some(&cached) = self.cache.get(&req_interval) {
             return cached;
@@ -179,9 +190,20 @@ impl<P: SubsidyParams> SubsidyCache<P> {
         let reduction_divisor = self.params.subsidy_reduction_divisor();
         let mut subsidy = start_subsidy;
         let mut cache_interval = req_interval;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "start_interval comes from the cache range ..=req_interval, so it is <= \
+                      req_interval"
+        )]
         let needed_intervals = req_interval - start_interval;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "reduction_divisor is the network's reduction divisor (101 on every \
+                      network), so nonzero and not -1; i < needed_intervals = req_interval - \
+                      start_interval, so start_interval + i + 1 <= req_interval"
+        )]
         for i in 0..needed_intervals {
-            subsidy *= reduction_multiplier;
+            subsidy = subsidy.wrapping_mul(reduction_multiplier);
             subsidy /= reduction_divisor;
 
             // Stop once no further reduction is possible.  This ensures
@@ -203,6 +225,12 @@ impl<P: SubsidyParams> SubsidyCache<P> {
     /// The proof-of-work subsidy for the given proportion; the shared
     /// logic behind the three public work-subsidy variants (dcrd
     /// `calcWorkSubsidy`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "both divisions divide by a u16 widened to i64, so never by -1; the divisors \
+                  are nonzero network parameters (or DCP0010/DCP0012 constants), and dcrd \
+                  divides by them unchecked as well"
+    )]
     fn calc_work_subsidy_inner(
         &mut self,
         height: i64,
@@ -226,7 +254,7 @@ impl<P: SubsidyParams> SubsidyCache<P> {
         // Calculate the full block subsidy and reduce it according to
         // the PoW proportion.
         let mut subsidy = self.calc_block_subsidy(height);
-        subsidy *= i64::from(proportion);
+        subsidy = subsidy.wrapping_mul(i64::from(proportion));
         subsidy /= i64::from(total_proportions);
 
         // Ignore any potential subsidy reductions due to the number of
@@ -236,7 +264,7 @@ impl<P: SubsidyParams> SubsidyCache<P> {
         }
 
         // Adjust for the number of voters.
-        (i64::from(voters) * subsidy) / i64::from(self.params.votes_per_block())
+        i64::from(voters).wrapping_mul(subsidy) / i64::from(self.params.votes_per_block())
     }
 
     /// The proof-of-work subsidy using the split in effect prior to
@@ -302,6 +330,12 @@ impl<P: SubsidyParams> SubsidyCache<P> {
     /// The subsidy for a single stake vote for the given proportion; the
     /// shared logic behind the three public vote-subsidy variants (dcrd
     /// `calcStakeVoteSubsidy`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the divisor is the product of two u16 values widened to i64, at most \
+                  65535^2 < 2^32 and never -1; both are nonzero network parameters (or \
+                  DCP0010/DCP0012 constants), and dcrd divides by them unchecked as well"
+    )]
     fn calc_stake_vote_subsidy_inner(
         &mut self,
         height: i64,
@@ -312,7 +346,7 @@ impl<P: SubsidyParams> SubsidyCache<P> {
         // minus one accounts for the fact that vote subsidy are,
         // unfortunately, based on the height that is being voted on as
         // opposed to the block in which they are included.
-        if height < self.params.stake_validation_begin_height() - 1 {
+        if height < self.params.stake_validation_begin_height().wrapping_sub(1) {
             return 0;
         }
 
@@ -320,7 +354,7 @@ impl<P: SubsidyParams> SubsidyCache<P> {
         // the stake proportion.  Then divide it by the number of votes
         // per block to arrive at the amount per vote.
         let mut subsidy = self.calc_block_subsidy(height);
-        subsidy *= i64::from(proportion);
+        subsidy = subsidy.wrapping_mul(i64::from(proportion));
         subsidy /= i64::from(total_proportions) * i64::from(self.params.votes_per_block());
 
         subsidy
@@ -389,6 +423,11 @@ impl<P: SubsidyParams> SubsidyCache<P> {
     /// `CalcTreasurySubsidy`).  When the treasury agenda is active, the
     /// rule changes from paying a proportion based on the number of
     /// votes to always paying the full subsidy.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "both divisions divide by a u16 widened to i64, so never by -1; the divisors \
+                  are nonzero network parameters, and dcrd divides by them unchecked as well"
+    )]
     pub fn calc_treasury_subsidy(
         &mut self,
         height: i64,
@@ -411,7 +450,7 @@ impl<P: SubsidyParams> SubsidyCache<P> {
         // Calculate the full block subsidy and reduce it according to
         // the treasury proportion.
         let mut subsidy = self.calc_block_subsidy(height);
-        subsidy *= i64::from(self.params.treasury_subsidy_proportion());
+        subsidy = subsidy.wrapping_mul(i64::from(self.params.treasury_subsidy_proportion()));
         subsidy /= i64::from(self.total_proportions);
 
         // Ignore any potential subsidy reductions due to the number of
@@ -422,6 +461,6 @@ impl<P: SubsidyParams> SubsidyCache<P> {
         }
 
         // Adjust for the number of voters.
-        (i64::from(voters) * subsidy) / i64::from(self.params.votes_per_block())
+        i64::from(voters).wrapping_mul(subsidy) / i64::from(self.params.votes_per_block())
     }
 }

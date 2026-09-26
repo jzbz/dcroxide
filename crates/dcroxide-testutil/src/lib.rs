@@ -8,9 +8,6 @@
 //!
 //! This crate is a dev-dependency only and is never published.
 
-// Test-harness arithmetic (PRNG mixing, chunk math) — not consensus code.
-#![allow(clippy::arithmetic_side_effects)]
-
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -26,6 +23,10 @@ pub fn hex(b: &[u8]) -> String {
 }
 
 /// Decode a lowercase/uppercase hex string; panics on invalid input (tests).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "i < s.len() <= isize::MAX, so i + 2 cannot overflow usize"
+)]
 pub fn unhex(s: &str) -> Vec<u8> {
     assert!(s.len().is_multiple_of(2), "unhex: odd-length string");
     (0..s.len())
@@ -77,6 +78,10 @@ impl SplitMix64 {
     }
 
     /// Uniform value in `0..n` (n > 0; modulo bias irrelevant for tests).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "callers pass n > 0, and u64 % n cannot overflow"
+    )]
     pub fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n
     }
@@ -91,6 +96,10 @@ impl SplitMix64 {
 
     /// A random byte vector with length in `0..=max_len`.
     pub fn bytes(&mut self, max_len: usize) -> Vec<u8> {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "max_len is a test buffer length, far below u64::MAX"
+        )]
         let len = self.below(max_len as u64 + 1) as usize;
         let mut v = vec![0u8; len];
         self.fill(&mut v);
@@ -356,6 +365,10 @@ impl DcrdNode {
 
         // Wait for the socket rather than for a log line: the log format is
         // not a stable interface and a bound port is the thing under test.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "now plus 30 seconds is far inside Instant's range"
+        )]
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if TcpStream::connect_timeout(
@@ -416,6 +429,10 @@ fn spawn_logged(cmd: &mut Command, log: &Path) -> std::io::Result<Child> {
 }
 
 /// The last 64 KiB of dcrd's output, headed with where it came from.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "start = bytes.len().saturating_sub(TAIL) <= bytes.len()"
+)]
 fn log_tail(log: &Path) -> String {
     const TAIL: usize = 64 * 1024;
     match std::fs::read(log) {

@@ -69,6 +69,10 @@ impl ScriptBuilder {
             return self;
         }
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "a Vec<u8> holds at most isize::MAX bytes, so script.len() + 1 fits in usize"
+        )]
         if self.script.len() + 1 > MAX_SCRIPT_SIZE {
             self.err = Some(NotCanonicalError(format!(
                 "adding an opcode would exceed the maximum allowed canonical script \
@@ -87,6 +91,10 @@ impl ScriptBuilder {
             return self;
         }
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "each length is at most isize::MAX, so the sum is at most usize::MAX - 1"
+        )]
         if self.script.len() + opcodes.len() > MAX_SCRIPT_SIZE {
             self.err = Some(NotCanonicalError(format!(
                 "adding opcodes would exceed the maximum allowed canonical script \
@@ -111,6 +119,10 @@ impl ScriptBuilder {
             return self;
         }
         if data_len == 1 && data[0] <= 16 {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "data[0] <= 16 is checked above, so OP_1 - 1 + data[0] <= 0x60"
+            )]
             self.script.push(OP_1 - 1 + data[0]);
             return self;
         }
@@ -158,6 +170,11 @@ impl ScriptBuilder {
         }
 
         let data_size = canonical_data_size(data);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "data_size <= data.len() + 5, and script and data are disjoint allocations \
+                      that together span less than the address space, so the sum fits in usize"
+        )]
         if self.script.len() + data_size > MAX_SCRIPT_SIZE {
             self.err = Some(NotCanonicalError(format!(
                 "adding {data_size} bytes of data would exceed the maximum allowed \
@@ -184,6 +201,10 @@ impl ScriptBuilder {
             return self;
         }
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "a Vec<u8> holds at most isize::MAX bytes, so script.len() + 1 fits in usize"
+        )]
         if self.script.len() + 1 > MAX_SCRIPT_SIZE {
             self.err = Some(NotCanonicalError(format!(
                 "adding an integer would exceed the maximum allow canonical script \
@@ -198,6 +219,10 @@ impl ScriptBuilder {
             return self;
         }
         if val == -1 || (1..=16).contains(&val) {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "val is -1 or in 1..=16 here, so OP_1 - 1 + val is in 0x4f..=0x60"
+            )]
             self.script.push(((i64::from(OP_1) - 1) + val) as u8);
             return self;
         }
@@ -232,6 +257,10 @@ impl ScriptBuilder {
 
 /// The number of bytes the canonical encoding of the data will take (dcrd
 /// `CanonicalDataSize`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "data.len() <= isize::MAX for a slice, so data.len() + 5 fits in usize"
+)]
 pub fn canonical_data_size(data: &[u8]) -> usize {
     let data_len = data.len();
 

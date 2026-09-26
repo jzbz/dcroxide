@@ -90,6 +90,10 @@ pub fn sort_parents_by_votes(
     // Fetch the vote metadata for the provided block hashes and
     // filter out any blocks without the minimum required number of
     // votes.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "tickets_per_block / 2 + 1 is at most 32768 for a u16"
+    )]
     let min_votes_required = params.tickets_per_block / 2 + 1;
     let vote_metadata = votes_for_blocks(blocks);
     let mut filtered: Vec<(Hash, u16)> = Vec::with_capacity(blocks.len());
@@ -271,7 +275,7 @@ pub fn create_coinbase_tx<SP: SubsidyParams>(
     let mut tx = new_msg_tx();
     tx.version = tx_version;
     tx.tx_in.push(coinbase_input);
-    tx.tx_in[0].value_in = work_subsidy + treasury_subsidy;
+    tx.tx_in[0].value_in = work_subsidy.wrapping_add(treasury_subsidy);
     if let Some(out) = treasury_output {
         tx.tx_out.push(out);
     }
@@ -336,6 +340,10 @@ pub fn create_treasury_base_tx<SP: SubsidyParams>(
 /// The minimum allowed timestamp for a block building on the current
 /// best chain, as unix seconds: one second after the past median
 /// time (dcrd `minimumMedianTime`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "a median of u32 header timestamps, so at most u32::MAX"
+)]
 pub fn minimum_median_time(best_median_time_unix: i64) -> i64 {
     best_median_time_unix + 1
 }
@@ -348,8 +356,8 @@ pub fn calc_fee_per_kb(tx_desc: &TxDesc, ancestor_stats: &TxAncestorStats) -> f6
     if ancestor_stats.fees < 0 || ancestor_stats.size_bytes < 0 {
         return (tx_desc.fee as f64 * KILOBYTE as f64) / tx_size as f64;
     }
-    ((tx_desc.fee + ancestor_stats.fees) as f64 * KILOBYTE as f64)
-        / (tx_size + ancestor_stats.size_bytes) as f64
+    (tx_desc.fee.wrapping_add(ancestor_stats.fees) as f64 * KILOBYTE as f64)
+        / tx_size.wrapping_add(ancestor_stats.size_bytes) as f64
 }
 
 /// A new empty full-serialization transaction (Go `wire.NewMsgTx`).

@@ -14,6 +14,11 @@ pub fn calc_tspend_expiry(next_block_height: i64, tvi: u64, multiplier: u64) -> 
     // The unsigned casts and wrapping operations mirror Go's uint64
     // arithmetic exactly, including for hostile inputs.
     let nbh = next_block_height as u64;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "nbh % tvi < tvi, so tvi - (nbh % tvi) cannot underflow; tvi is the network's \
+                  nonzero treasury vote interval, and Go's % panics on zero as well"
+    )]
     let next_tvi = nbh.wrapping_add(tvi - (nbh % tvi)); // Round up to next TVI
     let max_tvi = next_tvi.wrapping_add(tvi.wrapping_mul(multiplier)); // Max TVI allowed.
 

@@ -296,10 +296,14 @@ impl Node {
             final_state: [0u8; 6],
             params,
         };
-        if i64::from(height) >= params.stake_validation_begin_height - 1 {
+        if height >= params.stake_validation_begin_height.wrapping_sub(1) as u32 {
             node.next_winners = state_next_winners.to_vec();
 
             // Calculate the final state from the block header.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "votes_per_block is a u16, so at most (65535 + 1) * 32"
+            )]
             let mut state_buffer =
                 Vec::with_capacity((usize::from(params.votes_per_block) + 1) * 32);
             for ticket_hash in &node.next_winners {
@@ -334,15 +338,19 @@ impl Node {
     /// The live tickets that will expire as of the next block, less
     /// any that are winners of this block (dcrd `ExpiringNextBlock`).
     pub fn expiring_next_block(&self) -> Vec<Hash> {
-        let next_block_height = self.height + 1;
+        let next_block_height = self.height.wrapping_add(1);
         let mut to_expire_height: u32 = 0;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "next_block_height > ticket_expiry_blocks is the condition"
+        )]
         if next_block_height > self.params.ticket_expiry_blocks {
             to_expire_height = next_block_height - self.params.ticket_expiry_blocks;
         }
         let winners = &self.next_winners;
         let mut expiring = Vec::new();
         self.live_tickets
-            .for_each_by_height(to_expire_height + 1, |k, v| {
+            .for_each_by_height(to_expire_height.wrapping_add(1), |k, v| {
                 if v.height != to_expire_height {
                     return true;
                 }
@@ -366,7 +374,7 @@ impl Node {
         new_tickets: &[Hash],
     ) -> Result<Node, RuleError> {
         let mut connected = Node {
-            height: self.height + 1,
+            height: self.height.wrapping_add(1),
             live_tickets: self.live_tickets.clone(),
             missed_tickets: self.missed_tickets.clone(),
             revoked_tickets: self.revoked_tickets.clone(),
@@ -379,7 +387,7 @@ impl Node {
 
         // Iterate the spent and missed tickets and expire live tickets
         // once the stake enable height is reached.
-        if i64::from(connected.height) >= connected.params.stake_enable_height {
+        if connected.height >= connected.params.stake_enable_height as u32 {
             // Each voted ticket must be a winner from the parent.
             for voted in tickets_voted {
                 if !hash_in_slice(voted, &self.next_winners) {
@@ -415,13 +423,17 @@ impl Node {
 
             // Expire live tickets at the expiry boundary.
             let mut to_expire_height: u32 = 0;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "connected.height > ticket_expiry_blocks is the condition"
+            )]
             if connected.height > connected.params.ticket_expiry_blocks {
                 to_expire_height = connected.height - connected.params.ticket_expiry_blocks;
             }
             let mut expiring: Vec<(Key, Value)> = Vec::new();
             connected
                 .live_tickets
-                .for_each_by_height(to_expire_height + 1, |k, v| {
+                .for_each_by_height(to_expire_height.wrapping_add(1), |k, v| {
                     expiring.push((*k, *v));
                     true
                 });
@@ -476,13 +488,22 @@ impl Node {
 
         // Find the next set of winners and the final state once stake
         // validation is one block away.
-        if i64::from(connected.height) >= connected.params.stake_validation_begin_height - 1 {
+        if connected.height
+            >= connected
+                .params
+                .stake_validation_begin_height
+                .wrapping_sub(1) as u32
+        {
             let mut prng = Hash256Prng::from_iv(lottery_iv);
             let idxs = find_ticket_idxs(
                 connected.live_tickets.len(),
                 connected.params.votes_per_block,
                 &mut prng,
             )?;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "votes_per_block is a u16, so at most (65535 + 1) * 32"
+            )]
             let mut state_buffer =
                 Vec::with_capacity((connected.params.votes_per_block as usize + 1) * 32);
             let next_winner_keys = fetch_winners(&idxs, &connected.live_tickets)?;
@@ -517,7 +538,7 @@ impl Node {
 
         let votes_per_block = self.params.votes_per_block;
         let mut restored = Node {
-            height: self.height - 1,
+            height: self.height.wrapping_sub(1),
             live_tickets: self.live_tickets.clone(),
             missed_tickets: self.missed_tickets.clone(),
             revoked_tickets: self.revoked_tickets.clone(),
@@ -577,12 +598,17 @@ impl Node {
 
         // The winners were pushed in reverse order.
         let num_winners = winners.len();
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "num_winners <= database_undo_update.len(), a Vec of 40-byte entries, so \
+                      (num_winners + 1) * 32 fits in usize"
+        )]
         let mut state_buffer = Vec::with_capacity((num_winners + 1) * 32);
         for winner in winners.iter().rev() {
             restored.next_winners.push(*winner);
             state_buffer.extend_from_slice(&winner.0);
         }
-        if i64::from(self.height) >= self.params.stake_validation_begin_height {
+        if self.height >= self.params.stake_validation_begin_height as u32 {
             let mut prng = Hash256Prng::from_iv(parent_lottery_iv);
             find_ticket_idxs(
                 restored.live_tickets.len(),

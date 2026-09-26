@@ -31,6 +31,10 @@ pub struct Hash256Prng {
 /// usable with [`Hash256Prng::from_iv`] to reproduce
 /// [`Hash256Prng::new`]'s stream.
 pub fn calc_hash256_prng_iv(seed: &[u8]) -> Hash {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a slice length is at most isize::MAX, so adding 8 cannot overflow usize"
+    )]
     let mut buf = Vec::with_capacity(seed.len() + SEED_CONST.len());
     buf.extend_from_slice(seed);
     buf.extend_from_slice(&SEED_CONST);
@@ -64,6 +68,11 @@ impl Hash256Prng {
     }
 
     /// The next random u32, updating the state (dcrd `Hash256Rand`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "hash_idx stays in 0..=7 (reset once it passes 7), so start + 4 <= 32, and \
+                  idx <= 0xFFFF_FFFF before its increment (reset once it passes that)"
+    )]
     pub fn hash256_rand(&mut self) -> u32 {
         let start = self.hash_idx * 4;
         let r = u32::from_be_bytes(
@@ -95,6 +104,11 @@ impl Hash256Prng {
 
     /// A random value in `[0, upper_bound)` avoiding modulo bias (dcrd
     /// `UniformRandom`, ported from arc4random_uniform).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "upper_bound >= 2 past the early return, so both % have a nonzero unsigned \
+                  divisor"
+    )]
     pub fn uniform_random(&mut self, upper_bound: u32) -> u32 {
         if upper_bound < 2 {
             return 0;

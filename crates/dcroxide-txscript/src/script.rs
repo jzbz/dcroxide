@@ -180,6 +180,12 @@ pub(crate) fn remove_opcode_by_data<'s>(script: &'s [u8], data_to_remove: &[u8])
     while tokenizer.next() {
         let (op, data) = (tokenizer.opcode(), tokenizer.data());
         if is_canonical_push(op, data) && search.is_in(data) {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "prev_offset is an earlier tokenizer.byte_index(), and byte_index only \
+                          grows up to script.len(), so prev_offset <= byte_index and \
+                          full_push_len <= script.len()"
+            )]
             if result.is_none() {
                 let full_push_len = tokenizer.byte_index() - prev_offset;
                 let mut r = Vec::with_capacity(script.len() - full_push_len);
@@ -223,6 +229,11 @@ impl<'n> Substring<'n> {
     }
 
     /// Whether the needle occurs in `haystack`.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "k - 1 runs only when k > 0, and k += 1 only when k < needle.len() (k <= i \
+                  while building the table; the search returns once k reaches needle.len())"
+    )]
     fn is_in(&mut self, haystack: &[u8]) -> bool {
         let needle = self.needle;
         if haystack.len() <= needle.len() {
@@ -263,7 +274,7 @@ pub fn as_small_int(op: u8) -> usize {
     if op == OP_0 {
         return 0;
     }
-    usize::from(op - (OP_1 - 1))
+    usize::from(op.wrapping_sub(OP_1 - 1))
 }
 
 /// The number of signature operations in the script up to the first parse
@@ -271,6 +282,11 @@ pub fn as_small_int(op: u8) -> usize {
 ///
 /// WARNING (from dcrd): always treats the script as version 0 because
 /// consensus does the same.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "each opcode adds at most MAX_PUB_KEYS_PER_MULTI_SIG = 20, so num_sig_ops <= \
+              20 * script.len(), which fits in usize for any script held in memory"
+)]
 fn count_sig_ops_v0(script: &[u8], precise: bool, is_treasury_enabled: bool) -> usize {
     const SCRIPT_VERSION: u16 = 0;
 

@@ -118,6 +118,10 @@ impl TxPriorityQueue {
     }
 
     /// Go's `container/heap` sift-up.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "j > 0 is the loop condition"
+    )]
     fn up(&mut self, mut j: usize) {
         while j > 0 {
             let i = (j - 1) / 2; // parent
@@ -130,6 +134,11 @@ impl TxPriorityQueue {
     }
 
     /// Go's `container/heap` sift-down.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "i is 0 or below n <= items.len() <= isize::MAX, so 2 * i + 1 fits in usize, \
+                  and j1 + 1 follows the j1 < n check"
+    )]
     fn down(&mut self, i0: usize, n: usize) -> bool {
         let mut i = i0;
         loop {
@@ -165,7 +174,13 @@ impl TxPriorityQueue {
     /// Push an item onto the queue (Go `heap.Push`).
     pub fn push(&mut self, item: TxPrioItem) {
         self.items.push(item);
-        self.up(self.items.len() - 1);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the push above leaves items non-empty"
+        )]
+        {
+            self.up(self.items.len() - 1);
+        }
     }
 
     /// Pop the highest priority item from the queue (Go `heap.Pop`).
@@ -173,6 +188,10 @@ impl TxPriorityQueue {
         if self.items.is_empty() {
             return None;
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "items is non-empty, checked above"
+        )]
         let n = self.items.len() - 1;
         self.items.swap(0, n);
         self.down(0, n);

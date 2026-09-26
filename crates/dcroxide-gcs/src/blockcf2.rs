@@ -128,6 +128,10 @@ impl CommitmentConverter {
     /// conversions per ticket).
     fn new(num_tickets: u8) -> CommitmentConverter {
         const P2PKH_SCRIPT_LEN: usize = 25;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "at most 255 * 25 * 2 = 12750"
+        )]
         CommitmentConverter {
             all_scripts: Vec::with_capacity(usize::from(num_tickets) * P2PKH_SCRIPT_LEN * 2),
             ranges: Vec::new(),
@@ -193,6 +197,10 @@ pub fn regular(
     // Room for at least one output and one input per regular
     // transaction and two entries per stake transaction on average
     // (dcrd's `numEntriesHint`).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "lengths of in-memory Vec<MsgTx>, each element far larger than 3 bytes, so len * 2 + len < usize::MAX"
+    )]
     let mut data = Entries(Vec::with_capacity(
         block.transactions.len() * 2 + block.stransactions.len(),
     ));

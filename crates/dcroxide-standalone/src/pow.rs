@@ -38,6 +38,12 @@ pub fn compact_to_big(compact: u32) -> BigInt {
 
     // Treat the exponent as the number of bytes and shift the mantissa
     // accordingly; equivalent to N = mantissa * 256^(exponent-3).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "exponent is the 8-bit field compact >> 24: 8 * (3 - exponent) <= 24 when \
+                  exponent <= 3, 8 * (exponent - 3) <= 8 * 252 = 2016 otherwise; the BigInt \
+                  shift is arbitrary precision like Go's Lsh"
+    )]
     let mut bn = if exponent <= 3 {
         mantissa >>= 8 * (3 - exponent);
         BigInt::from(mantissa)
@@ -46,6 +52,10 @@ pub fn compact_to_big(compact: u32) -> BigInt {
     };
 
     // Make it negative if the sign bit is set.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt negation is exact, like Go's big.Int Neg"
+    )]
     if is_negative {
         bn = -bn;
     }
@@ -72,6 +82,12 @@ pub fn big_to_compact(n: &BigInt) -> u32 {
     // shifting the magnitude directly.
     let mut mantissa: u32;
     let mut exponent = n.magnitude().to_bytes_be().len();
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "exponent is the magnitude's byte length: 8 * (3 - exponent) <= 24 when \
+                  exponent <= 3, and 8 * (exponent - 3) is below the magnitude's bit length \
+                  otherwise; the BigInt shift floors like Go's Rsh"
+    )]
     if exponent <= 3 {
         mantissa = n.magnitude().iter_u64_digits().next().unwrap_or(0) as u32;
         mantissa <<= 8 * (3 - exponent);
@@ -83,6 +99,10 @@ pub fn big_to_compact(n: &BigInt) -> u32 {
     // When the mantissa already has the sign bit set, the number is too
     // large to fit into the available 23 bits, so divide the number by
     // 256 and increment the exponent accordingly.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "exponent is the magnitude's byte length, far below usize::MAX"
+    )]
     if mantissa & 0x0080_0000 != 0 {
         mantissa >>= 8;
         exponent += 1;
@@ -99,6 +119,12 @@ pub fn big_to_compact(n: &BigInt) -> u32 {
 
 /// Calculate a work value from difficulty bits: (1 << 256) divided by
 /// (target + 1), or zero for non-positive targets (dcrd `CalcWork`).
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "BigInt shift and addition are exact; difficulty_num > 0 past the early return, so \
+              the divisor is >= 2 and both operands are positive, where truncated division \
+              equals Go's Euclidean Div"
+)]
 pub fn calc_work(bits: u32) -> BigInt {
     // Return a work value of zero if the passed difficulty bits
     // represent a negative number, which could happen in an invalid
@@ -227,6 +253,12 @@ pub fn calc_asert_diff(
     // Go's `Int64()` (low 64 bits, two's complement) for out-of-range
     // values.
     let ideal_time_delta = height_delta.wrapping_mul(target_secs_per_block);
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "an i64 shifted left 16 bits has magnitude <= 2^79, so the i128 quotient cannot \
+                  overflow for any divisor, -1 included; half_life is the network's nonzero \
+                  ASERT half-life, and dcrd's Quo panics on zero as well"
+    )]
     let exponent: i128 =
         (i128::from(time_delta.wrapping_sub(ideal_time_delta)) << 16) / i128::from(half_life);
     let frac64 = u64::from((exponent as i64 & 0xffff) as u16);
@@ -260,8 +292,12 @@ pub fn calc_asert_diff(
     //   nextDiff = startDiff * 2^f * 2^n / 2^16
     //
     // where the division by 2^16 folds into the shift count.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt multiplication is exact, like Go's big.Int Mul"
+    )]
     let mut next_diff = start_diff * BigInt::from(frac_factor);
-    shifts -= 16;
+    shifts = shifts.wrapping_sub(16);
 
     // Shift counts beyond these bounds are mathematically guaranteed to
     // clamp below, so take the clamp directly rather than materializing
@@ -274,12 +310,19 @@ pub fn calc_asert_diff(
     // at most 8208 bits -- every network's is under 2^256 -- so a larger
     // limit takes dcrd's path and shifts.
     const MAX_MATERIALIZED_SHIFT: i64 = 8192;
+    #[allow(clippy::arithmetic_side_effects, reason = "constant: 16 + 8192 = 8208")]
     if shifts >= MAX_MATERIALIZED_SHIFT && pow_limit.bits() <= 16 + MAX_MATERIALIZED_SHIFT as u64 {
         return big_to_compact(pow_limit);
     }
     if shifts <= -MAX_MATERIALIZED_SHIFT {
         return big_to_compact(&BigInt::from(1));
     }
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "BigInt shifts are arbitrary precision and the right shift floors like Go's \
+                  Rsh; -8192 < shifts < 0 in the else branch after the clamps above, so \
+                  -shifts cannot overflow"
+    )]
     if shifts >= 0 {
         next_diff <<= shifts as u64;
     } else {

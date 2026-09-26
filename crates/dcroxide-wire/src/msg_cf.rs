@@ -177,6 +177,10 @@ impl MsgCFilter {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constant: 5 + 262144 + 32 + 1 = 262182"
+    )]
     pub(crate) fn max_payload_length(_pver: u32) -> u32 {
         var_int_serialize_size(MAX_CFILTER_DATA_SIZE) as u32
             + MAX_CFILTER_DATA_SIZE as u32
@@ -229,6 +233,10 @@ impl MsgGetCFHeaders {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constant: 3 + 500 * 32 + 32 + 1 = 16036"
+    )]
     pub(crate) fn max_payload_length(_pver: u32) -> u32 {
         var_int_serialize_size(MAX_BLOCK_LOCATORS_PER_MSG) as u32
             + (MAX_BLOCK_LOCATORS_PER_MSG as u32 * HASH_SIZE as u32)
@@ -281,6 +289,10 @@ impl MsgCFHeaders {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constant: 32 + 1 + 3 + 32 * 2000 = 64036"
+    )]
     pub(crate) fn max_payload_length(_pver: u32) -> u32 {
         HASH_SIZE as u32
             + 1
@@ -323,6 +335,7 @@ impl MsgCFTypes {
         Ok(())
     }
 
+    #[allow(clippy::arithmetic_side_effects, reason = "constant: 3 + 256 = 259")]
     pub(crate) fn max_payload_length(_pver: u32) -> u32 {
         var_int_serialize_size(MAX_FILTER_TYPES_PER_MSG) as u32 + MAX_FILTER_TYPES_PER_MSG as u32
     }
@@ -400,6 +413,10 @@ impl MsgCFilterV2 {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constant: 32 + 5 + 262144 + 4 + 1 + 32 * 32 = 263210"
+    )]
     pub(crate) fn max_payload_length(_pver: u32) -> u32 {
         HASH_SIZE as u32
             + var_int_serialize_size(MAX_CFILTER_DATA_SIZE) as u32
@@ -467,6 +484,10 @@ impl MsgCFiltersV2 {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "constant: 1 + 263210 * 100 = 26321001"
+    )]
     pub(crate) fn max_payload_length(_pver: u32) -> u32 {
         var_int_serialize_size(MAX_CFILTERS_V2_PER_BATCH) as u32
             + (HASH_SIZE as u32

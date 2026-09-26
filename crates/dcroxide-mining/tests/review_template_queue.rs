@@ -627,3 +627,34 @@ fn a_reorganized_build_keeps_the_old_snapshot_and_recycles_the_new_tip() {
     assert_eq!(template.block.header.prev_block, parent);
     assert_eq!(template.block.header.nonce, 2, "the recycled block is B");
 }
+
+/// dcrd offsets the mining time by `time.Duration(-MiningTimeOffset) *
+/// time.Second` (`mining.go:756-757`): the negation and the nanosecond
+/// product wrap in int64 once the offset passes about 292 years, and
+/// `time.Add` floors the wrapped duration to whole seconds.  The port
+/// subtracted whole seconds, so an offset of 3 * 2^32 seconds left the
+/// u32 header timestamp at 2,000,000 where dcrd moves it, and
+/// `i64::MIN` overflowed.  The expected values are Go's
+/// `uint32(time.Unix(2000000, 0).Add(time.Duration(-off) *
+/// time.Second).Unix())`.
+#[test]
+fn a_huge_mining_time_offset_wraps_in_nanoseconds_like_go() {
+    for (offset, want) in [
+        (0i64, 2_000_000u32),
+        (100, 1_999_900),
+        (-100, 2_000_100),
+        (3 << 32, 1_268_874_889),
+        (-(3 << 32), 3_030_092_406),
+        (9_223_372_037, 635_437_444),
+        (i64::MAX, 2_000_001),
+        (i64::MIN, 2_000_000),
+    ] {
+        // The adjusted time, 2,000,000, is past the minimum median
+        // time of 1,000,001.
+        let mut g = generator(low_chain(), Source::new());
+        g.mining_time_offset = offset;
+        let mut hdr = header(101, Hash([0xa1; 32]), 0);
+        g.update_block_time(&mut hdr);
+        assert_eq!(hdr.timestamp, want, "offset {offset}");
+    }
+}

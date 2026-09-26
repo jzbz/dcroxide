@@ -4,9 +4,6 @@
 //! block through the chain engine with bulk-import mode enabled and
 //! maintaining the enabled indexes.
 
-// The final tally mirrors Go's arithmetic over the import counters.
-#![allow(clippy::arithmetic_side_effects)]
-
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -258,6 +255,10 @@ fn import_main(cfg: &AddblockConfig, params: &Params) -> Result<(), ()> {
         return Err(());
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "run_import counts an imported block only after counting it processed, so 0 <= blocks_imported <= blocks_processed"
+    )]
     log_info(&format!(
         "Processed a total of {} blocks ({} imported, {} already known) in {}",
         stats.blocks_processed,

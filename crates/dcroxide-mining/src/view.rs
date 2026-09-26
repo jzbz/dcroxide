@@ -18,17 +18,34 @@ use crate::types::{TxAncestorStats, TxDesc};
 pub const ANCESTOR_TRACKING_LIMIT: usize = 25;
 
 fn add_ancestor_to(stats: &mut TxAncestorStats, tx_desc: &TxDesc) {
-    stats.fees += tx_desc.fee;
-    stats.size_bytes += tx_desc.tx_size;
-    stats.total_sig_ops += tx_desc.total_sig_ops;
-    stats.num_ancestors += 1;
+    stats.fees = stats.fees.wrapping_add(tx_desc.fee);
+    stats.size_bytes = stats.size_bytes.wrapping_add(tx_desc.tx_size);
+    // dcrd's `TotalSigOps` is a uint32 on both types, so the sum wraps
+    // at 32 bits; the fields here hold that uint32 value in an i64.
+    stats.total_sig_ops =
+        i64::from((stats.total_sig_ops as u32).wrapping_add(tx_desc.total_sig_ops as u32));
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "one per ancestor walked, at most the number of transactions in the view"
+    )]
+    {
+        stats.num_ancestors += 1;
+    }
 }
 
 fn remove_ancestor_from(stats: &mut TxAncestorStats, tx_desc: &TxDesc) {
-    stats.fees -= tx_desc.fee;
-    stats.size_bytes -= tx_desc.tx_size;
-    stats.total_sig_ops -= tx_desc.total_sig_ops;
-    stats.num_ancestors -= 1;
+    stats.fees = stats.fees.wrapping_sub(tx_desc.fee);
+    stats.size_bytes = stats.size_bytes.wrapping_sub(tx_desc.tx_size);
+    stats.total_sig_ops =
+        i64::from((stats.total_sig_ops as u32).wrapping_sub(tx_desc.total_sig_ops as u32));
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "undoes one add_ancestor_to, so it stays within the number of \
+                  transactions in the view"
+    )]
+    {
+        stats.num_ancestors -= 1;
+    }
 }
 
 /// A snapshot of all transactions ready to be mined along with their
@@ -210,15 +227,29 @@ impl TxMiningView {
                 // Any ancestor whose own ancestors would exceed the
                 // limit, or whose descendant count would, disables
                 // tracking.
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "cached counts are at most the number of transactions in the view"
+                )]
                 if stats.num_ancestors + 1 > ANCESTOR_TRACKING_LIMIT as i64 {
                     can_track_ancestors = false;
                     return false;
                 }
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "cached counts are at most the number of transactions in the view"
+                )]
                 if stats.num_descendants + 1 > ANCESTOR_TRACKING_LIMIT as i64 {
                     can_track_ancestors = false;
                     return false;
                 }
-                seen_count += 1;
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "seen_count < ANCESTOR_TRACKING_LIMIT was checked above"
+                )]
+                {
+                    seen_count += 1;
+                }
                 true
             },
         );
@@ -234,7 +265,14 @@ impl TxMiningView {
         for (ancestor_tx_hash, ancestor_tx_desc) in &seen_ancestors {
             add_ancestor_to(&mut base_stats, ancestor_tx_desc);
             if let Some(stats) = self.ancestor_stats.get_mut(ancestor_tx_hash) {
-                stats.num_descendants += 1;
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "the walk admitted only ancestors with num_descendants + 1 <= \
+                              ANCESTOR_TRACKING_LIMIT"
+                )]
+                {
+                    stats.num_descendants += 1;
+                }
             }
         }
         self.ancestor_stats.insert(base_tx_hash.0, base_stats);
@@ -281,6 +319,11 @@ impl TxMiningView {
                 return true;
             }
 
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "the cached count is at most the number of transactions in the view and \
+                          base_descendants_added stays <= ANCESTOR_TRACKING_LIMIT by this check"
+            )]
             if base_initial_descendants + base_descendants_added + 1
                 > ANCESTOR_TRACKING_LIMIT as i64
             {
@@ -289,6 +332,10 @@ impl TxMiningView {
                 return true;
             }
 
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "cached counts are at most the number of transactions in the view"
+            )]
             if descendant_stats.num_ancestors + 1 > ANCESTOR_TRACKING_LIMIT as i64 {
                 // The descendant has too many tracked ancestors.
                 ancestor_stats.remove(&descendant_tx_hash.0);
@@ -300,14 +347,28 @@ impl TxMiningView {
             if let Some(stats) = ancestor_stats.get_mut(&descendant_tx_hash.0) {
                 add_ancestor_to(stats, base_tx_desc);
             }
-            base_descendants_added += 1;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "the check above keeps base_initial_descendants + base_descendants_added \
+                          + 1 <= ANCESTOR_TRACKING_LIMIT"
+            )]
+            {
+                base_descendants_added += 1;
+            }
             true
         });
         if base_tx_has_stats
             && base_descendants_added > 0
             && let Some(stats) = self.ancestor_stats.get_mut(&base_tx_hash.0)
         {
-            stats.num_descendants += base_descendants_added;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "num_descendants is base_initial_descendants here, and the walk kept the \
+                          sum <= ANCESTOR_TRACKING_LIMIT"
+            )]
+            {
+                stats.num_descendants += base_descendants_added;
+            }
         }
     }
 
@@ -335,7 +396,13 @@ impl TxMiningView {
                 // it was not tracked previously, bounded to limit the
                 // number of ancestor walks.
                 if !has_stats && num_untracked_descendants < ANCESTOR_TRACKING_LIMIT {
-                    num_untracked_descendants += 1;
+                    #[allow(
+                        clippy::arithmetic_side_effects,
+                        reason = "num_untracked_descendants < ANCESTOR_TRACKING_LIMIT was checked"
+                    )]
+                    {
+                        num_untracked_descendants += 1;
+                    }
                     retrack.push(descendant.clone());
 
                     // Do not walk descendants of this descendant: it
@@ -368,7 +435,13 @@ impl TxMiningView {
         let ancestor_stats = &mut self.ancestor_stats;
         graph.for_each_ancestor_pre_order(&base_tx_hash, &mut seen_ancestors, &mut |ancestor| {
             if let Some(stats) = ancestor_stats.get_mut(&ancestor.tx_hash.0) {
-                stats.num_descendants -= 1;
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "cached counts stay within the number of transactions in the view"
+                )]
+                {
+                    stats.num_descendants -= 1;
+                }
             }
             true
         });
@@ -429,5 +502,80 @@ impl TxMiningView {
     /// `TxDescs`).
     pub fn tx_descs(&self) -> &[Arc<TxDesc>] {
         &self.tx_descs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use alloc::vec;
+    use dcroxide_stake::TxType;
+    use dcroxide_wire::{MsgTx, OutPoint, TX_TREE_REGULAR, TxIn, TxOut};
+
+    /// A descriptor for a transaction spending output 0 of `parent`
+    /// and carrying the given sigop count.
+    fn desc(parent: Hash, total_sig_ops: i64) -> Arc<TxDesc> {
+        let mut tx = MsgTx::default();
+        tx.tx_in.push(TxIn {
+            previous_out_point: OutPoint {
+                hash: parent,
+                index: 0,
+                tree: TX_TREE_REGULAR,
+            },
+            sequence: 0xffff_ffff,
+            value_in: 0,
+            block_height: 0,
+            block_index: 0,
+            signature_script: vec![],
+        });
+        tx.tx_out.push(TxOut {
+            value: 0,
+            version: 0,
+            pk_script: vec![0x51],
+        });
+        let tx_hash = tx.tx_hash();
+        Arc::new(TxDesc {
+            tx,
+            tx_hash,
+            tree: TX_TREE_REGULAR,
+            tx_type: TxType::Regular,
+            added_unix: 0,
+            height: 0,
+            fee: 0,
+            total_sig_ops,
+            tx_size: 0,
+        })
+    }
+
+    /// dcrd's `TxDesc.TotalSigOps` and `TxAncestorStats.TotalSigOps`
+    /// are uint32, so `addAncestorTo` wraps a bundle's sigop sum at 32
+    /// bits: ancestors carrying `u32::MAX` and 2 sigops sum to 1.  The
+    /// port summed in i64 and cached 2^32 + 1.  `removeAncestorFrom`
+    /// wraps back the same way.
+    #[test]
+    fn ancestor_sig_ops_wrap_at_32_bits_like_go() {
+        let grandparent = desc(Hash([1; 32]), i64::from(u32::MAX));
+        let parent = desc(grandparent.tx_hash, 2);
+        let child = desc(parent.tx_hash, 0);
+        let pool = [grandparent.clone(), parent.clone(), child.clone()];
+        let find = |hash: &Hash| pool.iter().find(|d| d.tx_hash == *hash).cloned();
+        let no_redeemers = |_: &TxDesc, _: &mut dyn FnMut(Arc<TxDesc>)| {};
+
+        let mut view = TxMiningView::new(true);
+        for d in &pool {
+            view.add_transaction(d, &find, &no_redeemers);
+        }
+        let (stats, tracked) = view.ancestor_stats(&child.tx_hash);
+        assert!(tracked);
+        assert_eq!(stats.num_ancestors, 2);
+        assert_eq!(stats.total_sig_ops, 1);
+
+        // 1 - u32::MAX wraps to 2, the parent's own count.
+        view.remove_transaction(&grandparent.tx_hash, true);
+        let (stats, tracked) = view.ancestor_stats(&child.tx_hash);
+        assert!(tracked);
+        assert_eq!(stats.num_ancestors, 1);
+        assert_eq!(stats.total_sig_ops, 2);
     }
 }

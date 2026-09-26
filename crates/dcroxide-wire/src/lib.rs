@@ -43,12 +43,6 @@
 // because the P2P, RPC and mixing crates legitimately hash (see
 // ADR-0008); note the lint fires only on `for` loops.
 #![deny(clippy::iter_over_hash_type)]
-// Wire arithmetic is cursor positions and serialize-size sums, all bounded by
-// slice lengths / in-memory object sizes (dcrd likewise uses plain int math
-// here). Like every consensus crate's, this allow is crate-wide, so the
-// workspace lint checks nothing here; release builds wrap on overflow
-// (`overflow-checks = false`) where dev and test builds panic.
-#![allow(clippy::arithmetic_side_effects)]
 
 extern crate alloc;
 

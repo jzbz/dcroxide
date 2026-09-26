@@ -459,7 +459,7 @@ pub fn write_connected_best_node(
     db_put_new_tickets(tx, node.height(), node.new_tickets())?;
 
     let mut next_winners = vec![Hash::ZERO; usize::from(node.params().votes_per_block)];
-    if i64::from(node.height()) >= node.params().stake_validation_begin_height - 1 {
+    if node.height() >= node.params().stake_validation_begin_height.wrapping_sub(1) as u32 {
         next_winners.copy_from_slice(node.winners());
     }
     db_put_best_state(
@@ -492,6 +492,10 @@ pub fn write_disconnected_best_node(
     let former_best = db_fetch_best_state(tx)?;
     if former_best.height > node.height() {
         let mut h = former_best.height;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "h > node.height() >= 0 inside the loop, so h >= 1"
+        )]
         while h > node.height() {
             db_drop_block_undo_data(tx, h)?;
             db_drop_new_tickets(tx, h)?;
@@ -563,7 +567,7 @@ pub fn write_disconnected_best_node(
     db_put_new_tickets(tx, node.height(), node.new_tickets())?;
 
     let mut next_winners = vec![Hash::ZERO; usize::from(node.params().votes_per_block)];
-    if i64::from(node.height()) >= node.params().stake_validation_begin_height - 1 {
+    if node.height() >= node.params().stake_validation_begin_height.wrapping_sub(1) as u32 {
         next_winners.copy_from_slice(node.winners());
     }
     db_put_best_state(

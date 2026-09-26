@@ -98,6 +98,10 @@ impl BlockHeader {
     pub fn serialize(&self) -> [u8; MAX_BLOCK_HEADER_PAYLOAD] {
         let mut out = [0u8; MAX_BLOCK_HEADER_PAYLOAD];
         let mut off = 0;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "off + field.len() <= 180: the fixed-size fields put below total exactly MAX_BLOCK_HEADER_PAYLOAD"
+        )]
         let mut put = |field: &[u8]| {
             out[off..off + field.len()].copy_from_slice(field);
             off += field.len();

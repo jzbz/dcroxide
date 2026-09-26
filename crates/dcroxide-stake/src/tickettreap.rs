@@ -136,6 +136,11 @@ impl Immutable {
         assert!(idx < root.size as usize, "getByIndex index out of bounds");
         let mut node = root;
         let mut idx = idx;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "idx != 0 before idx -= 1, and idx > left_size before idx -= left_size + \
+                      1, where left_size < root.size <= u32::MAX"
+        )]
         loop {
             match node.left.as_deref() {
                 None => {
@@ -237,6 +242,12 @@ impl Immutable {
         });
         let mut bubbling = true;
         while let Some((parent, went_left)) = path.pop() {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "subtree sizes are at most self.count + 1, and every entry is a ticket \
+                          from a block's fresh stake, at most max_fresh_stake_per_block (20 on \
+                          every network) per block, so u32::MAX takes over 214 million blocks"
+            )]
             if bubbling && acc.priority < parent.priority {
                 if went_left {
                     // Rotate right: the parent adopts acc's right
@@ -293,6 +304,12 @@ impl Immutable {
                 });
             }
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "count and total_size = count * NODE_SIZE (104) track this treap's \
+                      entries, each a ticket from a block's fresh stake (a u8 header field) over \
+                      at most 2^32 blocks, so count < 2^40 and total_size < 2^47"
+        )]
         Immutable {
             root: Some(acc),
             count: self.count + 1,
@@ -362,6 +379,11 @@ impl Immutable {
             }
         }
         let mut acc: Option<Arc<TreapNode>> = None;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "each folded size sums disjoint subtrees of del_node without del_node \
+                      itself, so every partial sum is at most del_node.size - 1 < u32::MAX"
+        )]
         while let Some((w, took_left)) = winners.pop() {
             let acc_size = acc.as_ref().map_or(0, |n| n.size);
             acc = Some(if took_left {
@@ -386,6 +408,11 @@ impl Immutable {
         }
 
         // Rebuild the ancestors with the sizes reduced by one.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "each ancestor on the path holds itself and the deleted node, so \
+                      parent.size >= 2"
+        )]
         while let Some((parent, went_left)) = path.pop() {
             let (left, right) = if went_left {
                 (acc, parent.right.clone())
@@ -401,6 +428,11 @@ impl Immutable {
                 right,
             }));
         }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the deleted key was found, so count >= 1 and total_size = count * \
+                      NODE_SIZE >= NODE_SIZE"
+        )]
         Immutable {
             root: acc,
             count: self.count - 1,
@@ -497,6 +529,11 @@ impl Immutable {
         let mut winners: Vec<Key> = Vec::new();
         let mut expired: Vec<Key> = Vec::new();
         let mut winner_idx = 0usize;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "winner_idx < sorted_idxs.len() since it was just used as an index, and idx \
+                      counts visited nodes, at most self.len()"
+        )]
         self.for_each(|k, v| {
             if v.height <= height {
                 expired.push(*k);

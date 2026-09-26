@@ -183,6 +183,10 @@ pub fn serialize_best_chain_state(state: &BestChainState) -> Vec<u8> {
         state.per_block,
         state.next_winners.len()
     );
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "per_block is a u16, so at most 58 + 32 * 65535"
+    )]
     let len = MINIMUM_BEST_CHAIN_STATE_SIZE + 32 * state.per_block as usize;
     let mut data = vec![0u8; len];
     data[0..32].copy_from_slice(&state.hash.0);
@@ -192,6 +196,10 @@ pub fn serialize_best_chain_state(state: &BestChainState) -> Vec<u8> {
     data[48..56].copy_from_slice(&state.revoked.to_le_bytes());
     data[56..58].copy_from_slice(&state.per_block.to_le_bytes());
     let mut offset = 58;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "next_winners.len() <= per_block (asserted above), so offset + 32 <= len"
+    )]
     for winner in &state.next_winners {
         data[offset..offset + 32].copy_from_slice(&winner.0);
         offset += 32;
@@ -223,6 +231,10 @@ pub fn deserialize_best_chain_state(data: &[u8]) -> Result<BestChainState, Ticke
     let per_block = u16::from_le_bytes([data[56], data[57]]);
     let mut next_winners = Vec::with_capacity(per_block as usize);
     let mut offset = 58;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "per_block is a u16, so offset + 32 <= 58 + 32 * 65535"
+    )]
     for _ in 0..per_block {
         let mut winner = [0u8; 32];
         winner.copy_from_slice(&data[offset..offset + 32]);
@@ -279,6 +291,11 @@ pub fn undo_bit_flags_from_byte(b: u8) -> (bool, bool, bool, bool) {
 
 /// Serialize the per-block undo data (dcrd `serializeBlockUndoData`).
 pub fn serialize_block_undo_data(utds: &[UndoTicketData]) -> Vec<u8> {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "utds is a slice of 40-byte UndoTicketData, so len * 37 stays below \
+                  isize::MAX"
+    )]
     let mut b = Vec::with_capacity(utds.len() * UNDO_TICKET_DATA_SIZE);
     for utd in utds {
         b.extend_from_slice(&utd.ticket_hash.0);
@@ -315,6 +332,10 @@ pub fn deserialize_block_undo_data(b: &[u8]) -> Result<Vec<UndoTicketData>, Tick
     let entries = b.len() / UNDO_TICKET_DATA_SIZE;
     let mut utds = Vec::with_capacity(entries);
     let mut offset = 0;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "entries * UNDO_TICKET_DATA_SIZE == b.len(), so offset never exceeds b.len()"
+    )]
     for _ in 0..entries {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&b[offset..offset + 32]);
@@ -337,6 +358,10 @@ pub fn deserialize_block_undo_data(b: &[u8]) -> Result<Vec<UndoTicketData>, Tick
 
 /// Serialize a list of ticket hashes (dcrd `serializeTicketHashes`).
 pub fn serialize_ticket_hashes(ths: &[Hash]) -> Vec<u8> {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "ths is a slice of 32-byte hashes, so len * 32 stays below isize::MAX"
+    )]
     let mut b = Vec::with_capacity(ths.len() * 32);
     for th in ths {
         b.extend_from_slice(&th.0);

@@ -19,9 +19,6 @@
 // because the P2P, RPC and mixing crates legitimately hash (see
 // ADR-0008); note the lint fires only on `for` loops.
 #![deny(clippy::iter_over_hash_type)]
-// The bookkeeping arithmetic mirrors Go's fixed-width semantics over
-// counts bounded by the tracking limits.
-#![allow(clippy::arithmetic_side_effects)]
 
 extern crate alloc;
 

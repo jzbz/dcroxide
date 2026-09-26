@@ -1095,6 +1095,10 @@ macro_rules! mix_message_hashes {
                 let mut msg_buf = Vec::new();
                 self.encode(&mut msg_buf, MIX_VERSION)?;
                 let cmd = concat!($cmd, "-sig");
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "msg_buf.len() >= 64: a successful encode writes the 64-byte signature first"
+                )]
                 let mut buf = Vec::with_capacity(1 + cmd.len() + msg_buf.len() - 64);
                 write_var_int(&mut buf, cmd.len() as u64);
                 buf.extend_from_slice(cmd.as_bytes());
@@ -1132,6 +1136,10 @@ impl MsgMixDCNet {
         let mut msg_buf = Vec::new();
         self.write_no_signature(&mut msg_buf, MIX_VERSION, true)?;
         let cmd = "mixdcnet-sig";
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "msg_buf.len() >= 64: a successful write_no_signature writes the 64-byte signature first"
+        )]
         let mut buf = Vec::with_capacity(1 + cmd.len() + msg_buf.len() - 64);
         write_var_int(&mut buf, cmd.len() as u64);
         buf.extend_from_slice(cmd.as_bytes());
