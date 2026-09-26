@@ -266,6 +266,24 @@ pub fn indx_log_sink() -> dcroxide_database::LogSink {
     subsystem_log_sink("INDX")
 }
 
+/// The RPC server's package log sink, rendered under `RPCS`: the
+/// authentication failures, internal errors, dropped replies and handler
+/// lines `dcroxide-rpc` logs.  The daemon installs it as dcrd's
+/// `log.go:96` does (`rpcserver.UseLogger(rpcsLog)`).
+pub fn rpcs_log_sink() -> dcroxide_rpc::log::LogSink {
+    std::sync::Arc::new(|level: dcroxide_rpc::log::LogLevel, msg: &str| {
+        use dcroxide_rpc::log::LogLevel as RpcLevel;
+        let level = match level {
+            RpcLevel::Trace => LogLevel::Trace,
+            RpcLevel::Debug => LogLevel::Debug,
+            RpcLevel::Info => LogLevel::Info,
+            RpcLevel::Warn => LogLevel::Warn,
+            RpcLevel::Error => LogLevel::Error,
+        };
+        log("RPCS", level, msg);
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

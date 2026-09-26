@@ -17,7 +17,6 @@ use dcroxide_node::bgtemplate::start_generator;
 use dcroxide_node::chainntfns::ChainNtfnHandler;
 use dcroxide_node::cpuminer::NodeCpuMiner;
 use dcroxide_node::dispatch::{SyncPeers, new_recently_advertised};
-use dcroxide_node::runtime::ConnectedPeers;
 use dcroxide_rpc::server::RpcCpuMiner;
 use dcroxide_testutil::unhex;
 use dcroxide_wire::MsgBlock;
@@ -177,7 +176,7 @@ fn generate_mines_blocks_onto_the_chain() {
         params.clone(),
         mining_policy(),
         0,
-        ConnectedPeers::new(),
+        SyncPeers::new(),
         true,
     );
 
@@ -387,7 +386,7 @@ fn continuous_mining_extends_the_chain() {
         params.clone(),
         mining_policy(),
         0,
-        ConnectedPeers::new(),
+        SyncPeers::new(),
         true,
     );
     let runtime = miner.start();

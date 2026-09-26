@@ -574,6 +574,25 @@ fn serve_tls(
     Vec<u8>,
     Vec<u8>,
 ) {
+    serve_tls_with(curve, None)
+}
+
+/// As [`serve_tls`], under `--authtype=clientcert` when `client_cas` is
+/// given: the bundle is written to `clients.pem` beside the pair and
+/// handed to the reloadable configuration as `--clientcafile` is
+/// (`server.go:3856-3860`), and the server holds no Basic credentials,
+/// which dcrd's `loadConfig` refuses under that auth type
+/// (`config.go:1044-1055`).
+fn serve_tls_with(
+    curve: dcroxide_certgen::Curve,
+    client_cas: Option<&[u8]>,
+) -> (
+    tempfile::TempDir,
+    dcroxide_node::rpcrun::RpcListener,
+    u16,
+    Vec<u8>,
+    Vec<u8>,
+) {
     let params = dcroxide_chaincfg::testnet3_params();
     let dir = tempfile::tempdir().expect("temp dir");
 
@@ -589,6 +608,11 @@ fn serve_tls(
         dcroxide_node::rpcrun::load_or_generate_cert_pair(&cert_path, &key_path, &[], curve)
             .expect("reload cert pair");
     assert_eq!(cert_pem, cert_again);
+    let client_cas_path = client_cas.map(|pem| {
+        let path = dir.path().join("clients.pem");
+        std::fs::write(&path, pem).expect("write clients.pem");
+        path
+    });
 
     // The listener takes the reloadable configuration the daemon builds,
     // reading the pair back from the paths it was just written to, as
@@ -596,10 +620,14 @@ fn serve_tls(
     let tls = dcroxide_node::rpcrun::reloadable_tls_config(
         &cert_path,
         &key_path,
-        None,
+        client_cas_path.as_deref(),
         dcroxide_node::rpcrun::RPC_TLS_MIN_RELOAD_CHECK_DELAY,
     )
     .expect("build tls config");
+    let (rpc_user, rpc_pass) = match client_cas {
+        Some(_) => (String::new(), String::new()),
+        None => ("user".to_string(), "pass".to_string()),
+    };
 
     // A chain-backed server exactly like the plain-HTTP fixture.
     let opts = Options::new(dir.path().join("blocks"), params.net.0);
@@ -615,7 +643,7 @@ fn serve_tls(
         max_protocol_version: PROTOCOL_VERSION,
         sync_mgr: Box::new(()),
         conn_mgr: Box::new(()),
-        client_cert_auth: false,
+        client_cert_auth: client_cas.is_some(),
         tx_mempooler: Box::new(()),
         clock: Box::new(dcroxide_node::rpcrun::SystemClock),
         interfaces: Box::new(NoInterfaces),
@@ -642,8 +670,8 @@ fn serve_tls(
         services: 0,
         request_shutdown: Box::new(|| {}),
         allow_unsynced_mining: false,
-        rpc_user: "user".to_string(),
-        rpc_pass: "pass".to_string(),
+        rpc_user,
+        rpc_pass,
         rpc_limit_user: String::new(),
         rpc_limit_pass: String::new(),
     }));
@@ -1195,14 +1223,419 @@ fn client_cert_auth_requires_usable_certificate_authorities() {
         );
     }
 
-    // A real certificate as the CA root builds a verifying listener
-    // (rustls keeps the verifier private, so the observable assertion
-    // here is that the CA material is required and parsed; the
-    // fail-closed half of the control is pinned by
-    // `zero_credentials_deny_without_client_certificate_auth`).
+    // A real certificate as the CA root builds a verifying listener.
+    // What that listener admits is pinned by the handshakes below and,
+    // end to end, by
+    // `clientcert_auth_admits_the_bundle_and_follows_its_revocation`;
+    // the fail-closed half of the control is pinned by
+    // `zero_credentials_deny_without_client_certificate_auth`.
     dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, Some(&cert_pem))
         .expect("build tls config with client CAs");
     dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, None).expect("build tls config");
+}
+
+/// A server verifier for the in-memory clientcert handshakes: the
+/// client side is not what they test, so any server certificate
+/// passes, with the handshake signatures still checked.
+#[derive(Debug)]
+struct AnyServerCert;
+
+impl rustls::client::danger::ServerCertVerifier for AnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Run a full TLS handshake in memory between the RPC server
+/// configuration and a client presenting `client_cert` under
+/// `client_key`, over each protocol version, returning the client
+/// certificates the server accepted or the server's error.
+fn clientcert_handshake(
+    server_config: &Arc<rustls::ServerConfig>,
+    client_cert: &[u8],
+    client_key: &rustls::pki_types::PrivateKeyDer<'static>,
+) -> Result<Vec<Vec<u8>>, rustls::Error> {
+    let mut accepted = Vec::new();
+    for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
+        let client_config = rustls::ClientConfig::builder_with_protocol_versions(&[version])
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyServerCert))
+            .with_client_auth_cert(
+                vec![rustls::pki_types::CertificateDer::from(
+                    client_cert.to_vec(),
+                )],
+                client_key.clone_key(),
+            )
+            .expect("client config");
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client_config),
+            rustls::pki_types::ServerName::try_from("localhost").expect("name"),
+        )
+        .expect("client");
+        let mut server = rustls::ServerConnection::new(Arc::clone(server_config)).expect("server");
+        for _ in 0..16 {
+            let mut flight = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut flight).expect("client write");
+            }
+            let mut input = flight.as_slice();
+            while !input.is_empty() {
+                server.read_tls(&mut input).expect("server read");
+            }
+            server.process_new_packets()?;
+            let mut flight = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut flight).expect("server write");
+            }
+            let mut input = flight.as_slice();
+            while !input.is_empty() {
+                client.read_tls(&mut input).expect("client read");
+            }
+            client.process_new_packets().expect("client process");
+            if !server.is_handshaking() && !client.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!server.is_handshaking(), "{version:?} handshake stalled");
+        accepted = server
+            .peer_certificates()
+            .expect("the server holds the client's certificates")
+            .iter()
+            .map(|cert| cert.as_ref().to_vec())
+            .collect();
+    }
+    Ok(accepted)
+}
+
+/// The scripted `gencerts` environment.
+struct GenEnvAt(i64, u8);
+
+impl dcroxide_certgen::gentool::GenEnv for GenEnvAt {
+    fn now_unix(&mut self) -> i64 {
+        self.0
+    }
+
+    fn serial_bytes(&mut self) -> Vec<u8> {
+        self.1 = self.1.wrapping_add(1);
+        vec![self.1]
+    }
+}
+
+/// The current unix time.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64
+}
+
+/// A `gencerts`-style self-signed authority valid for `years` from
+/// `now`, with its PEM, DER and PKCS#8 key.
+fn gencerts_pair(
+    now: i64,
+    years: i64,
+    signs: bool,
+) -> (
+    dcroxide_certgen::gentool::GenCert,
+    dcroxide_certgen::gentool::ToolKeyPair,
+    rustls::pki_types::PrivateKeyDer<'static>,
+) {
+    use dcroxide_certgen::gentool;
+    let key = gentool::generate_key("P-256").expect("key");
+    let cert =
+        gentool::generate_authority(&mut GenEnvAt(now, 0), &key, &[], "gencerts", years, signs)
+            .expect("authority");
+    let der = rustls::pki_types::PrivateKeyDer::Pkcs8(key.marshal_pkcs8().expect("pkcs8").into());
+    (cert, key, der)
+}
+
+/// The leaf client certificate `ca` issues at `now`, valid for five
+/// years whatever the authority's own window (without gencerts' clamp
+/// to the issuer's validity, as OpenSSL issues), with its PKCS#8 key.
+fn issue_client_cert(
+    ca: &dcroxide_certgen::gentool::GenCert,
+    ca_key: &dcroxide_certgen::gentool::ToolKeyPair,
+    now: i64,
+) -> (Vec<u8>, rustls::pki_types::PrivateKeyDer<'static>) {
+    use dcroxide_certgen::gentool;
+    let key_pem = gentool::pem_private_key(&ca_key.marshal_pkcs8().expect("pkcs8"));
+    let (mut loaded, ca_key) = gentool::load_ca_pair(&ca.pem, &key_pem).expect("ca pair");
+    loaded.not_after_unix = now.saturating_add(10 * 365 * 86_400);
+    let key = gentool::generate_key("P-256").expect("key");
+    let cert = gentool::create_issued_cert(
+        &mut GenEnvAt(now, 100),
+        &key,
+        &loaded,
+        &ca_key,
+        &[],
+        "client",
+        5,
+        false,
+    )
+    .expect("issued");
+    let der = rustls::pki_types::PrivateKeyDer::Pkcs8(key.marshal_pkcs8().expect("pkcs8").into());
+    (cert.der, der)
+}
+
+/// A server configuration over a fresh rpc.cert whose client CA file
+/// holds `clients_pem`.
+fn clientcert_server(clients_pem: &[u8]) -> (tempfile::TempDir, Arc<rustls::ServerConfig>) {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (cert_pem, key_pem) = dcroxide_node::rpcrun::load_or_generate_cert_pair(
+        &dir.path().join("rpc.cert"),
+        &dir.path().join("rpc.key"),
+        &[],
+        dcroxide_certgen::Curve::P256,
+    )
+    .expect("generate cert pair");
+    let config = dcroxide_node::rpcrun::tls_server_config(&cert_pem, &key_pem, Some(clients_pem))
+        .expect("clientcert server config");
+    (dir, config)
+}
+
+/// The simplest `--authtype=clientcert` setup authenticates (review
+/// finding GAP06#1): a certificate made by `gencerts` -- or by dcrd's
+/// certgen, rpc.cert's shape -- appended to clients.pem and presented
+/// by the client.  Both are self-signed CA certificates; Go accepts a
+/// presented certificate that is itself in the pool as its own chain
+/// (`crypto/x509/verify.go`, `opts.Roots.contains(c)`), where webpki
+/// refuses any CA as an end entity and the listener aborted every such
+/// handshake.  A certificate the file does not hold still fails.
+#[test]
+fn a_gencerts_client_certificate_in_clients_pem_authenticates() {
+    use rustls::pki_types::pem::PemObject;
+    let now = unix_now();
+    let (gencerts, _, gencerts_key) = gencerts_pair(now, 1, false);
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let (certgen_pem, certgen_key_pem) = dcroxide_node::rpcrun::load_or_generate_cert_pair(
+        &dir.path().join("client.cert"),
+        &dir.path().join("client.key"),
+        &[],
+        dcroxide_certgen::Curve::P256,
+    )
+    .expect("certgen pair");
+    let certgen_der = rustls::pki_types::CertificateDer::from_pem_slice(&certgen_pem)
+        .expect("certgen cert")
+        .as_ref()
+        .to_vec();
+    let certgen_key =
+        rustls::pki_types::PrivateKeyDer::from_pem_slice(&certgen_key_pem).expect("certgen key");
+
+    let clients = [gencerts.pem.as_slice(), certgen_pem.as_slice()].concat();
+    let (_server_dir, server) = clientcert_server(&clients);
+    for (name, cert, key) in [
+        ("gencerts", &gencerts.der, &gencerts_key),
+        ("certgen", &certgen_der, &certgen_key),
+    ] {
+        let accepted = clientcert_handshake(&server, cert, key)
+            .unwrap_or_else(|e| panic!("{name} client certificate refused: {e}"));
+        assert_eq!(accepted, vec![cert.clone()], "{name}");
+    }
+
+    // A certificate of the same shape that clients.pem does not hold
+    // has no chain to any of its roots.
+    let (stranger, _, stranger_key) = gencerts_pair(now, 1, false);
+    assert!(clientcert_handshake(&server, &stranger.der, &stranger_key).is_err());
+}
+
+/// A client chain through an authority outside its validity window is
+/// refused, as Go's `isValid(rootCertificate)` refuses it (review
+/// finding GAP06#2): webpki keeps no validity for a trust anchor, so
+/// the listener admitted a leaf issued -- without gencerts' clamp, as
+/// OpenSSL issues -- by an expired or not yet valid client CA.
+#[test]
+fn a_client_chain_under_an_authority_outside_its_validity_is_refused() {
+    let now = unix_now();
+    let year = 365 * 86_400;
+
+    // The control: a valid authority anchors its leaf.
+    let (valid, valid_key, _) = gencerts_pair(now - year, 3, true);
+    let (leaf, leaf_key) = issue_client_cert(&valid, &valid_key, now);
+    let (_dir, server) = clientcert_server(&valid.pem);
+    clientcert_handshake(&server, &leaf, &leaf_key).expect("a valid authority anchors its leaf");
+
+    for (name, start) in [("expired", now - 3 * year), ("not yet valid", now + year)] {
+        let (ca, ca_key, _) = gencerts_pair(start, 1, true);
+        let (leaf, leaf_key) = issue_client_cert(&ca, &ca_key, now);
+        let (_dir, server) = clientcert_server(&ca.pem);
+        assert!(
+            clientcert_handshake(&server, &leaf, &leaf_key).is_err(),
+            "a leaf under an {name} authority must be refused"
+        );
+    }
+}
+
+/// POST `getblockcount` with no `Authorization` header over TLS
+/// `version`, presenting `client` -- a DER certificate and its key --
+/// when given.  Returns the response, or the error that ended the
+/// exchange when the server refused the handshake.
+fn clientcert_getblockcount(
+    port: u16,
+    version: &'static rustls::SupportedProtocolVersion,
+    client: Option<(&[u8], &rustls::pki_types::PrivateKeyDer<'static>)>,
+) -> std::io::Result<String> {
+    let builder = rustls::ClientConfig::builder_with_protocol_versions(&[version])
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyServerCert));
+    let config = match client {
+        Some((cert, key)) => builder
+            .with_client_auth_cert(
+                vec![rustls::pki_types::CertificateDer::from(cert.to_vec())],
+                key.clone_key(),
+            )
+            .expect("client config"),
+        None => builder.with_no_client_auth(),
+    };
+    let session = rustls::ClientConnection::new(
+        Arc::new(config),
+        rustls::pki_types::ServerName::try_from("localhost").expect("name"),
+    )
+    .expect("client");
+    let tcp = TcpStream::connect(("127.0.0.1", port))?;
+    tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    let mut stream = rustls::StreamOwned::new(session, tcp);
+    let body = r#"{"jsonrpc":"1.0","method":"getblockcount","params":[],"id":1}"#;
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+/// `--authtype=clientcert` end to end over the listener (review finding
+/// GAP06#7).  dcrd's listener requires and verifies a client
+/// certificate (`tls.RequireAndVerifyClientCert`, `server.go:3694`), and
+/// with no credentials set `checkAuth` grants admin to every request
+/// (`rpcserver.go:5519-5523`), so the completed handshake is the whole
+/// authentication: a leaf the bundle's authority issued and a
+/// `gencerts` certificate the bundle lists are served with no
+/// `Authorization` header, while a client with no certificate, or one
+/// the bundle does not hold, gets no handshake.
+///
+/// Editing the bundle is also the whole revocation mechanism, neither
+/// implementation consulting a CRL or OCSP.  An authority dropped from
+/// `clients.pem` stops being trusted at the first connection after the
+/// next reload check (`configFileClient`, `server.go:3708-3736`), and
+/// not before it: until then the cached configuration still trusts it,
+/// as dcrd's does.
+#[test]
+fn clientcert_auth_admits_the_bundle_and_follows_its_revocation() {
+    use dcroxide_node::rpcrun::RPC_TLS_MIN_RELOAD_CHECK_DELAY;
+    use rustls::version::{TLS12, TLS13};
+
+    let now = unix_now();
+    let (ca, ca_key, _) = gencerts_pair(now - 365 * 86_400, 3, true);
+    let (issued, issued_key) = issue_client_cert(&ca, &ca_key, now);
+    let (listed, _, listed_key) = gencerts_pair(now, 1, false);
+    let (stranger, _, stranger_key) = gencerts_pair(now, 1, false);
+
+    // Taken before the fixture builds the reloadable configuration, so
+    // the first reload check is at least a full interval after it.
+    let started = std::time::Instant::now();
+    let (dir, listener, port, _, _) = serve_tls_with(
+        dcroxide_certgen::Curve::P256,
+        Some(&[ca.pem.as_slice(), listed.pem.as_slice()].concat()),
+    );
+    let served = |response: std::io::Result<String>, what: &str| {
+        let response = response.unwrap_or_else(|e| panic!("{what}: refused: {e}"));
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "{what}: {response}"
+        );
+        assert!(response.contains("\"result\":0"), "{what}: {response}");
+    };
+
+    for version in [&TLS13, &TLS12] {
+        served(
+            clientcert_getblockcount(port, version, Some((&issued, &issued_key))),
+            &format!("{version:?}: a leaf the listed authority issued"),
+        );
+        served(
+            clientcert_getblockcount(port, version, Some((&listed.der, &listed_key))),
+            &format!("{version:?}: a listed gencerts certificate"),
+        );
+        assert!(
+            clientcert_getblockcount(port, version, None).is_err(),
+            "{version:?}: a client with no certificate must get no handshake"
+        );
+        assert!(
+            clientcert_getblockcount(port, version, Some((&stranger.der, &stranger_key))).is_err(),
+            "{version:?}: a certificate the bundle does not hold must get no handshake"
+        );
+    }
+
+    // Revoke the authority, keeping the listed certificate.  The file
+    // shrinks, so the watcher sees the change whatever the filesystem's
+    // mtime granularity.
+    std::fs::write(dir.path().join("clients.pem"), &listed.pem).expect("rewrite clients.pem");
+    let edited = std::time::Instant::now();
+    let early = clientcert_getblockcount(port, &TLS13, Some((&issued, &issued_key)));
+    if started.elapsed() < RPC_TLS_MIN_RELOAD_CHECK_DELAY {
+        // No check has run since startup, so nothing has seen the edit.
+        served(early, "the revoked authority's leaf before the next check");
+    }
+
+    // Every check that ran before the edit set the next one at most a
+    // full interval after it, so by then the next connection checks,
+    // finds the bundle changed, and reloads it.
+    std::thread::sleep(RPC_TLS_MIN_RELOAD_CHECK_DELAY.saturating_sub(edited.elapsed()));
+    for version in [&TLS13, &TLS12] {
+        assert!(
+            clientcert_getblockcount(port, version, Some((&issued, &issued_key))).is_err(),
+            "{version:?}: the revoked authority's leaf must get no handshake after the check"
+        );
+        served(
+            clientcert_getblockcount(port, version, Some((&listed.der, &listed_key))),
+            &format!("{version:?}: the certificate still listed"),
+        );
+    }
+
+    listener.shutdown();
 }
 
 /// A half-present pair must not be regenerated over the file that is

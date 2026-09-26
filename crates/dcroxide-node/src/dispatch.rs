@@ -267,6 +267,12 @@ impl SyncPeers {
             .is_empty()
     }
 
+    /// The number of registered, handshaken peers (dcrd
+    /// `server.ConnectedCount` over its `peerState`).
+    pub fn len(&self) -> usize {
+        self.inner.lock().expect("sync peers mutex poisoned").len()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn register(
         &self,
@@ -1658,6 +1664,27 @@ impl BlockRead {
         });
         found
     }
+
+    /// The block's serialized bytes, as [`BlockRead::fetch`] would find
+    /// them: serialized from the shared recent-window copy, or read from
+    /// the database as stored (dcrd's `Block.Bytes`).
+    ///
+    /// The chain stores only `MsgBlock::serialize` output and the read
+    /// verifies the block file's checksum, so the stored bytes are exactly
+    /// what `fetch` would decode and a serialize would re-encode; handing
+    /// them over skips both.
+    pub(crate) fn fetch_bytes(self, hash: &Hash) -> Option<Vec<u8>> {
+        let db = match self {
+            BlockRead::Cached(block) => return Some(block.serialize()),
+            BlockRead::Stored(db) => db?,
+        };
+        let mut found = None;
+        let _ = db.view(|tx| {
+            found = tx.fetch_block(hash).ok();
+            Ok(())
+        });
+        found
+    }
 }
 
 /// Committed filters resolved under the chain lock (the index half of
@@ -2574,8 +2601,11 @@ impl ServerPeerHandler {
                 let accepted = self.on_tx_intake(tx, &tx_hash);
                 // dcrd's AnnounceNewTransactions: the websocket
                 // notification half; the peer inventory relay follows.
+                // The pairs copy every transaction, so they are built
+                // only while a websocket client could receive them.
                 if !accepted.is_empty()
                     && let Some(ntfn) = &self.ctx.ntfn
+                    && ntfn.has_clients()
                 {
                     // Announce from the values the accept returned, not
                     // from a second pool lookup.  dcrd carries the

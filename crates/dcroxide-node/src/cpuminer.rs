@@ -50,8 +50,8 @@ use dcroxide_rpc::worksem::request_cancelled;
 use dcroxide_wire::{BlockHeader, MsgBlock};
 
 use crate::bgtemplate::{GeneratorSink, NodeRpcBlockTemplater, SharedTemplate, SubscriberRegistry};
+use crate::dispatch::SyncPeers;
 use crate::mining::{NodeTemplateChain, NodeTemplateTxSource};
-use crate::runtime::ConnectedPeers;
 use crate::sync::NodeSyncManager;
 use crate::txmempool::NodeTxPool;
 
@@ -291,7 +291,11 @@ pub struct NodeCpuMiner {
     params: Params,
     policy: MiningPolicy,
     mining_time_offset: i64,
-    connected: ConnectedPeers,
+    /// The handshaken-peer registry behind the connection wait (dcrd
+    /// `cfg.ConnectedCount`, which is `server.ConnectedCount` over its
+    /// `peerState`), not the socket registry, which also holds sockets
+    /// still in their version handshake.
+    connected: SyncPeers,
     /// Whether the network permits mining without connected peers (dcrd
     /// `PermitConnectionlessMining`, true on simnet and regnet).
     permit_connectionless: bool,
@@ -331,7 +335,7 @@ pub struct NodeCpuMiner {
 impl NodeCpuMiner {
     /// Build the CPU miner over the running generator's handles, the
     /// shared chain, the sync manager (for `process_block`), the mempool,
-    /// and the connected-peer registry (dcrd `cpuminer.New` over its
+    /// and the handshaken-peer registry (dcrd `cpuminer.New` over its
     /// `Config`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -344,7 +348,7 @@ impl NodeCpuMiner {
         params: Params,
         policy: MiningPolicy,
         mining_time_offset: i64,
-        connected: ConnectedPeers,
+        connected: SyncPeers,
         permit_connectionless: bool,
     ) -> NodeCpuMiner {
         let (controller_tx, controller_rx) = mpsc::channel();
@@ -560,7 +564,7 @@ struct SolveShared {
     quit: Arc<AtomicBool>,
     speed_stats: Arc<Mutex<HashMap<u64, Arc<SpeedStats>>>>,
     mined_on_parents: Arc<Mutex<HashMap<Hash, u8>>>,
-    connected: ConnectedPeers,
+    connected: SyncPeers,
     permit_connectionless: bool,
 }
 
@@ -1681,7 +1685,7 @@ mod tests {
             params.clone(),
             policy,
             0,
-            ConnectedPeers::new(),
+            SyncPeers::new(),
             true,
         );
         let shared = miner.solve_shared();

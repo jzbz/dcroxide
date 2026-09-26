@@ -97,7 +97,7 @@ impl RpcSyncManager for ProbingSyncMgr {
             let _ = notify_work(
                 &server,
                 &[&mut client],
-                &block,
+                block,
                 TemplateUpdateReason::NewTxns,
             );
             let _ = done_tx.send(());
@@ -205,7 +205,7 @@ fn getwork_submission_releases_the_work_state_before_submitting() {
     let sent = notify_work(
         &server,
         &[&mut subscriber],
-        &block,
+        block.clone(),
         TemplateUpdateReason::NewVotes,
     );
     assert_eq!(sent.len(), 1, "the work notification is built");

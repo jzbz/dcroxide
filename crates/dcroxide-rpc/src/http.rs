@@ -66,31 +66,38 @@ fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 impl<C: RpcChain> Server<C> {
     /// Check the HTTP Basic authentication string against the stored
     /// credential MACs; the first result is auth success and the
-    /// second whether the user is an admin (dcrd `checkAuthMAC`).
-    pub fn check_auth_mac(&self, auth: &str) -> (bool, bool) {
+    /// second whether the user is an admin (dcrd `checkAuthMAC`).  A
+    /// mismatch is logged with the client's address, as dcrd warns
+    /// "RPC authentication failure from `<addr>`".
+    pub fn check_auth_mac(&self, auth: &str, remote_addr: &str) -> (bool, bool) {
         let mac = auth_mac(&self.hmac_key, auth.as_bytes());
         let cmp = ct_eq(&mac, &self.authsha);
         let limitcmp = ct_eq(&mac, &self.limitauthsha);
         if !cmp && !limitcmp {
+            // Request's auth doesn't match either user.
+            crate::log::warn(&format!("RPC authentication failure from {remote_addr}"));
             return (false, false);
         }
         (true, cmp)
     }
 
     /// Check a username and password by generating the corresponding
-    /// HTTP Basic authentication string (dcrd `checkAuthUserPass`).
-    pub fn check_auth_user_pass(&self, user: &str, pass: &str) -> (bool, bool) {
+    /// HTTP Basic authentication string (dcrd `checkAuthUserPass`); the
+    /// websocket `authenticate` command's check.
+    pub fn check_auth_user_pass(&self, user: &str, pass: &str, remote_addr: &str) -> (bool, bool) {
         let login = format!("{user}:{pass}");
         let auth = format!("Basic {}", base64_std_encode(login.as_bytes()));
-        self.check_auth_mac(&auth)
+        self.check_auth_mac(&auth, remote_addr)
     }
 
-    /// Check the HTTP Basic authentication supplied with a request;
-    /// the error only signals the auth failure (dcrd `checkAuth`).
+    /// Check the HTTP Basic authentication supplied with a request from
+    /// `remote_addr` (Go's `r.RemoteAddr`); the error only signals the
+    /// auth failure (dcrd `checkAuth`).
     pub fn check_auth(
         &self,
         auth_header: Option<&str>,
         require: bool,
+        remote_addr: &str,
     ) -> Result<(bool, bool), String> {
         // With no Basic credentials configured, authentication rests
         // entirely on the TLS layer having required and verified a
@@ -107,12 +114,13 @@ impl<C: RpcChain> Server<C> {
 
         let Some(auth) = auth_header else {
             if require {
+                crate::log::warn(&format!("RPC authentication failure from {remote_addr}"));
                 return Err("auth failure".to_string());
             }
             return Ok((false, false));
         };
 
-        let (authed, is_admin) = self.check_auth_mac(auth);
+        let (authed, is_admin) = self.check_auth_mac(auth, remote_addr);
         if !authed {
             return Err("auth failure".to_string());
         }
@@ -466,6 +474,19 @@ fn first_out_of_range_number(raw: &str) -> Option<&str> {
     None
 }
 
+/// A reply `jsonRPCRead` built with `dcrjson.MarshalResponse` itself, or
+/// `None` after logging why it failed (`log.Errorf("Failed to create
+/// reply: %v", err)`).
+fn created_or_logged<E: core::fmt::Display>(reply: Result<String, E>) -> Option<String> {
+    match reply {
+        Ok(reply) => Some(reply),
+        Err(err) => {
+            crate::log::error(&format!("Failed to create reply: {err}"));
+            None
+        }
+    }
+}
+
 /// Process a JSON-RPC request body and return the full response body
 /// including the Bitcoin Core compatibility newline (the request
 /// handling inside dcrd `jsonRPCRead`; the connection handling and
@@ -485,7 +506,7 @@ pub fn process_body<C: RpcChain>(server: &Server<C>, body: &str, is_admin: bool)
                     err_rpc_parse().code,
                     &format!("Failed to parse request: {err_text}"),
                 );
-                marshal_response("1.0", &RpcId::Null, None, Some(&json_err)).ok()
+                created_or_logged(marshal_response("1.0", &RpcId::Null, None, Some(&json_err)))
             }
             Ok(req) => {
                 let param_refs: Vec<&str> = req.params.iter().map(|s| s.as_str()).collect();
@@ -512,7 +533,9 @@ pub fn process_body<C: RpcChain>(server: &Server<C>, body: &str, is_admin: bool)
                     err_rpc_parse().code,
                     &format!("Failed to parse request: {}", err.go_message()),
                 );
-                if let Ok(resp) = marshal_response("2.0", &RpcId::Null, None, Some(&json_err)) {
+                if let Some(resp) =
+                    created_or_logged(marshal_response("2.0", &RpcId::Null, None, Some(&json_err)))
+                {
                     results.push(resp);
                 }
             }
@@ -526,8 +549,9 @@ pub fn process_body<C: RpcChain>(server: &Server<C>, body: &str, is_admin: bool)
                         err_rpc_invalid_request().code,
                         "Invalid request: empty batch",
                     );
-                    if let Ok(resp) = marshal_response("2.0", &RpcId::Null, None, Some(&json_err)) {
-                        results.push(resp);
+                    match marshal_response("2.0", &RpcId::Null, None, Some(&json_err)) {
+                        Ok(resp) => results.push(resp),
+                        Err(err) => crate::log::error(&format!("Failed to marshal reply: {err}")),
                     }
                 }
 
@@ -541,9 +565,12 @@ pub fn process_body<C: RpcChain>(server: &Server<C>, body: &str, is_admin: bool)
                                     err_rpc_invalid_request().code,
                                     &format!("Invalid request: {err_text}"),
                                 );
-                                if let Ok(resp) =
-                                    marshal_response("", &RpcId::Null, None, Some(&json_err))
-                                {
+                                if let Some(resp) = created_or_logged(marshal_response(
+                                    "",
+                                    &RpcId::Null,
+                                    None,
+                                    Some(&json_err),
+                                )) {
                                     results.push(resp);
                                 }
                             }
@@ -582,8 +609,9 @@ pub fn process_body<C: RpcChain>(server: &Server<C>, body: &str, is_admin: bool)
         }
     }
     if (!batched_request || batch_size == 0) && !results.is_empty() {
-        // Respond with the first results entry for single requests.
-        msg = results[0].clone().into_bytes();
+        // Respond with the first results entry for single requests,
+        // moved out rather than copied: nothing reads `results` after.
+        msg = results.swap_remove(0).into_bytes();
     }
 
     // Terminate with a newline to maintain compatibility with Bitcoin

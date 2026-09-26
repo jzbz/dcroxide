@@ -7,7 +7,8 @@
 //! The decoder rows were checked against Go's `json.NewDecoder(r).Decode`
 //! into dcrd's `serializedAddrManager` types, and the filesystem rows
 //! against dcrd's `os.Stat`/`os.Open`/`os.Remove` sequence, all built
-//! with Go 1.26.5, the toolchain dcrd's release image uses.  (Go 1.27's
+//! with Go 1.26.5.  dcrd's release image builds with Go 1.26.2 at the
+//! parity pin (`contrib/docker/Dockerfile`).  (Go 1.27's
 //! `encoding/json`, built on its v2 implementation, words several syntax
 //! errors differently.)
 

@@ -22,7 +22,7 @@ use dcroxide_database::{Database, Options};
 use dcroxide_mining::MiningPolicy;
 use dcroxide_node::bgtemplate::start_generator;
 use dcroxide_node::cpuminer::NodeCpuMiner;
-use dcroxide_node::runtime::ConnectedPeers;
+use dcroxide_node::dispatch::SyncPeers;
 use dcroxide_rpc::server::RpcCpuMiner;
 use dcroxide_testutil::unhex;
 use dcroxide_wire::MsgBlock;
@@ -126,7 +126,7 @@ fn generate_returns_when_its_target_block_connects() {
         params.clone(),
         policy,
         0,
-        ConnectedPeers::new(),
+        SyncPeers::new(),
         true,
     );
 

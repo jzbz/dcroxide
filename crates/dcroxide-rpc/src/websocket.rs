@@ -392,7 +392,7 @@ pub fn handle_websocket_help<C: RpcChain>(
         let usage = server
             .help_cacher
             .rpc_usage(&server.registry, true)
-            .map_err(|e| rpc_internal_err(&e))?;
+            .map_err(|e| rpc_internal_err(&e, "Failed to generate RPC usage"))?;
         return Ok(GoValue::String(usage));
     }
 
@@ -412,7 +412,7 @@ pub fn handle_websocket_help<C: RpcChain>(
     let help = server
         .help_cacher
         .rpc_method_help(&server.registry, command)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Failed to generate help"))?;
     Ok(GoValue::String(help))
 }
 
@@ -519,9 +519,14 @@ pub fn handle_rebroadcast_winners<C: RpcChain>(
 
     for block_hash in &blocks {
         // Lottery data can legitimately be missing when the header is
-        // known but not the block data; the failure is log-only.
-        let Ok(winning_tickets) = server.cfg.chain.lottery_data_for_block(block_hash) else {
-            continue;
+        // known but not the block data, so the failure is only logged,
+        // as a warning.
+        let winning_tickets = match server.cfg.chain.lottery_data_for_block(block_hash) {
+            Ok(winning_tickets) => winning_tickets,
+            Err(err) => {
+                crate::log::warn(&format!("Lottery data for block failed: {err}"));
+                continue;
+            }
         };
         server
             .ntfn_mgr
@@ -733,7 +738,9 @@ pub fn ws_cmd_result<C: RpcChain>(
 }
 
 /// Execute a parsed websocket request and build the marshalled reply
-/// (the reply construction inside dcrd `serviceRequest`).
+/// (the reply construction inside dcrd `serviceRequest`); `None` when it
+/// fails to marshal, which is logged as dcrd's `serviceRequest` and batch
+/// arm both log it.
 pub fn ws_service_request<C: RpcChain>(
     server: &Server<C>,
     wsc: &Mutex<WsClient>,
@@ -746,13 +753,20 @@ pub fn ws_service_request<C: RpcChain>(
         Ok(pair) => (Some(pair), None),
         Err(err) => (None, Some(err)),
     };
-    create_marshalled_reply(
+    match create_marshalled_reply(
         jsonrpc,
         id,
         result.as_ref().map(|(value, typ)| (typ, value)),
         err.as_ref(),
-    )
-    .ok()
+    ) {
+        Ok(reply) => Some(reply),
+        Err(err) => {
+            crate::log::error(&format!(
+                "Failed to marshal reply for <{method_name}> command: {err}"
+            ));
+            None
+        }
+    }
 }
 
 /// A template update reason (dcrd `mining.TemplateUpdateReason`).
@@ -797,10 +811,68 @@ fn marshal_ntfn<C: RpcChain>(
     dcroxide_dcrjson::marshal_cmd(&server.registry, "1.0", &RpcId::Null, &instance).ok()
 }
 
+/// What a client filter is matched against for one transaction output.
+///
+/// dcrd extracts it again for every client holding a filter, but it
+/// depends on the output alone, so the port extracts each output once,
+/// on the first such client, and matches every client against that.
+enum OutputAddrs {
+    /// A nonstandard output, which clients are not able to subscribe to.
+    NonStandard,
+    /// The addresses to match, and whether a match watches the output.
+    Addrs(Vec<stdaddr::Address>, bool),
+    /// A ticket commitment that failed to decode; dcrd logs it once for
+    /// each client, so the text is kept to log per client.
+    BadCommitment(String),
+}
+
+/// Extract every output's addresses for the client filters, reading
+/// ticket commitments as `subscribedClients` does when
+/// `ticket_commitments` is set (`notifyRelevantTxAccepted` does not).
+fn output_addrs(
+    tx: &MsgTx,
+    params: &dcroxide_chaincfg::Params,
+    ticket_commitments: bool,
+) -> Vec<OutputAddrs> {
+    let mut is_ticket = false; // lazily set
+    let mut outputs = Vec::with_capacity(tx.tx_out.len());
+    for (i, output) in tx.tx_out.iter().enumerate() {
+        let (script_type, addrs) =
+            stdscript::extract_addrs(output.version, &output.pk_script, params);
+        if script_type == stdscript::ScriptType::NonStandard {
+            // Clients are not able to subscribe to nonstandard or
+            // non-address outputs.
+            outputs.push(OutputAddrs::NonStandard);
+            continue;
+        }
+        if ticket_commitments
+            && script_type == stdscript::ScriptType::NullData
+            && i & 1 == 1
+            && (is_ticket || dcroxide_stake::is_sstx(tx))
+        {
+            is_ticket = true;
+            // OP_RETURN ticket commitments may contain relevant P2PKH or
+            // P2SH HASH160s.  These outputs cannot be spent and do not
+            // need to be watched.
+            outputs.push(
+                match dcroxide_stake::addr_from_sstx_pk_scr_commitment(&output.pk_script, params) {
+                    Ok(addr) => OutputAddrs::Addrs(vec![addr], false),
+                    Err(err) => OutputAddrs::BadCommitment(err.to_string()),
+                },
+            );
+            continue;
+        }
+        outputs.push(OutputAddrs::Addrs(addrs, true));
+    }
+    outputs
+}
+
 /// The clients whose filters consider the transaction relevant,
 /// updating their filters to watch discovered outputs; the result is
 /// parallel to the client list (dcrd `subscribedClients`, which also
-/// covers the ticket commitment address path).
+/// covers the ticket commitment address path).  The output addresses
+/// and the transaction hash are computed once for all clients, as dcrd's
+/// cached `tx.Hash()` is, rather than once per client and match.
 pub fn subscribed_clients<C: RpcChain>(
     server: &Server<C>,
     tx: &MsgTx,
@@ -810,7 +882,8 @@ pub fn subscribed_clients<C: RpcChain>(
     let params = &server.cfg.chain_params;
     let mut subscribed = vec![false; clients.len()];
 
-    let mut is_ticket = false; // lazily set
+    let mut outputs: Option<Vec<OutputAddrs>> = None; // lazily set
+    let mut tx_hash: Option<Hash> = None; // lazily set
     for (ci, client) in clients.iter_mut().enumerate() {
         let Some(f) = client.filter_data.as_mut() else {
             continue;
@@ -822,37 +895,24 @@ pub fn subscribed_clients<C: RpcChain>(
             }
         }
 
-        for (i, output) in tx.tx_out.iter().enumerate() {
-            let mut watch_output = true;
-            let (script_type, mut addrs) =
-                stdscript::extract_addrs(output.version, &output.pk_script, params);
-            if script_type == stdscript::ScriptType::NonStandard {
-                // Clients are not able to subscribe to nonstandard or
-                // non-address outputs.
-                continue;
-            }
-            if script_type == stdscript::ScriptType::NullData
-                && i & 1 == 1
-                && (is_ticket || dcroxide_stake::is_sstx(tx))
-            {
-                is_ticket = true;
-                // OP_RETURN ticket commitments may contain relevant
-                // P2PKH or P2SH HASH160s.  These outputs cannot be
-                // spent and do not need to be watched.
-                match dcroxide_stake::addr_from_sstx_pk_scr_commitment(&output.pk_script, params) {
-                    Ok(addr) => {
-                        addrs = vec![addr];
-                        watch_output = false;
-                    }
-                    Err(_) => continue, // log-only in dcrd
+        let outputs = outputs.get_or_insert_with(|| output_addrs(tx, params, true));
+        for (i, output) in outputs.iter().enumerate() {
+            let (addrs, watch_output) = match output {
+                OutputAddrs::NonStandard => continue,
+                OutputAddrs::BadCommitment(err) => {
+                    crate::log::error(&format!(
+                        "Failed to read commitment from previously-validated ticket: {err}"
+                    ));
+                    continue;
                 }
-            }
-            for a in &addrs {
+                OutputAddrs::Addrs(addrs, watch_output) => (addrs, *watch_output),
+            };
+            for a in addrs {
                 if f.exists_address(a) {
                     subscribed[ci] = true;
                     if watch_output {
                         let op = OutPoint {
-                            hash: tx.tx_hash(),
+                            hash: *tx_hash.get_or_insert_with(|| tx.tx_hash()),
                             index: i as u32,
                             tree,
                         };
@@ -881,36 +941,38 @@ pub fn notify_block_connected<C: RpcChain>(
     // The common portion of the notification.
     let header_hex = txresults::hex_str(&block.header.serialize());
 
-    // Search for relevant transactions for each client.
-    let mut subscribed_txs: Vec<Vec<String>> = vec![Vec::new(); clients.len()];
+    // Search for relevant transactions for each client and save them
+    // serialized in hex encoding for the notification.  Each is encoded
+    // once, on its first match, and shared by every matching client.
+    let mut subscribed_txs: Vec<Vec<GoValue>> = vec![Vec::new(); clients.len()];
     for tx in &block.stransactions {
+        let mut tx_hex: Option<String> = None;
         let flags = subscribed_clients(server, tx, 1, clients);
         for (ci, hit) in flags.iter().enumerate() {
             if *hit {
-                subscribed_txs[ci].push(tx_hex_string(tx));
+                let tx_hex = tx_hex.get_or_insert_with(|| tx_hex_string(tx));
+                subscribed_txs[ci].push(GoValue::String(tx_hex.clone()));
             }
         }
     }
     for tx in &block.transactions {
+        let mut tx_hex: Option<String> = None;
         let flags = subscribed_clients(server, tx, 0, clients);
         for (ci, hit) in flags.iter().enumerate() {
             if *hit {
-                subscribed_txs[ci].push(tx_hex_string(tx));
+                let tx_hex = tx_hex.get_or_insert_with(|| tx_hex_string(tx));
+                subscribed_txs[ci].push(GoValue::String(tx_hex.clone()));
             }
         }
     }
 
     let mut out = Vec::with_capacity(clients.len());
     for (ci, client) in clients.iter().enumerate() {
-        let txs = if subscribed_txs[ci].is_empty() {
+        let txs = std::mem::take(&mut subscribed_txs[ci]);
+        let txs = if txs.is_empty() {
             GoValue::Null
         } else {
-            GoValue::Array(
-                subscribed_txs[ci]
-                    .iter()
-                    .map(|s| GoValue::String(s.clone()))
-                    .collect(),
-            )
+            GoValue::Array(txs)
         };
         if let Some(marshalled) = marshal_ntfn(
             server,
@@ -950,11 +1012,12 @@ pub fn notify_block_disconnected<C: RpcChain>(
 
 /// Notify work-update clients about a new block template, adding the
 /// template to the pool and pruning it when the parent changed (dcrd
-/// `notifyWork`).
+/// `notifyWork`).  The template is taken by value because the pool keeps
+/// it: dcrd's pool holds the notification's own `*wire.MsgBlock`.
 pub fn notify_work<C: RpcChain>(
     server: &Server<C>,
     clients: &[&mut WsClient],
-    template_block: &MsgBlock,
+    template_block: MsgBlock,
     reason: TemplateUpdateReason,
 ) -> Vec<(u64, String)> {
     if clients.is_empty() {
@@ -962,14 +1025,16 @@ pub fn notify_work<C: RpcChain>(
     }
 
     // Serialize the data that represents work to be solved; the
-    // agenda and serialization failures are log-only.
+    // agenda and serialization failures are only logged.  The agenda
+    // check is the server's, so its internal error is logged first, and
+    // this line then carries that error's `Error()` text, code included.
     let header = template_block.header;
-    let Ok(is_blake3_pow_active) = server
-        .cfg
-        .chain
-        .is_blake3_pow_agenda_active(&header.prev_block)
-    else {
-        return Vec::new();
+    let is_blake3_pow_active = match server.is_blake3_pow_agenda_active(&header.prev_block) {
+        Ok(active) => active,
+        Err(err) => {
+            crate::log::error(&format!("Could not obtain blake3 agenda status: {err}"));
+            return Vec::new();
+        }
     };
     let Ok(data) = crate::helpers::serialize_get_work_data(&header, is_blake3_pow_active) else {
         return Vec::new();
@@ -1001,7 +1066,6 @@ pub fn notify_work<C: RpcChain>(
     let template_key = crate::helpers::get_work_template_key(&header);
     let best_height = (reason == TemplateUpdateReason::NewParent)
         .then(|| server.cfg.chain.best_snapshot().height);
-    let template_block = template_block.clone();
     {
         let mut state = server.work_state.lock().expect("work state poisoned");
         if let Some(best_height) = best_height {
@@ -1163,10 +1227,15 @@ pub fn notify_for_new_tx<C: RpcChain>(
     };
 
     // Determine if the treasury rules are active as of the current
-    // best tip; the failure is log-only.
+    // best tip; the failure is only logged, through the server's check
+    // as dcrd's is, so its internal error is logged first.
     let prev_blk_hash = server.cfg.chain.best_snapshot().hash;
-    let Ok(is_treasury_enabled) = server.cfg.chain.is_treasury_agenda_active(&prev_blk_hash) else {
-        return Vec::new();
+    let is_treasury_enabled = match server.is_treasury_agenda_active(&prev_blk_hash) {
+        Ok(enabled) => enabled,
+        Err(err) => {
+            crate::log::error(&format!("Could not obtain treasury agenda status: {err}"));
+            return Vec::new();
+        }
     };
 
     let mut out = Vec::with_capacity(clients.len());
@@ -1210,7 +1279,9 @@ pub fn notify_for_new_tx<C: RpcChain>(
 }
 
 /// Notify clients whose filters find the transaction relevant,
-/// watching discovered outputs (dcrd `notifyRelevantTxAccepted`).
+/// watching discovered outputs (dcrd `notifyRelevantTxAccepted`).  As
+/// in [`subscribed_clients`], the output addresses and the transaction
+/// hash are computed once for all clients.
 pub fn notify_relevant_tx_accepted<C: RpcChain>(
     server: &Server<C>,
     clients: &mut [&mut WsClient],
@@ -1220,6 +1291,8 @@ pub fn notify_relevant_tx_accepted<C: RpcChain>(
     let params = &server.cfg.chain_params;
     let mut notify = vec![false; clients.len()];
 
+    let mut outputs: Option<Vec<OutputAddrs>> = None; // lazily set
+    let mut tx_hash: Option<Hash> = None; // lazily set
     for (ci, client) in clients.iter_mut().enumerate() {
         let Some(f) = client.filter_data.as_mut() else {
             continue;
@@ -1231,18 +1304,19 @@ pub fn notify_relevant_tx_accepted<C: RpcChain>(
             }
         }
 
-        for (i, output) in tx.tx_out.iter().enumerate() {
-            let (script_type, addrs) =
-                stdscript::extract_addrs(output.version, &output.pk_script, params);
-            if script_type == stdscript::ScriptType::NonStandard {
+        let outputs = outputs.get_or_insert_with(|| output_addrs(tx, params, false));
+        for (i, output) in outputs.iter().enumerate() {
+            // Without ticket commitments every output that is not
+            // nonstandard is a watched address list.
+            let OutputAddrs::Addrs(addrs, _) = output else {
                 continue;
-            }
-            for a in &addrs {
+            };
+            for a in addrs {
                 if f.exists_address(a) {
                     notify[ci] = true;
 
                     let op = OutPoint {
-                        hash: tx.tx_hash(),
+                        hash: *tx_hash.get_or_insert_with(|| tx.tx_hash()),
                         index: i as u32,
                         tree,
                     };
@@ -1281,10 +1355,18 @@ pub fn notify_mix_message<C: RpcChain>(
         return Vec::new();
     }
 
-    // The encode failure is log-only and unreachable for accepted
-    // messages.
-    let Ok(payload_hex) = txresults::message_to_hex(msg, dcroxide_wire::MIX_VERSION) else {
-        return Vec::new();
+    // The encode failure is only logged, and unreachable for accepted
+    // messages.  dcrd encodes here itself rather than through
+    // `messageToHex`, so the failure is this one line, not an internal
+    // error.
+    let payload_hex = match msg.encode_payload(dcroxide_wire::MIX_VERSION) {
+        Ok(payload) => txresults::hex_str(&payload),
+        Err(err) => {
+            crate::log::error(&format!(
+                "Failed to serialize accepted mix message for notification: {err}"
+            ));
+            return Vec::new();
+        }
     };
     let Some(marshalled) = marshal_ntfn(
         server,

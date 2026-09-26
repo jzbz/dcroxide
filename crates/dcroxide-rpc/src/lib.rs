@@ -21,6 +21,7 @@ pub mod help;
 pub mod helpdescs;
 pub mod helpers;
 pub mod http;
+pub mod log;
 pub mod rpcerrors;
 pub mod server;
 pub mod txresults;

@@ -144,25 +144,39 @@ fn join_host_port(host: &str, port: &str) -> String {
     }
 }
 
-/// Go `net.SplitHostPort` success cases (errors keep the original
-/// address exactly as `normalizeAddress` does).
+/// Go `net.SplitHostPort` (`net/ipsock.go`): the same literal port as
+/// dcroxide-node's `gostd::split_host_port`, without the error texts,
+/// since every caller here only tests for failure (`normalizeAddress`
+/// then keeps the original address whole).
 pub(crate) fn split_host_port(hostport: &str) -> Result<(String, String), ()> {
-    if let Some(stripped) = hostport.strip_prefix('[') {
-        let end = stripped.find(']').ok_or(())?;
-        let rest = &stripped[end + 1..];
-        let port = rest.strip_prefix(':').ok_or(())?;
-        if port.contains(':') {
+    let (mut j, mut k) = (0, 0);
+
+    // The port starts after the last colon.
+    let i = hostport.rfind(':').ok_or(())?;
+
+    let host;
+    if hostport.as_bytes()[0] == b'[' {
+        // Expect the first ']' just before the last ':'.  Anything else
+        // is Go's "missing ']'", "missing port" or "too many colons".
+        let end = hostport.find(']').ok_or(())?;
+        if end + 1 != i {
             return Err(());
         }
-        return Ok((stripped[..end].to_string(), port.to_string()));
+        host = &hostport[1..end];
+        // There can't be a '[' resp. ']' before these positions.
+        (j, k) = (1, end + 1);
+    } else {
+        host = &hostport[..i];
+        if host.contains(':') {
+            return Err(());
+        }
     }
-    let colon = hostport.rfind(':').ok_or(())?;
-    let host = &hostport[..colon];
-    let port = &hostport[colon + 1..];
-    if host.contains(':') || hostport.contains('[') || hostport.contains(']') {
+    // Go's "unexpected '['" and "unexpected ']'".
+    if hostport[j..].contains('[') || hostport[k..].contains(']') {
         return Err(());
     }
-    Ok((host.to_string(), port.to_string()))
+
+    Ok((host.to_string(), hostport[i + 1..].to_string()))
 }
 
 /// Decode hash strings that are NOT byte-reversed on top of requiring
@@ -433,6 +447,56 @@ mod tests {
         assert_eq!(text("\u{1}"), "encoding/hex: invalid byte: U+0001");
         assert_eq!(text("\u{7f}"), "encoding/hex: invalid byte: U+007F");
         assert_eq!(text(&"0".repeat(65)), "max hash string length is 64 bytes");
+    }
+
+    /// A bracketed host:port with a second '[' or a stray ']' is Go's
+    /// "unexpected '['" / "unexpected ']'" error (`net/ipsock.go`
+    /// `SplitHostPort`), so `normalizeAddress` keeps the whole string as
+    /// the host and appends the default port.
+    #[test]
+    fn split_host_port_rejects_stray_brackets_after_the_host() {
+        // Every one of these is an error from Go 1.27's SplitHostPort.
+        for bad in [
+            "[a[b]:1",
+            "[a]:1]",
+            "[a]:[1",
+            "[[a]:1",
+            "[::1]:9108]",
+            "[::1]:8[0",
+            "[abc",
+            "a]:80",
+            "a[:80",
+            "[::1]",
+            "[::1]80",
+            "[::1]:80:90",
+            "a:b:80",
+            "abc",
+            "",
+        ] {
+            assert_eq!(split_host_port(bad), Err(()), "{bad}");
+        }
+        for (good, host, port) in [
+            ("[::1]:9108", "::1", "9108"),
+            ("[fe80::1%eth0]:80", "fe80::1%eth0", "80"),
+            ("[]:80", "", "80"),
+            ("host:80", "host", "80"),
+            (":80", "", "80"),
+            ("host:", "host", ""),
+        ] {
+            assert_eq!(
+                split_host_port(good),
+                Ok((host.to_string(), port.to_string())),
+                "{good}"
+            );
+        }
+        assert_eq!(
+            normalize_address(&NoInterfaces, "[a[b]:1", "9108"),
+            "[[a[b]:1]:9108"
+        );
+        assert_eq!(
+            normalize_address(&NoInterfaces, "[a]:1]", "9108"),
+            "[[a]:1]]:9108"
+        );
     }
 
     /// The template pool keeps exactly the templates at or above

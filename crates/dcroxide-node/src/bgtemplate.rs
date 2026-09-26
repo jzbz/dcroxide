@@ -678,7 +678,10 @@ fn drain_and_build(
                 .lock()
                 .expect("subscriber registry poisoned")
                 .broadcast(&template.block);
-            if let Some(ntfn) = &ctx.ntfn {
+            // The copy is only worth making for a connected client.
+            if let Some(ntfn) = &ctx.ntfn
+                && ntfn.has_clients()
+            {
                 ntfn.notify_work(template.block.clone(), map_reason(reason));
             }
         }
@@ -1182,6 +1185,15 @@ impl RpcBlockTemplater for NodeRpcBlockTemplater {
             return Err(err.clone());
         }
         Ok(current.block.clone())
+    }
+
+    fn current_template_err(&self) -> Result<(), String> {
+        // `current_template`'s answer without copying the block out.
+        let current = wait_for_current(&self.current);
+        match &current.err {
+            Some(err) if !current.reorganizing => Err(err.clone()),
+            _ => Ok(()),
+        }
     }
 
     fn subscribe(&self) -> Box<dyn RpcTemplateSubscription + Send> {

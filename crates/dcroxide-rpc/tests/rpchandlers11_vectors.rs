@@ -712,3 +712,149 @@ fn getwork_invocations_serialize() {
             .expect("second getwork result");
     });
 }
+
+/// A templater counting how often a template is copied out of
+/// `current_template`, the call that deep-copies the shared template
+/// in the daemon.
+struct CountingTemplater {
+    /// The template every call returns.
+    block: MsgBlock,
+    /// The error every call reports instead, if set.
+    err: Option<String>,
+    /// How many templates `current_template` has copied out.
+    copies: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl RpcBlockTemplater for CountingTemplater {
+    fn current_template(&self) -> Result<Option<MsgBlock>, String> {
+        if let Some(err) = &self.err {
+            return Err(err.clone());
+        }
+        self.copies
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(self.block.clone()))
+    }
+    fn current_template_err(&self) -> Result<(), String> {
+        match &self.err {
+            Some(err) => Err(err.clone()),
+            None => Ok(()),
+        }
+    }
+    fn subscribe(&self) -> Box<dyn RpcTemplateSubscription + Send> {
+        Box::new(ImmediateSub {
+            block: self.block.clone(),
+        })
+    }
+    fn update_block_time(&self, _header: &mut BlockHeader) {}
+}
+
+/// `getwork`'s first check only wants the template's error, as dcrd's
+/// `if _, err := bt.CurrentTemplate(); err != nil` does, so it asks for
+/// the error alone rather than copying the template out and dropping
+/// it.  A request after a tip change takes its template from the
+/// subscription and copies nothing from `current_template`; a request
+/// with the tip unchanged copies the template once, to use it.  The
+/// error still answers dcrd's "no work is available" text.
+#[test]
+fn getwork_copies_the_template_only_to_use_it() {
+    let params = mainnet_params();
+    let mut registry = Registry::new();
+    register_all(&mut registry);
+
+    let block: MsgBlock = include_str!("data/rpchandlers8_vectors.txt")
+        .lines()
+        .find_map(|line| {
+            let f: Vec<&str> = line.split('|').collect();
+            (f[0] == "blk").then(|| MsgBlock::from_bytes(&unhex(f[1])).unwrap().0)
+        })
+        .expect("block fixture");
+    let mining_addr =
+        dcroxide_txscript::stdaddr::decode_address("DsRah84zx6jdA4nMYboMfLERA5V3KhBr4ru", &params)
+            .unwrap();
+
+    let server_with = |templater: CountingTemplater| {
+        Server::new(Config {
+            chain: MockChain11 {
+                header: block.header,
+                best_hash: block.header.block_hash(),
+                best_height: 0,
+                best_header_height: 0,
+                is_current: true,
+                header_by_hash: Ok(()),
+                blake3: false,
+            },
+            chain_params: params.clone(),
+            subsidy_cache: std::sync::Mutex::new(SubsidyCache::new(params.clone())),
+            min_relay_tx_fee: 10000,
+            max_protocol_version: PROTOCOL_VERSION,
+            sync_mgr: Box::new(MockSyncMgr11 { submit: Ok(()) }),
+            conn_mgr: Box::new(MockConnMgr11 { count: 1 }),
+            client_cert_auth: false,
+            tx_mempooler: Box::new(()),
+            clock: Box::new(()),
+            interfaces: Box::new(NoInterfaces),
+            rand_u64: Box::new(|| 0),
+            tx_indexer: None,
+            db: Box::new(()),
+            filterer_v2: Box::new(()),
+            exists_addresser: None,
+            log_manager: Box::new(()),
+            fee_estimator: Box::new(()),
+            block_templater: Some(Box::new(templater)),
+            sanity_checker: Box::new(()),
+            time_source: Box::new(()),
+            proxy: String::new(),
+            test_net: false,
+            runtime_version: String::new(),
+            cpu_miner: Box::new(MockMiner11 { is_mining: false }),
+            mix_pooler: Box::new(()),
+            profiler_mgr: Box::new(()),
+            addr_manager: Box::new(()),
+            mining_addrs: vec![mining_addr.clone()],
+            user_agent_version: String::new(),
+            net_info: Vec::new(),
+            services: 0,
+            request_shutdown: Box::new(|| {}),
+            allow_unsynced_mining: true,
+            rpc_user: String::new(),
+            rpc_pass: String::new(),
+            rpc_limit_user: String::new(),
+            rpc_limit_pass: String::new(),
+        })
+    };
+    let cmd = GoValue::Struct(
+        parse_params(&registry, &method("getwork"), &[])
+            .expect("parse params")
+            .fields,
+    );
+
+    let copies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server = server_with(CountingTemplater {
+        block: block.clone(),
+        err: None,
+        copies: std::sync::Arc::clone(&copies),
+    });
+    let first = handlers::handle_get_work(&server, &cmd).expect("work after a tip change");
+    assert_eq!(
+        copies.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the tip-change request takes its template from the subscription"
+    );
+    let second = handlers::handle_get_work(&server, &cmd).expect("work on an unchanged tip");
+    assert_eq!(
+        copies.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the unchanged-tip request copies the template once, to use it"
+    );
+    assert_eq!(first, second, "both requests serve the same work");
+
+    let copies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server = server_with(CountingTemplater {
+        block: block.clone(),
+        err: Some("testnet difficulty rule".to_string()),
+        copies: std::sync::Arc::clone(&copies),
+    });
+    let err = handlers::handle_get_work(&server, &cmd).expect_err("a failed template");
+    assert_eq!(err.code, dcroxide_dcrjson::codes::MISC);
+    assert_eq!(err.message, "no work is available: testnet difficulty rule");
+}

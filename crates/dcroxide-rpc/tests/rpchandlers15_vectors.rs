@@ -218,9 +218,21 @@ fn websocket_notifications_match_dcrd() {
                 notify_block_connected(&server, &mut refs, &block)
             }
             "nb: blockdisconnected" => notify_block_disconnected(&server, &refs, &block),
-            "nb: work 0" => notify_work(&server, &refs, &block, TemplateUpdateReason::NewParent),
-            "nb: work 1" => notify_work(&server, &refs, &block, TemplateUpdateReason::NewVotes),
-            "nb: work 2" => notify_work(&server, &refs, &block, TemplateUpdateReason::NewTxns),
+            "nb: work 0" => notify_work(
+                &server,
+                &refs,
+                block.clone(),
+                TemplateUpdateReason::NewParent,
+            ),
+            "nb: work 1" => notify_work(
+                &server,
+                &refs,
+                block.clone(),
+                TemplateUpdateReason::NewVotes,
+            ),
+            "nb: work 2" => {
+                notify_work(&server, &refs, block.clone(), TemplateUpdateReason::NewTxns)
+            }
             "nb: tspend" => notify_tspend(&server, &refs, &tspend),
             "nb: reorganization" => notify_reorganization(
                 &server,

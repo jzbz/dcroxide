@@ -213,7 +213,7 @@ pub fn handle_create_raw_transaction<C: RpcChain>(
     // arbitrary there; entries are processed in JSON order here.
     for (encoded_addr, amount) in map(amounts) {
         let amount = float(amount);
-        let atoms = new_amount(amount).map_err(|e| rpc_internal_err(&e))?;
+        let atoms = new_amount(amount).map_err(|e| rpc_internal_err(&e, "New amount"))?;
 
         // Ensure amount is in the valid range for monetary amounts.
         if atoms <= 0 || atoms > MAX_AMOUNT {
@@ -381,7 +381,7 @@ pub fn handle_create_raw_sstx<C: RpcChain>(
     // Obtain the commitment amounts.
     let (_, amounts_committed) =
         dcroxide_stake::sstx_null_output_amounts(&input_amts, &change_amts, amt_ticket)
-            .map_err(|e| rpc_internal_err(&e.to_string()))?;
+            .map_err(|e| rpc_internal_err(&e.to_string(), "Invalid SSTx output amounts"))?;
 
     for (i, cout) in couts.iter().enumerate() {
         let cout = fields(cout);
@@ -438,7 +438,8 @@ pub fn handle_create_raw_sstx<C: RpcChain>(
     }
 
     // Make sure we generated a valid SStx.
-    dcroxide_stake::check_sstx(&mtx).map_err(|e| rpc_internal_err(&e.to_string()))?;
+    dcroxide_stake::check_sstx(&mtx)
+        .map_err(|e| rpc_internal_err(&e.to_string(), "Invalid SStx"))?;
 
     let mtx_hex = txresults::message_to_hex(&Message::Tx(mtx), server.cfg.max_protocol_version)?;
     Ok(GoValue::String(mtx_hex))
@@ -446,19 +447,10 @@ pub fn handle_create_raw_sstx<C: RpcChain>(
 
 /// Go's hex decoding acceptance for the handler inputs (Go
 /// `hex.DecodeString` succeeds only on full byte pairs of hex
-/// digits).
+/// digits), for the callers that answer every failure with the same
+/// error and so need none of [`go_decode_hex_msg`]'s texts.
 fn go_decode_hex(s: &str) -> Result<Vec<u8>, ()> {
-    if !s.len().is_multiple_of(2) {
-        return Err(());
-    }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for pair in bytes.chunks(2) {
-        let hi = (pair[0] as char).to_digit(16).ok_or(())?;
-        let lo = (pair[1] as char).to_digit(16).ok_or(())?;
-        out.push(((hi << 4) | lo) as u8);
-    }
-    Ok(out)
+    go_decode_hex_msg(s).map_err(|_| ())
 }
 
 /// handledecoderawtransaction (dcrd `handleDecodeRawTransaction`);
@@ -482,14 +474,11 @@ pub fn handle_decode_raw_transaction<C: RpcChain>(
     let serialized_tx = go_decode_hex(hex_str).map_err(|_| rpc_decode_hex_error(hex_str))?;
     // The wire error renders Go's io error or dcrd's `MessageError`
     // text, whichever dcrd's `Deserialize` returns.
-    let (mtx, consumed) = MsgTx::from_bytes(&serialized_tx)
+    //
+    // Bytes after the transaction are ignored: dcrd deserializes from a
+    // `bytes.Reader` and never checks that it was exhausted.
+    let (mtx, _) = MsgTx::from_bytes(&serialized_tx)
         .map_err(|e| rpc_deserialization_error(&format!("Could not decode Tx: {e}")))?;
-    if consumed != serialized_tx.len() {
-        // Go's Deserialize reads from a stream and ignores trailing
-        // bytes only when the reader is exhausted by the message;
-        // extra bytes after a full transaction are ignored by dcrd as
-        // well because it deserializes from a reader.
-    }
 
     // Determine if the treasury rules are active as of the current
     // best tip.
@@ -562,12 +551,18 @@ pub fn handle_decode_script<C: RpcChain>(
     let p2sh = if script_version == 0 {
         stdaddr::new_address_script_hash_v0(&script, params)
             .map(|a| a.to_string())
-            .map_err(|e| rpc_internal_err(&e.to_string()))?
+            .map_err(|e| {
+                rpc_internal_err(
+                    &e.to_string(),
+                    "Failed to convert script to pay-to-script-hash",
+                )
+            })?
     } else {
         // dcrd's version-generic NewAddressScriptHash error text.
-        return Err(rpc_internal_err(&format!(
-            "script hash addresses for version {script_version} are not supported"
-        )));
+        return Err(rpc_internal_err(
+            &format!("script hash addresses for version {script_version} are not supported"),
+            "Failed to convert script to pay-to-script-hash",
+        ));
     };
 
     // Generate and return the reply; the P2SH form is omitted for
@@ -613,11 +608,12 @@ pub fn handle_get_block_subsidy<C: RpcChain>(
     let best = server.cfg.chain.best_snapshot();
     let mut prev_blk_hash = best.hash;
     if height <= best.height {
-        let header = server
-            .cfg
-            .chain
-            .header_by_height(height)
-            .map_err(|e| rpc_internal_err(&e))?;
+        let header = server.cfg.chain.header_by_height(height).map_err(|e| {
+            rpc_internal_err(
+                &e,
+                &format!("Failed to retrieve header for height {height}"),
+            )
+        })?;
         prev_blk_hash = header.prev_block;
     }
     let is_treasury_enabled = server.is_treasury_agenda_active(&prev_blk_hash)?;
@@ -1004,7 +1000,7 @@ fn verbose_block_common<C: RpcChain>(
                 .cfg
                 .chain
                 .block_hash_by_height(height + 1)
-                .map_err(|e| rpc_internal_err(&e))?;
+                .map_err(|e| rpc_internal_err(&e, "No next block"))?;
             next_hash_string = next_hash.to_string();
         }
         confirmations = 1 + best.height - height;
@@ -1058,7 +1054,7 @@ pub fn handle_get_block_header<C: RpcChain>(
         .cfg
         .chain
         .chain_work(&hash)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Failed to retrieve work"))?;
 
     let common = verbose_block_common(server, &hash, &header)?;
 
@@ -1066,7 +1062,7 @@ pub fn handle_get_block_header<C: RpcChain>(
         .cfg
         .chain
         .median_time_by_hash(&hash)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Unable to retrieve median block time"))?;
 
     Ok(GoValue::Struct(vec![
         GoValue::String(hash_str.to_string()),
@@ -1117,22 +1113,28 @@ pub fn handle_get_block<C: RpcChain>(
     let hash: Hash = hash_str
         .parse()
         .map_err(|_| rpc_decode_hex_error(hash_str))?;
-    let block =
-        server.cfg.chain.block_by_hash(&hash).map_err(|_| {
-            RPCError::new(codes::BLOCK_NOT_FOUND, &format!("Block not found: {hash}"))
-        })?;
+    let not_found = |_| RPCError::new(codes::BLOCK_NOT_FOUND, &format!("Block not found: {hash}"));
 
     // When the verbose flag isn't set, simply return the
-    // network-serialized block as a hex-encoded string.
+    // network-serialized block as a hex-encoded string.  dcrd hex-encodes
+    // `blk.Bytes()`, the bytes the block was read from, so the bytes are
+    // fetched as they are rather than decoded into a block only to be
+    // serialized again.
     if let Some(false) = verbose {
-        return Ok(GoValue::String(hex_str(&block.serialize())));
+        let block_bytes = server
+            .cfg
+            .chain
+            .block_bytes_by_hash(&hash)
+            .map_err(not_found)?;
+        return Ok(GoValue::String(hex_str(&block_bytes)));
     }
+    let block = server.cfg.chain.block_by_hash(&hash).map_err(not_found)?;
 
     let chain_work = server
         .cfg
         .chain
         .chain_work(&hash)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Failed to retrieve work"))?;
 
     let header = block.header;
     let common = verbose_block_common(server, &hash, &header)?;
@@ -1143,7 +1145,7 @@ pub fn handle_get_block<C: RpcChain>(
         .cfg
         .chain
         .median_time_by_hash(&hash)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Unable to retrieve median block time"))?;
 
     // Determine if the treasury rules are active for the block.
     let is_treasury_enabled = server.is_treasury_agenda_active(&header.prev_block)?;
@@ -1168,25 +1170,30 @@ pub fn handle_get_block<C: RpcChain>(
         raw_stx = GoValue::Null;
     } else {
         let block_hash_str = block.header.block_hash().to_string();
-        let build = |txns: &[MsgTx]| -> Result<GoValue, RPCError> {
+        // dcrd wraps a failed result in a second internal error, so the
+        // client sees the first one's `Error()` text, code included.
+        let build = |txns: &[MsgTx], context: &str| -> Result<GoValue, RPCError> {
             let mut raw = Vec::with_capacity(txns.len());
             for (i, t) in txns.iter().enumerate() {
-                raw.push(txresults::create_tx_raw_result(
-                    &server.cfg.chain_params,
-                    t,
-                    &t.tx_hash().to_string(),
-                    i as u32,
-                    Some(&header),
-                    &block_hash_str,
-                    i64::from(header.height),
-                    common.confirmations,
-                    is_treasury_enabled,
-                )?);
+                raw.push(
+                    txresults::create_tx_raw_result(
+                        &server.cfg.chain_params,
+                        t,
+                        &t.tx_hash().to_string(),
+                        i as u32,
+                        Some(&header),
+                        &block_hash_str,
+                        i64::from(header.height),
+                        common.confirmations,
+                        is_treasury_enabled,
+                    )
+                    .map_err(|e| rpc_internal_err(&e.to_string(), context))?,
+                );
             }
             Ok(GoValue::Array(raw))
         };
-        raw_tx = build(&block.transactions)?;
-        raw_stx = build(&block.stransactions)?;
+        raw_tx = build(&block.transactions, "Could not create transaction")?;
+        raw_stx = build(&block.stransactions, "Could not create stake transaction")?;
         tx = GoValue::Null;
         stx = GoValue::Null;
     }
@@ -1241,7 +1248,7 @@ pub fn handle_get_blockchain_info<C: RpcChain>(
         .cfg
         .chain
         .chain_work(&best.hash)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Could not fetch chain work"))?;
 
     // Estimate the verification progress of the node.
     let mut verify_progress = 0.0f64;
@@ -1260,7 +1267,7 @@ pub fn handle_get_blockchain_info<C: RpcChain>(
             .cfg
             .chain
             .max_block_size(&best.prev_hash)
-            .map_err(|e| rpc_internal_err(&e))?;
+            .map_err(|e| rpc_internal_err(&e, "Could not fetch max block size"))?;
     }
 
     // Fetch the agendas of the consensus deployments as well as their
@@ -1281,13 +1288,29 @@ pub fn handle_get_blockchain_info<C: RpcChain>(
                     .cfg
                     .chain
                     .next_threshold_state(&best.prev_hash, agenda.vote.id)
-                    .map_err(|e| rpc_internal_err(&e))?;
+                    .map_err(|e| {
+                        rpc_internal_err(
+                            &e,
+                            &format!(
+                                "Could not fetch threshold state for agenda with id ({})",
+                                agenda.vote.id
+                            ),
+                        )
+                    })?;
 
                 since = server
                     .cfg
                     .chain
                     .state_last_changed_height(&best.hash, agenda.vote.id)
-                    .map_err(|e| rpc_internal_err(&e))?;
+                    .map_err(|e| {
+                        rpc_internal_err(
+                            &e,
+                            &format!(
+                                "Could not fetch state last changed height for agenda with id ({})",
+                                agenda.vote.id
+                            ),
+                        )
+                    })?;
             }
 
             d_info.push((
@@ -1356,12 +1379,12 @@ pub fn handle_estimate_stake_diff<C: RpcChain>(
         .cfg
         .chain
         .estimate_next_stake_difficulty(&best.hash, 0, false)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Could not estimate next minimum stake difficulty"))?;
     let max = server
         .cfg
         .chain
         .estimate_next_stake_difficulty(&best.hash, 0, true)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Could not estimate next maximum stake difficulty"))?;
 
     // The expected stake difficulty.  Average the number of fresh
     // stake since the last retarget to get the number of tickets per
@@ -1378,7 +1401,7 @@ pub fn handle_estimate_stake_diff<C: RpcChain>(
             .cfg
             .chain
             .header_by_height(i)
-            .map_err(|e| rpc_internal_err(&e))?;
+            .map_err(|e| rpc_internal_err(&e, "Could not estimate next stake difficulty"))?;
         total_tickets += i64::from(bh.fresh_stake);
     }
     let blocks_since = (best_height - last_adjustment + 1) as f64;
@@ -1389,7 +1412,7 @@ pub fn handle_estimate_stake_diff<C: RpcChain>(
         .cfg
         .chain
         .estimate_next_stake_difficulty(&best.hash, expected_tickets, false)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Could not estimate next stake difficulty"))?;
 
     // User-specified stake difficulty, if they asked for one.
     let mut user = GoValue::Null;
@@ -1398,7 +1421,12 @@ pub fn handle_estimate_stake_diff<C: RpcChain>(
             .cfg
             .chain
             .estimate_next_stake_difficulty(&best.hash, tickets as i64, false)
-            .map_err(|e| rpc_internal_err(&e))?;
+            .map_err(|e| {
+                rpc_internal_err(
+                    &e,
+                    "Could not estimate next user specified stake difficulty",
+                )
+            })?;
         user = GoValue::Float64(txresults::to_coin(user_est));
     }
 
@@ -1457,6 +1485,7 @@ pub fn handle_get_stake_difficulty<C: RpcChain>(
         .chain
         .header_by_height(best.height)
         .map_err(|e| {
+            crate::log::error(&format!("Error getting block: {e}"));
             RPCError::new(
                 codes::DIFFICULTY,
                 &format!("Error getting stake difficulty: {e}"),
@@ -1526,7 +1555,12 @@ pub fn handle_get_stake_version_info<C: RpcChain>(
             .cfg
             .chain
             .get_stake_versions(&hash, num_blocks + adjust)
-            .map_err(|e| rpc_internal_err(&e))?;
+            .map_err(|e| {
+                rpc_internal_err(
+                    &e,
+                    &format!("Failed to get stake versions starting from hash {hash}"),
+                )
+            })?;
 
         let mut pos_versions = std::collections::HashMap::new();
         let mut vote_versions = std::collections::HashMap::new();
@@ -1553,7 +1587,12 @@ pub fn handle_get_stake_version_info<C: RpcChain>(
             .cfg
             .chain
             .block_hash_by_height(start_height - 1)
-            .map_err(|e| rpc_internal_err(&e))?;
+            .map_err(|e| {
+                rpc_internal_err(
+                    &e,
+                    &format!("Failed to get block hash for height {}", start_height - 1),
+                )
+            })?;
     }
 
     Ok(GoValue::Struct(vec![
@@ -1584,7 +1623,7 @@ pub fn handle_get_stake_versions<C: RpcChain>(
         .cfg
         .chain
         .get_stake_versions(&hash, count as i32)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Could not obtain stake versions"))?;
 
     let stake_versions: Vec<GoValue> = sv
         .iter()
@@ -1635,7 +1674,7 @@ pub fn handle_get_vote_info<C: RpcChain>(
             if failure.is_unknown_deployment_version {
                 return rpc_invalid_error(&format!("{version}: unrecognized vote version"));
             }
-            rpc_internal_err(&failure.message)
+            rpc_internal_err(&failure.message, "Could not obtain vote info")
         })?;
 
     let start_height = server.cfg.chain.calc_want_height(interval, snapshot.height) + 1;
@@ -1646,7 +1685,7 @@ pub fn handle_get_vote_info<C: RpcChain>(
         .cfg
         .chain
         .count_vote_version(version)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Could not count voter versions"))?;
 
     let mut result_agendas = Vec::with_capacity(agendas.len());
     for agenda in &agendas {
@@ -1655,7 +1694,7 @@ pub fn handle_get_vote_info<C: RpcChain>(
             .cfg
             .chain
             .next_threshold_state(&snapshot.hash, agenda.vote.id)
-            .map_err(|e| rpc_internal_err(&e))?;
+            .map_err(|e| rpc_internal_err(&e, "Could not fetch next threshold state"))?;
 
         let mut quorum_progress = 0.0f64;
         let mut choice_counts: Vec<u32> = vec![0; agenda.vote.choices.len()];
@@ -1665,7 +1704,7 @@ pub fn handle_get_vote_info<C: RpcChain>(
                 .cfg
                 .chain
                 .get_vote_counts(version, agenda.vote.id)
-                .map_err(|e| rpc_internal_err(&e))?;
+                .map_err(|e| rpc_internal_err(&e, "Could not obtain vote count"))?;
 
             // Calculate quorum.
             let mut qmin = quorum;
@@ -1733,7 +1772,7 @@ pub fn handle_get_ticket_pool_value<C: RpcChain>(
         .cfg
         .chain
         .ticket_pool_value()
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Could not obtain ticket pool value"))?;
     Ok(GoValue::Float64(txresults::to_coin(amt)))
 }
 
@@ -1774,7 +1813,7 @@ pub fn handle_get_treasury_balance<C: RpcChain>(
                     &format!("Treasury inactive for block {hash}"),
                 );
             }
-            rpc_internal_err(&failure.message)
+            rpc_internal_err(&failure.message, "Failed to obtain treasury balance")
         })?;
 
     let updates = if matches!(verbose, Some(true)) {
@@ -1806,7 +1845,7 @@ pub fn handle_live_tickets<C: RpcChain>(
         .cfg
         .chain
         .live_tickets()
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Could not get live tickets"))?;
     Ok(GoValue::Struct(vec![GoValue::Array(
         lt.iter().map(|h| GoValue::String(h.to_string())).collect(),
     )]))
@@ -1864,7 +1903,7 @@ fn connect_error(sub_cmd: &str, addr: &str, err: &str) -> RPCError {
         crate::server::CONNECT_DEADLINE_EXCEEDED => {
             crate::rpcerrors::rpc_cancel_error(&format!("{sub_cmd}: timeout connecting to {addr}"))
         }
-        _ => rpc_internal_err(err),
+        _ => rpc_internal_err(err, &format!("{sub_cmd}: failed operation on {addr}")),
     }
 }
 
@@ -2132,11 +2171,10 @@ pub fn handle_exists_mempool_txs<C: RpcChain>(
 
     let exists = server.cfg.tx_mempooler.have_transactions(&hashes);
     if exists.len() != hashes.len() {
-        return Err(rpc_internal_err(&format!(
-            "got {}, want {}",
-            exists.len(),
-            hashes.len()
-        )));
+        return Err(rpc_internal_err(
+            &format!("got {}, want {}", exists.len(), hashes.len()),
+            "Invalid mempool Tx ticket count",
+        ));
     }
 
     Ok(GoValue::String(hex_str(&bitset_bytes(&exists))))
@@ -2167,32 +2205,37 @@ pub fn handle_get_raw_transaction<C: RpcChain>(
                 return Err(rpc_internal_err(
                     "the transaction index must be enabled to query the \
                      blockchain (specify --txindex)",
+                    "Configuration",
                 ));
             };
 
             // Ensure the tx index is synced.
-            let (t_height, t_hash) = tx_index.tip().map_err(|e| rpc_internal_err(&e))?;
+            let (t_height, t_hash) = tx_index.tip().map_err(|e| rpc_internal_err(&e, "Tip"))?;
 
             // Return an out-of-sync error if the index is lagging a
             // maximum reorg depth (6) blocks or more from the chain
             // tip.
             let index_name = tx_index.name();
             if server.cfg.chain.best_snapshot().height > t_height + 5 {
-                return Err(rpc_internal_err(&format!("{index_name}: index not synced")));
+                return Err(rpc_internal_err(
+                    &format!("{index_name}: index not synced"),
+                    "Sync",
+                ));
             }
 
             // Wait for the index to catch up to the current best tip,
             // failing after dcrd's three second timeout.
-            if server.cfg.chain.best_snapshot().hash != t_hash {
-                let tx_index = server.cfg.tx_indexer.as_ref().expect("checked above");
-                if !tx_index.wait_for_sync() {
-                    return Err(rpc_internal_err(&format!("{index_name}: index not synced")));
-                }
+            if server.cfg.chain.best_snapshot().hash != t_hash && !tx_index.wait_for_sync() {
+                return Err(rpc_internal_err(
+                    &format!("{index_name}: index not synced"),
+                    "Sync",
+                ));
             }
 
             // Look up the location of the transaction.
-            let tx_index = server.cfg.tx_indexer.as_ref().expect("checked above");
-            let idx_entry = tx_index.entry(&tx_hash).map_err(|e| rpc_internal_err(&e))?;
+            let idx_entry = tx_index
+                .entry(&tx_hash)
+                .map_err(|e| rpc_internal_err(&e, "Failed to retrieve transaction location"))?;
             let Some(idx_entry) = idx_entry else {
                 return Err(crate::rpcerrors::rpc_no_tx_info_error(&tx_hash));
             };
@@ -2218,14 +2261,15 @@ pub fn handle_get_raw_transaction<C: RpcChain>(
                 .cfg
                 .chain
                 .block_height_by_hash(&idx_entry.block_hash)
-                .map_err(|e| rpc_internal_err(&e))?;
+                .map_err(|e| rpc_internal_err(&e, "Failed to retrieve block height"))?;
             blk_index = idx_entry.block_index;
 
             // Deserialize the transaction.  The message is Go's
             // `err.Error()`, which the wire error renders (io.ErrUnexpectedEOF's
             // "unexpected EOF" for truncation).
-            let (msg_tx, _) =
-                MsgTx::from_bytes(&tx_bytes).map_err(|e| rpc_internal_err(&e.to_string()))?;
+            let (msg_tx, _) = MsgTx::from_bytes(&tx_bytes).map_err(|e| {
+                rpc_internal_err(&e.to_string(), "Failed to deserialize transaction")
+            })?;
             msg_tx
         }
         Ok((tx, _tree)) => {
@@ -2253,7 +2297,7 @@ pub fn handle_get_raw_transaction<C: RpcChain>(
             .cfg
             .chain
             .header_by_hash(&blk_hash)
-            .map_err(|e| rpc_internal_err(&e))?;
+            .map_err(|e| rpc_internal_err(&e, "Failed to fetch block header"))?;
 
         prev_blk_hash = header.prev_block;
         blk_header = Some(header);
@@ -2268,8 +2312,12 @@ pub fn handle_get_raw_transaction<C: RpcChain>(
 
     // Determine if the treasury rules are active as of either the
     // block that contains the transaction or the current best tip when
-    // it is in the mempool.
-    let is_treasury_enabled = server.is_treasury_agenda_active(&prev_blk_hash)?;
+    // it is in the mempool.  dcrd wraps the helper's RPC error in a
+    // second internal error here, so the message the client sees is the
+    // first one's `Error()` text, code included, and both are logged.
+    let is_treasury_enabled = server
+        .is_treasury_agenda_active(&prev_blk_hash)
+        .map_err(|e| rpc_internal_err(&e.to_string(), "Treasury Status"))?;
 
     txresults::create_tx_raw_result(
         &server.cfg.chain_params,
@@ -2350,7 +2398,7 @@ pub fn handle_get_tx_out<C: RpcChain>(
             .cfg
             .chain
             .fetch_utxo_entry(&tx_hash, vout, tree)
-            .map_err(|e| rpc_internal_err(&e))?;
+            .map_err(|e| rpc_internal_err(&e, "Failed to retrieve utxo entry"))?;
 
         // To match the behavior of the reference client, return nil
         // (JSON null) if the transaction output could not be found
@@ -2423,7 +2471,7 @@ pub fn handle_get_tx_out_set_info<C: RpcChain>(
         .cfg
         .chain
         .fetch_utxo_stats()
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, ""))?;
 
     Ok(GoValue::Struct(vec![
         GoValue::Int(best.height),
@@ -2456,7 +2504,10 @@ pub fn handle_get_cfilter_v2<C: RpcChain>(
             if failure.is_no_filter {
                 return RPCError::new(codes::BLOCK_NOT_FOUND, &format!("Block not found: {hash}"));
             }
-            rpc_internal_err(&failure.message)
+            rpc_internal_err(
+                &failure.message,
+                &format!("Failed to load filter for block {hash}"),
+            )
         })?;
 
     // dcrd allocates a zero-length proof hash slice and assigns into
@@ -2552,7 +2603,7 @@ pub fn handle_get_added_node_info<C: RpcChain>(
             }
         }
         let Some(i) = found else {
-            return Err(rpc_internal_err("node not found"));
+            return Err(rpc_internal_err("node not found", ""));
         };
         peers = vec![peers[i].clone()];
     }
@@ -2611,22 +2662,35 @@ pub fn handle_get_added_node_info<C: RpcChain>(
 }
 
 /// The exists-address index sync gauntlet shared by the two exists
-/// handlers (mirrors the tx index handling).
-fn exists_addr_index_synced<C: RpcChain>(server: &Server<C>) -> Result<(), RPCError> {
+/// handlers (mirrors the tx index handling).  `tip_context` is the log
+/// context of a failed tip read, which dcrd words differently in each
+/// handler.
+fn exists_addr_index_synced<C: RpcChain>(
+    server: &Server<C>,
+    tip_context: &str,
+) -> Result<(), RPCError> {
     let addresser = server.cfg.exists_addresser.as_ref().expect("checked");
-    let (t_height, t_hash) = addresser.tip().map_err(|e| rpc_internal_err(&e))?;
+    let (t_height, t_hash) = addresser
+        .tip()
+        .map_err(|e| rpc_internal_err(&e, tip_context))?;
     let index_name = addresser.name();
 
     // Return an out-of-sync error if the index is lagging a maximum
     // reorg depth (6) blocks or more from the chain tip.
     if server.cfg.chain.best_snapshot().height > t_height + 5 {
-        return Err(rpc_internal_err(&format!("{index_name}: index not synced")));
+        return Err(rpc_internal_err(
+            &format!("{index_name}: index not synced"),
+            "Sync",
+        ));
     }
 
     if server.cfg.chain.best_snapshot().hash != t_hash {
         let addresser = server.cfg.exists_addresser.as_ref().expect("checked");
         if !addresser.wait_for_sync() {
-            return Err(rpc_internal_err(&format!("{index_name}: index not synced")));
+            return Err(rpc_internal_err(
+                &format!("{index_name}: index not synced"),
+                "Sync",
+            ));
         }
     }
     Ok(())
@@ -2638,7 +2702,10 @@ pub fn handle_exists_address<C: RpcChain>(
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     if server.cfg.exists_addresser.is_none() {
-        return Err(rpc_internal_err("exists address index disabled"));
+        return Err(rpc_internal_err(
+            "exists address index disabled",
+            "Configuration",
+        ));
     }
 
     let c = fields(cmd);
@@ -2651,7 +2718,7 @@ pub fn handle_exists_address<C: RpcChain>(
         .map_err(|e| rpc_address_key_error(&format!("Could not decode address: {e}")))?;
 
     // Ensure the exists address index is synced.
-    exists_addr_index_synced(server)?;
+    exists_addr_index_synced(server, "Exists address index tip")?;
 
     let addresser = server.cfg.exists_addresser.as_ref().expect("checked");
     let exists = addresser
@@ -2668,7 +2735,10 @@ pub fn handle_exists_addresses<C: RpcChain>(
     cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     if server.cfg.exists_addresser.is_none() {
-        return Err(rpc_internal_err("exists address index disabled"));
+        return Err(rpc_internal_err(
+            "exists address index disabled",
+            "Configuration",
+        ));
     }
 
     let c = fields(cmd);
@@ -2681,7 +2751,7 @@ pub fn handle_exists_addresses<C: RpcChain>(
     }
 
     // Ensure the exists address index is synced.
-    exists_addr_index_synced(server)?;
+    exists_addr_index_synced(server, "Tip")?;
 
     let addresser = server.cfg.exists_addresser.as_ref().expect("checked");
     let exists = addresser
@@ -2717,7 +2787,7 @@ pub fn handle_tickets_for_address<C: RpcChain>(
         .cfg
         .chain
         .tickets_with_address(&addr)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Could not obtain tickets"))?;
 
     Ok(GoValue::Struct(vec![GoValue::Array(
         tickets
@@ -2787,8 +2857,12 @@ pub fn handle_send_raw_transaction<C: RpcChain>(
         {
             Ok(accepted) => accepted,
             Err(failure) => {
+                // A rule error means the transaction was simply rejected,
+                // so it is logged at debug; anything else really went
+                // wrong and is logged as an error.
                 if failure.is_rule_error {
                     let msg = format!("rejected transaction {tx_hash}: {}", failure.message);
+                    crate::log::debug(&msg);
 
                     // Use the duplicate tx error code when the transaction
                     // is known to already be submitted to the mempool, as
@@ -2803,10 +2877,12 @@ pub fn handle_send_raw_transaction<C: RpcChain>(
                     return Err(crate::rpcerrors::rpc_rule_error(&msg));
                 }
 
-                return Err(rpc_deserialization_error(&format!(
-                    "rejected: failed to process transaction {tx_hash}: {}",
+                let err = format!(
+                    "failed to process transaction {tx_hash}: {}",
                     failure.message
-                )));
+                );
+                crate::log::error(&err);
+                return Err(rpc_deserialization_error(&format!("rejected: {err}")));
             }
         };
 
@@ -2850,7 +2926,8 @@ pub fn handle_submit_block<C: RpcChain>(
     } else {
         hex_block
     };
-    let serialized_block = go_decode_hex_msg(hex_str).map_err(|e| rpc_internal_err(&e))?;
+    let serialized_block =
+        go_decode_hex_msg(hex_str).map_err(|e| rpc_internal_err(&e, "Block decode"))?;
     // Bytes past the block are ignored.  dcrd's `NewBlockFromBytes`
     // keeps the whole submission as the block's serialized bytes, so
     // it stores them and getblock's raw hex echoes them back; the port
@@ -2859,13 +2936,17 @@ pub fn handle_submit_block<C: RpcChain>(
     // them a re-serialized `MsgBlock` too.
     let block = match MsgBlock::from_bytes(&serialized_block) {
         Ok((block, _)) => block,
-        Err(e) => return Err(rpc_internal_err(&e.to_string())),
+        Err(e) => return Err(rpc_internal_err(&e.to_string(), "Block decode")),
     };
 
     if let Err(failure) = server.cfg.sync_mgr.submit_block(&block) {
         return Ok(GoValue::String(format!("rejected: {}", failure.message)));
     }
 
+    crate::log::info(&format!(
+        "Accepted block {} via submitblock",
+        block.header.block_hash()
+    ));
     Ok(GoValue::Null)
 }
 
@@ -2892,7 +2973,10 @@ pub fn handle_invalidate_block<C: RpcChain>(
             if failure.is_invalidate_genesis {
                 return rpc_invalid_error(&failure.message);
             }
-            rpc_internal_err(&failure.message)
+            rpc_internal_err(
+                &failure.message,
+                &format!("Failed to invalidate block {hash}"),
+            )
         })?;
 
     Ok(GoValue::Null)
@@ -2932,7 +3016,10 @@ pub fn handle_reconsider_block<C: RpcChain>(
             }
 
             // Fall back to an internal error.
-            rpc_internal_err(&failure.message)
+            rpc_internal_err(
+                &failure.message,
+                &format!("Error while reconsidering block {hash}"),
+            )
         })?;
 
     Ok(GoValue::Null)
@@ -2945,7 +3032,7 @@ pub fn handle_regen_template<C: RpcChain>(
     _cmd: &GoValue,
 ) -> Result<GoValue, RPCError> {
     let Some(bt) = server.cfg.block_templater.as_ref() else {
-        return Err(rpc_internal_err("node is not configured for mining"));
+        return Err(rpc_internal_err("node is not configured for mining", ""));
     };
     bt.force_regen();
     Ok(GoValue::Null)
@@ -3002,7 +3089,7 @@ pub fn handle_estimate_smart_fee<C: RpcChain>(
         .cfg
         .fee_estimator
         .estimate_fee(confirmations as i32)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Could not estimate fee"))?;
 
     Ok(GoValue::Struct(vec![
         GoValue::Float64(txresults::to_coin(fee)),
@@ -3219,7 +3306,8 @@ fn fee_info_blocks_past_genesis<C: RpcChain>(
     tx_type: dcroxide_stake::TxType,
 ) -> Result<(), RPCError> {
     if end < -1 {
-        ticket_fee_info_for_block(server, -1, tx_type).map_err(|e| rpc_internal_err(&e))?;
+        ticket_fee_info_for_block(server, -1, tx_type)
+            .map_err(|e| rpc_internal_err(&e, "Could not obtain ticket fee info"))?;
     }
     Ok(())
 }
@@ -3282,7 +3370,7 @@ pub fn handle_ticket_fee_info<C: RpcChain>(
         let mut i = start;
         while i > end {
             let stats = ticket_fee_info_for_block(server, i, dcroxide_stake::TxType::SStx)
-                .map_err(|e| rpc_internal_err(&e))?;
+                .map_err(|e| rpc_internal_err(&e, "Could not obtain ticket fee info"))?;
             let mut item = vec![GoValue::Uint(i as u32 as u64)];
             item.extend(stats.tail_fields());
             items.push(GoValue::Struct(item));
@@ -3304,7 +3392,7 @@ pub fn handle_ticket_fee_info<C: RpcChain>(
                            end: i64|
          -> Result<(), RPCError> {
             let stats = ticket_fee_info_for_range(server, start, end, dcroxide_stake::TxType::SStx)
-                .map_err(|e| rpc_internal_err(&e))?;
+                .map_err(|e| rpc_internal_err(&e, "Could not obtain ticket fee info"))?;
             let mut item = vec![
                 GoValue::Uint(start as u32 as u64),
                 GoValue::Uint(end as u32 as u64),
@@ -3386,7 +3474,7 @@ pub fn handle_ticket_vwap<C: RpcChain>(
             .cfg
             .chain
             .header_by_height(i64::from(i))
-            .map_err(|e| rpc_internal_err(&e))?;
+            .map_err(|e| rpc_internal_err(&e, "Could not obtain header"))?;
 
         ticket_num += i64::from(block_header.fresh_stake);
         total_value += block_header.sbits * i64::from(block_header.fresh_stake);
@@ -3423,7 +3511,7 @@ pub fn handle_tx_fee_info<C: RpcChain>(
         let mut i = start;
         while i > end {
             let stats = ticket_fee_info_for_block(server, i, dcroxide_stake::TxType::Regular)
-                .map_err(|e| rpc_internal_err(&e))?;
+                .map_err(|e| rpc_internal_err(&e, "Could not obtain ticket fee info"))?;
             let mut item = vec![GoValue::Uint(i as u32 as u64)];
             item.extend(stats.tail_fields());
             items.push(GoValue::Struct(item));
@@ -3466,7 +3554,7 @@ pub fn handle_tx_fee_info<C: RpcChain>(
         i64::from(end.wrapping_add(1)),
         dcroxide_stake::TxType::Regular,
     )
-    .map_err(|e| rpc_internal_err(&e))?;
+    .map_err(|e| rpc_internal_err(&e, "Could not obtain ticket fee info"))?;
 
     let mut mempool_item = Vec::new();
     mempool_item.extend(fee_info_mempool.tail_fields());
@@ -3485,11 +3573,19 @@ fn verify_chain<C: RpcChain>(server: &Server<C>, level: i64, depth: i64) -> Resu
     if finish_height < 0 {
         finish_height = 0;
     }
+    crate::log::info(&format!(
+        "Verifying chain for {} blocks at level {level}",
+        best.height - finish_height
+    ));
 
     let mut height = best.height;
     while height > finish_height {
         // Level 0 just looks up the block.
-        let block = server.cfg.chain.block_by_height(height).map_err(|_| ())?;
+        let block = server.cfg.chain.block_by_height(height).map_err(|err| {
+            crate::log::error(&format!(
+                "Verify is unable to fetch block at height {height}: {err}"
+            ));
+        })?;
 
         // Level 1 does basic chain sanity checks.
         if level > 0 {
@@ -3497,10 +3593,16 @@ fn verify_chain<C: RpcChain>(server: &Server<C>, level: i64, depth: i64) -> Resu
                 .cfg
                 .sanity_checker
                 .check_block_sanity(&block)
-                .map_err(|_| ())?;
+                .map_err(|err| {
+                    crate::log::error(&format!(
+                        "Verify is unable to validate block at hash {} height {height}: {err}",
+                        block.header.block_hash()
+                    ));
+                })?;
         }
         height -= 1;
     }
+    crate::log::info("Chain verify completed successfully");
     Ok(())
 }
 
@@ -3653,7 +3755,7 @@ pub fn handle_create_raw_ssrtx<C: RpcChain>(
     // The sstx pubkeyhashes and amounts as found in the transaction
     // outputs.
     let Some(minimal_outputs) = ticket_utxo.ticket_minimal_outputs else {
-        return Err(rpc_internal_err("missing ticket minimal outputs"));
+        return Err(rpc_internal_err("missing ticket minimal outputs", ""));
     };
 
     // The input amount must be the ticket submission amount.
@@ -3710,7 +3812,8 @@ pub fn handle_create_raw_ssrtx<C: RpcChain>(
     .map_err(|e| rpc_invalid_error(&format!("Invalid SSRtx: {e}")))?;
 
     // Check to make sure our SSRtx was created correctly.
-    dcroxide_stake::check_ssrtx(&mtx).map_err(|e| rpc_internal_err(&e.to_string()))?;
+    dcroxide_stake::check_ssrtx(&mtx)
+        .map_err(|e| rpc_internal_err(&e.to_string(), "Invalid SSRtx"))?;
 
     // Return the serialized and hex-encoded transaction.
     let mtx_hex = txresults::message_to_hex(&Message::Tx(mtx), server.cfg.max_protocol_version)?;
@@ -3728,6 +3831,7 @@ pub fn handle_generate<C: RpcChain>(
     if server.cfg.mining_addrs.is_empty() {
         return Err(rpc_internal_err(
             "no payment addresses specified via --miningaddr",
+            "Configuration",
         ));
     }
 
@@ -3760,7 +3864,12 @@ pub fn handle_generate<C: RpcChain>(
                 failure.message
             )));
         }
-        Err(failure) => return Err(rpc_internal_err(&failure.message)),
+        Err(failure) => {
+            return Err(rpc_internal_err(
+                &failure.message,
+                "Failed to generate the requested number of blocks",
+            ));
+        }
     };
     if block_hashes.is_empty() {
         return Ok(GoValue::Null);
@@ -3818,6 +3927,7 @@ pub fn handle_set_generate<C: RpcChain>(
         if server.cfg.mining_addrs.is_empty() {
             return Err(rpc_internal_err(
                 "no payment addresses specified via --miningaddr",
+                "Configuration",
             ));
         }
 
@@ -3861,6 +3971,9 @@ pub fn handle_get_network_hash_ps<C: RpcChain>(
     if start_height < 0 {
         start_height = 0;
     }
+    crate::log::debug(&format!(
+        "Calculating network hashes per second from {start_height} to {end_height}"
+    ));
 
     // Find the min and max block timestamps as well as calculate the
     // total amount of work that happened between the start and end
@@ -3874,12 +3987,12 @@ pub fn handle_get_network_hash_ps<C: RpcChain>(
             .cfg
             .chain
             .block_hash_by_height(cur_height)
-            .map_err(|e| rpc_internal_err(&e))?;
+            .map_err(|e| rpc_internal_err(&e, "Failed to fetch block hash"))?;
         let header = server
             .cfg
             .chain
             .header_by_hash(&hash)
-            .map_err(|e| rpc_internal_err(&e))?;
+            .map_err(|e| rpc_internal_err(&e, "Failed to fetch block header"))?;
 
         if cur_height == start_height {
             min_timestamp = header.timestamp;
@@ -4169,6 +4282,7 @@ pub fn handle_start_profiler<C: RpcChain>(
     if listeners.is_empty() {
         return Err(rpc_internal_err(
             "profile server started without active listeners",
+            "",
         ));
     }
 
@@ -4194,7 +4308,7 @@ pub fn handle_stop_profiler<C: RpcChain>(
         .cfg
         .profiler_mgr
         .stop()
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "unexpected error when stopping profile server"))?;
 
     Ok(GoValue::String("profile server stopped".to_string()))
 }
@@ -4288,11 +4402,9 @@ pub fn handle_get_treasury_spend_votes<C: RpcChain>(
 
                 // TSpend exists mined in at least one block.  Fetch
                 // the first one and extract the tspend.
-                let full_block = server
-                    .cfg
-                    .chain
-                    .block_by_hash(&blocks[0])
-                    .map_err(|e| rpc_internal_err(&e))?;
+                let full_block = server.cfg.chain.block_by_hash(&blocks[0]).map_err(|e| {
+                    rpc_internal_err(&e, "Block containing mined treasury spend not found")
+                })?;
 
                 // TSpends live in the stake tree.  dcrd dereferences a
                 // nil error when the block does not contain the
@@ -4323,7 +4435,7 @@ pub fn handle_get_treasury_spend_votes<C: RpcChain>(
                         .cfg
                         .chain
                         .header_by_hash(block_hash)
-                        .map_err(|e| rpc_internal_err(&e))?;
+                        .map_err(|e| rpc_internal_err(&e, "Block without associated header"))?;
 
                     // Count votes only up to the block before the
                     // tspend was mined.
@@ -4338,11 +4450,14 @@ pub fn handle_get_treasury_spend_votes<C: RpcChain>(
         _ => {
             // Fetch vote counts for all mempool tspends.
             for hash in server.cfg.tx_mempooler.tspend_hashes() {
-                let (tx, _tree) = server
-                    .cfg
-                    .tx_mempooler
-                    .fetch_transaction(&hash)
-                    .map_err(|e| rpc_internal_err(&e))?;
+                let (tx, _tree) =
+                    server
+                        .cfg
+                        .tx_mempooler
+                        .fetch_transaction(&hash)
+                        .map_err(|e| {
+                            rpc_internal_err(&e, "Could not fetch treasury spend from mempool")
+                        })?;
                 tspends.push(tx);
             }
         }
@@ -4356,9 +4471,10 @@ pub fn handle_get_treasury_spend_votes<C: RpcChain>(
         // Early check to ensure this tx has a valid expiry.
         let expiry = tx.expiry;
         if !dcroxide_standalone::is_treasury_vote_interval(u64::from(expiry.wrapping_sub(2)), tvi) {
-            return Err(rpc_internal_err(&format!(
-                "treasury spend {tx_hash} has incorrect expiry {expiry}"
-            )));
+            return Err(rpc_internal_err(
+                &format!("treasury spend {tx_hash} has incorrect expiry {expiry}"),
+                "Treasury spend without correct expiry",
+            ));
         }
 
         // Only count votes for tspends that are inside their voting
@@ -4385,7 +4501,12 @@ pub fn handle_get_treasury_spend_votes<C: RpcChain>(
                 Err(failure) if failure.is_unknown_block => {
                     return Err(crate::rpcerrors::rpc_block_not_found_error(&block));
                 }
-                Err(failure) => return Err(rpc_internal_err(&failure.message)),
+                Err(failure) => {
+                    return Err(rpc_internal_err(
+                        &failure.message,
+                        "Failed to obtain treasury spend votes",
+                    ));
+                }
             }
         }
 
@@ -4422,7 +4543,7 @@ fn handle_get_work_request<C: RpcChain>(server: &Server<C>) -> Result<GoValue, R
         .block_templater
         .as_ref()
         .expect("getwork requires a block templater");
-    if let Err(err) = bt.current_template() {
+    if let Err(err) = bt.current_template_err() {
         return Err(crate::rpcerrors::rpc_misc_error(&format!(
             "no work is available: {err}"
         )));
@@ -4498,7 +4619,10 @@ fn handle_get_work_request<C: RpcChain>(server: &Server<C>) -> Result<GoValue, R
             Err(err) => {
                 // The context "Unable to retrieve work due to invalid
                 // template" is log-only.
-                return Err(rpc_internal_err(&err));
+                return Err(rpc_internal_err(
+                    &err,
+                    "Unable to retrieve work due to invalid template",
+                ));
             }
             Ok(None) => {
                 return Err(crate::rpcerrors::rpc_misc_error(
@@ -4606,6 +4730,9 @@ fn handle_get_work_submission<C: RpcChain>(
     // Reject orphan blocks.
     let prev_blk_hash = submitted_header.prev_block;
     if server.cfg.chain.header_by_hash(&prev_blk_hash).is_err() {
+        crate::log::info(&format!(
+            "Block submitted via getwork rejected: orphan building on parent {prev_blk_hash}"
+        ));
         return Ok(GoValue::Bool(false));
     }
 
@@ -4625,9 +4752,12 @@ fn handle_get_work_submission<C: RpcChain>(
         num_bigint::Sign::Plus,
         &server.cfg.chain_params.pow_limit.to_be_bytes(),
     );
-    if dcroxide_standalone::check_proof_of_work(&pow_hash, submitted_header.bits, &pow_limit)
-        .is_err()
+    if let Err(err) =
+        dcroxide_standalone::check_proof_of_work(&pow_hash, submitted_header.bits, &pow_limit)
     {
+        crate::log::error(&format!(
+            "Block submitted via getwork does not meet the required proof of work: {err}"
+        ));
         return Ok(GoValue::Bool(false));
     }
 
@@ -4646,6 +4776,11 @@ fn handle_get_work_submission<C: RpcChain>(
         .get(&template_key)
         .cloned();
     let Some(mut msg_block) = template_block else {
+        crate::log::error(&format!(
+            "Block submitted via getwork has no matching template for merkle root {}, stake \
+             root {}",
+            submitted_header.merkle_root, submitted_header.stake_root
+        ));
         return Ok(GoValue::Bool(false));
     };
 
@@ -4659,12 +4794,29 @@ fn handle_get_work_submission<C: RpcChain>(
         // Anything other than a rule violation is an unexpected
         // error; the context is log-only.
         if !failure.is_rule_error {
-            return Err(rpc_internal_err(&failure.message));
+            return Err(rpc_internal_err(
+                &failure.message,
+                "Unexpected error while processing block",
+            ));
         }
+        crate::log::info(&format!(
+            "Block submitted via getwork rejected: {}",
+            failure.message
+        ));
         return Ok(GoValue::Bool(false));
     }
 
     // The block was accepted.
+    let block_hash = msg_block.header.block_hash();
+    let pow_hash_str = if block_hash != pow_hash {
+        format!(", pow hash {pow_hash}")
+    } else {
+        String::new()
+    };
+    crate::log::info(&format!(
+        "Block submitted via getwork accepted: {block_hash} (height {}{pow_hash_str})",
+        msg_block.header.height
+    ));
     Ok(GoValue::Bool(true))
 }
 
@@ -4686,6 +4838,7 @@ pub fn handle_get_work<C: RpcChain>(
     if server.cfg.mining_addrs.is_empty() {
         return Err(rpc_internal_err(
             "no payment addresses specified via --miningaddr",
+            "Configuration",
         ));
     }
 
@@ -4762,7 +4915,7 @@ pub fn handle_help<C: RpcChain>(server: &Server<C>, cmd: &GoValue) -> Result<GoV
         let usage = server
             .help_cacher
             .rpc_usage(&server.registry, false)
-            .map_err(|e| rpc_internal_err(&e))?;
+            .map_err(|e| rpc_internal_err(&e, "Failed to generate RPC usage"))?;
         return Ok(GoValue::String(usage));
     }
 
@@ -4779,7 +4932,7 @@ pub fn handle_help<C: RpcChain>(server: &Server<C>, cmd: &GoValue) -> Result<GoV
     let help = server
         .help_cacher
         .rpc_method_help(&server.registry, command)
-        .map_err(|e| rpc_internal_err(&e))?;
+        .map_err(|e| rpc_internal_err(&e, "Failed to generate help"))?;
     Ok(GoValue::String(help))
 }
 

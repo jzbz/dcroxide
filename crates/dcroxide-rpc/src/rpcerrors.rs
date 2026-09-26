@@ -5,9 +5,17 @@
 use dcroxide_chainhash::Hash;
 use dcroxide_dcrjson::{RPCError, codes, err_rpc_internal};
 
-/// An internal error carrying the underlying error text (dcrd
-/// `rpcInternalErr`; the context only feeds the log).
-pub fn rpc_internal_err(err_text: &str) -> RPCError {
+/// An internal error carrying the underlying error text, logged at error
+/// level to the RPC server's logger as `context: err_text`, or the error
+/// text alone when the context is empty (dcrd `rpcInternalErr`: "since
+/// internal errors really should not occur").  The context only feeds
+/// the log; the client sees the error text.
+pub fn rpc_internal_err(err_text: &str, context: &str) -> RPCError {
+    if context.is_empty() {
+        crate::log::error(err_text);
+    } else {
+        crate::log::error(&format!("{context}: {err_text}"));
+    }
     RPCError::new(err_rpc_internal().code, err_text)
 }
 

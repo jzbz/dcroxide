@@ -411,6 +411,9 @@ fn run_node(cfg: Config) -> ExitCode {
     // Install the per-subsystem log levels the configuration parsed
     // (dcrd's loadConfig calling parseAndSetDebugLevels).
     dcroxide_node::logging::set_levels(cfg.log_levels.clone());
+    // The RPC server's package logger (dcrd's `log.go:96`,
+    // `rpcserver.UseLogger(rpcsLog)`).
+    dcroxide_rpc::log::use_logger(dcroxide_node::logging::rpcs_log_sink());
     // The banner shares the log's sink and its tolerance of a stdout
     // that stopped taking writes.
     dcroxide_node::logging::write_stdout(
@@ -962,7 +965,7 @@ fn run_node(cfg: Config) -> ExitCode {
             cfg.params.params.clone(),
             mining_policy.clone(),
             cfg.mining_time_offset,
-            connected.clone(),
+            server.sync_peers.clone(),
             cfg.sim_net || cfg.reg_net,
         );
         let runtime = miner.start();

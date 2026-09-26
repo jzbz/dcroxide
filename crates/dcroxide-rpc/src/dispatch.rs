@@ -523,7 +523,7 @@ pub fn create_marshalled_reply(
 
 /// Parse the request, execute it, and return the marshalled response;
 /// `None` when the request is a notification, or when the reply fails
-/// to marshal, which dcrd logs and drops (dcrd `processRequest`).
+/// to marshal, which is logged and dropped (dcrd `processRequest`).
 pub fn process_request<C: RpcChain>(
     server: &Server<C>,
     jsonrpc: &str,
@@ -547,7 +547,12 @@ pub fn process_request<C: RpcChain>(
                 dcroxide_dcrjson::err_rpc_invalid_request().code,
                 "Invalid request: malformed",
             );
-            return create_marshalled_reply(jsonrpc, id, None, Some(&json_err)).ok();
+            return marshalled_or_logged(create_marshalled_reply(
+                jsonrpc,
+                id,
+                None,
+                Some(&json_err),
+            ));
         }
 
         // Valid requests with no ID (notifications) must not have a
@@ -572,11 +577,23 @@ pub fn process_request<C: RpcChain>(
     }
 
     // Marshal the response.
-    create_marshalled_reply(
+    marshalled_or_logged(create_marshalled_reply(
         jsonrpc,
         id,
         result.as_ref().map(|(value, typ)| (typ, value)),
         json_err.as_ref(),
-    )
-    .ok()
+    ))
+}
+
+/// The reply, or `None` after logging why it failed to marshal, as
+/// `processRequest` does with `log.Errorf("Failed to marshal reply:
+/// %v", err)` before returning nil.
+fn marshalled_or_logged(reply: Result<String, String>) -> Option<String> {
+    match reply {
+        Ok(reply) => Some(reply),
+        Err(err) => {
+            crate::log::error(&format!("Failed to marshal reply: {err}"));
+            None
+        }
+    }
 }

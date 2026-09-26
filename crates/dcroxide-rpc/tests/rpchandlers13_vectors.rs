@@ -126,13 +126,13 @@ fn zero_credentials_deny_without_client_certificate_auth() {
     let header = fixture_header();
     let server = new_server(header, "", "", "", "");
     assert!(
-        server.check_auth(None, false).is_err(),
+        server.check_auth(None, false, "addr").is_err(),
         "an endpoint with neither credentials nor client-certificate \
          verification must not authenticate anyone"
     );
     assert!(
         server
-            .check_auth(Some("Basic Zm9vOmJhcg=="), false)
+            .check_auth(Some("Basic Zm9vOmJhcg=="), false, "addr")
             .is_err(),
         "a bogus credential must not authenticate either"
     );
@@ -142,7 +142,9 @@ fn zero_credentials_deny_without_client_certificate_auth() {
     let mut server = new_server(header, "", "", "", "");
     server.cfg.client_cert_auth = true;
     assert_eq!(
-        server.check_auth(None, false).expect("client cert auth"),
+        server
+            .check_auth(None, false, "addr")
+            .expect("client cert auth"),
         (true, true)
     );
 }
@@ -183,7 +185,7 @@ fn auth_and_body_processing_matches_dcrd() {
                 let auth_header = (header_text != "-").then_some(header_text.as_str());
                 let require = f[8] == "true";
 
-                let verdict = match server.check_auth(auth_header, require) {
+                let verdict = match server.check_auth(auth_header, require, "addr") {
                     Ok((authed, is_admin)) => format!("OK:{authed}:{is_admin}"),
                     Err(err) => format!("ERR:{err}"),
                 };

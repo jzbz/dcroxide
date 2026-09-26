@@ -41,15 +41,65 @@ fn s(v: String) -> GoValue {
     GoValue::String(v)
 }
 
+/// The Go type of a wire message as `%T` prints it: the pointer to the
+/// `wire.Msg*` struct dcrd hands `messageToHex`.
+fn go_msg_type_name(msg: &Message) -> &'static str {
+    match msg {
+        Message::Version(_) => "*wire.MsgVersion",
+        Message::VerAck => "*wire.MsgVerAck",
+        Message::GetAddr => "*wire.MsgGetAddr",
+        Message::Addr(_) => "*wire.MsgAddr",
+        Message::AddrV2(_) => "*wire.MsgAddrV2",
+        Message::GetBlocks(_) => "*wire.MsgGetBlocks",
+        Message::Inv(_) => "*wire.MsgInv",
+        Message::GetData(_) => "*wire.MsgGetData",
+        Message::NotFound(_) => "*wire.MsgNotFound",
+        Message::Block(_) => "*wire.MsgBlock",
+        Message::Tx(_) => "*wire.MsgTx",
+        Message::GetHeaders(_) => "*wire.MsgGetHeaders",
+        Message::Headers(_) => "*wire.MsgHeaders",
+        Message::Ping(_) => "*wire.MsgPing",
+        Message::Pong(_) => "*wire.MsgPong",
+        Message::MemPool => "*wire.MsgMemPool",
+        Message::MiningState(_) => "*wire.MsgMiningState",
+        Message::GetMiningState => "*wire.MsgGetMiningState",
+        Message::Reject(_) => "*wire.MsgReject",
+        Message::SendHeaders => "*wire.MsgSendHeaders",
+        Message::FeeFilter(_) => "*wire.MsgFeeFilter",
+        Message::GetCFilter(_) => "*wire.MsgGetCFilter",
+        Message::GetCFHeaders(_) => "*wire.MsgGetCFHeaders",
+        Message::GetCFTypes => "*wire.MsgGetCFTypes",
+        Message::CFilter(_) => "*wire.MsgCFilter",
+        Message::CFHeaders(_) => "*wire.MsgCFHeaders",
+        Message::CFTypes(_) => "*wire.MsgCFTypes",
+        Message::GetCFilterV2(_) => "*wire.MsgGetCFilterV2",
+        Message::CFilterV2(_) => "*wire.MsgCFilterV2",
+        Message::GetInitState(_) => "*wire.MsgGetInitState",
+        Message::InitState(_) => "*wire.MsgInitState",
+        Message::GetCFsV2(_) => "*wire.MsgGetCFsV2",
+        Message::CFiltersV2(_) => "*wire.MsgCFiltersV2",
+        Message::MixPairReq(_) => "*wire.MsgMixPairReq",
+        Message::MixKeyExchange(_) => "*wire.MsgMixKeyExchange",
+        Message::MixCiphertexts(_) => "*wire.MsgMixCiphertexts",
+        Message::MixSlotReserve(_) => "*wire.MsgMixSlotReserve",
+        Message::MixFactoredPoly(_) => "*wire.MsgMixFactoredPoly",
+        Message::MixDCNet(_) => "*wire.MsgMixDCNet",
+        Message::MixConfirm(_) => "*wire.MsgMixConfirm",
+        Message::MixSecrets(_) => "*wire.MsgMixSecrets",
+    }
+}
+
 /// Serialize a message to its wire protocol hex encoding (dcrd
 /// `messageToHex`; the payload only, without framing).  An encode
 /// failure is `rpcInternalErr(err, "Failed to encode msg of type %T")`,
-/// whose message is the error text alone; the context only feeds
-/// dcrd's log.
+/// whose message is the error text alone; the context goes to the log.
 pub fn message_to_hex(msg: &Message, pver: u32) -> Result<String, RPCError> {
     match msg.encode_payload(pver) {
         Ok(payload) => Ok(hex_str(&payload)),
-        Err(e) => Err(rpc_internal_err(&e.to_string())),
+        Err(e) => Err(rpc_internal_err(
+            &e.to_string(),
+            &format!("Failed to encode msg of type {}", go_msg_type_name(msg)),
+        )),
     }
 }
 
@@ -200,13 +250,19 @@ pub fn create_vout_list(
         let mut commit_amt: Option<i64> = None;
         if is_sstx && (i % 2 != 0) {
             script_type = "sstxcommitment".to_string();
-            if let Ok(addr) =
-                dcroxide_stake::addr_from_sstx_pk_scr_commitment(&v.pk_script, chain_params)
-            {
-                addrs = vec![addr.to_string()];
+            match dcroxide_stake::addr_from_sstx_pk_scr_commitment(&v.pk_script, chain_params) {
+                Ok(addr) => addrs = vec![addr.to_string()],
+                Err(_) => crate::log::warn(&format!(
+                    "failed to decode ticket commitment addr output for tx hash {}, output idx {i}",
+                    mtx.tx_hash()
+                )),
             }
-            if let Ok(amt) = dcroxide_stake::amount_from_sstx_pk_scr_commitment(&v.pk_script) {
-                commit_amt = Some(amt);
+            match dcroxide_stake::amount_from_sstx_pk_scr_commitment(&v.pk_script) {
+                Ok(amt) => commit_amt = Some(amt),
+                Err(_) => crate::log::warn(&format!(
+                    "failed to decode ticket commitment amt output for tx hash {}, output idx {i}",
+                    mtx.tx_hash()
+                )),
             }
         } else {
             let (st, extracted) =

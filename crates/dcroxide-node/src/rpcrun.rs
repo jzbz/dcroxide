@@ -59,10 +59,11 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The absolute deadline covering a connection's initial handshake — the
 /// request head plus, for an authenticated POST, its body (dcrd's
-/// `http.Server.ReadTimeout = rpcAuthTimeoutSeconds`, 10 seconds).  It is
-/// re-armed as the remaining budget before every plaintext `stream.read`,
-/// so a byte-dribbling slowloris on the `--notls` path is bounded to the
-/// deadline rather than resetting a per-read timeout indefinitely.
+/// `http.Server.ReadTimeout = rpcAuthTimeoutSeconds`, 10 seconds).  Every
+/// plaintext `stream.read` runs under a receive timeout no longer than the
+/// remaining budget, re-armed as that budget shrinks, so a byte-dribbling
+/// slowloris on the `--notls` path is bounded to the deadline rather than
+/// resetting a per-read timeout indefinitely.
 ///
 /// Over TLS a single `rustls` read loops many internal `sock.read`
 /// syscalls under one re-armed `SO_RCVTIMEO`, so the absolute bound does
@@ -80,12 +81,17 @@ const WS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// shared chain (dcrd's `rpcChain`, which embeds `*blockchain.BlockChain`
 /// and so answers every method of the `rpcserver.Chain` interface).
 ///
-/// Every `RpcChain` method a handler reaches is overridden here: the
-/// trait's defaults exist for the handler test doubles, and a default
-/// reached from the daemon either fails the request with the unwired-seam
-/// error or, for the three whose signature cannot fail (`chain_tips`,
-/// `calc_want_height`, `tip_generation`), answers a neutral value that
-/// would be a wrong answer rather than an error.
+/// Every `RpcChain` method is overridden here.  The trait's defaults
+/// exist for the handler test doubles and are no safety net: most fail
+/// the request with the unwired-seam error, the three whose signature
+/// cannot fail (`chain_tips`, `calc_want_height`, `tip_generation`)
+/// answer a neutral value that would be a wrong answer rather than an
+/// error, and ten panic with `unimplemented!` -- `best_snapshot`,
+/// `best_header`, `is_current`, `locate_headers`, `main_chain_has_block`,
+/// `next_threshold_state`, `check_live_ticket`, `check_live_tickets`,
+/// `fetch_utxo_entry` and `tspend_count_votes` -- which the release
+/// profile's `panic = "abort"` turns into a stopped node.  A method added
+/// to the trait must therefore be overridden here as well.
 pub struct NodeRpcChain {
     chain: Arc<Mutex<Chain>>,
     params: dcroxide_chaincfg::Params,
@@ -127,6 +133,21 @@ impl NodeRpcChain {
         if let Some(handler) = &self.ntfn_handler {
             handler.drain_pending(&self.chain, adjusted_time_unix());
         }
+    }
+
+    /// A copy of the best chain tip's stake node, taken under the chain
+    /// mutex so a walk of its live tickets runs after the mutex is
+    /// released, as dcrd's `LiveTickets` and `CheckLiveTickets` read
+    /// `bestChain.Tip().stakeNode` under `chainLock` and walk it after
+    /// `RUnlock` (`stakeext.go:68-73`, `:121-131`).  The copy shares the
+    /// node's persistent ticket treaps rather than copying the pool, so
+    /// the mutex covers a few small vector copies instead of the walk.
+    /// `None` where the tip's stake node is not loaded, which
+    /// `Chain::live_tickets` also answers as no live tickets.
+    fn tip_stake_node(&self) -> Option<dcroxide_stake::ticketnode::Node> {
+        let chain = self.chain.lock().expect("chain mutex poisoned");
+        let tip = chain.best_chain.tip()?;
+        chain.store.node(tip).stake_node.as_deref().cloned()
     }
 
     /// Whether the chain's store has latched a fatal persistence fault,
@@ -194,22 +215,46 @@ fn chain_tips(chain: &Chain) -> Vec<dcroxide_rpc::server::RpcChainTip> {
         .collect()
 }
 
+/// A treasury balance failure with dcrd's classification.
+fn treasury_failure(
+    is_unknown_block: bool,
+    is_no_treasury_balance: bool,
+    message: String,
+) -> dcroxide_rpc::server::TreasuryBalanceFailure {
+    dcroxide_rpc::server::TreasuryBalanceFailure {
+        is_unknown_block,
+        is_no_treasury_balance,
+        message,
+    }
+}
+
+/// Where [`treasury_balance`] found the requested block's treasury
+/// state row.
+enum TreasuryBalanceRow {
+    /// The row was in the chain's recent-window mirror.
+    Resident(dcroxide_rpc::server::RpcTreasuryBalance),
+    /// The row lies below the window and is read from the treasury
+    /// bucket by [`stored_treasury_balance`], once the chain mutex is
+    /// released.
+    Stored {
+        db: Option<dcroxide_database::Database>,
+        hash: Hash,
+        block_height: i64,
+    },
+}
+
 /// The treasury balance as of the given block (dcrd
-/// `BlockChain.TreasuryBalance`, `treasury.go:497`), read from the
-/// chain's in-memory mirror of the treasury bucket that dcrd's
-/// `dbFetchTreasuryBalance` reads.
+/// `BlockChain.TreasuryBalance`, `treasury.go:497`), up to the load of
+/// the block's treasury state row.  The chain's `treasury_state` is only
+/// a recent-window mirror of the treasury bucket, so a row it does not
+/// hold is left for [`stored_treasury_balance`] to read from the
+/// database, which dcrd reads with `chainLock` released.
 fn treasury_balance(
     chain: &Chain,
     hash: &Hash,
     params: &dcroxide_chaincfg::Params,
-) -> Result<dcroxide_rpc::server::RpcTreasuryBalance, dcroxide_rpc::server::TreasuryBalanceFailure>
-{
-    use dcroxide_rpc::server::TreasuryBalanceFailure;
-    let failure = |is_unknown_block, is_no_treasury_balance, message| TreasuryBalanceFailure {
-        is_unknown_block,
-        is_no_treasury_balance,
-        message,
-    };
+) -> Result<TreasuryBalanceRow, dcroxide_rpc::server::TreasuryBalanceFailure> {
+    let failure = treasury_failure;
     let Some(node) = chain
         .index
         .lookup_node(hash)
@@ -242,23 +287,73 @@ fn treasury_balance(
 
     // Load treasury balance information.
     let node_hash = chain.store.node(node).hash;
-    let Some(ts) = chain.treasury_state.get(&node_hash.0) else {
-        return Err(failure(
+    let block_height = chain.store.node(node).height;
+    match chain.treasury_state.get(&node_hash.0) {
+        Some(ts) => Ok(TreasuryBalanceRow::Resident(treasury_balance_info(
+            block_height,
+            ts,
+        ))),
+        None => Ok(TreasuryBalanceRow::Stored {
+            // Cloning the handle shares the open database, as copies of
+            // dcrd's `database.DB` interface value do.
+            db: chain.db.clone(),
+            hash: node_hash,
+            block_height,
+        }),
+    }
+}
+
+/// Read a block's treasury state row from the treasury bucket (dcrd's
+/// `b.db.View` over `dbFetchTreasuryBalance` in `TreasuryBalance`,
+/// `treasury.go:522-530`).  A missing row is dcrd's `errDbTreasury`
+/// text; a failed read or a row that does not decode is its error text.
+/// A chain without a database keeps every row in its mirror, so there
+/// the miss is the missing key as well.
+fn stored_treasury_balance(
+    db: Option<&dcroxide_database::Database>,
+    hash: &Hash,
+    block_height: i64,
+) -> Result<dcroxide_rpc::server::RpcTreasuryBalance, dcroxide_rpc::server::TreasuryBalanceFailure>
+{
+    let mut found = Ok(None);
+    if let Some(db) = db {
+        db.view(|tx| {
+            found = dcroxide_blockchain::treasurydb::db_fetch_treasury_balance(tx, hash);
+            Ok(())
+        })
+        .map_err(|e| treasury_failure(false, false, e.to_string()))?;
+    }
+    let Some(ts) = found.map_err(|e| treasury_failure(false, false, e.to_string()))? else {
+        return Err(treasury_failure(
             false,
             false,
-            format!("treasury db missing key: {node_hash}"),
+            format!("treasury db missing key: {hash}"),
         ));
     };
-    Ok(dcroxide_rpc::server::RpcTreasuryBalance {
-        block_height: chain.store.node(node).height,
+    Ok(treasury_balance_info(block_height, &ts))
+}
+
+/// The `TreasuryBalanceInfo` dcrd builds from a treasury state row.
+fn treasury_balance_info(
+    block_height: i64,
+    ts: &dcroxide_blockchain::treasurydb::TreasuryState,
+) -> dcroxide_rpc::server::RpcTreasuryBalance {
+    dcroxide_rpc::server::RpcTreasuryBalance {
+        block_height,
         // dcrd's `uint64(ts.balance)` conversion, wrapping included.
         balance: ts.balance as u64,
         updates: ts.values.iter().map(|value| value.amount).collect(),
-    })
+    }
 }
 
 /// The live tickets whose voting rights pay to the given stake address
 /// (dcrd `BlockChain.TicketsWithAddress`, `stakeext.go:80`).
+///
+/// dcrd fetches the entries one at a time through its cache
+/// (`stakeext.go:88-90`); like `Chain::ticket_pool_value`, the port
+/// fetches them as one batch with the same per-entry cache semantics, so
+/// the cache misses of a cold call share one read transaction instead of
+/// opening one apiece under the chain mutex.
 fn tickets_with_address(
     chain: &Chain,
     addr: &dcroxide_txscript::stdaddr::Address,
@@ -268,18 +363,25 @@ fn tickets_with_address(
     let Some((voting_rights_script_ver, voting_rights_script)) = addr.voting_rights_script() else {
         return Ok(Vec::new());
     };
-    let mut tickets_with_addr = Vec::new();
-    for hash in chain.live_tickets() {
-        let outpoint = dcroxide_wire::OutPoint {
+    let tickets = chain.live_tickets();
+    let outpoints: Vec<dcroxide_wire::OutPoint> = tickets
+        .iter()
+        .map(|&hash| dcroxide_wire::OutPoint {
             hash,
             index: 0,
             tree: dcroxide_wire::TX_TREE_STAKE,
-        };
+        })
+        .collect();
+    let mut tickets_with_addr = Vec::new();
+    for (hash, utxo) in tickets
+        .into_iter()
+        .zip(chain.fetch_utxo_entries(&outpoints))
+    {
         // A live ticket always has its submission output, so a missing
         // one can only be corruption.  dcrd would dereference the nil
         // entry and panic the handler; the port fails the request
         // instead, as its `ticket_pool_value` does for the same state.
-        let Some(utxo) = chain.fetch_utxo_entry(&outpoint) else {
+        let Some(utxo) = utxo else {
             return Err(format!("unable to find ticket {hash} in the utxo set"));
         };
         if utxo.script_version() == voting_rights_script_ver
@@ -324,6 +426,18 @@ impl RpcChain for NodeRpcChain {
         located
             .and_then(|read| read.fetch(hash))
             // dcrd `unknownBlockError`.
+            .ok_or_else(|| format!("block {hash} is not known"))
+    }
+
+    fn block_bytes_by_hash(&self, hash: &Hash) -> Result<Vec<u8>, String> {
+        // `block_by_hash`'s lookup, without decoding the stored bytes
+        // (or copying the cached block) only to serialize them again.
+        let located = {
+            let chain = self.chain.lock().expect("chain mutex poisoned");
+            crate::dispatch::BlockRead::locate(&chain, hash)
+        };
+        located
+            .and_then(|read| read.fetch_bytes(hash))
             .ok_or_else(|| format!("block {hash} is not known"))
     }
 
@@ -442,6 +556,8 @@ impl RpcChain for NodeRpcChain {
             .ok_or_else(|| format!("block {hash} is not known"))
     }
 
+    /// One treap lookup, cheaper than copying the tip's stake node, so it
+    /// stays under the chain mutex.
     fn check_live_ticket(&self, hash: &Hash) -> bool {
         self.chain
             .lock()
@@ -449,19 +565,25 @@ impl RpcChain for NodeRpcChain {
             .check_live_ticket(hash)
     }
 
+    /// `Chain::check_live_tickets` over a copy of the tip's stake node,
+    /// so the lookups -- one per hash, as many as a request can carry --
+    /// run with the chain mutex released (see
+    /// `NodeRpcChain::tip_stake_node`).
     fn check_live_tickets(&self, hashes: &[Hash]) -> Vec<bool> {
-        self.chain
-            .lock()
-            .expect("chain mutex poisoned")
-            .check_live_tickets(hashes)
+        match self.tip_stake_node() {
+            Some(sn) => hashes.iter().map(|h| sn.exists_live_ticket(h)).collect(),
+            None => vec![false; hashes.len()],
+        }
     }
 
+    /// `Chain::live_tickets` over a copy of the tip's stake node, so the
+    /// walk of the whole live pool runs with the chain mutex released
+    /// (see `NodeRpcChain::tip_stake_node`).
     fn live_tickets(&self) -> Result<Vec<Hash>, String> {
         Ok(self
-            .chain
-            .lock()
-            .expect("chain mutex poisoned")
-            .live_tickets())
+            .tip_stake_node()
+            .map(|sn| sn.live_tickets())
+            .unwrap_or_default())
     }
 
     fn ticket_pool_value(&self) -> Result<i64, String> {
@@ -630,10 +752,13 @@ impl RpcChain for NodeRpcChain {
     // the tip and ws `rebroadcastwinners` reached the trait defaults.
     // Those defaults panicked, and release builds set `panic = "abort"`,
     // so a limited-credential client -- the cheapest one -- could stop the
-    // node with a single call. The defaults are errors now, but an error
-    // is still the wrong answer when the chain can supply the real one:
-    // `crates/dcroxide-node/src/mining.rs:242,248,275` has been calling
-    // exactly these, with these signatures, all along.
+    // node with a single call. The defaults no longer panic: the two
+    // agenda seams answer the unwired-seam error, and `tip_generation`
+    // an empty generation, so `rebroadcastwinners` would send nothing.
+    // Either is still the wrong answer when the chain can supply the real
+    // one: the template generator's chain adapter (`NodeTemplateChain` in
+    // `crates/dcroxide-node/src/mining.rs`) has been calling exactly
+    // these, with these signatures, all along.
 
     fn is_subsidy_split_agenda_active(&self, prev_blk_hash: &Hash) -> Result<bool, String> {
         self.chain
@@ -775,11 +900,21 @@ impl RpcChain for NodeRpcChain {
         dcroxide_rpc::server::RpcTreasuryBalance,
         dcroxide_rpc::server::TreasuryBalanceFailure,
     > {
-        treasury_balance(
+        let row = treasury_balance(
             &self.chain.lock().expect("chain mutex poisoned"),
             hash,
             &self.params,
-        )
+        )?;
+        match row {
+            TreasuryBalanceRow::Resident(info) => Ok(info),
+            // The chain mutex is released by here: dcrd reads the row
+            // outside `chainLock`.
+            TreasuryBalanceRow::Stored {
+                db,
+                hash,
+                block_height,
+            } => stored_treasury_balance(db.as_ref(), &hash, block_height),
+        }
     }
 
     fn tickets_with_address(
@@ -861,19 +996,6 @@ impl RpcChain for NodeRpcChain {
             .lottery_data_for_block(hash, &self.params)
             .map(|(winners, _pool_size, _final_state)| winners)
             .map_err(|e| e.description)
-    }
-}
-
-/// The mempool seam for a daemon that has no mempool yet: every
-/// transaction lookup misses with the error dcrd's mempool answers for
-/// an unknown transaction, which lets gettxout's mempool probe fall
-/// through to the UTXO set.  The remaining mempool operations stay
-/// unwired until the mempool arrives.
-pub struct EmptyTxMempooler;
-
-impl dcroxide_rpc::server::RpcTxMempooler for EmptyTxMempooler {
-    fn fetch_transaction(&self, _tx_hash: &Hash) -> Result<(dcroxide_wire::MsgTx, i8), String> {
-        Err("transaction is not in the pool".to_string())
     }
 }
 
@@ -1024,12 +1146,11 @@ impl RpcAddrManager for NodeRpcAddrManager {
 /// queries over the daemon's live-peer registry (a growing slice of
 /// the `RpcConnManager` seam).
 pub struct NodeRpcConnManager {
-    connected: crate::runtime::ConnectedPeers,
     net_totals: Arc<crate::transport::NetByteTotals>,
-    /// The sync-manager peer registry, backing `getpeerinfo` (and the
-    /// relay fan-out).  Held at the top level, not inside the relay
-    /// option, so peer info is available even when the relay handles are
-    /// not attached.
+    /// The sync-manager peer registry, backing `getpeerinfo` and the
+    /// connection count (and the relay fan-out).  Held at the top level,
+    /// not inside the relay option, so peer info is available even when
+    /// the relay handles are not attached.
     sync_peers: crate::dispatch::SyncPeers,
     relay: Option<RpcRelaySinks>,
     /// The outbound connection driver's control handle, backing the
@@ -1055,14 +1176,16 @@ struct RpcRelaySinks {
 }
 
 impl NodeRpcConnManager {
-    /// Adapt the connected-peer registry and byte totals for the RPC
-    /// handlers.
+    /// Adapt the byte totals for the RPC handlers.  The socket registry
+    /// is not read: it holds every accepted or dialed socket from before
+    /// its version handshake, while dcrd's connection count and peer list
+    /// both cover only handshaken peers, which the sync-manager registry
+    /// attached by [`with_relay`](Self::with_relay) holds.
     pub fn new(
-        connected: crate::runtime::ConnectedPeers,
+        _connected: crate::runtime::ConnectedPeers,
         net_totals: Arc<crate::transport::NetByteTotals>,
     ) -> NodeRpcConnManager {
         NodeRpcConnManager {
-            connected,
             net_totals,
             sync_peers: crate::dispatch::SyncPeers::default(),
             relay: None,
@@ -1134,8 +1257,16 @@ impl NodeRpcConnManager {
 }
 
 impl dcroxide_rpc::server::RpcConnManager for NodeRpcConnManager {
+    /// The number of handshaken peers (dcrd `rpcConnManager.ConnectedCount`
+    /// over `server.ConnectedCount`, `server.go:2805-2812`), read from the
+    /// same registry `getpeerinfo` reads.  dcrd counts only the peers in
+    /// its `peerState`, which a peer enters once its version handshake
+    /// succeeds, so a socket still negotiating -- held in the runtime's
+    /// socket registry from the accept or dial on -- is not a connection
+    /// here, and in particular does not satisfy getwork's not-connected
+    /// gate.
     fn connected_count(&self) -> i32 {
-        self.connected.len() as i32
+        self.sync_peers.len() as i32
     }
 
     /// Snapshot the live peers for `getpeerinfo` (dcrd
@@ -1611,10 +1742,13 @@ impl dcroxide_rpc::server::RpcCpuMiner for IdleCpuMiner {
         0.0
     }
 
-    /// dcrd's `cpuminer.NumWorkers` returns the configured worker count
-    /// even while idle, which defaults to `defaultNumWorkers` (1).
+    /// Zero: dcrd hands the RPC server `&rpcCPUMiner{nil}` when it
+    /// builds no miner, and that adaptor's `NumWorkers` returns 0 for
+    /// the nil miner (`rpcadaptors.go:600-606`), so getmininginfo's
+    /// `genproclimit` reads 0.  The real miner's `defaultNumWorkers` (1)
+    /// applies only once dcrd has built one.
     fn num_workers(&self) -> i32 {
-        1
+        0
     }
 
     /// A no-op: with no mining addresses there is no miner to configure,
@@ -2013,7 +2147,9 @@ impl ReloadState {
         let cert = read(&self.cert)?.ok_or_else(|| "no RPC certificate path".to_string())?;
         let key = read(&self.key)?.ok_or_else(|| "no RPC key path".to_string())?;
         let client_cas = read(&self.client_cas)?;
-        build_server_config(&cert, &key, client_cas.as_deref()).map(Arc::new)
+        build_server_config(&cert, &key, client_cas.as_deref())
+            .map(Arc::new)
+            .map_err(|e| with_client_cas_path(e, self.client_cas.path.as_deref()))
     }
 }
 
@@ -2046,7 +2182,8 @@ pub fn reloadable_tls_config(
         ),
         None => None,
     };
-    let cached_config = tls_server_config(&cert, &key, client_cas.as_deref())?;
+    let cached_config = tls_server_config(&cert, &key, client_cas.as_deref())
+        .map_err(|e| with_client_cas_path(e, client_cas_path))?;
 
     let now = Instant::now();
     let mut state = ReloadState {
@@ -2215,6 +2352,889 @@ impl rustls::sign::Signer for P521Signer {
     }
 }
 
+/// One PEM block as Go's `pem.Decode` returns it: the type, whether the
+/// block carried headers, and the decoded bytes.
+struct GoPemBlock {
+    block_type: Vec<u8>,
+    has_headers: bool,
+    bytes: Vec<u8>,
+}
+
+/// Go's `getLine` (`encoding/pem/pem.go`): the first `\n`- or
+/// `\r\n`-delimited line without its trailing spaces and tabs, the
+/// rest after the newline, and how many bytes that consumed.
+// Offsets bounded by the input length.
+#[allow(clippy::arithmetic_side_effects)]
+fn go_pem_get_line(data: &[u8]) -> (&[u8], &[u8], usize) {
+    let (mut i, j) = match data.iter().position(|&b| b == b'\n') {
+        None => (data.len(), data.len()),
+        Some(i) => (i, i + 1),
+    };
+    if j > i && i > 0 && data[i - 1] == b'\r' {
+        i -= 1;
+    }
+    let mut line = &data[..i];
+    while let [head @ .., b' ' | b'\t'] = line {
+        line = head;
+    }
+    (line, &data[j..], j)
+}
+
+/// Go's `base64.StdEncoding.Decode` (non-strict, padded) over PEM body
+/// text with its spaces and tabs already removed: carriage returns and
+/// newlines are skipped, `=` may only pad the final quantum, and
+/// nothing but newlines may follow it (`decodeQuantum`,
+/// `encoding/base64/base64.go`).  `None` is Go's `CorruptInputError`.
+// Sextet and offset arithmetic bounded by the input length.
+#[allow(clippy::arithmetic_side_effects)]
+fn go_base64_std_decode(src: &[u8]) -> Option<Vec<u8>> {
+    let chars: Vec<u8> = src
+        .iter()
+        .copied()
+        .filter(|&c| c != b'\r' && c != b'\n')
+        .collect();
+    if !chars.len().is_multiple_of(4) {
+        return None;
+    }
+    let value = |c: u8| -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let quanta = chars.len() / 4;
+    let mut out = Vec::with_capacity(quanta * 3);
+    for (index, quad) in chars.chunks(4).enumerate() {
+        let mut dlen = 4;
+        let mut acc = 0u32;
+        for (j, &c) in quad.iter().enumerate() {
+            if c == b'=' {
+                // Padding is only valid at the third or fourth position
+                // of the last quantum, and a third-position `=` needs a
+                // second one after it.
+                if j < 2 || index + 1 != quanta || (j == 2 && quad[3] != b'=') {
+                    return None;
+                }
+                dlen = j;
+                break;
+            }
+            acc |= value(c)? << (18 - 6 * j);
+        }
+        out.push((acc >> 16) as u8);
+        if dlen >= 3 {
+            out.push((acc >> 8) as u8);
+        }
+        if dlen == 4 {
+            out.push(acc as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Go's `pem.Decode` (`encoding/pem/pem.go`): find the first END line,
+/// take the last BEGIN line before it, and decode that block, skipping
+/// to the next END line whenever the block is malformed -- a bad type
+/// line, a mismatched or unterminated END line, or a body that is not
+/// base64.  `None` when no further block decodes, which is also Go's
+/// answer for input that ends inside a block's headers.
+// Go's signed offset bookkeeping, bounded by the input length.
+#[allow(clippy::arithmetic_side_effects)]
+fn go_pem_decode(data: &[u8]) -> Option<(GoPemBlock, &[u8])> {
+    const PEM_START: &[u8] = b"\n-----BEGIN ";
+    const PEM_END: &[u8] = b"\n-----END ";
+    const PEM_END_OF_LINE: &[u8] = b"-----";
+    let find = |haystack: &[u8], needle: &[u8]| {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    };
+    let rfind = |haystack: &[u8], needle: &[u8]| {
+        haystack
+            .windows(needle.len())
+            .rposition(|window| window == needle)
+    };
+
+    let mut rest = data;
+    // Offsets relative to `rest`, signed as in Go: consuming the type
+    // line of an empty block leaves `end_index` at -1.
+    let mut end_trailer_index: isize = 0;
+    loop {
+        // Skip past the END line already tried.
+        if end_trailer_index < 0 || end_trailer_index as usize > rest.len() {
+            return None;
+        }
+        rest = &rest[end_trailer_index as usize..];
+
+        // The first END line, then the last BEGIN line before it, so
+        // repeated BEGIN lines without a matching END are skipped.
+        let found_end = find(rest, PEM_END)?;
+        let mut end_index = found_end as isize;
+        end_trailer_index = (found_end + PEM_END.len()) as isize;
+        let Some(begin_index) = rfind(&rest[..found_end], &PEM_START[1..]) else {
+            continue;
+        };
+        if begin_index > 0 && rest[begin_index - 1] != b'\n' {
+            continue;
+        }
+        let skip = begin_index + PEM_START.len() - 1;
+        rest = &rest[skip..];
+        end_index -= skip as isize;
+        end_trailer_index -= skip as isize;
+
+        let (type_line, after_type, consumed) = go_pem_get_line(rest);
+        rest = after_type;
+        end_index -= consumed as isize;
+        end_trailer_index -= consumed as isize;
+        let Some(block_type) = type_line.strip_suffix(PEM_END_OF_LINE) else {
+            continue;
+        };
+
+        let mut has_headers = false;
+        loop {
+            if rest.is_empty() {
+                return None;
+            }
+            let (line, next, consumed) = go_pem_get_line(rest);
+            // Go keeps each `key: value` line in the block's header map;
+            // only whether there were any matters to the callers here.
+            if !line.contains(&b':') {
+                break;
+            }
+            has_headers = true;
+            rest = next;
+            end_index -= consumed as isize;
+            end_trailer_index -= consumed as isize;
+        }
+
+        // Headers must be followed by a newline before the END line.
+        if has_headers && end_index < 0 {
+            continue;
+        }
+
+        // The END line repeats the type and closes with five dashes,
+        // then only whitespace.
+        let Some(end_trailer) = usize::try_from(end_trailer_index)
+            .ok()
+            .and_then(|index| rest.get(index..))
+        else {
+            continue;
+        };
+        let end_trailer_len = block_type.len() + PEM_END_OF_LINE.len();
+        if end_trailer.len() < end_trailer_len {
+            continue;
+        }
+        let (end_trailer, rest_of_end_line) = end_trailer.split_at(end_trailer_len);
+        if !end_trailer.starts_with(block_type) || !end_trailer.ends_with(PEM_END_OF_LINE) {
+            continue;
+        }
+        if !go_pem_get_line(rest_of_end_line).0.is_empty() {
+            continue;
+        }
+
+        let mut bytes = Vec::new();
+        if end_index > 0 {
+            let base64_data: Vec<u8> = rest[..end_index as usize]
+                .iter()
+                .copied()
+                .filter(|&b| b != b' ' && b != b'\t')
+                .collect();
+            let Some(decoded) = go_base64_std_decode(&base64_data) else {
+                continue;
+            };
+            bytes = decoded;
+        }
+
+        // The -1 is because an empty block matched the END marker
+        // without its leading newline.
+        let after_end = (end_index + PEM_END.len() as isize - 1) as usize;
+        let (_, rest, _) = go_pem_get_line(&rest[after_end..]);
+        return Some((
+            GoPemBlock {
+                block_type: block_type.to_vec(),
+                has_headers,
+                bytes,
+            },
+            rest,
+        ));
+    }
+}
+
+/// The error for a client CA file that added no certificate; the
+/// callers that know the file's path turn it into dcrd's
+/// `no certificates found in %q` (`newTLSConfig`, `server.go:3696-3698`).
+const NO_CLIENT_CAS: &str = "no certificates found in the client CA file";
+
+/// dcrd's `no certificates found in %q` for the client CA file at
+/// `path`, in place of the path-less [`NO_CLIENT_CAS`]; every other
+/// error passes through.
+fn with_client_cas_path(err: String, path: Option<&Path>) -> String {
+    match path {
+        Some(path) if err == NO_CLIENT_CAS => format!(
+            "no certificates found in {}",
+            crate::gostd::go_quote(&path.to_string_lossy())
+        ),
+        _ => err,
+    }
+}
+
+/// A minimal DER reader over the certificate fields Go's client
+/// verification reads: low-tag-number, definite-length elements only,
+/// which is every shape Go's own parser accepts.
+struct DerReader<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> DerReader<'a> {
+    fn new(data: &'a [u8]) -> DerReader<'a> {
+        DerReader { data }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    fn peek_tag(&self) -> Option<u8> {
+        self.data.first().copied()
+    }
+
+    /// The next element's tag and content.
+    // A length of at most four bytes, checked against the input.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn read(&mut self) -> Option<(u8, &'a [u8])> {
+        let (&tag, rest) = self.data.split_first()?;
+        if tag & 0x1f == 0x1f {
+            return None;
+        }
+        let (&first, mut rest) = rest.split_first()?;
+        let len = if first & 0x80 == 0 {
+            usize::from(first)
+        } else {
+            let n = usize::from(first & 0x7f);
+            if n == 0 || n > 4 || rest.len() < n {
+                return None;
+            }
+            let (len_bytes, tail) = rest.split_at(n);
+            rest = tail;
+            len_bytes
+                .iter()
+                .fold(0usize, |len, &b| (len << 8) | usize::from(b))
+        };
+        if rest.len() < len {
+            return None;
+        }
+        let (content, tail) = rest.split_at(len);
+        self.data = tail;
+        Some((tag, content))
+    }
+
+    /// The next element's content, which must carry `want`.
+    fn read_tag(&mut self, want: u8) -> Option<&'a [u8]> {
+        match self.read()? {
+            (tag, content) if tag == want => Some(content),
+            _ => None,
+        }
+    }
+}
+
+/// Unix seconds from a proleptic Gregorian civil date and time.
+// Calendar arithmetic over four-digit years.
+#[allow(clippy::arithmetic_side_effects)]
+fn unix_from_civil(year: i64, month: i64, day: i64, hh: i64, mm: i64, ss: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    days * 86_400 + hh * 3600 + mm * 60 + ss
+}
+
+/// A certificate validity time in unix seconds, as cryptobyte's
+/// `ReadASN1UTCTime` (`060102150405Z0700`, falling back to minute
+/// precision, years 50-99 in the 1900s) and `ReadASN1GeneralizedTime`
+/// (`20060102150405Z0700`) read it: `time.Parse` with the layout, then
+/// the round-trip requirement that `Format` gives the input back.  So
+/// a fraction of a second, which `time.Parse` reads after the seconds
+/// but neither layout writes, a `+0000` or `-0000` zone and a zone
+/// minute of 60 are refused, while a zone hour of 24, which
+/// `time.Parse` allows, is not.
+// Digit and calendar arithmetic over at most four-digit fields.
+#[allow(clippy::arithmetic_side_effects)]
+fn parse_asn1_time(tag: u8, content: &[u8]) -> Option<i64> {
+    let digits = |s: &[u8]| -> Option<i64> {
+        if s.is_empty() || !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(s.iter().fold(0i64, |v, &d| v * 10 + i64::from(d - b'0')))
+    };
+    let (year, rest) = match tag {
+        0x17 => {
+            let yy = digits(content.get(..2)?)?;
+            (if yy >= 50 { 1900 + yy } else { 2000 + yy }, &content[2..])
+        }
+        0x18 => (digits(content.get(..4)?)?, &content[4..]),
+        _ => return None,
+    };
+    let month = digits(rest.get(..2)?)?;
+    let day = digits(rest.get(2..4)?)?;
+    let hour = digits(rest.get(4..6)?)?;
+    let minute = digits(rest.get(6..8)?)?;
+    let mut rest = &rest[8..];
+    // UTCTime's seconds are optional (the minute-precision fallback);
+    // GeneralizedTime's are not.
+    let second = match rest.get(..2) {
+        Some(s) if s.iter().all(u8::is_ascii_digit) => {
+            rest = &rest[2..];
+            digits(s)?
+        }
+        _ if tag == 0x17 => 0,
+        _ => return None,
+    };
+    let offset = match rest {
+        b"Z" => 0,
+        [sign @ (b'+' | b'-'), zone @ ..] if zone.len() == 4 => {
+            let hh = digits(&zone[..2])?;
+            let mm = digits(&zone[2..])?;
+            let offset = hh * 3600 + mm * 60;
+            if offset == 0 || hh > 24 || mm > 59 {
+                return None;
+            }
+            if *sign == b'-' { -offset } else { offset }
+        }
+        _ => return None,
+    };
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if day < 1 || day > days_in_month || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some(unix_from_civil(year, month, day, hour, minute, second) - offset)
+}
+
+/// The facts Go's `x509` package reads from a certificate for a client
+/// chain (`crypto/x509/parser.go`, `verify.go`): the validity window,
+/// whether it carries an unhandled critical extension, whether its
+/// extended key usage admits `ExtKeyUsageClientAuth`, and its path
+/// length constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CertFacts {
+    not_before: i64,
+    not_after: i64,
+    /// Go's `UnhandledCriticalExtensions` is not empty.
+    unhandled_critical: bool,
+    /// Go's `checkChainForKeyUsage` over this certificate alone passes
+    /// for `ExtKeyUsageClientAuth`: no extended key usage at all,
+    /// `anyExtendedKeyUsage`, or `clientAuth`.
+    client_auth: bool,
+    /// Go's `MaxPathLen` when `BasicConstraintsValid` and it is not
+    /// negative, which is when the basic constraints carry a
+    /// `pathLenConstraint`: the most intermediates a chain below this
+    /// certificate may hold.
+    max_path_len: Option<u64>,
+}
+
+/// A basic constraints `pathLenConstraint` as Go 1.27's
+/// `parseBasicConstraintsExtension` reads it, through cryptobyte's
+/// `ReadASN1Integer` into a `uint`: a minimally encoded, non-negative
+/// integer no larger than `math.MaxInt`.  `None` is Go's
+/// `x509: invalid basic constraints`.
+// Byte shifts over at most eight bytes.
+#[allow(clippy::arithmetic_side_effects)]
+fn der_path_len(content: &[u8]) -> Option<u64> {
+    match content {
+        [] => return None,
+        [first, ..] if first & 0x80 != 0 => return None,
+        [0x00, next, ..] if next & 0x80 == 0 => return None,
+        _ => {}
+    }
+    let digits = content.strip_prefix(&[0x00]).unwrap_or(content);
+    if digits.len() > 8 {
+        return None;
+    }
+    let value = digits
+        .iter()
+        .fold(0u64, |value, &b| (value << 8) | u64::from(b));
+    (value <= i64::MAX as u64).then_some(value)
+}
+
+/// Whether `content` is an OBJECT IDENTIFIER cryptobyte's
+/// `ReadASN1ObjectIdentifier` reads: not empty, and every subidentifier
+/// as `readBase128Int` takes it, minimally encoded in at most five
+/// bytes and below 2^31.
+// Shifts of a value checked below 2^24 first.
+#[allow(clippy::arithmetic_side_effects)]
+fn go_oid_ok(content: &[u8]) -> bool {
+    let mut rest = content;
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let mut ret = 0u32;
+        let mut i = 0;
+        loop {
+            let Some((&b, tail)) = rest.split_first() else {
+                return false;
+            };
+            if i == 5 || ret >= 1 << (31 - 7) || (i == 0 && b == 0x80) {
+                return false;
+            }
+            rest = tail;
+            ret = (ret << 7) | u32::from(b & 0x7f);
+            if b & 0x80 == 0 {
+                break;
+            }
+            i += 1;
+        }
+    }
+    true
+}
+
+/// Advance `chosen`, a strictly increasing choice of indexes below `n`,
+/// to the next such choice in lexicographic order; false after the
+/// last.
+// Index arithmetic bounded by `n`, which is at least `chosen.len()`.
+#[allow(clippy::arithmetic_side_effects)]
+fn next_choice(chosen: &mut [usize], n: usize) -> bool {
+    let k = chosen.len();
+    for i in (0..k).rev() {
+        if chosen[i] < n - k + i {
+            chosen[i] += 1;
+            for j in i + 1..k {
+                chosen[j] = chosen[j - 1] + 1;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+impl CertFacts {
+    /// Read the facts from a DER certificate, or `None` where Go's
+    /// `ParseCertificate` (`crypto/x509/parser.go`) fails on what this
+    /// reads: the version, the validity times, the extension list
+    /// (`parseExtension` and no OID twice), the critical marking
+    /// `processExtensions` refuses on the key identifiers and the
+    /// authority information access, and the extensions whose facts
+    /// are kept.  Go's other checks (the serial number, names, public
+    /// key, signature, and the contents of other extensions) are not
+    /// ported, so `Some` does not promise Go parses the certificate.
+    // The version is at most 2 before the increment.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn parse(der: &[u8]) -> Option<CertFacts> {
+        // id-ce-basicConstraints, id-ce-extKeyUsage,
+        // anyExtendedKeyUsage, id-kp-clientAuth and
+        // id-pe-authorityInfoAccess, as DER OID contents.
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const EKU: &[u8] = &[0x55, 0x1d, 0x25];
+        const EKU_ANY: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
+        const EKU_CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+        const AIA: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
+        // The GeneralName forms Go collects: rfc822Name, dNSName,
+        // uniformResourceIdentifier and iPAddress.
+        let known_name = |tag: u8| matches!(tag, 0x81 | 0x82 | 0x86 | 0x87);
+
+        let certificate = DerReader::new(der).read_tag(0x30)?;
+        let mut tbs = DerReader::new(DerReader::new(certificate).read_tag(0x30)?);
+        let version = if tbs.peek_tag() == Some(0xa0) {
+            match DerReader::new(tbs.read()?.1).read_tag(0x02)? {
+                [v @ 0..=2] => v + 1,
+                _ => return None,
+            }
+        } else {
+            1
+        };
+        tbs.read_tag(0x02)?; // serialNumber
+        tbs.read_tag(0x30)?; // signature
+        tbs.read_tag(0x30)?; // issuer
+        let mut validity = DerReader::new(tbs.read_tag(0x30)?);
+        let (tag, content) = validity.read()?;
+        let not_before = parse_asn1_time(tag, content)?;
+        let (tag, content) = validity.read()?;
+        let not_after = parse_asn1_time(tag, content)?;
+        tbs.read_tag(0x30)?; // subject
+        tbs.read_tag(0x30)?; // subjectPublicKeyInfo
+
+        let mut facts = CertFacts {
+            not_before,
+            not_after,
+            unhandled_critical: false,
+            client_auth: true,
+            max_path_len: None,
+        };
+        // Go reads the unique identifiers from v2 on and the extensions
+        // only from a v3 certificate.
+        if version < 2 {
+            return Some(facts);
+        }
+        for unique_id in [0x81, 0x82] {
+            if tbs.peek_tag() == Some(unique_id) {
+                tbs.read()?;
+            }
+        }
+        if version < 3 || tbs.peek_tag() != Some(0xa3) {
+            return Some(facts);
+        }
+        let mut extensions = DerReader::new(DerReader::new(tbs.read()?.1).read_tag(0x30)?);
+        let mut seen: Vec<&[u8]> = Vec::new();
+        while !extensions.is_empty() {
+            let mut extension = DerReader::new(extensions.read_tag(0x30)?);
+            // Go's `parseExtension`: an OID cryptobyte reads, a critical
+            // flag that is a DER BOOLEAN, and the value; then
+            // `parseCertificate` refuses an OID seen before.  An OID
+            // cryptobyte reads has one encoding, so comparing the bytes
+            // compares the OIDs.
+            let oid = extension.read_tag(0x06)?;
+            if !go_oid_ok(oid) || seen.contains(&oid) {
+                return None;
+            }
+            seen.push(oid);
+            let critical = if extension.peek_tag() == Some(0x01) {
+                match extension.read_tag(0x01)? {
+                    [0x00] => false,
+                    [0xff] => true,
+                    _ => return None,
+                }
+            } else {
+                false
+            };
+            let value = extension.read_tag(0x04)?;
+            // Go's `processExtensions`: which extensions it handles.
+            let unhandled = match oid {
+                &[0x55, 0x1d, id] if id < 0x80 => match id {
+                    // "incorrectly marked critical"
+                    14 | 35 if critical => return None,
+                    14 | 15 | 19 | 31 | 32 | 33 | 35 | 36 | 37 | 54 => false,
+                    // A subject alternative name counts as handled only
+                    // when Go collected a name from it.
+                    17 => {
+                        let mut names = DerReader::new(DerReader::new(value).read_tag(0x30)?);
+                        let mut any_known = false;
+                        while !names.is_empty() {
+                            any_known |= known_name(names.read()?.0);
+                        }
+                        !any_known
+                    }
+                    // Name constraints are unhandled when a subtree's
+                    // base is a form Go does not enforce.
+                    30 => {
+                        let mut top = DerReader::new(DerReader::new(value).read_tag(0x30)?);
+                        let mut unhandled = false;
+                        while !top.is_empty() {
+                            let mut subtrees = DerReader::new(top.read()?.1);
+                            while !subtrees.is_empty() {
+                                let subtree = subtrees.read_tag(0x30)?;
+                                unhandled |= !known_name(DerReader::new(subtree).read()?.0);
+                            }
+                        }
+                        unhandled
+                    }
+                    _ => true,
+                },
+                // "incorrectly marked critical"
+                _ if oid == AIA && critical => return None,
+                _ => oid != AIA,
+            };
+            if oid == EKU {
+                let mut usages = DerReader::new(DerReader::new(value).read_tag(0x30)?);
+                let mut client_auth = usages.is_empty();
+                while !usages.is_empty() {
+                    let usage = usages.read_tag(0x06)?;
+                    if !go_oid_ok(usage) {
+                        return None;
+                    }
+                    client_auth |= usage == EKU_ANY || usage == EKU_CLIENT_AUTH;
+                }
+                facts.client_auth = client_auth;
+            }
+            if oid == BASIC_CONSTRAINTS {
+                // An optional cA boolean, then the optional
+                // pathLenConstraint (`parseBasicConstraintsExtension`).
+                let mut constraints = DerReader::new(DerReader::new(value).read_tag(0x30)?);
+                if constraints.peek_tag() == Some(0x01)
+                    && !matches!(constraints.read_tag(0x01)?, [0x00] | [0xff])
+                {
+                    return None;
+                }
+                if constraints.peek_tag() == Some(0x02) {
+                    facts.max_path_len = Some(der_path_len(constraints.read_tag(0x02)?)?);
+                }
+            }
+            facts.unhandled_critical |= critical && unhandled;
+        }
+        Some(facts)
+    }
+
+    /// Go's `isValid` for this certificate at `now` (`verify.go`
+    /// `isValid`): no unhandled critical extension, and `now` inside
+    /// the validity window.  The path-length and name checks it also
+    /// makes depend on the chain.
+    fn valid_at(&self, now: i64) -> Result<(), rustls::CertificateError> {
+        if self.unhandled_critical {
+            return Err(rustls::CertificateError::UnhandledCriticalExtension);
+        }
+        if now < self.not_before {
+            return Err(rustls::CertificateError::NotValidYet);
+        }
+        if now > self.not_after {
+            return Err(rustls::CertificateError::Expired);
+        }
+        Ok(())
+    }
+}
+
+/// One certificate `--clientcafile` added to the pool.
+#[derive(Debug)]
+struct ClientCa {
+    der: Vec<u8>,
+    anchor: rustls::pki_types::TrustAnchor<'static>,
+    facts: CertFacts,
+}
+
+/// The client certificate verifier under `--authtype=clientcert`,
+/// deciding as Go's `x509.Certificate.Verify` does for
+/// `tls.RequireAndVerifyClientCert` (`crypto/tls/handshake_server.go`
+/// `processCertsFromClient`) where webpki would decide otherwise:
+///
+/// - A presented certificate that is itself in the pool is accepted
+///   on its own checks alone (`opts.Roots.contains(c)` making the chain
+///   `[c]`): validity, no unhandled critical extension, and a client
+///   extended key usage.  webpki refuses such a certificate when it is
+///   a CA, which is exactly what dcrd's `gencerts` and `certgen`
+///   produce, so the simplest clientcert setup would otherwise fail.
+/// - Any other certificate is chain-verified by webpki, over only the
+///   pool certificates Go would accept at the end of the chain: those
+///   `isValid(rootCertificate)` passes now, whose own extended key
+///   usage `checkChainForKeyUsage` admits, and whose path length
+///   constraint the chain's intermediates stay within.  webpki's trust
+///   anchors carry no validity window or extensions, so an expired,
+///   not yet valid, unhandled-critical, server-only or `pathlen:0` root
+///   used to anchor chains dcrd refuses.
+///
+/// The root hints and the handshake signature checks are webpki's over
+/// the whole pool.
+#[derive(Debug)]
+struct GoClientCertVerifier {
+    cas: Vec<ClientCa>,
+    all: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+}
+
+/// The most intermediate choices [`GoClientCertVerifier`] verifies
+/// for one client chain under path-length-constrained roots.  Go
+/// bounds its own chain search at `maxChainSignatureChecks` (100,
+/// `crypto/x509/verify.go`); this bounds the choices at the same
+/// number, so a client holding a chain to such a root cannot make one
+/// handshake verify combinatorially many paths by sending many
+/// intermediates.
+const MAX_CLIENT_CHAIN_CHOICES: usize = 100;
+
+impl GoClientCertVerifier {
+    /// Load the pool from the `--clientcafile` contents as Go's
+    /// `CertPool.AppendCertsFromPEM` does (`crypto/x509/cert_pool.go`):
+    /// every well-formed `CERTIFICATE` block without headers whose
+    /// certificate parses, skipping everything else, and failing only
+    /// when nothing was added.  webpki's anchor parser and
+    /// [`CertFacts::parse`] together stand in for Go's
+    /// `ParseCertificate`: a certificate either refuses is skipped.
+    fn from_pem(cas_pem: &[u8]) -> Result<GoClientCertVerifier, String> {
+        let mut cas = Vec::new();
+        let mut rest = cas_pem;
+        while !rest.is_empty() {
+            let Some((block, next)) = go_pem_decode(rest) else {
+                break;
+            };
+            rest = next;
+            if block.block_type != b"CERTIFICATE" || block.has_headers {
+                continue;
+            }
+            let mut one = rustls::RootCertStore::empty();
+            if one
+                .add(rustls::pki_types::CertificateDer::from(
+                    block.bytes.as_slice(),
+                ))
+                .is_err()
+            {
+                continue;
+            }
+            let Some(anchor) = one.roots.pop() else {
+                continue;
+            };
+            let Some(facts) = CertFacts::parse(&block.bytes) else {
+                continue;
+            };
+            cas.push(ClientCa {
+                der: block.bytes,
+                anchor,
+                facts,
+            });
+        }
+        if cas.is_empty() {
+            return Err(NO_CLIENT_CAS.to_string());
+        }
+        let all = Self::webpki_over(cas.iter().map(|ca| ca.anchor.clone()).collect())?;
+        Ok(GoClientCertVerifier { cas, all })
+    }
+
+    /// webpki's client verifier over the given anchors.
+    fn webpki_over(
+        roots: Vec<rustls::pki_types::TrustAnchor<'static>>,
+    ) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, String> {
+        rustls::server::WebPkiClientVerifier::builder(Arc::new(rustls::RootCertStore { roots }))
+            .build()
+            .map_err(|e| format!("unable to build the RPC client verifier: {e}"))
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for GoClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.all.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.all.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.all.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        let now_secs = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
+
+        // A certificate in the pool is its own chain: Go checks it with
+        // `isValid(leafCertificate)` and the key usage walk over `[c]`,
+        // and nothing else.
+        if let Some(facts) = self
+            .cas
+            .iter()
+            .find(|ca| ca.der == end_entity.as_ref())
+            .map(|ca| ca.facts)
+        {
+            facts
+                .valid_at(now_secs)
+                .map_err(rustls::Error::InvalidCertificate)?;
+            if !facts.client_auth {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::InvalidPurpose,
+                ));
+            }
+            return Ok(rustls::server::danger::ClientCertVerified::assertion());
+        }
+
+        // Otherwise only the roots Go would accept at the end of a chain
+        // may anchor one: `isValid(rootCertificate)` in `buildChains`
+        // (validity, critical extensions, and `MaxPathLen` against the
+        // chain's intermediates), and the root's own extended key usage
+        // in `checkChainForKeyUsage`.  Usually that is every root, with
+        // room for every intermediate sent, and the verifier over the
+        // whole pool answers.
+        let usable = |ca: &&ClientCa| ca.facts.valid_at(now_secs).is_ok() && ca.facts.client_auth;
+        let sent = intermediates.len();
+        let path_limit = |ca: &ClientCa| {
+            ca.facts.max_path_len.map_or(sent, |limit| {
+                usize::try_from(limit).map_or(sent, |l| l.min(sent))
+            })
+        };
+        if self
+            .cas
+            .iter()
+            .all(|ca| usable(&ca) && path_limit(ca) == sent)
+        {
+            return self.all.verify_client_cert(end_entity, intermediates, now);
+        }
+
+        // The usable roots, grouped by how many intermediates a chain to
+        // them may hold.  webpki may build its path through any of the
+        // intermediates it is given, so a group whose limit is below the
+        // number sent verifies over every choice of that many: a chain
+        // within the limit exists exactly when one of those choices
+        // verifies.
+        let mut groups: Vec<(usize, Vec<rustls::pki_types::TrustAnchor<'static>>)> = Vec::new();
+        for ca in self.cas.iter().filter(usable) {
+            let limit = path_limit(ca);
+            match groups.iter_mut().find(|(l, _)| *l == limit) {
+                Some((_, roots)) => roots.push(ca.anchor.clone()),
+                None => groups.push((limit, vec![ca.anchor.clone()])),
+            }
+        }
+        groups.sort_by_key(|(limit, _)| std::cmp::Reverse(*limit));
+        let mut first_err = None;
+        let mut choices_left = MAX_CLIENT_CHAIN_CHOICES;
+        'groups: for (limit, roots) in groups {
+            let verifier = Self::webpki_over(roots).map_err(rustls::Error::General)?;
+            // Every intermediate first.  A path through a choice of them
+            // is a path through all of them, so when no chain reaches
+            // these roots at all no choice is tried, and only a client
+            // holding a real chain to a constrained root reaches the
+            // choices.
+            match verifier.verify_client_cert(end_entity, intermediates, now) {
+                Ok(verified) if limit == sent => return Ok(verified),
+                Ok(_) => {}
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                    continue;
+                }
+            }
+            let mut chosen: Vec<usize> = (0..limit).collect();
+            loop {
+                let Some(left) = choices_left.checked_sub(1) else {
+                    break 'groups;
+                };
+                choices_left = left;
+                let subset: Vec<_> = chosen.iter().map(|&i| intermediates[i].clone()).collect();
+                match verifier.verify_client_cert(end_entity, &subset, now) {
+                    Ok(verified) => return Ok(verified),
+                    Err(e) => {
+                        first_err.get_or_insert(e);
+                    }
+                }
+                if !next_choice(&mut chosen, sent) {
+                    break;
+                }
+            }
+        }
+        Err(first_err.unwrap_or(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        )))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.all.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.all.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.all.supported_verify_schemes()
+    }
+}
+
 /// Build the rustls server configuration from the PEM certificate
 /// pair (dcrd loading `rpc.cert`/`rpc.key` into its `tls.Config`).
 ///
@@ -2240,31 +3260,41 @@ fn build_server_config(
     // P-384 only (`rustls/src/crypto/ring/sign.rs:45-65`), so a P-521
     // key is served around the provider, through [`P521SigningKey`].
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem)
-        .collect::<Result<_, _>>()
-        .map_err(|e| format!("unable to parse the RPC certificate: {e}"))?;
+    // The certificate chain is every `CERTIFICATE` block Go's
+    // `pem.Decode` finds, skipping blocks of other types and malformed
+    // ones, as `tls.X509KeyPair` collects it (`crypto/tls/tls.go`).
+    let mut certs = Vec::new();
+    let mut skipped_block_types = Vec::new();
+    let mut rest = cert_pem;
+    while let Some((block, next)) = go_pem_decode(rest) {
+        rest = next;
+        if block.block_type == b"CERTIFICATE" {
+            certs.push(rustls::pki_types::CertificateDer::from(block.bytes));
+        } else {
+            skipped_block_types.push(String::from_utf8_lossy(&block.block_type).into_owned());
+        }
+    }
+    if certs.is_empty() {
+        return Err(match skipped_block_types.as_slice() {
+            [] => "tls: failed to find any PEM data in certificate input".to_string(),
+            [only] if only.ends_with("PRIVATE KEY") => {
+                "tls: failed to find certificate PEM data in certificate input, but did find \
+                 a private key; PEM inputs may have been switched"
+                    .to_string()
+            }
+            types => format!(
+                "tls: failed to find \"CERTIFICATE\" PEM block in certificate input after \
+                 skipping PEM blocks of the following types: [{}]",
+                types.join(" ")
+            ),
+        });
+    }
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem)
         .map_err(|e| format!("unable to parse the RPC key: {e}"))?;
 
     let builder = match client_cas_pem {
-        Some(cas_pem) => {
-            let mut roots = rustls::RootCertStore::empty();
-            for cert in rustls::pki_types::CertificateDer::pem_slice_iter(cas_pem) {
-                let cert = cert.map_err(|e| {
-                    format!("unable to parse the RPC client certificate authorities: {e}")
-                })?;
-                roots.add(cert).map_err(|e| {
-                    format!("unable to add an RPC client certificate authority: {e}")
-                })?;
-            }
-            if roots.is_empty() {
-                return Err("no certificates found in the client CA file".to_string());
-            }
-            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-                .build()
-                .map_err(|e| format!("unable to build the RPC client verifier: {e}"))?;
-            rustls::ServerConfig::builder().with_client_cert_verifier(verifier)
-        }
+        Some(cas_pem) => rustls::ServerConfig::builder()
+            .with_client_cert_verifier(Arc::new(GoClientCertVerifier::from_pem(cas_pem)?)),
         None => rustls::ServerConfig::builder().with_no_client_auth(),
     };
     // A P-521 key never reaches `with_single_cert`, whose only path to a
@@ -2408,82 +3438,27 @@ impl CertEnv for SystemCertEnv {
 /// advertise a peer-to-peer listener bound to the unspecified address
 /// (dcrd `addLocalAddress`, [`crate::listenaddrs`]).
 ///
-/// On Linux they come from procfs, which needs neither a dependency nor
-/// unsafe code: the local IPv4 addresses are the `/32 host LOCAL`
-/// leaves of `/proc/net/fib_trie` (the kernel's local table, one entry
-/// per assigned address) and the IPv6 ones are `/proc/net/if_inet6`.
-/// An unreadable file contributes nothing, as the certificate still
-/// carries the loopback addresses.  Elsewhere there is no safe source
-/// in the current dependency set, so the list is empty and the
-/// certificate carries only the loopback addresses, the host name and
-/// `--altdnsnames` (recorded in PARITY).
+/// On Linux the kernel is asked over a route netlink socket, exactly as
+/// Go's `interfaceAddrTable` asks it (`net/interface_linux.go`): an
+/// `RTM_GETADDR` dump of every family, each address matched to an
+/// interface of an `RTM_GETLINK` dump.  So the list has Go's order (the
+/// kernel's, IPv4 ahead of IPv6), Go's prefixes and Go's membership:
+/// every assigned address, whether or not its link is up, and no local
+/// route that is not an address.  A kernel that cannot be asked
+/// contributes nothing, where dcrd's certgen and `addLocalAddress` fail
+/// on Go's error; the certificate still carries the loopback addresses.
+/// Elsewhere there is no safe source in the current dependency set, so
+/// the list is empty and the certificate carries only the loopback
+/// addresses, the host name and `--altdnsnames` (recorded in PARITY).
 #[cfg(target_os = "linux")]
 pub fn system_interface_addrs() -> Vec<String> {
-    let mut addrs = Vec::new();
-    if let Ok(trie) = std::fs::read_to_string("/proc/net/fib_trie") {
-        addrs.extend(fib_trie_local_addrs(&trie));
-    }
-    if let Ok(inet6) = std::fs::read_to_string("/proc/net/if_inet6") {
-        addrs.extend(if_inet6_addrs(&inet6));
-    }
-    addrs
+    netlink::interface_addrs().unwrap_or_default()
 }
 
 /// See the Linux variant: no safe interface enumeration is available.
 #[cfg(not(target_os = "linux"))]
 pub fn system_interface_addrs() -> Vec<String> {
     Vec::new()
-}
-
-/// The local IPv4 addresses in a `/proc/net/fib_trie` dump, each as
-/// `a.b.c.d/32`, deduplicated in first-seen order: every leaf line
-/// (`|-- a.b.c.d`) whose prefix lines include `/32 host LOCAL`.
-#[cfg(any(target_os = "linux", test))]
-fn fib_trie_local_addrs(trie: &str) -> Vec<String> {
-    let mut addrs: Vec<String> = Vec::new();
-    let mut leaf: Option<std::net::Ipv4Addr> = None;
-    for line in trie.lines() {
-        let line = line.trim();
-        if let Some(ip) = line.strip_prefix("|-- ") {
-            leaf = ip.trim().parse().ok();
-            continue;
-        }
-        if !line.starts_with('/') {
-            leaf = None;
-            continue;
-        }
-        let mut fields = line.split_whitespace();
-        let is_local_host = fields.next() == Some("/32")
-            && fields.next() == Some("host")
-            && fields.next() == Some("LOCAL");
-        if let Some(ip) = leaf.filter(|_| is_local_host) {
-            let cidr = format!("{ip}/32");
-            if !addrs.contains(&cidr) {
-                addrs.push(cidr);
-            }
-        }
-    }
-    addrs
-}
-
-/// The IPv6 addresses in a `/proc/net/if_inet6` table, each with its
-/// prefix length: the rows are the address as 32 hex digits, the
-/// interface index, the prefix length in hex, the scope, the flags and
-/// the interface name.
-#[cfg(any(target_os = "linux", test))]
-fn if_inet6_addrs(table: &str) -> Vec<String> {
-    table
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let hex = fields.next()?;
-            let prefix_len = u8::from_str_radix(fields.nth(1)?, 16).ok()?;
-            let bits = u128::from_str_radix(hex, 16)
-                .ok()
-                .filter(|_| hex.len() == 32)?;
-            Some(format!("{}/{prefix_len}", std::net::Ipv6Addr::from(bits)))
-        })
-        .collect()
 }
 
 /// The interface-name lookup behind `addnode` and `node` (Go's
@@ -2516,9 +3491,10 @@ impl dcroxide_rpc::helpers::InterfaceLookup for SystemInterfaces {
     }
 }
 
-/// Go's route netlink reads for [`SystemInterfaces`]
-/// (`syscall.NetlinkRIB`, `ParseNetlinkMessage`, `ParseNetlinkRouteAttr`
-/// and `net/interface_linux.go`).  Netlink structures are in host byte
+/// Go's route netlink reads for [`SystemInterfaces`] and
+/// [`system_interface_addrs`] (`syscall.NetlinkRIB`,
+/// `ParseNetlinkMessage`, `ParseNetlinkRouteAttr` and
+/// `net/interface_linux.go`).  Netlink structures are in host byte
 /// order.
 #[cfg(any(target_os = "linux", test))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Only tests use it.
@@ -2528,7 +3504,9 @@ mod netlink {
     pub(super) const NLMSG_ERROR: u16 = 2;
     pub(super) const NLMSG_DONE: u16 = 3;
     pub(super) const RTM_NEWLINK: u16 = 16;
+    const RTM_GETLINK: u16 = 18;
     pub(super) const RTM_NEWADDR: u16 = 20;
+    const RTM_GETADDR: u16 = 22;
     pub(super) const IFLA_IFNAME: u16 = 3;
     pub(super) const IFA_ADDRESS: u16 = 1;
     pub(super) const IFA_LOCAL: u16 = 2;
@@ -2625,47 +3603,101 @@ mod netlink {
         None
     }
 
-    /// The first address of interface `index` in an `RTM_GETADDR` dump,
-    /// as `ip/prefix` (Go `addrTable` over `newAddr`).  Like Go, an
-    /// address message that carries `IFA_LOCAL` -- every IPv4 one --
-    /// skips `IFA_ADDRESS` (the peer on a point-to-point link) and takes
-    /// its first other attribute, and one without takes its first
-    /// attribute.  An IPv4-mapped IPv6 address renders as IPv4, as Go's
-    /// `IP.String` renders it.
+    /// The index of every interface in an `RTM_GETLINK` dump (Go
+    /// `interfaceTable(0)`), or `None` where Go's parse fails.
+    pub(super) fn link_indexes(tab: &[u8]) -> Option<Vec<u32>> {
+        let mut indexes = Vec::new();
+        for m in messages(tab)? {
+            match m.kind {
+                NLMSG_DONE => break,
+                RTM_NEWLINK => {
+                    indexes.push(ne_u32(m.data, 4)?);
+                    route_attrs(m.data, IFINFOMSG_LEN)?;
+                }
+                _ => {}
+            }
+        }
+        Some(indexes)
+    }
+
+    /// One `RTM_NEWADDR` message's address, as Go's `newAddr` picks it and
+    /// `IPNet.String` renders it, `ip/prefix`.  Like Go, a message that
+    /// carries `IFA_LOCAL` -- every IPv4 one -- skips `IFA_ADDRESS` (the
+    /// peer on a point-to-point link) and takes its first other
+    /// attribute, and one without takes its first attribute.  An
+    /// IPv4-mapped IPv6 address renders as IPv4 with the low 32 bits of
+    /// its mask, as `networkNumberAndMask` trims a 16-byte mask for a
+    /// 4-byte address.  `Some(None)` where Go's `newAddr` returns nil (no
+    /// attribute to take, or a family other than IPv4 and IPv6), and
+    /// `None` for a malformed message.
+    fn new_addr(data: &[u8]) -> Option<Option<String>> {
+        let family = *data.first()?;
+        let prefix_len = *data.get(1)?;
+        let attrs = route_attrs(data, IFADDRMSG_LEN)?;
+        let point_to_point = attrs.iter().any(|(kind, _)| *kind == IFA_LOCAL);
+        let value = attrs
+            .iter()
+            .find(|(kind, _)| !(point_to_point && *kind == IFA_ADDRESS))
+            .map(|(_, value)| *value);
+        let (ip, prefix_len) = match (family, value) {
+            (AF_INET, Some(value)) => {
+                let octets: [u8; 4] = value.get(..4)?.try_into().ok()?;
+                (std::net::Ipv4Addr::from(octets).to_string(), prefix_len)
+            }
+            (AF_INET6, Some(value)) => {
+                let octets: [u8; 16] = value.get(..16)?.try_into().ok()?;
+                let ip = std::net::Ipv6Addr::from(octets);
+                match ip.to_ipv4_mapped() {
+                    Some(v4) => (v4.to_string(), prefix_len.saturating_sub(96)),
+                    None => (ip.to_string(), prefix_len),
+                }
+            }
+            _ => return Some(None),
+        };
+        Some(Some(format!("{ip}/{prefix_len}")))
+    }
+
+    /// The first address of interface `index` in an `RTM_GETADDR` dump
+    /// (Go `Interface.Addrs`: `addrTable` over [`new_addr`] for one
+    /// interface).
     pub(super) fn first_addr(tab: &[u8], index: u32) -> Option<String> {
         for m in messages(tab)? {
             match m.kind {
                 NLMSG_DONE => break,
                 RTM_NEWADDR if ne_u32(m.data, 4)? == index => {
-                    let family = *m.data.first()?;
-                    let prefix_len = *m.data.get(1)?;
-                    let attrs = route_attrs(m.data, IFADDRMSG_LEN)?;
-                    let point_to_point = attrs.iter().any(|(kind, _)| *kind == IFA_LOCAL);
-                    let value = attrs
-                        .iter()
-                        .find(|(kind, _)| !(point_to_point && *kind == IFA_ADDRESS))
-                        .map(|(_, value)| *value);
-                    let ip = match (family, value) {
-                        (AF_INET, Some(value)) => {
-                            let octets: [u8; 4] = value.get(..4)?.try_into().ok()?;
-                            std::net::Ipv4Addr::from(octets).to_string()
-                        }
-                        (AF_INET6, Some(value)) => {
-                            let octets: [u8; 16] = value.get(..16)?.try_into().ok()?;
-                            let ip = std::net::Ipv6Addr::from(octets);
-                            match ip.to_ipv4_mapped() {
-                                Some(v4) => v4.to_string(),
-                                None => ip.to_string(),
-                            }
-                        }
-                        _ => continue,
-                    };
-                    return Some(format!("{ip}/{prefix_len}"));
+                    if let Some(addr) = new_addr(m.data)? {
+                        return Some(addr);
+                    }
                 }
                 _ => {}
             }
         }
         None
+    }
+
+    /// Every address in an `RTM_GETADDR` dump, in the kernel's order (Go
+    /// `InterfaceAddrs`: `addrTable` over [`new_addr`] for every interface
+    /// of `interfaceTable(0)`, whose indexes are `links`).  `None` where
+    /// Go fails the call: a malformed message, or an address on an
+    /// interface the link dump did not list (`errNoSuchInterface`, which
+    /// an interface going away between the two dumps produces).
+    pub(super) fn all_addrs(tab: &[u8], links: &[u32]) -> Option<Vec<String>> {
+        let mut addrs = Vec::new();
+        for m in messages(tab)? {
+            match m.kind {
+                NLMSG_DONE => break,
+                RTM_NEWADDR => {
+                    if !links.contains(&ne_u32(m.data, 4)?) {
+                        return None;
+                    }
+                    if let Some(addr) = new_addr(m.data)? {
+                        addrs.push(addr);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(addrs)
     }
 
     /// One route netlink dump of every family (Go `syscall.NetlinkRIB`):
@@ -2731,11 +3763,20 @@ mod netlink {
         if name.is_empty() {
             return None;
         }
-        const RTM_GETLINK: u16 = 18;
-        const RTM_GETADDR: u16 = 22;
         let index = link_index(&rib(RTM_GETLINK).ok()?, name)?;
         let addr = first_addr(&rib(RTM_GETADDR).ok()?, index)?;
         Some((index, addr))
+    }
+
+    /// Every address of every interface (Go `net.InterfaceAddrs`), or
+    /// `None` where the kernel cannot be asked or Go's call fails: the
+    /// address dump first, then the link dump Go's `interfaceAddrTable`
+    /// takes to match each address to its interface.
+    #[cfg(target_os = "linux")]
+    pub(super) fn interface_addrs() -> Option<Vec<String>> {
+        let addrs = rib(RTM_GETADDR).ok()?;
+        let links = link_indexes(&rib(RTM_GETLINK).ok()?)?;
+        all_addrs(&addrs, &links)
     }
 }
 
@@ -2936,8 +3977,14 @@ const RPC_LOG_SUBSYSTEM: &str = "RPCS";
 /// How many OS threads one connection costs while it is still in the
 /// pre-authentication phase: the connection handler itself, plus the
 /// [`arm_handshake_watchdog`] thread that bounds its request read.  The
-/// watchdog stands down (and its thread exits) as soon as the request
-/// head is read, so past that point a connection costs one thread.
+/// watchdog outlives that phase: it stands down (and its thread exits)
+/// only at a websocket upgrade, once the request body has been read or
+/// just before an over-limit remainder is discarded, or when the handler
+/// returns.  So an authenticated connection reading its body still costs
+/// both threads, and dispatch then spawns the [`arm_request_cancel`]
+/// thread in the watchdog's place.  Those threads are outside this
+/// budget: an authenticated connection has left the pre-authentication
+/// pool and counts against `rpcmaxclients` instead.
 const THREADS_PER_PRE_AUTH_CONNECTION: usize = 2;
 
 /// The absolute ceiling on OS threads the listener dedicates to
@@ -4524,17 +5571,32 @@ enum ByteRead {
 
 /// Read one byte of the request head, reporting *how* it ended rather
 /// than just that it did.
+///
+/// `armed` is the receive timeout this head read last set on the socket
+/// (`None` before the first byte).  It is kept while it cannot outlast
+/// the deadline, so the socket is armed once per poll slice rather than
+/// once per byte -- a `set_read_timeout` apiece had cost as much again
+/// as the one-byte receive, under TLS too, where the byte usually comes
+/// from rustls's buffer -- and re-armed only in the last slice, where
+/// the remaining budget has shrunk below it.  Every receive is still
+/// bounded by both the slice and the deadline, exactly as
+/// [`read_exact_by_deadline`] bounds its receives.
 fn read_head_byte<S: Read + SocketTimeout>(
     stream: &mut S,
     byte: &mut [u8; 1],
     deadline: Instant,
+    armed: &mut Option<Duration>,
 ) -> ByteRead {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return ByteRead::TimedOut;
         }
-        stream.set_socket_read_timeout(Some(remaining.min(RPC_READ_POLL_INTERVAL)));
+        if armed.is_none_or(|armed| armed > remaining) {
+            let slice = remaining.min(RPC_READ_POLL_INTERVAL);
+            stream.set_socket_read_timeout(Some(slice));
+            *armed = Some(slice);
+        }
         match stream.read(byte) {
             Ok(0) => return ByteRead::Closed,
             Ok(_) => return ByteRead::Ok,
@@ -5268,8 +6330,9 @@ fn read_http_head<S: Read + SocketTimeout>(
 ) -> Result<HttpHead, HeadError> {
     let mut raw = Vec::new();
     let mut byte = [0u8; 1];
+    let mut armed = None;
     loop {
-        match read_head_byte(stream, &mut byte, deadline) {
+        match read_head_byte(stream, &mut byte, deadline, &mut armed) {
             ByteRead::Ok => {}
             // Whatever arrived, running out the clock is Go's silent
             // timeout branch.
@@ -5995,7 +7058,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
         // The upgrade allows an unauthenticated connection that must
         // authenticate in-band (dcrd `checkAuth` with `require =
         // false`), and it runs before `Upgrade` does.
-        let auth = { server.check_auth(head.authorization.as_deref(), false) };
+        let auth = { server.check_auth(head.authorization.as_deref(), false, &peer.to_string()) };
         let (authed, is_admin) = match auth {
             Ok(auth) => auth,
             Err(_) => {
@@ -6021,7 +7084,16 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
         // configuration admits.
         drop(slot);
         stream.set_socket_read_timeout(Some(WS_POLL_INTERVAL));
-        crate::websocket::serve_websocket(stream, &head, authed, is_admin, server, ntfn, shutdown);
+        crate::websocket::serve_websocket(
+            stream,
+            &head,
+            &peer.to_string(),
+            authed,
+            is_admin,
+            server,
+            ntfn,
+            shutdown,
+        );
         return;
     }
 
@@ -6062,7 +7134,7 @@ fn serve_rpc_connection<S: Read + Write + SocketTimeout + Send>(
     // Authenticate before allocating the body (dcrd runs `checkAuth`
     // before `jsonRPCRead`), so an unauthenticated client never drives a
     // full-body allocation from its declared Content-Length.
-    let auth = { server.check_auth(head.authorization.as_deref(), true) };
+    let auth = { server.check_auth(head.authorization.as_deref(), true, &peer.to_string()) };
     let is_admin = match auth {
         Ok((_, is_admin)) => is_admin,
         Err(_) => {
@@ -6854,63 +7926,6 @@ mod tests {
         assert_send_sync::<Server<NodeRpcChain>>();
     }
 
-    /// The local IPv4 addresses are the `/32 host LOCAL` leaves of the
-    /// kernel's fib trie -- not the loopback network's `/8` entry, not a
-    /// broadcast or unicast route -- each once, however many tables list
-    /// it.
-    #[test]
-    fn fib_trie_yields_each_local_address_once() {
-        let trie = "\
-Main:
-  +-- 0.0.0.0/0 3 0 5
-     |-- 0.0.0.0
-        /0 universe UNICAST
-     +-- 10.0.0.0/24 2 0 2
-        |-- 10.0.0.0
-           /24 link UNICAST
-        |-- 10.0.0.255
-           /32 link BROADCAST
-Local:
-  +-- 0.0.0.0/0 3 0 5
-     |-- 10.0.0.95
-        /32 host LOCAL
-     |-- 100.79.193.115
-        /32 host LOCAL
-     +-- 127.0.0.0/8 2 0 2
-        +-- 127.0.0.0/31 1 0 0
-           |-- 127.0.0.0
-              /8 host LOCAL
-           |-- 127.0.0.1
-              /32 host LOCAL
-     |-- 10.0.0.95
-        /32 host LOCAL
-";
-        assert_eq!(
-            fib_trie_local_addrs(trie),
-            ["10.0.0.95/32", "100.79.193.115/32", "127.0.0.1/32"]
-        );
-    }
-
-    /// `/proc/net/if_inet6` rows become `address/prefix` strings the
-    /// certgen parser reads, and a malformed row is skipped.
-    #[test]
-    fn if_inet6_yields_each_address_with_its_prefix() {
-        let table = "\
-00000000000000000000000000000001 01 80 10 80       lo
-fe8000000000000072f2615749fcb7d6 03 40 20 80 wlp194s0
-26066d00001082ad029a08db65bff626 03 40 00 00 wlp194s0
-nothex 03 40 00 00 broken
-";
-        assert_eq!(
-            if_inet6_addrs(table),
-            [
-                "::1/128",
-                "fe80::72f2:6157:49fc:b7d6/64",
-                "2606:6d00:10:82ad:29a:8db:65bf:f626/64"
-            ]
-        );
-    }
-
     /// One netlink message in host byte order: the header, the fixed
     /// part and each attribute padded to four bytes.
     fn netlink_msg(kind: u16, fixed: &[u8], attrs: &[(u16, &[u8])]) -> Vec<u8> {
@@ -7044,6 +8059,105 @@ nothex 03 40 00 00 broken
         assert_eq!(netlink::link_index(&truncated, "lo"), None);
     }
 
+    /// The host's interface addresses are Go's `InterfaceAddrs`: every
+    /// address of the `RTM_GETADDR` dump in the kernel's order, with its
+    /// own prefix, for an interface that is down as for one that is up.
+    /// They were the `/32 host LOCAL` leaves of `/proc/net/fib_trie` and
+    /// the rows of `/proc/net/if_inet6`, which put the IPv4 addresses in
+    /// numeric order, gave each of them a `/32` and left out an address
+    /// whose link was down, since the kernel flushes its local route.
+    #[test]
+    fn netlink_dumps_list_every_address_as_go_interface_addrs_does() {
+        let done = netlink_msg(netlink::NLMSG_DONE, &[0; 4], &[]);
+        let v4 = |prefix_len, index, local: [u8; 4]| {
+            netlink_msg(
+                netlink::RTM_NEWADDR,
+                &ifaddrmsg(netlink::AF_INET, prefix_len, index),
+                &[
+                    (netlink::IFA_ADDRESS, &local),
+                    (netlink::IFA_LOCAL, &local),
+                    (3, b"eth\0"),
+                ],
+            )
+        };
+        let v6 = |prefix_len, index, addr: [u8; 16]| {
+            netlink_msg(
+                netlink::RTM_NEWADDR,
+                &ifaddrmsg(netlink::AF_INET6, prefix_len, index),
+                &[(netlink::IFA_ADDRESS, &addr), (6, &[0; 16])],
+            )
+        };
+        let mut loopback6 = [0u8; 16];
+        loopback6[15] = 1;
+        let mut mapped = [0u8; 16];
+        mapped[10..].copy_from_slice(&[0xff, 0xff, 192, 0, 2, 7]);
+        let link_local = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7];
+        let dump = [
+            v4(8, 1, [127, 0, 0, 1]),
+            // A down link keeps its address, which the local table drops.
+            v4(24, 2, [10, 0, 0, 95]),
+            v4(32, 5, [100, 79, 193, 115]),
+            // A point-to-point peer is skipped for the local address.
+            netlink_msg(
+                netlink::RTM_NEWADDR,
+                &ifaddrmsg(netlink::AF_INET, 32, 7),
+                &[
+                    (netlink::IFA_ADDRESS, &[10, 0, 0, 2]),
+                    (netlink::IFA_LOCAL, &[10, 0, 0, 1]),
+                ],
+            ),
+            v6(128, 1, loopback6),
+            v6(64, 2, link_local),
+            // Go's `IPNet.String` keeps the low 32 bits of the mask of an
+            // IPv4-mapped address.
+            v6(128, 5, mapped),
+            // An address message with no attribute is Go's nil address.
+            netlink_msg(
+                netlink::RTM_NEWADDR,
+                &ifaddrmsg(netlink::AF_INET6, 64, 2),
+                &[],
+            ),
+            done.clone(),
+            // Nothing after the dump's end is read.
+            v4(8, 1, [127, 0, 0, 2]),
+        ]
+        .concat();
+        assert_eq!(
+            netlink::all_addrs(&dump, &[1, 2, 5, 7]).expect("the dump parses"),
+            [
+                "127.0.0.1/8",
+                "10.0.0.95/24",
+                "100.79.193.115/32",
+                "10.0.0.1/32",
+                "::1/128",
+                "fe80::7/64",
+                "192.0.2.7/32",
+            ]
+        );
+        // An address on an interface the link dump did not list fails
+        // the whole call, as Go's `errNoSuchInterface` does.
+        assert_eq!(netlink::all_addrs(&dump, &[1, 2, 7]), None);
+
+        let links = [
+            netlink_msg(
+                netlink::RTM_NEWLINK,
+                &ifinfomsg(1),
+                &[(netlink::IFLA_IFNAME, b"lo\0")],
+            ),
+            netlink_msg(
+                netlink::RTM_NEWLINK,
+                &ifinfomsg(2),
+                &[(netlink::IFLA_IFNAME, b"eth0\0")],
+            ),
+            done,
+        ]
+        .concat();
+        assert_eq!(netlink::link_indexes(&links), Some(vec![1, 2]));
+        let mut truncated = links;
+        truncated.truncate(truncated.len() - 1);
+        assert_eq!(netlink::link_indexes(&truncated), None);
+    }
+
     /// The daemon's lookup asks the running kernel: the loopback
     /// interface is dialed at its first address.  It used to be the
     /// `NoInterfaces` stand-in, which dialed the name `lo` as a host.
@@ -7070,6 +8184,982 @@ nothex 03 40 00 00 broken
         assert_eq!(SystemInterfaces.interface_addr("no-such-if0"), None);
     }
 
+    /// Go's `pem.Decode` over the malformed shapes a client CA file or
+    /// rpc.cert can hold, with the blocks Go 1.27 returns for each
+    /// (review finding GAP06#3): each entry is the input and the
+    /// `type|has headers|hex bytes` of every block decoded in turn.
+    #[test]
+    fn go_pem_decode_matches_go() {
+        let good = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+        let g = |extra: &str| format!("{good}{extra}");
+        let cases: Vec<(String, &str)> = vec![
+            (good.to_string(), "CERTIFICATE|false|010203"),
+            (
+                g("-----BEGIN CERTIFICATE-----\nAQID\n"),
+                "CERTIFICATE|false|010203",
+            ),
+            (
+                g(&format!(
+                    "-----BEGIN CERTIFICATE-----\nAQ!D\n-----END CERTIFICATE-----\n{good}"
+                )),
+                "CERTIFICATE|false|010203,CERTIFICATE|false|010203",
+            ),
+            (
+                "-----BEGIN CERTIFICATE-----\nProc-Type: 4,ENCRYPTED\n\nAQID\n-----END CERTIFICATE-----\n"
+                    .to_string(),
+                "CERTIFICATE|true|010203",
+            ),
+            (
+                format!("-----BEGIN CERTIFICATE----- x\nAQID\n-----END CERTIFICATE-----\n{good}"),
+                "CERTIFICATE|false|010203",
+            ),
+            ("-----BEGIN X-----\n-----END X-----\n".to_string(), "X|false|"),
+            (
+                "-----BEGIN A-----\n-----BEGIN B-----\nAQID\n-----END B-----\n".to_string(),
+                "B|false|010203",
+            ),
+            (
+                format!("-----BEGIN A-----\nAQID\n-----END B-----\n{good}"),
+                "CERTIFICATE|false|010203",
+            ),
+            (
+                "-----BEGIN A-----\r\nAQID\r\nBAUG\r\n-----END A-----\r\n".to_string(),
+                "A|false|010203040506",
+            ),
+            (
+                format!("-----BEGIN A-----\nAQID\n-----END A----- junk\n{good}"),
+                "CERTIFICATE|false|010203",
+            ),
+            (
+                "-----BEGIN A-----\nK: V\nAQID\n-----END A-----\n".to_string(),
+                "A|true|010203",
+            ),
+            ("-----BEGIN A-----\nK: V\n-----END A-----\n".to_string(), ""),
+            ("-----BEGIN A-----\nAQ==\n-----END A-----\n".to_string(), "A|false|01"),
+            ("-----BEGIN A-----\nAQI=\n-----END A-----\n".to_string(), "A|false|0102"),
+            ("-----BEGIN A-----\nAQ=A\n-----END A-----\n".to_string(), ""),
+            ("-----BEGIN A-----\nA===\n-----END A-----\n".to_string(), ""),
+            (
+                "-----BEGIN A-----\nAQID\nAQ==\n-----END A-----\n".to_string(),
+                "A|false|01020301",
+            ),
+            ("-----BEGIN A-----\nAQ==\nAQID\n-----END A-----\n".to_string(), ""),
+            (
+                "-----BEGIN A-----\nAQ ID\t\n-----END A-----\n".to_string(),
+                "A|false|010203",
+            ),
+            ("x-----BEGIN A-----\nAQID\n-----END A-----\n".to_string(), ""),
+            (
+                format!("junk\n{good}between\n{good}trailer"),
+                "CERTIFICATE|false|010203,CERTIFICATE|false|010203",
+            ),
+            ("-----BEGIN A-----\nAQID\n-----END A-----".to_string(), "A|false|010203"),
+            ("-----BEGIN A-----\nAQID\n-----END A-----  \n".to_string(), "A|false|010203"),
+            ("-----BEGIN A-----\nAQI\n-----END A-----\n".to_string(), ""),
+            ("-----BEGIN A-----\n\n-----END A-----\n".to_string(), "A|false|"),
+            ("-----BEGIN A-----\nK: V\n\n-----END A-----\n".to_string(), "A|true|"),
+            (
+                format!("-----BEGIN A-----\nAQID\n-----END A-----\n-----END A-----\n{good}"),
+                "A|false|010203,CERTIFICATE|false|010203",
+            ),
+            ("-----BEGIN A-----\nAQID==\n-----END A-----\n".to_string(), ""),
+            ("-----BEGIN -----\nAQID\n-----END -----\n".to_string(), "|false|010203"),
+            ("-----BEGIN A-----\nAQIDBA\n-----END A-----\n".to_string(), ""),
+            ("-----BEGIN A-----\nAQIDBA==\n-----END A-----\n".to_string(), "A|false|01020304"),
+            ("-----BEGIN A-----\nAQIDBAU=\n-----END A-----\n".to_string(), "A|false|0102030405"),
+            ("-----BEGIN A-----\nAB==\n-----END A-----\n".to_string(), "A|false|00"),
+        ];
+        for (input, want) in &cases {
+            let mut rest = input.as_bytes();
+            let mut got = Vec::new();
+            while let Some((block, next)) = go_pem_decode(rest) {
+                rest = next;
+                let hex: String = block.bytes.iter().map(|b| format!("{b:02x}")).collect();
+                got.push(format!(
+                    "{}|{}|{hex}",
+                    String::from_utf8_lossy(&block.block_type),
+                    block.has_headers
+                ));
+            }
+            assert_eq!(got.join(","), *want, "{input:?}");
+        }
+    }
+
+    /// cryptobyte's UTCTime and GeneralizedTime readers, as Go's
+    /// certificate parser reads the validity window.  Every row is Go
+    /// 1.27's `ParseCertificate` over a certificate with that notAfter:
+    /// a fraction of a second is refused in either form, and a zone
+    /// hour of 24 is accepted.
+    #[test]
+    fn asn1_times_parse_as_go_reads_them() {
+        let cases: [(u8, &str, Option<i64>); 21] = [
+            (0x17, "491231235959Z", Some(2_524_607_999)),
+            (0x17, "500101000000Z", Some(-631_152_000)),
+            (0x17, "4912312359Z", Some(2_524_607_940)),
+            (0x17, "491231235959+0100", Some(2_524_604_399)),
+            (0x17, "491231235959-0130", Some(2_524_613_399)),
+            (0x17, "491231235959+0000", None),
+            (0x17, "491231235959-0000", None),
+            (0x17, "491231235959+2400", Some(2_524_521_599)),
+            (0x17, "491231235959-2459", Some(2_524_697_939)),
+            (0x17, "491231235959+2500", None),
+            (0x17, "491231235959+0060", None),
+            (0x17, "491231235959.5Z", None),
+            (0x17, "491331235959Z", None),
+            (0x18, "20500101000000Z", Some(2_524_608_000)),
+            (0x18, "20500101000000.5Z", None),
+            (0x18, "20500101000000,5Z", None),
+            (0x18, "20500101000000.50Z", None),
+            (0x18, "20500101000000+2430", Some(2_524_519_800)),
+            (0x18, "20240229120000Z", Some(1_709_208_000)),
+            (0x18, "20230229120000Z", None),
+            (0x18, "205001010000Z", None),
+        ];
+        for (tag, text, want) in cases {
+            assert_eq!(parse_asn1_time(tag, text.as_bytes()), want, "{text}");
+        }
+    }
+
+    /// A DER element: tag, definite length, content.
+    fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        match content.len() {
+            len @ 0..0x80 => out.push(len as u8),
+            len @ 0x80..0x100 => out.extend([0x81, len as u8]),
+            len => out.extend([0x82, (len >> 8) as u8, len as u8]),
+        }
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// An X.509 extension element.
+    fn der_extension(oid: &[u8], critical: bool, value: &[u8]) -> Vec<u8> {
+        let mut ext = der_tlv(0x06, oid);
+        if critical {
+            ext.extend(der_tlv(0x01, &[0xff]));
+        }
+        ext.extend(der_tlv(0x04, value));
+        der_tlv(0x30, &ext)
+    }
+
+    /// A certificate skeleton carrying the given version and extensions
+    /// (the fact reader checks no signature or key).
+    fn der_certificate(version: Option<u8>, extensions: &[Vec<u8>]) -> Vec<u8> {
+        der_certificate_until(version, der_tlv(0x18, b"20500101000000Z"), extensions)
+    }
+
+    /// [`der_certificate`] with the given notAfter element.
+    fn der_certificate_until(
+        version: Option<u8>,
+        not_after: Vec<u8>,
+        extensions: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut tbs = Vec::new();
+        if let Some(version) = version {
+            tbs.extend(der_tlv(0xa0, &der_tlv(0x02, &[version])));
+        }
+        tbs.extend(der_tlv(0x02, &[1]));
+        tbs.extend(der_tlv(0x30, &[]));
+        tbs.extend(der_tlv(0x30, &[]));
+        tbs.extend(der_tlv(
+            0x30,
+            &[der_tlv(0x17, b"240101000000Z"), not_after].concat(),
+        ));
+        tbs.extend(der_tlv(0x30, &[]));
+        tbs.extend(der_tlv(0x30, &[]));
+        if !extensions.is_empty() {
+            tbs.extend(der_tlv(0xa3, &der_tlv(0x30, &extensions.concat())));
+        }
+        der_tlv(
+            0x30,
+            &[der_tlv(0x30, &tbs), der_tlv(0x30, &[]), der_tlv(0x03, &[0])].concat(),
+        )
+    }
+
+    /// The facts Go's parser and verifier read from a certificate: its
+    /// validity, which critical extensions it leaves unhandled
+    /// (`processExtensions`), whether its extended key usage admits
+    /// client authentication (`checkChainForKeyUsage`), and its path
+    /// length constraint (`parseBasicConstraintsExtension`).
+    #[test]
+    fn certificate_facts_follow_gos_parser() {
+        const UNKNOWN: &[u8] = &[0x2a, 0x03, 0x04];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const UNKNOWN_CE: &[u8] = &[0x55, 0x1d, 0x63];
+        const SAN: &[u8] = &[0x55, 0x1d, 0x11];
+        const NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
+        const EKU: &[u8] = &[0x55, 0x1d, 0x25];
+        let eku = |usages: &[&[u8]]| {
+            der_tlv(
+                0x30,
+                &usages
+                    .iter()
+                    .flat_map(|usage| der_tlv(0x06, usage))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let server_auth: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        let client_auth: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+        let any: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
+        let facts = |extensions: &[Vec<u8>]| {
+            CertFacts::parse(&der_certificate(Some(2), extensions)).expect("facts")
+        };
+
+        let plain = facts(&[]);
+        assert_eq!(
+            plain,
+            CertFacts {
+                not_before: 1_704_067_200,
+                not_after: 2_524_608_000,
+                unhandled_critical: false,
+                client_auth: true,
+                max_path_len: None,
+            }
+        );
+
+        // Critical extensions Go does not handle, and ones it does.
+        assert!(facts(&[der_extension(UNKNOWN, true, &[0x05, 0x00])]).unhandled_critical);
+        assert!(!facts(&[der_extension(UNKNOWN, false, &[0x05, 0x00])]).unhandled_critical);
+        assert!(facts(&[der_extension(UNKNOWN_CE, true, &[0x05, 0x00])]).unhandled_critical);
+        assert!(
+            !facts(&[der_extension(
+                KEY_USAGE,
+                true,
+                &der_tlv(0x03, &[0x07, 0x80])
+            )])
+            .unhandled_critical
+        );
+        // A subject alternative name with no name Go collects, and one
+        // with a DNS name.
+        let other_name = der_tlv(0x30, &der_tlv(0xa0, &[0x06, 0x01, 0x2a]));
+        assert!(facts(&[der_extension(SAN, true, &other_name)]).unhandled_critical);
+        let dns = der_tlv(0x30, &der_tlv(0x82, b"example.com"));
+        assert!(!facts(&[der_extension(SAN, true, &dns)]).unhandled_critical);
+        // Name constraints over a directory name, and over a DNS name.
+        let subtrees = |base: Vec<u8>| der_tlv(0x30, &der_tlv(0xa0, &der_tlv(0x30, &base)));
+        assert!(
+            facts(&[der_extension(
+                NAME_CONSTRAINTS,
+                true,
+                &subtrees(der_tlv(0xa4, &der_tlv(0x30, &[])))
+            )])
+            .unhandled_critical
+        );
+        assert!(
+            !facts(&[der_extension(
+                NAME_CONSTRAINTS,
+                true,
+                &subtrees(der_tlv(0x82, b"example.com"))
+            )])
+            .unhandled_critical
+        );
+
+        // Extended key usage.
+        for (usages, want) in [
+            (vec![], true),
+            (vec![client_auth], true),
+            (vec![any], true),
+            (vec![server_auth, client_auth], true),
+            (vec![server_auth], false),
+            (vec![UNKNOWN], false),
+        ] {
+            assert_eq!(
+                facts(&[der_extension(EKU, false, &eku(&usages))]).client_auth,
+                want,
+                "{usages:?}"
+            );
+        }
+
+        // The basic constraints' path length, read as Go 1.27 reads it:
+        // absent is no constraint, and a negative or non-minimal integer
+        // fails the parse.
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        let constraints = |content: &[u8]| {
+            CertFacts::parse(&der_certificate(
+                Some(2),
+                &[der_extension(
+                    BASIC_CONSTRAINTS,
+                    true,
+                    &der_tlv(0x30, content),
+                )],
+            ))
+        };
+        let ca = der_tlv(0x01, &[0xff]);
+        for (content, want) in [
+            (Vec::new(), Some(None)),
+            (ca.clone(), Some(None)),
+            ([ca.clone(), der_tlv(0x02, &[0])].concat(), Some(Some(0))),
+            ([ca.clone(), der_tlv(0x02, &[2])].concat(), Some(Some(2))),
+            (der_tlv(0x02, &[0x00, 0x80]), Some(Some(128))),
+            ([ca.clone(), der_tlv(0x02, &[0xff])].concat(), None),
+            ([ca.clone(), der_tlv(0x02, &[0x00, 0x01])].concat(), None),
+            ([ca, der_tlv(0x02, &[])].concat(), None),
+        ] {
+            let got = constraints(&content).map(|facts| facts.max_path_len);
+            assert_eq!(got, want, "{content:02x?}");
+            if let Some(facts) = constraints(&content) {
+                assert!(!facts.unhandled_critical, "{content:02x?}");
+            }
+        }
+
+        // Go reads no extensions from a v1 or v2 certificate.
+        for version in [None, Some(1)] {
+            let facts = CertFacts::parse(&der_certificate(
+                version,
+                &[der_extension(UNKNOWN, true, &[0x05, 0x00])],
+            ))
+            .expect("facts");
+            assert!(!facts.unhandled_critical, "{version:?}");
+        }
+
+        // What Go's parser refuses outright, so that the client CA file
+        // skips it, each checked against Go 1.27's `ParseCertificate`: a
+        // fractional validity time, a key identifier or authority
+        // information access marked critical, an extension twice, a
+        // critical flag or cA boolean that is not a DER BOOLEAN, and an
+        // OID cryptobyte does not read.
+        let parses = |extensions: &[Vec<u8>]| {
+            CertFacts::parse(&der_certificate(Some(2), extensions)).is_some()
+        };
+        let fractional = der_tlv(0x18, b"20500101000000.5Z");
+        assert_eq!(
+            CertFacts::parse(&der_certificate_until(Some(2), fractional, &[])),
+            None
+        );
+        const SKI: &[u8] = &[0x55, 0x1d, 0x0e];
+        const AKI: &[u8] = &[0x55, 0x1d, 0x23];
+        const AIA: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
+        const OCSP: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01];
+        let access = [der_tlv(0x06, OCSP), der_tlv(0x86, b"http://x/")].concat();
+        for (oid, value) in [
+            (SKI, der_tlv(0x04, &[1, 2, 3])),
+            (AKI, der_tlv(0x30, &der_tlv(0x80, &[1, 2, 3]))),
+            (AIA, der_tlv(0x30, &der_tlv(0x30, &access))),
+        ] {
+            assert!(parses(&[der_extension(oid, false, &value)]), "{oid:02x?}");
+            assert!(!parses(&[der_extension(oid, true, &value)]), "{oid:02x?}");
+        }
+        let unknown = der_extension(UNKNOWN, false, &[0x05, 0x00]);
+        assert!(!parses(&[unknown.clone(), unknown]));
+        let client_eku = der_extension(EKU, false, &eku(&[client_auth]));
+        assert!(!parses(&[client_eku.clone(), client_eku]));
+        let flagged = |flag: &[u8]| {
+            let extension = [
+                der_tlv(0x06, UNKNOWN),
+                der_tlv(0x01, flag),
+                der_tlv(0x04, &[0x05, 0x00]),
+            ];
+            CertFacts::parse(&der_certificate(
+                Some(2),
+                &[der_tlv(0x30, &extension.concat())],
+            ))
+            .map(|facts| facts.unhandled_critical)
+        };
+        assert_eq!(flagged(&[0x00]), Some(false));
+        assert_eq!(flagged(&[0xff]), Some(true));
+        for flag in [&[0x01][..], &[], &[0xff, 0xff]] {
+            assert_eq!(flagged(flag), None, "{flag:02x?}");
+        }
+        for (flag, want) in [(0x00, Some(None)), (0xff, Some(None)), (0x01, None)] {
+            assert_eq!(
+                constraints(&der_tlv(0x01, &[flag])).map(|facts| facts.max_path_len),
+                want,
+                "cA {flag:02x}"
+            );
+        }
+        for (oid, want) in [
+            (&[][..], false),
+            (&[0x80, 0x01], false),
+            (&[0x2a, 0x80, 0x01], false),
+            (&[0x2a, 0x83], false),
+            // 2^31, and a subidentifier of six bytes.
+            (&[0x2a, 0x88, 0x80, 0x80, 0x80, 0x00], false),
+            (&[0x2a, 0x81, 0x80, 0x80, 0x80, 0x80, 0x00], false),
+            // 2^31 - 1, and 2^28 in five bytes.
+            (&[0x2a, 0x87, 0xff, 0xff, 0xff, 0x7f], true),
+            (&[0x2a, 0x81, 0x80, 0x80, 0x80, 0x00], true),
+        ] {
+            assert_eq!(
+                parses(&[der_extension(oid, false, &[0x05, 0x00])]),
+                want,
+                "{oid:02x?}"
+            );
+            assert_eq!(
+                parses(&[der_extension(EKU, false, &eku(&[oid]))]),
+                want,
+                "EKU {oid:02x?}"
+            );
+        }
+    }
+
+    /// The `gencerts` environment for generated test certificates.
+    struct GenTestEnv {
+        now: i64,
+        serial: u8,
+    }
+
+    impl dcroxide_certgen::gentool::GenEnv for GenTestEnv {
+        fn now_unix(&mut self) -> i64 {
+            self.now
+        }
+
+        fn serial_bytes(&mut self) -> Vec<u8> {
+            self.serial = self.serial.wrapping_add(1);
+            vec![self.serial]
+        }
+    }
+
+    /// A `gencerts`-default self-signed authority valid for `years`
+    /// from `now`, as PEM and DER, with its key.
+    fn gencerts_authority(
+        now: i64,
+        years: i64,
+    ) -> (
+        dcroxide_certgen::gentool::GenCert,
+        dcroxide_certgen::gentool::ToolKeyPair,
+    ) {
+        use dcroxide_certgen::gentool;
+        let key = gentool::generate_key("P-256").expect("key");
+        let cert = gentool::generate_authority(
+            &mut GenTestEnv { now, serial: 0 },
+            &key,
+            &[],
+            "gencerts",
+            years,
+            true,
+        )
+        .expect("authority");
+        (cert, key)
+    }
+
+    /// A client certificate issued at `now` by the given authority,
+    /// valid past the authority's own validity.
+    fn gencerts_issued(
+        now: i64,
+        ca: &dcroxide_certgen::gentool::GenCert,
+        ca_key: &dcroxide_certgen::gentool::ToolKeyPair,
+    ) -> Vec<u8> {
+        use dcroxide_certgen::gentool;
+        let key_pem = gentool::pem_private_key(&ca_key.marshal_pkcs8().expect("pkcs8"));
+        let (mut loaded, ca_key) = gentool::load_ca_pair(&ca.pem, &key_pem).expect("ca pair");
+        // gencerts clamps an issued certificate to its parent's
+        // validity; OpenSSL does not, which is the case pinned here.
+        loaded.not_after_unix = 2_524_607_999;
+        let key = gentool::generate_key("P-256").expect("key");
+        gentool::create_issued_cert(
+            &mut GenTestEnv { now, serial: 100 },
+            &key,
+            &loaded,
+            &ca_key,
+            &[],
+            "client",
+            5,
+            false,
+        )
+        .expect("issued")
+        .der
+    }
+
+    /// Verify a client chain at `now` against a client CA file.
+    fn verify_client_at(
+        cas_pem: &[u8],
+        leaf: &[u8],
+        now: i64,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        use rustls::server::danger::ClientCertVerifier;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let verifier = GoClientCertVerifier::from_pem(cas_pem).expect("verifier");
+        verifier.verify_client_cert(
+            &rustls::pki_types::CertificateDer::from(leaf),
+            &[],
+            rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(now as u64)),
+        )
+    }
+
+    /// A certificate presented from the pool is its own chain, as Go's
+    /// `opts.Roots.contains(c)` makes it (review finding GAP06#1): the
+    /// self-signed CA certificate `gencerts` writes by default is
+    /// accepted inside its validity window, though webpki refuses a CA
+    /// as an end entity, and refused outside it.
+    #[test]
+    fn a_pool_certificate_is_its_own_chain() {
+        let now = 1_790_000_000;
+        let (ca, _) = gencerts_authority(now, 1);
+        verify_client_at(&ca.pem, &ca.der, now).expect("a pooled CA certificate authenticates");
+        assert!(matches!(
+            verify_client_at(&ca.pem, &ca.der, now - 3 * 86_400),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidYet
+            ))
+        ));
+        assert!(matches!(
+            verify_client_at(&ca.pem, &ca.der, now + 2 * 365 * 86_400),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Expired
+            ))
+        ));
+
+        // webpki alone refuses the same certificate, which is what the
+        // listener used to hand the handshake to.
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(ca.der.as_slice()))
+            .expect("root");
+        let webpki = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("webpki verifier");
+        assert!(
+            webpki
+                .verify_client_cert(
+                    &rustls::pki_types::CertificateDer::from(ca.der.as_slice()),
+                    &[],
+                    rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(now as u64)),
+                )
+                .is_err()
+        );
+    }
+
+    /// Only a root Go's `isValid(rootCertificate)` accepts now may anchor
+    /// a client chain (review finding GAP06#2): a leaf inside its own
+    /// validity that chains to an expired or not yet valid authority
+    /// is refused, and the same leaf under a valid authority is not.
+    #[test]
+    fn a_root_outside_its_validity_anchors_no_chain() {
+        let now = 1_790_000_000;
+        let year = 365 * 86_400;
+
+        let (valid, valid_key) = gencerts_authority(now - year, 3);
+        let leaf = gencerts_issued(now, &valid, &valid_key);
+        verify_client_at(&valid.pem, &leaf, now).expect("a valid root anchors the chain");
+
+        let (expired, expired_key) = gencerts_authority(now - 3 * year, 1);
+        let leaf = gencerts_issued(now, &expired, &expired_key);
+        assert!(verify_client_at(&expired.pem, &leaf, now).is_err());
+        // Alongside a valid but unrelated root, the expired one still
+        // anchors nothing.
+        let both = [valid.pem.as_slice(), expired.pem.as_slice()].concat();
+        assert!(verify_client_at(&both, &leaf, now).is_err());
+
+        let (future, future_key) = gencerts_authority(now + year, 1);
+        let leaf = gencerts_issued(now, &future, &future_key);
+        assert!(verify_client_at(&future.pem, &leaf, now).is_err());
+    }
+
+    /// A P-256 certificate for `subject` over `subject_key`, issued by
+    /// `issuer` and signed with `issuer_key` (ecdsa-with-SHA256), valid
+    /// from 2024 through 2049 and carrying `extensions`: the chain
+    /// shapes gencerts does not make.
+    fn signed_p256_certificate(
+        serial: u8,
+        subject: &str,
+        subject_key: &dcroxide_certgen::gentool::ToolKeyPair,
+        issuer: &str,
+        issuer_key: &dcroxide_certgen::gentool::ToolKeyPair,
+        extensions: &[Vec<u8>],
+    ) -> Vec<u8> {
+        signed_p256_certificate_until(
+            serial,
+            subject,
+            subject_key,
+            issuer,
+            issuer_key,
+            der_tlv(0x17, b"491231235959Z"),
+            extensions,
+        )
+    }
+
+    /// [`signed_p256_certificate`] with the given notAfter element.
+    fn signed_p256_certificate_until(
+        serial: u8,
+        subject: &str,
+        subject_key: &dcroxide_certgen::gentool::ToolKeyPair,
+        issuer: &str,
+        issuer_key: &dcroxide_certgen::gentool::ToolKeyPair,
+        not_after: Vec<u8>,
+        extensions: &[Vec<u8>],
+    ) -> Vec<u8> {
+        // ecdsa-with-SHA256, id-ecPublicKey, prime256v1 and commonName.
+        const ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+        const EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+        const P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+        const COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+        let name = |cn: &str| {
+            let attribute = [der_tlv(0x06, COMMON_NAME), der_tlv(0x0c, cn.as_bytes())].concat();
+            der_tlv(0x30, &der_tlv(0x31, &der_tlv(0x30, &attribute)))
+        };
+        let algorithm = der_tlv(0x30, &der_tlv(0x06, ECDSA_SHA256));
+        let spki = der_tlv(
+            0x30,
+            &[
+                der_tlv(
+                    0x30,
+                    &[der_tlv(0x06, EC_PUBLIC_KEY), der_tlv(0x06, P256)].concat(),
+                ),
+                der_tlv(0x03, &[&[0u8][..], &subject_key.public_bytes()].concat()),
+            ]
+            .concat(),
+        );
+        let validity = [der_tlv(0x17, b"240101000000Z"), not_after].concat();
+        let tbs = der_tlv(
+            0x30,
+            &[
+                der_tlv(0xa0, &der_tlv(0x02, &[2])),
+                der_tlv(0x02, &[serial]),
+                algorithm.clone(),
+                name(issuer),
+                der_tlv(0x30, &validity),
+                name(subject),
+                spki,
+                der_tlv(0xa3, &der_tlv(0x30, &extensions.concat())),
+            ]
+            .concat(),
+        );
+        // A TLS ECDSA signature is the same DER `ECDSA-Sig-Value` an
+        // X.509 signature carries.
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            issuer_key.marshal_pkcs8().expect("pkcs8").into(),
+        );
+        let signature = rustls::crypto::ring::sign::any_ecdsa_type(&key)
+            .expect("signing key")
+            .choose_scheme(&[rustls::SignatureScheme::ECDSA_NISTP256_SHA256])
+            .expect("scheme")
+            .sign(&tbs)
+            .expect("sign");
+        der_tlv(
+            0x30,
+            &[
+                tbs,
+                algorithm,
+                der_tlv(0x03, &[&[0u8][..], &signature].concat()),
+            ]
+            .concat(),
+        )
+    }
+
+    /// A DER certificate as a PEM block.
+    fn certificate_pem(der: &[u8]) -> Vec<u8> {
+        String::from_utf8(dcroxide_certgen::gentool::pem_private_key(der))
+            .expect("pem")
+            .replace("PRIVATE KEY", "CERTIFICATE")
+            .into_bytes()
+    }
+
+    /// The rest of Go's `isValid(rootCertificate)`, and the root's own
+    /// place in `checkChainForKeyUsage`, bound the chains a root anchors
+    /// (review finding GAP06#2), where webpki's trust anchors keep none
+    /// of it: a `pathlen:0` root anchors a leaf it signs but not one
+    /// under an intermediate, however many intermediates the client
+    /// sends; a `pathlen:1` root anchors a chain through one of several
+    /// sent; and a root with a server-only extended key usage or an
+    /// unknown critical extension anchors nothing.
+    #[test]
+    fn a_roots_constraints_bound_the_chains_it_anchors() {
+        use dcroxide_certgen::gentool::generate_key;
+        use rustls::server::danger::ClientCertVerifier;
+        const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
+        const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+        const EKU: &[u8] = &[0x55, 0x1d, 0x25];
+        const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        const CLIENT_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let now = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1_790_000_000));
+        let key = || generate_key("P-256").expect("key");
+        let (root_key, int_key, other_key, leaf_key, direct_key) =
+            (key(), key(), key(), key(), key());
+
+        // An authority's extensions: CA, with the given path length,
+        // allowed to sign certificates.
+        let authority = |path_len: Option<u8>| {
+            let mut constraints = der_tlv(0x01, &[0xff]);
+            if let Some(path_len) = path_len {
+                constraints.extend(der_tlv(0x02, &[path_len]));
+            }
+            vec![
+                der_extension(BASIC_CONSTRAINTS, true, &der_tlv(0x30, &constraints)),
+                der_extension(KEY_USAGE, true, &der_tlv(0x03, &[0x02, 0x84])),
+            ]
+        };
+        let eku = |usage: &[u8]| der_extension(EKU, false, &der_tlv(0x30, &der_tlv(0x06, usage)));
+        let leaf_extensions = [der_extension(
+            KEY_USAGE,
+            true,
+            &der_tlv(0x03, &[0x07, 0x80]),
+        )];
+
+        let intermediate =
+            signed_p256_certificate(2, "int", &int_key, "root", &root_key, &authority(None));
+        let other =
+            signed_p256_certificate(3, "other", &other_key, "root", &root_key, &authority(None));
+        let leaf = signed_p256_certificate(4, "leaf", &leaf_key, "int", &int_key, &leaf_extensions);
+        let direct = signed_p256_certificate(
+            5,
+            "direct",
+            &direct_key,
+            "root",
+            &root_key,
+            &leaf_extensions,
+        );
+        let verify = |root_extensions: &[Vec<u8>], end_entity: &[u8], sent: &[&[u8]]| {
+            let root =
+                signed_p256_certificate(1, "root", &root_key, "root", &root_key, root_extensions);
+            let verifier =
+                GoClientCertVerifier::from_pem(&certificate_pem(&root)).expect("verifier");
+            let sent: Vec<_> = sent
+                .iter()
+                .map(|der| rustls::pki_types::CertificateDer::from(*der))
+                .collect();
+            verifier
+                .verify_client_cert(
+                    &rustls::pki_types::CertificateDer::from(end_entity),
+                    &sent,
+                    now,
+                )
+                .is_ok()
+        };
+
+        // The path length constraint counts the chain's intermediates.
+        for (path_len, through_one) in [(None, true), (Some(1), true), (Some(0), false)] {
+            let root = authority(path_len);
+            assert_eq!(
+                verify(&root, &leaf, &[&intermediate]),
+                through_one,
+                "{path_len:?}"
+            );
+            assert_eq!(
+                verify(&root, &leaf, &[&other, &intermediate]),
+                through_one,
+                "{path_len:?}, an unrelated intermediate first"
+            );
+            assert!(verify(&root, &direct, &[]), "{path_len:?}");
+            assert!(
+                verify(&root, &direct, &[&intermediate, &other]),
+                "{path_len:?}"
+            );
+        }
+
+        // The root's own extended key usage takes part in the chain's.
+        let with = |extension: Vec<u8>| [authority(None), vec![extension]].concat();
+        assert!(verify(&with(eku(CLIENT_AUTH)), &direct, &[]));
+        assert!(!verify(&with(eku(SERVER_AUTH)), &direct, &[]));
+        assert!(!verify(&with(eku(SERVER_AUTH)), &leaf, &[&intermediate]));
+
+        // A critical extension Go does not handle disqualifies the root;
+        // the same extension marked non-critical does not.
+        let critical = der_extension(&[0x2a, 0x03, 0x04], true, &[0x05, 0x00]);
+        assert!(!verify(&with(critical), &direct, &[]));
+        let non_critical = der_extension(&[0x2a, 0x03, 0x04], false, &[0x05, 0x00]);
+        assert!(verify(&with(non_critical), &direct, &[]));
+    }
+
+    /// A pooled certificate presented as the client's is checked only as
+    /// Go checks the chain `[c]` (review findings GAP06#1 and GAP06#4):
+    /// `anyExtendedKeyUsage` admits it, as `checkChainForKeyUsage` does,
+    /// and its own signature is never verified, so a self-signature
+    /// webpki cannot check (SHA-1, or simply broken) does not refuse it.
+    /// A server-only extended key usage still does.
+    #[test]
+    fn a_pooled_leaf_is_checked_as_go_checks_it() {
+        use dcroxide_certgen::gentool::generate_key;
+        const EKU: &[u8] = &[0x55, 0x1d, 0x25];
+        const ANY: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
+        const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        let now = 1_790_000_000;
+        let key = generate_key("P-256").expect("key");
+        let self_signed = |usage: &[u8]| {
+            let eku = der_extension(EKU, false, &der_tlv(0x30, &der_tlv(0x06, usage)));
+            signed_p256_certificate(1, "client", &key, "client", &key, &[eku])
+        };
+
+        let any = self_signed(ANY);
+        verify_client_at(&certificate_pem(&any), &any, now).expect("anyExtendedKeyUsage");
+
+        // Flip the last byte of the signature value.
+        let mut broken = any.clone();
+        let last = broken.len() - 1;
+        broken[last] ^= 0x01;
+        verify_client_at(&certificate_pem(&broken), &broken, now)
+            .expect("unchecked self-signature");
+
+        let server = self_signed(SERVER_AUTH);
+        assert!(matches!(
+            verify_client_at(&certificate_pem(&server), &server, now),
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::InvalidPurpose
+            ))
+        ));
+    }
+
+    /// Every choice of `k` indexes below `n`, in order, once each.
+    #[test]
+    fn next_choice_walks_every_choice() {
+        for (n, k, want) in [
+            (3, 0, vec![vec![]]),
+            (3, 3, vec![vec![0, 1, 2]]),
+            (3, 1, vec![vec![0], vec![1], vec![2]]),
+            (
+                4,
+                2,
+                vec![
+                    vec![0, 1],
+                    vec![0, 2],
+                    vec![0, 3],
+                    vec![1, 2],
+                    vec![1, 3],
+                    vec![2, 3],
+                ],
+            ),
+        ] {
+            let mut chosen: Vec<usize> = (0..k).collect();
+            let mut got = vec![chosen.clone()];
+            while next_choice(&mut chosen, n) {
+                got.push(chosen.clone());
+            }
+            assert_eq!(got, want, "{n} choose {k}");
+        }
+    }
+
+    /// The client CA file loads as Go's `AppendCertsFromPEM` loads it
+    /// (review finding GAP06#3): malformed blocks, blocks with headers,
+    /// other block types and certificates that do not parse are skipped
+    /// beside a good certificate, and only a file with no certificate
+    /// fails, with dcrd's text once the path is known.
+    #[test]
+    fn the_client_ca_file_skips_what_go_skips() {
+        let (ca, key) = gencerts_authority(1_790_000_000, 1);
+        let good = String::from_utf8(ca.pem.clone()).expect("pem");
+        let key_pem = String::from_utf8(dcroxide_certgen::gentool::pem_private_key(
+            &key.marshal_pkcs8().expect("pkcs8"),
+        ))
+        .expect("pem");
+        let truncated: String = good.lines().take(3).map(|l| format!("{l}\n")).collect();
+        let with_header = good.replacen("-----\n", "-----\nProc-Type: 4,ENCRYPTED\n\n", 1);
+        for extra in [
+            truncated.clone(),
+            "-----BEGIN CERTIFICATE-----\nAQ!D\n-----END CERTIFICATE-----\n".to_string(),
+            with_header,
+            good.replacen("-----\n", "----- x\n", 1),
+            "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n".to_string(),
+            key_pem,
+        ] {
+            for file in [format!("{good}{extra}"), format!("{extra}{good}")] {
+                let verifier = GoClientCertVerifier::from_pem(file.as_bytes())
+                    .unwrap_or_else(|e| panic!("{e}: {file}"));
+                assert_eq!(verifier.cas.len(), 1, "{file}");
+            }
+        }
+
+        for file in [&b""[..], b"not a certificate at all", truncated.as_bytes()] {
+            let err = GoClientCertVerifier::from_pem(file).expect_err("no certificate");
+            assert_eq!(err, NO_CLIENT_CAS);
+            assert_eq!(
+                with_client_cas_path(err, Some(Path::new("/home/u/clients.pem"))),
+                r#"no certificates found in "/home/u/clients.pem""#
+            );
+        }
+    }
+
+    /// A certificate webpki takes as a trust anchor but Go's
+    /// `ParseCertificate` refuses (here a fractional notAfter, and a
+    /// subject key identifier marked critical) is skipped, as
+    /// `AppendCertsFromPEM` skips it: it neither authenticates as a
+    /// pooled certificate nor anchors a chain, and a file holding only
+    /// such certificates fails with dcrd's text.  The fact reader used
+    /// to read both, so they were pooled and authenticated.
+    #[test]
+    fn a_certificate_gos_parser_refuses_stays_out_of_the_pool() {
+        use dcroxide_certgen::gentool::generate_key;
+        const SKI: &[u8] = &[0x55, 0x1d, 0x0e];
+        let now = 1_790_000_000;
+        let key = generate_key("P-256").expect("key");
+        let ski = |critical: bool| der_extension(SKI, critical, &der_tlv(0x04, &[1, 2, 3]));
+        let parsed = signed_p256_certificate(1, "client", &key, "client", &key, &[ski(false)]);
+        verify_client_at(&certificate_pem(&parsed), &parsed, now)
+            .expect("the certificate Go parses authenticates");
+
+        let fractional = signed_p256_certificate_until(
+            2,
+            "client",
+            &key,
+            "client",
+            &key,
+            der_tlv(0x18, b"20491231235959.5Z"),
+            &[],
+        );
+        let critical_ski = signed_p256_certificate(3, "client", &key, "client", &key, &[ski(true)]);
+        let (ca, _) = gencerts_authority(now, 1);
+        for refused in [&fractional, &critical_ski] {
+            // webpki's anchor parser alone would keep it.
+            rustls::RootCertStore::empty()
+                .add(rustls::pki_types::CertificateDer::from(refused.as_slice()))
+                .expect("a webpki trust anchor");
+            let pem = certificate_pem(refused);
+            assert_eq!(
+                GoClientCertVerifier::from_pem(&pem).expect_err("nothing Go parses"),
+                NO_CLIENT_CAS
+            );
+            let file = [ca.pem.as_slice(), &pem].concat();
+            let verifier = GoClientCertVerifier::from_pem(&file).expect("the authority");
+            assert_eq!(verifier.cas.len(), 1);
+            assert!(verify_client_at(&file, refused, now).is_err());
+        }
+    }
+
+    /// rpc.cert is read as `tls.X509KeyPair` reads it: every
+    /// `CERTIFICATE` block Go's decoder finds, past malformed and
+    /// other blocks, and Go's texts when there is none (review finding
+    /// GAP06#3).
+    #[test]
+    fn the_rpc_certificate_skips_what_x509_key_pair_skips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_pem, key_pem) = load_or_generate_cert_pair(
+            &dir.path().join("rpc.cert"),
+            &dir.path().join("rpc.key"),
+            &[],
+            Curve::P256,
+        )
+        .expect("generate");
+        let cert = String::from_utf8(cert_pem).expect("pem");
+        let junk = "-----BEGIN CERTIFICATE-----\nAQ!D\n-----END CERTIFICATE-----\n\
+                    -----BEGIN CERTIFICATE-----\nAQID\n";
+        build_server_config(format!("{cert}{junk}").as_bytes(), &key_pem, None)
+            .expect("a trailing malformed block is skipped");
+
+        let err =
+            |cert: &str| build_server_config(cert.as_bytes(), &key_pem, None).expect_err("no cert");
+        assert_eq!(
+            err(""),
+            "tls: failed to find any PEM data in certificate input"
+        );
+        assert_eq!(
+            err(&String::from_utf8_lossy(&key_pem)),
+            "tls: failed to find certificate PEM data in certificate input, but did find a \
+             private key; PEM inputs may have been switched"
+        );
+        assert_eq!(
+            err(
+                "-----BEGIN A-----\nAQID\n-----END A-----\n-----BEGIN B-----\nAQID\n-----END B-----\n"
+            ),
+            "tls: failed to find \"CERTIFICATE\" PEM block in certificate input after skipping \
+             PEM blocks of the following types: [A B]"
+        );
+    }
+
+    /// The idle miner answers what dcrd's `rpcCPUMiner{nil}` answers
+    /// (`rpcadaptors.go:589-613`): not mining, no hash rate, no workers
+    /// (getmininginfo's `genproclimit` 0, review finding GAP03#3), and a
+    /// worker count that stays 0 after `setgenerate` sets one.
+    #[test]
+    fn the_idle_miner_answers_the_nil_miner_values() {
+        use dcroxide_rpc::server::RpcCpuMiner;
+        let miner = IdleCpuMiner;
+        assert!(!miner.is_mining());
+        assert_eq!(miner.hashes_per_second(), 0.0);
+        assert_eq!(miner.num_workers(), 0);
+        miner.set_num_workers(4);
+        assert_eq!(miner.num_workers(), 0);
+        assert!(!miner.is_mining());
+    }
+
     /// The idle stand-in refuses `generate` with the handler's own
     /// no-address text rather than reaching the trait's
     /// `unimplemented!`, which aborts the node.
@@ -7089,7 +9179,10 @@ nothex 03 40 00 00 broken
     /// On Linux the generated certificate's host identity is the live
     /// kernel's: the host name `/proc/sys/kernel/hostname` reports (Go's
     /// `os.Hostname`) and, among the interface addresses, the loopback
-    /// address every host carries.  The interface list used to be empty.
+    /// address every host carries, with the `/8` Go's `InterfaceAddrs`
+    /// reports for it, and every IPv4 address ahead of every IPv6 one, in
+    /// the kernel's dump order.  The interface list used to be empty, and
+    /// then gave every IPv4 address a `/32`.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_cert_env_reads_the_live_host_identity() {
@@ -7097,13 +9190,19 @@ nothex 03 40 00 00 broken
         if let Ok(name) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
             assert_eq!(env.hostname().expect("hostname"), name.trim());
         }
-        if std::fs::read_to_string("/proc/net/fib_trie").is_ok() {
-            let addrs = env.interface_addrs().expect("interface addresses");
-            assert!(
-                addrs.iter().any(|addr| addr == "127.0.0.1/32"),
-                "the loopback address is among the interface addresses: {addrs:?}"
-            );
-        }
+        let addrs = env.interface_addrs().expect("interface addresses");
+        assert!(
+            addrs.iter().any(|addr| addr == "127.0.0.1/8"),
+            "the loopback address is among the interface addresses: {addrs:?}"
+        );
+        let first_v6 = addrs
+            .iter()
+            .position(|addr| addr.contains(':'))
+            .unwrap_or(addrs.len());
+        assert!(
+            addrs.iter().skip(first_v6).all(|addr| addr.contains(':')),
+            "the IPv4 addresses come first: {addrs:?}"
+        );
     }
 
     /// A minimal request head carrying only an `Origin` and `Host`, for
@@ -7497,6 +9596,43 @@ nothex 03 40 00 00 broken
         assert!(!check_origin(&origin_head(Some("https://localhost"), None)));
     }
 
+    /// A connected full node's relay state, as the version handshake
+    /// records it, for the peer registry tests below.
+    fn test_relay_state() -> Arc<Mutex<crate::dispatch::RelayPeerState>> {
+        Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
+            crate::server::RelayPeerFacts {
+                connected: true,
+                services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
+                wants_headers: false,
+                disable_relay_tx: false,
+                protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+            },
+        )))
+    }
+
+    /// Register `peer` under `id` with its outbound `queue` and
+    /// [`test_relay_state`], as an inbound peer with no socket handle,
+    /// addresses, connection request or ban score.
+    fn register_test_peer(
+        sync_peers: &crate::dispatch::SyncPeers,
+        id: i32,
+        queue: crate::peerloop::OutboundQueue,
+        peer: Arc<Mutex<dcroxide_peer::Peer>>,
+    ) {
+        sync_peers.register(
+            id,
+            queue,
+            None,
+            test_relay_state(),
+            peer,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+    }
+
     /// The connection-manager adapter answers `getpeerinfo` from the
     /// peer registry attached through the builder — proving both the
     /// `sync_peers` wiring and the `connected_peers` delegation.
@@ -7511,15 +9647,7 @@ nothex 03 40 00 00 broken
             5,
             queue,
             None,
-            Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
-                crate::server::RelayPeerFacts {
-                    connected: true,
-                    services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
-                    wants_headers: false,
-                    disable_relay_tx: false,
-                    protocol_version: dcroxide_wire::PROTOCOL_VERSION,
-                },
-            ))),
+            test_relay_state(),
             peer,
             Some("10.0.0.1:9108".to_string()),
             false,
@@ -7549,50 +9677,75 @@ nothex 03 40 00 00 broken
         assert!(idle.connected_peers().is_empty());
     }
 
-    /// The `ping` RPC's broadcast reaches every registered peer's queue
-    /// (dcrd `BroadcastMessage`); the daemon used to inherit the trait's
-    /// empty default, so `ping` returned success and sent nothing.
+    /// The connection count is the handshaken peers `getpeerinfo`
+    /// lists, not the socket registry (review finding GAP03#2).  dcrd's
+    /// `ConnectedCount` walks its `peerState`, which a peer enters only
+    /// after its version handshake; the socket registry holds every
+    /// accepted or dialed socket from before it, so a port scan or a
+    /// peer that never sends `version` used to count, and satisfied
+    /// getwork's "Decred is not connected" gate.
     #[test]
-    fn broadcast_message_queues_to_every_registered_peer() {
+    fn connected_count_counts_the_handshaken_peers_getpeerinfo_lists() {
+        // A listener whose kernel backlog completes the dial and which
+        // then never answers the version handshake.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let silent_addr = silent.local_addr().expect("addr").to_string();
+        let channel = crate::outbound::outbound_channel();
+        let control = channel.control();
+        let connected = crate::runtime::ConnectedPeers::new();
+        let connector = crate::outbound::start_outbound(
+            crate::outbound::OutboundConfig {
+                template: control_template(),
+                connected: connected.clone(),
+                server: None,
+                manager: test_conn_manager_with_cap(50_000_000, 2),
+                dial_timeout: std::time::Duration::from_secs(5),
+                dialer: crate::socks::NodeDialer::direct(),
+                persistent: Vec::new(),
+                get_new_address: None,
+                addr_manager: None,
+            },
+            channel,
+        );
         let sync_peers = crate::dispatch::SyncPeers::new();
-        let mut receivers = Vec::new();
-        for id in [1, 2] {
-            let (queue, rx) = crate::peerloop::OutboundQueue::channel();
-            receivers.push(rx);
-            sync_peers.register(
+        let manager = NodeRpcConnManager::new(
+            connected.clone(),
+            Arc::new(crate::transport::NetByteTotals::new()),
+        )
+        .with_peer_registry(sync_peers.clone())
+        .with_outbound(control);
+        assert_eq!(manager.connected_count(), 0);
+
+        // The dialed socket is registered while its handshake is still
+        // pending, and is no connection yet.
+        manager.connect(&silent_addr, false).expect("connect");
+        assert!(
+            wait_until(std::time::Duration::from_secs(5), || connected.len() == 1),
+            "the dialed socket must be registered"
+        );
+        assert_eq!(manager.connected_count(), 0);
+        assert!(manager.connected_peers().is_empty());
+
+        for id in [3, 4] {
+            let (queue, _rx) = crate::peerloop::OutboundQueue::channel();
+            register_test_peer(
+                &sync_peers,
                 id,
                 queue,
-                None,
-                Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
-                    crate::server::RelayPeerFacts {
-                        connected: true,
-                        services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
-                        wants_headers: false,
-                        disable_relay_tx: false,
-                        protocol_version: dcroxide_wire::PROTOCOL_VERSION,
-                    },
-                ))),
                 Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
                     dcroxide_peer::Config::default(),
                 ))),
-                None,
-                false,
-                None,
-                None,
-                None,
             );
         }
-        let manager = NodeRpcConnManager::new(
-            crate::runtime::ConnectedPeers::new(),
-            Arc::new(crate::transport::NetByteTotals::new()),
-        )
-        .with_peer_registry(sync_peers);
+        assert_eq!(manager.connected_count(), 2);
+        assert_eq!(
+            manager.connected_count() as usize,
+            manager.connected_peers().len(),
+            "getconnectioncount and getpeerinfo read the same peers"
+        );
 
-        let ping = dcroxide_wire::Message::Ping(dcroxide_wire::MsgPing { nonce: 5 });
-        manager.broadcast_message(&ping);
-        for rx in &receivers {
-            assert_eq!(rx.try_recv().ok(), Some(ping.clone()));
-        }
+        connector.shutdown();
+        connected.disconnect_all();
     }
 
     /// `ping` reaches every registered peer through the connection
@@ -7624,26 +9777,7 @@ nothex 03 40 00 00 broken
             let peer = Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
                 dcroxide_peer::Config::default(),
             )));
-            sync_peers.register(
-                id,
-                queue,
-                None,
-                Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
-                    crate::server::RelayPeerFacts {
-                        connected: true,
-                        services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
-                        wants_headers: false,
-                        disable_relay_tx: false,
-                        protocol_version: dcroxide_wire::PROTOCOL_VERSION,
-                    },
-                ))),
-                Arc::clone(&peer),
-                None,
-                false,
-                None,
-                None,
-                None,
-            );
+            register_test_peer(&sync_peers, id, queue, Arc::clone(&peer));
             receivers.push(rx);
             peers.push(peer);
         }
@@ -7692,27 +9826,13 @@ nothex 03 40 00 00 broken
     fn relay_mix_messages_announces_mix_inventory() {
         let sync_peers = crate::dispatch::SyncPeers::new();
         let (queue, rx) = crate::peerloop::OutboundQueue::channel();
-        sync_peers.register(
+        register_test_peer(
+            &sync_peers,
             4,
             queue,
-            None,
-            Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
-                crate::server::RelayPeerFacts {
-                    connected: true,
-                    services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
-                    wants_headers: false,
-                    disable_relay_tx: false,
-                    protocol_version: dcroxide_wire::PROTOCOL_VERSION,
-                },
-            ))),
             Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
                 dcroxide_peer::Config::default(),
             ))),
-            None,
-            false,
-            None,
-            None,
-            None,
         );
         let manager = NodeRpcConnManager::new(
             crate::runtime::ConnectedPeers::new(),
@@ -7777,15 +9897,7 @@ nothex 03 40 00 00 broken
             3,
             queue,
             Some(crate::transport::Teardown::new(server)),
-            Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
-                crate::server::RelayPeerFacts {
-                    connected: true,
-                    services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
-                    wants_headers: false,
-                    disable_relay_tx: false,
-                    protocol_version: dcroxide_wire::PROTOCOL_VERSION,
-                },
-            ))),
+            test_relay_state(),
             peer,
             None,
             true,
@@ -7984,15 +10096,7 @@ nothex 03 40 00 00 broken
             1,
             queue,
             Some(crate::transport::Teardown::new(reg_socket)),
-            Arc::new(Mutex::new(crate::dispatch::RelayPeerState::new(
-                crate::server::RelayPeerFacts {
-                    connected: true,
-                    services: dcroxide_wire::ServiceFlag::NODE_NETWORK,
-                    wants_headers: false,
-                    disable_relay_tx: false,
-                    protocol_version: dcroxide_wire::PROTOCOL_VERSION,
-                },
-            ))),
+            test_relay_state(),
             Arc::new(Mutex::new(dcroxide_peer::Peer::new_inbound(
                 dcroxide_peer::Config::default(),
             ))),
@@ -8955,6 +11059,33 @@ nothex 03 40 00 00 broken
         assert_eq!(body, b"A");
         assert!(stream.reads < 8, "{} receives", stream.reads);
         assert!(stream.arms.get() < 8, "{} timeout arms", stream.arms.get());
+    }
+
+    /// The head is still received a byte at a time, so nothing past its
+    /// blank line is consumed, but the socket's timeout is armed once
+    /// for the slice rather than before every byte: a `dcrctl`-sized
+    /// head cost as many `set_read_timeout` calls as it had bytes.
+    #[test]
+    fn the_head_arms_the_read_timeout_once_per_slice() {
+        let head = "POST / HTTP/1.1\r\nHost: 127.0.0.1:9109\r\n\
+                    User-Agent: Go-http-client/1.1\r\nContent-Length: 2\r\n\
+                    Authorization: Basic dXNlcjpwYXNz\r\n\
+                    Content-Type: application/json\r\nAccept-Encoding: gzip\r\n\r\n";
+        let mut raw = head.as_bytes().to_vec();
+        raw.extend_from_slice(b"{}");
+        let mut stream = CountingStream {
+            inner: std::io::Cursor::new(raw),
+            reads: 0,
+            arms: std::cell::Cell::new(0),
+        };
+        let parsed = read_http_head(&mut stream, test_deadline());
+        assert!(parsed.is_ok(), "the head parses");
+        assert_eq!(stream.reads, head.len(), "one receive per head byte");
+        assert_eq!(stream.arms.get(), 1, "one timeout arm for the head");
+        // The body is still unread.
+        let mut rest = Vec::new();
+        stream.inner.read_to_end(&mut rest).expect("cursor read");
+        assert_eq!(rest, b"{}");
     }
 
     /// Read a head from raw bytes.

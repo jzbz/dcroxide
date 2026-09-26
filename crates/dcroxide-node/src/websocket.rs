@@ -59,6 +59,9 @@ const READ_LIMIT_AUTHENTICATED: usize = 1 << 24;
 pub struct NodeNtfnMgr {
     inner: Arc<Mutex<Subscriptions>>,
     clients: Arc<Mutex<HashMap<u64, ClientHandle>>>,
+    /// How many clients `clients` holds, kept beside it so a producer
+    /// can ask [`NodeNtfnMgr::has_clients`] without taking the lock.
+    registered: Arc<std::sync::atomic::AtomicUsize>,
     events: mpsc::Sender<NtfnEvent>,
     receiver: Arc<Mutex<Option<mpsc::Receiver<NtfnEvent>>>>,
     /// The maximum number of concurrent websocket clients (dcrd's
@@ -108,8 +111,10 @@ struct Pending {
     /// dcrd's `pendingNtfns` (`rpcwebsocket.go:1849`).
     held_notifications: VecDeque<String>,
     /// Whether a notification is with the writer: dcrd's `waiting`
-    /// (`:1850`). True exactly when one notification sits in `items`,
-    /// so `items` is empty only if `held_notifications` is too.
+    /// (`:1850`). True from the moment one is handed over until its
+    /// write completes, so it sits in `items` or in the batch the stream
+    /// holder is writing; outside that holder's hands, `items` is empty
+    /// only if `held_notifications` is too.
     waiting: bool,
     /// Set once nothing further will be queued.
     closed: bool,
@@ -206,31 +211,105 @@ impl OutboundQueue {
         }
     }
 
-    /// Everything queued right now, without waiting.
+    /// Everything handed to the writer right now, without waiting: every
+    /// reply and at most one notification.
     ///
     /// Called only with the stream lock held, by whichever thread holds
-    /// it. That is what keeps the writes ordered, and it is why the
-    /// reader can never be starved of output: it drains here itself
-    /// immediately before each read, so a writer that keeps losing the
-    /// stream costs latency inside one read interval rather than
-    /// forever.
+    /// it, and followed by [`OutboundQueue::batch_written`] once the
+    /// batch is on the wire (see [`write_queued_batch`]). That is what
+    /// keeps the writes ordered.
     fn take_all_now(&self) -> Vec<String> {
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let batch: Vec<String> = pending.items.drain(..).collect();
-        // The notification that was with the writer has just left, so
-        // the next one takes its place -- dcrd promoting from
-        // `pendingNtfns` when `ntfnSentChan` fires (`:1868-1880`).
+        pending.items.drain(..).collect()
+    }
+
+    /// Record that the batch last taken has been written: the
+    /// notification that was with the writer has left, so the next held
+    /// one takes its place -- dcrd promoting from `pendingNtfns` when
+    /// `ntfnSentChan` fires (`:1868-1880`), which `outHandler` signals
+    /// only once `WriteMessage` has returned (`:1902-1908`).
+    ///
+    /// Promoting on completion rather than when the batch is taken is
+    /// what orders a reply queued during the write ahead of the next
+    /// notification, as on dcrd's `sendChan`.
+    ///
+    /// A promotion is a push like any other and wakes the writer: the
+    /// batch may have been the reader's, and a reader that stops on its
+    /// drain budget leaves the rest to the writer.
+    fn batch_written(&self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if pending.waiting {
             match pending.held_notifications.pop_front() {
-                Some(next) => pending.items.push_back(next),
+                Some(next) => {
+                    pending.items.push_back(next);
+                    drop(pending);
+                    self.wake.notify_all();
+                }
                 None => pending.waiting = false,
             }
         }
-        batch
     }
+}
+
+/// Write one batch of queued output to the stream the caller holds,
+/// then promote the next held notification: `Ok(false)` when there was
+/// nothing to write.
+///
+/// A backlog therefore drains one notification per batch, each written
+/// before the next is handed over, which keeps dcrd's guarantee that a
+/// reply waits behind at most one notification.
+fn write_queued_batch<S: Read + Write>(
+    conn: &mut WsConn<S>,
+    outbound: &OutboundQueue,
+) -> Result<bool, String> {
+    let batch = outbound.take_all_now();
+    if batch.is_empty() {
+        return Ok(false);
+    }
+    for json in batch {
+        conn.write_text(json.as_bytes())?;
+    }
+    outbound.batch_written();
+    Ok(true)
+}
+
+/// How long the reader spends writing queued output before it reads
+/// again: one read poll interval (`rpcrun`'s `WS_POLL_INTERVAL`).
+///
+/// The reader keeps writing batches until the queue is empty, because
+/// it holds the stream across the blocking read that follows and the
+/// writer cannot deliver anything meanwhile. Draining one batch per
+/// read, as the port first did, delivered one notification per read
+/// interval to a client that only listens -- twenty a second, with any
+/// faster stream growing the held list without bound. The budget
+/// bounds the other direction: a stream the client takes more slowly
+/// than it is produced still lets the reader read requests between
+/// drains, which dcrd's separate `inHandler` does continuously.
+const READER_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The reader's drain before each read: write batches until the queue
+/// is empty or `budget` ([`READER_DRAIN_BUDGET`] from the reader) has
+/// been spent, so a backlog goes out at socket speed rather than one
+/// notification per read interval.  At least one batch is written
+/// whatever the budget.
+fn drain_before_read<S: Read + Write>(
+    conn: &mut WsConn<S>,
+    outbound: &OutboundQueue,
+    budget: std::time::Duration,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    while write_queued_batch(conn, outbound)? {
+        if started.elapsed() >= budget {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// One connected client: its shared request state (the ported
@@ -299,6 +378,7 @@ impl NodeNtfnMgr {
         NodeNtfnMgr {
             inner: Arc::default(),
             clients: Arc::default(),
+            registered: Arc::default(),
             events,
             receiver: Arc::new(Mutex::new(Some(receiver))),
             max_websockets,
@@ -322,29 +402,48 @@ impl NodeNtfnMgr {
         let _ = self.events.send(NtfnEvent::Shutdown);
     }
 
+    /// Whether any websocket client is registered.
+    ///
+    /// Every event is delivered only to registered clients, so with none
+    /// there is nothing for the delivery thread to do: the producers
+    /// below skip the send, and a caller that has to copy or classify
+    /// something just to build an event can ask first.  dcrd's
+    /// `notificationHandler` finds the same empty client maps and sends
+    /// nothing; a client registering an instant later misses the event
+    /// either way, since subscribing takes it a round trip after that.
+    pub fn has_clients(&self) -> bool {
+        self.registered.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+
+    /// Queue an event for the delivery thread, unless no client could
+    /// receive it.
+    fn send(&self, event: NtfnEvent) {
+        if self.has_clients() {
+            let _ = self.events.send(event);
+        }
+    }
+
     /// Queue a block-connected event (dcrd
     /// `Server.NotifyBlockConnected`).
     pub fn notify_block_connected(&self, block: Arc<MsgBlock>) {
-        let _ = self.events.send(NtfnEvent::BlockConnected(block));
+        self.send(NtfnEvent::BlockConnected(block));
     }
 
     /// Queue a block-disconnected event (dcrd
     /// `Server.NotifyBlockDisconnected`).
     pub fn notify_block_disconnected(&self, block: Arc<MsgBlock>) {
-        let _ = self.events.send(NtfnEvent::BlockDisconnected(block));
+        self.send(NtfnEvent::BlockDisconnected(block));
     }
 
     /// Queue a new-template work event (dcrd's template subscription
     /// forwarding into `NotifyWork`).
     pub fn notify_work(&self, template_block: MsgBlock, reason: TemplateUpdateReason) {
-        let _ = self
-            .events
-            .send(NtfnEvent::Work(Box::new(template_block), reason));
+        self.send(NtfnEvent::Work(Box::new(template_block), reason));
     }
 
     /// Queue a treasury-spend event (dcrd `Server.NotifyTSpend`).
     pub fn notify_tspend(&self, tspend: MsgTx) {
-        let _ = self.events.send(NtfnEvent::TSpend(Box::new(tspend)));
+        self.send(NtfnEvent::TSpend(Box::new(tspend)));
     }
 
     /// Queue a reorganization event (dcrd
@@ -356,7 +455,7 @@ impl NodeNtfnMgr {
         new_hash: Hash,
         new_height: i64,
     ) {
-        let _ = self.events.send(NtfnEvent::Reorganization {
+        self.send(NtfnEvent::Reorganization {
             old_hash,
             old_height,
             new_hash,
@@ -372,7 +471,7 @@ impl NodeNtfnMgr {
         stake_difficulty: i64,
         tickets_new: Vec<Hash>,
     ) {
-        let _ = self.events.send(NtfnEvent::NewTickets {
+        self.send(NtfnEvent::NewTickets {
             hash,
             height,
             stake_difficulty,
@@ -384,14 +483,14 @@ impl NodeNtfnMgr {
     /// their trees (dcrd `Server.NotifyNewTransactions`).
     pub fn notify_new_transactions(&self, txns: Vec<(MsgTx, i8)>) {
         for (tx, tree) in txns {
-            let _ = self.events.send(NtfnEvent::MempoolTx(Box::new(tx), tree));
+            self.send(NtfnEvent::MempoolTx(Box::new(tx), tree));
         }
     }
 
     /// Queue mixing-message events (dcrd `Server.NotifyMixMessages`).
     pub fn notify_mix_messages(&self, msgs: Vec<Message>) {
         for msg in msgs {
-            let _ = self.events.send(NtfnEvent::MixMessage(Box::new(msg)));
+            self.send(NtfnEvent::MixMessage(Box::new(msg)));
         }
     }
 
@@ -418,6 +517,8 @@ impl NodeNtfnMgr {
             return false;
         }
         clients.insert(session_id, ClientHandle { state, outbound });
+        self.registered
+            .store(clients.len(), std::sync::atomic::Ordering::Relaxed);
         true
     }
 
@@ -442,7 +543,10 @@ impl NodeNtfnMgr {
             subs.new_tickets.remove(&session_id);
             subs.mempool_txs.remove(&session_id);
         }
-        self.clients.lock().expect("ws clients").remove(&session_id);
+        let mut clients = self.clients.lock().expect("ws clients");
+        clients.remove(&session_id);
+        self.registered
+            .store(clients.len(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The number of currently registered websocket clients (dcrd
@@ -560,7 +664,7 @@ impl RpcNtfnManager for NodeNtfnMgr {
     }
 
     fn notify_winning_tickets(&self, block_hash: &Hash, block_height: i64, tickets: &[Hash]) {
-        let _ = self.events.send(NtfnEvent::WinningTickets {
+        self.send(NtfnEvent::WinningTickets {
             block_hash: *block_hash,
             block_height,
             tickets: tickets.to_vec(),
@@ -581,7 +685,7 @@ fn deliver_events(
         if matches!(event, NtfnEvent::Shutdown) {
             break;
         }
-        deliver_one(&event, &server, &subs, &clients);
+        deliver_one(event, &server, &subs, &clients);
     }
 }
 
@@ -590,9 +694,11 @@ fn deliver_events(
 /// clients, and queue the marshalled JSON on each target's outbound
 /// queue.  The builder needs no server-wide lock — dcrd's notification
 /// manager takes none either — so a handler thread serving a long
-/// request no longer blocks notification construction.
+/// request no longer blocks notification construction.  The event is
+/// taken by value so a work template moves into the template pool
+/// rather than being copied there.
 fn deliver_one(
-    event: &NtfnEvent,
+    event: NtfnEvent,
     server: &Arc<Server<NodeRpcChain>>,
     subs: &Arc<Mutex<Subscriptions>>,
     clients: &Arc<Mutex<HashMap<u64, ClientHandle>>>,
@@ -610,7 +716,7 @@ fn deliver_one(
                 .filter_map(|id| clients.get(id).map(|h| (*id, h.clone())))
                 .collect()
         };
-        let targets = match event {
+        let targets = match &event {
             NtfnEvent::BlockConnected(_)
             | NtfnEvent::BlockDisconnected(_)
             | NtfnEvent::Reorganization { .. } => pick(&subs.blocks),
@@ -634,44 +740,44 @@ fn deliver_one(
     }
 
     let out = match event {
-        NtfnEvent::BlockConnected(block) => build(server, &targets, |srv, refs| {
+        NtfnEvent::BlockConnected(ref block) => build(server, &targets, |srv, refs| {
             rpcws::notify_block_connected(srv, refs, block)
         }),
-        NtfnEvent::BlockDisconnected(block) => build(server, &targets, |srv, refs| {
+        NtfnEvent::BlockDisconnected(ref block) => build(server, &targets, |srv, refs| {
             rpcws::notify_block_disconnected(srv, refs, block)
         }),
         NtfnEvent::Work(template_block, reason) => {
             build_from_snapshots(server, &targets, |srv, refs| {
-                rpcws::notify_work(srv, refs, template_block, *reason)
+                rpcws::notify_work(srv, refs, *template_block, reason)
             })
         }
-        NtfnEvent::TSpend(tspend) => build(server, &targets, |srv, refs| {
+        NtfnEvent::TSpend(ref tspend) => build(server, &targets, |srv, refs| {
             rpcws::notify_tspend(srv, refs, tspend)
         }),
         NtfnEvent::Reorganization {
-            old_hash,
+            ref old_hash,
             old_height,
-            new_hash,
+            ref new_hash,
             new_height,
         } => build(server, &targets, |srv, refs| {
-            rpcws::notify_reorganization(srv, refs, old_hash, *old_height, new_hash, *new_height)
+            rpcws::notify_reorganization(srv, refs, old_hash, old_height, new_hash, new_height)
         }),
         NtfnEvent::WinningTickets {
-            block_hash,
+            ref block_hash,
             block_height,
-            tickets,
+            ref tickets,
         } => build(server, &targets, |srv, refs| {
-            rpcws::notify_winning_tickets_ntfn(srv, refs, block_hash, *block_height, tickets)
+            rpcws::notify_winning_tickets_ntfn(srv, refs, block_hash, block_height, tickets)
         }),
         NtfnEvent::NewTickets {
-            hash,
+            ref hash,
             height,
             stake_difficulty,
-            tickets_new,
+            ref tickets_new,
         } => build(server, &targets, |srv, refs| {
-            rpcws::notify_new_tickets(srv, refs, hash, *height, *stake_difficulty, tickets_new)
+            rpcws::notify_new_tickets(srv, refs, hash, height, stake_difficulty, tickets_new)
         }),
-        NtfnEvent::MempoolTx(tx, tree) => {
+        NtfnEvent::MempoolTx(ref tx, tree) => {
             // dcrd notifies the txaccepted subscribers only when some
             // exist, then always runs the relevant-tx pass over every
             // client.
@@ -683,11 +789,11 @@ fn deliver_one(
                 })
             };
             out.extend(build(server, &everyone, |srv, refs| {
-                rpcws::notify_relevant_tx_accepted(srv, refs, tx, *tree)
+                rpcws::notify_relevant_tx_accepted(srv, refs, tx, tree)
             }));
             out
         }
-        NtfnEvent::MixMessage(msg) => build(server, &targets, |srv, refs| {
+        NtfnEvent::MixMessage(ref msg) => build(server, &targets, |srv, refs| {
             rpcws::notify_mix_message(srv, refs, msg)
         }),
         NtfnEvent::Shutdown => Vec::new(),
@@ -767,6 +873,34 @@ where
     builder(server, &mut refs)
 }
 
+/// The RPC server's log subsystem, which dcrd's websocket code logs
+/// under (`internal/rpcserver`'s package logger, bound to `RPCS`).
+const RPCS: &str = "RPCS";
+
+/// Start a connection's writer on the scope, handing back the OS's
+/// refusal instead of panicking.
+///
+/// `Scope::spawn` panics when the OS refuses a thread (`EAGAIN` under
+/// `RLIMIT_NPROC` or a cgroup `pids.max`, `ENOMEM` for its stack), and
+/// release builds abort on a panic; this is the scoped counterpart of
+/// [`crate::runtime::spawn_conn_thread`], and honours the same test
+/// switch.
+fn spawn_writer<'scope, 'env, F>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    work: F,
+) -> std::io::Result<std::thread::ScopedJoinHandle<'scope, ()>>
+where
+    F: FnOnce() + Send + 'scope,
+{
+    #[cfg(test)]
+    if crate::runtime::REFUSE_CONN_THREADS.with(std::cell::Cell::get) {
+        return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+    }
+    std::thread::Builder::new()
+        .name("ws-writer".to_string())
+        .spawn_scoped(scope, work)
+}
+
 /// A random session id for a websocket client (dcrd
 /// `newWebsocketClient`, `internal/rpcserver/rpcwebsocket.go:2034`).
 ///
@@ -783,14 +917,18 @@ fn new_session_id() -> u64 {
 
 /// Complete the RFC 6455 handshake and serve the client's requests
 /// until it disconnects (dcrd `WebsocketHandler` plus the per-client
-/// loops).  `pre_authenticated` reflects a Basic-auth header accepted
+/// loops).  `remote_addr` is the client's address as dcrd's
+/// `r.RemoteAddr` renders it, for the log lines that name the client.
+/// `pre_authenticated` reflects a Basic-auth header accepted
 /// before the upgrade; an unauthenticated client must send
 /// `authenticate` before any other command.  The client registers with
 /// the notification manager for delivery, and its outbound queue is
 /// drained whenever the connection goes idle or between requests.
+#[allow(clippy::too_many_arguments)]
 pub fn serve_websocket<S: Read + Write + Send>(
     mut stream: S,
     head: &crate::rpcrun::HttpHead,
+    remote_addr: &str,
     pre_authenticated: bool,
     is_admin: bool,
     server: &Arc<Server<NodeRpcChain>>,
@@ -868,7 +1006,29 @@ pub fn serve_websocket<S: Read + Write + Send>(
     if stream.write_all(response.as_bytes()).is_err() || stream.flush().is_err() {
         return;
     }
+    serve_upgraded(
+        stream,
+        remote_addr,
+        pre_authenticated,
+        is_admin,
+        server,
+        ntfn,
+        shutdown,
+    );
+}
 
+/// Serve a client whose upgrade has been answered: register it, start
+/// its writer, and read its requests until it disconnects (dcrd
+/// `wsClient.Run`'s three goroutines).
+fn serve_upgraded<S: Read + Write + Send>(
+    stream: S,
+    remote_addr: &str,
+    pre_authenticated: bool,
+    is_admin: bool,
+    server: &Arc<Server<NodeRpcChain>>,
+    ntfn: &NodeNtfnMgr,
+    shutdown: &Arc<std::sync::atomic::AtomicBool>,
+) {
     let session_id = new_session_id();
     let state = Arc::new(Mutex::new({
         let mut wsc = WsClient::new(session_id);
@@ -905,21 +1065,39 @@ pub fn serve_websocket<S: Read + Write + Send>(
     let conn = Mutex::new(WsConn::new(stream));
     let write_failed = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| {
-        scope.spawn(|| {
+        let spawned = spawn_writer(scope, || {
             // Waits without the stream, then drains with it: the lock
             // order is pending (released) then conn here, and conn then
             // pending in the reader, so neither holds one while asking
-            // for the other in the opposite order.
+            // for the other in the opposite order.  One batch per
+            // acquisition, so the reader can take the stream between
+            // them; each written batch promotes the next notification,
+            // which is what brings this thread straight back.
             while outbound.wait_for_items() {
                 let mut conn = conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                for json in outbound.take_all_now() {
-                    if conn.write_text(json.as_bytes()).is_err() {
-                        write_failed.store(true, std::sync::atomic::Ordering::SeqCst);
-                        return;
-                    }
+                if write_queued_batch(&mut conn, &outbound).is_err() {
+                    write_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
                 }
             }
         });
+        // A refused writer drops the connection, as the RPC accept loop
+        // drops one whose serving thread the OS refuses: returning here
+        // closes the stream and the registration guard frees the
+        // websocket slot.  `Scope::spawn` panics instead, which the
+        // release profile turns into an abort of the whole node, and the
+        // upgrade that reaches it needs no credentials.  dcrd's
+        // `outHandler` is a goroutine, which cannot fail to start.
+        if let Err(e) = spawned {
+            crate::logging::warn(
+                RPCS,
+                &format!(
+                    "Unable to start a writer thread for websocket client {remote_addr}: {e} \
+                     -- dropping it"
+                ),
+            );
+            return;
+        }
         // Closing from a guard rather than a trailing statement, for
         // the reason `ClientRegistration` already documents: a panic
         // anywhere in the read loop that is not caught by the dispatch
@@ -933,7 +1111,15 @@ pub fn serve_websocket<S: Read + Write + Send>(
             }
         }
         let _close = CloseOnExit(&outbound);
-        serve_ws_reads(&conn, &outbound, &write_failed, &state, server, shutdown);
+        serve_ws_reads(
+            &conn,
+            &outbound,
+            &write_failed,
+            &state,
+            remote_addr,
+            server,
+            shutdown,
+        );
     });
 }
 
@@ -949,6 +1135,7 @@ fn serve_ws_reads<S: Read + Write>(
     outbound: &Arc<OutboundQueue>,
     write_failed: &std::sync::atomic::AtomicBool,
     state: &Arc<Mutex<WsClient>>,
+    remote_addr: &str,
     server: &Arc<Server<NodeRpcChain>>,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -982,16 +1169,15 @@ fn serve_ws_reads<S: Read + Write>(
         // here is what makes the writer's fairness irrelevant -- a plain
         // mutex lets this thread barge, and it does, so it takes the
         // output with it rather than leaving it for a writer it keeps
-        // outrunning. The lock is released before dispatch, which is
-        // when the writer gets its turn and the whole point of having
-        // one.
+        // outrunning. It drains until the queue is empty (or its budget
+        // is spent), not one batch, because the writer is shut out for
+        // the read that follows. The lock is
+        // released before dispatch, which is when the writer gets its
+        // turn and the whole point of having one.
         let read = {
             let mut conn = conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            for json in outbound.take_all_now() {
-                if conn.write_text(json.as_bytes()).is_err() {
-                    write_failed.store(true, std::sync::atomic::Ordering::SeqCst);
-                    break;
-                }
+            if drain_before_read(&mut conn, outbound, READER_DRAIN_BUDGET).is_err() {
+                write_failed.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             conn.read_message(read_limit)
         };
@@ -1035,7 +1221,7 @@ fn serve_ws_reads<S: Read + Write>(
         // would take.
         let outcome = {
             let _cancel = dcroxide_rpc::worksem::scope_request_cancel(Arc::clone(shutdown));
-            handle_ws_request(server, state, &message, &mut read_limit)
+            handle_ws_request(server, state, remote_addr, &message, &mut read_limit)
         };
         match outcome {
             WsOutcome::Reply(reply) => outbound.push_reply(reply),
@@ -1099,6 +1285,52 @@ enum WsOutcome {
     StopReading,
 }
 
+/// dcrd's log text for most replies `inHandler` fails to marshal
+/// (`rpcwebsocket.go:1426`, `:1440`, `:1465`, `:1598`, `:1642`, `:1670`).
+const MARSHAL_REPLY_FAILED: &str = "Failed to marshal reply";
+
+/// dcrd's log text for a limited user's refusal that fails to marshal
+/// (`rpcwebsocket.go:1520`, `:1729`).
+const MARSHAL_LIMITED_REPLY_FAILED: &str = "Failed to marshal parse failure reply";
+
+/// dcrd's log text for the batch arm's bare `MarshalResponse` failing
+/// (`rpcwebsocket.go:1577`, `:1625`).
+const CREATE_REPLY_FAILED: &str = "Failed to create reply";
+
+/// Log a reply that failed to marshal, as dcrd's `log.Errorf("<what>:
+/// %v", err)` does before dropping it.
+fn log_marshal_failure(failure: &str, err: &str) {
+    crate::logging::error(RPCS, &format!("{failure}: {err}"));
+}
+
+/// A request that parsed, logged at debug before the authentication
+/// check (`rpcwebsocket.go:1472`, `:1680`).
+fn log_received_command(method: &str, remote_addr: &str) {
+    crate::logging::debug(
+        RPCS,
+        &format!("Received command <{method}> from {remote_addr}"),
+    );
+}
+
+/// An authenticate request from a client that already authenticated:
+/// dcrd warns and disconnects it (`rpcwebsocket.go:1480-1482`,
+/// `:1688-1690`).
+fn already_authenticated(remote_addr: &str) -> WsOutcome {
+    crate::logging::warn(
+        RPCS,
+        &format!("Websocket client {remote_addr} is already authenticated"),
+    );
+    WsOutcome::Disconnect
+}
+
+/// Anything but authenticate from a client that has not authenticated:
+/// dcrd warns, without naming the client, and disconnects it
+/// (`rpcwebsocket.go:1484-1486`, `:1692-1694`).
+fn unauthenticated_message() -> WsOutcome {
+    crate::logging::warn(RPCS, "Unauthenticated websocket message received");
+    WsOutcome::Disconnect
+}
+
 /// The outcome for a request that could not be parsed: dcrd disconnects
 /// an unauthenticated client on any parse failure and hands an
 /// authenticated one an RPC parse error (dcrd `inHandler`).  Shared by
@@ -1111,12 +1343,10 @@ fn parse_error_outcome(authenticated: bool, err_text: &str) -> WsOutcome {
         err_rpc_parse().code,
         &format!("Failed to parse request: {err_text}"),
     );
-    reply_or_skip(create_marshalled_reply(
-        "1.0",
-        &RpcId::Null,
-        None,
-        Some(&json_err),
-    ))
+    reply_or_skip(
+        create_marshalled_reply("1.0", &RpcId::Null, None, Some(&json_err)),
+        MARSHAL_REPLY_FAILED,
+    )
 }
 
 /// The reply for a request whose handling panicked: dcrd's internal
@@ -1132,12 +1362,10 @@ fn panic_recovery_outcome() -> WsOutcome {
         err_rpc_internal().code,
         "internal error: the handler's daemon seam is not yet wired",
     );
-    reply_or_skip(create_marshalled_reply(
-        "1.0",
-        &RpcId::Null,
-        None,
-        Some(&json_err),
-    ))
+    reply_or_skip(
+        create_marshalled_reply("1.0", &RpcId::Null, None, Some(&json_err)),
+        MARSHAL_REPLY_FAILED,
+    )
 }
 
 /// Give one websocket request its dcrd `inHandler` handling, with the
@@ -1152,11 +1380,12 @@ fn panic_recovery_outcome() -> WsOutcome {
 fn handle_ws_request(
     server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
+    remote_addr: &str,
     message: &[u8],
     read_limit: &mut usize,
 ) -> WsOutcome {
     catch_unwind(AssertUnwindSafe(|| {
-        handle_ws_request_inner(server, state, message, read_limit)
+        handle_ws_request_inner(server, state, remote_addr, message, read_limit)
     }))
     .unwrap_or_else(|_| panic_recovery_outcome())
 }
@@ -1175,6 +1404,7 @@ fn handle_ws_request(
 fn handle_ws_request_inner(
     server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
+    remote_addr: &str,
     message: &[u8],
     read_limit: &mut usize,
 ) -> WsOutcome {
@@ -1200,9 +1430,9 @@ fn handle_ws_request_inner(
         }
     };
     if batched {
-        return handle_ws_batch(server, state, &body);
+        return handle_ws_batch(server, state, remote_addr, &body);
     }
-    handle_ws_single(server, state, &body, read_limit)
+    handle_ws_single(server, state, remote_addr, &body, read_limit)
 }
 
 /// One non-batched websocket request (dcrd `inHandler`'s
@@ -1210,6 +1440,7 @@ fn handle_ws_request_inner(
 fn handle_ws_single(
     server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
+    remote_addr: &str,
     body: &str,
     read_limit: &mut usize,
 ) -> WsOutcome {
@@ -1223,12 +1454,10 @@ fn handle_ws_single(
     // the connection open, unlike every other rejection here.
     if req.method.is_empty() {
         let json_err = RPCError::new(err_rpc_invalid_request().code, "Invalid request: malformed");
-        return reply_or_skip(create_marshalled_reply(
-            &req.jsonrpc,
-            &req.id,
-            None,
-            Some(&json_err),
-        ));
+        return reply_or_skip(
+            create_marshalled_reply(&req.jsonrpc, &req.id, None, Some(&json_err)),
+            MARSHAL_REPLY_FAILED,
+        );
     }
 
     // Valid requests with no id are notifications and draw no response.
@@ -1255,23 +1484,29 @@ fn handle_ws_single(
         if !authenticated {
             return WsOutcome::Disconnect;
         }
-        return reply_or_skip(create_marshalled_reply(
-            &req.jsonrpc,
-            &req.id,
-            None,
-            Some(&err),
-        ));
+        return reply_or_skip(
+            create_marshalled_reply(&req.jsonrpc, &req.id, None, Some(&err)),
+            MARSHAL_REPLY_FAILED,
+        );
     }
+
+    log_received_command(&req.method, remote_addr);
 
     // The authenticate state machine, keyed on whether the parsed
     // command is the authenticate one.
     let is_auth_cmd = req.method == "authenticate";
     match (authenticated, is_auth_cmd) {
-        (true, true) => return WsOutcome::Disconnect,
-        (false, false) => return WsOutcome::Disconnect,
+        (true, true) => return already_authenticated(remote_addr),
+        (false, false) => return unauthenticated_message(),
         (false, true) => {
-            let outcome =
-                authenticate(server, state, &req.jsonrpc, parsed.params.as_ref(), &req.id);
+            let outcome = authenticate(
+                server,
+                state,
+                remote_addr,
+                &req.jsonrpc,
+                parsed.params.as_ref(),
+                &req.id,
+            );
             // Only this arm raises the read limit, and it does so once
             // the credentials check out, ahead of marshalling the reply
             // (`rpcwebsocket.go:1496-1497`).
@@ -1292,11 +1527,15 @@ fn handle_ws_single(
             err_rpc_invalid_params().code,
             "limited user not authorized for this method",
         );
-        return reply_or_skip(create_marshalled_reply("", &req.id, None, Some(&json_err)));
+        return reply_or_skip(
+            create_marshalled_reply("", &req.id, None, Some(&json_err)),
+            MARSHAL_LIMITED_REPLY_FAILED,
+        );
     }
 
     // A reply that fails to marshal is logged and dropped
-    // (`serviceRequest`, `rpcwebsocket.go:1821-1826`).
+    // (`serviceRequest`, `rpcwebsocket.go:1821-1826`); the log line is
+    // `ws_service_request`'s.
     dispatch_ws_command(server, state, &req, parsed.params, WsOutcome::Skip)
 }
 
@@ -1355,6 +1594,7 @@ fn dispatch_ws_command(
 fn handle_ws_batch(
     server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
+    remote_addr: &str,
     body: &str,
 ) -> WsOutcome {
     let (authenticated, _) = client_flags(state);
@@ -1373,15 +1613,14 @@ fn handle_ws_batch(
                     err_rpc_invalid_request().code,
                     "Invalid request: empty batch",
                 );
-                if let Ok(reply) =
-                    create_marshalled_reply("2.0", &RpcId::Null, None, Some(&json_err))
-                {
-                    results.push(reply);
+                match create_marshalled_reply("2.0", &RpcId::Null, None, Some(&json_err)) {
+                    Ok(reply) => results.push(reply),
+                    Err(e) => log_marshal_failure(MARSHAL_REPLY_FAILED, &e),
                 }
             } else {
                 batch_size = entries.len();
                 for entry in entries {
-                    match handle_ws_batch_entry(server, state, &entry) {
+                    match handle_ws_batch_entry(server, state, remote_addr, &entry) {
                         WsOutcome::Reply(reply) => results.push(reply),
                         WsOutcome::Skip => {}
                         WsOutcome::Disconnect => return WsOutcome::Disconnect,
@@ -1423,7 +1662,10 @@ fn batch_parse_error_outcome(
         &format!("Failed to parse request: {}", err.go_message()),
     );
     WsOutcome::Reply(
-        create_marshalled_reply("2.0", &RpcId::Null, None, Some(&json_err)).unwrap_or_default(),
+        create_marshalled_reply("2.0", &RpcId::Null, None, Some(&json_err)).unwrap_or_else(|e| {
+            log_marshal_failure(CREATE_REPLY_FAILED, &e);
+            String::new()
+        }),
     )
 }
 
@@ -1449,6 +1691,7 @@ fn alloc_batch_array(results: &[String]) -> String {
 fn handle_ws_batch_entry(
     server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
+    remote_addr: &str,
     entry: &str,
 ) -> WsOutcome {
     let (authenticated, is_admin) = client_flags(state);
@@ -1462,12 +1705,10 @@ fn handle_ws_batch_entry(
                 err_rpc_invalid_request().code,
                 &format!("Invalid request: {err_text}"),
             );
-            return reply_or_skip(create_marshalled_reply(
-                "2.0",
-                &RpcId::Null,
-                None,
-                Some(&json_err),
-            ));
+            return reply_or_skip(
+                create_marshalled_reply("2.0", &RpcId::Null, None, Some(&json_err)),
+                CREATE_REPLY_FAILED,
+            );
         }
     };
 
@@ -1475,12 +1716,10 @@ fn handle_ws_batch_entry(
     // which the single arm does not.
     if req.method.is_empty() || !req.params_present {
         let json_err = RPCError::new(err_rpc_invalid_request().code, "Invalid request: malformed");
-        return reply_or_skip(create_marshalled_reply(
-            &req.jsonrpc,
-            &req.id,
-            None,
-            Some(&json_err),
-        ));
+        return reply_or_skip(
+            create_marshalled_reply(&req.jsonrpc, &req.id, None, Some(&json_err)),
+            MARSHAL_REPLY_FAILED,
+        );
     }
 
     if matches!(req.id, RpcId::Null) {
@@ -1503,20 +1742,27 @@ fn handle_ws_batch_entry(
         if !authenticated {
             return WsOutcome::Disconnect;
         }
-        return reply_or_skip(create_marshalled_reply(
-            &req.jsonrpc,
-            &req.id,
-            None,
-            Some(&err),
-        ));
+        return reply_or_skip(
+            create_marshalled_reply(&req.jsonrpc, &req.id, None, Some(&err)),
+            MARSHAL_REPLY_FAILED,
+        );
     }
+
+    log_received_command(&req.method, remote_addr);
 
     let is_auth_cmd = req.method == "authenticate";
     match (authenticated, is_auth_cmd) {
-        (true, true) => return WsOutcome::Disconnect,
-        (false, false) => return WsOutcome::Disconnect,
+        (true, true) => return already_authenticated(remote_addr),
+        (false, false) => return unauthenticated_message(),
         (false, true) => {
-            return authenticate(server, state, &req.jsonrpc, parsed.params.as_ref(), &req.id);
+            return authenticate(
+                server,
+                state,
+                remote_addr,
+                &req.jsonrpc,
+                parsed.params.as_ref(),
+                &req.id,
+            );
         }
         (true, false) => {}
     }
@@ -1527,12 +1773,10 @@ fn handle_ws_batch_entry(
             err_rpc_invalid_params().code,
             "limited user not authorized for this method",
         );
-        return reply_or_skip(create_marshalled_reply(
-            &req.jsonrpc,
-            &req.id,
-            None,
-            Some(&json_err),
-        ));
+        return reply_or_skip(
+            create_marshalled_reply(&req.jsonrpc, &req.id, None, Some(&json_err)),
+            MARSHAL_LIMITED_REPLY_FAILED,
+        );
     }
 
     // Unlike every marshal failure above, this one is not a `continue`
@@ -1546,6 +1790,7 @@ fn handle_ws_batch_entry(
 fn authenticate(
     server: &Arc<Server<NodeRpcChain>>,
     state: &Arc<Mutex<WsClient>>,
+    remote_addr: &str,
     jsonrpc: &str,
     params: Option<&dcroxide_dcrjson::GoValue>,
     id: &RpcId,
@@ -1558,7 +1803,9 @@ fn authenticate(
     };
     let username = struct_string(fields, 0);
     let passphrase = struct_string(fields, 1);
-    let (authed, is_admin) = server.check_auth_user_pass(&username, &passphrase);
+    // A failed check is logged by `check_auth_user_pass` itself, with
+    // the client's address, as dcrd's `checkAuthMAC` does.
+    let (authed, is_admin) = server.check_auth_user_pass(&username, &passphrase, remote_addr);
     if !authed {
         return WsOutcome::Disconnect;
     }
@@ -1569,7 +1816,10 @@ fn authenticate(
         wsc.authenticated = true;
         wsc.is_admin = is_admin;
     }
-    reply_or_skip(create_marshalled_reply(jsonrpc, id, None, None))
+    reply_or_skip(
+        create_marshalled_reply(jsonrpc, id, None, None),
+        "Failed to marshal authenticate reply",
+    )
 }
 
 /// The string value of a struct field, or empty when absent.
@@ -1581,11 +1831,15 @@ fn struct_string(fields: &[dcroxide_dcrjson::GoValue], index: usize) -> String {
 }
 
 /// Turn a marshalled reply into an outcome, dropping the reply when
-/// marshalling fails (dcrd logs and drops such failures).
-fn reply_or_skip(reply: Result<String, String>) -> WsOutcome {
+/// marshalling fails.  dcrd logs each such failure at error level before
+/// dropping it, under the text its arm uses (`failure`).
+fn reply_or_skip(reply: Result<String, String>, failure: &str) -> WsOutcome {
     match reply {
         Ok(reply) => WsOutcome::Reply(reply),
-        Err(_) => WsOutcome::Skip,
+        Err(e) => {
+            log_marshal_failure(failure, &e);
+            WsOutcome::Skip
+        }
     }
 }
 
@@ -1683,9 +1937,11 @@ mod tests {
         );
     }
 
-    /// And the backlog still drains, one per pass, in order.
+    /// And the backlog still drains, one per written batch, in order:
+    /// the next notification is handed over only once the one before it
+    /// has been written.
     #[test]
-    fn held_notifications_are_promoted_one_at_a_time() {
+    fn held_notifications_are_promoted_as_each_is_written() {
         let queue = OutboundQueue::default();
         for i in 0..3 {
             queue.push_notification(format!("ntfn{i}"));
@@ -1694,8 +1950,13 @@ mod tests {
             assert_eq!(
                 queue.take_all_now(),
                 vec![format!("ntfn{i}")],
-                "one notification per pass, oldest first"
+                "one notification per batch, oldest first"
             );
+            assert!(
+                queue.take_all_now().is_empty(),
+                "nothing more until the batch is written"
+            );
+            queue.batch_written();
         }
         assert!(
             queue.take_all_now().is_empty(),
@@ -1704,6 +1965,317 @@ mod tests {
         // The throttle resets, so a later notification is not held back.
         queue.push_notification("later".to_string());
         assert_eq!(queue.take_all_now(), vec!["later".to_string()]);
+    }
+
+    /// dcrd promotes the next notification when `outHandler` reports the
+    /// last one written, so a reply queued while that write was under way
+    /// is already on `sendChan` ahead of it.  Promoting as the batch was
+    /// taken put the reply second.
+    #[test]
+    fn a_reply_queued_during_a_write_goes_ahead_of_the_next_notification() {
+        let queue = OutboundQueue::default();
+        queue.push_notification("ntfn0".to_string());
+        queue.push_notification("ntfn1".to_string());
+        assert_eq!(queue.take_all_now(), vec!["ntfn0".to_string()]);
+        // The reply arrives while ntfn0 is being written.
+        queue.push_reply("reply".to_string());
+        queue.batch_written();
+        assert_eq!(
+            queue.take_all_now(),
+            vec!["reply".to_string(), "ntfn1".to_string()]
+        );
+    }
+
+    /// A stream that serves `input` and then an idle read, and records
+    /// what is written to it where the test can still see it once the
+    /// stream is gone.
+    #[derive(Default)]
+    struct ScriptedStream {
+        input: std::io::Cursor<Vec<u8>>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Read for ScriptedStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.input.read(buf)? {
+                0 => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+                n => Ok(n),
+            }
+        }
+    }
+
+    impl Write for ScriptedStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.lock().expect("written").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The payloads of the short unmasked text frames in `wire`.
+    fn text_frames(wire: &[u8]) -> Vec<String> {
+        let mut frames = Vec::new();
+        let mut rest = wire;
+        while let [first, second, tail @ ..] = rest {
+            assert_eq!(*first, 0x81, "a final text frame");
+            let len = usize::from(*second);
+            assert!(len < 126, "short payloads only");
+            frames.push(String::from_utf8(tail[..len].to_vec()).expect("utf8"));
+            rest = &tail[len..];
+        }
+        frames
+    }
+
+    /// An RPC server over a genesis testnet chain with the credentials
+    /// user:pass, as the websocket integration tests build it.
+    fn genesis_rpc_server() -> (tempfile::TempDir, Arc<Server<NodeRpcChain>>) {
+        use dcroxide_rpc::server::Config;
+
+        let params = dcroxide_chaincfg::testnet3_params();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let opts = dcroxide_database::Options::new(dir.path().join("blocks"), params.net.0);
+        let db = dcroxide_database::Database::create(&opts).expect("create database");
+        let chain = Arc::new(Mutex::new(
+            dcroxide_blockchain::process::Chain::open(db, &params, params.assume_valid, false, 0)
+                .expect("open chain"),
+        ));
+        let tx_pool = crate::txmempool::new_shared_tx_pool(
+            Arc::clone(&chain),
+            &params,
+            false,
+            100,
+            10000,
+            false,
+            false,
+        );
+        let sync_manager = Arc::new(Mutex::new(crate::sync::new_sync_manager(
+            Arc::clone(&chain),
+            &params,
+            false,
+            8,
+            1000,
+            Arc::clone(&tx_pool),
+            crate::mixnode::shared_mix_pool(Arc::clone(&chain), params.clone(), &tx_pool),
+        )));
+        let server = Server::new(Config {
+            chain: NodeRpcChain::new(chain, params.clone()),
+            chain_params: params.clone(),
+            subsidy_cache: Mutex::new(dcroxide_standalone::SubsidyCache::new(params.clone())),
+            min_relay_tx_fee: 10000,
+            max_protocol_version: dcroxide_wire::PROTOCOL_VERSION,
+            sync_mgr: Box::new(crate::rpcrun::NodeRpcSyncManager::new(
+                sync_manager,
+                Arc::clone(&tx_pool),
+            )),
+            conn_mgr: Box::new(crate::rpcrun::NodeRpcConnManager::new(
+                crate::runtime::ConnectedPeers::new(),
+                Arc::new(crate::transport::NetByteTotals::new()),
+            )),
+            client_cert_auth: false,
+            tx_mempooler: Box::new(crate::txmempool::NodeRpcTxMempooler::new(Arc::clone(
+                &tx_pool,
+            ))),
+            clock: Box::new(crate::rpcrun::SystemClock),
+            interfaces: Box::new(dcroxide_rpc::helpers::NoInterfaces),
+            rand_u64: Box::new(|| 7),
+            tx_indexer: None,
+            db: Box::new(()),
+            filterer_v2: Box::new(()),
+            exists_addresser: None,
+            log_manager: Box::new(()),
+            fee_estimator: Box::new(()),
+            block_templater: None,
+            sanity_checker: Box::new(()),
+            time_source: Box::new(crate::rpcrun::SystemTimeSource),
+            proxy: String::new(),
+            test_net: true,
+            runtime_version: String::new(),
+            cpu_miner: Box::new(()),
+            mix_pooler: Box::new(()),
+            profiler_mgr: Box::new(()),
+            addr_manager: Box::new(()),
+            mining_addrs: Vec::new(),
+            user_agent_version: "0.1.0".to_string(),
+            net_info: Vec::new(),
+            services: 0,
+            request_shutdown: Box::new(|| {}),
+            allow_unsynced_mining: false,
+            rpc_user: "user".to_string(),
+            rpc_pass: "pass".to_string(),
+            rpc_limit_user: "limit".to_string(),
+            rpc_limit_pass: "limitpass".to_string(),
+        });
+        (dir, Arc::new(server))
+    }
+
+    /// A masked client text frame carrying `payload`.
+    fn client_frame(payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 126, "short payloads only");
+        let mask = [0x12u8, 0x34, 0x56, 0x78];
+        let mut frame = vec![0x81, 0x80 | payload.len() as u8];
+        frame.extend_from_slice(&mask);
+        frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i & 3]));
+        frame
+    }
+
+    /// The OS refusing the writer thread drops the connection -- nothing
+    /// read, nothing written -- and frees its websocket slot, instead of
+    /// `Scope::spawn`'s panic, which the release profile turns into an
+    /// abort of the whole node.  The upgrade needs no credentials, so any
+    /// client that reaches the RPC port could otherwise take the node
+    /// down once the host is at its task limit.
+    #[test]
+    fn a_refused_writer_drops_the_connection_and_frees_the_slot() {
+        let (_dir, server) = genesis_rpc_server();
+        let ntfn = NodeNtfnMgr::with_max_websockets(1);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream = ScriptedStream {
+            input: std::io::Cursor::new(client_frame(
+                br#"{"jsonrpc":"1.0","method":"session","params":[],"id":1}"#,
+            )),
+            written: Arc::default(),
+        };
+        let written = Arc::clone(&stream.written);
+        // Ends a connection that was served after all, so a regression
+        // fails the assertions below rather than hanging the test.
+        {
+            let written = Arc::clone(&written);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while written.lock().expect("written").is_empty()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+
+        crate::runtime::REFUSE_CONN_THREADS.with(|refuse| refuse.set(true));
+        serve_upgraded(stream, "127.0.0.1:1", true, true, &server, &ntfn, &shutdown);
+        crate::runtime::REFUSE_CONN_THREADS.with(|refuse| refuse.set(false));
+
+        assert!(
+            written.lock().expect("written").is_empty(),
+            "the refused connection is dropped unserved"
+        );
+        assert_eq!(ntfn.num_clients(), 0, "its websocket slot is free again");
+        assert!(
+            ntfn.add_client(9, Arc::new(Mutex::new(WsClient::new(9))), Arc::default()),
+            "and another client can take it"
+        );
+    }
+
+    /// The same connection with its writer running is served: the
+    /// request is read and answered before the idle stream ends it at
+    /// shutdown.  This is what the refusal above must not do.
+    #[test]
+    fn a_connection_with_its_writer_is_served() {
+        let (_dir, server) = genesis_rpc_server();
+        let ntfn = NodeNtfnMgr::with_max_websockets(1);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream = ScriptedStream {
+            input: std::io::Cursor::new(client_frame(
+                br#"{"jsonrpc":"1.0","method":"session","params":[],"id":1}"#,
+            )),
+            written: Arc::default(),
+        };
+        let written = Arc::clone(&stream.written);
+        let stopper = {
+            let written = Arc::clone(&written);
+            let shutdown = Arc::clone(&shutdown);
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while written.lock().expect("written").is_empty()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        serve_upgraded(stream, "127.0.0.1:1", true, true, &server, &ntfn, &shutdown);
+        stopper.join().expect("stopper");
+        let frames = text_frames_any(&written.lock().expect("written"));
+        assert_eq!(frames.len(), 1, "one reply");
+        assert!(frames[0].contains("sessionid"), "{}", frames[0]);
+        assert_eq!(ntfn.num_clients(), 0, "the slot is released on exit");
+    }
+
+    /// The payloads of the unmasked text frames in `wire`, of any length
+    /// up to 64 KiB.
+    fn text_frames_any(wire: &[u8]) -> Vec<String> {
+        let mut frames = Vec::new();
+        let mut rest = wire;
+        while let [first, second, tail @ ..] = rest {
+            assert_eq!(*first, 0x81, "a final text frame");
+            let (len, tail) = match *second {
+                126 => (
+                    usize::from(u16::from_be_bytes([tail[0], tail[1]])),
+                    &tail[2..],
+                ),
+                n => (usize::from(n), tail),
+            };
+            frames.push(String::from_utf8(tail[..len].to_vec()).expect("utf8"));
+            rest = &tail[len..];
+        }
+        frames
+    }
+
+    /// The reader holds the stream across the read that follows its
+    /// drain, so it must write the whole backlog first.  Draining one
+    /// batch per read delivered one notification per read interval to a
+    /// client that only listens: twenty a second, however fast the
+    /// socket.
+    ///
+    /// The budget is unbounded here so the one-pass assertion does not
+    /// depend on the test thread being scheduled; the budget's own stop
+    /// is pinned by `the_reader_drain_stops_when_its_budget_is_spent`.
+    #[test]
+    fn the_reader_drains_a_whole_backlog_before_it_reads() {
+        let queue = OutboundQueue::default();
+        for i in 0..100 {
+            queue.push_notification(format!("ntfn{i}"));
+        }
+        queue.push_reply("reply".to_string());
+        let stream = ScriptedStream::default();
+        let written = Arc::clone(&stream.written);
+        let mut conn = WsConn::new(stream);
+        drain_before_read(&mut conn, &queue, std::time::Duration::MAX).expect("drain");
+        let frames = text_frames(&written.lock().expect("written"));
+        assert_eq!(frames.len(), 101, "the whole backlog in one pass");
+        // A reply still waits behind only the notification ahead of it.
+        assert_eq!(frames[0], "ntfn0");
+        assert_eq!(frames[1], "reply");
+        for (i, frame) in frames[2..].iter().enumerate() {
+            assert_eq!(*frame, format!("ntfn{}", i + 1), "oldest first");
+        }
+        assert!(queue.take_all_now().is_empty());
+    }
+
+    /// A spent budget ends the drain after the batch in hand, so the
+    /// reader gets back to reading requests; the rest stays queued, in
+    /// order, for the writer.  A zero budget is spent as soon as the
+    /// first batch is written, which makes the stop deterministic.
+    #[test]
+    fn the_reader_drain_stops_when_its_budget_is_spent() {
+        let queue = OutboundQueue::default();
+        for i in 0..3 {
+            queue.push_notification(format!("ntfn{i}"));
+        }
+        let stream = ScriptedStream::default();
+        let written = Arc::clone(&stream.written);
+        let mut conn = WsConn::new(stream);
+        drain_before_read(&mut conn, &queue, std::time::Duration::ZERO).expect("drain");
+        assert_eq!(
+            text_frames(&written.lock().expect("written")),
+            ["ntfn0"],
+            "one batch, then back to reading"
+        );
+        assert_eq!(queue.take_all_now(), ["ntfn1"], "the next one was promoted");
     }
 
     /// The writer parks until there is something to write.

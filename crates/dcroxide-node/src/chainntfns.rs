@@ -108,11 +108,12 @@ pub struct ChainNtfnHandler {
     /// maintenance, with the new-ticket and reorganization events
     /// interleaved in the chain's emission order.
     pending_block_events: Arc<Mutex<Vec<PendingBlockEvent>>>,
-    /// Serializes the whole deferred-notification drain: both the
-    /// netsync post-process path and the generator's drain hook run the
-    /// full [`ChainNtfnHandler::drain_pending`] sequence, and without
-    /// this one could take a prefix of an in-flight reorg batch while the
-    /// other takes the suffix, processing the maintenance, announcements,
+    /// Serializes the whole deferred-notification drain: the netsync
+    /// post-process path, the generator's drain hook and the RPC
+    /// `invalidateblock`/`reconsiderblock` seams all run the full
+    /// [`ChainNtfnHandler::drain_pending`] sequence, and without this
+    /// one could take a prefix of an in-flight reorg batch while another
+    /// takes the suffix, processing the maintenance, announcements,
     /// and index notifications out of the strict order dcrd's single
     /// notification goroutine emits them in.
     drain_lock: Arc<Mutex<()>>,
@@ -612,12 +613,13 @@ impl ChainNtfnHandler {
     /// ahead of the deferred blockconnected frame, where dcrd queues
     /// `NotifyBlockConnected` before calling `s.bg.BlockConnected` in
     /// its NTBlockConnected case.  The whole sequence holds the drain
-    /// lock so the two drivers — the netsync post-process path and the
-    /// background generator's drain hook — can never interleave two runs
-    /// and split a reorg batch, which would process the maintenance,
-    /// announcements, and index notifications out of order (an index
-    /// fed out of order fails every update until the heights line up
-    /// again).
+    /// lock so its drivers — the netsync post-process path, the
+    /// background generator's drain hook, and the RPC invalidate and
+    /// reconsider seams (`rpcrun.rs` `NodeRpcChain::drain_chain_events`)
+    /// — can never interleave two runs and split a reorg batch, which
+    /// would process the maintenance, announcements, and index
+    /// notifications out of order (an index fed out of order fails every
+    /// update until the heights line up again).
     pub fn drain_pending(&self, chain: &Arc<Mutex<Chain>>, adjusted_time_unix: i64) {
         let _drain = self.drain_lock.lock().expect("drain lock poisoned");
         self.drain_pending_block_events();

@@ -48,6 +48,14 @@ pub trait RpcChain {
     fn block_by_hash(&self, _hash: &Hash) -> Result<MsgBlock, String> {
         Err(unwired_seam("block_by_hash"))
     }
+    /// The serialized bytes of the block with the given hash, failing as
+    /// [`RpcChain::block_by_hash`] does (dcrd `BlockByHash` then
+    /// `Block.Bytes`, the bytes the block was read from).  The default
+    /// serializes the decoded block; a store holding the serialization
+    /// can hand it over without decoding it only to encode it again.
+    fn block_bytes_by_hash(&self, hash: &Hash) -> Result<Vec<u8>, String> {
+        self.block_by_hash(hash).map(|block| block.serialize())
+    }
     /// The main chain block at the given height (dcrd
     /// `BlockByHeight`).
     fn block_by_height(&self, _height: i64) -> Result<MsgBlock, String> {
@@ -815,6 +823,14 @@ pub trait RpcBlockTemplater {
     fn current_template(&self) -> Result<Option<MsgBlock>, String> {
         Err(unwired_seam("current_template"))
     }
+    /// The error [`RpcBlockTemplater::current_template`] would return,
+    /// without copying the template out: `handleGetWorkRequest` calls
+    /// dcrd `CurrentTemplate` first only for its error and discards the
+    /// template, a shared pointer there but a deep copy here.  The
+    /// default asks for the template and drops it.
+    fn current_template_err(&self) -> Result<(), String> {
+        self.current_template().map(|_| ())
+    }
     /// Subscribe to block template updates (dcrd `Subscribe`; the
     /// subscription immediately delivers the current template).
     fn subscribe(&self) -> Box<dyn RpcTemplateSubscription + Send> {
@@ -876,8 +892,10 @@ pub trait RpcTemplateSubscription {
 
 impl RpcTemplateSubscription for () {}
 
-/// The no-op stand-in for server dependencies a caller does not
-/// exercise.
+/// The stand-in for a sync manager a caller never reaches, as the test
+/// servers use it.  It is not a no-op: every method but
+/// `accept_mix_message` keeps its `unimplemented!` default, which aborts
+/// a release build, so it must never back a server clients can reach.
 impl RpcSyncManager for () {}
 
 /// The error [`RpcConnManager::connect`] returns for a connection
@@ -1372,7 +1390,12 @@ impl<C: RpcChain> Server<C> {
         self.cfg
             .chain
             .is_treasury_agenda_active(prev_blk_hash)
-            .map_err(|e| rpc_internal_err(&e))
+            .map_err(|e| {
+                rpc_internal_err(
+                    &e,
+                    &format!("Could not obtain treasury agenda status for block {prev_blk_hash}"),
+                )
+            })
     }
 
     /// dcrd `Server.isSubsidySplitAgendaActive`.
@@ -1383,7 +1406,7 @@ impl<C: RpcChain> Server<C> {
         self.cfg
             .chain
             .is_subsidy_split_agenda_active(prev_blk_hash)
-            .map_err(|e| rpc_internal_err(&e))
+            .map_err(|e| rpc_internal_err(&e, &format!("Could not obtain modified subsidy split agenda status for block {prev_blk_hash}")))
     }
 
     /// dcrd `Server.isBlake3PowAgendaActive`.
@@ -1394,7 +1417,7 @@ impl<C: RpcChain> Server<C> {
         self.cfg
             .chain
             .is_blake3_pow_agenda_active(prev_blk_hash)
-            .map_err(|e| rpc_internal_err(&e))
+            .map_err(|e| rpc_internal_err(&e, &format!("Could not obtain blake3 proof of work agenda status for block {prev_blk_hash}")))
     }
 
     /// dcrd `Server.isSubsidySplitR2AgendaActive`.
@@ -1405,7 +1428,15 @@ impl<C: RpcChain> Server<C> {
         self.cfg
             .chain
             .is_subsidy_split_r2_agenda_active(prev_blk_hash)
-            .map_err(|e| rpc_internal_err(&e))
+            .map_err(|e| {
+                rpc_internal_err(
+                    &e,
+                    &format!(
+                        "Could not obtain modified subsidy split round 2 agenda status for block \
+                     {prev_blk_hash}"
+                    ),
+                )
+            })
     }
 
     /// dcrd `Server.isAutoRevocationsAgendaActive`.
@@ -1416,6 +1447,14 @@ impl<C: RpcChain> Server<C> {
         self.cfg
             .chain
             .is_auto_revocations_agenda_active(prev_blk_hash)
-            .map_err(|e| rpc_internal_err(&e))
+            .map_err(|e| {
+                rpc_internal_err(
+                    &e,
+                    &format!(
+                        "Could not obtain automatic ticket revocations agenda status for block \
+                     {prev_blk_hash}"
+                    ),
+                )
+            })
     }
 }

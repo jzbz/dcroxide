@@ -304,7 +304,7 @@ fn error_constructors_match_dcrd() {
 
     let build = |label: &str| -> RPCError {
         match label {
-            "internal" => rpcerrors::rpc_internal_err("boom"),
+            "internal" => rpcerrors::rpc_internal_err("boom", ""),
             "invalid" => rpcerrors::rpc_invalid_error("bad thing 7"),
             "deserialization" => rpcerrors::rpc_deserialization_error("broken tx"),
             "rule" => rpcerrors::rpc_rule_error("rule 9"),
