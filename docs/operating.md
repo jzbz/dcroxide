@@ -319,13 +319,44 @@ missing is an error naming the missing half rather than a regeneration
 over the key that is still there. The modes are dcrd's, the certificate
 `0644` and the key `0600`. Back up or replace
 them the way you would dcrd's; a client that pinned dcrd's certificate
-needs the new one. Replacing them is not live, though: dcrd re-reads the
-pair on the first connection after a change, checking at most once every
-five seconds, while this daemon loads `rpc.cert`, `rpc.key`, and (under
-`--authtype=clientcert`) the `--clientcafile` bundle once at startup, so
-a new certificate, a replaced key, or an edit to `clients.pem` that adds
-or revokes a client takes effect only after a restart. `SIGHUP` will not
-do it: it stops the daemon, exactly as it does in dcrd.
+needs the new one. As in dcrd, replacing them is live: when an RPC
+connection arrives, `rpc.cert`, `rpc.key` and (under
+`--authtype=clientcert`) the `--clientcafile` bundle are checked for a
+change of size or modification time, at most once every five seconds and
+first five seconds after startup, and a changed set is re-read for that
+connection and every later one. Connections already open keep the
+configuration they were accepted under. A set that fails to load — a key
+that does not match its certificate, a file caught half-written, a
+deleted one — leaves the working configuration in place with a warning,
+logged once per distinct error, and the repaired files are picked up on
+a later check. Replacing the certificate and key together reloads twice,
+logging `Reloaded modified RPC certificates` both times, because the
+check stops at the first changed file and notices the key only on the
+check after; dcrd does the same, and it is harmless. Editing
+`clients.pem` is the whole revocation mechanism, since neither dcrd nor
+this daemon consults a CRL or OCSP: removing a client's certificate, or
+the authority that issued it, refuses every connection it makes from
+the first check that loads the edited bundle, normally within five
+seconds of the edit, while a websocket it already holds open stays
+connected until it closes. The edited bundle must still
+load, though: one left with no usable certificate is a failed reload
+like any other, and the old bundle stays in force. `SIGHUP` is not
+needed and will not help: it stops the daemon, exactly as it does in
+dcrd.
+
+The `--clientcafile` bundle is read the way dcrd's Go code reads it:
+malformed PEM blocks, blocks with headers, other block types and
+certificates that do not parse are skipped, and only a file with no
+usable certificate is refused. A client may present a certificate that
+is itself in the bundle, which is the simplest setup: run `gencerts
+client.cert client.key` and append `client.cert` to `clients.pem`. Such a
+certificate authenticates on its own validity and extended key usage;
+any other must chain to a bundle certificate that dcrd would accept at
+the top of the chain: within its validity window, with no critical
+extension Go does not handle, an extended key usage that allows client
+authentication, and a path length constraint the chain's intermediates
+stay within. The client certificate shapes the daemon still refuses
+where dcrd accepts them are listed in [PARITY.md](../PARITY.md).
 
 Default ports are dcrd's, unchanged: mainnet 9108 (P2P) and 9109 (RPC).
 

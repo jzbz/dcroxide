@@ -148,9 +148,6 @@ What Phase 15 has covered so far:
 
 Named open items, tracked and not fixed:
 
-- Named open items, tracked and not fixed:
-
-- The redb metadata tree packs at 64.86% page fill
 - The redb metadata tree packs at 64.86% page fill (0.645–0.649 across every
   run; the fill figure is the per-table `TableStats::fragmented_bytes` —
   `DatabaseStats::fragmented_bytes` charges the allocator's free pool against

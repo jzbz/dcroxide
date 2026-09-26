@@ -454,7 +454,14 @@ Three arms, each on its own reflink clone of the mainnet store: 400,000
 scattered writes over 8 commits with an 8 MiB overlay ceiling, sampling the
 full decomposition after every flush. The arms differ only in what is held
 open — nothing, one read transaction for the whole run, or a reader
-spanning exactly two flushes.
+spanning exactly two flushes (corrected 2026-09-25: that was the design,
+not what ran. `pinprobe` released the `two` arm's reader after its second
+commit rather than its second flush, and at these parameters no flush had
+run by then, so the reader spanned no flush and the `two` column below is a
+second `none` control — which is why it matches `none` exactly. The
+conclusion rests on `all` against `none` alone. `pinprobe` now counts
+flushes and releases the reader after flush 2; see the correction under the
+2026-08-07 row of `docs/bench-ledger.md`).
 
 | flush | `none` | `all` | `two` |
 |---|---:|---:|---:|
@@ -463,7 +470,8 @@ spanning exactly two flushes.
 | 3 | 4,967,783,213 | 4,967,741,431 | 4,967,783,213 |
 
 Free-page bytes. The first two flushes agree byte for byte across all three
-arms. At the third, `none` and `two` are still identical and `all` differs
+arms. At the third, `none` and `two` are still identical (necessarily: see
+the correction above) and `all` differs
 by 41,782 bytes — 0.0008% of 4.97 GiB, and *fewer* free pages with the
 reader held, which is the opposite of what pinning would produce. A reader
 held across every flush of the run changes nothing measurable. Lever (a) is

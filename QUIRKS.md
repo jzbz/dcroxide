@@ -601,14 +601,20 @@ Entry format:
   message" remains only for codec failures, and not even for those when the
   server's `OnRead` ban has already disconnected the peer (`BanPeer` calls
   `Disconnect` inside `readMessage`), or when a payload ends on a field
-  boundary, since `BtcDecode` then returns `io.EOF` itself (the port still
-  logs that case; see PARITY.md's open gaps).
+  boundary, since `BtcDecode` then returns `io.EOF` itself. The port
+  declines that case too: `read_error_to_log` drops the codec's `EOF` text
+  as dcrd's `errors.Is(err, io.EOF)` does (`peer/peer.go:1063-1065`), and
+  still logs a payload that ends inside a field, which is
+  `io.ErrUnexpectedEOF` (`unexpected EOF`) on both sides.
 - **Why reproduced:** operator-visible log parity. Porting the warning
   would log a line on every idle disconnect, where dcrd is silent.
 - **Pinned by:** `read_failures_are_logged_as_dcrd_logs_them` (a real
   transport timeout, a closed stream and an OS socket error log nothing; a
-  codec failure logs unless the teardown flag is up) and
-  `a_banned_wire_violation_is_not_logged_as_a_failed_read`, both in
+  codec failure logs unless the teardown flag is up),
+  `a_payload_cut_on_a_field_boundary_is_not_logged` (a `ping` with an empty
+  payload, cut before its nonce, logs nothing; one cut inside the nonce
+  logs `unexpected EOF`) and
+  `a_banned_wire_violation_is_not_logged_as_a_failed_read`, all in
   `crates/dcroxide-node/src/peerloop.rs`.
 
 ## QK-0022 — a banned onion peer is never refused before its handshake

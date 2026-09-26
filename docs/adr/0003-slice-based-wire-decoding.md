@@ -34,7 +34,9 @@ readers. Kinds whose description varies by check carry a `MessageText`
 holding dcrd's `op` and format string verbatim. Kinds only the other P2P
 codecs raise, the `ErrMsgInvalidForPVer` gate and `ReadMessage`'s framing
 errors reach only logs, and print their kind name (`ErrWrongNetwork` aside,
-which renders dcrd's text).
+which renders dcrd's `ReadMessage: message from other network [%v]`, the
+magic printed by `CurrencyNet.String`, pinned against the oracle by
+`crates/dcroxide-wire/tests/review_wrong_network_text.rs`).
 
 Two invariants follow from dcrd's canonical-varint enforcement and are locked
 in by fuzz targets and property tests for every codec:

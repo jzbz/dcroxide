@@ -69,6 +69,29 @@ path) has been measured yet, so this crossover is unconfirmed.
 > pending decision and is documentation accuracy. Worth running before a
 > release, or after any change expected to move IBD.
 
+**Open arm, unmeasured: the maturing-ticket ancestor read.** Every connect
+past stake-enabled height lists the ticket purchases in the block
+`ticket_maturity` below it (256 on mainnet) to add them to the live pool
+(`maybe_fetch_new_tickets` in `process.rs`, dcrd `maybeFetchNewTickets`,
+`stakenode.go:21-43`). The per-connect parent prune (dcrd `connectBlock`,
+`chain.go:795-808`) now also evicts the parent's body and rows from the port's
+recent-window mirrors once it sits more than 288 blocks below the best header,
+which during initial sync is every block. So that ancestor is never resident,
+and each connect pays a flat-file read, checksum and full `MsgBlock` decode of
+it, plus, after treasury activation, a database view for
+`calculate_treasury_balance`'s ancestor treasury row. dcrd pays the same
+reads: its recent-block cache holds only 12 blocks (`recentBlockCacheSize`,
+`chain.go:48`) and it fetches both treasury rows from the database
+(`treasury.go:379`, `:387`), so this is a cost, not a parity gap. Two fixes
+trade memory for it: exempt the ~257 bodies within `ticket_maturity + 1` of
+the tip from the eviction, or record each block's ticket-purchase hashes when
+its data is accepted (per node, or in a ring of `ticket_maturity + 1` entries)
+so the read needs no body. The gain is an estimate, about 1-2% of the 3.8
+ms/block above; nothing here has been measured. What decides it is a mainnet
+sync, or a long simnet sync past stake-enabled height, with and without a
+prototype of the hash ring, the arms alternated as in the overlay sweep below;
+record the result here whether or not it ships.
+
 ## Storage at tip
 
 | date | machine | dcroxide commit | corpus | result | source |
@@ -743,7 +766,7 @@ fjall #308 (open, filed against 3.1.8) has `WriteBatch::commit()` return
 `Ok` for a batch that does not survive restart, when an earlier journal
 *write failure* left an unterminated record and recovery truncates from it.
 fjall #311 (open) has no strict recovery mode, so mid-journal corruption is
-indistinguishable from a torn tail and presents as silent truncation. Both land on the cross-bucket atomicity `Chain::flush` (`process.rs:973-1000`) depends on, and
+indistinguishable from a torn tail and presents as silent truncation. Both land on the cross-bucket atomicity `Chain::flush`'s single-transaction commit (`process.rs`) depends on, and
 neither is reachable by killing a healthy process.
 
 ### The upgrade arm, taken

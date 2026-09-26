@@ -96,7 +96,16 @@ evaluating this code.
   until something restarts the process. The tradeoff is deliberate, and
   loud beats the previous behaviour, where a poisoned lock wedged the node
   while the RPC layer's `catch_unwind` kept it answering canned errors and
-  looking healthy.
+  looking healthy. One latent source of such panics sits on the RPC
+  surface. The seam traits in `dcroxide-rpc` (`server.rs`,
+  `websocket.rs`) still give 61 methods an `unimplemented!()` default,
+  and the public `impl … for ()` stand-ins the tests use inherit them.
+  Every adapter the daemon wires in overrides them today, so none is
+  reachable, but an adapter that later misses one would still compile,
+  and the first RPC to reach that method would abort the node. Making a
+  missing override a compile error needs the `()` stand-ins moved behind
+  a test-support feature and the test doubles made explicit; that has not
+  been done.
 - **A websocket client that stops reading grows node memory without
   bound.** The notification queues are unbounded, exactly as dcrd's are,
   so nothing is ever dropped and nothing is reordered — the whole cost of
@@ -125,6 +134,36 @@ evaluating this code.
   connection once the upgrade completes. Bind the RPC listeners to
   trusted interfaces, or firewall them, and raise `rpcmaxwebsockets` if
   untrusted hosts can reach them.
+- **Any host that can reach the RPC port can drive the
+  authentication-failure warning.** `RPC authentication failure from
+  <addr>` is logged for every wrong credential, and for every HTTP request
+  that carries none, as dcrd's `checkAuthMAC` and `checkAuth` log it, so
+  a client without credentials drives that warning at its request rate.
+  It is deliberately not rate-limited like the `Max RPC clients exceeded`
+  shed line: fail2ban-style filters count these lines, and a limiter
+  would hide the attempts they exist to catch. Nothing bounds it beyond
+  what bounds the requests themselves, the admission caps
+  (`rpcmaxclients` and the pre-authentication pool). Bind the RPC
+  listeners to trusted interfaces, or rotate logs, if that volume
+  matters.
+- **Seeder TLS roots are compiled in.** The HTTPS seeder clients verify
+  certificates against the `webpki-roots` snapshot built into the
+  binary, not against the operating system's trust store that dcrd's Go
+  client uses. A root the OS distrusts after the build stays trusted
+  until a rebuild, and a locally installed root, such as an enterprise
+  TLS-inspection CA or a private `SSL_CERT_FILE`, is not honoured, so
+  behind such a proxy the node cannot seed. Seeders are how a fresh node
+  bootstraps its peer list, which makes this trust anchor
+  security-relevant; see PARITY.md's open gaps.
+- **RPC TLS uses classical key exchange.** dcrd leaves Go's default
+  key-exchange preferences in place (`newTLSConfig`,
+  `server.go:3685-3688`), which since Go 1.24 put hybrid X25519MLKEM768
+  first, so it negotiates that with Go clients such as dcrctl and
+  dcrwallet. This daemon negotiates plain X25519, because its rustls
+  `ring` provider has no ML-KEM. RPC sessions recorded on a non-local
+  `--rpclisten` are therefore exposed to harvest-now-decrypt-later
+  attacks that dcrd's resist, including the Basic credentials sent with
+  every request. See PARITY.md's open gaps.
 - **Descriptor use is several times dcrd's.** The daemon spends several
   descriptors per peer and RPC connection where dcrd spends one, and
   keeps a read handle open for every block file it has touched where

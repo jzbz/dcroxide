@@ -360,7 +360,10 @@ work). Currently implemented:
   interval, so an optimization is measured on the same blocks before
   and after
 - `tools/oracle` — Go shim linking dcrd's own packages (pinned to the
-  master `452c1a6c` module versions) as a test oracle over line-delimited JSON
+  parity target, master `b9634e01`: each dcrd module at that commit's
+  pseudo-version or at a tag whose source is byte-identical to it, as the
+  header of `tools/oracle/go.mod` records) as a test oracle over
+  line-delimited JSON
 - `tools/helpgen` — the go-flags help-vector generator over dcrd's
   verbatim config struct
 - `tools/dcrdstat` — sums the payload dcrd actually stores, per ffldb
@@ -525,6 +528,14 @@ Rust 1.98.1 and a Go toolchain (for the oracle-backed differential
 tests; without Go those tests skip). `DCROXIDE_REQUIRE_ORACLE=1` turns a
 missing toolchain into a failure instead, so a run cannot silently pass
 with the differential coverage skipped — CI sets it.
+
+Every randomized differential prints the seed it drew
+(`<label>: seed 0x…`). To replay a failure without editing the test, set
+`DCROXIDE_TEST_SEED` to that value and run the failing test by name.
+`DCROXIDE_REQUIRE_FAULT_INJECTION=1` does for the Linux fault-injection
+tests (the database ENOSPC test and the `tools/powerloss` shim test) what
+`DCROXIDE_REQUIRE_ORACLE` does for the oracle: a missing prerequisite
+fails the test instead of skipping it. CI sets it too.
 
 `rust-toolchain.toml` pins the toolchain builds actually use, so a commit
 compiles with one rustc everywhere, and the workspace `rust-version` names

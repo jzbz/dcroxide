@@ -414,14 +414,16 @@ written wider than a kill test, and the wider half fails:
      and blames the peer. With the latch this becomes loud and permanent
      rather than silent, which is better but still wrong.
      **Fixed:** `Database::is_fatal` is public and threaded
-     into `combine_process_block_result` (`sync.rs:166-168`), so a latched
+     into `combine_process_block_result` (the `storage_failed` flag
+     `NodeSyncChain::process_block` computes, `sync.rs`), so a latched
      store reports a disk fault instead of a rule error attributed to the
      peer. Two tests pin both directions: a real rule violation stays the
      peer's, a storage failure does not become one.
    - `dcroxide.rs` logs a failed shutdown flush and exits `SUCCESS`, in the
      one place whose own comment says that failure wedges the node on next
      start.
-     **Fixed:** `dcroxide.rs:1158` returns `ExitCode::FAILURE` there.
+     **Fixed:** `run_node` in `dcroxide.rs` returns `ExitCode::FAILURE`
+     there, once the failed flush is logged.
 
    What was deliberately not done: a fatal storage error still does not
    shut the node down. The store latches and the manager logs "Failed to
@@ -727,10 +729,10 @@ Recorded because the errors are checkable and someone will propose it again.
 
 - **The append-shaped classification was factually wrong.**
   `spendjournalv3` — 84% of the payload that half would hold — is keyed by
-  block *hash* (`chaindb.rs:266`) and is *deleted* on disconnect
-  (`db_remove_spend_journal_entry`). `ffldb-blockidx` is likewise keyed by
-  hash. "Written once, in order, read by a monotone key" is false for the
-  data it named.
+  block *hash* (`db_put_spend_journal_entry`, `chaindb.rs`) and is
+  *deleted* on disconnect (`db_remove_spend_journal_entry`).
+  `ffldb-blockidx` is likewise keyed by hash. "Written once, in order, read
+  by a monotone key" is false for the data it named.
 - **It broke atomicity the chain depends on.** `Chain::flush`'s single-transaction commit (`process.rs`) writes
   block index rows, UTXO entries and both state markers in one
   transaction, with a comment that a crash must never leave the flushed set
